@@ -239,6 +239,8 @@ pub struct OpenedPager {
     writable: bool,
     superblock: Superblock,
     slot: u64,
+    /// Either superblock page holds a valid superblock of an older format version.
+    older: bool,
 }
 
 impl OpenedPager {
@@ -268,7 +270,25 @@ impl OpenedPager {
     /// extent. Exact duplicates are accepted (tablets may share an SST after a split);
     /// overlapping, misaligned or out-of-file extents fail with [`Error::Format`]. A writable
     /// pager first makes the file's current length durable (`sync_all`).
+    ///
+    /// If either superblock page holds an older format version, a writable pager then commits
+    /// the current root twice, so both pages carry [`FormatVersion::CURRENT`] before its
+    /// caller writes anything an older build could not read (ICR 0046): an older build
+    /// refuses the file with an unsupported-version error instead of falling back to the
+    /// page it can still decode. A crash between the two commits leaves one older page
+    /// naming the same root, and the next writable open finishes the upgrade.
     pub fn finish(self, live: impl IntoIterator<Item = Extent>) -> Result<Pager> {
+        let upgrade = self.writable && self.older;
+        let pager = self.load(live)?;
+        if upgrade {
+            let root = pager.root();
+            pager.commit_root(root)?;
+            pager.commit_root(root)?;
+        }
+        Ok(pager)
+    }
+
+    fn load(self, live: impl IntoIterator<Item = Extent>) -> Result<Pager> {
         // The allocator is sized from the length the page cache shows, which a process that
         // died between a growth's `fallocate` and its `sync_all` left longer than the disk's.
         // Make it durable before handing out that tail: root commits sync with `sync_data`.
@@ -566,11 +586,16 @@ fn read_slot(file: &FileRef, slot: u64) -> Result<pigeonhole_format::Result<Supe
     }
 }
 
-/// The current superblock and its page.
-fn read_superblocks(file: &FileRef) -> Result<(Superblock, u64)> {
+/// The current superblock and its page, and whether either page holds a valid superblock of
+/// an older format version.
+fn read_superblocks(file: &FileRef) -> Result<(Superblock, u64, bool)> {
     let a = read_slot(file, SUPERBLOCK_PAGE_A)?;
     let b = read_slot(file, SUPERBLOCK_PAGE_B)?;
-    Ok(Superblock::choose(a, b)?)
+    let older = [&a, &b]
+        .iter()
+        .any(|r| matches!(r, Ok(sb) if sb.version < FormatVersion::CURRENT));
+    let (sb, slot) = Superblock::choose(a, b)?;
+    Ok((sb, slot, older))
 }
 
 impl Inner {
@@ -788,6 +813,7 @@ impl Pager {
             writable: true,
             superblock,
             slot: SUPERBLOCK_PAGE_A,
+            older: false,
         }
         .finish([])
     }
@@ -798,12 +824,13 @@ impl Pager {
         let mut opts = OpenOptions::read();
         opts.write = writable;
         let file = vfs.open(path, opts)?;
-        let (superblock, slot) = read_superblocks(&file)?;
+        let (superblock, slot, older) = read_superblocks(&file)?;
         Ok(OpenedPager {
             file,
             writable,
             superblock,
             slot,
+            older,
         })
     }
 
@@ -1073,7 +1100,7 @@ impl Pager {
         if self.inner.writable {
             return Ok(None);
         }
-        let (sb, slot) = read_superblocks(&self.inner.file)?;
+        let (sb, slot, _) = read_superblocks(&self.inner.file)?;
         let mut st = lock(&self.inner.state);
         if sb.sequence == st.sequence {
             return Ok(None);

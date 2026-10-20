@@ -381,9 +381,11 @@ impl FrameDecoder {
     }
 }
 
-/// Record type byte. Numbers are frozen.
+/// Record type byte. Numbers are frozen. Non-exhaustive: a later format may add record
+/// types (ICR 0046).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum RecordType {
     /// A single-shard commit.
     Batch = 1,
@@ -391,10 +393,15 @@ pub enum RecordType {
     Prepare = 2,
     /// The coordinator's decision for a cross-shard commit.
     Commit = 3,
+    /// The coordinator's decision, naming the seqno and timestamp the commit applies at
+    /// (D263).
+    Decision = 4,
 }
 
-/// A decoded WAL record, borrowing its batch bytes.
+/// A decoded WAL record, borrowing its batch bytes. Non-exhaustive: a later format may add
+/// record types (ICR 0046).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum WalRecord<'a> {
     /// Single-shard commit: apply at `seqno`.
     Batch {
@@ -424,11 +431,24 @@ pub enum WalRecord<'a> {
         /// Participant streams (diagnostics and recovery cross-checks).
         participants: StreamList<'a>,
     },
+    /// Cross-shard decision (D263): every PREPARE whose id is `seqno` is
+    /// committed, applied at `apply_seqno` with `commit_ts` for mutations without a timestamp.
+    /// The id is a seqno reserved but never applied; `apply_seqno` is reserved at the decision.
+    Decision {
+        /// The commit's id (the PREPAREs' seqno field).
+        seqno: Seqno,
+        /// The seqno the commit applies at.
+        apply_seqno: Seqno,
+        /// The commit timestamp.
+        commit_ts: Timestamp,
+        /// Participant streams.
+        participants: StreamList<'a>,
+    },
 }
 
-/// The longest record head [`WalRecord::split`] writes: a PREPARE's type, seqno, commit
-/// timestamp and coordinator stream.
-pub const RECORD_HEAD_MAX: usize = 1 + 8 + 8 + 4;
+/// The longest record head [`WalRecord::split`] writes: a DECISION's type, id, seqno and
+/// commit timestamp.
+pub const RECORD_HEAD_MAX: usize = 1 + 8 + 8 + 8;
 
 impl WalRecord<'_> {
     /// Appends the record encoding.
@@ -474,6 +494,18 @@ impl WalRecord<'_> {
                 head[1..9].copy_from_slice(&seqno.to_le_bytes());
                 (9, participants.bytes)
             }
+            WalRecord::Decision {
+                seqno,
+                apply_seqno,
+                commit_ts,
+                participants,
+            } => {
+                head[0] = RecordType::Decision as u8;
+                head[1..9].copy_from_slice(&seqno.to_le_bytes());
+                head[9..17].copy_from_slice(&apply_seqno.to_le_bytes());
+                head[17..25].copy_from_slice(&commit_ts.to_le_bytes());
+                (25, participants.bytes)
+            }
         };
         (&head[..len], body)
     }
@@ -507,6 +539,12 @@ impl WalRecord<'_> {
             }),
             3 => Ok(WalRecord::Commit {
                 seqno: r.u64()?,
+                participants: StreamList::new(r.rest())?,
+            }),
+            4 => Ok(WalRecord::Decision {
+                seqno: r.u64()?,
+                apply_seqno: r.u64()?,
+                commit_ts: r.u64()?,
                 participants: StreamList::new(r.rest())?,
             }),
             _ => Err(Error::Corrupt {

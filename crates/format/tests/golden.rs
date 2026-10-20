@@ -540,6 +540,15 @@ fn wal() {
                 participants: StreamList::new(&participants).unwrap(),
             },
         ),
+        (
+            "wal_record_decision.bin",
+            WalRecord::Decision {
+                seqno: 101,
+                apply_seqno: 103,
+                commit_ts: 1_700_000_000_000_002,
+                participants: StreamList::new(&participants).unwrap(),
+            },
+        ),
     ];
     let mut frames = Vec::new();
     let mut enc = FrameEncoder::new(9, FRAME_SIZE as u64 * 2 - 100);

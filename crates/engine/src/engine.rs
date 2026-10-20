@@ -243,6 +243,12 @@ pub struct CrossShardMetrics {
     /// PREPAREs refused because they overlapped a row of an undecided share another commit
     /// prepared there (D249, ICR 0045). Retried once it is decided; not a conflict.
     pub refused_pending_overlap: u64,
+    /// Singles held back behind an undecided share (D263), once per group
+    /// that held them.
+    pub share_waits: u64,
+    /// The time shards had at least one single held back behind an
+    /// undecided share (D263), summed over shards.
+    pub share_wait_nanos: u64,
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -875,7 +881,11 @@ impl Engine {
         let mut recoveries: Vec<(StreamId, Recovery)> = Vec::new();
         let mut stashed: Vec<(StreamId, Seqno, u64, StreamId, Vec<u8>)> = Vec::new();
         // `(coordinator stream, seqno) -> participant streams` of every COMMIT decision.
-        let mut commits: HashMap<(StreamId, Seqno), Vec<StreamId>> = HashMap::new();
+        // With the seqno and timestamp a DECISION applies the commit at (D263);
+        // `None` for a 0.3.0 COMMIT, whose PREPAREs apply at their own.
+        #[allow(clippy::type_complexity)]
+        let mut commits: HashMap<(StreamId, Seqno), (Vec<StreamId>, Option<(Seqno, u64)>)> =
+            HashMap::new();
         let mut replayed: Vec<(StreamId, Vec<ReplayedRecord>)> = Vec::new();
         // Recovered memtables written to SSTs mid-replay when an arena ran short (#143).
         let mut spill = Spilled::new(Arc::clone(&pager));
@@ -933,13 +943,32 @@ impl Engine {
                         participants,
                     } => {
                         let list: Vec<StreamId> = participants.iter().collect();
-                        commits.insert((stream, seqno), list.clone());
+                        commits.insert((stream, seqno), (list.clone(), None));
                         records.push(ReplayedRecord {
                             end,
                             seqno,
                             kind: ReplayedRecordKind::Commit { participants: list },
                         });
                     }
+                    WalRecord::Decision {
+                        seqno,
+                        apply_seqno,
+                        commit_ts,
+                        participants,
+                    } => {
+                        let list: Vec<StreamId> = participants.iter().collect();
+                        commits.insert(
+                            (stream, seqno),
+                            (list.clone(), Some((apply_seqno, commit_ts))),
+                        );
+                        records.push(ReplayedRecord {
+                            end,
+                            seqno,
+                            kind: ReplayedRecordKind::Commit { participants: list },
+                        });
+                    }
+                    // `WalRecord::decode` returns no other type in this build.
+                    _ => return Err(Error::Corruption("wal record type".into())),
                 }
             }
             max_seqno = max_seqno.max(rec.max_seqno());
@@ -957,10 +986,10 @@ impl Engine {
         let complete = |coordinator: StreamId, seqno: Seqno| -> bool {
             commits
                 .get(&(coordinator, seqno))
-                .is_some_and(|ps| ps.iter().all(|p| prepared.contains(&(*p, seqno))))
+                .is_some_and(|(ps, _)| ps.iter().all(|p| prepared.contains(&(*p, seqno))))
         };
         // `(participant stream, seqno) -> slots written on each shard` of applied prepares.
-        let mut applied_slots: HashMap<(StreamId, Seqno), Vec<Slots>> = HashMap::new();
+        let mut applied_slots: HashMap<(StreamId, Seqno), (Seqno, Vec<Slots>)> = HashMap::new();
         for (stream, seqno, commit_ts, coordinator, bytes) in &stashed {
             crate::shard::trace!(
                 "replay prepare stream {} seqno {seqno} coordinator {} complete={} decision={:?}",
@@ -973,11 +1002,18 @@ impl Engine {
                 continue;
             }
             make_room(&shared, &catalog, &mut states, bytes, &mut spill)?;
+            let (apply_seqno, apply_ts) = commits
+                .get(&(*coordinator, *seqno))
+                .and_then(|(_, at)| *at)
+                .unwrap_or((*seqno, *commit_ts));
             let mut per_shard = Vec::with_capacity(states.len());
             for s in &mut states {
-                per_shard.push(s.replay(bytes, *seqno, *commit_ts).map_err(replay_error)?);
+                per_shard.push(
+                    s.replay(bytes, apply_seqno, apply_ts)
+                        .map_err(replay_error)?,
+                );
             }
-            applied_slots.insert((*stream, *seqno), per_shard);
+            applied_slots.insert((*stream, *seqno), (apply_seqno, per_shard));
         }
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
         let current = shm.next_seqno();
@@ -1016,16 +1052,16 @@ impl Engine {
                             // checkpoint waits for that. Off, only this shard's.
                             let applied = applied_slots.get(&(stream, r.seqno));
                             let slots = if options.tablet_changes {
-                                applied.map(|per| per.concat()).unwrap_or_default()
+                                applied.map(|(_, per)| per.concat()).unwrap_or_default()
                             } else {
                                 applied
-                                    .map(|per| per.get(i).cloned().unwrap_or_default())
+                                    .map(|(_, per)| per.get(i).cloned().unwrap_or_default())
                                     .unwrap_or_default()
                             };
                             ReplayedKind::Prepare {
                                 slots,
                                 coordinator: ShardId(coordinator.0 as u16),
-                                applied: applied.is_some(),
+                                applied: applied.map(|(s, _)| *s),
                             }
                         }
                         ReplayedRecordKind::Commit { participants } => ReplayedKind::Commit {
@@ -2194,6 +2230,8 @@ impl Engine {
             x.refused_moved += refused(CrossRefusal::Moved);
             x.refused_room += refused(CrossRefusal::Room);
             x.refused_pending_overlap += refused(CrossRefusal::PendingOverlap);
+            x.share_waits += s.cross.share_waits.load(Ordering::Relaxed);
+            x.share_wait_nanos += s.cross.share_wait_nanos.load(Ordering::Relaxed);
         }
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);

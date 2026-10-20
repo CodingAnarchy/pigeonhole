@@ -199,6 +199,12 @@ pub struct CrossShardMetrics {
     /// prepared there and not yet decided. Such a commit is retried, not failed: only a real
     /// conflict with a write after its snapshot fails it with `Conflict`.
     pub refused_pending_overlap: u64,
+    /// Singles held back behind an undecided cross-shard share (D263), once
+    /// per group that held them.
+    pub share_waits: u64,
+    /// The time shards had a single held back behind an undecided share
+    /// (D263), summed over shards.
+    pub share_wait_nanos: u64,
 }
 
 impl From<pigeonhole_engine::Metrics> for EngineMetrics {
@@ -255,6 +261,8 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
                 refused_moved: x.refused_moved,
                 refused_room: x.refused_room,
                 refused_pending_overlap: x.refused_pending_overlap,
+                share_waits: x.share_waits,
+                share_wait_nanos: x.share_wait_nanos,
             },
         }
     }

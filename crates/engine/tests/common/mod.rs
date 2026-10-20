@@ -422,6 +422,9 @@ pub struct Stats {
     /// checkpoint passed: an aborted or undecided attempt's PREPARE passes at once (D116),
     /// and such a commit is never recovered (D83, D114).
     pub undecided_prepares_passed: usize,
+    /// Decided commits whose DECISION a crash lost, with their applied seqno at or above the
+    /// recovered next seqno: known by their id again (D263).
+    pub aliases_reverted: usize,
     /// Mutating VFS operations the run made before its final crash: the crash points a
     /// sweep of the same seed and config must cover.
     pub mutating_ops: u64,
@@ -991,6 +994,8 @@ pub struct WalRead {
     pub batches: BTreeMap<Seqno, Survivor>,
     /// COMMIT decisions: `(coordinator stream, seqno) -> participant streams`.
     pub commits: BTreeMap<(u32, Seqno), Vec<u32>>,
+    /// D263: each DECISION's id, with the seqno and timestamp it applies at.
+    pub decisions: BTreeMap<Seqno, (Seqno, Timestamp)>,
 }
 
 /// A commit's records as the WAL holds them.
@@ -1016,6 +1021,7 @@ pub fn read_wal(
     let streams =
         pigeonhole_wal::discover_streams(&vfs_ref, db).map_err(|e| format!("discover: {e}"))?;
     let mut out = WalRead::default();
+    let mut decisions: BTreeMap<Seqno, (Seqno, Timestamp)> = BTreeMap::new();
     for stream in streams {
         let checkpoint = checkpoints.get(&stream).copied().unwrap_or_default();
         let mut rec = pigeonhole_wal::Recovery::open(&vfs_ref, db, stream, db_id, checkpoint)
@@ -1070,9 +1076,27 @@ pub fn read_wal(
                         participants.iter().map(|p| p.0).collect(),
                     );
                 }
+                WalRecord::Decision {
+                    seqno,
+                    apply_seqno,
+                    commit_ts,
+                    participants,
+                } => {
+                    list.push((apply_seqno, RecKind::Commit));
+                    decisions.insert(seqno, (apply_seqno, commit_ts));
+                    out.commits.insert(
+                        (stream.0, apply_seqno),
+                        participants.iter().map(|p| p.0).collect(),
+                    );
+                }
+                other => return Err(format!("stream {}: unexpected record {other:?}", stream.0)),
             }
         }
     }
+    // D263: the harness keys a decided commit's PREPAREs by the seqno its
+    // DECISION applies it at (`rekey_decided`), in one pass: ids and applied seqnos share one
+    // counter, so a second pass would chain one commit's seqno into another's.
+    out.decisions = decisions;
     Ok(out)
 }
 
@@ -1307,6 +1331,12 @@ struct World {
     /// Commit timestamps of the batch records the engine appended, by seqno, with the crash
     /// count when appended (seqnos are reused only across a crash).
     appended_ts: HashMap<Seqno, (usize, Timestamp)>,
+    /// D263: each decided commit's id, with the seqno and timestamp its
+    /// DECISION applies it at, from the engine's append order.
+    decided_ids: HashMap<Seqno, (Seqno, Timestamp)>,
+    /// Whether a crash reverts the aliases of decided commits whose applied seqno recovery
+    /// may hand out again (off only in the harness's own test of that revert).
+    revert_aliases: bool,
     /// Blob files seen in the catalog after a commit with a large value (`Stats::blob_files`).
     blob_files_seen: HashSet<(FamilyId, u32)>,
     /// Bottommost compactions applied to the model, by manifest version.
@@ -1368,6 +1398,8 @@ impl World {
             refused_seqnos: HashSet::new(),
             stream_epochs: BTreeMap::new(),
             appended_ts: HashMap::new(),
+            decided_ids: HashMap::new(),
+            revert_aliases: true,
             blob_files_seen: HashSet::new(),
             purges: Vec::new(),
             pending_purges: Vec::new(),
@@ -1477,15 +1509,81 @@ impl World {
                 self.appended_ts
                     .insert(r.seqno, (self.stats.crashes, r.commit_ts));
             }
+            if kind == RecKind::Prepare {
+                // A new commit took this id (a crash lost the old one's records).
+                self.decided_ids.remove(&r.seqno);
+            }
+            // D263: a DECISION names the commit's id (its PREPAREs' seqno) and
+            // the seqno it applies at; the harness keys a decided commit's records by the
+            // latter, as it knows the commit.
+            let seqno = if kind == RecKind::Commit && r.apply_seqno != 0 {
+                self.decided_ids
+                    .insert(r.seqno, (r.apply_seqno, r.commit_ts));
+                // Only this run's PREPAREs: an id whose PREPAREs a crash lost (or a seqno a
+                // lost DECISION reserved) may be taken again after it, as a lost seqno may.
+                let crashes = self.stats.crashes;
+                for (stream, list) in self.stream_records.iter_mut() {
+                    let epochs = self.stream_epochs.get(stream);
+                    for (i, (q, k)) in list.iter_mut().enumerate() {
+                        if *q == r.seqno
+                            && *k == RecKind::Prepare
+                            && epochs.and_then(|e| e.get(i)) == Some(&crashes)
+                        {
+                            *q = r.apply_seqno;
+                        }
+                    }
+                }
+                r.apply_seqno
+            } else {
+                r.seqno
+            };
             self.stream_records
                 .entry(u32::from(r.stream))
                 .or_default()
-                .push((r.seqno, kind));
+                .push((seqno, kind));
             self.stream_epochs
                 .entry(u32::from(r.stream))
                 .or_default()
                 .push(self.stats.crashes);
         }
+    }
+
+    /// D263: keys a decided commit's PREPAREs in `wal` by the seqno its
+    /// DECISION applied it at, also when the DECISION itself was checkpointed away.
+    fn rekey_decided(&mut self, mut wal: WalRead) -> WalRead {
+        self.drain_appended();
+        let decided = |q: &Seqno| {
+            wal.decisions
+                .get(q)
+                .or_else(|| self.decided_ids.get(q))
+                .copied()
+        };
+        let mut streams = std::mem::take(&mut wal.streams);
+        for list in streams.values_mut() {
+            for (q, k) in list.iter_mut() {
+                if *k == RecKind::Prepare
+                    && let Some((s, _)) = decided(q)
+                {
+                    *q = s;
+                }
+            }
+        }
+        wal.streams = streams;
+        let ids: Vec<(Seqno, (Seqno, Timestamp))> = wal
+            .batches
+            .keys()
+            .filter_map(|q| decided(q).map(|d| (*q, d)))
+            .collect();
+        let mut moved = BTreeMap::new();
+        for (id, (s, ts)) in ids {
+            if let Some(mut sv) = wal.batches.remove(&id) {
+                sv.seqno = s;
+                sv.commit_ts = ts;
+                moved.insert(s, sv);
+            }
+        }
+        wal.batches.extend(moved);
+        wal
     }
 
     /// The streams holding records of `seqno`, from the engine's append order: `None` when
@@ -1526,8 +1624,10 @@ impl World {
     /// Checks the records the WAL holds now against the engine's append order: they are a
     /// contiguous window of each stream (everything before it was checkpointed, everything
     /// after it is still buffered or was lost).
-    fn observe_streams(&mut self, wal: &WalRead) -> Result<(), Fail> {
-        self.drain_appended();
+    fn observe_streams(&mut self, wal: &mut WalRead) -> Result<(), Fail> {
+        // Drains the appended records, then keys the WAL's decided PREPAREs as they now are
+        // (D263: a DECISION drained here rekeys the append order too).
+        *wal = self.rekey_decided(std::mem::take(wal));
         for (stream, observed) in &wal.streams {
             let known = self.stream_records.entry(*stream).or_default();
             let Some(first) = observed.first() else {
@@ -1548,7 +1648,7 @@ impl World {
                         return fail(
                             FailureClass::Protocol,
                             format!(
-                                "stream {stream}: record {i} after the checkpoint is {r:?} but the engine appended {have:?} there"
+                                "stream {stream}: record {i} after the checkpoint is {r:?} but the engine appended {have:?} there",
                             ),
                         );
                     }
@@ -1579,7 +1679,7 @@ impl World {
         });
         self.vfs.set_faults(self.cfg.faults.clone());
         self.faults_active = true;
-        let wal = match wal {
+        let mut wal = match wal {
             Ok(w) => w,
             Err(e) => return fail(FailureClass::Protocol, format!("reading the WAL: {e}")),
         };
@@ -1590,7 +1690,7 @@ impl World {
                 wal.batches.keys().collect::<Vec<_>>()
             );
         }
-        self.observe_streams(&wal)?;
+        self.observe_streams(&mut wal)?;
         Ok(wal)
     }
 
@@ -2062,6 +2162,9 @@ impl World {
     ) -> Result<(), Fail> {
         // Commits the client already saw acknowledged count, whatever is still in flight.
         self.stash_acked()?;
+        // The dead engine's records belong to the run that appended them (the
+        // harness rekeys a decided commit's PREPAREs only within their run).
+        self.drain_appended();
         self.stats.crashes += 1;
         if self.trace_on() {
             eprintln!("crash {kind:?} already={already}");
@@ -2102,11 +2205,15 @@ impl World {
             Ok(m) => m,
             Err(e) => return fail(FailureClass::Protocol, format!("reading the manifest: {e}")),
         };
-        let wal = match read_wal(&self.vfs, Path::new(DB), &manifest.checkpoints) {
+        let raw_wal = match read_wal(&self.vfs, Path::new(DB), &manifest.checkpoints) {
             Ok(w) => w,
             Err(e) => return fail(FailureClass::Protocol, format!("reading the WAL: {e}")),
         };
-        self.observe_streams(&wal)?;
+        let mut wal = match read_wal(&self.vfs, Path::new(DB), &manifest.checkpoints) {
+            Ok(w) => w,
+            Err(e) => return fail(FailureClass::Protocol, format!("reading the WAL: {e}")),
+        };
+        self.observe_streams(&mut wal)?;
         if self.trace_on() {
             eprintln!(
                 "crash: checkpoints {:?} wal {:?} known {:?}",
@@ -2124,6 +2231,36 @@ impl World {
             Err(e) => return fail(FailureClass::Protocol, format!("recovery failed: {e}")),
         };
         self.store = Some(store);
+        // D263: a DECISION the crash lost may have reserved a seqno recovery
+        // hands out again, as an id or an applied seqno. Its commit is then keyed by its id,
+        // as 0.3.0 keyed a commit whose COMMIT record was lost; an alias below the recovered
+        // next seqno can never be taken again and stays.
+        let next = self.store.as_ref().expect("opened").engine.next_seqno();
+        let lost: Vec<(Seqno, Seqno)> = self
+            .decided_ids
+            .iter()
+            .filter(|(_, (s, _))| *s >= next)
+            .map(|(id, (s, _))| (*id, *s))
+            .collect();
+        if !lost.is_empty() && self.revert_aliases {
+            self.stats.aliases_reverted += lost.len();
+            for (id, s) in &lost {
+                self.decided_ids.remove(id);
+                // An acknowledged commit (its level allowed the loss) is now known by its id.
+                if let Some(mut c) = self.history.remove(s) {
+                    c.seqno = Some(*id);
+                    self.history.insert(*id, c);
+                }
+                for list in self.stream_records.values_mut() {
+                    for (q, _) in list.iter_mut() {
+                        if *q == *s {
+                            *q = *id;
+                        }
+                    }
+                }
+            }
+            wal = self.rekey_decided(raw_wal);
+        }
         // The crash killed every handle, the liveness probe's included.
         self.probe = match self
             .vfs
@@ -4879,7 +5016,20 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
         let (x, shards) = next(&w, &|s| s.len() == 2)?;
         let (coordinator, participant) = (usize::from(shards[0]), usize::from(shards[1]));
         let (pin, _) = next(&w, &|s| s == [coordinator as u16])?;
-        let (y, _) = next(&w, &|s| s == [coordinator as u16])?;
+        // Y must not touch X's rows: a single on a row of an undecided share waits for its
+        // decision (D263), and would then append nothing for the fault to hit.
+        let rows = |ops: &[ModelOp]| -> BTreeSet<(String, Vec<u8>)> {
+            ops.iter()
+                .map(|op| (op_table(op).to_owned(), op_row(op).to_vec()))
+                .collect()
+        };
+        let x_rows = rows(&x);
+        let y = loop {
+            let (y, _) = next(&w, &|s| s == [coordinator as u16])?;
+            if rows(&y).is_disjoint(&x_rows) {
+                break y;
+            }
+        };
         let (z, _) = next(&w, &|s| s == [participant as u16])?;
         let has = |w: &World, stream: usize, kind: RecKind| {
             w.stream_records
@@ -4930,6 +5080,12 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
                 break;
             }
             step(&mut w, coordinator);
+        }
+        if logged(&w) == before {
+            return fail(
+                FailureClass::Protocol,
+                "the injected fault hit no record: Y appended nothing on the coordinator".into(),
+            );
         }
         w.vfs.set_faults(FaultPlan::none());
         w.trace.push("faults off".into());
@@ -4995,6 +5151,133 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
         if !w.in_flight.is_empty() {
             return fail(FailureClass::Protocol, "Z never resolved".into());
         }
+        w.crash_and_recover(CrashKind::Process, false, &mut rng)
+    })();
+    let result = match outcome {
+        Ok(()) => Ok(w.stats),
+        Err(f) => Err(Failure {
+            seed,
+            class: f.class,
+            op_index: w.op_index,
+            message: f.message,
+            trace: std::mem::take(&mut w.trace),
+        }),
+    };
+    if let Some(mut store) = w.store.take() {
+        let _ = store.engine.close();
+        for _ in 0..4 {
+            store.step_shards(vfs.monotonic_nanos());
+        }
+    }
+    result
+}
+
+/// D263's alias revert, driven step by step (perf287). X, a cross-shard commit, logs its
+/// PREPAREs durably and is decided: its DECISION is appended (the harness keys X by the
+/// seqno it applies at), but the write carrying it is still in flight when the power goes. X is unacknowledged; its PREPAREs survive without a decision, so recovery settles
+/// X as never committed, and its next seqno, one past X's id, is X's applied seqno. A single
+/// after the reopen is acknowledged under it. With `revert`, the crash reverted X's alias to
+/// its id, and X was settled under the id; without it, under the seqno the single is
+/// acknowledged under, and the checker must fail.
+pub fn lost_decision_reuses_its_seqno(
+    seed: u64,
+    cfg: &Config,
+    revert: bool,
+) -> Result<Stats, Failure> {
+    let sim = Sim::with_faults(seed, FaultPlan::none());
+    let vfs = sim.vfs();
+    let probe = vfs
+        .open(Path::new("/db/probe"), OpenOptions::read_write_create())
+        .expect("probe");
+    let store = Store::open_cfg(&vfs, cfg.shards, cfg).expect("open");
+    let mut w = World::new(seed, cfg, &vfs, probe, new_model(), store, 0, None);
+    w.revert_aliases = revert;
+    let mut rng = Rng::new(seed);
+    let outcome = (|| -> Result<(), Fail> {
+        let mut commits =
+            Workload::new(seed ^ 0xa11a5, TABLE, cfg.spec.clone()).filter_map(|op| match op {
+                Op::Commit(ops, _) => Some(ops),
+                _ => None,
+            });
+        let mut next = |w: &World, want: &dyn Fn(&[u16]) -> bool| -> Result<_, Fail> {
+            for mut ops in commits.by_ref().take(10_000) {
+                w.prepare_ops(&mut ops);
+                if want(&w.shards_of(&ops)) {
+                    return Ok(ops);
+                }
+            }
+            fail(FailureClass::Protocol, "no workload commit fits".into())
+        };
+        let run = |w: &mut World, ops, durability, rng: &mut Rng| -> Result<(), Fail> {
+            w.submit_plain(ops, durability, true, rng)?;
+            for _ in 0..10_000 {
+                if w.poll_in_flight(rng)? {
+                    w.drain_appended();
+                    return Ok(());
+                }
+                let now = w.vfs.monotonic_nanos();
+                w.store.as_mut().expect("store open").step_shards(now);
+            }
+            fail(FailureClass::Protocol, "a commit never resolved".into())
+        };
+        // A durable single first, so the reopened store has records to recover.
+        let pin = next(&w, &|s| s.len() == 1)?;
+        run(&mut w, pin, Durability::Sync, &mut rng)?;
+        // X's PREPAREs, written and synced (the sim completes I/O as it is submitted).
+        let x = next(&w, &|s| s.len() == 2)?;
+        let x_shards = w.shards_of(&x);
+        w.submit_plain(x, Durability::Sync, true, &mut rng)?;
+        let prepared = |w: &World| {
+            x_shards.iter().all(|s| {
+                w.stream_records
+                    .get(&u32::from(*s))
+                    .is_some_and(|l| l.iter().any(|r| r.1 == RecKind::Prepare))
+            })
+        };
+        let step = |w: &mut World, done: &dyn Fn(&World) -> bool| {
+            for _ in 0..10_000 {
+                for shard in 0..cfg.shards {
+                    let now = w.vfs.monotonic_nanos();
+                    w.store.as_mut().expect("store open").shards[shard].run_once(now + 1_000);
+                    w.drain_appended();
+                    if done(w) {
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+        if !step(&mut w, &prepared) {
+            return fail(
+                FailureClass::Protocol,
+                "X's PREPAREs were not logged".into(),
+            );
+        }
+        // From here I/O waits for the harness, which completes none: X's DECISION is
+        // appended, and its write never runs.
+        w.vfs.set_deferred_io(true);
+        if !step(&mut w, &|w: &World| !w.decided_ids.is_empty()) {
+            return fail(FailureClass::Protocol, "X was not decided".into());
+        }
+        let (&id, &(applied, _)) = w.decided_ids.iter().next().expect("decided");
+        if w.in_flight.is_empty() {
+            return fail(FailureClass::Protocol, "X resolved before the crash".into());
+        }
+        w.trace.push(format!("X: id {id}, applied at {applied}"));
+        w.crash_and_recover(CrashKind::Power, false, &mut rng)?;
+        w.vfs.set_deferred_io(false);
+        let next_seqno = w.store.as_ref().expect("reopened").engine.next_seqno();
+        if next_seqno != applied {
+            return fail(
+                FailureClass::Protocol,
+                format!(
+                    "next seqno {next_seqno} after the crash, not X's applied seqno {applied} (id {id})"
+                ),
+            );
+        }
+        // A single, acknowledged under X's applied seqno.
+        let single = next(&w, &|s| s.len() == 1)?;
+        run(&mut w, single, Durability::Sync, &mut rng)?;
         w.crash_and_recover(CrashKind::Process, false, &mut rng)
     })();
     let result = match outcome {

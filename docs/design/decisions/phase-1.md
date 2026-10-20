@@ -118,6 +118,8 @@ Each segment header records its predecessor's epoch and the offset where the pre
 ## D26 — a cross-shard commit's id is its seqno (approved)
 The coordinator reserves one seqno per cross-shard commit; PREPARE and COMMIT records carry it and no separate commit id exists. Recovery raises `next_seqno` above every seqno in every replayed record, including discarded PREPAREs, so an id is never reused. A coordinator keeps each such seqno in its `held` set, and every `pending` watermark it publishes is `min(held, ..)`, so no snapshot sees half of the commit (FORMAT §11.3).
 
+*Amended by D263 (#717): the id is a seqno reserved at the start and never held or applied; the commit applies at a second seqno reserved and held at its decision, named by the DECISION record (FORMAT §10.3).*
+
 <a id="d27"></a>
 ## D27 — a shared-memory directory plus generation-named regions (approved)
 A one-page directory region with a fixed, never-changing layout records the current generation; the region itself is named with its generation. A writer builds a new generation, marks the old region abandoned, then updates the directory. Readers detect staleness with two atomic loads and re-attach. Changing the name per generation also avoids Windows reusing a named mapping still held by an old process.
@@ -893,6 +895,8 @@ D133 has the coordinator pick a commit timestamp above every participant's publi
 *Amended by D244 (#653): the participant also keeps the PREPARE in seqno order with what it stamped since the coordinator reserved its seqno.*
 
 *Amended by D245 (#637): the check is exact by seqno (the floor in assignment order no longer refuses), and the coordinator raises the participants' floors before it reserves.*
+
+*Amended by D263 (#717): a PREPARE carries no timestamp; the coordinator picks it at the decision above the floor each participant reports with `Prepared`, so no participant checks one.*
 
 <a id="d143"></a>
 ## D143 — Should commits pipelined on one row keep their order during a move (approved; engine)

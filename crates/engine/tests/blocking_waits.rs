@@ -318,7 +318,9 @@ fn a_visibility_wait_ends_when_the_shard_holding_it_dies() {
         thread::park_timeout(Duration::from_millis(1));
     }
     let (on_a, on_b) = tables.join().unwrap();
-    gate.hold(&wal(1));
+    // D263: the seqno is held from the decision, so shard 1's DECISION sync
+    // (its second; its own PREPARE's is the first) is the one held.
+    gate.hold_after(&wal(1), 1);
     drop(
         db.submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
             .unwrap(),

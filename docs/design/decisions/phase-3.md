@@ -1454,6 +1454,8 @@ At those lengths, one flush or compaction more or less, or a placement change, m
   - the shard-count comparison no longer compares seqnos, since a retry's seqno depends on the shard count.
 - **`purge_race`'s lagging-share case** (D192's note) can no longer arise: the share is refused below its participant's floor. The test now checks that the retry leaves the purge alone.
 
+*Amended by D263 (#717): the timestamp is picked at the decision; (i) and (ii) and the `stamps` history go. Per-cell order comes from admission (a single on an undecided share's rows waits for its decision); per tablet a straddle on other rows is allowed and documented.*
+
 <a id="d245"></a>
 ## D245 — A cross-shard commit's timestamp is checked exactly by seqno; its coordinator raises the participants' floors before it reserves; a PREPARE short of room is refused, not held (owner decision, 2026-10-13; engine, tablets, #637, #655, ICR 0042; amends D142, D244)
 
@@ -1498,6 +1500,8 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 - loom models of raise→reserve against reserve→stamp, the straddle and crossing coordinators.
 
 Each part disabled fails its test.
+
+*Amended by D263 (#717): raise-then-reserve happens at the decision, for the seqno the commit applies at; the exact check by seqno goes with D244's history. The room refusal stays.*
 
 <a id="d246"></a>
 ## D246 — Contended cross-shard commits are a judged gate workload (owner decision, 2026-10-13; bench, #406; part of D247)
@@ -1632,6 +1636,8 @@ Each part disabled fails its test.
 **Cost of a dropped future:** a commit whose future is dropped keeps running (as before), and its retries carry the transaction's seqno pin (#672) in `validate`, moved into each retry and never re-created. So under overlap starvation, a dropped commit can hold its seqno pin, and with it compaction's GC of what that snapshot sees, for up to `write_stall_timeout` before it ends with `Busy`. It is accepted: the pin is released on every outcome, and the same bound applies to any waiting commit (D241).
 
 **Shape on the commit path:** `CommitReq`'s inline `Option<Preset>` (32 bytes) becomes `Option<Box<Retried>>` (8), so every queued commit message is smaller. The new check runs only on the existing conditional-PREPARE branch.
+
+*Amended by D263 (#717): every PREPARE that writes a row an undecided share writes, or reads one it writes, is refused with `PendingOverlap` and resolved older-first, not only conditional ones; a retry that runs on one shard releases its earlier participants (#772).*
 
 <a id="d250"></a>
 ## D250 — Language bindings go native-to-Rust where the language allows; the C ABI is for C and FFI-only languages (owner decision, 2026-10-13; bindings, #690, #696–#699; amends the spec's Language scope)
@@ -2047,3 +2053,44 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 **Acceptance (perf2, AX102, da19ecc8 against its base d9616533, 3 reps alternating, `k` traced per pass, `.coord/inbox/archive/20261020-004829-perf2.md`):** on the gate's contended cross-shard row `k` stays 16 for every measured pass in all three reps (base: 13–15 for 74–95% of the passes), measured moves 35 → 1, splits 1 against 4–6, ops/s 337K → 347K (+3%), p99 143 → 144 µs; p99.9 1.17 → 1.49 ms, consistent across reps at equal p99 and without a mechanism found (flagged, not blocking). `C` 8.0 → 18.5 (packing off 8.35 → 19.7). ycsb-a at one and sixteen clients, time-series-ttl and riders default read the same `k` and `C` within noise: they commit on one shard and run none of the changed path. **Why 18.5, where this text first expected about 12:** the row's cross-shard commits span 2–4 consecutive partitions (D246: a coordinator and 1–3 participants, mean 2), not two shards, and they are half the operations and about 53% of the clients' commit time; a participant's span is about 0.9 of the coordinator's, so a round counts about 2.8 where it counted 1 and the store's `C` about 2.0× the base's by that estimate (16–17); the retries of rounds a participant refused as below its timestamp floor (about 0.12 refusals per round on this row; a retry's participants count their attempt again from the client's submit) take it the rest of the way. The bound argument stands: `C` is at most the clients times the shards a commit spans, `k_c` is clamped to `n` (16 here, `want` 16), and nothing in it grows with `k`.
 
 **Tests:** `spin_pool_terms.rs`'s `one_clients_cross_shard_commits_count_at_the_coordinator_and_the_participant` (one blocking client's two-shard commits on two shards that never pack: the participant's counter is above zero and below the coordinator's, the two shards added the same number of spans (one per round each, `Engine::inflight_counts`; a coordinator counting its own share at the decision too adds twice as many, which a ratio of the nanos could not tell apart on every platform: the macOS runner's reply hop reads 1.7× the decision span against 1.1× on Linux), the store reads at most about 2; without the participant's count the first fails, with the coordinator's own share counted the count check fails). D257's simulated tests use the override and pass unchanged.
+
+<a id="d263"></a>
+## D263 — A cross-shard commit takes one round: its PREPAREs carry a provisional id, and its seqno and timestamp are picked at the decision, held only until every participant applied (owner decision, 2026-10-20; engine, wal, format, #717, ICR 0046; amends D26, D142, D244, D245, D249)
+
+**Decided** (option (a) of #717, after the A/B against v0.3.0 and option (b), per-shard visibility, which is shelved):
+- **The id.** A commit's coordinator reserves one seqno from `NEXT_SEQNO` at the start, never held, published as pending or applied: the commit's **id**. Nothing is ever written at it, so a snapshot passes it at once. PREPAREs carry it in their `seqno` field, with `commit_ts` 0. It stays unique for the life of the database as D26's seqno id did: recovery raises `next_seqno` above every replayed record's seqno, discarded PREPAREs included.
+- **The decision** (`decide_commit`, once every participant answered `Prepared` OK):
+  - **`T`** is a default timestamp above every participant's floor: the floor each participant reports with `Prepared` (taken on its own thread after admitting and logging its share), and the published floors, coordinator raises and move raises.
+  - **D245's raise-then-reserve moves here:** `fetch_max(T)` into each participant's `ts_coord_raises`, then the coordinator reserves the seqno `S` the commit applies at, and holds it.
+  - **The hold** lasts from the decision until every participant applied: the DECISION group, `Decide`, apply, `Applied`. An attempt aborted before its decision holds nothing. Until 0.3.0 the seqno was held from the start, across the PREPARE round too, so every single reserved after it on any shard waited for both rounds to be visible.
+  - The coordinator logs a **DECISION** (WAL type 4: id, `S`, `T`, participants; FORMAT §10.3, ICR 0046), and participants apply their shares at `(S, T)`, raising their floors to `T` first.
+- **Admission keeps per-row order and OCC exact while a share is undecided:**
+  - a single that writes a row an undecided share writes or reads, or reads (validate reads, predicate row) a row it writes, waits for the decision, and later singles on the row keep submission order behind it;
+  - a PREPARE that writes such a row, or reads a row an undecided share writes, is refused with `PendingOverlap` and retried on D249's wake, older-first. That was D249's rule for conditional PREPAREs; it now covers every PREPARE;
+  - a share's read rows are tracked beside its written rows (`pending_reads`), on validation-only participants too.
+- **Timestamp order (D11, D142, D244, D245):** exact per cell. Every write to a share's rows on a participant was either stamped before its admission (at or below the floor sent with `Prepared`, which `T` exceeds) or admitted after its apply (above `T`, at a seqno above `S`). Per tablet it holds except in one **straddle**: a single on another row of the share's tablet, reserved before `S` and stamped after the coordinator read that participant's floor, can land above `T` at a seqno below `S`. It reorders two different rows' timestamps, never two versions of one cell, and two decisions can cross the same way only on disjoint rows. By the coordinator's ruling (proposed by perf287), this is documented rather than refused, given `purge_race.rs` and the D142 sweeps pass unmodified (they do; the sweeps' check is unchanged, pairing a PREPARE with its DECISION by id and checking it at `(S, T)`).
+  - D142's, D244's and D245's PREPARE-time checks go (`floor_refusal`, `floor_below`, `stamps`, `stamps_last`, `pruned_max`, D244's (i) raise): a PREPARE has no timestamp to check. `BelowFloor` and `MoveRaise` refusals no longer happen; `refused_below_floor` stays in the metrics, at 0, and a test hook can still force one.
+  - D245's room refusal (`PrepareError::Room`, ICR 0042) is unchanged.
+- **Retries** take a fresh timestamp at their own decision; an aborted attempt never picked one, so nothing is preset.
+- **Recovery** pairs PREPAREs with a DECISION by (coordinator stream, id) and applies them at its `(S, T)`, all or nothing as before; the flushed checks use `S`, and `next_seqno` covers every DECISION's `S`. A type-3 COMMIT (format version 2) replays as before, its PREPAREs at their own seqno and timestamp. A seqno a crash lost (an undecided id, or an `S` whose DECISION was not logged) can be handed out again, as any lost seqno could: nothing durable names it.
+- **Shard death and close:** unchanged. Before the DECISION is written the coordinator answers `Closed` (an abort); after it, `OutcomeUnknown`. `S` is released through `Applied`, or stays held with `not_applied` as before.
+- **The format version** is 3 (ICR 0046): a writable open of an older file rewrites both superblock pages first, so 0.2.x and 0.3.x refuse a file this build wrote with `UnsupportedFormat(3)` instead of failing on a DECISION as corruption or skipping its segment as torn.
+- **Counters:** `CrossShardMetrics::share_waits` and `share_wait_nanos` (engine and public crate), the singles held back behind an undecided share (once per group that held them) and the time a shard held one.
+
+**Why:** #717. Under 0.3.0 a cross-shard commit's seqno was held across both rounds, so the visibility of every single reserved after it waited for the commit's slowest participant twice over.
+- **The A/B** on the AX102 (perf2, 2026-10-20, median of 3, `inbox/done/20261020-200514-perf2-717-ab-results.md`): xs_contention 16 shards / 32 clients / 50% cross-shard +11% ops/s Buffered and +18% GroupSync; the gate's contended cross-shard row +9% (+7% in the `all` run); single-shard p50 37 → 24 µs Buffered and 193 → 104 µs GroupSync. Refused rounds per cross-shard commit on the gate row fell from 0.0102 to 0.0000. ycsb-a/c held.
+- **Costs:**
+  - cross-shard p99.9 rose about 1.5–2× (xs Buffered 510 → 1041 µs, GroupSync 2.1 → 4.3 ms, gate 223 → 340 µs), with p50 unchanged; perf2 is decomposing it (#717), and its fix follows separately;
+  - on `transfer`'s hot rows, about 2% of cross-shard commits held a single back, about 230 µs each (49–62 ms/s over 16 clients); on the uniform rows about 0.00002 per commit;
+  - two seqnos per committed cross-shard round (its id and `S`), so "seqnos used minus commits" overstates wasted rounds by about one per commit.
+- (b) gained more (+22–44%) but changed D19/D227's global prefix for single-shard commits, cost 3.5% on ycsb-c t=1, and grew cross-shard tails more.
+
+**Tests** (`crates/engine/tests/tablets.rs` unless named):
+- `a_blind_single_after_a_validation_only_prepare_lands_above_the_commit` (fails with the single's wait disabled), `a_single_shard_transaction_reading_an_undecided_shares_row_waits_and_conflicts`, and `review.rs::cross_shard_write_skew_is_prevented`: OCC across the decision;
+- `a_single_is_not_held_back_by_a_commit_still_in_its_prepare_round`: the one-round claim;
+- `an_undecided_prepare_left_by_a_crash_is_never_applied_after_more_commits_and_a_crash`: ids are never reused for a stale PREPARE;
+- `a_cross_shard_commit_in_a_0_3_0_wal_replays`: hand-written type-2/3 records replay at their own seqno and timestamp;
+- `a_participant_refuses_a_commit_timestamp_below_its_floor` (a stale published floor): one round, the share above the participant's floor;
+- the D142 sweeps, `cross_shard_commits_converge_on_a_frozen_clock`, `purge_race.rs` unmodified, and `model_check.rs` with a harness that pairs a PREPARE with its DECISION by id (`tests/common/mod.rs`: a decided commit's PREPAREs are rekeyed from id to `S` within the run that appended them, and an alias whose `S` a crash lost is reverted to the id, history included);
+- `crates/pager/tests/format_upgrade.rs`, `crates/engine/tests/format_upgrade.rs`: ICR 0046's upgrade;
+- loom (`src/ts_order_loom.rs`): raise→reserve at the decision keeps every later-seqno single above `T`; the straddle and crossing decisions are reachable.

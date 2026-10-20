@@ -121,6 +121,11 @@ fn seqno_of(rec: &WalRecord<'_>) -> Seqno {
         WalRecord::Batch { seqno, .. }
         | WalRecord::Prepare { seqno, .. }
         | WalRecord::Commit { seqno, .. } => *seqno,
+        WalRecord::Decision {
+            seqno, apply_seqno, ..
+        } => (*seqno).max(*apply_seqno),
+        // `WalRecord::decode` returns no other type in this build (a newer one is corrupt).
+        _ => 0,
     }
 }
 

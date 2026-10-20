@@ -72,9 +72,8 @@ pub(crate) struct Hooks {
     /// The seqnos of cross-shard attempts a participant refused (`Moved` or `BelowFloor`),
     /// whose commit was retried under a new seqno or gave up (`Engine::take_refused_attempts`).
     pub refused: Mutex<Vec<Seqno>>,
-    /// PREPAREs refused by reason (D245): a move's raise, a lower seqno's timestamp above,
-    /// a higher seqno's below, and arena room (`Engine::refusal_counts`).
-    pub refusals: [AtomicU64; 4],
+    /// PREPAREs refused for arena room (D245, `Engine::room_refusals`).
+    pub room_refusals: AtomicU64,
     /// Arms the manifest queue's release window (`manifest::race_window`,
     /// `Engine::probe_manifest_release_window`), and the waiter of the request it pushed.
     pub manifest_race: AtomicBool,
@@ -221,6 +220,9 @@ pub struct AppendedRecord {
     /// timestamp here when its record was checkpointed and compaction dropped every entry
     /// it wrote.
     pub commit_ts: Timestamp,
+    /// A COMMIT's (DECISION's) applied seqno, the commit's `seqno` being its id (D263)
+    ///; 0 for other records.
+    pub apply_seqno: Seqno,
 }
 
 /// The kind of an [`AppendedRecord`].
@@ -276,6 +278,13 @@ impl Engine {
     #[doc(hidden)]
     pub fn live_snapshot_seqnos(&self) -> Vec<Seqno> {
         self.inner.shared.live_seqnos.list()
+    }
+
+    /// The next seqno to reserve (D263: a harness learns which seqnos a crash
+    /// freed for reuse).
+    #[doc(hidden)]
+    pub fn next_seqno(&self) -> Seqno {
+        self.inner.shared.shm.next_seqno()
     }
 
     /// `flush` as a future (test harnesses that drive the shards themselves).
@@ -1021,13 +1030,15 @@ impl Engine {
         )
     }
 
-    /// PREPAREs refused since open, by reason (D245): `[move raise, below (a lower seqno's
-    /// timestamp above), above (a higher seqno's below), arena room]`. Counted only in
-    /// builds with this feature (test hook).
+    /// PREPAREs refused for arena room since open (D245). Counted only in builds with this
+    /// feature (test hook).
     #[doc(hidden)]
-    pub fn refusal_counts(&self) -> [u64; 4] {
-        let r = &self.inner.shared.hooks.refusals;
-        [0, 1, 2, 3].map(|i| r[i].load(Ordering::Relaxed))
+    pub fn room_refusals(&self) -> u64 {
+        self.inner
+            .shared
+            .hooks
+            .room_refusals
+            .load(Ordering::Relaxed)
     }
 
     /// The seqnos of cross-shard attempts refused by a participant (`Moved` or
