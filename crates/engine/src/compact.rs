@@ -359,6 +359,7 @@ pub(crate) fn gc_snapshots(shared: &Shared, tablet: TabletId) -> Vec<Seqno> {
 /// For a counter family it also lists the other sources that may hold a seqno at or below
 /// the newest input seqno (D179): the slot's other SSTs, its memtables (from
 /// `mem_min_seqno`) and the prepared shares (`prepared_seqnos`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn gc_policy(
     shared: &Shared,
     tablet: TabletId,
