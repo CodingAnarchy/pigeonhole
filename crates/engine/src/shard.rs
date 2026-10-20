@@ -124,6 +124,18 @@ fn moved_gives_up(waited: u64, timeout: u64) -> bool {
 /// p99 by 40%, and 64 cut it to 0.65-0.8 ms for 5% (2026-10-20, #764).
 const CHECKPOINT_POP_BUDGET: usize = 64;
 
+/// How many seqnos a coordinator counts and settles from its received `SharesFlushed`
+/// reports in one batch while open (#763): each is a map update and a settle check, and a
+/// flush's report of thousands held the coordinator's turn 4-5 ms. The rest wait in
+/// `reports_pending` for the kicked batches.
+const SETTLE_BUDGET: usize = 256;
+
+/// How many unreported shares a report scan (`report_shares_flushed`) examines in one batch
+/// while open (#763): the scan after a flush covers every share applied since the last one,
+/// 30-50K on the AX102's cross-shard row, 1-3 ms inside the flushing shard's turn. The rest
+/// follows on the kicked batches from `report_cursor`; a closing shard scans everything.
+const REPORT_SCAN_BUDGET: usize = 1024;
+
 /// Handler work left for the next batch (#763): a handler that stops at its budget sets its
 /// bit, `end_batch` sends one `Kick` for all of them, and the kick's batch runs each set bit's
 /// work after the batches in between ran their groups. One kick in the queue at a time.
@@ -138,6 +150,10 @@ struct Continuations {
 impl Continuations {
     /// `advance_checkpoint` stopped at `CHECKPOINT_POP_BUDGET` with more to pop.
     const CHECKPOINT: u8 = 1;
+    /// `settle_reports` stopped at `SETTLE_BUDGET` with reports left in `reports_pending`.
+    const SETTLE: u8 = 2;
+    /// `report_shares_flushed` stopped at `REPORT_SCAN_BUDGET` with its scan at `report_cursor`.
+    const REPORT_SCAN: u8 = 4;
 
     fn set(&mut self, bit: u8) {
         self.due |= bit;
@@ -2472,6 +2488,16 @@ pub(crate) struct ShardState {
     checkpoint_pops: usize,
     /// Handler work left for the next batch, and its kick (#763).
     continuations: Continuations,
+    /// `SharesFlushed` seqnos received and not yet counted and settled: `settle_reports`
+    /// takes `SETTLE_BUDGET` per batch (#763).
+    reports_pending: VecDeque<Seqno>,
+    /// Seqnos `settle_reports` settled in this batch (`end_batch` resets it).
+    settled_in_batch: usize,
+    /// A report scan in progress: the next `unreported` index to examine; `None` when no
+    /// scan is under way (#763).
+    report_cursor: Option<usize>,
+    /// Shares the report scan examined in this batch (`end_batch` resets it).
+    scanned_in_batch: usize,
     /// A wake is armed for the stream's creation to settle (D211, `advance_checkpoint`).
     creation_wake: bool,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
@@ -2792,6 +2818,10 @@ impl ShardState {
             checkpoint_dirty: false,
             checkpoint_pops: 0,
             continuations: Continuations::default(),
+            reports_pending: VecDeque::new(),
+            settled_in_batch: 0,
+            report_cursor: None,
+            scanned_in_batch: 0,
             creation_wake: false,
             aborted: HashSet::new(),
             commit_ckpt: HashSet::new(),
@@ -7122,6 +7152,25 @@ impl ShardState {
         }
     }
 
+    /// Counts and settles the received share reports (`reports_pending`), at most
+    /// `SETTLE_BUDGET` seqnos per batch while the shard is open; the rest wait for the
+    /// kicked batches (#763). A closing shard settles them all.
+    fn settle_reports(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        while let Some(&seqno) = self.reports_pending.front() {
+            if self.settled_in_batch >= SETTLE_BUDGET && !self.closing {
+                self.continuations.set(Continuations::SETTLE);
+                break;
+            }
+            self.reports_pending.pop_front();
+            self.settled_in_batch += 1;
+            // The COMMIT record may not be logged yet (a participant flushed before the
+            // coordinator's group ran): the count waits for it.
+            self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
+            self.settle_if_done(seqno);
+        }
+        self.send_settled(ctx);
+    }
+
     /// Counts a handled `SharesFlushed` or `CommitsSettled` and its seqnos (test hook).
     #[cfg(feature = "test-hooks")]
     fn count_reports(&self, seqnos: usize) {
@@ -7187,29 +7236,42 @@ impl ShardState {
             "shard {}: unreported slot counts drifted",
             self.id.0
         );
-        let moved = unreported_slots_moved(&mut self.unreported_slots, |s| match catalog {
-            Some(c) => c.flushed_through(s.0, s.1),
-            None if self.dropped.contains(&s.0) => None,
-            None => Some(self.flushed.get(s).copied().unwrap_or(0)),
-        });
-        if !moved && self.unreported_unslotted == 0 {
-            trace!(
-                "shard {} report skipped: slots {:?} unreported {}",
-                self.id.0,
-                self.unreported_slots,
-                self.unreported.len()
-            );
-            self.send_settled(ctx);
-            return;
-        }
-        trace!(
-            "shard {} report shares: flushed={:?} unreported={:?}",
-            self.id.0, self.flushed, self.unreported
-        );
+        let mut i = match self.report_cursor {
+            // A scan in progress continues from its cursor (#763).
+            Some(i) => i,
+            None => {
+                let moved = unreported_slots_moved(&mut self.unreported_slots, |s| match catalog {
+                    Some(c) => c.flushed_through(s.0, s.1),
+                    None if self.dropped.contains(&s.0) => None,
+                    None => Some(self.flushed.get(s).copied().unwrap_or(0)),
+                });
+                if !moved && self.unreported_unslotted == 0 {
+                    trace!(
+                        "shard {} report skipped: slots {:?} unreported {}",
+                        self.id.0,
+                        self.unreported_slots,
+                        self.unreported.len()
+                    );
+                    self.send_settled(ctx);
+                    return;
+                }
+                trace!(
+                    "shard {} report shares: flushed={:?} unreported={:?}",
+                    self.id.0, self.flushed, self.unreported
+                );
+                0
+            }
+        };
         // Ordered, so the sends keep a seed replay's message order.
         let mut out: BTreeMap<ShardId, Vec<Seqno>> = BTreeMap::new();
-        let mut i = 0;
         while i < self.unreported.len() {
+            if self.scanned_in_batch >= REPORT_SCAN_BUDGET && !self.closing {
+                // The rest of the scan follows on a kicked batch (#763); a share this
+                // batch skipped is found then, or by the next scan a flush triggers.
+                self.continuations.set(Continuations::REPORT_SCAN);
+                break;
+            }
+            self.scanned_in_batch += 1;
             let u = &self.unreported[i];
             let done = u
                 .slots
@@ -7237,6 +7299,7 @@ impl ShardState {
                 i += 1;
             }
         }
+        self.report_cursor = (i < self.unreported.len()).then_some(i);
         for (coordinator, seqnos) in out {
             self.send(coordinator, ShardMsg::SharesFlushed { seqnos }, ctx);
         }
@@ -8155,6 +8218,9 @@ impl ShardState {
             || self.op.is_some()
             || !self.parked.is_empty()
             || !self.retries.is_empty()
+            // Deferred report work finishes on its kicked batch first (#763).
+            || !self.reports_pending.is_empty()
+            || self.report_cursor.is_some()
         {
             return;
         }
@@ -8485,13 +8551,8 @@ impl ShardState {
             ShardMsg::SharesFlushed { seqnos } => {
                 #[cfg(feature = "test-hooks")]
                 self.count_reports(seqnos.len());
-                // The COMMIT record may not be logged yet (a participant flushed before the
-                // coordinator's group ran): the count waits for it.
-                for seqno in seqnos {
-                    self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
-                    self.settle_if_done(seqno);
-                }
-                self.send_settled(ctx);
+                self.reports_pending.extend(seqnos);
+                self.settle_reports(ctx);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
@@ -8568,6 +8629,17 @@ impl ShardState {
                 let due = self.continuations.take_on_kick();
                 if due & Continuations::CHECKPOINT != 0 {
                     self.advance_checkpoint(ctx);
+                }
+                if due & Continuations::SETTLE != 0 {
+                    self.settle_reports(ctx);
+                    self.advance_checkpoint(ctx);
+                }
+                if due & Continuations::REPORT_SCAN != 0 {
+                    self.report_shares_flushed(ctx);
+                    self.advance_checkpoint(ctx);
+                }
+                if due != 0 {
+                    self.try_finish_close(ctx);
                 }
             }
             ShardMsg::PinSlice => {
@@ -8743,8 +8815,14 @@ impl ShardHandler for ShardState {
             m.logged.store(self.log.len() as u64, Ordering::Relaxed);
             m.checkpoint_pops_max
                 .fetch_max(self.checkpoint_pops as u64, Ordering::Relaxed);
+            m.settled_max
+                .fetch_max(self.settled_in_batch as u64, Ordering::Relaxed);
+            m.report_scan_max
+                .fetch_max(self.scanned_in_batch as u64, Ordering::Relaxed);
         }
         self.checkpoint_pops = 0;
+        self.settled_in_batch = 0;
+        self.scanned_in_batch = 0;
         self.publish_arena();
     }
 }

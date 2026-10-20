@@ -194,6 +194,12 @@ pub(crate) struct ShardCounters {
     /// The most log records the shard's checkpoint popped in one batch (#763's budget),
     /// `Engine::max_checkpoint_pops`.
     pub checkpoint_pops_max: AtomicU64,
+    /// The most received share reports the shard counted and settled in one batch (#763's
+    /// budget), `Engine::max_settled_per_batch`.
+    pub settled_max: AtomicU64,
+    /// The most unreported shares the shard's report scan examined in one batch (#763's
+    /// budget), `Engine::max_report_scan_per_batch`.
+    pub report_scan_max: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -990,6 +996,26 @@ impl Engine {
         self.inner.shared.metrics[shard]
             .hooks
             .checkpoint_pops_max
+            .load(Ordering::Relaxed)
+    }
+
+    /// The most received share reports shard `shard` counted and settled in one batch so far
+    /// (#763: at most the settle budget while open). Test hook.
+    #[doc(hidden)]
+    pub fn max_settled_per_batch(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .settled_max
+            .load(Ordering::Relaxed)
+    }
+
+    /// The most unreported shares shard `shard`'s report scan examined in one batch so far
+    /// (#763: at most the scan budget while open). Test hook.
+    #[doc(hidden)]
+    pub fn max_report_scan_per_batch(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .report_scan_max
             .load(Ordering::Relaxed)
     }
 
