@@ -780,7 +780,6 @@ impl ShardState {
                     submitted_at: req.submitted_at,
                     validate: req.validate,
                     map_version: view.tablets.version(),
-                    commit_ts: retried.preset,
                     epoch: 0,
                     room_wait: None,
                     first_seqno: retried.first_seqno,
@@ -918,7 +917,6 @@ impl ShardState {
             validate: r.validate,
             predicate: None,
             retry: Some(Box::new(Retried {
-                preset: r.commit_ts,
                 first_seqno: r.first_seqno,
                 prev_shards: r.prev_shards,
             })),
@@ -1309,15 +1307,6 @@ impl ShardState {
         // tablet's own floor).
         for s in kind.targets(self.id) {
             let i = usize::from(s.0);
-            let mut raisers = self.shared.ts_raisers[i]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let me = if self.id.0 < 64 { 1u64 << self.id.0 } else { 0 };
-            if self.ts_floor > raisers.0 {
-                *raisers = (self.ts_floor, me);
-            } else if self.ts_floor == raisers.0 {
-                raisers.1 |= me;
-            }
             self.shared.ts_raises[i]
                 .0
                 .fetch_max(self.ts_floor, Ordering::AcqRel);
