@@ -7,7 +7,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ## [Unreleased]
 
 ## [0.3.0] - 2026-10-13
-The **Phase 3 latency engine**: io_uring and direct I/O, an async form of every data operation, commits visible once applied with group syncs shared between them, one-I/O cold gets, thread-per-core shards that are pinned and packed by load, cross-shard commits that stay ordered and cheap under contention, and the work measured against the Phase 3 gate on the reference machine (2026-10-19 at 5933e23e; see [Performance](#performance), and [Known issues](#known-issues) for what carries over to Phase 4). Several defaults and error semantics change; read [Upgrading from 0.2.x](#upgrading-from-02x) first. The file format is unchanged, and files written by 0.2.x open as before; the shared-memory layout moves to version 2, so stop reader processes before upgrading the writer. Includes the fixes released in 0.2.1, 0.2.2 and 0.2.3. Every published crate moves to 0.3.0 together.
+The **Phase 3 latency engine**: io_uring and direct I/O, an async form of every data operation, commits visible once applied with group syncs shared between them, one-I/O cold gets, thread-per-core shards that are pinned and packed by load, cross-shard commits that stay ordered and cheap under contention, and the work measured against the Phase 3 gate on the reference machine (2026-10-20 at 516b59b8; see [Performance](#performance), and [Known issues](#known-issues) for what carries over to Phase 4). Several defaults and error semantics change; read [Upgrading from 0.2.x](#upgrading-from-02x) first. The file format is unchanged, and files written by 0.2.x open as before; the shared-memory layout moves to version 2, so stop reader processes before upgrading the writer. Includes the fixes released in 0.2.1, 0.2.2 and 0.2.3. Every published crate moves to 0.3.0 together.
 
 ### Latency engine: commits
 - **Commits are visible once applied, not once durable** (D227 part 1, amends D19). A shard publishes a group's seqnos once its WAL records are handed to the OS and the group is applied, without waiting for its fsync. A commit's own call still returns only once it is durable at its level and visible, and cross-shard commits are unchanged. Readers, reader processes and backups can therefore see `GroupSync` and `Sync` commits that a power loss then removes; across shards, a later commit can survive an earlier one it was derived from, and a seqno or default timestamp a reader saw can be handed out again after a power loss. The durability guide's "Visibility and durability" section has examples.
@@ -148,41 +148,45 @@ Additions in the crates below `pigeonhole`, for those who build on them directly
 - The simulator's deferred I/O runs the simulated device when the thread that turned deferral on blocks without owner reaping (ICR 0028).
 
 ### Performance
-The Phase 3 gate ([D197](docs/design/decisions/phase-3.md#d197), [#406](https://github.com/CodingAnarchy/pigeonhole/issues/406)) ran on the reference machine, a Hetzner AX102 (16 cores, 32 threads), in the 2026-10-19 window at 5933e23e ([results](crates/bench/baselines/phase3-gate/results/2026-10-19/summary.md)). <GATE:verdict from the 516b59b8 gate; the owner accepted the cross-shard packing rows (D246 `all`, contended cross-shard against RocksDB) and contended ycsb-f (#755) for Phase 4, see [Known issues](#known-issues)>
+The Phase 3 gate ([D197](docs/design/decisions/phase-3.md#d197), [#406](https://github.com/CodingAnarchy/pigeonhole/issues/406)) ran on the reference machine, a Hetzner AX102 (16 cores, 32 threads), in the 2026-10-20 window at 516b59b8 ([results](crates/bench/baselines/phase3-gate/results/2026-10-20/summary.md)). **The owner judged it passed.** The latency, cold-get, group-commit, scan, open, scaling, placement, RocksDB and Phase 2 targets pass, and memtable lookup is accepted under D239. The contended rows outside 1.5× and one run-to-run miss are accepted for Phase 4 and listed under [Known issues](#known-issues).
 
 | Target | Goal | Measured |
 |---|---|--:|
-| Point get in memory | p50 < 2 µs, p99 < 10 µs | p50 0.80 µs, p99 5.79 µs |
-| Memtable lookup at 2^18 entries (D230, D239) | ≤ 300 ns (accepted to 354) | 337 ns (accepted, D239) |
+| Point get in memory | p50 < 2 µs, p99 < 10 µs | p50 0.80 µs, p99 5.98 µs |
+| Memtable lookup at 2^18 entries (D230, D239) | ≤ 300 ns (accepted to 354) | 338 ns (accepted, D239) |
 | Point get on cold data | one I/O | 1.05 device reads per get |
-| Durable group commit (D213, D226) | > 1M cells/s, p99 < 200 µs | 10.38M cells/s, p99 132 µs |
-| Ordered scan from cache | > 1 GB/s per core | 6.43 GB/s |
-| Open to first read | < 5 ms | 2.92 ms (io_uring), 3.42 ms (pread) |
-| Thread-per-core scaling (D231, D238) | ≥ 0.8 × N | 0.94, 1.11, 1.02 at N = 1, 4, 8 (0.64 at 16, reported) |
-| Balancer placement (D223, D231) | busiest ≤ 1.25/N | busiest 29.9%, 14.1%, 7.6% at N = 4, 8, 16 |
-| Every workload against RocksDB | within 1.5× | every workload but cross-shard-contention (RocksDB 1.45× throughput, p99 1.62–1.71×) |
-| Contended cross-shard commits (D246) | within 1.5× of RocksDB; tablets on ≥ 0.8× off (packing off); ≤ 0.1 wasted rounds per cross-shard commit; no `Busy`; p99 ≤ 1.5× RocksDB's, ≤ 2 ms `Buffered`, ≤ 1 ms `GroupSync` | `all`: p99 1.62–1.70× RocksDB's (171–174 µs), the rest met; contended buffered: RocksDB 1.72× throughput, p99 3.77×; contended `GroupSync`: met (RocksDB 1.12×, p99 276 µs) |
+| Durable group commit (D213, D226) | > 1M cells/s, p99 < 200 µs | 10.07M cells/s, p99 133 µs |
+| Ordered scan from cache | > 1 GB/s per core | 6.75 GB/s |
+| Open to first read | < 5 ms | 2.94 ms (io_uring), 3.41 ms (pread) |
+| Thread-per-core scaling (D231, D238) | ≥ 0.8 × N | 1.00, 1.16, 1.02 at N = 1, 4, 8 (0.65 at 16, reported) |
+| Balancer placement (D223, D231) | busiest ≤ 1.25/N | busiest 29.3%, 15.1%, 7.5% at N = 4, 8, 16 |
+| Every workload against RocksDB | within 1.5× | every workload, in both runs (cross-shard-contention: RocksDB 0.96–0.97× throughput, p99 1.28–1.33×) |
+| Contended cross-shard commits (D246) | within 1.5× of RocksDB; tablets on ≥ 0.8× off (packing off); ≤ 0.1 wasted rounds per cross-shard commit; no `Busy`; p99 ≤ 1.5× RocksDB's, ≤ 2 ms `Buffered`, ≤ 1 ms `GroupSync` | `all`: met (tablets on 1.00–1.01× packing off, 0.012–0.013 wasted rounds, p99 137 µs, 1.28–1.32× RocksDB's); contended `GroupSync`: met (RocksDB 1.03×, p99 255 µs, 1.20× RocksDB's); contended buffered: RocksDB 1.34× throughput, p99 2.95× (accepted, [#767](https://github.com/CodingAnarchy/pigeonhole/issues/767)) |
 | Contended, 16 threads, default options, D108 parity (D247) | within 1.5× of RocksDB and SQLite | outside: ycsb-e, cross-shard-contention, counters |
-| Contended, 16 threads, default durability `GroupSync` (D247) | within 1.5× of RocksDB and SQLite | outside: ycsb-e, ycsb-f (p99 against SQLite 2.13×), cross-shard-contention (p99 against SQLite), counters |
-| Phase 2 floors (D193, AX102 baselines D208); #387 | no regression; #387 p99 within 1.5× of SQLite EAV | floors hold in both runs; #387 row read 0.94–1.32×, scan 1.03–1.17× |
-| Run-to-run reproducibility (D243, D259) | p50 ±20% or ±3 µs, p99 ±40% or ±6 µs | <GATE:repro> |
+| Contended, 16 threads, default durability `GroupSync` (D247) | within 1.5× of RocksDB and SQLite | outside: ycsb-e, ycsb-f (p99 against SQLite 2.04×), cross-shard-contention (p99 against SQLite 2.29×), counters |
+| Phase 2 floors (D193, AX102 baselines D208); #387 | no regression; #387 p99 within 1.5× of SQLite EAV | floors hold in both runs; #387 row read 1.28–1.34×, scan 1.12–1.22× |
+| Run-to-run reproducibility (D243, D259) | p50 ±20% or ±3 µs, p99 ±40% or ±6 µs | three metrics outside: group-commit at 16 clients, throughput −21% and p99 +49% (run 1 a fast outlier, accepted, [#768](https://github.com/CodingAnarchy/pigeonhole/issues/768)), and RocksDB's one-client adjacency throughput −20.1% (RocksDB's own variance) |
 
 ### Known issues
 The owner released 0.3.0 with these gaps against the Phase 3 gate; each is a Phase 4 issue under [#695](https://github.com/CodingAnarchy/pigeonhole/issues/695).
 
 Under contention (16 client threads on the default options):
 
-- **Short scans** (ycsb-e: scans of 1–100 rows) trail RocksDB by 3.9× in throughput at buffered and 3.1× at the default durability (scan p99 1.52 ms against RocksDB's 268 µs). At one client they are within 1.5×, so the gap opens with concurrency ([#712](https://github.com/CodingAnarchy/pigeonhole/issues/712)).
-- **Counters:** counter reads have a p99 of 10.5 ms at buffered and 12.8 ms at the default durability at 16 clients (the whole mix's p99 is 78× SQLite's upsert at buffered and 54× at the default) ([#713](https://github.com/CodingAnarchy/pigeonhole/issues/713)).
-- **Transactions on hot rows:** `transfer` (optimistic transactions moving units between Zipfian accounts) runs 37× (buffered) and 8× (default) behind RocksDB, with 1.1 and 10.8 conflicts per transfer ([#708](https://github.com/CodingAnarchy/pigeonhole/issues/708)).
-- **Cross-shard commits:** their p99 trails SQLite's single-writer transactions by 2.45× (266 against 109 µs) at the default durability, and packing gathers mostly cross-shard loads onto fewer shards than they need ([#707](https://github.com/CodingAnarchy/pigeonhole/issues/707)).
-- **The async API at 16 in flight per client** runs at 0.06× the synchronous throughput at buffered (71K ops/s, p99 20 ms; [#749](https://github.com/CodingAnarchy/pigeonhole/issues/749), [#709](https://github.com/CodingAnarchy/pigeonhole/issues/709)).
-- **Application-owned mode on the defaults** runs at 0.19× the pre-split scaling run at buffered ([#710](https://github.com/CodingAnarchy/pigeonhole/issues/710)).
-- **time-series-range** trails RocksDB (1.49× at buffered) where time-series-ttl leads it ([#711](https://github.com/CodingAnarchy/pigeonhole/issues/711)).
-- **Cross-shard commits after packing regrows a store:** a cross-shard store whose write set grows after D257 packed it (pack, then regrow) runs at about <GATE:0.7>× the packing-off throughput for the rest of the session, with p99.9 near <GATE:1> ms; reopening the store, or `Options::tablet_packing(false)` (the bench's `--no-packing`) for such loads, avoids it ([#767](https://github.com/CodingAnarchy/pigeonhole/issues/767)). After the regrow the shards' flushes fall out of step, and each flush still holds a shard for a few milliseconds while it scans and settles cross-shard share reports, so some shard is nearly always stalled. #761, #762 and #764 (which bounds the WAL checkpoint's pops, [#727](https://github.com/CodingAnarchy/pigeonhole/issues/727)) narrow it; moving that work off the shard thread is Phase 4 ([#724](https://github.com/CodingAnarchy/pigeonhole/issues/724)). <GATE:the gate's rows: `all` cross-shard tablets on against packing off, contended buffered cross-shard against RocksDB>
-- **Read-modify-write at the default durability:** ycsb-f's p99 is <GATE:2.13>× SQLite's. With fewer commits in flight than shards, `GroupSync` has nothing to batch, so each commit pays its own fsync ([#755](https://github.com/CodingAnarchy/pigeonhole/issues/755)).
-- **Reads beside writes:** row-read and scan p99 run <GATE:1.7–2.3>× SQLite's while other clients write ([#759](https://github.com/CodingAnarchy/pigeonhole/issues/759)).
-- **sparse-wide puts at buffered:** the put p99 is about <GATE:10>× RocksDB's (<GATE:176 against 17 µs>) ([#760](https://github.com/CodingAnarchy/pigeonhole/issues/760)).
+- **Short scans** (ycsb-e: scans of 1–100 rows) trail RocksDB by 3.9× in throughput at buffered and 3.3× at the default durability (scan p99 1.58 ms against RocksDB's 276 µs at buffered). At one client they are within 1.5×, so the gap opens with concurrency ([#712](https://github.com/CodingAnarchy/pigeonhole/issues/712)).
+- **Counters:** counter reads have a p99 of 10.8 ms at buffered and 17.2 ms at the default durability at 16 clients (the whole mix's p99 is 82× SQLite's upsert at buffered and 52× at the default) ([#713](https://github.com/CodingAnarchy/pigeonhole/issues/713)).
+- **Transactions on hot rows:** `transfer` (optimistic transactions moving units between Zipfian accounts) runs 106× (buffered) and 8.8× (default) behind RocksDB, with 1.2 and 1.8 conflicts per transfer ([#708](https://github.com/CodingAnarchy/pigeonhole/issues/708)).
+- **Cross-shard commits:** at the default durability the mix's p99 trails SQLite's single-writer transactions by 2.29×, and the cross-shard commits' own by 2.05× (255 against 124 µs); packing gathers mostly cross-shard loads onto fewer shards than they need ([#707](https://github.com/CodingAnarchy/pigeonhole/issues/707)).
+- **The async API at 16 in flight per client** runs at 0.41× the synchronous throughput at buffered (473K ops/s, p99 11 ms; [#749](https://github.com/CodingAnarchy/pigeonhole/issues/749), [#709](https://github.com/CodingAnarchy/pigeonhole/issues/709)).
+- **Application-owned mode on the defaults** runs at 0.20× the pre-split scaling run at buffered ([#710](https://github.com/CodingAnarchy/pigeonhole/issues/710)).
+- **time-series-range** trails RocksDB (1.07× at buffered, 1.03× at the default) where time-series-ttl leads it (0.31×) ([#711](https://github.com/CodingAnarchy/pigeonhole/issues/711)).
+- **Cross-shard commits after packing regrows a store:** a cross-shard store whose write set grows after D257 packed it (pack, then regrow) runs at about 0.7× the packing-off throughput for the rest of the session, with p99.9 near 1 ms; reopening the store, or `Options::tablet_packing(false)` (the bench's `--no-packing`) for such loads, avoids it ([#767](https://github.com/CodingAnarchy/pigeonhole/issues/767)). After the regrow the shards' flushes fall out of step, and each flush still holds a shard for a few milliseconds while it scans and settles cross-shard share reports, so some shard is nearly always stalled. #761, #762 and #764 (which bounds the WAL checkpoint's pops, [#727](https://github.com/CodingAnarchy/pigeonhole/issues/727)) narrow it; moving that work off the shard thread is Phase 4 ([#724](https://github.com/CodingAnarchy/pigeonhole/issues/724)). The gate's own cross-shard rows do not pack during their load: tablets on ran at 1.00–1.01× packing off in `all` and 0.97× contended at buffered, where Pigeonhole still trails RocksDB by 1.34× in throughput with a 2.95× p99 (113 against 38 µs).
+- **Read-modify-write at the default durability:** ycsb-f's p99 is 2.04× SQLite's. With fewer commits in flight than shards, `GroupSync` has nothing to batch, so each commit pays its own fsync ([#755](https://github.com/CodingAnarchy/pigeonhole/issues/755)).
+- **Reads beside writes:** row-read and scan p99 run 1.8–2.2× SQLite's while other clients write (ycsb-a, ycsb-f, sparse-wide and time-series-ttl) ([#759](https://github.com/CodingAnarchy/pigeonhole/issues/759)).
+- **sparse-wide puts at buffered:** the put p99 is about 30× RocksDB's (498 against 17 µs) ([#760](https://github.com/CodingAnarchy/pigeonhole/issues/760)).
+
+Run to run:
+
+- The gate's two runs of `all` differed past D243's tolerance on group-commit at 16 clients (throughput −21%, p99 +49%: run 1 was a fast outlier) ([#768](https://github.com/CodingAnarchy/pigeonhole/issues/768)). RocksDB's one-client adjacency throughput also moved −20.1%, which is RocksDB's own variance.
 
 Placement and tails:
 
