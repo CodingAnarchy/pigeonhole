@@ -1,6 +1,6 @@
 # Recovering from a failed shard
 
-> **Status:** this page describes `main` (not in 0.2.2): `is_failed`, `failure` and `ErrorCode::OutcomeUnknown` are new.
+> **Status:** this page describes `main`; `is_failed`, `failure` and `ErrorCode::OutcomeUnknown` are new in 0.3.0.
 
 A Pigeonhole instance runs one thread per shard. A shard can fail on its own:
 - its thread panics (a bug);
