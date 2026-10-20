@@ -1,2 +1,0 @@
-### Fixed
-- An async commit waiting for admission behind its shard's earlier commits could, in principle, miss the wake when a charge returned at the same moment it queued, and stay queued until another commit on that shard resolved or the engine closed. The return now reads the waiter count in a way that can't miss a waiter that queued meanwhile (#645). Found by a new loom model; not observed on hardware.
