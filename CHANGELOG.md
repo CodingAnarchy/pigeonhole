@@ -6,7 +6,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
-## [0.2.3] - 2026-10-14
+## [0.2.3] - 2026-10-20
 A fix for a lost write under concurrent cross-shard and single-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 to 0.2.2 open as before. Every published crate moves to 0.2.3 together.
 
 **Known issue (#655, also in 0.2.2):** a cross-shard commit that finds a participant's memtable arena full waits for room while holding its sequence number, and that participant's flush waits for the same sequence number to become visible. With a real clock the wait ends at the write-stall timeout (`Options::write_stall_timeout`, 30 s by default): the commit, and writes queued behind it on that shard, get `Busy` and can be retried. It needs a full arena, so a larger `Options::memtable_budget` makes it rarer. 0.3.0 refuses such a commit and retries it once room frees, instead of letting it wait (D245).
