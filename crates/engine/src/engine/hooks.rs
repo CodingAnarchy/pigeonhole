@@ -69,7 +69,8 @@ pub(crate) struct Hooks {
     pub compactions: Mutex<Vec<CompactionRecord>>,
     /// Every WAL record appended, in append order (`Engine::take_appended`).
     pub appended: Mutex<Vec<AppendedRecord>>,
-    /// The seqnos of cross-shard attempts a participant refused (`Moved` or `BelowFloor`),
+    /// The seqnos of cross-shard attempts a participant refused (`Moved`, `Room` or
+    /// `PendingOverlap`),
     /// whose commit was retried under a new seqno or gave up (`Engine::take_refused_attempts`).
     pub refused: Mutex<Vec<Seqno>>,
     /// PREPAREs refused for arena room (D245, `Engine::room_refusals`).
@@ -177,8 +178,8 @@ pub(crate) struct ShardCounters {
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
-    /// PREPAREs the shard refuses below its floor before routing them as usual
-    /// (`Engine::refuse_prepares`).
+    /// PREPAREs the shard refuses as overlapping an undecided share before routing them as
+    /// usual (`Engine::refuse_prepares`).
     pub refuse_prepares: AtomicU64,
     /// `SharesFlushed` and `CommitsSettled` messages the shard handled
     /// (`Engine::share_reports`, D254).
@@ -572,9 +573,10 @@ impl Engine {
         Ok(())
     }
 
-    /// Makes shard `shard` refuse the next `n` PREPAREs below its floor, whatever their
-    /// timestamps, as a stamp race would (test hook: the cost of refused rounds). Each refused
-    /// round aborts, and its coordinator retries at once.
+    /// Makes shard `shard` refuse the next `n` PREPAREs as overlapping an undecided share
+    /// (`PendingOverlap`), whatever their rows (test hook: the cost of refused rounds). Each
+    /// refused round aborts with no record on that shard, and its coordinator retries once
+    /// the abort's decision there wakes it.
     #[doc(hidden)]
     pub fn refuse_prepares(&self, shard: usize, n: u64) {
         self.inner.shared.metrics[shard]
@@ -1041,8 +1043,8 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
-    /// The seqnos of cross-shard attempts refused by a participant (`Moved` or
-    /// `BelowFloor`, D244) since the last call, when recording is on
+    /// The seqnos of cross-shard attempts refused by a participant (`Moved`, `Room` or
+    /// `PendingOverlap`) since the last call, when recording is on
     /// ([`record_history`](Self::record_history)): their PREPAREs never get a COMMIT, and the
     /// commit runs again under a new seqno or gives up with `Busy`.
     #[doc(hidden)]

@@ -303,7 +303,7 @@ impl ShardState {
     }
 
     /// A PREPARE's admission routing: routed as any member (D263); a test hook can refuse it
-    /// as below the floor.
+    /// as overlapping an undecided share.
     #[inline(never)]
     fn route_prepare(&mut self, m: Member, ctx: &mut ShardContext<'_, ShardMsg>) -> Option<Member> {
         #[cfg(feature = "test-hooks")]
@@ -313,8 +313,8 @@ impl ShardState {
                 .refuse_prepares;
             if forced.load(Ordering::Acquire) > 0 {
                 forced.fetch_sub(1, Ordering::AcqRel);
-                self.shared.metrics[usize::from(self.id.0)].count_refusal(CrossRefusal::BelowFloor);
-                self.refuse_prepare(m, PrepareError::BelowFloor, ctx);
+                // Nothing here overlaps it, so the abort's decision wakes its coordinator.
+                self.refuse_for_overlap(m, ctx);
                 return None;
             }
         }
@@ -678,8 +678,8 @@ impl ShardState {
     }
 
     /// A PREPARE refused without a record: for rows this shard is moving or no longer owns
-    /// (`Moved`: the coordinator retries through the new tablet map), or as forced by a test
-    /// hook (`BelowFloor`: the coordinator retries).
+    /// (`Moved`: the coordinator retries through the new tablet map), for arena room or an
+    /// undecided share's rows (the coordinator retries on this shard's wake).
     fn refuse_prepare(
         &mut self,
         m: Member,

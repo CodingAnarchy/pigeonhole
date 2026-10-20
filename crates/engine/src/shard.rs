@@ -259,21 +259,16 @@ pub(crate) struct CrossShardCounters {
 /// Why a participant refused a PREPARE (ICR 0043).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CrossRefusal {
-    /// The commit timestamp is below a default timestamp this shard already assigned (D11).
-    BelowFloor = 0,
-    /// The commit timestamp is below the floor a shard that handed this one a tablet raised
-    /// it to (`ts_raises`, D11), and not below its own.
-    MoveRaise = 1,
     /// A row's tablet is being split, merged or moved, or now lives elsewhere (`Moved`).
-    Moved = 2,
+    Moved = 0,
     /// The share had to wait for arena room (ICR 0042).
-    Room = 3,
+    Room = 1,
     /// The share overlapped an undecided share or an earlier member's rows (D249, ICR 0045).
-    PendingOverlap = 4,
+    PendingOverlap = 2,
 }
 
 impl CrossRefusal {
-    const COUNT: usize = 5;
+    const COUNT: usize = 3;
 }
 
 impl ShardMetrics {
@@ -998,11 +993,6 @@ pub(crate) enum PrepareError {
     /// A row's tablet is being split, merged or moved, or now lives on another shard: the
     /// coordinator retries through the new tablet map.
     Moved,
-    /// Refused as below this shard's timestamp floor: since D263 a PREPARE carries no
-    /// timestamp, and only a test hook (`Engine::refuse_prepares`) refuses one so. The
-    /// coordinator retries at once.
-    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
-    BelowFloor,
     /// The PREPARE would wait for arena room (D245, ICR 0042): refused instead (before D263
     /// its held seqno kept the memtables it waited on from freezing, D227; kept unchanged);
     /// the coordinator retries once the participant reports room freed in a later
@@ -1025,7 +1015,6 @@ impl From<PrepareError> for Error {
         match e {
             PrepareError::Conflict => Error::Conflict,
             PrepareError::Moved
-            | PrepareError::BelowFloor
             | PrepareError::Room(_)
             | PrepareError::PendingOverlap
             | PrepareError::Busy => Error::Busy,
@@ -1399,8 +1388,6 @@ struct Coord {
     validate: Option<Box<Validate>>,
     map_version: u64,
     moved: bool,
-    /// A participant refused `commit_ts` as below its floor: the retry takes a fresh one.
-    below_floor: bool,
     /// A participant refused the PREPARE rather than wait for arena room (D245, ICR 0042),
     /// in that room generation: the retry waits until it reports room freed after it.
     room: Option<(ShardId, u64)>,
@@ -6579,13 +6566,12 @@ impl ShardState {
                 committing: false,
                 not_applied: false,
                 shards: shards.clone(),
-                // Kept for a retry: a participant may refuse with `Moved` (tablet changes
-                // on) or `BelowFloor` (either way, D244).
+                // Kept for a retry: a participant may refuse with `Moved`, `Room` or
+                // `PendingOverlap`.
                 parts: req.parts.clone(),
                 validate: req.validate.clone(),
                 map_version: req.map_version,
                 moved: false,
-                below_floor: false,
                 room: None,
                 commit_ts,
                 apply_seqno: 0,
@@ -6731,10 +6717,6 @@ impl ShardState {
         c.commit_ts = c.commit_ts.max(floor);
         match error {
             Some(PrepareError::Moved) => c.moved = true,
-            Some(PrepareError::BelowFloor) => {
-                c.moved = true;
-                c.below_floor = true;
-            }
             Some(PrepareError::Room(generation)) => {
                 // Not a timestamp refusal: the retry may keep its timestamp. Only the first
                 // participant that refused for room is waited on: another one may refuse
@@ -7075,9 +7057,9 @@ impl ShardState {
             && let Some(reply) = c.reply.take()
         {
             // A participant was splitting, merging or moving a tablet: the commit was
-            // aborted everywhere and runs again once the tablet map has changed. One that
-            // refused the timestamp as below its floor runs again at once, with a fresh one.
-            // Either gives up once it has waited the write-stall timeout (D241).
+            // aborted everywhere and runs again once the tablet map has changed, or once the
+            // participant that refused it for room or an overlap wakes it. It gives up once
+            // it has waited the write-stall timeout (D241).
             #[cfg(feature = "test-hooks")]
             if self.recording() {
                 self.shared
@@ -7132,8 +7114,6 @@ impl ShardState {
                     self.retries.push(req);
                     self.arm_tablet_timer(ctx);
                 }
-            } else if c.below_floor {
-                self.retry(req, ctx);
             } else {
                 self.retries.push(req);
                 self.run_retries(ctx);
