@@ -576,14 +576,19 @@ impl ShardState {
     }
 
     /// After a decision here (D249): wakes the coordinators refused over an overlap that has
-    /// cleared. One waiting behind an older commit is woken by that commit's next attempt's
-    /// decision here (a later seqno than the share it met), or its last; any other once no
-    /// undecided share here holds its rows.
+    /// cleared. One waiting behind an older commit is woken once that commit's next attempt
+    /// here (a later seqno than the share it met) commits, or by its last; any other once
+    /// no undecided share here holds its rows. Not by an aborted attempt (D263): the older
+    /// commit's attempt may have been refused elsewhere over the younger one's share, at the
+    /// younger one's own coordinator, and woken together they would cross again on every
+    /// round. The younger one holds no share while it waits, so the older one's retry
+    /// meets none of its shares.
     #[inline(never)]
     pub(super) fn release_overlaps(
         &mut self,
         seqno: Seqno,
         priority: CommitPriority,
+        commit: bool,
         last: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
@@ -591,7 +596,7 @@ impl ShardState {
         while i < self.overlap_refused.len() {
             let r = &self.overlap_refused[i];
             let go = match r.behind {
-                Some((older, met)) => older == priority && (last || seqno > met),
+                Some((older, met)) => older == priority && (last || (commit && seqno > met)),
                 None => !r.rows.iter().any(|h| {
                     self.pending_rows.contains_key(h) || self.pending_reads.contains_key(h)
                 }),

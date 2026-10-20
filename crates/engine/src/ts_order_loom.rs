@@ -75,11 +75,11 @@ fn loom_a_later_seqno_never_stamps_below_the_coordinators_timestamp() {
 }
 
 #[test]
-fn loom_crossing_decisions_are_reachable_and_ordered_by_seqno_otherwise() {
+fn loom_crossing_decisions_are_reachable() {
     // Two coordinators decide concurrently: one can read the floors before the other's raise
     // and reserve after its seqno (S1 < S2, T1 > T2). D263 allows that between shares on
     // different rows (two shares on one row never are undecided together at a participant,
-    // which refuses the second PREPARE). Without the crossing, seqno and timestamp agree.
+    // which refuses the second PREPARE).
     use std::sync::atomic::AtomicBool as StdBool;
     static CROSSED: StdBool = StdBool::new(false);
     loom::model(|| {

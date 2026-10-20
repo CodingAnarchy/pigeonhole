@@ -1113,8 +1113,8 @@ pub(crate) enum ShardMsg {
         seqno: Seqno,
         from: ShardId,
         error: Option<PrepareError>,
-        /// The participant's timestamp floor once its share was admitted and logged (D263)
-        ///: the decision's timestamp goes above it, whatever the published
+        /// The participant's timestamp floor once its share was admitted and logged (D263):
+        /// the decision's timestamp goes above it, whatever the published
         /// floors read.
         floor: Timestamp,
     },
@@ -1472,8 +1472,8 @@ pub(crate) struct OverlapRefusal {
     /// holds any of them.
     pub rows: Vec<u64>,
     /// An older commit one of whose shares it overlapped, and that share's seqno: it waits
-    /// for that commit's next attempt here to be decided, or its last, or for it to retry
-    /// elsewhere (`Released`), so the older one goes first (older-first, D249).
+    /// for that commit's next attempt here to commit, or its last, or for it to retry
+    /// elsewhere (`Released`), so the older one goes first (older-first, D249, D263).
     pub behind: Option<(CommitPriority, Seqno)>,
 }
 
@@ -2346,8 +2346,8 @@ pub(crate) struct ShardState {
     purge_voids: HashMap<(TabletId, FamilyId), u32>,
     /// Rows (hashed with their table) of prepared, undecided shares, with a count per row.
     pending_rows: FastMap<u64, u32>,
-    /// Rows (hashed) undecided shares' commits read here, with a count per row (D263)
-    ///: a write to one waits for (or a PREPARE is refused until) the decision,
+    /// Rows (hashed) undecided shares' commits read here, with a count per row (D263):
+    /// a write to one waits for (or a PREPARE is refused until) the decision,
     /// since the share's seqno, reserved at the decision, would otherwise land above a write
     /// its validation never saw.
     pending_reads: FastMap<u64, u32>,
@@ -4931,6 +4931,10 @@ impl ShardState {
             // retried once the overlap clears (D249's refusal, for every PREPARE now).
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) && self.overlaps_undecided(&m) {
                 if matches!(m.kind, MemberKind::Single) {
+                    if self.end_share_wait(&mut m) {
+                        self.settle(m, Ok(()), ctx);
+                        continue;
+                    }
                     trace!(
                         "shard {} single waits for an undecided share (pending {})",
                         self.id.0,
@@ -4957,6 +4961,10 @@ impl ShardState {
                 // for the next group: that is this shard's own write, waiting on no other
                 // coordinator (D249). A single also waits for an undecided share's decision.
                 if same_group || (pending_share && matches!(m.kind, MemberKind::Single)) {
+                    if !same_group && self.end_share_wait(&mut m) {
+                        self.settle(m, Ok(()), ctx);
+                        continue;
+                    }
                     self.hold_rows(&m);
                     self.pending.push(m);
                     continue;
@@ -5086,8 +5094,8 @@ impl ShardState {
                 if let Some((table, row, _)) = m.predicate.as_deref() {
                     reads.push(hash_row(*table, row));
                 }
-                // The share lands at its decision's timestamp, above this floor (D263)
-                //: a lower bound for compaction's and flush's GC.
+                // The share lands at its decision's timestamp, above this floor (D263):
+                // a lower bound for compaction's and flush's GC.
                 let floor = self.ts_floor + 1;
                 if let Some(share) = self.prepared.get_mut(&m.seqno)
                     && !share.tracked
@@ -6414,6 +6422,20 @@ impl ShardState {
         }
     }
 
+    /// Whether a single about to wait for an undecided share's decision ends instead, with
+    /// `Closed` (set in `m.failed`): after a shard's death no commit is accepted (D227), and
+    /// the share's coordinator may be the dead shard, so the decision may never come, as
+    /// `run_retries` ends room and overlap waits (D245, D249). The single was never
+    /// written, so `Closed` (not committed) is exact. Conditional singles too.
+    fn end_share_wait(&self, m: &mut Member) -> bool {
+        if !self.shared.shard_died.load(Ordering::Acquire) {
+            return false;
+        }
+        trace!("shard {} ends a share-held single: a shard died", self.id.0);
+        m.failed = Some(Error::Closed);
+        true
+    }
+
     /// D263: whether `m` (a single or a PREPARE) writes a row an undecided
     /// share writes or reads here, or (a PREPARE or a conditional single) reads one an
     /// undecided share writes. The share's seqno is reserved only at its decision, so such a
@@ -6573,6 +6595,15 @@ impl ShardState {
 
     fn start_coordination(&mut self, req: CoordinateReq, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.closing || self.poisoned {
+            // A retry ending here runs no further two-phase attempt: commits refused behind
+            // it at its earlier participants (this shard among them) stop waiting (D249,
+            // #772).
+            if !req.prev_shards.is_empty() {
+                let priority = (req.submitted_at, req.first_seqno);
+                for p in &req.prev_shards {
+                    self.send(*p, ShardMsg::Released { priority }, ctx);
+                }
+            }
             req.reply.notify(Err(if self.closing {
                 Error::Closed
             } else {
@@ -6910,7 +6941,7 @@ impl ShardState {
         self.decide_share(seqno, commit, at, coordinator, ctx);
         // Commits refused here over an overlap may retry now (D249).
         if !self.overlap_refused.is_empty() {
-            self.release_overlaps(seqno, priority, last, ctx);
+            self.release_overlaps(seqno, priority, commit, last, ctx);
         }
     }
 

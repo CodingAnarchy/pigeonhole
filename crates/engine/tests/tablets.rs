@@ -3770,6 +3770,17 @@ fn cross_shard_commits_converge_on_a_frozen_clock() {
     }
 }
 
+#[test]
+fn crossing_commits_regressions_from_the_seed_sweep() {
+    // Seed 277 (#774's sweep): two crossing commits re-crossed on every round. The older one
+    // was refused at the younger one's coordinator over its own share; the younger one,
+    // refused behind the older one, was woken when the older one's attempt aborted there,
+    // and both retried at once. A commit behind an older one now waits for that commit's
+    // next attempt to commit, or its last (D263).
+    d142_sweep(277, true, false);
+    d142_sweep(277, false, false);
+}
+
 /// The same with tablet changes off (D244): three tables, one per shard (placement is
 /// round-robin), and no moves.
 #[test]

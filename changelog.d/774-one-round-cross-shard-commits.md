@@ -4,3 +4,6 @@
 
 ### Added
 - `CrossShardMetrics::share_waits` and `share_wait_nanos`: single-shard commits held back behind an undecided cross-shard commit's rows, and for how long (ICR 0046).
+
+### Fixed
+- A cross-shard commit refused behind an older one (D249) waited for ever if the older commit's retry was answered with an error at its own coordinator, whose WAL had failed or which was closing, before any further attempt: the retry now releases the commits waiting behind it. In 0.3.x this hit cross-shard transactions and `commit_if` after an I/O error (#776).

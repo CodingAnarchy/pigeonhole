@@ -187,6 +187,19 @@ fn harness_regressions_from_the_seed_sweep() {
     cfg.reopen_shards = vec![1, 5, 2, 8, 4];
     cfg.deferred_io = true;
     check(41, &cfg);
+    // #774's sweep (D263): a retried cross-shard commit whose coordinator's stream had
+    // failed was answered with the I/O error before any further attempt, and the commit
+    // refused behind it at its earlier participants (its coordinator among them) waited for
+    // ever. Its coordinator now sends them `Released`. Seed 266 without deferred I/O, and
+    // seeds 19, 88 and 240 of the read-error runs with it.
+    let mut cfg = io_errors_config();
+    cfg.deferred_io = false;
+    check(266, &cfg);
+    let mut cfg = read_error_txn_config();
+    cfg.deferred_io = true;
+    for seed in [19, 88, 240] {
+        check(seed, &cfg);
+    }
 }
 
 #[test]
@@ -514,11 +527,7 @@ fn crash_at_every_write_point() {
 fn io_errors_poison_shards_and_recover_on_reopen() {
     // Random read and write failures: a failed write or sync poisons the stream, commits
     // on it fail until the reopen, and whatever was acknowledged survives.
-    let mut cfg = Config::standard(250);
-    cfg.faults.io_error_ppm = 8_000;
-    cfg.crash_ppm = 5_000;
-    cfg.mid_commit_crash_ppm = 5_000;
-    cfg.shards = 3;
+    let cfg = io_errors_config();
     for seed in seeds() {
         let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
         eprintln!("seed {seed}: {stats:?}");
@@ -527,6 +536,16 @@ fn io_errors_poison_shards_and_recover_on_reopen() {
             "seed {seed}: no I/O error was injected"
         );
     }
+}
+
+/// [`io_errors_poison_shards_and_recover_on_reopen`]'s configuration.
+fn io_errors_config() -> Config {
+    let mut cfg = Config::standard(250);
+    cfg.faults.io_error_ppm = 8_000;
+    cfg.crash_ppm = 5_000;
+    cfg.mid_commit_crash_ppm = 5_000;
+    cfg.shards = 3;
+    cfg
 }
 
 #[test]
