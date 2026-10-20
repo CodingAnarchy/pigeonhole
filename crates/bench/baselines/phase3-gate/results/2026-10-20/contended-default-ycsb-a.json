@@ -1,0 +1,442 @@
+{
+  "format": 1,
+  "environment": {
+    "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor",
+    "cores": 32,
+    "memory_bytes": 134514339840,
+    "os": "linux 6.8.0-139-generic",
+    "arch": "x86_64",
+    "filesystem": "xfs",
+    "reference": false,
+    "label": "non-reference (D5)",
+    "profile": "release",
+    "git_rev": "516b59b8f230",
+    "started_unix": 1792495682,
+    "load_average": 12.6
+  },
+  "results": [
+    {
+      "store": "pigeonhole",
+      "store_config": "shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync(default) load=buffered tablets=on",
+      "workload": "ycsb-a",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 28802734,
+      "value_len": 100,
+      "threads": 16,
+      "load_secs": 10.757770616,
+      "run_secs": 64.891579002,
+      "throughput": 443859.34882417147,
+      "p50_ns": 32511,
+      "p99_ns": 104959,
+      "p999_ns": 161791,
+      "mean_ns": 35610,
+      "max_ns": 48014124,
+      "warmup_ops": 5000,
+      "detail": {
+        "store_bytes": 2818572288,
+        "busy_retries": 0,
+        "reads": {
+          "cold": {
+            "count": 432094,
+            "p50_ns": 16767,
+            "p99_ns": 34303,
+            "p999_ns": 73215
+          },
+          "hot": {
+            "count": 13967187,
+            "p50_ns": 14783,
+            "p99_ns": 38143,
+            "p999_ns": 58111
+          }
+        },
+        "by_type": [
+          {
+            "op": "put",
+            "stats": {
+              "count": 14403453,
+              "p50_ns": 51711,
+              "p99_ns": 119295,
+              "p999_ns": 188415
+            },
+            "mean_ns": 57068
+          },
+          {
+            "op": "row read",
+            "stats": {
+              "count": 14399281,
+              "p50_ns": 14911,
+              "p99_ns": 38143,
+              "p999_ns": 58623
+            },
+            "mean_ns": 14146
+          }
+        ],
+        "shards": [
+          {
+            "commits": 946389,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 13409190010,
+            "commit_inflight_nanos": 47625081913
+          },
+          {
+            "commits": 1116036,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 15813061430,
+            "commit_inflight_nanos": 59056638355
+          },
+          {
+            "commits": 756265,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 10973022703,
+            "commit_inflight_nanos": 35707386026
+          },
+          {
+            "commits": 913504,
+            "tablets_start": 1,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 12965105456,
+            "commit_inflight_nanos": 46252433331
+          },
+          {
+            "commits": 733427,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 11450567762,
+            "commit_inflight_nanos": 36521955888
+          },
+          {
+            "commits": 1070365,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 14914546911,
+            "commit_inflight_nanos": 55202149411
+          },
+          {
+            "commits": 1142364,
+            "tablets_start": 2,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 15417759442,
+            "commit_inflight_nanos": 61790077709
+          },
+          {
+            "commits": 767860,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 11102755267,
+            "commit_inflight_nanos": 36934484801
+          },
+          {
+            "commits": 817022,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 1,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 11969672895,
+            "commit_inflight_nanos": 40402784670
+          },
+          {
+            "commits": 965920,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 13380431012,
+            "commit_inflight_nanos": 49492934853
+          },
+          {
+            "commits": 875247,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 12293475402,
+            "commit_inflight_nanos": 43890683554
+          },
+          {
+            "commits": 1197572,
+            "tablets_start": 1,
+            "tablets_end": 2,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 17106682670,
+            "commit_inflight_nanos": 66536341364
+          },
+          {
+            "commits": 858647,
+            "tablets_start": 1,
+            "tablets_end": 2,
+            "splits": 1,
+            "merges": 0,
+            "moves": 1,
+            "busy_nanos": 12580299015,
+            "commit_inflight_nanos": 44395585428
+          },
+          {
+            "commits": 1007641,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 13877070615,
+            "commit_inflight_nanos": 52459020236
+          },
+          {
+            "commits": 932245,
+            "tablets_start": 1,
+            "tablets_end": 1,
+            "splits": 0,
+            "merges": 0,
+            "moves": 0,
+            "busy_nanos": 13260018526,
+            "commit_inflight_nanos": 48805211994
+          },
+          {
+            "commits": 302949,
+            "tablets_start": 1,
+            "tablets_end": 0,
+            "splits": 0,
+            "merges": 0,
+            "moves": 2,
+            "busy_nanos": 4543471316,
+            "commit_inflight_nanos": 16177682310
+          }
+        ],
+        "stalls": {
+          "write_stalls": 0,
+          "write_stall_nanos": 0,
+          "flushes": 151,
+          "compactions": 39,
+          "unpin_passes": 1,
+          "unpin_flushes": 1,
+          "wal_inline_syncs": 0,
+          "file_growths": 0,
+          "file_growth_nanos": 0,
+          "file_growths_ahead": 13,
+          "shard_parks": 1627887,
+          "shard_wakes": 12617800,
+          "commit_parks": 14403406,
+          "visibility_waits": 41017,
+          "visibility_scanned": 0,
+          "visibility_wake_passes": 26861,
+          "visibility_woken": 41017,
+          "visibility_contended": 6555,
+          "wal_rollover_blocks": 0,
+          "slot_refusals": 0,
+          "row_cache_hits": 4668614,
+          "row_cache_misses": 9657354,
+          "row_cache_fills": 6736013,
+          "xshard_rounds": 0,
+          "xshard_refused_rounds": 0,
+          "xshard_refused_below_floor": 0,
+          "xshard_refused_move_raise": 0,
+          "xshard_refused_moved": 0,
+          "xshard_refused_room": 0,
+          "xshard_refused_pending_overlap": 0
+        },
+        "engine_commit": null,
+        "settle": {
+          "millis": 1579,
+          "settled": true,
+          "work": 12
+        },
+        "background_work": 190,
+        "warmup_secs": 17.152566003,
+        "warmup_settled": true,
+        "riders": null,
+        "capped": false,
+        "close_ms": 552.288892,
+        "txn_conflicts": 0,
+        "seqnos_used": 14403453
+      }
+    },
+    {
+      "store": "rocksdb",
+      "store_config": "write_buffer=64MiB cache=256MiB bloom=10 sync load=buffered",
+      "workload": "ycsb-a",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 13696021,
+      "value_len": 100,
+      "threads": 16,
+      "load_secs": 6.931879403,
+      "run_secs": 71.475776627,
+      "throughput": 191617.6591053132,
+      "p50_ns": 76287,
+      "p99_ns": 209919,
+      "p999_ns": 248831,
+      "mean_ns": 83306,
+      "max_ns": 32538773,
+      "warmup_ops": 5000,
+      "detail": {
+        "store_bytes": 1442743911,
+        "busy_retries": 0,
+        "reads": {
+          "cold": {
+            "count": 380526,
+            "p50_ns": 19199,
+            "p99_ns": 37631,
+            "p999_ns": 46335
+          },
+          "hot": {
+            "count": 6463924,
+            "p50_ns": 29055,
+            "p99_ns": 70655,
+            "p999_ns": 88575
+          }
+        },
+        "by_type": [
+          {
+            "op": "put",
+            "stats": {
+              "count": 6851571,
+              "p50_ns": 125951,
+              "p99_ns": 219135,
+              "p999_ns": 284671
+            },
+            "mean_ns": 136017
+          },
+          {
+            "op": "row read",
+            "stats": {
+              "count": 6844450,
+              "p50_ns": 28159,
+              "p99_ns": 70143,
+              "p999_ns": 88063
+            },
+            "mean_ns": 30541
+          }
+        ],
+        "shards": [],
+        "stalls": null,
+        "engine_commit": null,
+        "settle": {
+          "millis": 3671,
+          "settled": true,
+          "work": null
+        },
+        "background_work": null,
+        "warmup_secs": 5.007899707,
+        "warmup_settled": true,
+        "riders": null,
+        "capped": false,
+        "close_ms": 2.800542,
+        "txn_conflicts": null,
+        "seqnos_used": null
+      }
+    },
+    {
+      "store": "sqlite-eav",
+      "store_config": "page_cache=320MiB sync load=buffered",
+      "workload": "ycsb-a",
+      "seed": 24301,
+      "records": 1000000,
+      "operations": 2473602,
+      "value_len": 100,
+      "threads": 16,
+      "load_secs": 137.923827408,
+      "run_secs": 63.283252841,
+      "throughput": 39087.78213747889,
+      "p50_ns": 30591,
+      "p99_ns": 81919,
+      "p999_ns": 53739519,
+      "mean_ns": 378766,
+      "max_ns": 3030277930,
+      "warmup_ops": 5000,
+      "detail": {
+        "store_bytes": 1874489344,
+        "busy_retries": 0,
+        "reads": {
+          "cold": {
+            "count": 198525,
+            "p50_ns": 8959,
+            "p99_ns": 20863,
+            "p999_ns": 50431
+          },
+          "hot": {
+            "count": 1037810,
+            "p50_ns": 7871,
+            "p99_ns": 18303,
+            "p999_ns": 46335
+          }
+        },
+        "by_type": [
+          {
+            "op": "put",
+            "stats": {
+              "count": 1237267,
+              "p50_ns": 38911,
+              "p99_ns": 342015,
+              "p999_ns": 128974847
+            },
+            "mean_ns": 749203
+          },
+          {
+            "op": "row read",
+            "stats": {
+              "count": 1236335,
+              "p50_ns": 8095,
+              "p99_ns": 18687,
+              "p999_ns": 46847
+            },
+            "mean_ns": 8049
+          }
+        ],
+        "shards": [],
+        "stalls": null,
+        "engine_commit": null,
+        "settle": {
+          "millis": 4,
+          "settled": true,
+          "work": null
+        },
+        "background_work": null,
+        "warmup_secs": 5.012686014,
+        "warmup_settled": true,
+        "riders": null,
+        "capped": false,
+        "close_ms": 19.057543,
+        "txn_conflicts": null,
+        "seqnos_used": null
+      }
+    }
+  ],
+  "scaling": null,
+  "scaling_sync": null,
+  "group_commit": null,
+  "scaling_unpinned": null,
+  "group_commit_unpinned": null,
+  "placement": null
+}
