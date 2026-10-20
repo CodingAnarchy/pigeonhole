@@ -199,10 +199,10 @@ fn a_catalog_change_finishes_a_pump_commit_whose_shard_is_not_run() {
 
 // ---- 1-2 F1 / 3-4 3.3: a blocking wait on a thread that drives a shard ----
 
-/// Thread X drives shard B, which coordinates a cross-shard `Sync` commit whose sync is in
-/// flight (its seqno holds the global watermark; a single-shard group no longer does,
-/// D227). X commits to a table on shard A (driven by thread Y) and waits: only X can
-/// let B publish, so the wait used to spin for ever. Now (amended D88) calls that would
+/// Thread X drives shard B, which coordinates a cross-shard `Sync` commit whose DECISION
+/// sync is in flight (its seqno holds the global watermark, D263; a single-shard group no
+/// longer does, D227). X commits to a table on shard A (driven by thread Y) and waits: only
+/// X can let B publish, so the wait used to spin for ever. Now (amended D88) calls that would
 /// submit and block are refused before submitting anything (`InvalidArgument`), and
 /// waiting on an already-submitted commit fails with `WouldDeadlock` while the commit
 /// still applies.
@@ -213,7 +213,10 @@ fn a_blocking_wait_on_a_thread_driving_another_shard_fails_instead_of_deadlockin
     let drivers: Vec<_> = shards.into_iter().map(driver).collect();
     let (on_a, on_b) = tables_on_0_and_1(&db);
     let x = &drivers[1];
-    gate.hold(&wal(1));
+    // D263: a PREPARE holds no seqno, so holding shard 1's first sync (its own PREPARE's)
+    // pins nothing and the wait below races the single's reply (#780). Its second sync,
+    // the DECISION's, holds the seqno until every participant applied.
+    gate.hold_after(&wal(1), 1);
     let pending = db
         .submit(cross(&on_b, &on_a, "held"), Some(Durability::Sync))
         .unwrap();
