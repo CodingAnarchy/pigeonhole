@@ -191,6 +191,9 @@ pub(crate) struct ShardCounters {
     /// one per commit it replied to and one per share it decided for another coordinator
     /// (D257, D262), `Engine::inflight_counts`.
     pub inflight_counts: AtomicU64,
+    /// The most log records the shard's checkpoint popped in one batch (#763's budget),
+    /// `Engine::max_checkpoint_pops`.
+    pub checkpoint_pops_max: AtomicU64,
 }
 
 /// A reader process's snapshot hooks (`ReaderState::hooks`).
@@ -977,6 +980,16 @@ impl Engine {
         self.inner.shared.metrics[shard]
             .hooks
             .logged
+            .load(Ordering::Relaxed)
+    }
+
+    /// The most records shard `shard`'s checkpoint popped from its log in one batch so far
+    /// (#763: at most the pop budget while open). Test hook.
+    #[doc(hidden)]
+    pub fn max_checkpoint_pops(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .checkpoint_pops_max
             .load(Ordering::Relaxed)
     }
 
