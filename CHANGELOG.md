@@ -6,7 +6,7 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
-## [0.3.0] - 2026-10-13
+## [0.3.0] - 2026-10-20
 The **Phase 3 latency engine**: io_uring and direct I/O, an async form of every data operation, commits visible once applied with group syncs shared between them, one-I/O cold gets, thread-per-core shards that are pinned and packed by load, cross-shard commits that stay ordered and cheap under contention, and the work measured against the Phase 3 gate on the reference machine (2026-10-20 at 516b59b8; see [Performance](#performance), and [Known issues](#known-issues) for what carries over to Phase 4). Several defaults and error semantics change; read [Upgrading from 0.2.x](#upgrading-from-02x) first. The file format is unchanged, and files written by 0.2.x open as before; the shared-memory layout moves to version 2, so stop reader processes before upgrading the writer. Includes the fixes released in 0.2.1, 0.2.2 and 0.2.3. Every published crate moves to 0.3.0 together.
 
 ### Latency engine: commits
@@ -174,7 +174,7 @@ Under contention (16 client threads on the default options):
 
 - **Short scans** (ycsb-e: scans of 1–100 rows) trail RocksDB by 3.9× in throughput at buffered and 3.3× at the default durability (scan p99 1.58 ms against RocksDB's 276 µs at buffered). At one client they are within 1.5×, so the gap opens with concurrency ([#712](https://github.com/CodingAnarchy/pigeonhole/issues/712)).
 - **Counters:** counter reads have a p99 of 10.8 ms at buffered and 17.2 ms at the default durability at 16 clients (the whole mix's p99 is 82× SQLite's upsert at buffered and 52× at the default) ([#713](https://github.com/CodingAnarchy/pigeonhole/issues/713)).
-- **Transactions on hot rows:** `transfer` (optimistic transactions moving units between Zipfian accounts) runs 106× (buffered) and 8.8× (default) behind RocksDB, with 1.2 and 1.8 conflicts per transfer ([#708](https://github.com/CodingAnarchy/pigeonhole/issues/708)).
+- **Transactions on hot rows:** `transfer` (optimistic transactions moving units between Zipfian accounts) varies 4.7–14K ops/s across gates at buffered, 38–106× behind RocksDB, and runs 8.8× behind it at the default durability, with 1.2 and 1.8 conflicts per transfer on the release gate ([#708](https://github.com/CodingAnarchy/pigeonhole/issues/708)).
 - **Cross-shard commits:** at the default durability the mix's p99 trails SQLite's single-writer transactions by 2.29×, and the cross-shard commits' own by 2.05× (255 against 124 µs); packing gathers mostly cross-shard loads onto fewer shards than they need ([#707](https://github.com/CodingAnarchy/pigeonhole/issues/707)).
 - **The async API at 16 in flight per client** runs at 0.41× the synchronous throughput at buffered (473K ops/s, p99 11 ms; [#749](https://github.com/CodingAnarchy/pigeonhole/issues/749), [#709](https://github.com/CodingAnarchy/pigeonhole/issues/709)).
 - **Application-owned mode on the defaults** runs at 0.20× the pre-split scaling run at buffered ([#710](https://github.com/CodingAnarchy/pigeonhole/issues/710)).

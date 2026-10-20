@@ -53,7 +53,7 @@ Measured on the AX102 in the 2026-10-20 window at `516b59b8` ([results](../crate
 **Carried to Phase 4** (owner, 2026-10-14, 2026-10-19 and 2026-10-20; triaged under [#695](https://github.com/CodingAnarchy/pigeonhole/issues/695)): cross-shard commits after packing regrows a store (#767, the share-report turns off the shard thread under #724), contended ycsb-f against SQLite at `GroupSync` (#755), reads beside writes (#759), the sparse-wide put tail at buffered (#760), the run-to-run miss on group-commit at 16 clients (#768); contended short scans (#712), counters (#713), transfer (#708), cross-shard tails and packing (#707), the mover stopping early (#735), the put tail on thinly loaded shards (#738) and the regrow after a packed load (#744); and the reported rows the gate flags: the async API at 16 in flight (#749, #709), application-owned mode (#710), time-series-range (#711).
 
 ## What's in 0.3.0
-The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2026-10-13).
+The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2026-10-20).
 - **Commits:**
   - a commit is visible once applied, before its fsync, and returns once durable at its level ([D227](design/decisions/phase-3.md#d227), amends D19); durable snapshots and `backup_durable` keep the old view (ICR 0037; shared-memory layout 2);
   - concurrent durable commits share group syncs ([D207](design/decisions/phase-3.md#d207), [D221](design/decisions/phase-3.md#d221));
