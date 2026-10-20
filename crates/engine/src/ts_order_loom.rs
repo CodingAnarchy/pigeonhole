@@ -9,7 +9,8 @@
 //!   `fetch_max(floor, AcqRel)` before the move is published; the participant's
 //!   `load(Acquire)` once per group after its reservation (`fold_raises`).
 //! - the view (`Shared::view`, an `ArcSwap`): published (Release) after the move's raise,
-//!   loaded (Acquire) by the new owner before it admits the moved tablet's rows.
+//!   loaded (Acquire) by the client that routes a write on the moved tablet to the new
+//!   owner, before it submits the write through the new owner's queue.
 //! - `ts_floors[p]`: the participant's published floor (`store(Release)` after stamping),
 //!   which a coordinator reads (`Acquire`) to pick `T`.
 //!
@@ -111,8 +112,9 @@ fn loom_crossing_decisions_are_reachable() {
 #[test]
 fn loom_a_moved_tablets_floor_and_a_decision_share_one_raise() {
     // D264: one raise per shard carries both a tablet move's floor and a coordinator's
-    // timestamp. The old owner raises, then publishes the move; the new owner admits the
-    // tablet's rows only once it sees the published view, reserves, then folds the raise.
+    // timestamp. The old owner raises, then publishes the move. A client routes a write on
+    // the moved tablet to the new owner only once it sees the published view; the write
+    // reaches the new owner through its queue, which admits it, reserves, then folds.
     // Whatever the interleaving with a concurrent decision, such a single stamps above the
     // moved floor, and above the decision's timestamp when its seqno is later.
     use std::sync::atomic::AtomicBool as StdBool;
@@ -134,7 +136,9 @@ fn loom_a_moved_tablets_floor_and_a_decision_share_one_raise() {
             let (next, floor, raise) = (Arc::clone(&next), Arc::clone(&floor), Arc::clone(&raise));
             thread::spawn(move || coordinate(&next, &floor, &raise, COORD_FLOOR))
         };
-        // The new owner: a single on the moved tablet runs here only under the new view.
+        // The client and the new owner, as one thread (the shard queue between them is a
+        // release/acquire handoff): a single on the moved tablet is routed here only under
+        // the new view.
         let routed = view.load(Ordering::Acquire) == 1;
         let stamped = routed.then(|| stamp_single(&next, &floor, &raise, 0));
         mover.join().unwrap();

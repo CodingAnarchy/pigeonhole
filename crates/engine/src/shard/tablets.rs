@@ -407,8 +407,9 @@ impl ShardState {
 
     /// Folds the other shards' raises into the floor (D245, D264): once per group, after its
     /// reservation, so the load follows the reservation's read-modify-write on `NEXT_SEQNO`
-    /// (a coordinator's raise) and the view load that routed the group's rows here (a moved
-    /// tablet's raise, made before the move was published).
+    /// (a coordinator's raise) and the routing that sent the group's writes here: the
+    /// client's view load (Acquire) and this shard's queue, or the old owner's forward (a
+    /// moved tablet's raise, made before the move was published).
     #[inline(never)]
     pub(super) fn fold_raises(&mut self) {
         let raised = self.shared.ts_raises[usize::from(self.id.0)]
