@@ -3148,10 +3148,9 @@ impl Inner {
             validate,
             map_version: view.tablets.version(),
             epoch: 0,
-            room_wait: None,
             first_seqno: 0,
             prev_shards: Vec::new(),
-            overlap_wait: None,
+            wait: None,
         }));
         let Some(charge) = admit.admit(target) else {
             return Ok(Routed::Held(Prepared {

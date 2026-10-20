@@ -951,17 +951,62 @@ pub(crate) struct CoordinateReq {
     /// retried once a tablet change has finished since (it may have failed, leaving the map
     /// as it was).
     pub epoch: u64,
-    /// A participant that refused the last attempt for arena room, and its room generation
-    /// then (D245, ICR 0042): the retry waits for a room `Wake` of a later generation.
-    pub room_wait: Option<(ShardId, u64)>,
     /// The seqno this commit's first attempt reserved (0: this is the first attempt), for
     /// its `CommitPriority` (D249).
     pub first_seqno: Seqno,
     /// The participants of the attempt this one retries (D249, `Retried::prev_shards`).
     pub prev_shards: Vec<ShardId>,
-    /// A participant that refused the last attempt because it overlaps an undecided share
-    /// there (D249): the retry waits for that participant's overlap `Wake`.
-    pub overlap_wait: Option<ShardId>,
+    /// What this retry waits for before it runs (`None`: nothing, or not a retry).
+    pub wait: Option<RetryWait>,
+}
+
+/// What a refused cross-shard commit's retry waits for: one thing, chosen from the round's
+/// refusals by `RetryWait::rank` (the first refusal of each kind). A retry refused again
+/// waits for what refused it then.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetryWait {
+    /// A newer tablet map or tablet epoch than the attempt's (`Moved`, D145, D241).
+    Tablets,
+    /// `from` reporting room in a later room generation than `generation` (D245, ICR 0042).
+    Room { from: ShardId, generation: u64 },
+    /// `from`'s overlap wake for this commit (`PendingOverlap`, D249, ICR 0045).
+    Overlap { from: ShardId },
+}
+
+impl RetryWait {
+    /// An overlap wait goes before a room wait, and either before a tablet change: a wake
+    /// names this commit or this shard, while a tablet change may not concern it.
+    fn rank(self) -> u8 {
+        match self {
+            RetryWait::Tablets => 0,
+            RetryWait::Room { .. } => 1,
+            RetryWait::Overlap { .. } => 2,
+        }
+    }
+
+    /// Notes a refusal of kind `w` in `wait`, the round's: the first of the highest rank.
+    fn note(wait: &mut Option<RetryWait>, w: RetryWait) {
+        if wait.is_none_or(|cur| w.rank() > cur.rank()) {
+            *wait = Some(w);
+        }
+    }
+
+    /// Whether `reason`, from `from`, wakes a retry of priority `priority` waiting on this.
+    fn woken_by(self, from: ShardId, reason: WakeReason, priority: CommitPriority) -> bool {
+        match (self, reason) {
+            (
+                RetryWait::Room {
+                    from: p,
+                    generation: g,
+                },
+                WakeReason::Room { generation },
+            ) => p == from && g < generation,
+            (RetryWait::Overlap { from: p }, WakeReason::Overlap { priority: woken }) => {
+                p == from && woken == priority
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A participant's share of a cross-shard commit.
@@ -1386,19 +1431,14 @@ struct Coord {
     parts: Vec<(ShardId, Arc<BatchBuilder>)>,
     validate: Option<Box<Validate>>,
     map_version: u64,
-    moved: bool,
-    /// A participant refused the PREPARE rather than wait for arena room (D245, ICR 0042),
-    /// in that room generation: the retry waits until it reports room freed after it.
-    room: Option<(ShardId, u64)>,
+    /// Some participant refused this round, and what its retry waits for (`RetryWait`).
+    refused: Option<RetryWait>,
     commit_ts: Timestamp,
     /// The seqno reserved and held at the decision (D263), 0 before.
     apply_seqno: Seqno,
     epoch: u64,
     /// The commit's priority, the same across its retries (D249).
     priority: CommitPriority,
-    /// A participant refused the PREPARE because it overlaps an undecided share there (D249,
-    /// ICR 0045): the retry waits for that participant's overlap `Wake`.
-    overlap: Option<ShardId>,
     /// Decided with the abort (D249): the commit gives up rather than retry (D241's
     /// timeout passed), so the `Decide` says it is the last attempt and the retry agrees.
     gives_up: bool,
@@ -2415,9 +2455,9 @@ pub(crate) struct ShardState {
     room_refused: Vec<ShardId>,
     room_refused_free: usize,
     /// This shard's room generation: a PREPARE refused for room carries it, and each
-    /// `RoomFreed` this shard sends carries the next (D245).
+    /// room `Wake` this shard sends carries the next (D245).
     room_generation: u64,
-    /// Per shard, the latest room generation its `RoomFreed` reported: a room retry waits
+    /// Per shard, the latest room generation its room `Wake` reported: a room retry waits
     /// for a later one than its refusal's.
     room_freed: Vec<u64>,
     /// Coordinators whose PREPAREs this shard refused because they overlapped an undecided
@@ -6567,13 +6607,11 @@ impl ShardState {
                 parts: req.parts.clone(),
                 validate: req.validate.clone(),
                 map_version: req.map_version,
-                moved: false,
-                room: None,
+                refused: None,
                 commit_ts,
                 apply_seqno: 0,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
                 priority,
-                overlap: None,
                 gives_up: false,
             },
         );
@@ -6711,20 +6749,15 @@ impl ShardState {
         // Until the decision, `commit_ts` gathers the participants' floors (D263).
         c.commit_ts = c.commit_ts.max(floor);
         match error {
-            Some(PrepareError::Moved) => c.moved = true,
+            Some(PrepareError::Moved) => RetryWait::note(&mut c.refused, RetryWait::Tablets),
+            // Not timestamp refusals: the retry waits for that participant's wake. Only the
+            // first such participant is waited on: another one may refuse the retry again,
+            // which then waits for that one (bounded by D241).
             Some(PrepareError::Room(generation)) => {
-                // Not a timestamp refusal: the retry may keep its timestamp. Only the first
-                // participant that refused for room is waited on: another one may refuse
-                // the retry again, which then waits for that one (bounded by D241).
-                c.moved = true;
-                c.room.get_or_insert((from, generation));
+                RetryWait::note(&mut c.refused, RetryWait::Room { from, generation })
             }
             Some(PrepareError::PendingOverlap) => {
-                // Not a conflict (D249): the retry waits for the overlap to clear there, and
-                // keeps its timestamp. Only the first such participant is waited on: another
-                // that still overlaps refuses the retry again.
-                c.moved = true;
-                c.overlap.get_or_insert(from);
+                RetryWait::note(&mut c.refused, RetryWait::Overlap { from });
             }
             Some(e) if c.failed.is_none() => c.failed = Some(e.into()),
             Some(_) => {}
@@ -6737,7 +6770,7 @@ impl ShardState {
         c.decided = true;
         let cross = &self.shared.metrics[usize::from(self.id.0)].cross;
         cross.rounds.fetch_add(1, Ordering::Relaxed);
-        if c.moved {
+        if c.refused.is_some() {
             cross.refused_rounds.fetch_add(1, Ordering::Relaxed);
         }
         if gave_up && c.failed.is_none() {
@@ -6746,7 +6779,7 @@ impl ShardState {
             // logged after the close stopped waiting for it).
             c.failed = Some(Error::Closed);
         }
-        if c.failed.is_some() || c.moved {
+        if c.failed.is_some() || c.refused.is_some() {
             // Whether it retries is decided now, with the abort (D249): the `Decide` tells
             // the participants whether this was its last attempt, and the retry (once every
             // participant has answered, `on_applied`) follows the same decision.
@@ -7017,14 +7050,16 @@ impl ShardState {
         }
         c.applied += 1;
         trace!(
-            "shard {} on_applied {seqno}: {}/{} moved={}",
-            self.id.0, c.applied, c.participants, c.moved
+            "shard {} on_applied {seqno}: {}/{} refused={:?}",
+            self.id.0, c.applied, c.participants, c.refused
         );
         if c.applied < c.participants {
             return;
         }
         let mut c = self.coord.remove(&seqno).expect("present");
-        if !self.overlap_released.is_empty() && !(c.moved && c.failed.is_none() && !c.gives_up) {
+        if !self.overlap_released.is_empty()
+            && !(c.refused.is_some() && c.failed.is_none() && !c.gives_up)
+        {
             // It runs no further attempt: an early overlap wake for it is stale (D249).
             self.overlap_released.retain(|(_, p)| *p != c.priority);
         }
@@ -7047,7 +7082,7 @@ impl ShardState {
             self.held.remove(&c.apply_seqno);
             self.publish_watermark();
         }
-        if c.moved
+        if c.refused.is_some()
             && c.failed.is_none()
             && let Some(reply) = c.reply.take()
         {
@@ -7080,38 +7115,34 @@ impl ShardState {
                 validate: c.validate.take(),
                 map_version: c.map_version,
                 epoch: c.epoch,
-                room_wait: c.room,
                 first_seqno: c.priority.1,
                 prev_shards: c.shards.clone(),
-                overlap_wait: c.overlap,
+                wait: c.refused,
             };
-            if let Some(p) = req.overlap_wait {
-                // Waits for the overlap to clear at `p` (D249). A wake that came first (during
-                // the abort round) counts.
-                let key = (p, c.priority);
-                if let Some(i) = self.overlap_released.iter().position(|k| *k == key) {
-                    self.overlap_released.swap_remove(i);
-                    let mut req = req;
-                    req.overlap_wait = None;
-                    self.retry(req, ctx);
-                } else {
-                    self.retries.push(req);
-                    self.arm_tablet_timer(ctx);
+            // A wake that came first (during the abort round) counts: an overlap wake for
+            // this commit, or room reported in a later generation than the refusal's.
+            let woken = match req.wait {
+                Some(RetryWait::Overlap { from }) => {
+                    let key = (from, c.priority);
+                    let i = self.overlap_released.iter().position(|k| *k == key);
+                    i.map(|i| self.overlap_released.swap_remove(i)).is_some()
                 }
-            } else if let Some((p, generation)) = req.room_wait {
-                // Not in a loop while a flush frees room: each attempt logs a PREPARE. A
-                // later `RoomFreed` that came first (during the abort round) counts.
-                if self.room_freed[usize::from(p.0)] > generation {
-                    let mut req = req;
-                    req.room_wait = None;
-                    self.retry(req, ctx);
-                } else {
-                    self.retries.push(req);
-                    self.arm_tablet_timer(ctx);
+                Some(RetryWait::Room { from, generation }) => {
+                    self.room_freed[usize::from(from.0)] > generation
                 }
-            } else {
+                _ => false,
+            };
+            if woken {
+                let mut req = req;
+                req.wait = None;
+                self.retry(req, ctx);
+            } else if req.wait == Some(RetryWait::Tablets) {
                 self.retries.push(req);
                 self.run_retries(ctx);
+            } else {
+                // Not in a loop while a flush frees room: each attempt logs a PREPARE.
+                self.retries.push(req);
+                self.arm_tablet_timer(ctx);
             }
             self.try_finish_close(ctx);
             return;
@@ -8551,10 +8582,7 @@ impl ShardState {
                 error,
                 floor,
             } => self.on_prepared(seqno, from, error, floor, ctx),
-            ShardMsg::Wake { from, reason } => match reason {
-                WakeReason::Room { generation } => self.on_room_freed(from, generation, ctx),
-                WakeReason::Overlap { priority } => self.on_overlap_cleared(from, priority, ctx),
-            },
+            ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),
             ShardMsg::Released { priority } => self.release_overlaps_behind(priority, ctx),
             ShardMsg::Decide {
                 seqno,
@@ -9057,6 +9085,52 @@ mod tests {
         let wait = RoomWait::new(10, TimerState::new());
         wait.timer.give_up(60);
         assert!(wait.stopped(60));
+    }
+
+    #[test]
+    fn a_retry_waits_for_the_first_refusal_of_the_highest_rank_and_only_its_wake() {
+        let (a, b) = (ShardId(0), ShardId(1));
+        let mut wait = None;
+        RetryWait::note(&mut wait, RetryWait::Tablets);
+        assert_eq!(wait, Some(RetryWait::Tablets));
+        RetryWait::note(
+            &mut wait,
+            RetryWait::Room {
+                from: a,
+                generation: 3,
+            },
+        );
+        // The first room refusal stays; a tablet change never displaces it.
+        RetryWait::note(
+            &mut wait,
+            RetryWait::Room {
+                from: b,
+                generation: 9,
+            },
+        );
+        RetryWait::note(&mut wait, RetryWait::Tablets);
+        let room = RetryWait::Room {
+            from: a,
+            generation: 3,
+        };
+        assert_eq!(wait, Some(room));
+        // An overlap wait goes before it.
+        RetryWait::note(&mut wait, RetryWait::Overlap { from: b });
+        RetryWait::note(&mut wait, RetryWait::Overlap { from: a });
+        assert_eq!(wait, Some(RetryWait::Overlap { from: b }));
+        // Room in a later generation from the same shard wakes a room wait; nothing else does.
+        let prio = (7, 11);
+        assert!(room.woken_by(a, WakeReason::Room { generation: 4 }, prio));
+        assert!(!room.woken_by(a, WakeReason::Room { generation: 3 }, prio));
+        assert!(!room.woken_by(b, WakeReason::Room { generation: 4 }, prio));
+        assert!(!room.woken_by(a, WakeReason::Overlap { priority: prio }, prio));
+        // An overlap wait wakes only on that shard's wake for this commit.
+        let overlap = RetryWait::Overlap { from: b };
+        assert!(overlap.woken_by(b, WakeReason::Overlap { priority: prio }, prio));
+        assert!(!overlap.woken_by(b, WakeReason::Overlap { priority: (7, 12) }, prio));
+        assert!(!overlap.woken_by(a, WakeReason::Overlap { priority: prio }, prio));
+        assert!(!overlap.woken_by(b, WakeReason::Room { generation: 99 }, prio));
+        assert!(!RetryWait::Tablets.woken_by(a, WakeReason::Room { generation: 99 }, prio));
     }
 
     #[test]
