@@ -801,7 +801,6 @@ impl Engine {
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
             ts_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
-            ts_coord_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
             balance: BalanceConfig {
                 enabled: options.tablet_changes,
@@ -1348,7 +1347,6 @@ impl Engine {
             metrics: Vec::new(),
             ts_floors: Vec::new(),
             ts_raises: Vec::new(),
-            ts_coord_raises: Vec::new(),
             loads: Vec::new(),
             balance: BalanceConfig::default(),
             view_capacity: shm_config.view_buffer_bytes as usize,

@@ -446,14 +446,13 @@ pub(crate) struct Shared {
     /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits
     /// and by coordinators choosing a cross-shard commit timestamp.
     pub ts_floors: Vec<Padded>,
-    /// Per-shard floor raises from shards handing it tablets (D11: the floor travels with
-    /// the tablet); the shard's next default timestamp is above it.
+    /// Per shard, the floor other shards raise it to (`fetch_max`), D264: a shard handing it
+    /// a tablet raises it to its own floor (D11: the floor travels with the tablet), and a
+    /// coordinator to a cross-shard commit's timestamp before it reserves the commit's seqno
+    /// (D245, D263). The shard folds it in (Acquire) once per group after its reservation
+    /// (`fold_raises`), so its singles at later seqnos land above both; coordinators read
+    /// it too.
     pub ts_raises: Vec<Padded>,
-    /// Per shard, the largest timestamp a coordinator of a cross-shard commit it takes part
-    /// in picked, raised (`fetch_max`, Release) before that coordinator reserved the
-    /// commit's seqno (D245). The shard's stamping folds it in (Acquire), so its singles at
-    /// later seqnos land above the commit; coordinators read it too.
-    pub ts_coord_raises: Vec<Padded>,
     /// Per-shard load as of its last balancer interval.
     pub loads: Vec<LoadSlot>,
     pub balance: BalanceConfig,
@@ -4138,12 +4137,9 @@ impl ShardState {
 
     fn default_ts(&mut self) -> Timestamp {
         let now = self.shared.vfs.now_micros();
-        // A shard that handed us a tablet raised our floor to its own (D11). Coordinators'
-        // raises (D245) are folded in once per group, after its reservation (`run_group`).
-        let raised = self.shared.ts_raises[usize::from(self.id.0)]
-            .0
-            .load(Ordering::Acquire);
-        self.ts_floor = self.ts_floor.max(raised);
+        // Other shards' raises (a tablet handed to us, D11; a cross-shard commit's timestamp,
+        // D245) are folded in once per group after its reservation (`fold_raises`, D264), and
+        // by a coordinator's `decide_commit` before it stamps.
         let ts = now.max(self.ts_floor + 1);
         trace!(
             "shard {} default_ts now={now} floor={} -> {ts}",
@@ -5071,13 +5067,13 @@ impl ShardState {
             .filter(|m| matches!(m.kind, MemberKind::Single))
             .count() as u64;
         let first = (singles > 0).then(|| self.reserve(singles));
-        // One shard has no cross-shard commits: one test of a field on its commit path. With
-        // more, the coordinators' raises are folded in after this group's reservation, so
-        // every single it stamps lands above any cross-shard commit
-        // reserved before it (D245).
+        // One shard has no cross-shard commits or tablet moves: one test of a field on its
+        // commit path. With more, the raises are folded in after this group's reservation, so
+        // every single it stamps lands above any cross-shard commit reserved before it
+        // (D245) and above the floor of a tablet handed to this shard (D11, D264).
         let cross = self.cross && first.is_some();
         if cross {
-            self.fold_coord_raise();
+            self.fold_raises();
         }
         let mut next = first.unwrap_or(0);
         for m in &mut admitted {
@@ -6678,15 +6674,14 @@ impl ShardState {
         for s in shards {
             let i = usize::from(s.0);
             let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
-            let coord = self.shared.ts_coord_raises[i].0.load(Ordering::Acquire);
-            let moved = self.shared.ts_raises[i].0.load(Ordering::Acquire);
-            floor = floor.max(own_floor).max(coord).max(moved);
+            let raised = self.shared.ts_raises[i].0.load(Ordering::Acquire);
+            floor = floor.max(own_floor).max(raised);
         }
         self.ts_floor = self.ts_floor.max(floor);
         let commit_ts = self.default_ts();
         for s in shards {
             if *s != self.id {
-                self.shared.ts_coord_raises[usize::from(s.0)]
+                self.shared.ts_raises[usize::from(s.0)]
                     .0
                     .fetch_max(commit_ts, Ordering::Release);
             }
