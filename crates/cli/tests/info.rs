@@ -113,13 +113,10 @@ fn info_on_a_live_database_opens_as_a_reader() {
     assert!(out.stderr.contains("phdb: error: open:"), "{out:?}");
     db.close().unwrap();
 
-    // With no writer running, `--reader` cannot attach.
+    // With no writer running, `--reader` cannot attach: `NoWriter` (ICR 0057), exit 4.
     let out = phdb(&["--reader", "info", path.to_str().unwrap()]);
-    assert_eq!(out.status, 1, "{out:?}");
-    assert!(
-        out.stderr.contains("is a writer process running?"),
-        "{out:?}"
-    );
+    assert_eq!(out.status, 4, "{out:?}");
+    assert!(out.stderr.contains("no writer is running"), "{out:?}");
 }
 
 #[test]

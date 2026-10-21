@@ -228,15 +228,8 @@ fn reader(cli: &Cli, path: &Path) -> Result<PigeonholeReader, Failure> {
     if let Some(dir) = &cli.shm_dir {
         options = options.shm_dir(dir);
     }
-    Pigeonhole::open_reader(path, options).map_err(|e| {
-        if e.code() == ErrorCode::Io && cli.reader {
-            // The usual cause: no writer has the database open, so there is no shared
-            // memory to attach to.
-            Failure::db("open as a reader (is a writer process running?)", &e)
-        } else {
-            Failure::db("open as a reader", &e)
-        }
-    })
+    // With no writer running this is `NoWriter` (ICR 0057), whose message says so.
+    Pigeonhole::open_reader(path, options).map_err(|e| Failure::db("open as a reader", &e))
 }
 
 fn drive<E>(

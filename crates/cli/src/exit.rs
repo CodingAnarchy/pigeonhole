@@ -183,7 +183,10 @@ impl Failure {
 fn status_of(code: ErrorCode) -> ExitStatus {
     match code {
         ErrorCode::Corruption => ExitStatus::CORRUPTION,
-        ErrorCode::WriterLocked | ErrorCode::Busy | ErrorCode::NoReaderSlot => ExitStatus::LOCKED,
+        ErrorCode::WriterLocked
+        | ErrorCode::Busy
+        | ErrorCode::NoReaderSlot
+        | ErrorCode::NoWriter => ExitStatus::LOCKED,
         ErrorCode::TableNotFound | ErrorCode::FamilyNotFound => ExitStatus::NOT_FOUND,
         ErrorCode::UnsupportedFormat | ErrorCode::ShmVersionMismatch | ErrorCode::Unsupported => {
             ExitStatus::UNSUPPORTED
@@ -202,6 +205,7 @@ mod tests {
         assert_eq!(status_of(ErrorCode::WriterLocked).code(), 4);
         assert_eq!(status_of(ErrorCode::Busy).code(), 4);
         assert_eq!(status_of(ErrorCode::NoReaderSlot).code(), 4);
+        assert_eq!(status_of(ErrorCode::NoWriter).code(), 4);
         assert_eq!(status_of(ErrorCode::TableNotFound).code(), 5);
         assert_eq!(status_of(ErrorCode::FamilyNotFound).code(), 5);
         assert_eq!(status_of(ErrorCode::UnsupportedFormat).code(), 6);

@@ -109,9 +109,10 @@ impl Proc {
 fn reader_before_any_writer_finds_no_region() {
     let sim = SimVfs::new(1);
     let r = Proc::start(&sim, pid(10));
+    // ICR 0057: typed, not an I/O error.
     match r.open(Role::Reader) {
-        Err(Error::Io(e)) => assert_eq!(e.kind, ErrorKind::NotFound),
-        other => panic!("expected NotFound, got {other:?}"),
+        Err(Error::NoWriter) => {}
+        other => panic!("expected NoWriter, got {other:?}"),
     }
 }
 
@@ -413,7 +414,7 @@ fn last_process_removes_the_region() {
         ErrorKind::NotFound
     );
     ShmRegion::remove(&w.vfs, w.identity, None).unwrap();
-    assert!(matches!(r.open(Role::Reader), Err(Error::Io(e)) if e.kind == ErrorKind::NotFound));
+    assert!(matches!(r.open(Role::Reader), Err(Error::NoWriter)));
 
     // A new writer starts over at generation 1.
     let w2 = Proc::start(&sim, pid(2));
@@ -472,7 +473,7 @@ fn file_backed_region_in_a_directory() {
     shm.publish_view(&view(1, 1, 1)).unwrap();
     assert_eq!(shm_r.read_view().unwrap().view_version, 1);
     assert!(
-        matches!(r.open(Role::Reader), Err(Error::Io(e)) if e.kind == ErrorKind::NotFound),
+        matches!(r.open(Role::Reader), Err(Error::NoWriter)),
         "the default location has nothing"
     );
     ShmRegion::remove(&w.vfs, w.identity, config.dir.as_deref()).unwrap();
@@ -495,4 +496,40 @@ fn writer_open_is_present_before_presence_is_taken() {
     let _wp = Presence::acquire(&w.file).unwrap();
     assert_eq!(w.directory_generation(), shm.generation().0);
     assert!(w.region_exists(shm.generation().0));
+}
+
+/// #844 (ICR 0057): a reader that finds no writer's region to attach to gets `NoWriter`, not
+/// an I/O error: before any writer built one, and on re-attach when the generation the
+/// directory names is gone (on Windows a closed writer's mapping disappears with its last
+/// handle; here its name is removed by hand to the same effect).
+#[test]
+fn a_reader_with_no_writer_region_gets_no_writer() {
+    let sim = SimVfs::new(844);
+    // No writer has built a region yet.
+    let r = Proc::start(&sim, pid(11));
+    assert!(matches!(r.open(Role::Reader), Err(Error::NoWriter)));
+
+    let w = Proc::start(&sim, pid(1));
+    let (lock, wp, shm) = w.open_writer();
+    shm.publish_view(&view(1, 3, 8)).unwrap();
+    let (_rp, shm_r, _slot) = r.open_reader();
+
+    // A new writer builds generation 2, then goes away and its region with it.
+    w.crash();
+    std::mem::forget((lock, wp, shm));
+    let w2 = Proc::start(&sim, pid(2));
+    let (lock2, wp2, shm2) = w2.open_writer();
+    assert_eq!(shm2.generation(), Generation(2));
+    drop((shm2, wp2, lock2));
+    let name = region_name(w2.identity.device, w2.identity.inode, 2);
+    let _ = pigeonhole_io::Vfs::remove_shared(&*sim, &name, None);
+    assert!(!w2.region_exists(2));
+
+    // The reader sees the generation change and re-attaches: nothing to attach to.
+    r.enter();
+    assert!(shm_r.is_stale());
+    assert!(matches!(
+        shm_r.reattach(&r.vfs, &r.file),
+        Err(Error::NoWriter)
+    ));
 }

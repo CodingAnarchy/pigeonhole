@@ -331,7 +331,7 @@ u1   profile  name       1761030000000000  Ada
 | 1 | An error not listed below (see the error's code). |
 | 2 | Usage: bad arguments. |
 | 3 | Corruption: the file is damaged (`ErrorCode::Corruption`, or `phdb check` found damage). |
-| 4 | Locked or busy: another process holds the writer lock (`WriterLocked`), the database stayed too busy (`Busy`), or every reader slot is taken (`NoReaderSlot`). |
+| 4 | Locked or busy: another process holds the writer lock (`WriterLocked`), the database stayed too busy (`Busy`), every reader slot is taken (`NoReaderSlot`), or `--reader` found no running writer to attach to (`NoWriter`). |
 | 5 | Not found: the file, or a table or family the command names. |
 | 6 | Unsupported: the file's format version is newer than this `phdb` (`UnsupportedFormat`), or the writer runs another shared-memory layout (`ShmVersionMismatch`), or the system lacks a feature (`Unsupported`). |
 
