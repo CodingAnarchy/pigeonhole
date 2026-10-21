@@ -17,6 +17,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 8. [Recovering from a failed shard](recovery.md): detect a failed instance (`is_failed`), close, reopen, settle the commits in flight.
 9. [Agent reference](agent-reference.md): every public type and method, limits, error codes and copy-paste recipes on one page.
 10. [The `phdb` command-line tool](cli.md): inspect a database from the shell; how it opens a database, its output formats (stable JSON for programs) and exit statuses. In progress on `main`.
+11. [Arrow export](arrow.md): a scan as Arrow record batches (`pigeonhole-arrow`) for DuckDB, Polars and other Arrow readers; the schema, options and cost. In progress on `main`.
 
 Multi-process readers (P4) will get their own page when they are hardened; for now see [Concepts](concepts.md#multi-process-readers-phase-4-available-now) (including why readers need write permission on the file) and the API in the agent reference.
 
