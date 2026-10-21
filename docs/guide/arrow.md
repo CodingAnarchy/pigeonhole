@@ -110,5 +110,16 @@ assert_eq!(cells, 1);
 ## Cost
 Each row key, qualifier and value is copied once, into the batch's Arrow buffers. Nothing is allocated per cell: allocations are a fixed number per batch, and a test holds the export to that. Zero copy from the database's blocks isn't possible, because blocks hold encoded keys with values interleaved, while Arrow needs each column contiguous.
 
+Measured with `cargo run --release -p pigeonhole-bench --example arrowexport -- DIR 128`: one thread, a warm block cache, 128 MiB per shape, median of five passes, on an Apple M5 (macOS, 2026-10-21). GB/s counts key, qualifier and value bytes:
+
+| shape | plain scan (`next_ref`) | export | export cells/s |
+|---|---|---|---|
+| narrow: one 24-byte value per row | 0.47 GB/s | 0.39 GB/s | 9.2 M |
+| wide: 32 columns of 24 bytes per row | 0.85 GB/s | 0.66 GB/s | 15 M |
+| large: one 4000-byte value per row | 12.9 GB/s | 10.1 GB/s | 2.5 M |
+| counters: 8 `i64` columns, `typed_values` | 0.48 GB/s | 0.36 GB/s | 13 M |
+
+The export costs about a fifth to a quarter on top of the scan that feeds it. The scan, not the copy, sets the pace for small cells.
+
 ## arrow-rs versions
 `pigeonhole-arrow` pins one arrow-rs major (60) and re-exports the crates it uses: `pigeonhole_arrow::arrow_array`, `arrow_buffer` and `arrow_schema`. Use those re-exports, or the same major, to name the types. A consumer built on another major (duckdb-rs pins its own, and Polars uses polars-arrow) takes the stream through the Arrow C stream interface instead; that's the next step on `main` (#691).

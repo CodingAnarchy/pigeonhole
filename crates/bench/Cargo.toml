@@ -44,6 +44,8 @@ proptest = { workspace = true }
 pigeonhole-engine = { workspace = true }
 # The `coldscan` example counts what the scan readahead did.
 pigeonhole-sst = { workspace = true }
+# The `arrowexport` example measures the Arrow export (#691).
+pigeonhole-arrow = { workspace = true }
 
 [[example]]
 name = "hotrow_runners"
