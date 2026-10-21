@@ -23,6 +23,13 @@ pub const SHM_INIT_LOCK_BYTE: u64 = WRITER_LOCK_BYTE + 2;
 
 /// Number of meaningful bytes at the start of a superblock page; the rest is zero.
 pub const SUPERBLOCK_LEN: usize = 128;
+/// The superblock page's extension area (format 4, D269; FORMAT §8.2): reserved for later
+/// 1.x features, zero until one uses it. The superblock checksum does not cover it, so a
+/// feature that stores data here brings its own checksum. Every format 4 build carries the
+/// area unchanged into each root commit (`pigeonhole-pager`), so an unaware build keeps a
+/// compat feature's data here; data tied to the root goes stale when that build commits a
+/// new root, and the feature must detect that. [`Superblock::encode`] zeroes it.
+pub const EXTENSION_AREA: std::ops::Range<usize> = SUPERBLOCK_LEN..crate::PAGE_SIZE - 8;
 
 /// A power-of-two run of pages: `64 KiB << size_class` bytes starting at `page`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -69,6 +76,87 @@ impl ExtentRef {
     }
 }
 
+/// The file's feature sets (format 4, D269; FORMAT §8.2), as ext4 has them. A file sets a
+/// bit only once it uses the feature, so a file that uses none stays openable by every 1.x
+/// build. A build that meets a bit it does not know:
+/// - `incompat`: refuses the file ([`Error::UnsupportedFeature`]);
+/// - `ro_compat`: may read it but not write it;
+/// - `compat`: ignores it, and keeps it when it rewrites the superblock.
+///
+/// **A compat feature's data must stay correct, or detectably stale, after a build that
+/// does not know the feature commits.** Such a build keeps the bit and the
+/// [`EXTENSION_AREA`] bytes, but it may change the root they describe, and it drops manifest
+/// edits with skippable tags (128..=255) at its next manifest snapshot. A feature that
+/// cannot tolerate that is `ro_compat`, so builds that do not know it cannot write.
+///
+/// Setting or clearing an `incompat` or `ro_compat` bit commits both superblock pages before
+/// the file relies on the change: otherwise the other page keeps the old bits, and a build
+/// may refuse the file, or write to it, by the stale page.
+///
+/// ```
+/// use pigeonhole_format::superblock::Features;
+///
+/// assert!(Features::default().check_read().is_ok());
+/// assert!(Features { incompat: 1, ..Features::default() }.check_read().is_err());
+/// let ro = Features { ro_compat: 1 << 5, ..Features::default() };
+/// assert!(ro.check_read().is_ok() && ro.check_write().is_err());
+/// assert!(Features { compat: 1, ..Features::default() }.check_write().is_ok());
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Features {
+    /// Features an older build may read and write, ignoring them.
+    pub compat: u64,
+    /// Features an older build may read but must not write.
+    pub ro_compat: u64,
+    /// Features an older build must refuse the file for.
+    pub incompat: u64,
+}
+
+impl Features {
+    /// The `compat` bits this build knows (none yet: format 4's first release defines no
+    /// feature).
+    pub const KNOWN_COMPAT: u64 = 0;
+    /// The `ro_compat` bits this build knows.
+    pub const KNOWN_RO_COMPAT: u64 = 0;
+    /// The `incompat` bits this build knows.
+    pub const KNOWN_INCOMPAT: u64 = 0;
+
+    /// `incompat` bits this build does not know.
+    pub fn unknown_incompat(&self) -> u64 {
+        self.incompat & !Self::KNOWN_INCOMPAT
+    }
+
+    /// `ro_compat` bits this build does not know.
+    pub fn unknown_ro_compat(&self) -> u64 {
+        self.ro_compat & !Self::KNOWN_RO_COMPAT
+    }
+
+    /// Fails with [`Error::UnsupportedFeature`] if the file uses an incompatible feature this
+    /// build does not know: it must not even read it.
+    pub fn check_read(&self) -> crate::Result<()> {
+        match self.unknown_incompat() {
+            0 => Ok(()),
+            bits => Err(Error::UnsupportedFeature {
+                what: "incompatible feature bits",
+                value: bits,
+            }),
+        }
+    }
+
+    /// As [`check_read`](Self::check_read), and also fails if the file uses a
+    /// read-only-compatible feature this build does not know: it may read it, not write it.
+    pub fn check_write(&self) -> crate::Result<()> {
+        self.check_read()?;
+        match self.unknown_ro_compat() {
+            0 => Ok(()),
+            bits => Err(Error::UnsupportedFeature {
+                what: "read-only-compatible feature bits (the file can be opened read-only)",
+                value: bits,
+            }),
+        }
+    }
+}
+
 /// One superblock. The valid copy with the higher `sequence` is current.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Superblock {
@@ -94,6 +182,9 @@ pub struct Superblock {
     pub file_pages: u64,
     /// Bit 0: the last writer closed cleanly. Other bits reserved.
     pub flags: u64,
+    /// The file's feature sets (format 4; zero in older versions, whose bytes 96..120 are
+    /// reserved).
+    pub features: Features,
 }
 
 impl Superblock {
@@ -117,6 +208,9 @@ impl Superblock {
         put(p, 80, &log.0.to_le_bytes());
         p[88] = log.1;
         put(p, 92, &self.log_len.to_le_bytes());
+        put(p, 96, &self.features.compat.to_le_bytes());
+        put(p, 104, &self.features.ro_compat.to_le_bytes());
+        put(p, 112, &self.features.incompat.to_le_bytes());
         let checksum = crate::checksum::xxh3_64(&p[..120]);
         put(p, 120, &checksum.to_le_bytes());
     }
@@ -168,6 +262,16 @@ impl Superblock {
             flags: le_u64(b, 72),
             log,
             log_len,
+            // Bytes 96..120 were reserved (written zero) before format 4.
+            features: if version >= FormatVersion(4) {
+                Features {
+                    compat: le_u64(b, 96),
+                    ro_compat: le_u64(b, 104),
+                    incompat: le_u64(b, 112),
+                }
+            } else {
+                Features::default()
+            },
         })
     }
 
@@ -192,6 +296,7 @@ impl Superblock {
     ///     manifest_version: 0,
     ///     file_pages: 16,
     ///     flags: 0,
+    ///     features: Default::default(),
     /// };
     /// let mut page = [0u8; 4096];
     /// sb(5).encode(&mut page);
@@ -201,12 +306,19 @@ impl Superblock {
     /// assert_eq!(Superblock::choose(a, b).unwrap(), (sb(6), 1));
     /// ```
     pub fn choose(a: crate::Result<Self>, b: crate::Result<Self>) -> crate::Result<(Self, u64)> {
+        // A slot using an incompatible feature this build does not know is refused like a
+        // newer version: a newer build set the bit (in both slots, before using the feature),
+        // and the other slot may be one it has not rewritten yet.
+        let features = |r: crate::Result<Self>| r.and_then(|s| s.features.check_read().map(|()| s));
+        let (a, b) = (features(a), features(b));
         match (a, b) {
             // A slot with a valid checksum but a newer version was written by a newer build
             // (an upgrade that may have finished only that slot): never pass it over for the
             // older slot, whose root that build may already have freed (#496).
-            (Err(e @ Error::UnsupportedVersion { .. }), _)
-            | (_, Err(e @ Error::UnsupportedVersion { .. })) => Err(e),
+            (Err(e @ (Error::UnsupportedVersion { .. } | Error::UnsupportedFeature { .. })), _)
+            | (_, Err(e @ (Error::UnsupportedVersion { .. } | Error::UnsupportedFeature { .. }))) => {
+                Err(e)
+            }
             (Ok(a), Ok(b)) if b.sequence > a.sequence => Ok((b, SUPERBLOCK_PAGE_B)),
             (Ok(a), _) => Ok((a, SUPERBLOCK_PAGE_A)),
             (Err(_), Ok(b)) => Ok((b, SUPERBLOCK_PAGE_B)),

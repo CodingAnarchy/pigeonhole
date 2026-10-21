@@ -303,6 +303,7 @@ fn superblock() {
         manifest_version: 12,
         file_pages: 4096,
         flags: 1,
+        features: Default::default(),
     };
     let mut page = [0u8; 4096];
     sb.encode(&mut page);
@@ -519,10 +520,11 @@ fn wal() {
         prev_end: 1_048_000,
         db_id: *b"0123456789abcdef",
         segment_size: 64 << 20,
+        features: 0,
     };
     let mut frame = Box::new([0u8; FRAME_SIZE]);
     header.encode(&mut frame);
-    check("wal_segment_header.bin", prefix(&frame[..], 60));
+    check("wal_segment_header.bin", prefix(&frame[..], 128));
 
     let b = batch();
     let mut participants = Vec::new();
@@ -635,4 +637,55 @@ fn shm() {
         region_name(0x42, 0x1234_5678, 7)
     );
     check("shm_names.txt", names.as_bytes());
+}
+
+fn golden(name: &str) -> Vec<u8> {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden")
+        .join(name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Format 3's version-stamped structures (the golden files before format 4, D269), kept as
+/// they were: a format 4 build reads each, with no features, and writes them back byte for
+/// byte at version 3. 1.x reads every format from 1 (`MIN_READABLE`).
+#[test]
+fn format_3_structures_still_decode() {
+    let v3 = FormatVersion(3);
+
+    let bytes = golden("superblock_v3.bin");
+    let mut page = [0u8; 4096];
+    page[..bytes.len()].copy_from_slice(&bytes);
+    let sb = Superblock::decode(&page).unwrap();
+    assert_eq!((sb.version, sb.features), (v3, Default::default()));
+    let mut again = [0u8; 4096];
+    sb.encode(&mut again);
+    assert_eq!(&again[..bytes.len()], &bytes[..]);
+
+    let bytes = golden("wal_segment_header_v3.bin");
+    assert_eq!(bytes.len(), 60, "format 3's header layout");
+    let mut frame = Box::new([0u8; FRAME_SIZE]);
+    frame[..60].copy_from_slice(&bytes);
+    let h = SegmentHeader::decode(&frame[..]).unwrap();
+    assert_eq!((h.version, h.features), (v3, 0));
+    let mut again = Box::new([0u8; FRAME_SIZE]);
+    h.encode(&mut again);
+    assert_eq!(&again[..128], &frame[..128]);
+
+    let bytes = golden("sst_footer_v3.bin");
+    let footer = Footer::decode(&bytes).unwrap();
+    assert_eq!(footer.version, v3);
+    assert_eq!(&footer.encode()[..], &bytes[..]);
+
+    let bytes = golden("blob_extent_header_v3.bin");
+    let blob = BlobExtentHeader::decode(&bytes).unwrap();
+    assert_eq!(blob.version, v3);
+    assert_eq!(&blob.encode()[..], &bytes[..]);
+
+    for name in ["manifest_snapshot_v3.bin", "manifest_delta_log_v3.bin"] {
+        let bytes = golden(name);
+        let (header, edits, _) = decode_block(&bytes).unwrap();
+        assert_eq!(header.version, v3, "{name}");
+        assert!(!edits.is_empty(), "{name}");
+    }
 }

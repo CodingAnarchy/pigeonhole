@@ -1,8 +1,8 @@
 //! A writable open of a file an older build wrote (format version 2: 0.2.x, 0.3.x) rewrites
 //! both superblock pages at the current version before it writes any WAL record (ICR 0046):
 //! the WAL's DECISION record (D263) is one an older build cannot read, and an older build
-//! skips a newer WAL segment header as torn. With both pages at version 3 it refuses the
-//! file (`UnsupportedFormat(3)`) instead.
+//! skips a newer WAL segment header as torn. With both pages at the current version (4, the
+//! format 1.x is frozen at, D269) it refuses the file (`UnsupportedFormat`) instead.
 
 mod common;
 
@@ -251,7 +251,7 @@ fn make_segments_newer(vfs: &SimVfs, first: u64) -> usize {
     let mut opts = OpenOptions::read();
     opts.write = true;
     let wal = vfs.open(Path::new("/db/data.phdb-wal-0"), opts).unwrap();
-    let mut header = [0u8; 60];
+    let mut header = [0u8; pigeonhole_format::wal::SEGMENT_HEADER_LEN];
     wal.read_at(&mut header, 0).unwrap();
     assert_eq!(&header[..8], b"PHDBWALS", "slot 0 holds a segment");
     let segment = u64::from_le_bytes(header[40..48].try_into().unwrap());
@@ -265,8 +265,8 @@ fn make_segments_newer(vfs: &SimVfs, first: u64) -> usize {
         }
         let newer = FormatVersion::CURRENT.0 + 1;
         header[8..12].copy_from_slice(&newer.to_le_bytes());
-        let crc = crc32c(&header[..56]);
-        header[56..60].copy_from_slice(&crc.to_le_bytes());
+        let crc = crc32c(&header[..124]);
+        header[124..128].copy_from_slice(&crc.to_le_bytes());
         wal.write_at(&header, at).unwrap();
         patched += 1;
     }

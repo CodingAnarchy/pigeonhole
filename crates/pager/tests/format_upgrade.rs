@@ -8,7 +8,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use pigeonhole_format::FormatVersion;
-use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
+use pigeonhole_format::superblock::{
+    EXTENSION_AREA, Features, SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock,
+};
 use pigeonhole_io::sim::{SimOp, SimVfs};
 use pigeonhole_io::{FileRef, OpenOptions, Vfs, VfsRef};
 use pigeonhole_pager::{Pager, Root};
@@ -124,4 +126,125 @@ fn a_new_file_has_nothing_to_upgrade() {
     drop(Pager::create(&v, path()).unwrap());
     let (_, wrote) = open(&vfs, true);
     assert!(!wrote);
+}
+
+/// Rewrites both pages with `features`, keeping everything else.
+fn set_features(vfs: &Arc<SimVfs>, features: Features) {
+    let f = file(vfs);
+    for page in [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B] {
+        let mut sb = read_page(&f, page).unwrap();
+        sb.features = features;
+        let mut buf = [0u8; PAGE];
+        sb.encode(&mut buf);
+        f.write_at(&buf, page * PAGE as u64).unwrap();
+    }
+    f.sync_all().unwrap();
+}
+
+fn features(vfs: &Arc<SimVfs>) -> [Features; 2] {
+    let f = file(vfs);
+    [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B].map(|p| read_page(&f, p).unwrap().features)
+}
+
+fn refused(vfs: &Arc<SimVfs>, writable: bool) -> pigeonhole_format::Error {
+    let v: VfsRef = vfs.clone();
+    match Pager::open(&v, path(), writable) {
+        Err(pigeonhole_pager::Error::Format(e)) => e,
+        Err(e) => panic!("expected a format error, got {e:?}"),
+        Ok(_) => panic!("opened (writable: {writable})"),
+    }
+}
+
+#[test]
+fn feature_bits_this_build_does_not_know() {
+    // D269: an unknown ro_compat bit refuses a writer and admits a reader.
+    let vfs = prepare();
+    let ro = Features {
+        ro_compat: 1 << 7,
+        ..Features::default()
+    };
+    set_features(&vfs, ro);
+    assert!(matches!(
+        refused(&vfs, true),
+        pigeonhole_format::Error::UnsupportedFeature { value: 128, .. }
+    ));
+    let (root, wrote) = open(&vfs, false);
+    assert_eq!((root.manifest_version, wrote), (2, false));
+
+    // An unknown incompat bit refuses both.
+    let vfs = prepare();
+    set_features(
+        &vfs,
+        Features {
+            incompat: 1 << 2,
+            ..Features::default()
+        },
+    );
+    for writable in [false, true] {
+        assert!(matches!(
+            refused(&vfs, writable),
+            pigeonhole_format::Error::UnsupportedFeature { value: 4, .. }
+        ));
+    }
+
+    // An unknown compat bit admits a writer, and its commits keep the bit on both pages.
+    let vfs = prepare();
+    let compat = Features {
+        compat: 1 << 33,
+        ..Features::default()
+    };
+    set_features(&vfs, compat);
+    let v: VfsRef = vfs.clone();
+    let pager = Pager::open(&v, path(), true)
+        .unwrap()
+        .finish(Vec::new())
+        .unwrap();
+    for manifest_version in [3, 4] {
+        pager
+            .commit_root(Root {
+                manifest_version,
+                ..Root::default()
+            })
+            .unwrap();
+    }
+    drop(pager);
+    assert_eq!(features(&vfs), [compat; 2]);
+}
+
+#[test]
+fn the_extension_area_is_carried_into_every_commit() {
+    // D269: a later 1.x feature's bytes in 128..4088 survive a build that does not know it.
+    let vfs = prepare();
+    let f = file(&vfs);
+    let mut ext = vec![0u8; EXTENSION_AREA.len()];
+    for (i, b) in ext.iter_mut().enumerate() {
+        *b = (i % 251) as u8 + 1;
+    }
+    for page in [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B] {
+        let mut buf = [0u8; PAGE];
+        f.read_at(&mut buf, page * PAGE as u64).unwrap();
+        buf[EXTENSION_AREA].copy_from_slice(&ext);
+        f.write_at(&buf, page * PAGE as u64).unwrap();
+    }
+    f.sync_all().unwrap();
+    let v: VfsRef = vfs.clone();
+    let pager = Pager::open(&v, path(), true)
+        .unwrap()
+        .finish(Vec::new())
+        .unwrap();
+    for manifest_version in [3, 4, 5] {
+        pager
+            .commit_root(Root {
+                manifest_version,
+                ..Root::default()
+            })
+            .unwrap();
+    }
+    drop(pager);
+    for page in [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B] {
+        let mut buf = [0u8; PAGE];
+        f.read_at(&mut buf, page * PAGE as u64).unwrap();
+        assert!(buf[EXTENSION_AREA] == ext[..], "page {page}");
+        assert!(Superblock::decode(&buf).unwrap().manifest_version >= 4);
+    }
 }

@@ -1230,7 +1230,7 @@ impl WalScan {
     #[allow(clippy::type_complexity)]
     fn grid(&mut self, len: u64) -> Result<Option<(u64, Vec<Option<SegmentHeader>>)>> {
         let s = self.stream.0;
-        let mut probe = [0u8; 64];
+        let mut probe = [0u8; pigeonhole_format::wal::SEGMENT_HEADER_LEN];
         let mut segment_size = None;
         let mut off = 0;
         while off + probe.len() as u64 <= len {

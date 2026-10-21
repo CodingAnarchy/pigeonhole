@@ -8,7 +8,7 @@ mod common;
 
 use common::*;
 use pigeonhole_format::wal::FRAME_SIZE;
-use pigeonhole_format::{Durability, Lsn};
+use pigeonhole_format::{Durability, FormatVersion, Lsn};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{ErrorKind, OpenOptions, VfsRef};
 use pigeonhole_wal::{CommitTicket, Error, Wal, WalOptions, WalStream};
@@ -839,6 +839,21 @@ fn a_stream_written_before_d209_recovers_and_reopens() {
     let (got, r) = replay(&vfs, Lsn::default()).unwrap();
     assert_eq!(got.seqnos(), (1..=12).collect::<Vec<_>>());
     assert_eq!(got.end, t.end);
+    // The old segments keep their 60-byte headers; the new one has format 4's 128 bytes,
+    // and both read back (D269).
+    let versions: Vec<(u32, u32)> = headers(&vfs, opts.segment_size)
+        .iter()
+        .flatten()
+        .map(|h| (h.epoch, h.version.0))
+        .collect();
+    assert!(
+        versions.contains(&(6, FormatVersion::CURRENT.0)),
+        "{versions:?}"
+    );
+    assert!(
+        versions.iter().any(|&(_, v)| v < 4),
+        "an old header was rewritten: {versions:?}"
+    );
     // And once more from a checkpoint inside the old file's segments.
     drop(r.into_stream(opts).unwrap());
     let (again, _) = replay(&vfs, Lsn::default()).unwrap();

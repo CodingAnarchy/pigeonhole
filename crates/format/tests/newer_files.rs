@@ -22,6 +22,7 @@ fn sb(version: u32, sequence: u64) -> Superblock {
         manifest_version: 0,
         file_pages: 16,
         flags: 0,
+        features: Default::default(),
     }
 }
 

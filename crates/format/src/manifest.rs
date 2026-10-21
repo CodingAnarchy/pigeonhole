@@ -96,7 +96,8 @@ pub fn encode_block(header: &ManifestHeader, edits: &[Edit], out: &mut Vec<u8>) 
 /// deltas must carry consecutive versions following the snapshot's.
 ///
 /// Edits with a tag this build does not know are skipped (their length prefix makes that
-/// possible) and are not returned.
+/// possible) and are not returned when the tag is 128 or more; below 128 the edit must be
+/// understood and the block fails with [`Error::UnsupportedFeature`] (D269).
 pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>, usize)> {
     const WHAT: &str = "manifest block";
     let Some(h) = bytes.get(..MANIFEST_HEADER_LEN) else {
@@ -144,9 +145,27 @@ pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>, u
     let mut pos = 0;
     for _ in 0..edit_count {
         let rest = &body[pos..];
-        if rest.first().is_some_and(|tag| !KNOWN_TAGS.contains(tag)) {
-            pos += skip_edit(rest)?;
-            continue;
+        match rest.first() {
+            // No build writes tag 0: damage, not a newer build's edit.
+            Some(0) => {
+                return Err(Error::Corrupt {
+                    what: "manifest edit tag 0",
+                });
+            }
+            // An unknown tag below 128 is a must-understand edit from a newer build: skipping
+            // it could change what the manifest means (D269; FORMAT §9.3).
+            Some(&tag) if !KNOWN_TAGS.contains(&tag) && tag < SKIPPABLE_TAGS => {
+                return Err(Error::UnsupportedFeature {
+                    what: "manifest edit tag",
+                    value: u64::from(tag),
+                });
+            }
+            // From 128 an unknown edit is safe to skip; its length prefix allows it.
+            Some(tag) if !KNOWN_TAGS.contains(tag) => {
+                pos += skip_edit(rest)?;
+                continue;
+            }
+            _ => {}
         }
         let (e, n) = Edit::decode(rest)?;
         edits.push(e);
@@ -165,6 +184,11 @@ const MIN_EDIT_BYTES: usize = 2;
 
 /// Tags this build decodes (FORMAT §9.3).
 const KNOWN_TAGS: std::ops::RangeInclusive<u8> = 1..=13;
+
+/// The first edit tag an older build may skip (D269): tags 1..=127 must be understood,
+/// 128..=255 may be ignored. Tag 13 (`SstBlobRefs`), added before the ranges, is
+/// understood by every build since and skipped by older ones.
+pub const SKIPPABLE_TAGS: u8 = 128;
 
 /// Length of the edit at the front of `input`, whatever its tag.
 fn skip_edit(input: &[u8]) -> crate::Result<usize> {

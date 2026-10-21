@@ -76,7 +76,9 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError, TryLockError};
 
-use pigeonhole_format::superblock::{SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
+use pigeonhole_format::superblock::{
+    EXTENSION_AREA, Features, SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock,
+};
 use pigeonhole_format::{FormatVersion, ManifestVersion, PAGE_SIZE};
 use pigeonhole_io::{Completion, ErrorKind, FileRef, IoBuf, OpenOptions, VfsRef};
 
@@ -241,6 +243,8 @@ pub struct OpenedPager {
     slot: u64,
     /// Either superblock page holds a valid superblock of an older format version.
     older: bool,
+    /// The current page's extension area.
+    extension: Extension,
 }
 
 impl OpenedPager {
@@ -325,6 +329,8 @@ impl OpenedPager {
                     root: Root::from_superblock(&self.superblock),
                     sequence: self.superblock.sequence,
                     slot: self.slot,
+                    features: self.superblock.features,
+                    extension: self.extension,
                     poisoned: false,
                 }),
                 committing: AtomicBool::new(false),
@@ -508,6 +514,11 @@ struct CommitState {
     sequence: u64,
     /// Page of the current superblock; the next commit writes the other one.
     slot: u64,
+    /// The file's feature sets (format 4, D269), carried into every root commit: compat
+    /// bits a newer build set are kept, not cleared.
+    features: Features,
+    /// The extension area, carried likewise (D269).
+    extension: Extension,
     /// A sync of the file failed: a commit's (the on-disk root is uncertain) or a growth's
     /// or truncation's. An fsync error may have dropped written data, and on Linux it is
     /// reported to one sync only, so a later sync succeeding proves nothing: no further
@@ -573,10 +584,13 @@ fn random_db_id(vfs: &VfsRef, path: &Path) -> [u8; 16] {
 }
 
 /// Reads one superblock slot. A short file reads as a truncated (invalid) superblock.
-fn read_slot(file: &FileRef, slot: u64) -> Result<pigeonhole_format::Result<Superblock>> {
-    let mut page = [0u8; PAGE_SIZE];
-    match file.read_at(&mut page, slot * PAGE_SIZE as u64) {
-        Ok(()) => Ok(Superblock::decode(&page)),
+fn read_slot(
+    file: &FileRef,
+    slot: u64,
+    page: &mut [u8; PAGE_SIZE],
+) -> Result<pigeonhole_format::Result<Superblock>> {
+    match file.read_at(page, slot * PAGE_SIZE as u64) {
+        Ok(()) => Ok(Superblock::decode(page)),
         Err(e) if e.kind == ErrorKind::UnexpectedEof => {
             Ok(Err(pigeonhole_format::Error::Truncated {
                 what: "superblock",
@@ -589,13 +603,45 @@ fn read_slot(file: &FileRef, slot: u64) -> Result<pigeonhole_format::Result<Supe
 /// The current superblock and its page, and whether either page holds a valid superblock of
 /// an older format version.
 fn read_superblocks(file: &FileRef) -> Result<(Superblock, u64, bool)> {
-    let a = read_slot(file, SUPERBLOCK_PAGE_A)?;
-    let b = read_slot(file, SUPERBLOCK_PAGE_B)?;
+    read_superblocks_with(file).map(|(sb, slot, older, _)| (sb, slot, older))
+}
+
+/// As [`read_superblocks`], with the current page's extension area (zero before format 4).
+fn read_superblocks_with(file: &FileRef) -> Result<(Superblock, u64, bool, Extension)> {
+    let mut pages = [[0u8; PAGE_SIZE]; 2];
+    let [page_a, page_b] = &mut pages;
+    let a = read_slot(file, SUPERBLOCK_PAGE_A, page_a)?;
+    let b = read_slot(file, SUPERBLOCK_PAGE_B, page_b)?;
     let older = [&a, &b]
         .iter()
         .any(|r| matches!(r, Ok(sb) if sb.version < FormatVersion::CURRENT));
     let (sb, slot) = Superblock::choose(a, b)?;
-    Ok((sb, slot, older))
+    let mut extension = Extension::default();
+    if sb.version >= FormatVersion(4) {
+        let page = &pages[usize::from(slot == SUPERBLOCK_PAGE_B)];
+        extension.0.copy_from_slice(&page[EXTENSION_AREA]);
+    }
+    Ok((sb, slot, older, extension))
+}
+
+/// The superblock's extension area (FORMAT §8.2, D269), carried unchanged into every root
+/// commit so a later 1.x feature's data there survives a build that does not know it.
+#[derive(Clone)]
+struct Extension(Box<[u8; EXTENSION_LEN]>);
+
+const EXTENSION_LEN: usize = EXTENSION_AREA.end - EXTENSION_AREA.start;
+
+impl Default for Extension {
+    fn default() -> Self {
+        Self(Box::new([0; EXTENSION_LEN]))
+    }
+}
+
+impl fmt::Debug for Extension {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let used = self.0.iter().filter(|&&b| b != 0).count();
+        write!(f, "Extension({used} nonzero bytes)")
+    }
 }
 
 impl Inner {
@@ -619,7 +665,7 @@ impl Inner {
         }
         let sequence = st.sequence + 1;
         let slot = st.slot ^ 1;
-        drop(st);
+        let features = st.features;
         let file_pages = self.frontier.load(Ordering::Acquire) * UNIT_PAGES;
         let sb = Superblock {
             version: FormatVersion::CURRENT,
@@ -633,9 +679,12 @@ impl Inner {
             manifest_version: root.manifest_version,
             file_pages,
             flags: if clean { FLAG_CLEAN } else { 0 },
+            features,
         };
         let mut page = Box::new([0u8; PAGE_SIZE]);
         sb.encode(&mut page);
+        page[EXTENSION_AREA].copy_from_slice(&st.extension.0[..]);
+        drop(st);
         Ok(PendingCommit {
             page,
             slot,
@@ -798,6 +847,7 @@ impl Pager {
             manifest_version: 0,
             file_pages: UNIT_PAGES,
             flags: 0,
+            features: Default::default(),
         };
         let mut page = [0u8; PAGE_SIZE];
         superblock.encode(&mut page);
@@ -814,6 +864,7 @@ impl Pager {
             superblock,
             slot: SUPERBLOCK_PAGE_A,
             older: false,
+            extension: Extension::default(),
         }
         .finish([])
     }
@@ -824,13 +875,19 @@ impl Pager {
         let mut opts = OpenOptions::read();
         opts.write = writable;
         let file = vfs.open(path, opts)?;
-        let (superblock, slot, older) = read_superblocks(&file)?;
+        let (superblock, slot, older, extension) = read_superblocks_with(&file)?;
+        // `choose` refused unknown incompatible features; a writer also refuses unknown
+        // read-only-compatible ones (a reader process may read the file).
+        if writable {
+            superblock.features.check_write()?;
+        }
         Ok(OpenedPager {
             file,
             writable,
             superblock,
             slot,
             older,
+            extension,
         })
     }
 

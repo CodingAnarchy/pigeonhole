@@ -793,6 +793,12 @@ impl Engine {
         }
         let mut live = manifest_extents;
         live.extend(catalog.data_extents());
+        // `finish` upgrades an older file's superblocks, even for an open that is read-only
+        // because of an unregistered merge operator: that open still writes (a new WAL
+        // segment at the current version, or the recovered memtables' SSTs and manifest
+        // commits), and current-version bytes behind older superblocks are what an older
+        // build skips as torn (#774). A no-write read-only open, which would skip the
+        // upgrade, comes with `read_only_fallback` (#496 PR 4, ICR 0059).
         let pager = Arc::new(opened.finish(live)?);
         open_data_file(&vfs, path, &pager, options.direct_io, true)?;
         if let Some((block, from)) = options.grow_ahead {
