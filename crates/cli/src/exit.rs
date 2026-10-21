@@ -90,6 +90,22 @@ impl Failure {
         }
     }
 
+    /// A write in a read-only shell (exit 1, the `ReadOnly` error code).
+    pub(crate) fn read_only(mode: &str) -> Self {
+        Self {
+            code: "ReadOnly".into(),
+            code_num: Some(ErrorCode::ReadOnly as u32),
+            message: format!("read-only ({mode}): writes are refused"),
+            status: ExitStatus::ERROR,
+        }
+    }
+
+    /// The same failure, naming the script or `-c` line it came from.
+    pub(crate) fn at_line(mut self, line: usize) -> Self {
+        self.message = format!("line {line}: {}", self.message);
+        self
+    }
+
     /// An I/O error outside the database (writing the output).
     pub(crate) fn io(what: &str, e: &std::io::Error) -> Self {
         Self {

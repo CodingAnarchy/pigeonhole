@@ -1,0 +1,37 @@
+---
+source: crates/cli/tests/common/mod.rs
+expression: text
+---
+created  b
+created  a
+table
+a
+b
+table  name  counter  max_versions  ttl_micros  compression  merge_operator
+a      x     false    0             -           lz4          -
+a      y     true     0             -           lz4          -
+mode      writer
+writable  true
+failed    false
+failure   -
+metric              value
+flushes             0
+compactions         0
+write_stalls        0
+block_cache_hits    0
+block_cache_misses  0
+commands (one per line; values are bytes: "quoted\n", 0xhex, b64:base64):
+  get    <table> <row> [<family>[:<qualifier>]] [--versions N] [--time A..B] [--at SNAP]
+  scan   <table> [<start> [<end>]] [--prefix P] [--family F]... [--qualifier-prefix Q]
+         [--value-eq V | --value-prefix V | --i64 <op><n>] [--versions N] [--time A..B]
+         [--limit N] [--columns-per-row N] [--at SNAP]
+  put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
+  incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
+  delete <table> <row> [<family>[:<qualifier>]] [--ts US]
+  create <table> <family>[:counter]...
+  snapshot [--durable] <name>     release <name>
+  \tables  \schema [table]  \info  \metrics  \health
+  \format table|json|jsonl|csv  \timing on|off  \help  \quit
+table
+a
+b

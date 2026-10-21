@@ -59,14 +59,15 @@ pub fn phdb(args: &[&str]) -> Run {
 /// it), the 32-hex-digit database id and the file-level byte counts masked.
 pub fn snapshot(name: &str, dir: &TempDir, text: &str) {
     // Paths print with the platform's separators, and JSON escapes Windows' backslashes:
-    // mask the directory in both spellings, then normalize the separators.
+    // mask the directory in both spellings, then normalize the separator after it (only
+    // there: other backslashes, such as the shell's \\help, are output).
     let plain = dir.path().display().to_string();
     let escaped = serde_json::to_string(&plain).unwrap();
     let text = text
         .replace(&escaped[1..escaped.len() - 1], "[DIR]")
         .replace(&plain, "[DIR]")
-        .replace("\\\\", "/")
-        .replace('\\', "/");
+        .replace("[DIR]\\\\", "[DIR]/")
+        .replace("[DIR]\\", "[DIR]/");
     let mut settings = insta::Settings::clone_current();
     // Relative to this file: `tests/snapshots/`.
     settings.set_snapshot_path("../snapshots");

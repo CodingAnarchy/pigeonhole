@@ -19,7 +19,7 @@ pub(crate) fn run(cli: &Cli, file: &Path) -> Result<Report, Failure> {
     Ok(report(file, mode, &info?))
 }
 
-fn report(file: &Path, mode: &'static str, info: &DatabaseInfo) -> Report {
+pub(crate) fn report(file: &Path, mode: &'static str, info: &DatabaseInfo) -> Report {
     let db_id: String = info.db_id.iter().map(|b| format!("{b:02x}")).collect();
     // Shards are not stored in the file: as the writer, phdb opened with its own count, so
     // only a reader (the running writer's count) reports one.

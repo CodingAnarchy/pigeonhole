@@ -10,8 +10,8 @@ use crate::output::Report;
 mod backup;
 mod check;
 mod compact;
-mod dump;
-mod info;
+pub(crate) mod dump;
+pub(crate) mod info;
 mod load;
 pub(crate) mod schema;
 
@@ -36,6 +36,23 @@ pub(crate) fn run(
         } => {
             return dump::run(&cli, file, tables, prefix.as_deref(), *durable, stdout)
                 .map(Outcome::Streamed);
+        }
+        Command::Shell {
+            file,
+            commands,
+            script,
+            read_only,
+        } => {
+            return crate::shell::run(
+                &cli,
+                file,
+                commands,
+                script.as_deref(),
+                *read_only,
+                stdout,
+                stderr,
+            )
+            .map(Outcome::Streamed);
         }
         Command::Load {
             file,

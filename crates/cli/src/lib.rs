@@ -15,6 +15,7 @@ mod cmd;
 mod exit;
 mod open;
 mod output;
+mod shell;
 
 pub use exit::ExitStatus;
 

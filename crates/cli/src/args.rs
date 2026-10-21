@@ -95,6 +95,23 @@ pub(crate) enum Command {
         #[arg(long)]
         shrink: bool,
     },
+    /// An interactive shell (get, scan, put, incr, delete, create, snapshots; `\\help`):
+    /// commands from `-c`, a script (`-f`), piped input, or a terminal.
+    /// With a writer process running it is a read-only reader.
+    Shell {
+        /// The database file (`*.phdb`).
+        file: PathBuf,
+        /// Run this command, then exit (repeat for several, in order). The first failure
+        /// stops with its exit status.
+        #[arg(short = 'c', long = "command", value_name = "COMMAND")]
+        commands: Vec<String>,
+        /// Run the commands in this file, one per line, then exit.
+        #[arg(short = 'f', long = "file", value_name = "SCRIPT")]
+        script: Option<PathBuf>,
+        /// Refuse writes even when phdb is the writer.
+        #[arg(long)]
+        read_only: bool,
+    },
     Check {
         /// The database file (`*.phdb`).
         file: PathBuf,

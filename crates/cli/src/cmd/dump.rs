@@ -150,7 +150,7 @@ fn dump(
     Ok(())
 }
 
-fn value_json(v: Cell<'_>) -> Value {
+pub(crate) fn value_json(v: Cell<'_>) -> Value {
     match v {
         Cell::Bytes(b) => bytes_json(b),
         Cell::I64(n) | Cell::Varint(n) => json!({ "i64": n }),
