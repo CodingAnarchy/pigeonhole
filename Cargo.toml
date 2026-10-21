@@ -65,6 +65,7 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 proptest = "1"
 loom = "0.7"
 criterion = "0.8"
+rustix = { version = "1", default-features = false, features = ["std", "time"] }
 
 # Local disk budget for target/ (cargo-quota; cargo ignores this table). One pool across
 # every git worktree of the repo, pruned least recently used first; anything used within

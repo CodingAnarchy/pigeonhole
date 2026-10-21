@@ -135,6 +135,7 @@ All MIT/Apache-2.0 compatible (D6); none is a storage engine (spec: Pigeonhole o
 | `proptest` (dev) | MIT/Apache-2.0 | declared | Property tests (format order, round trips, model checks). Crates add it as a dev-dependency when they write those tests. |
 | `loom` (dev, `cfg(loom)`) | MIT | memtable, cache | Concurrency model checking required by their briefs. |
 | `criterion` (dev) | MIT/Apache-2.0 | declared | Benchmarks for every path with a latency target. |
+| `rustix` (dev, unix, `time`) | Apache-2.0 WITH LLVM-exception/Apache-2.0/MIT | engine | A test thread's CPU time (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) without `unsafe`, for cost comparisons that other tests running beside them must not skew (#795; owner, 2026-10-21). Already in the tree through `tempfile`. |
 | `clap` (derive) | MIT/Apache-2.0 | cli | `phdb`'s arguments, help and usage errors (#692; owner, 2026-10-20). |
 | `serde_json` (`preserve_order`) | MIT/Apache-2.0 | cli (bench also uses it) | `phdb`'s JSON and JSONL output, with fields in their documented order. |
 | `insta` (dev, `filters`) | Apache-2.0 | cli | Snapshot tests of `phdb`'s output (the spec's "snapshot tests of CLI output"). |
