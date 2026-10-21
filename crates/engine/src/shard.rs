@@ -455,6 +455,12 @@ pub(crate) struct Shared {
     /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits
     /// and by coordinators choosing a cross-shard commit timestamp.
     pub ts_floors: Vec<Padded>,
+    /// Per shard, the largest seqno `F` such that every write that shard will ever hold at
+    /// a seqno at or below `F` is in a durable SST (#724): below its oldest unflushed
+    /// memtable entry and at most the visible watermark. Published (Release) by the shard
+    /// after a flush's root commit, at `Start`, and when an unpin finds nothing to flush;
+    /// never decreases. 0 until the shard's first publish.
+    pub flushed_through: Vec<Padded>,
     /// Per shard, the floor other shards raise it to (`fetch_max`), D264: a shard handing it
     /// a tablet raises it to its own floor (D11: the floor travels with the tablet), and a
     /// coordinator to a cross-shard commit's timestamp before it reserves the commit's seqno
@@ -2905,6 +2911,54 @@ impl ShardState {
         self.shared.balance.enabled
     }
 
+    /// The largest seqno at or below which every write this shard will hold is in a
+    /// durable SST (`Shared::flushed_through`): one below the oldest entry of its unflushed
+    /// memtables (`MemSlot::unflushed`: an active memtable whose SST is in the manifest, or
+    /// a frozen one listed in `flushed_roots`, does not count), and at most the visible
+    /// watermark. A write at or below the visible watermark can no longer reach this shard's
+    /// memtables: a cross-shard share's seqno stays held by its coordinator until every
+    /// participant has applied it, a single's is behind this shard's pending watermark from
+    /// its reservation, and a tablet changes shard only once its memtables are flushed.
+    fn flushed_through(&self, oldest_unflushed: Option<Seqno>) -> Seqno {
+        let vis = self.shared.shm.visible_seqno();
+        oldest_unflushed.map_or(vis, |o| o.saturating_sub(1).min(vis))
+    }
+
+    /// The oldest entry of this shard's unflushed memtables (`MemSlot::unflushed`), if any.
+    fn oldest_unflushed(&self) -> Option<Seqno> {
+        self.shared.flushed_roots.read(|flushed| {
+            self.memtables
+                .values()
+                .flat_map(|slot| slot.unflushed(self.id, flushed))
+                .filter_map(|m| m.table.seqno_range().map(|(min, _)| min))
+                .min()
+        })
+    }
+
+    /// Publishes `flushed_through` (Release). It never decreases; a lower value would break
+    /// the bound itself, so it is asserted, not clamped.
+    fn publish_flushed_through(&mut self) {
+        self.publish_flushed_through_from(self.oldest_unflushed());
+    }
+
+    /// `publish_flushed_through` with this shard's oldest unflushed entry already found.
+    /// Returns the value published (0 on a reader's state, which publishes nothing).
+    fn publish_flushed_through_from(&mut self, oldest_unflushed: Option<Seqno>) -> Seqno {
+        let f = self.flushed_through(oldest_unflushed);
+        let Some(slot) = self.shared.flushed_through.get(usize::from(self.id.0)) else {
+            return 0;
+        };
+        let was = slot.0.load(Ordering::Relaxed);
+        debug_assert!(
+            f >= was,
+            "shard {}: flushed-through seqno went back from {was} to {f}",
+            self.id.0
+        );
+        trace!("shard {} flushed through {f}", self.id.0);
+        slot.0.store(f, Ordering::Release);
+        f
+    }
+
     pub(crate) fn raise_ts_floor(&mut self, ts: Timestamp) {
         trace!("shard {} raise floor {} -> {ts}", self.id.0, self.ts_floor);
         if ts > self.ts_floor {
@@ -3910,6 +3964,8 @@ impl ShardState {
                 // keeps every retired chunk (#104). They retire under arena pressure only.
                 self.reclaim_retired();
                 self.prune_flushed_slots(&landed);
+                // After the root commit that made these SSTs durable (#724).
+                self.publish_flushed_through();
                 self.report_shares_flushed(ctx);
                 self.advance_checkpoint(ctx);
             }
@@ -5980,6 +6036,17 @@ impl ShardState {
         self.start_pin_pass(Pinning::Through(through), false, ctx);
         let shares: Vec<(TabletId, FamilyId)> = self.unreported.slots_through(through).collect();
         self.unpin.extend(shares);
+        // Nothing unflushed at or below `through`: no flush will publish a higher
+        // flushed-through seqno, so publish it now (#724, perf287's review).
+        let oldest = self.oldest_unflushed();
+        if oldest.is_none_or(|o| o > through) {
+            let _f = self.publish_flushed_through_from(oldest);
+            #[cfg(feature = "test-hooks")]
+            self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .unpin_published
+                .store(_f, Ordering::Relaxed);
+        }
         if self.freeze(false).is_err() {
             self.poison(crate::health::FailureCause::Internal);
         }
@@ -8619,6 +8686,8 @@ impl ShardState {
             }
             ShardMsg::Start => {
                 self.replaying = false;
+                // After replay: a shard with nothing to flush never publishes otherwise.
+                self.publish_flushed_through();
                 self.maybe_prepare_spares(ctx);
                 // Replayed shares with nothing left to flush report at once.
                 self.report_shares_flushed(ctx);

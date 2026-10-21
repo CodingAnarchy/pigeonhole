@@ -1291,6 +1291,17 @@ impl ShardState {
         op.committing = true;
         let kind = op.kind.clone();
         let entries = op.entries.clone();
+        // A tablet changes shard only once its memtables are flushed (`progress_op`): the
+        // flushed-through seqno (`Shared::flushed_through`) relies on it, since no write at or
+        // below it may leave this shard's memtables for another's (#724).
+        debug_assert!(
+            self.memtables
+                .iter()
+                .filter(|(k, _)| self.moving.contains(&k.0))
+                .all(|(_, s)| s.active.table.is_empty() && s.frozen.is_empty()),
+            "shard {}: a tablet change commits with unflushed memtables on its tablets",
+            self.id.0
+        );
         // D11: default timestamps never go backwards on a tablet. A shard receiving one
         // starts above every default timestamp this shard assigned (an upper bound on the
         // tablet's own floor).

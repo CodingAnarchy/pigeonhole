@@ -888,6 +888,7 @@ impl Engine {
             failure: Default::default(),
             close: CloseState::new(shards),
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
+            flushed_through: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             ts_floors: (0..shards)
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
@@ -1441,6 +1442,7 @@ impl Engine {
             close: CloseState::new(0),
             metrics: Vec::new(),
             ts_floors: Vec::new(),
+            flushed_through: Vec::new(),
             ts_raises: Vec::new(),
             loads: Vec::new(),
             balance: BalanceConfig::default(),

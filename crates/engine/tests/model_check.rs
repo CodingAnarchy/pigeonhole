@@ -524,6 +524,27 @@ fn crash_at_every_write_point() {
 }
 
 #[test]
+fn crashes_check_every_shards_flushed_through_seqno() {
+    // #724: at every crash the checker asserts that each acknowledged write at or below its
+    // shard's published flushed-through seqno is in an SST the durable manifest names
+    // (`check_flushed_through`). With tablet changes on, so moves and splits are covered
+    // (perf287). The check must have had writes to look at, or it shows nothing.
+    let mut cfg = Config::standard(250);
+    cfg.shards = 3;
+    cfg.tablet_changes = true;
+    cfg.flush_ppm = 100_000;
+    let mut checked = 0;
+    for seed in seeds() {
+        let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+        checked += stats.flushed_through_checks;
+    }
+    assert!(
+        checked > 0,
+        "no write was ever at or below a published flushed-through seqno"
+    );
+}
+
+#[test]
 fn io_errors_poison_shards_and_recover_on_reopen() {
     // Random read and write failures: a failed write or sync poisons the stream, commits
     // on it fail until the reopen, and whatever was acknowledged survives.
