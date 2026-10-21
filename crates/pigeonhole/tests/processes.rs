@@ -525,9 +525,11 @@ fn a_writer_killed_mid_stream_leaves_only_whole_commits() {
         );
         assert!(rows / K >= seen, "round {round}: lost commits a reader saw");
         seen = rows / K;
-        db.close().unwrap();
-        // The reader re-attaches to the next generation and agrees.
+        // The reader re-attaches to the new writer's generation and agrees. Asked while that
+        // writer runs: on Windows a closed writer's shared memory is gone once no process
+        // maps it, so a reader can't re-attach to a generation whose writer already left.
         assert_eq!(r.ask(&format!("batches {K}")), format!("BATCHES {seen}"));
+        db.close().unwrap();
     }
     reader.take().unwrap().quit();
 }

@@ -152,6 +152,7 @@ fn run(seed: u64) {
     // What the seed exercised: reader snapshots scanned, expired or busy reads, reader kills,
     // writer kills.
     let (mut scans, mut expired, mut reader_kills, mut writer_kills) = (0u32, 0u32, 0u32, 0u32);
+    let mut no_slot = 0u32;
 
     for step in 0..STEPS {
         let at = format!("seed {seed} step {step}");
@@ -184,6 +185,10 @@ fn run(seed: u64) {
                         db,
                         held: None,
                     }),
+                    // Killed readers hold their slots until the writer's next reclamation (a
+                    // flush, a compaction or a room stall past the interval): with every slot
+                    // held, a new reader is refused at once, as documented.
+                    Err(Error::NoReaderSlot) => no_slot += 1,
                     Err(e) => expired += typed(&e, &format!("{at}: open_reader")),
                 }
             }
@@ -276,7 +281,7 @@ fn run(seed: u64) {
     db.close().unwrap();
     eprintln!(
         "seed {seed}: {committed} batches, {scans} reader scans, {expired} expired or busy, \
-         {reader_kills} reader kills, {writer_kills} writer kills"
+         {reader_kills} reader kills, {writer_kills} writer kills, {no_slot} refused for slots"
     );
 }
 
