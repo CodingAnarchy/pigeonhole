@@ -861,6 +861,19 @@ impl Shared {
     /// is the last process, removes the WAL files (every stream is checkpointed to its end
     /// by now) and the shared-memory region, so the database is one file at rest.
     pub(crate) fn final_close(&self, failed: bool) -> Result<()> {
+        let result = self.final_close_steps(failed);
+        if self.application_owned {
+            // No runtime to shut down and no thread of ours to join: the application's own
+            // threads drive the shards, and this is its close, so the wait is fair here. On
+            // every exit of the steps, an error's included (#824 R3): the locks must go
+            // and `close_done` be set, or a second close waits for ever.
+            self.release_after_io();
+        }
+        result
+    }
+
+    /// `final_close` up to the release.
+    fn final_close_steps(&self, failed: bool) -> Result<()> {
         // A failed final sync means the close is not clean: the flag stays clear so the next
         // open replays, and the caller learns about it.
         let mut clean = if failed {
@@ -909,11 +922,6 @@ impl Shared {
                 remove_wal_files(&self.vfs, &self.path)?;
             }
             ShmRegion::remove(&self.vfs, self.identity, self.shm_dir.as_deref())?;
-        }
-        if self.application_owned {
-            // No runtime to shut down and no thread of ours to join: the application's own
-            // threads drive the shards, and this is its close, so the wait is fair here.
-            self.release_after_io();
         }
         clean
     }

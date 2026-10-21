@@ -157,9 +157,10 @@ struct Shared {
     in_flight: Mutex<usize>,
     /// Signalled when `in_flight` reaches zero.
     in_flight_done: Condvar,
-    /// A close is waiting for the stream's submitted I/O ([`IoTracker::wait_idle`]): a
-    /// spare preparation still running submits nothing more and settles with its slots
-    /// blank, so the wait ends with what is in flight rather than with the whole fill.
+    /// A close is waiting for the stream's submitted I/O ([`IoTracker::wait_idle`]): no
+    /// operation is granted a token any more (`track`, under the `in_flight` lock), so a
+    /// spare preparation still running settles with its slots blank once its writes in
+    /// flight landed, and a held header's chain ends with an error instead of its write.
     closing_io: AtomicBool,
 }
 
@@ -207,19 +208,19 @@ impl IoTracker {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Blocks until no submitted operation is in flight, and stops a spare preparation
-    /// still running from submitting more (it settles once its writes in flight landed).
-    /// A preparation counts as in flight while it lives, so the wait never returns between
-    /// two of its steps, whether or not the stream's threads are joined. Reaps I/O only the
-    /// calling thread completes meanwhile (#207).
+    /// Blocks until no submitted operation is in flight. Sets `closing_io` first, under the
+    /// count's lock, so nothing is granted a token after this saw the count at zero: a
+    /// spare preparation still running (one nobody polls meanwhile, on an application-owned
+    /// engine's single driver thread, say) can add nothing, and settles with its slots blank
+    /// when it is next polled. Reaps I/O only the calling thread completes meanwhile (#207).
     pub fn wait_idle(&self) {
         crate::foreground::may_block("a wait for a WAL stream's submitted I/O");
-        self.0.closing_io.store(true, Ordering::Release);
         let mut n = self
             .0
             .in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        self.0.closing_io.store(true, Ordering::Release);
         loop {
             if *n == 0 {
                 return;
@@ -590,13 +591,27 @@ impl Shared {
     /// [`Shared::side_sync`] with the sync submitted to the I/O backend (`submit` issues
     /// it): the returned completion resolves with the sync's own outcome, and a failure
     /// poisons the stream.
-    /// Counts a submitted operation (or a chain) until the token drops ([`IoTracker`]).
-    fn track(self: &Arc<Self>) -> InFlight {
-        *self
+    /// Counts a submitted operation (or a chain) until the token drops ([`IoTracker`]), or
+    /// refuses it (`None`) once a close waits for the stream's I/O: the check and the count
+    /// are one step under the `in_flight` lock, so a wait that saw the count at zero after
+    /// setting `closing_io` is never followed by a granted token, whoever still drives the
+    /// stream (an application-owned engine's single driver thread blocks in that wait,
+    /// and nothing polls a paused preparation meanwhile, #824 R2).
+    fn track(self: &Arc<Self>) -> Option<InFlight> {
+        let mut n = self
             .in_flight
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 1;
-        InFlight(Arc::clone(self))
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.closing_io.load(Ordering::Acquire) {
+            return None;
+        }
+        *n += 1;
+        Some(InFlight(Arc::clone(self)))
+    }
+
+    /// The error of an operation refused because the stream is closing.
+    fn closing_error() -> pigeonhole_io::Error {
+        pigeonhole_io::Error::new(pigeonhole_io::ErrorKind::Other, "the WAL stream is closing")
     }
 
     fn submit_side_sync(
@@ -605,7 +620,14 @@ impl Shared {
     ) -> Completion<()> {
         let ticket = self.start_sync();
         let shared = Arc::clone(self);
-        let token = self.track();
+        let Some(token) = self.track() else {
+            let mut syncs = self.syncs();
+            self.end_sync(&mut syncs, ticket, true);
+            let ready = syncs.settled();
+            drop(syncs);
+            self.tell(ready);
+            return Completion::ready(Err(Self::closing_error()));
+        };
         submit().map(move |r| {
             let _token = token;
             let ready = {
@@ -668,7 +690,15 @@ impl Shared {
         let ticket = self.start_sync();
         let (done, resolver) = Completion::pair();
         let shared = Arc::clone(self);
-        let token = self.track();
+        let Some(token) = self.track() else {
+            let mut syncs = self.syncs();
+            self.end_sync(&mut syncs, ticket, true);
+            let ready = syncs.settled();
+            drop(syncs);
+            self.tell(ready);
+            resolver.resolve(Err(Self::closing_error()));
+            return done;
+        };
         // The continuation's own completion is not needed: `resolver` reports the outcome.
         let _chained = submit().map(move |r| {
             let _token = token;
@@ -844,7 +874,6 @@ impl SpareSegments {
     pub fn start(&self, n: u32) -> SparePrep {
         let slots = self.reserve(n);
         SparePrep {
-            _in_flight: self.shared.track(),
             spares: self.clone(),
             next_slot: 0,
             next_offset: 0,
@@ -942,9 +971,6 @@ const PREP_WRITES_PER_POLL: usize = 4;
 /// Dropped before it resolves (at shutdown), it keeps its slots out of the pool: a write
 /// still in flight there must never land on a segment started in one later.
 pub struct SparePrep {
-    /// Counted as in flight while the preparation lives, so a wait between two of its
-    /// steps does not see zero; its submitted writes carry tokens of their own past its drop.
-    _in_flight: InFlight,
     spares: SpareSegments,
     /// `None` once settled (or when there was nothing to prepare).
     slots: Option<Reserved>,
@@ -1001,7 +1027,13 @@ impl SparePrep {
             Some(b) if b.len() == len => b,
             _ => IoBuf::zeroed(len),
         };
-        let token = self.spares.shared.track();
+        let Some(token) = self.spares.shared.track() else {
+            // A close waits for the stream's I/O (under the count's lock: nothing granted
+            // after its wait saw zero): the preparation ends with its slots blank.
+            self.buffers.push(buf);
+            self.failed = Some(Error::Io(Shared::closing_error()));
+            return;
+        };
         self.writes.push_back(
             self.spares
                 .file
@@ -1037,11 +1069,9 @@ impl Future for SparePrep {
         }
         let (mut submitted, mut allocated) = (0, false);
         if this.failed.is_none() && this.spares.shared.closing_io.load(Ordering::Acquire) {
-            // A close waits for the stream's I/O: finish what is in flight, submit no more.
-            this.failed = Some(Error::Io(pigeonhole_io::Error::new(
-                pigeonhole_io::ErrorKind::Other,
-                "the WAL stream is closing",
-            )));
+            // A close waits for the stream's I/O: finish what is in flight, submit no more
+            // (`track` refuses anyway; this skips the allocation of the next slot).
+            this.failed = Some(Error::Io(Shared::closing_error()));
         }
         loop {
             // Collect finished writes, oldest first.
@@ -1841,12 +1871,19 @@ impl Wal for WalStream {
         let rollover = Arc::clone(&held.synced);
         // The chain stays counted as in flight until its last step (#824): between the
         // rollover sync's completion and the header write's submission, and between that
-        // write's and the final sync's, nothing else would be.
-        let chain = self.shared.track();
+        // write's and the final sync's, nothing else would be. Refused once a close waits
+        // for the stream's I/O, as is the header write itself inside the chain.
+        let Some(chain) = self.shared.track() else {
+            return Err(Error::Io(Shared::closing_error()));
+        };
         held.synced.then(move |ok| {
             let chain = chain;
             if !ok {
                 resolver.resolve(Err(rollover.chained_error()));
+                return;
+            }
+            if shared.closing_io.load(Ordering::Acquire) {
+                resolver.resolve(Err(Shared::closing_error()));
                 return;
             }
             let mut header = pigeonhole_io::IoBuf::zeroed(frame.len());

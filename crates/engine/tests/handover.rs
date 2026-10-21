@@ -839,3 +839,68 @@ fn a_plain_close_releases_the_writer_lock_only_after_its_submitted_writes_landed
     }
     again.close().unwrap();
 }
+
+/// perf287's R2 on #828: an application-owned engine driven by one thread, with a spare
+/// zero-fill held. Its final close waits for the stream's I/O on that driver thread, so
+/// nothing polls the paused preparation meanwhile: the wait must not depend on it (before
+/// the fix the preparation's own token deadlocked the close). The close stays pending while
+/// the write is held and returns once it landed; the shard reports closed, and the lock
+/// bytes are free.
+#[test]
+fn an_application_owned_close_on_one_driver_thread_waits_for_a_held_zero_fill() {
+    let (vfs, gate) = gate::vfs(1611);
+    let mut o = options(Arc::clone(&vfs), 1);
+    o.wal.segment_size = 512 << 10;
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+    let mut shard = shards.remove(0);
+    let (closed_tx, closed_rx) = std::sync::mpsc::channel();
+    let driver = std::thread::spawn(move || {
+        while shard.closed().is_none() {
+            shard.run_once(u64::MAX);
+        }
+        let _ = closed_tx.send(shard.closed().unwrap());
+    });
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    gate.hold_writes(&wal(0));
+    for i in 0..300 {
+        db.commit(
+            put_sized(&t, &format!("row{i:03}"), 1 << 10),
+            Some(Durability::Buffered),
+        )
+        .unwrap();
+    }
+    gate.wait_held_write(&wal(0));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let db2 = Arc::clone(&db);
+    std::thread::spawn(move || {
+        let _ = tx.send(db2.close());
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(3)).is_err(),
+        "the close returned with a submitted write of the stream still in flight"
+    );
+    assert!(
+        closed_rx.try_recv().is_err(),
+        "the shard reported closed before the held write landed"
+    );
+    gate.release_writes();
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the close did not return once the held write landed")
+        .expect("a clean close");
+    closed_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the shard did not report closed")
+        .expect("the shard's close is clean");
+    driver.join().unwrap();
+    drop(db);
+    assert_eq!(probe(&vfs), (true, true), "released after the write landed");
+    let again = Engine::open(Path::new(DB), options(Arc::clone(&vfs), 1)).unwrap();
+    let t = again.table("t").unwrap();
+    for i in 0..300 {
+        assert!(has(&again, &t, &format!("row{i:03}")), "row{i:03}");
+    }
+    again.close().unwrap();
+}
