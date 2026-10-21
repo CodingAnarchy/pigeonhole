@@ -38,16 +38,18 @@ pub(crate) struct Db {
 /// current engine loaded from the `ArcSwap` (the slow path).
 pub(crate) enum EngineRef<'a> {
     Cached(&'a Arc<Engine>),
-    Loaded(arc_swap::Guard<Arc<Engine>>),
+    /// The slow path's own strong reference (an `Arc` clone, not an `arc_swap` guard, so
+    /// the fast path's drop glue is a discriminant check and nothing else).
+    Loaded(Arc<Engine>),
 }
 
 impl std::ops::Deref for EngineRef<'_> {
     type Target = Engine;
-    #[inline]
+    #[inline(always)]
     fn deref(&self) -> &Engine {
         match self {
             EngineRef::Cached(e) => e,
-            EngineRef::Loaded(g) => g,
+            EngineRef::Loaded(e) => e,
         }
     }
 }
@@ -57,7 +59,7 @@ impl EngineRef<'_> {
     pub(crate) fn to_arc(&self) -> Arc<Engine> {
         match self {
             EngineRef::Cached(e) => Arc::clone(e),
-            EngineRef::Loaded(g) => Arc::clone(g),
+            EngineRef::Loaded(e) => Arc::clone(e),
         }
     }
 }
@@ -81,7 +83,7 @@ impl Cached {
     }
 
     /// The engine for one operation.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn get<'a>(&'a self, db: &'a Db) -> EngineRef<'a> {
         if db.generation() == self.generation {
             EngineRef::Cached(&self.engine)
@@ -115,7 +117,7 @@ impl Db {
     /// `Cached`). Hold the guard only for the operation.
     #[inline]
     pub(crate) fn engine(&self) -> EngineRef<'_> {
-        EngineRef::Loaded(self.engine.load())
+        EngineRef::Loaded(Arc::clone(&self.engine.load()))
     }
 
     /// The generation the current engine was opened in (see [`Db::swap_engine`]).
