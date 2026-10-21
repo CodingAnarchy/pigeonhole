@@ -98,6 +98,50 @@ impl Histogram {
         self.max_ns = self.max_ns.max(ns);
     }
 
+    /// The non-empty buckets as `(bucket, count)`: how a reader process sends its histogram
+    /// to the run that spawned it (#683). [`Histogram::from_sparse`] rebuilds it.
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole_bench::Histogram;
+    ///
+    /// let mut h = Histogram::new();
+    /// for us in 1..=100 {
+    ///     h.record(Duration::from_micros(us));
+    /// }
+    /// let back = Histogram::from_sparse(&h.to_sparse());
+    /// assert_eq!(back.count(), 100);
+    /// assert_eq!(back.percentile(0.99), h.percentile(0.99));
+    /// ```
+    pub fn to_sparse(&self) -> Vec<(u32, u64)> {
+        self.counts
+            .iter()
+            .enumerate()
+            .filter(|&(_, &c)| c > 0)
+            .map(|(i, &c)| (i as u32, c))
+            .collect()
+    }
+
+    /// A histogram from [`Histogram::to_sparse`]'s buckets: the same counts, so the same
+    /// percentiles; the sum, minimum and maximum come from the buckets' upper bounds (within
+    /// a bucket's width, under 0.8%). Buckets out of range are ignored.
+    pub fn from_sparse(buckets: &[(u32, u64)]) -> Self {
+        let mut h = Self::new();
+        for &(i, c) in buckets {
+            let i = i as usize;
+            if i >= h.counts.len() || c == 0 {
+                continue;
+            }
+            let ns = highest(i);
+            h.counts[i] += c;
+            h.count += c;
+            h.sum_ns += u128::from(ns) * u128::from(c);
+            h.min_ns = h.min_ns.min(ns);
+            h.max_ns = h.max_ns.max(ns);
+        }
+        h
+    }
+
     /// Adds every sample of `other`.
     pub fn merge(&mut self, other: &Histogram) {
         for (a, b) in self.counts.iter_mut().zip(other.counts.iter()) {

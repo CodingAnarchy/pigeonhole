@@ -39,14 +39,15 @@ mod workload;
 pub use histogram::Histogram;
 pub use report::{
     Comparison, Delta, EngineCommit, Environment, GroupCommit, JUDGED_MIN_COMMITS, JUDGED_MIN_SECS,
-    LatencyStats, OpTypeStats, Placement, ReadSplit, Riders, Rounds, RunDetail, RunRecord,
-    SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
+    LatencyStats, OpTypeStats, Placement, ReadSplit, ReaderProcesses, Riders, Rounds, RunDetail,
+    RunRecord, SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
 };
 #[cfg(feature = "fjall")]
 pub use runners::fjall::FjallRunner;
 pub use runners::inline::INLINE_IN_FLIGHT;
 pub use runners::pigeonhole::DEFAULT_MEMTABLE_BUDGET;
 pub use runners::placement::{PLACEMENT_RATE_PER_SHARD, PLACEMENT_SETTLE_BOUND, PlacementOptions};
+pub use runners::reader_process::{EXE_ENV as READER_EXE_ENV, child as reader_child};
 #[cfg(feature = "rocksdb")]
 pub use runners::rocksdb::RocksDbRunner;
 #[cfg(feature = "sqlite")]
@@ -653,6 +654,22 @@ pub trait Runner {
         Ok(None)
     }
 
+    /// Starts reader processes beside the measured phase, for runners asked to (#683, D247
+    /// item K): separate processes reading `config`'s loaded rows through
+    /// `Pigeonhole::open_reader`. The default does nothing. [`run_detailed`] calls it as the
+    /// measured phase starts and [`stop_reader_processes`](Self::stop_reader_processes) as it
+    /// ends.
+    fn start_reader_processes(&mut self, config: &WorkloadConfig) -> Result<(), String> {
+        let _ = config;
+        Ok(())
+    }
+
+    /// Stops the reader processes and reports them; `None` (the default) when there were
+    /// none.
+    fn stop_reader_processes(&mut self) -> Result<Option<ReaderProcesses>, String> {
+        Ok(None)
+    }
+
     /// Transactions retried after a conflict since open, for stores whose transactions can
     /// conflict; `None` (the default) elsewhere. [`run_detailed`] reads it around the measured
     /// phase.
@@ -906,7 +923,7 @@ pub fn run_detailed(
         (warmup_secs, warmup_settled),
         seqnos_used,
         txn_conflicts,
-        riders,
+        (riders, reader_processes),
         capped,
     ) = detail;
     closed?;
@@ -945,6 +962,7 @@ pub fn run_detailed(
             seqnos_used,
             txn_conflicts,
             riders,
+            reader_processes,
             close_ms: Some(close_ms),
             capped: options.max_measured.map(|_| capped),
         },
@@ -1063,7 +1081,7 @@ type Measured = (
         (f64, bool),
         Option<u64>,
         Option<u64>,
-        Option<Riders>,
+        (Option<Riders>, Option<ReaderProcesses>),
         bool,
     ),
 );
@@ -1143,6 +1161,7 @@ fn measure(
         runner.txn_conflicts(),
     );
     runner.start_riders()?;
+    runner.start_reader_processes(config)?;
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
     // D247: past `max_measured` no client starts another operation.
@@ -1184,7 +1203,7 @@ fn measure(
             .4
             .zip(runner.txn_conflicts())
             .map(|(b, a)| a.saturating_sub(b)),
-        runner.stop_riders()?,
+        (runner.stop_riders()?, runner.stop_reader_processes()?),
         capped,
     );
     Ok((load, elapsed, lanes, hist, split, shards))

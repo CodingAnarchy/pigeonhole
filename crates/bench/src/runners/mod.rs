@@ -4,6 +4,7 @@
 pub(crate) mod inline;
 pub(crate) mod pigeonhole;
 pub(crate) mod placement;
+pub(crate) mod reader_process;
 
 #[cfg(feature = "fjall")]
 pub(crate) mod fjall;

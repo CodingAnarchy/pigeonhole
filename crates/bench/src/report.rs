@@ -431,6 +431,10 @@ pub struct RunDetail {
     /// (`--riders`, Pigeonhole); `None` elsewhere.
     #[serde(default)]
     pub riders: Option<Riders>,
+    /// Reader processes that ran beside the measured phase (`--reader-processes`,
+    /// Pigeonhole, #683); `None` elsewhere and in results written before it.
+    #[serde(default)]
+    pub reader_processes: Option<ReaderProcesses>,
     /// Whether the measured phase stopped at its bound (`RunOptions::max_measured`, D247)
     /// before its operations were done; `None` for runs without a bound and in results
     /// written before it.
@@ -470,6 +474,24 @@ pub struct Riders {
     /// Milliseconds a full compaction took, started right after the backup and run to the end
     /// (the riders wait for it); `None` when the backup never started.
     pub compact_ms: Option<f64>,
+}
+
+/// Reader processes beside a measured phase (#683, D247 item K, reported): separate
+/// processes attached with `Pigeonhole::open_reader`, each doing ycsb-c reads (Zipfian rows,
+/// a whole row of the `ycsb` family) for as long as the phase runs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ReaderProcesses {
+    /// Reader processes that ran.
+    pub processes: u32,
+    /// Every process's row reads together.
+    pub reads: LatencyStats,
+    /// Reads per second over every process, from each process's own reading time.
+    pub reads_per_sec: f64,
+    /// Reads that found no row (0 on a fully loaded table).
+    pub misses: u64,
+    /// Reads that failed, every one counted (`SnapshotExpired` or `Busy` while the writer
+    /// restarts would show here; none are expected in a steady run).
+    pub errors: u64,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run

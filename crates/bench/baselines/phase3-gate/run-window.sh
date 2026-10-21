@@ -57,8 +57,8 @@
 #                  time-series-ttl, cross-shard-contention (D246, also with tablet
 #                  changes off), counters; transfer, sparse-wide with deletes,
 #                  filtered scans, the async API, app-owned mode on the defaults,
-#                  ycsb-a's riders and 16 KiB values reported; cross-shard-contention
-#                  also with packing off (D246)                                      200
+#                  ycsb-a's riders, reader processes and 16 KiB values reported;
+#                  cross-shard-contention also with packing off (D246)               200
 #   open-latency   open to first read (#158; phase3-io/open-latency.sh)               5
 #   wal-pin        wal_pin_bytes 2x vs 4x the budget: write path, open after a crash
 #                  (#527; phase3-io/wal-pin.sh)                                        10
@@ -529,6 +529,16 @@ step_contended() {
             --max-secs "$contended_report_max_secs" \
             --dir "$data/bench" --json "$results/contended-$level-ycsb-a-riders.json" \
             --markdown "$results/contended-$level-ycsb-a-riders.md"
+        rm -r "$data/bench"
+        # Reported reader processes on ycsb-a (Pigeonhole only; #683, D247 item K): two
+        # processes attached with open_reader doing ycsb-c row reads beside the 16 writers'
+        # measured phase; the record's reader_processes has their reads and latencies, and
+        # the writers' own numbers show the readers' effect on them.
+        "$bench" ycsb-a --engine pigeonhole --scale "$scale" --threads 16 --reader-processes 2 \
+            --durability "$level" --ops "$contended_ops" --min-secs "$contended_report_secs" \
+            --max-secs "$contended_report_max_secs" \
+            --dir "$data/bench" --json "$results/contended-$level-ycsb-a-readers.json" \
+            --markdown "$results/contended-$level-ycsb-a-readers.md"
         rm -r "$data/bench"
     done
 }
