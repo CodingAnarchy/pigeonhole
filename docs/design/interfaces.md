@@ -139,6 +139,7 @@ All MIT/Apache-2.0 compatible (D6); none is a storage engine (spec: Pigeonhole o
 | `clap` (derive) | MIT/Apache-2.0 | cli | `phdb`'s arguments, help and usage errors (#692; owner, 2026-10-20). |
 | `serde_json` (`preserve_order`) | MIT/Apache-2.0 | cli (bench also uses it) | `phdb`'s JSON and JSONL output, with fields in their documented order. |
 | `insta` (dev, `filters`) | Apache-2.0 | cli | Snapshot tests of `phdb`'s output (the spec's "snapshot tests of CLI output"). |
-| `arrow-array`, `arrow-buffer`, `arrow-schema` 60 (no default features) | Apache-2.0 | arrow | The `RecordBatch` export (#691, D5; owner, 2026-10-21). One major, pinned; the `arrow` umbrella crate is not used. 34 crates with their dependencies (chrono comes in through `arrow-array`). |
+| `arrow-array`, `arrow-buffer`, `arrow-schema` 60 (no default features; `arrow-array/ffi` behind pigeonhole-arrow's `ffi` feature) | Apache-2.0 | arrow, cli | The `RecordBatch` export (#691, D5; owner, 2026-10-21). One major, pinned; the `arrow` umbrella crate is not used. 34 crates with their dependencies (chrono comes in through `arrow-array`). |
+| `arrow-ipc` 60 (no default features) | Apache-2.0 | cli only | `phdb dump --format arrow`'s IPC stream (#691, D6; owner, 2026-10-21). Adds `flatbuffers` (Apache-2.0). |
 
 zstd (Phase 2), io_uring (Phase 3), `futures-core` (Phase 3 async) and the bench comparison runners are not added yet.

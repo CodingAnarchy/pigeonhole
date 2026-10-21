@@ -90,6 +90,17 @@ impl Failure {
         }
     }
 
+    /// Data the output format can't hold: a cell `dump --format arrow` can't put in an Arrow
+    /// batch, such as a timestamp above `i64::MAX` (exit 6, `Unsupported`).
+    pub(crate) fn unsupported(message: String) -> Self {
+        Self {
+            code: "Unsupported".into(),
+            code_num: None,
+            message,
+            status: ExitStatus::UNSUPPORTED,
+        }
+    }
+
     /// A write in a read-only shell (exit 1, the `ReadOnly` error code).
     pub(crate) fn read_only(mode: &str) -> Self {
         Self {
@@ -151,7 +162,9 @@ impl Failure {
                     "error": {"code": self.code, "code_num": self.code_num, "message": self.message},
                 })
             ),
-            Format::Table | Format::Csv => writeln!(out, "phdb: error: {}", self.message),
+            Format::Table | Format::Csv | Format::Arrow => {
+                writeln!(out, "phdb: error: {}", self.message)
+            }
         };
     }
 }

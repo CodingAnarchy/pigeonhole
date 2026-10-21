@@ -122,4 +122,40 @@ Measured with `cargo run --release -p pigeonhole-bench --example arrowexport -- 
 The export costs about a fifth to a quarter on top of the scan that feeds it. The scan, not the copy, sets the pace for small cells.
 
 ## arrow-rs versions
-`pigeonhole-arrow` pins one arrow-rs major (60) and re-exports the crates it uses: `pigeonhole_arrow::arrow_array`, `arrow_buffer` and `arrow_schema`. Use those re-exports, or the same major, to name the types. A consumer built on another major (duckdb-rs pins its own, and Polars uses polars-arrow) takes the stream through the Arrow C stream interface instead; that's the next step on `main` (#691).
+`pigeonhole-arrow` pins one arrow-rs major (60) and re-exports the crates it uses: `pigeonhole_arrow::arrow_array`, `arrow_buffer` and `arrow_schema`. Use those re-exports, or the same major, to name the types. A consumer built on another major (duckdb-rs pins its own, and Polars uses polars-arrow) takes the stream through the Arrow C stream interface instead, below.
+
+## Handing off: the Arrow C stream (feature `ffi`)
+The [Arrow C stream interface](https://arrow.apache.org/docs/format/CStreamInterface.html) passes a stream between libraries without sharing an arrow-rs version, or a language. With the `ffi` feature, `ArrowScan<'static>::into_ffi_stream()` gives an `FFI_ArrowArrayStream`: start from `Scan::into_owned()`, then hand the stream over. The consumer owns it and calls its `release` callback when done.
+
+```toml
+pigeonhole-arrow = { version = "0.4", features = ["ffi"] }
+```
+
+```rust,ignore
+// The `into_ffi_stream` rustdoc example runs this with arrow-rs's own C stream reader.
+let stream = scan_to_arrow(table.scan_prefix(b"").into_owned(), &ArrowOptions::default())?
+    .into_ffi_stream();
+// A C or C++ consumer, or a binding such as pyarrow's `RecordBatchReader._import_from_c`,
+// takes the pointer and owns the stream from then on:
+let ptr: *mut FFI_ArrowArrayStream = Box::into_raw(Box::new(stream));
+```
+
+The feature adds `libc`; `pigeonhole-arrow` itself uses no `unsafe`. Taking the pointer back on the consumer's side is the consumer's `unsafe`.
+
+## DuckDB and Polars without Rust: `phdb dump --format arrow`
+The [`phdb`](cli.md#phdb-dump-and-phdb-load) tool writes one table as an Arrow IPC stream in this schema, with the typed columns, every retained version, at one snapshot:
+
+```text
+$ phdb dump --format arrow --table users app.phdb > users.arrows
+```
+
+```text
+>>> import polars as pl
+>>> pl.read_ipc_stream("users.arrows").group_by("family").len()
+
+>>> import duckdb, pyarrow.ipc as ipc
+>>> users = ipc.open_stream("users.arrows").read_all()
+>>> duckdb.sql("select decode(row) as row, value_i64 from users where family = 'stats'")
+```
+
+CI dumps a table this way and checks it with Polars (`scripts/arrow-smoke.py`).

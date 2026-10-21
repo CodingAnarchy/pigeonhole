@@ -72,7 +72,8 @@ pub(crate) fn render(report: &Report, format: Format, out: &mut dyn Write) -> io
             }
             Ok(())
         }
-        Format::Table => table(report, out),
+        // Only `dump` takes arrow, and it streams its own output.
+        Format::Table | Format::Arrow => table(report, out),
     }
 }
 

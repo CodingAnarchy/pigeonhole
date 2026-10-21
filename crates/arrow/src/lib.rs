@@ -155,6 +155,42 @@ impl Iterator for ArrowScan<'_> {
     }
 }
 
+#[cfg(feature = "ffi")]
+impl ArrowScan<'static> {
+    /// The stream as an Arrow C stream (`ArrowArrayStream`, the Arrow C stream interface),
+    /// for a consumer built on another arrow major or in another language: DuckDB, Polars,
+    /// pyarrow, or duckdb-rs and polars-rs, which pin arrow versions of their own.
+    ///
+    /// Start from [`Scan::into_owned`]: the C stream may outlive any borrow. The consumer owns
+    /// the stream and calls its `release` callback when done (moving it into a
+    /// `Box::into_raw` pointer is the usual way to pass it over). Feature `ffi`.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    /// use pigeonhole_arrow::arrow_array::ffi_stream::ArrowArrayStreamReader;
+    /// use pigeonhole_arrow::{ArrowOptions, scan_to_arrow};
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"r").put("f", b"q", b"v").commit()?;
+    ///
+    /// let stream = scan_to_arrow(t.scan_prefix(b"").into_owned(), &ArrowOptions::default())?
+    ///     .into_ffi_stream();
+    /// // The consumer's side: here arrow-rs's own reader of a C stream.
+    /// let reader = ArrowArrayStreamReader::try_new(stream)?;
+    /// let cells: usize = reader.map(|b| b.map(|b| b.num_rows())).sum::<Result<_, _>>()?;
+    /// assert_eq!(cells, 1);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn into_ffi_stream(self) -> arrow_array::ffi_stream::FFI_ArrowArrayStream {
+        arrow_array::ffi_stream::FFI_ArrowArrayStream::new(Box::new(self))
+    }
+}
+
 impl RecordBatchReader for ArrowScan<'_> {
     fn schema(&self) -> SchemaRef {
         ArrowScan::schema(self)

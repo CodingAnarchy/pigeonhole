@@ -41,6 +41,11 @@ where
         }
     };
     let format = cli.format();
+    if format == args::Format::Arrow && !matches!(cli.command, args::Command::Dump { .. }) {
+        let e = exit::Failure::usage("--format arrow is for phdb dump");
+        e.render(format, stderr);
+        return e.status();
+    }
     match cmd::run(cli, stdout, stderr) {
         Ok(cmd::Outcome::Streamed(status)) => status,
         Ok(cmd::Outcome::Report(report)) => match output::render(&report, format, stdout) {

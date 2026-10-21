@@ -151,4 +151,6 @@ pub(crate) enum Format {
     Jsonl,
     /// Comma-separated values with a header line (RFC 4180).
     Csv,
+    /// An Arrow IPC stream of one table's cells, one Arrow row per cell (`dump` only).
+    Arrow,
 }

@@ -12,7 +12,7 @@
 |---|---|
 | `phdb info <file>` | Format version, file size and free space, and per table its tablets, its families with their stored options, and their files (SSTs per level, blob files). |
 | `phdb check <file> [--deep] [--map] [--online]` | Check the file for damage, offline. Exits 3 if anything is damaged. |
-| `phdb dump <file> [--table T]... [--prefix P] [--durable]` | Export every cell, with all retained versions, at one snapshot, to standard output: `jsonl` (the default) or `csv`. |
+| `phdb dump <file> [--table T]... [--prefix P] [--durable]` | Export every cell, with all retained versions, at one snapshot, to standard output: `jsonl` (the default), `csv`, or `arrow` (an Arrow IPC stream of one table). |
 | `phdb load <file> [<dump.jsonl> \| -] [--create]` | Load a `jsonl` dump: create its tables and families and write every cell at its timestamp. |
 | `phdb backup <file> <dest> [--latest] [--check]` | Copy the database into one new file, consistent at one snapshot, also while your application runs. |
 | `phdb compact <file> [--shrink]` | Full compaction, with progress; optionally release free space at the file's end. |
@@ -22,7 +22,7 @@
 
 | Flag | Meaning |
 |---|---|
-| `--format table\|json\|jsonl\|csv` | Output format (default `table`; for `dump`, `jsonl`). |
+| `--format table\|json\|jsonl\|csv\|arrow` | Output format (default `table`; for `dump`, `jsonl`). `arrow` is for `dump` only. |
 | `--shm-dir <DIR>` | The shared-memory directory the database's writer uses (`Options::shm_dir`), if not the default. |
 | `--reader` | Open only as a reader process; fail unless a writer process has the database open. |
 | `--writer` | Open only as the writer; fail if a writer process has it open. |
@@ -199,6 +199,19 @@ How values are written:
 - `type` is `bytes`, `base64` (a value that isn't UTF-8), `i64` or `f64`.
 - A row key or qualifier that isn't UTF-8 prints as `b64:` followed by base64. A key that really starts with `b64:` is ambiguous here, so use `jsonl` to round-trip.
 
+**`arrow`** is an [Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format) of one table, for DuckDB, Polars, pyarrow and other Arrow readers (#691). Name the table with `--table`: a stream has one schema, so `dump --format arrow` without exactly one table fails with status 2.
+- **Schema:** the [Arrow export's](arrow.md) long schema, one Arrow row per cell: `row`, `family`, `qualifier`, `ts` (a UTC microsecond timestamp), `value` (the bytes, or a typed value's little-endian encoding), `value_type` (`bytes`, `i64`, `f64`), and the typed columns `value_i64` (also every counter) and `value_f64`, null for other cells.
+- **Order:** as `jsonl`. Every retained version, at one snapshot.
+- **Limit:** a timestamp above `i64::MAX` doesn't fit an Arrow timestamp: the dump fails with status 6 (`Unsupported`), naming the row. `jsonl` dumps it.
+
+```text
+$ phdb dump --format arrow --table users app.phdb > users.arrows
+$ python3 -c 'import polars as pl; print(pl.read_ipc_stream("users.arrows").group_by("family").len())'
+$ python3 -c 'import duckdb, pyarrow.ipc as ipc; t = ipc.open_stream("users.arrows").read_all(); print(duckdb.sql("select count(*) from t"))'
+```
+
+CI dumps a table this way and reads it with Polars.
+
 **`phdb load`** writes a `jsonl` dump into a database, from a file or standard input:
 - **Writer only:** it opens the database as the writer, so it fails with status 4 while another writer runs. `--create` creates the file if it's missing.
 - **Tables and families:** each table line creates its table and families. An existing family keeps the options stored in the file.
@@ -326,4 +339,4 @@ u1   profile  name       1761030000000000  Ada
 {"phdb":1,"error":{"code":"WriterLocked","code_num":3,"message":"open: another process holds the writer lock"}}
 ```
 
-`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.
+`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read), `Unsupported` (a cell `dump --format arrow` can't hold; status 6) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.
