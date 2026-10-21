@@ -1,0 +1,51 @@
+{
+  "format": 1,
+  "environment": {
+    "cpu": "AMD Ryzen 9 7950X3D 16-Core Processor",
+    "cores": 32,
+    "memory_bytes": 134514339840,
+    "os": "linux 6.8.0-139-generic",
+    "arch": "x86_64",
+    "filesystem": "xfs",
+    "reference": false,
+    "label": "non-reference (D5)",
+    "profile": "release",
+    "git_rev": "3ee90c215206",
+    "started_unix": 1792556124,
+    "load_average": 7.58
+  },
+  "results": [],
+  "scaling": null,
+  "scaling_sync": null,
+  "group_commit": null,
+  "scaling_unpinned": null,
+  "group_commit_unpinned": null,
+  "placement": {
+    "shards": 16,
+    "offered_rate": 480000.0,
+    "achieved_rate": 479997.2732480581,
+    "settle_secs": 22.012204612,
+    "settle_bound_secs": 60.0,
+    "window_secs": 10.000058891,
+    "changes_measured": 0,
+    "max_share": 0.07689831731285056,
+    "shares": [
+      0.043429574285505354,
+      0.051476239275783486,
+      0.06377019504787604,
+      0.06876227734119222,
+      0.06438019492079272,
+      0.06227540369262423,
+      0.06114686226107036,
+      0.07689831731285056,
+      0.07341310970560215,
+      0.053481030524785304,
+      0.05801998791250252,
+      0.06938769387756377,
+      0.06574227797035875,
+      0.0560601966541257,
+      0.059903737520054685,
+      0.07185290169731215
+    ]
+  }
+}
