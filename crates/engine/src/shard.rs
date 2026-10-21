@@ -381,6 +381,9 @@ fn new_memtable(
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,
+    /// When the writer next frees the slots of reader processes that are gone (monotonic
+    /// nanoseconds; [`Shared::oldest_reader_pin`], #833).
+    pub reader_reclaim_at: AtomicU64,
     pub shards: usize,
     pub view: ArcSwap<View>,
     /// Reads inside async calls that went to the file synchronously (D196; `Metrics`).
@@ -546,7 +549,39 @@ impl std::fmt::Debug for Shared {
     }
 }
 
+/// How often the writer looks for reader slots whose process is gone (#833): a liveness
+/// check per active slot, so rare enough to cost nothing, and soon enough that a killed
+/// reader's pin does not hold arenas while commits wait for room.
+const READER_RECLAIM_NANOS: u64 = 250_000_000;
+
 impl Shared {
+    /// The oldest pin any reader slot holds, after freeing the slots of reader processes that
+    /// are gone (#833). Every reclamation bound the writer computes (memtable arenas, view
+    /// versions, extents, GC) asks here, so a crashed or killed reader holds nothing for
+    /// longer than [`READER_RECLAIM_NANOS`]. The liveness check runs at most that often over
+    /// all shards: the first caller past the deadline moves it and runs it.
+    pub(crate) fn oldest_reader_pin(&self) -> Option<(Seqno, u64)> {
+        let now = self.vfs.monotonic_nanos();
+        let at = self.reader_reclaim_at.load(Ordering::Relaxed);
+        if now >= at
+            && self
+                .reader_reclaim_at
+                .compare_exchange(
+                    at,
+                    now.saturating_add(READER_RECLAIM_NANOS),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            let freed = self.shm.reclaim_dead_slots(&self.vfs);
+            if freed > 0 {
+                trace!("reclaimed {freed} reader slots whose process is gone");
+            }
+        }
+        self.shm.oldest_reader_pin()
+    }
+
     pub(crate) fn submitter(&self, shard: ShardId) -> &Submitter<ShardMsg> {
         &self.submitters.get().expect("runtime started")[usize::from(shard.0)]
     }
@@ -700,7 +735,7 @@ impl Shared {
                 .unwrap_or_else(PoisonError::into_inner);
             vv.insert(version, view.manifest_version);
             // Keep what reader pins can still name: the oldest pinned view and newer.
-            let floor = self.shm.oldest_reader_pin().map_or(version, |(_, v)| {
+            let floor = self.oldest_reader_pin().map_or(version, |(_, v)| {
                 if v == 0 { version } else { v.min(version) }
             });
             let keep: BTreeMap<u64, ManifestVersion> = vv.split_off(&floor);
@@ -721,7 +756,7 @@ impl Shared {
     pub(crate) fn oldest_live_manifest(&self) -> ManifestVersion {
         let current = self.view.load().manifest_version;
         let mut oldest = self.live_views.oldest().unwrap_or(current).min(current);
-        if let Some((_, view_version)) = self.shm.oldest_reader_pin()
+        if let Some((_, view_version)) = self.oldest_reader_pin()
             && view_version != 0
         {
             let vv = self
@@ -4364,7 +4399,7 @@ impl ShardState {
         if self.retired.is_empty() {
             return;
         }
-        let oldest_pinned_view = self.shared.shm.oldest_reader_pin().map(|(_, v)| v);
+        let oldest_pinned_view = self.shared.oldest_reader_pin().map(|(_, v)| v);
         let mut keep = Vec::new();
         for (dropped_at, retired) in self.retired.drain(..) {
             match oldest_pinned_view {

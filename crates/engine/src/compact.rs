@@ -398,7 +398,7 @@ impl BlobGc {
 /// bounds everything a reader can still read), ascending.
 pub(crate) fn gc_snapshots(shared: &Shared) -> Vec<Seqno> {
     let mut snapshots = shared.live_seqnos.list();
-    if let Some((seqno, _)) = shared.shm.oldest_reader_pin()
+    if let Some((seqno, _)) = shared.oldest_reader_pin()
         && seqno != 0
     {
         snapshots.push(seqno);

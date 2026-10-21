@@ -1,0 +1,2 @@
+### Fixed
+- The writer now frees the slot of a reader process that has exited or was killed (#833). A crashed reader's pin used to hold the writer's retired memtables, view versions and extents until the next writer started, so a long-running writer could end up failing commits with `Busy`. The writer checks reader liveness at most every 250 ms, before each reclamation. A live reader's slot is never freed.

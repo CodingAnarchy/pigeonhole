@@ -844,6 +844,7 @@ impl Engine {
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
             shm: shm.clone(),
+            reader_reclaim_at: AtomicU64::new(0),
             shards,
             view: ArcSwap::new(empty_view),
             async_sync_reads: AtomicU64::new(0),
@@ -1431,6 +1432,7 @@ impl Engine {
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
             shm: shm.clone(),
+            reader_reclaim_at: AtomicU64::new(0),
             shards,
             view: ArcSwap::new(empty_view),
             async_sync_reads: AtomicU64::new(0),
