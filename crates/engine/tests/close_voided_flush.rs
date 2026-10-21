@@ -122,8 +122,12 @@ fn a_close_finishes_when_a_voided_guard_refuses_the_flush_of_its_in_place_memtab
         shard.closed().is_some(),
         "the close finished: the refused flush's in-place memtable was flushed again"
     );
-    // The flush callers are answered by the close (its outcome, or `Closed`).
-    assert!(ready(&mut first).is_some() || shard.closed().is_some());
+    // The path taken: the manifest refused the flush for the voided guard, at least once.
+    assert!(
+        engine.flush_voids(0) >= 1,
+        "no flush was refused for a voided guard"
+    );
+    drop(first);
     drop(later);
     drop(engine);
     drop(shard);

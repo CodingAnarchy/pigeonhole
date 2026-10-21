@@ -270,6 +270,9 @@ pub(crate) struct ShardCounters {
     /// The flushed-through seqno the shard last published from `on_unpin` (an unpin that
     /// found nothing unflushed at or below its seqno, #724), `Engine::unpin_published`.
     pub unpin_published: AtomicU64,
+    /// Flushes the manifest refused because a delete voided one of their purge guards,
+    /// flushed again without it (#287), `Engine::flush_voids` (#838's test).
+    pub voided_flushes: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -1058,6 +1061,16 @@ impl Engine {
         self.inner.shared.metrics[shard]
             .hooks
             .run_waits
+            .load(Ordering::Relaxed)
+    }
+
+    /// How many flushes on shard `shard` the manifest refused for a purge guard a delete had
+    /// voided, so that they flushed again without it (#287, test hook).
+    #[doc(hidden)]
+    pub fn flush_voids(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .voided_flushes
             .load(Ordering::Relaxed)
     }
 

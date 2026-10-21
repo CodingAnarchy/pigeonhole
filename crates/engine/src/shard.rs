@@ -4259,6 +4259,11 @@ impl ShardState {
                     "shard {} guarded flush voided by a delete; flushing again",
                     self.id.0
                 );
+                #[cfg(feature = "test-hooks")]
+                self.shared.metrics[usize::from(self.id.0)]
+                    .hooks
+                    .voided_flushes
+                    .fetch_add(1, Ordering::Relaxed);
                 self.requeue_frozen();
                 self.spawn_flush(ctx);
                 return;
