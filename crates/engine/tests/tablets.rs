@@ -746,7 +746,8 @@ fn spread_and_busy_with(busy: f64, pack: bool, tweak: impl FnOnce(&mut EngineOpt
     });
     tablets_on(&mut db, shards, |t| t as u16);
     for s in 0..shards {
-        db.engine.set_shard_busy(s, Some(busy));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(busy));
     }
     db
 }
@@ -817,9 +818,11 @@ fn every_shard_uses_the_same_active_shard_count_from_light_to_heavy_writes() {
     assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
     assert_eq!(agree(&db, "packed"), 1);
     // Shard 0 now does all the work and saturates; the others idle.
-    db.engine.set_shard_busy(0, Some(0.95));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Busy, Some(0.95));
     for s in 1..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
     let mut grew = None;
     for pass in 0..120 {
@@ -977,7 +980,8 @@ fn buffered_and_trickling_durable_loads_still_pack() {
 fn an_application_owned_durable_load_is_not_packed() {
     let mut db = spread_and_busy(0.05, true);
     for s in 0..4 {
-        db.engine.set_shard_busy(s, None);
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, None);
     }
     db.vfs.set_deferred_io(true);
     let setup = tablet_changes(&db.engine);
@@ -1089,7 +1093,8 @@ fn a_saturated_shard_grows_the_active_shards_holds_them_while_hot_and_lets_go_af
     let n = 20;
     tablets_on_wide(&mut db, n, |t| (t % shards) as u16);
     for s in 0..shards {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     let mut written = 0;
     let mut passes = 0;
@@ -1099,7 +1104,8 @@ fn a_saturated_shard_grows_the_active_shards_holds_them_while_hot_and_lets_go_af
     }
     assert_eq!(db.engine.pack_ks()[0], Some(2), "light writes did not pack");
     for (s, busy) in [0.98, 0.31, 0.0, 0.0].into_iter().enumerate() {
-        db.engine.set_shard_busy(s, Some(busy));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(busy));
     }
     let mut grew = None;
     for pass in 0..60 {
@@ -1122,7 +1128,8 @@ fn a_saturated_shard_grows_the_active_shards_holds_them_while_hot_and_lets_go_af
     }
     // Once the load drops, `k` shrinks back to the slot floor as before D251.
     for s in 0..shards {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     let mut passes = 0;
     while db.engine.pack_ks()[0] != Some(2) && passes < 600 {
@@ -1155,7 +1162,8 @@ fn an_unsplittable_hot_tablet_grows_k_at_most_once_and_does_not_flap() {
     });
     tablets_on(&mut db, shards, |t| t as u16);
     for s in 0..shards {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     let mut written = 0;
     let mut passes = 0;
@@ -1165,7 +1173,8 @@ fn an_unsplittable_hot_tablet_grows_k_at_most_once_and_does_not_flap() {
     }
     assert_eq!(db.engine.pack_ks()[0], Some(1), "light writes did not pack");
     // Shard 0's thread saturates on one row of tablet 0; nothing else is written.
-    db.engine.set_shard_busy(0, Some(0.95));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Busy, Some(0.95));
     let row = tablet_row(0, 0);
     let mut ks = vec![db.engine.pack_ks()[0].expect("decided")];
     for _ in 0..300 {
@@ -1194,7 +1203,8 @@ fn an_unsplittable_hot_tablet_grows_k_at_most_once_and_does_not_flap() {
 #[test]
 fn a_hot_shard_holds_off_the_shrink() {
     let mut db = spread_and_busy(0.0, true);
-    db.engine.set_shard_busy(0, Some(0.95));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Busy, Some(0.95));
     let row = tablet_row(0, 0);
     let mut ks = vec![];
     for _ in 0..300 {
@@ -1233,8 +1243,11 @@ fn a_sync_saturated_single_writer_settles_at_two_shards_or_fewer() {
     });
     tablets_on(&mut db, shards, |t| t as u16);
     for s in 0..shards {
-        db.engine
-            .set_shard_busy(s, Some(if s == 0 { 0.05 } else { 0.0 }));
+        db.engine.set_shard_load(
+            s,
+            pigeonhole_engine::LoadTerm::Busy,
+            Some(if s == 0 { 0.05 } else { 0.0 }),
+        );
     }
     db.vfs.set_deferred_io(true);
     let mut written = 0;
@@ -1304,7 +1317,8 @@ fn packing_keeps_as_many_shards_as_the_tablets_slots_need() {
     }
     assert_eq!(tablets_per_shard(&db, shards), vec![1; shards]);
     for s in 0..shards {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     let mut written = 0;
     let mut passes = 0;
@@ -1337,9 +1351,11 @@ fn packed_tablets_spread_again_when_the_shard_turns_busy() {
         passes += 1;
     }
     assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
-    db.engine.set_shard_busy(0, Some(0.9));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Busy, Some(0.9));
     for s in 1..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
     let packed = tablet_changes(&db.engine);
     passes = 0;
@@ -1507,7 +1523,8 @@ fn packed_tablets_spread_again_when_the_shard_stalls_for_room() {
     assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
     // Every thread idle: only the stall can make a shard hot.
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
     db.vfs.set_deferred_io(true);
     let packed = tablet_changes(&db.engine);
@@ -1570,9 +1587,11 @@ fn packed_without_compaction() -> (Db, u64) {
 #[test]
 fn a_stalling_shard_is_hot_even_when_the_busy_sum_is_low() {
     let (mut db, mut written) = packed_without_compaction();
-    db.engine.set_shard_busy(0, Some(0.8));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Busy, Some(0.8));
     for s in 1..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
     let mut passes = 0;
     while tablets_per_shard(&db, 4) != vec![2, 2, 0, 0] && passes < 300 {
@@ -1585,8 +1604,10 @@ fn a_stalling_shard_is_hot_even_when_the_busy_sum_is_low() {
         "after {passes} passes"
     );
     assert_eq!(db.engine.pack_ks()[0], Some(2));
-    db.engine.set_shard_busy(0, Some(0.0));
-    db.engine.set_shard_busy(1, Some(0.3));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
+    db.engine
+        .set_shard_load(1, pigeonhole_engine::LoadTerm::Busy, Some(0.3));
     db.vfs.set_deferred_io(true);
     passes = 0;
     while db.engine.pack_ks()[0] == Some(2) && passes < 100 {
@@ -1629,7 +1650,8 @@ fn a_stalling_shard_is_hot_even_when_the_busy_sum_is_low() {
 fn a_stall_still_open_at_the_balancer_pass_counts() {
     let (mut db, mut written) = packed_without_compaction();
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
     db.vfs.set_deferred_io(true);
     assert_eq!(db.engine.shard_stall_busy(0), Some(0.0));
@@ -1656,7 +1678,8 @@ fn a_stall_still_open_at_the_balancer_pass_counts() {
 fn the_active_shards_a_stall_spread_to_hold_while_the_writes_go_on() {
     let (mut db, mut written) = packed_without_compaction();
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     db.vfs.set_deferred_io(true);
     let mut passes = 0;
@@ -1840,7 +1863,8 @@ fn packed_onto_shard_0() -> (Db, u64) {
 #[test]
 fn pool_work_counts_toward_the_busy_sum() {
     let (mut db, mut written) = packed_onto_shard_0();
-    db.engine.set_shard_pool_busy(0, Some(1.5));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Pool, Some(1.5));
     let mut passes = 0;
     while !db.engine.pack_ks()[0].is_some_and(|k| k >= 3) && passes < 100 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -1864,7 +1888,8 @@ fn pool_work_counts_toward_the_busy_sum() {
 fn concurrent_commits_hold_the_active_shards() {
     let (mut db, mut written) = spread_and_settled(0.05);
     for s in 0..4 {
-        db.engine.set_shard_inflight(s, Some(0.75));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.75));
     }
     for pass in 0..150 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -1875,7 +1900,8 @@ fn concurrent_commits_hold_the_active_shards() {
         );
     }
     for s in 0..4 {
-        db.engine.set_shard_inflight(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.0));
     }
     let mut passes = 0;
     while db.engine.pack_ks()[0].is_none_or(|k| k == 4) && passes < 300 {
@@ -1900,7 +1926,8 @@ fn concurrent_commits_hold_the_active_shards() {
 fn a_lone_writers_commits_in_flight_pack_to_one_shard() {
     let (mut db, mut written) = spread_and_settled(0.05);
     for s in 0..4 {
-        db.engine.set_shard_inflight(s, Some(0.25));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.25));
     }
     let mut passes = 0;
     while db.engine.pack_ks()[0] != Some(1) && passes < 300 {
@@ -1923,7 +1950,8 @@ fn a_lone_writers_commits_in_flight_pack_to_one_shard() {
 #[test]
 fn concurrent_commits_grow_a_packed_store() {
     let (mut db, mut written) = packed_onto_shard_0();
-    db.engine.set_shard_inflight(0, Some(3.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Inflight, Some(3.0));
     let mut passes = 0;
     while db.engine.pack_ks()[0] != Some(4) && passes < 100 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -1946,7 +1974,8 @@ fn concurrent_commits_grow_a_packed_store() {
 fn a_pending_growth_publishes_the_count_it_is_heading_for() {
     let (mut db, mut written) = packed_onto_shard_0();
     assert_eq!(db.engine.pack_target(), Some((1, 1)));
-    db.engine.set_shard_inflight(0, Some(3.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Inflight, Some(3.0));
     let mut pending = 0;
     let mut passes = 0;
     while db.engine.pack_ks()[0] != Some(4) && passes < 100 {
@@ -1988,7 +2017,8 @@ fn a_pending_growth_publishes_the_count_it_is_heading_for() {
 fn a_concurrency_driven_first_shrink_does_not_wait_for_the_window() {
     let mut db = spread_and_busy(0.1, true);
     for s in 0..4 {
-        db.engine.set_shard_inflight(s, Some(0.25));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.25));
     }
     let mut written = 0;
     let mut passes = 0;
@@ -2015,14 +2045,16 @@ fn a_concurrency_dip_after_a_heavy_phase_does_not_pack_an_unpacked_store() {
     let mut db = spread_and_busy(0.1, true);
     let mut written = 0;
     for s in 0..4 {
-        db.engine.set_shard_inflight(s, Some(0.75));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.75));
     }
     for _ in 0..200 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
     }
     assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
     for s in 0..4 {
-        db.engine.set_shard_inflight(s, Some(0.1));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.1));
     }
     for pass in 0..50 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2033,7 +2065,8 @@ fn a_concurrency_dip_after_a_heavy_phase_does_not_pack_an_unpacked_store() {
         );
     }
     for s in 0..4 {
-        db.engine.set_shard_inflight(s, Some(0.75));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.75));
     }
     for pass in 0..50 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2054,7 +2087,8 @@ fn a_concurrency_dip_after_a_heavy_phase_does_not_pack_an_unpacked_store() {
 #[test]
 fn a_stall_driven_growth_is_not_held_to_the_commits_in_flight() {
     let (mut db, mut written) = packed_with_shard_0_stalled();
-    db.engine.set_shard_inflight(0, Some(0.9));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Inflight, Some(0.9));
     let mut passes = 0;
     while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 120 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2077,7 +2111,8 @@ fn a_stall_driven_growth_is_not_held_to_the_commits_in_flight() {
 #[test]
 fn a_saturated_growth_holds_while_the_writes_go_on() {
     let (mut db, mut written) = packed_onto_shard_0();
-    db.engine.set_shard_busy(0, Some(1.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Busy, Some(1.0));
     let mut passes = 0;
     while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 120 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2086,7 +2121,8 @@ fn a_saturated_growth_holds_while_the_writes_go_on() {
     let k = db.engine.pack_ks()[0].expect("decided");
     assert!(k >= 2, "after {passes} passes");
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     for pass in 0..100 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2120,9 +2156,11 @@ fn packed_with_shard_0_stalled() -> (Db, u64) {
     }
     assert_eq!(tablets_per_shard(&db, 4), vec![4, 0, 0, 0]);
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
-    db.engine.set_shard_stalled(0, Some(1.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(1.0));
     (db, written)
 }
 
@@ -2143,9 +2181,11 @@ fn packed_long_ago_with_shard_0_stalled() -> (Db, u64) {
     }
     assert_eq!(db.engine.pack_ks()[0], Some(1));
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
-    db.engine.set_shard_stalled(0, Some(1.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(1.0));
     (db, written)
 }
 
@@ -2187,9 +2227,11 @@ fn the_stall_floor_holds_under_the_same_rate_and_releases_when_it_drops() {
     }
     let k = db.engine.pack_ks()[0].expect("decided");
     assert!(k >= 3, "after {passes} passes");
-    db.engine.set_shard_stalled(0, Some(0.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(0.0));
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     for pass in 0..100 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2229,9 +2271,11 @@ fn the_stall_floor_expires_after_a_quiet_window() {
     }
     let k = db.engine.pack_ks()[0].expect("decided");
     assert!(k >= 3, "after {passes} passes");
-    db.engine.set_shard_stalled(0, Some(0.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(0.0));
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.05));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
     }
     for pass in 0..250 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2294,7 +2338,8 @@ fn the_floor_backoff_resets_after_a_quiet_episode() {
     // Episode 1: the stall-driven growth, then the stall gone; the floor expires after the
     // base window.
     let episode = |db: &mut Db, written: &mut u64| -> usize {
-        db.engine.set_shard_stalled(0, Some(1.0));
+        db.engine
+            .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(1.0));
         let mut passes = 0;
         while !db.engine.pack_ks()[0].is_some_and(|k| k >= 2) && passes < 120 {
             write_and_balance(db, 4, |_| 20, written);
@@ -2304,9 +2349,11 @@ fn the_floor_backoff_resets_after_a_quiet_episode() {
             db.engine.pack_ks()[0].is_some_and(|k| k >= 2),
             "no stall-driven growth after {passes} passes"
         );
-        db.engine.set_shard_stalled(0, Some(0.0));
+        db.engine
+            .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(0.0));
         for s in 0..4 {
-            db.engine.set_shard_busy(s, Some(0.05));
+            db.engine
+                .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.05));
         }
         passes = 0;
         while db.engine.pack_ks()[0] != Some(1) && passes < 1000 {
@@ -2349,7 +2396,8 @@ fn the_floor_backoff_resets_after_a_quiet_episode() {
 fn stalls_on_three_of_ten_passes_read_as_a_stalled_shard() {
     let (mut db, mut written) = packed_without_compaction();
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
     db.vfs.set_deferred_io(true);
     let mut passes = 0u64;
@@ -2382,7 +2430,8 @@ fn stalls_on_three_of_ten_passes_read_as_a_stalled_shard() {
 fn a_stall_every_ten_passes_does_not_read_as_a_stalled_shard() {
     let (mut db, mut written) = packed_without_compaction();
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.0));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.0));
     }
     db.vfs.set_deferred_io(true);
     for pass in 0..150u64 {
@@ -2419,7 +2468,8 @@ fn spread_and_settled(busy: f64) -> (Db, u64) {
     }
     assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(busy));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(busy));
     }
     (db, written)
 }
@@ -2437,13 +2487,15 @@ fn a_busy_pass_during_a_ramp_still_resets_the_shrink_count() {
     }
     assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.6));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.6));
     }
     for _ in 0..3 {
         write_and_balance(&mut db, 4, |_| 400, &mut written);
     }
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.3));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.3));
     }
     for pass in 0..40 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2473,9 +2525,11 @@ fn a_stalled_pass_resets_the_shrink_count() {
     }
     assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
     // Stalling (a published term past 0.1 after the pass), not hot.
-    db.engine.set_shard_stalled(0, Some(0.6));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(0.6));
     write_and_balance(&mut db, 4, |_| 20, &mut written);
-    db.engine.set_shard_stalled(0, Some(0.0));
+    db.engine
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(0.0));
     for pass in 0..40 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
         let k = db.engine.pack_ks()[0];
@@ -2544,7 +2598,8 @@ fn a_stall_at_the_same_rate_does_not_undo_the_shrink() {
 #[test]
 fn stalled_shards_weigh_in_the_busy_sum() {
     let (mut db, mut written) = packed_long_ago_with_shard_0_stalled();
-    db.engine.set_shard_stalled(1, Some(1.0));
+    db.engine
+        .set_shard_load(1, pigeonhole_engine::LoadTerm::Stalled, Some(1.0));
     let mut passes = 0;
     while db.engine.pack_ks()[0] == Some(1) && passes < 60 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2606,7 +2661,8 @@ fn a_dip_between_phases_does_not_pack_an_unpacked_store() {
     let phases: [(f64, usize); 3] = [(0.6, 100), (0.1, 100), (0.6, 100)];
     for (phase, &(busy, passes)) in phases.iter().enumerate() {
         for s in 0..4 {
-            db.engine.set_shard_busy(s, Some(busy));
+            db.engine
+                .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(busy));
         }
         for pass in 0..passes {
             write_and_balance(&mut db, 4, |_| 20, &mut written);
@@ -2670,7 +2726,8 @@ fn the_first_shrink_window_restarts_on_a_reopen() {
     let mut db = open_on(&vfs, 4, options);
     tablets_on(&mut db, 4, |t| t as u16);
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.1));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.1));
     }
     let mut written = 0;
     let mut passes = 0;
@@ -2689,7 +2746,8 @@ fn the_first_shrink_window_restarts_on_a_reopen() {
         "placed unpacked at open: {placed:?}"
     );
     for s in 0..4 {
-        db.engine.set_shard_busy(s, Some(0.1));
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Busy, Some(0.1));
     }
     for pass in 0..250 {
         write_and_balance(&mut db, 4, |_| 20, &mut written);

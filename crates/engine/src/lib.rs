@@ -71,8 +71,8 @@ pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, Txn, WriteBa
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use engine::hooks::{
-    AppendedKind, AppendedRecord, CompactionRecord, FlushGcMutation, HookSite, ManifestInfo,
-    RawEntry, TabletOwner, TabletRange,
+    AppendedKind, AppendedRecord, CompactionRecord, FlushGcMutation, HookSite, LoadTerm,
+    ManifestInfo, RawEntry, TabletOwner, TabletRange,
 };
 
 pub use pigeonhole_compaction::{

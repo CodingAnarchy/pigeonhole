@@ -172,6 +172,34 @@ pub enum FlushGcMutation {
     IgnoreVoids,
 }
 
+/// A balancer load term a test chooses for a shard (`Engine::set_shard_load`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoadTerm {
+    /// The shard thread's busy fraction (0 to 1; D217).
+    Busy = 0,
+    /// Its writers' stall fraction (0 to 1; D255).
+    Stalled = 1,
+    /// The pool's work for it (a fraction of the time; it may exceed 1 when several pool
+    /// threads serve the shard at once; D256).
+    Pool = 2,
+    /// Client commits in flight at it on average (0 up; a closed-loop client's worth is at
+    /// most 1; D257).
+    Inflight = 3,
+}
+
+impl LoadTerm {
+    const COUNT: usize = 4;
+
+    /// The largest value a test may choose.
+    fn max(self) -> f64 {
+        match self {
+            LoadTerm::Busy | LoadTerm::Stalled => 1.0,
+            LoadTerm::Pool => 16.0,
+            LoadTerm::Inflight => 1e6,
+        }
+    }
+}
+
 /// A shard's test-hook counters (`ShardMetrics::hooks`), stored after each batch.
 #[derive(Debug, Default)]
 pub(crate) struct ShardCounters {
@@ -187,18 +215,10 @@ pub(crate) struct ShardCounters {
     /// Compactions whose purge a write voided before they installed
     /// (`Engine::compaction_purge_voids`, #316).
     pub purge_voids: AtomicU64,
-    /// The busy fraction the shard's balancer measures (millionths plus one; 0 measures the
-    /// thread's real busy time), `Engine::set_shard_busy` (D217's packing tests).
-    pub busy_override: AtomicU64,
-    /// The stall fraction the shard's balancer measures (millionths plus one; 0 measures the
-    /// real one), `Engine::set_shard_stalled` (D255's packing tests).
-    pub stall_override: AtomicU64,
-    /// The pool busy fraction the shard's balancer measures (millionths plus one; 0 measures
-    /// the real one), `Engine::set_shard_pool_busy` (D256's packing tests).
-    pub pool_override: AtomicU64,
-    /// The mean commits in flight the shard's balancer measures (millionths plus one; 0
-    /// measures the real one), `Engine::set_shard_inflight` (D257's packing tests).
-    pub inflight_override: AtomicU64,
+    /// The load terms the shard's balancer measures, by `LoadTerm` (millionths plus one; 0
+    /// measures the real one), `Engine::set_shard_load` (D217, D255, D256, D257's packing
+    /// tests).
+    pub load_overrides: [AtomicU64; LoadTerm::COUNT],
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -220,6 +240,16 @@ pub(crate) struct ShardCounters {
     /// The most log records the shard's checkpoint popped in one batch (#763's budget),
     /// `Engine::max_checkpoint_pops`.
     pub checkpoint_pops_max: AtomicU64,
+}
+
+impl ShardCounters {
+    /// The value a test chose for `term`, or `None` to measure the real one.
+    pub(crate) fn load_override(&self, term: LoadTerm) -> Option<f64> {
+        match self.load_overrides[term as usize].load(Ordering::Relaxed) {
+            0 => None,
+            v => Some((v - 1) as f64 / 1e6),
+        }
+    }
 }
 
 /// A WAL record the engine appended to a stream (test hook): the per-stream append order,
@@ -292,6 +322,16 @@ impl Engine {
     #[doc(hidden)]
     pub fn on_next(&self, site: HookSite, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.sites.set(site, f);
+    }
+
+    /// Makes shard `shard`'s balancer measure `term` as `value` from now on (clamped to the
+    /// term's range, `LoadTerm`), or the real value with `None` (test hook: the packing
+    /// tests, decided on chosen loads under any clock).
+    #[doc(hidden)]
+    pub fn set_shard_load(&self, shard: usize, term: LoadTerm, value: Option<f64>) {
+        let v = value.map_or(0, |b| (b.clamp(0.0, term.max()) * 1e6).round() as u64 + 1);
+        self.inner.shared.metrics[shard].hooks.load_overrides[term as usize]
+            .store(v, Ordering::Relaxed);
     }
 
     /// The seqnos of this process's live snapshots, the ones compaction's GC keeps
@@ -604,55 +644,6 @@ impl Engine {
             .hooks
             .refuse_prepares
             .store(n, Ordering::Release);
-    }
-
-    /// Makes shard `shard`'s balancer measure itself `busy` (a fraction of the time, 0 to 1)
-    /// busy from now on, or its thread's real busy time with `None` (test hook: packing,
-    /// D217, decided on chosen loads under any clock).
-    #[doc(hidden)]
-    pub fn set_shard_busy(&self, shard: usize, busy: Option<f64>) {
-        let v = busy.map_or(0, |b| (b.clamp(0.0, 1.0) * 1e6).round() as u64 + 1);
-        self.inner.shared.metrics[shard]
-            .hooks
-            .busy_override
-            .store(v, Ordering::Relaxed);
-    }
-
-    /// Makes shard `shard`'s balancer measure its writers `stalled` (a fraction of the time,
-    /// 0 to 1) from now on, or the real stall time with `None` (test hook: D255's packing
-    /// tests, decided on chosen stalls under any clock).
-    #[doc(hidden)]
-    pub fn set_shard_stalled(&self, shard: usize, stalled: Option<f64>) {
-        let v = stalled.map_or(0, |b| (b.clamp(0.0, 1.0) * 1e6).round() as u64 + 1);
-        self.inner.shared.metrics[shard]
-            .hooks
-            .stall_override
-            .store(v, Ordering::Relaxed);
-    }
-
-    /// Makes shard `shard`'s balancer measure the pool's work for it as `busy` (a fraction
-    /// of the time; it may exceed 1 when several pool threads serve the shard at once) from
-    /// now on, or the real pool slice time with `None` (test hook: D256's packing tests).
-    #[doc(hidden)]
-    pub fn set_shard_pool_busy(&self, shard: usize, busy: Option<f64>) {
-        let v = busy.map_or(0, |b| (b.clamp(0.0, 16.0) * 1e6).round() as u64 + 1);
-        self.inner.shared.metrics[shard]
-            .hooks
-            .pool_override
-            .store(v, Ordering::Relaxed);
-    }
-
-    /// Makes shard `shard`'s balancer measure `inflight` client commits in flight at it on
-    /// average (0 up; a closed-loop client's worth is at most 1) from now on, or the real
-    /// in-flight time with `None` (test hook: D257's packing tests, decided on chosen
-    /// concurrency under any clock).
-    #[doc(hidden)]
-    pub fn set_shard_inflight(&self, shard: usize, inflight: Option<f64>) {
-        let v = inflight.map_or(0, |b| (b.clamp(0.0, 1e6) * 1e6).round() as u64 + 1);
-        self.inner.shared.metrics[shard]
-            .hooks
-            .inflight_override
-            .store(v, Ordering::Relaxed);
     }
 
     /// The mean commits in flight shard `shard`'s balancer published at its last pass
