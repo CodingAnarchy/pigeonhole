@@ -52,6 +52,8 @@ fn rich(path: &Path) {
     a.mutate(&[0xff, 0x00, 0x01])
         .put_at("p", &[0x80, 0x81], T0, &[0xfe, 0xfd])
         .put_at("p", b"tab", T0, b"a\tb\n\"q\"")
+        .put_f64_at("p", b"ratio", T0 + 5, 0.125)
+        .put_f64_at("p", b"nan", T0 + 6, f64::NAN)
         .commit()
         .unwrap();
     let b = db
@@ -109,8 +111,18 @@ fn a_dump_loaded_into_a_new_database_dumps_the_same() {
     let src = dir.path().join("src.phdb");
     rich(&src);
     let first = dump(&src, &[]);
-    // 30 rows × (3 name versions + score + counter) + 2 binary cells + 10 blobs.
-    assert_eq!(body(&first).len(), 2 + 30 * 5 + 2 + 10, "{first}");
+    // 2 table lines; 30 rows × (3 name versions + score + counter); the binary row's 4
+    // cells; 10 blobs.
+    assert_eq!(body(&first).len(), 2 + 30 * 5 + 4 + 10, "{first}");
+    // f64 values with their timestamps; a NaN by its bits (ICR 0051).
+    assert!(
+        first.contains(r#""qualifier":"ratio","ts":1760000000000005,"value":{"f64":0.125}"#),
+        "{first}"
+    );
+    assert!(
+        first.contains(r#""qualifier":"nan","ts":1760000000000006,"value":{"f64_bits":"#),
+        "{first}"
+    );
     // Bytes that are not UTF-8 are base64; control characters stay in JSON strings.
     assert!(
         first.contains(r#""row":{"base64":"/wAB"},"family":"p","qualifier":{"base64":"gIE="}"#),
@@ -152,6 +164,13 @@ fn a_dump_loaded_into_a_new_database_dumps_the_same() {
             .value(),
         &[0xfe, 0xfd]
     );
+    // f64 cells keep their timestamps and bits.
+    let ratio = a.get(&[0xff, 0x00, 0x01], "p", b"ratio").unwrap().unwrap();
+    assert_eq!(ratio.timestamp(), T0 + 5);
+    assert!(matches!(ratio.typed(), pigeonhole::Value::F64(x) if x == 0.125));
+    let nan = a.get(&[0xff, 0x00, 0x01], "p", b"nan").unwrap().unwrap();
+    assert_eq!(nan.timestamp(), T0 + 6);
+    assert!(matches!(nan.typed(), pigeonhole::Value::F64(x) if x.is_nan()));
     let b = db.table("b").unwrap().open().unwrap();
     assert_eq!(
         b.get(b"k1", "blob", b"v").unwrap().unwrap().value().len(),

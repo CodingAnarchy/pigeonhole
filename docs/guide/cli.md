@@ -201,7 +201,6 @@ How values are written:
 - **Tables and families:** each table line creates its table and families. An existing family keeps the options stored in the file.
 - **Cells:** each is written at its timestamp. Counters are set to their dumped value. A family with a merge operator gets the merged values as puts.
 - **Durability:** cells are committed in batches at `Durability::None`, and one flush at the end makes the load durable. If the load fails partway, what was committed stays.
-- **Known gap:** an `f64` value is written at the load's commit time, not its dumped timestamp. The API has no `put_f64_at` yet. The report counts these cells as `f64_cells_retimed`.
 
 A malformed dump fails with status 1 and the code `BadInput`, naming the line.
 

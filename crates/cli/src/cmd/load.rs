@@ -45,7 +45,6 @@ pub(crate) fn run(
         ("path", json!(file.display().to_string())),
         ("tables", json!(n.tables)),
         ("cells", json!(n.cells)),
-        ("f64_cells_retimed", json!(n.f64_retimed)),
     ];
     let document = summary
         .iter()
@@ -65,8 +64,6 @@ pub(crate) fn run(
 struct Loaded {
     tables: u64,
     cells: u64,
-    /// `f64` cells written at the load's commit time: there is no `put_f64_at` yet.
-    f64_retimed: u64,
 }
 
 fn load(db: &Pigeonhole, reader: Box<dyn BufRead>) -> Result<Loaded, Failure> {
@@ -140,8 +137,7 @@ fn load(db: &Pigeonhole, reader: Box<dyn BufRead>) -> Result<Loaded, Failure> {
                 .and_then(Value::as_u64)
                 .map(f64::from_bits)
         }) {
-            batch.put_f64(table, &row, family, &qualifier, x);
-            n.f64_retimed += 1;
+            batch.put_f64_at(table, &row, family, &qualifier, ts, x);
         } else {
             let bytes = bytes_from_json(value).map_err(|m| bad(&format!("value: {m}")))?;
             size += bytes.len();
