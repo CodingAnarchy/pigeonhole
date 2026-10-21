@@ -2497,6 +2497,13 @@ pub(crate) struct ShardState {
     change_waits: bool,
     /// `Engine::compact` callers: `(table filter, reply, when it asked)`, served in order.
     compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>, u64)>,
+    /// Slots the front `compact_all` request has rewritten (#805). A full compaction
+    /// rewrites a lone SST that may hold purgeable entries, but not in a slot this request
+    /// already rewrote: that rewrite was its bottommost purge, and doing it again at once would
+    /// meet the same bounds (snapshots, memtables, a voided purge), while an output that still
+    /// looks purgeable (markers a snapshot needs, rows of several columns) would loop.
+    /// Cleared whenever a request leaves `compact_all`.
+    full_purged: HashSet<(TabletId, FamilyId)>,
     /// The running compaction was started for the `compact_all` caller at the front: its
     /// failure is that caller's. A background compaction's failure is nobody's: it backs
     /// off (issue #141).
@@ -2796,6 +2803,7 @@ impl ShardState {
             compaction: None,
             change_waits: false,
             compact_all: VecDeque::new(),
+            full_purged: HashSet::new(),
             compaction_full: false,
             blob_gc: compact::BlobGc,
             due_backing_off: false,
@@ -3693,6 +3701,7 @@ impl ShardState {
             for (_, w, _) in self.compact_all.drain(..) {
                 w.notify(Err(Error::Closed));
             }
+            self.full_purged.clear();
             return;
         }
         if self.shared.pager_poisoned.load(Ordering::Acquire) {
@@ -3837,6 +3846,7 @@ impl ShardState {
             for (_, w, _) in self.compact_all.drain(..) {
                 w.notify(Err(Error::Busy));
             }
+            self.full_purged.clear();
         } else if now.saturating_sub(oldest) >= timeout {
             // The callers that waited the whole timeout themselves are refused; the rest
             // keep waiting (D240).
@@ -3856,6 +3866,11 @@ impl ShardState {
                 .into_iter()
                 .partition(|(_, _, at)| late(*at));
             self.compact_all = kept;
+            // The slots the front request rewrote are not the next one's (#805): a refused
+            // front leaves its successor to rewrite them again.
+            if !refused.is_empty() {
+                self.full_purged.clear();
+            }
             for (_, w, _) in refused {
                 w.notify(Err(Error::Busy));
             }
@@ -4008,6 +4023,7 @@ impl ShardState {
                 for (_, w, _) in self.compact_all.drain(..) {
                     w.notify(Err(crate::error::relay("flush", &e)));
                 }
+                self.full_purged.clear();
                 if self.closing {
                     self.flush_failed = true;
                     self.shared.fail_close();
@@ -7669,6 +7685,7 @@ impl ShardState {
             for (_, w, _) in self.compact_all.drain(..) {
                 w.notify(Err(poisoned_error()));
             }
+            self.full_purged.clear();
             return;
         }
         // An idle FIFO-by-time family drops an SST when it expires, not at its next flush
@@ -7714,6 +7731,20 @@ impl ShardState {
                     continue;
                 };
                 let rewrite = self.tablets_on();
+                // A lone SST that may hold purgeable entries is rewritten, unless this request
+                // already rewrote the slot (#805, `full_purged`); its rows come from its
+                // properties, read through the open-SST cache (and only when the cheaper
+                // checks miss).
+                let purgeable = |sst: &pigeonhole_format::manifest::SstMeta| {
+                    !self.full_purged.contains(&key)
+                        && compact::may_hold_purgeable(sst, &meta.options, now, || {
+                            let (_, open) = fam.find(sst.id)?;
+                            let priority =
+                                crate::snapshot::SstSet::priority(meta.options.cache_priority);
+                            let reader = open.reader(&view.ssts, priority).ok()?;
+                            Some(reader.properties().rows)
+                        })
+                };
                 if let Some(mut t) = compact::plan_full(
                     tablet,
                     key.1,
@@ -7722,7 +7753,11 @@ impl ShardState {
                     &busy,
                     rewrite,
                     self.shared.picker.target_sst_bytes,
+                    purgeable,
                 ) {
+                    if t.kind == pigeonhole_compaction::TaskKind::Rewrite {
+                        self.full_purged.insert(key);
+                    }
                     self.blob_gc.full(&view.catalog, &mut t);
                     task = Some((key, t));
                     break;
@@ -7736,6 +7771,7 @@ impl ShardState {
                     }
                     Err(e) => {
                         let (_, reply, _) = self.compact_all.pop_front().expect("front");
+                        self.full_purged.clear();
                         reply.notify(Err(e));
                     }
                 },
@@ -7743,6 +7779,7 @@ impl ShardState {
                     // Every slot is fully compacted. A background failure meanwhile is not
                     // this caller's (issue #141): its own failures were reported at once.
                     let (_, reply, _) = self.compact_all.pop_front().expect("front");
+                    self.full_purged.clear();
                     reply.notify(Ok(()));
                 }
             }
@@ -8172,6 +8209,7 @@ impl ShardState {
                 // and its slot waits out a backoff of its own so the other slots still
                 // compact.
                 if full && let Some((_, reply, _)) = self.compact_all.pop_front() {
+                    self.full_purged.clear();
                     reply.notify(Err(e));
                 }
                 if let Some(key) = key {

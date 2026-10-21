@@ -2373,6 +2373,8 @@ impl ShardState {
                 busy,
                 true,
                 self.shared.picker.target_sst_bytes,
+                // Rewritten anyway: it holds rows outside the tablet.
+                |_| false,
             ) else {
                 // Its inputs are busy: try again after the running work.
                 self.cleanups.insert(0, key);
