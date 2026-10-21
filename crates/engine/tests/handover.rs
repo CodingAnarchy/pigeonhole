@@ -13,7 +13,8 @@ use pigeonhole_engine::{
     Engine, EngineOptions, Error, FailureCause, FamilyOptions, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
-use pigeonhole_io::VfsRef;
+use pigeonhole_io::{OpenOptions, VfsRef};
+use pigeonhole_shm::{Presence, WriterLock};
 
 const DB: &str = "/db/h.phdb";
 
@@ -52,6 +53,26 @@ fn has(db: &Engine, t: &TableInfo, row: &str) -> bool {
     db.get(&snap, t.id, t.families[0].id, row.as_bytes(), b"q")
         .unwrap()
         .is_some()
+}
+
+/// Probes the file's lock bytes from a fresh handle: whether the writer byte is free, and
+/// whether a presence taken now would be the last one out (no writer or reader present).
+fn probe(vfs: &VfsRef) -> (bool, bool) {
+    let mut opts = OpenOptions::read();
+    opts.write = true;
+    let file = vfs.open(Path::new(DB), opts).unwrap();
+    let writer_free = match WriterLock::acquire(&file) {
+        Ok(lock) => {
+            drop(lock);
+            true
+        }
+        Err(pigeonhole_shm::Error::WriterLocked) => false,
+        Err(e) => panic!("{e}"),
+    };
+    let presence = Presence::acquire(&file).expect("the presence byte is shared");
+    let last = presence.try_become_last().unwrap();
+    drop(presence);
+    (writer_free, last)
 }
 
 /// The shard owning `t`: commit to it and look at the stream the record went to.
@@ -93,14 +114,39 @@ fn a_failed_instance_reopens_on_its_handover_with_the_writer_byte_held_throughou
         "a failed instance's close is unclean: {closed:?}"
     );
     let handover = handover.expect("the locks were still held");
+    assert_eq!(probe(&vfs), (false, false), "held by the handover");
     // Another writer cannot get in: the handover holds the writer byte.
     match Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)) {
         Err(Error::WriterLocked) => {}
         other => panic!("a second writer opened during the handover: {other:?}"),
     }
+    assert_eq!(
+        probe(&vfs),
+        (false, false),
+        "still held after the refused open"
+    );
+    // The disk still fails: the reopen's replay sync fails, and the handover comes back with
+    // the error, the locks still held, so the retry needs no plain open (D265's budget).
+    let handover = match Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 2), handover) {
+        Err((Error::Io(_), handover)) => handover,
+        Ok(_) => panic!("the reopen succeeded on a failing disk"),
+        Err((e, _)) => panic!("unexpected reopen error: {e:?}"),
+    };
+    assert_eq!(probe(&vfs), (false, false), "held across the failed reopen");
+    // Another path is refused, and the handover comes back too.
+    let handover = match Engine::open_with(
+        Path::new("/db/other.phdb"),
+        options(Arc::clone(&vfs), 2),
+        handover,
+    ) {
+        Err((Error::InvalidArgument(_), handover)) => handover,
+        other => panic!("another path was accepted: {:?}", other.map(|_| ())),
+    };
     gate.heal(&wal(s));
     let reopened = Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 2), handover)
+        .map_err(|(e, _)| e)
         .expect("reopen on the handover");
+    assert_eq!(probe(&vfs), (false, false), "held by the reopened instance");
     assert!(!reopened.is_failed());
     let t = reopened.table("t").expect("the table survives");
     assert!(
@@ -119,6 +165,7 @@ fn a_failed_instance_reopens_on_its_handover_with_the_writer_byte_held_throughou
     gate::within(10, move || reopened.close())
         .expect("close hung")
         .expect("the reopened instance closes cleanly");
+    assert_eq!(probe(&vfs), (true, true), "released by the clean close");
     // The clean close released everything: a plain open works.
     let again = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
     let t = again.table("t").unwrap();
@@ -143,7 +190,13 @@ fn a_dropped_handover_releases_the_locks() {
         Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)),
         Err(Error::WriterLocked)
     ));
+    assert_eq!(probe(&vfs), (false, false));
     drop(handover);
+    assert_eq!(
+        probe(&vfs),
+        (true, true),
+        "a dropped handover releases the writer byte and the presence"
+    );
     let again = Engine::open(Path::new(DB), options(vfs, 2)).expect("open after the drop");
     let t = again.table("t").unwrap();
     assert!(has(&again, &t, "row"), "the clean close kept the data");
@@ -177,6 +230,7 @@ fn a_reader_attached_before_the_handover_reads_the_new_generation() {
         options(Arc::clone(&vfs), 2),
         handover.unwrap(),
     )
+    .map_err(|(e, _)| e)
     .unwrap();
     let t = reopened.table("t").unwrap();
     reopened
@@ -246,6 +300,73 @@ fn wait_failed_returns_at_a_failure_at_the_deadline_and_at_the_close() {
     let woke =
         gate::within(10, move || waiter.join().unwrap()).expect("the close did not end the wait");
     assert!(!woke, "a close ends the wait with false");
+    // A reader handle: never fails, and its wait ends at its close too.
+    let (vfs3, _g) = gate::vfs(1607);
+    let writer = Engine::open(Path::new(DB), options(Arc::clone(&vfs3), 1)).unwrap();
+    let reader = Engine::open_reader(Path::new(DB), options(vfs3, 1)).unwrap();
+    let r2 = Arc::clone(&reader);
+    let waiter =
+        std::thread::spawn(move || r2.wait_failed(Instant::now() + Duration::from_secs(30)));
+    std::thread::sleep(Duration::from_millis(20));
+    reader.close().unwrap();
+    let woke = gate::within(10, move || waiter.join().unwrap())
+        .expect("the reader's close did not end the wait");
+    assert!(!woke);
+    writer.close().unwrap();
+}
+
+/// A `close_for_reopen` that finds a `close` under way does not take the locks from a live
+/// instance (perf287's review of #788 reproduced the handover of a live instance's locks):
+/// it waits for that close and reports no handover, and the close that started first
+/// releases the locks when it ends.
+#[test]
+fn a_handover_asked_for_during_a_close_waits_for_it_and_gets_none() {
+    let (vfs, gate) = gate::vfs(1608);
+    let db = Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let s = shard_of(&db, &t);
+    db.commit(put(&t, "row"), Some(Durability::Buffered))
+        .unwrap();
+    // The close's final sync of shard `s` is held: the close is under way, not finished.
+    gate.hold(&wal(s));
+    let db2 = Arc::clone(&db);
+    let closer = std::thread::spawn(move || db2.close());
+    gate.wait_held(&wal(s));
+    let db2 = Arc::clone(&db);
+    let second = std::thread::spawn(move || db2.close_for_reopen());
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !closer.is_finished(),
+        "the first close finished under a held sync"
+    );
+    assert!(
+        !second.is_finished(),
+        "close_for_reopen returned while the close that started first was still running"
+    );
+    assert_eq!(
+        probe(&vfs),
+        (false, false),
+        "the live instance keeps its locks"
+    );
+    gate.release();
+    gate::within(10, move || closer.join().unwrap())
+        .expect("the first close hung")
+        .expect("a clean close");
+    let (result, handover) =
+        gate::within(10, move || second.join().unwrap()).expect("close_for_reopen hung");
+    assert!(result.is_ok(), "{result:?}");
+    assert!(handover.is_none(), "a loser got the locks");
+    assert_eq!(
+        probe(&vfs),
+        (true, true),
+        "the first close released the locks"
+    );
+    let again = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
+    let t = again.table("t").unwrap();
+    assert!(has(&again, &t, "row"));
+    again.close().unwrap();
 }
 
 /// Application-owned mode has no handover: the application drives the shards.
@@ -289,7 +410,9 @@ fn a_handover_after_every_shard_died_reopens_either_way() {
         gate::within(10, move || db2.close_for_reopen()).expect("close_for_reopen hung");
     assert!(closed.is_err(), "{closed:?}");
     let reopened = match handover {
-        Some(h) => Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 1), h).unwrap(),
+        Some(h) => Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 1), h)
+            .map_err(|(e, _)| e)
+            .unwrap(),
         None => Engine::open(Path::new(DB), options(Arc::clone(&vfs), 1)).unwrap(),
     };
     let t = reopened.table("t").unwrap();

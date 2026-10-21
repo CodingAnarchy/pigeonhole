@@ -98,6 +98,21 @@ impl FailureRecord {
         }
     }
 
+    /// Waits until `done` holds, failure or not: for a `close_for_reopen` that lost the race
+    /// to start the close and waits for the close that won (D265). `done` must turn true only
+    /// before a [`FailureRecord::notify`] (`Shared::closed` does: `try_final_close` stores it,
+    /// then notifies); the 100 ms tick is belt and braces.
+    pub(crate) fn wait_for(&self, done: impl Fn() -> bool) {
+        let mut guard = self.lock.lock().unwrap_or_else(PoisonError::into_inner);
+        while !done() {
+            guard = self
+                .changed
+                .wait_timeout(guard, std::time::Duration::from_millis(100))
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+    }
+
     /// The first failure, if any.
     pub(crate) fn get(&self) -> Option<Failure> {
         let packed = self.first.load(Ordering::Acquire);

@@ -593,23 +593,37 @@ impl Engine {
     /// superblock and manifest, sets up shared memory, replays every WAL stream, resolves
     /// prepared cross-shard commits, and starts the shards (in engine-owned mode).
     pub fn open(path: &Path, options: EngineOptions) -> Result<Arc<Engine>> {
-        let (engine, _) = Self::open_writer(path, options, Mode::EngineOwned, None)?;
+        let (engine, _) =
+            Self::open_writer(path, options, Mode::EngineOwned, None).map_err(|(e, _)| e)?;
         Ok(engine)
     }
 
     /// Opens the database an engine closed with [`Engine::close_for_reopen`] left, on the
     /// writer lock and presence that close kept (D265): as [`Engine::open`], without taking
     /// them, so no other writer could open the file in between and no reader removed its
-    /// shared memory. The WAL is replayed as after a crash. For `pigeonhole`'s automatic
-    /// recovery (#620); not a stable API.
+    /// shared memory. The WAL is replayed as after a crashed writer. `path` must be the
+    /// handover's file (`InvalidArgument` otherwise). On an error the handover comes back
+    /// with it, the locks still held, so the caller can try again without opening the window
+    /// (D265's budget: an `Io` at reopen retries). For `pigeonhole`'s automatic recovery
+    /// (#620); not a stable API.
     #[doc(hidden)]
     pub fn open_with(
         path: &Path,
         options: EngineOptions,
         handover: Handover,
-    ) -> Result<Arc<Engine>> {
-        let (engine, _) = Self::open_writer(path, options, Mode::EngineOwned, Some(handover))?;
-        Ok(engine)
+    ) -> std::result::Result<Arc<Engine>, (Error, Handover)> {
+        match Self::open_writer(path, options, Mode::EngineOwned, Some(handover)) {
+            Ok((engine, _)) => Ok(engine),
+            // A failed open always gives the handover back (the locks move into the engine
+            // as its last step); the `None` arm is unreachable by construction.
+            Err((e, handover)) => Err((
+                e,
+                handover.unwrap_or_else(|| Handover {
+                    locks: None,
+                    path: path.to_path_buf(),
+                }),
+            )),
+        }
     }
 
     /// Opens in application-owned mode: as [`Engine::open`], but returns one [`EngineShard`]
@@ -641,15 +655,58 @@ impl Engine {
                 "compaction_cores must be 0 in application-owned mode (decision D40)".to_owned(),
             ));
         }
-        let (engine, shards) = Self::open_writer(path, options, Mode::ApplicationOwned, None)?;
+        let (engine, shards) =
+            Self::open_writer(path, options, Mode::ApplicationOwned, None).map_err(|(e, _)| e)?;
         Ok((engine, shards.unwrap_or_default()))
     }
 
+    /// `open_writer_inner`, keeping the locks out of the engine until it is fully open: on an
+    /// error they come back (with a handover, the one that came in), so a reopen can retry
+    /// without releasing them (D265).
+    #[allow(clippy::type_complexity)]
     fn open_writer(
         path: &Path,
         options: EngineOptions,
         mode: Mode,
         handover: Option<Handover>,
+    ) -> std::result::Result<(Arc<Engine>, Option<Vec<EngineShard>>), (Error, Option<Handover>)>
+    {
+        let handed_over = handover.is_some();
+        let mut held = match handover {
+            Some(Handover { locks, path: from }) => {
+                if from != path {
+                    return Err((
+                        Error::InvalidArgument(format!(
+                            "open_with: {} is not the handover's file {}",
+                            path.display(),
+                            from.display()
+                        )),
+                        Some(Handover { locks, path: from }),
+                    ));
+                }
+                locks
+            }
+            None => None,
+        };
+        match Self::open_writer_inner(path, options, mode, &mut held) {
+            Ok(opened) => Ok(opened),
+            Err(e) => Err((
+                e,
+                handed_over.then(|| Handover {
+                    locks: held,
+                    path: path.to_path_buf(),
+                }),
+            )),
+        }
+    }
+
+    /// `held`: the locks of a handover (D265), or `None` to take them; filled at step 3 and
+    /// moved into the engine as the last step, so an error leaves them in `held`.
+    fn open_writer_inner(
+        path: &Path,
+        options: EngineOptions,
+        mode: Mode,
+        held: &mut Option<Locks>,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
         let shards = if options.shards == 0 {
             pigeonhole_io::sys::default_shards()
@@ -686,15 +743,15 @@ impl Engine {
         //    comes first (#147): it only reads (`fstatfs`), and on a network filesystem
         //    without lock support taking the lock fails with a bare I/O error instead.
         //    A handover (D265) brings the handle with both locks held: nothing to take.
-        let (file, writer_lock, presence) = match handover {
-            Some(Handover { locks }) => (locks.file, locks._writer, Some(locks.presence)),
+        let (file, writer_lock) = match held.as_ref() {
+            Some(locks) => (locks.file.clone(), None),
             None => {
                 let mut open_opts = OpenOptions::read();
                 open_opts.write = true;
                 let file = vfs.open(path, open_opts)?;
                 check_local(&file, options.allow_fuse)?;
                 let writer_lock = WriterLock::acquire(&file)?;
-                (file, writer_lock, None)
+                (file, Some(writer_lock))
             }
         };
         let identity = file.identity()?;
@@ -733,17 +790,25 @@ impl Engine {
         // Opened only because unregistered operators are allowed: read-only (#43).
         let read_only = catalog.has_unknown_merge;
 
-        // 3. Shared memory under a new generation, then presence (D37).
+        // 3. Shared memory under a new generation, then presence (D37). On a handover the
+        //    presence is already held on this handle: the region's `present(file)` is a
+        //    no-op re-take (shared to shared, same owner), and D37's "not already present"
+        //    constraint is not hit, since a handover's old region has the current layout
+        //    version (`alone()` is reached only for another version).
         let mut shm_config = ShmConfig::new(shards as u32);
         shm_config.arena_bytes = options.memtable_budget;
         shm_config.reader_slots = options.reader_slots.max(1);
         shm_config.dir = options.shm_dir.clone();
         shm_config.first_seqno = first_seqno(catalog.counters.seqno_ceiling, 0);
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?;
-        let presence = match presence {
-            Some(presence) => presence,
-            None => Presence::acquire(&file)?,
-        };
+        if held.is_none() {
+            let presence = Presence::acquire(&file)?;
+            *held = Some(Locks {
+                _writer: writer_lock.expect("taken at step 1 when there is no handover"),
+                presence,
+                file: file.clone(),
+            });
+        }
 
         // 4. Shard states over the arenas. With tablet changes on, every tablet is placed so
         //    no shard holds more slots than its arena serves where the tablets allow, and the
@@ -813,11 +878,8 @@ impl Engine {
             room_recheck_nanos: options.room_recheck_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
             tail_index: options.memtable_tail_index,
-            locks: Mutex::new(Some(Locks {
-                _writer: writer_lock,
-                presence,
-                file: file.clone(),
-            })),
+            // Filled as the last step of the open (`held`).
+            locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
@@ -1278,6 +1340,9 @@ impl Engine {
                 )
             }
         };
+        // The locks move in last: an error above leaves them with the caller (a handover
+        // retries on them, D265).
+        *shared.locks.lock().unwrap_or_else(PoisonError::into_inner) = held.take();
         for i in 0..shards {
             let _ = shared.submitter(ShardId(i as u16)).submit(ShardMsg::Start);
         }
@@ -2321,12 +2386,15 @@ impl Engine {
 
     /// Closes as [`Engine::close`] does, keeping the writer lock and presence for an
     /// [`Engine::open_with`] of the same path (D265): the close's result, and the handover,
-    /// or `None` when the final close had already released the locks (every shard was dead
-    /// and the close ran before this call, or `close` ran concurrently); the caller then
-    /// falls back to [`Engine::open`]. Dropping the handover releases the locks as a close
-    /// does. Engine-owned writers only: an application-owned engine's close cannot wait,
-    /// and a reader holds no writer lock. For `pigeonhole`'s automatic recovery (#620); not
-    /// a stable API.
+    /// or `None` when this call did not start the close (a `close`, or another
+    /// `close_for_reopen`, was already under way: this call waits for it, and that close
+    /// releases the locks) or when the final close had already released them (every shard
+    /// was dead and the close ran before this call); the caller then falls back to
+    /// [`Engine::open`]. Dropping the handover releases the locks, but runs no last-one-out
+    /// cleanup: the WAL files and the shm region stay, as after a crashed writer, and the
+    /// next open replays and rebuilds. Engine-owned writers only: an application-owned
+    /// engine's close cannot wait, and a reader holds no writer lock. For `pigeonhole`'s
+    /// automatic recovery (#620); not a stable API.
     #[doc(hidden)]
     pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>) {
         if self.inner.role != Role::Writer || self.inner.application_owned {
@@ -2337,15 +2405,24 @@ impl Engine {
                 None,
             );
         }
-        let shared = &self.inner.shared;
-        shared.keep_locks.store(true, Ordering::Release);
-        let result = self.inner.close(true);
-        let locks = shared
+        let (result, started_here) = self.inner.close_with(true, true);
+        if !started_here {
+            return (result, None);
+        }
+        let locks = self
+            .inner
+            .shared
             .locks
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        (result, locks.map(|locks| Handover { locks }))
+        (
+            result,
+            locks.map(|locks| Handover {
+                locks: Some(locks),
+                path: self.inner.path.clone(),
+            }),
+        )
     }
 
     /// Waits until this instance records a failure ([`Engine::is_failed`]; `true`, at once if
@@ -2362,11 +2439,16 @@ impl Engine {
 }
 
 /// What [`Engine::close_for_reopen`] keeps for [`Engine::open_with`]: the writer lock, the
-/// presence and the handle they live on (D265). Dropping it releases them.
+/// presence and the handle they live on, and the path they belong to (D265). Dropping it
+/// releases the locks but runs no last-one-out cleanup: the WAL files and the shm region
+/// stay, as after a crashed writer.
 #[doc(hidden)]
 #[derive(Debug)]
 pub struct Handover {
-    locks: Locks,
+    /// `None` only in the handover `open_with` returns when it lost the locks (never
+    /// expected: they move into the engine as the open's last step).
+    locks: Option<Locks>,
+    path: PathBuf,
 }
 
 impl Drop for Engine {
@@ -3484,11 +3566,33 @@ impl Inner {
     // ---- close ----
 
     fn close(&self, wait: bool) -> Result<()> {
+        self.close_with(wait, false).0
+    }
+
+    /// `close`, and whether this call is the one that started the close. With `keep_locks`
+    /// (a `close_for_reopen`, D265) the final close leaves the locks in place, but only when
+    /// this call started it: a call that finds the close under way sets nothing (the close
+    /// that started first releases the locks when it ends) and, since its caller wants the
+    /// outcome, waits for that close to finish and returns its result.
+    fn close_with(&self, wait: bool, keep_locks: bool) -> (Result<()>, bool) {
         if self.role != Role::Writer {
-            return self.close_reader();
+            return (self.close_reader(), false);
         }
         if self.closing.swap(true, Ordering::AcqRel) {
-            return Ok(());
+            if keep_locks {
+                let shared = &self.shared;
+                shared
+                    .failure
+                    .wait_for(|| shared.closed.load(Ordering::Acquire));
+                let outcome = shared
+                    .close
+                    .outcome(|o| o.as_ref().copied().map_err(Error::duplicate));
+                return (outcome.unwrap_or(Ok(())), false);
+            }
+            return (Ok(()), false);
+        }
+        if keep_locks {
+            self.shared.keep_locks.store(true, Ordering::Release);
         }
         if let Some(a) = &self.admission {
             a.close();
@@ -3529,12 +3633,13 @@ impl Inner {
                 // A shard thread that panicked resumes its panic here: report it instead
                 // (this also runs from `Drop for Engine`).
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.shutdown())) {
-                    Ok(r) => drop(r?),
-                    Err(panic) => return Err(shard_panicked(&*panic)),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => return (Err(e.into()), true),
+                    Err(panic) => return (Err(shard_panicked(&*panic)), true),
                 }
             }
         }
-        result
+        (result, true)
     }
 
     fn close_reader(&self) -> Result<()> {
@@ -3576,6 +3681,8 @@ impl Inner {
             }
         }
         self.shared.closed.store(true, Ordering::Release);
+        // A `wait_failed` on a reader handle ends at its close, as on a writer (D265).
+        self.shared.failure.notify();
         Ok(())
     }
 

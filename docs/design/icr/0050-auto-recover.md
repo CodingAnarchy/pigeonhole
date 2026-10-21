@@ -56,23 +56,31 @@ Existing codes gain documented situations: `Busy` (an operation waited for a rec
 ### `pigeonhole-engine` (additive, `#[doc(hidden)]`: the public crate is a separate crate, so the handover cannot be crate-private; not a stable API)
 
 ```rust
-/// The writer lock, the presence and the handle they live on. Dropping it releases them.
+/// The writer lock, the presence, the handle they live on and the path they belong to.
+/// Dropping it releases the locks but runs no last-one-out cleanup: the WAL files and the
+/// shm region stay, as after a crashed writer, and the next open replays and rebuilds.
 pub struct Handover { /* private */ }
 
 impl Engine {
     /// Closes as `close` does, keeping the locks: the close's result, and the handover, or
-    /// `None` when the final close had already released them (then fall back to `open`).
-    /// Engine-owned writers only (`InvalidArgument` otherwise).
+    /// `None` when this call did not start the close (a close was under way: it waits for it,
+    /// and that close releases the locks) or the final close had already released them
+    /// (every shard dead); then fall back to `open`. Engine-owned writers only
+    /// (`InvalidArgument` otherwise).
     pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>);
     /// `open` on a handover: skips the local-filesystem check, `WriterLock::acquire` and
-    /// `Presence::acquire`; everything else as `open`.
-    pub fn open_with(path: &Path, options: EngineOptions, handover: Handover) -> Result<Arc<Engine>>;
-    /// Blocks until the instance records a failure (`true`), or until `deadline` or its close (`false`).
+    /// `Presence::acquire`; everything else as `open`. `path` must be the handover's file
+    /// (`InvalidArgument`). On an error the handover comes back with it, the locks still
+    /// held, so a retry (D265's budget) never opens the window.
+    pub fn open_with(path: &Path, options: EngineOptions, handover: Handover)
+        -> Result<Arc<Engine>, (Error, Handover)>;
+    /// Blocks until the instance records a failure (`true`), or until `deadline` or its close
+    /// (`false`); on a reader handle, which never fails, until its close.
     pub fn wait_failed(&self, deadline: Instant) -> bool;
 }
 ```
 
-Internal: `Locks` carries the handle (`file`); `Shared::keep_locks` makes `final_close` leave the locks in place, skip the presence upgrade and remove neither the WAL files nor the shm region (as after a crashed writer).
+Internal: `Locks` carries the handle (`file`) and moves into the engine as the open's last step, so a failed open leaves them with the caller; `Shared::keep_locks` is set only by the call that starts the close and makes `final_close` leave the locks in place, skip the presence upgrade and remove neither the WAL files nor the shm region (as after a crashed writer); `close_reader` notifies the failure wait.
 
 ### Not changed
 No format, WAL or shm layout change. `pigeonhole-shm` is unchanged. Reader processes keep D148's contract.
