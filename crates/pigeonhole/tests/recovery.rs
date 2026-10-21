@@ -428,6 +428,55 @@ fn a_deadline_that_passes_during_the_reopen_stays_given_up() {
     let _ = db.close();
 }
 
+/// A read as of now during the pause, once the failed engine's close released its memory
+/// (an empty view, #821): it must not answer from that view. It waits for the swap and reads
+/// on the recovered engine (D265: a read once the old view is gone waits). The model check's
+/// recovery arm found a get between the release and the swap answering `None` for a row that
+/// was there.
+#[test]
+fn a_read_after_the_release_waits_for_the_swap_instead_of_reading_the_empty_view() {
+    let (vfs, gate) = gate::vfs(2013);
+    let (db, t) = open(&vfs, Recovery::Io);
+    for i in 0..32 {
+        put(&t, &format!("row{i:02}")).unwrap();
+    }
+    // A record the reopen's replay reads back, held by its bytes: the window between the
+    // release and the swap stays open.
+    t.mutate(b"marker")
+        .put("f", b"q", b"HOLD-THIS-READ-HOLD-THIS-READ")
+        .commit()
+        .unwrap();
+    gate.hold_reads_containing(Some(b"HOLD-THIS-READ-HOLD-THIS-READ"));
+    let _ = fail_shard(&gate, &t, "lost");
+    gate.wait_held_read();
+    // The failed engine is closed and released; the reopen's replay is held.
+    assert!(db.is_failed());
+    let (tx, rx) = mpsc::channel();
+    let (db2, t2) = (db.clone(), t.clone());
+    std::thread::spawn(move || {
+        let _ = tx.send((
+            t2.get(b"row07", "f", b"q").map(|c| c.is_some()),
+            t2.row(b"row08").read().map(|r| r.is_some()),
+            db2.snapshot().map(|_| ()),
+        ));
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "a read answered during the pause, after the release"
+    );
+    gate.release_reads();
+    let (get, row, snapshot) = rx.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(get.unwrap(), "the get read the row on the recovered engine");
+    assert!(
+        row.unwrap(),
+        "the row read read the row on the recovered engine"
+    );
+    snapshot.unwrap();
+    assert!(wait_until(20, || !db.is_failed()));
+    assert_eq!(db.recovery_stats().generation, 2);
+    db.close().unwrap();
+}
+
 /// `close()` during a recovery waits for it to settle, then closes what the handle ends on.
 #[test]
 fn close_during_a_recovery_settles_it_first() {

@@ -207,21 +207,32 @@ impl Db {
     /// the handle is closed). Costs nothing on the success path.
     #[inline(always)]
     pub(crate) fn retry_closed<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
-        // The generation before the operation (one load, with the option on; none with it
-        // off): a `Closed` is then judged against the engine the operation ran on, not
-        // against whatever is current once the thread runs again (perf287's R3 on #836).
-        let generation = if self.supervision.is_some() {
-            self.generation()
-        } else {
-            0
-        };
+        // Option off: the operation as it was, nothing around it (the instructions run on
+        // #836 measured the version below with a load and a match around every get at
+        // about 120 instructions more per point get).
+        if self.supervision.is_none() {
+            return op();
+        }
+        // The generation before the operation (one load): a `Closed` is then judged against
+        // the engine the operation ran on, not against whatever is current once the thread
+        // runs again (perf287's R3 on #836).
+        let generation = self.generation();
         match op() {
-            Err(e) if e.code() == ErrorCode::Closed => {
-                self.after_closed(generation)?;
-                op()
-            }
+            Err(e) if e.code() == ErrorCode::Closed => self.retry_after_closed(generation, op),
             r => r,
         }
+    }
+
+    /// The retry, out of line: after the wait, the operation again on the current engine.
+    #[cold]
+    #[inline(never)]
+    fn retry_after_closed<T>(
+        &self,
+        generation: u64,
+        mut op: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        self.after_closed(generation)?;
+        op()
     }
 
     /// An operation got `Closed`: whether to run it again (`Ok`), after waiting for a running
@@ -1001,9 +1012,14 @@ impl Pigeonhole {
     pub fn close(self) -> Result<()> {
         self.db.generation.fetch_or(CLOSED, Ordering::Release);
         // A running recovery settles first (its swap, or its give-up; bounded by its own
-        // deadline), so the engine closed is the one every handle ends on.
+        // deadline), so the engine closed is the one every handle ends on. A failure the
+        // supervisor has not marked yet is waited for too: the model check found a close
+        // racing a fresh failure, which closed the failed engine unclean where the swap
+        // was a moment away.
         if let Some(sup) = self.db.supervision() {
-            sup.wait_settled(self.db.stall_timeout().saturating_mul(5), || false);
+            sup.wait_settled(self.db.stall_timeout().saturating_mul(5), || {
+                self.db.engine_arc().is_failed()
+            });
         }
         let result = self.db.engine().close();
         if let Some(sup) = self.db.supervision() {
