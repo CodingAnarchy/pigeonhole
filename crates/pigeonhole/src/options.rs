@@ -58,6 +58,24 @@ pub struct Options {
     write_stall_timeout: Option<Duration>,
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
+    auto_recover: Recovery,
+}
+
+/// Which failures [`Options::auto_recover`] recovers from in place (D265, #620).
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Recovery {
+    /// Never: a failed instance stays failed until it is closed and reopened (the recovery
+    /// guide's procedure). The default.
+    #[default]
+    Off = 0,
+    /// From an I/O failure: a shard that stopped after a write or sync to its log failed
+    /// (`FailureCause::Io`), or a failed manifest commit to the main file.
+    Io = 1,
+    /// From any failure, a shard's panic or an internal error included. A panic is a bug
+    /// the same input may repeat; the budget (three recoveries in ten minutes) bounds the
+    /// loop, and then the instance stays failed.
+    Any = 2,
 }
 
 /// Engine-owned mode's flush and compaction threads for `shards` shards (D252): one per
@@ -106,6 +124,7 @@ impl Default for Options {
             write_stall_timeout: None,
             commit_spin: None,
             shard_spin: None,
+            auto_recover: Recovery::Off,
         }
     }
 }
@@ -226,6 +245,58 @@ impl Options {
     /// ```
     pub fn write_stall_timeout(mut self, timeout: Duration) -> Self {
         self.write_stall_timeout = Some(timeout);
+        self
+    }
+
+    /// Recovers a failed instance in place (D265, #620): with [`Recovery::Io`] or
+    /// [`Recovery::Any`], a supervisor thread waits for a failure and, on one the setting
+    /// covers, closes the failed engine keeping its writer lock, reopens the same path on it
+    /// and swaps the new engine in behind every handle. Tables keep working; a snapshot, a
+    /// scan or a transaction from before fails with `SnapshotExpired`, and an operation that
+    /// arrives during the pause waits up to [`write_stall_timeout`](Self::write_stall_timeout)
+    /// for the swap (`Busy` past it: not committed, retry); a commit that was in flight when
+    /// the shard failed comes back as `Busy` too. At most three recoveries in ten minutes,
+    /// with a backoff of 0, 1 and 4 seconds before the reopen; past the budget, on a reopen
+    /// that fails with `Corruption`, `UnsupportedFormat`, `NoSpace`, `WriterLocked` or
+    /// `ShmVersionMismatch`, or when the failed engine's close has not returned within four
+    /// write-stall timeouts (a device that never answers), the instance stays failed as with
+    /// [`Recovery::Off`].
+    /// [`Pigeonhole::recovery_stats`](crate::Pigeonhole::recovery_stats) reports it. Refused
+    /// by [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned).
+    /// See the user guide's "Recovering from a failed shard".
+    ///
+    /// ```
+    /// use std::time::Duration;
+    /// use pigeonhole::{ErrorCode, Family, Options, Pigeonhole, Recovery};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(
+    ///     dir.join("app.phdb"),
+    ///     Options::default()
+    ///         .shards(1)
+    ///         .auto_recover(Recovery::Io)
+    ///         .write_stall_timeout(Duration::from_secs(5)),
+    /// )?;
+    /// let t = db.table("users")?.family("profile", Family::default()).create_if_missing()?;
+    /// // A commit during a recovery waits for the swap; past the timeout, or if it was in
+    /// // flight at the failure, it comes back as `Busy` and is simply retried.
+    /// let mut tries = 0;
+    /// loop {
+    ///     match t.mutate(b"u1").put("profile", b"name", b"Ada").commit() {
+    ///         Ok(_) => break,
+    ///         Err(e) if e.code() == ErrorCode::Busy && tries < 3 => tries += 1,
+    ///         Err(e) => return Err(e),
+    ///     }
+    /// }
+    /// let stats = db.recovery_stats();
+    /// assert_eq!((stats.generation, stats.recoveries, stats.gave_up), (1, 0, false));
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn auto_recover(mut self, recovery: Recovery) -> Self {
+        self.auto_recover = recovery;
         self
     }
 
@@ -736,6 +807,17 @@ impl Options {
     /// The engine configuration these options describe.
     pub(crate) fn to_engine(&self) -> Result<EngineOptions, pigeonhole_engine::Error> {
         self.to_engine_for(false)
+    }
+
+    /// [`Options::auto_recover`].
+    pub(crate) fn recovery(&self) -> Recovery {
+        self.auto_recover
+    }
+
+    /// [`Options::write_stall_timeout`], or the engine's default.
+    pub(crate) fn stall_timeout(&self) -> Duration {
+        self.write_stall_timeout
+            .unwrap_or_else(|| Duration::from_secs(30))
     }
 
     /// The engine configuration these options describe, for an application-owned open when

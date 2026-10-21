@@ -517,11 +517,17 @@ impl RowMutation<'_> {
 
     /// Commits.
     pub fn commit(self) -> Result<CommitInfo> {
-        self.builder.commit(
-            &self.table.engine(),
-            self.table.db.max_value,
-            self.durability,
-        )
+        let RowMutation {
+            table,
+            builder,
+            durability,
+            ..
+        } = self;
+        // A recovery running: wait for its swap, then commit on the new engine (D265).
+        table.db.before_commit()?;
+        builder
+            .commit(&table.engine(), table.db.max_value, durability)
+            .map_err(|e| table.db.after_commit_closed(e))
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
@@ -571,6 +577,7 @@ impl RowMutation<'_> {
         let predicate = self.predicate(condition)?;
         let db = &self.table.db;
         let largest = self.builder.largest_value;
+        db.before_commit()?;
         let (applied, info) = self
             .table
             .engine()
@@ -581,7 +588,7 @@ impl RowMutation<'_> {
                 self.builder.batch,
                 self.durability,
             )
-            .map_err(|e| commit_error(e, largest, db.max_value))?;
+            .map_err(|e| db.after_commit_closed(commit_error(e, largest, db.max_value)))?;
         Ok(if applied {
             info.map(CommitInfo::from)
         } else {
@@ -893,7 +900,10 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.commit(&cached.get(&db), db.max_value, None)
+        db.before_commit()?;
+        builder
+            .commit(&cached.get(&db), db.max_value, None)
+            .map_err(|e| db.after_commit_closed(e))
     }
 
     /// Commits with `durability` for this commit only.
@@ -903,7 +913,10 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.commit(&cached.get(&db), db.max_value, Some(durability))
+        db.before_commit()?;
+        builder
+            .commit(&cached.get(&db), db.max_value, Some(durability))
+            .map_err(|e| db.after_commit_closed(e))
     }
 
     /// Submits with `durability` and returns at once with a [`CommitTicket`] to wait on or
@@ -920,7 +933,10 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.submit(&cached.get(&db), db.max_value, durability)
+        db.before_commit()?;
+        builder
+            .submit(&cached.get(&db), db.max_value, durability)
+            .map_err(|e| db.after_commit_closed(e))
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
@@ -1035,10 +1051,13 @@ impl Transaction {
         self.db.check_open()?;
         self.db.check_generation(self.generation)?;
         let (largest, max) = (self.largest_value, self.db.max_value);
+        // A transaction's engine is the one it began on: a recovery running means its
+        // snapshot expires with the swap, so no wait and no retry, only the error's name.
+        let db = Arc::clone(&self.db);
         self.txn
             .commit(durability)
             .map(CommitInfo::from)
-            .map_err(|e| commit_error(e, largest, max))
+            .map_err(|e| db.after_commit_closed(commit_error(e, largest, max)))
     }
 
     /// Reads a cell at the transaction's snapshot and records the read.

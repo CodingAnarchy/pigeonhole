@@ -183,7 +183,9 @@ impl Selection {
                 core.db.check_snapshot(&s)?;
                 s.inner
             }
-            None => core.engine().snapshot()?,
+            None => core
+                .db
+                .retry_closed(|| core.engine().snapshot().map_err(crate::Error::from))?,
         };
         let info = core.current_info();
         let mut ids = SmallVec::new();
@@ -342,16 +344,15 @@ impl<'t> RowRead<'t> {
         // The engine resolves the cells straight into the row this returns (#287): no
         // intermediate row and no second copy of each cell.
         let mut buf = RowBuf::new(info, 0);
-        let (engine, table) = (&self.core.engine(), self.core.info.id);
+        let table = self.core.info.id;
         let any = match &snapshot {
-            None => engine.read_row_latest_into(
-                table,
-                &self.row,
-                &families,
-                &self.sel.spec,
-                &mut buf,
-            )?,
-            Some(snapshot) => engine.read_row_into_families(
+            None => self.core.db.retry_closed(|| {
+                self.core
+                    .engine()
+                    .read_row_latest_into(table, &self.row, &families, &self.sel.spec, &mut buf)
+                    .map_err(crate::Error::from)
+            })?,
+            Some(snapshot) => self.core.engine().read_row_into_families(
                 snapshot,
                 table,
                 &self.row,

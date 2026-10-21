@@ -113,26 +113,37 @@ impl TableBuilder<'_> {
                     ),
                 ));
             }
-            None => match engine.create_table(&self.name, &defs) {
+            None => match db.retry_closed(|| {
+                self.db
+                    .engine()
+                    .create_table(&self.name, &defs)
+                    .map_err(Error::from)
+            }) {
                 Ok(info) => info,
                 // Another thread created it first: open it as it is.
-                Err(pigeonhole_engine::Error::TableExists(_)) if how != Finish::Create => engine
+                Err(e) if e.code() == ErrorCode::TableExists && how != Finish::Create => engine
                     .table(&self.name)
                     .ok_or_else(|| pigeonhole_engine::Error::TableNotFound(self.name.clone()))?,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             },
         };
         for (name, options) in defs {
             if info.family(&name).is_some() {
                 continue;
             }
-            info = match engine.add_family(info.id, &name, options) {
+            let id = info.id;
+            info = match db.retry_closed(|| {
+                self.db
+                    .engine()
+                    .add_family(id, &name, options.clone())
+                    .map_err(Error::from)
+            }) {
                 Ok(info) => info,
                 // Added concurrently: it keeps the options it was created with.
-                Err(pigeonhole_engine::Error::FamilyExists(_)) => engine
+                Err(e) if e.code() == ErrorCode::FamilyExists => engine
                     .table(&self.name)
                     .ok_or_else(|| pigeonhole_engine::Error::TableNotFound(self.name.clone()))?,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             };
         }
         Ok(Table {
@@ -209,7 +220,10 @@ impl TableCore {
         let family = self.family_id(family)?;
         let table = self.info.id;
         let data = match snapshot {
-            None => self.with(|e| e.get_latest(table, family, row, qualifier))?,
+            None => self.db.retry_closed(|| {
+                self.with(|e| e.get_latest(table, family, row, qualifier))
+                    .map_err(Error::from)
+            })?,
             Some(s) => {
                 self.db.check_snapshot(s)?;
                 self.with(|e| e.get(&s.inner, table, family, row, qualifier))?
