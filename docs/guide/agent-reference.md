@@ -267,7 +267,7 @@ Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; befo
 
 | Item | Rule |
 |---|---|
-| Commands | `phdb info <file>`. `check`, `dump`, `load`, `backup`, `compact` and `shell` are coming. |
+| Commands | `phdb info <file>`; `phdb check <file> [--deep] [--map] [--online]` (offline integrity check, exit 3 on damage; `--online` scans through a reader while a writer runs). `dump`, `load`, `backup`, `compact` and `shell` are coming. |
 | For programs | `--format json` gives one document; `--format jsonl` gives a header line, then one object per row. Each carries `"phdb": 1`; within it fields are only added, so ignore unknown fields. |
 | Open policy | With no writer running, `phdb` becomes the writer for the command, replaying a crashed WAL, and closes. With a writer running, it opens as a reader process. `--reader` / `--writer` force one. |
 | Exit status | 0 ok, 1 error, 2 usage, 3 corruption, 4 locked or busy, 5 not found, 6 unsupported. |

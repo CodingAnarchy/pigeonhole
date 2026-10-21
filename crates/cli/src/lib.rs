@@ -42,9 +42,9 @@ where
     let format = cli.format;
     match cmd::run(cli) {
         Ok(report) => match output::render(&report, format, stdout) {
-            Ok(()) => ExitStatus::SUCCESS,
+            Ok(()) => report.status,
             // A closed pipe (`phdb … | head`) is not an error worth a message.
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitStatus::SUCCESS,
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => report.status,
             Err(e) => {
                 let e = exit::Failure::io("write output", &e);
                 e.render(format, stderr);

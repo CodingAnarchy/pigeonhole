@@ -2,7 +2,7 @@
 
 `phdb` inspects and maintains Pigeonhole databases from the shell, in the spirit of `sqlite3` and `duckdb`.
 
-> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). `phdb info` works. `check`, `dump`, `load`, `backup`, `compact` and the interactive `shell` are coming, in that order; this page grows with each.
+> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). `phdb info` and `phdb check` work. `dump`, `load`, `backup`, `compact` and the interactive `shell` are coming, in that order; this page grows with each.
 
 **Install:** `cargo install pigeonhole-cli` installs the `phdb` binary. Until the next release, build it from a checkout with `cargo install --path crates/cli`.
 
@@ -11,6 +11,7 @@
 | Command | What it does |
 |---|---|
 | `phdb info <file>` | Format version, file size and free space, and per table its tablets, its families with their stored options, and their files (SSTs per level, blob files). |
+| `phdb check <file> [--deep] [--map] [--online]` | Check the file for damage, offline. Exits 3 if anything is damaged. |
 
 **Global flags,** before or after the command:
 
@@ -23,6 +24,8 @@
 | `--help`, `--version` | Help (also per command: `phdb info --help`) and version. |
 
 ## How `phdb` opens a database
+
+`check` is the exception: it never opens the database (see [`phdb check`](#phdb-check)). The rest:
 
 A database has one writer process at a time and any number of reader processes (see [Concepts](concepts.md#multi-process-readers-phase-4-available-now)). A read-only command such as `info` works either way:
 
@@ -107,6 +110,70 @@ users   profile  1        0     0          0        0           1             - 
 users   history  1        0     0          0        0           0             2592000000000  none
 ```
 
+### `phdb check`
+
+`phdb check` reads every structure of the file and reports what is damaged:
+- both superblock slots;
+- the manifest, which is the catalog of tables and files;
+- every extent the manifest references (valid, inside the file, not overlapping);
+- every block of every SST, with its checksum verified, key order, and agreement with the manifest;
+- every blob record;
+- the WAL files a crash left, read as the next open would replay them.
+
+It is the library's [`pigeonhole::check`](agent-reference.md#check-offline-integrity-check-icr-0048).
+
+- **Offline, and it changes nothing.** It takes the writer lock, so it can't run while a writer process has the database open (exit 4). It never replays the WAL and never writes: a crashed database is checked as it was left. The lock needs write access to the file, so to check a copy on read-only media, copy it somewhere writable first.
+- **`--online`:** if a writer process has the database open, read every table through a reader process instead, all versions at one snapshot. It's a weaker check: it reaches only the data a scan reads, not index or filter blocks, the other superblock slot or the WAL. With no writer running, `--online` runs the offline check.
+- **`--deep`:** also read every separated value (blob) through its pointer, and recount each blob file's live bytes.
+- **`--map`:** list the file's regions instead of the findings: superblock pages, the manifest, each SST with its table, family and level, and each blob extent. In `json` they're added as `regions`.
+- **Exit status:** 3 if any finding is `corruption`. Warnings and info findings exit 0.
+
+**A finding** (each row of `table`, `csv` and `jsonl`, and each entry of `findings` in `json`):
+
+| Field | Meaning |
+|---|---|
+| `structure` | `superblock`, `manifest`, `allocation` (extents), `sst`, `blob` or `wal`. With `--online`: `data`. |
+| `severity` | `corruption`: damaged. `warning`: something a crash can also leave; the message says which. `info`: expected after a crash, such as a torn WAL tail. |
+| `object` | Which one: the superblock slot, SST id, blob file id or WAL stream. |
+| `offset` | Where, in bytes: in the database file, or in the WAL file for `wal`. |
+| `message` | What is wrong, for people. The wording may change. |
+
+After a crash, a WAL tail with valid records after a gap is a `warning`, not damage. A power loss that tears the last unsynced write leaves the same picture, and the WAL doesn't record what was synced. Damage inside the WAL is `corruption` when a later segment proves the lost records were synced.
+
+**Summary fields** (the `json` document's top level, and the `jsonl` header):
+
+| Field | Meaning |
+|---|---|
+| `path`, `mode` | The file, and `offline` or `online`. |
+| `result` | `ok` or `corrupt`. |
+| `corruption`, `warnings`, `info` | Findings by severity. |
+| `deep` | Whether `--deep` was given. |
+| `clean_shutdown` | The newest root's clean flag: no root commit since a clean close. A database reopened and then crashed before its first flush still has it set. |
+| `file_bytes` | The file's length. |
+| `superblocks`, `tables`, `ssts`, `sst_entries`, `blob_files`, `blob_records`, `blob_pointers`, `wal_files`, `wal_records` | How much was read. |
+
+In `json` only:
+- `wal`: per WAL file, `stream`, `path`, `len`, `segment_size`, `segments`, `records` (what the next open replays), `checkpoint` and `end` (each `epoch` and `offset`), and `end_slot`.
+- With `--map`, `regions`: each with `kind` (`superblock`, `manifest-snapshot`, `manifest-log`, `sst`, `blob`), `offset` and `len`. A superblock adds `slot`. An SST adds `sst`, `table`, `family`, `level` and `used` (its bytes in use). A blob extent adds `blob_file`, `index` and `family`.
+
+`--online` reports `tables`, `rows` and `cells` read, and per finding `table`, `code` (the `ErrorCode`) and `message`.
+
+Example of a damaged file (the summary is cut):
+
+```text
+$ phdb check app.phdb
+path            app.phdb
+mode            offline
+result          corrupt
+corruption      1
+...
+
+structure  severity    object  offset  message
+blob       corruption  1       262208  blob file 1: the record at 0: blob record: checksum mismatch
+$ echo $?
+3
+```
+
 ## Exit status
 
 | Status | Meaning |
@@ -114,7 +181,7 @@ users   history  1        0     0          0        0           0             25
 | 0 | Success. |
 | 1 | An error not listed below (see the error's code). |
 | 2 | Usage: bad arguments. |
-| 3 | Corruption: the file is damaged (`ErrorCode::Corruption`). |
+| 3 | Corruption: the file is damaged (`ErrorCode::Corruption`, or `phdb check` found damage). |
 | 4 | Locked or busy: another process holds the writer lock (`WriterLocked`), the database stayed too busy (`Busy`), or every reader slot is taken (`NoReaderSlot`). |
 | 5 | Not found: the file, or a table or family the command names. |
 | 6 | Unsupported: the file's format version is newer than this `phdb` (`UnsupportedFormat`), or the writer runs another shared-memory layout (`ShmVersionMismatch`), or the system lacks a feature (`Unsupported`). |

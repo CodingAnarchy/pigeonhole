@@ -71,6 +71,7 @@ fn report(file: &Path, mode: &'static str, info: &DatabaseInfo) -> Report {
             .collect(),
         rows,
         document,
+        status: crate::ExitStatus::SUCCESS,
     }
 }
 

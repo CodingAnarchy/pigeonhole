@@ -1,6 +1,6 @@
 [package]
 name = "pigeonhole-cli"
-description = "phdb: the command-line tool for Pigeonhole databases: info, and (planned) check, dump, load, backup, compact and an interactive shell."
+description = "phdb: the command-line tool for Pigeonhole databases: info and check, and (planned) dump, load, backup, compact and an interactive shell."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
