@@ -35,11 +35,11 @@ The spec's model is thread-per-core. Each shard owns its data (`ShardState`: mem
 
 | Where | Production | Test hooks only | Notes |
 |---|---:|---:|---|
-| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared` and the helper files appendix A covers) | 82 | 4 | Static test hooks: `READS_STEP`, `TAIL_SKIPS`, `SST_SKIPS`; the bench hook `Shared::pack_target` |
+| `engine/src/shard.rs`, `shard/tablets.rs` (incl. `Shared` and the helper files appendix A covers) | 83 | 4 | Static test hooks: `READS_STEP`, `TAIL_SKIPS`, `SST_SKIPS`; the bench hook `Shared::pack_target` |
 | `engine/src/engine.rs`, `engine/hooks.rs` | 8 | 29 | `Hooks` 20, `ShardCounters` 9 |
 | other `engine/src` files | 31 | 3 | Distinct: 37 rows minus 3 test-only rows minus 3 handles counted elsewhere (`LiveSnapshot::count`, `FlushItem::guard`, `CompactionWork::guard`). 10 thread-locals (one test-only) |
 | `runtime/src` | 19 | | Plus the `spawn_pinned` start ack and the per-thread `SlotCache`, listed |
-| **Total** | **141** | **45** | |
+| **Total** | **142** | **45** | |
 
 A large share are **statistics counters** with `Relaxed` ordering (`ShardMetrics`, `VisibilityCounts::{waits, scanned, passes, woken}` and `WatermarkWaiters::contended`, ICR 0023 and similar). They synchronize nothing: they're read by `Engine::metrics` and need no reduction. Step 2's count should report them separately from primitives that coordinate.
 
