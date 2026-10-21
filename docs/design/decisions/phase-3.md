@@ -2245,6 +2245,23 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 | chaining and wounds | 267–308K | 6.4–6.8 ms | 70–71K |
 | before #774 | 308–321K | 2.6–3.2 ms | 39K |
 
+- **Box A/B** (AX102, non-reference per D5; medians of 3 reps, sides rotated; Busy 0 in every run). The first pass compared main ae9379c7 with 655239ac; the rows the reader-fence fix touches were re-run against main with only the attempt counters added (`max attempts`: the most attempts one committed commit took, per rep).
+
+| row | ops/s, main → D267 | p99 | p99.9 | max attempts, reading (main / D267) | max attempts, blind (main / D267) |
+|---|--:|--:|--:|---|---|
+| app-owned, Buffered | 355K → 396K (1.12x) | 18.9 → 18.5 ms | 34.6 → 31.1 ms | – | 422–492 / 91–94 |
+| app-owned, default durability (first pass) | 122K → 188K (1.54x) | 51.1 → 21.8 ms | 86.0 → 32.0 ms | – | – |
+| mixed (blind writers and reading commits on hot rows), Buffered | 283K → 396K (1.40x) | 23.9 → 11.7 ms | 43.8 → 18.0 ms | 355–386 / 154–159 | 347–430 / 38–39 |
+| transfer, Buffered | 4.9K → 5.1K (1.05x) | 51.1 → 51.1 ms | 132.6 → 124.8 ms | 8–10 / 8–12 | – |
+| transfer, default durability (5 reps) | 4.3K → 5.3K (1.22x) | 55.3 → 45.4 ms | 147.8 → 118.5 ms | 8–17 / 11–15 | – |
+| gate contended, Buffered / default (first pass) | 0.98x / 0.99x | 80 → 80 / 241 → 243 µs | 135 → 135 / 840 → 881 µs | – | – |
+| `all` cross-shard (first pass) | 0.99x | 124 → 125 µs | 322 → 326 µs | – | – |
+| ycsb-a, 1 / 16 threads (first pass) | 0.98x / 0.98x | level | level | – | – |
+
+- **Transfer at the default durability is bimodal on the box, on both sides:** some runs reach about 11K ops/s with a fraction of the shard parks. Over all 8 runs per side, the medians are about 4.7K (main) and 5.2K (D267). D267 does not act there (no chains, no wounds; reading commits skip the fence).
+- **The first pass fenced reading PREPAREs too:** transfer ran at 0.61–0.66x main and mixed at 0.88x. Fixed as described under the reader fence.
+- **App-owned at Buffered gains less on the box than locally:** about 18 ms p99 on both sides.
+
 - **Without wounds, older commits starved:** the max latency reached 2–3 s.
 - **The alternatives:**
   - Refusing a newcomer while *any* older refused commit waits on the row brought the collapse back. The fence above applies only to commits that read, which cannot chain.
