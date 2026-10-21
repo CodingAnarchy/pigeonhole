@@ -558,9 +558,10 @@ impl Shared {
     /// Frees the slots of reader processes that are gone (#833), at most every
     /// [`READER_RECLAIM_NANOS`] over all shards: the first caller past the deadline moves it
     /// and runs the check. Called only on a shard thread holding no lock, and only at rare
-    /// points: when a flush completes (`on_flushed`) and when a commit finds no arena room
-    /// (`reserve_room`, again on every room recheck), so a commit stalled behind a dead
-    /// reader's pin gets in within one interval. Never per commit or per read: even the
+    /// points: when a flush or a compaction completes (`on_flushed`, `on_compaction_done`,
+    /// which also covers a writer gone idle while compactions finish) and when a commit finds
+    /// no arena room (`reserve_room`, again on every room recheck), so a commit stalled
+    /// behind a dead reader's pin gets in within one interval. Never per commit or per read: even the
     /// deadline's clock read showed up in the callgrind counts there. The liveness check (a
     /// `/proc` read or `proc_pidinfo` per active slot) stays off `view_lock` and off
     /// application threads; every other bound reads the pins as they are, and a slot freed
@@ -8367,6 +8368,9 @@ impl ShardState {
         nanos: u64,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        // Background compactions keep running after the writes stop: they free a dead
+        // reader's slot even when no flush or room stall comes (#833, perf287's review).
+        self.shared.reclaim_dead_readers();
         {
             let mut busy = self
                 .shared
