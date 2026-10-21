@@ -208,9 +208,7 @@ impl TableCore {
     }
 
     /// `get` as of now with a supervisor: run again on the recovered engine if it got
-    /// `Closed`. Out of line, so the plain arm of `get` keeps main's codegen (inlined beside
-    /// it, the two arms shared a temporary for the engine's result and moved it once more:
-    /// about 50 instructions per get on callgrind, #836 round 7).
+    /// `Closed`. Out of line, and called before `get`'s match (see there).
     #[cold]
     #[inline(never)]
     fn get_latest_supervised(
@@ -246,12 +244,16 @@ impl TableCore {
         self.db.check_open()?;
         let family = self.family_id(family)?;
         let table = self.info.id;
+        // With a supervisor, a read as of now is run again on the recovered engine if it
+        // got `Closed`: out of line, and before the match below, so the match stays the one
+        // main compiles (a second arm yielding into `data` moved the engine's result once
+        // more: about 50 instructions per get on callgrind, #836 rounds 6 and 7).
+        if snapshot.is_none() && self.db.supervised() {
+            return self
+                .get_latest_supervised(table, family, row, qualifier)
+                .map(|data| data.map(CellRef::owned));
+        }
         let data = match snapshot {
-            // With a supervisor, the read is run again on the recovered engine if it got
-            // `Closed`; without one, the call as before the option (`Db::supervised`).
-            None if self.db.supervised() => {
-                self.get_latest_supervised(table, family, row, qualifier)?
-            }
             None => self.with(|e| e.get_latest(table, family, row, qualifier))?,
             Some(s) => {
                 self.db.check_snapshot(s)?;
