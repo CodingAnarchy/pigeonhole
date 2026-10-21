@@ -40,7 +40,7 @@ assert!(rt.get(b"s", "f", b"q")?.is_some());
 ## When the writer stops, crashes or restarts
 - **The writer closes or crashes:** readers keep serving their snapshots. New snapshots see the last state the writer published. Rarely, they fail with `Busy` after about a second, if the writer had committed a manifest it never published (D149); retry.
 - **A new writer opens:** it recovers the WAL and starts a new shared-memory generation. Reads through snapshots taken before it, including a scan in progress, fail with `SnapshotExpired`, because the new writer may reuse the space they read. Take a new snapshot and redo the read; the reader re-attaches by itself. A clean close alone doesn't expire snapshots: only a new writer does.
-- Readers don't need to restart in either case.
+- Readers don't need to restart in either case, with one exception on Windows ([#844](https://github.com/CodingAnarchy/pigeonhole/issues/844)): a Windows writer's shared memory disappears once no process maps it. If a new writer opened and then closed before the reader's next snapshot, there's nothing left to re-attach to, and that snapshot fails with `Io`. Reopen the reader once a writer runs again. A shared `shm_dir` (a file-backed mapping) probably avoids this, but that isn't verified yet.
 
 ## When a reader exits or crashes
 - **Closing a reader** releases its slot at once.
