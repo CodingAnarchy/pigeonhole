@@ -6270,9 +6270,20 @@ fn a_younger_commit_refused_behind_an_older_one_waits_for_the_older_ones_next_at
     );
 }
 
-/// Seconds a cross-shard commit takes whose first `aborts` rounds the participant refuses
-/// (`refuse_prepares`, as overlapping an undecided share), on a two-shard store whose refusing shard first logs
-/// `backlog` single-shard commits that its checkpoint cannot pass (nothing flushes).
+/// This thread's CPU time in seconds. The shards are application-owned and driven here, so it
+/// counts their work; unlike wall-clock time, other tests running beside it do not inflate
+/// it (#795).
+#[cfg(unix)]
+fn thread_cpu_secs() -> f64 {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    t.tv_sec as f64 + t.tv_nsec as f64 * 1e-9
+}
+
+/// CPU seconds a cross-shard commit takes whose first `aborts` rounds the participant refuses
+/// (`refuse_prepares`, as overlapping an undecided share), on a two-shard store whose refusing
+/// shard first logs `backlog` single-shard commits that its checkpoint cannot pass (nothing
+/// flushes).
+#[cfg(unix)]
 fn refused_rounds_secs(backlog: usize, aborts: usize) -> f64 {
     let mut db = open(2, |o| {
         o.balance_interval_nanos = u64::MAX;
@@ -6302,9 +6313,9 @@ fn refused_rounds_secs(backlog: usize, aborts: usize) -> f64 {
         .unwrap();
     wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"v"))
         .unwrap();
-    let start = std::time::Instant::now();
+    let start = thread_cpu_secs();
     db.commit(wb);
-    let secs = start.elapsed().as_secs_f64();
+    let secs = thread_cpu_secs() - start;
     let refused = db.engine.metrics().cross_shard.refused_pending_overlap;
     assert!(
         refused >= aborts as u64,
@@ -6318,19 +6329,21 @@ fn refused_rounds_secs(backlog: usize, aborts: usize) -> f64 {
 }
 
 #[test]
+#[cfg(unix)]
 fn an_aborted_round_costs_the_same_whatever_the_log_holds() {
     // A refused round aborts, and each shard records the abort only if the commit's record is
     // in its log (`mark_aborted`). That check used to scan the log, which holds every
     // single-shard record since the checkpoint: a storm of refused rounds (application-owned
     // cross-shard batches, 2026-10-13) scanned it whole once per abort and saturated the
     // shards. It is a lookup now: the same refused rounds take about as long behind 100K
-    // logged records as behind none.
+    // logged records as behind none. Measured in this thread's CPU time, not wall-clock
+    // time, which a parallel test run inflated past the bound (#795).
     let aborts = 2_000;
     let small = refused_rounds_secs(0, aborts);
     let big = refused_rounds_secs(100_000, aborts);
     assert!(
-        big < small * 3.0 + 0.05,
-        "{aborts} refused rounds took {big:.3} s behind 100K logged records, {small:.3} s behind none"
+        big < small * 3.0 + 0.02,
+        "{aborts} refused rounds took {big:.3} CPU s behind 100K logged records, {small:.3} behind none"
     );
 }
 

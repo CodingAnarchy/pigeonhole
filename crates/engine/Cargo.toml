@@ -35,6 +35,11 @@ pigeonhole-sim = { workspace = true }
 pigeonhole-engine = { path = ".", features = ["test-hooks"] }
 criterion = { workspace = true }
 
+# A test thread's CPU time (`tests/tablets.rs`), which other tests running beside it do not
+# inflate as they do wall-clock time (#795).
+[target.'cfg(unix)'.dev-dependencies]
+rustix = { workspace = true }
+
 [[bench]]
 name = "engine"
 harness = false
