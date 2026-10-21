@@ -1946,6 +1946,136 @@ fn flush_and_compact_are_busy_after_the_stall_timeout_when_snapshots_hold_the_ar
     starved_flush_and_compact(true);
 }
 
+/// #724 area 3: on a frozen clock a starved freeze refuses its `flush` callers at once only
+/// when nothing in flight could free a chunk, as a room wait refuses its members. An
+/// undecided cross-shard share is in flight: its decision arrives as a message, and the
+/// callers wait for it (the room wait always counted it; the starved freeze did not, and
+/// refused while the share was undecided). The starved arena is #116's below, on shard 1,
+/// which coordinates a commit with shard 0 and prepares its share before the `flush` caller's
+/// freeze finds the arena short; shard 0 is not driven until that caller has waited, so the
+/// share stays undecided meanwhile. The snapshots holding the arena go before shard 0 answers: a caller that waited
+/// then flushes, one refused early has its `Busy` already.
+#[test]
+fn a_starved_flush_on_a_frozen_clock_waits_for_an_undecided_share() {
+    const TIMEOUT: u64 = 2_000_000;
+    let sim = SimVfs::new(7243);
+    let mut o = common::options(Arc::clone(&sim), 2, 2 << 20);
+    o.memtable_freeze_bytes = 1 << 20;
+    o.tablet_changes = false;
+    o.arena_chunk_bytes = Some(32 << 10);
+    o.write_stall_timeout_nanos = TIMEOUT;
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+    fn drive(shards: &mut [pigeonhole_engine::EngineShard]) {
+        for _ in 0..100_000 {
+            let mut more = false;
+            for s in shards.iter_mut() {
+                more |= s.run_once(u64::MAX);
+            }
+            if !more {
+                return;
+            }
+        }
+        panic!("the shards never went idle");
+    }
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut poll =
+        |m: &mut pigeonhole_engine::PendingMaintenance| match std::pin::Pin::new(m).poll(&mut cx) {
+            Poll::Ready(r) => Some(r),
+            Poll::Pending => None,
+        };
+    let defs: Vec<(String, FamilyOptions)> = (0..8)
+        .map(|f| (format!("f{f}"), FamilyOptions::default()))
+        .collect();
+    // `t` on shard 1, `u` on shard 0.
+    let t = db.create_table("t", &defs).unwrap();
+    let u = db
+        .create_table("u", &[("g".into(), FamilyOptions::default())])
+        .unwrap();
+    let mut snap = None;
+    for round in 0..2 {
+        for (fi, f) in t.families.iter().enumerate() {
+            let rows = match (round, fi) {
+                (0, 0..4) => 190,
+                (0, _) => 170,
+                _ => 1,
+            };
+            let mut wb = WriteBatch::new();
+            for i in 0..rows {
+                let row = format!("r{round}-{i:03}");
+                let v = ValueRef::Bytes(&[7u8; 1000]);
+                wb.put(t.id, f.id, row.as_bytes(), b"q", None, v).unwrap();
+            }
+            let mut pc = db.submit(wb, Some(Durability::Buffered)).unwrap();
+            let mut turns = 0;
+            while poll_commit(&mut pc).is_pending() {
+                turns += 1;
+                assert!(
+                    turns < 1_000,
+                    "round {round} family {fi}: the commit never finished"
+                );
+                drive(&mut shards);
+            }
+        }
+        if round == 0 {
+            snap = Some(db.snapshot().unwrap());
+            let mut m = db.flush_pending().unwrap();
+            for turn in 0.. {
+                if let Some(r) = poll(&mut m) {
+                    r.unwrap();
+                    break;
+                }
+                assert!(turn < 1_000, "the round-0 flush never finished");
+                drive(&mut shards);
+            }
+        }
+    }
+    // The cross-shard commit, while shard 1 still has room for its share: shard 1 prepares
+    // it, and nobody hears from shard 0.
+    let mut wb = WriteBatch::new();
+    let v = ValueRef::Bytes(b"v");
+    wb.put(t.id, t.families[0].id, b"x", b"q", None, v).unwrap();
+    wb.put(u.id, u.families[0].id, b"x", b"q", None, v).unwrap();
+    let mut cross = db.submit(wb, Some(Durability::Buffered)).unwrap();
+    drive(&mut shards[1..]);
+    assert!(
+        poll_commit(&mut cross).is_pending(),
+        "decided without shard 0"
+    );
+    let pin_round1 = db.snapshot().unwrap();
+    let start = sim.monotonic_nanos();
+    let mut flush = db.flush_pending().unwrap();
+    drive(&mut shards[1..]);
+    assert_eq!(sim.monotonic_nanos(), start, "the frozen clock moved");
+    // The arena frees, then shard 0 answers: the decision wakes the waiting caller.
+    drop(pin_round1);
+    drop(snap);
+    let mut turns = 0;
+    let flushed = loop {
+        drive(&mut shards);
+        if let Some(r) = poll(&mut flush) {
+            break r;
+        }
+        turns += 1;
+        assert!(turns < 1_000, "the flush caller was never answered");
+    };
+    assert!(
+        flushed.is_ok(),
+        "refused while a share was undecided: {flushed:?}"
+    );
+    let mut turns = 0;
+    let committed = loop {
+        if let Poll::Ready(r) = poll_commit(&mut cross) {
+            break r;
+        }
+        turns += 1;
+        assert!(turns < 1_000, "the cross-shard commit never finished");
+        drive(&mut shards);
+    };
+    committed.unwrap();
+    db.close().unwrap();
+    drive(&mut shards);
+}
+
 /// D240: in the starved freeze of the test below, each `flush` caller waits the stall
 /// timeout itself. A second caller that asks halfway through the first one's wait is not
 /// refused at the first one's deadline, and its flush succeeds once the pin drops.
