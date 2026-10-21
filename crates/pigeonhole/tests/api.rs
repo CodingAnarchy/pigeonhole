@@ -559,6 +559,35 @@ fn scans_bounds_prefixes_limits_and_both_iterator_forms() {
     );
 }
 
+/// ICR 0051: `put_f64_at` on a mutation and a batch stores the typed `f64` at the timestamp
+/// given, versions included.
+#[test]
+fn put_f64_at_keeps_its_timestamp() {
+    let db = db();
+    let t = table(&db);
+    t.mutate(b"r")
+        .put_f64_at("b", b"f", 1_000, 1.5)
+        .commit()
+        .unwrap();
+    let mut wb = db.write_batch();
+    wb.put_f64_at(&t, b"r", "b", b"f", 2_000, -0.25);
+    wb.commit().unwrap();
+    let r = t.row(b"r").family("b").versions(0).read().unwrap().unwrap();
+    let got: Vec<(u64, Option<f64>)> = r
+        .iter()
+        .map(|e| match e.cell.typed() {
+            Value::F64(x) => (e.cell.timestamp(), Some(x)),
+            _ => (e.cell.timestamp(), None),
+        })
+        .collect();
+    assert_eq!(got, [(2_000, Some(-0.25)), (1_000, Some(1.5))]);
+    let latest = t.get(b"r", "b", b"f").unwrap().unwrap();
+    assert_eq!(
+        (latest.timestamp(), latest.typed()),
+        (2_000, Value::F64(-0.25))
+    );
+}
+
 #[test]
 fn row_and_rowref_agree_and_cells_outlive_their_handles() {
     let db = db();
