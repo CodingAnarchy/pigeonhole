@@ -423,6 +423,68 @@ pub(crate) fn bind_numa(_ptr: *mut u8, _len: usize, _node: u32) -> Result<()> {
     Ok(())
 }
 
+/// The whole pages inside `[ptr, ptr + len)`: the start rounded up and the end rounded down
+/// to a page, or `None` when no whole page lies inside.
+#[cfg(target_os = "linux")]
+fn whole_pages(ptr: *mut u8, len: usize) -> Option<(usize, usize)> {
+    let page = pigeonhole_format::PAGE_SIZE;
+    let start = (ptr as usize).next_multiple_of(page);
+    let end = (ptr as usize + len) & !(page - 1);
+    (start < end).then_some((start, end - start))
+}
+
+/// Frees the pages of `[ptr, ptr + len)` and their backing store (`madvise(MADV_REMOVE)`:
+/// a hole in the region's file; a later touch reads zeros). Whole pages only: a partial
+/// page at either end stays. The mapping stays valid.
+#[cfg(target_os = "linux")]
+pub(crate) fn discard(ptr: *mut u8, len: usize) -> Result<()> {
+    let Some((start, span)) = whole_pages(ptr, len) else {
+        return Ok(());
+    };
+    // SAFETY: `[start, start + span)` covers whole pages of a live mapping we own; the
+    // pages stay mapped (`MADV_REMOVE` never unmaps), so no pointer into them dangles.
+    let rc = unsafe { libc::madvise(start as *mut libc::c_void, span, libc::MADV_REMOVE) };
+    if rc != 0 {
+        return Err(last_error("madvise"));
+    }
+    Ok(())
+}
+
+/// How many bytes of the whole pages inside `[ptr, ptr + len)` are resident (`mincore`).
+#[cfg(target_os = "linux")]
+pub(crate) fn resident_bytes(ptr: *mut u8, len: usize) -> Result<usize> {
+    let Some((start, span)) = whole_pages(ptr, len) else {
+        return Ok(0);
+    };
+    let page = pigeonhole_format::PAGE_SIZE;
+    let mut vec = vec![0u8; span / page];
+    // SAFETY: `[start, start + span)` covers whole pages of a live mapping we own, and `vec`
+    // holds one byte per page of it.
+    let rc = unsafe { libc::mincore(start as *mut libc::c_void, span, vec.as_mut_ptr()) };
+    if rc != 0 {
+        return Err(last_error("mincore"));
+    }
+    Ok(vec.iter().filter(|b| **b & 1 != 0).count() * page)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn discard(_ptr: *mut u8, _len: usize) -> Result<()> {
+    // A POSIX shared-memory object's pages cannot be punched (`madvise(MADV_FREE)` acts on
+    // anonymous memory, and the io crate keeps no descriptor for `F_PUNCHHOLE`).
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "discarding shared-memory pages is Linux only",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn resident_bytes(_ptr: *mut u8, _len: usize) -> Result<usize> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "counting resident shared-memory pages is Linux only",
+    ))
+}
+
 /// Start time of `pid` in clock ticks since boot (field 22 of `/proc/<pid>/stat`), or
 /// `None` if the process is gone or a zombie.
 #[cfg(any(target_os = "linux", target_os = "android"))]

@@ -213,6 +213,30 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         self.maybe_compact();
     }
 
+    /// Drops every unpinned entry and every ghost, and returns the index's and the queues'
+    /// spare capacity to the allocator: an engine releasing a closed instance's memory
+    /// (D265). Pinned entries stay indexed, as after `remove_unpinned_where`, until their
+    /// holders go and a later `clear` or eviction drops them.
+    pub(crate) fn clear(&mut self) {
+        self.remove_unpinned_where(|_| true);
+        self.ghost.clear();
+        self.ghost_set.clear();
+        let map = &self.map;
+        self.small.retain(|(k, id)| {
+            map.get(k)
+                .is_some_and(|s| s.id == *id && s.queue == Queue::Small)
+        });
+        self.main.retain(|(k, id)| {
+            map.get(k)
+                .is_some_and(|s| s.id == *id && s.queue == Queue::Main)
+        });
+        self.map.shrink_to_fit();
+        self.small.shrink_to_fit();
+        self.main.shrink_to_fit();
+        self.ghost.shrink_to_fit();
+        self.ghost_set.shrink_to_fit();
+    }
+
     /// Whether `key` is cached in the main queue.
     #[cfg(all(test, not(loom)))]
     pub(crate) fn in_main(&self, key: &K) -> bool {

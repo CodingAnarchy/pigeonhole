@@ -10,7 +10,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, Error, FailureCause, FamilyOptions, TableInfo, ValueRef, WriteBatch,
+    ArenaDiscard, Engine, EngineOptions, Error, FailureCause, FamilyOptions, ReadSpec, RowData,
+    TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::{OpenOptions, VfsRef};
@@ -419,4 +420,190 @@ fn a_handover_after_every_shard_died_reopens_either_way() {
     assert!(has(&reopened, &t, "kept"));
     drop(db);
     reopened.close().unwrap();
+}
+
+/// Fails the instance through shard `s`'s WAL and closes it for a reopen: the handover.
+fn fail_and_close(
+    db: &Arc<Engine>,
+    t: &Arc<TableInfo>,
+    gate: &gate::Gate,
+    s: u32,
+) -> pigeonhole_engine::Handover {
+    gate.fail(&wal(s));
+    let (db2, t2) = (Arc::clone(db), Arc::clone(t));
+    let failed = gate::within(10, move || {
+        db2.commit(put(&t2, "lost"), Some(Durability::Sync))
+    })
+    .expect("a commit with a failing sync hung");
+    assert!(failed.is_err(), "{failed:?}");
+    let db2 = Arc::clone(db);
+    let (closed, handover) =
+        gate::within(10, move || db2.close_for_reopen()).expect("close_for_reopen hung");
+    assert!(
+        closed.is_err(),
+        "a failed instance's close is unclean: {closed:?}"
+    );
+    handover.expect("the locks were still held")
+}
+
+/// A closed instance releases its memory (D265, #620 PR 2a): `close_for_reopen` publishes an
+/// empty view and empties the caches; the arenas are freed once the reopen supersedes the
+/// region and no view from before the close lives, which here is deferred to the drop of a
+/// snapshot taken before the failure. On an open instance the release is a no-op.
+#[test]
+fn a_closed_instance_releases_its_memory_once_no_view_outlives_it() {
+    let (vfs, gate) = gate::vfs(1606);
+    let mut o = options(Arc::clone(&vfs), 2);
+    o.row_cache_bytes = 1 << 20;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let s = shard_of(&db, &t);
+    for i in 0..64 {
+        db.commit(put(&t, &format!("sst{i:03}")), Some(Durability::Buffered))
+            .unwrap();
+    }
+    db.flush().unwrap();
+    for i in 0..64 {
+        db.commit(put(&t, &format!("mem{i:03}")), Some(Durability::Buffered))
+            .unwrap();
+    }
+    // Reads fill the block cache and, read twice, the row cache (latest single-version row
+    // reads fill it, D201).
+    let mut spec = ReadSpec::default();
+    spec.versions = 1;
+    for _ in 0..2 {
+        for i in 0..64 {
+            let row = format!("sst{i:03}");
+            let found = db
+                .read_row_latest_into(
+                    t.id,
+                    row.as_bytes(),
+                    &[t.families[0].id],
+                    &spec,
+                    &mut RowData::default(),
+                )
+                .unwrap();
+            assert!(found, "{row}");
+        }
+    }
+    let before = db.memory_release();
+    assert!(
+        before.view_memtables > 0
+            && before.view_ssts > 0
+            && before.block_cache_bytes > 0
+            && before.row_cache_bytes.is_some_and(|b| b > 0),
+        "{before:?} {:?}",
+        db.row_cache_stats()
+    );
+    assert_eq!(before.arenas, ArenaDiscard::Pending);
+    db.release_memory();
+    assert_eq!(db.memory_release(), before, "a no-op on an open instance");
+
+    let snap = db.snapshot().unwrap();
+    let handover = fail_and_close(&db, &t, &gate, s);
+    let closed = db.memory_release();
+    assert_eq!(
+        (
+            closed.view_memtables,
+            closed.view_ssts,
+            closed.row_cache_bytes
+        ),
+        (0, 0, Some(0)),
+        "{closed:?}"
+    );
+    assert!(
+        closed.block_cache_bytes < before.block_cache_bytes,
+        "the snapshot's SST set keeps its index blocks pinned; the rest went: {closed:?}"
+    );
+    assert_eq!(
+        closed.arenas,
+        ArenaDiscard::Pending,
+        "the region is still current and a view lives"
+    );
+    // An engine snapshot from before the close keeps reading (D148: writer snapshots never
+    // expire): its view keeps the memtables and SSTs it lists, and the arenas are not
+    // discarded while it lives.
+    let reads = |what: &str| {
+        for row in ["sst000", "mem063"] {
+            assert!(
+                db.get(&snap, t.id, t.families[0].id, row.as_bytes(), b"q")
+                    .unwrap()
+                    .is_some(),
+                "{row} through the old snapshot {what}"
+            );
+        }
+    };
+    reads("after the close");
+
+    gate.heal(&wal(s));
+    let reopened = Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 2), handover)
+        .map_err(|(e, _)| e)
+        .expect("reopen on the handover");
+    db.release_memory();
+    assert_eq!(
+        db.memory_release().arenas,
+        ArenaDiscard::Pending,
+        "a snapshot from before the close still lives"
+    );
+    reads("after the reopen");
+    drop(snap);
+    let released = db.memory_release();
+    assert_eq!(released.arenas, ArenaDiscard::Discarded, "{released:?}");
+    assert_eq!(released.block_cache_bytes, 0, "{released:?}");
+
+    let t2 = reopened.table("t").unwrap();
+    for i in 0..64 {
+        assert!(has(&reopened, &t2, &format!("sst{i:03}")));
+        assert!(has(&reopened, &t2, &format!("mem{i:03}")));
+    }
+    reopened
+        .commit(put(&t2, "after"), Some(Durability::Sync))
+        .unwrap();
+    assert!(has(&reopened, &t2, "after"));
+    drop(db);
+    gate::within(10, move || reopened.close())
+        .expect("close hung")
+        .expect("the reopened instance closes cleanly");
+    assert_eq!(probe(&vfs), (true, true));
+}
+
+/// With no view outliving the close, the arenas are freed by the release the reopen is
+/// followed by, and a plain `close` releases nothing (engine-level callers may still read
+/// through their snapshots, D148).
+#[test]
+fn the_arenas_are_freed_by_the_release_after_the_reopen() {
+    let (vfs, gate) = gate::vfs(1607);
+    let db = Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let s = shard_of(&db, &t);
+    for i in 0..32 {
+        db.commit(put(&t, &format!("row{i:03}")), Some(Durability::Buffered))
+            .unwrap();
+    }
+    let handover = fail_and_close(&db, &t, &gate, s);
+    assert_eq!(db.memory_release().arenas, ArenaDiscard::Pending);
+    gate.heal(&wal(s));
+    let reopened = Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 2), handover)
+        .map_err(|(e, _)| e)
+        .unwrap();
+    db.release_memory();
+    let released = db.memory_release();
+    assert_eq!(released.arenas, ArenaDiscard::Discarded, "{released:?}");
+    assert_eq!((released.view_memtables, released.view_ssts), (0, 0));
+    let t2 = reopened.table("t").unwrap();
+    for i in 0..32 {
+        assert!(has(&reopened, &t2, &format!("row{i:03}")));
+    }
+    drop(db);
+
+    // A plain close keeps the view.
+    let before = reopened.memory_release();
+    assert!(before.view_memtables > 0, "{before:?}");
+    gate::within(10, move || reopened.close())
+        .expect("close hung")
+        .unwrap();
 }

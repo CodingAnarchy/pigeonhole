@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, EngineOptions, Error, FamilyOptions, ValueRef, WriteBatch};
+use pigeonhole_engine::{
+    ArenaDiscard, Engine, EngineOptions, Error, FamilyOptions, ValueRef, WriteBatch,
+};
 use pigeonhole_format::Durability;
 use pigeonhole_io::{OpenOptions, VfsRef};
 use pigeonhole_shm::{Presence, WriterLock};
@@ -218,6 +220,63 @@ fn a_reader_closing_during_a_real_file_handover_is_not_last() {
         .unwrap();
     let t2 = db2.table("t").unwrap();
     put_sync(&db2, &t2, "b");
+    drop(db);
+    db2.close().unwrap();
+}
+
+/// The memory release after a handover on a real region (D265, #620 PR 2a): on Linux the
+/// arena pages are resident after commits and freed (`madvise(MADV_REMOVE)`, `mincore`)
+/// once the reopen superseded the region; macOS cannot free a POSIX shared-memory object's
+/// pages and says so.
+#[test]
+fn the_arena_pages_are_freed_after_the_reopen() {
+    let dir = TempDir::new("release");
+    let path = dir.db();
+    let vfs = real_vfs();
+    let db = Engine::open(&path, options(Arc::clone(&vfs))).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..256 {
+        put_sync(&db, &t, &format!("row{i:04}"));
+    }
+    let resident = db.arena_resident_bytes();
+    if cfg!(target_os = "linux") {
+        assert!(resident.as_ref().is_ok_and(|b| *b > 0), "{resident:?}");
+    } else {
+        assert!(
+            matches!(resident, Err(Error::Io(ref e)) if e.kind == pigeonhole_io::ErrorKind::Unsupported),
+            "{resident:?}"
+        );
+    }
+    let (closed, h) = db.close_for_reopen();
+    closed.unwrap();
+    assert_eq!(db.memory_release().arenas, ArenaDiscard::Pending);
+    let db2 = Engine::open_with(&path, options(Arc::clone(&vfs)), h.unwrap())
+        .map_err(|(e, _)| e)
+        .unwrap();
+    db.release_memory();
+    let released = db.memory_release();
+    assert_eq!((released.view_memtables, released.view_ssts), (0, 0));
+    if cfg!(target_os = "linux") {
+        assert_eq!(released.arenas, ArenaDiscard::Discarded, "{released:?}");
+        assert_eq!(db.arena_resident_bytes().unwrap(), 0);
+    } else {
+        assert_eq!(released.arenas, ArenaDiscard::Unsupported, "{released:?}");
+    }
+    let t2 = db2.table("t").unwrap();
+    let snap = db2.snapshot().unwrap();
+    for i in 0..256 {
+        let row = format!("row{i:04}");
+        assert!(
+            db2.get(&snap, t2.id, t2.families[0].id, row.as_bytes(), b"q")
+                .unwrap()
+                .is_some(),
+            "{row} survives the reopen"
+        );
+    }
+    drop(snap);
+    put_sync(&db2, &t2, "after");
     drop(db);
     db2.close().unwrap();
 }

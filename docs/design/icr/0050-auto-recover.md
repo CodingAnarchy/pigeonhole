@@ -77,13 +77,22 @@ impl Engine {
     /// Blocks until the instance records a failure (`true`), or until `deadline` or its close
     /// (`false`); on a reader handle, which never fails, until its close.
     pub fn wait_failed(&self, deadline: Instant) -> bool;
+    /// Releases what a closed writer still holds that is large (D265's memory release, PR
+    /// 2a): the last view (its frozen memtables, open SSTs and the blocks they pin), the
+    /// block and row caches, and on Linux the memtable arenas' pages, the latter once the
+    /// reopen superseded the region and no in-process view from before the close lives
+    /// (then when the last goes). `close_for_reopen` runs it; call it again after `open_with`
+    /// succeeded. A no-op on an open instance, a reader or an application-owned engine.
+    pub fn release_memory(&self);
 }
 ```
 
 Internal: `Locks` carries the handle (`file`) and moves into the engine as the open's last step, so a failed open leaves them with the caller; `Shared::keep_locks` is set only by the call that starts the close and makes `final_close` leave the locks in place, skip the presence upgrade and remove neither the WAL files nor the shm region (as after a crashed writer); `close_reader` notifies the failure wait.
 
+The memory release (PR 2a, for the per-handle cached engine of #796: a stale handle keeps the old engine alive): `Shared::release_memory` runs only once `closed`, publishes an empty view under `view_lock` (the last view's memtable readers, SST set and pinned blocks go with it unless a live view holds them), clears the caches (`BlockCache::clear`, `RowCache::clear`: new in `pigeonhole-cache`, with the index's spare capacity returned) and discards the arenas (`ShmRegion::discard_arenas` → `SharedRegion::discard`: `madvise(MADV_REMOVE)` on Linux, so the pages and their backing store go while the mapping stays valid; `Unsupported` on macOS and Windows; the heap stand-in zeroes) under `LiveViews::if_none_live`, and only once `ShmRegion::is_superseded` (the reopen built the next generation, or the region is in-memory): a reader process attached to the superseded generation fails its reads with `SnapshotExpired` after reading (D148), and the memtable reader never faults on zeroed pages. `LiveViews::on_all_released` re-runs the release when the last view goes. `Shared::arena_discard` records the outcome. A stale handle then keeps about 5–10 MiB on Linux: the mapping's header, view-buffer and reader-slot pages, the pager's descriptors and extent maps, the caches' tables, the per-shard metrics and slots, the options and the manifest writer; on macOS the arenas' resident pages too, until the last handle and snapshot drop.
+
 ### Not changed
-No format, WAL or shm layout change. `pigeonhole-shm` is unchanged. Reader processes keep D148's contract.
+No format, WAL or shm layout change. `pigeonhole-shm` gains `ShmRegion::{discard_arenas, arena_resident_bytes, is_superseded}` (PR 2a; the layout is unchanged). Reader processes keep D148's contract.
 
 ## Why
 
@@ -93,6 +102,7 @@ The handover is the piece the engine must provide: a second in-process open fail
 
 ## Callers
 
-- `pigeonhole-engine`: `engine.rs` (`open_writer`'s steps 1 and 3 take the handover, `open_with`, `close_for_reopen`, `wait_failed`, `Handover`), `shard.rs` (`Locks::file`, `Shared::keep_locks`, `final_close`), `lib.rs` (the hidden export); `tests/handover.rs`; `tests/gate` (`Gate::heal`).
+- `pigeonhole-engine`: `engine.rs` (`open_writer`'s steps 1 and 3 take the handover, `open_with`, `close_for_reopen`, `wait_failed`, `Handover`; PR 2a: `release_memory`, the `on_all_released` hook at open), `shard.rs` (`Locks::file`, `Shared::keep_locks`, `final_close`; PR 2a: `Shared::{release_memory, try_discard_arenas, arena_discard}`), `snapshot.rs` (PR 2a: `LiveViews::{on_all_released, if_none_live}`), `row_cache.rs` (PR 2a: `RowCaches::{clear, usage}`), `engine/hooks.rs` (PR 2a: `memory_release`, `arena_resident_bytes`, `MemoryRelease`, `ArenaDiscard`), `lib.rs` (the hidden exports); `tests/handover.rs`, `tests/handover_real.rs`; `tests/gate` (`Gate::heal`).
+- PR 2a's crates below the engine: `pigeonhole-cache` (`BlockCache::clear`, `RowCache::{clear, usage}`, `s3fifo::Shard::clear`), `pigeonhole-io` (`SharedRegion::{discard, resident_bytes}`, `os::{discard, resident_bytes}`), `pigeonhole-shm` (`ShmRegion::{discard_arenas, arena_resident_bytes, is_superseded}`).
 - `pigeonhole` (PRs 2–4): `db.rs` (`Db::engine()`, the generation, the supervisor, `recovery_stats`), `options.rs` (`auto_recover`), `lib.rs` (re-exports), `read.rs`/`write.rs`/`table.rs`/`nonblocking.rs` (every `db.engine` use through `Db::engine()`); `tests/recovery.rs`, `tests/model.rs`.
 - Docs: `docs/guide/recovery.md` ("Automatic recovery"), `errors.md`, `agent-reference.md`, D265, `concurrency.md` (the `Shared::keep_locks` row, later an appendix for `pigeonhole/src/db.rs`), changelog.

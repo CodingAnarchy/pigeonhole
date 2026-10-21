@@ -296,6 +296,34 @@ impl ShardCounters {
     }
 }
 
+/// What a closed instance still holds (`Engine::memory_release`, D265).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryRelease {
+    /// Memtable sets the current view lists.
+    pub view_memtables: usize,
+    /// SSTs the current view's set holds open.
+    pub view_ssts: usize,
+    /// Bytes in the block cache.
+    pub block_cache_bytes: usize,
+    /// Bytes in the row cache (`None` when it is off).
+    pub row_cache_bytes: Option<usize>,
+    /// The arenas' state.
+    pub arenas: ArenaDiscard,
+}
+
+/// What became of a closed instance's arena pages (`Engine::memory_release`, D265).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArenaDiscard {
+    /// Not freed yet: the instance is open, a view lives, or the region is still current.
+    Pending,
+    /// Freed.
+    Discarded,
+    /// The platform cannot free them (macOS, Windows): they stay until the last mapping goes.
+    Unsupported,
+}
+
 /// A WAL record the engine appended to a stream (test hook): the per-stream append order,
 /// which decides what a crash keeps (a stream survives as a prefix).
 #[doc(hidden)]
@@ -966,6 +994,33 @@ impl Engine {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner),
         )
+    }
+
+    /// What a closed instance still holds of what `Engine::release_memory` releases (D265):
+    /// how many memtable sets and SSTs the current view lists, the bytes in the block cache
+    /// and in the row cache (`None` when it is off), and the arenas' state.
+    #[doc(hidden)]
+    pub fn memory_release(&self) -> MemoryRelease {
+        let shared = &self.inner.shared;
+        let view = shared.view.load();
+        MemoryRelease {
+            view_memtables: view.mems.iter().map(|m| m.map.len()).sum(),
+            view_ssts: view.ssts.map.values().map(|f| f.iter().count()).sum(),
+            block_cache_bytes: shared.cache.usage(),
+            row_cache_bytes: shared.row_cache.as_ref().map(|r| r.usage()),
+            arenas: match shared.arena_discard.load(Ordering::Acquire) {
+                crate::shard::ARENAS_DISCARDED => ArenaDiscard::Discarded,
+                crate::shard::ARENAS_UNSUPPORTED => ArenaDiscard::Unsupported,
+                _ => ArenaDiscard::Pending,
+            },
+        }
+    }
+
+    /// How many bytes of the shared-memory arenas are resident (`mincore`; Linux mappings
+    /// only, `Unsupported` elsewhere and on the simulated VFS).
+    #[doc(hidden)]
+    pub fn arena_resident_bytes(&self) -> Result<usize> {
+        Ok(self.inner.shared.shm.arena_resident_bytes()?)
     }
 
     /// Seqnos the shards hold as aborted cross-shard commits, as of each shard's last

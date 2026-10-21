@@ -439,6 +439,10 @@ pub(crate) struct Shared {
     /// `Engine::close_for_reopen` ran: the final close leaves `locks` in place for the reopen
     /// (D265) instead of releasing them, and removes neither the WAL files nor the region.
     pub keep_locks: AtomicBool,
+    /// What became of the closed instance's memtable arenas (`release_memory`, D265):
+    /// `ARENAS_PENDING` until the discard ran (`ARENAS_DISCARDED`) or the platform refused it
+    /// (`ARENAS_UNSUPPORTED`: the pages stay until the last mapping goes).
+    pub arena_discard: AtomicU8,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
     /// `Engine::close` has started: background compaction stops.
@@ -508,6 +512,14 @@ pub(crate) struct Shared {
     pub identity: pigeonhole_io::FileIdentity,
     pub path: std::path::PathBuf,
 }
+
+/// `Shared::arena_discard`: the discard has not run.
+pub(crate) const ARENAS_PENDING: u8 = 0;
+/// `Shared::arena_discard`: the arena pages are freed.
+pub(crate) const ARENAS_DISCARDED: u8 = 1;
+/// `Shared::arena_discard`: the platform cannot free them (macOS, Windows): they stay
+/// resident until the last mapping goes.
+pub(crate) const ARENAS_UNSUPPORTED: u8 = 2;
 
 impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -716,6 +728,89 @@ impl Shared {
     /// scan's end, a shard). The busy holder's commit or shrink reclaims anyway.
     pub(crate) fn try_reclaim(&self) {
         let _ = self.pager.try_reclaim(self.oldest_live_manifest());
+    }
+
+    /// Releases what a closed instance still holds that is large, so a handle that keeps it
+    /// alive after a recovery keeps only a light shell (D265, #620): publishes an empty view
+    /// (the last one's frozen memtables, open SSTs and the blocks they pin go with it, unless
+    /// a live view still holds them), empties the block and row caches, and frees the arena
+    /// pages once nothing can read them (`try_discard_arenas`). Only once the close finished
+    /// (`closed`): every publisher is stopped, so the empty view is the last one. Idempotent;
+    /// run by `Engine::close_for_reopen`, `Engine::release_memory` (after the reopen, when
+    /// the region is superseded) and, while a view outlives the close, when the last one
+    /// goes (`LiveViews::on_all_released`). Each step is safe under a straggler still using
+    /// the instance: the caches are concurrent and a reader keeps its own handle, the view
+    /// store leaves a loaded view intact, and the discard waits for the views. What stays: the
+    /// mapping's header pages, the pager's descriptors and extent maps, the caches' tables,
+    /// the per-shard metrics and slots, the options and the manifest writer.
+    pub(crate) fn release_memory(&self) {
+        if !self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        // The old view drops after `view_lock` is released: if it was the last live view,
+        // its pin's `on_all_released` runs this again (and that re-entry takes the lock).
+        let old = {
+            let _publishing = self
+                .view_lock
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let current = self.view.load();
+            if current.mems.iter().all(|m| m.map.is_empty()) && current.ssts.map.is_empty() {
+                None
+            } else {
+                Some(
+                    self.view.swap(Arc::new(crate::snapshot::View {
+                        version: current.version,
+                        manifest_version: current.manifest_version,
+                        tablets: Arc::clone(&current.tablets),
+                        catalog: Arc::clone(&current.catalog),
+                        mems: (0..self.shards)
+                            .map(|_| Arc::new(crate::snapshot::ShardMems::default()))
+                            .collect(),
+                        ssts: Arc::new(crate::snapshot::SstSet::empty(
+                            self.pager.data_file().clone(),
+                            Arc::clone(&self.cache),
+                        )),
+                        _pin: None,
+                    })),
+                )
+            }
+        };
+        drop(old);
+        // After the view store: the SSTs it held pinned their index and filter blocks, which
+        // are unpinned now unless a live view keeps the SST set.
+        self.cache.clear();
+        if let Some(rows) = &self.row_cache {
+            rows.clear();
+        }
+        self.try_discard_arenas();
+    }
+
+    /// Frees a closed instance's arena pages (`ShmRegion::discard_arenas`) once nothing can
+    /// read them as data: no live in-process view (a frozen memtable's reader walks the
+    /// arena; the check and the discard run under the registry's lock, and while a view
+    /// lives the discard waits for `LiveViews::on_all_released`), and no reader process can
+    /// take the region for current (`ShmRegion::is_superseded`: after the reopen built the
+    /// next generation; a reader still attached fails its reads with `SnapshotExpired` after
+    /// reading, and the memtable reader never faults on zeroed pages). Records the outcome in
+    /// `arena_discard`; a platform that cannot free them records `ARENAS_UNSUPPORTED`.
+    pub(crate) fn try_discard_arenas(&self) {
+        if !self.closed.load(Ordering::Acquire)
+            || self.arena_discard.load(Ordering::Acquire) != ARENAS_PENDING
+            || !self.shm.is_superseded()
+        {
+            return;
+        }
+        self.live_views.if_none_live(|| {
+            if self.arena_discard.load(Ordering::Acquire) != ARENAS_PENDING {
+                return;
+            }
+            let state = match self.shm.discard_arenas() {
+                Ok(()) => ARENAS_DISCARDED,
+                Err(_) => ARENAS_UNSUPPORTED,
+            };
+            self.arena_discard.store(state, Ordering::Release);
+        });
     }
 
     pub(crate) fn default_durability(&self) -> Durability {
