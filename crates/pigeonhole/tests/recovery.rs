@@ -335,6 +335,17 @@ fn operations_wait_for_the_swap_bounded_by_the_stall_timeout() {
     );
     // Not given up: the recovery is still running.
     assert!(!db.recovery_stats().gave_up);
+    // A snapshot asked for during the pause: the failed engine serves it from its last view
+    // while that stands (it then expires at the swap, as any snapshot from before), or, had
+    // the engine refused it, it is retried on the new engine and tagged with that one's
+    // generation (perf287's R2 on #836), so it is usable. Either way a snapshot taken after
+    // the swap is usable.
+    let (stx, srx) = mpsc::channel();
+    let db2 = db.clone();
+    std::thread::spawn(move || {
+        let _ = stx.send(db2.snapshot());
+    });
+    std::thread::sleep(Duration::from_millis(50));
     gate.release_writes();
     assert!(
         wait_until(20, || !db.is_failed()
@@ -342,9 +353,78 @@ fn operations_wait_for_the_swap_bounded_by_the_stall_timeout() {
         "{:?}",
         db.recovery_stats()
     );
+    let snap = srx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the snapshot call returned")
+        .expect("a snapshot retried on the recovered engine");
+    let got = t.get_at(&snap, b"a", "f", b"q");
+    assert!(
+        matches!(&got, Ok(Some(_)))
+            || matches!(&got, Err(e) if e.code() == ErrorCode::SnapshotExpired),
+        "{got:?}"
+    );
+    let snap = db.snapshot().unwrap();
+    assert!(t.get_at(&snap, b"a", "f", b"q").unwrap().is_some());
     put(&t, "during").unwrap();
     assert!(has(&t, "a") && has(&t, "during"));
     db.close().unwrap();
+}
+
+/// perf287's R1 on #836: the deadline passes while the reopen runs (its WAL replay is held
+/// on a read), so the phase turned to `GaveUp` and the waiters were told `Closed`; the
+/// reopen that then succeeds must not swap its engine in. It is closed instead, the handle
+/// stays failed and given up, and a plain open afterwards works (the locks went with that
+/// close).
+#[test]
+fn a_deadline_that_passes_during_the_reopen_stays_given_up() {
+    let (vfs, gate) = gate::vfs(2011);
+    let db = Pigeonhole::open(
+        DB,
+        options(Arc::clone(&vfs), Recovery::Io).write_stall_timeout(Duration::from_millis(100)),
+    )
+    .unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    // A record the reopen's replay reads back, held by its bytes.
+    t.mutate(b"marker")
+        .put("f", b"q", b"HOLD-THIS-READ-HOLD-THIS-READ")
+        .commit()
+        .unwrap();
+    gate.hold_reads_containing(Some(b"HOLD-THIS-READ-HOLD-THIS-READ"));
+    let _ = fail_shard(&gate, &t, "lost");
+    gate.wait_held_read();
+    assert!(
+        wait_until(5, || db.recovery_stats().gave_up),
+        "the deadline passed during the held reopen: {:?}",
+        db.recovery_stats()
+    );
+    assert!(db.is_failed());
+    assert_eq!(put(&t, "b").unwrap_err().code(), ErrorCode::Closed);
+    gate.release_reads();
+    // The reopen completes, finds the recovery given up, and closes its engine: no swap.
+    std::thread::sleep(Duration::from_millis(500));
+    let stats = db.recovery_stats();
+    assert_eq!(
+        (stats.generation, stats.recoveries, stats.gave_up),
+        (1, 0, true),
+        "{stats:?}"
+    );
+    assert!(db.is_failed());
+    assert_eq!(put(&t, "c").unwrap_err().code(), ErrorCode::Closed);
+    let _ = db.close();
+    assert!(
+        wait_until(10, || Pigeonhole::open(
+            DB,
+            options(Arc::clone(&vfs), Recovery::Off)
+        )
+        .map(|db| db.close().is_ok())
+        .unwrap_or(false)),
+        "a plain open after the give-up: the closed engine released the locks"
+    );
 }
 
 /// `close()` during a recovery waits for it to settle, then closes what the handle ends on.

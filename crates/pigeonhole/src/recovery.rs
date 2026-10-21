@@ -361,20 +361,45 @@ fn recover(db: &Arc<Db>, failed: Arc<Engine>) -> bool {
         };
         match result {
             Ok(engine) => {
-                let old = db.swap_engine(engine);
-                // The old engine's view, caches and (once its region is superseded, as it is
-                // now) arena pages go; a stale handle keeps a light shell (#821).
-                old.release_memory();
-                drop(old);
-                let mut st = sup.lock();
-                let now = Instant::now();
-                st.recent.push(now);
-                st.stats.recoveries += 1;
-                st.stats.last_recovery = now.duration_since(since);
-                st.phase = Phase::Healthy;
-                sup.recovering.store(false, Ordering::Release);
-                sup.changed.notify_all();
-                return true;
+                // The swap is decided under the state lock (perf287's R1 on #836): the
+                // deadline may have passed during the backoff or the reopen, and whoever
+                // looked then turned the phase to `GaveUp` and told the waiters `Closed`,
+                // which is terminal; `close()` may have run meanwhile too. Then the new
+                // engine is closed instead (which releases the locks cleanly) and the phase
+                // stays as it is. The swap itself is an `ArcSwap` store and a `fetch_add`.
+                let mut engine = Some(engine);
+                let old = {
+                    let mut st = sup.lock();
+                    if matches!(st.phase, Phase::Recovering { .. }) && !db.is_closed() {
+                        let old = db.swap_engine(engine.take().expect("not swapped yet"));
+                        let now = Instant::now();
+                        st.recent.push(now);
+                        st.stats.recoveries += 1;
+                        st.stats.last_recovery = now.duration_since(since);
+                        st.phase = Phase::Healthy;
+                        sup.recovering.store(false, Ordering::Release);
+                        sup.changed.notify_all();
+                        Some(old)
+                    } else {
+                        None
+                    }
+                };
+                match old {
+                    Some(old) => {
+                        // The old engine's view, caches and (once its region is superseded,
+                        // as it is now) arena pages go; a stale handle keeps a light shell
+                        // (#821).
+                        old.release_memory();
+                        drop(old);
+                        return true;
+                    }
+                    None => {
+                        let engine = engine.take().expect("not swapped");
+                        let _ = engine.close();
+                        drop(engine);
+                        return give_up(sup);
+                    }
+                }
             }
             Err(e) => {
                 tries += 1;

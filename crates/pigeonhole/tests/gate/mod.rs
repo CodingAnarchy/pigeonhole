@@ -44,6 +44,12 @@ pub struct Gate {
     held_writes: Mutex<Vec<HeldWrite>>,
     /// Reads whose bytes contain this marker fail (one table's SST blocks, say).
     read_marker: Mutex<Option<Vec<u8>>>,
+    /// Reads whose bytes contain this marker block, on the reading thread, until
+    /// [`Gate::release_reads`] (a WAL replay held mid-reopen, say).
+    hold_read_marker: Mutex<Option<Vec<u8>>>,
+    /// How many reads are held now.
+    held_reads: Mutex<usize>,
+    reads_released: std::sync::Condvar,
     /// When each injected read failure happened.
     read_failures: Mutex<Vec<Instant>>,
     /// Writes to the main `.phdb` file whose bytes contain this marker fail (one table's
@@ -86,6 +92,27 @@ impl Gate {
     /// Fails every later read (blocking) whose bytes contain `marker`, or none (`None`).
     pub fn fail_reads_containing(&self, marker: Option<&[u8]>) {
         *self.read_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// Holds, on the reading thread, every later blocking read whose bytes contain `marker`
+    /// (or none), until [`Gate::release_reads`].
+    pub fn hold_reads_containing(&self, marker: Option<&[u8]>) {
+        *self.hold_read_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// Waits (up to 10 s) until a read is held.
+    pub fn wait_held_read(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while *self.held_reads.lock().unwrap() == 0 {
+            assert!(Instant::now() < deadline, "no read was held");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Stops holding reads and lets every held one go.
+    pub fn release_reads(&self) {
+        *self.hold_read_marker.lock().unwrap() = None;
+        self.reads_released.notify_all();
     }
 
     /// When each injected read failure happened.
@@ -312,6 +339,18 @@ impl pigeonhole_io::File for GateFile {
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> pigeonhole_io::Result<()> {
         self.inner.read_at(buf, offset)?;
+        let held = match &*self.gate.hold_read_marker.lock().unwrap() {
+            Some(marker) => buf.windows(marker.len()).any(|w| w == &marker[..]),
+            None => false,
+        };
+        if held {
+            let mut n = self.gate.held_reads.lock().unwrap();
+            *n += 1;
+            while self.gate.hold_read_marker.lock().unwrap().is_some() {
+                n = self.gate.reads_released.wait(n).unwrap();
+            }
+            *n -= 1;
+        }
         if let Some(marker) = &*self.gate.read_marker.lock().unwrap()
             && buf.windows(marker.len()).any(|w| w == &marker[..])
         {

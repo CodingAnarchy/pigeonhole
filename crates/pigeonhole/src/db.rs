@@ -207,9 +207,13 @@ impl Db {
     /// the handle is closed). Costs nothing on the success path.
     #[inline(always)]
     pub(crate) fn retry_closed<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        // The generation before the operation (one load): a `Closed` is then judged against
+        // the engine the operation ran on, not against whatever is current once the thread
+        // runs again (perf287's R3 on #836).
+        let generation = self.generation();
         match op() {
             Err(e) if e.code() == ErrorCode::Closed => {
-                self.after_closed()?;
+                self.after_closed(generation)?;
                 op()
             }
             r => r,
@@ -220,7 +224,7 @@ impl Db {
     /// recovery's swap, or to fail (`Closed`, or `Busy` past the wait's bound).
     #[cold]
     #[inline(never)]
-    pub(crate) fn after_closed(&self) -> Result<()> {
+    pub(crate) fn after_closed(&self, generation: u64) -> Result<()> {
         let closed = || Err(pigeonhole_engine::Error::Closed.into());
         if self.is_closed() {
             return closed();
@@ -232,7 +236,6 @@ impl Db {
         // engine (the failed one, closed meanwhile: run again on the new one). With neither,
         // the `Closed` is the instance's own (a failure the option does not cover, or one
         // the supervisor gave up on).
-        let generation = self.generation();
         match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
             crate::recovery::Settled::Swapped if self.generation() != generation => Ok(()),
             crate::recovery::Settled::Swapped => closed(),
@@ -247,11 +250,15 @@ impl Db {
 
     /// Before a commit is submitted: with a recovery running, waits for its swap (bounded),
     /// so the commit runs on the new engine rather than being refused by the closing one.
+    /// Returns the generation the commit submits under, for `after_commit_closed`.
     #[inline(always)]
-    pub(crate) fn before_commit(&self) -> Result<()> {
+    pub(crate) fn before_commit(&self) -> Result<u64> {
         match &self.supervision {
-            Some(sup) if sup.recovering() => self.wait_for_swap(),
-            _ => Ok(()),
+            Some(sup) if sup.recovering() => {
+                self.wait_for_swap()?;
+                Ok(self.generation())
+            }
+            _ => Ok(self.generation()),
         }
     }
 
@@ -276,14 +283,13 @@ impl Db {
     /// recovery gave up. Without a recovery, the error as it is.
     #[cold]
     #[inline(never)]
-    pub(crate) fn after_commit_closed(&self, e: Error) -> Error {
+    pub(crate) fn after_commit_closed(&self, generation: u64, e: Error) -> Error {
         if e.code() != ErrorCode::Closed || self.is_closed() {
             return e;
         }
         let Some(sup) = &self.supervision else {
             return e;
         };
-        let generation = self.generation();
         match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
             crate::recovery::Settled::Swapped if self.generation() != generation => Error::new(
                 ErrorCode::Busy,
@@ -359,11 +365,16 @@ impl Db {
 
     pub(crate) fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_open()?;
-        // The generation before the engine: a swap in between leaves a snapshot that fails
-        // its check rather than one that passes it with an old view.
-        let generation = self.generation();
+        // The generation before the engine, inside the retry (perf287's R2 on #836): a swap
+        // in between leaves a snapshot that fails its check rather than one that passes it
+        // with an old view, and a snapshot retried on the new engine carries that one's.
+        let (inner, generation) = self.retry_closed(|| {
+            let generation = self.generation();
+            let inner = self.engine().snapshot()?;
+            Ok((inner, generation))
+        })?;
         Ok(Snapshot {
-            inner: self.retry_closed(|| self.engine().snapshot().map_err(Error::from))?,
+            inner,
             db: Arc::downgrade(self),
             generation,
         })
@@ -371,9 +382,13 @@ impl Db {
 
     pub(crate) fn durable_snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_open()?;
-        let generation = self.generation();
+        let (inner, generation) = self.retry_closed(|| {
+            let generation = self.generation();
+            let inner = self.engine().durable_snapshot()?;
+            Ok((inner, generation))
+        })?;
         Ok(Snapshot {
-            inner: self.retry_closed(|| self.engine().durable_snapshot().map_err(Error::from))?,
+            inner,
             db: Arc::downgrade(self),
             generation,
         })
