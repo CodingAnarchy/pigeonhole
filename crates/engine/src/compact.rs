@@ -11,7 +11,7 @@ use pigeonhole_compaction::{
     JobPoll, KeyRange, Levels, NewBlobFile, OtherSource, TaskKind, pick_blob_gc,
 };
 use pigeonhole_format::key::encode_row_prefix;
-use pigeonhole_format::manifest::{Edit, SstMeta};
+use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{
     BlobFileId, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId, Timestamp,
@@ -157,7 +157,33 @@ pub(crate) fn narrow(
     Ok(())
 }
 
+/// Whether a lone SST of a full compaction may hold entries a bottommost rewrite would
+/// purge (#805, owner decision 2026-10-21), from what its metadata shows: delete markers,
+/// a cell old enough to have expired under the family's TTL, or, in a family that keeps
+/// `max_versions` (not a counter, whose versions are never purged), more entries than rows
+/// (`rows`, from the SST's properties; `None` if it could not be read), so possibly more
+/// versions of a column than the family keeps. Conservative: rows of several columns count
+/// too. Not seen: a keep-all family's put shadowed by a newer put at the same timestamp,
+/// kept because a snapshot needed it when the SST was written (nothing records that).
+pub(crate) fn may_hold_purgeable(
+    sst: &SstMeta,
+    family: &FamilyOptions,
+    now: Timestamp,
+    rows: impl FnOnce() -> Option<u64>,
+) -> bool {
+    sst.deletes > 0
+        || (family.ttl_micros > 0 && sst.ts_range.0.saturating_add(family.ttl_micros) <= now)
+        || (family.kind != FamilyKind::Counter
+            && family.max_versions > 0
+            && rows().is_none_or(|rows| sst.entries > rows))
+}
+
 /// A task compacting every level of a slot into the last level (`Engine::compact`).
+///
+/// A lone SST is rewritten rather than moved or left alone when `purgeable` says it may
+/// hold entries a bottommost rewrite purges ([`may_hold_purgeable`]): a full compaction
+/// leaves nothing purgeable (#805). The caller answers no for a slot the same full compaction
+/// already rewrote, so a rewrite whose output still matches does not repeat.
 ///
 /// A lone SST is also rewritten, not moved, when it is larger than one output piece
 /// (`output_piece_bytes` at `target`): the rewrite cuts it into pieces that pack below one
@@ -167,6 +193,7 @@ pub(crate) fn narrow(
 /// than moved, so the compaction purges what a bottommost compaction may (D74) whatever
 /// the slot's layout: splits and moves flush and share SSTs at points that depend on the
 /// shard count, and a move would keep deletes a rewrite of the same rows drops (issue #94).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_full(
     tablet: &TabletEntry,
     family: FamilyId,
@@ -175,6 +202,7 @@ pub(crate) fn plan_full(
     busy: &[SstId],
     rewrite: bool,
     target: u64,
+    purgeable: impl FnOnce(&SstMeta) -> bool,
 ) -> Option<CompactionTask> {
     let inputs: Vec<(u8, Vec<SstId>)> = levels
         .levels
@@ -206,7 +234,8 @@ pub(crate) fn plan_full(
         pigeonhole_compaction::output_piece_bytes(s.len, target) >= s.len
             || row_of(&s.smallest_key) == row_of(&s.largest_key)
     });
-    if inputs.len() == 1 && inputs[0].0 == last_level && one_piece {
+    let purge = lone.is_some_and(|s| purgeable(s));
+    if inputs.len() == 1 && inputs[0].0 == last_level && one_piece && !purge {
         let range = tablet_range(tablet).ok()?;
         if !levels
             .levels
@@ -217,7 +246,7 @@ pub(crate) fn plan_full(
             return None;
         }
     }
-    let kind = if total == 1 && !rewrite && one_piece {
+    let kind = if total == 1 && !rewrite && one_piece && !purge {
         TaskKind::TrivialMove
     } else {
         TaskKind::Rewrite
