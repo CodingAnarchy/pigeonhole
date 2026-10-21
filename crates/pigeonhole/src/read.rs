@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
@@ -438,7 +439,8 @@ impl RowRead<'_> {
 #[derive(Debug)]
 #[must_use = "a scan does nothing until .iter()"]
 pub struct Scan<'t> {
-    core: &'t TableCore,
+    /// Borrowed from the table handle, or held ([`Scan::into_owned`]).
+    core: Cow<'t, Arc<TableCore>>,
     start: Bound<Vec<u8>>,
     end: Bound<Vec<u8>>,
     sel: Selection,
@@ -446,9 +448,13 @@ pub struct Scan<'t> {
 }
 
 impl<'t> Scan<'t> {
-    pub(crate) fn new(core: &'t TableCore, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Self {
+    pub(crate) fn new(
+        core: &'t Arc<TableCore>,
+        start: Bound<Vec<u8>>,
+        end: Bound<Vec<u8>>,
+    ) -> Self {
         Self {
-            core,
+            core: Cow::Borrowed(core),
             start,
             end,
             sel: Selection::new(),
@@ -477,9 +483,41 @@ impl<'t> Scan<'t> {
         self
     }
 
+    /// The scan, holding its table instead of borrowing it (ICR 0052): its [`RowIter`] is
+    /// `Send + 'static`, so it can move to another thread or into a consumer that keeps it,
+    /// such as an Arrow stream handed to DuckDB or Polars. It holds the table as a clone of
+    /// the [`Table`](crate::Table) handle would, and keeps the database open as long.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"a").put("f", b"q", b"v").commit()?;
+    ///
+    /// let it = t.scan_prefix(b"").into_owned().iter()?;
+    /// drop(t);
+    /// let rows = std::thread::spawn(move || it.count()).join().unwrap();
+    /// assert_eq!(rows, 1);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn into_owned(self) -> Scan<'static> {
+        Scan {
+            core: Cow::Owned(self.core.into_owned()),
+            start: self.start,
+            end: self.end,
+            sel: self.sel,
+            limit: self.limit,
+        }
+    }
+
     /// Starts the scan.
     pub fn iter(mut self) -> Result<RowIter<'t>> {
-        let (info, snapshot, families) = self.sel.start(self.core)?;
+        let (info, snapshot, families) = self.sel.start(&self.core)?;
         let mut spec = ScanSpec::new(self.start, self.end);
         spec.read = self.sel.spec;
         spec.read.families = families.into_vec();
@@ -494,7 +532,7 @@ impl<'t> Scan<'t> {
             cursor,
             buf: RowBuf::new(info, 0),
             done: self.limit == Some(0),
-            _table: std::marker::PhantomData,
+            _table: self.core,
         })
     }
 
@@ -508,7 +546,7 @@ impl<'t> Scan<'t> {
     pub fn stream(mut self) -> crate::nonblocking::RowStream<'t> {
         let limit_zero = self.limit == Some(0);
         let started = (|| {
-            let (info, snapshot, families) = self.sel.start(self.core)?;
+            let (info, snapshot, families) = self.sel.start(&self.core)?;
             let mut spec = ScanSpec::new(self.start, self.end);
             spec.read = self.sel.spec;
             spec.read.families = families.into_vec();
@@ -520,7 +558,7 @@ impl<'t> Scan<'t> {
                 .scan_async(&snapshot, self.core.info.id, spec)?;
             Ok((cursor, RowBuf::new(info, 0)))
         })();
-        crate::nonblocking::RowStream::new(started, limit_zero)
+        crate::nonblocking::RowStream::new(started, limit_zero, self.core)
     }
 }
 
@@ -542,7 +580,8 @@ pub struct RowIter<'t> {
     cursor: ScanCursor,
     buf: RowBuf,
     done: bool,
-    _table: std::marker::PhantomData<&'t TableCore>,
+    /// The table: borrowed, or held by an owned scan.
+    _table: Cow<'t, Arc<TableCore>>,
 }
 
 impl RowIter<'_> {

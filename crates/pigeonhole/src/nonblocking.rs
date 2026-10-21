@@ -362,13 +362,13 @@ fn polled_after_done() -> Error {
 }
 
 /// A scan as a [`Stream`](futures_core::Stream) of owned [`Row`]s ([`Scan::stream`](crate::Scan::stream)).
-/// Borrows its table as a lifetime, as [`RowIter`](crate::RowIter) does. Dropping it is
-/// always safe.
+/// Borrows its table as a lifetime, as [`RowIter`](crate::RowIter) does, or holds it
+/// ([`Scan::into_owned`](crate::Scan::into_owned)). Dropping it is always safe.
 #[must_use = "a stream does nothing unless polled"]
 pub struct RowStream<'t> {
     inner: std::result::Result<(ScanCursor, RowBuf), Option<Error>>,
     done: bool,
-    _table: std::marker::PhantomData<&'t crate::Table>,
+    _table: std::borrow::Cow<'t, std::sync::Arc<crate::table::TableCore>>,
 }
 
 impl std::fmt::Debug for RowStream<'_> {
@@ -379,12 +379,16 @@ impl std::fmt::Debug for RowStream<'_> {
     }
 }
 
-impl RowStream<'_> {
-    pub(crate) fn new(started: Result<(ScanCursor, RowBuf)>, limit_zero: bool) -> Self {
+impl<'t> RowStream<'t> {
+    pub(crate) fn new(
+        started: Result<(ScanCursor, RowBuf)>,
+        limit_zero: bool,
+        table: std::borrow::Cow<'t, std::sync::Arc<crate::table::TableCore>>,
+    ) -> Self {
         Self {
             inner: started.map_err(Some),
             done: limit_zero,
-            _table: std::marker::PhantomData,
+            _table: table,
         }
     }
 }

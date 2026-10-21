@@ -1591,6 +1591,83 @@ fn the_default_backend_is_io_uring_where_the_kernel_offers_it() {
     db.close().unwrap();
 }
 
+/// ICR 0052: an owned scan keeps its selection, holds its table, and its iterator is
+/// `Send + 'static`: it moves to another thread after the table handle is gone, on the
+/// writer and on a reader process.
+#[test]
+fn an_owned_scan_outlives_its_table_handle() {
+    fn send_static<T: Send + 'static>(_: &T) {}
+    #[cfg(feature = "async")]
+    fn _stream_send_static(s: pigeonhole::nonblocking::RowStream<'static>) -> impl Send + 'static {
+        s
+    }
+
+    let vfs = SimVfs::new(52);
+    let db = Pigeonhole::open("/db/owned.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    for k in [&b"k1"[..], b"k2", b"k3", b"x1"] {
+        t.mutate(k)
+            .put("a", b"q", k)
+            .put("b", b"n", b"old")
+            .commit()
+            .unwrap();
+    }
+    let snap = db.snapshot().unwrap();
+    t.mutate(b"k1").put("b", b"n", b"new").commit().unwrap();
+
+    // The selection (prefix, family, snapshot, limit) carries over.
+    let it = t
+        .scan_prefix(b"k")
+        .family("b")
+        .snapshot(&snap)
+        .limit(2)
+        .into_owned()
+        .iter()
+        .unwrap();
+    send_static(&it);
+    drop(t);
+    let rows = std::thread::spawn(move || {
+        it.map(|r| {
+            let r = r.unwrap();
+            let cells: Vec<_> = r
+                .view()
+                .iter()
+                .map(|e| (e.family.to_owned(), e.cell.value().to_vec()))
+                .collect();
+            (r.key().to_vec(), cells)
+        })
+        .collect::<Vec<_>>()
+    })
+    .join()
+    .unwrap();
+    let old = vec![("b".to_owned(), b"old".to_vec())];
+    assert_eq!(
+        rows,
+        [(b"k1".to_vec(), old.clone()), (b"k2".to_vec(), old)],
+        "two rows, family b only, as of the snapshot"
+    );
+
+    // An owned scan that is never started holds nothing open but its handle.
+    let t = db.table("t").unwrap().open().unwrap();
+    let unstarted = t.scan_prefix(b"").into_owned();
+    drop(t);
+    assert_eq!(unstarted.iter().unwrap().count(), 4);
+
+    let reader = Pigeonhole::open_reader(
+        "/db/owned.phdb",
+        pigeonhole::ReaderOptions::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .block_cache(1 << 20),
+    )
+    .unwrap();
+    let rt = reader.table("t").unwrap();
+    let it = rt.scan(&b"x"[..]..).into_owned().iter().unwrap();
+    drop(rt);
+    assert_eq!(std::thread::spawn(move || it.count()).join().unwrap(), 1);
+    drop(reader);
+    db.close().unwrap();
+}
+
 #[test]
 fn reader_handles_see_the_writers_commits() {
     let vfs = SimVfs::new(9);

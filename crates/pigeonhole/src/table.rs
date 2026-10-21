@@ -232,12 +232,12 @@ impl TableCore {
         crate::nonblocking::GetFuture::new(started)
     }
 
-    fn scan(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Scan<'_> {
+    fn scan(self: &Arc<Self>, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Scan<'_> {
         Scan::new(self, start.map(<[u8]>::to_vec), end.map(<[u8]>::to_vec))
     }
 
     fn scan_range<'k, K: AsRef<[u8]> + ?Sized + 'k>(
-        &self,
+        self: &Arc<Self>,
         range: impl RangeBounds<&'k K>,
     ) -> Scan<'_> {
         self.scan(
@@ -246,7 +246,7 @@ impl TableCore {
         )
     }
 
-    fn scan_prefix(&self, prefix: &[u8]) -> Scan<'_> {
+    fn scan_prefix(self: &Arc<Self>, prefix: &[u8]) -> Scan<'_> {
         let end = match prefix_end(prefix) {
             Some(end) => Bound::Excluded(end),
             None => Bound::Unbounded,
