@@ -93,7 +93,7 @@ fn plain(v: &Value, none: &str) -> String {
 }
 
 /// One CSV field, quoted when it holds a comma, quote, CR or LF.
-fn csv_field(s: &str) -> String {
+pub(crate) fn csv_field(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {

@@ -39,9 +39,10 @@ where
             return status;
         }
     };
-    let format = cli.format;
-    match cmd::run(cli) {
-        Ok(report) => match output::render(&report, format, stdout) {
+    let format = cli.format();
+    match cmd::run(cli, stdout) {
+        Ok(cmd::Outcome::Streamed(status)) => status,
+        Ok(cmd::Outcome::Report(report)) => match output::render(&report, format, stdout) {
             Ok(()) => report.status,
             // A closed pipe (`phdb … | head`) is not an error worth a message.
             Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => report.status,

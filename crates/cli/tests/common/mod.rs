@@ -74,6 +74,8 @@ pub fn snapshot(name: &str, dir: &TempDir, text: &str) {
     settings.add_filter(r"\b[0-9a-f]{32}\b", "[DB_ID]");
     // JSON and JSONL: `"file_bytes": 123`; table: `file_bytes      123`.
     settings.add_filter(r#"("?(?:file_bytes|free_bytes)"?:?\s*)\d+"#, "${1}[BYTES]");
+    // A snapshot's seqno depends on the writes before it, which tests make differently.
+    settings.add_filter(r#"("seqno":\s*)\d+"#, "${1}[SEQNO]");
     settings.bind(|| insta::assert_snapshot!(name, text));
 }
 

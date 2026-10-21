@@ -13,8 +13,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub(crate) struct Cli {
     /// Output format: `table` for people; `json` (one document) and `jsonl` (a header line,
     /// then one object per row) for programs; `csv` with a header line.
-    #[arg(long, global = true, value_enum, default_value_t = Format::Table)]
-    pub format: Format,
+    /// `dump` defaults to `jsonl` and takes `jsonl` or `csv`; every other command defaults
+    /// to `table`.
+    #[arg(long, global = true, value_enum)]
+    pub format: Option<Format>,
 
     /// Shared-memory directory, as the database's writer was opened with
     /// (`Options::shm_dir`).
@@ -43,6 +45,33 @@ pub(crate) enum Command {
     },
     /// Check the database for damage, offline: superblocks, manifest, extents, every SST
     /// block, every blob record and the WAL a crash left. Exits 3 if anything is damaged.
+    /// Export every cell (all retained versions) at one snapshot: `jsonl` (the default;
+    /// `phdb load` reads it back) or `csv`, to standard output.
+    Dump {
+        /// The database file (`*.phdb`).
+        file: PathBuf,
+        /// Only this table (repeat for several).
+        #[arg(long = "table", value_name = "TABLE")]
+        tables: Vec<String>,
+        /// Only rows starting with this prefix (UTF-8).
+        #[arg(long)]
+        prefix: Option<String>,
+        /// Read at a durable snapshot: only commits durable at their level.
+        #[arg(long)]
+        durable: bool,
+    },
+    /// Load a `phdb dump --format jsonl` export: create its tables and families (an existing
+    /// family keeps its stored options) and write every cell at its timestamp. Opens as the
+    /// writer.
+    Load {
+        /// The database file (`*.phdb`).
+        file: PathBuf,
+        /// The dump to read; `-` or nothing reads standard input.
+        input: Option<PathBuf>,
+        /// Create the database file if it does not exist.
+        #[arg(long)]
+        create: bool,
+    },
     Check {
         /// The database file (`*.phdb`).
         file: PathBuf,
@@ -58,6 +87,16 @@ pub(crate) enum Command {
         #[arg(long)]
         online: bool,
     },
+}
+
+impl Cli {
+    /// The output format: `--format`, else the command's default.
+    pub(crate) fn format(&self) -> Format {
+        self.format.unwrap_or(match self.command {
+            Command::Dump { .. } => Format::Jsonl,
+            _ => Format::Table,
+        })
+    }
 }
 
 /// The output format (`--format`).

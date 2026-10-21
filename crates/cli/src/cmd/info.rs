@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use pigeonhole::{Compaction, Compression, DatabaseInfo, FamilyInfo, FamilyStorage, Priority};
+use pigeonhole::{DatabaseInfo, FamilyInfo, FamilyStorage};
 use serde_json::{Map, Value, json};
 
 use crate::args::Cli;
@@ -114,48 +114,21 @@ fn row(table: &str, tablets: usize, family: &Map<String, Value>) -> Vec<Value> {
 }
 
 fn family_json(f: &FamilyInfo, s: &FamilyStorage) -> Map<String, Value> {
-    let (compression, zstd_level) = match f.compression {
-        Compression::None => ("none", None),
-        Compression::Zstd(level) => ("zstd", Some(level)),
-        Compression::Lz4 => ("lz4", None),
-        _ => ("unknown", None),
-    };
+    let mut m = super::schema::family_json(f);
     let levels: Vec<Value> = s
         .levels
         .iter()
         .map(|l| json!({"level": l.level, "ssts": l.ssts, "bytes": l.bytes, "entries": l.entries}))
         .collect();
-    let json = json!({
-        "name": f.name,
-        "counter": f.counter,
-        "max_versions": f.max_versions,
-        "ttl_micros": f.ttl.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX)),
-        "bloom_bits": f.bloom_bits,
-        "blob_threshold": f.blob_threshold,
-        "compression": compression,
-        "zstd_level": zstd_level,
-        "block_size": f.block_size,
-        "merge_operator": f.merge_operator,
-        "cache_priority": match f.cache_priority {
-            Priority::Low => "low",
-            Priority::Normal => "normal",
-            Priority::High => "high",
-        },
-        "compaction": match f.compaction {
-            Compaction::Leveled => "leveled",
-            Compaction::Tiered => "tiered",
-            Compaction::FifoByTime => "fifo-by-time",
-        },
-        "ssts": s.ssts(),
-        "sst_bytes": s.sst_bytes(),
-        "entries": s.levels.iter().map(|l| l.entries).sum::<u64>(),
-        "levels": levels,
-        "blob_files": s.blob_files,
-        "blob_bytes": s.blob_bytes,
-        "blob_live_bytes": s.blob_live_bytes,
-    });
-    match json {
-        Value::Object(m) => m,
-        _ => unreachable!("json! of an object literal"),
-    }
+    m.insert("ssts".into(), json!(s.ssts()));
+    m.insert("sst_bytes".into(), json!(s.sst_bytes()));
+    m.insert(
+        "entries".into(),
+        json!(s.levels.iter().map(|l| l.entries).sum::<u64>()),
+    );
+    m.insert("levels".into(), Value::Array(levels));
+    m.insert("blob_files".into(), json!(s.blob_files));
+    m.insert("blob_bytes".into(), json!(s.blob_bytes));
+    m.insert("blob_live_bytes".into(), json!(s.blob_live_bytes));
+    m
 }
