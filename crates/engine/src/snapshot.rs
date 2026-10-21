@@ -1035,9 +1035,10 @@ impl LiveSnapshot {
         if self.shm.is_stale() {
             return Err(Error::SnapshotExpired);
         }
-        // The same argument for the slot: the writer frees a slot it judged dead before it
-        // reclaims anything the slot's pins held, so a read that finished while the slot was
-        // still this process's read what the snapshot names. A false "dead" (a hidden or
+        // The same argument for the slot, as D148's for the generation: the writer frees a
+        // slot it judged dead before it reclaims anything the slot's pins held, so a read
+        // that finished while the slot was still this process's read what the snapshot
+        // names. A false "dead" (a hidden or
         // foreign-namespace pid) costs an expired snapshot, not wrong rows.
         if !self.slot.is_current() {
             return Err(Error::SnapshotExpired);
