@@ -87,6 +87,12 @@ pub enum ErrorCode {
     /// after its writer's shared memory went away): a reader attaches to a running writer.
     /// Open the reader again once a writer runs (ICR 0057).
     NoWriter = 29,
+    /// The file uses a feature this build does not support: a value written by a newer
+    /// version (a value type, family kind, compression codec, block or log record kind) that
+    /// this one does not know. The message names it. Open the file with a newer version;
+    /// the data is intact, not corrupt (#496, ICR 0058). [`ErrorCode::UnsupportedFormat`], by
+    /// contrast, means the whole file's format version is unreadable.
+    UnsupportedFeature = 30,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
@@ -174,6 +180,7 @@ impl From<pigeonhole_engine::Error> for Error {
             E::WouldDeadlock => ErrorCode::WouldDeadlock,
             E::OutcomeUnknown => ErrorCode::OutcomeUnknown,
             E::NoWriter => ErrorCode::NoWriter,
+            E::UnsupportedFeature(_) => ErrorCode::UnsupportedFeature,
             // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
             // here surfaces as `Io` (the message names it) until it gets its own code; the
             // mapping test lists every current variant.

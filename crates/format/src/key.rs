@@ -119,7 +119,10 @@ impl Kind {
             0x03 => Ok(Self::CellDelete),
             0x04 => Ok(Self::ColumnDelete),
             0x05 => Ok(Self::FamilyDelete),
-            _ => Err(Error::Corrupt { what: "key kind" }),
+            b => Err(Error::UnsupportedFeature {
+                what: "key kind",
+                value: u64::from(b),
+            }),
         }
     }
 

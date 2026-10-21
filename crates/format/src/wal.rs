@@ -547,8 +547,9 @@ impl WalRecord<'_> {
                 commit_ts: r.u64()?,
                 participants: StreamList::new(r.rest())?,
             }),
-            _ => Err(Error::Corrupt {
+            t => Err(Error::UnsupportedFeature {
                 what: "wal record type",
+                value: u64::from(t),
             }),
         }
     }

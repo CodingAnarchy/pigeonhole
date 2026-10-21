@@ -200,13 +200,17 @@ impl Error {
         )
     }
 
-    /// Whether the bytes are intact but use a format version or codec this build does not
-    /// support.
+    /// Whether the bytes are intact but use a format version, codec or other feature this
+    /// build does not support.
     pub fn is_unsupported(&self) -> bool {
         use pigeonhole_format::Error as F;
         matches!(
             self,
-            Self::Format(F::UnsupportedVersion { .. } | F::UnsupportedCompression(_))
+            Self::Format(
+                F::UnsupportedVersion { .. }
+                    | F::UnsupportedCompression(_)
+                    | F::UnsupportedFeature { .. }
+            )
         )
     }
 }
