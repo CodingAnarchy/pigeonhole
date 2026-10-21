@@ -800,6 +800,11 @@ impl Family {
     pub(crate) fn to_engine(&self) -> FamilyOptions {
         self.options.clone()
     }
+
+    /// The builder for options read back from the catalog (ICR 0047).
+    pub(crate) fn from_engine(options: FamilyOptions) -> Self {
+        Self { options }
+    }
 }
 
 /// Which I/O backend a database runs its file I/O on.

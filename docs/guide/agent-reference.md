@@ -60,6 +60,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `nonblocking::{GetFuture, RowFuture, RowStream, CommitFuture, CheckFuture, MaintenanceFuture}` | Async results (feature `async`, default on). |
 | `ValueFilter`, `Condition` | Value predicate; `commit_if` condition. |
 | `CellRef<'a>`, `Cell`, `Row`, `RowRef<'a>`, `CellEntry<'a>`, `Value<'a>` | Borrowed and owned results. |
+| `DatabaseInfo`, `TableInfo`, `FamilyInfo`, `FamilyStorage`, `LevelInfo`, `Compression` | `info()` and `family_info()` results (ICR 0047; all `#[non_exhaustive]`, public fields). |
 | `Error`, `ErrorCode`, `Result<T>` | Errors. |
 | `MergeOperator`, `MergeError` | Custom merge operators: an associative fold over stored values (tag byte, then payload). |
 | `days(n: u64) -> Duration` | TTL helper. |
@@ -77,6 +78,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `transaction(&self) -> Result<Transaction>` | P4, early. Optimistic transaction. |
 | `row_cache_stats(&self) -> RowCacheStats` | Row cache `hits`, `misses`, `fills` since open (all 0 when off). |
 | `io_rings(&self) -> Option<IoRings>` | With `IoBackend::Uring`: `rings` (the shared one plus one per shard thread that got its own) and `pooled` (rings with a registered buffer pool; `pooled < rings` means the locked-memory limit, `RLIMIT_MEMLOCK`, was too low for every ring to get one: correct, but each read pins its pages). `None` on other backends. Also on `PigeonholeReader`. |
+| `info(&self) -> Result<DatabaseInfo>` | What the database holds and how it is stored, from the current catalog, no data I/O (ICR 0047; also on `PigeonholeReader`): `db_id`, `format_version`, `reader`, `shards` (this instance's: a reader's is the writer's), `file_bytes`, `free_bytes` (`None` on a reader), and per table (by name) `name`, `tablets`, `families: Vec<FamilyInfo>` and `storage: Vec<FamilyStorage>` (same order: `family`, `levels: Vec<LevelInfo { level, ssts, bytes, entries }>`, `blob_files`, `blob_bytes`, `blob_live_bytes`; `ssts()`, `sst_bytes()`). Memtable data isn't counted. |
 | `engine_metrics(&self) -> EngineMetrics` | The writer's counters since this instance opened (ICR 0044; cheap, non-blocking). Cumulative counters start at 0 at open and never reset: subtract two readings for an interval. Gauges are the value now. Nanoseconds and bytes. `commits(Durability) -> CommitStats { count, p50_nanos, p99_nanos, p999_nanos }` (latency percentiles are half-power-of-two bucket floors); `flushes`, `flush_failures`, `compactions`, `compaction_failures`; `write_stalls`, `write_stall_nanos`; `block_cache_hits`, `block_cache_misses`, `block_cache_capacity_bytes` (gauge), `block_cache_pinned_bytes` (gauge), `block_cache_pinned_warnings`; `wal_unpin_passes`, `wal_unpin_flushes`, `wal_inline_syncs`, `wal_rollover_blocks`; `file_growths`, `file_growth_nanos`, `file_growths_ahead`, `file_growth_ahead_nanos`; `async_sync_reads`; `shard_parks`, `shard_wakes`, `shard_busy_nanos`, `commit_parks`; `threads_started`, `threads_pinned`, `unpinned_reason: Option<&'static str>` (gauges; the reason's wording is not stable); `visibility_waits`, `visibility_waiters_ahead`, `visibility_wake_passes`, `visibility_woken`, `visibility_contended`; `cross_shard: CrossShardMetrics` (ICR 0043): `rounds` (two-phase rounds decided), `refused_rounds` (rounds a participant refused; per cross-shard commit, the wasted rounds), and refusals by reason: `refused_moved` (a tablet split, merge or move, D145), `refused_room` (no arena room for the share, ICR 0042), `refused_pending_overlap` (an undecided cross-shard share on the same rows, D249, D263); `refused_below_floor` and `refused_move_raise` are deprecated, always 0 since D263; `share_waits`, `share_wait_nanos` (singles held behind an undecided share, D263). |
 | `snapshot(&self) -> Result<Snapshot>` | Consistent view of everything committed. |
 | `durable_snapshot(&self) -> Result<Snapshot>` | Consistent view of the commits durable at their level (D227, ICR 0037; also on `PigeonholeReader`). Lags `snapshot()` by the fsyncs in flight. For reads a later write is derived from, and persisted cursors. |
@@ -148,6 +150,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `TableBuilder::open(self) -> Result<Table>` | `TableNotFound` if absent. |
 | `Table::name(&self) -> &str` | |
 | `Table::families(&self) -> Vec<&str>` | |
+| `Table::family_info(&self, &str) -> Option<FamilyInfo>` | A family's stored options as of when the handle opened (ICR 0047; also on `ReadTable`, with `ReadTable::families`): `name`, `family: Family` (the same options as a builder: pass it to `TableBuilder::family` to define an identical family), `counter`, `max_versions`, `ttl: Option<Duration>`, `bloom_bits`, `blob_threshold`, `compression: Compression` (`None`, `Lz4`, `Zstd(i8)`), `block_size`, `merge_operator: Option<String>` (`None` for counters), `cache_priority`, `compaction`. `None` if no such family. |
 | `Table::mutate(&self, row: &[u8]) -> RowMutation<'_>` | Start single-row mutation. |
 | `Table::get(&self, row: &[u8], family: &str, qualifier: &[u8]) -> Result<Option<CellRef<'_>>>` | Newest version; zero-copy. |
 | `Table::get_at(&self, &Snapshot, row, family, qualifier) -> Result<Option<CellRef<'_>>>` | As of snapshot. |
@@ -254,6 +257,17 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 Backpressure (D210): each shard holds at most ½ `memtable_budget` of async commits submitted and not yet resolved; over it, a commit future waits (arrival order) and submits when polled with room. Blocking commits and `commit_with_ticket` are never held or counted.
 Dropping a read future or stream: always safe. Dropping a ticket, or a commit future that has submitted: the commit still lands or fails atomically. **Dropping a commit future still waiting for room writes nothing** (fire-and-forget `let _ = ..commit_async()` can lose the commit over the bound; use `commit_with_ticket` to submit without awaiting).
 Sync-only by design (D196): `backup`, `shrink` (long-running; run on your executor's blocking pool), and open, close, table create/open/drop (short).
+
+## Command line: `phdb` (in progress, #692)
+Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; before the next release, use `cargo install --path crates/cli`.
+
+| Item | Rule |
+|---|---|
+| Commands | `phdb info <file>`. `check`, `dump`, `load`, `backup`, `compact` and `shell` are coming. |
+| For programs | `--format json` gives one document; `--format jsonl` gives a header line, then one object per row. Each carries `"phdb": 1`; within it fields are only added, so ignore unknown fields. |
+| Open policy | With no writer running, `phdb` becomes the writer for the command, replaying a crashed WAL, and closes. With a writer running, it opens as a reader process. `--reader` / `--writer` force one. |
+| Exit status | 0 ok, 1 error, 2 usage, 3 corruption, 4 locked or busy, 5 not found, 6 unsupported. |
+| Errors | On stderr. With json/jsonl: `{"phdb":1,"error":{"code","code_num","message"}}`, where `code` is the `ErrorCode` name, or `FileNotFound` with `code_num` `null`. |
 
 ## Recipes
 ### 1. Open, create table, write, read

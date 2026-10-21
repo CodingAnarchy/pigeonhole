@@ -414,6 +414,13 @@ impl Pigeonhole {
         self.db.io_rings()
     }
 
+    /// What the database holds and how it is stored: format version, file and free bytes,
+    /// and per table its tablets, its families' stored options and their SSTs per level and
+    /// blob files (ICR 0047). Reads the current catalog; cheap, no data I/O.
+    pub fn info(&self) -> Result<crate::DatabaseInfo> {
+        Ok(self.db.engine.info()?.into())
+    }
+
     /// The writer default durability.
     pub fn default_durability(&self) -> Durability {
         self.db.engine.default_durability()
@@ -649,6 +656,13 @@ impl PigeonholeReader {
     /// As [`Pigeonhole::io_rings`].
     pub fn io_rings(&self) -> Option<IoRings> {
         self.db.io_rings()
+    }
+
+    /// As [`Pigeonhole::info`], from the catalog the writer last published.
+    /// [`DatabaseInfo::free_bytes`](crate::DatabaseInfo::free_bytes) is `None`: a reader
+    /// does not track allocations.
+    pub fn info(&self) -> Result<crate::DatabaseInfo> {
+        Ok(self.db.engine.info()?.into())
     }
 
     /// Opens an existing table for reading.

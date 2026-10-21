@@ -153,6 +153,10 @@ impl TableCore {
         Self { db, info }
     }
 
+    fn family_info(&self, family: &str) -> Option<crate::FamilyInfo> {
+        self.info.family(family).map(crate::FamilyInfo::from)
+    }
+
     /// The catalog entry as of now: a family added through another handle shows up here.
     /// Falls back to the handle's own entry if the table was dropped or replaced.
     pub(crate) fn current_info(&self) -> Arc<TableInfo> {
@@ -328,6 +332,12 @@ impl Table {
             .collect()
     }
 
+    /// A family's stored options, as of when this handle was opened (ICR 0047); `None` if
+    /// the table has no such family.
+    pub fn family_info(&self, family: &str) -> Option<crate::FamilyInfo> {
+        self.core.family_info(family)
+    }
+
     /// Starts a single-row atomic mutation.
     pub fn mutate<'t>(&'t self, row: &[u8]) -> RowMutation<'t> {
         RowMutation::new(self, row)
@@ -455,6 +465,21 @@ impl ReadTable {
     /// The table name.
     pub fn name(&self) -> &str {
         &self.core.info.name
+    }
+
+    /// Family names, in creation order, as of when this handle was opened (ICR 0047).
+    pub fn families(&self) -> Vec<&str> {
+        self.core
+            .info
+            .families
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect()
+    }
+
+    /// As [`Table::family_info`].
+    pub fn family_info(&self, family: &str) -> Option<crate::FamilyInfo> {
+        self.core.family_info(family)
     }
 
     /// The newest version of one cell.
