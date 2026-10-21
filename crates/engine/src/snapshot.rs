@@ -722,6 +722,10 @@ pub(crate) struct LiveViews {
     /// a moment when `shrink` reclaimed). A reader process's unpin is not seen here; it waits
     /// for the next commit.
     on_oldest_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// Run when the last live view of any version goes (a closed instance releases its
+    /// memtable arenas once nothing can read them, D265). Runs after `on_oldest_released`,
+    /// outside the lock.
+    on_all_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
 }
 
 impl std::fmt::Debug for LiveViews {
@@ -737,6 +741,7 @@ impl Default for LiveViews {
         Self {
             versions: RegistryLock::new(BTreeMap::new()),
             on_oldest_released: OnceLock::new(),
+            on_all_released: OnceLock::new(),
         }
     }
 }
@@ -751,24 +756,45 @@ impl LiveViews {
             .or_insert(0) += 1;
     }
 
-    /// Whether this was the last view of the oldest version.
-    fn unregister(&self, v: ManifestVersion) -> bool {
+    /// Whether this was the last view of the oldest version, and whether it was the last
+    /// view of any.
+    fn unregister(&self, v: ManifestVersion) -> (bool, bool) {
         let mut m = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(n) = m.get_mut(&v) else {
-            return false;
+            return (false, false);
         };
         *n -= 1;
         if *n > 0 {
-            return false;
+            return (false, false);
         }
         m.remove(&v);
-        m.keys().next().is_none_or(|oldest| *oldest > v)
+        let oldest = m.keys().next().is_none_or(|oldest| *oldest > v);
+        (oldest, m.is_empty())
     }
 
     /// Sets what runs when the last view of the oldest version goes (once; the writer's
     /// reclaim). It runs on the thread dropping that view, outside this registry's lock.
     pub(crate) fn on_oldest_released(&self, f: Box<dyn Fn() + Send + Sync>) {
         let _ = self.on_oldest_released.set(f);
+    }
+
+    /// Sets what runs when the last live view goes (once; a closed instance's arena
+    /// release, D265). It runs on the thread dropping that view, after `on_oldest_released`
+    /// and outside this registry's lock.
+    pub(crate) fn on_all_released(&self, f: Box<dyn Fn() + Send + Sync>) {
+        let _ = self.on_all_released.set(f);
+    }
+
+    /// Runs `f` under the registry's lock if no view lives, so no view can be registered
+    /// meanwhile: whether it ran. For the arena release of a closed instance (D265), whose
+    /// publishers are stopped; `f` must not touch the registry.
+    pub(crate) fn if_none_live(&self, f: impl FnOnce()) -> bool {
+        let m = self.versions.lock().unwrap_or_else(PoisonError::into_inner);
+        if !m.is_empty() {
+            return false;
+        }
+        f();
+        true
     }
 
     /// The oldest manifest version any live view uses.
@@ -801,9 +827,11 @@ impl ViewPin {
 
 impl Drop for ViewPin {
     fn drop(&mut self) {
-        if self.registry.unregister(self.version)
-            && let Some(release) = self.registry.on_oldest_released.get()
-        {
+        let (oldest, all) = self.registry.unregister(self.version);
+        if oldest && let Some(release) = self.registry.on_oldest_released.get() {
+            release();
+        }
+        if all && let Some(release) = self.registry.on_all_released.get() {
             release();
         }
     }

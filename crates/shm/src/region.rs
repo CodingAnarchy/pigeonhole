@@ -639,6 +639,53 @@ impl ShmRegion {
         Ok(region.bind_numa(offset, len, node)?)
     }
 
+    /// The `(offset, len)` of every arena together: the region's tail, from the first
+    /// arena's start to the end.
+    fn arenas_range(&self) -> (usize, usize) {
+        let h = &self.inner.header;
+        (
+            h.arenas_off as usize,
+            h.arena_len as usize * h.shard_count as usize,
+        )
+    }
+
+    /// Frees the memory of every arena ([`SharedRegion::discard`]): the header, the
+    /// watermarks, the view buffers and the reader slots stay intact, so the region's
+    /// protocol keeps working, and a later read of an arena sees zeros. For a writer
+    /// releasing a closed instance's memory (D265), once no one still reads the arenas as
+    /// data: in this process, no view that lists a memtable lives; in other processes,
+    /// none can take the region for current ([`ShmRegion::is_superseded`]), so a reader
+    /// still attached fails its reads with the engine's `SnapshotExpired` after reading
+    /// them, and `pigeonhole-memtable`'s reader never faults on zeroed pages. That a reader
+    /// which saw a zero also sees the new generation is the kernel's doing, not the memory
+    /// model's: the writer stores the new generation in the directory (Release) before the
+    /// `madvise`, which zaps every process's page-table entries for the range and waits for
+    /// the TLB shootdowns before it returns, so a reader sees zeros only by faulting after
+    /// that, and the fault and the shootdown's interrupt are full barriers ahead of its
+    /// `Acquire` fence and directory load. Linux only: an error elsewhere
+    /// ([`pigeonhole_io::ErrorKind::Unsupported`] on macOS and Windows, `EOPNOTSUPP` from a
+    /// `shm_dir` file system without hole punching), and nothing is freed.
+    pub fn discard_arenas(&self) -> Result<()> {
+        let (offset, len) = self.arenas_range();
+        Ok(self.inner.region.discard(offset, len)?)
+    }
+
+    /// How many bytes of the arenas are resident in memory
+    /// ([`SharedRegion::resident_bytes`]; Linux mappings only). A test probe for
+    /// [`ShmRegion::discard_arenas`].
+    pub fn arena_resident_bytes(&self) -> Result<usize> {
+        let (offset, len) = self.arenas_range();
+        Ok(self.inner.region.resident_bytes(offset, len)?)
+    }
+
+    /// Whether no reader process can take this mapping for the current generation: an
+    /// in-memory region (no other process can attach to it), or a mapping a newer
+    /// generation replaced ([`ShmRegion::is_stale`]). A reader attached to such a region
+    /// fails its reads with `SnapshotExpired` and re-attaches (D148).
+    pub fn is_superseded(&self) -> bool {
+        self.inner.directory.is_none() || self.is_stale()
+    }
+
     // ---- seqnos and watermarks ----
 
     /// Reserves `count` consecutive seqnos (one atomic `fetch_add` per commit group) and

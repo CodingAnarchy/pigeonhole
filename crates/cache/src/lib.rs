@@ -235,6 +235,28 @@ impl BlockCache {
         }
     }
 
+    /// Drops every unpinned block and every ghost, and returns the index's spare capacity
+    /// to the allocator: for an engine releasing a closed instance's memory (D265). Pinned
+    /// blocks stay indexed until their holders go and a later `clear` or eviction drops
+    /// them; the capacity and the lookup counters are unchanged.
+    ///
+    /// ```
+    /// use pigeonhole_cache::{BlockCache, BlockKey, Priority};
+    ///
+    /// let cache = BlockCache::new(1 << 20, 0);
+    /// let held = cache.insert(BlockKey { file: 1, offset: 0 }, vec![0; 8].into(), Priority::Normal);
+    /// drop(cache.insert(BlockKey { file: 2, offset: 0 }, vec![0; 8].into(), Priority::Normal));
+    /// cache.clear();
+    /// assert!(cache.get(BlockKey { file: 2, offset: 0 }).is_none());
+    /// assert!(cache.get(BlockKey { file: 1, offset: 0 }).is_some(), "pinned by `held`");
+    /// drop(held);
+    /// cache.clear();
+    /// assert_eq!(cache.usage(), 0);
+    /// ```
+    pub fn clear(&self) {
+        self.shards.for_each(|s| s.clear());
+    }
+
     /// Counts `bytes` of blocks a reader keeps pinned while it is open (an SST's top index
     /// and filters), until a matching [`sub_pinned`](Self::sub_pinned). Pinned blocks count
     /// against the capacity and are never evicted, so once they pass half of it the blocks
@@ -529,9 +551,26 @@ impl RowCache {
         }
     }
 
+    /// Drops every unpinned row and every ghost, and returns the index's spare capacity to
+    /// the allocator: for an engine releasing a closed instance's memory (D265). Rows a
+    /// [`RowHandle`] still holds stay indexed until it goes and a later `clear` or eviction
+    /// drops them.
+    ///
+    /// ```
+    /// use pigeonhole_cache::RowCache;
+    ///
+    /// let rows = RowCache::new(1 << 20);
+    /// drop(rows.insert(3, b"user:42", 10, vec![1, 2, 3]));
+    /// rows.clear();
+    /// assert!(rows.get(3, b"user:42", 10).is_none());
+    /// assert_eq!(rows.usage(), 0);
+    /// ```
+    pub fn clear(&self) {
+        self.shards.for_each(|s| s.clear());
+    }
+
     /// Bytes currently cached (rows, encodings and a fixed per-entry overhead).
-    #[cfg(all(test, not(loom)))]
-    fn usage(&self) -> usize {
+    pub fn usage(&self) -> usize {
         self.shards.usage()
     }
 }

@@ -173,6 +173,47 @@ impl SharedRegion {
             Backing::Mapped { .. } => crate::os::bind_numa(p, len, node),
         }
     }
+
+    /// Frees the memory of `[offset, offset + len)`: a later read of the range sees zeros,
+    /// and the mapping stays valid, so nothing can fault. On Linux the whole pages inside
+    /// the range and their backing store go (`madvise(MADV_REMOVE)`: a hole in the region's
+    /// file, so every process mapping it sees the zeros); a partial page at either end
+    /// stays. A heap region zeroes the range (writing every page, so an untouched one is
+    /// faulted in: it simulates the discard for tests and frees nothing). Elsewhere [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported): a POSIX
+    /// shared-memory object's pages cannot be punched, and nothing is freed. For an engine
+    /// releasing a closed instance's memtable arenas (D265): the caller makes sure no one
+    /// still reads the range as data. Panics if the range is out of bounds.
+    pub fn discard(&self, offset: usize, len: usize) -> Result<()> {
+        let p = self.at(offset, len);
+        match &self.inner.backing {
+            Backing::Heap(_) => {
+                const ZEROS: [u8; 4096] = [0; 4096];
+                let mut done = 0;
+                while done < len {
+                    let n = (len - done).min(ZEROS.len());
+                    self.write(offset + done, &ZEROS[..n]);
+                    done += n;
+                }
+                Ok(())
+            }
+            Backing::Mapped { .. } => crate::os::discard(p, len),
+        }
+    }
+
+    /// How many bytes of the whole pages inside `[offset, offset + len)` are resident in
+    /// memory (`mincore`). Linux mappings only: [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported) elsewhere and for
+    /// heap regions. A test probe for [`SharedRegion::discard`]. Panics if the range is out
+    /// of bounds.
+    pub fn resident_bytes(&self, offset: usize, len: usize) -> Result<usize> {
+        let p = self.at(offset, len);
+        match &self.inner.backing {
+            Backing::Heap(_) => Err(crate::Error::new(
+                crate::ErrorKind::Unsupported,
+                "a heap region has no resident-page count",
+            )),
+            Backing::Mapped { .. } => crate::os::resident_bytes(p, len),
+        }
+    }
 }
 
 const WORD: usize = std::mem::size_of::<u64>();
@@ -317,6 +358,22 @@ mod tests {
         writer.join().unwrap();
         r.read(3, &mut buf);
         assert_eq!(buf, [49; 40]);
+    }
+
+    #[test]
+    fn discard_zeroes_a_heap_range_and_keeps_its_neighbours() {
+        let r = SharedRegion::heap(10000);
+        r.write(0, &[7u8; 10000]);
+        r.discard(100, 9000).unwrap();
+        let mut buf = vec![0u8; 10000];
+        r.read(0, &mut buf);
+        assert!(buf[..100].iter().all(|&b| b == 7));
+        assert!(buf[100..9100].iter().all(|&b| b == 0));
+        assert!(buf[9100..].iter().all(|&b| b == 7));
+        assert_eq!(
+            r.resident_bytes(0, 10000).unwrap_err().kind,
+            crate::ErrorKind::Unsupported
+        );
     }
 
     #[test]

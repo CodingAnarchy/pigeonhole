@@ -173,6 +173,18 @@ impl RowCaches {
     }
 
     /// The counters.
+    /// Drops every cached row (a closed instance releasing its memory, D265). The watermark
+    /// and hint tables are fixed allocations and stay.
+    pub fn clear(&self) {
+        self.cache.clear();
+    }
+
+    /// Bytes the rows and their encodings take (the `memory_release` test hook).
+    #[cfg(feature = "test-hooks")]
+    pub fn usage(&self) -> usize {
+        self.cache.usage()
+    }
+
     pub fn stats(&self) -> RowCacheStats {
         RowCacheStats {
             hits: self.hits.load(Ordering::Relaxed),

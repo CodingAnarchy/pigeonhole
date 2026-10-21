@@ -369,6 +369,20 @@ pub(crate) fn bind_numa(_ptr: *mut u8, _len: usize, _node: u32) -> Result<()> {
     Ok(())
 }
 
+pub(crate) fn discard(_ptr: *mut u8, _len: usize) -> Result<()> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "discarding shared-memory pages is Linux only",
+    ))
+}
+
+pub(crate) fn resident_bytes(_ptr: *mut u8, _len: usize) -> Result<usize> {
+    Err(Error::new(
+        ErrorKind::Unsupported,
+        "counting resident shared-memory pages is Linux only",
+    ))
+}
+
 fn filetime(t: FILETIME) -> u64 {
     (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)
 }

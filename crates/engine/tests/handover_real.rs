@@ -10,7 +10,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, EngineOptions, Error, FamilyOptions, ValueRef, WriteBatch};
+use pigeonhole_engine::{
+    ArenaDiscard, Engine, EngineOptions, Error, FamilyOptions, ValueRef, WriteBatch,
+};
 use pigeonhole_format::Durability;
 use pigeonhole_io::{OpenOptions, VfsRef};
 use pigeonhole_shm::{Presence, WriterLock};
@@ -218,6 +220,116 @@ fn a_reader_closing_during_a_real_file_handover_is_not_last() {
         .unwrap();
     let t2 = db2.table("t").unwrap();
     put_sync(&db2, &t2, "b");
+    drop(db);
+    db2.close().unwrap();
+}
+
+/// The memory release after a handover on a real region (D265, #620 PR 2a): on Linux the
+/// arena pages are resident after commits and freed (`madvise(MADV_REMOVE)`, `mincore`)
+/// once the reopen superseded the region; macOS cannot free a POSIX shared-memory object's
+/// pages and says so (`Refused`, with the error).
+#[test]
+fn the_arena_pages_are_freed_after_the_reopen() {
+    let dir = TempDir::new("release");
+    let path = dir.db();
+    let vfs = real_vfs();
+    let db = Engine::open(&path, options(Arc::clone(&vfs))).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..256 {
+        put_sync(&db, &t, &format!("row{i:04}"));
+    }
+    let resident = db.arena_resident_bytes();
+    if cfg!(target_os = "linux") {
+        assert!(resident.as_ref().is_ok_and(|b| *b > 0), "{resident:?}");
+    } else {
+        assert!(
+            matches!(resident, Err(Error::Io(ref e)) if e.kind == pigeonhole_io::ErrorKind::Unsupported),
+            "{resident:?}"
+        );
+    }
+    let (closed, h) = db.close_for_reopen();
+    closed.unwrap();
+    assert_eq!(db.memory_release().arenas, ArenaDiscard::Pending);
+    let db2 = Engine::open_with(&path, options(Arc::clone(&vfs)), h.unwrap())
+        .map_err(|(e, _)| e)
+        .unwrap();
+    db.release_memory();
+    let released = db.memory_release();
+    assert_eq!((released.view_memtables, released.view_ssts), (0, 0));
+    if cfg!(target_os = "linux") {
+        assert_eq!(released.arenas, ArenaDiscard::Discarded, "{released:?}");
+        assert_eq!(db.arena_resident_bytes().unwrap(), 0);
+    } else {
+        assert_eq!(released.arenas, ArenaDiscard::Refused, "{released:?}");
+        assert!(released.arena_error.is_some(), "{released:?}");
+    }
+    let t2 = db2.table("t").unwrap();
+    let snap = db2.snapshot().unwrap();
+    for i in 0..256 {
+        let row = format!("row{i:04}");
+        assert!(
+            db2.get(&snap, t2.id, t2.families[0].id, row.as_bytes(), b"q")
+                .unwrap()
+                .is_some(),
+            "{row} survives the reopen"
+        );
+    }
+    drop(snap);
+    put_sync(&db2, &t2, "after");
+    drop(db);
+    db2.close().unwrap();
+}
+
+/// perf287's R1 on a real region: a reader process's snapshot from before the discard
+/// expires with `SnapshotExpired` after the reopen (on Linux over the real
+/// `madvise(MADV_REMOVE)`), and a new snapshot re-attaches and reads every row.
+#[test]
+fn a_real_reader_snapshot_from_before_the_discard_expires_and_a_new_one_reads_every_row() {
+    let dir = TempDir::new("reader-release");
+    let path = dir.db();
+    let vfs = real_vfs();
+    let db = Engine::open(&path, options(Arc::clone(&vfs))).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..256 {
+        put_sync(&db, &t, &format!("row{i:04}"));
+    }
+    let reader = Engine::open_reader(&path, options(Arc::clone(&vfs))).unwrap();
+    let rt = reader.table("t").unwrap();
+    let old_snap = reader.snapshot().unwrap();
+    let read = |snap: &pigeonhole_engine::Snapshot, row: &str| {
+        reader.get(snap, rt.id, rt.families[0].id, row.as_bytes(), b"q")
+    };
+    assert!(read(&old_snap, "row0000").unwrap().is_some());
+    let (closed, h) = db.close_for_reopen();
+    closed.unwrap();
+    let db2 = Engine::open_with(&path, options(Arc::clone(&vfs)), h.unwrap())
+        .map_err(|(e, _)| e)
+        .unwrap();
+    db.release_memory();
+    let released = db.memory_release();
+    if cfg!(target_os = "linux") {
+        assert_eq!(released.arenas, ArenaDiscard::Discarded, "{released:?}");
+    } else {
+        assert_eq!(released.arenas, ArenaDiscard::Refused, "{released:?}");
+    }
+    for i in 0..256 {
+        let row = format!("row{i:04}");
+        match read(&old_snap, &row) {
+            Err(Error::SnapshotExpired) => {}
+            other => panic!("{row} through the old reader snapshot after the release: {other:?}"),
+        }
+    }
+    let snap = reader.snapshot().expect("re-attach to the new generation");
+    for i in 0..256 {
+        let row = format!("row{i:04}");
+        assert!(read(&snap, &row).unwrap().is_some(), "{row}");
+    }
+    drop((snap, old_snap));
+    reader.close().unwrap();
     drop(db);
     db2.close().unwrap();
 }

@@ -881,6 +881,7 @@ impl Engine {
             // Filled as the last step of the open (`held`).
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
+            arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -939,6 +940,15 @@ impl Engine {
         live_views.on_oldest_released(Box::new(move || {
             if let Some(shared) = weak.upgrade() {
                 shared.try_reclaim();
+            }
+        }));
+        // A closed instance whose last view outlived its close releases its memory once the
+        // view goes (D265): the arena pages are discarded only under the registry's lock, when
+        // no view can read them.
+        let weak = Arc::downgrade(&shared);
+        live_views.on_all_released(Box::new(move || {
+            if let Some(shared) = weak.upgrade() {
+                shared.release_memory();
             }
         }));
         let mut states: Vec<ShardState> = Vec::with_capacity(shards);
@@ -1451,6 +1461,7 @@ impl Engine {
             tail_index: false,
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
+            arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -2431,6 +2442,9 @@ impl Engine {
             );
         }
         let (result, started_here) = self.inner.close_with(true, true);
+        // The instance is closed either way: release what it holds (the view, the caches;
+        // the arenas once the reopen supersedes the region and no view lives).
+        self.inner.shared.release_memory();
         if !started_here {
             return (result, None);
         }
@@ -2448,6 +2462,26 @@ impl Engine {
                 path: self.inner.path.clone(),
             }),
         )
+    }
+
+    /// Releases what a closed writer still holds that is large, so a handle that keeps it
+    /// alive keeps only a light shell (D265): the last view (its frozen memtables, open SSTs
+    /// and the blocks they pin), the block and row caches, and the memtable arenas' pages.
+    /// [`Engine::close_for_reopen`] runs it; call it again once the reopen ([`Engine::open_with`])
+    /// succeeded, since the arenas are freed only when no other process can take the region
+    /// for current (the reopen's new generation supersedes it) and no in-process view lives
+    /// (a snapshot from before the close holds one: then the release runs when the last
+    /// goes). Linux frees the arena pages; macOS and Windows cannot (they stay until the
+    /// last handle and snapshot drop). A no-op on an open instance, on a reader and on an
+    /// application-owned engine (the application drives its close); a plain [`Engine::close`]
+    /// releases nothing, unless a `close_for_reopen` raced it (that call releases after the
+    /// close it waited for). For `pigeonhole`'s
+    /// automatic recovery (#620); not a stable API.
+    #[doc(hidden)]
+    pub fn release_memory(&self) {
+        if self.inner.role == Role::Writer && !self.inner.application_owned {
+            self.inner.shared.release_memory();
+        }
     }
 
     /// Waits until this instance records a failure ([`Engine::is_failed`]; `true`, at once if
