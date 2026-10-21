@@ -270,10 +270,12 @@ pub struct CrossShardMetrics {
     /// older share chained behind them (D267).
     pub wounds: u64,
     /// The most attempts (two-phase rounds) one committed cross-shard commit that only
-    /// writes took, over every coordinator since open.
+    /// writes took, over every coordinator since open (ICR 0056). Only commits that
+    /// committed count: one that gave up with `Busy` at the write-stall timeout never shows
+    /// here, so read it together with the `Busy` failures.
     pub max_attempts_blind: u64,
     /// The same for commits that read (validated reads): with no hard bound on their
-    /// refusals (D249, D263, D267), the worst case seen.
+    /// refusals (D249, D263, D267), the worst case seen. Committed commits only, as above.
     pub max_attempts_reading: u64,
 }
 

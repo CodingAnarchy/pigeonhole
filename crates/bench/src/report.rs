@@ -714,7 +714,7 @@ pub struct Stalls {
     pub xshard_wounds: u64,
     /// The most attempts one committed cross-shard commit took, for commits that only write
     /// and for commits that read. Not counts: the largest since the store opened, load and
-    /// warmup included.
+    /// warmup included. Committed commits only: read beside `busy_retries`.
     #[serde(default)]
     pub xshard_max_attempts_blind: u64,
     /// See [`Stalls::xshard_max_attempts_blind`].

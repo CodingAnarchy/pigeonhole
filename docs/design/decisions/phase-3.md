@@ -2229,10 +2229,10 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - **Recovery** needs nothing new.
   - Several undecided PREPAREs on one row in one stream (D263 had at most one) are each resolved by their coordinator's record, and applied at its own `(S, T)`.
   - A chained share has no decision until the share ahead of it is decided, so a crash mid-chain either drops it or applies it above that share.
-- **Counters,** in the engine and public crates:
+- **Counters,** in the engine and public crates (ICR 0056):
   - `CrossShardMetrics::chained`: PREPAREs admitted behind an undecided share or a waiting single.
   - `wounds`: younger undecided shares wounded.
-  - `max_attempts_blind` and `max_attempts_reading`: the most attempts one committed cross-shard commit took, since open.
+  - `max_attempts_blind` and `max_attempts_reading`: the most attempts one committed cross-shard commit took, since open. Only committed commits count; one that gave up with `Busy` never shows, so read them with the `Busy` failures.
   - The bench reports all four in its stalls detail (`xshard_*`).
 
 **Why:** #816. Under D263 a PREPARE overlapping any undecided share was refused, so cross-shard commits on a hot row ran one at a time, each taking a full undecided window (about 0.5 ms with application-owned inline driving). A herd of retries then multiplied the rounds: about 4.8 attempts per commit.

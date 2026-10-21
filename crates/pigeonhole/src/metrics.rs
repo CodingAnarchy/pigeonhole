@@ -228,10 +228,13 @@ pub struct CrossShardMetrics {
     /// behind them could go first (D267). Each is retried.
     pub wounds: u64,
     /// The most attempts (two-phase rounds) one committed cross-shard commit that only
-    /// writes took. Not cumulative: the largest since open.
+    /// writes took. Not cumulative: the largest since open. Only commits that committed
+    /// count: one that gave up with `ErrorCode::Busy` at the write-stall timeout never
+    /// shows here, so read it together with the `Busy` failures your application saw.
     pub max_attempts_blind: u64,
     /// The same for commits that read (a transaction's validated reads), whose refusals
-    /// have no hard bound: the worst case seen since open.
+    /// have no hard bound: the worst case seen since open. Committed commits only, as
+    /// above.
     pub max_attempts_reading: u64,
 }
 
