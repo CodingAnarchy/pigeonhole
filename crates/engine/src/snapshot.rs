@@ -1017,6 +1017,9 @@ pub(crate) struct LiveSnapshot {
     pub count: Arc<AtomicUsize>,
     /// The region generation the snapshot was taken in: its pin lives there.
     pub shm: ShmRegion,
+    /// The slot holding the pin: if the writer judged this process dead and freed it, the
+    /// pin protects nothing any more (#834 review).
+    pub slot: pigeonhole_shm::SlotOwnership,
 }
 
 impl LiveSnapshot {
@@ -1030,6 +1033,13 @@ impl LiveSnapshot {
         // Orders the read's loads (shared-memory arenas included) before the state load.
         std::sync::atomic::fence(Ordering::Acquire);
         if self.shm.is_stale() {
+            return Err(Error::SnapshotExpired);
+        }
+        // The same argument for the slot: the writer frees a slot it judged dead before it
+        // reclaims anything the slot's pins held, so a read that finished while the slot was
+        // still this process's read what the snapshot names. A false "dead" (a hidden or
+        // foreign-namespace pid) costs an expired snapshot, not wrong rows.
+        if !self.slot.is_current() {
             return Err(Error::SnapshotExpired);
         }
         Ok(())

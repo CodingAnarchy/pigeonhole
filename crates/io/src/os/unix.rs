@@ -498,26 +498,33 @@ pub(crate) fn resident_bytes(_ptr: *mut u8, _len: usize) -> Result<usize> {
     ))
 }
 
-/// Start time of `pid` in clock ticks since boot (field 22 of `/proc/<pid>/stat`), or
-/// `None` if the process is gone or a zombie.
+/// What `/proc/<pid>/stat` says: `Some(Alive(start))` with the start time in clock ticks
+/// since boot (field 22), `Some(Dead)` for a zombie, or `None` if it can't be read: the
+/// process is gone, or `/proc` hides it (`hidepid`, another user's process).
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn proc_start_time(pid: u32) -> Option<u64> {
+fn proc_liveness(pid: u32) -> Option<Liveness> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     // The command name (field 2) is parenthesized and may contain spaces.
     let rest = &stat[stat.rfind(')')? + 1..];
     let mut fields = rest.split_ascii_whitespace();
     let state = fields.next()?; // field 3
     if state == "Z" || state == "X" {
-        return None;
+        return Some(Liveness::Dead);
     }
-    fields.nth(18)?.parse().ok() // field 22
+    Some(Liveness::Alive(Some(fields.nth(18)?.parse().ok()?))) // field 22
 }
 
+/// `/proc` first, for the start time (which catches a reused pid); where `/proc` can't show
+/// the process, `kill(pid, 0)`. Under `hidepid` another user's live reader is invisible in
+/// `/proc`, and reading that as dead would free a live reader's slot (#834 review).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn process_liveness(pid: u32) -> Liveness {
-    match proc_start_time(pid) {
-        Some(t) => Liveness::Alive(Some(t)),
-        None => Liveness::Dead,
+    if let Some(l) = proc_liveness(pid) {
+        return l;
+    }
+    match libc::pid_t::try_from(pid) {
+        Ok(p) => kill_probe(p),
+        Err(_) => Liveness::Dead,
     }
 }
 
@@ -558,8 +565,8 @@ pub(crate) fn process_liveness(pid: u32) -> Liveness {
     }
 }
 
-/// `kill(pid, 0)`: alive (start time unknown) unless the pid does not exist.
-#[cfg(not(any(target_os = "linux", target_os = "android")))]
+/// `kill(pid, 0)`: alive (start time unknown) unless the pid does not exist. `EPERM` (a
+/// process of another user) is alive.
 fn kill_probe(pid: libc::pid_t) -> Liveness {
     if pid <= 0 {
         return Liveness::Dead;
@@ -828,4 +835,32 @@ pub(crate) fn direct_align(file: &fs::File) -> usize {
     #[cfg(not(target_os = "linux"))]
     let _ = file;
     4096
+}
+
+#[cfg(all(test, not(miri)))]
+mod liveness_tests {
+    use super::*;
+
+    /// #834 review: `kill(pid, 0)` failing with `EPERM` (another user's process, which
+    /// `hidepid` also hides from `/proc`) is alive. Pid 1 is root's: any other user gets
+    /// `EPERM`, root gets success; alive either way.
+    #[test]
+    fn kill_probe_reads_eperm_as_alive() {
+        assert_eq!(kill_probe(1), Liveness::Alive(None));
+        assert_eq!(kill_probe(0), Liveness::Dead);
+    }
+
+    #[test]
+    fn a_reaped_process_is_dead() {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        // The pid could be reused in between; not within a test's few microseconds.
+        assert_eq!(kill_probe(pid as libc::pid_t), Liveness::Dead);
+        assert_eq!(process_liveness(pid), Liveness::Dead);
+        assert!(matches!(
+            process_liveness(std::process::id()),
+            Liveness::Alive(_)
+        ));
+    }
 }

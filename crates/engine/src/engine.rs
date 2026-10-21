@@ -3873,6 +3873,14 @@ impl Inner {
                 *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 // Start the new generation from the new writer's root.
                 r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
+            } else if !a.slot.is_owned() {
+                // The writer judged this process dead and freed the slot (#834 review): its
+                // snapshots now fail as expired, and pinning there could overwrite another
+                // reader's pins. Claim a fresh slot; dropping the old handle leaves the old
+                // slot alone, since it no longer names this process.
+                a.slot = a.shm.claim_reader_slot(self.shared.vfs.current_process())?;
+                a.pinned = false;
+                a.live = Arc::new(AtomicUsize::new(0));
             }
             // The pin protects the oldest live snapshot and every newer view. While snapshots
             // of this generation are alive it stays put; once none is left it moves forward to
@@ -3903,6 +3911,7 @@ impl Inner {
             let live = Arc::new(LiveSnapshot {
                 count: Arc::clone(&a.live),
                 shm: a.shm.clone(),
+                slot: a.slot.ownership(),
             });
             let shm = a.shm.clone();
             drop(guard);

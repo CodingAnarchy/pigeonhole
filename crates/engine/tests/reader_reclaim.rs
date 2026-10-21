@@ -7,7 +7,9 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, EngineOptions, FamilyOptions, TableInfo, ValueRef, WriteBatch};
+use pigeonhole_engine::{
+    Engine, EngineOptions, Error, FamilyOptions, TableInfo, ValueRef, WriteBatch,
+};
 use pigeonhole_format::Durability;
 use pigeonhole_io::ProcessId;
 use pigeonhole_io::sim::SimVfs;
@@ -140,6 +142,94 @@ fn a_killed_readers_slot_is_freed_and_a_live_readers_is_kept() {
     );
     drop(live_snap);
     drop(live);
+    vfs.enter_process(WRITER);
+    db.close().unwrap();
+}
+
+/// #834 review, R1b: a reader judged dead while it is alive (a pid `/proc` hides, another
+/// PID namespace) loses its slot, and that costs it an expired snapshot, never wrong rows or
+/// another reader's slot: its reads through the old snapshot fail `SnapshotExpired`, its
+/// next snapshot claims a fresh slot without touching the pins of the reader that took the
+/// old one, and dropping it leaves that reader's slot alone.
+#[test]
+fn a_falsely_dead_reader_expires_and_never_touches_the_slot_reused_under_it() {
+    let vfs = SimVfs::new(834);
+    vfs.enter_process(WRITER);
+    let db = Engine::open(Path::new(DB), options(&vfs)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (tid, fid) = (t.id, t.families[0].id);
+    write_rows(&db, &t, 0..500);
+
+    vfs.enter_process(READER);
+    let zombie = Engine::open_reader(Path::new(DB), options(&vfs)).unwrap();
+    let old = zombie.snapshot().unwrap();
+    assert!(
+        zombie
+            .get(&old, tid, fid, b"row00001", b"q")
+            .unwrap()
+            .is_some()
+    );
+
+    // The writer comes to believe the reader is dead (its handles keep working) and frees
+    // its slot at the next reclamation past the interval.
+    vfs.kill_process(READER);
+    vfs.enter_process(WRITER);
+    vfs.advance(PAST_INTERVAL);
+    write_rows(&db, &t, 500..1500);
+    db.flush().unwrap();
+    assert_eq!(db.reader_pin_and_view().0, None, "the slot was not freed");
+
+    // Its reads through the old snapshot now fail, typed.
+    vfs.enter_process(READER);
+    assert!(matches!(
+        zombie.get(&old, tid, fid, b"row00001", b"q"),
+        Err(Error::SnapshotExpired)
+    ));
+
+    // Another reader takes the freed slot and pins the current view.
+    vfs.enter_process(OTHER_READER);
+    let other = Engine::open_reader(Path::new(DB), options(&vfs)).unwrap();
+    let other_snap = other.snapshot().unwrap();
+    vfs.enter_process(WRITER);
+    let (Some(other_pin), _) = db.reader_pin_and_view() else {
+        panic!("the new reader pins nothing");
+    };
+
+    // The zombie's next snapshot claims a fresh slot and reads; the other reader's pin is
+    // untouched.
+    vfs.enter_process(READER);
+    let fresh = zombie.snapshot().unwrap();
+    assert!(
+        zombie
+            .get(&fresh, tid, fid, b"row01400", b"q")
+            .unwrap()
+            .is_some()
+    );
+    vfs.enter_process(WRITER);
+    assert_eq!(db.reader_pin_and_view().0, Some(other_pin));
+
+    // Dropping every zombie handle releases only what is still its own.
+    vfs.enter_process(READER);
+    drop(old);
+    drop(fresh);
+    drop(zombie);
+    vfs.enter_process(WRITER);
+    assert_eq!(
+        db.reader_pin_and_view().0,
+        Some(other_pin),
+        "the zombie's drop freed or cleared the other reader's slot"
+    );
+    vfs.enter_process(OTHER_READER);
+    assert!(
+        other
+            .get(&other_snap, tid, fid, b"row01400", b"q")
+            .unwrap()
+            .is_some()
+    );
+    drop(other_snap);
+    drop(other);
     vfs.enter_process(WRITER);
     db.close().unwrap();
 }
