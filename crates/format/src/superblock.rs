@@ -202,6 +202,11 @@ impl Superblock {
     /// ```
     pub fn choose(a: crate::Result<Self>, b: crate::Result<Self>) -> crate::Result<(Self, u64)> {
         match (a, b) {
+            // A slot with a valid checksum but a newer version was written by a newer build
+            // (an upgrade that may have finished only that slot): never pass it over for the
+            // older slot, whose root that build may already have freed (#496).
+            (Err(e @ Error::UnsupportedVersion { .. }), _)
+            | (_, Err(e @ Error::UnsupportedVersion { .. })) => Err(e),
             (Ok(a), Ok(b)) if b.sequence > a.sequence => Ok((b, SUPERBLOCK_PAGE_B)),
             (Ok(a), _) => Ok((a, SUPERBLOCK_PAGE_A)),
             (Err(_), Ok(b)) => Ok((b, SUPERBLOCK_PAGE_B)),

@@ -1235,12 +1235,16 @@ impl WalScan {
         let mut off = 0;
         while off + probe.len() as u64 <= len {
             self.file.read_at(&mut probe, off)?;
-            if let Ok(h) = SegmentHeader::decode(&probe)
-                && h.segment_size > 0
-                && off.is_multiple_of(h.segment_size)
-            {
-                segment_size = Some(h.segment_size);
-                break;
+            match SegmentHeader::decode(&probe) {
+                Ok(h) if h.segment_size > 0 && off.is_multiple_of(h.segment_size) => {
+                    segment_size = Some(h.segment_size);
+                    break;
+                }
+                // A newer build's segment: the check can't judge it (as for the superblock).
+                Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) => {
+                    return Err(Error::UnsupportedFormat(found));
+                }
+                _ => {}
             }
             off += FRAME;
         }
@@ -1274,6 +1278,10 @@ impl WalScan {
                     None
                 }
                 Ok(h) => Some(h),
+                // A newer build's segment: the check can't judge it (as for the superblock).
+                Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) => {
+                    return Err(Error::UnsupportedFormat(found));
+                }
                 // Blank, or a torn header write: an unused slot.
                 Err(_) => None,
             });
