@@ -272,7 +272,7 @@ impl Pigeonhole {
     /// Dropping it does not stop the flush.
     pub fn flush_async(&self) -> MaintenanceFuture {
         MaintenanceFuture {
-            inner: self.db.engine().submit_flush().map_err(|e| Some(e.into())),
+            inner: self.engine().submit_flush().map_err(|e| Some(e.into())),
         }
     }
 

@@ -182,7 +182,7 @@ impl Selection {
                 core.db.check_snapshot(&s)?;
                 s.inner
             }
-            None => core.db.engine().snapshot()?,
+            None => core.engine().snapshot()?,
         };
         let info = core.current_info();
         let mut ids = SmallVec::new();
@@ -341,7 +341,7 @@ impl<'t> RowRead<'t> {
         // The engine resolves the cells straight into the row this returns (#287): no
         // intermediate row and no second copy of each cell.
         let mut buf = RowBuf::new(info, 0);
-        let (engine, table) = (&self.core.db.engine(), self.core.info.id);
+        let (engine, table) = (&self.core.engine(), self.core.info.id);
         let any = match &snapshot {
             None => engine.read_row_latest_into(
                 table,
@@ -378,7 +378,7 @@ impl RowRead<'_> {
                 None => self.sel.start_latest(self.core)?,
                 Some(_) => None,
             };
-            let (engine, table) = (&self.core.db.engine(), self.core.info.id);
+            let (engine, table) = (&self.core.engine(), self.core.info.id);
             Ok(match latest {
                 Some((info, families)) => engine.read_row_latest_async(
                     table,
@@ -627,7 +627,7 @@ mod tests {
             .create_if_missing()
             .unwrap();
         t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
-        let engine = Arc::clone(&t.core.db.engine());
+        let engine = t.core.engine().to_arc();
         let table = t.core.info.id;
         engine.on_next(
             pigeonhole_engine::HookSite::LatestViewLoad,
