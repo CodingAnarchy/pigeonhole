@@ -5501,6 +5501,19 @@ impl ShardState {
                     apply_seqno,
                 } => {
                     if let Some(t) = m.ticket {
+                        // A coordinator is always a participant (the first shard of its
+                        // commit's split; a retry re-splits and re-routes), and it logs its
+                        // own PREPARE, a validation-only one too, before it decides. Undecided
+                        // until the `Decide` this record's resolution sends, that PREPARE is
+                        // still in the log: it precedes the COMMIT and waits on every other
+                        // holder, so the COMMIT's own check (`needed`) is defence in depth.
+                        debug_assert!(
+                            self.log_cross.contains_key(&m.seqno)
+                                && !self.share_seqnos.contains_key(&m.seqno),
+                            "shard {}: COMMIT {} logged without its own undecided PREPARE",
+                            self.id.0,
+                            m.seqno
+                        );
                         let kind = LoggedKind::Commit {
                             holders: Arc::clone(participants),
                             apply: Some(*apply_seqno),
@@ -7266,6 +7279,9 @@ impl ShardState {
                     || self.peers_behind(holders, *at).next().is_some()
                     || (*replayed && self.own_behind(*at))
             }
+            // Never the record that decides a live commit: its own PREPARE precedes it and
+            // waits on the same holders (asserted where the COMMIT is logged). A replayed one
+            // may have lost that PREPARE to an earlier checkpoint, and waits on its own.
             LoggedKind::Commit {
                 holders,
                 apply,
