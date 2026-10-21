@@ -858,6 +858,8 @@ Proposed decision: amend D124 and D126 so that `flush` and `compact` wait for ar
 
 **Coordinator:** confirmed; this amends D124 and D126: `flush` and `compact` wait for arena room as a stalled write does and end with `Busy` on the same terms, never `Ok` with data left unflushed.
 
+**Corrected (#724 area 3, owner 2026-10-21):** the idle case is now the same as a stalled write's. The callers also wait while a cross-shard share is undecided, or a group's sync is in flight, on this shard (`ShardState::nothing_in_flight`, which both waits use). The decision arrives as a message and may free room. The starved freeze used to refuse at once in that state, whereas a stalled write waited.
+
 <a id="d139"></a>
 ## D139 — Where do tablets go at open, now that owners are not persisted (D130) (approved; engine)
 D130 re-derives every owner as `tablet % shards`. After splits, a reopen with fewer shards can put more `(tablet, family)` slots on one shard than its arena has chunks: a 20-family table split into four tablets is 80 slots, all on shard 0 of a one-shard reopen, against 64 chunks at a 4 MiB budget. A commit writing all of them, or a freeze of all of them, then never finds room, and that shard can neither shed slots nor receive moves (D136's `max_slots` refuses both).

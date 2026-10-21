@@ -2151,15 +2151,18 @@ struct ArenaNeed {
     alloc_chunks: usize,
 }
 
-/// A shard's wait for a flush to free memtable arena room (a write stall, counted in the
-/// metrics, from the first member that waits until none does). Each waiting member is
-/// refused with `Busy` once it has waited `write_stall_timeout_nanos` itself (D124, D240).
-/// On a frozen clock every waiting member is also refused after `ROOM_FLUSH_ATTEMPTS`
-/// failed flushes in a row, or at once when nothing can free room (issue #70).
+/// A wait for a flush to free memtable arena room, with its timers: a commit's (a write
+/// stall, counted in the metrics, from the first member that waits until none does,
+/// `ShardState::room_wait`) or a `flush` or `compact` caller's while a freeze of every
+/// memtable is starved of chunks (`ShardState::starve_wait`). Each waiter is refused with
+/// `Busy` once it has waited `write_stall_timeout_nanos` itself (D124, D240). On a frozen
+/// clock every waiter is also refused at once when nothing in flight can free room
+/// (`ShardState::nothing_in_flight`, issues #70 and #116), and a commit after
+/// `ROOM_FLUSH_ATTEMPTS` failed flushes in a row.
 #[derive(Debug)]
-struct RoomWait {
+struct StallWait {
     since: u64,
-    /// The timeout timer.
+    /// The timeout timer, armed for the oldest waiter's deadline.
     timer: Arc<TimerState>,
     failed_flushes: u32,
     /// On a moving clock, kicks the shard to look for room again: room freed by a snapshot
@@ -2169,7 +2172,25 @@ struct RoomWait {
     recheck_nanos: u64,
 }
 
-impl RoomWait {
+/// Spawns a timer that kicks shard `me` at `at`.
+fn arm_kick(
+    vfs: &VfsRef,
+    at: u64,
+    ctx: &mut ShardContext<'_, ShardMsg>,
+    me: ShardId,
+) -> Arc<TimerState> {
+    let state = TimerState::new();
+    ctx.spawn(Box::new(ClockTimer::new(
+        vfs,
+        at,
+        Arc::clone(&state),
+        ctx.submitter(me).clone(),
+        ShardMsg::Kick,
+    )));
+    state
+}
+
+impl StallWait {
     fn new(since: u64, timer: Arc<TimerState>) -> Self {
         Self {
             since,
@@ -2177,6 +2198,48 @@ impl RoomWait {
             failed_flushes: 0,
             recheck: None,
             recheck_nanos: 0,
+        }
+    }
+
+    /// A wait beginning at `now`, its timeout timer armed for `deadline`.
+    fn start(
+        now: u64,
+        deadline: u64,
+        vfs: &VfsRef,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+        me: ShardId,
+    ) -> Self {
+        Self::new(now, arm_kick(vfs, deadline, ctx, me))
+    }
+
+    /// Arms the timeout timer for `deadline` in place of the current one.
+    fn arm_timeout(
+        &mut self,
+        deadline: u64,
+        vfs: &VfsRef,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+        me: ShardId,
+    ) {
+        self.timer.cancel();
+        self.timer = arm_kick(vfs, deadline, ctx, me);
+    }
+
+    /// The timeout timer fired for an earlier waiter's deadline, or gave up on a clock that
+    /// has moved since (`frozen` false): it is armed again for the oldest waiter's, which
+    /// began at `oldest`, unless that has passed too (the caller refuses its waiter).
+    #[allow(clippy::too_many_arguments)]
+    fn rearm_if_fired(
+        &mut self,
+        frozen: bool,
+        now: u64,
+        oldest: u64,
+        timeout: u64,
+        vfs: &VfsRef,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+        me: ShardId,
+    ) {
+        if self.timer.finished() && !frozen && now.saturating_sub(oldest) < timeout {
+            self.timer = arm_kick(vfs, oldest.saturating_add(timeout), ctx, me);
         }
     }
 
@@ -2200,19 +2263,14 @@ impl RoomWait {
                 .saturating_mul(2)
                 .min(base.saturating_mul(ROOM_RECHECK_CAP))
         };
-        let state = TimerState::new();
-        ctx.spawn(Box::new(ClockTimer::new(
-            vfs,
-            ctx.now_nanos().saturating_add(self.recheck_nanos),
-            Arc::clone(&state),
-            ctx.submitter(me).clone(),
-            ShardMsg::Kick,
-        )));
-        self.recheck = Some(state);
+        let at = ctx.now_nanos().saturating_add(self.recheck_nanos);
+        self.recheck = Some(arm_kick(vfs, at, ctx, me));
     }
 
     /// Whether the clock stopped at `now`: the timeout or the re-check timer gave up on this
-    /// reading.
+    /// reading. The re-check timer counts too (#244): the timeout timer may have seen the
+    /// clock move and be asleep towards a deadline the clock never reaches, and a shard
+    /// kicked by each re-check never goes idle for it to be polled and notice.
     fn stopped(&self, now: u64) -> bool {
         self.timer.frozen(now) || self.recheck.as_ref().is_some_and(|t| t.frozen(now))
     }
@@ -2560,7 +2618,7 @@ pub(crate) struct ShardState {
     /// A group is deferred until a flush frees arena room.
     wait_room: bool,
     /// The wait for arena room in progress: when it began and its timeout timer.
-    room_wait: Option<RoomWait>,
+    room_wait: Option<StallWait>,
     /// A freeze waits for the watermark to pass the memtable (registered in `Shared`).
     freeze_deferred: bool,
     /// A freeze of every memtable (`flush`, `compact`, close) is still owed: some memtable
@@ -2572,7 +2630,7 @@ pub(crate) struct ShardState {
     starved_all: bool,
     /// The wait of `flush` and `compact` callers for a chunk (`starved_all`): when it
     /// began and its timeout timer. It ends with `Busy` as a write stall does (D124, D126).
-    starve_wait: Option<RoomWait>,
+    starve_wait: Option<StallWait>,
     /// A flush failed while closing: the close gives up on flushing (the WAL keeps the data)
     /// and is not clean.
     flush_failed: bool,
@@ -4062,6 +4120,20 @@ impl ShardState {
             && self.memtables.values().all(|s| s.frozen.is_empty())
     }
 
+    /// Nothing in flight that this shard will hear of can free arena room: no flush running
+    /// or queued, no deferred freeze, no undecided share (its decision may abort it and free
+    /// its reservation), no group whose sync is in flight, and no retired memtable a reader
+    /// process still pins. On a frozen clock a stall wait refuses its waiters then (issues
+    /// #70 and #116): in-process snapshots, which only they can drop, hold the rest.
+    fn nothing_in_flight(&self) -> bool {
+        !self.flush_running
+            && self.flush_queue.is_empty()
+            && !self.freeze_deferred
+            && self.prepared.is_empty()
+            && self.unresolved.is_empty()
+            && self.retired.is_empty()
+    }
+
     fn check_flush_waiters(&mut self) {
         if self.freeze_all_pending || self.starved_all || !self.to_freeze.is_empty() {
             return;
@@ -4103,54 +4175,26 @@ impl ShardState {
         }
         let now = ctx.now_nanos();
         let timeout = self.shared.write_stall_timeout_nanos;
-        let arm = |since: u64, ctx: &mut ShardContext<'_, ShardMsg>| {
-            let state = TimerState::new();
-            ctx.spawn(Box::new(ClockTimer::new(
-                &self.shared.vfs,
-                since.saturating_add(timeout),
-                Arc::clone(&state),
-                ctx.submitter(self.id).clone(),
-                ShardMsg::Kick,
-            )));
-            state
-        };
+        let me = self.id;
         let (since, frozen) = match &self.starve_wait {
             None => {
-                let timer = arm(now, ctx);
-                self.starve_wait = Some(RoomWait::new(now, timer));
+                let w =
+                    StallWait::start(now, now.saturating_add(timeout), &self.shared.vfs, ctx, me);
+                self.starve_wait = Some(w);
                 (now, false)
             }
-            // Either timer giving up on this reading means the clock stopped (#244).
             Some(w) => (w.since, w.stopped(now)),
         };
         // Each caller waits `timeout` itself (D240): from when it asked, or from when the
         // freeze starved if it asked before that.
         let oldest = self.starved_oldest(since);
-        if let Some(w) = &self.starve_wait
-            && w.timer.finished()
-            && !frozen
-            && now.saturating_sub(oldest) < timeout
-        {
-            // The timer fired for an earlier caller's deadline, or gave up on a clock that
-            // has moved since: it is armed again for the oldest caller's.
-            let timer = arm(oldest, ctx);
-            if let Some(w) = &mut self.starve_wait {
-                w.timer = timer;
+        let idle = frozen && self.nothing_in_flight();
+        if let Some(w) = &mut self.starve_wait {
+            w.rearm_if_fired(frozen, now, oldest, timeout, &self.shared.vfs, ctx, me);
+            if !frozen {
+                // As for a room wait: freed chunks are announced to nobody (issue #141).
+                w.arm_recheck(&self.shared.vfs, self.shared.room_recheck_nanos, ctx, me);
             }
-        }
-        let idle = frozen
-            && !self.flush_running
-            && self.flush_queue.is_empty()
-            && !self.freeze_deferred
-            && self.retired.is_empty();
-        if !frozen && let Some(w) = &mut self.starve_wait {
-            // As for a room wait: freed chunks are announced to nobody (issue #141).
-            w.arm_recheck(
-                &self.shared.vfs,
-                self.shared.room_recheck_nanos,
-                ctx,
-                self.id,
-            );
         }
         if idle {
             trace!(
@@ -4198,15 +4242,17 @@ impl ShardState {
             for (_, w, _) in refused {
                 w.notify(Err(Error::Busy));
             }
-            if let Some(w) = self.starve_wait.take() {
-                w.cancel();
-            }
             if self.flush_waiters.is_empty() && self.compact_all.is_empty() {
+                if let Some(w) = self.starve_wait.take() {
+                    w.cancel();
+                }
                 self.starved_all = false;
             } else {
-                let next = self.starved_oldest(since);
-                let timer = arm(next, ctx);
-                self.starve_wait = Some(RoomWait::new(since, timer));
+                // The next caller's deadline, as a room wait arms its next member's.
+                let next = self.starved_oldest(since).saturating_add(timeout);
+                if let Some(w) = &mut self.starve_wait {
+                    w.arm_timeout(next, &self.shared.vfs, ctx, me);
+                }
             }
         }
     }
@@ -5017,49 +5063,23 @@ impl ShardState {
             .min()
             .unwrap_or(now);
         // The clock has stopped if either of the wait's timers gave up on this reading.
-        // The re-check timer counts too (#244): the timeout timer may have seen the clock
-        // move and be asleep towards a deadline the clock never reaches, and a shard
-        // kicked by each re-check never goes idle for it to be polled and notice.
         let frozen = self.room_wait.as_ref().is_some_and(|w| w.stopped(now));
+        let me = self.id;
         let mut refuse = false;
-        match &self.room_wait {
+        match &mut self.room_wait {
             None => {
                 // The stall begins: count it, and arm the timeout.
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
                 metrics.stalls.fetch_add(1, Ordering::Relaxed);
-                let state = TimerState::new();
-                ctx.spawn(Box::new(ClockTimer::new(
-                    &self.shared.vfs,
-                    oldest.saturating_add(timeout),
-                    Arc::clone(&state),
-                    ctx.submitter(self.id).clone(),
-                    ShardMsg::Kick,
-                )));
-                self.room_wait = Some(RoomWait::new(now, state));
+                let deadline = oldest.saturating_add(timeout);
+                self.room_wait = Some(StallWait::start(now, deadline, &self.shared.vfs, ctx, me));
             }
             Some(w) if frozen && w.failed_flushes >= ROOM_FLUSH_ATTEMPTS => {
                 // On a frozen clock, which never reaches the timeout, the flushes keep
                 // failing (issue #70): every waiting member is refused.
                 refuse = true;
             }
-            Some(w) => {
-                // The timer fired for a deadline (or gave up on a clock that has moved
-                // since): it is armed again for the oldest waiter's deadline, unless that
-                // has passed (its members are refused below).
-                if w.timer.finished() && !frozen && now.saturating_sub(oldest) < timeout {
-                    let state = TimerState::new();
-                    ctx.spawn(Box::new(ClockTimer::new(
-                        &self.shared.vfs,
-                        oldest.saturating_add(timeout),
-                        Arc::clone(&state),
-                        ctx.submitter(self.id).clone(),
-                        ShardMsg::Kick,
-                    )));
-                    if let Some(w) = &mut self.room_wait {
-                        w.timer = state;
-                    }
-                }
-            }
+            Some(w) => w.rearm_if_fired(frozen, now, oldest, timeout, &self.shared.vfs, ctx, me),
         }
         // A flush frees room (one that failed is tried again), and so do empty slots.
         if self.retire_idle_slots().is_err() {
@@ -5084,18 +5104,11 @@ impl ShardState {
             }
         }
         self.spawn_flush(ctx);
-        // On a frozen clock, with no flush, deferred freeze, undecided share or unsynced
-        // group in flight and no retired memtable a reader process still pins, nothing
-        // the shard will hear of can free room (in-process snapshots hold what is left)
-        // and the timeout never comes: refuse now (issue #70). A moving clock waits for
-        // the timeout (D124), since a reader may release room meanwhile.
-        let mut idle = frozen
-            && !self.flush_running
-            && self.flush_queue.is_empty()
-            && !self.freeze_deferred
-            && self.prepared.is_empty()
-            && self.unresolved.is_empty()
-            && self.retired.is_empty();
+        // On a frozen clock with nothing in flight, nothing the shard will hear of can free
+        // room (in-process snapshots hold what is left) and the timeout never comes: refuse
+        // now (issue #70). A moving clock waits for the timeout (D124), since a reader may
+        // release room meanwhile.
+        let mut idle = frozen && self.nothing_in_flight();
         if idle && self.reserved > 0 {
             // This group's admitted members still hold their room reservations, which can
             // starve the freeze for a fresh memtable's chunk until they apply (below): look
@@ -5155,9 +5168,8 @@ impl ShardState {
             {
                 self.end_room_wait(now);
                 self.wait_room = false;
-            } else if let Some(w) = &self.room_wait {
+            } else {
                 // The next deadline: the timer that fired for this one is done.
-                w.timer.cancel();
                 let next = self
                     .pending
                     .iter()
@@ -5165,16 +5177,8 @@ impl ShardState {
                     .map(|m| room_since(m.room_since, now))
                     .min()
                     .unwrap_or(now);
-                let state = TimerState::new();
-                ctx.spawn(Box::new(ClockTimer::new(
-                    &self.shared.vfs,
-                    next.saturating_add(timeout),
-                    Arc::clone(&state),
-                    ctx.submitter(self.id).clone(),
-                    ShardMsg::Kick,
-                )));
                 if let Some(w) = &mut self.room_wait {
-                    w.timer = state;
+                    w.arm_timeout(next.saturating_add(timeout), &self.shared.vfs, ctx, me);
                 }
             }
         }
@@ -9347,7 +9351,7 @@ mod tests {
     /// suite, seed 53).
     #[test]
     fn a_room_wait_sees_a_stopped_clock_through_its_recheck_timer() {
-        let mut wait = RoomWait::new(10, TimerState::new());
+        let mut wait = StallWait::new(10, TimerState::new());
         assert!(!wait.stopped(50));
         // The timeout timer sleeps; the re-check timer gave up with the clock at 50.
         let recheck = TimerState::new();
@@ -9357,7 +9361,7 @@ mod tests {
         // Once the clock moves on, it is not stopped any more.
         assert!(!wait.stopped(51));
         // The timeout timer giving up counts as before.
-        let wait = RoomWait::new(10, TimerState::new());
+        let wait = StallWait::new(10, TimerState::new());
         wait.timer.give_up(60);
         assert!(wait.stopped(60));
     }

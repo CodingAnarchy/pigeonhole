@@ -243,7 +243,7 @@ The registry has one part per shard (`WatermarkWaiters::new(shards)`), each on i
 
 ### `TimerState` (timer_state.rs), shared between the shard and a `ClockTimer` background task (on the shard's scheduler, or a compaction pool thread when one is configured)
 
-The struct is held as `Arc<TimerState>` in `ShardState::flush_retry`, `backoff_timer`, `checkpoint_timer`, `tablet_timer` and `balance_timer`, in `RoomWait::timer`/`recheck`, and in `Stall::timer`.
+The struct is held as `Arc<TimerState>` in `ShardState::flush_retry`, `backoff_timer`, `checkpoint_timer`, `tablet_timer` and `balance_timer`, in `StallWait::timer`/`recheck` (`room_wait`, `starve_wait`), and in `Stall::timer`.
 
 | Name | Type | Protects / means | Writers | Readers | Ordering | Why / history |
 |---|---|---|---|---|---|---|
