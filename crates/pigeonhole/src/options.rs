@@ -43,6 +43,7 @@ pub struct Options {
     row_cache_max_row: Option<usize>,
     row_cache_families: Vec<(String, String)>,
     shm_dir: Option<PathBuf>,
+    reader_slots: u32,
     create_if_missing: bool,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     allow_unregistered_merge_operators: bool,
@@ -69,6 +70,14 @@ fn default_compaction_cores(shards: usize) -> usize {
 /// it answers about three gets in four from the cache; more memory buys few more hits.
 const DEFAULT_ROW_CACHE: usize = 64 << 20;
 
+/// Reader processes that can attach at once by default: 128 slots of 64 bytes, inside the
+/// padding before the 2 MiB-aligned arenas, so they cost no space.
+const DEFAULT_READER_SLOTS: u32 = 128;
+
+/// The most reader slots: 4 MiB of slots in the shared-memory file, which the writer scans
+/// for dead readers every 250 ms.
+const MAX_READER_SLOTS: u32 = 65_536;
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -82,6 +91,7 @@ impl Default for Options {
             row_cache_max_row: None,
             row_cache_families: Vec::new(),
             shm_dir: None,
+            reader_slots: DEFAULT_READER_SLOTS,
             create_if_missing: true,
             merge_operators: Vec::new(),
             allow_unregistered_merge_operators: false,
@@ -287,6 +297,26 @@ impl Options {
     /// memory-backed default.
     pub fn shm_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.shm_dir = Some(dir.into());
+        self
+    }
+
+    /// How many reader processes ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader))
+    /// can attach at once: default 128, at least 1, at most 65,536 (ICR 0055).
+    ///
+    /// Each attached reader handle holds one 64-byte slot in the shared-memory file. One more
+    /// fails `open_reader` with [`ErrorCode::NoReaderSlot`](crate::ErrorCode::NoReaderSlot)
+    /// at once, without waiting. The writer frees the slots of reader processes that exited
+    /// or were killed within about 250 ms. The count is fixed for a writer's lifetime: a
+    /// writer opened with another count builds its shared-memory file with that many.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().reader_slots(16);
+    /// # let _ = options;
+    /// ```
+    pub fn reader_slots(mut self, n: u32) -> Self {
+        self.reader_slots = n.clamp(1, MAX_READER_SLOTS);
         self
     }
 
@@ -745,6 +775,7 @@ impl Options {
         }
         o.row_cache_families = self.row_cache_families.clone();
         o.shm_dir.clone_from(&self.shm_dir);
+        o.reader_slots = self.reader_slots;
         o.allow_unregistered_merge = self.allow_unregistered_merge_operators;
         o.allow_fuse = self.allow_fuse;
         if let Some(bytes) = self.wal_segment_size {

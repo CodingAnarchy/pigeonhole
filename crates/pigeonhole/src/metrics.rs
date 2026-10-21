@@ -119,6 +119,21 @@ pub struct EngineMetrics {
     /// Blocking commit waits (`commit()`) that parked their thread after the short spin.
     /// Async commits never park.
     pub commit_parks: u64,
+    /// Gauge: reader processes attached ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)
+    /// handles holding a slot), out of [`reader_slots`](Self::reader_slots).
+    pub reader_slots_active: u64,
+    /// Gauge: the reader slot count ([`Options::reader_slots`](crate::Options::reader_slots)).
+    pub reader_slots: u64,
+    /// Reader slots freed because their process exited or was killed without closing.
+    pub reader_slots_reclaimed: u64,
+    /// Gauge: how many published views behind the current one the oldest reader snapshot is
+    /// (0 with none). A reader holding one snapshot for a long time keeps this growing; it
+    /// holds the memtables and file space since, and once the memtable budget is full,
+    /// commits wait and then fail `Busy` after `write_stall_timeout`.
+    pub reader_pin_view_lag: u64,
+    /// Gauge: how many sequence numbers behind the visible one the oldest reader snapshot is
+    /// (0 with none).
+    pub reader_pin_seqno_lag: u64,
     /// Gauge: threads the engine started (shard and compaction threads). 0 in
     /// application-owned mode or once closed.
     pub threads_started: u64,
@@ -247,6 +262,11 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             shard_spin_time_nanos: m.shard_spin_time_nanos,
             shard_commit_inflight_nanos: m.shard_commit_inflight_nanos,
             commit_parks: m.commit_parks,
+            reader_slots_active: m.reader_slots.0,
+            reader_slots: m.reader_slots.1,
+            reader_slots_reclaimed: m.reader_slots_reclaimed,
+            reader_pin_view_lag: m.reader_pin_lag.0,
+            reader_pin_seqno_lag: m.reader_pin_lag.1,
             // The engine fills `pinned_threads` as (pinned, started).
             threads_started: m.pinned_threads.1,
             threads_pinned: m.pinned_threads.0,

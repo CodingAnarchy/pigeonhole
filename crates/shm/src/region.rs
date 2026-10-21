@@ -911,6 +911,16 @@ impl ShmRegion {
         Err(Error::NoReaderSlot)
     }
 
+    /// Reader slots in use (claimed, not free) and the slot count.
+    pub fn reader_slot_usage(&self) -> (u32, u32) {
+        let inner = &self.inner;
+        let total = inner.header.reader_slot_count;
+        let used = (0..total)
+            .filter(|&i| inner.slot32(i, reader_slot::STATE).load(Ordering::Relaxed) != SLOT_FREE)
+            .count();
+        (u32::try_from(used).unwrap_or(u32::MAX), total)
+    }
+
     /// The oldest `(seqno, view_version)` pinned by any live reader slot, or `None`.
     ///
     /// Each component is the minimum over the slots that pin one (a slot pins when either

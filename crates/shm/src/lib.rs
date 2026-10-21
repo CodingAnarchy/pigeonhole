@@ -204,7 +204,7 @@ pub struct Generation(pub u64);
 /// let config = ShmConfig::new(8);
 /// assert_eq!(config.shards, 8);
 /// assert_eq!(config.arena_bytes, 64 << 20);
-/// assert_eq!(config.reader_slots, 126);
+/// assert_eq!(config.reader_slots, 128);
 /// assert_eq!(config.view_buffer_bytes, 4 << 20);
 /// assert_eq!(config.first_seqno, 1);
 /// assert!(config.dir.is_none());
@@ -218,7 +218,8 @@ pub struct ShmConfig {
     pub shards: u32,
     /// Bytes per shard arena (default 64 MiB; rounded up to 2 MiB).
     pub arena_bytes: u64,
-    /// Reader slots (default 126).
+    /// Reader slots (default 128). Each is 64 bytes, and the slot area is padded up to the
+    /// arenas' 2 MiB alignment, so the default costs no space.
     pub reader_slots: u32,
     /// Bytes per view buffer (default 4 MiB). Must hold the encoded view: about
     /// `40 + 2 * key bytes` per tablet plus 24 per memtable.
@@ -238,7 +239,7 @@ impl ShmConfig {
         Self {
             shards,
             arena_bytes: 64 << 20,
-            reader_slots: 126,
+            reader_slots: 128,
             view_buffer_bytes: 4 << 20,
             dir: None,
             first_seqno: 1,
