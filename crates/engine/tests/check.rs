@@ -332,7 +332,7 @@ fn damage_before_a_successor_segment_is_corruption() {
     let f = file(&vfs, w.path.to_str().unwrap());
     let mut first = None;
     for slot in 0..w.len / w.segment_size {
-        let mut page = [0u8; 64];
+        let mut page = [0u8; pigeonhole_format::wal::SEGMENT_HEADER_LEN];
         f.read_at(&mut page, slot * w.segment_size).unwrap();
         if let Ok(h) = pigeonhole_format::wal::SegmentHeader::decode(&page)
             && first.is_none_or(|(e, _)| h.epoch < e)

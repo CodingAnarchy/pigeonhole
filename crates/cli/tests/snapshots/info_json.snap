@@ -7,7 +7,7 @@ expression: text
   "command": "info",
   "path": "[DIR]/sample.phdb",
   "mode": "writer",
-  "format_version": 3,
+  "format_version": 4,
   "db_id": "[DB_ID]",
   "shards": null,
   "file_bytes": [BYTES],

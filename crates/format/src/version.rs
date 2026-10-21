@@ -9,6 +9,7 @@
 /// assert!(FormatVersion::CURRENT.is_readable());
 /// assert!(FormatVersion(1).is_readable()); // 0.1.0 files
 /// assert!(FormatVersion(2).is_readable()); // 0.2.x and 0.3.x files
+/// assert!(FormatVersion(3).is_readable()); // unreleased builds before format 4
 /// assert!(!FormatVersion(99).is_readable());
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -21,7 +22,11 @@ impl FormatVersion {
     /// this build has written. Version 3 adds the WAL's DECISION record (FORMAT §10.3, D263,
     /// ICR 0046): a version 2 build (0.2.x, 0.3.x) would fail on it as corruption, or skip a
     /// version 3 segment as a torn header, so it must refuse the file by its version.
-    pub const CURRENT: Self = Self(3);
+    /// Version 4 is the 1.x format (D269): the superblock's feature sets
+    /// ([`Features`](crate::superblock::Features)), the 128-byte WAL segment header, the SST
+    /// footer's incompatible-feature bits and the manifest's edit-tag ranges. 1.x never bumps
+    /// it again: later 1.x features set feature bits instead (FORMAT §12).
+    pub const CURRENT: Self = Self(4);
     /// The oldest format this build reads.
     pub const MIN_READABLE: Self = Self(1);
 

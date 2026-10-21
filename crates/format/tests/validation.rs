@@ -62,6 +62,7 @@ fn superblock(
         manifest_version: 1,
         file_pages: 64,
         flags: 0,
+        features: Default::default(),
     }
 }
 

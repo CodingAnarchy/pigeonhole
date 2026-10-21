@@ -43,9 +43,15 @@ pub struct Footer {
     pub compression_dict: BlockAddr,
     /// Format version of this SST.
     pub version: FormatVersion,
-    /// Reserved flags; zero in version 1.
+    /// The SST's incompatible feature bits (format 4, D269; reserved and zero before): a
+    /// build that does not know a bit refuses the SST ([`Error::UnsupportedFeature`]). A
+    /// feature that sets one also sets its bit in the superblock, so an older build refuses
+    /// the file at open rather than mid-read. No bit is defined yet.
     pub flags: u32,
 }
+
+/// The SST feature bits ([`Footer::flags`]) this build knows (none yet).
+pub const KNOWN_SST_FEATURES: u32 = 0;
 
 impl Footer {
     /// Encodes to exactly [`FOOTER_LEN`] bytes (checksum and magic included).
@@ -85,6 +91,13 @@ impl Footer {
         }
         let version = FormatVersion(le_u32(b, 80));
         version.check("sst footer")?;
+        let flags = le_u32(b, 84);
+        if flags & !KNOWN_SST_FEATURES != 0 {
+            return Err(Error::UnsupportedFeature {
+                what: "sst feature bits",
+                value: u64::from(flags & !KNOWN_SST_FEATURES),
+            });
+        }
         let addr = |i: usize| BlockAddr {
             offset: le_u64(b, 16 * i),
             len: le_u32(b, 16 * i + 8),
@@ -96,7 +109,7 @@ impl Footer {
             properties: addr(3),
             compression_dict: addr(4),
             version,
-            flags: le_u32(b, 84),
+            flags,
         })
     }
 }

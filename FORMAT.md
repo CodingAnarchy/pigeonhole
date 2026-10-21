@@ -2,7 +2,7 @@
 
 Every on-disk and shared-memory byte layout. Written during the interface freeze (build step 2). The executable form is the `pigeonhole-format` crate; where this file and the crate disagree, this file wins and the crate has a bug.
 
-Format version **3**, shared-memory layout version **2**. Nothing here is promised stable before 1.0 (spec: "promise forward compatibility only at 1.0"), but every structure carries a magic or a version so it can evolve.
+Format version **4**, shared-memory layout version **2**. Nothing here is promised stable before 1.0 (spec: "promise forward compatibility only at 1.0"), but every structure carries a magic or a version so it can evolve.
 
 ## 1. Conventions
 
@@ -25,7 +25,7 @@ Format version **3**, shared-memory layout version **2**. Nothing here is promis
 | Shared-memory directory | `PHDBSHMD` | offset 0 of the directory region |
 | Memtable header | `MEMT` (u32 `0x544D454D`) | offset 0 of each memtable header |
 
-- **Versions.** `FormatVersion` (u32, currently 3; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 2) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
+- **Versions.** `FormatVersion` (u32, currently 4; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 2) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
 
 ## 2. Internal key
 
@@ -131,7 +131,7 @@ Each address is 16 bytes: `offset` u64, `len` u32, reserved u32. A zero-length a
 | 48 | 16 | properties address |
 | 64 | 16 | compression dictionary address (reserved for zstd dictionaries; absent in v1) |
 | 80 | 4 | `format_version` u32 |
-| 84 | 4 | `flags` u32 (reserved, 0) |
+| 84 | 4 | `flags` u32: the SST's feature bits (format 4; none defined, so 0). A reader refuses an SST with a bit it does not know (`UnsupportedFeature`) |
 | 88 | 8 | `checksum` u64: xxh3-64 of bytes 0..88 |
 | 96 | 8 | magic `PHDBSST\x01` |
 
@@ -198,7 +198,7 @@ An **extent** is `64 KiB << size_class` bytes (`size_class` 0..=10: 64 KiB to 64
 
 ### 8.2 Superblock (pages 0 and 1)
 
-The first 128 bytes of the page; the rest is zero.
+The first 128 bytes of the page, then the extension area (bytes 128..4088; format 4); the rest of the page is zero.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -218,8 +218,16 @@ The first 128 bytes of the page; the rest is zero.
 | 88 | 1 | `log_size_class` u8 |
 | 89 | 3 | reserved |
 | 92 | 4 | `log_len` u32: live bytes of the delta log |
-| 96 | 24 | reserved |
+| 96 | 8 | `compat_features` u64 (format 4; reserved before) |
+| 104 | 8 | `ro_compat_features` u64 (format 4; reserved before) |
+| 112 | 8 | `incompat_features` u64 (format 4; reserved before) |
 | 120 | 8 | `checksum` u64: xxh3-64 of bytes 0..120 |
+
+**Feature bits** (format 4, D269). No bit is defined yet. A build that starts using a feature sets its bit in both pages before it writes anything that uses it; a build that stops using an `incompat` or `ro_compat` feature clears the bit in both pages the same way, or the other page's stale bit can refuse the file. A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only; an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
+
+**Extension area** (format 4, D269). Bytes 128..4088 are reserved for later 1.x features and are zero until one uses them. Every format 4 build copies them unchanged from the current page into each root commit. The superblock checksum does not cover them: a feature that stores data there brings its own checksum. A file written before format 4 has zeros there.
+
+**What a compat feature may rely on.** A build that does not know a `compat` feature keeps its bit and the extension area, but it commits new roots, and it drops manifest edits with skippable tags (§9.3) at its next manifest snapshot. So a compat feature's data must stay correct, or be detectably stale, after such a build commits; data tied to the root (in the extension area or in skippable edits) goes stale with the next root, and the feature must detect that, for example by recording the `sequence` or `manifest_version` it was written at. A feature that cannot tolerate this is `ro_compat`, so builds that do not know it cannot write the file.
 
 A superblock is valid if magic, checksum and version check out. The valid one with the higher `sequence` is current. **Root commit:** sync all data written since the last commit, write the new superblock (sequence + 1) over the *non-current* slot, sync. This is the only in-place write of live data in the main file. Reader processes re-read both superblocks to pick up a new root; they never write.
 
@@ -263,7 +271,7 @@ The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log
 
 ### 9.2 Edit encoding
 
-Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
+Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know, where §9.3's tag ranges allow it. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
 
 *FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter; decision D179). `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `Corrupt`. It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
 
@@ -286,6 +294,8 @@ Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader 
 | 11 | `DropBlobFile` | `blob_file` u32 |
 | 12 | `Counters` | `next_table` u32, `next_family` u32, `next_tablet` u64, `next_sst` u64, `next_blob_file` u32, `seqno_ceiling` u64, `ts_floor` u64 |
 | 13 | `SstBlobRefs` | `sst` u64, `count` u32, `count` x (`blob_file` u32, `bytes` u64): the blob files the SST's puts point into, ascending, and the bytes (`16 + len` per pointer, §7) each references |
+
+**Tag ranges** (format 4, D269). Tags 1..=127 are *must-understand*: a reader that meets one it does not know fails with `UnsupportedFeature` rather than skip an edit that changes what the manifest means. Tags 128..=255 are *skippable*: a reader that does not know one skips it, and as a writer it drops the edit at its next manifest snapshot (§8.2 says what a compat feature may rely on). Tag 0 is never written; reading it is `Corrupt`. Tag 13 predates the ranges; every build since knows it, and older builds skip it.
 
 Rules: family ids are unique across the database, so `(tablet, family)` names one tree. After a split both child tablets may reference the same SST; an SST's extent is retired when no tablet references it. A snapshot block contains `Counters`, every live table, family, tablet, SST, flushed seqno, blob file, SST blob references and stream checkpoint. Every commit that adds a new SST (a flush, compaction, backup or shrink copy) adds its `SstBlobRefs`, with an empty list if it holds no pointer; an SST without one (written before tag 13 existed) may point into any blob file of its family. References of an SST no tablet references are dropped from the next snapshot. A build that does not know tag 13 skips it. The live extents at open are: the snapshot and log extents, every referenced SST extent, and every blob-file extent. `ts_floor` is at least every default timestamp assigned before the commit (decision D11).
 
@@ -312,7 +322,7 @@ Replay starts at the segment whose epoch is the checkpoint's, at the checkpoint'
 
 A segment is made of 32 KiB **frames**. Frame 0 holds the segment header; the rest of frame 0 is zero.
 
-Segment header (offset 0 of frame 0):
+Segment header (offset 0 of frame 0). From format 4 it is 128 bytes; a segment written before format 4 has the 60-byte header (`crc` at 56, over bytes 0..56) and is still read. The `format_version` field picks the layout. A header whose version is above this build's is refused (never skipped as torn) if the CRC of either layout passes. That rule only recognises a newer header that keeps its CRC at 56 or 124; the real gate is the superblock: both pages carry a newer version or `incompat` bit before a newer build writes any WAL segment (§12), so a later format may lay its header out freely:
 
 | Offset | Size | Field |
 |---|---|---|
@@ -325,7 +335,10 @@ Segment header (offset 0 of frame 0):
 | 40 | 8 | `segment_size` u64 |
 | 48 | 4 | `frame_size` u32 (32768) |
 | 52 | 4 | `prev_end` u32: offset where the predecessor's data ends |
-| 56 | 4 | `crc` u32: CRC32C of bytes 0..56 |
+| 56 | 4 | `features` u32: the segment's feature bits (none defined, so 0). A reader refuses a segment with a bit it does not know (`UnsupportedFeature`) |
+| 60 | 16 | reserved for a per-database salt (#176), zero |
+| 76 | 48 | reserved |
+| 124 | 4 | `crc` u32: CRC32C of bytes 0..124 |
 
 Frames 1.. hold **fragments**. Fragment header (12 bytes):
 
@@ -507,6 +520,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 ## 12. Evolution
 
 - A reader rejects a `FormatVersion` above what it supports and refuses a `ShmLayoutVersion` that differs at all.
+- **Version 4** is the format 1.x is frozen at (D269). It reserves room to grow without a version bump: feature bits in the superblock (§8.2: compat, ro_compat, incompat), in the SST footer's `flags` (§5.1) and in the WAL segment header, which grows to 128 bytes (§10.2); the superblock's extension area; and the manifest's must-understand and skippable tag ranges (§9.3). Feature data follows §8.2's rules for compat features. Nothing else changes, and no bit is defined, so the upgrade from version 3 is the same as from version 2: a writable open commits the root twice, both pages carry version 4 before any WAL write, and new WAL segments get the 128-byte header while the older segments keep theirs until their slots are reused. A version 3 build (never released: main between 0.3.0 and format 4) or an older one refuses the file (`UnsupportedFormat(4)`). This build still reads versions 1 to 3.
 - **Shared-memory layout version 2** adds each shard's `durable` watermark (§11.2, D227). A version 1 process cannot attach to a version 2 region, nor the reverse, so writer and reader processes must run builds with the same layout.
 - **Version 3** adds the WAL's Decision record (§10.3, D263, ICR 0046). A version 2 build (0.2.x, 0.3.x) would fail on it as corruption, and would skip a version 3 segment header as torn, dropping every record from there on. So a writable open of an older file first commits its current root twice (`OpenedPager::finish`), and both superblock pages carry version 3 before this build writes any WAL record; a version 2 build then refuses the file (`UnsupportedFormat(3)`) instead of falling back to the page it can still decode. A crash between the two commits leaves one older page naming the same root, and the next writable open finishes the upgrade. This build still reads version 1 and 2 files and replays their Commit records.
 - **Version 2** adds blob files (§7): separated values, `PutBlobFile`/`DropBlobFile` edits in use, and the `Blob` value tag in SSTs. A version 1 build (0.1.0) would read a blob pointer as an empty value, so every structure is now written with version 2 and a version 1 build refuses the file (version 2 also covers zstd blocks, codec 2 in §4.1, which a version 1 build cannot decode). This build still reads version 1 files; a file it writes to (any commit rewrites the superblock) is version 2 from then on.

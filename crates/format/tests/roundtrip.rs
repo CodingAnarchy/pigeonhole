@@ -115,9 +115,18 @@ proptest! {
 
     #[test]
     fn footer(a in vec(addr(), 5), flags in any::<u32>()) {
-        let f = Footer { top_index: a[0], row_filter: a[1], column_filter: a[2], properties: a[3], compression_dict: a[4], version: FormatVersion::CURRENT, flags };
+        let f = Footer { top_index: a[0], row_filter: a[1], column_filter: a[2], properties: a[3], compression_dict: a[4], version: FormatVersion::CURRENT, flags: 0 };
         let bytes = f.encode();
         prop_assert_eq!(Footer::decode(&bytes).unwrap(), f);
+        // Feature bits this build does not know (all of them, D269) refuse the SST.
+        if flags != 0 {
+            let featured = Footer { flags, ..f };
+            let refused = matches!(
+                Footer::decode(&featured.encode()),
+                Err(pigeonhole_format::Error::UnsupportedFeature { what: "sst feature bits", value }) if value == u64::from(flags)
+            );
+            prop_assert!(refused);
+        }
         // Decoding the tail of a longer buffer works too.
         let sst = [vec![1; 7], bytes.to_vec()].concat();
         prop_assert_eq!(Footer::decode(&sst).unwrap(), f);
@@ -172,6 +181,7 @@ proptest! {
             snapshot: snap, snapshot_len: snap.map_or(0, |e| lens.0 % (e.len() as u32 + 1)),
             log, log_len: log.map_or(0, |e| lens.1 % (e.len() as u32 + 1)),
             manifest_version: n[1], file_pages: n[2], flags: n[3],
+        features: Default::default(),
         };
         let mut page = [0xEEu8; 4096];
         sb.encode(&mut page);
@@ -207,12 +217,20 @@ proptest! {
         let h = SegmentHeader {
             version: FormatVersion::CURRENT, stream: StreamId(n[0]), epoch: n[1], prev_epoch: n[2], prev_end: n[3],
             db_id, segment_size: frames * FRAME_SIZE as u64,
+        features: 0,
         };
         let mut frame = Box::new([0xEEu8; FRAME_SIZE]);
         h.encode(&mut frame);
         // (Under Miri, spot-check the zeroed tail instead of scanning 32 KiB.)
-        prop_assert!(frame[60..sized(FRAME_SIZE, 256)].iter().all(|&b| b == 0));
+        // Format 4's header is 128 bytes: 56..60 features, 60..124 zero, then the CRC.
+        prop_assert!(frame[60..124].iter().all(|&b| b == 0));
+        prop_assert!(frame[128..sized(FRAME_SIZE, 256)].iter().all(|&b| b == 0));
         prop_assert_eq!(SegmentHeader::decode(&frame[..]).unwrap(), h);
+        // Format 3's 60-byte layout still reads (with no features).
+        let old = SegmentHeader { version: FormatVersion(3), ..h };
+        old.encode(&mut frame);
+        prop_assert!(frame[60..128].iter().all(|&b| b == 0));
+        prop_assert_eq!(SegmentHeader::decode(&frame[..]).unwrap(), old);
     }
 
     #[test]
@@ -323,18 +341,19 @@ fn versions_are_checked() {
         column_filter: BlockAddr::default(),
         properties: BlockAddr::default(),
         compression_dict: BlockAddr::default(),
-        version: FormatVersion(4),
+        version: FormatVersion(5),
         flags: 0,
     };
     assert_eq!(
         Footer::decode(&f.encode()),
         Err(pigeonhole_format::Error::UnsupportedVersion {
             what: "sst footer",
-            found: 4
+            found: 5
         })
     );
-    // Files written by 0.1.0 (version 1) and 0.2.x/0.3.x (version 2) stay readable.
-    for v in [1, 2] {
+    // Files written by 0.1.0 (version 1), 0.2.x/0.3.x (version 2) and 0.4 (version 3) stay
+    // readable (D269: 1.x reads every format from 1).
+    for v in [1, 2, 3] {
         let old = Footer {
             version: FormatVersion(v),
             ..f
@@ -364,6 +383,7 @@ fn versions_are_checked() {
         manifest_version: 0,
         file_pages: 16,
         flags: 0,
+        features: Default::default(),
     };
     let mut page = [0u8; 4096];
     sb.encode(&mut page);

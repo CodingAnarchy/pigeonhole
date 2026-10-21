@@ -66,7 +66,7 @@ impl Grid {
     /// file, in which case its slot size is unknown and nothing in it is reachable.
     pub(crate) fn read(file: &FileRef, stream: StreamId, db_id: [u8; 16]) -> Result<Option<Self>> {
         let len = file.len()?;
-        let mut probe = [0u8; 64];
+        let mut probe = [0u8; pigeonhole_format::wal::SEGMENT_HEADER_LEN];
         // Slot 0 normally holds a valid header. If its last header write was torn, find the
         // slot size from the first valid header at any frame boundary.
         let mut segment_size = None;
@@ -1667,6 +1667,7 @@ impl WalStream {
             prev_end,
             db_id: self.db_id,
             segment_size: self.segment_size,
+            features: 0,
         };
         let frame: &mut [u8; FRAME_SIZE] = (&mut self.buf[..FRAME_SIZE])
             .try_into()

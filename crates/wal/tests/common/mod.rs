@@ -184,7 +184,7 @@ pub fn headers(vfs: &VfsRef, segment_size: u64) -> Vec<Option<SegmentHeader>> {
     let len = f.len().unwrap();
     (0..len / segment_size)
         .map(|slot| {
-            let mut buf = [0u8; 64];
+            let mut buf = [0u8; pigeonhole_format::wal::SEGMENT_HEADER_LEN];
             f.read_at(&mut buf, slot * segment_size).unwrap();
             SegmentHeader::decode(&buf).ok()
         })

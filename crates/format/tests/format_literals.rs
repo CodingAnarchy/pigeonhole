@@ -232,6 +232,7 @@ fn superblock_offsets() {
         manifest_version: 0x0C0D,
         file_pages: 0x0E0F,
         flags: 1,
+        features: Default::default(),
     };
     let mut p = [0u8; 4096];
     sb.encode(&mut p);
@@ -284,6 +285,7 @@ fn wal_segment_header_and_fragment() {
         prev_end: 0x8000,
         db_id: [0xD2; 16],
         segment_size: 1 << 26,
+        features: 0,
     };
     let mut f = Box::new([0u8; FRAME_SIZE]);
     h.encode(&mut f);
@@ -303,6 +305,18 @@ fn wal_segment_header_and_fragment() {
         (1 << 26, 32768, 0x8000)
     );
     assert_eq!(le32(&f[..], 56), crc32c(&f[..56]));
+    // Format 4: features u32 at 56, 60..124 reserved (zero), CRC32C at 124.
+    let mut f = Box::new([0u8; FRAME_SIZE]);
+    SegmentHeader {
+        version: FormatVersion(4),
+        features: 0x0102_0304,
+        ..h
+    }
+    .encode(&mut f);
+    assert_eq!(le32(&f[..], 8), 4);
+    assert_eq!(le32(&f[..], 56), 0x0102_0304);
+    assert_eq!(f[60..124], [0; 64]);
+    assert_eq!(le32(&f[..], 124), crc32c(&f[..124]));
 
     // §10.2 fragment: crc, epoch, len u16, type, reserved, payload.
     let mut out = Vec::new();

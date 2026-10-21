@@ -82,10 +82,18 @@ pub struct SegmentHeader {
     /// Segment size in bytes: a multiple of [`FRAME_SIZE`], at most 4 GiB (LSN offsets are
     /// `u32`).
     pub segment_size: u64,
+    /// Incompatible features the segment's records use (format 4; 0 before): a build that
+    /// does not know a bit refuses the segment ([`Error::UnsupportedFeature`]) rather than
+    /// misread its records. No bit is defined yet.
+    pub features: u32,
 }
 
+/// The segment features this build knows (none yet).
+pub const KNOWN_SEGMENT_FEATURES: u32 = 0;
+
 impl SegmentHeader {
-    /// Encodes into a frame-0 buffer (unused bytes zero).
+    /// Encodes into a frame-0 buffer (unused bytes zero): format 4's 128-byte layout for a
+    /// version 4 header, the 60-byte one before (FORMAT §10.2).
     pub fn encode(&self, frame: &mut [u8; FRAME_SIZE]) {
         frame.fill(0);
         frame[0..8].copy_from_slice(&WAL_SEGMENT_MAGIC);
@@ -97,8 +105,15 @@ impl SegmentHeader {
         frame[40..48].copy_from_slice(&self.segment_size.to_le_bytes());
         frame[48..52].copy_from_slice(&(FRAME_SIZE as u32).to_le_bytes());
         frame[52..56].copy_from_slice(&self.prev_end.to_le_bytes());
-        let crc = crate::checksum::crc32c(&frame[..56]);
-        frame[56..60].copy_from_slice(&crc.to_le_bytes());
+        if self.version >= FormatVersion(4) {
+            // 60..76: the per-database salt's slot (#176), 76..124 reserved; both zero.
+            frame[56..60].copy_from_slice(&self.features.to_le_bytes());
+            let crc = crate::checksum::crc32c(&frame[..V4_CRC_AT]);
+            frame[V4_CRC_AT..SEGMENT_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
+        } else {
+            let crc = crate::checksum::crc32c(&frame[..V3_CRC_AT]);
+            frame[V3_CRC_AT..V3_CRC_AT + 4].copy_from_slice(&crc.to_le_bytes());
+        }
     }
 
     /// Decodes and verifies magic, CRC32C and version. Also checks the frame size and that
@@ -111,11 +126,33 @@ impl SegmentHeader {
         if b[..8] != WAL_SEGMENT_MAGIC {
             return Err(Error::BadMagic { what: WHAT });
         }
-        if crate::checksum::crc32c(&b[..56]) != le_u32(b, 56) {
+        let crc_ok = |at: usize| crate::checksum::crc32c(&b[..at]) == le_u32(b, at);
+        let version = FormatVersion(le_u32(b, 8));
+        // The layout follows the version: 128 bytes from format 4, 60 before. A version this
+        // build does not know is a newer build's header if either layout's CRC passes (a
+        // newer segment must be refused, never skipped as torn, #496); otherwise torn.
+        let intact = if version > FormatVersion::CURRENT {
+            crc_ok(V4_CRC_AT) || crc_ok(V3_CRC_AT)
+        } else if version >= FormatVersion(4) {
+            crc_ok(V4_CRC_AT)
+        } else {
+            crc_ok(V3_CRC_AT)
+        };
+        if !intact {
             return Err(Error::Checksum { what: WHAT });
         }
-        let version = FormatVersion(le_u32(b, 8));
         version.check(WHAT)?;
+        let features = if version >= FormatVersion(4) {
+            le_u32(b, 56)
+        } else {
+            0
+        };
+        if features & !KNOWN_SEGMENT_FEATURES != 0 {
+            return Err(Error::UnsupportedFeature {
+                what: "wal segment feature bits",
+                value: u64::from(features & !KNOWN_SEGMENT_FEATURES),
+            });
+        }
         let segment_size = le_u64(b, 40);
         let frames = segment_size / FRAME_SIZE as u64;
         if le_u32(b, 48) as usize != FRAME_SIZE
@@ -133,6 +170,7 @@ impl SegmentHeader {
             prev_end: le_u32(b, 52),
             db_id: b[24..40].try_into().expect("16 bytes"),
             segment_size,
+            features,
         })
     }
 }
@@ -146,8 +184,13 @@ pub struct FrameEncoder {
     pos: u64,
 }
 
-/// Size of the meaningful part of a segment header (the rest of frame 0 is zero).
-const SEGMENT_HEADER_LEN: usize = 60;
+/// Size of the meaningful part of a segment header (the rest of frame 0 is zero): format 4's
+/// 128 bytes; a header before format 4 uses the first 60, the rest zero.
+pub const SEGMENT_HEADER_LEN: usize = 128;
+/// Where the CRC32C sits (over the bytes before it) in a format 4 header.
+const V4_CRC_AT: usize = 124;
+/// Where it sits in a header before format 4.
+const V3_CRC_AT: usize = 56;
 
 /// A fragment is only started where more than a header's worth of bytes remains, so every
 /// fragment except an empty record's carries payload. Shorter frame tails are skipped.
