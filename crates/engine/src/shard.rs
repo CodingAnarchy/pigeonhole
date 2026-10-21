@@ -381,6 +381,9 @@ fn new_memtable(
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,
+    /// When the writer next frees the slots of reader processes that are gone (monotonic
+    /// nanoseconds; [`Shared::reclaim_dead_readers`], #833).
+    pub reader_reclaim_at: AtomicU64,
     pub shards: usize,
     pub view: ArcSwap<View>,
     /// Reads inside async calls that went to the file synchronously (D196; `Metrics`).
@@ -546,7 +549,44 @@ impl std::fmt::Debug for Shared {
     }
 }
 
+/// How often the writer looks for reader slots whose process is gone (#833): a liveness
+/// check per active slot, so rare enough to cost nothing, and soon enough that a killed
+/// reader's pin does not hold arenas while commits wait for room.
+const READER_RECLAIM_NANOS: u64 = 250_000_000;
+
 impl Shared {
+    /// Frees the slots of reader processes that are gone (#833), at most every
+    /// [`READER_RECLAIM_NANOS`] over all shards: the first caller past the deadline moves it
+    /// and runs the check. Called only on a shard thread holding no lock, and only at rare
+    /// points: when a flush or a compaction completes (`on_flushed`, `on_compaction_done`,
+    /// which also covers a writer gone idle while compactions finish) and when a commit finds
+    /// no arena room (`reserve_room`, again on every room recheck), so a commit stalled
+    /// behind a dead reader's pin gets in within one interval. Never per commit or per read: even the
+    /// deadline's clock read showed up in the callgrind counts there. The liveness check (a
+    /// `/proc` read or `proc_pidinfo` per active slot) stays off `view_lock` and off
+    /// application threads; every other bound reads the pins as they are, and a slot freed
+    /// here lowers all of them (#834 review).
+    pub(crate) fn reclaim_dead_readers(&self) {
+        let now = self.vfs.monotonic_nanos();
+        let at = self.reader_reclaim_at.load(Ordering::Relaxed);
+        if now >= at
+            && self
+                .reader_reclaim_at
+                .compare_exchange(
+                    at,
+                    now.saturating_add(READER_RECLAIM_NANOS),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            let freed = self.shm.reclaim_dead_slots(&self.vfs);
+            if freed > 0 {
+                trace!("reclaimed {freed} reader slots whose process is gone");
+            }
+        }
+    }
+
     pub(crate) fn submitter(&self, shard: ShardId) -> &Submitter<ShardMsg> {
         &self.submitters.get().expect("runtime started")[usize::from(shard.0)]
     }
@@ -3651,7 +3691,10 @@ impl ShardState {
         };
         let fits = |arena: &ShardArena| bytes_fit(arena) && run_fits(arena);
         if !fits(&self.arena) {
-            // Memtables whose readers left since the last reclaim count too.
+            // Memtables whose readers left since the last reclaim count too, and those a
+            // reader process that is gone still pins (#833): a commit stalled for room gets in
+            // within one liveness interval of a later recheck.
+            self.shared.reclaim_dead_readers();
             self.reclaim_retired();
             self.refresh_free();
         }
@@ -4178,6 +4221,9 @@ impl ShardState {
     ) {
         self.flush_running = false;
         self.flushing.clear();
+        // A flush retires memtables: free the slots of reader processes that are gone first
+        // (#833), so their pins hold neither these nor the extents compaction frees next.
+        self.shared.reclaim_dead_readers();
         // The guarded flushes this one carried are settled either way (#287). One a delete
         // voided was refused at its commit: flush those memtables again without the guard,
         // at once (not a failure). Members that waited on an install run again at the end of
@@ -8322,6 +8368,9 @@ impl ShardState {
         nanos: u64,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        // Background compactions keep running after the writes stop: they free a dead
+        // reader's slot even when no flush or room stall comes (#833, perf287's review).
+        self.shared.reclaim_dead_readers();
         {
             let mut busy = self
                 .shared

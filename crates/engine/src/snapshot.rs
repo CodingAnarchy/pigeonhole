@@ -1017,6 +1017,9 @@ pub(crate) struct LiveSnapshot {
     pub count: Arc<AtomicUsize>,
     /// The region generation the snapshot was taken in: its pin lives there.
     pub shm: ShmRegion,
+    /// The slot holding the pin: if the writer judged this process dead and freed it, the
+    /// pin protects nothing any more (#834 review).
+    pub slot: pigeonhole_shm::SlotOwnership,
 }
 
 impl LiveSnapshot {
@@ -1026,10 +1029,21 @@ impl LiveSnapshot {
     /// **after** it read, seqlock style: a writer marks the old region abandoned and
     /// publishes its generation before it allocates anything, so a read that finished before
     /// either is visible read what the snapshot names.
+    /// Out of line: only reader processes get here, and its body (the generation and slot
+    /// checks) must not grow the writer's per-row path through [`Snapshot::check_current`].
+    #[inline(never)]
     pub(crate) fn check_current(&self) -> Result<()> {
         // Orders the read's loads (shared-memory arenas included) before the state load.
         std::sync::atomic::fence(Ordering::Acquire);
         if self.shm.is_stale() {
+            return Err(Error::SnapshotExpired);
+        }
+        // The same argument for the slot, as D148's for the generation: the writer frees a
+        // slot it judged dead before it reclaims anything the slot's pins held, so a read
+        // that finished while the slot was still this process's read what the snapshot
+        // names. A false "dead" (a hidden or
+        // foreign-namespace pid) costs an expired snapshot, not wrong rows.
+        if !self.slot.is_current() {
             return Err(Error::SnapshotExpired);
         }
         Ok(())
@@ -1070,8 +1084,14 @@ impl Snapshot {
     /// Reader processes: [`Error::SnapshotExpired`] if a writer restarted since the snapshot
     /// was taken; call after a read through it (see `LiveSnapshot::check_current`). Always
     /// `Ok` in the writer process.
+    /// Inline: every scan step calls it, and in the writer process it is one test of
+    /// `None` (the #834 callgrind job saw scans grow 2% when the reader's checks grew).
+    #[inline]
     pub(crate) fn check_current(&self) -> Result<()> {
-        self._live.as_ref().map_or(Ok(()), |l| l.check_current())
+        match &self._live {
+            None => Ok(()),
+            Some(live) => live.check_current(),
+        }
     }
 
     /// `result` of a read through this snapshot, or [`Error::SnapshotExpired`] in its place

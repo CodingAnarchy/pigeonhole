@@ -71,7 +71,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use pigeonhole_format::{Seqno, ShmLayoutVersion};
-use pigeonhole_io::FileRef;
+use pigeonhole_io::{FileRef, ProcessId};
 
 pub use region::ShmRegion;
 
@@ -343,4 +343,26 @@ pub enum Role {
 pub struct ReaderSlot {
     region: Arc<region::Inner>,
     index: u32,
+    /// The process that claimed it: the writer may judge that process dead and free the
+    /// slot under it ([`ShmRegion::reclaim_dead_slots`]); the slot is this handle's only
+    /// while its owner fields still name this process.
+    owner: ProcessId,
+}
+
+/// Whether a [`ReaderSlot`] still belongs to the handle that claimed it, checkable without
+/// the slot (a live snapshot keeps one: [`ReaderSlot::ownership`]).
+#[derive(Debug, Clone)]
+pub struct SlotOwnership {
+    region: Arc<region::Inner>,
+    index: u32,
+    owner: ProcessId,
+}
+
+impl SlotOwnership {
+    /// Whether the slot is still claimed by its owner: not free, with the owner's pid and
+    /// start time. False once the writer judged the owner dead and freed the slot (and
+    /// possibly another reader took it): reads through the slot's pins are then unprotected.
+    pub fn is_current(&self) -> bool {
+        self.region.slot_owned_by(self.index, self.owner)
+    }
 }

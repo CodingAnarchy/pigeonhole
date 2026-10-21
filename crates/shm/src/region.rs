@@ -147,13 +147,34 @@ impl Inner {
             .store(0, Ordering::SeqCst);
     }
 
+    /// Whether slot `index` is claimed (not free) and records `owner` as its process.
+    pub(crate) fn slot_owned_by(&self, index: u32, owner: ProcessId) -> bool {
+        self.slot32(index, reader_slot::STATE)
+            .load(Ordering::Acquire)
+            != SLOT_FREE
+            && self.slot32(index, reader_slot::PID).load(Ordering::Relaxed) == owner.pid
+            && self
+                .slot64(index, reader_slot::START_TIME)
+                .load(Ordering::Relaxed)
+                == owner.start_time
+    }
+
     /// The owner frees its slot: pins first, so a concurrent
     /// [`ShmRegion::oldest_reader_pin`] never sees a free slot still pinning, then `active`
     /// to `free`. The CAS fails only while the writer has the slot in `claiming` to check
     /// its owner's liveness ([`ShmRegion::reclaim_dead_slots`]); the writer puts it back to
     /// `active` at once because the owner is alive, so retry. If the writer died in that
     /// window the slot stays `claiming`; give up and leave it to the next generation.
-    fn release_slot(&self, index: u32) {
+    ///
+    /// Only while the slot still names `owner`: if the writer judged the owner dead and
+    /// freed the slot, it may belong to another reader now, whose pins and claim must not be
+    /// touched (#834 review). A narrow race remains between that check and the clear: the
+    /// writer would have to judge this live process dead again within it, until #693's
+    /// lock-based liveness removes false "dead" judgements altogether.
+    fn release_slot(&self, index: u32, owner: ProcessId) {
+        if !self.slot_owned_by(index, owner) {
+            return;
+        }
         self.clear_pins(index);
         let state = self.slot32(index, reader_slot::STATE);
         for attempt in 0..RELEASE_ATTEMPTS {
@@ -884,6 +905,7 @@ impl ShmRegion {
             return Ok(ReaderSlot {
                 region: inner.clone(),
                 index,
+                owner: process,
             });
         }
         Err(Error::NoReaderSlot)
@@ -969,6 +991,20 @@ impl ShmRegion {
 }
 
 impl ReaderSlot {
+    /// Whether the slot is still this handle's (see [`crate::SlotOwnership::is_current`]).
+    pub fn is_owned(&self) -> bool {
+        self.region.slot_owned_by(self.index, self.owner)
+    }
+
+    /// A handle that checks [`ReaderSlot::is_owned`] without holding the slot.
+    pub fn ownership(&self) -> crate::SlotOwnership {
+        crate::SlotOwnership {
+            region: self.region.clone(),
+            index: self.index,
+            owner: self.owner,
+        }
+    }
+
     /// Slot index.
     pub fn index(&self) -> u32 {
         self.index
@@ -1042,7 +1078,7 @@ impl ReaderSlot {
 
 impl Drop for ReaderSlot {
     fn drop(&mut self) {
-        self.region.release_slot(self.index);
+        self.region.release_slot(self.index, self.owner);
     }
 }
 
