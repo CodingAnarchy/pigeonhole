@@ -384,6 +384,8 @@ pub(crate) struct Shared {
     /// When the writer next frees the slots of reader processes that are gone (monotonic
     /// nanoseconds; [`Shared::reclaim_dead_readers`], #833).
     pub reader_reclaim_at: AtomicU64,
+    /// Reader slots freed because their process was gone (#833; `Metrics`).
+    pub reader_slots_reclaimed: AtomicU64,
     pub shards: usize,
     pub view: ArcSwap<View>,
     /// Reads inside async calls that went to the file synchronously (D196; `Metrics`).
@@ -581,6 +583,8 @@ impl Shared {
                 .is_ok()
         {
             let freed = self.shm.reclaim_dead_slots(&self.vfs);
+            self.reader_slots_reclaimed
+                .fetch_add(freed as u64, Ordering::Relaxed);
             if freed > 0 {
                 trace!("reclaimed {freed} reader slots whose process is gone");
             }

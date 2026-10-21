@@ -2,7 +2,7 @@
 
 Every on-disk and shared-memory byte layout. Written during the interface freeze (build step 2). The executable form is the `pigeonhole-format` crate; where this file and the crate disagree, this file wins and the crate has a bug.
 
-Format version **1**, shared-memory layout version **2**. Nothing here is promised stable before 1.0 (spec: "promise forward compatibility only at 1.0"), but every structure carries a magic or a version so it can evolve.
+Format version **3**, shared-memory layout version **2**. Nothing here is promised stable before 1.0 (spec: "promise forward compatibility only at 1.0"), but every structure carries a magic or a version so it can evolve.
 
 ## 1. Conventions
 
@@ -25,7 +25,7 @@ Format version **1**, shared-memory layout version **2**. Nothing here is promis
 | Shared-memory directory | `PHDBSHMD` | offset 0 of the directory region |
 | Memtable header | `MEMT` (u32 `0x544D454D`) | offset 0 of each memtable header |
 
-- **Versions.** `FormatVersion` (u32, currently 2; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 1) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
+- **Versions.** `FormatVersion` (u32, currently 3; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 2) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
 
 ## 2. Internal key
 

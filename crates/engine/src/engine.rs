@@ -188,6 +188,15 @@ pub struct Metrics {
     /// Blocking waits for a commit's reply (`PendingCommit::wait`, `Engine::commit`) that
     /// parked their thread after the D198 spin (ICR 0027). Async waits never park.
     pub commit_parks: u64,
+    /// Reader slots in use and the slot count, `(active, total)` (#693 D1). Both 0 in a
+    /// reader process.
+    pub reader_slots: (u64, u64),
+    /// Reader slots the writer freed because their process was gone (#833).
+    pub reader_slots_reclaimed: u64,
+    /// How far behind the current view and visible seqno the oldest reader pin is, `(views,
+    /// seqnos)`: `(0, 0)` with no pin. A pin that keeps falling behind holds the writer's
+    /// memtables and extents, and eventually stalls commits into `Busy` (#693 D1).
+    pub reader_pin_lag: (u64, u64),
     /// How many of the threads an engine-owned open started are pinned to a CPU of their
     /// own (D235), and how many it started (shards and compaction threads): `(pinned,
     /// started)`. Both 0 for an application-owned or closed engine.
@@ -845,6 +854,7 @@ impl Engine {
             vfs: Arc::clone(&vfs),
             shm: shm.clone(),
             reader_reclaim_at: AtomicU64::new(0),
+            reader_slots_reclaimed: AtomicU64::new(0),
             shards,
             view: ArcSwap::new(empty_view),
             async_sync_reads: AtomicU64::new(0),
@@ -1433,6 +1443,7 @@ impl Engine {
             vfs: Arc::clone(&vfs),
             shm: shm.clone(),
             reader_reclaim_at: AtomicU64::new(0),
+            reader_slots_reclaimed: AtomicU64::new(0),
             shards,
             view: ArcSwap::new(empty_view),
             async_sync_reads: AtomicU64::new(0),
@@ -2378,6 +2389,24 @@ impl Engine {
         m.block_cache_capacity = shared.cache.capacity() as u64;
         m.block_cache_pinned_warnings = shared.cache.pinned_warnings();
         m.commit_parks = shared.commit_parks.load(Ordering::Relaxed);
+        if self.inner.reader.is_none() {
+            let (active, total) = shared.shm.reader_slot_usage();
+            m.reader_slots = (u64::from(active), u64::from(total));
+            m.reader_slots_reclaimed = shared.reader_slots_reclaimed.load(Ordering::Relaxed);
+            if let Some((seqno, view)) = shared.shm.oldest_reader_pin() {
+                let views = if view == 0 {
+                    0
+                } else {
+                    shared.shm.view_version().saturating_sub(view)
+                };
+                let seqnos = if seqno == 0 {
+                    0
+                } else {
+                    shared.shm.visible_seqno().saturating_sub(seqno)
+                };
+                m.reader_pin_lag = (views, seqnos);
+            }
+        }
         m.shard_commit_inflight_nanos = shared
             .metrics
             .iter()

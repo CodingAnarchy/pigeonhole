@@ -116,6 +116,8 @@ mod guide {
     struct AgentReference;
     #[doc = include_str!("../../../docs/guide/concepts.md")]
     struct Concepts;
+    #[doc = include_str!("../../../docs/guide/readers.md")]
+    struct Readers;
     #[cfg(feature = "async")]
     #[doc = include_str!("../../../docs/guide/async.md")]
     struct Async;
