@@ -3866,6 +3866,11 @@ impl ShardState {
                 .into_iter()
                 .partition(|(_, _, at)| late(*at));
             self.compact_all = kept;
+            // The slots the front request rewrote are not the next one's (#805): a refused
+            // front leaves its successor to rewrite them again.
+            if !refused.is_empty() {
+                self.full_purged.clear();
+            }
             for (_, w, _) in refused {
                 w.notify(Err(Error::Busy));
             }
@@ -7728,7 +7733,8 @@ impl ShardState {
                 let rewrite = self.tablets_on();
                 // A lone SST that may hold purgeable entries is rewritten, unless this request
                 // already rewrote the slot (#805, `full_purged`); its rows come from its
-                // properties.
+                // properties, read through the open-SST cache (and only when the cheaper
+                // checks miss).
                 let purgeable = |sst: &pigeonhole_format::manifest::SstMeta| {
                     !self.full_purged.contains(&key)
                         && compact::may_hold_purgeable(sst, &meta.options, now, || {

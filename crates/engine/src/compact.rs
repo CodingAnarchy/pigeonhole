@@ -163,7 +163,8 @@ pub(crate) fn narrow(
 /// `max_versions` (not a counter, whose versions are never purged), more entries than rows
 /// (`rows`, from the SST's properties; `None` if it could not be read), so possibly more
 /// versions of a column than the family keeps. Conservative: rows of several columns count
-/// too. Not seen: a keep-all family's put shadowed by a newer put at the same timestamp,
+/// too, so a lone SST of such a table is rewritten on every `compact()` call, though only
+/// once per call (the shard's `full_purged`). Not seen: a keep-all family's put shadowed by a newer put at the same timestamp,
 /// kept because a snapshot needed it when the SST was written (nothing records that).
 pub(crate) fn may_hold_purgeable(
     sst: &SstMeta,
