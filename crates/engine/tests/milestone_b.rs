@@ -769,8 +769,9 @@ fn backup_releases_the_memtable_arena_before_its_long_merge() {
     let released = Arc::new(std::sync::Mutex::new(None));
     {
         let (db, t, released) = (Arc::clone(&db), Arc::clone(&t), Arc::clone(&released));
-        db.clone()
-            .after_backup_releases_memtables(Box::new(move || {
+        db.clone().on_next(
+            pigeonhole_engine::HookSite::BackupReleasedMemtables,
+            Box::new(move || {
                 db.flush().unwrap();
                 // The flushed memtable's chunks go back to the arena once the shard has
                 // retired it and no view lists it, which may be after `flush` returns, and
@@ -787,7 +788,8 @@ fn backup_releases_the_memtable_arena_before_its_long_merge() {
                     std::thread::yield_now();
                 }
                 *released.lock().unwrap() = Some(free);
-            }));
+            }),
+        );
     }
     db.backup(Path::new("/db/copy.phdb")).unwrap();
     let free = released.lock().unwrap().expect("the hook ran");

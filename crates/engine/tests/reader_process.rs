@@ -255,11 +255,14 @@ fn a_reader_view_never_mixes_a_record_with_another_versions_catalog() {
         add(&w, 10);
         // The writer flushes between the reader's record read and its catalog load.
         let (hw, hv) = (Arc::clone(&w), Arc::clone(&vfs));
-        reader.on_reader_view_record(Box::new(move || {
-            hv.enter_process(WRITER);
-            hw.lock().unwrap().flush();
-            hv.enter_process(READER);
-        }));
+        reader.on_next(
+            pigeonhole_engine::HookSite::ReaderViewRecord,
+            Box::new(move || {
+                hv.enter_process(WRITER);
+                hw.lock().unwrap().flush();
+                hv.enter_process(READER);
+            }),
+        );
         let snap = reader.snapshot().unwrap();
         assert_eq!(counter(&snap), 10 + round * 10, "round {round}");
         drop(snap);
@@ -311,20 +314,23 @@ fn a_writer_restart_during_a_manifest_load_re_attaches() {
     // The reader found the durable root at the record's version; before it reads that
     // manifest, the writer restarts and rewrites everything, reusing its extents.
     let (hw, hv) = (Arc::clone(&w), Arc::clone(&vfs));
-    reader.on_reader_manifest_load(Box::new(move || {
-        hv.enter_process(WRITER);
-        let mut g = hw.lock().unwrap();
-        g.take().unwrap().close();
-        let mut nw = Writer::open(&hv);
-        let t = nw.db.table("t").unwrap();
-        nw.compact();
-        for round in 0..6u32 {
-            write_rows(&mut nw, &t, "zzz", "NEW", round * 200..round * 200 + 200);
-        }
-        nw.compact();
-        *g = Some(nw);
-        hv.enter_process(READER);
-    }));
+    reader.on_next(
+        pigeonhole_engine::HookSite::ReaderManifestLoad,
+        Box::new(move || {
+            hv.enter_process(WRITER);
+            let mut g = hw.lock().unwrap();
+            g.take().unwrap().close();
+            let mut nw = Writer::open(&hv);
+            let t = nw.db.table("t").unwrap();
+            nw.compact();
+            for round in 0..6u32 {
+                write_rows(&mut nw, &t, "zzz", "NEW", round * 200..round * 200 + 200);
+            }
+            nw.compact();
+            *g = Some(nw);
+            hv.enter_process(READER);
+        }),
+    );
     vfs.enter_process(READER);
     let snap = reader.snapshot().unwrap();
     for i in [0u32, 150, 250, 399] {

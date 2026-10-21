@@ -274,11 +274,14 @@ fn a_snapshot_pins_its_seqno_before_it_loads_the_view() {
     put(b"v1");
     {
         let (db2, drive, put) = (Arc::clone(&db), drive.clone(), put.clone());
-        db.before_snapshot_view_load(Box::new(move || {
-            put(b"v2");
-            let flush = db2.flush_pending().unwrap();
-            drive(Box::pin(flush)).unwrap();
-        }));
+        db.on_next(
+            pigeonhole_engine::HookSite::SnapshotViewLoad,
+            Box::new(move || {
+                put(b"v2");
+                let flush = db2.flush_pending().unwrap();
+                drive(Box::pin(flush)).unwrap();
+            }),
+        );
     }
     let snap = db.snapshot().unwrap();
     let read = db
@@ -506,9 +509,12 @@ fn a_row_read_as_of_now_rereads_when_a_flush_publishes_before_its_view_load() {
     put_and_flush(&db, &drive, &t, b"v1".to_vec(), false);
     {
         let (db2, drive, t) = (Arc::clone(&db), Arc::clone(&drive), Arc::clone(&t));
-        db.before_latest_view_load(Box::new(move || {
-            put_and_flush(&db2, &drive, &t, b"v2".to_vec(), true);
-        }));
+        db.on_next(
+            pigeonhole_engine::HookSite::LatestViewLoad,
+            Box::new(move || {
+                put_and_flush(&db2, &drive, &t, b"v2".to_vec(), true);
+            }),
+        );
     }
     assert_eq!(
         read_row_latest(&db, &t),
@@ -525,9 +531,12 @@ fn get_latest_rereads_when_a_flush_publishes_before_its_view_load() {
     put_and_flush(&db, &drive, &t, b"v1".to_vec(), false);
     {
         let (db2, drive, t) = (Arc::clone(&db), Arc::clone(&drive), Arc::clone(&t));
-        db.before_latest_view_load(Box::new(move || {
-            put_and_flush(&db2, &drive, &t, b"v2".to_vec(), true);
-        }));
+        db.on_next(
+            pigeonhole_engine::HookSite::LatestViewLoad,
+            Box::new(move || {
+                put_and_flush(&db2, &drive, &t, b"v2".to_vec(), true);
+            }),
+        );
     }
     let got = db
         .get_latest(t.id, t.families[0].id, b"row", b"q")
@@ -553,14 +562,17 @@ fn a_row_read_as_of_now_falls_back_to_a_snapshot_under_steady_commits() {
             Arc::clone(t),
             Arc::clone(runs),
         );
-        db.before_latest_view_load(Box::new(move || {
-            let n = runs2.fetch_add(1, Ordering::Relaxed) + 1;
-            put_and_flush(&db2, &drive2, &t2, format!("v{n}").into_bytes(), true);
-            // Every try of this read; none after it (the fallback snapshot runs no such hook).
-            if n < 4 {
-                arm(&db2, &drive2, &t2, &runs2);
-            }
-        }));
+        db.on_next(
+            pigeonhole_engine::HookSite::LatestViewLoad,
+            Box::new(move || {
+                let n = runs2.fetch_add(1, Ordering::Relaxed) + 1;
+                put_and_flush(&db2, &drive2, &t2, format!("v{n}").into_bytes(), true);
+                // Every try of this read; none after it (the fallback snapshot runs no such hook).
+                if n < 4 {
+                    arm(&db2, &drive2, &t2, &runs2);
+                }
+            }),
+        );
     }
     arm(&db, &drive, &t, &runs);
     assert_eq!(read_row_latest(&db, &t), [b"v4".to_vec()]);

@@ -620,19 +620,22 @@ mod tests {
         t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
         let engine = Arc::clone(&t.core.db.engine);
         let table = t.core.info.id;
-        engine.before_latest_view_load(Box::new({
-            let engine = Arc::clone(&engine);
-            move || {
-                let info = engine
-                    .add_family(table, "x", FamilyOptions::default())
-                    .unwrap();
-                let x = info.family("x").unwrap().id;
-                let mut wb = WriteBatch::new();
-                wb.put(table, x, b"r", b"q", None, ValueRef::Bytes(b"new"))
-                    .unwrap();
-                engine.commit(wb, None).unwrap();
-            }
-        }));
+        engine.on_next(
+            pigeonhole_engine::HookSite::LatestViewLoad,
+            Box::new({
+                let engine = Arc::clone(&engine);
+                move || {
+                    let info = engine
+                        .add_family(table, "x", FamilyOptions::default())
+                        .unwrap();
+                    let x = info.family("x").unwrap().id;
+                    let mut wb = WriteBatch::new();
+                    wb.put(table, x, b"r", b"q", None, ValueRef::Bytes(b"new"))
+                        .unwrap();
+                    engine.commit(wb, None).unwrap();
+                }
+            }),
+        );
         let row = t.row(b"r").read().unwrap().unwrap();
         let families: Vec<&str> = row.iter().map(|e| e.family).collect();
         assert_eq!(

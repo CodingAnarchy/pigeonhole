@@ -1,7 +1,7 @@
 //! Test hooks: the `test-hooks` feature, which only the engine's own tests and benches
 //! enable (its dev-dependency on itself). Everything a test reaches into the engine with
 //! is here: the `#[doc(hidden)]` `Engine` methods, the types they return, and the state
-//! they keep in `Shared::hooks`, `ShardMetrics::hooks` and `ReaderState::hooks`.
+//! they keep in `Shared::hooks` and `ShardMetrics::hooks`.
 //!
 //! The rules:
 //! - Every hook is used by a committed test; delete one when its last test goes.
@@ -39,19 +39,60 @@ use crate::shard::ShardMsg;
 use crate::snapshot::{Snapshot, TabletMap};
 use crate::{Error, Result};
 
-/// A callback a test sets to run once, the next time the engine reaches its site.
-#[derive(Default)]
-pub(crate) struct Once(Mutex<Option<Box<dyn FnOnce() + Send>>>);
+/// Where a one-shot test callback runs (`Engine::on_next`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookSite {
+    /// At the start of the next view publish (a shard publishing its memtables or a
+    /// manifest commit), before that publish takes the publish lock: where another thread's
+    /// publish can land in between.
+    ViewPublish,
+    /// On the calling thread of the next writer `snapshot()`, after it pinned its seqno and
+    /// before it loads the view: where a test publishes a flush in between (#315 review).
+    SnapshotViewLoad,
+    /// On the calling thread of the next unpinned read as of now (`get_latest`,
+    /// `read_row_latest_into`), after its first visible-seqno read and before it loads the
+    /// view. The callback may set this site again, to run in the read's next try too.
+    LatestViewLoad,
+    /// In the next `shrink` round, after it has read the catalog and before it relocates
+    /// anything: where a compaction or `drop_table` can commit under it.
+    ShrinkRelocates,
+    /// On the calling thread of the next `backup`, right after it released its snapshot's
+    /// memtables and before it merges the SSTs: where a test writes past the arena while
+    /// the backup still runs (#262).
+    BackupReleasedMemtables,
+    /// In the next `shrink` round that commits, after it has written its copies and before
+    /// it commits them: where a `drop_table` makes a copy one to abandon.
+    ShrinkCommits,
+    /// Reader processes: in the next snapshot, between reading the view record from shared
+    /// memory and loading the catalog of its manifest version.
+    ReaderViewRecord,
+    /// Reader processes: when a snapshot found the durable root at the view record's
+    /// manifest version and is about to read that manifest.
+    ReaderManifestLoad,
+}
 
-impl Once {
-    /// Sets the callback, replacing one that has not run.
-    pub(crate) fn set(&self, f: Box<dyn FnOnce() + Send>) {
-        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(f);
+/// A one-shot test callback.
+type Callback = Box<dyn FnOnce() + Send>;
+
+/// The one-shot callbacks tests set, at most one per site (`Hooks::sites`).
+#[derive(Default)]
+pub(crate) struct Sites(Mutex<Vec<(HookSite, Callback)>>);
+
+impl Sites {
+    /// Sets the callback for `site`, replacing one that has not run.
+    pub(crate) fn set(&self, site: HookSite, f: Callback) {
+        let mut v = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        v.retain(|(s, _)| *s != site);
+        v.push((site, f));
     }
 
-    /// Runs the callback if one is set (outside the lock).
-    pub(crate) fn run(&self) {
-        let f = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+    /// Runs `site`'s callback if one is set (outside the lock).
+    pub(crate) fn run(&self, site: HookSite) {
+        let f = {
+            let mut v = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let i = v.iter().position(|(s, _)| *s == site);
+            i.map(|i| v.swap_remove(i).1)
+        };
         if let Some(f) = f {
             f();
         }
@@ -61,6 +102,8 @@ impl Once {
 /// The engine-wide hook state (`Shared::hooks`).
 #[derive(Default)]
 pub(crate) struct Hooks {
+    /// The one-shot callbacks tests set at named sites (`Engine::on_next`).
+    pub sites: Sites,
     /// Whether `compactions` and `appended` record (`Engine::record_history`); off until a
     /// test turns it on.
     pub record: AtomicBool,
@@ -82,28 +125,9 @@ pub(crate) struct Hooks {
     /// Threads that parked in `manifest::commit_req_from_thread`, counted after their last
     /// look and just before `park` (`Engine::manifest_thread_parks`).
     pub manifest_thread_parks: AtomicUsize,
-    /// Runs at the start of the next `publish_view`, before the publish lock
-    /// (`Engine::before_next_view_publish`).
-    pub before_view_publish: Once,
     /// Makes the next group's second member wait for arena room, as a full arena would
     /// (`Engine::force_room_wait_once`, #315 review).
     pub room_wait_once: AtomicBool,
-    /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
-    /// (`Engine::before_snapshot_view_load`, #315 review).
-    pub before_snapshot_view_load: Once,
-    /// Runs in the next unpinned read as of now (`get_latest`, `read_row_latest_into`),
-    /// between its first visible-seqno read and its view load
-    /// (`Engine::before_latest_view_load`).
-    pub before_latest_view_load: Once,
-    /// Runs in the next shrink round, between its catalog read and its relocations
-    /// (`Engine::before_shrink_relocates`).
-    pub before_shrink_relocates: Once,
-    /// Runs once `backup` has released its snapshot's memtables, before its long merge
-    /// (`Engine::after_backup_releases_memtables`).
-    pub after_backup_releases_memtables: Once,
-    /// Runs in the next shrink round that commits, after its copies are written and before
-    /// the commit (`Engine::before_shrink_commits`).
-    pub before_shrink_commits: Once,
     /// Parks background manifest commits before `end` (`manifest::parked`,
     /// `Engine::park_manifest_commits`), and the parked pump's waker.
     pub manifest_park: AtomicBool,
@@ -198,16 +222,6 @@ pub(crate) struct ShardCounters {
     pub checkpoint_pops_max: AtomicU64,
 }
 
-/// A reader process's snapshot hooks (`ReaderState::hooks`).
-#[derive(Default)]
-pub(crate) struct ReaderHooks {
-    /// Between reading the view record and loading the catalog of its manifest version.
-    pub after_record: Once,
-    /// After the durable root matched the record's manifest version, before the manifest
-    /// is read.
-    pub before_manifest_load: Once,
-}
-
 /// A WAL record the engine appended to a stream (test hook): the per-stream append order,
 /// which decides what a crash keeps (a stream survives as a prefix).
 #[doc(hidden)]
@@ -273,6 +287,13 @@ pub struct ManifestInfo {
 }
 
 impl Engine {
+    /// Runs `f` once, the next time the engine reaches `site` (test hook): see
+    /// [`HookSite`] for where each runs. Replaces a callback set there that has not run.
+    #[doc(hidden)]
+    pub fn on_next(&self, site: HookSite, f: Box<dyn FnOnce() + Send>) {
+        self.inner.shared.hooks.sites.set(site, f);
+    }
+
     /// The seqnos of this process's live snapshots, the ones compaction's GC keeps
     /// (`gc_snapshots`): a transaction's commit holds its snapshot here until it resolves
     /// (#672).
@@ -688,14 +709,6 @@ impl Engine {
         self.inner.shared.cache.usage()
     }
 
-    /// Runs `f` once, in the next `shrink` round, after it has read the catalog and before it
-    /// relocates anything: where a compaction or `drop_table` can commit under it (test
-    /// hook).
-    #[doc(hidden)]
-    pub fn before_shrink_relocates(&self, f: Box<dyn FnOnce() + Send>) {
-        self.inner.shared.hooks.before_shrink_relocates.set(f);
-    }
-
     /// The next commit group's second member waits for room as if the arena were full: the
     /// stall path freezes memtables after the group's first member was admitted (test hook,
     /// #315 review).
@@ -708,49 +721,12 @@ impl Engine {
             .store(true, Ordering::Release);
     }
 
-    /// Runs `f` once, on the calling thread of the next writer `snapshot()`, after it pinned
-    /// its seqno and before it loads the view: where a test publishes a flush in between
-    /// (#315 review; test hook).
-    #[doc(hidden)]
-    pub fn before_snapshot_view_load(&self, f: Box<dyn FnOnce() + Send>) {
-        self.inner.shared.hooks.before_snapshot_view_load.set(f);
-    }
-
-    /// Runs `f` once, on the calling thread of the next unpinned read as of now
-    /// (`get_latest`, `read_row_latest_into`), after its first visible-seqno read and before it
-    /// loads the view: where a test publishes a flush in between (test hook). `f` may set the
-    /// hook again, to run in the read's next try too.
-    #[doc(hidden)]
-    pub fn before_latest_view_load(&self, f: Box<dyn FnOnce() + Send>) {
-        self.inner.shared.hooks.before_latest_view_load.set(f);
-    }
-
     /// Runs `f` once, in the calling thread's next row read, after its first family and
     /// before its second: where a test flushes, compacts and reclaims while the read holds
     /// its view (#392 review; test hook).
     #[doc(hidden)]
     pub fn between_row_read_families(&self, f: Box<dyn FnOnce()>) {
         crate::read::BETWEEN_ROW_FAMILIES.with(|h| *h.borrow_mut() = Some(f));
-    }
-
-    /// Runs `f` once, on the calling thread of the next `backup`, right after it released its
-    /// snapshot's memtables and before it merges the SSTs: where a test writes past the
-    /// arena while the backup still runs (#262; test hook).
-    #[doc(hidden)]
-    pub fn after_backup_releases_memtables(&self, f: Box<dyn FnOnce() + Send>) {
-        self.inner
-            .shared
-            .hooks
-            .after_backup_releases_memtables
-            .set(f);
-    }
-
-    /// Runs `f` once, in the next `shrink` round that commits, after it has written its
-    /// copies and before it commits them: where a `drop_table` makes a copy one to abandon
-    /// (test hook).
-    #[doc(hidden)]
-    pub fn before_shrink_commits(&self, f: Box<dyn FnOnce() + Send>) {
-        self.inner.shared.hooks.before_shrink_commits.set(f);
     }
 
     /// Splits the tablet of `table` holding row `at` at `at`; both halves stay on its shard.
@@ -1089,14 +1065,6 @@ impl Engine {
         }
     }
 
-    /// Runs `f` once, at the start of the next view publish (a shard publishing its
-    /// memtables or a manifest commit), before that publish takes the publish lock: where
-    /// another thread's publish can land in between (test hook).
-    #[doc(hidden)]
-    pub fn before_next_view_publish(&self, f: Box<dyn FnOnce() + Send>) {
-        self.inner.shared.hooks.before_view_publish.set(f);
-    }
-
     /// While `refuse` is set, the manifest writer refuses every batch made only of WAL
     /// checkpoints with `NoSpace`, through the path a snapshot rewrite that finds no space
     /// takes (nothing written, the writer stays usable). Test hook.
@@ -1171,24 +1139,6 @@ impl Engine {
             if let Some(w) = parked {
                 w.wake();
             }
-        }
-    }
-
-    /// Reader processes: runs `hook` once, in the next snapshot, between reading the view
-    /// record from shared memory and loading the catalog of its manifest version (test hook).
-    #[doc(hidden)]
-    pub fn on_reader_view_record(&self, hook: Box<dyn FnOnce() + Send>) {
-        if let Some(r) = &self.inner.reader {
-            r.hooks.after_record.set(hook);
-        }
-    }
-
-    /// Reader processes: runs `hook` once, when a snapshot found the durable root at the
-    /// view record's manifest version and is about to read that manifest (test hook).
-    #[doc(hidden)]
-    pub fn on_reader_manifest_load(&self, hook: Box<dyn FnOnce() + Send>) {
-        if let Some(r) = &self.inner.reader {
-            r.hooks.before_manifest_load.set(hook);
         }
     }
 
