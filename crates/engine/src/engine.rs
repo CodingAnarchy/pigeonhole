@@ -2388,7 +2388,8 @@ impl Engine {
     /// [`Engine::open_with`] of the same path (D265): the close's result, and the handover,
     /// or `None` when this call did not start the close (a `close`, or another
     /// `close_for_reopen`, was already under way: this call waits for it, and that close
-    /// releases the locks) or when the final close had already released them (every shard
+    /// releases the locks, or hands them over if it is a `close_for_reopen` itself) or when
+    /// the final close had already released them (every shard
     /// was dead and the close ran before this call); the caller then falls back to
     /// [`Engine::open`]. Dropping the handover releases the locks, but runs no last-one-out
     /// cleanup: the WAL files and the shm region stay, as after a crashed writer, and the
@@ -3572,8 +3573,9 @@ impl Inner {
     /// `close`, and whether this call is the one that started the close. With `keep_locks`
     /// (a `close_for_reopen`, D265) the final close leaves the locks in place, but only when
     /// this call started it: a call that finds the close under way sets nothing (the close
-    /// that started first releases the locks when it ends) and, since its caller wants the
-    /// outcome, waits for that close to finish and returns its result.
+    /// that started first releases the locks when it ends, or hands them over if it is a
+    /// `close_for_reopen`) and, since its caller wants the outcome, waits for that close to
+    /// finish and returns its result.
     fn close_with(&self, wait: bool, keep_locks: bool) -> (Result<()>, bool) {
         if self.role != Role::Writer {
             return (self.close_reader(), false);

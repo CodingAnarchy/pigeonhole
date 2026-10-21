@@ -64,7 +64,7 @@ pub struct Handover { /* private */ }
 impl Engine {
     /// Closes as `close` does, keeping the locks: the close's result, and the handover, or
     /// `None` when this call did not start the close (a close was under way: it waits for it,
-    /// and that close releases the locks) or the final close had already released them
+    /// and that close releases or hands over the locks) or the final close had already released them
     /// (every shard dead); then fall back to `open`. Engine-owned writers only
     /// (`InvalidArgument` otherwise).
     pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>);
