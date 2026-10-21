@@ -1824,3 +1824,63 @@ fn large_puts_are_separated_at_the_output() {
     assert_eq!(kept[1].1, e[1].1);
     assert_eq!(kept[2].1, e[2].1);
 }
+
+/// D268: a compaction's outputs carry `Properties::fully_purged` (the family's
+/// `max_versions`) only when nothing held the purge back: bottommost, no snapshot, nothing
+/// above the inputs, and, for a counter family, every other source listed.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn outputs_are_marked_fully_purged_only_when_nothing_held_the_purge_back() {
+    let mut db = Db::new(268);
+    let family = FamilyOptions::default().max_versions(2);
+    let e = vec![
+        (key(b"r", b"q", 300, 3, Kind::Put), stored(b"c")),
+        (key(b"r", b"q", 200, 2, Kind::Put), stored(b"b")),
+        (key(b"r", b"q", 100, 1, Kind::Put), stored(b"a")),
+    ];
+    let input = db.sst(&family, &e);
+    let purged = |family: &FamilyOptions, gc: GcPolicy| {
+        let (out, _) = compact(&db, family, std::slice::from_ref(&input), gc);
+        let marks: Vec<_> = out
+            .added
+            .iter()
+            .map(|(_, meta)| {
+                open_sst(&db.pager, &db.cache, meta)
+                    .properties()
+                    .fully_purged
+            })
+            .collect();
+        assert_eq!(marks.len(), 1);
+        marks[0]
+    };
+    assert_eq!(purged(&family, policy(vec![], 1_000, true)), Some(2));
+    assert_eq!(
+        purged(&family, policy(vec![2], 1_000, true)),
+        None,
+        "a snapshot"
+    );
+    assert_eq!(
+        purged(&family, policy(vec![], 1_000, false)),
+        None,
+        "not bottommost"
+    );
+    let mut above = policy(vec![], 1_000, true);
+    above.min_ts_above = 150;
+    assert_eq!(purged(&family, above), None, "an entry above the inputs");
+
+    let counter = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_add")
+        .kind(FamilyKind::Counter);
+    let unknown = policy(vec![], 1_000, true);
+    assert_eq!(
+        purged(&counter, unknown.clone()),
+        None,
+        "other sources unknown"
+    );
+    let mut listed = unknown;
+    listed.other_sources = Some(Vec::new());
+    assert_eq!(purged(&counter, listed), Some(0));
+}

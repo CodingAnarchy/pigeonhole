@@ -641,6 +641,16 @@ impl CompactionJob {
         let mut options =
             SstWriterOptions::for_family(&context.family, context.table, task.family, task.tablet);
         options.created_micros = context.gc.now;
+        // Nothing held the purge back (D268): the output is bottommost, no snapshot keeps a
+        // version, nothing lies above the inputs, and a counter family's other sources are all
+        // listed (none), so its operands combine and its deletes go. A rewrite of the output
+        // would then drop only what expires meanwhile.
+        options.fully_purged = (context.gc.bottommost
+            && context.gc.snapshots.is_empty()
+            && context.gc.min_ts_above == Timestamp::MAX
+            && (context.family.kind != FamilyKind::Counter
+                || context.gc.other_sources.as_ref().is_some_and(Vec::is_empty)))
+        .then_some(context.family.max_versions);
         let subranges = if task.subranges.is_empty() {
             vec![task.range.clone()]
         } else {

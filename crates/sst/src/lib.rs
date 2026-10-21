@@ -248,6 +248,9 @@ pub struct SstWriterOptions {
     /// Creation time recorded in properties, microseconds since the Unix epoch (the engine
     /// passes `Vfs::now_micros`, so simulated runs stay deterministic). Default 0.
     pub created_micros: u64,
+    /// Recorded as `Properties::fully_purged`: `Some(max_versions)` when the writer is a
+    /// bottommost compaction that nothing held back (D268). Default `None`.
+    pub fully_purged: Option<u32>,
 }
 
 impl SstWriterOptions {
@@ -269,6 +272,7 @@ impl SstWriterOptions {
             tablet,
             merge_operator: options.merge_operator.clone(),
             created_micros: 0,
+            fully_purged: None,
         }
     }
 }

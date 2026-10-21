@@ -117,6 +117,12 @@ impl Rig {
     /// One shard, tablet changes off, a family keeping one version; the fourth L0 SST
     /// triggers a compaction into L1.
     fn open(seed: u64) -> Self {
+        Self::open_with(seed, FamilyOptions::default().max_versions(1), None)
+    }
+
+    /// As [`Rig::open`], with `family` for the table's family and, if given, a target SST
+    /// size (so a rewrite writes a run of several SSTs).
+    fn open_with(seed: u64, family: FamilyOptions, target: Option<u64>) -> Self {
         let vfs = SimVfs::new(seed);
         let mut o = common::options(Arc::clone(&vfs), 1, 4 << 20);
         let clock: VfsRef = Arc::new(Ticking {
@@ -128,13 +134,11 @@ impl Rig {
         o.compaction_threads = 0;
         o.compaction.l0_trigger = 4;
         o.compaction.level_base_bytes = u64::MAX;
+        if let Some(target) = target {
+            o.compaction.target_sst_bytes = target;
+        }
         let (db, shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
-        let t = db
-            .create_table(
-                "t",
-                &[("f".into(), FamilyOptions::default().max_versions(1))],
-            )
-            .unwrap();
+        let t = db.create_table("t", &[("f".into(), family)]).unwrap();
         let (t, f) = (t.id, t.families[0].id);
         Rig {
             db,
@@ -186,6 +190,49 @@ impl Rig {
             .count()
     }
 
+    /// The family's levels holding SSTs: `(level, SSTs, entries)`.
+    fn levels(&self) -> Vec<(u8, u64, u64)> {
+        let info = self.db.info().unwrap();
+        info.tables
+            .iter()
+            .filter(|t| t.info.id == self.t)
+            .flat_map(|t| t.families.iter().filter(|f| f.family == self.f))
+            .flat_map(|f| f.levels.iter().map(|l| (l.level, l.ssts, l.entries)))
+            .collect()
+    }
+
+    /// `rows` rows of `cols` columns, each cell one version at `ts` of 100 bytes that do
+    /// not compress.
+    fn put_rows(&mut self, rows: u32, cols: u32, ts: u64) {
+        for chunk in (0..rows).step_by(100) {
+            self.commit(|wb, t, f| {
+                for i in chunk..(chunk + 100).min(rows) {
+                    for c in 0..cols {
+                        let (row, q) = (format!("r{i:05}"), format!("q{c}"));
+                        let mut x = (u64::from(i) << 32 | u64::from(c)) ^ ts;
+                        let value: Vec<u8> = (0..100)
+                            .map(|_| {
+                                x = x
+                                    .wrapping_mul(6364136223846793005)
+                                    .wrapping_add(1442695040888963407);
+                                (x >> 56) as u8
+                            })
+                            .collect();
+                        wb.put(
+                            t,
+                            f,
+                            row.as_bytes(),
+                            q.as_bytes(),
+                            Some(ts),
+                            ValueRef::Bytes(&value),
+                        )
+                        .unwrap();
+                    }
+                }
+            });
+        }
+    }
+
     fn close(mut self) {
         self.db.close().unwrap();
         run(&mut self.shards);
@@ -229,8 +276,11 @@ fn a_full_compaction_purges_a_lone_sst_written_under_a_snapshot() {
 #[test]
 fn a_lone_sst_that_still_looks_purgeable_is_rewritten_once_per_full_compaction() {
     let mut rig = Rig::open(806);
-    // Rows of two columns: more entries than rows whatever is purged, so the rewritten SST
-    // still looks as if it might hold extra versions.
+    // Rows of two columns: more entries than rows whatever is purged. A snapshot taken
+    // before the last flush is live through the background compaction it triggers, and
+    // through the full compactions below, so no output carries the fully-purged property
+    // (D268), and the SST still looks as if it might hold extra versions.
+    let mut snap = None;
     for ts in [10u64, 20, 30, 40] {
         rig.commit(|wb, t, f| {
             for q in [b"q1".as_slice(), b"q2"] {
@@ -238,6 +288,9 @@ fn a_lone_sst_that_still_looks_purgeable_is_rewritten_once_per_full_compaction()
                     .unwrap();
             }
         });
+        if ts == 40 {
+            snap = Some(rig.db.snapshot().unwrap());
+        }
         rig.flush();
     }
     run(&mut rig.shards);
@@ -250,5 +303,124 @@ fn a_lone_sst_that_still_looks_purgeable_is_rewritten_once_per_full_compaction()
     // A second request rewrites it once more, and ends too.
     rig.compact();
     assert_eq!(rig.db.take_compactions().len(), 1);
+    // With the snapshot gone, a rewrite carries the property, and then none follows.
+    drop(snap);
+    rig.compact();
+    assert_eq!(rig.db.take_compactions().len(), 1);
+    rig.compact();
+    assert_eq!(
+        rig.db.take_compactions().len(),
+        0,
+        "fully purged: left alone"
+    );
+    rig.close();
+}
+
+/// #820: a last-level run of several SSTs a full compaction wrote while a snapshot held its
+/// purge back keeps every version; once the snapshot goes, the next full compaction purges
+/// it (#814 left a run as it was). Its output, written with nothing held back, carries the
+/// fully-purged property (D268), and a third full compaction rewrites nothing.
+#[test]
+fn a_full_compaction_purges_a_last_level_run_written_under_a_snapshot() {
+    let mut rig = Rig::open_with(
+        820,
+        FamilyOptions::default().max_versions(1),
+        Some(32 << 10),
+    );
+    rig.put_rows(2000, 1, 10);
+    rig.flush();
+    let snap = rig.db.snapshot().unwrap();
+    rig.put_rows(2000, 1, 20);
+    rig.flush();
+    rig.compact();
+    let held = rig.levels();
+    assert!(
+        matches!(held[..], [(_, ssts, 4000)] if ssts > 1),
+        "one run of several SSTs keeping both versions: {held:?}"
+    );
+    drop(snap);
+    rig.compact();
+    let purged = rig.levels();
+    assert!(
+        matches!(purged[..], [(_, _, 2000)]),
+        "one version per cell: {purged:?}"
+    );
+    rig.db.record_history(true);
+    rig.compact();
+    assert_eq!(
+        rig.db.take_compactions().len(),
+        0,
+        "fully purged: left alone"
+    );
+    rig.close();
+}
+
+/// D268: rows of several columns always have more entries than rows, so without the
+/// property a family keeping `max_versions` had its whole last level rewritten by every
+/// full compaction. A run a full compaction wrote with nothing held back is left alone.
+#[test]
+fn a_run_of_several_columns_purged_with_nothing_held_back_is_not_rewritten_again() {
+    let mut rig = Rig::open_with(
+        821,
+        FamilyOptions::default().max_versions(1),
+        Some(32 << 10),
+    );
+    rig.put_rows(1000, 3, 10);
+    rig.flush();
+    rig.put_rows(1000, 3, 20);
+    rig.flush();
+    rig.compact();
+    let run = rig.levels();
+    assert!(
+        matches!(run[..], [(_, ssts, 3000)] if ssts > 1),
+        "one run, one version per cell: {run:?}"
+    );
+    rig.db.record_history(true);
+    for _ in 0..2 {
+        rig.compact();
+        assert_eq!(rig.db.take_compactions().len(), 0, "rewritten again");
+    }
+    assert_eq!(rig.levels(), run);
+    rig.close();
+}
+
+/// #820 (ctr274's review): a run of several SSTs under a live snapshot still looks
+/// purgeable after each rewrite (the snapshot keeps the versions, and no output carries the
+/// fully-purged property), so each full compaction rewrites it exactly once and returns.
+/// Once the snapshot goes, one more rewrite purges it and marks it, and then none follows.
+#[test]
+fn a_run_under_a_live_snapshot_is_rewritten_once_per_full_compaction() {
+    let mut rig = Rig::open_with(
+        822,
+        FamilyOptions::default().max_versions(1),
+        Some(32 << 10),
+    );
+    rig.put_rows(2000, 1, 10);
+    rig.flush();
+    let snap = rig.db.snapshot().unwrap();
+    rig.put_rows(2000, 1, 20);
+    rig.flush();
+    rig.compact();
+    let held = rig.levels();
+    assert!(
+        matches!(held[..], [(_, ssts, 4000)] if ssts > 1),
+        "one run of several SSTs keeping both versions: {held:?}"
+    );
+    rig.db.record_history(true);
+    for _ in 0..2 {
+        rig.compact();
+        assert_eq!(rig.db.take_compactions().len(), 1, "one rewrite of the run");
+        assert_eq!(rig.levels(), held, "the snapshot keeps both versions");
+    }
+    drop(snap);
+    rig.compact();
+    assert_eq!(rig.db.take_compactions().len(), 1);
+    assert!(matches!(rig.levels()[..], [(_, _, 2000)]));
+    rig.compact();
+    assert_eq!(
+        rig.db.take_compactions().len(),
+        0,
+        "fully purged: left alone"
+    );
     rig.close();
 }

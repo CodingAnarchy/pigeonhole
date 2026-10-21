@@ -88,6 +88,7 @@ impl Writer {
             ts_range: (u64::MAX, 0),
             created_micros: opts.created_micros,
             merge_operator: opts.merge_operator.clone(),
+            fully_purged: opts.fully_purged,
             ..Properties::default()
         };
         Self {
@@ -163,7 +164,7 @@ impl Writer {
         let top = (self.partitions.len() + 4) * index_entry + BLOCK_TAIL + TRAILER_LEN;
         let filters =
             self.filter_bound(self.row_keys + 1) + self.filter_bound(self.column_keys + 1);
-        let props = 160 + 2 * (10 + max_key) + 10 + self.opts.merge_operator.len() + TRAILER_LEN;
+        let props = 168 + 2 * (10 + max_key) + 10 + self.opts.merge_operator.len() + TRAILER_LEN;
         (data + index + top + filters + props + FOOTER_LEN) as u64
     }
 

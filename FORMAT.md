@@ -139,7 +139,9 @@ Each address is 16 bytes: `offset` u64, `len` u32, reserved u32. A zero-length a
 
 Fields in order, fixed-width little-endian unless marked *bytes* (varint length + bytes):
 
-`table` u32, `family` u32, `tablet` u64, `entries` u64, `rows` u64, `deletes` u64, `merges` u64, `raw_key_bytes` u64, `raw_value_bytes` u64, `data_blocks` u32, `index_partitions` u32, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `created_micros` u64, `smallest_key` *bytes*, `largest_key` *bytes*, `merge_operator` *bytes* (UTF-8, empty if none).
+`table` u32, `family` u32, `tablet` u64, `entries` u64, `rows` u64, `deletes` u64, `merges` u64, `raw_key_bytes` u64, `raw_value_bytes` u64, `data_blocks` u32, `index_partitions` u32, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `created_micros` u64, `smallest_key` *bytes*, `largest_key` *bytes*, `merge_operator` *bytes* (UTF-8, empty if none), `purge_flags` u32, `purged_max_versions` u32.
+
+`purge_flags` bit 0 (**fully purged**, D268): a bottommost compaction wrote the SST with nothing holding its purge back (no live snapshot, nothing above its inputs, and for a counter family every other source listed), so a rewrite would drop only what expires afterwards. `purged_max_versions` is the family's `max_versions` at the time (0: every version kept); a later policy keeping fewer versions voids the flag. Other bits are reserved and ignored. A block written before these two fields (format 3 before D268) ends after `merge_operator`, and reads as not fully purged.
 
 Readers ignore trailing bytes after the last known field, so fields can be appended.
 
