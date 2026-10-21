@@ -80,6 +80,14 @@ impl Failure {
         }
     }
 
+    /// A database error with phdb's own message, keeping the error's code and status.
+    pub(crate) fn db_with(message: String, e: &Error) -> Self {
+        Self {
+            message,
+            ..Self::db("", e)
+        }
+    }
+
     /// A database error, with `context` (what phdb was doing) before its message.
     pub(crate) fn db(context: &str, e: &Error) -> Self {
         let code = e.code();

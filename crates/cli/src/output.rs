@@ -30,6 +30,8 @@ pub(crate) struct Report {
     /// Each row has one value per column.
     pub rows: Vec<Vec<Value>>,
     pub command: &'static str,
+    /// The exit status after rendering (`check` exits 3 when it found damage).
+    pub status: crate::ExitStatus,
 }
 
 /// Writes `report` to `out` in `format`.

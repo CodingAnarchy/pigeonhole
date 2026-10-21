@@ -41,6 +41,23 @@ pub(crate) enum Command {
         /// The database file (`*.phdb`).
         file: PathBuf,
     },
+    /// Check the database for damage, offline: superblocks, manifest, extents, every SST
+    /// block, every blob record and the WAL a crash left. Exits 3 if anything is damaged.
+    Check {
+        /// The database file (`*.phdb`).
+        file: PathBuf,
+        /// Also read every separated value through its pointer, and recount blob live bytes.
+        #[arg(long)]
+        deep: bool,
+        /// List the file's regions (superblocks, manifest, SSTs, blob extents) instead of the
+        /// findings, for `table` and `csv` output (`json` adds them as `regions`).
+        #[arg(long)]
+        map: bool,
+        /// If a writer process has the database open, read every table through a reader
+        /// process instead (a weaker check: only the data a scan reaches).
+        #[arg(long)]
+        online: bool,
+    },
 }
 
 /// The output format (`--format`).
