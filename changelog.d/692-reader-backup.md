@@ -1,0 +1,2 @@
+### Added
+- `PigeonholeReader::backup` and `backup_durable`: a consistent single-file copy from a reader process while the writer runs (ICR 0049). The reader's snapshot pins the writer's memtables for the copy's length, so on a write-heavy database the writer's commits can wait meanwhile. A writer restart mid-copy fails it with `SnapshotExpired`. `phdb backup` uses it while an application has the database open (#692).

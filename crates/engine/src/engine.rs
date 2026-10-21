@@ -2077,6 +2077,14 @@ impl Engine {
     /// at a snapshot taken now, as a clean database that opens without WAL replay. Visible is
     /// not durable (D227): the copy can hold commits whose sync had not finished, which a
     /// power loss then removes from this database.
+    ///
+    /// A reader process can back up too (ICR 0049). Its snapshot's pin in shared memory pins
+    /// the whole view, memtables included, so the writer frees none of that view's memtables
+    /// until the copy is done (the writer itself releases them after copying them, #262): a
+    /// long backup from a reader of a write-heavy database can fill the writer's memtable
+    /// arenas and make its commits wait. A writer restart while the copy runs fails it with
+    /// `SnapshotExpired`, removing the partial copy, even one during the copy's own manifest
+    /// commit, after every read (the data was complete; the check is conservative).
     pub fn backup(&self, dest: &Path) -> Result<()> {
         self.backup_of(dest, false)
     }
@@ -2090,9 +2098,6 @@ impl Engine {
 
     fn backup_of(&self, dest: &Path, durable: bool) -> Result<()> {
         let inner = &self.inner;
-        if inner.role != Role::Writer {
-            return Err(Error::ReadOnly);
-        }
         let _guard = inner.enter_maintenance()?;
         let snapshot = inner.snapshot_of(durable)?;
         crate::maintenance::backup(&inner.shared, snapshot, dest)

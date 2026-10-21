@@ -44,6 +44,17 @@ impl Db {
         }
     }
 
+    /// A consistent single-file copy at a durable snapshot, or with `latest` at a snapshot of
+    /// everything committed; from a reader process too (ICR 0049).
+    pub(crate) fn backup(&self, dest: &Path, latest: bool) -> pigeonhole::Result<()> {
+        match (self, latest) {
+            (Db::Writer(db), false) => db.backup_durable(dest),
+            (Db::Writer(db), true) => db.backup(dest),
+            (Db::Reader(db), false) => db.backup_durable(dest),
+            (Db::Reader(db), true) => db.backup(dest),
+        }
+    }
+
     /// Table names.
     pub(crate) fn tables(&self) -> Vec<String> {
         match self {

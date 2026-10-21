@@ -54,7 +54,9 @@ use crate::{Error, Result};
 /// Entries `backup` copies between checks for a close.
 const CLOSE_CHECK_EVERY: u64 = 4096;
 
-/// Writes a consistent copy of `snapshot` to `dest` (which must not exist). Stops with
+/// Writes a consistent copy of `snapshot` to `dest` (which must not exist), in the writer
+/// process or a reader process (ICR 0049; a reader holds its snapshot's pin throughout, see
+/// below, and stops with `SnapshotExpired` if the writer restarts). Stops with
 /// `Closed` (removing the partial copy) once the engine is closing. The snapshot's memtables
 /// are released after the first phase; see the module docs.
 pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result<()> {
@@ -91,13 +93,18 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
     let last = shared.picker.max_levels.max(2) - 1;
     let created = shared.vfs.now_micros();
     let all = ScanFilter::all();
+    // A reader process (ICR 0049) pins what it reads through its shm slot, which pins a
+    // whole view, memtables included (FORMAT §11.5): it can't release the memtables after
+    // phase 1 and keep only the SSTs pinned, as the writer does below. So it keeps its pin
+    // (a clone of the snapshot's live count) for the whole copy, and the writer frees nothing
+    // of that view meanwhile. A writer restart expires the snapshot: stop then.
+    let reader_pin = snapshot._live.clone();
     // `close` waits for this call (its maintenance guard): stop at the next check instead.
     let closing = || {
         if shared.closing.load(Ordering::Acquire) {
-            Err(Error::Closed)
-        } else {
-            Ok(())
+            return Err(Error::Closed);
         }
+        reader_pin.as_ref().map_or(Ok(()), |l| l.check_current())
     };
     // Reads of the new file's temporary SSTs: their ids start again at 1, so they must not
     // share the engine's cache, which is keyed by SST id.
@@ -142,6 +149,9 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
                 .map(|_| Arc::new(ShardMems::default()))
                 .collect(),
             ssts: Arc::clone(&full.ssts),
+            // The writer's protection for the SSTs below. In a reader process this registers
+            // in its own `live_views`, which nothing there reclaims against: harmless, and not
+            // the reader's protection (that is `reader_pin` above).
             _pin: Some(ViewPin::new(&shared.live_views, full.manifest_version)),
         });
         drop(full);
@@ -249,6 +259,12 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
         writer.commit(&catalog, &edits)?;
         writer.mark_clean()
     })();
+    // A reader whose writer restarted mid-copy may have read bytes the new writer reused, and
+    // failed on them: the cause is the expired snapshot, not damage.
+    let result = match (result, reader_pin.as_ref().map(|l| l.check_current())) {
+        (Err(_), Some(Err(expired))) => Err(expired),
+        (r, _) => r,
+    };
     if result.is_err() {
         // Leave nothing half-written behind: the copy is useless without its manifest.
         drop(pager);

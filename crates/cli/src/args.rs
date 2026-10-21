@@ -73,7 +73,8 @@ pub(crate) enum Command {
         create: bool,
     },
     /// Copy the database into one new file while it stays usable: by default only commits
-    /// durable at their level (`--latest` adds the rest). Opens as the writer.
+    /// durable at their level (`--latest` adds the rest). With a writer process running, it
+    /// copies from a reader process.
     Backup {
         /// The database file (`*.phdb`).
         file: PathBuf,

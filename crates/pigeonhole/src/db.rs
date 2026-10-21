@@ -699,6 +699,29 @@ impl PigeonholeReader {
     pub fn durable_snapshot(&self) -> Result<Snapshot> {
         self.db.durable_snapshot()
     }
+
+    /// As [`Pigeonhole::backup`], from this reader process while the writer runs (ICR 0049):
+    /// a consistent single-file copy of everything visible at a snapshot taken now. `dest`
+    /// must not exist.
+    ///
+    /// The snapshot's pin in shared memory covers the whole view, memtables included, so
+    /// the writer frees none of that view's memtables until the copy is done (its own
+    /// backup releases them after copying them): a long backup of a write-heavy database
+    /// can fill the writer's memtable arenas, and its commits then wait, up to
+    /// [`Options::write_stall_timeout`](crate::Options::write_stall_timeout). A writer
+    /// restart while the copy runs fails it with
+    /// [`ErrorCode::SnapshotExpired`](crate::ErrorCode::SnapshotExpired), removing the
+    /// partial copy, even one during the copy's own final commit, when the data was
+    /// complete.
+    pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
+        Ok(self.db.engine.backup(dest.as_ref())?)
+    }
+
+    /// As [`PigeonholeReader::backup`], at a durable snapshot (as
+    /// [`Pigeonhole::backup_durable`]): the copy holds only commits durable at their level.
+    pub fn backup_durable(&self, dest: impl AsRef<Path>) -> Result<()> {
+        Ok(self.db.engine.backup_durable(dest.as_ref())?)
+    }
 }
 
 /// A point-in-time view for reads. Holding it pins the data it can see; drop it promptly.

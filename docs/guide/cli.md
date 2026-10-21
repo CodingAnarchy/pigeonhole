@@ -14,7 +14,7 @@
 | `phdb check <file> [--deep] [--map] [--online]` | Check the file for damage, offline. Exits 3 if anything is damaged. |
 | `phdb dump <file> [--table T]... [--prefix P] [--durable]` | Export every cell, with all retained versions, at one snapshot, to standard output: `jsonl` (the default) or `csv`. |
 | `phdb load <file> [<dump.jsonl> \| -] [--create]` | Load a `jsonl` dump: create its tables and families and write every cell at its timestamp. |
-| `phdb backup <file> <dest> [--latest] [--check]` | Copy the database into one new file, consistent at one snapshot. |
+| `phdb backup <file> <dest> [--latest] [--check]` | Copy the database into one new file, consistent at one snapshot, also while your application runs. |
 | `phdb compact <file> [--shrink]` | Full compaction, with progress; optionally release free space at the file's end. |
 | `phdb shell <file> [-c CMD]... [-f SCRIPT] [--read-only]` | An interactive shell: get, scan, put, incr, delete, create and snapshots. |
 
@@ -217,13 +217,16 @@ $ phdb dump copy.phdb | tail -n +2 | diff - <(tail -n +2 app.jsonl)    # identic
 
 ### `phdb backup` and `phdb compact`
 
-Both open the database as the writer, so they fail with status 4 while your application has it open. A backup from a running application's process is planned (#692): until then, call `Pigeonhole::backup_durable` from the application itself, or stop it first.
+`phdb compact` opens the database as the writer, so it fails with status 4 while your application has it open. `phdb backup` follows the read commands' [open policy](#how-phdb-opens-a-database). With no writer running it opens as the writer. While your application runs, it copies from a reader process (`PigeonholeReader::backup_durable`, or `backup` with `--latest`; ICR 0049).
+
+**The cost of a backup from a reader process:** its snapshot pins the whole view in shared memory, including the application's memtables, until the copy is done. On a write-heavy database the application's memtables can then fill, and its commits wait (up to `write_stall_timeout`, then `Busy`). Back up a busy database when writes are light. Or call `Pigeonhole::backup_durable` from the application itself: the writer's own backup releases memtables as soon as it has copied them.
 
 **`phdb backup <file> <dest>`** writes a consistent single-file copy to `dest`, which must not exist. The copy needs no WAL replay to open. It's `Pigeonhole::backup_durable`, a copy at a durable snapshot holding only commits durable at their level. `--latest` uses `Pigeonhole::backup` instead, which also copies commits not yet durable. `--check` then runs `phdb check` on the copy and exits 3 if it's damaged.
 
 | Field | Meaning |
 |---|---|
 | `path`, `dest` | The database and the copy. |
+| `mode` | `writer` or `reader`: how `phdb` opened the database. |
 | `snapshot` | `durable` or `latest`. |
 | `bytes` | The copy's size. |
 | `elapsed_ms` | How long the copy took. |

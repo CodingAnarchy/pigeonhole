@@ -1,5 +1,6 @@
 //! `phdb backup`: a consistent single-file copy ([`Pigeonhole::backup_durable`], or
-//! [`Pigeonhole::backup`] with `--latest`), optionally checked afterwards.
+//! [`Pigeonhole::backup`] with `--latest`), optionally checked afterwards. While a writer
+//! process has the database open, it backs up from a reader process (ICR 0049).
 //!
 //! [`Pigeonhole::backup_durable`]: pigeonhole::Pigeonhole::backup_durable
 //! [`Pigeonhole::backup`]: pigeonhole::Pigeonhole::backup
@@ -29,15 +30,12 @@ pub(crate) fn run(
             dest.display()
         )));
     }
-    let db = open::for_write(cli, file, false)?;
+    let db = open::for_read(cli, file)?;
+    let mode = db.mode();
     let started = Instant::now();
-    let copied = if latest {
-        db.backup(dest)
-    } else {
-        db.backup_durable(dest)
-    };
+    let copied = db.backup(dest, latest);
     let elapsed = started.elapsed();
-    let closed = db.close().map_err(|e| Failure::db("close", &e));
+    let closed = db.close();
     copied.map_err(|e| Failure::db("backup", &e))?;
     closed?;
     let bytes = std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0);
@@ -45,6 +43,7 @@ pub(crate) fn run(
     let mut summary = vec![
         ("path", json!(file.display().to_string())),
         ("dest", json!(dest.display().to_string())),
+        ("mode", json!(mode)),
         ("snapshot", json!(if latest { "latest" } else { "durable" })),
         ("bytes", json!(bytes)),
         ("elapsed_ms", json!(elapsed.as_millis() as u64)),
