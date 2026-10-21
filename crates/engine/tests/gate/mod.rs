@@ -65,6 +65,11 @@ impl Gate {
         self.rules.lock().unwrap().fail.insert(path.to_path_buf());
     }
 
+    /// Stops failing `path`'s syncs (a disk that recovered).
+    pub fn heal(&self, path: &Path) {
+        self.rules.lock().unwrap().fail.remove(path);
+    }
+
     /// Panics in the next asynchronous sync of `path` (on whatever thread submits it).
     pub fn panic(&self, path: &Path) {
         self.rules.lock().unwrap().panic.insert(path.to_path_buf());

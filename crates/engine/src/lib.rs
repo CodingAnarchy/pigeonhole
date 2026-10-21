@@ -51,6 +51,8 @@ mod watermark_waiters;
 mod write;
 
 pub use admission::Admit;
+#[doc(hidden)]
+pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{
     CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard, FamilyInfo, FamilyStorage,

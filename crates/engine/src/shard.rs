@@ -311,11 +311,15 @@ pub(crate) fn bucket_floor(b: usize) -> u64 {
     if b % 2 == 1 { base + base / 2 } else { base }
 }
 
-/// The locks a writer holds for its lifetime, released at the final close.
+/// The locks a writer holds for its lifetime, released at the final close, or handed to
+/// the reopen that replaces this engine in place (`Engine::close_for_reopen`, D265) with the
+/// handle they live on.
 #[derive(Debug)]
 pub(crate) struct Locks {
     pub _writer: WriterLock,
     pub presence: Presence,
+    /// The handle the locks were taken on; a reopen takes its shm region and presence on it.
+    pub file: pigeonhole_io::FileRef,
 }
 
 /// The close handshake (`close_gate`): each shard reports when its WAL is checkpointed,
@@ -432,6 +436,9 @@ pub(crate) struct Shared {
     /// The writer keeps a stale-tail index beside each memtable (D194, D199).
     pub tail_index: bool,
     pub locks: Mutex<Option<Locks>>,
+    /// `Engine::close_for_reopen` ran: the final close leaves `locks` in place for the reopen
+    /// (D265) instead of releasing them, and removes neither the WAL files nor the region.
+    pub keep_locks: AtomicBool,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
     /// `Engine::close` has started: background compaction stops.
@@ -728,11 +735,18 @@ impl Shared {
         } else {
             Ok(())
         };
-        let locks = self
-            .locks
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
+        // A handover (`Engine::close_for_reopen`, D265) leaves the locks where they are: the
+        // reopen takes them, so no other writer gets in between and no reader's last-one-out
+        // cleanup runs. The WAL files and the region stay, as after a crashed writer; the
+        // reopen replays the files and builds the region's next generation.
+        let locks = if self.keep_locks.load(Ordering::Acquire) {
+            None
+        } else {
+            self.locks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        };
         // Our writer byte is held (so no opening writer can be mid-open); the presence
         // upgrade tells whether any reader is still attached.
         let last = match &locks {
