@@ -2550,9 +2550,14 @@ impl Engine {
     #[doc(hidden)]
     pub fn wait_failed(&self, deadline: std::time::Instant) -> bool {
         let shared = &self.inner.shared;
-        shared
+        let failed = shared
             .failure
-            .wait(deadline, || shared.closed.load(Ordering::Acquire))
+            .wait(deadline, || shared.closed.load(Ordering::Acquire));
+        #[cfg(feature = "test-hooks")]
+        if failed {
+            shared.hooks.sites.run(hooks::HookSite::FailureWake);
+        }
+        failed
     }
 }
 

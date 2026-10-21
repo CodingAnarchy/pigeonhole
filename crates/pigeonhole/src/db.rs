@@ -1013,13 +1013,12 @@ impl Pigeonhole {
         self.db.generation.fetch_or(CLOSED, Ordering::Release);
         // A running recovery settles first (its swap, or its give-up; bounded by its own
         // deadline), so the engine closed is the one every handle ends on. A failure the
-        // supervisor has not marked yet is waited for too: the model check found a close
-        // racing a fresh failure, which closed the failed engine unclean where the swap
-        // was a moment away.
+        // supervisor has not marked yet is not waited for (perf287's R5 on #836): the
+        // supervisor, once it wakes, finds the handle closed and ends, so there is no
+        // recovery to wait for, and this closes the failed engine as a close without the
+        // option would (unclean; the next open replays the log).
         if let Some(sup) = self.db.supervision() {
-            sup.wait_settled(self.db.stall_timeout().saturating_mul(5), || {
-                self.db.engine_arc().is_failed()
-            });
+            sup.wait_settled(self.db.stall_timeout().saturating_mul(5), || false);
         }
         let result = self.db.engine().close();
         if let Some(sup) = self.db.supervision() {
@@ -1525,6 +1524,86 @@ fn max_value(o: &pigeonhole_engine::EngineOptions) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    /// D265 (perf287's R5 on #836): a `close()` that reaches a failed engine before the
+    /// supervisor marked the failure does not wait for a recovery that never starts (the
+    /// supervisor finds the handle closed and ends). It closes the failed engine as a close
+    /// without the option would, and returns well under the stall timeout; the next open
+    /// replays the log. The supervisor is held on its wake by a test hook, so the close
+    /// wins the race for certain.
+    #[test]
+    fn a_close_racing_an_unmarked_failure_closes_the_failed_engine_at_once() {
+        let vfs: VfsRef = pigeonhole_io::sim::SimVfs::new(2651);
+        let options = Options::default()
+            .vfs(Arc::clone(&vfs))
+            .shards(1)
+            .pin_threads(false)
+            .write_stall_timeout(Duration::from_secs(10))
+            .auto_recover(crate::Recovery::Any);
+        let path = Path::new("/db/race.phdb");
+        let db = Pigeonhole::open(path, options.clone()).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", crate::Family::default())
+            .create_if_missing()
+            .unwrap();
+        for i in 0..8u8 {
+            t.mutate(&[b'r', i]).put("f", b"q", b"v").commit().unwrap();
+        }
+        // The supervisor, woken by the failure, is held before it looks at it.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let engine = db.engine().to_arc();
+        engine.on_next(
+            pigeonhole_engine::HookSite::FailureWake,
+            Box::new(move || {
+                let _ = entered_tx.send(());
+                let _ = go_rx.recv();
+            }),
+        );
+        // The next apply fails after its WAL append: the shard poisons itself (its record
+        // replays at the next open) and the commit gets `OutcomeUnknown`.
+        engine.inject(pigeonhole_engine::Fault::NextApply, true);
+        let e = t
+            .mutate(b"unknown")
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap_err();
+        assert_eq!(e.code(), crate::ErrorCode::OutcomeUnknown);
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the supervisor woke on the failure");
+        assert!(db.is_failed());
+        // `close()` on its own thread (it joins the supervisor at its end): once it has
+        // marked the handle closed, the supervisor is let go, finds the handle closed and
+        // ends without marking the failure.
+        let inner = Arc::clone(&db.db);
+        let closer = std::thread::spawn(move || {
+            let started = Instant::now();
+            (db.close(), started.elapsed())
+        });
+        while !inner.is_closed() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = go_tx.send(());
+        let (result, took) = closer.join().unwrap();
+        assert!(
+            took < Duration::from_secs(2),
+            "the close took {took:?} ({result:?}); it must not wait for a recovery"
+        );
+        drop(t);
+        // The next open replays the log: every row, the unknown commit's included.
+        let db = Pigeonhole::open(path, options.auto_recover(crate::Recovery::Off)).unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        for i in 0..8u8 {
+            assert!(t.get(&[b'r', i], "f", b"q").unwrap().is_some(), "row {i}");
+        }
+        assert!(t.get(b"unknown", "f", b"q").unwrap().is_some());
+        db.close().unwrap();
+    }
 
     /// D265: the engine behind the handle is swapped for one reopened on the first one's
     /// handover, as the recovery supervisor does. Table handles keep working on the new
