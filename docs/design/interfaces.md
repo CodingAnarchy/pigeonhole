@@ -135,5 +135,8 @@ All MIT/Apache-2.0 compatible (D6); none is a storage engine (spec: Pigeonhole o
 | `proptest` (dev) | MIT/Apache-2.0 | declared | Property tests (format order, round trips, model checks). Crates add it as a dev-dependency when they write those tests. |
 | `loom` (dev, `cfg(loom)`) | MIT | memtable, cache | Concurrency model checking required by their briefs. |
 | `criterion` (dev) | MIT/Apache-2.0 | declared | Benchmarks for every path with a latency target. |
+| `clap` (derive) | MIT/Apache-2.0 | cli | `phdb`'s arguments, help and usage errors (#692; owner, 2026-10-20). |
+| `serde_json` (`preserve_order`) | MIT/Apache-2.0 | cli (bench also uses it) | `phdb`'s JSON and JSONL output, with fields in their documented order. |
+| `insta` (dev, `filters`) | Apache-2.0 | cli | Snapshot tests of `phdb`'s output (the spec's "snapshot tests of CLI output"). |
 
 zstd (Phase 2), io_uring (Phase 3), `futures-core` (Phase 3 async) and the bench comparison runners are not added yet.

@@ -1,5 +1,8 @@
 #[cfg(feature = "test-hooks")]
 pub(crate) mod hooks;
+mod info;
+
+pub use info::{DbInfo, FamilyStorage, LevelStorage, TableStorage};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};

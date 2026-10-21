@@ -1,0 +1,120 @@
+---
+source: crates/cli/tests/common/mod.rs
+expression: text
+---
+{
+  "phdb": 1,
+  "command": "info",
+  "path": "[DIR]/sample.phdb",
+  "mode": "writer",
+  "format_version": 3,
+  "db_id": "[DB_ID]",
+  "shards": null,
+  "file_bytes": [BYTES],
+  "free_bytes": [BYTES],
+  "tables": [
+    {
+      "name": "events",
+      "tablets": 1,
+      "families": [
+        {
+          "name": "e",
+          "counter": false,
+          "max_versions": 0,
+          "ttl_micros": null,
+          "bloom_bits": 10,
+          "blob_threshold": 4096,
+          "compression": "zstd",
+          "zstd_level": 3,
+          "block_size": 16384,
+          "merge_operator": null,
+          "cache_priority": "normal",
+          "compaction": "leveled",
+          "ssts": 1,
+          "sst_bytes": 1061,
+          "entries": 50,
+          "levels": [
+            {
+              "level": 0,
+              "ssts": 1,
+              "bytes": 1061,
+              "entries": 50
+            }
+          ],
+          "blob_files": 0,
+          "blob_bytes": 0,
+          "blob_live_bytes": 0
+        }
+      ]
+    },
+    {
+      "name": "users",
+      "tablets": 1,
+      "families": [
+        {
+          "name": "profile",
+          "counter": false,
+          "max_versions": 1,
+          "ttl_micros": null,
+          "bloom_bits": 10,
+          "blob_threshold": 4096,
+          "compression": "lz4",
+          "zstd_level": null,
+          "block_size": 16384,
+          "merge_operator": null,
+          "cache_priority": "high",
+          "compaction": "leveled",
+          "ssts": 0,
+          "sst_bytes": 0,
+          "entries": 0,
+          "levels": [],
+          "blob_files": 0,
+          "blob_bytes": 0,
+          "blob_live_bytes": 0
+        },
+        {
+          "name": "logins",
+          "counter": true,
+          "max_versions": 0,
+          "ttl_micros": null,
+          "bloom_bits": 10,
+          "blob_threshold": 4096,
+          "compression": "lz4",
+          "zstd_level": null,
+          "block_size": 16384,
+          "merge_operator": null,
+          "cache_priority": "normal",
+          "compaction": "leveled",
+          "ssts": 0,
+          "sst_bytes": 0,
+          "entries": 0,
+          "levels": [],
+          "blob_files": 0,
+          "blob_bytes": 0,
+          "blob_live_bytes": 0
+        },
+        {
+          "name": "history",
+          "counter": false,
+          "max_versions": 0,
+          "ttl_micros": 2592000000000,
+          "bloom_bits": 10,
+          "blob_threshold": 4096,
+          "compression": "none",
+          "zstd_level": null,
+          "block_size": 16384,
+          "merge_operator": null,
+          "cache_priority": "normal",
+          "compaction": "tiered",
+          "ssts": 0,
+          "sst_bytes": 0,
+          "entries": 0,
+          "levels": [],
+          "blob_files": 0,
+          "blob_bytes": 0,
+          "blob_live_bytes": 0
+        }
+      ]
+    }
+  ]
+}

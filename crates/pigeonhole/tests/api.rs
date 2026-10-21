@@ -1578,6 +1578,18 @@ fn reader_handles_see_the_writers_commits() {
     assert_eq!(reader.tables(), ["t"]);
     let rt = reader.table("t").unwrap();
     assert_eq!(rt.name(), "t");
+    // ICR 0047: the reader sees the catalog's families, their options and the database info.
+    assert_eq!(rt.families(), t.families());
+    assert_eq!(rt.family_info("a"), t.family_info("a"));
+    let info = reader.info().unwrap();
+    assert!(info.reader);
+    assert_eq!(info.free_bytes, None);
+    assert_eq!(info.shards, db.info().unwrap().shards);
+    assert_eq!(info.tables[0].name, "t");
+    assert_eq!(
+        info.tables[0].families,
+        db.info().unwrap().tables[0].families
+    );
     assert_eq!(rt.get(b"r", "a", b"q").unwrap().unwrap().value(), b"1");
     t.mutate(b"s").put("a", b"q", b"2").commit().unwrap();
     let snap = reader.snapshot().unwrap();

@@ -53,8 +53,8 @@ mod write;
 pub use admission::Admit;
 pub use engine::PendingMaintenance;
 pub use engine::{
-    CommitInfo, CrossShardMetrics, Engine, EngineShard, FamilyInfo, Metrics, Role, ShardStats,
-    TableInfo,
+    CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard, FamilyInfo, FamilyStorage,
+    LevelStorage, Metrics, Role, ShardStats, TableInfo, TableStorage,
 };
 pub use error::{Error, Result};
 pub use health::{Failure, FailureCause};

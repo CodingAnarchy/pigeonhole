@@ -1,6 +1,6 @@
 [package]
 name = "pigeonhole-cli"
-description = "phdb: command-line tool for Pigeonhole databases (placeholder until Phase 4)."
+description = "phdb: the command-line tool for Pigeonhole databases: info, and (planned) check, dump, load, backup, compact and an interactive shell."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,11 +16,13 @@ name = "phdb"
 path = "src/main.rs"
 
 [dependencies]
+# The public crate only: phdb uses no engine internals (#692).
 pigeonhole = { workspace = true }
+clap = { version = "4.6", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[dev-dependencies]
+insta = { version = "1.49", features = ["filters"] }
 
 [lints]
 workspace = true
-
-# Phase 3/4 placeholder: builds on the public crate once implemented.
-[package.metadata.cargo-machete]
-ignored = ["pigeonhole"]

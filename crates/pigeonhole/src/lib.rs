@@ -86,6 +86,7 @@
 mod cell;
 mod db;
 mod error;
+mod info;
 mod metrics;
 mod options;
 mod read;
@@ -129,6 +130,7 @@ pub mod nonblocking;
 pub use cell::{Cell, CellEntry, CellRef, Row, RowRef, Value};
 pub use db::{Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
+pub use info::{Compression, DatabaseInfo, FamilyInfo, FamilyStorage, LevelInfo, TableInfo};
 pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
 pub use options::{Compaction, Family, IoBackend, IoRings, Options, Priority, ReaderOptions, days};
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};

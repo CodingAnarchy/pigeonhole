@@ -1,7 +1,11 @@
-//! The `phdb` command-line tool (Phase 4).
+//! The `phdb` command-line tool (#692).
 #![forbid(unsafe_code)]
 
-fn main() {
-    eprintln!("phdb: not yet implemented (Phase 4)");
-    std::process::exit(2);
+fn main() -> std::process::ExitCode {
+    let status = pigeonhole_cli::run(
+        std::env::args_os(),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    );
+    status.into()
 }

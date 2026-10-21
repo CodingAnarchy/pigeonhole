@@ -1,0 +1,18 @@
+---
+source: crates/cli/tests/common/mod.rs
+expression: text
+---
+path            [DIR]/sample.phdb
+mode            writer
+format_version  3
+db_id           [DB_ID]
+shards          -
+file_bytes      [BYTES]
+free_bytes      [BYTES]
+tables          2
+
+table   family   tablets  ssts  sst_bytes  entries  blob_bytes  max_versions  ttl_micros     compression
+events  e        1        1     1061       50       0           0             -              zstd
+users   profile  1        0     0          0        0           1             -              lz4
+users   logins   1        0     0          0        0           0             -              lz4
+users   history  1        0     0          0        0           0             2592000000000  none
