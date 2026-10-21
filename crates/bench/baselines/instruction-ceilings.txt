@@ -134,6 +134,11 @@
 # (+0.3-0.4%, within the per-change threshold), and the old ceilings left 1-3 instructions
 # over the new counts, too thin for unrelated drift. Measured against the alternatives on
 # #796: an `arc_swap` load per operation +80, a hazard pointer +31.
+#
+# Raised for #836 (D265 PR 3, the option with its supervisor): versions 5492 -> 5509, this
+# PR's head count on main 50a2a24a (run 39689863590: 5493, main's own 5484) times 1.003. The +9 is
+# the released-view check on the latest-view read and the supervisor branch of the row read;
+# the ceiling had no headroom left after #796's re-base and main's drift since.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -143,7 +148,7 @@ get-miss 4175 0.3
 row 2475 1.0
 scan 1358 0.3
 scan-filtered 5776 0.3
-versions 5492 0.3
+versions 5509 0.3
 counter 9388 0.5
 rows 19655 0.3
 level-scans 14015 0.6
