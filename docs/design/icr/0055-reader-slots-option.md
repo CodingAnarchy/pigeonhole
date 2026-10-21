@@ -5,7 +5,7 @@
 ## Change
 
 In `pigeonhole`:
-- `Options::reader_slots(self, n: u32) -> Self`: how many reader handles can attach at once. Default 126, clamped to 1..=65,536.
+- `Options::reader_slots(self, n: u32) -> Self`: how many reader handles can attach at once. Default 128, clamped to 1..=65,536.
 - `EngineMetrics` (`#[non_exhaustive]`) gains:
   - `reader_slots_active` and `reader_slots` (gauges);
   - `reader_slots_reclaimed` (a counter);
@@ -13,11 +13,13 @@ In `pigeonhole`:
 
 In `pigeonhole-engine`: `Metrics` gains `reader_slots`, `reader_slots_reclaimed` and `reader_pin_lag`. In `pigeonhole-shm`: `ShmRegion::reader_slot_usage()`.
 
-The engine already had `EngineOptions::reader_slots` (default 126), used to size the region and the footprint check. The public crate only passes the value through.
+The engine already had `EngineOptions::reader_slots`, used to size the region and the footprint check. The public crate only passes the value through.
+
+**The default moves from 126 to 128** (owner, 2026-10-21): in `ShmConfig`, `EngineOptions` and the new option. Nothing recorded why it was 126 (it dates from #11). Slots are 64 bytes and the slot area is padded to the arenas' 2 MiB alignment, so two more cost nothing; a test pins that the region size is the same. Compatibility is unaffected: a reader takes the slot count from the region header the writer built, never from its own configuration.
 
 ## Why
 
-- **D3:** the slot count bounds concurrent readers, and one more fails `NoReaderSlot` at once. An application with more than 126 reader handles (one per worker in a pre-forked server, for example) had no way to raise it.
+- **D3:** the slot count bounds concurrent readers, and one more fails `NoReaderSlot` at once. An application with more than the default's reader handles (one per worker in a pre-forked server, for example) had no way to raise it.
 - **D1:** a reader holding one snapshot for a long time stalls the writer into `Busy`, by design. The writer had no way to see that coming. The lag gauges show it, and the slot counts show attachment and reclamation (#833).
 
 ## Limits

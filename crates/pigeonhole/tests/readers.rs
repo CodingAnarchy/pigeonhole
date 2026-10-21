@@ -67,7 +67,9 @@ fn reader_slots_bound_attached_readers_and_one_more_fails_at_once() {
     let m = db.engine_metrics();
     assert_eq!((m.reader_slots_active, m.reader_slots), (2, 2));
 
-    // All taken: an error at once, not a wait.
+    // All taken: an error at once, not a wait. The readers open with their own default
+    // configuration (128 slots): the count comes from the region header the writer built,
+    // so a writer's count, older or newer default alike, is what binds them.
     let start = Instant::now();
     let e = reader(&vfs, 12).unwrap_err();
     assert_eq!(e.code(), ErrorCode::NoReaderSlot, "{e}");

@@ -563,3 +563,21 @@ pub mod memtable {
     /// bytes follow the tower. Nodes are 4-byte aligned.
     pub const N_TOWER: usize = 12;
 }
+
+#[cfg(test)]
+mod reader_slot_tests {
+    use super::*;
+
+    /// The default reader slot count went from 126 to 128 (#693 PR 5): the slot area is
+    /// padded up to the arenas' 2 MiB alignment, so for the default 4 MiB view buffers and any
+    /// shard count up to 256, the region is exactly as large either way.
+    #[test]
+    fn two_more_default_slots_cost_no_space() {
+        for shards in [1u32, 2, 4, 8, 16, 64, 256] {
+            let len = |slots| ShmHeader::layout([0; 16], shards, slots, 4 << 20, 64 << 20, 0, 0);
+            let (old, new) = (len(126), len(128));
+            assert_eq!(old.region_len, new.region_len, "{shards} shards");
+            assert_eq!(old.arenas_off, new.arenas_off, "{shards} shards");
+        }
+    }
+}

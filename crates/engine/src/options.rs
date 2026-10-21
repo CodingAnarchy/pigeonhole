@@ -214,7 +214,7 @@ impl EngineOptions {
             row_cache_max_row: 4 << 10,
             row_cache_families: Vec::new(),
             shm_dir: None,
-            reader_slots: 126,
+            reader_slots: 128,
             wal: WalOptions::default(),
             wal_pin_bytes: 0,
             tablet_split_bytes: 256 << 20,

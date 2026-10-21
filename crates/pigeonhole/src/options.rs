@@ -70,8 +70,9 @@ fn default_compaction_cores(shards: usize) -> usize {
 /// it answers about three gets in four from the cache; more memory buys few more hits.
 const DEFAULT_ROW_CACHE: usize = 64 << 20;
 
-/// Reader processes that can attach at once by default.
-const DEFAULT_READER_SLOTS: u32 = 126;
+/// Reader processes that can attach at once by default: 128 slots of 64 bytes, inside the
+/// padding before the 2 MiB-aligned arenas, so they cost no space.
+const DEFAULT_READER_SLOTS: u32 = 128;
 
 /// The most reader slots: 4 MiB of slots in the shared-memory file, which the writer scans
 /// for dead readers every 250 ms.
@@ -300,7 +301,7 @@ impl Options {
     }
 
     /// How many reader processes ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader))
-    /// can attach at once: default 126, at least 1, at most 65,536 (ICR 0055).
+    /// can attach at once: default 128, at least 1, at most 65,536 (ICR 0055).
     ///
     /// Each attached reader handle holds one 64-byte slot in the shared-memory file. One more
     /// fails `open_reader` with [`ErrorCode::NoReaderSlot`](crate::ErrorCode::NoReaderSlot)

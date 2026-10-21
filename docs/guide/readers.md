@@ -59,7 +59,7 @@ Every limit is an error, never a hang:
 
 | Limit | What happens | Remedy |
 |---|---|---|
-| Reader slots: `Options::reader_slots` (default 126, at most 65,536) | One more `open_reader` fails with `NoReaderSlot` at once | Close idle readers, or open the writer with more slots |
+| Reader slots: `Options::reader_slots` (default 128, at most 65,536) | One more `open_reader` fails with `NoReaderSlot` at once | Close idle readers, or open the writer with more slots |
 | Shared memory: about `memtable_budget × shards + 10 MiB` | The writer's open fails with `ShmUnavailable` if it can't be allocated | Free space in `/dev/shm`, give the container more, or use `shm_dir` |
 | A view larger than its shared-memory buffer (very many tablets) | `ViewTooLarge` | Fewer tablets |
 | A reader snapshot holding the writer's memory | The writer's commits fail with `Busy` after `write_stall_timeout` | Drop old snapshots (see above) |
