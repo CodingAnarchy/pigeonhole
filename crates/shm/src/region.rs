@@ -314,10 +314,8 @@ fn attach(
     generation: Generation,
 ) -> Result<Inner> {
     if generation.0 == 0 {
-        return Err(io_error(
-            ErrorKind::NotFound,
-            "no shared-memory region: no writer has built one",
-        ));
+        // No writer has built a region (or the last one removed the directory's generation).
+        return Err(Error::NoWriter);
     }
     let found = directory
         .atomic_u32(directory::LAYOUT_VERSION)
@@ -330,13 +328,23 @@ fn attach(
     }
     let dir = config.dir.as_deref();
     let name = region_name(identity.device, identity.inode, generation.0);
-    let probe = vfs.open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach)?;
+    // The generation the directory names may be gone: its writer closed and no process
+    // maps it (on Windows a mapping disappears with its last handle, #844). Only that is
+    // `NoWriter`; any other failure stays an I/O error.
+    let no_writer = |e: pigeonhole_io::Error| match e.kind {
+        ErrorKind::NotFound => Error::NoWriter,
+        _ => Error::Io(e),
+    };
+    let probe = vfs
+        .open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach)
+        .map_err(no_writer)?;
     let h = read_header(&probe, db_id, identity, generation)?;
     let len = usize::try_from(h.region_len).map_err(|_| Error::Corrupt("region length"))?;
     let region = if probe.len() >= len {
         probe
     } else {
-        vfs.open_shared(&name, dir, h.region_len, SharedOpen::Attach)?
+        vfs.open_shared(&name, dir, h.region_len, SharedOpen::Attach)
+            .map_err(no_writer)?
     };
     let state = region.atomic_u32(header::STATE);
     let mut waited = 0;

@@ -104,6 +104,11 @@ pub enum Error {
     /// A reader process's snapshot was taken before a writer restart: the new writer may
     /// have reused the space it names. Take a new snapshot.
     SnapshotExpired,
+    /// A reader process found no running writer to attach to: no writer has built a
+    /// shared-memory region, or the generation it names is gone (its writer closed and no
+    /// process maps it; on Windows that is at once, #844). Open the reader again once a
+    /// writer runs (ICR 0057).
+    NoWriter,
     /// A submitted commit's outcome was awaited on a thread that drives a shard
     /// (application-owned mode), where blocking could deadlock. The commit was submitted
     /// and will apply; await its future from the event loop instead (D88).
@@ -157,6 +162,7 @@ impl fmt::Display for Error {
                  in flight; the next open decides it from the WAL (reopen and read)",
             ),
             Error::NoReaderSlot => f.write_str("every reader slot is taken"),
+            Error::NoWriter => f.write_str("no writer is running: a reader process attaches to a running writer's shared memory; open the reader again once a writer runs"),
             Error::RecordTooLarge => {
                 f.write_str("the commit's WAL record is larger than a segment can hold")
             }
@@ -225,6 +231,7 @@ impl Error {
             Error::WouldDeadlock => Error::WouldDeadlock,
             Error::BatchTooLarge => Error::BatchTooLarge,
             Error::SnapshotExpired => Error::SnapshotExpired,
+            Error::NoWriter => Error::NoWriter,
         }
     }
 }
@@ -338,6 +345,7 @@ impl From<pigeonhole_shm::Error> for Error {
                 Error::Corruption("view version published out of order".to_owned())
             }
             S::InvalidConfig(what) => Error::InvalidArgument(what.to_owned()),
+            S::NoWriter => Error::NoWriter,
             _ => Error::Corruption(format!("shared memory: {e}")),
         }
     }

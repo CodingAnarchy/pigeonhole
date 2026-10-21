@@ -119,6 +119,10 @@ pub enum Error {
     },
     /// An [`ShmConfig`] field is out of range (see [`ShmConfig::validate`]).
     InvalidConfig(&'static str),
+    /// A reader found no writer's region to attach to: no writer has built one, or the
+    /// generation the directory names is gone (its writer closed and no process maps it;
+    /// on Windows a closed writer's mapping disappears at once, #844).
+    NoWriter,
 }
 
 impl fmt::Display for Error {
@@ -147,6 +151,7 @@ impl fmt::Display for Error {
                 "view version {offered} is not newer than the published version {published}"
             ),
             Error::InvalidConfig(what) => write!(f, "invalid shared-memory configuration: {what}"),
+            Error::NoWriter => f.write_str("no writer is running: a reader process attaches to a running writer's shared memory; open the reader again once a writer runs"),
         }
     }
 }

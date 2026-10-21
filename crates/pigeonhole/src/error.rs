@@ -82,6 +82,11 @@ pub enum ErrorCode {
     /// The next open decides it: reopen and read to see whether it landed. `Closed`, by
     /// contrast, means not committed.
     OutcomeUnknown = 28,
+    /// A reader process found no running writer to attach to
+    /// ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader), or a reader's next read
+    /// after its writer's shared memory went away): a reader attaches to a running writer.
+    /// Open the reader again once a writer runs (ICR 0057).
+    NoWriter = 29,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
@@ -168,6 +173,7 @@ impl From<pigeonhole_engine::Error> for Error {
             E::SnapshotExpired => ErrorCode::SnapshotExpired,
             E::WouldDeadlock => ErrorCode::WouldDeadlock,
             E::OutcomeUnknown => ErrorCode::OutcomeUnknown,
+            E::NoWriter => ErrorCode::NoWriter,
             // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
             // here surfaces as `Io` (the message names it) until it gets its own code; the
             // mapping test lists every current variant.

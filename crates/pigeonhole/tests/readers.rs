@@ -153,3 +153,20 @@ fn the_oldest_reader_snapshots_lag_is_reported() {
     drop(t);
     db.close().unwrap();
 }
+
+/// #844 (ICR 0057): with no writer running (the last one closed), `open_reader` fails with
+/// `NoWriter`, not `Io`. A file that does not exist is still `Io`: only a missing writer
+/// region is `NoWriter`.
+#[test]
+fn a_reader_with_no_writer_running_gets_no_writer() {
+    let vfs = SimVfs::new(844);
+    let missing = reader(&vfs, 40).unwrap_err();
+    assert_eq!(missing.code(), ErrorCode::Io, "no file at all: {missing}");
+    let (db, t) = open(&vfs, 4);
+    put(&t, 0..10);
+    drop(t);
+    db.close().unwrap();
+    let after = reader(&vfs, 41).unwrap_err();
+    assert_eq!(after.code(), ErrorCode::NoWriter, "{after}");
+    assert!(after.message().contains("no writer is running"), "{after}");
+}
