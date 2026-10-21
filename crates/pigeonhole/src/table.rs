@@ -220,10 +220,13 @@ impl TableCore {
         let family = self.family_id(family)?;
         let table = self.info.id;
         let data = match snapshot {
-            None => self.db.retry_closed(|| {
+            // With a supervisor, the read is run again on the recovered engine if it got
+            // `Closed`; without one, the call as before the option (`Db::supervised`).
+            None if self.db.supervised() => self.db.retry_closed(|| {
                 self.with(|e| e.get_latest(table, family, row, qualifier))
                     .map_err(Error::from)
             })?,
+            None => self.with(|e| e.get_latest(table, family, row, qualifier))?,
             Some(s) => {
                 self.db.check_snapshot(s)?;
                 self.with(|e| e.get(&s.inner, table, family, row, qualifier))?

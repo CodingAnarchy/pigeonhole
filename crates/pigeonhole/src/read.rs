@@ -183,9 +183,11 @@ impl Selection {
                 core.db.check_snapshot(&s)?;
                 s.inner
             }
-            None => core
+            // The retry only with a supervisor (`Db::supervised`).
+            None if core.db.supervised() => core
                 .db
                 .retry_closed(|| core.engine().snapshot().map_err(crate::Error::from))?,
+            None => core.engine().snapshot()?,
         };
         let info = core.current_info();
         let mut ids = SmallVec::new();
@@ -346,12 +348,20 @@ impl<'t> RowRead<'t> {
         let mut buf = RowBuf::new(info, 0);
         let table = self.core.info.id;
         let any = match &snapshot {
-            None => self.core.db.retry_closed(|| {
+            // The retry only with a supervisor (`Db::supervised`).
+            None if self.core.db.supervised() => self.core.db.retry_closed(|| {
                 self.core
                     .engine()
                     .read_row_latest_into(table, &self.row, &families, &self.sel.spec, &mut buf)
                     .map_err(crate::Error::from)
             })?,
+            None => self.core.engine().read_row_latest_into(
+                table,
+                &self.row,
+                &families,
+                &self.sel.spec,
+                &mut buf,
+            )?,
             Some(snapshot) => self.core.engine().read_row_into_families(
                 snapshot,
                 table,

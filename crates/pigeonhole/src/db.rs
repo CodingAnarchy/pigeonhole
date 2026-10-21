@@ -205,6 +205,16 @@ impl Db {
     /// recovery was replacing (D265): the wait for the swap is bounded by
     /// `Options::write_stall_timeout` (`Busy` past it; `Closed` once recovery gave up or
     /// the handle is closed). Costs nothing on the success path.
+    /// Whether a recovery supervisor runs for this database (`Options::auto_recover`): the
+    /// hot read paths take `retry_closed` only then, and the engine call as before the
+    /// option otherwise. A closure handing the engine's result back costs a move of it
+    /// (`CellData` carries up to 128 inline bytes: about 60 instructions per point get on
+    /// callgrind, #836 round 6), which the option-off path must not pay.
+    #[inline(always)]
+    pub(crate) fn supervised(&self) -> bool {
+        self.supervision.is_some()
+    }
+
     #[inline(always)]
     pub(crate) fn retry_closed<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
         // Option off: the operation as it was, nothing around it (the instructions run on

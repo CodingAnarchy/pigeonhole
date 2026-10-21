@@ -734,7 +734,9 @@ impl ShmRegion {
     }
 
     /// The highest seqno a new snapshot may include: every commit at or below it is applied
-    /// on every shard.
+    /// on every shard. Always inlined: on the point-get path it is one atomic load, and
+    /// left to the linker it was outlined into a call (12 instructions, #836 round 6).
+    #[inline(always)]
     pub fn visible_seqno(&self) -> Seqno {
         self.inner.visible_seqno()
     }
