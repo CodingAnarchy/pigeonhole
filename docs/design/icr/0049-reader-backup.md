@@ -44,14 +44,21 @@ A reader's slot pin also moves forward to a newer view when that reader takes a 
 
 `crates/pigeonhole/tests/api.rs`: `a_reader_backs_up_while_the_writer_runs`.
 
-**One caveat for review:**
-- Reclamation is lazy. With the held clone removed, the copy test still passed in the simulator, because the writer reclaimed nothing within the test's window either way.
-- The expiry test does fail without the pin's check.
-- The held pin's correctness rests on the slot rule above (FORMAT §11.5, `reader_snapshot`), not on a test that would catch its removal.
+**The dropped-pin test** (recov620's review): mid-copy, the steps run in this order.
+1. Record the backup's pinned view (`reader_pin_and_view`).
+2. The writer commits, flushes and compacts.
+3. The reader takes a fresh snapshot.
+4. The writer makes a flush the size of the first, whose manifest commit reclaims.
+
+The test then asserts two things: the oldest reader pin is still at or below the backup's view, and `unreferenced_bytes() > 0`.
+
+With the held clone removed, it fails deterministically: "the reader's pin moved past the backup's view 6: Some((1600, 10))". The ordering matters. A fresh snapshot taken before the compaction would move the slot only to a view that still names the old SSTs.
+
+The setup's 1500 rows are below 4096 entries per slot, so a restart is caught by the checks before each slot and the final one, not the in-merge one.
 
 ## Callers
 
 - `pigeonhole-engine`: `maintenance.rs`, `engine.rs` (`backup_of` and its docs), `tests/reader_backup.rs`.
 - `pigeonhole`: `db.rs`, `tests/api.rs`.
-- `pigeonhole-cli`: `phdb backup` backs up from a reader process while a writer runs.
+- `pigeonhole-cli`: `open.rs` (`Db::backup`, where the writer or reader choice lives) and `cmd/backup.rs`. `phdb backup` backs up from a reader process while a writer runs.
 - Docs: the agent reference, the CLI guide, the changelog.

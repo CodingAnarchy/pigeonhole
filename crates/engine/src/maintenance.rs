@@ -149,6 +149,9 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
                 .map(|_| Arc::new(ShardMems::default()))
                 .collect(),
             ssts: Arc::clone(&full.ssts),
+            // The writer's protection for the SSTs below. In a reader process this registers
+            // in its own `live_views`, which nothing there reclaims against: harmless, and not
+            // the reader's protection (that is `reader_pin` above).
             _pin: Some(ViewPin::new(&shared.live_views, full.manifest_version)),
         });
         drop(full);

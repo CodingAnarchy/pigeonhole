@@ -2082,8 +2082,9 @@ impl Engine {
     /// the whole view, memtables included, so the writer frees none of that view's memtables
     /// until the copy is done (the writer itself releases them after copying them, #262): a
     /// long backup from a reader of a write-heavy database can fill the writer's memtable
-    /// arenas and make its commits wait. A writer restart mid-copy fails it with
-    /// `SnapshotExpired`, removing the partial copy.
+    /// arenas and make its commits wait. A writer restart while the copy runs fails it with
+    /// `SnapshotExpired`, removing the partial copy, even one during the copy's own manifest
+    /// commit, after every read (the data was complete; the check is conservative).
     pub fn backup(&self, dest: &Path) -> Result<()> {
         self.backup_of(dest, false)
     }

@@ -709,9 +709,10 @@ impl PigeonholeReader {
     /// backup releases them after copying them): a long backup of a write-heavy database
     /// can fill the writer's memtable arenas, and its commits then wait, up to
     /// [`Options::write_stall_timeout`](crate::Options::write_stall_timeout). A writer
-    /// restart mid-copy fails it with
+    /// restart while the copy runs fails it with
     /// [`ErrorCode::SnapshotExpired`](crate::ErrorCode::SnapshotExpired), removing the
-    /// partial copy.
+    /// partial copy, even one during the copy's own final commit, when the data was
+    /// complete.
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
         Ok(self.db.engine.backup(dest.as_ref())?)
     }

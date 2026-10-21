@@ -217,7 +217,7 @@ $ phdb dump copy.phdb | tail -n +2 | diff - <(tail -n +2 app.jsonl)    # identic
 
 ### `phdb backup` and `phdb compact`
 
-`phdb compact` opens the database as the writer, so it fails with status 4 while your application has it open. `phdb backup` follows the read commands' [open policy](#how-phdb-opens-a-database). With no writer running it opens as the writer. While your application runs, it copies from a reader process (`PigeonholeReader::backup_durable`, ICR 0049).
+`phdb compact` opens the database as the writer, so it fails with status 4 while your application has it open. `phdb backup` follows the read commands' [open policy](#how-phdb-opens-a-database). With no writer running it opens as the writer. While your application runs, it copies from a reader process (`PigeonholeReader::backup_durable`, or `backup` with `--latest`; ICR 0049).
 
 **The cost of a backup from a reader process:** its snapshot pins the whole view in shared memory, including the application's memtables, until the copy is done. On a write-heavy database the application's memtables can then fill, and its commits wait (up to `write_stall_timeout`, then `Busy`). Back up a busy database when writes are light. Or call `Pigeonhole::backup_durable` from the application itself: the writer's own backup releases memtables as soon as it has copied them.
 

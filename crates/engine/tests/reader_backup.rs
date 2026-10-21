@@ -96,25 +96,39 @@ fn a_reader_backup_is_the_readers_snapshot_while_the_writer_commits() {
         reader.clone().on_next(
             HookSite::BackupReleasedMemtables,
             Box::new(move || {
-                // Mid-copy, the reader process reads at a new snapshot (without the backup's
-                // own pin, that would move its slot past the backup's view), then the writer
-                // commits, flushes and compacts everything into new SSTs: the backup's
-                // sources must not be reclaimed, and none of this is in the copy.
-                drop(r.snapshot().unwrap());
+                // recov620's ordering. The backup's pin, as the writer sees it now.
                 vfs.enter_process(WRITER);
+                let (Some((_, backup_view)), _) = db.reader_pin_and_view() else {
+                    panic!("the backup pins nothing");
+                };
+                // 1. The writer commits, flushes and compacts: the SSTs the backup reads retire
+                //    at the compaction's manifest version.
                 write_rows(&db, &t, 5000..5100);
                 db.flush().unwrap();
                 db.compact(None).unwrap();
-                write_rows(&db, &t, 5100..5600);
+                // 2. The reader process reads at a new snapshot. With the backup's pin held its
+                //    slot stays at the backup's view; without it (no live snapshot left), the
+                //    slot would move to the post-compaction view, which no longer names the
+                //    retired SSTs.
+                vfs.enter_process(READER);
+                drop(r.snapshot().unwrap());
+                // 3. A flush the size of the first, whose manifest commit reclaims what no pin
+                //    covers: its SST would land in the freed extents by first fit.
+                vfs.enter_process(WRITER);
+                write_rows(&db, &t, 5100..6100);
                 db.flush().unwrap();
-                // The SSTs the compaction replaced are retired, not reclaimed: the backup's
-                // pin still covers the view that names them.
+                // 4. The invariant: the oldest reader pin is still at or below the backup's
+                //    view, so the retired SSTs are kept.
+                let (pin, _) = db.reader_pin_and_view();
+                assert!(
+                    pin.is_some_and(|(_, view)| view <= backup_view),
+                    "the reader's pin moved past the backup's view {backup_view}: {pin:?}"
+                );
                 assert!(
                     db.unreferenced_bytes() > 0,
                     "the writer reclaimed SSTs the reader's backup is reading"
                 );
                 vfs.enter_process(READER);
-                drop(r.snapshot().unwrap());
             }),
         );
     }
@@ -130,7 +144,7 @@ fn a_reader_backup_is_the_readers_snapshot_while_the_writer_commits() {
     assert_eq!(got.len(), 1500, "every row before the backup, none after");
     assert!(got.iter().all(|r| r.as_str() < "row05000"));
     copy.close().unwrap();
-    assert_eq!(rows(&db).len(), 2100);
+    assert_eq!(rows(&db).len(), 2600);
     db.close().unwrap();
 }
 
@@ -177,6 +191,8 @@ fn a_reader_backup_holds_the_writers_memtables_for_the_whole_copy() {
     db.close().unwrap();
 }
 
+/// The setup's 1500 rows are below the 4096 entries per slot the in-merge check counts, so the
+/// restart is caught by the checks before each slot and before the copy's manifest commit.
 #[test]
 fn a_writer_restart_mid_copy_expires_the_reader_backup() {
     let (vfs, db, _t, reader) = setup(51);
