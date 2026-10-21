@@ -1168,41 +1168,50 @@ fn flushes_between_shrink_rounds_leave_the_cleared_region_alone() {
     let at_round_3 = Arc::new(std::sync::Mutex::new(None));
     let weak = Arc::downgrade(&db);
     let seen = Arc::clone(&at_round_3);
-    db.before_shrink_relocates(Box::new(move || {
-        // Round 1: arm round 2.
-        let Some(db) = weak.upgrade() else { return };
-        let weak = Arc::downgrade(&db);
-        db.before_shrink_relocates(Box::new(move || {
-            // Round 2: flush a table of about 2.5 MiB (64 KiB SSTs here): more than the free
-            // units elsewhere below the large SST, so with the cleared region freed some
-            // would land in it. Then arm round 3.
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkRelocates,
+        Box::new(move || {
+            // Round 1: arm round 2.
             let Some(db) = weak.upgrade() else { return };
-            let t = db
-                .create_table("w", &[("f".into(), FamilyOptions::default())])
-                .unwrap();
-            for i in 0..320u32 {
-                let mut wb = WriteBatch::new();
-                wb.put(
-                    t.id,
-                    t.families[0].id,
-                    &row(i),
-                    b"q",
-                    None,
-                    ValueRef::Bytes(&noise(500, i, 8 << 10)),
-                )
-                .unwrap();
-                db.commit(wb, None).unwrap();
-            }
-            db.flush().unwrap();
             let weak = Arc::downgrade(&db);
-            db.before_shrink_relocates(Box::new(move || {
-                // Round 3: where the large SST is.
-                if let Some(db) = weak.upgrade() {
-                    *seen.lock().unwrap() = Some(large_sst(&db, big.id));
-                }
-            }));
-        }));
-    }));
+            db.on_next(
+                pigeonhole_engine::HookSite::ShrinkRelocates,
+                Box::new(move || {
+                    // Round 2: flush a table of about 2.5 MiB (64 KiB SSTs here): more than the free
+                    // units elsewhere below the large SST, so with the cleared region freed some
+                    // would land in it. Then arm round 3.
+                    let Some(db) = weak.upgrade() else { return };
+                    let t = db
+                        .create_table("w", &[("f".into(), FamilyOptions::default())])
+                        .unwrap();
+                    for i in 0..320u32 {
+                        let mut wb = WriteBatch::new();
+                        wb.put(
+                            t.id,
+                            t.families[0].id,
+                            &row(i),
+                            b"q",
+                            None,
+                            ValueRef::Bytes(&noise(500, i, 8 << 10)),
+                        )
+                        .unwrap();
+                        db.commit(wb, None).unwrap();
+                    }
+                    db.flush().unwrap();
+                    let weak = Arc::downgrade(&db);
+                    db.on_next(
+                        pigeonhole_engine::HookSite::ShrinkRelocates,
+                        Box::new(move || {
+                            // Round 3: where the large SST is.
+                            if let Some(db) = weak.upgrade() {
+                                *seen.lock().unwrap() = Some(large_sst(&db, big.id));
+                            }
+                        }),
+                    );
+                }),
+            );
+        }),
+    );
     db.shrink().unwrap();
     let at_round_3 = at_round_3.lock().unwrap().expect("a third round ran");
     assert!(

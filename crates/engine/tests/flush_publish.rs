@@ -68,7 +68,10 @@ fn a_flush_published_while_a_shard_publishes_its_memtables_counts_each_operand_o
     // The shard's next publish (its new memtable for family `f`) starts while the flush's
     // commit has not published yet; that commit publishes before the shard's piece lands.
     let e = Arc::clone(&engine);
-    engine.before_next_view_publish(Box::new(move || e.drain_manifest()));
+    engine.on_next(
+        pigeonhole_engine::HookSite::ViewPublish,
+        Box::new(move || e.drain_manifest()),
+    );
     let mut b = WriteBatch::new();
     b.put(t.id, f, b"row", b"q", None, ValueRef::Bytes(b"x"))
         .unwrap();

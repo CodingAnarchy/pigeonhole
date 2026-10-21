@@ -147,7 +147,10 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
         drop(full);
         drop(snapshot.take());
         #[cfg(feature = "test-hooks")]
-        shared.hooks.after_backup_releases_memtables.run();
+        shared
+            .hooks
+            .sites
+            .run(crate::engine::hooks::HookSite::BackupReleasedMemtables);
 
         // Phase 2: each slot's SSTs merged with its temporary SSTs into the copy.
         for t in source.tablets() {
@@ -432,7 +435,10 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             }
         }
         #[cfg(feature = "test-hooks")]
-        shared.hooks.before_shrink_relocates.run();
+        shared
+            .hooks
+            .sites
+            .run(crate::engine::hooks::HookSite::ShrinkRelocates);
         // Every blob extent by extent: its file and position in the file's extent list.
         let mut blob_by_extent: HashMap<(u64, u8), (BlobFileId, usize)> = HashMap::new();
         for (id, b) in catalog.blob_files.iter() {
@@ -604,7 +610,10 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             break;
         }
         #[cfg(feature = "test-hooks")]
-        shared.hooks.before_shrink_commits.run();
+        shared
+            .hooks
+            .sites
+            .run(crate::engine::hooks::HookSite::ShrinkCommits);
         // The edits are computed against the catalog at commit time, not the one read
         // above: a compaction or `drop_table` that committed meanwhile removed an SST (its
         // copy is abandoned), and a trivial move changed its level (the copy goes to the

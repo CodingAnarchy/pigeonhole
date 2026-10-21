@@ -274,10 +274,13 @@ fn shrink_skips_an_sst_a_compaction_retired_under_it() {
 
     let ran = Arc::new(AtomicBool::new(false));
     let (db2, shard, ran2, id) = (Arc::clone(db), rig.shard.clone(), Arc::clone(&ran), t.id);
-    db.before_shrink_relocates(Box::new(move || {
-        shard.wait(db2.compact_pending(Some(id)).unwrap()).unwrap();
-        ran2.store(true, Ordering::Release);
-    }));
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkRelocates,
+        Box::new(move || {
+            shard.wait(db2.compact_pending(Some(id)).unwrap()).unwrap();
+            ran2.store(true, Ordering::Release);
+        }),
+    );
     db.shrink().unwrap();
     assert!(ran.load(Ordering::Acquire), "the hook ran inside shrink");
     let now = ssts_of(db, t.id);
@@ -313,9 +316,12 @@ fn shrink_keeps_the_level_a_trivial_move_gave_an_sst() {
     assert_eq!(old[0].0, 0, "flushed to L0");
 
     let (db2, shard, id) = (Arc::clone(db), rig.shard.clone(), t.id);
-    db.before_shrink_relocates(Box::new(move || {
-        shard.wait(db2.compact_pending(Some(id)).unwrap()).unwrap();
-    }));
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkRelocates,
+        Box::new(move || {
+            shard.wait(db2.compact_pending(Some(id)).unwrap()).unwrap();
+        }),
+    );
     let released = db.shrink().unwrap();
     assert!(released > 0);
     let now = ssts_of(db, t.id);
@@ -341,9 +347,12 @@ fn shrink_abandons_the_copy_of_a_table_dropped_under_it() {
     assert_eq!(ssts_of(db, t.id).len(), 1);
 
     let (db2, id) = (Arc::clone(db), t.id);
-    db.before_shrink_relocates(Box::new(move || {
-        db2.drop_table(id).unwrap();
-    }));
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkRelocates,
+        Box::new(move || {
+            db2.drop_table(id).unwrap();
+        }),
+    );
     db.shrink().unwrap();
     assert!(db.table("t").is_none());
     assert_eq!(db.shrink().unwrap(), 0);
@@ -370,10 +379,13 @@ fn shrink_erases_the_cached_blocks_of_a_copy_it_abandons() {
 
     let ran = Arc::new(AtomicBool::new(false));
     let (db2, ran2, id) = (Arc::clone(db), Arc::clone(&ran), t.id);
-    db.before_shrink_commits(Box::new(move || {
-        db2.drop_table(id).unwrap();
-        ran2.store(true, Ordering::Release);
-    }));
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkCommits,
+        Box::new(move || {
+            db2.drop_table(id).unwrap();
+            ran2.store(true, Ordering::Release);
+        }),
+    );
     db.shrink().unwrap();
     assert!(
         ran.load(Ordering::Acquire),

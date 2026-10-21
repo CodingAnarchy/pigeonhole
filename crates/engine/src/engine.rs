@@ -313,8 +313,6 @@ struct ReaderState {
     view: Mutex<Option<Arc<View>>>,
     shards: usize,
     registry: Arc<MergeRegistry>,
-    #[cfg(feature = "test-hooks")]
-    hooks: hooks::ReaderHooks,
 }
 
 /// A reader process's attachment to one region generation.
@@ -1383,8 +1381,6 @@ impl Engine {
             view: Mutex::new(None),
             shards,
             registry,
-            #[cfg(feature = "test-hooks")]
-            hooks: Default::default(),
         };
         let inner = Arc::new(Inner {
             // A reader commits nothing; one handle keeps `shard_ref` total.
@@ -1720,7 +1716,11 @@ impl Engine {
         for _ in 0..GET_LATEST_TRIES {
             let seqno = inner.shared.shm.visible_seqno();
             #[cfg(feature = "test-hooks")]
-            inner.shared.hooks.before_latest_view_load.run();
+            inner
+                .shared
+                .hooks
+                .sites
+                .run(hooks::HookSite::LatestViewLoad);
             let view = inner.shared.view.load();
             if inner.shared.shm.visible_seqno() != seqno {
                 continue;
@@ -3306,7 +3306,7 @@ impl Inner {
         for _ in 0..GET_LATEST_TRIES {
             let seqno = self.shared.shm.visible_seqno();
             #[cfg(feature = "test-hooks")]
-            self.shared.hooks.before_latest_view_load.run();
+            self.shared.hooks.sites.run(hooks::HookSite::LatestViewLoad);
             let view = self.shared.view.load();
             if self.shared.shm.visible_seqno() == seqno {
                 return Some((view, seqno));
@@ -3336,7 +3336,10 @@ impl Inner {
         });
         let seqno = pin.seqno();
         #[cfg(feature = "test-hooks")]
-        self.shared.hooks.before_snapshot_view_load.run();
+        self.shared
+            .hooks
+            .sites
+            .run(hooks::HookSite::SnapshotViewLoad);
         let view = self.shared.view.load_full();
         Ok(Snapshot {
             seqno,
@@ -3519,7 +3522,10 @@ impl Inner {
                 return Ok(None);
             }
             #[cfg(feature = "test-hooks")]
-            r.hooks.before_manifest_load.run();
+            self.shared
+                .hooks
+                .sites
+                .run(hooks::HookSite::ReaderManifestLoad);
             let (catalog, _) =
                 manifest::load_root(pager.file(), &root, r.shards, Arc::clone(&r.registry))?;
             *cached = (version, Arc::new(catalog), pager.data_file().clone());
@@ -3533,7 +3539,10 @@ impl Inner {
         let r = self.reader.as_ref().expect("reader");
         let record = shm.read_view()?;
         #[cfg(feature = "test-hooks")]
-        r.hooks.after_record.run();
+        self.shared
+            .hooks
+            .sites
+            .run(hooks::HookSite::ReaderViewRecord);
         let Some((catalog, file)) = self.reader_catalog(record.manifest_version)? else {
             return Ok(None);
         };

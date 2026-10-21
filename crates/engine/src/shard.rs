@@ -632,7 +632,9 @@ impl Shared {
         f: impl FnOnce(&View, u64) -> View,
     ) -> Result<Arc<View>> {
         #[cfg(feature = "test-hooks")]
-        self.hooks.before_view_publish.run();
+        self.hooks
+            .sites
+            .run(crate::engine::hooks::HookSite::ViewPublish);
         let mut last = self
             .view_lock
             .lock()
