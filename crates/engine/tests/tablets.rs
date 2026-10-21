@@ -6006,6 +6006,10 @@ fn a_cross_shard_transaction_overlapping_an_undecided_share_retries_instead_of_c
         db.engine.metrics().cross_shard.refused_pending_overlap > before,
         "B was never refused over the overlap"
     );
+    // B, a commit that reads, committed on a retry; A failed, and no blind commit ran.
+    let x = db.engine.metrics().cross_shard;
+    assert!(x.max_attempts_reading >= 2, "{x:?}");
+    assert_eq!(x.max_attempts_blind, 0, "{x:?}");
     assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"t".to_vec()));
 }
 
@@ -6757,6 +6761,11 @@ fn a_blind_prepare_over_an_undecided_share_chains_instead_of_refusing() {
         "B was refused instead of chained"
     );
     assert_eq!(after.refused_rounds, before.refused_rounds);
+    // Both blind commits, each committed on its first attempt.
+    assert_eq!(
+        (after.max_attempts_blind, after.max_attempts_reading),
+        (1, 0)
+    );
     assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"from-b".to_vec()));
 }
 

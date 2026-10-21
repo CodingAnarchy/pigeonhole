@@ -705,6 +705,21 @@ pub struct Stalls {
     /// See [`Stalls::xshard_share_waits`].
     #[serde(default)]
     pub xshard_share_wait_nanos: u64,
+    /// D267: PREPAREs admitted behind an undecided share or a waiting single, and younger
+    /// undecided shares wounded for one.
+    #[serde(default)]
+    pub xshard_chained: u64,
+    /// See [`Stalls::xshard_chained`].
+    #[serde(default)]
+    pub xshard_wounds: u64,
+    /// The most attempts one committed cross-shard commit took, for commits that only write
+    /// and for commits that read. Not counts: the largest since the store opened, load and
+    /// warmup included.
+    #[serde(default)]
+    pub xshard_max_attempts_blind: u64,
+    /// See [`Stalls::xshard_max_attempts_blind`].
+    #[serde(default)]
+    pub xshard_max_attempts_reading: u64,
 }
 
 impl Stalls {
@@ -756,6 +771,11 @@ impl Stalls {
                 before.xshard_share_wait_nanos,
                 after.xshard_share_wait_nanos,
             ),
+            xshard_chained: d(before.xshard_chained, after.xshard_chained),
+            xshard_wounds: d(before.xshard_wounds, after.xshard_wounds),
+            // Not counts: the largest seen since open.
+            xshard_max_attempts_blind: after.xshard_max_attempts_blind,
+            xshard_max_attempts_reading: after.xshard_max_attempts_reading,
         }
     }
 }

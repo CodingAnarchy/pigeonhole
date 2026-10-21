@@ -265,6 +265,9 @@ pub(crate) struct CrossShardCounters {
     pub chained: AtomicU64,
     /// Younger undecided shares this shard wounded for a share chained behind them (D267).
     pub wounds: AtomicU64,
+    /// The most attempts a commit this shard coordinated took to commit: blind commits,
+    /// then commits that read (validated reads).
+    pub max_attempts: [AtomicU64; 2],
 }
 
 /// Why a participant refused a PREPARE (ICR 0043).
@@ -1175,6 +1178,8 @@ pub(crate) struct Retried {
     /// The participants of the attempt it retries: those the next route leaves out hear
     /// `ShardMsg::Released`, so a commit waiting behind it there stops waiting (D249).
     pub prev_shards: Vec<ShardId>,
+    /// The attempts it has run.
+    pub attempts: u32,
 }
 
 /// A cross-shard commit request, sent to the coordinator (the shard owning the first row).
@@ -1197,6 +1202,8 @@ pub(crate) struct CoordinateReq {
     pub first_seqno: Seqno,
     /// The participants of the attempt this one retries (D249, `Retried::prev_shards`).
     pub prev_shards: Vec<ShardId>,
+    /// The attempts this commit ran before this one (0: this is the first).
+    pub attempts: u32,
     /// What this retry waits for before it runs (`None`: nothing, or not a retry).
     pub wait: Option<RetryWait>,
 }
@@ -1700,6 +1707,8 @@ struct Coord {
     /// Decided with the abort (D249): the commit gives up rather than retry (D241's
     /// timeout passed), so the `Decide` says it is the last attempt and the retry agrees.
     gives_up: bool,
+    /// This attempt's number, from 1.
+    attempt: u32,
 }
 
 /// A PREPARE this shard refused because it overlapped an undecided share (D249).
@@ -7112,6 +7121,7 @@ impl ShardState {
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
                 priority,
                 gives_up: false,
+                attempt: req.attempts + 1,
             },
         );
         // A retry that left a shard of its last attempt behind tells it, so commits waiting
@@ -7318,6 +7328,11 @@ impl ShardState {
             return;
         }
         c.committing = true;
+        let reads = c.validate.as_ref().is_some_and(|v| !v.reads.is_empty());
+        self.shared.metrics[usize::from(self.id.0)]
+            .cross
+            .max_attempts[usize::from(reads)]
+        .fetch_max(u64::from(c.attempt), Ordering::Relaxed);
         let streams: Vec<StreamId> = c.shards.iter().map(|s| StreamId(u32::from(s.0))).collect();
         let (durability, shards) = (c.durability, c.shards.clone());
         let floors = c.commit_ts;
@@ -7624,6 +7639,7 @@ impl ShardState {
                 epoch: c.epoch,
                 first_seqno: c.priority.1,
                 prev_shards: c.shards.clone(),
+                attempts: c.attempt,
                 wait: c.refused,
             };
             // A wake that came first (during the abort round) counts: an overlap wake for

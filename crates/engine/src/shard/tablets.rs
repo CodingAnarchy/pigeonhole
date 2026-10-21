@@ -1187,6 +1187,7 @@ impl ShardState {
                     epoch: 0,
                     first_seqno: retried.first_seqno,
                     prev_shards: retried.prev_shards,
+                    attempts: retried.attempts,
                     wait: None,
                 };
                 if shards[0] == self.id {
@@ -1322,6 +1323,7 @@ impl ShardState {
             retry: Some(Box::new(Retried {
                 first_seqno: r.first_seqno,
                 prev_shards: r.prev_shards,
+                attempts: r.attempts,
             })),
             map_version: r.map_version,
         });

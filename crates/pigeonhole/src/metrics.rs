@@ -227,6 +227,12 @@ pub struct CrossShardMetrics {
     /// Younger undecided cross-shard attempts aborted so that an older commit queued
     /// behind them could go first (D267). Each is retried.
     pub wounds: u64,
+    /// The most attempts (two-phase rounds) one committed cross-shard commit that only
+    /// writes took. Not cumulative: the largest since open.
+    pub max_attempts_blind: u64,
+    /// The same for commits that read (a transaction's validated reads), whose refusals
+    /// have no hard bound: the worst case seen since open.
+    pub max_attempts_reading: u64,
 }
 
 // The deprecated cross-shard refusal counters are always 0 (D263).
@@ -294,6 +300,8 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
                 share_wait_nanos: x.share_wait_nanos,
                 chained: x.chained,
                 wounds: x.wounds,
+                max_attempts_blind: x.max_attempts_blind,
+                max_attempts_reading: x.max_attempts_reading,
             },
         }
     }
