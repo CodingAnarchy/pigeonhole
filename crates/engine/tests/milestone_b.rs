@@ -1675,7 +1675,7 @@ fn a_moving_clock_paces_a_deep_l0_with_the_token_bucket() {
             .create_table("t", &[("f".into(), FamilyOptions::default())])
             .unwrap();
         let mut i = 0;
-        while engine.metrics().stalls.1 == 0 {
+        while engine.metrics().pacing_stalls.1 == 0 {
             assert!(
                 i < 20_000,
                 "writers were never paced: {:?}",
