@@ -2473,7 +2473,9 @@ impl Engine {
     /// (a snapshot from before the close holds one: then the release runs when the last
     /// goes). Linux frees the arena pages; macOS and Windows cannot (they stay until the
     /// last handle and snapshot drop). A no-op on an open instance, on a reader and on an
-    /// application-owned engine (the application drives its close). For `pigeonhole`'s
+    /// application-owned engine (the application drives its close); a plain [`Engine::close`]
+    /// releases nothing, unless a `close_for_reopen` raced it (that call releases after the
+    /// close it waited for). For `pigeonhole`'s
     /// automatic recovery (#620); not a stable API.
     #[doc(hidden)]
     pub fn release_memory(&self) {

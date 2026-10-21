@@ -600,9 +600,70 @@ fn the_arenas_are_freed_by_the_release_after_the_reopen() {
     }
     drop(db);
 
-    // A plain close keeps the view.
+    // A plain close keeps the view (unless a `close_for_reopen` races it: that call releases
+    // after the close it waited for).
     let before = reopened.memory_release();
     assert!(before.view_memtables > 0, "{before:?}");
+    gate::within(10, move || reopened.close())
+        .expect("close hung")
+        .unwrap();
+}
+
+/// A reader process across the release (perf287's R1 on #821): a `Role::Reader` engine's
+/// snapshot from before the discard lists memtables in the old region's arenas. After the
+/// reopen superseded the region and the discard zeroed them (the simulated region zeroes
+/// as `madvise(MADV_REMOVE)` does), a read through that snapshot is `SnapshotExpired`,
+/// never `Corrupt` and never a fault, and a new snapshot re-attaches to the new generation
+/// and reads every row.
+#[test]
+fn a_reader_snapshot_from_before_the_discard_expires_and_a_new_one_reads_every_row() {
+    let (vfs, gate) = gate::vfs(1608);
+    let db = Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let s = shard_of(&db, &t);
+    // Memtables only: the reader reads them from the arenas.
+    for i in 0..64 {
+        db.commit(put(&t, &format!("row{i:03}")), Some(Durability::Buffered))
+            .unwrap();
+    }
+    let reader = Engine::open_reader(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
+    let rt = reader.table("t").unwrap();
+    let old_snap = reader.snapshot().unwrap();
+    let read = |snap: &pigeonhole_engine::Snapshot, row: &str| {
+        reader.get(snap, rt.id, rt.families[0].id, row.as_bytes(), b"q")
+    };
+    for i in 0..64 {
+        assert!(read(&old_snap, &format!("row{i:03}")).unwrap().is_some());
+    }
+
+    let handover = fail_and_close(&db, &t, &gate, s);
+    gate.heal(&wal(s));
+    let reopened = Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 2), handover)
+        .map_err(|(e, _)| e)
+        .unwrap();
+    db.release_memory();
+    let released = db.memory_release();
+    assert_eq!(released.arenas, ArenaDiscard::Discarded, "{released:?}");
+    for i in 0..64 {
+        let row = format!("row{i:03}");
+        match read(&old_snap, &row) {
+            Err(Error::SnapshotExpired) => {}
+            other => panic!("{row} through the old reader snapshot after the discard: {other:?}"),
+        }
+    }
+    let snap = reader.snapshot().expect("re-attach to the new generation");
+    for i in 0..64 {
+        let row = format!("row{i:03}");
+        assert!(
+            read(&snap, &row).unwrap().is_some(),
+            "{row} through the new generation"
+        );
+    }
+    drop((snap, old_snap));
+    reader.close().unwrap();
+    drop(db);
     gate::within(10, move || reopened.close())
         .expect("close hung")
         .unwrap();

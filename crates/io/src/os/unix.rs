@@ -423,11 +423,24 @@ pub(crate) fn bind_numa(_ptr: *mut u8, _len: usize, _node: u32) -> Result<()> {
     Ok(())
 }
 
+/// The kernel's page size (`sysconf(_SC_PAGESIZE)`: 4 KiB, or 16 or 64 KiB on some arm64
+/// kernels), which `madvise` and `mincore` work in; `pigeonhole_format::PAGE_SIZE` is the
+/// file's page.
+#[cfg(target_os = "linux")]
+fn system_page_size() -> usize {
+    // SAFETY: plain syscall with a constant name.
+    let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    usize::try_from(n)
+        .ok()
+        .filter(|n| n.is_power_of_two())
+        .unwrap_or(4096)
+}
+
 /// The whole pages inside `[ptr, ptr + len)`: the start rounded up and the end rounded down
 /// to a page, or `None` when no whole page lies inside.
 #[cfg(target_os = "linux")]
 fn whole_pages(ptr: *mut u8, len: usize) -> Option<(usize, usize)> {
-    let page = pigeonhole_format::PAGE_SIZE;
+    let page = system_page_size();
     let start = (ptr as usize).next_multiple_of(page);
     let end = (ptr as usize + len) & !(page - 1);
     (start < end).then_some((start, end - start))
@@ -456,7 +469,7 @@ pub(crate) fn resident_bytes(ptr: *mut u8, len: usize) -> Result<usize> {
     let Some((start, span)) = whole_pages(ptr, len) else {
         return Ok(0);
     };
-    let page = pigeonhole_format::PAGE_SIZE;
+    let page = system_page_size();
     let mut vec = vec![0u8; span / page];
     // SAFETY: `[start, start + span)` covers whole pages of a live mapping we own, and `vec`
     // holds one byte per page of it.

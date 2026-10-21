@@ -440,8 +440,8 @@ pub(crate) struct Shared {
     /// (D265) instead of releasing them, and removes neither the WAL files nor the region.
     pub keep_locks: AtomicBool,
     /// What became of the closed instance's memtable arenas (`release_memory`, D265):
-    /// `ARENAS_PENDING` until the discard ran (`ARENAS_DISCARDED`) or the platform refused it
-    /// (`ARENAS_UNSUPPORTED`: the pages stay until the last mapping goes).
+    /// `ARENAS_PENDING` until the discard ran (`ARENAS_DISCARDED`) or the OS refused it
+    /// (`ARENAS_REFUSED`: the pages stay until the last mapping goes).
     pub arena_discard: AtomicU8,
     pub default_durability: AtomicU8,
     pub closed: AtomicBool,
@@ -517,9 +517,10 @@ pub(crate) struct Shared {
 pub(crate) const ARENAS_PENDING: u8 = 0;
 /// `Shared::arena_discard`: the arena pages are freed.
 pub(crate) const ARENAS_DISCARDED: u8 = 1;
-/// `Shared::arena_discard`: the platform cannot free them (macOS, Windows): they stay
+/// `Shared::arena_discard`: the OS refused the discard (`Unsupported` on macOS and Windows,
+/// `EOPNOTSUPP` on a `shm_dir` file system without hole punching, …): the pages stay
 /// resident until the last mapping goes.
-pub(crate) const ARENAS_UNSUPPORTED: u8 = 2;
+pub(crate) const ARENAS_REFUSED: u8 = 2;
 
 impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -740,7 +741,13 @@ impl Shared {
     /// the region is superseded) and, while a view outlives the close, when the last one
     /// goes (`LiveViews::on_all_released`). Each step is safe under a straggler still using
     /// the instance: the caches are concurrent and a reader keeps its own handle, the view
-    /// store leaves a loaded view intact, and the discard waits for the views. What stays: the
+    /// store leaves a loaded view intact, and the discard waits for the views, and for the
+    /// tasks whose result can no longer be committed: a dead shard's flush task holds its
+    /// memtable readers without a view pin, but it runs only on a thread the close joined
+    /// (a slice in progress ends before `rt.shutdown()` returns, and one not started is
+    /// dropped with the queue), its reads go through the checked reader (`Corrupt` or an
+    /// early end on zeroed pages, never a fault), and its manifest commit is refused by the
+    /// closed instance, so nothing commits what it wrote. What stays: the
     /// mapping's header pages, the pager's descriptors and extent maps, the caches' tables,
     /// the per-shard metrics and slots, the options and the manifest writer.
     pub(crate) fn release_memory(&self) {
@@ -793,7 +800,8 @@ impl Shared {
     /// take the region for current (`ShmRegion::is_superseded`: after the reopen built the
     /// next generation; a reader still attached fails its reads with `SnapshotExpired` after
     /// reading, and the memtable reader never faults on zeroed pages). Records the outcome in
-    /// `arena_discard`; a platform that cannot free them records `ARENAS_UNSUPPORTED`.
+    /// `arena_discard`; an OS that refuses records `ARENAS_REFUSED` (and, with test hooks,
+    /// the error in `Hooks::arena_discard_error`).
     pub(crate) fn try_discard_arenas(&self) {
         if !self.closed.load(Ordering::Acquire)
             || self.arena_discard.load(Ordering::Acquire) != ARENAS_PENDING
@@ -807,7 +815,19 @@ impl Shared {
             }
             let state = match self.shm.discard_arenas() {
                 Ok(()) => ARENAS_DISCARDED,
-                Err(_) => ARENAS_UNSUPPORTED,
+                Err(e) => {
+                    #[cfg(feature = "test-hooks")]
+                    {
+                        *self
+                            .hooks
+                            .arena_discard_error
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner) = Some(e.to_string());
+                    }
+                    #[cfg(not(feature = "test-hooks"))]
+                    let _ = e;
+                    ARENAS_REFUSED
+                }
             };
             self.arena_discard.store(state, Ordering::Release);
         });

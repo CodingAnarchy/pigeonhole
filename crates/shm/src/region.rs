@@ -656,8 +656,15 @@ impl ShmRegion {
     /// data: in this process, no view that lists a memtable lives; in other processes,
     /// none can take the region for current ([`ShmRegion::is_superseded`]), so a reader
     /// still attached fails its reads with the engine's `SnapshotExpired` after reading
-    /// them, and `pigeonhole-memtable`'s reader never faults on zeroed pages. Linux only:
-    /// [`pigeonhole_io::ErrorKind::Unsupported`] elsewhere, and nothing is freed.
+    /// them, and `pigeonhole-memtable`'s reader never faults on zeroed pages. That a reader
+    /// which saw a zero also sees the new generation is the kernel's doing, not the memory
+    /// model's: the writer stores the new generation in the directory (Release) before the
+    /// `madvise`, which zaps every process's page-table entries for the range and waits for
+    /// the TLB shootdowns before it returns, so a reader sees zeros only by faulting after
+    /// that, and the fault and the shootdown's interrupt are full barriers ahead of its
+    /// `Acquire` fence and directory load. Linux only: an error elsewhere
+    /// ([`pigeonhole_io::ErrorKind::Unsupported`] on macOS and Windows, `EOPNOTSUPP` from a
+    /// `shm_dir` file system without hole punching), and nothing is freed.
     pub fn discard_arenas(&self) -> Result<()> {
         let (offset, len) = self.arenas_range();
         Ok(self.inner.region.discard(offset, len)?)

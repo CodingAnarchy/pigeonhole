@@ -178,7 +178,8 @@ impl SharedRegion {
     /// and the mapping stays valid, so nothing can fault. On Linux the whole pages inside
     /// the range and their backing store go (`madvise(MADV_REMOVE)`: a hole in the region's
     /// file, so every process mapping it sees the zeros); a partial page at either end
-    /// stays. A heap region zeroes the range. Elsewhere [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported): a POSIX
+    /// stays. A heap region zeroes the range (writing every page, so an untouched one is
+    /// faulted in: it simulates the discard for tests and frees nothing). Elsewhere [`ErrorKind::Unsupported`](crate::ErrorKind::Unsupported): a POSIX
     /// shared-memory object's pages cannot be punched, and nothing is freed. For an engine
     /// releasing a closed instance's memtable arenas (D265): the caller makes sure no one
     /// still reads the range as data. Panics if the range is out of bounds.
