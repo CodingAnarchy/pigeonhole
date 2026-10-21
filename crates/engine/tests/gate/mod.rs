@@ -28,6 +28,8 @@ struct Rules {
     panic: HashSet<PathBuf>,
     /// Paths whose submitted writes are held, unperformed, until [`Gate::release_writes`].
     hold_writes: HashSet<PathBuf>,
+    /// Paths whose every write (synchronous or submitted) fails, nothing written.
+    fail_writes: HashSet<PathBuf>,
 }
 
 /// A held submitted write: the file, the write, and the completion's resolver.
@@ -54,6 +56,16 @@ pub struct Gate {
 }
 
 impl Gate {
+    /// Fails every later write of `path`, synchronous or submitted, with nothing written
+    /// (a WAL stream file: its shard poisons itself at the next group's write).
+    pub fn fail_writes(&self, path: &Path) {
+        self.rules
+            .lock()
+            .unwrap()
+            .fail_writes
+            .insert(path.to_path_buf());
+    }
+
     /// Holds every later asynchronous sync of `path` until [`Gate::release`].
     pub fn hold(&self, path: &Path) {
         self.rules.lock().unwrap().hold.insert(path.to_path_buf());
@@ -324,6 +336,19 @@ impl pigeonhole_io::File for GateFile {
         Ok(())
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        if self
+            .gate
+            .rules
+            .lock()
+            .unwrap()
+            .fail_writes
+            .contains(&self.path)
+        {
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected write failure",
+            ));
+        }
         if self.write_fails(buf) {
             return Err(pigeonhole_io::Error::new(
                 pigeonhole_io::ErrorKind::Other,
@@ -336,6 +361,21 @@ impl pigeonhole_io::File for GateFile {
         self.inner.submit_read(buf, offset)
     }
     fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> Completion {
+        if self
+            .gate
+            .rules
+            .lock()
+            .unwrap()
+            .fail_writes
+            .contains(&self.path)
+        {
+            let (completion, resolver) = Completion::pair();
+            resolver.resolve(Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected write failure",
+            )));
+            return completion;
+        }
         if self
             .gate
             .rules

@@ -35,6 +35,9 @@ on:
       env:
         description: Extra environment, space-separated KEY=VALUE pairs
         default: ""
+      tools:
+        description: Extra apt packages, space-separated (gdb for the hang watchdog's stacks)
+        default: ""
 
 permissions:
   contents: read
@@ -82,6 +85,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sweep
+      - name: Extra tools
+        if: inputs.tools != ''
+        env:
+          TOOLS: ${{ inputs.tools }}
+        run: |
+          re='^[a-z0-9.+ -]+$'
+          [[ "$TOOLS" =~ $re ]] || { echo "bad tools: $TOOLS"; exit 1; }
+          sudo apt-get update -q && sudo apt-get install -y -q $TOOLS
       - name: Extra environment
         env:
           EXTRA: ${{ inputs.env }}
