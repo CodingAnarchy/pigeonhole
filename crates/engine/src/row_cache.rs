@@ -179,7 +179,8 @@ impl RowCaches {
         self.cache.clear();
     }
 
-    /// Bytes the rows and their encodings take.
+    /// Bytes the rows and their encodings take (the `memory_release` test hook).
+    #[cfg(feature = "test-hooks")]
     pub fn usage(&self) -> usize {
         self.cache.usage()
     }
