@@ -207,10 +207,14 @@ impl Db {
     /// the handle is closed). Costs nothing on the success path.
     #[inline(always)]
     pub(crate) fn retry_closed<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
-        // The generation before the operation (one load): a `Closed` is then judged against
-        // the engine the operation ran on, not against whatever is current once the thread
-        // runs again (perf287's R3 on #836).
-        let generation = self.generation();
+        // The generation before the operation (one load, with the option on; none with it
+        // off): a `Closed` is then judged against the engine the operation ran on, not
+        // against whatever is current once the thread runs again (perf287's R3 on #836).
+        let generation = if self.supervision.is_some() {
+            self.generation()
+        } else {
+            0
+        };
         match op() {
             Err(e) if e.code() == ErrorCode::Closed => {
                 self.after_closed(generation)?;
@@ -254,11 +258,13 @@ impl Db {
     #[inline(always)]
     pub(crate) fn before_commit(&self) -> Result<u64> {
         match &self.supervision {
+            // Option off: no load at all (`after_commit_closed` returns early without it).
+            None => Ok(0),
             Some(sup) if sup.recovering() => {
                 self.wait_for_swap()?;
                 Ok(self.generation())
             }
-            _ => Ok(self.generation()),
+            Some(_) => Ok(self.generation()),
         }
     }
 

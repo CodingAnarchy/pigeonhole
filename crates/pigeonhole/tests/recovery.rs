@@ -405,8 +405,18 @@ fn a_deadline_that_passes_during_the_reopen_stays_given_up() {
     assert!(db.is_failed());
     assert_eq!(put(&t, "b").unwrap_err().code(), ErrorCode::Closed);
     gate.release_reads();
-    // The reopen completes, finds the recovery given up, and closes its engine: no swap.
-    std::thread::sleep(Duration::from_millis(500));
+    // The reopen completes, finds the recovery given up, and closes its engine instead of
+    // swapping it in: once that close released the locks, a plain open succeeds, with this
+    // handle still open on its closed, failed engine.
+    assert!(
+        wait_until(10, || Pigeonhole::open(
+            DB,
+            options(Arc::clone(&vfs), Recovery::Off)
+        )
+        .map(|db| db.close().is_ok())
+        .unwrap_or(false)),
+        "a plain open once the supervisor closed the engine it reopened"
+    );
     let stats = db.recovery_stats();
     assert_eq!(
         (stats.generation, stats.recoveries, stats.gave_up),
@@ -416,15 +426,6 @@ fn a_deadline_that_passes_during_the_reopen_stays_given_up() {
     assert!(db.is_failed());
     assert_eq!(put(&t, "c").unwrap_err().code(), ErrorCode::Closed);
     let _ = db.close();
-    assert!(
-        wait_until(10, || Pigeonhole::open(
-            DB,
-            options(Arc::clone(&vfs), Recovery::Off)
-        )
-        .map(|db| db.close().is_ok())
-        .unwrap_or(false)),
-        "a plain open after the give-up: the closed engine released the locks"
-    );
 }
 
 /// `close()` during a recovery waits for it to settle, then closes what the handle ends on.

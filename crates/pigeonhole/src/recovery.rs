@@ -50,7 +50,9 @@ pub struct RecoveryStats {
     /// Recoveries that completed.
     pub recoveries: u64,
     /// The supervisor gave up: the budget was spent, the reopen failed for good, or the
-    /// failed engine's close did not return in time. The instance stays failed.
+    /// failed engine's close did not return in time. The instance stays failed. Also set
+    /// when `close()` landed while a reopen ran: the engine that reopen produced was closed
+    /// instead of swapped in (the handle is closed then, so it changes nothing).
     pub gave_up: bool,
     /// The failure the last recovery (or give-up) was for.
     pub last_failure: Option<Failure>,
