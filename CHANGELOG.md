@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+- **The close waits for the WAL's submitted I/O** (#824). A spare segment's zero-fill and a held successor header are submitted to the I/O backend and were never waited for, and a failed shard's close waited for nothing, so a close followed by a reopen in the same process (the recovery guide's procedure) could hand the file over with such a write still in flight on the pread backend's threads, and the reopened instance could start a segment in the slot it then landed on. The close now returns only once every stream's submitted operations finished. On a device that never answers it blocks, as a sync would.
+
 ## [0.3.0] - 2026-10-20
 The **Phase 3 latency engine**: io_uring and direct I/O, an async form of every data operation, commits visible once applied with group syncs shared between them, one-I/O cold gets, thread-per-core shards that are pinned and packed by load, cross-shard commits that stay ordered and cheap under contention, and the work measured against the Phase 3 gate on the reference machine (2026-10-20 at 516b59b8; see [Performance](#performance), and [Known issues](#known-issues) for what carries over to Phase 4). Several defaults and error semantics change; read [Upgrading from 0.2.x](#upgrading-from-02x) first. The file format is unchanged, and files written by 0.2.x open as before; the shared-memory layout moves to version 2, so stop reader processes before upgrading the writer. Includes the fixes released in 0.2.1, 0.2.2 and 0.2.3. Every published crate moves to 0.3.0 together.
 

@@ -72,7 +72,7 @@ use pigeonhole_io::{Completion, VfsRef};
 pub use foreground::StrictForeground;
 pub use mem::MemWal;
 pub use recovery::Recovery;
-pub use stream::{SparePrep, SpareSegments, WalCounters, WalStream};
+pub use stream::{IoTracker, SparePrep, SpareSegments, WalCounters, WalStream};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -284,6 +284,13 @@ pub trait Wal: Send + fmt::Debug {
     /// and `upto` never passes a COMMIT record while a participant's PREPARE for it may
     /// still need replay (decision D24). This crate checks neither.
     fn checkpoint(&mut self, upto: Lsn) -> Result<()>;
+
+    /// A handle on this stream's count of submitted, unfinished I/O operations
+    /// ([`IoTracker`]), for a close to wait on after the stream's threads are joined
+    /// (#824); `None` for a stream that submits nothing (the in-memory one).
+    fn io_tracker(&self) -> Option<IoTracker> {
+        None
+    }
 
     /// A handle for preparing spare segments on a background task, if the implementation
     /// has segments to prepare (`None` for mocks).

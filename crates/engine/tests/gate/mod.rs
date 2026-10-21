@@ -2,8 +2,10 @@
 //! I/O in flight across scheduling points (a WAL group unresolved, a manifest root commit
 //! blocked) and decide when it completes. It also fails reads, and writes to the main
 //! file, whose bytes contain a marker (one table's SST blocks, stored uncompressed), so a
-//! test can make one table's flushes or compactions fail. Storage is `SimVfs` on a real
-//! clock.
+//! test can make one table's flushes or compactions fail. It also holds chosen files'
+//! submitted writes (a WAL spare segment's zero-fill) until the test lets them land, so a
+//! test can keep a write of a closed instance in flight across a reopen (#824). Storage is
+//! `SimVfs` on a real clock.
 
 // Shared by several test binaries, each using a subset of it (as `tests/common` is).
 #![allow(dead_code)]
@@ -14,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pigeonhole_io::sim::SimVfs;
-use pigeonhole_io::{Completion, FileRef, Resolver, Vfs, VfsRef};
+use pigeonhole_io::{Completion, FileRef, IoBuf, Resolver, Vfs, VfsRef};
 
 /// What to do with a file's syncs.
 #[derive(Debug, Default)]
@@ -24,7 +26,12 @@ struct Rules {
     skip: std::collections::HashMap<PathBuf, usize>,
     fail: HashSet<PathBuf>,
     panic: HashSet<PathBuf>,
+    /// Paths whose submitted writes are held, unperformed, until [`Gate::release_writes`].
+    hold_writes: HashSet<PathBuf>,
 }
+
+/// A held submitted write: the file, the write, and the completion's resolver.
+type HeldWrite = (PathBuf, FileRef, IoBuf, u64, Resolver<IoBuf>);
 
 /// A held sync: the file, its completion's resolver, and the sync's real outcome.
 type Held = (PathBuf, Resolver<()>, pigeonhole_io::Result<()>);
@@ -34,6 +41,7 @@ type Held = (PathBuf, Resolver<()>, pigeonhole_io::Result<()>);
 pub struct Gate {
     rules: Mutex<Rules>,
     held: Mutex<Vec<Held>>,
+    held_writes: Mutex<Vec<HeldWrite>>,
     /// Reads whose bytes contain this marker fail (one table's SST blocks, say).
     read_marker: Mutex<Option<Vec<u8>>>,
     /// When each injected read failure happened.
@@ -111,6 +119,52 @@ impl Gate {
         while !self.held().iter().any(|p| p == path) {
             assert!(Instant::now() < deadline, "no sync of {path:?} was held");
             std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Holds every later submitted write of `path` (a WAL spare segment's zero-fill, a held
+    /// header): the write is not performed and its completion stays pending until
+    /// [`Gate::release_writes`]. Blocking writes (`write_at`) are unaffected.
+    pub fn hold_writes(&self, path: &Path) {
+        self.rules
+            .lock()
+            .unwrap()
+            .hold_writes
+            .insert(path.to_path_buf());
+    }
+
+    /// Paths with a submitted write held now.
+    pub fn held_writes(&self) -> Vec<PathBuf> {
+        self.held_writes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(p, ..)| p.clone())
+            .collect()
+    }
+
+    /// Waits (up to 10 s) until a submitted write of `path` is held.
+    pub fn wait_held_write(&self, path: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.held_writes().iter().any(|p| p == path) {
+            assert!(Instant::now() < deadline, "no write of {path:?} was held");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Stops holding writes, performs every held one in submission order (on this thread)
+    /// and completes it, including writes the completions submit in turn.
+    pub fn release_writes(&self) {
+        self.rules.lock().unwrap().hold_writes.clear();
+        loop {
+            let held = std::mem::take(&mut *self.held_writes.lock().unwrap());
+            if held.is_empty() {
+                return;
+            }
+            for (_, file, buf, offset, resolver) in held {
+                let r = file.write_at(&buf, offset).map(|()| buf);
+                resolver.resolve(r);
+            }
         }
     }
 
@@ -282,6 +336,24 @@ impl pigeonhole_io::File for GateFile {
         self.inner.submit_read(buf, offset)
     }
     fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> Completion {
+        if self
+            .gate
+            .rules
+            .lock()
+            .unwrap()
+            .hold_writes
+            .contains(&self.path)
+        {
+            let (completion, resolver) = Completion::pair();
+            self.gate.held_writes.lock().unwrap().push((
+                self.path.clone(),
+                Arc::clone(&self.inner),
+                buf,
+                offset,
+                resolver,
+            ));
+            return completion;
+        }
         self.inner.submit_write(buf, offset)
     }
     fn sync_data(&self) -> pigeonhole_io::Result<()> {

@@ -927,6 +927,7 @@ impl Engine {
                 n => n,
             },
             submitters: std::sync::OnceLock::new(),
+            wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
             shm_dir: options.shm_dir.clone(),
             identity,
             path: path.to_path_buf(),
@@ -1488,6 +1489,7 @@ impl Engine {
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             wal_pin_bytes: 0,
             submitters: std::sync::OnceLock::new(),
+            wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
             shm_dir: options.shm_dir.clone(),
             identity,
             path: path.to_path_buf(),
@@ -3692,10 +3694,25 @@ impl Inner {
             if let Some(rt) = rt {
                 // A shard thread that panicked resumes its panic here: report it instead
                 // (this also runs from `Drop for Engine`).
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.shutdown())) {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => return (Err(e.into()), true),
-                    Err(panic) => return (Err(shard_panicked(&*panic)), true),
+                let shutdown = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.shutdown()
+                })) {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(e.into()),
+                    Err(panic) => Err(shard_panicked(&*panic)),
+                };
+                // Every thread is joined, so nothing submits more: wait for what the streams
+                // still have in flight on the I/O backend's own threads (a poisoned shard's
+                // final sync waited for nothing; a spare preparation's zero-fill writes and a
+                // held header's chain are never waited for), whatever the shutdown's outcome
+                // and the shards' state (#824). A reopen of the file in this process (the
+                // handover, D265, or the recovery guide's close and reopen) could otherwise
+                // reuse a WAL slot under a write that lands later.
+                for tracker in self.shared.wal_io.iter().filter_map(|t| t.get()) {
+                    tracker.wait_idle();
+                }
+                if let Err(e) = shutdown {
+                    return (Err(e), true);
                 }
             }
         }

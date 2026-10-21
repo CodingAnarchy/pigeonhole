@@ -455,6 +455,35 @@ fn a_closed_instance_releases_its_memory_once_no_view_outlives_it() {
     let (vfs, gate) = gate::vfs(1606);
     let mut o = options(Arc::clone(&vfs), 2);
     o.row_cache_bytes = 1 << 20;
+/// A `put` with a value of `len` bytes (to fill WAL segments).
+fn put_sized(t: &TableInfo, row: &str, len: usize) -> WriteBatch {
+    let mut wb = WriteBatch::new();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        row.as_bytes(),
+        b"q",
+        None,
+        ValueRef::Bytes(&vec![7u8; len]),
+    )
+    .unwrap();
+    wb
+}
+
+/// A submitted WAL write of a failed shard still in flight on the I/O backend is waited for
+/// by the close (#824): a spare segment's zero-fill (D35) is submitted by a background task
+/// and never waited for, and a poisoned shard's final sync waits for nothing, so before the
+/// fix `close_for_reopen` returned with the write in flight, and the reopened instance
+/// could start a segment in the slot the write then landed on. Now the close returns only
+/// once the write landed. The gate holds the stream file's submitted writes until the test
+/// lets them land.
+#[test]
+fn the_close_waits_for_a_submitted_wal_write_still_in_flight() {
+    let (vfs, gate) = gate::vfs(1609);
+    let mut o = options(Arc::clone(&vfs), 2);
+    // Past half a segment the spare preparation starts (D35); well short of a whole one, so
+    // no rollover waits for the spare the gate holds back.
+    o.wal.segment_size = 512 << 10;
     let db = Engine::open(Path::new(DB), o).unwrap();
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
@@ -536,6 +565,48 @@ fn a_closed_instance_releases_its_memory_once_no_view_outlives_it() {
         }
     };
     reads("after the close");
+    gate.hold_writes(&wal(s));
+    // About 330 KiB of records: the preparation's zero-fill writes are submitted and held.
+    for i in 0..300 {
+        db.commit(
+            put_sized(&t, &format!("row{i:03}"), 1 << 10),
+            Some(Durability::Buffered),
+        )
+        .unwrap();
+    }
+    gate.wait_held_write(&wal(s));
+    gate.fail(&wal(s));
+    let (db2, t2) = (Arc::clone(&db), Arc::clone(&t));
+    let failed = gate::within(10, move || {
+        db2.commit(put(&t2, "lost"), Some(Durability::Sync))
+    })
+    .expect("a commit with a failing sync hung");
+    assert!(failed.is_err(), "{failed:?}");
+    assert_eq!(db.failure().map(|f| f.cause), Some(FailureCause::Io));
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    let db2 = Arc::clone(&db);
+    std::thread::spawn(move || {
+        let _ = tx.send(db2.close_for_reopen());
+    });
+    assert!(
+        rx.recv_timeout(Duration::from_secs(3)).is_err(),
+        "close_for_reopen returned with a submitted write of the stream still in flight (#824)"
+    );
+    assert!(!gate.held_writes().is_empty(), "the write is still held");
+    gate.release_writes();
+    let (closed, handover) = rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("close_for_reopen did not return once the held writes landed");
+    assert!(
+        closed.is_err(),
+        "a failed instance's close is unclean: {closed:?}"
+    );
+    let handover = handover.expect("the locks were still held");
+    assert!(
+        gate.held_writes().is_empty(),
+        "nothing is in flight after the close"
+    );
 
     gate.heal(&wal(s));
     let reopened = Engine::open_with(Path::new(DB), options(Arc::clone(&vfs), 2), handover)
@@ -562,6 +633,23 @@ fn a_closed_instance_releases_its_memory_once_no_view_outlives_it() {
         .commit(put(&t2, "after"), Some(Durability::Sync))
         .unwrap();
     assert!(has(&reopened, &t2, "after"));
+    let t = reopened.table("t").unwrap();
+    for i in 0..300 {
+        assert!(has(&reopened, &t, &format!("row{i:03}")), "row{i:03}");
+    }
+    // The reopened stream prepares spares of its own, and rolls over onto them, without a
+    // stale write landing on them.
+    for i in 0..600 {
+        reopened
+            .commit(
+                put_sized(&t, &format!("after{i:03}"), 1 << 10),
+                Some(Durability::Buffered),
+            )
+            .unwrap();
+    }
+    reopened
+        .commit(put(&t, "synced"), Some(Durability::Sync))
+        .unwrap();
     drop(db);
     gate::within(10, move || reopened.close())
         .expect("close hung")
@@ -667,4 +755,10 @@ fn a_reader_snapshot_from_before_the_discard_expires_and_a_new_one_reads_every_r
     gate::within(10, move || reopened.close())
         .expect("close hung")
         .unwrap();
+    let again = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
+    let t = again.table("t").unwrap();
+    for row in ["row000", "row299", "after000", "after599", "synced"] {
+        assert!(has(&again, &t, row), "{row} after the clean close");
+    }
+    again.close().unwrap();
 }

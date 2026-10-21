@@ -508,6 +508,12 @@ pub(crate) struct Shared {
     pub wal_pin_bytes: u64,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
+    /// Per shard, a handle on its WAL stream's count of submitted, unfinished I/O
+    /// (`IoTracker`), set when the stream is attached at open (`ShardState::set_wal`); the
+    /// close waits on them after the runtime's threads are joined (#824), so a reopen in
+    /// this process never finds a write of the closed instance still in flight on the I/O
+    /// backend's own threads. Empty in a reader process.
+    pub wal_io: Vec<std::sync::OnceLock<pigeonhole_wal::IoTracker>>,
     pub shm_dir: Option<std::path::PathBuf>,
     pub identity: pigeonhole_io::FileIdentity,
     pub path: std::path::PathBuf,
@@ -2983,6 +2989,11 @@ impl ShardState {
     }
 
     pub(crate) fn set_wal(&mut self, wal: Box<dyn Wal>) {
+        if let Some(tracker) = wal.io_tracker()
+            && let Some(slot) = self.shared.wal_io.get(usize::from(self.id.0))
+        {
+            let _ = slot.set(tracker);
+        }
         self.spares = wal.spares();
         self.open_epoch = wal.written().epoch();
         self.wal = Some(wal);
