@@ -119,6 +119,13 @@
 # #626 (D236): a blocking commit waits on the engine's borrowed state and its request is
 # built in the submit that sends it, so commit-one, commit-overwrite and commit-at lowered
 # (callgrind 9600 -> 9556, 11647 -> 11601, 10596 -> 10558); commit-async is +2 (9689).
+# Raised by owner decision (2026-10-21, #794): compact 2692 -> 2770 (2757 times 1.005). A
+# measurement correction: the shape now runs on inline I/O and a stepped clock
+# (`support/inline_io.rs`) and counts 2757 on every run (12 runs on 3 runners, scratch run
+# 39538888713, within 244 instructions of 22M). Before, the pread backend checked and
+# decompressed most read-ahead blocks on its I/O worker threads, uncounted, and the rest on
+# the measured thread, depending on thread timing (2657-2707 on identical code); that work
+# (about 92 per entry) is now always counted, as io_uring does it on the shard thread.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -136,7 +143,7 @@ short-scans 13564 0.3
 commit-one 9585 0.3
 commit-sixteen 50044 0.3
 flush 2199 0.3
-compact 2692 0.5
+compact 2770 0.5
 ycsb-c 43293 1.0
 ycsb-a 27239 1.0
 commit-overwrite 11660 0.5
