@@ -251,10 +251,16 @@ fn history(seed: u64) {
 /// One test, so nothing else in this binary flips the process-wide switch meanwhile.
 #[test]
 fn jumping_reads_return_what_stepping_reads_return() {
+    // At least the default 12 seeds, whatever `PIGEONHOLE_SEEDS` asks (#810): the counts
+    // below are sums over the seeds, and one seed's vary a lot (seed 1 makes 44 memtable
+    // jumps), so fewer seeds would fail the thresholds with the index working. The 12 take
+    // well under a second.
+    const MIN_SEEDS: u64 = 12;
     let seeds: u64 = std::env::var("PIGEONHOLE_SEEDS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(12);
+        .unwrap_or(MIN_SEEDS)
+        .max(MIN_SEEDS);
     let before = Engine::tail_skips();
     let sst_before = Engine::sst_skips();
     for seed in 1..=seeds {
