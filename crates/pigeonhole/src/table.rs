@@ -207,6 +207,33 @@ impl TableCore {
             .ok_or_else(|| family_not_found(&self.info.name, name))
     }
 
+    /// `get` as of now with a supervisor: run again on the recovered engine if it got
+    /// `Closed`. Out of line, so the plain arm of `get` keeps main's codegen (inlined beside
+    /// it, the two arms shared a temporary for the engine's result and moved it once more:
+    /// about 50 instructions per get on callgrind, #836 round 7).
+    #[cold]
+    #[inline(never)]
+    fn get_latest_supervised(
+        &self,
+        table: pigeonhole_engine::TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+    ) -> Result<Option<pigeonhole_engine::CellData>> {
+        self.db.retry_closed(|| {
+            self.with(|e| e.get_latest(table, family, row, qualifier))
+                .map_err(Error::from)
+        })
+    }
+
+    /// A snapshot with a supervisor (see `get_latest_supervised`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn snapshot_supervised(&self) -> Result<pigeonhole_engine::Snapshot> {
+        self.db
+            .retry_closed(|| self.engine().snapshot().map_err(Error::from))
+    }
+
     /// The newest version of one cell, as of `snapshot` or now.
     #[inline]
     pub(crate) fn get(
@@ -222,10 +249,9 @@ impl TableCore {
         let data = match snapshot {
             // With a supervisor, the read is run again on the recovered engine if it got
             // `Closed`; without one, the call as before the option (`Db::supervised`).
-            None if self.db.supervised() => self.db.retry_closed(|| {
-                self.with(|e| e.get_latest(table, family, row, qualifier))
-                    .map_err(Error::from)
-            })?,
+            None if self.db.supervised() => {
+                self.get_latest_supervised(table, family, row, qualifier)?
+            }
             None => self.with(|e| e.get_latest(table, family, row, qualifier))?,
             Some(s) => {
                 self.db.check_snapshot(s)?;
