@@ -7044,3 +7044,52 @@ fn a_prepare_refused_by_a_fence_waits_behind_the_reader() {
         .expect("reader commits");
     drain(&mut db, stream);
 }
+
+#[test]
+fn a_fence_ends_with_its_readers_last_attempt_even_with_nothing_waiting() {
+    // D267: a reading commit R (reads `b`, writes `y` and `a`), the oldest on `a`, is
+    // refused on `low` over a younger blind commit's share there and fences `a`. `b` is then
+    // written, so R's retry fails validation on `low` itself: never tracked there, its last
+    // attempt is decided while `low` holds no refusal waiting (R's own was woken when `a`
+    // cleared). The fence must still end; it ended only when a refusal was waiting, and
+    // later blind commits on `a` were refused behind a commit that was gone (the bench's
+    // transfer smoke stalled for the write-stall timeout).
+    let (mut db, low, high) = overlap_db();
+    let b1 = blind_txn(&db, &[b"a", b"z"], b"b1");
+    let mut b1 = b1.submit(Some(Durability::Buffered)).unwrap();
+    let r = overlap_txn(&db, &[b"b"], &[b"y", b"a"]);
+    let mut r = r.submit(Some(Durability::Buffered)).unwrap();
+    // `high` gives R the oldest id; `low` admits B1's share, then refuses R's PREPARE.
+    turn(&mut db, high);
+    turn(&mut db, low);
+    assert!(
+        db.engine.metrics().cross_shard.refused_pending_overlap > 0,
+        "R was not refused on `a`"
+    );
+    // A write to `b` after R's snapshot, admitted on `low` before R's retry.
+    let table = db.table.clone();
+    let mut put = submit_put(&db, &table, b"b");
+    turn(&mut db, low);
+    poll_until(&mut db, &mut put, 100_000)
+        .expect("the put resolved")
+        .expect("the put commits");
+    let rr = poll_until(&mut db, &mut r, 100_000).expect("R resolved");
+    assert!(
+        matches!(rr, Err(pigeonhole_engine::Error::Conflict)),
+        "R: {rr:?}"
+    );
+    poll_until(&mut db, &mut b1, 100_000)
+        .expect("B1 resolved")
+        .expect("B1 commits");
+    // A later blind commit on `a` is not fenced by R, which is gone.
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    let b2 = blind_txn(&db, &[b"a", b"z"], b"b2");
+    let mut b2 = b2.submit(Some(Durability::Buffered)).unwrap();
+    poll_until(&mut db, &mut b2, 100_000)
+        .expect("B2 resolved: refused behind a fence nothing ends")
+        .expect("B2 commits");
+    assert_eq!(
+        db.engine.metrics().cross_shard.refused_pending_overlap,
+        before
+    );
+}

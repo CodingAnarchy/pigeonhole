@@ -7247,6 +7247,14 @@ impl ShardState {
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
+        if c.decided {
+            // An answer after a wound decided the attempt early (D267): ignored. The abort
+            // already told the participants whether it was the last attempt, and the retry
+            // must follow that; a late `Conflict` or `Moved` would change it (a commit that
+            // failed after its participants heard "not last" leaves its fences and the
+            // commits waiting behind it there for good).
+            return;
+        }
         // Until the decision, `commit_ts` gathers the participants' floors (D263).
         c.commit_ts = c.commit_ts.max(floor);
         match error {
@@ -7382,8 +7390,9 @@ impl ShardState {
         if !self.chained_after.is_empty() {
             self.release_chained(seqno, ctx);
         }
-        // Commits refused here over an overlap may retry now (D249).
-        if !self.overlap_refused.is_empty() {
+        // Commits refused here over an overlap may retry now (D249), and a fence this
+        // commit set here ends with its last attempt (D267).
+        if !self.overlap_refused.is_empty() || !self.reader_fences.is_empty() {
             self.release_overlaps(seqno, priority, commit, last, ctx);
         }
     }

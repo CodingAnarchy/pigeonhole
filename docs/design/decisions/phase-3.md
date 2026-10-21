@@ -2212,13 +2212,14 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
   - **Bounded.** This bounds its wait by the chain ahead of it, at most `CHAIN_CAP` shares plus older commits exempt from the cap, and keeps per-row submission order.
   - **Ending the wait.** A waiting single that is forwarded or parked for a tablet change ends its wait there. Back, it starts a new one.
 - **Wound-wait.** Waits between chained shares could form a cycle: A behind B on one shard, B behind A on another. So a share chained behind a *younger* commit's undecided share sends that commit's coordinator `Wound`. This includes a share it is behind through a waiting single, where the edge is made explicit.
-  - The coordinator decides an attempt not yet decided as an abort at once, without waiting for the remaining `Prepared` answers. Answers arriving after the decision are ignored, as before.
+  - The coordinator decides an attempt not yet decided as an abort at once, without waiting for the remaining `Prepared` answers.
+  - Answers arriving after the decision are ignored entirely, a late `Conflict` or `Moved` included. The abort already told the participants whether it was the commit's last attempt (D249), and the retry must follow that.
   - The participant records the younger commit as refused behind the older one, D249's older-first wake: the older commit's next attempt there committing, its last attempt, or `Released`.
   - A commit already deciding is not aborted; the older share simply waits for its `Decide`.
   - Every wait that remains runs from a younger commit to an older one, or to a decided commit, or from a share to a single, which waits only for shares admitted before it. So no cycle forms.
 - **Starvation.** Among admitted (chained) shares, the oldest commit is never wounded. Two rules keep a commit from being refused for ever:
   - **The cap.** A blind PREPARE older than every undecided share on its rows chains past the cap and wounds them, so the queue holds at most `CHAIN_CAP` shares plus older commits.
-  - **The reader fence.** A refused commit that reads, and is older than every undecided share on its rows, *fences* those rows (`reader_fences`). Younger PREPAREs writing them are refused, chained or not, so the row drains and the commit's retry gets in. The fence ends once that commit's PREPARE is tracked there, its last attempt is decided there, or it retries without that shard (`Released`).
+  - **The reader fence.** A refused commit that reads, and is older than every undecided share on its rows, *fences* those rows (`reader_fences`). Younger PREPAREs writing them are refused, chained or not, so the row drains and the commit's retry gets in. The fence ends once that commit's PREPARE is tracked there, its last attempt is decided there, or it retries without that shard (`Released`). Its last attempt ends the fence even when nothing waits on that shard: for example, the attempt failed validation there, so it was never tracked, and the commit's own refusal had already been woken. Before this was fixed, the fence outlived its reader, and the younger commits it refused waited behind a commit that was gone until the write-stall timeout (the bench's transfer smoke).
 - **What a refusal waits for** (perf287's R4). Each refused PREPARE waits for what actually refused it, never for shares that may already be gone. Otherwise it would be woken at once and refused again every round.
   - **Refused by a fence:** it waits behind the fencing reader, with D249's older-first wake (the reader's next attempt committing there, its last, or `Released`), which is the fence's own end set.
   - **Refused by a waiting single:** it is woken when that single is logged (`end_single_wait`).
@@ -2254,8 +2255,10 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
   - `the_oldest_blind_commit_chains_past_a_full_row_and_wounds_it`;
   - `a_reading_commit_gets_in_against_a_stream_of_blind_commits`.
 - **Refusal waits:** `a_prepare_refused_by_a_fence_waits_behind_the_reader`. Three shards; the reader's coordinator is held still, so the fence stands while `a` is clear. 30 fenced commits are refused at most 32 times; with the refusal waiting for shares instead, 281 times.
+- **Fences:** `a_fence_ends_with_its_readers_last_attempt_even_with_nothing_waiting`. The reader's retry fails validation on the fenced shard. A later blind commit on the row goes in unrefused; before the fix, it was refused and never woken.
 - **Crashes:** `a_crash_mid_chain_applies_the_decided_share_and_drops_the_one_behind_it`. A is decided but not applied on the participant, B is chained and logged behind it, then a crash: the reopen applies A and drops B.
 - **Model check** (`model_check.rs`):
   - `hot_rows_chain_and_wound_across_many_shards`: Zipfian blind batches over 3, 6 and 10 shards;
-  - `hot_rows_chain_and_wound_through_crashes`: the same shape on 4 shards, with crashes and mid-commit crashes.
+  - `hot_rows_chain_and_wound_through_crashes`: the same shape on 4 shards, with crashes and mid-commit crashes;
+  - `hot_rows_mix_reading_commits_and_blind_writers`: transactions and conditional writes beside blind batches on the hot rows, on 3 and 6 shards, with no commit allowed to give up with `Busy`.
 - **The existing sweeps** run unchanged.
