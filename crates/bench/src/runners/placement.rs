@@ -36,6 +36,10 @@ pub struct PlacementOptions {
 /// a busy application, and well under a shard's capacity, so the load stays open-loop.
 pub const PLACEMENT_RATE_PER_SHARD: f64 = 30_000.0;
 
+/// How far a measuring window that saw no writes may grow, as a multiple of its length
+/// (#802).
+pub const WINDOW_GROWTH: f64 = 10.0;
+
 /// The default settle bound (D231).
 pub const PLACEMENT_SETTLE_BOUND: Duration = Duration::from_secs(60);
 
@@ -139,6 +143,16 @@ impl PigeonholeRunner {
             let done_before = completed.load(Ordering::Relaxed);
             let window_start = Instant::now();
             std::thread::sleep(opts.window);
+            // A window with no writes measures nothing: on a loaded runner a debug build's
+            // commits can stall through all of it (#802). It then grows until a write lands,
+            // up to `WINDOW_GROWTH` times its length; the record names the window it got.
+            let cap = opts.window.mul_f64(WINDOW_GROWTH);
+            while completed.load(Ordering::Relaxed) == done_before
+                && window_start.elapsed() < cap
+                && !stop.load(Ordering::Acquire)
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
             let (after, changes_after, _) = snapshot(&db);
             let window = window_start.elapsed().as_secs_f64();
             let done = completed.load(Ordering::Relaxed) - done_before;

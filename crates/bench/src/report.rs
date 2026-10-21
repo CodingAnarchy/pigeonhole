@@ -877,7 +877,8 @@ pub struct Placement {
     pub settle_secs: Option<f64>,
     /// The settle-time bound, in seconds.
     pub settle_bound_secs: f64,
-    /// Seconds measured after settling (or after the bound).
+    /// Seconds measured after settling (or after the bound): the requested window, or longer
+    /// if no write landed in it (up to `WINDOW_GROWTH` times, #802).
     pub window_secs: f64,
     /// Splits, merges and moves while measuring.
     pub changes_measured: u64,
