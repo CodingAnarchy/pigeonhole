@@ -276,6 +276,17 @@ Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; unti
 | Errors | On stderr. With json/jsonl: `{"phdb":1,"error":{"code","code_num","message"}}`. `code` is the `ErrorCode` name (`ReadOnly` for a write in a read-only shell). Failures outside the database have `code_num` `null`: `FileNotFound`, `BadInput` (a dump `load` can't read; the message names the line), `Usage` (exit 2). Shell and script failures name their line. |
 | Agent recipe | Inspect: `phdb --format json info DB`. Verify: `phdb --format json check DB` (exit 3 and `findings` on damage). Export: `phdb dump DB > db.jsonl`. Query or edit: `phdb --format json shell DB -c 'scan t --prefix user: --limit 10' -c 'put t r f:q v'` (one JSON document per command; the first failure stops with its status). |
 
+## Arrow export: `pigeonhole-arrow` (#691)
+Full page: [`arrow.md`](arrow.md). Depends on the public crate only; pins arrow-rs 60 and re-exports `arrow_array`, `arrow_buffer`, `arrow_schema`.
+
+| Item | Rule |
+|---|---|
+| `scan_to_arrow(Scan<'t>, &ArrowOptions) -> Result<ArrowScan<'t>>` | Starts the scan (setup errors here); the scan's whole selection passes through, so batches = a plain scan's cells, in order. |
+| `ArrowScan<'t>` | `Iterator<Item = Result<RecordBatch, ArrowError>>` + `RecordBatchReader`; `schema() -> SchemaRef`. Finished after an error. Read errors are `ArrowError::ExternalError(pigeonhole::Error)`. From `Scan::into_owned()`: `Send + 'static`. |
+| Schema | `row: Binary`, `family: Dictionary<Int32, Utf8>`, `qualifier: Binary`, `ts: Timestamp(Microsecond, "UTC")`, `value: Binary` (`CellRef::value`), `value_type: Dictionary<Int8, Utf8>` (`bytes`/`i64`/`f64`/`varint`). `schema(&ArrowOptions)` without scanning. |
+| `ArrowOptions` (`self -> Self`) | `typed_values(bool)` adds nullable `value_i64: Int64`, `value_f64: Float64`; `utf8_keys(bool)` (`Utf8` row/qualifier; invalid UTF-8 fails the batch, naming the key); `row_dictionary(bool)` (per-batch `Dictionary<Int32, _>`); `ts(TsType::Timestamp \| TsType::UInt64)` (`Timestamp` fails above `i64::MAX`); `batch_cells(n)` (default 8192), `batch_bytes(n)` (default 8 MiB, ≤ 1 GiB); a row may span batches. |
+| Cost | One copy per key and value into Arrow buffers; a fixed number of allocations per batch, none per cell. |
+
 ## `check` (offline integrity check, ICR 0048)
 `pigeonhole::check(path: impl AsRef<Path>, CheckOptions) -> Result<CheckReport>`
 

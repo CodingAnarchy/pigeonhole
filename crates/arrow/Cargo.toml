@@ -12,11 +12,14 @@ categories.workspace = true
 readme = "README.md"
 
 [dependencies]
+# The public crate only (spec Risks: query features build on the core, never the reverse).
 pigeonhole = { workspace = true }
+arrow-array = { workspace = true }
+arrow-buffer = { workspace = true }
+arrow-schema = { workspace = true }
+
+[dev-dependencies]
+pigeonhole-io = { workspace = true }
 
 [lints]
 workspace = true
-
-# Phase 3/4 placeholder: builds on the public crate once implemented.
-[package.metadata.cargo-machete]
-ignored = ["pigeonhole"]
