@@ -385,9 +385,12 @@ fn a_live_readers_snapshot_stalls_the_writer_into_busy_until_it_leaves() {
     assert_eq!(e.code(), ErrorCode::Busy, "row {row}: {e}");
     // The snapshot still reads what it saw.
     assert_eq!(reader.ask("count"), "COUNT 1000");
-    // The reader leaving releases its slot; the writer goes on.
+    // The reader leaving releases its slot and the memtables it pinned; the writer goes on.
+    // A bounded amount, inside the room that frees: writing the whole rest would depend on
+    // flushes keeping pace with the 1 s stall timeout, which a slow CI runner (Windows) does
+    // not always (#840's CI).
     reader.quit();
-    put(&t, row..1000 + PAST_BUDGET).unwrap();
+    put(&t, row..row + 1000).unwrap();
     drop(t);
     db.close().unwrap();
 }
