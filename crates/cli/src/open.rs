@@ -121,6 +121,30 @@ impl Db {
         }
     }
 
+    /// `table`'s rows starting with `prefix`, all retained versions, at `snapshot`, as an
+    /// Arrow export that holds its table (ICR 0052).
+    pub(crate) fn arrow(
+        &self,
+        table: &str,
+        prefix: &[u8],
+        snapshot: &pigeonhole::Snapshot,
+        options: &pigeonhole_arrow::ArrowOptions,
+    ) -> Result<pigeonhole_arrow::ArrowScan<'static>, Failure> {
+        let read = |e: pigeonhole::Error| Failure::db(&format!("read table {table}"), &e);
+        let scan = match self {
+            Db::Writer(db) => {
+                let t = db.table(table).and_then(|b| b.open()).map_err(read)?;
+                t.scan_prefix(prefix).into_owned()
+            }
+            Db::Reader(db) => db
+                .table(table)
+                .map_err(read)?
+                .scan_prefix(prefix)
+                .into_owned(),
+        };
+        pigeonhole_arrow::scan_to_arrow(scan.versions(0).snapshot(snapshot), options).map_err(read)
+    }
+
     /// Closes the database: as the writer this flushes and checkpoints, and a failure is
     /// the command's failure.
     pub(crate) fn close(self) -> Result<(), Failure> {

@@ -18,6 +18,11 @@ arrow-array = { workspace = true }
 arrow-buffer = { workspace = true }
 arrow-schema = { workspace = true }
 
+[features]
+# The Arrow C stream interface (`ArrowScan::into_ffi_stream`): hands a stream to a consumer
+# built on another arrow major or another language (DuckDB, Polars, pyarrow). Adds libc.
+ffi = ["arrow-array/ffi"]
+
 [dev-dependencies]
 pigeonhole-io = { workspace = true }
 

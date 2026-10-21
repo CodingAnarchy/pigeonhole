@@ -20,6 +20,9 @@ path = "src/main.rs"
 pigeonhole = { workspace = true }
 clap = { version = "4.6", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# dump --format arrow (#691): the export and its IPC stream.
+pigeonhole-arrow = { workspace = true }
+arrow-ipc = { workspace = true }
 
 [dev-dependencies]
 insta = { version = "1.49", features = ["filters"] }

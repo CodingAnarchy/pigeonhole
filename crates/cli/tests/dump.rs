@@ -1,5 +1,6 @@
 //! `phdb dump` and `phdb load` (#692): a dump loaded into a new database dumps the same, cell
-//! for cell; snapshot tests of both formats; the errors and exit statuses.
+//! for cell; snapshot tests of both formats; the errors and exit statuses. `dump --format
+//! arrow` (#691): an Arrow IPC stream of one table, cell for cell the jsonl dump's.
 
 mod common;
 
@@ -268,4 +269,160 @@ fn errors_and_exit_statuses() {
             "{err}"
         );
     }
+}
+
+/// The cells of an Arrow IPC stream, decoded to the jsonl dump's cell objects (without
+/// `table`), so the two dumps compare cell for cell.
+fn arrow_cells(stream: &[u8]) -> Vec<serde_json::Value> {
+    use pigeonhole_arrow::arrow_array::cast::AsArray;
+    use pigeonhole_arrow::arrow_array::types::{
+        Float64Type, Int8Type, Int32Type, Int64Type, TimestampMicrosecondType,
+    };
+    let bytes_json = |b: &[u8]| match std::str::from_utf8(b) {
+        Ok(s) => serde_json::json!(s),
+        Err(_) => serde_json::json!({ "base64": base64(b) }),
+    };
+    let reader = arrow_ipc::reader::StreamReader::try_new(stream, None).unwrap();
+    let mut out = Vec::new();
+    for batch in reader {
+        let batch = batch.unwrap();
+        let col = |n: &str| batch.column_by_name(n).unwrap().clone();
+        let (row, qualifier, value) = (col("row"), col("qualifier"), col("value"));
+        let (row, qualifier, value) = (
+            row.as_binary::<i32>(),
+            qualifier.as_binary::<i32>(),
+            value.as_binary::<i32>(),
+        );
+        let family = col("family");
+        let family = family.as_dictionary::<Int32Type>();
+        let names = family.values().as_string::<i32>();
+        let ts = col("ts");
+        let ts = ts.as_primitive::<TimestampMicrosecondType>();
+        let types = col("value_type");
+        let types = types.as_dictionary::<Int8Type>();
+        let type_names = types.values().as_string::<i32>();
+        let ints = col("value_i64");
+        let ints = ints.as_primitive::<Int64Type>();
+        let floats = col("value_f64");
+        let floats = floats.as_primitive::<Float64Type>();
+        for i in 0..batch.num_rows() {
+            let v = match type_names.value(types.keys().value(i) as usize) {
+                "bytes" => bytes_json(value.value(i)),
+                "f64" if floats.value(i).is_finite() => {
+                    serde_json::json!({ "f64": floats.value(i) })
+                }
+                "f64" => serde_json::json!({ "f64_bits": floats.value(i).to_bits() }),
+                _ => serde_json::json!({ "i64": ints.value(i) }),
+            };
+            out.push(serde_json::json!({
+                "row": bytes_json(row.value(i)),
+                "family": names.value(family.keys().value(i) as usize),
+                "qualifier": bytes_json(qualifier.value(i)),
+                "ts": ts.value(i),
+                "value": v,
+            }));
+        }
+    }
+    out
+}
+
+/// Standard base64 with padding, as the jsonl dump writes it.
+fn base64(b: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::new();
+    for c in b.chunks(3) {
+        let n = (u32::from(c[0]) << 16)
+            | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*c.get(2).unwrap_or(&0));
+        for k in 0..4 {
+            if k <= c.len() {
+                s.push(A[(n >> (18 - 6 * k) & 63) as usize] as char);
+            } else {
+                s.push('=');
+            }
+        }
+    }
+    s
+}
+
+#[test]
+fn an_arrow_dump_is_the_jsonl_dumps_cells() {
+    let dir = TempDir::new("dump-arrow");
+    let src = dir.path().join("src.phdb");
+    rich(&src);
+    let jsonl = dump(&src, &["--table", "a"]);
+    let want: Vec<serde_json::Value> = body(&jsonl)
+        .into_iter()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .filter(|v| v.get("row").is_some())
+        .map(|mut v| {
+            v.as_object_mut().unwrap().remove("table");
+            v
+        })
+        .collect();
+    let (status, stream, err) = common::phdb_bytes(&[
+        "--format",
+        "arrow",
+        "dump",
+        "--table",
+        "a",
+        src.to_str().unwrap(),
+    ]);
+    assert_eq!(status, 0, "{err}");
+    let got = arrow_cells(&stream);
+    assert!(got.len() > 100, "{}", got.len());
+    assert_eq!(got, want);
+    // With a prefix.
+    let (status, stream, _) = common::phdb_bytes(&[
+        "--format",
+        "arrow",
+        "dump",
+        "--table",
+        "a",
+        "--prefix",
+        "row00",
+        src.to_str().unwrap(),
+    ]);
+    assert_eq!(status, 0);
+    let rows: std::collections::BTreeSet<_> = arrow_cells(&stream)
+        .into_iter()
+        .map(|c| c["row"].to_string())
+        .collect();
+    assert_eq!(rows.len(), 10);
+}
+
+#[test]
+fn arrow_dump_errors() {
+    let dir = TempDir::new("dump-arrow-errors");
+    let src = dir.path().join("src.phdb");
+    rich(&src);
+    let path = src.to_str().unwrap();
+    // One table: the stream has one schema.
+    let (status, _, err) = common::phdb_bytes(&["--format", "arrow", "dump", path]);
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("one table"), "{err}");
+    // Arrow is dump's alone.
+    let (status, _, err) = common::phdb_bytes(&["--format", "arrow", "info", path]);
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("--format arrow is for phdb dump"), "{err}");
+    // A timestamp an Arrow Timestamp can't hold: exit 6, and jsonl dumps it.
+    let db = Pigeonhole::open(&src, options()).unwrap();
+    db.table("a")
+        .unwrap()
+        .open()
+        .unwrap()
+        .mutate(b"late")
+        .put_at("p", b"q", i64::MAX as u64 + 1, b"v")
+        .commit()
+        .unwrap();
+    db.close().unwrap();
+    let (status, _, err) = common::phdb_bytes(&[
+        "--format", "arrow", "dump", "--table", "a", "--prefix", "late", path,
+    ]);
+    assert_eq!(status, 6, "{err}");
+    assert!(
+        err.contains("Unsupported") || err.contains("i64::MAX"),
+        "{err}"
+    );
+    assert!(dump(&src, &["--table", "a", "--prefix", "late"]).contains("9223372036854775808"));
 }

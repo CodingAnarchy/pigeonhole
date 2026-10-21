@@ -83,6 +83,18 @@ jobs:
           "$phdb" shell "$db" -c "create t f" -c "put t r f:q v" -c "get t r f:q" | grep -q 'v$'
           "$phdb" --format json info "$db" | grep -q '"name": "t"'
           "$phdb" check "$db"
+      # #691: `phdb dump --format arrow` is an Arrow IPC stream another Arrow reader takes.
+      # Polars (pinned) reads a dump whose family dictionary grows mid-stream and checks its
+      # cells, typed columns and types.
+      - name: an arrow dump read by Polars
+        run: |
+          phdb="$RUNNER_TEMP/phdb/bin/phdb"
+          db="$RUNNER_TEMP/arrow.phdb"
+          python3 scripts/arrow-smoke.py jsonl | "$phdb" load --create "$db" -
+          "$phdb" dump --format arrow --table t "$db" > "$RUNNER_TEMP/t.arrows"
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet polars==2.0.0
+          "$RUNNER_TEMP/venv/bin/python" scripts/arrow-smoke.py check "$RUNNER_TEMP/t.arrows"
       - run: cargo test -p pigeonhole-bench --features "$BENCH_FEATURES"
       # The public crate on its own: feature unification gives the workspace run an engine
       # built with `test-hooks`, and this run tests the production one (#148, review 1-2 F10).

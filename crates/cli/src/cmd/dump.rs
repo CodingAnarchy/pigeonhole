@@ -1,5 +1,6 @@
 //! `phdb dump`: every cell, all retained versions, at one snapshot, streamed as `jsonl` (what
-//! `phdb load` reads) or `csv`.
+//! `phdb load` reads), `csv`, or `arrow`: an Arrow IPC stream of one table, in
+//! `pigeonhole-arrow`'s schema with the typed value columns (#691).
 //!
 //! JSONL lines, in order:
 //! - a header: `{"phdb": 1, "command": "dump", "format_version", "snapshot": "latest" |
@@ -30,9 +31,9 @@ pub(crate) fn run(
     stdout: &mut dyn Write,
 ) -> Result<ExitStatus, Failure> {
     let format = cli.format();
-    if !matches!(format, Format::Jsonl | Format::Csv) {
+    if !matches!(format, Format::Jsonl | Format::Csv | Format::Arrow) {
         return Err(Failure::usage(
-            "dump writes jsonl or csv (--format jsonl|csv)",
+            "dump writes jsonl, csv or arrow (--format jsonl|csv|arrow)",
         ));
     }
     let db = open::for_read(cli, file)?;
@@ -90,6 +91,15 @@ fn dump(
     let snapshot = db
         .snapshot(durable)
         .map_err(|e| Failure::db("dump: snapshot", &e))?;
+    if format == Format::Arrow {
+        let [table] = &tables[..] else {
+            return Err(Failure::usage(
+                "dump --format arrow writes one table: name it with --table",
+            )
+            .into());
+        };
+        return arrow(db, table, prefix, &snapshot, stdout);
+    }
     let mut out = BufWriter::with_capacity(1 << 16, stdout);
     match format {
         Format::Csv => writeln!(out, "table,row,family,qualifier,ts,type,value")?,
@@ -147,6 +157,44 @@ fn dump(
         })?;
     }
     out.flush()?;
+    Ok(())
+}
+
+/// One table as an Arrow IPC stream: `pigeonhole-arrow`'s long schema (one Arrow row per
+/// cell) with `value_i64` and `value_f64`, every retained version, at `snapshot`.
+fn arrow(
+    db: &open::Db,
+    table: &str,
+    prefix: &[u8],
+    snapshot: &pigeonhole::Snapshot,
+    stdout: &mut dyn Write,
+) -> Result<(), Out> {
+    use pigeonhole_arrow::arrow_schema::ArrowError;
+    let options = pigeonhole_arrow::ArrowOptions::default().typed_values(true);
+    let export = db.arrow(table, prefix, snapshot, &options)?;
+    let out = BufWriter::with_capacity(1 << 16, stdout);
+    let fail = |e: ArrowError| -> Out {
+        match e {
+            ArrowError::IoError(_, e) => Out::Io(e),
+            ArrowError::ExternalError(e) => match e.downcast::<pigeonhole::Error>() {
+                Ok(e) => Failure::db(&format!("read table {table}"), &e).into(),
+                Err(e) => Failure::export(format!("dump --format arrow: {e}")).into(),
+            },
+            // The export reports a cell an Arrow batch can't hold (a timestamp above
+            // i64::MAX, a key or value over the 32-bit offsets) as an invalid argument.
+            e @ ArrowError::InvalidArgumentError(_) => {
+                Failure::unsupported(format!("dump --format arrow: {e}")).into()
+            }
+            // Anything else (the IPC writer's own errors) is a plain failure.
+            e => Failure::export(format!("dump --format arrow: {e}")).into(),
+        }
+    };
+    let mut w = arrow_ipc::writer::StreamWriter::try_new(out, &export.schema()).map_err(fail)?;
+    for batch in export {
+        w.write(&batch.map_err(fail)?).map_err(fail)?;
+    }
+    w.finish().map_err(fail)?;
+    w.into_inner().map_err(fail)?.flush()?;
     Ok(())
 }
 

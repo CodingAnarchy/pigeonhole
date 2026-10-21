@@ -63,6 +63,7 @@ io-uring = "0.7.15"
 # Arrow export (pigeonhole-arrow, and phdb dump --format arrow): one arrow-rs major, pinned (#691).
 arrow-array = { version = "60", default-features = false }
 arrow-buffer = { version = "60", default-features = false }
+arrow-ipc = { version = "60", default-features = false }
 arrow-schema = { version = "60", default-features = false }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading"] }
 # Dev-only.

@@ -55,6 +55,18 @@ pub fn phdb(args: &[&str]) -> Run {
     }
 }
 
+/// Runs `phdb args…` in process, keeping stdout as bytes (`dump --format arrow`).
+pub fn phdb_bytes(args: &[&str]) -> (u8, Vec<u8>, String) {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let status = pigeonhole_cli::run(
+        std::iter::once("phdb").chain(args.iter().copied()),
+        &mut stdout,
+        &mut stderr,
+    );
+    (status.code(), stdout, String::from_utf8(stderr).unwrap())
+}
+
 /// Asserts `text` matches the snapshot `name`, with `dir` (and so every database path in
 /// it), the 32-hex-digit database id and the file-level byte counts masked.
 pub fn snapshot(name: &str, dir: &TempDir, text: &str) {
