@@ -5377,11 +5377,10 @@ impl ShardState {
             // A waiting single whose shares ahead are decided: the shares undecided on its
             // rows now came after it and wait for it (D267).
             let mut waited = false;
-            if m.share_wait != 0 && !self.waiting_singles.contains_key(&m.share_wait) {
-                m.share_wait = 0;
-            }
             if m.share_wait != 0 {
-                if self.single_ahead_undecided(&m) {
+                if !self.waiting_singles.contains_key(&m.share_wait) {
+                    m.share_wait = 0;
+                } else if self.single_ahead_undecided(&m) {
                     if self.end_share_wait(&mut m) {
                         self.settle(m, Ok(()), ctx);
                         continue;
@@ -5390,8 +5389,9 @@ impl ShardState {
                     self.pending.push(m);
                     share_waits += 1;
                     continue;
+                } else {
+                    waited = true;
                 }
-                waited = true;
             }
             if !waited
                 && !matches!(m.kind, MemberKind::CommitRecord { .. })

@@ -634,6 +634,7 @@ impl ShardState {
     /// chain, so it cannot keep the row from draining: it is not fenced, and D249 orders
     /// it as before (fenced, every reading commit on a hot row waited out an older one's
     /// whole retry).
+    #[inline]
     pub(super) fn fenced(&self, m: &Member) -> Option<CommitPriority> {
         if self.reader_fences.is_empty()
             || m.validate.as_ref().is_some_and(|v| !v.reads.is_empty())
@@ -641,6 +642,12 @@ impl ShardState {
         {
             return None;
         }
+        self.fenced_slow(m)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fenced_slow(&self, m: &Member) -> Option<CommitPriority> {
         let priority = self.prepared.get(&m.seqno)?.priority;
         let rows = Self::written_rows(m);
         self.reader_fences
@@ -656,6 +663,8 @@ impl ShardState {
     /// writes (no validated reads, no predicate), and either no row it writes already has [`CHAIN_CAP`]
     /// undecided shares or it is older than every undecided share on its rows (it then
     /// wounds them, so the oldest commit is never refused for the cap).
+    #[cold]
+    #[inline(never)]
     pub(super) fn may_chain(&self, m: &Member) -> bool {
         if !matches!(m.kind, MemberKind::Prepare { .. })
             || m.validate.as_ref().is_some_and(|v| !v.reads.is_empty())
@@ -685,6 +694,7 @@ impl ShardState {
     /// of younger commits among them are wounded: their coordinators abort them unless
     /// decided, so no two commits wait for each other (wound-wait), and each such commit
     /// waits here behind `m`'s commit, as D249 refused it.
+    #[inline(never)]
     pub(super) fn chain_behind_undecided(
         &mut self,
         m: &Member,
@@ -830,6 +840,8 @@ impl ShardState {
 
     /// Single `m` starts waiting for the undecided shares on its rows (D267): it waits for
     /// those only; shares chained on its rows later wait for it.
+    #[cold]
+    #[inline(never)]
     pub(super) fn start_share_wait(&mut self, m: &mut Member) {
         let writes = Self::written_rows(m);
         let reads = Self::read_rows(m);
@@ -873,6 +885,8 @@ impl ShardState {
     }
 
     /// Whether waiting single `m` still has a share it waits for undecided here.
+    #[cold]
+    #[inline(never)]
     pub(super) fn single_ahead_undecided(&self, m: &Member) -> bool {
         self.waiting_singles.get(&m.share_wait).is_some_and(|w| {
             w.ahead
@@ -882,10 +896,17 @@ impl ShardState {
     }
 
     /// A waiting single that writes a row PREPARE `m` reads, if any (D267).
+    #[inline]
     pub(super) fn reads_waiting_single(&self, m: &Member) -> Option<u32> {
         if self.waiting_singles.is_empty() {
             return None;
         }
+        self.reads_waiting_single_slow(m)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn reads_waiting_single_slow(&self, m: &Member) -> Option<u32> {
         Self::read_rows(m).iter().find_map(|h| {
             self.single_rows.get(h).and_then(|ids| {
                 ids.iter()
@@ -897,6 +918,8 @@ impl ShardState {
 
     /// Waiting single `id` was logged, or failed (D267): the shares chained behind it count
     /// one less.
+    #[cold]
+    #[inline(never)]
     pub(super) fn end_single_wait(&mut self, id: u32, ctx: &mut ShardContext<'_, ShardMsg>) {
         let Some(w) = self.waiting_singles.remove(&id) else {
             return;
