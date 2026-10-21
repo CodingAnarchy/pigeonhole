@@ -557,10 +557,12 @@ const READER_RECLAIM_NANOS: u64 = 250_000_000;
 impl Shared {
     /// Frees the slots of reader processes that are gone (#833), at most every
     /// [`READER_RECLAIM_NANOS`] over all shards: the first caller past the deadline moves it
-    /// and runs the check. Called only from a shard thread's `reclaim_retired`, which holds
-    /// no lock and runs on maintenance and on every room recheck, so a commit stalled behind
-    /// a dead reader's pin gets in within one interval of the next recheck. The liveness
-    /// check (a `/proc` read or `proc_pidinfo` per active slot) stays off `view_lock` and off
+    /// and runs the check. Called only on a shard thread holding no lock, and only at rare
+    /// points: when a flush completes (`on_flushed`) and when a commit finds no arena room
+    /// (`reserve_room`, again on every room recheck), so a commit stalled behind a dead
+    /// reader's pin gets in within one interval. Never per commit or per read: even the
+    /// deadline's clock read showed up in the callgrind counts there. The liveness check (a
+    /// `/proc` read or `proc_pidinfo` per active slot) stays off `view_lock` and off
     /// application threads; every other bound reads the pins as they are, and a slot freed
     /// here lowers all of them (#834 review).
     pub(crate) fn reclaim_dead_readers(&self) {
@@ -3688,7 +3690,10 @@ impl ShardState {
         };
         let fits = |arena: &ShardArena| bytes_fit(arena) && run_fits(arena);
         if !fits(&self.arena) {
-            // Memtables whose readers left since the last reclaim count too.
+            // Memtables whose readers left since the last reclaim count too, and those a
+            // reader process that is gone still pins (#833): a commit stalled for room gets in
+            // within one liveness interval of a later recheck.
+            self.shared.reclaim_dead_readers();
             self.reclaim_retired();
             self.refresh_free();
         }
@@ -4215,6 +4220,9 @@ impl ShardState {
     ) {
         self.flush_running = false;
         self.flushing.clear();
+        // A flush retires memtables: free the slots of reader processes that are gone first
+        // (#833), so their pins hold neither these nor the extents compaction frees next.
+        self.shared.reclaim_dead_readers();
         // The guarded flushes this one carried are settled either way (#287). One a delete
         // voided was refused at its commit: flush those memtables again without the guard,
         // at once (not a failure). Members that waited on an install run again at the end of
@@ -4398,9 +4406,6 @@ impl ShardState {
 
     /// Reclaims retired memtables no reader slot pins any more.
     fn reclaim_retired(&mut self) {
-        // Free dead readers' slots first, on this shard thread (#833): whatever they pinned
-        // is released for every bound below and elsewhere.
-        self.shared.reclaim_dead_readers();
         if self.retired.is_empty() {
             return;
         }
