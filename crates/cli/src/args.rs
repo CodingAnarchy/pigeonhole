@@ -72,6 +72,29 @@ pub(crate) enum Command {
         #[arg(long)]
         create: bool,
     },
+    /// Copy the database into one new file while it stays usable: by default only commits
+    /// durable at their level (`--latest` adds the rest). Opens as the writer.
+    Backup {
+        /// The database file (`*.phdb`).
+        file: PathBuf,
+        /// The new file; it must not exist.
+        dest: PathBuf,
+        /// Copy everything committed, including commits not yet durable at their level.
+        #[arg(long)]
+        latest: bool,
+        /// Check the copy afterwards (`phdb check`); exit 3 if it is damaged.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Flush, then merge every level of every table into one (purging old versions, expired
+    /// cells and deletes), with progress on standard error. Opens as the writer.
+    Compact {
+        /// The database file (`*.phdb`).
+        file: PathBuf,
+        /// Then release the file's free space at its end (`Pigeonhole::shrink`).
+        #[arg(long)]
+        shrink: bool,
+    },
     Check {
         /// The database file (`*.phdb`).
         file: PathBuf,

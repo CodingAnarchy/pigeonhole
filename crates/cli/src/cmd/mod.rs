@@ -7,7 +7,9 @@ use crate::args::{Cli, Command};
 use crate::exit::Failure;
 use crate::output::Report;
 
+mod backup;
 mod check;
+mod compact;
 mod dump;
 mod info;
 mod load;
@@ -20,7 +22,11 @@ pub(crate) enum Outcome {
     Streamed(crate::ExitStatus),
 }
 
-pub(crate) fn run(cli: Cli, stdout: &mut dyn Write) -> Result<Outcome, Failure> {
+pub(crate) fn run(
+    cli: Cli,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+) -> Result<Outcome, Failure> {
     let report = match &cli.command {
         Command::Dump {
             file,
@@ -36,6 +42,13 @@ pub(crate) fn run(cli: Cli, stdout: &mut dyn Write) -> Result<Outcome, Failure> 
             input,
             create,
         } => load::run(&cli, file, input.as_deref(), *create),
+        Command::Backup {
+            file,
+            dest,
+            latest,
+            check,
+        } => backup::run(&cli, file, dest, *latest, *check),
+        Command::Compact { file, shrink } => compact::run(&cli, file, *shrink, stderr),
         Command::Info { file } => info::run(&cli, file),
         Command::Check {
             file,

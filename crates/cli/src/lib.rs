@@ -40,7 +40,7 @@ where
         }
     };
     let format = cli.format();
-    match cmd::run(cli, stdout) {
+    match cmd::run(cli, stdout, stderr) {
         Ok(cmd::Outcome::Streamed(status)) => status,
         Ok(cmd::Outcome::Report(report)) => match output::render(&report, format, stdout) {
             Ok(()) => report.status,
