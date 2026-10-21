@@ -2300,11 +2300,7 @@ impl ShardState {
             return;
         }
         let now = ctx.now_nanos();
-        if self
-            .balance_timer
-            .as_ref()
-            .is_some_and(|t| !t.finished() || t.frozen(now))
-        {
+        if self.balance_timer.as_ref().is_some_and(|t| t.holds(now)) {
             return;
         }
         let state = TimerState::new();

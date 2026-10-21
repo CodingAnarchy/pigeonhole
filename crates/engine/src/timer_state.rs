@@ -112,6 +112,13 @@ impl<W: TimerWake> TimerState<W> {
     pub(crate) fn frozen(&self, now: u64) -> bool {
         self.frozen_at.load(Ordering::Acquire) == now
     }
+
+    /// The timer still covers its wait: it is running, or it gave up on a clock that still
+    /// reads `now`, where a new one would give up at once (#70). A wait arms another only
+    /// when this is false.
+    pub(crate) fn holds(&self, now: u64) -> bool {
+        !self.finished() || self.frozen(now)
+    }
 }
 
 #[cfg(all(test, engine_loom))]
@@ -190,5 +197,30 @@ mod loom_tests {
             timer.join().unwrap();
             assert!(state.frozen(5) && !state.fired());
         });
+    }
+}
+
+#[cfg(all(test, not(engine_loom)))]
+mod tests {
+    use super::TimerState;
+    use pigeonhole_runtime::TaskWaker;
+
+    #[test]
+    fn a_timer_holds_while_running_and_on_the_frozen_reading_it_gave_up_on() {
+        let running = TimerState::<TaskWaker>::new();
+        assert!(running.holds(5), "running");
+        let fired = TimerState::<TaskWaker>::new();
+        fired.fire();
+        assert!(!fired.holds(5), "fired: a wait arms another");
+        let cancelled = TimerState::<TaskWaker>::new();
+        cancelled.cancel();
+        assert!(!cancelled.holds(5), "cancelled");
+        let gave_up = TimerState::<TaskWaker>::new();
+        gave_up.give_up(5);
+        assert!(
+            gave_up.holds(5),
+            "the clock still reads 5: another would give up too"
+        );
+        assert!(!gave_up.holds(6), "the clock moved: a wait arms another");
     }
 }

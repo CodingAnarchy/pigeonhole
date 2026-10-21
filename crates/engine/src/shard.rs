@@ -102,11 +102,12 @@ fn room_since(stamp: u32, now: u64) -> u64 {
     now.saturating_sub(waited)
 }
 
-/// Whether a cross-shard commit refused with `Moved` (or a timestamp below a floor),
-/// `waited` nanoseconds after it was submitted, fails with `Busy` instead of retrying: only
-/// once the write-stall timeout has passed (D241). A commit that keeps meeting tablet
-/// changes still gives up, but never sooner, however often it was refused.
-fn moved_gives_up(waited: u64, timeout: u64) -> bool {
+/// Whether a cross-shard commit some participant refused (`Moved`, `Room`, an overlap with
+/// an undecided share, or a timestamp below a floor), `waited` nanoseconds after it was
+/// submitted, fails with `Busy` instead of retrying: only once the write-stall timeout has
+/// passed (D241). A commit that keeps being refused still gives up, but never sooner,
+/// however often it was refused.
+fn refusal_gives_up(waited: u64, timeout: u64) -> bool {
     waited >= timeout
 }
 
@@ -4991,12 +4992,7 @@ impl ShardState {
         }
         // A timer that gave up on a clock that has not moved since is not armed again: the
         // running compaction's completion kicks the shard.
-        if self
-            .stall
-            .timer
-            .as_ref()
-            .is_none_or(|t| t.finished() && !t.frozen(now))
-        {
+        if self.stall.timer.as_ref().is_none_or(|t| !t.holds(now)) {
             let state = TimerState::new();
             self.stall.timer = Some(Arc::clone(&state));
             let due = self.stall.arm(now, rate);
@@ -7117,8 +7113,8 @@ impl ShardState {
             // the participants whether this was its last attempt, and the retry (once every
             // participant has answered, `on_applied`) follows the same decision.
             let waited = ctx.now_nanos().saturating_sub(c.submitted_at);
-            c.gives_up =
-                c.failed.is_none() && moved_gives_up(waited, self.shared.write_stall_timeout_nanos);
+            c.gives_up = c.failed.is_none()
+                && refusal_gives_up(waited, self.shared.write_stall_timeout_nanos);
             let last = c.failed.is_some() || c.gives_up;
             let priority = c.priority;
             let shards = c.shards.clone();
@@ -9413,11 +9409,11 @@ mod tests {
     }
 
     #[test]
-    fn a_commit_refused_with_moved_gives_up_only_at_the_timeout() {
+    fn a_refused_commit_gives_up_only_at_the_timeout() {
         let timeout = 30_000_000_000;
-        assert!(!moved_gives_up(0, timeout));
-        assert!(!moved_gives_up(timeout - 1, timeout));
-        assert!(moved_gives_up(timeout, timeout));
+        assert!(!refusal_gives_up(0, timeout));
+        assert!(!refusal_gives_up(timeout - 1, timeout));
+        assert!(refusal_gives_up(timeout, timeout));
     }
 
     #[test]
