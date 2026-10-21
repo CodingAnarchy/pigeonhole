@@ -1263,8 +1263,8 @@ impl ShardState {
         if self
             .shared
             .hooks
-            .fail_next_tablet_freeze
-            .swap(false, Ordering::AcqRel)
+            .faults
+            .take(crate::engine::hooks::Fault::NextTabletFreeze)
         {
             return Err(Error::Busy);
         }

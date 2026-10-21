@@ -388,7 +388,7 @@ fn delete_before_a_room_wait(mutation: FlushGcMutation) -> Option<Vec<u8>> {
     rig.put(Some(10), b"ten");
     rig.put(Some(20), b"twenty");
     // One group: the delete, then a put that waits for room (forced).
-    rig.db.force_room_wait_once();
+    rig.db.inject(pigeonhole_engine::Fault::NextRoomWait, true);
     let mut wb = WriteBatch::new();
     wb.delete_cell(t, f, b"row", b"q", 20).unwrap();
     let del = rig.db.submit(wb, Some(Durability::Buffered)).unwrap();

@@ -527,7 +527,7 @@ fn a_newer_format_is_refused_not_reported() {
 fn unrecorded_blob_references_are_a_warning() {
     let vfs = SimVfs::new(15);
     let db = Engine::open(Path::new(DB), options(&vfs)).unwrap();
-    db.omit_blob_refs(true);
+    db.inject(pigeonhole_engine::Fault::OmitBlobRefs, true);
     let t = db
         .create_table(
             "t",

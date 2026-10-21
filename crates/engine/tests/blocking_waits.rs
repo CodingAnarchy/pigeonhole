@@ -653,7 +653,7 @@ fn a_failed_share_apply_ends_visibility_instead_of_stalling_it() {
     let (db, shards) = Engine::open_application_owned(Path::new(DB), options(vfs, 2)).unwrap();
     let drivers: Vec<_> = shards.into_iter().map(driver).collect();
     let (on_a, on_b) = tables_on_0_and_1(&db);
-    db.fail_next_apply();
+    db.inject(pigeonhole_engine::Fault::NextApply, true);
     let (db2, a2, b2) = (Arc::clone(&db), Arc::clone(&on_a), Arc::clone(&on_b));
     let crossed = gate::within(10, move || {
         db2.commit(cross(&b2, &a2, "fails"), Some(Durability::Sync))

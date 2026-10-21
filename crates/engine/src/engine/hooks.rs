@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_compaction::MergeRegistry;
@@ -99,11 +99,69 @@ impl Sites {
     }
 }
 
+/// A fault or forced path a test switches on (`Engine::inject`). The `Next` ones are
+/// one-shot: the site that takes one clears it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// While on, the manifest writer refuses every batch made only of WAL checkpoints with
+    /// `NoSpace`, through the path a snapshot rewrite that finds no space takes (nothing
+    /// written, the writer stays usable).
+    RefuseCheckpoints = 0,
+    /// While on, manifest commits drop every `SstBlobRefs` edit and the catalog keeps no
+    /// blob references, so the file looks as one written before tag 13 (#240).
+    OmitBlobRefs = 1,
+    /// Fails the next apply after its WAL append, of a single-shard batch or of a
+    /// cross-shard share: it is not applied, and the shard poisons itself, as an arena
+    /// miscount would (#230). The commit returns `OutcomeUnknown` either way: a single-shard
+    /// one's record replays at the next open, and a cross-shard one decided to commit is
+    /// settled there too (D227, ICR 0038, ICR 0040).
+    NextApply = 2,
+    /// Fails the next freeze a tablet change (a split, merge or move) makes of its tablets'
+    /// memtables: the shard poisons itself, as an arena miscount would, and the instance
+    /// reports the failure (ICR 0040).
+    NextTabletFreeze = 3,
+    /// The next commit group's second member waits for room as if the arena were full: the
+    /// stall path freezes memtables after the group's first member was admitted (#315
+    /// review).
+    NextRoomWait = 4,
+}
+
+/// The faults on, a bit per `Fault` (`Hooks::faults`).
+#[derive(Default)]
+pub(crate) struct Faults(AtomicU8);
+
+impl Faults {
+    fn bit(f: Fault) -> u8 {
+        1 << (f as u8)
+    }
+
+    /// Switches `f` on or off.
+    fn set(&self, f: Fault, on: bool) {
+        if on {
+            self.0.fetch_or(Self::bit(f), Ordering::AcqRel);
+        } else {
+            self.0.fetch_and(!Self::bit(f), Ordering::AcqRel);
+        }
+    }
+
+    /// Whether `f` is on.
+    pub(crate) fn on(&self, f: Fault) -> bool {
+        self.0.load(Ordering::Acquire) & Self::bit(f) != 0
+    }
+
+    /// Whether `f` was on, switching it off (a one-shot fault's site).
+    pub(crate) fn take(&self, f: Fault) -> bool {
+        self.0.fetch_and(!Self::bit(f), Ordering::AcqRel) & Self::bit(f) != 0
+    }
+}
+
 /// The engine-wide hook state (`Shared::hooks`).
 #[derive(Default)]
 pub(crate) struct Hooks {
     /// The one-shot callbacks tests set at named sites (`Engine::on_next`).
     pub sites: Sites,
+    /// The faults and forced paths tests switch on (`Engine::inject`).
+    pub faults: Faults,
     /// Whether `compactions` and `appended` record (`Engine::record_history`); off until a
     /// test turns it on.
     pub record: AtomicBool,
@@ -125,9 +183,6 @@ pub(crate) struct Hooks {
     /// Threads that parked in `manifest::commit_req_from_thread`, counted after their last
     /// look and just before `park` (`Engine::manifest_thread_parks`).
     pub manifest_thread_parks: AtomicUsize,
-    /// Makes the next group's second member wait for arena room, as a full arena would
-    /// (`Engine::force_room_wait_once`, #315 review).
-    pub room_wait_once: AtomicBool,
     /// Parks background manifest commits before `end` (`manifest::parked`,
     /// `Engine::park_manifest_commits`), and the parked pump's waker.
     pub manifest_park: AtomicBool,
@@ -138,18 +193,6 @@ pub(crate) struct Hooks {
     pub compaction_hold: AtomicBool,
     pub compaction_held: Mutex<Vec<(u64, TaskWaker)>>,
     pub compaction_hold_ids: AtomicU64,
-    /// Refuses batches of only `WalCheckpoint` edits as `NoSpace`, as a snapshot rewrite
-    /// that finds no space does (`Engine::refuse_checkpoints`).
-    pub refuse_checkpoints: AtomicBool,
-    /// Commits no `SstBlobRefs` edit and keeps no blob references, as a build from before
-    /// tag 13 (#240) wrote (`Engine::omit_blob_refs`).
-    pub omit_blob_refs: AtomicBool,
-    /// Fails the next apply after its WAL append, without applying it, as an arena miscount
-    /// would (`Engine::fail_next_apply`).
-    pub fail_next_apply: AtomicBool,
-    /// Fails the next freeze a tablet change makes, as an arena miscount would
-    /// (`Engine::fail_next_tablet_freeze`).
-    pub fail_next_tablet_freeze: AtomicBool,
     /// A deliberate fault in the flush GC (`Engine::mutate_flush_gc`, #287): 1 treats the
     /// guard as always holding, 2 drops the snapshot floor (no live read point is kept), 3
     /// lets writes pass guarded flushes and compactions without voiding them.
@@ -322,6 +365,13 @@ impl Engine {
     #[doc(hidden)]
     pub fn on_next(&self, site: HookSite, f: Box<dyn FnOnce() + Send>) {
         self.inner.shared.hooks.sites.set(site, f);
+    }
+
+    /// Switches fault `fault` on or off (test hook): see [`Fault`] for each. A one-shot fault
+    /// (`Next…`) switches itself off where it fires.
+    #[doc(hidden)]
+    pub fn inject(&self, fault: Fault, on: bool) {
+        self.inner.shared.hooks.faults.set(fault, on);
     }
 
     /// Makes shard `shard`'s balancer measure `term` as `value` from now on (clamped to the
@@ -700,18 +750,6 @@ impl Engine {
         self.inner.shared.cache.usage()
     }
 
-    /// The next commit group's second member waits for room as if the arena were full: the
-    /// stall path freezes memtables after the group's first member was admitted (test hook,
-    /// #315 review).
-    #[doc(hidden)]
-    pub fn force_room_wait_once(&self) {
-        self.inner
-            .shared
-            .hooks
-            .room_wait_once
-            .store(true, Ordering::Release);
-    }
-
     /// Runs `f` once, in the calling thread's next row read, after its first family and
     /// before its second: where a test flushes, compacts and reclaims while the read holds
     /// its view (#392 review; test hook).
@@ -1056,62 +1094,12 @@ impl Engine {
         }
     }
 
-    /// While `refuse` is set, the manifest writer refuses every batch made only of WAL
-    /// checkpoints with `NoSpace`, through the path a snapshot rewrite that finds no space
-    /// takes (nothing written, the writer stays usable). Test hook.
-    #[doc(hidden)]
-    pub fn refuse_checkpoints(&self, refuse: bool) {
-        self.inner
-            .shared
-            .hooks
-            .refuse_checkpoints
-            .store(refuse, Ordering::Release);
-    }
-
-    /// While `omit` is set, manifest commits drop every `SstBlobRefs` edit and the catalog
-    /// keeps no blob references, so the file looks as one written before tag 13 (#240).
-    /// Test hook.
-    #[doc(hidden)]
-    pub fn omit_blob_refs(&self, omit: bool) {
-        self.inner
-            .shared
-            .hooks
-            .omit_blob_refs
-            .store(omit, Ordering::Release);
-    }
-
     /// Whether a shard died (a panic, a dropped application-owned shard, a failed WAL sync or
     /// a failed cross-shard apply): new commits are then refused with `Closed` (D227). Lets
     /// the model checker tell that refusal from a wrong one. Test hook.
     #[doc(hidden)]
     pub fn shard_died(&self) -> bool {
         self.inner.shared.shard_died.load(Ordering::Acquire)
-    }
-
-    /// Fails the next apply after its WAL append, of a single-shard batch or of a
-    /// cross-shard share: it is not applied, and the shard poisons itself, as an arena
-    /// miscount would (#230). The commit returns `OutcomeUnknown` either way: a single-shard
-    /// one's record replays at the next open, and a cross-shard one decided to commit is
-    /// settled there too (D227, ICR 0038, ICR 0040). Test hook.
-    #[doc(hidden)]
-    pub fn fail_next_apply(&self) {
-        self.inner
-            .shared
-            .hooks
-            .fail_next_apply
-            .store(true, Ordering::Release);
-    }
-
-    /// Fails the next freeze a tablet change (a split, merge or move) makes of its tablets'
-    /// memtables: the shard poisons itself, as an arena miscount would, and the instance
-    /// reports the failure (ICR 0040). Test hook.
-    #[doc(hidden)]
-    pub fn fail_next_tablet_freeze(&self) {
-        self.inner
-            .shared
-            .hooks
-            .fail_next_tablet_freeze
-            .store(true, Ordering::Release);
     }
 
     /// While `park` is set, a background manifest commit whose root commit completed waits

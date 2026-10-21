@@ -806,7 +806,7 @@ fn blob_gc_empties_files_of_ssts_written_without_references() {
     // such SSTs as pointing anywhere and still empty a mostly-garbage file.
     let vfs = SimVfs::new(43);
     let mut rig = Rig::open(&vfs, false);
-    rig.db.omit_blob_refs(true);
+    rig.db.inject(pigeonhole_engine::Fault::OmitBlobRefs, true);
     let one_version = family().max_versions(1);
     let t = rig
         .db

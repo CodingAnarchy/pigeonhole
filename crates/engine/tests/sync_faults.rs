@@ -413,7 +413,7 @@ fn a_refused_checkpoint_is_retried_on_an_idle_shard_once_space_is_freed() {
     let t = db.create_table("t", &family()).unwrap();
     // The manifest finds no space for checkpoints: a flush commits, its checkpoint is
     // refused (as a snapshot rewrite that cannot allocate is).
-    db.refuse_checkpoints(true);
+    db.inject(pigeonhole_engine::Fault::RefuseCheckpoints, true);
     db.commit(batch(&t, 0, 32), Some(Durability::GroupSync))
         .unwrap();
     let before = checkpoint(&sim);
@@ -421,7 +421,7 @@ fn a_refused_checkpoint_is_retried_on_an_idle_shard_once_space_is_freed() {
     std::thread::sleep(Duration::from_millis(200));
     assert_eq!(checkpoint(&sim), before, "the checkpoint was refused");
     // Space is freed. Nothing else happens on the shard: the backoff timer retries.
-    db.refuse_checkpoints(false);
+    db.inject(pigeonhole_engine::Fault::RefuseCheckpoints, false);
     let deadline = Instant::now() + Duration::from_secs(20);
     while checkpoint(&sim) == before {
         assert!(

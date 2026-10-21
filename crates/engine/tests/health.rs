@@ -113,7 +113,7 @@ fn a_failed_wal_sync_is_reported_as_io_and_the_first_failure_stays() {
     assert!(committed.is_err(), "{committed:?}");
     assert_eq!(db.failure(), failed(s, FailureCause::Io));
     // A later failure (an apply on another shard) does not replace the first.
-    db.fail_next_apply();
+    db.inject(pigeonhole_engine::Fault::NextApply, true);
     let other = table(&db, "other");
     let _ = db.commit(put(&other, "x"), Some(Durability::Buffered));
     assert_eq!(db.failure(), failed(s, FailureCause::Io));
@@ -126,7 +126,7 @@ fn a_failed_apply_is_reported_as_internal() {
     let db = Engine::open(Path::new(DB), options(vfs, 2)).unwrap();
     let t = table(&db, "t");
     let s = shard_of(&db, &t);
-    db.fail_next_apply();
+    db.inject(pigeonhole_engine::Fault::NextApply, true);
     // Logged, then not applied: the outcome is the log's (ICR 0038).
     let committed = db.commit(put(&t, "torn"), Some(Durability::Buffered));
     assert!(
@@ -170,7 +170,7 @@ fn a_failed_tablet_change_is_reported_as_internal() {
     let t = table(&db, "t");
     let s = shard_of(&db, &t);
     db.commit(put(&t, "a"), Some(Durability::Buffered)).unwrap();
-    db.fail_next_tablet_freeze();
+    db.inject(pigeonhole_engine::Fault::NextTabletFreeze, true);
     let split = db.split_table(t.id, vec![b"m".to_vec()], &[s as u16, s as u16]);
     assert!(split.is_err(), "{split:?}");
     assert!(db.is_failed());
