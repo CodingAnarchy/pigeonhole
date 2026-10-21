@@ -52,6 +52,8 @@ pub(crate) struct Settings {
     /// The inline driver makes about a fifth of its commits batches across shards (D247's
     /// app-owned row).
     pub(crate) cross_batches: bool,
+    /// With `cross_batches`, every other batch is a read-modify-write transaction instead.
+    pub(crate) cross_readers: bool,
     /// The pre-split cuts at the measured writes' quantiles rather than the loaded rows', so
     /// each piece takes about the same share of the writes (D231's engine scaling).
     pub(crate) presplit_writes: bool,
@@ -209,6 +211,15 @@ impl PigeonholeRunner {
     /// other shards: about 20% cross-shard batches (D247, perf287's L).
     pub fn cross_batches(mut self, yes: bool) -> Self {
         self.settings.cross_batches = yes;
+        self
+    }
+
+    /// `true`, with [`cross_batches`](Self::cross_batches): every other such batch is a
+    /// transaction that reads a cold companion row of each of its rows and writes the rows,
+    /// so commits that read and blind writes meet on the same hot rows (#816, D267). A
+    /// transaction that conflicts is retried and counted.
+    pub fn cross_readers(mut self, yes: bool) -> Self {
+        self.settings.cross_readers = yes;
         self
     }
 

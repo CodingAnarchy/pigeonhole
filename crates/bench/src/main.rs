@@ -110,6 +110,10 @@ OPTIONS:
     --async N              Pigeonhole: each client thread keeps N operations in flight
                            through the async API (commit_async, read_async, get_async;
                            D247) [default: 0, one at a time]
+    --mixed                app-owned: every other cross-shard batch is a transaction that
+                           reads a cold row beside each of its rows and writes the rows,
+                           so commits that read and blind writes meet on the same hot
+                           rows (D267's mixed row)
     --riders               Pigeonhole: snapshot and durable-snapshot readers, then a
                            durable backup and a compaction, beside the measured
                            phase (D247, reported in the record's riders)
@@ -160,6 +164,8 @@ struct Args {
     no_tablet_changes: bool,
     no_packing: bool,
     riders: bool,
+    /// `app-owned`: every other cross-shard batch reads its rows first (D267's mixed row).
+    mixed: bool,
     async_in_flight: Option<usize>,
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
@@ -225,6 +231,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--no-tablet-changes" => a.no_tablet_changes = true,
             "--no-packing" => a.no_packing = true,
             "--riders" => a.riders = true,
+            "--mixed" => a.mixed = true,
             "--async" => a.async_in_flight = Some(parse(&arg, it.next())?),
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
@@ -475,7 +482,9 @@ fn bench(a: &Args) -> Result<Suite, String> {
             // shards are by default (D235).
             let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
             let c = config(a, WorkloadKind::SkewedMultiShard)?;
-            let r = pigeonhole(a, Some(n)).cross_batches(true);
+            let r = pigeonhole(a, Some(n))
+                .cross_batches(true)
+                .cross_readers(a.mixed);
             let run = one_inline(a, &root, &mut seq, &r, &c, true)?;
             suite.results.push(run);
             return Ok(());
