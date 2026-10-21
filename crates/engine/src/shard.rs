@@ -508,6 +508,21 @@ pub(crate) struct Shared {
     pub wal_pin_bytes: u64,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
+    /// Per shard, a handle on its WAL stream's count of submitted, unfinished I/O
+    /// (`IoTracker`), set when the stream is attached at open (`ShardState::set_wal`); the
+    /// close waits on them after the runtime's threads are joined (#824), so a reopen in
+    /// this process never finds a write of the closed instance still in flight on the I/O
+    /// backend's own threads. Empty in a reader process.
+    pub wal_io: Vec<std::sync::OnceLock<pigeonhole_wal::IoTracker>>,
+    /// The close ended: the streams' submitted I/O landed and the locks are released (or
+    /// left for a handover). Set after `closed`, by the thread that ran the wait
+    /// (`release_after_io`); a `close` that lost the race to start the close waits for it,
+    /// so "close returned" means nothing of the instance is in flight, for every caller
+    /// (#824, perf287's review of #828).
+    pub close_done: AtomicBool,
+    /// Application-owned mode: no runtime, so the final close waits for the streams' I/O
+    /// and releases the locks on the application thread that runs it.
+    pub application_owned: bool,
     pub shm_dir: Option<std::path::PathBuf>,
     pub identity: pigeonhole_io::FileIdentity,
     pub path: std::path::PathBuf,
@@ -846,6 +861,19 @@ impl Shared {
     /// is the last process, removes the WAL files (every stream is checkpointed to its end
     /// by now) and the shared-memory region, so the database is one file at rest.
     pub(crate) fn final_close(&self, failed: bool) -> Result<()> {
+        let result = self.final_close_steps(failed);
+        if self.application_owned {
+            // No runtime to shut down and no thread of ours to join: the application's own
+            // threads drive the shards, and this is its close, so the wait is fair here. On
+            // every exit of the steps, an error's included (#824 R3): the locks must go
+            // and `close_done` be set, or a second close waits for ever.
+            self.release_after_io();
+        }
+        result
+    }
+
+    /// `final_close` up to the release.
+    fn final_close_steps(&self, failed: bool) -> Result<()> {
         // A failed final sync means the close is not clean: the flag stays clear so the next
         // open replays, and the caller learns about it.
         let mut clean = if failed {
@@ -859,20 +887,20 @@ impl Shared {
         // A handover (`Engine::close_for_reopen`, D265) leaves the locks where they are: the
         // reopen takes them, so no other writer gets in between and no reader's last-one-out
         // cleanup runs. The WAL files and the region stay, as after a crashed writer; the
-        // reopen replays the files and builds the region's next generation.
-        let locks = if self.keep_locks.load(Ordering::Acquire) {
-            None
-        } else {
-            self.locks
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take()
-        };
+        // reopen replays the files and builds the region's next generation. A plain close
+        // leaves them here too: `release_after_io` releases them once the streams' submitted
+        // I/O landed (#824), not this thread.
+        let keep = self.keep_locks.load(Ordering::Acquire);
         // Our writer byte is held (so no opening writer can be mid-open); the presence
         // upgrade tells whether any reader is still attached.
-        let last = match &locks {
-            Some(locks) => locks.presence.try_become_last()?,
-            None => false,
+        let last = if keep {
+            false
+        } else {
+            let locks = self.locks.lock().unwrap_or_else(PoisonError::into_inner);
+            match &*locks {
+                Some(locks) => locks.presence.try_become_last()?,
+                None => false,
+            }
         };
         if clean.is_ok() && last {
             // The WAL files go away with this close: the streams the next open creates
@@ -887,16 +915,36 @@ impl Shared {
             let mut manifest = self.manifest.lock().unwrap_or_else(PoisonError::into_inner);
             clean = manifest.mark_clean();
         }
-        if let Some(locks) = locks {
-            if last {
-                if clean.is_ok() {
-                    remove_wal_files(&self.vfs, &self.path)?;
-                }
-                ShmRegion::remove(&self.vfs, self.identity, self.shm_dir.as_deref())?;
+        if last {
+            // Under the locks (still held): no other process is in the file. A write of
+            // this instance still in flight lands in the unlinked inode, harmlessly.
+            if clean.is_ok() {
+                remove_wal_files(&self.vfs, &self.path)?;
             }
-            drop(locks);
+            ShmRegion::remove(&self.vfs, self.identity, self.shm_dir.as_deref())?;
         }
         clean
+    }
+
+    /// Ends the close: waits until every stream's submitted I/O landed (#824; a device that
+    /// never answers blocks here, as a sync would), releases the locks unless a handover
+    /// keeps them (`Engine::close_for_reopen` takes them afterwards), and records
+    /// `close_done` for the closers waiting on it. Engine-owned: from `Inner::close_with`
+    /// after the runtime's threads are joined; application-owned: from `final_close`.
+    pub(crate) fn release_after_io(&self) {
+        for tracker in self.wal_io.iter().filter_map(|t| t.get()) {
+            tracker.wait_idle();
+        }
+        if !self.keep_locks.load(Ordering::Acquire) {
+            let locks = self
+                .locks
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            drop(locks);
+        }
+        self.close_done.store(true, Ordering::Release);
+        self.failure.notify();
     }
 
     /// Commits a manifest delta resetting every stream's checkpoint to the start. Called
@@ -2983,6 +3031,11 @@ impl ShardState {
     }
 
     pub(crate) fn set_wal(&mut self, wal: Box<dyn Wal>) {
+        if let Some(tracker) = wal.io_tracker()
+            && let Some(slot) = self.shared.wal_io.get(usize::from(self.id.0))
+        {
+            let _ = slot.set(tracker);
+        }
         self.spares = wal.spares();
         self.open_epoch = wal.written().epoch();
         self.wal = Some(wal);

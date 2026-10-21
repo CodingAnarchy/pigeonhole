@@ -882,6 +882,8 @@ impl Engine {
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
+            close_done: AtomicBool::new(false),
+            application_owned: mode == Mode::ApplicationOwned,
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -927,6 +929,7 @@ impl Engine {
                 n => n,
             },
             submitters: std::sync::OnceLock::new(),
+            wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
             shm_dir: options.shm_dir.clone(),
             identity,
             path: path.to_path_buf(),
@@ -1462,6 +1465,8 @@ impl Engine {
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
+            close_done: AtomicBool::new(false),
+            application_owned: false,
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1488,6 +1493,7 @@ impl Engine {
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             wal_pin_bytes: 0,
             submitters: std::sync::OnceLock::new(),
+            wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
             shm_dir: options.shm_dir.clone(),
             identity,
             path: path.to_path_buf(),
@@ -2415,6 +2421,14 @@ impl Engine {
     /// once, `close` cannot wait: it returns `Ok(())` as soon as it has told the shards to
     /// close. That `Ok` says nothing about the outcome: a failed or unclean close is then
     /// reported **only** by [`EngineShard::closed`].
+    ///
+    /// The close returns, and releases the writer lock, only once every WAL write the
+    /// instance submitted to the I/O backend has landed (#824), so no opener can reuse a
+    /// segment slot under a write that lands later. On a device that never answers it
+    /// blocks, as a blocking sync would; so does dropping the last `Engine` handle, on
+    /// whatever thread does it, and a second `close` made meanwhile. In application-owned
+    /// mode that wait runs inside the final close, on the application thread driving the
+    /// last shard, before [`EngineShard::closed`] reports.
     pub fn close(&self) -> Result<()> {
         self.inner.close(true)
     }
@@ -2510,6 +2524,8 @@ pub struct Handover {
     path: PathBuf,
 }
 
+/// Closes as [`Engine::close`] does (an application-owned engine's drop cannot wait). It
+/// can block on a device that never answers, as `close` does (#824).
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.inner.role == Role::Writer {
@@ -3639,11 +3655,18 @@ impl Inner {
             return (self.close_reader(), false);
         }
         if self.closing.swap(true, Ordering::AcqRel) {
-            if keep_locks {
-                let shared = &self.shared;
+            // The close under way ends with the streams' submitted I/O landed and the locks
+            // released (or handed over): wait for that whole close, not just for `closed`,
+            // so an open this caller makes next cannot race a write of this instance (#824).
+            // Not on a thread that may have to drive it (application-owned, not driven
+            // elsewhere): the winner does not wait there either.
+            let shared = &self.shared;
+            if wait && (!self.application_owned || shared.drivers.driven_elsewhere()) {
                 shared
                     .failure
-                    .wait_for(|| shared.closed.load(Ordering::Acquire));
+                    .wait_for(|| shared.close_done.load(Ordering::Acquire));
+            }
+            if keep_locks {
                 let outcome = shared
                     .close
                     .outcome(|o| o.as_ref().copied().map_err(Error::duplicate));
@@ -3692,11 +3715,27 @@ impl Inner {
             if let Some(rt) = rt {
                 // A shard thread that panicked resumes its panic here: report it instead
                 // (this also runs from `Drop for Engine`).
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.shutdown())) {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(e)) => return (Err(e.into()), true),
-                    Err(panic) => return (Err(shard_panicked(&*panic)), true),
+                let shutdown = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.shutdown()
+                })) {
+                    Ok(Ok(_)) => Ok(()),
+                    Ok(Err(e)) => Err(e.into()),
+                    Err(panic) => Err(shard_panicked(&*panic)),
+                };
+                // Every thread is joined, so nothing submits more: wait for what the streams
+                // still have in flight on the I/O backend's own threads (a poisoned shard's
+                // final sync waited for nothing; a spare preparation's zero-fill writes and a
+                // held header's chain are never waited for), whatever the shutdown's outcome
+                // and the shards' state, and only then release the writer lock (#824): any
+                // opener, in this process (the handover, D265, or the recovery guide's close
+                // and reopen) or another, could otherwise reuse a WAL slot under a write
+                // that lands later.
+                self.shared.release_after_io();
+                if let Err(e) = shutdown {
+                    return (Err(e), true);
                 }
+            } else {
+                self.shared.release_after_io();
             }
         }
         (result, true)
