@@ -425,6 +425,9 @@ pub struct Stats {
     /// Decided commits whose DECISION a crash lost, with their applied seqno at or above the
     /// recovered next seqno: known by their id again (D263).
     pub aliases_reverted: usize,
+    /// Writes checked at a crash against their shard's published flushed-through seqno
+    /// (#724): each must be in an SST the manifest names.
+    pub flushed_through_checks: usize,
     /// Mutating VFS operations the run made before its final crash: the crash points a
     /// sweep of the same seed and config must cover.
     pub mutating_ops: u64,
@@ -1138,6 +1141,16 @@ enum Kind {
     },
 }
 
+/// An acknowledged write at or below its shard's published flushed-through seqno (#724).
+#[derive(Debug)]
+struct FlushedWrite {
+    table: TableId,
+    row: Vec<u8>,
+    families: Vec<FamilyId>,
+    seqno: Seqno,
+    shard: u16,
+}
+
 /// One acknowledged (or in-flight) commit.
 #[derive(Debug, Clone)]
 struct Committed {
@@ -1337,6 +1350,12 @@ struct World {
     /// Whether a crash reverts the aliases of decided commits whose applied seqno recovery
     /// may hand out again (off only in the harness's own test of that revert).
     revert_aliases: bool,
+    /// The shard each op of an acknowledged commit routed to when it was acknowledged, by
+    /// the commit's seqno (#724): the crash assertion checks a write against the
+    /// flushed-through seqno of the shard that held it, as well as its row's owner now.
+    /// The commit's ops are kept beside them: a seqno a crash freed can come back for
+    /// another commit, which must not take these owners.
+    ack_owners: HashMap<Seqno, (Vec<ModelOp>, Vec<Option<u16>>)>,
     /// Blob files seen in the catalog after a commit with a large value (`Stats::blob_files`).
     blob_files_seen: HashSet<(FamilyId, u32)>,
     /// Bottommost compactions applied to the model, by manifest version.
@@ -1400,6 +1419,7 @@ impl World {
             appended_ts: HashMap::new(),
             decided_ids: HashMap::new(),
             revert_aliases: true,
+            ack_owners: HashMap::new(),
             blob_files_seen: HashSet::new(),
             purges: Vec::new(),
             pending_purges: Vec::new(),
@@ -2150,6 +2170,141 @@ impl World {
         out
     }
 
+    /// Records the shard each of `ops` routes to now, as the one that holds it at its
+    /// acknowledgement (`ack_owners`). A tablet moving between the apply and the
+    /// acknowledgement is flushed first, so either owner is right then.
+    fn note_ack_owners(&mut self, seqno: Seqno, ops: &[ModelOp]) {
+        let Some(store) = self.store.as_ref() else {
+            return;
+        };
+        let Ok(snap) = store.engine.snapshot() else {
+            return;
+        };
+        let view = snap.view().clone();
+        let owners = ops
+            .iter()
+            .map(|op| {
+                let t = store.tables.get(op_table(op))?;
+                view.tablets().route(t.id, op_row(op)).map(|(_, s)| s.0)
+            })
+            .collect();
+        self.ack_owners.insert(seqno, (ops.to_vec(), owners));
+    }
+
+    /// Every acknowledged write at or below the flushed-through seqno its shard published
+    /// (#724), as `(table, row, families, seqno)`: the slots it wrote must be flushed
+    /// through its seqno in the durable manifest, whatever a crash does next. A write is
+    /// checked against the shard that held it at its acknowledgement (`ack_owners`) and its
+    /// row's owner now (perf287): a shard that gave a tablet away unflushed and then raised
+    /// its bound past the write is caught by the first.
+    fn writes_at_or_below_flushed(&self) -> Vec<FlushedWrite> {
+        let Some(store) = self.store.as_ref() else {
+            return Vec::new();
+        };
+        let f: Vec<Seqno> = (0..store.shards.len())
+            .map(|s| store.engine.flushed_through(s))
+            .collect();
+        let Ok(snap) = store.engine.snapshot() else {
+            return Vec::new();
+        };
+        let view = snap.view().clone();
+        let mut out = Vec::new();
+        for c in self.history.values() {
+            let Some(seqno) = c.seqno else { continue };
+            if !(c.acked || c.observed) {
+                continue;
+            }
+            let at_ack = self
+                .ack_owners
+                .get(&seqno)
+                .filter(|(ops, _)| *ops == c.ops)
+                .map(|(_, owners)| owners);
+            for (i, op) in c.ops.iter().enumerate() {
+                let table = op_table(op);
+                let Some(t) = store.tables.get(table) else {
+                    continue;
+                };
+                // The shard that held it when acknowledged, and its row's owner now: the
+                // write must be in an SST if either one's bound passed it.
+                let now = view.tablets().route(t.id, op_row(op)).map(|(_, s)| s.0);
+                let then = at_ack.and_then(|o| o.get(i).copied().flatten());
+                let Some(shard) = [then, now]
+                    .into_iter()
+                    .flatten()
+                    // A shard gone since (a reopen with fewer shards) has no bound to check.
+                    .find(|&s| f.get(usize::from(s)).is_some_and(|&fs| seqno <= fs))
+                else {
+                    continue;
+                };
+                let fams: Vec<String> = match op {
+                    ModelOp::DeleteRow { .. } => families().into_iter().map(|f| f.name).collect(),
+                    ModelOp::Put { family, .. }
+                    | ModelOp::Incr { family, .. }
+                    | ModelOp::DeleteCell { family, .. }
+                    | ModelOp::DeleteColumn { family, .. }
+                    | ModelOp::DeleteFamily { family, .. } => vec![family.clone()],
+                };
+                out.push(FlushedWrite {
+                    table: t.id,
+                    row: op_row(op).to_vec(),
+                    families: fams
+                        .iter()
+                        .map(|f| store.family_ids[&(table.to_owned(), f.clone())])
+                        .collect(),
+                    seqno,
+                    shard,
+                });
+            }
+        }
+        out
+    }
+
+    /// Fails unless every write `writes_at_or_below_flushed` listed has its slots flushed
+    /// through its seqno in `manifest` (a dropped tablet needs nothing).
+    fn check_flushed_through(
+        &mut self,
+        manifest: &pigeonhole_engine::ManifestInfo,
+        writes: &[FlushedWrite],
+    ) -> Result<(), Fail> {
+        self.stats.flushed_through_checks += writes.len();
+        for w in writes {
+            let Some(tablet) = manifest
+                .tablet_ranges
+                .iter()
+                .find(|(_, t, start, end)| {
+                    *t == w.table
+                        && start.as_slice() <= w.row.as_slice()
+                        && end.as_ref().is_none_or(|e| w.row.as_slice() < e.as_slice())
+                })
+                .map(|(id, ..)| *id)
+            else {
+                continue;
+            };
+            for fid in &w.families {
+                let flushed = manifest.flushed.get(&(tablet, *fid)).copied().unwrap_or(0);
+                if flushed < w.seqno {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!(
+                            "a write at seqno {} (row {:?}) is at or below shard {}'s published \
+                             flushed-through seqno, but its slot ({tablet:?}, {fid:?}) is flushed \
+                             only through {flushed} (the tablet's slots: {:?})",
+                            w.seqno,
+                            String::from_utf8_lossy(&w.row),
+                            w.shard,
+                            manifest
+                                .flushed
+                                .iter()
+                                .filter(|((t, _), _)| *t == tablet)
+                                .collect::<Vec<_>>()
+                        ),
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Crashes (or notes the fault plan already did), works out from the manifest, the WAL
     /// and the reopened engine's raw entries which commits recovery must have applied,
     /// checks the durability promises, rebuilds the model from those commits and compares
@@ -2165,6 +2320,9 @@ impl World {
         // The dead engine's records belong to the run that appended them (the
         // harness rekeys a decided commit's PREPAREs only within their run).
         self.drain_appended();
+        // #724: the writes each shard's flushed-through seqno says are in durable SSTs,
+        // checked against the manifest the crash leaves.
+        let below_flushed = self.writes_at_or_below_flushed();
         self.stats.crashes += 1;
         if self.trace_on() {
             eprintln!("crash {kind:?} already={already}");
@@ -2205,6 +2363,7 @@ impl World {
             Ok(m) => m,
             Err(e) => return fail(FailureClass::Protocol, format!("reading the manifest: {e}")),
         };
+        self.check_flushed_through(&manifest, &below_flushed)?;
         let raw_wal = match read_wal(&self.vfs, Path::new(DB), &manifest.checkpoints) {
             Ok(w) => w,
             Err(e) => return fail(FailureClass::Protocol, format!("reading the WAL: {e}")),
@@ -2231,6 +2390,10 @@ impl World {
             Err(e) => return fail(FailureClass::Protocol, format!("recovery failed: {e}")),
         };
         self.store = Some(store);
+        // A reopen places tablets afresh (`Catalog::reassign`) and replays a write into its
+        // row's owner now, flushed or not: an owner at acknowledgement holds only within
+        // the run that acknowledged (#724).
+        self.ack_owners.clear();
         // D263: a DECISION the crash lost may have reserved a seqno recovery
         // hands out again, as an id or an applied seqno. Its commit is then keyed by its id,
         // as 0.3.0 keyed a commit whose COMMIT record was lost; an alias below the recovered
@@ -3329,6 +3492,7 @@ impl World {
                 self.stats.cross_shard += 1;
             }
             self.drain_appended();
+            self.note_ack_owners(seqno, &c.ops);
             self.history.insert(seqno, c);
         }
         Ok(())
@@ -3413,6 +3577,7 @@ impl World {
             c.acked = true;
             self.stats.commits += 1;
             self.engine_seqnos.push(seqno);
+            self.note_ack_owners(seqno, &c.ops);
             self.history.insert(seqno, c);
         }
         Ok(())
@@ -4321,6 +4486,7 @@ impl World {
         };
         self.drain_appended();
         self.check_fresh_seqno(info.seqno)?;
+        self.note_ack_owners(info.seqno, &c.ops);
         self.history.insert(info.seqno, c);
         Ok(true)
     }

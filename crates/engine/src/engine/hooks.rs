@@ -262,6 +262,9 @@ pub(crate) struct ShardCounters {
     /// measures the real one), `Engine::set_shard_load` (D217, D255, D256, D257's packing
     /// tests).
     pub load_overrides: [AtomicU64; LoadTerm::COUNT],
+    /// The flushed-through seqno the shard last published from `on_unpin` (an unpin that
+    /// found nothing unflushed at or below its seqno, #724), `Engine::unpin_published`.
+    pub unpin_published: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -372,6 +375,37 @@ impl Engine {
     #[doc(hidden)]
     pub fn inject(&self, fault: Fault, on: bool) {
         self.inner.shared.hooks.faults.set(fault, on);
+    }
+
+    /// The flushed-through seqno shard `shard` last published from an unpin that found
+    /// nothing unflushed at or below its seqno, 0 if none (test hook, #724).
+    #[doc(hidden)]
+    pub fn unpin_published(&self, shard: usize) -> Seqno {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .unpin_published
+            .load(Ordering::Relaxed)
+    }
+
+    /// Asks shard `shard` to unpin through `through`, as a peer whose checkpoint a commit's
+    /// records pin does (`ShardMsg::Unpin`, test hook).
+    #[doc(hidden)]
+    pub fn request_unpin(&self, shard: usize, through: Seqno) -> Result<()> {
+        self.inner
+            .shared
+            .submitter(ShardId(shard as u16))
+            .submit(ShardMsg::Unpin { through })?;
+        Ok(())
+    }
+
+    /// Shard `shard`'s published flushed-through seqno (`Shared::flushed_through`, #724):
+    /// every write it will hold at or below it is in a durable SST. 0 before its first
+    /// publish (test hook).
+    #[doc(hidden)]
+    pub fn flushed_through(&self, shard: usize) -> Seqno {
+        self.inner.shared.flushed_through[shard]
+            .0
+            .load(Ordering::Acquire)
     }
 
     /// Makes shard `shard`'s balancer measure `term` as `value` from now on (clamped to the
