@@ -13,7 +13,7 @@
 //! | `commit-async` | 500 commits of one 100-byte cell through `commit_async`, each awaited (an uncontended async commit, D210) | commits |
 //! | `commit-at` | 500 timestamped appends of one 100-byte cell to a new row of a family with a TTL (`time-series-ttl`'s write) | commits |
 //! | `flush` | 2,000 entries flushed from the memtable to one SST | entries |
-//! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level | entries |
+//! | `compact` | 2,000 entries compacted from 3 L0 SSTs into the last level, with inline I/O and a stepped clock (`support/inline_io.rs`, #794) | entries |
 //!
 //! Only the measured work runs inside functions named `shape_*`, each counting its thread's
 //! work with a `Measured` guard (`support/measure.rs`); the commits a flush or compaction needs are
@@ -24,6 +24,8 @@
 //! `flush` and `compact` the setup commits grow with ITERATIONS too, so that difference
 //! includes them: only callgrind measures those two shapes alone. The commit shapes are
 //! clean either way.
+#[path = "support/inline_io.rs"]
+mod inline_io;
 #[path = "support/measure.rs"]
 mod measure;
 #[path = "support/shards.rs"]
@@ -45,7 +47,11 @@ fn main() {
     let base = std::path::PathBuf::from(args.next().expect(usage));
     let dir = base.join(format!("phdb-writepath-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let (db, shards) = Shards::open(&dir.join("w.phdb"));
+    // `compact` reads its input SSTs ahead and runs as a background task: on the default
+    // backend, which thread completed a read and how many slices the task took depended on
+    // timing (#794). Inline I/O and a stepped clock keep its count the same on every run.
+    let vfs = (shape == "compact").then(inline_io::InlineVfs::vfs);
+    let (db, shards) = Shards::open(&dir.join("w.phdb"), vfs);
     let t = db
         .table("t")
         .unwrap()

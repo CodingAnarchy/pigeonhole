@@ -25,9 +25,11 @@ pub struct Shards {
 
 impl Shards {
     /// Opens `path` (one shard, `Buffered`, no tablet changes, a memtable budget no setup
-    /// reaches, a 256 MiB block cache), each shard driven by a thread.
-    pub fn open(path: &Path) -> (Pigeonhole, Shards) {
-        let (db, drivers, ctl) = open(path);
+    /// reaches, a 256 MiB block cache) on `vfs` if given (`support/inline_io.rs`, for a shape
+    /// whose I/O must complete on the thread that submitted it), else the default backend,
+    /// each shard driven by a thread.
+    pub fn open(path: &Path, vfs: Option<pigeonhole_io::VfsRef>) -> (Pigeonhole, Shards) {
+        let (db, drivers, ctl) = open(path, vfs);
         (db, Shards { drivers, ctl })
     }
 
@@ -102,10 +104,17 @@ impl Ctl {
 }
 
 /// Opens with application-owned shards, each driven by a thread of its own.
-fn open(path: &Path) -> (Pigeonhole, Vec<thread::JoinHandle<()>>, Arc<Ctl>) {
+fn open(
+    path: &Path,
+    vfs: Option<pigeonhole_io::VfsRef>,
+) -> (Pigeonhole, Vec<thread::JoinHandle<()>>, Arc<Ctl>) {
+    let mut options = Options::default();
+    if let Some(vfs) = vfs {
+        options = options.vfs(vfs);
+    }
     let (db, shards) = Pigeonhole::open_application_owned(
         path,
-        Options::default()
+        options
             .shards(1)
             .tablet_changes(false)
             .durability(Durability::Buffered)
