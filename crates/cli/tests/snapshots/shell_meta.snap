@@ -18,6 +18,8 @@ metric              value
 flushes             0
 compactions         0
 write_stalls        0
+room_stalls         0
+pacing_stalls       0
 block_cache_hits    0
 block_cache_misses  0
 commands (one per line; values are bytes: "quoted\n", 0xhex, b64:base64):

@@ -171,8 +171,12 @@ pub(crate) struct ShardMetrics {
     pub commits: [AtomicU64; 4],
     /// Bucket `b` holds latencies from `bucket_floor(b)` nanoseconds up to the next floor.
     pub latency: [[AtomicU64; 64]; 4],
-    pub stalls: AtomicU64,
-    pub stall_nanos: AtomicU64,
+    /// Waits for arena room (D124) begun, and nanoseconds spent in them.
+    pub room_stalls: AtomicU64,
+    pub room_stall_nanos: AtomicU64,
+    /// L0 pacing spans (D119) begun, and nanoseconds spent in them.
+    pub pacing_stalls: AtomicU64,
+    pub pacing_stall_nanos: AtomicU64,
     pub flushes: AtomicU64,
     pub flush_nanos: AtomicU64,
     pub compactions: AtomicU64,
@@ -217,8 +221,10 @@ impl Default for ShardMetrics {
         Self {
             commits: Default::default(),
             latency: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
-            stalls: AtomicU64::new(0),
-            stall_nanos: AtomicU64::new(0),
+            room_stalls: AtomicU64::new(0),
+            room_stall_nanos: AtomicU64::new(0),
+            pacing_stalls: AtomicU64::new(0),
+            pacing_stall_nanos: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
             flush_nanos: AtomicU64::new(0),
             compactions: AtomicU64::new(0),
@@ -3903,7 +3909,7 @@ impl ShardState {
         trace!("shard {} pacing ends with no writer left", self.id.0);
         self.stall.cancel_timer();
         self.shared.metrics[usize::from(self.id.0)]
-            .stall_nanos
+            .pacing_stall_nanos
             .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
         self.stall.since = 0;
     }
@@ -3913,7 +3919,7 @@ impl ShardState {
         if let Some(w) = self.room_wait.take() {
             w.cancel();
             self.shared.metrics[usize::from(self.id.0)]
-                .stall_nanos
+                .room_stall_nanos
                 .fetch_add(now.saturating_sub(w.since), Ordering::Relaxed);
             // A member still pending (behind a conditional one, say) starts a fresh wait if
             // room runs out again (D240).
@@ -5063,7 +5069,7 @@ impl ShardState {
             self.stall.last_refill = now;
             if self.stall.since != 0 {
                 self.shared.metrics[usize::from(self.id.0)]
-                    .stall_nanos
+                    .pacing_stall_nanos
                     .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
                 self.stall.since = 0;
             }
@@ -5074,7 +5080,7 @@ impl ShardState {
             self.stall.cancel_timer();
             if self.stall.since != 0 {
                 self.shared.metrics[usize::from(self.id.0)]
-                    .stall_nanos
+                    .pacing_stall_nanos
                     .fetch_add(now.saturating_sub(self.stall.since), Ordering::Relaxed);
                 self.stall.since = 0;
             }
@@ -5083,7 +5089,7 @@ impl ShardState {
         if self.stall.since == 0 {
             self.stall.since = now;
             self.shared.metrics[usize::from(self.id.0)]
-                .stalls
+                .pacing_stalls
                 .fetch_add(1, Ordering::Relaxed);
         }
         // A timer that gave up on a clock that has not moved since is not armed again: the
@@ -5162,7 +5168,7 @@ impl ShardState {
             None => {
                 // The stall begins: count it, and arm the timeout.
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
-                metrics.stalls.fetch_add(1, Ordering::Relaxed);
+                metrics.room_stalls.fetch_add(1, Ordering::Relaxed);
                 let deadline = oldest.saturating_add(timeout);
                 self.room_wait = Some(StallWait::start(now, deadline, &self.shared.vfs, ctx, me));
             }

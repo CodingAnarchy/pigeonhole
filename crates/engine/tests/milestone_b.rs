@@ -858,7 +858,15 @@ fn deep_l0_stalls_writes_without_refusing_them() {
     }
     let m = db.metrics();
     assert!(m.flushes >= 4 && m.compactions >= 1, "{m:?}");
-    assert!(m.stalls.0 > 0, "writers were never stalled: {m:?}");
+    assert!(m.pacing_stalls.0 > 0, "writers were never paced: {m:?}");
+    assert_eq!(
+        m.stalls,
+        (
+            m.room_stalls.0 + m.pacing_stalls.0,
+            m.room_stalls.1 + m.pacing_stalls.1
+        ),
+        "the old field is the sum (ICR 0054)"
+    );
     assert_eq!(row_count(&db, &t), written as usize);
     db.close().unwrap();
 }
@@ -1179,7 +1187,15 @@ fn a_full_arena_stalls_writers_until_a_slow_flush_frees_it() {
     });
     let m = db.metrics();
     assert!(m.flushes >= 8, "{m:?}");
-    assert!(m.stalls.0 > 0, "writers were never stalled: {m:?}");
+    assert!(m.room_stalls.0 > 0, "writers never waited for room: {m:?}");
+    assert_eq!(
+        m.stalls,
+        (
+            m.room_stalls.0 + m.pacing_stalls.0,
+            m.room_stalls.1 + m.pacing_stalls.1
+        ),
+        "the old field is the sum (ICR 0054)"
+    );
     assert_eq!(row_count(&db, &t), 4 * 60 * 32);
     db.close().unwrap();
 }
@@ -1671,7 +1687,15 @@ fn a_moving_clock_paces_a_deep_l0_with_the_token_bucket() {
         tx.send(engine.metrics()).unwrap();
     });
     let m = worker_result(&rx, "the paced writer never finished");
-    assert!(m.stalls.0 > 0 && m.stalls.1 > 0, "{m:?}");
+    assert!(m.pacing_stalls.0 > 0 && m.pacing_stalls.1 > 0, "{m:?}");
+    assert_eq!(
+        m.stalls,
+        (
+            m.room_stalls.0 + m.pacing_stalls.0,
+            m.room_stalls.1 + m.pacing_stalls.1
+        ),
+        "the old field is the sum (ICR 0054)"
+    );
 }
 
 #[test]

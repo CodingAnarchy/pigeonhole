@@ -635,6 +635,8 @@ impl Session {
             ("flushes", m.flushes),
             ("compactions", m.compactions),
             ("write_stalls", m.write_stalls),
+            ("room_stalls", m.room_stalls),
+            ("pacing_stalls", m.pacing_stalls),
             ("block_cache_hits", m.block_cache_hits),
             ("block_cache_misses", m.block_cache_misses),
         ]
