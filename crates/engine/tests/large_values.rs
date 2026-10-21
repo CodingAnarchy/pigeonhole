@@ -248,7 +248,7 @@ fn a_commit_that_fails_after_its_wal_append_keeps_its_blob_files() {
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
     let f = t.families[0].id;
-    db.fail_next_apply();
+    db.inject(pigeonhole_engine::Fault::NextApply, true);
     let mut wb = WriteBatch::new();
     wb.put(t.id, f, &row(1), b"q", None, ValueRef::Bytes(&value(1, 0)))
         .unwrap();

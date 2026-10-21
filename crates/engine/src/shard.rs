@@ -4966,8 +4966,8 @@ impl ShardState {
                 && self
                     .shared
                     .hooks
-                    .room_wait_once
-                    .swap(false, Ordering::AcqRel)
+                    .faults
+                    .take(crate::engine::hooks::Fault::NextRoomWait)
             {
                 cut = true;
                 need_room = true;
@@ -5286,8 +5286,8 @@ impl ShardState {
                     let applied = if self
                         .shared
                         .hooks
-                        .fail_next_apply
-                        .swap(false, Ordering::AcqRel)
+                        .faults
+                        .take(crate::engine::hooks::Fault::NextApply)
                     {
                         Err(Error::Busy)
                     } else {
@@ -6894,8 +6894,8 @@ impl ShardState {
                 let applied = if self
                     .shared
                     .hooks
-                    .fail_next_apply
-                    .swap(false, Ordering::AcqRel)
+                    .faults
+                    .take(crate::engine::hooks::Fault::NextApply)
                 {
                     Err(Error::Busy)
                 } else {

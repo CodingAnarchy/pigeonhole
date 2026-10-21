@@ -828,12 +828,19 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     edits.push(counters);
     catalog.prune_blob_refs_since(&old);
     #[cfg(feature = "test-hooks")]
-    if shared.hooks.omit_blob_refs.load(Ordering::Acquire) {
+    if shared
+        .hooks
+        .faults
+        .on(crate::engine::hooks::Fault::OmitBlobRefs)
+    {
         edits.retain(|e| !matches!(e, Edit::SstBlobRefs { .. }));
         std::sync::Arc::make_mut(&mut catalog.blob_refs).clear();
     }
     #[cfg(feature = "test-hooks")]
-    let refused = shared.hooks.refuse_checkpoints.load(Ordering::Acquire)
+    let refused = shared
+        .hooks
+        .faults
+        .on(crate::engine::hooks::Fault::RefuseCheckpoints)
         && edits
             .iter()
             .all(|e| matches!(e, Edit::WalCheckpoint { .. } | Edit::Counters { .. }));

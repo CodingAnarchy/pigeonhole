@@ -47,7 +47,7 @@ fn a_room_wait_during_a_flush_leaves_the_active_memtable_open() {
     // waits for room as if the arena were full.
     let group = |shard: &mut EngineShard, rows: &[&[u8]], room_wait: bool| {
         if room_wait {
-            engine.force_room_wait_once();
+            engine.inject(pigeonhole_engine::Fault::NextRoomWait, true);
         }
         let pcs: Vec<_> = rows
             .iter()
@@ -246,7 +246,7 @@ fn a_room_wait_on_a_crowded_shard_freezes_the_largest_memtables() {
     }
     assert_eq!(l0(), before, "nothing froze by size");
     // A group whose second member waits for room, with no flush in flight.
-    engine.force_room_wait_once();
+    engine.inject(pigeonhole_engine::Fault::NextRoomWait, true);
     let pcs: Vec<PendingCommit> = [&b"t05-x"[..], b"t06-x"]
         .iter()
         .map(|row| {

@@ -78,7 +78,7 @@ pub use write::{COUNTER_TS, PendingCheck, PendingCommit, Predicate, Txn, WriteBa
 #[cfg(feature = "test-hooks")]
 #[doc(hidden)]
 pub use engine::hooks::{
-    AppendedKind, AppendedRecord, CompactionRecord, FlushGcMutation, HookSite, LoadTerm,
+    AppendedKind, AppendedRecord, CompactionRecord, Fault, FlushGcMutation, HookSite, LoadTerm,
     ManifestInfo, RawEntry, TabletOwner, TabletRange,
 };
 
