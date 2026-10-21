@@ -1652,20 +1652,18 @@ impl MemSlot {
             .filter(move |m| !flushed.contains(&(shard.0, m.table.root())))
     }
 
-    /// The smallest seqno in any of these memtables, `None` when all are empty.
-    fn min_seqno(&self) -> Option<Seqno> {
-        std::iter::once(&self.active)
-            .chain(&self.frozen)
-            .filter_map(|m| m.table.seqno_range().map(|(min, _)| min))
-            .min()
-    }
-
-    /// The smallest user timestamp in any of these memtables.
-    fn min_ts(&self) -> Timestamp {
-        self.frozen
-            .iter()
-            .map(|m| m.min_ts)
-            .fold(self.active.min_ts, Timestamp::min)
+    /// The smallest user timestamp and the smallest seqno (`None` when all are empty) in the
+    /// memtables not yet in SSTs ([`unflushed`](Self::unflushed)).
+    fn unflushed_mins(
+        &self,
+        shard: ShardId,
+        flushed: &HashSet<(u16, u32)>,
+    ) -> (Timestamp, Option<Seqno>) {
+        self.unflushed(shard, flushed)
+            .fold((Timestamp::MAX, None), |(ts, seqno), m| {
+                let lo = m.table.seqno_range().map(|(lo, _)| lo);
+                (ts.min(m.min_ts), seqno.into_iter().chain(lo).min())
+            })
     }
 }
 
@@ -7969,20 +7967,26 @@ impl ShardState {
             "shard {} compaction start {:?}: inputs {:?} -> level {} ({:?})",
             self.id.0, key, task.inputs, task.output_level, task.kind
         );
-        let mem_min_ts = self
-            .memtables
-            .get(&key)
-            .map_or(u64::MAX, MemSlot::min_ts)
-            .min(self.prepared_min_ts(key.1));
+        // The slot's memtables not yet in SSTs (#805): one whose flush the view holds is in
+        // the inputs or the slot's other SSTs, though this shard has not yet handled its
+        // `Flushed`. `flushed_roots` matches the current view only; with an older one, every
+        // frozen memtable counts. An active memtable sealed `Flushed` is still left out: the
+        // seal comes after the view with its SST is published, and `maintain` loads its view
+        // afresh, so that view holds the SST.
+        let (mem_min_ts, mem_min_seqno) = self.shared.flushed_roots.read(|flushed| {
+            let none = HashSet::new();
+            let current = self.shared.view.load().version == view.version;
+            self.memtables.get(&key).map_or((u64::MAX, None), |slot| {
+                slot.unflushed_mins(self.id, if current { flushed } else { &none })
+            })
+        });
+        let mem_min_ts = mem_min_ts.min(self.prepared_min_ts(key.1));
         let now = self.shared.vfs.now_micros();
         let mut gc = compact::gc_policy(
             &self.shared,
             fam,
             &task,
-            (
-                mem_min_ts,
-                self.memtables.get(&key).and_then(MemSlot::min_seqno),
-            ),
+            (mem_min_ts, mem_min_seqno),
             self.prepared.keys().copied(),
             meta.options.kind == FamilyKind::Counter,
             now,
@@ -8015,7 +8019,7 @@ impl ShardState {
             max_seqno: compact::max_input_seqno(
                 fam,
                 &task,
-                self.memtables.get(&key).and_then(MemSlot::min_seqno),
+                mem_min_seqno,
                 self.shared.shm.visible_seqno(),
             ),
             rows: (
