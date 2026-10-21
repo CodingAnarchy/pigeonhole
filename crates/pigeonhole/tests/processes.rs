@@ -7,6 +7,14 @@
 //! | scenario | expected |
 //! |---|---|
 //! | a reader killed while it holds a snapshot | the writer frees its slot (#833) and keeps committing past its memtable budget; a new reader attaches |
+//! | a live reader holding a snapshot | the writer's commits stall, then fail `Busy` after `write_stall_timeout`; the reader leaving unblocks them |
+//! | the writer killed with a reader attached | the reader's snapshot still reads; a new writer recovers; the old snapshot fails `SnapshotExpired`, a new one reads the recovered data |
+//! | a reader process's snapshot across writer commits | a held snapshot keeps its count while new snapshots see each commit whole |
+//! | a scan held across a writer kill and restart | the scan's next row fails `SnapshotExpired`; nothing from the new generation leaks into it |
+//! | the writer killed at random points mid-stream of multi-row commits | readers and the recovered writer only ever see whole commits, and the writer recovers everything readers saw |
+//!
+//! The seeded SimVfs side of the matrix (reader and writer kills at seeded points, torn
+//! state) is `pigeonhole-engine`'s `tests/reader_crash_matrix.rs`.
 #![cfg(not(miri))]
 
 use std::io::{BufRead, BufReader, Write};
@@ -15,7 +23,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{
-    Durability, Family, Options, Pigeonhole, PigeonholeReader, ReaderOptions, Snapshot, Table,
+    Durability, ErrorCode, Family, Options, Pigeonhole, PigeonholeReader, ReaderOptions, Snapshot,
+    Table,
 };
 
 const CHILD_ENV: &str = "PIGEONHOLE_PROCESS_CHILD";
@@ -101,6 +110,21 @@ fn writer_child(path: &Path) {
                 db.flush().unwrap();
                 say("FLUSHED");
             }
+            // Batches of K rows (one commit each) until killed.
+            ["stream", k] => {
+                let k: u64 = k.parse().unwrap();
+                // Until killed: far more batches than any run reaches.
+                for b in 0..u64::MAX {
+                    let mut wb = db.write_batch();
+                    for j in 0..k {
+                        wb.put(&t, format!("s{b:08}-{j}").as_bytes(), "f", b"v", &[7; 256]);
+                    }
+                    wb.commit_with(Durability::Buffered).unwrap();
+                    if b == 0 {
+                        say("STREAMING");
+                    }
+                }
+            }
             ["quit"] => break,
             _ => panic!("unknown command {cmd:?}"),
         }
@@ -137,6 +161,7 @@ fn reader_child(path: &Path) {
     let r: PigeonholeReader = Pigeonhole::open_reader(path, reader_options()).unwrap();
     let t = r.table("t").unwrap();
     let mut held: Option<Snapshot> = None;
+    let mut scan: Option<pigeonhole::RowIter<'static>> = None;
     say("READY");
     for cmd in commands() {
         match cmd.trim() {
@@ -152,6 +177,51 @@ fn reader_child(path: &Path) {
             }
             "count" => say(count(&t, Some(held.as_ref().expect("a held snapshot")))),
             "latest" => say(count(&t, None)),
+            // An owned scan of the held snapshot: its first row, then the rest.
+            "scan-start" => {
+                let snap = held.as_ref().expect("a held snapshot");
+                let mut it = t
+                    .scan_prefix(b"")
+                    .snapshot(snap)
+                    .into_owned()
+                    .iter()
+                    .unwrap();
+                match it.next() {
+                    Some(Ok(row)) => say(format!("ROW {}", String::from_utf8_lossy(row.key()))),
+                    other => say(format!("ERR {other:?}")),
+                }
+                scan = Some(it);
+            }
+            "scan-rest" => {
+                let it = scan.take().expect("a started scan");
+                let mut n = 0u64;
+                let mut failed = None;
+                for row in it {
+                    match row {
+                        Ok(_) => n += 1,
+                        Err(e) => {
+                            failed = Some(e.code());
+                            break;
+                        }
+                    }
+                }
+                match failed {
+                    None => say(format!("COUNT {n}")),
+                    Some(code) => say(format!("ERR {code:?} after {n}")),
+                }
+            }
+            // The rows now, checked to be whole batches of `k`: `BATCHES n` or the error.
+            cmd if cmd.starts_with("batches ") => {
+                let k: u64 = cmd[8..].parse().unwrap();
+                say(match count(&t, None).strip_prefix("COUNT ") {
+                    Some(n) => {
+                        let n: u64 = n.parse().unwrap();
+                        assert_eq!(n % k, 0, "a reader saw part of a commit: {n} rows");
+                        format!("BATCHES {}", n / k)
+                    }
+                    None => count(&t, None),
+                });
+            }
             "drop" => {
                 held = None;
                 say("DROPPED");
@@ -294,4 +364,170 @@ fn a_killed_reader_does_not_stall_the_writer() {
     next.quit();
     drop(t);
     db.close().unwrap();
+}
+
+#[test]
+fn a_live_readers_snapshot_stalls_the_writer_into_busy_until_it_leaves() {
+    let dir = Dir::new("live-reader");
+    let db = Pigeonhole::open(
+        dir.db(),
+        writer_options().write_stall_timeout(Duration::from_secs(1)),
+    )
+    .unwrap();
+    let t = table(&db);
+    put(&t, 0..1000).unwrap();
+    let mut reader = Peer::spawn("reader", &dir.db());
+    assert_eq!(reader.ask("snap"), "SNAP");
+    // The held snapshot pins the first memtables: the writer runs out of arena and its
+    // commits fail `Busy` after the stall timeout (D1 of #693: the reader's responsibility,
+    // documented).
+    let (row, e) = put(&t, 1000..1000 + PAST_BUDGET).expect_err("the writer never stalled");
+    assert_eq!(e.code(), ErrorCode::Busy, "row {row}: {e}");
+    // The snapshot still reads what it saw.
+    assert_eq!(reader.ask("count"), "COUNT 1000");
+    // The reader leaving releases its slot; the writer goes on.
+    reader.quit();
+    put(&t, row..1000 + PAST_BUDGET).unwrap();
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_killed_writer_leaves_readers_serving_and_a_new_writer_expires_them() {
+    let dir = Dir::new("killed-writer");
+    let mut writer = Peer::spawn("writer", &dir.db());
+    assert_eq!(writer.ask("put 0 1000"), "PUT 1000");
+    assert_eq!(writer.ask("flush"), "FLUSHED");
+    // Rows only in the memtable (and the WAL) when the writer dies.
+    assert_eq!(writer.ask("put 1000 1500"), "PUT 1500");
+    let mut reader = Peer::spawn("reader", &dir.db());
+    assert_eq!(reader.ask("snap"), "SNAP");
+    assert_eq!(reader.ask("count"), "COUNT 1500");
+
+    writer.kill();
+    // The reader keeps serving its snapshot, and new snapshots see the last published
+    // state (or `Busy`, if the writer had committed a root it never published: D149).
+    assert_eq!(reader.ask("count"), "COUNT 1500");
+    let latest = reader.ask("latest");
+    assert!(
+        latest == "COUNT 1500" || latest == "ERR Busy",
+        "after the writer died: {latest}"
+    );
+
+    // A new writer recovers the WAL's rows and starts a new generation.
+    let db = Pigeonhole::open(dir.db(), writer_options()).unwrap();
+    let t = table(&db);
+    assert_eq!(t.scan_prefix(b"").iter().unwrap().count(), 1500);
+    put(&t, 1500..1600).unwrap();
+    // The old snapshot may name extents the new writer freed: it fails, typed.
+    assert_eq!(reader.ask("count"), "ERR SnapshotExpired");
+    // A new snapshot re-attaches to the new generation.
+    assert_eq!(reader.ask("snap"), "SNAP");
+    assert_eq!(reader.ask("count"), "COUNT 1600");
+    reader.quit();
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_reader_process_sees_commits_whole_and_its_snapshot_stays_put() {
+    let dir = Dir::new("commits");
+    let db = Pigeonhole::open(dir.db(), writer_options()).unwrap();
+    let t = table(&db);
+    let mut reader = Peer::spawn("reader", &dir.db());
+    assert_eq!(reader.ask("snap"), "SNAP");
+    let mut done = 0;
+    for step in [10u64, 500, 3000] {
+        put(&t, done..done + step).unwrap();
+        done += step;
+        if step == 500 {
+            db.flush().unwrap();
+        }
+        // Visible once applied (D227): a new snapshot sees every row committed so far.
+        assert_eq!(reader.ask("latest"), format!("COUNT {done}"));
+        // The held snapshot (taken before any commit) still sees none.
+        assert_eq!(reader.ask("count"), "COUNT 0");
+    }
+    reader.quit();
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_scan_held_across_a_writer_restart_fails_expired() {
+    let dir = Dir::new("scan-restart");
+    let mut writer = Peer::spawn("writer", &dir.db());
+    assert_eq!(writer.ask("put 0 3000"), "PUT 3000");
+    assert_eq!(writer.ask("flush"), "FLUSHED");
+    let mut reader = Peer::spawn("reader", &dir.db());
+    assert_eq!(reader.ask("snap"), "SNAP");
+    assert_eq!(reader.ask("scan-start"), "ROW row00000000");
+    writer.kill();
+    // A new writer rewrites the file under the scan: deletes, compacts, writes anew.
+    let db = Pigeonhole::open(dir.db(), writer_options()).unwrap();
+    let t = table(&db);
+    for i in 0..3000 {
+        t.mutate(&key(i)).delete_row().commit().unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    put(&t, 5000..8000).unwrap();
+    db.flush().unwrap();
+    // The held scan fails typed, never reads the new generation's pages as its own.
+    let rest = reader.ask("scan-rest");
+    assert!(rest.starts_with("ERR SnapshotExpired"), "{rest}");
+    assert_eq!(reader.ask("snap"), "SNAP");
+    assert_eq!(reader.ask("count"), "COUNT 3000");
+    reader.quit();
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_writer_killed_mid_stream_leaves_only_whole_commits() {
+    const K: u64 = 8;
+    let dir = Dir::new("stream-kill");
+    let mut reader: Option<Peer> = None;
+    let mut seen = 0u64;
+    for (round, delay_ms) in [3u64, 17, 40, 1, 75].into_iter().enumerate() {
+        let mut writer = Peer::spawn("writer", &dir.db());
+        let r = reader.get_or_insert_with(|| Peer::spawn("reader", &dir.db()));
+        let stdin = writer.stdin.as_mut().unwrap();
+        writeln!(stdin, "stream {K}").unwrap();
+        stdin.flush().unwrap();
+        assert_eq!(writer.recv(), "STREAMING");
+        // Readers only ever see whole commits while the writer streams.
+        for _ in 0..3 {
+            let b = r.ask(&format!("batches {K}"));
+            assert!(
+                b.starts_with("BATCHES") || b == "ERR Busy",
+                "round {round}: {b}"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(delay_ms));
+        writer.kill();
+        // Still whole after the kill (the last published view), or busy.
+        let b = r.ask(&format!("batches {K}"));
+        assert!(
+            b.starts_with("BATCHES") || b == "ERR Busy",
+            "round {round}: {b}"
+        );
+        if let Some(n) = b.strip_prefix("BATCHES ") {
+            seen = seen.max(n.parse().unwrap());
+        }
+        // A new writer recovers whole commits, at least every one a reader saw.
+        let db = Pigeonhole::open(dir.db(), writer_options()).unwrap();
+        let rows = table(&db).scan_prefix(b"s").iter().unwrap().count() as u64;
+        assert_eq!(
+            rows % K,
+            0,
+            "round {round}: recovered part of a commit ({rows} rows)"
+        );
+        assert!(rows / K >= seen, "round {round}: lost commits a reader saw");
+        seen = rows / K;
+        db.close().unwrap();
+        // The reader re-attaches to the next generation and agrees.
+        assert_eq!(r.ask(&format!("batches {K}")), format!("BATCHES {seen}"));
+    }
+    reader.take().unwrap().quit();
 }
