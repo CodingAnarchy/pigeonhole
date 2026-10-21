@@ -627,7 +627,7 @@ mod tests {
             .create_if_missing()
             .unwrap();
         t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
-        let engine = Arc::clone(&t.core.db.engine());
+        let engine = t.core.db.engine().to_arc();
         let table = t.core.info.id;
         engine.on_next(
             pigeonhole_engine::HookSite::LatestViewLoad,

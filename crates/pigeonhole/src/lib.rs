@@ -81,7 +81,9 @@
 //! blocking only (D196).
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
-#![forbid(unsafe_code)]
+// SCRATCH (option 2 measurement, #620 PR 2): `swap.rs` needs raw pointers; a real adoption
+// moves it to a small Miri-checked crate and restores the forbid here.
+#![deny(unsafe_code)]
 
 mod cell;
 mod db;
@@ -90,6 +92,8 @@ mod info;
 mod metrics;
 mod options;
 mod read;
+#[allow(unsafe_code)]
+mod swap;
 mod table;
 mod write;
 

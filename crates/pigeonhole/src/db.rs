@@ -2,7 +2,6 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
-use arc_swap::ArcSwap;
 use pigeonhole_engine::{Engine, EngineShard, Failure};
 use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
@@ -23,7 +22,7 @@ use crate::{
 /// `SnapshotExpired` once the generation moved on.
 #[derive(Debug)]
 pub(crate) struct Db {
-    engine: ArcSwap<Engine>,
+    engine: crate::swap::Swap<Engine>,
     /// Opens of the engine behind this handle: 1 at open, +1 per swap.
     generation: AtomicU64,
     /// The I/O backend the engine runs on (for [`Pigeonhole::io_rings`]).
@@ -34,12 +33,12 @@ pub(crate) struct Db {
 }
 
 /// The current engine, held for the duration of one operation.
-pub(crate) type EngineRef = arc_swap::Guard<Arc<Engine>>;
+pub(crate) type EngineRef<'a> = crate::swap::Guard<'a, Engine>;
 
 impl Db {
     fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize) -> Arc<Self> {
         Arc::new(Self {
-            engine: ArcSwap::from(engine),
+            engine: crate::swap::Swap::new(engine),
             generation: AtomicU64::new(1),
             vfs,
             closed: AtomicBool::new(false),
@@ -47,9 +46,10 @@ impl Db {
         })
     }
 
-    /// The current engine. One `ArcSwap` load; hold the guard only for the operation.
+    /// The current engine (a hazard-pointer load, `swap.rs`); hold the guard only for the
+    /// operation.
     #[inline]
-    pub(crate) fn engine(&self) -> EngineRef {
+    pub(crate) fn engine(&self) -> EngineRef<'_> {
         self.engine.load()
     }
 
@@ -1163,7 +1163,7 @@ mod tests {
         assert_eq!(db.db.generation(), 1);
 
         // The swap: close the engine keeping its locks, reopen on them, swap it in.
-        let old = Arc::clone(&db.db.engine());
+        let old = db.db.engine().to_arc();
         let (closed, handover) = old.close_for_reopen();
         closed.unwrap();
         let reopened = Engine::open_with(path, options.to_engine().unwrap(), handover.unwrap())
