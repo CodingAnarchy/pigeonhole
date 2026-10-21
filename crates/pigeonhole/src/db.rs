@@ -88,8 +88,17 @@ impl Cached {
         if db.generation() == self.generation {
             EngineRef::Cached(&self.engine)
         } else {
-            db.engine()
+            Self::stale(db)
         }
+    }
+
+    /// The slow path, out of line and cold: inlined into every operation it made the fast
+    /// function large enough to spoil the codegen of the engine calls inlined after it
+    /// (about 30 instructions on a get, measured).
+    #[cold]
+    #[inline(never)]
+    fn stale(db: &Db) -> EngineRef<'_> {
+        db.engine()
     }
 
     /// A cache for a handle derived from this one: this one while it is current.
