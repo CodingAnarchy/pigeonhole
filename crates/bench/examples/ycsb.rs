@@ -115,7 +115,7 @@ fn main() {
     };
     let dir = base.join(format!("phdb-ycsb-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("create the store directory");
-    let (db, shards) = Shards::open(&dir.join("y.phdb"));
+    let (db, shards) = Shards::open(&dir.join("y.phdb"), None);
     let t = db
         .table("bench")
         .unwrap()
