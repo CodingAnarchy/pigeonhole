@@ -150,7 +150,7 @@ impl TableBuilder<'_> {
 pub(crate) struct TableCore {
     pub(crate) db: Arc<Db>,
     pub(crate) info: Arc<TableInfo>,
-    cached: crate::db::Cached,
+    pub(crate) cached: crate::db::Cached,
 }
 
 impl TableCore {
@@ -162,6 +162,12 @@ impl TableCore {
     #[inline]
     pub(crate) fn engine(&self) -> crate::db::EngineRef<'_> {
         self.cached.get(&self.db)
+    }
+
+    /// `f` on the engine for one operation (the hot paths: no guard materialized).
+    #[inline(always)]
+    pub(crate) fn with<R>(&self, f: impl FnOnce(&pigeonhole_engine::Engine) -> R) -> R {
+        self.cached.with(&self.db, f)
     }
 
     fn family_info(&self, family: &str) -> Option<crate::FamilyInfo> {
@@ -203,12 +209,10 @@ impl TableCore {
         let family = self.family_id(family)?;
         let table = self.info.id;
         let data = match snapshot {
-            None => self.engine().get_latest(table, family, row, qualifier)?,
+            None => self.with(|e| e.get_latest(table, family, row, qualifier))?,
             Some(s) => {
                 self.db.check_snapshot(s)?;
-                self.db
-                    .engine()
-                    .get(&s.inner, table, family, row, qualifier)?
+                self.with(|e| e.get(&s.inner, table, family, row, qualifier))?
             }
         };
         Ok(data.map(CellRef::owned))
@@ -228,15 +232,10 @@ impl TableCore {
             let family = self.family_id(family)?;
             let table = self.info.id;
             Ok(match snapshot {
-                None => self
-                    .db
-                    .engine()
-                    .get_latest_async(table, family, row, qualifier),
+                None => self.with(|e| e.get_latest_async(table, family, row, qualifier)),
                 Some(s) => {
                     self.db.check_snapshot(s)?;
-                    self.db
-                        .engine()
-                        .get_async(&s.inner, table, family, row, qualifier)
+                    self.with(|e| e.get_async(&s.inner, table, family, row, qualifier))
                 }
             })
         });

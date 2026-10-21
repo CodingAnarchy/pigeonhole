@@ -101,6 +101,24 @@ impl Cached {
         db.engine()
     }
 
+    /// Runs `f` on the engine for one operation without materializing a guard: the fast
+    /// path is two loads, a compare and the call (a materialized `EngineRef`, constructed,
+    /// dereferenced and drop-checked, measured about 25 instructions more per operation).
+    #[inline(always)]
+    pub(crate) fn with<R>(&self, db: &Db, f: impl FnOnce(&Engine) -> R) -> R {
+        if db.generation() == self.generation {
+            f(&self.engine)
+        } else {
+            Self::stale_with(db, f)
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn stale_with<R>(db: &Db, f: impl FnOnce(&Engine) -> R) -> R {
+        f(&db.engine())
+    }
+
     /// A cache for a handle derived from this one: this one while it is current.
     pub(crate) fn fresh(&self, db: &Db) -> Self {
         if db.generation() == self.generation {

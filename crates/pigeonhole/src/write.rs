@@ -510,21 +510,25 @@ impl RowMutation<'_> {
 
     /// Commits.
     pub fn commit(self) -> Result<CommitInfo> {
-        self.builder.commit(
-            &self.table.engine(),
-            self.table.db.max_value,
-            self.durability,
-        )
+        let RowMutation {
+            table,
+            builder,
+            durability,
+            ..
+        } = self;
+        table.with(|e| builder.commit(e, table.db.max_value, durability))
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
     pub(crate) fn submit_async(self) -> Result<Submitted> {
-        self.builder.submit_async(
-            &self.table.engine(),
-            self.table.db.max_value,
-            self.durability,
-        )
+        let RowMutation {
+            table,
+            builder,
+            durability,
+            ..
+        } = self;
+        table.with(|e| builder.submit_async(e, table.db.max_value, durability))
     }
 
     /// Submits as an async conditional commit (D210): the condition is resolved now; the
@@ -538,15 +542,9 @@ impl RowMutation<'_> {
         let (db, table) = (&self.table.db, self.table.info.id);
         let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
         let durability = self.durability;
+        let (row, batch) = (self.row, self.builder.batch);
         self.table
-            .engine()
-            .submit_check_and_mutate_async(
-                table,
-                &self.row,
-                &predicate,
-                self.builder.batch,
-                durability,
-            )
+            .with(|e| e.submit_check_and_mutate_async(table, &row, &predicate, batch, durability))
             .map(|pending| SubmittedCheck {
                 pending,
                 largest_value,
@@ -564,16 +562,15 @@ impl RowMutation<'_> {
         let predicate = self.predicate(condition)?;
         let db = &self.table.db;
         let largest = self.builder.largest_value;
+        let (table_id, row, batch, durability) = (
+            self.table.info.id,
+            self.row,
+            self.builder.batch,
+            self.durability,
+        );
         let (applied, info) = self
             .table
-            .engine()
-            .check_and_mutate(
-                self.table.info.id,
-                &self.row,
-                &predicate,
-                self.builder.batch,
-                self.durability,
-            )
+            .with(|e| e.check_and_mutate(table_id, &row, &predicate, batch, durability))
             .map_err(|e| commit_error(e, largest, db.max_value))?;
         Ok(if applied {
             info.map(CommitInfo::from)
@@ -871,7 +868,7 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.commit(&cached.get(&db), db.max_value, None)
+        cached.with(&db, |e| builder.commit(e, db.max_value, None))
     }
 
     /// Commits with `durability` for this commit only.
@@ -881,7 +878,7 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.commit(&cached.get(&db), db.max_value, Some(durability))
+        cached.with(&db, |e| builder.commit(e, db.max_value, Some(durability)))
     }
 
     /// Submits with `durability` and returns at once with a [`CommitTicket`] to wait on or
@@ -898,7 +895,7 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.submit(&cached.get(&db), db.max_value, durability)
+        cached.with(&db, |e| builder.submit(e, db.max_value, durability))
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
@@ -909,7 +906,7 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.submit_async(&cached.get(&db), db.max_value, durability)
+        cached.with(&db, |e| builder.submit_async(e, db.max_value, durability))
     }
 }
 
