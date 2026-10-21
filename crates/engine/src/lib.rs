@@ -23,6 +23,7 @@
 
 mod admission;
 mod catalog;
+mod check;
 mod close_gate;
 mod compact;
 mod engine;
@@ -53,6 +54,10 @@ mod write;
 pub use admission::Admit;
 #[doc(hidden)]
 pub use engine::Handover;
+pub use check::{
+    CheckCounts, CheckOptions, CheckReport, Extent, ExtentKind, Finding, Severity, Structure,
+    WalFile,
+};
 pub use engine::PendingMaintenance;
 pub use engine::{
     CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard, FamilyInfo, FamilyStorage,

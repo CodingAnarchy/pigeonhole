@@ -1,0 +1,2 @@
+### Added
+- `pigeonhole::check`: an offline integrity check of a database no writer has open (ICR 0048). It checks both superblock slots, the manifest, the extents, every SST block with its checksum forced, every blob record, and the WAL sidecars a crash left, chained as replay would read them. Damage comes back as findings (`CheckReport`, `Finding`, `Structure`, `Severity`), with a map of the file's regions. It replays nothing and writes nothing. `CheckOptions::deep` also reads every blob pointer through.

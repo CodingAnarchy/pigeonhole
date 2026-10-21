@@ -61,6 +61,8 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `ValueFilter`, `Condition` | Value predicate; `commit_if` condition. |
 | `CellRef<'a>`, `Cell`, `Row`, `RowRef<'a>`, `CellEntry<'a>`, `Value<'a>` | Borrowed and owned results. |
 | `DatabaseInfo`, `TableInfo`, `FamilyInfo`, `FamilyStorage`, `LevelInfo`, `Compression` | `info()` and `family_info()` results (ICR 0047; all `#[non_exhaustive]`, public fields). |
+| `check(path, CheckOptions) -> Result<CheckReport>` | Offline integrity check (ICR 0048): see below. |
+| `CheckOptions`, `CheckReport`, `Finding`, `Structure`, `Severity`, `Region`, `RegionKind`, `WalFile`, `CheckCounts` | Its options and result (`#[non_exhaustive]`, public fields). |
 | `Error`, `ErrorCode`, `Result<T>` | Errors. |
 | `MergeOperator`, `MergeError` | Custom merge operators: an associative fold over stored values (tag byte, then payload). |
 | `days(n: u64) -> Duration` | TTL helper. |
@@ -268,6 +270,19 @@ Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; befo
 | Open policy | With no writer running, `phdb` becomes the writer for the command, replaying a crashed WAL, and closes. With a writer running, it opens as a reader process. `--reader` / `--writer` force one. |
 | Exit status | 0 ok, 1 error, 2 usage, 3 corruption, 4 locked or busy, 5 not found, 6 unsupported. |
 | Errors | On stderr. With json/jsonl: `{"phdb":1,"error":{"code","code_num","message"}}`, where `code` is the `ErrorCode` name, or `FileNotFound` with `code_num` `null`. |
+
+## `check` (offline integrity check, ICR 0048)
+`pigeonhole::check(path: impl AsRef<Path>, CheckOptions) -> Result<CheckReport>`
+
+| Item | Rule |
+|---|---|
+| When | No writer running: it takes the writer lock and fails with `WriterLocked` otherwise. It never replays the WAL and never writes; a crashed database checks as it was left. |
+| Result | `Err` only if it couldn't run (missing file is `Io`, locked, unreadable). Damage is a `Finding` in `report.findings`. `report.is_ok()` is true when no finding is `Severity::Corruption`. |
+| Checks | Both superblock slots, the manifest, extents (valid, inside the file, disjoint), every SST block with its checksum forced (key order, agreement with the manifest, blob references), every blob record, and the WAL sidecars from each stream's checkpoint, as replay chains them. |
+| `CheckOptions` | `deep(true)`: also read every blob pointer's record, and recount blob live bytes (a mismatch is a `Warning`). `allow_fuse(true)`. |
+| `Finding` | `structure` (`Superblock`, `Manifest`, `Allocation`, `Sst`, `Blob`, `Wal`), `severity` (`Corruption`; `Warning` for something a crash can also leave; `Info` for expected after a crash, such as a torn WAL tail), `object` (slot, SST id, blob file id or stream), `offset` (main file, or the WAL file for `Wal`), `message` (not stable wording). |
+| `regions` | Every region of the main file by offset: `Superblock { slot }`, `ManifestSnapshot`, `ManifestLog`, `Sst { sst, table, family, level, used }`, `Blob { blob_file, index, family }`. |
+| `wal` | One `WalFile` per sidecar (none after a clean close): `stream`, `path`, `len`, `segment_size`, `segments`, `records` (what the next open replays), `checkpoint` and `end` as (epoch, offset), `end_slot`. |
 
 ## Recipes
 ### 1. Open, create table, write, read
