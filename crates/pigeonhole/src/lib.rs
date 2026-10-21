@@ -84,6 +84,7 @@
 #![forbid(unsafe_code)]
 
 mod cell;
+mod check;
 mod db;
 mod error;
 mod info;
@@ -128,6 +129,10 @@ mod guide {
 pub mod nonblocking;
 
 pub use cell::{Cell, CellEntry, CellRef, Row, RowRef, Value};
+pub use check::{
+    CheckCounts, CheckOptions, CheckReport, Finding, Region, RegionKind, Severity, Structure,
+    WalFile, check,
+};
 pub use db::{Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
 pub use info::{Compression, DatabaseInfo, FamilyInfo, FamilyStorage, LevelInfo, TableInfo};

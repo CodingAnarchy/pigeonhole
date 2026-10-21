@@ -23,6 +23,7 @@
 
 mod admission;
 mod catalog;
+mod check;
 mod close_gate;
 mod compact;
 mod engine;
@@ -51,6 +52,10 @@ mod watermark_waiters;
 mod write;
 
 pub use admission::Admit;
+pub use check::{
+    CheckCounts, CheckOptions, CheckReport, Extent, ExtentKind, Finding, Severity, Structure,
+    WalFile,
+};
 #[doc(hidden)]
 pub use engine::Handover;
 pub use engine::PendingMaintenance;

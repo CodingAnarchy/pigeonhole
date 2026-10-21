@@ -4016,7 +4016,7 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
 }
 
 /// Refuses a file on a network filesystem, and on FUSE unless `allow_fuse` (D173, #299).
-fn check_local(file: &FileRef, allow_fuse: bool) -> Result<()> {
+pub(crate) fn check_local(file: &FileRef, allow_fuse: bool) -> Result<()> {
     match file.locality()? {
         Locality::Local => Ok(()),
         Locality::Fuse if allow_fuse => Ok(()),
