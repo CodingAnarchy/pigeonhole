@@ -20,6 +20,8 @@
 //!    queue, to the new owner, or through two-phase commit when their rows now span shards.
 
 use super::*;
+#[cfg(feature = "test-hooks")]
+use crate::engine::hooks::LoadTerm;
 
 use pigeonhole_format::key::{Escaped, row_prefix_len};
 use pigeonhole_format::manifest::SstMeta;
@@ -1732,13 +1734,9 @@ impl ShardState {
         let counted = busy > 0;
         // A chosen turn busy, as an engine-owned shard measures it.
         #[cfg(feature = "test-hooks")]
-        let (turns, counted) = match self.shared.metrics[me]
-            .hooks
-            .busy_override
-            .load(Ordering::Relaxed)
-        {
-            0 => (turns, counted),
-            v => (Some((v - 1) as f64 / 1e6), true),
+        let (turns, counted) = match self.shared.metrics[me].hooks.load_override(LoadTerm::Busy) {
+            None => (turns, counted),
+            Some(v) => (Some(v), true),
         };
         // A counted term over the interval, from its counter's rise (0 for an
         // application-owned shard, which counts no turns).
@@ -1760,26 +1758,18 @@ impl ShardState {
         // A chosen concurrency (D257's packing tests), measured whether or not the clock
         // moved, as the chosen busy fraction is.
         #[cfg(feature = "test-hooks")]
-        let inflights = match self.shared.metrics[me]
+        let inflights = self.shared.metrics[me]
             .hooks
-            .inflight_override
-            .load(Ordering::Relaxed)
-        {
-            0 => inflights,
-            v => Some((v - 1) as f64 / 1e6),
-        };
+            .load_override(LoadTerm::Inflight)
+            .or(inflights);
         // The pool's slices for this shard over the interval (D256).
         let pools = term(pool, |m| m.pool);
         // A chosen pool term (D256's packing tests).
         #[cfg(feature = "test-hooks")]
-        let pools = match self.shared.metrics[me]
+        let pools = self.shared.metrics[me]
             .hooks
-            .pool_override
-            .load(Ordering::Relaxed)
-        {
-            0 => pools,
-            v => (v - 1) as f64 / 1e6,
-        };
+            .load_override(LoadTerm::Pool)
+            .unwrap_or(pools);
         // This pass's stall bit, then the count over the window.
         let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
         let stalled_now = events > self.stall_events_mark || self.stall_open();
@@ -1793,14 +1783,10 @@ impl ShardState {
         };
         // A chosen stall term (D255's packing tests).
         #[cfg(feature = "test-hooks")]
-        let stalls = match self.shared.metrics[me]
+        let stalls = self.shared.metrics[me]
             .hooks
-            .stall_override
-            .load(Ordering::Relaxed)
-        {
-            0 => stalls,
-            v => (v - 1) as f64 / 1e6,
-        };
+            .load_override(LoadTerm::Stalled)
+            .unwrap_or(stalls);
         let measured = turns.map(|t| (t + pools).max(syncs.min(1.0)).max(stalls));
         if let Some(frac) = measured {
             self.busy_ewma = LOAD_ALPHA * frac + (1.0 - LOAD_ALPHA) * self.busy_ewma;
