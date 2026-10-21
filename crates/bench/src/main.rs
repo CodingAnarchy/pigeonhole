@@ -718,8 +718,9 @@ mod tests {
     #[test]
     fn placement_smoke_reports_the_check() {
         // D231: the open-loop placement check runs end to end and reports its record, with
-        // writes measured in its window. The window is 3 s: on a slow Windows CI runner a debug
-        // build's commits once stalled through a whole 1 s window and it measured none.
+        // writes measured in its window. A debug build's commits on a loaded CI runner have
+        // stalled through a whole fixed window (1 s on Windows, then 3 s on macOS, #802), so a
+        // window that saw no writes grows until one lands, up to `WINDOW_GROWTH` times.
         let dir = std::env::temp_dir().join(format!("phdb-bench-placement-{}", std::process::id()));
         let a = args(&format!(
             "placement --scale smoke --shards 2 --offered-rate 40000 --min-secs 3 --dir {}",
