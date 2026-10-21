@@ -182,7 +182,7 @@ impl Selection {
                 core.db.check_snapshot(&s)?;
                 s.inner
             }
-            None => core.db.engine.snapshot()?,
+            None => core.db.engine().snapshot()?,
         };
         let info = core.current_info();
         let mut ids = SmallVec::new();
@@ -341,7 +341,7 @@ impl<'t> RowRead<'t> {
         // The engine resolves the cells straight into the row this returns (#287): no
         // intermediate row and no second copy of each cell.
         let mut buf = RowBuf::new(info, 0);
-        let (engine, table) = (&self.core.db.engine, self.core.info.id);
+        let (engine, table) = (&self.core.db.engine(), self.core.info.id);
         let any = match &snapshot {
             None => engine.read_row_latest_into(
                 table,
@@ -378,7 +378,7 @@ impl RowRead<'_> {
                 None => self.sel.start_latest(self.core)?,
                 Some(_) => None,
             };
-            let (engine, table) = (&self.core.db.engine, self.core.info.id);
+            let (engine, table) = (&self.core.db.engine(), self.core.info.id);
             Ok(match latest {
                 Some((info, families)) => engine.read_row_latest_async(
                     table,
@@ -479,6 +479,7 @@ impl<'t> Scan<'t> {
 
     /// Starts the scan.
     pub fn iter(mut self) -> Result<RowIter<'t>> {
+        let generation = self.core.db.generation();
         let (info, snapshot, families) = self.sel.start(self.core)?;
         let mut spec = ScanSpec::new(self.start, self.end);
         spec.read = self.sel.spec;
@@ -488,13 +489,14 @@ impl<'t> Scan<'t> {
         let cursor = self
             .core
             .db
-            .engine
+            .engine()
             .scan(&snapshot, self.core.info.id, spec)?;
         Ok(RowIter {
             cursor,
             buf: RowBuf::new(info, 0),
             done: self.limit == Some(0),
-            _table: std::marker::PhantomData,
+            db: &self.core.db,
+            generation,
         })
     }
 
@@ -507,6 +509,7 @@ impl<'t> Scan<'t> {
     #[cfg(feature = "async")]
     pub fn stream(mut self) -> crate::nonblocking::RowStream<'t> {
         let limit_zero = self.limit == Some(0);
+        let generation = self.core.db.generation();
         let started = (|| {
             let (info, snapshot, families) = self.sel.start(self.core)?;
             let mut spec = ScanSpec::new(self.start, self.end);
@@ -516,11 +519,11 @@ impl<'t> Scan<'t> {
             let cursor = self
                 .core
                 .db
-                .engine
+                .engine()
                 .scan_async(&snapshot, self.core.info.id, spec)?;
             Ok((cursor, RowBuf::new(info, 0)))
         })();
-        crate::nonblocking::RowStream::new(started, limit_zero)
+        crate::nonblocking::RowStream::new(started, limit_zero, &self.core.db, generation)
     }
 }
 
@@ -542,7 +545,10 @@ pub struct RowIter<'t> {
     cursor: ScanCursor,
     buf: RowBuf,
     done: bool,
-    _table: std::marker::PhantomData<&'t TableCore>,
+    db: &'t crate::db::Db,
+    /// The engine generation the scan started in (D265): a step after the database
+    /// recovered onto a newer engine fails with `SnapshotExpired`.
+    generation: u64,
 }
 
 impl RowIter<'_> {
@@ -552,7 +558,10 @@ impl RowIter<'_> {
         if self.done {
             return Ok(false);
         }
-        let r = self.fill_inner();
+        let r = self
+            .db
+            .check_generation(self.generation)
+            .and_then(|()| self.fill_inner());
         if !matches!(r, Ok(true)) {
             self.done = true;
         }
@@ -618,7 +627,7 @@ mod tests {
             .create_if_missing()
             .unwrap();
         t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
-        let engine = Arc::clone(&t.core.db.engine);
+        let engine = Arc::clone(&t.core.db.engine());
         let table = t.core.info.id;
         engine.on_next(
             pigeonhole_engine::HookSite::LatestViewLoad,

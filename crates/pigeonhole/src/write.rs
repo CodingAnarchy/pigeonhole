@@ -159,7 +159,7 @@ impl Builder {
             return Err(e);
         }
         let (largest_value, max_value) = (self.largest_value, db.max_value);
-        db.engine
+        db.engine()
             .submit_async(self.batch, durability)
             .map(|pending| Submitted {
                 pending,
@@ -174,7 +174,7 @@ impl Builder {
             return Err(e);
         }
         let (largest_value, max_value) = (self.largest_value, db.max_value);
-        db.engine
+        db.engine()
             .submit(self.batch, durability)
             .map(|pending| Submitted {
                 pending,
@@ -190,7 +190,7 @@ impl Builder {
             return Err(e);
         }
         let largest = self.largest_value;
-        db.engine
+        db.engine()
             .commit(self.batch, durability)
             .map(CommitInfo::from)
             .map_err(|e| commit_error(e, largest, db.max_value))
@@ -515,7 +515,7 @@ impl RowMutation<'_> {
         let (db, table) = (&self.table.db, self.table.info.id);
         let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
         let durability = self.durability;
-        db.engine
+        db.engine()
             .submit_check_and_mutate_async(
                 table,
                 &self.row,
@@ -541,7 +541,7 @@ impl RowMutation<'_> {
         let db = &self.table.db;
         let largest = self.builder.largest_value;
         let (applied, info) = db
-            .engine
+            .engine()
             .check_and_mutate(
                 self.table.info.id,
                 &self.row,
@@ -896,15 +896,19 @@ pub struct Transaction {
     txn: Txn,
     error: Option<Error>,
     largest_value: usize,
+    /// The engine generation it began in (D265): its reads and its commit fail with
+    /// `SnapshotExpired` once the database recovered onto a newer engine.
+    generation: u64,
 }
 
 impl Transaction {
-    pub(crate) fn new(db: Arc<Db>, txn: Txn) -> Self {
+    pub(crate) fn new(db: Arc<Db>, txn: Txn, generation: u64) -> Self {
         Self {
             db,
             txn,
             error: None,
             largest_value: 0,
+            generation,
         }
     }
 
@@ -943,6 +947,7 @@ impl Transaction {
             return Err(e);
         }
         self.db.check_open()?;
+        self.db.check_generation(self.generation)?;
         let (largest_value, max_value) = (self.largest_value, self.db.max_value);
         self.txn
             .submit_async(durability)
@@ -959,6 +964,7 @@ impl Transaction {
             return Err(e);
         }
         self.db.check_open()?;
+        self.db.check_generation(self.generation)?;
         let (largest, max) = (self.largest_value, self.db.max_value);
         self.txn
             .commit(durability)
@@ -976,6 +982,7 @@ impl Transaction {
     ) -> Result<Option<CellRef<'_>>> {
         check_table(&self.db, table)?;
         self.db.check_open()?;
+        self.db.check_generation(self.generation)?;
         let family = table.core.family_id(family)?;
         Ok(self
             .txn
@@ -997,6 +1004,7 @@ impl Transaction {
     ) -> crate::nonblocking::GetFuture {
         let started = check_table(&self.db, table)
             .and_then(|()| self.db.check_open())
+            .and_then(|()| self.db.check_generation(self.generation))
             .and_then(|()| table.core.family_id(family))
             .map(|family| {
                 self.txn

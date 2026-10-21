@@ -272,7 +272,7 @@ impl Pigeonhole {
     /// Dropping it does not stop the flush.
     pub fn flush_async(&self) -> MaintenanceFuture {
         MaintenanceFuture {
-            inner: self.db.engine.submit_flush().map_err(|e| Some(e.into())),
+            inner: self.db.engine().submit_flush().map_err(|e| Some(e.into())),
         }
     }
 
@@ -282,7 +282,7 @@ impl Pigeonhole {
         MaintenanceFuture {
             inner: self
                 .db
-                .engine
+                .engine()
                 .submit_compact(None)
                 .map_err(|e| Some(e.into())),
         }
@@ -368,7 +368,10 @@ fn polled_after_done() -> Error {
 pub struct RowStream<'t> {
     inner: std::result::Result<(ScanCursor, RowBuf), Option<Error>>,
     done: bool,
-    _table: std::marker::PhantomData<&'t crate::Table>,
+    db: &'t crate::db::Db,
+    /// The engine generation the scan started in (D265): a step after the database
+    /// recovered onto a newer engine fails with `SnapshotExpired`.
+    generation: u64,
 }
 
 impl std::fmt::Debug for RowStream<'_> {
@@ -379,12 +382,18 @@ impl std::fmt::Debug for RowStream<'_> {
     }
 }
 
-impl RowStream<'_> {
-    pub(crate) fn new(started: Result<(ScanCursor, RowBuf)>, limit_zero: bool) -> Self {
+impl<'t> RowStream<'t> {
+    pub(crate) fn new(
+        started: Result<(ScanCursor, RowBuf)>,
+        limit_zero: bool,
+        db: &'t crate::db::Db,
+        generation: u64,
+    ) -> Self {
         Self {
             inner: started.map_err(Some),
             done: limit_zero,
-            _table: std::marker::PhantomData,
+            db,
+            generation,
         }
     }
 }
@@ -404,6 +413,10 @@ impl futures_core::Stream for RowStream<'_> {
                 return Poll::Ready(e.take().map(Err));
             }
         };
+        if let Err(e) = this.db.check_generation(this.generation) {
+            this.done = true;
+            return Poll::Ready(Some(Err(e)));
+        }
         let item = match cursor.poll_next_row(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Ok(false)) => None,

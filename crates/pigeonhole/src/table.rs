@@ -89,7 +89,7 @@ impl TableBuilder<'_> {
         if self.name.is_empty() {
             return Err(Error::new(ErrorCode::InvalidArgument, "empty table name"));
         }
-        let engine = &db.engine;
+        let engine = &db.engine();
         let mut defs = Vec::with_capacity(self.families.len());
         for (name, family) in &self.families {
             if !defs.iter().any(|(n, _)| n == name) {
@@ -160,7 +160,7 @@ impl TableCore {
     /// The catalog entry as of now: a family added through another handle shows up here.
     /// Falls back to the handle's own entry if the table was dropped or replaced.
     pub(crate) fn current_info(&self) -> Arc<TableInfo> {
-        match self.db.engine.table(&self.info.name) {
+        match self.db.engine().table(&self.info.name) {
             Some(info) if info.id == self.info.id => info,
             _ => Arc::clone(&self.info),
         }
@@ -192,11 +192,11 @@ impl TableCore {
         let family = self.family_id(family)?;
         let table = self.info.id;
         let data = match snapshot {
-            None => self.db.engine.get_latest(table, family, row, qualifier)?,
+            None => self.db.engine().get_latest(table, family, row, qualifier)?,
             Some(s) => {
                 self.db.check_snapshot(s)?;
                 self.db
-                    .engine
+                    .engine()
                     .get(&s.inner, table, family, row, qualifier)?
             }
         };
@@ -219,12 +219,12 @@ impl TableCore {
             Ok(match snapshot {
                 None => self
                     .db
-                    .engine
+                    .engine()
                     .get_latest_async(table, family, row, qualifier),
                 Some(s) => {
                     self.db.check_snapshot(s)?;
                     self.db
-                        .engine
+                        .engine()
                         .get_async(&s.inner, table, family, row, qualifier)
                 }
             })
@@ -386,7 +386,7 @@ impl Table {
     /// # }
     /// ```
     pub fn shard_of(&self, row: &[u8]) -> Option<usize> {
-        self.core.db.engine.shard_of(self.core.info.id, row)
+        self.core.db.engine().shard_of(self.core.info.id, row)
     }
 
     /// Splits this table's row space at `keys` (sorted) and spreads the pieces over the
@@ -395,11 +395,11 @@ impl Table {
     /// The balancer may still move the pieces later.
     #[doc(hidden)]
     pub fn split_over_shards(&self, keys: Vec<Vec<u8>>) -> Result<()> {
-        let shards = self.core.db.engine.shard_stats().len().max(1);
+        let shards = self.core.db.engine().shard_stats().len().max(1);
         let owners: Vec<u16> = (0..=keys.len()).map(|i| (i % shards) as u16).collect();
         self.core
             .db
-            .engine
+            .engine()
             .split_table(self.core.info.id, keys, &owners)
             .map_err(Into::into)
     }

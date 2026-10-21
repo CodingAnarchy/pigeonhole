@@ -909,6 +909,7 @@ dependencies = [
 name = "pigeonhole"
 version = "0.4.0"
 dependencies = [
+ "arc-swap",
  "criterion",
  "futures-core",
  "libc",

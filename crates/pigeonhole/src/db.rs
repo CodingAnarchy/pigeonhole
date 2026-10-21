@@ -1,7 +1,8 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
+use arc_swap::ArcSwap;
 use pigeonhole_engine::{Engine, EngineShard, Failure};
 use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
@@ -14,9 +15,17 @@ use crate::{
 
 /// What every handle derived from one open database shares: the engine, whether
 /// [`Pigeonhole::close`] ran, and the largest value a commit may carry.
+///
+/// The engine can be replaced (D265: automatic recovery reopens the file and swaps the new
+/// engine in behind the handles). Every operation loads the current one through
+/// [`Db::engine`]; what was taken from an earlier engine (a snapshot, a transaction, an
+/// iterator) carries the [`generation`](Db::generation) it was taken in and expires with
+/// `SnapshotExpired` once the generation moved on.
 #[derive(Debug)]
 pub(crate) struct Db {
-    pub(crate) engine: Arc<Engine>,
+    engine: ArcSwap<Engine>,
+    /// Opens of the engine behind this handle: 1 at open, +1 per swap.
+    generation: AtomicU64,
     /// The I/O backend the engine runs on (for [`Pigeonhole::io_rings`]).
     vfs: VfsRef,
     closed: AtomicBool,
@@ -24,14 +33,54 @@ pub(crate) struct Db {
     pub(crate) max_value: usize,
 }
 
+/// The current engine, held for the duration of one operation.
+pub(crate) type EngineRef = arc_swap::Guard<Arc<Engine>>;
+
 impl Db {
     fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize) -> Arc<Self> {
         Arc::new(Self {
-            engine,
+            engine: ArcSwap::from(engine),
+            generation: AtomicU64::new(1),
             vfs,
             closed: AtomicBool::new(false),
             max_value,
         })
+    }
+
+    /// The current engine. One `ArcSwap` load; hold the guard only for the operation.
+    #[inline]
+    pub(crate) fn engine(&self) -> EngineRef {
+        self.engine.load()
+    }
+
+    /// The generation the current engine was opened in (see [`Db::swap_engine`]).
+    #[inline]
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Fails with `SnapshotExpired` unless `generation` is the current one: a snapshot, a
+    /// transaction or an iterator from an earlier engine must not read through its old view
+    /// (the reopen freed the extents it names: D148's reasoning, D265).
+    #[inline]
+    pub(crate) fn check_generation(&self, generation: u64) -> Result<()> {
+        if self.generation() == generation {
+            Ok(())
+        } else {
+            Err(pigeonhole_engine::Error::SnapshotExpired.into())
+        }
+    }
+
+    /// Replaces the engine (D265): later operations run on `engine`, the generation moves
+    /// on, and the previous engine is returned for the caller to drop. The order matters: the
+    /// new engine is in place before the generation moves, so an operation that passed its
+    /// generation check loads either the old engine (still open, or closing: it then fails
+    /// with `Closed`) or the new one, never a mix.
+    #[allow(dead_code)] // used by the recovery supervisor (the next PR) and the tests
+    pub(crate) fn swap_engine(&self, engine: Arc<Engine>) -> Arc<Engine> {
+        let previous = self.engine.swap(engine);
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        previous
     }
 
     fn io_rings(&self) -> Option<IoRings> {
@@ -53,31 +102,37 @@ impl Db {
 
     pub(crate) fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_open()?;
+        // The generation before the engine: a swap in between leaves a snapshot that fails
+        // its check rather than one that passes it with an old view.
+        let generation = self.generation();
         Ok(Snapshot {
-            inner: self.engine.snapshot()?,
+            inner: self.engine().snapshot()?,
             db: Arc::downgrade(self),
+            generation,
         })
     }
 
     pub(crate) fn durable_snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_open()?;
+        let generation = self.generation();
         Ok(Snapshot {
-            inner: self.engine.durable_snapshot()?,
+            inner: self.engine().durable_snapshot()?,
             db: Arc::downgrade(self),
+            generation,
         })
     }
 
-    /// Refuses a snapshot taken from another database.
+    /// Refuses a snapshot taken from another database, or from an earlier engine of this one
+    /// (`SnapshotExpired`, D265).
     #[inline]
     pub(crate) fn check_snapshot(self: &Arc<Self>, snapshot: &Snapshot) -> Result<()> {
-        if std::ptr::eq(Weak::as_ptr(&snapshot.db), Arc::as_ptr(self)) {
-            Ok(())
-        } else {
-            Err(Error::new(
+        if !std::ptr::eq(Weak::as_ptr(&snapshot.db), Arc::as_ptr(self)) {
+            return Err(Error::new(
                 ErrorCode::InvalidArgument,
                 "the snapshot belongs to another database",
-            ))
+            ));
         }
+        self.check_generation(snapshot.generation)
     }
 }
 
@@ -248,7 +303,7 @@ impl Pigeonhole {
     /// Names of every table.
     pub fn tables(&self) -> Vec<String> {
         self.db
-            .engine
+            .engine()
             .tables()
             .iter()
             .map(|t| t.name.clone())
@@ -259,10 +314,10 @@ impl Pigeonhole {
     pub fn drop_table(&self, name: &str) -> Result<()> {
         let info = self
             .db
-            .engine
+            .engine()
             .table(name)
             .ok_or_else(|| pigeonhole_engine::Error::TableNotFound(name.to_owned()))?;
-        Ok(self.db.engine.drop_table(info.id)?)
+        Ok(self.db.engine().drop_table(info.id)?)
     }
 
     /// A batch of writes across any rows and tables, committed with one durability point.
@@ -273,9 +328,11 @@ impl Pigeonhole {
     /// Starts an optimistic multi-row transaction (Phase 4).
     pub fn transaction(&self) -> Result<Transaction> {
         self.db.check_open()?;
+        let generation = self.db.generation();
         Ok(Transaction::new(
             Arc::clone(&self.db),
-            self.db.engine.begin()?,
+            self.db.engine().begin()?,
+            generation,
         ))
     }
 
@@ -287,14 +344,14 @@ impl Pigeonhole {
     /// "Recovering from a failed shard". [`failure`](Self::failure) says which shard and
     /// why. Cheap (one atomic load), so it can back a health endpoint.
     pub fn is_failed(&self) -> bool {
-        self.db.engine.is_failed()
+        self.db.engine().is_failed()
     }
 
     /// The instance's first failure, if any (see [`is_failed`](Self::is_failed)): the shard
     /// ([`Failure::MAIN_FILE`] for the main file) and the
     /// [`FailureCause`](crate::FailureCause). Later failures do not replace it.
     pub fn failure(&self) -> Option<Failure> {
-        self.db.engine.failure()
+        self.db.engine().failure()
     }
 
     /// A consistent snapshot of everything committed so far. It sees a commit once the commit
@@ -333,7 +390,7 @@ impl Pigeonhole {
     /// hook (ICR 0010) that shows whether one table's writes spread over the shards.
     #[doc(hidden)]
     pub fn shard_stats(&self) -> Vec<crate::ShardStats> {
-        self.db.engine.shard_stats()
+        self.db.engine().shard_stats()
     }
 
     /// The active shard count the balancer published and the count it is heading for (the
@@ -341,13 +398,13 @@ impl Pigeonhole {
     /// (D242's amendment) so a warm-up does not end inside a regrow.
     #[doc(hidden)]
     pub fn pack_target(&self) -> Option<(usize, usize)> {
-        self.db.engine.pack_target()
+        self.db.engine().pack_target()
     }
 
     /// What the row cache did since open: hits, misses and fills (D201). All zero when
     /// [`Options::row_cache`](crate::Options::row_cache) is 0.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
-        self.db.engine.row_cache_stats()
+        self.db.engine().row_cache_stats()
     }
 
     /// The writer's counters since this instance opened: commits and their latency,
@@ -356,7 +413,7 @@ impl Pigeonhole {
     /// from 0 at open, so take two readings and subtract for an interval; see
     /// [`EngineMetrics`](crate::EngineMetrics) for each field. Cheap and non-blocking.
     pub fn engine_metrics(&self) -> crate::EngineMetrics {
-        self.db.engine.metrics().into()
+        self.db.engine().metrics().into()
     }
 
     /// Commit latency histograms per durability level since open, summed over shards: a
@@ -364,7 +421,7 @@ impl Pigeonhole {
     /// [`commit_latency_floor(b)`](Self::commit_latency_floor) nanoseconds; subtract two readings for a phase.
     #[doc(hidden)]
     pub fn commit_latency_buckets(&self) -> [[u64; 64]; 4] {
-        self.db.engine.commit_latency_buckets()
+        self.db.engine().commit_latency_buckets()
     }
 
     /// The lower bound in nanoseconds of [`commit_latency_buckets`](Self::commit_latency_buckets)'
@@ -378,7 +435,7 @@ impl Pigeonhole {
     /// see the engine's `tablet_refusals`. A bench hook (#123).
     #[doc(hidden)]
     pub fn tablet_refusals(&self) -> (u64, u64) {
-        self.db.engine.tablet_refusals()
+        self.db.engine().tablet_refusals()
     }
 
     /// Bytes of async commits each shard holds submitted and not yet resolved (D210): a
@@ -386,8 +443,8 @@ impl Pigeonhole {
     /// alone.
     #[doc(hidden)]
     pub fn async_commit_inflight(&self) -> Vec<u64> {
-        (0..self.db.engine.shard_stats().len())
-            .map(|s| self.db.engine.admission_inflight(s))
+        (0..self.db.engine().shard_stats().len())
+            .map(|s| self.db.engine().admission_inflight(s))
             .collect()
     }
 
@@ -396,7 +453,7 @@ impl Pigeonhole {
     /// no async read blocked its executor thread on the file.
     #[cfg(feature = "async")]
     pub fn async_sync_reads(&self) -> u64 {
-        self.db.engine.metrics().async_sync_reads
+        self.db.engine().metrics().async_sync_reads
     }
 
     /// With io_uring (#402; the default on Linux, D218): how many io_uring rings the
@@ -418,17 +475,17 @@ impl Pigeonhole {
     /// and per table its tablets, its families' stored options and their SSTs per level and
     /// blob files (ICR 0047). Reads the current catalog; cheap, no data I/O.
     pub fn info(&self) -> Result<crate::DatabaseInfo> {
-        Ok(self.db.engine.info()?.into())
+        Ok(self.db.engine().info()?.into())
     }
 
     /// The writer default durability.
     pub fn default_durability(&self) -> Durability {
-        self.db.engine.default_durability()
+        self.db.engine().default_durability()
     }
 
     /// Changes the writer default; applies to commits that start afterwards.
     pub fn set_default_durability(&self, durability: Durability) {
-        self.db.engine.set_default_durability(durability);
+        self.db.engine().set_default_durability(durability);
     }
 
     /// Writes every memtable into the file and returns once the data is there (the SSTs are
@@ -463,7 +520,7 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn flush(&self) -> Result<()> {
-        Ok(self.db.engine.flush()?)
+        Ok(self.db.engine().flush()?)
     }
 
     /// Compacts every table fully: flushes, then merges every level into the last one.
@@ -493,7 +550,7 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn compact(&self) -> Result<()> {
-        Ok(self.db.engine.compact(None)?)
+        Ok(self.db.engine().compact(None)?)
     }
 
     /// Writes a consistent single-file copy to `dest`, which must not exist, while writes
@@ -528,14 +585,14 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
-        Ok(self.db.engine.backup(dest.as_ref())?)
+        Ok(self.db.engine().backup(dest.as_ref())?)
     }
 
     /// As [`backup`](Self::backup), at a durable snapshot (D227, ICR 0037): the copy holds
     /// only commits durable here at their level. A `GroupSync` or `Sync` commit it holds
     /// survives a power loss here; a `Buffered` or `None` one may not.
     pub fn backup_durable(&self, dest: impl AsRef<Path>) -> Result<()> {
-        Ok(self.db.engine.backup_durable(dest.as_ref())?)
+        Ok(self.db.engine().backup_durable(dest.as_ref())?)
     }
 
     /// Returns free space at the end of the file to the filesystem and reports the bytes
@@ -598,7 +655,7 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn shrink(&self) -> Result<u64> {
-        Ok(self.db.engine.shrink()?)
+        Ok(self.db.engine().shrink()?)
     }
 
     /// Closes this handle's database. Flushes every memtable and checkpoints the WAL; if
@@ -611,7 +668,7 @@ impl Pigeonhole {
     /// [`ErrorCode::Closed`](crate::ErrorCode::Closed) afterwards.
     pub fn close(self) -> Result<()> {
         self.db.closed.store(true, Ordering::Release);
-        Ok(self.db.engine.close()?)
+        Ok(self.db.engine().close()?)
     }
 }
 
@@ -650,7 +707,7 @@ impl PigeonholeReader {
     /// no async read blocked its executor thread on the file.
     #[cfg(feature = "async")]
     pub fn async_sync_reads(&self) -> u64 {
-        self.db.engine.metrics().async_sync_reads
+        self.db.engine().metrics().async_sync_reads
     }
 
     /// As [`Pigeonhole::io_rings`].
@@ -662,14 +719,14 @@ impl PigeonholeReader {
     /// [`DatabaseInfo::free_bytes`](crate::DatabaseInfo::free_bytes) is `None`: a reader
     /// does not track allocations.
     pub fn info(&self) -> Result<crate::DatabaseInfo> {
-        Ok(self.db.engine.info()?.into())
+        Ok(self.db.engine().info()?.into())
     }
 
     /// Opens an existing table for reading.
     pub fn table(&self, name: &str) -> Result<ReadTable> {
         let info = self
             .db
-            .engine
+            .engine()
             .table(name)
             .ok_or_else(|| pigeonhole_engine::Error::TableNotFound(name.to_owned()))?;
         Ok(ReadTable {
@@ -680,7 +737,7 @@ impl PigeonholeReader {
     /// Names of every table.
     pub fn tables(&self) -> Vec<String> {
         self.db
-            .engine
+            .engine()
             .tables()
             .iter()
             .map(|t| t.name.clone())
@@ -728,6 +785,9 @@ pub struct Snapshot {
     pub(crate) inner: pigeonhole_engine::Snapshot,
     /// The database it was taken from (weak: a snapshot does not keep the database open).
     db: Weak<Db>,
+    /// The engine generation it was taken in (D265): reads through it fail with
+    /// `SnapshotExpired` once the database recovered onto a newer engine.
+    generation: u64,
 }
 
 impl Snapshot {
@@ -1073,6 +1133,76 @@ fn max_value(o: &pigeonhole_engine::EngineOptions) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// D265: the engine behind the handle is swapped for one reopened on the first one's
+    /// handover, as the recovery supervisor does. Table handles keep working on the new
+    /// engine; a snapshot, a scan and a transaction from the old one expire.
+    #[test]
+    fn a_swapped_engine_serves_table_handles_and_expires_what_the_old_one_gave_out() {
+        let vfs: VfsRef = pigeonhole_io::sim::SimVfs::new(265);
+        let options = Options::default()
+            .vfs(Arc::clone(&vfs))
+            .shards(2)
+            .pin_threads(false);
+        let path = Path::new("/db/swap.phdb");
+        let db = Pigeonhole::open(path, options.clone()).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", crate::Family::default())
+            .create_if_missing()
+            .unwrap();
+        t.mutate(b"row").put("f", b"q", b"old").commit().unwrap();
+        let snap = db.snapshot().unwrap();
+        let mut rows = t
+            .scan_bounds(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded)
+            .iter()
+            .unwrap();
+        let mut txn = db.transaction().unwrap();
+        txn.put(&t, b"row2", "f", b"q", b"txn");
+        assert_eq!(db.db.generation(), 1);
+
+        // The swap: close the engine keeping its locks, reopen on them, swap it in.
+        let old = Arc::clone(&db.db.engine());
+        let (closed, handover) = old.close_for_reopen();
+        closed.unwrap();
+        let reopened = Engine::open_with(path, options.to_engine().unwrap(), handover.unwrap())
+            .map_err(|(e, _)| e)
+            .unwrap();
+        let previous = db.db.swap_engine(reopened);
+        assert!(Arc::ptr_eq(&previous, &old));
+        drop((previous, old));
+        assert_eq!(db.db.generation(), 2);
+
+        // Table handles keep working, on the new engine.
+        assert_eq!(t.get(b"row", "f", b"q").unwrap().unwrap().value(), b"old");
+        t.mutate(b"row").put("f", b"q", b"new").commit().unwrap();
+        assert_eq!(db.tables(), ["t"]);
+        assert!(!db.is_failed());
+
+        // What the old engine gave out expires before it touches an engine.
+        let expired = |e: &Error| e.code() == ErrorCode::SnapshotExpired;
+        let r = t.get_at(&snap, b"row", "f", b"q");
+        assert!(matches!(&r, Err(e) if expired(e)), "{r:?}");
+        let r = rows.next().expect("an item, the error");
+        assert!(matches!(&r, Err(e) if expired(e)), "{r:?}");
+        let r = txn.commit();
+        assert!(matches!(&r, Err(e) if expired(e)), "{r:?}");
+
+        // A snapshot of the new generation reads the new engine.
+        let snap2 = db.snapshot().unwrap();
+        assert_eq!(
+            t.get_at(&snap2, b"row", "f", b"q")
+                .unwrap()
+                .unwrap()
+                .value(),
+            b"new"
+        );
+        drop(rows);
+        drop((snap, snap2));
+        drop(t);
+        db.close().unwrap();
+    }
 
     fn footprint(shards: usize, budget: u64, dir: Option<&str>) -> ShmFootprint {
         let mut o = pigeonhole_engine::EngineOptions::new(pigeonhole_io::sim::SimVfs::new(1));
