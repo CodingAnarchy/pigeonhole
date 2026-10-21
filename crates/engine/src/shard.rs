@@ -2482,11 +2482,12 @@ pub(crate) struct ShardState {
     /// `Engine::compact` callers: `(table filter, reply, when it asked)`, served in order.
     compact_all: VecDeque<(Option<TableId>, Notifier<Result<()>>, u64)>,
     /// Slots the front `compact_all` request has rewritten (#805). A full compaction
-    /// rewrites a lone SST that may hold purgeable entries, but not in a slot this request
-    /// already rewrote: that rewrite was its bottommost purge, and doing it again at once would
-    /// meet the same bounds (snapshots, memtables, a voided purge), while an output that still
-    /// looks purgeable (markers a snapshot needs, rows of several columns) would loop.
-    /// Cleared whenever a request leaves `compact_all`.
+    /// rewrites a lone SST or a last-level run that may hold purgeable entries (#820), but
+    /// not in a slot this request already rewrote: that rewrite was its bottommost purge, and
+    /// doing it again at once would meet the same bounds (snapshots, memtables, a voided
+    /// purge), while an output that still looks purgeable (markers a snapshot needs, rows of
+    /// several columns written while one lived) would loop. Cleared whenever a request leaves
+    /// `compact_all`.
     full_purged: HashSet<(TabletId, FamilyId)>,
     /// The running compaction was started for the `compact_all` caller at the front: its
     /// failure is that caller's. A background compaction's failure is nobody's: it backs
@@ -7734,10 +7735,10 @@ impl ShardState {
                     continue;
                 };
                 let rewrite = self.tablets_on();
-                // A lone SST that may hold purgeable entries is rewritten, unless this request
-                // already rewrote the slot (#805, `full_purged`); its rows come from its
-                // properties, read through the open-SST cache (and only when the cheaper
-                // checks miss).
+                // A lone SST or a last-level run that may hold purgeable entries is rewritten,
+                // unless this request already rewrote the slot (#805, #820, `full_purged`); its
+                // properties are read through the open-SST cache, and only when the cheaper
+                // checks miss.
                 let purgeable = |sst: &pigeonhole_format::manifest::SstMeta| {
                     !self.full_purged.contains(&key)
                         && compact::may_hold_purgeable(sst, &meta.options, now, || {
@@ -7745,7 +7746,11 @@ impl ShardState {
                             let priority =
                                 crate::snapshot::SstSet::priority(meta.options.cache_priority);
                             let reader = open.reader(&view.ssts, priority).ok()?;
-                            Some(reader.properties().rows)
+                            let props = reader.properties();
+                            Some(compact::PurgeProps {
+                                rows: props.rows,
+                                fully_purged: props.fully_purged,
+                            })
                         })
                 };
                 if let Some(mut t) = compact::plan_full(

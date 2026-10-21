@@ -157,34 +157,56 @@ pub(crate) fn narrow(
     Ok(())
 }
 
-/// Whether a lone SST of a full compaction may hold entries a bottommost rewrite would
-/// purge (#805, owner decision 2026-10-21), from what its metadata shows: delete markers,
-/// a cell old enough to have expired under the family's TTL, or, in a family that keeps
-/// `max_versions` (not a counter, whose versions are never purged), more entries than rows
-/// (`rows`, from the SST's properties; `None` if it could not be read), so possibly more
-/// versions of a column than the family keeps. Conservative: rows of several columns count
-/// too, so a lone SST of such a table is rewritten on every `compact()` call, though only
-/// once per call (the shard's `full_purged`). Not seen: a keep-all family's put shadowed by a newer put at the same timestamp,
-/// kept because a snapshot needed it when the SST was written (nothing records that).
+/// What a full compaction reads of an SST's properties to judge it (D268): its distinct
+/// rows, and `Properties::fully_purged`.
+pub(crate) struct PurgeProps {
+    pub rows: u64,
+    pub fully_purged: Option<u32>,
+}
+
+/// Whether an SST a full compaction would otherwise leave as it is may hold entries a
+/// bottommost rewrite would purge (#805, #820, D268), from its metadata and `props` (read
+/// only when the manifest's metadata cannot settle it; `None` if they could not be read):
+/// a cell old enough to have expired under the family's TTL; or, unless a bottommost
+/// compaction that nothing held back wrote it under a policy that still holds
+/// (`Properties::fully_purged`: a counter family, or the family keeps every version now or
+/// at least as many as then), delete markers, or, in a family that keeps `max_versions`
+/// (not a counter, whose versions are never purged), more entries than rows (possibly more
+/// versions of a column than the family keeps; a row of several columns counts too, so
+/// such an SST without the property is rewritten once per `compact()` call, the shard's
+/// `full_purged`). Not seen without the property: a keep-all family's put shadowed by a
+/// newer put at the same timestamp, kept because a snapshot needed it when the SST was
+/// written.
 pub(crate) fn may_hold_purgeable(
     sst: &SstMeta,
     family: &FamilyOptions,
     now: Timestamp,
-    rows: impl FnOnce() -> Option<u64>,
+    props: impl FnOnce() -> Option<PurgeProps>,
 ) -> bool {
-    sst.deletes > 0
-        || (family.ttl_micros > 0 && sst.ts_range.0.saturating_add(family.ttl_micros) <= now)
-        || (family.kind != FamilyKind::Counter
-            && family.max_versions > 0
-            && rows().is_none_or(|rows| sst.entries > rows))
+    if family.ttl_micros > 0 && sst.ts_range.0.saturating_add(family.ttl_micros) <= now {
+        return true;
+    }
+    let counter = family.kind == FamilyKind::Counter;
+    let versions = !counter && family.max_versions > 0;
+    if sst.deletes == 0 && !versions {
+        return false;
+    }
+    let Some(props) = props() else {
+        return true;
+    };
+    let purged = props.fully_purged.is_some_and(|then| {
+        counter || family.max_versions == 0 || (then != 0 && family.max_versions >= then)
+    });
+    !purged && (sst.deletes > 0 || (versions && sst.entries > props.rows))
 }
 
 /// A task compacting every level of a slot into the last level (`Engine::compact`).
 ///
-/// A lone SST is rewritten rather than moved or left alone when `purgeable` says it may
-/// hold entries a bottommost rewrite purges ([`may_hold_purgeable`]): a full compaction
-/// leaves nothing purgeable (#805). The caller answers no for a slot the same full compaction
-/// already rewrote, so a rewrite whose output still matches does not repeat.
+/// A lone SST, or a run already at the last level, is rewritten rather than moved or left
+/// alone when `purgeable` says one of its SSTs may hold entries a bottommost rewrite purges
+/// ([`may_hold_purgeable`]): a full compaction leaves nothing purgeable (#805, #820, D268).
+/// The caller answers no for a slot the same full compaction already rewrote, so a rewrite
+/// whose output still matches does not repeat.
 ///
 /// A lone SST is also rewritten, not moved, when it is larger than one output piece
 /// (`output_piece_bytes` at `target`): the rewrite cuts it into pieces that pack below one
@@ -203,7 +225,7 @@ pub(crate) fn plan_full(
     busy: &[SstId],
     rewrite: bool,
     target: u64,
-    purgeable: impl FnOnce(&SstMeta) -> bool,
+    mut purgeable: impl FnMut(&SstMeta) -> bool,
 ) -> Option<CompactionTask> {
     let inputs: Vec<(u8, Vec<SstId>)> = levels
         .levels
@@ -223,8 +245,9 @@ pub(crate) fn plan_full(
     {
         return None;
     }
-    // Already one run at the bottom: nothing to do, unless it holds rows outside the tablet
-    // (inherited from a split's parent), which a rewrite drops.
+    // Already one run at the bottom: nothing to do, unless it may hold purgeable entries
+    // (#820) or rows outside the tablet (inherited from a split's parent), which a rewrite
+    // drops.
     // A lone SST larger than one output piece is cut into pieces (#185), unless it holds a
     // single row: outputs are cut only between rows, so its rewrite would be the same SST,
     // and a full compaction, which runs until nothing is left to do, would never end.
@@ -235,8 +258,12 @@ pub(crate) fn plan_full(
         pigeonhole_compaction::output_piece_bytes(s.len, target) >= s.len
             || row_of(&s.smallest_key) == row_of(&s.largest_key)
     });
-    let purge = lone.is_some_and(|s| purgeable(s));
-    if inputs.len() == 1 && inputs[0].0 == last_level && one_piece && !purge {
+    // Asked only where the answer changes the plan: a run already at the bottom, or a lone
+    // SST that would be moved.
+    let settled = inputs.len() == 1 && inputs[0].0 == last_level && one_piece;
+    let movable = total == 1 && !rewrite && one_piece;
+    let purge = (settled || movable) && levels.levels.iter().flatten().any(|s| purgeable(s));
+    if settled && !purge {
         let range = tablet_range(tablet).ok()?;
         if !levels
             .levels
@@ -247,7 +274,7 @@ pub(crate) fn plan_full(
             return None;
         }
     }
-    let kind = if total == 1 && !rewrite && one_piece && !purge {
+    let kind = if movable && !purge {
         TaskKind::TrivialMove
     } else {
         TaskKind::Rewrite
@@ -1238,5 +1265,64 @@ mod tests {
         .unwrap();
         c.prune_blob_refs();
         assert!(!c.blob_refs.contains_key(&SstId(10)));
+    }
+
+    /// D268: what makes an SST a full compaction would otherwise leave alone a candidate for
+    /// a rewrite, with and without the fully-purged property.
+    #[test]
+    fn may_hold_purgeable_honours_the_fully_purged_property_except_for_expiry() {
+        let sst = |entries, deletes, ts| SstMeta {
+            id: SstId(1),
+            extent: ExtentRef {
+                page: 16,
+                size_class: 0,
+            },
+            len: 4096,
+            smallest_key: Vec::new(),
+            largest_key: Vec::new(),
+            seqno_range: (1, 10),
+            ts_range: (ts, ts),
+            entries,
+            deletes,
+        };
+        let family = |max_versions, ttl_micros| {
+            let mut f = FamilyOptions::default();
+            f.max_versions = max_versions;
+            f.ttl_micros = ttl_micros;
+            f
+        };
+        let props = |rows, fully_purged| move || Some(PurgeProps { rows, fully_purged });
+        let check = |s: &SstMeta, f: &FamilyOptions, p: Option<u32>| {
+            may_hold_purgeable(s, f, 1_000, props(50, p))
+        };
+        // Keep-all, no deletes: nothing to purge, properties not read.
+        assert!(!may_hold_purgeable(
+            &sst(100, 0, 500),
+            &family(0, 0),
+            1_000,
+            || -> Option<PurgeProps> { panic!("read") }
+        ));
+        // Deletes, or more entries than rows under max_versions: a candidate without the
+        // property, not with it.
+        assert!(check(&sst(100, 1, 500), &family(0, 0), None));
+        assert!(!check(&sst(100, 1, 500), &family(0, 0), Some(0)));
+        assert!(check(&sst(100, 0, 500), &family(1, 0), None));
+        assert!(!check(&sst(100, 0, 500), &family(1, 0), Some(1)));
+        // Purged under a policy that no longer holds: fewer versions kept now, or every
+        // version kept then and a limit now.
+        assert!(!check(&sst(100, 0, 500), &family(2, 0), Some(1)));
+        assert!(check(&sst(100, 0, 500), &family(1, 0), Some(2)));
+        assert!(check(&sst(100, 0, 500), &family(1, 0), Some(0)));
+        // Unreadable properties: a candidate.
+        assert!(may_hold_purgeable(
+            &sst(100, 0, 500),
+            &family(1, 0),
+            1_000,
+            || None
+        ));
+        // Expiry whatever the property says: the property is about what nothing held back,
+        // not about what has expired since.
+        assert!(check(&sst(50, 0, 500), &family(1, 400), Some(1)));
+        assert!(!check(&sst(50, 0, 700), &family(1, 400), Some(1)));
     }
 }

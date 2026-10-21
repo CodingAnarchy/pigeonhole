@@ -124,17 +124,20 @@ proptest! {
     }
 
     #[test]
-    fn properties(n in any::<[u64; 14]>(), small in bytes(40), large in bytes(40), op in "\\PC{0,12}", extra in bytes(8)) {
+    fn properties(n in any::<[u64; 14]>(), small in bytes(40), large in bytes(40), op in "\\PC{0,12}", extra in bytes(8), purged in any::<Option<u32>>()) {
         let p = Properties {
             table: TableId(n[0] as u32), family: FamilyId(n[1] as u32), tablet: TabletId(n[2]),
             entries: n[3], rows: n[4], deletes: n[5], merges: n[6], raw_key_bytes: n[7], raw_value_bytes: n[8],
             data_blocks: n[9] as u32, index_partitions: (n[9] >> 32) as u32,
             seqno_range: (n[10], n[11]), ts_range: (n[12], n[13]), created_micros: n[0] ^ n[13],
-            smallest_key: small, largest_key: large, merge_operator: op,
+            smallest_key: small, largest_key: large, merge_operator: op, fully_purged: purged,
         };
         let mut out = Vec::new();
         p.encode(&mut out);
         prop_assert_eq!(&Properties::decode(&out).unwrap(), &p);
+        // A block written before the purge word (D268) reads as unknown.
+        let old = Properties::decode(&out[..out.len() - 8]).unwrap();
+        prop_assert_eq!(&old, &Properties { fully_purged: None, ..p.clone() });
         out.extend_from_slice(&extra); // appended future fields are ignored
         prop_assert_eq!(Properties::decode(&out).unwrap(), p);
     }

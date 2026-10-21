@@ -138,7 +138,16 @@ pub struct Properties {
     pub largest_key: Vec<u8>,
     /// Merge operator name in force when written, empty if none.
     pub merge_operator: String,
+    /// `Some(max_versions)` when a bottommost compaction wrote the SST with nothing holding
+    /// its purge back (no live snapshot, nothing above its inputs, every other source of a
+    /// counter family listed), under a family keeping `max_versions` (0: every version):
+    /// a later rewrite drops nothing but what expires meanwhile (D268, ICR 0053). `None`:
+    /// unknown (any other writer, or an SST written before the property).
+    pub fully_purged: Option<u32>,
 }
+
+/// `Properties::fully_purged`'s flag bit in the purge word.
+const FULLY_PURGED: u32 = 1;
 
 impl Properties {
     /// Appends the logical properties block.
@@ -170,13 +179,16 @@ impl Properties {
         crate::varint::put_bytes(out, &self.smallest_key);
         crate::varint::put_bytes(out, &self.largest_key);
         crate::varint::put_bytes(out, self.merge_operator.as_bytes());
+        let (flags, max_versions) = self.fully_purged.map_or((0, 0), |v| (FULLY_PURGED, v));
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&max_versions.to_le_bytes());
     }
 
     /// Decodes a logical properties block. Trailing bytes after the last known field are
     /// ignored, so later versions can append fields.
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
         let mut r = Reader::new(bytes, "sst properties");
-        Ok(Self {
+        let mut props = Self {
             table: TableId(r.u32()?),
             family: FamilyId(r.u32()?),
             tablet: TabletId(r.u64()?),
@@ -194,6 +206,15 @@ impl Properties {
             smallest_key: r.bytes()?.to_vec(),
             largest_key: r.bytes()?.to_vec(),
             merge_operator: r.string()?,
-        })
+            fully_purged: None,
+        };
+        // The purge word and its `max_versions` (D268), absent from blocks written before
+        // them; unknown flag bits are ignored.
+        if r.remaining() >= 8 {
+            let flags = r.u32()?;
+            let max_versions = r.u32()?;
+            props.fully_purged = (flags & FULLY_PURGED != 0).then_some(max_versions);
+        }
+        Ok(props)
     }
 }

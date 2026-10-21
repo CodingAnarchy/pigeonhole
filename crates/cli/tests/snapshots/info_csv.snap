@@ -3,7 +3,7 @@ source: crates/cli/tests/common/mod.rs
 expression: text
 ---
 table,family,tablets,counter,ssts,sst_bytes,entries,blob_files,blob_bytes,blob_live_bytes,max_versions,ttl_micros,compression,zstd_level,bloom_bits,block_size,blob_threshold,merge_operator,cache_priority,compaction
-events,e,1,false,1,1061,50,0,0,0,0,,zstd,3,10,16384,4096,,normal,leveled
+events,e,1,false,1,1069,50,0,0,0,0,,zstd,3,10,16384,4096,,normal,leveled
 users,profile,1,false,0,0,0,0,0,0,1,,lz4,,10,16384,4096,,high,leveled
 users,logins,1,true,0,0,0,0,0,0,0,,lz4,,10,16384,4096,,normal,leveled
 users,history,1,false,0,0,0,0,0,0,0,2592000000000,none,,10,16384,4096,,normal,tiered

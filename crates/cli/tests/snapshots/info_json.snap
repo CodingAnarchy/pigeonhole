@@ -31,13 +31,13 @@ expression: text
           "cache_priority": "normal",
           "compaction": "leveled",
           "ssts": 1,
-          "sst_bytes": 1061,
+          "sst_bytes": 1069,
           "entries": 50,
           "levels": [
             {
               "level": 0,
               "ssts": 1,
-              "bytes": 1061,
+              "bytes": 1069,
               "entries": 50
             }
           ],

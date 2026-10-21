@@ -250,11 +250,23 @@ fn sst() {
         smallest_key: keys[0].clone(),
         largest_key: keys[keys.len() - 1].clone(),
         merge_operator: "pigeonhole.i64_add".into(),
+        fully_purged: Some(3),
     };
     let mut out = Vec::new();
     props.encode(&mut out);
     check("sst_properties.bin", &out);
     assert_eq!(Properties::decode(&out).unwrap(), props);
+    // Format 3's block before the purge word (D268): the same fields, the property unknown.
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/golden/sst_properties_before_d268.bin");
+    let before = std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    assert_eq!(
+        Properties::decode(&before).unwrap(),
+        Properties {
+            fully_purged: None,
+            ..props
+        }
+    );
 }
 
 #[test]
