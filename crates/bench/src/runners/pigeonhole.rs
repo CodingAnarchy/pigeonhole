@@ -46,6 +46,9 @@ pub(crate) struct Settings {
     /// Riders on the measured phase (D247): snapshot and durable-snapshot readers, then a
     /// durable backup and a compaction.
     pub(crate) riders: bool,
+    /// Reader processes beside the measured phase (#683): this many `phdb-bench reader`
+    /// children doing ycsb-c reads through `open_reader`; 0 runs none.
+    pub(crate) reader_processes: usize,
     /// Client threads keep this many operations in flight through the async API (D247's
     /// async rows); 0 runs one at a time.
     pub(crate) async_in_flight: usize,
@@ -68,6 +71,8 @@ pub(crate) struct Open {
     dir: std::path::PathBuf,
     /// The riders' threads while the measured phase runs.
     riders: Option<riders::Running>,
+    /// The reader processes while the measured phase runs.
+    readers: Option<super::reader_process::Running>,
 }
 
 /// How many times a write refused with `Busy` is retried (each after the engine's own
@@ -188,6 +193,23 @@ impl PigeonholeRunner {
     /// ```
     pub fn riders(mut self, yes: bool) -> Self {
         self.settings.riders = yes;
+        self
+    }
+
+    /// Runs `n` reader processes beside the measured phase (#683, D247 item K, reported):
+    /// `phdb-bench reader` children attached with `Pigeonhole::open_reader`, each reading
+    /// whole `ycsb` rows, Zipfian over the loaded records, for as long as the phase runs. The
+    /// record's [`ReaderProcesses`](crate::ReaderProcesses) has their reads, latencies and
+    /// errors. The children are this executable (or [`READER_EXE_ENV`](crate::READER_EXE_ENV)).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().reader_processes(2);
+    /// assert!(r.describe().contains(" readers=2"));
+    /// ```
+    pub fn reader_processes(mut self, n: usize) -> Self {
+        self.settings.reader_processes = n;
         self
     }
 
@@ -573,6 +595,7 @@ impl Runner for PigeonholeRunner {
             busy: Arc::default(),
             dir: dir.to_path_buf(),
             riders: None,
+            readers: None,
         });
         Ok(())
     }
@@ -681,6 +704,27 @@ impl Runner for PigeonholeRunner {
         }
     }
 
+    fn start_reader_processes(&mut self, config: &crate::WorkloadConfig) -> Result<(), String> {
+        let n = self.settings.reader_processes;
+        if n == 0 {
+            return Ok(());
+        }
+        let o = self.open.as_mut().ok_or("pigeonhole runner is not open")?;
+        o.readers = Some(super::reader_process::spawn(
+            &o.dir.join("bench.phdb"),
+            n,
+            config,
+        )?);
+        Ok(())
+    }
+
+    fn stop_reader_processes(&mut self) -> Result<Option<crate::ReaderProcesses>, String> {
+        match self.open.as_mut().and_then(|o| o.readers.take()) {
+            Some(r) => r.stop().map(Some),
+            None => Ok(None),
+        }
+    }
+
     fn txn_conflicts(&self) -> Option<u64> {
         Some(self.open.as_ref()?.target.conflicts.load(Ordering::Relaxed))
     }
@@ -711,7 +755,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -744,6 +788,11 @@ impl Runner for PigeonholeRunner {
                 _ => "",
             },
             if s.riders { " riders" } else { "" },
+            if s.reader_processes > 0 {
+                format!(" readers={}", s.reader_processes)
+            } else {
+                String::new()
+            },
             if s.async_in_flight > 0 {
                 format!(" async={}", s.async_in_flight)
             } else {
