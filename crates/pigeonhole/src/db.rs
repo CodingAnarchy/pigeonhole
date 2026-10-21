@@ -1,5 +1,5 @@
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use arc_swap::ArcSwap;
@@ -24,11 +24,13 @@ use crate::{
 #[derive(Debug)]
 pub(crate) struct Db {
     engine: ArcSwap<Engine>,
-    /// Opens of the engine behind this handle: 1 at open, +1 per swap.
+    /// Opens of the engine behind this handle: 1 at open, +1 per swap, with [`CLOSED`] set
+    /// once the database was closed through any handle. One word, so a scan step checks
+    /// both with one load ([`Db::check_generation`]): #827's per-row `Closed` check and
+    /// D265's generation check together cost what either does alone.
     generation: AtomicU64,
     /// The I/O backend the engine runs on (for [`Pigeonhole::io_rings`]).
     vfs: VfsRef,
-    closed: AtomicBool,
     /// Largest value accepted at commit (decision D16), for error messages; 0 for readers.
     pub(crate) max_value: usize,
 }
@@ -129,13 +131,15 @@ impl Cached {
     }
 }
 
+/// The bit of [`Db::generation`] that says the database was closed (`Pigeonhole::close`).
+const CLOSED: u64 = 1 << 63;
+
 impl Db {
     fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize) -> Arc<Self> {
         Arc::new(Self {
             engine: ArcSwap::from(engine),
             generation: AtomicU64::new(1),
             vfs,
-            closed: AtomicBool::new(false),
             max_value,
         })
     }
@@ -150,16 +154,20 @@ impl Db {
     /// The generation the current engine was opened in (see [`Db::swap_engine`]).
     #[inline]
     pub(crate) fn generation(&self) -> u64 {
-        self.generation.load(Ordering::Acquire)
+        self.generation.load(Ordering::Acquire) & !CLOSED
     }
 
-    /// Fails with `SnapshotExpired` unless `generation` is the current one: a snapshot, a
-    /// transaction or an iterator from an earlier engine must not read through its old view
-    /// (the reopen freed the extents it names: D148's reasoning, D265).
+    /// Fails unless `generation` is the current one and the database is open: with
+    /// `SnapshotExpired` when a snapshot, a transaction or an iterator from an earlier
+    /// engine would read through its old view (the reopen freed the extents it names:
+    /// D148's reasoning, D265), with `Closed` after `close()` (#826). One load.
     #[inline]
     pub(crate) fn check_generation(&self, generation: u64) -> Result<()> {
-        if self.generation() == generation {
+        let current = self.generation.load(Ordering::Acquire);
+        if current == generation {
             Ok(())
+        } else if current & CLOSED != 0 {
+            Err(pigeonhole_engine::Error::Closed.into())
         } else {
             Err(pigeonhole_engine::Error::SnapshotExpired.into())
         }
@@ -187,7 +195,7 @@ impl Db {
     /// Fails with `Closed` once the database was closed through any handle.
     #[inline]
     pub(crate) fn check_open(&self) -> Result<()> {
-        if self.closed.load(Ordering::Acquire) {
+        if self.generation.load(Ordering::Acquire) & CLOSED != 0 {
             Err(pigeonhole_engine::Error::Closed.into())
         } else {
             Ok(())
@@ -767,7 +775,7 @@ impl Pigeonhole {
     /// Every handle derived from this database (tables, batches) fails with
     /// [`ErrorCode::Closed`](crate::ErrorCode::Closed) afterwards.
     pub fn close(self) -> Result<()> {
-        self.db.closed.store(true, Ordering::Release);
+        self.db.generation.fetch_or(CLOSED, Ordering::Release);
         Ok(self.engine().close()?)
     }
 }

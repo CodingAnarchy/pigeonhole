@@ -417,13 +417,8 @@ impl futures_core::Stream for RowStream<'_> {
             }
         };
         // As `RowIter`: nothing is read after `close` (#826), nor after a recovery onto a
-        // newer engine (D265).
-        if let Err(e) = this
-            .table
-            .db
-            .check_open()
-            .and_then(|()| this.table.db.check_generation(this.generation))
-        {
+        // newer engine (D265); one check, one load.
+        if let Err(e) = this.table.db.check_generation(this.generation) {
             this.done = true;
             return Poll::Ready(Some(Err(e)));
         }

@@ -603,12 +603,12 @@ impl RowIter<'_> {
         }
         // After `close` the engine's files may already belong to a new writer, which can
         // reuse the pages this cursor would read next (#826): fail with `Closed`, as every
-        // handle does; after a recovery onto a newer engine, `SnapshotExpired` (D265).
+        // handle does; after a recovery onto a newer engine, `SnapshotExpired` (D265). One
+        // check, one load: the closed flag lives in the generation word.
         let r = self
             .table
             .db
-            .check_open()
-            .and_then(|()| self.table.db.check_generation(self.generation))
+            .check_generation(self.generation)
             .and_then(|()| self.fill_inner());
         if !matches!(r, Ok(true)) {
             self.done = true;
