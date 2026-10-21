@@ -52,12 +52,12 @@ mod watermark_waiters;
 mod write;
 
 pub use admission::Admit;
-#[doc(hidden)]
-pub use engine::Handover;
 pub use check::{
     CheckCounts, CheckOptions, CheckReport, Extent, ExtentKind, Finding, Severity, Structure,
     WalFile,
 };
+#[doc(hidden)]
+pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{
     CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard, FamilyInfo, FamilyStorage,

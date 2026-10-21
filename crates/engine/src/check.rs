@@ -236,8 +236,9 @@ pub struct CheckReport {
     pub counts: CheckCounts,
     /// The main file's length.
     pub file_bytes: u64,
-    /// Whether the last writer closed cleanly (from the superblock in use; `false` if no
-    /// slot is valid).
+    /// The newest valid root's clean flag (`false` if no slot is valid). It means no root
+    /// commit since a clean close, not that nothing was logged since: a clean reopen commits
+    /// no root, so a session that then crashed before its first flush leaves it set.
     pub clean_shutdown: bool,
 }
 
@@ -361,8 +362,14 @@ impl Checker {
                 // commit.
                 continue;
             }
-            // The newest valid root closed cleanly, so both slots were written in full. Else a
-            // crash during a root commit can tear the slot it was writing.
+            // Under 512-byte sector atomicity no crash damages a slot: the 128-byte superblock
+            // sits in one sector, so a tear leaves the old or the new one. Without it, a crash
+            // during a root commit can tear the slot being written, which the newest root's
+            // clean flag does not rule out: it means no root commit since a clean close, and a
+            // clean reopen commits none, so a session after one can crash in its first root
+            // commit while the clean root is still the newest. The rule assumes sector
+            // atomicity there (ICR 0048): with a clean newest root (or none valid) it's damage,
+            // otherwise a warning.
             let severity = if clean || newest.is_none() {
                 Severity::Corruption
             } else {
@@ -745,15 +752,10 @@ impl Checker {
                 }
             }
         }
-        let clean = self.report.clean_shutdown;
         for (id, b) in catalog.blob_files.iter() {
             let n = refs.get(id).copied().unwrap_or(0);
             if n != b.live_bytes {
-                let why = if clean {
-                    ""
-                } else {
-                    " (a crash before a large value's commit settled leaves this too)"
-                };
+                let why = " (a crash before a large value's commit settled leaves this too)";
                 self.find(
                     Structure::Blob,
                     Severity::Warning,
@@ -935,7 +937,6 @@ impl Checker {
                 file,
                 stream,
                 db_id,
-                clean: self.report.clean_shutdown,
                 findings: Vec::new(),
             };
             scan.run(checkpoint, &mut w)?;
@@ -952,8 +953,6 @@ struct WalScan {
     file: FileRef,
     stream: StreamId,
     db_id: [u8; 16],
-    /// The last writer closed cleanly: everything it logged was synced, so a gap is damage.
-    clean: bool,
     findings: Vec<Finding>,
 }
 
@@ -1142,12 +1141,15 @@ impl WalScan {
     }
 
     /// A segment's data stopped at `stop`: a clean end (unused space or an older epoch), a
-    /// torn tail, or a gap with valid fragments of this epoch after it. A gap is damage only
-    /// after a clean shutdown: a power loss tears the last unsynced write at sector
-    /// granularity, and the sectors that survive need not be a prefix, so a crash leaves the
-    /// same picture (FORMAT §10.1: only a segment with a successor is known to be synced in
-    /// full, and that case is the `prev_end` check). `resolved`: a recovery already chained
-    /// a new segment at `stop`.
+    /// torn tail, or a gap with valid fragments of this epoch after it. A gap is never proof
+    /// of damage: a power loss tears the last unsynced write at sector granularity, and the
+    /// sectors that survive need not be a prefix, so a crash leaves the same picture, and the
+    /// WAL does not record what was synced. Nor does the root's clean flag: it means no root
+    /// commit since a clean close, and a clean reopen commits none, so a crashed session
+    /// after one leaves it set (perf287's re-review of #793). Damage inside the WAL is
+    /// provable only where a successor exists (FORMAT §10.1: a full segment is synced before
+    /// its successor's header), which is the `prev_end` check. `resolved`: a recovery already
+    /// chained a new segment at `stop` and dropped what follows.
     fn classify_stop(
         &mut self,
         base: u64,
@@ -1184,11 +1186,6 @@ impl WalScan {
                 (
                     Severity::Info,
                     "a recovery already continued the log at the stop and dropped them",
-                )
-            } else if self.clean {
-                (
-                    Severity::Corruption,
-                    "the last writer closed cleanly, so they were synced: replay would drop them",
                 )
             } else {
                 (

@@ -561,3 +561,76 @@ fn unrecorded_blob_references_are_a_warning() {
         r.findings
     );
 }
+
+/// perf287's re-review of #793: a torn power loss in a session after a clean close. A clean
+/// reopen commits no root ("the clean flag stays set until the next commit"), so the newest
+/// root still says clean while the session's WAL tail is torn; that is never corruption (8
+/// of 600 seeds reported it while the gap rule trusted the clean flag).
+#[test]
+fn a_crash_after_a_clean_reopen_never_looks_like_corruption() {
+    for seed in 0..200u64 {
+        let mut plan = pigeonhole_io::sim::FaultPlan::none();
+        plan.torn_writes = true;
+        let vfs = SimVfs::with_faults(3000 + seed, plan);
+        // Session 1: create, write, close cleanly (the WAL files go).
+        let db = Engine::open(Path::new(DB), options(&vfs)).unwrap();
+        let t = db
+            .create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        for i in 0..20u32 {
+            let mut wb = WriteBatch::new();
+            let row = format!("a{i}");
+            wb.put(
+                t.id,
+                t.families[0].id,
+                row.as_bytes(),
+                b"q",
+                None,
+                ValueRef::Bytes(b"v"),
+            )
+            .unwrap();
+            db.commit(wb, Some(Durability::Sync)).unwrap();
+        }
+        db.close().unwrap();
+        drop(db);
+        // Session 2: the reopen commits no root; WAL-only commits (no flush), then a power loss.
+        let db = Engine::open(Path::new(DB), options(&vfs)).unwrap();
+        let t = db.table("t").unwrap();
+        for i in 0..(500 + (seed as u32 * 37) % 2000) {
+            let mut wb = WriteBatch::new();
+            let row = format!("b{i}");
+            wb.put(
+                t.id,
+                t.families[0].id,
+                row.as_bytes(),
+                b"q",
+                None,
+                ValueRef::Bytes(&[b'x'; 120]),
+            )
+            .unwrap();
+            let d = match (u64::from(i) + seed) % 3 {
+                0 => Durability::None,
+                1 => Durability::Buffered,
+                _ => Durability::Sync,
+            };
+            db.commit(wb, Some(d)).unwrap();
+        }
+        vfs.crash(CrashKind::Power);
+        drop(db);
+        let r = check(&vfs, false);
+        assert!(
+            r.clean_shutdown,
+            "seed {seed}: the state this test is about"
+        );
+        let bad: Vec<_> = r
+            .findings
+            .iter()
+            .filter(|f| f.severity == Severity::Corruption)
+            .collect();
+        assert!(bad.is_empty(), "seed {seed}: {bad:#?}");
+        Engine::open(Path::new(DB), options(&vfs))
+            .unwrap()
+            .close()
+            .unwrap();
+    }
+}

@@ -245,7 +245,9 @@ pub struct CheckReport {
     pub counts: CheckCounts,
     /// The main file's length.
     pub file_bytes: u64,
-    /// Whether the last writer closed cleanly.
+    /// The newest root's clean flag: no root commit since a clean close. A database
+    /// reopened after a clean close and then crashed before its first flush still has it set,
+    /// so it says nothing about the WAL.
     pub clean_shutdown: bool,
 }
 
