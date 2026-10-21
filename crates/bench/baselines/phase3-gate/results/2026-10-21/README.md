@@ -10,7 +10,7 @@ It ran `run-window.sh` at full scale on 3ee90c21, in a fresh data directory, wit
   - the test-hook registries (#789, #790) and the writer-lock handover (D265, #788);
   - flushed shares indexed by slot (#777, #778).
 - **Every step finished**, with none failed, timed out or skipped, in 321 minutes (`durations.tsv`).
-- **The owner's verdict is pending.** The verdicts below are the summary's.
+- **The owner reviewed the gate on 2026-10-21** and filed #816 for application-owned mode (below). The verdicts below are the summary's.
 - **Start here:** `summary.md`.
 
 ## Every step started on a trimmed drive (D258)
@@ -66,10 +66,10 @@ cross-shard-contention in `all`: Pigeonhole's throughput and overall p99 / p99.9
 | share waits | — | 3.64M, 59.4 s in total |
 | write stalls | 1850 (6.1 s) | 3 (73 ms) |
 
-Five of every six rounds are refused for an overlap with a pending share, and the share waits sum to about 59 s. The default durability row shows the same pattern: 120K commits/s and p99 48 ms against gate 20's 393K and 4.0 ms, with 9.17M of 10.35M rounds refused (gate 20: 48K of 3.96M). It is not root-caused yet. The likely cause: under D263 a pending share now covers the window from the decision until the share is applied everywhere, and with application-owned shards driven inline, a refused round's retry meets the same pending share again. This needs an issue (the summary flags it).
+Five of every six rounds are refused for an overlap with a pending share, and the share waits sum to about 59 s. The default durability row shows the same pattern: 120K commits/s and p99 48 ms against gate 20's 393K and 4.0 ms, with 9.17M of 10.35M rounds refused (gate 20: 48K of 3.96M). It was not root-caused at the time of the gate. The likely cause: under D263 a pending share now covers the window from the decision until the share is applied everywhere, and with application-owned shards driven inline, a refused round's retry meets the same pending share again. Tracked in #816.
 
 ## Other changes against gate 20
-- **Ordered scan from cache, 6.75 → 4.26 GB/s:** a sizing effect in the harness, not a slower scan. `coldscan warm` sizes the block cache at 1.25× the file plus 64 MiB. The file was smaller this time (cache 3904 MiB against 4624 MiB), so the decoded blocks no longer fit: 243,738 misses against 30,272 hits, where gate 20 had 0 misses. It still passes the 1 GB/s target. Sizing the cache from the table's decoded size would keep this row measuring the cache.
+- **Ordered scan from cache, 6.75 → 4.26 GB/s:** a sizing effect in the harness, not a slower scan. `coldscan warm` sizes the block cache at 1.25× the file plus 64 MiB. The file was smaller this time (cache 3904 MiB against 4624 MiB), so the decoded blocks no longer fit: 243,738 misses against 30,272 hits, where gate 20 had 0 misses. It still passes the 1 GB/s target. #817 sizes the cache from the decoded bytes instead, so the row measures the cache again.
 - **ycsb-a through the async API at 16 in flight, buffered:** 297K ops/s, 0.25× the synchronous run (gate 20: 473K, 0.41×; gate 19: 0.06×). It has no cross-shard commits, and its write stalls doubled (6,750 → 13,207). This row has swung on every gate (#749).
 - **Contended cross-shard at buffered:** 475K → 537K ops/s, RocksDB 1.34× → 1.19×, with its p99 ratio about level (2.95× → 3.02×).
 
