@@ -1,2 +1,2 @@
 ### Fixed
-- A flush on a store running many cross-shard commits no longer holds its shard for 17-21 ms while it reports the flushed shares to their coordinators: the shares are indexed by the slots they write, and a shard reports at most 1024 per batch (#777).
+- A flush on a store running many cross-shard commits no longer scans every unreported share on its shard thread to find the flushed ones (17-21 ms with ~100K): the shares are indexed by the slots they write, so a report touches only the shares it reports (#777).

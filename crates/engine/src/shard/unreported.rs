@@ -43,8 +43,6 @@ pub(super) struct Unreported {
     /// Shares per slot, with what the last report saw.
     slots: HashMap<Slot, UnreportedSlot>,
     len: usize,
-    /// The last report stopped at its budget: the next one runs even if no slot moved.
-    more: bool,
 }
 
 impl Unreported {
@@ -79,9 +77,8 @@ impl Unreported {
     }
 
     /// Whether a report has anything to do: a listed slot's flushed-through seqno (`current`,
-    /// `None` once its tablet is gone) differs from what the last report saw, a share writes
-    /// no slot (it is due at once), or the last report stopped at its budget. Records what it
-    /// sees.
+    /// `None` once its tablet is gone) differs from what the last report saw, or a share
+    /// writes no slot (it is due at once). Records what it sees.
     pub(super) fn due(&mut self, current: impl Fn(&Slot) -> Option<Seqno>) -> bool {
         let mut moved = false;
         for (key, slot) in self.slots.iter_mut() {
@@ -91,22 +88,18 @@ impl Unreported {
                 moved = true;
             }
         }
-        moved || self.more || self.groups.contains_key(&[][..])
+        moved || self.groups.contains_key(&[][..])
     }
 
-    /// Takes up to `budget` shares whose every slot is flushed through the seqno the share
-    /// applied at (`current` as for [`due`](Self::due); a gone tablet's slot counts as
-    /// flushed), group by group in flush order, handing each to `report(id, coordinator)`.
-    /// Returns whether it stopped at the budget with such a share left.
+    /// Takes every share whose every slot is flushed through the seqno the share applied at
+    /// (`current` as for [`due`](Self::due); a gone tablet's slot counts as flushed), group
+    /// by group in flush order, handing each to `report(id, coordinator)`.
     pub(super) fn take_flushed(
         &mut self,
-        budget: usize,
         current: impl Fn(&Slot) -> Option<Seqno>,
         mut report: impl FnMut(Seqno, ShardId),
-    ) -> bool {
-        let mut taken = 0;
+    ) {
         let mut emptied = Vec::new();
-        self.more = false;
         for (key, shares) in self.groups.iter_mut() {
             let through = key
                 .iter()
@@ -118,13 +111,8 @@ impl Unreported {
                 if entry.key().0 > through {
                     break;
                 }
-                if taken == budget {
-                    self.more = true;
-                    break;
-                }
                 let ((_, seqno), coordinator) = entry.remove_entry();
                 report(seqno, coordinator);
-                taken += 1;
                 k += 1;
             }
             if k > 0 {
@@ -140,14 +128,10 @@ impl Unreported {
                     emptied.push(key.clone());
                 }
             }
-            if self.more {
-                break;
-            }
         }
         for key in emptied {
             self.groups.remove(&key);
         }
-        self.more
     }
 
     /// The slots of every share whose commit id is at most `through`.
@@ -261,18 +245,14 @@ mod tests {
                 .map(|(id, _, c, _)| (*id, *c))
                 .collect();
             want.sort_unstable();
-            // In budgets of 1..=7 until done.
-            let budget = 1 + round % 7;
             let mut got = Vec::new();
-            while u.take_flushed(budget, current, |id, c| got.push((id, c))) {
-                u.debug_check();
-            }
+            u.take_flushed(current, |id, c| got.push((id, c)));
             u.debug_check();
             got.sort_unstable();
             assert_eq!(got, want, "round {round}");
             assert_eq!(u.len(), flat.len() - want.len());
             // Nothing more is taken without a move.
-            assert!(!u.take_flushed(usize::MAX, current, |_, _| panic!("taken twice")));
+            u.take_flushed(current, |_, _| panic!("taken twice"));
         }
     }
 

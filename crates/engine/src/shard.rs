@@ -126,13 +126,6 @@ fn moved_gives_up(waited: u64, timeout: u64) -> bool {
 /// p99 by 40%, and 64 cut it to 0.65-0.8 ms for 5% (2026-10-20, #764).
 const CHECKPOINT_POP_BUDGET: usize = 64;
 
-/// Shares `report_shares_flushed` reports per batch while the shard is open (#777). A flush
-/// install can find ~60K shares flushed at once; reporting them all in one turn held it for
-/// 17-21 ms on the AX102's 16-shard cross-shard rows, and every PREPARE and commit queued
-/// behind it. The rest follows on the next batches, one budget each; a closing shard
-/// reports everything.
-const SHARE_REPORT_BUDGET: usize = 1024;
-
 /// Handler work left for the next batch (#763): a handler that stops at its budget sets its
 /// bit, `end_batch` sends one `Kick` for all of them, and the kick's batch runs each set bit's
 /// work after the batches in between ran their groups. One kick in the queue at a time.
@@ -147,8 +140,6 @@ struct Continuations {
 impl Continuations {
     /// `advance_checkpoint` stopped at `CHECKPOINT_POP_BUDGET` with more to pop.
     const CHECKPOINT: u8 = 1;
-    /// `report_shares_flushed` stopped at `SHARE_REPORT_BUDGET` with more to report.
-    const REPORT: u8 = 2;
 
     fn set(&mut self, bit: u8) {
         self.due |= bit;
@@ -7240,10 +7231,16 @@ impl ShardState {
     }
 
     /// Tells coordinators about applied shares whose slots are all in SSTs now: one
-    /// `SharesFlushed` per coordinator (D254), at most [`SHARE_REPORT_BUDGET`] shares per
-    /// batch while the shard is open (the rest on the following batches, #777). A flush
-    /// install can find 100K shares flushed, and a message per share cost the install about
-    /// 20 ms and its coordinators as many handler runs (#716).
+    /// `SharesFlushed` per coordinator (D254). A flush install can find 100K shares flushed,
+    /// and a message per share cost the install about 20 ms and its coordinators as many
+    /// handler runs (#716).
+    ///
+    /// All of them in one turn, not in budgets over the following batches (#777): reporting
+    /// costs about 110 ns a share, so a flush's ~60K hold the turn for about 6 ms, but on the
+    /// AX102's contended cross-shard gate row a 1024-share budget (about 78 slices of 115 µs
+    /// per flush) raised the p99 from 110 to 131 µs and the p99.9 from 200 to 524 µs, and a
+    /// 128-share budget the p99 as much and the p99.9 to 260 µs; one report per flush left
+    /// both where they were (2026-10-21).
     fn report_shares_flushed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         let Ok(view) = self.checkpoint_view() else {
             return;
@@ -7256,8 +7253,7 @@ impl ShardState {
             None => Some(self.flushed.get(s).copied().unwrap_or(0)),
         };
         // Nothing to report unless a listed slot's flushed-through seqno moved since the
-        // last report (`UnreportedSlot`), or the last one stopped at its budget; the settles
-        // found by other callers still go out.
+        // last report (`UnreportedSlot`); the settles found by other callers still go out.
         if !self.unreported.due(current) {
             trace!(
                 "shard {} report skipped: unreported {}",
@@ -7271,22 +7267,10 @@ impl ShardState {
             "shard {} report shares: flushed={:?} unreported={:?}",
             self.id.0, self.flushed, self.unreported
         );
-        let budget = if self.closing {
-            usize::MAX
-        } else {
-            SHARE_REPORT_BUDGET
-        };
         let mut done: Vec<(Seqno, ShardId)> = Vec::new();
-        if self
-            .unreported
-            .take_flushed(budget, current, |seqno, coordinator| {
-                done.push((seqno, coordinator))
-            })
-        {
-            // A flush can find ~60K shares flushed; reporting them all held its turn for
-            // ~20 ms on the AX102's cross-shard rows (#777). The next batches continue.
-            self.continuations.set(Continuations::REPORT);
-        }
+        self.unreported.take_flushed(current, |seqno, coordinator| {
+            done.push((seqno, coordinator))
+        });
         // Ordered, so the sends keep a seed replay's message order.
         let mut out: BTreeMap<ShardId, Vec<Seqno>> = BTreeMap::new();
         for (seqno, coordinator) in done {
@@ -8644,11 +8628,7 @@ impl ShardState {
             }
             ShardMsg::Kick => {
                 let due = self.continuations.take_on_kick();
-                if due & Continuations::REPORT != 0 {
-                    self.report_shares_flushed(ctx);
-                }
-                if due != 0 {
-                    // A report can settle our own shares: the checkpoint may move too.
+                if due & Continuations::CHECKPOINT != 0 {
                     self.advance_checkpoint(ctx);
                 }
             }

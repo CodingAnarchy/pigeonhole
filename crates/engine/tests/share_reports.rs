@@ -4,8 +4,9 @@
 //! flush install took ~20 ms on the shard thread). The reports still settle every commit,
 //! and a power loss after them keeps every write.
 //!
-//! A flush that finds more shares than a batch reports (`SHARE_REPORT_BUDGET`, 1024) reports
-//! the rest on the following batches (#777): the last test fails if that continuation is lost.
+//! The participant finds its flushed shares through an index by slot, not a scan (#777), and
+//! reports all of them on the flush: the last test runs without tablet changes, so no later
+//! manifest commit asks it to report again.
 //!
 //! Application-owned with every shard driven by the test, so each run is deterministic.
 
@@ -72,15 +73,12 @@ fn a_flush_reports_its_shares_in_one_message_per_coordinator() {
     flush_reports(254, 600, 6, true);
 }
 
-/// More shares than one batch reports: the participant reports 1024 per batch and the rest
-/// on the following batches (#777), and every commit still settles. Without tablet changes
-/// no manifest commit asks a shard to report again (`Maintain` reports only with them on),
-/// so only the continuation reports the rest: without it the checkpoints stop short.
+/// Thousands of shares, all reported on the flush that put them in SSTs (#777). Without
+/// tablet changes no manifest commit asks a shard to report again (`Maintain` reports only
+/// with them on), so a report that left shares behind would leave the checkpoints short.
 #[test]
-fn a_flush_beyond_the_report_budget_reports_every_share() {
-    // Shard 2 reports its 2100 shares in three batches, to both coordinators (6 messages);
-    // the coordinators settle theirs in a few batches each.
-    flush_reports(777, 2100, 16, false);
+fn a_flush_reports_thousands_of_shares_at_once() {
+    flush_reports(777, 2100, 6, false);
 }
 
 /// `commits` cross-shard commits over two coordinators and one participant, one flush of
