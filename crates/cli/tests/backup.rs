@@ -109,7 +109,7 @@ fn a_backup_holds_the_same_cells_and_checks_clean() {
 }
 
 #[test]
-fn backup_refusals() {
+fn backup_refusals_and_a_live_writer() {
     let dir = TempDir::new("backup-refusals");
     let src = sample(&dir);
     let taken = dir.path().join("taken.phdb");
@@ -123,12 +123,13 @@ fn backup_refusals() {
     let (status, _, _) = json(&["backup", missing.to_str().unwrap(), dest.to_str().unwrap()]);
     assert_eq!(status, 5);
 
+    // With the writer running, the backup comes from a reader process (ICR 0049).
     let db = Pigeonhole::open(&src, options()).unwrap();
-    let (status, _, err) = json(&["backup", src.to_str().unwrap(), dest.to_str().unwrap()]);
-    assert_eq!(status, 4, "{err}");
-    assert!(err.contains("WriterLocked"), "{err}");
-    assert!(!dest.exists());
+    let (status, doc, err) = json(&["backup", src.to_str().unwrap(), dest.to_str().unwrap()]);
+    assert_eq!(status, 0, "{err}");
+    assert_eq!(doc["mode"], "reader");
     db.close().unwrap();
+    assert_eq!(cells(&src), cells(&dest));
 }
 
 #[test]

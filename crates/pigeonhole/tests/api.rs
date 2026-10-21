@@ -1646,6 +1646,44 @@ fn reader_handles_see_the_writers_commits() {
     db.close().unwrap();
 }
 
+/// ICR 0049: a reader process backs up while the writer runs; the copy holds what the
+/// reader's snapshot saw, and opens as a database of its own.
+#[test]
+fn a_reader_backs_up_while_the_writer_runs() {
+    let vfs = SimVfs::new(49);
+    let db = Pigeonhole::open("/db/r.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    for i in 0..50u32 {
+        t.mutate(format!("r{i:02}").as_bytes())
+            .put("a", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let reader = Pigeonhole::open_reader(
+        "/db/r.phdb",
+        pigeonhole::ReaderOptions::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .block_cache(1 << 20),
+    )
+    .unwrap();
+    reader.backup_durable("/db/copy.phdb").unwrap();
+    assert_eq!(
+        reader.backup("/db/copy.phdb").unwrap_err().code(),
+        ErrorCode::Io,
+        "dest must not exist"
+    );
+    t.mutate(b"later").put("a", b"q", b"v").commit().unwrap();
+    drop(reader);
+    drop(t);
+    db.close().unwrap();
+    let copy = Pigeonhole::open("/db/copy.phdb", sim_options(&vfs)).unwrap();
+    let ct = copy.table("t").unwrap().open().unwrap();
+    assert_eq!(ct.scan_prefix(b"r").iter().unwrap().count(), 50);
+    assert!(ct.get(b"later", "a", b"q").unwrap().is_none());
+    drop(ct);
+    copy.close().unwrap();
+}
+
 // ---- review fixes ----
 
 #[test]
