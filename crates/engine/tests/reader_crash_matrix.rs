@@ -179,16 +179,32 @@ fn run(seed: u64) {
                 };
                 next_pid += 1;
                 vfs.enter_process(process);
-                match Engine::open_reader(Path::new(DB), options(&vfs)) {
+                let mut opened = Engine::open_reader(Path::new(DB), options(&vfs));
+                if matches!(opened, Err(Error::NoReaderSlot)) {
+                    // Killed readers hold their slots until the writer's next reclamation (a
+                    // flush, a compaction or a room stall past the interval): with every slot
+                    // held, a new reader is refused at once, as documented. The slots must
+                    // come back: past the interval, a flush frees the dead readers' slots
+                    // (at most 4 readers live, of 8 slots), and the retry attaches.
+                    no_slot += 1;
+                    vfs.advance(PAST_INTERVAL);
+                    vfs.enter_process(writer);
+                    commit(&db, &t, committed).unwrap_or_else(|e| panic!("{at}: commit: {e:?}"));
+                    committed += 1;
+                    db.flush().unwrap_or_else(|e| panic!("{at}: flush: {e:?}"));
+                    vfs.enter_process(process);
+                    opened = Engine::open_reader(Path::new(DB), options(&vfs));
+                    assert!(
+                        !matches!(opened, Err(Error::NoReaderSlot)),
+                        "{at}: killed readers' slots were not reclaimed after a flush"
+                    );
+                }
+                match opened {
                     Ok(db) => readers.push(Reader {
                         process,
                         db,
                         held: None,
                     }),
-                    // Killed readers hold their slots until the writer's next reclamation (a
-                    // flush, a compaction or a room stall past the interval): with every slot
-                    // held, a new reader is refused at once, as documented.
-                    Err(Error::NoReaderSlot) => no_slot += 1,
                     Err(e) => expired += typed(&e, &format!("{at}: open_reader")),
                 }
             }
