@@ -432,6 +432,13 @@ impl RowMutation<'_> {
         })
     }
 
+    /// Puts a typed `f64` at an explicit timestamp (ICR 0051).
+    pub fn put_f64_at(self, family: &str, qualifier: &[u8], ts: u64, value: f64) -> Self {
+        self.op(family, qualifier, 8, |b, t, f, row| {
+            b.put(t, f, row, qualifier, Some(ts), ValueRef::F64(value))
+        })
+    }
+
     /// Atomically adds `delta` (wrapping) to the counter in a counter family
     /// ([`Family::counter`](crate::Family::counter)) without reading it. Increments of one
     /// counter combine into one cell. Within one mutation (or batch) the writes of a counter
@@ -737,6 +744,21 @@ impl WriteBatch {
     ) -> &mut Self {
         self.op(table, row, family, qualifier, 8, |b, t, f| {
             b.put(t, f, row, qualifier, None, ValueRef::F64(value))
+        })
+    }
+
+    /// Puts a typed `f64` at an explicit timestamp (ICR 0051).
+    pub fn put_f64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: f64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, Some(ts), ValueRef::F64(value))
         })
     }
 

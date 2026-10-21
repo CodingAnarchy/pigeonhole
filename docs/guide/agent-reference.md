@@ -168,6 +168,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `put(family, qualifier: &[u8], value: &[u8])` | Bytes at commit timestamp. |
 | `put_at(family, qualifier, ts: u64, value)` | Bytes at explicit timestamp (µs). |
 | `put_i64(family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. In a counter family `put_i64` sets the counter. |
+| `put_f64_at(family, qualifier, ts, f64)` | Typed `f64` at an explicit timestamp (ICR 0051). |
 | `put_i64_at(family, qualifier, ts, i64)` | Typed `i64` at `ts` (a counter family's bucket). |
 | `incr(family, qualifier, delta: i64)` | Blind atomic wrapping `i64` add; counter families only. |
 | `incr_at(family, qualifier, ts: u64, delta: i64)` | Add to the bucket at `ts`; counter families only. |
@@ -189,6 +190,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `put_at(&Table, row, family, qualifier, ts, value)` | |
 | `put_i64(&Table, row, family, qualifier, i64)` / `put_f64(.., f64)` | Typed values. |
 | `put_i64_at(&Table, row, family, qualifier, ts, i64)` | |
+| `put_f64_at(&Table, row, family, qualifier, ts, f64)` | ICR 0051. |
 | `incr(&Table, row, family, qualifier, delta)` | Counter families only. |
 | `incr_at(&Table, row, family, qualifier, ts, delta)` | Counter families only. |
 | `merge(&Table, row, family, qualifier, operand)` | Untyped operand (for custom operators). |
