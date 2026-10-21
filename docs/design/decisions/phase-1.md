@@ -858,7 +858,7 @@ Proposed decision: amend D124 and D126 so that `flush` and `compact` wait for ar
 
 **Coordinator:** confirmed; this amends D124 and D126: `flush` and `compact` wait for arena room as a stalled write does and end with `Busy` on the same terms, never `Ok` with data left unflushed.
 
-**Corrected (#724 area 3, owner 2026-10-21):** the idle case is now the same as a stalled write's. The callers also wait while a cross-shard share is undecided, or a group's sync is in flight, on this shard (`ShardState::nothing_in_flight`, which both waits use). The decision arrives as a message and may free room. The starved freeze used to refuse at once in that state, whereas a stalled write waited.
+**Corrected (#724 area 3, owner 2026-10-21):** the idle case is now the same as a stalled write's. The callers also wait while a cross-shard share is undecided, or a group's sync is in flight, on this shard (`ShardState::nothing_in_flight`, which both waits use). The decision arrives as a message and may free room. The starved freeze needs no flush-attempt backstop like a stalled write's: the share's decision always comes, by commit or abort, and an unsynced group leaves on its sync's completion, so the next batch either finds a chunk or refuses. The starved freeze used to refuse at once in that state, whereas a stalled write waited.
 
 <a id="d139"></a>
 ## D139 — Where do tablets go at open, now that owners are not persisted (D130) (approved; engine)

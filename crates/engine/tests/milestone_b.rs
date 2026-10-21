@@ -1951,10 +1951,11 @@ fn flush_and_compact_are_busy_after_the_stall_timeout_when_snapshots_hold_the_ar
 /// undecided cross-shard share is in flight: its decision arrives as a message, and the
 /// callers wait for it (the room wait always counted it; the starved freeze did not, and
 /// refused while the share was undecided). The starved arena is #116's below, on shard 1,
-/// which coordinates a commit with shard 0 and prepares its share before the `flush` caller's
-/// freeze finds the arena short; shard 0 is not driven until that caller has waited, so the
-/// share stays undecided meanwhile. The snapshots holding the arena go before shard 0 answers: a caller that waited
-/// then flushes, one refused early has its `Busy` already.
+/// which coordinates a commit with shard 0 and prepares its share before the `flush`
+/// caller's freeze finds the arena short; shard 0 is not driven until that caller has
+/// waited, so the share stays undecided meanwhile. The snapshots holding the arena go
+/// before shard 0 answers: a caller that waited then flushes, one refused early has its
+/// `Busy` already.
 #[test]
 fn a_starved_flush_on_a_frozen_clock_waits_for_an_undecided_share() {
     const TIMEOUT: u64 = 2_000_000;
