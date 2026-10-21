@@ -780,13 +780,8 @@ impl Engine {
             manifest::load(&opened, shards, Arc::clone(&registry))?;
         // With tablet changes on, owners are placed within the arenas' slot budgets below.
         catalog.reassign(shards);
-        let mut live = manifest_extents;
-        live.extend(catalog.data_extents());
-        let pager = Arc::new(opened.finish(live)?);
-        open_data_file(&vfs, path, &pager, options.direct_io, true)?;
-        if let Some((block, from)) = options.grow_ahead {
-            pager.set_grow_ahead(block, from)?;
-        }
+        // Refuse what will be refused before `finish`, which may upgrade the file's
+        // superblocks: a refused open must leave an older file as it was (#496).
         if catalog.has_unknown_merge && !options.allow_unregistered_merge {
             let name = catalog
                 .tables()
@@ -795,6 +790,13 @@ impl Engine {
                 .find(|n| !n.is_empty() && registry.get(n).is_none())
                 .unwrap_or_default();
             return Err(Error::UnknownMergeOperator(name));
+        }
+        let mut live = manifest_extents;
+        live.extend(catalog.data_extents());
+        let pager = Arc::new(opened.finish(live)?);
+        open_data_file(&vfs, path, &pager, options.direct_io, true)?;
+        if let Some((block, from)) = options.grow_ahead {
+            pager.set_grow_ahead(block, from)?;
         }
         // Opened only because unregistered operators are allowed: read-only (#43).
         let read_only = catalog.has_unknown_merge;

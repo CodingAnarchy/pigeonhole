@@ -344,14 +344,22 @@ impl FrameDecoder {
                 3 | 4 => self.partial_start.is_some(),
                 _ => false,
             };
-            if !sequenced
-                || le_u32(h, 4) != self.epoch
-                || end > FRAME_SIZE
-                || crate::checksum::crc32c_append(
+            let intact = le_u32(h, 4) == self.epoch
+                && end <= FRAME_SIZE
+                && crate::checksum::crc32c_append(
                     crate::checksum::crc32c(&h[4..]),
                     &frame[at + FRAGMENT_HEADER_LEN..end],
-                ) != le_u32(h, 0)
-            {
+                ) == le_u32(h, 0);
+            // A fragment of this segment's epoch whose CRC passes is real data, not a torn
+            // tail: a type this build does not know means a newer build wrote it (#496).
+            // Zeroed and recycled frames fail the epoch or the CRC and stay a stop.
+            if intact && !(1..=4).contains(&ty) {
+                return Err(Error::UnsupportedFeature {
+                    what: "wal fragment type",
+                    value: u64::from(ty),
+                });
+            }
+            if !sequenced || !intact {
                 self.stopped = true;
                 return Ok(Some(Decoded::Stop {
                     offset: self.record_end,

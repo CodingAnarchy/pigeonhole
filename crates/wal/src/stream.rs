@@ -73,11 +73,17 @@ impl Grid {
         let mut off = 0;
         while off + probe.len() as u64 <= len {
             file.read_at(&mut probe, off)?;
-            if let Ok(h) = SegmentHeader::decode(&probe)
-                && off.is_multiple_of(h.segment_size)
-            {
-                segment_size = Some(h.segment_size);
-                break;
+            match SegmentHeader::decode(&probe) {
+                Ok(h) if off.is_multiple_of(h.segment_size) => {
+                    segment_size = Some(h.segment_size);
+                    break;
+                }
+                // A newer build's segment (its CRC passed): refuse rather than find no
+                // segment and read the stream as empty (#496, the #774 hazard).
+                Err(e @ pigeonhole_format::Error::UnsupportedVersion { .. }) => {
+                    return Err(e.into());
+                }
+                _ => {}
             }
             off += FRAME;
         }
@@ -100,6 +106,12 @@ impl Grid {
                         return Err(corrupt("wal segment size"));
                     }
                     Some(h)
+                }
+                // A header whose checksum passed but whose version is newer was written by a
+                // newer build: refuse, never treat it as a blank or torn slot and skip its
+                // records (#496, the #774 hazard).
+                Err(e @ pigeonhole_format::Error::UnsupportedVersion { .. }) => {
+                    return Err(e.into());
                 }
                 Err(_) => None,
             });
