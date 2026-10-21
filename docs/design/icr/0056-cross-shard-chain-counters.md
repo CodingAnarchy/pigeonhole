@@ -1,6 +1,6 @@
 # 0056: cross-shard chain, wound and max-attempts counters
 
-**Status:** Proposed with D267 (#830). The coordinator assigned the number on 2026-10-21; the owner decides it with D267. Additive.
+**Status:** Approved (owner, via the coordinator, 2026-10-21; with D267, #830). Additive.
 
 ## Change
 

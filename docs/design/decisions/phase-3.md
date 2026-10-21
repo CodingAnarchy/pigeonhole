@@ -2186,16 +2186,11 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 **Cost:** for a family that keeps `max_versions`, the manifest's metadata never settles a last-level SST, so every `compact()` reads each one's properties through the open-SST cache, opening its reader the first time. On a quiet database that is the whole cost of a `compact()` with nothing to do (about 10 ms for a fresh 10-SST run on macOS, microseconds once open). If it shows up at thousands of SSTs, an in-memory set of SST ids known to be fully purged, kept per open, avoids the repeated reads without a format change.
 
 <a id="d267"></a>
-## D267 — A blind cross-shard PREPARE over an undecided share goes behind it instead of being refused; an older one wounds a younger undecided share (proposed; engine, #816; amends D263, D249)
+## D267 — A blind cross-shard PREPARE over an undecided share goes behind it instead of being refused; an older one wounds a younger undecided share (owner decision, 2026-10-21; engine, #816, ICR 0056; amends D263, D249)
 
-**Status: proposed.** The number is provisional. The owner decides on the box A/B, after perf287's re-review. The A/B rows:
-- app-owned at Buffered and at the default durability;
-- transfer (commits that read);
-- a single on a hot row;
-- the gate's contended and `all` cross-shard rows;
-- ycsb-a.
+**Status: accepted** (owner, 2026-10-21), on the box A/B below and perf287's protocol reviews (R1–R4, the reader-fence fix).
 
-**Proposed:**
+**Decided:**
 - **Chaining.** A PREPARE that only writes (no validated reads, no predicate) is admitted on a participant even where an undecided share writes or reads one of its rows. D263 refused it.
   - **What it waits for.** It is tracked behind every undecided share there that writes or reads a row it writes, and behind every single waiting on one of its rows, together with the shares that single waits for.
   - **When it answers.** Its `Prepared` is sent only once those shares are decided at that participant and those singles are logged.
