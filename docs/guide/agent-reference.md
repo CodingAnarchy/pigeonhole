@@ -224,7 +224,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | terminal | `read(self) -> Result<Option<RowRef<'t>>>` | `iter(self) -> Result<RowIter<'t>>` |
 
 `ValueFilter`: `Equals(Vec<u8>)`, `Prefix(Vec<u8>)`, `I64(std::cmp::Ordering, i64)`.
-`RowIter`: `Iterator<Item = Result<Row>>`; `next_ref(&mut self) -> Result<Option<RowRef<'_>>>` (zero-copy, valid until next call).
+`RowIter`: `Iterator<Item = Result<Row>>`; `next_ref(&mut self) -> Result<Option<RowRef<'_>>>` (zero-copy, valid until next call). After `close` (any handle) the next step is `Closed`, then the end; also `RowStream` and owned scans (#826).
 Pushdown (D22): qualifier and time filters in the block decoder; versions, column limits, value filters in resolution on snapshot-visible data. Deletes and merge operands always pass the decoder filters. Details: [`scans-and-filters.md`](scans-and-filters.md).
 
 ## Results

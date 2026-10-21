@@ -1668,6 +1668,63 @@ fn an_owned_scan_outlives_its_table_handle() {
     db.close().unwrap();
 }
 
+/// #826: an iterator held past `close` fails with `Closed` instead of reading on. A new
+/// writer on the same file may reuse the pages the old cursor would read next (simp724's
+/// repro read 1,100 more cells, then `Corruption`): borrowed and owned iterators, through
+/// `next` and `next_ref`, whether or not they had started.
+#[test]
+fn iterators_fail_with_closed_after_close() {
+    let vfs = SimVfs::new(826);
+    let db = Pigeonhole::open("/db/closed.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    for i in 0..200u32 {
+        t.mutate(format!("r{i:03}").as_bytes())
+            .put("a", b"q", &[7u8; 200])
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    let mut started = t.scan_prefix(b"").iter().unwrap();
+    assert!(started.next_ref().unwrap().is_some());
+    let mut owned = t.scan_prefix(b"").into_owned().iter().unwrap();
+    assert!(owned.next().unwrap().is_ok());
+    let fresh = t.scan_prefix(b"").into_owned().iter().unwrap();
+    db.close().unwrap();
+
+    let e = started.next_ref().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Closed);
+    assert!(
+        started.next_ref().unwrap().is_none(),
+        "finished after the error"
+    );
+
+    // A new writer on the same file frees and rewrites what the old cursor would read.
+    let db = Pigeonhole::open("/db/closed.phdb", sim_options(&vfs)).unwrap();
+    let t2 = table(&db);
+    for i in 0..200u32 {
+        t2.mutate(format!("r{i:03}").as_bytes())
+            .delete_row()
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    for i in 0..200u32 {
+        t2.mutate(format!("s{i:03}").as_bytes())
+            .put("a", b"q", &[9u8; 200])
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    let mut owned_errors = owned.by_ref().map(|r| r.unwrap_err().code());
+    assert_eq!(owned_errors.next(), Some(ErrorCode::Closed));
+    assert_eq!(owned_errors.next(), None);
+    let fresh: Vec<_> = fresh.map(|r| r.map(|_| ()).map_err(|e| e.code())).collect();
+    assert_eq!(fresh, [Err(ErrorCode::Closed)]);
+    drop((t, t2));
+    db.close().unwrap();
+}
+
 #[test]
 fn reader_handles_see_the_writers_commits() {
     let vfs = SimVfs::new(9);

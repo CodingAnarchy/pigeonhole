@@ -885,3 +885,26 @@ fn the_documented_wait_loop_completes_durable_commits_without_spinning() {
     drop(shards);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// #826: a scan stream held past `close` yields `Closed`, then ends, instead of reading on.
+#[test]
+fn a_stream_fails_with_closed_after_close() {
+    let vfs = SimVfs::new(826);
+    let db = Pigeonhole::open("/db/closed.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    for i in 0..50u32 {
+        t.mutate(format!("r{i:02}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let mut s = t.scan_prefix(b"r").into_owned().stream();
+    let (first, _) = next_deferred(&vfs, &mut s);
+    assert!(first.unwrap().is_ok());
+    drop(t);
+    db.close().unwrap();
+    let (item, _) = next_deferred(&vfs, &mut s);
+    assert_eq!(item.unwrap().unwrap_err().code(), ErrorCode::Closed);
+    let (end, _) = next_deferred(&vfs, &mut s);
+    assert!(end.is_none());
+}

@@ -532,7 +532,7 @@ impl<'t> Scan<'t> {
             cursor,
             buf: RowBuf::new(info, 0),
             done: self.limit == Some(0),
-            _table: self.core,
+            table: self.core,
         })
     }
 
@@ -574,14 +574,18 @@ pub(crate) fn fill_row(cursor: &mut ScanCursor, buf: &mut RowBuf) -> Result<()> 
 /// Rows of a scan, in key order. As an [`Iterator`] it yields owned [`Row`]s (cheap: values
 /// stay pinned, not copied); [`RowIter::next_ref`] lends zero-copy [`RowRef`]s instead.
 ///
+/// Once the database is closed through any handle, the next step fails with `Closed` and
+/// the iterator is finished (#826), owned ones ([`Scan::into_owned`]) included.
+///
 /// See [`Scan`] for an example.
 #[derive(Debug)]
 pub struct RowIter<'t> {
     cursor: ScanCursor,
     buf: RowBuf,
     done: bool,
-    /// The table: borrowed, or held by an owned scan.
-    _table: Cow<'t, Arc<TableCore>>,
+    /// The table: borrowed, or held by an owned scan. Its database's closed flag stops
+    /// the iterator (#826).
+    table: Cow<'t, Arc<TableCore>>,
 }
 
 impl RowIter<'_> {
@@ -591,7 +595,10 @@ impl RowIter<'_> {
         if self.done {
             return Ok(false);
         }
-        let r = self.fill_inner();
+        // After `close` the engine's files may already belong to a new writer, which can
+        // reuse the pages this cursor would read next (#826): fail with `Closed`, as every
+        // handle does.
+        let r = self.table.db.check_open().and_then(|()| self.fill_inner());
         if !matches!(r, Ok(true)) {
             self.done = true;
         }
