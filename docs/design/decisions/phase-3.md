@@ -2184,3 +2184,78 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 **Not covered:** in a keep-all family, a put shadowed by a newer put at the same timestamp, written while a snapshot needed it, in an SST without the property. Nothing in the metadata shows it.
 
 **Cost:** for a family that keeps `max_versions`, the manifest's metadata never settles a last-level SST, so every `compact()` reads each one's properties through the open-SST cache, opening its reader the first time. On a quiet database that is the whole cost of a `compact()` with nothing to do (about 10 ms for a fresh 10-SST run on macOS, microseconds once open). If it shows up at thousands of SSTs, an in-memory set of SST ids known to be fully purged, kept per open, avoids the repeated reads without a format change.
+
+<a id="d267"></a>
+## D267 — A blind cross-shard PREPARE over an undecided share goes behind it instead of being refused; an older one wounds a younger undecided share (proposed; engine, #816; amends D263, D249)
+
+**Status: proposed.** The number is provisional. The owner decides on the box A/B, after perf287's re-review. The A/B rows:
+- app-owned at Buffered and at the default durability;
+- transfer (commits that read);
+- a single on a hot row;
+- the gate's contended and `all` cross-shard rows;
+- ycsb-a.
+
+**Proposed:**
+- **Chaining.** A PREPARE that only writes (no validated reads, no predicate) is admitted on a participant even where an undecided share writes or reads one of its rows. D263 refused it.
+  - **What it waits for.** It is tracked behind every undecided share there that writes or reads a row it writes, and behind every single waiting on one of its rows, together with the shares that single waits for.
+  - **When it answers.** Its `Prepared` is sent only once those shares are decided at that participant and those singles are logged.
+- **When a blind PREPARE is still refused** (`PendingOverlap`, D249):
+  - a row it writes already has `CHAIN_CAP` (8) undecided shares, unless it is older than every undecided share on its rows (see the starvation item below);
+  - a refused commit that reads, older than it, fences one of its rows (below).
+- **A PREPARE that reads** (validation or predicate) keeps D263's refusal. It is also refused when it reads a row a waiting single writes.
+- **Order.** The later share's `Prepared` leaves the participant only after the earlier share's `Decide` has been applied there.
+  - **Seqno.** The earlier coordinator reserved its `S` before sending that `Decide`, and the later coordinator reserves its `S` after receiving every `Prepared`. So `S_later > S_earlier` in `NEXT_SEQNO`'s modification order.
+  - **Timestamp.** The earlier coordinator raised the participant's `ts_raises` to its `T` (Release) before reserving its `S`. The chain of messages carries that raise to the later coordinator's Acquire load. So `T_later ≥ T_earlier`; where they are equal, the seqnos order the two versions, which is still a consistent order.
+  - **Behind a waiting single.** Its `Prepared` leaves after the single was logged, so after its seqno was reserved and its timestamp stamped (the participant's floor covers it). One cell's versions keep seqno and timestamp in the same order, as D263 required. The straddle D263 documents is unchanged.
+- **Singles.** A single that overlaps an undecided share starts waiting and records the undecided shares on its rows at that moment (`WaitingSingle::ahead`).
+  - **It waits for those only.** It goes in once they are decided. Shares that chain on its rows later wait for it, as above.
+  - **Bounded.** This bounds its wait by the chain ahead of it, at most `CHAIN_CAP` shares plus older commits exempt from the cap, and keeps per-row submission order.
+  - **Ending the wait.** A waiting single that is forwarded or parked for a tablet change ends its wait there. Back, it starts a new one.
+- **Wound-wait.** Waits between chained shares could form a cycle: A behind B on one shard, B behind A on another. So a share chained behind a *younger* commit's undecided share sends that commit's coordinator `Wound`. This includes a share it is behind through a waiting single, where the edge is made explicit.
+  - The coordinator decides an attempt not yet decided as an abort at once, without waiting for the remaining `Prepared` answers. Answers arriving after the decision are ignored, as before.
+  - The participant records the younger commit as refused behind the older one, D249's older-first wake: the older commit's next attempt there committing, its last attempt, or `Released`.
+  - A commit already deciding is not aborted; the older share simply waits for its `Decide`.
+  - Every wait that remains runs from a younger commit to an older one, or to a decided commit, or from a share to a single, which waits only for shares admitted before it. So no cycle forms.
+- **Starvation.** Among admitted (chained) shares, the oldest commit is never wounded. Two rules keep a commit from being refused for ever:
+  - **The cap.** A blind PREPARE older than every undecided share on its rows chains past the cap and wounds them, so the queue holds at most `CHAIN_CAP` shares plus older commits.
+  - **The reader fence.** A refused commit that reads, and is older than every undecided share on its rows, *fences* those rows (`reader_fences`). Younger PREPAREs writing them are refused, chained or not, so the row drains and the commit's retry gets in. The fence ends once that commit's PREPARE is tracked there, its last attempt is decided there, or it retries without that shard (`Released`).
+- **What a refusal waits for** (perf287's R4). Each refused PREPARE waits for what actually refused it, never for shares that may already be gone. Otherwise it would be woken at once and refused again every round.
+  - **Refused by a fence:** it waits behind the fencing reader, with D249's older-first wake (the reader's next attempt committing there, its last, or `Released`), which is the fence's own end set.
+  - **Refused by a waiting single:** it is woken when that single is logged (`end_single_wait`).
+- **An attempt aborted before a participant's group admitted its PREPARE** leaves nothing there. The decision removes the share, and the queued PREPARE is dropped unlogged and unanswered (the coordinator waits only for `Applied`).
+- **Overlap wakes and wounds go through the shard's queue even to the shard itself.** This includes the wake for `Released`, since every overlap wake goes through `wake_overlap`. Otherwise a `Wake` could overtake a `Wound` queued before it for the same commit: it then reached a coordinator that was not waiting yet and was dropped. Handling a `Wound` inline would also decide a commit in the middle of a group's admission.
+- **Recovery** needs nothing new.
+  - Several undecided PREPAREs on one row in one stream (D263 had at most one) are each resolved by their coordinator's record, and applied at its own `(S, T)`.
+  - A chained share has no decision until the share ahead of it is decided, so a crash mid-chain either drops it or applies it above that share.
+- **Counters:** `CrossShardMetrics::chained` (PREPAREs admitted behind an undecided share or a waiting single) and `wounds` (younger undecided shares wounded), in the engine and public crates.
+
+**Why:** #816. Under D263 a PREPARE overlapping any undecided share was refused, so cross-shard commits on a hot row ran one at a time, each taking a full undecided window (about 0.5 ms with application-owned inline driving). A herd of retries then multiplied the rounds: about 4.8 attempts per commit.
+- **Gate 21:** the app-owned row fell from 886K to 322K commits/s at Buffered (p99 0.5 → 20.6 ms) and from 393K to 120K at the default durability. Bisected locally to #774.
+- **Local A/B** (`phdb-bench app-owned --scale small`, Buffered, two interleaved runs each, before the review fixes):
+
+| | ops/s | p99 | rounds |
+|---|--:|--:|--:|
+| main | 175–200K | 16–18 ms | 174–187K |
+| chaining and wounds | 267–308K | 6.4–6.8 ms | 70–71K |
+| before #774 | 308–321K | 2.6–3.2 ms | 39K |
+
+- **Without wounds, older commits starved:** the max latency reached 2–3 s.
+- **The alternatives:**
+  - Refusing a newcomer while *any* older refused commit waits on the row brought the collapse back. The fence above applies only to commits that read, which cannot chain.
+  - Refusing newcomers while a single waits cost 15–20%. Singles are ordered in the chain instead (perf287's review, R1).
+  - Waking only the oldest refused commit cut refusals but made hot rows a convoy, below main.
+
+**Tests** (`crates/engine/tests/tablets.rs` unless named):
+- **Chaining and wounds:**
+  - `a_blind_prepare_over_an_undecided_share_chains_instead_of_refusing` (on main B is refused);
+  - `an_older_prepare_chained_behind_a_younger_share_wounds_it` (hangs with the `Wound` send removed).
+- **Starvation** (each fails with its rule removed):
+  - `a_single_waiting_on_a_hot_row_goes_in_while_commits_keep_chaining`;
+  - `the_oldest_blind_commit_chains_past_a_full_row_and_wounds_it`;
+  - `a_reading_commit_gets_in_against_a_stream_of_blind_commits`.
+- **Refusal waits:** `a_prepare_refused_by_a_fence_waits_behind_the_reader`. Three shards; the reader's coordinator is held still, so the fence stands while `a` is clear. 30 fenced commits are refused at most 32 times; with the refusal waiting for shares instead, 281 times.
+- **Crashes:** `a_crash_mid_chain_applies_the_decided_share_and_drops_the_one_behind_it`. A is decided but not applied on the participant, B is chained and logged behind it, then a crash: the reopen applies A and drops B.
+- **Model check** (`model_check.rs`):
+  - `hot_rows_chain_and_wound_across_many_shards`: Zipfian blind batches over 3, 6 and 10 shards;
+  - `hot_rows_chain_and_wound_through_crashes`: the same shape on 4 shards, with crashes and mid-commit crashes.
+- **The existing sweeps** run unchanged.

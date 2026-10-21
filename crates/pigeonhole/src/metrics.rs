@@ -221,6 +221,12 @@ pub struct CrossShardMetrics {
     /// The time shards had a single held back behind an undecided share
     /// (D263), summed over shards.
     pub share_wait_nanos: u64,
+    /// Cross-shard shares admitted behind another commit's undecided share (or a waiting
+    /// single) instead of refused, answering once that one was decided (D267).
+    pub chained: u64,
+    /// Younger undecided cross-shard attempts aborted so that an older commit queued
+    /// behind them could go first (D267). Each is retried.
+    pub wounds: u64,
 }
 
 // The deprecated cross-shard refusal counters are always 0 (D263).
@@ -286,6 +292,8 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
                 refused_pending_overlap: x.refused_pending_overlap,
                 share_waits: x.share_waits,
                 share_wait_nanos: x.share_wait_nanos,
+                chained: x.chained,
+                wounds: x.wounds,
             },
         }
     }
