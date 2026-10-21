@@ -1,0 +1,136 @@
+**Warning:** the machine was busy when a run started (load 1.03 and 17.94); other work skews every number
+
+| Result | Metric | Baseline | Candidate | Change | Allowed | |
+|---|---|--:|--:|--:|--:|---|
+| ycsb-a/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 176.4K | 176.8K | +0.3% | ±20% | ok |
+| ycsb-a/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 4.86 µs | 4.80 µs | -1.3% | ±20% or ±3 µs | ok |
+| ycsb-a/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 14.9 µs | 15.1 µs | +1.3% | ±40% or ±6 µs | ok |
+| ycsb-a/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 21.4 µs | 22.7 µs | +6.0% | — | ok |
+| ycsb-a/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 100.0K | 100.1K | +0.1% | ±20% | ok |
+| ycsb-a/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 6.37 µs | 6.37 µs | +0.0% | ±20% or ±3 µs | ok |
+| ycsb-a/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 29.3 µs | 29.1 µs | -0.9% | ±40% or ±6 µs | ok |
+| ycsb-a/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 36.6 µs | 36.4 µs | -0.7% | — | ok |
+| ycsb-b/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 282.0K | 282.3K | +0.1% | ±20% | ok |
+| ycsb-b/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 1.05 µs | 1.05 µs | +0.0% | ±20% or ±3 µs | ok |
+| ycsb-b/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 13.3 µs | 13.2 µs | -0.5% | ±40% or ±6 µs | ok |
+| ycsb-b/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 16.2 µs | 16.0 µs | -1.2% | — | ok |
+| ycsb-b/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 89.4K | 89.7K | +0.4% | ±20% | ok |
+| ycsb-b/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 9.21 µs | 9.21 µs | +0.0% | ±20% or ±3 µs | ok |
+| ycsb-b/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 22.8 µs | 22.3 µs | -2.2% | ±40% or ±6 µs | ok |
+| ycsb-b/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 26.2 µs | 25.5 µs | -2.9% | — | ok |
+| ycsb-c/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 388.6K | 393.7K | +1.3% | ±20% | ok |
+| ycsb-c/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 0.90 µs | 0.90 µs | +0.0% | ±20% or ±3 µs | ok |
+| ycsb-c/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 12.2 µs | 11.9 µs | -2.1% | ±40% or ±6 µs | ok |
+| ycsb-c/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 14.8 µs | 14.3 µs | -3.5% | — | ok |
+| ycsb-c/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 162.6K | 161.0K | -0.9% | ±20% | ok |
+| ycsb-c/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 5.41 µs | 5.47 µs | +1.2% | ±20% or ±3 µs | ok |
+| ycsb-c/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 10.9 µs | 11.0 µs | +1.2% | ±40% or ±6 µs | ok |
+| ycsb-c/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 13.6 µs | 13.9 µs | +1.9% | — | ok |
+| ycsb-d/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 302.0K | 290.2K | -3.9% | ±20% | ok |
+| ycsb-d/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 1.09 µs | 1.14 µs | +4.4% | ±20% or ±3 µs | ok |
+| ycsb-d/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 14.1 µs | 15.2 µs | +7.7% | ±40% or ±6 µs | ok |
+| ycsb-d/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 18.8 µs | 20.1 µs | +6.8% | — | ok |
+| ycsb-d/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 122.4K | 121.6K | -0.6% | ±20% | ok |
+| ycsb-d/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 7.87 µs | 7.84 µs | -0.4% | ±20% or ±3 µs | ok |
+| ycsb-d/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 15.1 µs | 15.3 µs | +1.3% | ±40% or ±6 µs | ok |
+| ycsb-d/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 17.5 µs | 17.9 µs | +2.2% | — | ok |
+| ycsb-e/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 14.5K | 14.6K | +0.5% | ±20% | ok |
+| ycsb-e/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 66.6 µs | 66.6 µs | +0.0% | ±20% or ±3 µs | ok |
+| ycsb-e/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 181 µs | 170 µs | -6.2% | ±40% or ±6 µs | ok |
+| ycsb-e/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 238 µs | 211 µs | -11.2% | — | ok |
+| ycsb-e/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 11.8K | 11.9K | +0.8% | ±20% | ok |
+| ycsb-e/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 81.9 µs | 81.4 µs | -0.6% | ±20% or ±3 µs | ok |
+| ycsb-e/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 185 µs | 183 µs | -1.1% | ±40% or ±6 µs | ok |
+| ycsb-e/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 194 µs | 191 µs | -1.1% | — | ok |
+| ycsb-f/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 88.7K | 76.6K | -13.7% | ±20% | ok |
+| ycsb-f/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 10.8 µs | 13.1 µs | +20.7% | ±20% or ±3 µs | ok |
+| ycsb-f/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 27.9 µs | 27.9 µs | +0.0% | ±40% or ±6 µs | ok |
+| ycsb-f/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 34.0 µs | 33.0 µs | -3.0% | — | ok |
+| ycsb-f/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 86.2K | 85.7K | -0.6% | ±20% | ok |
+| ycsb-f/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 10.2 µs | 10.4 µs | +1.3% | ±20% or ±3 µs | ok |
+| ycsb-f/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 29.8 µs | 30.3 µs | +1.7% | ±40% or ±6 µs | ok |
+| ycsb-f/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 37.9 µs | 38.4 µs | +1.4% | — | ok |
+| sparse-wide/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 27.1K | 26.8K | -0.9% | ±20% | ok |
+| sparse-wide/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 11.1 µs | 10.9 µs | -1.2% | ±20% or ±3 µs | ok |
+| sparse-wide/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 408 µs | 426 µs | +4.5% | ±40% or ±6 µs | ok |
+| sparse-wide/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 502 µs | 565 µs | +12.7% | — | ok |
+| sparse-wide/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 18.5K | 18.6K | +0.5% | ±20% | ok |
+| sparse-wide/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 6.72 µs | 6.75 µs | +0.5% | ±20% or ±3 µs | ok |
+| sparse-wide/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 930 µs | 926 µs | -0.4% | ±40% or ±6 µs | ok |
+| sparse-wide/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 1245 µs | 1237 µs | -0.7% | — | ok |
+| time-series-ttl/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 242.4K | 237.3K | -2.1% | ±20% | ok |
+| time-series-ttl/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 4.19 µs | 4.25 µs | +1.5% | ±20% or ±3 µs | ok |
+| time-series-ttl/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 7.58 µs | 8.45 µs | +11.4% | ±40% or ±6 µs | ok |
+| time-series-ttl/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 10.7 µs | 14.1 µs | +32.3% | — | ok |
+| time-series-ttl/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 214.7K | 212.4K | -1.1% | ±20% | ok |
+| time-series-ttl/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 3.25 µs | 3.26 µs | +0.5% | ±20% or ±3 µs | ok |
+| time-series-ttl/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 12.2 µs | 12.3 µs | +1.1% | ±40% or ±6 µs | ok |
+| time-series-ttl/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 14.7 µs | 14.8 µs | +0.9% | — | ok |
+| adjacency/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | throughput | 26.3K | 26.3K | +0.0% | ±20% | ok |
+| adjacency/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p50 | 11.8 µs | 11.9 µs | +0.5% | ±20% or ±3 µs | ok |
+| adjacency/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99 | 293 µs | 299 µs | +2.1% | ±40% or ±6 µs | ok |
+| adjacency/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1 | p99.9 | 336 µs | 332 µs | -1.2% | — | ok |
+| adjacency/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | throughput | 15.1K | 15.1K | +0.2% | ±20% | ok |
+| adjacency/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p50 | 16.9 µs | 17.0 µs | +0.8% | ±20% or ±3 µs | ok |
+| adjacency/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99 | 586 µs | 586 µs | +0.0% | ±40% or ±6 µs | ok |
+| adjacency/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=1 | p99.9 | 647 µs | 643 µs | -0.6% | — | ok |
+| skewed-multi-shard/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=4 | throughput | 748.9K | 720.3K | -3.8% | ±20% | ok |
+| skewed-multi-shard/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=4 | p50 | 4.93 µs | 5.05 µs | +2.6% | ±20% or ±3 µs | ok |
+| skewed-multi-shard/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=4 | p99 | 9.21 µs | 9.47 µs | +2.8% | ±40% or ±6 µs | ok |
+| skewed-multi-shard/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=4 | p99.9 | 13.8 µs | 13.8 µs | +0.0% | — | ok |
+| skewed-multi-shard/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=4 | throughput | 641.7K | 651.9K | +1.6% | ±20% | ok |
+| skewed-multi-shard/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=4 | p50 | 6.33 µs | 6.30 µs | -0.5% | ±20% or ±3 µs | ok |
+| skewed-multi-shard/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=4 | p99 | 10.4 µs | 10.4 µs | +0.0% | ±40% or ±6 µs | ok |
+| skewed-multi-shard/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=4 | p99.9 | 13.6 µs | 14.0 µs | +2.8% | — | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 pinned] t=16 | throughput | 2.56M | 2.58M | +0.9% | ±20% | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 pinned] t=16 | p50 | 73.7 µs | 72.7 µs | -1.4% | ±20% or ±3 µs | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 pinned] t=16 | p99 | 137 µs | 136 µs | -0.7% | ±40% or ±6 µs | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 pinned] t=16 | p99.9 | 918 µs | 983 µs | +7.1% | — | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 unpinned] t=16 | throughput | 2.48M | 2.43M | -1.9% | ±20% | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 unpinned] t=16 | p50 | 76.8 µs | 78.3 µs | +2.0% | ±20% or ±3 µs | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 unpinned] t=16 | p99 | 167 µs | 171 µs | +2.5% | ±40% or ±6 µs | ok |
+| group-commit/pigeonhole [shards=16 memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on presplit inline in-flight=16 unpinned] t=16 | p99.9 | 315 µs | 311 µs | -1.3% | — | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=1 | throughput | 17.4K | 17.4K | +0.1% | ±20% | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=1 | p50 | 49.4 µs | 49.9 µs | +1.0% | ±20% or ±3 µs | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=1 | p99 | 118 µs | 116 µs | -1.7% | ±40% or ±6 µs | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=1 | p99.9 | 157 µs | 147 µs | -5.9% | — | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=4 | throughput | 68.8K | 69.3K | +0.7% | ±20% | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=4 | p50 | 45.8 µs | 45.8 µs | +0.0% | ±20% or ±3 µs | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=4 | p99 | 140 µs | 141 µs | +0.7% | ±40% or ±6 µs | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=4 | p99.9 | 166 µs | 166 µs | +0.0% | — | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=16 | throughput | 231.9K | 232.5K | +0.3% | ±20% | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=16 | p50 | 56.3 µs | 56.6 µs | +0.5% | ±20% or ±3 µs | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=16 | p99 | 162 µs | 163 µs | +0.6% | ±40% or ±6 µs | ok |
+| group-commit/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 group-sync tablets=on] t=16 | p99.9 | 418 µs | 479 µs | +14.7% | — | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=1 | throughput | 15.4K | 15.5K | +0.8% | ±20% | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=1 | p50 | 63.2 µs | 63.0 µs | -0.4% | ±20% or ±3 µs | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=1 | p99 | 78.3 µs | 77.8 µs | -0.7% | ±40% or ±6 µs | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=1 | p99.9 | 101 µs | 99.8 µs | -1.0% | — | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=4 | throughput | 28.3K | 28.4K | +0.2% | ±20% | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=4 | p50 | 143 µs | 143 µs | +0.0% | ±20% or ±3 µs | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=4 | p99 | 169 µs | 168 µs | -0.6% | ±40% or ±6 µs | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=4 | p99.9 | 200 µs | 202 µs | +1.0% | — | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=16 | throughput | 96.9K | 100.6K | +3.9% | ±20% | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=16 | p50 | 175 µs | 167 µs | -4.7% | ±20% or ±3 µs | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=16 | p99 | 230 µs | 220 µs | -4.4% | ±40% or ±6 µs | ok |
+| group-commit/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 sync] t=16 | p99.9 | 293 µs | 291 µs | -0.7% | — | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=32 | throughput | 645.7K | 660.8K | +2.3% | ±20% | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=32 | p50 | 36.4 µs | 35.1 µs | -3.5% | ±20% or ±3 µs | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=32 | p99 | 147 µs | 143 µs | -2.8% | ±40% or ±6 µs | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=32 | p99.9 | 457 µs | 627 µs | +37.2% | — | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered] t=32 | throughput | 640.3K | 650.3K | +1.6% | ±20% | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered] t=32 | p50 | 36.4 µs | 36.1 µs | -0.7% | ±20% or ±3 µs | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered] t=32 | p99 | 145 µs | 143 µs | -1.4% | ±40% or ±6 µs | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered] t=32 | p99.9 | 520 µs | 440 µs | -15.4% | — | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on packing=off] t=32 | throughput | 645.1K | 642.7K | -0.4% | ±20% | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on packing=off] t=32 | p50 | 36.4 µs | 36.1 µs | -0.7% | ±20% or ±3 µs | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on packing=off] t=32 | p99 | 146 µs | 143 µs | -2.1% | ±40% or ±6 µs | ok |
+| cross-shard-contention/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on packing=off] t=32 | p99.9 | 594 µs | 518 µs | -12.8% | — | ok |
+| cross-shard-contention/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=32 | throughput | 570.8K | 571.5K | +0.1% | ±20% | ok |
+| cross-shard-contention/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=32 | p50 | 50.7 µs | 49.9 µs | -1.5% | ±20% or ±3 µs | ok |
+| cross-shard-contention/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=32 | p99 | 103 µs | 105 µs | +1.5% | ±40% or ±6 µs | ok |
+| cross-shard-contention/rocksdb [write_buffer=64MiB cache=256MiB bloom=10 buffered] t=32 | p99.9 | 326 µs | 446 µs | +37.1% | — | ok |
+
+**Background work differs:** ycsb-b/pigeonhole [shards=default(16) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on] t=1: 0 flushes and compactions in the baseline's measured phase, 1 in the candidate's
+
+**Runs agree within tolerance.**
