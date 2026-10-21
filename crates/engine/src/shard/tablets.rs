@@ -628,11 +628,17 @@ impl ShardState {
         on
     }
 
-    /// Whether PREPARE `m` writes a row a refused reading commit older than it fences
+    /// Whether blind PREPARE `m` writes a row a refused reading commit older than it fences
     /// (D267): it is refused, chained or not, so the row drains for that commit's retry.
-    /// The oldest such commit, which the refusal waits behind.
+    /// The oldest such commit, which the refusal waits behind. A PREPARE that reads cannot
+    /// chain, so it cannot keep the row from draining: it is not fenced, and D249 orders
+    /// it as before (fenced, every reading commit on a hot row waited out an older one's
+    /// whole retry).
     pub(super) fn fenced(&self, m: &Member) -> Option<CommitPriority> {
-        if self.reader_fences.is_empty() {
+        if self.reader_fences.is_empty()
+            || m.validate.as_ref().is_some_and(|v| !v.reads.is_empty())
+            || m.predicate.is_some()
+        {
             return None;
         }
         let priority = self.prepared.get(&m.seqno)?.priority;

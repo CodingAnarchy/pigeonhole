@@ -7046,6 +7046,44 @@ fn a_prepare_refused_by_a_fence_waits_behind_the_reader() {
 }
 
 #[test]
+fn a_younger_reading_commit_is_not_held_by_a_fence() {
+    // D267: a fence keeps younger blind commits from chaining on a row an older refused
+    // reading commit waits for. A younger reading commit cannot chain, and goes in on the
+    // row as under D249. Held by the fence too, each reading commit on a hot row waited out
+    // an older one's whole retry, and the bench's transfer row (reading commits only) ran
+    // at half main's rate (#830's box A/B).
+    let mut db = three_tablet_db();
+    let mut stream = Vec::new();
+    for i in 0..2u8 {
+        let t = blind_txn(&db, &[b"a", b"z"], &[b's', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+    }
+    let reader = overlap_txn(&db, &[b"b"], &[b"n", b"a"]);
+    let mut reader = reader.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, 1);
+    turn(&mut db, 0);
+    // Shard 1 stands still: the reader's retry cannot run, and its fence on `a` stands. The
+    // chain on `a` drains, and a younger reading commit on `a` goes in and commits.
+    let younger = overlap_txn(&db, &[b"c"], &[b"a", b"z"]);
+    let mut younger = younger.submit(Some(Durability::Buffered)).unwrap();
+    let mut committed = false;
+    for _ in 0..200 {
+        turn(&mut db, 0);
+        turn(&mut db, 2);
+        if let Some(r) = poll_commit(&mut younger) {
+            r.expect("the younger reading commit commits");
+            committed = true;
+            break;
+        }
+    }
+    assert!(committed, "the younger reading commit is held by the fence");
+    poll_until(&mut db, &mut reader, 200_000)
+        .expect("reader resolved")
+        .expect("reader commits");
+    drain(&mut db, stream);
+}
+
+#[test]
 fn a_fence_ends_with_its_readers_last_attempt_even_with_nothing_waiting() {
     // D267: a reading commit R (reads `b`, writes `y` and `a`), the oldest on `a`, is
     // refused on `low` over a younger blind commit's share there and fences `a`. `b` is then

@@ -5414,8 +5414,8 @@ impl ShardState {
                 chains = true;
             }
             // D267: a PREPARE reading a row a waiting single writes would read below the
-            // single while landing above it, and one writing a row an older refused reading
-            // commit fences would keep that row from draining: refused, as over an
+            // single while landing above it, and a blind one writing a row an older refused
+            // reading commit fences would keep that row from draining: refused, as over an
             // undecided share.
             if matches!(m.kind, MemberKind::Prepare { .. }) {
                 let wait = match (self.reads_waiting_single(&m), self.fenced(&m)) {
