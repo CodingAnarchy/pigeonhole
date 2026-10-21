@@ -85,11 +85,10 @@ impl Cached {
     /// The engine for one operation.
     #[inline(always)]
     pub(crate) fn get<'a>(&'a self, db: &'a Db) -> EngineRef<'a> {
-        if db.generation() == self.generation {
-            EngineRef::Cached(&self.engine)
-        } else {
-            db.engine()
-        }
+        // SCRATCH CONTROL (measurement only, unsound after a swap): no generation check, so
+        // the instructions attributable to the check alone can be read off against 3b.
+        let _ = db;
+        EngineRef::Cached(&self.engine)
     }
 
     /// A cache for a handle derived from this one: this one while it is current.
