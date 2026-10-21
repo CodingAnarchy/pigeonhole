@@ -26,6 +26,7 @@ pigeonhole-format = { workspace = true }
 pigeonhole-io = { workspace = true }
 pigeonhole-shm = { workspace = true }
 smallvec = { workspace = true }
+arc-swap = { workspace = true }
 futures-core = { workspace = true, optional = true }
 
 [dev-dependencies]

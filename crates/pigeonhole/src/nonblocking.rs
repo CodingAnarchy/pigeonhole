@@ -272,7 +272,7 @@ impl Pigeonhole {
     /// Dropping it does not stop the flush.
     pub fn flush_async(&self) -> MaintenanceFuture {
         MaintenanceFuture {
-            inner: self.db.engine.submit_flush().map_err(|e| Some(e.into())),
+            inner: self.engine().submit_flush().map_err(|e| Some(e.into())),
         }
     }
 
@@ -282,7 +282,7 @@ impl Pigeonhole {
         MaintenanceFuture {
             inner: self
                 .db
-                .engine
+                .engine()
                 .submit_compact(None)
                 .map_err(|e| Some(e.into())),
         }
@@ -372,6 +372,9 @@ pub struct RowStream<'t> {
     /// The table: borrowed, or held by an owned scan. Its database's closed flag stops the
     /// stream (#826).
     table: std::borrow::Cow<'t, std::sync::Arc<crate::table::TableCore>>,
+    /// The engine generation the scan started in (D265): a step after the database
+    /// recovered onto a newer engine fails with `SnapshotExpired`.
+    generation: u64,
 }
 
 impl std::fmt::Debug for RowStream<'_> {
@@ -387,11 +390,13 @@ impl<'t> RowStream<'t> {
         started: Result<(ScanCursor, RowBuf)>,
         limit_zero: bool,
         table: std::borrow::Cow<'t, std::sync::Arc<crate::table::TableCore>>,
+        generation: u64,
     ) -> Self {
         Self {
             inner: started.map_err(Some),
             done: limit_zero,
             table,
+            generation,
         }
     }
 }
@@ -411,8 +416,14 @@ impl futures_core::Stream for RowStream<'_> {
                 return Poll::Ready(e.take().map(Err));
             }
         };
-        // As `RowIter`: nothing is read after `close` (#826).
-        if let Err(e) = this.table.db.check_open() {
+        // As `RowIter`: nothing is read after `close` (#826), nor after a recovery onto a
+        // newer engine (D265).
+        if let Err(e) = this
+            .table
+            .db
+            .check_open()
+            .and_then(|()| this.table.db.check_generation(this.generation))
+        {
             this.done = true;
             return Poll::Ready(Some(Err(e)));
         }

@@ -154,12 +154,17 @@ impl Builder {
     /// Submits an async commit (D210): at once while its shard has room, else as a pending
     /// commit that submits once admitted.
     #[cfg(feature = "async")]
-    fn submit_async(self, db: &Db, durability: Option<Durability>) -> Result<Submitted> {
+    fn submit_async(
+        self,
+        engine: &pigeonhole_engine::Engine,
+        max_value: usize,
+        durability: Option<Durability>,
+    ) -> Result<Submitted> {
         if let Some(e) = self.error {
             return Err(e);
         }
-        let (largest_value, max_value) = (self.largest_value, db.max_value);
-        db.engine
+        let largest_value = self.largest_value;
+        engine
             .submit_async(self.batch, durability)
             .map(|pending| Submitted {
                 pending,
@@ -169,12 +174,17 @@ impl Builder {
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
 
-    fn submit(self, db: &Db, durability: Option<Durability>) -> Result<Submitted> {
+    fn submit(
+        self,
+        engine: &pigeonhole_engine::Engine,
+        max_value: usize,
+        durability: Option<Durability>,
+    ) -> Result<Submitted> {
         if let Some(e) = self.error {
             return Err(e);
         }
-        let (largest_value, max_value) = (self.largest_value, db.max_value);
-        db.engine
+        let largest_value = self.largest_value;
+        engine
             .submit(self.batch, durability)
             .map(|pending| Submitted {
                 pending,
@@ -185,15 +195,20 @@ impl Builder {
     }
 
     /// Commits through `db`, reporting the first builder error instead if there was one.
-    fn commit(self, db: &Db, durability: Option<Durability>) -> Result<CommitInfo> {
+    fn commit(
+        self,
+        engine: &pigeonhole_engine::Engine,
+        max_value: usize,
+        durability: Option<Durability>,
+    ) -> Result<CommitInfo> {
         if let Some(e) = self.error {
             return Err(e);
         }
         let largest = self.largest_value;
-        db.engine
+        engine
             .commit(self.batch, durability)
             .map(CommitInfo::from)
-            .map_err(|e| commit_error(e, largest, db.max_value))
+            .map_err(|e| commit_error(e, largest, max_value))
     }
 }
 
@@ -502,13 +517,21 @@ impl RowMutation<'_> {
 
     /// Commits.
     pub fn commit(self) -> Result<CommitInfo> {
-        self.builder.commit(&self.table.db, self.durability)
+        self.builder.commit(
+            &self.table.engine(),
+            self.table.db.max_value,
+            self.durability,
+        )
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
     pub(crate) fn submit_async(self) -> Result<Submitted> {
-        self.builder.submit_async(&self.table.db, self.durability)
+        self.builder.submit_async(
+            &self.table.engine(),
+            self.table.db.max_value,
+            self.durability,
+        )
     }
 
     /// Submits as an async conditional commit (D210): the condition is resolved now; the
@@ -522,7 +545,8 @@ impl RowMutation<'_> {
         let (db, table) = (&self.table.db, self.table.info.id);
         let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
         let durability = self.durability;
-        db.engine
+        self.table
+            .engine()
             .submit_check_and_mutate_async(
                 table,
                 &self.row,
@@ -547,8 +571,9 @@ impl RowMutation<'_> {
         let predicate = self.predicate(condition)?;
         let db = &self.table.db;
         let largest = self.builder.largest_value;
-        let (applied, info) = db
-            .engine
+        let (applied, info) = self
+            .table
+            .engine()
             .check_and_mutate(
                 self.table.info.id,
                 &self.row,
@@ -644,13 +669,15 @@ impl SubmittedCheck {
 #[derive(Debug)]
 pub struct WriteBatch {
     db: Arc<Db>,
+    cached: crate::db::Cached,
     builder: Builder,
 }
 
 impl WriteBatch {
-    pub(crate) fn new(db: Arc<Db>) -> Self {
+    pub(crate) fn new(db: Arc<Db>, cached: crate::db::Cached) -> Self {
         Self {
             db,
+            cached,
             builder: Builder::default(),
         }
     }
@@ -861,12 +888,22 @@ impl WriteBatch {
 
     /// Commits with the writer default durability.
     pub fn commit(self) -> Result<CommitInfo> {
-        self.builder.commit(&self.db, None)
+        let Self {
+            db,
+            cached,
+            builder,
+        } = self;
+        builder.commit(&cached.get(&db), db.max_value, None)
     }
 
     /// Commits with `durability` for this commit only.
     pub fn commit_with(self, durability: Durability) -> Result<CommitInfo> {
-        self.builder.commit(&self.db, Some(durability))
+        let Self {
+            db,
+            cached,
+            builder,
+        } = self;
+        builder.commit(&cached.get(&db), db.max_value, Some(durability))
     }
 
     /// Submits with `durability` and returns at once with a [`CommitTicket`] to wait on or
@@ -878,13 +915,23 @@ impl WriteBatch {
 
     /// Submits without waiting (the async front door's commit).
     pub(crate) fn submit(self, durability: Option<Durability>) -> Result<Submitted> {
-        self.builder.submit(&self.db, durability)
+        let Self {
+            db,
+            cached,
+            builder,
+        } = self;
+        builder.submit(&cached.get(&db), db.max_value, durability)
     }
 
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
     pub(crate) fn submit_async(self, durability: Option<Durability>) -> Result<Submitted> {
-        self.builder.submit_async(&self.db, durability)
+        let Self {
+            db,
+            cached,
+            builder,
+        } = self;
+        builder.submit_async(&cached.get(&db), db.max_value, durability)
     }
 }
 
@@ -918,15 +965,19 @@ pub struct Transaction {
     txn: Txn,
     error: Option<Error>,
     largest_value: usize,
+    /// The engine generation it began in (D265): its reads and its commit fail with
+    /// `SnapshotExpired` once the database recovered onto a newer engine.
+    generation: u64,
 }
 
 impl Transaction {
-    pub(crate) fn new(db: Arc<Db>, txn: Txn) -> Self {
+    pub(crate) fn new(db: Arc<Db>, txn: Txn, generation: u64) -> Self {
         Self {
             db,
             txn,
             error: None,
             largest_value: 0,
+            generation,
         }
     }
 
@@ -965,6 +1016,7 @@ impl Transaction {
             return Err(e);
         }
         self.db.check_open()?;
+        self.db.check_generation(self.generation)?;
         let (largest_value, max_value) = (self.largest_value, self.db.max_value);
         self.txn
             .submit_async(durability)
@@ -981,6 +1033,7 @@ impl Transaction {
             return Err(e);
         }
         self.db.check_open()?;
+        self.db.check_generation(self.generation)?;
         let (largest, max) = (self.largest_value, self.db.max_value);
         self.txn
             .commit(durability)
@@ -998,6 +1051,7 @@ impl Transaction {
     ) -> Result<Option<CellRef<'_>>> {
         check_table(&self.db, table)?;
         self.db.check_open()?;
+        self.db.check_generation(self.generation)?;
         let family = table.core.family_id(family)?;
         Ok(self
             .txn
@@ -1019,6 +1073,7 @@ impl Transaction {
     ) -> crate::nonblocking::GetFuture {
         let started = check_table(&self.db, table)
             .and_then(|()| self.db.check_open())
+            .and_then(|()| self.db.check_generation(self.generation))
             .and_then(|()| table.core.family_id(family))
             .map(|family| {
                 self.txn
