@@ -189,13 +189,16 @@ fn is_batch(j: usize, all: usize) -> bool {
     j.is_multiple_of(CROSS_BATCH_EVERY) && all >= 2
 }
 
-/// With readers on, whether batch `j` is a read-modify-write transaction: every other one.
+/// With readers on, whether batch `j` is a reading transaction: every other one.
 fn is_rmw(j: usize, all: usize, readers: bool) -> bool {
     readers && is_batch(j, all) && (j / CROSS_BATCH_EVERY) % 2 == 1
 }
 
-/// The mixed row's read-modify-write commit (#816, D267): a transaction that reads the
-/// first cell of `w` and of the batch's extra rows, then writes them all.
+/// The mixed row's reading commit (#816, D267): a transaction that reads a cold companion
+/// row of each of its rows (`<row>/r`, never written) and writes the batch's rows, so it
+/// meets the blind batches on their hot rows as a commit that reads (it cannot chain behind
+/// them) without conflicting on the hot rows themselves: a hot row is written every few
+/// microseconds, so a transaction reading one would conflict on nearly every attempt.
 fn submit_rmw(
     db: &Pigeonhole,
     t: &Table,
@@ -207,7 +210,9 @@ fn submit_rmw(
     let rows: Vec<&Write> = std::iter::once(w).chain(batch_extras(j, all)).collect();
     for x in &rows {
         if let Some((q, _)) = x.cells.first() {
-            txn.get(t, &x.row, x.family, q).map_err(err)?;
+            let mut cold = x.row.clone();
+            cold.extend_from_slice(b"/r");
+            txn.get(t, &cold, x.family, q).map_err(err)?;
         }
     }
     for x in &rows {
@@ -828,7 +833,7 @@ impl PigeonholeRunner {
             [
                 ("single-commit", &kinds.single),
                 ("batch-commit", &kinds.batch),
-                ("rmw-commit", &kinds.rmw),
+                ("reading-commit", &kinds.rmw),
             ]
             .into_iter()
             .filter(|(_, h)| h.count() > 0)

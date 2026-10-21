@@ -215,7 +215,7 @@ impl PigeonholeRunner {
     }
 
     /// `true`, with [`cross_batches`](Self::cross_batches): every other such batch is a
-    /// transaction that reads its rows and writes them back (a read-modify-write commit),
+    /// transaction that reads a cold companion row of each of its rows and writes the rows,
     /// so commits that read and blind writes meet on the same hot rows (#816, D267). A
     /// transaction that conflicts is retried and counted.
     pub fn cross_readers(mut self, yes: bool) -> Self {

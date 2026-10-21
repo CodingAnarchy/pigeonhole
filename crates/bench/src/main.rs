@@ -111,8 +111,9 @@ OPTIONS:
                            through the async API (commit_async, read_async, get_async;
                            D247) [default: 0, one at a time]
     --mixed                app-owned: every other cross-shard batch is a transaction that
-                           reads its rows and writes them back, so commits that read and
-                           blind writes meet on the same hot rows (D267's mixed row)
+                           reads a cold row beside each of its rows and writes the rows,
+                           so commits that read and blind writes meet on the same hot
+                           rows (D267's mixed row)
     --riders               Pigeonhole: snapshot and durable-snapshot readers, then a
                            durable backup and a compaction, beside the measured
                            phase (D247, reported in the record's riders)
