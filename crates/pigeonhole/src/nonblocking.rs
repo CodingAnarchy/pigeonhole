@@ -362,13 +362,16 @@ fn polled_after_done() -> Error {
 }
 
 /// A scan as a [`Stream`](futures_core::Stream) of owned [`Row`]s ([`Scan::stream`](crate::Scan::stream)).
+/// After the database is closed, the next item is `Closed` and the stream ends (#826).
 /// Borrows its table as a lifetime, as [`RowIter`](crate::RowIter) does, or holds it
 /// ([`Scan::into_owned`](crate::Scan::into_owned)). Dropping it is always safe.
 #[must_use = "a stream does nothing unless polled"]
 pub struct RowStream<'t> {
     inner: std::result::Result<(ScanCursor, RowBuf), Option<Error>>,
     done: bool,
-    _table: std::borrow::Cow<'t, std::sync::Arc<crate::table::TableCore>>,
+    /// The table: borrowed, or held by an owned scan. Its database's closed flag stops the
+    /// stream (#826).
+    table: std::borrow::Cow<'t, std::sync::Arc<crate::table::TableCore>>,
 }
 
 impl std::fmt::Debug for RowStream<'_> {
@@ -388,7 +391,7 @@ impl<'t> RowStream<'t> {
         Self {
             inner: started.map_err(Some),
             done: limit_zero,
-            _table: table,
+            table,
         }
     }
 }
@@ -408,6 +411,11 @@ impl futures_core::Stream for RowStream<'_> {
                 return Poll::Ready(e.take().map(Err));
             }
         };
+        // As `RowIter`: nothing is read after `close` (#826).
+        if let Err(e) = this.table.db.check_open() {
+            this.done = true;
+            return Poll::Ready(Some(Err(e)));
+        }
         let item = match cursor.poll_next_row(cx) {
             Poll::Pending => return Poll::Pending,
             Poll::Ready(Ok(false)) => None,

@@ -1,0 +1,2 @@
+### Fixed
+- A `RowIter` or `RowStream` held past `Pigeonhole::close` now fails with `Closed` on its next step and then ends, as every other handle does (#826). It used to keep reading the closed engine's view, so once a new writer on the same file reused those pages, it read about a thousand more cells and then reported corruption. Owned scans (`Scan::into_owned`) and the Arrow C stream make holding an iterator past `close` common.
