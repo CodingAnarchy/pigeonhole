@@ -762,3 +762,80 @@ fn a_reader_snapshot_from_before_the_discard_expires_and_a_new_one_reads_every_r
     }
     again.close().unwrap();
 }
+
+/// perf287's R1 on #828: a plain `close` (and a second one racing it) returns, and
+/// releases the writer lock, only once the stream's submitted writes landed: while a spare
+/// zero-fill is held, an `Engine::open` of the path fails `WriterLocked` instead of getting
+/// in under the write (which it did before the fix, on main and on #828's first head), and
+/// both closes stay pending; after the release the closes return and an open succeeds.
+#[test]
+fn a_plain_close_releases_the_writer_lock_only_after_its_submitted_writes_landed() {
+    let (vfs, gate) = gate::vfs(1610);
+    let mut o = options(Arc::clone(&vfs), 2);
+    o.wal.segment_size = 512 << 10;
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let s = shard_of(&db, &t);
+    gate.hold_writes(&wal(s));
+    for i in 0..300 {
+        db.commit(
+            put_sized(&t, &format!("row{i:03}"), 1 << 10),
+            Some(Durability::Buffered),
+        )
+        .unwrap();
+    }
+    gate.wait_held_write(&wal(s));
+    gate.fail(&wal(s));
+    let (db2, t2) = (Arc::clone(&db), Arc::clone(&t));
+    let failed = gate::within(10, move || {
+        db2.commit(put(&t2, "lost"), Some(Durability::Sync))
+    })
+    .expect("a commit with a failing sync hung");
+    assert!(failed.is_err(), "{failed:?}");
+
+    // Two closes: whichever starts it, and one that finds it under way.
+    let (tx, rx) = std::sync::mpsc::channel();
+    for _ in 0..2 {
+        let (db2, tx) = (Arc::clone(&db), tx.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send(db2.close());
+        });
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_secs(3)).is_err(),
+        "a close returned with a submitted write of the stream still in flight (#824)"
+    );
+    match Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)) {
+        Err(Error::WriterLocked) => {}
+        other => panic!(
+            "an open got in while a write of the closing instance was in flight: {:?}",
+            other.map(|_| ())
+        ),
+    }
+    // (No `probe` here: a last-one-out close holds the presence byte exclusive from the
+    // final close until the release, so a shared probe is refused meanwhile.)
+    gate.release_writes();
+    for _ in 0..2 {
+        let closed = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a close did not return once the held writes landed");
+        // The first close's outcome is unclean (a failed shard); the second finds it under
+        // way and reports Ok, as before.
+        let _ = closed;
+    }
+    assert_eq!(
+        probe(&vfs),
+        (true, true),
+        "released after the writes landed"
+    );
+    gate.heal(&wal(s));
+    drop(db);
+    let again = Engine::open(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
+    let t = again.table("t").unwrap();
+    for i in 0..300 {
+        assert!(has(&again, &t, &format!("row{i:03}")), "row{i:03}");
+    }
+    again.close().unwrap();
+}

@@ -157,6 +157,10 @@ struct Shared {
     in_flight: Mutex<usize>,
     /// Signalled when `in_flight` reaches zero.
     in_flight_done: Condvar,
+    /// A close is waiting for the stream's submitted I/O ([`IoTracker::wait_idle`]): a
+    /// spare preparation still running submits nothing more and settles with its slots
+    /// blank, so the wait ends with what is in flight rather than with the whole fill.
+    closing_io: AtomicBool,
 }
 
 /// One operation (or a chain of them) a stream submitted and not finished: counted in
@@ -203,11 +207,14 @@ impl IoTracker {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Blocks until no submitted operation is in flight. Call once nothing can submit more
-    /// (the stream's threads are joined): otherwise it may return between two steps of a
-    /// preparation. Reaps I/O only the calling thread completes meanwhile (#207).
+    /// Blocks until no submitted operation is in flight, and stops a spare preparation
+    /// still running from submitting more (it settles once its writes in flight landed).
+    /// A preparation counts as in flight while it lives, so the wait never returns between
+    /// two of its steps, whether or not the stream's threads are joined. Reaps I/O only the
+    /// calling thread completes meanwhile (#207).
     pub fn wait_idle(&self) {
         crate::foreground::may_block("a wait for a WAL stream's submitted I/O");
+        self.0.closing_io.store(true, Ordering::Release);
         let mut n = self
             .0
             .in_flight
@@ -1029,6 +1036,13 @@ impl Future for SparePrep {
             return Poll::Ready(this.spares.settle(slots, r.map_err(Error::from)));
         }
         let (mut submitted, mut allocated) = (0, false);
+        if this.failed.is_none() && this.spares.shared.closing_io.load(Ordering::Acquire) {
+            // A close waits for the stream's I/O: finish what is in flight, submit no more.
+            this.failed = Some(Error::Io(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "the WAL stream is closing",
+            )));
+        }
         loop {
             // Collect finished writes, oldest first.
             while let Some(w) = this.writes.front_mut() {
@@ -1387,6 +1401,7 @@ impl WalStream {
                 creation: Mutex::new(Creation::Durable),
                 in_flight: Mutex::new(0),
                 in_flight_done: Condvar::new(),
+                closing_io: AtomicBool::new(false),
             }),
         }
     }
