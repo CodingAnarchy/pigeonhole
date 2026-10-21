@@ -1,0 +1,2 @@
+### Added
+- `ErrorCode::UnsupportedFeature` (30): the file uses a feature from a newer version, a stored value this build doesn't know. The message names it (#496, ICR 0058). Unknown key kinds, value tags, block and filter kinds, family settings (kind, compaction style, cache priority, compression), compression codecs and WAL record types used to be reported as `Corruption`, sending users to their backups for files that were intact.

@@ -97,7 +97,10 @@ pub fn decode_value(stored: &[u8]) -> crate::Result<ValueRef<'_>> {
             Ok(ValueRef::Varint(((z >> 1) as i64) ^ -((z & 1) as i64)))
         }
         0x80 => Ok(ValueRef::Blob(BlobPointer::decode(payload)?)),
-        _ => Err(Error::Corrupt { what: "value tag" }),
+        t => Err(Error::UnsupportedFeature {
+            what: "value tag",
+            value: u64::from(t),
+        }),
     }
 }
 

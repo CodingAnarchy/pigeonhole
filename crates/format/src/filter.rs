@@ -118,8 +118,9 @@ impl<B: Deref<Target = [u8]>> Filter<B> {
             return Err(Error::Truncated { what: "filter" });
         }
         if b[0] != FilterKind::BlockedBloom as u8 {
-            return Err(Error::Corrupt {
+            return Err(Error::UnsupportedFeature {
                 what: "filter kind",
+                value: u64::from(b[0]),
             });
         }
         let probes = u32::from(b[1]);

@@ -48,6 +48,16 @@ pub enum Error {
     ValueTooLarge,
     /// A compression codec this build does not support.
     UnsupportedCompression(u8),
+    /// A value of a persisted enum this build does not know (a key kind, value tag, block
+    /// kind, family kind, WAL record type and so on): the bytes are intact (their checksum
+    /// passed) and were written by a newer build using a feature this one lacks. Never
+    /// [`Error::Corrupt`] (#496, ICR 0058).
+    UnsupportedFeature {
+        /// The enum being decoded.
+        what: &'static str,
+        /// The value found.
+        value: u64,
+    },
     /// The caller passed arguments an encoder cannot accept (for example a
     /// [`FamilyDelete`](crate::Kind::FamilyDelete) cell key, or keys out of order). Never
     /// produced by a decoder: bad bytes are [`Error::Corrupt`].
@@ -70,6 +80,11 @@ impl fmt::Display for Error {
             Error::KeyTooLarge => write!(f, "row key or qualifier longer than 65536 bytes"),
             Error::ValueTooLarge => write!(f, "value longer than 2^32 - 1 bytes"),
             Error::UnsupportedCompression(c) => write!(f, "unsupported compression codec {c}"),
+            Error::UnsupportedFeature { what, value } => write!(
+                f,
+                "{what} {value} is not known to this build: the file uses a feature from a newer \
+                 version"
+            ),
             Error::InvalidArgument { what } => write!(f, "invalid argument: {what}"),
         }
     }

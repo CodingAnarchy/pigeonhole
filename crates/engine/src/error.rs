@@ -56,6 +56,10 @@ pub enum Error {
     ShmUnavailable,
     /// The file's format version is not readable by this build.
     UnsupportedFormat(u32),
+    /// The file uses a feature this build lacks: a persisted enum value it does not know (a
+    /// value tag, family kind, block kind, WAL record type, compression codec...), written
+    /// by a newer build. The message names it. Never `Corruption` (#496, ICR 0058).
+    UnsupportedFeature(String),
     /// The database is on a network filesystem.
     NetworkFilesystem,
     /// No such table.
@@ -140,6 +144,11 @@ impl fmt::Display for Error {
                 f.write_str("the shared-memory region could not be created at the configured size")
             }
             Error::UnsupportedFormat(v) => write!(f, "unsupported file format version {v}"),
+            Error::UnsupportedFeature(what) => write!(
+                f,
+                "the file uses a feature this build does not support ({what}); open it with a \
+                 newer version"
+            ),
             Error::NetworkFilesystem => f.write_str("the database is on a network filesystem"),
             Error::TableNotFound(t) => write!(f, "no such table {t:?}"),
             Error::TableExists(t) => write!(f, "table {t:?} already exists"),
@@ -209,6 +218,7 @@ impl Error {
             },
             Error::ShmUnavailable => Error::ShmUnavailable,
             Error::UnsupportedFormat(v) => Error::UnsupportedFormat(*v),
+            Error::UnsupportedFeature(s) => Error::UnsupportedFeature(s.clone()),
             Error::NetworkFilesystem => Error::NetworkFilesystem,
             Error::TableNotFound(s) => Error::TableNotFound(s.clone()),
             Error::TableExists(s) => Error::TableExists(s.clone()),
@@ -270,7 +280,10 @@ impl From<pigeonhole_format::Error> for Error {
             F::KeyTooLarge => Error::KeyTooLarge,
             F::ValueTooLarge => Error::ValueTooLarge,
             F::UnsupportedCompression(c) => {
-                Error::Corruption(format!("unsupported compression codec {c}"))
+                Error::UnsupportedFeature(format!("compression codec {c}"))
+            }
+            F::UnsupportedFeature { what, value } => {
+                Error::UnsupportedFeature(format!("{what} {value}"))
             }
             F::InvalidArgument { what } => Error::InvalidArgument(what.to_owned()),
             _ => Error::Corruption(format!("format: {e}")),
@@ -423,9 +436,17 @@ mod tests {
             ),
             (F::KeyTooLarge, |e| matches!(e, Error::KeyTooLarge)),
             (F::ValueTooLarge, |e| matches!(e, Error::ValueTooLarge)),
-            (F::UnsupportedCompression(7), |e| {
-                matches!(e, Error::Corruption(_))
-            }),
+            (
+                F::UnsupportedCompression(7),
+                |e| matches!(e, Error::UnsupportedFeature(m) if m == "compression codec 7"),
+            ),
+            (
+                F::UnsupportedFeature {
+                    what: "value tag",
+                    value: 4,
+                },
+                |e| matches!(e, Error::UnsupportedFeature(m) if m == "value tag 4"),
+            ),
             (F::InvalidArgument { what: "x" }, |e| {
                 matches!(e, Error::InvalidArgument(_))
             }),

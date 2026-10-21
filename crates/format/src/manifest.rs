@@ -119,9 +119,10 @@ pub fn decode_block(bytes: &[u8]) -> crate::Result<(ManifestHeader, Vec<Edit>, u
     let kind = match h[12] {
         1 => ManifestBlockKind::Snapshot,
         2 => ManifestBlockKind::Delta,
-        _ => {
-            return Err(Error::Corrupt {
+        k => {
+            return Err(Error::UnsupportedFeature {
                 what: "manifest block kind",
+                value: u64::from(k),
             });
         }
     };
@@ -370,9 +371,14 @@ impl FamilyOptions {
     }
 
     fn decode(r: &mut Reader<'_>) -> crate::Result<Self> {
-        let corrupt = |what| move |_| Error::Corrupt { what };
         Ok(Self {
-            compression: Compression::from_u8(r.u8()?).map_err(corrupt("family compression"))?,
+            compression: {
+                let c = r.u8()?;
+                Compression::from_u8(c).map_err(|_| Error::UnsupportedFeature {
+                    what: "family compression",
+                    value: u64::from(c),
+                })?
+            },
             compression_level: r.i8()?,
             block_size: r.u32()?,
             bloom_bits: r.u8()?,
@@ -384,9 +390,10 @@ impl FamilyOptions {
                 0 => CachePriority::Low,
                 1 => CachePriority::Normal,
                 2 => CachePriority::High,
-                _ => {
-                    return Err(Error::Corrupt {
+                p => {
+                    return Err(Error::UnsupportedFeature {
                         what: "family cache priority",
+                        value: u64::from(p),
                     });
                 }
             },
@@ -394,9 +401,10 @@ impl FamilyOptions {
                 0 => CompactionStyle::Leveled,
                 1 => CompactionStyle::Tiered,
                 2 => CompactionStyle::FifoByTime,
-                _ => {
-                    return Err(Error::Corrupt {
+                c => {
+                    return Err(Error::UnsupportedFeature {
                         what: "family compaction style",
+                        value: u64::from(c),
                     });
                 }
             },
@@ -407,9 +415,10 @@ impl FamilyOptions {
                 match r.u8()? {
                     0 => FamilyKind::Standard,
                     1 => FamilyKind::Counter,
-                    _ => {
-                        return Err(Error::Corrupt {
+                    k => {
+                        return Err(Error::UnsupportedFeature {
                             what: "family kind",
+                            value: u64::from(k),
                         });
                     }
                 }

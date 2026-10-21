@@ -333,7 +333,7 @@ u1   profile  name       1761030000000000  Ada
 | 3 | Corruption: the file is damaged (`ErrorCode::Corruption`, or `phdb check` found damage). |
 | 4 | Locked or busy: another process holds the writer lock (`WriterLocked`), the database stayed too busy (`Busy`), every reader slot is taken (`NoReaderSlot`), or `--reader` found no running writer to attach to (`NoWriter`). |
 | 5 | Not found: the file, or a table or family the command names. |
-| 6 | Unsupported: the file's format version is newer than this `phdb` (`UnsupportedFormat`), or the writer runs another shared-memory layout (`ShmVersionMismatch`), or the system lacks a feature (`Unsupported`). |
+| 6 | Unsupported: the file's format version is newer than this `phdb` (`UnsupportedFormat`), the file uses a feature this `phdb` lacks (`UnsupportedFeature`), or the writer runs another shared-memory layout (`ShmVersionMismatch`), or the system lacks a feature (`Unsupported`). |
 
 **Errors** go to standard error. With `--format table` or `csv` they print as one line, `phdb: error: <message>`. With `--format json` or `jsonl` they print as one JSON object:
 

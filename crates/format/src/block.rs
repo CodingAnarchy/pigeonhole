@@ -125,7 +125,10 @@ impl BlockKind {
             3 => Ok(Self::TopIndex),
             4 => Ok(Self::Filter),
             5 => Ok(Self::Properties),
-            _ => Err(Error::Corrupt { what: "block kind" }),
+            b => Err(Error::UnsupportedFeature {
+                what: "block kind",
+                value: u64::from(b),
+            }),
         }
     }
 }

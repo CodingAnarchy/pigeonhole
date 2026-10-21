@@ -286,6 +286,7 @@ fn error_codes_are_stable_numbers() {
         (ErrorCode::BatchTooLarge, 27),
         (ErrorCode::OutcomeUnknown, 28),
         (ErrorCode::NoWriter, 29),
+        (ErrorCode::UnsupportedFeature, 30),
     ];
     for (code, n) in codes {
         assert_eq!(code as u32, n, "{code:?}");
@@ -339,6 +340,10 @@ fn every_engine_error_maps_to_its_code() {
         (E::WouldDeadlock, ErrorCode::WouldDeadlock),
         (E::OutcomeUnknown, ErrorCode::OutcomeUnknown),
         (E::NoWriter, ErrorCode::NoWriter),
+        (
+            E::UnsupportedFeature("value tag 4".into()),
+            ErrorCode::UnsupportedFeature,
+        ),
     ];
     for (e, code) in cases {
         let what = format!("{e:?}");
