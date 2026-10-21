@@ -178,9 +178,15 @@ fn arrow(
             ArrowError::IoError(_, e) => Out::Io(e),
             ArrowError::ExternalError(e) => match e.downcast::<pigeonhole::Error>() {
                 Ok(e) => Failure::db(&format!("read table {table}"), &e).into(),
-                Err(e) => Failure::unsupported(format!("dump --format arrow: {e}")).into(),
+                Err(e) => Failure::export(format!("dump --format arrow: {e}")).into(),
             },
-            e => Failure::unsupported(format!("dump --format arrow: {e}")).into(),
+            // The export reports a cell an Arrow batch can't hold (a timestamp above
+            // i64::MAX, a key or value over the 32-bit offsets) as an invalid argument.
+            e @ ArrowError::InvalidArgumentError(_) => {
+                Failure::unsupported(format!("dump --format arrow: {e}")).into()
+            }
+            // Anything else (the IPC writer's own errors) is a plain failure.
+            e => Failure::export(format!("dump --format arrow: {e}")).into(),
         }
     };
     let mut w = arrow_ipc::writer::StreamWriter::try_new(out, &export.schema()).map_err(fail)?;

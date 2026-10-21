@@ -202,11 +202,13 @@ How values are written:
 **`arrow`** is an [Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format) of one table, for DuckDB, Polars, pyarrow and other Arrow readers (#691). Name the table with `--table`: a stream has one schema, so `dump --format arrow` without exactly one table fails with status 2.
 - **Schema:** the [Arrow export's](arrow.md) long schema, one Arrow row per cell: `row`, `family`, `qualifier`, `ts` (a UTC microsecond timestamp), `value` (the bytes, or a typed value's little-endian encoding), `value_type` (`bytes`, `i64`, `f64`), and the typed columns `value_i64` (also every counter) and `value_f64`, null for other cells.
 - **Order:** as `jsonl`. Every retained version, at one snapshot.
-- **Limit:** a timestamp above `i64::MAX` doesn't fit an Arrow timestamp: the dump fails with status 6 (`Unsupported`), naming the row. `jsonl` dumps it.
+- **Limit:** a timestamp above `i64::MAX` doesn't fit an Arrow timestamp: the dump fails with status 6 (`Unsupported`), naming the row. `jsonl` dumps it. Any other failure of the Arrow writer is status 1 (`Export`).
+- **Check the status.** A dump that fails partway, in any format, leaves what it wrote so far on standard output, and an Arrow stream cut short has no end-of-stream marker: pyarrow and Polars read it as a shorter table without complaint. Treat the output as complete only when `phdb` exits 0.
 
 ```text
 $ phdb dump --format arrow --table users app.phdb > users.arrows
 $ python3 -c 'import polars as pl; print(pl.read_ipc_stream("users.arrows").group_by("family").len())'
+$ pip install polars duckdb pyarrow pytz    # DuckDB needs pytz for the UTC timestamp column
 $ python3 -c 'import duckdb, pyarrow.ipc as ipc; t = ipc.open_stream("users.arrows").read_all(); print(duckdb.sql("select count(*) from t"))'
 ```
 
@@ -339,4 +341,4 @@ u1   profile  name       1761030000000000  Ada
 {"phdb":1,"error":{"code":"WriterLocked","code_num":3,"message":"open: another process holds the writer lock"}}
 ```
 
-`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read), `Unsupported` (a cell `dump --format arrow` can't hold; status 6) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.
+`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read), `Unsupported` (a cell `dump --format arrow` can't hold; status 6), `Export` (the Arrow writer failed otherwise; status 1) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.

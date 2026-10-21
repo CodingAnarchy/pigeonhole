@@ -163,7 +163,17 @@ impl ArrowScan<'static> {
     ///
     /// Start from [`Scan::into_owned`]: the C stream may outlive any borrow. The consumer owns
     /// the stream and calls its `release` callback when done (moving it into a
-    /// `Box::into_raw` pointer is the usual way to pass it over). Feature `ffi`.
+    /// `Box::into_raw` pointer is the usual way to pass it over). The stream is `Send`, not
+    /// `Sync`: the consumer serializes its calls, from any thread, as the C stream
+    /// interface requires. Feature `ffi`.
+    ///
+    /// - **After [`Pigeonhole::close`](pigeonhole::Pigeonhole::close):** the next
+    ///   `get_next` fails with the database's `Closed` error (`get_last_error` says "the
+    ///   database is closed") and the stream ends; `release` is still the consumer's job and
+    ///   is safe to call.
+    /// - **A panic** inside `get_next` (an `extern "C"` callback) aborts the consumer's
+    ///   process rather than coming back as an error. The export does not panic on any input
+    ///   it accepts, but an embedder should know the failure mode.
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole};

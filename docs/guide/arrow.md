@@ -142,6 +142,11 @@ let ptr: *mut FFI_ArrowArrayStream = Box::into_raw(Box::new(stream));
 
 The feature adds `libc`; `pigeonhole-arrow` itself uses no `unsafe`. Taking the pointer back on the consumer's side is the consumer's `unsafe`.
 
+- **After `close`:** a stream still held gets `Closed` from its next `get_next` (the message is "the database is closed") and ends. `release` is still the consumer's to call, and is safe.
+- **Threads:** the stream is `Send`, not `Sync`. The consumer calls it from one thread at a time, which may change, as the C stream interface requires.
+- **Panics:** a panic inside `get_next` aborts the process, because it's an `extern "C"` callback. The export doesn't panic on any input it accepts.
+- **A stream cut short** by an error leaves the batches already taken; check the error before treating the data as complete.
+
 ## DuckDB and Polars without Rust: `phdb dump --format arrow`
 The [`phdb`](cli.md#phdb-dump-and-phdb-load) tool writes one table as an Arrow IPC stream in this schema, with the typed columns, every retained version, at one snapshot:
 
@@ -153,6 +158,7 @@ $ phdb dump --format arrow --table users app.phdb > users.arrows
 >>> import polars as pl
 >>> pl.read_ipc_stream("users.arrows").group_by("family").len()
 
+>>> # pip install duckdb pyarrow pytz: DuckDB needs pytz for the UTC timestamp column
 >>> import duckdb, pyarrow.ipc as ipc
 >>> users = ipc.open_stream("users.arrows").read_all()
 >>> duckdb.sql("select decode(row) as row, value_i64 from users where family = 'stats'")

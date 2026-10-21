@@ -65,3 +65,54 @@ fn a_c_stream_reads_back_as_the_export() {
     drop(t);
     db.close().unwrap();
 }
+
+/// #826 via the C stream: a consumer that holds the stream past `close` gets `Closed` from
+/// `get_next`, then the end, and its `release` afterwards is clean, whether it had read a
+/// batch or not.
+#[test]
+fn a_c_stream_held_past_close_reports_closed_and_releases() {
+    let vfs = SimVfs::new(5);
+    let db = Pigeonhole::open(
+        "/db/ffi-close.phdb",
+        Options::default().vfs(Arc::clone(&vfs) as _).shards(1),
+    )
+    .unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    for i in 0..100u32 {
+        t.mutate(format!("r{i:03}").as_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+    }
+    let o = ArrowOptions::default().batch_cells(10);
+    let stream = |o: &ArrowOptions| {
+        ArrowArrayStreamReader::try_new(
+            scan_to_arrow(t.scan_prefix(b"").into_owned(), o)
+                .unwrap()
+                .into_ffi_stream(),
+        )
+        .unwrap()
+    };
+    let mut started = stream(&o);
+    assert_eq!(started.next().unwrap().unwrap().num_rows(), 10);
+    let mut unread = stream(&o);
+    let untouched = stream(&o);
+    drop(t);
+    db.close().unwrap();
+
+    for reader in [&mut started, &mut unread] {
+        let e = reader.next().unwrap().unwrap_err().to_string();
+        assert!(e.contains("the database is closed"), "{e}");
+        assert!(reader.next().is_none(), "the stream ends after the error");
+    }
+    // Releasing (dropping the reader calls the stream's `release`) is clean after close,
+    // also for a stream never read.
+    drop(started);
+    drop(unread);
+    drop(untouched);
+}

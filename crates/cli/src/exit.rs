@@ -101,6 +101,16 @@ impl Failure {
         }
     }
 
+    /// The Arrow IPC writer failed for a reason other than the data (exit 1, `Export`).
+    pub(crate) fn export(message: String) -> Self {
+        Self {
+            code: "Export".into(),
+            code_num: None,
+            message,
+            status: ExitStatus::ERROR,
+        }
+    }
+
     /// A write in a read-only shell (exit 1, the `ReadOnly` error code).
     pub(crate) fn read_only(mode: &str) -> Self {
         Self {
