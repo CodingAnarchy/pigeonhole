@@ -23,20 +23,26 @@ In `pigeonhole-engine` (additions): `Engine::check(vfs, path, &CheckOptions) -> 
 - It opens a read-write handle only to take the writer lock, like a writer's open. A running writer makes it fail with `WriterLocked`.
 - It reads through a separate read-only handle. It never builds shared memory, never replays the WAL, never calls `OpenedPager::finish`, and writes nothing.
 - An error means the check could not run (missing, locked, unreadable). Damage is a finding.
+- **A file a newer build wrote** fails with `UnsupportedFormat`. It is not reported as two damaged superblock slots.
+- **It needs write access** to the file, for the lock handle, so a copy on read-only media can't be checked in place.
 
 **What it checks:**
 
 | Structure | Checks |
 |---|---|
-| Superblock | Each slot decoded on its own. `Superblock::choose`'s fallback would hide a damaged slot. An all-zero slot B is a new file's, never written. A damaged slot is `Corruption` if the newest valid root closed cleanly, else `Warning`, because a crash mid-root-commit tears the slot being written. The root's `file_pages` must fit the file's length (truncation). |
+| Superblock | Each slot decoded on its own. `Superblock::choose`'s fallback would hide a damaged slot. An all-zero slot B is a new file's, never written. A damaged slot is `Corruption` if the newest valid root closed cleanly, else `Warning`, because a crash mid-root-commit tears the slot being written. The rule assumes 512-byte sector atomicity: the 128-byte superblock sits inside one sector, so a sector-atomic tear leaves the old or the new superblock, never an invalid one. On a device that tears inside a sector, a power loss during the first root commit after a clean open could damage the other slot while the clean root is newest. The root's `file_pages` must fit the file's length (truncation). |
 | Manifest | The snapshot and delta blocks the root names, through `manifest::load`, the same decode as open. A failure is one finding, and the checks that need the catalog are skipped. |
 | Allocation | Every extent the root and the manifest reference: a valid extent (past the reserved header, a power of two from 64 KiB to 64 MiB, aligned to its size), inside the file, and overlapping no other. SSTs shared by tablets after a split are counted once. |
-| SSTs | Opened with a disabled block cache, so every block is read from disk and its checksum verified. A cached block skips verification. The walk checks: footer, top index, filters and properties at open; then every index partition and data block; keys strictly increasing within the recorded key range; the properties agreeing with the manifest's `SstMeta` (table, family, key range, seqnos, timestamps, entries, deletes); the entry count; the last key; every blob pointer naming a blob file of the same family; and the SST's recorded blob references (#240) equal to the pointers it holds. |
+| SSTs | Opened with a disabled block cache, so every block is read from disk and its checksum verified. A cached block skips verification. The walk checks: footer, top index, filters and properties at open; then every index partition and data block; keys strictly increasing within the recorded key range; the properties agreeing with the manifest's `SstMeta` (table, family, key range, seqnos, timestamps, entries, deletes); the entry count; the last key; every blob pointer naming a blob file of the same family; and the SST's recorded blob references (#240) equal to the pointers it holds. An SST with pointers but no recorded references is a `Warning`: no release writes one, and the engine treats it as pointing anywhere. |
 | Blob files | Each extent's header (file id, position, one size class), then every record from logical offset 0 to `total_bytes`, with its checksum verified. |
 | WAL sidecars | Each slot's header: another database's segment, or a wrong stream or segment size, is corruption. Then the log is read from the stream's checkpoint and chained as `wal::Recovery` replays it. Recovery isn't reused because it opens the stream writable and syncs it. |
 
-**How a WAL stop is classified:**
-- **Valid fragments of the same epoch after the stop,** in the rest of that frame or at a later frame's start, are `Corruption`. Replay would silently drop them. The message names the other cause, a power loss that reordered unsynced writes.
+**How a WAL stop is classified** (amended after perf287's review):
+- **Valid fragments of the same epoch after the stop,** in the rest of that frame or at a later frame's start, are classified this way:
+  - **`Warning`** after a crash. A power loss tears the last unsynced write at sector granularity, and the sectors that survive need not be a prefix. So a stop followed by a later fragment of the same final write is an ordinary crash state: perf287 measured 7 in 400 seeds under `torn_writes`. Offline, it can't be told apart from damage, because the WAL doesn't record what was synced.
+  - **`Corruption`** after a clean shutdown, since everything logged was synced. In practice a clean close checkpoints to the log's end, so nothing past the checkpoint is left to damage; the rule covers WALs kept by an attached reader.
+  - **`Info`** when a recovery already chained a new segment exactly at the stop (`prev_end == stop`), so it has dropped what follows. Without this, every later check would re-report the same tear until the checkpoint passed it.
+- **Damage inside the WAL is provable.** FORMAT §10.1 rule 1 syncs a full segment before its successor's header is written. So in a segment with a running-time successor, damage shows up as a successor `prev_end` past the stop, which is `Corruption`.
 - **A torn last fragment** is `Info`.
 - **Unused space or an older epoch** is a clean end.
 - **A successor whose `prev_end` disagrees with the stop**, several successors, a missing checkpoint segment with later segments present, or a segment newer than the checkpoint that the chain never reaches: each is `Corruption`.
@@ -64,9 +70,11 @@ It touches no commit, cross-shard (#724) or share-reporting (#777) code.
 `crates/engine/tests/check.rs`, on the simulated filesystem:
 - A healthy database (plain and `deep`), and a crashed one with a WAL, check clean.
 - After a crashed one checks clean, it opens and recovers every commit, so the check changed nothing.
-- A live writer refuses the check.
-- Corruption is found when bytes are flipped in: a superblock slot, the manifest snapshot, an SST data block, an SST footer, a blob record, a blob extent header, and a WAL record before later records. A truncated file is found too.
-- **False positives:** 40 seeded workloads (all three durabilities, background flushes from small memtables, separated values) crash by process kill and by power loss. None leaves anything but `Info`, and each then opens and checks clean.
+- A live writer refuses the check, and a newer format version is refused with `UnsupportedFormat`.
+- Corruption is found when bytes are flipped in: a superblock slot, the manifest snapshot, an SST data block, an SST footer, a blob record, a blob extent header, and a WAL record in a segment with a successor (the `prev_end` mismatch). A truncated file is found too.
+- The same WAL damage at the end of a crashed log is a `Warning`, and unrecorded blob references are a `Warning`.
+- **False positives**, without faults: 40 seeded workloads (all three durabilities, background flushes from small memtables, separated values) crash by process kill and by power loss. None leaves anything but `Info`, and each then opens and checks clean.
+- **False positives, with faults:** perf287's `power_losses_that_tear_or_reorder_never_look_like_corruption` runs 100 seeds under each of `torn_writes`, `reorder_unsynced` and both, plus both again followed by a reopen, 50 `Sync` commits and a process crash. None reports `Corruption`, and every database opens. Under the first rule, torn seed 12 failed it.
 
 `crates/pigeonhole/tests/check.rs`: the same on the real filesystem through the public API (a healthy file, a damaged SST, a running writer, a missing file), plus a doctest.
 

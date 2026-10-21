@@ -18,7 +18,10 @@ use crate::Result;
 /// an [`Severity::Info`] finding, not damage).
 ///
 /// Damage is reported in [`CheckReport::findings`], not as an error: an error means the check
-/// could not run (the file is missing or locked, or a read failed).
+/// could not run (the file is missing or locked, or a read failed). A file a newer build
+/// wrote fails with [`ErrorCode::UnsupportedFormat`](crate::ErrorCode::UnsupportedFormat).
+/// The lock needs write access to the file, so a copy on read-only media can't be checked
+/// in place.
 ///
 /// ```
 /// use pigeonhole::{CheckOptions, Family, Options, Pigeonhole};

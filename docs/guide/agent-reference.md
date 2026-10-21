@@ -276,11 +276,11 @@ Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; befo
 
 | Item | Rule |
 |---|---|
-| When | No writer running: it takes the writer lock and fails with `WriterLocked` otherwise. It never replays the WAL and never writes; a crashed database checks as it was left. |
+| When | No writer running: it takes the writer lock and fails with `WriterLocked` otherwise. The lock needs write access to the file. It never replays the WAL and never writes; a crashed database checks as it was left. A newer format version fails with `UnsupportedFormat`. |
 | Result | `Err` only if it couldn't run (missing file is `Io`, locked, unreadable). Damage is a `Finding` in `report.findings`. `report.is_ok()` is true when no finding is `Severity::Corruption`. |
 | Checks | Both superblock slots, the manifest, extents (valid, inside the file, disjoint), every SST block with its checksum forced (key order, agreement with the manifest, blob references), every blob record, and the WAL sidecars from each stream's checkpoint, as replay chains them. |
 | `CheckOptions` | `deep(true)`: also read every blob pointer's record, and recount blob live bytes (a mismatch is a `Warning`). `allow_fuse(true)`. |
-| `Finding` | `structure` (`Superblock`, `Manifest`, `Allocation`, `Sst`, `Blob`, `Wal`), `severity` (`Corruption`; `Warning` for something a crash can also leave; `Info` for expected after a crash, such as a torn WAL tail), `object` (slot, SST id, blob file id or stream), `offset` (main file, or the WAL file for `Wal`), `message` (not stable wording). |
+| `Finding` | `structure` (`Superblock`, `Manifest`, `Allocation`, `Sst`, `Blob`, `Wal`), `severity` (`Corruption`; `Warning` for something a crash can also leave; `Info` for expected after a crash, such as a torn WAL tail; a WAL gap after a crash is a `Warning`, since a power loss tearing the last write looks the same), `object` (slot, SST id, blob file id or stream), `offset` (main file, or the WAL file for `Wal`), `message` (not stable wording). |
 | `regions` | Every region of the main file by offset: `Superblock { slot }`, `ManifestSnapshot`, `ManifestLog`, `Sst { sst, table, family, level, used }`, `Blob { blob_file, index, family }`. |
 | `wal` | One `WalFile` per sidecar (none after a clean close): `stream`, `path`, `len`, `segment_size`, `segments`, `records` (what the next open replays), `checkpoint` and `end` as (epoch, offset), `end_slot`. |
 

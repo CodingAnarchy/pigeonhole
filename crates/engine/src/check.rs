@@ -342,6 +342,12 @@ impl Checker {
             .iter()
             .map(|(_, _, read, page)| read.then(|| Superblock::decode(page)))
             .collect();
+        // A file a newer build wrote isn't damaged: this build can't check it.
+        for d in decoded.iter().flatten() {
+            if let Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) = d {
+                return Err(Error::UnsupportedFormat(*found));
+            }
+        }
         let valid: Vec<&Superblock> = decoded.iter().flatten().flatten().collect();
         self.report.counts.superblocks = valid.len() as u64;
         let newest = valid.iter().max_by_key(|s| s.sequence).copied().cloned();
@@ -670,11 +676,26 @@ impl Checker {
                 "SST {id}'s last key is not its recorded largest key"
             ));
         }
-        let recorded = catalog.blob_refs.get(&meta.id).cloned().unwrap_or_default();
-        if refs != recorded {
-            return Err(format!(
-                "SST {id} holds blob references {refs:?}; the manifest records {recorded:?}"
-            ));
+        match catalog.blob_refs.get(&meta.id) {
+            Some(recorded) if *recorded != refs => {
+                return Err(format!(
+                    "SST {id} holds blob references {refs:?}; the manifest records {recorded:?}"
+                ));
+            }
+            Some(_) => {}
+            // No release writes an SST with pointers but no recorded references; the engine
+            // treats one as pointing anywhere (blob GC keeps every file of its family).
+            None if !refs.is_empty() => self.find(
+                Structure::Sst,
+                Severity::Warning,
+                Some(id),
+                Some(meta.extent.offset()),
+                format!(
+                    "SST {id} holds blob pointers but the manifest records no references for \
+                     it: blob GC keeps every file of its family"
+                ),
+            ),
+            None => {}
         }
         Ok(())
     }
@@ -914,6 +935,7 @@ impl Checker {
                 file,
                 stream,
                 db_id,
+                clean: self.report.clean_shutdown,
                 findings: Vec::new(),
             };
             scan.run(checkpoint, &mut w)?;
@@ -930,6 +952,8 @@ struct WalScan {
     file: FileRef,
     stream: StreamId,
     db_id: [u8; 16],
+    /// The last writer closed cleanly: everything it logged was synced, so a gap is damage.
+    clean: bool,
     findings: Vec<Finding>,
 }
 
@@ -1057,15 +1081,18 @@ impl WalScan {
                     Err(e) => return Err(Error::Corruption(e.to_string())),
                 }
             };
-            self.classify_stop(base, segment_size, epoch, stop)?;
-            w.end = (epoch, stop);
-            w.end_slot = Some(slot as u64);
             // As replay: continue in the one segment chained to this one, or end the log.
             let succ: Vec<_> = headers
                 .iter()
                 .enumerate()
                 .filter_map(|(i, h)| h.as_ref().filter(|h| h.prev_epoch == epoch).map(|h| (i, h)))
                 .collect();
+            // A successor chained exactly at the stop was started there by a recovery, which
+            // already dropped what follows.
+            let resolved = matches!(succ.as_slice(), [(_, h)] if u64::from(h.prev_end) == stop);
+            self.classify_stop(base, segment_size, epoch, stop, resolved)?;
+            w.end = (epoch, stop);
+            w.end_slot = Some(slot as u64);
             cur = match succ.as_slice() {
                 [] => None,
                 [(i, h)] if u64::from(h.prev_end) == stop => Some((*i, h.epoch, FRAME)),
@@ -1115,8 +1142,20 @@ impl WalScan {
     }
 
     /// A segment's data stopped at `stop`: a clean end (unused space or an older epoch), a
-    /// torn tail, or damage with valid fragments of this epoch after it.
-    fn classify_stop(&mut self, base: u64, segment_size: u64, epoch: u32, stop: u64) -> Result<()> {
+    /// torn tail, or a gap with valid fragments of this epoch after it. A gap is damage only
+    /// after a clean shutdown: a power loss tears the last unsynced write at sector
+    /// granularity, and the sectors that survive need not be a prefix, so a crash leaves the
+    /// same picture (FORMAT §10.1: only a segment with a successor is known to be synced in
+    /// full, and that case is the `prev_end` check). `resolved`: a recovery already chained
+    /// a new segment at `stop`.
+    fn classify_stop(
+        &mut self,
+        base: u64,
+        segment_size: u64,
+        epoch: u32,
+        stop: u64,
+        resolved: bool,
+    ) -> Result<()> {
         let s = self.stream.0;
         let mut frame = vec![0u8; FRAME_SIZE];
         let stop_frame = stop - stop % FRAME;
@@ -1141,13 +1180,29 @@ impl WalScan {
             at += FRAME;
         }
         if let Some(at) = later {
+            let (severity, why) = if resolved {
+                (
+                    Severity::Info,
+                    "a recovery already continued the log at the stop and dropped them",
+                )
+            } else if self.clean {
+                (
+                    Severity::Corruption,
+                    "the last writer closed cleanly, so they were synced: replay would drop them",
+                )
+            } else {
+                (
+                    Severity::Warning,
+                    "replay will drop them: a power loss that tore the last unsynced write leaves \
+                     this, and so does damage",
+                )
+            };
             self.find(
-                Severity::Corruption,
+                severity,
                 Some(base + stop),
                 format!(
                     "WAL stream {s}: segment epoch {epoch}'s data stops at offset {stop}, but valid \
-                     records follow at {at}: replay would drop them (damage, or a power loss that \
-                     reordered unsynced writes)"
+                     records follow at {at}: {why}"
                 ),
             );
             return Ok(());
