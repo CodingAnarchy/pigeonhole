@@ -14,10 +14,10 @@
 //! (`pigeonhole_sst::counting_readahead`).
 //!
 //! `warm` measures the other end, the ordered scan from cache (#29; spec: > 1 GB/s decoded per
-//! core): it reopens with a block cache larger than the table, fills it with one untimed
-//! pass, then times a second pass on this thread and prints its value bytes per second and
-//! its block-cache hits and misses (so the share served from the cache is visible).
-//!
+//! core): it reopens with a block cache larger than the table's decoded blocks, fills it with
+//! one untimed pass, then times a second pass on this thread and prints its value bytes per
+//! second and its block-cache hits and misses (so the share served from the cache is visible).
+
 //! `scan` measures nothing about the page cache: the caller empties it before each `scan` (on
 //! Linux, `sync; echo 3 > /proc/sys/vm/drop_caches` as root), or opens with direct I/O
 //! (`PIGEONHOLE_DIRECT=1`). The backend comes from `PIGEONHOLE_IO` (`pread`, `uring`), as for
@@ -112,9 +112,20 @@ fn scan(dir: &Path) {
 /// The ordered scan from cache (#29; spec: > 1 GB/s decoded per core): a block cache larger
 /// than the table, one untimed pass to fill it, then a timed pass on this thread; its
 /// block-cache hits and misses are printed, so the share served from the cache is visible.
+///
+/// The cache holds decoded blocks, so it is sized from the bytes a first pass decodes, not
+/// from the file: compressed, the file can be smaller than its blocks (gate 21's file was
+/// 3.0 GiB for 4.0 GiB of values, and a cache of 1.25× the file missed 243K blocks).
 fn warm(dir: &Path) {
-    let file = std::fs::metadata(dir.join("cold.phdb")).unwrap().len();
-    let cache = usize::try_from(file + file / 4 + (64 << 20)).unwrap();
+    let decoded = {
+        let db = open(dir, 64 << 20);
+        let t = db.table("t").unwrap().open().unwrap();
+        let (rows, bytes) = pass(&t);
+        drop(t);
+        db.close().unwrap();
+        bytes + rows * key(0).len() as u64
+    };
+    let cache = usize::try_from(decoded + decoded / 4 + (64 << 20)).unwrap();
     let db = open(dir, cache);
     let t = db.table("t").unwrap().open().unwrap();
     pass(&t);
