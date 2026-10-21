@@ -593,7 +593,22 @@ impl Engine {
     /// superblock and manifest, sets up shared memory, replays every WAL stream, resolves
     /// prepared cross-shard commits, and starts the shards (in engine-owned mode).
     pub fn open(path: &Path, options: EngineOptions) -> Result<Arc<Engine>> {
-        let (engine, _) = Self::open_writer(path, options, Mode::EngineOwned)?;
+        let (engine, _) = Self::open_writer(path, options, Mode::EngineOwned, None)?;
+        Ok(engine)
+    }
+
+    /// Opens the database an engine closed with [`Engine::close_for_reopen`] left, on the
+    /// writer lock and presence that close kept (D265): as [`Engine::open`], without taking
+    /// them, so no other writer could open the file in between and no reader removed its
+    /// shared memory. The WAL is replayed as after a crash. For `pigeonhole`'s automatic
+    /// recovery (#620); not a stable API.
+    #[doc(hidden)]
+    pub fn open_with(
+        path: &Path,
+        options: EngineOptions,
+        handover: Handover,
+    ) -> Result<Arc<Engine>> {
+        let (engine, _) = Self::open_writer(path, options, Mode::EngineOwned, Some(handover))?;
         Ok(engine)
     }
 
@@ -626,7 +641,7 @@ impl Engine {
                 "compaction_cores must be 0 in application-owned mode (decision D40)".to_owned(),
             ));
         }
-        let (engine, shards) = Self::open_writer(path, options, Mode::ApplicationOwned)?;
+        let (engine, shards) = Self::open_writer(path, options, Mode::ApplicationOwned, None)?;
         Ok((engine, shards.unwrap_or_default()))
     }
 
@@ -634,6 +649,7 @@ impl Engine {
         path: &Path,
         options: EngineOptions,
         mode: Mode,
+        handover: Option<Handover>,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
         let shards = if options.shards == 0 {
             pigeonhole_io::sys::default_shards()
@@ -669,11 +685,18 @@ impl Engine {
         // 1. The lock handle: the local-filesystem check, then the writer byte. The check
         //    comes first (#147): it only reads (`fstatfs`), and on a network filesystem
         //    without lock support taking the lock fails with a bare I/O error instead.
-        let mut open_opts = OpenOptions::read();
-        open_opts.write = true;
-        let file = vfs.open(path, open_opts)?;
-        check_local(&file, options.allow_fuse)?;
-        let writer_lock = WriterLock::acquire(&file)?;
+        //    A handover (D265) brings the handle with both locks held: nothing to take.
+        let (file, writer_lock, presence) = match handover {
+            Some(Handover { locks }) => (locks.file, locks._writer, Some(locks.presence)),
+            None => {
+                let mut open_opts = OpenOptions::read();
+                open_opts.write = true;
+                let file = vfs.open(path, open_opts)?;
+                check_local(&file, options.allow_fuse)?;
+                let writer_lock = WriterLock::acquire(&file)?;
+                (file, writer_lock, None)
+            }
+        };
         let identity = file.identity()?;
 
         // 2. The page file and the manifest.
@@ -717,7 +740,10 @@ impl Engine {
         shm_config.dir = options.shm_dir.clone();
         shm_config.first_seqno = first_seqno(catalog.counters.seqno_ceiling, 0);
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?;
-        let presence = Presence::acquire(&file)?;
+        let presence = match presence {
+            Some(presence) => presence,
+            None => Presence::acquire(&file)?,
+        };
 
         // 4. Shard states over the arenas. With tablet changes on, every tablet is placed so
         //    no shard holds more slots than its arena serves where the tablets allow, and the
@@ -790,7 +816,9 @@ impl Engine {
             locks: Mutex::new(Some(Locks {
                 _writer: writer_lock,
                 presence,
+                file: file.clone(),
             })),
+            keep_locks: AtomicBool::new(false),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1339,6 +1367,7 @@ impl Engine {
             commit_spin_nanos: options.commit_spin_nanos,
             tail_index: false,
             locks: Mutex::new(None),
+            keep_locks: AtomicBool::new(false),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -2289,6 +2318,55 @@ impl Engine {
     pub fn close(&self) -> Result<()> {
         self.inner.close(true)
     }
+
+    /// Closes as [`Engine::close`] does, keeping the writer lock and presence for an
+    /// [`Engine::open_with`] of the same path (D265): the close's result, and the handover,
+    /// or `None` when the final close had already released the locks (every shard was dead
+    /// and the close ran before this call, or `close` ran concurrently); the caller then
+    /// falls back to [`Engine::open`]. Dropping the handover releases the locks as a close
+    /// does. Engine-owned writers only: an application-owned engine's close cannot wait,
+    /// and a reader holds no writer lock. For `pigeonhole`'s automatic recovery (#620); not
+    /// a stable API.
+    #[doc(hidden)]
+    pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>) {
+        if self.inner.role != Role::Writer || self.inner.application_owned {
+            return (
+                Err(Error::InvalidArgument(
+                    "close_for_reopen needs an engine-owned writer".to_owned(),
+                )),
+                None,
+            );
+        }
+        let shared = &self.inner.shared;
+        shared.keep_locks.store(true, Ordering::Release);
+        let result = self.inner.close(true);
+        let locks = shared
+            .locks
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        (result, locks.map(|locks| Handover { locks }))
+    }
+
+    /// Waits until this instance records a failure ([`Engine::is_failed`]; `true`, at once if
+    /// it already has), or until `deadline` passes or the instance's close finishes
+    /// (`false`). Blocks on a condition variable: no polling. For `pigeonhole`'s automatic
+    /// recovery (#620, D265); not a stable API.
+    #[doc(hidden)]
+    pub fn wait_failed(&self, deadline: std::time::Instant) -> bool {
+        let shared = &self.inner.shared;
+        shared
+            .failure
+            .wait(deadline, || shared.closed.load(Ordering::Acquire))
+    }
+}
+
+/// What [`Engine::close_for_reopen`] keeps for [`Engine::open_with`]: the writer lock, the
+/// presence and the handle they live on (D265). Dropping it releases them.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct Handover {
+    locks: Locks,
 }
 
 impl Drop for Engine {
