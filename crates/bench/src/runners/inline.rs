@@ -189,6 +189,35 @@ fn is_batch(j: usize, all: usize) -> bool {
     j.is_multiple_of(CROSS_BATCH_EVERY) && all >= 2
 }
 
+/// With readers on, whether batch `j` is a read-modify-write transaction: every other one.
+fn is_rmw(j: usize, all: usize, readers: bool) -> bool {
+    readers && is_batch(j, all) && (j / CROSS_BATCH_EVERY) % 2 == 1
+}
+
+/// The mixed row's read-modify-write commit (#816, D267): a transaction that reads the
+/// first cell of `w` and of the batch's extra rows, then writes them all.
+fn submit_rmw(
+    db: &Pigeonhole,
+    t: &Table,
+    w: &Write,
+    j: usize,
+    all: &[Write],
+) -> Result<CommitFuture, String> {
+    let mut txn = db.transaction().map_err(err)?;
+    let rows: Vec<&Write> = std::iter::once(w).chain(batch_extras(j, all)).collect();
+    for x in &rows {
+        if let Some((q, _)) = x.cells.first() {
+            txn.get(t, &x.row, x.family, q).map_err(err)?;
+        }
+    }
+    for x in &rows {
+        for (q, v) in &x.cells {
+            txn.put(t, &x.row, x.family, q, v);
+        }
+    }
+    Ok(txn.commit_async())
+}
+
 fn submit_with_batches(
     db: &Pigeonhole,
     t: &Table,
@@ -316,23 +345,30 @@ fn run_crew<I: Send, R: Send>(
     }
 }
 
-/// Commit latencies (submit to resolution) by kind: single-row commits and D247's batches.
+/// Commit latencies (submit to resolution) by kind: single-row commits, D247's batches and
+/// the mixed row's read-modify-write transactions.
 #[derive(Default)]
 struct KindHists {
     single: Histogram,
     batch: Histogram,
+    rmw: Histogram,
+    /// Read-modify-write transactions retried after a conflict.
+    conflicts: u64,
 }
 
 impl KindHists {
     fn merge(&mut self, other: &KindHists) {
         self.single.merge(&other.single);
         self.batch.merge(&other.batch);
+        self.rmw.merge(&other.rmw);
+        self.conflicts += other.conflicts;
     }
 
     fn all(&self) -> Histogram {
         let mut h = Histogram::new();
         h.merge(&self.single);
         h.merge(&self.batch);
+        h.merge(&self.rmw);
         h
     }
 }
@@ -349,29 +385,38 @@ fn pipeline(
     crew: &Crew,
     extras: PipelineExtras<'_>,
 ) -> Result<u64, String> {
-    let PipelineExtras { batches, deadline } = extras;
+    let PipelineExtras {
+        batches,
+        readers,
+        deadline,
+    } = extras;
     // A commit can resolve on another shard's thread: its wake must end this thread's wait.
     let waker = shard.waker();
     let mut cx = Context::from_waker(&waker);
     let submit_one = |j: usize, w: &Write| match batches {
-        Some((db, all)) => submit_with_batches(db, t, w, j, all),
-        None => submit(t, w),
+        Some((db, all)) if is_rmw(j, all.len(), readers) => submit_rmw(db, t, w, j, all),
+        Some((db, all)) => Ok(submit_with_batches(db, t, w, j, all)),
+        None => Ok(submit(t, w)),
     };
     // (first submission, commit index, write, retries after `Busy`, future)
     let mut flight: VecDeque<(Instant, usize, &Write, u32, CommitFuture)> =
         VecDeque::with_capacity(in_flight);
     let mut next = writes.iter().enumerate();
     let mut busy = 0u64;
+    let mut conflicts = 0u64;
     loop {
         // Past the deadline (D247) no commit starts; those in flight finish.
         let open = deadline.is_none_or(|d| Instant::now() < d);
         while open && flight.len() < in_flight {
             match next.next() {
-                Some((j, w)) => flight.push_back((Instant::now(), j, w, 0, submit_one(j, w))),
+                Some((j, w)) => flight.push_back((Instant::now(), j, w, 0, submit_one(j, w)?)),
                 None => break,
             }
         }
         if flight.is_empty() {
+            if let Some(h) = hist.as_deref_mut() {
+                h.conflicts += conflicts;
+            }
             return Ok(busy);
         }
         let mut progressed = false;
@@ -383,14 +428,24 @@ fn pipeline(
                 match r {
                     Ok(_) => {
                         if let Some(h) = hist.as_deref_mut() {
-                            let batch = batches.is_some_and(|(_, all)| is_batch(*j, all.len()));
-                            if batch { &mut h.batch } else { &mut h.single }.record(at.elapsed());
+                            let kind = match batches {
+                                Some((_, all)) if is_rmw(*j, all.len(), readers) => &mut h.rmw,
+                                Some((_, all)) if is_batch(*j, all.len()) => &mut h.batch,
+                                _ => &mut h.single,
+                            };
+                            kind.record(at.elapsed());
                         }
+                    }
+                    // The mixed row's read-modify-write transaction lost to a write after its
+                    // snapshot: run again with a new snapshot, as the transfer clients do.
+                    Err(e) if e.code() == ErrorCode::Conflict && *tries < CONFLICT_RETRIES => {
+                        conflicts += 1;
+                        retry.push((*at, *j, *w, *tries + 1, false));
                     }
                     // A stall past the engine's timeout: retried and counted, as the client
                     // runners do (D247's app-owned row reports it instead of stopping).
                     Err(e) if e.code() == ErrorCode::Busy && *tries < BUSY_RETRIES => {
-                        retry.push((*at, *j, *w, *tries + 1));
+                        retry.push((*at, *j, *w, *tries + 1, true));
                     }
                     Err(e) => failed = Some(err(e)),
                 }
@@ -398,9 +453,9 @@ fn pipeline(
             }
             Poll::Pending => true,
         });
-        for (at, j, w, tries) in retry {
-            busy += 1;
-            flight.push_back((at, j, w, tries, submit_one(j, w)));
+        for (at, j, w, tries, stalled) in retry {
+            busy += u64::from(stalled);
+            flight.push_back((at, j, w, tries, submit_one(j, w)?));
         }
         if let Some(e) = failed {
             return Err(e);
@@ -421,6 +476,8 @@ fn pipeline(
 #[derive(Clone, Copy)]
 struct PhaseExtras<'a> {
     batches: Option<&'a Pigeonhole>,
+    /// Every other batch reads its rows first (the mixed row).
+    readers: bool,
     deadline: Option<Instant>,
 }
 
@@ -428,8 +485,13 @@ struct PhaseExtras<'a> {
 #[derive(Clone, Copy)]
 struct PipelineExtras<'a> {
     batches: Option<(&'a Pigeonhole, &'a [Write])>,
+    readers: bool,
     deadline: Option<Instant>,
 }
+
+/// How many times the inline driver reruns a read-modify-write transaction that conflicted
+/// before the run fails.
+const CONFLICT_RETRIES: u32 = 1000;
 
 /// How many times the inline driver resubmits a commit refused with `Busy` before the run
 /// fails (as the client runners' `retry_busy`).
@@ -478,7 +540,11 @@ fn phase(
     pins: Option<&PinPlan>,
     extras: PhaseExtras<'_>,
 ) -> Result<(Vec<Shard>, Duration, KindHists, u64), String> {
-    let PhaseExtras { batches, deadline } = extras;
+    let PhaseExtras {
+        batches,
+        readers,
+        deadline,
+    } = extras;
     let (results, start) = run_crew(shards, |mut shard, crew| {
         // D235: each shard's thread on a CPU of its own, the same one every phase. A pin the
         // OS refuses leaves the thread unpinned (the plan was checked when it was made).
@@ -515,6 +581,7 @@ fn phase(
             crew,
             PipelineExtras {
                 batches: batches.map(|db| (db, writes)),
+                readers,
                 deadline,
             },
         );
@@ -629,6 +696,7 @@ impl PigeonholeRunner {
         let load = load_start.elapsed();
         // D247's app-owned row: about 20% of the commits are batches across shards.
         let batches = self.settings.cross_batches.then_some(&db);
+        let readers = self.settings.cross_readers;
         let (warm, measured) = run.split_at((warmup as usize).min(run.len()));
         // Warm up until the balancer has spread the table and settled: every shard owns a
         // tablet and nothing split, merged or moved for `WARMUP_SETTLED` (a fixed warmup can end
@@ -659,6 +727,7 @@ impl PigeonholeRunner {
                 pins.as_ref(),
                 PhaseExtras {
                     batches,
+                    readers,
                     deadline: Some(started + cap),
                 },
             )?;
@@ -710,7 +779,11 @@ impl PigeonholeRunner {
                 in_flight,
                 true,
                 pins.as_ref(),
-                PhaseExtras { batches, deadline },
+                PhaseExtras {
+                    batches,
+                    readers,
+                    deadline,
+                },
             )?;
             shards = s;
             busy_retries += b;
@@ -755,8 +828,10 @@ impl PigeonholeRunner {
             [
                 ("single-commit", &kinds.single),
                 ("batch-commit", &kinds.batch),
+                ("rmw-commit", &kinds.rmw),
             ]
             .into_iter()
+            .filter(|(_, h)| h.count() > 0)
             .map(|(op, h)| OpTypeStats {
                 op: op.to_owned(),
                 stats: LatencyStats::of(h),
@@ -771,10 +846,10 @@ impl PigeonholeRunner {
             store_config: format!(
                 "{} inline in-flight={in_flight} {placement}{}",
                 self.describe(),
-                if self.settings.cross_batches {
-                    " cross-batches=20%"
-                } else {
-                    ""
+                match (self.settings.cross_batches, readers) {
+                    (true, true) => " cross-batches=20% (half read-modify-write)",
+                    (true, false) => " cross-batches=20%",
+                    _ => "",
                 }
             ),
             workload: config.kind.name().to_owned(),
@@ -801,6 +876,7 @@ impl PigeonholeRunner {
                 busy_retries,
                 capped: options_.max_measured.map(|_| capped),
                 by_type,
+                txn_conflicts: readers.then_some(kinds.conflicts),
                 ..RunDetail::default()
             },
         })
