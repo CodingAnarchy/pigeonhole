@@ -124,6 +124,9 @@ pub enum Fault {
     /// stall path freezes memtables after the group's first member was admitted (#315
     /// review).
     NextRoomWait = 4,
+    /// The next freeze finds no chunk for a fresh memtable, as a starved arena would give
+    /// it: a closing shard then flushes the active memtable in place (#111, #838).
+    NextFreezeStarved = 5,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).
