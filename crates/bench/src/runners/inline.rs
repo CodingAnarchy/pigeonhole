@@ -19,9 +19,9 @@ use pigeonhole_io::sys::PinPlan;
 
 use super::pigeonhole::{create_table, err, options};
 use crate::{
-    BenchOp, EngineCommit, Histogram, PigeonholeRunner, RunDetail, RunOptions, RunRecord, Runner,
-    ShardShare, Stalls, WARMUP_CAP, WARMUP_CAP_AFTER_SWITCH, WARMUP_SETTLED,
-    WARMUP_SETTLED_AFTER_SWITCH, Workload, WorkloadConfig,
+    BenchOp, EngineCommit, Histogram, LatencyStats, OpTypeStats, PigeonholeRunner, RunDetail,
+    RunOptions, RunRecord, Runner, ShardShare, Stalls, WARMUP_CAP, WARMUP_CAP_AFTER_SWITCH,
+    WARMUP_SETTLED, WARMUP_SETTLED_AFTER_SWITCH, Workload, WorkloadConfig,
 };
 
 /// Commits each shard thread keeps in flight (D204).
@@ -183,6 +183,12 @@ fn batch_extras(j: usize, all: &[Write]) -> impl Iterator<Item = &Write> {
 /// D247's app-owned row: commit `j` of a thread's share is a batch of `w` and 1-3 rows picked
 /// across the whole stream (`all`), most of them owned by other shards; other commits are `w`
 /// alone.
+/// Whether commit `j` of a thread's share is a batch (D247's app-owned row), given the
+/// whole stream's length.
+fn is_batch(j: usize, all: usize) -> bool {
+    j.is_multiple_of(CROSS_BATCH_EVERY) && all >= 2
+}
+
 fn submit_with_batches(
     db: &Pigeonhole,
     t: &Table,
@@ -190,7 +196,7 @@ fn submit_with_batches(
     j: usize,
     all: &[Write],
 ) -> CommitFuture {
-    if !j.is_multiple_of(CROSS_BATCH_EVERY) || all.len() < 2 {
+    if !is_batch(j, all.len()) {
         return submit(t, w);
     }
     let mut batch = db.write_batch();
@@ -310,15 +316,36 @@ fn run_crew<I: Send, R: Send>(
     }
 }
 
+/// Commit latencies (submit to resolution) by kind: single-row commits and D247's batches.
+#[derive(Default)]
+struct KindHists {
+    single: Histogram,
+    batch: Histogram,
+}
+
+impl KindHists {
+    fn merge(&mut self, other: &KindHists) {
+        self.single.merge(&other.single);
+        self.batch.merge(&other.batch);
+    }
+
+    fn all(&self) -> Histogram {
+        let mut h = Histogram::new();
+        h.merge(&self.single);
+        h.merge(&self.batch);
+        h
+    }
+}
+
 /// Pipelines `writes` (up to `in_flight` at a time), giving `shard` a turn between polls;
-/// records each commit's latency (submit to resolution) in `hist` when given. Stops with an
+/// records each commit's latency (submit to resolution) in `hist` when given, by kind. Stops with an
 /// error if another thread of `crew` fails.
 fn pipeline(
     t: &Table,
     writes: &[&Write],
     in_flight: usize,
     shard: &mut Shard,
-    mut hist: Option<&mut Histogram>,
+    mut hist: Option<&mut KindHists>,
     crew: &Crew,
     extras: PipelineExtras<'_>,
 ) -> Result<u64, String> {
@@ -356,7 +383,8 @@ fn pipeline(
                 match r {
                     Ok(_) => {
                         if let Some(h) = hist.as_deref_mut() {
-                            h.record(at.elapsed());
+                            let batch = batches.is_some_and(|(_, all)| is_batch(*j, all.len()));
+                            if batch { &mut h.batch } else { &mut h.single }.record(at.elapsed());
                         }
                     }
                     // A stall past the engine's timeout: retried and counted, as the client
@@ -449,7 +477,7 @@ fn phase(
     record: bool,
     pins: Option<&PinPlan>,
     extras: PhaseExtras<'_>,
-) -> Result<(Vec<Shard>, Duration, Histogram, u64), String> {
+) -> Result<(Vec<Shard>, Duration, KindHists, u64), String> {
     let PhaseExtras { batches, deadline } = extras;
     let (results, start) = run_crew(shards, |mut shard, crew| {
         // D235: each shard's thread on a CPU of its own, the same one every phase. A pin the
@@ -477,7 +505,7 @@ fn phase(
         if !crew.start() {
             return Err(ANOTHER_FAILED.to_owned());
         }
-        let mut hist = Histogram::new();
+        let mut hist = KindHists::default();
         let r = pipeline(
             t,
             &mine,
@@ -507,7 +535,7 @@ fn phase(
     })?;
     let elapsed = start.elapsed();
     let mut shards = Vec::with_capacity(results.len());
-    let mut hist = Histogram::new();
+    let mut hist = KindHists::default();
     let mut busy = 0;
     for r in results {
         let (shard, h, b) = r?;
@@ -670,7 +698,7 @@ impl PigeonholeRunner {
         // The measured writes, repeated until `min_measured` has been measured (D219): a
         // fixed count measures a faster store for less time, too short for its flushes and
         // compactions to show.
-        let (mut shards, mut elapsed, mut hist) = (shards, Duration::ZERO, Histogram::new());
+        let (mut shards, mut elapsed, mut kinds) = (shards, Duration::ZERO, KindHists::default());
         // D247: past `max_measured` no commit starts; the record says the phase was capped.
         let deadline = options_.max_measured.map(|m| Instant::now() + m);
         let mut capped = false;
@@ -687,7 +715,7 @@ impl PigeonholeRunner {
             shards = s;
             busy_retries += b;
             elapsed += e;
-            hist.merge(&h);
+            kinds.merge(&h);
             if deadline.is_some_and(|d| Instant::now() >= d) {
                 capped = true;
                 break;
@@ -719,7 +747,25 @@ impl PigeonholeRunner {
         drop(t);
         let (_, closed) = with_drivers(shards, || db.close().map_err(err));
         closed?;
+        let hist = kinds.all();
         let ops = hist.count();
+        // D247's app-owned row: singles and batches apart (a single there lands on a hot
+        // row as often as the batches do, #816).
+        let by_type = if self.settings.cross_batches {
+            [
+                ("single-commit", &kinds.single),
+                ("batch-commit", &kinds.batch),
+            ]
+            .into_iter()
+            .map(|(op, h)| OpTypeStats {
+                op: op.to_owned(),
+                stats: LatencyStats::of(h),
+                mean_ns: h.mean().as_nanos() as u64,
+            })
+            .collect()
+        } else {
+            Vec::new()
+        };
         Ok(RunRecord {
             store: self.name().to_owned(),
             store_config: format!(
@@ -754,6 +800,7 @@ impl PigeonholeRunner {
                 warmup_settled: Some(warmup_settled),
                 busy_retries,
                 capped: options_.max_measured.map(|_| capped),
+                by_type,
                 ..RunDetail::default()
             },
         })
