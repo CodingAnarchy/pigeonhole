@@ -40,11 +40,9 @@ use pigeonhole_shm::{Presence, ShmRegion, WriterLock};
 use pigeonhole_wal::{CommitTicket, SpareSegments, Wal};
 
 mod tablets;
-mod unreported;
 
 use tablets::{ActiveOp, TabletLoad};
 pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
-use unreported::Unreported;
 
 use crate::catalog::{Catalog, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
@@ -117,8 +115,8 @@ fn moved_gives_up(waited: u64, timeout: u64) -> bool {
 // ---------------------------------------------------------------------------------------
 
 /// How many unneeded records `advance_checkpoint` pops from the log's front in one batch
-/// while the shard is open (#763). A `CommitsSettled`, a flush report or a flush install can
-/// free thousands at once; at about a microsecond each (the catalog and index lookups per
+/// while the shard is open (#763). A peer's flushed-through seqno passing a run of cross
+/// records, or a flush install, can free thousands at once; at about a microsecond each (the catalog and index lookups per
 /// record), popping them all held a turn, and the shard's pending watermark, for 3-5 ms. The
 /// rest follows on the next batches, one budget each; a closing shard pops everything.
 /// Every batch that pops a budget delays the commits behind it by that long: on the AX102's
@@ -526,8 +524,8 @@ impl Shared {
     }
 
     /// Marks the close unclean. The first time, every shard is kicked: one waiting at close
-    /// for its peers' reports (`SharesFlushed`, `CommitsSettled`) stops waiting, since a
-    /// shard that gave up will never send them (5-6 5.1).
+    /// for its peers' flushed-through seqnos (`FlushedThrough`) stops waiting, since a shard
+    /// that gave up will never raise its own (5-6 5.1).
     pub(crate) fn fail_close(&self) {
         if self.close.fail() {
             self.broadcast(|| ShardMsg::Kick);
@@ -1162,6 +1160,10 @@ pub(crate) enum ShardMsg {
         /// The commit runs no further attempt (committed, failed, or given up): commits
         /// waiting behind it stop waiting (D249).
         last: bool,
+        /// A commit's participants, the shards holding its writes at `apply_seqno`: the
+        /// share's PREPARE leaves the log once each one's flushed-through seqno passes it
+        /// (D266). `None` for an abort.
+        participants: Option<Holders>,
     },
     Applied {
         seqno: Seqno,
@@ -1192,16 +1194,17 @@ pub(crate) enum ShardMsg {
     SyncBarrier {
         reply: Notifier<Result<()>>,
     },
-    /// A participant's shares of these cross-shard commits are in SSTs: one message per
-    /// coordinator per report, not one per share (D254).
-    SharesFlushed {
-        seqnos: Vec<Seqno>,
+    /// `from`'s checkpoint waits for this shard's flushed-through seqno to reach `through`
+    /// (D266): answered with `FlushedThrough` once it does (at once if it has).
+    AwaitFlushed {
+        from: ShardId,
+        through: Seqno,
     },
-    /// Every share of each of these cross-shard commits is in SSTs (the coordinator counted
-    /// every participant's report): the participant's PREPAREs are no longer needed (#585).
-    /// One message per participant per handler that settles them, not one per commit (D254).
-    CommitsSettled {
-        seqnos: Vec<Seqno>,
+    /// The flushed-through seqno of shard `from` reached `through` (D266), the answer to an
+    /// `AwaitFlushed`: cross records waiting for it may leave the log.
+    FlushedThrough {
+        from: ShardId,
+        through: Seqno,
     },
     /// This shard's WAL stream's creation settled (D211): a checkpoint held back for it may
     /// be submitted.
@@ -1281,7 +1284,7 @@ enum MemberKind {
     /// `apply_seqno`: the seqno reserved at the decision, which the commit applies at
     /// (D263); the member's own `seqno` is the commit's id.
     CommitRecord {
-        participants: Vec<ShardId>,
+        participants: Holders,
         apply_seqno: Seqno,
     },
 }
@@ -2037,24 +2040,27 @@ enum LoggedKind {
     /// A single-shard commit writing to these slots.
     Single { slots: LoggedSlots },
     /// A participant's PREPARE writing to these slots.
-    Prepare {
-        slots: Vec<(TabletId, FamilyId)>,
-        coordinator: ShardId,
+    Prepare { slots: Vec<(TabletId, FamilyId)> },
+    /// A coordinator's COMMIT decision: the shards holding the commit's writes, and the
+    /// seqno they landed at (`None` for an incomplete commit found at replay, never needed).
+    Commit {
+        holders: Holders,
+        apply: Option<Seqno>,
+        /// Replayed at open (see `cross_wait`).
+        replayed: bool,
     },
-    /// A coordinator's COMMIT decision.
-    Commit { participants: Vec<ShardId> },
 }
+
+/// The shards holding a cross-shard commit's writes (D266): its participants, or, for a
+/// record replayed at open, the shards the replay applied its shares to.
+pub(crate) type Holders = Arc<[ShardId]>;
 
 /// A slot's single-shard records in the checkpoint log (#175): their log indices in log
 /// order (the records that left `log`, or whose writes to the slot are in SSTs, are dropped
-/// from the front when a pass looks), and whether their seqnos rose with them.
+/// from the front when a pass looks).
 #[derive(Debug, Default)]
 struct SlotLog {
     at: VecDeque<u64>,
-    last_seqno: Seqno,
-    /// A record arrived with a lower seqno than the one before it: a pass asking for the
-    /// records at or below a seqno scans this slot's instead of reading the front.
-    unordered: bool,
 }
 
 /// Work units one WAL pin slice does per shard turn (D206, #474): records indexed, slots
@@ -2063,12 +2069,11 @@ struct SlotLog {
 const PIN_SLICE: usize = 1024;
 
 /// A WAL pin pass in progress (D206): it selects the needed records logged before it
-/// started (`end`) that `which` takes, and works through them a slice per shard turn.
+/// started (`end`) and below WAL position `below`, and works through them a slice per
+/// shard turn.
 #[derive(Debug)]
 struct PinPass {
-    which: Pinning,
-    /// The shard's own pass (it asks every shard again), or one served for an `Unpin`.
-    origin: bool,
+    below: u64,
     /// The log index of the first record logged after the pass started.
     end: u64,
     stage: PinStage,
@@ -2083,9 +2088,15 @@ struct PinPass {
 #[derive(Debug, Default)]
 struct PinCheck;
 
-/// Slots and (shard, seqno) asks, as sets (the debug cross-check's).
+/// Slots, (shard, record seqno) asks, and the undecided PREPAREs, as sets (the debug
+/// cross-check's). A PREPARE decided during a pass may ask peers the start's scan did not:
+/// the check leaves those out.
 #[cfg(debug_assertions)]
-type PinSets = (BTreeSet<(TabletId, FamilyId)>, BTreeSet<(ShardId, Seqno)>);
+type PinSets = (
+    BTreeSet<(TabletId, FamilyId)>,
+    BTreeSet<(ShardId, Seqno)>,
+    BTreeSet<Seqno>,
+);
 
 #[cfg(debug_assertions)]
 #[derive(Debug, Default)]
@@ -2104,28 +2115,8 @@ enum PinStage {
         keys: Vec<(TabletId, FamilyId)>,
         at: usize,
     },
-    /// Examining the selected cross-shard records past `after` (a log index for `Below`,
-    /// a seqno and log index for `Through`).
-    Cross { after: Option<(Seqno, u64)> },
-}
-
-/// The needed records a WAL pin pass forces (#137): those logged below a position (the
-/// shard's own pass) or those at or below a seqno (another shard's `Unpin`).
-#[derive(Debug, Clone, Copy)]
-enum Pinning {
-    Below(u64),
-    Through(Seqno),
-}
-
-impl Pinning {
-    /// Whether a scan of the whole log takes `l` (the debug cross-check's).
-    #[cfg(debug_assertions)]
-    fn selects(self, l: &Logged) -> bool {
-        match self {
-            Pinning::Below(pos) => l.pos < pos,
-            Pinning::Through(seqno) => l.seqno <= seqno,
-        }
-    }
+    /// Examining the selected cross-shard records past log index `after`.
+    Cross { after: Option<u64> },
 }
 
 /// The per-shard token bucket on L0 depth (spec: Write path).
@@ -2312,9 +2303,12 @@ pub(crate) struct ShardState {
     /// since the share's seqno, reserved at the decision, would otherwise land above a write
     /// its validation never saw.
     pending_reads: FastMap<u64, u32>,
-    /// The seqno each applied share (by its commit's id) landed at (D263),
-    /// for the flushed checks of its PREPARE record; dropped when the record leaves the log.
-    share_seqnos: FastMap<Seqno, Seqno>,
+    /// The seqno each applied share (by its commit's id) landed at (D263), and the shards
+    /// holding its commit's writes (D266), for the checks of its PREPARE record; dropped
+    /// when the record leaves the log.
+    /// A replayed record's holders may include this shard for another participant's share
+    /// (`replayed`, see `cross_wait`).
+    share_seqnos: FastMap<Seqno, (Seqno, Holders, bool)>,
     /// Since when a single has been held back behind an undecided share
     /// (`share_wait_nanos`, D263).
     share_wait_since: Option<u64>,
@@ -2404,23 +2398,20 @@ pub(crate) struct ShardState {
     /// indexes the records logged since the last one (`index_tail`), so logging a commit
     /// costs nothing more.
     slot_log: FastMap<(TabletId, FamilyId), SlotLog>,
-    /// The log index up to which `slot_log`, `cross_log` and `cross_seqnos` are built.
+    /// The log index up to which `slot_log` and `cross_log` are built.
     indexed_upto: u64,
-    /// The WAL pin pass in progress (D206), and the passes asked for meanwhile: this
-    /// shard's own (its position) and served ones (the highest `through` received).
+    /// The WAL pin pass in progress (D206), and the position of the one asked for meanwhile.
     pin_pass: Option<PinPass>,
     pin_queued_own: Option<u64>,
-    pin_queued_through: Option<Seqno>,
     /// A `PinSlice` is queued to this shard.
     pin_slice_queued: bool,
     /// `log_bytes` below which background indexing cannot be due yet: one comparison per
     /// group until then.
     index_check_at: u64,
     /// The log indices of the cross-shard records (PREPAREs and COMMITs) still needed when
-    /// a pass last looked, in log order, and by seqno (an `Unpin` served asks for the ones
-    /// at or below a seqno). A record no longer needed never is again, so a pass drops it.
+    /// a pass last looked, in log order. A record no longer needed never is again, so a pass
+    /// drops it.
     cross_log: BTreeSet<u64>,
-    cross_seqnos: BTreeSet<(Seqno, u64)>,
     /// Slots flushed because their records pinned the checkpoint, whatever their size,
     /// until their active memtable freezes.
     unpin: BTreeSet<(TabletId, FamilyId)>,
@@ -2451,9 +2442,6 @@ pub(crate) struct ShardState {
     /// to `unpin_at`.
     unpin_upto: u64,
     unpin_at: u64,
-    /// The shards already sent `Unpin` for a needed record, by its seqno (pruned when the
-    /// record leaves `log`).
-    asked: HashMap<Seqno, Vec<ShardId>>,
     /// End of the newest record ever appended to the stream.
     last_end: Option<Lsn>,
     /// The checkpoint the manifest holds.
@@ -2471,19 +2459,15 @@ pub(crate) struct ShardState {
     creation_wake: bool,
     /// Prepares and commits of aborted or incomplete cross-shard commits (never needed).
     aborted: HashSet<Seqno>,
-    /// Commits whose coordinator reported them settled: every share in SSTs (#585).
-    commit_ckpt: HashSet<Seqno>,
-    /// Coordinator: `(participants that reported their share flushed, participants)` per
-    /// commit whose COMMIT record is in the log.
-    share_reports: HashMap<Seqno, (usize, usize)>,
-    /// Coordinator: the participants to tell once each logged commit is settled.
-    settle_to: HashMap<Seqno, Vec<ShardId>>,
-    /// Coordinator: settled commits not yet sent to each participant, sent together as one
-    /// `CommitsSettled` by `send_settled` (D254), in shard order.
-    settle_out: BTreeMap<ShardId, Vec<Seqno>>,
-    /// Participant: applied shares whose flush has not been reported to the coordinator
-    /// (#777: indexed by slots and flush seqno).
-    unreported: Unreported,
+    /// The highest seqno this shard asked each peer to answer for (`AwaitFlushed`, D266),
+    /// until the peer's `FlushedThrough` covers it.
+    awaiting: BTreeMap<ShardId, Seqno>,
+    /// The peers waiting for this shard's flushed-through seqno, each with the highest seqno
+    /// it asked for (D266): answered by every publish that reaches it.
+    f_waiters: BTreeMap<ShardId, Seqno>,
+    /// The checkpoint's front is a cross record whose seqno is not visible yet: a
+    /// visibility wake (`Wake::Shard`) is registered for it, and the kick looks again.
+    ckpt_vis_wait: Option<Seqno>,
 
     // ---- compaction and stalls ----
     /// Pickers by `CompactionStyle`: each family compacts by its own style.
@@ -2767,11 +2751,9 @@ impl ShardState {
             indexed_upto: 0,
             pin_pass: None,
             pin_queued_own: None,
-            pin_queued_through: None,
             pin_slice_queued: false,
             index_check_at: 0,
             cross_log: BTreeSet::new(),
-            cross_seqnos: BTreeSet::new(),
             unpin: BTreeSet::new(),
             room_freezes: BTreeSet::new(),
             room_refused: Vec::new(),
@@ -2782,7 +2764,6 @@ impl ShardState {
             overlap_released: Vec::new(),
             unpin_upto: 0,
             unpin_at: 0,
-            asked: HashMap::new(),
             last_end: None,
             checkpoint: Lsn::default(),
             checkpoint_candidate: Lsn::default(),
@@ -2792,11 +2773,9 @@ impl ShardState {
             continuations: Continuations::default(),
             creation_wake: false,
             aborted: HashSet::new(),
-            commit_ckpt: HashSet::new(),
-            share_reports: HashMap::new(),
-            settle_to: HashMap::new(),
-            settle_out: BTreeMap::new(),
-            unreported: Unreported::default(),
+            awaiting: BTreeMap::new(),
+            f_waiters: BTreeMap::new(),
+            ckpt_vis_wait: None,
             leveled,
             tiered,
             fifo,
@@ -2941,15 +2920,157 @@ impl ShardState {
         })
     }
 
-    /// Publishes `flushed_through` (Release). It never decreases; a lower value would break
-    /// the bound itself, so it is asserted, not clamped.
-    fn publish_flushed_through(&mut self) {
-        self.publish_flushed_through_from(self.oldest_unflushed());
+    /// The oldest entry of this shard's unflushed memtables, and the slots whose open active
+    /// memtable holds an entry at or below `through`: freezing those lets the flushed-through
+    /// seqno pass `through` once their flushes land (frozen memtables are flushing already).
+    fn unflushed_through(&self, through: Seqno) -> (Option<Seqno>, Vec<(TabletId, FamilyId)>) {
+        let mut forced = Vec::new();
+        let oldest = self.shared.flushed_roots.read(|flushed| {
+            let mut oldest: Option<Seqno> = None;
+            for (key, slot) in &self.memtables {
+                for m in slot.unflushed(self.id, flushed) {
+                    let Some((min, _)) = m.table.seqno_range() else {
+                        continue;
+                    };
+                    oldest = Some(oldest.map_or(min, |o| o.min(min)));
+                    if min <= through
+                        && slot.seal == Seal::Open
+                        && std::ptr::eq(m, &slot.active)
+                        && !forced.contains(key)
+                    {
+                        forced.push(*key);
+                    }
+                }
+            }
+            oldest
+        });
+        (oldest, forced)
+    }
+
+    /// This shard's last published flushed-through seqno.
+    fn published_flushed_through(&self) -> Seqno {
+        self.shared
+            .flushed_through
+            .get(usize::from(self.id.0))
+            .map_or(0, |f| f.0.load(Ordering::Relaxed))
+    }
+
+    /// Publishes `flushed_through` (Release) and answers the peers waiting for it. It never
+    /// decreases; a lower value would break the bound itself, so it is asserted, not clamped.
+    fn publish_flushed_through(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.publish_flushed_through_from(self.oldest_unflushed(), ctx);
     }
 
     /// `publish_flushed_through` with this shard's oldest unflushed entry already found.
     /// Returns the value published (0 on a reader's state, which publishes nothing).
-    fn publish_flushed_through_from(&mut self, oldest_unflushed: Option<Seqno>) -> Seqno {
+    fn publish_flushed_through_from(
+        &mut self,
+        oldest_unflushed: Option<Seqno>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) -> Seqno {
+        let f = self.store_flushed_through(oldest_unflushed);
+        self.answer_flushed_waiters(f, ctx);
+        f
+    }
+
+    /// Answers each peer waiting for this shard's flushed-through seqno that `f` reaches.
+    fn answer_flushed_waiters(&mut self, f: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.f_waiters.is_empty() {
+            return;
+        }
+        let due: smallvec::SmallVec<[ShardId; 4]> = self
+            .f_waiters
+            .iter()
+            .filter(|&(_, &through)| through <= f)
+            .map(|(&q, _)| q)
+            .collect();
+        for q in due {
+            self.f_waiters.remove(&q);
+            self.send(
+                q,
+                ShardMsg::FlushedThrough {
+                    from: self.id,
+                    through: f,
+                },
+                ctx,
+            );
+        }
+    }
+
+    /// `from`'s checkpoint waits for this shard's flushed-through seqno to reach `through`
+    /// (D266). With nothing unflushed at or below `through`, only the visible watermark
+    /// capped the last publish (`from` asks only for visible seqnos): publish again, rather
+    /// than flush. Otherwise the answer waits for the flushes that are due anyway; an `Unpin`
+    /// forces them.
+    fn on_await_flushed(
+        &mut self,
+        from: ShardId,
+        through: Seqno,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let w = self.f_waiters.entry(from).or_insert(through);
+        *w = (*w).max(through);
+        let f = self.published_flushed_through();
+        if f >= through {
+            self.answer_flushed_waiters(f, ctx);
+            return;
+        }
+        let oldest = self.oldest_unflushed();
+        if oldest.is_none_or(|o| o > through) {
+            self.publish_flushed_through_from(oldest, ctx);
+        }
+    }
+
+    /// The checkpoint stopped at a cross record whose other holders' flushed-through seqnos
+    /// are behind (D266): ask each such peer to answer once its seqno passes the record's
+    /// (`AwaitFlushed`), once per peer and seqno. A peer's bound never passes the visible
+    /// watermark, so a seqno not yet visible is waited for first: a visibility wake
+    /// (`Wake::Shard`) looks again.
+    fn await_front(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let Some(front) = self.log.front() else {
+            return;
+        };
+        let Some((at, holders, _)) = self.cross_wait(front) else {
+            return;
+        };
+        let behind: smallvec::SmallVec<[ShardId; 4]> = self
+            .peers_behind(holders, at)
+            .filter(|q| self.awaiting.get(q).is_none_or(|&asked| asked < at))
+            .collect();
+        if behind.is_empty() {
+            return;
+        }
+        if self.shared.shm.visible_seqno() < at {
+            if self.ckpt_vis_wait != Some(at) {
+                self.ckpt_vis_wait = Some(at);
+                let id = self.id.0;
+                self.shared.waiters.register(
+                    crate::watermark_waiters::shard_key(id),
+                    at,
+                    Wake::Shard(id),
+                );
+                // A publish that missed the registration is seen here.
+                if self.shared.shm.visible_seqno() >= at {
+                    let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+                }
+            }
+            return;
+        }
+        for q in behind {
+            self.awaiting.insert(q, at);
+            self.send(
+                q,
+                ShardMsg::AwaitFlushed {
+                    from: self.id,
+                    through: at,
+                },
+                ctx,
+            );
+        }
+    }
+
+    /// Stores `flushed_through` from this shard's oldest unflushed entry; returns it.
+    fn store_flushed_through(&mut self, oldest_unflushed: Option<Seqno>) -> Seqno {
         let f = self.flushed_through(oldest_unflushed);
         let Some(slot) = self.shared.flushed_through.get(usize::from(self.id.0)) else {
             return 0;
@@ -3061,15 +3182,9 @@ impl ShardState {
                     slots: slots.into_iter().collect(),
                 },
             }),
-            ReplayedKind::Prepare {
-                slots,
-                coordinator,
-                applied,
-            } => {
-                if let Some(apply_seqno) = applied {
-                    self.share_seqnos.insert(seqno, apply_seqno);
-                    self.unreported
-                        .push(seqno, apply_seqno, coordinator, &slots);
+            ReplayedKind::Prepare { slots, applied } => {
+                if let Some((at, holders)) = applied {
+                    self.share_seqnos.insert(seqno, (at, holders, true));
                 } else {
                     self.aborted.insert(seqno);
                 }
@@ -3077,35 +3192,23 @@ impl ShardState {
                     end,
                     pos: self.log_bytes,
                     seqno,
-                    kind: LoggedKind::Prepare { slots, coordinator },
+                    kind: LoggedKind::Prepare { slots },
                 });
                 self.log_cross_record(seqno);
             }
-            ReplayedKind::Commit {
-                participants,
-                complete,
-            } => {
-                if !complete {
+            ReplayedKind::Commit { holders, apply } => {
+                if apply.is_none() {
                     self.aborted.insert(seqno);
-                }
-                // Replay runs before any shard starts (`ShardMsg::Start` reports the replayed
-                // shares), so no share of this commit has been counted yet: the settle check
-                // the live path makes after logging a COMMIT has nothing to find here.
-                debug_assert!(
-                    self.share_reports
-                        .get(&seqno)
-                        .is_none_or(|(reported, _)| *reported == 0),
-                    "a share of replayed commit {seqno} was counted before its COMMIT was logged"
-                );
-                self.share_reports.entry(seqno).or_insert((0, 0)).1 = participants.len();
-                if complete {
-                    self.settle_to.insert(seqno, participants.clone());
                 }
                 self.push_logged(Logged {
                     end,
                     pos: self.log_bytes,
                     seqno,
-                    kind: LoggedKind::Commit { participants },
+                    kind: LoggedKind::Commit {
+                        holders,
+                        apply,
+                        replayed: true,
+                    },
                 });
                 self.log_cross_record(seqno);
             }
@@ -3137,15 +3240,13 @@ impl ShardState {
         self.indexed_upto = self.log_base;
         self.pin_pass = None;
         self.pin_queued_own = None;
-        self.pin_queued_through = None;
         self.log.clear();
         self.log_cross.clear();
         self.slot_log.clear();
         self.cross_log.clear();
-        self.cross_seqnos.clear();
-        self.asked.clear();
-        self.unreported.clear();
-        self.share_reports.clear();
+        self.share_seqnos.clear();
+        self.awaiting.clear();
+        self.ckpt_vis_wait = None;
         self.aborted.clear();
         out
     }
@@ -3978,8 +4079,7 @@ impl ShardState {
                 self.reclaim_retired();
                 self.prune_flushed_slots(&landed);
                 // After the root commit that made these SSTs durable (#724).
-                self.publish_flushed_through();
-                self.report_shares_flushed(ctx);
+                self.publish_flushed_through(ctx);
                 self.advance_checkpoint(ctx);
             }
             Err(e) => {
@@ -5383,7 +5483,7 @@ impl ShardState {
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                     }
                 }
-                MemberKind::Prepare { coordinator } => {
+                MemberKind::Prepare { .. } => {
                     // The share keeps its reservation until the decision.
                     if let Some(share) = self.prepared.get_mut(&m.seqno) {
                         share.reserved = m.reserved;
@@ -5391,30 +5491,40 @@ impl ShardState {
                     }
                     if let Some(t) = m.ticket {
                         let slots = self.slots_of(m.bytes.as_slice());
-                        let kind = LoggedKind::Prepare {
-                            slots,
-                            coordinator: *coordinator,
-                        };
+                        let kind = LoggedKind::Prepare { slots };
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                         self.log_cross_record(m.seqno);
                     }
                 }
-                MemberKind::CommitRecord { participants, .. } => {
+                MemberKind::CommitRecord {
+                    participants,
+                    apply_seqno,
+                } => {
                     if let Some(t) = m.ticket {
-                        self.share_reports.entry(m.seqno).or_insert((0, 0)).1 = participants.len();
-                        self.settle_to.insert(m.seqno, participants.clone());
+                        // A coordinator is always a participant (the first shard of its
+                        // commit's split; a retry re-splits and re-routes), and it logs its
+                        // own PREPARE, a validation-only one too, before it decides. Undecided
+                        // until the `Decide` this record's resolution sends, that PREPARE is
+                        // still in the log: it precedes the COMMIT and waits on every other
+                        // holder, so the COMMIT's own check (`needed`) is defence in depth.
+                        debug_assert!(
+                            self.log_cross.contains_key(&m.seqno)
+                                && !self.share_seqnos.contains_key(&m.seqno),
+                            "shard {}: COMMIT {} logged without its own undecided PREPARE",
+                            self.id.0,
+                            m.seqno
+                        );
                         let kind = LoggedKind::Commit {
-                            participants: participants.clone(),
+                            holders: Arc::clone(participants),
+                            apply: Some(*apply_seqno),
+                            replayed: false,
                         };
                         self.log_record(t.end, m.seqno, 0, kind);
                         self.log_cross_record(m.seqno);
-                        // Every share may have reported before the record was logged.
-                        self.settle_if_done(m.seqno);
                     }
                 }
             }
         }
-        self.send_settled(ctx);
         if self.view_dirty
             && let Err(e) = self.publish_memtables()
         {
@@ -5501,7 +5611,6 @@ impl ShardState {
             }
             LoggedKind::Prepare { .. } | LoggedKind::Commit { .. } => {
                 self.cross_log.remove(&i);
-                self.cross_seqnos.remove(&(l.seqno, i));
             }
         }
     }
@@ -5542,42 +5651,28 @@ impl ShardState {
         self.shared.metrics[usize::from(self.id.0)]
             .unpin_passes
             .fetch_add(1, Ordering::Relaxed);
-        self.start_pin_pass(Pinning::Below(upto), true, ctx);
+        self.start_pin_pass(upto, ctx);
     }
 
-    /// Starts a pass over the needed records `which` selects: its slots are marked for
-    /// flushing, and `Unpin` goes to the shards its cross-shard commits wait for, always from
-    /// this shard's own pass (`origin`) and only to shards not yet asked about a record when
-    /// serving another shard's `Unpin`, so the requests between a coordinator and its
-    /// participants stop after one round. The pass runs a slice of at most `PIN_SLICE`
-    /// units per shard turn (D206, #474); one asked for while another runs waits, and the
-    /// served ones waiting merge into the highest `through`, which covers each of them.
-    fn start_pin_pass(
-        &mut self,
-        which: Pinning,
-        origin: bool,
-        ctx: &mut ShardContext<'_, ShardMsg>,
-    ) {
+    /// Starts a pass over the needed records logged below WAL position `below`: their slots
+    /// are marked for flushing, and `Unpin` goes to the other holders of their cross-shard
+    /// commits whose flushed-through seqnos are behind (D266). The pass runs a slice of at
+    /// most `PIN_SLICE` units per shard turn (D206, #474); one asked for while another runs
+    /// waits.
+    fn start_pin_pass(&mut self, below: u64, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.pin_pass.is_some() {
-            match which {
-                Pinning::Below(pos) => self.pin_queued_own = Some(pos),
-                Pinning::Through(seqno) => {
-                    let q = self.pin_queued_through.get_or_insert(seqno);
-                    *q = (*q).max(seqno);
-                }
-            }
+            self.pin_queued_own = Some(below);
             return;
         }
         let end = self.log_base + self.log.len() as u64;
         self.pin_pass = Some(PinPass {
-            which,
-            origin,
+            below,
             end,
             stage: PinStage::Index,
             asks: BTreeMap::new(),
             #[cfg(debug_assertions)]
             check: PinCheck {
-                start: self.scan_pinning(which, end),
+                start: self.scan_pinning(below, end),
                 ..PinCheck::default()
             },
             #[cfg(not(debug_assertions))]
@@ -5627,9 +5722,7 @@ impl ShardState {
             self.send(shard, ShardMsg::Unpin { through }, ctx);
         }
         if let Some(pos) = self.pin_queued_own.take() {
-            self.start_pin_pass(Pinning::Below(pos), true, ctx);
-        } else if let Some(seqno) = self.pin_queued_through.take() {
-            self.start_pin_pass(Pinning::Through(seqno), false, ctx);
+            self.start_pin_pass(pos, ctx);
         }
     }
 
@@ -5696,7 +5789,7 @@ impl ShardState {
                         budget -= 1;
                         let s = keys[*at];
                         let (pinned, used) =
-                            self.slot_pinned(catalog, &s, pass.which, pass.end, budget);
+                            self.slot_pinned(catalog, &s, pass.below, pass.end, budget);
                         budget -= used;
                         let Some(pinned) = pinned else {
                             return false;
@@ -5713,8 +5806,7 @@ impl ShardState {
                 PinStage::Cross { after } => {
                     let (done, used) = self.pin_cross(
                         catalog,
-                        pass.which,
-                        pass.origin,
+                        pass.below,
                         pass.end,
                         after,
                         &mut pass.asks,
@@ -5740,10 +5832,6 @@ impl ShardState {
                 LoggedKind::Single { slots } => {
                     for s in slots {
                         let sl = self.slot_log.entry(*s).or_default();
-                        if !sl.at.is_empty() && l.seqno < sl.last_seqno {
-                            sl.unordered = true;
-                        }
-                        sl.last_seqno = sl.last_seqno.max(l.seqno);
                         if sl.at.back() != Some(&i) {
                             sl.at.push_back(i);
                         }
@@ -5751,7 +5839,6 @@ impl ShardState {
                 }
                 LoggedKind::Prepare { .. } | LoggedKind::Commit { .. } => {
                     self.cross_log.insert(i);
-                    self.cross_seqnos.insert((l.seqno, i));
                 }
             }
         }
@@ -5759,15 +5846,15 @@ impl ShardState {
         (to.saturating_sub(from)) as usize
     }
 
-    /// Whether slot `s` has an unflushed single-shard record logged before `end` that
-    /// `which` selects. Prunes the slot's front first (`prune_slot_log`).
+    /// Whether slot `s` has an unflushed single-shard record logged before `end` and below
+    /// WAL position `below`. Prunes the slot's front first (`prune_slot_log`).
     /// `None` when `budget` ran out while pruning (look at the slot again next slice);
     /// the units used either way.
     fn slot_pinned(
         &mut self,
         catalog: Option<&Catalog>,
         s: &(TabletId, FamilyId),
-        which: Pinning,
+        below: u64,
         end: u64,
         budget: usize,
     ) -> (Option<bool>, usize) {
@@ -5782,21 +5869,8 @@ impl ShardState {
         let pinned = match sl.at.front().copied() {
             None => false,
             Some(i) if i >= end => false,
-            Some(i) => {
-                let front = self.logged(i).expect("pruned");
-                match which {
-                    // Log order is position order.
-                    Pinning::Below(pos) => front.pos < pos,
-                    // With seqnos rising in log order, the front has the lowest unflushed one.
-                    Pinning::Through(seqno) if !sl.unordered => front.seqno <= seqno,
-                    Pinning::Through(seqno) => sl.at.iter().any(|&i| {
-                        i < end
-                            && self.logged(i).is_some_and(|l| {
-                                l.seqno <= seqno && !self.slot_flushed(catalog, s, l.seqno)
-                            })
-                    }),
-                }
-            }
+            // Log order is position order.
+            Some(i) => self.logged(i).expect("pruned").pos < below,
         };
         if !sl.at.is_empty() {
             self.slot_log.insert(*s, sl);
@@ -5804,96 +5878,72 @@ impl ShardState {
         (Some(pinned), used)
     }
 
-    /// Examines up to `budget` units of the cross-shard records logged before `end` that
-    /// `which` selects, past `after`: a needed PREPARE's unflushed slots are marked, and the
-    /// shards needed records wait for go into `asks` (deduped per record and shard by
-    /// `asked`, except on the shard's own pass). A record no longer needed never is again,
-    /// so it leaves the index. Returns whether the stage is done and the units used.
+    /// Examines up to `budget` units of the cross-shard records logged before `end` and
+    /// below WAL position `below`, past log index `after`: a needed PREPARE's unflushed
+    /// slots are marked, and the other holders behind a needed record's seqno go into
+    /// `asks` (D266). A record no longer needed never is again, so it leaves the index.
+    /// Returns whether the stage is done and the units used.
     #[allow(clippy::too_many_arguments)]
     fn pin_cross(
         &mut self,
         catalog: Option<&Catalog>,
-        which: Pinning,
-        origin: bool,
+        below: u64,
         end: u64,
-        after: &mut Option<(Seqno, u64)>,
+        after: &mut Option<u64>,
         asks: &mut BTreeMap<ShardId, Seqno>,
         budget: usize,
         check: &mut PinCheck,
     ) -> (bool, usize) {
-        use std::ops::Bound::{Excluded, Included, Unbounded};
+        use std::ops::Bound::{Excluded, Unbounded};
         let mut used = 0;
         let mut finished = true;
         // The next batch of candidates, in order (`after` resumes it).
-        let candidates: Vec<(Seqno, u64)> = match which {
-            Pinning::Below(pos) => {
-                let lo = after.map_or(Unbounded, |(_, i)| Excluded(i));
-                let mut out = Vec::new();
-                for &i in self.cross_log.range((lo, Unbounded)) {
-                    let Some(l) = self.logged(i) else { continue };
-                    if i >= end || l.pos >= pos {
-                        break;
-                    }
-                    if out.len() == budget {
-                        finished = false;
-                        break;
-                    }
-                    out.push((l.seqno, i));
-                }
-                out
+        let lo = after.map_or(Unbounded, Excluded);
+        let mut candidates = Vec::new();
+        for &i in self.cross_log.range((lo, Unbounded)) {
+            let Some(l) = self.logged(i) else { continue };
+            if i >= end || l.pos >= below {
+                break;
             }
-            Pinning::Through(seqno) => {
-                let lo = after.map_or(Unbounded, Excluded);
-                let mut out = Vec::new();
-                for &(q, i) in self.cross_seqnos.range((lo, Included((seqno, u64::MAX)))) {
-                    if out.len() == budget {
-                        finished = false;
-                        break;
-                    }
-                    if i < end {
-                        out.push((q, i));
-                    } else {
-                        // Logged after the pass started: the next pass's, but resume past it.
-                        *after = Some((q, i));
-                        used += 1;
-                        if used >= budget {
-                            finished = false;
-                            break;
-                        }
-                    }
-                }
-                out
+            if candidates.len() == budget {
+                finished = false;
+                break;
             }
-        };
+            candidates.push(i);
+        }
         let mut done = Vec::new();
-        for (q, i) in candidates {
-            *after = Some((q, i));
+        for i in candidates {
+            *after = Some(i);
             used += 1;
             let Some(l) = self.logged(i) else {
                 continue;
             };
             if !self.needed(catalog, l) {
-                done.push((q, i));
+                done.push(i);
                 continue;
             }
+            let id = l.seqno;
+            // The other holders behind the record's seqno are asked to flush through it
+            // (D266); an undecided PREPARE waits for its decision, which no flush hastens.
             let mut pairs: smallvec::SmallVec<[(ShardId, Seqno); 4]> = smallvec::SmallVec::new();
+            // A replayed record waiting on this shard's own bound: its flushes are forced
+            // here, as an `Unpin` would.
+            let mut own_through = None;
+            if let Some((at, holders, replayed)) = self.cross_wait(l) {
+                pairs.extend(self.peers_behind(holders, at).map(|q| (q, at)));
+                if replayed && self.own_behind(at) {
+                    own_through = Some(at);
+                }
+            }
             let mut forced: smallvec::SmallVec<[(TabletId, FamilyId); 4]> =
                 smallvec::SmallVec::new();
-            match &l.kind {
-                LoggedKind::Prepare { slots, coordinator } => {
-                    forced.extend(
-                        slots
-                            .iter()
-                            .filter(|s| !self.slot_flushed(catalog, s, self.share_seqno(l.seqno)))
-                            .copied(),
-                    );
-                    // The coordinator's checkpoint must pass the COMMIT too.
-                    pairs.push((*coordinator, l.seqno));
-                }
-                LoggedKind::Commit { participants } => {
-                    pairs.extend(participants.iter().map(|&p| (p, l.seqno)));
-                }
-                LoggedKind::Single { .. } => {}
+            if let LoggedKind::Prepare { slots, .. } = &l.kind {
+                forced.extend(
+                    slots
+                        .iter()
+                        .filter(|s| !self.slot_flushed(catalog, s, self.share_seqno(l.seqno)))
+                        .copied(),
+                );
             }
             used += pairs.len();
             #[cfg(not(debug_assertions))]
@@ -5903,62 +5953,58 @@ impl ShardState {
                 #[cfg(debug_assertions)]
                 check.forced.insert(s);
             }
+            if let Some(at) = own_through {
+                let (_, own) = self.unflushed_through(at);
+                self.unpin.extend(own);
+            }
+            #[cfg(not(debug_assertions))]
+            let _ = id;
             for (shard, seqno) in pairs {
                 #[cfg(debug_assertions)]
-                check.seen.insert((shard, seqno));
-                if shard == self.id {
-                    continue;
-                }
-                let sent = self.asked.entry(seqno).or_default();
-                if sent.contains(&shard) {
-                    if !origin {
-                        continue;
-                    }
-                } else {
-                    sent.push(shard);
-                }
+                check.seen.insert((shard, id));
                 let through = asks.entry(shard).or_insert(seqno);
                 *through = (*through).max(seqno);
             }
         }
-        for (q, i) in done {
+        for i in done {
             self.cross_log.remove(&i);
-            self.cross_seqnos.remove(&(q, i));
         }
         (finished, used)
     }
 
-    /// What a scan of the whole log selects for `which` among the records before `end`:
+    /// What a scan of the whole log selects below WAL position `below` among the records
+    /// before `end`:
     /// the unflushed slots of needed records, and the (shard, seqno) pairs their
     /// cross-shard commits wait for. Debug builds check passes against it.
     #[cfg(debug_assertions)]
-    fn scan_pinning(&self, which: Pinning, end: u64) -> PinSets {
+    fn scan_pinning(&self, below: u64, end: u64) -> PinSets {
         let mut slots = BTreeSet::new();
         let mut pairs = BTreeSet::new();
+        let mut undecided = BTreeSet::new();
         let Ok(view) = self.checkpoint_view() else {
-            return (slots, pairs);
+            return (slots, pairs, undecided);
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
         for (k, l) in self.log.iter().enumerate() {
-            if self.log_base + k as u64 >= end || !which.selects(l) || !self.needed(catalog, l) {
+            if self.log_base + k as u64 >= end || l.pos >= below || !self.needed(catalog, l) {
                 continue;
             }
             let unflushed = |s: &&(TabletId, FamilyId)| !self.slot_flushed(catalog, s, l.seqno);
             match &l.kind {
                 LoggedKind::Single { slots: s } => slots.extend(s.iter().filter(unflushed)),
-                LoggedKind::Prepare {
-                    slots: s,
-                    coordinator,
-                } => {
+                LoggedKind::Prepare { slots: s, .. } => {
                     slots.extend(s.iter().filter(unflushed));
-                    pairs.insert((*coordinator, l.seqno));
+                    if !self.share_seqnos.contains_key(&l.seqno) {
+                        undecided.insert(l.seqno);
+                    }
                 }
-                LoggedKind::Commit { participants } => {
-                    pairs.extend(participants.iter().map(|&p| (p, l.seqno)));
-                }
+                LoggedKind::Commit { .. } => {}
+            }
+            if let Some((at, holders, _)) = self.cross_wait(l) {
+                pairs.extend(self.peers_behind(holders, at).map(|q| (q, l.seqno)));
             }
         }
-        (slots, pairs)
+        (slots, pairs, undecided)
     }
 
     /// Debug builds: a finished pass forced only slots a full scan found pinning when it
@@ -5966,29 +6012,35 @@ impl ShardState {
     /// (Slots stop pinning as their flushes land, never the other way round.)
     #[cfg(debug_assertions)]
     fn check_pin_pass(&self, pass: &PinPass) {
-        let (now_slots, now_pairs) = self.scan_pinning(pass.which, pass.end);
+        let (now_slots, now_pairs, _) = self.scan_pinning(pass.below, pass.end);
         let c = &pass.check;
+        // Records decided during the pass ask peers the start's scan could not name.
+        let decided_since = |&&(_, seqno): &&(ShardId, Seqno)| !c.start.2.contains(&seqno);
+        let seen: BTreeSet<(ShardId, Seqno)> =
+            c.seen.iter().filter(decided_since).copied().collect();
+        let now_pairs: BTreeSet<(ShardId, Seqno)> =
+            now_pairs.iter().filter(decided_since).copied().collect();
         let id = self.id.0;
-        let which = pass.which;
+        let which = pass.below;
         assert!(
             c.forced.is_subset(&c.start.0),
-            "shard {id} {which:?}: forced {:?} not pinning at the start",
+            "shard {id} below {which}: forced {:?} not pinning at the start",
             c.forced.difference(&c.start.0).collect::<Vec<_>>()
         );
         assert!(
             now_slots.is_subset(&c.forced),
-            "shard {id} {which:?}: {:?} still pinning, not forced",
+            "shard {id} below {which}: {:?} still pinning, not forced",
             now_slots.difference(&c.forced).collect::<Vec<_>>()
         );
         assert!(
-            c.seen.is_subset(&c.start.1),
-            "shard {id} {which:?}: asked {:?} not waiting at the start",
-            c.seen.difference(&c.start.1).collect::<Vec<_>>()
+            seen.is_subset(&c.start.1),
+            "shard {id} below {which}: asked {:?} not waiting at the start",
+            seen.difference(&c.start.1).collect::<Vec<_>>()
         );
         assert!(
-            now_pairs.is_subset(&c.seen),
-            "shard {id} {which:?}: {:?} still waiting, not asked",
-            now_pairs.difference(&c.seen).collect::<Vec<_>>()
+            now_pairs.is_subset(&seen),
+            "shard {id} below {which}: {:?} still waiting, not asked",
+            now_pairs.difference(&seen).collect::<Vec<_>>()
         );
     }
 
@@ -6037,9 +6089,11 @@ impl ShardState {
         self.slot_log = slot_log;
     }
 
-    /// Another shard's checkpoint waits for cross-shard commits up to `through`. Every
-    /// request is served (requests carry no order: a commit decided later may have a lower
-    /// seqno), so the only dedupe is `force_pinning`'s per record and shard.
+    /// Another shard's checkpoint waits for cross-shard commits up to `through`: freeze
+    /// every slot holding an unflushed entry at or below it, so this shard's flushed-through
+    /// seqno passes it once those flushes land (D266). Every request is served (requests
+    /// carry no order: a commit decided later may have a lower seqno). The asker learns of
+    /// the new seqno from its own `AwaitFlushed`.
     fn on_unpin(&mut self, through: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.closing {
             return;
@@ -6047,14 +6101,12 @@ impl ShardState {
         self.shared.metrics[usize::from(self.id.0)]
             .unpin_passes
             .fetch_add(1, Ordering::Relaxed);
-        self.start_pin_pass(Pinning::Through(through), false, ctx);
-        let shares: Vec<(TabletId, FamilyId)> = self.unreported.slots_through(through).collect();
-        self.unpin.extend(shares);
+        let (oldest, forced) = self.unflushed_through(through);
+        self.unpin.extend(forced);
         // Nothing unflushed at or below `through`: no flush will publish a higher
         // flushed-through seqno, so publish it now (#724, perf287's review).
-        let oldest = self.oldest_unflushed();
         if oldest.is_none_or(|o| o > through) {
-            let _f = self.publish_flushed_through_from(oldest);
+            let _f = self.publish_flushed_through_from(oldest, ctx);
             #[cfg(feature = "test-hooks")]
             self.shared.metrics[usize::from(self.id.0)]
                 .hooks
@@ -6400,7 +6452,7 @@ impl ShardState {
 
     /// The seqno a PREPARE record's share was applied at: its id until it is applied.
     fn share_seqno(&self, id: Seqno) -> Seqno {
-        self.share_seqnos.get(&id).copied().unwrap_or(id)
+        self.share_seqnos.get(&id).map_or(id, |s| s.0)
     }
 
     fn track_share_reads(&mut self, reads: &[u64], add: bool) {
@@ -6557,7 +6609,7 @@ impl ShardState {
                     self.mark_aborted(m.seqno);
                 }
                 let priority = self.coord.get(&m.seqno).map_or((0, 0), |c| c.priority);
-                for p in participants {
+                for &p in participants.iter() {
                     self.send(
                         p,
                         ShardMsg::Decide {
@@ -6568,6 +6620,7 @@ impl ShardState {
                             coordinator: self.id,
                             priority,
                             last: true,
+                            participants: commit.then(|| Arc::clone(&participants)),
                         },
                         ctx,
                     );
@@ -6838,6 +6891,7 @@ impl ShardState {
                         coordinator: self.id,
                         priority,
                         last,
+                        participants: None,
                     },
                     ctx,
                 );
@@ -6869,6 +6923,7 @@ impl ShardState {
                         coordinator: self.id,
                         priority,
                         last: true,
+                        participants: None,
                     },
                     ctx,
                 );
@@ -6877,7 +6932,7 @@ impl ShardState {
         }
         self.pending.push(Member {
             kind: MemberKind::CommitRecord {
-                participants: shards,
+                participants: shards.into(),
                 apply_seqno,
             },
             durability,
@@ -6903,7 +6958,7 @@ impl ShardState {
         &mut self,
         seqno: Seqno,
         commit: bool,
-        at: (Seqno, Timestamp),
+        at: (Seqno, Timestamp, Option<Holders>),
         coordinator: ShardId,
         priority: CommitPriority,
         last: bool,
@@ -6920,7 +6975,7 @@ impl ShardState {
         &mut self,
         seqno: Seqno,
         commit: bool,
-        (apply_seqno, commit_ts): (Seqno, Timestamp),
+        (apply_seqno, commit_ts, holders): (Seqno, Timestamp, Option<Holders>),
         coordinator: ShardId,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
@@ -6970,7 +7025,9 @@ impl ShardState {
                 // D263: the share lands at the decision's seqno and timestamp.
                 // Later writes to its rows, held back until now, stamp above it.
                 self.raise_ts_floor(commit_ts);
-                self.share_seqnos.insert(seqno, apply_seqno);
+                let holders = holders.unwrap_or_else(|| Arc::from([self.id]));
+                self.share_seqnos
+                    .insert(seqno, (apply_seqno, holders, false));
                 #[cfg(feature = "test-hooks")]
                 let applied = if self
                     .shared
@@ -6986,24 +7043,10 @@ impl ShardState {
                 let applied = self.apply(share.bytes.batch().as_bytes(), apply_seqno, commit_ts);
                 match applied {
                     Ok(()) => {
-                        let slots = self.touched_slots.clone();
-                        for key in &slots {
+                        for key in &self.touched_slots {
                             if let Some(slot) = self.memtables.get_mut(key) {
                                 slot.active.has_shares = true;
                             }
-                        }
-                        if slots.is_empty() {
-                            // An empty share (validation only): nothing to flush.
-                            self.send(
-                                coordinator,
-                                ShardMsg::SharesFlushed {
-                                    seqnos: vec![seqno],
-                                },
-                                ctx,
-                            );
-                        } else {
-                            self.unreported
-                                .push(seqno, apply_seqno, coordinator, &slots);
                         }
                     }
                     Err(e) => {
@@ -7020,6 +7063,12 @@ impl ShardState {
                     self.poison(crate::health::FailureCause::Internal);
                 }
                 self.spawn_flush(ctx);
+                // A decided PREPARE at the checkpoint's front waits for its holders' flushes
+                // now: ask the ones behind (`await_front`, D266). Nothing else looks until a
+                // flush of this shard's own.
+                if self.log.front().is_some_and(|f| f.seqno == seqno) {
+                    self.advance_checkpoint(ctx);
+                }
             } else {
                 self.mark_aborted(seqno);
                 // Only the front record can let the checkpoint move, and the abort changes
@@ -7205,31 +7254,87 @@ impl ShardState {
     /// in this stream while another shard owns and flushes it. A slot whose tablet is gone
     /// (its table dropped, or retired by a split or merge once everything in it was flushed)
     /// needs nothing.
+    ///
+    /// A cross-shard commit's records are needed until every share is in SSTs (D24): replay
+    /// applies a commit only with all of them. Since D266 that is read off the holders'
+    /// flushed-through seqnos, not reported share by share: a PREPARE is unneeded once its
+    /// own slots are flushed through the share's seqno and every other holder's
+    /// flushed-through seqno has passed it, a COMMIT once every other holder's has. The
+    /// coordinator's own share is its own PREPARE's, which precedes its COMMIT in this log.
     fn needed(&self, catalog: Option<&Catalog>, l: &Logged) -> bool {
-        let flush_seqno = match l.kind {
-            LoggedKind::Prepare { .. } => self.share_seqno(l.seqno),
-            _ => l.seqno,
-        };
-        let unflushed = |slots: &[(TabletId, FamilyId)]| {
-            slots
-                .iter()
-                .any(|s| !self.slot_flushed(catalog, s, flush_seqno))
-        };
-        // A COMMIT this shard coordinates is unneeded once every participant's share is in
-        // SSTs (decision D24); its own PREPARE (logged before it) goes with it.
-        let commit_done = |seqno: Seqno| {
-            self.share_reports
-                .get(&seqno)
-                .is_some_and(|(reported, total)| reported >= total)
+        let unflushed = |slots: &[(TabletId, FamilyId)], seqno: Seqno| {
+            slots.iter().any(|s| !self.slot_flushed(catalog, s, seqno))
         };
         match &l.kind {
-            LoggedKind::Single { slots } => unflushed(slots),
+            LoggedKind::Single { slots } => unflushed(slots, l.seqno),
             LoggedKind::Prepare { slots, .. } => {
-                !self.aborted.contains(&l.seqno)
-                    && (unflushed(slots)
-                        || !(self.commit_ckpt.contains(&l.seqno) || commit_done(l.seqno)))
+                if self.aborted.contains(&l.seqno) {
+                    return false;
+                }
+                // Undecided: needed until the decision.
+                let Some((at, holders, replayed)) = self.share_seqnos.get(&l.seqno) else {
+                    return true;
+                };
+                unflushed(slots, *at)
+                    || self.peers_behind(holders, *at).next().is_some()
+                    || (*replayed && self.own_behind(*at))
             }
-            LoggedKind::Commit { .. } => !self.aborted.contains(&l.seqno) && !commit_done(l.seqno),
+            // Never the record that decides a live commit: its own PREPARE precedes it and
+            // waits on the same holders (asserted where the COMMIT is logged). A replayed one
+            // may have lost that PREPARE to an earlier checkpoint, and waits on its own.
+            LoggedKind::Commit {
+                holders,
+                apply,
+                replayed,
+            } => match apply {
+                Some(at) if !self.aborted.contains(&l.seqno) => {
+                    self.peers_behind(holders, *at).next().is_some()
+                        || (*replayed && self.own_behind(*at))
+                }
+                _ => false,
+            },
+        }
+    }
+
+    /// The other shards among `holders` whose flushed-through seqno is below `seqno` (D266).
+    fn peers_behind<'a>(
+        &'a self,
+        holders: &'a [ShardId],
+        seqno: Seqno,
+    ) -> impl Iterator<Item = ShardId> + 'a {
+        holders.iter().copied().filter(move |&q| {
+            q != self.id
+                && self
+                    .shared
+                    .flushed_through
+                    .get(usize::from(q.0))
+                    .is_none_or(|f| f.0.load(Ordering::Acquire) < seqno)
+        })
+    }
+
+    /// Whether this shard's own flushed-through seqno is below `seqno`.
+    fn own_behind(&self, seqno: Seqno) -> bool {
+        self.published_flushed_through() < seqno
+    }
+
+    /// The cross record `l`'s seqno and holders, if it is a decided PREPARE or a COMMIT,
+    /// and whether it was replayed at open. A live record's own share is its own PREPARE's
+    /// slots (a coordinator's precedes its COMMIT in this log). A replayed one's holders are
+    /// where the replay put the shares, and a reopen places tablets again: another
+    /// participant's share may sit in this shard's memtables, so this shard's own
+    /// flushed-through seqno must pass it too.
+    fn cross_wait<'a>(&'a self, l: &'a Logged) -> Option<(Seqno, &'a Holders, bool)> {
+        match &l.kind {
+            LoggedKind::Prepare { .. } => self
+                .share_seqnos
+                .get(&l.seqno)
+                .map(|(at, h, replayed)| (*at, h, *replayed)),
+            LoggedKind::Commit {
+                holders,
+                apply: Some(at),
+                replayed,
+            } => Some((*at, holders, *replayed)),
+            _ => None,
         }
     }
 
@@ -7266,112 +7371,13 @@ impl ShardState {
         }
     }
 
-    /// Coordinator: once every participant's share of commit `seqno` is in SSTs (D24's
-    /// condition for its COMMIT), tells the other participants their PREPAREs are no longer
-    /// needed (#585). Telling them only once this shard's checkpoint passed the COMMIT made
-    /// each stream's checkpoint wait on another's: two commits in flight together whose
-    /// coordinators take part in each other log each other's PREPARE before their own
-    /// COMMIT, and neither checkpoint could pass. A replay that finds a participant's
-    /// PREPARE gone treats the commit as incomplete and applies none of it, which is right
-    /// once every share is in SSTs.
-    fn settle_if_done(&mut self, seqno: Seqno) {
-        let done = self
-            .share_reports
-            .get(&seqno)
-            .is_some_and(|(reported, total)| reported >= total);
-        if !done {
-            return;
-        }
-        if let Some(participants) = self.settle_to.remove(&seqno) {
-            for p in participants {
-                if p != self.id {
-                    self.settle_out.entry(p).or_default().push(seqno);
-                }
-            }
-        }
-    }
-
-    /// Counts a handled `SharesFlushed` or `CommitsSettled` and its seqnos (test hook).
+    /// Counts a handled `AwaitFlushed` or `FlushedThrough` (test hook).
     #[cfg(feature = "test-hooks")]
-    fn count_reports(&self, seqnos: usize) {
-        let h = &self.shared.metrics[usize::from(self.id.0)].hooks;
-        h.report_msgs.fetch_add(1, Ordering::Relaxed);
-        h.report_seqnos.fetch_add(seqnos as u64, Ordering::Relaxed);
-    }
-
-    /// Coordinator: sends each participant the commits `settle_if_done` found settled, as
-    /// one `CommitsSettled` (D254). Every caller of `settle_if_done` calls this once its loop
-    /// is done; `end_batch` checks that (debug) and sends anything left.
-    fn send_settled(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
-        if self.settle_out.is_empty() {
-            return;
-        }
-        for (p, seqnos) in std::mem::take(&mut self.settle_out) {
-            self.send(p, ShardMsg::CommitsSettled { seqnos }, ctx);
-        }
-    }
-
-    /// Tells coordinators about applied shares whose slots are all in SSTs now: one
-    /// `SharesFlushed` per coordinator (D254). A flush install can find 100K shares flushed,
-    /// and a message per share cost the install about 20 ms and its coordinators as many
-    /// handler runs (#716).
-    ///
-    /// All of them in one turn, not in budgets over the following batches (#777): reporting
-    /// costs about 110 ns a share, so a flush's ~60K hold the turn for about 6 ms, but on the
-    /// AX102's contended cross-shard gate row a 1024-share budget (about 78 slices of 115 µs
-    /// per flush) raised the p99 from 110 to 131 µs and the p99.9 from 200 to 524 µs, and a
-    /// 128-share budget the p99 as much and the p99.9 to 260 µs; one report per flush left
-    /// both where they were (2026-10-21).
-    fn report_shares_flushed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
-        let Ok(view) = self.checkpoint_view() else {
-            return;
-        };
-        let catalog = view.as_ref().map(|v| &*v.catalog);
-        self.unreported.debug_check();
-        let current = |s: &(TabletId, FamilyId)| match catalog {
-            Some(c) => c.flushed_through(s.0, s.1),
-            None if self.dropped.contains(&s.0) => None,
-            None => Some(self.flushed.get(s).copied().unwrap_or(0)),
-        };
-        // Nothing to report unless a listed slot's flushed-through seqno moved since the
-        // last report (`UnreportedSlot`); the settles found by other callers still go out.
-        if !self.unreported.due(current) {
-            trace!(
-                "shard {} report skipped: unreported {}",
-                self.id.0,
-                self.unreported.len()
-            );
-            self.send_settled(ctx);
-            return;
-        }
-        trace!(
-            "shard {} report shares: flushed={:?} unreported={:?}",
-            self.id.0, self.flushed, self.unreported
-        );
-        let mut done: Vec<(Seqno, ShardId)> = Vec::new();
-        self.unreported.take_flushed(current, |seqno, coordinator| {
-            done.push((seqno, coordinator))
-        });
-        // Ordered, so the sends keep a seed replay's message order.
-        let mut out: BTreeMap<ShardId, Vec<Seqno>> = BTreeMap::new();
-        for (seqno, coordinator) in done {
-            if coordinator == self.id {
-                // Our own share of a commit we coordinate: counted here, not handled as a
-                // message sent to ourselves. That handler would advance the checkpoint and
-                // re-enter the close (which calls this), one stack frame per share: a close
-                // with thousands of them overflowed the shard's stack (#585). Every caller
-                // advances the checkpoint next, and the batch's `end_batch` re-checks the
-                // close.
-                self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
-                self.settle_if_done(seqno);
-            } else {
-                out.entry(coordinator).or_default().push(seqno);
-            }
-        }
-        for (coordinator, seqnos) in out {
-            self.send(coordinator, ShardMsg::SharesFlushed { seqnos }, ctx);
-        }
-        self.send_settled(ctx);
+    fn count_flushed_msg(&self) {
+        self.shared.metrics[usize::from(self.id.0)]
+            .hooks
+            .flushed_msgs
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Pops the unneeded records from the front of the log, at most
@@ -7400,29 +7406,26 @@ impl ShardState {
             let l = self.log.pop_front().expect("checked");
             self.unindex_front(&l);
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
-            self.asked.remove(&l.seqno);
             match l.kind {
                 LoggedKind::Commit { .. } => {
                     self.unlog_cross(l.seqno);
                     self.aborted.remove(&l.seqno);
-                    self.share_reports.remove(&l.seqno);
-                    self.settle_to.remove(&l.seqno);
                 }
                 LoggedKind::Prepare { .. } => {
                     // A coordinator logs its own PREPARE before its COMMIT, under the same
-                    // seqno: while that COMMIT is still in the log (`share_reports` has it),
-                    // an aborted commit stays aborted, or its COMMIT would read as undecided
-                    // and be needed for ever (#591).
+                    // seqno. A COMMIT still in the log needs no `aborted` entry: one found
+                    // incomplete at replay has no seqno (`apply: None`) and is never needed
+                    // (#591).
                     self.unlog_cross(l.seqno);
-                    if !self.share_reports.contains_key(&l.seqno) {
-                        self.aborted.remove(&l.seqno);
-                    }
-                    self.commit_ckpt.remove(&l.seqno);
+                    self.aborted.remove(&l.seqno);
                 }
                 LoggedKind::Single { .. } => {
                     self.aborted.remove(&l.seqno);
                 }
             }
+        }
+        if !more {
+            self.await_front(ctx);
         }
         if self.log.is_empty() {
             // No record left names a dropped tablet (a table created again gets new ones):
@@ -8245,8 +8248,8 @@ impl ShardState {
         trace!(
             "shard {} close: stage {:?} unresolved={} coord={} prepared={} pending={} flush_idle={} \
              flush_running={} queue={} frozen={} to_freeze={:?} deferred={} log={} ckpt_inflight={} \
-             dirty={} failed={} unreported={} op={} parked={} retries={} share_reports={:?} \
-             commit_ckpt={:?} aborted={:?}",
+             dirty={} failed={} op={} parked={} retries={} awaiting={:?} \
+             f_waiters={:?} aborted={:?}",
             self.id.0,
             self.close_stage,
             self.unresolved.len(),
@@ -8266,12 +8269,11 @@ impl ShardState {
             self.checkpoint_inflight,
             self.checkpoint_dirty,
             self.flush_failed,
-            self.unreported.len(),
             self.op.is_some(),
             self.parked.len(),
             self.retries.len(),
-            self.share_reports,
-            self.commit_ckpt,
+            self.awaiting,
+            self.f_waiters,
             self.aborted,
         );
         if tracing() {
@@ -8379,17 +8381,18 @@ impl ShardState {
             {
                 self.poison(crate::health::FailureCause::Io);
             }
-            self.report_shares_flushed(ctx);
+            // Everything is flushed: publish, so peers waiting on this shard hear (D266).
+            self.publish_flushed_through(ctx);
             self.advance_checkpoint(ctx);
             if self.checkpoint_inflight {
                 // Waiting for our own edit.
                 return;
             }
             if (!self.log.is_empty() || self.checkpoint_dirty) && !self.shared.close.failed() {
-                // Waiting for the other shards' flushes and checkpoints (SharesFlushed and
-                // CommitsSettled arrive as messages). Once the close is unclean, a shard
-                // that gave up flushing never sends its reports: stop waiting (the WAL keeps
-                // whatever the checkpoint did not pass, and the next open replays it).
+                // Waiting for the other shards' flushes and checkpoints (`FlushedThrough`
+                // arrives as a message). Once the close is unclean, a shard that gave up
+                // flushing never raises its flushed-through seqno: stop waiting (the WAL
+                // keeps whatever the checkpoint did not pass, and the next open replays it).
                 return;
             }
             self.close_stage = CloseStage::Checkpointing;
@@ -8614,10 +8617,11 @@ impl ShardState {
                 coordinator,
                 priority,
                 last,
+                participants,
             } => self.on_decide(
                 seqno,
                 commit,
-                (apply_seqno, commit_ts),
+                (apply_seqno, commit_ts, participants),
                 coordinator,
                 priority,
                 last,
@@ -8653,28 +8657,26 @@ impl ShardState {
                 nanos,
             } => self.on_flushed(items, result, nanos, ctx),
             ShardMsg::SyncBarrier { reply } => self.on_sync_barrier(reply, ctx),
-            ShardMsg::SharesFlushed { seqnos } => {
+            ShardMsg::AwaitFlushed { from, through } => {
                 #[cfg(feature = "test-hooks")]
-                self.count_reports(seqnos.len());
-                // The COMMIT record may not be logged yet (a participant flushed before the
-                // coordinator's group ran): the count waits for it.
-                for seqno in seqnos {
-                    self.share_reports.entry(seqno).or_insert((0, usize::MAX)).0 += 1;
-                    self.settle_if_done(seqno);
+                self.count_flushed_msg();
+                self.on_await_flushed(from, through, ctx);
+            }
+            ShardMsg::FlushedThrough { from, through } => {
+                #[cfg(feature = "test-hooks")]
+                self.count_flushed_msg();
+                if self
+                    .awaiting
+                    .get(&from)
+                    .is_some_and(|&asked| asked <= through)
+                {
+                    self.awaiting.remove(&from);
                 }
-                self.send_settled(ctx);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
             ShardMsg::Created => {
                 self.creation_wake = false;
-                self.advance_checkpoint(ctx);
-                self.try_finish_close(ctx);
-            }
-            ShardMsg::CommitsSettled { seqnos } => {
-                #[cfg(feature = "test-hooks")]
-                self.count_reports(seqnos.len());
-                self.commit_ckpt.extend(seqnos);
                 self.advance_checkpoint(ctx);
                 self.try_finish_close(ctx);
             }
@@ -8693,7 +8695,6 @@ impl ShardState {
                 if !self.replaying && self.tablets_on() {
                     // Another shard's flush may cover slots logged in this stream (moved
                     // tablets, a reopen), and the tablet map may have changed.
-                    self.report_shares_flushed(ctx);
                     self.advance_checkpoint(ctx);
                     self.progress_op(ctx);
                     self.run_retries(ctx);
@@ -8729,18 +8730,26 @@ impl ShardState {
             ShardMsg::Start => {
                 self.replaying = false;
                 // After replay: a shard with nothing to flush never publishes otherwise.
-                self.publish_flushed_through();
+                self.publish_flushed_through(ctx);
                 self.maybe_prepare_spares(ctx);
-                // Replayed shares with nothing left to flush report at once.
-                self.report_shares_flushed(ctx);
                 self.advance_checkpoint(ctx);
                 self.spawn_flush(ctx);
                 self.maintain(ctx);
             }
             ShardMsg::Kick => {
                 let due = self.continuations.take_on_kick();
-                if due & Continuations::CHECKPOINT != 0 {
+                // The cross record at the checkpoint's front became visible (`await_front`).
+                let visible = self
+                    .ckpt_vis_wait
+                    .is_some_and(|at| self.shared.shm.visible_seqno() >= at);
+                if visible {
+                    self.ckpt_vis_wait = None;
+                }
+                if visible || due & Continuations::CHECKPOINT != 0 {
                     self.advance_checkpoint(ctx);
+                }
+                if visible {
+                    self.try_finish_close(ctx);
                 }
             }
             ShardMsg::PinSlice => {
@@ -8855,13 +8864,16 @@ pub(crate) enum ReplayedKind {
     },
     Prepare {
         slots: Vec<(TabletId, FamilyId)>,
-        coordinator: ShardId,
-        /// The seqno it was applied at, if its commit was decided (D263).
-        applied: Option<Seqno>,
+        /// The seqno it was applied at, if its commit was decided (D263), and the shards
+        /// the replay applied the commit's shares to (D266).
+        applied: Option<(Seqno, Holders)>,
     },
     Commit {
-        participants: Vec<ShardId>,
-        complete: bool,
+        /// The shards the replay applied the commit's shares to (D266).
+        holders: Holders,
+        /// The seqno its shares were applied at; `None` if the commit is incomplete (a
+        /// participant's PREPARE is gone), so nothing was applied.
+        apply: Option<Seqno>,
     },
 }
 
@@ -8890,15 +8902,6 @@ impl ShardHandler for ShardState {
         }
         self.expire_tablet_waits(ctx);
         self.maybe_balance(false, None, ctx);
-        // Every loop that settles commits sends them before its handler returns
-        // (`send_settled`). One that forgot would hold the participants' PREPAREs, and so
-        // their WAL, until some later settle: caught in tests, and sent here regardless.
-        debug_assert!(
-            self.settle_out.is_empty(),
-            "settled commits left unsent to {} participants",
-            self.settle_out.len()
-        );
-        self.send_settled(ctx);
         if (self.freeze_all_pending
             || (!self.to_freeze.is_empty() && self.freeze_deferred)
             || self.wait_room)
