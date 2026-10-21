@@ -220,6 +220,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `value_filter(ValueFilter)` | ✓ | ✓ |
 | `limit(u64)` rows (0: none) | | ✓ |
 | `snapshot(&Snapshot)` | ✓ | ✓ |
+| `into_owned() -> Scan<'static>`: holds the table instead of borrowing it, so the `RowIter` is `Send + 'static` (ICR 0052) | | ✓ |
 | terminal | `read(self) -> Result<Option<RowRef<'t>>>` | `iter(self) -> Result<RowIter<'t>>` |
 
 `ValueFilter`: `Equals(Vec<u8>)`, `Prefix(Vec<u8>)`, `I64(std::cmp::Ordering, i64)`.
