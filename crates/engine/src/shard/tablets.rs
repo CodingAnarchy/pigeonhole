@@ -419,7 +419,7 @@ impl ShardState {
     }
 
     /// A PREPARE that would wait for arena room, refused instead (D245, ICR 0042); its
-    /// coordinator hears `RoomFreed` once this shard's room wait ends.
+    /// coordinator hears a room `Wake` once this shard's room wait ends.
     #[inline(never)]
     pub(super) fn refuse_for_room(
         &mut self,
@@ -475,40 +475,6 @@ impl ShardState {
                 ctx,
             );
         }
-    }
-
-    /// Runs the retries that waited for `from`'s room before `generation` (D245).
-    pub(super) fn on_room_freed(
-        &mut self,
-        from: ShardId,
-        generation: u64,
-        ctx: &mut ShardContext<'_, ShardMsg>,
-    ) {
-        let seen = &mut self.room_freed[usize::from(from.0)];
-        *seen = (*seen).max(generation);
-        let (ready, wait): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
-            std::mem::take(&mut self.retries)
-                .into_iter()
-                .partition(|r| {
-                    r.room_wait
-                        .is_some_and(|(p, g)| p == from && g < generation)
-                });
-        self.retries = wait;
-        trace!(
-            "shard {} room freed on {} ({generation}): {} retries ready",
-            self.id.0,
-            from.0,
-            ready.len()
-        );
-        for mut r in ready {
-            r.room_wait = None;
-            if self.closing {
-                r.reply.notify(Err(Error::Closed));
-            } else {
-                self.retry(r, ctx);
-            }
-        }
-        self.arm_tablet_timer(ctx);
     }
 
     /// The rows a conditional member writes, reads, or tests (`hash_row`), deduplicated: what
@@ -651,33 +617,52 @@ impl ShardState {
         );
     }
 
-    /// A coordinator's side of an overlap wake (D249): the retry of the commit of `priority`
-    /// that waited for `from` runs now. One that came before the refused round was decided is
-    /// kept for its retry.
-    pub(super) fn on_overlap_cleared(
+    /// A coordinator's side of a participant's wake (D245, D249): the retries it wakes run
+    /// now (`RetryWait::woken_by`). Room is remembered per shard by generation, for a retry
+    /// still in its abort round; an overlap wake that came before the refused round was
+    /// decided is kept for that commit's retry.
+    pub(super) fn on_wake(
         &mut self,
         from: ShardId,
-        priority: CommitPriority,
+        reason: WakeReason,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
-        if let Some(i) = self.retries.iter().position(|r| {
-            r.overlap_wait == Some(from) && (r.submitted_at, r.first_seqno) == priority
-        }) {
-            let mut r = self.retries.swap_remove(i);
-            r.overlap_wait = None;
+        if let WakeReason::Room { generation } = reason {
+            let seen = &mut self.room_freed[usize::from(from.0)];
+            *seen = (*seen).max(generation);
+        }
+        let (ready, wait): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
+            std::mem::take(&mut self.retries)
+                .into_iter()
+                .partition(|r| {
+                    r.wait
+                        .is_some_and(|w| w.woken_by(from, reason, (r.submitted_at, r.first_seqno)))
+                });
+        self.retries = wait;
+        trace!(
+            "shard {} wake from {} ({reason:?}): {} retries ready",
+            self.id.0,
+            from.0,
+            ready.len()
+        );
+        if let WakeReason::Overlap { priority } = reason
+            && ready.is_empty()
+            && self
+                .coord
+                .values()
+                .any(|c| c.priority == priority && c.refused == Some(RetryWait::Overlap { from }))
+        {
+            self.overlap_released.push((from, priority));
+        }
+        for mut r in ready {
+            r.wait = None;
             if self.closing {
                 r.reply.notify(Err(Error::Closed));
             } else {
                 self.retry(r, ctx);
             }
-            self.arm_tablet_timer(ctx);
-        } else if self
-            .coord
-            .values()
-            .any(|c| c.priority == priority && c.overlap == Some(from))
-        {
-            self.overlap_released.push((from, priority));
         }
+        self.arm_tablet_timer(ctx);
     }
 
     /// A PREPARE refused without a record: for rows this shard is moving or no longer owns
@@ -784,10 +769,9 @@ impl ShardState {
                     validate: req.validate,
                     map_version: view.tablets.version(),
                     epoch: 0,
-                    room_wait: None,
                     first_seqno: retried.first_seqno,
                     prev_shards: retried.prev_shards,
-                    overlap_wait: None,
+                    wait: None,
                 };
                 if shards[0] == self.id {
                     self.start_coordination(creq, ctx);
@@ -838,7 +822,12 @@ impl ShardState {
         // After a shard's death no commit is accepted (D227): one waiting for a participant's
         // room, or for an overlap there to clear, may wait on the dead one, so it ends now
         // rather than at the timeout (D245, D249).
-        let waits = |r: &CoordinateReq| r.room_wait.is_some() || r.overlap_wait.is_some();
+        let waits = |r: &CoordinateReq| {
+            matches!(
+                r.wait,
+                Some(RetryWait::Room { .. } | RetryWait::Overlap { .. })
+            )
+        };
         if self.shared.shard_died.load(Ordering::Acquire) && self.retries.iter().any(waits) {
             let (dead, keep): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
                 std::mem::take(&mut self.retries)
@@ -854,11 +843,7 @@ impl ShardState {
         let (ready, wait): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
             std::mem::take(&mut self.retries)
                 .into_iter()
-                .partition(|r| {
-                    r.room_wait.is_none()
-                        && r.overlap_wait.is_none()
-                        && (r.map_version < version || r.epoch < epoch)
-                });
+                .partition(|r| !waits(r) && (r.map_version < version || r.epoch < epoch));
         self.retries = wait;
         if !self.retries.is_empty() {
             trace!(
@@ -868,8 +853,7 @@ impl ShardState {
                     .iter()
                     .map(|r| {
                         (
-                            r.room_wait.map(|(s, g)| (s.0, g)),
-                            r.overlap_wait.map(|s| s.0),
+                            r.wait,
                             (r.submitted_at, r.first_seqno),
                             r.map_version,
                             r.epoch,
