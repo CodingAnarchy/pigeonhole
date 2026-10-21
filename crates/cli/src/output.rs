@@ -83,11 +83,21 @@ fn header(report: &Report) -> Map<String, Value> {
     m
 }
 
-/// A value as plain text: strings unquoted, `null` as `none`.
+/// A value as plain text: strings unquoted, `null` as `none`, and the JSON shapes of bytes
+/// and typed values (`{"base64": …}`, `{"i64": n}`, `{"f64": x}`, `{"f64_bits": n}`) as
+/// `b64:…` and plain numbers.
 fn plain(v: &Value, none: &str) -> String {
     match v {
         Value::Null => none.to_owned(),
         Value::String(s) => s.clone(),
+        Value::Object(m) if m.len() == 1 => match m.iter().next() {
+            Some((k, Value::String(b))) if k == "base64" => format!("b64:{b}"),
+            Some((k, n)) if k == "i64" || k == "f64" => n.to_string(),
+            Some((k, Value::Number(n))) if k == "f64_bits" => n
+                .as_u64()
+                .map_or_else(|| n.to_string(), |b| f64::from_bits(b).to_string()),
+            _ => v.to_string(),
+        },
         other => other.to_string(),
     }
 }

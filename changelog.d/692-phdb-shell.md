@@ -1,0 +1,2 @@
+### Added
+- `phdb shell`: a small command language over the public API, not SQL. It covers `get`, `scan` (ranges, prefixes, family, qualifier and value filters, versions, time ranges, limits), `put` (typed and timestamped), `incr`, `delete`, `create`, named snapshots and meta commands (`\tables`, `\schema`, `\info`, `\metrics`, `\health`, `\format`, `\timing`). Commands come from `-c`, a script, a pipe, or an interactive terminal. It is read-only while a writer process runs (#692).

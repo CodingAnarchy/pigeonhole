@@ -2,7 +2,7 @@
 
 `phdb` inspects and maintains Pigeonhole databases from the shell, in the spirit of `sqlite3` and `duckdb`.
 
-> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). `phdb info`, `check`, `dump`, `load`, `backup` and `compact` work. The interactive `shell` is coming; this page grows with each command.
+> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). Every command works: `info`, `check`, `dump`, `load`, `backup`, `compact` and the interactive `shell`.
 
 **Install:** `cargo install pigeonhole-cli` installs the `phdb` binary. Until the next release, build it from a checkout with `cargo install --path crates/cli`.
 
@@ -16,6 +16,7 @@
 | `phdb load <file> [<dump.jsonl> \| -] [--create]` | Load a `jsonl` dump: create its tables and families and write every cell at its timestamp. |
 | `phdb backup <file> <dest> [--latest] [--check]` | Copy the database into one new file, consistent at one snapshot. |
 | `phdb compact <file> [--shrink]` | Full compaction, with progress; optionally release free space at the file's end. |
+| `phdb shell <file> [-c CMD]... [-f SCRIPT] [--read-only]` | An interactive shell: get, scan, put, incr, delete, create and snapshots. |
 
 **Global flags,** before or after the command:
 
@@ -237,6 +238,72 @@ Both open the database as the writer, so they fail with status 4 while your appl
 | `file_bytes_before`, `file_bytes` | The file's length before and after. |
 | `released_bytes` | With `--shrink`: the bytes released (`null` otherwise). |
 | `free_bytes` | Free space left in the file afterwards. |
+
+### `phdb shell`
+
+The shell runs one command per line, each a single API call with flags. It isn't SQL: there are no joins, no `WHERE` and no expressions.
+
+**Where the commands come from:**
+- the `-c` commands (repeat for several, run in order);
+- the `-f` script file;
+- whatever is piped to standard input;
+- otherwise a terminal, interactively: a `phdb> ` prompt with no line editing or history. Run `rlwrap phdb shell app.phdb` for both (#811 tracks a built-in editor).
+
+In `-c`, script or piped mode, the first failing command stops the run with its exit status, and the message names the line. Interactively, an error prints and the session goes on.
+
+**Writes:** with no writer running, the shell opens as the writer and can write. While your application runs, it opens as a reader process and refuses writes (`ReadOnly`, exit 1). `--read-only` refuses them in either case.
+
+```text
+get    <table> <row> [<family>[:<qualifier>]] [--versions N] [--time A..B] [--at SNAP]
+scan   <table> [<start> [<end>]] [--prefix P] [--family F]... [--qualifier-prefix Q]
+       [--value-eq V | --value-prefix V | --i64 <op><n>] [--versions N] [--time A..B]
+       [--limit N] [--columns-per-row N] [--at SNAP]
+put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
+incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
+delete <table> <row> [<family>[:<qualifier>]] [--ts US]
+create <table> <family>[:counter]...
+snapshot [--durable] <name>     release <name>
+\tables  \schema [table]  \info  \metrics  \health
+\format table|json|jsonl|csv  \timing on|off  \help  \quit
+```
+
+**Reading:**
+- **`get`** reads one row: all of it, one family, or one column.
+- **`scan`** reads a row range (start inclusive, end exclusive) or a `--prefix`.
+- **The read flags** map to the API's `RowRead` and `Scan` builders:
+  - `--versions 0` returns every retained version;
+  - `--time A..B` is a half-open microsecond range;
+  - `--i64 >30` (also `<n` and `=n`) keeps `i64` values that compare as given.
+- **`--at`** reads at a named snapshot. `snapshot` takes one (`--durable` for a durable one); `release` drops it.
+- **Output:** reads print one row per cell, `row`, `family`, `qualifier`, `ts`, `value`, in the current `\format`.
+
+**Writing:**
+- **`put`** writes bytes, or with `--i64` or `--f64` a typed value. `--ts` sets the timestamp.
+- **`incr`** adds to a counter.
+- **`delete`** removes a row, a family, a column, or with `--ts` one version.
+- **`create`** makes a table with default family options. Append `:counter` to a family name for a counter family.
+
+**Values:** words are bytes, so keys and values can be anything.
+- A bare word is its UTF-8.
+- `"…"` takes escapes: `\n`, `\t`, `\r`, `\0`, `\\`, `\"` and `\xHH`.
+- `'…'` is literal.
+- `0x…` is hex, and `b64:…` is base64.
+- In `table` and `csv` output, bytes that aren't UTF-8 print as `b64:…`.
+
+**Meta commands:**
+- **`\tables`** lists the tables; **`\schema`** shows the families' options; **`\info`** is `phdb info`.
+- **`\metrics`** shows the writer's counters since the shell opened, and **`\health`** shows whether the instance failed.
+- **`\format`** changes the output format, and **`\timing on`** prints each command's time to standard error.
+
+In `json`, every command prints one document: reads put their cells under `rows`, and writes print `result` and `seqno`.
+
+```text
+$ phdb shell app.phdb -c "create users profile" -c "put users u1 profile:name Ada" -c "get users u1"
+result  ok
+seqno   3
+row  family   qualifier  ts                value
+u1   profile  name       1761030000000000  Ada
+```
 
 ## Exit status
 
