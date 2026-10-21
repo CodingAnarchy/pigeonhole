@@ -70,6 +70,19 @@ jobs:
       - run: cargo doc --workspace --exclude pigeonhole-bench --no-deps --all-features
       - run: cargo doc -p pigeonhole-bench --no-deps --features "$BENCH_FEATURES"
       - run: cargo test --workspace --exclude pigeonhole-bench --all-features
+      # #692: `cargo install pigeonhole-cli` keeps working. Install `phdb` from this checkout
+      # (release, with the lockfile) into a scratch root, then use the installed binary end to
+      # end: make a database, write and read through the shell, and check it.
+      - name: install phdb and run it
+        run: |
+          cargo install --path crates/cli --locked --root "$RUNNER_TEMP/phdb"
+          phdb="$RUNNER_TEMP/phdb/bin/phdb"
+          "$phdb" --version
+          db="$RUNNER_TEMP/smoke.phdb"
+          printf '' | "$phdb" load --create "$db" -
+          "$phdb" shell "$db" -c "create t f" -c "put t r f:q v" -c "get t r f:q" | grep -q 'v$'
+          "$phdb" --format json info "$db" | grep -q '"name": "t"'
+          "$phdb" check "$db"
       - run: cargo test -p pigeonhole-bench --features "$BENCH_FEATURES"
       # The public crate on its own: feature unification gives the workspace run an engine
       # built with `test-hooks`, and this run tests the production one (#148, review 1-2 F10).

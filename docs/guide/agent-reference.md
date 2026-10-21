@@ -262,8 +262,8 @@ Backpressure (D210): each shard holds at most ½ `memtable_budget` of async comm
 Dropping a read future or stream: always safe. Dropping a ticket, or a commit future that has submitted: the commit still lands or fails atomically. **Dropping a commit future still waiting for room writes nothing** (fire-and-forget `let _ = ..commit_async()` can lose the commit over the bound; use `commit_with_ticket` to submit without awaiting).
 Sync-only by design (D196): `backup`, `shrink` (long-running; run on your executor's blocking pool), and open, close, table create/open/drop (short).
 
-## Command line: `phdb` (in progress, #692)
-Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; before the next release, use `cargo install --path crates/cli`.
+## Command line: `phdb` (#692)
+Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; until the release that ships it, use `cargo install --path crates/cli` (CI installs it that way and runs it).
 
 | Item | Rule |
 |---|---|
@@ -271,7 +271,8 @@ Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; befo
 | For programs | `--format json` gives one document; `--format jsonl` gives a header line, then one object per row. Each carries `"phdb": 1`; within it fields are only added, so ignore unknown fields. |
 | Open policy | With no writer running, `phdb` becomes the writer for the command, replaying a crashed WAL, and closes. With a writer running, it opens as a reader process. `--reader` / `--writer` force one. |
 | Exit status | 0 ok, 1 error, 2 usage, 3 corruption, 4 locked or busy, 5 not found, 6 unsupported. |
-| Errors | On stderr. With json/jsonl: `{"phdb":1,"error":{"code","code_num","message"}}`, where `code` is the `ErrorCode` name, or `FileNotFound` with `code_num` `null`. |
+| Errors | On stderr. With json/jsonl: `{"phdb":1,"error":{"code","code_num","message"}}`. `code` is the `ErrorCode` name (`ReadOnly` for a write in a read-only shell). Failures outside the database have `code_num` `null`: `FileNotFound`, `BadInput` (a dump `load` can't read; the message names the line), `Usage` (exit 2). Shell and script failures name their line. |
+| Agent recipe | Inspect: `phdb --format json info DB`. Verify: `phdb --format json check DB` (exit 3 and `findings` on damage). Export: `phdb dump DB > db.jsonl`. Query or edit: `phdb --format json shell DB -c 'scan t --prefix user: --limit 10' -c 'put t r f:q v'` (one JSON document per command; the first failure stops with its status). |
 
 ## `check` (offline integrity check, ICR 0048)
 `pigeonhole::check(path: impl AsRef<Path>, CheckOptions) -> Result<CheckReport>`
