@@ -44,6 +44,72 @@ impl Db {
         }
     }
 
+    /// Table names.
+    pub(crate) fn tables(&self) -> Vec<String> {
+        match self {
+            Db::Writer(db) => db.tables(),
+            Db::Reader(db) => db.tables(),
+        }
+    }
+
+    /// A snapshot of everything committed, or with `durable` of what is durable.
+    pub(crate) fn snapshot(&self, durable: bool) -> pigeonhole::Result<pigeonhole::Snapshot> {
+        match (self, durable) {
+            (Db::Writer(db), false) => db.snapshot(),
+            (Db::Writer(db), true) => db.durable_snapshot(),
+            (Db::Reader(db), false) => db.snapshot(),
+            (Db::Reader(db), true) => db.durable_snapshot(),
+        }
+    }
+
+    /// A table's families' stored options, in creation order.
+    pub(crate) fn families(&self, table: &str) -> pigeonhole::Result<Vec<pigeonhole::FamilyInfo>> {
+        let infos = |names: Vec<&str>, info: &dyn Fn(&str) -> Option<pigeonhole::FamilyInfo>| {
+            names.into_iter().filter_map(info).collect()
+        };
+        Ok(match self {
+            Db::Writer(db) => {
+                let t = db.table(table)?.open()?;
+                infos(t.families(), &|f| t.family_info(f))
+            }
+            Db::Reader(db) => {
+                let t = db.table(table)?;
+                infos(t.families(), &|f| t.family_info(f))
+            }
+        })
+    }
+
+    /// Calls `each` with every row of `table` starting with `prefix`, all retained versions,
+    /// at `snapshot`, in key order. A read failure is the command's failure; `each` may stop
+    /// the scan with its own error.
+    pub(crate) fn scan<E: From<Failure>>(
+        &self,
+        table: &str,
+        prefix: &[u8],
+        snapshot: &pigeonhole::Snapshot,
+        each: &mut dyn FnMut(pigeonhole::RowRef<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let read = |e: pigeonhole::Error| E::from(Failure::db(&format!("read table {table}"), &e));
+        match self {
+            Db::Writer(db) => {
+                let t = db.table(table).and_then(|b| b.open()).map_err(read)?;
+                drive(
+                    t.scan_prefix(prefix).versions(0).snapshot(snapshot),
+                    read,
+                    each,
+                )
+            }
+            Db::Reader(db) => {
+                let t = db.table(table).map_err(read)?;
+                drive(
+                    t.scan_prefix(prefix).versions(0).snapshot(snapshot),
+                    read,
+                    each,
+                )
+            }
+        }
+    }
+
     /// Closes the database: as the writer this flushes and checkpoints, and a failure is
     /// the command's failure.
     pub(crate) fn close(self) -> Result<(), Failure> {
@@ -80,12 +146,36 @@ fn exists(path: &Path) -> Result<(), Failure> {
     }
 }
 
+/// Opens `path` as the writer for a write command (`load`): a running writer is exit 4.
+/// With `create`, a missing file is created.
+pub(crate) fn for_write(cli: &Cli, path: &Path, create: bool) -> Result<Pigeonhole, Failure> {
+    if !create {
+        exists(path)?;
+    }
+    Pigeonhole::open(path, options(cli, create)).map_err(|e| {
+        if e.code() == ErrorCode::WriterLocked {
+            Failure::db_with(
+                "open: a writer process has the database open; stop it to write to the \
+                     database with phdb"
+                    .into(),
+                &e,
+            )
+        } else {
+            Failure::db("open", &e)
+        }
+    })
+}
+
 /// The writer phdb opens as: one unpinned shard with no tablet changes, small caches, never
 /// creating the file, and accepting families whose merge operator phdb cannot know (they
 /// open read-only).
 fn writer(cli: &Cli, path: &Path) -> pigeonhole::Result<Pigeonhole> {
+    Pigeonhole::open(path, options(cli, false))
+}
+
+fn options(cli: &Cli, create: bool) -> Options {
     let mut options = Options::default()
-        .create_if_missing(false)
+        .create_if_missing(create)
         .shards(1)
         .pin_threads(false)
         .tablet_changes(false)
@@ -95,7 +185,7 @@ fn writer(cli: &Cli, path: &Path) -> pigeonhole::Result<Pigeonhole> {
     if let Some(dir) = &cli.shm_dir {
         options = options.shm_dir(dir);
     }
-    Pigeonhole::open(path, options)
+    options
 }
 
 fn reader(cli: &Cli, path: &Path) -> Result<PigeonholeReader, Failure> {
@@ -112,4 +202,16 @@ fn reader(cli: &Cli, path: &Path) -> Result<PigeonholeReader, Failure> {
             Failure::db("open as a reader", &e)
         }
     })
+}
+
+fn drive<E>(
+    scan: pigeonhole::Scan<'_>,
+    read: impl Fn(pigeonhole::Error) -> E,
+    each: &mut dyn FnMut(pigeonhole::RowRef<'_>) -> Result<(), E>,
+) -> Result<(), E> {
+    let mut it = scan.iter().map_err(&read)?;
+    while let Some(row) = it.next_ref().map_err(&read)? {
+        each(row)?;
+    }
+    Ok(())
 }

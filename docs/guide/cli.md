@@ -2,7 +2,7 @@
 
 `phdb` inspects and maintains Pigeonhole databases from the shell, in the spirit of `sqlite3` and `duckdb`.
 
-> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). `phdb info` and `phdb check` work. `dump`, `load`, `backup`, `compact` and the interactive `shell` are coming, in that order; this page grows with each.
+> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). `phdb info`, `check`, `dump` and `load` work. `backup`, `compact` and the interactive `shell` are coming, in that order; this page grows with each.
 
 **Install:** `cargo install pigeonhole-cli` installs the `phdb` binary. Until the next release, build it from a checkout with `cargo install --path crates/cli`.
 
@@ -12,12 +12,14 @@
 |---|---|
 | `phdb info <file>` | Format version, file size and free space, and per table its tablets, its families with their stored options, and their files (SSTs per level, blob files). |
 | `phdb check <file> [--deep] [--map] [--online]` | Check the file for damage, offline. Exits 3 if anything is damaged. |
+| `phdb dump <file> [--table T]... [--prefix P] [--durable]` | Export every cell, with all retained versions, at one snapshot, to standard output: `jsonl` (the default) or `csv`. |
+| `phdb load <file> [<dump.jsonl> \| -] [--create]` | Load a `jsonl` dump: create its tables and families and write every cell at its timestamp. |
 
 **Global flags,** before or after the command:
 
 | Flag | Meaning |
 |---|---|
-| `--format table\|json\|jsonl\|csv` | Output format (default `table`). |
+| `--format table\|json\|jsonl\|csv` | Output format (default `table`; for `dump`, `jsonl`). |
 | `--shm-dir <DIR>` | The shared-memory directory the database's writer uses (`Options::shm_dir`), if not the default. |
 | `--reader` | Open only as a reader process; fail unless a writer process has the database open. |
 | `--writer` | Open only as the writer; fail if a writer process has it open. |
@@ -174,6 +176,42 @@ $ echo $?
 3
 ```
 
+### `phdb dump` and `phdb load`
+
+`phdb dump` exports every cell of every table, or of the `--table`s named, with every retained version. It reads them all at one snapshot, so the export is consistent even while a writer runs: it then reads through a reader process. `--durable` reads at a durable snapshot instead, holding only commits durable at their level. `--prefix` keeps the rows starting with a prefix. Deleted cells and expired ones aren't exported.
+
+**`jsonl`** (the default) is what `phdb load` reads. Its lines are, in order:
+
+1. **A header:** `{"phdb": 1, "command": "dump", "format_version", "snapshot": "latest" | "durable", "seqno", "mode"}`.
+2. **Per table, before its cells:** `{"table", "families": [...]}`. Each family has the same fields as in `phdb info`: `name`, `counter`, `max_versions`, `ttl_micros`, `bloom_bits`, `blob_threshold`, `compression`, `zstd_level`, `block_size`, `merge_operator`, `cache_priority` and `compaction`.
+3. **Per cell:** `{"table", "row", "family", "qualifier", "ts", "value"}`. Within a row, cells are ordered by family, then qualifier, newest version first.
+
+How values are written:
+- **Bytes** (`row`, `qualifier`, and a byte `value`) are a JSON string when they are valid UTF-8, and `{"base64": "…"}` otherwise.
+- **Typed values** are `{"i64": n}` (also every counter) or `{"f64": x}` (`{"f64_bits": n}` for a NaN or an infinity).
+- **`ts`** is microseconds since the Unix epoch.
+
+**`csv`** is for spreadsheets and other tools; `phdb load` doesn't read it.
+- The header is `table,row,family,qualifier,ts,type,value`.
+- `type` is `bytes`, `base64` (a value that isn't UTF-8), `i64` or `f64`.
+- A row key or qualifier that isn't UTF-8 prints as `b64:` followed by base64. A key that really starts with `b64:` is ambiguous here, so use `jsonl` to round-trip.
+
+**`phdb load`** writes a `jsonl` dump into a database, from a file or standard input:
+- **Writer only:** it opens the database as the writer, so it fails with status 4 while another writer runs. `--create` creates the file if it's missing.
+- **Tables and families:** each table line creates its table and families. An existing family keeps the options stored in the file.
+- **Cells:** each is written at its timestamp. Counters are set to their dumped value. A family with a merge operator gets the merged values as puts.
+- **Durability:** cells are committed in batches at `Durability::None`, and one flush at the end makes the load durable. If the load fails partway, what was committed stays.
+
+A malformed dump fails with status 1 and the code `BadInput`, naming the line.
+
+Round trip:
+
+```text
+$ phdb dump app.phdb > app.jsonl
+$ phdb load --create copy.phdb app.jsonl
+$ phdb dump copy.phdb | tail -n +2 | diff - <(tail -n +2 app.jsonl)    # identical
+```
+
 ## Exit status
 
 | Status | Meaning |
@@ -192,4 +230,4 @@ $ echo $?
 {"phdb":1,"error":{"code":"WriterLocked","code_num":3,"message":"open: another process holds the writer lock"}}
 ```
 
-`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. Today the only such code is `FileNotFound`, for a missing file. The message is for people; its wording may change.
+`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.

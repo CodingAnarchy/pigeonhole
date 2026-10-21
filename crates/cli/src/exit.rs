@@ -70,6 +70,26 @@ impl Failure {
         }
     }
 
+    /// Bad usage that clap's checks do not catch (exit 2).
+    pub(crate) fn usage(message: &str) -> Self {
+        Self {
+            code: "Usage".into(),
+            code_num: None,
+            message: message.into(),
+            status: ExitStatus::USAGE,
+        }
+    }
+
+    /// Bad input: a dump file `phdb load` can't read (exit 1).
+    pub(crate) fn input(message: String) -> Self {
+        Self {
+            code: "BadInput".into(),
+            code_num: None,
+            message,
+            status: ExitStatus::ERROR,
+        }
+    }
+
     /// An I/O error outside the database (writing the output).
     pub(crate) fn io(what: &str, e: &std::io::Error) -> Self {
         Self {
