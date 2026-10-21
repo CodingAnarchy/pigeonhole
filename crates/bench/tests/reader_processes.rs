@@ -37,6 +37,12 @@ fn a_run_reports_its_reader_processes() {
     assert!(r["reads_per_sec"].as_f64().unwrap() > 0.0, "{r}");
     let (p50, p99) = (r["reads"]["p50_ns"].as_u64(), r["reads"]["p99_ns"].as_u64());
     assert!(p50 <= p99, "{r}");
+    // The writer saw both processes attached (#842's metrics, sampled every 100 ms).
+    assert_eq!(r["max_slots_active"], 2, "{r}");
+    assert!(
+        r["max_view_lag"].is_u64() && r["max_seqno_lag"].is_u64(),
+        "{r}"
+    );
     // Every row is loaded and the writer stays up: no misses, no errors.
     assert_eq!(
         (r["misses"].as_u64(), r["errors"].as_u64()),

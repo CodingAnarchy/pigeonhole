@@ -492,6 +492,18 @@ pub struct ReaderProcesses {
     /// Reads that failed, every one counted (`SnapshotExpired` or `Busy` while the writer
     /// restarts would show here; none are expected in a steady run).
     pub errors: u64,
+    /// The most published views the oldest reader snapshot lagged behind the writer's
+    /// current view, sampled from the writer's `engine_metrics()` every 100 ms while the
+    /// readers ran (`reader_pin_view_lag`, #842); 0 in results written before it.
+    #[serde(default)]
+    pub max_view_lag: u64,
+    /// The same in commits (`reader_pin_seqno_lag`).
+    #[serde(default)]
+    pub max_seqno_lag: u64,
+    /// The most reader slots the writer saw in use (`reader_slots_active`): the processes,
+    /// once they attached.
+    #[serde(default)]
+    pub max_slots_active: u64,
 }
 
 /// The settle step after the load (D233): the store flushed its write buffer, then the run
