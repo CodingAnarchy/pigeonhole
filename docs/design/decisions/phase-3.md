@@ -937,6 +937,8 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 <a id="d225"></a>
 ## D225 — A participant's PREPARE may be checkpointed once its commit is settled, not once the coordinator checkpointed the COMMIT (coordinator decision, 2026-10-12; engine, #585; amends D116)
 
+*Amended by D266 (#724): a PREPARE is checkpointed once its holders' flushed-through seqnos pass the commit, with no `CommitSettled` message; the uncoupling of the stream checkpoints this decided stands.*
+
 **Decided:**
 - **"Settled"** means the coordinator has counted every participant's `ShareFlushed`, its own share included: every share of the commit is in SSTs, D24's condition for the COMMIT record. At that point it tells the other participants (`CommitSettled`, formerly `CommitCheckpointed`), and each may checkpoint past its PREPARE.
 - **Before,** D116 kept a participant's PREPARE until the coordinator's checkpoint passed the COMMIT. The checkpoint-time notice and the `passed_commits` queue are gone.
@@ -1783,6 +1785,8 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 <a id="d254"></a>
 ## D254 — Share reports and settlements go one message per peer per pass, not one per share (owner decision, 2026-10-14; engine, #716; amends D225's messages)
 
+*Replaced by D266 (#724): the reports and settlements are gone; the holders' flushed-through seqnos decide.*
+
 **Decided:**
 - **`SharesFlushed { seqnos }` replaces `ShareFlushed { seqno }`.** A participant's report pass (`report_shares_flushed`: the flush install, `Maintain` with tablet changes on, `Start`, the close) gathers the seqnos of every share it finds in SSTs by coordinator and sends each coordinator one message. A coordinator's own shares are still counted without a message (D225).
 - **`CommitsSettled { seqnos }` replaces `CommitSettled { seqno }`.** A coordinator collects the commits it finds settled per participant and sends each one message (`send_settled`). That happens once per handler that can settle: the report pass, the `SharesFlushed` handler, and `run_group`'s logging of COMMIT records.
@@ -2132,3 +2136,30 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 **Why:** #620. A failed shard ends the instance, and a service that does not supervise its own process is left with a dead handle until it closes and reopens. The swap reuses the open path recovery already uses and the model checker covers; restarting shards inside one `Engine` would need a restart path through every piece of shared state. Reads through old views had to expire for the same reason D148 expired reader snapshots. The alternative, keeping only the documented reopen pattern, costs nothing; the option buys a short pause instead of a dead handle, at the price of one `ArcSwap` load per operation on every handle (measured against the ceilings before the option lands) and a supervisor thread when it is on.
 
 **Lands in four PRs** (ICR 0050): the engine handover (`tests/handover.rs`); the `Db` swap plumbing with the ceilings and allocation A/B; the option, supervisor, waits, stats, docs and targeted tests (`tests/recovery.rs`); the public model checker's arm (I/O faults with the option on, unacknowledged commits decided by reading back) and its sweep.
+
+<a id="d266"></a>
+## D266 — A cross-shard commit's records leave the log once every shard holding its writes has published a flushed-through seqno past it; the share reports go (owner decision, 2026-10-21; engine, #724; amends D24's mechanism, D225 (#585) and D254)
+
+**Decided** (#724 area 4, design B, with perf287's review and the protocol addendum of 2026-10-21):
+- **The bound.** Each shard publishes `flushed_through[p]`, the largest seqno at or below which every write shard p will ever hold is in a durable SST (#800, PR 1): `min(oldest unflushed memtable entry − 1, visible watermark)`, published after a flush's root commit, at `Start`, when an `Unpin` or `AwaitFlushed` finds nothing at or below its seqno unflushed, and at close once flushes are idle; Release store, Acquire load, never decreasing.
+- **D24 read off the bound.** A cross-shard commit at seqno S is replayed only whole, so its records may leave a log only once every share is in SSTs:
+  - **PREPARE:** needed while undecided; once decided, until its own slots are flushed through S and every other holder's `flushed_through` is at or above S. Aborted: never.
+  - **COMMIT:** needed until every other holder's `flushed_through` is at or above S. Its own share is its own PREPARE's, logged before it in the same stream. An incomplete COMMIT found at replay has no S (`apply: None`) and is never needed, which replaces #591's `share_reports` test.
+- **Holders.** A live record's holders are the commit's participants: `Decide` carries them (`Arc<[ShardId]>`, built once per commit). A record replayed at open takes the shards the replay applied the commit's shares to, since a reopen places tablets again and the logged participants may no longer hold them. Within one run a tablet changes shard only once its memtables are flushed (#800's `commit_op` assertion), so the participants stay a sound holder set.
+- **Re-checks by request, not broadcast.** A checkpoint stopped at a cross record whose other holders are behind sends each one `AwaitFlushed { from, through: S }`, once per peer and seqno (`awaiting`). The peer answers `FlushedThrough` once its published bound reaches S, at once if it has; with nothing unflushed at or below S it publishes again rather than flush (perf287: a bound held only by the visible watermark needs no flush). A seqno not yet visible is waited for first (a `Wake::Shard` visibility waiter). A decided PREPARE at the front looks at once.
+- **`Unpin { through }`** freezes every slot whose open memtable holds an entry at or below `through`, or publishes when there is none. It no longer starts a pass on the receiver: a pin pass asks every holder behind a needed record directly, so the transitive asks (participant → coordinator → its participants) and their dedupe (`asked`, `origin`), the `Through` pass and its seqno index go.
+- **Removed:** `unreported.rs` (#777's index), `share_reports`, `settle_to`, `settle_out`, `commit_ckpt`, the `SharesFlushed` and `CommitsSettled` messages and their handlers, `report_shares_flushed`, `settle_if_done`, `send_settled` and D254's backstop, and the `report_msgs`/`report_seqnos` test hooks (replaced by `flushed_msgs`).
+
+**Why:** after #778 the 16-shard cross-shard rows still spent about 6 ms of the `Flushed` turn reporting about 57K shares at about 110 ns each, plus the coordinators' `SharesFlushed` and the participants' `CommitsSettled` turns (#763: 4.3–4.8 ms and 2.8–3.1 ms per run before #778). Budgeting the turn raised the p99 (#777). Per-share work at apply, flush and settle goes; what remains is a check of a few atomics per cross record at the log front, and a message pair per blocked peer. The cost: settlement is conservative. A cold memtable on a holder holds back every cross record involving that holder, not only the commits that wrote to it. The WAL pin's `Unpin` bounds this, as it bounds a cold slot's single-shard records.
+
+**Tests:**
+- `cross_checkpoints.rs` (recast from `share_reports.rs`):
+  - one flush passes 600 cross records with tablet changes, and 2,100 without (no `Maintain` re-check), in at most 12 `AwaitFlushed`/`FlushedThrough` messages, where D254 sent 6 report messages and per-share reports were 1,200;
+  - perf287's validation-only share on an idle shard: the idle shard answers by publishing, and every checkpoint passes after the flush;
+  - each survives a power loss.
+- `wal_pin.rs`, unmodified: the idle participant and the cold-slot cases.
+- The model checker's crash check of the bound (#800), now also against each surviving commit's owners as the reopened engine places them (perf287's #800 follow-up).
+- The sweeps: `model_check` with and without deferred I/O, `model`, `tablets`; `crash_at_every_write_point`.
+
+**Acceptance:** a box A/B against main before merge (owner, 2026-10-21), queued after perf2's gate. Rows: the gate's contended cross-shard row at p99 and p99.9, xs Buffered and GroupSync, the regrown 2M row (≥ 0.8× packing off, #763's bar), ycsb-a, WAL pinned bytes and unpin flushes on a hot-and-cold tablet mix, and an injected-write-stall row (WAL bytes pinned on the other shards).
+

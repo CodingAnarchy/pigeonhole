@@ -2315,6 +2315,29 @@ impl World {
         already: bool,
         rng: &mut Rng,
     ) -> Result<(), Fail> {
+        self.recover(kind, already, rng)?;
+        self.note_recovered_owners();
+        Ok(())
+    }
+
+    /// After a reopen, records each surviving commit's owners as the reopened engine
+    /// places them (perf287's #800 follow-up): replay put its writes there, unflushed, so
+    /// their flushed-through seqnos are the bounds to check them against, alongside the
+    /// row's owner at each later crash.
+    fn note_recovered_owners(&mut self) {
+        let commits: Vec<(Seqno, Vec<ModelOp>)> = self
+            .history
+            .values()
+            .filter(|c| c.acked || c.observed)
+            .filter_map(|c| Some((c.seqno?, c.ops.clone())))
+            .collect();
+        for (seqno, ops) in commits {
+            self.note_ack_owners(seqno, &ops);
+        }
+    }
+
+    /// `crash_and_recover`'s crash, recovery and checks.
+    fn recover(&mut self, kind: CrashKind, already: bool, rng: &mut Rng) -> Result<(), Fail> {
         // Commits the client already saw acknowledged count, whatever is still in flight.
         self.stash_acked()?;
         // The dead engine's records belong to the run that appended them (the
@@ -2392,7 +2415,7 @@ impl World {
         self.store = Some(store);
         // A reopen places tablets afresh (`Catalog::reassign`) and replays a write into its
         // row's owner now, flushed or not: an owner at acknowledgement holds only within
-        // the run that acknowledged (#724).
+        // the run that acknowledged (#724). `note_recovered_owners` records the new ones.
         self.ack_owners.clear();
         // D263: a DECISION the crash lost may have reserved a seqno recovery
         // hands out again, as an id or an applied seqno. Its commit is then keyed by its id,

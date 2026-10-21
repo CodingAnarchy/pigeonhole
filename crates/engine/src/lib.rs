@@ -30,6 +30,8 @@ mod engine;
 mod error;
 mod flush;
 mod flushed_roots;
+#[cfg(all(test, engine_loom))]
+mod flushed_through_loom;
 mod health;
 mod large;
 mod large_settle;

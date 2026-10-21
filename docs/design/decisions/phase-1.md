@@ -110,6 +110,8 @@ The spec lists "the current tablet map" and published views separately. A view a
 ## D24 — WAL checkpoints never strand a prepared commit (approved)
 A participant's PREPARE is applied at recovery only if the coordinator's stream still holds the COMMIT. So a stream's checkpoint may not pass a COMMIT record until every participant's share of that commit is flushed (its `SetFlushed` covers the seqno). The engine computes checkpoints with this rule.
 
+*Mechanism amended by D266 (#724): the rule stands; a record's holders' published flushed-through seqnos decide it, not per-share reports.*
+
 <a id="d25"></a>
 ## D25 — WAL segments are chained; recovery never appends to a torn segment (approved)
 Each segment header records its predecessor's epoch and the offset where the predecessor's data ends. A writer syncs a full segment before writing its successor's header, and after recovery starts a new segment (epoch above every epoch in any header) chained to where replay ended, never appending to the torn one. Replay distinguishes end of segment (a successor names this exact stop offset) from end of log (no successor), and treats a successor naming a different offset as corruption. This closes the hole where stale-but-valid-looking data past a torn tail, or a later segment, could be resurrected. FORMAT §10.

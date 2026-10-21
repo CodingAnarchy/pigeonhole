@@ -271,11 +271,9 @@ pub(crate) struct ShardCounters {
     /// PREPAREs the shard refuses as overlapping an undecided share before routing them as
     /// usual (`Engine::refuse_prepares`).
     pub refuse_prepares: AtomicU64,
-    /// `SharesFlushed` and `CommitsSettled` messages the shard handled
-    /// (`Engine::share_reports`, D254).
-    pub report_msgs: AtomicU64,
-    /// The seqnos those messages carried (`Engine::share_reports`, D254).
-    pub report_seqnos: AtomicU64,
+    /// `AwaitFlushed` and `FlushedThrough` messages the shard handled
+    /// (`Engine::flushed_msgs`, D266).
+    pub flushed_msgs: AtomicU64,
     /// Records in the shard's log (those its checkpoint has not passed) after its last
     /// batch (`Engine::logged_records`, D254).
     pub logged: AtomicU64,
@@ -1002,16 +1000,14 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
-    /// Shard `shard`'s handled `SharesFlushed` and `CommitsSettled` messages, and the
-    /// seqnos they carried: one message carries every report a shard has for that peer at
-    /// once, not one per commit (D254).
+    /// How many `AwaitFlushed` and `FlushedThrough` messages shard `shard` handled: one pair
+    /// per peer a blocked checkpoint waits for, not one per share (D266). Test hook.
     #[doc(hidden)]
-    pub fn share_reports(&self, shard: usize) -> (u64, u64) {
-        let h = &self.inner.shared.metrics[shard].hooks;
-        (
-            h.report_msgs.load(Ordering::Relaxed),
-            h.report_seqnos.load(Ordering::Relaxed),
-        )
+    pub fn flushed_msgs(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .flushed_msgs
+            .load(Ordering::Relaxed)
     }
 
     /// How many spans shard `shard` added to its commits' in-flight time: one per commit it

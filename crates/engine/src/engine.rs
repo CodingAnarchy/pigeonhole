@@ -529,7 +529,7 @@ struct ReplayedRecord {
 enum ReplayedRecordKind {
     Single { slots: Vec<(TabletId, FamilyId)> },
     Prepare { coordinator: StreamId },
-    Commit { participants: Vec<StreamId> },
+    Commit,
 }
 
 /// The rounds of a full compaction with tablet changes on (issue #94). A tablet that moves
@@ -1035,11 +1035,11 @@ impl Engine {
                         participants,
                     } => {
                         let list: Vec<StreamId> = participants.iter().collect();
-                        commits.insert((stream, seqno), (list.clone(), None));
+                        commits.insert((stream, seqno), (list, None));
                         records.push(ReplayedRecord {
                             end,
                             seqno,
-                            kind: ReplayedRecordKind::Commit { participants: list },
+                            kind: ReplayedRecordKind::Commit,
                         });
                     }
                     WalRecord::Decision {
@@ -1049,14 +1049,11 @@ impl Engine {
                         participants,
                     } => {
                         let list: Vec<StreamId> = participants.iter().collect();
-                        commits.insert(
-                            (stream, seqno),
-                            (list.clone(), Some((apply_seqno, commit_ts))),
-                        );
+                        commits.insert((stream, seqno), (list, Some((apply_seqno, commit_ts))));
                         records.push(ReplayedRecord {
                             end,
                             seqno,
-                            kind: ReplayedRecordKind::Commit { participants: list },
+                            kind: ReplayedRecordKind::Commit,
                         });
                     }
                     // `WalRecord::decode` returns no other type in this build.
@@ -1121,6 +1118,24 @@ impl Engine {
             && streams.len() == shards
             && streams.iter().enumerate().all(|(i, s)| s.0 as usize == i);
         let mut have_wal = vec![false; shards];
+        // The shards the replay applied a commit's shares to: its records' holders (D266),
+        // whichever shards held them before (a reopen places tablets again).
+        let holders_of = |coordinator: StreamId, seqno: Seqno| -> crate::shard::Holders {
+            let mut on = std::collections::BTreeSet::new();
+            if let Some((ps, _)) = commits.get(&(coordinator, seqno)) {
+                for p in ps.iter() {
+                    if let Some((_, per)) = applied_slots.get(&(*p, seqno)) {
+                        on.extend(
+                            per.iter()
+                                .enumerate()
+                                .filter(|(_, slots)| !slots.is_empty())
+                                .map(|(i, _)| ShardId(i as u16)),
+                        );
+                    }
+                }
+            }
+            on.into_iter().collect()
+        };
         if same_layout {
             for ((stream, records), (_, rec)) in replayed.into_iter().zip(&recoveries) {
                 let i = stream.0 as usize;
@@ -1152,16 +1167,18 @@ impl Engine {
                             };
                             ReplayedKind::Prepare {
                                 slots,
-                                coordinator: ShardId(coordinator.0 as u16),
-                                applied: applied.map(|(s, _)| *s),
+                                applied: applied
+                                    .map(|(s, _)| (*s, holders_of(coordinator, r.seqno))),
                             }
                         }
-                        ReplayedRecordKind::Commit { participants } => ReplayedKind::Commit {
-                            participants: participants
-                                .iter()
-                                .map(|p| ShardId(p.0 as u16))
-                                .collect(),
-                            complete: complete(stream, r.seqno),
+                        ReplayedRecordKind::Commit => ReplayedKind::Commit {
+                            holders: holders_of(stream, r.seqno),
+                            apply: complete(stream, r.seqno).then(|| {
+                                commits
+                                    .get(&(stream, r.seqno))
+                                    .and_then(|(_, at)| *at)
+                                    .map_or(r.seqno, |(s, _)| s)
+                            }),
                         },
                     };
                     state.log_replayed(r.end, r.seqno, kind);
