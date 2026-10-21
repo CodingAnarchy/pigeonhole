@@ -711,6 +711,7 @@ impl Runner for PigeonholeRunner {
         }
         let o = self.open.as_mut().ok_or("pigeonhole runner is not open")?;
         o.readers = Some(super::reader_process::spawn(
+            &o.target.db,
             &o.dir.join("bench.phdb"),
             n,
             config,

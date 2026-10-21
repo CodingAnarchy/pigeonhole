@@ -37,10 +37,18 @@ struct ChildReport {
     secs: f64,
 }
 
-/// The children while the measured phase runs.
+/// How often the writer's reader metrics are sampled while the readers run.
+const SAMPLE_EVERY: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The writer-side maxima: view lag, seqno lag, slots active.
+type Lag = (u64, u64, u64);
+
+/// The children while the measured phase runs, and the writer-side sampler.
 #[derive(Debug)]
 pub(crate) struct Running {
     children: Vec<(Child, Option<ChildStdin>, BufReader<ChildStdout>)>,
+    stop_sampling: Arc<AtomicBool>,
+    sampler: Option<std::thread::JoinHandle<Lag>>,
 }
 
 /// The next tagged line from a child, or an error once its output ends.
@@ -57,9 +65,15 @@ fn tagged(out: &mut BufReader<ChildStdout>) -> Result<String, String> {
     }
 }
 
-/// Spawns `n` reader processes on the database at `db`, reading `config`'s loaded rows,
-/// and waits until each has attached and started reading.
-pub(crate) fn spawn(db: &Path, n: usize, config: &WorkloadConfig) -> Result<Running, String> {
+/// Spawns `n` reader processes on the database at `db` (open in this process as `writer`),
+/// reading `config`'s loaded rows, waits until each has attached and started reading, and
+/// samples the writer's reader metrics until [`Running::stop`].
+pub(crate) fn spawn(
+    writer: &pigeonhole::Pigeonhole,
+    db: &Path,
+    n: usize,
+    config: &WorkloadConfig,
+) -> Result<Running, String> {
     let exe = match std::env::var_os(EXE_ENV) {
         Some(p) => PathBuf::from(p),
         None => std::env::current_exe().map_err(|e| e.to_string())?,
@@ -89,12 +103,39 @@ pub(crate) fn spawn(db: &Path, n: usize, config: &WorkloadConfig) -> Result<Runn
         }
         children.push((child, stdin, out));
     }
-    Ok(Running { children })
+    let stop_sampling = Arc::new(AtomicBool::new(false));
+    let sampler = {
+        let (writer, stop) = (writer.clone(), Arc::clone(&stop_sampling));
+        std::thread::spawn(move || {
+            let mut max: Lag = (0, 0, 0);
+            loop {
+                let m = writer.engine_metrics();
+                max.0 = max.0.max(m.reader_pin_view_lag);
+                max.1 = max.1.max(m.reader_pin_seqno_lag);
+                max.2 = max.2.max(m.reader_slots_active);
+                if stop.load(Ordering::Acquire) {
+                    return max;
+                }
+                std::thread::sleep(SAMPLE_EVERY);
+            }
+        })
+    };
+    Ok(Running {
+        children,
+        stop_sampling,
+        sampler: Some(sampler),
+    })
 }
 
 impl Running {
     /// Closes every child's stdin, collects their reports and merges them.
     pub(crate) fn stop(mut self) -> Result<ReaderProcesses, String> {
+        // The last sample is taken with the readers still attached.
+        self.stop_sampling.store(true, Ordering::Release);
+        let (max_view_lag, max_seqno_lag, max_slots_active) = self
+            .sampler
+            .take()
+            .map_or((0, 0, 0), |s| s.join().unwrap_or((0, 0, 0)));
         for (_, stdin, _) in &mut self.children {
             drop(stdin.take());
         }
@@ -121,12 +162,16 @@ impl Running {
             reads_per_sec: rate,
             misses,
             errors,
+            max_view_lag,
+            max_seqno_lag,
+            max_slots_active,
         })
     }
 }
 
 impl Drop for Running {
     fn drop(&mut self) {
+        self.stop_sampling.store(true, Ordering::Release);
         // A run that failed before `stop` still leaves no reader behind.
         for (child, _, _) in &mut self.children {
             let _ = child.kill();
