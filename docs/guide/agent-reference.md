@@ -267,7 +267,7 @@ Full page: [`cli.md`](cli.md). Install with `cargo install pigeonhole-cli`; befo
 
 | Item | Rule |
 |---|---|
-| Commands | `phdb info <file>`; `phdb check <file> [--deep] [--map] [--online]` (offline integrity check, exit 3 on damage; `--online` scans through a reader while a writer runs). `phdb dump <file> [--table T]... [--prefix P] [--durable]` (jsonl by default, or csv; all versions at one snapshot); `phdb load <file> [<dump.jsonl>|-] [--create]` (writer only). `backup`, `compact` and `shell` are coming. |
+| Commands | `phdb info <file>`; `phdb check <file> [--deep] [--map] [--online]` (offline integrity check, exit 3 on damage; `--online` scans through a reader while a writer runs). `phdb dump <file> [--table T]... [--prefix P] [--durable]` (jsonl by default, or csv; all versions at one snapshot); `phdb load <file> [<dump.jsonl>|-] [--create]` (writer only). `phdb backup <file> <dest> [--latest] [--check]` and `phdb compact <file> [--shrink]` (both writer only: exit 4 while an application has the database open). `shell` is coming. |
 | For programs | `--format json` gives one document; `--format jsonl` gives a header line, then one object per row. Each carries `"phdb": 1`; within it fields are only added, so ignore unknown fields. |
 | Open policy | With no writer running, `phdb` becomes the writer for the command, replaying a crashed WAL, and closes. With a writer running, it opens as a reader process. `--reader` / `--writer` force one. |
 | Exit status | 0 ok, 1 error, 2 usage, 3 corruption, 4 locked or busy, 5 not found, 6 unsupported. |

@@ -2,7 +2,7 @@
 
 `phdb` inspects and maintains Pigeonhole databases from the shell, in the spirit of `sqlite3` and `duckdb`.
 
-> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). `phdb info`, `check`, `dump` and `load` work. `backup`, `compact` and the interactive `shell` are coming, in that order; this page grows with each.
+> **Status: in progress on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). `phdb info`, `check`, `dump`, `load`, `backup` and `compact` work. The interactive `shell` is coming; this page grows with each command.
 
 **Install:** `cargo install pigeonhole-cli` installs the `phdb` binary. Until the next release, build it from a checkout with `cargo install --path crates/cli`.
 
@@ -14,6 +14,8 @@
 | `phdb check <file> [--deep] [--map] [--online]` | Check the file for damage, offline. Exits 3 if anything is damaged. |
 | `phdb dump <file> [--table T]... [--prefix P] [--durable]` | Export every cell, with all retained versions, at one snapshot, to standard output: `jsonl` (the default) or `csv`. |
 | `phdb load <file> [<dump.jsonl> \| -] [--create]` | Load a `jsonl` dump: create its tables and families and write every cell at its timestamp. |
+| `phdb backup <file> <dest> [--latest] [--check]` | Copy the database into one new file, consistent at one snapshot. |
+| `phdb compact <file> [--shrink]` | Full compaction, with progress; optionally release free space at the file's end. |
 
 **Global flags,** before or after the command:
 
@@ -211,6 +213,30 @@ $ phdb dump app.phdb > app.jsonl
 $ phdb load --create copy.phdb app.jsonl
 $ phdb dump copy.phdb | tail -n +2 | diff - <(tail -n +2 app.jsonl)    # identical
 ```
+
+### `phdb backup` and `phdb compact`
+
+Both open the database as the writer, so they fail with status 4 while your application has it open. A backup from a running application's process is planned (#692): until then, call `Pigeonhole::backup_durable` from the application itself, or stop it first.
+
+**`phdb backup <file> <dest>`** writes a consistent single-file copy to `dest`, which must not exist. The copy needs no WAL replay to open. It's `Pigeonhole::backup_durable`, a copy at a durable snapshot holding only commits durable at their level. `--latest` uses `Pigeonhole::backup` instead, which also copies commits not yet durable. `--check` then runs `phdb check` on the copy and exits 3 if it's damaged.
+
+| Field | Meaning |
+|---|---|
+| `path`, `dest` | The database and the copy. |
+| `snapshot` | `durable` or `latest`. |
+| `bytes` | The copy's size. |
+| `elapsed_ms` | How long the copy took. |
+| `check` | With `--check`: `ok` or `corrupt`. |
+
+**`phdb compact <file>`** is `Pigeonhole::compact`: it flushes, then merges every level of every table into the last. The merge drops versions past `max_versions`, expired cells and deleted data, as the engine's compaction rules allow. The API reports no progress, so with `--format table` `phdb` prints one line every half second to standard error (`compacting: 2.5 s, 1 flushes, 3 compactions done`). Other formats print nothing there. `--shrink` then runs `Pigeonhole::shrink`, which releases free space at the end of the file.
+
+| Field | Meaning |
+|---|---|
+| `elapsed_ms` | The compaction's wall time. |
+| `flushes`, `compactions` | Flushes and compactions finished while it ran. |
+| `file_bytes_before`, `file_bytes` | The file's length before and after. |
+| `released_bytes` | With `--shrink`: the bytes released (`null` otherwise). |
+| `free_bytes` | Free space left in the file afterwards. |
 
 ## Exit status
 
