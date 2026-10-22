@@ -497,7 +497,9 @@ pub(crate) struct Shared {
     /// 0 before the first decision. Read by `Engine::pack_target` only (a bench hook: the
     /// warm-up does not end while a growth is pending).
     pub pack_target: AtomicUsize,
-    /// Async commits and deferred freezes waiting for the watermark.
+    /// Commits (blocking and async) waiting for the visible watermark, and checkpoint fronts
+    /// waiting for a cross-shard record's seqno to become visible (D266). Deferred freezes
+    /// wait in `durable_waiters` (D227).
     pub waiters: WatermarkWaiters,
     /// Shards whose deferred freeze waits for the durable seqno (D227, ICR 0037): a frozen
     /// memtable holds only durable entries, so flush and compaction GC never collapse a

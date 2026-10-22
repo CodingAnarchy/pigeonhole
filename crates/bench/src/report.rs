@@ -652,7 +652,7 @@ pub struct Stalls {
     /// See [`Stalls::shard_parks`].
     #[serde(default)]
     pub commit_parks: u64,
-    /// Async commits that waited on the global visibility watermark (D19), and the
+    /// Commit waits (blocking and async) on the global visibility watermark (D19, D227), and the
     /// waiter-list entries their registrations scanned (ICR 0023, #154).
     #[serde(default)]
     pub visibility_waits: u64,

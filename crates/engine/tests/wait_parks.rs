@@ -1,5 +1,6 @@
-//! Issue #135 (1-2 F1): a blocking commit wait whose seqno another shard's in-flight group
-//! holds below the global watermark parks instead of spinning, and wakes when it publishes.
+//! Issue #135 (1-2 F1): a blocking commit wait whose seqno another shard holds below the
+//! global watermark (here a cross-shard decision's seqno, held until every participant
+//! applied, D263) parks instead of spinning, and wakes when it publishes.
 //!
 //! Its own test binary, so no other test's threads add to the process's CPU time.
 

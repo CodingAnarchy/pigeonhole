@@ -1,6 +1,7 @@
-//! Who waits for the visible watermark (#134 step 2, item 2): one registry for async
-//! commits waiting for their seqno to become visible and shards with a freeze deferred
-//! until the watermark passes their memtable.
+//! Who waits for a watermark (#134 step 2, item 2). One type, two instances in `Shared`:
+//! `waiters`, for commits (blocking and async) waiting for their seqno to become visible
+//! and shards whose checkpoint waits for a cross-shard record's seqno (D266); and
+//! `durable_waiters`, for shards whose freeze waits for the durable seqno (D227).
 //!
 //! An entry is a seqno, a key that names its waiter, and a wake. A shard publishing a
 //! watermark wakes, and forgets, the entries whose seqno is visible, outside the lock.
@@ -357,8 +358,8 @@ pub(crate) fn commit_key(seqno: Seqno) -> u64 {
     seqno
 }
 
-/// The key of a shard waiting for the watermark (a deferred freeze): one per shard, with
-/// the top bit set so it never meets a [`commit_key`].
+/// The key of a shard waiting for a watermark (a deferred freeze, or a checkpoint front,
+/// D266): one per shard, with the top bit set so it never meets a [`commit_key`].
 pub(crate) fn shard_key(shard: u16) -> u64 {
     (1 << 63) | u64::from(shard)
 }

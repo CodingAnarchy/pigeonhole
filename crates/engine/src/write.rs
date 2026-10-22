@@ -551,7 +551,7 @@ fn wait_body(
 }
 
 /// A blocking wait's poll before it parks (D198): up to its window, unless this thread's
-/// recent polls kept finding nothing (then it skips the next 1, 2, 4, ... up to 64 polls).
+/// recent waits kept finding nothing (then the next 1, 2, 4, ... up to 32 waits skip it).
 /// A shard usually answers a buffered commit within a few microseconds, and a parked
 /// thread's wakeup costs that again or more.
 struct SpinWait {
@@ -741,7 +741,7 @@ fn wait_reply_spinning<T: Send>(
     park_for_reply(shared, waiter)
 }
 
-/// Blocks until `seqno` is visible (D19), parked on the shards' watermark publishes. Fails
+/// Blocks until `seqno` is visible (D19, D227), parked on the shards' watermark publishes. Fails
 /// instead on a thread that drives a shard, which may be the one holding the watermark, and
 /// with `OutcomeUnknown` once visibility can no longer advance (the close finished, or a
 /// shard died): the commit was acknowledged by its shard, but never became visible here.
@@ -850,9 +850,11 @@ impl Future for PendingCommit {
                 }
             },
         };
-        // Durable and applied on its shard; another shard's in-flight group may still hold
-        // the global watermark below it (D19). The shards wake registered waiters when they
-        // publish a watermark, so this never spins.
+        // Durable at its level and applied on its shard; another shard may still hold the
+        // global watermark below it: a group it has reserved but not applied, a cross-shard
+        // decision's seqno until every participant applied (D263), or a group behind a held
+        // segment header (D200). The shards wake registered waiters when they publish a
+        // watermark, so this never spins.
         if this.sub.shared.wait_visible(info.seqno, cx.waker()) {
             Poll::Ready(Ok(info))
         } else if this.sub.shared.visibility_ended() {
