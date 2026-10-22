@@ -4675,7 +4675,8 @@ impl ShardState {
     fn reserve_stamps(&mut self, n: u64, k: u64) -> (Seqno, Timestamp) {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
-        shm.publish_pending(shard, self.watermark().min(self.shared.clock.next_seqno()));
+        // The mirror never passes the allocator's `S`, so it is a lower bound (§11.3 step 1).
+        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
         let now = self.shared.vfs.now_micros();
         let (first, t0) = self
             .shared
@@ -7237,7 +7238,8 @@ impl ShardState {
         let _ = floors;
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
-        shm.publish_pending(shard, self.watermark().min(self.shared.clock.next_seqno()));
+        // The mirror never passes the allocator's `S`, so it is a lower bound (§11.3 step 1).
+        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
         let now = self.shared.vfs.now_micros();
         let (apply_seqno, commit_ts) = self.shared.clock.reserve_decision(now, shm);
         self.held.insert(apply_seqno);
