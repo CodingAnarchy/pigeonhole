@@ -66,6 +66,11 @@ impl Gate {
             .insert(path.to_path_buf());
     }
 
+    /// Ends [`Gate::fail_writes`] for `path`: later writes go through again.
+    pub fn heal_writes(&self, path: &Path) {
+        self.rules.lock().unwrap().fail_writes.remove(path);
+    }
+
     /// Holds every later asynchronous sync of `path` until [`Gate::release`].
     pub fn hold(&self, path: &Path) {
         self.rules.lock().unwrap().hold.insert(path.to_path_buf());

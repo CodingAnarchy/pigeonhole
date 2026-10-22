@@ -651,6 +651,8 @@ The spec says a flush "must not persist a share of a cross-shard commit until ev
 
 *Since D227, a flush's frozen memtables can hold records whose group sync is still in flight. This barrier is what keeps a flush from persisting them into an SST ahead of their stream's sync.*
 
+*History: Amended 2026-10-21 (#847). On a poisoned stream (a write or sync failed; nothing more reaches the file) the barrier answers from what is already durable, and which records it must cover depends on who asks. The flushing shard's own barrier holds only if the stream is durable through every record appended since open: its memtables hold the stream's every record, and a `None` record can still sit in the stream's buffer (it is written with the next group's records, whose write is what failed), so an SST persisting its cells in some slots while the log holds none of it would make the commit durable in part. A peer's barrier holds once the stream's PREPAREs and COMMITs are durable, as before (5-6 5.1): its memtables hold only shares of this shard's cross-shard commits. The same two rules answer a barrier that reaches the shard after its close reported. The flush task names its shard in the barrier (`SyncBarrier::from`). Found by the public model check's recovery arm (#837).*
+
 <a id="d116"></a>
 ## D116 — When may a shard checkpoint a PREPARE or COMMIT record? (approved; engine Milestone B)
 D24 says a checkpoint never strands a prepared commit, and D83 that a cross-shard commit is recovered all or nothing. Neither says what a participant needs to know about the coordinator's COMMIT before it moves its checkpoint past its own PREPARE.
