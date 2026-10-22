@@ -56,6 +56,10 @@ pub enum HookSite {
     /// In the next `shrink` round, after it has read the catalog and before it relocates
     /// anything: where a compaction or `drop_table` can commit under it.
     ShrinkRelocates,
+    /// On the thread that `Engine::wait_failed` woke with a failure, before it returns:
+    /// where the recovery supervisor has not marked the failure yet, and a `close()` can
+    /// reach the failed engine first (D265).
+    FailureWake,
     /// On the calling thread of the next `backup`, right after it released its snapshot's
     /// memtables and before it merges the SSTs: where a test writes past the arena while
     /// the backup still runs (#262).

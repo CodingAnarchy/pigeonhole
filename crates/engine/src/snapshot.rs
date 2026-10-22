@@ -920,6 +920,11 @@ pub struct View {
     /// Registered in the writer's live-view registry while the view lives (none in a
     /// reader process).
     pub(crate) _pin: Option<ViewPin>,
+    /// The empty view a closed engine's memory release published (`Shared::release_memory`,
+    /// D265): nothing may be read through it. A read as of now that loads it fails with
+    /// `Closed` instead of answering from nothing; the public handle then waits for the
+    /// recovery's swap and reads on the new engine. Found by the model check's recovery arm.
+    pub(crate) released: bool,
 }
 
 impl View {

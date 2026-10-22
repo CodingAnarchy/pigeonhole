@@ -91,6 +91,7 @@ mod info;
 mod metrics;
 mod options;
 mod read;
+mod recovery;
 mod table;
 mod write;
 
@@ -139,8 +140,11 @@ pub use db::{Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
 pub use info::{Compression, DatabaseInfo, FamilyInfo, FamilyStorage, LevelInfo, TableInfo};
 pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
-pub use options::{Compaction, Family, IoBackend, IoRings, Options, Priority, ReaderOptions, days};
+pub use options::{
+    Compaction, Family, IoBackend, IoRings, Options, Priority, ReaderOptions, Recovery, days,
+};
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
+pub use recovery::RecoveryStats;
 pub use table::{ReadTable, Table, TableBuilder};
 pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
 

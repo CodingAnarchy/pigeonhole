@@ -1,6 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
+use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use pigeonhole_engine::{Engine, EngineShard, Failure};
@@ -9,8 +10,8 @@ use pigeonhole_io::VfsRef;
 
 use crate::table::TableCore;
 use crate::{
-    Error, ErrorCode, IoRings, Options, ReadTable, ReaderOptions, Result, TableBuilder,
-    Transaction, WriteBatch,
+    Error, ErrorCode, IoRings, Options, ReadTable, ReaderOptions, Recovery, RecoveryStats, Result,
+    TableBuilder, Transaction, WriteBatch,
 };
 
 /// What every handle derived from one open database shares: the engine, whether
@@ -33,6 +34,13 @@ pub(crate) struct Db {
     vfs: VfsRef,
     /// Largest value accepted at commit (decision D16), for error messages; 0 for readers.
     pub(crate) max_value: usize,
+    /// Automatic recovery (D265): the supervisor's state and thread, with
+    /// `Options::auto_recover` on; `None` otherwise, and for readers.
+    supervision: Option<crate::recovery::Supervision>,
+    /// What a reopen needs: the options and the path (writers with the option on).
+    reopen: Option<(Options, PathBuf)>,
+    /// `Options::write_stall_timeout`: how long an operation waits for a recovery's swap.
+    stall_timeout: Duration,
 }
 
 /// The engine an operation runs on, held for the operation: the handle's cached `Arc`
@@ -136,12 +144,192 @@ const CLOSED: u64 = 1 << 63;
 
 impl Db {
     fn new(engine: Arc<Engine>, vfs: VfsRef, max_value: usize) -> Arc<Self> {
+        Self::with_recovery(engine, vfs, max_value, None, Duration::from_secs(30))
+    }
+
+    /// `new`, supervised when `reopen` names the options and path to recover with and the
+    /// options ask for it.
+    fn with_recovery(
+        engine: Arc<Engine>,
+        vfs: VfsRef,
+        max_value: usize,
+        reopen: Option<(Options, PathBuf)>,
+        stall_timeout: Duration,
+    ) -> Arc<Self> {
+        let supervision = reopen
+            .as_ref()
+            .map(|(o, _)| o.recovery())
+            .filter(|r| *r != Recovery::Off)
+            .map(crate::recovery::Supervision::new);
         Arc::new(Self {
             engine: ArcSwap::from(engine),
             generation: AtomicU64::new(1),
             vfs,
             max_value,
+            supervision,
+            reopen,
+            stall_timeout,
         })
+    }
+
+    /// The supervisor's state, with the option on.
+    pub(crate) fn supervision(&self) -> Option<&crate::recovery::Supervision> {
+        self.supervision.as_ref()
+    }
+
+    /// The current engine, as an `Arc` (the supervisor's wait holds it).
+    pub(crate) fn engine_arc(&self) -> Arc<Engine> {
+        Arc::clone(&self.engine.load())
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        self.generation.load(Ordering::Acquire) & CLOSED != 0
+    }
+
+    pub(crate) fn stall_timeout(&self) -> Duration {
+        self.stall_timeout
+    }
+
+    /// The engine options a recovery reopens with (the handle's own, re-resolved).
+    pub(crate) fn reopen_options(&self) -> Result<pigeonhole_engine::EngineOptions> {
+        let (options, _) = self.reopen.as_ref().expect("a supervised writer");
+        Ok(options.to_engine()?)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        let (_, path) = self.reopen.as_ref().expect("a supervised writer");
+        path
+    }
+
+    /// Runs `op`, and once more on the current engine if it got `Closed` from an engine a
+    /// recovery was replacing (D265): the wait for the swap is bounded by
+    /// `Options::write_stall_timeout` (`Busy` past it; `Closed` once recovery gave up or
+    /// the handle is closed). Costs nothing on the success path.
+    /// Whether a recovery supervisor runs for this database (`Options::auto_recover`): the
+    /// hot read paths take `retry_closed` only then, and the engine call as before the
+    /// option otherwise. A closure handing the engine's result back costs a move of it
+    /// (`CellData` carries up to 128 inline bytes: about 60 instructions per point get on
+    /// callgrind, #836 round 6), which the option-off path must not pay.
+    #[inline(always)]
+    pub(crate) fn supervised(&self) -> bool {
+        self.supervision.is_some()
+    }
+
+    #[inline(always)]
+    pub(crate) fn retry_closed<T>(&self, mut op: impl FnMut() -> Result<T>) -> Result<T> {
+        // Option off: the operation as it was, nothing around it (the instructions run on
+        // #836 measured the version below with a load and a match around every get at
+        // about 120 instructions more per point get).
+        if self.supervision.is_none() {
+            return op();
+        }
+        // The generation before the operation (one load): a `Closed` is then judged against
+        // the engine the operation ran on, not against whatever is current once the thread
+        // runs again (perf287's R3 on #836).
+        let generation = self.generation();
+        match op() {
+            Err(e) if e.code() == ErrorCode::Closed => self.retry_after_closed(generation, op),
+            r => r,
+        }
+    }
+
+    /// The retry, out of line: after the wait, the operation again on the current engine.
+    #[cold]
+    #[inline(never)]
+    fn retry_after_closed<T>(
+        &self,
+        generation: u64,
+        mut op: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        self.after_closed(generation)?;
+        op()
+    }
+
+    /// An operation got `Closed`: whether to run it again (`Ok`), after waiting for a running
+    /// recovery's swap, or to fail (`Closed`, or `Busy` past the wait's bound).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn after_closed(&self, generation: u64) -> Result<()> {
+        let closed = || Err(pigeonhole_engine::Error::Closed.into());
+        if self.is_closed() {
+            return closed();
+        }
+        let Some(sup) = &self.supervision else {
+            return closed();
+        };
+        // A recovery either runs (wait for it) or completed since the operation loaded its
+        // engine (the failed one, closed meanwhile: run again on the new one). With neither,
+        // the `Closed` is the instance's own (a failure the option does not cover, or one
+        // the supervisor gave up on).
+        match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
+            crate::recovery::Settled::Swapped if self.generation() != generation => Ok(()),
+            crate::recovery::Settled::Swapped => closed(),
+            crate::recovery::Settled::Failed => closed(),
+            crate::recovery::Settled::TimedOut => Err(Error::new(
+                ErrorCode::Busy,
+                "recovering after a shard failure (Options::auto_recover): the reopen did not \
+                 finish within Options::write_stall_timeout; not committed, retry",
+            )),
+        }
+    }
+
+    /// Before a commit is submitted: with a recovery running, waits for its swap (bounded),
+    /// so the commit runs on the new engine rather than being refused by the closing one.
+    /// Returns the generation the commit submits under, for `after_commit_closed`.
+    #[inline(always)]
+    pub(crate) fn before_commit(&self) -> Result<u64> {
+        match &self.supervision {
+            // Option off: no load at all (`after_commit_closed` returns early without it).
+            None => Ok(0),
+            Some(sup) if sup.recovering() => {
+                self.wait_for_swap()?;
+                Ok(self.generation())
+            }
+            Some(_) => Ok(self.generation()),
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn wait_for_swap(&self) -> Result<()> {
+        let sup = self.supervision.as_ref().expect("checked");
+        match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
+            crate::recovery::Settled::Swapped => Ok(()),
+            crate::recovery::Settled::Failed => Err(pigeonhole_engine::Error::Closed.into()),
+            crate::recovery::Settled::TimedOut => Err(Error::new(
+                ErrorCode::Busy,
+                "recovering after a shard failure (Options::auto_recover): the reopen did not \
+                 finish within Options::write_stall_timeout; not committed, retry",
+            )),
+        }
+    }
+
+    /// A commit got `Closed` from the engine: with a recovery running or just completed, the
+    /// commit was refused by the failing engine before anything was written, and the batch
+    /// is gone with it: `Busy` (not committed, retry) once the swap is in, or `Closed` if the
+    /// recovery gave up. Without a recovery, the error as it is.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn after_commit_closed(&self, generation: u64, e: Error) -> Error {
+        if e.code() != ErrorCode::Closed || self.is_closed() {
+            return e;
+        }
+        let Some(sup) = &self.supervision else {
+            return e;
+        };
+        match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
+            crate::recovery::Settled::Swapped if self.generation() != generation => Error::new(
+                ErrorCode::Busy,
+                "refused by the failed engine while the database recovered \
+                     (Options::auto_recover): not committed, retry on the recovered one",
+            ),
+            crate::recovery::Settled::TimedOut => Error::new(
+                ErrorCode::Busy,
+                "recovering after a shard failure (Options::auto_recover): the reopen did not \
+                 finish within Options::write_stall_timeout; not committed, retry",
+            ),
+            _ => e,
+        }
     }
 
     /// The current engine, loaded from the `ArcSwap` (the slow path; handles use their
@@ -204,11 +392,16 @@ impl Db {
 
     pub(crate) fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_open()?;
-        // The generation before the engine: a swap in between leaves a snapshot that fails
-        // its check rather than one that passes it with an old view.
-        let generation = self.generation();
+        // The generation before the engine, inside the retry (perf287's R2 on #836): a swap
+        // in between leaves a snapshot that fails its check rather than one that passes it
+        // with an old view, and a snapshot retried on the new engine carries that one's.
+        let (inner, generation) = self.retry_closed(|| {
+            let generation = self.generation();
+            let inner = self.engine().snapshot()?;
+            Ok((inner, generation))
+        })?;
         Ok(Snapshot {
-            inner: self.engine().snapshot()?,
+            inner,
             db: Arc::downgrade(self),
             generation,
         })
@@ -216,9 +409,13 @@ impl Db {
 
     pub(crate) fn durable_snapshot(self: &Arc<Self>) -> Result<Snapshot> {
         self.check_open()?;
-        let generation = self.generation();
+        let (inner, generation) = self.retry_closed(|| {
+            let generation = self.generation();
+            let inner = self.engine().durable_snapshot()?;
+            Ok((inner, generation))
+        })?;
         Ok(Snapshot {
-            inner: self.engine().durable_snapshot()?,
+            inner,
             db: Arc::downgrade(self),
             generation,
         })
@@ -281,7 +478,18 @@ impl Pigeonhole {
         let max_value = max_value(&engine_options);
         let shm = ShmFootprint::of(&engine_options);
         let engine = Engine::open(path.as_ref(), engine_options).map_err(|e| shm.explain(e))?;
-        let db = Db::new(engine, vfs, max_value);
+        let stall_timeout = options.stall_timeout();
+        let supervised = options.recovery() != Recovery::Off;
+        let db = Db::with_recovery(
+            engine,
+            vfs,
+            max_value,
+            Some((options, path.as_ref().to_path_buf())),
+            stall_timeout,
+        );
+        if supervised {
+            crate::recovery::Supervision::start(&db)?;
+        }
         let cached = Cached::new(&db);
         Ok(Pigeonhole { db, cached })
     }
@@ -383,6 +591,13 @@ impl Pigeonhole {
         path: impl AsRef<Path>,
         options: Options,
     ) -> Result<(Pigeonhole, Vec<Shard>)> {
+        if options.recovery() != Recovery::Off {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "Options::auto_recover needs engine-owned shards: an application-owned engine's \
+                 shards are driven by the application, which closes and reopens it itself",
+            ));
+        }
         let engine_options = options.to_engine_for(true)?;
         let vfs = Arc::clone(&engine_options.vfs);
         let max_value = max_value(&engine_options);
@@ -425,7 +640,8 @@ impl Pigeonhole {
             .engine()
             .table(name)
             .ok_or_else(|| pigeonhole_engine::Error::TableNotFound(name.to_owned()))?;
-        Ok(self.engine().drop_table(info.id)?)
+        self.db
+            .retry_closed(|| self.engine().drop_table(info.id).map_err(Error::from))
     }
 
     /// A batch of writes across any rows and tables, committed with one durability point.
@@ -452,14 +668,35 @@ impl Pigeonhole {
     /// "Recovering from a failed shard". [`failure`](Self::failure) says which shard and
     /// why. Cheap (one atomic load), so it can back a health endpoint.
     pub fn is_failed(&self) -> bool {
-        self.engine().is_failed()
+        self.engine().is_failed() || self.db.supervision().is_some_and(|s| s.stood_down())
+    }
+
+    /// What automatic recovery ([`Options::auto_recover`](crate::Options::auto_recover))
+    /// did since this handle opened: the engine's generation (1 at open, +1 per recovery),
+    /// how many recoveries completed, whether the supervisor gave up, the last failure it
+    /// handled and the last recovery's duration. All zero and `false` with the option off.
+    /// Cheap (one lock, no I/O). Engine metrics restart from zero at each recovery;
+    /// `generation` shows the reset.
+    pub fn recovery_stats(&self) -> RecoveryStats {
+        match self.db.supervision() {
+            Some(s) => s.stats(self.db.generation()),
+            None => RecoveryStats {
+                generation: self.db.generation(),
+                ..RecoveryStats::default()
+            },
+        }
     }
 
     /// The instance's first failure, if any (see [`is_failed`](Self::is_failed)): the shard
     /// ([`Failure::MAIN_FILE`] for the main file) and the
     /// [`FailureCause`](crate::FailureCause). Later failures do not replace it.
     pub fn failure(&self) -> Option<Failure> {
-        self.engine().failure()
+        self.engine().failure().or_else(|| {
+            self.db
+                .supervision()
+                .filter(|s| s.gave_up())
+                .and_then(|s| s.last_failure())
+        })
     }
 
     /// A consistent snapshot of everything committed so far. It sees a commit once the commit
@@ -628,7 +865,8 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn flush(&self) -> Result<()> {
-        Ok(self.engine().flush()?)
+        self.db
+            .retry_closed(|| self.engine().flush().map_err(Error::from))
     }
 
     /// Compacts every table fully: flushes, then merges every level into the last one.
@@ -658,7 +896,8 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn compact(&self) -> Result<()> {
-        Ok(self.engine().compact(None)?)
+        self.db
+            .retry_closed(|| self.engine().compact(None).map_err(Error::from))
     }
 
     /// Writes a consistent single-file copy to `dest`, which must not exist, while writes
@@ -693,14 +932,19 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn backup(&self, dest: impl AsRef<Path>) -> Result<()> {
-        Ok(self.engine().backup(dest.as_ref())?)
+        self.db
+            .retry_closed(|| self.engine().backup(dest.as_ref()).map_err(Error::from))
     }
 
     /// As [`backup`](Self::backup), at a durable snapshot (D227, ICR 0037): the copy holds
     /// only commits durable here at their level. A `GroupSync` or `Sync` commit it holds
     /// survives a power loss here; a `Buffered` or `None` one may not.
     pub fn backup_durable(&self, dest: impl AsRef<Path>) -> Result<()> {
-        Ok(self.engine().backup_durable(dest.as_ref())?)
+        self.db.retry_closed(|| {
+            self.engine()
+                .backup_durable(dest.as_ref())
+                .map_err(Error::from)
+        })
     }
 
     /// Returns free space at the end of the file to the filesystem and reports the bytes
@@ -763,7 +1007,8 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn shrink(&self) -> Result<u64> {
-        Ok(self.engine().shrink()?)
+        self.db
+            .retry_closed(|| self.engine().shrink().map_err(Error::from))
     }
 
     /// Closes this handle's database. Flushes every memtable and checkpoints the WAL; if
@@ -776,7 +1021,20 @@ impl Pigeonhole {
     /// [`ErrorCode::Closed`](crate::ErrorCode::Closed) afterwards.
     pub fn close(self) -> Result<()> {
         self.db.generation.fetch_or(CLOSED, Ordering::Release);
-        Ok(self.engine().close()?)
+        // A running recovery settles first (its swap, or its give-up; bounded by its own
+        // deadline), so the engine closed is the one every handle ends on. A failure the
+        // supervisor has not marked yet is not waited for (perf287's R5 on #836): the
+        // supervisor, once it wakes, finds the handle closed and ends, so there is no
+        // recovery to wait for, and this closes the failed engine as a close without the
+        // option would (unclean; the next open replays the log).
+        if let Some(sup) = self.db.supervision() {
+            sup.wait_settled(self.db.stall_timeout().saturating_mul(5), || false);
+        }
+        let result = self.db.engine().close();
+        if let Some(sup) = self.db.supervision() {
+            sup.join();
+        }
+        Ok(result?)
     }
 }
 
@@ -1276,6 +1534,86 @@ fn max_value(o: &pigeonhole_engine::EngineOptions) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc;
+    use std::time::Instant;
+
+    /// D265 (perf287's R5 on #836): a `close()` that reaches a failed engine before the
+    /// supervisor marked the failure does not wait for a recovery that never starts (the
+    /// supervisor finds the handle closed and ends). It closes the failed engine as a close
+    /// without the option would, and returns well under the stall timeout; the next open
+    /// replays the log. The supervisor is held on its wake by a test hook, so the close
+    /// wins the race for certain.
+    #[test]
+    fn a_close_racing_an_unmarked_failure_closes_the_failed_engine_at_once() {
+        let vfs: VfsRef = pigeonhole_io::sim::SimVfs::new(2651);
+        let options = Options::default()
+            .vfs(Arc::clone(&vfs))
+            .shards(1)
+            .pin_threads(false)
+            .write_stall_timeout(Duration::from_secs(10))
+            .auto_recover(crate::Recovery::Any);
+        let path = Path::new("/db/race.phdb");
+        let db = Pigeonhole::open(path, options.clone()).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", crate::Family::default())
+            .create_if_missing()
+            .unwrap();
+        for i in 0..8u8 {
+            t.mutate(&[b'r', i]).put("f", b"q", b"v").commit().unwrap();
+        }
+        // The supervisor, woken by the failure, is held before it looks at it.
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let engine = db.engine().to_arc();
+        engine.on_next(
+            pigeonhole_engine::HookSite::FailureWake,
+            Box::new(move || {
+                let _ = entered_tx.send(());
+                let _ = go_rx.recv();
+            }),
+        );
+        // The next apply fails after its WAL append: the shard poisons itself (its record
+        // replays at the next open) and the commit gets `OutcomeUnknown`.
+        engine.inject(pigeonhole_engine::Fault::NextApply, true);
+        let e = t
+            .mutate(b"unknown")
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap_err();
+        assert_eq!(e.code(), crate::ErrorCode::OutcomeUnknown);
+        entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the supervisor woke on the failure");
+        assert!(db.is_failed());
+        // `close()` on its own thread (it joins the supervisor at its end): once it has
+        // marked the handle closed, the supervisor is let go, finds the handle closed and
+        // ends without marking the failure.
+        let inner = Arc::clone(&db.db);
+        let closer = std::thread::spawn(move || {
+            let started = Instant::now();
+            (db.close(), started.elapsed())
+        });
+        while !inner.is_closed() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let _ = go_tx.send(());
+        let (result, took) = closer.join().unwrap();
+        assert!(
+            took < Duration::from_secs(2),
+            "the close took {took:?} ({result:?}); it must not wait for a recovery"
+        );
+        drop(t);
+        // The next open replays the log: every row, the unknown commit's included.
+        let db = Pigeonhole::open(path, options.auto_recover(crate::Recovery::Off)).unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        for i in 0..8u8 {
+            assert!(t.get(&[b'r', i], "f", b"q").unwrap().is_some(), "row {i}");
+        }
+        assert!(t.get(b"unknown", "f", b"q").unwrap().is_some());
+        db.close().unwrap();
+    }
 
     /// D265: the engine behind the handle is swapped for one reopened on the first one's
     /// handover, as the recovery supervisor does. Table handles keep working on the new

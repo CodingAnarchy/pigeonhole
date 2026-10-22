@@ -1223,6 +1223,7 @@ mod tests {
                 mems: Vec::new(),
                 ssts: Arc::new(ssts),
                 _pin: None,
+                released: false,
             }
         };
         let slots = [(TabletId(1), family), (TabletId(2), family)];

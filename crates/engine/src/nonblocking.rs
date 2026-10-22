@@ -107,7 +107,7 @@ impl Reading {
     /// a pinned snapshot in a reader process or under a steady stream of commits.
     fn take_point(&self) -> Result<At> {
         if !self.inner.is_reader()
-            && let Some((view, seqno)) = self.inner.latest_view()
+            && let Some((view, seqno)) = self.inner.latest_view()?
         {
             return Ok(At::Latest {
                 view: arc_swap::Guard::into_inner(view),

@@ -839,6 +839,7 @@ impl Shared {
                             Arc::clone(&self.cache),
                         )),
                         _pin: None,
+                        released: true,
                     })),
                 )
             }
@@ -3575,6 +3576,7 @@ impl ShardState {
                     &this.shared.live_views,
                     current.manifest_version,
                 )),
+                released: false,
             }
         })?;
         Ok(())

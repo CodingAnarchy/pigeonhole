@@ -33,6 +33,8 @@ futures-core = { workspace = true, optional = true }
 # The engine's test hooks, for the unit tests that race a read (never in a normal build).
 pigeonhole-engine = { workspace = true, features = ["test-hooks"] }
 pigeonhole-sim = { workspace = true }
+# The recovery tests fail and hold one stream's syncs by path.
+pigeonhole-wal = { workspace = true }
 futures-core = { workspace = true }
 criterion = { workspace = true }
 # The app-owned io_uring test waits in `poll` on the shard's completion fd (#408).

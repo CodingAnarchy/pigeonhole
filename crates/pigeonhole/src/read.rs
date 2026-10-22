@@ -183,6 +183,8 @@ impl Selection {
                 core.db.check_snapshot(&s)?;
                 s.inner
             }
+            // The retry only with a supervisor (`Db::supervised`).
+            None if core.db.supervised() => core.snapshot_supervised()?,
             None => core.engine().snapshot()?,
         };
         let info = core.current_info();
@@ -302,6 +304,24 @@ pub struct RowRead<'t> {
 }
 
 impl<'t> RowRead<'t> {
+    /// The latest-version read with a supervisor: run again on the recovered engine if it
+    /// got `Closed`. Out of line, so the plain arm keeps main's codegen (`TableCore::get_latest_supervised`).
+    #[cold]
+    #[inline(never)]
+    fn read_latest_supervised(
+        &self,
+        table: pigeonhole_engine::TableId,
+        families: &[pigeonhole_engine::FamilyId],
+        buf: &mut RowBuf,
+    ) -> Result<bool> {
+        self.core.db.retry_closed(|| {
+            self.core
+                .engine()
+                .read_row_latest_into(table, &self.row, families, &self.sel.spec, buf)
+                .map_err(crate::Error::from)
+        })
+    }
+
     pub(crate) fn new(core: &'t TableCore, row: &[u8]) -> Self {
         Self {
             core,
@@ -342,16 +362,20 @@ impl<'t> RowRead<'t> {
         // The engine resolves the cells straight into the row this returns (#287): no
         // intermediate row and no second copy of each cell.
         let mut buf = RowBuf::new(info, 0);
-        let (engine, table) = (&self.core.engine(), self.core.info.id);
+        let table = self.core.info.id;
         let any = match &snapshot {
-            None => engine.read_row_latest_into(
+            // The retry only with a supervisor (`Db::supervised`).
+            None if self.core.db.supervised() => {
+                self.read_latest_supervised(table, &families, &mut buf)?
+            }
+            None => self.core.engine().read_row_latest_into(
                 table,
                 &self.row,
                 &families,
                 &self.sel.spec,
                 &mut buf,
             )?,
-            Some(snapshot) => engine.read_row_into_families(
+            Some(snapshot) => self.core.engine().read_row_into_families(
                 snapshot,
                 table,
                 &self.row,

@@ -15,7 +15,7 @@ What a failure refuses depends on what failed:
 - **A shard that stopped for another reason** (a failed log write, an internal error) refuses its own commits.
 - **After a failed manifest commit,** flushes stop, so commits fail once they need memtable room.
 
-Reads keep working in every case. Nothing already durable is lost: the log and the main file hold it, and the next open replays what the log holds. Recovery is therefore: notice, close, reopen, and settle the commits that were in flight. Pigeonhole doesn't recover in place yet. Automatic recovery is a planned option ([#620](https://github.com/CodingAnarchy/pigeonhole/issues/620)).
+Reads keep working in every case. Nothing already durable is lost: the log and the main file hold it, and the next open replays what the log holds. Recovery is therefore: notice, close, reopen, and settle the commits that were in flight. With `Options::auto_recover` on, the handle does the close and reopen itself, in place: see [Automatic recovery](#automatic-recovery) below. The manual procedure follows; it is what a handle without the option, or one whose recovery gave up, needs.
 
 ## 1. Detect
 Either way works; use both in a long-running service.
@@ -45,6 +45,49 @@ Non-idempotent writes (`incr`, a `commit_if` whose condition depends on the outc
 
 ## 5. Reader processes
 Reader processes (`PigeonholeReader`) don't need to restart. Once the writer reopens, a snapshot taken before fails with `SnapshotExpired`. Take a new snapshot and read again: it sees the reopened instance's state.
+
+## Automatic recovery
+`Options::auto_recover(Recovery::Io)` (or `Recovery::Any`) makes the handle recover in place: a supervisor thread waits for a failure and, on one the setting covers, closes the failed engine keeping its writer lock, reopens the same path on it and swaps the new engine in behind every handle. The same `Pigeonhole`, tables and batches keep working; nothing is reopened by hand.
+
+- **Which failures.** `Recovery::Io`: a shard that stopped after a write or sync to its log failed, or a failed manifest commit to the main file. `Recovery::Any`: also a panic or an internal error (bugs the same input may repeat; the budget bounds the loop). The default is `Recovery::Off`: this page's manual procedure.
+- **What a call sees during the recovery.** The pause is the failed engine's close (which waits for its log's I/O to land: on a device that never answers, as long as the device takes) plus the backoff and the reopen's replay, usually well under a second. A read without a snapshot is answered from the failed engine's last view as long as that stands (everything committed before the failure; nothing commits during the pause), as reads on a failed instance always were. A commit, a flush, a compact, a catalog change, or a read once the old view is gone, waits for the swap, up to `Options::write_stall_timeout` (30 s by default), then runs on the recovered engine; past the timeout it gets `Busy`: not committed, retry. A commit that was **in flight when the shard failed** comes back as `Busy` too (not committed; the failed engine refused it before writing anything, and the batch went with it): retry it on the recovered engine. One whose log write or sync failed gets `OutcomeUnknown`, as without the option: read it back. Async calls (`submit_async`, the futures) do not wait: they return `Closed` or `Busy` at once and are retried by the caller.
+- **What expires.** A `Snapshot`, a `Transaction`, a scan or a row iterator taken before the recovery fails with `SnapshotExpired` from then on (the reopen frees and reuses the space their old view names): take a new one. Reader processes see the same, as after any writer restart.
+- **The budget.** At most three recoveries in ten minutes, with a backoff of 0, 1 and 4 seconds before the reopen; the reopen's own retries after an `Io` count against the same three, so a later recovery in the window gets fewer of them. Past it, or when the reopen fails with `Corruption`, `UnsupportedFormat`, `NoSpace`, `WriterLocked` or `ShmVersionMismatch`, or when the failed engine's close does not return within four write-stall timeouts (two minutes by default), the supervisor gives up: the handle stays failed exactly as with the option off (`is_failed()` true, commits `Closed`, reads still working), and the manual procedure applies.
+- **`close()` during a recovery** waits for it to settle (its swap or its give-up), then closes what the handle ends on. It is not bounded by the recovery's deadline: like `close()` without the option, it waits for the failed engine's own close, which a device that never answers can hold for ever. A `close()` that reaches a failure the supervisor has not noticed yet (a race of microseconds after the failure) does not wait for a recovery that has not started: it closes the failed engine as `close()` without the option would (unclean, with the failure's error), and the next open replays the log.
+- **Watching it.** `is_failed()` and `failure()` describe the current engine: true and `Some` from the failure until the swap, false and `None` after it. `recovery_stats()` reports the generation (1 at open, +1 per recovery; `engine_metrics()` restarts from zero at each), the recoveries so far, whether the supervisor gave up, the last failure it handled and how long the last recovery took.
+- **Not for application-owned mode.** `open_application_owned` refuses the option: the application drives the shards, so it closes and reopens itself.
+
+```rust
+use std::time::Duration;
+use pigeonhole::{ErrorCode, Family, Options, Pigeonhole, Recovery};
+
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+let db = Pigeonhole::open(
+    dir.join("app.phdb"),
+    Options::default()
+        .shards(1)
+        .auto_recover(Recovery::Io)
+        .write_stall_timeout(Duration::from_secs(5)),
+)?;
+let t = db.table("users")?.family("profile", Family::default()).create_if_missing()?;
+
+// A commit during a recovery waits for the swap; past the timeout, or if it was in flight
+// at the failure, it comes back as `Busy` and is simply retried.
+let mut tries = 0;
+loop {
+    match t.mutate(b"u1").put("profile", b"name", b"Ada").commit() {
+        Ok(_) => break,
+        Err(e) if e.code() == ErrorCode::Busy && tries < 3 => tries += 1,
+        Err(e) => return Err(e),
+    }
+}
+let stats = db.recovery_stats();
+assert_eq!((stats.generation, stats.recoveries, stats.gave_up), (1, 0, false)); // healthy here
+# db.close()?;
+# Ok(())
+# }
+```
 
 ## Example
 A write that recovers the instance once if it failed, then settles the commit. It takes the database by value and returns the one to keep using: the same instance, or the reopened one. It runs here on a healthy database, so it takes the first path.

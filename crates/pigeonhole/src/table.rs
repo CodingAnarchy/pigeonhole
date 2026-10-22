@@ -113,26 +113,37 @@ impl TableBuilder<'_> {
                     ),
                 ));
             }
-            None => match engine.create_table(&self.name, &defs) {
+            None => match db.retry_closed(|| {
+                self.db
+                    .engine()
+                    .create_table(&self.name, &defs)
+                    .map_err(Error::from)
+            }) {
                 Ok(info) => info,
                 // Another thread created it first: open it as it is.
-                Err(pigeonhole_engine::Error::TableExists(_)) if how != Finish::Create => engine
+                Err(e) if e.code() == ErrorCode::TableExists && how != Finish::Create => engine
                     .table(&self.name)
                     .ok_or_else(|| pigeonhole_engine::Error::TableNotFound(self.name.clone()))?,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             },
         };
         for (name, options) in defs {
             if info.family(&name).is_some() {
                 continue;
             }
-            info = match engine.add_family(info.id, &name, options) {
+            let id = info.id;
+            info = match db.retry_closed(|| {
+                self.db
+                    .engine()
+                    .add_family(id, &name, options.clone())
+                    .map_err(Error::from)
+            }) {
                 Ok(info) => info,
                 // Added concurrently: it keeps the options it was created with.
-                Err(pigeonhole_engine::Error::FamilyExists(_)) => engine
+                Err(e) if e.code() == ErrorCode::FamilyExists => engine
                     .table(&self.name)
                     .ok_or_else(|| pigeonhole_engine::Error::TableNotFound(self.name.clone()))?,
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(e),
             };
         }
         Ok(Table {
@@ -196,6 +207,31 @@ impl TableCore {
             .ok_or_else(|| family_not_found(&self.info.name, name))
     }
 
+    /// `get` as of now with a supervisor: run again on the recovered engine if it got
+    /// `Closed`. Out of line, and called before `get`'s match (see there).
+    #[cold]
+    #[inline(never)]
+    fn get_latest_supervised(
+        &self,
+        table: pigeonhole_engine::TableId,
+        family: FamilyId,
+        row: &[u8],
+        qualifier: &[u8],
+    ) -> Result<Option<pigeonhole_engine::CellData>> {
+        self.db.retry_closed(|| {
+            self.with(|e| e.get_latest(table, family, row, qualifier))
+                .map_err(Error::from)
+        })
+    }
+
+    /// A snapshot with a supervisor (see `get_latest_supervised`).
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn snapshot_supervised(&self) -> Result<pigeonhole_engine::Snapshot> {
+        self.db
+            .retry_closed(|| self.engine().snapshot().map_err(Error::from))
+    }
+
     /// The newest version of one cell, as of `snapshot` or now.
     #[inline]
     pub(crate) fn get(
@@ -208,6 +244,15 @@ impl TableCore {
         self.db.check_open()?;
         let family = self.family_id(family)?;
         let table = self.info.id;
+        // With a supervisor, a read as of now is run again on the recovered engine if it
+        // got `Closed`: out of line, and before the match below, so the match stays the one
+        // main compiles (a second arm yielding into `data` moved the engine's result once
+        // more: about 50 instructions per get on callgrind, #836 rounds 6 and 7).
+        if snapshot.is_none() && self.db.supervised() {
+            return self
+                .get_latest_supervised(table, family, row, qualifier)
+                .map(|data| data.map(CellRef::owned));
+        }
         let data = match snapshot {
             None => self.with(|e| e.get_latest(table, family, row, qualifier))?,
             Some(s) => {

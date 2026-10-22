@@ -153,6 +153,7 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
             // in its own `live_views`, which nothing there reclaims against: harmless, and not
             // the reader's protection (that is `reader_pin` above).
             _pin: Some(ViewPin::new(&shared.live_views, full.manifest_version)),
+            released: false,
         });
         drop(full);
         drop(snapshot.take());

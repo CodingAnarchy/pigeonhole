@@ -1002,6 +1002,7 @@ pub(crate) fn end(
             mems,
             ssts,
             _pin: Some(ViewPin::new(&shared.live_views, version)),
+            released: false,
         }
     });
     if let Err(e) = &published {

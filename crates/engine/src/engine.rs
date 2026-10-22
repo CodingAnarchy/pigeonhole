@@ -857,6 +857,7 @@ impl Engine {
                 .collect(),
             ssts: Arc::new(SstSet::empty(pager.data_file().clone(), Arc::clone(&cache))),
             _pin: None,
+            released: false,
         });
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
@@ -1315,6 +1316,7 @@ impl Engine {
             mems,
             ssts,
             _pin: Some(ViewPin::new(&live_views, manifest_version)),
+            released: false,
         });
         shm.publish_view(&first_view.to_record())?;
         shm.set_manifest_version(manifest_version);
@@ -1446,6 +1448,7 @@ impl Engine {
                 .collect(),
             ssts: Arc::new(SstSet::empty(pager.data_file().clone(), Arc::clone(&cache))),
             _pin: None,
+            released: false,
         });
         let shared = Arc::new(Shared {
             vfs: Arc::clone(&vfs),
@@ -1876,6 +1879,9 @@ impl Engine {
             if inner.shared.shm.visible_seqno() != seqno {
                 continue;
             }
+            if view.released {
+                return Err(Error::Closed);
+            }
             let clock = || inner.shared.vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
                 && let Some(hit) = crate::row_cache::get_cached(
@@ -2052,7 +2058,7 @@ impl Engine {
                 }
             }
         }
-        if let Some((view, seqno)) = inner.latest_view() {
+        if let Some((view, seqno)) = inner.latest_view()? {
             let families = families_in_order(&view, table, families)?;
             let now = inner.shared.vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
@@ -2544,9 +2550,14 @@ impl Engine {
     #[doc(hidden)]
     pub fn wait_failed(&self, deadline: std::time::Instant) -> bool {
         let shared = &self.inner.shared;
-        shared
+        let failed = shared
             .failure
-            .wait(deadline, || shared.closed.load(Ordering::Acquire))
+            .wait(deadline, || shared.closed.load(Ordering::Acquire));
+        #[cfg(feature = "test-hooks")]
+        if failed {
+            shared.hooks.sites.run(hooks::HookSite::FailureWake);
+        }
+        failed
     }
 }
 
@@ -3576,17 +3587,20 @@ impl Inner {
         self.role == Role::Reader
     }
 
-    pub(crate) fn latest_view(&self) -> Option<(arc_swap::Guard<Arc<View>>, Seqno)> {
+    pub(crate) fn latest_view(&self) -> Result<Option<(arc_swap::Guard<Arc<View>>, Seqno)>> {
         for _ in 0..GET_LATEST_TRIES {
             let seqno = self.shared.shm.visible_seqno();
             #[cfg(feature = "test-hooks")]
             self.shared.hooks.sites.run(hooks::HookSite::LatestViewLoad);
             let view = self.shared.view.load();
             if self.shared.shm.visible_seqno() == seqno {
-                return Some((view, seqno));
+                if view.released {
+                    return Err(Error::Closed);
+                }
+                return Ok(Some((view, seqno)));
             }
         }
-        None
+        Ok(None)
     }
 
     pub(crate) fn snapshot(&self) -> Result<Snapshot> {
@@ -3615,6 +3629,9 @@ impl Inner {
             .sites
             .run(hooks::HookSite::SnapshotViewLoad);
         let view = self.shared.view.load_full();
+        if view.released {
+            return Err(Error::Closed);
+        }
         Ok(Snapshot {
             seqno,
             view,
@@ -4069,6 +4086,7 @@ fn view_from_record(
             .collect(),
         ssts,
         _pin: None,
+        released: false,
     })
 }
 
