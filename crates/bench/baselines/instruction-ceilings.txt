@@ -139,11 +139,16 @@
 # PR's head count on main 50a2a24a (run 39689863590: 5493, main's own 5484) times 1.003. The +9 is
 # the released-view check on the latest-view read and the supervisor branch of the row read;
 # the ceiling had no headroom left after #796's re-base and main's drift since.
+#
+# Raised for #909 (the owner's D195 policy, via the coordinator, 2026-10-22): get-sst 17272 ->
+# 17360 (+0.5%). Main itself read 17280 (run 39859158837's base, over the ceiling) and 17234
+# (run 39856495172's base): identical code moves about 60 run to run, so every PR failed
+# the absolute check on main's own count. Until #909 pins that noise; then it comes back down.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
 get-mem 5681 0.3
-get-sst 17272 0.5
+get-sst 17360 0.5
 get-miss 4175 0.3
 row 2475 1.0
 scan 1358 0.3
