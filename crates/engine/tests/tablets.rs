@@ -6968,6 +6968,11 @@ fn drain(db: &mut Db, stream: Vec<pigeonhole_engine::PendingCommit>) {
 /// without checking newer undecided shares, so it would read `a` without B while B's decision
 /// may take the lower seqno. Whatever order the shards then run in, if C applied (it saw `p`
 /// absent) it is serialized before B.
+///
+/// The window needs B coordinated by the shard where C waits (`low`, B's first row's shard):
+/// that shard decides B, reserving its seqno, from its inbox in the same turn whose group
+/// admits C, while B's own share there is applied only on a later turn, through its queue.
+/// Coordinated by the other shard, C reserves first in every order.
 #[test]
 fn a_blind_prepare_writing_a_row_a_waiting_single_reads_lands_after_the_single() {
     for schedule in 0..6u8 {
