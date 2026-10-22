@@ -1,6 +1,6 @@
 # 0062: `Transaction::get_row` and the transaction write ops
 
-**Status:** Number assigned by the coordinator (2026-10-21; #694 PR 4). Additive.
+**Status:** Number assigned by the coordinator (2026-10-21; #694 PR 4). Additive. Full parity with `RowMutation`'s write ops: the plan listed eight, and the coordinator confirmed the `_at` variants (`put_i64_at`, `put_f64_at`, `incr_at`) belong too, making eleven.
 
 ## Change
 
