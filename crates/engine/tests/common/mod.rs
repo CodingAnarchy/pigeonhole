@@ -401,6 +401,10 @@ pub struct Stats {
     pub observed_crashes: usize,
     pub crashes: usize,
     pub mid_commit_crashes: usize,
+    /// Commits that resolved in the same poll as one that met a crash, after it, recorded as
+    /// they resolved (#860): acknowledged, and not.
+    pub crash_poll_acked: usize,
+    pub crash_poll_unacked: usize,
     /// Armed power losses that fired on background I/O and surfaced as a later step's error.
     pub background_crashes: usize,
     pub busy: usize,
@@ -1514,20 +1518,24 @@ impl World {
     /// Appends the records the engine logged since the last call to the per-stream append
     /// order (the engine reports every record it appends, in order, test hook).
     fn drain_appended(&mut self) {
-        let Some(store) = self.store.as_ref() else {
+        let Some(engine) = self.store.as_ref().map(|s| Arc::clone(&s.engine)) else {
             return;
         };
-        self.refused_seqnos
-            .extend(store.engine.take_refused_attempts());
-        for r in store.engine.take_appended() {
+        self.drain_appended_from(&engine, self.stats.crashes);
+    }
+
+    /// [`drain_appended`](Self::drain_appended) from `engine`, its records keyed to run
+    /// `epoch` (the crash count while it ran).
+    fn drain_appended_from(&mut self, engine: &Engine, epoch: usize) {
+        self.refused_seqnos.extend(engine.take_refused_attempts());
+        for r in engine.take_appended() {
             let kind = match r.kind {
                 AppendedKind::Batch => RecKind::Batch,
                 AppendedKind::Prepare => RecKind::Prepare,
                 AppendedKind::Commit => RecKind::Commit,
             };
             if kind == RecKind::Batch {
-                self.appended_ts
-                    .insert(r.seqno, (self.stats.crashes, r.commit_ts));
+                self.appended_ts.insert(r.seqno, (epoch, r.commit_ts));
             }
             if kind == RecKind::Prepare {
                 // A new commit took this id (a crash lost the old one's records).
@@ -1541,7 +1549,7 @@ impl World {
                     .insert(r.seqno, (r.apply_seqno, r.commit_ts));
                 // Only this run's PREPAREs: an id whose PREPAREs a crash lost (or a seqno a
                 // lost DECISION reserved) may be taken again after it, as a lost seqno may.
-                let crashes = self.stats.crashes;
+                let crashes = epoch;
                 for (stream, list) in self.stream_records.iter_mut() {
                     let epochs = self.stream_epochs.get(stream);
                     for (i, (q, k)) in list.iter_mut().enumerate() {
@@ -1564,7 +1572,7 @@ impl World {
             self.stream_epochs
                 .entry(u32::from(r.stream))
                 .or_default()
-                .push(self.stats.crashes);
+                .push(epoch);
         }
     }
 
@@ -2374,7 +2382,14 @@ impl World {
         self.drain_appended();
         self.tablet_pending = None;
         self.count_tablet_changes();
+        // The dead engine's shards close as the store drops, and may still append: a
+        // coordinator logs a decision it was waiting on while its stream still works (an
+        // armed crash fires later, #860). Those records belong to the crashed run too.
+        let dead = self.store.as_ref().map(|s| Arc::clone(&s.engine));
         self.store = None;
+        if let Some(engine) = dead {
+            self.drain_appended_from(&engine, self.stats.crashes - 1);
+        }
         self.snaps.clear();
         self.vfs.set_faults(FaultPlan::none());
         self.faults_active = false;
@@ -3860,7 +3875,8 @@ impl World {
         // Successful commits are applied to the model in seqno order.
         let mut successes: Vec<(Seqno, InFlight, Option<pigeonhole_engine::CommitInfo>)> =
             Vec::new();
-        for (inf, outcome) in resolved {
+        let mut resolved = resolved.into_iter();
+        while let Some((inf, outcome)) = resolved.next() {
             let armed = inf.armed;
             match outcome {
                 Outcome::Commit(Ok(info)) => successes.push((info.seqno, inf, Some(info))),
@@ -3925,6 +3941,29 @@ impl World {
                         c.acked = false;
                         self.unacked.push(c);
                     }
+                    // The commits resolved in this same poll and not yet looked at count as
+                    // they resolved: they were dropped, so one whose record survived was
+                    // taken for a commit the client never made (#860). An acknowledged one
+                    // (and those acknowledged before it in this poll) goes in as
+                    // acknowledged; a refused predicate wrote nothing; any other failure may
+                    // have landed.
+                    let first_acked = self.acked_pending.len();
+                    self.acked_pending.append(&mut successes);
+                    for (other, o) in resolved.by_ref() {
+                        match o {
+                            Outcome::Commit(Ok(info)) | Outcome::Cas(Ok((_, Some(info)))) => {
+                                self.acked_pending.push((info.seqno, other, Some(info)));
+                            }
+                            Outcome::Cas(Ok((_, None))) => self.aborted.push(other.commit),
+                            _ => {
+                                let mut c = other.commit;
+                                c.acked = false;
+                                self.unacked.push(c);
+                                self.stats.crash_poll_unacked += 1;
+                            }
+                        }
+                    }
+                    self.stats.crash_poll_acked += self.acked_pending.len() - first_acked;
                     self.crash_and_recover(CrashKind::Power, true, rng)?;
                     return Ok(true);
                 }

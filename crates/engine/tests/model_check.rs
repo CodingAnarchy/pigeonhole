@@ -582,6 +582,29 @@ fn io_errors_poison_shards_and_recover_on_reopen() {
     }
 }
 
+#[test]
+fn io_errors_with_deferred_io_keep_every_record_the_crash_poll_and_the_close_leave() {
+    // #860, two seeds of `io_errors_poison_shards_and_recover_on_reopen` with deferred I/O:
+    // - 107: a commit resolved `OutcomeUnknown` in the same poll as, and after, one that met
+    //   the crash; the checker dropped it, and its surviving record read as a commit the
+    //   client never made;
+    // - 245: the dead store's close logged a decision it had been waiting for (the armed
+    //   crash fired later in the close); the checker drained the append order before the
+    //   close, so the WAL's record of it read as out of order.
+    // D267 (#830) changed the timing that reaches both. Each seed fails with its half of
+    // the fix reverted.
+    let mut cfg = io_errors_config();
+    cfg.deferred_io = true;
+    for seed in [107, 245] {
+        let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+        if seed == 107 && stats.crash_poll_unacked == 0 {
+            // Not reached with this target's families (`counters.rs` runs this file with
+            // others): the seed still runs as a regression check.
+            eprintln!("seed 107 resolved no commit beside a crash here");
+        }
+    }
+}
+
 /// [`io_errors_poison_shards_and_recover_on_reopen`]'s configuration.
 fn io_errors_config() -> Config {
     let mut cfg = Config::standard(250);
