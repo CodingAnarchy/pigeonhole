@@ -158,6 +158,58 @@ fn a_crashed_database_reopens_with_fewer_shards() {
 }
 
 #[test]
+fn a_shard_count_change_keeps_the_timestamp_floor_through_a_crash() {
+    // A reopen with another shard count flushes everything it replayed and checkpoints every
+    // stream past it (`flush_recovered`), so the replayed timestamps live only in SSTs. The
+    // manifest's timestamp floor must carry them: after a crash before any other manifest
+    // commit, the next open has nothing to replay, and its `H` comes from that floor alone.
+    // Below them, a clock behind would stamp new versions under existing ones (#653, D11).
+    let vfs = SimVfs::new(1434);
+    let db = Engine::open(Path::new(DB), common::options(Arc::clone(&vfs), 2, 4 << 20)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    // Default timestamps well above the clock's start.
+    vfs.advance(10_000_000_000);
+    for r in 0..64u32 {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, t.id, f, &r.to_be_bytes(), b"v");
+        db.commit(wb, Some(Durability::GroupSync)).unwrap();
+    }
+    assert_eq!(
+        db.metrics().flushes,
+        0,
+        "the rows are replayed, not flushed"
+    );
+    let newest = db.last_default_ts();
+    vfs.crash(CrashKind::Power);
+    drop(db);
+
+    // One shard: the replay is flushed and every stream checkpointed. Crash before any other
+    // commit.
+    let db = Engine::open(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20)).unwrap();
+    assert!(db.last_default_ts() >= newest);
+    vfs.crash(CrashKind::Power);
+    drop(db);
+
+    let db = Engine::open(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20)).unwrap();
+    let floor = db.last_default_ts();
+    assert!(
+        floor >= newest,
+        "the floor fell to {floor} below the replayed timestamps (up to {newest})"
+    );
+    for r in 0..64u32 {
+        assert!(
+            db.get_latest(t.id, f, &r.to_be_bytes(), b"q")
+                .unwrap()
+                .is_some(),
+            "row {r}"
+        );
+    }
+}
+
+#[test]
 fn a_crashed_database_reopens_with_a_smaller_budget() {
     // The same layout, but every arena a quarter of the size it crashed with.
     crash_with_unflushed(1432, 2, 2_500_000, 2, 1 << 20);

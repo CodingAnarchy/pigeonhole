@@ -902,7 +902,6 @@ impl ShardState {
                 seqno: m.seqno,
                 from: self.id,
                 error: Some(error),
-                floor: 0,
             },
             ctx,
         );
@@ -1519,16 +1518,8 @@ impl ShardState {
             "shard {}: a tablet change commits with unflushed memtables on its tablets",
             self.id.0
         );
-        // D11: default timestamps never go backwards on a tablet. A shard receiving one
-        // starts above every default timestamp this shard assigned (an upper bound on the
-        // tablet's own floor).
-        for s in kind.targets(self.id) {
-            let i = usize::from(s.0);
-            self.shared.ts_raises[i]
-                .0
-                .fetch_max(self.ts_floor, Ordering::AcqRel);
-        }
-        // D271: the new owner's next stamp is above every one the allocator handed out.
+        // D11, D271: default timestamps never go backwards on a tablet. The new owner's next
+        // stamp is above every one the allocator handed out, so above the tablet's own.
         self.shared.clock.raise();
         trace!("shard {} tablet change {kind:?} commits", self.id.0);
         let me = self.id;

@@ -816,14 +816,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.next_blob_file = shared.blob_ids.load(Ordering::Relaxed);
     catalog.counters.seqno_ceiling = shared.clock.next_seqno();
-    catalog.counters.ts_floor = shared
-        .ts_floors
-        .iter()
-        .map(|f| f.0.load(Ordering::Acquire))
-        .max()
-        .unwrap_or(0)
-        .max(shared.clock.last_ts())
-        .max(catalog.counters.ts_floor);
+    // D271: every default timestamp comes from the one allocator, at or below its `H`.
+    catalog.counters.ts_floor = shared.clock.last_ts().max(catalog.counters.ts_floor);
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);
     edits.push(counters);

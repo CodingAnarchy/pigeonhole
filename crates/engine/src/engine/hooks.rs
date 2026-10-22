@@ -933,30 +933,11 @@ impl Engine {
         })
     }
 
-    /// The largest default-timestamp floor of any shard (including floors raised by shards
-    /// handing over tablets): the next default timestamp anywhere is above it.
+    /// The largest default timestamp handed out (the allocator's `H`, D271): every default
+    /// timestamp so far is at or below it.
     #[doc(hidden)]
-    pub fn max_ts_floor(&self) -> pigeonhole_format::Timestamp {
-        let shared = &self.inner.shared;
-        shared
-            .ts_floors
-            .iter()
-            .chain(&shared.ts_raises)
-            .map(|f| f.0.load(Ordering::Acquire))
-            .max()
-            .unwrap_or(0)
-            // D271: every default timestamp comes from the one allocator, at or below `H`.
-            .max(shared.clock.last_ts())
-    }
-
-    /// Publishes `ts` as `shard`'s default-timestamp floor, whatever the shard assigned: what
-    /// a coordinator reads when it loads the floor just before the shard publishes a higher
-    /// one (a race between threads, issue #105). The shard's own floor is unchanged.
-    #[doc(hidden)]
-    pub fn publish_stale_ts_floor(&self, shard: u16, ts: pigeonhole_format::Timestamp) {
-        self.inner.shared.ts_floors[usize::from(shard)]
-            .0
-            .store(ts, Ordering::Release);
+    pub fn last_default_ts(&self) -> pigeonhole_format::Timestamp {
+        self.inner.shared.clock.last_ts()
     }
 
     /// With `on` false, reads in this process step over superseded memtable versions even

@@ -3490,12 +3490,12 @@ fn a_bottommost_compaction_counts_a_prepared_share_above_its_inputs() {
 
 #[test]
 #[allow(deprecated)] // the D263-deprecated refusal counters stay 0
-fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
-    // Issue #105: a coordinator picks a cross-shard commit's timestamp above the floors it
-    // reads, but a participant may assign higher default timestamps before the PREPARE
-    // arrives (another thread published its floor just after the coordinator read it; the
-    // hook replays that read). The participant refuses, and the retry takes a fresh
-    // timestamp above everything it assigned, so its tablet's timestamps never go back.
+fn a_cross_shard_commit_lands_above_a_participants_earlier_stamps() {
+    // Issue #105, under D271: a participant stamps default timestamps on its own before a
+    // cross-shard commit over its tablet. The decision's timestamp comes from the one
+    // allocator, above every stamp handed out, so the commit lands above the participant's
+    // in one round and its tablet's timestamps never go back. (Before D271, a coordinator
+    // could read a stale published floor here; the floors are gone.)
     let mut db = open(2, |_| {});
     let id = db.table.id;
     let f = db.table.families[0].id;
@@ -3507,14 +3507,13 @@ fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
         let m = db.engine.move_tablet_pending(id, b"z", high).unwrap();
         db.drive(m).unwrap();
     }
-    // The frozen clock: each default timestamp is the shard's floor plus one.
+    // The frozen clock: each default timestamp is the shard's last stamp plus one.
     let mut last = 0;
     for i in 0..10u8 {
         db.put(b"z", &[i]);
         last = db.get(b"z").unwrap().0;
     }
     assert!(db.get(b"a").is_none());
-    db.engine.publish_stale_ts_floor(high, 0);
     let before = db.engine.metrics().cross_shard;
     let mut wb = WriteBatch::new();
     wb.put(id, f, b"a", b"q", None, ValueRef::Bytes(b"low"))
@@ -3522,9 +3521,8 @@ fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
     wb.put(id, f, b"z", b"q", None, ValueRef::Bytes(b"both"))
         .unwrap();
     db.commit(wb);
-    // D263: the timestamp is picked at the decision, above the floor the
-    // participant reported with its `Prepared` (taken on its own thread), so the stale
-    // published floor refuses nothing: one round, and the commit lands above the floor.
+    // D271: the timestamp is picked at the decision, above every default timestamp handed
+    // out: one round, and the commit lands above the participant's stamps.
     let after = db.engine.metrics().cross_shard;
     assert_eq!(after.refused_below_floor, before.refused_below_floor);
     assert_eq!(after.refused_rounds, before.refused_rounds);
@@ -3535,7 +3533,7 @@ fn a_participant_refuses_a_commit_timestamp_below_its_floor() {
     assert_eq!(v, b"both");
     assert!(
         ts > last,
-        "{ts} <= {last}: the commit went below the participant's floor"
+        "{ts} <= {last}: the commit went below the participant's stamps"
     );
     assert_eq!(db.get(b"a").unwrap().0, ts);
     db.engine.close().unwrap();

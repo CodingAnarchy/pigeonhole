@@ -287,8 +287,9 @@ fn a_value_the_same_commit_collapse_drops_releases_its_blob_file() {
         .unwrap();
     let f = t.families[0].id;
     put(&db, &t, 2..3, 0, Durability::Sync);
-    // A default timestamp is the simulated clock at submission, once past the shard's floor.
-    let floor = db.max_ts_floor();
+    // A default timestamp is the simulated clock at submission, once past every default
+    // timestamp handed out (D271).
+    let floor = db.last_default_ts();
     if floor >= vfs.now_micros() {
         vfs.advance(1_000 * (floor - vfs.now_micros() + 1));
     }
