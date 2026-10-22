@@ -22,6 +22,8 @@ struct State {
     /// The next stamp must be strictly above `H`: the last reservation was a decision's, or a
     /// tablet changed owner since.
     decided: bool,
+    /// The drift gauge: the largest lead of `H` over the clock at any reservation.
+    max_lead: u64,
 }
 
 /// `(S, H, F)` under one lock.
@@ -59,6 +61,15 @@ impl Reservation {
         self.lock().h
     }
 
+    /// The drift gauge (D271, ICR XXXX): how far `H` is ahead of the clock `now`, and the
+    /// largest such lead at any reservation since open, in µs. One shard reserving more
+    /// than one group a µs, or a decision with a group after it in the same µs, moves `H`
+    /// past the clock.
+    pub(crate) fn lead(&self, now: Timestamp) -> (u64, u64) {
+        let st = self.lock();
+        (st.h.saturating_sub(now), st.max_lead)
+    }
+
     /// A group's `n` seqnos and the first of `k` default timestamps (`T0 .. T0 + k`): `T0`
     /// above `H` after a decision, and above this shard's own last stamp `last`, so a
     /// shard's stamps strictly increase (D271 variant B).
@@ -77,6 +88,7 @@ impl Reservation {
             let t0 = now.max(st.h + u64::from(st.decided)).max(last + 1);
             st.h = st.h.max(t0 + k.max(1) - 1);
             st.decided = false;
+            st.max_lead = st.max_lead.max(st.h.saturating_sub(now));
             (first, t0)
         };
         shm.advance_next_seqno(first + n);
@@ -105,6 +117,7 @@ impl Reservation {
             let t = now.max(st.h + 1);
             st.h = t;
             st.decided = true;
+            st.max_lead = st.max_lead.max(t - now);
             (s, t)
         };
         shm.advance_next_seqno(s + 1);
@@ -146,6 +159,9 @@ mod tests {
         assert_eq!(t3, 102);
         assert_eq!(t4, 103);
         assert_eq!(shm.next_seqno(), 15);
+        // The clock read 50 at each reservation: `H` ran ahead of it by 53 at the last.
+        assert_eq!(r.lead(50), (53, 53));
+        assert_eq!(r.lead(200), (0, 53));
     }
 
     #[test]

@@ -187,6 +187,13 @@ pub struct EngineMetrics {
     pub transaction_retries: u64,
     /// Cross-shard commits' two-phase rounds and the refusals that made rounds retry.
     pub cross_shard: CrossShardMetrics,
+    /// Gauge: how far the largest default timestamp handed out is ahead of the clock now, in
+    /// µs; 0 while the clock leads. Default timestamps run ahead of the clock only when one
+    /// shard commits more than one group a µs, or a cross-shard decision and a commit after
+    /// it fall in the same µs (D271, ICR XXXX).
+    pub default_ts_lead_micros: u64,
+    /// The largest `default_ts_lead_micros` at any commit since open.
+    pub max_default_ts_lead_micros: u64,
 }
 
 impl EngineMetrics {
@@ -303,6 +310,8 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             file_growths_ahead: m.file_growths_ahead.0,
             file_growth_ahead_nanos: m.file_growths_ahead.1,
             async_sync_reads: m.async_sync_reads,
+            default_ts_lead_micros: m.default_ts_lead_micros.0,
+            max_default_ts_lead_micros: m.default_ts_lead_micros.1,
             shard_parks: m.shard_idle.0,
             shard_wakes: m.shard_idle.1,
             shard_busy_nanos: m.shard_busy_nanos,
