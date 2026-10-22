@@ -1105,6 +1105,48 @@ impl Transaction {
         self.failed_read.clone()
     }
 
+    /// Reads a row at the transaction's snapshot (the newest version of each column) and
+    /// records a read of each family it covers: `families`, or every family of the table
+    /// when empty (ICR 0062). A family the row has no cell in still counts as read, so a
+    /// commit that adds one conflicts. `None` if the row has no visible cell.
+    pub fn get_row(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        families: &[&str],
+    ) -> Result<Option<crate::RowRef<'_>>> {
+        let read = (|| {
+            check_table(&self.db, table)?;
+            self.db.check_open()?;
+            self.db.check_generation(self.generation)?;
+            let ids = families
+                .iter()
+                .map(|f| table.core.family_id(f))
+                .collect::<Result<Vec<_>>>()?;
+            let mut spec = pigeonhole_engine::ReadSpec::default();
+            spec.versions = 1;
+            let mut buf = crate::cell::RowBuf::new(table.core.current_info(), 0);
+            let any = self
+                .txn
+                .read_row_into(table.core.info.id, row, &ids, &spec, &mut buf)?;
+            Ok((any, buf))
+        })();
+        match read {
+            Ok((false, _)) => Ok(None),
+            Ok((true, mut buf)) => {
+                buf.key = row.to_vec();
+                Ok(Some(crate::RowRef::owned(buf)))
+            }
+            Err(e) => {
+                let e: Error = e;
+                if self.failed_read.is_none() {
+                    self.failed_read = Some(e.clone());
+                }
+                Err(e)
+            }
+        }
+    }
+
     /// [`get`](Transaction::get) as a future resolving to an owned [`Cell`](crate::Cell): the
     /// read is recorded at the call (so it counts at commit even if the future is dropped
     /// unpolled), then made at the transaction's snapshot as
@@ -1153,6 +1195,164 @@ impl Transaction {
         self.op(table, row, family, qualifier, 0, |b, t, f| {
             b.delete_column(t, f, row, qualifier, None)
         })
+    }
+
+    /// Buffers a put at an explicit timestamp (ICR 0062; see [`RowMutation::put_at`]).
+    pub fn put_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u8],
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, value.len(), |b, t, f| {
+            b.put(t, f, row, qualifier, Some(ts), ValueRef::Bytes(value))
+        })
+    }
+
+    /// Buffers a typed `i64` put (in a counter family, it sets the counter).
+    pub fn put_i64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, None, ValueRef::I64(value))
+        })
+    }
+
+    /// Buffers a typed `f64` put.
+    pub fn put_f64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: f64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, None, ValueRef::F64(value))
+        })
+    }
+
+    /// Buffers an add to the counter of a counter family (see [`RowMutation::incr`]). It is
+    /// a blind write: it reads nothing, so it conflicts with nothing unless the transaction
+    /// also read the cell.
+    pub fn incr(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        delta: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.merge(t, f, row, qualifier, ValueRef::I64(delta))
+        })
+    }
+
+    /// [`put_i64`](Self::put_i64) at an explicit timestamp.
+    pub fn put_i64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, Some(ts), ValueRef::I64(value))
+        })
+    }
+
+    /// [`put_f64`](Self::put_f64) at an explicit timestamp.
+    pub fn put_f64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: f64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.put(t, f, row, qualifier, Some(ts), ValueRef::F64(value))
+        })
+    }
+
+    /// Buffers an add to the bucket at `ts` of a counter family (see
+    /// [`RowMutation::incr_at`]).
+    pub fn incr_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        delta: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(delta))
+        })
+    }
+
+    /// Buffers an untyped operand for the family's merge operator (see
+    /// [`RowMutation::merge`]).
+    pub fn merge(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        operand: &[u8],
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, operand.len(), |b, t, f| {
+            b.merge(t, f, row, qualifier, ValueRef::Bytes(operand))
+        })
+    }
+
+    /// Buffers the delete of one version.
+    pub fn delete_cell(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 0, |b, t, f| {
+            b.delete_cell(t, f, row, qualifier, ts)
+        })
+    }
+
+    /// Buffers the delete of every column of a family in a row.
+    pub fn delete_family(&mut self, table: &Table, row: &[u8], family: &str) -> &mut Self {
+        self.op(table, row, family, &[], 0, |b, t, f| {
+            b.delete_family(t, f, row, None)
+        })
+    }
+
+    /// Buffers the delete of a whole row.
+    pub fn delete_row(&mut self, table: &Table, row: &[u8]) -> &mut Self {
+        if self.error.is_some() {
+            return self;
+        }
+        let r = check_table(&self.db, table).and_then(|()| {
+            self.txn
+                .batch()
+                .delete_row(table.core.info.id, row, None)
+                .map_err(|e| size_error(e, Sizes::new(row, &[], 0), 0))
+        });
+        if let Err(e) = r {
+            self.error = Some(e);
+        }
+        self
     }
 
     /// Commits with the writer default; fails with
