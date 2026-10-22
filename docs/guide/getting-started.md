@@ -282,7 +282,7 @@ match txn.commit() {
 # Ok::<(), pigeonhole::Error>(())
 ```
 
-`Pigeonhole::transact` runs that loop for you: a fresh transaction per attempt, retried on `Conflict` with exponential backoff and jitter, as a `RetryPolicy` says. The closure may run more than once, so keep side effects outside it.
+[Transactions](transactions.md) covers isolation, conflicts and cost. `Pigeonhole::transact` runs that loop for you: a fresh transaction per attempt, retried on `Conflict` with exponential backoff and jitter, as a `RetryPolicy` says. The closure may run more than once, so keep side effects outside it.
 
 ```rust
 # use pigeonhole::*;
