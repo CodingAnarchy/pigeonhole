@@ -1753,6 +1753,14 @@ fn flush_recovered(
         });
     }
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
+    // The streams are checkpointed past every replayed record, so their timestamps now live
+    // only in SSTs: the floor must carry them, or a crash before the next manifest commit
+    // reopens with a lower floor and nothing to replay, and a clock behind them stamps below
+    // existing versions (#904, #653). Replay raised each shard's floor.
+    catalog.counters.ts_floor = catalog
+        .counters
+        .ts_floor
+        .max(states.iter().map(ShardState::ts_floor).max().unwrap_or(0));
     catalog.counters.seqno_ceiling = shared.shm.next_seqno();
     edits.push(catalog.counters_edit());
     for e in edits.iter() {
