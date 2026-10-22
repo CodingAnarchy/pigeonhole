@@ -351,10 +351,26 @@ fn a_killed_reader_does_not_stall_the_writer() {
     assert_eq!(reader.ask("snap"), "SNAP");
     assert_eq!(reader.ask("count"), "COUNT 1000");
     reader.kill();
+    // The writer frees the dead reader's slot (the real `process_alive`, not the
+    // simulator's) at its next reclaim: at most every 250 ms, run when a flush or a
+    // compaction finishes or a commit finds no room. Wait for it, flushing so one runs,
+    // before the burst (#887): the burst then measures that the freed pin lets the writer
+    // through, not how fast a slow runner flushes its way out of a stall that began before
+    // the reclaim (on Windows the killed process read as alive in neither failure: it is
+    // dead from `GetExitCodeProcess` at once).
+    let killed = Instant::now();
+    while db.engine_metrics().reader_slots_reclaimed == 0 {
+        assert!(
+            killed.elapsed() < Duration::from_secs(30),
+            "the killed reader's slot was not reclaimed: {:?}",
+            db.engine_metrics()
+        );
+        db.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    }
     // #833's symptom: without the slot freed, the dead reader's pin keeps the first
     // memtables, the arena runs out, and these commits stall and then fail `Busy` after the
-    // 5 s timeout. With it, a stalled commit gets in after the writer's next liveness check
-    // (the real `process_alive`, not the simulator's).
+    // 5 s timeout. With it freed, they go through.
     let start = Instant::now();
     put(&t, 1000..1000 + PAST_BUDGET)
         .unwrap_or_else(|(i, e)| panic!("row {i} after {:?}: {e}", start.elapsed()));
