@@ -2946,6 +2946,8 @@ pub(crate) struct ShardState {
     lost_version: u64,
     /// Cross-shard commits to retry once the tablet map changes.
     retries: Vec<CoordinateReq>,
+    /// SCRATCH (#854 hang trace): the last state printed.
+    hang_last: Option<String>,
     /// Slots whose SSTs, inherited from a split's parent, still hold a sibling's rows and so
     /// block a merge the balancer wants: rewritten when no other compaction is due (#95).
     cleanups: Vec<(TabletId, FamilyId)>,
@@ -3224,6 +3226,7 @@ impl ShardState {
             tablet_timer: None,
             lost_version: 0,
             retries: Vec::new(),
+            hang_last: None,
             cleanups: Vec::new(),
             cleanup_turn: false,
             loads: HashMap::new(),
@@ -9524,6 +9527,44 @@ impl ShardHandler for ShardState {
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
         self.run_group(ctx);
+        // SCRATCH (#854 hang trace): this shard's cross-shard state, printed on change.
+        if std::env::var_os("GCLOCK_HANG_TRACE").is_some() {
+            let undecided: Vec<Seqno> = {
+                let mut v: Vec<Seqno> = self.prepared.keys().copied().collect();
+                v.sort_unstable();
+                v.truncate(6);
+                v
+            };
+            let chained: Vec<(Seqno, usize, bool)> = {
+                let mut v: Vec<(Seqno, usize, bool)> =
+                    self.chained.iter().map(|(s, c)| (*s, c.behind, c.logged)).collect();
+                v.sort_unstable();
+                v.truncate(6);
+                v
+            };
+            let coord: Vec<(Seqno, usize, usize, bool)> = {
+                let mut v: Vec<(Seqno, usize, usize, bool)> = self
+                    .coord
+                    .iter()
+                    .map(|(s, c)| (*s, c.prepared, c.participants, c.decided))
+                    .collect();
+                v.sort_unstable();
+                v.truncate(6);
+                v
+            };
+            let state = format!(
+                "coord {coord:?} prepared {undecided:?} chained {chained:?} refused {} retries {} pending {} singles {} fences {}",
+                self.overlap_refused.len(),
+                self.retries.len(),
+                self.pending.len(),
+                self.waiting_singles.len(),
+                self.reader_fences.len()
+            );
+            if self.hang_last.as_deref() != Some(state.as_str()) {
+                eprintln!("HANG shard {} t={}ms {state}", self.id.0, ctx.now_nanos() / 1_000_000);
+                self.hang_last = Some(state);
+            }
+        }
         // Coordinators refused for room hear once the room wait has ended, or once no single
         // waits, no flush is in flight and more room is free than at the refusal: their
         // retry may fit then. Never while nothing has freed room, so never a loop (D245).
