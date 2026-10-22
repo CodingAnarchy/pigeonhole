@@ -320,6 +320,12 @@ pub struct Config {
     /// flight until the scheduler completes it, in an order the seed picks, so it spans
     /// shard slices and client steps. Defaults to `PIGEONHOLE_DEFERRED_IO` (`1` on).
     pub deferred_io: bool,
+    /// Holds acknowledgements back (#860's forced construction): while other commits are in
+    /// flight and nothing failed, a poll's resolved commits wait (their outcomes kept) and
+    /// are taken with the next poll that resolves a failure, a crash's included. A client
+    /// that reads its results late; the engine runs as without it. Off in every suite but
+    /// the one that needs acknowledged commits beside a crash.
+    pub hold_acks: bool,
 }
 
 impl Config {
@@ -371,6 +377,7 @@ impl Config {
             balance_fast: tablets_env.as_deref() == Some("1"),
             tablet_every: None,
             deferred_io: std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1"),
+            hold_acks: false,
         }
     }
 
@@ -1264,6 +1271,13 @@ enum Outcome {
 /// An in-flight commit, polled between scheduler steps. Every kind goes through the
 /// engine's non-blocking API, so no OS thread or real-time wait takes part and a seed
 /// replays exactly (#590).
+/// What [`World::take_outcome`] asks of its poll.
+enum Resolved {
+    Done,
+    /// The commit met a crash: the poll recovers.
+    Crashed,
+}
+
 enum Pending {
     Poll(PendingCommit),
     Check(pigeonhole_engine::PendingCheck),
@@ -2354,6 +2368,9 @@ impl World {
         // #724: the writes each shard's flushed-through seqno says are in durable SSTs,
         // checked against the manifest the crash leaves.
         let below_flushed = self.writes_at_or_below_flushed();
+        // The crashed run's epoch: every later drain of the dead engine keys its records
+        // to it (#876).
+        let crashed = self.stats.crashes;
         self.stats.crashes += 1;
         if self.trace_on() {
             eprintln!("crash {kind:?} already={already}");
@@ -2379,7 +2396,9 @@ impl World {
             self.pending_advance = 0;
         }
         self.stash_compactions();
-        self.drain_appended();
+        if let Some(engine) = self.store.as_ref().map(|s| Arc::clone(&s.engine)) {
+            self.drain_appended_from(&engine, crashed);
+        }
         self.tablet_pending = None;
         self.count_tablet_changes();
         // The dead engine's shards close as the store drops, and may still append: a
@@ -2388,7 +2407,7 @@ impl World {
         let dead = self.store.as_ref().map(|s| Arc::clone(&s.engine));
         self.store = None;
         if let Some(engine) = dead {
-            self.drain_appended_from(&engine, self.stats.crashes - 1);
+            self.drain_appended_from(&engine, crashed);
         }
         self.snaps.clear();
         self.vfs.set_faults(FaultPlan::none());
@@ -3829,6 +3848,126 @@ impl World {
         }
     }
 
+    /// One resolved commit's outcome, taken into the model (#876): acknowledged ones into
+    /// `successes`, the rest as aborted (checked) or unacknowledged. `dead`: the store is
+    /// known dead (the rest of a poll that met a crash, or outcomes that had resolved before
+    /// it died), so a failure the crash may explain goes in unacknowledged instead of
+    /// starting the crash.
+    fn take_outcome(
+        &mut self,
+        inf: InFlight,
+        outcome: Outcome,
+        dead: bool,
+        successes: &mut Vec<(Seqno, InFlight, Option<pigeonhole_engine::CommitInfo>)>,
+    ) -> Result<Resolved, Fail> {
+        let armed = inf.armed;
+        match outcome {
+            Outcome::Commit(Ok(info)) => successes.push((info.seqno, inf, Some(info))),
+            Outcome::Cas(Ok((applied, info))) => {
+                let Kind::Cas { expected, .. } = &inf.commit.kind else {
+                    unreachable!()
+                };
+                if applied != *expected {
+                    return fail(
+                        FailureClass::LiveReadMismatch,
+                        format!(
+                            "check_and_mutate applied={applied} but the model's predicate said {expected}"
+                        ),
+                    );
+                }
+                match info {
+                    Some(info) => successes.push((info.seqno, inf, Some(info))),
+                    None => {
+                        self.stats.cas_refused += 1;
+                        self.trace.push("  -> predicate false, not applied".into());
+                        self.aborted.push(inf.commit);
+                    }
+                }
+            }
+            Outcome::Commit(Err(Error::Busy)) | Outcome::Cas(Err(Error::Busy)) => {
+                self.stats.busy += 1;
+                self.trace.push("  -> busy (arena full)".into());
+                self.aborted.push(inf.commit);
+            }
+            Outcome::Commit(Err(Error::Conflict)) => {
+                let Kind::Txn { snapshot, reads } = &inf.commit.kind else {
+                    return fail(FailureClass::Protocol, "conflict on a plain commit".into());
+                };
+                // A real conflict: some commit above the snapshot touched a read key.
+                let real = self.history.values().any(|c| {
+                    c.seqno.is_some_and(|s| s > *snapshot)
+                        && reads.iter().any(|(t, r, f)| c.touches(t, r, f))
+                });
+                if !real {
+                    return fail(
+                        FailureClass::Protocol,
+                        format!(
+                            "spurious conflict: nothing above snapshot {snapshot} touched {reads:?}"
+                        ),
+                    );
+                }
+                self.stats.conflicts += 1;
+                self.trace.push("  -> conflict".into());
+                self.aborted.push(inf.commit);
+            }
+            Outcome::Commit(Err(e)) | Outcome::Cas(Err(e))
+                if dead || !self.alive() || is_crashed(&e) =>
+            {
+                let mut c = inf.commit;
+                c.acked = false;
+                self.unacked.push(c);
+                if dead {
+                    self.stats.crash_poll_unacked += 1;
+                    return Ok(Resolved::Done);
+                }
+                if armed {
+                    self.stats.mid_commit_crashes += 1;
+                }
+                return Ok(Resolved::Crashed);
+            }
+            Outcome::Commit(Err(Error::Io(e))) | Outcome::Cas(Err(Error::Io(e))) => {
+                // A failed write or sync poisoned a stream: the commit may have landed
+                // (a sync failure after apply), so it is unacknowledged, and the engine
+                // must be reopened once everything in flight has settled.
+                self.stats.io_errors += 1;
+                self.trace
+                    .push(format!("  -> I/O error ({e}); reopen pending"));
+                let mut c = inf.commit;
+                c.acked = false;
+                self.unacked.push(c);
+                self.need_reopen = true;
+            }
+            Outcome::Commit(Err(Error::OutcomeUnknown))
+            | Outcome::Cas(Err(Error::OutcomeUnknown)) => {
+                // A shard died meanwhile (a failed sync, D227): the commit may have
+                // landed, and the next open decides it from the WAL. As a failed sync.
+                self.stats.io_errors += 1;
+                self.trace
+                    .push("  -> outcome unknown; reopen pending".into());
+                let mut c = inf.commit;
+                c.acked = false;
+                self.unacked.push(c);
+                self.need_reopen = true;
+            }
+            Outcome::Commit(Err(Error::Closed)) | Outcome::Cas(Err(Error::Closed))
+                if self.store().engine.shard_died() =>
+            {
+                // Refused after a shard's death (D227): nothing was written.
+                self.trace
+                    .push("  -> refused after a shard's death; reopen pending".into());
+                self.aborted.push(inf.commit);
+                self.need_reopen = true;
+            }
+            Outcome::Commit(Err(e)) | Outcome::Cas(Err(e)) => {
+                return fail(
+                    FailureClass::Protocol,
+                    format!("unexpected commit error: {e}"),
+                );
+            }
+        }
+        Ok(Resolved::Done)
+    }
+
     /// Settles every in-flight commit that resolved. Returns whether the client may go on
     /// (nothing left in flight).
     fn poll_in_flight(&mut self, rng: &mut Rng) -> Result<bool, Fail> {
@@ -3843,6 +3982,22 @@ impl World {
             if self.in_flight.iter().any(|i| i.armed) {
                 self.stats.mid_commit_crashes += 1;
             }
+            // Outcomes that had resolved before the store died count as they resolved
+            // (#876): an acknowledged commit stays acknowledged. `hold_acks` keeps them here.
+            let (known, rest): (Vec<InFlight>, Vec<InFlight>) = std::mem::take(&mut self.in_flight)
+                .into_iter()
+                .partition(|i| matches!(i.pending, Pending::Ready(Some(_))));
+            self.in_flight = rest;
+            let mut successes = Vec::new();
+            for mut inf in known {
+                let Pending::Ready(o) = &mut inf.pending else {
+                    unreachable!()
+                };
+                let o = o.take().expect("partitioned on a known outcome");
+                self.take_outcome(inf, o, true, &mut successes)?;
+            }
+            self.stats.crash_poll_acked += successes.len();
+            self.acked_pending.append(&mut successes);
             self.crash_and_recover(CrashKind::Power, true, rng)?;
             return Ok(true);
         }
@@ -3872,145 +4027,43 @@ impl World {
         if resolved.is_empty() {
             return Ok(false);
         }
+        let ok = |o: &Outcome| matches!(o, Outcome::Commit(Ok(_)) | Outcome::Cas(Ok(_)));
+        if self.cfg.hold_acks
+            && self.alive()
+            && !self.in_flight.is_empty()
+            && resolved.iter().all(|(_, o)| ok(o))
+        {
+            for (mut inf, o) in resolved {
+                inf.pending = Pending::Ready(Some(o));
+                self.in_flight.push(inf);
+            }
+            return Ok(false);
+        }
         // Successful commits are applied to the model in seqno order.
         let mut successes: Vec<(Seqno, InFlight, Option<pigeonhole_engine::CommitInfo>)> =
             Vec::new();
         let mut resolved = resolved.into_iter();
         while let Some((inf, outcome)) = resolved.next() {
             let armed = inf.armed;
-            match outcome {
-                Outcome::Commit(Ok(info)) => successes.push((info.seqno, inf, Some(info))),
-                Outcome::Cas(Ok((applied, info))) => {
-                    let Kind::Cas { expected, .. } = &inf.commit.kind else {
-                        unreachable!()
-                    };
-                    if applied != *expected {
-                        return fail(
-                            FailureClass::LiveReadMismatch,
-                            format!(
-                                "check_and_mutate applied={applied} but the model's predicate said {expected}"
-                            ),
-                        );
-                    }
-                    match info {
-                        Some(info) => successes.push((info.seqno, inf, Some(info))),
-                        None => {
-                            self.stats.cas_refused += 1;
-                            self.trace.push("  -> predicate false, not applied".into());
-                            self.aborted.push(inf.commit);
-                        }
-                    }
-                }
-                Outcome::Commit(Err(Error::Busy)) | Outcome::Cas(Err(Error::Busy)) => {
-                    self.stats.busy += 1;
-                    self.trace.push("  -> busy (arena full)".into());
-                    self.aborted.push(inf.commit);
-                }
-                Outcome::Commit(Err(Error::Conflict)) => {
-                    let Kind::Txn { snapshot, reads } = &inf.commit.kind else {
-                        return fail(FailureClass::Protocol, "conflict on a plain commit".into());
-                    };
-                    // A real conflict: some commit above the snapshot touched a read key.
-                    let real = self.history.values().any(|c| {
-                        c.seqno.is_some_and(|s| s > *snapshot)
-                            && reads.iter().any(|(t, r, f)| c.touches(t, r, f))
-                    });
-                    if !real {
-                        return fail(
-                            FailureClass::Protocol,
-                            format!(
-                                "spurious conflict: nothing above snapshot {snapshot} touched {reads:?}"
-                            ),
-                        );
-                    }
-                    self.stats.conflicts += 1;
-                    self.trace.push("  -> conflict".into());
-                    self.aborted.push(inf.commit);
-                }
-                Outcome::Commit(Err(e)) | Outcome::Cas(Err(e))
-                    if !self.alive() || is_crashed(&e) =>
-                {
-                    let mut c = inf.commit;
+            if let Resolved::Crashed = self.take_outcome(inf, outcome, false, &mut successes)? {
+                for other in self.in_flight.drain(..) {
+                    let mut c = other.commit;
                     c.acked = false;
                     self.unacked.push(c);
-                    if armed {
-                        self.stats.mid_commit_crashes += 1;
-                    }
-                    for other in self.in_flight.drain(..) {
-                        let mut c = other.commit;
-                        c.acked = false;
-                        self.unacked.push(c);
-                    }
-                    // The commits resolved in this same poll and not yet looked at count as
-                    // they resolved: they were dropped, so one whose record survived was
-                    // taken for a commit the client never made (#860). An acknowledged one
-                    // (and those acknowledged before it in this poll) goes in as
-                    // acknowledged; a refused predicate wrote nothing; any other failure may
-                    // have landed.
-                    let first_acked = self.acked_pending.len();
-                    self.acked_pending.append(&mut successes);
-                    for (other, o) in resolved.by_ref() {
-                        match o {
-                            Outcome::Commit(Ok(info)) | Outcome::Cas(Ok((_, Some(info)))) => {
-                                self.acked_pending.push((info.seqno, other, Some(info)));
-                            }
-                            Outcome::Cas(Ok((_, None))) => self.aborted.push(other.commit),
-                            _ => {
-                                let mut c = other.commit;
-                                c.acked = false;
-                                self.unacked.push(c);
-                                self.stats.crash_poll_unacked += 1;
-                            }
-                        }
-                    }
-                    self.stats.crash_poll_acked += self.acked_pending.len() - first_acked;
-                    self.crash_and_recover(CrashKind::Power, true, rng)?;
-                    return Ok(true);
                 }
-                Outcome::Commit(Err(Error::Io(e))) | Outcome::Cas(Err(Error::Io(e))) => {
-                    // A failed write or sync poisoned a stream: the commit may have landed
-                    // (a sync failure after apply), so it is unacknowledged, and the engine
-                    // must be reopened once everything in flight has settled.
-                    self.stats.io_errors += 1;
-                    self.trace
-                        .push(format!("  -> I/O error ({e}); reopen pending"));
-                    let mut c = inf.commit;
-                    c.acked = false;
-                    self.unacked.push(c);
-                    self.need_reopen = true;
+                // The commits resolved in this same poll and not yet looked at count as they
+                // resolved, the store known dead (#860, #876); with the ones acknowledged
+                // before the crash in this poll, they go in before it.
+                for (other, o) in resolved.by_ref() {
+                    self.take_outcome(other, o, true, &mut successes)?;
                 }
-                Outcome::Commit(Err(Error::OutcomeUnknown))
-                | Outcome::Cas(Err(Error::OutcomeUnknown)) => {
-                    // A shard died meanwhile (a failed sync, D227): the commit may have
-                    // landed, and the next open decides it from the WAL. As a failed sync.
-                    self.stats.io_errors += 1;
-                    self.trace
-                        .push("  -> outcome unknown; reopen pending".into());
-                    let mut c = inf.commit;
-                    c.acked = false;
-                    self.unacked.push(c);
-                    self.need_reopen = true;
-                }
-                Outcome::Commit(Err(Error::Closed)) | Outcome::Cas(Err(Error::Closed))
-                    if self.store().engine.shard_died() =>
-                {
-                    // Refused after a shard's death (D227): nothing was written.
-                    self.trace
-                        .push("  -> refused after a shard's death; reopen pending".into());
-                    self.aborted.push(inf.commit);
-                    self.need_reopen = true;
-                }
-                Outcome::Commit(Err(e)) | Outcome::Cas(Err(e)) => {
-                    return fail(
-                        FailureClass::Protocol,
-                        format!("unexpected commit error: {e}"),
-                    );
-                }
+                self.stats.crash_poll_acked += successes.len();
+                self.acked_pending.append(&mut successes);
+                self.crash_and_recover(CrashKind::Power, true, rng)?;
+                return Ok(true);
             }
             if armed {
                 self.vfs.set_faults(self.cfg.faults.clone());
-                self.faults_active = true;
-                self.faults_active = true;
                 self.faults_active = true;
             }
         }
