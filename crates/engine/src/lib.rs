@@ -24,6 +24,7 @@
 mod admission;
 mod catalog;
 mod check;
+mod clock;
 mod close_gate;
 mod compact;
 mod engine;

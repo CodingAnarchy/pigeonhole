@@ -934,6 +934,7 @@ impl Engine {
             close: CloseState::new(shards),
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             flushed_through: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
+            clock: Default::default(),
             ts_floors: (0..shards)
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
@@ -1160,10 +1161,9 @@ impl Engine {
             applied_slots.insert((*stream, *seqno), (apply_seqno, per_shard));
         }
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
-        let current = shm.next_seqno();
-        if next > current {
-            shm.reserve_seqnos(next - current);
-        }
+        // The allocator starts above every recovered seqno, and shm mirrors it (D271).
+        shm.advance_next_seqno(next);
+        shared.clock.seed(shm.next_seqno());
 
         // 6. Streams. With the same layout as before, every stream's unflushed records are
         // logged on its shard for checkpointing. Otherwise (D20), or when replay already
@@ -1520,6 +1520,7 @@ impl Engine {
             failure: Default::default(),
             close: CloseState::new(0),
             metrics: Vec::new(),
+            clock: Default::default(),
             ts_floors: Vec::new(),
             flushed_through: Vec::new(),
             ts_raises: Vec::new(),
@@ -2824,7 +2825,7 @@ fn flush_recovered(
         });
     }
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
-    catalog.counters.seqno_ceiling = shared.shm.next_seqno();
+    catalog.counters.seqno_ceiling = shared.clock.next_seqno();
     if nothing_recovered && catalog.counters == before {
         // A clean reopen (#158, D203): no stream to replay, nothing spilled, and the
         // counters are what the manifest holds. The commit would publish nothing; skipping
