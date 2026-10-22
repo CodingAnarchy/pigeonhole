@@ -5447,14 +5447,10 @@ impl ShardState {
                     share_waits += 1;
                     continue;
                 }
-                // D267: a blind PREPARE goes behind the undecided shares it overlaps (its
-                // `Prepared` waits for their decisions, `chain_behind_undecided` below);
-                // any other is refused, as D263 had every one.
-                if !self.may_chain(&m) {
-                    self.refuse_for_overlap(m, ctx);
-                    continue;
-                }
-                chains = true;
+                // D271: what overlaps now is an optimistic conflict, refused as D263 did
+                // (D249's wake); a blind write over a write no longer overlaps.
+                self.refuse_for_overlap(m, ctx);
+                continue;
             }
             // D267: a PREPARE reading a row a waiting single writes would read below the
             // single while landing above it, and a blind one writing a row an older refused
@@ -5628,9 +5624,6 @@ impl ShardState {
                 // The share lands at its decision's timestamp, above this floor (D263):
                 // a lower bound for compaction's and flush's GC.
                 let floor = self.ts_floor + 1;
-                if self.prepared.get(&m.seqno).is_some_and(|s| !s.tracked) {
-                    self.chain_behind_undecided(&m, ctx);
-                }
                 if let Some(share) = self.prepared.get_mut(&m.seqno)
                     && !share.tracked
                 {
@@ -6962,10 +6955,14 @@ impl ShardState {
         if self.pending_rows.is_empty() && self.pending_reads.is_empty() {
             return false;
         }
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+        // D271: a write over an undecided share's write is ordered by the one allocator (its
+        // seqno and timestamp against the share's decision), so only the optimistic checks
+        // remain: a write to a row the share read, and a read of a row it writes.
+        if !self.pending_reads.is_empty()
+            && let Ok(batch) = BatchRef::new(m.bytes.as_slice())
+        {
             for mu in batch.iter().flatten() {
-                let h = hash_row(mu.table, mu.row);
-                if self.pending_rows.contains_key(&h) || self.pending_reads.contains_key(&h) {
+                if self.pending_reads.contains_key(&hash_row(mu.table, mu.row)) {
                     return true;
                 }
             }
