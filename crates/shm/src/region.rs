@@ -726,6 +726,17 @@ impl ShmRegion {
             .fetch_add(count, Ordering::AcqRel)
     }
 
+    /// Raises the next seqno to reserve to at least `to` (`fetch_max`, release ordering): the
+    /// mirror of a writer that reserves seqnos in its own process (D271, ICR 0063). It never
+    /// moves past a reservation the writer made, and the writer published its pending
+    /// watermark before reserving, so a reader that sees the mirror at `to` sees that
+    /// watermark too (`FORMAT.md` §11.3).
+    pub fn advance_next_seqno(&self, to: Seqno) {
+        self.inner
+            .h64(header::NEXT_SEQNO)
+            .fetch_max(to, Ordering::AcqRel);
+    }
+
     /// Publishes `shard`'s pending watermark with release ordering: the minimum of its current
     /// group's lower bound and every cross-shard seqno it coordinates and has not released;
     /// `u64::MAX` when it holds nothing, so an idle shard never holds back snapshots.

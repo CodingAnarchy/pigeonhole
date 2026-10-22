@@ -815,13 +815,14 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     // Counters go with every commit: ids, the seqno ceiling and the timestamp floor.
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.next_blob_file = shared.blob_ids.load(Ordering::Relaxed);
-    catalog.counters.seqno_ceiling = shared.shm.next_seqno();
+    catalog.counters.seqno_ceiling = shared.clock.next_seqno();
     catalog.counters.ts_floor = shared
         .ts_floors
         .iter()
         .map(|f| f.0.load(Ordering::Acquire))
         .max()
         .unwrap_or(0)
+        .max(shared.clock.last_ts())
         .max(catalog.counters.ts_floor);
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);

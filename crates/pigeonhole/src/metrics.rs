@@ -187,6 +187,13 @@ pub struct EngineMetrics {
     pub transaction_retries: u64,
     /// Cross-shard commits' two-phase rounds and the refusals that made rounds retry.
     pub cross_shard: CrossShardMetrics,
+    /// Gauge: how far the largest default timestamp handed out is ahead of the clock now, in
+    /// µs; 0 while the clock leads. Default timestamps run ahead of the clock only when one
+    /// shard commits more than one group a µs, or a cross-shard decision and a commit after
+    /// it fall in the same µs (D271, ICR 0064).
+    pub default_ts_lead_micros: u64,
+    /// The largest `default_ts_lead_micros` at any commit since open.
+    pub max_default_ts_lead_micros: u64,
 }
 
 impl EngineMetrics {
@@ -250,11 +257,11 @@ pub struct CrossShardMetrics {
     /// The time shards had a single held back behind an undecided share
     /// (D263), summed over shards.
     pub share_wait_nanos: u64,
-    /// Cross-shard shares admitted behind another commit's undecided share (or a waiting
-    /// single) instead of refused, answering once that one was decided (D267).
+    /// Always 0 since 0.4.0's single clock (D271): cross-shard writes to the same rows no
+    /// longer wait for each other's decision, so none is chained. Kept for the API.
     pub chained: u64,
-    /// Younger undecided cross-shard attempts aborted so that an older commit queued
-    /// behind them could go first (D267). Each is retried.
+    /// Always 0 since 0.4.0's single clock (D271): nothing waits, so nothing is wounded.
+    /// Kept for the API.
     pub wounds: u64,
     /// The most attempts (two-phase rounds) one committed cross-shard commit that only
     /// writes took. Not cumulative: the largest since open. Only commits that committed
@@ -303,6 +310,8 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             file_growths_ahead: m.file_growths_ahead.0,
             file_growth_ahead_nanos: m.file_growths_ahead.1,
             async_sync_reads: m.async_sync_reads,
+            default_ts_lead_micros: m.default_ts_lead_micros.0,
+            max_default_ts_lead_micros: m.default_ts_lead_micros.1,
             shard_parks: m.shard_idle.0,
             shard_wakes: m.shard_idle.1,
             shard_busy_nanos: m.shard_busy_nanos,

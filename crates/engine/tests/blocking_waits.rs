@@ -923,13 +923,14 @@ fn a_visibility_wait_behind_a_poisoned_shards_group_ends() {
     assert!(closed.is_err(), "a close with a poisoned shard reported Ok");
 }
 
-/// D263 (perf287's review): a single on an undecided share's row waits for its decision,
-/// with no timeout of its own. Shard 1 coordinates a cross-shard commit X, and shard 0
-/// admits X's share on row `x` while both PREPARE syncs are held. A blind single and a
-/// conditional one on `x` then wait on shard 0. Shard 1 panics on its next sync (its
-/// DECISION's), before deciding: X's decision never comes. Both singles end with `Closed`
-/// (never written, so not committed) once the death is known, instead of waiting until
-/// the application closes the database.
+/// D263 (perf287's review): a single that reads an undecided share's row waits for its
+/// decision, with no timeout of its own. Shard 1 coordinates a cross-shard commit X, and
+/// shard 0 admits X's share on row `x` while both PREPARE syncs are held. A conditional
+/// single on `x` then waits on shard 0; a blind one goes ahead (D271: blind over blind is
+/// admitted, the one clock orders their timestamps). Shard 1 panics on its next sync (its
+/// DECISION's), before deciding: X's decision never comes. The conditional single ends
+/// with `Closed` (never written, so not committed) once the death is known, instead of
+/// waiting until the application closes the database.
 #[test]
 fn singles_held_behind_a_share_end_closed_when_its_coordinator_panics() {
     let (vfs, gate) = gate::vfs(1774);
@@ -966,12 +967,15 @@ fn singles_held_behind_a_share_end_closed_when_its_coordinator_panics() {
     }
     assert!(
         waits(&db) > before,
-        "the singles did not wait for X's share"
+        "the conditional single did not wait for X's share"
     );
     gate.panic(&wal(1));
     gate.release();
     let blind = gate::within(10, move || blind.wait()).expect("the blind single hung");
-    assert!(matches!(blind, Err(Error::Closed)), "{blind:?}");
+    assert!(
+        blind.is_ok(),
+        "a blind single on X's row did not go ahead: {blind:?}"
+    );
     let conditional =
         gate::within(10, move || conditional.join().unwrap()).expect("the conditional single hung");
     assert!(matches!(conditional, Err(Error::Closed)), "{conditional:?}");

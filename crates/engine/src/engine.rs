@@ -230,6 +230,10 @@ pub struct Metrics {
     /// Cross-shard commits' two-phase rounds and the PREPAREs participants refused, by
     /// reason (ICR 0043).
     pub cross_shard: CrossShardMetrics,
+    /// The drift gauge (D271, ICR 0064): how far the largest default timestamp handed out is
+    /// ahead of the clock now, and the largest such lead at any reservation since open, in
+    /// µs. Both 0 while the clock leads.
+    pub default_ts_lead_micros: (u64, u64),
 }
 
 /// Cross-shard commits' two-phase rounds and refusals since open, summed over shards
@@ -271,11 +275,10 @@ pub struct CrossShardMetrics {
     /// The time shards had at least one single held back behind an
     /// undecided share (D263), summed over shards.
     pub share_wait_nanos: u64,
-    /// PREPAREs admitted behind an undecided share or a waiting single instead of refused,
-    /// their `Prepared` held until those were decided or logged (D267).
+    /// Always 0 since D271: a blind write over an undecided share's write is admitted, so no
+    /// PREPARE is chained (D267's chaining went). Kept for the API (ICR 0056).
     pub chained: u64,
-    /// Younger undecided shares wounded (their attempts aborted unless decided) for an
-    /// older share chained behind them (D267).
+    /// Always 0 since D271: nothing chains, so nothing is wounded (D267). Kept for the API.
     pub wounds: u64,
     /// The most attempts (two-phase rounds) one committed cross-shard commit that only
     /// writes took, over every coordinator since open (ICR 0056). Only commits that
@@ -934,6 +937,7 @@ impl Engine {
             close: CloseState::new(shards),
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             flushed_through: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
+            clock: Default::default(),
             ts_floors: (0..shards)
                 .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
                 .collect(),
@@ -1160,10 +1164,10 @@ impl Engine {
             applied_slots.insert((*stream, *seqno), (apply_seqno, per_shard));
         }
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
-        let current = shm.next_seqno();
-        if next > current {
-            shm.reserve_seqnos(next - current);
-        }
+        // The allocator starts above every recovered seqno, and shm mirrors it (D271); its
+        // timestamp is seeded once replay has raised the floors (below).
+        shm.advance_next_seqno(next);
+        shared.clock.seed_seqno(shm.next_seqno());
 
         // 6. Streams. With the same layout as before, every stream's unflushed records are
         // logged on its shard for checkpointing. Otherwise (D20), or when replay already
@@ -1310,6 +1314,16 @@ impl Engine {
         for (i, s) in states.iter().enumerate() {
             shared.ts_floors[i].0.store(s.ts_floor(), Ordering::Release);
         }
+        // D271: the allocator's `H` is the largest default timestamp handed out: the
+        // manifest's floor and every replayed timestamp (§5). Not the clock: stamps take
+        // `max(now, ..)` themselves, and a decision must only be above `H`.
+        let h = states
+            .iter()
+            .map(|s| s.ts_floor())
+            .max()
+            .unwrap_or(0)
+            .max(catalog.counters.ts_floor);
+        shared.clock.seed_ts(h);
 
         // 7. The first view: tablets, recovered memtables, the manifest version and its SSTs.
         let mems: Vec<Arc<ShardMems>> = states
@@ -1520,6 +1534,7 @@ impl Engine {
             failure: Default::default(),
             close: CloseState::new(0),
             metrics: Vec::new(),
+            clock: Default::default(),
             ts_floors: Vec::new(),
             flushed_through: Vec::new(),
             ts_raises: Vec::new(),
@@ -2417,8 +2432,6 @@ impl Engine {
             x.refused_pending_overlap += refused(CrossRefusal::PendingOverlap);
             x.share_waits += s.cross.share_waits.load(Ordering::Relaxed);
             x.share_wait_nanos += s.cross.share_wait_nanos.load(Ordering::Relaxed);
-            x.chained += s.cross.chained.load(Ordering::Relaxed);
-            x.wounds += s.cross.wounds.load(Ordering::Relaxed);
             let most = |i: usize| s.cross.max_attempts[i].load(Ordering::Relaxed);
             x.max_attempts_blind = x.max_attempts_blind.max(most(0));
             x.max_attempts_reading = x.max_attempts_reading.max(most(1));
@@ -2431,6 +2444,7 @@ impl Engine {
         m.file_growths = (pager.growths, pager.growth_nanos);
         m.file_growths_ahead = (pager.growths_ahead, pager.ahead_nanos);
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
+        m.default_ts_lead_micros = shared.clock.lead(shared.vfs.now_micros());
         m.block_cache = shared.cache.hits_and_misses();
         m.block_cache_pinned = shared.cache.pinned() as u64;
         m.block_cache_capacity = shared.cache.capacity() as u64;
@@ -2824,7 +2838,7 @@ fn flush_recovered(
         });
     }
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
-    catalog.counters.seqno_ceiling = shared.shm.next_seqno();
+    catalog.counters.seqno_ceiling = shared.clock.next_seqno();
     if nothing_recovered && catalog.counters == before {
         // A clean reopen (#158, D203): no stream to replay, nothing spilled, and the
         // counters are what the manifest holds. The commit would publish nothing; skipping

@@ -400,19 +400,6 @@ impl ShardState {
         out
     }
 
-    /// Folds the other shards' raises into the floor (D245, D264): once per group, after its
-    /// reservation, so the load follows the reservation's read-modify-write on `NEXT_SEQNO`
-    /// (a coordinator's raise) and the routing that sent the group's writes here: the
-    /// client's view load (Acquire) and this shard's queue, or the old owner's forward (a
-    /// moved tablet's raise, made before the move was published).
-    #[inline(never)]
-    pub(super) fn fold_raises(&mut self) {
-        let raised = self.shared.ts_raises[usize::from(self.id.0)]
-            .0
-            .load(Ordering::Acquire);
-        self.ts_floor = self.ts_floor.max(raised);
-    }
-
     /// A PREPARE that would wait for arena room, refused instead (D245, ICR 0042); its
     /// coordinator hears a room `Wake` once this shard's room wait ends.
     #[inline(never)]
@@ -652,185 +639,6 @@ impl ShardState {
             .min()
     }
 
-    /// Whether PREPARE `m`, overlapping an undecided share, may go behind it (D267): it only
-    /// writes (no validated reads, no predicate), and either no row it writes already has [`CHAIN_CAP`]
-    /// undecided shares or it is older than every undecided share on its rows (it then
-    /// wounds them, so the oldest commit is never refused for the cap).
-    #[cold]
-    #[inline(never)]
-    pub(super) fn may_chain(&self, m: &Member) -> bool {
-        if !matches!(m.kind, MemberKind::Prepare { .. })
-            || m.validate.as_ref().is_some_and(|v| !v.reads.is_empty())
-            || m.predicate.is_some()
-        {
-            return false;
-        }
-        let Some(priority) = self.prepared.get(&m.seqno).map(|s| s.priority) else {
-            return false;
-        };
-        let rows = Self::written_rows(m);
-        let full = rows
-            .iter()
-            .any(|h| self.pending_rows.get(h).is_some_and(|n| *n >= CHAIN_CAP));
-        !full
-            || self
-                .shares_on(&rows, m.seqno)
-                .iter()
-                .all(|(_, p)| *p > priority)
-    }
-
-    /// PREPARE `m`, about to be tracked, goes behind what is undecided on the rows it
-    /// writes (D267): the shares that write or read them, and the singles waiting there
-    /// with the shares each waits for. Its `Prepared` waits until those shares are decided
-    /// and those singles logged here, so its coordinator picks its seqno after theirs and
-    /// its timestamp at or above theirs, and one cell's versions stay in order. The shares
-    /// of younger commits among them are wounded: their coordinators abort them unless
-    /// decided, so no two commits wait for each other (wound-wait), and each such commit
-    /// waits here behind `m`'s commit, as D249 refused it.
-    #[inline(never)]
-    pub(super) fn chain_behind_undecided(
-        &mut self,
-        m: &Member,
-        ctx: &mut ShardContext<'_, ShardMsg>,
-    ) {
-        let MemberKind::Prepare { coordinator } = m.kind else {
-            return;
-        };
-        let Some(priority) = self.prepared.get(&m.seqno).map(|s| s.priority) else {
-            return;
-        };
-        // Its commit is in here now: a fence for it has done its work.
-        if !self.reader_fences.is_empty() {
-            self.reader_fences.retain(|(p, _)| *p != priority);
-        }
-        let rows = Self::written_rows(m);
-        let mut singles: Vec<u32> = rows
-            .iter()
-            .filter_map(|h| self.single_rows.get(h))
-            .flatten()
-            .copied()
-            .collect();
-        if singles.is_empty()
-            && !rows
-                .iter()
-                .any(|h| self.pending_rows.contains_key(h) || self.pending_reads.contains_key(h))
-        {
-            return;
-        }
-        singles.sort_unstable();
-        singles.dedup();
-        let mut behind: Vec<Seqno> = self
-            .shares_on(&rows, m.seqno)
-            .into_iter()
-            .map(|(seqno, _)| seqno)
-            .collect();
-        // Behind a waiting single, so behind the shares it waits for too: that edge is
-        // explicit, and wounds keep it acyclic.
-        for w in &singles {
-            behind.extend(self.waiting_singles[w].ahead.iter().copied().filter(|s| {
-                *s != m.seqno && self.prepared.get(s).is_some_and(|share| share.tracked)
-            }));
-        }
-        behind.sort_unstable();
-        behind.dedup();
-        if behind.is_empty() && singles.is_empty() {
-            return;
-        }
-        let mut wounds = Vec::new();
-        for seqno in &behind {
-            let share = &self.prepared[seqno];
-            if share.priority > priority {
-                let mut share_rows: Vec<u64> = BatchRef::new(share.bytes.batch().as_bytes())
-                    .map(|b| {
-                        b.iter()
-                            .flatten()
-                            .map(|mu| hash_row(mu.table, mu.row))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                share_rows.extend(share.reads.iter().copied());
-                share_rows.sort_unstable();
-                share_rows.dedup();
-                wounds.push((*seqno, share.coordinator, share.priority, share_rows));
-            }
-        }
-        trace!(
-            "shard {} chains {} {priority:?} behind {behind:?} and singles {singles:?}, wounds {}",
-            self.id.0,
-            m.seqno,
-            wounds.len()
-        );
-        for d in &behind {
-            self.chained_after.entry(*d).or_default().push(m.seqno);
-        }
-        for w in &singles {
-            self.single_after.entry(*w).or_default().push(m.seqno);
-        }
-        self.chained.insert(
-            m.seqno,
-            ChainedShare {
-                coordinator,
-                behind: behind.len() + singles.len(),
-                logged: false,
-            },
-        );
-        let cross = &self.shared.metrics[usize::from(self.id.0)].cross;
-        cross.chained.fetch_add(1, Ordering::Relaxed);
-        cross
-            .wounds
-            .fetch_add(wounds.len() as u64, Ordering::Relaxed);
-        for (seqno, coordinator, younger, rows) in wounds {
-            // An earlier refusal of that commit here is stale: it has an attempt in flight.
-            self.overlap_refused.retain(|r| r.priority != younger);
-            self.overlap_refused.push(OverlapRefusal {
-                coordinator,
-                priority: younger,
-                rows,
-                behind: Some((priority, 0)),
-                single: 0,
-            });
-            // Through the queue even to this shard: handled here, it would decide the
-            // younger commit in the middle of this group's admission.
-            let _ = ctx.submitter(coordinator).submit(ShardMsg::Wound {
-                seqno,
-                from: self.id,
-            });
-        }
-    }
-
-    /// Share `seqno` was decided here (D267): the shares chained behind it count one less.
-    pub(super) fn release_chained(&mut self, seqno: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
-        let Some(waiting) = self.chained_after.remove(&seqno) else {
-            return;
-        };
-        for w in waiting {
-            self.chained_step(w, ctx);
-        }
-    }
-
-    /// One thing chained share `w` waited for is done: once nothing is left and it is
-    /// logged, its `Prepared` goes, with the floor this shard has now.
-    fn chained_step(&mut self, w: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
-        let Some(c) = self.chained.get_mut(&w) else {
-            return;
-        };
-        c.behind -= 1;
-        if c.behind > 0 || !c.logged {
-            return;
-        }
-        let c = self.chained.remove(&w).expect("present");
-        self.send(
-            c.coordinator,
-            ShardMsg::Prepared {
-                seqno: w,
-                from: self.id,
-                error: None,
-                floor: self.ts_floor,
-            },
-            ctx,
-        );
-    }
-
     /// Single `m` starts waiting for the undecided shares on its rows (D267): it waits for
     /// those only; shares chained on its rows later wait for it.
     #[cold]
@@ -858,7 +666,7 @@ impl ShardState {
         ahead.sort_unstable();
         ahead.dedup();
         let mut rows = writes.clone();
-        rows.extend(reads);
+        rows.extend(&reads);
         rows.sort_unstable();
         rows.dedup();
         self.next_share_wait = self.next_share_wait.wrapping_add(1).max(1);
@@ -871,6 +679,7 @@ impl ShardState {
             WaitingSingle {
                 ahead,
                 writes,
+                reads,
                 rows,
             },
         );
@@ -888,25 +697,29 @@ impl ShardState {
         })
     }
 
-    /// A waiting single that writes a row PREPARE `m` reads, if any (D267).
+    /// A waiting single that writes a row PREPARE `m` reads (D267), or reads a row `m`
+    /// writes (D271, perf287's M1), if any.
     #[inline]
-    pub(super) fn reads_waiting_single(&self, m: &Member) -> Option<u32> {
+    pub(super) fn overlaps_waiting_single(&self, m: &Member) -> Option<u32> {
         if self.waiting_singles.is_empty() {
             return None;
         }
-        self.reads_waiting_single_slow(m)
+        self.overlaps_waiting_single_slow(m)
     }
 
     #[cold]
     #[inline(never)]
-    fn reads_waiting_single_slow(&self, m: &Member) -> Option<u32> {
-        Self::read_rows(m).iter().find_map(|h| {
-            self.single_rows.get(h).and_then(|ids| {
-                ids.iter()
-                    .copied()
-                    .find(|id| self.waiting_singles[id].writes.binary_search(h).is_ok())
+    fn overlaps_waiting_single_slow(&self, m: &Member) -> Option<u32> {
+        let on = |rows: Vec<u64>, of: fn(&WaitingSingle) -> &[u64]| {
+            rows.into_iter().find_map(|h| {
+                self.single_rows.get(&h).and_then(|ids| {
+                    ids.iter()
+                        .copied()
+                        .find(|id| of(&self.waiting_singles[id]).binary_search(&h).is_ok())
+                })
             })
-        })
+        };
+        on(Self::read_rows(m), |w| &w.writes).or_else(|| on(Self::written_rows(m), |w| &w.reads))
     }
 
     /// Waiting single `id` was logged, or failed (D267): the shares chained behind it count
@@ -925,9 +738,6 @@ impl ShardState {
                 }
             }
         }
-        for s in self.single_after.remove(&id).unwrap_or_default() {
-            self.chained_step(s, ctx);
-        }
         // The PREPAREs it refused may retry (R4: not before, or they spin).
         let mut i = 0;
         while i < self.overlap_refused.len() {
@@ -938,31 +748,6 @@ impl ShardState {
                 i += 1;
             }
         }
-    }
-
-    /// A coordinator's side of a [`ShardMsg::Wound`] (D267): an attempt not yet decided is
-    /// decided abort now, without the answers still out (they are ignored once decided), and
-    /// its retry waits for `from`'s overlap wake.
-    pub(super) fn on_wound(
-        &mut self,
-        seqno: Seqno,
-        from: ShardId,
-        ctx: &mut ShardContext<'_, ShardMsg>,
-    ) {
-        let Some(c) = self.coord.get_mut(&seqno) else {
-            return;
-        };
-        if c.decided {
-            return;
-        }
-        trace!("shard {} aborts {seqno}: wounded at {}", self.id.0, from.0);
-        RetryWait::note(&mut c.refused, RetryWait::Overlap { from });
-        // Invariant: `refused` is set, so `on_prepared` decides abort; it counts `from`'s
-        // answer as the last one (the real ones, still out, come after the decision and
-        // are ignored).
-        c.prepared = c.participants - 1;
-        let floor = c.commit_ts;
-        self.on_prepared(seqno, from, None, floor, ctx);
     }
 
     /// After a decision here (D249): wakes the coordinators refused over an overlap that has
@@ -1743,6 +1528,8 @@ impl ShardState {
                 .0
                 .fetch_max(self.ts_floor, Ordering::AcqRel);
         }
+        // D271: the new owner's next stamp is above every one the allocator handed out.
+        self.shared.clock.raise();
         trace!("shard {} tablet change {kind:?} commits", self.id.0);
         let me = self.id;
         let change: TabletChange =

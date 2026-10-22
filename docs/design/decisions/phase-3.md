@@ -2192,7 +2192,7 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 <a id="d267"></a>
 ## D267 — A blind cross-shard PREPARE over an undecided share goes behind it instead of being refused; an older one wounds a younger undecided share (owner decision, 2026-10-21; engine, #816, ICR 0056; amends D263, D249)
 
-**Status: accepted** (owner, 2026-10-21), on the box A/B below and perf287's protocol reviews (R1–R4, the reader-fence fix).
+**Status: accepted** (owner, 2026-10-21), on the box A/B below and perf287's protocol reviews (R1–R4, the reader-fence fix). **Its chaining, `CHAIN_CAP` and wound-wait are superseded by D271** (2026-10-22): with one allocator a write over an undecided share's write is admitted, so nothing chains. The reader fence and waiting singles stay.
 
 **Decided:**
 - **Chaining.** A PREPARE that only writes (no validated reads, no predicate) is admitted on a participant even where an undecided share writes or reads one of its rows. D263 refused it.
@@ -2300,6 +2300,45 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - `a_packing_move_waits_for_a_claimed_shard`: with the only active shard claimed for 400 passes, no tablet moves past the shrink; once the claim runs out the three land together.
 - `a_change_that_waits_on_a_compaction_claims_no_shard`: a hot tablet's split, held by its compaction, claims no shard; it splits once the compaction ends.
 - Each fails without its change.
+
+<a id="d271"></a>
+## D271 — One allocator for seqnos and default timestamps; a cross-shard write over an undecided share's write is admitted (owner decision, 2026-10-22; engine, shm, #854, #816, ICR 0063; supersedes D267's chaining and wounds; amends D11, D244, D245, D263, D264)
+
+**Decided** (#854's design note, with perf287's correctness sections and perf2's cost and #816 sections):
+- **One allocator.** Every seqno a writer reserves comes from one per-engine word, `Shared::clock` (`(S, H, F)` under a lock): a group's seqnos, a cross-shard commit's id (D263), its decision's seqno. Its default timestamps come from the same reservation. shm `NEXT_SEQNO` becomes a mirror, raised after each reservation by `ShmRegion::advance_next_seqno` (`fetch_max`, ICR 0063), so it never passes a reservation, and FORMAT §11.3's publish order holds: the pending watermark first, then the mirror. No shm layout change.
+- **Stamps** (variant B):
+  - **A group's singles:** `T0 = max(now, H + F, last_X + 1)`, where `last_X` is the shard's own last stamp; `H' = max(H, T0 + k − 1)`; `F = 0`. Single i is stamped `T0 + rank_i`. Its rank is above every earlier single of the group on one of its rows (two on one cell never share a timestamp), and never below the single before it, so a shard's stamps follow its seqnos.
+  - **A decision:** `T_d = max(now, H + 1)`, `H' = T_d`, `F = 1`. So a group reserved after it in the same µs takes `H + 1`, and cannot tie with the decision's cells (the owner's ruling).
+  - **A tablet changing owner** sets `F`: the next stamp anywhere is strictly above every one handed out.
+- **At open:** the seqno is seeded at replay's catch-up, before anything at open reserves one. `H` is seeded with the largest stamp handed out: the replayed floors and the manifest's `ts_floor`, not the clock (a decision just after the reopen must not be pushed past `now`). The manifest records `H` as `ts_floor`. No format change.
+- **Admission** (§1.6): a write over an undecided share's *write* is ordered by the allocator, so it no longer overlaps.
+  - A blind PREPARE over it answers `Prepared` at once.
+  - A blind single on such a row goes ahead.
+  - What still overlaps is optimistic: a read of a row an undecided share writes, and a write to a row it read. A single waits (D263); a PREPARE is refused and woken (D249).
+  - D267's reader fence stays (an older refused reader fences younger blind PREPAREs off its rows), and so do its waiting singles: they keep a stream of reading commits from starving a writer single.
+  - **A PREPARE that writes a row a waiting single reads is refused until the single is logged** (`OverlapWait::Single`, woken by `end_single_wait`), the mirror of D267's refusal of a PREPARE reading a row a waiting single writes. A waiting single, once the shares it waits for are decided, is admitted without checking newer undecided shares, so without this it would read the row without the PREPARE's write while that write's decision could take the lower seqno: a lost update through `check_and_mutate`, or a missed transaction conflict (perf287's review, M1). D267 had held such a PREPARE's `Prepared` behind the single instead.
+  - **A group's conditional member no longer counts its *written* rows against undecided shares** (`conflicts_with_group`, which changes D260's conditional-group rule): a write over an undecided share's read is refused by `overlaps_undecided`'s read check, and a read over an undecided write by the reads loop.
+  - D267's chaining, `CHAIN_CAP` and wound-wait go. `CrossShardMetrics::{chained, wounds}` stay at 0 (ICR 0056).
+- **The floors** (`ts_floors`, `ts_raises`) are still written but no longer read by a decision, admission or refusal. They go in a second PR, with `ts_order_loom.rs` and D244's mechanism (its guarantee stays, restated here). That PR keeps a shard-local last stamp (today `ts_floor`, passed to `reserve_group` as `last`): it is variant B's per-shard strictness.
+
+**Why:** #816. Under D263 a later commit on a hot row had to wait for the earlier one's decision to carry its timestamp, refused (D263) or chained (D267). Chains crossing shards needed wounds: about 2.4 per cross-shard commit on the box, and without them the run deadlocked. With one allocator nothing waits for another commit's decision on a write. Measured locally (small scale, Buffered): app-owned 461K commits/s at 1 round per cross-shard commit and 0 refusals, against main's 157–182K and before #774's 308–321K.
+
+**Cost:** one lock-protected reservation per group; the pending watermark's lower bound is the mirror, not a second lock. On x86 (callgrind) that is +50 instructions per single-group commit (commit-one +0.54%, commit-overwrite +0.44%, commit-sixteen +0.10%). One 128-bit word through `portable-atomic` measured +77 (its compare-exchange is outlined on baseline x86-64), and two locks per group +65. The prototype's inline `cmpxchg16b` was +25 per group, and level on ycsb-a at 1 and 16 threads on the box (#854 §4); the engine forbids `unsafe`.
+
+**Drift gauge** (ICR 0064): `EngineMetrics::default_ts_lead_micros` is how far `H` is ahead of the clock now; `max_default_ts_lead_micros` is the largest lead at any reservation since open. Default timestamps run ahead of the clock only when one shard reserves more than one group a µs, or a group follows a decision in the same µs.
+
+**Tests** (`crates/engine/tests/tablets.rs` unless named):
+- **Admission:**
+  - `a_blind_prepare_over_an_undecided_share_is_admitted_and_answers_at_once`;
+  - `a_blind_single_on_an_undecided_shares_row_goes_ahead`;
+  - `a_crash_with_two_shares_on_one_row_applies_the_decided_one_and_drops_the_other`.
+- **Order:** `default_timestamps_keep_seqno_order_on_every_shard_under_cross_shard_commits` and its siblings (`d142_sweep`, seeded). They now also check the order across shards: all streams' writes by seqno, timestamps never going back, and each decision strictly above the write before it and strictly below the write after it. They fail with the decision at `H` instead of `H + 1`, and with a group ignoring `F`. On the frozen clock they check that the drift gauge reads a lead.
+- **D249's overlap tests** now overlap through reads: `overlap_txn` reads a second family of the rows it writes.
+- **The allocator's unit tests** (`clock.rs`).
+- **M1:** `a_blind_prepare_writing_a_row_a_waiting_single_reads_lands_after_the_single` (`tablets.rs`): A undecided on `a`, a conditional single C waiting for it, and B blind across shards writing `a:p` (C's predicate column), coordinated by the shard where C waits. Over six turn orders, if C applied it is serialized before B. It fails without the refusal (C applied at seqno 8, B at 7). model_check's `hot_rows_conditional_singles_beside_blind_cross_shard_writers` covers the shape with deferred I/O, but did not reach that window in 200 seeds without the refusal.
+- **The model check** in both test targets, its D267 hot-row shapes unchanged (renamed `hot_rows_blind_overlaps_*`); and a no-hang run of the contended cross-shard rows (app-owned, mixed, transfer, gate contended) at both levels.
+- **`blocking_waits.rs`:** `singles_held_behind_a_share_end_closed_when_its_coordinator_panics`: the blind single goes ahead; the conditional one still waits and ends `Closed` at the coordinator's death.
+- **Loom** (`clock_loom.rs`, `--cfg engine_loom`): a group and a decision reserved in the same µs against a reader's `visible_seqno`. No seqno shows before it is applied, stamps follow seqnos, and a decision is strictly above. It fails if the pending watermark is not published before the mirror rises.
 
 <a id="d272"></a>
 ## D272 — Transactions in 1.0: no lock mode; conflicts stay at (row, family) granularity; the transfer gap stays open under #708 (owner decision, 2026-10-21; pigeonhole, engine, #694)
