@@ -74,7 +74,10 @@ impl RetryPolicy {
         self
     }
 
-    /// No new attempt starts once `d` has passed since the first began (default 30 s).
+    /// No new attempt starts once `d` has passed since the first began (default 30 s). An
+    /// attempt already running finishes, so the whole call can take longer: a commit
+    /// waiting for room returns `Busy` only after `Options::write_stall_timeout` (also 30 s
+    /// by default).
     pub fn deadline(mut self, d: Duration) -> Self {
         self.deadline = Some(d);
         self
@@ -193,10 +196,14 @@ impl Pigeonhole {
     /// commit.
     ///
     /// `body` returns any error type that a [`pigeonhole::Error`](Error) converts into, so
-    /// it can give up with the application's own error (nothing is committed then). An
-    /// error from the transaction's own reads that the policy retries (a recovery expiring
-    /// its snapshot) is retried whatever `body` turned it into; a commit that fails with a
-    /// retried error (a `Conflict`) is retried; anything else is returned as is.
+    /// it can give up with the application's own error (nothing is committed then). If any
+    /// of the transaction's reads failed with an error the policy retries (a recovery
+    /// expiring its snapshot), the attempt is retried whatever `body` returned, even if it
+    /// swallowed that error and gave up for another reason: the snapshot is gone either way.
+    /// Only [`Transaction::get`] reads count; a failed
+    /// [`get_async`](Transaction::get_async) does not. A commit that fails with a retried
+    /// error (a `Conflict`, or `SnapshotExpired` when a recovery refused it) is retried;
+    /// anything else is returned as is.
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole, RetryPolicy};

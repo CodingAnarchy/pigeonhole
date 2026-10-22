@@ -586,3 +586,36 @@ fn a_close_that_does_not_return_in_time_gives_the_recovery_up() {
         "a plain open after the give-up"
     );
 }
+
+/// perf287's S1 on #877 (ICR 0060): a transaction whose commit the failed engine refuses
+/// during a recovery gets `SnapshotExpired` (not `Busy`), which `transact` retries by
+/// default, so `transact` survives a recovery transparently: the first attempt's commit
+/// meets the failed engine, the second runs on the recovered one.
+#[test]
+fn transact_survives_a_recovery_with_the_default_policy() {
+    let (vfs, gate) = gate::vfs(2011);
+    let (db, t) = open(&vfs, Recovery::Io);
+    t.mutate(b"n").put("f", b"q", b"0").commit().unwrap();
+    let mut attempts = 0;
+    let (value, _) = db
+        .transact(&pigeonhole::RetryPolicy::default(), |txn| {
+            attempts += 1;
+            let n: u64 = txn.get(&t, b"n", "f", b"q")?.map_or(0, |c| {
+                std::str::from_utf8(c.value()).unwrap().parse().unwrap()
+            });
+            if attempts == 1 {
+                // The shard holding the row dies while this transaction is open: its commit
+                // goes to the failed engine.
+                let _ = fail_shard(&gate, &t, "n2");
+            }
+            txn.put(&t, b"n", "f", b"q", (n + 1).to_string().as_bytes());
+            Ok::<_, pigeonhole::Error>(n)
+        })
+        .unwrap();
+    assert_eq!(attempts, 2, "{:?}", db.recovery_stats());
+    assert_eq!(value, 0);
+    assert_eq!(t.get(b"n", "f", b"q").unwrap().unwrap().value(), b"1");
+    assert_eq!(db.recovery_stats().recoveries, 1);
+    assert_eq!(db.engine_metrics().transaction_retries, 1);
+    db.close().unwrap();
+}

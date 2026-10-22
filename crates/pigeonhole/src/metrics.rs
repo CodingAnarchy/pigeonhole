@@ -12,6 +12,11 @@ use crate::Durability;
 /// interval, take two readings and subtract. **Gauges** (marked so below) report the value
 /// now. Durations are nanoseconds; sizes are bytes.
 ///
+/// **Two lifetimes.** The engine's fields restart from 0 when an automatic recovery
+/// (`Options::auto_recover`) swaps in a new engine. The three transaction counters
+/// (`transactions`, `transaction_conflicts`, `transaction_retries`) are kept by the handle
+/// and span recoveries. Subtract readings taken across a recovery only for those three.
+///
 /// Every field is a sum over the shards. Reading is cheap (about 300 relaxed atomic loads
 /// per shard, no I/O), so a monitoring loop can call it every second; it never waits for a
 /// shard.
@@ -177,7 +182,8 @@ pub struct EngineMetrics {
     /// Over `transactions + transaction_conflicts`, the conflict rate.
     pub transaction_conflicts: u64,
     /// Attempts [`Pigeonhole::transact`](crate::Pigeonhole::transact) retried, for any
-    /// reason its policy retries.
+    /// reason its policy retries. A retry loop of the application's own (around
+    /// [`RetryPolicy::next_pause`](crate::RetryPolicy::next_pause), say) is not counted.
     pub transaction_retries: u64,
     /// Cross-shard commits' two-phase rounds and the refusals that made rounds retry.
     pub cross_shard: CrossShardMetrics,

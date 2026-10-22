@@ -1066,7 +1066,9 @@ impl Transaction {
             .txn
             .commit(durability)
             .map(CommitInfo::from)
-            .map_err(|e| db.after_commit_closed(generation, commit_error(e, largest, max)));
+            .map_err(|e| {
+                db.after_transaction_commit_closed(generation, commit_error(e, largest, max))
+            });
         db.txn_counts.count(&result);
         result
     }

@@ -52,6 +52,18 @@ It writes nothing, so it has no seqno of its own and nothing to make durable. It
 - **So a caller can run the same loop by hand.** An async caller with its own timer, or a future C ABI, uses `Pigeonhole::transaction()`, its own reads and writes, `commit`, then `next_pause` with the commit's (or a read's) error code.
 - **There's no async `transact`,** because the crate has no timer.
 
+### A transaction refused by the failed engine during a recovery (refines ICR 0050)
+
+ICR 0050 gives a commit refused by the failed engine while a recovery runs `Busy` ("not committed, retry on the recovered one"). **For a transaction's commit it's `SnapshotExpired`** instead, with "not committed" kept in the message (perf287's S1 on #877).
+- **The reason:** the transaction's snapshot expired with the swap, exactly as its reads would have. `SnapshotExpired` is what `transact` retries by default, so surviving a recovery doesn't depend on whether the read or the commit met the swap.
+- **Unchanged:** a recovery that doesn't finish within `write_stall_timeout` is still `Busy`.
+- **Not covered:** the async transaction commit doesn't wait for the swap, as before.
+- **Test:** `tests/recovery.rs::transact_survives_a_recovery_with_the_default_policy`.
+
+**Smaller points:**
+- Only `Transaction::get` records a failed read for `transact`'s retry decision; `get_async` doesn't. ICR 0062's `get_row` will record it.
+- The deadline bounds when attempts start; a running one finishes.
+
 ### Why the generic error
 
 `pigeonhole::Error` can't be built by applications. A `body` returning `pigeonhole::Result` couldn't give up with the application's own reason. Generic `E: From<Error>` lets `?` work on pigeonhole calls inside the body and lets the application return its own error. The transaction remembering its failed read keeps "retry this" separate from "the application gave up". A body may need `Ok::<_, pigeonhole::Error>(…)` for inference.
