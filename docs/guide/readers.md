@@ -49,7 +49,7 @@ assert!(rt.get(b"s", "f", b"q")?.is_some());
 - **A reader the writer wrongly judges dead** (see the PID-namespace requirement below) loses its slot. Its reads then fail with `SnapshotExpired`, and its next snapshot takes a fresh slot. It never reads wrong data.
 
 ## Long-held snapshots stall the writer
-A reader's oldest live snapshot pins the writer's state as of that snapshot: the memtables and file space the writer would otherwise reclaim. A reader that holds one snapshot for a long time while the writer keeps committing eventually fills the writer's memtable budget. The writer's commits then wait for room, and fail with `Busy` after `Options::write_stall_timeout` (30 s by default).
+A reader's oldest live snapshot pins the writer's state as of that snapshot: the memtables and file space the writer would otherwise reclaim. Only live snapshots pin. Once a reader drops its oldest snapshot the pin moves up to its next oldest, and a reader holding no snapshot pins nothing, however long it stays open (#693). A reader that holds one snapshot for a long time while the writer keeps committing eventually fills the writer's memtable budget. The writer's commits then wait for room, and fail with `Busy` after `Options::write_stall_timeout` (30 s by default).
 
 - **This is the reader's responsibility.** Take a snapshot per unit of work, drop it when done, and take a new one for the next.
 - **Watch it from the writer:** `engine_metrics()` reports `reader_slots_active` out of `reader_slots`, `reader_slots_reclaimed`, and how far the oldest reader snapshot lags the current state, as `reader_pin_view_lag` (published views) and `reader_pin_seqno_lag` (commits). A lag that only grows is a reader holding a snapshot.

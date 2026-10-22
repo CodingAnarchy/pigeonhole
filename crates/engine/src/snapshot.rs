@@ -3,7 +3,7 @@
 //! flush and compaction which views and seqnos are still live in this process.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_cache::{BlockCache, Cell, Priority};
@@ -1019,7 +1019,10 @@ pub(crate) struct RecordCache {
 /// reclamation for ever.
 #[derive(Debug)]
 pub(crate) struct LiveSnapshot {
-    pub count: Arc<AtomicUsize>,
+    /// The pins it holds, released on drop (#693 PR 2).
+    pub pins: Arc<ReaderPins>,
+    /// What it holds there: its seqno and the view version current when it was taken.
+    pub key: (Seqno, u64),
     /// The region generation the snapshot was taken in: its pin lives there.
     pub shm: ShmRegion,
     /// The slot holding the pin: if the writer judged this process dead and freed it, the
@@ -1057,7 +1060,143 @@ impl LiveSnapshot {
 
 impl Drop for LiveSnapshot {
     fn drop(&mut self) {
-        self.count.fetch_sub(1, Ordering::AcqRel);
+        self.pins.release(self.key);
+    }
+}
+
+/// A reader process's pins in its slot, exactly those of the snapshots it holds (#693 PR 2,
+/// #39, replacing D87's "move only when none is left"): the slot's seqno pin is the oldest
+/// live snapshot's seqno, its view pin the oldest live snapshot's view, and with no snapshot
+/// the slot pins nothing. So an idle reader never holds the writer back, and one whose
+/// snapshots overlap still lets go of each as it is dropped.
+///
+/// The multisets are this process's own, behind a mutex that also serializes its slot
+/// stores: a new snapshot pins before it reads (the empty case re-pins until the view
+/// pointer is covered, [`ReaderSlot::pin`]), and a dropped one only ever raises the pins
+/// (or clears them), so the writer can reclaim only what no live snapshot of this reader
+/// can reach. The writer reads the pins without a lock, as before.
+pub(crate) struct ReaderPins {
+    slot: pigeonhole_shm::ReaderSlot,
+    held: Mutex<HeldPins>,
+}
+
+#[derive(Default)]
+struct HeldPins {
+    seqnos: std::collections::BTreeMap<Seqno, usize>,
+    views: std::collections::BTreeMap<u64, usize>,
+    /// The reader closed: the slot was unpinned, and snapshots dropped later leave it alone.
+    closed: bool,
+}
+
+fn add<K: Ord + Copy>(map: &mut std::collections::BTreeMap<K, usize>, k: K) {
+    *map.entry(k).or_default() += 1;
+}
+
+fn remove<K: Ord + Copy>(map: &mut std::collections::BTreeMap<K, usize>, k: K) {
+    if let std::collections::btree_map::Entry::Occupied(mut e) = map.entry(k) {
+        *e.get_mut() -= 1;
+        if *e.get() == 0 {
+            e.remove();
+        }
+    }
+}
+
+impl std::fmt::Debug for ReaderPins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        f.debug_struct("ReaderPins")
+            .field("snapshots", &held.seqnos.values().sum::<usize>())
+            .field("oldest_seqno", &held.seqnos.keys().next())
+            .field("oldest_view", &held.views.keys().next())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ReaderPins {
+    pub(crate) fn new(slot: pigeonhole_shm::ReaderSlot) -> Arc<Self> {
+        Arc::new(Self {
+            slot,
+            held: Mutex::new(HeldPins::default()),
+        })
+    }
+
+    /// The slot these pins are in.
+    pub(crate) fn slot(&self) -> &pigeonhole_shm::ReaderSlot {
+        &self.slot
+    }
+
+    /// Pins for a new snapshot of `shm` (its visible seqno, or its durable one) and returns
+    /// the snapshot's seqno and the key to release on drop. Called with the slot owned.
+    pub(crate) fn take(
+        &self,
+        shm: &pigeonhole_shm::ShmRegion,
+        durable: bool,
+    ) -> (Seqno, (Seqno, u64)) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let seqno = if durable {
+            shm.durable_seqno()
+        } else {
+            shm.visible_seqno()
+        };
+        let view = shm.view_version();
+        let key = if held.seqnos.is_empty() {
+            // Nothing pinned: pin, re-pinning until the view pointer is covered.
+            if durable {
+                self.slot.pin_durable(seqno, view)
+            } else {
+                self.slot.pin(seqno, view)
+            }
+        } else {
+            // The pinned view is an older snapshot's, at or below every view this one can
+            // read. A durable seqno may be below the pinned seqno: lower it (D227).
+            if held
+                .seqnos
+                .keys()
+                .next()
+                .is_some_and(|&oldest| seqno < oldest)
+            {
+                self.slot.lower_pin(seqno);
+            }
+            (seqno, view)
+        };
+        add(&mut held.seqnos, key.0);
+        add(&mut held.views, key.1);
+        (key.0, key)
+    }
+
+    /// Releases a snapshot's key: the pins rise to the oldest snapshot left, or clear when
+    /// none is. Leaves the slot alone once the writer freed it (it may be another
+    /// process's now: #834 review) or the reader closed.
+    pub(crate) fn release(&self, key: (Seqno, u64)) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        remove(&mut held.seqnos, key.0);
+        remove(&mut held.views, key.1);
+        if held.closed || !self.slot.is_owned() {
+            return;
+        }
+        match (held.seqnos.keys().next(), held.views.keys().next()) {
+            (Some(&seqno), Some(&view)) => self.slot.raise_pin(seqno, view),
+            _ => self.slot.unpin(),
+        }
+    }
+
+    /// The reader closes: unpin, and leave the slot alone from now on.
+    pub(crate) fn close(&self) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.closed = true;
+        self.slot.unpin();
     }
 }
 

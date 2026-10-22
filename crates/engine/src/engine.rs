@@ -26,7 +26,7 @@ use pigeonhole_pager::Pager;
 use pigeonhole_runtime::{
     Runtime, RuntimeConfig, ShardDriver, ShardId, Submitter, Waiter, completion,
 };
-use pigeonhole_shm::{Presence, ReaderSlot, Role as ShmRole, ShmConfig, ShmRegion, WriterLock};
+use pigeonhole_shm::{Presence, Role as ShmRole, ShmConfig, ShmRegion, WriterLock};
 use pigeonhole_sst::SstWriterOptions;
 use pigeonhole_wal::{Recovery, Wal, WalStream, discover_streams, stream_path};
 use smallvec::SmallVec;
@@ -352,12 +352,8 @@ struct ReaderState {
 /// A reader process's attachment to one region generation.
 struct Attachment {
     shm: ShmRegion,
-    slot: ReaderSlot,
-    /// Whether the slot holds a pin.
-    pinned: bool,
-    /// Snapshots taken in this generation still alive; the pin moves forward when it drops
-    /// to zero.
-    live: Arc<AtomicUsize>,
+    /// This generation's slot and the pins its live snapshots hold there (#693 PR 2).
+    pins: Arc<crate::snapshot::ReaderPins>,
 }
 
 /// Everything behind an [`Engine`] (and the handle a [`Txn`] keeps).
@@ -1600,9 +1596,7 @@ impl Engine {
             presence: Mutex::new(Some(presence)),
             shm: Mutex::new(Attachment {
                 shm,
-                slot,
-                pinned: false,
-                live: Arc::new(AtomicUsize::new(0)),
+                pins: crate::snapshot::ReaderPins::new(slot),
             }),
             catalog: Mutex::new((manifest_version, Arc::new(catalog), manifest_file)),
             view: Mutex::new(None),
@@ -3895,7 +3889,7 @@ impl Inner {
         }
         {
             let shm = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
-            shm.slot.unpin();
+            shm.pins.close();
         }
         let presence = r
             .presence
@@ -4009,52 +4003,28 @@ impl Inner {
                 // read, so they must not hold this generation's pin back.
                 *a = Attachment {
                     shm,
-                    slot,
-                    pinned: false,
-                    live: Arc::new(AtomicUsize::new(0)),
+                    pins: crate::snapshot::ReaderPins::new(slot),
                 };
                 *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 // Start the new generation from the new writer's root.
                 r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
-            } else if !a.slot.is_owned() {
+            } else if !a.pins.slot().is_owned() {
                 // The writer judged this process dead and freed the slot (#834 review): its
                 // snapshots now fail as expired, and pinning there could overwrite another
                 // reader's pins. Claim a fresh slot; dropping the old handle leaves the old
                 // slot alone, since it no longer names this process.
-                a.slot = a.shm.claim_reader_slot(self.shared.vfs.current_process())?;
-                a.pinned = false;
-                a.live = Arc::new(AtomicUsize::new(0));
+                a.pins = crate::snapshot::ReaderPins::new(
+                    a.shm.claim_reader_slot(self.shared.vfs.current_process())?,
+                );
             }
-            // The pin protects the oldest live snapshot and every newer view. While snapshots
-            // of this generation are alive it stays put; once none is left it moves forward to
-            // this one, so a long-lived reader never blocks reclamation for ever.
-            let seqno = if durable {
-                a.shm.durable_seqno()
-            } else {
-                a.shm.visible_seqno()
-            };
-            let seqno = if a.pinned && a.live.load(Ordering::Acquire) > 0 {
-                // A durable seqno may be below the pin newer snapshots set: lower it, keeping
-                // their view (D227).
-                if durable {
-                    a.slot.lower_pin(seqno);
-                }
-                seqno
-            } else {
-                let view = a.shm.view_version();
-                let (s, _) = if durable {
-                    a.slot.pin_durable(seqno, view)
-                } else {
-                    a.slot.pin(seqno, view)
-                };
-                a.pinned = true;
-                s
-            };
-            a.live.fetch_add(1, Ordering::AcqRel);
+            // The slot pins exactly what this reader's live snapshots need: this one's seqno
+            // and view join them here, before the view is read (#693 PR 2).
+            let (seqno, key) = a.pins.take(&a.shm, durable);
             let live = Arc::new(LiveSnapshot {
-                count: Arc::clone(&a.live),
+                pins: Arc::clone(&a.pins),
+                key,
                 shm: a.shm.clone(),
-                slot: a.slot.ownership(),
+                slot: a.pins.slot().ownership(),
             });
             let shm = a.shm.clone();
             drop(guard);
