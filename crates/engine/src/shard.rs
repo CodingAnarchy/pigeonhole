@@ -4816,6 +4816,7 @@ impl ShardState {
     /// Whether any entry of `(table, row, family)` on this shard has a seqno above
     /// `snapshot` (optimistic validation). Reads of rows other shards own are theirs to check.
     fn conflicts(&mut self, snapshot: Seqno, read: &ReadKey) -> Result<bool> {
+        crate::hops::VAL[2].fetch_add(1, Ordering::Relaxed);
         let Some((tablet, shard)) = self.tablets.route(read.table, &read.row) else {
             return Ok(false);
         };
@@ -4839,6 +4840,7 @@ impl ShardState {
                             .hooks
                             .validate_entries
                             .fetch_add(1, Ordering::Relaxed);
+                        crate::hops::VAL[0].fetch_add(1, Ordering::Relaxed);
                         let (_, _, seqno, _) = split_suffix(it.key())?;
                         if seqno > snapshot {
                             return Ok(true);
@@ -4892,6 +4894,7 @@ impl ShardState {
                             .hooks
                             .validate_sst_entries
                             .fetch_add(1, Ordering::Relaxed);
+                        crate::hops::VAL[1].fetch_add(1, Ordering::Relaxed);
                         let (_, _, seqno, _) = split_suffix(it.key())?;
                         if seqno > snapshot {
                             found = true;

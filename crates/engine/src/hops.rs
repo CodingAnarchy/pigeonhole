@@ -46,6 +46,8 @@ static MAX: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
 // log2 buckets of each gap, for a p99.
 static HIST: [[AtomicU64; 40]; N] = [const { [const { AtomicU64::new(0) }; 40] }; N];
 static DONE: AtomicU64 = AtomicU64::new(0);
+/// SCRATCH: validation entries visited in memtables and in SSTs, and validations run.
+pub(crate) static VAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 pub(crate) fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
@@ -92,7 +94,7 @@ pub(crate) fn finish(id: u64) {
     SUM[N - 1].fetch_add(total, Ordering::Relaxed);
     let n = DONE.fetch_add(1, Ordering::Relaxed) + 1;
     if n % (1 << 13) == 0 {
-        let mut out = format!("HOPS n={n} total_mean_us={:.1}", SUM[N - 1].load(Ordering::Relaxed) as f64 / n as f64 / 1e3);
+        let mut out = format!("HOPS n={n} total_mean_us={:.1} val_mem_entries={} val_sst_entries={} validations={}", SUM[N - 1].load(Ordering::Relaxed) as f64 / n as f64 / 1e3, VAL[0].load(Ordering::Relaxed), VAL[1].load(Ordering::Relaxed), VAL[2].load(Ordering::Relaxed));
         for i in 0..N - 1 {
             let mean = SUM[i].load(Ordering::Relaxed) as f64 / n as f64 / 1e3;
             let mut seen = 0;
