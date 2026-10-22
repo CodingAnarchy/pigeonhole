@@ -41,7 +41,23 @@
 //! so a crash is the store dropped without a clean close and checked as a process crash
 //! (the WAL replays what the OS holds); fault plans and in-commit power losses are off, and
 //! the tests built on a scheduled power loss skip.
+//!
+//! **Failures recovered in place** (`Options::auto_recover`, D265, #620). With the option on
+//! and injected read and write errors (`FaultPlan::io_error_ppm`), a failed WAL write or
+//! manifest commit fails the instance and the supervisor swaps a reopened engine in behind
+//! the same handles. The run keeps them: a commit answered `OutcomeUnknown` (its own log
+//! write failed) is logged unacknowledged, one answered `Busy` (in flight at the failure:
+//! not committed) is retried on the recovered engine, and after every swap the store is
+//! read back and must match an allowed prefix of the commits from before the failure under
+//! a process crash's floor (the files are intact, so everything handed to them survived;
+//! only `None` records still in the stream's buffer, and the unacknowledged commit, may be
+//! missing), followed by every commit since. A commit made while the generation changed may
+//! have run on either engine, so both readings are tried. Past the budget, or on a failure
+//! the option does not cover, the run closes and reopens by hand, as the recovery guide
+//! says. An injected read error (`Io`) on a read is accepted: nothing to compare. The
+//! read-back and the opens run with the faults off; the supervisor's reopen runs under them.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::ops::Bound;
@@ -49,7 +65,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
-use pigeonhole::{Compaction, Durability, ErrorCode, Family, Options, Pigeonhole, Snapshot, Table};
+use pigeonhole::{
+    Compaction, Durability, ErrorCode, FailureCause, Family, Options, Pigeonhole, Recovery,
+    Snapshot, Table,
+};
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
@@ -61,6 +80,10 @@ use pigeonhole_sim::{
 const DB: &str = "model.phdb";
 /// A file whose handle dies with every other one at a crash: the liveness probe.
 const PROBE: &str = "probe";
+/// The recovery arm's injected error rate, per read or write, in parts per million: enough
+/// for most seeds to fail the instance at least once in a run, with some reaching the
+/// budget's give-up, and few enough that the supervisor's reopen usually succeeds.
+const IO_ERROR_PPM: u32 = 3_000;
 
 /// Rows are spread over several tables (deterministically by row) so batches span shards.
 const TABLES: [&str; 4] = ["t0", "t1", "t2", "t3"];
@@ -206,6 +229,9 @@ struct Config {
     /// never stored (D201). Defaults to `PIGEONHOLE_ROW_CACHE` (`1`: a 64 KiB cache, small
     /// enough to evict), else off.
     row_cache: usize,
+    /// `Options::auto_recover`: with `Recovery::Io`, a failure on an injected write error
+    /// is recovered in place and what survived is decided by reading back (the module doc).
+    recovery: Recovery,
 }
 
 /// The front door a run's operations use. Every result is checked against the model either
@@ -227,6 +253,20 @@ impl Front {
             _ => Front::Sync,
         }
     }
+}
+
+/// How a failure settled, with the recovery option on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Settled {
+    /// The supervisor swapped a reopened engine in.
+    Swapped,
+    /// Not failed, same generation: there was no failure to settle (a commit answered
+    /// `OutcomeUnknown` without one; it is still decided by reading back).
+    Healthy,
+    /// The supervisor gave up: the budget, or a reopen that failed for good.
+    GaveUp,
+    /// A failure the option does not cover: the handle stays failed.
+    Uncovered,
 }
 
 impl Config {
@@ -259,6 +299,7 @@ impl Config {
             } else {
                 0
             },
+            recovery: Recovery::Off,
         }
     }
 
@@ -268,6 +309,15 @@ impl Config {
         c.faults.reorder_unsynced = true;
         c.crash_ppm = 15_000;
         c.mid_commit_crash_ppm = 25_000;
+        c
+    }
+
+    /// One shard (so the read-back's prefix oracle applies, as for crashes), injected read
+    /// and write errors, and the recovery option on; no crashes.
+    fn recovering(ops: usize) -> Self {
+        let mut c = Self::quiet(ops, 1);
+        c.faults.io_error_ppm = IO_ERROR_PPM;
+        c.recovery = Recovery::Io;
         c
     }
 }
@@ -296,6 +346,18 @@ struct Stats {
     file_len: u64,
     /// Row cache hits over the run's handles (D201).
     row_cache_hits: u64,
+    /// With the recovery option on: recoveries in place, give-ups (then a reopen by hand),
+    /// commits answered `OutcomeUnknown` (decided by reading back), commits retried after a
+    /// failure refused them, injected read errors accepted on reads.
+    recoveries: usize,
+    gave_up: usize,
+    unknown_outcomes: usize,
+    retried: usize,
+    io_errors: usize,
+    /// Closes (before a reopen, or the final one) that found the instance failed: a
+    /// failure landed between the last look and the close, before the supervisor marked
+    /// it, so the close closed the failed engine as without the option (D265).
+    unclean_closes: usize,
 }
 
 struct Run {
@@ -322,6 +384,11 @@ struct Run {
     trace: Vec<String>,
     stats: Stats,
     deletes: Deletes,
+    /// The engine generation last seen (`recovery_stats().generation`): a change means the
+    /// supervisor swapped a reopened engine in since.
+    generation: u64,
+    /// Injected read errors accepted so far (a `Cell`: counted while a table is borrowed).
+    io_errors: Cell<usize>,
 }
 
 /// Every delete generated so far (lost ones too: dropping more is harmless), so `prepare`
@@ -599,12 +666,29 @@ impl Run {
             trace: Vec::new(),
             stats: Stats::default(),
             deletes: Deletes::default(),
+            generation: 0,
+            io_errors: Cell::new(0),
         };
         run.open()?;
         Ok(run)
     }
 
+    /// Opens the store and its tables. With injected errors in the plan, the open runs with
+    /// them off and they are on from then on (so the first open and a reopen by hand never
+    /// fail on one; the supervisor's reopen runs under them).
     fn open(&mut self) -> Result<(), String> {
+        let faults_off = self.cfg.faults.io_error_ppm > 0;
+        if faults_off {
+            self.vfs.set_faults(FaultPlan::none());
+        }
+        let opened = self.open_under_the_plan();
+        if faults_off {
+            self.vfs.set_faults(self.cfg.faults.clone());
+        }
+        opened
+    }
+
+    fn open_under_the_plan(&mut self) -> Result<(), String> {
         let mut options = Options::default()
             .vfs(Arc::clone(&self.store))
             .shards(self.cfg.shards)
@@ -613,24 +697,15 @@ impl Run {
             .block_cache(self.cfg.block_cache)
             .tablet_changes(self.cfg.tablet_changes)
             .row_cache(self.cfg.row_cache)
-            .row_cache_max_row(ROW_CACHE_MAX_ROW);
+            .row_cache_max_row(ROW_CACHE_MAX_ROW)
+            .auto_recover(self.cfg.recovery);
         if self.cfg.fast_balancer {
             // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
             options = options.tablet_balance(Duration::from_micros(15), 3, 8 << 10);
         }
         let db = Pigeonhole::open(self.root.join(DB), options).map_err(|e| format!("open: {e}"))?;
-        let mut tables = Vec::new();
-        for name in TABLES {
-            let mut builder = db.table(name).map_err(|e| e.to_string())?;
-            for f in families() {
-                builder = builder.family(&f.name, public_family(&f));
-            }
-            tables.push(
-                builder
-                    .create_if_missing()
-                    .map_err(|e| format!("table {name}: {e}"))?,
-            );
-        }
+        let tables = Self::open_tables(&db)?;
+        self.generation = db.recovery_stats().generation;
         self.db = Some((db, tables));
         self.probe = Some(
             self.store
@@ -656,6 +731,116 @@ impl Run {
             e.code()
         ));
         self.crash_and_recover(CrashKind::Power, true)
+    }
+
+    /// Every table's handle, created if missing.
+    fn open_tables(db: &Pigeonhole) -> Result<Vec<Table>, String> {
+        let mut tables = Vec::new();
+        for name in TABLES {
+            let mut builder = db.table(name).map_err(|e| e.to_string())?;
+            for f in families() {
+                builder = builder.family(&f.name, public_family(&f));
+            }
+            tables.push(
+                builder
+                    .create_if_missing()
+                    .map_err(|e| format!("table {name}: {e}"))?,
+            );
+        }
+        Ok(tables)
+    }
+
+    /// Whether the instance failed since the last look, with the recovery option on: it is
+    /// failed now, or the supervisor swapped a reopened engine in (the generation moved).
+    fn failed_over(&self) -> bool {
+        if self.cfg.recovery == Recovery::Off {
+            return false;
+        }
+        let db = self.db();
+        db.is_failed() || db.recovery_stats().generation != self.generation
+    }
+
+    /// An injected read error on a read (`FaultPlan::io_error_ppm`): accepted, nothing to
+    /// compare. A read on a failed instance is not one: `failed_over` is checked first.
+    fn injected(&self, e: &pigeonhole::Error) -> bool {
+        let injected = self.cfg.faults.io_error_ppm > 0 && e.code() == ErrorCode::Io;
+        if injected {
+            self.io_errors.set(self.io_errors.get() + 1);
+        }
+        injected
+    }
+
+    /// Waits for the supervisor to settle a failure: the swap, a give-up, or a failure the
+    /// option does not cover (the handle stays failed with a cause other than `Io`).
+    fn settle(&mut self) -> Result<Settled, String> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let (failed, stats, failure) = {
+                let db = self.db();
+                (db.is_failed(), db.recovery_stats(), db.failure())
+            };
+            if stats.gave_up {
+                return Ok(Settled::GaveUp);
+            }
+            if !failed {
+                if stats.generation == self.generation {
+                    return Ok(Settled::Healthy);
+                }
+                self.generation = stats.generation;
+                return Ok(Settled::Swapped);
+            }
+            if failure.is_some_and(|f| !matches!(f.cause, FailureCause::Io)) {
+                return Ok(Settled::Uncovered);
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "the recovery did not settle in 60 s: {stats:?}, failure {failure:?}"
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// The instance failed with the recovery option on (an injected write error poisoned the
+    /// shard, or a manifest commit failed): waits for the supervisor to settle, then checks
+    /// what survived by reading back (`check_survivors`). `since` is this step's commit,
+    /// unacknowledged (`OutcomeUnknown`) or acknowledged while the generation changed. Past
+    /// the budget, or on a failure the option does not cover, closes and reopens by hand, as
+    /// the recovery guide says.
+    fn recover_in_place(&mut self, why: &str, since: Option<Logged>) -> Result<(), String> {
+        self.trace.push(format!("  -> the instance failed ({why})"));
+        match self.settle()? {
+            Settled::Swapped => {
+                self.stats.recoveries += 1;
+                let stats = self.db().recovery_stats();
+                self.trace.push(format!(
+                    "RECOVERED IN PLACE: generation {}, {} recoveries, from {:?} in {:?}",
+                    stats.generation, stats.recoveries, stats.last_failure, stats.last_recovery
+                ));
+                // The recovery guide says to open new table handles; stale ones keep
+                // working through the handle's fallback. Alternate, so both paths run.
+                if self.stats.recoveries.is_multiple_of(2) {
+                    let tables = Self::open_tables(self.db())?;
+                    self.db.as_mut().expect("open").1 = tables;
+                }
+            }
+            Settled::Healthy => {
+                self.trace.push("  -> not failed, same generation".into());
+            }
+            settled @ (Settled::GaveUp | Settled::Uncovered) => {
+                self.stats.gave_up += 1;
+                let stats = self.db().recovery_stats();
+                self.trace.push(format!(
+                    "GAVE UP ({settled:?}: {stats:?}, failure {:?}): closing and reopening by hand",
+                    self.db().failure()
+                ));
+                self.note_row_cache();
+                self.drop_handles();
+                self.open()?;
+            }
+        }
+        self.snaps.clear();
+        self.check_survivors(Some(CrashKind::Process), since)
     }
 
     fn db(&self) -> &Pigeonhole {
@@ -989,9 +1174,8 @@ impl Run {
     /// commit's record sits in the stream's buffer until the next stronger commit's write, a
     /// flush or a clean close carries it (decision #50). An unacknowledged commit counts as
     /// `Durability::None` (D42).
-    fn stream_commits(&self) -> Vec<StreamCommit> {
-        self.log
-            .iter()
+    fn stream_commits(log: &[Logged]) -> Vec<StreamCommit> {
+        log.iter()
             .map(|c| StreamCommit {
                 ops: c.ops.clone(),
                 commit_ts: c.ts,
@@ -1005,47 +1189,106 @@ impl Run {
             .collect()
     }
 
-    /// Reopens and finds which commits survived: after a crash, the longest prefix of the
-    /// stream whose recovered commits (`recovered_from_records`) keep every commit the
-    /// crash's floor promised (`check_acknowledged_survive`) and whose model
-    /// (`Model::from_commits`) matches the store. Without a crash, every commit.
+    /// Reopens and finds which commits survived (`check_survivors`).
     fn recover(&mut self, kind: Option<CrashKind>) -> Result<(), String> {
         self.snaps.clear();
         self.open()?;
-        let commits = self.stream_commits();
-        let hi = commits.len();
-        let stream = [(0..hi).map(StreamRecord::Single).collect::<Vec<_>>()];
+        self.check_survivors(kind, None)
+    }
+
+    /// Finds which commits survived by reading the store back: after a crash (or a failure
+    /// recovered in place, `kind` a process crash's floor), the longest prefix of the
+    /// stream whose recovered commits (`recovered_from_records`) keep every commit the
+    /// crash's floor promised (`check_acknowledged_survive`) and whose model
+    /// (`Model::from_commits`) matches the store. Without a crash, every commit. `since` is
+    /// a commit this step made at a failure: unacknowledged, it ends the prefix's commits
+    /// and may be lost; acknowledged while the generation changed, it ran on either the
+    /// failed engine (it is one of the prefix's commits) or the recovered one (it follows
+    /// the prefix), and both readings are tried.
+    fn check_survivors(
+        &mut self,
+        kind: Option<CrashKind>,
+        since: Option<Logged>,
+    ) -> Result<(), String> {
+        let got = self.dump_recovered()?;
         let now = self.now();
-        let got = self.dump().map_err(|e| format!("dump after reopen: {e}"))?;
+        let before = std::mem::take(&mut self.log);
+        let candidates: Vec<(Vec<Logged>, Vec<Logged>)> = match since {
+            None => vec![(before, Vec::new())],
+            Some(c) if c.acked => {
+                let mut with = before.clone();
+                with.push(c.clone());
+                vec![(with, Vec::new()), (before, vec![c])]
+            }
+            Some(c) => {
+                let mut with = before;
+                with.push(c);
+                vec![(with, Vec::new())]
+            }
+        };
         let mut shortest = None;
-        for n in (0..=hi).rev() {
-            let survivors = recovered_from_records(&stream, &[n]);
-            let allowed = match kind {
-                None => n == hi,
-                Some(kind) => check_acknowledged_survive(&commits, &survivors, kind).is_ok(),
-            };
-            if !allowed {
-                // Shorter prefixes lose that commit too.
-                break;
-            }
-            let m = Model::from_commits(create_tables, survivors.iter().map(|&i| &commits[i]));
-            let want = Self::model_dump(&m, now);
-            if want == got {
-                self.trace.push(format!("RECOVERED {n} of {hi} commits"));
-                self.log = survivors.iter().map(|&i| self.log[i].clone()).collect();
-                for c in &mut self.log {
-                    c.acked = true;
+        // Every prefix tried, with the first difference of each (the error names them all:
+        // a prefix that fails on one row while a shorter one fails on another is the sign
+        // of a commit that survived in part).
+        let mut tried: Vec<String> = Vec::new();
+        for (old, new) in candidates {
+            let commits = Self::stream_commits(&old);
+            let later = Self::stream_commits(&new);
+            let hi = commits.len();
+            let stream = [(0..hi).map(StreamRecord::Single).collect::<Vec<_>>()];
+            for n in (0..=hi).rev() {
+                let survivors = recovered_from_records(&stream, &[n]);
+                let allowed = match kind {
+                    None => n == hi,
+                    Some(kind) => check_acknowledged_survive(&commits, &survivors, kind).is_ok(),
+                };
+                if !allowed {
+                    // Shorter prefixes lose that commit too.
+                    break;
                 }
-                self.model = m;
-                return Ok(());
+                let m = Model::from_commits(
+                    create_tables,
+                    survivors.iter().map(|&i| &commits[i]).chain(&later),
+                );
+                let want = Self::model_dump(&m, now);
+                if want == got {
+                    self.trace.push(format!(
+                        "RECOVERED {n} of {hi} commits{}",
+                        if new.is_empty() {
+                            String::new()
+                        } else {
+                            format!(", then {} on the recovered engine", new.len())
+                        }
+                    ));
+                    self.log = survivors
+                        .iter()
+                        .map(|&i| old[i].clone())
+                        .chain(new)
+                        .collect();
+                    for c in &mut self.log {
+                        c.acked = true;
+                    }
+                    self.model = m;
+                    return Ok(());
+                }
+                tried.push(format!(
+                    "prefix {n} of {hi}{}: {}",
+                    if new.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" + {}", new.len())
+                    },
+                    first_diff(&got, &want).unwrap_or_default()
+                ));
+                shortest = Some((n, hi, want));
             }
-            shortest = Some((n, want));
         }
-        let (n, want) = shortest.unwrap_or_default();
+        let (n, hi, want) = shortest.unwrap_or_default();
         Err(format!(
             "recovered state matches no allowed prefix (from {hi} commits down to {n}); vs \
-             the shortest: {}",
-            first_diff(&got, &want).unwrap_or_default()
+             the shortest: {}\n  tried:\n    {}",
+            first_diff(&got, &want).unwrap_or_default(),
+            tried.join("\n    ")
         ))
     }
 
@@ -1095,14 +1338,31 @@ impl Run {
     }
 
     fn reopen(&mut self) -> Result<(), String> {
+        if self.failed_over() {
+            self.recover_in_place("seen before a reopen", None)?;
+        }
         self.stats.reopens += 1;
         self.trace.push("REOPEN".into());
         self.snaps.clear();
         self.note_row_cache();
         let (db, tables) = self.db.take().expect("open");
         drop(tables);
-        db.close().map_err(|e| format!("close: {e}"))?;
-        self.recover(None)
+        // With the recovery option on, a failure can land between the look above and the
+        // close: marked by the supervisor, the close settles it and closes what the handle
+        // ended on; not yet marked, it closes the failed engine as without the option,
+        // unclean (D265). So the reopen is checked under a process crash's floor, as a
+        // recovery is.
+        let arm = self.cfg.recovery != Recovery::Off;
+        match self.close_traced(db) {
+            Ok(()) => {}
+            Err(e) if arm => {
+                self.stats.unclean_closes += 1;
+                self.trace
+                    .push(format!("  -> the close was not clean: {e}"));
+            }
+            Err(e) => return Err(format!("close: {e}")),
+        }
+        self.recover(if arm { Some(CrashKind::Process) } else { None })
     }
 
     /// Adds the open handle's row cache hits to the run's.
@@ -1112,11 +1372,96 @@ impl Run {
         }
     }
 
-    fn compare_dump(&self, when: &str) -> Result<(), String> {
-        let got = self.dump().map_err(|e| format!("dump {when}: {e}"))?;
+    /// Runs `f` with the plan's injected errors off meanwhile: the read-back and a clean
+    /// close are the checker's work, not the store's, and either would fail on one now and
+    /// then (a close's final flush, say).
+    fn without_faults<T>(&self, f: impl FnOnce() -> T) -> T {
+        if self.cfg.faults.io_error_ppm == 0 {
+            return f();
+        }
+        self.vfs.set_faults(FaultPlan::none());
+        let out = f();
+        self.vfs.set_faults(self.cfg.faults.clone());
+        out
+    }
+
+    fn dump_without_faults(&self) -> pigeonhole::Result<Rows> {
+        self.without_faults(|| self.dump())
+    }
+
+    /// Closes `db` with the faults off and, with the recovery option on, the engine's close
+    /// protocol traced to stderr: a close that never returns (#838) then leaves the last
+    /// `try_finish_close` line, with the stage and every counter it waits on, in the log.
+    fn close_traced(&self, db: Pigeonhole) -> pigeonhole::Result<()> {
+        let trace = self.cfg.recovery != Recovery::Off;
+        if trace {
+            pigeonhole_engine::set_tracing(true);
+        }
+        let result = self.without_faults(|| db.close());
+        if trace {
+            pigeonhole_engine::set_tracing(false);
+        }
+        result
+    }
+
+    /// Drops the handles, closing the engine (`close_traced`); errors ignored.
+    fn drop_handles(&mut self) {
+        if let Some((db, tables)) = self.db.take() {
+            drop(tables);
+            let _ = self.close_traced(db);
+        }
+    }
+
+    /// The read-back's dump. With the recovery option on, another failure can be under way
+    /// (one that landed before the faults went off, its recovery still running): the swap
+    /// then expires the dump's snapshot midway, or the dump finds the instance closed. It
+    /// is settled like the first (the survivors are the same: nothing committed meanwhile,
+    /// and what the first reopen replayed is in the log for the next) and the dump runs
+    /// again, a bounded number of times.
+    fn dump_recovered(&mut self) -> Result<Rows, String> {
+        for _ in 0..4 {
+            match self.dump_without_faults() {
+                Ok(rows) => return Ok(rows),
+                Err(e)
+                    if self.cfg.recovery != Recovery::Off
+                        && matches!(
+                            e.code(),
+                            ErrorCode::SnapshotExpired | ErrorCode::Closed | ErrorCode::Busy
+                        ) =>
+                {
+                    self.trace
+                        .push(format!("  -> the read-back's dump failed ({e}); settling"));
+                    match self.settle()? {
+                        Settled::Swapped => self.stats.recoveries += 1,
+                        Settled::Healthy => {}
+                        settled @ (Settled::GaveUp | Settled::Uncovered) => {
+                            self.stats.gave_up += 1;
+                            self.trace
+                                .push(format!("GAVE UP ({settled:?}) during a read-back"));
+                            self.note_row_cache();
+                            self.drop_handles();
+                            self.open()?;
+                        }
+                    }
+                    self.snaps.clear();
+                }
+                Err(e) => return Err(format!("dump after reopen: {e}")),
+            }
+        }
+        Err("the read-back's dump kept failing on recoveries".into())
+    }
+
+    fn compare_dump(&mut self, when: &str) -> Result<(), String> {
+        let got = self
+            .dump_without_faults()
+            .map_err(|e| format!("dump {when}: {e}"))?;
         let want = Self::model_dump(&self.model, self.now());
         match first_diff(&got, &want) {
             None => Ok(()),
+            // A failure landed since the last step: what survived it is read back instead.
+            Some(_) if self.failed_over() => {
+                self.recover_in_place(&format!("seen at the dump {when}"), None)
+            }
             Some(d) => Err(format!("state {when}: {d}")),
         }
     }
@@ -1158,6 +1503,7 @@ impl Run {
                 }
                 if matches!(&result, Err(e) if e.code() == ErrorCode::Busy)
                     && !self.snaps.is_empty()
+                    && !self.failed_over()
                 {
                     // The memtable arena is full of memtables this run's snapshots hold and
                     // nothing is left to flush: on this frozen clock the engine refuses the
@@ -1169,6 +1515,52 @@ impl Run {
                     self.compare_dump("after a commit refused with Busy")?;
                     self.snaps.clear();
                     result = self.commit(&ops, durability, async_front);
+                }
+                // With the recovery option on: what a commit sees at a failure (D265).
+                if self.cfg.recovery != Recovery::Off {
+                    let mut retried = false;
+                    loop {
+                        match &result {
+                            Err(e) if e.code() == ErrorCode::OutcomeUnknown => {
+                                // Its own log write failed: unacknowledged, and decided by
+                                // reading back once the recovery settled.
+                                self.stats.unknown_outcomes += 1;
+                                let why = format!("{e} ({:?})", e.code());
+                                let since = Logged {
+                                    ops,
+                                    ts: now,
+                                    durability,
+                                    acked: false,
+                                };
+                                return self.recover_in_place(&why, Some(since));
+                            }
+                            Err(e) if self.failed_over() => {
+                                // In flight at the failure (`Busy`), or refused by the
+                                // failed engine: not committed. Settle, read back, and
+                                // retry it once on the recovered engine.
+                                let why = format!("{e} ({:?})", e.code());
+                                self.recover_in_place(&why, None)?;
+                                if retried {
+                                    self.trace
+                                        .push("  -> refused again: not committed, skipped".into());
+                                    return Ok(());
+                                }
+                                retried = true;
+                                self.stats.retried += 1;
+                                self.trace.push("  -> the commit is retried".into());
+                                result = self.commit(&ops, durability, async_front);
+                            }
+                            Err(e) if e.code() == ErrorCode::Busy => {
+                                // A wait for room ends with `Busy` once four flushes in a
+                                // row failed on injected errors: not committed, and the
+                                // store still matches the model without it.
+                                self.stats.busy += 1;
+                                self.trace.push("BUSY: not committed, skipped".into());
+                                return self.compare_dump("after a commit refused with Busy");
+                            }
+                            _ => break,
+                        }
+                    }
                 }
                 match result {
                     Ok(()) => {
@@ -1182,6 +1574,14 @@ impl Run {
                             durability,
                             acked: true,
                         });
+                        if self.failed_over() {
+                            // The generation moved while the commit ran, or the instance
+                            // failed right after it: it ran on either engine (both readings
+                            // are read back).
+                            let since = self.log.pop();
+                            return self
+                                .recover_in_place("seen after an acknowledged commit", since);
+                        }
                     }
                     Err(e) if armed && self.fired() => {
                         // The power loss hit the commit: unacknowledged, it may have landed.
@@ -1234,6 +1634,10 @@ impl Run {
                     (Err(e), _) if self.armed && self.fired() => {
                         return self.recover_fired(&e);
                     }
+                    (Err(e), _) if self.failed_over() => {
+                        return self.recover_in_place(&format!("read: {e}"), None);
+                    }
+                    (Err(e), _) if self.injected(&e) => {}
                     (g, w) => {
                         return Err(format!(
                             "get {}/{family}:{} (model seqno {ms}): store {g:?} vs model {w:?}",
@@ -1259,6 +1663,10 @@ impl Run {
                     (Err(e), _) if self.armed && self.fired() => {
                         return self.recover_fired(&e);
                     }
+                    (Err(e), _) if self.failed_over() => {
+                        return self.recover_in_place(&format!("read: {e}"), None);
+                    }
+                    (Err(e), _) if self.injected(&e) => {}
                     (g, w) => {
                         return Err(format!(
                             "row read {} (model seqno {ms}): store {g:?} vs model {w:?}",
@@ -1292,6 +1700,10 @@ impl Run {
                         (Err(e), _) if self.armed && self.fired() => {
                             return self.recover_fired(&e);
                         }
+                        (Err(e), _) if self.failed_over() => {
+                            return self.recover_in_place(&format!("read: {e}"), None);
+                        }
+                        (Err(e), _) if self.injected(&e) => {}
                         (g, w) => {
                             return Err(format!(
                                 "latest row read {} {names:?} (model seqno {ms}): store {g:?} \
@@ -1350,6 +1762,10 @@ impl Run {
                         (Err(e), _) if self.armed && self.fired() => {
                             return self.recover_fired(&e);
                         }
+                        (Err(e), _) if self.failed_over() => {
+                            return self.recover_in_place(&format!("read: {e}"), None);
+                        }
+                        (Err(e), _) if self.injected(&e) => {}
                         (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
                             if e.code() == ErrorCode::MergeFailed => {}
                         (g, w) => {
@@ -1366,6 +1782,9 @@ impl Run {
                 let s = match self.db().snapshot() {
                     Ok(s) => s,
                     Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
+                    Err(e) if self.failed_over() => {
+                        return self.recover_in_place(&format!("snapshot: {e}"), None);
+                    }
                     Err(e) => return Err(format!("snapshot: {e}")),
                 };
                 self.snaps.push((s, self.model.snapshot()));
@@ -1385,6 +1804,17 @@ impl Run {
             match result {
                 Ok(()) => {}
                 Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
+                Err(e) if self.failed_over() => {
+                    return self.recover_in_place(&format!("flush: {e}"), None);
+                }
+                // An injected error failed it (it is retried in the background), or a
+                // wait for room ended with `Busy` after flushes failed on them.
+                Err(e)
+                    if self.injected(&e)
+                        || (self.cfg.recovery != Recovery::Off && e.code() == ErrorCode::Busy) =>
+                {
+                    self.trace.push(format!("  -> flush failed: {e}"));
+                }
                 Err(e) => return Err(format!("flush failed: {e} ({:?})", e.code())),
             }
         }
@@ -1399,8 +1829,24 @@ impl Run {
             match result {
                 Ok(()) => {}
                 Err(e) if self.armed && self.fired() => return self.recover_fired(&e),
+                Err(e) if self.failed_over() => {
+                    return self.recover_in_place(&format!("compact: {e}"), None);
+                }
+                // An injected error failed it (it is retried in the background), or a
+                // wait for room ended with `Busy` after flushes failed on them.
+                Err(e)
+                    if self.injected(&e)
+                        || (self.cfg.recovery != Recovery::Off && e.code() == ErrorCode::Busy) =>
+                {
+                    self.trace.push(format!("  -> compact failed: {e}"));
+                }
                 Err(e) => return Err(format!("compact failed: {e} ({:?})", e.code())),
             }
+        }
+        if self.failed_over() {
+            // A background write failed (a flush's manifest commit, a spare segment's
+            // zero-fill): nothing the step did saw it.
+            return self.recover_in_place("seen at the end of the step", None);
         }
         if self.armed && rng.chance(self.cfg.reopen_ppm.max(self.cfg.crash_ppm)) {
             // The scheduled power loss, whether or not it has fired yet.
@@ -1447,6 +1893,10 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
         at("final dump".into());
         result = run.compare_dump("at the end");
     }
+    if result.is_ok() && run.failed_over() {
+        at("a failure before the final close".into());
+        result = run.recover_in_place("seen before the final close", None);
+    }
     at("final close".into());
     match result {
         Ok(()) => {
@@ -1457,9 +1907,20 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
                 run.stats.file_len = f.len().unwrap_or(0);
             }
             run.note_row_cache();
+            run.stats.io_errors = run.io_errors.get();
             if let Some((db, tables)) = run.db.take() {
                 drop(tables);
-                db.close().map_err(|e| format!("final close: {e}"))?;
+                // With the recovery option on, a failure the supervisor has not marked yet
+                // can land right before the close, which then closes the failed engine as
+                // without the option (D265, unclean): accepted, as at a reopen.
+                match run.close_traced(db) {
+                    Ok(()) => {}
+                    Err(e) if run.cfg.recovery != Recovery::Off => {
+                        run.stats.unclean_closes += 1;
+                        eprintln!("seed {seed}: the final close was not clean: {e}");
+                    }
+                    Err(e) => return Err(format!("final close: {e}")),
+                }
             }
             Ok(run.stats)
         }
@@ -1500,12 +1961,13 @@ fn seed_timeout() -> Duration {
 /// outlives [`seed_timeout`] is reported with its test, configuration and the step it was
 /// on, and the process aborts, so a hang fails fast and names itself instead of eating the
 /// job's timeout (#244, #209).
-fn check(cfg: &Config) {
+fn check(cfg: &Config) -> Vec<Stats> {
     let test = std::thread::current().name().unwrap_or("?").to_owned();
     let limit = seed_timeout();
     // Row cache hits over every seed: a crash-heavy seed may hit none (each crash empties
     // the cache), but a test whose seeds never hit is not testing the cache (D201).
     let (mut reads, mut row_cache_hits) = (0, 0);
+    let mut all = Vec::new();
     for seed in seeds() {
         let started = Instant::now();
         let progress = Arc::new(Mutex::new(String::new()));
@@ -1524,6 +1986,7 @@ fn check(cfg: &Config) {
                 eprintln!("seed {seed}: {stats:?} in {:?}", started.elapsed());
                 reads += stats.reads;
                 row_cache_hits += stats.row_cache_hits;
+                all.push(stats);
             }
             Ok(Err(e)) => panic!("{e}"),
             Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -1540,6 +2003,57 @@ fn check(cfg: &Config) {
                     cfg.tablet_changes,
                     cfg.deferred_io
                 );
+                // Every thread's stack, where gdb can attach: what the hung thread waits
+                // on, when nothing else shows it (#838). Only on CI (`CI` is set on the
+                // runners, where root bypasses ptrace_scope) or on request
+                // (`PIGEONHOLE_HUNG_STACKS=1`), never on a developer's machine by itself;
+                // bounded by `timeout`, so gdb cannot hold the job.
+                if std::env::var_os("CI").is_some()
+                    || std::env::var("PIGEONHOLE_HUNG_STACKS").is_ok_and(|v| v == "1")
+                {
+                    let pid = std::process::id().to_string();
+                    // Every thread's stack, then the shard threads' state: `shard_main`'s
+                    // locals hold the `ShardState` (its close stage, what it waits for).
+                    let script = std::env::temp_dir().join(format!("hung-{pid}.gdb"));
+                    let _ = std::fs::write(
+                        &script,
+                        "set pagination off\nset print pretty on\nset print elements 400\n\
+                         thread apply all bt 30\n\
+                         define dumpshard\n  frame 5\n  info frame\n  info locals\nend\n\
+                         thread apply all -s dumpshard\n",
+                    );
+                    for cmd in [&["sudo", "-n", "gdb"][..], &["gdb"][..]] {
+                        let out = std::process::Command::new("timeout")
+                            .args(["-k", "5", "90"])
+                            .args(cmd)
+                            .args(["--batch", "-p", &pid, "-x"])
+                            .arg(&script)
+                            .output();
+                        match out {
+                            Ok(o) if o.status.success() => {
+                                let _ = writeln!(std::io::stderr(), "HUNG: thread stacks (gdb):");
+                                let _ = std::io::stderr().write_all(&o.stdout);
+                                break;
+                            }
+                            Ok(o) => {
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "HUNG: {} failed ({}): {}",
+                                    cmd.join(" "),
+                                    o.status,
+                                    String::from_utf8_lossy(&o.stderr).trim()
+                                );
+                            }
+                            Err(e) => {
+                                let _ = writeln!(
+                                    std::io::stderr(),
+                                    "HUNG: {} could not run: {e}",
+                                    cmd.join(" ")
+                                );
+                            }
+                        }
+                    }
+                }
                 // What the shards do from here on, if anything (#244).
                 pigeonhole_engine::set_tracing(true);
                 std::thread::sleep(Duration::from_secs(5));
@@ -1559,6 +2073,7 @@ fn check(cfg: &Config) {
         cfg.row_cache == 0 || reads < 500 || row_cache_hits > 0,
         "{test}: the row cache never hit in {reads} reads"
     );
+    all
 }
 
 #[test]
@@ -1576,6 +2091,22 @@ fn crashes_and_reopens_match_a_durable_prefix() {
 /// The sync/async parity suite (#42): every commit, get, row read and scan through the async
 /// front door, checked against the same model the sync runs are.
 #[cfg(feature = "async")]
+#[test]
+fn io_failures_are_recovered_in_place_and_match_a_durable_prefix() {
+    if real_fs() {
+        eprintln!("skipped with PIGEONHOLE_REAL_FS: injected errors need the simulator");
+        return;
+    }
+    // D265's arm (#620): injected read and write errors with `Recovery::Io` on; every
+    // failure the supervisor recovers from is checked by reading back (the module doc).
+    let stats = check(&Config::recovering(1000));
+    let recoveries: usize = stats.iter().map(|s| s.recoveries).sum();
+    assert!(
+        recoveries > 0,
+        "no failure was recovered in place: {stats:?}"
+    );
+}
+
 #[test]
 fn quiet_runs_through_the_async_front_door_match_the_model() {
     for shards in [1, 4] {
