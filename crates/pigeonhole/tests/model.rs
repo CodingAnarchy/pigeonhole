@@ -861,6 +861,8 @@ impl Run {
             }
             settled @ (Settled::GaveUp | Settled::Uncovered) => {
                 self.stats.gave_up += 1;
+                // No recovery to count: a later random one must not pass as the forced one's.
+                self.forced_pending = false;
                 let stats = self.db().recovery_stats();
                 self.trace.push(format!(
                     "GAVE UP ({settled:?}: {stats:?}, failure {:?}): closing and reopening by hand",
@@ -1468,6 +1470,8 @@ impl Run {
                         Settled::Healthy => {}
                         settled @ (Settled::GaveUp | Settled::Uncovered) => {
                             self.stats.gave_up += 1;
+                            // As in `recover_in_place`: nothing for the forced failure.
+                            self.forced_pending = false;
                             self.trace
                                 .push(format!("GAVE UP ({settled:?}) during a read-back"));
                             self.note_row_cache();
@@ -1547,7 +1551,10 @@ impl Run {
                     plan.fail_on = Some("-wal-");
                     self.vfs.set_faults(plan);
                 }
-                if !self.armed && rng.chance(self.cfg.mid_commit_crash_ppm) {
+                // A forced commit arms no mid-commit crash: arming replaces the fault plan,
+                // which would drop the forced failure. The draw is still taken, so the seed's
+                // later draws are the same whether or not this commit was the forced one.
+                if !self.armed && rng.chance(self.cfg.mid_commit_crash_ppm) && !forced {
                     self.armed = true;
                     let mut plan = self.cfg.faults.clone();
                     plan.crash_after_ops = Some(self.vfs.mutating_ops() + 1 + rng.below(6));

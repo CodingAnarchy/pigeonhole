@@ -1268,9 +1268,6 @@ enum Outcome {
     Cas(Result<(bool, Option<pigeonhole_engine::CommitInfo>), Error>),
 }
 
-/// An in-flight commit, polled between scheduler steps. Every kind goes through the
-/// engine's non-blocking API, so no OS thread or real-time wait takes part and a seed
-/// replays exactly (#590).
 /// What [`World::take_outcome`] asks of its poll.
 enum Resolved {
     Done,
@@ -1278,6 +1275,9 @@ enum Resolved {
     Crashed,
 }
 
+/// An in-flight commit, polled between scheduler steps. Every kind goes through the
+/// engine's non-blocking API, so no OS thread or real-time wait takes part and a seed
+/// replays exactly (#590).
 enum Pending {
     Poll(PendingCommit),
     Check(pigeonhole_engine::PendingCheck),
@@ -3908,6 +3908,14 @@ impl World {
                 }
                 self.stats.conflicts += 1;
                 self.trace.push("  -> conflict".into());
+                self.aborted.push(inf.commit);
+            }
+            Outcome::Commit(Err(Error::Closed)) | Outcome::Cas(Err(Error::Closed)) if dead => {
+                // `Closed` means not committed (D227). With the store dead the live arm's
+                // shard-death test can't be asked, but the refusal stands, so it is aborted:
+                // the stricter reading (perf287's review of #882).
+                self.trace
+                    .push("  -> refused as the store died: not committed".into());
                 self.aborted.push(inf.commit);
             }
             Outcome::Commit(Err(e)) | Outcome::Cas(Err(e))
