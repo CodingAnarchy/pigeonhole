@@ -200,7 +200,7 @@ impl Pigeonhole {
     /// of the transaction's reads failed with an error the policy retries (a recovery
     /// expiring its snapshot), the attempt is retried whatever `body` returned, even if it
     /// swallowed that error and gave up for another reason: the snapshot is gone either way.
-    /// Only [`Transaction::get`] reads count; a failed
+    /// [`Transaction::get`] and [`Transaction::get_row`] reads count; a failed
     /// [`get_async`](Transaction::get_async) does not. A commit that fails with a retried
     /// error (a `Conflict`, or `SnapshotExpired` when a recovery refused it) is retried;
     /// anything else is returned as is.

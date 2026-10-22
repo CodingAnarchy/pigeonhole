@@ -5,7 +5,8 @@
 ## Change
 
 **`pigeonhole::Transaction`:**
-- **`get_row(&mut self, table: &Table, row: &[u8], families: &[&str]) -> Result<Option<RowRef<'_>>>`:** reads the row at the transaction's snapshot, the newest version of each column, and records a read of every family it covers: `families`, or every family of the table when empty.
+- **`get_row(&mut self, table: &Table, row: &[u8], families: &[&str]) -> Result<Option<RowRef<'_>>>`:** reads the row at the transaction's snapshot, the newest version of each column, and records a read of every family it covers: `families`, or every family of the table **at the snapshot** when empty.
+  - A family created after the snapshot is neither returned nor recorded. That's consistent: the transaction serializes before that family's creation and any write into it, since it read nothing they wrote.
   - A family the row has no cell in still counts as read, so a commit that adds one (or creates the row) conflicts.
   - A failed read is recorded like `get`'s for `Pigeonhole::transact`'s retry decision (ICR 0060).
   - An unknown family is `FamilyNotFound`.
