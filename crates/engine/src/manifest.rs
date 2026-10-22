@@ -815,7 +815,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     // Counters go with every commit: ids, the seqno ceiling and the timestamp floor.
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.next_blob_file = shared.blob_ids.load(Ordering::Relaxed);
-    catalog.counters.seqno_ceiling = shared.shm.next_seqno();
+    catalog.counters.seqno_ceiling = shared.clock.next_seqno();
     catalog.counters.ts_floor = shared
         .ts_floors
         .iter()

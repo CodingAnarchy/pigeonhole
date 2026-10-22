@@ -479,6 +479,9 @@ pub(crate) struct Shared {
     pub failure: crate::health::FailureRecord,
     pub close: CloseState,
     pub metrics: Vec<ShardMetrics>,
+    /// The one seqno allocator (D271): every reservation goes through it, and shm
+    /// `NEXT_SEQNO` mirrors it.
+    pub clock: crate::clock::Reservation,
     /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits
     /// and by coordinators choosing a cross-shard commit timestamp.
     pub ts_floors: Vec<Padded>,
@@ -4705,8 +4708,8 @@ impl ShardState {
     fn reserve(&mut self, n: u64) -> Seqno {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
-        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
-        let first = shm.reserve_seqnos(n);
+        shm.publish_pending(shard, self.watermark().min(self.shared.clock.next_seqno()));
+        let first = self.shared.clock.reserve(n, shm);
         shm.publish_pending(shard, self.watermark().min(first));
         first
     }
@@ -7106,7 +7109,7 @@ impl ShardState {
         // It stays unique for the database's life as D26's seqno id did: recovery raises
         // `next_seqno` above every replayed PREPARE's. The seqno the commit applies at, and
         // its timestamp, are picked at the decision (`decide_commit`).
-        let seqno = self.shared.shm.reserve_seqnos(1);
+        let seqno = self.shared.clock.reserve(1, &self.shared.shm);
         let commit_ts: Timestamp = 0;
         let priority = (
             req.submitted_at,
