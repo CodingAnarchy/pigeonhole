@@ -41,6 +41,8 @@ pub(crate) struct Db {
     reopen: Option<(Options, PathBuf)>,
     /// `Options::write_stall_timeout`: how long an operation waits for a recovery's swap.
     stall_timeout: Duration,
+    /// Transaction outcomes since open (ICR 0061).
+    pub(crate) txn_counts: crate::retry::TxnCounts,
 }
 
 /// The engine an operation runs on, held for the operation: the handle's cached `Arc`
@@ -169,6 +171,7 @@ impl Db {
             supervision,
             reopen,
             stall_timeout,
+            txn_counts: Default::default(),
         })
     }
 
@@ -758,7 +761,9 @@ impl Pigeonhole {
     /// from 0 at open, so take two readings and subtract for an interval; see
     /// [`EngineMetrics`](crate::EngineMetrics) for each field. Cheap and non-blocking.
     pub fn engine_metrics(&self) -> crate::EngineMetrics {
-        self.engine().metrics().into()
+        let mut m: crate::EngineMetrics = self.engine().metrics().into();
+        self.db.txn_counts.fill(&mut m);
+        m
     }
 
     /// Commit latency histograms per durability level since open, summed over shards: a

@@ -169,6 +169,16 @@ pub struct EngineMetrics {
     pub visibility_woken: u64,
     /// Waits and wake passes that found the waiters' lock held by another thread.
     pub visibility_contended: u64,
+    /// Transactions committed through this handle since open, write-free ones included
+    /// (ICR 0061). Unlike the engine's counters, the three transaction counters span
+    /// automatic recoveries (`Options::auto_recover`).
+    pub transactions: u64,
+    /// Transaction commits that failed with [`ErrorCode::Conflict`](crate::ErrorCode::Conflict).
+    /// Over `transactions + transaction_conflicts`, the conflict rate.
+    pub transaction_conflicts: u64,
+    /// Attempts [`Pigeonhole::transact`](crate::Pigeonhole::transact) retried, for any
+    /// reason its policy retries.
+    pub transaction_retries: u64,
     /// Cross-shard commits' two-phase rounds and the refusals that made rounds retry.
     pub cross_shard: CrossShardMetrics,
 }
@@ -308,6 +318,10 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             visibility_wake_passes: m.visibility_wakes.0,
             visibility_woken: m.visibility_wakes.1,
             visibility_contended: m.visibility_contended,
+            // Filled from the handle's own counters (`Pigeonhole::engine_metrics`).
+            transactions: 0,
+            transaction_conflicts: 0,
+            transaction_retries: 0,
             cross_shard: CrossShardMetrics {
                 rounds: x.rounds,
                 refused_rounds: x.refused_rounds,

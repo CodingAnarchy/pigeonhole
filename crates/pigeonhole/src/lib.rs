@@ -92,6 +92,7 @@ mod metrics;
 mod options;
 mod read;
 mod recovery;
+mod retry;
 mod table;
 mod write;
 
@@ -145,6 +146,7 @@ pub use options::{
 };
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use recovery::RecoveryStats;
+pub use retry::RetryPolicy;
 pub use table::{ReadTable, Table, TableBuilder};
 pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
 

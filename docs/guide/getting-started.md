@@ -282,6 +282,25 @@ match txn.commit() {
 # Ok::<(), pigeonhole::Error>(())
 ```
 
+`Pigeonhole::transact` runs that loop for you: a fresh transaction per attempt, retried on `Conflict` with exponential backoff and jitter, as a `RetryPolicy` says. The closure may run more than once, so keep side effects outside it.
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let bank = pigeonhole::doc_support::table(&db, "bank", &["acct"])?;
+# bank.mutate(b"alice").put("acct", b"balance", b"10").commit()?;
+let (_, commit) = db.transact(&RetryPolicy::default(), |txn| {
+    let alice = txn.get(&bank, b"alice", "acct", b"balance")?.map(|c| c.to_owned());
+    # let _ = alice;
+    txn.put(&bank, b"alice", "acct", b"balance", b"5")
+        .put(&bank, b"bob", "acct", b"balance", b"5");
+    Ok::<_, pigeonhole::Error>(())
+})?;
+# let _ = commit;
+# Ok::<(), pigeonhole::Error>(())
+```
+
 ## Close
 ```rust
 # use pigeonhole::*;

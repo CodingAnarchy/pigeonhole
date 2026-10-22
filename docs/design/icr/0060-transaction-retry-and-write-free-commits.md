@@ -29,3 +29,41 @@ It writes nothing, so it has no seqno of its own and nothing to make durable. It
 - `pigeonhole-engine`: `write.rs` (`Txn::write_free`, `resolved`, the commit paths); `engine.rs` (`check_open` is now `pub(crate)`); `tests/api.rs`.
 - `pigeonhole`: the `Transaction::commit` docs.
 - Docs: getting-started, and the changelog.
+
+## Change, part 2: `transact` and `RetryPolicy` (PR 3)
+
+- **`Pigeonhole::transact<T, E>(&self, policy: &RetryPolicy, body: impl FnMut(&mut Transaction) -> Result<T, E>) -> Result<(T, CommitInfo), E> where E: From<Error>`:** each attempt begins a fresh transaction, runs `body`, and commits, at `policy`'s durability or the writer's default. It retries:
+  - a commit that fails with an error the policy retries (`Conflict`, `SnapshotExpired`, and `Busy` if asked);
+  - a `body` error, when one of the transaction's own reads failed with such an error, which the transaction records (`Transaction::failed_read`, crate-private).
+
+  Any other `body` error is returned as is, with nothing committed: that's how an application gives up with its own error type. Pauses are exponential with full jitter, cut short at the deadline. Each retry counts in `EngineMetrics::transaction_retries` (ICR 0061).
+- **`RetryPolicy`** (`Clone`, `Debug`, `Default`; private fields, builder methods):
+  - `max_attempts(n)`, `unlimited_attempts()` (the default);
+  - `deadline(d)` (default 30 s, the default write-stall timeout), `no_deadline()`;
+  - `backoff(base, cap)` (defaults 100 µs and 100 ms);
+  - `retry_busy(bool)` (default off);
+  - `durability(d)`;
+  - `retries(&Error) -> bool`, `retries_code(ErrorCode) -> bool`, `delay(attempt) -> Duration`, and `next_pause(code, attempt, elapsed) -> Option<Duration>` (the whole decision: `None` to give up, else the pause cut at the deadline).
+
+### Rust-only convenience, C-ABI reachable (coordinator's condition, AGENTS.md)
+
+`transact` takes a closure and a generic error type, so it's a Rust-only convenience and won't cross the C ABI.
+- **Everything it decides is reachable without it.** `RetryPolicy` is a plain value (numbers, durations, flags; no closure or trait object). The retryable-error classification is `retries_code(ErrorCode)`. The loop's decision is `next_pause(code, attempt, elapsed)`, and `transact` itself uses exactly these.
+- **So a caller can run the same loop by hand.** An async caller with its own timer, or a future C ABI, uses `Pigeonhole::transaction()`, its own reads and writes, `commit`, then `next_pause` with the commit's (or a read's) error code.
+- **There's no async `transact`,** because the crate has no timer.
+
+### Why the generic error
+
+`pigeonhole::Error` can't be built by applications. A `body` returning `pigeonhole::Result` couldn't give up with the application's own reason. Generic `E: From<Error>` lets `?` work on pigeonhole calls inside the body and lets the application return its own error. The transaction remembering its failed read keeps "retry this" separate from "the application gave up". A body may need `Ok::<_, pigeonhole::Error>(…)` for inference.
+
+## Callers (part 2)
+
+- `pigeonhole`:
+  - `retry.rs` (new);
+  - `lib.rs` (`RetryPolicy` exported);
+  - `write.rs` (`Transaction::failed_read`, and counting in `finish`);
+  - `nonblocking.rs` (the async transaction commit counts);
+  - `db.rs` (`txn_counts`, `engine_metrics`);
+  - `metrics.rs`;
+  - `tests/transact.rs`.
+- Docs: getting-started, errors.md, the agent reference, and the changelog.

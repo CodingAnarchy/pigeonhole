@@ -76,6 +76,8 @@ use pigeonhole_engine::ScanCursor;
 #[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
 pub struct CommitFuture {
     state: State,
+    /// A transaction's commit counts its outcome here (ICR 0061).
+    counts: Option<std::sync::Arc<crate::db::Db>>,
 }
 
 #[derive(Debug)]
@@ -95,6 +97,7 @@ impl CommitFuture {
                 Ok(s) => State::Pending(s),
                 Err(e) => State::Ready(Some(Err(e))),
             },
+            counts: None,
         }
     }
 }
@@ -108,16 +111,25 @@ impl Future for CommitFuture {
                 Poll::Ready(r) => {
                     let out = s.outcome(r);
                     self.state = State::Ready(None);
+                    if let Some(db) = self.counts.take() {
+                        db.txn_counts.count(&out);
+                    }
                     Poll::Ready(out)
                 }
                 Poll::Pending => Poll::Pending,
             },
-            State::Ready(r) => Poll::Ready(r.take().unwrap_or_else(|| {
-                Err(Error::new(
-                    crate::ErrorCode::InvalidArgument,
-                    "commit future polled after it resolved",
-                ))
-            })),
+            State::Ready(r) => {
+                let out = r.take();
+                if let (Some(out), Some(db)) = (&out, self.counts.take()) {
+                    db.txn_counts.count(out);
+                }
+                Poll::Ready(out.unwrap_or_else(|| {
+                    Err(Error::new(
+                        crate::ErrorCode::InvalidArgument,
+                        "commit future polled after it resolved",
+                    ))
+                }))
+            }
         }
     }
 }
@@ -132,6 +144,7 @@ impl IntoFuture for CommitTicket {
                 TicketState::Pending(s) => State::Pending(s),
                 TicketState::Done(r) => State::Ready(Some(r)),
             },
+            counts: None,
         }
     }
 }
@@ -203,7 +216,10 @@ impl Transaction {
     }
 
     fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
-        CommitFuture::new(self.submit_async(durability))
+        let db = std::sync::Arc::clone(&self.db);
+        let mut future = CommitFuture::new(self.submit_async(durability));
+        future.counts = Some(db);
+        future
     }
 }
 
