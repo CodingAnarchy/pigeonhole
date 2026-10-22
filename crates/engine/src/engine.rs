@@ -2870,6 +2870,14 @@ fn flush_recovered(
     }
     catalog.counters.next_sst = shared.sst_ids.load(Ordering::Relaxed);
     catalog.counters.seqno_ceiling = shared.clock.next_seqno();
+    // The streams are checkpointed past every replayed record, so their timestamps now live
+    // only in SSTs: the floor must carry them, or a crash before the next manifest commit
+    // reopens with a lower `H` and nothing to replay, and a clock behind them stamps below
+    // existing versions (#653, D11). Replay raised each shard's last stamp (perf287, #899).
+    catalog.counters.ts_floor = catalog
+        .counters
+        .ts_floor
+        .max(states.iter().map(ShardState::last_stamp).max().unwrap_or(0));
     if nothing_recovered && catalog.counters == before {
         // A clean reopen (#158, D203): no stream to replay, nothing spilled, and the
         // counters are what the manifest holds. The commit would publish nothing; skipping
