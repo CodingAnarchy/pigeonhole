@@ -174,7 +174,7 @@ pub struct EngineMetrics {
     /// Gauge: how far the largest default timestamp handed out is ahead of the clock now, in
     /// µs; 0 while the clock leads. Default timestamps run ahead of the clock only when one
     /// shard commits more than one group a µs, or a cross-shard decision and a commit after
-    /// it fall in the same µs (D271, ICR XXXX).
+    /// it fall in the same µs (D271, ICR 0064).
     pub default_ts_lead_micros: u64,
     /// The largest `default_ts_lead_micros` at any commit since open.
     pub max_default_ts_lead_micros: u64,
