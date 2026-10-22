@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-10-22
+Two engine fixes from `main`, also released as 0.3.1 (#862). **Upgrade recommended** for every 0.2.x user: a close could hang for ever on a full memtable arena, and a `None`-durability commit could come back in part after a shard's WAL failure. The file format is unchanged; files written by 0.2.0 to 0.2.3 open as before.
+
 ### Fixed
 - **A close no longer hangs when a voided purge guard refuses the flush of its in-place memtables** (#838). A close whose arena had no chunk left flushes its active memtables in place (#111); when that flush also carried a frozen memtable whose purge guard a delete had voided (#287), the manifest refused the whole flush and only the frozen memtables were queued again, so the in-place ones were never flushed, their log records stayed needed, and `close()` waited for ever (the shard idle, nothing to flush). The refused flush now re-queues them too, and an I/O error on such a flush counts as a failure (the close gives up, unclean) instead of a retry. Present since 0.2.0 (#315). Found by the public model check's recovery arm (#837).
 - **A flush on a shard whose WAL stream failed can no longer make a commit durable in part** (#847). A flush's sync barrier on a poisoned stream (a write or sync had failed) answered that the stream held once its cross-shard records were durable, which a single-shard database meets at once; so a flush in flight at the failure committed its SST and `SetFlushed` over records the log never held. A `None`-durability commit is applied before its buffered record reaches the file (it goes with the next group's write, the one that failed), so its cells in the slots that flushed survived the reopen and the others did not: the public model check's recovery arm read a part of such a commit after a recovery. The shard's own barrier now holds on a poisoned stream only if the stream is durable through everything appended; a peer's barrier keeps the cross-shard rule (D115, amended). The flush fails instead, the close gives up and is unclean, and the next open replays the log: the commit is there whole or not at all. Present since 0.2.0 (#159's barrier rule for a failed stream; a `None` record is buffered until the next group's write).
@@ -123,7 +126,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.0...v0.2.1
