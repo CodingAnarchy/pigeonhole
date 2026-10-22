@@ -271,11 +271,10 @@ pub struct CrossShardMetrics {
     /// The time shards had at least one single held back behind an
     /// undecided share (D263), summed over shards.
     pub share_wait_nanos: u64,
-    /// PREPAREs admitted behind an undecided share or a waiting single instead of refused,
-    /// their `Prepared` held until those were decided or logged (D267).
+    /// Always 0 since D271: a blind write over an undecided share's write is admitted, so no
+    /// PREPARE is chained (D267's chaining went). Kept for the API (ICR 0056).
     pub chained: u64,
-    /// Younger undecided shares wounded (their attempts aborted unless decided) for an
-    /// older share chained behind them (D267).
+    /// Always 0 since D271: nothing chains, so nothing is wounded (D267). Kept for the API.
     pub wounds: u64,
     /// The most attempts (two-phase rounds) one committed cross-shard commit that only
     /// writes took, over every coordinator since open (ICR 0056). Only commits that
@@ -2429,8 +2428,6 @@ impl Engine {
             x.refused_pending_overlap += refused(CrossRefusal::PendingOverlap);
             x.share_waits += s.cross.share_waits.load(Ordering::Relaxed);
             x.share_wait_nanos += s.cross.share_wait_nanos.load(Ordering::Relaxed);
-            x.chained += s.cross.chained.load(Ordering::Relaxed);
-            x.wounds += s.cross.wounds.load(Ordering::Relaxed);
             let most = |i: usize| s.cross.max_attempts[i].load(Ordering::Relaxed);
             x.max_attempts_blind = x.max_attempts_blind.max(most(0));
             x.max_attempts_reading = x.max_attempts_reading.max(most(1));
