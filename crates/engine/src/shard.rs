@@ -1789,7 +1789,11 @@ struct MemEntry {
     /// Holds a cell whose versions may not follow seqno order (D273): one with an explicit
     /// timestamp, or one replayed (written before this open, possibly by a build before
     /// D271). Without it, every cell's first version holds its largest seqno, so read
-    /// validation reads only that version (`conflicts`).
+    /// validation reads only that version (`conflicts`). The invariant this rests on: every
+    /// write path that stamps a *default* timestamp goes through D271's allocator
+    /// (`reserve_stamps`, `reserve_decision`), and anything else sets this flag. Counter
+    /// families are the standing example: their writes carry D186's fixed timestamp as an
+    /// explicit one. A future ingest or import path writing memtables directly must set it.
     explicit_ts: bool,
 }
 
