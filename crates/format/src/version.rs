@@ -57,8 +57,10 @@ pub struct ShmLayoutVersion(pub u32);
 
 impl ShmLayoutVersion {
     /// The layout this build creates and attaches to (exact match required). Version 2 adds
-    /// each shard's durable watermark (D227).
-    pub const CURRENT: Self = Self(2);
+    /// each shard's durable watermark (D227). Version 3 judges reader liveness by each
+    /// slot's byte-range lock in the database file, not by process id (#693 PR 3): a
+    /// version 2 reader takes no such lock and would look dead to a version 3 writer.
+    pub const CURRENT: Self = Self(3);
 }
 
 /// Magic at offset 0 of each superblock (pages 0 and 1).

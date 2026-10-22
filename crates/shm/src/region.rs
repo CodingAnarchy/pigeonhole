@@ -3,16 +3,17 @@
 //! offsets come from `pigeonhole_format::shm`.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_format::shm::{
     DIRECTORY_MAGIC, HEADER_LEN, READER_SLOT_LEN, ShmHeader, ViewRecord, WATERMARK_STRIDE,
     directory, directory_name, header, reader_slot, region_name, watermark,
 };
+use pigeonhole_format::superblock::READER_LOCK_BASE;
 use pigeonhole_format::{ManifestVersion, Seqno, ShmLayoutVersion};
 use pigeonhole_io::{
-    ErrorKind, FileIdentity, FileRef, ProcessId, SharedOpen, SharedRegion, VfsRef,
+    ErrorKind, FileIdentity, FileRef, LockMode, ProcessId, SharedOpen, SharedRegion, VfsRef,
 };
 
 use crate::lock::{ShmInit, alone, present};
@@ -166,11 +167,15 @@ impl Inner {
     /// `active` at once because the owner is alive, so retry. If the writer died in that
     /// window the slot stays `claiming`; give up and leave it to the next generation.
     ///
-    /// Only while the slot still names `owner`: if the writer judged the owner dead and
-    /// freed the slot, it may belong to another reader now, whose pins and claim must not be
-    /// touched (#834 review). A narrow race remains between that check and the clear: the
-    /// writer would have to judge this live process dead again within it, until #693's
-    /// lock-based liveness removes false "dead" judgements altogether.
+    /// Every store an owner makes to its slot (here, and its pins) is to its own slot
+    /// (#693 PR 3, perf287's review of #894): a slot claimed with its liveness lock
+    /// ([`ShmRegion::claim_reader_slot_locked`]) is freed only by a handle that has taken
+    /// that lock ([`ShmRegion::reclaim_dead_slots_locked`]), and the owner holds it from
+    /// before its claim until after this release. So the slot cannot be freed and handed to
+    /// another reader under a live owner. The ownership check below matters only for a slot
+    /// judged by pid ([`ShmRegion::reclaim_dead_slots`], in-memory regions and tests), where
+    /// a false "dead" judgement can free it under its owner; a narrow race between that
+    /// check and the clear remains there.
     fn release_slot(&self, index: u32, owner: ProcessId) {
         if !self.slot_owned_by(index, owner) {
             return;
@@ -892,10 +897,39 @@ impl ShmRegion {
 
     // ---- reader slots ----
 
-    /// Claims a free reader slot for `process`.
+    /// Claims a free reader slot for `process`, its liveness judged by pid
+    /// ([`ShmRegion::reclaim_dead_slots`]): for in-memory regions and tests. A reader of a
+    /// database file claims with [`ShmRegion::claim_reader_slot_locked`].
     pub fn claim_reader_slot(&self, process: ProcessId) -> Result<ReaderSlot> {
+        self.claim(process, None)
+    }
+
+    /// Claims a free reader slot for `process` and takes its liveness lock through `file`,
+    /// the reader's handle on the database file (layout 3, #693 PR 3): byte
+    /// [`READER_LOCK_BASE`] `+ index`, exclusive, taken **before** the slot's `free ->
+    /// claiming` CAS and held until the slot is freed. The writer frees a slot only once it
+    /// can take that byte itself ([`ShmRegion::reclaim_dead_slots_locked`]), so a live
+    /// reader is never judged dead (whatever its pid namespace), and a claimer that died
+    /// between its CAS and its `active` store is reclaimed too. A byte another handle holds
+    /// is skipped: a reader that died with its slot still `active` until the writer frees it.
+    pub fn claim_reader_slot_locked(
+        &self,
+        process: ProcessId,
+        file: &FileRef,
+    ) -> Result<ReaderSlot> {
+        self.claim(process, Some(file))
+    }
+
+    fn claim(&self, process: ProcessId, lock: Option<&FileRef>) -> Result<ReaderSlot> {
         let inner = &self.inner;
         for index in 0..inner.header.reader_slot_count {
+            if let Some(file) = lock {
+                match file.lock(READER_LOCK_BASE + u64::from(index), LockMode::Exclusive) {
+                    Ok(()) => {}
+                    Err(e) if e.kind == ErrorKind::Locked => continue,
+                    Err(e) => return Err(e.into()),
+                }
+            }
             let state = inner.slot32(index, reader_slot::STATE);
             if state
                 .compare_exchange(
@@ -906,6 +940,9 @@ impl ShmRegion {
                 )
                 .is_err()
             {
+                if let Some(file) = lock {
+                    let _ = file.unlock(READER_LOCK_BASE + u64::from(index));
+                }
                 continue;
             }
             inner
@@ -928,6 +965,8 @@ impl ShmRegion {
                 region: inner.clone(),
                 index,
                 owner: process,
+                lock: lock.cloned(),
+                abandoned: Arc::new(AtomicBool::new(false)),
             });
         }
         Err(Error::NoReaderSlot)
@@ -986,21 +1025,52 @@ impl ShmRegion {
     /// (a process that dies between its CAS and its `active` store leaks its slot until the
     /// next generation).
     pub fn reclaim_dead_slots(&self, vfs: &VfsRef) -> usize {
+        self.reclaim(|owner, _| vfs.process_alive(owner), false)
+    }
+
+    /// Frees the slots whose reader process is gone, judged by each slot's liveness lock
+    /// (layout 3, #693 PR 3): the writer probes byte [`READER_LOCK_BASE`] `+ index` through
+    /// `file`, its own handle on the database file, with a non-blocking exclusive lock. If it
+    /// gets the byte, no process holds the slot, so the slot is freed (and the byte
+    /// released); if the byte is held, the reader is alive. Independent of pids, so a reader
+    /// in another pid namespace is never judged dead. Slots stuck in `claiming` (a claimer
+    /// that died between its CAS and its `active` store, D46) are probed and freed the same
+    /// way: a live claimer holds its byte from before its CAS. Returns how many were freed.
+    pub fn reclaim_dead_slots_locked(&self, file: &FileRef) -> usize {
+        self.reclaim(
+            |_, index| {
+                let byte = READER_LOCK_BASE + u64::from(index);
+                match file.lock(byte, LockMode::Exclusive) {
+                    Ok(()) => {
+                        let _ = file.unlock(byte);
+                        false
+                    }
+                    // Held by its reader, or the probe failed: alive (conservative).
+                    Err(_) => true,
+                }
+            },
+            true,
+        )
+    }
+
+    /// The reclaim loop: `alive(owner, index)` decides each `active` slot (and each
+    /// `claiming` one when `claiming_too`).
+    fn reclaim(&self, alive: impl Fn(ProcessId, u32) -> bool, claiming_too: bool) -> usize {
         let inner = &self.inner;
         let mut reclaimed = 0;
         for index in 0..inner.header.reader_slot_count {
             let state = inner.slot32(index, reader_slot::STATE);
-            if state
-                .compare_exchange(
-                    SLOT_ACTIVE,
-                    SLOT_CLAIMING,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-            {
-                continue;
-            }
+            let was = match state.compare_exchange(
+                SLOT_ACTIVE,
+                SLOT_CLAIMING,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => SLOT_ACTIVE,
+                // A claimer that may have died before recording itself: only the lock knows.
+                Err(SLOT_CLAIMING) if claiming_too => SLOT_CLAIMING,
+                Err(_) => continue,
+            };
             // Only this writer can change the slot now; the owner's release waits for it.
             let owner = ProcessId {
                 pid: inner
@@ -1010,8 +1080,11 @@ impl ShmRegion {
                     .slot64(index, reader_slot::START_TIME)
                     .load(Ordering::Relaxed),
             };
-            if vfs.process_alive(owner) {
-                state.store(SLOT_ACTIVE, Ordering::Release);
+            if alive(owner, index) {
+                // Back as it was: a live claimer finishes its own claim.
+                if was == SLOT_ACTIVE {
+                    state.store(SLOT_ACTIVE, Ordering::Release);
+                }
                 continue;
             }
             inner.clear_pins(index);
@@ -1025,7 +1098,25 @@ impl ShmRegion {
 impl ReaderSlot {
     /// Whether the slot is still this handle's (see [`crate::SlotOwnership::is_current`]).
     pub fn is_owned(&self) -> bool {
-        self.region.slot_owned_by(self.index, self.owner)
+        !self.abandoned.load(Ordering::Acquire) && self.region.slot_owned_by(self.index, self.owner)
+    }
+
+    /// Gives the slot up without freeing it: releases its liveness lock now, and from then on
+    /// this handle stores nothing to the slot (its pin calls and its drop do nothing) and
+    /// [`ReaderSlot::is_owned`] and every [`crate::SlotOwnership`] taken from it are false.
+    /// For a reader about to claim another slot through the same file handle while this one
+    /// lives on: the slot of a superseded generation, which no writer reclaims, or one freed
+    /// under it. Byte-range locks do not conflict within one handle, so if this slot kept its
+    /// lock, a new claim could take the same byte and this slot's drop would then release it
+    /// under the new slot (and, in the same region, free the new slot, which names the same
+    /// process).
+    pub fn abandon(&self) {
+        if self.abandoned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(file) = &self.lock {
+            let _ = file.unlock(READER_LOCK_BASE + u64::from(self.index));
+        }
     }
 
     /// A handle that checks [`ReaderSlot::is_owned`] without holding the slot.
@@ -1034,6 +1125,7 @@ impl ReaderSlot {
             region: self.region.clone(),
             index: self.index,
             owner: self.owner,
+            abandoned: Arc::clone(&self.abandoned),
         }
     }
 
@@ -1092,6 +1184,9 @@ impl ReaderSlot {
     /// durable seqno it was frozen under, so nothing a snapshot at `seqno` reads has been
     /// collapsed yet.
     pub fn lower_pin(&self, seqno: Seqno) {
+        if self.abandoned.load(Ordering::Acquire) {
+            return;
+        }
         self.region
             .slot64(self.index, reader_slot::PINNED_SEQNO)
             .fetch_min(seqno, Ordering::SeqCst);
@@ -1101,6 +1196,9 @@ impl ReaderSlot {
     /// reader's oldest snapshot was dropped, so what it pinned for that snapshot alone may be
     /// reclaimed. Only ever raises: a field already at or above its new value stays.
     pub fn raise_pin(&self, seqno: Seqno, view_version: u64) {
+        if self.abandoned.load(Ordering::Acquire) {
+            return;
+        }
         self.region
             .slot64(self.index, reader_slot::PINNED_SEQNO)
             .fetch_max(seqno, Ordering::SeqCst);
@@ -1109,8 +1207,12 @@ impl ReaderSlot {
             .fetch_max(view_version, Ordering::SeqCst);
     }
 
-    /// Clears the pin.
+    /// Clears the pin (nothing once abandoned, as for [`ReaderSlot::lower_pin`] and
+    /// [`ReaderSlot::raise_pin`]).
     pub fn unpin(&self) {
+        if self.abandoned.load(Ordering::Acquire) {
+            return;
+        }
         self.region
             .slot64(self.index, reader_slot::PINNED_SEQNO)
             .store(0, Ordering::SeqCst);
@@ -1122,7 +1224,14 @@ impl ReaderSlot {
 
 impl Drop for ReaderSlot {
     fn drop(&mut self) {
+        if self.abandoned.load(Ordering::Acquire) {
+            return;
+        }
         self.region.release_slot(self.index, self.owner);
+        // After the slot is free: until then the writer must see this reader alive.
+        if let Some(file) = &self.lock {
+            let _ = file.unlock(READER_LOCK_BASE + u64::from(self.index));
+        }
     }
 }
 
@@ -1203,7 +1312,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 2
+                expected: 3
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });

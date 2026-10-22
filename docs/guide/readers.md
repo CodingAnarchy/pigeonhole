@@ -46,7 +46,7 @@ assert!(rt.get(b"s", "f", b"q")?.is_some());
 ## When a reader exits or crashes
 - **Closing a reader** releases its slot at once.
 - **A reader process that crashes or is killed** releases nothing itself. The writer checks for reader processes that are gone at most every 250 ms, and frees their slots and whatever their snapshots held (#833).
-- **A reader the writer wrongly judges dead** (see the PID-namespace requirement below) loses its slot. Its reads then fail with `SnapshotExpired`, and its next snapshot takes a fresh slot. It never reads wrong data.
+- **How the writer tells:** each reader holds a byte-range lock on the database file for its slot, and the operating system releases it when the process exits, however it exits. The writer frees a slot only once it can take that lock itself (#693). It never looks at process ids, so a live reader is never judged dead, whatever its PID namespace.
 
 ## Long-held snapshots stall the writer
 A reader's oldest live snapshot pins the writer's state as of that snapshot: the memtables and file space the writer would otherwise reclaim. Only live snapshots pin. Once a reader drops its oldest snapshot the pin moves up to its next oldest, and a reader holding no snapshot pins nothing, however long it stays open (#693). A reader that holds one snapshot for a long time while the writer keeps committing eventually fills the writer's memtable budget. The writer's commits then wait for room, and fail with `Busy` after `Options::write_stall_timeout` (30 s by default).
@@ -69,8 +69,7 @@ Every limit is an error, never a hang:
 ## Requirements
 - **Same host, local filesystem.** Network filesystems are refused.
 - **Write permission on the file.** A reader opens the file read-write (D36), because the processes coordinate with byte-range locks, some of them exclusive. It writes nothing.
-- **Same PID namespace.** The writer checks reader liveness by process id and start time. A reader in another PID namespace (another container that shares only the volume and shared memory) looks dead to the writer, so it keeps losing its slot and keeps getting `SnapshotExpired`. Run the writer and its readers in the same PID namespace. On Linux, a reader that `/proc` hides from the writer (`hidepid`, another user's process) still counts as alive.
-- **Same build layout.** The writer and every reader need the same shared-memory layout. Stop reader processes before upgrading the writer: a writer with a newer layout fails with `ShmVersionMismatch` while older readers are attached.
+- **Same build layout.** The writer and every reader need the same shared-memory layout. Stop reader processes before upgrading the writer: a writer with a newer layout fails with `ShmVersionMismatch` while older readers are attached. Layout 3 (#693) judges reader liveness by lock, so readers from earlier releases can't attach to a writer from this one, nor the reverse.
 - **Windows, across sessions.** Shared memory lives in the session's `Local\` namespace by default, so a reader in another session (a service and a desktop process, for example) can't attach. Give the writer and every reader the same `shm_dir` (`Options::shm_dir`, `ReaderOptions::shm_dir`): a file-backed mapping that any session can open.
 - **Block cache per process.** Each reader has its own block cache, 256 MiB by default (`ReaderOptions::block_cache`), on top of the writer's.
 

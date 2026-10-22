@@ -344,19 +344,19 @@ fn layout_version_mismatch_is_refused_unless_alone() {
     let (mapping, _, _) = shm.arena(0);
     mapping
         .atomic_u32(header::LAYOUT_VERSION)
-        .store(3, Ordering::Release);
+        .store(4, Ordering::Release);
     let dir_name = directory_name(w.identity.device, w.identity.inode);
     w.vfs
         .open_shared(&dir_name, None, directory::LEN as u64, SharedOpen::Attach)
         .unwrap()
         .atomic_u32(directory::LAYOUT_VERSION)
-        .store(3, Ordering::Release);
+        .store(4, Ordering::Release);
 
     // A new reader is refused.
     let r2 = Proc::start(&sim, pid(12));
     match r2.open(Role::Reader) {
         Err(Error::VersionMismatch { found, expected }) => {
-            assert_eq!((found, expected), (3, 2));
+            assert_eq!((found, expected), (4, 3));
         }
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
@@ -367,7 +367,7 @@ fn layout_version_mismatch_is_refused_unless_alone() {
     let w2 = Proc::start(&sim, pid(2));
     let lock2 = WriterLock::acquire(&w2.file).unwrap();
     match w2.open(Role::Writer) {
-        Err(Error::VersionMismatch { found, .. }) => assert_eq!(found, 3),
+        Err(Error::VersionMismatch { found, .. }) => assert_eq!(found, 4),
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
     // ...and rebuilds once it is alone. The probe ran with no presence lock held (D37) and
@@ -397,10 +397,13 @@ fn last_process_removes_the_region() {
     let r = Proc::start(&sim, pid(11));
     let (rp, _shm_r, slot) = r.open_reader();
 
+    // The writer is not last while the reader is present; a failed upgrade releases its
+    // presence byte (#150 item 4.7), so the reader, closing next, is.
     assert!(!wp.try_become_last().unwrap());
-    assert!(!rp.try_become_last().unwrap());
     drop(slot);
+    assert!(rp.try_become_last().unwrap());
     drop(rp);
+    // The writer re-takes its byte only to test removal below.
     assert!(wp.try_become_last().unwrap());
     drop(shm);
     ShmRegion::remove(&w.vfs, w.identity, None).unwrap();
@@ -532,4 +535,121 @@ fn a_reader_with_no_writer_region_gets_no_writer() {
         shm_r.reattach(&r.vfs, &r.file),
         Err(Error::NoWriter)
     ));
+}
+
+/// #693 PR 3: liveness by each slot's byte-range lock, not the pid. A live reader is never
+/// judged dead (even one whose pid the writer reads as gone, as from another pid namespace),
+/// a killed reader's slot is freed, and so is a slot left in `claiming` by a claimer that
+/// died before recording itself.
+#[test]
+fn reader_liveness_is_judged_by_the_slots_lock() {
+    use pigeonhole_format::superblock::READER_LOCK_BASE;
+    let sim = SimVfs::new(693);
+    let w = Proc::start(&sim, pid(1));
+    let (_lock, _wp, shm) = w.open_writer();
+
+    // A live reader: its handle holds its slot's lock, so it is kept whatever its pid says
+    // (the probe never looks at the pid; a reader in another pid namespace is the same).
+    let hidden = Proc::start(&sim, pid(21));
+    let rs = hidden.open(Role::Reader).unwrap();
+    let kept = rs
+        .claim_reader_slot_locked(hidden.id, &hidden.file)
+        .unwrap();
+    assert_eq!(
+        shm.reclaim_dead_slots_locked(&w.file),
+        0,
+        "a live reader's slot was freed"
+    );
+    assert!(kept.is_owned());
+    // Its byte is held: another handle cannot take it, so a second claim skips the slot.
+    assert!(
+        w.file
+            .lock(
+                READER_LOCK_BASE + u64::from(kept.index()),
+                LockMode::Exclusive
+            )
+            .is_err()
+    );
+
+    // A killed reader (its handles closed by the crash, so its lock released): freed.
+    let doomed = Proc::start(&sim, pid(22));
+    let ds = doomed.open(Role::Reader).unwrap();
+    let dslot = ds
+        .claim_reader_slot_locked(doomed.id, &doomed.file)
+        .unwrap();
+    let dindex = dslot.index();
+    doomed.crash();
+    std::mem::forget(dslot);
+    std::mem::forget(ds);
+    sim.enter_process(pid(1));
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 1);
+    assert_eq!(
+        shm.reader_slot_usage().0,
+        1,
+        "only the live reader's slot is claimed"
+    );
+
+    // The freed slot can be claimed again, and holds its new owner's lock.
+    let next = Proc::start(&sim, pid(23));
+    let ns = next.open(Role::Reader).unwrap();
+    let nslot = ns.claim_reader_slot_locked(next.id, &next.file).unwrap();
+    assert_eq!(nslot.index(), dindex);
+    sim.enter_process(pid(1));
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 0);
+
+    // Dropping a slot frees it and releases its byte, in that order.
+    drop(nslot);
+    assert!(
+        next.file
+            .lock(READER_LOCK_BASE + u64::from(dindex), LockMode::Exclusive)
+            .is_ok()
+    );
+    next.file
+        .unlock(READER_LOCK_BASE + u64::from(dindex))
+        .unwrap();
+    drop(kept);
+    assert_eq!(shm.reader_slot_usage().0, 0);
+}
+
+#[test]
+fn an_abandoned_slot_leaves_a_later_claim_through_its_handle_alone() {
+    use pigeonhole_format::superblock::READER_LOCK_BASE;
+    let sim = SimVfs::new(694);
+    let w = Proc::start(&sim, pid(1));
+    let (_lock, _wp, shm) = w.open_writer();
+    let r = Proc::start(&sim, pid(31));
+    let rs = r.open(Role::Reader).unwrap();
+    let old = rs.claim_reader_slot_locked(r.id, &r.file).unwrap();
+    let index = old.index();
+    let byte = READER_LOCK_BASE + u64::from(index);
+    let ownership = old.ownership();
+
+    // Abandoned: no longer this handle's, and its byte is released at once (so the writer
+    // may free the slot), but the slot itself is left as it was.
+    old.abandon();
+    assert!(!old.is_owned() && !ownership.is_current());
+    sim.enter_process(pid(1));
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 1);
+
+    // The same handle claims the same slot again (locks never conflict within a handle).
+    sim.enter_process(pid(31));
+    let new = rs.claim_reader_slot_locked(r.id, &r.file).unwrap();
+    assert_eq!(new.index(), index);
+    assert_eq!(new.pin(5, 0), (5, 0));
+    // The abandoned handle stores nothing, and its drop neither frees the new claim (which
+    // names the same process) nor releases the byte under it.
+    old.raise_pin(9, 9);
+    old.unpin();
+    drop(old);
+    assert!(new.is_owned() && !ownership.is_current());
+    assert_eq!(shm.oldest_reader_pin(), Some((5, 0)));
+    sim.enter_process(pid(1));
+    assert!(
+        w.file.lock(byte, LockMode::Exclusive).is_err(),
+        "the new claim lost its lock"
+    );
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 0);
+    sim.enter_process(pid(31));
+    drop(new);
+    assert_eq!(shm.reader_slot_usage().0, 0);
 }

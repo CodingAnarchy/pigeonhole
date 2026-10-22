@@ -69,6 +69,7 @@ mod region;
 
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use pigeonhole_format::{Seqno, ShmLayoutVersion};
 use pigeonhole_io::{FileRef, ProcessId};
@@ -353,6 +354,13 @@ pub struct ReaderSlot {
     /// slot under it ([`ShmRegion::reclaim_dead_slots`]); the slot is this handle's only
     /// while its owner fields still name this process.
     owner: ProcessId,
+    /// The database file handle holding the slot's liveness lock (layout 3,
+    /// [`ShmRegion::claim_reader_slot_locked`]), released after the slot is freed; `None`
+    /// for a slot claimed without one (in-memory regions and tests, liveness by pid).
+    lock: Option<FileRef>,
+    /// Set by [`ReaderSlot::abandon`]: the handle no longer owns the slot and leaves it
+    /// alone. Shared with every [`SlotOwnership`] taken from this handle.
+    abandoned: Arc<AtomicBool>,
 }
 
 /// Whether a [`ReaderSlot`] still belongs to the handle that claimed it, checkable without
@@ -362,13 +370,16 @@ pub struct SlotOwnership {
     region: Arc<region::Inner>,
     index: u32,
     owner: ProcessId,
+    abandoned: Arc<AtomicBool>,
 }
 
 impl SlotOwnership {
     /// Whether the slot is still claimed by its owner: not free, with the owner's pid and
     /// start time. False once the writer judged the owner dead and freed the slot (and
-    /// possibly another reader took it): reads through the slot's pins are then unprotected.
+    /// possibly another reader took it), or once its handle abandoned it
+    /// ([`ReaderSlot::abandon`]): reads through the slot's pins are then unprotected.
     pub fn is_current(&self) -> bool {
-        self.region.slot_owned_by(self.index, self.owner)
+        !self.abandoned.load(std::sync::atomic::Ordering::Acquire)
+            && self.region.slot_owned_by(self.index, self.owner)
     }
 }

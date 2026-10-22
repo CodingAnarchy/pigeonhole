@@ -41,14 +41,37 @@ impl Presence {
     ///
     /// The upgrade needs a handle opened for writing; on a read-only handle it fails with
     /// `Unsupported` (decision D36).
+    ///
+    /// **Two processes closing at once** (#150 item 4.7) would each fail the upgrade while
+    /// the other still holds its shared byte, and neither would clean up. So after a failed
+    /// upgrade this releases its shared byte and retries the exclusive lock a few times, a
+    /// little later each time: the other closer, doing the same, has released its byte, and
+    /// one of the two gets it. Cleanup is idempotent (the region and the WAL files may
+    /// already be gone), so a second closer that also gets the byte later is harmless. A
+    /// process that stays open keeps its shared byte, and every retry fails. After `false`
+    /// this handle no longer holds the presence byte.
     pub fn try_become_last(&self) -> Result<bool> {
         match self.file.lock(PRESENCE_BYTE, LockMode::Exclusive) {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind == ErrorKind::Locked => Ok(false),
-            Err(e) => Err(e.into()),
+            Ok(()) => return Ok(true),
+            Err(e) if e.kind == ErrorKind::Locked => {}
+            Err(e) => return Err(e.into()),
         }
+        self.file.unlock(PRESENCE_BYTE)?;
+        for delay_ms in LAST_RETRY_DELAYS_MS {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            match self.file.lock(PRESENCE_BYTE, LockMode::Exclusive) {
+                Ok(()) => return Ok(true),
+                Err(e) if e.kind == ErrorKind::Locked => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(false)
     }
 }
+
+/// The waits between `try_become_last`'s retries after its first upgrade failed: about 15 ms
+/// in all, longer than a closing process takes from its own failed upgrade to its retry.
+const LAST_RETRY_DELAYS_MS: [u64; 4] = [1, 2, 4, 8];
 
 impl Drop for Presence {
     fn drop(&mut self) {

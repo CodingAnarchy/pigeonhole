@@ -318,3 +318,101 @@ fn churn(seed: u64) {
     vfs.enter_process(WRITER);
     db.close().unwrap();
 }
+
+/// perf287's review of #894: two threads of one reader process take and drop snapshots at
+/// once (sharing one slot) while the writer commits and flushes. Whenever a thread holds a
+/// snapshot, the slot's pins cover it (seqno and view at or below its own) and its read is
+/// unchanged; once both threads are done the slot pins nothing. Catches a release that
+/// raises or clears the pin under a snapshot another thread took concurrently.
+#[test]
+fn two_threads_taking_and_dropping_snapshots_keep_the_pin_covering_each() {
+    let seed: u64 = std::env::var("PIGEONHOLE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6933);
+    eprintln!("seed {seed}");
+    let (vfs, db, t, reader) = open_with(seed, 64 << 20);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let threads: Vec<_> = (0..2u64)
+        .map(|n| {
+            let (vfs, db, t, reader, stop) = (
+                Arc::clone(&vfs),
+                Arc::clone(&db),
+                Arc::clone(&t),
+                Arc::clone(&reader),
+                Arc::clone(&stop),
+            );
+            std::thread::spawn(move || {
+                let mut rng = Rng((seed ^ (n + 1)).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+                let mut held: Vec<(Snapshot, Vec<u8>)> = Vec::new();
+                let mut rounds = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) || rounds < 200 {
+                    rounds += 1;
+                    if held.len() < 3 && (held.is_empty() || rng.below(2) == 0) {
+                        let s = snap(&vfs, &reader, rng.below(4) == 0);
+                        let v = read_k(&vfs, &reader, &t, &s);
+                        held.push((s, v));
+                    } else {
+                        let i = rng.below(held.len() as u64) as usize;
+                        let (s, _) = held.swap_remove(i);
+                        vfs.enter_process(READER);
+                        drop(s);
+                    }
+                    // The other thread may raise, lower or clear the pin at any moment, but
+                    // never above a snapshot this thread holds.
+                    vfs.enter_process(WRITER);
+                    let pin = db.reader_pin_and_view().0;
+                    for (s, v) in &held {
+                        let (ps, pv) = pin.unwrap_or_else(|| {
+                            panic!("seed {seed} thread {n}: no pin under a live snapshot")
+                        });
+                        assert!(
+                            ps != 0 && ps <= s.seqno(),
+                            "seed {seed} thread {n}: seqno pin {ps} above snapshot {}",
+                            s.seqno()
+                        );
+                        assert!(
+                            pv != 0 && pv <= s.view().version(),
+                            "seed {seed} thread {n}: view pin {pv} above snapshot's view {}",
+                            s.view().version()
+                        );
+                        assert_eq!(
+                            &read_k(&vfs, &reader, &t, s),
+                            v,
+                            "seed {seed} thread {n}: a snapshot's read changed"
+                        );
+                    }
+                }
+                vfs.enter_process(READER);
+                drop(held);
+                rounds
+            })
+        })
+        .collect();
+    vfs.enter_process(WRITER);
+    for i in 0..300u32 {
+        put(&db, &t, b"k", format!("v{i}").as_bytes());
+        fill(&db, &t, i * 20..(i + 1) * 20).unwrap();
+        if i % 10 == 0
+            && let Err(e) = db.flush()
+        {
+            assert!(
+                matches!(e, pigeonhole_engine::Error::Busy),
+                "seed {seed}: {e:?}"
+            );
+        }
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for th in threads {
+        th.join().expect("a reader thread failed");
+    }
+    assert_eq!(
+        pin(&vfs, &db),
+        None,
+        "seed {seed}: the slot still pins with no snapshot alive"
+    );
+    vfs.enter_process(READER);
+    drop(reader);
+    vfs.enter_process(WRITER);
+    db.close().unwrap();
+}

@@ -946,6 +946,7 @@ impl Engine {
             close_done: AtomicBool::new(false),
             application_owned: mode == Mode::ApplicationOwned,
             no_writes,
+            lock_file: Some(file.clone()),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1490,7 +1491,7 @@ impl Engine {
         shm_config.dir = options.shm_dir.clone();
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Reader, &shm_config)?;
         let shards = shm.shard_count() as usize;
-        let slot = shm.claim_reader_slot(vfs.current_process())?;
+        let slot = shm.claim_reader_slot_locked(vfs.current_process(), &file)?;
         let (catalog, _) = manifest::load(&opened, shards, Arc::clone(&registry))?;
         let manifest_version = opened.root().manifest_version;
         let manifest_file = opened.file().clone();
@@ -1552,6 +1553,7 @@ impl Engine {
             close_done: AtomicBool::new(false),
             application_owned: false,
             no_writes: true,
+            lock_file: None,
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -3997,9 +3999,13 @@ impl Inner {
             let a = &mut *guard;
             if a.shm.is_stale() {
                 let shm = a.shm.reattach(&self.shared.vfs, &r.file)?;
-                let slot = shm.claim_reader_slot(self.shared.vfs.current_process())?;
-                // Snapshots of the old generation keep counting there: they can no longer be
-                // read, so they must not hold this generation's pin back.
+                // The old slot's liveness byte is on this same file handle: give it up before
+                // claiming in the new generation (`ReaderSlot::abandon`).
+                a.pins.abandon();
+                let slot =
+                    shm.claim_reader_slot_locked(self.shared.vfs.current_process(), &r.file)?;
+                // Snapshots of the old generation leave the abandoned slot alone: they can no
+                // longer be read, so they must not hold this generation's pin back.
                 *a = Attachment {
                     shm,
                     pins: crate::snapshot::ReaderPins::new(slot),
@@ -4008,12 +4014,15 @@ impl Inner {
                 // Start the new generation from the new writer's root.
                 r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
             } else if !a.pins.slot().is_owned() {
-                // The writer judged this process dead and freed the slot (#834 review): its
-                // snapshots now fail as expired, and pinning there could overwrite another
-                // reader's pins. Claim a fresh slot; dropping the old handle leaves the old
-                // slot alone, since it no longer names this process.
+                // The slot was freed under this process (#834 review). Defensive since #693
+                // PR 3: the writer frees a slot only once it holds the slot's liveness lock,
+                // which this process holds until it drops the slot. If it happened anyway,
+                // the snapshots fail as expired and pinning there could overwrite another
+                // reader's pins: abandon it and claim a fresh slot.
+                a.pins.abandon();
                 a.pins = crate::snapshot::ReaderPins::new(
-                    a.shm.claim_reader_slot(self.shared.vfs.current_process())?,
+                    a.shm
+                        .claim_reader_slot_locked(self.shared.vfs.current_process(), &r.file)?,
                 );
             }
             // The slot pins exactly what this reader's live snapshots need: this one's seqno
