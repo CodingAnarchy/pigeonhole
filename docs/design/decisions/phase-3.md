@@ -2365,3 +2365,24 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - **`transact`, `RetryPolicy` and the transaction counters** are ICR 0060 part 2 and ICR 0061; `get_row` and the write ops are ICR 0062.
 - **The black-box serializability checker** (#868) runs in CI and in sweeps.
 
+<a id="d273"></a>
+## D273 — Read validation reads a column's first version only, where D271's order holds (owner decision, 2026-10-22; engine, #708 candidate 3; builds on D271)
+
+**Decided:**
+- **The invariant.** Since D271, every default timestamp comes from the one allocator, monotone in seqno. A cell's versions sort newest timestamp first, then newest seqno first among equal timestamps. So when every version of a cell has a default timestamp, **its first version holds its largest seqno**.
+- **Validation** (`ShardState::conflicts`, a transaction's or conditional write's read checked at PREPARE or in its group) looks for any entry of the read `(row, family)` with a seqno above the snapshot. In a memtable where the invariant holds, it reads each column's first version, steps once, and seeks past the column only when the next entry is an older version of it. A hot row is O(columns), not O(versions). A conflict still returns at the first newer entry.
+- **The fallback is exact.** A memtable is walked whole, as before, when it holds any cell the invariant can't vouch for. Its `MemEntry::explicit_ts` flag is set on every memtable a batch wrote when:
+  - the batch holds any cell with an explicit timestamp, whose version can sit behind newer ones with a larger seqno;
+  - the batch is a replayed record, which may come from a build before D271.
+
+  It's a superset, so it stays exact. The decode already in `apply` (dedup's scan) notes the batch-level bit once; `apply` ORs it into each memtable it writes. The flag travels with the memtable when it freezes.
+- **Write-path cost** (x86 callgrind against main): commit-one +21, commit-at +9, commit-sixteen +141 (+0.28%), the lowest worst case of four forms measured. A per-cell flag was +194 on commit-sixteen; a cold after-loop pass was +59 on commit-at, which writes explicit timestamps.
+- **SSTs keep the full walk.** A per-SST flag would need a format change. Validation already skips every SST whose newest seqno is at or below the snapshot. The SST share is measured (test hook `validate_sst_entries`). If it matters, the format change follows after 1.0 or under D269's `ro_compat` rules.
+
+**Why:** #708's box decomposition: transfer at 16 clients, a cross-shard commit cycle of 570–647 µs. Validation was the largest single step (215–231 µs, 35–41%), walking every buffered version of the hot account when no conflict was found. It sits on the hot account's serial path.
+
+**Tests** (`tests/tablets.rs`, test hooks `Engine::{validate_entries, validate_sst_entries}`):
+- `a_hot_rows_validation_reads_one_version_and_still_conflicts`: a 2,000-version row validates in at most 2 entries, and a write after the snapshot still conflicts.
+- `an_explicit_older_timestamp_behind_newer_versions_still_conflicts`: an explicitly older write behind 50 newer versions still conflicts.
+- `a_replayed_memtable_is_validated_whole`: after a process crash, the replayed memtable is walked whole (at least 200 entries) and still conflicts.
+- **Mutations:** ignoring the flag fails the second and third tests; walking always fails the first.
