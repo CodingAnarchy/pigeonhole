@@ -4778,7 +4778,7 @@ impl ShardState {
             }
         };
         let g = if GC_COUNT { GC_STATS[0].fetch_add(1, Ordering::Relaxed) + 1 } else { 1 };
-        if GC_COUNT && g % (1 << 20) == 0 {
+        if GC_COUNT && g % (1 << 16) == 0 {
             eprintln!(
                 "GCLOCK groups {g} flag_fires {} decisions {}",
                 GC_STATS[1].load(Ordering::Relaxed),
