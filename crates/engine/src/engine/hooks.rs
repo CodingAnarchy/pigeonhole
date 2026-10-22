@@ -88,6 +88,10 @@ pub(crate) struct Hooks {
     /// Makes the next group's second member wait for arena room, as a full arena would
     /// (`Engine::force_room_wait_once`, #315 review).
     pub room_wait_once: AtomicBool,
+    /// The next freeze finds no chunk for a fresh memtable, as a starved arena would give
+    /// it: a closing shard then flushes the active memtable in place (#111, #838;
+    /// `Engine::force_freeze_starved_once`).
+    pub freeze_starved_once: AtomicBool,
     /// Runs in the next writer `snapshot()`, between pinning its seqno and loading the view
     /// (`Engine::before_snapshot_view_load`, #315 review).
     pub before_snapshot_view_load: Once,
@@ -161,6 +165,9 @@ pub(crate) struct ShardCounters {
     /// Compactions whose purge a write voided before they installed
     /// (`Engine::compaction_purge_voids`, #316).
     pub purge_voids: AtomicU64,
+    /// Flushes the manifest refused because a delete voided one of their purge guards,
+    /// flushed again without it (#287), `Engine::flush_voids` (#838's test).
+    pub voided_flushes: AtomicU64,
     /// The busy fraction the shard's balancer measures (millionths plus one; 0 measures the
     /// thread's real busy time), `Engine::set_shard_busy` (D217's packing tests).
     pub busy_override: AtomicU64,
@@ -695,6 +702,17 @@ impl Engine {
             .store(true, Ordering::Release);
     }
 
+    /// The next freeze finds no chunk for a fresh memtable, as a starved arena would give
+    /// it: a closing shard then flushes the active memtable in place (#111, #838; test hook).
+    #[doc(hidden)]
+    pub fn force_freeze_starved_once(&self) {
+        self.inner
+            .shared
+            .hooks
+            .freeze_starved_once
+            .store(true, Ordering::Release);
+    }
+
     /// Runs `f` once, on the calling thread of the next writer `snapshot()`, after it pinned
     /// its seqno and before it loads the view: where a test publishes a flush in between
     /// (#315 review; test hook).
@@ -947,6 +965,16 @@ impl Engine {
         self.inner.shared.metrics[shard]
             .hooks
             .purge_voids
+            .load(Ordering::Relaxed)
+    }
+
+    /// How many flushes on shard `shard` the manifest refused for a purge guard a delete had
+    /// voided, so that they flushed again without it (#287, test hook).
+    #[doc(hidden)]
+    pub fn flush_voids(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .voided_flushes
             .load(Ordering::Relaxed)
     }
 
