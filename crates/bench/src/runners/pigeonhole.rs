@@ -1220,6 +1220,10 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
     crate::Stalls {
         write_stalls: m.write_stalls,
         write_stall_nanos: m.write_stall_nanos,
+        room_stalls: m.room_stalls,
+        room_stall_nanos: m.room_stall_nanos,
+        pacing_stalls: m.pacing_stalls,
+        pacing_stall_nanos: m.pacing_stall_nanos,
         flushes: m.flushes,
         compactions: m.compactions,
         unpin_passes: m.wal_unpin_passes,

@@ -605,10 +605,24 @@ impl EngineCommit {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stalls {
     /// Commits that waited for memtable room or the L0 token bucket, and the time they
-    /// waited.
+    /// waited: the sum of the two kinds below.
     pub write_stalls: u64,
     /// See [`Stalls::write_stalls`].
     pub write_stall_nanos: u64,
+    /// Waits for memtable arena room (arena pressure), and their time (ICR 0054). Absent
+    /// from results written before them.
+    #[serde(default)]
+    pub room_stalls: u64,
+    /// See [`Stalls::room_stalls`].
+    #[serde(default)]
+    pub room_stall_nanos: u64,
+    /// L0 pacing spans (compaction debt), and their time (ICR 0054). Absent from results
+    /// written before them.
+    #[serde(default)]
+    pub pacing_stalls: u64,
+    /// See [`Stalls::pacing_stalls`].
+    #[serde(default)]
+    pub pacing_stall_nanos: u64,
     /// Flushes and compactions completed.
     pub flushes: u64,
     /// See [`Stalls::flushes`].
@@ -729,6 +743,10 @@ impl Stalls {
         Stalls {
             write_stalls: d(before.write_stalls, after.write_stalls),
             write_stall_nanos: d(before.write_stall_nanos, after.write_stall_nanos),
+            room_stalls: d(before.room_stalls, after.room_stalls),
+            room_stall_nanos: d(before.room_stall_nanos, after.room_stall_nanos),
+            pacing_stalls: d(before.pacing_stalls, after.pacing_stalls),
+            pacing_stall_nanos: d(before.pacing_stall_nanos, after.pacing_stall_nanos),
             flushes: d(before.flushes, after.flushes),
             compactions: d(before.compactions, after.compactions),
             unpin_passes: d(before.unpin_passes, after.unpin_passes),
@@ -1386,19 +1404,23 @@ impl Suite {
             .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)))
             .collect();
         if !stalled.is_empty() {
-            s.push_str("\n| Workload | Store | Threads | Write stalls | Stalled ms | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | WAL rollover blocks | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) | Slot refusals |\n");
+            s.push_str("\n| Workload | Store | Threads | Write stalls (room / pacing) | Stalled ms (room / pacing) | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | WAL rollover blocks | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) | Slot refusals |\n");
             s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
             for (r, st) in stalled {
                 let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
                 let per_op = |n: u64| format!("{:.2}", n as f64 / r.operations.max(1) as f64);
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} |",
+                    "| {} | {} | {} | {} ({} / {}) | {} ({} / {}) | {} | {} | {} ({}) | {} | {} | {} | {} | {} | {} | {} | {} ({}) | {} |",
                     r.workload,
                     r.store,
                     r.threads,
                     st.write_stalls,
+                    st.room_stalls,
+                    st.pacing_stalls,
                     ms(st.write_stall_nanos),
+                    ms(st.room_stall_nanos),
+                    ms(st.pacing_stall_nanos),
                     st.flushes,
                     st.compactions,
                     st.unpin_passes,

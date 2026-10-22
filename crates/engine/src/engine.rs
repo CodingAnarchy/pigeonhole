@@ -119,8 +119,16 @@ pub struct Metrics {
     pub flush_failures: u64,
     /// Compactions that failed or could not start (their slot backs off, then retries).
     pub compaction_failures: u64,
-    /// Write stalls (token-bucket waits and refused commits) and total stalled nanoseconds.
+    /// Write stalls and total stalled nanoseconds: the sum of `room_stalls` and
+    /// `pacing_stalls`, kept as it was before the split (ICR 0054).
     pub stalls: (u64, u64),
+    /// Waits for memtable arena room (D124): commits held until a flush frees room. A count
+    /// of waits begun and the nanoseconds spent in them, summed over shards.
+    pub room_stalls: (u64, u64),
+    /// L0 pacing (D119): commits held by the token bucket while L0 is too deep, until
+    /// compaction catches up. A count of pacing spans begun and the nanoseconds spent in
+    /// them, summed over shards.
+    pub pacing_stalls: (u64, u64),
     /// Block cache lookups that hit and that missed since open (#57). A miss is a block read
     /// from the file; with the cache disabled (`block_cache_bytes` 0) nothing is counted.
     pub block_cache: (u64, u64),
@@ -2392,8 +2400,10 @@ impl Engine {
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.flush_failures += s.flush_failures.load(Ordering::Relaxed);
             m.compaction_failures += s.compaction_failures.load(Ordering::Relaxed);
-            m.stalls.0 += s.stalls.load(Ordering::Relaxed);
-            m.stalls.1 += s.stall_nanos.load(Ordering::Relaxed);
+            m.room_stalls.0 += s.room_stalls.load(Ordering::Relaxed);
+            m.room_stalls.1 += s.room_stall_nanos.load(Ordering::Relaxed);
+            m.pacing_stalls.0 += s.pacing_stalls.load(Ordering::Relaxed);
+            m.pacing_stalls.1 += s.pacing_stall_nanos.load(Ordering::Relaxed);
             m.unpin.0 += s.unpin_passes.load(Ordering::Relaxed);
             m.unpin.1 += s.unpin_flushes.load(Ordering::Relaxed);
             m.wal_inline_syncs += s.wal.get().map_or(0, |c| c.inline_rollover_syncs());
@@ -2414,6 +2424,10 @@ impl Engine {
             x.max_attempts_reading = x.max_attempts_reading.max(most(1));
         }
         let pager = shared.pager.stats();
+        m.stalls = (
+            m.room_stalls.0 + m.pacing_stalls.0,
+            m.room_stalls.1 + m.pacing_stalls.1,
+        );
         m.file_growths = (pager.growths, pager.growth_nanos);
         m.file_growths_ahead = (pager.growths_ahead, pager.ahead_nanos);
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);

@@ -45,10 +45,23 @@ pub struct EngineMetrics {
     /// Compactions that failed or could not start. Their slot backs off, then retries.
     pub compaction_failures: u64,
     /// Write stalls: times a shard paced or held its commits because L0 was too deep, or
-    /// because its memtable arena had no room until a flush freed some.
+    /// because its memtable arena had no room until a flush freed some. The sum of
+    /// `room_stalls` and `pacing_stalls`.
     pub write_stalls: u64,
-    /// Nanoseconds the shards spent in those stalls, summed over shards.
+    /// Nanoseconds the shards spent in those stalls, summed over shards: the sum of
+    /// `room_stall_nanos` and `pacing_stall_nanos`.
     pub write_stall_nanos: u64,
+    /// Times a shard held its commits because its memtable arena had no room, until a
+    /// flush freed some. Many of these point at arena pressure: too small an arena, or
+    /// snapshots holding flushed memtables.
+    pub room_stalls: u64,
+    /// Nanoseconds the shards spent waiting for arena room, summed over shards.
+    pub room_stall_nanos: u64,
+    /// Times a shard paced its commits because L0 was too deep, until compaction caught
+    /// up. Many of these point at compaction debt.
+    pub pacing_stalls: u64,
+    /// Nanoseconds the shards spent pacing commits, summed over shards.
+    pub pacing_stall_nanos: u64,
     /// Block cache lookups that found the block. With the cache disabled
     /// (`Options::block_cache(0)`) nothing is counted.
     pub block_cache_hits: u64,
@@ -256,6 +269,10 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
             compaction_failures: m.compaction_failures,
             write_stalls: m.stalls.0,
             write_stall_nanos: m.stalls.1,
+            room_stalls: m.room_stalls.0,
+            room_stall_nanos: m.room_stalls.1,
+            pacing_stalls: m.pacing_stalls.0,
+            pacing_stall_nanos: m.pacing_stalls.1,
             block_cache_hits: m.block_cache.0,
             block_cache_misses: m.block_cache.1,
             block_cache_capacity_bytes: m.block_cache_capacity,
@@ -320,6 +337,8 @@ mod tests {
         m.commits = [1, 2, 3, 4];
         m.commit_latency_nanos[Durability::Sync as usize] = [10, 20, 30];
         m.stalls = (5, 6);
+        m.room_stalls = (31, 32);
+        m.pacing_stalls = (33, 34);
         m.block_cache = (7, 8);
         m.unpin = (9, 10);
         m.file_growths = (11, 12);
@@ -340,6 +359,8 @@ mod tests {
             (4, 10, 20, 30)
         );
         assert_eq!((e.write_stalls, e.write_stall_nanos), (5, 6));
+        assert_eq!((e.room_stalls, e.room_stall_nanos), (31, 32));
+        assert_eq!((e.pacing_stalls, e.pacing_stall_nanos), (33, 34));
         assert_eq!((e.block_cache_hits, e.block_cache_misses), (7, 8));
         assert_eq!((e.wal_unpin_passes, e.wal_unpin_flushes), (9, 10));
         assert_eq!((e.file_growths, e.file_growth_nanos), (11, 12));

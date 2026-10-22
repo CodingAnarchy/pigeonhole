@@ -2221,7 +2221,9 @@ impl ShardState {
             .load_override(LoadTerm::Pool)
             .unwrap_or(pools);
         // This pass's stall bit, then the count over the window.
-        let events = self.shared.metrics[me].stalls.load(Ordering::Relaxed);
+        let m = &self.shared.metrics[me];
+        let events =
+            m.room_stalls.load(Ordering::Relaxed) + m.pacing_stalls.load(Ordering::Relaxed);
         let stalled_now = events > self.stall_events_mark || self.stall_open();
         self.stall_events_mark = events;
         self.stall_history = (self.stall_history << 1) | u32::from(stalled_now);
