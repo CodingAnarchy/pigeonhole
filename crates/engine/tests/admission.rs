@@ -173,14 +173,19 @@ fn pending_commits_stay_send_and_sync() {
 fn a_full_shard_does_not_hold_another_shards_async_commits() {
     // D236: each shard's charges are its own. With shard 0 at its bound, an async commit to
     // a row shard 1 owns submits at once, and its charge comes back to shard 1 alone.
+    // Application-owned, so shard 1 applies the commit only when this thread runs it: an
+    // engine-owned shard thread could apply it and return the charge before the check.
     let vfs = SimVfs::new(2205);
-    let mut o = common::options(vfs, 2, 1 << 20);
+    let mut o = common::options(std::sync::Arc::clone(&vfs), 2, 1 << 20);
     o.async_commit_bound = 1_000;
-    let db = Engine::open(Path::new(DB), o).unwrap();
+    let db = Engine::open(Path::new(DB), o.clone()).unwrap();
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
     db.split_table(t.id, vec![b"m".to_vec()], &[0, 1]).unwrap();
+    db.close().unwrap();
+    drop(db);
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
     assert_eq!(db.shard_of(t.id, b"a"), Some(0));
     assert_eq!(db.shard_of(t.id, b"z"), Some(1));
     let held = db.admit(&batch(&t, b"a", 1_000));
@@ -192,9 +197,21 @@ fn a_full_shard_does_not_hold_another_shards_async_commits() {
     assert!(waiting.poll_admit(&mut cx).is_pending());
     // Shard 1 is empty: a commit to it is charged there and submitted at once.
     let durable = Some(Durability::Buffered);
-    let pending = db.submit_async(batch(&t, b"z", 8), durable).unwrap();
-    assert!(db.admission_inflight(1) > 0);
-    pending.wait().unwrap();
+    let mut pending = db.submit_async(batch(&t, b"z", 8), durable).unwrap();
+    assert!(db.admission_inflight(1) > 0, "shard 1 took no charge");
+    let mut resolved = None;
+    for _ in 0..1_000 {
+        for s in shards.iter_mut() {
+            s.run_once(u64::MAX);
+        }
+        if let Poll::Ready(r) = Pin::new(&mut pending).poll(&mut cx) {
+            resolved = Some(r);
+            break;
+        }
+    }
+    resolved
+        .expect("the commit to shard 1 never resolved")
+        .unwrap();
     assert_eq!(
         db.admission_inflight(1),
         0,
@@ -207,5 +224,6 @@ fn a_full_shard_does_not_hold_another_shards_async_commits() {
     assert!(waiting.poll_admit(&mut cx).is_ready());
     drop(waiting);
     assert_eq!(db.admission_inflight(0), 0);
-    db.close().unwrap();
+    drop(shards);
+    drop(db);
 }
