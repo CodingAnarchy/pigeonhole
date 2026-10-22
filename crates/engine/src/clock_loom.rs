@@ -29,7 +29,8 @@ struct Shared {
     mirror: AtomicU64,
     pending: [AtomicU64; 2],
     applied: [AtomicBool; 4],
-    stamps: Mutex<Vec<(u64, u64, bool)>>,
+    /// Each writer's `(seqno, timestamp)`, read after the joins.
+    stamps: [[AtomicU64; 2]; 2],
 }
 
 /// Writer `i`: one reservation (a group of one when `!decision`, else a decision), stamped
@@ -56,7 +57,8 @@ fn write(sh: &Shared, i: usize, decision: bool, now: u64) {
     };
     sh.pending[i].store(s, Ordering::Release);
     sh.mirror.fetch_max(s + 1, Ordering::AcqRel);
-    sh.stamps.lock().unwrap().push((s, t, decision));
+    sh.stamps[i][0].store(s, Ordering::Relaxed);
+    sh.stamps[i][1].store(t, Ordering::Relaxed);
     sh.applied[s as usize].store(true, Ordering::Release);
     sh.pending[i].store(u64::MAX, Ordering::Release);
 }
@@ -69,9 +71,15 @@ fn visible(sh: &Shared) -> u64 {
     lowest.saturating_sub(1)
 }
 
+/// Set when some explored execution's reader saw a seqno visible, so the check above is not
+/// vacuous (outside loom: it spans executions).
+static SAW_PROGRESS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[test]
 fn loom_the_mirror_never_shows_an_unapplied_seqno_and_stamps_follow_seqnos() {
-    loom::model(|| {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
         let sh = Arc::new(Shared {
             clock: Mutex::new(Clock {
                 next: 1,
@@ -86,7 +94,7 @@ fn loom_the_mirror_never_shows_an_unapplied_seqno_and_stamps_follow_seqnos() {
                 AtomicBool::new(false),
                 AtomicBool::new(false),
             ],
-            stamps: Mutex::new(Vec::new()),
+            stamps: Default::default(),
         });
         // A group and a decision in the same µs, on two shards.
         let a = {
@@ -97,28 +105,43 @@ fn loom_the_mirror_never_shows_an_unapplied_seqno_and_stamps_follow_seqnos() {
             let sh = Arc::clone(&sh);
             thread::spawn(move || write(&sh, 1, true, 5))
         };
-        // A reader process.
-        let v = visible(&sh);
-        for s in 1..=v {
-            assert!(
-                sh.applied[s as usize].load(Ordering::Acquire),
-                "seqno {s} visible (v = {v}) before it was applied"
-            );
-        }
+        // A reader process, on a thread of its own.
+        let r = {
+            let sh = Arc::clone(&sh);
+            thread::spawn(move || {
+                let v = visible(&sh);
+                for s in 1..=v {
+                    assert!(
+                        sh.applied[s as usize].load(Ordering::Acquire),
+                        "seqno {s} visible (v = {v}) before it was applied"
+                    );
+                }
+                if v > 0 {
+                    SAW_PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        };
         a.join().unwrap();
         b.join().unwrap();
-        let mut stamps = sh.stamps.lock().unwrap().clone();
-        stamps.sort_unstable();
-        for w in stamps.windows(2) {
-            let ((_, t0, _), (_, t1, d1)) = (w[0], w[1]);
-            assert!(t1 >= t0, "{stamps:?}");
-            if d1 {
-                assert!(t1 > t0, "a decision tied an earlier stamp: {stamps:?}");
-            }
-        }
-        // A group after a decision in the same µs is above it (the flag).
-        if let [(_, _, true), (_, t1, false)] = stamps[..] {
-            assert!(t1 > stamps[0].1, "{stamps:?}");
+        r.join().unwrap();
+        // Writer 0 reserved a group, writer 1 a decision, in the same µs.
+        let stamp = |i: usize| {
+            (
+                sh.stamps[i][0].load(Ordering::Relaxed),
+                sh.stamps[i][1].load(Ordering::Relaxed),
+            )
+        };
+        let ((sg, tg), (sd, td)) = (stamp(0), stamp(1));
+        // The decision is strictly above the group if after it, and the group strictly above
+        // the decision if after it (the flag): never a tie, and never out of seqno order.
+        if sg < sd {
+            assert!(td > tg, "group ({sg}, {tg}), decision ({sd}, {td})");
+        } else {
+            assert!(tg > td, "decision ({sd}, {td}), group ({sg}, {tg})");
         }
     });
+    assert!(
+        SAW_PROGRESS.load(std::sync::atomic::Ordering::Relaxed),
+        "no explored execution's reader saw a seqno visible"
+    );
 }
