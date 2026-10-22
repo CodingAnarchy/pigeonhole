@@ -43,8 +43,9 @@ impl Reservation {
         self.lock().next = next;
     }
 
-    /// Raises `H` to `h` (at open: the largest of the clock, the manifest's floor and every
-    /// replayed timestamp).
+    /// Raises `H` to `h` (at open: the manifest's floor and every replayed timestamp, not the
+    /// clock: every reservation takes `now` into account itself, and a decision just after
+    /// the reopen must not be pushed past it).
     pub(crate) fn seed_ts(&self, h: Timestamp) {
         let mut st = self.lock();
         st.h = st.h.max(h);

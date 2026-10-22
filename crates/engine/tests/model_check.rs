@@ -864,6 +864,29 @@ fn hot_rows_blind_overlaps_through_crashes() {
 }
 
 #[test]
+fn hot_rows_conditional_singles_beside_blind_cross_shard_writers() {
+    // D271 (perf287's M1): conditional singles on a few Zipfian rows beside blind batches
+    // across shards, with deferred I/O so decisions land while singles wait. A blind PREPARE
+    // writing a row a waiting single reads must land after the single, or the single's
+    // predicate reads a state its seqno says is stale (the checker replays in seqno order).
+    for shards in [2usize, 4] {
+        let mut cfg = Config::quiet(600);
+        cfg.shards = shards;
+        cfg.tasks = 64;
+        (cfg.cas_ppm, cfg.txn_ppm) = (300_000, 0);
+        cfg.deferred_io = true;
+        cfg.spec.zipf_theta = 0.99;
+        cfg.spec.rows = 50;
+        cfg.spec.read_fraction = 0.1;
+        cfg.spec.delete_fraction = 0.0;
+        cfg.spec.max_batch = 4;
+        for seed in seeds() {
+            check(seed, &cfg);
+        }
+    }
+}
+
+#[test]
 fn hot_rows_mix_reading_commits_and_blind_writers() {
     // D267, kept for D271: transactions and conditional writes (commits that read) beside
     // blind batches on a few Zipfian rows: fences, and refusals of reads over undecided
