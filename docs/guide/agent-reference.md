@@ -257,7 +257,7 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 | `Scan::stream(self) -> RowStream<'t>` | `futures_core::Stream<Item = Result<Row>>`, key order; setup error is the first item. Fetches the next step's blocks only as polled. |
 | `RowMutation::commit_async(self) -> CommitFuture` | `Output = Result<CommitInfo>`. Submitted at the call when its shard has room, else when polled with room (D210); resolves when durable and visible. |
 | `WriteBatch::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | As above. |
-| `Transaction::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | `Conflict` on a conflicting commit. |
+| `Transaction::commit_async(self)` / `commit_with_async(self, Durability) -> TransactionCommitFuture` | `Conflict` on a conflicting commit. Its own future type (ICR 0060): a `CommitFuture` that also counts the outcome in `EngineMetrics`' transaction counters (ICR 0061). |
 | `RowMutation::commit_if_async(self, &Condition) -> CheckFuture` | `Output = Result<Option<CommitInfo>>`; `None` if the condition failed. |
 | `Transaction::get_async(&mut self, &Table, row, family, qualifier) -> GetFuture` | Read recorded at the call (a dropped future still counts at commit). |
 | `Pigeonhole::flush_async(&self)` / `compact_async(&self) -> MaintenanceFuture` | `Output = Result<()>`; dropping does not stop it. |

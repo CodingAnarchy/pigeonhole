@@ -64,6 +64,13 @@ ICR 0050 gives a commit refused by the failed engine while a recovery runs `Busy
 - Only `Transaction::get` records a failed read for `transact`'s retry decision; `get_async` doesn't. ICR 0062's `get_row` will record it.
 - The deadline bounds when attempts start; a running one finishes.
 
+### `Transaction::commit_async` returns `TransactionCommitFuture` (#877's callgrind)
+
+`Transaction::commit_async` and `commit_with_async` now return `pigeonhole::nonblocking::TransactionCommitFuture`, not `CommitFuture`.
+- **What it is:** a `CommitFuture` plus the count of its outcome (ICR 0061). It implements `Future<Output = Result<CommitInfo>>`, `Send`, `Unpin`.
+- **Why its own type:** counting inside the shared `CommitFuture` gave every async commit an extra field and a check on its ready path, row mutations and batches included. The `commit-async` callgrind shape rose 0.7%, past its 0.5% per-PR threshold. With the counting in its own type, `CommitFuture` is exactly as on main, and only transaction commits carry the counter.
+- **API break:** `Transaction::commit_async` returned `CommitFuture` in 0.3.0. Code that only `.await`s it is unaffected. Code that names the type, or stores transaction and other commit futures in one collection, uses `TransactionCommitFuture`, or an enum or boxed `dyn Future` over both, as `pigeonhole-bench`'s inline runner now does. Allowed in the 0.4 minor release, and listed in the changelog.
+
 ### Why the generic error
 
 `pigeonhole::Error` can't be built by applications. A `body` returning `pigeonhole::Result` couldn't give up with the application's own reason. Generic `E: From<Error>` lets `?` work on pigeonhole calls inside the body and lets the application return its own error. The transaction remembering its failed read keeps "retry this" separate from "the application gave up". A body may need `Ok::<_, pigeonhole::Error>(…)` for inference.

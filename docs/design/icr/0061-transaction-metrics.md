@@ -9,7 +9,7 @@
 - `transaction_conflicts`: transaction commits that failed with `Conflict`;
 - `transaction_retries`: attempts `Pigeonhole::transact` retried.
 
-The counts are kept by the pigeonhole handle, not the engine, so they span automatic recoveries (`Options::auto_recover`), unlike the engine's counters, which restart with each engine. Blocking and async transaction commits are both counted.
+The counts are kept by the pigeonhole handle, not the engine, so they span automatic recoveries (`Options::auto_recover`), unlike the engine's counters, which restart with each engine. Blocking and async transaction commits are both counted: an async one through its own future type, `TransactionCommitFuture` (ICR 0060), so the commit futures of row mutations and batches carry nothing for it. `commit-async` stays at main's instruction count.
 
 ## Why
 

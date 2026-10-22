@@ -179,6 +179,7 @@ fn a_ticket_is_waited_on_checked_or_awaited() {
 fn async_commits_from_many_threads_join_the_same_groups() {
     fn assert_send<T: Send + 'static>() {}
     assert_send::<CommitFuture>();
+    assert_send::<pigeonhole::nonblocking::TransactionCommitFuture>();
     assert_send::<pigeonhole::CommitTicket>();
     let vfs = SimVfs::new(4205);
     let db = Pigeonhole::open("/db/m.phdb", sim_options(&vfs)).unwrap();
