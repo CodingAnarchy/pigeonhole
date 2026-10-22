@@ -6682,11 +6682,8 @@ impl ShardState {
     fn conflicts_with_group(&self, m: &Member, admitted: &[Member]) -> (bool, bool) {
         let mut same = false;
         let mut pending = false;
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
-            for mu in batch.iter().flatten() {
-                pending |= self.pending_rows.contains_key(&hash_row(mu.table, mu.row));
-            }
-        }
+        // D271: its writes over an undecided share's writes are ordered by the one allocator;
+        // over its reads, `overlaps_undecided` refused them already. What it reads counts.
         if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 let h = hash_row(r.table, &r.row);
