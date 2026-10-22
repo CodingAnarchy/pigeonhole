@@ -7321,3 +7321,98 @@ fn a_fence_ends_with_its_readers_last_attempt_even_with_nothing_waiting() {
         before
     );
 }
+
+/// D273: a transaction reading `row` (column `q` of family `f`) and writing `out`, submitted
+/// once its snapshot is taken; `between` runs after the read and before the submit.
+fn txn_reading(
+    db: &mut Db,
+    row: &[u8],
+    out: &[u8],
+    between: impl FnOnce(&mut Db),
+) -> pigeonhole_engine::Result<pigeonhole_engine::CommitInfo> {
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, row, b"q").unwrap();
+    t.batch()
+        .put(id, f, out, b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    between(db);
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    poll_until(db, &mut pc, 100_000).expect("resolved")
+}
+
+/// D273: a hot row's versions all carry D271's default timestamps, so read validation reads
+/// its column's first version only (one entry, not one per version), and a write after the
+/// snapshot still conflicts.
+#[test]
+fn a_hot_rows_validation_reads_one_version_and_still_conflicts() {
+    let mut db = open(1, |_| {});
+    for i in 0..2_000u32 {
+        db.put(b"hot", &i.to_le_bytes());
+    }
+    let before = db.engine.validate_entries(0);
+    txn_reading(&mut db, b"hot", b"out", |_| {}).expect("no conflict");
+    let visited = db.engine.validate_entries(0) - before;
+    assert!(
+        visited <= 2,
+        "validation visited {visited} entries of a 2000-version row"
+    );
+    let r = txn_reading(&mut db, b"hot", b"out", |db| {
+        db.put(b"hot", b"after");
+    });
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "{r:?}"
+    );
+}
+
+/// D273's fallback: a write with an explicit, older timestamp lands behind the column's
+/// newer versions. A memtable holding one is walked whole, so the write still conflicts
+/// with a transaction whose snapshot predates it.
+#[test]
+fn an_explicit_older_timestamp_behind_newer_versions_still_conflicts() {
+    let mut db = open(1, |_| {});
+    for i in 0..50u32 {
+        db.put(b"hot", &i.to_le_bytes());
+    }
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let r = txn_reading(&mut db, b"hot", b"out", |db| {
+        let mut wb = WriteBatch::new();
+        wb.put(id, f, b"hot", b"q", Some(1), ValueRef::Bytes(b"old"))
+            .unwrap();
+        db.commit(wb);
+    });
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "a write behind newer versions was missed: {r:?}"
+    );
+}
+
+/// D273's fallback for replay: a memtable rebuilt at open (here after a process crash, so
+/// from the WAL) may hold records from a build before D271, so it is walked whole; a write
+/// after the snapshot still conflicts.
+#[test]
+fn a_replayed_memtable_is_validated_whole() {
+    let vfs = SimVfs::new(7);
+    let mut db = open_on(&vfs, 1, |_| {});
+    for i in 0..200u32 {
+        db.put(b"hot", &i.to_le_bytes());
+    }
+    vfs.crash(pigeonhole_io::sim::CrashKind::Process);
+    drop(db);
+    let mut db = open_on(&vfs, 1, |_| {});
+    let before = db.engine.validate_entries(0);
+    txn_reading(&mut db, b"hot", b"out", |_| {}).expect("no conflict");
+    let visited = db.engine.validate_entries(0) - before;
+    assert!(
+        visited >= 200,
+        "a replayed memtable was not walked whole: {visited} entries"
+    );
+    let r = txn_reading(&mut db, b"hot", b"out", |db| {
+        db.put(b"hot", b"after");
+    });
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "{r:?}"
+    );
+}

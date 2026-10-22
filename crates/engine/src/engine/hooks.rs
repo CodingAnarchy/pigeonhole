@@ -281,6 +281,12 @@ pub(crate) struct ShardCounters {
     /// Flushes the manifest refused because a delete voided one of their purge guards,
     /// flushed again without it (#287), `Engine::flush_voids` (#838's test).
     pub voided_flushes: AtomicU64,
+    /// Entries read validation visited in the shard's memtables (`Engine::validate_entries`,
+    /// D273's tests: a hot row validates in a few entries, not one per version).
+    pub validate_entries: AtomicU64,
+    /// Entries read validation visited in the shard's SSTs (`Engine::validate_sst_entries`,
+    /// D273: SSTs keep the full walk; their share of validation is measured).
+    pub validate_sst_entries: AtomicU64,
     /// The active shard count (`k`, D217) the shard's balancer used at its last pass, plus
     /// one (0 before its first pass), `Engine::pack_ks`.
     pub pack_k: AtomicU64,
@@ -1098,6 +1104,25 @@ impl Engine {
         self.inner.shared.metrics[shard]
             .hooks
             .voided_flushes
+            .load(Ordering::Relaxed)
+    }
+
+    /// How many memtable entries read validation on shard `shard` has visited (D273, test
+    /// hook).
+    #[doc(hidden)]
+    pub fn validate_entries(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .validate_entries
+            .load(Ordering::Relaxed)
+    }
+
+    /// How many SST entries read validation on shard `shard` has visited (D273, test hook).
+    #[doc(hidden)]
+    pub fn validate_sst_entries(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .validate_sst_entries
             .load(Ordering::Relaxed)
     }
 
