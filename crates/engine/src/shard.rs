@@ -2852,6 +2852,13 @@ impl ShardState {
             }
             let reserved = tablets_on
                 && self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size);
+            #[cfg(feature = "test-hooks")]
+            let reserved = reserved
+                || self
+                    .shared
+                    .hooks
+                    .freeze_starved_once
+                    .swap(false, Ordering::AcqRel);
             let fresh = if reserved {
                 trace!(
                     "shard {} freeze {:?}: the arena's free chunks are reserved",
@@ -2933,6 +2940,20 @@ impl ShardState {
             self.publish_memtables()?;
         }
         Ok(())
+    }
+
+    /// The oldest entry of this shard's unflushed memtables (the close's slot trace, #838).
+    fn oldest_unflushed(&self) -> Option<Seqno> {
+        let flushed = self
+            .shared
+            .flushed_roots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        self.memtables
+            .values()
+            .flat_map(|slot| slot.unflushed(self.id, &flushed))
+            .filter_map(|m| m.table.seqno_range().map(|(min, _)| min))
+            .min()
     }
 
     /// Starts a flush task over everything queued, if none is running.
@@ -3108,11 +3129,19 @@ impl ShardState {
             false
         });
         let result = match result {
-            Err(_) if voided => {
+            // The refusal itself (`Busy` from the commit's closure): not a failure. Any
+            // other error with a guard voided is a failure as without one (an I/O error
+            // while closing makes the close give up, #838).
+            Err(Error::Busy) if voided => {
                 trace!(
                     "shard {} guarded flush voided by a delete; flushing again",
                     self.id.0
                 );
+                #[cfg(feature = "test-hooks")]
+                self.shared.metrics[usize::from(self.id.0)]
+                    .hooks
+                    .voided_flushes
+                    .fetch_add(1, Ordering::Relaxed);
                 self.requeue_frozen();
                 self.spawn_flush(ctx);
                 return;
@@ -3251,7 +3280,12 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            for m in &slot.frozen {
+            // The frozen memtables, and an active one a close flushes in place (#111,
+            // `Seal::Flushing`): it was in the refused flush too, and nothing else would
+            // queue it again (`freeze` skips a sealed slot), so the close waited for ever
+            // (#838).
+            let in_place = (slot.seal == Seal::Flushing).then_some(&slot.active);
+            for m in slot.frozen.iter().chain(in_place) {
                 if self.flush_queue.iter().any(|i| i.root == m.table.root()) {
                     continue;
                 }
@@ -6203,6 +6237,64 @@ impl ShardState {
             || !self.retries.is_empty()
         {
             return;
+        }
+        if tracing() && self.close_stage == CloseStage::Flushing {
+            // Every slot's memtables (#838): what `freeze` skips and `unflushed` counts.
+            let oldest = self.oldest_unflushed();
+            trace!(
+                "  shard {} close slots: oldest_unflushed={oldest:?} moving={:?} unpin={:?} \
+                 to_freeze={:?} retired={} free={}",
+                self.id.0,
+                self.moving,
+                self.unpin,
+                self.to_freeze,
+                self.retired.len(),
+                self.arena.free_bytes()
+            );
+            let flushed = self
+                .shared
+                .flushed_roots
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            {
+                for (key, slot) in &self.memtables {
+                    let a = &slot.active.table;
+                    trace!(
+                        "    slot {key:?}: seal={:?} active(root={} empty={} seqnos={:?} \
+                         bytes={} flushed={}) frozen={:?}",
+                        slot.seal,
+                        a.root(),
+                        a.is_empty(),
+                        a.seqno_range(),
+                        a.allocated_bytes(),
+                        flushed.contains(&(self.id.0, a.root())),
+                        slot.frozen
+                            .iter()
+                            .map(|m| (
+                                m.table.root(),
+                                m.table.seqno_range(),
+                                flushed.contains(&(self.id.0, m.table.root()))
+                            ))
+                            .collect::<Vec<_>>()
+                    );
+                }
+            }
+            drop(flushed);
+        }
+        if self.close_stage == CloseStage::Flushing {
+            // Every memtable a close flushes in place is queued or flushing: a refused
+            // flush re-queues it (`requeue_frozen`, #838).
+            debug_assert!(
+                self.memtables.values().all(|slot| {
+                    slot.seal != Seal::Flushing || {
+                        let root = slot.active.table.root();
+                        self.flushing.contains(&root)
+                            || self.flush_queue.iter().any(|i| i.root == root)
+                    }
+                }),
+                "shard {}: a memtable flushed in place is neither queued nor flushing",
+                self.id.0
+            );
         }
         if self.close_stage == CloseStage::Draining {
             self.close_stage = CloseStage::Flushing;
