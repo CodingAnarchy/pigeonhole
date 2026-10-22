@@ -2323,12 +2323,14 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 
 **Cost:** one lock-protected reservation per group. The prototype's lock-free form was +25 instructions per group on the commit shapes, and level on ycsb-a at 1 and 16 threads on the box (#854 §4).
 
+**Drift gauge** (ICR XXXX): `EngineMetrics::default_ts_lead_micros` is how far `H` is ahead of the clock now; `max_default_ts_lead_micros` is the largest lead at any reservation since open. Default timestamps run ahead of the clock only when one shard reserves more than one group a µs, or a group follows a decision in the same µs.
+
 **Tests** (`crates/engine/tests/tablets.rs` unless named):
 - **Admission:**
   - `a_blind_prepare_over_an_undecided_share_is_admitted_and_answers_at_once`;
   - `a_blind_single_on_an_undecided_shares_row_goes_ahead`;
   - `a_crash_with_two_shares_on_one_row_applies_the_decided_one_and_drops_the_other`.
-- **Order:** `default_timestamps_keep_seqno_order_on_every_shard_under_cross_shard_commits` and its siblings, unchanged.
+- **Order:** `default_timestamps_keep_seqno_order_on_every_shard_under_cross_shard_commits` and its siblings (`d142_sweep`, seeded). They now also check the order across shards: all streams' writes by seqno, timestamps never going back, and each decision strictly above the write before it and strictly below the write after it. They fail with the decision at `H` instead of `H + 1`, and with a group ignoring `F`. On the frozen clock they check that the drift gauge reads a lead.
 - **D249's overlap tests** now overlap through reads: `overlap_txn` reads a second family of the rows it writes.
 - **The allocator's unit tests** (`clock.rs`).
 - **The model check** in both test targets, its D267 hot-row shapes unchanged (renamed `hot_rows_blind_overlaps_*`); and a no-hang run of the contended cross-shard rows (app-owned, mixed, transfer, gate contended) at both levels.

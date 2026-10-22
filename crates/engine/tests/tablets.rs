@@ -4357,8 +4357,56 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
         }
     }
     assert!(shares > 0, "seed {seed}: no cross-shard commit");
+    // D271: one allocator gives every seqno and default timestamp, so the order holds across
+    // shards too, and a decision's timestamp is strictly above every write before it and
+    // strictly below every write after it (the flag): no write ties a decision's cells.
+    let mut all: Vec<(u64, u64)> = records
+        .iter()
+        .filter_map(|r| match r.kind {
+            pigeonhole_engine::AppendedKind::Batch => Some((r.seqno, r.commit_ts)),
+            pigeonhole_engine::AppendedKind::Prepare => committed.get(&r.seqno).copied(),
+            pigeonhole_engine::AppendedKind::Commit => None,
+        })
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    for w in all.windows(2) {
+        assert!(
+            w[1].0 > w[0].0 && w[1].1 >= w[0].1,
+            "seed {seed}: seqno {} at ts {} after seqno {} at ts {} across shards (D271)",
+            w[1].0,
+            w[1].1,
+            w[0].0,
+            w[0].1
+        );
+    }
+    let decided: std::collections::HashSet<u64> = committed.values().map(|&(s, _)| s).collect();
+    for (i, &(s, t)) in all.iter().enumerate() {
+        if !decided.contains(&s) {
+            continue;
+        }
+        if let Some(&(ps, pt)) = i.checked_sub(1).map(|j| &all[j]) {
+            assert!(
+                pt < t,
+                "seed {seed}: seqno {ps} at ts {pt} ties decision {s} at ts {t} (D271)"
+            );
+        }
+        if let Some(&(ns, nt)) = all.get(i + 1) {
+            assert!(
+                nt > t,
+                "seed {seed}: seqno {ns} at ts {nt} ties decision {s} at ts {t} (D271)"
+            );
+        }
+    }
     if !moving_clock {
         assert_eq!(busy, 0, "seed {seed}: {busy} commits gave up");
+        // The drift gauge (D271): on a frozen clock every reservation after the first runs
+        // `H` ahead of it, and the largest lead seen bounds the current one.
+        let (lead, max_lead) = db.engine.metrics().default_ts_lead_micros;
+        assert!(
+            lead > 0 && lead <= max_lead,
+            "seed {seed}: lead {lead}, max {max_lead}"
+        );
     }
     eprintln!(
         "seed {seed}: {} records, {shares} shares, {busy} busy",

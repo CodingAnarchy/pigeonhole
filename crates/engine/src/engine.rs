@@ -230,6 +230,10 @@ pub struct Metrics {
     /// Cross-shard commits' two-phase rounds and the PREPAREs participants refused, by
     /// reason (ICR 0043).
     pub cross_shard: CrossShardMetrics,
+    /// The drift gauge (D271, ICR XXXX): how far the largest default timestamp handed out is
+    /// ahead of the clock now, and the largest such lead at any reservation since open, in
+    /// µs. Both 0 while the clock leads.
+    pub default_ts_lead_micros: (u64, u64),
 }
 
 /// Cross-shard commits' two-phase rounds and refusals since open, summed over shards
@@ -2440,6 +2444,7 @@ impl Engine {
         m.file_growths = (pager.growths, pager.growth_nanos);
         m.file_growths_ahead = (pager.growths_ahead, pager.ahead_nanos);
         m.async_sync_reads = shared.async_sync_reads.load(Ordering::Relaxed);
+        m.default_ts_lead_micros = shared.clock.lead(shared.vfs.now_micros());
         m.block_cache = shared.cache.hits_and_misses();
         m.block_cache_pinned = shared.cache.pinned() as u64;
         m.block_cache_capacity = shared.cache.capacity() as u64;
