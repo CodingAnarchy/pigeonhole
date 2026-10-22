@@ -93,9 +93,11 @@ pub struct FaultPlan {
     /// Crash (as [`CrashKind::Power`]) immediately after the n-th mutating operation (write,
     /// sync, set_len, remove). Iterating `n` over every value crashes at every write point.
     pub crash_after_ops: Option<u64>,
-    /// Fail every write and sync of files whose name contains this, with `Other` and nothing
-    /// written, while set. A test forces a shard's WAL stream to fail at a point of its own
-    /// choosing (the model check's recovery arm, #880), then clears it.
+    /// Fail the next write or sync of a file whose name contains this, with `Other` and
+    /// nothing written: one shot, cleared by the simulator under its lock as it fires
+    /// (`SimVfs::scheduled_fired` counts), so it cannot outlive the operation it was set
+    /// for, whatever the threads do. A test forces a shard's WAL stream to fail at a point
+    /// of its own choosing (the model check's recovery arm, #880).
     pub fail_on: Option<&'static str>,
 }
 
@@ -239,6 +241,8 @@ struct SimState {
     next_handle: u64,
     bytes_written: u64,
     ops: u64,
+    /// Scheduled faults (`FaultPlan::fail_on`) fired so far.
+    scheduled_fired: u64,
     /// Values handed out by `Vfs::random_u64`. A counter of its own, not `rng`, so asking
     /// for one does not shift the fault decisions a seed makes.
     random_draws: u64,
@@ -397,9 +401,9 @@ impl SimState {
         self.nodes.get_mut(&id).expect("live node")
     }
 
-    /// Fails a read or write with probability `io_error_ppm / 10^6`.
-    /// Fails a write or sync of `node` while [`FaultPlan::fail_on`] names its file (#880).
-    fn scheduled(&self, node: u64, context: &'static str) -> Result<()> {
+    /// Fails a write or sync of `node` if [`FaultPlan::fail_on`] names its file, once: the
+    /// fault clears as it fires (#880).
+    fn scheduled(&mut self, node: u64, context: &'static str) -> Result<()> {
         let Some(name) = self.plan.fail_on else {
             return Ok(());
         };
@@ -408,11 +412,14 @@ impl SimState {
             .iter()
             .any(|(path, &n)| n == node && path.to_string_lossy().contains(name));
         if named {
+            self.plan.fail_on = None;
+            self.scheduled_fired += 1;
             return Err(Error::new(ErrorKind::Other, context));
         }
         Ok(())
     }
 
+    /// Fails a read or write with probability `io_error_ppm / 10^6`.
     fn inject(&mut self, context: &'static str) -> Result<()> {
         let ppm = self.plan.io_error_ppm;
         if ppm > 0 && self.rng.below(1_000_000) < u64::from(ppm) {
@@ -539,6 +546,7 @@ impl SimVfs {
                 next_handle: 1,
                 bytes_written: 0,
                 ops: 0,
+                scheduled_fired: 0,
                 random_draws: 0,
                 trace: None,
                 shm: BTreeMap::new(),
@@ -571,6 +579,11 @@ impl SimVfs {
     /// Replaces the fault plan.
     pub fn set_faults(&self, plan: FaultPlan) {
         self.state().plan = plan;
+    }
+
+    /// How many scheduled faults ([`FaultPlan::fail_on`]) have fired since the VFS was made.
+    pub fn scheduled_fired(&self) -> u64 {
+        self.state().scheduled_fired
     }
 
     /// Simulates a crash: every open handle starts failing with `Crashed`, and the stored
