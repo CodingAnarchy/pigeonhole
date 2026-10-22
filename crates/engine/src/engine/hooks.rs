@@ -942,6 +942,8 @@ impl Engine {
             .map(|f| f.0.load(Ordering::Acquire))
             .max()
             .unwrap_or(0)
+            // D271: every default timestamp comes from the one allocator, at or below `H`.
+            .max(shared.clock.last_ts())
     }
 
     /// Publishes `ts` as `shard`'s default-timestamp floor, whatever the shard assigned: what

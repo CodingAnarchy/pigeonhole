@@ -35,13 +35,17 @@ impl Reservation {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Starts at seqno `next` and timestamp `h` (at open: above every recovered seqno, and
-    /// at the largest of the clock, the manifest's floor and every replayed timestamp).
-    pub(crate) fn seed(&self, next: Seqno, h: Timestamp) {
+    /// Starts at seqno `next` (at open, once replay has passed every recovered seqno), before
+    /// anything at open reserves one.
+    pub(crate) fn seed_seqno(&self, next: Seqno) {
+        self.lock().next = next;
+    }
+
+    /// Raises `H` to `h` (at open: the largest of the clock, the manifest's floor and every
+    /// replayed timestamp).
+    pub(crate) fn seed_ts(&self, h: Timestamp) {
         let mut st = self.lock();
-        st.next = next;
-        st.h = h;
-        st.decided = false;
+        st.h = st.h.max(h);
     }
 
     /// The next seqno to reserve: a lower bound for every later reservation (FORMAT §11.3's
@@ -128,7 +132,8 @@ mod tests {
     #[test]
     fn default_timestamps_never_go_back_with_the_seqno() {
         let (r, shm) = (Reservation::default(), shm());
-        r.seed(10, 100);
+        r.seed_seqno(10);
+        r.seed_ts(100);
         // Two shards' groups, a decision, and a group in the same µs after it.
         let (s1, t1) = r.reserve_group(2, 2, 50, 0, &shm);
         let (s2, t2) = r.reserve_group(1, 1, 50, 0, &shm);
@@ -146,7 +151,7 @@ mod tests {
     #[test]
     fn a_shard_never_repeats_its_own_stamp_and_the_clock_leads_when_ahead() {
         let (r, shm) = (Reservation::default(), shm());
-        r.seed(1, 0);
+        r.seed_seqno(1);
         let (_, a) = r.reserve_group(1, 1, 500, 0, &shm);
         let (_, b) = r.reserve_group(1, 1, 500, a, &shm);
         let (_, c) = r.reserve_group(1, 1, 900, b, &shm);
