@@ -1529,6 +1529,8 @@ Each part disabled fails its test.
 
 *Amended by [D251](#d251): the tablets on ≥ 0.8× off check is judged with packing off (`Options::tablet_packing(false)`, tablet changes on); the default config's on/off ratio, packing's gap, is reported beside it (#707).*
 
+*Amended again (owner, via the coordinator, 2026-10-22): the check is judged with the default config, packing on, once more; the packing-off run's ratio is reported beside it. #707 is closed as fixed by D257 and D262: on main 9cb3dcb9 the default config read 0.989× tablets off at 32 clients and 0.988× at 16, with `k` at 16 throughout (#724 comment 6330564020).*
+
 *Owner decision, 2026-10-14: the GroupSync cross-shard p99 cap is 1 ms, set from the pre-release gate run (#705: 303 µs at the default durability).*
 
 <a id="d247"></a>
@@ -1673,7 +1675,7 @@ Every binding is still a thin wrapper over the Rust crate, never a reimplementat
    - **Turn busy, not D248's combined busy.** A shard whose group syncs run back to back may not cool however many shards share the load, so its sync term neither grows `k` nor blocks a shrink here; D248's average rule still applies to it. Each shard now also publishes its turn busy (`LoadSlot::turn_busy`).
    - **Once per hot spot.** A hot-triggered growth repeats only after the hot shard's turn busy has fallen by at least 0.02 since the last one (what it shed helped), or when another shard is the hot one. A hot spot that more shards can't cool (one unsplittable tablet) grows `k` once.
 2. **Small tablets move (amends D214).** When no tablet carries the eighth of the gap a move needs, and none dominates (the hottest is below the gap), the largest tablet that fits the coldest shard moves. The dominant-tablet case keeps D214's split.
-3. **D246's tablets check is judged with packing off (amends D246; owner, 2026-10-14).** `cross-shard-contention`'s tablets on ≥ 0.8× off compares tablet changes on with `tablet_packing(false)` against them off. The default config's ratio (packing on) is reported beside it as packing's gap. Packing targets about 0.5 busy per active shard, which caps a closed-loop, mostly cross-shard load at about half of spreading over every shard (0.48–0.63× in the 2026-10-14 A/B on the AX102, #707). Packing less when commits are mostly cross-shard is a Phase 4 design (#707).
+3. **D246's tablets check is judged with packing off (amends D246; owner, 2026-10-14).** `cross-shard-contention`'s tablets on ≥ 0.8× off compares tablet changes on with `tablet_packing(false)` against them off. The default config's ratio (packing on) is reported beside it as packing's gap. Packing targets about 0.5 busy per active shard, which caps a closed-loop, mostly cross-shard load at about half of spreading over every shard (0.48–0.63× in the 2026-10-14 A/B on the AX102, #707). Packing less when commits are mostly cross-shard is a Phase 4 design (#707). *Superseded (owner, 2026-10-22): D257 and D262 closed the gap (0.989× at 32 clients, `k` 16 throughout; #724 comment 6330564020), #707 is closed, and D246's check is judged with packing on again.*
 
 **Why** (the pre-release gate, 175c0ffc, AX102, 2026-10-14): `cross-shard-contention` with tablet changes on ran at 184K ops/s, against 384K off.
 - The load had packed the table onto `k` = 2 (the slot floor: 22 tablets × 4 families). In the measured phase, shard 0 held 16 tablets at 0.98 busy and shard 1 held 6 at 0.31.
