@@ -1500,7 +1500,8 @@ impl Run {
 
     fn step(&mut self, op: Op, rng: &mut Rng) -> Result<(), String> {
         self.vfs.advance(1_000);
-        let now = self.now();
+        // A commit retried after a recovery moves it on (below).
+        let mut now = self.now();
         match op {
             Op::Commit(ops, durability) => {
                 let ops = self.prepare(ops);
@@ -1621,7 +1622,15 @@ impl Run {
                                 }
                                 retried = true;
                                 self.stats.retried += 1;
-                                self.trace.push("  -> the commit is retried".into());
+                                // The refused attempt was stamped at `now`, and the recovered
+                                // engine's timestamp floor may already hold that stamp (D11:
+                                // a floor can include stamps whose commits never landed), so
+                                // the retry is stamped above it. Move the clock past it and
+                                // record the retry at its own time (#881, seed 63).
+                                self.vfs.advance(1_000);
+                                now = self.now();
+                                self.trace
+                                    .push(format!("  -> the commit is retried at ts={now}"));
                                 result = self.commit(&ops, durability, async_front);
                             }
                             Err(e) if e.code() == ErrorCode::Busy => {
