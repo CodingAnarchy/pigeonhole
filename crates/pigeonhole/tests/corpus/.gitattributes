@@ -1,0 +1,3 @@
+# Corpus files are compared byte for byte (database files) and line for line
+# (expected.txt): never convert line endings.
+* -text

@@ -1,0 +1,3 @@
+# The corpus databases are checked in (the root .gitignore excludes *.phdb).
+!*.phdb
+!*.phdb-wal-*
