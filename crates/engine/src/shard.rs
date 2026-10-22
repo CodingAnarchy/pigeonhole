@@ -62,11 +62,6 @@ const ENTRY_OVERHEAD: usize = 12 + 4 * 16 + 8;
 const KEY_FIXED: usize = 2 + 2 + 17;
 /// Token-bucket capacity (groups) and refill rate at an L0 score of 1 (groups per second).
 const STALL_CAPACITY: f64 = 8.0;
-/// The most undecided shares one row takes before a further PREPARE on it is refused
-/// instead of chained, unless that PREPARE is older than all of them (D267): it bounds the
-/// shares ahead of a single that starts waiting on the row. In the app-owned row's local
-/// A/B (#816) 8 and 32 measured alike.
-const CHAIN_CAP: u32 = 8;
 /// Bytes a logged record counts for on top of its payload (framing and record header),
 /// for the WAL pin limit (#137).
 const LOGGED_OVERHEAD: u64 = 64;
@@ -266,11 +261,6 @@ pub(crate) struct CrossShardCounters {
     /// The time this shard had at least one single held back behind an
     /// undecided share (D263).
     pub share_wait_nanos: AtomicU64,
-    /// PREPAREs this shard admitted behind an undecided share or a waiting single, their
-    /// `Prepared` held until those were decided or logged (D267).
-    pub chained: AtomicU64,
-    /// Younger undecided shares this shard wounded for a share chained behind them (D267).
-    pub wounds: AtomicU64,
     /// The most attempts a commit this shard coordinated took to commit: blind commits,
     /// then commits that read (validated reads).
     pub max_attempts: [AtomicU64; 2],
@@ -1382,13 +1372,6 @@ pub(crate) enum ShardMsg {
     Released {
         priority: CommitPriority,
     },
-    /// An older commit's share was admitted at `from` behind this undecided attempt (D267):
-    /// the coordinator aborts the attempt now unless it is decided, and its retry waits for
-    /// `from`'s overlap wake.
-    Wound {
-        seqno: Seqno,
-        from: ShardId,
-    },
     Decide {
         seqno: Seqno,
         commit: bool,
@@ -1765,16 +1748,6 @@ pub(crate) struct WaitingSingle {
     pub rows: Vec<u64>,
 }
 
-/// A share admitted behind undecided shares it overlaps (D267, `ShardState::chained`).
-#[derive(Debug)]
-pub(crate) struct ChainedShare {
-    pub coordinator: ShardId,
-    /// The overlapped shares still undecided here, and the waiting singles not yet logged.
-    pub behind: usize,
-    /// Logged: its `Prepared` waits only for `behind` to reach zero.
-    pub logged: bool,
-}
-
 /// A share this shard prepared and holds until the decision.
 #[derive(Debug)]
 struct PreparedShare {
@@ -1793,8 +1766,6 @@ struct PreparedShare {
     priority: CommitPriority,
     /// `PrepareReq::submitted_at` (D262).
     submitted_at: u64,
-    /// The commit's coordinator, told when a share chains behind this one (D267).
-    coordinator: ShardId,
 }
 
 /// A memtable with what flush and compaction need to know about it: the smallest user
@@ -2792,19 +2763,10 @@ pub(crate) struct ShardState {
     /// Coordinators whose PREPAREs this shard refused because they overlapped an undecided
     /// share (D249), told when the overlap clears.
     overlap_refused: Vec<OverlapRefusal>,
-    /// Shares admitted behind undecided shares they overlap (D267), by seqno: whom their
-    /// `Prepared` goes to, how many of those shares are still undecided here, and whether
-    /// the share is logged (its `Prepared` is due once the count reaches zero).
-    chained: FastMap<Seqno, ChainedShare>,
-    /// An undecided share's seqno to the chained shares waiting for its decision (D267).
-    chained_after: FastMap<Seqno, Vec<Seqno>>,
     /// Singles waiting for undecided shares, by `Member::share_wait` (D267).
     waiting_singles: FastMap<u32, WaitingSingle>,
     /// A row's waiting singles (any row they write or read).
     single_rows: FastMap<u64, Vec<u32>>,
-    /// A waiting single to the shares chained behind it: their `Prepared` waits until the
-    /// single is logged (D267).
-    single_after: FastMap<u32, Vec<Seqno>>,
     next_share_wait: u32,
     /// Refused commits that read, each older than every undecided share on its rows: while
     /// one is listed, a younger blind PREPARE on its rows is refused, not chained, so the
@@ -3144,11 +3106,8 @@ impl ShardState {
             room_generation: 0,
             room_freed: vec![0; shards],
             overlap_refused: Vec::new(),
-            chained: FastMap::default(),
-            chained_after: FastMap::default(),
             waiting_singles: FastMap::default(),
             single_rows: FastMap::default(),
-            single_after: FastMap::default(),
             next_share_wait: 0,
             reader_fences: Vec::new(),
             overlap_released: Vec::new(),
@@ -5406,8 +5365,6 @@ impl ShardState {
             // its rows (or to rows its commit read) admitted now would land below it while
             // ordered after it. A single waits for the decision; a PREPARE is refused and
             // retried once the overlap clears (D249's refusal, for every PREPARE now).
-            // A blind PREPARE admitted behind an undecided share (D267).
-            let mut chains = false;
             // A waiting single whose shares ahead are decided: the shares undecided on its
             // rows now came after it and wait for it (D267).
             let mut waited = false;
@@ -5492,7 +5449,7 @@ impl ShardState {
                     self.pending.push(m);
                     continue;
                 }
-                if pending_share && !chains {
+                if pending_share {
                     // A PREPARE does not wait on another commit's decision, which could
                     // deadlock two coordinators: it is refused, not failed, and retried
                     // once the overlap clears (D249, ICR 0045). `Conflict` comes only from
@@ -7050,14 +7007,6 @@ impl ShardState {
                     // A failed prepare's record (if any) is never needed.
                     self.mark_aborted(m.seqno);
                 }
-                if let Some(c) = self.chained.get_mut(&m.seqno) {
-                    if error.is_none() && c.behind > 0 {
-                        // D267: answered once the shares it went behind are decided here.
-                        c.logged = true;
-                        return;
-                    }
-                    self.chained.remove(&m.seqno);
-                }
                 self.send(
                     coordinator,
                     ShardMsg::Prepared {
@@ -7246,7 +7195,6 @@ impl ShardState {
                 participants: req.participants,
                 priority: req.priority,
                 submitted_at: req.submitted_at,
-                coordinator: req.coordinator,
             },
         );
         self.pending.push(Member {
@@ -7462,11 +7410,6 @@ impl ShardState {
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         self.decide_share(seqno, commit, at, coordinator, ctx);
-        // Shares chained behind this one may answer now (D267).
-        self.chained.remove(&seqno);
-        if !self.chained_after.is_empty() {
-            self.release_chained(seqno, ctx);
-        }
         // Commits refused here over an overlap may retry now (D249), and a fence this
         // commit set here ends with its last attempt (D267).
         if !self.overlap_refused.is_empty() || !self.reader_fences.is_empty() {
@@ -9204,7 +9147,6 @@ impl ShardState {
             } => self.on_prepared(seqno, from, error, floor, ctx),
             ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),
             ShardMsg::Released { priority } => self.release_overlaps_behind(priority, ctx),
-            ShardMsg::Wound { seqno, from } => self.on_wound(seqno, from, ctx),
             ShardMsg::Decide {
                 seqno,
                 commit,

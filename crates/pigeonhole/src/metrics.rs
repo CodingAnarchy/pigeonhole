@@ -234,11 +234,11 @@ pub struct CrossShardMetrics {
     /// The time shards had a single held back behind an undecided share
     /// (D263), summed over shards.
     pub share_wait_nanos: u64,
-    /// Cross-shard shares admitted behind another commit's undecided share (or a waiting
-    /// single) instead of refused, answering once that one was decided (D267).
+    /// Always 0 since 0.4.0's single clock (D271): cross-shard writes to the same rows no
+    /// longer wait for each other's decision, so none is chained. Kept for the API.
     pub chained: u64,
-    /// Younger undecided cross-shard attempts aborted so that an older commit queued
-    /// behind them could go first (D267). Each is retried.
+    /// Always 0 since 0.4.0's single clock (D271): nothing waits, so nothing is wounded.
+    /// Kept for the API.
     pub wounds: u64,
     /// The most attempts (two-phase rounds) one committed cross-shard commit that only
     /// writes took. Not cumulative: the largest since open. Only commits that committed
