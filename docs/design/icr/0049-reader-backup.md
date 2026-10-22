@@ -26,7 +26,7 @@ The writer's backup works like this:
 
 A reader process can't pin that way. Its only protection is its shm reader slot (a seqno and a view version). The writer frees a view's memtables **and** extents only once no slot pins that view or an older one (FORMAT §11.5).
 
-A reader's slot pin also moves forward to a newer view when that reader takes a new snapshot and none of its snapshots is alive. Without a held clone of the live count, a read in the reader process during the backup would move the pin past the backup's view. The writer could then reclaim SST extents the merge is still reading.
+A reader's slot pin also moves forward to a newer view when that reader takes a new snapshot and none of its snapshots is alive. Without a held clone of the live count, a read in the reader process during the backup would move the pin past the backup's view. The writer could then reclaim SST extents the merge is still reading. (Since #693 PR 2 the pin is exactly the oldest live snapshot's: the backup's held snapshot keeps its key in the reader's pin set for the whole copy, which has the same effect.)
 
 **So a reader backup holds its pin, memtables included, for the whole copy.** The cost:
 - For the backup's length, the writer frees none of that view's memtables (arena chunks) or extents.

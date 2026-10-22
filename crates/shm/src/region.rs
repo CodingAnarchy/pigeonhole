@@ -1096,6 +1096,18 @@ impl ReaderSlot {
             .fetch_min(seqno, Ordering::SeqCst);
     }
 
+    /// Raises the pin to `seqno` and `view_version` where it is lower (#693 PR 2): the
+    /// reader's oldest snapshot was dropped, so what it pinned for that snapshot alone may be
+    /// reclaimed. Only ever raises: a field already at or above its new value stays.
+    pub fn raise_pin(&self, seqno: Seqno, view_version: u64) {
+        self.region
+            .slot64(self.index, reader_slot::PINNED_SEQNO)
+            .fetch_max(seqno, Ordering::SeqCst);
+        self.region
+            .slot64(self.index, reader_slot::PINNED_VIEW)
+            .fetch_max(view_version, Ordering::SeqCst);
+    }
+
     /// Clears the pin.
     pub fn unpin(&self) {
         self.region
