@@ -131,6 +131,9 @@ pub enum Fault {
     /// The next freeze finds no chunk for a fresh memtable, as a starved arena would give
     /// it: a closing shard then flushes the active memtable in place (#111, #838).
     NextFreezeStarved = 5,
+    /// As `NextRoomWait`, for the group's third member: two members are admitted first, so a
+    /// group can wait for room with two singles on one row admitted, ranked 0 and 1 (#900).
+    ThirdRoomWait = 6,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).

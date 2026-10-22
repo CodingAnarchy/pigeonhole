@@ -124,6 +124,44 @@ fn a_write_at_a_default_timestamp_does_not_void_the_purge() {
 }
 
 #[test]
+fn a_ranked_single_rechecked_in_a_room_wait_leaves_an_installing_compaction_alone() {
+    // #900: a group's second single on a row is ranked 1 (D271 §1.4). The room wait checks
+    // the group's admitted members against the guards again; the rank used to sit in
+    // `commit_ts` until the stamp, so the check read it as a timestamp of 1, below the
+    // inputs of a bottommost compaction, and tried to void its guard while the compaction's
+    // commit was installing it (a debug assertion on the shard thread). Its real timestamp
+    // is above the inputs, as its first check found: the compaction is left alone.
+    let mut rig = Rig::open(900, FlushGcMutation::None);
+    rig.flushed(|wb, t, f| wb.put(t, f, b"r", b"q", None, ValueRef::Bytes(b"old")));
+    rig.flushed(|wb, t, f| wb.put(t, f, b"r", b"q", None, ValueRef::Bytes(b"new")));
+    let voids = rig.voids();
+    rig.db.park_manifest_commits(true);
+    let mut compaction = rig.db.compact_pending(Some(rig.t)).unwrap();
+    rig.run(|db| db.manifest_commit_parked());
+    assert!(
+        rig.db.manifest_commit_parked(),
+        "the compaction reached its install"
+    );
+    // One group: two singles on one cell (ranks 0 and 1), then a third that waits for room.
+    rig.db.inject(pigeonhole_engine::Fault::ThirdRoomWait, true);
+    let single = |q: &'static [u8], v: &'static [u8]| {
+        let mut wb = WriteBatch::new();
+        wb.put(rig.t, rig.f, b"r", q, None, ValueRef::Bytes(v))
+            .unwrap();
+        rig.db.submit(wb, Some(Durability::Buffered)).unwrap()
+    };
+    let mut pcs = [single(b"q", b"a"), single(b"q", b"b"), single(b"q2", b"c")];
+    rig.poke();
+    rig.db.park_manifest_commits(false);
+    rig.settle(&mut compaction).unwrap();
+    for pc in &mut pcs {
+        rig.commit(pc).expect("the single commits");
+    }
+    assert_eq!(rig.voids(), voids, "the compaction was voided");
+    assert_eq!(rig.read().map(|(_, v)| v), Some(b"b".to_vec()));
+}
+
+#[test]
 fn a_backfill_newest_to_oldest_cannot_starve_a_bottommost_compaction() {
     // Each write of the backfill is below the bound the compaction last sampled (the
     // previous write, now in the memtable) and among the inputs' timestamps, and arrives

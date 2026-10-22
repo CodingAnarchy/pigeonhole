@@ -1573,6 +1573,11 @@ struct Member {
     /// it is not waiting). It waits only for the shares undecided on its rows when it
     /// started; shares that come after wait for it (D267).
     share_wait: u32,
+    /// A single's rank in its group (D271 §1.4), from `touch_rows`: it is stamped
+    /// `T0 + rank`. Kept apart from `commit_ts`, which stays 0 until the stamp, because
+    /// `admit_against_guards` reads `commit_ts` as a timestamp when `wait_for_room` checks the
+    /// group's admitted members again (#900).
+    rank: u32,
 }
 
 #[derive(Debug)]
@@ -1612,6 +1617,7 @@ impl Member {
             map_version: req.map_version,
             room_since: 0,
             share_wait: 0,
+            rank: 0,
         }
     }
 
@@ -5545,13 +5551,19 @@ impl ShardState {
                 continue;
             }
             #[cfg(feature = "test-hooks")]
-            if !admitted.is_empty()
-                && matches!(m.kind, MemberKind::Single)
-                && self
-                    .shared
-                    .hooks
-                    .faults
-                    .take(crate::engine::hooks::Fault::NextRoomWait)
+            if matches!(m.kind, MemberKind::Single)
+                && ((!admitted.is_empty()
+                    && self
+                        .shared
+                        .hooks
+                        .faults
+                        .take(crate::engine::hooks::Fault::NextRoomWait))
+                    || (admitted.len() >= 2
+                        && self
+                            .shared
+                            .hooks
+                            .faults
+                            .take(crate::engine::hooks::Fault::ThirdRoomWait)))
             {
                 cut = true;
                 need_room = true;
@@ -5663,8 +5675,8 @@ impl ShardState {
                 MemberKind::Single => {
                     m.seqno = next;
                     next += 1;
-                    // `touch_rows` left the rank in `commit_ts`.
-                    m.commit_ts += t0;
+                    // `touch_rows` left the rank in `rank` (#900: not in `commit_ts`).
+                    m.commit_ts = t0 + u64::from(m.rank);
                 }
                 MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
                     self.raise_ts_floor(m.commit_ts);
@@ -6783,7 +6795,7 @@ impl ShardState {
                 // D271 §1.4: the group stamps a single at its first timestamp plus a rank: above
                 // every earlier single of the group on one of its rows (two on one cell never
                 // share a timestamp), and never below the single before it (a shard's
-                // timestamps follow its seqnos). Kept in `commit_ts` until the stamp.
+                // timestamps follow its seqnos). Kept in `rank` until the stamp.
                 let floor = self.group_rank;
                 let rank = if let [h] = self.admit_rows[..] {
                     let c = self.touched.entry(h).or_insert(0);
@@ -6807,7 +6819,7 @@ impl ShardState {
                 if rank >= self.group_k {
                     self.group_k = rank + 1;
                 }
-                m.commit_ts = u64::from(rank);
+                m.rank = rank;
             }
         }
     }
@@ -7238,6 +7250,7 @@ impl ShardState {
             retry: None,
             room_since: 0,
             share_wait: 0,
+            rank: 0,
         });
     }
 
@@ -7417,6 +7430,7 @@ impl ShardState {
             retry: None,
             room_since: 0,
             share_wait: 0,
+            rank: 0,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
