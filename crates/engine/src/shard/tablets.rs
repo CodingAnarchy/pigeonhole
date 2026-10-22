@@ -666,7 +666,7 @@ impl ShardState {
         ahead.sort_unstable();
         ahead.dedup();
         let mut rows = writes.clone();
-        rows.extend(reads);
+        rows.extend(&reads);
         rows.sort_unstable();
         rows.dedup();
         self.next_share_wait = self.next_share_wait.wrapping_add(1).max(1);
@@ -679,6 +679,7 @@ impl ShardState {
             WaitingSingle {
                 ahead,
                 writes,
+                reads,
                 rows,
             },
         );
@@ -696,25 +697,29 @@ impl ShardState {
         })
     }
 
-    /// A waiting single that writes a row PREPARE `m` reads, if any (D267).
+    /// A waiting single that writes a row PREPARE `m` reads (D267), or reads a row `m`
+    /// writes (D271, perf287's M1), if any.
     #[inline]
-    pub(super) fn reads_waiting_single(&self, m: &Member) -> Option<u32> {
+    pub(super) fn overlaps_waiting_single(&self, m: &Member) -> Option<u32> {
         if self.waiting_singles.is_empty() {
             return None;
         }
-        self.reads_waiting_single_slow(m)
+        self.overlaps_waiting_single_slow(m)
     }
 
     #[cold]
     #[inline(never)]
-    fn reads_waiting_single_slow(&self, m: &Member) -> Option<u32> {
-        Self::read_rows(m).iter().find_map(|h| {
-            self.single_rows.get(h).and_then(|ids| {
-                ids.iter()
-                    .copied()
-                    .find(|id| self.waiting_singles[id].writes.binary_search(h).is_ok())
+    fn overlaps_waiting_single_slow(&self, m: &Member) -> Option<u32> {
+        let on = |rows: Vec<u64>, of: fn(&WaitingSingle) -> &[u64]| {
+            rows.into_iter().find_map(|h| {
+                self.single_rows.get(&h).and_then(|ids| {
+                    ids.iter()
+                        .copied()
+                        .find(|id| of(&self.waiting_singles[id]).binary_search(&h).is_ok())
+                })
             })
-        })
+        };
+        on(Self::read_rows(m), |w| &w.writes).or_else(|| on(Self::written_rows(m), |w| &w.reads))
     }
 
     /// Waiting single `id` was logged, or failed (D267): the shares chained behind it count

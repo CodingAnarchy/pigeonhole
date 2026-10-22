@@ -1744,6 +1744,8 @@ pub(crate) struct WaitingSingle {
     pub ahead: Vec<Seqno>,
     /// The rows it writes.
     pub writes: Vec<u64>,
+    /// The rows it reads (its predicate row, its validated reads), sorted.
+    pub reads: Vec<u64>,
     /// The rows it writes or reads.
     pub rows: Vec<u64>,
 }
@@ -5418,9 +5420,13 @@ impl ShardState {
             // D267: a PREPARE reading a row a waiting single writes would read below the
             // single while landing above it, and a blind one writing a row an older refused
             // reading commit fences would keep that row from draining: refused, as over an
-            // undecided share.
+            // undecided share. D271 (perf287's M1): a PREPARE writing a row a waiting single
+            // reads is refused too. The single, once its shares are decided, is admitted
+            // without checking newer undecided shares (`waited`), so it would read the row
+            // without that write while the write's decision may take the lower seqno; D267
+            // held such a PREPARE's `Prepared` behind the single instead.
             if matches!(m.kind, MemberKind::Prepare { .. }) {
-                let wait = match (self.reads_waiting_single(&m), self.fenced(&m)) {
+                let wait = match (self.overlaps_waiting_single(&m), self.fenced(&m)) {
                     (Some(id), _) => Some(OverlapWait::Single(id)),
                     (None, Some(reader)) => Some(OverlapWait::Fence(reader)),
                     (None, None) => None,

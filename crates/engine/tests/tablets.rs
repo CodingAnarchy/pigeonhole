@@ -6962,6 +6962,94 @@ fn drain(db: &mut Db, stream: Vec<pigeonhole_engine::PendingCommit>) {
     }
 }
 
+/// D271 (perf287's M1): a waiting conditional single C on `a` (it waits for A's undecided
+/// share there) and a blind cross-shard commit B writing `a`'s other column `p`, which C's
+/// predicate reads. B must not be admitted while C waits: C, once A is decided, is admitted
+/// without checking newer undecided shares, so it would read `a` without B while B's decision
+/// may take the lower seqno. Whatever order the shards then run in, if C applied (it saw `p`
+/// absent) it is serialized before B.
+#[test]
+fn a_blind_prepare_writing_a_row_a_waiting_single_reads_lands_after_the_single() {
+    for schedule in 0..6u8 {
+        let (mut db, low, high) = overlap_db();
+        let (id, f) = (db.table.id, db.table.families[0].id);
+        // A: an undecided blind share on `a`.
+        let a = blind_txn(&db, &[b"z", b"a"], b"from-a");
+        let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+        turn(&mut db, high);
+        turn(&mut db, low);
+        // C: `a:c` if `a:p` is absent; it reads `a`, so it waits for A.
+        let before = db.engine.metrics().cross_shard.share_waits;
+        let mut wb = WriteBatch::new();
+        wb.put(id, f, b"a", b"c", None, ValueRef::Bytes(b"from-c"))
+            .unwrap();
+        let absent = pigeonhole_engine::Predicate::Absent {
+            family: f,
+            qualifier: b"p".to_vec(),
+        };
+        let mut pcheck = db
+            .engine
+            .submit_check_and_mutate(id, b"a", &absent, wb, Some(Durability::Buffered))
+            .unwrap();
+        turn(&mut db, low);
+        assert!(
+            db.engine.metrics().cross_shard.share_waits > before,
+            "schedule {schedule}: C did not wait for A"
+        );
+        // B: blind, across shards, writing `a:p`; coordinated by `low` (its first row's
+        // shard), so `low` can decide B in the turn that admits C, before B's share is
+        // applied there.
+        let mut t = db.engine.begin().unwrap();
+        t.batch()
+            .put(id, f, b"a", b"p", None, ValueRef::Bytes(b"from-b"))
+            .unwrap();
+        t.batch()
+            .put(id, f, b"z", b"q", None, ValueRef::Bytes(b"from-b"))
+            .unwrap();
+        let mut pb = t.submit(Some(Durability::Buffered)).unwrap();
+        let order: &[usize] = match schedule {
+            0 => &[high, low, high, low],
+            1 => &[high, high, low],
+            2 => &[low, high, high, low],
+            3 => &[high, low, low, high, low],
+            4 => &[high, low, high, high, low, low],
+            _ => &[low, high, low, high, low],
+        };
+        for &i in order {
+            turn(&mut db, i);
+        }
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut rc = None;
+        for _ in 0..100_000 {
+            if let Poll::Ready(r) = Pin::new(&mut pcheck).poll(&mut cx) {
+                rc = Some(r);
+                break;
+            }
+            db.step();
+        }
+        let rc = rc.expect("C resolved").expect("C resolves without error");
+        let rb = poll_until(&mut db, &mut pb, 100_000)
+            .expect("B resolved")
+            .expect("B commits");
+        poll_until(&mut db, &mut pa, 100_000)
+            .expect("A resolved")
+            .expect("A commits");
+        if let (true, Some(c)) = rc {
+            assert!(
+                c.seqno < rb.seqno,
+                "schedule {schedule}: C read `a:p` absent at seqno {} but B wrote it at {} \
+                 (a lost update)",
+                c.seqno,
+                rb.seqno
+            );
+        }
+        eprintln!(
+            "schedule {schedule}: C applied {} (B at {})",
+            rc.0, rb.seqno
+        );
+    }
+}
+
 #[test]
 fn a_blind_single_on_an_undecided_shares_row_goes_ahead() {
     // D271: a single writing `a` while cross-shard shares on `a` are undecided goes ahead:
