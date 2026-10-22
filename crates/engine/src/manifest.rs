@@ -822,6 +822,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
         .map(|f| f.0.load(Ordering::Acquire))
         .max()
         .unwrap_or(0)
+        .max(shared.clock.last_ts())
         .max(catalog.counters.ts_floor);
     let counters = catalog.counters_edit();
     let _ = catalog.apply(&counters, shared.shards);

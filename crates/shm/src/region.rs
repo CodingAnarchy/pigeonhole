@@ -727,7 +727,7 @@ impl ShmRegion {
     }
 
     /// Raises the next seqno to reserve to at least `to` (`fetch_max`, release ordering): the
-    /// mirror of a writer that reserves seqnos in its own process (D271, ICR XXXX). It never
+    /// mirror of a writer that reserves seqnos in its own process (D271, ICR 0063). It never
     /// moves past a reservation the writer made, and the writer published its pending
     /// watermark before reserving, so a reader that sees the mirror at `to` sees that
     /// watermark too (`FORMAT.md` §11.3).

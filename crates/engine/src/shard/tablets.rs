@@ -400,19 +400,6 @@ impl ShardState {
         out
     }
 
-    /// Folds the other shards' raises into the floor (D245, D264): once per group, after its
-    /// reservation, so the load follows the reservation's read-modify-write on `NEXT_SEQNO`
-    /// (a coordinator's raise) and the routing that sent the group's writes here: the
-    /// client's view load (Acquire) and this shard's queue, or the old owner's forward (a
-    /// moved tablet's raise, made before the move was published).
-    #[inline(never)]
-    pub(super) fn fold_raises(&mut self) {
-        let raised = self.shared.ts_raises[usize::from(self.id.0)]
-            .0
-            .load(Ordering::Acquire);
-        self.ts_floor = self.ts_floor.max(raised);
-    }
-
     /// A PREPARE that would wait for arena room, refused instead (D245, ICR 0042); its
     /// coordinator hears a room `Wake` once this shard's room wait ends.
     #[inline(never)]
@@ -1743,6 +1730,8 @@ impl ShardState {
                 .0
                 .fetch_max(self.ts_floor, Ordering::AcqRel);
         }
+        // D271: the new owner's next stamp is above every one the allocator handed out.
+        self.shared.clock.raise();
         trace!("shard {} tablet change {kind:?} commits", self.id.0);
         let me = self.id;
         let change: TabletChange =

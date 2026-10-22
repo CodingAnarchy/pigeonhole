@@ -2677,7 +2677,12 @@ pub(crate) struct ShardState {
     dedup: Dedup,
     /// The row hashes of the member `reserve_room` sized last, for `touch_rows`.
     admit_rows: Vec<u64>,
-    touched: FastSet<u64>,
+    touched: FastMap<u64, u32>,
+    /// The current group's distinct default timestamps (D271): one more than the largest rank
+    /// `touch_rows` gave a single.
+    group_k: u32,
+    /// The rank `touch_rows` gave the group's last single (D271): the next is no lower.
+    group_rank: u32,
     /// Rows of members this group held back for the next one (`run_group`).
     held_rows: FastSet<u64>,
     /// Slots the last `apply` wrote (deduplicated).
@@ -3094,7 +3099,9 @@ impl ShardState {
             key_buf: Vec::new(),
             dedup: Dedup::default(),
             admit_rows: Vec::new(),
-            touched: FastSet::default(),
+            touched: FastMap::default(),
+            group_k: 1,
+            group_rank: 0,
             held_rows: FastSet::default(),
             touched_slots: Vec::new(),
             closing: false,
@@ -4703,32 +4710,36 @@ impl ShardState {
         self.shared.wake_visible();
     }
 
-    /// Reserves `n` seqnos per FORMAT §11.3: publish the lower bound, reserve, publish the
-    /// reservation.
-    fn reserve(&mut self, n: u64) -> Seqno {
+    /// Reserves a group's `n` seqnos and `k` default timestamps per FORMAT §11.3 (publish
+    /// the lower bound, reserve, publish the reservation) from the one allocator (D271).
+    /// Returns the first seqno and the first timestamp.
+    fn reserve_stamps(&mut self, n: u64, k: u64) -> (Seqno, Timestamp) {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
         shm.publish_pending(shard, self.watermark().min(self.shared.clock.next_seqno()));
-        let first = self.shared.clock.reserve(n, shm);
-        shm.publish_pending(shard, self.watermark().min(first));
-        first
-    }
-
-    fn default_ts(&mut self) -> Timestamp {
         let now = self.shared.vfs.now_micros();
-        // Other shards' raises (a tablet handed to us, D11; a cross-shard commit's timestamp,
-        // D245) are folded in once per group after its reservation (`fold_raises`, D264), and
-        // by a coordinator's `decide_commit` before it stamps.
-        let ts = now.max(self.ts_floor + 1);
+        let (first, t0) = self
+            .shared
+            .clock
+            .reserve_group(n, k, now, self.ts_floor, shm);
+        shm.publish_pending(shard, self.watermark().min(first));
         trace!(
-            "shard {} default_ts now={now} floor={} -> {ts}",
+            "shard {} reserves {first}+{n} at {t0}+{k} (now {now}, last {})",
             self.id.0, self.ts_floor
         );
-        self.ts_floor = ts;
-        self.shared.ts_floors[usize::from(self.id.0)]
-            .0
-            .store(ts, Ordering::Release);
-        ts
+        self.note_stamped(t0 + k.max(1) - 1);
+        (first, t0)
+    }
+
+    /// This shard stamped up to `ts`: its own last stamp (D271's `last_X`), and the floor
+    /// still published until the floors go (D271 PR 2).
+    fn note_stamped(&mut self, ts: Timestamp) {
+        if ts > self.ts_floor {
+            self.ts_floor = ts;
+            self.shared.ts_floors[usize::from(self.id.0)]
+                .0
+                .store(ts, Ordering::Release);
+        }
     }
 
     // ---- reads on the shard (predicates, validation) ----
@@ -5340,6 +5351,8 @@ impl ShardState {
         let mut admitted = self.member_buf();
         admitted.reserve(members.len());
         self.touched.clear();
+        self.group_k = 1;
+        self.group_rank = 0;
         self.held_rows.clear();
         // Once a member waits for room or a guarded flush's install, every later single
         // waits with it (the room wait's queue keeps submission order); two-phase-commit
@@ -5605,7 +5618,7 @@ impl ShardState {
                     }
                 }
             }
-            self.touch_rows(&m);
+            self.touch_rows(&mut m);
             if let MemberKind::Prepare { .. } = m.kind {
                 // D263: no timestamp yet (it is picked at the decision), so
                 // nothing to raise here (D244's (i)).
@@ -5668,22 +5681,20 @@ impl ShardState {
             .iter()
             .filter(|m| matches!(m.kind, MemberKind::Single))
             .count() as u64;
-        let first = (singles > 0).then(|| self.reserve(singles));
-        // One shard has no cross-shard commits or tablet moves: one test of a field on its
-        // commit path. With more, the raises are folded in after this group's reservation, so
-        // every single it stamps lands above any cross-shard commit reserved before it
-        // (D245) and above the floor of a tablet handed to this shard (D11, D264).
-        let cross = self.cross && first.is_some();
-        if cross {
-            self.fold_raises();
-        }
-        let mut next = first.unwrap_or(0);
+        // D271: one reservation per group gives its seqnos and its default timestamps, so a
+        // later seqno never carries an earlier default timestamp on any shard. A single's
+        // timestamp is the group's first plus its rank among the group's singles on its rows
+        // (`touch_rows`): two on one cell never share a timestamp.
+        let reserved = (singles > 0).then(|| self.reserve_stamps(singles, u64::from(self.group_k)));
+        let first = reserved.map(|(s, _)| s);
+        let (mut next, t0) = reserved.unwrap_or((0, 0));
         for m in &mut admitted {
             match m.kind {
                 MemberKind::Single => {
                     m.seqno = next;
                     next += 1;
-                    m.commit_ts = self.default_ts();
+                    // `touch_rows` left the rank in `commit_ts`.
+                    m.commit_ts += t0;
                 }
                 MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
                     self.raise_ts_floor(m.commit_ts);
@@ -6734,7 +6745,7 @@ impl ShardState {
         if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 let h = hash_row(r.table, &r.row);
-                same |= self.touched.contains(&h);
+                same |= self.touched.contains_key(&h);
                 pending |= self.pending_rows.contains_key(&h);
             }
         }
@@ -6743,7 +6754,7 @@ impl ShardState {
             pending |= self.pending_rows.contains_key(&h);
             // The row hash first: only a row an earlier member touched is looked at cell
             // by cell.
-            if !same && self.touched.contains(&h) {
+            if !same && self.touched.contains_key(&h) {
                 same = writes_cell(admitted, *table, row, predicate);
             }
         }
@@ -6793,11 +6804,45 @@ impl ShardState {
 
     /// Records `m`'s written rows as touched by this group.
     /// Uses the row hashes `reserve_room` left for `m`, which admission sizes just before.
-    fn touch_rows(&mut self, m: &Member) {
-        if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-            return;
+    fn touch_rows(&mut self, m: &mut Member) {
+        match m.kind {
+            MemberKind::CommitRecord { .. } => {}
+            MemberKind::Prepare { .. } => {
+                for h in &self.admit_rows {
+                    self.touched.entry(*h).or_insert(0);
+                }
+            }
+            MemberKind::Single => {
+                // D271 §1.4: the group stamps a single at its first timestamp plus a rank: above
+                // every earlier single of the group on one of its rows (two on one cell never
+                // share a timestamp), and never below the single before it (a shard's
+                // timestamps follow its seqnos). Kept in `commit_ts` until the stamp.
+                let floor = self.group_rank;
+                let rank = if let [h] = self.admit_rows[..] {
+                    let c = self.touched.entry(h).or_insert(0);
+                    let r = (*c).max(floor);
+                    *c = r + 1;
+                    r
+                } else {
+                    let rank = self
+                        .admit_rows
+                        .iter()
+                        .map(|h| self.touched.get(h).copied().unwrap_or(0))
+                        .max()
+                        .unwrap_or(0)
+                        .max(floor);
+                    for h in &self.admit_rows {
+                        self.touched.insert(*h, rank + 1);
+                    }
+                    rank
+                };
+                self.group_rank = rank;
+                if rank >= self.group_k {
+                    self.group_k = rank + 1;
+                }
+                m.commit_ts = u64::from(rank);
+            }
         }
-        self.touched.extend(self.admit_rows.iter().copied());
     }
 
     /// Counts or releases the rows of a prepared share.
@@ -7109,7 +7154,7 @@ impl ShardState {
         // It stays unique for the database's life as D26's seqno id did: recovery raises
         // `next_seqno` above every replayed PREPARE's. The seqno the commit applies at, and
         // its timestamp, are picked at the decision (`decide_commit`).
-        let seqno = self.shared.clock.reserve(1, &self.shared.shm);
+        let seqno = self.shared.clock.reserve_id(&self.shared.shm);
         let commit_ts: Timestamp = 0;
         let priority = (
             req.submitted_at,
@@ -7244,17 +7289,16 @@ impl ShardState {
     /// reserved after the seqno stamps above the timestamp; then the seqno, held until
     /// every participant has applied.
     fn decide_commit(&mut self, shards: &[ShardId], floors: Timestamp) -> (Seqno, Timestamp) {
-        // The floors the participants reported with `Prepared`, taken on their own threads
-        // after admitting and logging their shares, then the published ones.
-        let mut floor = floors;
-        for s in shards {
-            let i = usize::from(s.0);
-            let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
-            let raised = self.shared.ts_raises[i].0.load(Ordering::Acquire);
-            floor = floor.max(own_floor).max(raised);
-        }
-        self.ts_floor = self.ts_floor.max(floor);
-        let commit_ts = self.default_ts();
+        // D271: the seqno and timestamp come from the one allocator, the timestamp strictly
+        // above every default timestamp handed out before (the participants' floors are no
+        // longer read). The raises are still written until the floors go (PR 2).
+        let _ = floors;
+        let shm = &self.shared.shm;
+        let shard = u32::from(self.id.0);
+        shm.publish_pending(shard, self.watermark().min(self.shared.clock.next_seqno()));
+        let now = self.shared.vfs.now_micros();
+        let (apply_seqno, commit_ts) = self.shared.clock.reserve_decision(now, shm);
+        self.held.insert(apply_seqno);
         for s in shards {
             if *s != self.id {
                 self.shared.ts_raises[usize::from(s.0)]
@@ -7262,8 +7306,7 @@ impl ShardState {
                     .fetch_max(commit_ts, Ordering::Release);
             }
         }
-        let apply_seqno = self.reserve(1);
-        self.held.insert(apply_seqno);
+        self.note_stamped(commit_ts);
         self.publish_watermark();
         (apply_seqno, commit_ts)
     }
