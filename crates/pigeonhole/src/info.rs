@@ -34,11 +34,18 @@ pub struct DatabaseInfo {
     /// The database's random id, chosen at creation (WAL segments and the shared-memory
     /// region carry it too).
     pub db_id: [u8; 16],
-    /// The file format version. A writer's open upgrades an older file, so an open database
-    /// reports the version this build writes.
+    /// The file format version. A writer's open upgrades an older file, so a writable
+    /// database reports the version this build writes; a read-only open (a reader process, or
+    /// [`Options::read_only_fallback`](crate::Options::read_only_fallback)) writes nothing and
+    /// reports the file's own.
     pub format_version: u32,
+    /// The file's feature sets (FORMAT §8.2).
+    pub features: FileFeatures,
     /// Whether this handle is a reader process ([`PigeonholeReader`](crate::PigeonholeReader)).
     pub reader: bool,
+    /// Whether this handle cannot write: a reader process, or a writer that
+    /// [`Options::read_only_fallback`](crate::Options::read_only_fallback) opened read-only.
+    pub read_only: bool,
     /// Shards (for a reader, the writer's).
     pub shards: usize,
     /// The main file's length in bytes, the WAL sidecars not included.
@@ -49,6 +56,34 @@ pub struct DatabaseInfo {
     pub free_bytes: Option<u64>,
     /// Every table, by name.
     pub tables: Vec<TableInfo>,
+}
+
+/// The file's feature sets ([`DatabaseInfo::features`]; FORMAT §8.2). A 1.x file sets a
+/// bit only once it uses a feature added after 1.0; a build that does not know a bit refuses
+/// the file (`incompat`, [`ErrorCode::UnsupportedFeature`](crate::ErrorCode::UnsupportedFeature)),
+/// opens it read-only only (`ro_compat`, see
+/// [`Options::read_only_fallback`](crate::Options::read_only_fallback)), or ignores it
+/// (`compat`). No bit is defined yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct FileFeatures {
+    /// Features a build that does not know them may read and write.
+    pub compat: u64,
+    /// Features a build that does not know them may read but not write.
+    pub ro_compat: u64,
+    /// Features a build that does not know them must refuse the file for.
+    pub incompat: u64,
+}
+
+impl FileFeatures {
+    // Not a `From` impl: the format crate's types stay out of the public API.
+    fn of(f: pigeonhole_format::superblock::Features) -> Self {
+        Self {
+            compat: f.compat,
+            ro_compat: f.ro_compat,
+            incompat: f.incompat,
+        }
+    }
 }
 
 /// One table of [`DatabaseInfo`].
@@ -194,7 +229,9 @@ impl From<pigeonhole_engine::DbInfo> for DatabaseInfo {
         Self {
             db_id: d.db_id,
             format_version: d.format_version,
+            features: FileFeatures::of(d.features),
             reader: d.role == pigeonhole_engine::Role::Reader,
+            read_only: d.read_only,
             shards: d.shards,
             file_bytes: d.file_bytes,
             free_bytes: d.free_bytes,
@@ -301,6 +338,8 @@ mod tests {
         db.flush()?;
         let info = db.info()?;
         assert!(!info.reader);
+        assert!(!info.read_only);
+        assert_eq!(info.features, crate::FileFeatures::default());
         assert_eq!(
             info.format_version,
             pigeonhole_format::FormatVersion::CURRENT.0

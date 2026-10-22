@@ -326,6 +326,7 @@ fn every_engine_error_maps_to_its_code() {
         (E::Merge(merge), ErrorCode::MergeFailed),
         (E::Conflict, ErrorCode::Conflict),
         (E::ReadOnly, ErrorCode::ReadOnly),
+        (E::ReadOnlyOpen("x".into()), ErrorCode::ReadOnly),
         (E::KeyTooLarge, ErrorCode::KeyTooLarge),
         (E::ValueTooLarge, ErrorCode::ValueTooLarge),
         (E::NoSpace, ErrorCode::NoSpace),
@@ -2538,11 +2539,9 @@ fn registered_merge_operators_resolve_through_flush_compaction_and_reopen() {
         .expect_err("opened without the family's merge operator");
     assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
     // Allowed: read-only; the operator's cells fail to read, the other family reads.
-    let db = Pigeonhole::open(
-        "/db/merge.phdb",
-        sim_options(&vfs).allow_unregistered_merge_operators(true),
-    )
-    .unwrap();
+    let db =
+        Pigeonhole::open("/db/merge.phdb", sim_options(&vfs).read_only_fallback(true)).unwrap();
+    assert!(db.info().unwrap().read_only);
     let t = db.table("log").unwrap().open().unwrap();
     let err = log_value(&t, b"r").unwrap_err();
     assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
@@ -2558,6 +2557,9 @@ fn registered_merge_operators_resolve_through_flush_compaction_and_reopen() {
         .commit()
         .unwrap_err();
     assert_eq!(err.code(), ErrorCode::ReadOnly, "{err}");
+    for err in [db.flush().unwrap_err(), db.compact().unwrap_err()] {
+        assert_eq!(err.code(), ErrorCode::ReadOnly, "{err}");
+    }
     drop(t);
     db.close().unwrap();
 }
@@ -2568,6 +2570,12 @@ fn a_family_naming_an_unregistered_operator_is_refused_at_creation() {
     let err = log_table(&db).unwrap_err();
     assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
     assert!(db.tables().is_empty());
+    // `read_only_fallback` does not lift the check (ICR 0059): a writable handle never
+    // creates a family the next open could not write.
+    let vfs = SimVfs::new(8);
+    let db = Pigeonhole::open("/db/api.phdb", sim_options(&vfs).read_only_fallback(true)).unwrap();
+    let err = log_table(&db).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::UnknownMergeOperator, "{err}");
 }
 
 // ---- #210: the write-stall timeout ----

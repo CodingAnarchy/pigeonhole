@@ -165,7 +165,7 @@ impl From<pigeonhole_engine::Error> for Error {
             E::UnknownMergeOperator(_) => ErrorCode::UnknownMergeOperator,
             E::Merge(_) => ErrorCode::MergeFailed,
             E::Conflict => ErrorCode::Conflict,
-            E::ReadOnly => ErrorCode::ReadOnly,
+            E::ReadOnly | E::ReadOnlyOpen(_) => ErrorCode::ReadOnly,
             E::KeyTooLarge => ErrorCode::KeyTooLarge,
             E::ValueTooLarge => ErrorCode::ValueTooLarge,
             E::NoSpace => ErrorCode::NoSpace,

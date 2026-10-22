@@ -541,6 +541,10 @@ pub(crate) struct Shared {
     /// Application-owned mode: no runtime, so the final close waits for the streams' I/O
     /// and releases the locks on the application thread that runs it.
     pub application_owned: bool,
+    /// Nothing may write the database's files (a reader process, or a writer opened
+    /// read-only by `read_only_fallback`, ICR 0059): no flush, compaction, checkpoint,
+    /// tablet change or clean-close commit. Set at open, never changed.
+    pub no_writes: bool,
     pub shm_dir: Option<std::path::PathBuf>,
     pub identity: pigeonhole_io::FileIdentity,
     pub path: std::path::PathBuf,
@@ -960,6 +964,14 @@ impl Shared {
                 None => false,
             }
         };
+        if self.no_writes {
+            // A read-only open (ICR 0059) leaves the file as it found it: no checkpoint
+            // reset, no clean mark, and the WAL files stay (they may hold unflushed commits).
+            if last {
+                ShmRegion::remove(&self.vfs, self.identity, self.shm_dir.as_deref())?;
+            }
+            return clean;
+        }
         if clean.is_ok() && last {
             // The WAL files go away with this close: the streams the next open creates
             // start over at epoch 1, so their checkpoints must not point into the old
@@ -4157,7 +4169,8 @@ impl ShardState {
 
     /// Starts a flush task over everything queued, if none is running.
     fn spawn_flush(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
-        if self.flush_running || self.flush_queue.is_empty() {
+        // A read-only open writes no SST (ICR 0059): its memtables hold what it replayed.
+        if self.flush_running || self.flush_queue.is_empty() || self.shared.no_writes {
             return;
         }
         // The close gave up flushing after a failure (the WAL keeps the data; the close is
@@ -7842,6 +7855,10 @@ impl ShardState {
     /// batches, #763), and, if the checkpoint moved, submits a `WalCheckpoint` edit (one in
     /// flight at a time).
     fn advance_checkpoint(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        // A read-only open has no stream and commits nothing (ICR 0059).
+        if self.shared.no_writes {
+            return;
+        }
         let Ok(view) = self.checkpoint_view() else {
             return;
         };
@@ -8061,7 +8078,8 @@ impl ShardState {
     /// Scores the shard's slots, refreshes the stall score (L0 depth only, D119) and starts
     /// the most urgent compaction (or the next step of a full compaction) if none is running.
     fn maintain(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
-        if self.replaying {
+        // No compaction, cleanup or blob GC in a read-only open (ICR 0059, D-e).
+        if self.replaying || self.shared.no_writes {
             return;
         }
         let view = self.shared.view.load_full();
@@ -8835,6 +8853,11 @@ impl ShardState {
                 "shard {}: a memtable flushed in place is neither queued nor flushing",
                 self.id.0
             );
+        }
+        if self.close_stage == CloseStage::Draining && self.shared.no_writes {
+            // A read-only open (ICR 0059) has nothing to flush or checkpoint: what it
+            // replayed is still in the WAL, which stays for the next writable open.
+            self.close_stage = CloseStage::Checkpointing;
         }
         if self.close_stage == CloseStage::Draining {
             // Every admitted member applied or was settled, each releasing its room; what

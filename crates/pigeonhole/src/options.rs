@@ -46,7 +46,7 @@ pub struct Options {
     reader_slots: u32,
     create_if_missing: bool,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
-    allow_unregistered_merge_operators: bool,
+    read_only_fallback: bool,
     allow_fuse: bool,
     io_backend: Option<IoBackend>,
     direct_io: Option<bool>,
@@ -112,7 +112,7 @@ impl Default for Options {
             reader_slots: DEFAULT_READER_SLOTS,
             create_if_missing: true,
             merge_operators: Vec::new(),
-            allow_unregistered_merge_operators: false,
+            read_only_fallback: false,
             allow_fuse: false,
             io_backend: None,
             direct_io: None,
@@ -399,8 +399,8 @@ impl Options {
 
     /// Registers a merge operator, referenced by families through its name
     /// ([`Family::merge_operator`]). A family naming an operator that is not registered is
-    /// refused at creation, and a database whose families name one opens only with
-    /// [`allow_unregistered_merge_operators`](Self::allow_unregistered_merge_operators), with
+    /// refused at creation, and a database whose families name one opens only read-only, with
+    /// [`read_only_fallback`](Self::read_only_fallback), and with
     /// [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator) otherwise.
     /// Registering an operator under the built-in name `pigeonhole.i64_add` replaces it.
     pub fn merge_operator(mut self, op: Arc<dyn MergeOperator>) -> Self {
@@ -408,12 +408,31 @@ impl Options {
         self
     }
 
-    /// Open even if a family names an unregistered merge operator: the handle is read-only,
-    /// compaction is off, and reads of affected cells fail with
-    /// [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator).
-    pub fn allow_unregistered_merge_operators(mut self, yes: bool) -> Self {
-        self.allow_unregistered_merge_operators = yes;
+    /// Open read-only instead of failing when this build cannot write the database (default
+    /// off; ICR 0059). Two cases:
+    /// - the file uses a feature a newer build added that older builds may read but not
+    ///   write: otherwise [`ErrorCode::UnsupportedFeature`](crate::ErrorCode::UnsupportedFeature);
+    /// - a family names a merge operator this process has not registered: otherwise
+    ///   [`ErrorCode::UnknownMergeOperator`](crate::ErrorCode::UnknownMergeOperator), and reads
+    ///   of that family's merged cells fail with it.
+    ///
+    /// A handle opened read-only refuses writes, schema changes, `flush`, `compact` and
+    /// `shrink` with [`ErrorCode::ReadOnly`](crate::ErrorCode::ReadOnly), and writes nothing to
+    /// the database's files: it does not upgrade an older file's format, flush, compact or
+    /// mark a clean close. It replays the write-ahead log into memory, so an open whose log
+    /// does not fit [`memtable_budget`](Self::memtable_budget) fails with `ReadOnly`; raise
+    /// the budget. [`DatabaseInfo::read_only`](crate::DatabaseInfo::read_only) tells whether
+    /// the fallback was taken. It still holds the writer lock while open. A file that opens
+    /// writable is unaffected.
+    pub fn read_only_fallback(mut self, yes: bool) -> Self {
+        self.read_only_fallback = yes;
         self
+    }
+
+    /// Open even if a family names an unregistered merge operator.
+    #[deprecated(note = "use `read_only_fallback`, which also covers this case")]
+    pub fn allow_unregistered_merge_operators(self, yes: bool) -> Self {
+        self.read_only_fallback(yes)
     }
 
     /// Accept a database on a FUSE filesystem (default off; decision D173). Use it only for a
@@ -858,7 +877,7 @@ impl Options {
         o.row_cache_families = self.row_cache_families.clone();
         o.shm_dir.clone_from(&self.shm_dir);
         o.reader_slots = self.reader_slots;
-        o.allow_unregistered_merge = self.allow_unregistered_merge_operators;
+        o.read_only_fallback = self.read_only_fallback;
         o.allow_fuse = self.allow_fuse;
         if let Some(bytes) = self.wal_segment_size {
             o.wal.segment_size = bytes;

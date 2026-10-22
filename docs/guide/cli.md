@@ -39,7 +39,7 @@ A database has one writer process at a time and any number of reader processes (
   - While `phdb` holds the writer lock, your application can't open as the writer: its open fails with `WriterLocked` until `phdb` exits.
 - **A writer is running:** `phdb` opens as a reader process. It sees everything the writer has committed and changes nothing.
 
-`phdb` opens with one unpinned shard and small caches, and never creates a file. Families that name a merge operator `phdb` doesn't know open read-only.
+`phdb` opens with one unpinned shard and small caches, and never creates a file. A database `phdb` can't write opens read-only (`read_only_fallback`): families that name a merge operator `phdb` doesn't know, or a feature from a newer version that this one may only read. Such an open writes nothing to the file.
 
 `--reader` and `--writer` force one role, and fail rather than fall back.
 
@@ -69,7 +69,9 @@ Choose with `--format`:
 |---|---|
 | `path` | The file as given. |
 | `mode` | `writer` or `reader`: how `phdb` opened it. |
-| `format_version` | The file format version. |
+| `read_only` | Whether the open can't write: `reader` mode, or a writer that fell back to read-only (see below). |
+| `format_version` | The file format version. A read-only open leaves an older file's version as it is. |
+| `features` | The file's feature bits, `{"compat", "ro_compat", "incompat"}`: all 0 until a feature added after 1.0 is used. |
 | `db_id` | The database's id, 32 hex digits. |
 | `shards` | The running writer's shard count in `reader` mode. `null` in `writer` mode: the count is an open option, not stored in the file. |
 | `file_bytes` | The main file's length, without the WAL sidecars. |
@@ -102,7 +104,9 @@ Example:
 $ phdb info app.phdb
 path            app.phdb
 mode            writer
-format_version  3
+read_only       false
+format_version  4
+features        {"compat":0,"ro_compat":0,"incompat":0}
 db_id           5f1c0e9a2b7d4c3e8a6f0b1d2c3e4f50
 shards          -
 file_bytes      67239936

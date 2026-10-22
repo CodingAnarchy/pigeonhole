@@ -4,7 +4,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
-use pigeonhole_format::{FamilyId, FormatVersion, SstId};
+use pigeonhole_format::superblock::Features;
+use pigeonhole_format::{FamilyId, SstId};
 
 use super::{Engine, Role, TableInfo};
 
@@ -14,11 +15,17 @@ use super::{Engine, Role, TableInfo};
 pub struct DbInfo {
     /// The database's random id, chosen at creation.
     pub db_id: [u8; 16],
-    /// The file format version: a writable open upgrades older files, so an open database
-    /// is always at [`FormatVersion::CURRENT`].
+    /// The file format version of the current superblock. A writable open upgrades an
+    /// older file to [`FormatVersion::CURRENT`](pigeonhole_format::FormatVersion::CURRENT); a read-only open (a reader process, or a
+    /// writer's `read_only_fallback`) writes nothing, so it reports the file's own.
     pub format_version: u32,
+    /// The file's feature sets (D269; FORMAT §8.2).
+    pub features: Features,
     /// The role this instance opened in.
     pub role: Role,
+    /// Whether this instance cannot write: a reader, or a writer opened read-only by
+    /// `read_only_fallback` (ICR 0059).
+    pub read_only: bool,
     /// Shard count (the writer's, for a reader).
     pub shards: usize,
     /// The main file's length in bytes.
@@ -148,8 +155,10 @@ impl Engine {
 
         Ok(DbInfo {
             db_id: pager.db_id(),
-            format_version: FormatVersion::CURRENT.0,
+            format_version: pager.format_version().0,
+            features: pager.features(),
             role: inner.role,
+            read_only: inner.read_only,
             shards: shared.shards,
             file_bytes,
             free_bytes,

@@ -43,10 +43,17 @@ pub(crate) fn report(file: &Path, mode: &'static str, info: &DatabaseInfo) -> Re
         tables.push(json!({"name": t.name, "tablets": t.tablets, "families": families}));
     }
 
+    let features = json!({
+        "compat": info.features.compat,
+        "ro_compat": info.features.ro_compat,
+        "incompat": info.features.incompat,
+    });
     let mut document = Map::new();
     document.insert("path".into(), json!(file.display().to_string()));
     document.insert("mode".into(), json!(mode));
+    document.insert("read_only".into(), json!(info.read_only));
     document.insert("format_version".into(), json!(info.format_version));
+    document.insert("features".into(), features.clone());
     document.insert("db_id".into(), json!(db_id));
     document.insert("shards".into(), shards.clone());
     document.insert("file_bytes".into(), json!(info.file_bytes));
@@ -58,7 +65,9 @@ pub(crate) fn report(file: &Path, mode: &'static str, info: &DatabaseInfo) -> Re
         summary: vec![
             ("path", json!(file.display().to_string())),
             ("mode", json!(mode)),
+            ("read_only", json!(info.read_only)),
             ("format_version", json!(info.format_version)),
+            ("features", features),
             ("db_id", json!(db_id)),
             ("shards", shards),
             ("file_bytes", json!(info.file_bytes)),
