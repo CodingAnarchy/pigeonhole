@@ -1,0 +1,3 @@
+### Added
+- FORMAT.md §13: the 1.x file compatibility promise (D269, #496). Every 1.x build opens every file written by 0.1.0 or later; a newer 1.x build's file opens unless it uses a feature this build lacks (then `UnsupportedFeature`, or read-only with `read_only_fallback`). The section also says where each structure has room for later features, and how each tracked post-1.0 feature fits format 4. The shared-memory layout stays outside the promise.
+- The guide's [file format and upgrades](docs/guide/concepts.md#file-format-and-upgrades) note: upgrading a file is one-way, so back up before the first writable open with a new release.
