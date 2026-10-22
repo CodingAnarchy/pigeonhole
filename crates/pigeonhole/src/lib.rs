@@ -120,6 +120,8 @@ mod guide {
     struct Concepts;
     #[doc = include_str!("../../../docs/guide/readers.md")]
     struct Readers;
+    #[doc = include_str!("../../../docs/guide/transactions.md")]
+    struct Transactions;
     #[cfg(feature = "async")]
     #[doc = include_str!("../../../docs/guide/async.md")]
     struct Async;

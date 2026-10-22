@@ -2300,3 +2300,29 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - `a_packing_move_waits_for_a_claimed_shard`: with the only active shard claimed for 400 passes, no tablet moves past the shrink; once the claim runs out the three land together.
 - `a_change_that_waits_on_a_compaction_claims_no_shard`: a hot tablet's split, held by its compaction, claims no shard; it splits once the compaction ends.
 - Each fails without its change.
+
+<a id="d272"></a>
+## D272 — Transactions in 1.0: no lock mode; conflicts stay at (row, family) granularity; the transfer gap stays open under #708 (owner decision, 2026-10-21; pigeonhole, engine, #694)
+
+**Status: accepted** for C1 and C2 (owner, 2026-10-21). C3 is **open**: the owner rejected accepting the gap, and a perf agent investigates under #708.
+
+**Decided:**
+- **C1: no pessimistic or lock-based mode in 1.0.**
+  - The spec's transactions have no lock manager.
+  - D267's chaining and wound-wait cover blind writers on hot rows.
+  - A lock or "intent" mode (D249's named follow-up) is post-1.0 if C3's investigation needs one, and the owner asked for C3 to be solved short of it.
+- **C2: conflicts stay at (row, family) granularity.**
+  - A transaction's reads are recorded per (row, family) (`get`, and `get_row` per family, ICR 0062). A commit that touches any column of such a family in that row makes it conflict.
+  - Per-cell tracking would mean qualifier-level read sets and a per-qualifier check in the SSTs. It would only remove false conflicts between transactions that read and write different qualifiers of one family.
+  - The guide's transactions page documents the granularity and the modeling advice: put columns that change independently and are read in transactions in different families.
+- **C3: the `transfer` row (D247's 3× rule) is not accepted.** At 16 clients and θ 0.99 it's 38× behind RocksDB's pessimistic locking at Buffered (#708, gate 2026-10-14), and the owner judged the mode unusable at that level.
+  - **D267 doesn't act on it:** transfer uses only reading commits. It measured 1.05× (Buffered) and 1.22× (default durability) against main.
+  - **The work:** improving it without a lock mode goes to a perf agent under #708.
+  - **What it can use:** `EngineMetrics::transaction_conflicts` and `transaction_retries` (ICR 0061), `max_attempts_reading` (D267), and `transact`'s backoff (ICR 0060).
+  - Until #708 lands, #694's "the transfer row is within the agreed bound or explicitly accepted" stays open.
+
+**Also part of #694's hardening** (recorded here so the transaction decisions are in one place):
+- **Write-free transactions** commit at their snapshot without validation, and never conflict (ICR 0060 part 1). This is safe because writers are validated, so serializable in seqno order; it would not hold under plain snapshot-isolation writers (Fekete et al.).
+- **`transact`, `RetryPolicy` and the transaction counters** are ICR 0060 part 2 and ICR 0061; `get_row` and the write ops are ICR 0062.
+- **The black-box serializability checker** (#868) runs in CI and in sweeps.
+
