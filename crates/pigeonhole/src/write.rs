@@ -1136,7 +1136,8 @@ impl Transaction {
     /// A transaction that wrote nothing commits at once and never conflicts: its reads all
     /// come from one snapshot, so it is serializable there (ICR 0060). Its [`CommitInfo`]
     /// names the snapshot's seqno and [`Durability::None`]: it wrote nothing, and what it
-    /// read is visible but not necessarily durable, as for any snapshot.
+    /// read is visible but not necessarily durable, as for any snapshot. For reads of only
+    /// durable data, read at [`Pigeonhole::durable_snapshot`](crate::Pigeonhole::durable_snapshot).
     pub fn commit(self) -> Result<CommitInfo> {
         self.finish(None)
     }
