@@ -378,7 +378,7 @@ rows.append(("Within 1.5× of RocksDB on every workload",
 # and at most 2 ms at Buffered and 1 ms at GroupSync.
 XSHARD_P99_VS_ROCKSDB = 1.5
 XSHARD_P99_CAP_US = {"buffered": 2000, "default": 1000}
-XSHARD_TARGET = ("Contended cross-shard commits (D246): within 1.5× of RocksDB; tablets on ≥ 0.8× off (packing off); "
+XSHARD_TARGET = ("Contended cross-shard commits (D246): within 1.5× of RocksDB; tablets on ≥ 0.8× off (packing on); "
                  "≤ 0.1 wasted 2PC rounds per cross-shard commit; no Busy; cross-shard p99 ≤ 1.5× RocksDB's "
                  "batch p99, ≤ 2 ms at Buffered and ≤ 1 ms at GroupSync")
 
@@ -390,8 +390,9 @@ def xshard(run, level="buffered"):
     ph = [r for r in rs if r["store"] == "pigeonhole"]
     on = next((r for r in ph if default_config(r)), None)
     off = next((r for r in ph if "tablets=on" not in r.get("store_config", "")), None)
-    # D246 (owner, 2026-10-14): tablets on against off is judged with packing off; runs from
-    # before that have no such run and fall back to the default one.
+    # D246: tablets on against off is judged with the default run, packing on (owner,
+    # 2026-10-22: #707 closed, D257/D262 closed packing's gap). From 2026-10-14 to then it
+    # was judged with packing off (D251 item 3); that run's ratio is still reported beside it.
     unpacked = next((r for r in ph if "packing=off" in r.get("store_config", "")), None)
     rk = next((r for r in rs if r["store"] == "rocksdb"), None)
     if not (on and off and rk):
@@ -418,8 +419,9 @@ def xshard(run, level="buffered"):
     x = {
         "tput": rk["throughput"] / on["throughput"],
         "p99": on["p99_ns"] / max(rk["p99_ns"], 1),
-        "on_off": (unpacked or on)["throughput"] / max(off["throughput"], 1e-9),
-        "on_off_how": "packing off" if unpacked else "packing on (no packing-off run)",
+        "on_off": on["throughput"] / max(off["throughput"], 1e-9),
+        "on_off_how": "packing on" + (f"; packing off {unpacked['throughput'] / max(off['throughput'], 1e-9):.2f}"
+                                      if unpacked else ""),
         "wasted": wasted,
         "how": how,
         "cross_p99_us": us(cross["p99_ns"]) if cross else None,
