@@ -2,7 +2,7 @@
 
 Every on-disk and shared-memory byte layout. Written during the interface freeze (build step 2). The executable form is the `pigeonhole-format` crate; where this file and the crate disagree, this file wins and the crate has a bug.
 
-Format version **4**, shared-memory layout version **2**. Nothing here is promised stable before 1.0 (spec: "promise forward compatibility only at 1.0"), but every structure carries a magic or a version so it can evolve.
+Format version **4**, shared-memory layout version **2**. Format 4 is the format every 1.x build reads and writes (D269): later 1.x features use the feature bits and reserved room described here, never a new version. §13 states the compatibility promise, which takes effect with 1.0.0. The shared-memory layout (§11) is outside it.
 
 ## 1. Conventions
 
@@ -385,6 +385,8 @@ A `Durability::None` commit's record is appended to the shard's in-memory stream
 
 ## 11. Shared-memory region
 
+**Not part of the compatibility promise** (§13, D269 D9). The layout may change in any release, and `ShmLayoutVersion` must match exactly: stop reader processes before upgrading the writer.
+
 Two objects (decision D27), placed at `/dev/shm/<name>` on Linux, POSIX `shm_open("/<name>")` on macOS and BSD, a `Local\<name>` pagefile-backed mapping on Windows, or `<shm_dir>/<name>.phdb-shm` when `shm_dir` is set:
 
 - **Directory** `phdb-<h>`, where `<h>` is 16 lowercase hex digits of `xxh3_64(device LE ++ inode LE)` of the main file. One page whose layout never changes: magic `PHDBSHMD` @0, `format` u32 @8 (=1), `generation` u64 atomic @16 (current region, 0 = none), `layout_version` u32 atomic @24.
@@ -527,3 +529,48 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.
 - Golden files for every structure are frozen at 1.0 (format brief).
+- **Version 4 is the last 1.x version.** A later 1.x feature takes a feature bit (§8.2) and the room §13.1 names for it (§13.2 lists the paths for tracked features); 2.0 is format 5.
+
+## 13. Compatibility promise
+
+From 1.0.0 (D269):
+
+- **Older files.** Every 1.x build opens every file written by 0.1.0 or later, including any older 1.x build's (`MIN_READABLE` stays 1). A writable open upgrades an older file to format 4 before it writes anything an older build could misread (both superblock pages first, §12), so the upgrade is one-way: the older build then refuses the file with `UnsupportedFormat`. Back up a file before opening it writable with a newer build if you may need to go back. A read-only open (a reader process, or `read_only_fallback`) never upgrades.
+- **Newer files.** A 1.x build opens a file a newer 1.x build wrote, read-write, unless the file uses a feature it lacks:
+  - an unknown `incompat` bit refuses the open with `UnsupportedFeature`, naming the bits;
+  - an unknown `ro_compat` bit refuses a writable open with `UnsupportedFeature`; reader processes open it, and a writer opens it read-only with `read_only_fallback` (ICR 0059), writing nothing;
+  - unknown `compat` bits are ignored and kept; §8.2 says what a compat feature's data may rely on.
+- **Features are flagged only once used.** A bit is set in both superblock pages before the first structure that uses the feature is written, so a file that doesn't use a new feature stays readable and writable by every older 1.x build.
+- **Unknown values are never corruption.** A value of a frozen enum that this build doesn't know, in bytes whose checksum passes, decodes to `UnsupportedFeature` (ICR 0058): key kind, value tag, compression, block, filter and manifest block kinds, family settings, WAL record and fragment types, must-understand edit tags (§9.3), SST and WAL segment feature bits. With the file-level bit set first, an older build normally refuses at open; the per-structure error is the backstop.
+- **What isn't promised:** the shared-memory layout (§11), the API (semver covers it separately), and files written by 2.0 (format 5), which no 1.x build opens. 2.0 comes with upgrade tooling.
+- **How it's checked:** golden files for every structure (`crates/format/tests/golden`, frozen at 1.0), a corpus of files written by the 1.0 release that every later build opens in CI, and, once 1.0.0 is published, a job that opens files from `main` with 1.0.0.
+
+### 13.1 Where each structure has room
+
+| Structure | Room for later 1.x features |
+|---|---|
+| Superblock (§8.2) | `compat`, `ro_compat`, `incompat` feature sets; the extension area, bytes 128..4088. The first feature that uses the area defines its record layout (D269 D6: TLV records with an xxh3 at 4088) behind an `incompat` bit |
+| Manifest edits (§9.2, §9.3) | new must-understand tags 14..=127 behind an `incompat` bit; skippable tags 128..=255 for data an older writer may drop; fields appended to an edit body when a bit says they're there |
+| SST (§5) | footer `flags` as per-SST feature bits; properties block fields appended (length-delimited); new block kinds |
+| Values and keys (§2, §3) | new value tags (0x04.., 0x81..) and key kinds, each behind an `incompat` bit |
+| Blocks (§4) | new compression codes (3..) and block kinds, behind an `incompat` bit |
+| WAL (§10) | segment header `features` bits and reserved bytes (the salt slot at 60..76); new record types behind an `incompat` bit |
+| Blob extents (§7) | reserved header bytes 20..56; new blob pointer tags behind a bit |
+
+### 13.2 Paths for tracked features
+
+How each feature tracked for after 1.0 fits format 4 (D269 §3). The bit numbers are assigned when a feature lands.
+
+| Feature | Path |
+|---|---|
+| Min, Max and HLL families (#487) | `FamilyKind` values 2–4, behind an `incompat` bit (the first real feature bit); the HLL sketch is a byte value with a fixed encoding |
+| More aggregations (#488) | more `FamilyKind` values, plus an optional `kind_params` byte field appended to `PutFamily` (must-understand when present, under the same bit) |
+| Adjacency sets, roaring (#489) | a `FamilyKind` value and a value encoding, behind a bit |
+| Vector values (#490) | a value tag (0x04) behind an `incompat` bit; payload alignment as a data-block kind (6) or an entry flag under the same bit; dimension and metric in `kind_params` |
+| Time-series codec (#491) | a compression code (3..) or a block kind, behind an `incompat` bit |
+| Content-addressed blob dedupe (#491) | a blob-pointer value tag (0x81) and a must-understand refcount edit, behind an `incompat` bit |
+| Encryption at rest (#493) | an `incompat` bit; key ids in the superblock extension area; a per-block nonce and MAC as a trailer form under the bit; WAL segment feature bits |
+| Zone maps (#493), per-block time ranges (#535) | a meta block kind addressed from an appended properties field: `compat` (derived data an older writer drops when it rewrites the SST) |
+| Zero-copy clones and branches (#493) | shared extents as a must-understand edit, behind an `incompat` bit (free space is rebuilt from the manifest, D8) |
+| Read replicas, WAL shipping (#493, #176) | the WAL framing frozen in format 4; the per-database salt slot in the segment header |
+| Multi-process readers (#39, #397) | the shared-memory layout version (§11): outside the promise |
