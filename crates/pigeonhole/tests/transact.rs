@@ -269,3 +269,115 @@ fn next_pause_is_the_whole_decision() {
     assert!(near <= Duration::from_micros(5));
     assert!(p.retries_code(ErrorCode::Conflict) && !p.retries_code(ErrorCode::Corruption));
 }
+
+// ---- ICR 0062: `Transaction::get_row` and write-op parity ----
+
+fn wide(db: &Pigeonhole) -> Table {
+    db.table("wide")
+        .unwrap()
+        .family("a", Family::default())
+        .family("b", Family::default())
+        .family("c", Family::counter())
+        .create()
+        .unwrap()
+}
+
+#[test]
+fn get_row_records_a_read_of_each_family_it_covers() {
+    let (db, _) = db();
+    let w = wide(&db);
+    w.mutate(b"r")
+        .put("a", b"x", b"1")
+        .put("a", b"y", b"2")
+        .put("b", b"z", b"3")
+        .commit()
+        .unwrap();
+    // The newest version of each column of the families asked for.
+    let mut txn = db.transaction().unwrap();
+    let row = txn.get_row(&w, b"r", &["a"]).unwrap().unwrap();
+    let cells: Vec<(&str, Vec<u8>)> = row
+        .iter()
+        .map(|e| (e.family, e.qualifier.to_vec()))
+        .collect();
+    assert_eq!(cells, [("a", b"x".to_vec()), ("a", b"y".to_vec())]);
+    drop(row);
+    // A write to another qualifier of a family it read conflicts...
+    w.mutate(b"r").put("a", b"new", b"9").commit().unwrap();
+    txn.put(&w, b"out", "a", b"q", b"v");
+    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
+    // ...one to a family it did not read does not.
+    let mut txn = db.transaction().unwrap();
+    let _ = txn.get_row(&w, b"r", &["a"]).unwrap();
+    w.mutate(b"r").put("b", b"z", b"4").commit().unwrap();
+    txn.put(&w, b"out", "a", b"q", b"v");
+    txn.commit().unwrap();
+    // No families named: every family of the table counts as read.
+    let mut txn = db.transaction().unwrap();
+    assert!(txn.get_row(&w, b"r", &[]).unwrap().is_some());
+    w.mutate(b"r").put("b", b"z", b"5").commit().unwrap();
+    txn.put(&w, b"out", "a", b"q", b"v");
+    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
+    // An absent row is a read too: a commit that creates it conflicts.
+    let mut txn = db.transaction().unwrap();
+    assert!(txn.get_row(&w, b"absent", &["a"]).unwrap().is_none());
+    w.mutate(b"absent")
+        .put("a", b"x", b"now here")
+        .commit()
+        .unwrap();
+    txn.put(&w, b"out", "a", b"q", b"v");
+    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
+    // An unknown family is an error, as on a plain row read.
+    let mut txn = db.transaction().unwrap();
+    assert_eq!(
+        txn.get_row(&w, b"r", &["nope"]).unwrap_err().code(),
+        ErrorCode::FamilyNotFound
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn every_row_mutation_write_is_available_in_a_transaction() {
+    let (db, _) = db();
+    let w = wide(&db);
+    w.mutate(b"gone").put("a", b"x", b"1").commit().unwrap();
+    w.mutate(b"fam")
+        .put("a", b"x", b"1")
+        .put("b", b"y", b"2")
+        .commit()
+        .unwrap();
+    w.mutate(b"cell")
+        .put_at("a", b"x", 5, b"old")
+        .put_at("a", b"x", 6, b"new")
+        .commit()
+        .unwrap();
+    let mut txn = db.transaction().unwrap();
+    txn.put_at(&w, b"t", "a", b"at", 77, b"v")
+        .put_i64(&w, b"t", "b", b"i", -3)
+        .put_i64_at(&w, b"t", "b", b"i2", 78, 4)
+        .put_f64(&w, b"t", "b", b"f", 0.5)
+        .put_f64_at(&w, b"t", "b", b"f2", 79, 1.5)
+        .incr(&w, b"t", "c", b"n", 2)
+        .incr_at(&w, b"t", "c", b"m", 80, 3)
+        .delete_cell(&w, b"cell", "a", b"x", 6)
+        .delete_family(&w, b"fam", "a")
+        .delete_row(&w, b"gone");
+    txn.commit().unwrap();
+
+    let at = w.get(b"t", "a", b"at").unwrap().unwrap();
+    assert_eq!((at.timestamp(), at.value()), (77, &b"v"[..]));
+    assert_eq!(w.get(b"t", "b", b"i").unwrap().unwrap().as_i64(), Some(-3));
+    let i2 = w.get(b"t", "b", b"i2").unwrap().unwrap();
+    assert_eq!((i2.timestamp(), i2.as_i64()), (78, Some(4)));
+    assert!(matches!(
+        w.get(b"t", "b", b"f").unwrap().unwrap().typed(),
+        pigeonhole::Value::F64(x) if x == 0.5
+    ));
+    assert_eq!(w.get(b"t", "b", b"f2").unwrap().unwrap().timestamp(), 79);
+    assert_eq!(w.get(b"t", "c", b"n").unwrap().unwrap().as_i64(), Some(2));
+    assert_eq!(w.get(b"t", "c", b"m").unwrap().unwrap().as_i64(), Some(3));
+    assert_eq!(w.get(b"cell", "a", b"x").unwrap().unwrap().value(), b"old");
+    assert!(w.get(b"fam", "a", b"x").unwrap().is_none());
+    assert!(w.get(b"fam", "b", b"y").unwrap().is_some());
+    assert!(w.get(b"gone", "a", b"x").unwrap().is_none());
+    db.close().unwrap();
+}

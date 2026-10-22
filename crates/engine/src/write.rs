@@ -1039,6 +1039,44 @@ impl Txn {
             .get(&self.snapshot, table, family, row, qualifier)
     }
 
+    /// Reads one row of `table` at the transaction's snapshot into `sink`, projected by
+    /// `spec`, and records a read of every family it covers: `families`, or every family of
+    /// the table at the snapshot when empty (ICR 0062). Returns whether the row has a visible
+    /// cell. A family the row has no cell in still counts as read: a commit adding one
+    /// conflicts.
+    pub fn read_row_into(
+        &mut self,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &crate::ReadSpec,
+        sink: &mut impl crate::RowSink,
+    ) -> crate::Result<bool> {
+        let families = crate::engine::families_in_order(&self.snapshot.view, table, families)?;
+        for &family in &families {
+            let key = ReadKey {
+                table,
+                row: row.to_vec(),
+                family,
+            };
+            if !self.reads.contains(&key) {
+                self.reads.push(key);
+            }
+        }
+        let now = self.engine.shared.vfs.now_micros();
+        self.snapshot.checked(crate::read::read_row_into(
+            &self.snapshot.view,
+            self.snapshot.seqno,
+            table,
+            row,
+            &families,
+            spec,
+            now,
+            false,
+            sink,
+        ))
+    }
+
     /// [`get`](Txn::get) as a future: records the read at the call, then reads at the
     /// transaction's snapshot as [`Engine::get_async`](crate::Engine::get_async) does. A
     /// read recorded and then dropped unpolled still counts at validation (conservative).
