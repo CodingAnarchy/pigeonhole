@@ -6006,6 +6006,10 @@ fn a_cross_shard_transaction_overlapping_an_undecided_share_retries_instead_of_c
         db.engine.metrics().cross_shard.refused_pending_overlap > before,
         "B was never refused over the overlap"
     );
+    // B, a commit that reads, committed on a retry; A failed, and no blind commit ran.
+    let x = db.engine.metrics().cross_shard;
+    assert!(x.max_attempts_reading >= 2, "{x:?}");
+    assert_eq!(x.max_attempts_blind, 0, "{x:?}");
     assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"t".to_vec()));
 }
 
@@ -6717,4 +6721,422 @@ fn a_cross_shard_commit_in_a_0_3_0_wal_replays() {
         );
     }
     assert!(db.engine.next_seqno() > seqno);
+}
+
+/// A blind cross-shard batch writing `value` to each of `rows` (the first row's shard
+/// coordinates).
+fn blind_txn(db: &Db, rows: &[&[u8]], value: &[u8]) -> pigeonhole_engine::Txn {
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    for w in rows {
+        t.batch()
+            .put(id, f, w, b"q", None, ValueRef::Bytes(value))
+            .unwrap();
+    }
+    t
+}
+
+#[test]
+fn a_blind_prepare_over_an_undecided_share_chains_instead_of_refusing() {
+    // D267: B's PREPARE meets A's undecided share on `a` and goes behind it instead of
+    // being refused (D263 refused it). Its `Prepared` waits for A's decision there, so B
+    // lands above A: the latest `a` is B's.
+    let (mut db, low, high) = overlap_db();
+    let before = db.engine.metrics().cross_shard;
+    let a = blind_txn(&db, &[b"y", b"a"], b"from-a");
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    let b = blind_txn(&db, &[b"z", b"a"], b"from-b");
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    turn(&mut db, low);
+    turn(&mut db, low);
+    let ra = poll_until(&mut db, &mut pa, 100_000).expect("A resolved");
+    let rb = poll_until(&mut db, &mut pb, 100_000).expect("B resolved");
+    let (ra, rb) = (ra.expect("A commits"), rb.expect("B commits"));
+    assert!(ra.seqno < rb.seqno, "A {ra:?} B {rb:?}");
+    let after = db.engine.metrics().cross_shard;
+    assert_eq!(
+        after.refused_pending_overlap, before.refused_pending_overlap,
+        "B was refused instead of chained"
+    );
+    assert_eq!(after.refused_rounds, before.refused_rounds);
+    // Both blind commits, each committed on its first attempt.
+    assert_eq!(
+        (after.max_attempts_blind, after.max_attempts_reading),
+        (1, 0)
+    );
+    assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"from-b".to_vec()));
+}
+
+#[test]
+fn an_older_prepare_chained_behind_a_younger_share_wounds_it() {
+    // D267 wound-wait. A (coordinated by `high`) and B (coordinated by `low`) both write `a`
+    // and `y`; on the frozen clock A is the older since `high` takes its id first. Each
+    // coordinator admits its own share first, so each commit's share at the other's
+    // coordinator lands behind the other's: B, younger, chains behind A on `high`; A, older,
+    // chains behind B on `low` and wounds B. B's coordinator aborts B without waiting for
+    // `high`, A commits, and B retries behind A and commits above it.
+    let (mut db, low, high) = overlap_db();
+    let before = db.engine.metrics().cross_shard;
+    let a = blind_txn(&db, &[b"y", b"a"], b"from-a");
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    let b = blind_txn(&db, &[b"a", b"y"], b"from-b");
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    turn(&mut db, low);
+    turn(&mut db, low);
+    turn(&mut db, high);
+    let ra = poll_until(&mut db, &mut pa, 100_000).expect("A resolved");
+    let rb = poll_until(&mut db, &mut pb, 100_000).expect("B resolved");
+    let (ra, rb) = (ra.expect("A commits"), rb.expect("B commits"));
+    assert!(ra.seqno < rb.seqno, "A {ra:?} B {rb:?}");
+    let after = db.engine.metrics().cross_shard;
+    assert!(
+        after.refused_rounds > before.refused_rounds,
+        "B's wounded round was not aborted"
+    );
+    assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"from-b".to_vec()));
+    assert_eq!(db.get(b"y").map(|(_, v)| v), Some(b"from-b".to_vec()));
+}
+
+/// Turns `high`, then `low`.
+fn turn_both(db: &mut Db, low: usize, high: usize) {
+    turn(db, high);
+    turn(db, low);
+}
+
+/// Polls `pc` once; `Some` once it resolved.
+fn resolved(pc: &mut pigeonhole_engine::PendingCommit) -> bool {
+    poll_commit(pc).is_some_and(|r| {
+        r.expect("commits");
+        true
+    })
+}
+
+/// Lets every commit in `stream` resolve; each commits.
+fn drain(db: &mut Db, stream: Vec<pigeonhole_engine::PendingCommit>) {
+    for mut pc in stream {
+        poll_until(db, &mut pc, 200_000)
+            .expect("resolved")
+            .expect("commits");
+    }
+}
+
+#[test]
+fn a_single_waiting_on_a_hot_row_goes_in_while_commits_keep_chaining() {
+    // D267 (perf287's R1): a single on `a` waits only for the shares undecided there when it
+    // started; blind commits chaining on `a` after it wait for it. Without that, the steady
+    // stream of chained commits below keeps `a` undecided and the single never goes in.
+    let (mut db, low, high) = overlap_db();
+    let mut stream = Vec::new();
+    // Four commits chain on `a` at `low`, then the single arrives and waits behind them.
+    for i in 0..4u8 {
+        let t = blind_txn(&db, &[b"y", b"a"], &[b's', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+    }
+    turn(&mut db, high);
+    turn(&mut db, low);
+    let table = db.table.clone();
+    let mut single = submit_put(&db, &table, b"a");
+    turn(&mut db, low);
+    // One more commit chains on `a` every round.
+    let mut went_in = None;
+    for i in 0..40u8 {
+        let t = blind_txn(&db, &[b"y", b"a"], &[b'n', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+        turn_both(&mut db, low, high);
+        if went_in.is_none() && resolved(&mut single) {
+            went_in = Some(i);
+        }
+    }
+    let went_in = went_in.expect("the single never went in while commits kept chaining");
+    assert!(
+        went_in <= 8,
+        "the single went in only after {went_in} rounds"
+    );
+    let m = db.engine.metrics().cross_shard;
+    assert!(m.share_waits > 0, "the single never waited");
+    assert!(m.chained > 0, "nothing chained");
+    drain(&mut db, stream);
+}
+
+#[test]
+fn the_oldest_blind_commit_chains_past_a_full_row_and_wounds_it() {
+    // D267 (perf287's R2): `low` holds `CHAIN_CAP` (8) younger undecided shares on `a` when
+    // the oldest commit's PREPARE arrives. It is exempt from the cap: it chains and wounds
+    // them. Without the exemption it is refused, and with one younger commit chaining on
+    // `a` every round the row never clears for its retry.
+    let (mut db, low, high) = overlap_db();
+    let mut stream = Vec::new();
+    for i in 0..10u8 {
+        let t = blind_txn(&db, &[b"a", b"z"], &[b'y', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+    }
+    let old = blind_txn(&db, &[b"y", b"a"], b"old");
+    let mut old = old.submit(Some(Durability::Buffered)).unwrap();
+    // `high` takes the oldest id; `low` then coordinates the ten and gets the old PREPARE.
+    turn(&mut db, high);
+    turn(&mut db, low);
+    let mut went_in = None;
+    for i in 0..40u8 {
+        let t = blind_txn(&db, &[b"a", b"z"], &[b'n', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+        turn(&mut db, low);
+        turn(&mut db, high);
+        if went_in.is_none() && resolved(&mut old) {
+            went_in = Some(i);
+        }
+    }
+    let went_in = went_in.expect("the oldest commit never went in");
+    assert!(
+        went_in <= 8,
+        "the oldest commit went in only after {went_in} rounds"
+    );
+    assert!(
+        db.engine.metrics().cross_shard.wounds > 0,
+        "nothing was wounded"
+    );
+    drain(&mut db, stream);
+}
+
+#[test]
+fn a_reading_commit_gets_in_against_a_stream_of_blind_commits() {
+    // D267 (perf287's R2): a commit that reads cannot chain. Refused on `a`, which a stream
+    // of blind commits keeps undecided, and older than every share there, it fences `a`:
+    // younger blind commits are refused there, the row drains and its retry gets in.
+    let (mut db, low, high) = overlap_db();
+    let mut stream = Vec::new();
+    for i in 0..4u8 {
+        let t = blind_txn(&db, &[b"a", b"z"], &[b's', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+        turn_both(&mut db, low, high);
+    }
+    let reader = overlap_txn(&db, &[b"b"], &[b"y", b"a"]);
+    let mut reader = reader.submit(Some(Durability::Buffered)).unwrap();
+    let mut went_in = None;
+    for i in 0..60u8 {
+        for j in 0..2u8 {
+            let t = blind_txn(&db, &[b"a", b"z"], &[b'n', i, j]);
+            stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+        }
+        turn_both(&mut db, low, high);
+        if went_in.is_none() && resolved(&mut reader) {
+            went_in = Some(i);
+        }
+    }
+    let went_in = went_in.expect("the reading commit never went in");
+    assert!(
+        went_in <= 30,
+        "the reading commit went in only after {went_in} rounds"
+    );
+    drain(&mut db, stream);
+}
+
+#[test]
+fn a_crash_mid_chain_applies_the_decided_share_and_drops_the_one_behind_it() {
+    // D267 (perf287's R3): A is decided (its DECISION logged by `high`) but not yet applied
+    // on `low`; B is chained behind A on `low` and its PREPARE logged there. A crash: the
+    // reopen applies A from its DECISION and drops B, whose coordinator never decided.
+    let vfs = SimVfs::new(267);
+    let mut db = open_on(&vfs, 2, |_| {});
+    let id = db.table.id;
+    let m = db.engine.split_tablet_pending(id, b"m").unwrap();
+    db.drive(m).unwrap();
+    let low = usize::from(db.ranges()[0].1);
+    let high = 1 - low;
+    if usize::from(db.ranges()[1].1) != high {
+        let m = db
+            .engine
+            .move_tablet_pending(id, b"z", high as u16)
+            .unwrap();
+        db.drive(m).unwrap();
+    }
+    db.put(b"a", b"a0");
+    db.put(b"y", b"y0");
+    db.put(b"z", b"z0");
+    db.engine.take_appended();
+    let a = blind_txn(&db, &[b"y", b"a"], b"from-a");
+    let _pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    let b = blind_txn(&db, &[b"z", b"a"], b"from-b");
+    let _pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    // `low` logs A's PREPARE, then B's behind it (B's `Prepared` waits for A's decision).
+    turn(&mut db, low);
+    turn(&mut db, low);
+    // `high` decides A and logs its DECISION; `low` never hears it.
+    let mut decided = false;
+    for _ in 0..8 {
+        turn(&mut db, high);
+        decided |= db.engine.take_appended().iter().any(|r| {
+            r.kind == pigeonhole_engine::AppendedKind::Commit && usize::from(r.stream) == high
+        });
+        if decided {
+            break;
+        }
+    }
+    assert!(decided, "A's DECISION was never logged");
+    assert!(
+        db.engine.metrics().cross_shard.chained > 0,
+        "B did not chain"
+    );
+    vfs.crash(pigeonhole_io::sim::CrashKind::Process);
+    drop(db);
+
+    let db = open_on(&vfs, 2, |_| {});
+    assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"from-a".to_vec()));
+    assert_eq!(db.get(b"y").map(|(_, v)| v), Some(b"from-a".to_vec()));
+    assert_eq!(db.get(b"z").map(|(_, v)| v), Some(b"z0".to_vec()));
+}
+
+/// Three shards, one tablet each: `a` on shard 0, `n` on shard 1, `z` on shard 2.
+fn three_tablet_db() -> Db {
+    let mut db = open(3, |_| {});
+    let id = db.table.id;
+    for key in [&b"m"[..], b"t"] {
+        let m = db.engine.split_tablet_pending(id, key).unwrap();
+        db.drive(m).unwrap();
+    }
+    // `ranges` lists the tablets in key order: [.., m), [m, t), [t, ..).
+    for (i, key) in [&b"a"[..], b"n", b"z"].into_iter().enumerate() {
+        let shard = i as u16;
+        if db.ranges()[i].1 != shard {
+            let m = db.engine.move_tablet_pending(id, key, shard).unwrap();
+            db.drive(m).unwrap();
+        }
+    }
+    for row in [&b"a"[..], b"n", b"z"] {
+        db.put(row, b"0");
+    }
+    db
+}
+
+#[test]
+fn a_prepare_refused_by_a_fence_waits_behind_the_reader() {
+    // D267 (perf287's R4): a refused reading commit, the oldest on `a`, fences it. A
+    // younger blind commit refused there by the fence waits behind the reader (D249's
+    // older-first wake), not for `a`'s shares to clear: with the reader's retry held back
+    // (its coordinator, shard 1, does not run) and `a` clear, it would be woken at once and
+    // refused again every round.
+    let mut db = three_tablet_db();
+    // The blind commits (coordinated by shard 0, `a` then `z`) are queued at shard 0 first;
+    // the reader (coordinated by shard 1) takes the oldest id there, and its PREPARE reaches
+    // shard 0 after them, so it meets their undecided shares, younger, and fences `a`.
+    let mut stream = Vec::new();
+    for i in 0..2u8 {
+        let t = blind_txn(&db, &[b"a", b"z"], &[b's', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+    }
+    let reader = overlap_txn(&db, &[b"b"], &[b"n", b"a"]);
+    let mut reader = reader.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, 1);
+    turn(&mut db, 0);
+    // Shard 1 stands still: the reader's retry cannot run, and the fence stands. The chain
+    // on `a` drains (shards 0 and 2), and a younger blind commit arrives every round.
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    let rounds = 30;
+    for i in 0..rounds as u8 {
+        let t = blind_txn(&db, &[b"a", b"z"], &[b'n', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+        turn(&mut db, 0);
+        turn(&mut db, 2);
+    }
+    let refused = db.engine.metrics().cross_shard.refused_pending_overlap - before;
+    assert!(
+        refused <= rounds + 2,
+        "{refused} refusals for {rounds} fenced commits: refused ones are woken and refused again"
+    );
+    // Shard 1 runs again: the reader commits, then the fenced commits.
+    poll_until(&mut db, &mut reader, 200_000)
+        .expect("reader resolved")
+        .expect("reader commits");
+    drain(&mut db, stream);
+}
+
+#[test]
+fn a_younger_reading_commit_is_not_held_by_a_fence() {
+    // D267: a fence keeps younger blind commits from chaining on a row an older refused
+    // reading commit waits for. A younger reading commit cannot chain, and goes in on the
+    // row as under D249. Held by the fence too, each reading commit on a hot row waited out
+    // an older one's whole retry, and the bench's transfer row (reading commits only) ran
+    // at half main's rate (#830's box A/B).
+    let mut db = three_tablet_db();
+    let mut stream = Vec::new();
+    for i in 0..2u8 {
+        let t = blind_txn(&db, &[b"a", b"z"], &[b's', i]);
+        stream.push(t.submit(Some(Durability::Buffered)).unwrap());
+    }
+    let reader = overlap_txn(&db, &[b"b"], &[b"n", b"a"]);
+    let mut reader = reader.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, 1);
+    turn(&mut db, 0);
+    // Shard 1 stands still: the reader's retry cannot run, and its fence on `a` stands. The
+    // chain on `a` drains, and a younger reading commit on `a` goes in and commits.
+    let younger = overlap_txn(&db, &[b"c"], &[b"a", b"z"]);
+    let mut younger = younger.submit(Some(Durability::Buffered)).unwrap();
+    let mut committed = false;
+    for _ in 0..200 {
+        turn(&mut db, 0);
+        turn(&mut db, 2);
+        if let Some(r) = poll_commit(&mut younger) {
+            r.expect("the younger reading commit commits");
+            committed = true;
+            break;
+        }
+    }
+    assert!(committed, "the younger reading commit is held by the fence");
+    poll_until(&mut db, &mut reader, 200_000)
+        .expect("reader resolved")
+        .expect("reader commits");
+    drain(&mut db, stream);
+}
+
+#[test]
+fn a_fence_ends_with_its_readers_last_attempt_even_with_nothing_waiting() {
+    // D267: a reading commit R (reads `b`, writes `y` and `a`), the oldest on `a`, is
+    // refused on `low` over a younger blind commit's share there and fences `a`. `b` is then
+    // written, so R's retry fails validation on `low` itself: never tracked there, its last
+    // attempt is decided while `low` holds no refusal waiting (R's own was woken when `a`
+    // cleared). The fence must still end; it ended only when a refusal was waiting, and
+    // later blind commits on `a` were refused behind a commit that was gone (the bench's
+    // transfer smoke stalled for the write-stall timeout).
+    let (mut db, low, high) = overlap_db();
+    let b1 = blind_txn(&db, &[b"a", b"z"], b"b1");
+    let mut b1 = b1.submit(Some(Durability::Buffered)).unwrap();
+    let r = overlap_txn(&db, &[b"b"], &[b"y", b"a"]);
+    let mut r = r.submit(Some(Durability::Buffered)).unwrap();
+    // `high` gives R the oldest id; `low` admits B1's share, then refuses R's PREPARE.
+    turn(&mut db, high);
+    turn(&mut db, low);
+    assert!(
+        db.engine.metrics().cross_shard.refused_pending_overlap > 0,
+        "R was not refused on `a`"
+    );
+    // A write to `b` after R's snapshot, admitted on `low` before R's retry.
+    let table = db.table.clone();
+    let mut put = submit_put(&db, &table, b"b");
+    turn(&mut db, low);
+    poll_until(&mut db, &mut put, 100_000)
+        .expect("the put resolved")
+        .expect("the put commits");
+    let rr = poll_until(&mut db, &mut r, 100_000).expect("R resolved");
+    assert!(
+        matches!(rr, Err(pigeonhole_engine::Error::Conflict)),
+        "R: {rr:?}"
+    );
+    poll_until(&mut db, &mut b1, 100_000)
+        .expect("B1 resolved")
+        .expect("B1 commits");
+    // A later blind commit on `a` is not fenced by R, which is gone.
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    let b2 = blind_txn(&db, &[b"a", b"z"], b"b2");
+    let mut b2 = b2.submit(Some(Durability::Buffered)).unwrap();
+    poll_until(&mut db, &mut b2, 100_000)
+        .expect("B2 resolved: refused behind a fence nothing ends")
+        .expect("B2 commits");
+    assert_eq!(
+        db.engine.metrics().cross_shard.refused_pending_overlap,
+        before
+    );
 }

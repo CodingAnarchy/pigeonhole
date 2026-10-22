@@ -1251,6 +1251,10 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         xshard_refused_pending_overlap: m.cross_shard.refused_pending_overlap,
         xshard_share_waits: m.cross_shard.share_waits,
         xshard_share_wait_nanos: m.cross_shard.share_wait_nanos,
+        xshard_chained: m.cross_shard.chained,
+        xshard_wounds: m.cross_shard.wounds,
+        xshard_max_attempts_blind: m.cross_shard.max_attempts_blind,
+        xshard_max_attempts_reading: m.cross_shard.max_attempts_reading,
     }
 }
 

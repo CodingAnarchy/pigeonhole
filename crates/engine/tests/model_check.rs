@@ -31,9 +31,32 @@ fn seeds() -> Vec<u64> {
 
 fn check(seed: u64, cfg: &Config) {
     match run(seed, cfg) {
-        Ok(stats) => eprintln!("seed {seed}: {stats:?}"),
+        Ok(stats) => {
+            eprintln!("seed {seed}: {stats:?}");
+            // On a fault-free run (no I/O fault, no crash) the clock moves 1 µs per operation
+            // and nothing can stall a commit for the write-stall timeout, so a commit that
+            // gave up with `Busy` waited for something that never came: a liveness bug, such
+            // as D267's fence that outlived its reader (#830). Fail it, not count it.
+            if fault_free(cfg) {
+                assert_eq!(
+                    stats.busy, 0,
+                    "seed {seed}: {} commit(s) gave up with Busy on a fault-free run: {stats:?}",
+                    stats.busy
+                );
+            }
+        }
         Err(f) => panic!("{f}"),
     }
+}
+
+/// No injected I/O fault and no crash of any kind.
+fn fault_free(cfg: &Config) -> bool {
+    cfg.faults == pigeonhole_io::sim::FaultPlan::none()
+        && cfg.crash_ppm == 0
+        && cfg.mid_commit_crash_ppm == 0
+        && cfg.observed_crash_ppm == 0
+        && cfg.crash_at.is_none()
+        && cfg.crash_every.is_none()
 }
 
 #[test]
@@ -774,4 +797,66 @@ fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant()
     assert!(reads > 0, "no read ran beside an in-flight commit");
     assert!(observed > 0, "no read saw an in-flight commit whole");
     eprintln!("{reads} reads beside commits, {observed} saw one whole, {crashes} crashes after");
+}
+
+#[test]
+fn hot_rows_chain_and_wound_across_many_shards() {
+    // D267: blind batches on a few Zipfian rows over many shards, the shape of the
+    // app-owned bench row (#816): PREPAREs chain behind undecided shares and older ones
+    // wound younger ones. The checker holds every cell's versions to seqno and timestamp
+    // order, and a hung commit fails the run.
+    for shards in [3usize, 6, 10] {
+        let mut cfg = Config::quiet(600);
+        cfg.shards = shards;
+        cfg.tasks = 64;
+        (cfg.cas_ppm, cfg.txn_ppm) = (0, 0);
+        cfg.spec.zipf_theta = 0.99;
+        cfg.spec.rows = 200;
+        cfg.spec.read_fraction = 0.1;
+        cfg.spec.delete_fraction = 0.0;
+        cfg.spec.max_batch = 4;
+        for seed in seeds() {
+            check(seed, &cfg);
+        }
+    }
+}
+
+#[test]
+fn hot_rows_chain_and_wound_through_crashes() {
+    // D267 (perf287's R3): the hot-row shape with crashes and mid-commit crashes on, so
+    // chains of several undecided PREPAREs on one row sit in a stream at a crash.
+    let mut cfg = Config::standard(600);
+    cfg.shards = 4;
+    cfg.tasks = 64;
+    (cfg.cas_ppm, cfg.txn_ppm) = (0, 0);
+    cfg.spec.zipf_theta = 0.99;
+    cfg.spec.rows = 200;
+    cfg.spec.read_fraction = 0.1;
+    cfg.spec.delete_fraction = 0.0;
+    cfg.spec.max_batch = 4;
+    for seed in seeds() {
+        check(seed, &cfg);
+    }
+}
+
+#[test]
+fn hot_rows_mix_reading_commits_and_blind_writers() {
+    // D267: transactions and conditional writes (commits that read, which cannot chain)
+    // beside blind batches on a few Zipfian rows: fences, refusals behind readers and
+    // singles, wounds of reading shares. A fence or a refusal nothing ends leaves a commit
+    // to give up with `Busy`, which `check` fails on a fault-free run.
+    for shards in [3usize, 6] {
+        let mut cfg = Config::quiet(600);
+        cfg.shards = shards;
+        cfg.tasks = 64;
+        (cfg.cas_ppm, cfg.txn_ppm) = (100_000, 250_000);
+        cfg.spec.zipf_theta = 0.99;
+        cfg.spec.rows = 200;
+        cfg.spec.read_fraction = 0.1;
+        cfg.spec.delete_fraction = 0.0;
+        cfg.spec.max_batch = 4;
+        for seed in seeds() {
+            check(seed, &cfg);
+        }
+    }
 }

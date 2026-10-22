@@ -263,6 +263,20 @@ pub struct CrossShardMetrics {
     /// The time shards had at least one single held back behind an
     /// undecided share (D263), summed over shards.
     pub share_wait_nanos: u64,
+    /// PREPAREs admitted behind an undecided share or a waiting single instead of refused,
+    /// their `Prepared` held until those were decided or logged (D267).
+    pub chained: u64,
+    /// Younger undecided shares wounded (their attempts aborted unless decided) for an
+    /// older share chained behind them (D267).
+    pub wounds: u64,
+    /// The most attempts (two-phase rounds) one committed cross-shard commit that only
+    /// writes took, over every coordinator since open (ICR 0056). Only commits that
+    /// committed count: one that gave up with `Busy` at the write-stall timeout never shows
+    /// here, so read it together with the `Busy` failures.
+    pub max_attempts_blind: u64,
+    /// The same for commits that read (validated reads): with no hard bound on their
+    /// refusals (D249, D263, D267), the worst case seen. Committed commits only, as above.
+    pub max_attempts_reading: u64,
 }
 
 /// One shard's share of the work, for benchmarks that check writes spread over shards
@@ -2393,6 +2407,11 @@ impl Engine {
             x.refused_pending_overlap += refused(CrossRefusal::PendingOverlap);
             x.share_waits += s.cross.share_waits.load(Ordering::Relaxed);
             x.share_wait_nanos += s.cross.share_wait_nanos.load(Ordering::Relaxed);
+            x.chained += s.cross.chained.load(Ordering::Relaxed);
+            x.wounds += s.cross.wounds.load(Ordering::Relaxed);
+            let most = |i: usize| s.cross.max_attempts[i].load(Ordering::Relaxed);
+            x.max_attempts_blind = x.max_attempts_blind.max(most(0));
+            x.max_attempts_reading = x.max_attempts_reading.max(most(1));
         }
         let pager = shared.pager.stats();
         m.file_growths = (pager.growths, pager.growth_nanos);
@@ -3438,6 +3457,7 @@ impl Inner {
             epoch: 0,
             first_seqno: 0,
             prev_shards: Vec::new(),
+            attempts: 0,
             wait: None,
         }));
         let Some(charge) = admit.admit(target) else {
