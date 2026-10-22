@@ -1484,9 +1484,24 @@ impl Run {
     }
 
     fn compare_dump(&mut self, when: &str) -> Result<(), String> {
-        let got = self
-            .dump_without_faults()
-            .map_err(|e| format!("dump {when}: {e}"))?;
+        let got = match self.dump_without_faults() {
+            Ok(rows) => rows,
+            // With the recovery option on, a failure that landed before the faults went off
+            // can still be recovering: its swap expires the dump's snapshot midway, or the
+            // dump finds the instance closed or waits past the stall timeout (#877's
+            // sweep, seed 77). Settle it as any other failure is: `recover_in_place`
+            // reconciles the model with what survived and compares every row read back.
+            Err(e)
+                if self.cfg.recovery != Recovery::Off
+                    && matches!(
+                        e.code(),
+                        ErrorCode::SnapshotExpired | ErrorCode::Closed | ErrorCode::Busy
+                    ) =>
+            {
+                return self.recover_in_place(&format!("dump {when}: {e}"), None);
+            }
+            Err(e) => return Err(format!("dump {when}: {e}")),
+        };
         let want = Self::model_dump(&self.model, self.now());
         match first_diff(&got, &want) {
             None => Ok(()),
