@@ -769,6 +769,29 @@ impl PigeonholeRunner {
         }
         let (before, stalls_before) = (db.shard_stats(), super::pigeonhole::stalls(&db));
         let latency_before = db.commit_latency_buckets();
+        // SCRATCH (#886, perf287's drift-gauge check; not for merge): the D271 drift gauge
+        // every 5 s through the measured phase.
+        let drift_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drift = {
+            let (db, stop) = (db.clone(), std::sync::Arc::clone(&drift_stop));
+            let t0 = Instant::now();
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if i % 50 == 0 {
+                        let m = db.engine_metrics();
+                        eprintln!(
+                            "DRIFT t={:.0}s lead_us={} max_lead_us={}",
+                            t0.elapsed().as_secs_f64(),
+                            m.default_ts_lead_micros,
+                            m.max_default_ts_lead_micros
+                        );
+                    }
+                    i += 1;
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            })
+        };
         // The measured writes, repeated until `min_measured` has been measured (D219): a
         // fixed count measures a faster store for less time, too short for its flushes and
         // compactions to show.
@@ -801,6 +824,15 @@ impl PigeonholeRunner {
             if elapsed >= options_.min_measured || measured.is_empty() {
                 break;
             }
+        }
+        drift_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = drift.join();
+        {
+            let m = db.engine_metrics();
+            eprintln!(
+                "DRIFT end lead_us={} max_lead_us={}",
+                m.default_ts_lead_micros, m.max_default_ts_lead_micros
+            );
         }
         let (after, stalls_after) = (db.shard_stats(), super::pigeonhole::stalls(&db));
         let engine_commit = EngineCommit::between(
