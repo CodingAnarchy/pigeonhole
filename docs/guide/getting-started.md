@@ -1,6 +1,6 @@
 # Getting started
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.3.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
+> **Status:** this guide describes `main`; the current release on crates.io is 0.3.1, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
 Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:
