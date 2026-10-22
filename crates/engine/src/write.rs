@@ -1072,10 +1072,37 @@ impl Txn {
         &mut self.batch
     }
 
+    /// The commit of a transaction that writes nothing (#694, ICR 0060): it needs no
+    /// validation and no shard round. Its reads all come from one consistent snapshot, so it
+    /// is serializable at that snapshot whatever committed since, and it never conflicts. It
+    /// writes nothing, so the commit names the snapshot's seqno and `Durability::None`: what
+    /// it read is visible, not necessarily durable, as for any snapshot (D227).
+    fn write_free(&self) -> Option<CommitInfo> {
+        self.batch.is_empty().then(|| CommitInfo {
+            seqno: self.snapshot.seqno(),
+            durability: Durability::None,
+        })
+    }
+
+    /// A [`Submission`] already resolved with `info` (a write-free commit).
+    fn resolved(engine: &Inner, info: CommitInfo) -> crate::Result<Submission> {
+        engine.check_open()?;
+        let (reply, waiter) = completion();
+        reply.notify(Ok(Settled::from(info)));
+        Ok(Submission {
+            waiter,
+            shared: engine.shard_ref(pigeonhole_runtime::ShardId(0)),
+            spins: false,
+        })
+    }
+
     /// [`submit`](Self::submit) for an async commit (D210), as
     /// [`Engine::submit_async`](crate::Engine::submit_async): when it has to wait for room,
     /// the pending commit submits the transaction once admitted.
     pub fn submit_async(self, durability: Option<Durability>) -> crate::Result<PendingCommit> {
+        if self.write_free().is_some() {
+            return self.submission(durability).map(PendingCommit::from);
+        }
         let mut charge = match self.engine.fast_admit(None, &self.batch) {
             crate::engine::FastAdmit::Wait(admit) => {
                 let shared = self
@@ -1116,6 +1143,9 @@ impl Txn {
 
     /// [`submit`](Self::submit), as the engine's own [`Submission`].
     pub(crate) fn submission(self, durability: Option<Durability>) -> crate::Result<Submission> {
+        if let Some(info) = self.write_free() {
+            return Self::resolved(&self.engine, info);
+        }
         let Txn {
             engine,
             snapshot,
@@ -1130,8 +1160,13 @@ impl Txn {
         )
     }
 
-    /// Validates and commits.
+    /// Validates and commits. A transaction that wrote nothing commits at once, at its
+    /// snapshot, and never conflicts (see `write_free`).
     pub fn commit(self, durability: Option<Durability>) -> crate::Result<CommitInfo> {
+        if let Some(info) = self.write_free() {
+            self.engine.check_open()?;
+            return Ok(info);
+        }
         let Txn {
             engine,
             snapshot,

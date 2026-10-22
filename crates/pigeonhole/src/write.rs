@@ -33,7 +33,9 @@ type EngineBatch = pigeonhole_engine::WriteBatch;
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommitInfo {
-    /// The commit's sequence number.
+    /// The commit's sequence number. For a transaction that wrote nothing it is the
+    /// snapshot point it read at, not a seqno of its own: other commits may share it, and it
+    /// is 0 on an empty database (ICR 0060).
     pub seqno: u64,
     /// The durability level actually applied.
     pub durability: Durability,
@@ -1132,6 +1134,17 @@ impl Transaction {
 
     /// Commits with the writer default; fails with
     /// [`ErrorCode::Conflict`](crate::ErrorCode::Conflict) on a conflicting commit.
+    ///
+    /// A transaction that wrote nothing commits at once and never conflicts: its reads all
+    /// come from one snapshot, so it is serializable there (ICR 0060). `Ok` then means what
+    /// it read was consistent **as of its snapshot**, not that it was still current when
+    /// `commit` ran: to confirm a value still holds at commit, write something in the
+    /// transaction (it is then validated) or use
+    /// [`RowMutation::commit_if`](crate::RowMutation::commit_if) on the cell. Its
+    /// [`CommitInfo`] names the snapshot's seqno (not a seqno of its own, so other commits
+    /// may share it) and [`Durability::None`]: it wrote nothing, and what it read is visible
+    /// but not necessarily durable, as for any snapshot. For reads of only durable data, read
+    /// at [`Pigeonhole::durable_snapshot`](crate::Pigeonhole::durable_snapshot).
     pub fn commit(self) -> Result<CommitInfo> {
         self.finish(None)
     }

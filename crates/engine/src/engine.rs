@@ -3110,7 +3110,7 @@ impl Inner {
         Ok(())
     }
 
-    fn check_open(&self) -> Result<()> {
+    pub(crate) fn check_open(&self) -> Result<()> {
         if self.closing.load(Ordering::Acquire) || self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
