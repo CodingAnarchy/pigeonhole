@@ -1491,12 +1491,15 @@ impl Run {
             // dump finds the instance closed or waits past the stall timeout (#877's
             // sweep, seed 77). Settle it as any other failure is: `recover_in_place`
             // reconciles the model with what survived and compares every row read back.
+            // Only when the instance did fail (perf287 on #889): a dump error on an
+            // instance that has not failed is a test failure.
             Err(e)
                 if self.cfg.recovery != Recovery::Off
                     && matches!(
                         e.code(),
                         ErrorCode::SnapshotExpired | ErrorCode::Closed | ErrorCode::Busy
-                    ) =>
+                    )
+                    && self.failed_over() =>
             {
                 return self.recover_in_place(&format!("dump {when}: {e}"), None);
             }
