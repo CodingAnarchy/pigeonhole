@@ -605,6 +605,34 @@ fn io_errors_with_deferred_io_keep_every_record_the_crash_poll_and_the_close_lea
     }
 }
 
+#[test]
+fn acknowledged_commits_resolved_beside_a_crash_are_checked() {
+    // #860, the dangerous half: commits acknowledged in the same poll as one that met a
+    // crash were dropped from the model, so losing one would go unseen (and a surviving one
+    // read as a commit the client never made). The generator never resolves one there on its
+    // own; holding acknowledgements back until a failure (`Config::hold_acks`) does. Every
+    // seed must pass, and some must reach the case. With that branch of the fix reverted,
+    // the acknowledged commits are dropped and the check fails.
+    let mut cfg = io_errors_config();
+    cfg.deferred_io = true;
+    cfg.hold_acks = true;
+    // Durable acknowledgements: a crash may drop a `Buffered` one, so losing it from the
+    // model would show nowhere.
+    cfg.durability = Some(Durability::Sync);
+    cfg.crash_ppm = 100_000;
+    cfg.mid_commit_crash_ppm = 100_000;
+    cfg.tasks = 8;
+    let mut reached = 0;
+    for seed in 1..=200u64 {
+        let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+        reached += stats.crash_poll_acked;
+    }
+    assert!(
+        reached > 0,
+        "no seed resolved an acknowledged commit beside a crash"
+    );
+}
+
 /// [`io_errors_poison_shards_and_recover_on_reopen`]'s configuration.
 fn io_errors_config() -> Config {
     let mut cfg = Config::standard(250);
