@@ -248,3 +248,86 @@ fn the_extension_area_is_carried_into_every_commit() {
         assert!(Superblock::decode(&buf).unwrap().manifest_version >= 4);
     }
 }
+
+#[test]
+fn set_features_reaches_both_pages_before_it_returns() {
+    let vfs = prepare();
+    let v: VfsRef = vfs.clone();
+    let pager = Pager::open(&v, path(), true)
+        .unwrap()
+        .finish(Vec::new())
+        .unwrap();
+    let f = Features {
+        compat: 1 << 4,
+        ..Features::default()
+    };
+    vfs.record_ops();
+    pager.set_features(f).unwrap();
+    assert_eq!(pager.features(), f);
+    assert_eq!(features(&vfs), [f; 2]);
+    assert_eq!(pager.root().manifest_version, 2, "the same root");
+    // Equal sets commit nothing.
+    vfs.record_ops();
+    pager.set_features(f).unwrap();
+    assert!(
+        !vfs.recorded_ops()
+            .iter()
+            .any(|op| matches!(op, SimOp::Write { .. })),
+        "an unchanged set wrote"
+    );
+    // Clearing goes to both pages the same way.
+    pager.set_features(Features::default()).unwrap();
+    drop(pager);
+    assert_eq!(features(&vfs), [Features::default(); 2]);
+}
+
+#[test]
+fn pages_left_disagreeing_by_a_crash_are_rewritten_at_a_writable_open() {
+    // A crash between `set_features`' two commits: one page has the new sets.
+    let f = Features {
+        compat: 1 << 6,
+        ..Features::default()
+    };
+    for page in [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B] {
+        let vfs = prepare();
+        let file = file(&vfs);
+        let mut sb = read_page(&file, page).unwrap();
+        sb.features = f;
+        let mut buf = [0u8; PAGE];
+        sb.encode(&mut buf);
+        file.write_at(&buf, page * PAGE as u64).unwrap();
+        file.sync_all().unwrap();
+        let current = [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B]
+            .into_iter()
+            .max_by_key(|&p| read_page(&file, p).unwrap().sequence)
+            .unwrap();
+        let expect = read_page(&file, current).unwrap().features;
+        // A reader neither writes nor repairs.
+        let (_, wrote) = open(&vfs, false);
+        assert!(!wrote, "page {page}");
+        // A writer rewrites both pages with the current page's sets.
+        let (root, wrote) = open(&vfs, true);
+        assert!(wrote, "page {page}");
+        assert_eq!(root.manifest_version, 2, "page {page}");
+        assert_eq!(features(&vfs), [expect; 2], "page {page}");
+    }
+}
+
+#[test]
+fn format_version_reports_the_file_for_a_reader_and_current_after_an_upgrade() {
+    let vfs = prepare();
+    set_version(&vfs, SUPERBLOCK_PAGE_A, 2);
+    set_version(&vfs, SUPERBLOCK_PAGE_B, 2);
+    let v: VfsRef = vfs.clone();
+    let reader = Pager::open(&v, path(), false)
+        .unwrap()
+        .finish(Vec::new())
+        .unwrap();
+    assert_eq!(reader.format_version(), FormatVersion(2));
+    drop(reader);
+    let writer = Pager::open(&v, path(), true)
+        .unwrap()
+        .finish(Vec::new())
+        .unwrap();
+    assert_eq!(writer.format_version(), FormatVersion::CURRENT);
+}

@@ -366,8 +366,8 @@ pub(crate) struct Inner {
     /// One handle on `shared` per shard, for pending commits (D236).
     shard_refs: Box<[Arc<ShardRef>]>,
     role: Role,
-    /// Refuses writes and catalog changes with `ReadOnly`: a reader process, or a writer
-    /// opened with `allow_unregistered_merge` over a family whose operator is unknown.
+    /// Refuses writes, catalog changes and maintenance with `ReadOnly`: a reader process, or
+    /// a writer opened read-only by `read_only_fallback` (ICR 0059), which writes nothing.
     read_only: bool,
     options: EngineOptions,
     path: PathBuf,
@@ -790,9 +790,23 @@ impl Engine {
         };
         let identity = file.identity()?;
 
-        // 2. The page file and the manifest.
+        // 2. The page file and the manifest. A file this build may read but not write (a
+        //    read-only-compatible feature bit it does not know, D269) opens read-only under
+        //    `read_only_fallback` (ICR 0059): `no_writes`, and nothing below writes to it.
+        let mut no_writes = false;
         let opened = match Pager::open(&vfs, path, true) {
             Ok(o) => o,
+            Err(pigeonhole_pager::Error::Format(
+                pigeonhole_format::Error::UnsupportedFeature { .. },
+            )) if options.read_only_fallback => {
+                no_writes = true;
+                Pager::open(&vfs, path, false)?
+            }
+            // A newer build's file is intact: say so, not "no valid superblock".
+            Err(pigeonhole_pager::Error::Format(
+                e @ (pigeonhole_format::Error::UnsupportedFeature { .. }
+                | pigeonhole_format::Error::UnsupportedVersion { .. }),
+            )) => return Err(e.into()),
             Err(pigeonhole_pager::Error::Format(e)) => {
                 return Err(interrupted_create(path, &file, e)?);
             }
@@ -806,8 +820,9 @@ impl Engine {
         // With tablet changes on, owners are placed within the arenas' slot budgets below.
         catalog.reassign(shards);
         // Refuse what will be refused before `finish`, which may upgrade the file's
-        // superblocks: a refused open must leave an older file as it was (#496).
-        if catalog.has_unknown_merge && !options.allow_unregistered_merge {
+        // superblocks: a refused open must leave an older file as it was (#496). An
+        // unregistered merge operator opens read-only under `read_only_fallback`.
+        if catalog.has_unknown_merge && !options.read_only_fallback {
             let name = catalog
                 .tables()
                 .flat_map(|t| t.families.iter())
@@ -816,21 +831,26 @@ impl Engine {
                 .unwrap_or_default();
             return Err(Error::UnknownMergeOperator(name));
         }
+        no_writes |= catalog.has_unknown_merge;
+        let opened = if no_writes {
+            opened.into_read_only()
+        } else {
+            opened
+        };
         let mut live = manifest_extents;
         live.extend(catalog.data_extents());
-        // `finish` upgrades an older file's superblocks, even for an open that is read-only
-        // because of an unregistered merge operator: that open still writes (a new WAL
-        // segment at the current version, or the recovered memtables' SSTs and manifest
-        // commits), and current-version bytes behind older superblocks are what an older
-        // build skips as torn (#774). A no-write read-only open, which would skip the
-        // upgrade, comes with `read_only_fallback` (#496 PR 4, ICR 0059).
+        // `finish` upgrades an older file's superblocks before anything below writes
+        // (current-version bytes behind older superblocks are what an older build skips as
+        // torn, #774). A read-only pager neither syncs nor upgrades: a `no_writes` open
+        // leaves the file exactly as it was.
         let pager = Arc::new(opened.finish(live)?);
-        open_data_file(&vfs, path, &pager, options.direct_io, true)?;
-        if let Some((block, from)) = options.grow_ahead {
+        open_data_file(&vfs, path, &pager, options.direct_io, !no_writes)?;
+        if let Some((block, from)) = options.grow_ahead
+            && !no_writes
+        {
             pager.set_grow_ahead(block, from)?;
         }
-        // Opened only because unregistered operators are allowed: read-only (#43).
-        let read_only = catalog.has_unknown_merge;
+        let read_only = no_writes;
 
         // 3. Shared memory under a new generation, then presence (D37). On a handover the
         //    presence is already held on this handle: the region's `present(file)` is a
@@ -929,6 +949,7 @@ impl Engine {
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: mode == Mode::ApplicationOwned,
+            no_writes,
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1040,6 +1061,7 @@ impl Engine {
         let mut replayed: Vec<(StreamId, Vec<ReplayedRecord>)> = Vec::new();
         // Recovered memtables written to SSTs mid-replay when an arena ran short (#143).
         let mut spill = Spilled::new(Arc::clone(&pager));
+        spill.refuse = no_writes;
         let streams = discover_streams(&vfs, path)?;
         for &stream in &streams {
             let checkpoint = catalog
@@ -1047,7 +1069,11 @@ impl Engine {
                 .get(&stream)
                 .copied()
                 .unwrap_or_default();
-            let mut rec = Recovery::open(&vfs, path, stream, db_id, checkpoint)?;
+            let mut rec = if no_writes {
+                Recovery::open_read_only(&vfs, path, stream, db_id, checkpoint)?
+            } else {
+                Recovery::open(&vfs, path, stream, db_id, checkpoint)?
+            };
             let mut records = Vec::new();
             while let Some((end, record)) = rec.next_record()? {
                 match record {
@@ -1195,7 +1221,14 @@ impl Engine {
             }
             on.into_iter().collect()
         };
-        if same_layout {
+        if no_writes {
+            // A read-only open (ICR 0059) keeps what it replayed in its memtables, whatever
+            // the layout (replay routes each record to the shard owning its rows), and
+            // writes no stream: no new segment, no flush, no checkpoint. The WAL files stay
+            // as they are for the next writable open to replay.
+            drop(replayed);
+            drop(recoveries);
+        } else if same_layout {
             for ((stream, records), (_, rec)) in replayed.into_iter().zip(&recoveries) {
                 let i = stream.0 as usize;
                 let state = &mut states[i];
@@ -1292,7 +1325,7 @@ impl Engine {
             }
         }
         let missing: Vec<StreamId> = (0..shards)
-            .filter(|&i| !have_wal[i])
+            .filter(|&i| !have_wal[i] && !no_writes)
             .map(|i| StreamId(i as u32))
             .collect();
         for (stream, wal) in missing.iter().zip(WalStream::create_all(
@@ -1308,7 +1341,9 @@ impl Engine {
         for s in &mut states {
             s.finish_replay();
         }
-        sweep_unreferenced_blobs(&shared, &mut catalog, &states, shards)?;
+        if !no_writes {
+            sweep_unreferenced_blobs(&shared, &mut catalog, &states, shards)?;
+        }
 
         // The timestamp floor starts above every replayed commit (D11).
         for (i, s) in states.iter().enumerate() {
@@ -1527,6 +1562,7 @@ impl Engine {
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
             close_done: AtomicBool::new(false),
             application_owned: false,
+            no_writes: true,
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -2207,7 +2243,7 @@ impl Engine {
     /// manifest was being moved.
     pub fn shrink(&self) -> Result<u64> {
         let inner = &self.inner;
-        if inner.role != Role::Writer {
+        if inner.read_only {
             return Err(Error::ReadOnly);
         }
         let _guard = inner.enter_maintenance()?;
@@ -2644,6 +2680,8 @@ struct Spilled {
     pager: Arc<Pager>,
     /// Replay ran short of arena room at least once.
     spilled: bool,
+    /// A read-only open (ICR 0059): running short fails with `ReadOnlyOpen` instead.
+    refuse: bool,
     /// The edits to commit: the `AddSst` of every SST written so far, then (in
     /// `flush_recovered`) the rest of the open-time flush.
     edits: Vec<Edit>,
@@ -2656,6 +2694,7 @@ impl Spilled {
         Self {
             pager,
             spilled: false,
+            refuse: false,
             edits: Vec::new(),
             flushed: BTreeMap::new(),
         }
@@ -2688,6 +2727,13 @@ fn make_room(
 ) -> Result<()> {
     if states.iter().all(|s| s.replay_fits(bytes)) || !states.iter().any(|s| s.has_recovered()) {
         return Ok(());
+    }
+    if spill.refuse {
+        return Err(Error::ReadOnlyOpen(
+            "the WAL to replay does not fit the memtable budget, and replay would have to \
+             flush it to SSTs; raise memtable_budget to open read-only"
+                .to_owned(),
+        ));
     }
     crate::shard::trace!("replay: an arena is short, spilling recovered memtables");
     spill.spilled = true;
@@ -3016,7 +3062,8 @@ impl Inner {
         shard: ShardId,
         op: crate::shard::TabletOpKind,
     ) -> Result<PendingMaintenance> {
-        if self.role != Role::Writer {
+        // A reader, or a writer opened read-only (ICR 0059): nothing may write.
+        if self.read_only {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
@@ -3184,11 +3231,7 @@ impl Inner {
             if !seen.insert(fname.as_str()) {
                 return Err(Error::FamilyExists(fname.clone()));
             }
-            check_merge_operator(
-                options,
-                &self.options.merge_operators,
-                self.options.allow_unregistered_merge,
-            )?;
+            check_merge_operator(options, &self.options.merge_operators)?;
         }
         let name_owned = name.to_owned();
         let families = families.to_vec();
@@ -3234,11 +3277,7 @@ impl Inner {
         if name.is_empty() {
             return Err(Error::InvalidArgument("empty family name".to_owned()));
         }
-        check_merge_operator(
-            &options,
-            &self.options.merge_operators,
-            self.options.allow_unregistered_merge,
-        )?;
+        check_merge_operator(&options, &self.options.merge_operators)?;
         let name_owned = name.to_owned();
         let view = self.catalog_change(move |catalog| {
             let info = catalog
@@ -3709,7 +3748,8 @@ impl Inner {
     }
 
     fn flush_pending(&self) -> Result<PendingMaintenance> {
-        if self.role != Role::Writer {
+        // A reader, or a writer opened read-only (ICR 0059): nothing may write.
+        if self.read_only {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
@@ -3729,7 +3769,8 @@ impl Inner {
     }
 
     fn compact_pending(&self, table: Option<TableId>) -> Result<PendingMaintenance> {
-        if self.role != Role::Writer {
+        // A reader, or a writer opened read-only (ICR 0059): nothing may write.
+        if self.read_only {
             return Err(Error::ReadOnly);
         }
         self.check_open()?;
@@ -4242,11 +4283,7 @@ fn stored_i64(v: &[u8]) -> i64 {
         .map_or(0, i64::from_le_bytes)
 }
 
-fn check_merge_operator(
-    options: &FamilyOptions,
-    registry: &MergeRegistry,
-    allow_unregistered: bool,
-) -> Result<()> {
+fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Result<()> {
     let name = options.merge_operator.as_str();
     if options.kind == FamilyKind::Counter && name != crate::catalog::I64_ADD {
         return Err(Error::InvalidArgument(format!(
@@ -4254,7 +4291,7 @@ fn check_merge_operator(
             crate::catalog::I64_ADD
         )));
     }
-    if name.is_empty() || registry.get(name).is_some() || allow_unregistered {
+    if name.is_empty() || registry.get(name).is_some() {
         Ok(())
     } else {
         Err(Error::UnknownMergeOperator(name.to_owned()))

@@ -9,7 +9,7 @@ use pigeonhole_format::{Lsn, Seqno, StreamId};
 use pigeonhole_io::{FileRef, VfsRef};
 
 use crate::stream::{FRAME, Grid, check_options, corrupt, open_existing};
-use crate::{Result, WalOptions, WalStream, stream_path};
+use crate::{Error, Result, WalOptions, WalStream, stream_path};
 
 /// Frames read from the file at a time.
 const CHUNK_FRAMES: u64 = 32;
@@ -90,6 +90,8 @@ pub struct Recovery {
     chunk_slot: usize,
     /// Segment offset of `chunk[0]`.
     chunk_start: u64,
+    /// Opened by [`Recovery::open`] (else [`Recovery::open_read_only`]).
+    writable: bool,
 }
 
 #[derive(Debug)]
@@ -138,7 +140,35 @@ impl Recovery {
         db_id: [u8; 16],
         checkpoint: Lsn,
     ) -> Result<Recovery> {
+        Self::open_with(vfs, db_path, stream, db_id, checkpoint, true)
+    }
+
+    /// [`Recovery::open`] for a replay that writes nothing (a read-only open, ICR 0059): the
+    /// file is opened read-only and neither it nor its directory is synced. Such a recovery
+    /// is read only; [`Recovery::into_stream`] refuses it.
+    pub fn open_read_only(
+        vfs: &VfsRef,
+        db_path: &Path,
+        stream: StreamId,
+        db_id: [u8; 16],
+        checkpoint: Lsn,
+    ) -> Result<Recovery> {
+        Self::open_with(vfs, db_path, stream, db_id, checkpoint, false)
+    }
+
+    fn open_with(
+        vfs: &VfsRef,
+        db_path: &Path,
+        stream: StreamId,
+        db_id: [u8; 16],
+        checkpoint: Lsn,
+        writable: bool,
+    ) -> Result<Recovery> {
         let path = stream_path(db_path, stream);
+        if !writable {
+            let file = vfs.open(&path, pigeonhole_io::OpenOptions::read())?;
+            return Self::replay_from(vfs, file, path, stream, db_id, checkpoint, false);
+        }
         let file = vfs.open(&path, open_existing())?;
         // A process that died between a slot's `allocate` and its `sync_all` left the page
         // cache's length longer than the disk's. The grid (and the blank slots the stream
@@ -149,6 +179,18 @@ impl Recovery {
         // finished left this file's name in the page cache only. The stream is adopted and
         // appended to, and its new commits would vanish with the name in a power loss.
         crate::sync_parent(vfs, &path)?;
+        Self::replay_from(vfs, file, path, stream, db_id, checkpoint, true)
+    }
+
+    fn replay_from(
+        vfs: &VfsRef,
+        file: FileRef,
+        path: PathBuf,
+        stream: StreamId,
+        db_id: [u8; 16],
+        checkpoint: Lsn,
+        writable: bool,
+    ) -> Result<Recovery> {
         let grid = Grid::read(&file, stream, db_id)?;
         let start = match &grid {
             Some(g) if checkpoint.epoch() == 0 => g
@@ -193,6 +235,7 @@ impl Recovery {
             chunk: Vec::new(),
             chunk_slot: usize::MAX,
             chunk_start: 0,
+            writable,
         };
         if missing {
             // The checkpoint's segment never reached the disk: everything before the
@@ -328,6 +371,11 @@ impl Recovery {
     /// background task.
     pub fn into_stream(self, opts: WalOptions) -> Result<WalStream> {
         check_options(&opts)?;
+        if !self.writable {
+            return Err(Error::InvalidArgument {
+                what: "a read-only recovery cannot become a stream",
+            });
+        }
         let Recovery {
             vfs,
             file,

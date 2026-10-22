@@ -78,6 +78,9 @@ pub enum Error {
     Conflict,
     /// The handle is read-only.
     ReadOnly,
+    /// A read-only open (`read_only_fallback`, ICR 0059) cannot go on without writing: the
+    /// message says why (public code `ReadOnly`).
+    ReadOnlyOpen(String),
     /// A row key or qualifier exceeds 64 KiB.
     KeyTooLarge,
     /// A value exceeds the limit.
@@ -160,6 +163,7 @@ impl fmt::Display for Error {
             Error::Merge(e) => write!(f, "merge failed: {e}"),
             Error::Conflict => f.write_str("the transaction conflicted with a later commit"),
             Error::ReadOnly => f.write_str("the handle is read-only"),
+            Error::ReadOnlyOpen(why) => write!(f, "a read-only open would have to write: {why}"),
             Error::KeyTooLarge => f.write_str("row key or qualifier exceeds 64 KiB"),
             Error::ValueTooLarge => f.write_str("value exceeds the size limit"),
             Error::NoSpace => f.write_str("no space left on device"),
@@ -228,6 +232,7 @@ impl Error {
             Error::Merge(e) => Error::Merge(e.clone()),
             Error::Conflict => Error::Conflict,
             Error::ReadOnly => Error::ReadOnly,
+            Error::ReadOnlyOpen(s) => Error::ReadOnlyOpen(s.clone()),
             Error::KeyTooLarge => Error::KeyTooLarge,
             Error::ValueTooLarge => Error::ValueTooLarge,
             Error::NoSpace => Error::NoSpace,

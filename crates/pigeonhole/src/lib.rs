@@ -141,7 +141,9 @@ pub use check::{
 };
 pub use db::{Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
-pub use info::{Compression, DatabaseInfo, FamilyInfo, FamilyStorage, LevelInfo, TableInfo};
+pub use info::{
+    Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FileFeatures, LevelInfo, TableInfo,
+};
 pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
 pub use options::{
     Compaction, Family, IoBackend, IoRings, Options, Priority, ReaderOptions, Recovery, days,

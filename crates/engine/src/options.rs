@@ -122,9 +122,14 @@ pub struct EngineOptions {
     pub balance_pack: bool,
     /// Merge operators available to this process.
     pub merge_operators: MergeRegistry,
-    /// Open even if a family names an unregistered merge operator: read-only, compaction
-    /// off, and reads of affected cells fail with `UnknownMergeOperator`.
-    pub allow_unregistered_merge: bool,
+    /// Open read-only instead of failing when this build cannot write the file (D269, ICR
+    /// 0059): the file sets a read-only-compatible feature bit this build does not know
+    /// (otherwise `UnsupportedFeature`), or a family names a merge operator this process has
+    /// not registered (otherwise `UnknownMergeOperator`; reads of affected cells fail with
+    /// it). Such an open writes nothing to the database's files: no format upgrade, no new
+    /// WAL segment, no flush or compaction, no clean-close commit. It replays the WAL into
+    /// memory, and fails with `ReadOnlyOpen` if that does not fit `memtable_budget`.
+    pub read_only_fallback: bool,
     /// Accept a database on a FUSE filesystem (D173, #299): only for a local FUSE mount
     /// the user trusts (ntfs-3g, an encrypted home directory). FUSE byte-range locks may be
     /// local to one host, so two hosts could both open it as writers, and a sync may not
@@ -224,7 +229,7 @@ impl EngineOptions {
             balance_skew: 1.25,
             balance_pack: true,
             merge_operators: MergeRegistry::default(),
-            allow_unregistered_merge: false,
+            read_only_fallback: false,
             allow_fuse: false,
             direct_io: false,
             compaction: PickerOptions::default(),

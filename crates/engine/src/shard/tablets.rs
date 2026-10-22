@@ -1707,7 +1707,8 @@ impl ShardState {
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         let cfg = self.shared.balance;
-        if !cfg.enabled {
+        // A read-only open (ICR 0059) changes no tablet.
+        if !cfg.enabled || self.shared.no_writes {
             if let Some(r) = reply {
                 r.notify(Err(Error::Unsupported("tablet changes are off")));
             }
