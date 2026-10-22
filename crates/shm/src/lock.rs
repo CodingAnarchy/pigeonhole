@@ -16,7 +16,10 @@ impl WriterLock {
     /// Takes the writer byte; fails at once with [`Error::WriterLocked`].
     pub fn acquire(file: &FileRef) -> Result<WriterLock> {
         match file.lock(WRITER_BYTE, LockMode::Exclusive) {
-            Ok(()) => Ok(WriterLock { file: file.clone() }),
+            Ok(()) => Ok(WriterLock {
+                file: file.clone(),
+                held_in: pigeonhole_io::sys::process_id(),
+            }),
             Err(e) if e.kind == ErrorKind::Locked => Err(Error::WriterLocked),
             Err(e) => Err(e.into()),
         }
@@ -25,7 +28,9 @@ impl WriterLock {
 
 impl Drop for WriterLock {
     fn drop(&mut self) {
-        let _ = self.file.unlock(WRITER_BYTE);
+        if pigeonhole_io::sys::process_id() == self.held_in {
+            let _ = self.file.unlock(WRITER_BYTE);
+        }
     }
 }
 
@@ -33,7 +38,10 @@ impl Presence {
     /// Takes the presence byte shared.
     pub fn acquire(file: &FileRef) -> Result<Presence> {
         file.lock(PRESENCE_BYTE, LockMode::Shared)?;
-        Ok(Presence { file: file.clone() })
+        Ok(Presence {
+            file: file.clone(),
+            held_in: pigeonhole_io::sys::process_id(),
+        })
     }
 
     /// Tries to upgrade to exclusive. Success means this is the last process: it may
@@ -49,8 +57,13 @@ impl Presence {
     /// one of the two gets it. Cleanup is idempotent (the region and the WAL files may
     /// already be gone), so a second closer that also gets the byte later is harmless. A
     /// process that stays open keeps its shared byte, and every retry fails. After `false`
-    /// this handle no longer holds the presence byte.
+    /// this handle no longer holds the presence byte. In a forked child (a process other
+    /// than the one that acquired it) this is `false` at once and touches no lock.
     pub fn try_become_last(&self) -> Result<bool> {
+        // A forked child's copy is never the last one: the byte is the parent's.
+        if pigeonhole_io::sys::process_id() != self.held_in {
+            return Ok(false);
+        }
         match self.file.lock(PRESENCE_BYTE, LockMode::Exclusive) {
             Ok(()) => return Ok(true),
             Err(e) if e.kind == ErrorKind::Locked => {}
@@ -75,7 +88,9 @@ const LAST_RETRY_DELAYS_MS: [u64; 4] = [1, 2, 4, 8];
 
 impl Drop for Presence {
     fn drop(&mut self) {
-        let _ = self.file.unlock(PRESENCE_BYTE);
+        if pigeonhole_io::sys::process_id() == self.held_in {
+            let _ = self.file.unlock(PRESENCE_BYTE);
+        }
     }
 }
 

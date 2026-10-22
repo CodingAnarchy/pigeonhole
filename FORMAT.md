@@ -244,7 +244,7 @@ Byte-range locks on single bytes at absolute file offsets (decision D3; refined 
 
 Locks are held per open handle (OFD locks on Linux, a per-handle registry over `fcntl` on macOS and BSD, `LockFileEx` on Windows), so two handles in one process conflict like two processes. Two limits:
 - **macOS and BSD:** `fcntl` locks belong to the process, and closing *any* descriptor of the file drops all of them. The registry defers this crate's own closes while a lock is held, but a `close` of the file by other code in the process drops the writer, presence and reader slot locks (a reader's slot is then freed under it).
-- **Linux:** a forked child shares the parent's open file description and so its OFD locks. A reader slot handle does nothing in a process other than the one that claimed it (§11.5), so a child never releases the parent's lock; a child that keeps the descriptor keeps the lock held after the parent exits.
+- **Linux:** a forked child shares the parent's open file description and so its OFD locks. A reader slot handle does nothing in a process other than the one that claimed it (§11.5), and a reader refuses snapshots and slot claims there, so a child never releases the parent's lock or takes a slot through the shared description; a child that keeps the descriptor keeps the lock held after the parent exits. The process is told apart by a cached id that a `pthread_atfork` child handler resets, so only `fork(3)` is covered: `_Fork`, `vfork` and a raw `clone` skip the handlers.
 
 Network filesystems are refused at open: their lock managers don't give these guarantees.
 

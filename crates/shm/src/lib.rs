@@ -291,6 +291,10 @@ impl ShmConfig {
 #[derive(Debug)]
 pub struct WriterLock {
     file: FileRef,
+    /// The process that took it ([`pigeonhole_io::sys::process_id`]): a forked child's copy
+    /// releases nothing (on Linux it shares the parent's open file description, so its
+    /// unlock would release the parent's lock).
+    held_in: u32,
 }
 
 /// The shared presence lock every open process holds on the presence byte.
@@ -314,6 +318,8 @@ pub struct WriterLock {
 #[derive(Debug)]
 pub struct Presence {
     file: FileRef,
+    /// As [`WriterLock`]'s: a forked child's copy releases nothing and is never "last".
+    held_in: u32,
 }
 
 /// How the calling process uses the region.

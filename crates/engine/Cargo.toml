@@ -39,6 +39,8 @@ criterion = { workspace = true }
 # inflate as they do wall-clock time (#795).
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true }
+# `fork` for `tests/reader_fork.rs`.
+libc = { workspace = true }
 
 [[bench]]
 name = "engine"

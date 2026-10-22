@@ -347,31 +347,42 @@ struct ReaderState {
     view: Mutex<Option<Arc<View>>>,
     shards: usize,
     registry: Arc<MergeRegistry>,
-    /// The process that opened the reader ([`pigeonhole_io::sys::process_id`]): `claim_slot`
-    /// checks its handle only there, not in a forked child.
+    /// The process that opened the reader ([`pigeonhole_io::sys::process_id`]). In any other
+    /// process (a forked child's copy) the reader refuses snapshots and slot claims
+    /// ([`FORKED_READER`]) and its close releases nothing.
     opened_in: u32,
 }
 
+/// What a reader used in a process other than the one that opened it fails with
+/// (`Unsupported`, perf287's review of #898, F1). A forked child inherits the reader's file
+/// handle, which on Linux shares the parent's open file description: a slot it claimed
+/// through it would share locks with the parent's, so each could release the other's and
+/// the child's slot would outlive it.
+pub(crate) const FORKED_READER: &str =
+    "this reader was opened in another process (fork); open a new reader here";
+
 /// Claims a reader slot through `file`, its liveness lock taken through that handle (#693
-/// PR 3). The reader abandons its previous slot before every re-claim, so `file` holds no
-/// slot's liveness byte here: the claim would skip such a byte, costing a slot (perf287's
-/// review of #898, S2). Not checked in a forked child, whose copy of the handle still
-/// records the parent's byte.
+/// PR 3). Refused in a process other than `opened_in` (a forked child, [`FORKED_READER`]).
+/// The reader abandons its previous slot before every re-claim, so `file` holds no slot's
+/// liveness byte here: the claim would skip such a byte, costing a slot (perf287's review
+/// of #898, S2).
 fn claim_slot(
     shm: &ShmRegion,
     process: pigeonhole_io::ProcessId,
     file: &FileRef,
     opened_in: u32,
-) -> std::result::Result<pigeonhole_shm::ReaderSlot, pigeonhole_shm::Error> {
+) -> Result<pigeonhole_shm::ReaderSlot> {
+    if pigeonhole_io::sys::process_id() != opened_in {
+        return Err(Error::Unsupported(FORKED_READER));
+    }
     debug_assert!(
-        pigeonhole_io::sys::process_id() != opened_in
-            || (0..u64::from(shm.reader_slot_usage().1)).all(|i| {
-                file.holds(pigeonhole_format::superblock::READER_LOCK_BASE + i)
-                    .is_none()
-            }),
+        (0..u64::from(shm.reader_slot_usage().1)).all(|i| {
+            file.holds(pigeonhole_format::superblock::READER_LOCK_BASE + i)
+                .is_none()
+        }),
         "a reader claims a slot through a handle that holds another slot's liveness byte"
     );
-    shm.claim_reader_slot_locked(process, file)
+    Ok(shm.claim_reader_slot_locked(process, file)?)
 }
 
 /// A reader process's attachment to one region generation.
@@ -739,7 +750,7 @@ impl Engine {
                         Some(Handover { locks, path: from }),
                     ));
                 }
-                locks
+                locks.map(|l| *l)
             }
             None => None,
         };
@@ -748,7 +759,7 @@ impl Engine {
             Err(e) => Err((
                 e,
                 handed_over.then(|| Handover {
-                    locks: held,
+                    locks: held.map(Box::new),
                     path: path.to_path_buf(),
                 }),
             )),
@@ -2614,7 +2625,7 @@ impl Engine {
         (
             result,
             locks.map(|locks| Handover {
-                locks: Some(locks),
+                locks: Some(Box::new(locks)),
                 path: self.inner.path.clone(),
             }),
         )
@@ -2666,8 +2677,9 @@ impl Engine {
 #[derive(Debug)]
 pub struct Handover {
     /// `None` only in the handover `open_with` returns when it lost the locks (never
-    /// expected: they move into the engine as the open's last step).
-    locks: Option<Locks>,
+    /// expected: they move into the engine as the open's last step). Boxed: it rides in
+    /// `open_with`'s error, which clippy keeps small.
+    locks: Option<Box<Locks>>,
     path: PathBuf,
 }
 
@@ -3924,7 +3936,10 @@ impl Inner {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        // In a forked child the presence handle is the parent's (`Presence` releases nothing
+        // there, and `try_become_last` is false): no last-one-out cleanup.
         if let Some(presence) = presence
+            && pigeonhole_io::sys::process_id() == r.opened_in
             && presence.try_become_last()?
         {
             // Last one out (issue #20): only if no writer holds or is taking the writer byte,
@@ -4019,6 +4034,10 @@ impl Inner {
 
     fn reader_snapshot(&self, durable: bool) -> Result<Snapshot> {
         let r = self.reader.as_ref().expect("reader");
+        // A forked child's copy of the reader takes no snapshot (and so claims no slot).
+        if pigeonhole_io::sys::process_id() != r.opened_in {
+            return Err(Error::Unsupported(FORKED_READER));
+        }
         let deadline = std::time::Instant::now() + READER_VIEW_WAIT;
         let mut waits = 0u32;
         loop {

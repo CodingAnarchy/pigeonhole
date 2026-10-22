@@ -8,7 +8,7 @@
 - **`File::holds(&self, byte: u64) -> Option<LockMode>`:** the lock this handle holds on `byte`, if any.
   - It's a provided method whose default reports `None`, so existing implementations still compile.
   - `PreadFile` reads its per-handle `held` map, `SimFile` its node's holders, and `UringFile` forwards.
-  - A wrapper that forwards `lock` must forward `holds` too. Every wrapper in the workspace's tests, benches and examples does.
+  - A wrapper that forwards `lock` must forward `holds` too, if anything claims reader slots through it. Every wrapper in the workspace's tests does. The bench examples keep the default: they claim no slots, and the callgrind job builds them against the base tree too, whose `File` has no `holds`.
 - **`sys::process_id() -> u32`:** this process's id, as `std::process::id()`, but cached after the first call.
   - **Unix:** a `pthread_atfork` child handler resets the cache (one atomic store), so a forked child never sees its parent's id. If the handler can't be registered, the id is never cached.
   - **Windows** (no `fork`): a `OnceLock`.
@@ -20,6 +20,11 @@
 - **`ShmRegion::reclaim_dead_slots_locked(&self, file: &FileRef) -> usize`:** frees the slots whose liveness byte `file` can take: the reader is gone. Slots stuck in `claiming` are included.
 - **`ReaderSlot::abandon(&self)`:** gives a slot up without freeing it. It releases the byte now; from then on the handle stores nothing, its drop does nothing, and `is_owned` is false.
 - **Behaviour change, no signature change:** a `ReaderSlot` or `SlotOwnership` used in a process other than the one that claimed it (a forked child) is inert, as if abandoned.
+
+- **Behaviour change, no signature change:** `WriterLock` and `Presence` release nothing in a process other than the one that took them, and `Presence::try_become_last` is `false` there. On Linux a forked child shares the parent's open file description, so its unlock would release the parent's lock, and its exclusive try could succeed.
+
+**`pigeonhole-engine` and `pigeonhole` (behaviour, perf287's re-read of #898, F1):** a reader used in a process other than the one that opened it fails new snapshots, and so slot claims, with `Error::Unsupported` ("this reader was opened in another process (fork); open a new reader here"); the public code is `ErrorCode::Unsupported`, already in the enum. Its close releases nothing and skips the last-one-out cleanup.
+- **Why refuse rather than claim:** a slot claimed through the inherited handle would share the parent's open file description on Linux, so parent and child could release each other's slot locks, and the child's slot would outlive it.
 
 `claim_reader_slot` and `reclaim_dead_slots` (liveness by pid) stay, for in-memory regions and tests. The engine no longer uses them.
 
@@ -40,6 +45,8 @@
 
 - `pigeonhole-io`: `file.rs` (the trait method), `pread.rs`, `uring.rs`, `sim.rs`, `sys.rs`, `os/unix.rs`, `os/windows.rs`.
 - `pigeonhole-shm`: `region.rs` (`claim`, `reclaim_dead_slots_locked`, `ReaderSlot::inert` and `abandon`), `lib.rs` (`SlotOwnership::is_current`); `tests/sim.rs`, `tests/multiprocess.rs` (fork test).
-- `pigeonhole-engine`: `engine.rs` (`claim_slot`, which debug-asserts the handle holds no slot byte; reader open, reattach and re-claim), `shard.rs` (`Shared::reclaim_dead_readers`), `snapshot.rs` (`ReaderPins::abandon`).
-- `File` wrappers that forward `holds`: tests in `pigeonhole-engine`, `pigeonhole`, `pigeonhole-pager` and `pigeonhole-wal`, and `crates/bench/examples`.
+- `pigeonhole-io` tests: `parity.rs` (`holds_reports_this_handles_locks`, on pread, uring and sim).
+- `pigeonhole-shm`: `lock.rs` (the `WriterLock` and `Presence` fork guards).
+- `pigeonhole-engine`: `engine.rs` (`FORKED_READER` in `reader_snapshot`, `claim_slot` and `close_reader`), `tests/reader_fork.rs` (Unix); `engine.rs` (`claim_slot`, which debug-asserts the handle holds no slot byte; reader open, reattach and re-claim), `shard.rs` (`Shared::reclaim_dead_readers`), `snapshot.rs` (`ReaderPins::abandon`).
+- `File` wrappers that forward `holds`: tests in `pigeonhole-engine`, `pigeonhole`, `pigeonhole-pager` and `pigeonhole-wal`.
 - Docs: FORMAT §8.3 and §11.5, concurrency.md, the readers guide, and the changelog.

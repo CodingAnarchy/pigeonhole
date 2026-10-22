@@ -1239,6 +1239,7 @@ version = "0.4.0"
 dependencies = [
  "arc-swap",
  "criterion",
+ "libc",
  "loom",
  "pigeonhole-cache",
  "pigeonhole-compaction",
