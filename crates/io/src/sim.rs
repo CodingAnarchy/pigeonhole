@@ -64,7 +64,10 @@ use crate::{
     ProcessId, Result, SharedOpen, SharedRegion, Vfs,
 };
 
-/// Which faults to inject. All decisions draw from the seeded RNG, so a seed replays exactly.
+/// Which faults to inject. Every random decision draws from the seeded RNG, which every
+/// thread's I/O shares: a seed replays the decisions in call order, so where a random fault
+/// lands depends on the threads' interleaving (#880). A scheduled fault (`crash_after_ops`,
+/// `fail_on`) does not draw.
 ///
 /// ```
 /// use pigeonhole_io::sim::FaultPlan;
@@ -90,6 +93,10 @@ pub struct FaultPlan {
     /// Crash (as [`CrashKind::Power`]) immediately after the n-th mutating operation (write,
     /// sync, set_len, remove). Iterating `n` over every value crashes at every write point.
     pub crash_after_ops: Option<u64>,
+    /// Fail every write and sync of files whose name contains this, with `Other` and nothing
+    /// written, while set. A test forces a shard's WAL stream to fail at a point of its own
+    /// choosing (the model check's recovery arm, #880), then clears it.
+    pub fail_on: Option<&'static str>,
 }
 
 impl FaultPlan {
@@ -108,6 +115,7 @@ impl FaultPlan {
             enospc_after_bytes: Some(64 << 20),
             io_error_ppm: 1_000,
             crash_after_ops: None,
+            fail_on: None,
         }
     }
 }
@@ -390,6 +398,21 @@ impl SimState {
     }
 
     /// Fails a read or write with probability `io_error_ppm / 10^6`.
+    /// Fails a write or sync of `node` while [`FaultPlan::fail_on`] names its file (#880).
+    fn scheduled(&self, node: u64, context: &'static str) -> Result<()> {
+        let Some(name) = self.plan.fail_on else {
+            return Ok(());
+        };
+        let named = self
+            .names
+            .iter()
+            .any(|(path, &n)| n == node && path.to_string_lossy().contains(name));
+        if named {
+            return Err(Error::new(ErrorKind::Other, context));
+        }
+        Ok(())
+    }
+
     fn inject(&mut self, context: &'static str) -> Result<()> {
         let ppm = self.plan.io_error_ppm;
         if ppm > 0 && self.rng.below(1_000_000) < u64::from(ppm) {
@@ -1048,6 +1071,7 @@ impl SimFile {
     /// Makes the pending writes durable, and the length too when `metadata` is set.
     fn sync(&self, metadata: bool) -> Result<()> {
         self.with(|st| {
+            st.scheduled(self.node, "sync: scheduled I/O error")?;
             let node = st.node(self.node);
             for op in std::mem::take(&mut node.pending) {
                 apply(&mut node.durable, &op);
@@ -1133,6 +1157,7 @@ impl File for SimFile {
             if buf.is_empty() {
                 return Ok(());
             }
+            st.scheduled(self.node, "write: scheduled I/O error")?;
             st.inject("write: injected I/O error")?;
             file_end(
                 offset,

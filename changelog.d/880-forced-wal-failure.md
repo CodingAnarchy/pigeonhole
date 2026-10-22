@@ -1,0 +1,2 @@
+### Added
+- `pigeonhole-io`: `FaultPlan::fail_on` fails every write and sync of files whose name contains a given component while set, with nothing written (#880). The public model check's recovery arm uses it to force one WAL failure per seed, so every seed exercises a recovery whatever the random faults hit: where those land depends on the threads' interleaving (one simulator RNG serves every thread's I/O), not only on the seed, and a seed's faults may never hit a WAL write. The `FaultPlan` doc says so.
