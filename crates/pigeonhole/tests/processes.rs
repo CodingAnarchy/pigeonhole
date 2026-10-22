@@ -365,6 +365,10 @@ fn a_killed_reader_does_not_stall_the_writer() {
             "the killed reader's slot was not reclaimed: {:?}",
             db.engine_metrics()
         );
+        // A flush with nothing to write answers at once without a flush task, and so
+        // without the reclaim a finished flush runs (#886's run): rewrite row 0 first, so
+        // every flush writes and reclaims (the row count stays the same).
+        put(&t, 0..1).unwrap();
         db.flush().unwrap();
         std::thread::sleep(Duration::from_millis(300));
     }
