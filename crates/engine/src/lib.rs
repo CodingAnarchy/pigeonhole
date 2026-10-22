@@ -25,6 +25,8 @@ mod admission;
 mod catalog;
 mod check;
 mod clock;
+#[cfg(all(test, engine_loom))]
+mod clock_loom;
 mod close_gate;
 mod compact;
 mod engine;

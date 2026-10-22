@@ -851,11 +851,12 @@ fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant()
 }
 
 #[test]
-fn hot_rows_chain_and_wound_across_many_shards() {
-    // D267: blind batches on a few Zipfian rows over many shards, the shape of the
-    // app-owned bench row (#816): PREPAREs chain behind undecided shares and older ones
-    // wound younger ones. The checker holds every cell's versions to seqno and timestamp
-    // order, and a hung commit fails the run.
+fn hot_rows_blind_overlaps_across_many_shards() {
+    // D271: blind batches on a few Zipfian rows over many shards, the shape of the
+    // app-owned bench row (#816): blind PREPAREs over undecided shares are admitted at
+    // once, and the one clock orders their default timestamps with their seqnos. The
+    // checker holds every cell's versions to seqno and timestamp order, and a hung commit
+    // fails the run.
     for shards in [3usize, 6, 10] {
         let mut cfg = Config::quiet(600);
         cfg.shards = shards;
@@ -873,9 +874,9 @@ fn hot_rows_chain_and_wound_across_many_shards() {
 }
 
 #[test]
-fn hot_rows_chain_and_wound_through_crashes() {
-    // D267 (perf287's R3): the hot-row shape with crashes and mid-commit crashes on, so
-    // chains of several undecided PREPAREs on one row sit in a stream at a crash.
+fn hot_rows_blind_overlaps_through_crashes() {
+    // D267 (perf287's R3), kept for D271: the hot-row shape with crashes and mid-commit
+    // crashes on, so several undecided shares on one row sit in a stream at a crash.
     let mut cfg = Config::standard(600);
     cfg.shards = 4;
     cfg.tasks = 64;
@@ -892,9 +893,9 @@ fn hot_rows_chain_and_wound_through_crashes() {
 
 #[test]
 fn hot_rows_mix_reading_commits_and_blind_writers() {
-    // D267: transactions and conditional writes (commits that read, which cannot chain)
-    // beside blind batches on a few Zipfian rows: fences, refusals behind readers and
-    // singles, wounds of reading shares. A fence or a refusal nothing ends leaves a commit
+    // D267, kept for D271: transactions and conditional writes (commits that read) beside
+    // blind batches on a few Zipfian rows: fences, and refusals of reads over undecided
+    // writes and of writes over undecided reads. A fence or a refusal nothing ends leaves a commit
     // to give up with `Busy`, which `check` fails on a fault-free run.
     for shards in [3usize, 6] {
         let mut cfg = Config::quiet(600);
