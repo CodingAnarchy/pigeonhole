@@ -2074,6 +2074,12 @@ impl ShardState {
     /// The compaction a change waited on ended: decides again (on this interval's loads)
     /// and starts the change, before the next compaction is picked.
     pub(super) fn start_waiting_change(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        // With a compaction running, `claim_targets` would pass a change on its tablets
+        // without claiming, and the change would start during the compaction (#102, D270).
+        debug_assert!(
+            self.compaction.is_none(),
+            "a waiting change decided again while a compaction runs"
+        );
         self.change_waits = false;
         if !self.may_change() {
             return;
@@ -3084,11 +3090,15 @@ impl ShardState {
         matches!(self.compaction, Some((t, _)) if op.tablets().contains(&t))
     }
 
-    /// Claims every shard a skew change hands load to (D224), for `dwell` of their passes or as many base intervals of clock, whichever comes first (the slow
-    /// path's dwell for its changes). False if another change claimed one first: the change
-    /// waits for a later pass. A change that waits on a compaction claims nothing (D270): it
-    /// claims when it is decided again at the compaction's end. A claim whose change is
-    /// refused simply runs out.
+    /// Claims every shard a skew change hands load to (D224), for `dwell` of their passes or
+    /// as many base intervals of clock, whichever comes first (the slow path's dwell for its
+    /// changes). False if another change claimed one first: the change waits for a later
+    /// pass. A claim whose change is refused simply runs out.
+    ///
+    /// A change that waits on a compaction claims nothing and reads as claimed (D270): it
+    /// claims when it is decided again at the compaction's end. So a caller that starts the
+    /// change it gets must not have a compaction running on its tablets: `maybe_balance`
+    /// filters waiting changes out, and `start_waiting_change` runs with no compaction.
     fn claim_targets(&self, op: &TabletOpKind, dwell: u64, now: u64) -> bool {
         if self.waits_on_compaction(op) {
             return true;
