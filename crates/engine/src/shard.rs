@@ -1429,9 +1429,12 @@ pub(crate) enum ShardMsg {
         result: Result<ManifestVersion>,
         nanos: u64,
     },
-    /// Sync the stream (a flush's durability barrier) and reply when done.
+    /// Sync the stream (a flush's durability barrier) and reply when done. `from` is the
+    /// flushing shard: its own stream must be durable through everything appended, a peer's
+    /// only through its cross-shard records (#847).
     SyncBarrier {
         reply: Notifier<Result<()>>,
+        from: ShardId,
     },
     /// `from`'s checkpoint waits for this shard's flushed-through seqno to reach `through`
     /// (D266): answered with `FlushedThrough` once it does (at once if it has).
@@ -2584,6 +2587,13 @@ pub(crate) struct ShardState {
     cross_end: Lsn,
     /// After the close: whether the stream was durable through `cross_end` when dropped.
     cross_durable_at_close: bool,
+    /// End of the newest record of any kind given a ticket since open. This shard's own
+    /// flushes need the stream durable through here: a memtable may hold a `None` record
+    /// still in the stream's buffer, or a written one not yet synced, and an SST must not
+    /// make such a record durable in some of its slots while the log loses it (#847).
+    stream_end: Lsn,
+    /// After the close: whether the stream was durable through `stream_end` when dropped.
+    stream_durable_at_close: bool,
     arena: ShardArena,
     chunk_size: usize,
     /// Ordered, so freezes and flushes visit slots in the same order on every run (#61).
@@ -3046,6 +3056,8 @@ impl ShardState {
             poisoned: false,
             cross_end: Lsn::default(),
             cross_durable_at_close: false,
+            stream_end: Lsn::default(),
+            stream_durable_at_close: false,
             arena: ShardArena::new(region, chunk_size),
             chunk_size,
             memtables: BTreeMap::new(),
@@ -5756,6 +5768,7 @@ impl ShardState {
             match result {
                 Ok(t) => {
                     m.ticket = Some(t);
+                    self.stream_end = self.stream_end.max(t.end);
                     if m.durability == Durability::Buffered {
                         buffered_end = Some(t.end);
                     }
@@ -8930,6 +8943,11 @@ impl ShardState {
         } else {
             !self.poisoned
         };
+        self.stream_durable_at_close = if self.wal.is_some() {
+            self.stream_durable()
+        } else {
+            !self.poisoned
+        };
         trace!(
             "shard {} final sync failed={failed} poisoned={}",
             self.id.0, self.poisoned
@@ -8981,6 +8999,13 @@ impl ShardState {
         self.wal
             .as_ref()
             .is_some_and(|w| w.durable() >= self.cross_end)
+    }
+
+    /// Whether every record appended since open is durable (#847).
+    fn stream_durable(&self) -> bool {
+        self.wal
+            .as_ref()
+            .is_some_and(|w| w.durable() >= self.stream_end)
     }
 
     /// Finishes a shard whose driver is dropped before the close handshake completed: the
@@ -9055,20 +9080,34 @@ impl ShardState {
     fn on_sync_barrier(
         &mut self,
         reply: Notifier<Result<()>>,
+        from: ShardId,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         let _ = ctx;
+        let own = from == self.id;
         trace!(
-            "shard {} barrier: poisoned={} wal={}",
+            "shard {} barrier: from={} poisoned={} wal={}",
             self.id.0,
+            from.0,
             self.poisoned,
             self.wal.is_some()
         );
         if self.poisoned {
-            // The barrier covers records other shards' shares depend on: this stream's
-            // PREPAREs and COMMITs. Durable ones keep holding after the failure, so one
-            // shard's WAL error does not fail every peer's flush (5-6 5.1).
-            if self.cross_records_durable() {
+            // Nothing more reaches the file: the barrier holds only for what already is.
+            // This shard's own flush holds memtables of every record of the stream, so the
+            // stream must be durable to its end: a `None` record may still sit in the
+            // buffer (written with the next group's records, which failed), and an SST that
+            // persisted its cells in some slots while the log holds none of it would make
+            // the commit durable in part (#847). A peer's flush holds only shares of this
+            // shard's cross-shard commits: its stream's PREPAREs and COMMITs. Durable ones
+            // keep holding after the failure, so one shard's WAL error does not fail every
+            // peer's flush (5-6 5.1).
+            let holds = if own {
+                self.stream_durable()
+            } else {
+                self.cross_records_durable()
+            };
+            if holds {
                 reply.notify(Ok(()));
             } else {
                 reply.notify(Err(poisoned_error()));
@@ -9088,9 +9127,15 @@ impl ShardState {
                     reply.notify(Err(e.into()));
                 }
             },
-            // Closed: the stream was synced before it was dropped, or (after a failure) its
-            // cross-shard records were durable by then.
-            None if self.close_stage == CloseStage::Reported && self.cross_durable_at_close => {
+            // Closed: the stream was synced before it was dropped, or (after a failure) the
+            // records the flush depends on were durable by then.
+            None if self.close_stage == CloseStage::Reported
+                && if own {
+                    self.stream_durable_at_close
+                } else {
+                    self.cross_durable_at_close
+                } =>
+            {
                 reply.notify(Ok(()))
             }
             None => reply.notify(Err(Error::Unsupported("no WAL stream"))),
@@ -9164,7 +9209,7 @@ impl ShardState {
                 result,
                 nanos,
             } => self.on_flushed(items, result, nanos, ctx),
-            ShardMsg::SyncBarrier { reply } => self.on_sync_barrier(reply, ctx),
+            ShardMsg::SyncBarrier { reply, from } => self.on_sync_barrier(reply, from, ctx),
             ShardMsg::AwaitFlushed { from, through } => {
                 #[cfg(feature = "test-hooks")]
                 self.count_flushed_msg();
