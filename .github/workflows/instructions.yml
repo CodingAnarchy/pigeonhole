@@ -67,12 +67,7 @@ env:
   # than raising its threshold silently.
   # The YCSB shapes get 1.0%: identical code varied by up to 0.54% across runs.
   # `compact` gets 1.0%: identical code measured 2660-2678 (0.7%) across nine A/Bs (blob33).
-  # commit-one and commit-async 0.6%, commit-at 0.7%, for #886 only (D195): the owner accepted
-  # D271's +50 instructions per single-group commit (2026-10-22; one allocator for seqnos and
-  # default timestamps: commit-one +0.53%, commit-async +0.54%, commit-at +0.49 to +0.58%
-  # across rebases). Back to the default 0.5% right after #886 merges, once main's base
-  # includes it; #888 tracks taking the cost back down.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 commit-one=0.6 commit-async=0.6 commit-at=0.7
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0
 
 jobs:
   instructions:
