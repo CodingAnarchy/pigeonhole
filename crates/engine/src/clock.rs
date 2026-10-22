@@ -62,7 +62,7 @@ impl Reservation {
         self.lock().h
     }
 
-    /// The drift gauge (D271, ICR XXXX): how far `H` is ahead of the clock `now`, and the
+    /// The drift gauge (D271, ICR 0064): how far `H` is ahead of the clock `now`, and the
     /// largest such lead at any reservation since open, in µs. One shard reserving more
     /// than one group a µs, or a decision with a group after it in the same µs, moves `H`
     /// past the clock.

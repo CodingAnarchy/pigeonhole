@@ -2325,7 +2325,7 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 
 **Cost:** one lock-protected reservation per group; the pending watermark's lower bound is the mirror, not a second lock. On x86 (callgrind) that is +50 instructions per single-group commit (commit-one +0.54%, commit-overwrite +0.44%, commit-sixteen +0.10%). One 128-bit word through `portable-atomic` measured +77 (its compare-exchange is outlined on baseline x86-64), and two locks per group +65. The prototype's inline `cmpxchg16b` was +25 per group, and level on ycsb-a at 1 and 16 threads on the box (#854 §4); the engine forbids `unsafe`.
 
-**Drift gauge** (ICR XXXX): `EngineMetrics::default_ts_lead_micros` is how far `H` is ahead of the clock now; `max_default_ts_lead_micros` is the largest lead at any reservation since open. Default timestamps run ahead of the clock only when one shard reserves more than one group a µs, or a group follows a decision in the same µs.
+**Drift gauge** (ICR 0064): `EngineMetrics::default_ts_lead_micros` is how far `H` is ahead of the clock now; `max_default_ts_lead_micros` is the largest lead at any reservation since open. Default timestamps run ahead of the clock only when one shard reserves more than one group a µs, or a group follows a decision in the same µs.
 
 **Tests** (`crates/engine/tests/tablets.rs` unless named):
 - **Admission:**

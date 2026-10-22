@@ -230,7 +230,7 @@ pub struct Metrics {
     /// Cross-shard commits' two-phase rounds and the PREPAREs participants refused, by
     /// reason (ICR 0043).
     pub cross_shard: CrossShardMetrics,
-    /// The drift gauge (D271, ICR XXXX): how far the largest default timestamp handed out is
+    /// The drift gauge (D271, ICR 0064): how far the largest default timestamp handed out is
     /// ahead of the clock now, and the largest such lead at any reservation since open, in
     /// µs. Both 0 while the clock leads.
     pub default_ts_lead_micros: (u64, u64),
