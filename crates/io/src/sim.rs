@@ -64,7 +64,10 @@ use crate::{
     ProcessId, Result, SharedOpen, SharedRegion, Vfs,
 };
 
-/// Which faults to inject. All decisions draw from the seeded RNG, so a seed replays exactly.
+/// Which faults to inject. Every random decision draws from the seeded RNG, which every
+/// thread's I/O shares: a seed replays the decisions in call order, so where a random fault
+/// lands depends on the threads' interleaving (#880). A scheduled fault (`crash_after_ops`,
+/// `fail_on`) does not draw.
 ///
 /// ```
 /// use pigeonhole_io::sim::FaultPlan;
@@ -90,6 +93,12 @@ pub struct FaultPlan {
     /// Crash (as [`CrashKind::Power`]) immediately after the n-th mutating operation (write,
     /// sync, set_len, remove). Iterating `n` over every value crashes at every write point.
     pub crash_after_ops: Option<u64>,
+    /// Fail the next write or sync of a file whose name contains this, with `Other` and
+    /// nothing written: one shot, cleared by the simulator under its lock as it fires
+    /// (`SimVfs::scheduled_fired` counts), so it cannot outlive the operation it was set
+    /// for, whatever the threads do. A test forces a shard's WAL stream to fail at a point
+    /// of its own choosing (the model check's recovery arm, #880).
+    pub fail_on: Option<&'static str>,
 }
 
 impl FaultPlan {
@@ -108,6 +117,7 @@ impl FaultPlan {
             enospc_after_bytes: Some(64 << 20),
             io_error_ppm: 1_000,
             crash_after_ops: None,
+            fail_on: None,
         }
     }
 }
@@ -231,6 +241,8 @@ struct SimState {
     next_handle: u64,
     bytes_written: u64,
     ops: u64,
+    /// Scheduled faults (`FaultPlan::fail_on`) fired so far.
+    scheduled_fired: u64,
     /// Values handed out by `Vfs::random_u64`. A counter of its own, not `rng`, so asking
     /// for one does not shift the fault decisions a seed makes.
     random_draws: u64,
@@ -389,6 +401,24 @@ impl SimState {
         self.nodes.get_mut(&id).expect("live node")
     }
 
+    /// Fails a write or sync of `node` if [`FaultPlan::fail_on`] names its file, once: the
+    /// fault clears as it fires (#880).
+    fn scheduled(&mut self, node: u64, context: &'static str) -> Result<()> {
+        let Some(name) = self.plan.fail_on else {
+            return Ok(());
+        };
+        let named = self
+            .names
+            .iter()
+            .any(|(path, &n)| n == node && path.to_string_lossy().contains(name));
+        if named {
+            self.plan.fail_on = None;
+            self.scheduled_fired += 1;
+            return Err(Error::new(ErrorKind::Other, context));
+        }
+        Ok(())
+    }
+
     /// Fails a read or write with probability `io_error_ppm / 10^6`.
     fn inject(&mut self, context: &'static str) -> Result<()> {
         let ppm = self.plan.io_error_ppm;
@@ -516,6 +546,7 @@ impl SimVfs {
                 next_handle: 1,
                 bytes_written: 0,
                 ops: 0,
+                scheduled_fired: 0,
                 random_draws: 0,
                 trace: None,
                 shm: BTreeMap::new(),
@@ -548,6 +579,11 @@ impl SimVfs {
     /// Replaces the fault plan.
     pub fn set_faults(&self, plan: FaultPlan) {
         self.state().plan = plan;
+    }
+
+    /// How many scheduled faults ([`FaultPlan::fail_on`]) have fired since the VFS was made.
+    pub fn scheduled_fired(&self) -> u64 {
+        self.state().scheduled_fired
     }
 
     /// Simulates a crash: every open handle starts failing with `Crashed`, and the stored
@@ -1048,6 +1084,7 @@ impl SimFile {
     /// Makes the pending writes durable, and the length too when `metadata` is set.
     fn sync(&self, metadata: bool) -> Result<()> {
         self.with(|st| {
+            st.scheduled(self.node, "sync: scheduled I/O error")?;
             let node = st.node(self.node);
             for op in std::mem::take(&mut node.pending) {
                 apply(&mut node.durable, &op);
@@ -1133,6 +1170,7 @@ impl File for SimFile {
             if buf.is_empty() {
                 return Ok(());
             }
+            st.scheduled(self.node, "write: scheduled I/O error")?;
             st.inject("write: injected I/O error")?;
             file_end(
                 offset,

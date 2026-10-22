@@ -56,6 +56,12 @@
 //! the option does not cover, the run closes and reopens by hand, as the recovery guide
 //! says. An injected read error (`Io`) on a read is accepted: nothing to compare. The
 //! read-back and the opens run with the faults off; the supervisor's reopen runs under them.
+//! Where the random faults land depends on the threads' interleaving, not only on the seed
+//! (one simulator RNG serves every thread's I/O), so a seed's faults may never hit a WAL
+//! write: every seed also **forces one WAL failure** (`FaultPlan::fail_on`, one shot, on a
+//! `GroupSync` commit at a seed-chosen op in the run's first half), so a recovery always
+//! happens and the arm's check that one did stays real; the random faults' own recoveries
+//! are counted apart and must happen over a sweep's worth of seeds (#880).
 
 use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -358,6 +364,12 @@ struct Stats {
     /// failure landed between the last look and the close, before the supervisor marked
     /// it, so the close closed the failed engine as without the option (D265).
     unclean_closes: usize,
+    /// With the recovery option on: the one failure the harness forced per seed, a `GroupSync`
+    /// commit whose WAL write fails (`FaultPlan::fail_on`, counted by the simulator as it
+    /// fires), so every seed exercises a recovery whatever the random faults hit; and the
+    /// recoveries the random faults caused, which a single seed may miss (#880).
+    forced_faults: usize,
+    recoveries_random: usize,
 }
 
 struct Run {
@@ -381,6 +393,13 @@ struct Run {
     /// A power loss is scheduled (`FaultPlan::crash_after_ops`) and may have fired already:
     /// the next I/O error is that crash, and the next crash or reopen is one.
     armed: bool,
+    /// The op index at which the forced failure runs (`Stats::forced_faults`), from the seed,
+    /// in the run's first half; `None` once it ran or without the recovery option.
+    force_at: Option<usize>,
+    /// The forced failure fired and its recovery has not been counted yet.
+    forced_pending: bool,
+    /// The index of the op under way (`run` counts).
+    op: usize,
     trace: Vec<String>,
     stats: Stats,
     deletes: Deletes,
@@ -663,6 +682,9 @@ impl Run {
             snaps: Vec::new(),
             base,
             armed: false,
+            force_at: None,
+            forced_pending: false,
+            op: 0,
             trace: Vec::new(),
             stats: Stats::default(),
             deletes: Deletes::default(),
@@ -807,11 +829,21 @@ impl Run {
     /// unacknowledged (`OutcomeUnknown`) or acknowledged while the generation changed. Past
     /// the budget, or on a failure the option does not cover, closes and reopens by hand, as
     /// the recovery guide says.
+    /// Counts a recovery: the forced failure's, once, or a random fault's (#880).
+    fn count_recovery(&mut self) {
+        self.stats.recoveries += 1;
+        if self.forced_pending {
+            self.forced_pending = false;
+        } else {
+            self.stats.recoveries_random += 1;
+        }
+    }
+
     fn recover_in_place(&mut self, why: &str, since: Option<Logged>) -> Result<(), String> {
         self.trace.push(format!("  -> the instance failed ({why})"));
         match self.settle()? {
             Settled::Swapped => {
-                self.stats.recoveries += 1;
+                self.count_recovery();
                 let stats = self.db().recovery_stats();
                 self.trace.push(format!(
                     "RECOVERED IN PLACE: generation {}, {} recoveries, from {:?} in {:?}",
@@ -1432,7 +1464,7 @@ impl Run {
                     self.trace
                         .push(format!("  -> the read-back's dump failed ({e}); settling"));
                     match self.settle()? {
-                        Settled::Swapped => self.stats.recoveries += 1,
+                        Settled::Swapped => self.count_recovery(),
                         Settled::Healthy => {}
                         settled @ (Settled::GaveUp | Settled::Uncovered) => {
                             self.stats.gave_up += 1;
@@ -1468,14 +1500,35 @@ impl Run {
 
     fn step(&mut self, op: Op, rng: &mut Rng) -> Result<(), String> {
         self.vfs.advance(1_000);
-        let now = self.now();
+        // A commit retried after a recovery moves it on (below).
+        let mut now = self.now();
         match op {
             Op::Commit(ops, durability) => {
                 let ops = self.prepare(ops);
                 if ops.is_empty() {
                     return Ok(());
                 }
-                let durability = self.cfg.durability.unwrap_or(durability);
+                let mut durability = self.cfg.durability.unwrap_or(durability);
+                // The forced failure (#880): from here every WAL write and sync fails, and a
+                // `GroupSync` commit meets both, so the shard poisons itself and the
+                // supervisor recovers. The random faults alone may never hit a WAL write
+                // (they fall where the threads' interleaving puts them), and the arm's
+                // check that a recovery happened must not depend on that. The plan is
+                // one shot, cleared by the simulator as it fires, so it cannot outlive the
+                // commit: the supervisor's reopen runs under the random faults only. The
+                // plan is restored after the commit as a safety net.
+                let forced = self.force_at.is_some_and(|at| self.op >= at)
+                    && self.cfg.recovery != Recovery::Off
+                    && !self.armed
+                    && !self.failed_over();
+                let fired_before = self.vfs.scheduled_fired();
+                if forced {
+                    self.force_at = None;
+                    durability = Durability::GroupSync;
+                    let mut plan = self.cfg.faults.clone();
+                    plan.fail_on = Some("-wal-");
+                    self.vfs.set_faults(plan);
+                }
                 if !self.armed && rng.chance(self.cfg.mid_commit_crash_ppm) {
                     self.armed = true;
                     let mut plan = self.cfg.faults.clone();
@@ -1486,10 +1539,32 @@ impl Run {
                 self.trace.push(format!(
                     "commit {durability:?} ts={now} [{}]{}",
                     ops.iter().map(show).collect::<Vec<_>>().join("; "),
-                    if armed { " (crash armed)" } else { "" }
+                    if armed {
+                        " (crash armed)"
+                    } else if forced {
+                        " (forced WAL failure)"
+                    } else {
+                        ""
+                    }
                 ));
                 let async_front = self.async_front(rng);
                 let mut result = self.commit(&ops, durability, async_front);
+                if forced {
+                    self.vfs.set_faults(self.cfg.faults.clone());
+                    let fired = (self.vfs.scheduled_fired() - fired_before) as usize;
+                    self.stats.forced_faults += fired;
+                    self.forced_pending = fired > 0;
+                    self.trace.push(format!(
+                        "  -> forced WAL failure (fired {fired}): {:?}",
+                        result.as_ref().err()
+                    ));
+                    if fired != 1 || result.is_ok() {
+                        return Err(format!(
+                            "the forced WAL failure fired {fired} times and the commit returned {:?}",
+                            result.as_ref().map(|_| ())
+                        ));
+                    }
+                }
                 if let Err(e) = &result
                     && e.code() == ErrorCode::Busy
                     && armed
@@ -1547,7 +1622,15 @@ impl Run {
                                 }
                                 retried = true;
                                 self.stats.retried += 1;
-                                self.trace.push("  -> the commit is retried".into());
+                                // The refused attempt was stamped at `now`, and the recovered
+                                // engine's timestamp floor may already hold that stamp (D11:
+                                // a floor can include stamps whose commits never landed), so
+                                // the retry is stamped above it. Move the clock past it and
+                                // record the retry at its own time (#881, seed 63).
+                                self.vfs.advance(1_000);
+                                now = self.now();
+                                self.trace
+                                    .push(format!("  -> the commit is retried at ts={now}"));
                                 result = self.commit(&ops, durability, async_front);
                             }
                             Err(e) if e.code() == ErrorCode::Busy => {
@@ -1874,12 +1957,21 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
     at("open".into());
     let mut run = Run::new(seed, cfg.clone())?;
     let mut rng = Rng::new(seed ^ 0xa11ce);
+    if cfg.recovery != Recovery::Off && cfg.ops >= 20 {
+        // The forced failure (#880): at an op in the run's first half, so the recovery it
+        // forces is followed by plenty of commits and reads on the recovered engine. Its own
+        // Rng, so the run's other decisions stay those of the seed before #880 (seeds 401
+        // and 496 of #847 replay).
+        let mut force_rng = Rng::new(seed ^ 0xf0ce);
+        run.force_at = Some(cfg.ops / 10 + force_rng.below((cfg.ops * 2 / 5) as u64) as usize);
+    }
     let ops: Vec<Op> = Workload::new(seed, "t", cfg.spec.clone())
         .take(cfg.ops)
         .collect();
     let mut result = Ok(());
     for (i, op) in ops.into_iter().enumerate() {
         at(format!("op {i}: {op:?}"));
+        run.op = i;
         if let Err(e) = run.step(op, &mut rng) {
             result = Err(format!("op {i}: {e}"));
             break;
@@ -2100,11 +2192,34 @@ fn io_failures_are_recovered_in_place_and_match_a_durable_prefix() {
     // D265's arm (#620): injected read and write errors with `Recovery::Io` on; every
     // failure the supervisor recovers from is checked by reading back (the module doc).
     let stats = check(&Config::recovering(1000));
+    // Every seed forces one WAL failure (#880; the simulator counts it as it fires), so a
+    // recovery happens whatever the random faults hit, and this stays a real check of the
+    // arm. The random faults' own recoveries are printed per seed and must happen over a
+    // sweep's worth of seeds; a single seed may miss (where they land depends on the threads'
+    // interleaving).
+    for s in &stats {
+        assert_eq!(
+            s.forced_faults, 1,
+            "the forced WAL failure did not fire once: {s:?}"
+        );
+    }
     let recoveries: usize = stats.iter().map(|s| s.recoveries).sum();
     assert!(
         recoveries > 0,
         "no failure was recovered in place: {stats:?}"
     );
+    let random: usize = stats.iter().map(|s| s.recoveries_random).sum();
+    eprintln!(
+        "random-fault recoveries over {} seeds: {random}",
+        stats.len()
+    );
+    if stats.len() >= 20 {
+        assert!(
+            random > 0,
+            "no random fault was recovered from over {} seeds: {stats:?}",
+            stats.len()
+        );
+    }
 }
 
 #[test]
