@@ -1552,13 +1552,17 @@ impl Run {
                     self.vfs.set_faults(plan);
                 }
                 // A forced commit arms no mid-commit crash: arming replaces the fault plan,
-                // which would drop the forced failure. The draw is still taken, so the seed's
-                // later draws are the same whether or not this commit was the forced one.
-                if !self.armed && rng.chance(self.cfg.mid_commit_crash_ppm) && !forced {
-                    self.armed = true;
-                    let mut plan = self.cfg.faults.clone();
-                    plan.crash_after_ops = Some(self.vfs.mutating_ops() + 1 + rng.below(6));
-                    self.vfs.set_faults(plan);
+                // which would drop the forced failure. Both draws are still taken (the chance,
+                // and the crash's op), so the seed's later draws are the same whether or not
+                // this commit was the forced one (perf287's review of #890).
+                if !self.armed && rng.chance(self.cfg.mid_commit_crash_ppm) {
+                    let after = 1 + rng.below(6);
+                    if !forced {
+                        self.armed = true;
+                        let mut plan = self.cfg.faults.clone();
+                        plan.crash_after_ops = Some(self.vfs.mutating_ops() + after);
+                        self.vfs.set_faults(plan);
+                    }
                 }
                 let armed = self.armed;
                 self.trace.push(format!(
