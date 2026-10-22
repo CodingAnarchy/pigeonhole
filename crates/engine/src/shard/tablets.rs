@@ -144,13 +144,6 @@ const PACK_RAMP: f64 = 1.25;
 /// interval): a load that only ever grows still packs.
 const PACK_RAMP_MAX: u64 = 600;
 
-/// A published stall fraction at or above which an active shard counts as stalling for the
-/// shrink count (D255): a pass on which any active shard's writers stall is no light pass,
-/// whatever the busy sum reads. On the AX102 a write lull in the middle of a 16 GiB load
-/// (the loader's writers waiting on room: writes 2,479 against 10–48K around it, busy
-/// 0.27) completed the count the ramp had let accrue, and D217 shrank 16 → 2 mid-load.
-const PACK_STALLING: u64 = 100_000;
-
 /// Balancer passes after a shrink within which a stall-driven growth undoes it (60 s at
 /// the base interval, D255): the growth goes straight back to the count before the shrink.
 /// Regrowing one shard per ten passes took most of a 16 GiB load on the AX102 after one
@@ -2456,16 +2449,10 @@ impl ShardState {
         // the stalls would come back, and `k` would swing between the two. The floor also
         // expires after a quiet window with no active shard stalling (the cause went away
         // with the load unchanged), each expiry doubling the next window.
-        let stall_terms = || {
-            self.shared.loads[..k.min(n)]
-                .iter()
-                .map(|l| l.read_stall_busy_fresh(now, stale).unwrap_or(0))
-        };
-        let any_stalled = stall_terms().any(|s| s > 0);
-        let stalling = stall_terms().any(|s| s >= PACK_STALLING);
         // A pass with a stalling or a saturated shard is not quiet (D255, D256): the floor
-        // expires only once neither cause has shown for a window.
-        if any_stalled || hot {
+        // expires only once neither cause has shown for a window. A stalling shard reads
+        // hot: its stall term is 0 or 1 (D255), and 1 is past `PACK_HOT`.
+        if hot {
             self.floor_quiet = 0;
         } else {
             self.floor_quiet = self.floor_quiet.saturating_add(1);
@@ -2507,7 +2494,7 @@ impl ShardState {
         };
         let ramping = ramping && self.ramp_passes <= PACK_RAMP_MAX;
         trace!(
-            "shard {} balancer pass: k {k} busy {busy:.2} in flight {inflight:.2} (k_c {k_c}, slow {:.2} k_c {k_c_slow}, settled {} of {}) writes {writes} (slow {writes_slow}, ramping {ramping}, stalling {stalling}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
+            "shard {} balancer pass: k {k} busy {busy:.2} in flight {inflight:.2} (k_c {k_c}, slow {:.2} k_c {k_c_slow}, settled {} of {}) writes {writes} (slow {writes_slow}, ramping {ramping}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
             self.id.0,
             self.inflight_slow,
             self.settled_passes,
@@ -2526,8 +2513,12 @@ impl ShardState {
         } else {
             self.pack_up = 0;
         }
-        if !hot && !stalling && k > floor.max(1) && k > k_c && busy / ((k - 1) as f64) < PACK_TARGET
-        {
+        // No shrink on a pass with a hot shard, stalling ones included (D255): a pass on which
+        // an active shard's writers stall is no light pass, whatever the busy sum reads. On
+        // the AX102 a write lull in the middle of a 16 GiB load (the loader's writers waiting
+        // on room: writes 2,479 against 10–48K around it, busy 0.27) completed the count the
+        // ramp had let accrue, and D217 shrank 16 → 2 mid-load.
+        if !hot && k > floor.max(1) && k > k_c && busy / ((k - 1) as f64) < PACK_TARGET {
             // A ramping pass pauses the shrink count: a light pass advances it only while
             // the load is not ramping, and a hot, busy or stalling pass resets it ramping
             // or not (ctr274's review: a count carried across a bursty heavy load's bursts

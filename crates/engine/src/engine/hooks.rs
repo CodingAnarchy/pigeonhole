@@ -229,7 +229,8 @@ pub enum FlushGcMutation {
 pub enum LoadTerm {
     /// The shard thread's busy fraction (0 to 1; D217).
     Busy = 0,
-    /// Its writers' stall fraction (0 to 1; D255).
+    /// Its writers' stall term (D255): 0 or 1 as measured. A fraction in between reads as
+    /// stalled only past `PACK_HOT` (0.9), like a turn busy fraction.
     Stalled = 1,
     /// The pool's work for it (a fraction of the time; it may exceed 1 when several pool
     /// threads serve the shard at once; D256).

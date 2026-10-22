@@ -2941,8 +2941,8 @@ pub(crate) struct ShardState {
     /// The moving average of the mean number of client commits in flight at this shard
     /// (D257): the rise of `commit_inflight_nanos` over the interval, by Little's law.
     inflight_ewma: f64,
-    /// The moving average of the larger of the thread's turn busy fraction and its writers'
-    /// stall fraction, without the sync term (D251's hot test, D255).
+    /// The moving average of the thread's turn busy fraction, without the pool or sync terms
+    /// (D251's hot test, which takes the larger of it and the stall term, D255).
     turn_ewma: f64,
     /// A hot-triggered growth of the active shards (D251): the hot shard and its turn busy
     /// fraction then (millionths). Another one needs that shard to have cooled since (what

@@ -2514,9 +2514,10 @@ fn a_busy_pass_during_a_ramp_still_resets_the_shrink_count() {
 
 /// A pass on which an active shard's writers stall resets the shrink count (D255): four
 /// shards settled at 30% busy have 40 light passes counted, then one pass on which shard 0
-/// reads stalling but not hot; 40 more light passes leave the active shards at four. Counting the stalled
-/// pass as light would carry the 40 across and shrink after 10 (a write lull whose writers
-/// waited on room shrank a 16 GiB load from 16 shards to 2 on the AX102).
+/// reads stalled (a stall term of 1, which reads hot); 40 more light passes leave the active
+/// shards at four. Counting the stalled pass as light would carry the 40 across and shrink
+/// after 10 (a write lull whose writers waited on room shrank a 16 GiB load from 16 shards
+/// to 2 on the AX102).
 #[test]
 fn a_stalled_pass_resets_the_shrink_count() {
     let (mut db, mut written) = spread_and_settled(0.3);
@@ -2524,9 +2525,9 @@ fn a_stalled_pass_resets_the_shrink_count() {
         write_and_balance(&mut db, 4, |_| 20, &mut written);
     }
     assert!(db.engine.pack_ks()[0].is_none_or(|k| k == 4));
-    // Stalling (a published term past 0.1 after the pass), not hot.
+    // Stalled for one pass: one hot pass, too few for a growth.
     db.engine
-        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(0.6));
+        .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(1.0));
     write_and_balance(&mut db, 4, |_| 20, &mut written);
     db.engine
         .set_shard_load(0, pigeonhole_engine::LoadTerm::Stalled, Some(0.0));
