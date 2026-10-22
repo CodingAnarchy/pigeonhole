@@ -1998,12 +1998,10 @@ impl ShardState {
         self.change_waits = false;
         let (decision, cleanups) = if idle {
             let (kind, cleanups) = self.decide(now, &mem_per);
-            let kind = kind.filter(|kind| match self.compaction {
-                Some((t, _)) if kind.tablets().contains(&t) => {
-                    self.change_waits = true;
-                    false
-                }
-                _ => true,
+            let kind = kind.filter(|kind| {
+                let waits = self.waits_on_compaction(kind);
+                self.change_waits |= waits;
+                !waits
             });
             (kind, cleanups)
         } else {
@@ -2896,7 +2894,10 @@ impl ShardState {
             .is_some_and(|p| p + DWELL_PASSES > self.balance_pass);
         // Packing (D217): a shard outside the active ones (`0..k`) hands its written tablets,
         // one per dwell, to the least busy active shard with room. Cold tablets stay: they
-        // cost no wakeups.
+        // cost no wakeups. A shard a skew change claimed is no target until its load shows
+        // (D270), as for skew changes (D224). A packing move claims nothing itself: packing
+        // means handing load to the active shards, and claims would hold its moves to one
+        // per target per dwell.
         let active = self.active_shards();
         if usize::from(self.id.0) >= active && !dwelling {
             let stale = cfg.interval_nanos.saturating_mul(3).max(1);
@@ -2916,10 +2917,10 @@ impl ShardState {
                 });
             if let Some(t) = written {
                 let families = view.catalog.family_ids_of(t.table).len();
-                if let Some((_, to)) = targets
-                    .iter()
-                    .find(|(_, i)| self.slots_fit(&view, ShardId(*i as u16), families))
-                {
+                if let Some((_, to)) = targets.iter().find(|(_, i)| {
+                    self.shared.loads[*i].claimable(now)
+                        && self.slots_fit(&view, ShardId(*i as u16), families)
+                }) {
                     return Some(TabletOpKind::Move {
                         tablet: t.id,
                         to: ShardId(*to as u16),
@@ -3077,11 +3078,21 @@ impl ShardState {
         None
     }
 
-    /// Claims every shard a skew change hands load to (D224), for `dwell` of their passes or
-    /// as many base intervals of clock, whichever comes first (the slow path's dwell for its
-    /// changes). False if another change claimed one first: the change waits for a later pass.
-    /// A claim whose change is then dropped or refused simply runs out.
+    /// Whether `op` touches the tablet a running compaction is on: it waits for the
+    /// compaction's end and is decided again then (#102).
+    fn waits_on_compaction(&self, op: &TabletOpKind) -> bool {
+        matches!(self.compaction, Some((t, _)) if op.tablets().contains(&t))
+    }
+
+    /// Claims every shard a skew change hands load to (D224), for `dwell` of their passes or as many base intervals of clock, whichever comes first (the slow
+    /// path's dwell for its changes). False if another change claimed one first: the change
+    /// waits for a later pass. A change that waits on a compaction claims nothing (D270): it
+    /// claims when it is decided again at the compaction's end. A claim whose change is
+    /// refused simply runs out.
     fn claim_targets(&self, op: &TabletOpKind, dwell: u64, now: u64) -> bool {
+        if self.waits_on_compaction(op) {
+            return true;
+        }
         let dwell_nanos = self.shared.balance.interval_nanos.saturating_mul(dwell);
         let to: Vec<ShardId> = match op {
             TabletOpKind::Move { to, .. } => vec![*to],

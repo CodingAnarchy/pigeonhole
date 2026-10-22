@@ -2285,3 +2285,18 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
   - `hot_rows_chain_and_wound_through_crashes`: the same shape on 4 shards, with crashes and mid-commit crashes;
   - `hot_rows_mix_reading_commits_and_blind_writers`: transactions and conditional writes beside blind batches on the hot rows, on 3 and 6 shards, with no commit allowed to give up with `Busy`.
 - **The existing sweeps** run unchanged.
+
+<a id="d270"></a>
+## D270 — A packing move leaves a claimed shard alone and claims nothing itself; a change that waits on a compaction claims no shard (owner decision, 2026-10-21; tablets, engine, #724 area 2; amends D217, D224)
+
+**Decided:**
+- **A packing move honours skew claims.** An inactive shard hands its written tablet to the least busy active shard with room that no skew change has claimed (D224). It used to ignore claims, so in one pass a packing move and a skew move could both pick the same receiver before its load showed.
+- **A packing move claims nothing.** Packing hands load to the active shards on purpose. Claiming each target for a dwell would allow one packing move per target per dwell: three tablets onto one shard took 321 passes instead of 301 in `light_writes_pack_tablets_onto_fewer_shards`, and a 16-shard store packing to two shards would take about one dwell per two tablets. The design comment had proposed the claim; the measurement replaced it with this.
+- **A change that waits on a compaction claims no shard.** `claim_targets` claims nothing for a change touching the compacting tablet (#102's `change_waits`). It claims when `start_waiting_change` decides it again at the compaction's end. Before, the claim was taken inside `choose`, the change was then dropped, and the claim held its targets off every other skew change for its dwell (10 or 100 passes).
+
+**Why:** #724 area 2's inventory (comment 6329234329): the two kinds of tablet move picked targets by different rules, and a dropped change kept a claim.
+
+**Tests** (`tests/tablets.rs`, with test hooks `Engine::claim_shard` and `Engine::shard_claimed`):
+- `a_packing_move_waits_for_a_claimed_shard`: with the only active shard claimed for 400 passes, no tablet moves past the shrink; once the claim runs out the three land together.
+- `a_change_that_waits_on_a_compaction_claims_no_shard`: a hot tablet's split, held by its compaction, claims no shard; it splits once the compaction ends.
+- Each fails without its change.
