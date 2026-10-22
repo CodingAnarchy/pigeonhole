@@ -22,6 +22,8 @@ struct Rules {
     hold: HashSet<PathBuf>,
     fail: HashSet<PathBuf>,
     panic: HashSet<PathBuf>,
+    /// Paths whose every write (synchronous or submitted) fails, nothing written.
+    fail_writes: HashSet<PathBuf>,
 }
 
 /// A held sync: the file, its completion's resolver, and the sync's real outcome.
@@ -44,6 +46,21 @@ pub struct Gate {
 }
 
 impl Gate {
+    /// Fails every later write of `path`, synchronous or submitted, with nothing written
+    /// (a WAL stream file: its shard poisons itself at the next group's write).
+    pub fn fail_writes(&self, path: &Path) {
+        self.rules
+            .lock()
+            .unwrap()
+            .fail_writes
+            .insert(path.to_path_buf());
+    }
+
+    /// Ends [`Gate::fail_writes`] for `path`: later writes go through again.
+    pub fn heal_writes(&self, path: &Path) {
+        self.rules.lock().unwrap().fail_writes.remove(path);
+    }
+
     /// Holds every later asynchronous sync of `path` until [`Gate::release`].
     pub fn hold(&self, path: &Path) {
         self.rules.lock().unwrap().hold.insert(path.to_path_buf());
@@ -247,6 +264,19 @@ impl pigeonhole_io::File for GateFile {
         Ok(())
     }
     fn write_at(&self, buf: &[u8], offset: u64) -> pigeonhole_io::Result<()> {
+        if self
+            .gate
+            .rules
+            .lock()
+            .unwrap()
+            .fail_writes
+            .contains(&self.path)
+        {
+            return Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected write failure",
+            ));
+        }
         if self.write_fails(buf) {
             return Err(pigeonhole_io::Error::new(
                 pigeonhole_io::ErrorKind::Other,
@@ -259,6 +289,21 @@ impl pigeonhole_io::File for GateFile {
         self.inner.submit_read(buf, offset)
     }
     fn submit_write(&self, buf: pigeonhole_io::IoBuf, offset: u64) -> Completion {
+        if self
+            .gate
+            .rules
+            .lock()
+            .unwrap()
+            .fail_writes
+            .contains(&self.path)
+        {
+            let (completion, resolver) = Completion::pair();
+            resolver.resolve(Err(pigeonhole_io::Error::new(
+                pigeonhole_io::ErrorKind::Other,
+                "injected write failure",
+            )));
+            return completion;
+        }
         self.inner.submit_write(buf, offset)
     }
     fn sync_data(&self) -> pigeonhole_io::Result<()> {
