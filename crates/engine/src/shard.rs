@@ -472,22 +472,12 @@ pub(crate) struct Shared {
     /// The one seqno allocator (D271): every reservation goes through it, and shm
     /// `NEXT_SEQNO` mirrors it.
     pub clock: crate::clock::Reservation,
-    /// Per-shard largest default timestamp assigned (decision D11), read at manifest commits
-    /// and by coordinators choosing a cross-shard commit timestamp.
-    pub ts_floors: Vec<Padded>,
     /// Per shard, the largest seqno `F` such that every write that shard will ever hold at
     /// a seqno at or below `F` is in a durable SST (#724): below its oldest unflushed
     /// memtable entry and at most the visible watermark. Published (Release) by the shard
     /// after a flush's root commit, at `Start`, and when an unpin finds nothing to flush;
     /// never decreases. 0 until the shard's first publish.
     pub flushed_through: Vec<Padded>,
-    /// Per shard, the floor other shards raise it to (`fetch_max`), D264: a shard handing it
-    /// a tablet raises it to its own floor (D11: the floor travels with the tablet), and a
-    /// coordinator to a cross-shard commit's timestamp before it reserves the commit's seqno
-    /// (D245, D263). The shard folds it in (Acquire) once per group after its reservation
-    /// (`fold_raises`), so its singles at later seqnos land above both; coordinators read
-    /// it too.
-    pub ts_raises: Vec<Padded>,
     /// Per-shard load as of its last balancer interval.
     pub loads: Vec<LoadSlot>,
     pub balance: BalanceConfig,
@@ -1368,10 +1358,6 @@ pub(crate) enum ShardMsg {
         seqno: Seqno,
         from: ShardId,
         error: Option<PrepareError>,
-        /// The participant's timestamp floor once its share was admitted and logged (D263):
-        /// the decision's timestamp goes above it, whatever the published
-        /// floors read.
-        floor: Timestamp,
     },
     /// A participant that refused a coordinator's PREPAREs tells it the refusal's cause is
     /// gone (D245, D249).
@@ -2662,8 +2648,10 @@ pub(crate) struct ShardState {
     reserved: usize,
     /// `(tablet, family)` slots whose active memtable crossed the freeze threshold.
     to_freeze: Vec<(TabletId, FamilyId)>,
-    /// Largest default timestamp assigned on this shard (D11).
-    ts_floor: Timestamp,
+    /// This shard's last default timestamp: its stamps strictly increase (D271's variant B,
+    /// the reservation's `last`). Seeded from the manifest's `ts_floor` and raised by every
+    /// replayed or applied record, so a cell's next stamp is above every earlier one here.
+    last_stamp: Timestamp,
     key_buf: Vec<u8>,
     dedup: Dedup,
     /// The row hashes of the member `reserve_room` sized last, for `touch_rows`.
@@ -3030,12 +3018,12 @@ impl ShardState {
         region: ArenaRegion,
         chunk_size: usize,
         tablets: Arc<TabletMap>,
-        ts_floor: Timestamp,
+        last_stamp: Timestamp,
     ) -> Self {
         let leveled = CompactionPicker::new(CompactionStyle::Leveled, shared.picker.clone());
         let tiered = CompactionPicker::new(CompactionStyle::Tiered, shared.picker.clone());
         let fifo = CompactionPicker::new(CompactionStyle::FifoByTime, shared.picker.clone());
-        let shards = shared.ts_floors.len();
+        let shards = shared.shards;
         let cross = shards > 1;
         let shard = Self {
             cross,
@@ -3077,7 +3065,7 @@ impl ShardState {
             share_wait_since: None,
             reserved: 0,
             to_freeze: Vec::new(),
-            ts_floor,
+            last_stamp,
             key_buf: Vec::new(),
             dedup: Dedup::default(),
             admit_rows: Vec::new(),
@@ -3460,23 +3448,10 @@ impl ShardState {
         f
     }
 
-    pub(crate) fn raise_ts_floor(&mut self, ts: Timestamp) {
-        trace!("shard {} raise floor {} -> {ts}", self.id.0, self.ts_floor);
-        if ts > self.ts_floor {
-            self.ts_floor = ts;
-            // Coordinators read it to keep a moved tablet's timestamps above its old floor,
-            // and a share's above its participant's (D244).
-            if (self.cross || self.tablets_on())
-                && let Some(f) = self.shared.ts_floors.get(usize::from(self.id.0))
-            {
-                f.0.store(ts, Ordering::Release);
-            }
-        }
-    }
-
-    /// The largest default timestamp known to this shard (seeded from replay, D11).
-    pub(crate) fn ts_floor(&self) -> Timestamp {
-        self.ts_floor
+    /// This shard's last default timestamp (seeded from replay): open seeds the allocator's
+    /// `H` from every shard's (D271).
+    pub(crate) fn last_stamp(&self) -> Timestamp {
+        self.last_stamp
     }
 
     /// The memtable sets of this shard, for a view.
@@ -3496,7 +3471,7 @@ impl ShardState {
         seqno: Seqno,
         commit_ts: Timestamp,
     ) -> Result<Vec<(TabletId, FamilyId)>> {
-        self.raise_ts_floor(commit_ts);
+        self.note_stamped(commit_ts);
         self.apply(bytes, seqno, commit_ts)?;
         Ok(self.touched_slots.clone())
     }
@@ -4702,25 +4677,20 @@ impl ShardState {
         let (first, t0) = self
             .shared
             .clock
-            .reserve_group(n, k, now, self.ts_floor, shm);
+            .reserve_group(n, k, now, self.last_stamp, shm);
         shm.publish_pending(shard, self.watermark().min(first));
         trace!(
             "shard {} reserves {first}+{n} at {t0}+{k} (now {now}, last {})",
-            self.id.0, self.ts_floor
+            self.id.0, self.last_stamp
         );
         self.note_stamped(t0 + k.max(1) - 1);
         (first, t0)
     }
 
-    /// This shard stamped up to `ts`: its own last stamp (D271's `last_X`), and the floor
-    /// still published until the floors go (D271 PR 2).
+    /// This shard stamped up to `ts`, or applied or replayed a record at `ts`: its last stamp
+    /// (D271's `last_X`), local to the shard thread.
     fn note_stamped(&mut self, ts: Timestamp) {
-        if ts > self.ts_floor {
-            self.ts_floor = ts;
-            self.shared.ts_floors[usize::from(self.id.0)]
-                .0
-                .store(ts, Ordering::Release);
-        }
+        self.last_stamp = self.last_stamp.max(ts);
     }
 
     // ---- reads on the shard (predicates, validation) ----
@@ -5615,9 +5585,10 @@ impl ShardState {
                 if let Some((table, row, _)) = m.predicate.as_deref() {
                     reads.push(hash_row(*table, row));
                 }
-                // The share lands at its decision's timestamp, above this floor (D263):
-                // a lower bound for compaction's and flush's GC.
-                let floor = self.ts_floor + 1;
+                // The share lands at its decision's timestamp, above every stamp handed out
+                // before it (D271), so above this shard's last: a lower bound for
+                // compaction's and flush's GC.
+                let floor = self.last_stamp + 1;
                 if let Some(share) = self.prepared.get_mut(&m.seqno)
                     && !share.tracked
                 {
@@ -5679,7 +5650,7 @@ impl ShardState {
                     m.commit_ts = t0 + u64::from(m.rank);
                 }
                 MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
-                    self.raise_ts_floor(m.commit_ts);
+                    self.note_stamped(m.commit_ts);
                 }
             }
         }
@@ -6842,13 +6813,13 @@ impl ShardState {
             return true;
         };
         // The least timestamp a mutation without one gets: for a single commit its default
-        // timestamp, above the floor; a share's, above this floor too (below).
+        // timestamp, above this shard's last stamp; a share's, above it too (below).
         let default_ts = match m.kind {
-            MemberKind::Single if m.commit_ts == 0 => self.ts_floor + 1,
-            MemberKind::Single => m.commit_ts.min(self.ts_floor + 1),
-            // Its timestamp is picked at the decision, above this floor (D263:
-            // `decide_commit` takes a default timestamp over every participant's floor).
-            MemberKind::Prepare { .. } => self.ts_floor + 1,
+            MemberKind::Single if m.commit_ts == 0 => self.last_stamp + 1,
+            MemberKind::Single => m.commit_ts.min(self.last_stamp + 1),
+            // Its timestamp is picked at the decision, above every stamp handed out before it
+            // (D271), so above this shard's last.
+            MemberKind::Prepare { .. } => self.last_stamp + 1,
             _ => m.commit_ts,
         };
         let mut families: Vec<FamilyId> = Vec::new();
@@ -7047,7 +7018,6 @@ impl ShardState {
                         seqno: m.seqno,
                         from: self.id,
                         error,
-                        floor: self.ts_floor,
                     },
                     ctx,
                 );
@@ -7194,7 +7164,7 @@ impl ShardState {
             if shard == self.id {
                 self.handle_msg(msg, ctx);
             } else if ctx.submitter(shard).submit(msg).is_err() {
-                self.on_prepared(seqno, shard, Some(PrepareError::Closed), 0, ctx);
+                self.on_prepared(seqno, shard, Some(PrepareError::Closed), ctx);
             }
         }
     }
@@ -7212,7 +7182,6 @@ impl ShardState {
                     seqno: req.seqno,
                     from: self.id,
                     error,
-                    floor: 0,
                 },
                 ctx,
             );
@@ -7254,20 +7223,11 @@ impl ShardState {
         });
     }
 
-    /// D263: the decision's timestamp and seqno. The timestamp is picked above
-    /// every participant's floor (D11): its own, a tablet move's raise, and other
-    /// coordinators' raises. Every participant answered `Prepared` after admitting its share,
-    /// and admission keeps any write to the share's rows (or rows its commit read) waiting
-    /// until the decision, so every earlier write to those rows is in the floors read here:
-    /// per cell, the commit lands above them in both seqno and timestamp. Then the
-    /// participants' coordinator raises (D245's order: raise, then reserve), so a single
-    /// reserved after the seqno stamps above the timestamp; then the seqno, held until
-    /// every participant has applied.
-    fn decide_commit(&mut self, shards: &[ShardId], floors: Timestamp) -> (Seqno, Timestamp) {
-        // D271: the seqno and timestamp come from the one allocator, the timestamp strictly
-        // above every default timestamp handed out before (the participants' floors are no
-        // longer read). The raises are still written until the floors go (PR 2).
-        let _ = floors;
+    /// D263, D271: the decision's seqno and timestamp, from the one allocator: the timestamp
+    /// strictly above every default timestamp handed out before it, on any shard, and the
+    /// allocator's flag puts every later one strictly above it. The seqno is held until every
+    /// participant has applied.
+    fn decide_commit(&mut self) -> (Seqno, Timestamp) {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
         // The mirror never passes the allocator's `S`, so it is a lower bound (§11.3 step 1).
@@ -7275,13 +7235,6 @@ impl ShardState {
         let now = self.shared.vfs.now_micros();
         let (apply_seqno, commit_ts) = self.shared.clock.reserve_decision(now, shm);
         self.held.insert(apply_seqno);
-        for s in shards {
-            if *s != self.id {
-                self.shared.ts_raises[usize::from(s.0)]
-                    .0
-                    .fetch_max(commit_ts, Ordering::Release);
-            }
-        }
         self.note_stamped(commit_ts);
         self.publish_watermark();
         (apply_seqno, commit_ts)
@@ -7292,7 +7245,6 @@ impl ShardState {
         seqno: Seqno,
         from: ShardId,
         error: Option<PrepareError>,
-        floor: Timestamp,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         trace!(
@@ -7311,8 +7263,6 @@ impl ShardState {
             // commits waiting behind it there for good).
             return;
         }
-        // Until the decision, `commit_ts` gathers the participants' floors (D263).
-        c.commit_ts = c.commit_ts.max(floor);
         match error {
             Some(PrepareError::Moved) => RetryWait::note(&mut c.refused, RetryWait::Tablets),
             // Not timestamp refusals: the retry waits for that participant's wake. Only the
@@ -7381,8 +7331,7 @@ impl ShardState {
         .fetch_max(u64::from(c.attempt), Ordering::Relaxed);
         let streams: Vec<StreamId> = c.shards.iter().map(|s| StreamId(u32::from(s.0))).collect();
         let (durability, shards) = (c.durability, c.shards.clone());
-        let floors = c.commit_ts;
-        let (apply_seqno, commit_ts) = self.decide_commit(&shards, floors);
+        let (apply_seqno, commit_ts) = self.decide_commit();
         let c = self.coord.get_mut(&seqno).expect("present");
         c.apply_seqno = apply_seqno;
         c.commit_ts = commit_ts;
@@ -7505,9 +7454,9 @@ impl ShardState {
             }
             if commit {
                 self.refresh_tablets();
-                // D263: the share lands at the decision's seqno and timestamp.
-                // Later writes to its rows, held back until now, stamp above it.
-                self.raise_ts_floor(commit_ts);
+                // D263: the share lands at the decision's seqno and timestamp, this
+                // shard's last stamp from now on (D271: later ones are above it anyway).
+                self.note_stamped(commit_ts);
                 let holders = holders.unwrap_or_else(|| Arc::from([self.id]));
                 self.share_seqnos
                     .insert(seqno, (apply_seqno, holders, false));
@@ -8791,8 +8740,9 @@ impl ShardState {
         // D116); waiting would hang the close. A coordinated commit still undecided is
         // decided abort now (a late `Prepared` finds it failed, `on_prepared`), and its
         // caller is told `Closed`: such a `Closed` always means not committed. One already
-        // decided keeps its reply, which resolves as usual, or ends `Closed` when the
-        // shard reports without a participant's answer (its outcome is then the WAL's).
+        // decided keeps its reply, which resolves as usual, or ends `OutcomeUnknown` when
+        // the shard reports without a participant's answer (`answer_unsettled`, ICR 0038:
+        // its outcome is then the WAL's).
         // Either way its seqno stays held, so nothing of it becomes visible half applied.
         // A decision arriving later is answered without applying (`on_decide`). Found by
         // D227's tests, whose visibility pin is such a commit.
@@ -9197,12 +9147,7 @@ impl ShardState {
             }
             ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),
             ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
-            ShardMsg::Prepared {
-                seqno,
-                from,
-                error,
-                floor,
-            } => self.on_prepared(seqno, from, error, floor, ctx),
+            ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
             ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),
             ShardMsg::Released { priority } => self.release_overlaps_behind(priority, ctx),
             ShardMsg::Decide {

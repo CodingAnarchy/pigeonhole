@@ -3374,7 +3374,7 @@ impl World {
         self.cfg.tablet_changes || self.cfg.shards > 1
     }
 
-    /// Moves the clock past every shard's default-timestamp floor.
+    /// Moves the clock past every default timestamp handed out (the allocator's `H`, D271).
     fn clock_past_floors(&mut self) {
         let Some(store) = &self.store else {
             return;
@@ -3382,7 +3382,7 @@ impl World {
         if !self.retries() {
             return;
         }
-        let floor = store.engine.max_ts_floor();
+        let floor = store.engine.last_default_ts();
         let now = self.now();
         if floor >= now {
             self.vfs.advance(1_000 * (floor - now + 1));

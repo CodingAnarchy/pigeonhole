@@ -244,13 +244,8 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
             next_sst: sst_ids.load(Ordering::Relaxed),
             next_blob_file: blob_ids.load(Ordering::Relaxed),
             seqno_ceiling: seqno + 1,
-            ts_floor: shared
-                .ts_floors
-                .iter()
-                .map(|f| f.0.load(Ordering::Acquire))
-                .max()
-                .unwrap_or(0)
-                .max(c.ts_floor),
+            // D271: every default timestamp handed out is at or below the allocator's `H`.
+            ts_floor: shared.clock.last_ts().max(c.ts_floor),
         });
         for e in &edits {
             catalog.apply(e, 1)?;

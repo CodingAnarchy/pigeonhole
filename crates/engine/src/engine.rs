@@ -955,10 +955,6 @@ impl Engine {
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             flushed_through: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             clock: Default::default(),
-            ts_floors: (0..shards)
-                .map(|_| Padded(AtomicU64::new(catalog.counters.ts_floor)))
-                .collect(),
-            ts_raises: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
             balance: BalanceConfig {
                 enabled: options.tablet_changes,
@@ -1341,16 +1337,13 @@ impl Engine {
             sweep_unreferenced_blobs(&shared, &mut catalog, &states, shards)?;
         }
 
-        // The timestamp floor starts above every replayed commit (D11).
-        for (i, s) in states.iter().enumerate() {
-            shared.ts_floors[i].0.store(s.ts_floor(), Ordering::Release);
-        }
         // D271: the allocator's `H` is the largest default timestamp handed out: the
-        // manifest's floor and every replayed timestamp (§5). Not the clock: stamps take
-        // `max(now, ..)` themselves, and a decision must only be above `H`.
+        // manifest's floor and every replayed timestamp (§5), each shard's last stamp once
+        // replay raised it. Not the clock: stamps take `max(now, ..)` themselves, and a
+        // decision must only be above `H`.
         let h = states
             .iter()
-            .map(|s| s.ts_floor())
+            .map(|s| s.last_stamp())
             .max()
             .unwrap_or(0)
             .max(catalog.counters.ts_floor);
@@ -1567,9 +1560,7 @@ impl Engine {
             close: CloseState::new(0),
             metrics: Vec::new(),
             clock: Default::default(),
-            ts_floors: Vec::new(),
             flushed_through: Vec::new(),
-            ts_raises: Vec::new(),
             loads: Vec::new(),
             balance: BalanceConfig::default(),
             view_capacity: shm_config.view_buffer_bytes as usize,
