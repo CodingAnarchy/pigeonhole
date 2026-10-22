@@ -981,13 +981,16 @@ impl WriteBatch {
 /// ```
 #[derive(Debug)]
 pub struct Transaction {
-    db: Arc<Db>,
+    pub(crate) db: Arc<Db>,
     txn: Txn,
     error: Option<Error>,
     largest_value: usize,
     /// The engine generation it began in (D265): its reads and its commit fail with
     /// `SnapshotExpired` once the database recovered onto a newer engine.
     generation: u64,
+    /// The first error one of its own reads failed with: how `Pigeonhole::transact` tells
+    /// a retryable failure from the application giving up (ICR 0060).
+    failed_read: Option<Error>,
 }
 
 impl Transaction {
@@ -998,6 +1001,7 @@ impl Transaction {
             error: None,
             largest_value: 0,
             generation,
+            failed_read: None,
         }
     }
 
@@ -1058,10 +1062,15 @@ impl Transaction {
         // A transaction's engine is the one it began on: a recovery running means its
         // snapshot expires with the swap, so no wait and no retry, only the error's name.
         let (db, generation) = (Arc::clone(&self.db), self.generation);
-        self.txn
+        let result = self
+            .txn
             .commit(durability)
             .map(CommitInfo::from)
-            .map_err(|e| db.after_commit_closed(generation, commit_error(e, largest, max)))
+            .map_err(|e| {
+                db.after_transaction_commit_closed(generation, commit_error(e, largest, max))
+            });
+        db.txn_counts.count(&result);
+        result
     }
 
     /// Reads a cell at the transaction's snapshot and records the read.
@@ -1072,14 +1081,28 @@ impl Transaction {
         family: &str,
         qualifier: &[u8],
     ) -> Result<Option<CellRef<'_>>> {
-        check_table(&self.db, table)?;
-        self.db.check_open()?;
-        self.db.check_generation(self.generation)?;
-        let family = table.core.family_id(family)?;
-        Ok(self
-            .txn
-            .get(table.core.info.id, family, row, qualifier)?
-            .map(CellRef::owned))
+        let read = (|| {
+            check_table(&self.db, table)?;
+            self.db.check_open()?;
+            self.db.check_generation(self.generation)?;
+            let family = table.core.family_id(family)?;
+            Ok(self.txn.get(table.core.info.id, family, row, qualifier)?)
+        })();
+        match read {
+            Ok(cell) => Ok(cell.map(CellRef::owned)),
+            Err(e) => {
+                let e: Error = e;
+                if self.failed_read.is_none() {
+                    self.failed_read = Some(e.clone());
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The first error one of this transaction's reads failed with.
+    pub(crate) fn failed_read(&self) -> Option<Error> {
+        self.failed_read.clone()
     }
 
     /// [`get`](Transaction::get) as a future resolving to an owned [`Cell`](crate::Cell): the

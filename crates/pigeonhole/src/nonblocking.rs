@@ -191,19 +191,49 @@ impl Transaction {
     /// conflicting commit. Dropped once submitted, the future does not roll it back: it
     /// commits or aborts atomically either way. **Dropped while it still waits for room, it
     /// writes nothing** (see the [module docs](self)).
-    pub fn commit_async(self) -> CommitFuture {
+    pub fn commit_async(self) -> TransactionCommitFuture {
         self.async_commit(None)
     }
 
     /// [`commit_with`](Transaction::commit_with), as a future, submitted when its shard has
     /// room (D210). Dropped once submitted, the future does not roll it back. **Dropped
     /// while it still waits for room, it writes nothing** (see the [module docs](self)).
-    pub fn commit_with_async(self, durability: Durability) -> CommitFuture {
+    pub fn commit_with_async(self, durability: Durability) -> TransactionCommitFuture {
         self.async_commit(Some(durability))
     }
 
-    fn async_commit(self, durability: Option<Durability>) -> CommitFuture {
-        CommitFuture::new(self.submit_async(durability))
+    fn async_commit(self, durability: Option<Durability>) -> TransactionCommitFuture {
+        let db = std::sync::Arc::clone(&self.db);
+        TransactionCommitFuture {
+            commit: CommitFuture::new(self.submit_async(durability)),
+            counts: Some(db),
+        }
+    }
+}
+
+/// A transaction's commit, as a future ([`Transaction::commit_async`]): a [`CommitFuture`]
+/// that also counts the outcome in the transaction counters of
+/// [`EngineMetrics`](crate::EngineMetrics) (ICR 0061). Its own type, so the commit
+/// futures of row mutations and batches carry nothing for it (ICR 0060). Dropped once
+/// submitted, it does not roll the commit back; dropped while it still waits for room
+/// (D210), it writes nothing, and counts nothing.
+#[derive(Debug)]
+#[must_use = "a commit future dropped while it waits for room writes nothing (D210); await it"]
+pub struct TransactionCommitFuture {
+    commit: CommitFuture,
+    /// Taken when the outcome is counted, so a repeated poll does not count it again.
+    counts: Option<std::sync::Arc<crate::db::Db>>,
+}
+
+impl Future for TransactionCommitFuture {
+    type Output = Result<CommitInfo>;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let out = std::task::ready!(Pin::new(&mut self.commit).poll(cx));
+        if let Some(db) = self.counts.take() {
+            db.txn_counts.count(&out);
+        }
+        Poll::Ready(out)
     }
 }
 

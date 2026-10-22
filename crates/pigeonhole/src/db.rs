@@ -41,6 +41,8 @@ pub(crate) struct Db {
     reopen: Option<(Options, PathBuf)>,
     /// `Options::write_stall_timeout`: how long an operation waits for a recovery's swap.
     stall_timeout: Duration,
+    /// Transaction outcomes since open (ICR 0061).
+    pub(crate) txn_counts: crate::retry::TxnCounts,
 }
 
 /// The engine an operation runs on, held for the operation: the handle's cached `Arc`
@@ -169,6 +171,7 @@ impl Db {
             supervision,
             reopen,
             stall_timeout,
+            txn_counts: Default::default(),
         })
     }
 
@@ -311,6 +314,23 @@ impl Db {
     #[cold]
     #[inline(never)]
     pub(crate) fn after_commit_closed(&self, generation: u64, e: Error) -> Error {
+        self.after_commit_closed_as(generation, e, false)
+    }
+
+    /// [`after_commit_closed`](Self::after_commit_closed) for a transaction's commit: refused
+    /// by the failed engine before the swap, it gets `SnapshotExpired` rather than `Busy`
+    /// (perf287's S1 on #877, ICR 0060): its snapshot expired with the swap, as its reads
+    /// would have, and `SnapshotExpired` is what `Pigeonhole::transact` retries by default.
+    /// A recovery that times out is still `Busy`.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn after_transaction_commit_closed(&self, generation: u64, e: Error) -> Error {
+        self.after_commit_closed_as(generation, e, true)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn after_commit_closed_as(&self, generation: u64, e: Error, transaction: bool) -> Error {
         if e.code() != ErrorCode::Closed || self.is_closed() {
             return e;
         }
@@ -318,11 +338,22 @@ impl Db {
             return e;
         };
         match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
-            crate::recovery::Settled::Swapped if self.generation() != generation => Error::new(
-                ErrorCode::Busy,
-                "refused by the failed engine while the database recovered \
-                     (Options::auto_recover): not committed, retry on the recovered one",
-            ),
+            crate::recovery::Settled::Swapped if self.generation() != generation => {
+                if transaction {
+                    Error::new(
+                        ErrorCode::SnapshotExpired,
+                        "refused by the failed engine while the database recovered \
+                         (Options::auto_recover): not committed; the transaction's snapshot \
+                         expired with the swap, so begin it again",
+                    )
+                } else {
+                    Error::new(
+                        ErrorCode::Busy,
+                        "refused by the failed engine while the database recovered \
+                         (Options::auto_recover): not committed, retry on the recovered one",
+                    )
+                }
+            }
             crate::recovery::Settled::TimedOut => Error::new(
                 ErrorCode::Busy,
                 "recovering after a shard failure (Options::auto_recover): the reopen did not \
@@ -758,7 +789,9 @@ impl Pigeonhole {
     /// from 0 at open, so take two readings and subtract for an interval; see
     /// [`EngineMetrics`](crate::EngineMetrics) for each field. Cheap and non-blocking.
     pub fn engine_metrics(&self) -> crate::EngineMetrics {
-        self.engine().metrics().into()
+        let mut m: crate::EngineMetrics = self.engine().metrics().into();
+        self.db.txn_counts.fill(&mut m);
+        m
     }
 
     /// Commit latency histograms per durability level since open, summed over shards: a

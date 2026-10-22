@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use pigeonhole::nonblocking::CommitFuture;
+use pigeonhole::nonblocking::{CommitFuture, TransactionCommitFuture};
 use pigeonhole::{ErrorCode, Pigeonhole, Shard, Table};
 use pigeonhole_io::sys::PinPlan;
 
@@ -162,6 +162,24 @@ fn one_tablet_each(db: &Pigeonhole, when: &str) -> Result<(), String> {
     }
 }
 
+/// A commit in flight: a write or batch commit, or a reading transaction's, whose commit
+/// future is its own type (ICR 0060).
+enum Flight {
+    Commit(CommitFuture),
+    Txn(TransactionCommitFuture),
+}
+
+impl std::future::Future for Flight {
+    type Output = pigeonhole::Result<pigeonhole::CommitInfo>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.get_mut() {
+            Flight::Commit(f) => Pin::new(f).poll(cx),
+            Flight::Txn(f) => Pin::new(f).poll(cx),
+        }
+    }
+}
+
 fn submit(t: &Table, w: &Write) -> CommitFuture {
     let mut m = t.mutate(&w.row);
     for (q, v) in &w.cells {
@@ -205,7 +223,7 @@ fn submit_rmw(
     w: &Write,
     j: usize,
     all: &[Write],
-) -> Result<CommitFuture, String> {
+) -> Result<TransactionCommitFuture, String> {
     let mut txn = db.transaction().map_err(err)?;
     let rows: Vec<&Write> = std::iter::once(w).chain(batch_extras(j, all)).collect();
     for x in &rows {
@@ -399,12 +417,14 @@ fn pipeline(
     let waker = shard.waker();
     let mut cx = Context::from_waker(&waker);
     let submit_one = |j: usize, w: &Write| match batches {
-        Some((db, all)) if is_rmw(j, all.len(), readers) => submit_rmw(db, t, w, j, all),
-        Some((db, all)) => Ok(submit_with_batches(db, t, w, j, all)),
-        None => Ok(submit(t, w)),
+        Some((db, all)) if is_rmw(j, all.len(), readers) => {
+            submit_rmw(db, t, w, j, all).map(Flight::Txn)
+        }
+        Some((db, all)) => Ok(Flight::Commit(submit_with_batches(db, t, w, j, all))),
+        None => Ok(Flight::Commit(submit(t, w))),
     };
     // (first submission, commit index, write, retries after `Busy`, future)
-    let mut flight: VecDeque<(Instant, usize, &Write, u32, CommitFuture)> =
+    let mut flight: VecDeque<(Instant, usize, &Write, u32, Flight)> =
         VecDeque::with_capacity(in_flight);
     let mut next = writes.iter().enumerate();
     let mut busy = 0u64;
