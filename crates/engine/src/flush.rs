@@ -585,11 +585,10 @@ impl FlushTask {
         let mut waiters = Vec::with_capacity(shards.len());
         for s in shards {
             let (tx, rx) = completion();
-            match self
-                .shared
-                .submitter(s)
-                .submit(ShardMsg::SyncBarrier { reply: tx })
-            {
+            match self.shared.submitter(s).submit(ShardMsg::SyncBarrier {
+                reply: tx,
+                from: self.shard,
+            }) {
                 Ok(()) => waiters.push(rx),
                 Err(_) => {
                     // The shard is gone (shutdown): its stream can no longer be synced.
