@@ -8846,10 +8846,14 @@ impl ShardState {
             );
         }
         if self.close_stage == CloseStage::Draining {
-            // Every admitted member applied or was settled, each releasing its room (#845).
+            // Every admitted member applied or was settled, each releasing its room; what
+            // stays reserved is the undecided shares' (a share prepared for a coordinator
+            // that died keeps its room, its outcome the WAL's: D83, D116), which the close
+            // leaves listed once a shard died (#845, perf287's review of #857).
             debug_assert_eq!(
-                self.reserved, 0,
-                "shard {}: room still reserved after the queue drained",
+                self.reserved,
+                self.prepared.values().map(|s| s.reserved).sum::<usize>(),
+                "shard {}: room reserved beyond the undecided shares after the queue drained",
                 self.id.0
             );
             self.close_stage = CloseStage::Flushing;
