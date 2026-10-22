@@ -173,6 +173,9 @@ impl File for TimedFile {
     fn unlock(&self, byte: u64) -> Result<()> {
         self.clock.0.time("unlock", || self.inner.unlock(byte))
     }
+    fn holds(&self, byte: u64) -> Option<LockMode> {
+        self.inner.holds(byte)
+    }
     fn identity(&self) -> Result<FileIdentity> {
         self.clock.0.time("identity", || self.inner.identity())
     }

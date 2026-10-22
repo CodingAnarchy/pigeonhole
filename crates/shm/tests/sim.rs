@@ -653,3 +653,35 @@ fn an_abandoned_slot_leaves_a_later_claim_through_its_handle_alone() {
     drop(new);
     assert_eq!(shm.reader_slot_usage().0, 0);
 }
+
+/// perf287's review of #898, S2: a claim through a handle that already holds a live slot's
+/// byte skips that slot instead of locking and then unlocking the byte (locks never conflict
+/// within a handle), so the live slot keeps its lock.
+#[test]
+fn a_claim_through_a_handle_holding_a_slots_byte_leaves_that_lock_alone() {
+    use pigeonhole_format::superblock::READER_LOCK_BASE;
+    let sim = SimVfs::new(695);
+    let w = Proc::start(&sim, pid(1));
+    let (_lock, _wp, shm) = w.open_writer();
+    let r = Proc::start(&sim, pid(41));
+    let rs = r.open(Role::Reader).unwrap();
+    let first = rs.claim_reader_slot_locked(r.id, &r.file).unwrap();
+    let byte = READER_LOCK_BASE + u64::from(first.index());
+    assert!(r.file.holds(byte).is_some());
+
+    // A second claim through the same handle, the first slot not abandoned: another slot.
+    let second = rs.claim_reader_slot_locked(r.id, &r.file).unwrap();
+    assert_ne!(second.index(), first.index());
+    assert!(
+        r.file.holds(byte).is_some(),
+        "the claim released the first slot's byte"
+    );
+    sim.enter_process(pid(1));
+    assert!(w.file.lock(byte, LockMode::Exclusive).is_err());
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 0);
+    sim.enter_process(pid(41));
+    assert!(first.is_owned() && second.is_owned());
+    drop(second);
+    drop(first);
+    assert_eq!(shm.reader_slot_usage().0, 0);
+}

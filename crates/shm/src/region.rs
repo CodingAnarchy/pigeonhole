@@ -924,7 +924,15 @@ impl ShmRegion {
         let inner = &self.inner;
         for index in 0..inner.header.reader_slot_count {
             if let Some(file) = lock {
-                match file.lock(READER_LOCK_BASE + u64::from(index), LockMode::Exclusive) {
+                let byte = READER_LOCK_BASE + u64::from(index);
+                // A byte this handle already holds is another live slot's (locks never
+                // conflict within a handle, so locking it would succeed, and the failure path
+                // below would release it under that slot): taken, like a byte another handle
+                // holds (perf287's review of #898, S2).
+                if file.holds(byte).is_some() {
+                    continue;
+                }
+                match file.lock(byte, LockMode::Exclusive) {
                     Ok(()) => {}
                     Err(e) if e.kind == ErrorKind::Locked => continue,
                     Err(e) => return Err(e.into()),
@@ -967,6 +975,7 @@ impl ShmRegion {
                 owner: process,
                 lock: lock.cloned(),
                 abandoned: Arc::new(AtomicBool::new(false)),
+                claimed_in: pigeonhole_io::sys::process_id(),
             });
         }
         Err(Error::NoReaderSlot)
@@ -1098,7 +1107,16 @@ impl ShmRegion {
 impl ReaderSlot {
     /// Whether the slot is still this handle's (see [`crate::SlotOwnership::is_current`]).
     pub fn is_owned(&self) -> bool {
-        !self.abandoned.load(Ordering::Acquire) && self.region.slot_owned_by(self.index, self.owner)
+        !self.inert() && self.region.slot_owned_by(self.index, self.owner)
+    }
+
+    /// Abandoned ([`ReaderSlot::abandon`]), or used in a process other than the one that
+    /// claimed it (a forked child, perf287's review of #898, S1): the handle stores nothing
+    /// to the slot, and its drop frees nothing and unlocks nothing. One cached-id compare
+    /// ([`pigeonhole_io::sys::process_id`]), no system call.
+    fn inert(&self) -> bool {
+        self.abandoned.load(Ordering::Acquire)
+            || pigeonhole_io::sys::process_id() != self.claimed_in
     }
 
     /// Gives the slot up without freeing it: releases its liveness lock now, and from then on
@@ -1114,6 +1132,10 @@ impl ReaderSlot {
         if self.abandoned.swap(true, Ordering::AcqRel) {
             return;
         }
+        // A forked child's copy releases nothing: the byte is the parent's.
+        if pigeonhole_io::sys::process_id() != self.claimed_in {
+            return;
+        }
         if let Some(file) = &self.lock {
             let _ = file.unlock(READER_LOCK_BASE + u64::from(self.index));
         }
@@ -1126,6 +1148,7 @@ impl ReaderSlot {
             index: self.index,
             owner: self.owner,
             abandoned: Arc::clone(&self.abandoned),
+            claimed_in: self.claimed_in,
         }
     }
 
@@ -1158,6 +1181,11 @@ impl ReaderSlot {
     fn pin_from(&self, seqno: Seqno, view_version: u64, durable: bool) -> (Seqno, u64) {
         let inner = &self.region;
         let mut pair = (seqno, view_version);
+        // An inert handle pins nothing ([`ReaderSlot::is_owned`] is false: its owner claims
+        // a fresh slot before pinning).
+        if self.inert() {
+            return pair;
+        }
         loop {
             inner
                 .slot64(self.index, reader_slot::PINNED_VIEW)
@@ -1184,7 +1212,7 @@ impl ReaderSlot {
     /// durable seqno it was frozen under, so nothing a snapshot at `seqno` reads has been
     /// collapsed yet.
     pub fn lower_pin(&self, seqno: Seqno) {
-        if self.abandoned.load(Ordering::Acquire) {
+        if self.inert() {
             return;
         }
         self.region
@@ -1196,7 +1224,7 @@ impl ReaderSlot {
     /// reader's oldest snapshot was dropped, so what it pinned for that snapshot alone may be
     /// reclaimed. Only ever raises: a field already at or above its new value stays.
     pub fn raise_pin(&self, seqno: Seqno, view_version: u64) {
-        if self.abandoned.load(Ordering::Acquire) {
+        if self.inert() {
             return;
         }
         self.region
@@ -1207,10 +1235,10 @@ impl ReaderSlot {
             .fetch_max(view_version, Ordering::SeqCst);
     }
 
-    /// Clears the pin (nothing once abandoned, as for [`ReaderSlot::lower_pin`] and
-    /// [`ReaderSlot::raise_pin`]).
+    /// Clears the pin (nothing once abandoned or in a forked child, as for
+    /// [`ReaderSlot::lower_pin`] and [`ReaderSlot::raise_pin`]).
     pub fn unpin(&self) {
-        if self.abandoned.load(Ordering::Acquire) {
+        if self.inert() {
             return;
         }
         self.region
@@ -1224,7 +1252,7 @@ impl ReaderSlot {
 
 impl Drop for ReaderSlot {
     fn drop(&mut self) {
-        if self.abandoned.load(Ordering::Acquire) {
+        if self.inert() {
             return;
         }
         self.region.release_slot(self.index, self.owner);

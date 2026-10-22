@@ -1284,6 +1284,16 @@ impl File for SimFile {
         })
     }
 
+    fn holds(&self, byte: u64) -> Option<LockMode> {
+        let st = self.vfs.state();
+        let node = st.nodes.get(&self.node)?;
+        node.locks
+            .get(&byte)?
+            .iter()
+            .find(|&&(h, _)| h == self.handle)
+            .map(|&(_, m)| m)
+    }
+
     fn identity(&self) -> Result<FileIdentity> {
         self.with(|_| {
             Ok(FileIdentity {

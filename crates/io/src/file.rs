@@ -124,6 +124,16 @@ pub trait File: Send + Sync + Debug {
     /// Releases this handle's lock on `byte` (a no-op if none is held).
     fn unlock(&self, byte: u64) -> Result<()>;
 
+    /// The lock this handle holds on `byte`, if any. Locks never conflict within one handle
+    /// (a second [`File::lock`] of a byte the handle holds succeeds), so a caller that would
+    /// release a byte after a failed step checks this first, to never drop a lock it held
+    /// before (reader slots, #693). The default reports none: a wrapper that forwards
+    /// [`File::lock`] must forward this too.
+    fn holds(&self, byte: u64) -> Option<LockMode> {
+        let _ = byte;
+        None
+    }
+
     /// Device and inode (file index on Windows), used to name the shared-memory region.
     fn identity(&self) -> Result<FileIdentity>;
 

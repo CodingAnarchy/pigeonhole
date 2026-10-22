@@ -574,3 +574,69 @@ fn concurrent_reader_processes_claim_distinct_slots_until_exhausted() {
         r.quit();
     }
 }
+
+/// perf287's review of #898, S1: a forked child inherits a copy of the reader's slot handle
+/// (and on Linux the same open file description, so the slot's OFD lock). Dropping that copy
+/// in the child frees nothing, clears no pin and releases no lock: the parent's slot stays
+/// claimed, pinned and locked.
+#[cfg(unix)]
+#[test]
+fn a_forked_child_dropping_the_slot_leaves_the_parents_alone() {
+    use pigeonhole_format::superblock::READER_LOCK_BASE;
+    use pigeonhole_io::LockMode;
+    let db = Db::new("fork");
+    let wfile = db.open();
+    let (_lock, _presence, shm) = db.open_writer(&wfile);
+    shm.publish_view(&view(1, 1, 4)).unwrap();
+
+    let rfile = db.open();
+    let reader = ShmRegion::open(
+        &db.vfs,
+        &rfile,
+        db.identity,
+        DB_ID,
+        Role::Reader,
+        &small_config(),
+    )
+    .unwrap();
+    let slot = reader
+        .claim_reader_slot_locked(db.vfs.current_process(), &rfile)
+        .unwrap();
+    assert_eq!(slot.pin(5, 1), (5, 1));
+    let byte = READER_LOCK_BASE + u64::from(slot.index());
+
+    // SAFETY: the child only drops the slot handle (atomic loads and a compare, then
+    // nothing, if the guard holds) and exits without running the parent's destructors.
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        let owned = slot.is_owned();
+        drop(slot);
+        // SAFETY: `_exit` ends the child at once.
+        unsafe { libc::_exit(if owned { 1 } else { 0 }) };
+    }
+    let mut status = 0;
+    // SAFETY: waits for the child forked above.
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+
+    assert!(slot.is_owned(), "the child's drop freed the parent's slot");
+    assert_eq!(
+        shm.oldest_reader_pin(),
+        Some((5, 1)),
+        "the child's drop cleared the pin"
+    );
+    assert_eq!(
+        shm.reclaim_dead_slots_locked(&wfile),
+        0,
+        "the child's drop released the parent's lock"
+    );
+    let probe = db.open();
+    assert!(probe.lock(byte, LockMode::Exclusive).is_err());
+    assert!(
+        libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+        "the child saw the parent's slot as its own (status {status})"
+    );
+    drop(slot);
+    assert_eq!(shm.reader_slot_usage().0, 0);
+    assert!(probe.lock(byte, LockMode::Exclusive).is_ok());
+}

@@ -19,6 +19,9 @@ pigeonhole-format = { workspace = true }
 proptest = { workspace = true }
 criterion = { workspace = true }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = { workspace = true }
+
 [[bench]]
 name = "shm"
 harness = false

@@ -347,6 +347,31 @@ struct ReaderState {
     view: Mutex<Option<Arc<View>>>,
     shards: usize,
     registry: Arc<MergeRegistry>,
+    /// The process that opened the reader ([`pigeonhole_io::sys::process_id`]): `claim_slot`
+    /// checks its handle only there, not in a forked child.
+    opened_in: u32,
+}
+
+/// Claims a reader slot through `file`, its liveness lock taken through that handle (#693
+/// PR 3). The reader abandons its previous slot before every re-claim, so `file` holds no
+/// slot's liveness byte here: the claim would skip such a byte, costing a slot (perf287's
+/// review of #898, S2). Not checked in a forked child, whose copy of the handle still
+/// records the parent's byte.
+fn claim_slot(
+    shm: &ShmRegion,
+    process: pigeonhole_io::ProcessId,
+    file: &FileRef,
+    opened_in: u32,
+) -> std::result::Result<pigeonhole_shm::ReaderSlot, pigeonhole_shm::Error> {
+    debug_assert!(
+        pigeonhole_io::sys::process_id() != opened_in
+            || (0..u64::from(shm.reader_slot_usage().1)).all(|i| {
+                file.holds(pigeonhole_format::superblock::READER_LOCK_BASE + i)
+                    .is_none()
+            }),
+        "a reader claims a slot through a handle that holds another slot's liveness byte"
+    );
+    shm.claim_reader_slot_locked(process, file)
 }
 
 /// A reader process's attachment to one region generation.
@@ -1491,7 +1516,8 @@ impl Engine {
         shm_config.dir = options.shm_dir.clone();
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Reader, &shm_config)?;
         let shards = shm.shard_count() as usize;
-        let slot = shm.claim_reader_slot_locked(vfs.current_process(), &file)?;
+        let opened_in = pigeonhole_io::sys::process_id();
+        let slot = claim_slot(&shm, vfs.current_process(), &file, opened_in)?;
         let (catalog, _) = manifest::load(&opened, shards, Arc::clone(&registry))?;
         let manifest_version = opened.root().manifest_version;
         let manifest_file = opened.file().clone();
@@ -1595,6 +1621,7 @@ impl Engine {
             view: Mutex::new(None),
             shards,
             registry,
+            opened_in,
         };
         let inner = Arc::new(Inner {
             // A reader commits nothing; one handle keeps `shard_ref` total.
@@ -4002,8 +4029,12 @@ impl Inner {
                 // The old slot's liveness byte is on this same file handle: give it up before
                 // claiming in the new generation (`ReaderSlot::abandon`).
                 a.pins.abandon();
-                let slot =
-                    shm.claim_reader_slot_locked(self.shared.vfs.current_process(), &r.file)?;
+                let slot = claim_slot(
+                    &shm,
+                    self.shared.vfs.current_process(),
+                    &r.file,
+                    r.opened_in,
+                )?;
                 // Snapshots of the old generation leave the abandoned slot alone: they can no
                 // longer be read, so they must not hold this generation's pin back.
                 *a = Attachment {
@@ -4020,10 +4051,12 @@ impl Inner {
                 // the snapshots fail as expired and pinning there could overwrite another
                 // reader's pins: abandon it and claim a fresh slot.
                 a.pins.abandon();
-                a.pins = crate::snapshot::ReaderPins::new(
-                    a.shm
-                        .claim_reader_slot_locked(self.shared.vfs.current_process(), &r.file)?,
-                );
+                a.pins = crate::snapshot::ReaderPins::new(claim_slot(
+                    &a.shm,
+                    self.shared.vfs.current_process(),
+                    &r.file,
+                    r.opened_in,
+                )?);
             }
             // The slot pins exactly what this reader's live snapshots need: this one's seqno
             // and view join them here, before the view is read (#693 PR 2).

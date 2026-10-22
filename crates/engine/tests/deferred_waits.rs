@@ -264,6 +264,9 @@ impl pigeonhole_io::File for DevFile {
     fn unlock(&self, byte: u64) -> pigeonhole_io::Result<()> {
         self.inner.unlock(byte)
     }
+    fn holds(&self, byte: u64) -> Option<pigeonhole_io::LockMode> {
+        self.inner.holds(byte)
+    }
     fn identity(&self) -> pigeonhole_io::Result<pigeonhole_io::FileIdentity> {
         self.inner.identity()
     }
