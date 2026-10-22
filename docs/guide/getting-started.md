@@ -261,7 +261,7 @@ assert!(jobs.mutate(b"job:1").put("meta", b"state", b"done").commit_if(&is_w1)?.
 ```
 `Condition::Exists` and `Condition::Absent` test a column, `Condition::Value` its newest value. The condition and the mutation are on one row.
 
-For invariants across rows, a `Transaction` (P4, available now) reads, buffers writes and commits them atomically. It is optimistic: if a commit changed anything it read before it commits, `commit` fails with `ErrorCode::Conflict` and nothing is written, so retry the whole transaction.
+For invariants across rows, a `Transaction` (P4, available now) reads, buffers writes and commits them atomically. It is optimistic: if a commit changed anything it read before it commits, `commit` fails with `ErrorCode::Conflict` and nothing is written, so retry the whole transaction. A transaction that only reads never conflicts: all its reads come from one snapshot, and its commit returns at once.
 
 ```rust
 # use pigeonhole::*;

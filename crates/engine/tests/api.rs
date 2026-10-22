@@ -591,6 +591,54 @@ fn optimistic_transactions_abort_on_conflict() {
     db.close().unwrap();
 }
 
+#[test]
+fn a_write_free_transaction_commits_at_its_snapshot_and_never_conflicts() {
+    // #694 (ICR 0060): a transaction that only reads is serializable at its snapshot, so
+    // it commits without validation, a shard round or any I/O, even after a later commit
+    // changed every row it read.
+    let vfs = SimVfs::new(12);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.family("f").unwrap().id;
+    for row in [&b"a"[..], b"b"] {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, &t, "f", row, b"q", b"1");
+        db.commit(wb, Some(Durability::Sync)).unwrap();
+    }
+    for durability in [None, Some(Durability::Buffered), Some(Durability::Sync)] {
+        let mut txn = db.begin().unwrap();
+        let snapshot = txn.snapshot().seqno();
+        for row in [&b"a"[..], b"b"] {
+            assert!(txn.get(t.id, f, row, b"q").unwrap().is_some());
+        }
+        // Both rows change after the reads.
+        for row in [&b"a"[..], b"b"] {
+            let mut wb = WriteBatch::new();
+            put(&mut wb, &t, "f", row, b"q", b"2");
+            db.commit(wb, Some(Durability::Sync)).unwrap();
+        }
+        vfs.record_ops();
+        let info = txn.commit(durability).unwrap();
+        assert!(vfs.recorded_ops().is_empty(), "a write-free commit did I/O");
+        assert_eq!(info.seqno, snapshot);
+        assert_eq!(info.durability, Durability::None);
+    }
+    // The same through `submit`.
+    let mut txn = db.begin().unwrap();
+    let snapshot = txn.snapshot().seqno();
+    let _ = txn.get(t.id, f, b"a", b"q").unwrap();
+    let mut wb = WriteBatch::new();
+    put(&mut wb, &t, "f", b"a", b"q", b"3");
+    db.commit(wb, None).unwrap();
+    assert_eq!(txn.submit(None).unwrap().wait().unwrap().seqno, snapshot);
+    // After close, a write-free commit reports `Closed` like any other.
+    let txn = db.begin().unwrap();
+    db.close().unwrap();
+    assert!(matches!(txn.commit(None), Err(Error::Closed)));
+}
+
 // ---- catalog, limits, lifecycle ----
 
 #[test]
