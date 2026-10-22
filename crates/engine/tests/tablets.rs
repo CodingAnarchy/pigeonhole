@@ -698,6 +698,103 @@ fn skewed_shards_wait_when_every_cold_shard_is_claimed() {
     }
 }
 
+/// A packing move leaves a shard a skew change claimed alone (D270), as a skew change does
+/// (D224): with shard 0, the only active shard once light writes pack, claimed for 400 of
+/// its passes, shards 1-3 keep their tablets past the shrink to one active shard, and hand
+/// them over once the claim runs out. Packing moves claim nothing themselves, so the three
+/// then land together, as before.
+#[test]
+fn a_packing_move_waits_for_a_claimed_shard() {
+    let mut db = spread_and_busy(0.1, true);
+    assert!(db.engine.claim_shard(0, 400));
+    let mut written = 0;
+    let mut packed_k = None;
+    for pass in 0..390 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        if packed_k.is_none() && db.engine.pack_ks()[0] == Some(1) {
+            packed_k = Some(pass);
+        }
+        assert_eq!(
+            tablets_per_shard(&db, 4),
+            vec![1, 1, 1, 1],
+            "a tablet moved into the claimed shard at pass {pass}"
+        );
+    }
+    assert!(packed_k.is_some(), "the active shards never shrank to one");
+    let mut passes = 390;
+    while tablets_per_shard(&db, 4) != vec![4, 0, 0, 0] && passes < 600 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+    }
+    assert_eq!(
+        tablets_per_shard(&db, 4),
+        vec![4, 0, 0, 0],
+        "after {passes} passes (shrank at pass {packed_k:?})"
+    );
+    assert!(
+        passes <= 430,
+        "packed {passes} passes in, long after the claim ran out"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
+/// A skew change that waits on a compaction of its tablet claims no shard (D270): shard 0's
+/// one tablet is hot, so it would split into the cold shards, but it is compacting (#102).
+/// While it waits, no cold shard is claimed: a claim would hold every other shard's skew
+/// change off it for nothing. Once the compaction ends, the split claims and starts.
+#[test]
+fn a_change_that_waits_on_a_compaction_claims_no_shard() {
+    let shards = 4;
+    let mut db = open(shards, |o| {
+        o.balance_interval_nanos = u64::MAX;
+        o.balance_min_writes = 10;
+    });
+    let n = 4;
+    tablets_on(&mut db, n, |t| t as u16);
+    // `key` rows sort before `t01`: they are tablet 0's, on shard 0.
+    hold_a_compaction(&mut db);
+    let before = tablet_changes(&db.engine);
+    let mut written = 0;
+    for pass in 0..40 {
+        write_and_balance(&mut db, n, |t| if t == 0 { 40 } else { 2 }, &mut written);
+        assert_eq!(
+            tablet_changes(&db.engine),
+            before,
+            "a change at pass {pass}"
+        );
+        for s in 1..shards {
+            assert!(
+                !db.engine.shard_claimed(s),
+                "shard {s} claimed at pass {pass} by a change that waits"
+            );
+        }
+    }
+    db.engine.park_manifest_commits(false);
+    for _ in 0..1_000 {
+        db.step();
+    }
+    let mut passes = 0;
+    while tablet_changes(&db.engine) == before && passes < 100 {
+        write_and_balance(&mut db, n, |t| if t == 0 { 40 } else { 2 }, &mut written);
+        passes += 1;
+    }
+    assert_ne!(
+        tablet_changes(&db.engine),
+        before,
+        "the hot tablet never split after the compaction"
+    );
+    // And `hold_a_compaction`'s 20 rows.
+    assert_eq!(db.scan_rows().len() as u64, written + 20);
+    db.engine.close().unwrap();
+    for _ in 0..8 {
+        db.step();
+    }
+}
+
 /// A burst of skew shorter than the persistence (10 passes, D214) moves and splits nothing:
 /// before D214 one skewed pass split the hot shard's tablet over the others.
 #[test]

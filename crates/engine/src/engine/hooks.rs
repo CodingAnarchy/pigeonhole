@@ -805,6 +805,23 @@ impl Engine {
         Some((busy as f64 / 1e6, turn as f64 / 1e6))
     }
 
+    /// Claims shard `shard` as a skew change handing it load would (D224), for `passes` of
+    /// its balancer passes. False while another claim holds it. Test hook: D270's packing
+    /// moves leave a claimed shard alone.
+    #[doc(hidden)]
+    pub fn claim_shard(&self, shard: usize, passes: u64) -> bool {
+        let now = self.inner.shared.vfs.monotonic_nanos();
+        self.inner.shared.loads[shard].claim(passes, u64::MAX, now)
+    }
+
+    /// Whether a skew change's claim holds shard `shard` now (D224). Test hook: D270's
+    /// change that waits on a compaction claims nothing.
+    #[doc(hidden)]
+    pub fn shard_claimed(&self, shard: usize) -> bool {
+        let now = self.inner.shared.vfs.monotonic_nanos();
+        !self.inner.shared.loads[shard].claimable(now)
+    }
+
     /// The active shard count (`k`, D217's packing) each shard's balancer used at its last
     /// pass, by shard (`None` before its first pass). Test hook: every shard must use the same.
     #[doc(hidden)]
