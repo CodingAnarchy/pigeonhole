@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+- **A close no longer hangs when a voided purge guard refuses the flush of its in-place memtables** (#838). A close whose arena had no chunk left flushes its active memtables in place (#111); when that flush also carried a frozen memtable whose purge guard a delete had voided (#287), the manifest refused the whole flush and only the frozen memtables were queued again, so the in-place ones were never flushed, their log records stayed needed, and `close()` waited for ever (the shard idle, nothing to flush). The refused flush now re-queues them too, and an I/O error on such a flush counts as a failure (the close gives up, unclean) instead of a retry. Present since 0.2.0 (#315). Found by the public model check's recovery arm (#837).
+
 ## [0.2.3] - 2026-10-20
 A fix for a lost write under concurrent cross-shard and single-shard commits. **Upgrade recommended** for every 0.2.x user whose writes span shards. The file format is unchanged, and files written by 0.2.0 to 0.2.2 open as before. Every published crate moves to 0.2.3 together.
 
