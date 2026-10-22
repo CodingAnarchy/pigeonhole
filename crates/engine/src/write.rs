@@ -1100,7 +1100,7 @@ impl Txn {
     /// [`Engine::submit_async`](crate::Engine::submit_async): when it has to wait for room,
     /// the pending commit submits the transaction once admitted.
     pub fn submit_async(self, durability: Option<Durability>) -> crate::Result<PendingCommit> {
-        if self.batch.is_empty() {
+        if self.write_free().is_some() {
             return self.submission(durability).map(PendingCommit::from);
         }
         let mut charge = match self.engine.fast_admit(None, &self.batch) {
