@@ -4,7 +4,8 @@
 //! The protocol's shared state, with the orderings the engine uses:
 //! - the allocator (`Shared::clock`): `(next, h, decided)` under a lock;
 //! - each writer's pending watermark (shm): stored Release, first a lower bound read from
-//!   the allocator, then the reservation's first seqno, then `u64::MAX` once applied;
+//!   the mirror (never past the allocator's next seqno), then the reservation's first
+//!   seqno, then `u64::MAX` once applied;
 //! - the mirror (shm `NEXT_SEQNO`): `fetch_max(first + n, AcqRel)` after the reservation;
 //! - a reader's `visible_seqno`: `min(mirror, every pending) − 1`, each loaded Acquire.
 //!
@@ -34,7 +35,7 @@ struct Shared {
 /// Writer `i`: one reservation (a group of one when `!decision`, else a decision), stamped
 /// at clock `now`, then applied.
 fn write(sh: &Shared, i: usize, decision: bool, now: u64) {
-    let lb = sh.clock.lock().unwrap().next;
+    let lb = sh.mirror.load(Ordering::Acquire);
     sh.pending[i].store(lb, Ordering::Release);
     let (s, t) = {
         let mut c = sh.clock.lock().unwrap();
