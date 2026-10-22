@@ -4085,9 +4085,14 @@ impl ShardState {
                     .faults
                     .take(crate::engine::hooks::Fault::NextFreezeStarved);
             let fresh = if reserved {
+                // `reserved` is often 0 here: the arena is simply full (#845).
                 trace!(
-                    "shard {} freeze {:?}: the arena's free chunks are reserved",
-                    self.id.0, key
+                    "shard {} freeze {:?}: no chunk for a fresh memtable: free {} < reserved {} + chunk {}",
+                    self.id.0,
+                    key,
+                    self.arena.free_bytes(),
+                    self.reserved,
+                    self.chunk_size
                 );
                 None
             } else {
@@ -8792,13 +8797,14 @@ impl ShardState {
             let oldest = self.oldest_unflushed();
             trace!(
                 "  shard {} close slots: oldest_unflushed={oldest:?} moving={:?} unpin={:?} \
-                 to_freeze={:?} retired={} free={}",
+                 to_freeze={:?} retired={} free={} reserved={}",
                 self.id.0,
                 self.moving,
                 self.unpin,
                 self.to_freeze,
                 self.retired.len(),
-                self.arena.free_bytes()
+                self.arena.free_bytes(),
+                self.reserved
             );
             self.shared.flushed_roots.read(|flushed| {
                 for (key, slot) in &self.memtables {
@@ -8840,6 +8846,16 @@ impl ShardState {
             );
         }
         if self.close_stage == CloseStage::Draining {
+            // Every admitted member applied or was settled, each releasing its room; what
+            // stays reserved is the undecided shares' (a share prepared for a coordinator
+            // that died keeps its room, its outcome the WAL's: D83, D116), which the close
+            // leaves listed once a shard died (#845, perf287's review of #857).
+            debug_assert_eq!(
+                self.reserved,
+                self.prepared.values().map(|s| s.reserved).sum::<usize>(),
+                "shard {}: room reserved beyond the undecided shares after the queue drained",
+                self.id.0
+            );
             self.close_stage = CloseStage::Flushing;
             // Abandon the stalls: nothing is admitted any more (issue #88).
             self.stall.score = 0.0;
