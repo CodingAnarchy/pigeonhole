@@ -67,6 +67,61 @@ const STALL_CAPACITY: f64 = 8.0;
 /// shares ahead of a single that starts waiting on the row. In the app-owned row's local
 /// A/B (#816) 8 and 32 measured alike.
 const CHAIN_CAP: u32 = 8;
+
+/// SCRATCH (global clock, #854): the writer-process (S, H) pair.
+static GCLOCK: portable_atomic::AtomicU128 = portable_atomic::AtomicU128::new(0);
+
+/// SCRATCH: one CAS on GCLOCK: inline `lock cmpxchg16b` on x86-64 when the CPU has it
+/// (detected once), `portable-atomic` otherwise. `Err` carries the current value.
+#[inline(always)]
+#[allow(unsafe_code)]
+fn gclock_cas(old: u128, new: u128) -> std::result::Result<(), u128> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static CX16: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+        let mut f = CX16.load(Ordering::Relaxed);
+        if f == 0 {
+            f = if std::arch::is_x86_feature_detected!("cmpxchg16b") { 1 } else { 2 };
+            CX16.store(f, Ordering::Relaxed);
+        }
+        if f == 1 {
+            let (mut lo, mut hi) = (old as u64, (old >> 64) as u64);
+            let ok: u8;
+            // SAFETY: GCLOCK is 16-byte aligned and only accessed atomically; the CPU has
+            // cmpxchg16b; rbx is saved and restored around it (LLVM reserves it).
+            unsafe {
+                std::arch::asm!(
+                    "xchg {t}, rbx",
+                    "lock cmpxchg16b xmmword ptr [{p}]",
+                    "sete {ok}",
+                    "mov rbx, {t}",
+                    p = in(reg) GCLOCK.as_ptr(),
+                    t = inout(reg) new as u64 => _,
+                    ok = out(reg_byte) ok,
+                    inout("rax") lo,
+                    inout("rdx") hi,
+                    in("rcx") (new >> 64) as u64,
+                    options(nostack),
+                );
+            }
+            return if ok != 0 { Ok(()) } else { Err((u128::from(hi) << 64) | u128::from(lo)) };
+        }
+    }
+    GCLOCK
+        .compare_exchange(old, new, Ordering::AcqRel, Ordering::Acquire)
+        .map(|_| ())
+}
+
+/// SCRATCH: H's top bit: the last reservation was a cross-shard decision (#854's flag fix).
+const DECIDED: u64 = 1 << 63;
+/// SCRATCH: counting build (`GC_COUNT=1` at compile time).
+const GC_COUNT: bool = option_env!("GC_COUNT").is_some();
+/// SCRATCH counters: groups reserved, flag fixes fired, decisions reserved.
+pub(crate) static GC_STATS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
 /// Bytes a logged record counts for on top of its payload (framing and record header),
 /// for the WAL pin limit (#137).
 const LOGGED_OVERHEAD: u64 = 64;
@@ -2658,7 +2713,11 @@ pub(crate) struct ShardState {
     dedup: Dedup,
     /// The row hashes of the member `reserve_room` sized last, for `touch_rows`.
     admit_rows: Vec<u64>,
-    touched: FastSet<u64>,
+    touched: FastMap<u64, u32>,
+    /// SCRATCH: this shard's last seen (S, H) pair, the CAS's first guess.
+    gclock_seen: u128,
+    /// SCRATCH: the group's largest rank + 1 (k).
+    group_k: u32,
     /// Rows of members this group held back for the next one (`run_group`).
     held_rows: FastSet<u64>,
     /// Slots the last `apply` wrote (deduplicated).
@@ -3073,7 +3132,9 @@ impl ShardState {
             key_buf: Vec::new(),
             dedup: Dedup::default(),
             admit_rows: Vec::new(),
-            touched: FastSet::default(),
+            touched: FastMap::default(),
+            group_k: 1,
+            gclock_seen: 0,
             held_rows: FastSet::default(),
             touched_slots: Vec::new(),
             closing: false,
@@ -4688,6 +4749,48 @@ impl ShardState {
         first
     }
 
+    /// SCRATCH (global clock, #854 variant B): `n` seqnos and a base stamp from the
+    /// writer-process (S, H) pair; `k` distinct stamps T0 .. T0 + k - 1.
+    fn reserve_st(&mut self, n: u64, k: u64) -> (Seqno, Timestamp) {
+        let shm = &self.shared.shm;
+        let shard = u32::from(self.id.0);
+        // FORMAT §11.3 step 1: a lower bound at or below the S about to be reserved (the
+        // mirror lags the pair, so it is one).
+        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
+        let now = self.shared.vfs.now_micros();
+        let last = self.ts_floor;
+        let mut cur = self.gclock_seen;
+        let (first, t0) = loop {
+            let (s, hf) = ((cur >> 64) as u64, cur as u64);
+            let s = if s == 0 { shm.next_seqno() } else { s };
+            let (h, flag) = (hf & !DECIDED, hf >> 63);
+            let t0 = now.max(h + flag).max(last + 1);
+            let next = (u128::from(s + n) << 64) | u128::from(h.max(t0 + k - 1));
+            match gclock_cas(cur, next) {
+                Ok(()) => {
+                    self.gclock_seen = next;
+                    if GC_COUNT && flag == 1 && now.max(h).max(last + 1) == h {
+                        GC_STATS[1].fetch_add(1, Ordering::Relaxed);
+                    }
+                    break (s, t0);
+                }
+                Err(c) => cur = c,
+            }
+        };
+        let g = if GC_COUNT { GC_STATS[0].fetch_add(1, Ordering::Relaxed) + 1 } else { 1 };
+        if GC_COUNT && g % (1 << 20) == 0 {
+            eprintln!(
+                "GCLOCK groups {g} flag_fires {} decisions {}",
+                GC_STATS[1].load(Ordering::Relaxed),
+                GC_STATS[2].load(Ordering::Relaxed)
+            );
+        }
+        self.ts_floor = t0 + k - 1;
+        shm.publish_pending(shard, self.watermark().min(first));
+        shm.mirror_next_seqno(first + n);
+        (first, t0)
+    }
+
     fn default_ts(&mut self) -> Timestamp {
         let now = self.shared.vfs.now_micros();
         // Other shards' raises (a tablet handed to us, D11; a cross-shard commit's timestamp,
@@ -5314,6 +5417,7 @@ impl ShardState {
         let mut admitted = self.member_buf();
         admitted.reserve(members.len());
         self.touched.clear();
+        self.group_k = 1;
         self.held_rows.clear();
         // Once a member waits for room or a guarded flush's install, every later single
         // waits with it (the room wait's queue keeps submission order); two-phase-commit
@@ -5579,7 +5683,7 @@ impl ShardState {
                     }
                 }
             }
-            self.touch_rows(&m);
+            self.touch_rows(&mut m);
             if let MemberKind::Prepare { .. } = m.kind {
                 // D263: no timestamp yet (it is picked at the decision), so
                 // nothing to raise here (D244's (i)).
@@ -5642,26 +5746,23 @@ impl ShardState {
             .iter()
             .filter(|m| matches!(m.kind, MemberKind::Single))
             .count() as u64;
-        let first = (singles > 0).then(|| self.reserve(singles));
+        let k = u64::from(self.group_k);
+        let reserved = (singles > 0).then(|| self.reserve_st(singles, k));
+        let first = reserved.map(|(s, _)| s);
+        let t0 = reserved.map_or(0, |(_, t)| t);
         // One shard has no cross-shard commits or tablet moves: one test of a field on its
         // commit path. With more, the raises are folded in after this group's reservation, so
         // every single it stamps lands above any cross-shard commit reserved before it
         // (D245) and above the floor of a tablet handed to this shard (D11, D264).
-        let cross = self.cross && first.is_some();
-        if cross {
-            self.fold_raises();
-        }
         let mut next = first.unwrap_or(0);
         for m in &mut admitted {
             match m.kind {
                 MemberKind::Single => {
                     m.seqno = next;
                     next += 1;
-                    m.commit_ts = self.default_ts();
+                    m.commit_ts += t0;
                 }
-                MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {
-                    self.raise_ts_floor(m.commit_ts);
-                }
+                MemberKind::Prepare { .. } | MemberKind::CommitRecord { .. } => {}
             }
         }
 
@@ -6707,7 +6808,7 @@ impl ShardState {
         if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 let h = hash_row(r.table, &r.row);
-                same |= self.touched.contains(&h);
+                same |= self.touched.contains_key(&h);
                 pending |= self.pending_rows.contains_key(&h);
             }
         }
@@ -6716,7 +6817,7 @@ impl ShardState {
             pending |= self.pending_rows.contains_key(&h);
             // The row hash first: only a row an earlier member touched is looked at cell
             // by cell.
-            if !same && self.touched.contains(&h) {
+            if !same && self.touched.contains_key(&h) {
                 same = writes_cell(admitted, *table, row, predicate);
             }
         }
@@ -6766,11 +6867,37 @@ impl ShardState {
 
     /// Records `m`'s written rows as touched by this group.
     /// Uses the row hashes `reserve_room` left for `m`, which admission sizes just before.
-    fn touch_rows(&mut self, m: &Member) {
-        if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-            return;
+    fn touch_rows(&mut self, m: &mut Member) {
+        match m.kind {
+            MemberKind::CommitRecord { .. } => {}
+            MemberKind::Prepare { .. } => {
+                for h in &self.admit_rows {
+                    self.touched.entry(*h).or_insert(0);
+                }
+            }
+            MemberKind::Single => {
+                // SCRATCH (global clock, #854 §1.4): rank by row; carried in commit_ts.
+                let rank = if let [h] = self.admit_rows[..] {
+                    let c = self.touched.entry(h).or_insert(0);
+                    let r = *c;
+                    *c = r + 1;
+                    r
+                } else {
+                    let mut rank = 0;
+                    for h in &self.admit_rows {
+                        rank = rank.max(self.touched.get(h).copied().unwrap_or(0));
+                    }
+                    for h in &self.admit_rows {
+                        self.touched.insert(*h, rank + 1);
+                    }
+                    rank
+                };
+                if rank > 0 {
+                    self.group_k = self.group_k.max(rank + 1);
+                }
+                m.commit_ts = u64::from(rank);
+            }
         }
-        self.touched.extend(self.admit_rows.iter().copied());
     }
 
     /// Counts or releases the rows of a prepared share.
@@ -7219,23 +7346,32 @@ impl ShardState {
     fn decide_commit(&mut self, shards: &[ShardId], floors: Timestamp) -> (Seqno, Timestamp) {
         // The floors the participants reported with `Prepared`, taken on their own threads
         // after admitting and logging their shares, then the published ones.
-        let mut floor = floors;
-        for s in shards {
-            let i = usize::from(s.0);
-            let own_floor = self.shared.ts_floors[i].0.load(Ordering::Acquire);
-            let raised = self.shared.ts_raises[i].0.load(Ordering::Acquire);
-            floor = floor.max(own_floor).max(raised);
-        }
-        self.ts_floor = self.ts_floor.max(floor);
-        let commit_ts = self.default_ts();
-        for s in shards {
-            if *s != self.id {
-                self.shared.ts_raises[usize::from(s.0)]
-                    .0
-                    .fetch_max(commit_ts, Ordering::Release);
+        let _ = (shards, floors);
+        // SCRATCH (#854): (S, T_d) from the pair; T_d = max(now, H + 1), flag set.
+        let shm = &self.shared.shm;
+        let shard = u32::from(self.id.0);
+        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
+        let now = self.shared.vfs.now_micros();
+        let mut cur = self.gclock_seen;
+        let (apply_seqno, commit_ts) = loop {
+            let (s, hf) = ((cur >> 64) as u64, cur as u64);
+            let s = if s == 0 { shm.next_seqno() } else { s };
+            let h = hf & !DECIDED;
+            let t = now.max(h + 1);
+            let next = (u128::from(s + 1) << 64) | u128::from(t | DECIDED);
+            match gclock_cas(cur, next) {
+                Ok(()) => {
+                    self.gclock_seen = next;
+                    break (s, t);
+                }
+                Err(c) => cur = c,
             }
+        };
+        if GC_COUNT {
+            GC_STATS[2].fetch_add(1, Ordering::Relaxed);
         }
-        let apply_seqno = self.reserve(1);
+        shm.publish_pending(shard, self.watermark().min(apply_seqno));
+        shm.mirror_next_seqno(apply_seqno + 1);
         self.held.insert(apply_seqno);
         self.publish_watermark();
         (apply_seqno, commit_ts)

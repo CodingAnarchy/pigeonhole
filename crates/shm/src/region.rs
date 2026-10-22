@@ -757,6 +757,12 @@ impl ShmRegion {
 
     /// The next seqno [`ShmRegion::reserve_seqnos`] will hand out (acquire load). Step 1 of
     /// the protocol publishes this as the lower bound before reserving.
+    /// SCRATCH (global-clock cost, not for merge): the mirror of the writer's (S, H) pair.
+    pub fn mirror_next_seqno(&self, v: Seqno) {
+        self.inner.h64(header::NEXT_SEQNO).fetch_max(v, Ordering::Release);
+    }
+
+    /// The next seqno to reserve.
     pub fn next_seqno(&self) -> Seqno {
         self.inner.h64(header::NEXT_SEQNO).load(Ordering::Acquire)
     }

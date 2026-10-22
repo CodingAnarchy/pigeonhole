@@ -19,7 +19,7 @@
 //! move between shards when load is skewed; reads are never blocked by any of it.
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 mod admission;
 mod catalog;

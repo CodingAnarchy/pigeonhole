@@ -12,6 +12,7 @@ categories.workspace = true
 readme = "README.md"
 
 [dependencies]
+portable-atomic = "1"
 pigeonhole-format = { workspace = true }
 pigeonhole-io = { workspace = true }
 pigeonhole-pager = { workspace = true }
