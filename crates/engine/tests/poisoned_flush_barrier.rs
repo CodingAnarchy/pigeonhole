@@ -51,7 +51,7 @@ fn options(vfs: VfsRef) -> EngineOptions {
 ///    its barrier;
 /// 4. the close's flush of `f2` fails (the data file refuses writes), so the close is unclean.
 ///
-/// After a reopen, the `None` commit is there whole or not at all. With the barrier
+/// After a reopen, the `None` commit is absent: its record never reached the log. With the barrier
 /// answering `Ok` on the poisoned stream, the 96 cells of `f1` were there and the cell of
 /// `f2` was not: the SST and its `SetFlushed` had made a record durable in part that the
 /// log never held.
@@ -155,9 +155,10 @@ fn a_flush_on_a_poisoned_stream_does_not_make_an_unlogged_commit_durable_in_part
         .count();
     let in_f2 = engine.get(&snap, t.id, f2, b"row", b"q").unwrap().is_some();
     eprintln!("after the reopen: {in_f1} of 96 f1 cells, f2 {in_f2}");
+    // Its record never reached the log, so the commit is absent, not merely whole.
     assert!(
-        (in_f1 == 96 && in_f2) || (in_f1 == 0 && !in_f2),
-        "the None commit survived in part: {in_f1} of 96 f1 cells, f2 {in_f2}"
+        in_f1 == 0 && !in_f2,
+        "the None commit survived: {in_f1} of 96 f1 cells, f2 {in_f2}"
     );
     drop(snap);
     engine.close().unwrap();
