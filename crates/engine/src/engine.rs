@@ -1161,9 +1161,9 @@ impl Engine {
             applied_slots.insert((*stream, *seqno), (apply_seqno, per_shard));
         }
         let next = first_seqno(catalog.counters.seqno_ceiling, max_seqno);
-        // The allocator starts above every recovered seqno, and shm mirrors it (D271).
+        // The allocator starts above every recovered seqno, and shm mirrors it (D271); its
+        // timestamp is seeded once replay has raised the floors (below).
         shm.advance_next_seqno(next);
-        shared.clock.seed(shm.next_seqno());
 
         // 6. Streams. With the same layout as before, every stream's unflushed records are
         // logged on its shard for checkpointing. Otherwise (D20), or when replay already
@@ -1310,6 +1310,16 @@ impl Engine {
         for (i, s) in states.iter().enumerate() {
             shared.ts_floors[i].0.store(s.ts_floor(), Ordering::Release);
         }
+        // D271: the one allocator starts above every recovered seqno and at the largest of
+        // the clock, the manifest's floor and every replayed timestamp (§5).
+        let h = states
+            .iter()
+            .map(|s| s.ts_floor())
+            .max()
+            .unwrap_or(0)
+            .max(catalog.counters.ts_floor)
+            .max(shared.vfs.now_micros());
+        shared.clock.seed(shared.shm.next_seqno(), h);
 
         // 7. The first view: tablets, recovered memtables, the manifest version and its SSTs.
         let mems: Vec<Arc<ShardMems>> = states

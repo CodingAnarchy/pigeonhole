@@ -1,45 +1,155 @@
-//! The engine's one seqno allocator (D271): every seqno a writer reserves (a group's, a
-//! cross-shard commit's id, its decision's) comes from here, in the writer's process, and
-//! shm `NEXT_SEQNO` mirrors it (`ShmRegion::advance_next_seqno`, a `fetch_max` after each
-//! reservation) for reader processes.
+//! The engine's one seqno and default-timestamp allocator (D271). Every seqno a writer
+//! reserves (a group's, a cross-shard commit's id, its decision's) comes from here, in the
+//! writer's process, with the default timestamps that go with it, so a later seqno never
+//! carries an earlier default timestamp on any shard. shm `NEXT_SEQNO` mirrors the seqnos
+//! (`ShmRegion::advance_next_seqno`, a `fetch_max` after each reservation) for readers.
 //!
-//! D271's default timestamps come from the same reservation in a later step; this step only
-//! moves the seqnos.
+//! `H` is the largest default timestamp handed out; `F` says the last reservation was a
+//! cross-shard decision, so a group reserved in the same µs takes `H + 1` and cannot tie
+//! with the decision's cells (D271, the owner's ruling on the same-µs tie).
 
 use std::sync::{Mutex, PoisonError};
 
-use pigeonhole_format::Seqno;
+use pigeonhole_format::{Seqno, Timestamp};
 use pigeonhole_shm::ShmRegion;
 
-/// The next seqno to reserve, under one lock.
+#[derive(Debug, Default)]
+struct State {
+    /// The next seqno to reserve.
+    next: Seqno,
+    /// The largest default timestamp handed out.
+    h: Timestamp,
+    /// The next stamp must be strictly above `H`: the last reservation was a decision's, or a
+    /// tablet changed owner since.
+    decided: bool,
+}
+
+/// `(S, H, F)` under one lock.
 #[derive(Debug, Default)]
 pub(crate) struct Reservation {
-    next: Mutex<Seqno>,
+    state: Mutex<State>,
 }
 
 impl Reservation {
-    /// Starts at `next` (at open, once replay has raised shm `NEXT_SEQNO` past every
-    /// recovered seqno).
-    pub(crate) fn seed(&self, next: Seqno) {
-        *self.next.lock().unwrap_or_else(PoisonError::into_inner) = next;
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Starts at seqno `next` and timestamp `h` (at open: above every recovered seqno, and
+    /// at the largest of the clock, the manifest's floor and every replayed timestamp).
+    pub(crate) fn seed(&self, next: Seqno, h: Timestamp) {
+        let mut st = self.lock();
+        st.next = next;
+        st.h = h;
+        st.decided = false;
     }
 
     /// The next seqno to reserve: a lower bound for every later reservation (FORMAT §11.3's
     /// pending watermark), and the seqno ceiling the manifest records.
     pub(crate) fn next_seqno(&self) -> Seqno {
-        *self.next.lock().unwrap_or_else(PoisonError::into_inner)
+        self.lock().next
     }
 
-    /// Reserves `n` consecutive seqnos and returns the first, then raises the shm mirror past
-    /// them. The caller published its pending watermark first, no higher than the result.
-    pub(crate) fn reserve(&self, n: u64, shm: &ShmRegion) -> Seqno {
-        let first = {
-            let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
-            let first = *next;
-            *next += n;
-            first
+    /// The largest default timestamp handed out (the manifest's `ts_floor`).
+    pub(crate) fn last_ts(&self) -> Timestamp {
+        self.lock().h
+    }
+
+    /// A group's `n` seqnos and the first of `k` default timestamps (`T0 .. T0 + k`): `T0`
+    /// above `H` after a decision, and above this shard's own last stamp `last`, so a
+    /// shard's stamps strictly increase (D271 variant B).
+    pub(crate) fn reserve_group(
+        &self,
+        n: u64,
+        k: u64,
+        now: Timestamp,
+        last: Timestamp,
+        shm: &ShmRegion,
+    ) -> (Seqno, Timestamp) {
+        let (first, t0) = {
+            let mut st = self.lock();
+            let first = st.next;
+            st.next += n;
+            let t0 = now.max(st.h + u64::from(st.decided)).max(last + 1);
+            st.h = st.h.max(t0 + k.max(1) - 1);
+            st.decided = false;
+            (first, t0)
         };
         shm.advance_next_seqno(first + n);
+        (first, t0)
+    }
+
+    /// One seqno with no timestamp: a cross-shard commit's id (D263), never applied.
+    pub(crate) fn reserve_id(&self, shm: &ShmRegion) -> Seqno {
+        let first = {
+            let mut st = self.lock();
+            let first = st.next;
+            st.next += 1;
+            first
+        };
+        shm.advance_next_seqno(first + 1);
         first
+    }
+
+    /// A cross-shard decision's seqno and timestamp: strictly above every default timestamp
+    /// handed out before it.
+    pub(crate) fn reserve_decision(&self, now: Timestamp, shm: &ShmRegion) -> (Seqno, Timestamp) {
+        let (s, t) = {
+            let mut st = self.lock();
+            let s = st.next;
+            st.next += 1;
+            let t = now.max(st.h + 1);
+            st.h = t;
+            st.decided = true;
+            (s, t)
+        };
+        shm.advance_next_seqno(s + 1);
+        (s, t)
+    }
+
+    /// A tablet changes owner: the next stamp anywhere is strictly above every one handed out,
+    /// so above the old owner's last one on the tablet (D11's floor that travels with a
+    /// tablet), as after a decision.
+    pub(crate) fn raise(&self) {
+        self.lock().decided = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shm() -> ShmRegion {
+        let mut config = pigeonhole_shm::ShmConfig::new(1);
+        config.arena_bytes = 2 << 20;
+        ShmRegion::in_memory([7; 16], &config)
+    }
+
+    #[test]
+    fn default_timestamps_never_go_back_with_the_seqno() {
+        let (r, shm) = (Reservation::default(), shm());
+        r.seed(10, 100);
+        // Two shards' groups, a decision, and a group in the same µs after it.
+        let (s1, t1) = r.reserve_group(2, 2, 50, 0, &shm);
+        let (s2, t2) = r.reserve_group(1, 1, 50, 0, &shm);
+        let (s3, t3) = r.reserve_decision(50, &shm);
+        let (s4, t4) = r.reserve_group(1, 1, 50, 0, &shm);
+        assert_eq!((s1, s2, s3, s4), (10, 12, 13, 14));
+        // A group's k stamps are t1, t1 + 1; the next group may share H (another shard),
+        // the decision is strictly above, and the group after it strictly above that.
+        assert_eq!((t1, t2), (100, 101));
+        assert_eq!(t3, 102);
+        assert_eq!(t4, 103);
+        assert_eq!(shm.next_seqno(), 15);
+    }
+
+    #[test]
+    fn a_shard_never_repeats_its_own_stamp_and_the_clock_leads_when_ahead() {
+        let (r, shm) = (Reservation::default(), shm());
+        r.seed(1, 0);
+        let (_, a) = r.reserve_group(1, 1, 500, 0, &shm);
+        let (_, b) = r.reserve_group(1, 1, 500, a, &shm);
+        let (_, c) = r.reserve_group(1, 1, 900, b, &shm);
+        assert_eq!((a, b, c), (500, 501, 900));
     }
 }
