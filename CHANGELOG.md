@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-10-22
+One engine fix from `main` (#904). **Upgrade recommended** for every 0.3.x user: after an open with a different shard count, or one whose replay spilled, a crash before the next manifest commit could let later default-timestamp writes land below existing versions of a cell (a lost update). The file format and the shared-memory layout are unchanged; files written by 0.3.0 and 0.3.1 open as before, and 0.3.1 opens files written by 0.3.2.
+
 ### Fixed
 - **A reopen that flushes its replay keeps the timestamp floor above the replayed writes** (#904). An open with a different shard count, or one whose replay spilled to SSTs, flushes everything it replayed and checkpoints the WAL past it, but its manifest commit left the default-timestamp floor where it was. After a crash before the next manifest commit, the next open found nothing to replay and started its default timestamps from that lower floor, so with the clock behind the replayed writes' timestamps (it stepped back, or default timestamps had run ahead of it) a new default-timestamp write could land below an existing version of the same cell and stay hidden behind it: a lost update (#653's class). The floor now carries the replayed timestamps. Present since 0.2.0.
 
@@ -343,7 +346,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...v0.3.0
 [0.2.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...v0.2.3
