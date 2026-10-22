@@ -7416,3 +7416,83 @@ fn a_replayed_memtable_is_validated_whole() {
         "{r:?}"
     );
 }
+
+/// A counter table (D186's family kind) beside `t`, and its family.
+fn counter_table(db: &Db) -> (pigeonhole_format::TableId, pigeonhole_format::FamilyId) {
+    let counters = db
+        .engine
+        .create_table(
+            "ctr",
+            &[(
+                "c".into(),
+                FamilyOptions::default()
+                    .merge_operator("pigeonhole.i64_add")
+                    .kind(pigeonhole_format::manifest::FamilyKind::Counter),
+            )],
+        )
+        .expect("counter table");
+    (counters.id, counters.family("c").unwrap().id)
+}
+
+/// D273 (perf287's review): a counter family's `put_i64` and increments all carry D186's
+/// fixed timestamp, so their versions follow seqno order. An increment after a transaction's
+/// snapshot conflicts with its read of the counter.
+#[test]
+fn a_counter_increment_after_the_snapshot_conflicts() {
+    let mut db = open(1, |_| {});
+    let (ctr, c) = counter_table(&db);
+    let mut wb = WriteBatch::new();
+    wb.put(ctr, c, b"r", b"n", None, ValueRef::I64(100))
+        .unwrap();
+    db.commit(wb);
+    for _ in 0..20 {
+        let mut wb = WriteBatch::new();
+        wb.merge(ctr, c, b"r", b"n", ValueRef::I64(1)).unwrap();
+        db.commit(wb);
+    }
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    t.get(ctr, c, b"r", b"n").unwrap();
+    t.batch()
+        .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let mut wb = WriteBatch::new();
+    wb.merge(ctr, c, b"r", b"n", ValueRef::I64(1)).unwrap();
+    db.commit(wb);
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "an increment after the snapshot was missed: {r:?}"
+    );
+}
+
+/// D273's fallback in a counter family: a bucket increment (`merge_at`, an explicit
+/// timestamp) into an older bucket, after the snapshot, sits behind a newer bucket with a
+/// lower seqno. The counter memtable holds explicit timestamps, so it is walked whole and
+/// the increment conflicts.
+#[test]
+fn a_counter_bucket_increment_behind_a_newer_bucket_still_conflicts() {
+    let mut db = open(1, |_| {});
+    let (ctr, c) = counter_table(&db);
+    let mut wb = WriteBatch::new();
+    wb.merge_at(ctr, c, b"r", b"n", 200, ValueRef::I64(1))
+        .unwrap();
+    db.commit(wb);
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    t.get(ctr, c, b"r", b"n").unwrap();
+    t.batch()
+        .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let mut wb = WriteBatch::new();
+    wb.merge_at(ctr, c, b"r", b"n", 100, ValueRef::I64(1))
+        .unwrap();
+    db.commit(wb);
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "an older bucket's increment after the snapshot was missed: {r:?}"
+    );
+}
