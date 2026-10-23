@@ -875,12 +875,21 @@ extern "C" fn forked_child() {
     PROCESS_ID.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// The cached id: one load on the fast path; the first call (and the first in a forked
+/// child) takes [`process_id_slow`].
+#[inline]
 pub(crate) fn process_id() -> u32 {
-    use std::sync::atomic::Ordering;
-    let id = PROCESS_ID.load(Ordering::Relaxed);
+    let id = PROCESS_ID.load(std::sync::atomic::Ordering::Relaxed);
     if id != 0 {
         return id;
     }
+    process_id_slow()
+}
+
+#[cold]
+#[inline(never)]
+fn process_id_slow() -> u32 {
+    use std::sync::atomic::Ordering;
     static HANDLER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // SAFETY: registers a handler that only stores to a static atomic.
     let registered = *HANDLER

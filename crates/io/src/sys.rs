@@ -17,6 +17,9 @@ use crate::Result;
 /// a cached value that a forked child resets (a `pthread_atfork` child handler on Unix), so a
 /// child never sees its parent's id. Reader slots compare it with the id recorded at claim,
 /// on every pin store, to leave a forked child's copy of a reader's handle inert (#693).
+/// Inline: the fork checks on commit and read paths call it per operation (#919's
+/// callgrind run measured the out-of-line call).
+#[inline]
 pub fn process_id() -> u32 {
     crate::os::process_id()
 }
