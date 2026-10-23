@@ -5543,8 +5543,12 @@ impl ShardState {
                 }
             }
             let hop_prep = matches!(m.kind, MemberKind::Prepare { .. });
+            let remote_prep = matches!(m.kind, MemberKind::Prepare { coordinator } if coordinator != self.id);
             if hop_prep {
                 crate::hops::mark(m.seqno, crate::hops::PREP_GROUP);
+            }
+            if remote_prep {
+                crate::hops::vote(m.seqno, crate::hops::V_B_GROUP);
             }
             if let Some((snapshot, reads)) = m.validate.as_ref().map(|v| (&v.seqno, &v.reads)) {
                 let mut conflict = false;
@@ -5571,6 +5575,9 @@ impl ShardState {
             }
             if hop_prep {
                 crate::hops::mark(m.seqno, crate::hops::PREP_VALIDATED);
+            }
+            if remote_prep {
+                crate::hops::vote(m.seqno, crate::hops::V_B_VAL);
             }
             // A delete in a family whose memtable is being flushed under the guard (#287),
             // or a write below a running bottommost compaction's bound (#316), voids that
@@ -9236,6 +9243,11 @@ impl ShardState {
             }
             ShardMsg::Prepared { seqno, from, error } => {
                 crate::hops::mark(seqno, crate::hops::PREPARED_RECV);
+                if error.is_none() {
+                    // SCRATCH #914: the coordinator's own vote, or the remote's write done
+                    // (its Prepared received here; the hop is about the same either way).
+                    crate::hops::vote(seqno, if from == self.id { crate::hops::V_A_SELF } else { crate::hops::V_B_LOGGED });
+                }
                 self.on_prepared(seqno, from, error, ctx)
             }
             ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),

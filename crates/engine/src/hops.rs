@@ -49,6 +49,75 @@ static DONE: AtomicU64 = AtomicU64::new(0);
 /// SCRATCH: validation entries visited in memtables and in SSTs, and validations run.
 pub(crate) static VAL: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
+/// SCRATCH (#914 C1): when the coordinator's own share is prepared (its vote), and when
+/// the remote participant builds its group and finishes validating, per commit.
+pub(crate) const V_A_SELF: usize = 0;
+pub(crate) const V_B_GROUP: usize = 1;
+pub(crate) const V_B_VAL: usize = 2;
+pub(crate) const V_B_LOGGED: usize = 3;
+fn votes() -> &'static Mutex<HashMap<u64, [u64; 4]>> {
+    static M: OnceLock<Mutex<HashMap<u64, [u64; 4]>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+/// Vote-in-time counts against B's group build, B's validation end and B's write end,
+/// assuming a 1.8 µs A->B hop; then the sum of (vote arrival - B's group build), and n.
+static VOTE: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+static VOTE_LATE_HIST: [AtomicU64; 40] = [const { AtomicU64::new(0) }; 40];
+const HOP_NS: u64 = 1_800;
+
+pub(crate) fn vote(id: u64, ev: usize) {
+    if !enabled() || id % 4 != 0 {
+        return;
+    }
+    let t = now();
+    let mut m = votes().lock().unwrap();
+    let e = m.entry(id).or_insert([0; 4]);
+    if e[ev] == 0 {
+        e[ev] = t;
+    }
+}
+
+fn vote_finish(id: u64) {
+    let Some(v) = votes().lock().unwrap().remove(&id) else {
+        return;
+    };
+    if v.iter().any(|t| *t == 0) {
+        return;
+    }
+    let arrive = v[V_A_SELF] + HOP_NS;
+    for (i, ev) in [V_B_GROUP, V_B_VAL, V_B_LOGGED].into_iter().enumerate() {
+        if arrive <= v[ev] {
+            VOTE[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let late = arrive.saturating_sub(v[V_B_GROUP]);
+    let b = (64 - late.leading_zeros() as usize).min(39);
+    VOTE_LATE_HIST[b].fetch_add(1, Ordering::Relaxed);
+    VOTE[3].fetch_add(arrive.saturating_sub(v[V_B_GROUP]), Ordering::Relaxed);
+    VOTE[4].fetch_add(v[V_B_GROUP].saturating_sub(arrive), Ordering::Relaxed);
+    VOTE[5].fetch_add(1, Ordering::Relaxed);
+}
+
+fn vote_line() -> String {
+    let n = VOTE[5].load(Ordering::Relaxed).max(1);
+    let pct = |i: usize| VOTE[i].load(Ordering::Relaxed) as f64 * 100.0 / n as f64;
+    let mut late = String::new();
+    for b in 0..40 {
+        let c = VOTE_LATE_HIST[b].load(Ordering::Relaxed);
+        if c > 0 {
+            late += &format!(" <{}ns:{:.1}%", 1u64 << b, c as f64 * 100.0 / n as f64);
+        }
+    }
+    format!(
+        "VOTE n={n} in_time_vs_B_group={:.1}% vs_B_validated={:.1}% vs_B_logged={:.1}% mean_late_us={:.2} mean_early_us={:.2} late_hist:{late}",
+        pct(0),
+        pct(1),
+        pct(2),
+        VOTE[3].load(Ordering::Relaxed) as f64 / n as f64 / 1e3,
+        VOTE[4].load(Ordering::Relaxed) as f64 / n as f64 / 1e3,
+    )
+}
+
 pub(crate) fn enabled() -> bool {
     static E: OnceLock<bool> = OnceLock::new();
     *E.get_or_init(|| std::env::var_os("PH_HOPS").is_some())
@@ -70,6 +139,7 @@ pub(crate) fn drop_id(id: u64) {
     if !enabled() || id % 4 != 0 {
         return;
     }
+    votes().lock().unwrap().remove(&id);
     map().lock().unwrap().remove(&id);
 }
 
@@ -77,6 +147,7 @@ pub(crate) fn finish(id: u64) {
     if !enabled() || id % 4 != 0 {
         return;
     }
+    vote_finish(id);
     let Some(e) = map().lock().unwrap().remove(&id) else {
         return;
     };
@@ -109,5 +180,6 @@ pub(crate) fn finish(id: u64) {
             out += &format!(" | {} mean={mean:.1}us p99<{:.0}us", NAMES[i], p99 as f64 / 1e3);
         }
         eprintln!("{out}");
+        eprintln!("{}", vote_line());
     }
 }
