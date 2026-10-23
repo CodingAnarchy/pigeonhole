@@ -5,12 +5,17 @@
 
 use std::path::Path;
 
-use fjall::{Database, Keyspace, KeyspaceCreateOptions, PersistMode};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use fjall::{
+    Database, Keyspace, KeyspaceCreateOptions, OptimisticTxDatabase, OptimisticTxKeyspace,
+    OptimisticWriteTx, PersistMode, Readable,
+};
 
 use super::{
-    Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id, keys,
-    live_value, modified, now_micros, read_family, scan_rows, scan_rows_filtered,
-    transfer_balances,
+    Counted, MemoryBudget, Touched, durability, encode_value, family_id, keys, live_value,
+    modified, now_micros, read_family, scan_rows, scan_rows_filtered, transfer_balances,
 };
 use crate::workload::YCSB_FAMILY;
 use crate::{BenchOp, Client, Runner};
@@ -73,14 +78,20 @@ impl FjallRunner {
 
 #[derive(Clone)]
 struct Handle {
+    /// The transactional database's plain handle, for every non-transactional operation.
     db: Database,
     cells: Keyspace,
     mode: PersistMode,
     /// The counters workload's keyspace (D247): one `i64` (little-endian) per row,
-    /// incremented by a read-modify-write under the row's lock.
+    /// incremented by a read-modify-write in a transaction (fjall has no merge operator).
     counters: Keyspace,
-    /// Row locks for an atomic read-modify-write across clients.
-    locks: std::sync::Arc<RowLocks>,
+    /// fjall's optimistic transactions (D274): transfer, read-modify-write, counter
+    /// increments and row deletes run in one, retried on a conflict.
+    tx: OptimisticTxDatabase,
+    tx_cells: OptimisticTxKeyspace,
+    tx_counters: OptimisticTxKeyspace,
+    /// Transactions retried on a conflict.
+    conflicts: Arc<AtomicU64>,
 }
 
 impl Runner for FjallRunner {
@@ -91,24 +102,27 @@ impl Runner for FjallRunner {
     fn open(&mut self, dir: &Path) -> Result<(), String> {
         let e = |e: fjall::Error| e.to_string();
         let m = self.memory;
-        let db = Database::builder(dir.join("fjall"))
+        let tx = OptimisticTxDatabase::builder(dir.join("fjall"))
             .cache_size(m.cache)
             .open()
             .map_err(e)?;
-        let cells = db
+        let tx_cells = tx
             .keyspace("cells", || {
                 KeyspaceCreateOptions::default().max_memtable_size(m.write_buffer)
             })
             .map_err(e)?;
-        let counters = db
+        let tx_counters = tx
             .keyspace("counters", KeyspaceCreateOptions::default)
             .map_err(e)?;
         self.open = Some(Handle {
-            db,
-            cells,
-            counters,
+            db: tx.inner().clone(),
+            cells: tx_cells.inner().clone(),
+            counters: tx_counters.inner().clone(),
             mode: self.mode(self.sync && !self.load_buffered),
-            locks: std::sync::Arc::default(),
+            tx,
+            tx_cells,
+            tx_counters,
+            conflicts: Arc::default(),
         });
         Ok(())
     }
@@ -156,6 +170,10 @@ impl Runner for FjallRunner {
         Some(Box::new(self.open.clone()?))
     }
 
+    fn txn_conflicts(&self) -> Option<u64> {
+        Some(self.open.as_ref()?.conflicts.load(Ordering::Relaxed))
+    }
+
     fn describe(&self) -> String {
         format!(
             "{} bloom=default {}{}",
@@ -186,6 +204,25 @@ impl Client for Handle {
 }
 
 impl Handle {
+    /// Runs `body` in one of fjall's optimistic write transactions until it commits: a
+    /// conflict at commit counts and runs it again (D274).
+    fn in_tx(
+        &self,
+        mut body: impl FnMut(&mut OptimisticWriteTx) -> Result<Touched, String>,
+    ) -> Result<Touched, String> {
+        let e = |e: fjall::Error| e.to_string();
+        loop {
+            let mut tx = self.tx.write_tx().map_err(e)?.durability(Some(self.mode));
+            let t = body(&mut tx)?;
+            match tx.commit().map_err(e)? {
+                Ok(()) => return Ok(t),
+                Err(_conflict) => {
+                    self.conflicts.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+    }
+
     /// One atomic batch of cells of one row, all stamped `ts`.
     fn put(
         &self,
@@ -256,58 +293,72 @@ impl Handle {
                 batch.commit().map_err(e)?;
             }
             BenchOp::DeleteRow { row } => {
-                // No range delete: remove each of the row's keys in one batch, under its lock.
+                // No range delete: remove each of the row's keys in one transaction (D274).
                 let prefix = keys::row_prefix(row);
-                let _held = self.locks.lock(&prefix);
-                let mut batch = self.db.batch().durability(Some(self.mode));
-                for kv in self.cells.prefix(&prefix) {
-                    let key = kv.key().map_err(e)?;
-                    batch.remove(&self.cells, key);
-                }
-                batch.commit().map_err(e)?;
+                self.in_tx(|tx| {
+                    let keys: Vec<_> = tx
+                        .prefix(&self.tx_cells, &prefix)
+                        .map(|kv| kv.key())
+                        .collect::<Result<_, _>>()
+                        .map_err(e)?;
+                    for key in keys {
+                        tx.remove(&self.tx_cells, key);
+                    }
+                    Ok(Touched::default())
+                })?;
             }
             BenchOp::Transfer { from, to, amount } => {
-                // Both rows locked from the reads to the batch (D247).
+                // An optimistic transaction reading both balances, retried on a conflict
+                // (D274), as Pigeonhole's.
                 let f = family_id(YCSB_FAMILY)?;
                 let (ka, kb) = (keys::cell(from, f, b"bal"), keys::cell(to, f, b"bal"));
-                let _held = self.locks.lock_two(&ka, &kb);
-                let now = now_micros();
-                let a = self.cells.get(&ka).map_err(e)?;
-                let b = self.cells.get(&kb).map_err(e)?;
-                let va = a
-                    .as_deref()
-                    .map(|v| live_value(f, v, now))
-                    .transpose()?
-                    .flatten();
-                let vb = b
-                    .as_deref()
-                    .map(|v| live_value(f, v, now))
-                    .transpose()?
-                    .flatten();
-                for v in [va, vb].into_iter().flatten() {
-                    t.cell(v);
-                }
-                let (na, nb) = transfer_balances(va, vb, *amount);
-                let mut batch = self.db.batch().durability(Some(self.mode));
-                batch.insert(&self.cells, ka, encode_value(now, &na.to_le_bytes()));
-                batch.insert(&self.cells, kb, encode_value(now, &nb.to_le_bytes()));
-                batch.commit().map_err(e)?;
+                t = self.in_tx(|tx| {
+                    let mut t = Touched::default();
+                    let now = now_micros();
+                    let a = tx.get(&self.tx_cells, &ka).map_err(e)?;
+                    let b = tx.get(&self.tx_cells, &kb).map_err(e)?;
+                    let va = a
+                        .as_deref()
+                        .map(|v| live_value(f, v, now))
+                        .transpose()?
+                        .flatten();
+                    let vb = b
+                        .as_deref()
+                        .map(|v| live_value(f, v, now))
+                        .transpose()?
+                        .flatten();
+                    for v in [va, vb].into_iter().flatten() {
+                        t.cell(v);
+                    }
+                    let (na, nb) = transfer_balances(va, vb, *amount);
+                    tx.insert(
+                        &self.tx_cells,
+                        ka.clone(),
+                        encode_value(now, &na.to_le_bytes()),
+                    );
+                    tx.insert(
+                        &self.tx_cells,
+                        kb.clone(),
+                        encode_value(now, &nb.to_le_bytes()),
+                    );
+                    Ok(t)
+                })?;
             }
             BenchOp::Incr { row, delta } => {
-                let _held = self.locks.lock(row);
-                let n = self
-                    .counters
-                    .get(row)
-                    .map_err(e)?
-                    .and_then(|v| v.as_ref().try_into().ok().map(i64::from_le_bytes))
-                    .unwrap_or(0);
-                let mut batch = self.db.batch().durability(Some(self.mode));
-                batch.insert(
-                    &self.counters,
-                    row.as_slice(),
-                    n.wrapping_add(*delta).to_le_bytes(),
-                );
-                batch.commit().map_err(e)?;
+                // fjall has no merge operator: a read and a write in a transaction (D274).
+                self.in_tx(|tx| {
+                    let n = tx
+                        .get(&self.tx_counters, row)
+                        .map_err(e)?
+                        .and_then(|v| v.as_ref().try_into().ok().map(i64::from_le_bytes))
+                        .unwrap_or(0);
+                    tx.insert(
+                        &self.tx_counters,
+                        row.as_slice(),
+                        n.wrapping_add(*delta).to_le_bytes(),
+                    );
+                    Ok(Touched::default())
+                })?;
             }
             BenchOp::ReadCounter { row } => {
                 if let Some(v) = self.counters.get(row).map_err(e)? {
@@ -345,20 +396,22 @@ impl Handle {
             BenchOp::ReadModifyWrite { row, qualifier } => {
                 let key = keys::cell(row, family_id(YCSB_FAMILY)?, qualifier);
                 let f = family_id(YCSB_FAMILY)?;
-                // Atomic across clients: the read and the write under the row's lock.
-                let _held = self.locks.lock(&key);
-                let stored = self.cells.get(&key).map_err(e)?;
-                let old = match &stored {
-                    Some(v) => live_value(f, v, now_micros())?,
-                    None => None,
-                };
-                if let Some(v) = old {
-                    t.cell(v);
-                }
-                let new = encode_value(now_micros(), &modified(old));
-                let mut batch = self.db.batch().durability(Some(self.mode));
-                batch.insert(&self.cells, key, new);
-                batch.commit().map_err(e)?;
+                // Atomic across clients: the read and the write in one optimistic transaction,
+                // retried on a conflict (D274).
+                t = self.in_tx(|tx| {
+                    let mut t = Touched::default();
+                    let stored = tx.get(&self.tx_cells, &key).map_err(e)?;
+                    let old = match &stored {
+                        Some(v) => live_value(f, v, now_micros())?,
+                        None => None,
+                    };
+                    if let Some(v) = old {
+                        t.cell(v);
+                    }
+                    let new = encode_value(now_micros(), &modified(old));
+                    tx.insert(&self.tx_cells, key.clone(), new);
+                    Ok(t)
+                })?;
             }
         }
         Ok(t)

@@ -467,17 +467,26 @@ step_placement() {
 # (Pigeonhole Buffered, RocksDB's WAL unsynced, SQLite NORMAL), and `default`
 # (`Options::default()`'s GroupSync against the others fsyncing every write; every store
 # loads buffered and switches after the settle step). Judged within
-# 1.5x at each; cross-shard-contention also runs with tablet changes off (D246); transfer is
-# reported, not judged.
+# 1.5x at each; cross-shard-contention also runs with tablet changes off (D246). D274: the
+# transactional workloads (ycsb-f, transfer) are judged against RocksDB's optimistic
+# transactions (the `rocksdb` engine runs them on OptimisticTransactionDB), and also run
+# RocksDB's pessimistic TransactionDB (`rocksdb-txn`, reported beside them).
 contended_levels=(buffered default)
-contended_workloads=(ycsb-a ycsb-b ycsb-c ycsb-e ycsb-f sparse-wide time-series-ttl cross-shard-contention counters)
+contended_workloads=(ycsb-a ycsb-b ycsb-c ycsb-e ycsb-f sparse-wide time-series-ttl cross-shard-contention counters transfer)
 # Reported, not judged (owner: 45 s runs; the judged ones keep 60 s or more).
-contended_reported=(transfer sparse-wide-deletes adjacency-prefix time-series-range)
+contended_reported=(sparse-wide-deletes adjacency-prefix time-series-range)
+# The engines a contended workload runs on (D274: the transactional ones add rocksdb-txn).
+engines_for() {
+    case "$1" in
+    ycsb-f | transfer) echo pigeonhole,rocksdb,rocksdb-txn,sqlite ;;
+    *) echo pigeonhole,rocksdb,sqlite ;;
+    esac
+}
 step_contended() {
     local level w
     for level in "${contended_levels[@]}"; do
         for w in "${contended_workloads[@]}"; do
-            "$bench" "$w" --engine pigeonhole,rocksdb,sqlite --scale "$scale" --threads 16 \
+            "$bench" "$w" --engine "$(engines_for "$w")" --scale "$scale" --threads 16 \
                 --durability "$level" --ops "$contended_ops" --min-secs "$contended_secs" \
                 --max-secs "$contended_max_secs" \
                 --dir "$data/bench" --json "$results/contended-$level-$w.json" \

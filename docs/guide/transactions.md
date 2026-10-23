@@ -72,7 +72,7 @@ Transactions are **serializable over what they read with `get` and `get_row`**: 
 - **A transaction whose reads and writes all fall on one shard** commits like a single commit: one log record, no two-phase commit.
 - **One that spans shards** commits with two-phase commit: a PREPARE on each shard involved, including shards it only read from, then a decision. It costs about two commits' latency, and more at `Sync`.
 - **Conflicts cost a full retry.** `EngineMetrics::transactions`, `transaction_conflicts` and `transaction_retries` show the conflict rate and what retries cost. On a few hot rows, a high conflict rate means the work is serializing on them: split the hot rows, or use a counter family (`incr` is a blind write and doesn't conflict unless you also read the cell).
-- **Under heavy contention on the same rows, optimistic transactions are slower than a lock-based database** (the `transfer` benchmark, #708). There's no lock mode in 1.0 (D272).
+- **Under heavy contention on the same rows, every conflict costs a retry.** The `transfer` benchmark (#708) compares this with RocksDB's own transactions: its `OptimisticTransactionDB` is the judged baseline, and its pessimistic `TransactionDB` is reported beside it (D274). There's no lock mode in 1.0 (D272).
 
 ## Errors
 
