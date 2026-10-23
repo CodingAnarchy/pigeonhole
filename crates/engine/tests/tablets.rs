@@ -6176,6 +6176,109 @@ fn a_cross_shard_transaction_overlapping_an_undecided_share_retries_instead_of_c
     assert_eq!(db.get(b"a").map(|(_, v)| v), Some(b"t".to_vec()));
 }
 
+/// #693: a reader process sees a cross-shard commit that D249 retried (its PREPARE refused
+/// over an undecided share, then retried) only through the visible watermark, as writer
+/// snapshots do: whole once it committed, nothing of it before, and never one shard's half
+/// while the retry is under way.
+#[test]
+fn a_reader_process_sees_a_retried_cross_shard_commit_whole_or_not_at_all() {
+    let (mut db, low, high) = overlap_db();
+    let before = db.engine.metrics().cross_shard.refused_pending_overlap;
+    let writer = pigeonhole_io::Vfs::current_process(&*db.vfs);
+    let reader_process = pigeonhole_io::ProcessId {
+        pid: 6930,
+        start_time: 1,
+    };
+    db.vfs.enter_process(reader_process);
+    let mut ro = EngineOptions::new(db.vfs.clone());
+    ro.pin_threads = false;
+    let reader = Engine::open_reader(Path::new("/db/data.phdb"), ro).expect("open_reader");
+    db.vfs.enter_process(writer);
+    let (id, f) = (db.table.id, db.table.families[0].id);
+
+    // B writes `z` (on `high`) and `a` (on `low`), A writes `y` and `a`: both write `t`. A
+    // snapshot may see `z` as `t` only together with `a` as `t` (and A, which aborts, never
+    // makes `a` `t` alone).
+    let mut checks = 0u32;
+    let mut check = |db: &Db, at: &str| {
+        db.vfs.enter_process(reader_process);
+        let snap = reader.snapshot().expect("reader snapshot");
+        let read = |row: &[u8]| {
+            reader
+                .get(&snap, id, f, row, b"q")
+                .expect("reader get")
+                .map(|c| match c.value() {
+                    ValueRef::Bytes(v) => v.to_vec(),
+                    other => panic!("unexpected value {other:?}"),
+                })
+        };
+        let (z, a) = (read(b"z"), read(b"a"));
+        db.vfs.enter_process(writer);
+        assert_eq!(
+            z.as_deref() == Some(b"t".as_slice()),
+            a.as_deref() == Some(b"t".as_slice()),
+            "{at}: a reader saw part of a cross-shard commit: z {z:?}, a {a:?}"
+        );
+        checks += 1;
+    };
+
+    let a = overlap_txn(&db, &[b"y"], &[b"y", b"a"]);
+    db.put(b"y", b"y1");
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    check(&db, "A prepared on high");
+    let b = overlap_txn(&db, &[b"a"], &[b"z", b"a"]);
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    check(&db, "B prepared on high");
+    turn(&mut db, low);
+    check(&db, "low took A's PREPARE");
+    turn(&mut db, low);
+    check(&db, "low refused B's");
+    let (mut ra, mut rb) = (None, None);
+    for step in 0..200_000 {
+        if ra.is_none() {
+            ra = poll_commit(&mut pa);
+        }
+        if rb.is_none() {
+            rb = poll_commit(&mut pb);
+        }
+        if ra.is_some() && rb.is_some() {
+            break;
+        }
+        db.step();
+        check(&db, &format!("step {step}"));
+    }
+    let ra = ra.expect("A never resolved");
+    let rb = rb.expect("B never resolved");
+    assert!(
+        matches!(ra, Err(pigeonhole_engine::Error::Conflict)),
+        "A: {ra:?}"
+    );
+    rb.expect("B commits on its retry");
+    assert!(
+        db.engine.metrics().cross_shard.refused_pending_overlap > before,
+        "B was never refused over the overlap: no retry exercised"
+    );
+
+    // Once B is visible, a reader's new snapshot sees all of it.
+    db.step();
+    db.vfs.enter_process(reader_process);
+    let snap = reader.snapshot().expect("reader snapshot");
+    for row in [b"z", b"a"] {
+        let v = reader.get(&snap, id, f, row, b"q").expect("reader get");
+        assert!(
+            matches!(v.as_ref().map(|c| c.value()), Some(ValueRef::Bytes(b"t"))),
+            "the reader does not see B's write to {}",
+            String::from_utf8_lossy(row)
+        );
+    }
+    drop(snap);
+    drop(reader);
+    db.vfs.enter_process(writer);
+    assert!(checks > 4, "only {checks} reader checks ran");
+}
+
 #[test]
 fn a_cross_shard_transaction_still_conflicts_with_a_write_after_its_snapshot() {
     // D249: the same overlap, but A commits a write to `a` after B's snapshot. B's retry
