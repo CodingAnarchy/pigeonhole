@@ -134,6 +134,10 @@ pub enum Fault {
     /// As `NextRoomWait`, for the group's third member: two members are admitted first, so a
     /// group can wait for room with two singles on one row admitted, ranked 0 and 1 (#900).
     ThirdRoomWait = 6,
+    /// The next commit group's second append fails as an I/O error would, before anything of
+    /// that member reaches the stream's buffer; the first member is appended (and written and
+    /// synced if it is a `Sync` one). The shard poisons itself (#921, #925).
+    SecondAppend = 7,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).

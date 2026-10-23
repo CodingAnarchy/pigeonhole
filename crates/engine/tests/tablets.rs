@@ -8018,3 +8018,84 @@ fn a_counter_cell_read_conflicts_only_with_its_own_increments() {
         );
     }
 }
+
+// ---- #921 / #925: a failed shard's refusal is only for commits never appended ----
+
+/// A single on `row` (family `f`, qualifier `q`) at `durability`, submitted without driving.
+fn submit_put_at(db: &Db, row: &[u8], durability: Durability) -> pigeonhole_engine::PendingCommit {
+    let mut wb = WriteBatch::new();
+    wb.put(
+        db.table.id,
+        db.table.families[0].id,
+        row,
+        b"q",
+        None,
+        ValueRef::Bytes(b"v"),
+    )
+    .unwrap();
+    db.engine.submit(wb, Some(durability)).unwrap()
+}
+
+/// perf287's M1 on #925: a group's `Sync` member writes and syncs its record before a later
+/// member's append fails. Its commit landed, so it gets `OutcomeUnknown` (never
+/// `ShardFailed`, which a recovering caller would retry, applying it twice) and is there
+/// after a reopen; only the member never appended gets `ShardFailed`, and is not.
+#[test]
+fn a_synced_member_ahead_of_a_failed_append_is_outcome_unknown_and_recovers() {
+    let vfs = SimVfs::new(9251);
+    let mut db = open_on(&vfs, 1, |_| {});
+    db.engine
+        .inject(pigeonhole_engine::Fault::SecondAppend, true);
+    let mut synced = submit_put_at(&db, b"synced", Durability::Sync);
+    let mut refused = submit_put_at(&db, b"refused", Durability::Buffered);
+    let synced = poll_until(&mut db, &mut synced, 100_000).expect("resolved");
+    let refused = poll_until(&mut db, &mut refused, 100_000).expect("resolved");
+    assert!(
+        matches!(synced, Err(pigeonhole_engine::Error::OutcomeUnknown)),
+        "the synced member: {synced:?}"
+    );
+    assert!(
+        matches!(refused, Err(pigeonhole_engine::Error::ShardFailed)),
+        "the never-appended member: {refused:?}"
+    );
+    vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+    drop(db);
+    let db = open_on(&vfs, 1, |_| {});
+    assert!(db.get(b"synced").is_some(), "the synced record replays");
+    assert!(db.get(b"refused").is_none(), "nothing of the refused one");
+}
+
+/// perf287's M1 on #925: a cross-shard commit's COMMIT record appended ahead of a failing
+/// append in its coordinator's group: the record may be in the file and decides commit, so
+/// its client gets `OutcomeUnknown`; the single after it, never appended, `ShardFailed`.
+#[test]
+fn a_commit_record_ahead_of_a_failed_append_is_outcome_unknown() {
+    let mut db = open(2, |_| {});
+    tablets_on(&mut db, 2, |t| t as u16);
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut wb = WriteBatch::new();
+    for row in [tablet_row(0, 1), tablet_row(1, 1)] {
+        wb.put(id, f, &row, b"q", None, ValueRef::Bytes(b"x"))
+            .unwrap();
+    }
+    let mut cross = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    // The coordinator (shard 0, the first row's) sends the PREPAREs and logs its own; the
+    // participant logs its share and answers.
+    turn(&mut db, 0);
+    turn(&mut db, 1);
+    // A single queued behind the answer: the decision's COMMIT record and the single form
+    // the coordinator's next group, in that order.
+    let mut single = submit_put_at(&db, &tablet_row(0, 2), Durability::Buffered);
+    db.engine
+        .inject(pigeonhole_engine::Fault::SecondAppend, true);
+    let cross = poll_until(&mut db, &mut cross, 100_000).expect("resolved");
+    let single = poll_until(&mut db, &mut single, 100_000).expect("resolved");
+    assert!(
+        matches!(cross, Err(pigeonhole_engine::Error::OutcomeUnknown)),
+        "the commit whose COMMIT record was appended: {cross:?}"
+    );
+    assert!(
+        matches!(single, Err(pigeonhole_engine::Error::ShardFailed)),
+        "the never-appended single: {single:?}"
+    );
+}

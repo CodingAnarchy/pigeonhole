@@ -5307,7 +5307,10 @@ impl ShardState {
     /// Fails every member of a group that could not be logged. `written`: the failure came
     /// at or after the group's `write()`, which may have put some or all of its records in
     /// the file, so the next open may replay them: `OutcomeUnknown` (ICR 0038, ICR 0040).
-    /// Otherwise nothing reached the file: the poison error, not committed.
+    /// Otherwise it is decided per member: one appended (it has a ticket) may be in the file
+    /// all the same (a `Sync` member's write and sync, a rollover's write of the buffer, an
+    /// earlier COMMIT record), so `OutcomeUnknown`; only one never appended is
+    /// `ShardFailed`, not committed (#921, perf287's review of #925).
     fn fail_all(
         &mut self,
         members: Vec<Member>,
@@ -5316,7 +5319,7 @@ impl ShardState {
     ) {
         for mut m in members {
             if m.failed.is_none() {
-                m.failed = Some(if written {
+                m.failed = Some(if written || m.ticket.is_some() {
                     Error::OutcomeUnknown
                 } else {
                     Error::ShardFailed
@@ -5890,6 +5893,8 @@ impl ShardState {
         let mut buffered_end: Option<Lsn> = None;
         // The end of the group's last written record (any level but `None`), for D227.
         let mut group_end: Option<Lsn> = None;
+        #[cfg(feature = "test-hooks")]
+        let mut appends = 0usize;
         for m in &mut group.members {
             if m.failed.is_some() {
                 continue;
@@ -5905,7 +5910,26 @@ impl ShardState {
                     continue;
                 }
             };
-            let result = wal.append(&record, m.durability);
+            #[cfg(feature = "test-hooks")]
+            let inject = {
+                appends += 1;
+                appends == 2
+                    && self
+                        .shared
+                        .hooks
+                        .faults
+                        .take(crate::engine::hooks::Fault::SecondAppend)
+            };
+            #[cfg(not(feature = "test-hooks"))]
+            let inject = false;
+            let result = if inject {
+                Err(pigeonhole_wal::Error::Io(pigeonhole_io::Error::new(
+                    ErrorKind::Other,
+                    "injected append failure (Fault::SecondAppend)",
+                )))
+            } else {
+                wal.append(&record, m.durability)
+            };
             // The commit point of a value separated at commit time: a record the stream
             // accepted (even one whose write then fails: it may have landed) may be applied
             // or replayed, so its blob files must stay (#230).
@@ -5981,7 +6005,8 @@ impl ShardState {
                 Err(e) => {
                     trace!("shard {} append failed: {e}", self.id.0);
                     self.poison(crate::health::FailureCause::Io);
-                    // Nothing of the group was written: the stream is poisoned before it.
+                    // This member was never appended; earlier ones were and may be in the
+                    // file (`fail_all` decides by ticket).
                     self.fail_all(group.members, false, ctx);
                     return;
                 }
