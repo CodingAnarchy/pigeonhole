@@ -1228,6 +1228,10 @@ pub struct Snapshot {
     pub(crate) _live: Option<Arc<LiveSnapshot>>,
     /// Writer process: the seqno stays in the live-snapshot list while any clone lives.
     pub(crate) _pin: Option<Arc<SeqnoPin>>,
+    /// The process that took it ([`pigeonhole_io::sys::process_id`]). A writer-process
+    /// snapshot read in a forked child fails with `Unsupported` (#901); a reader process's
+    /// fails with `SnapshotExpired` there (its slot is inert, #898).
+    pub(crate) taken_in: u32,
 }
 
 impl Snapshot {
@@ -1245,11 +1249,14 @@ impl Snapshot {
     /// was taken; call after a read through it (see `LiveSnapshot::check_current`). Always
     /// `Ok` in the writer process.
     /// Inline: every scan step calls it, and in the writer process it is one test of
-    /// `None` (the #834 callgrind job saw scans grow 2% when the reader's checks grew).
+    /// `None` plus the process compare (the #834 callgrind job saw scans grow 2% when the
+    /// reader's checks grew). A writer-process snapshot used in a forked child fails with
+    /// `Unsupported` (#901).
     #[inline]
     pub(crate) fn check_current(&self) -> Result<()> {
         match &self._live {
-            None => Ok(()),
+            None if pigeonhole_io::sys::process_id() == self.taken_in => Ok(()),
+            None => Err(crate::engine::forked()),
             Some(live) => live.check_current(),
         }
     }
@@ -1268,6 +1275,7 @@ impl Snapshot {
     #[cfg(feature = "test-hooks")]
     pub fn at_seqno(&self, seqno: Seqno) -> Snapshot {
         Snapshot {
+            taken_in: self.taken_in,
             seqno: seqno.min(self.seqno),
             view: Arc::clone(&self.view),
             _live: self._live.clone(),
