@@ -18,7 +18,9 @@ use crate::{CommitInfo, Durability, Error, ErrorCode, Pigeonhole, Result, Transa
 /// comes first, returning the last error.
 ///
 /// The defaults: no attempt cap, a 30 s deadline (the default write-stall timeout), pauses
-/// from 100 µs up to 100 ms, `Busy` not retried, the writer's default durability.
+/// from 5 µs up to 100 ms, `Busy` not retried, the writer's default durability. The 5 µs base
+/// is measured (#708): a pause of a few microseconds already spreads competing
+/// transactions out, and a larger base mostly lengthens the tail of those that keep losing.
 ///
 /// A plain value: numbers, durations and flags, no closure or trait object.
 /// [`Pigeonhole::transact`] is a Rust-only convenience (a closure and a generic error) over
@@ -53,7 +55,7 @@ impl Default for RetryPolicy {
         Self {
             max_attempts: None,
             deadline: Some(Duration::from_secs(30)),
-            base: Duration::from_micros(100),
+            base: Duration::from_micros(5),
             cap: Duration::from_millis(100),
             retry_busy: false,
             durability: None,
@@ -91,7 +93,7 @@ impl RetryPolicy {
     }
 
     /// The pause before the second attempt is drawn below `base`, and the bound doubles per
-    /// attempt up to `cap` (defaults 100 µs and 100 ms).
+    /// attempt up to `cap` (defaults 5 µs and 100 ms).
     pub fn backoff(mut self, base: Duration, cap: Duration) -> Self {
         self.base = base;
         self.cap = cap.max(base);
