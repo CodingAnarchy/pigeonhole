@@ -5374,13 +5374,16 @@ impl ShardState {
         // kicks the shard, so they need no kick of their own (D263).
         let mut share_waits = 0usize;
         for mut m in members.drain(..) {
-            if matches!(m.kind, MemberKind::Prepare { .. }) && !self.prepared.contains_key(&m.seqno)
-            {
-                // Decided (aborted after a wound, D267) before its group admitted it: never
-                // logged, nothing to answer.
-                self.release_room(m.reserved);
-                continue;
-            }
+            // A share is decided only once every participant answered its PREPARE, and a
+            // participant answers only once its group ran the member (logged or refused), so
+            // a PREPARE member's share is still here. An early decision came only from a
+            // wound, which went with D271 (#724 area 7).
+            debug_assert!(
+                !matches!(m.kind, MemberKind::Prepare { .. })
+                    || self.prepared.contains_key(&m.seqno),
+                "a PREPARE member {} whose share is gone",
+                m.seqno
+            );
             if cut && matches!(m.kind, MemberKind::Single) {
                 self.pending.push(m);
                 continue;
@@ -7312,14 +7315,13 @@ impl ShardState {
         let Some(c) = self.coord.get_mut(&seqno) else {
             return;
         };
-        if c.decided {
-            // An answer after a wound decided the attempt early (D267): ignored. The abort
-            // already told the participants whether it was the last attempt, and the retry
-            // must follow that; a late `Conflict` or `Moved` would change it (a commit that
-            // failed after its participants heard "not last" leaves its fences and the
-            // commits waiting behind it there for good).
-            return;
-        }
+        // Each participant answers once, and the decision waits for every answer, so no
+        // answer arrives after it. A late answer came only after a wound decided the attempt
+        // early, which went with D271 (#724 area 7).
+        debug_assert!(
+            !c.decided,
+            "a Prepared answer for {seqno} after its decision"
+        );
         match error {
             Some(PrepareError::Moved) => RetryWait::note(&mut c.refused, RetryWait::Tablets),
             // Not timestamp refusals: the retry waits for that participant's wake. Only the
@@ -7336,7 +7338,7 @@ impl ShardState {
             None => {}
         }
         c.prepared += 1;
-        if c.prepared < c.participants || c.decided {
+        if c.prepared < c.participants {
             return;
         }
         c.decided = true;
