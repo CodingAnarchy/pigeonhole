@@ -253,7 +253,7 @@ pub struct CrossShardMetrics {
     pub refused_pending_overlap: u64,
     /// Commits so refused that failed with `Conflict` without another round: the share they
     /// overlapped committed a write to a row they read, after their snapshot, so their retry
-    /// could only fail validation (D276, ICR 0066).
+    /// could only fail validation (D276, ICR 0066). Counted once per commit.
     pub failed_fast: u64,
     /// Singles held back behind an undecided cross-shard share (D263), once
     /// per group that held them.

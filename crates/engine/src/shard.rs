@@ -8878,6 +8878,9 @@ impl ShardState {
                     reply.notify(Err(Error::Closed));
                 }
             }
+            // No commit here retries now: a doom kept for one (D276) is moot, and a decided
+            // round still waiting ends `Closed` through the closing retry path.
+            self.doomed.clear();
         }
         if !self.unresolved.is_empty()
             || (!self.coord.is_empty() && !died)
@@ -9186,6 +9189,9 @@ impl ShardState {
                 }));
             }
         }
+        // Every coordinated commit is answered: no doom (D276) is left to act on. Panic-free
+        // (no allocation).
+        self.doomed.clear();
     }
 
     /// Commits inline on the shard's own thread (application-owned mode): the member joins

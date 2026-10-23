@@ -271,7 +271,8 @@ pub struct CrossShardMetrics {
     pub refused_pending_overlap: u64,
     /// Commits so refused that read a row the overlapping share then committed a write to,
     /// after their snapshot: they fail with [`Error::Conflict`] at once instead of retrying
-    /// into a validation failure (D276, ICR 0066). By coordinator, like `rounds`.
+    /// into a validation failure (D276, ICR 0066). Once per commit, by its coordinator,
+    /// however many participants found it doomed.
     pub failed_fast: u64,
     /// Singles held back behind an undecided share (D263), once per group
     /// that held them.
