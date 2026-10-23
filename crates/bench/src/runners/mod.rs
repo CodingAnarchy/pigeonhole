@@ -10,6 +10,8 @@ pub(crate) mod reader_process;
 pub(crate) mod fjall;
 #[cfg(feature = "rocksdb")]
 pub(crate) mod rocksdb;
+#[cfg(feature = "rocksdb")]
+pub(crate) mod rocksdb_txn;
 #[cfg(feature = "sqlite")]
 pub(crate) mod sqlite;
 
@@ -112,57 +114,6 @@ impl Touched {
 /// A runner whose operations report what they read.
 pub(crate) trait Counted {
     fn execute_counted(&mut self, op: &BenchOp) -> Result<Touched, String>;
-}
-
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
-/// Striped locks that make a key-value store's read-modify-write atomic across client
-/// threads (D247: ycsb-f runs at 16 threads; Pigeonhole uses `commit_if`, SQLite an
-/// immediate transaction). One lock per key hash stripe, held from the read to the write.
-#[derive(Debug)]
-pub(crate) struct RowLocks(Box<[std::sync::Mutex<()>]>);
-
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
-impl Default for RowLocks {
-    fn default() -> Self {
-        Self((0..1024).map(|_| std::sync::Mutex::new(())).collect())
-    }
-}
-
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
-impl RowLocks {
-    /// Holds the stripe of `key` until the guard drops.
-    pub(crate) fn lock(&self, key: &[u8]) -> std::sync::MutexGuard<'_, ()> {
-        self.hold(self.stripe(key))
-    }
-
-    /// Holds the stripes of two keys (one lock when they share a stripe), taken in stripe
-    /// order so two clients locking the same pair never deadlock.
-    pub(crate) fn lock_two(
-        &self,
-        a: &[u8],
-        b: &[u8],
-    ) -> (
-        std::sync::MutexGuard<'_, ()>,
-        Option<std::sync::MutexGuard<'_, ()>>,
-    ) {
-        let (i, j) = (self.stripe(a), self.stripe(b));
-        let (lo, hi) = (i.min(j), i.max(j));
-        let first = self.hold(lo);
-        (first, (hi != lo).then(|| self.hold(hi)))
-    }
-
-    fn stripe(&self, key: &[u8]) -> usize {
-        let h = key.iter().fold(0xCBF2_9CE4_8422_2325u64, |h, &b| {
-            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01B3)
-        });
-        (h % self.0.len() as u64) as usize
-    }
-
-    fn hold(&self, i: usize) -> std::sync::MutexGuard<'_, ()> {
-        self.0[i]
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
 }
 
 /// A transfer's new balances: `from` less `amount`, `to` plus it; a missing account reads
@@ -545,13 +496,99 @@ mod concurrent_rmw {
         // Each read-modify-write adds one to the first byte.
         let first = run.0.first_byte(b"hot", b"field0");
         assert_eq!(first, Some(((CLIENTS * EACH) % 256) as u8));
+        // D274: a lost `commit_if` race counts as a conflict.
+        assert!(run.0.txn_conflicts().unwrap() > 0, "8 clients on one cell");
         done(run);
     }
 
+    /// D274: ycsb-f's read-modify-write in a transaction (`pigeonhole-txn`) loses no update
+    /// and counts its conflicts.
+    #[test]
+    fn pigeonhole_transactions_lose_no_update() {
+        let run = hammer(
+            PigeonholeRunner::default()
+                .shards(2)
+                .rmw_in_transaction(true),
+            "ph-txn",
+        );
+        let first = run.0.first_byte(b"hot", b"field0");
+        assert_eq!(first, Some(((CLIENTS * EACH) % 256) as u8));
+        assert!(run.0.txn_conflicts().unwrap() > 0, "8 clients on one cell");
+        done(run);
+    }
+
+    /// D274: RocksDB's transactions, both kinds, lose no read-modify-write.
     #[cfg(feature = "rocksdb")]
     #[test]
-    fn rocksdb_runs_concurrent_rmw() {
-        done(hammer(crate::RocksDbRunner::default(), "rocksdb"));
+    fn rocksdb_transactions_lose_no_update() {
+        use crate::{RocksDbTxnRunner, TxnMode};
+        for (mode, tag) in [
+            (TxnMode::Optimistic, "rocksdb-otxn"),
+            (TxnMode::Pessimistic, "rocksdb-txn"),
+        ] {
+            let run = hammer(RocksDbTxnRunner::new(mode), tag);
+            let first = run
+                .0
+                .value(b"hot", b"field0")
+                .and_then(|v| v.first().copied());
+            assert_eq!(first, Some(((CLIENTS * EACH) % 256) as u8), "{tag}");
+            done(run);
+        }
+    }
+
+    /// D274: RocksDB's transfers keep the total under contention; the optimistic kind
+    /// counts its retried conflicts.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_transfers_keep_the_total() {
+        use crate::{RocksDbTxnRunner, TxnMode};
+        for (mode, tag) in [
+            (TxnMode::Optimistic, "rocksdb-otxn"),
+            (TxnMode::Pessimistic, "rocksdb-txn"),
+        ] {
+            let dir =
+                std::env::temp_dir().join(format!("phdb-bench-xfer-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut r = RocksDbTxnRunner::new(mode);
+            r.open(&dir).unwrap();
+            let account = |i: usize| format!("acct:{i}").into_bytes();
+            for i in 0..4 {
+                r.execute(&BenchOp::Put {
+                    row: account(i),
+                    family: YCSB_FAMILY,
+                    cells: vec![(b"bal".to_vec(), 100i64.to_le_bytes().to_vec())],
+                })
+                .unwrap();
+            }
+            let clients: Vec<_> = (0..CLIENTS).map(|_| r.client().unwrap()).collect();
+            std::thread::scope(|s| {
+                for (c, mut client) in clients.into_iter().enumerate() {
+                    s.spawn(move || {
+                        for k in 0..EACH {
+                            let from = (c + k) % 4;
+                            client
+                                .execute(&BenchOp::Transfer {
+                                    from: account(from),
+                                    to: account((from + 1 + k % 3) % 4),
+                                    amount: 1,
+                                })
+                                .unwrap();
+                        }
+                    });
+                }
+            });
+            let total: i64 = (0..4)
+                .map(|i| {
+                    let v = r.value(&account(i), b"bal").unwrap();
+                    i64::from_le_bytes(v.try_into().unwrap())
+                })
+                .sum();
+            assert_eq!(total, 400, "{tag}");
+            if mode == TxnMode::Optimistic {
+                assert!(r.txn_conflicts().unwrap() > 0, "4 hot accounts, 8 clients");
+            }
+            done((r, dir));
+        }
     }
 
     #[cfg(feature = "sqlite")]
@@ -609,9 +646,17 @@ mod agreement {
     }
 
     fn agree<R: Runner + Counted>(make: impl Fn() -> R, tag: &str) {
+        agree_on(make, tag, &WorkloadKind::EVERY);
+    }
+
+    /// The transactional workloads (D274): RocksDB runs them on its transactions.
+    #[cfg(feature = "rocksdb")]
+    const TRANSACTIONAL: [WorkloadKind; 2] = [WorkloadKind::YcsbF, WorkloadKind::Transfer];
+
+    fn agree_on<R: Runner + Counted>(make: impl Fn() -> R, tag: &str, kinds: &[WorkloadKind]) {
         // One "now" for both stores, so they place the same event times.
         let epoch = super::now_micros();
-        for kind in WorkloadKind::EVERY {
+        for &kind in kinds {
             let (want, want_misses) = trace(
                 PigeonholeRunner::default()
                     .shards(1)
@@ -648,7 +693,44 @@ mod agreement {
     #[cfg(feature = "rocksdb")]
     #[test]
     fn rocksdb_reads_what_pigeonhole_reads() {
-        agree(crate::RocksDbRunner::default, "rocksdb");
+        let plain: Vec<_> = WorkloadKind::EVERY
+            .into_iter()
+            .filter(|k| !TRANSACTIONAL.contains(k))
+            .collect();
+        agree_on(crate::RocksDbRunner::default, "rocksdb", &plain);
+    }
+
+    /// D274: ycsb-f through a Pigeonhole transaction reads what `commit_if`'s row reads.
+    #[test]
+    fn pigeonhole_transactions_read_what_pigeonhole_reads() {
+        agree_on(
+            || {
+                PigeonholeRunner::default()
+                    .shards(1)
+                    .memtable_budget(32 << 20)
+                    .rmw_in_transaction(true)
+            },
+            "pigeonhole-txn",
+            &[WorkloadKind::YcsbF],
+        );
+    }
+
+    /// D274: RocksDB's transactions, both kinds, read what Pigeonhole reads on the
+    /// transactional workloads.
+    #[cfg(feature = "rocksdb")]
+    #[test]
+    fn rocksdb_transactions_read_what_pigeonhole_reads() {
+        use crate::{RocksDbTxnRunner, TxnMode};
+        agree_on(
+            || RocksDbTxnRunner::new(TxnMode::Optimistic),
+            "rocksdb-otxn",
+            &TRANSACTIONAL,
+        );
+        agree_on(
+            || RocksDbTxnRunner::new(TxnMode::Pessimistic),
+            "rocksdb-txn",
+            &TRANSACTIONAL,
+        );
     }
 
     #[cfg(feature = "sqlite")]
