@@ -48,7 +48,8 @@ pub enum ErrorCode {
     /// An argument is invalid.
     InvalidArgument = 19,
     /// The feature is not available in this build, or the call is not supported here: a
-    /// reader used in a process forked from the one that opened it (#693, ICR 0065).
+    /// database or reader handle used in a process forked from the one that opened it
+    /// (#693, #901, ICR 0065, ICR 0067).
     Unsupported = 20,
     /// The database is closed, or a shard failed and the database now refuses every new
     /// commit (reads still work; reopen it). A commit that fails with it was not committed

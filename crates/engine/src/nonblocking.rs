@@ -123,6 +123,10 @@ impl Reading {
         cx: &mut Context<'_>,
         mut attempt: impl FnMut(&Arc<View>, Seqno, Timestamp, bool) -> Result<T>,
     ) -> Poll<Result<T>> {
+        // A forked child's copy of the engine reads nothing (#901).
+        if let Err(e) = self.inner.check_process() {
+            return Poll::Ready(Err(e));
+        }
         loop {
             if let Some((completion, fetch)) = &mut self.fetch {
                 let buf = match Pin::new(completion).poll(cx) {

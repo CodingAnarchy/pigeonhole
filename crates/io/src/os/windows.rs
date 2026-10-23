@@ -573,6 +573,7 @@ pub(crate) fn direct_align(_file: &fs::File) -> usize {
 
 /// The cached process id ([`crate::sys::process_id`]). Windows has no `fork`, so the id never
 /// changes under a running process.
+#[inline]
 pub(crate) fn process_id() -> u32 {
     static PROCESS_ID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *PROCESS_ID.get_or_init(std::process::id)

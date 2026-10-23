@@ -69,6 +69,9 @@ pub(crate) struct LargeValues {
     /// sweeps what nothing points into.
     shared: Weak<Shared>,
     files: Vec<BlobFileId>,
+    /// The process that created it: dropped in a forked child, it releases nothing (its
+    /// release would edit the parent's manifest, #901).
+    owner: u32,
 }
 
 impl std::fmt::Debug for LargeValues {
@@ -85,6 +88,7 @@ impl LargeValues {
         LargeValues {
             shared: Arc::downgrade(shared),
             files,
+            owner: pigeonhole_io::sys::process_id(),
         }
     }
 
@@ -145,6 +149,9 @@ impl LargeValues {
 
 impl Drop for LargeValues {
     fn drop(&mut self) {
+        if self.owner != pigeonhole_io::sys::process_id() {
+            return;
+        }
         self.release();
         if let Some(shared) = self.shared.upgrade() {
             shared.large_open.fetch_sub(1, Ordering::AcqRel);

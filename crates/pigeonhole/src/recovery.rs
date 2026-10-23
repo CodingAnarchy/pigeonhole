@@ -106,6 +106,9 @@ pub(crate) struct Supervision {
     /// it (#921).
     #[cfg(test)]
     pub(crate) test_hold: TestHold,
+    /// The process that created it ([`pigeonhole_io::sys::process_id`]). A forked child has
+    /// no supervisor thread: it waits for no recovery and joins nothing (#901).
+    started_in: u32,
 }
 
 /// Unit tests only: while `armed`, the supervisor, woken by a failure, starts its recovery
@@ -154,7 +157,13 @@ impl Supervision {
             thread: Mutex::new(None),
             #[cfg(test)]
             test_hold: TestHold::default(),
+            started_in: pigeonhole_io::sys::process_id(),
         }
+    }
+
+    /// In a forked child: the supervisor thread is the parent's.
+    fn forked(&self) -> bool {
+        pigeonhole_io::sys::process_id() != self.started_in
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -179,21 +188,37 @@ impl Supervision {
     }
 
     pub(crate) fn gave_up(&self) -> bool {
+        // In a forked child the state's lock may have been copied held: inert (#901).
+        if self.forked() {
+            return false;
+        }
         matches!(self.lock().phase, Phase::GaveUp)
     }
 
     /// The supervisor stood down: it gave up, or the failure is not one it covers.
     pub(crate) fn stood_down(&self) -> bool {
+        if self.forked() {
+            return false;
+        }
         matches!(self.lock().phase, Phase::GaveUp | Phase::Uncovered)
     }
 
     pub(crate) fn stats(&self, generation: u64) -> RecoveryStats {
+        if self.forked() {
+            return RecoveryStats {
+                generation,
+                ..RecoveryStats::default()
+            };
+        }
         let mut s = self.lock().stats;
         s.generation = generation;
         s
     }
 
     pub(crate) fn last_failure(&self) -> Option<Failure> {
+        if self.forked() {
+            return None;
+        }
         self.lock().stats.last_failure
     }
 
@@ -206,6 +231,9 @@ impl Supervision {
         timeout: Duration,
         still_failing: impl Fn() -> bool,
     ) -> Settled {
+        if self.forked() {
+            return Settled::Failed;
+        }
         #[cfg(test)]
         self.test_hold.waited.store(true, Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
@@ -256,6 +284,12 @@ impl Supervision {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
+        // A forked child's copy of the handle names a thread that runs only in the parent:
+        // joining would wait for ever, so it is left alone (#901).
+        if self.forked() {
+            std::mem::forget(thread);
+            return;
+        }
         if let Some(t) = thread
             && t.thread().id() != std::thread::current().id()
         {

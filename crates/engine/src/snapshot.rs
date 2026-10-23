@@ -726,6 +726,9 @@ pub(crate) struct LiveViews {
     /// memtable arenas once nothing can read them, D265). Runs after `on_oldest_released`,
     /// outside the lock.
     on_all_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The process that created it: in a forked child a view dropped leaves the registry
+    /// alone and runs no release (#901, perf287's M3).
+    owner: u32,
 }
 
 impl std::fmt::Debug for LiveViews {
@@ -742,6 +745,7 @@ impl Default for LiveViews {
             versions: RegistryLock::new(BTreeMap::new()),
             on_oldest_released: OnceLock::new(),
             on_all_released: OnceLock::new(),
+            owner: pigeonhole_io::sys::process_id(),
         }
     }
 }
@@ -827,6 +831,9 @@ impl ViewPin {
 
 impl Drop for ViewPin {
     fn drop(&mut self) {
+        if self.registry.owner != pigeonhole_io::sys::process_id() {
+            return;
+        }
         let (oldest, all) = self.registry.unregister(self.version);
         if oldest && let Some(release) = self.registry.on_oldest_released.get() {
             release();
@@ -838,9 +845,21 @@ impl Drop for ViewPin {
 }
 
 /// Every live in-process snapshot seqno, for compaction's `GcPolicy::snapshots`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LiveSeqnos {
     seqnos: Mutex<BTreeMap<Seqno, u32>>,
+    /// The process that created it: in a forked child a snapshot dropped leaves the list
+    /// alone, whose lock a parent's shard thread may have held at the fork (#901, M3).
+    owner: u32,
+}
+
+impl Default for LiveSeqnos {
+    fn default() -> Self {
+        Self {
+            seqnos: Mutex::default(),
+            owner: pigeonhole_io::sys::process_id(),
+        }
+    }
 }
 
 impl LiveSeqnos {
@@ -890,6 +909,9 @@ impl SeqnoPin {
 
 impl Drop for SeqnoPin {
     fn drop(&mut self) {
+        if self.registry.owner != pigeonhole_io::sys::process_id() {
+            return;
+        }
         let mut m = self
             .registry
             .seqnos
@@ -1060,6 +1082,11 @@ impl LiveSnapshot {
 
 impl Drop for LiveSnapshot {
     fn drop(&mut self) {
+        // In a forked child the slot handle is inert (#898) and `ReaderPins`' lock may have
+        // been copied held by a parent thread: leave it alone (#901, perf287's M3).
+        if !self.slot.is_current() {
+            return;
+        }
         self.pins.release(self.key);
     }
 }
@@ -1228,6 +1255,10 @@ pub struct Snapshot {
     pub(crate) _live: Option<Arc<LiveSnapshot>>,
     /// Writer process: the seqno stays in the live-snapshot list while any clone lives.
     pub(crate) _pin: Option<Arc<SeqnoPin>>,
+    /// The process that took it ([`pigeonhole_io::sys::process_id`]). A writer-process
+    /// snapshot read in a forked child fails with `Unsupported` (#901); a reader process's
+    /// fails with `SnapshotExpired` there (its slot is inert, #898).
+    pub(crate) taken_in: u32,
 }
 
 impl Snapshot {
@@ -1254,6 +1285,19 @@ impl Snapshot {
         }
     }
 
+    /// `Unsupported` for a writer-process snapshot used in a forked child (#901), checked
+    /// once per read operation (a point or row read, a scan's creation and each tablet it
+    /// opens), never per scan step: per step it cost the scan shapes 0.5% (#919's callgrind
+    /// run). A reader process's snapshot fails with `SnapshotExpired` there instead (its
+    /// slot is inert, #898).
+    #[inline]
+    pub(crate) fn check_process(&self) -> Result<()> {
+        if self._live.is_none() && pigeonhole_io::sys::process_id() != self.taken_in {
+            return Err(crate::engine::forked());
+        }
+        Ok(())
+    }
+
     /// `result` of a read through this snapshot, or [`Error::SnapshotExpired`] in its place
     /// when the snapshot expired during the read (whatever the read returned).
     pub(crate) fn checked<T>(&self, result: Result<T>) -> Result<T> {
@@ -1268,6 +1312,7 @@ impl Snapshot {
     #[cfg(feature = "test-hooks")]
     pub fn at_seqno(&self, seqno: Seqno) -> Snapshot {
         Snapshot {
+            taken_in: self.taken_in,
             seqno: seqno.min(self.seqno),
             view: Arc::clone(&self.view),
             _live: self._live.clone(),

@@ -545,6 +545,10 @@ pub(crate) struct Shared {
     /// liveness locks (`reclaim_dead_readers`, layout 3, #693 PR 3); `None` in a reader
     /// process, which reclaims nothing. Set at open, never changed.
     pub lock_file: Option<pigeonhole_io::FileRef>,
+    /// The process that opened the engine ([`pigeonhole_io::sys::process_id`]): commits,
+    /// checks and maintenance waited on in a forked child fail `Unsupported` at once instead
+    /// of waiting for a shard thread that only runs in the parent (#901, perf287's M2).
+    pub opened_in: u32,
     pub shm_dir: Option<std::path::PathBuf>,
     pub identity: pigeonhole_io::FileIdentity,
     pub path: std::path::PathBuf,

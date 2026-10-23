@@ -352,10 +352,6 @@ struct ReaderState {
     view: Mutex<Option<Arc<View>>>,
     shards: usize,
     registry: Arc<MergeRegistry>,
-    /// The process that opened the reader ([`pigeonhole_io::sys::process_id`]). In any other
-    /// process (a forked child's copy) the reader refuses snapshots and slot claims
-    /// ([`FORKED_READER`]) and its close releases nothing.
-    opened_in: u32,
 }
 
 /// What a reader used in a process other than the one that opened it fails with
@@ -365,6 +361,20 @@ struct ReaderState {
 /// the child's slot would outlive it.
 pub(crate) const FORKED_READER: &str =
     "this reader was opened in another process (fork); open a new reader here";
+
+/// What a writer engine used in a process other than the one that opened it fails with
+/// (`Unsupported`, #901): a forked child has none of its shard, compaction or I/O threads,
+/// shares its descriptors (on Linux its open file descriptions) and its shared-memory
+/// arenas, which the parent keeps writing and reclaiming. Any operation there would hang
+/// or read memory the parent reuses.
+pub(crate) const FORKED_ENGINE: &str =
+    "this database was opened in another process (fork); open it again here";
+
+/// The error a writer-process handle (an engine, a snapshot) fails with in a forked child.
+#[cold]
+pub(crate) fn forked() -> Error {
+    Error::Unsupported(FORKED_ENGINE)
+}
 
 /// Claims a reader slot through `file`, its liveness lock taken through that handle (#693
 /// PR 3). Refused in a process other than `opened_in` (a forked child, [`FORKED_READER`]).
@@ -418,6 +428,10 @@ pub(crate) struct Inner {
     max_value: AtomicUsize,
     /// Async commits' backpressure (D210); writer only.
     admission: Option<Arc<crate::admission::Admission>>,
+    /// The process that opened it ([`pigeonhole_io::sys::process_id`]). In any other process
+    /// (a forked child's copy) every entry point fails with `Unsupported` and close and drop
+    /// do nothing (#901, and #898 for a reader).
+    opened_in: u32,
 }
 
 impl std::fmt::Debug for Inner {
@@ -988,6 +1002,7 @@ impl Engine {
             application_owned: mode == Mode::ApplicationOwned,
             no_writes,
             lock_file: Some(file.clone()),
+            opened_in: pigeonhole_io::sys::process_id(),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1463,6 +1478,7 @@ impl Engine {
             reader: None,
             max_value: AtomicUsize::new(max_value),
             admission,
+            opened_in: pigeonhole_io::sys::process_id(),
         });
         let engine = Arc::new(Engine {
             inner: Arc::clone(&inner),
@@ -1596,6 +1612,7 @@ impl Engine {
             application_owned: false,
             no_writes: true,
             lock_file: None,
+            opened_in: pigeonhole_io::sys::process_id(),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1637,7 +1654,6 @@ impl Engine {
             view: Mutex::new(None),
             shards,
             registry,
-            opened_in,
         };
         let inner = Arc::new(Inner {
             // A reader commits nothing; one handle keeps `shard_ref` total.
@@ -1653,6 +1669,7 @@ impl Engine {
             reader: Some(reader),
             max_value: AtomicUsize::new(0),
             admission: None,
+            opened_in,
         });
         Ok(Arc::new(Engine { inner }))
     }
@@ -1685,11 +1702,17 @@ impl Engine {
 
     /// Looks up a table by name.
     pub fn table(&self, name: &str) -> Option<Arc<TableInfo>> {
+        if self.inner.forked() {
+            return None;
+        }
         self.inner.catalog().table_by_name(name).cloned()
     }
 
     /// Every table.
     pub fn tables(&self) -> Vec<Arc<TableInfo>> {
+        if self.inner.forked() {
+            return Vec::new();
+        }
         self.inner.catalog().tables().cloned().collect()
     }
 
@@ -1707,6 +1730,9 @@ impl Engine {
 
     /// Changes the writer default; applies to commits that start afterwards.
     pub fn set_default_durability(&self, durability: Durability) {
+        if self.inner.forked() {
+            return;
+        }
         self.inner
             .shared
             .default_durability
@@ -1719,6 +1745,9 @@ impl Engine {
     /// then [`Admit::attach`](crate::Admit::attach) it to the submitted commit, which returns the charge when the
     /// commit resolves. Blocking commits take no admission.
     pub fn admit(&self, batch: &WriteBatch) -> crate::Admit {
+        if self.inner.forked() {
+            return crate::Admit::new(None, 0, 0);
+        }
         self.inner.admit(batch)
     }
 
@@ -1726,6 +1755,9 @@ impl Engine {
     /// benches).
     #[doc(hidden)]
     pub fn admission_inflight(&self, shard: usize) -> u64 {
+        if self.inner.forked() {
+            return 0;
+        }
         self.inner
             .admission
             .as_ref()
@@ -1970,6 +2002,7 @@ impl Engine {
         // it sees (#315 review). Otherwise read again; under a steady stream of commits, fall
         // back to a pinned snapshot. (The loop of `Inner::latest_view`, written out: through
         // the helper, a point get measured a few instructions more, #287.)
+        inner.check_process()?;
         for _ in 0..GET_LATEST_TRIES {
             let seqno = inner.shared.shm.visible_seqno();
             #[cfg(feature = "test-hooks")]
@@ -2016,6 +2049,7 @@ impl Engine {
         row: &[u8],
         spec: &ReadSpec,
     ) -> Result<Option<RowData>> {
+        snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.families)?;
         let now = self.inner.shared.vfs.now_micros();
         snapshot.checked(read::read_row(snapshot, table, row, &families, spec, now))
@@ -2047,6 +2081,7 @@ impl Engine {
         spec: &ReadSpec,
         sink: &mut impl read::RowSink,
     ) -> Result<bool> {
+        snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, families)?;
         let now = self.inner.shared.vfs.now_micros();
         snapshot.checked(read::read_row_into(
@@ -2181,6 +2216,7 @@ impl Engine {
 
     /// Starts an ordered scan.
     pub fn scan(&self, snapshot: &Snapshot, table: TableId, spec: ScanSpec) -> Result<ScanCursor> {
+        snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
         let now = self.inner.shared.vfs.now_micros();
         Ok(ScanCursor::new(
@@ -2283,6 +2319,9 @@ impl Engine {
     /// What the row cache did since open (D201); all zero when it is off or in a reader
     /// process. A method rather than [`Metrics`] fields, which would break struct literals.
     pub fn row_cache_stats(&self) -> RowCacheStats {
+        if self.inner.forked() {
+            return RowCacheStats::default();
+        }
         self.inner
             .shared
             .row_cache
@@ -2296,6 +2335,9 @@ impl Engine {
     /// change after a split, merge or move, and a commit from any thread is correct whatever
     /// shard owns its rows.
     pub fn shard_of(&self, table: TableId, row: &[u8]) -> Option<usize> {
+        if self.inner.forked() {
+            return None;
+        }
         let view = self.inner.shared.view.load();
         view.tablets()
             .route(table, row)
@@ -2336,6 +2378,9 @@ impl Engine {
     /// [`Metrics::commit_latency_nanos`] (since open) cannot.
     #[doc(hidden)]
     pub fn commit_latency_buckets(&self) -> [[u64; 64]; 4] {
+        if self.inner.forked() {
+            return [[0; 64]; 4];
+        }
         let mut out = [[0u64; 64]; 4];
         for s in &self.inner.shared.metrics {
             for (d, hist) in out.iter_mut().enumerate() {
@@ -2362,6 +2407,9 @@ impl Engine {
     /// `memtable_budget` (#122). A method rather than a [`Metrics`] field, which would
     /// break struct literals.
     pub fn tablet_refusals(&self) -> (u64, u64) {
+        if self.inner.forked() {
+            return (0, 0);
+        }
         self.inner.shared.metrics.iter().fold((0, 0), |(s, v), m| {
             (
                 s + m.refused_slots.load(Ordering::Relaxed),
@@ -2378,6 +2426,9 @@ impl Engine {
     /// regrow after a packed load.
     #[doc(hidden)]
     pub fn pack_target(&self) -> Option<(usize, usize)> {
+        if self.inner.forked() {
+            return None;
+        }
         let target = self.inner.shared.pack_target.load(Ordering::Acquire);
         (target > 0).then(|| (self.inner.shared.pack_k.load(Ordering::Acquire), target))
     }
@@ -2386,6 +2437,9 @@ impl Engine {
     /// issue #51).
     #[doc(hidden)]
     pub fn shard_stats(&self) -> Vec<ShardStats> {
+        if self.inner.forked() {
+            return Vec::new();
+        }
         let shared = &self.inner.shared;
         let mut out: Vec<ShardStats> = shared
             .metrics
@@ -2425,17 +2479,26 @@ impl Engine {
     /// it is closed and reopened; [`Engine::failure`] says which shard and why. Cheap: one
     /// atomic load.
     pub fn is_failed(&self) -> bool {
+        if self.inner.forked() {
+            return false;
+        }
         self.inner.shared.failure.get().is_some()
     }
 
     /// The instance's first failure, if any (see [`Engine::is_failed`]). Later failures do
     /// not replace it.
     pub fn failure(&self) -> Option<crate::Failure> {
+        if self.inner.forked() {
+            return None;
+        }
         self.inner.shared.failure.get()
     }
 
     /// Current metrics.
     pub fn metrics(&self) -> Metrics {
+        if self.inner.forked() {
+            return Metrics::default();
+        }
         let shared = &self.inner.shared;
         let mut m = Metrics::default();
         if let Some(rt) = self
@@ -2589,6 +2652,11 @@ impl Engine {
     /// mode that wait runs inside the final close, on the application thread driving the
     /// last shard, before [`EngineShard::closed`] reports.
     pub fn close(&self) -> Result<()> {
+        // A forked child's copy does nothing (#901, #898): no flush, WAL, root commit,
+        // cleanup or lock release.
+        if pigeonhole_io::sys::process_id() != self.inner.opened_in {
+            return Ok(());
+        }
         self.inner.close(true)
     }
 
@@ -2606,6 +2674,9 @@ impl Engine {
     /// automatic recovery (#620); not a stable API.
     #[doc(hidden)]
     pub fn close_for_reopen(&self) -> (Result<()>, Option<Handover>) {
+        if let Err(e) = self.inner.check_process() {
+            return (Err(e), None);
+        }
         if self.inner.role != Role::Writer || self.inner.application_owned {
             return (
                 Err(Error::InvalidArgument(
@@ -2652,6 +2723,9 @@ impl Engine {
     /// automatic recovery (#620); not a stable API.
     #[doc(hidden)]
     pub fn release_memory(&self) {
+        if self.inner.forked() {
+            return;
+        }
         if self.inner.role == Role::Writer && !self.inner.application_owned {
             self.inner.shared.release_memory();
         }
@@ -2663,6 +2737,9 @@ impl Engine {
     /// recovery (#620, D265); not a stable API.
     #[doc(hidden)]
     pub fn wait_failed(&self, deadline: std::time::Instant) -> bool {
+        if self.inner.forked() {
+            return false;
+        }
         let shared = &self.inner.shared;
         let failed = shared
             .failure
@@ -2693,6 +2770,13 @@ pub struct Handover {
 /// can block on a device that never answers, as `close` does (#824).
 impl Drop for Engine {
     fn drop(&mut self) {
+        // In a forked child nothing of the engine may be torn down: its threads run only in
+        // the parent (joining them would wait for ever) and its descriptors and arenas are
+        // the parent's. Leak the instance (#901).
+        if pigeonhole_io::sys::process_id() != self.inner.opened_in {
+            std::mem::forget(Arc::clone(&self.inner));
+            return;
+        }
         if self.inner.role == Role::Writer {
             let _ = self.inner.close(!self.inner.application_owned);
         } else {
@@ -3009,11 +3093,17 @@ pub struct PendingMaintenance {
     /// A failed reply of the current round, reported once every shard has replied (the
     /// future; the blocking `wait` keeps its own).
     pub(crate) failed: Option<Error>,
+    /// The process that submitted it: polled or waited on in a forked child, it fails
+    /// `Unsupported` at once (#901, perf287's M2).
+    owner: u32,
 }
 
 impl PendingMaintenance {
     /// Blocks until every shard replied (to every round of a full compaction).
     pub(crate) fn wait(mut self) -> Result<()> {
+        if self.owner != pigeonhole_io::sys::process_id() {
+            return Err(forked());
+        }
         loop {
             let mut result = Ok(());
             for w in std::mem::take(&mut self.waiters) {
@@ -3038,6 +3128,9 @@ impl std::future::Future for PendingMaintenance {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        if self.owner != pigeonhole_io::sys::process_id() {
+            return std::task::Poll::Ready(Err(forked()));
+        }
         loop {
             match self.poll_round(cx) {
                 std::task::Poll::Ready(Ok(())) => {}
@@ -3116,6 +3209,7 @@ impl Inner {
             waiters: vec![rx],
             rounds: None,
             failed: None,
+            owner: pigeonhole_io::sys::process_id(),
         })
     }
 
@@ -3211,7 +3305,33 @@ impl Inner {
         Ok(())
     }
 
+    /// In a forked child of the process that opened the engine (#901): the rule there is
+    /// that a handle may only be dropped or closed; every other entry point fails
+    /// `Unsupported` ([`Inner::check_process`]) or is inert (an accessor returns its empty or
+    /// default value without taking any lock, which a parent thread may have held at the
+    /// fork). ICR 0067.
+    #[inline]
+    pub(crate) fn forked(&self) -> bool {
+        pigeonhole_io::sys::process_id() != self.opened_in
+    }
+
+    /// `Unsupported` in a process other than the one that opened the engine (a forked
+    /// child, #901): before anything touches a shard, a queue, a ring or the shared arenas.
+    /// One compare with the cached process id.
+    #[inline]
+    pub(crate) fn check_process(&self) -> Result<()> {
+        if pigeonhole_io::sys::process_id() != self.opened_in {
+            return Err(if self.reader.is_some() {
+                Error::Unsupported(FORKED_READER)
+            } else {
+                forked()
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_open(&self) -> Result<()> {
+        self.check_process()?;
         if self.closing.load(Ordering::Acquire) || self.shared.closed.load(Ordering::Acquire) {
             return Err(Error::Closed);
         }
@@ -3715,6 +3835,7 @@ impl Inner {
     }
 
     pub(crate) fn latest_view(&self) -> Result<Option<(arc_swap::Guard<Arc<View>>, Seqno)>> {
+        self.check_process()?;
         for _ in 0..GET_LATEST_TRIES {
             let seqno = self.shared.shm.visible_seqno();
             #[cfg(feature = "test-hooks")]
@@ -3739,6 +3860,7 @@ impl Inner {
         if self.reader.is_some() {
             return self.reader_snapshot(durable);
         }
+        self.check_process()?;
         // The seqno is pinned before the view loads (and read under the pin's lock), so a
         // flush GC that publishes in between keeps what it reads; still seqno before view: a
         // seqno is only visible once the view holding its memtables is published.
@@ -3764,6 +3886,7 @@ impl Inner {
             view,
             _live: None,
             _pin: Some(Arc::new(pin)),
+            taken_in: self.opened_in,
         })
     }
 
@@ -3775,6 +3898,7 @@ impl Inner {
         row: &[u8],
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
+        snapshot.check_process()?;
         snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,
@@ -3805,6 +3929,7 @@ impl Inner {
             waiters,
             rounds: None,
             failed: None,
+            owner: pigeonhole_io::sys::process_id(),
         })
     }
 
@@ -3820,6 +3945,7 @@ impl Inner {
             waiters,
             rounds,
             failed: None,
+            owner: pigeonhole_io::sys::process_id(),
         })
     }
 
@@ -3945,7 +4071,7 @@ impl Inner {
         // In a forked child the presence handle is the parent's (`Presence` releases nothing
         // there, and `try_become_last` is false): no last-one-out cleanup.
         if let Some(presence) = presence
-            && pigeonhole_io::sys::process_id() == r.opened_in
+            && pigeonhole_io::sys::process_id() == self.opened_in
             && presence.try_become_last()?
         {
             // Last one out (issue #20): only if no writer holds or is taking the writer byte,
@@ -4041,7 +4167,7 @@ impl Inner {
     fn reader_snapshot(&self, durable: bool) -> Result<Snapshot> {
         let r = self.reader.as_ref().expect("reader");
         // A forked child's copy of the reader takes no snapshot (and so claims no slot).
-        if pigeonhole_io::sys::process_id() != r.opened_in {
+        if pigeonhole_io::sys::process_id() != self.opened_in {
             return Err(Error::Unsupported(FORKED_READER));
         }
         let deadline = std::time::Instant::now() + READER_VIEW_WAIT;
@@ -4058,7 +4184,7 @@ impl Inner {
                     &shm,
                     self.shared.vfs.current_process(),
                     &r.file,
-                    r.opened_in,
+                    self.opened_in,
                 )?;
                 // Snapshots of the old generation leave the abandoned slot alone: they can no
                 // longer be read, so they must not hold this generation's pin back.
@@ -4080,7 +4206,7 @@ impl Inner {
                     &a.shm,
                     self.shared.vfs.current_process(),
                     &r.file,
-                    r.opened_in,
+                    self.opened_in,
                 )?);
             }
             // The slot pins exactly what this reader's live snapshots need: this one's seqno
@@ -4105,6 +4231,7 @@ impl Inner {
                         view,
                         _live: Some(live),
                         _pin: None,
+                        taken_in: self.opened_in,
                     });
                 }
                 Err(e) => return Err(e),
@@ -4363,6 +4490,12 @@ pub struct EngineShard {
 }
 
 impl EngineShard {
+    /// In a forked child (#901): the shard is the parent's, and every driving method does
+    /// nothing (`run_once` returns `false`, `commit_local` fails `Unsupported`).
+    fn forked(&self) -> bool {
+        pigeonhole_io::sys::process_id() != self.engine.opened_in
+    }
+
     /// Shard index.
     pub fn index(&self) -> u16 {
         self.driver.as_ref().map_or(0, |d| d.shard().0)
@@ -4383,6 +4516,11 @@ impl EngineShard {
     /// counts as its driver: a thread holding a shard it has not run yet is not protected,
     /// and must not block on a commit (run the shard first).
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
+        // A forked child's copy runs nothing: its state machine would append to the
+        // parent's log and apply into the parent's arenas (#901, perf287's M1).
+        if self.forked() {
+            return false;
+        }
         let Some(d) = self.driver.as_mut() else {
             return false;
         };
@@ -4399,6 +4537,9 @@ impl EngineShard {
     /// in engine-owned mode (shards never move). Debug builds panic when a shard turns up on
     /// another thread with I/O left on the old one unreleased.
     pub fn release(&mut self) {
+        if self.forked() {
+            return;
+        }
         if let Some(d) = self.driver.as_mut() {
             d.release();
         }
@@ -4410,6 +4551,9 @@ impl EngineShard {
     /// same outcome; an `Err` means the close was not clean or failed (the next open
     /// replays the WAL).
     pub fn closed(&self) -> Option<Result<()>> {
+        if self.forked() {
+            return None;
+        }
         self.engine
             .shared
             .close
@@ -4423,6 +4567,9 @@ impl EngineShard {
     /// shard. It may return early: loop on `run_once`. It needs no completion fd: with
     /// io_uring it waits in the thread's ring while its own I/O is in flight.
     pub fn wait(&mut self, timeout: std::time::Duration) {
+        if self.forked() {
+            return;
+        }
         if let Some(d) = self.driver.as_mut() {
             d.wait(timeout);
         }
@@ -4432,6 +4579,9 @@ impl EngineShard {
     /// futures the driving thread polls itself (a commit's future, resolved on another
     /// shard's thread).
     pub fn waker(&self) -> std::task::Waker {
+        if self.forked() {
+            return std::task::Waker::noop().clone();
+        }
         self.driver
             .as_ref()
             .map_or_else(|| std::task::Waker::noop().clone(), |d| d.waker())
@@ -4442,6 +4592,9 @@ impl EngineShard {
     /// backoff), or `None`. After [`run_once`](EngineShard::run_once) returns `false`, call
     /// it again when the wakeup fires or this deadline passes, whichever comes first.
     pub fn next_deadline(&self) -> Option<u64> {
+        if self.forked() {
+            return None;
+        }
         self.driver.as_ref().and_then(ShardDriver::next_deadline)
     }
 
@@ -4498,6 +4651,9 @@ impl EngineShard {
 
     /// Registers a callback the engine calls when work arrives for this shard.
     pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        if self.forked() {
+            return;
+        }
         if let Some(d) = self.driver.as_mut() {
             d.set_wakeup(wake);
         }
@@ -4506,6 +4662,11 @@ impl EngineShard {
 
 impl Drop for EngineShard {
     fn drop(&mut self) {
+        // As `Engine`'s drop: a forked child's copy shuts nothing down (#901).
+        if pigeonhole_io::sys::process_id() != self.engine.opened_in {
+            std::mem::forget(self.driver.take());
+            return;
+        }
         if let Some(driver) = self.driver.take() {
             self.engine
                 .shared
