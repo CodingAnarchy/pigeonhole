@@ -132,6 +132,10 @@ OPTIONS:
                            [default: the library's]
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
+    --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
+                           retry a conflict after RetryPolicy's full-jitter backoff from
+                           US µs (0: at once), a reported variant (D274)
+                           [default: transact()'s default RetryPolicy, as judged]
     --dir DIR              where stores are created [default: system temp dir]
     --json PATH            write results as JSON
     --markdown PATH        write the markdown summary
@@ -185,6 +189,7 @@ struct Args {
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
     commit_spin: Option<u64>,
+    txn_backoff: Option<u64>,
     dir: Option<PathBuf>,
     json: Option<PathBuf>,
     markdown: Option<PathBuf>,
@@ -252,6 +257,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
+            "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
             "--tablet-changes" => a.no_tablet_changes = false,
             "--dir" => a.dir = Some(parse(&arg, it.next())?),
@@ -340,6 +346,9 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if let Some(us) = a.commit_spin {
         r = r.commit_spin_micros(us);
+    }
+    if let Some(us) = a.txn_backoff {
+        r = r.txn_backoff_micros(us);
     }
     r
 }
@@ -750,6 +759,7 @@ mod tests {
         assert_eq!(rc.row_cache, Some(1 << 20));
         assert_eq!(args("ycsb-a --shard-spin 200").shard_spin, Some(200));
         assert_eq!(args("ycsb-a --commit-spin 0").commit_spin, Some(0));
+        assert_eq!(args("transfer --txn-backoff 0").txn_backoff, Some(0));
         assert!(pigeonhole(&rc, None).describe().contains(" rowcache=1MiB"));
         assert!(
             !pigeonhole(&args("ycsb-c"), None)

@@ -58,9 +58,12 @@ XSHARD = "cross-shard-contention"
 
 def default_config(r):
     """False for the runs `all` adds beside the default for D246: Pigeonhole's cross-shard
-    contention with tablet changes off, and with packing off. Tables keyed by workload use
-    the default run."""
+    contention with tablet changes off, and with packing off. Also for a transaction
+    backoff variant (`--txn-backoff`): reported, never judged, since judged rows retry
+    each store's out-of-the-box way (D274). Tables keyed by workload use the default run."""
     cfg = r.get("store_config", "")
+    if "txn_backoff=" in cfg:
+        return False
     return not (r["store"] == "pigeonhole" and r["workload"] == XSHARD
                 and ("tablets=on" not in cfg or "packing=off" in cfg))
 
