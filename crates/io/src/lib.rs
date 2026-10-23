@@ -34,6 +34,7 @@ pub mod sys;
 #[cfg(target_os = "linux")]
 pub mod uring;
 mod vfs;
+mod word128;
 
 pub use buf::{BufPool, IoBuf};
 pub use completion::{Completion, Resolver};
@@ -45,3 +46,4 @@ pub use own::{
 };
 pub use shared::{SharedOpen, SharedRegion};
 pub use vfs::{FileIdentity, ProcessId, RingStats, Vfs, VfsRef};
+pub use word128::AtomicWord128;

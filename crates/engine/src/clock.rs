@@ -8,58 +8,104 @@
 //! cross-shard decision, so a group reserved in the same µs takes `H + 1` and cannot tie
 //! with the decision's cells (D271, the owner's ruling on the same-µs tie).
 
-use std::sync::{Mutex, PoisonError};
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pigeonhole_format::{Seqno, Timestamp};
+use pigeonhole_io::AtomicWord128;
 use pigeonhole_shm::ShmRegion;
 
-#[derive(Debug, Default)]
-struct State {
-    /// The next seqno to reserve.
-    next: Seqno,
-    /// The largest default timestamp handed out.
-    h: Timestamp,
-    /// The next stamp must be strictly above `H`: the last reservation was a decision's, or a
-    /// tablet changed owner since.
-    decided: bool,
-    /// The drift gauge: the largest lead of `H` over the clock at any reservation.
-    max_lead: u64,
+/// `F`, kept in `H`'s top bit (default timestamps are µs, far below it).
+const DECIDED: u64 = 1 << 63;
+
+thread_local! {
+    /// The word as this thread last saw it: a reservation's first guess (#888). Stale only
+    /// when another thread reserved since, which costs one more exchange.
+    static GUESS: Cell<u128> = const { Cell::new(0) };
 }
 
-/// `(S, H, F)` under one lock.
+/// `(S, H, F)` in one 16-byte word (#888, ICR 0069): `S` the low half, `H` the high half
+/// with `F` its top bit. Every change is one compare-exchange of the whole word, so the
+/// three move together as they did under D271's lock.
+fn pack(next: Seqno, h: Timestamp, decided: bool) -> u128 {
+    debug_assert!(h < DECIDED, "a default timestamp at or past 2^63: {h}");
+    u128::from(next) | (u128::from(h | if decided { DECIDED } else { 0 }) << 64)
+}
+
+fn unpack(w: u128) -> (Seqno, Timestamp, bool) {
+    let hi = (w >> 64) as u64;
+    (w as u64, hi & !DECIDED, hi & DECIDED != 0)
+}
+
+/// The allocator's state: `(S, H, F)` in one word changed by compare-exchange (#888), and
+/// the drift gauge beside it.
 #[derive(Debug, Default)]
 pub(crate) struct Reservation {
-    state: Mutex<State>,
+    /// `S`, the next seqno to reserve; `H`, the largest default timestamp handed out; `F`,
+    /// the next stamp must be strictly above `H` (the last reservation was a decision's, or
+    /// a tablet changed owner since).
+    word: AtomicWord128,
+    /// The drift gauge: the largest lead of `H` over the clock at any reservation. Not in
+    /// the word (ICR 0064): written only when the lead grows.
+    max_lead: AtomicU64,
 }
 
 impl Reservation {
-    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    /// Changes the word by `f` (`(S, H, F)` in, the new one and a result out) in one
+    /// exchange, retried with what it found until none raced it. `f` may run more than once.
+    fn update<R>(&self, f: impl Fn(Seqno, Timestamp, bool) -> (Seqno, Timestamp, bool, R)) -> R {
+        let mut cur = GUESS.get();
+        loop {
+            let (next, h, decided) = unpack(cur);
+            let (next2, h2, decided2, r) = f(next, h, decided);
+            let new = pack(next2, h2, decided2);
+            match self.word.compare_exchange(cur, new) {
+                Ok(_) => {
+                    GUESS.set(new);
+                    return r;
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
+
+    fn read(&self) -> (Seqno, Timestamp, bool) {
+        let w = self.word.load();
+        GUESS.set(w);
+        unpack(w)
+    }
+
+    fn note_lead(&self, h: Timestamp, now: Timestamp) {
+        let lead = h.saturating_sub(now);
+        if lead > self.max_lead.load(Ordering::Relaxed) {
+            self.max_lead.fetch_max(lead, Ordering::Relaxed);
+        }
     }
 
     /// Starts at seqno `next` (at open, once replay has passed every recovered seqno), before
     /// anything at open reserves one.
     pub(crate) fn seed_seqno(&self, next: Seqno) {
-        self.lock().next = next;
+        self.update(|_, h, d| (next, h, d, ()));
     }
 
     /// Raises `H` to `h` (at open: the manifest's floor and every replayed timestamp, not the
     /// clock: every reservation takes `now` into account itself, and a decision just after
-    /// the reopen must not be pushed past it).
+    /// the reopen must not be pushed past it). Held below `F`'s bit: every one of them came
+    /// from this allocator, so only a damaged file could carry more.
     pub(crate) fn seed_ts(&self, h: Timestamp) {
-        let mut st = self.lock();
-        st.h = st.h.max(h);
+        let h = h.min(DECIDED - 1);
+        self.update(|s, cur, d| (s, cur.max(h), d, ()));
     }
 
     /// The next seqno to reserve: a lower bound for every later reservation (FORMAT §11.3's
     /// pending watermark), and the seqno ceiling the manifest records.
     pub(crate) fn next_seqno(&self) -> Seqno {
-        self.lock().next
+        self.read().0
     }
 
     /// The largest default timestamp handed out (the manifest's `ts_floor`).
     pub(crate) fn last_ts(&self) -> Timestamp {
-        self.lock().h
+        self.read().1
     }
 
     /// The drift gauge (D271, ICR 0064): how far `H` is ahead of the clock `now`, and the
@@ -67,8 +113,8 @@ impl Reservation {
     /// than one group a µs, or a decision with a group after it in the same µs, moves `H`
     /// past the clock.
     pub(crate) fn lead(&self, now: Timestamp) -> (u64, u64) {
-        let st = self.lock();
-        (st.h.saturating_sub(now), st.max_lead)
+        let h = self.read().1;
+        (h.saturating_sub(now), self.max_lead.load(Ordering::Relaxed))
     }
 
     /// A group's `n` seqnos and the first of `k` default timestamps (`T0 .. T0 + k`): `T0`
@@ -82,28 +128,19 @@ impl Reservation {
         last: Timestamp,
         shm: &ShmRegion,
     ) -> (Seqno, Timestamp) {
-        let (first, t0) = {
-            let mut st = self.lock();
-            let first = st.next;
-            st.next += n;
-            let t0 = now.max(st.h + u64::from(st.decided)).max(last + 1);
-            st.h = st.h.max(t0 + k.max(1) - 1);
-            st.decided = false;
-            st.max_lead = st.max_lead.max(st.h.saturating_sub(now));
-            (first, t0)
-        };
+        let (first, t0, h) = self.update(|next, h, decided| {
+            let t0 = now.max(h + u64::from(decided)).max(last + 1);
+            let h2 = h.max(t0 + k.max(1) - 1);
+            (next + n, h2, false, (next, t0, h2))
+        });
+        self.note_lead(h, now);
         shm.advance_next_seqno(first + n);
         (first, t0)
     }
 
     /// One seqno with no timestamp: a cross-shard commit's id (D263), never applied.
     pub(crate) fn reserve_id(&self, shm: &ShmRegion) -> Seqno {
-        let first = {
-            let mut st = self.lock();
-            let first = st.next;
-            st.next += 1;
-            first
-        };
+        let first = self.update(|next, h, d| (next + 1, h, d, next));
         shm.advance_next_seqno(first + 1);
         first
     }
@@ -111,16 +148,11 @@ impl Reservation {
     /// A cross-shard decision's seqno and timestamp: strictly above every default timestamp
     /// handed out before it.
     pub(crate) fn reserve_decision(&self, now: Timestamp, shm: &ShmRegion) -> (Seqno, Timestamp) {
-        let (s, t) = {
-            let mut st = self.lock();
-            let s = st.next;
-            st.next += 1;
-            let t = now.max(st.h + 1);
-            st.h = t;
-            st.decided = true;
-            st.max_lead = st.max_lead.max(t - now);
-            (s, t)
-        };
+        let (s, t) = self.update(|next, h, _| {
+            let t = now.max(h + 1);
+            (next + 1, t, true, (next, t))
+        });
+        self.note_lead(t, now);
         shm.advance_next_seqno(s + 1);
         (s, t)
     }
@@ -129,7 +161,7 @@ impl Reservation {
     /// so above the old owner's last one on the tablet (D11's floor that travels with a
     /// tablet), as after a decision.
     pub(crate) fn raise(&self) {
-        self.lock().decided = true;
+        self.update(|s, h, _| (s, h, true, ()));
     }
 }
 
