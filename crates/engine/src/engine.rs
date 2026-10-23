@@ -1403,7 +1403,7 @@ impl Engine {
             .map(|s| s.last_stamp())
             .max()
             .unwrap_or(0)
-            .max(catalog.counters.ts_floor);
+            .max(crate::clock::check_replayed_ts(catalog.counters.ts_floor)?);
         shared.clock.seed_ts(h);
 
         // 7. The first view: tablets, recovered memtables, the manifest version and its SSTs.
