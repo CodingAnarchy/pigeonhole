@@ -146,12 +146,10 @@
 # the absolute check on main's own count. Until #909 pins that noise; then it comes back down.
 #
 # Raised for #919 (#901, a database handle in a forked child refuses every operation) under
-# D195's ceiling rule (owner, 2026-10-13; the coordinator OK'd scan-wide-q1, 2026-10-23):
-# get-miss 4175 -> 4190 and scan-wide-q1 14282 -> 14326, this PR's head counts on main
-# (run 39912275511: get-miss 4177, main's own 4170; scan-wide-q1 14283, main's 14277) times
-# 1.003. get-miss's +7 is the fork check a point read now makes (the snapshot's process,
-# one load and compare); scan-wide-q1's +6 is the scan cursor's 256-row check and the scan's
-# creation check, within run-to-run noise. Both ceilings had 5 or fewer instructions left.
+# D195's ceiling rule (owner, 2026-10-13): get-miss 4175 -> 4190, this PR's head count on
+# main (run 39934367569: 4177, main's own 4170) times 1.003. The +7 is the fork check a point
+# read now makes (the snapshot's process, one load and compare); the ceiling had 5
+# instructions left.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -180,4 +178,4 @@ scan-wide 1296 0.3
 commit-async 9695 0.3
 scan-narrow-q1 5251 0.3
 scan-wide-q10 1784 0.3
-scan-wide-q1 14326 0.3
+scan-wide-q1 14282 0.3
