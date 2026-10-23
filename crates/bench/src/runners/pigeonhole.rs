@@ -1251,14 +1251,26 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             })?;
         }
         BenchOp::Transfer { from, to, amount } => {
-            // An optimistic transaction reading both balances, through `transact` (D274).
-            transact(target, busy, buffered, |txn| {
+            // SCRATCH (#932 M0): `transact`'s loop driven by hand (`transaction`, the body,
+            // the commit, `next_pause`), so each attempt's commit and pause are timed apart.
+            let cross = usize::from(table.shard_of(from) != table.shard_of(to));
+            let op_start = Instant::now();
+            let mut attempts = 0u32;
+            let mut busy_tries = 0;
+            loop {
+                attempts += 1;
+                let t0 = Instant::now();
+                let mut txn = target.db.transaction().map_err(err)?;
+                let t1 = Instant::now();
                 let a = txn
-                    .get(table, from, YCSB_FAMILY, BALANCE)?
+                    .get(table, from, YCSB_FAMILY, BALANCE)
+                    .map_err(err)?
                     .map(|c| c.value().to_vec());
                 let b = txn
-                    .get(table, to, YCSB_FAMILY, BALANCE)?
+                    .get(table, to, YCSB_FAMILY, BALANCE)
+                    .map_err(err)?
                     .map(|c| c.value().to_vec());
+                let t2 = Instant::now();
                 t = Touched::default();
                 for v in [&a, &b].into_iter().flatten() {
                     t.cell(v);
@@ -1266,8 +1278,54 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 let (na, nb) = transfer_balances(a.as_deref(), b.as_deref(), *amount);
                 txn.put(table, from, YCSB_FAMILY, BALANCE, &na.to_le_bytes());
                 txn.put(table, to, YCSB_FAMILY, BALANCE, &nb.to_le_bytes());
-                Ok(())
-            })?;
+                let t3 = Instant::now();
+                let committed = if buffered {
+                    txn.commit_with(Durability::Buffered)
+                } else {
+                    txn.commit()
+                };
+                let t4 = Instant::now();
+                let ok = committed.is_ok();
+                xd::add(cross, xd::BEGIN, (t1 - t0).as_nanos() as u64);
+                xd::add(cross, xd::READS, (t2 - t1).as_nanos() as u64);
+                xd::add(cross, xd::BUILD, (t3 - t2).as_nanos() as u64);
+                xd::add(
+                    cross,
+                    if ok { xd::COMMIT_OK } else { xd::COMMIT_FAIL },
+                    (t4 - t3).as_nanos() as u64,
+                );
+                xd::add(cross, if ok { xd::N_OK } else { xd::N_FAIL }, 1);
+                match committed {
+                    Ok(_) => {
+                        xd::add(cross, xd::OPS, 1);
+                        xd::add(cross, xd::OP_TOTAL, op_start.elapsed().as_nanos() as u64);
+                        xd::max(cross, u64::from(attempts));
+                        xd::report(&target.db);
+                        break;
+                    }
+                    Err(e) if e.code() == ErrorCode::Conflict => {
+                        target.conflicts.fetch_add(1, Ordering::Relaxed);
+                        if let Some(p) =
+                            target
+                                .retry
+                                .next_pause(e.code(), attempts, op_start.elapsed())
+                        {
+                            let s = Instant::now();
+                            if !p.is_zero() {
+                                std::thread::sleep(p);
+                            }
+                            xd::add(cross, xd::PAUSE, s.elapsed().as_nanos() as u64);
+                            xd::add(cross, xd::PAUSE_ASKED, p.as_nanos() as u64);
+                        }
+                    }
+                    Err(e) if e.code() == ErrorCode::Busy && busy_tries < BUSY_RETRIES => {
+                        busy_tries += 1;
+                        busy.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(err(e)),
+                }
+            }
         }
         BenchOp::Incr { row, delta } => {
             let table = target
@@ -1734,5 +1792,63 @@ mod tests {
         assert_eq!(r.execute_counted(&read).unwrap().cells, 10);
         r.close().unwrap();
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+/// SCRATCH (#932 M0): per-phase client times of transfer's attempts, same-shard and cross-shard
+/// apart.
+mod xd {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const BEGIN: usize = 0;
+    pub const READS: usize = 1;
+    pub const BUILD: usize = 2;
+    pub const COMMIT_OK: usize = 3;
+    pub const COMMIT_FAIL: usize = 4;
+    pub const N_OK: usize = 5;
+    pub const N_FAIL: usize = 6;
+    pub const OPS: usize = 7;
+    pub const OP_TOTAL: usize = 8;
+    pub const MAX_ATT: usize = 9;
+    pub const PAUSE: usize = 10;
+    pub const PAUSE_ASKED: usize = 11;
+    static C: [[AtomicU64; 12]; 2] = [const { [const { AtomicU64::new(0) }; 12] }; 2];
+    pub fn add(cross: usize, k: usize, v: u64) {
+        C[cross][k].fetch_add(v, Ordering::Relaxed);
+    }
+    pub fn max(cross: usize, v: u64) {
+        C[cross][MAX_ATT].fetch_max(v, Ordering::Relaxed);
+    }
+    pub fn report(db: &pigeonhole::Pigeonhole) {
+        let total = C[0][OPS].load(Ordering::Relaxed) + C[1][OPS].load(Ordering::Relaxed);
+        if total % 20_000 != 0 {
+            return;
+        }
+        let x = db.engine_metrics().cross_shard;
+        let mut out = format!(
+            "XD ops={total} rounds={} refused={} overlap={} failed_fast={}",
+            x.rounds, x.refused_rounds, x.refused_pending_overlap, x.failed_fast
+        );
+        for (c, name) in [(0, "same"), (1, "cross")] {
+            let g = |k: usize| C[c][k].load(Ordering::Relaxed);
+            let att = (g(N_OK) + g(N_FAIL)).max(1);
+            let ops = g(OPS).max(1);
+            let fails = g(N_FAIL).max(1);
+            out += &format!(
+                " | {name}: ops={} attempts/op={:.2} max_att={} op_us={:.1} per-attempt us: begin={:.1} reads={:.1} build={:.1} commit_ok={:.1} commit_conflict={:.1} conflict_rate={:.2} pause_per_conflict={:.1} asked={:.1}",
+                g(OPS),
+                att as f64 / ops as f64,
+                g(MAX_ATT),
+                g(OP_TOTAL) as f64 / ops as f64 / 1e3,
+                g(BEGIN) as f64 / att as f64 / 1e3,
+                g(READS) as f64 / att as f64 / 1e3,
+                g(BUILD) as f64 / att as f64 / 1e3,
+                g(COMMIT_OK) as f64 / g(N_OK).max(1) as f64 / 1e3,
+                g(COMMIT_FAIL) as f64 / fails as f64 / 1e3,
+                g(N_FAIL) as f64 / att as f64,
+                g(PAUSE) as f64 / fails as f64 / 1e3,
+                g(PAUSE_ASKED) as f64 / fails as f64 / 1e3,
+            );
+        }
+        eprintln!("{out}");
     }
 }

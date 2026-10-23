@@ -36,6 +36,7 @@ mod flushed_roots;
 #[cfg(all(test, engine_loom))]
 mod flushed_through_loom;
 mod health;
+mod hops;
 mod large;
 mod large_settle;
 mod load_slot;

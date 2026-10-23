@@ -4845,6 +4845,7 @@ impl ShardState {
     /// (optimistic validation): for a family read, any entry of `(table, row, family)`; for a
     /// cell read, `cell_conflicts`. Reads of rows other shards own are theirs to check.
     fn conflicts(&mut self, snapshot: Seqno, read: &ReadKey) -> Result<bool> {
+        crate::hops::VAL[2].fetch_add(1, Ordering::Relaxed);
         let Some((tablet, shard)) = self.tablets.route(read.table, &read.row) else {
             return Ok(false);
         };
@@ -4871,6 +4872,7 @@ impl ShardState {
                             .hooks
                             .validate_entries
                             .fetch_add(1, Ordering::Relaxed);
+                        crate::hops::VAL[0].fetch_add(1, Ordering::Relaxed);
                         let (_, _, seqno, _) = split_suffix(it.key())?;
                         if seqno > snapshot {
                             return Ok(true);
@@ -4924,6 +4926,7 @@ impl ShardState {
                             .hooks
                             .validate_sst_entries
                             .fetch_add(1, Ordering::Relaxed);
+                        crate::hops::VAL[1].fetch_add(1, Ordering::Relaxed);
                         let (_, _, seqno, _) = split_suffix(it.key())?;
                         if seqno > snapshot {
                             found = true;
@@ -5700,6 +5703,10 @@ impl ShardState {
                     }
                 }
             }
+            let hop_prep = matches!(m.kind, MemberKind::Prepare { .. });
+            if hop_prep {
+                crate::hops::mark(m.seqno, crate::hops::PREP_GROUP);
+            }
             if let Some((snapshot, reads)) = m.validate.as_ref().map(|v| (&v.seqno, &v.reads)) {
                 let mut conflict = false;
                 for r in reads {
@@ -5722,6 +5729,9 @@ impl ShardState {
                     self.settle(m, Ok(()), ctx);
                     continue;
                 }
+            }
+            if hop_prep {
+                crate::hops::mark(m.seqno, crate::hops::PREP_VALIDATED);
             }
             // A delete in a family whose memtable is being flushed under the guard (#287),
             // or a write below a running bottommost compaction's bound (#316), voids that
@@ -7334,6 +7344,18 @@ impl ShardState {
 
     /// Sends a message to `shard`, handling our own inline.
     fn send(&mut self, shard: ShardId, msg: ShardMsg, ctx: &mut ShardContext<'_, ShardMsg>) {
+        match &msg {
+            ShardMsg::Prepared {
+                seqno, error: None, ..
+            } => crate::hops::mark(*seqno, crate::hops::PREPARED_SENT),
+            ShardMsg::Decide {
+                seqno,
+                commit: true,
+                ..
+            } => crate::hops::mark(*seqno, crate::hops::DECIDE_SENT),
+            ShardMsg::Applied { seqno, .. } => crate::hops::mark(*seqno, crate::hops::APPLIED_SENT),
+            _ => {}
+        }
         if shard == self.id {
             self.handle_msg(msg, ctx);
         } else if let Err(pigeonhole_runtime::Error::Closed) = ctx.submitter(shard).submit(msg) {
@@ -7368,6 +7390,10 @@ impl ShardState {
         // `next_seqno` above every replayed PREPARE's. The seqno the commit applies at, and
         // its timestamp, are picked at the decision (`decide_commit`).
         let seqno = self.shared.clock.reserve_id(&self.shared.shm);
+        crate::hops::mark(seqno, crate::hops::COORD);
+        if req.first_seqno == 0 {
+            crate::hops::submit_gap(seqno, ctx.now_nanos().saturating_sub(req.submitted_at));
+        }
         let priority = (
             req.submitted_at,
             if req.first_seqno == 0 {
@@ -7663,6 +7689,9 @@ impl ShardState {
         last: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        if commit {
+            crate::hops::mark(seqno, crate::hops::DECIDE_RECV);
+        }
         // The rows the share writes, if a commit refused here reads (D276).
         let written = if commit && self.overlap_refused.iter().any(|r| r.validate.is_some()) {
             self.prepared
@@ -7864,6 +7893,11 @@ impl ShardState {
         );
         if c.applied < c.participants {
             return;
+        }
+        if c.committing && c.failed.is_none() && !c.not_applied {
+            crate::hops::finish(seqno);
+        } else {
+            crate::hops::drop_id(seqno);
         }
         let mut c = self.coord.remove(&seqno).expect("present");
         // A participant found it doomed while this round ran (D276).
@@ -9458,8 +9492,14 @@ impl ShardState {
                 }
             }
             ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),
-            ShardMsg::Prepare(req) => self.on_prepare(req, ctx),
-            ShardMsg::Prepared { seqno, from, error } => self.on_prepared(seqno, from, error, ctx),
+            ShardMsg::Prepare(req) => {
+                crate::hops::mark(req.seqno, crate::hops::PREP_RECV);
+                self.on_prepare(req, ctx)
+            }
+            ShardMsg::Prepared { seqno, from, error } => {
+                crate::hops::mark(seqno, crate::hops::PREPARED_RECV);
+                self.on_prepared(seqno, from, error, ctx)
+            }
             ShardMsg::Wake { from, reason } => self.on_wake(from, reason, ctx),
             ShardMsg::Released { priority } => self.release_overlaps_behind(priority, ctx),
             ShardMsg::Decide {
@@ -9480,7 +9520,10 @@ impl ShardState {
                 last,
                 ctx,
             ),
-            ShardMsg::Applied { seqno, from, error } => self.on_applied(seqno, from, error, ctx),
+            ShardMsg::Applied { seqno, from, error } => {
+                crate::hops::mark(seqno, crate::hops::APPLIED_RECV);
+                self.on_applied(seqno, from, error, ctx)
+            }
             ShardMsg::SyncDone {
                 group,
                 result,
