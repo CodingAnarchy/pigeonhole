@@ -188,21 +188,37 @@ impl Supervision {
     }
 
     pub(crate) fn gave_up(&self) -> bool {
+        // In a forked child the state's lock may have been copied held: inert (#901).
+        if self.forked() {
+            return false;
+        }
         matches!(self.lock().phase, Phase::GaveUp)
     }
 
     /// The supervisor stood down: it gave up, or the failure is not one it covers.
     pub(crate) fn stood_down(&self) -> bool {
+        if self.forked() {
+            return false;
+        }
         matches!(self.lock().phase, Phase::GaveUp | Phase::Uncovered)
     }
 
     pub(crate) fn stats(&self, generation: u64) -> RecoveryStats {
+        if self.forked() {
+            return RecoveryStats {
+                generation,
+                ..RecoveryStats::default()
+            };
+        }
         let mut s = self.lock().stats;
         s.generation = generation;
         s
     }
 
     pub(crate) fn last_failure(&self) -> Option<Failure> {
+        if self.forked() {
+            return None;
+        }
         self.lock().stats.last_failure
     }
 

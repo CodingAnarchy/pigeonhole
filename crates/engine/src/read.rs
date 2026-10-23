@@ -1136,11 +1136,25 @@ impl ScanCursor {
                 return Ok(Some(false));
             }
             self.rows_emitted += 1;
+            // Inside a tablet, a cursor created before a fork stops in the child within
+            // `FORK_CHECK_ROWS` rows (#901, perf287's residual): not per row, which cost the
+            // scan shapes 0.5%.
+            if self.rows_emitted & (FORK_CHECK_ROWS - 1) == 0 {
+                self.check_fork()?;
+            }
             self.in_row = true;
             self.lane_idx = 0;
             self.last_lane = None;
             return Ok(Some(true));
         }
+    }
+
+    /// The writer-process snapshot's fork check (#901), out of line: it runs once every
+    /// [`FORK_CHECK_ROWS`] rows.
+    #[cold]
+    #[inline(never)]
+    fn check_fork(&self) -> Result<()> {
+        self.snapshot.check_process()
     }
 
     /// The current row key.
@@ -1295,6 +1309,9 @@ impl Drop for ScanCursor {
         self.recycle_lanes();
     }
 }
+
+/// Rows between a scan cursor's fork checks inside a tablet (#901): a power of two.
+const FORK_CHECK_ROWS: u64 = 256;
 
 thread_local! {
     /// Resolvers scans refill in place, kept by each scanning thread (#287) as row reads and

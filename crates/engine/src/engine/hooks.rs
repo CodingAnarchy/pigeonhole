@@ -940,6 +940,7 @@ impl Engine {
             waiters,
             rounds: None,
             failed: None,
+            owner: pigeonhole_io::sys::process_id(),
         })
     }
 

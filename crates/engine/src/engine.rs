@@ -1002,6 +1002,7 @@ impl Engine {
             application_owned: mode == Mode::ApplicationOwned,
             no_writes,
             lock_file: Some(file.clone()),
+            opened_in: pigeonhole_io::sys::process_id(),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1611,6 +1612,7 @@ impl Engine {
             application_owned: false,
             no_writes: true,
             lock_file: None,
+            opened_in: pigeonhole_io::sys::process_id(),
             default_durability: AtomicU8::new(options.durability as u8),
             closed: AtomicBool::new(false),
             closing: AtomicBool::new(false),
@@ -1700,11 +1702,17 @@ impl Engine {
 
     /// Looks up a table by name.
     pub fn table(&self, name: &str) -> Option<Arc<TableInfo>> {
+        if self.inner.forked() {
+            return None;
+        }
         self.inner.catalog().table_by_name(name).cloned()
     }
 
     /// Every table.
     pub fn tables(&self) -> Vec<Arc<TableInfo>> {
+        if self.inner.forked() {
+            return Vec::new();
+        }
         self.inner.catalog().tables().cloned().collect()
     }
 
@@ -1722,6 +1730,9 @@ impl Engine {
 
     /// Changes the writer default; applies to commits that start afterwards.
     pub fn set_default_durability(&self, durability: Durability) {
+        if self.inner.forked() {
+            return;
+        }
         self.inner
             .shared
             .default_durability
@@ -1734,6 +1745,9 @@ impl Engine {
     /// then [`Admit::attach`](crate::Admit::attach) it to the submitted commit, which returns the charge when the
     /// commit resolves. Blocking commits take no admission.
     pub fn admit(&self, batch: &WriteBatch) -> crate::Admit {
+        if self.inner.forked() {
+            return crate::Admit::new(None, 0, 0);
+        }
         self.inner.admit(batch)
     }
 
@@ -1741,6 +1755,9 @@ impl Engine {
     /// benches).
     #[doc(hidden)]
     pub fn admission_inflight(&self, shard: usize) -> u64 {
+        if self.inner.forked() {
+            return 0;
+        }
         self.inner
             .admission
             .as_ref()
@@ -2302,6 +2319,9 @@ impl Engine {
     /// What the row cache did since open (D201); all zero when it is off or in a reader
     /// process. A method rather than [`Metrics`] fields, which would break struct literals.
     pub fn row_cache_stats(&self) -> RowCacheStats {
+        if self.inner.forked() {
+            return RowCacheStats::default();
+        }
         self.inner
             .shared
             .row_cache
@@ -2315,6 +2335,9 @@ impl Engine {
     /// change after a split, merge or move, and a commit from any thread is correct whatever
     /// shard owns its rows.
     pub fn shard_of(&self, table: TableId, row: &[u8]) -> Option<usize> {
+        if self.inner.forked() {
+            return None;
+        }
         let view = self.inner.shared.view.load();
         view.tablets()
             .route(table, row)
@@ -2355,6 +2378,9 @@ impl Engine {
     /// [`Metrics::commit_latency_nanos`] (since open) cannot.
     #[doc(hidden)]
     pub fn commit_latency_buckets(&self) -> [[u64; 64]; 4] {
+        if self.inner.forked() {
+            return [[0; 64]; 4];
+        }
         let mut out = [[0u64; 64]; 4];
         for s in &self.inner.shared.metrics {
             for (d, hist) in out.iter_mut().enumerate() {
@@ -2381,6 +2407,9 @@ impl Engine {
     /// `memtable_budget` (#122). A method rather than a [`Metrics`] field, which would
     /// break struct literals.
     pub fn tablet_refusals(&self) -> (u64, u64) {
+        if self.inner.forked() {
+            return (0, 0);
+        }
         self.inner.shared.metrics.iter().fold((0, 0), |(s, v), m| {
             (
                 s + m.refused_slots.load(Ordering::Relaxed),
@@ -2397,6 +2426,9 @@ impl Engine {
     /// regrow after a packed load.
     #[doc(hidden)]
     pub fn pack_target(&self) -> Option<(usize, usize)> {
+        if self.inner.forked() {
+            return None;
+        }
         let target = self.inner.shared.pack_target.load(Ordering::Acquire);
         (target > 0).then(|| (self.inner.shared.pack_k.load(Ordering::Acquire), target))
     }
@@ -2405,6 +2437,9 @@ impl Engine {
     /// issue #51).
     #[doc(hidden)]
     pub fn shard_stats(&self) -> Vec<ShardStats> {
+        if self.inner.forked() {
+            return Vec::new();
+        }
         let shared = &self.inner.shared;
         let mut out: Vec<ShardStats> = shared
             .metrics
@@ -2444,17 +2479,26 @@ impl Engine {
     /// it is closed and reopened; [`Engine::failure`] says which shard and why. Cheap: one
     /// atomic load.
     pub fn is_failed(&self) -> bool {
+        if self.inner.forked() {
+            return false;
+        }
         self.inner.shared.failure.get().is_some()
     }
 
     /// The instance's first failure, if any (see [`Engine::is_failed`]). Later failures do
     /// not replace it.
     pub fn failure(&self) -> Option<crate::Failure> {
+        if self.inner.forked() {
+            return None;
+        }
         self.inner.shared.failure.get()
     }
 
     /// Current metrics.
     pub fn metrics(&self) -> Metrics {
+        if self.inner.forked() {
+            return Metrics::default();
+        }
         let shared = &self.inner.shared;
         let mut m = Metrics::default();
         if let Some(rt) = self
@@ -2679,6 +2723,9 @@ impl Engine {
     /// automatic recovery (#620); not a stable API.
     #[doc(hidden)]
     pub fn release_memory(&self) {
+        if self.inner.forked() {
+            return;
+        }
         if self.inner.role == Role::Writer && !self.inner.application_owned {
             self.inner.shared.release_memory();
         }
@@ -2690,6 +2737,9 @@ impl Engine {
     /// recovery (#620, D265); not a stable API.
     #[doc(hidden)]
     pub fn wait_failed(&self, deadline: std::time::Instant) -> bool {
+        if self.inner.forked() {
+            return false;
+        }
         let shared = &self.inner.shared;
         let failed = shared
             .failure
@@ -3043,11 +3093,17 @@ pub struct PendingMaintenance {
     /// A failed reply of the current round, reported once every shard has replied (the
     /// future; the blocking `wait` keeps its own).
     pub(crate) failed: Option<Error>,
+    /// The process that submitted it: polled or waited on in a forked child, it fails
+    /// `Unsupported` at once (#901, perf287's M2).
+    owner: u32,
 }
 
 impl PendingMaintenance {
     /// Blocks until every shard replied (to every round of a full compaction).
     pub(crate) fn wait(mut self) -> Result<()> {
+        if self.owner != pigeonhole_io::sys::process_id() {
+            return Err(forked());
+        }
         loop {
             let mut result = Ok(());
             for w in std::mem::take(&mut self.waiters) {
@@ -3072,6 +3128,9 @@ impl std::future::Future for PendingMaintenance {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        if self.owner != pigeonhole_io::sys::process_id() {
+            return std::task::Poll::Ready(Err(forked()));
+        }
         loop {
             match self.poll_round(cx) {
                 std::task::Poll::Ready(Ok(())) => {}
@@ -3150,6 +3209,7 @@ impl Inner {
             waiters: vec![rx],
             rounds: None,
             failed: None,
+            owner: pigeonhole_io::sys::process_id(),
         })
     }
 
@@ -3243,6 +3303,16 @@ impl Inner {
             return Err(Error::Closed);
         }
         Ok(())
+    }
+
+    /// In a forked child of the process that opened the engine (#901): the rule there is
+    /// that a handle may only be dropped or closed; every other entry point fails
+    /// `Unsupported` ([`Inner::check_process`]) or is inert (an accessor returns its empty or
+    /// default value without taking any lock, which a parent thread may have held at the
+    /// fork). ICR 0067.
+    #[inline]
+    pub(crate) fn forked(&self) -> bool {
+        pigeonhole_io::sys::process_id() != self.opened_in
     }
 
     /// `Unsupported` in a process other than the one that opened the engine (a forked
@@ -3859,6 +3929,7 @@ impl Inner {
             waiters,
             rounds: None,
             failed: None,
+            owner: pigeonhole_io::sys::process_id(),
         })
     }
 
@@ -3874,6 +3945,7 @@ impl Inner {
             waiters,
             rounds,
             failed: None,
+            owner: pigeonhole_io::sys::process_id(),
         })
     }
 
@@ -4418,6 +4490,12 @@ pub struct EngineShard {
 }
 
 impl EngineShard {
+    /// In a forked child (#901): the shard is the parent's, and every driving method does
+    /// nothing (`run_once` returns `false`, `commit_local` fails `Unsupported`).
+    fn forked(&self) -> bool {
+        pigeonhole_io::sys::process_id() != self.engine.opened_in
+    }
+
     /// Shard index.
     pub fn index(&self) -> u16 {
         self.driver.as_ref().map_or(0, |d| d.shard().0)
@@ -4438,6 +4516,11 @@ impl EngineShard {
     /// counts as its driver: a thread holding a shard it has not run yet is not protected,
     /// and must not block on a commit (run the shard first).
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
+        // A forked child's copy runs nothing: its state machine would append to the
+        // parent's log and apply into the parent's arenas (#901, perf287's M1).
+        if self.forked() {
+            return false;
+        }
         let Some(d) = self.driver.as_mut() else {
             return false;
         };
@@ -4454,6 +4537,9 @@ impl EngineShard {
     /// in engine-owned mode (shards never move). Debug builds panic when a shard turns up on
     /// another thread with I/O left on the old one unreleased.
     pub fn release(&mut self) {
+        if self.forked() {
+            return;
+        }
         if let Some(d) = self.driver.as_mut() {
             d.release();
         }
@@ -4465,6 +4551,9 @@ impl EngineShard {
     /// same outcome; an `Err` means the close was not clean or failed (the next open
     /// replays the WAL).
     pub fn closed(&self) -> Option<Result<()>> {
+        if self.forked() {
+            return None;
+        }
         self.engine
             .shared
             .close
@@ -4478,6 +4567,9 @@ impl EngineShard {
     /// shard. It may return early: loop on `run_once`. It needs no completion fd: with
     /// io_uring it waits in the thread's ring while its own I/O is in flight.
     pub fn wait(&mut self, timeout: std::time::Duration) {
+        if self.forked() {
+            return;
+        }
         if let Some(d) = self.driver.as_mut() {
             d.wait(timeout);
         }
@@ -4487,6 +4579,9 @@ impl EngineShard {
     /// futures the driving thread polls itself (a commit's future, resolved on another
     /// shard's thread).
     pub fn waker(&self) -> std::task::Waker {
+        if self.forked() {
+            return std::task::Waker::noop().clone();
+        }
         self.driver
             .as_ref()
             .map_or_else(|| std::task::Waker::noop().clone(), |d| d.waker())
@@ -4497,6 +4592,9 @@ impl EngineShard {
     /// backoff), or `None`. After [`run_once`](EngineShard::run_once) returns `false`, call
     /// it again when the wakeup fires or this deadline passes, whichever comes first.
     pub fn next_deadline(&self) -> Option<u64> {
+        if self.forked() {
+            return None;
+        }
         self.driver.as_ref().and_then(ShardDriver::next_deadline)
     }
 
@@ -4553,6 +4651,9 @@ impl EngineShard {
 
     /// Registers a callback the engine calls when work arrives for this shard.
     pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        if self.forked() {
+            return;
+        }
         if let Some(d) = self.driver.as_mut() {
             d.set_wakeup(wake);
         }

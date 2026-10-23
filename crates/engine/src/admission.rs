@@ -45,6 +45,10 @@ struct ShardAdmission {
     /// takes the fast path).
     waiting: AtomicUsize,
     queue: Mutex<Queue>,
+    /// The process that created it ([`pigeonhole_io::sys::process_id`]). In a forked child a
+    /// charge or a queued commit dropped leaves it alone: its lock may have been copied held
+    /// by a parent thread (#901, perf287's M3).
+    owner: u32,
 }
 
 #[derive(Debug, Default)]
@@ -73,6 +77,7 @@ impl Admission {
                         inflight: AtomicU64::new(0),
                         waiting: AtomicUsize::new(0),
                         queue: Mutex::new(Queue::default()),
+                        owner: pigeonhole_io::sys::process_id(),
                     })
                 })
                 .collect(),
@@ -184,7 +189,9 @@ impl Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        if let Some((s, bytes)) = self.0.take() {
+        if let Some((s, bytes)) = self.0.take()
+            && s.owner == pigeonhole_io::sys::process_id()
+        {
             s.release(bytes);
         }
     }
@@ -332,6 +339,10 @@ impl Drop for Admit {
         let Some(a) = self.admission.take() else {
             return;
         };
+        // A forked child's copy leaves the parent's queue alone (#901).
+        if a.shards[self.shard].owner != pigeonhole_io::sys::process_id() {
+            return;
+        }
         match self.state {
             AdmitState::Charged => a.shards[self.shard].release(self.bytes),
             AdmitState::Queued(id) => {

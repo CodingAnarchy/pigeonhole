@@ -487,6 +487,10 @@ impl PendingCommit {
     /// [`Error::WouldDeadlock`]: the commit was submitted and will apply, but its outcome
     /// must be awaited from the event loop (poll this future there) or another thread.
     pub fn wait(mut self) -> crate::Result<CommitInfo> {
+        // Submitted before a fork: in the child no shard thread will resolve it (#901, M2).
+        if forked(&self.sub.shared) {
+            return Err(crate::engine::forked());
+        }
         if self.deferred.is_some() {
             self = self.submit_deferred_blocking()?;
         }
@@ -509,8 +513,19 @@ impl Submission {
     /// [`PendingCommit::wait`] for a commit the engine submitted itself (a blocking
     /// commit): never waiting for room.
     pub(crate) fn wait(mut self) -> crate::Result<CommitInfo> {
+        if forked(&self.shared) {
+            return Err(crate::engine::forked());
+        }
         wait_body(&self.shared, &mut self.waiter, self.spins)
     }
+}
+
+/// Whether this is a forked child of the process that opened the engine (#901): a commit
+/// or check waited on there would wait for ever for a shard thread that runs only in the
+/// parent, so it fails `Unsupported` on its first poll or wait instead (perf287's M2).
+#[inline]
+fn forked(shared: &crate::engine::ShardRef) -> bool {
+    pigeonhole_io::sys::process_id() != shared.opened_in
 }
 
 /// A blocking commit's wait on the engine's own borrowed state (D236): the caller holds
@@ -834,6 +849,9 @@ impl Future for PendingCommit {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        if forked(&this.sub.shared) {
+            return Poll::Ready(Err(crate::engine::forked()));
+        }
         if this.deferred.is_some() {
             return this.poll_deferred(cx);
         }
@@ -884,6 +902,9 @@ impl PendingCheck {
     /// Blocks until the check resolved and an applied commit is visible, as
     /// [`PendingCommit::wait`] does (including its refusal on a thread that drives a shard).
     pub fn wait(mut self) -> crate::Result<(bool, Option<CommitInfo>)> {
+        if forked(&self.shared) {
+            return Err(crate::engine::forked());
+        }
         if self.deferred.is_some() {
             let (admit, submitted) = Deferred::submit_blocking(&mut self.deferred);
             self = submitted?;
@@ -939,6 +960,9 @@ impl Future for PendingCheck {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        if forked(&this.shared) {
+            return Poll::Ready(Err(crate::engine::forked()));
+        }
         if this.deferred.is_some() {
             return this.poll_deferred(cx);
         }

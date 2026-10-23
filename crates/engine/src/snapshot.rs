@@ -726,6 +726,9 @@ pub(crate) struct LiveViews {
     /// memtable arenas once nothing can read them, D265). Runs after `on_oldest_released`,
     /// outside the lock.
     on_all_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The process that created it: in a forked child a view dropped leaves the registry
+    /// alone and runs no release (#901, perf287's M3).
+    owner: u32,
 }
 
 impl std::fmt::Debug for LiveViews {
@@ -742,6 +745,7 @@ impl Default for LiveViews {
             versions: RegistryLock::new(BTreeMap::new()),
             on_oldest_released: OnceLock::new(),
             on_all_released: OnceLock::new(),
+            owner: pigeonhole_io::sys::process_id(),
         }
     }
 }
@@ -827,6 +831,9 @@ impl ViewPin {
 
 impl Drop for ViewPin {
     fn drop(&mut self) {
+        if self.registry.owner != pigeonhole_io::sys::process_id() {
+            return;
+        }
         let (oldest, all) = self.registry.unregister(self.version);
         if oldest && let Some(release) = self.registry.on_oldest_released.get() {
             release();
@@ -838,9 +845,21 @@ impl Drop for ViewPin {
 }
 
 /// Every live in-process snapshot seqno, for compaction's `GcPolicy::snapshots`.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct LiveSeqnos {
     seqnos: Mutex<BTreeMap<Seqno, u32>>,
+    /// The process that created it: in a forked child a snapshot dropped leaves the list
+    /// alone, whose lock a parent's shard thread may have held at the fork (#901, M3).
+    owner: u32,
+}
+
+impl Default for LiveSeqnos {
+    fn default() -> Self {
+        Self {
+            seqnos: Mutex::default(),
+            owner: pigeonhole_io::sys::process_id(),
+        }
+    }
 }
 
 impl LiveSeqnos {
@@ -890,6 +909,9 @@ impl SeqnoPin {
 
 impl Drop for SeqnoPin {
     fn drop(&mut self) {
+        if self.registry.owner != pigeonhole_io::sys::process_id() {
+            return;
+        }
         let mut m = self
             .registry
             .seqnos
@@ -1060,6 +1082,11 @@ impl LiveSnapshot {
 
 impl Drop for LiveSnapshot {
     fn drop(&mut self) {
+        // In a forked child the slot handle is inert (#898) and `ReaderPins`' lock may have
+        // been copied held by a parent thread: leave it alone (#901, perf287's M3).
+        if !self.slot.is_current() {
+            return;
+        }
         self.pins.release(self.key);
     }
 }
