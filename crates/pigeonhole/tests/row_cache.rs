@@ -88,8 +88,32 @@ fn a_cached_row_is_served_until_the_row_is_written() {
     assert_eq!(read(), after);
     assert_eq!(delta(&db, s), (1, 0, 0));
     assert_eq!(after[0].3, b"3");
-    // A write to another row leaves it cached; flushes and compactions too.
-    t.mutate(b"other").put("f", b"a", b"x").commit().unwrap();
+    // A write to another row leaves it cached, unless the two rows share a write-watermark
+    // slot (D201: a shared slot costs a false miss, never a wrong row). The slots are hashed
+    // with a per-engine random seed, so any one other row shares `r`'s with probability about
+    // 1 in 4,096 (#918): such a write makes the next read miss and refill, and the test tries
+    // another row.
+    let left_cached = (0..3).any(|i| {
+        t.mutate(format!("other{i}").as_bytes())
+            .put("f", b"a", b"x")
+            .commit()
+            .unwrap();
+        let s = db.row_cache_stats();
+        assert_eq!(read(), after);
+        match delta(&db, s) {
+            (1, 0, 0) => true,
+            d => {
+                assert_eq!(
+                    d,
+                    (0, 1, 1),
+                    "only a shared slot makes it miss, and it refills"
+                );
+                false
+            }
+        }
+    });
+    assert!(left_cached, "three other rows all shared r's slot");
+    // Flushes and compactions write no row: it stays cached.
     db.flush().unwrap();
     db.compact().unwrap();
     let s = db.row_cache_stats();
