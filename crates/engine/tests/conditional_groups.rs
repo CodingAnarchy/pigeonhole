@@ -198,3 +198,186 @@ fn only_commits_on_a_held_back_row_wait_with_it() {
     assert_eq!(r.syncs(), 2, "two groups: {:?}", r.vfs.recorded_ops());
     r.db.close().unwrap();
 }
+
+// ---- D275: a transaction's cell read in a group ----
+
+/// A transaction that read `f:read` of `row` and writes `f:write` there, its snapshot taken
+/// now: submitted once the case's earlier members are.
+fn txn(r: &Rig, row: &[u8], read: &[u8], write: &[u8]) -> pigeonhole_engine::Txn {
+    let f = r.t.families[0].id;
+    let mut t = r.db.begin().unwrap();
+    t.get(r.t.id, f, row, read).unwrap();
+    t.batch()
+        .put(r.t.id, f, row, write, None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    t
+}
+
+/// ycsb-f's transactional read-modify-write on two fields of one hot row: the second
+/// transaction reads a cell the first did not write, so it joins the group and shares its
+/// sync, and both commit.
+#[test]
+fn a_transaction_reading_another_cell_of_a_row_the_group_wrote_joins_the_group() {
+    let mut r = open(7611);
+    r.commit(r.put(b"r", b"q1"));
+    r.commit(r.put(b"r", b"q2"));
+    let a = txn(&r, b"r", b"q1", b"q1");
+    let b = txn(&r, b"r", b"q2", b"q2");
+    r.start();
+    let a = a.submit(DURABLE).unwrap();
+    let b = b.submit(DURABLE).unwrap();
+    let a = r.drive(a).unwrap();
+    let b = r.drive(b).unwrap();
+    assert!(b.seqno > a.seqno);
+    assert_eq!(r.syncs(), 1, "one group: {:?}", r.vfs.recorded_ops());
+    r.db.close().unwrap();
+}
+
+/// A write a case puts earlier in the group.
+type EarlierWrite = fn(&Rig, &mut WriteBatch);
+
+/// Each kind of write of the read cell earlier in the group (perf287's P4: a put, a cell
+/// delete, a column delete, a family delete, a row delete) holds the transaction for the next
+/// group, where its validation sees the write and it conflicts.
+#[test]
+fn a_transaction_reading_a_cell_the_group_wrote_waits_and_conflicts() {
+    let kinds: [(&str, EarlierWrite); 5] = [
+        ("put", |r, wb| {
+            wb.put(
+                r.t.id,
+                r.t.families[0].id,
+                b"r",
+                b"q1",
+                None,
+                ValueRef::Bytes(b"x"),
+            )
+            .unwrap()
+        }),
+        ("delete_cell", |r, wb| {
+            wb.delete_cell(r.t.id, r.t.families[0].id, b"r", b"q1", 1)
+                .unwrap()
+        }),
+        ("delete_column", |r, wb| {
+            wb.delete_column(r.t.id, r.t.families[0].id, b"r", b"q1", None)
+                .unwrap()
+        }),
+        ("delete_family", |r, wb| {
+            wb.delete_family(r.t.id, r.t.families[0].id, b"r", None)
+                .unwrap()
+        }),
+        ("delete_row", |r, wb| {
+            wb.delete_row(r.t.id, b"r", None).unwrap()
+        }),
+    ];
+    for (seed, (kind, write)) in (7612..).zip(kinds) {
+        let mut r = open(seed);
+        r.commit(r.put(b"r", b"q1"));
+        let t = txn(&r, b"r", b"q1", b"q3");
+        let mut wb = WriteBatch::new();
+        write(&r, &mut wb);
+        let a = r.db.submit(wb, DURABLE).unwrap();
+        let b = t.submit(DURABLE).unwrap();
+        r.drive(a).unwrap();
+        let b = r.drive(b);
+        assert!(
+            matches!(b, Err(pigeonhole_engine::Error::Conflict)),
+            "{kind} of the read cell earlier in the group was missed: {b:?}"
+        );
+        r.db.close().unwrap();
+    }
+}
+
+/// A transaction that read a row whole (`get_row`) still waits for any earlier write to the
+/// row in its group, and conflicts with it.
+#[test]
+fn a_transaction_reading_a_row_whole_waits_for_any_write_to_it() {
+    let mut r = open(7620);
+    r.commit(r.put(b"r", b"q1"));
+    let mut t = r.db.begin().unwrap();
+    let mut sink = pigeonhole_engine::RowData::default();
+    t.read_row_into(
+        r.t.id,
+        b"r",
+        &[],
+        &pigeonhole_engine::ReadSpec::default(),
+        &mut sink,
+    )
+    .unwrap();
+    t.batch()
+        .put(
+            r.t.id,
+            r.t.families[0].id,
+            b"r",
+            b"q3",
+            None,
+            ValueRef::Bytes(b"t"),
+        )
+        .unwrap();
+    let a = r.db.submit(r.put(b"r", b"q2"), DURABLE).unwrap();
+    let b = t.submit(DURABLE).unwrap();
+    r.drive(a).unwrap();
+    let b = r.drive(b);
+    assert!(
+        matches!(b, Err(pigeonhole_engine::Error::Conflict)),
+        "a write to the row read whole was missed: {b:?}"
+    );
+    r.db.close().unwrap();
+}
+
+/// In a counter family (perf287's P4): an increment of the read counter earlier in the group
+/// holds the transaction and it conflicts; an increment of another counter of the row lets it
+/// join the group.
+#[test]
+fn a_transaction_after_an_increment_in_the_group_waits_only_for_its_own_counter() {
+    for (seed, incremented, conflicts) in [(7621, &b"n1"[..], true), (7622, b"n2", false)] {
+        let mut r = open(seed);
+        let ctr =
+            r.db.create_table(
+                "ctr",
+                &[(
+                    "c".into(),
+                    FamilyOptions::default()
+                        .merge_operator("pigeonhole.i64_add")
+                        .kind(pigeonhole_format::manifest::FamilyKind::Counter),
+                )],
+            )
+            .unwrap();
+        let c = ctr.family("c").unwrap().id;
+        let mut wb = WriteBatch::new();
+        for q in [&b"n1"[..], b"n2"] {
+            wb.put(ctr.id, c, b"r", q, None, ValueRef::I64(100))
+                .unwrap();
+        }
+        r.commit(wb);
+        let mut t = r.db.begin().unwrap();
+        t.get(ctr.id, c, b"r", b"n1").unwrap();
+        t.batch()
+            .put(
+                r.t.id,
+                r.t.families[0].id,
+                b"out",
+                b"q",
+                None,
+                ValueRef::Bytes(b"t"),
+            )
+            .unwrap();
+        r.start();
+        let mut wb = WriteBatch::new();
+        wb.merge(ctr.id, c, b"r", incremented, ValueRef::I64(1))
+            .unwrap();
+        let a = r.db.submit(wb, DURABLE).unwrap();
+        let b = t.submit(DURABLE).unwrap();
+        r.drive(a).unwrap();
+        let b = r.drive(b);
+        if conflicts {
+            assert!(
+                matches!(b, Err(pigeonhole_engine::Error::Conflict)),
+                "an increment of the read counter earlier in the group was missed: {b:?}"
+            );
+        } else {
+            b.unwrap();
+            assert_eq!(r.syncs(), 1, "one group: {:?}", r.vfs.recorded_ops());
+        }
+        r.db.close().unwrap();
+    }
+}

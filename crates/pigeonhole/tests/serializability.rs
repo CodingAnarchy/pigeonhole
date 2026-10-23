@@ -2,7 +2,8 @@
 //! read, through the public API, with real threads (so real interleavings), no reference
 //! model and no engine internals:
 //! - `histories_are_serializable`: concurrent read-modify-write, blind-write and read-only
-//!   transactions over a few hot keys spread across shards. Every write stores a unique
+//!   transactions over a few hot keys spread across shards, two cells to a row (D275: a
+//!   transaction conflicts per cell read). Every write stores a unique
 //!   value, so each read names the write it saw. The history must have no read of an
 //!   aborted or unknown write (G1a), every attempt's reads must come from one snapshot (even
 //!   one that then conflicts), and the dependency graph of the committed transactions (ww
@@ -118,6 +119,17 @@ impl Keys {
     fn of(&self, k: usize) -> (&Table, Vec<u8>) {
         (&self.tables[k % TABLES], format!("key{k:04}").into_bytes())
     }
+    /// Key `k` as a cell: keys `2i` and `2i + 1` of a table are two qualifiers of one row, so
+    /// transactions on different cells of a row commit side by side (D275), and the history
+    /// check covers that too.
+    fn cell(&self, k: usize) -> (&Table, Vec<u8>, Vec<u8>) {
+        let i = k / TABLES;
+        (
+            &self.tables[k % TABLES],
+            format!("key{:04}", i / 2).into_bytes(),
+            format!("v{}", i % 2).into_bytes(),
+        )
+    }
 }
 
 /// A transaction's read, or a write's value: eight bytes, little-endian.
@@ -157,10 +169,10 @@ fn histories_are_serializable() {
         // The initial values, committed before any transaction.
         let mut init_seqno = 0;
         for k in 0..nkeys {
-            let (t, row) = keys.of(k);
+            let (t, row, q) = keys.cell(k);
             init_seqno = t
                 .mutate(&row)
-                .put("f", b"v", &(k as u64).to_le_bytes())
+                .put("f", &q, &(k as u64).to_le_bytes())
                 .commit()
                 .unwrap()
                 .seqno
@@ -168,7 +180,7 @@ fn histories_are_serializable() {
         }
         let shards: std::collections::HashSet<_> = (0..nkeys)
             .map(|k| {
-                let (t, row) = keys.of(k);
+                let (t, row, _) = keys.cell(k);
                 t.shard_of(&row)
             })
             .collect();
@@ -203,11 +215,8 @@ fn histories_are_serializable() {
         // The final value of each key, for the last version check.
         let mut last = BTreeMap::new();
         for k in 0..nkeys {
-            let (t, row) = keys.of(k);
-            let v = t
-                .get(&row, "f", b"v")
-                .unwrap()
-                .expect("every key is present");
+            let (t, row, q) = keys.cell(k);
+            let v = t.get(&row, "f", &q).unwrap().expect("every key is present");
             last.insert(k, decode(v.value()));
         }
         check_history(&history, nkeys, init_seqno, &last);
@@ -259,8 +268,8 @@ fn attempt(
     let mut writes = Vec::new();
     let read_keys: &[usize] = if kind == 3 { &picked[1..] } else { &picked };
     for &k in read_keys {
-        let (t, row) = keys.of(k);
-        match txn.get(t, &row, "f", b"v") {
+        let (t, row, q) = keys.cell(k);
+        match txn.get(t, &row, "f", &q) {
             Ok(Some(c)) => reads.push((k, decode(c.value()))),
             Ok(None) => panic!("key {k} read as absent"),
             Err(e) => {
@@ -281,8 +290,8 @@ fn attempt(
     for &k in write_keys {
         *n += 1;
         let v = unique(worker, *n);
-        let (t, row) = keys.of(k);
-        txn.put(t, &row, "f", b"v", &v.to_le_bytes());
+        let (t, row, q) = keys.cell(k);
+        txn.put(t, &row, "f", &q, &v.to_le_bytes());
         writes.push((k, v));
     }
     let outcome = match txn.commit() {

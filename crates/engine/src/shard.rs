@@ -21,8 +21,8 @@ use pigeonhole_compaction::{
 };
 use pigeonhole_format::hash::{FastBuildHasher, FastMap, FastSet};
 use pigeonhole_format::key::{
-    SUFFIX_LEN, compare, encode_key_after_row, encode_marker_after_row, encode_row_prefix,
-    split_suffix,
+    MARKER_QUALIFIER, SUFFIX_LEN, compare, encode_column_prefix, encode_key_after_row,
+    encode_marker_after_row, encode_marker_prefix, encode_row_prefix, split_suffix,
 };
 use pigeonhole_format::manifest::{CompactionStyle, Edit, FamilyKind};
 use pigeonhole_format::scan::ScanFilter;
@@ -51,7 +51,7 @@ use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
 use crate::purge_guard::PurgeGuard;
 use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
-use crate::source::{ColumnKey, Resolver, Source, mem_sources_from, sst_sources_point};
+use crate::source::{ColumnKey, Probe, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::timer_state::TimerState;
 use crate::waker::StdWaker;
 use crate::write::{ReadKey, Settled, Validate};
@@ -1171,7 +1171,7 @@ pub(crate) struct CommitReq {
     pub reply: Reply,
     pub submitted_at: u64,
     /// Optimistic validation: the snapshot seqno and the reads to check.
-    pub validate: Option<Box<Validate>>,
+    pub validate: Option<Arc<Validate>>,
     /// `check_and_mutate`: the row and predicate to test first. Boxed: rare, and the
     /// largest part of the request, which every queued message is sized for.
     pub predicate: Option<RowPredicate>,
@@ -1208,7 +1208,7 @@ pub(crate) struct CoordinateReq {
     pub durability: Durability,
     pub reply: Notifier<Result<Settled>>,
     pub submitted_at: u64,
-    pub validate: Option<Box<Validate>>,
+    pub validate: Option<Arc<Validate>>,
     /// Version of the tablet map the parts were routed with: a commit a participant refused
     /// because it is moving a tablet is retried once the map is newer.
     pub map_version: u64,
@@ -1285,7 +1285,7 @@ pub(crate) struct PrepareReq {
     pub coordinator: ShardId,
     pub bytes: Arc<BatchBuilder>,
     pub durability: Durability,
-    pub validate: Option<Box<Validate>>,
+    pub validate: Option<Arc<Validate>>,
     /// Every shard the commit was routed to: a share routed with an older tablet map runs
     /// again only when one of its rows now lives outside them (#102).
     pub participants: Vec<ShardId>,
@@ -1558,7 +1558,7 @@ struct Member {
     bytes: Bytes,
     reply: Reply,
     submitted_at: u64,
-    validate: Option<Box<Validate>>,
+    validate: Option<Arc<Validate>>,
     predicate: Option<RowPredicate>,
     ticket: Option<CommitTicket>,
     /// Failed before being logged (not applied, resolved with this error).
@@ -1655,18 +1655,20 @@ impl Member {
     }
 }
 
-/// Whether a member of `members` writes the cell `predicate` reads on `row`: any mutation of
-/// its column, or a delete of its family (a row delete is one per family, D10).
-fn writes_cell(members: &[Member], table: TableId, row: &[u8], predicate: &Predicate) -> bool {
-    let (family, qualifier) = match predicate {
-        Predicate::Exists { family, qualifier }
-        | Predicate::Absent { family, qualifier }
-        | Predicate::Value {
-            family, qualifier, ..
-        } => (*family, qualifier.as_slice()),
-    };
+/// Whether a member of `members` writes the cell `(family, qualifier)` of `row`: any mutation
+/// of its column, or a delete of its family (a row delete is one per family, D10).
+fn writes_cell<'a>(
+    members: impl Iterator<Item = &'a Member>,
+    table: TableId,
+    row: &[u8],
+    family: FamilyId,
+    qualifier: &[u8],
+) -> bool {
+    // Every kind of mutation of the column writes the cell: a put, a merge operand (a counter
+    // increment, at any bucket), a cell delete and a column delete all carry its qualifier. A
+    // family marker (a family delete, or one of a row delete's, expanded per family before
+    // routing, D10) writes every cell of its family.
     members
-        .iter()
         .filter(|m| !matches!(m.kind, MemberKind::CommitRecord { .. }))
         .filter_map(|m| BatchRef::new(m.bytes.as_slice()).ok())
         .any(|batch| {
@@ -1713,7 +1715,7 @@ struct Coord {
     shards: Vec<ShardId>,
     /// The request, kept for a retry when a participant refused with `Moved`.
     parts: Vec<(ShardId, Arc<BatchBuilder>)>,
-    validate: Option<Box<Validate>>,
+    validate: Option<Arc<Validate>>,
     map_version: u64,
     /// Some participant refused this round, and what its retry waits for (`RetryWait`).
     refused: Option<RetryWait>,
@@ -1748,8 +1750,9 @@ pub(crate) struct OverlapRefusal {
     /// single is logged (`end_single_wait`), not when the shares clear (0: not so refused).
     pub single: u32,
     /// Its validated reads (`None`: it reads nothing): once a share writing one of them
-    /// commits here and the read is stale, it fails rather than retries (D276).
-    pub validate: Option<Box<Validate>>,
+    /// commits here and the read is stale, it fails rather than retries (D276). A clone of
+    /// the commit's shared reads (D275).
+    pub validate: Option<Arc<Validate>>,
 }
 
 /// What a PREPARE refused over an overlap waits for (D249, D267).
@@ -4832,14 +4835,18 @@ impl ShardState {
         })
     }
 
-    /// Whether any entry of `(table, row, family)` on this shard has a seqno above
-    /// `snapshot` (optimistic validation). Reads of rows other shards own are theirs to check.
+    /// Whether a write above `snapshot` on this shard could change what `read` read
+    /// (optimistic validation): for a family read, any entry of `(table, row, family)`; for a
+    /// cell read, `cell_conflicts`. Reads of rows other shards own are theirs to check.
     fn conflicts(&mut self, snapshot: Seqno, read: &ReadKey) -> Result<bool> {
         let Some((tablet, shard)) = self.tablets.route(read.table, &read.row) else {
             return Ok(false);
         };
         if shard != self.id {
             return Ok(false);
+        }
+        if let Some(qualifier) = &read.qualifier {
+            return self.cell_conflicts(snapshot, read, tablet, qualifier);
         }
         self.key_buf.clear();
         encode_row_prefix(&mut self.key_buf, &read.row)?;
@@ -4923,6 +4930,125 @@ impl ShardState {
         }
         self.key_buf = prefix;
         Ok(found)
+    }
+
+    /// D275: whether an entry above `snapshot` could change the one cell `read` names: an
+    /// entry of its column (a put, merge operand, counter increment, cell or column delete), or
+    /// a family marker of its row (a family delete, or a row delete's marker in this family).
+    /// Writes to other qualifiers leave the cell as read. Every marker version of the row is
+    /// read whatever the memtable's `explicit_ts` flag: a marker may carry an explicit
+    /// timestamp, so the row's markers need not follow seqno order, and they are few. Of the
+    /// column, the first version only where D273's order holds, else all of its versions.
+    fn cell_conflicts(
+        &mut self,
+        snapshot: Seqno,
+        read: &ReadKey,
+        tablet: TabletId,
+        qualifier: &[u8],
+    ) -> Result<bool> {
+        let mut marker = std::mem::take(&mut self.key_buf);
+        let mut column = std::mem::take(&mut self.seek_buf);
+        marker.clear();
+        column.clear();
+        let found = match encode_marker_prefix(&mut marker, &read.row)
+            .and_then(|()| encode_column_prefix(&mut column, &read.row, qualifier))
+        {
+            // A row or qualifier no key may hold: nothing was written there.
+            Err(_) => Ok(false),
+            Ok(()) => self.cell_entries_above(snapshot, read, tablet, qualifier, &marker, &column),
+        };
+        self.key_buf = marker;
+        self.seek_buf = column;
+        found
+    }
+
+    /// [`cell_conflicts`](Self::cell_conflicts)' walk, with the row's marker prefix and the
+    /// column prefix built: the unflushed memtables, then the SSTs holding anything above
+    /// `snapshot` whose filters admit the column or the row's markers.
+    fn cell_entries_above(
+        &self,
+        snapshot: Seqno,
+        read: &ReadKey,
+        tablet: TabletId,
+        qualifier: &[u8],
+        marker: &[u8],
+        column: &[u8],
+    ) -> Result<bool> {
+        #[cfg(feature = "test-hooks")]
+        let hooks = &self.shared.metrics[usize::from(self.id.0)].hooks;
+        if let Some(slot) = self.memtables.get(&(tablet, read.family)) {
+            let found = self.shared.flushed_roots.read(|flushed| -> Result<bool> {
+                for entry in slot.unflushed(self.id, flushed) {
+                    let reader = entry.table.reader();
+                    let mut it = reader.iter();
+                    it.seek(marker)?;
+                    while it.valid() && it.key().starts_with(marker) {
+                        #[cfg(feature = "test-hooks")]
+                        hooks.validate_entries.fetch_add(1, Ordering::Relaxed);
+                        if split_suffix(it.key())?.2 > snapshot {
+                            return Ok(true);
+                        }
+                        it.next()?;
+                    }
+                    it.seek(column)?;
+                    while it.valid() && it.key().starts_with(column) {
+                        #[cfg(feature = "test-hooks")]
+                        hooks.validate_entries.fetch_add(1, Ordering::Relaxed);
+                        if split_suffix(it.key())?.2 > snapshot {
+                            return Ok(true);
+                        }
+                        if !entry.explicit_ts {
+                            // D273: the column's first version holds its largest seqno.
+                            break;
+                        }
+                        it.next()?;
+                    }
+                }
+                Ok(false)
+            })?;
+            if found {
+                return Ok(true);
+            }
+        }
+        let view = self.shared.view.load();
+        let l = view.locate(self.id, tablet, read.family);
+        let Some(fam) = l.ssts else {
+            return Ok(false);
+        };
+        let row = &marker[..marker.len() - MARKER_QUALIFIER.len()];
+        let mut past = Vec::new();
+        crate::read::past_row(row, &mut past);
+        let mut probe = None;
+        for sst in fam.iter() {
+            if sst.meta.seqno_range.1 <= snapshot
+                || sst.first_row() >= past.as_slice()
+                || sst.last_row() < row
+            {
+                continue;
+            }
+            let reader = sst.reader(&view.ssts, l.priority)?;
+            // The point read's filter probe: the column filter is keyed per column, so a miss
+            // on the column and on the row's markers rules the SST out.
+            let probe =
+                probe.get_or_insert_with(|| Probe::new(&mut ColumnKey::new(&read.row, qualifier)));
+            if !probe.admits(&reader) {
+                continue;
+            }
+            // SSTs carry no `explicit_ts` flag (D273): every version is read.
+            let mut it = reader.iter(ScanFilter::all(), pigeonhole_sst::ReadOptions::default());
+            for prefix in [marker, column] {
+                it.seek(prefix)?;
+                while it.valid() && it.key().starts_with(prefix) {
+                    #[cfg(feature = "test-hooks")]
+                    hooks.validate_sst_entries.fetch_add(1, Ordering::Relaxed);
+                    if split_suffix(it.key())?.2 > snapshot {
+                        return Ok(true);
+                    }
+                    it.next()?;
+                }
+            }
+        }
+        Ok(false)
     }
 
     // ---- apply ----
@@ -6770,9 +6896,9 @@ impl ShardState {
     }
 
     /// Whether conditional `m` reads what an earlier member of this group (`admitted`)
-    /// wrote: its predicate cell (a write to that column, or a delete of its family or
-    /// row) or any of its read rows; and whether any of its rows (written, read, or its
-    /// predicate row) is a prepared, undecided share's.
+    /// wrote: its predicate cell or a cell it read (a write to that column, or a delete of
+    /// its family or row), or a row it read whole; and whether any of its rows (written,
+    /// read, or its predicate row) is a prepared, undecided share's.
     fn conflicts_with_group(&self, m: &Member, admitted: &[Member]) -> (bool, bool) {
         let mut same = false;
         let mut pending = false;
@@ -6781,8 +6907,26 @@ impl ShardState {
         if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 let h = hash_row(r.table, &r.row);
-                same |= self.touched.contains_key(&h);
                 pending |= self.pending_rows.contains_key(&h);
+                // The row hash first: only a row an earlier member touched is looked at.
+                if same || !self.touched.contains_key(&h) {
+                    continue;
+                }
+                same = match &r.qualifier {
+                    // D275: a cell read waits only for an earlier single's write of that
+                    // cell. A share admitted earlier in the group is undecided, so it is
+                    // left to the overlap sets: its rows are in `pending_rows`.
+                    Some(qualifier) => writes_cell(
+                        admitted
+                            .iter()
+                            .filter(|a| matches!(a.kind, MemberKind::Single)),
+                        r.table,
+                        &r.row,
+                        r.family,
+                        qualifier,
+                    ),
+                    None => true,
+                };
             }
         }
         if let Some((table, row, predicate)) = m.predicate.as_deref() {
@@ -6791,7 +6935,14 @@ impl ShardState {
             // The row hash first: only a row an earlier member touched is looked at cell
             // by cell.
             if !same && self.touched.contains_key(&h) {
-                same = writes_cell(admitted, *table, row, predicate);
+                let (family, qualifier) = match predicate {
+                    Predicate::Exists { family, qualifier }
+                    | Predicate::Absent { family, qualifier }
+                    | Predicate::Value {
+                        family, qualifier, ..
+                    } => (*family, qualifier.as_slice()),
+                };
+                same = writes_cell(admitted.iter(), *table, row, family, qualifier);
             }
         }
         (same, pending)
