@@ -285,6 +285,11 @@ fn a_forked_childs_application_owned_shards_run_nothing_and_its_futures_refuse()
         )
         .unwrap();
     let mut flush = db.submit_flush().unwrap();
+    // Polled once before the fork, `Pending` (nothing drives the shards): perf287's round 2
+    // on #919 found a first-poll-only check let such a future hang in the child.
+    assert!(poll_once(&mut commit).is_pending());
+    assert!(poll_once(&mut check).is_pending());
+    assert!(poll_once(&mut flush).is_pending());
     let before = files_of(&dir.0);
 
     // SAFETY: the child calls the engine from the forking thread and a watchdog thread it

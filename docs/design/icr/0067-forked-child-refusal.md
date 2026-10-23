@@ -20,7 +20,12 @@
 - `next_deadline` and `closed` return `None`;
 - `waker` returns a no-op waker.
 
-**Futures and waits created before the fork (M2):** `PendingCommit`, `PendingCheck` and `PendingMaintenance` fail `Unsupported` on their first `poll` or `wait`, as does `Submission::wait` with its spin. Otherwise they would wait for ever for a shard thread that runs only in the parent.
+**Futures and waits created before the fork (M2):**
+- `PendingCommit` and `PendingCheck` fail `Unsupported` on any poll that would return `Pending` (or wait for room, while deferred). The check sits there, not on every poll: a future that resolves at once pays nothing, and one polled `Pending` before the fork fails on its next poll in the child (perf287's round 2).
+- `PendingMaintenance` checks on every poll and wait; it's not on a hot path.
+- Their blocking `wait`s, and `Submission::wait` with its spin, fail at once.
+
+Otherwise they would wait for ever for a shard thread that runs only in the parent.
 
 **Accessors are inert (M3):** `metrics()` returns `Metrics::default()`, and each of these returns its empty or zero value:
 - `table`, `tables`, `shard_of`;

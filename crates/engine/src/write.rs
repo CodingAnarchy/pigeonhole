@@ -358,8 +358,6 @@ pub struct PendingCommit {
     /// An async commit still waiting for room on its shard (D210): submitted once
     /// admitted. `sub` holds a placeholder waiter meanwhile.
     pub(crate) deferred: Option<Box<Deferred<PendingCommit, crate::Result<Settled>>>>,
-    /// The fork check ran (on the first poll, #901): later polls skip it.
-    pub(crate) fork_checked: bool,
 }
 
 impl From<Submission> for PendingCommit {
@@ -368,7 +366,6 @@ impl From<Submission> for PendingCommit {
             sub,
             resolved: None,
             deferred: None,
-            fork_checked: false,
         }
     }
 }
@@ -529,6 +526,19 @@ impl Submission {
 #[inline]
 fn forked(shared: &crate::engine::ShardRef) -> bool {
     pigeonhole_io::sys::process_id() != shared.opened_in
+}
+
+/// `Pending`, or `Unsupported` in a forked child (#901). Checked where a commit or check
+/// future is about to return `Pending` (the only way it can wait), not on every poll: a
+/// future that resolves at once pays nothing, and one polled `Pending` before a fork fails
+/// on its next poll in the child (perf287's round 2 on #919).
+#[inline]
+fn pending_or_forked<T>(shared: &crate::engine::ShardRef) -> Poll<crate::Result<T>> {
+    if forked(shared) {
+        Poll::Ready(Err(crate::engine::forked()))
+    } else {
+        Poll::Pending
+    }
 }
 
 /// A blocking commit's wait on the engine's own borrowed state (D236): the caller holds
@@ -825,7 +835,6 @@ impl PendingCommit {
             },
             resolved: None,
             deferred: Some(deferred),
-            fork_checked: false,
         }
     }
 
@@ -853,20 +862,16 @@ impl Future for PendingCommit {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        // Once, on the first poll: submitted before a fork, nothing resolves it in the child.
-        if !this.fork_checked {
+        if this.deferred.is_some() {
             if forked(&this.sub.shared) {
                 return Poll::Ready(Err(crate::engine::forked()));
             }
-            this.fork_checked = true;
-        }
-        if this.deferred.is_some() {
             return this.poll_deferred(cx);
         }
         let info = match this.resolved {
             Some(info) => info,
             None => match Pin::new(&mut this.sub.waiter).poll(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => return pending_or_forked(&this.sub.shared),
                 Poll::Ready(None) => return Poll::Ready(Err(dropped_reply_now(&this.sub.shared))),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
                 Poll::Ready(Some(Ok(Settled { info, batch }))) => {
@@ -886,7 +891,7 @@ impl Future for PendingCommit {
         } else if this.sub.shared.visibility_ended() {
             Poll::Ready(Err(Error::OutcomeUnknown))
         } else {
-            Poll::Pending
+            pending_or_forked(&this.sub.shared)
         }
     }
 }
@@ -904,8 +909,6 @@ pub struct PendingCheck {
     pub(crate) resolved: Option<(bool, Option<CommitInfo>)>,
     /// As [`PendingCommit`]'s: still waiting for room (D210).
     pub(crate) deferred: Option<Box<Deferred<PendingCheck, CheckReply>>>,
-    /// As [`PendingCommit`]'s.
-    pub(crate) fork_checked: bool,
 }
 
 impl PendingCheck {
@@ -941,7 +944,6 @@ impl PendingCheck {
             shared,
             resolved: None,
             deferred: Some(deferred),
-            fork_checked: false,
         }
     }
 
@@ -971,19 +973,16 @@ impl Future for PendingCheck {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        if !this.fork_checked {
+        if this.deferred.is_some() {
             if forked(&this.shared) {
                 return Poll::Ready(Err(crate::engine::forked()));
             }
-            this.fork_checked = true;
-        }
-        if this.deferred.is_some() {
             return this.poll_deferred(cx);
         }
         let outcome = match this.resolved {
             Some(outcome) => outcome,
             None => match Pin::new(&mut this.waiter).poll(cx) {
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => return pending_or_forked(&this.shared),
                 Poll::Ready(None) => return Poll::Ready(Err(dropped_reply_now(&this.shared))),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
                 Poll::Ready(Some(Ok(outcome))) => {
@@ -1001,7 +1000,7 @@ impl Future for PendingCheck {
         } else if this.shared.visibility_ended() {
             Poll::Ready(Err(Error::OutcomeUnknown))
         } else {
-            Poll::Pending
+            pending_or_forked(&this.shared)
         }
     }
 }
