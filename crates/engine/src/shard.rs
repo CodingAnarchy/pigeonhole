@@ -1267,7 +1267,6 @@ pub(crate) struct PrepareReq {
     /// Version of the tablet map the share was routed with.
     pub map_version: u64,
     pub seqno: Seqno,
-    pub commit_ts: Timestamp,
     pub coordinator: ShardId,
     pub bytes: Arc<BatchBuilder>,
     pub durability: Durability,
@@ -7162,7 +7161,6 @@ impl ShardState {
         // `next_seqno` above every replayed PREPARE's. The seqno the commit applies at, and
         // its timestamp, are picked at the decision (`decide_commit`).
         let seqno = self.shared.clock.reserve_id(&self.shared.shm);
-        let commit_ts: Timestamp = 0;
         let priority = (
             req.submitted_at,
             if req.first_seqno == 0 {
@@ -7172,7 +7170,7 @@ impl ShardState {
             },
         );
         trace!(
-            "shard {} coordinates {seqno} {priority:?} at {commit_ts} over {shards:?} routed with map v{}",
+            "shard {} coordinates {seqno} {priority:?} over {shards:?} routed with map v{}",
             self.id.0, req.map_version
         );
         self.coord.insert(
@@ -7195,7 +7193,8 @@ impl ShardState {
                 validate: req.validate.clone(),
                 map_version: req.map_version,
                 refused: None,
-                commit_ts,
+                // Picked at the decision (`decide_commit`, D263, D271).
+                commit_ts: 0,
                 apply_seqno: 0,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
                 priority,
@@ -7214,7 +7213,6 @@ impl ShardState {
             let msg = ShardMsg::Prepare(PrepareReq {
                 map_version: req.map_version,
                 seqno,
-                commit_ts,
                 coordinator: self.id,
                 bytes,
                 durability: req.durability,
@@ -7253,7 +7251,8 @@ impl ShardState {
             req.seqno,
             PreparedShare {
                 bytes: Arc::clone(&req.bytes),
-                commit_ts: req.commit_ts,
+                // A lower bound set at admission; the decision's timestamp lands later.
+                commit_ts: 0,
                 reserved: 0,
                 tracked: false,
                 reads: Vec::new(),
@@ -7268,7 +7267,8 @@ impl ShardState {
             },
             durability: req.durability,
             seqno: req.seqno,
-            commit_ts: req.commit_ts,
+            // A PREPARE carries no timestamp (D263): the decision picks it.
+            commit_ts: 0,
             bytes: Bytes::Shared(req.bytes),
             reply: Reply::None,
             submitted_at: 0,
