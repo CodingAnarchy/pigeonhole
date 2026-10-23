@@ -11,10 +11,10 @@ SQLite's deployment model (one file, a library, no server).
 > gap, the read tail of wide, heavily overwritten rows
 > ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The latency engine
 > (Phase 3: io_uring, direct I/O, the async API, pinned thread-per-core shards) is complete in
-> this release, its gate passed on the reference machine (contended
-> gaps carried to Phase 4). The on-disk format and the API may
-> change before 1.0
-> ([`FORMAT.md`](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md)).
+> 0.3.0, its gate passed on the reference machine (contended gaps carried to Phase 4). The
+> file format is frozen for 1.x at format 4 (the
+> [compatibility promise](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md#13-compatibility-promise)
+> takes effect at 1.0.0); the API may still change before 1.0.
 > Pigeonhole is **not recommended for production use yet**. See the
 > [status and roadmap](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md).
 
