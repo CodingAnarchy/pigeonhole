@@ -5,7 +5,8 @@
 //! workload.
 //!
 //! - **Optimistic** (`rocksdb`, the judged baseline): `OptimisticTransactionDB`. A transaction
-//!   reads with `get_for_update` (the read is validated at commit) and writes; a commit that
+//!   reads with `get_pinned_for_update` at a snapshot taken at its start (validated at
+//!   commit) and writes; a commit that
 //!   finds a conflicting write fails with `Busy` and runs again, as Pigeonhole's optimistic
 //!   transactions do.
 //! - **Pessimistic** (`rocksdb-txn`, reported): `TransactionDB`. `get_for_update` takes the
@@ -64,6 +65,9 @@ pub struct RocksDbTxnRunner {
     memory: MemoryBudget,
     db: Option<Arc<Db>>,
     conflicts: Arc<AtomicU64>,
+    /// The retries by cause: `Busy`, `TryAgain`, `TimedOut` (perf287's F2: `TryAgain` means
+    /// the memtable history was too short to validate, not a conflict).
+    causes: Arc<[AtomicU64; 3]>,
 }
 
 impl std::fmt::Debug for RocksDbTxnRunner {
@@ -88,6 +92,7 @@ impl RocksDbTxnRunner {
             memory: MemoryBudget::default(),
             db: None,
             conflicts: Arc::default(),
+            causes: Arc::default(),
         }
     }
 
@@ -132,6 +137,7 @@ impl RocksDbTxnRunner {
             db: Arc::clone(db),
             write,
             conflicts: Arc::clone(&self.conflicts),
+            causes: Arc::clone(&self.causes),
         }
     }
 }
@@ -140,6 +146,7 @@ struct Handle {
     db: Arc<Db>,
     write: WriteOptions,
     conflicts: Arc<AtomicU64>,
+    causes: Arc<[AtomicU64; 3]>,
 }
 
 impl Runner for RocksDbTxnRunner {
@@ -186,6 +193,16 @@ impl Runner for RocksDbTxnRunner {
     }
 
     fn close(&mut self) -> Result<(), String> {
+        let c = |i: usize| self.causes[i].load(Ordering::Relaxed);
+        if c(0) + c(1) + c(2) > 0 {
+            eprintln!(
+                "{} transaction retries: busy={} try_again={} timed_out={}",
+                self.name(),
+                c(0),
+                c(1),
+                c(2)
+            );
+        }
         match self.db.take().as_deref() {
             Some(Db::Optimistic(db)) => db.flush_wal(true).map_err(|e| e.to_string()),
             Some(Db::Pessimistic(db)) => db.flush_wal(true).map_err(|e| e.to_string()),
@@ -243,6 +260,14 @@ impl Client for Handle {
     }
 }
 
+/// The live value of a stored cell `v` of family `f`, if any (`None` when absent or
+/// expired).
+fn live(f: u8, v: Option<&[u8]>, now: u64) -> Result<Option<&[u8]>, String> {
+    v.map(|v| live_value(f, v, now))
+        .transpose()
+        .map(Option::flatten)
+}
+
 /// A transaction attempt's failure that runs it again: a conflict found at commit
 /// (`Busy`, `TryAgain`) or a lock wait that timed out (`TimedOut`).
 fn retries(e: &rocksdb::Error) -> bool {
@@ -253,7 +278,7 @@ fn retries(e: &rocksdb::Error) -> bool {
 }
 
 /// Runs `$body` in a transaction of `$handle`'s database until it commits, `$txn` naming
-/// the transaction (either kind; both have `get_for_update`, `put` and `commit`). `$body`
+/// the transaction (either kind; both have `get_pinned_for_update`, `put` and `commit`). `$body`
 /// evaluates to `Result<Result<Touched, String>, rocksdb::Error>`: the outer error is the
 /// database's, retried when [`retries`] says so.
 macro_rules! in_txn {
@@ -262,8 +287,11 @@ macro_rules! in_txn {
         loop {
             let attempt: Result<Result<Touched, String>, rocksdb::Error> = match &*h.db {
                 Db::Optimistic(db) => {
-                    let $txn =
-                        db.transaction_opt(&h.write, &OptimisticTransactionOptions::default());
+                    // A snapshot at the transaction's start, as Pigeonhole's transactions read
+                    // at theirs (perf287's note on #912).
+                    let mut o = OptimisticTransactionOptions::default();
+                    o.set_snapshot(true);
+                    let $txn = db.transaction_opt(&h.write, &o);
                     match $body {
                         Ok(Ok(t)) => $txn.commit().map(|()| Ok(t)),
                         other => other,
@@ -281,6 +309,12 @@ macro_rules! in_txn {
                 Ok(r) => break r,
                 Err(e) if retries(&e) => {
                     h.conflicts.fetch_add(1, Ordering::Relaxed);
+                    let cause = match e.kind() {
+                        ErrorKind::Busy => 0,
+                        ErrorKind::TryAgain => 1,
+                        _ => 2,
+                    };
+                    h.causes[cause].fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => break Err(e.to_string()),
             }
@@ -323,7 +357,7 @@ impl Handle {
                 let f = family_id(YCSB_FAMILY)?;
                 let key = keys::cell(row, f, qualifier);
                 in_txn!(self, |txn| (|| {
-                    let stored = txn.get_for_update(&key, true)?;
+                    let stored = txn.get_pinned_for_update(&key, true)?;
                     let mut t = Touched::default();
                     let old = match stored.as_deref().map(|v| live_value(f, v, now_micros())) {
                         Some(Err(e)) => return Ok(Err(e)),
@@ -344,25 +378,19 @@ impl Handle {
                     // Key order, so two pessimistic transfers over the same accounts never
                     // wait on each other's second lock.
                     let (first, second) = if ka <= kb { (&ka, &kb) } else { (&kb, &ka) };
-                    let v1 = txn.get_for_update(first, true)?;
-                    let v2 = txn.get_for_update(second, true)?;
-                    let (a, b) = if ka <= kb { (v1, v2) } else { (v2, v1) };
+                    let p1 = txn.get_pinned_for_update(first, true)?;
+                    let p2 = txn.get_pinned_for_update(second, true)?;
+                    let (a, b) = if ka <= kb { (p1, p2) } else { (p2, p1) };
                     let now = now_micros();
-                    let live = |v: &Option<Vec<u8>>| -> Result<Option<Vec<u8>>, String> {
-                        v.as_deref()
-                            .map(|v| live_value(f, v, now).map(|o| o.map(<[u8]>::to_vec)))
-                            .transpose()
-                            .map(Option::flatten)
-                    };
-                    let (va, vb) = match (live(&a), live(&b)) {
+                    let (va, vb) = match (live(f, a.as_deref(), now), live(f, b.as_deref(), now)) {
                         (Ok(va), Ok(vb)) => (va, vb),
                         (Err(e), _) | (_, Err(e)) => return Ok(Err(e)),
                     };
                     let mut t = Touched::default();
-                    for v in [&va, &vb].into_iter().flatten() {
+                    for v in [va, vb].into_iter().flatten() {
                         t.cell(v);
                     }
-                    let (na, nb) = transfer_balances(va.as_deref(), vb.as_deref(), *amount);
+                    let (na, nb) = transfer_balances(va, vb, *amount);
                     txn.put(&ka, encode_value(now, &na.to_le_bytes()))?;
                     txn.put(&kb, encode_value(now, &nb.to_le_bytes()))?;
                     Ok(Ok(t))

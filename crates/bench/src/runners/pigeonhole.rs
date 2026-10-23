@@ -63,6 +63,9 @@ pub(crate) struct Settings {
     /// The pre-split cuts at the measured writes' quantiles rather than the loaded rows', so
     /// each piece takes about the same share of the writes (D231's engine scaling).
     pub(crate) presplit_writes: bool,
+    /// ycsb-f's read-modify-write runs in a `Transaction` instead of `commit_if` (D274: the
+    /// judged row, transaction against transaction; the runner is named `pigeonhole-txn`).
+    pub(crate) rmw_txn: bool,
 }
 
 #[derive(Debug)]
@@ -181,6 +184,23 @@ impl PigeonholeRunner {
     /// ```
     pub fn load_buffered(mut self, yes: bool) -> Self {
         self.settings.load_buffered = yes;
+        self
+    }
+
+    /// `true`: ycsb-f's read-modify-write runs in an optimistic `Transaction` (read, put,
+    /// commit, retried on a conflict) instead of `commit_if` (D274). The runner is then
+    /// named `pigeonhole-txn`, the row judged against RocksDB's `OptimisticTransactionDB`;
+    /// `commit_if` stays the idiomatic fast path, reported beside it.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().rmw_in_transaction(true);
+    /// assert_eq!(r.name(), "pigeonhole-txn");
+    /// assert!(r.describe().contains(" rmw=txn"));
+    /// ```
+    pub fn rmw_in_transaction(mut self, yes: bool) -> Self {
+        self.settings.rmw_txn = yes;
         self
     }
 
@@ -598,7 +618,11 @@ fn create_partitions(db: &Pigeonhole) -> Result<Vec<Table>, String> {
 
 impl Runner for PigeonholeRunner {
     fn name(&self) -> &'static str {
-        "pigeonhole"
+        if self.settings.rmw_txn {
+            "pigeonhole-txn"
+        } else {
+            "pigeonhole"
+        }
     }
 
     fn open(&mut self, dir: &Path) -> Result<(), String> {
@@ -612,6 +636,7 @@ impl Runner for PigeonholeRunner {
                 counters: None,
                 conflicts: Arc::default(),
                 load_buffered: self.settings.load_buffered,
+                rmw_txn: self.settings.rmw_txn,
             },
             busy: Arc::default(),
             dir: dir.to_path_buf(),
@@ -777,7 +802,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -821,7 +846,8 @@ impl Runner for PigeonholeRunner {
                 format!(" async={}", s.async_in_flight)
             } else {
                 String::new()
-            }
+            },
+            if s.rmw_txn { " rmw=txn" } else { "" }
         )
     }
 }
@@ -875,6 +901,8 @@ pub(crate) struct Target {
     conflicts: Arc<AtomicU64>,
     /// Commits are `Buffered` (the load of a run set to [`PigeonholeRunner::load_buffered`]).
     load_buffered: bool,
+    /// [`PigeonholeRunner::rmw_in_transaction`].
+    rmw_txn: bool,
 }
 
 struct PigeonholeClient {
@@ -1087,9 +1115,50 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 }
             }
         }
+        BenchOp::ReadModifyWrite { row, qualifier } if target.rmw_txn => {
+            // D274: transaction against transaction. Read, put and commit in an optimistic
+            // `Transaction`, retried on a conflict (counted) and on `Busy`, as transfer.
+            let mut busy_tries = 0;
+            loop {
+                let mut txn = target.db.transaction().map_err(err)?;
+                let old = txn
+                    .get(table, row, YCSB_FAMILY, qualifier)
+                    .map_err(err)?
+                    .map(|c| c.value().to_vec());
+                t = Touched::default();
+                if let Some(v) = &old {
+                    t.cell(v);
+                }
+                txn.put(
+                    table,
+                    row,
+                    YCSB_FAMILY,
+                    qualifier,
+                    &modified(old.as_deref()),
+                );
+                let committed = if buffered {
+                    txn.commit_with(Durability::Buffered)
+                } else {
+                    txn.commit()
+                };
+                match committed {
+                    Ok(_) => break,
+                    Err(e) if e.code() == ErrorCode::Conflict => {
+                        target.conflicts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) if e.code() == ErrorCode::Busy && busy_tries < BUSY_RETRIES => {
+                        busy_tries += 1;
+                        busy.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    Err(e) => return Err(err(e)),
+                }
+            }
+        }
         BenchOp::ReadModifyWrite { row, qualifier } => {
             // Atomic across clients (D247): the write commits only if the cell still holds
-            // what was read, else the read and the write go again.
+            // what was read, else the read and the write go again; a lost race counts as a
+            // conflict (D274).
             loop {
                 let old = table.get(row, YCSB_FAMILY, qualifier).map_err(err)?;
                 let new = modified(old.as_ref().map(|c| c.value()));
@@ -1117,6 +1186,7 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 if applied.is_some() {
                     break;
                 }
+                target.conflicts.fetch_add(1, Ordering::Relaxed);
             }
         }
         BenchOp::DeleteColumn {

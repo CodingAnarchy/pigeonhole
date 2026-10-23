@@ -496,6 +496,24 @@ mod concurrent_rmw {
         // Each read-modify-write adds one to the first byte.
         let first = run.0.first_byte(b"hot", b"field0");
         assert_eq!(first, Some(((CLIENTS * EACH) % 256) as u8));
+        // D274: a lost `commit_if` race counts as a conflict.
+        assert!(run.0.txn_conflicts().unwrap() > 0, "8 clients on one cell");
+        done(run);
+    }
+
+    /// D274: ycsb-f's read-modify-write in a transaction (`pigeonhole-txn`) loses no update
+    /// and counts its conflicts.
+    #[test]
+    fn pigeonhole_transactions_lose_no_update() {
+        let run = hammer(
+            PigeonholeRunner::default()
+                .shards(2)
+                .rmw_in_transaction(true),
+            "ph-txn",
+        );
+        let first = run.0.first_byte(b"hot", b"field0");
+        assert_eq!(first, Some(((CLIENTS * EACH) % 256) as u8));
+        assert!(run.0.txn_conflicts().unwrap() > 0, "8 clients on one cell");
         done(run);
     }
 
@@ -680,6 +698,21 @@ mod agreement {
             .filter(|k| !TRANSACTIONAL.contains(k))
             .collect();
         agree_on(crate::RocksDbRunner::default, "rocksdb", &plain);
+    }
+
+    /// D274: ycsb-f through a Pigeonhole transaction reads what `commit_if`'s row reads.
+    #[test]
+    fn pigeonhole_transactions_read_what_pigeonhole_reads() {
+        agree_on(
+            || {
+                PigeonholeRunner::default()
+                    .shards(1)
+                    .memtable_budget(32 << 20)
+                    .rmw_in_transaction(true)
+            },
+            "pigeonhole-txn",
+            &[WorkloadKind::YcsbF],
+        );
     }
 
     /// D274: RocksDB's transactions, both kinds, read what Pigeonhole reads on the

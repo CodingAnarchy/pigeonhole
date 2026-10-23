@@ -552,42 +552,54 @@ for level, label in CONTENDED_LEVELS:
     else:
         rows.append((xt, "", verdict(None), f"contended-{level}-{XSHARD}.json"))
 
-# D274: the transactional rows against RocksDB's own transactions, at each level. Judged:
-# RocksDB OptimisticTransactionDB over Pigeonhole throughput <= TXN_FLOOR (a hard floor), with
-# TXN_GOAL (1.0x) reported as met or not. Tracked (not judged): RocksDB TransactionDB within
-# TXN_PESSIMISTIC_TARGET; a pessimistic row more than 2x from the optimistic one is flagged for
-# the owner (D274).
+# D274: the transactional rows against RocksDB's own transactions, at each level, transaction
+# against transaction. Judged against RocksDB OptimisticTransactionDB, on throughput (RocksDB's
+# over Pigeonhole's) and on p99 (Pigeonhole's over RocksDB's): each at most TXN_FLOOR (a hard
+# floor), with TXN_GOAL (1.0x) reported as met or not. ycsb-f's judged Pigeonhole row is its
+# read-modify-write in a transaction (`pigeonhole-txn`); its `commit_if` row (`pigeonhole`, the
+# idiomatic fast path) is reported beside it. Tracked (not judged): RocksDB TransactionDB within
+# TXN_PESSIMISTIC_TARGET on throughput and p99; a pessimistic row more than 2x from the
+# optimistic one on throughput is flagged for the owner (D274).
+TXN_JUDGED_STORE = {"ycsb-f": "pigeonhole-txn", "transfer": "pigeonhole"}
 for level, label in CONTENDED_LEVELS:
     for w in TXN_ROWS:
         name = f"contended-{level}-{w}.json"
         target = (f"{w}, 16 threads, {label} (D274): within {TXN_FLOOR}× of RocksDB OptimisticTransactionDB "
-                  f"(hard floor), goal {TXN_GOAL}×")
-        ph = next((r for r in results(name, "pigeonhole", w) if default_config(r)), None)
+                  f"on throughput and p99 (hard floor), goal {TXN_GOAL}×")
+        mine = TXN_JUDGED_STORE[w]
+        ph = next((r for r in results(name, mine, w) if default_config(r)), None)
         ot = next(iter(results(name, "rocksdb", w)), None)
         pt = next(iter(results(name, "rocksdb-txn", w)), None)
         if not ph or not ot:
-            rows.append((target, "", verdict(None), name))
+            rows.append((target, f"missing: {mine if not ph else 'rocksdb'}", verdict(None), name))
             continue
-        ratio = ot["throughput"] / ph["throughput"]
+        tput = ot["throughput"] / ph["throughput"]
         p99 = ph["p99_ns"] / max(ot["p99_ns"], 1)
-        goal = "goal met" if ratio <= TXN_GOAL else "goal not met"
-        rows.append((target,
-                     f"Pigeonhole {rate(ph['throughput'])} ops/s, OptimisticTransactionDB {rate(ot['throughput'])} ({ratio:.2f}×), "
-                     f"p99 {p99:.2f}×; {goal}",
-                     verdict(ratio <= TXN_FLOOR), name))
+        goal = "goal met" if tput <= TXN_GOAL and p99 <= TXN_GOAL else "goal not met"
+        detail = (f"{mine} {rate(ph['throughput'])} ops/s p99 {us(ph['p99_ns']):.0f} µs; "
+                  f"OptimisticTransactionDB {rate(ot['throughput'])} ops/s p99 {us(ot['p99_ns']):.0f} µs; "
+                  f"throughput {tput:.2f}×, p99 {p99:.2f}×; {goal}")
+        if w == "ycsb-f":
+            cas = next((r for r in results(name, "pigeonhole", w) if default_config(r)), None)
+            if cas:
+                detail += (f"; commit_if (reported) {rate(cas['throughput'])} ops/s, "
+                           f"p99 {us(cas['p99_ns']):.0f} µs")
+        rows.append((target, detail, verdict(tput <= TXN_FLOOR and p99 <= TXN_FLOOR), name))
         ptarget = (f"{w}, 16 threads, {label} (D274, tracked, not judged): within "
-                   f"{TXN_PESSIMISTIC_TARGET}× of RocksDB TransactionDB")
+                   f"{TXN_PESSIMISTIC_TARGET}× of RocksDB TransactionDB on throughput and p99")
         if not pt:
             rows.append((ptarget, "", "-", name))
             continue
-        pratio = pt["throughput"] / ph["throughput"]
+        ptput = pt["throughput"] / ph["throughput"]
+        pp99 = ph["p99_ns"] / max(pt["p99_ns"], 1)
+        within = ptput <= TXN_PESSIMISTIC_TARGET and pp99 <= TXN_PESSIMISTIC_TARGET
         flag = ""
         if max(pt["throughput"], ot["throughput"]) > 2 * min(pt["throughput"], ot["throughput"]):
             flag = (f"; **TransactionDB is more than 2× from OptimisticTransactionDB "
                     f"({pt['throughput'] / ot['throughput']:.2f}×): owner decides (D274)**")
         rows.append((ptarget,
-                     f"TransactionDB {rate(pt['throughput'])} ops/s ({pratio:.2f}×): "
-                     f"{'within' if pratio <= TXN_PESSIMISTIC_TARGET else 'outside'} target{flag}",
+                     f"TransactionDB {rate(pt['throughput'])} ops/s p99 {us(pt['p99_ns']):.0f} µs: "
+                     f"throughput {ptput:.2f}×, p99 {pp99:.2f}×, {'within' if within else 'outside'} target{flag}",
                      "-", name))
 
 # The contended step's reported rows (D247): not judged, but a row more than 3x worse than its

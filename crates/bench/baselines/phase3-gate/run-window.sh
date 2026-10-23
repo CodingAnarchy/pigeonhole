@@ -475,10 +475,12 @@ contended_levels=(buffered default)
 contended_workloads=(ycsb-a ycsb-b ycsb-c ycsb-e ycsb-f sparse-wide time-series-ttl cross-shard-contention counters transfer)
 # Reported, not judged (owner: 45 s runs; the judged ones keep 60 s or more).
 contended_reported=(sparse-wide-deletes adjacency-prefix time-series-range)
-# The engines a contended workload runs on (D274: the transactional ones add rocksdb-txn).
+# The engines a contended workload runs on (D274: the transactional ones add rocksdb-txn, and
+# ycsb-f adds pigeonhole-txn, its judged row).
 engines_for() {
     case "$1" in
-    ycsb-f | transfer) echo pigeonhole,rocksdb,rocksdb-txn,sqlite ;;
+    ycsb-f) echo pigeonhole,pigeonhole-txn,rocksdb,rocksdb-txn,sqlite ;;
+    transfer) echo pigeonhole,rocksdb,rocksdb-txn,sqlite ;;
     *) echo pigeonhole,rocksdb,sqlite ;;
     esac
 }

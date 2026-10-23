@@ -2395,15 +2395,19 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 
 **Decided:**
 - **Every store runs the transactional workloads with its own transaction API.** That covers transfer and ycsb-f's read-modify-write, plus fjall's counter increments and row deletes. Nothing is wrapped in a bench-side lock: D247's striped `RowLocks` and its mutex rows are removed, since every former mutex row has a native counterpart.
-  - **RocksDB, `rocksdb` (the judged baseline):** `OptimisticTransactionDB`. A transaction reads with `get_for_update` (validated at commit) and writes, and a commit that finds a conflicting write fails with `Busy` and runs again, as Pigeonhole's optimistic transactions do. For transfer and ycsb-f the `rocksdb` engine runs on it (`RocksDbTxnRunner`); every other workload keeps the plain `DB`, so their baselines don't move.
+  - **RocksDB, `rocksdb` (the judged baseline):** `OptimisticTransactionDB`. A transaction takes a snapshot at its start (`set_snapshot(true)`, as Pigeonhole's transactions read at theirs), reads with `get_pinned_for_update` (validated at commit) and writes. A commit that finds a conflicting write fails with `Busy` and runs again, as Pigeonhole's optimistic transactions do. `TryAgain`, which means the memtable history was too short to validate, also runs again and is counted apart (perf287's F2). For transfer and ycsb-f the `rocksdb` engine runs on it (`RocksDbTxnRunner`); every other workload keeps the plain `DB`, so their baselines don't move.
   - **RocksDB, `rocksdb-txn` (reported):** the pessimistic `TransactionDB`. `get_for_update` takes the row's lock until the commit (the default lock timeout), a transfer locks its two accounts in key order, and `Busy` or `TimedOut` runs it again.
   - **fjall:** its `OptimisticTxDatabase`, a write transaction retried on `Conflict`: transfer, read-modify-write, counter increments (fjall has no merge operator) and row deletes.
   - **Unchanged:** RocksDB's counters (a merge operator) and row deletes (a range delete) were already native; SQLite runs immediate transactions.
   - Every store counts its retries (`txn_conflicts`).
+- **Pigeonhole's rows are transaction against transaction** (the owner's ruling on perf287's F1):
+  - **transfer** runs a `Transaction`, as before;
+  - **ycsb-f's judged row is `pigeonhole-txn`:** its read-modify-write in a `Transaction` (read, put, commit, retried on `Conflict`). Its `commit_if` row (`pigeonhole`) is the idiomatic fast path, reported beside it.
+  - **A lost `commit_if` race counts as a conflict,** as a transaction's retry does.
 - **Targets** (owner, 2026-10-22), at 16 clients in the gate's `contended` step, Buffered and default durability:
-  - **Judged, against RocksDB `OptimisticTransactionDB`:** a **hard floor of 1.2×**: RocksDB's throughput over Pigeonhole's is at most 1.2. The **goal is 1.0×**, Pigeonhole at least level; it's reported as met or not, but not judged. This applies to transfer (judged from now on; D247 reported it) and to ycsb-f. ycsb-f's SQLite comparison keeps D247's 1.5×.
-  - **Tracked, not judged, against RocksDB `TransactionDB`:** within **2.5×**. If the pessimistic row is more than 2× from the optimistic one, the report flags it and the owner decides.
-- **report.py** judges these rows as above. **run-window.sh** runs transfer among the judged workloads, and adds `rocksdb-txn` to transfer and ycsb-f.
+  - **Judged, against RocksDB `OptimisticTransactionDB`, on throughput and p99:** a **hard floor of 1.2×** on each: RocksDB's throughput over Pigeonhole's, and Pigeonhole's p99 over RocksDB's, are each at most 1.2. The **goal is 1.0×** on both, Pigeonhole at least level; it's reported as met or not, but not judged. This applies to transfer (judged from now on; D247 reported it) and to ycsb-f (`pigeonhole-txn`). ycsb-f's SQLite comparison keeps D247's 1.5×.
+  - **Tracked, not judged, against RocksDB `TransactionDB`:** within **2.5×** on throughput and p99. If the pessimistic row is more than 2× from the optimistic one on throughput, the report flags it and the owner decides.
+- **report.py** judges these rows as above. **run-window.sh** runs transfer among the judged workloads, adds `rocksdb-txn` to transfer and ycsb-f, and adds `pigeonhole-txn` to ycsb-f.
 
 **Why:** #708. D247's RocksDB row was a plain `DB` behind a bench-side 1,024-stripe mutex held from the reads to the write: no retries, and not RocksDB's transaction API. Comparing Pigeonhole's optimistic transactions against it measured something no RocksDB user would deploy. The owner wanted the comparison API to API, with the optimistic one as the bar.
 
@@ -2411,4 +2415,5 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - `rocksdb_transactions_lose_no_update`: 8 clients × 100 read-modify-writes of one cell, both kinds, lose none.
 - `rocksdb_transfers_keep_the_total`: transfers among 4 accounts from 8 clients keep the total, both kinds; the optimistic kind counts conflicts.
 - `rocksdb_transactions_read_what_pigeonhole_reads`: both kinds read exactly what Pigeonhole reads on transfer and ycsb-f.
+- `pigeonhole_transactions_lose_no_update` and `pigeonhole_transactions_read_what_pigeonhole_reads`: ycsb-f through a Pigeonhole transaction loses no update, counts its conflicts, and reads what `commit_if`'s row reads; `pigeonhole_loses_no_update` now checks that lost races count too.
 - `fjall_reads_what_pigeonhole_reads` and `fjall_runs_concurrent_rmw`: these now run on fjall's transactions.
