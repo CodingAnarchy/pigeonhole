@@ -694,6 +694,10 @@ pub struct Stalls {
     /// See [`Stalls::xshard_rounds`].
     #[serde(default)]
     pub xshard_refused_rounds: u64,
+    /// Cross-shard commits refused over an overlap that failed with a conflict without
+    /// another round (D276, `CrossShardMetrics::failed_fast`).
+    #[serde(default)]
+    pub xshard_failed_fast: u64,
     /// Refused PREPAREs by reason: below a timestamp the participant assigned (D11), below a
     /// tablet move's raised floor, a tablet being changed or moved (D145), no arena room
     /// (ICR 0042). One refused round can hold several.
@@ -770,6 +774,7 @@ impl Stalls {
             row_cache_fills: d(before.row_cache_fills, after.row_cache_fills),
             xshard_rounds: d(before.xshard_rounds, after.xshard_rounds),
             xshard_refused_rounds: d(before.xshard_refused_rounds, after.xshard_refused_rounds),
+            xshard_failed_fast: d(before.xshard_failed_fast, after.xshard_failed_fast),
             xshard_refused_below_floor: d(
                 before.xshard_refused_below_floor,
                 after.xshard_refused_below_floor,

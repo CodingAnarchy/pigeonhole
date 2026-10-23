@@ -1306,6 +1306,7 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         row_cache_fills: rc.fills,
         xshard_rounds: m.cross_shard.rounds,
         xshard_refused_rounds: m.cross_shard.refused_rounds,
+        xshard_failed_fast: m.cross_shard.failed_fast,
         // Always 0 since D263 (the counters are deprecated); the report keeps its columns.
         xshard_refused_below_floor: 0,
         xshard_refused_move_raise: 0,
