@@ -2451,7 +2451,16 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 
 **Why:** D274's box run (#708, comment 6355660465): the transactional ycsb-f row at Buffered was 2.37× behind RocksDB's `OptimisticTransactionDB` (p99 18×), with about 180× its conflicts. A ycsb row has 10 fields and each read-modify-write touches one; under (row, family) validation, writes to other fields of a hot row conflicted. RocksDB validates per key.
 
-**Measured:** _the box A/B (ycsb-f and transfer, Buffered and default, against `OptimisticTransactionDB`) is recorded here once run._
+**Measured** (AX102, io_uring, 16 shards, full scale, 16 clients, 3 reps alternating, medians; base main ab5320ce and head #917 8dfdd2c0, each with #912's bench crate; `/root/scratch/ctr274/out-d275`):
+
+| row | base | D275 | D275 / base | `OptimisticTransactionDB` | D274 judged (D275) |
+|---|--:|--:|--:|--:|---|
+| ycsb-f txn, Buffered | 301.8K, p99 926 µs, 9.6M conflicts | 731.2K, p99 55 µs, 131K conflicts | 2.42×, p99 0.06× | 661.7K, p99 61 µs, 52K conflicts | 0.90×, p99 0.90×: **goal met** (base 2.19×, p99 15.3×) |
+| ycsb-f txn, default | 295.8K, p99 178 µs, 652K conflicts | 352.3K, p99 128 µs, 50K conflicts | 1.19×, p99 0.72× | 154.3K, p99 241 µs | 0.44×, p99 0.53× (was already met) |
+| transfer, Buffered | 95.4K, p99 2,884 µs | 105.7K, p99 2,556 µs | 1.11×, p99 0.89× | 375.5K, p99 623 µs | 3.55×, p99 4.11× (base 3.94×, 4.63×): still #708's per-attempt gap |
+| transfer, default | 41.7K, p99 5,505 µs | 43.9K, p99 5,177 µs | 1.05×, p99 0.94× | 50.7K, p99 3,539 µs | 1.16×, p99 1.46× (base 1.22×, 1.56×) |
+
+Every rep of head is above every rep of base on all four rows. ycsb-f's conflicts fall to RocksDB's order (about 2.5× at Buffered, 1.2× at default). Transfer reads and writes the one balance cell per row, so its conflicts don't change; its small gain is the cheaper walk and the shared `Validate`.
 
 **Tests:**
 - **`tests/tablets.rs`:**
