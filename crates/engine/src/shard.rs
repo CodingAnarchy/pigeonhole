@@ -21,7 +21,8 @@ use pigeonhole_compaction::{
 };
 use pigeonhole_format::hash::{FastBuildHasher, FastMap, FastSet};
 use pigeonhole_format::key::{
-    compare, encode_key_after_row, encode_marker_after_row, encode_row_prefix, split_suffix,
+    SUFFIX_LEN, compare, encode_key_after_row, encode_marker_after_row, encode_row_prefix,
+    split_suffix,
 };
 use pigeonhole_format::manifest::{CompactionStyle, Edit, FamilyKind};
 use pigeonhole_format::scan::ScanFilter;
@@ -1785,6 +1786,15 @@ struct MemEntry {
     has_shares: bool,
     /// Holds a delete of any kind (the flush GC guard, #287).
     deletes: bool,
+    /// Holds a cell whose versions may not follow seqno order (D273): one with an explicit
+    /// timestamp, or one replayed (written before this open, possibly by a build before
+    /// D271). Without it, every cell's first version holds its largest seqno, so read
+    /// validation reads only that version (`conflicts`). The invariant this rests on: every
+    /// write path that stamps a *default* timestamp goes through D271's allocator
+    /// (`reserve_stamps`, `reserve_decision`), and anything else sets this flag. Counter
+    /// families are the standing example: their writes carry D186's fixed timestamp as an
+    /// explicit one. A future ingest or import path writing memtables directly must set it.
+    explicit_ts: bool,
 }
 
 impl MemEntry {
@@ -1794,6 +1804,7 @@ impl MemEntry {
             min_ts: u64::MAX,
             has_shares: false,
             deletes: false,
+            explicit_ts: false,
         }
     }
 
@@ -1971,6 +1982,8 @@ struct Dedup {
     loser: Vec<bool>,
     /// The batch failed to decode after `keys.len()` mutations.
     error: Option<pigeonhole_format::Error>,
+    /// Some mutation of the batch carries its own timestamp, not the commit's (D273).
+    explicit: bool,
 }
 
 /// A mutation of the batch, its parts located within the batch bytes.
@@ -2008,6 +2021,7 @@ impl Dedup {
             let off = (part.as_ptr() as usize).wrapping_sub(base);
             (off as u32, part.len() as u32)
         };
+        let mut explicit = false;
         for m in batch.iter() {
             let m = match m {
                 Ok(m) => m,
@@ -2016,6 +2030,7 @@ impl Dedup {
                     break;
                 }
             };
+            explicit |= m.ts.is_some();
             self.keys.push(MutKey {
                 table: m.table.0,
                 family: m.family.0,
@@ -2026,6 +2041,7 @@ impl Dedup {
                 value: at(m.value),
             });
         }
+        self.explicit = explicit;
         let n = self.keys.len();
         self.loser.clear();
         self.loser.resize(n, false);
@@ -2653,6 +2669,8 @@ pub(crate) struct ShardState {
     /// replayed or applied record, so a cell's next stamp is above every earlier one here.
     last_stamp: Timestamp,
     key_buf: Vec<u8>,
+    /// A cell's key past its last version, for read validation's seek (D273).
+    seek_buf: Vec<u8>,
     dedup: Dedup,
     /// The row hashes of the member `reserve_room` sized last, for `touch_rows`.
     admit_rows: Vec<u64>,
@@ -3067,6 +3085,7 @@ impl ShardState {
             to_freeze: Vec::new(),
             last_stamp,
             key_buf: Vec::new(),
+            seek_buf: Vec::new(),
             dedup: Dedup::default(),
             admit_rows: Vec::new(),
             touched: FastMap::default(),
@@ -4801,20 +4820,47 @@ impl ShardState {
         let prefix = std::mem::take(&mut self.key_buf);
         let mut found = false;
         if let Some(slot) = self.memtables.get(&(tablet, read.family)) {
-            found = self.shared.flushed_roots.read(|flushed| -> Result<bool> {
-                for reader in slot.readers(self.id, flushed) {
+            let mut past_cell = std::mem::take(&mut self.seek_buf);
+            let scanned = self.shared.flushed_roots.read(|flushed| -> Result<bool> {
+                for entry in slot.unflushed(self.id, flushed) {
+                    let reader = entry.table.reader();
                     let mut it = reader.iter();
                     it.seek(&prefix)?;
                     while it.valid() && it.key().starts_with(&prefix) {
+                        #[cfg(feature = "test-hooks")]
+                        self.shared.metrics[usize::from(self.id.0)]
+                            .hooks
+                            .validate_entries
+                            .fetch_add(1, Ordering::Relaxed);
                         let (_, _, seqno, _) = split_suffix(it.key())?;
                         if seqno > snapshot {
                             return Ok(true);
                         }
+                        if entry.explicit_ts {
+                            it.next()?;
+                            continue;
+                        }
+                        // D273: every timestamp here came from D271's allocator, monotone in
+                        // seqno, and a cell's versions sort newest timestamp first (newest
+                        // seqno first among equal ones): its first version holds its largest
+                        // seqno, so its older versions cannot be above the snapshot. Step to
+                        // the next entry; past the cell's versions with one seek if it is an
+                        // older one.
+                        let key = it.key();
+                        let body = &key[..key.len() - SUFFIX_LEN];
+                        past_cell.clear();
+                        past_cell.extend_from_slice(body);
                         it.next()?;
+                        if it.valid() && it.key().starts_with(&past_cell) {
+                            past_cell.extend_from_slice(&[0xFF; SUFFIX_LEN]);
+                            it.seek(&past_cell)?;
+                        }
                     }
                 }
                 Ok(false)
-            })?;
+            });
+            self.seek_buf = past_cell;
+            found = scanned?;
         }
         if !found {
             let view = self.shared.view.load();
@@ -4834,6 +4880,11 @@ impl ShardState {
                         reader.iter(ScanFilter::all(), pigeonhole_sst::ReadOptions::default());
                     it.seek(&prefix)?;
                     while it.valid() && it.key().starts_with(&prefix) {
+                        #[cfg(feature = "test-hooks")]
+                        self.shared.metrics[usize::from(self.id.0)]
+                            .hooks
+                            .validate_sst_entries
+                            .fetch_add(1, Ordering::Relaxed);
                         let (_, _, seqno, _) = split_suffix(it.key())?;
                         if seqno > snapshot {
                             found = true;
@@ -4875,8 +4926,13 @@ impl ShardState {
         let track = !self.replaying
             && self.shared.balance.enabled
             && self.shared.balance.interval_nanos > 0;
+
         // The mutations as the scan decoded them (the batch is decoded once).
         let keys = std::mem::take(&mut self.dedup.keys);
+        // D273: a batch with an explicit timestamp, or a replayed record (possibly from before
+        // D271), may write versions out of seqno order: the memtables it writes are validated
+        // whole.
+        let unordered = self.dedup.explicit || self.replaying;
         for (i, k) in keys.iter().enumerate() {
             let m = pigeonhole_format::wal::Mutation {
                 table: TableId(k.table),
@@ -4979,6 +5035,7 @@ impl ShardState {
                 break;
             }
             slot.active.min_ts = slot.active.min_ts.min(ts);
+            slot.active.explicit_ts |= unordered;
             if !matches!(m.kind, Kind::Put | Kind::Merge) {
                 slot.active.deletes = true;
             }

@@ -7319,3 +7319,178 @@ fn a_fence_ends_with_its_readers_last_attempt_even_with_nothing_waiting() {
         before
     );
 }
+
+/// D273: a transaction reading `row` (column `q` of family `f`) and writing `out`, submitted
+/// once its snapshot is taken; `between` runs after the read and before the submit.
+fn txn_reading(
+    db: &mut Db,
+    row: &[u8],
+    out: &[u8],
+    between: impl FnOnce(&mut Db),
+) -> pigeonhole_engine::Result<pigeonhole_engine::CommitInfo> {
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, row, b"q").unwrap();
+    t.batch()
+        .put(id, f, out, b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    between(db);
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    poll_until(db, &mut pc, 100_000).expect("resolved")
+}
+
+/// D273: a hot row's versions all carry D271's default timestamps, so read validation reads
+/// its column's first version only (one entry, not one per version), and a write after the
+/// snapshot still conflicts.
+#[test]
+fn a_hot_rows_validation_reads_one_version_and_still_conflicts() {
+    let mut db = open(1, |_| {});
+    for i in 0..2_000u32 {
+        db.put(b"hot", &i.to_le_bytes());
+    }
+    let before = db.engine.validate_entries(0);
+    txn_reading(&mut db, b"hot", b"out", |_| {}).expect("no conflict");
+    let visited = db.engine.validate_entries(0) - before;
+    assert!(
+        visited <= 2,
+        "validation visited {visited} entries of a 2000-version row"
+    );
+    let r = txn_reading(&mut db, b"hot", b"out", |db| {
+        db.put(b"hot", b"after");
+    });
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "{r:?}"
+    );
+}
+
+/// D273's fallback: a write with an explicit, older timestamp lands behind the column's
+/// newer versions. A memtable holding one is walked whole, so the write still conflicts
+/// with a transaction whose snapshot predates it.
+#[test]
+fn an_explicit_older_timestamp_behind_newer_versions_still_conflicts() {
+    let mut db = open(1, |_| {});
+    for i in 0..50u32 {
+        db.put(b"hot", &i.to_le_bytes());
+    }
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let r = txn_reading(&mut db, b"hot", b"out", |db| {
+        let mut wb = WriteBatch::new();
+        wb.put(id, f, b"hot", b"q", Some(1), ValueRef::Bytes(b"old"))
+            .unwrap();
+        db.commit(wb);
+    });
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "a write behind newer versions was missed: {r:?}"
+    );
+}
+
+/// D273's fallback for replay: a memtable rebuilt at open (here after a process crash, so
+/// from the WAL) may hold records from a build before D271, so it is walked whole; a write
+/// after the snapshot still conflicts.
+#[test]
+fn a_replayed_memtable_is_validated_whole() {
+    let vfs = SimVfs::new(7);
+    let mut db = open_on(&vfs, 1, |_| {});
+    for i in 0..200u32 {
+        db.put(b"hot", &i.to_le_bytes());
+    }
+    vfs.crash(pigeonhole_io::sim::CrashKind::Process);
+    drop(db);
+    let mut db = open_on(&vfs, 1, |_| {});
+    let before = db.engine.validate_entries(0);
+    txn_reading(&mut db, b"hot", b"out", |_| {}).expect("no conflict");
+    let visited = db.engine.validate_entries(0) - before;
+    assert!(
+        visited >= 200,
+        "a replayed memtable was not walked whole: {visited} entries"
+    );
+    let r = txn_reading(&mut db, b"hot", b"out", |db| {
+        db.put(b"hot", b"after");
+    });
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "{r:?}"
+    );
+}
+
+/// A counter table (D186's family kind) beside `t`, and its family.
+fn counter_table(db: &Db) -> (pigeonhole_format::TableId, pigeonhole_format::FamilyId) {
+    let counters = db
+        .engine
+        .create_table(
+            "ctr",
+            &[(
+                "c".into(),
+                FamilyOptions::default()
+                    .merge_operator("pigeonhole.i64_add")
+                    .kind(pigeonhole_format::manifest::FamilyKind::Counter),
+            )],
+        )
+        .expect("counter table");
+    (counters.id, counters.family("c").unwrap().id)
+}
+
+/// D273 (perf287's review): a counter family's `put_i64` and increments all carry D186's
+/// fixed timestamp, so their versions follow seqno order. An increment after a transaction's
+/// snapshot conflicts with its read of the counter.
+#[test]
+fn a_counter_increment_after_the_snapshot_conflicts() {
+    let mut db = open(1, |_| {});
+    let (ctr, c) = counter_table(&db);
+    let mut wb = WriteBatch::new();
+    wb.put(ctr, c, b"r", b"n", None, ValueRef::I64(100))
+        .unwrap();
+    db.commit(wb);
+    for _ in 0..20 {
+        let mut wb = WriteBatch::new();
+        wb.merge(ctr, c, b"r", b"n", ValueRef::I64(1)).unwrap();
+        db.commit(wb);
+    }
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    t.get(ctr, c, b"r", b"n").unwrap();
+    t.batch()
+        .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let mut wb = WriteBatch::new();
+    wb.merge(ctr, c, b"r", b"n", ValueRef::I64(1)).unwrap();
+    db.commit(wb);
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "an increment after the snapshot was missed: {r:?}"
+    );
+}
+
+/// D273's fallback in a counter family: a bucket increment (`merge_at`, an explicit
+/// timestamp) into an older bucket, after the snapshot, sits behind a newer bucket with a
+/// lower seqno. The counter memtable holds explicit timestamps, so it is walked whole and
+/// the increment conflicts.
+#[test]
+fn a_counter_bucket_increment_behind_a_newer_bucket_still_conflicts() {
+    let mut db = open(1, |_| {});
+    let (ctr, c) = counter_table(&db);
+    let mut wb = WriteBatch::new();
+    wb.merge_at(ctr, c, b"r", b"n", 200, ValueRef::I64(1))
+        .unwrap();
+    db.commit(wb);
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut t = db.engine.begin().unwrap();
+    t.get(ctr, c, b"r", b"n").unwrap();
+    t.batch()
+        .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let mut wb = WriteBatch::new();
+    wb.merge_at(ctr, c, b"r", b"n", 100, ValueRef::I64(1))
+        .unwrap();
+    db.commit(wb);
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "an older bucket's increment after the snapshot was missed: {r:?}"
+    );
+}
