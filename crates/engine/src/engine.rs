@@ -269,6 +269,10 @@ pub struct CrossShardMetrics {
     /// PREPAREs refused because they overlapped a row of an undecided share another commit
     /// prepared there (D249, ICR 0045). Retried once it is decided; not a conflict.
     pub refused_pending_overlap: u64,
+    /// Commits so refused that read a row the overlapping share then committed a write to,
+    /// after their snapshot: they fail with [`Error::Conflict`] at once instead of retrying
+    /// into a validation failure (D276, ICR 0066). By coordinator, like `rounds`.
+    pub failed_fast: u64,
     /// Singles held back behind an undecided share (D263), once per group
     /// that held them.
     pub share_waits: u64,
@@ -2491,6 +2495,7 @@ impl Engine {
             x.refused_moved += refused(CrossRefusal::Moved);
             x.refused_room += refused(CrossRefusal::Room);
             x.refused_pending_overlap += refused(CrossRefusal::PendingOverlap);
+            x.failed_fast += s.cross.failed_fast.load(Ordering::Relaxed);
             x.share_waits += s.cross.share_waits.load(Ordering::Relaxed);
             x.share_wait_nanos += s.cross.share_wait_nanos.load(Ordering::Relaxed);
             let most = |i: usize| s.cross.max_attempts[i].load(Ordering::Relaxed);

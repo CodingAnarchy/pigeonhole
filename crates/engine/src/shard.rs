@@ -254,6 +254,9 @@ pub(crate) struct CrossShardCounters {
     pub rounds: AtomicU64,
     /// Of those, rounds a participant refused (so the commit was retried or gave up).
     pub refused_rounds: AtomicU64,
+    /// Commits refused over an overlap that failed with `Conflict` without another round
+    /// (D276).
+    pub failed_fast: AtomicU64,
     /// PREPAREs this shard refused, by reason (see `CrossRefusal`).
     pub refused: [AtomicU64; CrossRefusal::COUNT],
     /// Singles held back behind an undecided share (D263), once per group
@@ -1359,6 +1362,9 @@ pub(crate) enum WakeReason {
     /// The undecided shares the commit of `priority` overlapped are decided, or the older
     /// commit it waited behind has run its next attempt here (D249).
     Overlap { priority: CommitPriority },
+    /// A share writing a row the commit of `priority` reads committed here, after its
+    /// snapshot: its retry would fail validation, so it fails with `Conflict` now (D276).
+    Doomed { priority: CommitPriority },
 }
 
 /// Messages a shard handles. An engine enum, so the queue hot path has no boxing.
@@ -1741,6 +1747,9 @@ pub(crate) struct OverlapRefusal {
     /// Refused because it reads a row this waiting single writes (D267): woken when the
     /// single is logged (`end_single_wait`), not when the shares clear (0: not so refused).
     pub single: u32,
+    /// Its validated reads (`None`: it reads nothing): once a share writing one of them
+    /// commits here and the read is stale, it fails rather than retries (D276).
+    pub validate: Option<Box<Validate>>,
 }
 
 /// What a PREPARE refused over an overlap waits for (D249, D267).
@@ -2814,6 +2823,9 @@ pub(crate) struct ShardState {
     /// Overlap wakes this coordinator heard before the refused round was decided (D249):
     /// `(participant, priority)`, consumed when its retry is queued.
     overlap_released: Vec<(ShardId, CommitPriority)>,
+    /// Commits a participant found doomed (`WakeReason::Doomed`) while their round was
+    /// undecided or aborting: they fail at the round's end instead of retrying (D276).
+    doomed: Vec<CommitPriority>,
     /// Slots a wait for arena room picked to freeze, whatever their size, until their active
     /// memtable freezes: the largest ones, holding about half the arena (D124).
     room_freezes: BTreeSet<(TabletId, FamilyId)>,
@@ -3151,6 +3163,7 @@ impl ShardState {
             next_share_wait: 0,
             reader_fences: Vec::new(),
             overlap_released: Vec::new(),
+            doomed: Vec::new(),
             unpin_upto: 0,
             unpin_at: 0,
             last_end: None,
@@ -7468,7 +7481,35 @@ impl ShardState {
         last: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        // The rows the share writes, if a commit refused here reads (D276).
+        let written = if commit && self.overlap_refused.iter().any(|r| r.validate.is_some()) {
+            self.prepared
+                .get(&seqno)
+                .filter(|share| share.tracked)
+                .map(|share| {
+                    let mut rows: Vec<u64> = BatchRef::new(share.bytes.batch().as_bytes())
+                        .map(|b| {
+                            b.iter()
+                                .flatten()
+                                .map(|mu| hash_row(mu.table, mu.row))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    rows.sort_unstable();
+                    rows.dedup();
+                    rows
+                })
+        } else {
+            None
+        };
         self.decide_share(seqno, commit, at, coordinator, ctx);
+        // A commit refused here that reads a row the share wrote, and is now stale, fails
+        // instead of retrying (D276): before the release below, which would wake it.
+        if let Some(written) = written
+            && !self.poisoned
+        {
+            self.doom_overlaps(priority, &written, ctx);
+        }
         // Commits refused here over an overlap may retry now (D249), and a fence this
         // commit set here ends with its last attempt (D267).
         if !self.overlap_refused.is_empty() || !self.reader_fences.is_empty() {
@@ -7643,8 +7684,14 @@ impl ShardState {
             return;
         }
         let mut c = self.coord.remove(&seqno).expect("present");
+        // A participant found it doomed while this round ran (D276).
+        let doomed = !self.doomed.is_empty() && {
+            let before = self.doomed.len();
+            self.doomed.retain(|p| *p != c.priority);
+            self.doomed.len() < before
+        };
         if !self.overlap_released.is_empty()
-            && !(c.refused.is_some() && c.failed.is_none() && !c.gives_up)
+            && !(c.refused.is_some() && c.failed.is_none() && !c.gives_up && !doomed)
         {
             // It runs no further attempt: an early overlap wake for it is stale (D249).
             self.overlap_released.retain(|(_, p)| *p != c.priority);
@@ -7684,6 +7731,10 @@ impl ShardState {
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .push(seqno);
+            }
+            if doomed {
+                self.fail_doomed(c.submitted_at, c.priority.1, &c.shards, reply, ctx);
+                return;
             }
             let waited = ctx.now_nanos().saturating_sub(c.submitted_at);
             // Decided with the abort, so the participants heard the same (D249).
