@@ -1116,8 +1116,15 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             // An optimistic transaction reading both balances, retried on a conflict
             // (counted) and on `Busy` (as `retry_busy` counts it).
             let mut busy_tries = 0;
+            // SCRATCH (#708 decomposition): per-phase times and attempts.
+            let cross = usize::from(table.shard_of(from) != table.shard_of(to));
+            let op_start = Instant::now();
+            let mut attempts = 0u64;
             loop {
+                attempts += 1;
+                let t0 = Instant::now();
                 let mut txn = target.db.transaction().map_err(err)?;
+                let t1 = Instant::now();
                 let mut read = |row: &[u8]| -> Result<Option<Vec<u8>>, String> {
                     Ok(txn
                         .get(table, row, YCSB_FAMILY, BALANCE)
@@ -1125,6 +1132,7 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                         .map(|c| c.value().to_vec()))
                 };
                 let (a, b) = (read(from)?, read(to)?);
+                let t2 = Instant::now();
                 t = Touched::default();
                 for v in [&a, &b].into_iter().flatten() {
                     t.cell(v);
@@ -1132,11 +1140,40 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 let (na, nb) = transfer_balances(a.as_deref(), b.as_deref(), *amount);
                 txn.put(table, from, YCSB_FAMILY, BALANCE, &na.to_le_bytes());
                 txn.put(table, to, YCSB_FAMILY, BALANCE, &nb.to_le_bytes());
+                // SCRATCH: was a read already stale before the commit (a newer committed value)?
+                let stale = std::env::var_os("XD_STALE").is_some() && {
+                    let now_a = table.get(from, YCSB_FAMILY, BALANCE).map_err(err)?.map(|c| c.value().to_vec());
+                    let now_b = table.get(to, YCSB_FAMILY, BALANCE).map_err(err)?.map(|c| c.value().to_vec());
+                    now_a != a || now_b != b
+                };
+                let t3 = Instant::now();
                 let committed = if buffered {
                     txn.commit_with(Durability::Buffered)
                 } else {
                     txn.commit()
                 };
+                let t4 = Instant::now();
+                let ok = committed.is_ok();
+                if stale {
+                    xd::add(cross, if ok { xd::STALE_OK } else { xd::STALE_FAIL }, 1);
+                }
+                if !ok && let Some(us) = std::env::var("XD_BACKOFF_US").ok().and_then(|v| v.parse::<u64>().ok()) {
+                    // Jittered exponential backoff after a conflict.
+                    let cap = us << attempts.min(6);
+                    let r = (op_start.elapsed().as_nanos() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 40;
+                    std::thread::sleep(Duration::from_micros(r % cap.max(1)));
+                }
+                xd::add(cross, xd::BEGIN, (t1 - t0).as_nanos() as u64);
+                xd::add(cross, xd::READS, (t2 - t1).as_nanos() as u64);
+                xd::add(cross, xd::BUILD, (t3 - t2).as_nanos() as u64);
+                xd::add(cross, if ok { xd::COMMIT_OK } else { xd::COMMIT_FAIL }, (t4 - t3).as_nanos() as u64);
+                xd::add(cross, if ok { xd::N_OK } else { xd::N_FAIL }, 1);
+                if ok {
+                    xd::add(cross, xd::OPS, 1);
+                    xd::add(cross, xd::OP_TOTAL, op_start.elapsed().as_nanos() as u64);
+                    xd::max(cross, attempts);
+                    xd::report(&target.db);
+                }
                 match committed {
                     Ok(_) => break,
                     Err(e) if e.code() == ErrorCode::Conflict => {
@@ -1616,5 +1653,53 @@ mod tests {
         assert_eq!(r.execute_counted(&read).unwrap().cells, 10);
         r.close().unwrap();
         std::fs::remove_dir_all(dir).ok();
+    }
+}
+
+
+/// SCRATCH (#708 decomposition, not for merge): per-phase transfer times, same-shard (0) and
+/// cross-shard (1) transfers apart.
+mod xd {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const BEGIN: usize = 0;
+    pub const READS: usize = 1;
+    pub const BUILD: usize = 2;
+    pub const COMMIT_OK: usize = 3;
+    pub const COMMIT_FAIL: usize = 4;
+    pub const N_OK: usize = 5;
+    pub const N_FAIL: usize = 6;
+    pub const OPS: usize = 7;
+    pub const OP_TOTAL: usize = 8;
+    pub const MAX_ATT: usize = 9;
+    pub const STALE_OK: usize = 10;
+    pub const STALE_FAIL: usize = 11;
+    static C: [[AtomicU64; 12]; 2] = [const { [const { AtomicU64::new(0) }; 12] }; 2];
+    pub fn add(cross: usize, k: usize, v: u64) {
+        C[cross][k].fetch_add(v, Ordering::Relaxed);
+    }
+    pub fn max(cross: usize, v: u64) {
+        C[cross][MAX_ATT].fetch_max(v, Ordering::Relaxed);
+    }
+    pub fn report(db: &pigeonhole::Pigeonhole) {
+        let total = C[0][OPS].load(Ordering::Relaxed) + C[1][OPS].load(Ordering::Relaxed);
+        if total % 20_000 != 0 {
+            return;
+        }
+        let x = db.engine_metrics().cross_shard;
+        let mut out = format!("XD ops={total} rounds={} refused={} overlap={} share_waits={}", x.rounds, x.refused_rounds, x.refused_pending_overlap, x.share_waits);
+        for (c, name) in [(0, "same"), (1, "cross")] {
+            let g = |k: usize| C[c][k].load(Ordering::Relaxed);
+            let att = (g(N_OK) + g(N_FAIL)).max(1);
+            let ops = g(OPS).max(1);
+            out += &format!(
+                " | {name}: ops={} attempts/op={:.2} max_att={} op_us={:.0} per-attempt us: begin={:.1} reads={:.1} build={:.1} commit_ok={:.0} commit_conflict={:.0} conflict_rate={:.2}",
+                g(OPS), att as f64 / ops as f64, g(MAX_ATT), g(OP_TOTAL) as f64 / ops as f64 / 1e3,
+                g(BEGIN) as f64 / att as f64 / 1e3, g(READS) as f64 / att as f64 / 1e3, g(BUILD) as f64 / att as f64 / 1e3,
+                g(COMMIT_OK) as f64 / g(N_OK).max(1) as f64 / 1e3, g(COMMIT_FAIL) as f64 / g(N_FAIL).max(1) as f64 / 1e3,
+                g(N_FAIL) as f64 / att as f64,
+            );
+            out += &format!(" stale_at_commit: ok={} conflicted={} (of {} conflicts)", g(STALE_OK), g(STALE_FAIL), g(N_FAIL));
+        }
+        eprintln!("{out}");
     }
 }
