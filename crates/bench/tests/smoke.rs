@@ -10,13 +10,23 @@ fn temp_dir(tag: &str) -> PathBuf {
     dir
 }
 
-fn smoke_all(tag: &str, mut make: impl FnMut() -> Box<dyn Runner>) {
+fn smoke_all(tag: &str, make: impl FnMut(WorkloadKind) -> Box<dyn Runner>) {
+    smoke_kinds(tag, &WorkloadKind::EVERY, make);
+}
+
+/// [`smoke_all`] over `kinds` only; `make` builds the runner for each workload (D274: RocksDB
+/// runs the transactional ones on its transactions).
+fn smoke_kinds(
+    tag: &str,
+    kinds: &[WorkloadKind],
+    mut make: impl FnMut(WorkloadKind) -> Box<dyn Runner>,
+) {
     let root = temp_dir(tag);
-    for kind in WorkloadKind::EVERY {
+    for &kind in kinds {
         let config = WorkloadConfig::smoke(kind);
         let dir = root.join(kind.name());
         std::fs::create_dir_all(&dir).unwrap();
-        let mut runner = make();
+        let mut runner = make(kind);
         let report = run(runner.as_mut(), &config, &dir)
             .unwrap_or_else(|e| panic!("{kind:?} on {tag} (seed {}): {e}", config.seed));
         assert_eq!(report.workload, kind);
@@ -35,7 +45,7 @@ fn smoke_all(tag: &str, mut make: impl FnMut() -> Box<dyn Runner>) {
 
 #[test]
 fn every_workload_on_pigeonhole() {
-    smoke_all("pigeonhole", || {
+    smoke_all("pigeonhole", |_| {
         Box::new(
             PigeonholeRunner::default()
                 .shards(2)
@@ -76,15 +86,33 @@ fn pigeonhole_loads_more_than_the_memtable_budget() {
 #[cfg(feature = "rocksdb")]
 #[test]
 fn every_workload_on_rocksdb() {
-    smoke_all("rocksdb", || {
-        Box::new(pigeonhole_bench::RocksDbRunner::default())
+    use pigeonhole_bench::{RocksDbRunner, RocksDbTxnRunner, TxnMode};
+    // D274: as `phdb-bench --engine rocksdb` does, the transactional workloads run on
+    // RocksDB's optimistic transactions, every other on the plain DB.
+    smoke_all("rocksdb", |kind| match kind {
+        WorkloadKind::Transfer | WorkloadKind::YcsbF => {
+            Box::new(RocksDbTxnRunner::new(TxnMode::Optimistic))
+        }
+        _ => Box::new(RocksDbRunner::default()),
     });
+}
+
+/// D274: `rocksdb-txn`, RocksDB's pessimistic transactions, on the transactional workloads.
+#[cfg(feature = "rocksdb")]
+#[test]
+fn transactional_workloads_on_rocksdb_txn() {
+    use pigeonhole_bench::{RocksDbTxnRunner, TxnMode};
+    smoke_kinds(
+        "rocksdb-txn",
+        &[WorkloadKind::Transfer, WorkloadKind::YcsbF],
+        |_| Box::new(RocksDbTxnRunner::new(TxnMode::Pessimistic)),
+    );
 }
 
 #[cfg(feature = "sqlite")]
 #[test]
 fn every_workload_on_sqlite() {
-    smoke_all("sqlite", || {
+    smoke_all("sqlite", |_| {
         Box::new(pigeonhole_bench::SqliteRunner::default())
     });
 }
@@ -92,7 +120,7 @@ fn every_workload_on_sqlite() {
 #[cfg(feature = "fjall")]
 #[test]
 fn every_workload_on_fjall() {
-    smoke_all("fjall", || {
+    smoke_all("fjall", |_| {
         Box::new(pigeonhole_bench::FjallRunner::default())
     });
 }
