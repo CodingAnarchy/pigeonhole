@@ -59,10 +59,17 @@
 //!
 //! # Install and status
 //!
-//! `cargo add pigeonhole`, or `pigeonhole = "0.1"` in `Cargo.toml`. This is an experimental
-//! 0.x release: the core engine (Phase 1) is complete and fault-tested in simulation, but the
-//! on-disk format and the API may change before 1.0, the wide-column model (Phase 2) and the
-//! latency work (Phase 3) are still to come, and it is not recommended for production use yet.
+//! `cargo add pigeonhole`, or `pigeonhole = "0.3"` in `Cargo.toml`. This is a pre-1.0
+//! release:
+//! - **Done:** the core engine (Phase 1) is fault-tested in simulation; the wide-column model
+//!   (Phase 2) shipped in 0.2.0 and the latency engine (Phase 3) in 0.3.0.
+//! - **The file format is frozen for 1.x** at format 4: later 1.x releases read and write it,
+//!   and the
+//!   [compatibility promise](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md#13-compatibility-promise)
+//!   takes effect at 1.0.0.
+//! - **The API may still change before 1.0,** and Pigeonhole is not recommended for production
+//!   use yet.
+//!
 //! See the [status page](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md)
 //! and the [changelog](https://github.com/CodingAnarchy/pigeonhole/blob/main/CHANGELOG.md).
 //!
