@@ -199,7 +199,7 @@ impl TableCore {
     pub(crate) fn info_at(&self, snapshot: &pigeonhole_engine::Snapshot) -> Arc<TableInfo> {
         snapshot
             .table(self.info.id)
-            .unwrap_or_else(|| self.current_info())
+            .map_or_else(|| self.current_info(), Arc::clone)
     }
 
     /// Resolves a family name for a read at `snapshot`: as the snapshot saw it, so a family

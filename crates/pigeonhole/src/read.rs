@@ -192,7 +192,10 @@ impl Selection {
         let info = core.info_at(&snapshot);
         let mut ids = SmallVec::new();
         for name in self.family_names() {
-            let id = core.family_id_at(&snapshot, name)?;
+            let id = match info.family(name) {
+                Some(f) => f.id,
+                None => core.family_id(name)?,
+            };
             if !ids.contains(&id) {
                 ids.push(id);
             }
