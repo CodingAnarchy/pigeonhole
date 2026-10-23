@@ -531,6 +531,13 @@ fn the_application_owned_backend_starts_no_thread() {
         "an application-owned backend started a thread"
     );
     let engine = Backend::uring("uring-engine-threads");
+    // The reaper names itself once it runs: `thread::Builder::spawn` returns before the new
+    // thread's `pthread_setname_np`, so a count right away can still miss it (40 of 100 runs
+    // failed on main in a Linux VM). Wait for the name, up to a deadline.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while threads() != before + 1 && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(threads(), before + 1, "the engine-owned backend's reaper");
     drop((app, engine));
 }
