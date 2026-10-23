@@ -430,6 +430,17 @@ fn pipeline(
     // Conflicted transactions waiting out their `RetryPolicy` pause: (resubmit at, first
     // submission, commit index, write, attempts so far). They hold their pipeline slot.
     let mut paused: Vec<(Instant, Instant, usize, &Write, u32)> = Vec::new();
+    // SCRATCH (#708 retry study): an EWMA (1/8) of first-attempt read-modify-write times, the
+    // adaptive base's input under `PH_RETRY_ADAPTIVE`.
+    let mut rmw_ewma_ns: u64 = 0;
+    let note = |ewma: &mut u64, d: Duration| {
+        let d = d.as_nanos() as u64;
+        *ewma = if *ewma == 0 {
+            d
+        } else {
+            *ewma - *ewma / 8 + d / 8
+        };
+    };
     let mut next = writes.iter().enumerate();
     let mut busy = 0u64;
     let mut conflicts = 0u64;
@@ -466,6 +477,11 @@ fn pipeline(
                 progressed = true;
                 match r {
                     Ok(_) => {
+                        if *tries == 0
+                            && matches!(batches, Some((_, all)) if is_rmw(*j, all.len(), readers))
+                        {
+                            note(&mut rmw_ewma_ns, at.elapsed());
+                        }
                         if let Some(h) = hist.as_deref_mut() {
                             let kind = match batches {
                                 Some((_, all)) if is_rmw(*j, all.len(), readers) => &mut h.rmw,
@@ -479,6 +495,20 @@ fn pipeline(
                     // snapshot: run again with a new snapshot, as the transfer clients do.
                     Err(e) if e.code() == ErrorCode::Conflict && *tries < CONFLICT_RETRIES => {
                         conflicts += 1;
+                        if *tries == 0 {
+                            note(&mut rmw_ewma_ns, at.elapsed());
+                        }
+                        let adapted;
+                        let policy = match pigeonhole::scratch_adaptive_factor() {
+                            Some(f) => {
+                                adapted = policy.clone().backoff(
+                                    Duration::from_nanos((rmw_ewma_ns as f64 * f) as u64),
+                                    Duration::from_millis(100),
+                                );
+                                &adapted
+                            }
+                            None => policy,
+                        };
                         // Attempts count from 1; `tries` counts the retries so far. Past the
                         // policy's deadline it runs again at once, as before.
                         match policy

@@ -151,6 +151,8 @@ pub use options::{
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use recovery::RecoveryStats;
 pub use retry::RetryPolicy;
+#[doc(hidden)]
+pub use retry::scratch_adaptive_factor;
 pub use table::{ReadTable, Table, TableBuilder};
 pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
 

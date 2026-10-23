@@ -243,6 +243,7 @@ impl Pigeonhole {
         let started = Instant::now();
         let mut attempt = 1u32;
         loop {
+            let attempt_start = Instant::now();
             // `retryable`: a pigeonhole error the policy may retry; `given_up`: the
             // application's own error, returned as is.
             let mut given_up = None;
@@ -261,6 +262,7 @@ impl Pigeonhole {
                             Some(d) => txn.commit_with(d),
                             None => txn.commit(),
                         };
+                        self.db.txn_counts.note_attempt(attempt_start.elapsed());
                         match commit {
                             Ok(info) => return Ok((value, info)),
                             Err(e) => Some(e),
@@ -272,7 +274,18 @@ impl Pigeonhole {
                 return Err(app);
             }
             let error = retryable.expect("an error when nothing was given up");
-            let Some(pause) = policy.next_pause(error.code(), attempt, started.elapsed()) else {
+            let adapted;
+            let policy_now = match scratch_adaptive_factor() {
+                Some(f) => {
+                    let ewma = self.db.txn_counts.attempt_ewma_ns.load(Ordering::Relaxed);
+                    let base = Duration::from_nanos((ewma as f64 * f) as u64);
+                    adapted = policy.clone().backoff(base, policy.cap);
+                    &adapted
+                }
+                None => policy,
+            };
+            let Some(pause) = policy_now.next_pause(error.code(), attempt, started.elapsed())
+            else {
                 return Err(E::from(error));
             };
             attempt += 1;
@@ -290,6 +303,28 @@ pub(crate) struct TxnCounts {
     pub(crate) commits: AtomicU64,
     pub(crate) conflicts: AtomicU64,
     pub(crate) retries: AtomicU64,
+    /// SCRATCH (#708 retry study): an EWMA (1/8) of `transact` attempt times, in ns.
+    pub(crate) attempt_ewma_ns: AtomicU64,
+}
+
+/// SCRATCH (#708 retry study): `PH_RETRY_ADAPTIVE=<factor>` makes `transact`'s backoff base
+/// `factor` × the handle's EWMA of attempt times instead of the policy's base.
+pub fn scratch_adaptive_factor() -> Option<f64> {
+    static F: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    *F.get_or_init(|| {
+        std::env::var("PH_RETRY_ADAPTIVE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
+impl TxnCounts {
+    fn note_attempt(&self, took: Duration) {
+        let d = took.as_nanos() as u64;
+        let old = self.attempt_ewma_ns.load(Ordering::Relaxed);
+        let new = if old == 0 { d } else { old - old / 8 + d / 8 };
+        self.attempt_ewma_ns.store(new, Ordering::Relaxed);
+    }
 }
 
 impl TxnCounts {
