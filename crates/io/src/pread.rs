@@ -647,6 +647,10 @@ impl File for PreadFile {
         }
     }
 
+    fn holds(&self, byte: u64) -> Option<LockMode> {
+        lock(&self.inner.held).get(&byte).copied()
+    }
+
     fn identity(&self) -> Result<FileIdentity> {
         os::identity(self.inner.file())
     }

@@ -334,8 +334,10 @@ fn shm_layout() {
     assert_eq!(&p[0..8], b"PHDBSHM\0");
     assert_eq!(
         (le32(&p, 8), le32(&p, 12), le64(&p, 16)),
-        (2, 4096, h.region_len)
+        (3, 4096, h.region_len)
     );
+    // §8.3: reader slot `i`'s liveness lock is byte 2^62 + i (layout version 3, #693).
+    assert_eq!(pigeonhole_format::superblock::READER_LOCK_BASE, 1 << 62);
     // §11.2: each shard's 64-byte watermark line holds `pending` at 0 and `durable` at 8
     // (layout version 2, D227).
     assert_eq!(

@@ -44,6 +44,7 @@ parity!(
     read_only_handle_rejects_writes,
     exclusive_conflicts,
     shared_locks_coexist,
+    holds_reports_this_handles_locks,
     upgrade_and_downgrade,
     closing_a_handle_releases_its_locks,
     exclusive_lock_needs_a_writable_handle,
@@ -227,6 +228,34 @@ fn exclusive_conflicts(b: &Backend) {
         a.lock(8192, LockMode::Shared).unwrap_err().kind,
         ErrorKind::Locked
     );
+}
+
+/// `File::holds` (ICR 0065): the lock this handle holds on a byte, never another handle's,
+/// including a byte far past the end (reader slot liveness bytes, `2^62 + i`).
+fn holds_reports_this_handles_locks(b: &Backend) {
+    let a = b.create("f");
+    let c = b
+        .vfs
+        .open(&b.path("f"), OpenOptions::read_write_create())
+        .unwrap();
+    let far = (1u64 << 62) + 3;
+    assert_eq!(a.holds(far), None);
+    a.lock(far, LockMode::Exclusive).unwrap();
+    assert_eq!(a.holds(far), Some(LockMode::Exclusive));
+    assert_eq!(c.holds(far), None, "another handle's lock");
+    assert_eq!(
+        c.lock(far, LockMode::Exclusive).unwrap_err().kind,
+        ErrorKind::Locked
+    );
+    a.unlock(far).unwrap();
+    assert_eq!(a.holds(far), None);
+    a.lock(8193, LockMode::Shared).unwrap();
+    c.lock(8193, LockMode::Shared).unwrap();
+    assert_eq!(a.holds(8193), Some(LockMode::Shared));
+    assert_eq!(c.holds(8193), Some(LockMode::Shared));
+    a.lock(8194, LockMode::Exclusive).unwrap();
+    a.lock(8194, LockMode::Shared).unwrap(); // downgrade
+    assert_eq!(a.holds(8194), Some(LockMode::Shared));
 }
 
 fn shared_locks_coexist(b: &Backend) {

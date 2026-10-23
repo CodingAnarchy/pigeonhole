@@ -13,6 +13,14 @@
 
 use crate::Result;
 
+/// This process's id, as [`std::process::id`] but without a system call after the first:
+/// a cached value that a forked child resets (a `pthread_atfork` child handler on Unix), so a
+/// child never sees its parent's id. Reader slots compare it with the id recorded at claim,
+/// on every pin store, to leave a forked child's copy of a reader's handle inert (#693).
+pub fn process_id() -> u32 {
+    crate::os::process_id()
+}
+
 /// Number of CPUs available to this process, honoring affinity masks and cgroup CPU quotas.
 pub fn available_cpus() -> usize {
     crate::os::available_cpus()

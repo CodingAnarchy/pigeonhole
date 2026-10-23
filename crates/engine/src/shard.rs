@@ -538,6 +538,10 @@ pub(crate) struct Shared {
     /// read-only by `read_only_fallback`, ICR 0059): no flush, compaction, checkpoint,
     /// tablet change or clean-close commit. Set at open, never changed.
     pub no_writes: bool,
+    /// The writer's lock handle on the database file, through which it probes reader slots'
+    /// liveness locks (`reclaim_dead_readers`, layout 3, #693 PR 3); `None` in a reader
+    /// process, which reclaims nothing. Set at open, never changed.
+    pub lock_file: Option<pigeonhole_io::FileRef>,
     pub shm_dir: Option<std::path::PathBuf>,
     pub identity: pigeonhole_io::FileIdentity,
     pub path: std::path::PathBuf,
@@ -573,12 +577,19 @@ impl Shared {
     /// points: when a flush or a compaction completes (`on_flushed`, `on_compaction_done`,
     /// which also covers a writer gone idle while compactions finish) and when a commit finds
     /// no arena room (`reserve_room`, again on every room recheck), so a commit stalled
-    /// behind a dead reader's pin gets in within one interval. Never per commit or per read: even the
-    /// deadline's clock read showed up in the callgrind counts there. The liveness check (a
-    /// `/proc` read or `proc_pidinfo` per active slot) stays off `view_lock` and off
-    /// application threads; every other bound reads the pins as they are, and a slot freed
-    /// here lowers all of them (#834 review).
+    /// behind a dead reader's pin gets in within one interval. Never per commit or per read:
+    /// even the deadline's clock read showed up in the callgrind counts there. The liveness
+    /// check (a non-blocking lock probe per claimed slot,
+    /// `ShmRegion::reclaim_dead_slots_locked`) stays off `view_lock` and off application
+    /// threads; every other bound reads the pins as they are, and a slot freed here lowers
+    /// all of them (#834 review).
     pub(crate) fn reclaim_dead_readers(&self) {
+        // A reader process frees no slots; nor does anything by pid (#693 PR 3): a reader's
+        // slot is freed only by a handle that holds its liveness lock, which is what makes
+        // every store a reader makes to its slot a store to its own slot.
+        let Some(file) = &self.lock_file else {
+            return;
+        };
         let now = self.vfs.monotonic_nanos();
         let at = self.reader_reclaim_at.load(Ordering::Relaxed);
         if now >= at
@@ -592,7 +603,8 @@ impl Shared {
                 )
                 .is_ok()
         {
-            let freed = self.shm.reclaim_dead_slots(&self.vfs);
+            // By each slot's liveness lock (#693 PR 3), not its pid.
+            let freed = self.shm.reclaim_dead_slots_locked(file);
             self.reader_slots_reclaimed
                 .fetch_add(freed as u64, Ordering::Relaxed);
             if freed > 0 {

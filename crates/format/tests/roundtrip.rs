@@ -362,13 +362,13 @@ fn versions_are_checked() {
     }
     let mut page = [0u8; 4096];
     let h = ShmHeader {
-        layout_version: pigeonhole_format::ShmLayoutVersion(3),
+        layout_version: pigeonhole_format::ShmLayoutVersion(4),
         ..ShmHeader::layout([0; 16], 1, 1, 64, 1, 0, 0)
     };
     h.encode(&mut page);
     assert!(matches!(
         ShmHeader::decode(&page),
-        Err(pigeonhole_format::Error::UnsupportedVersion { found: 3, .. })
+        Err(pigeonhole_format::Error::UnsupportedVersion { found: 4, .. })
     ));
     // A newer superblock is reported as such even if the other copy is garbage.
     let sb = Superblock {

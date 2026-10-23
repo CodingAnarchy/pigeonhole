@@ -472,6 +472,10 @@ impl File for UringFile {
         self.file.unlock(byte)
     }
 
+    fn holds(&self, byte: u64) -> Option<LockMode> {
+        self.file.holds(byte)
+    }
+
     fn identity(&self) -> Result<FileIdentity> {
         self.file.identity()
     }

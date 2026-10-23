@@ -1239,6 +1239,7 @@ version = "0.4.0"
 dependencies = [
  "arc-swap",
  "criterion",
+ "libc",
  "loom",
  "pigeonhole-cache",
  "pigeonhole-compaction",
@@ -1319,6 +1320,7 @@ name = "pigeonhole-shm"
 version = "0.4.0"
 dependencies = [
  "criterion",
+ "libc",
  "pigeonhole-format",
  "pigeonhole-io",
  "proptest",

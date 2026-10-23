@@ -1171,8 +1171,11 @@ impl ReaderPins {
     }
 
     /// Releases a snapshot's key: the pins rise to the oldest snapshot left, or clear when
-    /// none is. Leaves the slot alone once the writer freed it (it may be another
-    /// process's now: #834 review) or the reader closed.
+    /// none is. Leaves the slot alone once the reader closed, or if the slot no longer names
+    /// this process (it may be another process's then: #834 review). That check is
+    /// defensive since #693 PR 3: the writer frees a slot only under its liveness lock, which
+    /// this process holds while it holds the slot, so no store here lands in a slot freed
+    /// under it.
     pub(crate) fn release(&self, key: (Seqno, u64)) {
         let mut held = self
             .held
@@ -1187,6 +1190,19 @@ impl ReaderPins {
             (Some(&seqno), Some(&view)) => self.slot.raise_pin(seqno, view),
             _ => self.slot.unpin(),
         }
+    }
+
+    /// The reader is about to claim another slot while this one lives on (a superseded
+    /// generation, or a slot freed under it): give the slot up without touching it
+    /// ([`pigeonhole_shm::ReaderSlot::abandon`]), and leave it alone from now on, as after
+    /// [`ReaderPins::close`].
+    pub(crate) fn abandon(&self) {
+        let mut held = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        held.closed = true;
+        self.slot.abandon();
     }
 
     /// The reader closes: unpin, and leave the slot alone from now on.

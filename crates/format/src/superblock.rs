@@ -20,6 +20,12 @@ pub const PRESENCE_LOCK_BYTE: u64 = WRITER_LOCK_BYTE + 1;
 /// Absolute file offset of the shared-memory init byte (held exclusive while a process
 /// creates, validates or rebuilds the shared-memory region).
 pub const SHM_INIT_LOCK_BYTE: u64 = WRITER_LOCK_BYTE + 2;
+/// Absolute file offset of reader slot 0's liveness lock byte (shared-memory layout 3,
+/// #693 PR 3): slot `i` is byte `READER_LOCK_BASE + i`, held exclusive by the reader process
+/// that owns the slot for as long as it does. The writer frees a slot only once it can take
+/// that byte itself. 2^62 lies beyond any file this format can reach, so no read or write
+/// ever touches these bytes (on Windows, where byte-range locks are mandatory, that matters).
+pub const READER_LOCK_BASE: u64 = 1 << 62;
 
 /// Number of meaningful bytes at the start of a superblock page; the rest is zero.
 pub const SUPERBLOCK_LEN: usize = 128;

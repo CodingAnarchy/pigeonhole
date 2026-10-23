@@ -864,3 +864,32 @@ mod liveness_tests {
         ));
     }
 }
+
+/// The cached process id ([`crate::sys::process_id`]); 0 until first read and in a child
+/// right after `fork`.
+static PROCESS_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// `pthread_atfork` child handler: runs in the child, on the forking thread, before `fork`
+/// returns there. A single atomic store, which is async-signal-safe.
+extern "C" fn forked_child() {
+    PROCESS_ID.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn process_id() -> u32 {
+    use std::sync::atomic::Ordering;
+    let id = PROCESS_ID.load(Ordering::Relaxed);
+    if id != 0 {
+        return id;
+    }
+    static HANDLER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // SAFETY: registers a handler that only stores to a static atomic.
+    let registered = *HANDLER
+        .get_or_init(|| unsafe { libc::pthread_atfork(None, None, Some(forked_child)) } == 0);
+    let id = std::process::id();
+    // Cached only with the handler registered, so a later fork always resets it; if
+    // registration failed (`ENOMEM`), every call asks the system.
+    if registered {
+        PROCESS_ID.store(id, Ordering::Relaxed);
+    }
+    id
+}

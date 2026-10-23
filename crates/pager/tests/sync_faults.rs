@@ -200,6 +200,9 @@ impl File for FaultFile {
     fn unlock(&self, byte: u64) -> Result<()> {
         self.inner.unlock(byte)
     }
+    fn holds(&self, byte: u64) -> Option<LockMode> {
+        self.inner.holds(byte)
+    }
     fn identity(&self) -> Result<FileIdentity> {
         self.inner.identity()
     }
