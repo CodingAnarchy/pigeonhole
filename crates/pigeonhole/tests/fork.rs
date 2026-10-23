@@ -13,8 +13,11 @@ const HUNG: i32 = 99;
 fn a_forked_child_cannot_use_or_close_the_parents_handle() {
     let dir = pigeonhole::doc_support::temp_dir();
     let path = dir.join("fork.phdb");
-    let db = Pigeonhole::open(&path, Options::default().shards(2).auto_recover(Recovery::Io))
-        .unwrap();
+    let db = Pigeonhole::open(
+        &path,
+        Options::default().shards(2).auto_recover(Recovery::Io),
+    )
+    .unwrap();
     let t = pigeonhole::doc_support::table(&db, "t", &["f"]).unwrap();
     t.mutate(b"r").put("f", b"q", b"v").commit().unwrap();
 
