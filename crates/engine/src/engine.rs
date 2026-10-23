@@ -3817,6 +3817,7 @@ impl Inner {
             shared: self.shard_ref(shard),
             resolved: None,
             deferred: None,
+            fork_checked: false,
         })
     }
 

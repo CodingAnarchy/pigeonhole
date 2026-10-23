@@ -358,6 +358,8 @@ pub struct PendingCommit {
     /// An async commit still waiting for room on its shard (D210): submitted once
     /// admitted. `sub` holds a placeholder waiter meanwhile.
     pub(crate) deferred: Option<Box<Deferred<PendingCommit, crate::Result<Settled>>>>,
+    /// The fork check ran (on the first poll, #901): later polls skip it.
+    pub(crate) fork_checked: bool,
 }
 
 impl From<Submission> for PendingCommit {
@@ -366,6 +368,7 @@ impl From<Submission> for PendingCommit {
             sub,
             resolved: None,
             deferred: None,
+            fork_checked: false,
         }
     }
 }
@@ -822,6 +825,7 @@ impl PendingCommit {
             },
             resolved: None,
             deferred: Some(deferred),
+            fork_checked: false,
         }
     }
 
@@ -849,8 +853,12 @@ impl Future for PendingCommit {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        if forked(&this.sub.shared) {
-            return Poll::Ready(Err(crate::engine::forked()));
+        // Once, on the first poll: submitted before a fork, nothing resolves it in the child.
+        if !this.fork_checked {
+            if forked(&this.sub.shared) {
+                return Poll::Ready(Err(crate::engine::forked()));
+            }
+            this.fork_checked = true;
         }
         if this.deferred.is_some() {
             return this.poll_deferred(cx);
@@ -896,6 +904,8 @@ pub struct PendingCheck {
     pub(crate) resolved: Option<(bool, Option<CommitInfo>)>,
     /// As [`PendingCommit`]'s: still waiting for room (D210).
     pub(crate) deferred: Option<Box<Deferred<PendingCheck, CheckReply>>>,
+    /// As [`PendingCommit`]'s.
+    pub(crate) fork_checked: bool,
 }
 
 impl PendingCheck {
@@ -931,6 +941,7 @@ impl PendingCheck {
             shared,
             resolved: None,
             deferred: Some(deferred),
+            fork_checked: false,
         }
     }
 
@@ -960,8 +971,11 @@ impl Future for PendingCheck {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
-        if forked(&this.shared) {
-            return Poll::Ready(Err(crate::engine::forked()));
+        if !this.fork_checked {
+            if forked(&this.shared) {
+                return Poll::Ready(Err(crate::engine::forked()));
+            }
+            this.fork_checked = true;
         }
         if this.deferred.is_some() {
             return this.poll_deferred(cx);
