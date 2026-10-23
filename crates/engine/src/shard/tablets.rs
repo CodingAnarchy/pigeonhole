@@ -499,7 +499,7 @@ impl ShardState {
     #[inline(never)]
     pub(super) fn refuse_waiting(
         &mut self,
-        m: Member,
+        mut m: Member,
         wait: OverlapWait,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
@@ -546,12 +546,14 @@ impl ShardState {
             self.id.0, m.seqno
         );
         self.shared.metrics[usize::from(self.id.0)].count_refusal(CrossRefusal::PendingOverlap);
+        let validate = m.validate.take().filter(|v| !v.reads.is_empty());
         self.overlap_refused.push(OverlapRefusal {
             coordinator,
             priority,
             rows,
             behind,
             single,
+            validate,
         });
         self.refuse_prepare(m, PrepareError::PendingOverlap, ctx);
     }
@@ -790,6 +792,52 @@ impl ShardState {
         }
     }
 
+    /// A share of the commit of `priority`, writing `written` (`hash_row`, sorted), committed
+    /// here (D276): a refused commit that reads one of those rows and now fails validation
+    /// on it would fail its retry the same way (its snapshot stays, and a version above it
+    /// stays above it), so its coordinator is told to fail it now, without another round.
+    #[cold]
+    #[inline(never)]
+    pub(super) fn doom_overlaps(
+        &mut self,
+        priority: CommitPriority,
+        written: &[u64],
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let mut refused = std::mem::take(&mut self.overlap_refused);
+        let mut i = 0;
+        while i < refused.len() {
+            let r = &refused[i];
+            let doomed = r.priority != priority
+                && r.validate.as_deref().is_some_and(|v| {
+                    v.reads.iter().any(|read| {
+                        written
+                            .binary_search(&hash_row(read.table, &read.row))
+                            .is_ok()
+                            && self.conflicts(v.seqno, read).unwrap_or(false)
+                    })
+                });
+            if doomed {
+                let r = refused.swap_remove(i);
+                trace!(
+                    "shard {} dooms {:?}: tells {}",
+                    self.id.0, r.priority, r.coordinator.0
+                );
+                // Through the queue, as `wake_overlap`.
+                let _ = ctx.submitter(r.coordinator).submit(ShardMsg::Wake {
+                    from: self.id,
+                    reason: WakeReason::Doomed {
+                        priority: r.priority,
+                    },
+                });
+            } else {
+                i += 1;
+            }
+        }
+        refused.append(&mut self.overlap_refused);
+        self.overlap_refused = refused;
+    }
+
     /// The commit of `priority` retries without this shard (D249): the commits waiting here
     /// behind it are woken.
     pub(super) fn release_overlaps_behind(
@@ -842,6 +890,10 @@ impl ShardState {
             let seen = &mut self.room_freed[usize::from(from.0)];
             *seen = (*seen).max(generation);
         }
+        if let WakeReason::Doomed { priority } = reason {
+            self.on_doomed(priority, ctx);
+            return;
+        }
         let (ready, wait): (Vec<CoordinateReq>, Vec<CoordinateReq>) =
             std::mem::take(&mut self.retries)
                 .into_iter()
@@ -874,6 +926,55 @@ impl ShardState {
             }
         }
         self.arm_tablet_timer(ctx);
+    }
+
+    /// A participant found the commit of `priority` doomed (D276): a retry waiting for its
+    /// wake fails now; one whose round is still undecided or aborting fails at the round's
+    /// end (`on_applied`). Otherwise it has ended, or it runs a later round: that round's
+    /// PREPARE there either came after the doom and fails validation, or was refused again
+    /// and doomed in the same pass.
+    fn on_doomed(&mut self, priority: CommitPriority, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if let Some(i) = self
+            .retries
+            .iter()
+            .position(|r| (r.submitted_at, r.first_seqno) == priority)
+        {
+            let r = self.retries.swap_remove(i);
+            self.overlap_released.retain(|(_, p)| *p != priority);
+            self.fail_doomed(r.submitted_at, r.first_seqno, &r.prev_shards, r.reply, ctx);
+        } else if self
+            .coord
+            .values()
+            .any(|c| c.priority == priority && !c.committing)
+            && !self.doomed.contains(&priority)
+        {
+            self.doomed.push(priority);
+        }
+    }
+
+    /// Ends a doomed commit (D276) with `Conflict`: its last participants hear `Released`,
+    /// so fences it set and commits waiting behind it there go on, as for any commit that
+    /// runs no further attempt.
+    pub(super) fn fail_doomed(
+        &mut self,
+        submitted_at: u64,
+        first_seqno: Seqno,
+        shards: &[ShardId],
+        reply: Notifier<Result<Settled>>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        trace!(
+            "shard {} fails doomed {:?}",
+            self.id.0,
+            (submitted_at, first_seqno)
+        );
+        self.shared.metrics[usize::from(self.id.0)]
+            .cross
+            .failed_fast
+            .fetch_add(1, Ordering::Relaxed);
+        self.release_shards(submitted_at, first_seqno, shards, ctx);
+        reply.notify(Err(Error::Conflict));
+        self.try_finish_close(ctx);
     }
 
     /// A PREPARE refused without a record: for rows this shard is moving or no longer owns
