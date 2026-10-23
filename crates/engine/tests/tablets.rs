@@ -6198,6 +6198,63 @@ fn a_cross_shard_transaction_still_conflicts_with_a_write_after_its_snapshot() {
     );
 }
 
+#[test]
+fn a_refused_cross_shard_transaction_whose_read_goes_stale_fails_without_another_round() {
+    // D276: as above, B is refused over A's undecided share on `a`, and A commits a write to
+    // `a` (the family B read) after B's snapshot. `low` validates B's read when A's share
+    // commits there and finds it stale: B fails with `Conflict` without retrying. So each
+    // commit ran one round.
+    let (mut db, low, high) = overlap_db();
+    let before = db.engine.metrics().cross_shard;
+    let b = overlap_txn(&db, &[b"a"], &[b"z", b"a"]);
+    let a = overlap_txn(&db, &[], &[b"y", b"a"]);
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    turn(&mut db, low);
+    turn(&mut db, low);
+    let (ra, rb) = resolve_both(&mut db, &mut pa, &mut pb);
+    ra.expect("A commits");
+    assert!(
+        matches!(rb, Err(pigeonhole_engine::Error::Conflict)),
+        "B: {rb:?}"
+    );
+    let x = db.engine.metrics().cross_shard;
+    assert!(
+        x.refused_pending_overlap > before.refused_pending_overlap,
+        "B was never refused over the overlap"
+    );
+    assert_eq!(x.failed_fast - before.failed_fast, 1, "{x:?}");
+    assert_eq!(x.rounds - before.rounds, 2, "B retried: {x:?}");
+}
+
+#[test]
+fn a_refused_cross_shard_transaction_is_not_failed_for_a_write_to_a_family_it_did_not_read() {
+    // D276 only fails what validation would: B reads `a` in family `g` only (the rows it
+    // writes, `overlap_txn`), and A's committed write to `a` is in `f`. B retries and
+    // commits.
+    let (mut db, low, high) = overlap_db();
+    let before = db.engine.metrics().cross_shard;
+    let b = overlap_txn(&db, &[], &[b"z", b"a"]);
+    let a = overlap_txn(&db, &[], &[b"y", b"a"]);
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    let mut pb = b.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    turn(&mut db, low);
+    turn(&mut db, low);
+    let (ra, rb) = resolve_both(&mut db, &mut pa, &mut pb);
+    ra.expect("A commits");
+    rb.expect("B commits on its retry");
+    let x = db.engine.metrics().cross_shard;
+    assert!(
+        x.refused_pending_overlap > before.refused_pending_overlap,
+        "B was never refused over the overlap"
+    );
+    assert_eq!(x.failed_fast, before.failed_fast, "{x:?}");
+}
+
 /// Polls both commits, stepping every shard, until both resolve.
 fn resolve_both(
     db: &mut Db,

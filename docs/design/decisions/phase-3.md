@@ -2389,3 +2389,24 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - `a_counter_increment_after_the_snapshot_conflicts`: a counter family's `put_i64`, then an increment after a transaction's snapshot, conflicts. Every such write carries D186's fixed timestamp, so the versions tie on timestamp and follow seqno order; this passes with or without the fallback.
 - `a_counter_bucket_increment_behind_a_newer_bucket_still_conflicts`: a bucket increment (`merge_at`) into an older bucket after the snapshot sits behind a newer bucket with a lower seqno, and still conflicts. It fails without the fallback.
 - **Mutations:** ignoring the flag fails the second and third tests; walking always fails the first.
+
+<a id="d276"></a>
+## D276 — A commit refused over an overlap fails at once when the share it overlapped commits a write to a row it read (owner decision, 2026-10-23; engine, pigeonhole, #708 candidate 2, ICR 0066; builds on D249, D263)
+
+**Decided:**
+- **Where the doom is found.** A participant that refuses a PREPARE over an undecided overlap (`PendingOverlap`, D249) keeps the refused commit's validated reads in its `OverlapRefusal`. When a share that writes one of those rows commits there, `on_decide` has already applied it (`decide_share`). The participant then runs the same validation as a PREPARE (`conflicts`) on the reads of those rows, against the commit's snapshot (`doom_overlaps`).
+- **What it sends.** If a read is stale, the participant drops the refusal and sends `Wake { Doomed }` instead of the overlap wake. This happens before `release_overlaps`, which would otherwise wake the commit.
+- **What the coordinator does with it.**
+  - A retry waiting for a wake fails with `Conflict` at once (`on_doomed`).
+  - A round still undecided, or in its abort round, keeps the doom (`doomed`) and fails at the round's end (`on_applied`), instead of queueing the retry.
+  - In both cases the commit's last participants hear `Released`: fences it set, and commits waiting behind it, go on as for any commit that runs no further attempt.
+  - Otherwise the commit has ended, or it runs a later round whose PREPARE there either comes after the doom and fails validation, or was refused again and is doomed in the same pass.
+- **`Released` never precedes a participant's decision of the doomed round.** The coordinator fails a doomed commit only in two places. One is `on_applied`, once every participant has answered the round's abort `Decide`. The other is a retry queued after that. So each participant has already decided the round, and released its fences' last-attempt state, when `Released` arrives. The participant that sent the doom has dropped its refusal before sending; any later wake for that priority finds no retry and no round, and is ignored as a stale overlap wake is.
+- **It is exact.** It fails only commits the retry's validation would fail. The snapshot is the same across retries, and the commit's snapshot pin (`Validate::_pin`) keeps any version above it from being purged. A write to a family the commit did not read dooms nothing. A commit's own share never dooms its own refusal.
+- **Counter:** `CrossShardMetrics::failed_fast`, per coordinator (ICR 0066).
+
+**Why:** #708's transfer sizing at Buffered. 58% of cross-shard attempts conflict, and a conflicting attempt costs 74–77 µs against 48 µs for a successful one. Most of the difference is the refused round, the wake, and a second round that only fails validation. About 4.4M of 16.9M rounds were refused.
+
+**Tests** (`tests/tablets.rs`):
+- `a_refused_cross_shard_transaction_whose_read_goes_stale_fails_without_another_round`: B is refused over A's undecided share, and A commits a write to the family B read. B fails with `Conflict` after one round (`failed_fast` 1, two rounds in all). Without `doom_overlaps` it takes three rounds.
+- `a_refused_cross_shard_transaction_is_not_failed_for_a_write_to_a_family_it_did_not_read`: the same overlap with A writing a family B did not read. B retries and commits.
