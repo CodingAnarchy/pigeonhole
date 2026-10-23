@@ -47,6 +47,10 @@ type Lag = (u64, u64, u64);
 #[derive(Debug)]
 pub(crate) struct Running {
     children: Vec<(Child, Option<ChildStdin>, BufReader<ChildStdout>)>,
+    /// #397 measurement (scratch): `PHDB_IN_PROCESS_READERS` threads in the writer process
+    /// running the children's read loop, and their stop flag.
+    in_process: Vec<std::thread::JoinHandle<ChildReport>>,
+    stop_in_process: Arc<AtomicBool>,
     stop_sampling: Arc<AtomicBool>,
     sampler: Option<std::thread::JoinHandle<Lag>>,
 }
@@ -103,6 +107,28 @@ pub(crate) fn spawn(
         }
         children.push((child, stdin, out));
     }
+    let stop_in_process = Arc::new(AtomicBool::new(false));
+    let in_process_n: usize = std::env::var("PHDB_IN_PROCESS_READERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let mut in_process = Vec::new();
+    for i in 0..in_process_n {
+        let table = writer
+            .table("bench")
+            .and_then(|b| b.open())
+            .map_err(|e| e.to_string())?;
+        let stop = Arc::clone(&stop_in_process);
+        let (records, seed) = (config.records, config.seed ^ (0x1A_0000 + i as u64));
+        in_process.push(std::thread::spawn(move || {
+            read_loop(
+                |row, family| table.row(row).family(family).read().map(|r| r.is_some()),
+                records,
+                seed,
+                &stop,
+            )
+        }));
+    }
     let stop_sampling = Arc::new(AtomicBool::new(false));
     let sampler = {
         let (writer, stop) = (writer.clone(), Arc::clone(&stop_sampling));
@@ -122,6 +148,8 @@ pub(crate) fn spawn(
     };
     Ok(Running {
         children,
+        in_process,
+        stop_in_process,
         stop_sampling,
         sampler: Some(sampler),
     })
@@ -138,6 +166,26 @@ impl Running {
             .map_or((0, 0, 0), |s| s.join().unwrap_or((0, 0, 0)));
         for (_, stdin, _) in &mut self.children {
             drop(stdin.take());
+        }
+        self.stop_in_process.store(true, Ordering::Release);
+        if !self.in_process.is_empty() {
+            let mut hist = Histogram::new();
+            let (mut misses, mut errors, mut rate) = (0u64, 0u64, 0f64);
+            for t in self.in_process.drain(..) {
+                let r = t
+                    .join()
+                    .map_err(|_| "an in-process reader panicked".to_owned())?;
+                let h = Histogram::from_sparse(&r.reads);
+                rate += h.count() as f64 / r.secs.max(1e-9);
+                hist.merge(&h);
+                misses += r.misses;
+                errors += r.errors;
+            }
+            let s = LatencyStats::of(&hist);
+            eprintln!(
+                "INPROC {}",
+                serde_json::json!({"reads": s, "reads_per_sec": rate, "misses": misses, "errors": errors})
+            );
         }
         let mut hist = Histogram::new();
         let (mut misses, mut errors, mut rate) = (0u64, 0u64, 0f64);
@@ -172,6 +220,7 @@ impl Running {
 impl Drop for Running {
     fn drop(&mut self) {
         self.stop_sampling.store(true, Ordering::Release);
+        self.stop_in_process.store(true, Ordering::Release);
         // A run that failed before `stop` still leaves no reader behind.
         for (child, _, _) in &mut self.children {
             let _ = child.kill();
@@ -202,6 +251,35 @@ pub fn child(path: &Path, records: u64, seed: u64) -> Result<(), String> {
             stop.store(true, Ordering::Release);
         });
     }
+    say("READY");
+    let report = read_loop(
+        |row, family| table.row(row).family(family).read().map(|r| r.is_some()),
+        records,
+        seed,
+        &stop,
+    );
+    say(&serde_json::to_string(&report).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
+/// The read loop of a reader process, and of an in-process reader (#397 measurement):
+/// whole `ycsb` rows, Zipfian over `records` (ycsb-c's distribution, seeded with `seed`),
+/// or, with `PHDB_READER_HOT=K`, uniformly over the K hottest rows of that distribution (the
+/// rows ycsb-a's updates overwrite most), until `stop`.
+fn read_loop<E>(
+    mut read: impl FnMut(&[u8], &str) -> Result<bool, E>,
+    records: u64,
+    seed: u64,
+    stop: &AtomicBool,
+) -> ChildReport {
+    let hot: u64 = std::env::var("PHDB_READER_HOT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let hot_rows: Vec<Vec<u8>> = (0..hot)
+        .map(|r| crate::workload::ycsb_key(crate::rng::fnv64(r) % records.max(1)))
+        .collect();
+    let mut rng = crate::rng::Rng::new(seed);
     let mut workload = Workload::new(WorkloadConfig {
         kind: WorkloadKind::YcsbC,
         seed,
@@ -209,32 +287,36 @@ pub fn child(path: &Path, records: u64, seed: u64) -> Result<(), String> {
         operations: u64::MAX / 4,
         ..WorkloadConfig::smoke(WorkloadKind::YcsbC)
     });
+    let mut ops = workload.run_ops();
     let (mut hist, mut misses, mut errors) = (Histogram::new(), 0u64, 0u64);
-    say("READY");
     let begun = Instant::now();
-    for op in workload.run_ops() {
-        if stop.load(Ordering::Acquire) {
-            break;
-        }
-        let (row, family) = match &op {
-            BenchOp::GetRow { row, family } => (row, *family),
-            BenchOp::Get { row, family, .. } => (row, *family),
-            _ => continue,
+    while !stop.load(Ordering::Acquire) {
+        let (row, family) = if hot_rows.is_empty() {
+            match ops.next() {
+                Some(BenchOp::GetRow { row, family }) | Some(BenchOp::Get { row, family, .. }) => {
+                    (row, family)
+                }
+                Some(_) => continue,
+                None => break,
+            }
+        } else {
+            (
+                hot_rows[rng.below(hot) as usize].clone(),
+                crate::workload::YCSB_FAMILY,
+            )
         };
         let t = Instant::now();
-        match table.row(row).family(family).read() {
-            Ok(Some(_)) => {}
-            Ok(None) => misses += 1,
+        match read(&row, family) {
+            Ok(true) => {}
+            Ok(false) => misses += 1,
             Err(_) => errors += 1,
         }
         hist.record(t.elapsed());
     }
-    let report = ChildReport {
+    ChildReport {
         reads: hist.to_sparse(),
         misses,
         errors,
         secs: begun.elapsed().as_secs_f64(),
-    };
-    say(&serde_json::to_string(&report).map_err(|e| e.to_string())?);
-    Ok(())
+    }
 }
