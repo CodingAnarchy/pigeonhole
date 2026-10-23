@@ -40,7 +40,7 @@ It writes nothing, so it has no seqno of its own and nothing to make durable. It
 - **`RetryPolicy`** (`Clone`, `Debug`, `Default`; private fields, builder methods):
   - `max_attempts(n)`, `unlimited_attempts()` (the default);
   - `deadline(d)` (default 30 s, the default write-stall timeout), `no_deadline()`;
-  - `backoff(base, cap)` (defaults 100 µs and 100 ms);
+  - `backoff(base, cap)` (defaults 5 µs and 100 ms; the base was 100 µs until the amendment of 2026-10-23 below);
   - `retry_busy(bool)` (default off);
   - `durability(d)`;
   - `retries(&Error) -> bool`, `retries_code(ErrorCode) -> bool`, `delay(attempt) -> Duration`, and `next_pause(code, attempt, elapsed) -> Option<Duration>` (the whole decision: `None` to give up, else the pause cut at the deadline).
@@ -86,3 +86,13 @@ ICR 0050 gives a commit refused by the failed engine while a recovery runs `Busy
   - `metrics.rs`;
   - `tests/transact.rs`.
 - Docs: getting-started, errors.md, the agent reference, and the changelog.
+
+## Amendment (2026-10-23, coordinator; #708, D274's retry brief)
+
+`RetryPolicy`'s default backoff base goes from **100 µs to 5 µs**. Nothing else changes: the cap stays 100 ms, and the API, the full jitter and the deadline are unchanged. The API is unreleased, so this ICR is amended in place rather than given a new number.
+
+**Why:** the 100 µs base was set when a contended cross-shard commit took about 570 µs. After D273 the cycle is about 36 µs at `Buffered`. The study (#708, https://github.com/CodingAnarchy/pigeonhole/issues/708#issuecomment-6360229776) covered fixed bases of 0, 5, 10, 25, 50 and 100 µs and an adaptive base, on transfer, transactional ycsb-f and the mixed row, at both levels:
+- Retrying at once (0) loses 26–28% of throughput at `Buffered`.
+- 5 µs is best or tied on throughput and has the lowest p99.9 in every contended cell.
+- Against 100 µs: transfer at `Buffered` gains 3.1% throughput, with p99 −23% and p99.9 −52%. At default, 2.0%, −12% and −36%.
+- An adaptive base (a multiple of recent attempt times) did no better, so none was added.
