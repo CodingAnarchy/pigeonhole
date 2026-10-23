@@ -1249,16 +1249,26 @@ impl Snapshot {
     /// was taken; call after a read through it (see `LiveSnapshot::check_current`). Always
     /// `Ok` in the writer process.
     /// Inline: every scan step calls it, and in the writer process it is one test of
-    /// `None` plus the process compare (the #834 callgrind job saw scans grow 2% when the
-    /// reader's checks grew). A writer-process snapshot used in a forked child fails with
-    /// `Unsupported` (#901).
+    /// `None` (the #834 callgrind job saw scans grow 2% when the reader's checks grew).
     #[inline]
     pub(crate) fn check_current(&self) -> Result<()> {
         match &self._live {
-            None if pigeonhole_io::sys::process_id() == self.taken_in => Ok(()),
-            None => Err(crate::engine::forked()),
+            None => Ok(()),
             Some(live) => live.check_current(),
         }
+    }
+
+    /// `Unsupported` for a writer-process snapshot used in a forked child (#901), checked
+    /// once per read operation (a point or row read, a scan's creation and each tablet it
+    /// opens), never per scan step: per step it cost the scan shapes 0.5% (#919's callgrind
+    /// run). A reader process's snapshot fails with `SnapshotExpired` there instead (its
+    /// slot is inert, #898).
+    #[inline]
+    pub(crate) fn check_process(&self) -> Result<()> {
+        if self._live.is_none() && pigeonhole_io::sys::process_id() != self.taken_in {
+            return Err(crate::engine::forked());
+        }
+        Ok(())
     }
 
     /// `result` of a read through this snapshot, or [`Error::SnapshotExpired`] in its place

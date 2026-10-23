@@ -89,6 +89,14 @@ fn a_forked_childs_writer_refuses_every_entry_point_and_leaves_the_parent_alone(
     db.flush().unwrap();
     let held = db.snapshot().unwrap();
     let (tid, fid) = (t.id, t.families[0].id);
+    // A cursor created before the fork, not yet stepped.
+    let mut pre_fork_cursor = db
+        .scan(
+            &held,
+            tid,
+            ScanSpec::new(std::ops::Bound::Unbounded, std::ops::Bound::Unbounded),
+        )
+        .unwrap();
 
     // SAFETY: the child only calls the engine (which must refuse before touching any
     // thread, queue or lock) from the forking thread and a watchdog thread it starts, then
@@ -133,6 +141,10 @@ fn a_forked_childs_writer_refuses_every_entry_point_and_leaves_the_parent_alone(
             .and_then(|mut c| c.next_row())
             .map(drop),
         );
+        expect(
+            "a cursor created before the fork",
+            pre_fork_cursor.next_row().map(drop),
+        );
         expect("begin", db.begin().map(drop));
         expect(
             "create_table",
@@ -169,8 +181,14 @@ fn a_forked_childs_writer_refuses_every_entry_point_and_leaves_the_parent_alone(
         "{code} entry points did not refuse in the forked child (see its stderr)"
     );
 
-    // The parent is untouched: its snapshot reads, it commits, and a reopen after its close
-    // sees exactly its own commits.
+    // The parent is untouched: its cursor and snapshot read, it commits, and a reopen after
+    // its close sees exactly its own commits.
+    let mut parent_rows = 0;
+    while pre_fork_cursor.next_row().unwrap() {
+        parent_rows += 1;
+    }
+    assert_eq!(parent_rows, 100);
+    drop(pre_fork_cursor);
     assert!(db.get(&held, tid, fid, b"r001", b"q").unwrap().is_some());
     db.commit(batch(&t, b"r100", b"v"), Some(Durability::Sync))
         .unwrap();

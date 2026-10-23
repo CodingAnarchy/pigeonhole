@@ -2032,6 +2032,7 @@ impl Engine {
         row: &[u8],
         spec: &ReadSpec,
     ) -> Result<Option<RowData>> {
+        snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.families)?;
         let now = self.inner.shared.vfs.now_micros();
         snapshot.checked(read::read_row(snapshot, table, row, &families, spec, now))
@@ -2063,6 +2064,7 @@ impl Engine {
         spec: &ReadSpec,
         sink: &mut impl read::RowSink,
     ) -> Result<bool> {
+        snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, families)?;
         let now = self.inner.shared.vfs.now_micros();
         snapshot.checked(read::read_row_into(
@@ -2197,6 +2199,7 @@ impl Engine {
 
     /// Starts an ordered scan.
     pub fn scan(&self, snapshot: &Snapshot, table: TableId, spec: ScanSpec) -> Result<ScanCursor> {
+        snapshot.check_process()?;
         let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
         let now = self.inner.shared.vfs.now_micros();
         Ok(ScanCursor::new(
@@ -3825,6 +3828,7 @@ impl Inner {
         row: &[u8],
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
+        snapshot.check_process()?;
         snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,

@@ -1082,6 +1082,7 @@ impl Txn {
         spec: &crate::ReadSpec,
         sink: &mut impl crate::RowSink,
     ) -> crate::Result<bool> {
+        self.snapshot.check_process()?;
         let families = crate::engine::families_in_order(&self.snapshot.view, table, families)?;
         for &family in &families {
             record_read(

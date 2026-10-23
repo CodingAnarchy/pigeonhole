@@ -919,6 +919,8 @@ impl ScanCursor {
     /// Builds the lanes for the next tablet, seeking each to the scan start. Returns false
     /// when no tablet is left.
     fn open_next_tablet<const CACHE_ONLY: bool>(&mut self) -> Result<bool> {
+        // A cursor taken before a fork stops in the child at its next tablet (#901).
+        self.snapshot.check_process()?;
         self.recycle_lanes();
         let view = Arc::clone(&self.snapshot.view);
         let Some(tablet) = view.tablets().tablets_of(self.table).get(self.next_tablet) else {
