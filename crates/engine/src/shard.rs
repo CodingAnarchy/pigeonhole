@@ -1750,8 +1750,9 @@ pub(crate) struct OverlapRefusal {
     /// single is logged (`end_single_wait`), not when the shares clear (0: not so refused).
     pub single: u32,
     /// Its validated reads (`None`: it reads nothing): once a share writing one of them
-    /// commits here and the read is stale, it fails rather than retries (D276).
-    pub validate: Option<Box<Validate>>,
+    /// commits here and the read is stale, it fails rather than retries (D276). A clone of
+    /// the commit's shared reads (D275).
+    pub validate: Option<Arc<Validate>>,
 }
 
 /// What a PREPARE refused over an overlap waits for (D249, D267).

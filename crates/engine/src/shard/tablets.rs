@@ -499,7 +499,7 @@ impl ShardState {
     #[inline(never)]
     pub(super) fn refuse_waiting(
         &mut self,
-        mut m: Member,
+        m: Member,
         wait: OverlapWait,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
@@ -546,7 +546,7 @@ impl ShardState {
             self.id.0, m.seqno
         );
         self.shared.metrics[usize::from(self.id.0)].count_refusal(CrossRefusal::PendingOverlap);
-        let validate = m.validate.take().filter(|v| !v.reads.is_empty());
+        let validate = m.validate.clone().filter(|v| !v.reads.is_empty());
         self.overlap_refused.push(OverlapRefusal {
             coordinator,
             priority,
