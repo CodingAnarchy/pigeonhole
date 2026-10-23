@@ -658,13 +658,7 @@ impl Runner for PigeonholeRunner {
                 conflicts: Arc::default(),
                 load_buffered: self.settings.load_buffered,
                 rmw_txn: self.settings.rmw_txn,
-                retry: self
-                    .settings
-                    .txn_backoff_micros
-                    .map_or_else(RetryPolicy::default, |us| {
-                        RetryPolicy::default()
-                            .backoff(Duration::from_micros(us), Duration::from_millis(100))
-                    }),
+                retry: retry_policy(&self.settings),
             },
             busy: Arc::default(),
             dir: dir.to_path_buf(),
@@ -935,6 +929,15 @@ pub(crate) struct Target {
     rmw_txn: bool,
     /// How transactions retry (D274): the library default, or a variant's base.
     retry: RetryPolicy,
+}
+
+/// How the runners' transactions retry (D274): the library's default `RetryPolicy`, or a
+/// variant's backoff base (`PigeonholeRunner::txn_backoff_micros`) to the default cap.
+pub(crate) fn retry_policy(s: &Settings) -> RetryPolicy {
+    s.txn_backoff_micros
+        .map_or_else(RetryPolicy::default, |us| {
+            RetryPolicy::default().backoff(Duration::from_micros(us), Duration::from_millis(100))
+        })
 }
 
 /// Runs `body` in a transaction through [`Pigeonhole::transact`] with the target's

@@ -14,10 +14,10 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use pigeonhole::nonblocking::{CommitFuture, TransactionCommitFuture};
-use pigeonhole::{ErrorCode, Pigeonhole, Shard, Table};
+use pigeonhole::{ErrorCode, Pigeonhole, RetryPolicy, Shard, Table};
 use pigeonhole_io::sys::PinPlan;
 
-use super::pigeonhole::{create_table, err, options};
+use super::pigeonhole::{create_table, err, options, retry_policy};
 use crate::{
     BenchOp, EngineCommit, Histogram, LatencyStats, OpTypeStats, PigeonholeRunner, RunDetail,
     RunOptions, RunRecord, Runner, ShardShare, Stalls, WARMUP_CAP, WARMUP_CAP_AFTER_SWITCH,
@@ -412,6 +412,7 @@ fn pipeline(
         batches,
         readers,
         deadline,
+        retry: policy,
     } = extras;
     // A commit can resolve on another shard's thread: its wake must end this thread's wait.
     let waker = shard.waker();
@@ -426,19 +427,32 @@ fn pipeline(
     // (first submission, commit index, write, retries after `Busy`, future)
     let mut flight: VecDeque<(Instant, usize, &Write, u32, Flight)> =
         VecDeque::with_capacity(in_flight);
+    // Conflicted transactions waiting out their `RetryPolicy` pause: (resubmit at, first
+    // submission, commit index, write, attempts so far). They hold their pipeline slot.
+    let mut paused: Vec<(Instant, Instant, usize, &Write, u32)> = Vec::new();
     let mut next = writes.iter().enumerate();
     let mut busy = 0u64;
     let mut conflicts = 0u64;
     loop {
         // Past the deadline (D247) no commit starts; those in flight finish.
         let open = deadline.is_none_or(|d| Instant::now() < d);
-        while open && flight.len() < in_flight {
+        let now = Instant::now();
+        let mut i = 0;
+        while i < paused.len() {
+            if paused[i].0 <= now {
+                let (_, at, j, w, tries) = paused.swap_remove(i);
+                flight.push_back((at, j, w, tries, submit_one(j, w)?));
+            } else {
+                i += 1;
+            }
+        }
+        while open && flight.len() + paused.len() < in_flight {
             match next.next() {
                 Some((j, w)) => flight.push_back((Instant::now(), j, w, 0, submit_one(j, w)?)),
                 None => break,
             }
         }
-        if flight.is_empty() {
+        if flight.is_empty() && paused.is_empty() {
             if let Some(h) = hist.as_deref_mut() {
                 h.conflicts += conflicts;
             }
@@ -465,7 +479,15 @@ fn pipeline(
                     // snapshot: run again with a new snapshot, as the transfer clients do.
                     Err(e) if e.code() == ErrorCode::Conflict && *tries < CONFLICT_RETRIES => {
                         conflicts += 1;
-                        retry.push((*at, *j, *w, *tries + 1, false));
+                        // Attempts count from 1; `tries` counts the retries so far. Past the
+                        // policy's deadline it runs again at once, as before.
+                        match policy
+                            .next_pause(e.code(), *tries + 1, at.elapsed())
+                            .filter(|p| !p.is_zero())
+                        {
+                            Some(p) => paused.push((Instant::now() + p, *at, *j, *w, *tries + 1)),
+                            None => retry.push((*at, *j, *w, *tries + 1, false)),
+                        }
                     }
                     // A stall past the engine's timeout: retried and counted, as the client
                     // runners do (D247's app-owned row reports it instead of stopping).
@@ -490,8 +512,15 @@ fn pipeline(
         }
         let more = shard.run_once(TURN);
         if !progressed && !more {
-            // Until a commit resolves, work arrives, or this thread's own I/O completes (#553).
-            shard.wait(Duration::from_micros(200));
+            // Until a commit resolves, work arrives, or this thread's own I/O completes (#553),
+            // or a paused retry is due.
+            let due = paused
+                .iter()
+                .map(|p| p.0.saturating_duration_since(Instant::now()))
+                .min();
+            shard.wait(due.map_or(Duration::from_micros(200), |d| {
+                d.min(Duration::from_micros(200))
+            }));
         }
     }
 }
@@ -504,6 +533,9 @@ struct PhaseExtras<'a> {
     /// Every other batch reads its rows first (the mixed row).
     readers: bool,
     deadline: Option<Instant>,
+    /// How the mixed row's transactions retry a conflict (D274): `RetryPolicy::next_pause`
+    /// with this thread's own timer, as an async caller drives it.
+    retry: &'a RetryPolicy,
 }
 
 /// [`PhaseExtras`] for one thread's pipeline, the batches with the whole stream to pick from.
@@ -512,6 +544,7 @@ struct PipelineExtras<'a> {
     batches: Option<(&'a Pigeonhole, &'a [Write])>,
     readers: bool,
     deadline: Option<Instant>,
+    retry: &'a RetryPolicy,
 }
 
 /// How many times the inline driver reruns a read-modify-write transaction that conflicted
@@ -569,6 +602,7 @@ fn phase(
         batches,
         readers,
         deadline,
+        retry,
     } = extras;
     let (results, start) = run_crew(shards, |mut shard, crew| {
         // D235: each shard's thread on a CPU of its own, the same one every phase. A pin the
@@ -608,6 +642,7 @@ fn phase(
                 batches: batches.map(|db| (db, writes)),
                 readers,
                 deadline,
+                retry,
             },
         );
         crew.finish();
@@ -722,6 +757,7 @@ impl PigeonholeRunner {
         // D247's app-owned row: about 20% of the commits are batches across shards.
         let batches = self.settings.cross_batches.then_some(&db);
         let readers = self.settings.cross_readers;
+        let retry = retry_policy(&self.settings);
         let (warm, measured) = run.split_at((warmup as usize).min(run.len()));
         // Warm up until the balancer has spread the table and settled: every shard owns a
         // tablet and nothing split, merged or moved for `WARMUP_SETTLED` (a fixed warmup can end
@@ -754,6 +790,7 @@ impl PigeonholeRunner {
                     batches,
                     readers,
                     deadline: Some(started + cap),
+                    retry: &retry,
                 },
             )?;
             shards = warmed.0;
@@ -808,6 +845,7 @@ impl PigeonholeRunner {
                     batches,
                     readers,
                     deadline,
+                    retry: &retry,
                 },
             )?;
             shards = s;
