@@ -28,8 +28,22 @@ thread_local! {
 /// with `F` its top bit. Every change is one compare-exchange of the whole word, so the
 /// three move together as they did under D271's lock.
 fn pack(next: Seqno, h: Timestamp, decided: bool) -> u128 {
-    debug_assert!(h < DECIDED, "a default timestamp at or past 2^63: {h}");
+    // A real assert (perf287's S2): `H` reaching `F`'s bit would flip `F` silently. Every
+    // `H` comes from the clock (µs) or from replay, which refuses one this large
+    // (`check_replayed_ts`).
+    assert!(h < DECIDED, "a default timestamp at or past 2^63: {h}");
     u128::from(next) | (u128::from(h | if decided { DECIDED } else { 0 }) << 64)
+}
+
+/// A replayed commit timestamp or the manifest's `ts_floor`, as `H` may hold it: below `F`'s
+/// bit. Every one came from this allocator (µs), so a larger one means a damaged file.
+pub(crate) fn check_replayed_ts(ts: Timestamp) -> crate::Result<Timestamp> {
+    if ts >= DECIDED {
+        return Err(crate::Error::Corruption(format!(
+            "a default timestamp at or past 2^63 ({ts}): no allocator hands one out"
+        )));
+    }
+    Ok(ts)
 }
 
 fn unpack(w: u128) -> (Seqno, Timestamp, bool) {
@@ -168,6 +182,34 @@ impl Reservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replayed_timestamp_at_or_past_the_flag_bit_is_corruption() {
+        // perf287's S2 on #933: `H` shares its word with `F`, so replay refuses a timestamp
+        // that would reach `F`'s bit instead of letting it flip the flag.
+        assert_eq!(check_replayed_ts(DECIDED - 1).unwrap(), DECIDED - 1);
+        assert!(matches!(
+            check_replayed_ts(DECIDED),
+            Err(crate::Error::Corruption(_))
+        ));
+        assert!(matches!(
+            check_replayed_ts(u64::MAX),
+            Err(crate::Error::Corruption(_))
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "a default timestamp at or past 2^63")]
+    fn packing_a_timestamp_into_the_flag_bit_panics_in_every_build() {
+        let _ = pack(1, DECIDED, false);
+    }
+
+    #[test]
+    fn the_word_round_trips_s_h_and_f() {
+        for (s, h, f) in [(0, 0, false), (7, 9, true), (u64::MAX, DECIDED - 1, true)] {
+            assert_eq!(unpack(pack(s, h, f)), (s, h, f));
+        }
+    }
 
     fn shm() -> ShmRegion {
         let mut config = pigeonhole_shm::ShmConfig::new(1);

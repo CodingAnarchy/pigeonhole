@@ -2,7 +2,7 @@
 //! seqno and default-timestamp allocator keeps `(S, H, F)` in one ([D271]), so a reservation
 //! is one atomic step with no lock.
 //!
-//! On x86-64 with `cmpxchg16b`, and on aarch64 with LSE's `caspal`, each operation is one
+//! On x86-64 with `cmpxchg16b`, and on little-endian aarch64 with LSE's `caspal`, each operation is one
 //! inline instruction (a full barrier). Elsewhere, and under Miri and loom (`--cfg
 //! io_loom`), a lock guards the word; the path is chosen once per process, so every word in
 //! it uses the same one.
@@ -14,7 +14,10 @@ use std::sync::PoisonError;
 #[cfg(all(
     not(miri),
     not(io_loom),
-    any(target_arch = "x86_64", target_arch = "aarch64")
+    any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", target_endian = "little")
+    )
 ))]
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -35,7 +38,10 @@ fn path() -> Path {
     #[cfg(any(
         miri,
         io_loom,
-        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+        not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ))
     ))]
     {
         Path::Lock
@@ -43,7 +49,10 @@ fn path() -> Path {
     #[cfg(all(
         not(miri),
         not(io_loom),
-        any(target_arch = "x86_64", target_arch = "aarch64")
+        any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        )
     ))]
     {
         static PATH: AtomicU8 = AtomicU8::new(0);
@@ -53,7 +62,7 @@ fn path() -> Path {
             _ => {
                 #[cfg(target_arch = "x86_64")]
                 let native = std::arch::is_x86_feature_detected!("cmpxchg16b");
-                #[cfg(target_arch = "aarch64")]
+                #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
                 let native = std::arch::is_aarch64_feature_detected!("lse");
                 PATH.store(if native { 1 } else { 2 }, Ordering::Relaxed);
                 if native { Path::Native } else { Path::Lock }
@@ -174,13 +183,19 @@ impl AtomicWord128 {
         if ok != 0 { Ok(current) } else { Err(held) }
     }
 
-    #[cfg(all(not(miri), not(io_loom), target_arch = "aarch64"))]
+    #[cfg(all(
+        not(miri),
+        not(io_loom),
+        target_arch = "aarch64",
+        target_endian = "little"
+    ))]
     #[inline]
     fn native(&self, current: u128, new: u128) -> Result<u128, u128> {
         let (mut lo, mut hi) = (current as u64, (current >> 64) as u64);
         // SAFETY: `word` is 16-byte aligned and valid for the word's life; this process
         // detected LSE (`path`), and every access on this path is atomic. `caspal` compares
-        // the pair x0:x1 (low, high: little-endian, low half first) with the word, stores
+        // the pair x0:x1 (low, high: this path is little-endian only, so the low half is at
+        // the lower address) with the word, stores
         // x2:x3 if equal, and leaves the word's previous value in x0:x1 either way.
         unsafe {
             std::arch::asm!(
@@ -205,7 +220,10 @@ impl AtomicWord128 {
     #[cfg(any(
         miri,
         io_loom,
-        not(any(target_arch = "x86_64", target_arch = "aarch64"))
+        not(any(
+            target_arch = "x86_64",
+            all(target_arch = "aarch64", target_endian = "little")
+        ))
     ))]
     #[inline]
     fn native(&self, _current: u128, _new: u128) -> Result<u128, u128> {
@@ -295,12 +313,14 @@ mod tests {
             AtomicWord128::is_lock_free(),
             std::arch::is_x86_feature_detected!("cmpxchg16b")
         );
-        #[cfg(all(not(miri), target_arch = "aarch64"))]
+        #[cfg(all(not(miri), target_arch = "aarch64", target_endian = "little"))]
         assert_eq!(
             AtomicWord128::is_lock_free(),
             std::arch::is_aarch64_feature_detected!("lse")
         );
-        #[cfg(miri)]
+        // Big-endian aarch64 takes the lock: `caspal`'s register pair is laid out for
+        // little-endian (perf287's S1).
+        #[cfg(any(miri, all(target_arch = "aarch64", target_endian = "big")))]
         assert!(!AtomicWord128::is_lock_free());
     }
 

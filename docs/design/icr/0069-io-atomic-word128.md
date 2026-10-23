@@ -1,6 +1,6 @@
 # 0069: `pigeonhole_io::AtomicWord128`, a 16-byte word changed by one atomic compare-exchange
 
-**Status:** Number assigned by the coordinator (2026-10-23; #888). Additive. Needs perf287's review: it adds `unsafe` (inline assembly) to `pigeonhole-io`.
+**Status:** Number assigned by the coordinator (2026-10-23; #888). Additive. perf287 approved the `unsafe` (inline assembly) in `pigeonhole-io`, with two should-fixes, both applied (below).
 
 ## Change
 
@@ -12,14 +12,15 @@
 
 **How it changes the word:**
 - **x86-64 with `cmpxchg16b`:** one inline `lock cmpxchg16b`.
-- **aarch64 with LSE:** one inline `caspal`.
+- **Little-endian aarch64 with LSE:** one inline `caspal`. Big-endian aarch64 takes the lock: the instruction's register pair is laid out low half first (perf287's S1).
 - **Otherwise, and always under Miri and loom** (`--cfg io_loom`): under the word's own leaf `Mutex`.
 
 The path is detected once per process (a cached `is_*_feature_detected!`), so every word in a process uses the same one.
 
 **`pigeonhole-engine`:** `clock::Reservation` keeps D271's `(S, H, F)` in one `AtomicWord128` instead of a `Mutex`:
 - `S` in the low half;
-- `H` in the high half, with `F` in its top bit. Default timestamps are µs, far below 2^63, and `seed_ts` clamps a damaged file's value below it.
+- `H` in the high half, with `F` in its top bit. Default timestamps are µs, far below 2^63.
+- **Keeping `H` below `F`'s bit in every build** (perf287's S2): packing asserts it with `assert!`, not `debug_assert!`. Open refuses, with `Corruption`, a replayed commit timestamp or a manifest `ts_floor` at or past 2^63 (`clock::check_replayed_ts`, called from `ShardState::replay` and at open), since no allocator hands one out.
 - Every change is one compare-exchange, retried with the value found.
 - Each thread keeps the word as it last saw it in a thread-local, as its first guess, so a reservation with no race is a single exchange.
 - The drift gauge (ICR 0064) stays a separate `AtomicU64`, written only when the lead grows.

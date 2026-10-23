@@ -3525,6 +3525,8 @@ impl ShardState {
         seqno: Seqno,
         commit_ts: Timestamp,
     ) -> Result<Vec<(TabletId, FamilyId)>> {
+        // It seeds the allocator's `H`, which must stay below `F`'s bit (#888).
+        crate::clock::check_replayed_ts(commit_ts)?;
         self.note_stamped(commit_ts);
         self.apply(bytes, seqno, commit_ts)?;
         Ok(self.touched_slots.clone())
