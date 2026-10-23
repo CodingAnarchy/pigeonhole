@@ -129,13 +129,32 @@ pub(crate) fn spawn(
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
     let mut in_process = Vec::new();
+    // #930 scratch: `PHDB_IN_PROCESS_OPEN_READER=1` makes the in-process threads read through
+    // a reader handle (`open_reader`) opened in this, the writer's, process.
+    let via_reader = std::env::var("PHDB_IN_PROCESS_OPEN_READER").is_ok();
     for i in 0..in_process_n {
+        let stop = Arc::clone(&stop_in_process);
+        let (records, seed) = (config.records, config.seed ^ (0x1A_0000 + i as u64));
+        if via_reader {
+            let reader =
+                pigeonhole::Pigeonhole::open_reader(db, pigeonhole::ReaderOptions::default())
+                    .map_err(|e| e.to_string())?;
+            let table = reader.table("bench").map_err(|e| e.to_string())?;
+            in_process.push(std::thread::spawn(move || {
+                let _keep = &reader;
+                read_loop(
+                    |row, family| table.row(row).family(family).read().map(|r| r.is_some()),
+                    records,
+                    seed,
+                    &stop,
+                )
+            }));
+            continue;
+        }
         let table = writer
             .table("bench")
             .and_then(|b| b.open())
             .map_err(|e| e.to_string())?;
-        let stop = Arc::clone(&stop_in_process);
-        let (records, seed) = (config.records, config.seed ^ (0x1A_0000 + i as u64));
         in_process.push(std::thread::spawn(move || {
             read_loop(
                 |row, family| table.row(row).family(family).read().map(|r| r.is_some()),
