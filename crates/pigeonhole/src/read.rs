@@ -9,7 +9,7 @@ use pigeonhole_engine::{
 use smallvec::SmallVec;
 
 use crate::cell::RowBuf;
-use crate::table::{TableCore, family_not_found};
+use crate::table::TableCore;
 use crate::{Result, Row, RowRef, Snapshot};
 
 /// A predicate on a cell value, evaluated inside the read path before materialization.
@@ -177,7 +177,6 @@ impl Selection {
         core: &TableCore,
     ) -> Result<(Arc<TableInfo>, pigeonhole_engine::Snapshot, FamilyIds)> {
         core.db.check_open()?;
-        // The snapshot first: the catalog read afterwards includes every family it can see.
         let snapshot = match self.snapshot.take() {
             Some(s) => {
                 core.db.check_snapshot(&s)?;
@@ -187,13 +186,13 @@ impl Selection {
             None if core.db.supervised() => core.snapshot_supervised()?,
             None => core.engine().snapshot()?,
         };
-        let info = core.current_info();
+        // The catalog as of the snapshot names every family it can return, and resolves a
+        // family dropped (or dropped and created again) since as the snapshot saw it; a name
+        // only the current catalog knows resolves there and reads nothing (#892).
+        let info = core.info_at(&snapshot);
         let mut ids = SmallVec::new();
         for name in self.family_names() {
-            let id = info
-                .family(name)
-                .ok_or_else(|| family_not_found(&info.name, name))?
-                .id;
+            let id = core.family_id_at(&snapshot, name)?;
             if !ids.contains(&id) {
                 ids.push(id);
             }

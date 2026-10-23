@@ -1534,3 +1534,38 @@ fn a_reused_batch_buffer_starts_empty() {
     assert_eq!(get_bytes(&db, &t, "f", b"last", b"q"), Some(b"v".to_vec()));
     db.close().unwrap();
 }
+
+/// #892: `Snapshot::table` is the table as the snapshot's catalog knew it: a family added
+/// afterwards is in the current catalog, not in the snapshot's.
+#[test]
+fn a_snapshot_names_the_families_of_its_catalog() {
+    let vfs = SimVfs::new(892);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let t = db
+        .create_table("t", &[("a".into(), FamilyOptions::default())])
+        .unwrap();
+    let snap = db.snapshot().unwrap();
+    db.add_family(t.id, "late", FamilyOptions::default())
+        .unwrap();
+    let now = db.table("t").unwrap();
+    assert_eq!(
+        now.families
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a", "late"]
+    );
+    let then = snap.table(t.id).expect("the table existed");
+    assert_eq!(
+        then.families
+            .iter()
+            .map(|f| f.name.as_str())
+            .collect::<Vec<_>>(),
+        ["a"]
+    );
+    assert!(
+        snap.table(pigeonhole_format::TableId(t.id.0 + 100))
+            .is_none()
+    );
+    db.close().unwrap();
+}
