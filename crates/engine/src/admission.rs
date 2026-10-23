@@ -153,6 +153,12 @@ impl ShardAdmission {
         // plain load could miss the waiter while the waiter misses the room (store
         // buffering, loom-modelled below), leaving it queued with nothing to wake it.
         if self.waiting.fetch_add(0, Ordering::AcqRel) != 0 {
+            // The only lock a release takes: in a forked child it may have been copied held
+            // by a parent thread, so it is left alone there (#901). The counters above are
+            // this process's own memory.
+            if self.owner != pigeonhole_io::sys::process_id() {
+                return;
+            }
             let q = self.queue.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some((_, Some(w))) = q.waiters.front() {
                 w.wake_by_ref();
@@ -189,9 +195,8 @@ impl Charge {
 
 impl Drop for Charge {
     fn drop(&mut self) {
-        if let Some((s, bytes)) = self.0.take()
-            && s.owner == pigeonhole_io::sys::process_id()
-        {
+        // Lock-free unless a commit waits for room; `release` guards that lock (#901).
+        if let Some((s, bytes)) = self.0.take() {
             s.release(bytes);
         }
     }
@@ -339,14 +344,14 @@ impl Drop for Admit {
         let Some(a) = self.admission.take() else {
             return;
         };
-        // A forked child's copy leaves the parent's queue alone (#901).
-        if a.shards[self.shard].owner != pigeonhole_io::sys::process_id() {
-            return;
-        }
         match self.state {
             AdmitState::Charged => a.shards[self.shard].release(self.bytes),
             AdmitState::Queued(id) => {
                 let s = &a.shards[self.shard];
+                // A forked child's copy leaves the parent's queue (and its lock) alone (#901).
+                if s.owner != pigeonhole_io::sys::process_id() {
+                    return;
+                }
                 let mut q = s.queue.lock().unwrap_or_else(PoisonError::into_inner);
                 let was_first = q.waiters.front().is_some_and(|(f, _)| *f == id);
                 if let Some(i) = q.find(id) {
