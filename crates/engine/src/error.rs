@@ -130,6 +130,11 @@ pub enum Error {
     /// `GroupSync` or `Sync` one is then durable: a reopen shows it) (decision D227,
     /// ICR 0038).
     OutcomeUnknown,
+    /// A commit refused, never logged, by a shard whose WAL stream (or the manifest) failed
+    /// earlier: nothing of it was written. The database must be reopened, or is being
+    /// recovered (`pigeonhole`'s `Options::auto_recover` treats it as it treats `Closed`,
+    /// #921, ICR 0060). Shown as an I/O error.
+    ShardFailed,
 }
 
 impl fmt::Display for Error {
@@ -170,6 +175,9 @@ impl fmt::Display for Error {
             Error::InvalidArgument(what) => write!(f, "invalid argument: {what}"),
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::Closed => f.write_str("the database is closed"),
+            Error::ShardFailed => f.write_str(
+                "I/O error: the shard's WAL stream failed earlier; reopen the database",
+            ),
             Error::OutcomeUnknown => f.write_str(
                 "the commit's outcome is not known: a shard died or the database closed while it was \
                  in flight; the next open decides it from the WAL (reopen and read)",
@@ -240,6 +248,7 @@ impl Error {
             Error::Unsupported(s) => Error::Unsupported(s),
             Error::Closed => Error::Closed,
             Error::OutcomeUnknown => Error::OutcomeUnknown,
+            Error::ShardFailed => Error::ShardFailed,
             Error::NoReaderSlot => Error::NoReaderSlot,
             Error::RecordTooLarge => Error::RecordTooLarge,
             Error::Busy => Error::Busy,

@@ -59,6 +59,13 @@ ICR 0050 gives a commit refused by the failed engine while a recovery runs `Busy
 - **Unchanged:** a recovery that doesn't finish within `write_stall_timeout` is still `Busy`.
 - **Not covered:** the async transaction commit doesn't wait for the swap, as before.
 - **Test:** `tests/recovery.rs::transact_survives_a_recovery_with_the_default_policy`.
+- **The refusal before the close (#921, 2026-10-23).** "Refused by the failed engine" covers two forms:
+  - `Closed`, once the engine is closing or marked dead;
+  - a failed shard's refusal of a commit it never logged, which a commit gets when it reaches the shard after the failure but before the supervisor began closing the engine. The engine reports this one as `Error::ShardFailed`; it's still `Io` to the caller.
+
+  With `auto_recover` covering the failure, the second form is treated as the first: the commit waits for the swap, then gets `SnapshotExpired` (a transaction) or `Busy` (a plain commit). Without `auto_recover`, or for a failure it doesn't cover, it stays `Io`.
+  - **Recognised by the engine's variant, not the message.** A commit the shard had already logged keeps `OutcomeUnknown` and is never retried.
+  - **Test:** `src/recovery.rs::tests::a_commit_refused_by_a_failed_shard_before_the_close_recovers` (deterministic: a failed apply poisons the shard without marking the engine dead, and the supervisor is held until the commit waits). It fails on main with the issue's `Io`.
 
 **Smaller points:**
 - Only `Transaction::get` records a failed read for `transact`'s retry decision; `get_async` doesn't. ICR 0062's `get_row` will record it.

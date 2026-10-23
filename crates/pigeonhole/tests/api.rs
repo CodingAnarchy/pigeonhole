@@ -340,6 +340,7 @@ fn every_engine_error_maps_to_its_code() {
         (E::SnapshotExpired, ErrorCode::SnapshotExpired),
         (E::WouldDeadlock, ErrorCode::WouldDeadlock),
         (E::OutcomeUnknown, ErrorCode::OutcomeUnknown),
+        (E::ShardFailed, ErrorCode::Io),
         (E::NoWriter, ErrorCode::NoWriter),
         (
             E::UnsupportedFeature("value tag 4".into()),

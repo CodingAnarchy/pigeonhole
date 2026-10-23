@@ -429,8 +429,8 @@ pub struct Stats {
     pub refused_attempts: usize,
     /// Commits recovered only from SSTs (their WAL records were checkpointed away).
     pub sst_only: usize,
-    /// PREPAREs of an unacknowledged cross-shard commit with no COMMIT on any stream that a
-    /// checkpoint passed: an aborted or undecided attempt's PREPARE passes at once (D116),
+    /// PREPAREs of an unacknowledged or aborted cross-shard commit with no COMMIT on any stream
+    /// that a checkpoint passed: an aborted or undecided attempt's PREPARE passes at once (D116),
     /// and such a commit is never recovered (D83, D114).
     pub undecided_prepares_passed: usize,
     /// Decided commits whose DECISION a crash lost, with their applied seqno at or above the
@@ -2862,7 +2862,13 @@ impl World {
                     let commit = all.iter().find(|c| c.seqno == Some(*seqno));
                     let Some(c) = commit else {
                         // A refused attempt's PREPARE (no commit to recover) or an
-                        // unacknowledged commit that left nothing behind.
+                        // unacknowledged commit that left nothing behind. An aborted
+                        // attempt's PREPARE with no COMMIT anywhere is the hole D116 leaves
+                        // (a commit refused by its failed coordinator before its COMMIT was
+                        // appended is aborted, `ShardFailed`, #925): counted as one.
+                        if self.settled_seqnos.contains(seqno) && !decided(*seqno) {
+                            undecided_passed += 1;
+                        }
                         continue;
                     };
                     // A cross-shard commit no coordinator appended a COMMIT for aborted or
@@ -3980,6 +3986,15 @@ impl World {
                 }
                 return Ok(Resolved::Crashed);
             }
+            Outcome::Commit(Err(Error::ShardFailed)) | Outcome::Cas(Err(Error::ShardFailed)) => {
+                // A failed shard refused it before logging anything (#921): not committed, the
+                // stricter reading, as `Closed` after a shard's death.
+                self.stats.io_errors += 1;
+                self.trace
+                    .push("  -> refused by a failed shard: not committed; reopen pending".into());
+                self.aborted.push(inf.commit);
+                self.need_reopen = true;
+            }
             Outcome::Commit(Err(Error::Io(e))) | Outcome::Cas(Err(Error::Io(e))) => {
                 // A failed write or sync poisoned a stream: the commit may have landed
                 // (a sync failure after apply), so it is unacknowledged, and the engine
@@ -4255,7 +4270,7 @@ impl World {
                 self.need_reopen = true;
                 Ok(false)
             }
-            Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
+            Err(e @ (Error::Io(_) | Error::ShardFailed)) if self.cfg.faults.io_error_ppm > 0 => {
                 // Refused outright (a poisoned pager, D58): nothing was logged.
                 self.stats.io_errors += 1;
                 self.trace
@@ -4640,7 +4655,7 @@ impl World {
                 self.need_reopen = true;
                 return Ok(false);
             }
-            Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
+            Err(e @ (Error::Io(_) | Error::ShardFailed)) if self.cfg.faults.io_error_ppm > 0 => {
                 self.stats.io_errors += 1;
                 self.trace
                     .push(format!("  -> refused ({e}); reopen pending"));
@@ -5510,8 +5525,17 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
                 match poll_commit(pc) {
                     Poll::Pending => i += 1,
                     // The injected write error fails the group after its write: the outcome
-                    // is the WAL's (`OutcomeUnknown`, ICR 0040), or an I/O error for a group
-                    // refused before writing. Either may have landed or not.
+                    // is the WAL's (`OutcomeUnknown`, ICR 0040): it may have landed or not. A
+                    // commit the failed shard refused before appending it is not committed.
+                    Poll::Ready(Err(Error::ShardFailed)) => {
+                        // Refused by a failed shard before it was appended (#921, #925):
+                        // not committed, the stricter reading.
+                        w.trace
+                            .push("  -> refused by a failed shard: not committed".into());
+                        w.stats.io_errors += 1;
+                        let c = w.in_flight.remove(i).commit;
+                        w.aborted.push(c);
+                    }
                     Poll::Ready(Err(e @ (Error::Io(_) | Error::OutcomeUnknown))) => {
                         w.trace
                             .push(format!("  -> I/O error or outcome unknown ({e})"));
@@ -5538,6 +5562,13 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
             );
         }
         if acked {
+            // The lie under test: the client is told X committed, wherever its outcome put it
+            // (aborted when refused before its COMMIT was appended, `ShardFailed`, #925).
+            let (cross, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut w.aborted)
+                .into_iter()
+                .partition(|c| matches!(c.streams, CommitStreams::Cross { .. }));
+            w.aborted = rest;
+            w.unacked.extend(cross);
             for c in &mut w.unacked {
                 c.acked |= matches!(c.streams, CommitStreams::Cross { .. });
             }

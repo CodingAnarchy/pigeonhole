@@ -102,6 +102,33 @@ pub(crate) struct Supervision {
     state: Mutex<State>,
     changed: Condvar,
     thread: Mutex<Option<JoinHandle<()>>>,
+    /// Unit tests only: holds the supervisor back after a failure until an operation waits for
+    /// it (#921).
+    #[cfg(test)]
+    pub(crate) test_hold: TestHold,
+}
+
+/// Unit tests only: while `armed`, the supervisor, woken by a failure, starts its recovery
+/// only once an operation has entered [`Supervision::wait_settled`] (or after 10 s), so an
+/// operation meets the failed engine before its close begins (#921's window).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct TestHold {
+    pub(crate) armed: AtomicBool,
+    waited: AtomicBool,
+}
+
+#[cfg(test)]
+impl TestHold {
+    fn hold(&self) {
+        if !self.armed.load(Ordering::SeqCst) {
+            return;
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.waited.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
 }
 
 impl std::fmt::Debug for Supervision {
@@ -125,6 +152,8 @@ impl Supervision {
             }),
             changed: Condvar::new(),
             thread: Mutex::new(None),
+            #[cfg(test)]
+            test_hold: TestHold::default(),
         }
     }
 
@@ -177,6 +206,8 @@ impl Supervision {
         timeout: Duration,
         still_failing: impl Fn() -> bool,
     ) -> Settled {
+        #[cfg(test)]
+        self.test_hold.waited.store(true, Ordering::SeqCst);
         let deadline = Instant::now() + timeout;
         let mut st = self.lock();
         loop {
@@ -250,6 +281,10 @@ fn run(weak: Weak<Db>) {
             drop(engine);
             drop(db);
             continue;
+        }
+        #[cfg(test)]
+        if let Some(sup) = db.supervision() {
+            sup.test_hold.hold();
         }
         if !recover(&db, engine) {
             return;
@@ -411,5 +446,79 @@ fn recover(db: &Arc<Db>, failed: Arc<Engine>) -> bool {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    use pigeonhole_io::sim::SimVfs;
+
+    use crate::{ErrorCode, Family, Options, Pigeonhole, Recovery, RetryPolicy};
+
+    /// #921: a transaction whose commit reaches a shard after it failed, but before the
+    /// supervisor began closing the engine, is refused there, never logged (the engine's
+    /// `ShardFailed`, code `Io`). With `auto_recover` covering the failure it is treated as a
+    /// `Closed` refusal: `SnapshotExpired` once the swap is in, which `transact` retries (ICR
+    /// 0060). On main it got `Io` and `transact` failed.
+    ///
+    /// Deterministic: a failed apply (`Fault::NextApply`) poisons the shard without marking
+    /// the engine dead, so the next commit always passes the engine's open check and reaches
+    /// the poisoned shard. (A failed WAL sync marks the engine dead in the same shard turn
+    /// that answers the failing commit, so only a racing commit meets the shard there, as on
+    /// CI.) The supervisor is held until the commit waits for it.
+    #[test]
+    fn a_commit_refused_by_a_failed_shard_before_the_close_recovers() {
+        let vfs = SimVfs::new(9211);
+        let options = Options::default()
+            .shards(2)
+            .pin_threads(false)
+            .memtable_budget(4 << 20)
+            .write_stall_timeout(Duration::from_secs(10))
+            .vfs(Arc::clone(&vfs) as _)
+            .auto_recover(Recovery::Any);
+        let db = Pigeonhole::open("/db/r921.phdb", options).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        t.mutate(b"n").put("f", b"q", b"0").commit().unwrap();
+        db.db
+            .supervision()
+            .unwrap()
+            .test_hold
+            .armed
+            .store(true, Ordering::SeqCst);
+        let mut attempts = 0;
+        let (value, _) = db
+            .transact(&RetryPolicy::default(), |txn| {
+                attempts += 1;
+                let n: u64 = txn.get(&t, b"n", "f", b"q")?.map_or(0, |c| {
+                    std::str::from_utf8(c.value()).unwrap().parse().unwrap()
+                });
+                if attempts == 1 {
+                    // The shard holding the rows fails (a new table is one tablet on one
+                    // shard); this attempt's commit then meets the poisoned shard.
+                    db.engine()
+                        .to_arc()
+                        .inject(pigeonhole_engine::Fault::NextApply, true);
+                    let e = t.mutate(b"x").put("f", b"q", b"1").commit().unwrap_err();
+                    assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
+                }
+                txn.put(&t, b"n", "f", b"q", (n + 1).to_string().as_bytes());
+                Ok::<_, crate::Error>(n)
+            })
+            .unwrap();
+        assert_eq!(attempts, 2, "{:?}", db.recovery_stats());
+        assert_eq!(value, 0);
+        assert_eq!(t.get(b"n", "f", b"q").unwrap().unwrap().value(), b"1");
+        assert_eq!(db.recovery_stats().recoveries, 1);
+        drop(t);
+        db.close().unwrap();
     }
 }
