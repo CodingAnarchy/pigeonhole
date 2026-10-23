@@ -934,6 +934,13 @@ pub(crate) struct Target {
 /// How the runners' transactions retry (D274): the library's default `RetryPolicy`, or a
 /// variant's backoff base (`PigeonholeRunner::txn_backoff_micros`) to the default cap.
 pub(crate) fn retry_policy(s: &Settings) -> RetryPolicy {
+    // SCRATCH (#708 cap study): PH_RETRY_CAP_MS caps the default policy's pauses.
+    if let Some(ms) = std::env::var("PH_RETRY_CAP_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        return RetryPolicy::default().backoff(Duration::from_micros(5), Duration::from_millis(ms));
+    }
     s.txn_backoff_micros
         .map_or_else(RetryPolicy::default, |us| {
             RetryPolicy::default().backoff(Duration::from_micros(us), Duration::from_millis(100))
