@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{
-    Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, RowMutation, Table,
-    ValueFilter,
+    Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, RetryPolicy,
+    RowMutation, Table, Transaction, ValueFilter,
 };
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified, transfer_balances};
@@ -66,6 +66,10 @@ pub(crate) struct Settings {
     /// ycsb-f's read-modify-write runs in a `Transaction` instead of `commit_if` (D274: the
     /// judged row, transaction against transaction; the runner is named `pigeonhole-txn`).
     pub(crate) rmw_txn: bool,
+    /// Transactions retry with `RetryPolicy`'s backoff from this base, in microseconds, to its
+    /// default cap: a reported variant (D274). `None`: the library's default policy, as the
+    /// judged rows run.
+    pub(crate) txn_backoff_micros: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -201,6 +205,23 @@ impl PigeonholeRunner {
     /// ```
     pub fn rmw_in_transaction(mut self, yes: bool) -> Self {
         self.settings.rmw_txn = yes;
+        self
+    }
+
+    /// Transactions (transfer, ycsb-f's `pigeonhole-txn`) retry a conflict after
+    /// `RetryPolicy`'s full-jitter backoff from `micros` (0: at once) instead of the library
+    /// default's. A reported variant: the judged rows run `transact` with the default policy,
+    /// each store's out-of-the-box retry (D274).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("txn_backoff"));
+    /// let r = PigeonholeRunner::default().txn_backoff_micros(25);
+    /// assert!(r.describe().contains(" txn_backoff=25us"));
+    /// ```
+    pub fn txn_backoff_micros(mut self, micros: u64) -> Self {
+        self.settings.txn_backoff_micros = Some(micros);
         self
     }
 
@@ -637,6 +658,7 @@ impl Runner for PigeonholeRunner {
                 conflicts: Arc::default(),
                 load_buffered: self.settings.load_buffered,
                 rmw_txn: self.settings.rmw_txn,
+                retry: retry_policy(&self.settings),
             },
             busy: Arc::default(),
             dir: dir.to_path_buf(),
@@ -802,7 +824,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -847,7 +869,9 @@ impl Runner for PigeonholeRunner {
             } else {
                 String::new()
             },
-            if s.rmw_txn { " rmw=txn" } else { "" }
+            if s.rmw_txn { " rmw=txn" } else { "" },
+            s.txn_backoff_micros
+                .map_or_else(String::new, |us| format!(" txn_backoff={us}us")),
         )
     }
 }
@@ -903,6 +927,46 @@ pub(crate) struct Target {
     load_buffered: bool,
     /// [`PigeonholeRunner::rmw_in_transaction`].
     rmw_txn: bool,
+    /// How transactions retry (D274): the library default, or a variant's base.
+    retry: RetryPolicy,
+}
+
+/// How the runners' transactions retry (D274): the library's default `RetryPolicy`, or a
+/// variant's backoff base (`PigeonholeRunner::txn_backoff_micros`) to the default cap.
+pub(crate) fn retry_policy(s: &Settings) -> RetryPolicy {
+    s.txn_backoff_micros
+        .map_or_else(RetryPolicy::default, |us| {
+            RetryPolicy::default().backoff(Duration::from_micros(us), Duration::from_millis(100))
+        })
+}
+
+/// Runs `body` in a transaction through [`Pigeonhole::transact`] with the target's
+/// `RetryPolicy` (D274: each store's out-of-the-box retry; Pigeonhole's is `transact` with the
+/// default policy). Each attempt after the first follows a conflict (or an expired snapshot)
+/// and is counted; `Busy` ends `transact` and is retried here as for every other write.
+fn transact<T>(
+    target: &Target,
+    busy: &AtomicU64,
+    buffered: bool,
+    mut body: impl FnMut(&mut Transaction) -> Result<T, pigeonhole::Error>,
+) -> Result<T, String> {
+    let policy = if buffered {
+        target.retry.clone().durability(Durability::Buffered)
+    } else {
+        target.retry.clone()
+    };
+    retry_busy(busy, || {
+        let mut first = true;
+        target
+            .db
+            .transact(&policy, |txn| {
+                if !std::mem::take(&mut first) {
+                    target.conflicts.fetch_add(1, Ordering::Relaxed);
+                }
+                body(txn)
+            })
+            .map(|(v, _)| v)
+    })
 }
 
 struct PigeonholeClient {
@@ -1117,13 +1181,10 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
         }
         BenchOp::ReadModifyWrite { row, qualifier } if target.rmw_txn => {
             // D274: transaction against transaction. Read, put and commit in an optimistic
-            // `Transaction`, retried on a conflict (counted) and on `Busy`, as transfer.
-            let mut busy_tries = 0;
-            loop {
-                let mut txn = target.db.transaction().map_err(err)?;
+            // transaction through `transact` (its default retry), as transfer.
+            transact(target, busy, buffered, |txn| {
                 let old = txn
-                    .get(table, row, YCSB_FAMILY, qualifier)
-                    .map_err(err)?
+                    .get(table, row, YCSB_FAMILY, qualifier)?
                     .map(|c| c.value().to_vec());
                 t = Touched::default();
                 if let Some(v) = &old {
@@ -1136,24 +1197,8 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                     qualifier,
                     &modified(old.as_deref()),
                 );
-                let committed = if buffered {
-                    txn.commit_with(Durability::Buffered)
-                } else {
-                    txn.commit()
-                };
-                match committed {
-                    Ok(_) => break,
-                    Err(e) if e.code() == ErrorCode::Conflict => {
-                        target.conflicts.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) if e.code() == ErrorCode::Busy && busy_tries < BUSY_RETRIES => {
-                        busy_tries += 1;
-                        busy.fetch_add(1, Ordering::Relaxed);
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(e) => return Err(err(e)),
-                }
-            }
+                Ok(())
+            })?;
         }
         BenchOp::ReadModifyWrite { row, qualifier } => {
             // Atomic across clients (D247): the write commits only if the cell still holds
@@ -1206,18 +1251,14 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             })?;
         }
         BenchOp::Transfer { from, to, amount } => {
-            // An optimistic transaction reading both balances, retried on a conflict
-            // (counted) and on `Busy` (as `retry_busy` counts it).
-            let mut busy_tries = 0;
-            loop {
-                let mut txn = target.db.transaction().map_err(err)?;
-                let mut read = |row: &[u8]| -> Result<Option<Vec<u8>>, String> {
-                    Ok(txn
-                        .get(table, row, YCSB_FAMILY, BALANCE)
-                        .map_err(err)?
-                        .map(|c| c.value().to_vec()))
-                };
-                let (a, b) = (read(from)?, read(to)?);
+            // An optimistic transaction reading both balances, through `transact` (D274).
+            transact(target, busy, buffered, |txn| {
+                let a = txn
+                    .get(table, from, YCSB_FAMILY, BALANCE)?
+                    .map(|c| c.value().to_vec());
+                let b = txn
+                    .get(table, to, YCSB_FAMILY, BALANCE)?
+                    .map(|c| c.value().to_vec());
                 t = Touched::default();
                 for v in [&a, &b].into_iter().flatten() {
                     t.cell(v);
@@ -1225,24 +1266,8 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                 let (na, nb) = transfer_balances(a.as_deref(), b.as_deref(), *amount);
                 txn.put(table, from, YCSB_FAMILY, BALANCE, &na.to_le_bytes());
                 txn.put(table, to, YCSB_FAMILY, BALANCE, &nb.to_le_bytes());
-                let committed = if buffered {
-                    txn.commit_with(Durability::Buffered)
-                } else {
-                    txn.commit()
-                };
-                match committed {
-                    Ok(_) => break,
-                    Err(e) if e.code() == ErrorCode::Conflict => {
-                        target.conflicts.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(e) if e.code() == ErrorCode::Busy && busy_tries < BUSY_RETRIES => {
-                        busy_tries += 1;
-                        busy.fetch_add(1, Ordering::Relaxed);
-                        std::thread::sleep(Duration::from_millis(50));
-                    }
-                    Err(e) => return Err(err(e)),
-                }
-            }
+                Ok(())
+            })?;
         }
         BenchOp::Incr { row, delta } => {
             let table = target
