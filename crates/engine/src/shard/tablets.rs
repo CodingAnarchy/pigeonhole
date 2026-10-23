@@ -818,8 +818,8 @@ impl ShardState {
             "shard {} overlap cleared for {:?}: tells {}",
             self.id.0, r.priority, r.coordinator.0
         );
-        // Through the queue even to this shard: it must follow a `Wound` this shard queued
-        // for the same commit before it (D267), or the coordinator, not yet waiting, drops it.
+        // Through the queue even to this shard: it must follow what this shard queued for the
+        // same commit before it, or the coordinator, not yet waiting, drops it (D249).
         let _ = ctx.submitter(r.coordinator).submit(ShardMsg::Wake {
             from: self.id,
             reason: WakeReason::Overlap {

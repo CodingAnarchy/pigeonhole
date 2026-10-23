@@ -149,8 +149,8 @@ pub struct RuntimeConfig {
     /// Engine-owned mode: how long a shard thread that just handled a message keeps
     /// polling its queue before it parks (D198). A message that arrives meanwhile is
     /// handled without the producer waking the thread. Zero (the default) parks at once.
-    /// A poll that finds nothing backs off: the thread skips the next 1, 2, 4, ... up to 64
-    /// polls, and an idle shard (no message since its last park) never polls.
+    /// A window that finds nothing backs off: the thread skips the next 1, 2, 4, ... up to 32
+    /// windows, and an idle shard (no message since its last park) never polls.
     pub idle_spin: Duration,
     /// Clock source (simulated under test).
     pub vfs: VfsRef,

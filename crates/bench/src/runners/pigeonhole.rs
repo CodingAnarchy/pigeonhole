@@ -41,6 +41,9 @@ pub(crate) struct Settings {
     /// A shard's idle spin before it parks (`Options::shard_spin`, D198), in microseconds;
     /// `None`: the library default.
     pub(crate) shard_spin_micros: Option<u64>,
+    /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
+    /// D253), in microseconds; `None`: the library default.
+    pub(crate) commit_spin_micros: Option<u64>,
     /// The inline driver splits the table over every shard before loading it (D213).
     pub(crate) presplit: bool,
     /// Riders on the measured phase (D247): snapshot and durable-snapshot readers, then a
@@ -307,6 +310,21 @@ impl PigeonholeRunner {
         self
     }
 
+    /// A blocking `None`/`Buffered` commit's spin before it parks, in microseconds
+    /// (`Options::commit_spin`, D253); the library default when not set.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("commit_spin"));
+    /// let r = PigeonholeRunner::default().commit_spin_micros(0);
+    /// assert!(r.describe().contains(" commit_spin=0us"));
+    /// ```
+    pub fn commit_spin_micros(mut self, micros: u64) -> Self {
+        self.settings.commit_spin_micros = Some(micros);
+        self
+    }
+
     /// `true`: [`run_inline`](Self::run_inline) splits the table at the loaded rows'
     /// quantiles and hands one piece to each shard before loading it, so every shard owns
     /// rows from the start instead of waiting for the balancer to spread them (D213's
@@ -519,6 +537,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
+    }
+    if let Some(us) = s.commit_spin_micros {
+        options = options.commit_spin(Duration::from_micros(us));
     }
     if s.presplit {
         // The pre-split placement stays fixed (D213): no balancer pass ever falls due, and no
@@ -756,7 +777,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -783,6 +804,8 @@ impl Runner for PigeonholeRunner {
             },
             s.shard_spin_micros
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
+            s.commit_spin_micros
+                .map_or_else(String::new, |us| format!(" commit_spin={us}us")),
             match (s.presplit, s.presplit_writes) {
                 (_, true) => " presplit=writes",
                 (true, false) => " presplit",

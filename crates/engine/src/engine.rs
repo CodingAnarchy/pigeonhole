@@ -216,8 +216,8 @@ pub struct Metrics {
     /// are unpinned, D252), or the OS refused (some threads unpinned). `None` when every
     /// thread is pinned or pinning is off (D235).
     pub unpinned: Option<&'static str>,
-    /// Async commit polls that found their seqno not yet visible and registered as waiters
-    /// on the global watermark (D19, ICR 0023), and the waiters already listed in the
+    /// Commit waits (blocking and async) that found their seqno not yet visible and
+    /// registered as waiters on the global watermark (D19, D227, ICR 0023), and the waiters already listed in the
     /// registry part each registration joined (a queue depth: registration no longer scans
     /// for a duplicate). Waits per commit near 0 mean the watermark is not what commits
     /// wait on (#154).

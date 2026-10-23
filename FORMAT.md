@@ -437,16 +437,16 @@ One 64-byte line per shard at `watermarks_off + 64 x shard`. The rest of the lin
 
 ### 11.3 Seqno reservation and snapshot protocol
 
-Each shard tracks `held`: the seqnos of cross-shard commits it coordinates that are decided and not yet applied everywhere (the seqno a Decision applies at, §10.3; a commit's id is reserved with a bare `fetch_add`, never held, since nothing is written at it). Every store to `pending` publishes `min(held, x)`:
+Each shard tracks `held`: the seqnos of cross-shard commits it coordinates that are decided and not yet applied everywhere (the seqno a Decision applies at, §10.3; a commit's id is reserved like any seqno, never held, since nothing is written at it). Every store to `pending` publishes `min(held, x)`:
 
 1. `pending[shard].store(min(held, next_seqno.load()))` (Release): a lower bound, published before reserving.
-2. `first = next_seqno.fetch_add(n)` (AcqRel). A cross-shard commit's decision reserves `n = 1` and adds its seqno to `held`.
+2. `first` = the next `n` seqnos from the writer process's one allocator (D271: reserved under its lock, with the group's default timestamps), then `next_seqno.fetch_max(first + n)` (AcqRel): `next_seqno` is a mirror of the allocator and never passes a reservation. A cross-shard commit's decision reserves `n = 1` and adds its seqno to `held`.
 3. `pending[shard].store(min(held, first))`; apply the group; then store `min(held, next unapplied seqno)`, which is `u64::MAX` when nothing is held or pending.
 4. When every participant has applied a cross-shard commit, remove it from `held` and store `pending` again.
 
 Without the `min(held, ..)` in steps 1 and 3, a coordinator's next group would overwrite `pending` and expose half of a cross-shard commit.
 
-Snapshot (writer threads and reader processes alike): `n = next_seqno.load()` (Acquire), then `m = min over shards of pending.load()` (Acquire); the snapshot seqno is `min(n, m) - 1`. A *durable* snapshot (D227) loads each shard's `pending` and then its `durable` (Acquire both), and takes `min(n, every pending, every durable) - 1`. A shard stores `durable` first, so a reader that sees a raised `pending` also sees the `durable` covering what is applied but not yet synced. Every seqno below `n` was reserved by a `fetch_add` that published a lower bound first, so it is either applied or holds `m` at or below it.
+Snapshot (writer threads and reader processes alike): `n = next_seqno.load()` (Acquire), then `m = min over shards of pending.load()` (Acquire); the snapshot seqno is `min(n, m) - 1`. A *durable* snapshot (D227) loads each shard's `pending` and then its `durable` (Acquire both), and takes `min(n, every pending, every durable) - 1`. A shard stores `durable` first, so a reader that sees a raised `pending` also sees the `durable` covering what is applied but not yet synced. Every seqno below `n` was reserved (step 2) by a shard that published a lower bound first, so it is either applied or holds `m` at or below it.
 
 ### 11.4 View buffers
 
