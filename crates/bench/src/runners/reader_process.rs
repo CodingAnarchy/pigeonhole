@@ -35,6 +35,22 @@ struct ChildReport {
     misses: u64,
     errors: u64,
     secs: f64,
+    /// #930 (scratch): the reading thread's CPU time over the loop.
+    #[serde(default)]
+    cpu_secs: f64,
+}
+
+/// This thread's CPU time, in seconds (#930 scratch): utime + stime from
+/// `/proc/thread-self/stat`, in 100 Hz clock ticks; 0 where there is no such file.
+fn thread_cpu_secs() -> f64 {
+    let Ok(stat) = std::fs::read_to_string("/proc/thread-self/stat") else {
+        return 0.0;
+    };
+    // Fields after the parenthesised command name: state is field 3, utime 14, stime 15.
+    let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+    let f: Vec<&str> = rest.split_whitespace().collect();
+    let tick = |i: usize| f.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    (tick(11) + tick(12)) / 100.0
 }
 
 /// How often the writer's reader metrics are sampled while the readers run.
@@ -171,12 +187,15 @@ impl Running {
         if !self.in_process.is_empty() {
             let mut hist = Histogram::new();
             let (mut misses, mut errors, mut rate) = (0u64, 0u64, 0f64);
+            let (mut cpu, mut wall) = (0f64, 0f64);
             for t in self.in_process.drain(..) {
                 let r = t
                     .join()
                     .map_err(|_| "an in-process reader panicked".to_owned())?;
                 let h = Histogram::from_sparse(&r.reads);
                 rate += h.count() as f64 / r.secs.max(1e-9);
+                cpu += r.cpu_secs;
+                wall += r.secs;
                 hist.merge(&h);
                 misses += r.misses;
                 errors += r.errors;
@@ -184,7 +203,7 @@ impl Running {
             let s = LatencyStats::of(&hist);
             eprintln!(
                 "INPROC {}",
-                serde_json::json!({"reads": s, "reads_per_sec": rate, "misses": misses, "errors": errors})
+                serde_json::json!({"reads": s, "reads_per_sec": rate, "misses": misses, "errors": errors, "cpu_ns_per_read": cpu * 1e9 / hist.count().max(1) as f64, "cpu_share": cpu / wall.max(1e-9)})
             );
         }
         let mut hist = Histogram::new();
@@ -199,6 +218,10 @@ impl Running {
             let r: ChildReport =
                 serde_json::from_str(&line).map_err(|e| format!("reader report {line:?}: {e}"))?;
             let h = Histogram::from_sparse(&r.reads);
+            eprintln!(
+                "CHILDCPU {}",
+                serde_json::json!({"cpu_ns_per_read": r.cpu_secs * 1e9 / h.count().max(1) as f64, "cpu_share": r.cpu_secs / r.secs.max(1e-9), "reads_per_sec": h.count() as f64 / r.secs.max(1e-9)})
+            );
             rate += h.count() as f64 / r.secs.max(1e-9);
             hist.merge(&h);
             misses += r.misses;
@@ -290,6 +313,7 @@ fn read_loop<E>(
     let mut ops = workload.run_ops();
     let (mut hist, mut misses, mut errors) = (Histogram::new(), 0u64, 0u64);
     let begun = Instant::now();
+    let cpu0 = thread_cpu_secs();
     while !stop.load(Ordering::Acquire) {
         let (row, family) = if hot_rows.is_empty() {
             match ops.next() {
@@ -318,5 +342,6 @@ fn read_loop<E>(
         misses,
         errors,
         secs: begun.elapsed().as_secs_f64(),
+        cpu_secs: thread_cpu_secs() - cpu0,
     }
 }
