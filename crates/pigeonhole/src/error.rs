@@ -114,10 +114,31 @@ pub enum ErrorCode {
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Error {
     code: ErrorCode,
     message: String,
+    /// A commit the failed engine refused before logging anything (the engine's
+    /// `ShardFailed`, code `Io`): with `Options::auto_recover` covering the failure it is
+    /// treated as a `Closed` refusal (#921, ICR 0060). Not part of equality or `Debug`.
+    unlogged: bool,
+}
+
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        self.code == other.code && self.message == other.message
+    }
+}
+
+impl Eq for Error {}
+
+impl fmt::Debug for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Error")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .finish()
+    }
 }
 
 impl Error {
@@ -125,7 +146,14 @@ impl Error {
         Self {
             code,
             message: message.into(),
+            unlogged: false,
         }
+    }
+
+    /// Whether a commit got this from a failed engine that refused it before logging it
+    /// (see the `unlogged` field).
+    pub(crate) fn refused_unlogged(&self) -> bool {
+        self.unlogged
     }
 
     /// The stable code.
@@ -180,6 +208,8 @@ impl From<pigeonhole_engine::Error> for Error {
             E::SnapshotExpired => ErrorCode::SnapshotExpired,
             E::WouldDeadlock => ErrorCode::WouldDeadlock,
             E::OutcomeUnknown => ErrorCode::OutcomeUnknown,
+            // A failed shard's refusal of a commit it never logged: still `Io` to the caller.
+            E::ShardFailed => ErrorCode::Io,
             E::NoWriter => ErrorCode::NoWriter,
             E::UnsupportedFeature(_) => ErrorCode::UnsupportedFeature,
             // `engine::Error` is `#[non_exhaustive]`. A variant added there without a code
@@ -203,6 +233,8 @@ impl From<pigeonhole_engine::Error> for Error {
                 .to_owned(),
             _ => e.to_string(),
         };
-        Self::new(code, message)
+        let mut out = Self::new(code, message);
+        out.unlogged = matches!(e, E::ShardFailed);
+        out
     }
 }

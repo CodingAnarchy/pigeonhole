@@ -307,10 +307,12 @@ impl Db {
         }
     }
 
-    /// A commit got `Closed` from the engine: with a recovery running or just completed, the
-    /// commit was refused by the failing engine before anything was written, and the batch
-    /// is gone with it: `Busy` (not committed, retry) once the swap is in, or `Closed` if the
-    /// recovery gave up. Without a recovery, the error as it is.
+    /// A commit got `Closed` from the engine, or a failed shard's refusal of a commit it never
+    /// logged (`Io`, before the supervisor began closing that engine: #921): with a recovery
+    /// running or just completed, the commit was refused by the failing engine before
+    /// anything was written, and the batch is gone with it: `Busy` (not committed, retry)
+    /// once the swap is in, or the error as it is if the recovery gave up. Without a
+    /// recovery, the error as it is.
     #[cold]
     #[inline(never)]
     pub(crate) fn after_commit_closed(&self, generation: u64, e: Error) -> Error {
@@ -331,7 +333,7 @@ impl Db {
     #[cold]
     #[inline(never)]
     fn after_commit_closed_as(&self, generation: u64, e: Error, transaction: bool) -> Error {
-        if e.code() != ErrorCode::Closed || self.is_closed() {
+        if (e.code() != ErrorCode::Closed && !e.refused_unlogged()) || self.is_closed() {
             return e;
         }
         let Some(sup) = &self.supervision else {

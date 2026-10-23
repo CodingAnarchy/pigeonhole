@@ -3980,6 +3980,15 @@ impl World {
                 }
                 return Ok(Resolved::Crashed);
             }
+            Outcome::Commit(Err(Error::ShardFailed)) | Outcome::Cas(Err(Error::ShardFailed)) => {
+                // A failed shard refused it before logging anything (#921): not committed, the
+                // stricter reading, as `Closed` after a shard's death.
+                self.stats.io_errors += 1;
+                self.trace
+                    .push("  -> refused by a failed shard: not committed; reopen pending".into());
+                self.aborted.push(inf.commit);
+                self.need_reopen = true;
+            }
             Outcome::Commit(Err(Error::Io(e))) | Outcome::Cas(Err(Error::Io(e))) => {
                 // A failed write or sync poisoned a stream: the commit may have landed
                 // (a sync failure after apply), so it is unacknowledged, and the engine
@@ -4255,7 +4264,7 @@ impl World {
                 self.need_reopen = true;
                 Ok(false)
             }
-            Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
+            Err(e @ (Error::Io(_) | Error::ShardFailed)) if self.cfg.faults.io_error_ppm > 0 => {
                 // Refused outright (a poisoned pager, D58): nothing was logged.
                 self.stats.io_errors += 1;
                 self.trace
@@ -4640,7 +4649,7 @@ impl World {
                 self.need_reopen = true;
                 return Ok(false);
             }
-            Err(Error::Io(e)) if self.cfg.faults.io_error_ppm > 0 => {
+            Err(e @ (Error::Io(_) | Error::ShardFailed)) if self.cfg.faults.io_error_ppm > 0 => {
                 self.stats.io_errors += 1;
                 self.trace
                     .push(format!("  -> refused ({e}); reopen pending"));
@@ -5512,7 +5521,9 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
                     // The injected write error fails the group after its write: the outcome
                     // is the WAL's (`OutcomeUnknown`, ICR 0040), or an I/O error for a group
                     // refused before writing. Either may have landed or not.
-                    Poll::Ready(Err(e @ (Error::Io(_) | Error::OutcomeUnknown))) => {
+                    Poll::Ready(Err(
+                        e @ (Error::Io(_) | Error::ShardFailed | Error::OutcomeUnknown),
+                    )) => {
                         w.trace
                             .push(format!("  -> I/O error or outcome unknown ({e})"));
                         w.stats.io_errors += 1;

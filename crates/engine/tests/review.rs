@@ -222,7 +222,8 @@ fn aborts_from_busy_poison_and_close_all_resolve() {
         let r = within("a later commit on the poisoned shard", move || {
             db2.commit(put(&a2, b"x", b"2"), None)
         });
-        assert!(matches!(r, Err(Error::Io(_))), "{r:?}");
+        // Refused before logging anything (#921): `ShardFailed`, shown as an I/O error.
+        assert!(matches!(r, Err(Error::ShardFailed)), "{r:?}");
         within("close with a poisoned shard", move || db.close()).ok();
         let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
         let a = db.table("a").unwrap();

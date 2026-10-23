@@ -1331,11 +1331,13 @@ impl From<PrepareError> for Error {
             PrepareError::Closed => Error::Closed,
             PrepareError::TooLarge => Error::RecordTooLarge,
             PrepareError::NeverFits => Error::BatchTooLarge,
-            PrepareError::Io => poisoned_error(),
+            PrepareError::Io => Error::ShardFailed,
         }
     }
 }
 
+/// A failed shard's error for work that is not a commit (maintenance, a durability wait). A
+/// commit it refuses, never logged, gets [`Error::ShardFailed`] instead (#921).
 fn poisoned_error() -> Error {
     Error::Io(pigeonhole_io::Error::new(
         ErrorKind::Other,
@@ -5317,7 +5319,7 @@ impl ShardState {
                 m.failed = Some(if written {
                     Error::OutcomeUnknown
                 } else {
-                    poisoned_error()
+                    Error::ShardFailed
                 });
             }
             self.settle(m, Ok(()), ctx);
@@ -5555,7 +5557,7 @@ impl ShardState {
                 continue;
             }
             if self.poisoned {
-                m.failed = Some(poisoned_error());
+                m.failed = Some(Error::ShardFailed);
                 self.settle(m, Ok(()), ctx);
                 continue;
             }
@@ -5765,7 +5767,7 @@ impl ShardState {
                     Err(Room::Wait) => {
                         if self.shared.pager_poisoned.load(Ordering::Acquire) {
                             // No flush can ever free anything: refuse now.
-                            m.failed = Some(poisoned_error());
+                            m.failed = Some(Error::ShardFailed);
                             self.settle(m, Ok(()), ctx);
                             continue;
                         }
@@ -7326,7 +7328,7 @@ impl ShardState {
             req.reply.notify(Err(if self.closing {
                 Error::Closed
             } else {
-                poisoned_error()
+                Error::ShardFailed
             }));
             return;
         }
