@@ -1087,7 +1087,7 @@ impl Transaction {
             check_table(&self.db, table)?;
             self.db.check_open()?;
             self.db.check_generation(self.generation)?;
-            let family = table.core.family_id(family)?;
+            let family = table.core.family_id_at(self.txn.snapshot(), family)?;
             Ok(self.txn.get(table.core.info.id, family, row, qualifier)?)
         })();
         match read {
@@ -1121,13 +1121,15 @@ impl Transaction {
             check_table(&self.db, table)?;
             self.db.check_open()?;
             self.db.check_generation(self.generation)?;
+            // The families as the transaction's snapshot saw them, which name its cells (#892).
+            let snapshot = self.txn.snapshot();
             let ids = families
                 .iter()
-                .map(|f| table.core.family_id(f))
+                .map(|f| table.core.family_id_at(snapshot, f))
                 .collect::<Result<Vec<_>>>()?;
             let mut spec = pigeonhole_engine::ReadSpec::default();
             spec.versions = 1;
-            let mut buf = crate::cell::RowBuf::new(table.core.current_info(), 0);
+            let mut buf = crate::cell::RowBuf::new(table.core.info_at(snapshot), 0);
             let any = self
                 .txn
                 .read_row_into(table.core.info.id, row, &ids, &spec, &mut buf)?;
@@ -1164,7 +1166,7 @@ impl Transaction {
         let started = check_table(&self.db, table)
             .and_then(|()| self.db.check_open())
             .and_then(|()| self.db.check_generation(self.generation))
-            .and_then(|()| table.core.family_id(family))
+            .and_then(|()| table.core.family_id_at(self.txn.snapshot(), family))
             .map(|family| {
                 self.txn
                     .get_async(table.core.info.id, family, row, qualifier)

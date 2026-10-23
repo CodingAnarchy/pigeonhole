@@ -2670,3 +2670,75 @@ fn a_registered_operator_folds_onto_a_separated_base() {
     drop(t);
     db.close().unwrap();
 }
+
+/// #892: a read at a snapshot names and resolves families from the catalog as of the
+/// snapshot. The catalog can only gain families today (none is dropped or renamed), so the
+/// case is a family added after the snapshot: a get at the snapshot that names it reports it
+/// unknown there and a row read returns nothing of it (both as before), and reads of every
+/// family return, and name, only those the snapshot saw. The same for a transaction, whose snapshot is taken at `begin`.
+#[test]
+fn reads_at_a_snapshot_name_the_families_the_snapshot_saw() {
+    let db = db();
+    let t = db
+        .table("s")
+        .unwrap()
+        .family("a", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"r").put("a", b"q", b"1").commit().unwrap();
+    let snap = db.snapshot().unwrap();
+    let mut txn = db.transaction().unwrap();
+    let t = db
+        .table("s")
+        .unwrap()
+        .family("late", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"r").put("late", b"q", b"2").commit().unwrap();
+    let families = |r: Option<pigeonhole::RowRef<'_>>| -> Vec<String> {
+        r.map(|r| r.iter().map(|e| e.family.to_owned()).collect())
+            .unwrap_or_default()
+    };
+
+    // Named: a get reports the family unknown at the snapshot (the engine's check, as
+    // before); a row read resolves it and returns nothing of it.
+    assert_eq!(
+        t.get_at(&snap, b"r", "late", b"q").unwrap_err().code(),
+        ErrorCode::FamilyNotFound
+    );
+    assert_eq!(
+        families(t.row(b"r").snapshot(&snap).family("late").read().unwrap()),
+        Vec::<String>::new()
+    );
+    // Every family: only those the snapshot saw.
+    assert_eq!(families(t.row(b"r").snapshot(&snap).read().unwrap()), ["a"]);
+    let scanned: Vec<String> = t
+        .scan_prefix(b"r")
+        .snapshot(&snap)
+        .iter()
+        .unwrap()
+        .map(|row| row.unwrap())
+        .flat_map(|row| {
+            (0..row.len())
+                .filter_map(|i| row.entry(i).map(|(f, _, _)| f.to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(scanned, ["a"]);
+    // As of now, both.
+    assert_eq!(families(t.row(b"r").read().unwrap()), ["a", "late"]);
+
+    // The transaction began before the family was added.
+    assert_eq!(
+        txn.get(&t, b"r", "late", b"q").unwrap_err().code(),
+        ErrorCode::FamilyNotFound
+    );
+    let row = txn
+        .get_row(&t, b"r", &[])
+        .unwrap()
+        .map(|r| r.iter().map(|e| e.family.to_owned()).collect::<Vec<_>>());
+    assert_eq!(row, Some(vec!["a".to_owned()]));
+    drop(txn);
+    drop(t);
+    db.close().unwrap();
+}

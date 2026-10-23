@@ -1272,6 +1272,13 @@ impl Snapshot {
         &self.view
     }
 
+    /// Table `id` as this snapshot's catalog knew it (its families then), or `None` if it
+    /// did not exist yet. A read at the snapshot names its families from this (#892, ICR
+    /// 0068). Borrowed: a lookup takes no reference on the shared entry.
+    pub fn table(&self, id: pigeonhole_format::TableId) -> Option<&Arc<crate::TableInfo>> {
+        self.view.catalog.table(id)
+    }
+
     /// Reader processes: [`Error::SnapshotExpired`] if a writer restarted since the snapshot
     /// was taken; call after a read through it (see `LiveSnapshot::check_current`). Always
     /// `Ok` in the writer process.

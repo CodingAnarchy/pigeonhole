@@ -194,6 +194,30 @@ impl TableCore {
         }
     }
 
+    /// The table as `snapshot` saw it, which names every family a read at it can return; the
+    /// current entry if the table did not exist then (#892).
+    pub(crate) fn info_at(&self, snapshot: &pigeonhole_engine::Snapshot) -> Arc<TableInfo> {
+        snapshot
+            .table(self.info.id)
+            .map_or_else(|| self.current_info(), Arc::clone)
+    }
+
+    /// Resolves a family name for a read at `snapshot`: as the snapshot saw it, so a family
+    /// dropped (or dropped and created again) since still reads what the snapshot holds; a
+    /// family created since resolves as now and reads nothing at the snapshot (#892).
+    pub(crate) fn family_id_at(
+        &self,
+        snapshot: &pigeonhole_engine::Snapshot,
+        name: &str,
+    ) -> Result<FamilyId> {
+        if let Some(info) = snapshot.table(self.info.id)
+            && let Some(f) = info.family(name)
+        {
+            return Ok(f.id);
+        }
+        self.family_id(name)
+    }
+
     /// Resolves a family name: from the handle's entry (no allocation), else from the
     /// current catalog.
     #[inline]
@@ -242,6 +266,9 @@ impl TableCore {
         qualifier: &[u8],
     ) -> Result<Option<CellRef<'_>>> {
         self.db.check_open()?;
+        if let Some(s) = snapshot {
+            return self.get_at(s, row, family, qualifier);
+        }
         let family = self.family_id(family)?;
         let table = self.info.id;
         // With a supervisor, a read as of now is run again on the recovered engine if it
@@ -253,13 +280,24 @@ impl TableCore {
                 .get_latest_supervised(table, family, row, qualifier)
                 .map(|data| data.map(CellRef::owned));
         }
-        let data = match snapshot {
-            None => self.with(|e| e.get_latest(table, family, row, qualifier))?,
-            Some(s) => {
-                self.db.check_snapshot(s)?;
-                self.with(|e| e.get(&s.inner, table, family, row, qualifier))?
-            }
-        };
+        let data = self.with(|e| e.get_latest(table, family, row, qualifier))?;
+        Ok(data.map(CellRef::owned))
+    }
+
+    /// [`get`](Self::get) as of `snapshot`: the family resolved as the snapshot saw it
+    /// (#892). Out of line, so the read as of now keeps its shape.
+    #[inline(never)]
+    fn get_at(
+        &self,
+        snapshot: &Snapshot,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> Result<Option<CellRef<'_>>> {
+        self.db.check_snapshot(snapshot)?;
+        let family = self.family_id_at(&snapshot.inner, family)?;
+        let table = self.info.id;
+        let data = self.with(|e| e.get(&snapshot.inner, table, family, row, qualifier))?;
         Ok(data.map(CellRef::owned))
     }
 
@@ -274,12 +312,16 @@ impl TableCore {
         qualifier: &[u8],
     ) -> crate::nonblocking::GetFuture {
         let started = self.db.check_open().and_then(|()| {
-            let family = self.family_id(family)?;
             let table = self.info.id;
             Ok(match snapshot {
-                None => self.with(|e| e.get_latest_async(table, family, row, qualifier)),
+                None => {
+                    let family = self.family_id(family)?;
+                    self.with(|e| e.get_latest_async(table, family, row, qualifier))
+                }
                 Some(s) => {
                     self.db.check_snapshot(s)?;
+                    // The family as the snapshot saw it (#892).
+                    let family = self.family_id_at(&s.inner, family)?;
                     self.with(|e| e.get_async(&s.inner, table, family, row, qualifier))
                 }
             })
