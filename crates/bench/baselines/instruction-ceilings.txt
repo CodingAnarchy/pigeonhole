@@ -144,12 +144,20 @@
 # 17360 (+0.5%). Main itself read 17280 (run 39859158837's base, over the ceiling) and 17234
 # (run 39856495172's base): identical code moves about 60 run to run, so every PR failed
 # the absolute check on main's own count. Until #909 pins that noise; then it comes back down.
+#
+# Raised for #919 (#901, a database handle in a forked child refuses every operation) under
+# D195's ceiling rule (owner, 2026-10-13; the coordinator OK'd scan-wide-q1, 2026-10-23):
+# get-miss 4175 -> 4190 and scan-wide-q1 14282 -> 14326, this PR's head counts on main
+# (run 39912275511: get-miss 4177, main's own 4170; scan-wide-q1 14283, main's 14277) times
+# 1.003. get-miss's +7 is the fork check a point read now makes (the snapshot's process,
+# one load and compare); scan-wide-q1's +6 is the scan cursor's 256-row check and the scan's
+# creation check, within run-to-run noise. Both ceilings had 5 or fewer instructions left.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
 get-mem 5681 0.3
 get-sst 17360 0.5
-get-miss 4175 0.3
+get-miss 4190 0.3
 row 2475 1.0
 scan 1358 0.3
 scan-filtered 5776 0.3
@@ -172,4 +180,4 @@ scan-wide 1296 0.3
 commit-async 9695 0.3
 scan-narrow-q1 5251 0.3
 scan-wide-q10 1784 0.3
-scan-wide-q1 14282 0.3
+scan-wide-q1 14326 0.3
