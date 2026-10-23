@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{
-    Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, RowMutation, Table,
-    ValueFilter,
+    Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, RetryPolicy,
+    RowMutation, Table, ValueFilter,
 };
 
 use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified, transfer_balances};
@@ -44,6 +44,10 @@ pub(crate) struct Settings {
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
+    /// Transfer's pause before retrying a conflicted transaction: `RetryPolicy`'s full-jitter
+    /// backoff from this base, in microseconds, to its default cap (#708); `None`: retried
+    /// at once.
+    pub(crate) txn_backoff_micros: Option<u64>,
     /// The inline driver splits the table over every shard before loading it (D213).
     pub(crate) presplit: bool,
     /// Riders on the measured phase (D247): snapshot and durable-snapshot readers, then a
@@ -322,6 +326,22 @@ impl PigeonholeRunner {
     /// ```
     pub fn commit_spin_micros(mut self, micros: u64) -> Self {
         self.settings.commit_spin_micros = Some(micros);
+        self
+    }
+
+    /// Transfer retries a conflicted transaction after a pause drawn by
+    /// `RetryPolicy::next_pause` (full jitter, exponential from `micros` to the default cap),
+    /// as `Pigeonhole::transact` does, instead of at once (#708).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("txn_backoff"));
+    /// let r = PigeonholeRunner::default().txn_backoff_micros(100);
+    /// assert!(r.describe().contains(" txn_backoff=100us"));
+    /// ```
+    pub fn txn_backoff_micros(mut self, micros: u64) -> Self {
+        self.settings.txn_backoff_micros = Some(micros);
         self
     }
 
@@ -611,6 +631,10 @@ impl Runner for PigeonholeRunner {
                 parts: Arc::default(),
                 counters: None,
                 conflicts: Arc::default(),
+                backoff: self.settings.txn_backoff_micros.map(|us| {
+                    RetryPolicy::default()
+                        .backoff(Duration::from_micros(us), Duration::from_millis(100))
+                }),
                 load_buffered: self.settings.load_buffered,
             },
             busy: Arc::default(),
@@ -777,7 +801,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -806,6 +830,8 @@ impl Runner for PigeonholeRunner {
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
             s.commit_spin_micros
                 .map_or_else(String::new, |us| format!(" commit_spin={us}us")),
+            s.txn_backoff_micros
+                .map_or_else(String::new, |us| format!(" txn_backoff={us}us")),
             match (s.presplit, s.presplit_writes) {
                 (_, true) => " presplit=writes",
                 (true, false) => " presplit",
@@ -873,6 +899,8 @@ pub(crate) struct Target {
     counters: Option<Table>,
     /// Transactions retried after a conflict, shared with every client (D247).
     conflicts: Arc<AtomicU64>,
+    /// Transfer's retry pauses (`PigeonholeRunner::txn_backoff_micros`); `None`: none.
+    backoff: Option<RetryPolicy>,
     /// Commits are `Buffered` (the load of a run set to [`PigeonholeRunner::load_buffered`]).
     load_buffered: bool,
 }
@@ -1139,7 +1167,9 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             // An optimistic transaction reading both balances, retried on a conflict
             // (counted) and on `Busy` (as `retry_busy` counts it).
             let mut busy_tries = 0;
+            let (mut attempt, start) = (0u32, Instant::now());
             loop {
+                attempt += 1;
                 let mut txn = target.db.transaction().map_err(err)?;
                 let mut read = |row: &[u8]| -> Result<Option<Vec<u8>>, String> {
                     Ok(txn
@@ -1164,6 +1194,12 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
                     Ok(_) => break,
                     Err(e) if e.code() == ErrorCode::Conflict => {
                         target.conflicts.fetch_add(1, Ordering::Relaxed);
+                        // Past the policy's deadline it retries at once, as without one.
+                        if let Some(pause) = target.backoff.as_ref().and_then(|p| {
+                            p.next_pause(ErrorCode::Conflict, attempt, start.elapsed())
+                        }) {
+                            std::thread::sleep(pause);
+                        }
                     }
                     Err(e) if e.code() == ErrorCode::Busy && busy_tries < BUSY_RETRIES => {
                         busy_tries += 1;
