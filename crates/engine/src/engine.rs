@@ -3462,7 +3462,7 @@ impl Inner {
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
-        validate: Option<Box<Validate>>,
+        validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
     ) -> Result<Submission> {
         let routed = self.route_and_send(batch, durability, validate, predicate, NoAdmission)?;
@@ -3482,7 +3482,7 @@ impl Inner {
         &self,
         batch: WriteBatch,
         durability: Option<Durability>,
-        validate: Option<Box<Validate>>,
+        validate: Option<Arc<Validate>>,
         predicate: Option<(TableId, Vec<u8>, Predicate)>,
         admit: A,
     ) -> Result<Routed<A::Charge>> {

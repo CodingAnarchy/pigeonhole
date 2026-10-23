@@ -1145,10 +1145,11 @@ enum Kind {
         /// What the model said when the predicate was evaluated (nothing in flight).
         expected: bool,
     },
-    /// A transaction: reads at the engine snapshot, then the batch.
+    /// A transaction: reads at the engine snapshot (each a `(table, row, family, qualifier)`
+    /// cell, D275), then the batch.
     Txn {
         snapshot: Seqno,
-        reads: Vec<(String, Vec<u8>, String)>,
+        reads: Vec<(String, Vec<u8>, String, Vec<u8>)>,
     },
 }
 
@@ -1246,7 +1247,7 @@ impl PurgeEvent {
 
 impl Committed {
     /// A `(table, row, family)` the commit writes.
-    fn touches(&self, table: &str, row: &[u8], family: &str) -> bool {
+    fn touches_family(&self, table: &str, row: &[u8], family: &str) -> bool {
         self.ops.iter().any(|op| {
             op_table(op) == table
                 && op_row(op) == row
@@ -1257,6 +1258,39 @@ impl Committed {
                     | ModelOp::DeleteCell { family: f, .. }
                     | ModelOp::DeleteColumn { family: f, .. }
                     | ModelOp::DeleteFamily { family: f, .. } => f == family,
+                }
+        })
+    }
+
+    /// Whether the commit writes the cell `(table, row, family, qualifier)` a transaction
+    /// read (D275): any mutation of its column, or a delete of its family or row.
+    fn touches_cell(&self, table: &str, row: &[u8], family: &str, qualifier: &[u8]) -> bool {
+        self.ops.iter().any(|op| {
+            op_table(op) == table
+                && op_row(op) == row
+                && match op {
+                    ModelOp::DeleteRow { .. } => true,
+                    ModelOp::DeleteFamily { family: f, .. } => f == family,
+                    ModelOp::Put {
+                        family: f,
+                        qualifier: q,
+                        ..
+                    }
+                    | ModelOp::Incr {
+                        family: f,
+                        qualifier: q,
+                        ..
+                    }
+                    | ModelOp::DeleteCell {
+                        family: f,
+                        qualifier: q,
+                        ..
+                    }
+                    | ModelOp::DeleteColumn {
+                        family: f,
+                        qualifier: q,
+                        ..
+                    } => f == family && q == qualifier,
                 }
         })
     }
@@ -3584,7 +3618,7 @@ impl World {
             // Validation must have seen every commit between the snapshot and this one.
             if let Some(bad) = self.history.values().find(|h| {
                 h.seqno.is_some_and(|s| s > *snapshot && s < seqno)
-                    && reads.iter().any(|(t, r, f)| h.touches(t, r, f))
+                    && reads.iter().any(|(t, r, f, q)| h.touches_cell(t, r, f, q))
             }) {
                 return fail(
                     FailureClass::Protocol,
@@ -3695,7 +3729,7 @@ impl World {
             cells.push(p);
         }
         for c in others {
-            if puts.iter().any(|p| c.touches(&p.0, &p.1, &p.2)) {
+            if puts.iter().any(|p| c.touches_family(&p.0, &p.1, &p.2)) {
                 return Ok(());
             }
         }
@@ -3800,7 +3834,7 @@ impl World {
             .iter()
             .map(|i| &i.commit)
             .chain(self.acked_pending.iter().map(|(_, i, _)| &i.commit))
-            .any(|c| c.touches(&table, &row, &family))
+            .any(|c| c.touches_family(&table, &row, &family))
         {
             return Ok(());
         }
@@ -3896,7 +3930,7 @@ impl World {
                 // A real conflict: some commit above the snapshot touched a read key.
                 let real = self.history.values().any(|c| {
                     c.seqno.is_some_and(|s| s > *snapshot)
-                        && reads.iter().any(|(t, r, f)| c.touches(t, r, f))
+                        && reads.iter().any(|(t, r, f, q)| c.touches_cell(t, r, f, q))
                 });
                 if !real {
                     return fail(
@@ -4405,18 +4439,18 @@ impl World {
                     );
                 }
             }
-            reads.push((table, row, family));
+            reads.push((table, row, family, qualifier));
         }
         let batch = match store.batch(&ops) {
             Ok(b) => b,
             Err(e) => return fail(FailureClass::Protocol, format!("batch: {e}")),
         };
         *txn.batch() = batch;
-        // Half the time another writer touches a read key between the reads and the
+        // Half the time another writer touches a read cell between the reads and the
         // commit, so validation must abort the transaction.
         let interfere = rng.chance(500_000);
         if interfere {
-            let (t, r, f) = reads[0].clone();
+            let (t, r, f, q) = reads[0].clone();
             let value = if is_i64(&f) {
                 77i64.to_le_bytes().to_vec()
             } else {
@@ -4428,7 +4462,7 @@ impl World {
                 table: t,
                 row: r,
                 family: f,
-                qualifier: b"q0".to_vec(),
+                qualifier: q,
                 ts,
                 value,
             };
@@ -4442,7 +4476,7 @@ impl World {
             "txn {durability:?} ts={now} snapshot={snapshot} reads={}{} [{}]{}",
             reads
                 .iter()
-                .map(|(t, r, f)| format!("{t}/{}/{f}", text(r)))
+                .map(|(t, r, f, q)| format!("{t}/{}/{f}:{}", text(r), text(q)))
                 .collect::<Vec<_>>()
                 .join(","),
             if interfere { " (interfered)" } else { "" },
@@ -4459,7 +4493,7 @@ impl World {
             let view = store.engine.snapshot().expect("snapshot").view().clone();
             reads
                 .iter()
-                .filter_map(|(t, r, _)| {
+                .filter_map(|(t, r, _, _)| {
                     view.tablets()
                         .route(store.tables[t].id, r)
                         .map(|(_, s)| s.0)

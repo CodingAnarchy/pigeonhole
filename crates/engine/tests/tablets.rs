@@ -7654,3 +7654,367 @@ fn a_counter_bucket_increment_behind_a_newer_bucket_still_conflicts() {
         "an older bucket's increment after the snapshot was missed: {r:?}"
     );
 }
+
+// ---- D275: per-cell validation ----
+
+/// How a D275 matrix transaction reads row `r`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MatrixRead {
+    /// `get` of `f:q1`: a cell read.
+    Cell,
+    /// `get_row` of family `f`.
+    Family,
+    /// `get_row` of every family.
+    Row,
+}
+
+/// A write committed after a D275 matrix transaction's snapshot.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MatrixWrite {
+    PutQ1,
+    PutQ2,
+    DeleteCellQ1,
+    DeleteCellQ2,
+    DeleteColumnQ1,
+    DeleteColumnQ2,
+    DeleteFamilyF,
+    DeleteFamilyG,
+    DeleteRow,
+    PutG,
+    OtherRow,
+}
+
+impl MatrixWrite {
+    const ALL: [MatrixWrite; 11] = [
+        MatrixWrite::PutQ1,
+        MatrixWrite::PutQ2,
+        MatrixWrite::DeleteCellQ1,
+        MatrixWrite::DeleteCellQ2,
+        MatrixWrite::DeleteColumnQ1,
+        MatrixWrite::DeleteColumnQ2,
+        MatrixWrite::DeleteFamilyF,
+        MatrixWrite::DeleteFamilyG,
+        MatrixWrite::DeleteRow,
+        MatrixWrite::PutG,
+        MatrixWrite::OtherRow,
+    ];
+
+    fn batch(self, db: &Db, row: &[u8], other: &[u8]) -> WriteBatch {
+        let (id, f, g) = (
+            db.table.id,
+            db.table.families[0].id,
+            db.table.families[1].id,
+        );
+        let mut wb = WriteBatch::new();
+        let v = ValueRef::Bytes(b"later");
+        match self {
+            MatrixWrite::PutQ1 => wb.put(id, f, row, b"q1", None, v),
+            MatrixWrite::PutQ2 => wb.put(id, f, row, b"q2", None, v),
+            MatrixWrite::DeleteCellQ1 => wb.delete_cell(id, f, row, b"q1", 1),
+            MatrixWrite::DeleteCellQ2 => wb.delete_cell(id, f, row, b"q2", 1),
+            MatrixWrite::DeleteColumnQ1 => wb.delete_column(id, f, row, b"q1", None),
+            MatrixWrite::DeleteColumnQ2 => wb.delete_column(id, f, row, b"q2", None),
+            MatrixWrite::DeleteFamilyF => wb.delete_family(id, f, row, None),
+            MatrixWrite::DeleteFamilyG => wb.delete_family(id, g, row, None),
+            MatrixWrite::DeleteRow => wb.delete_row(id, row, None),
+            MatrixWrite::PutG => wb.put(id, g, row, b"q1", None, v),
+            MatrixWrite::OtherRow => wb.put(id, f, other, b"q1", None, v),
+        }
+        .unwrap();
+        wb
+    }
+
+    /// D275's matrix: whether this write after the snapshot conflicts with `read`.
+    fn conflicts_with(self, read: MatrixRead) -> bool {
+        use MatrixWrite::*;
+        match read {
+            MatrixRead::Cell => matches!(
+                self,
+                PutQ1 | DeleteCellQ1 | DeleteColumnQ1 | DeleteFamilyF | DeleteRow
+            ),
+            MatrixRead::Family => !matches!(self, DeleteFamilyG | PutG | OtherRow),
+            MatrixRead::Row => self != OtherRow,
+        }
+    }
+}
+
+/// Seeds row `row` with `f:q1`, `f:q2` and `g:q1`, then runs a transaction that reads it as
+/// `read` and writes `out`, with `write` committed after its snapshot (and everything flushed
+/// first when `flush`, so validation finds the write in an SST).
+fn matrix_case(
+    db: &mut Db,
+    row: &[u8],
+    out: &[u8],
+    other: &[u8],
+    read: MatrixRead,
+    write: MatrixWrite,
+    flush: bool,
+) -> pigeonhole_engine::Result<pigeonhole_engine::CommitInfo> {
+    let (id, f, g) = (
+        db.table.id,
+        db.table.families[0].id,
+        db.table.families[1].id,
+    );
+    let mut wb = WriteBatch::new();
+    for (fam, q) in [(f, &b"q1"[..]), (f, b"q2"), (g, b"q1")] {
+        wb.put(id, fam, row, q, None, ValueRef::Bytes(b"seed"))
+            .unwrap();
+    }
+    db.commit(wb);
+    let mut t = db.engine.begin().unwrap();
+    match read {
+        MatrixRead::Cell => {
+            t.get(id, f, row, b"q1").unwrap();
+        }
+        MatrixRead::Family | MatrixRead::Row => {
+            let families = if read == MatrixRead::Family {
+                vec![f]
+            } else {
+                Vec::new()
+            };
+            let mut sink = pigeonhole_engine::RowData::default();
+            t.read_row_into(id, row, &families, &ReadSpec::default(), &mut sink)
+                .unwrap();
+        }
+    }
+    t.batch()
+        .put(id, f, out, b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let later = write.batch(db, row, other);
+    db.commit(later);
+    if flush {
+        db.flush();
+    }
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    poll_until(db, &mut pc, 100_000).expect("resolved")
+}
+
+fn check_matrix(db: &mut Db, rows: impl Fn(usize) -> (Vec<u8>, Vec<u8>, Vec<u8>), what: &str) {
+    let mut n = 0;
+    for flush in [false, true] {
+        for read in [MatrixRead::Cell, MatrixRead::Family, MatrixRead::Row] {
+            for write in MatrixWrite::ALL {
+                let (row, out, other) = rows(n);
+                n += 1;
+                let r = matrix_case(db, &row, &out, &other, read, write, flush);
+                let conflicted = matches!(r, Err(pigeonhole_engine::Error::Conflict));
+                assert!(
+                    conflicted || r.is_ok(),
+                    "{what}: {read:?} / {write:?} / flush {flush}: {r:?}"
+                );
+                assert_eq!(
+                    conflicted,
+                    write.conflicts_with(read),
+                    "{what}: {read:?} read, then {write:?} (flush {flush}): {r:?}"
+                );
+            }
+        }
+    }
+}
+
+/// D275's conflict matrix on one shard: a cell read conflicts only with a later write of
+/// its column (put, cell delete, column delete) or a delete of its family or row; a family
+/// read with any later write to the family in that row; a whole-row read with any write to
+/// the row. Checked with the later write in a memtable and in an SST.
+#[test]
+fn d275_conflict_matrix_on_one_shard() {
+    let mut db = open(1, |_| {});
+    check_matrix(
+        &mut db,
+        |n| {
+            (
+                format!("r{n:03}").into_bytes(),
+                format!("o{n:03}").into_bytes(),
+                format!("x{n:03}").into_bytes(),
+            )
+        },
+        "one shard",
+    );
+}
+
+/// D275's matrix validated by a participant that does not coordinate: the transaction
+/// writes on shard 0 and reads on shard 1, which checks the read at PREPARE.
+#[test]
+fn d275_conflict_matrix_on_a_participant() {
+    let mut db = open(2, |_| {});
+    tablets_on(&mut db, 2, |t| t as u16);
+    check_matrix(
+        &mut db,
+        |n| {
+            let n = n as u64 * 3;
+            (tablet_row(1, n), tablet_row(0, n + 1), tablet_row(1, n + 2))
+        },
+        "participant",
+    );
+}
+
+/// D275: a cell read on a 2,000-column row validates in a few entries (the row's markers,
+/// then one version of its column), not one per column, and still conflicts.
+#[test]
+fn a_cell_read_on_a_wide_row_visits_its_column_only() {
+    let mut db = open(1, |_| {});
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut wb = WriteBatch::new();
+    for i in 0..2_000u32 {
+        wb.put(
+            id,
+            f,
+            b"wide",
+            format!("c{i:05}").as_bytes(),
+            None,
+            ValueRef::Bytes(b"v"),
+        )
+        .unwrap();
+    }
+    db.commit(wb);
+    let read_one = |db: &mut Db, between: &dyn Fn(&mut Db)| {
+        let mut t = db.engine.begin().unwrap();
+        t.get(id, f, b"wide", b"c01000").unwrap();
+        t.batch()
+            .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+            .unwrap();
+        between(db);
+        let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+        poll_until(db, &mut pc, 100_000).expect("resolved")
+    };
+    let before = db.engine.validate_entries(0);
+    read_one(&mut db, &|db| {
+        let mut wb = WriteBatch::new();
+        wb.put(id, f, b"wide", b"c00999", None, ValueRef::Bytes(b"x"))
+            .unwrap();
+        db.commit(wb);
+    })
+    .expect("another column of the row: no conflict");
+    let visited = db.engine.validate_entries(0) - before;
+    assert!(visited <= 3, "validation visited {visited} entries");
+    let r = read_one(&mut db, &|db| {
+        let mut wb = WriteBatch::new();
+        wb.put(id, f, b"wide", b"c01000", None, ValueRef::Bytes(b"x"))
+            .unwrap();
+        db.commit(wb);
+    });
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "{r:?}"
+    );
+}
+
+/// D275 (perf287's P2): the seek keys use the engine's escaping, so qualifiers that share a
+/// prefix (`q` and `q\0x`) or are empty stay apart: only a write of the read qualifier
+/// itself conflicts.
+#[test]
+fn cell_reads_keep_escaped_and_empty_qualifiers_apart() {
+    let qualifiers: [&[u8]; 3] = [b"q", b"q\0x", b""];
+    let mut db = open(1, |_| {});
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let mut n = 0;
+    for flush in [false, true] {
+        for read in qualifiers {
+            for written in qualifiers {
+                let row = format!("e{n:03}").into_bytes();
+                n += 1;
+                let mut wb = WriteBatch::new();
+                for q in qualifiers {
+                    wb.put(id, f, &row, q, None, ValueRef::Bytes(b"seed"))
+                        .unwrap();
+                }
+                db.commit(wb);
+                let mut t = db.engine.begin().unwrap();
+                t.get(id, f, &row, read).unwrap();
+                t.batch()
+                    .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+                    .unwrap();
+                let mut wb = WriteBatch::new();
+                wb.put(id, f, &row, written, None, ValueRef::Bytes(b"later"))
+                    .unwrap();
+                db.commit(wb);
+                if flush {
+                    db.flush();
+                }
+                let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+                let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+                assert_eq!(
+                    matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+                    read == written,
+                    "read {read:?}, wrote {written:?}, flush {flush}: {r:?}"
+                );
+            }
+        }
+    }
+}
+
+/// D275 (perf287's P1): a family delete with an explicit, older timestamp sorts behind the
+/// row's newer markers, so every marker version is read, whatever the memtable's flag.
+#[test]
+fn an_explicit_older_family_delete_behind_newer_markers_conflicts() {
+    let mut db = open(1, |_| {});
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    for _ in 0..5 {
+        let mut wb = WriteBatch::new();
+        wb.delete_family(id, f, b"m", None).unwrap();
+        db.commit(wb);
+    }
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"m", b"q1", None, ValueRef::Bytes(b"v"))
+        .unwrap();
+    db.commit(wb);
+    let mut t = db.engine.begin().unwrap();
+    t.get(id, f, b"m", b"q1").unwrap();
+    t.batch()
+        .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+        .unwrap();
+    let mut wb = WriteBatch::new();
+    wb.delete_family(id, f, b"m", Some(1)).unwrap();
+    db.commit(wb);
+    let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    assert!(
+        matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+        "a family delete behind newer markers was missed: {r:?}"
+    );
+}
+
+/// D275 in a counter family: an increment of the read counter conflicts, at the fixed
+/// timestamp or into a bucket (`merge_at`); an increment of another counter of the row
+/// does not.
+#[test]
+fn a_counter_cell_read_conflicts_only_with_its_own_increments() {
+    let mut db = open(1, |_| {});
+    let (ctr, c) = counter_table(&db);
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    for (n, (q, bucket, conflicts)) in [
+        (&b"n1"[..], None, true),
+        (b"n2", None, false),
+        (b"n1", Some(5), true),
+        (b"n2", Some(5), false),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let row = format!("c{n}").into_bytes();
+        let mut wb = WriteBatch::new();
+        for q in [&b"n1"[..], b"n2"] {
+            wb.put(ctr, c, &row, q, None, ValueRef::I64(100)).unwrap();
+        }
+        db.commit(wb);
+        let mut t = db.engine.begin().unwrap();
+        t.get(ctr, c, &row, b"n1").unwrap();
+        t.batch()
+            .put(id, f, b"out", b"q", None, ValueRef::Bytes(b"t"))
+            .unwrap();
+        let mut wb = WriteBatch::new();
+        match bucket {
+            None => wb.merge(ctr, c, &row, q, ValueRef::I64(1)),
+            Some(ts) => wb.merge_at(ctr, c, &row, q, ts, ValueRef::I64(1)),
+        }
+        .unwrap();
+        db.commit(wb);
+        let mut pc = t.submit(Some(Durability::Buffered)).unwrap();
+        let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+        assert_eq!(
+            matches!(r, Err(pigeonhole_engine::Error::Conflict)),
+            conflicts,
+            "increment of {q:?} (bucket {bucket:?}): {r:?}"
+        );
+    }
+}

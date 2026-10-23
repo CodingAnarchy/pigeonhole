@@ -633,6 +633,14 @@ impl Probe {
             marker,
         }
     }
+
+    /// Whether `reader`'s filters admit the row and either the column or the row's family
+    /// markers. The column filter is keyed per column (row and qualifier), and the markers are
+    /// added to it under the marker prefix, so a miss on both means the SST holds neither.
+    pub(crate) fn admits(&self, reader: &pigeonhole_sst::SstReader) -> bool {
+        reader.may_contain_row(self.row)
+            && (reader.may_contain_column(self.column) || reader.may_contain_column(self.marker))
+    }
 }
 
 /// SST sources for a point read of one column: every SST of a level whose range covers the
@@ -673,10 +681,7 @@ pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
             } else {
                 sst.reader(set, priority)?
             };
-            if !reader.may_contain_row(probe.row)
-                || !(reader.may_contain_column(probe.column)
-                    || reader.may_contain_column(probe.marker))
-            {
+            if !probe.admits(&reader) {
                 continue;
             }
             out.push(Source::Sst(reader.iter(ScanFilter::all(), opts).into()));

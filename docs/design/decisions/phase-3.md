@@ -2350,7 +2350,7 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
   - The spec's transactions have no lock manager.
   - D267's chaining and wound-wait cover blind writers on hot rows.
   - A lock or "intent" mode (D249's named follow-up) is post-1.0 if C3's investigation needs one, and the owner asked for C3 to be solved short of it.
-- **C2: conflicts stay at (row, family) granularity.**
+- **C2: conflicts stay at (row, family) granularity.** *Amended by [D275](#d275) (2026-10-23): a `get` is validated per cell; `get_row` keeps the family granularity.*
   - A transaction's reads are recorded per (row, family) (`get`, and `get_row` per family, ICR 0062). A commit that touches any column of such a family in that row makes it conflict.
   - Per-cell tracking would mean qualifier-level read sets and a per-qualifier check in the SSTs. It would only remove false conflicts between transactions that read and write different qualifiers of one family.
   - The guide's transactions page documents the granularity and the modeling advice: put columns that change independently and are read in transactions in different families.
@@ -2422,6 +2422,47 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - `rocksdb_transactions_read_what_pigeonhole_reads`: both kinds read exactly what Pigeonhole reads on transfer and ycsb-f.
 - `pigeonhole_transactions_lose_no_update` and `pigeonhole_transactions_read_what_pigeonhole_reads`: ycsb-f through a Pigeonhole transaction loses no update, counts its conflicts, and reads what `commit_if`'s row reads; `pigeonhole_loses_no_update` now checks that lost races count too.
 - `fjall_reads_what_pigeonhole_reads` and `fjall_runs_concurrent_rmw`: these now run on fjall's transactions.
+
+<a id="d275"></a>
+## D275 — A transaction's cell read is validated per cell; family and row reads keep their granularity (owner decision, 2026-10-23; engine, pigeonhole, #708; amends D272 C2)
+
+**Decided** (design on #708, comment 6356115899; perf287's review, comment 6356142758):
+- **What a read records.** `get` (and `get_async`) records the one cell it read, `(table, row, family, qualifier)`. `get_row` records each family it covers, as before (every family when none are named). A transaction's reads are sorted and deduplicated at commit, a family read dropping the cell reads of its family it covers. They are shared by every participant of a cross-shard commit and by its retries (`Arc<Validate>`), not copied per participant. Reads are never logged: no WAL or format change.
+- **What conflicts with a cell read:** a later entry (seqno above the snapshot) of its column (a put, a merge operand or counter increment at any bucket, a cell delete, a column delete), or a later family marker of its row in its family (a family delete, or a row delete's marker, D10). A write to another qualifier, family or row doesn't.
+
+  | later write | cell read of `f:q1` | `get_row` of `f` | `get_row` of the row |
+  |---|:-:|:-:|:-:|
+  | put, merge or increment, cell or column delete of `f:q1` | conflict | conflict | conflict |
+  | the same of `f:q2` | **no** | conflict | conflict |
+  | family delete of `f`, or row delete | conflict | conflict | conflict |
+  | any write to family `g` of the row | no | no | conflict |
+  | any write to another row | no | no | no |
+
+- **The walk** (`ShardState::cell_conflicts`). Seek keys are built with the format's encoders (`encode_marker_prefix`, `encode_column_prefix`), so the escaping keeps `q`, `q\0x` and the empty qualifier apart, and the marker prefix (`00 00`) matches no qualifier.
+  - **Every marker version of the row** is read, whatever the memtable's `explicit_ts` flag: a family or row delete may carry an explicit timestamp, so the row's markers need not follow seqno order, and there are few of them (perf287's P1).
+  - **The column:** its first version only where D273's order holds; all of its versions (and only its) where the memtable's flag is set. That is exact for a cell read: nothing outside the column and the markers changes it.
+  - **SSTs** holding anything above the snapshot are probed with the point read's filters first (`Probe::admits`): the column filter is keyed per column (row and qualifier), and every SST holding a marker adds the row's marker prefix to it, so a miss on both rules the SST out; the row filter is used only as a row filter (P3). An admitted SST is read over the markers and the column, every version (SSTs have no flag).
+  - **Family reads** walk the family's row as before (D273's per-column step).
+- **The group cut** (`conflicts_with_group`). A conditional member waits for the next group when an earlier member of its group wrote what it read. For a cell read, that is an earlier **single** that wrote the cell: `writes_cell` counts every mutation of the column (put, merge or increment, cell delete, column delete) and any family marker of the family (a row delete arrives expanded into markers) (P4). A PREPARE share admitted earlier in the group is undecided and left to the overlap sets (its rows are in `pending_rows`) (P5). Family reads keep the row rule.
+- **Unchanged:**
+  - **the cross-shard overlap sets** (`overlaps_undecided`, `pending_reads`, `pending_rows`, `held_rows`, D249/D263/D271's refusals and waits) stay keyed by row. They order commits and never report `Conflict`, so row granularity costs latency only, and M1's refusal (#886) relies on them being a superset;
+  - **not validated, as before:** a family's TTL or option change, and a cell expiring by TTL between the read and the commit. These are catalog and time effects, not writes.
+- **The read set** is a sorted `Vec<ReadKey>` with owned row and qualifier bytes (the design's single-buffer form saves an allocation per read and was left out: it would touch every row-hash site for no measured gain).
+
+**Why:** D274's box run (#708, comment 6355660465): the transactional ycsb-f row at Buffered was 2.37× behind RocksDB's `OptimisticTransactionDB` (p99 18×), with about 180× its conflicts. A ycsb row has 10 fields and each read-modify-write touches one; under (row, family) validation, writes to other fields of a hot row conflicted. RocksDB validates per key.
+
+**Measured:** _the box A/B (ycsb-f and transfer, Buffered and default, against `OptimisticTransactionDB`) is recorded here once run._
+
+**Tests:**
+- **`tests/tablets.rs`:**
+  - `d275_conflict_matrix_on_one_shard`, `d275_conflict_matrix_on_a_participant`: the matrix (three reads × eleven later writes, the delete kinds included), with the write in a memtable and in an SST; the second validates on a shard that doesn't coordinate.
+  - `a_cell_read_on_a_wide_row_visits_its_column_only`: a 2,000-column row validates in at most 3 entries.
+  - `cell_reads_keep_escaped_and_empty_qualifiers_apart` (P2).
+  - `an_explicit_older_family_delete_behind_newer_markers_conflicts` (P1).
+  - `a_counter_cell_read_conflicts_only_with_its_own_increments`: increments and bucket increments of the read counter conflict, of another counter of the row don't.
+- **`tests/conditional_groups.rs`:** a transaction reading another cell of a row the group wrote joins the group (one sync); after an earlier put, cell delete, column delete, family delete or row delete of the read cell, or an increment of the read counter, it waits and conflicts; a `get_row` reader waits for any write to the row.
+- **`pigeonhole/tests/serializability.rs`:** the history check's keys are now two cells to a row.
+- **Mutations:** each fails a test: no marker check (the matrix, P1's test, the group conflict); the first marker only (P1's test); a row-level group cut (the two join-the-group tests); a cell read validated as its family (the matrix, the escaping and counter tests); SSTs skipped (the flushed half of the matrix); no column check (the serializability history).
 
 <a id="d276"></a>
 ## D276 — A commit refused over an overlap fails at once when the share it overlapped commits a write to a row it read (owner decision, 2026-10-23; engine, pigeonhole, #708 candidate 2, ICR 0066; builds on D249, D263)

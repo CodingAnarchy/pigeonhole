@@ -19,7 +19,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 10. [The `phdb` command-line tool](cli.md): inspect a database from the shell; how it opens a database, its output formats (stable JSON for programs) and exit statuses. In progress on `main`.
 11. [Arrow export](arrow.md): a scan as Arrow record batches (`pigeonhole-arrow`) for DuckDB, Polars and other Arrow readers; the schema, options and cost. In progress on `main`.
 12. [Reader processes](readers.md): one writer and many reader processes on a host: what readers see, crashes and restarts on either side, long-held snapshots, the limits and the requirements.
-13. [Transactions](transactions.md): optimistic multi-row transactions: `transact` and retries, what is read and what conflicts ((row, family) granularity), the isolation level and anomalies, read-only transactions, the cost model.
+13. [Transactions](transactions.md): optimistic multi-row transactions: `transact` and retries, what is read and what conflicts (per cell for `get`, per family for `get_row`), the isolation level and anomalies, read-only transactions, the cost model.
 
 Multi-process readers have their own page, [Reader processes](readers.md); [Concepts](concepts.md#multi-process-readers-phase-4-available-now) has the overview.
 

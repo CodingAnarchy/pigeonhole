@@ -44,9 +44,9 @@ Both read at the transaction's snapshot, and every read is recorded.
 
 **Writes:** every `RowMutation` operation is available, with the table and row first: `put`, `put_at`, `put_i64`, `put_f64`, `incr`, `merge`, `delete_cell`, `delete_column`, `delete_family` and `delete_row`. They're buffered, and invisible to the transaction's own reads.
 
-**Reads are tracked per (row, family), not per cell** (D272). A commit that changes *any* column of a family a transaction read in that row makes the transaction conflict, even a column it didn't read:
-- reading `alice/acct:balance` conflicts with a concurrent write to `alice/acct:nickname`, but not with one to `alice/profile:nickname`;
-- put columns that change independently and are read in transactions in different families.
+**What conflicts depends on how you read** (D275):
+- **`get` is tracked per cell.** The transaction conflicts with a commit that writes that cell (a put, `incr`, `merge`, `delete_cell` or `delete_column` of it) or deletes its family or row. Reading `alice/acct:balance` doesn't conflict with a concurrent write to `alice/acct:nickname`.
+- **`get_row` is tracked per family it read.** A commit that changes *any* column of those families in that row makes the transaction conflict, even a column it didn't use. Prefer `get` when a transaction depends on only a few columns.
 
 **A row or cell that wasn't there counts as read too:** a commit that creates it makes the transaction conflict.
 
@@ -68,7 +68,7 @@ Transactions are **serializable over what they read with `get` and `get_row`**: 
 
 ## What a transaction costs
 
-- **Reads cost the same as outside a transaction,** plus one read-set entry per (row, family).
+- **Reads cost the same as outside a transaction,** plus one read-set entry per cell (`get`) or per family (`get_row`).
 - **A transaction whose reads and writes all fall on one shard** commits like a single commit: one log record, no two-phase commit.
 - **One that spans shards** commits with two-phase commit: a PREPARE on each shard involved, including shards it only read from, then a decision. It costs about two commits' latency, and more at `Sync`.
 - **Conflicts cost a full retry.** `EngineMetrics::transactions`, `transaction_conflicts` and `transaction_retries` show the conflict rate and what retries cost. On a few hot rows, a high conflict rate means the work is serializing on them: split the hot rows, or use a counter family (`incr` is a blind write and doesn't conflict unless you also read the cell).

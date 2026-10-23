@@ -1073,7 +1073,9 @@ impl Transaction {
         result
     }
 
-    /// Reads a cell at the transaction's snapshot and records the read.
+    /// Reads a cell at the transaction's snapshot and records the read: a commit that writes
+    /// this cell, or deletes its family or row, makes the transaction conflict; one that writes
+    /// another cell of the row doesn't (D275).
     pub fn get(
         &mut self,
         table: &Table,

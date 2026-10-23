@@ -968,12 +968,34 @@ impl Future for PendingCheck {
     }
 }
 
-/// One `(table, row, family)` a transaction read; validated at commit.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// One read a transaction recorded; validated at commit (D275). `qualifier` names the one
+/// cell a `get` read: only a later write that could change that cell (a write of its column,
+/// or a delete of its family or row) conflicts with it. `None` is a read of the whole
+/// `(row, family)` (`get_row`): any later write to it conflicts.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct ReadKey {
     pub table: TableId,
     pub row: Vec<u8>,
     pub family: FamilyId,
+    pub qualifier: Option<Vec<u8>>,
+}
+
+impl ReadKey {
+    /// Whether this read covers `other`: the same, or the whole family `other` reads a cell of.
+    fn covers(&self, other: &ReadKey) -> bool {
+        self.table == other.table
+            && self.family == other.family
+            && self.row == other.row
+            && (self.qualifier.is_none() || self.qualifier == other.qualifier)
+    }
+}
+
+/// Records `key`, unless it repeats the previous read (a cheap check; the rest of the
+/// duplicates go at commit, `Validate::new`).
+fn record_read(reads: &mut Vec<ReadKey>, key: ReadKey) {
+    if reads.last() != Some(&key) {
+        reads.push(key);
+    }
 }
 
 /// A transaction's validation data, carried by its commit: the snapshot's seqno and the
@@ -982,7 +1004,8 @@ pub(crate) struct ReadKey {
 /// it hides) before validation looks for it (#672). The commit owns it until the commit
 /// resolves, fails or is dropped, retries included. Only the seqno pin: the snapshot's view
 /// would also hold every shard's memtables and extents, and an async commit waiting for
-/// arena room could then wait on room its own pin holds. Boxed: commits without one move a
+/// arena room could then wait on room its own pin holds. Shared: a cross-shard commit's
+/// participants and its retries all validate the one copy (D275); commits without one move a
 /// pointer-sized `None`.
 #[derive(Debug, Clone)]
 pub(crate) struct Validate {
@@ -994,9 +1017,13 @@ pub(crate) struct Validate {
 }
 
 impl Validate {
-    /// Takes the snapshot's seqno pin and drops the rest of it (its view).
-    pub(crate) fn boxed(snapshot: Snapshot, reads: Vec<ReadKey>) -> Box<Self> {
-        Box::new(Self {
+    /// Takes the snapshot's seqno pin and drops the rest of it (its view). The reads are
+    /// sorted and deduplicated: a family read sorts before the cell reads of its family
+    /// (`None` first) and drops them, since it covers them.
+    pub(crate) fn new(snapshot: Snapshot, mut reads: Vec<ReadKey>) -> Arc<Self> {
+        reads.sort_unstable();
+        reads.dedup_by(|later, kept| kept.covers(later));
+        Arc::new(Self {
             seqno: snapshot.seqno,
             reads,
             _pin: snapshot._pin.clone(),
@@ -1004,8 +1031,8 @@ impl Validate {
     }
 }
 
-/// An optimistic multi-row transaction (Phase 4). Reads record the `(row, family)` ranges
-/// they touch; at commit, each participant shard checks its tablets for conflicting commits
+/// An optimistic multi-row transaction (Phase 4). Reads record the cells (`get`) or the
+/// `(row, family)` ranges (`get_row`) they touch (D275); at commit, each participant shard checks its tablets for conflicting commits
 /// since the snapshot during PREPARE, and any conflict aborts with `Error::Conflict`.
 #[derive(Debug)]
 pub struct Txn {
@@ -1029,14 +1056,15 @@ impl Txn {
         row: &[u8],
         qualifier: &[u8],
     ) -> crate::Result<Option<CellData>> {
-        let key = ReadKey {
-            table,
-            row: row.to_vec(),
-            family,
-        };
-        if !self.reads.contains(&key) {
-            self.reads.push(key);
-        }
+        record_read(
+            &mut self.reads,
+            ReadKey {
+                table,
+                row: row.to_vec(),
+                family,
+                qualifier: Some(qualifier.to_vec()),
+            },
+        );
         self.engine
             .get(&self.snapshot, table, family, row, qualifier)
     }
@@ -1056,14 +1084,15 @@ impl Txn {
     ) -> crate::Result<bool> {
         let families = crate::engine::families_in_order(&self.snapshot.view, table, families)?;
         for &family in &families {
-            let key = ReadKey {
-                table,
-                row: row.to_vec(),
-                family,
-            };
-            if !self.reads.contains(&key) {
-                self.reads.push(key);
-            }
+            record_read(
+                &mut self.reads,
+                ReadKey {
+                    table,
+                    row: row.to_vec(),
+                    family,
+                    qualifier: None,
+                },
+            );
         }
         let now = self.engine.shared.vfs.now_micros();
         self.snapshot.checked(crate::read::read_row_into(
@@ -1089,14 +1118,15 @@ impl Txn {
         row: &[u8],
         qualifier: &[u8],
     ) -> crate::GetFuture {
-        let key = ReadKey {
-            table,
-            row: row.to_vec(),
-            family,
-        };
-        if !self.reads.contains(&key) {
-            self.reads.push(key);
-        }
+        record_read(
+            &mut self.reads,
+            ReadKey {
+                table,
+                row: row.to_vec(),
+                family,
+                qualifier: Some(qualifier.to_vec()),
+            },
+        );
         crate::GetFuture::new(
             Arc::clone(&self.engine),
             Some(self.snapshot.clone()),
@@ -1156,7 +1186,7 @@ impl Txn {
                     reads,
                     batch,
                 } = self;
-                let validate = Validate::boxed(snapshot, reads);
+                let validate = Validate::new(snapshot, reads);
                 return Ok(PendingCommit::waiting(
                     shared,
                     admit,
@@ -1195,7 +1225,7 @@ impl Txn {
         engine.submit(
             batch,
             durability,
-            Some(Validate::boxed(snapshot, reads)),
+            Some(Validate::new(snapshot, reads)),
             None,
         )
     }
@@ -1218,7 +1248,7 @@ impl Txn {
             .submit(
                 batch,
                 durability,
-                Some(Validate::boxed(snapshot, reads)),
+                Some(Validate::new(snapshot, reads)),
                 None,
             )?
             .wait()
