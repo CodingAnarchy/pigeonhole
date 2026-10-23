@@ -50,6 +50,8 @@ pub use runners::placement::{PLACEMENT_RATE_PER_SHARD, PLACEMENT_SETTLE_BOUND, P
 pub use runners::reader_process::{EXE_ENV as READER_EXE_ENV, child as reader_child};
 #[cfg(feature = "rocksdb")]
 pub use runners::rocksdb::RocksDbRunner;
+#[cfg(feature = "rocksdb")]
+pub use runners::rocksdb_txn::{RocksDbTxnRunner, TxnMode};
 #[cfg(feature = "sqlite")]
 pub use runners::sqlite::SqliteRunner;
 pub use runners::{BLOOM_BITS, MemoryBudget};
@@ -104,8 +106,10 @@ pub enum WorkloadKind {
     /// Transfers (D247, reported): from [`COUNTER_THREADS`] clients, each operation moves one
     /// unit between two Zipfian accounts in one transaction that reads both
     /// ([`BenchOp::Transfer`]). Pigeonhole runs an optimistic `Transaction`, retried on a
-    /// conflict (counted, [`RunDetail::txn_conflicts`]); RocksDB and fjall lock both rows,
-    /// SQLite uses an immediate transaction. Not in `all`.
+    /// conflict (counted, [`RunDetail::txn_conflicts`]); RocksDB runs an
+    /// `OptimisticTransactionDB` transaction (or `TransactionDB`'s, as `rocksdb-txn`) and fjall
+    /// an optimistic write transaction, each retried on a conflict (D274); SQLite uses an
+    /// immediate transaction. Not in `all`.
     Transfer,
     /// Sparse-wide with deletes (D247, reported): [`WorkloadKind::SparseWide`]'s mix with 5% of
     /// the operations deleting, half a column ([`BenchOp::DeleteColumn`]) and half a whole row

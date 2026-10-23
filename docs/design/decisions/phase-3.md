@@ -2389,3 +2389,26 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - `a_counter_increment_after_the_snapshot_conflicts`: a counter family's `put_i64`, then an increment after a transaction's snapshot, conflicts. Every such write carries D186's fixed timestamp, so the versions tie on timestamp and follow seqno order; this passes with or without the fallback.
 - `a_counter_bucket_increment_behind_a_newer_bucket_still_conflicts`: a bucket increment (`merge_at`) into an older bucket after the snapshot sits behind a newer bucket with a lower seqno, and still conflicts. It fails without the fallback.
 - **Mutations:** ignoring the flag fails the second and third tests; walking always fails the first.
+
+<a id="d274"></a>
+## D274 — Transactional rows are judged against the other engine's own optimistic transactions; the bench-side row locks go (owner decision, 2026-10-22; bench, gate, #708; amends D247)
+
+**Decided:**
+- **Every store runs the transactional workloads with its own transaction API.** That covers transfer and ycsb-f's read-modify-write, plus fjall's counter increments and row deletes. Nothing is wrapped in a bench-side lock: D247's striped `RowLocks` and its mutex rows are removed, since every former mutex row has a native counterpart.
+  - **RocksDB, `rocksdb` (the judged baseline):** `OptimisticTransactionDB`. A transaction reads with `get_for_update` (validated at commit) and writes, and a commit that finds a conflicting write fails with `Busy` and runs again, as Pigeonhole's optimistic transactions do. For transfer and ycsb-f the `rocksdb` engine runs on it (`RocksDbTxnRunner`); every other workload keeps the plain `DB`, so their baselines don't move.
+  - **RocksDB, `rocksdb-txn` (reported):** the pessimistic `TransactionDB`. `get_for_update` takes the row's lock until the commit (the default lock timeout), a transfer locks its two accounts in key order, and `Busy` or `TimedOut` runs it again.
+  - **fjall:** its `OptimisticTxDatabase`, a write transaction retried on `Conflict`: transfer, read-modify-write, counter increments (fjall has no merge operator) and row deletes.
+  - **Unchanged:** RocksDB's counters (a merge operator) and row deletes (a range delete) were already native; SQLite runs immediate transactions.
+  - Every store counts its retries (`txn_conflicts`).
+- **Targets** (owner, 2026-10-22), at 16 clients in the gate's `contended` step, Buffered and default durability:
+  - **Judged, against RocksDB `OptimisticTransactionDB`:** a **hard floor of 1.2×**: RocksDB's throughput over Pigeonhole's is at most 1.2. The **goal is 1.0×**, Pigeonhole at least level; it's reported as met or not, but not judged. This applies to transfer (judged from now on; D247 reported it) and to ycsb-f. ycsb-f's SQLite comparison keeps D247's 1.5×.
+  - **Tracked, not judged, against RocksDB `TransactionDB`:** within **2.5×**. If the pessimistic row is more than 2× from the optimistic one, the report flags it and the owner decides.
+- **report.py** judges these rows as above. **run-window.sh** runs transfer among the judged workloads, and adds `rocksdb-txn` to transfer and ycsb-f.
+
+**Why:** #708. D247's RocksDB row was a plain `DB` behind a bench-side 1,024-stripe mutex held from the reads to the write: no retries, and not RocksDB's transaction API. Comparing Pigeonhole's optimistic transactions against it measured something no RocksDB user would deploy. The owner wanted the comparison API to API, with the optimistic one as the bar.
+
+**Tests** (`runners/mod.rs`):
+- `rocksdb_transactions_lose_no_update`: 8 clients × 100 read-modify-writes of one cell, both kinds, lose none.
+- `rocksdb_transfers_keep_the_total`: transfers among 4 accounts from 8 clients keep the total, both kinds; the optimistic kind counts conflicts.
+- `rocksdb_transactions_read_what_pigeonhole_reads`: both kinds read exactly what Pigeonhole reads on transfer and ycsb-f.
+- `fjall_reads_what_pigeonhole_reads` and `fjall_runs_concurrent_rmw`: these now run on fjall's transactions.

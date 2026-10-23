@@ -462,12 +462,22 @@ else:
 # against the same type in each store (read-modify-write against read-modify-write, read
 # against read, and so on) is reported beside it, not judged.
 CONTENDED_LEVELS = [("buffered", "D108 parity, buffered"), ("default", "default durability, GroupSync")]
-# ycsb-f's read-modify-write is atomic in every runner (Pigeonhole: commit_if, retried on a
-# lost race; RocksDB and fjall: a row lock; SQLite: an immediate transaction).
+# ycsb-f's read-modify-write is atomic in every runner, each with its own API (D274): Pigeonhole
+# commit_if, retried on a lost race; RocksDB an OptimisticTransactionDB transaction; SQLite an
+# immediate transaction.
 # counters: Pigeonhole's counter family against RocksDB's merge operator and SQLite's upsert.
 CONTENDED_JUDGED = ["ycsb-a", "ycsb-b", "ycsb-c", "ycsb-e", "ycsb-f", "sparse-wide", "time-series-ttl", XSHARD,
                     "counters"]
 CONTENDED_AGAINST = ["rocksdb", "sqlite-eav"]
+# D274 (amending D247): the transactional rows are judged against the other engine's
+# optimistic transactions, RocksDB's OptimisticTransactionDB (the `rocksdb` store of these
+# runs), not the 1.5x above: a hard floor of 1.2x (RocksDB's throughput over Pigeonhole's) and
+# a goal of 1.0x (Pigeonhole at least level). RocksDB's pessimistic TransactionDB
+# (`rocksdb-txn`) is reported with a tracked target of within 2.5x. SQLite keeps the 1.5x.
+TXN_ROWS = ["ycsb-f", "transfer"]
+TXN_FLOOR = 1.2
+TXN_GOAL = 1.0
+TXN_PESSIMISTIC_TARGET = 2.5
 
 
 def contended(level, w):
@@ -479,6 +489,8 @@ def contended(level, w):
         return None
     vs = {}
     for store in CONTENDED_AGAINST:
+        if w in TXN_ROWS and store == "rocksdb":
+            continue  # judged by D274 below
         o = next(iter(results(name, store, w)), None)
         if o:
             vs[store] = (o["throughput"] / ph["throughput"], ph["p99_ns"] / max(o["p99_ns"], 1))
@@ -511,7 +523,8 @@ for level, _ in CONTENDED_LEVELS:
         c = contended(level, w)
         if c:
             ph, vs = c
-            ok = len(vs) == len(CONTENDED_AGAINST) and all(t <= 1.5 and l <= 1.5 for t, l in vs.values())
+            want = len(CONTENDED_AGAINST) - (1 if w in TXN_ROWS else 0)
+            ok = len(vs) == want and all(t <= 1.5 and l <= 1.5 for t, l in vs.values())
             cont[(level, w)] = (ph, vs, ok)
             cont_ops[(level, w)] = contended_ops(level, w, ph)
 for level, label in CONTENDED_LEVELS:
@@ -539,11 +552,49 @@ for level, label in CONTENDED_LEVELS:
     else:
         rows.append((xt, "", verdict(None), f"contended-{level}-{XSHARD}.json"))
 
+# D274: the transactional rows against RocksDB's own transactions, at each level. Judged:
+# RocksDB OptimisticTransactionDB over Pigeonhole throughput <= TXN_FLOOR (a hard floor), with
+# TXN_GOAL (1.0x) reported as met or not. Tracked (not judged): RocksDB TransactionDB within
+# TXN_PESSIMISTIC_TARGET; a pessimistic row more than 2x from the optimistic one is flagged for
+# the owner (D274).
+for level, label in CONTENDED_LEVELS:
+    for w in TXN_ROWS:
+        name = f"contended-{level}-{w}.json"
+        target = (f"{w}, 16 threads, {label} (D274): within {TXN_FLOOR}× of RocksDB OptimisticTransactionDB "
+                  f"(hard floor), goal {TXN_GOAL}×")
+        ph = next((r for r in results(name, "pigeonhole", w) if default_config(r)), None)
+        ot = next(iter(results(name, "rocksdb", w)), None)
+        pt = next(iter(results(name, "rocksdb-txn", w)), None)
+        if not ph or not ot:
+            rows.append((target, "", verdict(None), name))
+            continue
+        ratio = ot["throughput"] / ph["throughput"]
+        p99 = ph["p99_ns"] / max(ot["p99_ns"], 1)
+        goal = "goal met" if ratio <= TXN_GOAL else "goal not met"
+        rows.append((target,
+                     f"Pigeonhole {rate(ph['throughput'])} ops/s, OptimisticTransactionDB {rate(ot['throughput'])} ({ratio:.2f}×), "
+                     f"p99 {p99:.2f}×; {goal}",
+                     verdict(ratio <= TXN_FLOOR), name))
+        ptarget = (f"{w}, 16 threads, {label} (D274, tracked, not judged): within "
+                   f"{TXN_PESSIMISTIC_TARGET}× of RocksDB TransactionDB")
+        if not pt:
+            rows.append((ptarget, "", "-", name))
+            continue
+        pratio = pt["throughput"] / ph["throughput"]
+        flag = ""
+        if max(pt["throughput"], ot["throughput"]) > 2 * min(pt["throughput"], ot["throughput"]):
+            flag = (f"; **TransactionDB is more than 2× from OptimisticTransactionDB "
+                    f"({pt['throughput'] / ot['throughput']:.2f}×): owner decides (D274)**")
+        rows.append((ptarget,
+                     f"TransactionDB {rate(pt['throughput'])} ops/s ({pratio:.2f}×): "
+                     f"{'within' if pratio <= TXN_PESSIMISTIC_TARGET else 'outside'} target{flag}",
+                     "-", name))
+
 # The contended step's reported rows (D247): not judged, but a row more than 3x worse than its
 # nearest judged row gets an issue. "Worse" compares the stores' ratio: the reported row's
 # RocksDB/Pigeonhole throughput against its judged neighbour's at the same level.
 # (reported workload, nearest judged workload)
-CONTENDED_REPORTED = [("transfer", XSHARD), ("sparse-wide-deletes", "sparse-wide"),
+CONTENDED_REPORTED = [("sparse-wide-deletes", "sparse-wide"),
                       ("adjacency-prefix", "ycsb-e"), ("time-series-range", "time-series-ttl")]
 reported = []  # (level label, workload, pigeonhole run, {store: (tput, p99)}, flag)
 for level, label in CONTENDED_LEVELS:

@@ -62,7 +62,9 @@ WORKLOADS:
               the table, and once settled the busiest shard's share is judged
 
 OPTIONS:
-    --engine LIST          pigeonhole,rocksdb,sqlite,fjall or all [default: pigeonhole]
+    --engine LIST          pigeonhole,rocksdb,sqlite,fjall or all [default: pigeonhole];
+                           rocksdb-txn: RocksDB's pessimistic TransactionDB on transfer
+                           and ycsb-f, reported beside rocksdb's optimistic one (D274)
                            (comparison engines need the matching cargo feature)
     --scale smoke|small|full|larger-than-ram
                            preset sizes [default: small]; full is the spec's 1M rows;
@@ -357,6 +359,23 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
             let r = pigeonhole(a, None);
             Ok(Box::new(if group { r.group_sync(true) } else { r }))
         }
+        // D274: the transactional workloads run on RocksDB's own transactions, optimistic
+        // (`rocksdb`, the judged baseline) or pessimistic (`rocksdb-txn`, reported); every
+        // other workload on the plain `DB`.
+        #[cfg(feature = "rocksdb")]
+        "rocksdb" if matches!(kind, WorkloadKind::Transfer | WorkloadKind::YcsbF) => Ok(Box::new(
+            pigeonhole_bench::RocksDbTxnRunner::new(pigeonhole_bench::TxnMode::Optimistic)
+                .sync(a.sync)
+                .load_buffered(a.durability.is_some())
+                .memory(memory(a)),
+        )),
+        #[cfg(feature = "rocksdb")]
+        "rocksdb-txn" => Ok(Box::new(
+            pigeonhole_bench::RocksDbTxnRunner::new(pigeonhole_bench::TxnMode::Pessimistic)
+                .sync(a.sync)
+                .load_buffered(a.durability.is_some())
+                .memory(memory(a)),
+        )),
         #[cfg(feature = "rocksdb")]
         "rocksdb" => Ok(Box::new(
             pigeonhole_bench::RocksDbRunner::default()
@@ -365,7 +384,7 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
                 .memory(memory(a)),
         )),
         #[cfg(not(feature = "rocksdb"))]
-        "rocksdb" => missing("rocksdb"),
+        "rocksdb" | "rocksdb-txn" => missing("rocksdb"),
         #[cfg(feature = "sqlite")]
         "sqlite" | "sqlite-eav" => Ok(Box::new(
             pigeonhole_bench::SqliteRunner::default()

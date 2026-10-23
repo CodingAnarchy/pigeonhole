@@ -19,11 +19,10 @@ use rocksdb::{
 };
 
 use super::{
-    BLOOM_BITS, Counted, MemoryBudget, RowLocks, Touched, durability, encode_value, family_id,
-    keys, live_value, modified, now_micros, read_family, scan_rows, scan_rows_filtered,
-    transfer_balances,
+    BLOOM_BITS, Counted, MemoryBudget, Touched, durability, encode_value, family_id, keys,
+    live_value, now_micros, read_family, scan_rows, scan_rows_filtered,
 };
-use crate::workload::{METRIC_FAMILY, TIME_SERIES_TTL, YCSB_FAMILY};
+use crate::workload::{METRIC_FAMILY, TIME_SERIES_TTL};
 
 /// The column family of [`METRIC_FAMILY`].
 const METRIC_CF: &str = "metric";
@@ -63,8 +62,6 @@ pub struct RocksDbRunner {
     db: Option<Arc<DB>>,
     /// Whether a `metric` cell was written: scans then merge both column families.
     metric_written: Arc<AtomicBool>,
-    /// Row locks for an atomic read-modify-write across clients.
-    locks: Arc<RowLocks>,
 }
 
 impl std::fmt::Debug for RocksDbRunner {
@@ -103,7 +100,6 @@ struct Handle {
     db: Arc<DB>,
     write: WriteOptions,
     metric_written: Arc<AtomicBool>,
-    locks: Arc<RowLocks>,
 }
 
 impl RocksDbRunner {
@@ -114,7 +110,6 @@ impl RocksDbRunner {
             db: Arc::clone(db),
             write,
             metric_written: Arc::clone(&self.metric_written),
-            locks: Arc::clone(&self.locks),
         }
     }
 }
@@ -353,33 +348,12 @@ impl Handle {
                 }
                 self.db.write_opt(batch, &self.write).map_err(e)?;
             }
-            BenchOp::Transfer { from, to, amount } => {
-                // Both rows locked from the reads to the batch (D247).
-                let f = family_id(YCSB_FAMILY)?;
-                let (ka, kb) = (keys::cell(from, f, b"bal"), keys::cell(to, f, b"bal"));
-                let _held = self.locks.lock_two(&ka, &kb);
-                let now = now_micros();
-                let a = self.db.get_pinned(&ka).map_err(e)?;
-                let b = self.db.get_pinned(&kb).map_err(e)?;
-                let va = a
-                    .as_deref()
-                    .map(|v| live_value(f, v, now))
-                    .transpose()?
-                    .flatten();
-                let vb = b
-                    .as_deref()
-                    .map(|v| live_value(f, v, now))
-                    .transpose()?
-                    .flatten();
-                for v in [va, vb].into_iter().flatten() {
-                    t.cell(v);
-                }
-                let (na, nb) = transfer_balances(va, vb, *amount);
-                drop((a, b));
-                let mut batch = WriteBatch::default();
-                batch.put(ka, encode_value(now, &na.to_le_bytes()));
-                batch.put(kb, encode_value(now, &nb.to_le_bytes()));
-                self.db.write_opt(batch, &self.write).map_err(e)?;
+            BenchOp::Transfer { .. } | BenchOp::ReadModifyWrite { .. } => {
+                // D274: the transactional workloads run on RocksDB's own transactions
+                // (`RocksDbTxnRunner`); the plain `DB` has no atomic read-modify-write.
+                return Err(format!(
+                    "{op:?} runs on RocksDB's transactions (D274, RocksDbTxnRunner)"
+                ));
             }
             BenchOp::Incr { row, delta } => {
                 let cf = self.counter_cf()?;
@@ -438,23 +412,6 @@ impl Handle {
                         *time_range,
                     )?,
                 };
-            }
-            BenchOp::ReadModifyWrite { row, qualifier } => {
-                let key = keys::cell(row, family_id(YCSB_FAMILY)?, qualifier);
-                let f = family_id(YCSB_FAMILY)?;
-                // Atomic across clients: the read and the write under the row's lock.
-                let _held = self.locks.lock(&key);
-                let stored = self.db.get_pinned(&key).map_err(e)?;
-                let old = match &stored {
-                    Some(v) => live_value(f, v, now_micros())?,
-                    None => None,
-                };
-                if let Some(v) = old {
-                    t.cell(v);
-                }
-                let new = encode_value(now_micros(), &modified(old));
-                drop(stored);
-                self.db.put_opt(key, new, &self.write).map_err(e)?;
             }
         }
         Ok(t)
