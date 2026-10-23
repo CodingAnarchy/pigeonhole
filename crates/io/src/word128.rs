@@ -160,27 +160,33 @@ impl AtomicWord128 {
     #[inline]
     fn native(&self, current: u128, new: u128) -> Result<u128, u128> {
         let (mut lo, mut hi) = (current as u64, (current >> 64) as u64);
-        let ok: u8;
         // SAFETY: `word` is 16-byte aligned and valid for the word's life; this process
-        // detected `cmpxchg16b` (`path`), and every access on this path is atomic. `rbx`,
-        // which LLVM reserves, is swapped in for the new low half and restored after.
+        // detected `cmpxchg16b` (`path`), and every access on this path is atomic.
+        // `cmpxchg16b` takes the new low half in `rbx`, which can't be named as an operand,
+        // so it is swapped in from `rsi` and restored after. Every operand is a named
+        // register: a `reg` operand may be allocated `rbx` itself (it was, for the pointer,
+        // and the swap then clobbered the address: #933's SIGSEGV on CI).
         unsafe {
             std::arch::asm!(
-                "xchg {t}, rbx",
-                "lock cmpxchg16b xmmword ptr [{p}]",
-                "sete {ok}",
-                "mov rbx, {t}",
-                p = in(reg) self.word.0.get(),
-                t = inout(reg) new as u64 => _,
-                ok = out(reg_byte) ok,
+                "xchg rsi, rbx",
+                "lock cmpxchg16b xmmword ptr [rdi]",
+                "mov rbx, rsi",
+                in("rdi") self.word.0.get(),
+                inout("rsi") new as u64 => _,
                 inout("rax") lo,
                 inout("rdx") hi,
                 in("rcx") (new >> 64) as u64,
                 options(nostack),
             );
         }
+        // `rdx:rax` holds the word's previous value either way, and the exchange stored only
+        // if that equalled `current`.
         let held = (u128::from(hi) << 64) | u128::from(lo);
-        if ok != 0 { Ok(current) } else { Err(held) }
+        if held == current {
+            Ok(current)
+        } else {
+            Err(held)
+        }
     }
 
     #[cfg(all(
