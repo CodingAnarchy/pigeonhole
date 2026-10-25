@@ -2,7 +2,7 @@
 
 Every on-disk and shared-memory byte layout. Written during the interface freeze (build step 2). The executable form is the `pigeonhole-format` crate; where this file and the crate disagree, this file wins and the crate has a bug.
 
-Format version **4**, shared-memory layout version **3**. Format 4 is the format every 1.x build reads and writes (D269): later 1.x features use the feature bits and reserved room described here, never a new version. §13 states the compatibility promise, which takes effect with 1.0.0. The shared-memory layout (§11) is outside it.
+Format version **4**, shared-memory layout version **4**. Format 4 is the format every 1.x build reads and writes (D269): later 1.x features use the feature bits and reserved room described here, never a new version. §13 states the compatibility promise, which takes effect with 1.0.0. The shared-memory layout (§11) is outside it.
 
 ## 1. Conventions
 
@@ -25,7 +25,7 @@ Format version **4**, shared-memory layout version **3**. Format 4 is the format
 | Shared-memory directory | `PHDBSHMD` | offset 0 of the directory region |
 | Memtable header | `MEMT` (u32 `0x544D454D`) | offset 0 of each memtable header |
 
-- **Versions.** `FormatVersion` (u32, currently 4; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 3) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
+- **Versions.** `FormatVersion` (u32, currently 4; see §12) is stored in the superblock, every manifest block, every SST footer, every blob extent header and every WAL segment header. `ShmLayoutVersion` (u32, currently 4) is stored in the shared-memory header and must match exactly. Blocks, filters and WAL records carry kind/tag bytes whose numbering is frozen; new kinds take new numbers.
 
 ## 2. Internal key
 
@@ -502,8 +502,8 @@ Memtable header (64 bytes, at the `root` offset named in the view):
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | magic `MEMT` |
-| 4 | 2 | `version` u16 (1) |
-| 6 | 1 | `flags` u8: bit 0 frozen |
+| 4 | 2 | `version` u16 (2) |
+| 6 | 1 | `flags` u8: bit 0 frozen; bit 1 the writer records stale tails in this memtable's nodes (D277) |
 | 7 | 1 | reserved |
 | 8 | 4 | `head` u32: head node (height 16) |
 | 12 | 4 | `count` u32, atomic |
@@ -520,16 +520,18 @@ Skiplist node (4-byte aligned; maximum height 16):
 | 4 | 4 | `value_len` u32 |
 | 8 | 1 | `height` u8 |
 | 9 | 3 | reserved |
-| 12 | 4 x height | `next[i]` u32, atomic |
-| 12 + 4 x height | `key_len` | internal key (§2) |
+| 12 | 4 | `tail` u32: a later node of the same column, or 0 (D194, D277) |
+| 16 | 4 x height | `next[i]` u32, atomic |
+| 16 + 4 x height | `key_len` | internal key (§2) |
 | ... | `value_len` | stored value (§3) |
 
-The writer fully writes a node, then links it bottom-up with Release stores to each predecessor's `next[i]`; readers load `next[i]` with Acquire. Nodes are never modified after linking and never freed while any view listing their memtable is pinned.
+The writer fully writes a node, then links it bottom-up with Release stores to each predecessor's `next[i]`; readers load `next[i]` with Acquire. `tail` is written with the rest of the node, before the links (0 when it has none, also when the writer records no tails), and names a node linked before this one, so a reader that acquired this node's link sees the tail's target fully written too. A reader follows a tail only after its column is finished (D194), validates it as a node whose key is in that column, and treats anything else as corruption. Nodes are never modified after linking and never freed while any view listing their memtable is pinned.
 
 ## 12. Evolution
 
 - A reader rejects a `FormatVersion` above what it supports and refuses a `ShmLayoutVersion` that differs at all.
 - **Version 4** is the format 1.x is frozen at (D269). It reserves room to grow without a version bump: feature bits in the superblock (§8.2: compat, ro_compat, incompat), in the SST footer's `flags` (§5.1) and in the WAL segment header, which grows to 128 bytes (§10.2); the superblock's extension area; and the manifest's must-understand and skippable tag ranges (§9.3). Feature data follows §8.2's rules for compat features. Nothing else changes, and no bit is defined, so the upgrade from version 3 is the same as from version 2: a writable open commits the root twice, both pages carry version 4 before any WAL write, and new WAL segments get the 128-byte header while the older segments keep theirs until their slots are reused. A version 3 build (never released: main between 0.3.0 and format 4) or an older one refuses the file (`UnsupportedFormat(4)`). This build still reads versions 1 to 3.
+- **Shared-memory layout version 4** gives every memtable node a `tail` field at offset 12 (the node header grows from 12 to 16 bytes, so the tower moves to offset 16) and raises the memtable header's `version` to 2, with flag bit 1 (D277). The writer stores there the stale tail D194 computes at insert: a later node of the same column, when the node was linked in front of an older version of its column. Reader processes then pass a finished column's superseded versions in one jump, as the writer does. The field is written on every insert, before the node is linked, so a reused chunk never shows an earlier memtable's tail; a reader validates a tail as a node in the same column before following it, and reports `Corrupt` otherwise. A version 3 process would misread every node's tower and key, so writer and readers must run the same build: a version 3 reader refuses a version 4 region, and a version 4 writer rebuilds a version 3 region left behind once no other process has the database open.
 - **Shared-memory layout version 3** judges reader liveness by each slot's lock byte (§8.3, §11.5, #693) instead of `pid` and `start_time`. The region's bytes are unchanged, but a version 2 reader holds no slot lock, so a version 3 writer would free its slot at once; hence the bump, and a version 2 process cannot attach to a version 3 region, nor the reverse.
 - **Shared-memory layout version 2** adds each shard's `durable` watermark (§11.2, D227). A version 1 process cannot attach to a version 2 region, nor the reverse, so writer and reader processes must run builds with the same layout.
 - **Version 3** adds the WAL's Decision record (§10.3, D263, ICR 0046). A version 2 build (0.2.x, 0.3.x) would fail on it as corruption, and would skip a version 3 segment header as torn, dropping every record from there on. So a writable open of an older file first commits its current root twice (`OpenedPager::finish`), and both superblock pages carry version 3 before this build writes any WAL record; a version 2 build then refuses the file (`UnsupportedFormat(3)`) instead of falling back to the page it can still decode. A crash between the two commits leaves one older page naming the same root, and the next writable open finishes the upgrade. This build still reads version 1 and 2 files and replays their Commit records.

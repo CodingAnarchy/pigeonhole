@@ -109,8 +109,10 @@ mod imp {
             // page-aligned, and `ArenaRegion::new` requires a 64-aligned offset), node
             // offsets are multiples of 4 (nodes start 4-aligned and sizes round up to 4),
             // header roots are multiples of 64 (chunk starts and the 64-byte reserved
-            // prefix), and the fields read here sit at 4-aligned offsets inside them;
-            // readers reject any other offset before reaching here. Lives as long as
+            // prefix), and the fields read here sit at 4-aligned offsets inside them (a
+            // node's `key_len`, `value_len`, stale `tail` (D277) and tower links); readers
+            // reject any other offset before reaching here, a stale tail included (it is
+            // validated as a node before its link is loaded). Lives as long as
             // `self`; only ever accessed atomically while shared.
             unsafe { AtomicU32::from_ptr(p) }
         }
@@ -152,7 +154,6 @@ mod imp {
             self.atomic_u64(off).store(v, ord);
         }
 
-        #[cfg(test)]
         pub(crate) fn load_u8(&self, off: usize, ord: Ordering) -> u8 {
             self.atomic_u8(off).load(ord)
         }

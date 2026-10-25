@@ -539,9 +539,9 @@ pub mod memtable {
     pub const HEADER_LEN: usize = 64;
     /// Header: `u32` [`MEMTABLE_MAGIC`](crate::version::MEMTABLE_MAGIC).
     pub const H_MAGIC: usize = 0;
-    /// Header: `u16` layout version (1).
+    /// Header: `u16` layout version (2: nodes carry a stale-tail offset, D277).
     pub const H_VERSION: usize = 4;
-    /// Header: `u8` flags (bit 0: frozen).
+    /// Header: `u8` flags (bit 0: frozen; bit 1: the writer records stale tails, D277).
     pub const H_FLAGS: usize = 6;
     /// Header: `u32` offset of the head node (height [`MAX_HEIGHT`]).
     pub const H_HEAD: usize = 8;
@@ -559,9 +559,12 @@ pub mod memtable {
     pub const N_VALUE_LEN: usize = 4;
     /// Node: `u8` height.
     pub const N_HEIGHT: usize = 8;
+    /// Node: `u32` stale-tail offset (D194, D277): a later node of the same column, or 0.
+    /// Written once, before the node is linked.
+    pub const N_TAIL: usize = 12;
     /// Node: tower of `height` atomic `u32` next offsets, starting here; key bytes then value
     /// bytes follow the tower. Nodes are 4-byte aligned.
-    pub const N_TOWER: usize = 12;
+    pub const N_TOWER: usize = 16;
 }
 
 #[cfg(test)]

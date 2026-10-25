@@ -3,7 +3,7 @@
 Indexed in [README.md](README.md). Numbers are permanent and continue from Phase 2; code and docs cite them as `Dn`.
 
 <a id="d194"></a>
-## D194 — Reads skip superseded memtable versions through a writer-only, process-local stale-tail index (approved; owner decision, 2026-10-09; memtable, engine, compaction, #387; alternative deferred as #397)
+## D194 — Reads skip superseded memtable versions through a writer-only, process-local stale-tail index (approved; owner decision, 2026-10-09; memtable, engine, compaction, #387; alternative deferred as #397; refined by D277: the tail now lives in the shared node, and reader processes skip too)
 **Owner decisions.**
 1. A writer-only acceleration structure is acceptable. Reader processes have no index: they read the same data with the same results, at today's cost.
 2. The alternative, a skip offset stored in the shared-memory node, is not taken now. It would serve reader processes too, but needs FORMAT and `ShmLayoutVersion` changes, and since nodes are written once it could only point backward. It is kept open as #397 (Phase 4), to revisit before 1.0 only if reader-process latency matters.
@@ -2494,3 +2494,28 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 **Tests** (`tests/tablets.rs`):
 - `a_refused_cross_shard_transaction_whose_read_goes_stale_fails_without_another_round`: B is refused over A's undecided share, and A commits a write to the family B read. B fails with `Conflict` after one round (`failed_fast` 1, two rounds in all). Without `doom_overlaps` it takes three rounds.
 - `a_refused_cross_shard_transaction_is_not_failed_for_a_write_to_a_family_it_did_not_read`: the same overlap with A writing a family B did not read. B retries and commits.
+
+<a id="d277"></a>
+## D277 — The stale tail lives in the shared memtable node, so reader processes skip superseded versions too (owner decision, 2026-10-23; memtable, shm, engine, #930, #397; refines D194)
+
+**Decided:** option (a) of #930. The writer stores the stale tail D194 computes at insert in the shared skiplist node, so reader processes jump past a finished column's superseded versions exactly as the writer does. #397, deferred on a wrong attribution of #930's profile, is undeferred and fixed by the same change.
+
+**Why:** a reader process's hot-row reads cost 15.1 µs against the writer's 4.7 µs (ycsb-a's 16 hottest rows, row cache off; CPU time per read in a Linux VM). With the writer's index off (`PIGEONHOLE_TAIL_INDEX=0`), the writer's own reads cost 14.0 µs. So the whole gap was D194's process-local index, which reader processes did not have. With no writes running, reader and writer read paths cost the same.
+
+**What changes:**
+- **Node layout (FORMAT §11.6):** the header grows from 12 to 16 bytes, with `tail` u32 at offset 12 (a later node of the same column, or 0), and the tower moves to offset 16. The 3 reserved bytes could not hold an offset (24 bits of 4-byte units reach only 64 MiB).
+- **Versions:** the memtable header's `version` goes 1 → 2, with flag bit 1 ("tails recorded", set by the writer before the memtable is published). `ShmLayoutVersion` goes 3 → 4. Writer and readers upgrade in lockstep: a version 3 process refuses a version 4 region, and a version 4 writer rebuilds a version 3 region once alone.
+- **One mechanism:** D194's `TailIndex` (a paged table in the writer's memory, an eighth of the arena) is removed. The writer reads tails from the arena too.
+- **Unconditional write (perf287's P2):** every insert writes `tail` (0 by default) before the node is linked, tails recorded or not, because chunks are reused without zeroing.
+
+**Publication:** no new protocol. `tail` is written before the node's Release links, and names the insert-time level-0 successor or that node's own tail, a node linked earlier. A reader that acquired the node's link therefore sees the tail and the target's header and links. A late tail write would be harmless too: the target is older, and the field is one word. So safety rests on P2 and on validation, not on the order.
+
+**Correctness for readers:** D194's seven conditions carry over unchanged, since readers use the same tail values. The only new reader-side condition is untrusted input. A tail read from shared memory is validated as a node (non-null, 4-aligned, header and key in bounds, height 1–16) before its link is loaded (perf287's M1), and must be in the column being skipped (P1). Anything else is `Corrupt`, never a fault or a silent skip.
+
+**Cost:** +4 arena bytes per node (about 3–4% of a ycsb node), against the writer's index of one `u32` per 32 arena bytes. Inserts write one more word; a jump reads the node's field instead of the index's directory and page. perf2 reads the callgrind shapes and the VM reader-vs-writer measurement on the PR.
+
+**Tests:**
+- `memtable` unit tests: a bad tail (past the arena, misaligned, inside the header, at a height-0 node, at another column, backward) is `Corrupt`; reused chunks never show an earlier memtable's tails, with tails recorded or not. These run under Miri too.
+- The loom test of a skip with a concurrent writer, on the node field.
+- `engine/tests/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
+- `shm/tests/sim.rs`: a layout 3 region (and a newer one) is refused while other processes are attached, and rebuilt when the new writer is alone.
