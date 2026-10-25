@@ -249,3 +249,96 @@ fn readers_see_consistent_prefixes(sorted_runs: Option<usize>) {
     assert_eq!(reader.len(), n);
     assert!(common::scan(&reader) == final_entries);
 }
+
+/// D277 (perf287's R1): readers jump by stale tails while the writer links newer versions
+/// of the columns they skip, so `record_tail` writes tails concurrently with readers that
+/// follow them. Every successful skip lands past the skipped column, and the columns a walk
+/// visits come in strictly increasing order. Under Miri this is the guard on publication: a
+/// tail written after the node's Release link is a data race on a published node.
+#[test]
+fn readers_skip_columns_while_the_writer_adds_versions() {
+    let (columns, versions, readers) = if cfg!(miri) {
+        (6u8, 5u64, 2)
+    } else {
+        (64u8, 60u64, 3)
+    };
+    let key = |q: u8, ts: u64| {
+        let mut k = Vec::new();
+        pigeonhole_format::encode_key(&mut k, b"row", &[q], ts, ts, pigeonhole_format::Kind::Put)
+            .unwrap();
+        k
+    };
+    fn column_of(k: &[u8]) -> Vec<u8> {
+        k[..k.len() - pigeonhole_format::key::SUFFIX_LEN].to_vec()
+    }
+    let mut arena = ShardArena::new(ArenaRegion::heap(4 << 20), 64 * 1024);
+    let mut mt = Memtable::create(&mut arena).unwrap().with_tail_index();
+    // A first version of every column, so readers have columns to skip from the start.
+    for q in 0..columns {
+        mt.insert(&mut arena, &key(q, 1), b"\x00v").unwrap();
+    }
+    let reader = mt.reader();
+    let done = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let done = Arc::clone(&done);
+        thread::spawn(move || {
+            // Newer versions, linked in front of each column's older ones: each records a
+            // stale tail.
+            for ts in 2..=versions {
+                for q in 0..columns {
+                    mt.insert(&mut arena, &key(q, ts), b"\x00v").unwrap();
+                }
+            }
+            done.store(true, Ordering::Release);
+            mt
+        })
+    };
+    let handles: Vec<_> = (0..readers)
+        .map(|_| {
+            let reader = reader.clone();
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                let mut skips = 0u64;
+                loop {
+                    let finished = done.load(Ordering::Acquire);
+                    let mut it = reader.iter();
+                    it.seek_to_first().unwrap();
+                    let mut last: Option<Vec<u8>> = None;
+                    while it.valid() {
+                        let column = column_of(it.key());
+                        if let Some(prev) = &last {
+                            assert!(
+                                column > *prev,
+                                "a walk revisited or went back over a column"
+                            );
+                        }
+                        // The newest version read: finish the column.
+                        if it.skip_column(&column).unwrap() {
+                            skips += 1;
+                            if it.valid() {
+                                assert!(
+                                    column_of(it.key()) > column,
+                                    "a skip landed inside or before the skipped column"
+                                );
+                            }
+                        } else {
+                            // No tail here (yet): step past the column's versions.
+                            while it.valid() && column_of(it.key()) == column {
+                                it.next().unwrap();
+                            }
+                        }
+                        last = Some(column);
+                    }
+                    if finished {
+                        break;
+                    }
+                }
+                skips
+            })
+        })
+        .collect();
+    let mt = writer.join().unwrap();
+    let skips: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    assert_eq!(mt.len(), columns as usize * versions as usize);
+    assert!(skips > 0, "no reader ever jumped by a stale tail");
+}
