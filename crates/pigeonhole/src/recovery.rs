@@ -175,6 +175,11 @@ pub(crate) struct TestHold {
 
 #[cfg(test)]
 impl TestHold {
+    /// Lets a held supervisor go, as an operation entering `wait_settled` would.
+    pub(crate) fn release(&self) {
+        self.waited.store(true, Ordering::SeqCst);
+    }
+
     fn hold(&self) {
         if !self.armed.load(Ordering::SeqCst) {
             return;
@@ -253,6 +258,21 @@ impl Supervision {
             return false;
         }
         matches!(self.lock().phase, Phase::GaveUp | Phase::Uncovered)
+    }
+
+    /// Whether a commit the failed engine refused before logging it falls under the option
+    /// (ICR 0060): not once the supervisor stood down on a failure it does not cover, nor for
+    /// such a failure it has not looked at yet (`failure`, the current engine's). A swapped
+    /// engine (no failure) means the refusal's failure was recovered from.
+    pub(crate) fn covers_refusal(&self, failure: Option<Failure>) -> bool {
+        if self.forked() {
+            return false;
+        }
+        match self.lock().phase {
+            Phase::Uncovered => false,
+            Phase::Healthy => failure.is_none_or(|f| covers(self.mode, f.cause)),
+            Phase::Recovering { .. } | Phase::GaveUp => true,
+        }
     }
 
     pub(crate) fn stats(&self, generation: u64) -> RecoveryStats {
@@ -606,5 +626,143 @@ mod tests {
         assert_eq!(db.recovery_stats().recoveries, 1);
         drop(t);
         db.close().unwrap();
+    }
+
+    /// #966, perf287's S1 on #968: a commit that resolves after its call returned (a ticket,
+    /// an async commit), refused by the failed engine before it logged anything and looked
+    /// at only after the swap, is `Busy` (not committed, retry on the recovered engine), as a
+    /// sync commit refused there is once it waited for the swap.
+    #[test]
+    fn a_ticket_or_async_commit_refused_before_the_swap_is_busy_after_it() {
+        let vfs = SimVfs::new(9662);
+        let options = Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .memtable_budget(4 << 20)
+            .write_stall_timeout(Duration::from_secs(10))
+            .vfs(Arc::clone(&vfs) as _)
+            .auto_recover(Recovery::Any);
+        let db = Pigeonhole::open("/db/r9662.phdb", options).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        // Held until the refusals are in, so neither commit meets the closing engine.
+        db.db
+            .supervision()
+            .unwrap()
+            .test_hold
+            .armed
+            .store(true, Ordering::SeqCst);
+        db.engine()
+            .to_arc()
+            .inject(pigeonhole_engine::Fault::NextApply, true);
+        let e = t.mutate(b"x").put("f", b"q", b"1").commit().unwrap_err();
+        assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
+        // Both reach the poisoned shard and are refused there, unlogged.
+        let mut wb = db.write_batch();
+        wb.put(&t, b"w", "f", b"q", b"2");
+        let ticket = wb.commit_with_ticket(crate::Durability::Buffered).unwrap();
+        #[cfg(feature = "async")]
+        let fut = t.mutate(b"z").put("f", b"q", b"3").commit_async();
+        // Let the supervisor go, and wait for the swap.
+        db.db.supervision().unwrap().test_hold.release();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while db.recovery_stats().recoveries < 1 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                db.recovery_stats()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let e = ticket.wait().unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Busy, "ticket: {e}");
+        #[cfg(feature = "async")]
+        {
+            let e = crate::doc_support::block_on(fut).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Busy, "async: {e}");
+        }
+        drop(t);
+        db.close().unwrap();
+    }
+
+    /// #966: once the supervisor gave up, a commit is `Closed` (the recovery guide: "the
+    /// handle stays failed exactly as with the option off (`is_failed()` true, commits
+    /// `Closed`)"), also when it reaches the failed shard before the engine is marked dead
+    /// and is refused there unlogged (the engine's `ShardFailed`, code `Io`). On Windows the
+    /// budget's give-up, which is immediate, left that window open (#966).
+    ///
+    /// Deterministic: a failed apply (`Fault::NextApply`) poisons the shard without marking
+    /// the engine dead, so after the fourth failure (past the budget of three) the next
+    /// commit always passes the engine's open check and reaches the poisoned shard.
+    #[test]
+    fn a_commit_after_a_give_up_is_closed_even_when_the_failed_shard_refuses_it() {
+        let vfs = SimVfs::new(9661);
+        let options = Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .memtable_budget(4 << 20)
+            .write_stall_timeout(Duration::from_secs(10))
+            .vfs(Arc::clone(&vfs) as _)
+            .auto_recover(Recovery::Any);
+        let db = Pigeonhole::open("/db/r966.phdb", options).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        let fail = || {
+            db.engine()
+                .to_arc()
+                .inject(pigeonhole_engine::Fault::NextApply, true);
+            let e = t.mutate(b"x").put("f", b"q", b"1").commit().unwrap_err();
+            assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
+        };
+        for n in 1..=3 {
+            fail();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while db.recovery_stats().recoveries < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{:?}",
+                    db.recovery_stats()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fail();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !db.recovery_stats().gave_up {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                db.recovery_stats()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(db.is_failed());
+        let e = t.mutate(b"y").put("f", b"q", b"2").commit().unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Closed, "{e}");
+        // The same for a commit resolved after its call returned, which does not wait: a
+        // ticket, and an async commit (the guide: "they return `Closed` or `Busy` at once").
+        let mut wb = db.write_batch();
+        wb.put(&t, b"w", "f", b"q", b"3");
+        let e = wb
+            .commit_with_ticket(crate::Durability::Buffered)
+            .and_then(crate::CommitTicket::wait)
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Closed, "ticket: {e}");
+        #[cfg(feature = "async")]
+        {
+            let fut = t.mutate(b"z").put("f", b"q", b"4").commit_async();
+            let e = crate::doc_support::block_on(fut).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Closed, "async: {e}");
+        }
+        drop(t);
+        let _ = db.close();
     }
 }

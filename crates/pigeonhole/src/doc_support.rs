@@ -7,6 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::{Family, Pigeonhole, Result, Table};
 
+/// Runs `f` while another thread holds this process's registry of databases opened with
+/// `Options::auto_recover` locked: a test forks inside `f` to check a forked child does not
+/// wait for the lock it copied held (#968).
+pub fn with_watch_registry_locked_elsewhere<R>(f: impl FnOnce() -> R) -> R {
+    crate::db::with_watch_registry_locked_elsewhere(f)
+}
+
 /// A fresh temporary directory, removed with everything in it on drop. Derefs to its path,
 /// so examples write `dir.join("app.phdb")`.
 #[derive(Debug)]
