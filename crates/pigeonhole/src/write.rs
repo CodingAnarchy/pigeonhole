@@ -601,6 +601,9 @@ impl RowMutation<'_> {
                 self.durability,
             )
             .map(|s| s.watched(watch))
+            // A refusal at submit (the failed or closing engine's `Closed`) as one at resolution
+            // (#970).
+            .map_err(|e| watch.refused(e))
     }
 
     /// Submits as an async conditional commit (D210): the condition is resolved now; the
@@ -630,7 +633,7 @@ impl RowMutation<'_> {
                 max_value,
                 watch,
             })
-            .map_err(|e| commit_error(e, largest_value, max_value))
+            .map_err(|e| watch.refused(commit_error(e, largest_value, max_value)))
     }
 
     /// Commits only if `condition` holds on this row, atomically (BigTable's
@@ -1025,6 +1028,7 @@ impl WriteBatch {
         builder
             .submit_async(&cached.get(&db), db.max_value, durability)
             .map(|s| s.watched(watch))
+            .map_err(|e| watch.refused(e))
     }
 }
 
@@ -1115,6 +1119,8 @@ impl Transaction {
         self.db.check_open()?;
         self.db.check_generation(self.generation)?;
         let (largest_value, max_value) = (self.largest_value, self.db.max_value);
+        // The transaction runs on the engine it began on: its generation.
+        let watch = self.db.watch_at(self.generation).transaction();
         self.txn
             .submit_async(durability.map(Durability::engine))
             .map(|pending| Submitted {
@@ -1123,9 +1129,8 @@ impl Transaction {
                 max_value,
                 watch: Default::default(),
             })
-            // The transaction runs on the engine it began on: its generation.
-            .map(|s| s.watched(self.db.watch_at(self.generation).transaction()))
-            .map_err(|e| commit_error(e, largest_value, max_value))
+            .map(|s| s.watched(watch))
+            .map_err(|e| watch.refused(commit_error(e, largest_value, max_value)))
     }
 
     fn finish(self, durability: Option<Durability>) -> Result<CommitInfo> {

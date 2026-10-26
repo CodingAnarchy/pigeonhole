@@ -762,6 +762,7 @@ mod tests {
             .and_then(crate::CommitTicket::wait)
             .unwrap_err();
         assert_eq!(e.code(), ErrorCode::Closed, "ticket: {e}");
+        assert!(e.to_string().contains("gave up"), "ticket: {e}");
         #[cfg(feature = "async")]
         {
             let fut = t.mutate(b"z").put("f", b"q", b"4").commit_async();

@@ -491,12 +491,17 @@ impl Db {
     #[cold]
     #[inline(never)]
     fn after_commit_closed_as(&self, generation: u64, e: Error, transaction: bool) -> Error {
-        if (e.code() != ErrorCode::Closed && !e.refused_unlogged()) || self.is_closed() {
+        if e.code() != ErrorCode::Closed && !e.refused_unlogged() {
             return e;
         }
         let Some(sup) = &self.supervision else {
             return e;
         };
+        // Closed through any handle: `Closed`, also for a refusal the failed shard made
+        // unlogged, as an async commit or a ticket gets it (`refused_later`; #970, N1).
+        if self.is_closed() {
+            return pigeonhole_engine::Error::Closed.into();
+        }
         match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
             crate::recovery::Settled::Swapped if self.generation() != generation => {
                 if transaction {
@@ -569,11 +574,17 @@ impl Db {
                 )
             };
         }
+        if sup.gave_up() {
+            return Error::new(
+                ErrorCode::Closed,
+                "refused by the failed engine, and automatic recovery gave up \
+                 (recovery_stats().gave_up): not committed; reopen the database",
+            );
+        }
         Error::new(
             ErrorCode::Closed,
-            "refused by the failed engine before it logged anything \
-             (Options::auto_recover): not committed; retry once the database recovered, \
-             or reopen it if recovery_stats().gave_up",
+            "refused by the failed engine while the database recovers \
+             (Options::auto_recover): not committed; retry once it recovered",
         )
     }
 
