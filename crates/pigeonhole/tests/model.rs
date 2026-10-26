@@ -375,9 +375,10 @@ struct Stats {
     forced_rearms: usize,
 }
 
-/// The most forced commits that may be refused `Busy` before the WAL (#897) before the run
-/// fails: a store that never lets a commit reach its log is a bug, not bad luck.
-const MAX_FORCED_REARMS: usize = 50;
+/// The most forced commits in a row that may be refused `Busy` before the WAL (#897) before
+/// the run fails: each one sat out the write-stall timeout, and a store that never lets a
+/// commit reach its log is a bug, not bad luck (perf287's review of #943).
+const MAX_FORCED_REARMS_IN_A_ROW: usize = 5;
 
 /// What a forced commit's outcome means (#880, #897).
 #[derive(Debug, PartialEq, Eq)]
@@ -456,6 +457,8 @@ struct Run {
     /// The op index at which the forced failure runs (`Stats::forced_faults`), from the seed,
     /// in the run's first half; `None` once it ran or without the recovery option.
     force_at: Option<usize>,
+    /// Forced commits refused `Busy` before the WAL since the last that reached it (#897).
+    forced_rearms_in_a_row: usize,
     /// The forced failure fired and its recovery has not been counted yet.
     forced_pending: bool,
     /// The index of the op under way (`run` counts).
@@ -743,6 +746,7 @@ impl Run {
             base,
             armed: false,
             force_at: None,
+            forced_rearms_in_a_row: 0,
             forced_pending: false,
             op: 0,
             trace: Vec::new(),
@@ -1648,7 +1652,7 @@ impl Run {
                         result.as_ref().err()
                     ));
                     match forced_outcome(fired, result.as_ref().map(|_| ()).map_err(|e| e.code())) {
-                        Forced::Fired => {}
+                        Forced::Fired => self.forced_rearms_in_a_row = 0,
                         Forced::Rearm => {
                             // Refused for room before it was logged (#897): no WAL write,
                             // so nothing to fail. The next commit takes the forced failure.
@@ -1657,13 +1661,20 @@ impl Run {
                             // The arm's end check still wants one firing per seed, so a
                             // re-arm can never stand in for the recovery.
                             self.stats.forced_rearms += 1;
-                            if self.stats.forced_rearms > MAX_FORCED_REARMS {
+                            self.forced_rearms_in_a_row += 1;
+                            if self.forced_rearms_in_a_row > MAX_FORCED_REARMS_IN_A_ROW {
                                 return Err(format!(
                                     "the forced WAL failure was refused Busy {} times in a row: \
                                      no commit reached the WAL",
-                                    self.stats.forced_rearms
+                                    self.forced_rearms_in_a_row
                                 ));
                             }
+                            // Nothing stays armed until the next forced commit arms a fresh
+                            // plan: another thread's WAL write meanwhile would otherwise fire
+                            // it outside this commit's accounting (perf287's review of #943).
+                            // The plan was reset as the commit returned; this keeps it so
+                            // whatever that line becomes.
+                            self.vfs.set_faults(self.cfg.faults.clone());
                             self.force_at = Some(self.op + 1);
                             self.forced_pending = false;
                             self.trace.push(
