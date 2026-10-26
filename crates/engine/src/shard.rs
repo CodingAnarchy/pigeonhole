@@ -2361,7 +2361,10 @@ struct ArenaNeed {
 /// else allocates from the arena (the freeze after the group comes last), and the arena
 /// bound holds for any sequence of entries into the same memtables, whatever batches they
 /// came in (the memtable crate's `a_batch_stays_within_the_engine_bound`), so the group needs
-/// its entries' bytes plus these chunks once.
+/// its entries' bytes plus these chunks once. Members after the carrier don't need them: a
+/// PREPARE allocates nothing when its group applies, and a DECISION applies its share (on
+/// a participant that is also the coordinator) into room the share's PREPARE reserved in
+/// full on its own, held until the decision.
 #[derive(Default)]
 struct GroupRoom {
     slots: smallvec::SmallVec<[(TabletId, FamilyId); 8]>,
@@ -3979,8 +3982,9 @@ impl ShardState {
     }
 
     /// Reserves arena room for `bytes` (on top of everything already reserved by members of
-    /// this group and undecided shares) or returns `None` when it would not fit. Returns the
-    /// room the member itself releases when applied.
+    /// this group and undecided shares), or returns `Err(Room::Wait)` when it does not fit
+    /// now and `Err(Room::Never)` when it never could. Returns the room the member itself
+    /// releases when applied.
     ///
     /// With `group` (a single), the per-slot chunks are the group's (#749): a slot an earlier
     /// single of the group already reserved for, and the fixed two once one did, cost
@@ -4008,7 +4012,9 @@ impl ShardState {
         };
         self.admit_rows = rows;
         // A single's per-slot chunks are its group's: only those no earlier single of the
-        // group reserved (#749).
+        // group reserved (#749). Writes no tablet routes keep their chunk per member, as
+        // before: they have no slot to share it by, and they are rare (a table not yet
+        // routed), so the conservative charge costs nothing that matters.
         let (needed, own, extra) = match &group {
             Some(g) => {
                 let mut extra = need.unrouted + if g.fixed { 0 } else { 2 };
@@ -5993,6 +5999,8 @@ impl ShardState {
             {
                 Some(last) => last.reserved += room,
                 None => {
+                    // Unreachable: a single whose reservation succeeded is always admitted
+                    // (nothing between `reserve_room` and `admitted.push` drops it).
                     debug_assert!(false, "group room reserved with no single admitted");
                     self.release_room(room);
                 }
