@@ -1354,7 +1354,7 @@ fn give_back(mut resolver: Resolver) {
     });
 }
 
-/// [`clamp_to_tablet`] into reused buffers: `lo` and `hi` receive the clamped start and end,
+/// `clamp_to_tablet` into reused buffers: `lo` and `hi` receive the clamped start and end,
 /// and the result says which are set (`false` = unbounded).
 fn clamp_into(
     tablet: &TabletEntry,
@@ -1401,7 +1401,9 @@ fn clamp_into(
     Ok((has_lo, has_hi))
 }
 
-/// Narrows `[start, end)` (row prefixes, `None` = unbounded) to the rows of `tablet`.
+/// Narrows `[start, end)` (row prefixes, `None` = unbounded) to the rows of `tablet` (the
+/// test hooks' slot scans).
+#[cfg(feature = "test-hooks")]
 pub(crate) fn clamp_to_tablet(
     tablet: &TabletEntry,
     start: Option<Vec<u8>>,

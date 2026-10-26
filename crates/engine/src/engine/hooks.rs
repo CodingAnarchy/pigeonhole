@@ -1117,6 +1117,14 @@ impl Engine {
             .load(Ordering::Relaxed)
     }
 
+    /// [`Engine::backup`] at `snapshot`: with [`Snapshot::at_seqno`], below commits its SSTs
+    /// already hold, so the backup rewrites those SSTs instead of copying them (#715).
+    #[doc(hidden)]
+    pub fn backup_at(&self, snapshot: Snapshot, dest: &Path) -> Result<()> {
+        let _guard = self.inner.enter_maintenance()?;
+        crate::maintenance::backup(&self.inner.shared, snapshot, dest)
+    }
+
     /// How many compactions on shard `shard` a write voided before they installed their
     /// purge, so that they compacted again (#316).
     #[doc(hidden)]
