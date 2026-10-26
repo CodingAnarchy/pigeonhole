@@ -89,8 +89,9 @@ A reader's snapshot survives the writer closing. Once a new writer opens, though
 From 1.0.0 (D282):
 
 - **`pigeonhole` follows [semantic versioning](https://semver.org).** No 1.x release breaks code that compiles against an earlier 1.x. New API arrives in minor releases, and fixes in patch releases.
-  - **Types that can grow are `#[non_exhaustive]`:** `Value`, `Condition`, `ValueFilter`, `Compaction`, `Priority`, `Recovery`, `Durability`, `ErrorCode`, `FailureCause`, and the info, metrics, stats and outcome structs (ICR 0071 and the part-2 ICR). A minor release may add a variant or a field to them, so a `match` on one of the enums needs a `_` arm, and the output structs are read, not built.
+  - **Types that can grow are `#[non_exhaustive]`:** `Value`, `Condition`, `ValueFilter`, `Compaction`, `Priority`, `Recovery`, `Durability`, `ErrorCode`, `FailureCause`, and the info, metrics, stats and outcome structs (ICR 0071, ICR 0073). A minor release may add a variant or a field to them, so a `match` on one of the enums needs a `_` arm, and the output structs are read, not built.
   - **Error codes are stable:** an `ErrorCode`'s number never changes; new codes may appear in minor releases.
+  - **The minimum Rust version (D283):** a 1.x minor release may raise `rust-version`, a patch release never does, and the changelog calls out every raise.
   - **Hidden items are outside the promise:** anything `#[doc(hidden)]` is a test or bench hook (`Options::vfs`, `shard_stats`, the trait impls that name internal crates' types) and may change in any release.
 - **`pigeonhole-arrow` follows semver too.** Its arrow-rs major is part of its API, so moving to a new arrow-rs major is a major release of `pigeonhole-arrow`.
 - **`phdb` (`pigeonhole-cli`) follows semver for its commands, flags, exit statuses and output formats.** The JSON output is versioned (`"phdb": 1`); a breaking change to it takes a new version number and a major release.

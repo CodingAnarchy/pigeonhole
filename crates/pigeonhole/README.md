@@ -28,7 +28,8 @@ SQLite's deployment model (one file, a library, no server).
 ## Versioning
 
 From 1.0.0 this crate follows semantic versioning; the types that can grow are
-`#[non_exhaustive]`, and `#[doc(hidden)]` items are outside the promise. The internal
+`#[non_exhaustive]`, `#[doc(hidden)]` items are outside the promise, and only a minor release
+may raise the minimum Rust version (D283). The internal
 `pigeonhole-*` crates it depends on make no stability promise of their own and are pinned
 exactly. The file format's promise is separate. Details:
 [versions and compatibility](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/concepts.md#versions-and-compatibility).
