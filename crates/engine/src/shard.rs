@@ -1619,6 +1619,9 @@ struct Member {
     /// `admit_against_guards` reads `commit_ts` as a timestamp when `wait_for_room` checks the
     /// group's admitted members again (#900).
     rank: u32,
+    /// A PREPARE whose `Prepared` went out once it was appended, before its group's write
+    /// (D279): its `settle` sends no second one.
+    voted: bool,
 }
 
 #[derive(Debug)]
@@ -1659,6 +1662,7 @@ impl Member {
             room_since: 0,
             share_wait: 0,
             rank: 0,
+            voted: false,
         }
     }
 
@@ -1874,6 +1878,22 @@ struct PreparedShare {
     priority: CommitPriority,
     /// `PrepareReq::submitted_at` (D262).
     submitted_at: u64,
+    /// Its PREPARE's group resolved: written, and past any segment header a sync still had
+    /// to write (D200). Until then a decision parks in `parked` (D279).
+    settled: bool,
+    /// A decision that arrived before its PREPARE settled (D279: only a Buffered PREPARE that
+    /// voted early, in a group resolved through a sync). `settle` runs it.
+    parked: Option<Box<ParkedDecide>>,
+}
+
+/// A `Decide` waiting for its share's PREPARE to settle (D279).
+#[derive(Debug)]
+struct ParkedDecide {
+    commit: bool,
+    at: Decided,
+    coordinator: ShardId,
+    priority: CommitPriority,
+    last: bool,
 }
 
 /// A memtable with what flush and compaction need to know about it: the smallest user
@@ -6098,6 +6118,24 @@ impl ShardState {
                 Durability::Buffered | Durability::None => {}
             }
         }
+        // D279: a Buffered PREPARE votes once its record is appended, when its group has no
+        // sync of its own, so its coordinator decides while this shard writes and applies.
+        // Every member is appended by now (a failed append returned above). A failure from
+        // here on (the write, the view publish, a held header's sync) settles it `Err`: the
+        // shard is poisoned, it votes no second time, and its share is not applied, so a
+        // decided commit ends `OutcomeUnknown` (`on_applied`). It counts down only once it
+        // settled (`ParkedDecide`).
+        if !need_group_sync && last_sync.is_none() {
+            for m in &mut group.members {
+                if let MemberKind::Prepare { coordinator } = m.kind
+                    && m.durability == Durability::Buffered
+                    && m.ticket.is_some()
+                    && m.failed.is_none()
+                {
+                    self.send_vote(m.seqno, coordinator, &mut m.voted, None, ctx);
+                }
+            }
+        }
         if appended {
             let wal = self.wal.as_mut().expect("appended through it");
             if wal.write().is_err() {
@@ -6227,9 +6265,29 @@ impl ShardState {
                 }
             }
         }
-        if self.view_dirty
-            && let Err(e) = self.publish_memtables()
+        #[cfg(feature = "test-hooks")]
+        let published = if self.view_dirty
+            && self
+                .shared
+                .hooks
+                .faults
+                .take(crate::engine::hooks::Fault::NextGroupPublish)
         {
+            Err(Error::Corruption(
+                "injected view publish failure (Fault::NextGroupPublish)".into(),
+            ))
+        } else if self.view_dirty {
+            self.publish_memtables()
+        } else {
+            Ok(())
+        };
+        #[cfg(not(feature = "test-hooks"))]
+        let published = if self.view_dirty {
+            self.publish_memtables()
+        } else {
+            Ok(())
+        };
+        if let Err(e) = published {
             self.poison(crate::health::FailureCause::Internal);
             for m in &mut group.members {
                 if m.failed.is_none() {
@@ -7333,26 +7391,46 @@ impl ShardState {
                     trace!("shard {} prepare {} failed: {e}", self.id.0, m.seqno);
                 }
                 let error = result.as_ref().err().map(prepare_error_of);
-                if error.is_some()
-                    && let Some(share) = self.prepared.remove(&m.seqno)
-                {
-                    if share.tracked {
-                        self.track_share_rows(share.bytes.batch().as_bytes(), false);
-                        self.track_share_reads(&share.reads, false);
+                let mut parked = None;
+                if error.is_some() {
+                    if let Some(mut share) = self.prepared.remove(&m.seqno) {
+                        if share.tracked {
+                            self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                            self.track_share_reads(&share.reads, false);
+                        }
+                        self.release_room(share.reserved);
+                        if m.voted {
+                            // D279: its coordinator may have decided commit, and a partly
+                            // written record may hold the PREPARE, so the log keeps it
+                            // undecided. The shard is poisoned; the next open decides it by
+                            // its COMMIT, all or nothing. A parked decision finds the share
+                            // gone and answers not applied.
+                            parked = share.parked.take();
+                        } else {
+                            // A failed prepare's record (if any) is never needed.
+                            self.mark_aborted(m.seqno);
+                        }
                     }
-                    self.release_room(share.reserved);
-                    // A failed prepare's record (if any) is never needed.
-                    self.mark_aborted(m.seqno);
+                } else if let Some(share) = self.prepared.get_mut(&m.seqno) {
+                    share.settled = true;
+                    parked = share.parked.take();
                 }
-                self.send(
-                    coordinator,
-                    ShardMsg::Prepared {
-                        seqno: m.seqno,
-                        from: self.id,
-                        error,
-                    },
-                    ctx,
-                );
+                if !m.voted {
+                    self.send_vote(m.seqno, coordinator, &mut m.voted, error, ctx);
+                }
+                // Groups settle in order, and members in their group's order, so parked
+                // decisions run in seqno order.
+                if let Some(p) = parked {
+                    self.on_decide(
+                        m.seqno,
+                        p.commit,
+                        p.at,
+                        p.coordinator,
+                        p.priority,
+                        p.last,
+                        ctx,
+                    );
+                }
             }
             MemberKind::CommitRecord {
                 participants,
@@ -7531,6 +7609,30 @@ impl ShardState {
         }
     }
 
+    /// Answers a PREPARE member's coordinator, once: `voted` is the member's flag (D279).
+    /// The coordinator decides once every participant answered, so a second answer would
+    /// be counted against another participant's.
+    fn send_vote(
+        &mut self,
+        seqno: Seqno,
+        coordinator: ShardId,
+        voted: &mut bool,
+        error: Option<PrepareError>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        debug_assert!(!*voted, "shard {}: a second vote for {seqno}", self.id.0);
+        *voted = true;
+        self.send(
+            coordinator,
+            ShardMsg::Prepared {
+                seqno,
+                from: self.id,
+                error,
+            },
+            ctx,
+        );
+    }
+
     fn on_prepare(&mut self, req: PrepareReq, ctx: &mut ShardContext<'_, ShardMsg>) {
         if self.closing || self.poisoned {
             let error = Some(if self.closing {
@@ -7561,6 +7663,8 @@ impl ShardState {
                 participants: req.participants,
                 priority: req.priority,
                 submitted_at: req.submitted_at,
+                settled: false,
+                parked: None,
             },
         );
         self.pending.push(Member {
@@ -7584,6 +7688,7 @@ impl ShardState {
             room_since: 0,
             share_wait: 0,
             rank: 0,
+            voted: false,
         });
     }
 
@@ -7740,6 +7845,7 @@ impl ShardState {
             room_since: 0,
             share_wait: 0,
             rank: 0,
+            voted: false,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
     }
@@ -7755,6 +7861,26 @@ impl ShardState {
         last: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
+        // D279: a share whose PREPARE voted before its group resolved waits for it, commit or
+        // abort alike, so `settle` stays the one place a voted share leaves `prepared`.
+        if let Some(share) = self.prepared.get_mut(&seqno)
+            && !share.settled
+        {
+            debug_assert!(share.parked.is_none(), "a second decision for {seqno}");
+            #[cfg(feature = "test-hooks")]
+            self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .parked_decisions
+                .fetch_add(1, Ordering::Relaxed);
+            share.parked = Some(Box::new(ParkedDecide {
+                commit,
+                at,
+                coordinator,
+                priority,
+                last,
+            }));
+            return;
+        }
         // The rows the share writes, if a commit refused here reads (D276).
         let written = if commit && self.overlap_refused.iter().any(|r| r.validate.is_some()) {
             self.prepared

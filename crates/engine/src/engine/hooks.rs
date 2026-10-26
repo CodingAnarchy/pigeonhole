@@ -20,7 +20,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_compaction::MergeRegistry;
@@ -138,15 +138,19 @@ pub enum Fault {
     /// that member reaches the stream's buffer; the first member is appended (and written and
     /// synced if it is a `Sync` one). The shard poisons itself (#921, #925).
     SecondAppend = 7,
+    /// The next commit group's view publish (`publish_memtables`, after its write and apply)
+    /// fails: every member of the group fails with `Corruption` and the shard poisons itself.
+    /// A Buffered PREPARE in it has voted already (D279), so its commit ends `OutcomeUnknown`.
+    NextGroupPublish = 8,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).
 #[derive(Default)]
-pub(crate) struct Faults(AtomicU8);
+pub(crate) struct Faults(AtomicU16);
 
 impl Faults {
-    fn bit(f: Fault) -> u8 {
-        1 << (f as u8)
+    fn bit(f: Fault) -> u16 {
+        1 << (f as u16)
     }
 
     /// Switches `f` on or off.
@@ -285,6 +289,9 @@ pub(crate) struct ShardCounters {
     /// Flushes the manifest refused because a delete voided one of their purge guards,
     /// flushed again without it (#287), `Engine::flush_voids` (#838's test).
     pub voided_flushes: AtomicU64,
+    /// Decisions that reached the shard before their share's PREPARE settled and waited for
+    /// it (D279), `Engine::parked_decisions`.
+    pub parked_decisions: AtomicU64,
     /// Entries read validation visited in the shard's memtables (`Engine::validate_entries`,
     /// D273's tests: a hot row validates in a few entries, not one per version).
     pub validate_entries: AtomicU64,
@@ -1087,6 +1094,16 @@ impl Engine {
         self.inner.shared.metrics[shard]
             .hooks
             .voided_flushes
+            .load(Ordering::Relaxed)
+    }
+
+    /// How many decisions on shard `shard` arrived before their share's PREPARE settled and
+    /// waited for it (D279, test hook).
+    #[doc(hidden)]
+    pub fn parked_decisions(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .parked_decisions
             .load(Ordering::Relaxed)
     }
 

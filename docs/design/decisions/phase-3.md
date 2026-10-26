@@ -2522,6 +2522,28 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 - `engine/tests/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
 - `shm/tests/sim.rs`: a layout 3 region (and a newer one) is refused while other processes are attached, and rebuilt when the new writer is alone.
 
+<a id="d279"></a>
+## D279 — A Buffered PREPARE votes once appended, before its group's write; a decision that overtakes it waits (owner decision, 2026-10-26; engine, #932 3c, #708)
+
+**Decided:** #932's candidate 3c, allowed by the owner at `Buffered` only (`.coord/brief-932-pick.md`), in the form of the design on #932 (comment 6410103337) that perf287 approved (comment 6410157286).
+
+**Why:** a participant voted from `settle`, after its group's write, the apply of every member, the view publish and the turn's freeze, index and flush-spawn work. The coordinator's DECISION waited for all of it. The WAL write is a synchronous `pwrite` on the shard thread, so the vote can leave as soon as the record is appended: the coordinator then writes its DECISION while the participant finishes its turn.
+
+**What changes:**
+- **The vote.** At the end of `run_group`'s append loop, each Buffered PREPARE member with a ticket votes `Prepared { error: None }` and is marked `voted`, when its group has no sync of its own (no `GroupSync` member, no `Sync` member). Groups with a sync vote from `settle` as before, so GroupSync's guarantee that every PREPARE is durable before its COMMIT is written stays. A failed append ends the turn before the vote.
+- **A decision waits for its PREPARE to settle.** The shard thread handles messages only between turns, and a group with no sync resolves in its own turn. So a `Decide` reaches an unsettled share only when the group resolves through a sync: a held segment header (#19, D200). It parks on the `PreparedShare`, commit or abort alike, and `settle` runs it once the member settles. Groups settle in order, and members in their order, so parked decisions run in seqno order. The share counts down (D278) only then. A close waits for it: `try_finish_close` waits for `prepared` to drain, and the held header's sync is already submitted.
+- **A voted member that settles `Err`** (the write, the view publish, the held sync): the shard is already poisoned. The share is removed unapplied and its record left undecided in the log (no `mark_aborted`: the coordinator may have decided commit, and a partly written record may hold the PREPARE). No second vote is sent: `send_vote` asserts that a member votes once. A parked decision, or one arriving later, finds the share gone and answers not applied, so a decided commit ends `OutcomeUnknown` at its coordinator (`on_applied`, #925's rule) and the engine dies; an aborted one is released as before.
+
+**Why it is safe:**
+- **An acknowledged commit has both PREPAREs and the DECISION written.** The client's `Ok` comes only from the last count-down (D278), each participant counts down only after its PREPARE settled `Ok` and its share applied, and the DECISION is written before any `Decide` is sent.
+- **No torn commit after a failure.** A participant that voted and then failed never applies its share. The other shares are applied but held (`CROSS_HELD`), so they never become durable (`durable_seqno` includes the hold) and never freeze into an SST. Behind that, a PREPARE with a ticket raised its shard's `cross_end`, and a poisoned shard answers a peer flush's `SyncBarrier` with `cross_records_durable()`, false then (perf287's point). Replay is all or nothing for Buffered (a COMMIT whose participant lost its PREPARE is dropped whole), so the next open finds the commit whole or not at all, consistent with `OutcomeUnknown`.
+
+**Tests:** `engine/tests/vote_on_append.rs`:
+- a failed PREPARE write after the vote answers `OutcomeUnknown` (it answered `ShardFailed` before), shows nothing, holds back a peer flush, and reopens whole or empty (perf287's T1);
+- a failed view publish after the vote (`Fault::NextGroupPublish`), the same route through `Corruption` (T2);
+- a decision reaching a PREPARE under a held header waits for its sync (`Engine::parked_decisions` shows it is reached); a commit answered before its I/O completed survives a process crash.
+Mutations caught: no early vote (all three), no parking (a commit answered `Ok` is lost by a process crash), a second vote (the coordinator's assert).
+
 <a id="d278"></a>
 ## D278 — The participant that applies a cross-shard commit last releases its seqno and answers the client; the hold lives in the allocator (owner decision, 2026-10-26; engine, shm, #932 3a, #708; ICR 0074)
 
