@@ -20,6 +20,7 @@ Pigeonhole is built by a mix of humans and coding agents. The rules below apply 
 ## Agent rules
 - One agent owns one crate per task and edits only that crate and its tests. Shared files (`Cargo.toml` workspace deps, `FORMAT.md`, `docs/`) change only when the task says so.
 - Frozen interfaces change only through an **interface-change request**: add a short note to `docs/design/icr/NNNN-title.md` naming the change and every caller, and get it approved before changing code.
+- **The 1.0 golden files never change; they only gain siblings.** Every on-disk golden file in `crates/format/tests/golden` is listed with its hash in `crates/format/tests/golden-frozen.txt`, which is append-only. A new encoding gets a new file (`superblock_v5.bin`, say) and a new line at the end, and the old file stays with the test that decodes it. The format crate's golden test and a CI step (`scripts/golden-frozen.py`) enforce this. The shared-memory files (`shm_*`) are exempt, since the layout is outside the compatibility promise (FORMAT.md §13).
 - No new dependency without a passing `cargo deny check` and a one-line justification in the PR.
 - A task is done when its brief's acceptance tests and the workspace simulation suite pass in CI. **Nothing merges on red.**
 - When the spec is silent or contradictory, stop and record the question and your interim behavior in `docs/design/questions/<crate>.md` (see its [README](docs/design/questions/README.md)) instead of guessing; the coordinator turns it into a numbered decision.

@@ -3,11 +3,18 @@
 //!
 //! After an intentional format change (with a FORMAT.md update and a version bump where
 //! needed), regenerate with `UPDATE_GOLDEN=1 cargo test -p pigeonhole-format --test golden`.
+//!
+//! The on-disk golden files are frozen at 1.0 (FORMAT.md §12, §13): `tests/golden-frozen.txt`
+//! records each one's length and hash, and they never change. A later format adds a sibling
+//! (`superblock_v5.bin`, say) and appends its line, keeping the old file and the test that
+//! decodes it. Regenerating never rewrites a frozen file. The shared-memory files (`shm_*`)
+//! are not frozen: the layout is outside the compatibility promise.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use pigeonhole_format::blob::{BlobExtentHeader, encode_record_header};
 use pigeonhole_format::block::{Block, BlockAddr, BlockBuilder, BlockKind, seal, verify};
+use pigeonhole_format::checksum::xxh3_64;
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::filter::{Filter, FilterBuilder, column_hash, row_hash};
 use pigeonhole_format::key::{Kind, decode_key, encode_key, encode_marker_key, encode_seek_key};
@@ -33,6 +40,14 @@ fn check(name: &str, bytes: &[u8]) {
         .join("tests/golden")
         .join(name);
     if std::env::var_os("UPDATE_GOLDEN").is_some() {
+        if frozen().iter().any(|f| f.name == name) {
+            let old = std::fs::read(&path).unwrap_or_default();
+            assert!(
+                old == bytes,
+                "{name} is frozen at 1.0 (tests/golden-frozen.txt): add a sibling file instead"
+            );
+            return;
+        }
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, bytes).unwrap();
         return;
@@ -688,4 +703,85 @@ fn format_3_structures_still_decode() {
         assert_eq!(header.version, v3, "{name}");
         assert!(!edits.is_empty(), "{name}");
     }
+}
+
+// ---- the 1.0 freeze ----
+
+/// A line of `tests/golden-frozen.txt`.
+struct Frozen {
+    name: String,
+    len: usize,
+    hash: u64,
+}
+
+fn golden_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden")
+}
+
+fn frozen_line(name: &str, bytes: &[u8]) -> String {
+    format!("{name} {} {:016x}", bytes.len(), xxh3_64(bytes))
+}
+
+/// The frozen set: `name length xxh3-64`, one file per line; `#` starts a comment.
+fn frozen() -> Vec<Frozen> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden-frozen.txt");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            assert_eq!(f.len(), 3, "golden-frozen.txt: bad line {l:?}");
+            Frozen {
+                name: f[0].to_owned(),
+                len: f[1]
+                    .parse()
+                    .unwrap_or_else(|_| panic!("bad length in {l:?}")),
+                hash: u64::from_str_radix(f[2], 16).unwrap_or_else(|_| panic!("bad hash in {l:?}")),
+            }
+        })
+        .collect()
+}
+
+/// Every frozen golden file is still there, byte for byte.
+#[test]
+fn frozen_golden_files_never_change() {
+    let frozen = frozen();
+    let mut names: Vec<&str> = frozen.iter().map(|f| f.name.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    assert_eq!(
+        names.len(),
+        frozen.len(),
+        "golden-frozen.txt lists a file twice"
+    );
+    for f in &frozen {
+        let bytes = golden(&f.name);
+        assert!(
+            bytes.len() == f.len && xxh3_64(&bytes) == f.hash,
+            "{} changed, but it is frozen at 1.0: restore it, and add a sibling file for the \
+             new encoding (now: {})",
+            f.name,
+            frozen_line(&f.name, &bytes)
+        );
+    }
+}
+
+/// Every on-disk golden file is in the frozen set, so a sibling added later is frozen too.
+#[test]
+fn every_on_disk_golden_file_is_frozen() {
+    let frozen = frozen();
+    let mut missing: Vec<String> = std::fs::read_dir(golden_dir())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| !n.starts_with("shm_") && !n.starts_with('.'))
+        .filter(|n| !frozen.iter().any(|f| &f.name == n))
+        .map(|n| frozen_line(&n, &golden(&n)))
+        .collect();
+    missing.sort_unstable();
+    assert!(
+        missing.is_empty(),
+        "golden files not in tests/golden-frozen.txt; append:\n{}",
+        missing.join("\n")
+    );
 }
