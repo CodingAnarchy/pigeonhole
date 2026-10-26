@@ -253,7 +253,7 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 
 | Signature | Semantics |
 |---|---|
-| `Table::get_async(&self, row, family, qualifier) -> GetFuture` / `get_at_async(&self, &Snapshot, ..)` | `Output = Result<Option<Cell>>`. Also on `ReadTable`. Read point taken on first poll; cache hits ready on first poll. |
+| `Table::get_async(&self, row, family, qualifier) -> GetFuture` / `get_at_async(&self, &Snapshot, ..)` | `Output = Result<Option<Cell>>`. Also on `ReadTable`. A memtable or cache hit is read at the call (as of then) and ready on first poll; otherwise the read point is taken on first poll. |
 | `RowRead::read_async(self) -> RowFuture` | `Output = Result<Option<Row>>`. |
 | `Scan::stream(self) -> RowStream<'t>` | `futures_core::Stream<Item = Result<Row>>`, key order; setup error is the first item. Fetches the next step's blocks only as polled. |
 | `RowMutation::commit_async(self) -> CommitFuture` | `Output = Result<CommitInfo>`. Submitted at the call when its shard has room, else when polled with room (D210); resolves when durable and visible. |

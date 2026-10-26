@@ -1,12 +1,16 @@
 //! Async reads (#42, D196, ICR 0014): point gets and row reads as futures that never block
 //! their executor thread on a block the cache does not hold.
 //!
-//! A poll runs the ordinary read in cache-only mode. Memtable and cache hits resolve on the
-//! first poll. When the read misses a block (`Error::WouldBlock`), the future submits that
-//! block's read through the VFS (`submit_read`, a completion that wakes it), admits the
-//! verified block to the cache when it completes, keeps it pinned, and reads again: the
-//! blocks it fetched are hits now. The read point (view and seqno) is taken on the first
-//! poll and held, so every attempt reads the same data.
+//! A latest read in a writer process first runs at the call, in cache-only mode, on the
+//! caller's thread under the view's `arc-swap` guard, as the sync read does: a memtable or
+//! cache hit resolves there, and the future only hands the result over. It holds no
+//! engine, view or copied key, so concurrent async readers share no reference count
+//! (#709). Otherwise a poll runs the ordinary read in cache-only mode. When the read misses
+//! a block (`Error::WouldBlock`), the future submits that block's read through the VFS
+//! (`submit_read`, a completion that wakes it), admits the verified block to the cache
+//! when it completes, keeps it pinned, and reads again: the blocks it fetched are hits now.
+//! A future's read point (view and seqno) is taken on its first poll and held, so every
+//! attempt reads the same data.
 //!
 //! A read falls back to one synchronous attempt, counted in `Metrics::async_sync_reads`,
 //! when the cache cannot keep a fetched block (capacity 0, or a block larger than a cache
@@ -245,42 +249,154 @@ impl Reading {
     }
 }
 
-/// A point get as a future ([`Engine::get_latest_async`](crate::Engine::get_latest_async),
-/// [`Engine::get_async`](crate::Engine::get_async)). Dropping it is always safe.
-#[must_use = "a read does nothing unless polled"]
-pub struct GetFuture {
-    reading: Reading,
+/// A latest read at the call, in a writer process (#709): `attempt` runs once in cache-only
+/// mode under the view's guard, as the sync read reads, with the writer's row cache.
+/// `None` when it would miss a block (the caller builds the future, which takes its own
+/// read point on the first poll), in a reader process, or when the visible seqno kept
+/// moving; otherwise its result, an error included.
+pub(crate) fn try_latest_now<T>(
+    inner: &Inner,
+    attempt: impl FnOnce(
+        &Arc<View>,
+        Seqno,
+        Timestamp,
+        Option<&crate::row_cache::RowCaches>,
+    ) -> Result<T>,
+) -> Option<Result<T>> {
+    if inner.is_reader() {
+        return None;
+    }
+    let (view, seqno) = match inner.latest_view() {
+        Ok(Some(point)) => point,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    let now = inner.shared.vfs.now_micros();
+    let (r, sync_reads) = as_async_read(true, || {
+        attempt(&view, seqno, now, inner.shared.row_cache.as_ref())
+    });
+    if sync_reads > 0 {
+        inner
+            .shared
+            .async_sync_reads
+            .fetch_add(sync_reads, Ordering::Relaxed);
+    }
+    match r {
+        Err(Error::WouldBlock(_)) => None,
+        other => Some(other),
+    }
+}
+
+/// One attempt of a point get at a read point, through the row cache when given (D201;
+/// a reader process's, #946).
+#[allow(clippy::too_many_arguments)]
+fn get_attempt(
+    view: &Arc<View>,
+    seqno: Seqno,
+    now: Timestamp,
+    cache_only: bool,
+    row_cache: Option<&crate::row_cache::RowCaches>,
     table: TableId,
     family: FamilyId,
-    row: Vec<u8>,
-    qualifier: Vec<u8>,
+    row: &[u8],
+    qualifier: &[u8],
+) -> Result<Option<CellData>> {
+    if let Some(rc) = row_cache
+        && let Some(hit) =
+            crate::row_cache::get_cached(rc, view, seqno, now, table, family, row, qualifier)
+    {
+        return Ok(hit);
+    }
+    if cache_only {
+        get_in::<true>(
+            view,
+            seqno,
+            || now,
+            table,
+            family,
+            row,
+            qualifier,
+            || Arc::clone(view),
+        )
+    } else {
+        get_in::<false>(
+            view,
+            seqno,
+            || now,
+            table,
+            family,
+            row,
+            qualifier,
+            || Arc::clone(view),
+        )
+    }
+}
+
+/// A point get as a future ([`Engine::get_latest_async`](crate::Engine::get_latest_async),
+/// [`Engine::get_async`](crate::Engine::get_async)). Dropping it is always safe.
+#[must_use = "a read's result is lost unless it is polled"]
+pub struct GetFuture {
+    state: GetState,
+}
+
+enum GetState {
+    /// Resolved at the call (#709); `None` once taken.
+    Done(Option<Result<Option<CellData>>>),
+    Reading {
+        reading: Reading,
+        table: TableId,
+        family: FamilyId,
+        row: Vec<u8>,
+        qualifier: Vec<u8>,
+    },
 }
 
 impl std::fmt::Debug for GetFuture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("GetFuture")
-            .field("table", &self.table)
-            .field("family", &self.family)
-            .field("fetches", &self.reading.fetches)
-            .finish()
+        match &self.state {
+            GetState::Done(_) => f.debug_struct("GetFuture").field("done", &true).finish(),
+            GetState::Reading {
+                reading,
+                table,
+                family,
+                ..
+            } => f
+                .debug_struct("GetFuture")
+                .field("table", table)
+                .field("family", family)
+                .field("fetches", &reading.fetches)
+                .finish(),
+        }
     }
 }
 
 impl GetFuture {
+    /// A latest get (`snapshot` `None`) runs at the call first (#709): a hit resolves here.
     pub(crate) fn new(
-        inner: Arc<Inner>,
+        inner: &Arc<Inner>,
         snapshot: Option<Snapshot>,
         table: TableId,
         family: FamilyId,
         row: &[u8],
         qualifier: &[u8],
     ) -> Self {
+        if snapshot.is_none()
+            && let Some(r) = try_latest_now(inner, |view, seqno, now, rc| {
+                get_attempt(view, seqno, now, true, rc, table, family, row, qualifier)
+            })
+        {
+            return Self {
+                state: GetState::Done(Some(r)),
+            };
+        }
         Self {
-            reading: Reading::new(inner, snapshot),
-            table,
-            family,
-            row: row.to_vec(),
-            qualifier: qualifier.to_vec(),
+            state: GetState::Reading {
+                reading: Reading::new(Arc::clone(inner), snapshot),
+                table,
+                family,
+                row: row.to_vec(),
+                qualifier: qualifier.to_vec(),
+            },
         }
     }
 }
@@ -289,50 +405,42 @@ impl Future for GetFuture {
     type Output = Result<Option<CellData>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let this = &mut *self;
-        let (table, family, row, qualifier) = (this.table, this.family, &this.row, &this.qualifier);
-        // A latest get consults the row cache, as the sync one does (D201; a reader
-        // process's, #946).
-        this.reading.poll_read(cx, |p| {
-            let (view, seqno, now, cache_only) = (p.view, p.seqno, p.now, p.cache_only);
-            if let Some(rc) = p.row_cache
-                && let Some(hit) = crate::row_cache::get_cached(
-                    rc, view, seqno, now, table, family, row, qualifier,
-                )
-            {
-                return Ok(hit);
+        match &mut self.state {
+            GetState::Done(r) => Poll::Ready(r.take().unwrap_or_else(|| {
+                Err(Error::InvalidArgument(
+                    "get polled after it resolved".into(),
+                ))
+            })),
+            GetState::Reading {
+                reading,
+                table,
+                family,
+                row,
+                qualifier,
+            } => {
+                let (table, family) = (*table, *family);
+                reading.poll_read(cx, |p| {
+                    get_attempt(
+                        p.view,
+                        p.seqno,
+                        p.now,
+                        p.cache_only,
+                        p.row_cache,
+                        table,
+                        family,
+                        row,
+                        qualifier,
+                    )
+                })
             }
-            if cache_only {
-                get_in::<true>(
-                    view,
-                    seqno,
-                    || now,
-                    table,
-                    family,
-                    row,
-                    qualifier,
-                    || Arc::clone(view),
-                )
-            } else {
-                get_in::<false>(
-                    view,
-                    seqno,
-                    || now,
-                    table,
-                    family,
-                    row,
-                    qualifier,
-                    || Arc::clone(view),
-                )
-            }
-        })
+        }
     }
 }
 
 /// A row read as a future, resolving to its sink when the row has a visible cell
 /// ([`Engine::read_row_latest_async`](crate::Engine::read_row_latest_async),
 /// [`Engine::read_row_async`](crate::Engine::read_row_async)). Dropping it is always safe.
-#[must_use = "a read does nothing unless polled"]
+#[must_use = "a read's result is lost unless it is polled"]
 pub struct RowFuture<S> {
     reading: Reading,
     table: TableId,

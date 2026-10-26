@@ -23,7 +23,7 @@ Every data operation has two forms over the same engine: a blocking method, and 
 ## Any executor, no blocking pool
 The futures depend only on `std::task`, so they run on Tokio, smol, async-std or your own executor. None of them spawns a thread or uses `spawn_blocking`:
 
-- A **read** that hits the memtable or the block cache resolves on its first poll, about as cheaply as the blocking call. A read that needs a block the cache does not hold submits that block's read to the I/O backend and returns `Pending`; the completion wakes the task, the block goes into the cache, and the read runs again. The read point is taken on the first poll, so every attempt sees the same data.
+- A **read** as of now runs at the call first, as the blocking call does. If it hits the memtable or the block cache, it is read there, as of the call, and the future resolves to it on its first poll. A read that needs a block the cache does not hold submits that block's read to the I/O backend and returns `Pending`; the completion wakes the task, the block goes into the cache, and the read runs again. Such a read, and a read at a snapshot, takes its read point on the first poll, so every attempt sees the same data.
 - A **commit** is submitted when you call `commit_async`, not when you first poll it. It joins the same commit groups as blocking commits and resolves exactly when the blocking `commit` would return: durable at its level and visible to reads.
 - A **scan stream** fetches the blocks its next step will read before it steps, and only as you poll it, so a slow consumer never makes it read ahead.
 

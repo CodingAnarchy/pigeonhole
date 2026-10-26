@@ -398,9 +398,9 @@ impl<'t> RowRead<'t> {
 
 #[cfg(feature = "async")]
 impl RowRead<'_> {
-    /// [`read`](RowRead::read) as a future resolving to an owned [`Row`]: memtable and cache
-    /// hits resolve on the first poll, and a block the cache does not hold is read
-    /// asynchronously (see [`nonblocking`](crate::nonblocking)).
+    /// [`read`](RowRead::read) as a future resolving to an owned [`Row`]: a memtable or cache
+    /// hit is read at the call and resolves on the first poll, and a block the cache does
+    /// not hold is read asynchronously (see [`nonblocking`](crate::nonblocking)).
     pub fn read_async(mut self) -> crate::nonblocking::RowFuture {
         let started = (|| {
             let latest = match self.sel.snapshot {
@@ -408,14 +408,36 @@ impl RowRead<'_> {
                 Some(_) => None,
             };
             let (engine, table) = (&self.core.engine(), self.core.info.id);
-            Ok(match latest {
-                Some((info, families)) => engine.read_row_latest_async(
-                    table,
-                    &self.row,
-                    &families,
-                    &self.sel.spec,
-                    RowBuf::new(info, 0),
-                ),
+            Ok(Ok(match latest {
+                Some((info, families)) => {
+                    // First at the call, as the sync read (#709): a hit needs no future, so
+                    // concurrent readers share no reference count beyond the sync read's.
+                    let mut buf = RowBuf::new(info, 0);
+                    if let Some(r) = engine.try_read_row_latest_into(
+                        table,
+                        &self.row,
+                        &families,
+                        &self.sel.spec,
+                        &mut buf,
+                    ) {
+                        return Ok(Err(r.map_err(crate::Error::from).map(|any| {
+                            any.then(|| {
+                                buf.key = std::mem::take(&mut self.row);
+                                Row::new(buf)
+                            })
+                        })));
+                    }
+                    // A miss may have left cells in `buf`: the future starts from an empty
+                    // row for the same table entry.
+                    let info = buf.info.take().expect("set by RowBuf::new");
+                    engine.read_row_latest_async(
+                        table,
+                        &self.row,
+                        &families,
+                        &self.sel.spec,
+                        RowBuf::new(info, 0),
+                    )
+                }
                 None => {
                     let (info, snapshot, families) = self.sel.start(self.core)?;
                     engine.read_row_async(
@@ -427,9 +449,13 @@ impl RowRead<'_> {
                         RowBuf::new(info, 0),
                     )
                 }
-            })
+            }))
         })();
-        crate::nonblocking::RowFuture::new(started, self.row)
+        match started {
+            Ok(Err(done)) => crate::nonblocking::RowFuture::done(done),
+            Ok(Ok(f)) => crate::nonblocking::RowFuture::new(Ok(f), self.row),
+            Err(e) => crate::nonblocking::RowFuture::new(Err(e), self.row),
+        }
     }
 }
 

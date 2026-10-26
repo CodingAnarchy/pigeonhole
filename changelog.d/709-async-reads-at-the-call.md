@@ -1,0 +1,3 @@
+### Changed
+- An async get or row read as of now (`get_async`, `read_async`) runs at the call first, as the blocking call does. A memtable or cache hit is read there, as of the call, and the future only hands the result over on its first poll. Such a future no longer holds a reference to the engine, the current view or a copy of the key. Concurrent async readers used to write those shared reference counts on every read, and ran at about 0.4× the blocking reads' throughput at 16 clients (#709). A read that misses the cache, and a read at a snapshot, work as before.
+- A row read no longer clones the catalog's reference count to look up its table (#709).

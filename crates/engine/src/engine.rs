@@ -1742,6 +1742,19 @@ impl Engine {
         if self.inner.forked() {
             return None;
         }
+        // In a writer, looked up under the view's guard: a row read checks its table's entry
+        // on every call, and cloning the catalog's `Arc` was a reference count every reader
+        // thread wrote (#709).
+        if self.inner.reader.is_none() {
+            return self
+                .inner
+                .shared
+                .view
+                .load()
+                .catalog
+                .table_by_name(name)
+                .cloned();
+        }
         self.inner.catalog().table_by_name(name).cloned()
     }
 
@@ -2183,7 +2196,9 @@ impl Engine {
 
     /// [`Engine::get_latest`] as a future that never blocks on a block the cache does not
     /// hold: it fetches what it misses through the VFS's asynchronous reads and reads again
-    /// (D196, ICR 0014). Memtable and cache hits resolve on the first poll.
+    /// (D196, ICR 0014). In a writer process the get runs at the call first, as the sync one
+    /// does: a memtable or cache hit resolves there, as of the call, and the future holds
+    /// only its result (#709). Otherwise the read point is taken on the first poll.
     pub fn get_latest_async(
         &self,
         table: TableId,
@@ -2191,7 +2206,7 @@ impl Engine {
         row: &[u8],
         qualifier: &[u8],
     ) -> crate::GetFuture {
-        crate::GetFuture::new(Arc::clone(&self.inner), None, table, family, row, qualifier)
+        crate::GetFuture::new(&self.inner, None, table, family, row, qualifier)
     }
 
     /// [`Engine::get`] (at `snapshot`) as a future, as [`Engine::get_latest_async`].
@@ -2204,13 +2219,49 @@ impl Engine {
         qualifier: &[u8],
     ) -> crate::GetFuture {
         crate::GetFuture::new(
-            Arc::clone(&self.inner),
+            &self.inner,
             Some(snapshot.clone()),
             table,
             family,
             row,
             qualifier,
         )
+    }
+
+    /// [`Engine::read_row_latest_into`] that never blocks: the read runs now in cache-only
+    /// mode, through the row cache, and returns `None` when it would need a block the cache
+    /// does not hold (and in a reader process). `sink` may then hold some of the row's cells;
+    /// start [`Engine::read_row_latest_async`] with an empty one. A memtable or cache hit is
+    /// the async read's fast path: no future, no reference counted (#709).
+    pub fn try_read_row_latest_into(
+        &self,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: &mut impl read::RowSink,
+    ) -> Option<Result<bool>> {
+        crate::nonblocking::try_latest_now(&self.inner, |view, seqno, now, rc| {
+            let families = families_in_order(view, table, families)?;
+            if let Some(rc) = rc
+                && crate::row_cache::serves_spec(spec)
+            {
+                return crate::row_cache::read_row_cached(
+                    rc,
+                    view,
+                    seqno,
+                    table,
+                    row,
+                    &families,
+                    spec,
+                    now,
+                    true,
+                    sink,
+                    || true,
+                );
+            }
+            read::read_row_into(view, seqno, table, row, &families, spec, now, true, sink)
+        })
     }
 
     /// [`Engine::read_row_latest_into`] as a future, as [`Engine::get_latest_async`]: it
