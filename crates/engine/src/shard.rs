@@ -10086,10 +10086,8 @@ impl ShardHandler for ShardState {
     /// queued commits and `safe_point` takes it between groups. `Wake` and `Released` ride it
     /// too, since a protocol message must not overtake them from the same sender: a later
     /// refusal would take an earlier `Wake`, and a `Prepare` would pass the `Released` that
-    /// lets older commits in first (D249). `SyncDone` stays on the main lane: it comes from
-    /// the shard's own sync, so no peer's message can overtake it, and handled at the safe
-    /// point (the sync completes inline on the simulator) it made a cross-shard write racing
-    /// a compaction's install wait for the install (`purge_race.rs`). Main-lane
+    /// lets older commits in first (D249). `SyncDone` rides it so a `Decide` parked on a held
+    /// header's sync (D279) resolves at the next safe point. Main-lane
     /// messages a peer shard sends
     /// that a protocol message may now overtake, and why that is safe:
     /// - a forwarded `Commit` (a tablet moved) against a `Prepare`: both are unanswered
@@ -10111,6 +10109,7 @@ impl ShardHandler for ShardState {
                 | ShardMsg::Applied { .. }
                 | ShardMsg::Wake { .. }
                 | ShardMsg::Released { .. }
+                | ShardMsg::SyncDone { .. }
         )
     }
 
