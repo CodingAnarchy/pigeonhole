@@ -1146,7 +1146,7 @@ impl PigeonholeReader {
     /// [`ReaderOptions::row_cache`](crate::ReaderOptions::row_cache) is 0. A re-attach (the
     /// writer restarted or recovered) empties the cache and starts the counts again.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
-        self.engine().row_cache_stats()
+        crate::RowCacheStats::from_engine(self.engine().row_cache_stats())
     }
 
     /// Opens an existing table for reading.
