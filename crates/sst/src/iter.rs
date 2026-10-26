@@ -97,6 +97,14 @@ pub struct SstIter {
     window: u32,
 }
 
+/// Where a cursor's readahead ramp stands ([`SstIter::readahead_ramp`]), to carry it to the
+/// cursor of the next SST a level scan reads on into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadaheadRamp {
+    stepped: u32,
+    window: u32,
+}
+
 /// Forward blocks a cursor reads after a seek before it reads ahead, and the first batch's
 /// size, which doubles with each batch up to [`ReadOptions::readahead_blocks`] (#712). A short
 /// scan (a few rows past its seek, the common case) then fetches nothing it does not read;
@@ -262,6 +270,21 @@ impl SstIter {
     /// (#402) fetches more from its miss path.
     pub fn upcoming(&self, max: usize, out: &mut Vec<crate::Fetch>) {
         self.upcoming_with(max, true, false, |_, fetch| out.push(fetch));
+    }
+
+    /// Where this cursor's readahead ramp stands (#712), for [`SstIter::resume_readahead`].
+    pub fn readahead_ramp(&self) -> ReadaheadRamp {
+        ReadaheadRamp {
+            stepped: self.stepped,
+            window: self.window,
+        }
+    }
+
+    /// Resumes a ramp taken with [`SstIter::readahead_ramp`] (#712): for a level's cursor
+    /// that read one SST to its end and is now positioned at the next one's first entry. That
+    /// is the scan reading on, not a seek, so readahead keeps the size it had reached.
+    pub fn resume_readahead(&mut self, ramp: ReadaheadRamp) {
+        (self.stepped, self.window) = (ramp.stepped, ramp.window);
     }
 
     /// [`SstIter::upcoming`], each fetch handed to `f` with its block's address. With

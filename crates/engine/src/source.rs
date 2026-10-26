@@ -502,8 +502,11 @@ impl SstSource {
             return Ok(());
         };
         while !self.iter.valid() && level.at + 1 < level.files.len() {
+            // The scan reads on into the next SST: its readahead keeps the ramp's size.
+            let ramp = self.iter.readahead_ramp();
             self.iter = level.open(level.at + 1)?;
             self.iter.seek_to_first()?;
+            self.iter.resume_readahead(ramp);
         }
         Ok(())
     }

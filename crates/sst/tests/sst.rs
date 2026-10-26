@@ -690,6 +690,35 @@ fn readahead_ramps_up_after_a_seek_so_a_short_scan_fetches_nothing() {
 }
 
 #[test]
+fn a_resumed_ramp_reads_ahead_at_the_size_it_had_reached() {
+    // #712: a level scan that reads one SST to its end and goes on into the next keeps its
+    // readahead's size there, instead of starting the ramp again as a seek does.
+    let (_vfs, first, _) = many_blocks(25);
+    let mut it = first.iter(ScanFilter::all(), readahead(16, true, false));
+    it.seek_to_first().unwrap();
+    while it.valid() {
+        it.next().unwrap();
+    }
+    let ramp = it.readahead_ramp();
+    let (_vfs, next, want) = many_blocks(26);
+    let mut it = next.iter(ScanFilter::all(), readahead(16, true, false));
+    it.seek_to_first().unwrap();
+    it.resume_readahead(ramp);
+    // The first miss past the first block fetches a full batch.
+    let mut batches = Vec::new();
+    for _ in 0..20 {
+        let (res, counts) = pigeonhole_sst::counting_readahead(|| it.next());
+        res.unwrap();
+        if counts.issued > 0 {
+            batches.push(counts.issued);
+        }
+    }
+    assert_eq!(batches.first(), Some(&16), "{batches:?}");
+    assert!(it.valid());
+    assert_eq!(it.key(), &want[20].0[..]);
+}
+
+#[test]
 fn a_cache_only_cursor_never_fetches_ahead() {
     let (_vfs, r, _) = many_blocks(22);
     let mut o = readahead(4, true, false);

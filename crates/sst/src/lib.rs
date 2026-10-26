@@ -40,7 +40,7 @@ use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::value::BlobPointer;
 use pigeonhole_format::{BlobFileId, FamilyId, SstId, TableId, TabletId};
 
-pub use iter::SstIter;
+pub use iter::{ReadaheadRamp, SstIter};
 pub use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use pigeonhole_io::FileRef;
 pub use reader::Fetch;
