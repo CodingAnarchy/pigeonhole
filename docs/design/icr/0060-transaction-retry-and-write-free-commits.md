@@ -36,7 +36,7 @@ It writes nothing, so it has no seqno of its own and nothing to make durable. It
   - a commit that fails with an error the policy retries (`Conflict`, `SnapshotExpired`, and `Busy` if asked);
   - a `body` error, when one of the transaction's own reads failed with such an error, which the transaction records (`Transaction::failed_read`, crate-private).
 
-  Any other `body` error is returned as is, with nothing committed: that's how an application gives up with its own error type. Pauses are exponential with full jitter, cut short at the deadline. Each retry counts in `EngineMetrics::transaction_retries` (ICR 0061).
+  Any other `body` error is returned as is, with nothing committed: that's how an application gives up with its own error type. Pauses are exponential with full jitter, cut short at the deadline; one below 100 µs is yield-spun, not slept (amendment of 2026-10-26 below). Each retry counts in `EngineMetrics::transaction_retries` (ICR 0061).
 - **`RetryPolicy`** (`Clone`, `Debug`, `Default`; private fields, builder methods):
   - `max_attempts(n)`, `unlimited_attempts()` (the default);
   - `deadline(d)` (default 30 s, the default write-stall timeout), `no_deadline()`;
@@ -103,3 +103,12 @@ ICR 0050 gives a commit refused by the failed engine while a recovery runs `Busy
 - 5 µs is best or tied on throughput and has the lowest p99.9 in every contended cell.
 - Against 100 µs: transfer at `Buffered` gains 3.1% throughput, with p99 −23% and p99.9 −52%. At default, 2.0%, −12% and −36%.
 - An adaptive base (a multiple of recent attempt times) did no better, so none was added.
+
+## Amendment (2026-10-26, owner's #932 pick; .coord/brief-932-pick.md)
+
+**`transact` yield-spins a pause below 100 µs instead of sleeping.** Until the pause has passed, it calls `thread::yield_now`; a pause of 100 µs or more still sleeps. `RetryPolicy`, its defaults, `delay` and `next_pause` are unchanged, so a caller that drives the loop with its own timer sees the same pauses. The threshold is internal, not a policy field: it's a property of how the OS sleeps, not of the workload. The API is unreleased, so the ICR is amended in place.
+
+**Why:** #932's M0 run measured 61 µs of a contended transfer's ~104 µs per operation spent paused, ~52 µs of it past the pause asked for. That overshoot is Linux's timer slack (50 µs by default for normal threads), which stretches every `nanosleep`. A library shouldn't change its caller's slack (`PR_SET_TIMERSLACK`). The study (#932, https://github.com/CodingAnarchy/pigeonhole/issues/932#issuecomment-6407096501) compared main against immediate retry, the spin, and the spin with a 50, 100, 200 or 400 µs cap. It ran transfer and transactional ycsb-f at both levels, plus a ycsb-a 16 control.
+- **The spin:** transfer's p99 falls from 464 to 190 µs at `Buffered` and from 1,282 to 688 µs at the default, with 2.6% and 3.5% more throughput. Transfer's p99.9 falls too. ycsb-f and ycsb-a are level, since they don't retry.
+- **The caps and immediate retry:** they raise attempts per operation from about 1.2 to 1.5–2.6 and transfer's p99 to 1.4–4.8 ms, so none was adopted.
+
