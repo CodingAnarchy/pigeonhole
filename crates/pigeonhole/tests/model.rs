@@ -2224,6 +2224,21 @@ fn log_failure(line: &str) {
     }
 }
 
+/// Appends `line` to the file `PIGEONHOLE_SUMMARY_LOG` names, when it is set: a target's
+/// totals over its seeds, which a sweep keeps whether the run passed or failed.
+fn log_summary(line: &str) {
+    let Some(path) = std::env::var_os("PIGEONHOLE_SUMMARY_LOG") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// How long one seed may run before [`check`] declares it hung: `PIGEONHOLE_SEED_TIMEOUT`
 /// seconds, 120 by default (a seed normally takes well under a second).
 fn seed_timeout() -> Duration {
@@ -2382,6 +2397,19 @@ fn io_failures_are_recovered_in_place_and_match_a_durable_prefix() {
     // D265's arm (#620): injected read and write errors with `Recovery::Io` on; every
     // failure the supervisor recovers from is checked by reading back (the module doc).
     let stats = check(&Config::recovering(1000));
+    let sum = |f: fn(&Stats) -> usize| stats.iter().map(f).sum::<usize>();
+    // The forced failure's re-arms, for the sweep's summary artifact: a passing seed's stats
+    // line is captured, so this is where a sweep shows them (#897, perf287's review of #952).
+    log_summary(&format!(
+        "io_failures_are_recovered_in_place_and_match_a_durable_prefix: {} seeds from {}: \
+         forced_rearms {}, forced_preempted {}, recoveries {}, recoveries_random {}",
+        stats.len(),
+        std::env::var("PIGEONHOLE_SEED").unwrap_or_else(|_| "1".into()),
+        sum(|s| s.forced_rearms),
+        sum(|s| s.forced_preempted),
+        sum(|s| s.recoveries),
+        sum(|s| s.recoveries_random),
+    ));
     // Every seed forces one WAL failure (#880; the simulator counts it as it fires), so a
     // recovery happens whatever the random faults hit, and this stays a real check of the
     // arm. The random faults' own recoveries are printed per seed and must happen over a

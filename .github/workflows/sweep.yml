@@ -110,6 +110,8 @@ jobs:
           PIGEONHOLE_SEEDS: ${{ matrix.chunk.seeds }}
           # Failing and hung seeds append here (the public `model` target, #897).
           PIGEONHOLE_FAIL_LOG: ${{ runner.temp }}/failures.log
+          # Targets' totals over their seeds (the recovery arm's forced re-arms, #897).
+          PIGEONHOLE_SUMMARY_LOG: ${{ runner.temp }}/summary.log
         run: |
           [[ "$PACKAGE$TEST" =~ ^[A-Za-z0-9_-]+$ && "$FILTER" =~ ^[A-Za-z0-9_:]*$ ]] \
             || { echo "bad package, test or filter"; exit 1; }
@@ -120,4 +122,11 @@ jobs:
         with:
           name: failures-${{ matrix.chunk.seed }}
           path: ${{ runner.temp }}/failures.log
+          if-no-files-found: ignore
+      - name: Keep the summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: summary-${{ matrix.chunk.seed }}
+          path: ${{ runner.temp }}/summary.log
           if-no-files-found: ignore
