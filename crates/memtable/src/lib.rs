@@ -81,11 +81,9 @@ use pigeonhole_format::{Cursor, Seqno};
 use pigeonhole_io::SharedRegion;
 
 mod mem;
-mod tail;
 
 use mem::{Mem, Ordering};
 use pigeonhole_format::key::SUFFIX_LEN;
-use tail::TailIndex;
 
 #[cfg(all(test, loom))]
 mod loom_tests;
@@ -150,10 +148,14 @@ const RESERVED: usize = 64;
 const HEAD_LEN: usize = layout::N_TOWER + 4 * MAX_HEIGHT;
 /// Offsets are `u32`, so an arena holds at most this many bytes.
 const MAX_ARENA_LEN: usize = 1 << 32;
-/// Header layout version written to every memtable header.
-const HEADER_VERSION: u16 = 1;
+/// Header layout version written to every memtable header (2: nodes carry a stale-tail
+/// offset, D277).
+const HEADER_VERSION: u16 = 2;
 /// Header flag bit: frozen.
 const FLAG_FROZEN: u8 = 1;
+/// Header flag bit: the writer records stale tails in this memtable's nodes (D194, D277), so
+/// a reader's [`Cursor::skip_column`] can jump.
+const FLAG_TAILS: u8 = 2;
 /// The null offset.
 const NULL: u32 = 0;
 /// Extra traversal steps allowed beyond the entry count before a walk is called a cycle
@@ -167,16 +169,12 @@ const STEP_SLACK: usize = MAX_HEIGHT + 16;
 /// Also carries the writer's process-local knowledge of the memtable (ICR 0020): whether a
 /// delete marker was ever inserted. A pin a reader process makes for a root it found in a
 /// view has no writer behind it, so it answers "maybe" ([`MemtableReader::may_have_markers`]).
-/// And it holds the memtable's stale-tail index (D194), set by `with_tail_index`: every
-/// handle reaches it through the pin it already holds, at no extra reference count.
 #[derive(Debug)]
 struct Pin {
     /// Made by this memtable's writer (`Memtable::create`), so `markers` is kept.
     writer: bool,
     /// A delete marker was inserted (set before the marker is linked, Release).
     markers: AtomicBool,
-    /// The stale-tail index, when the writer keeps one (D194).
-    tails: std::sync::OnceLock<TailIndex>,
 }
 
 impl Pin {
@@ -184,7 +182,6 @@ impl Pin {
         Self {
             writer: true,
             markers: AtomicBool::new(false),
-            tails: std::sync::OnceLock::new(),
         }
     }
 
@@ -192,7 +189,6 @@ impl Pin {
         Self {
             writer: false,
             markers: AtomicBool::new(true),
-            tails: std::sync::OnceLock::new(),
         }
     }
 }
@@ -613,6 +609,8 @@ pub struct Memtable {
     /// removed, so the splice stays exact.
     splice: [u32; MAX_HEIGHT],
     pin: Arc<Pin>,
+    /// The writer records stale tails (D194, D277): set by [`Memtable::with_tail_index`].
+    tails: bool,
 }
 
 impl Memtable {
@@ -648,6 +646,7 @@ impl Memtable {
         mem.write_u32(head + layout::N_KEY_LEN, 0);
         mem.write_u32(head + layout::N_VALUE_LEN, 0);
         mem.write(head + layout::N_HEIGHT, &[MAX_HEIGHT as u8, 0, 0, 0]);
+        mem.write_u32(head + layout::N_TAIL, NULL);
         for level in 0..MAX_HEIGHT {
             mem.write_u32(tower(head as u32, level), NULL);
         }
@@ -670,14 +669,17 @@ impl Memtable {
             rng: 0x9E37_79B9_7F4A_7C15 ^ (root as u64),
             splice: [head as u32; MAX_HEIGHT],
             pin,
+            tails: false,
         })
     }
 
-    /// Keeps a stale-tail index (D194, ICR 0013): for each entry inserted in front of an
-    /// older entry of its column, a later entry of that column, so a reader that has finished
-    /// the column passes its superseded versions in one jump ([`Cursor::skip_column`]). The
-    /// index is process memory: readers from [`Memtable::reader`] share it, and readers from
-    /// [`MemtableReader::open`] (other processes) have none. Call before the first insert.
+    /// Records stale tails (D194, ICR 0013; in the node since D277): for each entry inserted
+    /// in front of an older entry of its column, a later entry of that column, so a reader
+    /// that has finished the column passes its superseded versions in one jump
+    /// ([`Cursor::skip_column`]). The tail is a field of the node in the arena (FORMAT
+    /// §11.6), so readers from [`Memtable::reader`] and from [`MemtableReader::open`] (other
+    /// processes) jump alike; the header's flag tells them the tails are recorded. Call
+    /// before the first insert.
     ///
     /// ```
     /// use pigeonhole_format::{Cursor, Kind, encode_key};
@@ -705,12 +707,15 @@ impl Memtable {
     ///
     /// # Panics
     /// If the memtable already holds entries.
-    pub fn with_tail_index(self) -> Self {
+    pub fn with_tail_index(mut self) -> Self {
         assert_eq!(self.count, 0, "with_tail_index on a memtable with entries");
-        let index = TailIndex::new(self.region.len());
-        if self.pin.tails.set(index).is_err() {
-            unreachable!("a new memtable's pin has no index yet");
-        }
+        self.tails = true;
+        // Before the memtable is published (its root reaches a view only after this).
+        self.region.mem.fetch_or_u8(
+            self.root as usize + layout::H_FLAGS,
+            FLAG_TAILS,
+            Ordering::Release,
+        );
         self
     }
 
@@ -787,7 +792,10 @@ impl Memtable {
         mem.write_u32(off + layout::N_KEY_LEN, key_len);
         mem.write_u32(off + layout::N_VALUE_LEN, value_len);
         mem.write(off + layout::N_HEIGHT, &[height as u8, 0, 0, 0]);
-        // Level 0 first: its successor is the stale-tail index's too.
+        // Always written, tails recorded or not: the chunk may hold an older memtable's bytes
+        // (D277, perf287's P2). `record_tail` overwrites it below when the node has one.
+        mem.write_u32(off + layout::N_TAIL, NULL);
+        // Level 0 first: its successor is the stale tail's too.
         let next0 = mem.load_u32(tower(prev[0], 0), Ordering::Relaxed);
         mem.write_u32(tower(node, 0), next0);
         // An index loop: the iterator form (`enumerate().take(height).skip(1)` over the
@@ -800,9 +808,10 @@ impl Memtable {
         let key_off = off + layout::N_TOWER + 4 * height;
         mem.write(key_off, key);
         mem.write(key_off + key.len(), value);
-        // Before the node is linked, so a reader that reaches it sees its entry. An insert in
-        // key order (no successor) tests one word.
-        if next0 != NULL && self.pin.tails.get().is_some() {
+        // Before the node is linked, so a reader that reaches it (an Acquire of the link)
+        // sees its tail, as it sees its key (D277). An insert in key order (no successor)
+        // tests one word.
+        if next0 != NULL && self.tails {
             self.record_tail(node, next0, key);
         }
 
@@ -863,15 +872,14 @@ impl Memtable {
     /// line, so `insert` keeps its shape for the inserts that need none.
     #[inline(never)]
     fn record_tail(&self, node: u32, next: u32, key: &[u8]) {
-        let Some(tails) = self.pin.tails.get() else {
-            return;
-        };
         if self.same_column(next, key) {
-            let tail = match tails.get(next) {
+            let mem = &self.region.mem;
+            // `next` is linked already, so its tail (and the tail's target) are published.
+            let tail = match mem.read_u32(next as usize + layout::N_TAIL) {
                 NULL => next,
                 t => t,
             };
-            tails.set(node, tail);
+            mem.write_u32(node as usize + layout::N_TAIL, tail);
         }
     }
 
@@ -960,13 +968,17 @@ impl Memtable {
     }
 
     /// A reader for other threads. While it (or a cursor or slice taken from it) is alive,
-    /// the memtable's chunks are not reused.
+    /// the memtable's chunks are not reused. The only reader that trusts the stale tails
+    /// (D277): this process wrote them, so its column skips follow them unchecked, as D194's
+    /// process-local index did. A reader from [`MemtableReader::open`] checks every tail.
     pub fn reader(&self) -> MemtableReader {
         MemtableReader {
             region: self.region.clone(),
             root: self.root,
             head: self.head,
             pin: Arc::clone(&self.pin),
+            tails: self.tails,
+            trusted: true,
         }
     }
 
@@ -1029,6 +1041,13 @@ pub struct MemtableReader {
     /// Keeps the memtable's chunks from being reused while this handle lives (writer
     /// process only; in a reader process it pins nothing).
     pin: Arc<Pin>,
+    /// The writer records stale tails in the nodes (the header's `FLAG_TAILS`, D277).
+    tails: bool,
+    /// The tails were written by this process: set only by [`Memtable::reader`], kept by
+    /// clones and cursors, never set on a reader from [`MemtableReader::open`] (in the writer
+    /// process too, whose `open` also gets a writer pin). A trusted skip follows a tail
+    /// unchecked; an untrusted one validates it first (M1, P1).
+    trusted: bool,
 }
 
 impl MemtableReader {
@@ -1070,11 +1089,16 @@ impl MemtableReader {
         }
         let head = mem.read_u32(off + layout::H_HEAD);
         let pin = region.registry.pin_for(root);
+        // Set before the memtable was published (`with_tail_index`); the frozen bit beside
+        // it may change concurrently, hence an atomic load.
+        let tails = mem.load_u8(off + layout::H_FLAGS, Ordering::Acquire) & FLAG_TAILS != 0;
         let reader = MemtableReader {
             region,
             root,
             head,
             pin,
+            tails,
+            trusted: false,
         };
         let node = reader.node(head)?;
         if node.height != MAX_HEIGHT || node.key_len != 0 || node.value_len != 0 {
@@ -1284,6 +1308,13 @@ impl MemtableReader {
             self.node(next).map(Some)
         }
     }
+
+    /// Whether the validated node `n` is in `column` (an internal key without its suffix).
+    #[inline]
+    fn in_column(&self, n: &Node, column: &[u8]) -> bool {
+        n.key_len == column.len() + SUFFIX_LEN
+            && self.region.mem.cmp(n.key_off, column.len(), column) == Cmp::Equal
+    }
 }
 
 /// A zero-copy cursor over a memtable: keys and values borrow arena memory, which the view
@@ -1341,11 +1372,16 @@ impl MemIter {
     /// (D194) and holds entries. A reader can leave the skip off for a read whose sources
     /// have no such memtable, so it never pays for a try that cannot succeed.
     pub fn skips_columns(&self) -> bool {
-        self.reader.pin.tails.get().is_some() && !self.reader.is_empty()
+        self.reader.tails && !self.reader.is_empty()
     }
 
     /// [`Cursor::skip_column`]'s jump: from the tail `at`, steps while the key is still in
     /// `column` (following later tails), and stops on the first entry past it.
+    ///
+    /// A tail is an offset read from the arena, untrusted in a reader process (D277,
+    /// perf287's M1): each one is validated as a node ([`MemtableReader::node`]) before its
+    /// link is loaded, and must be in `column` (P1), so a bad tail (reused memory, a writer
+    /// bug) is [`Error::Corrupt`], never a fault or a silent skip of live entries.
     fn jump(&mut self, mut at: u32, column: &[u8]) -> Result<bool> {
         loop {
             self.steps += 1;
@@ -1355,14 +1391,32 @@ impl MemIter {
                     return Err(Error::Corrupt("link cycle"));
                 }
             }
+            if self.reader.trusted {
+                // This process wrote the tail: checked in debug builds only, so a
+                // `record_tail` bug still fails the tests.
+                debug_assert!(
+                    self.reader
+                        .node(at)
+                        .is_ok_and(|t| self.reader.in_column(&t, column)),
+                    "stale tail {at} outside its column"
+                );
+            } else {
+                // From shared memory: validated before its link is loaded (M1), and in the
+                // column (P1).
+                let t = self.reader.node(at)?;
+                if !self.reader.in_column(&t, column) {
+                    return Err(Error::Corrupt("stale tail outside its column"));
+                }
+            }
             let next = self.reader.successor(at)?;
             match next {
-                Some(n)
-                    if n.key_len == column.len() + SUFFIX_LEN
-                        && self.reader.region.mem.cmp(n.key_off, column.len(), column)
-                            == Cmp::Equal =>
-                {
-                    at = match self.reader.pin.tails.get().map_or(NULL, |t| t.get(n.off)) {
+                Some(n) if self.reader.in_column(&n, column) => {
+                    at = match self
+                        .reader
+                        .region
+                        .mem
+                        .read_u32(n.off as usize + layout::N_TAIL)
+                    {
                         NULL => n.off,
                         t => t,
                     };
@@ -1519,10 +1573,14 @@ impl Cursor for MemIter {
     /// then steps inside the memtable while the key is still in `column`.
     #[inline]
     fn skip_column(&mut self, column: &[u8]) -> Result<bool> {
-        let (Some(tails), Some(node)) = (self.reader.pin.tails.get(), self.node) else {
+        let Some(node) = self.node.filter(|_| self.reader.tails) else {
             return Ok(false);
         };
-        let at = tails.get(node.off);
+        let at = self
+            .reader
+            .region
+            .mem
+            .read_u32(node.off as usize + layout::N_TAIL);
         if at == NULL {
             return Ok(false);
         }

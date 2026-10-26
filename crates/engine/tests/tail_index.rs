@@ -30,7 +30,15 @@ struct Rig {
     db: Arc<Engine>,
     shard: EngineShard,
     t: Arc<TableInfo>,
+    vfs: Arc<SimVfs>,
 }
+
+/// The reader process of D277's check: it reads the writer's memtables through the shared
+/// arena, jumping by the stale tails the writer stored in the nodes.
+const READER: pigeonhole_io::ProcessId = pigeonhole_io::ProcessId {
+    pid: 4242,
+    start_time: 1,
+};
 
 /// A read's result, comparable: (family, qualifier, timestamp, value) per cell.
 type Cells = Vec<(u32, Vec<u8>, u64, Vec<u8>)>;
@@ -38,7 +46,7 @@ type Cells = Vec<(u32, Vec<u8>, u64, Vec<u8>)>;
 impl Rig {
     fn open(seed: u64) -> Self {
         let vfs = SimVfs::new(seed);
-        let mut o = common::options(vfs, 1, 16 << 20);
+        let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
         o.tablet_changes = false;
         o.compaction.l0_trigger = u32::MAX;
         o.memtable_tail_index = true;
@@ -64,7 +72,7 @@ impl Rig {
                 ],
             )
             .unwrap();
-        Self { db, shard, t }
+        Self { db, shard, t, vfs }
     }
 
     fn wait<F: Future + Unpin>(&mut self, mut f: F) -> F::Output {
@@ -106,51 +114,52 @@ impl Rig {
 
     /// Every row read and a full scan, under every spec.
     fn read_all(&self, snap: &Snapshot) -> Vec<Cells> {
-        let mut out = Vec::new();
-        for spec in self.specs() {
-            for r in 0..ROWS {
-                let row = self
-                    .db
-                    .read_row(snap, self.t.id, &row_key(r), &spec)
-                    .unwrap();
-                out.push(row.map_or_else(Vec::new, |row| {
-                    row.cells
-                        .iter()
-                        .map(|c| {
-                            (
-                                c.family.0,
-                                row.qualifier(c).to_vec(),
-                                c.data.timestamp(),
-                                common::value_bytes(c.data.value()),
-                            )
-                        })
-                        .collect()
-                }));
-            }
-            let mut scan = self
-                .db
-                .scan(snap, self.t.id, {
-                    let mut scan = ScanSpec::new(Bound::Unbounded, Bound::Unbounded);
-                    scan.read = spec.clone();
-                    scan
-                })
-                .unwrap();
-            let mut cells = Vec::new();
-            while scan.next_row().unwrap() {
-                let row = scan.row().to_vec();
-                while let Some(c) = scan.next_cell().unwrap() {
-                    cells.push((
-                        c.family.0,
-                        [row.as_slice(), b"/", c.qualifier].concat(),
-                        c.ts,
-                        c.stored.to_vec(),
-                    ));
-                }
-            }
-            out.push(cells);
-        }
-        out
+        read_all_on(&self.db, &self.t, snap, self.specs())
     }
+}
+
+/// Every spec's row reads and scan of `t` through `db` (the writer, or a reader process).
+fn read_all_on(db: &Engine, t: &TableInfo, snap: &Snapshot, specs: Vec<ReadSpec>) -> Vec<Cells> {
+    let mut out = Vec::new();
+    for spec in specs {
+        for r in 0..ROWS {
+            let row = db.read_row(snap, t.id, &row_key(r), &spec).unwrap();
+            out.push(row.map_or_else(Vec::new, |row| {
+                row.cells
+                    .iter()
+                    .map(|c| {
+                        (
+                            c.family.0,
+                            row.qualifier(c).to_vec(),
+                            c.data.timestamp(),
+                            common::value_bytes(c.data.value()),
+                        )
+                    })
+                    .collect()
+            }));
+        }
+        let mut scan = db
+            .scan(snap, t.id, {
+                let mut scan = ScanSpec::new(Bound::Unbounded, Bound::Unbounded);
+                scan.read = spec.clone();
+                scan
+            })
+            .unwrap();
+        let mut cells = Vec::new();
+        while scan.next_row().unwrap() {
+            let row = scan.row().to_vec();
+            while let Some(c) = scan.next_cell().unwrap() {
+                cells.push((
+                    c.family.0,
+                    [row.as_slice(), b"/", c.qualifier].concat(),
+                    c.ts,
+                    c.stored.to_vec(),
+                ));
+            }
+        }
+        out.push(cells);
+    }
+    out
 }
 
 fn row_key(r: u64) -> Vec<u8> {
@@ -169,7 +178,8 @@ impl Rng {
     }
 }
 
-fn history(seed: u64) {
+/// One seeded history; returns the jumps the reader process took (D277).
+fn history(seed: u64) -> u64 {
     let mut rig = Rig::open(seed);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let fams: Vec<_> = rig.t.families.iter().map(|f| f.id).collect();
@@ -241,11 +251,42 @@ fn history(seed: u64) {
         }
     }
     drop(snaps);
+
+    // D277: a reader process reads the same memtables through the shared arena, jumping by
+    // the tails the writer stored in the nodes. Its reads (jumping and stepping) return
+    // exactly what the writer's do at the same state.
+    let writer = pigeonhole_io::Vfs::current_process(&*rig.vfs);
+    let writer_snap = rig.db.snapshot().unwrap();
+    let want = rig.read_all(&writer_snap);
+    drop(writer_snap);
+    rig.vfs.enter_process(READER);
+    let reader = Engine::open_reader(
+        Path::new(DB),
+        common::options(Arc::clone(&rig.vfs), 1, 16 << 20),
+    )
+    .unwrap();
+    let snap = reader.snapshot().unwrap();
+    let before = Engine::tail_skips();
+    Engine::set_tail_index(true);
+    let jumping = read_all_on(&reader, &rig.t, &snap, rig.specs());
+    let reader_jumps = Engine::tail_skips() - before;
+    Engine::set_tail_index(false);
+    let stepping = read_all_on(&reader, &rig.t, &snap, rig.specs());
+    Engine::set_tail_index(true);
+    drop(snap);
+    drop(reader);
+    rig.vfs.enter_process(writer);
+    for (j, ((a, b), w)) in jumping.iter().zip(&stepping).zip(&want).enumerate() {
+        assert_eq!(a, b, "seed {seed}, reader read {j}: jumping vs stepping");
+        assert_eq!(a, w, "seed {seed}, reader read {j}: reader vs writer");
+    }
+
     let Rig { db, mut shard, .. } = rig;
     db.close().unwrap();
     while shard.closed().is_none() {
         shard.run_once(u64::MAX);
     }
+    reader_jumps
 }
 
 /// One test, so nothing else in this binary flips the process-wide switch meanwhile.
@@ -263,9 +304,15 @@ fn jumping_reads_return_what_stepping_reads_return() {
         .max(MIN_SEEDS);
     let before = Engine::tail_skips();
     let sst_before = Engine::sst_skips();
+    let mut reader_jumps = 0;
     for seed in 1..=seeds {
-        history(seed);
+        reader_jumps += history(seed);
     }
+    // D277: the reader process jumps too, by the tails in the shared nodes.
+    assert!(
+        reader_jumps > 100,
+        "only {reader_jumps} memtable jumps in the reader process: the shared tails are unused"
+    );
     let jumps = Engine::tail_skips() - before;
     assert!(
         jumps > 1_000,

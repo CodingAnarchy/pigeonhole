@@ -485,11 +485,11 @@ fn mismatched_layout_version_is_refused() {
     let (_lock, presence, shm) = db.open_writer(&file);
     shm.publish_view(&view(1, 1, 4)).unwrap();
 
-    // Pretend the live region was built by a build with layout version 3.
+    // Pretend the live region was built by a build with another layout version.
     let (mapping, _, _) = shm.arena(0);
     mapping
         .atomic_u32(header::LAYOUT_VERSION)
-        .store(4, Ordering::Release);
+        .store(5, Ordering::Release);
     db.vfs
         .open_shared(
             &directory_name(db.identity.device, db.identity.inode),
@@ -499,12 +499,12 @@ fn mismatched_layout_version_is_refused() {
         )
         .unwrap()
         .atomic_u32(directory::LAYOUT_VERSION)
-        .store(4, Ordering::Release);
+        .store(5, Ordering::Release);
 
     let mut reader = Peer::spawn("reader", &db.path);
     let answer = reader.recv();
     assert!(
-        answer.starts_with("ERR VersionMismatch") && answer.contains("found: 4"),
+        answer.starts_with("ERR VersionMismatch") && answer.contains("found: 5"),
         "{answer}"
     );
     drop(reader);

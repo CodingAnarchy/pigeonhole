@@ -101,7 +101,7 @@ fn header_follows_format() {
     let root = mt.root() as usize;
     assert_eq!(mem.read_u32(root + layout::H_MAGIC), MEMTABLE_MAGIC);
     assert_eq!(mem.copy(root + layout::H_MAGIC, 4), b"MEMT");
-    assert_eq!(mem.read_u8(root + layout::H_VERSION), 1);
+    assert_eq!(mem.read_u8(root + layout::H_VERSION), 2);
     assert_eq!(mem.read_u8(root + layout::H_VERSION + 1), 0);
     assert_eq!(mem.read_u8(root + layout::H_FLAGS), 0);
     let head = mem.read_u32(root + layout::H_HEAD) as usize;
@@ -341,7 +341,11 @@ fn open_validates_header() {
 
     let mem = &region.mem;
     let saved = mem.copy(root as usize, layout::HEADER_LEN);
-    mem.write(root as usize + layout::H_VERSION, &[2, 0]);
+    // A version this build does not know, and version 1 (nodes without a stale-tail field,
+    // before D277): both refused.
+    mem.write(root as usize + layout::H_VERSION, &[3, 0]);
+    assert_eq!(corrupt(root), Error::Corrupt("memtable header version"));
+    mem.write(root as usize + layout::H_VERSION, &[1, 0]);
     assert_eq!(corrupt(root), Error::Corrupt("memtable header version"));
     mem.write(root as usize, &saved);
 
@@ -369,7 +373,7 @@ fn reader_reports_corrupt_nodes_instead_of_faulting() {
     let mem = &arena.region().mem;
     let first = mem.load_u32(tower(mt.head, 0), Ordering::Acquire);
     let second = mem.load_u32(tower(first, 0), Ordering::Acquire);
-    let saved = mem.copy(second as usize, 12);
+    let saved = mem.copy(second as usize, layout::N_TOWER);
 
     let step = || {
         let mut it = reader.iter();
@@ -783,5 +787,194 @@ fn skip_column_lands_on_the_next_column() {
             jumps > if cfg!(miri) { 10 } else { 100 },
             "seed {seed}: only {jumps} jumps"
         );
+    }
+}
+
+/// D277 (perf287's M1 and P1): a stale tail is an offset read from the arena, untrusted in a
+/// reader process. A bad one (past the arena, misaligned, inside the header, at a node of
+/// height 0, pointing backward, or at a valid node of another column) surfaces as
+/// `Corrupt` from `skip_column`, never as a panic, a fault or a silent skip.
+#[test]
+fn a_bad_stale_tail_is_corrupt_never_a_fault() {
+    let mut arena = small();
+    let mut mt = Memtable::create(&mut arena).unwrap().with_tail_index();
+    let ckey = |q: &[u8], ts| {
+        let mut k = Vec::new();
+        encode_key(&mut k, b"row", q, ts, ts, Kind::Put).unwrap();
+        k
+    };
+    for ts in 1..=5 {
+        mt.insert(&mut arena, &ckey(b"a", ts), b"\x00v").unwrap();
+    }
+    mt.insert(&mut arena, &ckey(b"b", 1), b"\x00v").unwrap();
+    let column = ckey(b"a", 0)[..ckey(b"a", 0).len() - SUFFIX_LEN].to_vec();
+    let region = arena.region().clone();
+    let mem = &region.mem;
+    // The nodes in key order: a@5, a@4, ..., a@1, b@1.
+    let a5 = mem.load_u32(tower(mt.head, 0), Ordering::Acquire);
+    let a4 = mem.load_u32(tower(a5, 0), Ordering::Acquire);
+    let a3 = mem.load_u32(tower(a4, 0), Ordering::Acquire);
+    let mut b1 = a4;
+    while b1 != NULL
+        && mem.read_u32(b1 as usize + layout::N_KEY_LEN) as usize == column.len() + SUFFIX_LEN
+        && mem.cmp(
+            b1 as usize
+                + layout::N_TOWER
+                + 4 * mem.read_u8(b1 as usize + layout::N_HEIGHT) as usize,
+            column.len(),
+            &column,
+        ) == Cmp::Equal
+    {
+        b1 = mem.load_u32(tower(b1, 0), Ordering::Acquire);
+    }
+    let good = mem.read_u32(a4 as usize + layout::N_TAIL);
+    assert_ne!(good, NULL, "a@4 has a stale tail");
+    // Through a reader opened by root, as a reader process opens it.
+    let reader = MemtableReader::open(region.clone(), mt.root()).unwrap();
+    let skip = || {
+        let mut it = reader.iter();
+        it.seek_to_first()?;
+        it.next()?; // on a@4
+        it.skip_column(&column)
+    };
+    assert_eq!(skip(), Ok(true), "the good tail jumps");
+
+    // A node of height 0, written in unused arena space near its end.
+    let zero = (64 * 1024 - 128) as u32;
+    mem.write_u32(zero as usize + layout::N_KEY_LEN, 0);
+    mem.write_u32(zero as usize + layout::N_VALUE_LEN, 0);
+    mem.write(zero as usize + layout::N_HEIGHT, &[0, 0, 0, 0]);
+    // Wherever a bad tail lands, the reader reports corruption (which check fires depends
+    // on the bytes there); a tail on a valid node of another column names itself (P1).
+    let cases: [(&str, u32, Option<&str>); 6] = [
+        ("past the arena", (64 * 1024 - 4) as u32, None),
+        ("misaligned", a3 + 1, Some("node offset")),
+        ("inside the header", mt.root() + 4, None),
+        ("at a node of height 0", zero, Some("node height")),
+        ("another column", b1, Some("stale tail outside its column")),
+        (
+            "backward, to the head",
+            mt.head,
+            Some("stale tail outside its column"),
+        ),
+    ];
+    for (what, bad, expect) in cases {
+        mem.write_u32(a4 as usize + layout::N_TAIL, bad);
+        match (skip(), expect) {
+            (Err(Error::Corrupt(got)), Some(want)) => assert_eq!(got, want, "{what}"),
+            (Err(Error::Corrupt(_)), None) => {}
+            (other, _) => panic!("{what}: {other:?}"),
+        }
+    }
+    mem.write_u32(a4 as usize + layout::N_TAIL, good);
+    assert_eq!(skip(), Ok(true));
+}
+
+/// D277 (perf287's option 2 on #934): the writer's own `reader()` follows the tails it wrote
+/// without validating them, and lands where a reader opened by root, which validates them,
+/// does.
+#[test]
+fn the_writers_reader_jumps_by_its_own_tails_as_a_checked_reader_does() {
+    let (arena, mt, column, _) = tail_fixture();
+    let checked = MemtableReader::open(arena.region().clone(), mt.root()).unwrap();
+    let land = |reader: &MemtableReader| {
+        let mut it = reader.iter();
+        it.seek_to_first().unwrap();
+        it.next().unwrap(); // on a@4
+        assert_eq!(it.skip_column(&column), Ok(true), "the tail jumps");
+        it.key().to_vec()
+    };
+    let landed = land(&mt.reader());
+    assert!(landed.starts_with(b"row") && !landed.starts_with(&column));
+    assert_eq!(landed, land(&checked));
+}
+
+/// D277 (perf287's condition 3 on #934): on the trusted path M1 and P1 stay as debug
+/// assertions, so a `record_tail` bug still fails the tests in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "outside its column")]
+fn a_bad_tail_on_the_writers_reader_fails_a_debug_assertion() {
+    let (arena, mt, column, b1) = tail_fixture();
+    let a5 = arena
+        .region()
+        .mem
+        .load_u32(tower(mt.head, 0), Ordering::Acquire);
+    let a4 = arena.region().mem.load_u32(tower(a5, 0), Ordering::Acquire);
+    arena
+        .region()
+        .mem
+        .write_u32(a4 as usize + layout::N_TAIL, b1);
+    let reader = mt.reader();
+    let mut it = reader.iter();
+    it.seek_to_first().unwrap();
+    it.next().unwrap();
+    let _ = it.skip_column(&column);
+}
+
+/// Column `a` at timestamps 5 down to 1, then `b@1`, with tails recorded: the arena, the
+/// memtable, column `a`, and `b@1`'s node.
+fn tail_fixture() -> (ShardArena, Memtable, Vec<u8>, u32) {
+    let mut arena = small();
+    let mut mt = Memtable::create(&mut arena).unwrap().with_tail_index();
+    let ckey = |q: &[u8], ts| {
+        let mut k = Vec::new();
+        encode_key(&mut k, b"row", q, ts, ts, Kind::Put).unwrap();
+        k
+    };
+    for ts in 1..=5 {
+        mt.insert(&mut arena, &ckey(b"a", ts), b"\x00v").unwrap();
+    }
+    mt.insert(&mut arena, &ckey(b"b", 1), b"\x00v").unwrap();
+    let column = ckey(b"a", 0)[..ckey(b"a", 0).len() - SUFFIX_LEN].to_vec();
+    let mut b1 = mt.head;
+    for _ in 0..6 {
+        b1 = arena.region().mem.load_u32(tower(b1, 0), Ordering::Acquire);
+    }
+    (arena, mt, column, b1)
+}
+
+/// D277 (perf287's P2): chunks are reused without zeroing, so every insert writes its node's
+/// stale-tail field before the node is linked, whether or not the memtable records tails.
+/// A memtable built over chunks whose previous memtable recorded tails everywhere shows a
+/// null tail on every node that has none, with tails recorded or not.
+#[test]
+fn reused_chunks_never_show_a_previous_memtables_tails() {
+    for tails in [false, true] {
+        let mut arena = small();
+        let ckey = |q: &[u8], ts| {
+            let mut k = Vec::new();
+            encode_key(&mut k, b"row", q, ts, ts, Kind::Put).unwrap();
+            k
+        };
+        // Overwrites, oldest first: every version after the first records a tail.
+        let mut old = Memtable::create(&mut arena).unwrap().with_tail_index();
+        for q in 0..20u8 {
+            for ts in 1..=6 {
+                old.insert(&mut arena, &ckey(&[q], ts), b"\x00old").unwrap();
+            }
+        }
+        arena.reclaim(old.retire());
+        // Key order only, distinct columns: no node has a tail.
+        let mut new = Memtable::create(&mut arena).unwrap();
+        if tails {
+            new = new.with_tail_index();
+        }
+        for q in 0..120u8 {
+            new.insert(&mut arena, &ckey(&[q], 1), b"\x00new").unwrap();
+        }
+        let mem = &arena.region().mem;
+        let mut at = mem.load_u32(tower(new.head, 0), Ordering::Acquire);
+        let mut seen = 0;
+        while at != NULL {
+            assert_eq!(
+                mem.read_u32(at as usize + layout::N_TAIL),
+                NULL,
+                "tails {tails}: node {at} shows a stale tail"
+            );
+            seen += 1;
+            at = mem.load_u32(tower(at, 0), Ordering::Acquire);
+        }
+        assert_eq!(seen, 120);
     }
 }

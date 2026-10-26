@@ -334,29 +334,38 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
 
 #[test]
 fn layout_version_mismatch_is_refused_unless_alone() {
+    // The previous layout (an older writer's region left behind, D277's upgrade: perf287's
+    // P3) and a newer one.
+    for other in [3, 5] {
+        mismatch_refused_unless_alone(other);
+    }
+}
+
+fn mismatch_refused_unless_alone(other: u32) {
+    let current = pigeonhole_format::ShmLayoutVersion::CURRENT.0;
     let sim = SimVfs::new(6);
     let w = Proc::start(&sim, pid(1));
     let (lock, wp, shm) = w.open_writer();
     let r = Proc::start(&sim, pid(11));
     let (rp, _shm_r, _slot) = r.open_reader();
 
-    // Pretend the live region was built by a build with layout version 3.
+    // Pretend the live region was built by a build with another layout version.
     let (mapping, _, _) = shm.arena(0);
     mapping
         .atomic_u32(header::LAYOUT_VERSION)
-        .store(4, Ordering::Release);
+        .store(other, Ordering::Release);
     let dir_name = directory_name(w.identity.device, w.identity.inode);
     w.vfs
         .open_shared(&dir_name, None, directory::LEN as u64, SharedOpen::Attach)
         .unwrap()
         .atomic_u32(directory::LAYOUT_VERSION)
-        .store(4, Ordering::Release);
+        .store(other, Ordering::Release);
 
     // A new reader is refused.
     let r2 = Proc::start(&sim, pid(12));
     match r2.open(Role::Reader) {
         Err(Error::VersionMismatch { found, expected }) => {
-            assert_eq!((found, expected), (4, 3));
+            assert_eq!((found, expected), (other, current));
         }
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
@@ -367,7 +376,7 @@ fn layout_version_mismatch_is_refused_unless_alone() {
     let w2 = Proc::start(&sim, pid(2));
     let lock2 = WriterLock::acquire(&w2.file).unwrap();
     match w2.open(Role::Writer) {
-        Err(Error::VersionMismatch { found, .. }) => assert_eq!(found, 4),
+        Err(Error::VersionMismatch { found, .. }) => assert_eq!(found, other),
         other => panic!("expected VersionMismatch, got {other:?}"),
     }
     // ...and rebuilds once it is alone. The probe ran with no presence lock held (D37) and

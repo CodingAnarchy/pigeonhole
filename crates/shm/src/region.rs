@@ -1340,7 +1340,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 3
+                expected: 4
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });
