@@ -15,10 +15,13 @@
 //! the call, and the future resolves to it on its first poll, holding nothing else (#709).
 //! A block the cache does not hold is read through the VFS's asynchronous reads, and the
 //! read runs again once it is cached; such a read, and a read at a snapshot, takes its read
-//! point on the first poll, so every attempt sees the same data. Dropping a read future is always safe. Two cases read synchronously inside the
-//! future, counted by [`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads)
-//! (D196, #398): a separated value too large to cache (above an eighth of the block cache,
-//! at most 1 MiB), and a block the cache cannot keep (a cache of size 0).
+//! point on the first poll, so every attempt sees the same data. Dropping a read future is
+//! always safe. Two cases read synchronously, counted by
+//! [`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads) (D196, #398):
+//! - a separated value too large to cache (above an eighth of the block cache, at most
+//!   1 MiB): inside `get_async` or `read_async` itself when the rest of the read hits at
+//!   the call, else inside the future;
+//! - a block the cache cannot keep (a cache of size 0): inside the future.
 //!
 //! **Commits.** `commit_async` and `commit_with_async` submit at the call when the commit's
 //! shard has room, then resolve when the record meets the requested durability and is

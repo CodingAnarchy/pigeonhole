@@ -12,11 +12,12 @@
 //! A future's read point (view and seqno) is taken on its first poll and held, so every
 //! attempt reads the same data.
 //!
-//! A read falls back to one synchronous attempt, counted in `Metrics::async_sync_reads`,
+//! A future falls back to one synchronous attempt, counted in `Metrics::async_sync_reads`,
 //! when the cache cannot keep a fetched block (capacity 0, or a block larger than a cache
 //! shard) or after `MAX_FETCHES` fetches. A separated value is fetched the same way (its
 //! extent header, then its record, in pieces when it spans extents); one too large to cache
-//! is read synchronously and counted (D196, #398).
+//! is read synchronously and counted (D196, #398): at the call, when the attempt there
+//! reaches it (`try_latest_now`), else inside the future.
 
 use std::future::Future;
 use std::pin::Pin;

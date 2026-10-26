@@ -1745,7 +1745,7 @@ impl Engine {
         // In a writer, looked up under the view's guard: a row read checks its table's entry
         // on every call, and cloning the catalog's `Arc` was a reference count every reader
         // thread wrote (#709).
-        if self.inner.reader.is_none() {
+        if !self.inner.is_reader() {
             return self
                 .inner
                 .shared
