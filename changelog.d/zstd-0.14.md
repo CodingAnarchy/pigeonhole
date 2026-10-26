@@ -1,0 +1,2 @@
+### Security
+- zstd is now 0.14.3, with zstd-safe 8.2 and zstd-sys 2.1.2, up from 0.13.3. The upgrade clears RUSTSEC-2026-0391, 0398, 0403 and 0410. Pigeonhole called only zstd's one-shot `bulk` API and never the stream encoders or decoders those advisories describe. The bundled libzstd is still 1.5.7, so compressed blocks are byte-identical to 0.13's. Files written by earlier releases read as before, and a zstd-sealed block from 0.13 is now among the frozen golden files.
