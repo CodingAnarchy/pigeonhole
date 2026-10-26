@@ -40,7 +40,11 @@ pub fn check(path: impl AsRef<Path>, options: CheckOptions) -> Result<CheckRepor
     let engine = pigeonhole_engine::CheckOptions::default()
         .deep(options.deep)
         .allow_fuse(options.allow_fuse);
-    Ok(Engine::check(&vfs, path.as_ref(), &engine)?.into())
+    Ok(CheckReport::from_engine(Engine::check(
+        &vfs,
+        path.as_ref(),
+        &engine,
+    )?))
 }
 
 /// What [`check`] verifies, beyond its default pass.
@@ -249,8 +253,8 @@ impl CheckReport {
     }
 }
 
-impl From<pigeonhole_engine::CheckReport> for CheckReport {
-    fn from(r: pigeonhole_engine::CheckReport) -> Self {
+impl CheckReport {
+    pub(crate) fn from_engine(r: pigeonhole_engine::CheckReport) -> Self {
         use pigeonhole_engine::{Severity as S, Structure as T};
         Self {
             findings: r

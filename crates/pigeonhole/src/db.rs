@@ -4,8 +4,10 @@ use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
-use pigeonhole_engine::{Engine, EngineShard, Failure};
-use pigeonhole_format::Durability;
+use pigeonhole_engine::{Engine, EngineShard};
+
+use crate::Durability;
+use crate::Failure;
 use pigeonhole_io::VfsRef;
 
 use crate::table::TableCore;
@@ -725,12 +727,15 @@ impl Pigeonhole {
     /// ([`Failure::MAIN_FILE`] for the main file) and the
     /// [`FailureCause`](crate::FailureCause). Later failures do not replace it.
     pub fn failure(&self) -> Option<Failure> {
-        self.engine().failure().or_else(|| {
-            self.db
-                .supervision()
-                .filter(|s| s.gave_up())
-                .and_then(|s| s.last_failure())
-        })
+        self.engine()
+            .failure()
+            .map(Failure::from_engine)
+            .or_else(|| {
+                self.db
+                    .supervision()
+                    .filter(|s| s.gave_up())
+                    .and_then(|s| s.last_failure())
+            })
     }
 
     /// A consistent snapshot of everything committed so far. It sees a commit once the commit
@@ -769,7 +774,11 @@ impl Pigeonhole {
     /// hook (ICR 0010) that shows whether one table's writes spread over the shards.
     #[doc(hidden)]
     pub fn shard_stats(&self) -> Vec<crate::ShardStats> {
-        self.engine().shard_stats()
+        self.engine()
+            .shard_stats()
+            .into_iter()
+            .map(crate::ShardStats::from_engine)
+            .collect()
     }
 
     /// The active shard count the balancer published and the count it is heading for (the
@@ -783,7 +792,7 @@ impl Pigeonhole {
     /// What the row cache did since open: hits, misses and fills (D201). All zero when
     /// [`Options::row_cache`](crate::Options::row_cache) is 0.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
-        self.engine().row_cache_stats()
+        crate::RowCacheStats::from_engine(self.engine().row_cache_stats())
     }
 
     /// The writer's counters since this instance opened: commits and their latency,
@@ -792,7 +801,7 @@ impl Pigeonhole {
     /// from 0 at open, so take two readings and subtract for an interval; see
     /// [`EngineMetrics`](crate::EngineMetrics) for each field. Cheap and non-blocking.
     pub fn engine_metrics(&self) -> crate::EngineMetrics {
-        let mut m: crate::EngineMetrics = self.engine().metrics().into();
+        let mut m = crate::EngineMetrics::from_engine(self.engine().metrics());
         self.db.txn_counts.fill(&mut m);
         m
     }
@@ -856,17 +865,17 @@ impl Pigeonhole {
     /// and per table its tablets, its families' stored options and their SSTs per level and
     /// blob files (ICR 0047). Reads the current catalog; cheap, no data I/O.
     pub fn info(&self) -> Result<crate::DatabaseInfo> {
-        Ok(self.engine().info()?.into())
+        Ok(crate::DatabaseInfo::from_engine(self.engine().info()?))
     }
 
     /// The writer default durability.
     pub fn default_durability(&self) -> Durability {
-        self.engine().default_durability()
+        Durability::from_engine(self.engine().default_durability())
     }
 
     /// Changes the writer default; applies to commits that start afterwards.
     pub fn set_default_durability(&self, durability: Durability) {
-        self.engine().set_default_durability(durability);
+        self.engine().set_default_durability(durability.engine());
     }
 
     /// Writes every memtable into the file and returns once the data is there (the SSTs are
@@ -1129,7 +1138,7 @@ impl PigeonholeReader {
     /// [`DatabaseInfo::free_bytes`](crate::DatabaseInfo::free_bytes) is `None`: a reader
     /// does not track allocations.
     pub fn info(&self) -> Result<crate::DatabaseInfo> {
-        Ok(self.engine().info()?.into())
+        Ok(crate::DatabaseInfo::from_engine(self.engine().info()?))
     }
 
     /// What this reader's row cache did since it last attached to a writer: hits, misses
@@ -1137,7 +1146,7 @@ impl PigeonholeReader {
     /// [`ReaderOptions::row_cache`](crate::ReaderOptions::row_cache) is 0. A re-attach (the
     /// writer restarted or recovered) empties the cache and starts the counts again.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
-        self.engine().row_cache_stats()
+        crate::RowCacheStats::from_engine(self.engine().row_cache_stats())
     }
 
     /// Opens an existing table for reading.

@@ -2,10 +2,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::Durability;
 use pigeonhole_engine::{
     CachePriority, CompactionStyle, Compression, EngineOptions, FamilyKind, FamilyOptions,
 };
-use pigeonhole_format::Durability;
 use pigeonhole_io::VfsRef;
 
 use crate::MergeOperator;
@@ -899,7 +899,7 @@ impl Options {
             }),
         };
         o.pin_threads = self.pin_threads;
-        o.durability = self.durability;
+        o.durability = self.durability.engine();
         o.memtable_budget = self.memtable_budget;
         o.memtable_freeze_bytes = self.memtable_budget / 4;
         if let Some(bytes) = self.block_cache {
@@ -934,7 +934,8 @@ impl Options {
             o.tablet_split_bytes = split_bytes;
         }
         for op in &self.merge_operators {
-            o.merge_operators.register(Arc::clone(op));
+            o.merge_operators
+                .register(Arc::new(crate::merge::EngineMergeOperator(Arc::clone(op))));
         }
         Ok(o)
     }
@@ -961,7 +962,8 @@ impl ReaderOptions {
         }
         o.row_cache_families.clone_from(&self.row_cache_families);
         for op in &self.merge_operators {
-            o.merge_operators.register(Arc::clone(op));
+            o.merge_operators
+                .register(Arc::new(crate::merge::EngineMergeOperator(Arc::clone(op))));
         }
         Ok(o)
     }

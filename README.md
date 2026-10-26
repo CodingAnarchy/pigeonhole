@@ -76,14 +76,16 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 - **Contributing** (people and agents building it): [`CONTRIBUTING.md`](CONTRIBUTING.md), [`AGENTS.md`](AGENTS.md)
 
 ## Crates
-| Crate | Role |
-|---|---|
-| `pigeonhole` | The public API — depend on this one. |
-| `pigeonhole-engine` | Tablets, shards, MVCC, recovery. |
-| `pigeonhole-{format,io,pager,wal,memtable,cache,runtime,shm,sst,compaction}` | Engine components. |
-| `pigeonhole-sim` | Deterministic simulation and reference model. |
-| `pigeonhole-cli` | The `phdb` tool (Phase 4). |
-| `pigeonhole-arrow` | Arrow export (Phase 4). |
+| Crate | Role | Stability (from 1.0, D282) |
+|---|---|---|
+| `pigeonhole` | The public API — depend on this one. | semver |
+| `pigeonhole-arrow` | Arrow export. | semver |
+| `pigeonhole-cli` | The `phdb` tool. | semver for commands, flags, exit statuses and output |
+| `pigeonhole-engine` | Tablets, shards, MVCC, recovery. | internal: none |
+| `pigeonhole-{format,io,pager,wal,memtable,cache,runtime,shm,sst,compaction}` | Engine components. | internal: none |
+| `pigeonhole-sim` | Deterministic simulation and reference model. | internal: none |
+
+The internal crates are published only as `pigeonhole`'s dependencies, which pins each exactly; any release may change them incompatibly. [Versions and compatibility](docs/guide/concepts.md#versions-and-compatibility) has the full policy, and [`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) the file format's promise.
 
 ## License
 MIT. See [LICENSE](LICENSE).

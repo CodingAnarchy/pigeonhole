@@ -43,7 +43,7 @@ Anything left for later is a GitHub issue titled `[crate] summary`, labeled with
 ## Releases
 A PR with a user-visible change adds a fragment file under [`changelog.d/`](changelog.d/README.md) instead of editing `CHANGELOG.md`, so parallel PRs don't conflict. `python3 scripts/changelog.py check` checks the fragments; the Changelog workflow runs it on every PR.
 
-Before tagging a release: update [`CHANGELOG.md`](CHANGELOG.md) with `python3 scripts/changelog.py fold <version>` (it folds the `changelog.d/` fragments and any `Unreleased` entries under the new version, updates the compare links and deletes the fragments; `--dry-run` shows the result first), update the maturity note in `README.md`, `crates/pigeonhole/README.md`, `docs/guide/README.md` and `docs/status.md`, and check the install version in the READMEs and `docs/guide/getting-started.md`.
+Before tagging a release: update [`CHANGELOG.md`](CHANGELOG.md) with `python3 scripts/changelog.py fold <version>` (it folds the `changelog.d/` fragments and any `Unreleased` entries under the new version, updates the compare links and deletes the fragments; `--dry-run` shows the result first), update the maturity note in `README.md`, `crates/pigeonhole/README.md`, `docs/guide/README.md` and `docs/status.md`, and check the install version in the READMEs and `docs/guide/getting-started.md`. Bump every crate's version and every exact (`=`) pin of the internal crates in the workspace `Cargo.toml` together, in the same version-bump PR (D282: `pigeonhole` pins each internal crate exactly; a pin left behind resolves to the previous release's crate).
 
 ## Seed sweeps and local resources
 Several agents often build and test on one machine, so local runs stay small:

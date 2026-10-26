@@ -95,6 +95,7 @@ mod check;
 mod db;
 mod error;
 mod info;
+mod merge;
 mod metrics;
 mod options;
 mod read;
@@ -159,11 +160,10 @@ pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use recovery::RecoveryStats;
 pub use retry::RetryPolicy;
 pub use table::{ReadTable, Table, TableBuilder};
-pub use write::{CommitInfo, CommitTicket, RowMutation, Transaction, WriteBatch};
+pub use write::{CommitInfo, CommitTicket, Durability, RowMutation, Transaction, WriteBatch};
 
-pub use pigeonhole_engine::RowCacheStats;
+pub use merge::{MergeError, MergeOperator};
+pub use metrics::RowCacheStats;
 #[doc(hidden)]
-pub use pigeonhole_engine::ShardStats;
-pub use pigeonhole_engine::{Failure, FailureCause};
-pub use pigeonhole_engine::{MergeError, MergeOperator};
-pub use pigeonhole_format::Durability;
+pub use metrics::ShardStats;
+pub use recovery::{Failure, FailureCause};

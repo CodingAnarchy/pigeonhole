@@ -17,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use pigeonhole_engine::{Engine, Failure, FailureCause};
+use pigeonhole_engine::Engine;
 
 use crate::db::Db;
 use crate::options::Recovery;
@@ -38,6 +38,58 @@ const POLL: Duration = Duration::from_millis(500);
 /// The recovery's deadline, in write-stall timeouts (two minutes by default): a close that
 /// has not returned by then, or reopens still failing, end the recovery.
 const DEADLINE_STALLS: u32 = 4;
+
+/// Why the instance failed ([`Failure::cause`]). The numbers are stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum FailureCause {
+    /// A shard's thread panicked.
+    Panic = 1,
+    /// An application-owned shard's driver ([`Shard`](crate::Shard)) was dropped before the
+    /// close finished.
+    DriverDropped = 2,
+    /// A write or sync to the shard's log, or (for [`Failure::MAIN_FILE`]) a manifest commit
+    /// to the main file, failed.
+    Io = 3,
+    /// The shard's in-memory state could not be updated consistently: it stops rather than
+    /// extend a state it cannot trust.
+    Internal = 4,
+}
+
+/// The first failure of an instance ([`Pigeonhole::failure`](crate::Pigeonhole::failure),
+/// ICR 0040).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(C)]
+#[non_exhaustive]
+pub struct Failure {
+    /// The shard that failed, or [`Failure::MAIN_FILE`] when a manifest commit to the main
+    /// file failed (no single shard).
+    pub shard: u32,
+    /// Why it failed.
+    pub cause: FailureCause,
+}
+
+impl Failure {
+    /// The `shard` of a main-file failure.
+    pub const MAIN_FILE: u32 = u32::MAX;
+
+    /// The public failure of an engine failure (D282: the public type is this crate's own).
+    pub(crate) fn from_engine(f: pigeonhole_engine::Failure) -> Self {
+        use pigeonhole_engine::FailureCause as C;
+        let cause = match f.cause {
+            C::Panic => FailureCause::Panic,
+            C::DriverDropped => FailureCause::DriverDropped,
+            C::Io => FailureCause::Io,
+            // `Internal`, and any cause a later engine adds: a state it cannot trust.
+            _ => FailureCause::Internal,
+        };
+        Self {
+            shard: f.shard,
+            cause,
+        }
+    }
+}
 
 /// What the supervisor did since the handle opened
 /// ([`Pigeonhole::recovery_stats`](crate::Pigeonhole::recovery_stats)). Plain data.
@@ -354,7 +406,7 @@ fn recover(db: &Arc<Db>, failed: Arc<Engine>) -> bool {
     let sup = db
         .supervision()
         .expect("the supervisor runs only with the option on");
-    let failure = failed.failure();
+    let failure = failed.failure().map(Failure::from_engine);
     if !failure.is_some_and(|f| covers(sup.mode, f.cause)) {
         // Not covered: the handle is failed as without the option; the waiters learn it.
         let mut st = sup.lock();

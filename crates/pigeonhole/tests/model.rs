@@ -72,8 +72,7 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{
-    Compaction, Durability, ErrorCode, FailureCause, Family, Options, Pigeonhole, Recovery,
-    Snapshot, Table,
+    Compaction, ErrorCode, FailureCause, Family, Options, Pigeonhole, Recovery, Snapshot, Table,
 };
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{FileRef, OpenOptions, Vfs};
@@ -81,6 +80,18 @@ use pigeonhole_sim::{
     COUNTER_TS, CommitStreams, Model, ModelCell, ModelFamily, ModelOp, Op, Rng, StreamCommit,
     StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive, recovered_from_records,
 };
+// The simulator's model and operations carry the engine's level; `public` converts at the
+// public API (D282: `pigeonhole::Durability` is the public crate's own type).
+use pigeonhole_engine::Durability;
+
+fn public(d: Durability) -> pigeonhole::Durability {
+    match d {
+        Durability::None => pigeonhole::Durability::None,
+        Durability::Buffered => pigeonhole::Durability::Buffered,
+        Durability::GroupSync => pigeonhole::Durability::GroupSync,
+        Durability::Sync => pigeonhole::Durability::Sync,
+    }
+}
 
 /// The store's file name, in the run's directory (`/db`, or a temporary directory).
 const DB: &str = "model.phdb";
@@ -1015,7 +1026,7 @@ impl Run {
         };
         let (ti, row) = key(&ops[0]);
         if ops.iter().all(|op| key(op) == (ti, row.clone())) {
-            let mut m = self.table(ti).mutate(&row).durability(durability);
+            let mut m = self.table(ti).mutate(&row).durability(public(durability));
             for op in ops {
                 m = match op {
                     ModelOp::Put {
@@ -1126,7 +1137,7 @@ impl Run {
                 };
             }
             assert_eq!(wb.len(), ops.len());
-            front::commit_batch(wb, durability, async_front).map(|_| ())
+            front::commit_batch(wb, public(durability), async_front).map(|_| ())
         }
     }
 
