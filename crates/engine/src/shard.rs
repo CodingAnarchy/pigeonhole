@@ -3859,7 +3859,9 @@ impl ShardState {
         // `(tablet, family)` slots the batch writes to, and those it would create (each a
         // memtable with a chunk of its own; a table split into many tablets has many slots).
         // Inline for a few: admission computes this for every commit (#320).
-        let mut touched: smallvec::SmallVec<[(TabletId, FamilyId); 4]> = smallvec::SmallVec::new();
+        // Each with whether the batch creates it (#749: a group's singles reserve per slot).
+        let mut touched: smallvec::SmallVec<[(TabletId, FamilyId, bool); 4]> =
+            smallvec::SmallVec::new();
         let mut unrouted = 0usize;
         let mut new_slots = 0usize;
         // The row of the previous write and its tablet: a run of writes to one row routes
@@ -3887,11 +3889,15 @@ impl ShardState {
                 }
             };
             match tablet {
-                Some(tablet) if !touched.contains(&(tablet, m.family)) => {
-                    touched.push((tablet, m.family));
-                    if self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family)) {
-                        new_slots += 1;
-                    }
+                Some(tablet)
+                    if !touched
+                        .iter()
+                        .any(|&(t, f, _)| t == tablet && f == m.family) =>
+                {
+                    let new =
+                        self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family));
+                    new_slots += usize::from(new);
+                    touched.push((tablet, m.family, new));
                 }
                 Some(_) => {}
                 None => unrouted += 1,
@@ -3899,16 +3905,9 @@ impl ShardState {
         }
         // A new memtable needs a chunk of its own, and a freeze needs one more.
         let chunks = touched.len() + unrouted + new_slots + 2;
-        let slots = touched
-            .iter()
-            .map(|&(t, f)| {
-                let new = self.tablets_on() && !self.memtables.contains_key(&(t, f));
-                (t, f, new)
-            })
-            .collect();
         ArenaNeed {
             entries: total + waste,
-            slots,
+            slots: touched,
             unrouted,
             bytes: total + waste + chunks * self.chunk_size,
             run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
@@ -4016,15 +4015,20 @@ impl ShardState {
         // before: they have no slot to share it by, and they are rare (a table not yet
         // routed), so the conservative charge costs nothing that matters.
         let (needed, own, extra) = match &group {
+            // The group's first single needs every chunk, as a member on its own.
+            Some(g) if !g.fixed => (
+                need.bytes,
+                need.entries,
+                (need.bytes - need.entries) / self.chunk_size,
+            ),
             Some(g) => {
-                let mut extra = need.unrouted + if g.fixed { 0 } else { 2 };
+                let mut extra = need.unrouted;
                 for &(t, f, new) in &need.slots {
                     if !g.slots.contains(&(t, f)) {
                         extra += 1 + usize::from(new);
                     }
                 }
-                let needed = need.entries + extra * self.chunk_size;
-                (needed, need.entries, extra)
+                (need.entries + extra * self.chunk_size, need.entries, extra)
             }
             None => (need.bytes, need.bytes, 0),
         };
@@ -4081,12 +4085,16 @@ impl ShardState {
         }
         self.reserved += needed;
         if let Some(g) = group {
-            for &(t, f, _) in &need.slots {
-                if !g.slots.contains(&(t, f)) {
-                    g.slots.push((t, f));
+            if g.fixed {
+                for &(t, f, _) in &need.slots {
+                    if !g.slots.contains(&(t, f)) {
+                        g.slots.push((t, f));
+                    }
                 }
+            } else {
+                g.slots.extend(need.slots.iter().map(|&(t, f, _)| (t, f)));
+                g.fixed = true;
             }
-            g.fixed = true;
             g.chunks += extra;
         }
         Ok(own)
