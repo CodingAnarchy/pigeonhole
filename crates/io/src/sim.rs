@@ -243,6 +243,8 @@ struct SimState {
     ops: u64,
     /// Scheduled faults (`FaultPlan::fail_on`) fired so far.
     scheduled_fired: u64,
+    /// Random write errors (`FaultPlan::io_error_ppm`) injected so far.
+    writes_injected: u64,
     /// Values handed out by `Vfs::random_u64`. A counter of its own, not `rng`, so asking
     /// for one does not shift the fault decisions a seed makes.
     random_draws: u64,
@@ -547,6 +549,7 @@ impl SimVfs {
                 bytes_written: 0,
                 ops: 0,
                 scheduled_fired: 0,
+                writes_injected: 0,
                 random_draws: 0,
                 trace: None,
                 shm: BTreeMap::new(),
@@ -584,6 +587,12 @@ impl SimVfs {
     /// How many scheduled faults ([`FaultPlan::fail_on`]) have fired since the VFS was made.
     pub fn scheduled_fired(&self) -> u64 {
         self.state().scheduled_fired
+    }
+
+    /// How many random write errors ([`FaultPlan::io_error_ppm`]) have been injected since
+    /// the VFS was made. Counting draws nothing, so it does not shift a seed's faults.
+    pub fn writes_injected(&self) -> u64 {
+        self.state().writes_injected
     }
 
     /// Simulates a crash: every open handle starts failing with `Crashed`, and the stored
@@ -1171,7 +1180,8 @@ impl File for SimFile {
                 return Ok(());
             }
             st.scheduled(self.node, "write: scheduled I/O error")?;
-            st.inject("write: injected I/O error")?;
+            st.inject("write: injected I/O error")
+                .inspect_err(|_| st.writes_injected += 1)?;
             file_end(
                 offset,
                 buf.len(),
