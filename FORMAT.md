@@ -525,7 +525,7 @@ Skiplist node (4-byte aligned; maximum height 16):
 | 16 + 4 x height | `key_len` | internal key (§2) |
 | ... | `value_len` | stored value (§3) |
 
-The writer fully writes a node, then links it bottom-up with Release stores to each predecessor's `next[i]`; readers load `next[i]` with Acquire. `tail` is written with the rest of the node, before the links (0 when it has none, also when the writer records no tails), and names a node linked before this one, so a reader that acquired this node's link sees the tail's target fully written too. A reader follows a tail only after its column is finished (D194), validates it as a node whose key is in that column, and treats anything else as corruption. Nodes are never modified after linking and never freed while any view listing their memtable is pinned.
+The writer fully writes a node, then links it bottom-up with Release stores to each predecessor's `next[i]`; readers load `next[i]` with Acquire. `tail` is written with the rest of the node, before the links (0 when it has none, also when the writer records no tails), and names a node linked before this one, so a reader that acquired this node's link sees the tail's target fully written too. A reader follows a tail only after its column is finished (D194). A reader process (any reader that opens the memtable from shared memory) validates it as a node whose key is in that column, and treats anything else as corruption; only the writer's own in-process reader, which wrote the tails, follows them unchecked. Nodes are never modified after linking and never freed while any view listing their memtable is pinned.
 
 ## 12. Evolution
 

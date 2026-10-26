@@ -870,6 +870,70 @@ fn a_bad_stale_tail_is_corrupt_never_a_fault() {
     assert_eq!(skip(), Ok(true));
 }
 
+/// D277 (perf287's option 2 on #934): the writer's own `reader()` follows the tails it wrote
+/// without validating them, and lands where a reader opened by root, which validates them,
+/// does.
+#[test]
+fn the_writers_reader_jumps_by_its_own_tails_as_a_checked_reader_does() {
+    let (arena, mt, column, _) = tail_fixture();
+    let checked = MemtableReader::open(arena.region().clone(), mt.root()).unwrap();
+    let land = |reader: &MemtableReader| {
+        let mut it = reader.iter();
+        it.seek_to_first().unwrap();
+        it.next().unwrap(); // on a@4
+        assert_eq!(it.skip_column(&column), Ok(true), "the tail jumps");
+        it.key().to_vec()
+    };
+    let landed = land(&mt.reader());
+    assert!(landed.starts_with(b"row") && !landed.starts_with(&column));
+    assert_eq!(landed, land(&checked));
+}
+
+/// D277 (perf287's condition 3 on #934): on the trusted path M1 and P1 stay as debug
+/// assertions, so a `record_tail` bug still fails the tests in debug builds.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "outside its column")]
+fn a_bad_tail_on_the_writers_reader_fails_a_debug_assertion() {
+    let (arena, mt, column, b1) = tail_fixture();
+    let a5 = arena
+        .region()
+        .mem
+        .load_u32(tower(mt.head, 0), Ordering::Acquire);
+    let a4 = arena.region().mem.load_u32(tower(a5, 0), Ordering::Acquire);
+    arena
+        .region()
+        .mem
+        .write_u32(a4 as usize + layout::N_TAIL, b1);
+    let reader = mt.reader();
+    let mut it = reader.iter();
+    it.seek_to_first().unwrap();
+    it.next().unwrap();
+    let _ = it.skip_column(&column);
+}
+
+/// Column `a` at timestamps 5 down to 1, then `b@1`, with tails recorded: the arena, the
+/// memtable, column `a`, and `b@1`'s node.
+fn tail_fixture() -> (ShardArena, Memtable, Vec<u8>, u32) {
+    let mut arena = small();
+    let mut mt = Memtable::create(&mut arena).unwrap().with_tail_index();
+    let ckey = |q: &[u8], ts| {
+        let mut k = Vec::new();
+        encode_key(&mut k, b"row", q, ts, ts, Kind::Put).unwrap();
+        k
+    };
+    for ts in 1..=5 {
+        mt.insert(&mut arena, &ckey(b"a", ts), b"\x00v").unwrap();
+    }
+    mt.insert(&mut arena, &ckey(b"b", 1), b"\x00v").unwrap();
+    let column = ckey(b"a", 0)[..ckey(b"a", 0).len() - SUFFIX_LEN].to_vec();
+    let mut b1 = mt.head;
+    for _ in 0..6 {
+        b1 = arena.region().mem.load_u32(tower(b1, 0), Ordering::Acquire);
+    }
+    (arena, mt, column, b1)
+}
+
 /// D277 (perf287's P2): chunks are reused without zeroing, so every insert writes its node's
 /// stale-tail field before the node is linked, whether or not the memtable records tails.
 /// A memtable built over chunks whose previous memtable recorded tails everywhere shows a

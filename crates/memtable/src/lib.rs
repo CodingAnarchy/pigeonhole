@@ -968,7 +968,9 @@ impl Memtable {
     }
 
     /// A reader for other threads. While it (or a cursor or slice taken from it) is alive,
-    /// the memtable's chunks are not reused.
+    /// the memtable's chunks are not reused. The only reader that trusts the stale tails
+    /// (D277): this process wrote them, so its column skips follow them unchecked, as D194's
+    /// process-local index did. A reader from [`MemtableReader::open`] checks every tail.
     pub fn reader(&self) -> MemtableReader {
         MemtableReader {
             region: self.region.clone(),
@@ -976,6 +978,7 @@ impl Memtable {
             head: self.head,
             pin: Arc::clone(&self.pin),
             tails: self.tails,
+            trusted: true,
         }
     }
 
@@ -1040,6 +1043,11 @@ pub struct MemtableReader {
     pin: Arc<Pin>,
     /// The writer records stale tails in the nodes (the header's `FLAG_TAILS`, D277).
     tails: bool,
+    /// The tails were written by this process: set only by [`Memtable::reader`], kept by
+    /// clones and cursors, never set on a reader from [`MemtableReader::open`] (in the writer
+    /// process too, whose `open` also gets a writer pin). A trusted skip follows a tail
+    /// unchecked; an untrusted one validates it first (M1, P1).
+    trusted: bool,
 }
 
 impl MemtableReader {
@@ -1090,6 +1098,7 @@ impl MemtableReader {
             head,
             pin,
             tails,
+            trusted: false,
         };
         let node = reader.node(head)?;
         if node.height != MAX_HEIGHT || node.key_len != 0 || node.value_len != 0 {
@@ -1382,11 +1391,24 @@ impl MemIter {
                     return Err(Error::Corrupt("link cycle"));
                 }
             }
-            let t = self.reader.node(at)?;
-            if !self.reader.in_column(&t, column) {
-                return Err(Error::Corrupt("stale tail outside its column"));
+            if self.reader.trusted {
+                // This process wrote the tail: checked in debug builds only, so a
+                // `record_tail` bug still fails the tests.
+                debug_assert!(
+                    self.reader
+                        .node(at)
+                        .is_ok_and(|t| self.reader.in_column(&t, column)),
+                    "stale tail {at} outside its column"
+                );
+            } else {
+                // From shared memory: validated before its link is loaded (M1), and in the
+                // column (P1).
+                let t = self.reader.node(at)?;
+                if !self.reader.in_column(&t, column) {
+                    return Err(Error::Corrupt("stale tail outside its column"));
+                }
             }
-            let next = self.reader.successor(t.off)?;
+            let next = self.reader.successor(at)?;
             match next {
                 Some(n) if self.reader.in_column(&n, column) => {
                     at = match self

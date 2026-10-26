@@ -2512,6 +2512,8 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 
 **Correctness for readers:** D194's seven conditions carry over unchanged, since readers use the same tail values. The only new reader-side condition is untrusted input. A tail read from shared memory is validated as a node (non-null, 4-aligned, header and key in bounds, height 1–16) before its link is loaded (perf287's M1), and must be in the column being skipped (P1). Anything else is `Corrupt`, never a fault or a silent skip.
 
+**Trust (perf287's option 2 on #934):** only the writer's own `Memtable::reader()` follows tails unchecked. That process wrote them, before the node's link, into chunks its pin keeps from reuse: the trust D194's process-local index had. A reader from `MemtableReader::open` checks every tail, in the writer process too (its `open` also gets a writer pin, so trust is never keyed on the pin). The split is a private flag set only by `reader()`, kept by clones and cursors, with no conversion from checked to trusted. A type parameter would have put both kinds through the engine's `MemSet` and its memtable sources, compiling the memtable cursor twice. On the trusted path M1 and P1 stay as debug assertions, so a `record_tail` bug still fails the tests. Callgrind: validating every tail in the writer cost hotrow's as-written state 1.2% per cell (1984 to 2007), which the trusted path returns.
+
 **Cost:** +4 arena bytes per node (about 3–4% of a ycsb node), against the writer's index of one `u32` per 32 arena bytes. Inserts write one more word; a jump reads the node's field instead of the index's directory and page. perf2 reads the callgrind shapes and the VM reader-vs-writer measurement on the PR.
 
 **Tests:**
