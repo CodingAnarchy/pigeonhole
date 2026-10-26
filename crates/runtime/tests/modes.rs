@@ -3,7 +3,7 @@
 
 use std::future::Future;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::thread::{self, JoinHandle, Thread};
@@ -128,6 +128,9 @@ fn sim_config(shards: usize) -> (RuntimeConfig, Arc<SimVfs>) {
 
 enum Msg {
     Echo(u64, Notifier<u64>),
+    /// Replies with the counter's value when the shard handles it (#960: how many background
+    /// slices finished while the message was queued).
+    SliceProbe(Arc<AtomicU64>, Notifier<u64>),
     Record {
         producer: u32,
         seq: u32,
@@ -162,6 +165,7 @@ impl ShardHandler for Handler {
         self.in_batch += 1;
         match msg {
             Msg::Echo(v, n) => n.notify(v),
+            Msg::SliceProbe(slices, n) => n.notify(slices.load(Ordering::SeqCst)),
             Msg::Record { producer, seq } => self.records.push((producer, seq)),
             Msg::Forward {
                 hops,
@@ -291,6 +295,8 @@ impl Task for SimBusy {
 struct RealBusy {
     vfs: VfsRef,
     stop: Arc<AtomicBool>,
+    /// Slices finished.
+    slices: Arc<AtomicU64>,
 }
 
 impl Task for RealBusy {
@@ -298,6 +304,7 @@ impl Task for RealBusy {
         while self.vfs.monotonic_nanos() < deadline {
             std::hint::spin_loop();
         }
+        self.slices.fetch_add(1, Ordering::SeqCst);
         if self.stop.load(Ordering::Relaxed) {
             TaskPoll::Done
         } else {
@@ -487,62 +494,52 @@ fn foreground_latency_bounded_sim(mode: Mode) {
 }
 
 /// Real-clock latency: a background task that spins for whole slices never holds a queued
-/// foreground message for long.
+/// foreground message for more than the slice it is in. Judged in slices, not wall time
+/// (#960): a loaded runner can keep the shard thread, which spins, off its CPU for tens of
+/// milliseconds (a p99 of 69 ms on macOS CI against a plain thread's 5 ms), which is the
+/// machine's doing, not the shard holding a message behind its background task. The slice
+/// count is what the runtime controls: it checks its queue between slices, so a message
+/// waits for at most the one in progress, however long the OS stretches it.
 fn foreground_latency_bounded_real(mode: Mode) {
     let vfs: VfsRef = PreadVfs::new(1);
     let mut cfg = config(1, Arc::clone(&vfs));
     cfg.time_slice = Duration::from_millis(1);
     let h = Harness::start(mode, cfg, handlers(1));
     let stop = Arc::new(AtomicBool::new(false));
+    let slices = Arc::new(AtomicU64::new(0));
     let busy = RealBusy {
         vfs,
         stop: Arc::clone(&stop),
+        slices: Arc::clone(&slices),
     };
     h.submitter(0).submit(Msg::Spawn(Box::new(busy))).unwrap();
-    // A plain thread answering the same round trips, interleaved with the shard's: how long
-    // this machine takes to get a thread to answer right now. A loaded runner can hold any
-    // thread off its CPU for tens of milliseconds (main's macOS CI: a p99 of 98 ms), which is
-    // not the shard holding a foreground message behind its background task.
-    let (ask, asked) = std::sync::mpsc::channel::<(u64, Notifier<u64>)>();
-    let reference = thread::spawn(move || {
-        for (i, n) in asked {
-            n.notify(i);
-        }
-    });
-    let (mut lat, mut reference_lat) = (Vec::new(), Vec::new());
-    for i in 0..200 {
+    let mut waited = Vec::new();
+    for _ in 0..200 {
         let (n, w) = completion();
-        let t = Instant::now();
-        h.submitter(0).submit(Msg::Echo(i, n)).unwrap();
-        assert_eq!(w.wait(), Some(i));
-        lat.push(t.elapsed());
-        thread::sleep(Duration::from_micros(300));
-        let (n, w) = completion();
-        let t = Instant::now();
-        ask.send((i, n)).unwrap();
-        assert_eq!(w.wait(), Some(i));
-        reference_lat.push(t.elapsed());
+        let before = slices.load(Ordering::SeqCst);
+        h.submitter(0)
+            .submit(Msg::SliceProbe(Arc::clone(&slices), n))
+            .unwrap();
+        let handled = w.wait().expect("handled");
+        waited.push(handled - before);
         thread::sleep(Duration::from_micros(300));
     }
-    drop(ask);
-    reference.join().unwrap();
     stop.store(true, Ordering::Relaxed);
     h.finish(|_| ());
-    let quantiles = |lat: &mut Vec<Duration>| {
-        lat.sort();
-        (lat[lat.len() / 2], lat[lat.len() * 99 / 100])
-    };
-    let (p50, p99) = quantiles(&mut lat);
-    let (ref_p50, ref_p99) = quantiles(&mut reference_lat);
-    // One 1 ms slice bounds the wait; the margins absorb CI scheduling noise beyond what the
-    // plain thread saw.
+    let max = waited.iter().copied().max().unwrap_or(0);
     assert!(
-        p50 < Duration::from_millis(5) + ref_p50,
-        "p50 {p50:?} (a plain thread: {ref_p50:?})"
+        max <= 1,
+        "a foreground message waited {max} background slices (at most the one in progress)"
     );
+    // Not vacuous: the background task ran, and messages landed mid-slice and waited for it.
     assert!(
-        p99 < Duration::from_millis(50) + ref_p99,
-        "p99 {p99:?} (a plain thread: {ref_p99:?})"
+        slices.load(Ordering::SeqCst) > 0,
+        "the background task never ran"
+    );
+    let mid_slice = waited.iter().filter(|&&w| w == 1).count();
+    assert!(
+        mid_slice >= 10,
+        "only {mid_slice} of 200 messages waited a slice: the background task was not busy"
     );
 }
 
