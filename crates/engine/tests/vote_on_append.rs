@@ -191,9 +191,11 @@ fn ready<F: std::future::Future + Unpin>(f: &mut F) -> Option<F::Output> {
 /// the failure and the commit aborted (`ShardFailed`, not committed); now the coordinator
 /// decides commit on the vote, writes its DECISION, and hears from shard 1 that the share was
 /// not applied: `OutcomeUnknown`, with nothing visible. T1 (perf287): shard 0 applied its
-/// share; a flush of it must not persist it (its seqno is held, so it is never durable, and
-/// shard 1's barrier answers not durable), and the reopened database holds the commit whole
-/// or not at all.
+/// share; a flush of it must not persist it, and the reopened database holds the commit whole
+/// or not at all. Two layers protect it, and mutations show each: the held seqno alone (the
+/// barrier made to answer durable: the flush still waits, the test passes), the barrier alone
+/// (`durable_seqno` made to ignore the hold: the flush fails at shard 1's barrier), and
+/// neither (the flush installs the share, and the reopen finds the commit torn).
 #[test]
 fn a_failed_prepare_write_after_its_vote_ends_outcome_unknown_and_recovers_whole() {
     let mut db = open(279, None);
@@ -215,17 +217,23 @@ fn a_failed_prepare_write_after_its_vote_ends_outcome_unknown_and_recovers_whole
     );
     assert!(!db.visible(0, b"x") && !db.visible(1, b"x"));
     // A flush on shard 0 now: whatever it does, the held share stays out of every SST.
-    let mut flush = db.engine.submit_flush().ok();
+    let mut flush = db.engine.submit_flush().expect("a flush is accepted");
     let outcome = db.answer(&mut pc, 64).expect("answered");
     assert!(matches!(outcome, Err(Error::OutcomeUnknown)), "{outcome:?}");
     assert!(!db.visible(0, b"x") && !db.visible(1, b"x"));
+    let mut flushed = None;
     for _ in 0..64 {
         db.step(0);
         db.step(1);
-        if flush.as_mut().is_some_and(|f| ready(f).is_some()) {
-            flush = None;
+        if flushed.is_none() {
+            flushed = ready(&mut flush);
         }
     }
+    // The held seqno keeps shard 0's share from ever being durable, so its memtable never
+    // freezes and the flush waits (it never reaches shard 1's barrier). Were the share
+    // durable, shard 1's barrier would fail the flush (`cross_records_durable`). Either way
+    // it never succeeds with the share in an SST.
+    assert!(flushed.is_none(), "the flush finished: {flushed:?}");
     let (a, b) = db.crash_and_reopen(b"x");
     assert_eq!(a, b, "a torn cross-shard commit after reopen: {a} {b}");
 }
