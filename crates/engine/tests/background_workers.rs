@@ -503,7 +503,8 @@ fn a_dropped_worker_mid_compaction_leaves_its_inputs_to_compact_again() {
         "the same L0 runs were compacted: {l0:?} vs {levels:?}"
     );
     // Nothing else is left to compact, so no compaction is mid-job when the close ends (the
-    // close does not wait for one; its output would stay allocated until the next open).
+    // close does not wait for one; its output would stay allocated until the next open: #991,
+    // where perf287 suggests the close abort the job as D284's reclaim does).
     assert!(
         levels.iter().filter(|(_, level, _)| *level == 0).count() < 4,
         "a new L0 run formed after the stop: {levels:?}"
