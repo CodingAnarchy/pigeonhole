@@ -2068,6 +2068,22 @@ fn seeds() -> Vec<u64> {
     (base..base + var("PIGEONHOLE_SEEDS", 1)).collect()
 }
 
+/// Appends `line` to the file `PIGEONHOLE_FAIL_LOG` names, when it is set (#897): a failing
+/// seed's test, configuration and message survive however the output is filtered, and a
+/// sweep can keep the file.
+fn log_failure(line: &str) {
+    let Some(path) = std::env::var_os("PIGEONHOLE_FAIL_LOG") else {
+        return;
+    };
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// How long one seed may run before [`check`] declares it hung: `PIGEONHOLE_SEED_TIMEOUT`
 /// seconds, 120 by default (a seed normally takes well under a second).
 fn seed_timeout() -> Duration {
@@ -2109,21 +2125,26 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 row_cache_hits += stats.row_cache_hits;
                 all.push(stats);
             }
-            Ok(Err(e)) => panic!("{e}"),
+            Ok(Err(e)) => {
+                log_failure(&format!(
+                    "FAILED: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}): {e}",
+                    cfg.shards, cfg.tablet_changes, cfg.deferred_io
+                ));
+                panic!("{e}")
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 let at = progress
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
                     .clone();
                 // Straight to stderr: the test harness's capture would lose an `eprintln!`.
-                let _ = writeln!(
-                    std::io::stderr(),
+                let hung = format!(
                     "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}) \
                      did not finish in {limit:?}; it was at {at}",
-                    cfg.shards,
-                    cfg.tablet_changes,
-                    cfg.deferred_io
+                    cfg.shards, cfg.tablet_changes, cfg.deferred_io
                 );
+                log_failure(&hung);
+                let _ = writeln!(std::io::stderr(), "{hung}");
                 // Every thread's stack, where gdb can attach: what the hung thread waits
                 // on, when nothing else shows it (#838). Only on CI (`CI` is set on the
                 // runners, where root bypasses ptrace_scope) or on request

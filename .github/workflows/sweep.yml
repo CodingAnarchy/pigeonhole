@@ -108,7 +108,16 @@ jobs:
           FILTER: ${{ inputs.filter }}
           PIGEONHOLE_SEED: ${{ matrix.chunk.seed }}
           PIGEONHOLE_SEEDS: ${{ matrix.chunk.seeds }}
+          # Failing and hung seeds append here (the public `model` target, #897).
+          PIGEONHOLE_FAIL_LOG: ${{ runner.temp }}/failures.log
         run: |
           [[ "$PACKAGE$TEST" =~ ^[A-Za-z0-9_-]+$ && "$FILTER" =~ ^[A-Za-z0-9_:]*$ ]] \
             || { echo "bad package, test or filter"; exit 1; }
           cargo test --release --all-features -p "$PACKAGE" --test "$TEST" -- $FILTER
+      - name: Keep the failure log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failures-${{ matrix.chunk.seed }}
+          path: ${{ runner.temp }}/failures.log
+          if-no-files-found: ignore
