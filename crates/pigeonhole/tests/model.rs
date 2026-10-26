@@ -370,6 +370,67 @@ struct Stats {
     /// recoveries the random faults caused, which a single seed may miss (#880).
     forced_faults: usize,
     recoveries_random: usize,
+    /// Forced commits refused `Busy` before they reached the WAL, so the forced failure was
+    /// armed again for the next commit (#897).
+    forced_rearms: usize,
+}
+
+/// The most forced commits in a row that may be refused `Busy` before the WAL (#897) before
+/// the run fails: each one sat out the write-stall timeout, and a store that never lets a
+/// commit reach its log is a bug, not bad luck (perf287's review of #943).
+const MAX_FORCED_REARMS_IN_A_ROW: usize = 5;
+
+/// What a forced commit's outcome means (#880, #897).
+#[derive(Debug, PartialEq, Eq)]
+enum Forced {
+    /// The forced failure fired once, and the commit failed: the recovery follows.
+    Fired,
+    /// Refused `Busy` before its WAL write: nothing fired, nothing was logged; force the next
+    /// commit instead.
+    Rearm,
+    /// Anything else is a harness or engine bug.
+    Fail(String),
+}
+
+/// Classifies a forced commit by how many times the forced failure fired and what the commit
+/// returned. Only a `Busy` refusal with no firing re-arms: a commit that fired the failure
+/// and still succeeded, fired it twice, or failed any other way without firing it, fails the
+/// run, as before #897.
+fn forced_outcome(fired: usize, result: Result<(), ErrorCode>) -> Forced {
+    match (fired, result) {
+        (1, Err(_)) => Forced::Fired,
+        (0, Err(ErrorCode::Busy)) => Forced::Rearm,
+        _ => Forced::Fail(format!(
+            "the forced WAL failure fired {fired} times and the commit returned {result:?}"
+        )),
+    }
+}
+
+#[test]
+fn only_a_busy_refusal_with_nothing_fired_re_arms_the_forced_failure() {
+    use ErrorCode::{Busy, Closed, Io, OutcomeUnknown};
+    // The recovery's normal case: the forced write failed, whatever the commit reports.
+    for code in [Io, OutcomeUnknown, Busy, Closed] {
+        assert_eq!(forced_outcome(1, Err(code)), Forced::Fired, "{code:?}");
+    }
+    // #897: refused for room before its WAL write.
+    assert_eq!(forced_outcome(0, Err(Busy)), Forced::Rearm);
+    // Everything else stays a failure: no firing with another error, a commit that
+    // succeeded through the failure, or more than one firing.
+    for (fired, result) in [
+        (0, Err(Io)),
+        (0, Err(OutcomeUnknown)),
+        (0, Err(Closed)),
+        (0, Ok(())),
+        (1, Ok(())),
+        (2, Err(Io)),
+        (2, Err(Busy)),
+    ] {
+        assert!(
+            matches!(forced_outcome(fired, result), Forced::Fail(_)),
+            "fired {fired}, {result:?}"
+        );
+    }
 }
 
 struct Run {
@@ -396,6 +457,8 @@ struct Run {
     /// The op index at which the forced failure runs (`Stats::forced_faults`), from the seed,
     /// in the run's first half; `None` once it ran or without the recovery option.
     force_at: Option<usize>,
+    /// Forced commits refused `Busy` before the WAL since the last that reached it (#897).
+    forced_rearms_in_a_row: usize,
     /// The forced failure fired and its recovery has not been counted yet.
     forced_pending: bool,
     /// The index of the op under way (`run` counts).
@@ -683,6 +746,7 @@ impl Run {
             base,
             armed: false,
             force_at: None,
+            forced_rearms_in_a_row: 0,
             forced_pending: false,
             op: 0,
             trace: Vec::new(),
@@ -1587,11 +1651,37 @@ impl Run {
                         "  -> forced WAL failure (fired {fired}): {:?}",
                         result.as_ref().err()
                     ));
-                    if fired != 1 || result.is_ok() {
-                        return Err(format!(
-                            "the forced WAL failure fired {fired} times and the commit returned {:?}",
-                            result.as_ref().map(|_| ())
-                        ));
+                    match forced_outcome(fired, result.as_ref().map(|_| ()).map_err(|e| e.code())) {
+                        Forced::Fired => self.forced_rearms_in_a_row = 0,
+                        Forced::Rearm => {
+                            // Refused for room before it was logged (#897): no WAL write,
+                            // so nothing to fail. The next commit takes the forced failure.
+                            // This commit goes on as any `Busy` one: not committed, and the
+                            // store must still match the model without it (checked below).
+                            // The arm's end check still wants one firing per seed, so a
+                            // re-arm can never stand in for the recovery.
+                            self.stats.forced_rearms += 1;
+                            self.forced_rearms_in_a_row += 1;
+                            if self.forced_rearms_in_a_row > MAX_FORCED_REARMS_IN_A_ROW {
+                                return Err(format!(
+                                    "the forced WAL failure was refused Busy {} times in a row: \
+                                     no commit reached the WAL",
+                                    self.forced_rearms_in_a_row
+                                ));
+                            }
+                            // Nothing stays armed until the next forced commit arms a fresh
+                            // plan: another thread's WAL write meanwhile would otherwise fire
+                            // it outside this commit's accounting (perf287's review of #943).
+                            // The plan was reset as the commit returned; this keeps it so
+                            // whatever that line becomes.
+                            self.vfs.set_faults(self.cfg.faults.clone());
+                            self.force_at = Some(self.op + 1);
+                            self.forced_pending = false;
+                            self.trace.push(
+                                "  -> refused Busy before the WAL: forced failure re-armed".into(),
+                            );
+                        }
+                        Forced::Fail(e) => return Err(e),
                     }
                 }
                 if let Err(e) = &result
