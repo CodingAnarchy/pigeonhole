@@ -607,4 +607,66 @@ mod tests {
         drop(t);
         db.close().unwrap();
     }
+
+    /// #966: once the supervisor gave up, a commit is `Closed` (the recovery guide: "the
+    /// handle stays failed exactly as with the option off (`is_failed()` true, commits
+    /// `Closed`)"), also when it reaches the failed shard before the engine is marked dead
+    /// and is refused there unlogged (the engine's `ShardFailed`, code `Io`). On Windows the
+    /// budget's give-up, which is immediate, left that window open (#966).
+    ///
+    /// Deterministic: a failed apply (`Fault::NextApply`) poisons the shard without marking
+    /// the engine dead, so after the fourth failure (past the budget of three) the next
+    /// commit always passes the engine's open check and reaches the poisoned shard.
+    #[test]
+    fn a_commit_after_a_give_up_is_closed_even_when_the_failed_shard_refuses_it() {
+        let vfs = SimVfs::new(9661);
+        let options = Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .memtable_budget(4 << 20)
+            .write_stall_timeout(Duration::from_secs(10))
+            .vfs(Arc::clone(&vfs) as _)
+            .auto_recover(Recovery::Any);
+        let db = Pigeonhole::open("/db/r966.phdb", options).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        let fail = || {
+            db.engine()
+                .to_arc()
+                .inject(pigeonhole_engine::Fault::NextApply, true);
+            let e = t.mutate(b"x").put("f", b"q", b"1").commit().unwrap_err();
+            assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
+        };
+        for n in 1..=3 {
+            fail();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while db.recovery_stats().recoveries < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{:?}",
+                    db.recovery_stats()
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+        fail();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !db.recovery_stats().gave_up {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                db.recovery_stats()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(db.is_failed());
+        let e = t.mutate(b"y").put("f", b"q", b"2").commit().unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Closed, "{e}");
+        drop(t);
+        let _ = db.close();
+    }
 }

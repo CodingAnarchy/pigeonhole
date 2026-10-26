@@ -363,6 +363,13 @@ impl Db {
                 "recovering after a shard failure (Options::auto_recover): the reopen did not \
                  finish within Options::write_stall_timeout; not committed, retry",
             ),
+            // The supervisor gave up on a failure it covers: the handle stays failed and
+            // refuses commits with `Closed` (ICR 0060's rule for a covered failure), also one
+            // the failed shard refused before logging it, which can meet it before the engine
+            // is marked dead (#966). A failure it does not cover is as without the option.
+            crate::recovery::Settled::Failed if e.refused_unlogged() && sup.gave_up() => {
+                pigeonhole_engine::Error::Closed.into()
+            }
             _ => e,
         }
     }
