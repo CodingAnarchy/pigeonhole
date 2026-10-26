@@ -39,6 +39,10 @@ use crate::{
 /// Submission queue entries of the shared ring (completions get twice as many).
 const RING_ENTRIES: u32 = 256;
 
+/// The most io-wq workers a thread submitting to the shared ring keeps for bounded work (reads
+/// and writes of regular files, #974); `0` would leave the kernel's default.
+const IOWQ_BOUNDED_WORKERS: u32 = 4;
+
 /// Registered buffer slots per ring (64 KiB each: an SST block or a run of them), at most:
 /// 1 MiB a ring.
 const POOL_SLOTS: u32 = 16;
@@ -910,6 +914,14 @@ impl Ring {
         if !needed.iter().all(|&op| probe.is_supported(op)) {
             return Err(Error::new(ErrorKind::Unsupported, "io_uring operations"));
         }
+        // Bounds each submitting thread's io-wq (#974): in 6.8 io-wq is per task, so every
+        // client thread gets its own pool, up to `min(entries, 4 x CPUs)` workers, each
+        // created inside that thread's enter. The registering thread takes the cap now, and
+        // every task whose first submit goes to this ring takes it then. Best effort: a
+        // kernel without the call keeps its default.
+        let _ = uring
+            .submitter()
+            .register_iowq_max_workers(&mut [IOWQ_BOUNDED_WORKERS, 0]);
         Ok(Self {
             uring,
             counted: Counted::new(counts),
@@ -940,11 +952,26 @@ impl Ring {
 
     /// Pushes `entry` and tells the kernel, waiting for room in a full queue. An error means
     /// the entry was not published (the kernel never sees it); once it is, it is the ring's
-    /// ([`enter_published`]).
+    /// ([`enter_published`]). `sq` covers only the push and the tail's publication: the
+    /// enter runs after it is released, as the reaper's always has (an enter hands over
+    /// whatever tail it sees, so another thread's later enter finds less or nothing), and the
+    /// kernel copies a page-cache hit inline under its own `uring_lock` during the enter
+    /// (#974), which would otherwise hold every other pusher too, as would a retried enter's
+    /// backoff (#976).
     fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
-        let sq = lock(&self.sq);
+        {
+            let _sq = lock(&self.sq);
+            self.publish(entry)?;
+        }
+        enter_published(&self.uring);
+        Ok(())
+    }
+
+    /// Publishes `entry` in the submission queue, handing queued entries to the kernel while
+    /// it is full. The caller holds `sq`.
+    fn publish(&self, entry: &squeue::Entry) -> io::Result<()> {
         loop {
-            // SAFETY: `self.sq` is held, so this is the only submission queue borrowed. The
+            // SAFETY: the caller holds `self.sq`, so this is the only submission queue borrowed. The
             // entry's buffer and descriptor belong to an operation in `self.table`, which
             // keeps them until the entry's completion is reaped.
             let pushed = unsafe {
@@ -962,11 +989,6 @@ impl Ring {
                 }
             }
         }
-        // `sq` covers the push and the tail's publication only: an enter hands over whatever
-        // tail it sees (the reaper's always ran without `sq`), and a retried enter would hold
-        // every other submitter for its backoff.
-        drop(sq);
-        enter_published(&self.uring);
         Ok(())
     }
 
