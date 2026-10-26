@@ -299,12 +299,30 @@ impl ShardMetrics {
     }
 
     /// Counts a client commit's time in flight, from its submit to its reply, committed or
-    /// failed (D257's concurrency measure).
+    /// failed (D257's concurrency measure). Only the part inside the balancer's current
+    /// window ([`inflight_in_window`]), so the rise over a window is Little's law over that
+    /// window.
     fn count_inflight(&self, nanos: u64) {
         self.commit_inflight_nanos
             .fetch_add(nanos, Ordering::Relaxed);
         #[cfg(feature = "test-hooks")]
         self.hooks.inflight_counts.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// The part of a commit round of `span` nanoseconds ending at `now` that falls inside the
+/// balancer window opened at `window_start` (its last pass, `BusyMark::at`; `None` before
+/// the first pass): what [`ShardMetrics::count_inflight`] adds, so the published commits in
+/// flight (the counter's rise over the window, divided by its length) never exceed the
+/// rounds actually in flight. Counting whole spans at their end put a round that outlasted
+/// the window entirely into the window it ended in: one stalled round of a single blocking
+/// client read as 4.56 commits in flight on a Linux runner (#922). The part before the
+/// window belongs to windows that already published, and is dropped: a round that spans
+/// several windows is under-counted in the earlier ones, never over-counted.
+pub(crate) fn inflight_in_window(span: u64, now: u64, window_start: Option<u64>) -> u64 {
+    match window_start {
+        Some(start) if now >= start => span.min(now - start),
+        _ => span,
     }
 }
 
@@ -3064,6 +3082,13 @@ impl std::fmt::Debug for ShardState {
 }
 
 impl ShardState {
+    /// Where the balancer's current window opened (its last pass): commit rounds count in
+    /// flight only from here ([`inflight_in_window`], #922).
+    #[inline]
+    fn window_start(&self) -> Option<u64> {
+        self.busy_mark.as_ref().map(|m| m.at)
+    }
+
     pub(crate) fn new(
         id: ShardId,
         shared: Arc<Shared>,
@@ -7252,9 +7277,10 @@ impl ShardState {
         };
         match m.kind {
             MemberKind::Single => {
-                let in_flight = ctx.now_nanos().saturating_sub(m.submitted_at);
+                let now = ctx.now_nanos();
+                let in_flight = now.saturating_sub(m.submitted_at);
                 let metrics = &self.shared.metrics[usize::from(self.id.0)];
-                metrics.count_inflight(in_flight);
+                metrics.count_inflight(inflight_in_window(in_flight, now, self.window_start()));
                 if result.is_ok() {
                     metrics.record(m.durability, in_flight);
                 }
@@ -7745,8 +7771,12 @@ impl ShardState {
             // The coordinator prepares its own share the same way, and its reply span
             // already covers that: it counts nothing here.
             if coordinator != self.id {
-                self.shared.metrics[usize::from(self.id.0)]
-                    .count_inflight(ctx.now_nanos().saturating_sub(share.submitted_at));
+                let now = ctx.now_nanos();
+                self.shared.metrics[usize::from(self.id.0)].count_inflight(inflight_in_window(
+                    now.saturating_sub(share.submitted_at),
+                    now,
+                    self.window_start(),
+                ));
             }
             if commit {
                 self.refresh_tablets();
@@ -7967,9 +7997,10 @@ impl ShardState {
             self.try_finish_close(ctx);
             return;
         }
-        let in_flight = ctx.now_nanos().saturating_sub(c.submitted_at);
+        let now = ctx.now_nanos();
+        let in_flight = now.saturating_sub(c.submitted_at);
         let metrics = &self.shared.metrics[usize::from(self.id.0)];
-        metrics.count_inflight(in_flight);
+        metrics.count_inflight(inflight_in_window(in_flight, now, self.window_start()));
         let outcome = match c.failed.take() {
             Some(e) => Err(e),
             None => {
@@ -9987,6 +10018,18 @@ mod tests {
             .map(|f| backoff_nanos(10_000_000, FLUSH_BACKOFF_CAP, f) / 1_000_000)
             .collect();
         assert_eq!(ms, [10, 20, 40, 80, 160, 320, 640, 1000, 1000]);
+    }
+
+    /// #922: a round counts only its part inside the window it ends in.
+    #[test]
+    fn a_round_counts_its_part_inside_the_window() {
+        // Inside the window: all of it.
+        assert_eq!(inflight_in_window(3, 100, Some(90)), 3);
+        // Begun before the window: from the window's start.
+        assert_eq!(inflight_in_window(300, 100, Some(90)), 10);
+        // No window yet, or a clock behind the start: the span as is.
+        assert_eq!(inflight_in_window(300, 100, None), 300);
+        assert_eq!(inflight_in_window(300, 80, Some(90)), 300);
     }
 }
 
