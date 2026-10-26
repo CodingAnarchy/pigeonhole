@@ -1,0 +1,2 @@
+### Changed
+- **A `Buffered` cross-shard commit decides sooner** (D279, #932). A participant now votes as soon as its share's record is in its log, rather than after it has written the record and finished its turn, so the coordinating shard writes its decision meanwhile. A participant whose write then fails can no longer turn the commit into a clean failure: the commit returns `OutcomeUnknown`, as any commit does when its shard fails after logging it. Other durability levels are unchanged.
