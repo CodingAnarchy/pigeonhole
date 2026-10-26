@@ -32,6 +32,7 @@ type EngineBatch = pigeonhole_engine::WriteBatch;
 /// # }
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct CommitInfo {
     /// The commit's sequence number. For a transaction that wrote nothing it is the
     /// snapshot point it read at, not a seqno of its own: other commits may share it, and it

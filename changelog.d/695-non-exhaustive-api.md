@@ -1,0 +1,2 @@
+### Changed
+- **Breaking (before the 1.0 API freeze, ICR 0071):** `Value`, `Condition`, `ValueFilter`, `Compaction`, `Priority` and `Recovery` are `#[non_exhaustive]`, as are the output structs `CommitInfo` and `CellEntry`. A `match` on one of the enums outside the crate needs a wildcard arm, and the two structs can no longer be built with a struct literal. After 1.0, a new value type, condition, filter, compaction style, cache priority, recovery level or commit field is then a minor release, not a major one.

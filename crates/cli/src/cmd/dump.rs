@@ -204,6 +204,8 @@ pub(crate) fn value_json(v: Cell<'_>) -> Value {
         Cell::I64(n) | Cell::Varint(n) => json!({ "i64": n }),
         Cell::F64(x) if x.is_finite() => json!({ "f64": x }),
         Cell::F64(x) => json!({ "f64_bits": x.to_bits() }),
+        // A value type this build of `phdb` doesn't know (`Value` is non-exhaustive).
+        _ => json!({ "unknown_type": true }),
     }
 }
 
@@ -229,6 +231,8 @@ fn csv_line(
         },
         Cell::I64(n) | Cell::Varint(n) => ("i64", n.to_string()),
         Cell::F64(x) => ("f64", x.to_string()),
+        // A value type this build of `phdb` doesn't know (`Value` is non-exhaustive).
+        _ => ("unknown", String::new()),
     };
     let fields = [
         table.to_owned(),

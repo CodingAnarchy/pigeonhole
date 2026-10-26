@@ -40,6 +40,7 @@ use crate::{Result, Row, RowRef, Snapshot};
 /// # }
 /// ```
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum ValueFilter {
     /// Value bytes equal.
     Equals(Vec<u8>),
@@ -63,6 +64,7 @@ impl ValueFilter {
 ///
 /// See [`RowMutation`](crate::RowMutation) for an example.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Condition {
     /// The column has a visible version.
     Exists {

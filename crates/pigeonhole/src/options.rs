@@ -64,6 +64,7 @@ pub struct Options {
 /// Which failures [`Options::auto_recover`] recovers from in place (D265, #620).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum Recovery {
     /// Never: a failed instance stays failed until it is closed and reopened (the recovery
     /// guide's procedure). The default.
@@ -626,6 +627,7 @@ impl ReaderOptions {
 
 /// Block-cache priority of a family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[non_exhaustive]
 pub enum Priority {
     /// Evicted first.
     Low,
@@ -638,6 +640,7 @@ pub enum Priority {
 
 /// Compaction strategy of a family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
 pub enum Compaction {
     /// Lowest read and space amplification (the default).
     #[default]
