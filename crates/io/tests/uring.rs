@@ -727,3 +727,34 @@ fn an_inline_sync_returns_while_another_rings_write_is_in_flight() {
     );
     pigeonhole_io::uring::fail_ring_attaches(0);
 }
+
+/// perf287's S1 on #938: a permanent refusal (a kernel without the support a thread's ring
+/// needs) is not retried: the thread runs inline for good, the failure counted once, and no
+/// probe ring is built and dropped every retry interval.
+#[test]
+fn a_permanent_attach_failure_is_not_retried() {
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-attach-permanent");
+    let f = b.create("f");
+    pigeonhole_io::uring::fail_ring_attaches_unsupported(1);
+    let vfs = Arc::clone(&b.vfs);
+    let g = Arc::clone(&f);
+    thread::spawn(move || {
+        vfs.attach_thread();
+        for i in 0..100u64 {
+            let w = g.submit_write(filled(512, i as u8), i * 512);
+            assert!(w.is_ready(), "inline for good");
+            w.wait().unwrap();
+            if i % 25 == 24 {
+                // Past several retry intervals.
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+        assert!(own_io_waker().is_none(), "never attached");
+    })
+    .join()
+    .unwrap();
+    pigeonhole_io::uring::fail_ring_attaches(0);
+    let s = b.vfs.ring_stats().unwrap();
+    assert_eq!((s.attach_failures, s.inline, s.rings), (1, 100, 1), "{s:?}");
+}

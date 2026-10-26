@@ -81,15 +81,46 @@ struct RingCounts {
 /// gives back only once their teardown has run.
 const ATTACH_RETRY: Duration = Duration::from_millis(10);
 
-/// Attaches still to fail on purpose ([`fail_ring_attaches`]), through the same path as a
-/// kernel that lacks what a thread's ring needs.
+/// Attaches still to fail on purpose ([`fail_ring_attaches`]), and whether as a kernel
+/// without the support (permanent) rather than out of memory (transient).
 static FAIL_ATTACHES: AtomicUsize = AtomicUsize::new(0);
+static FAIL_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
-/// Makes the next `n` attempts to give a thread its own ring fail, as a kernel without the
-/// support would (`usize::MAX`: every one). A test hook (#929), not part of the API.
+/// Makes the next `n` attempts to give a thread its own ring fail as the kernel refusing it
+/// for memory would (`ENOMEM`: the thread retries later; `usize::MAX`: every one). A test hook
+/// (#929), not part of the API.
 #[doc(hidden)]
 pub fn fail_ring_attaches(n: usize) {
+    FAIL_UNSUPPORTED.store(false, Ordering::SeqCst);
     FAIL_ATTACHES.store(n, Ordering::SeqCst);
+}
+
+/// As [`fail_ring_attaches`], failing as a kernel without the support does (permanent: the
+/// thread never retries). A test hook (#929, perf287's S1 on #938), not part of the API.
+#[doc(hidden)]
+pub fn fail_ring_attaches_unsupported(n: usize) {
+    FAIL_UNSUPPORTED.store(true, Ordering::SeqCst);
+    FAIL_ATTACHES.store(n, Ordering::SeqCst);
+}
+
+/// Why a thread got no ring of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachFailure {
+    /// The kernel refused one for now (`ENOMEM`, `EAGAIN`): often the previous rings'
+    /// charge, given back once their teardown has run. Retried after [`ATTACH_RETRY`].
+    Transient,
+    /// The kernel lacks what a thread's ring needs (timed waits, `PollAdd`), or refused it
+    /// for a reason waiting will not change: never retried.
+    Permanent,
+}
+
+impl AttachFailure {
+    fn of(e: &io::Error) -> Self {
+        match e.raw_os_error() {
+            Some(libc::ENOMEM | libc::EAGAIN) => AttachFailure::Transient,
+            _ => AttachFailure::Permanent,
+        }
+    }
 }
 
 /// One ring's place in its backend's [`RingCounts`], given back when the ring goes.
@@ -398,7 +429,7 @@ impl UringFile {
             .try_with(|a| {
                 a.borrow()
                     .iter()
-                    .any(|(b, at)| *b == backend && Instant::now() >= *at)
+                    .any(|(b, at)| *b == backend && at.is_some_and(|at| Instant::now() >= at))
             })
             .unwrap_or(false);
         if retry {
@@ -1052,8 +1083,10 @@ const DRIVE_SLICE: Duration = Duration::from_millis(1);
 thread_local! {
     /// The rings this thread attached, one per backend.
     static THREAD_RINGS: RefCell<Vec<Arc<ThreadRing>>> = const { RefCell::new(Vec::new()) };
-    /// Per backend this thread failed to attach a ring for, when it may try again.
-    static ATTACH_AFTER: RefCell<Vec<(usize, Instant)>> = const { RefCell::new(Vec::new()) };
+    /// Per backend this thread failed to attach a ring for, when it may try again (`None`:
+    /// never, the failure was permanent).
+    static ATTACH_AFTER: RefCell<Vec<(usize, Option<Instant>)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// A ring owned by one thread (a shard's, #402): only that thread submits to it and reaps
@@ -1176,16 +1209,26 @@ impl ThreadRing {
         if Self::current(backend).is_some() {
             return;
         }
-        let Some(ring) = Self::new(backend, counts, client) else {
-            // The thread goes on without a ring of its own; on a backend with no reaper its
-            // operations run inline meanwhile, and it tries again later (#929).
-            counts.attach_failures.fetch_add(1, Ordering::Relaxed);
-            let _ = ATTACH_AFTER.try_with(|a| {
-                let mut a = a.borrow_mut();
-                a.retain(|(b, _)| *b != backend);
-                a.push((backend, Instant::now() + ATTACH_RETRY));
-            });
-            return;
+        let ring = match Self::new(backend, counts, client) {
+            Ok(ring) => ring,
+            Err(why) => {
+                // The thread goes on without a ring of its own; on a backend with no reaper
+                // its operations run inline meanwhile (#929). It tries again later only if
+                // the refusal may pass: a kernel without the support never gives one, and
+                // building and dropping a probe ring every few ms would add to the very
+                // locked-memory pressure a transient refusal comes from (perf287's S1).
+                counts.attach_failures.fetch_add(1, Ordering::Relaxed);
+                let retry = match why {
+                    AttachFailure::Transient => Some(Instant::now() + ATTACH_RETRY),
+                    AttachFailure::Permanent => None,
+                };
+                let _ = ATTACH_AFTER.try_with(|a| {
+                    let mut a = a.borrow_mut();
+                    a.retain(|(b, _)| *b != backend);
+                    a.push((backend, retry));
+                });
+                return;
+            }
         };
         let _ = ATTACH_AFTER.try_with(|a| a.borrow_mut().retain(|(b, _)| *b != backend));
         let own: std::sync::Weak<dyn crate::own::OwnIo> = Arc::downgrade(&ring) as _;
@@ -1197,13 +1240,15 @@ impl ThreadRing {
         backend: usize,
         counts: &Arc<RingCounts>,
         client: Option<Arc<Ring>>,
-    ) -> Option<Arc<Self>> {
-        // The test hook fails here, as a kernel without the support below does.
+    ) -> std::result::Result<Arc<Self>, AttachFailure> {
+        use AttachFailure::{Permanent, Transient};
+        // The test hook fails here, on the same path as a refusal below.
         let mut n = FAIL_ATTACHES.load(Ordering::SeqCst);
         while n > 0 {
             let next = if n == usize::MAX { n } else { n - 1 };
             match FAIL_ATTACHES.compare_exchange_weak(n, next, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => return None,
+                Ok(_) if FAIL_UNSUPPORTED.load(Ordering::SeqCst) => return Err(Permanent),
+                Ok(_) => return Err(Transient),
                 Err(now) => n = now,
             }
         }
@@ -1224,17 +1269,20 @@ impl ThreadRing {
                 IoUring::builder()
                     .setup_cqsize(RING_ENTRIES * 2)
                     .build(RING_ENTRIES)
-                    .ok()?,
+                    .map_err(|e| AttachFailure::of(&e))?,
                 false,
             ),
         };
         if !uring.params().is_feature_ext_arg() {
-            return None;
+            return Err(Permanent);
         }
         let mut probe = Probe::new();
-        uring.submitter().register_probe(&mut probe).ok()?;
+        uring
+            .submitter()
+            .register_probe(&mut probe)
+            .map_err(|_| Permanent)?;
         if !probe.is_supported(opcode::PollAdd::CODE) {
-            return None;
+            return Err(Permanent);
         }
         // Signalled on each completion, for an application's own event loop (#408). Kept off
         // `wake`, which the ring itself polls: a registered eventfd the ring also polled
@@ -1252,7 +1300,7 @@ impl ThreadRing {
             taskrun_flag,
             fd_taken: AtomicBool::new(false),
             enters: AtomicU64::new(0),
-            wake: Arc::new(EventFd::new().ok()?),
+            wake: Arc::new(EventFd::new().map_err(|e| AttachFailure::of(&e))?),
             ring_wake: Arc::default(),
             epoll: epoll_over(
                 [
@@ -1264,8 +1312,8 @@ impl ThreadRing {
             notify,
             client,
         });
-        ring.arm_wake().ok()?;
-        Some(ring)
+        ring.arm_wake().map_err(|e| AttachFailure::of(&e))?;
+        Ok(ring)
     }
 
     /// Polls the eventfd, so a signal ends the ring's wait.
@@ -1524,6 +1572,9 @@ impl Drop for ThreadRing {
         // the ring's own memory only once its teardown has run, after the descriptor
         // closes, and the next thread's ring may meanwhile hit the locked-memory limit
         // (#929). The pool is the bulk of the charge (1 MiB against the ring's ~30 KiB).
+        // Owner-only, as the check above makes it: a single-issuer ring refuses
+        // registrations from other tasks (`EEXIST`). Its error is ignored by design: should
+        // the unregister fail, the pool is uncharged at the ring's teardown, as before.
         if self.pool.registered().is_some() {
             let _ = self.uring.submitter().unregister_buffers();
         }
