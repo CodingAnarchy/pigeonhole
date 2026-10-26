@@ -295,29 +295,19 @@ impl Drop for TempDir {
     }
 }
 
-/// After a close: nothing unreferenced is still allocated (a dropped compaction's output was
-/// freed, not leaked), and the retired extents (inputs of the compactions that did commit)
-/// all come back once reclaimed. The reclaim a dropped view triggers only tries the pager
-/// lock and skips when another thread holds it (an I/O completion on the pread pool, say),
-/// so whether retired bytes are still there right after the close depends on timing: they
-/// are reclaimed here, blocking, before the total is checked.
+/// After a close, every extent comes back: nothing unreferenced is allocated (a dropped
+/// compaction's output was freed) or retired (a committed compaction's inputs were
+/// reclaimed by the close, whatever reclaims were skipped before it).
 fn assert_extents_back(engine: &Engine, context: &str) {
     let (allocated, retired) = engine.unreferenced_split();
     assert_eq!(
-        allocated,
-        0,
-        "{context}: unreferenced bytes still allocated (retired {retired}); metrics {:?}; \
-         levels {:?}; SSTs {:?}",
+        (allocated, retired),
+        (0, 0),
+        "{context}: unreferenced (allocated, retired) bytes; metrics {:?}; levels {:?}",
         engine.metrics(),
-        engine.sst_levels(),
-        engine.sst_lens()
+        engine.sst_levels()
     );
-    engine.reclaim_now();
-    assert_eq!(
-        engine.unreferenced_bytes(),
-        0,
-        "{context}: retired bytes left after a reclaim (retired {retired} before it)"
-    );
+    assert_eq!(engine.unreferenced_bytes(), 0, "{context}");
 }
 
 fn real_options(vfs: &VfsRef) -> EngineOptions {
@@ -465,13 +455,30 @@ fn a_dropped_worker_mid_compaction_leaves_its_inputs_to_compact_again() {
     let path = dir.0.join("w.phdb");
     let vfs = real_vfs();
     let (engine, mut shard, worker, l0) = stop_mid_compaction(&vfs, &path);
-    drop(worker);
-    let mut turns = 0;
-    while engine.metrics().compactions == 0 {
-        shard.run_once(vfs.monotonic_nanos() + 1_000_000);
-        turns += 1;
-        assert!(turns < 1_000_000, "the inputs never compacted again");
-    }
+    // Another thread keeps taking the pager's allocator, half the time, from here until the
+    // compaction is redone: reclaims a dropped view only tries mostly skip (as when a pread
+    // completion or a file growth holds it, CI run 40394372772), so the close's own reclaim
+    // has to free the committed compaction's inputs.
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                {
+                    let _held = engine.hold_pager_alloc();
+                    std::thread::sleep(std::time::Duration::from_micros(50));
+                }
+                std::thread::sleep(std::time::Duration::from_micros(50));
+            }
+        });
+        drop(worker);
+        let mut turns = 0;
+        while engine.metrics().compactions == 0 {
+            shard.run_once(vfs.monotonic_nanos() + 1_000_000);
+            turns += 1;
+            assert!(turns < 1_000_000, "the inputs never compacted again");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
     assert_eq!(engine.metrics().compactions_reclaimed, 1);
     assert_eq!(engine.metrics().compaction_failures, 0);
     let levels = engine.sst_levels();

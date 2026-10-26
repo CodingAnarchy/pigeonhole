@@ -647,12 +647,12 @@ impl Engine {
         )
     }
 
-    /// Frees retired extents no view reaches, waiting for the pager if it is busy (test
-    /// hook, D284): the reclaim a dropped view only tries (`Shared::try_reclaim` skips when
-    /// another thread holds the pager, and the next commit reclaims instead).
+    /// Holds the pager's allocator until the guard drops (test hook, D284): a reclaim a
+    /// dropped view only tries (`Shared::try_reclaim`) skips meanwhile, as when another
+    /// thread grows the file or commits.
     #[doc(hidden)]
-    pub fn reclaim_now(&self) {
-        self.inner.shared.reclaim();
+    pub fn hold_pager_alloc(&self) -> impl Sized + '_ {
+        self.inner.shared.pager.hold_alloc_for_test()
     }
 
     /// Every SST the current catalog names, as `(level, length, size class)` (test hook:
