@@ -3,9 +3,12 @@
 //!
 //! Files are opened, locked and read or written synchronously exactly as by
 //! [`PreadVfs`]; only the submitted operations (`submit_read`, `submit_write`,
-//! `submit_sync_data`, `submit_sync_all`) differ. They go to one shared ring, and one
-//! reaper thread waits for their completions and resolves each operation's [`Completion`],
-//! waking its waiter or task. Per-shard rings reaped on the shard thread come next (#402).
+//! `submit_sync_data`, `submit_sync_all`) differ. A thread that attached a ring of its own
+//! ([`Vfs::attach_thread`]: shard, compaction and pool threads, #402) submits there and
+//! reaps it itself, in its turns and its waits. Any other thread submits to the backend's
+//! shared ring, whose reaper thread resolves each operation's [`Completion`], waking its
+//! waiter or task; in application-owned mode there is no reaper, and such a thread runs its
+//! operations inline instead (#408, #929).
 //!
 //! Every `unsafe` block of the backend is here. The invariant they rely on: an operation in
 //! flight owns its buffer and its file handle in the ring's table of operations until its
