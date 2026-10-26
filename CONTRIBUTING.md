@@ -84,6 +84,7 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 | `PIGEONHOLE_TRACE_LINES` | engine harness | Trace lines a checker failure prints (default 40). |
 | `PIGEONHOLE_SEED_TIMEOUT` | pigeonhole `model` | Seconds one seed may run before the watchdog reports it hung (test, seed, configuration and the step it was on), turns on the engine's trace for 5 s to show what the shards do, and aborts (default 120; #244). |
 | `PIGEONHOLE_FAIL_LOG` | pigeonhole `model` | A file each failing or hung seed appends a line to (test, seed, configuration and the checker's message), so a filtered local loop or a sweep cannot lose it (#897). |
+| `PIGEONHOLE_SUMMARY_LOG` | pigeonhole `model` | A file a target appends its totals over its seeds to, pass or fail: the recovery arm's forced re-arms (`forced_rearms`, `forced_preempted`) and recoveries (#897). Sweeps keep it as the `summary-<seed>` artifact. |
 | `PIGEONHOLE_SHM_CHILD`, `PIGEONHOLE_MEMTABLE_CHILD`, `PIGEONHOLE_IO_LOCK_PROBE`, `PIGEONHOLE_TEST_SMALL_SHM` | multi-process tests | Set by a test when it re-runs itself as a child process. Don't set them yourself. |
 
 ## Performance discipline
