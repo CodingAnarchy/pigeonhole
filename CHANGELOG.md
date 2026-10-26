@@ -9,6 +9,13 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 ### Security
 - zstd is now 0.14.3, with zstd-safe 8.2 and zstd-sys 2.1.2, up from 0.13.3. The upgrade clears RUSTSEC-2026-0391, 0398, 0403 and 0410. Pigeonhole called only zstd's one-shot `bulk` API and never the stream encoders or decoders those advisories describe. The bundled libzstd is still 1.5.7, so compressed blocks are byte-identical. Files written by earlier releases read as before, and a test now decodes a zstd-sealed block written by 0.13.
 
+### Fixed
+- io_uring backend (#976): when the kernel refused for now the system call that hands queued requests to it (`EAGAIN` under memory pressure), the backend failed requests the kernel could still run, and freed or reused their buffers:
+  - a read or write whose own submission was refused failed at once, though it stayed queued and the next call handed it over;
+  - a refusal of the completion thread's call (or of a thread reaping its own queue) failed every request in flight, and the shared queue's completion thread then stopped, so later requests never completed.
+
+  The kernel could then read into, or write from, memory the request no longer owned. A refused call is now retried, and nothing queued or in flight fails because of it. If a queue breaks for good, its requests fail but their buffers are never freed. Present since 0.3.0 (the io_uring backend, the default on Linux).
+
 ## [0.3.2] - 2026-10-22
 One engine fix from `main` (#904). **Upgrade recommended** for every 0.3.x user: after an open with a different shard count, or one whose replay spilled, a crash before the next manifest commit could let later default-timestamp writes land below existing versions of a cell (a lost update). The file format and the shared-memory layout are unchanged; files written by 0.3.0 and 0.3.1 open as before, and 0.3.1 opens files written by 0.3.2.
 
