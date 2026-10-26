@@ -316,9 +316,13 @@ fn real_options(vfs: &VfsRef) -> EngineOptions {
     o.shards = 1;
     o.pin_threads = false;
     o.tablet_changes = false;
-    o.memtable_budget = 8 << 20;
-    o.memtable_freeze_bytes = 1 << 20;
+    // Each ~1 MiB run fits a memtable, so only the explicit flushes freeze: L0 is exactly
+    // four runs (the trigger), with no room or pacing stalls while the compaction is held.
+    o.memtable_budget = 32 << 20;
+    o.memtable_freeze_bytes = 2 << 20;
     o.background_workers = 1;
+    // A stall (should one come) delays a commit; it never ends `Busy` on a slow runner.
+    o.write_stall_timeout_nanos = 600_000_000_000;
     o
 }
 
@@ -352,8 +356,15 @@ fn stop_mid_compaction(
                     .unwrap(),
             );
             if pcs.len() == 256 {
-                step(&**vfs, &mut shard, Some(&mut worker), 64);
-                pcs.clear();
+                // Every commit lands before the next batch (CI run 40401802297: dropped
+                // unfinished, commits still queued at the stop flushed during the redo, and a
+                // second compaction was mid-job when the close ended).
+                for mut pc in pcs.drain(..) {
+                    while ready(&mut pc).is_none() {
+                        step(&**vfs, &mut shard, Some(&mut worker), 8);
+                    }
+                    ready(&mut pc).expect("resolved").expect("committed");
+                }
             }
         }
         let mut f = engine.flush_pending().unwrap();
@@ -364,6 +375,11 @@ fn stop_mid_compaction(
     while !engine.compaction_held() {
         step(&**vfs, &mut shard, Some(&mut worker), 8);
     }
+    assert_eq!(
+        engine.metrics().commits[Durability::Buffered as usize],
+        4 * 4096,
+        "every commit landed before the stop"
+    );
     let l0: Vec<u64> = engine
         .sst_levels()
         .into_iter()
@@ -485,6 +501,12 @@ fn a_dropped_worker_mid_compaction_leaves_its_inputs_to_compact_again() {
     assert!(
         l0.iter().all(|id| !levels.iter().any(|(_, _, s)| s == id)),
         "the same L0 runs were compacted: {l0:?} vs {levels:?}"
+    );
+    // Nothing else is left to compact, so no compaction is mid-job when the close ends (the
+    // close does not wait for one; its output would stay allocated until the next open).
+    assert!(
+        levels.iter().filter(|(_, level, _)| *level == 0).count() < 4,
+        "a new L0 run formed after the stop: {levels:?}"
     );
     engine.close().unwrap();
     while shard.closed().is_none() {
