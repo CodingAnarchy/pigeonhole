@@ -1334,6 +1334,12 @@ fn work_queued_before_the_wait_returns_it_at_once() {
 
 #[test]
 fn the_wakeup_callback_still_fires_beside_a_wait() {
+    // A submit while the driver waits fires the wakeup callback as well as ending the wait.
+    // `wait` may return spuriously (its contract; `park_timeout` does on Windows, #867), and
+    // a submit that then finds the driver awake rightly calls nothing: the message waits for
+    // the next turn. So the test waits again until the submit has happened, and repeats the
+    // scenario a few times: a callback that never fires still fails every attempt, while a
+    // spurious return just before the submit (a window of a few instructions) fails one.
     let (mut drivers, _) = app_drivers(1);
     let mut d = drivers.remove(0);
     let fired = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1341,18 +1347,29 @@ fn the_wakeup_callback_still_fires_beside_a_wait() {
     d.set_wakeup(Box::new(move || {
         f.fetch_add(1, Ordering::SeqCst);
     }));
-    assert!(!d.run_once(u64::MAX));
-    let before = fired.load(Ordering::SeqCst);
-    let s = d.submitter(ShardId(0));
-    let other = thread::spawn(move || {
-        thread::sleep(Duration::from_millis(50));
-        let (n, _w) = completion();
-        s.submit(Msg::Echo(2, n)).unwrap();
-    });
-    d.wait(Duration::from_secs(30));
-    other.join().unwrap();
-    assert!(
-        fired.load(Ordering::SeqCst) > before,
-        "the callback was not called"
-    );
+    let mut called = false;
+    for _attempt in 0..5 {
+        while d.run_once(u64::MAX) {}
+        let before = fired.load(Ordering::SeqCst);
+        let s = d.submitter(ShardId(0));
+        let submitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let other = {
+            let submitted = Arc::clone(&submitted);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                let (n, _w) = completion();
+                s.submit(Msg::Echo(2, n)).unwrap();
+                submitted.store(true, Ordering::SeqCst);
+            })
+        };
+        while !submitted.load(Ordering::SeqCst) {
+            d.wait(Duration::from_secs(30));
+        }
+        other.join().unwrap();
+        if fired.load(Ordering::SeqCst) > before {
+            called = true;
+            break;
+        }
+    }
+    assert!(called, "the callback was not called in any of 5 attempts");
 }
