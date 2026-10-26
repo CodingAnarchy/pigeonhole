@@ -295,6 +295,31 @@ impl Drop for TempDir {
     }
 }
 
+/// After a close: nothing unreferenced is still allocated (a dropped compaction's output was
+/// freed, not leaked), and the retired extents (inputs of the compactions that did commit)
+/// all come back once reclaimed. The reclaim a dropped view triggers only tries the pager
+/// lock and skips when another thread holds it (an I/O completion on the pread pool, say),
+/// so whether retired bytes are still there right after the close depends on timing: they
+/// are reclaimed here, blocking, before the total is checked.
+fn assert_extents_back(engine: &Engine, context: &str) {
+    let (allocated, retired) = engine.unreferenced_split();
+    assert_eq!(
+        allocated,
+        0,
+        "{context}: unreferenced bytes still allocated (retired {retired}); metrics {:?}; \
+         levels {:?}; SSTs {:?}",
+        engine.metrics(),
+        engine.sst_levels(),
+        engine.sst_lens()
+    );
+    engine.reclaim_now();
+    assert_eq!(
+        engine.unreferenced_bytes(),
+        0,
+        "{context}: retired bytes left after a reclaim (retired {retired} before it)"
+    );
+}
+
 fn real_options(vfs: &VfsRef) -> EngineOptions {
     let mut o = EngineOptions::new(Arc::clone(vfs));
     o.create_if_missing = true;
@@ -415,11 +440,7 @@ fn close_from_another_thread_with_a_worker_stopped_mid_compaction() {
     while shard.run_once(u64::MAX) {}
     assert_eq!(engine.metrics().compactions_reclaimed, 1);
     // The dropped job's output is free (a reopen's own preallocation would hide it).
-    assert_eq!(
-        engine.unreferenced_bytes(),
-        0,
-        "the dropped job's output is free"
-    );
+    assert_extents_back(&engine, "after the close");
     drop((engine, shard, worker));
     // And the file reopens.
     let (engine, mut shards) = Engine::open_application_owned(&path, {
@@ -462,7 +483,7 @@ fn a_dropped_worker_mid_compaction_leaves_its_inputs_to_compact_again() {
     while shard.closed().is_none() {
         shard.run_once(u64::MAX);
     }
-    assert_eq!(engine.unreferenced_bytes(), 0);
+    assert_extents_back(&engine, "after the close");
 }
 
 /// perf287's must-fix on #983: a driven worker busy with two long compactions (one per

@@ -622,6 +622,39 @@ impl Engine {
         (stats.allocated_bytes + stats.retired_bytes).saturating_sub(referenced)
     }
 
+    /// [`unreferenced_bytes`](Self::unreferenced_bytes) split: `(allocated, retired)`, the
+    /// unreferenced bytes still allocated (output in flight or leaked: a compaction or
+    /// flush that never committed and was never abandoned) and those retired, which a
+    /// later reclaim frees once no view reaches them (test hook, D284).
+    #[doc(hidden)]
+    pub fn unreferenced_split(&self) -> (u64, u64) {
+        let shared = &self.inner.shared;
+        let root = shared
+            .manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .root();
+        let mut live: Vec<_> = shared.view.load().catalog.data_extents();
+        live.extend(root.snapshot);
+        live.extend(root.log);
+        live.sort();
+        live.dedup();
+        let referenced: u64 = live.iter().map(|e| e.len()).sum();
+        let stats = shared.pager.stats();
+        (
+            stats.allocated_bytes.saturating_sub(referenced),
+            stats.retired_bytes,
+        )
+    }
+
+    /// Frees retired extents no view reaches, waiting for the pager if it is busy (test
+    /// hook, D284): the reclaim a dropped view only tries (`Shared::try_reclaim` skips when
+    /// another thread holds the pager, and the next commit reclaims instead).
+    #[doc(hidden)]
+    pub fn reclaim_now(&self) {
+        self.inner.shared.reclaim();
+    }
+
     /// Every SST the current catalog names, as `(level, length, size class)` (test hook:
     /// the footprint test reads the live bytes and the SST count per run, #185).
     #[doc(hidden)]
