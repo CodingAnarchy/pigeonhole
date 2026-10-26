@@ -6461,6 +6461,16 @@ impl ShardState {
                             self.id.0,
                             m.seqno
                         );
+                        // What makes the early case safe, checked directly (perf287's form):
+                        // the share's apply seqno is still held, so not yet durable.
+                        debug_assert!(
+                            !early || self.shared.shm.durable_seqno() < *apply_seqno,
+                            "shard {}: COMMIT {} logged after an early Decide with its apply \
+                             seqno {} already durable",
+                            self.id.0,
+                            m.seqno,
+                            apply_seqno
+                        );
                         let kind = LoggedKind::Commit {
                             holders: Arc::clone(participants),
                             apply: Some(*apply_seqno),
