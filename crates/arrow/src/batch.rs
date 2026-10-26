@@ -222,6 +222,9 @@ impl Builder {
             Value::I64(v) => (1, Some(v), None),
             Value::F64(v) => (2, None, Some(v)),
             Value::Varint(v) => (3, Some(v), None),
+            // A value type added after this build (`Value` is non-exhaustive): its raw bytes
+            // are in `values` already, so it exports as bytes.
+            _ => (0, None, None),
         };
         self.type_keys.push(kind);
         if self.options.typed_values {

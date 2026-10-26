@@ -71,6 +71,7 @@ fn contents(db: &Pigeonhole) -> Vec<String> {
                     Value::I64(n) => format!("i64:{n}"),
                     Value::F64(x) => format!("f64:{:016x}", x.to_bits()),
                     Value::Varint(n) => format!("varint:{n}"),
+                    other => panic!("a value type this test doesn't know: {other:?}"),
                 };
                 lines.push(format!(
                     "{name}\t{}\t{}\t{}\t{}\t{value}",

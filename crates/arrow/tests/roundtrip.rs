@@ -148,6 +148,7 @@ fn type_name(v: pigeonhole::Value<'_>) -> &'static str {
         pigeonhole::Value::I64(_) => "i64",
         pigeonhole::Value::F64(_) => "f64",
         pigeonhole::Value::Varint(_) => "varint",
+        other => panic!("a value type this test doesn't know: {other:?}"),
     }
 }
 

@@ -29,11 +29,13 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
             Priority::Low => "low",
             Priority::Normal => "normal",
             Priority::High => "high",
+            _ => "unknown",
         },
         "compaction": match f.compaction {
             Compaction::Leveled => "leveled",
             Compaction::Tiered => "tiered",
             Compaction::FifoByTime => "fifo-by-time",
+            _ => "unknown",
         },
     });
     match v {

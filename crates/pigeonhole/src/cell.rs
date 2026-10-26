@@ -6,6 +6,7 @@ use pigeonhole_engine::{CellData, FamilyId, TableInfo, ValueRef};
 
 /// A typed view of a value.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub enum Value<'a> {
     /// Opaque bytes.
     Bytes(&'a [u8]),
@@ -158,6 +159,7 @@ impl Cell {
 
 /// One entry of a row: which column, and which version.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CellEntry<'a> {
     /// Family name.
     pub family: &'a str,
