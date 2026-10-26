@@ -2336,7 +2336,7 @@ impl Task for ClockTimer {
 }
 
 /// Arena room a batch needs (`ShardState::arena_needed`).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ArenaNeed {
     /// Worst-case bytes of free chunks it uses.
     bytes: usize,
@@ -2346,6 +2346,29 @@ struct ArenaNeed {
     min_large: usize,
     /// Chunks its allocations can take in all.
     alloc_chunks: usize,
+    /// Its entries' bytes alone: each entry plus the run tail it may leave, `bytes` without
+    /// the chunks below (#749).
+    entries: usize,
+    /// The slots it writes to, each with whether it would create the slot's memtable, and
+    /// its writes no tablet routes: the per-slot chunks of `bytes`.
+    slots: smallvec::SmallVec<[(TabletId, FamilyId, bool); 4]>,
+    unrouted: usize,
+}
+
+/// The chunks a group's singles have reserved between them (#749): each slot's run tail
+/// (and a new slot's first chunk) once per group, and the fresh-memtable and freeze chunks
+/// once, rather than once per member. Every member of a group is applied before anything
+/// else allocates from the arena (the freeze after the group comes last), and the arena
+/// bound holds for any sequence of entries into the same memtables, whatever batches they
+/// came in (the memtable crate's `a_batch_stays_within_the_engine_bound`), so the group needs
+/// its entries' bytes plus these chunks once.
+#[derive(Default)]
+struct GroupRoom {
+    slots: smallvec::SmallVec<[(TabletId, FamilyId); 8]>,
+    fixed: bool,
+    /// Chunks reserved for the slots and the fixed two so far, carried by the group's last
+    /// admitted single (released when it applies, after every other member).
+    chunks: usize,
 }
 
 /// A wait for a flush to free memtable arena room, with its timers: a commit's (a write
@@ -3873,7 +3896,17 @@ impl ShardState {
         }
         // A new memtable needs a chunk of its own, and a freeze needs one more.
         let chunks = touched.len() + unrouted + new_slots + 2;
+        let slots = touched
+            .iter()
+            .map(|&(t, f)| {
+                let new = self.tablets_on() && !self.memtables.contains_key(&(t, f));
+                (t, f, new)
+            })
+            .collect();
         ArenaNeed {
+            entries: total + waste,
+            slots,
+            unrouted,
             bytes: total + waste + chunks * self.chunk_size,
             run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
             min_large: if min_large == usize::MAX {
@@ -3946,8 +3979,19 @@ impl ShardState {
     }
 
     /// Reserves arena room for `bytes` (on top of everything already reserved by members of
-    /// this group and undecided shares) or returns `None` when it would not fit.
-    fn reserve_room(&mut self, bytes: &[u8]) -> std::result::Result<usize, Room> {
+    /// this group and undecided shares) or returns `None` when it would not fit. Returns the
+    /// room the member itself releases when applied.
+    ///
+    /// With `group` (a single), the per-slot chunks are the group's (#749): a slot an earlier
+    /// single of the group already reserved for, and the fixed two once one did, cost
+    /// nothing more, and what this member adds goes to `group.chunks`, which the group's last
+    /// single carries. Without it (a PREPARE, whose share keeps its room until the decision,
+    /// past the group) the member reserves every chunk it could need on its own.
+    fn reserve_room(
+        &mut self,
+        bytes: &[u8],
+        group: Option<&mut GroupRoom>,
+    ) -> std::result::Result<usize, Room> {
         let mut rows = std::mem::take(&mut self.admit_rows);
         rows.clear();
         let need = match BatchRef::new(bytes) {
@@ -3957,10 +4001,27 @@ impl ShardState {
                 run_chunks: 1,
                 min_large: 0,
                 alloc_chunks: 0,
+                entries: 0,
+                slots: smallvec::SmallVec::new(),
+                unrouted: 0,
             },
         };
         self.admit_rows = rows;
-        let needed = need.bytes;
+        // A single's per-slot chunks are its group's: only those no earlier single of the
+        // group reserved (#749).
+        let (needed, own, extra) = match &group {
+            Some(g) => {
+                let mut extra = need.unrouted + if g.fixed { 0 } else { 2 };
+                for &(t, f, new) in &need.slots {
+                    if !g.slots.contains(&(t, f)) {
+                        extra += 1 + usize::from(new);
+                    }
+                }
+                let needed = need.entries + extra * self.chunk_size;
+                (needed, need.entries, extra)
+            }
+            None => (need.bytes, need.bytes, 0),
+        };
         // Entries within a chunk fit any free chunk. A larger entry must also find a long
         // enough run (issue #141: a run too short for it, with enough free chunks elsewhere,
         // used to poison the shard at apply). Before any large entry allocates, at most the
@@ -4005,14 +4066,24 @@ impl ShardState {
                     .fetch_add(1, Ordering::Relaxed);
             }
             let total = self.arena.region().len();
-            return Err(if needed + 2 * self.chunk_size > total {
+            // Whether it could ever fit is judged on its own, as if first in its group.
+            return Err(if need.bytes + 2 * self.chunk_size > total {
                 Room::Never
             } else {
                 Room::Wait
             });
         }
         self.reserved += needed;
-        Ok(needed)
+        if let Some(g) = group {
+            for &(t, f, _) in &need.slots {
+                if !g.slots.contains(&(t, f)) {
+                    g.slots.push((t, f));
+                }
+            }
+            g.fixed = true;
+            g.chunks += extra;
+        }
+        Ok(own)
     }
 
     /// Whether the shard's writers are stalled now: a wait for room or L0 pacing is open
@@ -5602,6 +5673,8 @@ impl ShardState {
         // together have no order (D143).
         let mut admitted = self.member_buf();
         admitted.reserve(members.len());
+        // The per-slot chunks the group's singles reserve between them (#749).
+        let mut group_room = GroupRoom::default();
         self.touched.clear();
         self.group_k = 1;
         self.group_rank = 0;
@@ -5845,7 +5918,8 @@ impl ShardState {
                 continue;
             }
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                match self.reserve_room(m.bytes.as_slice()) {
+                let group = matches!(m.kind, MemberKind::Single).then_some(&mut group_room);
+                match self.reserve_room(m.bytes.as_slice(), group) {
                     Ok(bytes) => m.reserved = bytes,
                     Err(Room::Never) => {
                         // Not a stall: no flush could ever make room. The caller must split
@@ -5908,6 +5982,22 @@ impl ShardState {
             admitted.push(m);
         }
         self.return_member_buf(members);
+        // The group's per-slot chunks go with its last single, which applies after every
+        // other member: until then any of them may use them (#749).
+        if group_room.chunks > 0 {
+            let room = group_room.chunks * self.chunk_size;
+            match admitted
+                .iter_mut()
+                .rev()
+                .find(|m| matches!(m.kind, MemberKind::Single))
+            {
+                Some(last) => last.reserved += room,
+                None => {
+                    debug_assert!(false, "group room reserved with no single admitted");
+                    self.release_room(room);
+                }
+            }
+        }
         if share_waits > 0 || self.share_wait_since.is_some() {
             self.count_share_waits(share_waits, ctx.now_nanos());
         }
