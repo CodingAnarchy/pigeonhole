@@ -1,0 +1,32 @@
+# The golden files frozen at 1.0 (FORMAT.md §13): name, length, xxh3-64 of the bytes.
+# Append only. A frozen file never changes and no line is edited or removed; a later
+# format adds a sibling golden file (and its line) instead. See tests/golden.rs.
+blob_extent_header.bin 64 61242ff006fd192e
+blob_extent_header_v3.bin 64 d968885210c59337
+blob_pointer.bin 16 99adf1f04e611c80
+blob_record_header.bin 16 6803961c6920daff
+data_block.bin 334 79a2767ee1cf1fd4
+filter.bin 264 8c39c6f023574df4
+index_block.bin 63 ed22e5ce87e39093
+keys.bin 322 b6d57f3c2618d427
+manifest_delta_log.bin 335 c5ba8075c11473c5
+manifest_delta_log_v3.bin 335 5e2054ab1f56eea1
+manifest_snapshot.bin 607 9283aad969e18ee2
+manifest_snapshot_0_1.bin 508 77158957e93cc428
+manifest_snapshot_v3.bin 607 381212e1c94e5b26
+sealed_block_lz4.bin 29 030df4c1266f8895
+sealed_block_none.bin 350 dcc1096db4cd81be
+sst_footer.bin 104 30ada29b00a0b22d
+sst_footer_v3.bin 104 73403fe111f80241
+sst_properties.bin 213 ff2c92ce33428b32
+sst_properties_before_d268.bin 205 20f53c2252ec73a3
+superblock.bin 128 505ad8d7c7722922
+superblock_v3.bin 128 ad69d8c87a119e56
+values.bin 55 0b7e4b0d244d1450
+wal_fragments.bin 408 1a15fa5f900db1d6
+wal_record_batch.bin 145 7985e0208b7a07b7
+wal_record_commit.bin 19 87f216db1c93e51d
+wal_record_decision.bin 35 c0526b54ea8382d7
+wal_record_prepare.bin 149 bbccda37d8de0e5a
+wal_segment_header.bin 128 3b4ab3ade47a4bc0
+wal_segment_header_v3.bin 60 29f5fac990ee2963

@@ -70,6 +70,13 @@ jobs:
       - run: cargo doc --workspace --exclude pigeonhole-bench --no-deps --all-features
       - run: cargo doc -p pigeonhole-bench --no-deps --features "$BENCH_FEATURES"
       - run: cargo test --workspace --exclude pigeonhole-bench --all-features
+      # The golden files frozen at 1.0 (#695): the golden test checks each against its line in
+      # golden-frozen.txt, and this checks that a PR only appends lines there.
+      - name: frozen golden files only gain siblings
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+          python3 scripts/golden-frozen.py FETCH_HEAD
       # #692: `cargo install pigeonhole-cli` keeps working. Install `phdb` from this checkout
       # (release, with the lockfile) into a scratch root, then use the installed binary end to
       # end: make a database, write and read through the shell, and check it.

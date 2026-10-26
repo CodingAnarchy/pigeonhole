@@ -553,7 +553,7 @@ From 1.0.0 (D269):
 - **Features are flagged only once used.** A bit is set in both superblock pages before the first structure that uses the feature is written, so a file that doesn't use a new feature stays readable and writable by every older 1.x build.
 - **Unknown values are never corruption.** A value of a frozen enum that this build doesn't know, in bytes whose checksum passes, decodes to `UnsupportedFeature` (ICR 0058): key kind, value tag, compression, block, filter and manifest block kinds, family settings, WAL record and fragment types, must-understand edit tags (§9.3), SST and WAL segment feature bits. With the file-level bit set first, an older build normally refuses at open; the per-structure error is the backstop.
 - **What isn't promised:** the shared-memory layout (§11), the API (semver covers it separately), and files written by 2.0 (format 5), which no 1.x build opens. 2.0 comes with upgrade tooling.
-- **How it's checked:** golden files for every structure (`crates/format/tests/golden`, frozen at 1.0), a corpus of files written by the 1.0 release that every later build opens in CI, and, once 1.0.0 is published, a job that opens files from `main` with 1.0.0.
+- **How it's checked:** golden files for every structure (`crates/format/tests/golden`, frozen at 1.0 by the append-only hash list `crates/format/tests/golden-frozen.txt`), a corpus of files written by the 1.0 release that every later build opens in CI, and, once 1.0.0 is published, a job that opens files from `main` with 1.0.0.
 
 ### 13.1 Where each structure has room
 
