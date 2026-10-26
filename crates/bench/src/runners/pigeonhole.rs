@@ -1335,7 +1335,10 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
 pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
     let m = db.engine_metrics();
     let rc = db.row_cache_stats();
+    let rings = db.io_rings().unwrap_or_default();
     crate::Stalls {
+        ring_attach_failures: rings.attach_failures,
+        ring_inline: rings.inline,
         write_stalls: m.write_stalls,
         write_stall_nanos: m.write_stall_nanos,
         room_stalls: m.room_stalls,

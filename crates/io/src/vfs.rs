@@ -14,6 +14,12 @@ pub struct RingStats {
     pub rings: usize,
     /// Rings with a registered buffer pool (fixed buffers); the rest use plain buffers.
     pub pooled: usize,
+    /// Times a thread could not get a ring of its own (the kernel refused one, `ENOMEM` or a
+    /// missing feature), counted per attempt; it retries later (#929).
+    pub attach_failures: u64,
+    /// Operations a thread with no ring of its own ran inline, as the pread backend does,
+    /// on a backend with no reaper thread (application-owned mode, #929).
+    pub inline: u64,
 }
 
 /// Device and inode of a file: the same on every process however the path is spelled.

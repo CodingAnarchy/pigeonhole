@@ -962,6 +962,13 @@ pub struct IoRings {
     pub rings: usize,
     /// Rings with a registered buffer pool; the rest use plain buffers.
     pub pooled: usize,
+    /// Times a thread could not get a ring of its own (the kernel refused one, `ENOMEM` or a
+    /// missing feature), counted per attempt; the thread retries later (#929, ICR 0070).
+    pub attach_failures: u64,
+    /// Operations a thread with no ring of its own ran inline, as the pread backend does, in
+    /// application-owned mode (#929, ICR 0070). Nonzero: some I/O ran synchronously on the
+    /// calling thread.
+    pub inline: u64,
 }
 
 /// The backend `backend` names; unset, the one `PIGEONHOLE_IO` names (a test variable:

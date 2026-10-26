@@ -410,6 +410,8 @@ impl Db {
         self.vfs.ring_stats().map(|s| IoRings {
             rings: s.rings,
             pooled: s.pooled,
+            attach_failures: s.attach_failures,
+            inline: s.inline,
         })
     }
 

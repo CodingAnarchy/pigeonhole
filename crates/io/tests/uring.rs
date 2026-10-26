@@ -543,52 +543,23 @@ fn the_application_owned_backend_starts_no_thread() {
 }
 
 #[test]
-fn a_client_threads_io_completes_through_a_driving_threads_fd() {
-    // The shared ring has no reaper: a thread that drives shards, waiting only on its
-    // completion fd, takes the completions of I/O a thread without a ring submitted.
+fn a_client_threads_io_completes_inline_with_no_reaper() {
+    // The shared ring has no reaper (application-owned mode): a thread without a ring of its
+    // own runs its I/O inline (#929), so it completes at once, with no thread driving shards
+    // and nothing to reap. (Before #929 it went to the shared ring, and a driving thread's
+    // completion fd fired for it.)
     let _serial = serial();
     let b = Backend::uring_application_owned("uring-app-client");
     let f = b.create("f");
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let driver = {
-        let (vfs, stop) = (Arc::clone(&b.vfs), Arc::clone(&stop));
-        thread::spawn(move || {
-            vfs.attach_thread();
-            let fd = own_io_fd().expect("a completion fd");
-            let mut wakes = 0u32;
-            while !stop.load(std::sync::atomic::Ordering::Acquire) {
-                if readable(fd, 100) {
-                    wakes += 1;
-                }
-                reap_own_io(None);
-            }
-            wakes
-        })
-    };
-    // Let the driver attach and arm its poll before the client submits.
-    thread::sleep(Duration::from_millis(50));
     for i in 0..20u64 {
-        // Polled, never waited for: only the driver can complete it.
         let write = f.submit_write(filled(4096, i as u8), i * 4096);
-        let started = std::time::Instant::now();
-        while !write.is_ready() {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the client write never completed"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert!(write.is_ready(), "the client write ran inline");
         write.wait().unwrap();
     }
-    stop.store(true, std::sync::atomic::Ordering::Release);
-    let wakes = driver.join().unwrap();
-    assert!(
-        wakes > 0,
-        "the driver's fd never fired for client completions"
-    );
-    // A blocked wait on a client operation reaps the shared ring itself (no driver now).
     let got = f.submit_read(IoBuf::zeroed(4096), 0).wait().unwrap();
     assert!(got.iter().all(|&x| x == 0));
+    let s = b.vfs.ring_stats().unwrap();
+    assert_eq!((s.rings, s.inline), (1, 21), "{s:?}");
 }
 
 #[test]
@@ -611,4 +582,148 @@ fn a_blocked_wait_on_a_completion_chained_after_the_shared_ring_completes_with_n
     rx.recv_timeout(Duration::from_secs(10))
         .expect("the chained completion resolved")
         .unwrap();
+}
+
+/// #929: a thread the kernel gives no ring of its own (here the test hook, through the same
+/// path as a kernel without the support) on a backend with no reaper (application-owned
+/// mode) runs its submitted operations inline, as the pread backend does: they complete at
+/// once, with nothing left in a ring for some other thread to reap.
+#[test]
+fn a_thread_without_its_own_ring_runs_its_io_inline_when_nothing_reaps() {
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-attach-fails");
+    let f = b.create("f");
+    pigeonhole_io::uring::fail_ring_attaches(1);
+    let vfs = Arc::clone(&b.vfs);
+    let g = Arc::clone(&f);
+    thread::spawn(move || {
+        vfs.attach_thread();
+        assert!(own_io_waker().is_none(), "no ring of its own");
+        let write = g.submit_write(filled(4096, 7), 0);
+        assert!(write.is_ready(), "the write ran inline");
+        write.wait().unwrap();
+        let sync = g.submit_sync_data();
+        assert!(sync.is_ready(), "the sync ran inline");
+        sync.wait().unwrap();
+        let read = g.submit_read(IoBuf::zeroed(4096), 0);
+        assert!(read.is_ready());
+        assert!(read.wait().unwrap().iter().all(|&x| x == 7));
+        assert!(!own_io_in_flight());
+    })
+    .join()
+    .unwrap();
+    let s = b.vfs.ring_stats().unwrap();
+    assert_eq!(s.attach_failures, 1, "{s:?}");
+    assert_eq!(s.inline, 3, "{s:?}");
+    pigeonhole_io::uring::fail_ring_attaches(0);
+}
+
+/// #929: with every attach failing (an old kernel, or the locked-memory limit spent), no
+/// thread has a ring and nothing reaps the shared one: every thread's I/O still completes.
+#[test]
+fn with_no_thread_ring_at_all_every_threads_io_completes() {
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-attach-all-fail");
+    let f = b.create("f");
+    pigeonhole_io::uring::fail_ring_attaches(usize::MAX);
+    let threads: Vec<_> = (0..4u64)
+        .map(|t| {
+            let (vfs, f) = (Arc::clone(&b.vfs), Arc::clone(&f));
+            thread::spawn(move || {
+                vfs.attach_thread();
+                for i in 0..50u64 {
+                    let at = (t * 50 + i) * 512;
+                    let w = f.submit_write(filled(512, (t * 7 + i) as u8), at);
+                    assert!(w.is_ready());
+                    w.wait().unwrap();
+                }
+                let s = f.submit_sync_data();
+                assert!(s.is_ready());
+                s.wait().unwrap();
+            })
+        })
+        .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    pigeonhole_io::uring::fail_ring_attaches(0);
+    let s = b.vfs.ring_stats().unwrap();
+    assert_eq!(s.rings, 1, "only the shared ring: {s:?}");
+    assert!(s.attach_failures >= 4, "{s:?}");
+    assert_eq!(s.inline, 4 * 51, "{s:?}");
+    assert_eq!(f.len().unwrap(), 4 * 50 * 512);
+}
+
+/// #929: a failed attach is tried again once its retry delay has passed, and the thread
+/// then submits to its own ring.
+#[test]
+fn a_failed_attach_is_retried_later() {
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-attach-retry");
+    let f = b.create("f");
+    pigeonhole_io::uring::fail_ring_attaches(1);
+    let vfs = Arc::clone(&b.vfs);
+    let g = Arc::clone(&f);
+    thread::spawn(move || {
+        vfs.attach_thread();
+        assert!(g.submit_write(filled(512, 1), 0).is_ready(), "inline");
+        thread::sleep(Duration::from_millis(20));
+        let w = g.submit_write(filled(512, 2), 512);
+        assert!(own_io_waker().is_some(), "attached on the retry");
+        while !w.is_ready() {
+            reap_own_io(Some(Duration::from_millis(10)));
+        }
+        w.wait().unwrap();
+    })
+    .join()
+    .unwrap();
+    let s = b.vfs.ring_stats().unwrap();
+    assert_eq!((s.attach_failures, s.inline), (1, 1), "{s:?}");
+}
+
+/// #929 (perf287's review): an inline sync is an `fdatasync`, which covers only writes that
+/// completed, not one still in flight on another thread's ring. A caller must take its sync
+/// target from completed writes; the WAL does (`WalStream::submit_sync` syncs to the written
+/// position, taken after its synchronous buffer write).
+#[test]
+fn an_inline_sync_returns_while_another_rings_write_is_in_flight() {
+    let _serial = serial();
+    let b = Backend::uring_application_owned("uring-inline-sync-inflight");
+    let f = b.create("f");
+    let (vfs, g) = (Arc::clone(&b.vfs), Arc::clone(&f));
+    let (submitted_tx, submitted_rx) = mpsc::channel();
+    let (synced_tx, synced_rx) = mpsc::channel::<()>();
+    // Thread X: its own ring, a write it does not reap until the inline sync returned.
+    let x = thread::spawn(move || {
+        vfs.attach_thread();
+        assert!(own_io_waker().is_some());
+        let w = g.submit_write(filled(1 << 20, 9), 0);
+        submitted_tx.send(()).unwrap();
+        synced_rx.recv().unwrap();
+        let still_pending = !w.is_ready();
+        while !w.is_ready() {
+            reap_own_io(Some(Duration::from_millis(10)));
+        }
+        w.wait().unwrap();
+        still_pending
+    });
+    submitted_rx.recv().unwrap();
+    // Thread Y: no ring of its own; its sync runs inline and returns at once.
+    pigeonhole_io::uring::fail_ring_attaches(1);
+    let (vfs, g) = (Arc::clone(&b.vfs), Arc::clone(&f));
+    thread::spawn(move || {
+        vfs.attach_thread();
+        let s = g.submit_sync_data();
+        assert!(s.is_ready(), "inline");
+        s.wait().unwrap();
+    })
+    .join()
+    .unwrap();
+    synced_tx.send(()).unwrap();
+    assert!(
+        x.join().unwrap(),
+        "the write was still in flight on X's ring when Y's inline sync returned: it did not \
+         wait for it, so it cannot make it durable"
+    );
+    pigeonhole_io::uring::fail_ring_attaches(0);
 }
