@@ -606,11 +606,12 @@ fn shm() {
     );
     let h = ShmHeader {
         row_epoch_seed: 0x5eed_5eed_5eed_5eed,
+        row_epoch_flags: pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED,
         ..h
     };
     let mut page = [0u8; 4096];
     h.encode(&mut page);
-    check("shm_header.bin", prefix(&page, 184));
+    check("shm_header.bin", prefix(&page, 188));
     let view = ViewRecord {
         view_version: 3,
         manifest_version: 12,

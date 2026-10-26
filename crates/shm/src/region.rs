@@ -454,6 +454,9 @@ fn build(
         identity.inode,
     );
     h.row_epoch_seed = row_epoch_seed(generation, vfs.current_process());
+    if config.row_epochs_maintained {
+        h.row_epoch_flags |= pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED;
+    }
     let region = match vfs.open_shared(&name, dir, h.region_len, SharedOpen::CreateNew) {
         Ok(r) => r,
         Err(e) if e.kind == ErrorKind::AlreadyExists => {
@@ -575,6 +578,9 @@ impl ShmRegion {
                 start_time: 0,
             },
         );
+        if config.row_epochs_maintained {
+            h.row_epoch_flags |= pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED;
+        }
         let len = usize::try_from(h.region_len).expect("region fits in memory");
         let region = SharedRegion::heap(len);
         let generation = Generation(1);
@@ -678,6 +684,7 @@ impl ShmRegion {
             off: h.row_epochs_off as usize,
             mask: u64::from(h.row_epoch_slots) - 1,
             seed: h.row_epoch_seed,
+            maintained: h.row_epoch_flags & pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED != 0,
         }
     }
 
@@ -1411,6 +1418,7 @@ pub struct RowEpochTable {
     off: usize,
     mask: u64,
     seed: u64,
+    maintained: bool,
 }
 
 impl RowEpochTable {
@@ -1422,6 +1430,12 @@ impl RowEpochTable {
     /// How many slots the table has (a power of two).
     pub fn slots(&self) -> usize {
         self.mask as usize + 1
+    }
+
+    /// Whether the writer raises the slots (the header's `ROW_EPOCHS_MAINTAINED`): a reader
+    /// may cache rows only then.
+    pub fn maintained(&self) -> bool {
+        self.maintained
     }
 
     #[inline]

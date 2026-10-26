@@ -57,6 +57,7 @@ A reader process keeps the newest version of small, hot rows in a row cache of i
 - **Size:** `ReaderOptions::row_cache(bytes)`, 64 MiB by default, as the writer's; `0` turns it off. **Each reader process has its own:** N reader processes use up to N × 64 MiB by default, plus about 4 MiB each for the cache's per-row tables. `row_cache_max_row` and `row_cache_family` work as on `Options`.
 - **Counts:** `PigeonholeReader::row_cache_stats()`: hits, misses and fills.
 - **A new writer empties it:** when the writer restarts, recovers or hands over (a new shared-memory generation), the reader re-attaches with an empty cache and the counts start again.
+- **It needs the writer's row cache on** (`Options::row_cache`, on by default): only then does the writer raise the watermarks. A writer opened with `row_cache(0)` gives its readers no cache (their reads are uncached, and still right).
 - **What bypasses it:** snapshot reads, scans, multi-version reads, and, until [#946](https://github.com/CodingAnarchy/pigeonhole/issues/946), the async reads (`get_async` and the async row read).
 
 ## Long-held snapshots stall the writer

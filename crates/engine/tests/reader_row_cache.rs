@@ -38,6 +38,8 @@ struct Writer {
 fn options(vfs: &Arc<SimVfs>) -> EngineOptions {
     let mut o = common::options(Arc::clone(vfs), 1, 16 << 20);
     o.tablet_changes = false;
+    // The writer's own row cache on: only then does it raise the slots (D281).
+    o.row_cache_bytes = 1 << 20;
     o
 }
 
@@ -384,5 +386,55 @@ fn a_write_lost_with_its_writer_is_never_served_from_a_reader_cache() {
     }
     drop(reader);
     vfs.enter_process(second);
+    w.close();
+}
+
+/// D281 after callgrind (the owner's ruling): a writer with its row cache off raises no slot
+/// and says so in the header, and a reader process then keeps no cache, so its reads stay
+/// right instead of keying on slots that stay 0.
+#[test]
+fn a_writer_without_a_row_cache_gives_readers_none() {
+    let vfs = SimVfs::new(928);
+    let writer_process = pigeonhole_io::Vfs::current_process(&*vfs);
+    let mut o = options(&vfs);
+    o.row_cache_bytes = 0;
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
+    let mut shard = shards.remove(0);
+    while shard.run_once(u64::MAX) {}
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let mut w = Writer { db, shard, t };
+    let f = w.t.families[0].id;
+    w.commit(|wb, t| {
+        wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"v1"))
+            .unwrap();
+    });
+    vfs.enter_process(READER);
+    let reader = open_reader(&vfs);
+    let t = Arc::clone(&w.t);
+    for _ in 0..3 {
+        latest(&reader, &t, b"r");
+    }
+    vfs.enter_process(writer_process);
+    w.commit(|wb, t| {
+        wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"v2"))
+            .unwrap();
+    });
+    let want = latest(&w.db, &t, b"r");
+    vfs.enter_process(READER);
+    assert_eq!(
+        latest(&reader, &t, b"r"),
+        want,
+        "a stale row from slots nobody raised"
+    );
+    let stats = reader.row_cache_stats();
+    assert_eq!(
+        (stats.hits, stats.fills),
+        (0, 0),
+        "a cache keyed on unraised slots: {stats:?}"
+    );
+    drop(reader);
+    vfs.enter_process(writer_process);
     w.close();
 }

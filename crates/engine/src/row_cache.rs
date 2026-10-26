@@ -22,14 +22,12 @@
 //! entry holds only those, so they need no epoch change. TTL does: an entry stores the
 //! earliest moment one of its cells expires and misses from then on.
 
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::ops::Bound;
 use std::sync::Arc;
 
 use pigeonhole_cache::{RowCache, RowHandle};
-use pigeonhole_format::hash::SeededBuildHasher;
 use pigeonhole_format::scan::QualifierFilter;
 use pigeonhole_format::{FamilyId, Seqno, TableId, Timestamp};
 use pigeonhole_shm::RowEpochTable;
@@ -58,13 +56,14 @@ pub fn table_slots(bytes: usize) -> u32 {
         .min(pigeonhole_shm::MAX_ROW_EPOCH_SLOTS)
 }
 
-/// The region's write watermarks and the hash that picks a row's slot (D201, D281). The
-/// writer raises a row's slot for every write, whether or not its own row cache is on, so
-/// reader processes' caches can trust it (perf287: a reader caching against slots nobody
-/// raises would serve stale rows for ever).
+/// The region's write watermarks and the hash that picks a row's slot (D201, D281). A writer
+/// with its row cache on raises a row's slot for every write and says so in the header
+/// (`ROW_EPOCHS_MAINTAINED`); a reader caches only then (perf287: a reader caching against
+/// slots nobody raises would serve stale rows for ever). With the writer's cache off the
+/// commit path pays nothing (the owner's ruling, after callgrind).
 pub(crate) struct RowEpochs {
     table: RowEpochTable,
-    hasher: SeededBuildHasher,
+    seed: u64,
 }
 
 impl std::fmt::Debug for RowEpochs {
@@ -78,13 +77,19 @@ impl std::fmt::Debug for RowEpochs {
 impl RowEpochs {
     /// The epochs of `table`, hashed with its generation's seed.
     pub fn new(table: RowEpochTable) -> Self {
-        let hasher = SeededBuildHasher::with_seed(table.seed());
-        Self { table, hasher }
+        let seed = table.seed();
+        Self { table, seed }
     }
 
+    /// The row's slot hash: FORMAT §11.7's, the same in every build of every process.
     #[inline]
     fn hash(&self, table: TableId, row: &[u8]) -> u64 {
-        self.hasher.hash_one((table.0, row))
+        pigeonhole_format::shm::row_epoch_hash(self.seed, table.0, row)
+    }
+
+    /// Whether the writer raises the slots (a reader caches only then).
+    pub fn maintained(&self) -> bool {
+        self.table.maintained()
     }
 
     /// A commit at `seqno` writes `row` (before the write is inserted, so before it can be

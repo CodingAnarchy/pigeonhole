@@ -67,6 +67,8 @@ fn options(vfs: &Arc<SimVfs>) -> EngineOptions {
     let mut o = common::options(Arc::clone(vfs), 1, 2 << 20);
     o.memtable_freeze_bytes = 256 << 10;
     o.tablet_changes = false;
+    // The writer's row cache on, so it raises the slots and readers cache (D281).
+    o.row_cache_bytes = 1 << 20;
     o
 }
 

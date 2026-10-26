@@ -37,6 +37,41 @@ pub const ARENA_ALIGN: usize = 2 * 1024 * 1024;
 pub const ROW_EPOCH_LEN: usize = 8;
 /// Alignment of the row-epoch table.
 pub const ROW_EPOCHS_ALIGN: usize = 64;
+/// [`header::ROW_EPOCH_HASH`]: xxh3-64 with the seed over `table u32 LE ‖ row`
+/// ([`row_epoch_hash`]), the only hash this build knows.
+pub const ROW_EPOCH_HASH_XXH3: u32 = 1;
+/// [`header::ROW_EPOCH_FLAGS`] bit: the writer raises the slots (its row cache is on). A
+/// reader caches only when it is set.
+pub const ROW_EPOCHS_MAINTAINED: u32 = 1;
+
+/// The hash that picks a row's row-epoch slot (FORMAT §11.7, D281):
+/// `xxh3_64_with_seed(seed, table u32 LE ‖ row)`; the slot is `hash & (slots − 1)`. Specified
+/// bytes and algorithm, so every build of every process agrees (perf287's review of #947):
+/// a reader looking at a slot the writer never raises would serve a stale row for ever.
+///
+/// ```
+/// use pigeonhole_format::shm::row_epoch_hash;
+///
+/// let mut key = 7u32.to_le_bytes().to_vec();
+/// key.extend_from_slice(b"row");
+/// assert_eq!(row_epoch_hash(42, 7, b"row"), twox_hash::XxHash3_64::oneshot_with_seed(42, &key));
+/// ```
+#[inline]
+pub fn row_epoch_hash(seed: u64, table: u32, row: &[u8]) -> u64 {
+    const SHORT: usize = 256;
+    if row.len() <= SHORT - 4 {
+        let mut buf = [0u8; SHORT];
+        buf[..4].copy_from_slice(&table.to_le_bytes());
+        buf[4..4 + row.len()].copy_from_slice(row);
+        twox_hash::XxHash3_64::oneshot_with_seed(seed, &buf[..4 + row.len()])
+    } else {
+        use std::hash::Hasher;
+        let mut h = twox_hash::XxHash3_64::with_seed(seed);
+        h.write(&table.to_le_bytes());
+        h.write(row);
+        h.finish()
+    }
+}
 
 /// Byte offsets of the header fields.
 pub mod header {
@@ -91,8 +126,14 @@ pub mod header {
     pub const ROW_EPOCHS_OFF: usize = 160;
     /// `u32` row-epoch slots, a power of two.
     pub const ROW_EPOCH_SLOTS: usize = 168;
+    /// `u32` which hash picks a row's slot: 1 is [`row_epoch_hash`](super::row_epoch_hash)
+    /// (xxh3). Any other value is refused at attach.
+    pub const ROW_EPOCH_HASH: usize = 172;
     /// `u64` seed of the hash that maps a `(table, row)` to its slot, random per generation.
     pub const ROW_EPOCH_SEED: usize = 176;
+    /// `u32` row-epoch flags: bit 0, the writer raises the slots
+    /// ([`ROW_EPOCHS_MAINTAINED`](super::ROW_EPOCHS_MAINTAINED)).
+    pub const ROW_EPOCH_FLAGS: usize = 184;
 }
 
 /// Byte offsets within a watermark line.
@@ -154,6 +195,10 @@ pub struct ShmHeader {
     pub row_epoch_slots: u32,
     /// Seed of the row-epoch hash (set by the builder; [`ShmHeader::layout`] leaves it 0).
     pub row_epoch_seed: u64,
+    /// Which hash picks a row's slot ([`ROW_EPOCH_HASH_XXH3`]).
+    pub row_epoch_hash: u32,
+    /// Row-epoch flags ([`ROW_EPOCHS_MAINTAINED`]; set by the builder, 0 from `layout`).
+    pub row_epoch_flags: u32,
     /// Device of the main file.
     pub file_device: u64,
     /// Inode of the main file.
@@ -205,6 +250,8 @@ impl ShmHeader {
             row_epochs_off,
             row_epoch_slots,
             row_epoch_seed: 0,
+            row_epoch_hash: ROW_EPOCH_HASH_XXH3,
+            row_epoch_flags: 0,
             file_device,
             file_inode,
         }
@@ -266,6 +313,16 @@ impl ShmHeader {
             header::ROW_EPOCH_SEED,
             &self.row_epoch_seed.to_le_bytes(),
         );
+        put_at(
+            o,
+            header::ROW_EPOCH_HASH,
+            &self.row_epoch_hash.to_le_bytes(),
+        );
+        put_at(
+            o,
+            header::ROW_EPOCH_FLAGS,
+            &self.row_epoch_flags.to_le_bytes(),
+        );
     }
 
     /// Decodes and validates magic, layout version and offsets against `region_len`.
@@ -309,6 +366,8 @@ impl ShmHeader {
             row_epochs_off: le_u64(b, header::ROW_EPOCHS_OFF),
             row_epoch_slots: le_u32(b, header::ROW_EPOCH_SLOTS),
             row_epoch_seed: le_u64(b, header::ROW_EPOCH_SEED),
+            row_epoch_hash: le_u32(b, header::ROW_EPOCH_HASH),
+            row_epoch_flags: le_u32(b, header::ROW_EPOCH_FLAGS),
             file_device: le_u64(b, header::FILE_DEVICE),
             file_inode: le_u64(b, header::FILE_INODE),
         };
@@ -333,6 +392,7 @@ impl ShmHeader {
                 h.row_epochs_off,
             )
             && h.row_epoch_slots.is_power_of_two()
+            && h.row_epoch_hash == ROW_EPOCH_HASH_XXH3
             && h.row_epochs_off.is_multiple_of(ROW_EPOCHS_ALIGN as u64)
             && fits(
                 h.row_epochs_off,
@@ -699,6 +759,13 @@ mod row_epoch_tests {
                 "past the region",
                 ShmHeader {
                     row_epochs_off: !63,
+                    ..good
+                },
+            ),
+            (
+                "an unknown slot hash",
+                ShmHeader {
+                    row_epoch_hash: 2,
                     ..good
                 },
             ),

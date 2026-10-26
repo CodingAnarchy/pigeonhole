@@ -16,13 +16,14 @@
 
 **`pigeonhole-shm`:**
 - **`ShmConfig::row_epoch_slots`:** a power of two, default 2^18, at most `MAX_ROW_EPOCH_SLOTS` (2^24).
-- **`ShmRegion::row_epochs() -> RowEpochTable`:** a new type with `note_write(hash, seqno)`, `epoch(hash, seqno)`, `seed()` and `slots()`.
+- **`ShmConfig::row_epochs_maintained`:** default `true`; the engine sets it from the writer's row cache.
+- **`ShmRegion::row_epochs() -> RowEpochTable`:** a new type with `note_write(hash, seqno)`, `epoch(hash, seqno)`, `seed()`, `slots()` and `maintained()`.
 
 **`pigeonhole-format`:**
-- **Header fields:** `shm::header::{ROW_EPOCHS_OFF, ROW_EPOCH_SLOTS, ROW_EPOCH_SEED}` and `ShmHeader::{row_epochs_off, row_epoch_slots, row_epoch_seed}`.
+- **Header fields:** `shm::header::{ROW_EPOCHS_OFF, ROW_EPOCH_SLOTS, ROW_EPOCH_HASH, ROW_EPOCH_SEED, ROW_EPOCH_FLAGS}` and `ShmHeader::{row_epochs_off, row_epoch_slots, row_epoch_hash, row_epoch_seed, row_epoch_flags}`.
+- **`shm::row_epoch_hash(seed, table, row)`:** the specified slot hash (xxh3-64 with the seed over `table u32 LE ‖ row`); constants `ROW_EPOCH_HASH_XXH3` and `ROW_EPOCHS_MAINTAINED`.
 - **`ShmHeader::layout`** takes the slot count (a new parameter before the device).
 - **Constants:** `ROW_EPOCH_LEN` and `ROW_EPOCHS_ALIGN`.
-- **`hash::SeededBuildHasher`.**
 - **`ShmLayoutVersion::CURRENT` = 5.**
 
 ## Why

@@ -244,6 +244,10 @@ pub struct ShmConfig {
     /// every reader process, 8 bytes each. A power of two (default 2^18, 2 MiB). Fewer
     /// slots only make rows share them more (false row-cache misses, never a wrong row).
     pub row_epoch_slots: u32,
+    /// Whether the writer raises the row-epoch slots (its row cache is on, D281): recorded in
+    /// the header (`ROW_EPOCHS_MAINTAINED`), and a reader process caches rows only when it
+    /// is set. Default `true`.
+    pub row_epochs_maintained: bool,
 }
 
 impl ShmConfig {
@@ -257,6 +261,7 @@ impl ShmConfig {
             dir: None,
             first_seqno: 1,
             row_epoch_slots: 1 << 18,
+            row_epochs_maintained: true,
         }
     }
 

@@ -417,11 +417,17 @@ fn reader_row_cache(
     options: &EngineOptions,
     shm: &ShmRegion,
 ) -> Option<Arc<crate::row_cache::RowCaches>> {
+    let epochs = crate::row_cache::RowEpochs::new(shm.row_epochs());
+    // A writer that does not raise the slots (its row cache off): no cache here, never one
+    // keyed on slots that stay 0.
+    if !epochs.maintained() {
+        return None;
+    }
     crate::row_cache::RowCaches::new(
         options.row_cache_bytes,
         options.row_cache_max_row,
         options.row_cache_families.clone(),
-        Arc::new(crate::row_cache::RowEpochs::new(shm.row_epochs())),
+        Arc::new(epochs),
     )
     .map(Arc::new)
 }
@@ -933,6 +939,10 @@ impl Engine {
         shm_config.dir = options.shm_dir.clone();
         shm_config.first_seqno = first_seqno(catalog.counters.seqno_ceiling, 0);
         shm_config.row_epoch_slots = crate::row_cache::table_slots(options.row_cache_bytes);
+        // The slots are raised only with the writer's own row cache on, and the header says
+        // so: readers cache only then (D281; a raise on every commit cost the cache-off
+        // commit shapes 1.5%).
+        shm_config.row_epochs_maintained = options.row_cache_bytes > 0;
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?;
         // A new generation, so new zero slots: reader processes re-attach, which clears their
         // caches (D281; every writer open, a recovery's and a handover's too, builds one).
@@ -1000,7 +1010,7 @@ impl Engine {
                 options.row_cache_families.clone(),
                 Arc::clone(&row_epochs),
             ),
-            row_epochs: Some(row_epochs),
+            row_epochs: row_epochs.maintained().then_some(row_epochs),
             sst_ids: Arc::new(AtomicU64::new(catalog.counters.next_sst.max(1))),
             blob_ids: Arc::new(AtomicU32::new(catalog.counters.next_blob_file.max(1))),
             live_views: Arc::clone(&live_views),
