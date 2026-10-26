@@ -80,7 +80,8 @@ pub trait File: Send + Sync + Debug {
     /// Submits reads that nothing waits on yet (a scan's readahead) as one batch, each
     /// resolving as [`File::submit_read`] would, in the order given. A backend may hand the
     /// whole batch to the kernel at once and run each read off the submitting thread (io_uring:
-    /// one enter, every read with `IOSQE_ASYNC`, ICR 0077). The default submits each in turn.
+    /// one enter; on the shared ring every read with `IOSQE_ASYNC`, ICR 0077). The default
+    /// submits each in turn.
     ///
     /// ```
     /// use std::path::Path;

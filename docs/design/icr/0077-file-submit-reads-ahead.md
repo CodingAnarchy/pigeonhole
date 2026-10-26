@@ -17,7 +17,7 @@ fn submit_reads_ahead(&self, reads: Vec<(IoBuf, u64)>) -> Vec<Completion> {
 
 - **The io_uring backend overrides it.** It inserts every read, pushes all their entries under the ring's `sq` mutex with `IOSQE_ASYNC`, releases `sq`, then makes one `io_uring_enter`.
   - A page-cache hit is then copied by an io-wq worker, not inline under the kernel's `uring_lock` in the submitter's call.
-  - On a thread with its own ring, the batch goes to that ring the same way (one enter).
+  - On a thread with its own ring, the batch goes to that ring with one enter but **without** `IOSQE_ASYNC`: the owner is its ring's only submitter, so there is no `uring_lock` queue to leave, and that thread's io-wq is not capped (amended 2026-10-26 after perf287's review of #977; implementation detail, interface unchanged).
   - On an inline thread (application-owned mode, no ring), each read runs inline, as `submit_read` does.
 - **The pread and sim backends keep the default.** Under the simulator, a batch is exactly the reads in turn, so seeds replay unchanged.
 - **Ring setup caps io-wq** (`IORING_REGISTER_IOWQ_MAX_WORKERS`, bounded only) on the shared ring.

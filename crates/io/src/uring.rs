@@ -39,8 +39,14 @@ use crate::{
 /// Submission queue entries of the shared ring (completions get twice as many).
 const RING_ENTRIES: u32 = 256;
 
-/// The most io-wq workers a thread submitting to the shared ring keeps for bounded work (reads
-/// and writes of regular files, #974); `0` would leave the kernel's default.
+/// The most io-wq workers for bounded work (reads and writes of regular files, #974) of each
+/// task that submits to the shared ring; `0` would leave the kernel's default. io-wq is per
+/// task, and an entry's work runs on the io-wq of whichever task's enter submitted it: a
+/// client's, or the reaper's (its wait submits what the queue holds), so a client's batches
+/// use at most twice this. In 6.8 a task takes the cap when the ring registers it (the
+/// registering task, and every task already on the ring), or when its task context is first
+/// created, by its first io_uring submit of any ring: a thread that used another ring first
+/// (its own ring, or another backend's shared ring) keeps that one's limits, or none.
 const IOWQ_BOUNDED_WORKERS: u32 = 4;
 
 /// Registered buffer slots per ring (64 KiB each: an SST block or a run of them), at most:
@@ -515,10 +521,11 @@ impl File for UringFile {
         })
     }
 
-    /// One batch on the ring this thread submits to (ICR 0077): every read's entry with
-    /// `IOSQE_ASYNC`, so an io-wq worker copies a page-cache hit rather than this thread
-    /// inside the enter (under the kernel's `uring_lock` on the shared ring, #974), and one
-    /// enter for the batch. A thread that runs its I/O inline reads each in turn.
+    /// One batch on the ring this thread submits to, with one enter for it (ICR 0077). On the
+    /// shared ring every read's entry carries `IOSQE_ASYNC`, so an io-wq worker copies a
+    /// page-cache hit rather than the submitter inside its enter, under the kernel's
+    /// `uring_lock` that every submitter queues on (#974). A thread that runs its I/O inline
+    /// reads each in turn.
     fn submit_reads_ahead(&self, reads: Vec<(IoBuf, u64)>) -> Vec<Completion> {
         if self.inline_here() {
             return reads
@@ -533,6 +540,14 @@ impl File for UringFile {
                 .collect();
         }
         let own = ThreadRing::current(self.ring.id());
+        // `IOSQE_ASYNC` only on the shared ring, where submitters queue on the kernel's
+        // `uring_lock`: a thread's own ring has one submitter, so the copy is its own work
+        // either way, and its io-wq is not capped (perf287 on #977).
+        let flags = if own.is_some() {
+            squeue::Flags::empty()
+        } else {
+            squeue::Flags::ASYNC
+        };
         let mut out = Vec::with_capacity(reads.len());
         let mut ops = Vec::with_capacity(reads.len());
         for (buf, offset) in reads {
@@ -550,7 +565,7 @@ impl File for UringFile {
                     done: 0,
                     resolver,
                 },
-                flags: squeue::Flags::ASYNC,
+                flags,
             });
         }
         match own {
@@ -1041,9 +1056,9 @@ impl Ring {
     /// it is full. The caller holds `sq`.
     fn publish(&self, entry: &squeue::Entry) -> io::Result<()> {
         loop {
-            // SAFETY: the caller holds `self.sq`, so this is the only submission queue borrowed. The
-            // entry's buffer and descriptor belong to an operation in `self.table`, which
-            // keeps them until the entry's completion is reaped.
+            // SAFETY: the caller holds `self.sq`, so this is the only submission queue
+            // borrowed. The entry's buffer and descriptor belong to an operation in
+            // `self.table`, which keeps them until the entry's completion is reaped.
             let pushed = unsafe {
                 let mut sq = self.uring.submission_shared();
                 let r = sq.push(entry);
@@ -1770,6 +1785,34 @@ mod tests {
             .submitter()
             .register_iowq_max_workers(&mut limits)
             .expect("the kernel reports io-wq limits");
+        assert_eq!(limits[0], IOWQ_BOUNDED_WORKERS, "{limits:?}");
+    }
+
+    /// The case the cap is for (perf287 on #977): a client thread whose first io_uring submit
+    /// goes to the shared ring takes the cap with the task context that submit creates.
+    #[test]
+    fn a_fresh_thread_submitting_to_the_shared_ring_takes_the_cap() {
+        let ring =
+            Arc::new(Ring::probe(&Arc::new(RingCounts::default())).expect("io_uring is available"));
+        let r = Arc::clone(&ring);
+        let limits = thread::spawn(move || {
+            let mut limits = [0, 0];
+            // Before any submit the thread has no task context: nothing to read back.
+            r.uring
+                .submitter()
+                .register_iowq_max_workers(&mut limits)
+                .expect("the kernel reports io-wq limits");
+            assert_eq!(limits, [0, 0], "a thread that never submitted");
+            r.push(&opcode::Nop::new().build().user_data(SHUTDOWN))
+                .expect("pushed");
+            r.uring
+                .submitter()
+                .register_iowq_max_workers(&mut limits)
+                .expect("the kernel reports io-wq limits");
+            limits
+        })
+        .join()
+        .unwrap();
         assert_eq!(limits[0], IOWQ_BOUNDED_WORKERS, "{limits:?}");
     }
 }
