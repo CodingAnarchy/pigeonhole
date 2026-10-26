@@ -80,15 +80,16 @@ impl Db {
         self.shards[i].run_once(now + 1_000)
     }
 
-    /// Runs every shard until none has work left: two idle passes in a row, since shard 1's
-    /// turn may send shard 0 a message after shard 0's turn.
+    /// Runs every shard until none has work left or did any in a pass: shard 1's turn may
+    /// send shard 0 a message after shard 0's turn, and `run_once` says whether work remains,
+    /// not whether it did any, so a pass is quiet only if no shard's
+    /// `EngineShard::work_count` moved either.
     fn settle(&mut self) {
-        let mut idle = 0;
         for _ in 0..10_000 {
+            let work: u64 = self.shards.iter().map(EngineShard::work_count).sum();
             let a = self.step(0);
             let b = self.step(1);
-            idle = if a || b { 0 } else { idle + 1 };
-            if idle == 2 {
+            if !a && !b && self.shards.iter().map(EngineShard::work_count).sum::<u64>() == work {
                 return;
             }
         }
