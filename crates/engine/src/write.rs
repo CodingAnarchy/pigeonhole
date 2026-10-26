@@ -1166,7 +1166,7 @@ impl Txn {
             },
         );
         crate::GetFuture::new(
-            Arc::clone(&self.engine),
+            &self.engine,
             Some(self.snapshot.clone()),
             table,
             family,

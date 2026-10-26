@@ -10,14 +10,18 @@
 //!
 //! **Reads.** [`Table::get_async`](crate::Table::get_async) and
 //! [`RowRead::read_async`](crate::RowRead::read_async) resolve to owned results
-//! ([`Cell`], [`Row`]), safe to hold across `.await`. Memtable and
-//! cache hits resolve on the first poll, as cheaply as the sync calls. A block the cache
-//! does not hold is read through the VFS's asynchronous reads, and the read runs again once
-//! it is cached; the read point is taken on the first poll, so every attempt sees the same
-//! data. Dropping a read future is always safe. Two cases read synchronously inside the
-//! future, counted by [`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads)
-//! (D196, #398): a separated value too large to cache (above an eighth of the block cache,
-//! at most 1 MiB), and a block the cache cannot keep (a cache of size 0).
+//! ([`Cell`], [`Row`]), safe to hold across `.await`. A read as of now (no snapshot) runs
+//! at the call first, as the sync one does: a memtable or cache hit is read there, as of
+//! the call, and the future resolves to it on its first poll, holding nothing else (#709).
+//! A block the cache does not hold is read through the VFS's asynchronous reads, and the
+//! read runs again once it is cached; such a read, and a read at a snapshot, takes its read
+//! point on the first poll, so every attempt sees the same data. Dropping a read future is
+//! always safe. Two cases read synchronously, counted by
+//! [`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads) (D196, #398):
+//! - a separated value too large to cache (above an eighth of the block cache, at most
+//!   1 MiB): inside `get_async` or `read_async` itself when the rest of the read hits at
+//!   the call, else inside the future;
+//! - a block the cache cannot keep (a cache of size 0): inside the future.
 //!
 //! **Commits.** `commit_async` and `commit_with_async` submit at the call when the commit's
 //! shard has room, then resolve when the record meets the requested durability and is
@@ -321,7 +325,7 @@ impl Pigeonhole {
 
 /// A get as a future, resolving to an owned [`Cell`] ([`Table::get_async`](crate::Table::get_async)).
 #[derive(Debug)]
-#[must_use = "a read does nothing unless polled"]
+#[must_use = "a read's result is lost unless it is polled"]
 pub struct GetFuture {
     inner: std::result::Result<pigeonhole_engine::GetFuture, Option<Error>>,
 }
@@ -350,10 +354,13 @@ impl Future for GetFuture {
 /// A row read as a future, resolving to an owned [`Row`], or `None` if the row has no
 /// matching cell ([`RowRead::read_async`](crate::RowRead::read_async)).
 #[derive(Debug)]
-#[must_use = "a read does nothing unless polled"]
+#[must_use = "a read's result is lost unless it is polled"]
 pub struct RowFuture {
     inner: std::result::Result<pigeonhole_engine::RowFuture<RowBuf>, Option<Error>>,
     key: Vec<u8>,
+    /// Resolved at the call (a memtable or cache hit, #709); `None` once taken, or for a
+    /// read that runs in the engine's future.
+    done: Option<Result<Option<Row>>>,
 }
 
 impl RowFuture {
@@ -361,6 +368,16 @@ impl RowFuture {
         Self {
             inner: started.map_err(Some),
             key,
+            done: None,
+        }
+    }
+
+    /// A read that resolved at the call.
+    pub(crate) fn done(r: Result<Option<Row>>) -> Self {
+        Self {
+            inner: Err(None),
+            key: Vec::new(),
+            done: Some(r),
         }
     }
 }
@@ -370,6 +387,9 @@ impl Future for RowFuture {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
+        if let Some(r) = this.done.take() {
+            return Poll::Ready(r);
+        }
         match &mut this.inner {
             Ok(f) => Pin::new(f).poll(cx).map(|r| match r {
                 Ok(Some(mut buf)) => {

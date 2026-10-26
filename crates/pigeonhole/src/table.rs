@@ -501,9 +501,9 @@ impl Table {
             .map_err(Into::into)
     }
 
-    /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): memtable
-    /// and cache hits resolve on the first poll, and a block the cache does not hold is read
-    /// asynchronously (see [`nonblocking`](crate::nonblocking)).
+    /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): a memtable
+    /// or cache hit is read at the call and resolves on the first poll, and a block the cache
+    /// does not hold is read asynchronously (see [`nonblocking`](crate::nonblocking)).
     #[cfg(feature = "async")]
     pub fn get_async(
         &self,
@@ -595,9 +595,9 @@ impl ReadTable {
         self.core.get(Some(snapshot), row, family, qualifier)
     }
 
-    /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): memtable
-    /// and cache hits resolve on the first poll, and a block the cache does not hold is read
-    /// asynchronously (see [`nonblocking`](crate::nonblocking)).
+    /// [`get`](Self::get) as a future resolving to an owned [`Cell`](crate::Cell): a memtable
+    /// or cache hit is read at the call and resolves on the first poll, and a block the cache
+    /// does not hold is read asynchronously (see [`nonblocking`](crate::nonblocking)).
     #[cfg(feature = "async")]
     pub fn get_async(
         &self,

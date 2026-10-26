@@ -466,6 +466,40 @@ fn a_memtable_or_cache_hit_resolves_on_the_first_poll() {
 }
 
 #[test]
+fn a_hit_resolves_at_the_call_with_the_data_as_of_the_call() {
+    // #709: a latest get or row read that hits runs at the call, as the sync one does, and
+    // its future only hands the result over: a commit after the call is not seen, and the
+    // result is still there after a close.
+    let vfs = SimVfs::new(4220);
+    let db = Pigeonhole::open("/db/at-call.phdb", sim_options(&vfs)).unwrap();
+    let t = table(&db);
+    t.mutate(b"r").put("f", b"q", b"v1").commit().unwrap();
+    let get = t.get_async(b"r", "f", b"q");
+    let row = t.row(b"r").read_async();
+    t.mutate(b"r").put("f", b"q", b"v2").commit().unwrap();
+    let later = t.get_async(b"r", "f", b"q");
+    db.close().unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut get = get;
+    match Pin::new(&mut get).poll(&mut cx) {
+        Poll::Ready(Ok(Some(c))) => assert_eq!(c.value(), b"v1"),
+        other => panic!("the get must hold what it read at the call: {other:?}"),
+    }
+    let mut row = row;
+    match Pin::new(&mut row).poll(&mut cx) {
+        Poll::Ready(Ok(Some(r))) => {
+            assert_eq!(r.key(), b"r");
+            assert_eq!(r.get("f", b"q").unwrap().value(), b"v1");
+        }
+        other => panic!("the row read must hold what it read at the call: {other:?}"),
+    }
+    assert_eq!(
+        block_on(later).unwrap().map(|c| c.value().to_vec()),
+        Some(b"v2".to_vec())
+    );
+}
+
+#[test]
 fn a_cold_get_waits_on_io_and_reads_what_the_sync_get_reads() {
     let vfs = SimVfs::new(4208);
     let db = cold_db(&vfs, "/db/c.phdb", 300, sim_options(&vfs));
