@@ -28,7 +28,7 @@
 //! the moves against the catalog current at commit time, and truncates the file again once
 //! everything retired has been reclaimed.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -102,7 +102,8 @@ pub(crate) fn backup(shared: &Shared, snapshot: Snapshot, dest: &Path) -> Result
         let mut verbatim: HashMap<SstId, ExtentRef> = HashMap::new();
         let mut verbatim_family: HashMap<SstId, FamilyId> = HashMap::new();
         let mut verbatim_len: HashMap<ExtentRef, u64> = HashMap::new();
-        let mut rewrite: HashMap<SstId, (Arc<SstMeta>, Vec<Slot>)> = HashMap::new();
+        // By id, so a seed lays the copy out the same way every run.
+        let mut rewrite: BTreeMap<SstId, (Arc<SstMeta>, Vec<Slot>)> = BTreeMap::new();
         for e in &edits {
             if let Edit::AddSst {
                 tablet,

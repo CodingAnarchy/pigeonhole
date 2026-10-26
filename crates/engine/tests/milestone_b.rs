@@ -16,7 +16,7 @@ use std::task::Poll;
 use common::{Store, families, poll_commit};
 use pigeonhole_engine::{
     CheckOptions, Engine, EngineOptions, Error, FamilyOptions, PickerOptions, ReadSpec, ScanSpec,
-    ValueRef, WriteBatch,
+    Severity, Structure, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
@@ -824,8 +824,25 @@ fn backup_below_an_ssts_commits_rewrites_it_without_them() {
     write_rows(&db, &t, 0..100, Durability::Buffered);
     // Held, so compaction keeps every version this seqno reads.
     let before = db.snapshot().unwrap();
-    write_rows(&db, &t, 100..200, Durability::Buffered);
+    // Every row again, above `before`; the full compaction then leaves SSTs holding both
+    // versions, so a rewrite keeps half of each.
+    for i in 0..100u32 {
+        let mut wb = WriteBatch::new();
+        put(
+            &mut wb,
+            &t,
+            format!("row{i:05}").as_bytes(),
+            b"q",
+            &[0xEE; 300],
+        );
+        db.commit(wb, Some(Durability::Buffered)).unwrap();
+    }
     db.flush().unwrap();
+    db.compact(None).unwrap();
+    // The children share the SST the split key falls in: it is rewritten once and listed
+    // under both (stored once: rewritten per child, its kept entries would count twice).
+    db.split_table(t.id, vec![b"row00050".to_vec()], &[0, 0])
+        .unwrap();
     let at = db.snapshot().unwrap().at_seqno(before.seqno());
     db.backup_at(at, Path::new("/db/copy.phdb")).unwrap();
     drop(before);
@@ -846,7 +863,61 @@ fn backup_below_an_ssts_commits_rewrites_it_without_them() {
         get_bytes(&copy, &ct, b"row00099", b"q"),
         Some(vec![99u8; 300])
     );
-    assert_eq!(get_bytes(&copy, &ct, b"row00100", b"q"), None);
+    assert_eq!(
+        get_bytes(&copy, &ct, b"row00050", b"q"),
+        Some(vec![50u8; 300])
+    );
+    copy.close().unwrap();
+}
+
+/// #715, perf287's S2: SSTs an older build wrote record no blob references and may point
+/// anywhere in their family, so the copy keeps every blob file of that family, at its
+/// source live bytes.
+#[test]
+fn backup_keeps_a_familys_blob_files_for_ssts_without_recorded_references() {
+    let vfs = SimVfs::new(31);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    db.inject(pigeonhole_engine::Fault::OmitBlobRefs, true);
+    let mut f = FamilyOptions::default();
+    f.blob_threshold = 100;
+    let t = db.create_table("t", &[("f".into(), f)]).unwrap();
+    write_rows(&db, &t, 0..200, Durability::Buffered);
+    db.flush().unwrap();
+    db.inject(pigeonhole_engine::Fault::OmitBlobRefs, false);
+    db.backup(Path::new("/db/copy.phdb")).unwrap();
+    db.close().unwrap();
+    let v: VfsRef = Arc::clone(&vfs) as _;
+    let r = Engine::check(
+        &v,
+        Path::new("/db/copy.phdb"),
+        &CheckOptions::default().deep(true),
+    )
+    .unwrap();
+    // Expected: one warning per copied SST, that it records no references (as the source's
+    // own check reports), and no blob finding: the kept live bytes are the source's, which
+    // the deep recount matches. Nothing is corruption.
+    assert!(r.is_ok(), "{:#?}", r.findings);
+    assert!(!r.findings.is_empty());
+    for f in &r.findings {
+        assert!(
+            f.structure == Structure::Sst
+                && f.severity == Severity::Warning
+                && f.message.contains("records no references"),
+            "{f:#?}"
+        );
+    }
+    // Every blob file of the family is kept.
+    let source = Engine::check(&v, Path::new(DB), &CheckOptions::default()).unwrap();
+    assert_eq!(r.counts.blob_files, source.counts.blob_files);
+    assert!(r.counts.blob_files > 0);
+
+    let copy = Engine::open(Path::new("/db/copy.phdb"), owned(Arc::clone(&vfs), 1)).unwrap();
+    let ct = copy.table("t").unwrap();
+    assert_eq!(row_count(&copy, &ct), 200);
+    assert_eq!(
+        get_bytes(&copy, &ct, b"row00123", b"q"),
+        Some(vec![123u8; 300])
+    );
     copy.close().unwrap();
 }
 
