@@ -215,6 +215,7 @@ impl Builder {
                 pending,
                 largest_value,
                 max_value,
+                watch: None,
             })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
@@ -235,6 +236,7 @@ impl Builder {
                 pending,
                 largest_value,
                 max_value,
+                watch: None,
             })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
@@ -264,6 +266,9 @@ pub(crate) struct Submitted {
     pub(crate) pending: PendingCommit,
     largest_value: usize,
     max_value: usize,
+    /// With `Options::auto_recover`: the database, for a refusal by its failed engine
+    /// (`Db::refused_later`, #966). `None` with the option off.
+    watch: Option<Arc<Db>>,
 }
 
 impl Submitted {
@@ -272,8 +277,28 @@ impl Submitted {
         &self,
         r: pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>,
     ) -> Result<CommitInfo> {
-        r.map(CommitInfo::from_engine)
-            .map_err(|e| commit_error(e, self.largest_value, self.max_value))
+        r.map(CommitInfo::from_engine).map_err(|e| {
+            refused_later(
+                &self.watch,
+                commit_error(e, self.largest_value, self.max_value),
+            )
+        })
+    }
+
+    /// Watches `db` for its failed engine's refusals, with the option on (#966).
+    pub(crate) fn watched_by(mut self, db: &Arc<Db>) -> Self {
+        if db.supervision().is_some() {
+            self.watch = Some(Arc::clone(db));
+        }
+        self
+    }
+}
+
+/// `e`, or `Closed` for a refusal by the failed engine of the watched database (#966).
+fn refused_later(watch: &Option<Arc<Db>>, e: Error) -> Error {
+    match watch {
+        Some(db) => db.refused_later(e),
+        None => e,
     }
 }
 
@@ -329,11 +354,12 @@ impl CommitTicket {
                     pending,
                     largest_value,
                     max_value,
+                    watch,
                 } = s;
                 pending
                     .wait()
                     .map(CommitInfo::from_engine)
-                    .map_err(|e| commit_error(e, largest_value, max_value))
+                    .map_err(|e| refused_later(&watch, commit_error(e, largest_value, max_value)))
             }
         }
     }
@@ -578,11 +604,13 @@ impl RowMutation<'_> {
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
     pub(crate) fn submit_async(self) -> Result<Submitted> {
-        self.builder.submit_async(
-            &self.table.engine(),
-            self.table.db.max_value,
-            self.durability,
-        )
+        self.builder
+            .submit_async(
+                &self.table.engine(),
+                self.table.db.max_value,
+                self.durability,
+            )
+            .map(|s| s.watched_by(&self.table.db))
     }
 
     /// Submits as an async conditional commit (D210): the condition is resolved now; the
@@ -609,6 +637,7 @@ impl RowMutation<'_> {
                 pending,
                 largest_value,
                 max_value,
+                watch: db.supervision().is_some().then(|| Arc::clone(db)),
             })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
@@ -675,6 +704,8 @@ pub(crate) struct SubmittedCheck {
     pub(crate) pending: pigeonhole_engine::PendingCheck,
     largest_value: usize,
     max_value: usize,
+    /// As [`Submitted`]'s.
+    watch: Option<Arc<Db>>,
 }
 
 #[cfg(feature = "async")]
@@ -684,7 +715,12 @@ impl SubmittedCheck {
         &self,
         r: pigeonhole_engine::Result<(bool, Option<pigeonhole_engine::CommitInfo>)>,
     ) -> Result<Option<CommitInfo>> {
-        let (applied, info) = r.map_err(|e| commit_error(e, self.largest_value, self.max_value))?;
+        let (applied, info) = r.map_err(|e| {
+            refused_later(
+                &self.watch,
+                commit_error(e, self.largest_value, self.max_value),
+            )
+        })?;
         Ok(if applied {
             info.map(CommitInfo::from_engine)
         } else {
@@ -983,6 +1019,7 @@ impl WriteBatch {
         let generation = db.before_commit()?;
         builder
             .submit(&cached.get(&db), db.max_value, durability)
+            .map(|s| s.watched_by(&db))
             .map_err(|e| db.after_commit_closed(generation, e))
     }
 
@@ -994,7 +1031,9 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
-        builder.submit_async(&cached.get(&db), db.max_value, durability)
+        builder
+            .submit_async(&cached.get(&db), db.max_value, durability)
+            .map(|s| s.watched_by(&db))
     }
 }
 
@@ -1091,7 +1130,9 @@ impl Transaction {
                 pending,
                 largest_value,
                 max_value,
+                watch: None,
             })
+            .map(|s| s.watched_by(&self.db))
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
 

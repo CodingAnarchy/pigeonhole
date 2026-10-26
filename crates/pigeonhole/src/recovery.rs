@@ -255,6 +255,21 @@ impl Supervision {
         matches!(self.lock().phase, Phase::GaveUp | Phase::Uncovered)
     }
 
+    /// Whether a commit the failed engine refused before logging it falls under the option
+    /// (ICR 0060): not once the supervisor stood down on a failure it does not cover, nor for
+    /// such a failure it has not looked at yet (`failure`, the current engine's). A swapped
+    /// engine (no failure) means the refusal's failure was recovered from.
+    pub(crate) fn covers_refusal(&self, failure: Option<Failure>) -> bool {
+        if self.forked() {
+            return false;
+        }
+        match self.lock().phase {
+            Phase::Uncovered => false,
+            Phase::Healthy => failure.is_none_or(|f| covers(self.mode, f.cause)),
+            Phase::Recovering { .. } | Phase::GaveUp => true,
+        }
+    }
+
     pub(crate) fn stats(&self, generation: u64) -> RecoveryStats {
         if self.forked() {
             return RecoveryStats {
@@ -666,6 +681,21 @@ mod tests {
         assert!(db.is_failed());
         let e = t.mutate(b"y").put("f", b"q", b"2").commit().unwrap_err();
         assert_eq!(e.code(), ErrorCode::Closed, "{e}");
+        // The same for a commit resolved after its call returned, which does not wait: a
+        // ticket, and an async commit (the guide: "they return `Closed` or `Busy` at once").
+        let mut wb = db.write_batch();
+        wb.put(&t, b"w", "f", b"q", b"3");
+        let e = wb
+            .commit_with_ticket(crate::Durability::Buffered)
+            .and_then(crate::CommitTicket::wait)
+            .unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Closed, "ticket: {e}");
+        #[cfg(feature = "async")]
+        {
+            let fut = t.mutate(b"z").put("f", b"q", b"4").commit_async();
+            let e = crate::doc_support::block_on(fut).unwrap_err();
+            assert_eq!(e.code(), ErrorCode::Closed, "async: {e}");
+        }
         drop(t);
         let _ = db.close();
     }

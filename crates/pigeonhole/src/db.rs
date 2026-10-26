@@ -374,6 +374,37 @@ impl Db {
         }
     }
 
+    /// A commit resolved after its call returned (an async commit, a ticket), refused by the
+    /// failed engine before it logged anything (the engine's `ShardFailed`, code `Io`):
+    /// `Closed` while the option covers the failure (ICR 0060), as a sync commit's refusal
+    /// is, without waiting (#966): the caller retries once the database recovered, or
+    /// reopens it if `recovery_stats().gave_up`. Not committed either way. A failure the
+    /// option does not cover is as without it.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn refused_later(&self, e: Error) -> Error {
+        if !e.refused_unlogged() {
+            return e;
+        }
+        let Some(sup) = &self.supervision else {
+            return e;
+        };
+        let failure = self
+            .engine_arc()
+            .failure()
+            .map(crate::recovery::Failure::from_engine);
+        if sup.covers_refusal(failure) {
+            Error::new(
+                ErrorCode::Closed,
+                "refused by the failed engine before it logged anything \
+                 (Options::auto_recover): not committed; retry once the database recovered, \
+                 or reopen it if recovery_stats().gave_up",
+            )
+        } else {
+            e
+        }
+    }
+
     /// The current engine, loaded from the `ArcSwap` (the slow path; handles use their
     /// `Cached`). Hold the guard only for the operation.
     #[inline]
