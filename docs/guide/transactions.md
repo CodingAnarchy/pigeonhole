@@ -29,7 +29,7 @@ assert_eq!(moved, 5);
 
 **How `transact` works:**
 - **Each attempt gets a fresh transaction.** The closure reads current data every time, and it may run more than once, so keep side effects that mustn't repeat outside it.
-- **What it retries:** a `Conflict`, or a snapshot expired by an automatic recovery (`SnapshotExpired`). Pauses grow exponentially, with full jitter, so competing transactions spread out.
+- **What it retries:** a `Conflict`, or a snapshot expired by an automatic recovery (`SnapshotExpired`). Pauses grow exponentially, with full jitter, so competing transactions spread out. A pause below 100 µs yields the core instead of sleeping, because an OS sleep that short overshoots.
 - **When it stops:** at `RetryPolicy::max_attempts` or past its `deadline` (30 s by default), returning the last error.
 - **Giving up:** the closure may return your own error type, as long as `From<pigeonhole::Error>` is implemented for it. Returning it ends the call with nothing committed. That's how you give up, for example on an overdrawn account.
 - **Async code** uses its own timer with the same policy: `RetryPolicy::next_pause(code, attempt, elapsed)` gives the pause before the next attempt, or `None` to give up.

@@ -21,6 +21,8 @@ use crate::{CommitInfo, Durability, Error, ErrorCode, Pigeonhole, Result, Transa
 /// from 5 µs up to 100 ms, `Busy` not retried, the writer's default durability. The 5 µs base
 /// is measured (#708): a pause of a few microseconds already spreads competing
 /// transactions out, and a larger base mostly lengthens the tail of those that keep losing.
+/// [`Pigeonhole::transact`] yields the core for a pause below 100 µs instead of sleeping,
+/// since a sleep that short overshoots by the OS timer slack (#932); longer pauses sleep.
 ///
 /// A plain value: numbers, durations and flags, no closure or trait object.
 /// [`Pigeonhole::transact`] is a Rust-only convenience (a closure and a generic error) over
@@ -279,10 +281,30 @@ impl Pigeonhole {
             };
             attempt += 1;
             self.db.txn_counts.retries.fetch_add(1, Ordering::Relaxed);
-            if !pause.is_zero() {
-                std::thread::sleep(pause);
-            }
+            wait(pause);
         }
+    }
+}
+
+/// Pauses below this are yield-spun rather than slept (ICR 0060's 2026-10-26 amendment):
+/// Linux stretches every `nanosleep` by the thread's timer slack (50 µs by default), which
+/// more than doubled the short pauses a contended transfer takes (#932). A library
+/// shouldn't change its caller's timer slack, so it doesn't sleep below it.
+const SPIN_BELOW: Duration = Duration::from_micros(100);
+
+/// [`Pigeonhole::transact`]'s pause: yield the core until `pause` has passed if it's short,
+/// else sleep.
+fn wait(pause: Duration) {
+    if pause.is_zero() {
+        return;
+    }
+    if pause >= SPIN_BELOW {
+        std::thread::sleep(pause);
+        return;
+    }
+    let until = Instant::now() + pause;
+    while Instant::now() < until {
+        std::thread::yield_now();
     }
 }
 
@@ -311,5 +333,26 @@ impl TxnCounts {
         m.transactions = self.commits.load(Ordering::Relaxed);
         m.transaction_conflicts = self.conflicts.load(Ordering::Relaxed);
         m.transaction_retries = self.retries.load(Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wait_lasts_at_least_the_pause_spun_or_slept() {
+        for pause in [
+            Duration::from_micros(20),
+            SPIN_BELOW,
+            Duration::from_micros(300),
+        ] {
+            let started = Instant::now();
+            wait(pause);
+            assert!(started.elapsed() >= pause, "{pause:?}");
+        }
+        let started = Instant::now();
+        wait(Duration::ZERO);
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }

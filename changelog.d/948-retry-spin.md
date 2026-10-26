@@ -1,0 +1,2 @@
+### Changed
+- **`transact` no longer sleeps for a retry pause below 100 µs** (ICR 0060, #932). It yields the core until the pause has passed, since Linux stretches every short sleep by the thread's timer slack (50 µs by default), which more than doubled the short pauses. On the reference machine, transfer's p99 fell from 464 to 190 µs at `Buffered` and from 1,282 to 688 µs at the default durability, with 2.6% and 3.5% more throughput. Longer pauses still sleep, and `RetryPolicy`'s pauses are unchanged.
