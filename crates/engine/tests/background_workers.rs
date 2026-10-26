@@ -601,7 +601,7 @@ fn commit_path_tasks_do_not_wait_behind_compactions_on_a_driven_worker() {
 ///   of a compaction, no write or sync it submitted is still in flight
 ///   (`SimVfs::inline_writes_in_flight`), so freeing a taken-back compaction's output at
 ///   once never races a late write. A future submitted write on the output path fails here.
-/// - **A stopped worker** (not dropped, no close): once it has made no pass for 10 ms the
+/// - **A stopped worker** (not dropped, no close): once it has made no pass for 100 ms the
 ///   shard takes its compaction back, drops it, and compacts the same inputs itself.
 #[test]
 fn a_stopped_worker_mid_compaction_leaves_no_write_in_flight_and_its_compaction_comes_back() {

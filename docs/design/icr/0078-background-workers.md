@@ -13,9 +13,9 @@ All additions; nothing is removed or renamed.
     - the same driving contract as `ShardDriver`, except that it has no `release`;
     - dropping it hands back what it held.
   - `WorkerPool`: `close()` (takes everything the workers hold back to the shards, waiting only for a slice running at that moment) and `closed()`.
-  - `ShardDriver::take_back()` adopts what the workers handed back, now rather than at the next turn. `ShardDriver::reclaim_room() -> usize` is the room wait's take-back of its own idle room-freeing tasks, and never waits. `ShardDriver::background_take_backs() -> (u64, u64)` gives the fallback and room-wait counts.
+  - `ShardContext::take_back()` adopts what the workers handed back, now rather than at the next turn. `ShardContext::reclaim_room() -> usize` is the room wait's take-back of its own idle commit-path tasks, and never waits. `Submitter::background_take_backs() -> (u64, u64)` gives the fallback and room-wait counts.
   - `Task` gains three methods with defaults, so existing implementors are unaffected:
-    - `frees_room() -> bool` (default `false`);
+    - `commit_path() -> bool` (default `false`): commits wait for the task (a flush, the manifest pump, a WAL spare), so a worker takes and runs it ahead of compactions and a room wait can take it back (renamed from `frees_room` in review, perf287's must-fix on #983);
     - `offload() -> bool` (default `true`);
     - `reclaim(&mut self, failed: bool) -> bool` (default: resume unless it failed).
   - `pub use pool::{PoolDriver, WorkerPool}`.
@@ -24,6 +24,7 @@ All additions; nothing is removed or renamed.
   - `Engine::open_application_owned_with(path, options) -> Result<AppOwned>`. `#[non_exhaustive] AppOwned { engine: Arc<Engine>, shards: Vec<EngineShard>, workers: Vec<BackgroundWorker> }`.
   - `BackgroundWorker`, wrapping `PoolDriver`: `run_once`, `next_deadline`, `wait`, `waker`, `set_wakeup`, `closed`.
   - `Metrics::compactions_reclaimed: u64` and `Metrics::background_take_backs: (u64, u64)`.
+- **`pigeonhole-io`:** `inline_io(f)` and `in_inline_io()`, the scope an application worker's slice runs in (its I/O synchronous on the real backends); `SimVfs::inline_writes_in_flight()`, for tests.
   - Test hooks (`test-hooks` feature, doc-hidden): `Engine::compaction_commits_submitted` and `Engine::compaction_tiny_slices`.
 
 ## Why
@@ -36,6 +37,6 @@ D284: in application-owned mode, D40 starts no threads, so flushes and compactio
 - **`pigeonhole-engine`:**
   - `engine.rs`: the opens, `close` (which calls `WorkerPool::close` first), `Metrics`;
   - `shard.rs`: room waits, the close message's `take_back`;
-  - `flush.rs`, `compact.rs`, `manifest.rs`: `Task::reclaim`, `frees_room` and `offload`;
+  - `flush.rs`, `compact.rs`, `manifest.rs`, `shard.rs` (`SpareTask`, `ClockTimer`): `Task::reclaim`, `commit_path` and `offload`;
   - tests: the stopped-worker close, the room-wait take-back, the inline-I/O and re-pick tests.
 - **`pigeonhole`:** none in PR 1. PR 2 adds the public API above.

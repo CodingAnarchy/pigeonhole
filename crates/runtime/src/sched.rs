@@ -382,7 +382,7 @@ impl Scheduler {
         };
         let mut task = b.task;
         let poll = task.run(deadline, &b.waker);
-        self.end_one(b.slot, task, poll, 0);
+        self.end_one(b.slot, Some(task), poll, 0);
     }
 
     /// Takes the next runnable task out for one slice, commit-path tasks first when
@@ -408,14 +408,23 @@ impl Scheduler {
         })
     }
 
-    /// Puts a task back after its slice, as `poll` says (`now`: the VFS clock).
-    pub(crate) fn end_one(&mut self, i: usize, task: Box<dyn Task>, poll: TaskPoll, now: u64) {
+    /// Puts a task back after its slice, as `poll` says (`now`: the VFS clock). A finished
+    /// task is not passed back (`None`): its owner drops it, a worker with no pool lock
+    /// held, since a task's destructor may run engine code (a settle callback, the release
+    /// of the last view it pinned).
+    pub(crate) fn end_one(
+        &mut self,
+        i: usize,
+        task: Option<Box<dyn Task>>,
+        poll: TaskPoll,
+        now: u64,
+    ) {
         let Some(e) = self.slots[i].as_mut() else {
             return;
         };
         e.idle_since = now;
         if poll != TaskPoll::Done {
-            e.task = Some(task);
+            e.task = task;
         }
         match poll {
             TaskPoll::Pending => self.runnable.push_back(i),

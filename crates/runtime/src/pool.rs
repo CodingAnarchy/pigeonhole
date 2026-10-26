@@ -58,6 +58,12 @@ pub(crate) const ROOM_RECLAIM: u64 = 2_000_000;
 /// that spawned it takes it back (D284): workers configured but not driven.
 pub(crate) const FALLBACK: u64 = 10_000_000;
 
+/// How long an application's driver may make no pass (no turn started, no slice ended)
+/// before the shards take back the tasks it holds without running them (D284): long
+/// enough that a driven worker in one slow slice (an inline sync on a slow device) does not
+/// look stopped, since a compaction taken back is dropped and redone.
+pub(crate) const STOPPED: u64 = 100_000_000;
+
 /// Where a shard's tasks go back to (D284), and its share of the pool's accounting.
 pub(crate) struct Origin {
     /// The shard's signal: slices' time counts to it (D256), and it is notified when tasks
@@ -191,8 +197,9 @@ pub(crate) struct Pool {
     /// The VFS clock at the last pass any driver made: queued tasks fall back to their
     /// shards only when nobody drives (`FALLBACK`).
     last_pass: AtomicU64,
-    /// Each driver's last pass (VFS clock), by driver id: a driver that stopped making passes
-    /// for `FALLBACK` gives its idle held tasks back too (application drivers only).
+    /// Each driver's last pass (VFS clock: a turn's start or a slice's end), by driver id: a
+    /// driver that made none for `STOPPED` gives its idle held tasks back too (application
+    /// drivers only).
     passes: Vec<AtomicU64>,
     /// Engine-owned threads: never taken from.
     builtin: bool,
@@ -419,7 +426,7 @@ impl Pool {
     /// not driven, or one the application stopped driving without dropping it): its tasks
     /// queued for [`FALLBACK`] while no driver made a pass, and every task of its an
     /// application driver holds without running, once that driver has made no pass for
-    /// [`FALLBACK`] (a compaction is then dropped and picked again, rather than keep its
+    /// [`STOPPED`] (a compaction is then dropped and picked again, rather than keep its
     /// inputs busy until the close).
     pub(crate) fn take_stale(&self, origin: &Arc<Origin>, now: u64) -> Vec<Moved> {
         let mut moved = Vec::new();
@@ -432,10 +439,12 @@ impl Pool {
             st.take_queued(before, mine, &mut moved);
             self.queued.fetch_sub(moved.len(), Ordering::Relaxed);
         }
-        if !self.builtin {
+        if !self.builtin
+            && let Some(stopped_before) = now.checked_sub(STOPPED)
+        {
             for (id, sched) in st.drivers.iter_mut().enumerate() {
                 if let Some(sched) = sched
-                    && self.passes[id].load(Ordering::Relaxed) <= before
+                    && self.passes[id].load(Ordering::Relaxed) <= stopped_before
                 {
                     sched.take_idle(u64::MAX, false, mine, &mut moved);
                 }
@@ -596,8 +605,19 @@ impl PoolDriver {
             if let Some(origin) = &begun.origin {
                 origin.signal.add_pool_busy(after.saturating_sub(now));
             }
+            // A finished task is dropped here, before the pool lock: its destructor may run
+            // engine code (settle callbacks, the release of a view it held), which must not
+            // nest inside `Pool::state` (lock order item 12).
+            let task = match poll {
+                TaskPoll::Done => {
+                    drop(task);
+                    None
+                }
+                _ => task,
+            };
+            pool.passes[self.id].store(after, Ordering::Relaxed);
             st = pool.lock();
-            if let (Some(task), Some(sched)) = (task, st.drivers[self.id].as_mut()) {
+            if let Some(sched) = st.drivers[self.id].as_mut() {
                 sched.end_one(begun.slot, task, poll, after);
             }
             pool.slice_done.notify_all();

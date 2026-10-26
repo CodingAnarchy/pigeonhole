@@ -158,7 +158,7 @@ impl Drop for InlineScope {
 /// Runs `f` with every operation the calling thread submits run inline, synchronously, on
 /// this thread (D284): never on a ring of its own (an io_uring thread ring is not used, nor
 /// is one attached), never on the backend's shared ring or its I/O threads. On the real
-/// backends ([`UringVfs`](crate::uring) and [`PreadVfs`](crate::pread::PreadVfs)) each
+/// backends (io_uring and [`PreadVfs`](crate::pread::PreadVfs)) each
 /// submitted operation has completed when its `submit_*` call returns, so when `f` returns
 /// nothing it submitted is in flight, whichever thread reaps what.
 ///
