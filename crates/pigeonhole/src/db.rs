@@ -142,9 +142,11 @@ impl Watch {
     }
 
     /// `e`, or what the sync path reports for a refusal by the failed engine of the watched
-    /// database (#966). Only an unlogged refusal looks the database up.
+    /// database (#966). Only a refusal looks the database up: one the failed shard made
+    /// before logging, or a `Closed` from the failed engine's close (a slow commit meets it),
+    /// as the sync path's `after_commit_closed` takes both.
     pub(crate) fn refused(self, e: Error) -> Error {
-        if self.id == 0 || !e.refused_unlogged() {
+        if self.id == 0 || (e.code() != ErrorCode::Closed && !e.refused_unlogged()) {
             return e;
         }
         let db = watched()
@@ -529,8 +531,9 @@ impl Db {
     }
 
     /// A commit resolved after its call returned (an async commit, a ticket), refused by the
-    /// failed engine before it logged anything (the engine's `ShardFailed`, code `Io`),
-    /// reported as the sync path reports it once it has waited, but without waiting (#966):
+    /// failed engine before it logged anything (the engine's `ShardFailed`, code `Io`, or a
+    /// `Closed` from its close), reported as the sync path reports it once it has waited, but
+    /// without waiting (#966):
     /// `Busy` (`SnapshotExpired` for a transaction) once the swap is in, `Closed` while the
     /// recovery runs or after a give-up. Not committed either way. A failure the option
     /// does not cover is as without it.

@@ -661,6 +661,9 @@ mod tests {
             .inject(pigeonhole_engine::Fault::NextApply, true);
         let e = t.mutate(b"x").put("f", b"q", b"1").commit().unwrap_err();
         assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
+        // A refusal the failed engine's close makes instead (a `Closed`, as a slow commit meets
+        // on CI, #968's macOS flake) is mapped the same way: taken now, looked at after.
+        let watch = db.db.watch();
         // Both reach the poisoned shard and are refused there, unlogged.
         let mut wb = db.write_batch();
         wb.put(&t, b"w", "f", b"q", b"2");
@@ -680,6 +683,9 @@ mod tests {
         }
         let e = ticket.wait().unwrap_err();
         assert_eq!(e.code(), ErrorCode::Busy, "ticket: {e}");
+        let closed: crate::Error = pigeonhole_engine::Error::Closed.into();
+        let e = watch.refused(closed);
+        assert_eq!(e.code(), ErrorCode::Busy, "a Closed refusal: {e}");
         #[cfg(feature = "async")]
         {
             let e = crate::doc_support::block_on(fut).unwrap_err();
