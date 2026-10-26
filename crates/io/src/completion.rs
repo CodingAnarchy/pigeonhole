@@ -43,7 +43,7 @@ type Then<T> = Box<dyn FnOnce(Result<T>) + Send>;
 /// ring owned by the waiting thread reaps it (#402). Returns whether calling it again may
 /// make more progress (`false`: wait for another thread to resolve it). Calling it when the
 /// operation already completed does nothing.
-/// How long a blocked wait with no drive reaps orphan rings, or sleeps between reaps (#408).
+/// How long a blocked wait with no drive reaps orphan backends, or sleeps between reaps.
 const ORPHAN_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
 
 pub(crate) type Drive = Arc<dyn Fn() -> bool + Send + Sync>;
@@ -157,8 +157,8 @@ impl<T: Send + 'static> Completion<T> {
                         state = shared.lock();
                         continue;
                     }
-                    // No drive: with rings no thread reaps in this process (application-owned
-                    // io_uring, #408), take their completions while waiting, in short slices.
+                    // No drive: with backends no thread reaps in this process (the simulator
+                    // under deferred I/O), take their completions while waiting, in short slices.
                     drop(state);
                     let reaped = crate::own::reap_orphans(ORPHAN_SLICE);
                     state = shared.lock();
