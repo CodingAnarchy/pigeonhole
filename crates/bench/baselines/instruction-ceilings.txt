@@ -153,6 +153,12 @@
 # run 39938533013 (main's own 14276), 14280 on the run before; the +4 to +8 is
 # the scan's creation check and the cursor's 256-row check, and the shape moves about 4
 # instructions run to run, against a ceiling 5 above main.
+#
+# Raised for #947 (D281, the reader processes' row cache) under D195's ceiling rule (owner,
+# 2026-10-13): commit-sixteen 50044 -> 50224, this PR's head count (run 40265247549: 50074,
+# main's own 50023) times 1.003. The +51 (0.1%) comes with the row cache off, where the commit
+# path does the same work as on main (no slot raise: the writer maintains the row epochs only
+# with its row cache on); main itself stood 21 instructions under the ceiling.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -168,7 +174,7 @@ rows 19655 0.3
 level-scans 14015 0.6
 short-scans 13564 0.3
 commit-one 9585 0.3
-commit-sixteen 50044 0.3
+commit-sixteen 50224 0.3
 flush 2199 0.3
 compact 2770 0.5
 ycsb-c 43293 1.0
