@@ -3,7 +3,6 @@
 use std::path::{Path, PathBuf};
 
 use pigeonhole_engine::{Engine, ExtentKind};
-use pigeonhole_io::VfsRef;
 
 use crate::Result;
 
@@ -37,10 +36,7 @@ use crate::Result;
 /// # Ok::<(), pigeonhole::Error>(())
 /// ```
 pub fn check(path: impl AsRef<Path>, options: CheckOptions) -> Result<CheckReport> {
-    let vfs = match options.vfs.clone() {
-        Some(v) => v,
-        None => pigeonhole_io::pread::PreadVfs::new(0),
-    };
+    let vfs: pigeonhole_io::VfsRef = pigeonhole_io::pread::PreadVfs::new(0);
     let engine = pigeonhole_engine::CheckOptions::default()
         .deep(options.deep)
         .allow_fuse(options.allow_fuse);
@@ -52,7 +48,6 @@ pub fn check(path: impl AsRef<Path>, options: CheckOptions) -> Result<CheckRepor
 pub struct CheckOptions {
     deep: bool,
     allow_fuse: bool,
-    vfs: Option<VfsRef>,
 }
 
 impl std::fmt::Debug for CheckOptions {
@@ -75,13 +70,6 @@ impl CheckOptions {
     /// Accept a database on a local FUSE mount (as [`Options::allow_fuse`](crate::Options::allow_fuse)).
     pub fn allow_fuse(mut self, allow: bool) -> Self {
         self.allow_fuse = allow;
-        self
-    }
-
-    /// Custom filesystem (simulation).
-    #[doc(hidden)]
-    pub fn vfs(mut self, vfs: VfsRef) -> Self {
-        self.vfs = Some(vfs);
         self
     }
 }
