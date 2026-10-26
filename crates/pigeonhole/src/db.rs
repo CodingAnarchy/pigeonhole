@@ -399,7 +399,6 @@ impl Db {
     /// new engine is in place before the generation moves, so an operation that passed its
     /// generation check loads either the old engine (still open, or closing: it then fails
     /// with `Closed`) or the new one, never a mix.
-    #[allow(dead_code)] // used by the recovery supervisor (the next PR) and the tests
     pub(crate) fn swap_engine(&self, engine: Arc<Engine>) -> Arc<Engine> {
         let previous = self.engine.swap(engine);
         self.generation.fetch_add(1, Ordering::AcqRel);

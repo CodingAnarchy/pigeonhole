@@ -448,7 +448,6 @@ impl Catalog {
     /// Whether `(tablet, family)` holds the same SST list here as in `other`: the same shared
     /// list, compared by pointer (#499). A catalog made from another by edits shares the
     /// lists of the slots they did not change, so this finds the changed slots cheaply.
-    #[allow(dead_code)] // The view publish's first use is blob33's (#499 item 3).
     pub(crate) fn same_ssts(&self, other: &Catalog, key: (TabletId, FamilyId)) -> bool {
         match (self.ssts.get(&key), other.ssts.get(&key)) {
             (Some(a), Some(b)) => Arc::ptr_eq(a, b),
