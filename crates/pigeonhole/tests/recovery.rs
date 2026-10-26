@@ -292,6 +292,44 @@ fn the_fourth_failure_in_the_window_is_not_recovered() {
     assert!(db.close().is_err());
 }
 
+/// #970, perf287's S1: an async commit does not wait for the swap, and one refused at
+/// submit (the failed engine is closing: `Closed`) is mapped as one refused when it resolves:
+/// the supervisor's `Closed` for a recovery still running ("while the database recovers"),
+/// not the engine's bare one. The recovery is held at the failed engine's close.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_commit_refused_at_submit_during_the_recovery_is_mapped() {
+    let (vfs, gate) = gate::vfs(2016);
+    let db = Pigeonhole::open(DB, options(Arc::clone(&vfs), Recovery::Io)).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    put(&t, "a").unwrap();
+    hold_recovery(&gate, &t, "lost");
+    let _ = fail_shard(&gate, &t, "lost");
+    assert!(
+        wait_until(5, || db.recovery_stats().generation == 1 && db.is_failed()),
+        "{:?}",
+        db.recovery_stats()
+    );
+    let fut = t.mutate(b"async").put("f", b"q", b"v").commit_async();
+    let e = pigeonhole::doc_support::block_on(fut).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::Closed, "{e}");
+    assert!(e.to_string().contains("while the database recovers"), "{e}");
+    gate.release_writes();
+    assert!(
+        wait_until(20, || !db.is_failed()
+            && db.recovery_stats().recoveries == 1),
+        "{:?}",
+        db.recovery_stats()
+    );
+    put(&t, "after").unwrap();
+    db.close().unwrap();
+}
+
 /// A commit that arrives while the recovery runs waits for the swap, bounded by the
 /// write-stall timeout: `Busy` past it (not committed), and once the recovery completes it
 /// succeeds; a read without a snapshot is served by the failed engine's last view, or waits

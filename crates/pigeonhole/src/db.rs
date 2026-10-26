@@ -142,9 +142,11 @@ impl Watch {
     }
 
     /// `e`, or what the sync path reports for a refusal by the failed engine of the watched
-    /// database (#966). Only an unlogged refusal looks the database up.
+    /// database (#966). Only a refusal looks the database up: one the failed shard made
+    /// before logging, or a `Closed` from the failed engine's close (a slow commit meets it),
+    /// as the sync path's `after_commit_closed` takes both.
     pub(crate) fn refused(self, e: Error) -> Error {
-        if self.id == 0 || !e.refused_unlogged() {
+        if self.id == 0 || (e.code() != ErrorCode::Closed && !e.refused_unlogged()) {
             return e;
         }
         let db = watched()
@@ -489,12 +491,17 @@ impl Db {
     #[cold]
     #[inline(never)]
     fn after_commit_closed_as(&self, generation: u64, e: Error, transaction: bool) -> Error {
-        if (e.code() != ErrorCode::Closed && !e.refused_unlogged()) || self.is_closed() {
+        if e.code() != ErrorCode::Closed && !e.refused_unlogged() {
             return e;
         }
         let Some(sup) = &self.supervision else {
             return e;
         };
+        // Closed through any handle: `Closed`, also for a refusal the failed shard made
+        // unlogged, as an async commit or a ticket gets it (`refused_later`; #970, N1).
+        if self.is_closed() {
+            return pigeonhole_engine::Error::Closed.into();
+        }
         match sup.wait_settled(self.stall_timeout, || self.engine_arc().is_failed()) {
             crate::recovery::Settled::Swapped if self.generation() != generation => {
                 if transaction {
@@ -529,8 +536,9 @@ impl Db {
     }
 
     /// A commit resolved after its call returned (an async commit, a ticket), refused by the
-    /// failed engine before it logged anything (the engine's `ShardFailed`, code `Io`),
-    /// reported as the sync path reports it once it has waited, but without waiting (#966):
+    /// failed engine before it logged anything (the engine's `ShardFailed`, code `Io`, or a
+    /// `Closed` from its close), reported as the sync path reports it once it has waited, but
+    /// without waiting (#966):
     /// `Busy` (`SnapshotExpired` for a transaction) once the swap is in, `Closed` while the
     /// recovery runs or after a give-up. Not committed either way. A failure the option
     /// does not cover is as without it.
@@ -566,11 +574,17 @@ impl Db {
                 )
             };
         }
+        if sup.gave_up() {
+            return Error::new(
+                ErrorCode::Closed,
+                "refused by the failed engine, and automatic recovery gave up \
+                 (recovery_stats().gave_up): not committed; reopen the database",
+            );
+        }
         Error::new(
             ErrorCode::Closed,
-            "refused by the failed engine before it logged anything \
-             (Options::auto_recover): not committed; retry once the database recovered, \
-             or reopen it if recovery_stats().gave_up",
+            "refused by the failed engine while the database recovers \
+             (Options::auto_recover): not committed; retry once it recovered",
         )
     }
 
