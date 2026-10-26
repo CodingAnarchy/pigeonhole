@@ -143,6 +143,111 @@ fn errors_arrive_through_the_completion() {
     assert_eq!(err.kind, ErrorKind::Other, "{err}");
 }
 
+/// Runs `f` on a thread of its own and returns its result, failing if it takes longer than
+/// 10 s (an operation whose entry no enter ever hands over).
+fn within_10s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || tx.send(f()).unwrap());
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the operations completed")
+}
+
+/// perf287's must-fix on #974: an enter that fails after an operation's entry is published
+/// does not fail the operation (the entry is still in the queue, and the kernel would read
+/// into its buffer after it went back). A refusal for now is retried, and the read
+/// completes with the file's bytes.
+#[test]
+fn a_refused_enter_after_the_entry_is_published_does_not_fail_the_operation() {
+    let _serial = serial();
+    let b = Backend::uring("uring-enter-eagain");
+    let f = b.create("f");
+    f.submit_write(filled(4096, 5), 0).wait().unwrap();
+    // The shared ring: this thread has no ring of its own.
+    let g = Arc::clone(&f);
+    let got = within_10s(move || {
+        pigeonhole_io::uring::fail_ring_enters(1, libc::EAGAIN);
+        g.submit_read(IoBuf::zeroed(4096), 0).wait()
+    });
+    pigeonhole_io::uring::fail_ring_enters(0, 0);
+    assert!(got.unwrap().iter().all(|&x| x == 5));
+
+    // A thread's own ring.
+    let (vfs, g) = (Arc::clone(&b.vfs), Arc::clone(&f));
+    let got = within_10s(move || {
+        vfs.attach_thread();
+        assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
+        pigeonhole_io::uring::fail_ring_enters(1, libc::EAGAIN);
+        let read = g.submit_read(IoBuf::zeroed(4096), 0).wait();
+        assert!(!own_io_in_flight());
+        read
+    });
+    pigeonhole_io::uring::fail_ring_enters(0, 0);
+    assert!(got.unwrap().iter().all(|&x| x == 5));
+}
+
+/// As above, with an error that is not retried (`EBUSY`): the published entry waits for the
+/// ring's next enter, here another operation's, and both complete.
+#[test]
+fn a_published_entry_whose_enter_failed_goes_with_the_next_enter() {
+    let _serial = serial();
+    let b = Backend::uring("uring-enter-ebusy");
+    let f = b.create("f");
+    f.submit_write(filled(8192, 6), 0).wait().unwrap();
+    let g = Arc::clone(&f);
+    let (first, second) = within_10s(move || {
+        pigeonhole_io::uring::fail_ring_enters(1, libc::EBUSY);
+        let first = g.submit_read(IoBuf::zeroed(4096), 0);
+        let second = g.submit_read(IoBuf::zeroed(4096), 4096);
+        (first.wait(), second.wait())
+    });
+    pigeonhole_io::uring::fail_ring_enters(0, 0);
+    assert!(first.unwrap().iter().all(|&x| x == 6));
+    assert!(second.unwrap().iter().all(|&x| x == 6));
+}
+
+/// perf287's must-fix on #976: a reap's enter also submits what the queue holds, so the
+/// kernel can refuse it for now (`EAGAIN`) as it can a push's. A thread reaping its own ring
+/// keeps what is in flight: the read completes with the file's bytes.
+#[test]
+fn a_refused_reap_on_a_threads_ring_keeps_its_io() {
+    let _serial = serial();
+    let b = Backend::uring("uring-reap-eagain-own");
+    let f = b.create("f");
+    f.submit_write(filled(4096, 8), 0).wait().unwrap();
+    let (vfs, g) = (Arc::clone(&b.vfs), Arc::clone(&f));
+    let got = within_10s(move || {
+        vfs.attach_thread();
+        assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
+        let read = g.submit_read(IoBuf::zeroed(4096), 0);
+        assert!(own_io_in_flight() || read.is_ready());
+        pigeonhole_io::uring::fail_ring_reaps(1, libc::EAGAIN);
+        read.wait()
+    });
+    pigeonhole_io::uring::fail_ring_reaps(0, 0);
+    assert!(got.unwrap().iter().all(|&x| x == 8));
+}
+
+/// As above for the shared ring's reaper: refused for now, it backs off and goes on reaping
+/// (it used to fail everything in flight and end, so no later read completed).
+#[test]
+fn a_refused_reap_on_the_shared_ring_keeps_the_reaper() {
+    let _serial = serial();
+    let b = Backend::uring("uring-reap-eagain-shared");
+    let f = b.create("f");
+    f.submit_write(filled(8192, 9), 0).wait().unwrap();
+    let g = Arc::clone(&f);
+    let (first, second) = within_10s(move || {
+        // The reaper's next enter, after it takes the first read's completion, is refused.
+        pigeonhole_io::uring::fail_ring_reaps(1, libc::EAGAIN);
+        let first = g.submit_read(IoBuf::zeroed(4096), 0).wait();
+        let second = g.submit_read(IoBuf::zeroed(4096), 4096).wait();
+        (first, second)
+    });
+    pigeonhole_io::uring::fail_ring_reaps(0, 0);
+    assert!(first.unwrap().iter().all(|&x| x == 9));
+    assert!(second.unwrap().iter().all(|&x| x == 9));
+}
+
 #[test]
 fn dropping_the_backend_with_operations_in_flight_completes_them() {
     let _serial = serial();
