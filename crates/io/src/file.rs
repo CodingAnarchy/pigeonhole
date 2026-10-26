@@ -77,6 +77,34 @@ pub trait File: Send + Sync + Debug {
     /// Submits a read of `buf.len()` bytes at `offset` and returns at once.
     fn submit_read(&self, buf: IoBuf, offset: u64) -> Completion;
 
+    /// Submits reads that nothing waits on yet (a scan's readahead) as one batch, each
+    /// resolving as [`File::submit_read`] would, in the order given. A backend may hand the
+    /// whole batch to the kernel at once and run each read off the submitting thread (io_uring:
+    /// one enter, every read with `IOSQE_ASYNC`, ICR 0077). The default submits each in turn.
+    ///
+    /// ```
+    /// use std::path::Path;
+    /// use pigeonhole_io::{File, OpenOptions, Vfs};
+    /// use pigeonhole_io::sim::SimVfs;
+    ///
+    /// # fn main() -> pigeonhole_io::Result<()> {
+    /// let vfs = SimVfs::new(42);
+    /// let f = vfs.open(Path::new("/db/f"), OpenOptions::read_write_create())?;
+    /// f.write_at(&[7; 8192], 0)?;
+    /// let reads = vec![(f.read_buf(4096), 0), (f.read_buf(4096), 4096)];
+    /// for done in f.submit_reads_ahead(reads) {
+    ///     assert!(done.wait()?.iter().all(|&b| b == 7));
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    fn submit_reads_ahead(&self, reads: Vec<(IoBuf, u64)>) -> Vec<Completion> {
+        reads
+            .into_iter()
+            .map(|(buf, offset)| self.submit_read(buf, offset))
+            .collect()
+    }
+
     /// Submits a write of `buf` at `offset` and returns at once.
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion;
 

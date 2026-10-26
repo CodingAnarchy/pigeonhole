@@ -471,21 +471,34 @@ impl SstIter {
                 _ => runs.push(vec![(addr, fetch)]),
             }
         }
-        let reader = Arc::clone(&self.reader);
+        // Every run's read in one batch (ICR 0077): one submission, each read off this thread
+        // where the backend can (#974).
+        let ranges: Vec<(u64, usize)> = runs
+            .iter()
+            .filter_map(|run| {
+                let ((first, _), (last, _)) = (run.first()?, run.last()?);
+                Some((
+                    first.offset,
+                    (last.offset + u64::from(last.len) - first.offset) as usize,
+                ))
+            })
+            .collect();
+        let submitted = self.reader.inner.blocks.submit_ahead(&ranges);
         let Some(ahead) = self.ahead.as_mut() else {
             return;
         };
-        for run in runs {
-            let (Some((first, _)), Some((last, _))) = (run.first(), run.last()) else {
-                continue;
-            };
-            let (first, last) = (*first, *last);
+        for (run, read) in runs
+            .into_iter()
+            .filter(|run| !run.is_empty())
+            .zip(submitted)
+        {
+            let (first, last) = (run[0].0, run[run.len() - 1].0);
             crate::note_readahead(|c| c.issued += run.len() as u64);
             ahead.unclaimed += run.len();
             let arrived = Arc::clone(&ahead.arrived);
             let done = if let [(addr, fetch)] = run.as_slice() {
                 let (offset, fetch) = (addr.offset, fetch.clone());
-                fetch.submit().map(move |read| {
+                read.map(move |read| {
                     if let Ok(buf) = read
                         && let Ok(Some(h)) = fetch.admit(buf)
                     {
@@ -495,24 +508,19 @@ impl SstIter {
                 })
             } else {
                 // One read of the whole run, split into its blocks (one copy each).
-                let len = (last.offset + u64::from(last.len) - first.offset) as usize;
-                reader
-                    .inner
-                    .blocks
-                    .submit_run(first.offset, len)
-                    .map(move |read| {
-                        if let Ok(buf) = read {
-                            for (addr, fetch) in &run {
-                                let at = (addr.offset - first.offset) as usize;
-                                let mut piece = fetch.buffer(addr.len as usize);
-                                piece.copy_from_slice(&buf[at..at + addr.len as usize]);
-                                if let Ok(Some(h)) = fetch.admit(piece) {
-                                    lock(&arrived).push((addr.offset, h));
-                                }
+                read.map(move |read| {
+                    if let Ok(buf) = read {
+                        for (addr, fetch) in &run {
+                            let at = (addr.offset - first.offset) as usize;
+                            let mut piece = fetch.buffer(addr.len as usize);
+                            piece.copy_from_slice(&buf[at..at + addr.len as usize]);
+                            if let Ok(Some(h)) = fetch.admit(piece) {
+                                lock(&arrived).push((addr.offset, h));
                             }
                         }
-                        Ok(())
-                    })
+                    }
+                    Ok(())
+                })
             };
             ahead.in_flight.push_back((first.offset, last.offset, done));
         }
