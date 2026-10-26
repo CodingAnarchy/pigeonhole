@@ -649,6 +649,14 @@ pub struct Stalls {
     /// See [`Stalls::shard_parks`].
     #[serde(default)]
     pub shard_wakes: u64,
+    /// io_uring threads the kernel gave no ring of their own (`IoRings::attach_failures`,
+    /// ICR 0070, #929): nonzero means some I/O ran inline below.
+    #[serde(default)]
+    pub ring_attach_failures: u64,
+    /// Operations such threads ran inline (pread) in application-owned mode
+    /// (`IoRings::inline`, ICR 0070, #929): a run that quietly degraded shows here.
+    #[serde(default)]
+    pub ring_inline: u64,
     /// See [`Stalls::shard_parks`].
     #[serde(default)]
     pub commit_parks: u64,
@@ -757,6 +765,8 @@ impl Stalls {
             file_growths_ahead: d(before.file_growths_ahead, after.file_growths_ahead),
             shard_parks: d(before.shard_parks, after.shard_parks),
             shard_wakes: d(before.shard_wakes, after.shard_wakes),
+            ring_attach_failures: d(before.ring_attach_failures, after.ring_attach_failures),
+            ring_inline: d(before.ring_inline, after.ring_inline),
             commit_parks: d(before.commit_parks, after.commit_parks),
             visibility_waits: d(before.visibility_waits, after.visibility_waits),
             visibility_scanned: d(before.visibility_scanned, after.visibility_scanned),

@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use io_uring::{IoUring, Probe, opcode, squeue, types};
 
@@ -72,6 +72,55 @@ fn memlock_budget() -> usize {
 struct RingCounts {
     rings: AtomicUsize,
     pooled: AtomicUsize,
+    attach_failures: AtomicU64,
+    inline: AtomicU64,
+}
+
+/// How long a thread whose ring could not be created waits before it tries again (#929):
+/// a refusal for memory (`ENOMEM`) is often the previous rings' charge, which the kernel
+/// gives back only once their teardown has run.
+const ATTACH_RETRY: Duration = Duration::from_millis(10);
+
+/// Attaches still to fail on purpose ([`fail_ring_attaches`]), and whether as a kernel
+/// without the support (permanent) rather than out of memory (transient).
+static FAIL_ATTACHES: AtomicUsize = AtomicUsize::new(0);
+static FAIL_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+
+/// Makes the next `n` attempts to give a thread its own ring fail as the kernel refusing it
+/// for memory would (`ENOMEM`: the thread retries later; `usize::MAX`: every one). A test hook
+/// (#929), not part of the API.
+#[doc(hidden)]
+pub fn fail_ring_attaches(n: usize) {
+    FAIL_UNSUPPORTED.store(false, Ordering::SeqCst);
+    FAIL_ATTACHES.store(n, Ordering::SeqCst);
+}
+
+/// As [`fail_ring_attaches`], failing as a kernel without the support does (permanent: the
+/// thread never retries). A test hook (#929, perf287's S1 on #938), not part of the API.
+#[doc(hidden)]
+pub fn fail_ring_attaches_unsupported(n: usize) {
+    FAIL_UNSUPPORTED.store(true, Ordering::SeqCst);
+    FAIL_ATTACHES.store(n, Ordering::SeqCst);
+}
+
+/// Why a thread got no ring of its own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachFailure {
+    /// The kernel refused one for now (`ENOMEM`, `EAGAIN`): often the previous rings'
+    /// charge, given back once their teardown has run. Retried after [`ATTACH_RETRY`].
+    Transient,
+    /// The kernel lacks what a thread's ring needs (timed waits, `PollAdd`), or refused it
+    /// for a reason waiting will not change: never retried.
+    Permanent,
+}
+
+impl AttachFailure {
+    fn of(e: &io::Error) -> Self {
+        match e.raw_os_error() {
+            Some(libc::ENOMEM | libc::EAGAIN) => AttachFailure::Transient,
+            _ => AttachFailure::Permanent,
+        }
+    }
 }
 
 /// One ring's place in its backend's [`RingCounts`], given back when the ring goes.
@@ -256,6 +305,8 @@ impl Vfs for UringVfs {
         Some(crate::RingStats {
             rings: counts.rings.load(Ordering::Relaxed),
             pooled: counts.pooled.load(Ordering::Relaxed),
+            attach_failures: counts.attach_failures.load(Ordering::Relaxed),
+            inline: counts.inline.load(Ordering::Relaxed),
         })
     }
 
@@ -356,6 +407,45 @@ impl UringFile {
         }
     }
 
+    /// Whether the calling thread runs this file's operations inline (#929): the backend has
+    /// no reaper (application-owned mode) and the thread no ring of its own. Nothing then
+    /// waits in a ring for someone to reap, whatever the thread's waits look like. A thread
+    /// whose attach failed tries again here once [`ATTACH_RETRY`] has passed.
+    ///
+    /// An inline sync covers only writes that completed, as any `fdatasync` does, not one
+    /// still in flight on another thread's ring. The WAL never counts on more: a sync's
+    /// target is the stream's written position, taken after its synchronous buffer write
+    /// (`WalStream::submit_sync`: `let lsn = self.write()?`, `write_buf`'s `write_at`), and a
+    /// held segment header's write completes before the sync chained after it.
+    fn inline_here(&self) -> bool {
+        if self.ring.reaper.is_some() {
+            return false;
+        }
+        let backend = self.ring.id();
+        if ThreadRing::current(backend).is_some() {
+            return false;
+        }
+        let retry = ATTACH_AFTER
+            .try_with(|a| {
+                a.borrow()
+                    .iter()
+                    .any(|(b, at)| *b == backend && at.is_some_and(|at| Instant::now() >= at))
+            })
+            .unwrap_or(false);
+        if retry {
+            ThreadRing::attach(
+                backend,
+                &self.ring.counts,
+                Some(Arc::clone(&self.ring.ring)),
+            );
+            if ThreadRing::current(backend).is_some() {
+                return false;
+            }
+        }
+        self.ring.counts.inline.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     /// Submits the operation `kind` builds: to the calling thread's own ring for this
     /// backend if it attached one (completed when it reaps), else to the shared ring.
     fn submit<T: Send + 'static>(&self, kind: impl FnOnce(Resolver<T>) -> Kind) -> Completion<T> {
@@ -406,9 +496,12 @@ impl File for UringFile {
         self.file.write_at(buf, offset)
     }
 
-    fn submit_read(&self, buf: IoBuf, offset: u64) -> Completion {
+    fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
         if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
+        }
+        if self.inline_here() {
+            return Completion::ready(self.file.read_at(&mut buf, offset).map(|()| buf));
         }
         self.submit(|resolver| Kind::Read {
             buf,
@@ -421,6 +514,9 @@ impl File for UringFile {
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
         if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
+        }
+        if self.inline_here() {
+            return Completion::ready(self.file.write_at(&buf, offset).map(|()| buf));
         }
         self.submit(|resolver| Kind::Write {
             buf,
@@ -435,6 +531,9 @@ impl File for UringFile {
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
+        if self.inline_here() {
+            return Completion::ready(self.file.sync_data());
+        }
         self.submit(|resolver| Kind::Sync {
             data_only: true,
             resolver,
@@ -446,6 +545,9 @@ impl File for UringFile {
     }
 
     fn submit_sync_all(&self) -> Completion<()> {
+        if self.inline_here() {
+            return Completion::ready(self.file.sync_all());
+        }
         self.submit(|resolver| Kind::Sync {
             data_only: false,
             resolver,
@@ -981,6 +1083,10 @@ const DRIVE_SLICE: Duration = Duration::from_millis(1);
 thread_local! {
     /// The rings this thread attached, one per backend.
     static THREAD_RINGS: RefCell<Vec<Arc<ThreadRing>>> = const { RefCell::new(Vec::new()) };
+    /// Per backend this thread failed to attach a ring for, when it may try again (`None`:
+    /// never, the failure was permanent).
+    static ATTACH_AFTER: RefCell<Vec<(usize, Option<Instant>)>> =
+        const { RefCell::new(Vec::new()) };
 }
 
 /// A ring owned by one thread (a shard's, #402): only that thread submits to it and reaps
@@ -1096,14 +1202,35 @@ impl ThreadRing {
     }
 
     /// Gives the calling thread a ring for `backend` (once). Without the kernel support it
-    /// needs (timed waits), the thread keeps using the shared ring.
+    /// needs (timed waits), or when the kernel refuses one (`ENOMEM`), the thread goes on
+    /// without: on a backend with a reaper its operations use the shared ring, and on one
+    /// without (application-owned mode) they run inline (#929).
     fn attach(backend: usize, counts: &Arc<RingCounts>, client: Option<Arc<Ring>>) {
         if Self::current(backend).is_some() {
             return;
         }
-        let Some(ring) = Self::new(backend, counts, client) else {
-            return;
+        let ring = match Self::new(backend, counts, client) {
+            Ok(ring) => ring,
+            Err(why) => {
+                // The thread goes on without a ring of its own; on a backend with no reaper
+                // its operations run inline meanwhile (#929). It tries again later only if
+                // the refusal may pass: a kernel without the support never gives one, and
+                // building and dropping a probe ring every few ms would add to the very
+                // locked-memory pressure a transient refusal comes from (perf287's S1).
+                counts.attach_failures.fetch_add(1, Ordering::Relaxed);
+                let retry = match why {
+                    AttachFailure::Transient => Some(Instant::now() + ATTACH_RETRY),
+                    AttachFailure::Permanent => None,
+                };
+                let _ = ATTACH_AFTER.try_with(|a| {
+                    let mut a = a.borrow_mut();
+                    a.retain(|(b, _)| *b != backend);
+                    a.push((backend, retry));
+                });
+                return;
+            }
         };
+        let _ = ATTACH_AFTER.try_with(|a| a.borrow_mut().retain(|(b, _)| *b != backend));
         let own: std::sync::Weak<dyn crate::own::OwnIo> = Arc::downgrade(&ring) as _;
         crate::own::register(own);
         let _ = THREAD_RINGS.try_with(|r| r.borrow_mut().push(ring));
@@ -1113,7 +1240,18 @@ impl ThreadRing {
         backend: usize,
         counts: &Arc<RingCounts>,
         client: Option<Arc<Ring>>,
-    ) -> Option<Arc<Self>> {
+    ) -> std::result::Result<Arc<Self>, AttachFailure> {
+        use AttachFailure::{Permanent, Transient};
+        // The test hook fails here, on the same path as a refusal below.
+        let mut n = FAIL_ATTACHES.load(Ordering::SeqCst);
+        while n > 0 {
+            let next = if n == usize::MAX { n } else { n - 1 };
+            match FAIL_ATTACHES.compare_exchange_weak(n, next, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) if FAIL_UNSUPPORTED.load(Ordering::SeqCst) => return Err(Permanent),
+                Ok(_) => return Err(Transient),
+                Err(now) => n = now,
+            }
+        }
         // Completions run only when this thread enters the ring (no work on other threads),
         // where the kernel offers it (6.1); a plain ring otherwise. The task-run flag tells
         // a non-waiting reap that deferred completions are pending, so its enter carries
@@ -1131,17 +1269,20 @@ impl ThreadRing {
                 IoUring::builder()
                     .setup_cqsize(RING_ENTRIES * 2)
                     .build(RING_ENTRIES)
-                    .ok()?,
+                    .map_err(|e| AttachFailure::of(&e))?,
                 false,
             ),
         };
         if !uring.params().is_feature_ext_arg() {
-            return None;
+            return Err(Permanent);
         }
         let mut probe = Probe::new();
-        uring.submitter().register_probe(&mut probe).ok()?;
+        uring
+            .submitter()
+            .register_probe(&mut probe)
+            .map_err(|_| Permanent)?;
         if !probe.is_supported(opcode::PollAdd::CODE) {
-            return None;
+            return Err(Permanent);
         }
         // Signalled on each completion, for an application's own event loop (#408). Kept off
         // `wake`, which the ring itself polls: a registered eventfd the ring also polled
@@ -1159,7 +1300,7 @@ impl ThreadRing {
             taskrun_flag,
             fd_taken: AtomicBool::new(false),
             enters: AtomicU64::new(0),
-            wake: Arc::new(EventFd::new().ok()?),
+            wake: Arc::new(EventFd::new().map_err(|e| AttachFailure::of(&e))?),
             ring_wake: Arc::default(),
             epoll: epoll_over(
                 [
@@ -1171,8 +1312,8 @@ impl ThreadRing {
             notify,
             client,
         });
-        ring.arm_wake().ok()?;
-        Some(ring)
+        ring.arm_wake().map_err(|e| AttachFailure::of(&e))?;
+        Ok(ring)
     }
 
     /// Polls the eventfd, so a signal ends the ring's wait.
@@ -1426,6 +1567,16 @@ impl Drop for ThreadRing {
         }
         while lock(&self.table).live > 0 {
             self.reap(Some(Duration::from_millis(10)));
+        }
+        // Unpins and uncharges the pool now, with nothing in flight: the kernel gives back
+        // the ring's own memory only once its teardown has run, after the descriptor
+        // closes, and the next thread's ring may meanwhile hit the locked-memory limit
+        // (#929). The pool is the bulk of the charge (1 MiB against the ring's ~30 KiB).
+        // Owner-only, as the check above makes it: a single-issuer ring refuses
+        // registrations from other tasks (`EEXIST`). Its error is ignored by design: should
+        // the unregister fail, the pool is uncharged at the ring's teardown, as before.
+        if self.pool.registered().is_some() {
+            let _ = self.uring.submitter().unregister_buffers();
         }
     }
 }
