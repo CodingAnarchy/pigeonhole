@@ -20,7 +20,7 @@ use std::cell::RefCell;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle, ThreadId};
 use std::time::{Duration, Instant};
@@ -104,6 +104,59 @@ pub fn fail_ring_attaches(n: usize) {
 pub fn fail_ring_attaches_unsupported(n: usize) {
     FAIL_UNSUPPORTED.store(true, Ordering::SeqCst);
     FAIL_ATTACHES.store(n, Ordering::SeqCst);
+}
+
+/// Kernel enters still to fail on purpose ([`fail_ring_enters`]), and with which `errno`.
+static FAIL_ENTERS: AtomicUsize = AtomicUsize::new(0);
+static FAIL_ENTERS_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// Makes the next `n` kernel enters that hand a ring's submitted entries over fail with
+/// `errno`, as the kernel refusing them would (`EAGAIN` under memory pressure). A test hook
+/// (perf287's must-fix on #974), not part of the API.
+#[doc(hidden)]
+pub fn fail_ring_enters(n: usize, errno: i32) {
+    FAIL_ENTERS_ERRNO.store(errno, Ordering::SeqCst);
+    FAIL_ENTERS.store(n, Ordering::SeqCst);
+}
+
+/// `io_uring_enter` handing over what the submission queue holds, failing while
+/// [`fail_ring_enters`] asks.
+fn enter(uring: &IoUring) -> io::Result<usize> {
+    let mut left = FAIL_ENTERS.load(Ordering::Relaxed);
+    while left > 0 {
+        match FAIL_ENTERS.compare_exchange_weak(left, left - 1, Ordering::SeqCst, Ordering::Relaxed)
+        {
+            Ok(_) => {
+                return Err(io::Error::from_raw_os_error(
+                    FAIL_ENTERS_ERRNO.load(Ordering::SeqCst),
+                ));
+            }
+            Err(now) => left = now,
+        }
+    }
+    uring.submit()
+}
+
+/// Hands entries already published to the kernel. Whatever it returns, they stay the
+/// ring's: an operation whose entry is published is never failed here, as some later enter
+/// submits the entry and the kernel then reads into or from its buffer (perf287's must-fix
+/// on #974). A refusal for now (`EAGAIN`, `EINTR`) is retried, backing off up to 1 ms: the
+/// ring's waiter may be blocked in the kernel with nothing else in flight, and would never
+/// enter again on its own. Any other error is left to the next enter: `EBUSY` means
+/// completions wait to be taken, so the reaper (or the owner) is not blocked and enters
+/// again soon, and a broken ring fails that enter too, which resolves everything in flight
+/// (`fail_all`).
+fn enter_published(uring: &IoUring) {
+    let mut pause = Duration::from_micros(1);
+    loop {
+        match enter(uring) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) => {
+                thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(1));
+            }
+            _ => return,
+        }
+    }
 }
 
 /// Why a thread got no ring of its own.
@@ -834,12 +887,14 @@ impl Ring {
         if let Err(e) = self.push(&entry)
             && let Some(op) = lock(&self.table).take(user_data)
         {
-            // Not submitted: the kernel never saw its buffer.
+            // Not published: the kernel never sees its buffer.
             fail(op, e);
         }
     }
 
-    /// Pushes `entry` and tells the kernel, waiting for room in a full queue.
+    /// Pushes `entry` and tells the kernel, waiting for room in a full queue. An error means
+    /// the entry was not published (the kernel never sees it); once it is, it is the ring's
+    /// ([`enter_published`]).
     fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
         let _sq = lock(&self.sq);
         loop {
@@ -854,13 +909,15 @@ impl Ring {
             };
             match pushed {
                 Ok(()) => break,
-                // Full: hand the queued entries to the kernel to make room.
+                // Full: hand the queued entries to the kernel to make room. `entry` is not
+                // published yet, so a failure here fails only its operation.
                 Err(_) => {
-                    self.uring.submit()?;
+                    enter(&self.uring)?;
                 }
             }
         }
-        self.uring.submit().map(drop)
+        enter_published(&self.uring);
+        Ok(())
     }
 
     /// The reaper's loop: waits for completions and resolves them until shut down with
@@ -1227,7 +1284,8 @@ impl ThreadRing {
         self.push(&poll)
     }
 
-    /// Pushes `entry` and hands it to the kernel. Only the owner thread calls this.
+    /// Pushes `entry` and hands it to the kernel. Only the owner thread calls this. An error
+    /// means the entry was not published; once it is, it is the ring's ([`enter_published`]).
     fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
         debug_assert_eq!(thread::current().id(), self.owner);
         loop {
@@ -1244,11 +1302,12 @@ impl ThreadRing {
             match pushed {
                 Ok(()) => break,
                 Err(_) => {
-                    self.uring.submit()?;
+                    enter(&self.uring)?;
                 }
             }
         }
-        self.uring.submit().map(drop)
+        enter_published(&self.uring);
+        Ok(())
     }
 
     fn submit(&self, op: Op) {

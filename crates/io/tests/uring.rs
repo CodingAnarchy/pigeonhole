@@ -758,3 +758,65 @@ fn a_permanent_attach_failure_is_not_retried() {
     let s = b.vfs.ring_stats().unwrap();
     assert_eq!((s.attach_failures, s.inline, s.rings), (1, 100, 1), "{s:?}");
 }
+
+/// Runs `f` on a thread of its own and returns its result, failing if it takes longer than
+/// 10 s (an operation whose entry no enter ever hands over).
+fn within_10s<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || tx.send(f()).unwrap());
+    rx.recv_timeout(Duration::from_secs(10))
+        .expect("the operations completed")
+}
+
+/// perf287's must-fix on #974: an enter that fails after an operation's entry is published
+/// does not fail the operation (the entry is still in the queue, and the kernel would read
+/// into its buffer after it went back). A refusal for now is retried, and the read
+/// completes with the file's bytes.
+#[test]
+fn a_refused_enter_after_the_entry_is_published_does_not_fail_the_operation() {
+    let _serial = serial();
+    let b = Backend::uring("uring-enter-eagain");
+    let f = b.create("f");
+    f.submit_write(filled(4096, 5), 0).wait().unwrap();
+    // The shared ring: this thread has no ring of its own.
+    let g = Arc::clone(&f);
+    let got = within_10s(move || {
+        pigeonhole_io::uring::fail_ring_enters(1, libc::EAGAIN);
+        g.submit_read(IoBuf::zeroed(4096), 0).wait()
+    });
+    pigeonhole_io::uring::fail_ring_enters(0, 0);
+    assert!(got.unwrap().iter().all(|&x| x == 5));
+
+    // A thread's own ring.
+    let (vfs, g) = (Arc::clone(&b.vfs), Arc::clone(&f));
+    let got = within_10s(move || {
+        vfs.attach_thread();
+        assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
+        pigeonhole_io::uring::fail_ring_enters(1, libc::EAGAIN);
+        let read = g.submit_read(IoBuf::zeroed(4096), 0).wait();
+        assert!(!own_io_in_flight());
+        read
+    });
+    pigeonhole_io::uring::fail_ring_enters(0, 0);
+    assert!(got.unwrap().iter().all(|&x| x == 5));
+}
+
+/// As above, with an error that is not retried (`EBUSY`): the published entry waits for the
+/// ring's next enter, here another operation's, and both complete.
+#[test]
+fn a_published_entry_whose_enter_failed_goes_with_the_next_enter() {
+    let _serial = serial();
+    let b = Backend::uring("uring-enter-ebusy");
+    let f = b.create("f");
+    f.submit_write(filled(8192, 6), 0).wait().unwrap();
+    let g = Arc::clone(&f);
+    let (first, second) = within_10s(move || {
+        pigeonhole_io::uring::fail_ring_enters(1, libc::EBUSY);
+        let first = g.submit_read(IoBuf::zeroed(4096), 0);
+        let second = g.submit_read(IoBuf::zeroed(4096), 4096);
+        (first.wait(), second.wait())
+    });
+    pigeonhole_io::uring::fail_ring_enters(0, 0);
+    assert!(first.unwrap().iter().all(|&x| x == 6));
+    assert!(second.unwrap().iter().all(|&x| x == 6));
+}
