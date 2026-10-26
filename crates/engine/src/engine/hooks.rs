@@ -292,6 +292,10 @@ pub(crate) struct ShardCounters {
     /// Decisions that reached the shard before their share's PREPARE settled and waited for
     /// it (D279), `Engine::parked_decisions`.
     pub parked_decisions: AtomicU64,
+    /// Protocol messages handled at D285's safe point between groups, and the extra groups
+    /// it ran, `Engine::safe_point_counts`.
+    pub safe_point_messages: AtomicU64,
+    pub safe_point_groups: AtomicU64,
     /// Entries read validation visited in the shard's memtables (`Engine::validate_entries`,
     /// D273's tests: a hot row validates in a few entries, not one per version).
     pub validate_entries: AtomicU64,
@@ -1105,6 +1109,17 @@ impl Engine {
             .hooks
             .parked_decisions
             .load(Ordering::Relaxed)
+    }
+
+    /// How many protocol messages shard `shard` handled at D285's safe point between groups,
+    /// and how many extra groups it ran for them (test hook).
+    #[doc(hidden)]
+    pub fn safe_point_counts(&self, shard: usize) -> (u64, u64) {
+        let h = &self.inner.shared.metrics[shard].hooks;
+        (
+            h.safe_point_messages.load(Ordering::Relaxed),
+            h.safe_point_groups.load(Ordering::Relaxed),
+        )
     }
 
     /// How many memtable entries read validation on shard `shard` has visited (D273, test

@@ -277,10 +277,12 @@ mod loom_tests {
         }
     }
 
-    /// A shard's queue and its signal, as `Inbox` and `ShardCore` hold them.
+    /// A shard's queues and its signal, as `Inbox` and `ShardCore` hold them: the main lane
+    /// and D285's priority lane.
     struct Shard {
         signal: Signal,
         queue: Mutex<VecDeque<u32>>,
+        priority: Mutex<VecDeque<u32>>,
     }
 
     impl Shard {
@@ -289,6 +291,7 @@ mod loom_tests {
             let shard = std::sync::Arc::new(Shard {
                 signal: Signal::new(),
                 queue: Mutex::new(VecDeque::new()),
+                priority: Mutex::new(VecDeque::new()),
             });
             let p = std::sync::Arc::clone(&parker);
             shard
@@ -303,10 +306,26 @@ mod loom_tests {
             self.signal.notify();
         }
 
+        /// `Submitter::submit` of a message `ShardHandler::priority` routes to that lane.
+        fn submit_priority(&self, msg: u32) {
+            self.priority.lock().unwrap().push_back(msg);
+            self.signal.notify();
+        }
+
+        /// `Lanes::try_recv`: the priority lane first.
+        fn pop(&self) -> Option<u32> {
+            let p = self.priority.lock().unwrap().pop_front();
+            p.or_else(|| self.queue.lock().unwrap().pop_front())
+        }
+
+        fn any_queued(&self) -> bool {
+            !self.priority.lock().unwrap().is_empty() || !self.queue.lock().unwrap().is_empty()
+        }
+
         /// `ShardCore::check_before_sleep`.
         fn check_before_sleep(&self) -> bool {
             self.signal.prepare_sleep();
-            if !self.queue.lock().unwrap().is_empty() || self.signal.task_woken() {
+            if self.any_queued() || self.signal.task_woken() {
                 self.signal.awake();
                 return true;
             }
@@ -316,7 +335,7 @@ mod loom_tests {
         /// One poll of `spin_before_park` (D198), awake, then the handshake on a miss.
         fn spin_once(&self) -> bool {
             self.signal.awake();
-            if !self.queue.lock().unwrap().is_empty() || self.signal.task_woken() {
+            if self.any_queued() || self.signal.task_woken() {
                 return true;
             }
             let hit = self.check_before_sleep();
@@ -332,7 +351,7 @@ mod loom_tests {
             let (mut handled, mut task) = (0, false);
             loop {
                 self.signal.awake();
-                while self.queue.lock().unwrap().pop_front().is_some() {
+                while self.pop().is_some() {
                     handled += 1;
                 }
                 task |= self.signal.take_task_woken();
@@ -445,6 +464,50 @@ mod loom_tests {
             shard.run(&parker, 2, true);
             producer.join().unwrap();
             task.join().unwrap();
+        });
+    }
+    #[test]
+    #[ignore = "loom 0.7.2 lets an RMW read past a store (tokio-rs/loom#254; `notify`'s swap): \
+                passes with tokio-rs/loom#391 patched in; un-ignore with #533"]
+    fn loom_a_priority_message_left_by_a_bounded_take_is_never_slept_through() {
+        // D285: a main-lane submit and two priority-lane submits race the shard. Each turn
+        // drains (the priority lane first), then a safe point takes at most one priority
+        // message mid-batch, leaving any other queued: the shard never parks for good with
+        // either lane non-empty.
+        model(|| {
+            let (shard, parker) = Shard::new();
+            let main = {
+                let shard = std::sync::Arc::clone(&shard);
+                thread::spawn(move || shard.submit(1))
+            };
+            let peer = {
+                let shard = std::sync::Arc::clone(&shard);
+                thread::spawn(move || {
+                    shard.submit_priority(10);
+                    shard.submit_priority(11);
+                })
+            };
+            let mut handled = 0;
+            loop {
+                shard.signal.awake();
+                while shard.pop().is_some() {
+                    handled += 1;
+                }
+                // The safe point's bounded take (`ShardContext::take_priority`, bound 1).
+                if shard.priority.lock().unwrap().pop_front().is_some() {
+                    handled += 1;
+                }
+                if handled == 3 {
+                    break;
+                }
+                if shard.check_before_sleep() {
+                    continue;
+                }
+                shard.signal.parked();
+                parker.park();
+            }
+            main.join().unwrap();
+            peer.join().unwrap();
         });
     }
 }

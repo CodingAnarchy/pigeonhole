@@ -468,6 +468,9 @@ pub(crate) struct Shared {
     pub picker: PickerOptions,
     /// How long a commit waits for arena room before `Busy`.
     pub write_stall_timeout_nanos: u64,
+    /// D285's safe point bounds (`EngineOptions::safe_point_messages`, `safe_point_groups`).
+    pub safe_point_messages: usize,
+    pub safe_point_groups: usize,
     /// Backoff bases (`EngineOptions`; issue #141).
     pub compaction_backoff_nanos: u64,
     pub flush_backoff_nanos: u64,
@@ -9659,6 +9662,54 @@ impl ShardState {
         self.doomed.clear();
     }
 
+    /// D285's safe point between groups: protocol messages that arrived during the group are
+    /// handled now rather than at the next turn's drain, and what they queue (a `Prepare`'s
+    /// member, the DECISION after the last `Prepared`) runs in an extra group this batch.
+    /// No group is in flight here: every member settled or was queued again, and the view
+    /// is published. Room notices and retries go first, so commits of older priority join
+    /// that group ahead of fresh `Prepare`s (D245, D249). Bounded by
+    /// `EngineOptions::safe_point_messages` per pass and `safe_point_groups` per batch.
+    fn safe_point(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let bound = self.shared.safe_point_messages;
+        if bound == 0 {
+            return;
+        }
+        let mut groups = 0;
+        loop {
+            let queued = self.pending.len();
+            let mut n = 0;
+            while n < bound {
+                let Some(msg) = ctx.take_priority() else {
+                    break;
+                };
+                self.handle_msg(msg, ctx);
+                n += 1;
+            }
+            if n == 0 {
+                return;
+            }
+            #[cfg(feature = "test-hooks")]
+            self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .safe_point_messages
+                .fetch_add(n as u64, Ordering::Relaxed);
+            if self.cross && !self.room_refused.is_empty() && self.room_freed_since_refusal() {
+                self.notify_room_freed(ctx);
+            }
+            self.run_retries(ctx);
+            if groups == self.shared.safe_point_groups || self.pending.len() <= queued {
+                return;
+            }
+            groups += 1;
+            #[cfg(feature = "test-hooks")]
+            self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .safe_point_groups
+                .fetch_add(1, Ordering::Relaxed);
+            self.run_group(ctx);
+        }
+    }
+
     /// Commits inline on the shard's own thread (application-owned mode): the member joins
     /// whatever is pending and the group runs now.
     pub(crate) fn commit_inline(&mut self, req: CommitReq, ctx: &mut ShardContext<'_, ShardMsg>) {
@@ -10021,8 +10072,39 @@ impl ShardHandler for ShardState {
         self.handle_msg(msg, ctx);
     }
 
+    /// D285: the cross-shard protocol rides the priority lane, so a drain takes it ahead of
+    /// queued commits and `safe_point` takes it between groups. `Wake`, `Released` and
+    /// `SyncDone` ride it too, since a protocol message must not overtake them from the same
+    /// sender: a later refusal would take an earlier `Wake`, and a `Prepare` would pass the
+    /// `Released` that lets older commits in first (D249); a `Decide` parked on a held
+    /// header's sync (D279) resolves with `SyncDone`. Main-lane messages a peer shard sends
+    /// that a protocol message may now overtake, and why that is safe:
+    /// - a forwarded `Commit` (a tablet moved) against a `Prepare`: both are unanswered
+    ///   client commits, concurrent, so either order is linearizable;
+    /// - `TabletOp`, `DropTablets`, `TabletOpDone`: ownership and `Moved` refusals read the
+    ///   shared view and map version, not message order;
+    /// - `AwaitFlushed` against a `Decide`, `FlushedThrough` against an `Applied`: a decision
+    ///   applied first only adds data the flushed-through watermark later covers, and
+    ///   `on_applied` reads no flush watermark;
+    /// - `SyncBarrier` against a `Decide`: the barrier syncs what the shard has, and an
+    ///   earlier decision adds to it;
+    /// - `Unpin`: independent of the protocol.
+    fn priority(msg: &ShardMsg) -> bool {
+        matches!(
+            msg,
+            ShardMsg::Prepare(_)
+                | ShardMsg::Prepared { .. }
+                | ShardMsg::Decide { .. }
+                | ShardMsg::Applied { .. }
+                | ShardMsg::Wake { .. }
+                | ShardMsg::Released { .. }
+                | ShardMsg::SyncDone { .. }
+        )
+    }
+
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
         self.run_group(ctx);
+        self.safe_point(ctx);
         // Coordinators refused for room hear once the room wait has ended, or once no single
         // waits, no flush is in flight and more room is free than at the refusal: their
         // retry may fit then. Never while nothing has freed room, so never a loop (D245).

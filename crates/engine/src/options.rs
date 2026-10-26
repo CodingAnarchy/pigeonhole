@@ -168,6 +168,16 @@ pub struct EngineOptions {
     /// consolidation (100 by default, D224). For tests of merges, which shorten it.
     #[doc(hidden)]
     pub balance_cold_passes: Option<u64>,
+    /// D285's safe point between groups: at most this many protocol messages (a cross-shard
+    /// commit's `Prepare`, `Prepared`, `Decide` and the like) handled right after a group,
+    /// before the rest of the batch's work (64 by default; 0 turns the safe point off). For
+    /// the A/B, which sweeps it.
+    #[doc(hidden)]
+    pub safe_point_messages: usize,
+    /// D285: at most this many extra groups a batch runs for what its safe points queued
+    /// (1 by default).
+    #[doc(hidden)]
+    pub safe_point_groups: usize,
     /// How long a slot whose compaction failed waits before it is retried (nanoseconds,
     /// default 1 s), doubling with each failure in a row up to 60 times this. A refused WAL
     /// checkpoint retries on the same schedule. Mostly for tests, which shorten it.
@@ -237,6 +247,8 @@ impl EngineOptions {
             arena_chunk_bytes: None,
             grow_ahead: None,
             balance_cold_passes: None,
+            safe_point_messages: 64,
+            safe_point_groups: 1,
             compaction_backoff_nanos: 1_000_000_000,
             flush_backoff_nanos: 10_000_000,
             room_recheck_nanos: 1_000_000,

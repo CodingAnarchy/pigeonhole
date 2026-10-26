@@ -295,4 +295,5 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D278](phase-3.md#d278) — The participant that applies a cross-shard commit last releases its seqno (held in the allocator, shm `CROSS_HELD`, layout 6) and answers the client; `Applied` becomes bookkeeping · owner decision, engine, shm, #932, #708 · ICR 0074
 - [D279](phase-3.md#d279) — A Buffered PREPARE votes once appended, before its group's write; a decision that reaches it before it settled (a held header's sync) waits · owner decision, engine, #932, #708
 - [D281](phase-3.md#d281) — Reader processes have a row cache, keyed on the writer's write watermarks moved into shared memory (shm layout 5); every writer generation empties it · owner decision, cache, shm, engine, pigeonhole, #926, ICR 0072 · refines D201
+- [D285](phase-3.md#d285) — Each shard's inbox has a priority lane for the cross-shard protocol, taken first at every drain, and a safe point right after each group handles what arrived on it during the group, with one extra group for what that queued · engine, runtime, #708 (2d)
 _None._

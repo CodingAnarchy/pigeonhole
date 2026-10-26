@@ -191,6 +191,14 @@ pub trait ShardHandler: Send + 'static {
     /// Called after each drained batch of messages (the group-commit point: write the WAL
     /// once, sync once, publish, wake committers).
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>);
+
+    /// Whether `msg` goes on the shard's priority lane (D285): taken before the main lane at
+    /// every drain, and by [`ShardContext::take_priority`] in the middle of a batch. Order
+    /// holds within each lane, not across them: a priority message may be handled before a
+    /// main-lane message its sender submitted first. None by default.
+    fn priority(_msg: &Self::Msg) -> bool {
+        false
+    }
 }
 
 /// The handler's view of the runtime while it runs on its shard.
@@ -217,6 +225,7 @@ pub struct ShardContext<'a, M> {
     submitters: &'a [Submitter<M>],
     spawner: &'a mut Spawner,
     vfs: &'a dyn Vfs,
+    lanes: &'a Lanes<M>,
 }
 
 impl<M> fmt::Debug for ShardContext<'_, M> {
@@ -256,12 +265,37 @@ impl<M: Send + 'static> ShardContext<'_, M> {
     pub fn now_nanos(&self) -> u64 {
         self.vfs.monotonic_nanos()
     }
+
+    /// Takes the next message queued on this shard's priority lane ([`ShardHandler::priority`]),
+    /// if any: a handler may handle it in the middle of a batch (D285's safe point). What it
+    /// leaves stays queued, and the shard's wake stays armed for it.
+    pub fn take_priority(&mut self) -> Option<M> {
+        self.lanes.priority.try_recv().ok()
+    }
+}
+
+/// A shard's two queues (D285): the priority lane is taken first.
+struct Lanes<M> {
+    priority: Receiver<M>,
+    main: Receiver<M>,
+}
+
+impl<M> Lanes<M> {
+    fn try_recv(&self) -> Option<M> {
+        self.priority
+            .try_recv()
+            .ok()
+            .or_else(|| self.main.try_recv().ok())
+    }
 }
 
 /// One shard's queue. Producers share it through [`Submitter`]s.
 struct Inbox<M> {
     shard: ShardId,
     tx: Sender<M>,
+    /// The priority lane (D285), and which messages go on it.
+    priority_tx: Sender<M>,
+    route: fn(&M) -> bool,
     /// Submits against shutdown (`submit_gate`).
     gate: submit_gate::SubmitGate,
     signal: Arc<Signal>,
@@ -280,7 +314,8 @@ impl<M> Inbox<M> {
 
 /// Sends messages to one shard's lock-free MPSC queue and wakes it. Cheap to clone.
 ///
-/// Messages from one submitter (or one thread) arrive in the order they were submitted.
+/// Messages from one submitter (or one thread) arrive in the order they were submitted, within
+/// each lane ([`ShardHandler::priority`]).
 /// See the [crate example](crate#example).
 pub struct Submitter<M> {
     inbox: Arc<Inbox<M>>,
@@ -350,7 +385,11 @@ impl<M: Send + 'static> Submitter<M> {
         if !inbox.gate.enter() {
             return Err(Error::Closed);
         }
-        let sent = inbox.tx.send(msg);
+        let sent = if (inbox.route)(&msg) {
+            inbox.priority_tx.send(msg)
+        } else {
+            inbox.tx.send(msg)
+        };
         inbox.gate.leave();
         sent.map_err(|_| Error::Closed)?;
         inbox.signal.notify();
@@ -398,7 +437,7 @@ fn thread_token() -> u64 {
 struct ShardCore<H: ShardHandler> {
     id: ShardId,
     handler: H,
-    rx: Receiver<H::Msg>,
+    lanes: Lanes<H::Msg>,
     /// A message taken while checking for work before sleeping; handled first.
     stash: Option<H::Msg>,
     submitters: Arc<[Submitter<H::Msg>]>,
@@ -493,6 +532,7 @@ impl<H: ShardHandler> ShardCore<H> {
             submitters: &self.submitters,
             spawner: &mut self.spawner,
             vfs: &*self.vfs,
+            lanes: &self.lanes,
         };
         (&mut self.handler, ctx)
     }
@@ -503,7 +543,7 @@ impl<H: ShardHandler> ShardCore<H> {
         let ShardCore {
             id,
             handler,
-            rx,
+            lanes,
             submitters,
             spawner,
             vfs,
@@ -514,6 +554,7 @@ impl<H: ShardHandler> ShardCore<H> {
             submitters,
             spawner,
             vfs: &**vfs,
+            lanes,
         };
         let mut n = 0;
         if let Some(msg) = stash {
@@ -521,12 +562,14 @@ impl<H: ShardHandler> ShardCore<H> {
             n += 1;
         }
         while n < MAX_BATCH {
-            match rx.try_recv() {
-                Ok(msg) => {
+            // The priority lane first (D285). It can't starve the main lane: its traffic is
+            // bounded by the handler's own protocol (a few messages per commit in flight).
+            match ctx.lanes.try_recv() {
+                Some(msg) => {
                     handler.handle(&mut ctx, msg);
                     n += 1;
                 }
-                Err(_) => break,
+                None => break,
             }
         }
         if n > 0 {
@@ -567,7 +610,7 @@ impl<H: ShardHandler> ShardCore<H> {
         let mut polls = 0u32;
         let mut hit = loop {
             if self.stash.is_none() {
-                self.stash = self.rx.try_recv().ok();
+                self.stash = self.lanes.try_recv();
             }
             if self.stash.is_some() || self.signal().task_woken() || self.inbox().is_closed() {
                 break true;
@@ -718,7 +761,7 @@ impl<H: ShardHandler> ShardCore<H> {
     fn check_before_sleep(&mut self) -> bool {
         self.signal().prepare_sleep();
         if self.stash.is_none() {
-            self.stash = self.rx.try_recv().ok();
+            self.stash = self.lanes.try_recv();
         }
         if self.stash.is_some() || self.signal().task_woken() {
             self.signal().awake();
@@ -741,11 +784,11 @@ impl<H: ShardHandler> ShardCore<H> {
         }
         let ring = self.own_ring && pigeonhole_io::own_io_in_flight();
         let signal = &self.submitters[usize::from(self.id.0)].inbox.signal;
-        let (stash, rx) = (&mut self.stash, &self.rx);
+        let (stash, lanes) = (&mut self.stash, &self.lanes);
         signal.sleep_unless(
             || {
                 if stash.is_none() {
-                    *stash = rx.try_recv().ok();
+                    *stash = lanes.try_recv();
                 }
                 stash.is_some()
             },
@@ -840,12 +883,15 @@ fn build<H: ShardHandler>(
     let mut rxs = Vec::with_capacity(n);
     let submitters: Arc<[Submitter<H::Msg>]> = (0..n)
         .map(|i| {
-            let (tx, rx) = mpsc::channel();
-            rxs.push(rx);
+            let (tx, main) = mpsc::channel();
+            let (priority_tx, priority) = mpsc::channel();
+            rxs.push(Lanes { priority, main });
             Submitter {
                 inbox: Arc::new(Inbox {
                     shard: ShardId(i as u16),
                     tx,
+                    priority_tx,
+                    route: H::priority,
                     gate: submit_gate::SubmitGate::new(),
                     signal: Arc::new(Signal::new()),
                 }),
@@ -856,10 +902,10 @@ fn build<H: ShardHandler>(
         .into_iter()
         .zip(rxs)
         .enumerate()
-        .map(|(i, (handler, rx))| ShardCore {
+        .map(|(i, (handler, lanes))| ShardCore {
             id: ShardId(i as u16),
             handler,
-            rx,
+            lanes,
             stash: None,
             spawner: Spawner::new(
                 Scheduler::new(Arc::clone(&submitters[i].inbox.signal)),

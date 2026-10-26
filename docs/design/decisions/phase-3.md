@@ -2600,3 +2600,31 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - **M1:** the table's offset, slot count and seed are another process's data. `ShmHeader::decode`, run at every attach, refuses a table that is misaligned, not a nonzero power of two, overlapping the reader slots or arenas, or outside the region.
 - **Defaults:** 64 MiB per reader process, as the writer's (owner ruling), so N reader processes use up to N × 64 MiB, plus 16 bytes per slot for the cache's presence and admission tables (4 MiB at the defaults). The region grows by 8 bytes per slot (2 MiB). `ReaderOptions::row_cache*` and `PigeonholeReader::row_cache_stats` (ICR 0072).
 - **Async reads** in a reader process (the latest point get and row read futures) go through its cache as the sync ones do (#946): a read future's attempt gets its read point's cache, and a fill passes the same snapshot check.
+
+<a id="d285"></a>
+## D285 — A priority lane for the cross-shard protocol, and a safe point between groups (engine, runtime, #708 trim 2d)
+
+**Decided:** #708's trim 2d, in the form of the design on #708 (comment 6423938933), revised after perf287's review (comment 6424142912) in comment 6424173818.
+
+**Why:** after D278 and D279, waits took ~13.6 µs of a cross-shard commit's 24.8 µs on the box (#708 comment 6422171206): four message hops and two waits for a group. A shard handled messages only at a turn's drain, behind everything queued before them, so a protocol message that landed while the shard ran a group waited for the rest of the batch's work and the next drain. D278 and D279 removed 4.45 µs of work and got ~3.5 µs back as longer waits of this kind.
+
+**What changes:**
+- **A priority lane.** Each shard's inbox has a second queue (`ShardHandler::priority` routes a message to it). Every drain, and the sleep handshake's re-check, takes it first. Order holds within each lane, not across them. The engine routes `Prepare`, `Prepared`, `Decide`, `Applied`, `Wake`, `Released` and `SyncDone` there:
+  - `Wake` and `Released`, so a protocol message never overtakes them from the same sender: a later refusal would otherwise take an earlier `Wake`, and a `Prepare` would pass the `Released` that lets older commits in first (D249);
+  - `SyncDone`, so a `Decide` parked on a held header's sync (D279) resolves at the next safe point.
+  
+  The main-lane messages a protocol message may now overtake from the same sender, and why each is safe, are listed at `ShardState::priority`: forwarded commits, tablet operations, `AwaitFlushed`/`FlushedThrough`, `SyncBarrier` and `Unpin`. The lane can't starve the main lane: its traffic is a few messages per cross-shard commit in flight.
+- **A safe point between groups** (`ShardState::safe_point`, right after `run_group` in `end_batch`). No group is in flight there: every member settled or was queued again, and the view is published. In order, it:
+  1. handles up to `EngineOptions::safe_point_messages` (64) messages from the lane, through `ShardContext::take_priority`;
+  2. runs the room notice and `run_retries`, so retried commits of older priority join the next group ahead of fresh `Prepare`s (D245, D249);
+  3. if the messages queued members, runs one more group (`safe_point_groups`, 1), then takes from the lane again.
+  
+  What a bound leaves stays queued, and the handshake finds it. Both bounds are doc-hidden options, so an A/B can sweep them; 0 messages turns the safe point off.
+- **Between background slices** the existing drain takes the lane first.
+- **Not done: a safe point inside `run_group`** (after D279's vote, before the write). A share's apply seqno comes from the decision's reservation and can sit above the group's appended, unapplied seqnos, and `decide_share` would re-enter `handle_msg` with a group half built (perf287).
+
+**Tests:**
+- `runtime/tests/lanes.rs`: a drain takes the priority lane first and keeps order within each lane; a bounded take mid-batch leaves the rest queued, and the shard is woken for it.
+- `runtime` signal.rs: a loom model of the two lanes with a bounded take, `#[ignore]`d with its siblings (loom 0.7.2, tokio-rs/loom#254, #533).
+- `engine/tests/safe_points.rs`: under concurrent cross-shard commits on engine-owned shards, the safe point handles messages, and every commit applies whole; with it off, it never runs. Mutation caught: no `safe_point` call.
+- The engine's sim harness runs the real runtime, so seeded runs use the same lane order.
