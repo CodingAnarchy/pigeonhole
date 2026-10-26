@@ -438,7 +438,10 @@ struct ShardCore<H: ShardHandler> {
     id: ShardId,
     handler: H,
     lanes: Lanes<H::Msg>,
-    /// A message taken while checking for work before sleeping; handled first.
+    /// A message taken while checking for work before sleeping; handled first. It can be a
+    /// main-lane message while a priority-lane one arrives just after (D285): the next drain
+    /// still handles the stash first. Priority is a latency preference, and order within each
+    /// lane holds, so that is harmless.
     stash: Option<H::Msg>,
     submitters: Arc<[Submitter<H::Msg>]>,
     spawner: Spawner,

@@ -8178,3 +8178,74 @@ fn a_commit_record_ahead_of_a_failed_append_is_outcome_unknown() {
         "the never-appended single: {single:?}"
     );
 }
+
+#[test]
+fn a_safe_point_admits_an_older_prepare_ahead_of_a_younger_one_that_arrived_first() {
+    // D285 (perf287's review of #984): PREPAREs that reach a shard while it runs a group are
+    // handled at its safe point, right after the group, and admitted in an extra group of
+    // the same turn, in priority order (D249). R (older) and F (younger) both read and write
+    // `a` on shard 0, and F's PREPARE arrives first: R is admitted, and F is refused over
+    // R's undecided share, not the reverse.
+    let mut db = three_tablet_db();
+    // R: coordinated by shard 1 (`n` first), its share on 0 writes `a`. F, submitted later
+    // (younger), coordinated by shard 2 (`z` first), the same on 0.
+    let r = overlap_txn(&db, &[], &[b"n", b"a"]);
+    let mut pr = r.submit(Some(Durability::Buffered)).unwrap();
+    db.vfs.advance(1_000);
+    let f = overlap_txn(&db, &[], &[b"z", b"a"]);
+    let mut pf = f.submit(Some(Durability::Buffered)).unwrap();
+    // F's coordinator runs first, then R's: their PREPAREs to shard 0 are held in that order.
+    db.engine.take_appended();
+    db.engine.inject(Fault::HoldPrepares, true);
+    turn(&mut db, 2);
+    turn(&mut db, 1);
+    db.engine.inject(Fault::HoldPrepares, false);
+    let coordinated = db.engine.take_appended();
+    let id = |stream: u16| {
+        coordinated
+            .iter()
+            .find(|r| r.stream == stream && r.kind == pigeonhole_engine::AppendedKind::Prepare)
+            .map(|r| r.seqno)
+            .expect("the coordinator logged its own share")
+    };
+    let (id_r, id_f) = (id(1), id(2));
+    assert!(id_f < id_r, "F's coordinator ran first");
+    // A single on shard 0 makes a group there; the held PREPAREs are sent right after its
+    // write, so they land in shard 0's lane mid-batch, F's first.
+    let table = db.table.clone();
+    let mut single = submit_put(&db, &table, b"b");
+    let (messages, groups) = db.engine.safe_point_counts(0);
+    let refused = db.engine.metrics().cross_shard.refused_pending_overlap;
+    db.engine.inject(Fault::ReleaseHeldAtGroupEnd, true);
+    turn(&mut db, 0);
+    let (messages_after, groups_after) = db.engine.safe_point_counts(0);
+    assert_eq!(
+        messages_after - messages,
+        2,
+        "both PREPAREs handled at the safe point"
+    );
+    assert_eq!(groups_after - groups, 1, "admitted in one extra group");
+    let logged: Vec<_> = db
+        .engine
+        .take_appended()
+        .into_iter()
+        .filter(|r| r.stream == 0 && r.kind == pigeonhole_engine::AppendedKind::Prepare)
+        .map(|r| r.seqno)
+        .collect();
+    assert_eq!(
+        logged,
+        [id_r],
+        "R's share logged on 0 in the same turn, F's not"
+    );
+    assert_eq!(
+        db.engine.metrics().cross_shard.refused_pending_overlap - refused,
+        1,
+        "F refused over R's undecided share"
+    );
+    // Both commit in the end: F retries once R is decided.
+    for pc in [&mut single, &mut pr, &mut pf] {
+        poll_until(&mut db, pc, 100_000)
+            .expect("resolved")
+            .expect("commits");
+    }
+}

@@ -451,7 +451,10 @@ mod loom_tests {
     /// D285's two lanes against the sleep handshake, runnable on loom 0.7.2: `Signal`'s
     /// `sleeping` flag is a `Mutex<bool>` stand-in here (as the manifest exclusion's model
     /// does, #533), since loom 0.7.2 lets `notify`'s swap read past a store
-    /// (tokio-rs/loom#254). The models above check the handshake itself; this one checks
+    /// (tokio-rs/loom#254). The stand-in assumes two properties of the real `Signal`, which
+    /// the models above check: a producer notifies after its send, and the consumer
+    /// re-checks its sources after `prepare_sleep`. A change to `Signal` that drops either
+    /// invalidates this model. The models above check the handshake itself; this one checks
     /// the lane logic, which the stand-in keeps: a submit to either lane wakes a shard that
     /// announced sleep, the re-check before sleeping looks at both lanes, and what a bounded
     /// take mid-batch leaves stays queued for a later turn.

@@ -2617,7 +2617,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - **A safe point between groups** (`ShardState::safe_point`, right after `run_group` in `end_batch`). No group is in flight there: every member settled or was queued again, and the view is published. In order, it:
   1. handles up to `EngineOptions::safe_point_messages` (64) messages from the lane, through `ShardContext::take_priority`;
   2. runs the room notice and `run_retries`, so retried commits of older priority join the next group ahead of fresh `Prepare`s (D245, D249);
-  3. if the messages queued members, runs one more group (`safe_point_groups`, 1), then takes from the lane again.
+  3. if the messages queued members, puts the PREPAREs among them in priority order (older first, D249; `order_by_priority`), then runs one more group (`safe_point_groups`, 1) and takes from the lane again. The pass queues in arrival order (lane messages, and a retry a `Wake` or `run_retries` started), so without the ordering a younger commit's PREPARE handled first would be admitted ahead of an older one, which would then be refused behind it (perf287's review of #984).
   
   What a bound leaves stays queued, and the handshake finds it. Both bounds are doc-hidden options, so an A/B can sweep them; 0 messages turns the safe point off.
 - **Between background slices** the existing drain takes the lane first.
@@ -2627,4 +2627,10 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - `runtime/tests/lanes.rs`: a drain takes the priority lane first and keeps order within each lane; a bounded take mid-batch leaves the rest queued, and the shard is woken for it.
 - `runtime` signal.rs: a loom model of the two lanes with a bounded take, runnable on loom 0.7.2 (`sleeping` is a `Mutex<bool>` stand-in, as in the manifest exclusion's model, #533). Re-checking only the main lane before sleeping deadlocks it.
 - `engine/tests/safe_points.rs`: under concurrent cross-shard commits on engine-owned shards, the safe point handles messages, and every commit applies whole; with it off, it never runs. Mutation caught: no `safe_point` call.
+- `tablets.rs` `a_safe_point_admits_an_older_prepare_ahead_of_a_younger_one_that_arrived_first`, deterministic (`Fault::ReleaseHeldAtGroupEnd` sends held PREPAREs right after a group's write, so they land mid-batch):
+  - two PREPAREs reach shard 0 mid-group, the younger first, and the safe point handles both;
+  - one extra group in the same turn admits the older;
+  - the younger is refused over its undecided share.
+  
+  Mutation caught: no `order_by_priority`, and the younger is admitted.
 - The engine's sim harness runs the real runtime, so seeded runs use the same lane order.

@@ -148,6 +148,10 @@ pub enum Fault {
     /// (D285) would otherwise decide: a participant's turn between the coordinator reserving
     /// a commit's seqno and the PREPARE reaching it.
     HoldPrepares = 9,
+    /// The next commit group that writes the WAL, on any shard, sends the PREPAREs
+    /// `HoldPrepares` held, right after its write: they land in the priority lanes while
+    /// that shard is inside its batch, so its safe point (D285) takes them. One-shot.
+    ReleaseHeldAtGroupEnd = 10,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).
@@ -451,10 +455,20 @@ impl Engine {
     }
 
     /// Sends the PREPAREs `Fault::HoldPrepares` held, in the order they were held; returns
-    /// how many (test hook).
+    /// how many (test hook). Switch `HoldPrepares` off first, so a hold can't leak into a
+    /// later step. A participant already closed refuses the send (`Closed`) and the PREPARE
+    /// is dropped: the test then sees its commit unanswered.
+    ///
+    /// # Panics
+    /// If `HoldPrepares` is still on.
     #[doc(hidden)]
     pub fn release_held_prepares(&self) -> usize {
-        let held = std::mem::take(&mut *self.inner.shared.hooks.held_prepares.lock().unwrap());
+        let hooks = &self.inner.shared.hooks;
+        assert!(
+            !hooks.faults.on(Fault::HoldPrepares),
+            "release_held_prepares with Fault::HoldPrepares still on"
+        );
+        let held = std::mem::take(&mut *hooks.held_prepares.lock().unwrap());
         let n = held.len();
         let subs = self
             .inner

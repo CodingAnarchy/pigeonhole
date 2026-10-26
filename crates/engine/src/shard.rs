@@ -6147,6 +6147,18 @@ impl ShardState {
                 self.fail_all(group.members, true, ctx);
                 return;
             }
+            #[cfg(feature = "test-hooks")]
+            if self
+                .shared
+                .hooks
+                .faults
+                .take(crate::engine::hooks::Fault::ReleaseHeldAtGroupEnd)
+            {
+                let held = std::mem::take(&mut *self.shared.hooks.held_prepares.lock().unwrap());
+                for (to, msg) in held {
+                    let _ = ctx.submitter(to).submit(msg);
+                }
+            }
             // Visible once applied (D227), unless a record is not yet where a crash
             // recovers it: then the group stays hidden until a sync resolves it, which
             // writes the held header first (D200).
@@ -9710,6 +9722,7 @@ impl ShardState {
             if groups == self.shared.safe_point_groups || self.pending.len() <= queued {
                 return;
             }
+            self.order_by_priority(queued);
             groups += 1;
             #[cfg(feature = "test-hooks")]
             self.shared.metrics[usize::from(self.id.0)]
@@ -9717,6 +9730,47 @@ impl ShardState {
                 .safe_point_groups
                 .fetch_add(1, Ordering::Relaxed);
             self.run_group(ctx);
+        }
+    }
+
+    /// Puts the PREPAREs queued from `pending[from..]` in priority order (older first,
+    /// D249), keeping every other member's place. A safe point queues what its pass handled
+    /// in arrival order (lane messages, and a retry a `Wake` or `run_retries` started), so a
+    /// younger commit's PREPARE handled before an older one's retry would otherwise be
+    /// admitted first in the extra group, and the older one refused behind it.
+    fn order_by_priority(&mut self, from: usize) {
+        let priority = |prepared: &HashMap<Seqno, PreparedShare>, m: &Member| {
+            prepared
+                .get(&m.seqno)
+                .map_or((u64::MAX, m.seqno), |s| s.priority)
+        };
+        let tail = &self.pending[from..];
+        let keys: Vec<CommitPriority> = tail
+            .iter()
+            .filter(|m| matches!(m.kind, MemberKind::Prepare { .. }))
+            .map(|m| priority(&self.prepared, m))
+            .collect();
+        if keys.windows(2).all(|w| w[0] <= w[1]) {
+            return;
+        }
+        let tail = self.pending.split_off(from);
+        let mut is_prepare = Vec::with_capacity(tail.len());
+        let (mut prepares, mut others) = (Vec::new(), Vec::new());
+        for m in tail {
+            if matches!(m.kind, MemberKind::Prepare { .. }) {
+                is_prepare.push(true);
+                prepares.push((priority(&self.prepared, &m), m));
+            } else {
+                is_prepare.push(false);
+                others.push(m);
+            }
+        }
+        // Stable: equal priorities keep their arrival order.
+        prepares.sort_by_key(|(p, _)| *p);
+        let (mut p, mut o) = (prepares.into_iter().map(|(_, m)| m), others.into_iter());
+        for prepare in is_prepare {
+            let m = if prepare { p.next() } else { o.next() };
+            self.pending.push(m.expect("as many members as places"));
         }
     }
 
