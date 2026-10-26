@@ -335,7 +335,7 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
 #[test]
 fn layout_version_mismatch_is_refused_unless_alone() {
     // The previous layout (an older writer's region left behind: D277's upgrade, perf287's
-    // P3, and D281's) and a newer one.
+    // P3, D281's, and D278's) and a newer one.
     let current = pigeonhole_format::ShmLayoutVersion::CURRENT.0;
     for other in [current - 1, current + 1] {
         mismatch_refused_unless_alone(other);

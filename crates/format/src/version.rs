@@ -65,7 +65,10 @@ impl ShmLayoutVersion {
     /// version 3 reader would misread every node's tower and key. Version 5 adds the
     /// row-epoch table the row caches of every process share (D281): a version 4 writer
     /// would not raise its slots, so a version 5 reader's cache would serve stale rows.
-    pub const CURRENT: Self = Self(5);
+    /// Version 6 holds decided cross-shard seqnos in the header's `cross_held` word, not in
+    /// the coordinator's pending watermark (D278): a version 5 reader ignores the word and
+    /// would see a commit before every share of it is applied.
+    pub const CURRENT: Self = Self(6);
 }
 
 /// Magic at offset 0 of each superblock (pages 0 and 1).

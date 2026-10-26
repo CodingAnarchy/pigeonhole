@@ -88,19 +88,20 @@ impl Db {
             .expect("submit")
     }
 
-    /// Starts a cross-shard commit coordinated by shard 1, prepares it on both shards and
-    /// decides it, leaving shard 1 holding its seqno: nothing past it is visible until shard
-    /// 1 runs again (after shard 0 applied). D263: the seqno is held only from
-    /// the decision, so shard 1 runs past it here.
+    /// Starts a cross-shard commit coordinated by shard 0, prepares it on both shards and
+    /// decides it, leaving its seqno held until shard 1 applies its share: nothing past it
+    /// is visible until shard 1 runs again. D263: the seqno is held only from the decision,
+    /// so shard 0 runs that far. D278: the last participant to apply releases it, so the
+    /// hold is shard 1's.
     fn hold_watermark(&mut self) -> PendingCommit {
         let mut b = WriteBatch::new();
-        self.put(&mut b, 1, b"held", b"x");
         self.put(&mut b, 0, b"held", b"x");
+        self.put(&mut b, 1, b"held", b"x");
         let pc = self.submit(b);
-        self.step(1);
         self.step(0);
         self.step(1);
-        self.step(1);
+        self.step(0);
+        self.step(0);
         pc
     }
 

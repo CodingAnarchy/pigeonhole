@@ -2522,6 +2522,47 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 - `engine/tests/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
 - `shm/tests/sim.rs`: a layout 3 region (and a newer one) is refused while other processes are attached, and rebuilt when the new writer is alone.
 
+<a id="d278"></a>
+## D278 — The participant that applies a cross-shard commit last releases its seqno and answers the client; the hold lives in the allocator (owner decision, 2026-10-26; engine, shm, #932 3a, #708; ICR 0074)
+
+**Decided:** #932's candidate 3a, picked by the owner after M0 (`.coord/brief-932-pick.md`), in the form of the design on #932 (comment 6407200875) that perf287 approved.
+
+**Why:** the coordinator held a decided seqno in its own `pending` watermark until every participant's `Applied` reached it, then woke the client. So the client's answer and every later commit's visibility waited for one more hop and one more turn on the coordinator (M0: the `Applied` hop 1.45 µs plus A's handling and wake). Under transfer's hot account, that tail is part of the hot row's cycle, which bounds throughput at `Buffered` (#932's pause study: hot-account utilization 0.70).
+
+**What changes:**
+- **The hold moves into the allocator.**
+  - `Reservation` (D271's one Mutex) keeps the decided seqnos not yet applied everywhere. It publishes their minimum as shm `CROSS_HELD` (header offset 192, layout version 6), stored under the lock.
+  - `reserve_decision` stores it before the `NEXT_SEQNO` mirror passes the seqno. The coordinator no longer publishes a lower bound first: the hold is stored in the same critical section that reserves the seqno.
+  - The shard-local `held` set goes.
+- **A shared count of the shares still to apply.**
+  - When the coordinator's DECISION is written, a `Completion` takes the client's reply and travels in every `Decide`.
+  - Each participant counts down (`AcqRel`) once its share is applied and in its published view.
+  - The one that reaches zero releases the seqno (`Reservation::release`), wakes visibility waiters, and answers the client, before it sends `Applied`.
+- **`Applied` is bookkeeping.** It still reaches the coordinator from every participant, for the `coord` entry, D249/D276's clean-up and the close.
+- **Aborts don't change.** A seqno reserved and then aborted (a DECISION never logged, or not encodable) is released by the coordinator once every participant answered.
+- **Readers** take `min(NEXT_SEQNO, CROSS_HELD, every pending) − 1`, loading `NEXT_SEQNO` first and `CROSS_HELD` second (perf287's M1, FORMAT §11.3).
+
+**Failures:**
+- **A share that can't apply never counts down.** That covers an apply that fails, a close that gave up, and a dead shard. The seqno stays held for good, as before, and the coordinator answers `OutcomeUnknown` from the failed `Applied` and treats it as a shard's death.
+- **Exactly once by construction:** only the decrement that reaches zero releases, and it happens only once every share is applied. No death sentinel is needed.
+- **The answer is taken exactly once.** A coordinator whose shard stops (`answer_unsettled`) takes it if no participant has, so the client hears `OutcomeUnknown`. A coordinator that dies after its own apply leaves the last participant to release the seqno and answer `Ok`, which is true: the decision was written, and every share is applied.
+
+**Correctness:**
+- **D263 (visible whole):** the release comes at zero. The `AcqRel` count-down carries every apply to the releaser, and its Release store under the lock carries them to readers.
+- **The DECISION is written (and synced at its level) before any `Decide` is sent,** as before.
+- **D266, recovery and the WAL format:** unchanged.
+
+**Tests:**
+- `engine/tests/applier_release.rs` covers:
+  - the last participant answers without the coordinator running;
+  - a participant that can't apply (`Fault::NextApply`);
+  - a dropped participant applies its queued decision;
+  - a coordinator that dies after its apply;
+  - a transaction and a blind commit resubmitted on the same rows at once don't stall (perf287's point 1).
+- `clock_loom.rs` models the hold, the release from either thread and the reader in both load orders. The wrong order is caught.
+- `clock.rs` unit tests cover holds released out of order.
+- `blocking_waits`' failed-share-apply test is unchanged and passes. freeze_wake's hold helper now makes shard 1 the last applier.
+
 ## D281 — Reader processes have a row cache, keyed on the writer's write watermarks in shared memory (owner decision, 2026-10-26; cache, shm, engine, pigeonhole, #926; refines D201)
 
 **Decided:** a 1.0 item. Every reader process gets a row cache of its own, run on D201's epoch protocol against the writer's write watermarks, which move from the writer's memory into the shared-memory region (layout version 5). Design on #926, reviewed by perf287, with two must-fixes (M1, M2), both in.

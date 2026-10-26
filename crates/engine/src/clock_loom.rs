@@ -13,6 +13,12 @@
 //! - a reader never sees a seqno visible before the writer that reserved it applied it;
 //! - default timestamps never go back as seqnos go up, and a decision's is strictly above
 //!   every stamp before it.
+//!
+//! The second model is D278's: a decision's seqno is held in the allocator (shm
+//! `CROSS_HELD`, stored Release under the lock before the mirror passes it), its two
+//! participants count down `AcqRel` once each applied its share, and the one that reaches
+//! zero releases it under the lock, from either thread. A reader (`min(mirror, CROSS_HELD)`
+//! − 1, Acquire both) never sees the seqno before both shares are applied.
 
 use loom::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use loom::sync::{Arc, Mutex};
@@ -144,4 +150,194 @@ fn loom_the_mirror_never_shows_an_unapplied_seqno_and_stamps_follow_seqnos() {
         SAW_PROGRESS.load(std::sync::atomic::Ordering::Relaxed),
         "no explored execution's reader saw a seqno visible"
     );
+}
+
+struct Held {
+    /// The allocator's next seqno and the held decisions, under one lock.
+    clock: Mutex<(u64, Vec<u64>)>,
+    mirror: AtomicU64,
+    cross_held: AtomicU64,
+    /// The `Decide` message to the participant: the decision's seqno, 0 before.
+    decide: AtomicU64,
+    /// Each participant's share applied.
+    shares: [AtomicBool; 2],
+    remaining: AtomicU64,
+    /// Which participant released (1 + index), checked after the joins: exactly once.
+    released_by: AtomicU64,
+    /// The decision's seqno, set under `clock`'s lock as it is reserved (0 before), and the
+    /// third thread's group applied (it has seqno 1 or 2).
+    decision: AtomicU64,
+    group_applied: AtomicBool,
+    /// The group's shard's pending watermark (FORMAT §11.3 steps 1 and 3).
+    group_pending: AtomicU64,
+}
+
+fn publish_held(sh: &Held, held: &[u64]) {
+    let lowest = held.iter().copied().min().unwrap_or(u64::MAX);
+    sh.cross_held.store(lowest, Ordering::Release);
+}
+
+/// Participant `i` applied its share of decision `s`: counts down, and the last releases.
+fn applied(sh: &Held, i: usize, s: u64) {
+    sh.shares[i].store(true, Ordering::Release);
+    if sh.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+        let mut c = sh.clock.lock().unwrap();
+        c.1.retain(|&x| x != s);
+        publish_held(sh, &c.1);
+        drop(c);
+        let before = sh.released_by.swap(1 + i as u64, Ordering::Relaxed);
+        assert_eq!(before, 0, "released twice");
+    }
+}
+
+static SAW_RELEASE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[test]
+fn loom_a_decision_is_visible_only_once_its_last_participant_released_it() {
+    held_model(true);
+    assert!(
+        SAW_RELEASE.load(std::sync::atomic::Ordering::Relaxed),
+        "no explored execution's reader saw the decision visible"
+    );
+}
+
+/// perf287's M1: a reader that loads `CROSS_HELD` before `NEXT_SEQNO` can see no hold, then
+/// a mirror past a decision made in between, and take the decision as visible.
+#[test]
+#[should_panic(expected = "decision visible half applied")]
+fn loom_a_reader_loading_the_hold_before_the_mirror_sees_a_held_decision() {
+    held_model(false);
+}
+
+/// perf287's optional model on D278: a group on another shard reserves after the decision
+/// and moves the mirror past it, with no lower bound published by the decider (the publish
+/// D278 dropped). The reader still never sees the decision before both shares are applied.
+#[test]
+fn loom_a_group_passing_the_mirror_beyond_a_held_decision_does_not_expose_it() {
+    held_model_with(true, true);
+}
+
+/// D278's hold against a reader of `min(mirror, CROSS_HELD) − 1`, loading the mirror first
+/// (FORMAT §11.3) or, to show the order matters, the hold first.
+fn held_model(mirror_first: bool) {
+    held_model_with(mirror_first, false);
+}
+
+/// As [`held_model`], with `group`: a third thread reserves a group's seqno under the lock,
+/// with its own pending watermark as §11.3 steps 1 and 3 have it, and advances the mirror
+/// past it.
+fn held_model_with(mirror_first: bool, group: bool) {
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(if group { 2 } else { 3 });
+    model.check(move || {
+        let sh = Arc::new(Held {
+            clock: Mutex::new((1, Vec::new())),
+            mirror: AtomicU64::new(1),
+            cross_held: AtomicU64::new(u64::MAX),
+            decide: AtomicU64::new(0),
+            shares: [AtomicBool::new(false), AtomicBool::new(false)],
+            remaining: AtomicU64::new(2),
+            released_by: AtomicU64::new(0),
+            decision: AtomicU64::new(0),
+            group_applied: AtomicBool::new(false),
+            group_pending: AtomicU64::new(u64::MAX),
+        });
+        // The coordinator decides, sends the decision, then applies its own share: the
+        // participant may apply first or last.
+        let coord = {
+            let sh = Arc::clone(&sh);
+            thread::spawn(move || {
+                let s = {
+                    let mut c = sh.clock.lock().unwrap();
+                    let s = c.0;
+                    c.0 += 1;
+                    c.1.push(s);
+                    sh.decision.store(s, Ordering::Relaxed);
+                    publish_held(&sh, &c.1);
+                    s
+                };
+                sh.mirror.fetch_max(s + 1, Ordering::AcqRel);
+                sh.decide.store(s, Ordering::Release);
+                applied(&sh, 0, s);
+            })
+        };
+        let part = {
+            let sh = Arc::clone(&sh);
+            thread::spawn(move || {
+                let s = loop {
+                    let s = sh.decide.load(Ordering::Acquire);
+                    if s != 0 {
+                        break s;
+                    }
+                    thread::yield_now();
+                };
+                applied(&sh, 1, s);
+            })
+        };
+        let g = group.then(|| {
+            let sh = Arc::clone(&sh);
+            thread::spawn(move || {
+                // §11.3: a lower bound first, then the reservation, then applied.
+                let lb = sh.mirror.load(Ordering::Acquire);
+                sh.group_pending.store(lb, Ordering::Release);
+                let s = {
+                    let mut c = sh.clock.lock().unwrap();
+                    let s = c.0;
+                    c.0 += 1;
+                    s
+                };
+                sh.group_pending.store(s, Ordering::Release);
+                sh.mirror.fetch_max(s + 1, Ordering::AcqRel);
+                sh.group_applied.store(true, Ordering::Release);
+                sh.group_pending.store(u64::MAX, Ordering::Release);
+            })
+        });
+        let r = {
+            let sh = Arc::clone(&sh);
+            thread::spawn(move || {
+                let (next, held) = if mirror_first {
+                    let next = sh.mirror.load(Ordering::Acquire);
+                    (next, sh.cross_held.load(Ordering::Acquire))
+                } else {
+                    let held = sh.cross_held.load(Ordering::Acquire);
+                    (sh.mirror.load(Ordering::Acquire), held)
+                };
+                let v = next
+                    .min(held)
+                    .min(sh.group_pending.load(Ordering::Acquire))
+                    .saturating_sub(1);
+                // Which seqno is the decision's, read under the lock after `v` (taking it now
+                // cannot change what the loads above saw): 0 means not reserved yet, so `v`
+                // covers only the group's.
+                let d = {
+                    let _c = sh.clock.lock().unwrap();
+                    sh.decision.load(Ordering::Relaxed)
+                };
+                for s in 1..=v {
+                    if s == d {
+                        for share in &sh.shares {
+                            assert!(
+                                share.load(Ordering::Acquire),
+                                "decision visible half applied"
+                            );
+                        }
+                        SAW_RELEASE.store(true, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        assert!(
+                            group && sh.group_applied.load(Ordering::Acquire),
+                            "seqno {s} visible unapplied"
+                        );
+                    }
+                }
+            })
+        };
+        coord.join().unwrap();
+        part.join().unwrap();
+        if let Some(g) = g {
+            g.join().unwrap();
+        }
+        r.join().unwrap();
+        assert_ne!(sh.released_by.load(Ordering::Relaxed), 0, "never released");
+        assert_eq!(sh.cross_held.load(Ordering::Relaxed), u64::MAX);
+    });
 }

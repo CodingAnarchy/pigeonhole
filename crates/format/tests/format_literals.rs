@@ -362,8 +362,10 @@ fn shm_layout() {
     assert_eq!(&p[0..8], b"PHDBSHM\0");
     assert_eq!(
         (le32(&p, 8), le32(&p, 12), le64(&p, 16)),
-        (5, 4096, h.region_len)
+        (6, 4096, h.region_len)
     );
+    // Layout version 6 (D278): the cross-shard hold, a live word the writer initializes.
+    assert_eq!(pigeonhole_format::shm::header::CROSS_HELD, 192);
     // §8.3: reader slot `i`'s liveness lock is byte 2^62 + i (layout version 3, #693).
     assert_eq!(pigeonhole_format::superblock::READER_LOCK_BASE, 1 << 62);
     // §11.2: each shard's 64-byte watermark line holds `pending` at 0 and `durable` at 8
@@ -446,4 +448,55 @@ fn shm_layout() {
         (5, 6, 1, 2, 0)
     );
     assert_eq!((le32(&b, 80), le32(&b, 84)), (64, 0));
+}
+
+/// No two shm header fields overlap, every one is inside the header page, and every `u64` is
+/// 8-aligned (most are atomics). A new field must be added here, beside FORMAT §11.1.
+#[test]
+fn shm_header_fields_do_not_overlap() {
+    use pigeonhole_format::shm::{HEADER_LEN, header as h};
+    let mut fields = [
+        ("magic", h::MAGIC, 8),
+        ("layout_version", h::LAYOUT_VERSION, 4),
+        ("header_len", h::HEADER_LEN, 4),
+        ("region_len", h::REGION_LEN, 8),
+        ("db_id", h::DB_ID, 16),
+        ("generation", h::GENERATION, 8),
+        ("state", h::STATE, 4),
+        ("shard_count", h::SHARD_COUNT, 4),
+        ("reader_slot_count", h::READER_SLOT_COUNT, 4),
+        ("view_buffer_len", h::VIEW_BUFFER_LEN, 4),
+        ("manifest_version", h::MANIFEST_VERSION, 8),
+        ("view_pointer", h::VIEW_POINTER, 8),
+        ("writer_pid", h::WRITER_PID, 4),
+        ("writer_start_time", h::WRITER_START_TIME, 8),
+        ("watermarks_off", h::WATERMARKS_OFF, 8),
+        ("views_off", h::VIEWS_OFF, 8),
+        ("reader_slots_off", h::READER_SLOTS_OFF, 8),
+        ("arenas_off", h::ARENAS_OFF, 8),
+        ("arena_len", h::ARENA_LEN, 8),
+        ("next_seqno", h::NEXT_SEQNO, 8),
+        ("file_device", h::FILE_DEVICE, 8),
+        ("file_inode", h::FILE_INODE, 8),
+        ("row_epochs_off", h::ROW_EPOCHS_OFF, 8),
+        ("row_epoch_slots", h::ROW_EPOCH_SLOTS, 4),
+        ("row_epoch_hash", h::ROW_EPOCH_HASH, 4),
+        ("row_epoch_seed", h::ROW_EPOCH_SEED, 8),
+        ("row_epoch_flags", h::ROW_EPOCH_FLAGS, 4),
+        ("cross_held", h::CROSS_HELD, 8),
+    ];
+    fields.sort_by_key(|&(_, off, _)| off);
+    for w in fields.windows(2) {
+        let ((a, a_off, a_len), (b, b_off, _)) = (w[0], w[1]);
+        assert!(
+            a_off + a_len <= b_off,
+            "{a} (@{a_off}, {a_len} bytes) overlaps {b} (@{b_off})"
+        );
+    }
+    for (name, off, len) in fields {
+        assert!(off + len <= HEADER_LEN, "{name} is past the header");
+        if len == 8 && name != "magic" {
+            assert_eq!(off % 8, 0, "{name} (@{off}) is not 8-aligned");
+        }
+    }
 }
