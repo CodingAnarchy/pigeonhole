@@ -2,11 +2,13 @@
 
 **Status:** Approved (owner, via the coordinator, 2026-10-20; #692). For `phdb check`. Reviewed by perf287, because it reads the on-disk format.
 
+*Amended by ICR 0075: `CheckOptions` has no hidden `vfs`; `check` always reads the real file system.*
+
 ## Change
 
 In `pigeonhole` (additions):
 - **`pub fn check(path: impl AsRef<Path>, options: CheckOptions) -> Result<CheckReport>`**, a free function: it needs no open database.
-- **`CheckOptions`** (a builder): `deep(bool)` and `allow_fuse(bool)`, plus a hidden `vfs` for the simulation.
+- **`CheckOptions`** (a builder): `deep(bool)` and `allow_fuse(bool)`. (A hidden `vfs` for the simulation was removed by ICR 0075.)
 - **`CheckReport`**: `findings: Vec<Finding>`, `regions: Vec<Region>`, `wal: Vec<WalFile>`, `counts: CheckCounts`, `file_bytes`, `clean_shutdown`, and `is_ok()`, which is true when no finding is `Corruption`.
 - **`Finding`**: `structure: Structure`, `severity: Severity`, `object: Option<u64>`, `offset: Option<u64>`, `message`.
 - **`Structure`**: `Superblock`, `Manifest`, `Allocation`, `Sst`, `Blob`, `Wal`. **`Severity`**: `Corruption`, `Warning`, `Info`.
