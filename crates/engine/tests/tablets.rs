@@ -3704,13 +3704,16 @@ fn a_retry_waiting_for_room_ends_closed_at_close() {
     assert!(matches!(r, Err(pigeonhole_engine::Error::Closed)), "{r:?}");
 }
 
-#[test]
-fn a_moved_retry_keeping_its_timestamp_still_raises_its_new_participant_first() {
-    // D245 (perf287's check 1): a cross-shard commit refused `Moved` while its tablet moves
-    // to a shard with a lower floor is retried with its first timestamp (it still fits).
-    // The retry must raise the new owner before it reserves its seqno, like a fresh pick:
-    // 1,024 singles queued there ahead of the retry's PREPARE are stamped in an earlier
-    // turn than the one that reads the PREPARE, at later seqnos, and must land above it.
+/// A cross-shard commit refused `Moved` while its tablet moves to a shard with a lower
+/// floor, retried while singles queue on its new participant. In either order (the singles
+/// all resolved there before the retry runs, or its PREPARE reaching it first, #980), every
+/// single's default timestamp keeps D11's order with the commit's (D271). The commit's cells
+/// land at its DECISION's seqno and timestamp, reserved together (D263: a PREPARE has no
+/// timestamp, and its seqno is the commit's id, never applied), so the order is checked
+/// against the COMMIT record's applied seqno. (Before D263 a retry kept its first timestamp
+/// and had to raise its new participant first, D245; release/0.3.x still works that way and
+/// passes both orders.)
+fn moved_retry_against_queued_singles(retry_first: bool) {
     let mut db = open(3, |o| o.memtable_budget = 64 << 20);
     let (t, f) = (db.table.id, db.table.families[0].id);
     let m = db.engine.split_tablet_pending(t, b"m").unwrap();
@@ -3793,8 +3796,12 @@ fn a_moved_retry_keeping_its_timestamp_still_raises_its_new_participant_first() 
         }
     }
     assert!(moved, "the move never finished");
-    // 1,024 singles queued on 2; then 0 retries (raise, reserve, PREPARE behind them), and
-    // 2's next turn stamps only the singles.
+    // 1,024 singles queued on 2, and 0 retries: before them (its PREPARE reaches 2 first) or
+    // after them (2's next turn stamps only the singles).
+    if retry_first {
+        let now = db.clock.monotonic_nanos();
+        db.shards[0].run_once(now + 1_000);
+    }
     let mut singles: Vec<_> = (0..1_024u32)
         .map(|i| {
             let mut wb = WriteBatch::new();
@@ -3810,6 +3817,26 @@ fn a_moved_retry_keeping_its_timestamp_still_raises_its_new_participant_first() 
             db.engine.submit(wb, Some(Durability::Buffered)).unwrap()
         })
         .collect();
+    if !retry_first {
+        // The singles first, explicitly (perf287 on #982): every one resolves on 2 (and 1)
+        // before 0 runs again, whatever room they reserve or a priority lane does with them.
+        for _ in 0..100_000 {
+            let now = db.clock.monotonic_nanos();
+            db.shards[1].run_once(now + 1_000);
+            db.shards[2].run_once(now + 1_000);
+            singles.retain_mut(|s| match poll_commit(s) {
+                Some(r) => {
+                    r.expect("a single on 2");
+                    false
+                }
+                None => true,
+            });
+            if singles.is_empty() {
+                break;
+            }
+        }
+        assert!(singles.is_empty(), "the singles never resolved on 2 alone");
+    }
     let now = db.clock.monotonic_nanos();
     db.shards[0].run_once(now + 1_000);
     db.shards[2].run_once(now + 1_000);
@@ -3817,58 +3844,96 @@ fn a_moved_retry_keeping_its_timestamp_still_raises_its_new_participant_first() 
     for s in &mut singles {
         step_until_done(&mut db, s);
     }
+    // And singles on 2 after the decision: they must stamp above it, though the clock is far
+    // behind `H` (shard 0's 3,000 puts ran it ahead) and 2's own last stamp below it.
+    for i in 0..8u32 {
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t,
+            f,
+            format!("q{i:04}").as_bytes(),
+            b"s",
+            None,
+            ValueRef::Bytes(b"s"),
+        )
+        .unwrap();
+        let mut s = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+        step_until_done(&mut db, &mut s);
+    }
     let records = db.engine.take_appended();
     let prepares: Vec<_> = records
         .iter()
         .filter(|r| r.stream == 0 && r.kind == pigeonhole_engine::AppendedKind::Prepare)
         .collect();
-    let (ts_c, _) = db.get(b"a").unwrap();
     assert!(
         prepares.len() >= 2,
         "the commit was never refused: {prepares:?}"
     );
-    // The `Moved` retry kept its first timestamp.
-    let (first, retry) = (prepares[0], prepares[1]);
-    assert_eq!(retry.commit_ts, first.commit_ts, "{prepares:?}");
-    // Every single on 2 reserved after the retry's seqno was stamped above its kept
-    // timestamp: the retry raised 2 before reserving. (A later attempt refused for room
-    // behind them takes a fresh timestamp, since 2 stamped since.)
-    let singles_on_2: Vec<_> = records
+    let retry_id = prepares.last().unwrap().seqno;
+    let commit = records
         .iter()
-        .filter(|r| r.stream == 2 && r.kind == pigeonhole_engine::AppendedKind::Batch)
-        .collect();
-    let after: Vec<_> = singles_on_2
-        .iter()
-        .filter(|r| r.seqno > retry.seqno)
-        .collect();
+        .find(|r| r.kind == pigeonhole_engine::AppendedKind::Commit && r.seqno == retry_id)
+        .expect("the retry's DECISION");
+    let (apply, ts_c) = (commit.apply_seqno, commit.commit_ts);
     assert!(
-        !after.is_empty(),
-        "no single reserved after the retry's seqno"
+        apply > retry_id,
+        "the DECISION applied at {apply}, not above the retry's id {retry_id}"
     );
-    for r in &after {
+    assert_eq!(db.get(b"a").unwrap().0, ts_c, "the commit's cell");
+    let singles: Vec<_> = records
+        .iter()
+        .filter(|r| r.kind == pigeonhole_engine::AppendedKind::Batch)
+        .collect();
+    // Each order's interleaving happened: the singles on 2 reserved before the retry's id
+    // (queued first), or some between its id and its decision (#980: the PREPARE first).
+    let on_2: Vec<_> = singles.iter().filter(|r| r.stream == 2).collect();
+    if retry_first {
         assert!(
-            r.commit_ts > retry.commit_ts,
-            "single ({}, {}) below the retry ({}, {})",
-            r.seqno,
-            r.commit_ts,
-            retry.seqno,
-            retry.commit_ts
+            on_2.iter().any(|r| r.seqno > retry_id && r.seqno < apply),
+            "no single on 2 between the retry ({retry_id}) and its decision ({apply})"
+        );
+    } else {
+        assert!(
+            on_2.iter().filter(|r| r.seqno < apply).count() >= 1_024
+                && on_2
+                    .iter()
+                    .filter(|r| r.seqno < apply)
+                    .all(|r| r.seqno < retry_id),
+            "the singles on 2 were not all reserved before the retry ({retry_id})"
         );
     }
-    // And D11's order with the share that landed.
-    let seqno_c = prepares.last().unwrap().seqno;
-    for r in &singles_on_2 {
+    assert!(
+        on_2.iter().any(|r| r.seqno > apply),
+        "no single on 2 after the decision ({apply})"
+    );
+    // D11 (D271): a group reserved before the decision stamps below it, one after above it,
+    // on every shard.
+    for r in &singles {
         assert!(
-            (r.seqno < seqno_c) == (r.commit_ts <= ts_c),
-            "single ({}, {}) against commit ({seqno_c}, {ts_c})",
+            (r.seqno < apply) == (r.commit_ts < ts_c) && r.commit_ts != ts_c,
+            "single ({}, {}) on {} against the commit's cells ({apply}, {ts_c}); retry first: \
+             {retry_first}",
             r.seqno,
-            r.commit_ts
+            r.commit_ts,
+            r.stream
         );
     }
     db.engine.close().unwrap();
     for _ in 0..8 {
         db.step();
     }
+}
+
+#[test]
+fn a_moved_retry_after_singles_queued_on_its_new_participant_keeps_d11_order() {
+    moved_retry_against_queued_singles(false);
+}
+
+#[test]
+fn a_moved_retry_whose_prepare_reaches_its_new_participant_first_keeps_d11_order() {
+    // #980's order: perf2's reversed run of the earlier test failed only its check against
+    // the PREPARE's seqno (the commit's id since D263), not against the applied one.
+    moved_retry_against_queued_singles(true);
 }
 
 /// Two shards: `low`'s arena (4 MiB, nothing frozen by size) filled with committed singles
