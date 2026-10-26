@@ -7604,6 +7604,16 @@ impl ShardState {
                 priority,
                 submitted_at: req.submitted_at,
             });
+            #[cfg(feature = "test-hooks")]
+            if shard != self.id && self.shared.hooks.faults.on(crate::Fault::HoldPrepares) {
+                self.shared
+                    .hooks
+                    .held_prepares
+                    .lock()
+                    .unwrap()
+                    .push((shard, msg));
+                continue;
+            }
             if shard == self.id {
                 self.handle_msg(msg, ctx);
             } else if ctx.submitter(shard).submit(msg).is_err() {
