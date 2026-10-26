@@ -689,6 +689,12 @@ for level, label in CONTENDED_LEVELS:
         vs = f"; {t:.2f}× the scaling gate's N = 16 (pre-split, balancer off)"
         if t < 1 / 3:
             flag = "; **under a third of the scaling gate's N = 16: file an issue**"
+    # D280 (#816, #710): against the same workload on engine-owned shards (floor 0.83×).
+    er = next(iter(results(f"contended-{level}-app-owned-engine.json", "pigeonhole")), None)
+    if er:
+        vs += (f"; engine-owned on the same workload {rate(er['throughput'])} commits/s, p99 "
+               f"{us(er['p99_ns']):.0f} µs: {ar['throughput'] / max(er['throughput'], 1e-9):.2f}× its "
+               f"throughput, {er['p99_ns'] / max(ar['p99_ns'], 1):.2f}× its p99 (D280 floor 0.83×)")
     rounds = (f"; {st.get('xshard_rounds', 0)} two-phase rounds, {st.get('xshard_refused_rounds', 0)} refused"
               if "xshard_rounds" in st else "")
     settled = "" if d.get("warmup_settled", True) else ", not settled"
@@ -718,6 +724,15 @@ for level, label in CONTENDED_LEVELS:
             flag = "; **> 3× the judged ycsb-a's p99: file an issue**"
     ms = lambda v: f"{v:.0f} ms" if v is not None else "not reached"
     close = (rr.get("detail", {}).get("close_ms"))
+    # D280 (#715): RocksDB's checkpoint and BackupEngine backup beside the same load, and
+    # each side's bytes, so the backup is read against them at the same size.
+    rk = next(iter(results(f"contended-{level}-ycsb-a-riders.json", "rocksdb", "ycsb-a")), None)
+    rkd = (rk or {}).get("detail", {}).get("riders") or {}
+    gb = lambda v: f"{v / 1e9:.2f} GB" if v is not None else "?"
+    if rkd.get("checkpoint_ms") is not None:
+        fg += (f"; RocksDB checkpoint {ms(rkd.get('checkpoint_ms'))}, BackupEngine "
+               f"{ms(rkd.get('copy_backup_ms'))} (backup {gb(rd.get('backup_bytes'))}, "
+               f"checkpoint {gb(rkd.get('backup_bytes'))})")
     rows.append((f"Contended ycsb-a with riders, {label} (reported, not judged; D247)",
                  f"snapshot scans p99 {us(rd['snapshot_scans']['p99_ns']):.0f} µs ({rd['snapshots']} snapshots), "
                  f"durable-snapshot scans p99 {us(rd['durable_snapshot_scans']['p99_ns']):.0f} µs "

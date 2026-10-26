@@ -8,7 +8,7 @@
 //! the default one. A scan merges both column families once a `metric` cell was written, so
 //! runs that never write one (the sparse-wide gate) scan one iterator as before.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +62,12 @@ pub struct RocksDbRunner {
     db: Option<Arc<DB>>,
     /// Whether a `metric` cell was written: scans then merge both column families.
     metric_written: Arc<AtomicBool>,
+    /// A checkpoint and a copying backup beside the measured phase (D280, #715).
+    riders: bool,
+    /// The store's directory (the riders' checkpoint and backup go under it).
+    dir: Option<PathBuf>,
+    /// The riders' thread while the measured phase runs.
+    rider: Option<riders::Running>,
 }
 
 impl std::fmt::Debug for RocksDbRunner {
@@ -93,6 +99,118 @@ impl RocksDbRunner {
     pub fn load_buffered(mut self, yes: bool) -> Self {
         self.load_buffered = yes;
         self
+    }
+
+    /// `true`: 2 s into the measured phase, a `Checkpoint` and then a `BackupEngine` backup,
+    /// each timed (D280, #715: Pigeonhole's durable backup under load against them, at the
+    /// same size), reported in the record's riders.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{RocksDbRunner, Runner};
+    ///
+    /// assert!(RocksDbRunner::default().riders(true).describe().contains(" riders"));
+    /// ```
+    pub fn riders(mut self, yes: bool) -> Self {
+        self.riders = yes;
+        self
+    }
+}
+
+/// D280's riders on RocksDB (#715): a checkpoint, then a backup that copies every file,
+/// started 2 s into the measured phase, as Pigeonhole's durable backup rider starts.
+mod riders {
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::thread::JoinHandle;
+    use std::time::{Duration, Instant};
+
+    use rocksdb::backup::{BackupEngine, BackupEngineOptions};
+    use rocksdb::checkpoint::Checkpoint;
+    use rocksdb::{DB, Env};
+
+    use crate::Riders;
+
+    /// How far into the measured phase the checkpoint starts (Pigeonhole's backup rider's).
+    const AFTER: Duration = Duration::from_secs(2);
+
+    /// The checkpoint's and the backup's milliseconds and the checkpoint's bytes, `None`
+    /// if the phase ended before they started.
+    type Work = JoinHandle<Result<Option<(f64, f64, u64)>, String>>;
+
+    pub(super) struct Running {
+        stop: Arc<AtomicBool>,
+        work: Work,
+        checkpoint: PathBuf,
+        backup: PathBuf,
+    }
+
+    impl std::fmt::Debug for Running {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Running").finish_non_exhaustive()
+        }
+    }
+
+    pub(super) fn start(db: &Arc<DB>, dir: &Path) -> Running {
+        let stop = Arc::new(AtomicBool::new(false));
+        let (checkpoint, backup) = (dir.join("rider-checkpoint"), dir.join("rider-backup"));
+        let work = {
+            let (db, stop) = (Arc::clone(db), Arc::clone(&stop));
+            let (checkpoint, backup) = (checkpoint.clone(), backup.clone());
+            std::thread::spawn(move || {
+                let begun = Instant::now();
+                while begun.elapsed() < AFTER {
+                    if stop.load(Ordering::Relaxed) {
+                        return Ok(None);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let e = |e: rocksdb::Error| e.to_string();
+                // Once started, both run to the end, whenever the measured phase ends, as
+                // Pigeonhole's backup and compaction do.
+                let t = Instant::now();
+                Checkpoint::new(&*db)
+                    .map_err(e)?
+                    .create_checkpoint(&checkpoint)
+                    .map_err(e)?;
+                let checkpoint_ms = t.elapsed().as_secs_f64() * 1e3;
+                let bytes = crate::dir_bytes(&checkpoint);
+                let t = Instant::now();
+                let opts = BackupEngineOptions::new(&backup).map_err(e)?;
+                let mut engine = BackupEngine::open(&opts, &Env::new().map_err(e)?).map_err(e)?;
+                engine.create_new_backup_flush(&*db, true).map_err(e)?;
+                Ok(Some((
+                    checkpoint_ms,
+                    t.elapsed().as_secs_f64() * 1e3,
+                    bytes,
+                )))
+            })
+        };
+        Running {
+            stop,
+            work,
+            checkpoint,
+            backup,
+        }
+    }
+
+    impl Running {
+        pub(super) fn stop(self) -> Result<Riders, String> {
+            self.stop.store(true, Ordering::Relaxed);
+            let done = self
+                .work
+                .join()
+                .map_err(|_| "the rocksdb rider panicked".to_owned())??;
+            // Not counted in the store's size.
+            let _ = std::fs::remove_dir_all(&self.checkpoint);
+            let _ = std::fs::remove_dir_all(&self.backup);
+            Ok(Riders {
+                checkpoint_ms: done.map(|d| d.0),
+                copy_backup_ms: done.map(|d| d.1),
+                backup_bytes: done.map(|d| d.2),
+                ..Riders::default()
+            })
+        }
     }
 }
 
@@ -150,8 +268,23 @@ impl Runner for RocksDbRunner {
         )
         .map_err(|e| e.to_string())?;
         self.db = Some(Arc::new(db));
+        self.dir = Some(dir.to_path_buf());
         self.loading = self.load_buffered;
         Ok(())
+    }
+
+    fn start_riders(&mut self) -> Result<(), String> {
+        if !self.riders {
+            return Ok(());
+        }
+        let db = self.db.as_ref().ok_or("rocksdb runner is not open")?;
+        let dir = self.dir.as_deref().ok_or("rocksdb runner is not open")?;
+        self.rider = Some(riders::start(db, dir));
+        Ok(())
+    }
+
+    fn stop_riders(&mut self) -> Result<Option<crate::Riders>, String> {
+        self.rider.take().map(riders::Running::stop).transpose()
     }
 
     fn measured_durability(&mut self) -> Result<bool, String> {
@@ -201,14 +334,15 @@ impl Runner for RocksDbRunner {
 
     fn describe(&self) -> String {
         format!(
-            "{} bloom={BLOOM_BITS} {}{}",
+            "{} bloom={BLOOM_BITS} {}{}{}",
             self.memory,
             durability(self.sync),
             if self.load_buffered {
                 " load=buffered"
             } else {
                 ""
-            }
+            },
+            if self.riders { " riders" } else { "" }
         )
     }
 }

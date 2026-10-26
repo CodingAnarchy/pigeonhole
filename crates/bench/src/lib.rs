@@ -974,7 +974,7 @@ pub fn run_detailed(
 }
 
 /// Bytes of every file under `dir`: the store's size on disk after the run.
-fn dir_bytes(dir: &Path) -> u64 {
+pub(crate) fn dir_bytes(dir: &Path) -> u64 {
     let mut total = 0;
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {

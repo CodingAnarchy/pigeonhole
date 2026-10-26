@@ -10,7 +10,7 @@ use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant};
 
 use pigeonhole::nonblocking::{CommitFuture, TransactionCommitFuture};
@@ -32,6 +32,69 @@ const TURN: Duration = Duration::from_micros(50);
 
 /// Writes a shard thread checks for its rows between turns of its shard, as a phase starts.
 const PICK_CHUNK: usize = 1 << 16;
+
+/// What one of a phase's threads drives between polls of its commits: an application-owned
+/// shard, or, engine-owned (D280's comparator, [`PigeonholeRunner::inline_engine_owned`]),
+/// nothing: the engine's own shard threads run the commits, and the thread only issues the
+/// same share of the writes and waits for their wakes.
+enum Driver {
+    // Boxed: a `Shard` is large, and the engine-owned variant is a number.
+    Owned(Box<Shard>),
+    Engine {
+        /// The shard whose rows this thread issues ([`Table::shard_of`]).
+        index: usize,
+    },
+}
+
+/// Wakes the thread that made it: an engine-owned driver's commits resolve on the engine's
+/// threads.
+struct Unpark(std::thread::Thread);
+
+impl Wake for Unpark {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+impl Driver {
+    fn index(&self) -> usize {
+        match self {
+            Driver::Owned(shard) => shard.index(),
+            Driver::Engine { index } => *index,
+        }
+    }
+
+    /// The waker for this thread's commits.
+    fn waker(&self) -> Waker {
+        match self {
+            Driver::Owned(shard) => shard.waker(),
+            Driver::Engine { .. } => Waker::from(Arc::new(Unpark(std::thread::current()))),
+        }
+    }
+
+    /// A turn of the shard: whether it has more work at once (never, with none to drive).
+    fn run_once(&mut self, turn: Duration) -> bool {
+        match self {
+            Driver::Owned(shard) => shard.run_once(turn),
+            Driver::Engine { .. } => false,
+        }
+    }
+
+    /// Waits at most `d` for work or a wake.
+    fn wait(&mut self, d: Duration) {
+        match self {
+            Driver::Owned(shard) => shard.wait(d),
+            Driver::Engine { .. } => std::thread::park_timeout(d),
+        }
+    }
+
+    /// Before the shard moves to another thread (#492).
+    fn release(&mut self) {
+        if let Driver::Owned(shard) = self {
+            shard.release();
+        }
+    }
+}
 
 /// One write of the stream: a row and its cells, in one family.
 struct Write {
@@ -403,7 +466,7 @@ fn pipeline(
     t: &Table,
     writes: &[&Write],
     in_flight: usize,
-    shard: &mut Shard,
+    shard: &mut Driver,
     mut hist: Option<&mut KindHists>,
     crew: &Crew,
     extras: PipelineExtras<'_>,
@@ -557,7 +620,11 @@ const BUSY_RETRIES: u32 = 20;
 
 /// Drives every shard on a helper thread while `f` runs (setup and teardown, which use the
 /// blocking API), then gives the shards back.
-fn with_drivers<T>(shards: Vec<Shard>, f: impl FnOnce() -> T) -> (Vec<Shard>, T) {
+fn with_drivers<T>(shards: Vec<Driver>, f: impl FnOnce() -> T) -> (Vec<Driver>, T) {
+    // Engine-owned, the engine drives its own shards.
+    if shards.iter().all(|d| matches!(d, Driver::Engine { .. })) {
+        return (shards, f());
+    }
     let stop = Arc::new(AtomicBool::new(false));
     let threads: Vec<_> = shards
         .into_iter()
@@ -591,13 +658,13 @@ fn with_drivers<T>(shards: Vec<Shard>, f: impl FnOnce() -> T) -> (Vec<Shard>, T)
 /// and the merged latencies.
 fn phase(
     t: &Table,
-    shards: Vec<Shard>,
+    shards: Vec<Driver>,
     writes: &[Write],
     in_flight: usize,
     record: bool,
     pins: Option<&PinPlan>,
     extras: PhaseExtras<'_>,
-) -> Result<(Vec<Shard>, Duration, KindHists, u64), String> {
+) -> Result<(Vec<Driver>, Duration, KindHists, u64), String> {
     let PhaseExtras {
         batches,
         readers,
@@ -691,9 +758,24 @@ impl PigeonholeRunner {
             operations: config.operations + warmup,
             ..config.clone()
         });
-        let (db, shards) =
-            Pigeonhole::open_application_owned(dir.join("bench.phdb"), options(&self.settings))
-                .map_err(err)?;
+        let engine_owned = self.settings.inline_engine_owned;
+        let (db, shards) = if engine_owned {
+            let db =
+                Pigeonhole::open(dir.join("bench.phdb"), options(&self.settings)).map_err(err)?;
+            let n = db.shard_stats().len();
+            (db, (0..n).map(|index| Driver::Engine { index }).collect())
+        } else {
+            let (db, shards) =
+                Pigeonhole::open_application_owned(dir.join("bench.phdb"), options(&self.settings))
+                    .map_err(err)?;
+            (
+                db,
+                shards
+                    .into_iter()
+                    .map(|s| Driver::Owned(Box::new(s)))
+                    .collect::<Vec<_>>(),
+            )
+        };
         let n = shards.len();
         // D235: the judged runs pin each shard's thread to a CPU of its own, one per physical
         // core first (D220); the plan holds those CPUs for the run. Where pinning is refused
@@ -907,8 +989,13 @@ impl PigeonholeRunner {
         Ok(RunRecord {
             store: self.name().to_owned(),
             store_config: format!(
-                "{} inline in-flight={in_flight} {placement}{}",
+                "{} {} in-flight={in_flight} {placement}{}",
                 self.describe(),
+                if engine_owned {
+                    "engine-owned"
+                } else {
+                    "inline"
+                },
                 match (self.settings.cross_batches, readers) {
                     (true, true) => " cross-batches=20% (half read-modify-write)",
                     (true, false) => " cross-batches=20%",

@@ -60,6 +60,9 @@ pub(crate) struct Settings {
     pub(crate) cross_batches: bool,
     /// With `cross_batches`, every other batch is a read-modify-write transaction instead.
     pub(crate) cross_readers: bool,
+    /// The inline driver opens the store engine-owned: its threads issue the same writes
+    /// but drive no shard (D280's comparator for the application-owned row).
+    pub(crate) inline_engine_owned: bool,
     /// The pre-split cuts at the measured writes' quantiles rather than the loaded rows', so
     /// each piece takes about the same share of the writes (D231's engine scaling).
     pub(crate) presplit_writes: bool,
@@ -286,6 +289,16 @@ impl PigeonholeRunner {
     /// transaction that conflicts is retried and counted.
     pub fn cross_readers(mut self, yes: bool) -> Self {
         self.settings.cross_readers = yes;
+        self
+    }
+
+    /// `true`: [`run_inline`](Self::run_inline) opens the store engine-owned. Each of its
+    /// threads issues the same share of the same stream (with the same batches, and the same
+    /// commits in flight) through `commit_async`, but drives no shard: the engine's own shard
+    /// threads run the commits. That's the application-owned row's comparator on the same
+    /// workload (D280, #816, #710).
+    pub fn inline_engine_owned(mut self, yes: bool) -> Self {
+        self.settings.inline_engine_owned = yes;
         self
     }
 
@@ -534,6 +547,12 @@ mod riders {
                 .work
                 .join()
                 .map_err(|_| "the backup rider panicked".to_owned())??;
+            // Its size, for a comparison at the same size (D280, #715): a file or a directory.
+            let backup_bytes = backup_ms.map(|_| match std::fs::metadata(&self.backup) {
+                Ok(m) if m.is_dir() => crate::dir_bytes(&self.backup),
+                Ok(m) => m.len(),
+                Err(_) => 0,
+            });
             // Not counted in the store's size.
             let _ = std::fs::remove_dir_all(&self.backup);
             let _ = std::fs::remove_file(&self.backup);
@@ -544,6 +563,8 @@ mod riders {
                 durable_snapshots,
                 backup_ms,
                 compact_ms,
+                backup_bytes,
+                ..Riders::default()
             })
         }
     }
