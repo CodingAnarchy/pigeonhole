@@ -17,7 +17,7 @@ fn missing_shm_dir_fails_at_open() {
     let m = err.message();
     assert!(m.contains(&shm.display().to_string()), "{m}");
     assert!(
-        m.contains("14 MiB (2 shards × 1 MiB memtable_budget"),
+        m.contains("16 MiB (2 shards × 1 MiB memtable_budget"),
         "{m}"
     );
 
@@ -26,7 +26,7 @@ fn missing_shm_dir_fails_at_open() {
     db.close().unwrap();
 }
 
-/// The tmpfs size the Linux test mounts: room for a 12 MiB region, not for a 74 MiB one.
+/// The tmpfs size the Linux test mounts: room for a 14 MiB region, not for a 76 MiB one.
 #[cfg(target_os = "linux")]
 const SMALL_TMPFS: &str = "size=32m";
 
@@ -148,7 +148,7 @@ fn small_shm_child(mount: &std::path::Path) {
     let m = err.message();
     assert!(m.contains(&mount.display().to_string()), "{m}");
     assert!(
-        m.contains("74 MiB (4 shards × 16 MiB memtable_budget"),
+        m.contains("76 MiB (4 shards × 16 MiB memtable_budget"),
         "{m}"
     );
 

@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use pigeonhole_format::shm::{
-    DIRECTORY_MAGIC, HEADER_LEN, READER_SLOT_LEN, ShmHeader, ViewRecord, WATERMARK_STRIDE,
-    directory, directory_name, header, reader_slot, region_name, watermark,
+    DIRECTORY_MAGIC, HEADER_LEN, READER_SLOT_LEN, ROW_EPOCH_LEN, ShmHeader, ViewRecord,
+    WATERMARK_STRIDE, directory, directory_name, header, reader_slot, region_name, watermark,
 };
 use pigeonhole_format::superblock::READER_LOCK_BASE;
 use pigeonhole_format::{ManifestVersion, Seqno, ShmLayoutVersion};
@@ -217,6 +217,21 @@ fn io_error(kind: ErrorKind, context: &'static str) -> Error {
 
 /// Writes the header, including the fields `ShmHeader` leaves to this crate, and idles every
 /// watermark. `state` stays `initializing`; the caller stores `ready` once everything is in.
+/// A seed for a new generation's row-epoch hash (D281): unpredictable from outside the
+/// process (`foldhash`'s per-process random state), different per generation.
+fn row_epoch_seed(generation: Generation, writer: ProcessId) -> u64 {
+    use std::hash::BuildHasher;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    pigeonhole_format::hash::FastBuildHasher::default().hash_one((
+        generation.0,
+        writer.pid,
+        writer.start_time,
+        now,
+    ))
+}
+
 fn init_region(
     region: &SharedRegion,
     h: &ShmHeader,
@@ -428,15 +443,20 @@ fn build(
             "shared-memory region name exceeds 30 bytes (31 with the leading `/`)",
         ));
     }
-    let h = ShmHeader::layout(
+    let mut h = ShmHeader::layout(
         db_id,
         config.shards,
         config.reader_slots,
         config.view_buffer_bytes,
         config.arena_bytes,
+        config.row_epoch_slots,
         identity.device,
         identity.inode,
     );
+    h.row_epoch_seed = row_epoch_seed(generation, vfs.current_process());
+    if config.row_epochs_maintained {
+        h.row_epoch_flags |= pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED;
+    }
     let region = match vfs.open_shared(&name, dir, h.region_len, SharedOpen::CreateNew) {
         Ok(r) => r,
         Err(e) if e.kind == ErrorKind::AlreadyExists => {
@@ -541,15 +561,26 @@ impl ShmRegion {
             device: 0,
             inode: 0,
         };
-        let h = ShmHeader::layout(
+        let mut h = ShmHeader::layout(
             db_id,
             config.shards,
             config.reader_slots,
             config.view_buffer_bytes,
             config.arena_bytes,
+            config.row_epoch_slots,
             identity.device,
             identity.inode,
         );
+        h.row_epoch_seed = row_epoch_seed(
+            Generation(1),
+            ProcessId {
+                pid: 0,
+                start_time: 0,
+            },
+        );
+        if config.row_epochs_maintained {
+            h.row_epoch_flags |= pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED;
+        }
         let len = usize::try_from(h.region_len).expect("region fits in memory");
         let region = SharedRegion::heap(len);
         let generation = Generation(1);
@@ -640,6 +671,21 @@ impl ShmRegion {
             Role::Reader,
             &self.inner.config,
         )
+    }
+
+    /// This generation's row-epoch table (D281): the write watermarks of every process's row
+    /// cache, with the seed of the hash that picks a row's slot. Both come from this region's
+    /// header, validated at attach, so a reader never pairs one generation's seed with
+    /// another's table.
+    pub fn row_epochs(&self) -> RowEpochTable {
+        let h = &self.inner.header;
+        RowEpochTable {
+            region: self.inner.region.clone(),
+            off: h.row_epochs_off as usize,
+            mask: u64::from(h.row_epoch_slots) - 1,
+            seed: h.row_epoch_seed,
+            maintained: h.row_epoch_flags & pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED != 0,
+        }
     }
 
     /// Current generation.
@@ -1340,7 +1386,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 4
+                expected: 5
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });
@@ -1348,5 +1394,69 @@ mod tests {
         let io = Error::from(pigeonhole_io::Error::new(ErrorKind::Locked, "lock"));
         assert!(std::error::Error::source(&io).is_some());
         assert!(std::error::Error::source(&Error::Stale).is_none());
+    }
+}
+
+/// A region's row-epoch table (D281, `FORMAT.md` §11): one atomic `u64` per slot, indexed by a
+/// hash of `(table, row)`. The writer raises a row's slot to a commit's seqno before the
+/// commit's write to the row can be visible; a row cache in any process stores and serves a
+/// row only under its slot's current value (D201's epoch protocol, across processes).
+///
+/// ```
+/// use pigeonhole_shm::{ShmConfig, ShmRegion};
+///
+/// let shm = ShmRegion::in_memory([1; 16], &ShmConfig::new(1));
+/// let epochs = shm.row_epochs();
+/// assert_eq!(epochs.epoch(42, 10), Some(0));
+/// epochs.note_write(42, 7);
+/// assert_eq!(epochs.epoch(42, 10), Some(7));
+/// assert_eq!(epochs.epoch(42, 6), None); // written, not visible at 6
+/// ```
+#[derive(Debug, Clone)]
+pub struct RowEpochTable {
+    region: SharedRegion,
+    off: usize,
+    mask: u64,
+    seed: u64,
+    maintained: bool,
+}
+
+impl RowEpochTable {
+    /// The seed of the hash that maps a `(table, row)` to its slot (random per generation).
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// How many slots the table has (a power of two).
+    pub fn slots(&self) -> usize {
+        self.mask as usize + 1
+    }
+
+    /// Whether the writer raises the slots (the header's `ROW_EPOCHS_MAINTAINED`): a reader
+    /// may cache rows only then.
+    pub fn maintained(&self) -> bool {
+        self.maintained
+    }
+
+    #[inline]
+    fn slot(&self, hash: u64) -> &AtomicU64 {
+        // In bounds: `decode` checked the table lies inside the region (perf287's M1).
+        self.region
+            .atomic_u64(self.off + (hash & self.mask) as usize * ROW_EPOCH_LEN)
+    }
+
+    /// The row hashing to `hash` is written at `seqno` (call before the write can be
+    /// visible). Writer only.
+    #[inline]
+    pub fn note_write(&self, hash: u64, seqno: u64) {
+        self.slot(hash).fetch_max(seqno, Ordering::Release);
+    }
+
+    /// The epoch of the row hashing to `hash` for a read at `seqno` (load it after taking
+    /// the read point): `None` when a write to it is applied but not visible at `seqno`.
+    #[inline]
+    pub fn epoch(&self, hash: u64, seqno: u64) -> Option<u64> {
+        let e = self.slot(hash).load(Ordering::Acquire);
+        (e <= seqno).then_some(e)
     }
 }

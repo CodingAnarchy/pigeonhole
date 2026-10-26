@@ -368,7 +368,17 @@ impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
                 && let Some(rc) = &inner.shared.row_cache
             {
                 return crate::row_cache::read_row_cached(
-                    rc, view, seqno, table, row, &families, spec, now, cache_only, sink,
+                    rc,
+                    view,
+                    seqno,
+                    table,
+                    row,
+                    &families,
+                    spec,
+                    now,
+                    cache_only,
+                    sink,
+                    || true,
                 );
             }
             read::read_row_into(

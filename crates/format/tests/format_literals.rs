@@ -326,15 +326,43 @@ fn wal_segment_header_and_fragment() {
     assert_eq!(Lsn::new(7, 0x8000).0, (7 << 32) | 0x8000);
 }
 
+/// §11.7 (D281, perf287's review of #947): a row's row-epoch slot is
+/// `xxh3_64_with_seed(seed + table, row) & (slots − 1)` (the seed plus the table id, wrapping)
+/// in every build of every process. Golden vectors: a dependency or compiler change that
+/// moves the hash fails here (a reader and a writer disagreeing on a slot would serve stale
+/// rows for ever).
+#[test]
+fn row_epoch_hash_vectors() {
+    use pigeonhole_format::shm::row_epoch_hash;
+    let long: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
+    assert_eq!(
+        row_epoch_hash(0x5eed_5eed, 7, b"com.example/a"),
+        0xc8e3_a972_e90b_591a
+    );
+    assert_eq!(row_epoch_hash(0, 0, b""), 0x2d06_8005_38d3_94c2);
+    // The seed wraps: u64::MAX + u32::MAX.
+    assert_eq!(
+        row_epoch_hash(u64::MAX, u32::MAX, &long),
+        0xc952_63d4_13d4_ab8a
+    );
+    for len in [0, 16, 17, 128, 129, 240, 241, 300] {
+        assert_eq!(
+            row_epoch_hash(3, 9, &long[..len]),
+            twox_hash::XxHash3_64::oneshot_with_seed(12, &long[..len]),
+            "row of {len} bytes"
+        );
+    }
+}
+
 #[test]
 fn shm_layout() {
-    let h = ShmHeader::layout([0xD3; 16], 2, 3, 100, 1, 0x77, 0x88);
+    let h = ShmHeader::layout([0xD3; 16], 2, 3, 100, 1, 64, 0x77, 0x88);
     let mut p = [0u8; 4096];
     h.encode(&mut p);
     assert_eq!(&p[0..8], b"PHDBSHM\0");
     assert_eq!(
         (le32(&p, 8), le32(&p, 12), le64(&p, 16)),
-        (4, 4096, h.region_len)
+        (5, 4096, h.region_len)
     );
     // §8.3: reader slot `i`'s liveness lock is byte 2^62 + i (layout version 3, #693).
     assert_eq!(pigeonhole_format::superblock::READER_LOCK_BASE, 1 << 62);
@@ -357,6 +385,19 @@ fn shm_layout() {
     );
     assert_eq!((le64(&p, 120), le64(&p, 128)), (2 << 20, 2 << 20));
     assert_eq!((le64(&p, 144), le64(&p, 152)), (0x77, 0x88));
+    // Layout version 5 (D281): the row-epoch table after the reader slots (64-aligned), its
+    // slot count, its hash (1 = xxh3), its seed (0 from `layout`; the builder sets it) and
+    // its flags (bit 0: the writer maintains the slots; 0 from `layout`).
+    assert_eq!(
+        (
+            le64(&p, 160),
+            le32(&p, 168),
+            le32(&p, 172),
+            le64(&p, 176),
+            le32(&p, 184)
+        ),
+        (4096 + 128 + 256 + 3 * 64, 64, 1, 0, 0)
+    );
     assert_eq!(h.region_len, 6 << 20);
 
     let v = ViewRecord {

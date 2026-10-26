@@ -74,7 +74,7 @@ use std::sync::atomic::AtomicBool;
 use pigeonhole_format::{Seqno, ShmLayoutVersion};
 use pigeonhole_io::{FileRef, ProcessId};
 
-pub use region::ShmRegion;
+pub use region::{RowEpochTable, ShmRegion};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -202,6 +202,9 @@ impl From<pigeonhole_format::Error> for Error {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Generation(pub u64);
 
+/// The most row-epoch slots a region takes (128 MiB of table).
+pub const MAX_ROW_EPOCH_SLOTS: u32 = 1 << 24;
+
 /// Region sizing and placement.
 ///
 /// ```
@@ -237,6 +240,14 @@ pub struct ShmConfig {
     /// writer restart (ICR 0002). Values below 1 are raised to 1: 0 means "none" in reader
     /// slots.
     pub first_seqno: Seqno,
+    /// Row-epoch slots (D281): the row caches' write watermarks, shared by the writer and
+    /// every reader process, 8 bytes each. A power of two (default 2^18, 2 MiB). Fewer
+    /// slots only make rows share them more (false row-cache misses, never a wrong row).
+    pub row_epoch_slots: u32,
+    /// Whether the writer raises the row-epoch slots (its row cache is on, D281): recorded in
+    /// the header (`ROW_EPOCHS_MAINTAINED`), and a reader process caches rows only when it
+    /// is set. Default `true`.
+    pub row_epochs_maintained: bool,
 }
 
 impl ShmConfig {
@@ -249,6 +260,8 @@ impl ShmConfig {
             view_buffer_bytes: 4 << 20,
             dir: None,
             first_seqno: 1,
+            row_epoch_slots: 1 << 18,
+            row_epochs_maintained: true,
         }
     }
 
@@ -264,6 +277,11 @@ impl ShmConfig {
         if self.view_buffer_bytes < 32 {
             return Err(Error::InvalidConfig(
                 "view_buffer_bytes must be at least 32 (one view header)",
+            ));
+        }
+        if !self.row_epoch_slots.is_power_of_two() || self.row_epoch_slots > MAX_ROW_EPOCH_SLOTS {
+            return Err(Error::InvalidConfig(
+                "row_epoch_slots must be a power of two, at most 2^24",
             ));
         }
         Ok(())

@@ -1132,6 +1132,14 @@ impl PigeonholeReader {
         Ok(self.engine().info()?.into())
     }
 
+    /// What this reader's row cache did since it last attached to a writer: hits, misses
+    /// and fills (D281). All zero when
+    /// [`ReaderOptions::row_cache`](crate::ReaderOptions::row_cache) is 0. A re-attach (the
+    /// writer restarted or recovered) empties the cache and starts the counts again.
+    pub fn row_cache_stats(&self) -> crate::RowCacheStats {
+        self.engine().row_cache_stats()
+    }
+
     /// Opens an existing table for reading.
     pub fn table(&self, name: &str) -> Result<ReadTable> {
         let info = self
@@ -1479,7 +1487,7 @@ struct ShmFootprint {
     shards: u64,
     budget: u64,
     /// The whole region: every arena (each rounded up to 2 MiB) plus the header, the two view
-    /// buffers and the reader slots, laid out as the engine lays it out.
+    /// buffers, the reader slots and the row-epoch table, laid out as the engine lays it out.
     region_len: u64,
     dir: Option<std::path::PathBuf>,
 }
@@ -1499,6 +1507,7 @@ impl ShmFootprint {
             o.reader_slots.max(1),
             config.view_buffer_bytes,
             o.memtable_budget,
+            pigeonhole_engine::row_epoch_slots(o.row_cache_bytes),
             0,
             0,
         );
@@ -1517,7 +1526,7 @@ impl ShmFootprint {
         }
         let arenas = self.shards.saturating_mul(self.budget);
         let need = format!(
-            "{} ({} shards × {} memtable_budget, plus {} for views and reader slots)",
+            "{} ({} shards × {} memtable_budget, plus {} for views, reader slots and row epochs)",
             bytes(self.region_len),
             self.shards,
             bytes(self.budget),
@@ -1735,7 +1744,7 @@ mod tests {
         assert_eq!(e.code(), ErrorCode::ShmUnavailable);
         let m = e.message();
         assert!(
-            m.contains("266 MiB (4 shards × 64 MiB memtable_budget, plus 10 MiB for views"),
+            m.contains("268 MiB (4 shards × 64 MiB memtable_budget, plus 12 MiB for views"),
             "{m}"
         );
         assert!(
@@ -1753,7 +1762,7 @@ mod tests {
         let m = e.message();
         assert!(
             // Each arena rounds up to 2 MiB.
-            m.contains("in /mnt/small: it needs 16 MiB (3 shards × 192 KiB memtable_budget"),
+            m.contains("in /mnt/small: it needs 18 MiB (3 shards × 192 KiB memtable_budget"),
             "{m}"
         );
     }

@@ -2,7 +2,8 @@
 //! rows, served to latest row reads without merging their sources.
 //!
 //! **The epoch protocol.** `lw` is a table of write watermarks indexed by a hash of
-//! `(table, row)`. A shard raises its slot to the commit's seqno (`fetch_max`, Release) when it
+//! `(table, row)`. It lives in the shared-memory region ([`RowEpochs`], D281), so a reader
+//! process's row cache runs the same protocol against the writer's watermarks. A shard raises its slot to the commit's seqno (`fetch_max`, Release) when it
 //! applies the commit's first write to the row, before the write is inserted into the memtable
 //! and so before it can become visible. A latest read takes its read point (view and seqno
 //! `S`) and then loads the slot, `e` (Acquire):
@@ -21,16 +22,15 @@
 //! entry holds only those, so they need no epoch change. TTL does: an entry stores the
 //! earliest moment one of its cells expires and misses from then on.
 
-use std::hash::BuildHasher;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use std::ops::Bound;
 use std::sync::Arc;
 
-use pigeonhole_cache::{RowCache, RowEpochs, RowHandle};
-use pigeonhole_format::hash::FastBuildHasher;
+use pigeonhole_cache::{RowCache, RowHandle};
 use pigeonhole_format::scan::QualifierFilter;
 use pigeonhole_format::{FamilyId, Seqno, TableId, Timestamp};
+use pigeonhole_shm::RowEpochTable;
 
 use crate::Result;
 use crate::read::{CellData, ReadSpec, RowSink, read_row_into};
@@ -40,11 +40,75 @@ use crate::snapshot::View;
 const BYTES_PER_SLOT: usize = 256;
 /// The fewest slots the watermark table has.
 const MIN_SLOTS: usize = 4096;
+/// The row-cache size the shared watermark table is sized for at least (D281): reader
+/// processes' default cache (64 MiB) gets its slots whatever the writer's own cache is.
+const MIN_TABLE_BYTES: usize = 64 << 20;
+
+/// Slots of the shared row-epoch table for a writer whose row cache is `bytes` (D281): one
+/// per 256 bytes of `max(bytes, 64 MiB)`, a power of two, at least 4,096 and at most the
+/// region's limit. What the engine passes the region at open (for footprint estimates).
+pub fn table_slots(bytes: usize) -> u32 {
+    let slots = (bytes.max(MIN_TABLE_BYTES) / BYTES_PER_SLOT)
+        .max(MIN_SLOTS)
+        .next_power_of_two();
+    u32::try_from(slots)
+        .unwrap_or(u32::MAX)
+        .min(pigeonhole_shm::MAX_ROW_EPOCH_SLOTS)
+}
+
+/// The region's write watermarks and the hash that picks a row's slot (D201, D281). A writer
+/// with its row cache on raises a row's slot for every write and says so in the header
+/// (`ROW_EPOCHS_MAINTAINED`); a reader caches only then (perf287: a reader caching against
+/// slots nobody raises would serve stale rows for ever). With the writer's cache off the
+/// commit path pays nothing (the owner's ruling, after callgrind).
+pub(crate) struct RowEpochs {
+    table: RowEpochTable,
+    seed: u64,
+}
+
+impl std::fmt::Debug for RowEpochs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowEpochs")
+            .field("slots", &self.table.slots())
+            .finish()
+    }
+}
+
+impl RowEpochs {
+    /// The epochs of `table`, hashed with its generation's seed.
+    pub fn new(table: RowEpochTable) -> Self {
+        let seed = table.seed();
+        Self { table, seed }
+    }
+
+    /// The row's slot hash: FORMAT §11.7's, the same in every build of every process.
+    #[inline]
+    fn hash(&self, table: TableId, row: &[u8]) -> u64 {
+        pigeonhole_format::shm::row_epoch_hash(self.seed, table.0, row)
+    }
+
+    /// Whether the writer raises the slots (a reader caches only then).
+    pub fn maintained(&self) -> bool {
+        self.table.maintained()
+    }
+
+    /// A commit at `seqno` writes `row` (before the write is inserted, so before it can be
+    /// visible).
+    #[inline]
+    pub fn note_write(&self, table: TableId, row: &[u8], seqno: Seqno) {
+        self.table.note_write(self.hash(table, row), seqno);
+    }
+
+    /// How many slots the table has.
+    pub fn slots(&self) -> usize {
+        self.table.slots()
+    }
+}
 
 /// The row cache, its write watermarks and its admission rules (writer process only).
 pub(crate) struct RowCaches {
     cache: RowCache,
-    lw: RowEpochs,
+    lw: Arc<RowEpochs>,
     /// Per slot, the tag of the family row filled last: a lookup whose tag differs misses
     /// without taking the cache's lock. A hint only: the cache itself verifies a hit.
     present: Box<[AtomicU64]>,
@@ -53,7 +117,6 @@ pub(crate) struct RowCaches {
     /// written refills on its next read.
     ghost: Box<[AtomicU64]>,
     mask: usize,
-    hasher: FastBuildHasher,
     /// Largest encoded family row filled.
     pub max_row: usize,
     /// `(table, family)` names the cache serves; empty means every family.
@@ -86,13 +149,17 @@ impl std::fmt::Debug for RowCaches {
 }
 
 impl RowCaches {
-    /// A row cache of `bytes`, or `None` when `bytes` is 0.
-    pub fn new(bytes: usize, max_row: usize, families: Vec<(String, String)>) -> Option<Self> {
+    /// A row cache of `bytes` over the watermarks `lw`, or `None` when `bytes` is 0.
+    pub fn new(
+        bytes: usize,
+        max_row: usize,
+        families: Vec<(String, String)>,
+        lw: Arc<RowEpochs>,
+    ) -> Option<Self> {
         if bytes == 0 {
             return None;
         }
-        let lw = RowEpochs::new((bytes / BYTES_PER_SLOT).max(MIN_SLOTS));
-        let slots = lw.len();
+        let slots = lw.slots();
         let table = || (0..slots).map(|_| AtomicU64::new(0)).collect();
         Some(Self {
             cache: RowCache::new(bytes),
@@ -100,7 +167,6 @@ impl RowCaches {
             present: table(),
             ghost: table(),
             mask: slots - 1,
-            hasher: FastBuildHasher::default(),
             max_row,
             families,
             hits: AtomicU64::new(0),
@@ -109,25 +175,13 @@ impl RowCaches {
         })
     }
 
-    #[inline]
-    fn hash(&self, table: TableId, row: &[u8]) -> u64 {
-        self.hasher.hash_one((table.0, row))
-    }
-
-    /// A commit at `seqno` writes `row` (before the write is inserted, so before it can be
-    /// visible).
-    #[inline]
-    pub fn note_write(&self, table: TableId, row: &[u8], seqno: Seqno) {
-        self.lw.note_write(self.hash(table, row), seqno);
-    }
-
     /// The row's epoch for a read at `seqno`, loaded after the read point was taken: `None`
     /// when a write to the row is applied but not visible at `seqno` (no lookup can hit, and
     /// no fill may store).
     #[inline]
     pub fn epoch(&self, table: TableId, row: &[u8], seqno: Seqno) -> Option<RowKey> {
-        let hash = self.hash(table, row);
-        let epoch = self.lw.epoch(hash, seqno)?;
+        let hash = self.lw.hash(table, row);
+        let epoch = self.lw.table.epoch(hash, seqno)?;
         Some(RowKey { hash, epoch })
     }
 
@@ -362,6 +416,7 @@ pub(crate) fn read_row_cached(
     now: Timestamp,
     cache_only: bool,
     sink: &mut impl RowSink,
+    still_valid: impl Fn() -> bool,
 ) -> Result<bool> {
     let uncached = |families: &[FamilyId], sink: &mut _| {
         read_row_into(
@@ -407,9 +462,13 @@ pub(crate) fn read_row_cached(
         }
         let mark = sink.cell_count();
         any |= uncached(family, sink)?;
+        // `still_valid`: a reader process's snapshot still protects what it read (checked
+        // after the read, seqlock style), so a row read from reclaimed memory is never
+        // stored (D281). Always true in the writer process.
         if store
             && let Some(mark) = mark
             && rc.admit(id, key)
+            && still_valid()
             && let Some(meta) = view.catalog.family(id)
         {
             match encode(sink, mark, meta.options.ttl_micros, rc.max_row) {
@@ -533,6 +592,13 @@ fn selects(filter: &QualifierFilter, qualifier: &[u8]) -> bool {
 mod tests {
     use super::*;
 
+    /// A 1 MiB row cache over a private region's watermarks.
+    fn caches(families: Vec<(String, String)>) -> RowCaches {
+        let shm = pigeonhole_shm::ShmRegion::in_memory([1; 16], &pigeonhole_shm::ShmConfig::new(1));
+        let lw = Arc::new(RowEpochs::new(shm.row_epochs()));
+        RowCaches::new(1 << 20, 4096, families, lw).unwrap()
+    }
+
     #[test]
     fn an_encoded_row_round_trips_and_keeps_the_earliest_expiry() {
         let mut buf = Vec::new();
@@ -555,9 +621,9 @@ mod tests {
 
     #[test]
     fn a_write_after_a_fill_makes_the_entry_miss() {
-        let rc = RowCaches::new(1 << 20, 4096, Vec::new()).unwrap();
+        let rc = caches(Vec::new());
         let (t, f) = (TableId(1), FamilyId(2));
-        rc.note_write(t, b"r", 5);
+        rc.lw.note_write(t, b"r", 5);
         // A read at 10 sees the write at 5 and fills under epoch 5.
         let k = rc.epoch(t, b"r", 10).unwrap();
         assert_eq!(k.epoch, 5);
@@ -569,21 +635,56 @@ mod tests {
             Lookup::Hit(_)
         ));
         // A write at 11, applied: a read at 10 may neither hit nor fill; a read at 11 misses.
-        rc.note_write(t, b"r", 11);
+        rc.lw.note_write(t, b"r", 11);
         assert!(rc.epoch(t, b"r", 10).is_none());
         let k = rc.epoch(t, b"r", 11).unwrap();
         assert!(matches!(rc.get(f, b"r", k, 0), Lookup::Miss));
     }
 
+    /// Rows sharing a watermark slot cost misses, never each other's rows (D201, D281): a
+    /// one-slot table.
+    #[test]
+    fn rows_sharing_a_slot_miss_and_never_cross() {
+        let mut config = pigeonhole_shm::ShmConfig::new(1);
+        config.row_epoch_slots = 1;
+        let shm = pigeonhole_shm::ShmRegion::in_memory([1; 16], &config);
+        let lw = Arc::new(RowEpochs::new(shm.row_epochs()));
+        let rc = RowCaches::new(1 << 20, 4096, Vec::new(), lw).unwrap();
+        let (t, f) = (TableId(1), FamilyId(2));
+        let fill = |row: &[u8], at: Seqno| {
+            let k = rc.epoch(t, row, at).unwrap();
+            let mut buf = Vec::new();
+            Encoded::start(&mut buf);
+            Encoded::push_cell(&mut buf, b"q", 1, row);
+            rc.insert(f, row, k, buf);
+        };
+        fill(b"a", 10);
+        fill(b"b", 10);
+        let hit = |row: &[u8], at: Seqno| match rc.get(f, row, rc.epoch(t, row, at).unwrap(), 0) {
+            Lookup::Hit(h) => Some(Encoded::cells(&h).next().unwrap().2.to_vec()),
+            _ => None,
+        };
+        // `b`, filled last, hits; `a` shares `b`'s presence hint too, so it may miss, but
+        // never answers with `b`'s row.
+        assert_eq!(hit(b"b", 10).as_deref(), Some(&b"b"[..]));
+        assert!(matches!(hit(b"a", 10).as_deref(), None | Some(b"a")));
+        fill(b"a", 10);
+        assert_eq!(hit(b"a", 10).as_deref(), Some(&b"a"[..]));
+        // A write to `b` raises the shared slot: `a` misses too, and nothing crosses.
+        rc.lw.note_write(t, b"b", 11);
+        assert_eq!(hit(b"a", 11), None);
+        assert_eq!(hit(b"b", 11), None);
+    }
+
     #[test]
     fn a_row_is_admitted_on_its_second_miss() {
-        let rc = RowCaches::new(1 << 20, 4096, Vec::new()).unwrap();
+        let rc = caches(Vec::new());
         let (t, f) = (TableId(1), FamilyId(2));
         let k = rc.epoch(t, b"r", 1).unwrap();
         assert!(!rc.admit(f, k));
         assert!(rc.admit(f, k));
         // After a write, the row has been seen: its next miss fills.
-        rc.note_write(t, b"r", 2);
+        rc.lw.note_write(t, b"r", 2);
         let k = rc.epoch(t, b"r", 2).unwrap();
         assert!(rc.admit(f, k));
         // Another family of the row has not.
@@ -592,7 +693,7 @@ mod tests {
 
     #[test]
     fn an_entry_misses_once_a_cell_expires() {
-        let rc = RowCaches::new(1 << 20, 4096, Vec::new()).unwrap();
+        let rc = caches(Vec::new());
         let (t, f) = (TableId(1), FamilyId(1));
         let k = rc.epoch(t, b"r", 0).unwrap();
         let mut buf = Vec::new();
@@ -607,12 +708,12 @@ mod tests {
 
     #[test]
     fn the_family_list_selects_by_name() {
-        let all = RowCaches::new(1 << 20, 4096, Vec::new()).unwrap();
+        let all = caches(Vec::new());
         assert!(all.serves("t", "f"));
-        let some = RowCaches::new(1 << 20, 4096, vec![("t".into(), "f".into())]).unwrap();
+        let some = caches(vec![("t".into(), "f".into())]);
         assert!(some.serves("t", "f"));
         assert!(!some.serves("t", "g"));
         assert!(!some.serves("u", "f"));
-        assert!(RowCaches::new(0, 4096, Vec::new()).is_none());
+        assert!(RowCaches::new(0, 4096, Vec::new(), Arc::clone(&all.lw)).is_none());
     }
 }

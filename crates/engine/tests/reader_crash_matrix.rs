@@ -13,6 +13,10 @@
 //!   process kill), and so does a reader's next snapshot.
 //! - **Reclamation:** after the last reader is killed and the writer's liveness interval
 //!   passes, no slot pins anything.
+//! - **Row cache (D281):** every commit also overwrites one hot row with its batch number,
+//!   and readers, with their row cache on, read it latest: a reader's reads of it never go
+//!   back and never pass the last batch committed, across writer kills and reopens (a new
+//!   generation each, its cache emptied at re-attach) and reader kills.
 //!
 //! `PIGEONHOLE_SEED`/`PIGEONHOLE_SEEDS` choose the seeds (default 1..=8); a failure names
 //! its seed and step.
@@ -23,8 +27,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use pigeonhole_engine::{
-    Engine, EngineOptions, Error, FamilyOptions, ScanSpec, Snapshot, TableInfo, ValueRef,
-    WriteBatch,
+    Engine, EngineOptions, Error, FamilyOptions, ReadSpec, RowData, ScanSpec, Snapshot, TableInfo,
+    ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::ProcessId;
@@ -63,6 +67,15 @@ fn options(vfs: &Arc<SimVfs>) -> EngineOptions {
     let mut o = common::options(Arc::clone(vfs), 1, 2 << 20);
     o.memtable_freeze_bytes = 256 << 10;
     o.tablet_changes = false;
+    // The writer's row cache on, so it raises the slots and readers cache (D281).
+    o.row_cache_bytes = 1 << 20;
+    o
+}
+
+/// A reader process's options: its row cache on (D281).
+fn reader_options(vfs: &Arc<SimVfs>) -> EngineOptions {
+    let mut o = options(vfs);
+    o.row_cache_bytes = 1 << 20;
     o
 }
 
@@ -77,8 +90,16 @@ fn row(batch: u64, j: u64) -> Vec<u8> {
     format!("b{batch:06}-{j}").into_bytes()
 }
 
-fn commit(db: &Engine, t: &TableInfo, batch: u64) -> Result<(), Error> {
+fn commit(db: &Engine, t: &TableInfo, h: &TableInfo, batch: u64) -> Result<(), Error> {
     let mut wb = WriteBatch::new();
+    wb.put(
+        h.id,
+        h.families[0].id,
+        b"hot",
+        b"q",
+        None,
+        ValueRef::Bytes(&batch.to_le_bytes()),
+    )?;
     for j in 0..BATCH {
         wb.put(
             t.id,
@@ -121,6 +142,24 @@ fn scan(db: &Engine, t: &TableInfo, snap: &Snapshot) -> Result<u64, Error> {
     Ok(seen / BATCH)
 }
 
+/// The hot row's batch number as a latest row read sees it (`None` before the first
+/// commit). Row reads fill the row cache (point gets only consult it, D201).
+fn hot(db: &Engine, h: &TableInfo) -> Result<Option<u64>, Error> {
+    let mut spec = ReadSpec::default();
+    spec.versions = 1;
+    let mut data = RowData::default();
+    if !db.read_row_latest_into(h.id, b"hot", &[h.families[0].id], &spec, &mut data)? {
+        return Ok(None);
+    }
+    let [cell] = &data.cells[..] else {
+        panic!("hot row cells {:?}", data.cells.len());
+    };
+    Ok(Some(match cell.data.value() {
+        ValueRef::Bytes(b) => u64::from_le_bytes(b.try_into().expect("8 bytes")),
+        other => panic!("hot row value {other:?}"),
+    }))
+}
+
 /// A reader failure must be typed: expired or busy. Returns 1, for the count.
 fn typed(e: &Error, what: &str) -> u32 {
     assert!(
@@ -135,6 +174,8 @@ struct Reader {
     db: Arc<Engine>,
     /// A held snapshot and the batch count it saw.
     held: Option<(Snapshot, u64)>,
+    /// The newest hot-row batch its latest reads saw.
+    hot: Option<u64>,
 }
 
 fn run(seed: u64) {
@@ -146,6 +187,9 @@ fn run(seed: u64) {
     let mut t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
+    let mut h = db
+        .create_table("h", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
     let mut committed = 0u64;
     let mut readers: Vec<Reader> = Vec::new();
     let mut next_pid = 100u32;
@@ -153,6 +197,7 @@ fn run(seed: u64) {
     // writer kills.
     let (mut scans, mut expired, mut reader_kills, mut writer_kills) = (0u32, 0u32, 0u32, 0u32);
     let mut no_slot = 0u32;
+    let mut hot_reads = 0u32;
 
     for step in 0..STEPS {
         let at = format!("seed {seed} step {step}");
@@ -160,7 +205,7 @@ fn run(seed: u64) {
         match rng.below(100) {
             0..=44 => {
                 vfs.enter_process(writer);
-                commit(&db, &t, committed).unwrap_or_else(|e| panic!("{at}: commit: {e:?}"));
+                commit(&db, &t, &h, committed).unwrap_or_else(|e| panic!("{at}: commit: {e:?}"));
                 committed += 1;
             }
             45..=49 => {
@@ -179,7 +224,7 @@ fn run(seed: u64) {
                 };
                 next_pid += 1;
                 vfs.enter_process(process);
-                let mut opened = Engine::open_reader(Path::new(DB), options(&vfs));
+                let mut opened = Engine::open_reader(Path::new(DB), reader_options(&vfs));
                 if matches!(opened, Err(Error::NoReaderSlot)) {
                     // Killed readers hold their slots until the writer's next reclamation (a
                     // flush, a compaction or a room stall past the interval): with every slot
@@ -189,11 +234,12 @@ fn run(seed: u64) {
                     no_slot += 1;
                     vfs.advance(PAST_INTERVAL);
                     vfs.enter_process(writer);
-                    commit(&db, &t, committed).unwrap_or_else(|e| panic!("{at}: commit: {e:?}"));
+                    commit(&db, &t, &h, committed)
+                        .unwrap_or_else(|e| panic!("{at}: commit: {e:?}"));
                     committed += 1;
                     db.flush().unwrap_or_else(|e| panic!("{at}: flush: {e:?}"));
                     vfs.enter_process(process);
-                    opened = Engine::open_reader(Path::new(DB), options(&vfs));
+                    opened = Engine::open_reader(Path::new(DB), reader_options(&vfs));
                     assert!(
                         !matches!(opened, Err(Error::NoReaderSlot)),
                         "{at}: killed readers' slots were not reclaimed after a flush"
@@ -204,6 +250,7 @@ fn run(seed: u64) {
                         process,
                         db,
                         held: None,
+                        hot: None,
                     }),
                     Err(e) => expired += typed(&e, &format!("{at}: open_reader")),
                 }
@@ -213,7 +260,7 @@ fn run(seed: u64) {
                 let r = &mut readers[i];
                 vfs.enter_process(r.process);
                 let rt = r.db.table("t").expect("the reader sees the table");
-                match rng.below(3) {
+                match rng.below(4) {
                     // A new snapshot: everything committed so far, whole.
                     0 => match r.db.snapshot() {
                         Ok(snap) => match scan(&r.db, &rt, &snap) {
@@ -235,6 +282,39 @@ fn run(seed: u64) {
                                     scans += 1;
                                 }
                                 Err(e) => expired += typed(&e, &format!("{at}: rescan")),
+                            }
+                        }
+                    }
+                    // The hot row, latest, three times (a miss, a fill, a hit): never older than the
+                    // last read, never past the last commit.
+                    2 => {
+                        let rh = r.db.table("h").expect("the reader sees the table");
+                        // A fresh snapshot's batches first: a latest read after it sees at
+                        // least its newest batch (a stale cached copy would not).
+                        let floor = match r.db.snapshot().and_then(|snap| scan(&r.db, &rt, &snap)) {
+                            Ok(n) => n.checked_sub(1),
+                            Err(e) => {
+                                expired += typed(&e, &format!("{at}: hot floor"));
+                                None
+                            }
+                        };
+                        r.hot = r.hot.max(floor);
+                        for _ in 0..3 {
+                            match hot(&r.db, &rh) {
+                                Ok(seen) => {
+                                    assert!(
+                                        seen >= r.hot,
+                                        "{at}: hot row went back from {:?} to {seen:?}",
+                                        r.hot
+                                    );
+                                    assert!(
+                                        seen.is_none_or(|b| b < committed),
+                                        "{at}: hot row {seen:?} past {committed} batches"
+                                    );
+                                    r.hot = seen;
+                                    hot_reads += 1;
+                                }
+                                Err(e) => expired += typed(&e, &format!("{at}: hot row")),
                             }
                         }
                     }
@@ -261,6 +341,7 @@ fn run(seed: u64) {
                 db = Engine::open(Path::new(DB), options(&vfs))
                     .unwrap_or_else(|e| panic!("{at}: reopen: {e:?}"));
                 t = db.table("t").unwrap();
+                h = db.table("h").unwrap();
                 let snap = db.snapshot().unwrap();
                 let n = scan(&db, &t, &snap).unwrap_or_else(|e| panic!("{at}: {e:?}"));
                 assert_eq!(n, committed, "{at}: the reopened writer lost batches");
@@ -269,7 +350,15 @@ fn run(seed: u64) {
         }
     }
 
-    // Every surviving reader's next snapshot sees every batch.
+    // Every surviving reader's next snapshot sees every batch, and its row cache served
+    // some of the hot-row reads.
+    let hits: u64 = readers
+        .iter()
+        .map(|r| {
+            vfs.enter_process(r.process);
+            r.db.row_cache_stats().hits
+        })
+        .sum();
     for r in &mut readers {
         vfs.enter_process(r.process);
         let rt = r.db.table("t").unwrap();
@@ -286,7 +375,7 @@ fn run(seed: u64) {
     }
     vfs.enter_process(writer_process(incarnation));
     vfs.advance(PAST_INTERVAL);
-    commit(&db, &t, committed).unwrap();
+    commit(&db, &t, &h, committed).unwrap();
     db.flush().unwrap();
     assert_eq!(
         db.reader_pin_and_view().0,
@@ -294,10 +383,12 @@ fn run(seed: u64) {
         "seed {seed}: a dead reader still pins"
     );
     drop(t);
+    drop(h);
     db.close().unwrap();
     eprintln!(
         "seed {seed}: {committed} batches, {scans} reader scans, {expired} expired or busy, \
-         {reader_kills} reader kills, {writer_kills} writer kills, {no_slot} refused for slots"
+         {reader_kills} reader kills, {writer_kills} writer kills, {no_slot} refused for slots, \
+         {hot_reads} hot-row reads ({hits} row cache hits by the surviving readers)"
     );
 }
 

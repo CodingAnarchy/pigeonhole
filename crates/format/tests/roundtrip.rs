@@ -262,8 +262,9 @@ proptest! {
     }
 
     #[test]
-    fn shm_header(db_id in any::<[u8; 16]>(), shards in 1u32..64, slots in 0u32..512, view in 0u32..(8 << 20), arena in 1u64..(256 << 20), dev in any::<u64>(), ino in any::<u64>()) {
-        let h = ShmHeader::layout(db_id, shards, slots, view, arena, dev, ino);
+    fn shm_header(db_id in any::<[u8; 16]>(), shards in 1u32..64, slots in 0u32..512, view in 0u32..(8 << 20), arena in 1u64..(256 << 20), epochs in 0u32..20, seed in any::<u64>(), dev in any::<u64>(), ino in any::<u64>()) {
+        let mut h = ShmHeader::layout(db_id, shards, slots, view, arena, 1 << epochs, dev, ino);
+        h.row_epoch_seed = seed;
         prop_assert!(h.arena_len >= arena && h.region_len == h.arenas_off + h.arena_len * u64::from(shards));
         let mut page = [0xEEu8; 4096];
         h.encode(&mut page);
@@ -362,13 +363,13 @@ fn versions_are_checked() {
     }
     let mut page = [0u8; 4096];
     let h = ShmHeader {
-        layout_version: pigeonhole_format::ShmLayoutVersion(5),
-        ..ShmHeader::layout([0; 16], 1, 1, 64, 1, 0, 0)
+        layout_version: pigeonhole_format::ShmLayoutVersion(6),
+        ..ShmHeader::layout([0; 16], 1, 1, 64, 1, 1, 0, 0)
     };
     h.encode(&mut page);
     assert!(matches!(
         ShmHeader::decode(&page),
-        Err(pigeonhole_format::Error::UnsupportedVersion { found: 5, .. })
+        Err(pigeonhole_format::Error::UnsupportedVersion { found: 6, .. })
     ));
     // A newer superblock is reported as such even if the other copy is garbage.
     let sb = Superblock {

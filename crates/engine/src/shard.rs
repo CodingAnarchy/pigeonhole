@@ -438,6 +438,10 @@ pub(crate) struct Shared {
     pub cache: Arc<BlockCache>,
     /// The row cache (D201): writer process only, `None` when off.
     pub row_cache: Option<crate::row_cache::RowCaches>,
+    /// The region's row-epoch table (D281): raised for every written row, whether or not
+    /// `row_cache` is on, so reader processes' row caches can trust it. `None` in a reader
+    /// process (its cache is per generation, `ReaderState`).
+    pub row_epochs: Option<Arc<crate::row_cache::RowEpochs>>,
     pub sst_ids: Arc<AtomicU64>,
     pub blob_ids: Arc<AtomicU32>,
     pub live_views: Arc<LiveViews>,
@@ -5146,11 +5150,12 @@ impl ShardState {
                     if track {
                         self.note_write(id, m.row);
                     }
-                    // Before the write is inserted, so before it can be visible (D201).
-                    if let Some(rc) = &self.shared.row_cache
+                    // Before the write is inserted, so before it can be visible (D201), whatever
+                    // the write's kind: every cache in every process keys on it (D281).
+                    if let Some(epochs) = &self.shared.row_epochs
                         && !self.replaying
                     {
-                        rc.note_write(m.table, m.row, seqno);
+                        epochs.note_write(m.table, m.row, seqno);
                     }
                     id
                 }
