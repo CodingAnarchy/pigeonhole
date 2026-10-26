@@ -14,7 +14,7 @@ use std::task::{Context, Poll, Waker};
 
 use common::{Config, final_dump, run, tablet_changes};
 use pigeonhole_engine::{
-    CompactionStyle, Engine, EngineOptions, EngineShard, FamilyOptions, PendingMaintenance,
+    CompactionStyle, Engine, EngineOptions, EngineShard, FamilyOptions, Fault, PendingMaintenance,
     ReadSpec, ScanSpec, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
@@ -4061,11 +4061,16 @@ fn stamped_in_an_earlier_group(moving_clock: bool, budget: u64) -> (usize, u64) 
         .engine
         .submit(wb, Some(Durability::Buffered))
         .expect("submit");
-    // `high` reserves B's seqno, picks its timestamp and queues the PREPARE behind the
-    // 1,024 singles; `low`'s first turn stamps only those.
+    // `high` reserves B's seqno and picks its timestamp; `low`'s next turn stamps only the
+    // 1,024 singles, and B's PREPARE reaches it after that turn. The PREPARE is held through
+    // the turn (which runs no task slice, so no flush frees room first) rather than left to
+    // queue order.
+    db.engine.inject(Fault::HoldPrepares, true);
     let now = db.clock.monotonic_nanos();
     db.shards[usize::from(high)].run_once(now + 1_000);
-    db.shards[usize::from(low)].run_once(now + 1_000);
+    db.engine.inject(Fault::HoldPrepares, false);
+    db.shards[usize::from(low)].run_once(0);
+    assert_eq!(db.engine.release_held_prepares(), 1, "B's PREPARE was held");
     let mut cx = Context::from_waker(Waker::noop());
     let mut seqno = |pc: &mut pigeonhole_engine::PendingCommit, db: &mut Db| {
         for _ in 0..100_000 {
@@ -7473,7 +7478,18 @@ fn a_younger_reading_commit_is_not_held_by_a_fence() {
     }
     let reader = overlap_txn(&db, &[b"b"], &[b"n", b"a"]);
     let mut reader = reader.submit(Some(Durability::Buffered)).unwrap();
+    // The reader's PREPARE reaches shard 0 after the blind commits' shares are admitted
+    // there, so it is the one refused and fences `a`: held through shard 0's first turn,
+    // whatever order the messages are taken in.
+    db.engine.inject(Fault::HoldPrepares, true);
     turn(&mut db, 1);
+    db.engine.inject(Fault::HoldPrepares, false);
+    turn(&mut db, 0);
+    assert_eq!(
+        db.engine.release_held_prepares(),
+        1,
+        "the reader's PREPARE was held"
+    );
     turn(&mut db, 0);
     // Shard 1 stands still: the reader's retry cannot run, and its fence on `a` stands. The
     // chain on `a` drains, and a younger reading commit on `a` goes in and commits.
@@ -7510,8 +7526,14 @@ fn a_fence_ends_with_its_readers_last_attempt_even_with_nothing_waiting() {
     let mut b1 = b1.submit(Some(Durability::Buffered)).unwrap();
     let r = overlap_txn(&db, &[b"b"], &[b"y", b"a"]);
     let mut r = r.submit(Some(Durability::Buffered)).unwrap();
-    // `high` gives R the oldest id; `low` admits B1's share, then refuses R's PREPARE.
+    // `high` gives R the oldest id; `low` admits B1's share, then refuses R's PREPARE. R's
+    // PREPARE is held through `low`'s first turn, so B1's share is admitted first whatever
+    // order the messages are taken in.
+    db.engine.inject(Fault::HoldPrepares, true);
     turn(&mut db, high);
+    db.engine.inject(Fault::HoldPrepares, false);
+    turn(&mut db, low);
+    assert_eq!(db.engine.release_held_prepares(), 1, "R's PREPARE was held");
     turn(&mut db, low);
     assert!(
         db.engine.metrics().cross_shard.refused_pending_overlap > 0,
