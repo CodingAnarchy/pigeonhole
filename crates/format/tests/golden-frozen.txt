@@ -30,3 +30,4 @@ wal_record_decision.bin 35 c0526b54ea8382d7
 wal_record_prepare.bin 149 bbccda37d8de0e5a
 wal_segment_header.bin 128 3b4ab3ade47a4bc0
 wal_segment_header_v3.bin 60 29f5fac990ee2963
+sealed_block_zstd.bin 205 6aba6fbd119aed6b

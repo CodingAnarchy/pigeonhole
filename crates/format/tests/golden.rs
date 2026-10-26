@@ -667,6 +667,30 @@ fn golden(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
+/// A zstd-sealed data block written by zstd 0.13 (libzstd 1.5.7): a build on a newer zstd
+/// must still read it. Decode only: zstd's encoder may produce other bytes for the same
+/// input across versions, and those frames are fine as long as every version decodes them.
+#[test]
+fn a_zstd_block_from_an_older_zstd_still_decodes() {
+    let data = golden("data_block.bin");
+    let plain: Vec<u8> = data.iter().copied().cycle().take(data.len() * 8).collect();
+    let frozen = golden("sealed_block_zstd.bin");
+    let (trailer, payload) = verify(&frozen).unwrap();
+    assert_eq!(trailer.kind, BlockKind::Data);
+    assert_eq!(trailer.compression, Compression::Zstd);
+    assert_eq!(trailer.uncompressed_len as usize, plain.len());
+    let mut back = vec![0; plain.len()];
+    pigeonhole_format::compress::decompress(Compression::Zstd, payload, &mut back).unwrap();
+    assert_eq!(back, plain);
+    // What this build writes for the same block decodes to it too.
+    let mut sealed = Vec::new();
+    seal(BlockKind::Data, Compression::Zstd, &plain, &mut sealed).unwrap();
+    let (_, payload) = verify(&sealed).unwrap();
+    let mut back = vec![0; plain.len()];
+    pigeonhole_format::compress::decompress(Compression::Zstd, payload, &mut back).unwrap();
+    assert_eq!(back, plain);
+}
+
 /// Format 3's version-stamped structures (the golden files before format 4, D269), kept as
 /// they were: a format 4 build reads each, with no features, and writes them back byte for
 /// byte at version 3. 1.x reads every format from 1 (`MIN_READABLE`).
