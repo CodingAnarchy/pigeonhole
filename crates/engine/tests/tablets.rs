@@ -3817,8 +3817,23 @@ fn moved_retry_against_queued_singles(retry_first: bool) {
         })
         .collect();
     let now = db.clock.monotonic_nanos();
-    db.shards[0].run_once(now + 1_000);
-    db.shards[2].run_once(now + 1_000);
+    if retry_first {
+        db.shards[0].run_once(now + 1_000);
+        db.shards[2].run_once(now + 1_000);
+    } else {
+        // The retry's PREPARE rides the priority lane (D285), so queued with the singles it
+        // would be taken first: it is held through 2's turn (which runs no task slice) and
+        // reaches 2 after the singles' group.
+        db.engine.inject(Fault::HoldPrepares, true);
+        db.shards[0].run_once(now + 1_000);
+        db.engine.inject(Fault::HoldPrepares, false);
+        db.shards[2].run_once(0);
+        assert_eq!(
+            db.engine.release_held_prepares(),
+            1,
+            "the retry's PREPARE was held"
+        );
+    }
     step_until_done(&mut db, &mut c);
     for s in &mut singles {
         step_until_done(&mut db, s);
