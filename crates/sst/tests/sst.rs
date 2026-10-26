@@ -652,6 +652,44 @@ fn readahead_fetches_ahead_and_the_scan_uses_what_it_fetched() {
 }
 
 #[test]
+fn readahead_ramps_up_after_a_seek_so_a_short_scan_fetches_nothing() {
+    // #712: a scan that reads a few rows past its seek fetches nothing ahead; a long one
+    // fetches 2, 4, 8, then 16 blocks a batch, and the next seek starts the ramp again.
+    let (_vfs, r, want) = many_blocks(24);
+    let mut it = r.iter(ScanFilter::all(), readahead(16, true, false));
+    let short = |it: &mut pigeonhole_sst::SstIter, start: usize| {
+        let ((), counts) = pigeonhole_sst::counting_readahead(|| {
+            it.seek(&want[start].0).unwrap();
+            // Under 256-byte blocks of about five entries, five entries span at most two.
+            for w in &want[start..start + 5] {
+                assert_eq!((it.key(), it.value()), (&w.0[..], &w.1[..]));
+                it.next().unwrap();
+            }
+        });
+        assert_eq!(counts.issued, 0, "a short scan from {start}: {counts:?}");
+    };
+    short(&mut it, 400);
+    // On to the end, one step at a time: the batches in the order the scan submitted them.
+    let mut batches = Vec::new();
+    let mut at = 405;
+    while it.valid() {
+        assert_eq!((it.key(), it.value()), (&want[at].0[..], &want[at].1[..]));
+        let (res, counts) = pigeonhole_sst::counting_readahead(|| it.next());
+        res.unwrap();
+        if counts.issued > 0 {
+            batches.push(counts.issued);
+        }
+        at += 1;
+    }
+    assert_eq!(at, want.len());
+    assert!(batches.len() >= 4, "{batches:?}");
+    assert_eq!(batches[..4], [2, 4, 8, 16], "{batches:?}");
+    assert!(batches.iter().all(|&b| b <= 16), "{batches:?}");
+    // A seek resets the ramp: a short scan elsewhere fetches nothing again.
+    short(&mut it, 100);
+}
+
+#[test]
 fn a_cache_only_cursor_never_fetches_ahead() {
     let (_vfs, r, _) = many_blocks(22);
     let mut o = readahead(4, true, false);
