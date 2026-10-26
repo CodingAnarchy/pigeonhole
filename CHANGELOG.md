@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-10-26
+One io_uring fix from `main` (#976) and a dependency update (#979). **Upgrade recommended** for every 0.3.x user on Linux, where io_uring is the default backend: when the kernel refused an io_uring submission for now (`EAGAIN` under memory pressure), the backend could free or reuse a buffer the kernel still read into or wrote from. zstd moves to 0.14.3, clearing four RustSec advisories (none reachable from Pigeonhole's use of it). The file format and the shared-memory layout are unchanged; files written by 0.3.0 through 0.3.2 open as before, and 0.3.2 opens files written by 0.3.3.
+
 ### Security
 - zstd is now 0.14.3, with zstd-safe 8.2 and zstd-sys 2.1.2, up from 0.13.3. The upgrade clears RUSTSEC-2026-0391, 0398, 0403 and 0410. Pigeonhole called only zstd's one-shot `bulk` API and never the stream encoders or decoders those advisories describe. The bundled libzstd is still 1.5.7, so compressed blocks are byte-identical. Files written by earlier releases read as before, and a test now decodes a zstd-sealed block written by 0.13.
 
@@ -356,7 +359,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...v0.3.0
