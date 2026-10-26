@@ -120,9 +120,12 @@ OPTIONS:
                            reads a cold row beside each of its rows and writes the rows,
                            so commits that read and blind writes meet on the same hot
                            rows (D267's mixed row)
+    --engine-owned         app-owned: the same workload (stream, batches, 16 in flight per
+                           shard's thread) on engine-owned shards, its comparator (D280)
     --riders               Pigeonhole: snapshot and durable-snapshot readers, then a
                            durable backup and a compaction, beside the measured
-                           phase (D247, reported in the record's riders)
+                           phase (D247, reported in the record's riders); RocksDB: a
+                           checkpoint, then a BackupEngine backup (D280, #715)
     --reader-processes N   Pigeonhole: N reader processes (open_reader) doing ycsb-c
                            row reads beside the measured phase (#683, D247 item K,
                            reported in the record's reader_processes) [default: 0]
@@ -185,6 +188,8 @@ struct Args {
     path: Option<PathBuf>,
     /// `app-owned`: every other cross-shard batch reads its rows first (D267's mixed row).
     mixed: bool,
+    /// `app-owned`: the same workload on engine-owned shards (D280's comparator).
+    engine_owned: bool,
     async_in_flight: Option<usize>,
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
@@ -253,6 +258,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--no-packing" => a.no_packing = true,
             "--riders" => a.riders = true,
             "--mixed" => a.mixed = true,
+            "--engine-owned" => a.engine_owned = true,
             "--async" => a.async_in_flight = Some(parse(&arg, it.next())?),
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
@@ -401,6 +407,7 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
             pigeonhole_bench::RocksDbRunner::default()
                 .sync(a.sync)
                 .load_buffered(a.durability.is_some())
+                .riders(a.riders)
                 .memory(memory(a)),
         )),
         #[cfg(not(feature = "rocksdb"))]
@@ -536,8 +543,11 @@ fn bench(a: &Args) -> Result<Suite, String> {
             let c = config(a, WorkloadKind::SkewedMultiShard)?;
             let r = pigeonhole(a, Some(n))
                 .cross_batches(true)
-                .cross_readers(a.mixed);
-            let run = one_inline(a, &root, &mut seq, &r, &c, true)?;
+                .cross_readers(a.mixed)
+                .inline_engine_owned(a.engine_owned);
+            // Engine-owned, the engine pins its own shard threads (D235); the issuing threads
+            // are left unpinned so they don't take the shards' CPUs.
+            let run = one_inline(a, &root, &mut seq, &r, &c, !a.engine_owned)?;
             suite.results.push(run);
             return Ok(());
         }
@@ -867,6 +877,41 @@ mod tests {
         assert!(r.operations >= 400 && r.throughput > 0.0);
         // Whether the batches crossed shards depends on the placement the balancer reached;
         // the batch composition has its own test (inline.rs).
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn app_owned_engine_owned_runs_the_same_workload_on_engine_owned_shards() {
+        // D280 (#816, #710): the comparator, the same stream and batches with the engine's
+        // own shard threads running the commits; nothing drives a shard, so a lost wake would
+        // hang it rather than pass.
+        let dir =
+            std::env::temp_dir().join(format!("phdb-bench-appowned-eo-{}", std::process::id()));
+        let a = args(&format!(
+            "app-owned --engine-owned --scale smoke --ops 400 --shards 2 --min-secs 0.2 --write-buffer 16777216 --dir {}",
+            dir.display()
+        ));
+        let suite = bench(&a).unwrap();
+        assert_eq!(suite.results.len(), 1);
+        let r = &suite.results[0];
+        assert!(
+            r.store_config
+                .contains(" engine-owned in-flight=16 unpinned"),
+            "{}",
+            r.store_config
+        );
+        assert!(
+            r.store_config.contains(" cross-batches=20%"),
+            "{}",
+            r.store_config
+        );
+        assert!(r.operations >= 400 && r.throughput > 0.0);
+        let batches = r.detail.by_type.iter().find(|t| t.op == "batch-commit");
+        assert!(
+            batches.is_some_and(|t| t.stats.count > 0),
+            "{:?}",
+            r.detail.by_type
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

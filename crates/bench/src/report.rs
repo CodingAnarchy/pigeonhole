@@ -474,6 +474,19 @@ pub struct Riders {
     /// Milliseconds a full compaction took, started right after the backup and run to the end
     /// (the riders wait for it); `None` when the backup never started.
     pub compact_ms: Option<f64>,
+    /// Bytes of the backup (Pigeonhole) or of the checkpoint (RocksDB) the rider took, so a
+    /// comparison is at the same size (D280, #715); `None` when none was taken.
+    #[serde(default)]
+    pub backup_bytes: Option<u64>,
+    /// RocksDB: milliseconds a `Checkpoint` took, started 2 s into the measured phase (D280,
+    /// #715). On one file system its table files are hard links, so the checkpoint copies
+    /// only the WAL and the metadata; `None` elsewhere.
+    #[serde(default)]
+    pub checkpoint_ms: Option<f64>,
+    /// RocksDB: milliseconds a `BackupEngine` backup took right after the checkpoint (every
+    /// file copied, as Pigeonhole's backup copies its file); `None` elsewhere.
+    #[serde(default)]
+    pub copy_backup_ms: Option<f64>,
 }
 
 /// Reader processes beside a measured phase (#683, D247 item K, reported): separate

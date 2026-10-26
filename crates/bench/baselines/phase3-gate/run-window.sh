@@ -533,9 +533,17 @@ step_contended() {
             --json "$results/contended-$level-app-owned.json" \
             --markdown "$results/contended-$level-app-owned.md"
         rm -r "$data/bench"
-        # Reported riders on ycsb-a (Pigeonhole only): snapshot and durable-snapshot readers,
-        # a durable backup and a compaction beside the measured phase.
-        "$bench" ycsb-a --engine pigeonhole --scale "$scale" --threads 16 --riders \
+        # D280 (#816, #710): the same workload on engine-owned shards, its comparator.
+        "$bench" app-owned --engine-owned --scale "$scale" --durability "$level" \
+            --min-secs "$contended_report_secs" --max-secs "$contended_report_max_secs" \
+            --dir "$data/bench" \
+            --json "$results/contended-$level-app-owned-engine.json" \
+            --markdown "$results/contended-$level-app-owned-engine.md"
+        rm -r "$data/bench"
+        # Reported riders on ycsb-a: Pigeonhole's snapshot and durable-snapshot readers, a
+        # durable backup and a compaction beside the measured phase.
+        # D280 (#715): RocksDB beside it, with a checkpoint and a BackupEngine backup.
+        "$bench" ycsb-a --engine pigeonhole,rocksdb --scale "$scale" --threads 16 --riders \
             --durability "$level" --ops "$contended_ops" --min-secs "$contended_report_secs" \
             --max-secs "$contended_report_max_secs" \
             --dir "$data/bench" --json "$results/contended-$level-ycsb-a-riders.json" \
