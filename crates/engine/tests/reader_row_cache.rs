@@ -527,3 +527,63 @@ fn a_reader_process_async_reads_use_its_row_cache() {
     vfs.enter_process(writer_process);
     w.close();
 }
+
+/// #946 with a writer restart (perf287's optional test on #963): an entry the reader's async
+/// row read filled against one writer generation never serves the next generation's reads,
+/// and the restarted writer's writes reach the async reads.
+#[test]
+fn a_reader_process_async_reads_never_outlive_their_generation() {
+    let vfs = SimVfs::new(947);
+    let writer_process = pigeonhole_io::Vfs::current_process(&*vfs);
+    let mut w = Writer::open(&vfs);
+    let f = w.t.families[0].id;
+    w.commit(|wb, t| {
+        wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"before"))
+            .unwrap();
+    });
+    vfs.enter_process(READER);
+    let reader = open_reader(&vfs);
+    let t = Arc::clone(&w.t);
+    for _ in 0..3 {
+        latest_async(&reader, &t, b"r");
+    }
+    assert!(
+        reader.row_cache_stats().hits > 0,
+        "the async read cached the row"
+    );
+
+    vfs.enter_process(writer_process);
+    w.commit(|wb, t| {
+        wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"after"))
+            .unwrap();
+    });
+    w.close();
+    let mut w = Writer::open(&vfs);
+    let want = latest(&w.db, &t, b"r");
+    assert_eq!(want[0].2, b"after");
+    vfs.enter_process(READER);
+    for _ in 0..3 {
+        assert_eq!(
+            latest_async(&reader, &t, b"r"),
+            want,
+            "a stale row across the reopen"
+        );
+    }
+    vfs.enter_process(writer_process);
+    w.commit(|wb, t| {
+        wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"later"))
+            .unwrap();
+    });
+    let want = latest(&w.db, &t, b"r");
+    vfs.enter_process(READER);
+    for _ in 0..3 {
+        assert_eq!(
+            latest_async(&reader, &t, b"r"),
+            want,
+            "a later write missed"
+        );
+    }
+    drop(reader);
+    vfs.enter_process(writer_process);
+    w.close();
+}
