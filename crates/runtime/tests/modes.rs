@@ -499,7 +499,9 @@ fn foreground_latency_bounded_sim(mode: Mode) {
 /// milliseconds (a p99 of 69 ms on macOS CI against a plain thread's 5 ms), which is the
 /// machine's doing, not the shard holding a message behind its background task. The slice
 /// count is what the runtime controls: it checks its queue between slices, so a message
-/// waits for at most the one in progress, however long the OS stretches it.
+/// waits for at most the one in progress, however long the OS stretches it: it drains after
+/// every slice, and a sent message is visible to the next drain (`std::sync::mpsc` claims its
+/// slot before writing, and a receive that sees the claim waits for the write).
 fn foreground_latency_bounded_real(mode: Mode) {
     let vfs: VfsRef = PreadVfs::new(1);
     let mut cfg = config(1, Arc::clone(&vfs));
@@ -516,12 +518,17 @@ fn foreground_latency_bounded_real(mode: Mode) {
     let mut waited = Vec::new();
     for _ in 0..200 {
         let (n, w) = completion();
-        let before = slices.load(Ordering::SeqCst);
         h.submitter(0)
             .submit(Msg::SliceProbe(Arc::clone(&slices), n))
             .unwrap();
+        // Counted from once the message is in the queue (`submit` returned): read before
+        // the submit, a preemption between the read and the send let the shard finish one
+        // slice and start the next with the queue still empty, and the message's one slice
+        // of waiting counted as two (#960, macOS CI). Read after, the count can only fall
+        // short of the wait (the shard may run on before this read), never exceed it.
+        let enqueued = slices.load(Ordering::SeqCst);
         let handled = w.wait().expect("handled");
-        waited.push(handled - before);
+        waited.push(handled.saturating_sub(enqueued));
         thread::sleep(Duration::from_micros(300));
     }
     stop.store(true, Ordering::Relaxed);
