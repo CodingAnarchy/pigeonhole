@@ -37,7 +37,7 @@ pub const ARENA_ALIGN: usize = 2 * 1024 * 1024;
 pub const ROW_EPOCH_LEN: usize = 8;
 /// Alignment of the row-epoch table.
 pub const ROW_EPOCHS_ALIGN: usize = 64;
-/// [`header::ROW_EPOCH_HASH`]: xxh3-64 with the seed over `table u32 LE ‖ row`
+/// [`header::ROW_EPOCH_HASH`]: xxh3-64 of the row with the seed plus the table id
 /// ([`row_epoch_hash`]), the only hash this build knows.
 pub const ROW_EPOCH_HASH_XXH3: u32 = 1;
 /// [`header::ROW_EPOCH_FLAGS`] bit: the writer raises the slots (its row cache is on). A
@@ -45,32 +45,21 @@ pub const ROW_EPOCH_HASH_XXH3: u32 = 1;
 pub const ROW_EPOCHS_MAINTAINED: u32 = 1;
 
 /// The hash that picks a row's row-epoch slot (FORMAT §11.7, D281):
-/// `xxh3_64_with_seed(seed, table u32 LE ‖ row)`; the slot is `hash & (slots − 1)`. Specified
-/// bytes and algorithm, so every build of every process agrees (perf287's review of #947):
-/// a reader looking at a slot the writer never raises would serve a stale row for ever.
+/// `xxh3_64_with_seed(seed + table, row)`, the seed plus the table id wrapping in `u64`; the
+/// slot is `hash & (slots − 1)`. Specified algorithm and bytes, so every build of every
+/// process agrees (perf287's review of #947): a reader looking at a slot the writer never
+/// raises would serve a stale row for ever. The table goes into the seed rather than the
+/// input, so the row is hashed in place (a concatenated key cost a cached point get about
+/// 60 instructions, callgrind).
 ///
 /// ```
 /// use pigeonhole_format::shm::row_epoch_hash;
 ///
-/// let mut key = 7u32.to_le_bytes().to_vec();
-/// key.extend_from_slice(b"row");
-/// assert_eq!(row_epoch_hash(42, 7, b"row"), twox_hash::XxHash3_64::oneshot_with_seed(42, &key));
+/// assert_eq!(row_epoch_hash(42, 7, b"row"), twox_hash::XxHash3_64::oneshot_with_seed(49, b"row"));
 /// ```
 #[inline]
 pub fn row_epoch_hash(seed: u64, table: u32, row: &[u8]) -> u64 {
-    const SHORT: usize = 256;
-    if row.len() <= SHORT - 4 {
-        let mut buf = [0u8; SHORT];
-        buf[..4].copy_from_slice(&table.to_le_bytes());
-        buf[4..4 + row.len()].copy_from_slice(row);
-        twox_hash::XxHash3_64::oneshot_with_seed(seed, &buf[..4 + row.len()])
-    } else {
-        use std::hash::Hasher;
-        let mut h = twox_hash::XxHash3_64::with_seed(seed);
-        h.write(&table.to_le_bytes());
-        h.write(row);
-        h.finish()
-    }
+    twox_hash::XxHash3_64::oneshot_with_seed(seed.wrapping_add(u64::from(table)), row)
 }
 
 /// Byte offsets of the header fields.

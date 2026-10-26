@@ -21,7 +21,7 @@
 
 **`pigeonhole-format`:**
 - **Header fields:** `shm::header::{ROW_EPOCHS_OFF, ROW_EPOCH_SLOTS, ROW_EPOCH_HASH, ROW_EPOCH_SEED, ROW_EPOCH_FLAGS}` and `ShmHeader::{row_epochs_off, row_epoch_slots, row_epoch_hash, row_epoch_seed, row_epoch_flags}`.
-- **`shm::row_epoch_hash(seed, table, row)`:** the specified slot hash (xxh3-64 with the seed over `table u32 LE ‖ row`); constants `ROW_EPOCH_HASH_XXH3` and `ROW_EPOCHS_MAINTAINED`.
+- **`shm::row_epoch_hash(seed, table, row)`:** the specified slot hash (xxh3-64 of the row with the seed plus the table id); constants `ROW_EPOCH_HASH_XXH3` and `ROW_EPOCHS_MAINTAINED`.
 - **`ShmHeader::layout`** takes the slot count (a new parameter before the device).
 - **Constants:** `ROW_EPOCH_LEN` and `ROW_EPOCHS_ALIGN`.
 - **`ShmLayoutVersion::CURRENT` = 5.**

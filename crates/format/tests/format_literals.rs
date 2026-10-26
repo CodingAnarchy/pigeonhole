@@ -327,30 +327,31 @@ fn wal_segment_header_and_fragment() {
 }
 
 /// §11.7 (D281, perf287's review of #947): a row's row-epoch slot is
-/// `xxh3_64_with_seed(seed, table u32 LE ‖ row) & (slots − 1)` in every build of every
-/// process. Golden vectors: a dependency or compiler change that moves the hash fails here
-/// (a reader and a writer disagreeing on a slot would serve stale rows for ever). The long
-/// row takes the streaming path.
+/// `xxh3_64_with_seed(seed + table, row) & (slots − 1)` (the seed plus the table id, wrapping)
+/// in every build of every process. Golden vectors: a dependency or compiler change that
+/// moves the hash fails here (a reader and a writer disagreeing on a slot would serve stale
+/// rows for ever).
 #[test]
 fn row_epoch_hash_vectors() {
     use pigeonhole_format::shm::row_epoch_hash;
     let long: Vec<u8> = (0..300u32).map(|i| (i * 7) as u8).collect();
     assert_eq!(
         row_epoch_hash(0x5eed_5eed, 7, b"com.example/a"),
-        0xfd16_b4ab_0edf_055a
+        0xc8e3_a972_e90b_591a
     );
-    assert_eq!(row_epoch_hash(0, 0, b""), 0x48b2_c926_16fc_193d);
+    assert_eq!(row_epoch_hash(0, 0, b""), 0x2d06_8005_38d3_94c2);
+    // The seed wraps: u64::MAX + u32::MAX.
     assert_eq!(
         row_epoch_hash(u64::MAX, u32::MAX, &long),
-        0x9bb1_ad61_c018_34d2
+        0xc952_63d4_13d4_ab8a
     );
-    // The streaming path is the specified hash of the concatenated bytes.
-    let mut key = u32::MAX.to_le_bytes().to_vec();
-    key.extend_from_slice(&long);
-    assert_eq!(
-        row_epoch_hash(u64::MAX, u32::MAX, &long),
-        twox_hash::XxHash3_64::oneshot_with_seed(u64::MAX, &key)
-    );
+    for len in [0, 16, 17, 128, 129, 240, 241, 300] {
+        assert_eq!(
+            row_epoch_hash(3, 9, &long[..len]),
+            twox_hash::XxHash3_64::oneshot_with_seed(12, &long[..len]),
+            "row of {len} bytes"
+        );
+    }
 }
 
 #[test]
