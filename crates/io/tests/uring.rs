@@ -820,3 +820,46 @@ fn a_published_entry_whose_enter_failed_goes_with_the_next_enter() {
     assert!(first.unwrap().iter().all(|&x| x == 6));
     assert!(second.unwrap().iter().all(|&x| x == 6));
 }
+
+/// perf287's must-fix on #976: a reap's enter also submits what the queue holds, so the
+/// kernel can refuse it for now (`EAGAIN`) as it can a push's. A thread reaping its own ring
+/// keeps what is in flight: the read completes with the file's bytes.
+#[test]
+fn a_refused_reap_on_a_threads_ring_keeps_its_io() {
+    let _serial = serial();
+    let b = Backend::uring("uring-reap-eagain-own");
+    let f = b.create("f");
+    f.submit_write(filled(4096, 8), 0).wait().unwrap();
+    let (vfs, g) = (Arc::clone(&b.vfs), Arc::clone(&f));
+    let got = within_10s(move || {
+        vfs.attach_thread();
+        assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
+        let read = g.submit_read(IoBuf::zeroed(4096), 0);
+        assert!(own_io_in_flight() || read.is_ready());
+        pigeonhole_io::uring::fail_ring_reaps(1, libc::EAGAIN);
+        read.wait()
+    });
+    pigeonhole_io::uring::fail_ring_reaps(0, 0);
+    assert!(got.unwrap().iter().all(|&x| x == 8));
+}
+
+/// As above for the shared ring's reaper: refused for now, it backs off and goes on reaping
+/// (it used to fail everything in flight and end, so no later read completed).
+#[test]
+fn a_refused_reap_on_the_shared_ring_keeps_the_reaper() {
+    let _serial = serial();
+    let b = Backend::uring("uring-reap-eagain-shared");
+    let f = b.create("f");
+    f.submit_write(filled(8192, 9), 0).wait().unwrap();
+    let g = Arc::clone(&f);
+    let (first, second) = within_10s(move || {
+        // The reaper's next enter, after it takes the first read's completion, is refused.
+        pigeonhole_io::uring::fail_ring_reaps(1, libc::EAGAIN);
+        let first = g.submit_read(IoBuf::zeroed(4096), 0).wait();
+        let second = g.submit_read(IoBuf::zeroed(4096), 4096).wait();
+        (first, second)
+    });
+    pigeonhole_io::uring::fail_ring_reaps(0, 0);
+    assert!(first.unwrap().iter().all(|&x| x == 9));
+    assert!(second.unwrap().iter().all(|&x| x == 9));
+}

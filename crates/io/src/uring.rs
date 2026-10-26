@@ -119,22 +119,49 @@ pub fn fail_ring_enters(n: usize, errno: i32) {
     FAIL_ENTERS.store(n, Ordering::SeqCst);
 }
 
+/// Reaps' kernel enters still to fail on purpose ([`fail_ring_reaps`]), and with which `errno`.
+static FAIL_REAPS: AtomicUsize = AtomicUsize::new(0);
+static FAIL_REAPS_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// As [`fail_ring_enters`], for the next `n` enters of a reap (the shared ring's reaper,
+/// or a thread reaping its own ring), which submit what the queue holds too. A test hook
+/// (perf287's must-fix on #976), not part of the API.
+#[doc(hidden)]
+pub fn fail_ring_reaps(n: usize, errno: i32) {
+    FAIL_REAPS_ERRNO.store(errno, Ordering::SeqCst);
+    FAIL_REAPS.store(n, Ordering::SeqCst);
+}
+
+/// Takes one injected failure from `left` ([`fail_ring_enters`], [`fail_ring_reaps`]).
+fn injected(left: &AtomicUsize, errno: &AtomicI32) -> Option<io::Error> {
+    let mut n = left.load(Ordering::Relaxed);
+    while n > 0 {
+        match left.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return Some(io::Error::from_raw_os_error(errno.load(Ordering::SeqCst))),
+            Err(now) => n = now,
+        }
+    }
+    None
+}
+
+/// A reap's enter, `enter`, failing while [`fail_ring_reaps`] asks.
+fn reap_enter(enter: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
+    match injected(&FAIL_REAPS, &FAIL_REAPS_ERRNO) {
+        Some(e) => Err(e),
+        None => enter(),
+    }
+}
+
+/// The longest pause between enters the kernel refuses for now (`EAGAIN`).
+const ENTER_RETRY_MAX: Duration = Duration::from_millis(1);
+
 /// `io_uring_enter` handing over what the submission queue holds, failing while
 /// [`fail_ring_enters`] asks.
 fn enter(uring: &IoUring) -> io::Result<usize> {
-    let mut left = FAIL_ENTERS.load(Ordering::Relaxed);
-    while left > 0 {
-        match FAIL_ENTERS.compare_exchange_weak(left, left - 1, Ordering::SeqCst, Ordering::Relaxed)
-        {
-            Ok(_) => {
-                return Err(io::Error::from_raw_os_error(
-                    FAIL_ENTERS_ERRNO.load(Ordering::SeqCst),
-                ));
-            }
-            Err(now) => left = now,
-        }
+    match injected(&FAIL_ENTERS, &FAIL_ENTERS_ERRNO) {
+        Some(e) => Err(e),
+        None => uring.submit(),
     }
-    uring.submit()
 }
 
 /// Hands entries already published to the kernel. Whatever it returns, they stay the
@@ -152,7 +179,7 @@ fn enter_published(uring: &IoUring) {
         match enter(uring) {
             Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) => {
                 thread::sleep(pause);
-                pause = (pause * 2).min(Duration::from_millis(1));
+                pause = (pause * 2).min(ENTER_RETRY_MAX);
             }
             _ => return,
         }
@@ -896,7 +923,7 @@ impl Ring {
     /// the entry was not published (the kernel never sees it); once it is, it is the ring's
     /// ([`enter_published`]).
     fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
-        let _sq = lock(&self.sq);
+        let sq = lock(&self.sq);
         loop {
             // SAFETY: `self.sq` is held, so this is the only submission queue borrowed. The
             // entry's buffer and descriptor belong to an operation in `self.table`, which
@@ -916,6 +943,10 @@ impl Ring {
                 }
             }
         }
+        // `sq` covers the push and the tail's publication only: an enter hands over whatever
+        // tail it sees (the reaper's always ran without `sq`), and a retried enter would hold
+        // every other submitter for its backoff.
+        drop(sq);
         enter_published(&self.uring);
         Ok(())
     }
@@ -923,11 +954,20 @@ impl Ring {
     /// The reaper's loop: waits for completions and resolves them until shut down with
     /// nothing in flight.
     fn reap(&self) {
+        let mut pause = Duration::from_micros(1);
         loop {
-            match self.uring.submit_and_wait(1) {
-                Ok(_) => {}
+            match reap_enter(|| self.uring.submit_and_wait(1)) {
+                Ok(_) => pause = Duration::from_micros(1),
                 Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
                 Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+                // Refused for now (no request could be allocated; the enter also submits
+                // what the queue holds, #976): what is published and in flight stays the
+                // ring's. Take what has completed (which frees requests), back off, enter
+                // again.
+                Err(e) if e.raw_os_error() == Some(libc::EAGAIN) => {
+                    thread::sleep(pause);
+                    pause = (pause * 2).min(ENTER_RETRY_MAX);
+                }
                 Err(_) => {
                     // The ring is unusable: fail what is in flight rather than hang.
                     self.fail_all();
@@ -999,12 +1039,30 @@ impl Ring {
             (0..n).filter_map(|i| table.take(i)).collect()
         };
         for op in ops {
-            fail(op, io::Error::other("io_uring failed"));
+            abandon(op, io::Error::other("io_uring failed"));
         }
     }
 }
 
-/// Resolves `op` with `e`.
+/// Resolves `op`, in flight on a ring that failed, with `e`, and leaks its buffer: the kernel
+/// may still read into or write from it until the ring's teardown has cancelled everything,
+/// which happens after the ring is dropped, so the buffer is never freed or given back to its
+/// slot pool (perf287 on #976). Only for a ring that can no longer be entered.
+fn abandon(op: Op, e: io::Error) {
+    match op.kind {
+        Kind::Read { buf, resolver, .. } => {
+            std::mem::forget(buf);
+            resolver.resolve(Err(Error::os("read", e)));
+        }
+        Kind::Write { buf, resolver, .. } => {
+            std::mem::forget(buf);
+            resolver.resolve(Err(Error::os("write", e)));
+        }
+        Kind::Sync { resolver, .. } => resolver.resolve(Err(Error::os("sync", e))),
+    }
+}
+
+/// Resolves `op`, whose entry the kernel never saw, with `e`.
 fn fail(op: Op, e: io::Error) {
     match op.kind {
         Kind::Read { resolver, .. } => resolver.resolve(Err(Error::os("read", e))),
@@ -1390,7 +1448,7 @@ impl ThreadRing {
                         .nsec(t.subsec_nanos());
                     let args = types::SubmitArgs::new().timespec(&ts);
                     self.count_enter();
-                    let entered = self.uring.submitter().submit_with_args(1, &args);
+                    let entered = reap_enter(|| self.uring.submitter().submit_with_args(1, &args));
                     self.ring_wake.end_wait();
                     entered
                 } else {
@@ -1402,15 +1460,24 @@ impl ThreadRing {
             // Runs this thread's deferred completion work without waiting.
             _ => {
                 self.count_enter();
-                self.uring
-                    .submitter()
-                    .submit_with_args(0, &types::SubmitArgs::new())
+                reap_enter(|| {
+                    self.uring
+                        .submitter()
+                        .submit_with_args(0, &types::SubmitArgs::new())
+                })
             }
         };
+        if let Err(e) = &entered
+            && e.raw_os_error() == Some(libc::EAGAIN)
+        {
+            // Refused for now (#976): what is published and in flight stays the ring's; this
+            // reap takes what has completed, and the owner's next one enters again.
+            thread::sleep(ENTER_RETRY_MAX / 20);
+        }
         if let Err(e) = entered
             && !matches!(
                 e.raw_os_error(),
-                Some(libc::ETIME | libc::EINTR | libc::EBUSY)
+                Some(libc::ETIME | libc::EINTR | libc::EBUSY | libc::EAGAIN)
             )
         {
             // The ring is unusable: fail what is in flight rather than hang.
@@ -1421,7 +1488,7 @@ impl ThreadRing {
             };
             let any = !ops.is_empty();
             for op in ops {
-                fail(op, io::Error::other("io_uring failed"));
+                abandon(op, io::Error::other("io_uring failed"));
             }
             return any;
         }
