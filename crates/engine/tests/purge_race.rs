@@ -410,17 +410,20 @@ impl Rig {
         }
     }
 
-    /// Runs the shards until `until` holds or they go idle (two passes in a row with
-    /// nothing to do: a message one shard sends another in a pass may not count as work).
+    /// Runs the shards until `until` holds or they go idle: a pass in which no shard has
+    /// work left or did any. `run_once` says whether work remains after its turn, not
+    /// whether it did any (a message one shard sends another in a pass is the other's
+    /// work), so a pass is quiet only if no shard's `EngineShard::work_count` moved either.
     fn run(&mut self, until: impl Fn(&Engine) -> bool) {
-        let mut idle = 0;
         for _ in 0..100_000 {
+            let work: u64 = self.shards.iter().map(EngineShard::work_count).sum();
             let mut more = false;
             for s in &mut self.shards {
                 more |= s.run_once(u64::MAX);
             }
-            idle = if more { 0 } else { idle + 1 };
-            if until(&self.db) || idle == 2 {
+            let quiet =
+                !more && self.shards.iter().map(EngineShard::work_count).sum::<u64>() == work;
+            if until(&self.db) || quiet {
                 return;
             }
         }
