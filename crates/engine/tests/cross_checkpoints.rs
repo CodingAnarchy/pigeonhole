@@ -49,19 +49,19 @@ fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Ou
     panic!("never resolved");
 }
 
-/// Runs every shard until all of them go idle: three passes in a row where no shard has work
-/// left. `run_once` says whether work remains after its turn, not whether it did any: the
-/// last shard of a pass can message an earlier one and drain its own kick in the same turn,
-/// so one idle pass can leave messages queued.
+/// Runs every shard until all of them go idle: a pass in which no shard has work left or did
+/// any. `run_once` says whether work remains after its turn, not whether it did any: the
+/// last shard of a pass can message an earlier one and drain its own kick in the same turn.
+/// So a pass is quiet only if no shard's `EngineShard::work_count` moved either: then it
+/// handled nothing, sent nothing, and left nothing queued.
 fn settle(shards: &mut [EngineShard]) {
-    let mut idle = 0;
     for _ in 0..100_000 {
+        let work: u64 = shards.iter().map(EngineShard::work_count).sum();
         let mut more = false;
         for s in shards.iter_mut() {
             more |= s.run_once(u64::MAX);
         }
-        idle = if more { 0 } else { idle + 1 };
-        if idle == 3 {
+        if !more && shards.iter().map(EngineShard::work_count).sum::<u64>() == work {
             return;
         }
     }

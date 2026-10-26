@@ -4695,6 +4695,15 @@ impl EngineShard {
         d.run_once(deadline_nanos)
     }
 
+    /// How many messages this shard has handled and background slices it has run, in all
+    /// (`ShardDriver::work_count`): for tests that drive shards by hand and run them until
+    /// nothing is queued and nothing remains (a pass in which no `run_once` returned `true`
+    /// and no count moved). 0 in a forked child.
+    #[doc(hidden)]
+    pub fn work_count(&self) -> u64 {
+        self.driver.as_ref().map_or(0, |d| d.work_count())
+    }
+
     /// Before handing this shard to another thread: drives it until the calling thread has
     /// none of its I/O in flight (#492, ICR 0029). With io_uring in application-owned mode
     /// each driving thread has its own ring, and only that thread can complete what was

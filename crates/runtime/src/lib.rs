@@ -463,6 +463,8 @@ struct ShardCore<H: ShardHandler> {
     released: bool,
     /// Polling the queue before parking (D198; engine-owned mode only).
     spin: IdleSpin,
+    /// Messages handled and background slices run, in all (`ShardDriver::work_count`).
+    work_done: u64,
     /// Turns in a row that ended before their background slices because a future of the
     /// driving thread was woken (D237; application-owned mode only, at most
     /// [`MAX_TURN_YIELDS`]).
@@ -575,6 +577,7 @@ impl<H: ShardHandler> ShardCore<H> {
         if n > 0 {
             handler.end_batch(&mut ctx);
             self.spin.worked = true;
+            self.work_done += n as u64;
         }
         n
     }
@@ -724,6 +727,7 @@ impl<H: ShardHandler> ShardCore<H> {
                 self.spawner
                     .local
                     .run_one(now.saturating_add(self.time_slice).min(deadline));
+                self.work_done += 1;
                 // Foreground first: whatever queued during the slice runs before the next
                 // one.
                 self.drain();
@@ -915,6 +919,7 @@ fn build<H: ShardHandler>(
             vfs: Arc::clone(&config.vfs),
             time_slice: config.slice_nanos(),
             idle_at: None,
+            work_done: 0,
             yields: 0,
             attached: 0,
             #[cfg(debug_assertions)]
@@ -1323,6 +1328,16 @@ impl<H: ShardHandler> ShardDriver<H> {
     /// by [`next_deadline`](ShardDriver::next_deadline) even if no wakeup arrives.
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
         self.core.run_once(deadline_nanos)
+    }
+
+    /// How many messages this shard has handled and background slices it has run, in all.
+    /// For tests that drive shards by hand: `run_once` returning `false` says no work
+    /// *remains* on this shard, not that it did none, and a message it sent another shard is
+    /// that shard's work. A pass in which every shard's `run_once` returned `false` and no
+    /// shard's count moved handled nothing, so it sent nothing and left nothing queued.
+    #[doc(hidden)]
+    pub fn work_count(&self) -> u64 {
+        self.core.work_done
     }
 
     /// Before handing this shard to another thread: drives it until the calling thread's

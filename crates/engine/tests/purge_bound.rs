@@ -25,16 +25,18 @@ fn poll<F: Future + Unpin>(f: &mut F) -> Poll<F::Output> {
     Pin::new(f).poll(&mut Context::from_waker(Waker::noop()))
 }
 
-/// Runs the shards until they go idle (two passes in a row with nothing to do).
+/// Runs the shards until they go idle: a pass in which no shard has work left or did any.
+/// `run_once` says whether work remains after its turn, not whether it did any, so a pass is quiet
+/// only if no shard did any work either (`EngineShard::work_count`): then it handled
+/// nothing, sent nothing, and left nothing queued.
 fn run(shards: &mut [EngineShard]) {
-    let mut idle = 0;
     for _ in 0..100_000 {
+        let work: u64 = shards.iter().map(EngineShard::work_count).sum();
         let mut more = false;
         for s in shards.iter_mut() {
             more |= s.run_once(u64::MAX);
         }
-        idle = if more { 0 } else { idle + 1 };
-        if idle == 2 {
+        if !more && shards.iter().map(EngineShard::work_count).sum::<u64>() == work {
             return;
         }
     }
