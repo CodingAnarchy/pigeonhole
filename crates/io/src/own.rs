@@ -141,8 +141,8 @@ pub fn own_io_fd() -> Option<i32> {
 
 // ---- rings no thread reaps on its own (#408) ----
 
-/// A backend whose completions no thread of its own takes (an io_uring shared ring without a
-/// reaper, in application-owned mode): any thread blocked on a completion may take them.
+/// A backend whose completions no thread of its own takes (the simulator under deferred I/O):
+/// any thread blocked on a completion may take them.
 pub(crate) trait OrphanIo: Send + Sync {
     /// Takes what has completed, waiting up to `wait` for something to when nothing has.
     /// Returns whether an operation completed.
@@ -153,8 +153,8 @@ static ORPHANS: std::sync::Mutex<Vec<Weak<dyn OrphanIo>>> = std::sync::Mutex::ne
 /// Live entries of `ORPHANS` (checked without the lock by every blocked wait).
 static ORPHAN_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// Registers a backend no thread reaps (application-owned io_uring's shared ring; the
-/// simulator under deferred I/O); it stays registered until dropped.
+/// Registers a backend no thread reaps (the simulator under deferred I/O); it stays
+/// registered until dropped.
 pub(crate) fn register_orphan(orphan: Weak<dyn OrphanIo>) {
     let mut o = ORPHANS
         .lock()
@@ -164,10 +164,10 @@ pub(crate) fn register_orphan(orphan: Weak<dyn OrphanIo>) {
     ORPHAN_COUNT.store(o.len(), std::sync::atomic::Ordering::Release);
 }
 
-/// Reaps every backend no thread reaps (application-owned io_uring's shared ring, #408),
-/// waiting up to `wait` for something to complete: for a thread blocked on an outcome chained
-/// after I/O it holds no completion of, such as a WAL sync waiting for the stream's older
-/// syncs (ICR 0028), which would otherwise wait for ever. `None` when no such backend is
+/// Reaps every backend no thread reaps (the simulator under deferred I/O), waiting up to
+/// `wait` for something to complete: for a thread blocked on an outcome chained after I/O it
+/// holds no completion of, such as a WAL sync waiting for the stream's older syncs (ICR
+/// 0028), which would otherwise wait for ever. `None` when no such backend is
 /// registered (one relaxed load: then wait as usual); otherwise whether anything completed.
 ///
 /// ```
