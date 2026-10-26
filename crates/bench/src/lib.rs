@@ -1250,27 +1250,43 @@ fn warm_up(
     quiet: Duration,
     cap: Duration,
 ) -> Result<(f64, bool), String> {
+    let origin = Instant::now();
+    warm_up_on(runner, clients, warm, quiet, cap, &|| origin.elapsed())
+}
+
+/// [`warm_up`] on `clock` (the time since any fixed origin), which times the quiet window,
+/// the cap and the seconds returned. Tests pass a fake store's own clock, so the windows
+/// are judged on the store's time, not on how fast the runner runs it (#936).
+fn warm_up_on(
+    runner: &mut dyn Runner,
+    clients: &mut [Box<dyn Client>],
+    warm: &[Vec<(BenchOp, Class)>],
+    quiet: Duration,
+    cap: Duration,
+    clock: &dyn Fn() -> Duration,
+) -> Result<(f64, bool), String> {
     if warm.iter().all(Vec::is_empty) {
         return Ok((0.0, true));
     }
-    let started = Instant::now();
+    // A pass stops at the cap on the wall clock too.
+    let deadline = Instant::now() + cap;
+    let started = clock();
     let mut last_change = started;
     let settled = loop {
         let before = runner.shard_shares();
-        pass(runner, clients, warm, false, Some(started + cap))
-            .map_err(|e| format!("warmup: {e}"))?;
+        pass(runner, clients, warm, false, Some(deadline)).map_err(|e| format!("warmup: {e}"))?;
         let after = runner.shard_shares();
         // A pending growth counts as a change: its moves have not started yet. So does a
         // growth whose moves have not spread the tablets yet: fewer shards hold one than
         // the active count calls for (as many as there are tablets at most), and the next
         // move may be more than a quiet window away (one per dwell, behind a compaction).
         if unwinding(runner.pack_target(), &after) || placement_changed(&before, &after) {
-            last_change = Instant::now();
+            last_change = clock();
         }
-        if last_change.elapsed() >= quiet {
+        if clock() - last_change >= quiet {
             break true;
         }
-        if started.elapsed() >= cap {
+        if clock() - started >= cap {
             eprintln!(
                 "warning: {}'s tablet placement still changed {cap:?} into the warmup; the \
                  measured phase may include tablet changes",
@@ -1279,7 +1295,7 @@ fn warm_up(
             break false;
         }
     };
-    Ok((started.elapsed().as_secs_f64(), settled))
+    Ok(((clock() - started).as_secs_f64(), settled))
 }
 
 /// Whether the balancer is still heading somewhere (D242's amendments): a growth is
@@ -1421,8 +1437,12 @@ mod tests {
         /// Tablet moves the store reports: one more per reading until `moving` readings.
         readings: std::cell::Cell<u64>,
         moving: u64,
-        /// A timed spread: from the instant, one more move every interval, this many in all.
-        spread: Option<(Instant, Duration, u64)>,
+        /// A timed spread on the fake's own clock (`now`): one more move every interval,
+        /// this many in all. The fake's operations then advance `now` by `op_time` instead
+        /// of sleeping, so the spread and the warmup's windows share one clock (#936).
+        spread: Option<(Duration, u64)>,
+        /// The fake's clock: the time its operations took.
+        now: std::rc::Rc<std::cell::Cell<Duration>>,
         /// Operations executed, and how long each takes.
         executed: u64,
         op_time: Duration,
@@ -1444,7 +1464,10 @@ mod tests {
         }
         fn execute(&mut self, _: &BenchOp) -> Result<(), String> {
             self.executed += 1;
-            std::thread::sleep(self.op_time);
+            self.now.set(self.now.get() + self.op_time);
+            if self.spread.is_none() {
+                std::thread::sleep(self.op_time);
+            }
             Ok(())
         }
         fn close(&mut self) -> Result<(), String> {
@@ -1460,8 +1483,8 @@ mod tests {
             Some(if n < self.growing { (4, 16) } else { (16, 16) })
         }
         fn shard_shares(&self) -> Vec<ShardShare> {
-            if let Some((from, every, moves)) = self.spread {
-                let n = (from.elapsed().as_nanos() / every.as_nanos()) as u64;
+            if let Some((every, moves)) = self.spread {
+                let n = (self.now.get().as_nanos() / every.as_nanos()) as u64;
                 return vec![ShardShare {
                     moves: n.min(moves),
                     ..ShardShare::default()
@@ -1506,6 +1529,7 @@ mod tests {
             readings: std::cell::Cell::new(0),
             moving: 0,
             spread: None,
+            now: std::rc::Rc::default(),
             executed: 0,
             op_time: Duration::ZERO,
             targets: std::cell::Cell::new(0),
@@ -1635,47 +1659,44 @@ mod tests {
         // D242/D247: a store whose placement moves once every 300 ms for 1.5 s, as packing
         // re-places tablets one per dwell after a durability switch. A 200 ms window ends
         // between two moves, with moves still to come; a 500 ms one outlasts the spread.
-        // The early end is judged by the fake's own move count, not by wall seconds: on a
-        // loaded macOS runner the 5 ms op sleeps stretched until the window fell between
-        // the third and fourth moves (1.15 s), which is still mid-spread (#741's CI).
+        // On the fake's own clock (#936): its spread once ran on wall time, and on a loaded
+        // macOS runner the warmup's passes stretched past the move cadence, so every window
+        // saw a move (#741's CI, then #935's). A pass is 4 operations of 5 ms: 20 ms.
         const MOVES: u64 = 5;
-        let spreading = || {
+        let spreading = |every: u64, moves: u64| {
             let mut r = fake(0);
             r.op_time = Duration::from_millis(5);
-            r.spread = Some((Instant::now(), Duration::from_millis(300), MOVES));
+            r.spread = Some((Duration::from_millis(every), moves));
             r
         };
         let warm = warm_ops(4);
         let cap = Duration::from_secs(10);
-        let mut early = spreading();
-        let (secs, settled) =
-            warm_up(&mut early, &mut [], &warm, Duration::from_millis(200), cap).unwrap();
+        let run = |r: &mut Fake, quiet: u64, cap: Duration| {
+            let now = r.now.clone();
+            warm_up_on(
+                r,
+                &mut [],
+                &warm,
+                Duration::from_millis(quiet),
+                cap,
+                &|| now.get(),
+            )
+            .unwrap()
+        };
+        // 200 ms quiet before the first move at 300 ms: settled at 200 ms, all five to come.
+        let mut early = spreading(300, MOVES);
+        let (secs, settled) = run(&mut early, 200, cap);
         let moved = early.shard_shares()[0].moves;
         assert!(
-            settled && moved < MOVES,
-            "ended mid-spread: after move {moved} of {MOVES}, {secs} s"
+            settled && moved == 0 && secs == 0.2,
+            "after move {moved} of {MOVES}, {secs} s"
         );
-        let (secs, settled) = warm_up(
-            &mut spreading(),
-            &mut [],
-            &warm,
-            Duration::from_millis(500),
-            cap,
-        )
-        .unwrap();
-        assert!(settled && secs >= 1.5 + 0.5, "outlasted the spread: {secs}");
+        // The last move at 1.5 s, then 500 ms quiet.
+        let (secs, settled) = run(&mut spreading(300, MOVES), 500, cap);
+        assert!(settled && secs == 1.5 + 0.5, "outlasted the spread: {secs}");
         // A spread longer than the cap ends at the cap, not settled.
-        let mut r = spreading();
-        r.spread = Some((Instant::now(), Duration::from_millis(100), u64::MAX));
-        let (_, settled) = warm_up(
-            &mut r,
-            &mut [],
-            &warm,
-            Duration::from_millis(500),
-            Duration::from_secs(1),
-        )
-        .unwrap();
-        assert!(!settled);
+        let (secs, settled) = run(&mut spreading(100, u64::MAX), 500, Duration::from_secs(1));
+        assert!(!settled && secs == 1.0, "capped at {secs} s");
     }
 
     #[test]
