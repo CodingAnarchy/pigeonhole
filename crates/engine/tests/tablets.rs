@@ -3854,6 +3854,10 @@ fn moved_retry_against_queued_singles(retry_first: bool) {
         .find(|r| r.kind == pigeonhole_engine::AppendedKind::Commit && r.seqno == retry_id)
         .expect("the retry's DECISION");
     let (apply, ts_c) = (commit.apply_seqno, commit.commit_ts);
+    assert!(
+        apply > retry_id,
+        "the DECISION applied at {apply}, not above the retry's id {retry_id}"
+    );
     assert_eq!(db.get(b"a").unwrap().0, ts_c, "the commit's cell");
     let singles: Vec<_> = records
         .iter()
