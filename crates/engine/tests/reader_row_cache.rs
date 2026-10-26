@@ -438,3 +438,92 @@ fn a_writer_without_a_row_cache_gives_readers_none() {
     vfs.enter_process(writer_process);
     w.close();
 }
+
+/// Polls `f` to completion (the simulator completes reads at once).
+fn block_on<F: Future + Unpin>(mut f: F) -> F::Output {
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(r) = Pin::new(&mut f).poll(&mut cx) {
+            return r;
+        }
+    }
+}
+
+/// The row's cells through the async row read.
+fn latest_async(db: &Engine, t: &TableInfo, row: &[u8]) -> Vec<(u32, Vec<u8>, Vec<u8>)> {
+    let mut spec = ReadSpec::default();
+    spec.versions = 1;
+    let families: Vec<_> = t.families.iter().map(|f| f.id).collect();
+    let Some(data) =
+        block_on(db.read_row_latest_async(t.id, row, &families, &spec, RowData::default()))
+            .unwrap()
+    else {
+        return Vec::new();
+    };
+    data.cells
+        .iter()
+        .map(|c| {
+            (
+                c.family.0,
+                data.qualifier(c).to_vec(),
+                common::value_bytes(c.data.value()),
+            )
+        })
+        .collect()
+}
+
+/// #946: a reader process's async latest reads (the row read and the point get) go through
+/// its row cache as its sync ones do, and see every write the reader can see.
+#[test]
+fn a_reader_process_async_reads_use_its_row_cache() {
+    let vfs = SimVfs::new(946);
+    let writer_process = pigeonhole_io::Vfs::current_process(&*vfs);
+    let mut w = Writer::open(&vfs);
+    let f = w.t.families[0].id;
+    w.commit(|wb, t| {
+        wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"v1"))
+            .unwrap();
+    });
+    vfs.enter_process(READER);
+    let reader = open_reader(&vfs);
+    let t = Arc::clone(&w.t);
+    let first = latest_async(&reader, &t, b"r");
+    assert_eq!(latest_async(&reader, &t, b"r"), first);
+    let filled = reader.row_cache_stats();
+    assert_eq!(latest_async(&reader, &t, b"r"), first);
+    let get = block_on(reader.get_latest_async(t.id, f, b"r", b"q")).unwrap();
+    assert_eq!(
+        get.map(|c| common::value_bytes(c.value())),
+        Some(b"v1".to_vec())
+    );
+    let after = reader.row_cache_stats();
+    assert!(
+        filled.fills >= 1,
+        "the async row read never filled: {filled:?}"
+    );
+    assert!(
+        after.hits >= filled.hits + 2,
+        "the async reads never hit: {after:?}"
+    );
+
+    vfs.enter_process(writer_process);
+    w.commit(|wb, t| {
+        wb.put(t.id, f, b"r", b"q", None, ValueRef::Bytes(b"v2"))
+            .unwrap();
+    });
+    let want = latest(&w.db, &t, b"r");
+    vfs.enter_process(READER);
+    assert_eq!(
+        latest_async(&reader, &t, b"r"),
+        want,
+        "a stale row through the async read"
+    );
+    let get = block_on(reader.get_latest_async(t.id, f, b"r", b"q")).unwrap();
+    assert_eq!(
+        get.map(|c| common::value_bytes(c.value())),
+        Some(b"v2".to_vec())
+    );
+    drop(reader);
+    vfs.enter_process(writer_process);
+    w.close();
+}

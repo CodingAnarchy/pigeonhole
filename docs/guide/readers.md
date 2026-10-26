@@ -58,7 +58,7 @@ A reader process keeps the newest version of small, hot rows in a row cache of i
 - **Counts:** `PigeonholeReader::row_cache_stats()`: hits, misses and fills.
 - **A new writer empties it:** when the writer restarts, recovers or hands over (a new shared-memory generation), the reader re-attaches with an empty cache and the counts start again.
 - **It needs the writer's row cache on** (`Options::row_cache`, on by default): only then does the writer raise the watermarks. A writer opened with `row_cache(0)` gives its readers no cache (their reads are uncached, and still right).
-- **What bypasses it:** snapshot reads, scans, multi-version reads, and, until [#946](https://github.com/CodingAnarchy/pigeonhole/issues/946), the async reads (`get_async` and the async row read).
+- **What bypasses it:** snapshot reads, scans and multi-version reads. Latest reads go through it, sync and async alike.
 
 ## Long-held snapshots stall the writer
 A reader's oldest live snapshot pins the writer's state as of that snapshot: the memtables and file space the writer would otherwise reclaim. Only live snapshots pin. Once a reader drops its oldest snapshot the pin moves up to its next oldest, and a reader holding no snapshot pins nothing, however long it stays open (#693). A reader that holds one snapshot for a long time while the writer keeps committing eventually fills the writer's memtable budget. The writer's commits then wait for room, and fail with `Busy` after `Options::write_stall_timeout` (30 s by default).

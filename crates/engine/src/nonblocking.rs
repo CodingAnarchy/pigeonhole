@@ -67,6 +67,35 @@ impl At {
             At::Snapshot(s) => s.checked(r),
         }
     }
+
+    /// The row cache a latest read at this point goes through (D201, D281): the writer's for
+    /// the latest view, and for a snapshot its generation's reader cache in a reader process
+    /// (#946), else the writer's.
+    fn row_cache<'a>(&'a self, inner: &'a Inner) -> Option<&'a crate::row_cache::RowCaches> {
+        match self {
+            At::Latest { .. } => inner.shared.row_cache.as_ref(),
+            At::Snapshot(s) => s.reader_row_cache().or(inner.shared.row_cache.as_ref()),
+        }
+    }
+}
+
+/// What one attempt of a read gets: the read point and, for a latest read, the row cache
+/// with the check a fill must pass first (the snapshot still protects what was read).
+pub(crate) struct Attempt<'a> {
+    pub view: &'a Arc<View>,
+    pub seqno: Seqno,
+    pub now: Timestamp,
+    pub cache_only: bool,
+    pub row_cache: Option<&'a crate::row_cache::RowCaches>,
+    at: &'a At,
+}
+
+impl Attempt<'_> {
+    /// Whether a fill may be stored: always in the writer; in a reader process, while its
+    /// snapshot is current (checked after the read).
+    pub fn still_valid(&self) -> bool {
+        self.at.checked(Ok(())).is_ok()
+    }
 }
 
 /// The fetch-and-retry loop shared by the read futures.
@@ -117,11 +146,11 @@ impl Reading {
         self.inner.snapshot().map(At::Snapshot)
     }
 
-    /// Runs `attempt(view, seqno, now, cache_only)` until it does not miss.
+    /// Runs `attempt` until it does not miss.
     fn poll_read<T>(
         &mut self,
         cx: &mut Context<'_>,
-        mut attempt: impl FnMut(&Arc<View>, Seqno, Timestamp, bool) -> Result<T>,
+        mut attempt: impl FnMut(&Attempt<'_>) -> Result<T>,
     ) -> Poll<Result<T>> {
         // A forked child's copy of the engine reads nothing (#901).
         if let Err(e) = self.inner.check_process() {
@@ -160,9 +189,20 @@ impl Reading {
                 unreachable!("taken above");
             };
             let cache_only = !self.sync;
-            let (r, sync_reads) = as_async_read(cache_only, || {
-                attempt(at.view(), at.seqno(), self.now, cache_only)
-            });
+            let point = Attempt {
+                view: at.view(),
+                seqno: at.seqno(),
+                now: self.now,
+                cache_only,
+                // A snapshot read given by the caller never goes through a row cache.
+                row_cache: if self.given {
+                    None
+                } else {
+                    at.row_cache(&self.inner)
+                },
+                at,
+            };
+            let (r, sync_reads) = as_async_read(cache_only, || attempt(&point));
             if sync_reads > 0 {
                 self.inner
                     .shared
@@ -251,12 +291,11 @@ impl Future for GetFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = &mut *self;
         let (table, family, row, qualifier) = (this.table, this.family, &this.row, &this.qualifier);
-        // A latest get consults the row cache, as the sync one does (D201).
-        let row_cache = (!this.reading.given && this.reading.inner.shared.row_cache.is_some())
-            .then(|| Arc::clone(&this.reading.inner));
-        this.reading.poll_read(cx, |view, seqno, now, cache_only| {
-            if let Some(inner) = &row_cache
-                && let Some(rc) = &inner.shared.row_cache
+        // A latest get consults the row cache, as the sync one does (D201; a reader
+        // process's, #946).
+        this.reading.poll_read(cx, |p| {
+            let (view, seqno, now, cache_only) = (p.view, p.seqno, p.now, p.cache_only);
+            if let Some(rc) = p.row_cache
                 && let Some(hit) = crate::row_cache::get_cached(
                     rc, view, seqno, now, table, family, row, qualifier,
                 )
@@ -354,18 +393,14 @@ impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
             &this.spec,
             &this.empty,
         );
-        // A latest read goes through the row cache, as the sync one does (D201).
-        let row_cache = match &this.reading.inner.shared.row_cache {
-            Some(rc) if !this.reading.given && crate::row_cache::serves_spec(spec) => {
-                Some(Arc::clone(&this.reading.inner))
-            }
-            _ => None,
-        };
-        let r = this.reading.poll_read(cx, |view, seqno, now, cache_only| {
+        // A latest read goes through the row cache, as the sync one does (D201; a reader
+        // process's, #946).
+        let r = this.reading.poll_read(cx, |p| {
+            let (view, seqno, now, cache_only) = (p.view, p.seqno, p.now, p.cache_only);
             sink.clone_from(empty);
             let families = crate::engine::families_in_order(view, table, families)?;
-            if let Some(inner) = &row_cache
-                && let Some(rc) = &inner.shared.row_cache
+            if let Some(rc) = p.row_cache
+                && crate::row_cache::serves_spec(spec)
             {
                 return crate::row_cache::read_row_cached(
                     rc,
@@ -378,7 +413,7 @@ impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
                     now,
                     cache_only,
                     sink,
-                    || true,
+                    || p.still_valid(),
                 );
             }
             read::read_row_into(
