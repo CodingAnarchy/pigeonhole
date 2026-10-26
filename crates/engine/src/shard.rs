@@ -3009,6 +3009,10 @@ pub(crate) struct ShardState {
     /// Commits a participant found doomed (`WakeReason::Doomed`) while their round was
     /// undecided or aborting: they fail at the round's end instead of retrying (D276).
     doomed: Vec<CommitPriority>,
+    /// DECISION members set aside while `Fault::HoldDecisionRecords` is on (D286's tests);
+    /// they rejoin the end of `pending` at the first group after it is off.
+    #[cfg(feature = "test-hooks")]
+    held_decisions: Vec<Member>,
     /// Slots a wait for arena room picked to freeze, whatever their size, until their active
     /// memtable freezes: the largest ones, holding about half the arena (D124).
     room_freezes: BTreeSet<(TabletId, FamilyId)>,
@@ -3352,6 +3356,8 @@ impl ShardState {
             reader_fences: Vec::new(),
             overlap_released: Vec::new(),
             doomed: Vec::new(),
+            #[cfg(feature = "test-hooks")]
+            held_decisions: Vec::new(),
             unpin_upto: 0,
             unpin_at: 0,
             last_end: None,
@@ -5737,6 +5743,17 @@ impl ShardState {
 
     /// Runs the group commit over everything drained since the last one.
     fn run_group(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        #[cfg(feature = "test-hooks")]
+        if !self.held_decisions.is_empty()
+            && !self
+                .shared
+                .hooks
+                .faults
+                .on(crate::engine::hooks::Fault::HoldDecisionRecords)
+        {
+            let held = std::mem::take(&mut self.held_decisions);
+            self.pending.extend(held);
+        }
         if self.pending.is_empty() {
             // Nothing waits for room any more (the waiting commits were parked or
             // forwarded by a tablet change): the stall is over and its timer goes, and so
@@ -5816,6 +5833,17 @@ impl ShardState {
             if self.closing && matches!(m.kind, MemberKind::Single) {
                 m.failed = Some(Error::Closed);
                 self.settle(m, Ok(()), ctx);
+                continue;
+            }
+            #[cfg(feature = "test-hooks")]
+            if matches!(m.kind, MemberKind::CommitRecord { .. })
+                && self
+                    .shared
+                    .hooks
+                    .faults
+                    .on(crate::engine::hooks::Fault::HoldDecisionRecords)
+            {
+                self.held_decisions.push(m);
                 continue;
             }
             if self.poisoned {
@@ -7684,6 +7712,13 @@ impl ShardState {
 
     /// Sends a message to `shard`, handling our own inline.
     fn send(&mut self, shard: ShardId, msg: ShardMsg, ctx: &mut ShardContext<'_, ShardMsg>) {
+        #[cfg(feature = "test-hooks")]
+        if matches!(msg, ShardMsg::Decide { commit: false, .. }) {
+            self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .abort_decides
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if shard == self.id {
             self.handle_msg(msg, ctx);
         } else if let Err(pigeonhole_runtime::Error::Closed) = ctx.submitter(shard).submit(msg) {
@@ -8064,9 +8099,7 @@ impl ShardState {
             return;
         };
         let done = Arc::new(Completion {
-            remaining: AtomicU32::new(
-                u32::try_from(holders.len()).expect("few participants") + 1,
-            ),
+            remaining: AtomicU32::new(u32::try_from(holders.len()).expect("few participants") + 1),
             apply_seqno,
             coordinator: self.id,
             done: Mutex::new(Some(Done {

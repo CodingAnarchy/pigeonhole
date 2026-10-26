@@ -148,6 +148,11 @@ pub enum Fault {
     /// than from the order messages were queued in: a participant's turn between the
     /// coordinator reserving a commit's seqno and the PREPARE reaching it.
     HoldPrepares = 9,
+    /// While on, a coordinator sets its DECISION members aside instead of admitting them
+    /// (D286's tests: an early `Decide` is applied while its DECISION is unwritten). Switch
+    /// it off with `Engine::release_held_decisions`, which kicks the shards: the held
+    /// DECISIONs rejoin the end of their shard's queue at its next group.
+    HoldDecisionRecords = 10,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).
@@ -304,6 +309,10 @@ pub(crate) struct ShardCounters {
     /// Decisions that reached the shard before their share's PREPARE settled and waited for
     /// it (D279), `Engine::parked_decisions`.
     pub parked_decisions: AtomicU64,
+    /// `Decide { commit: false }` messages the shard sent as a coordinator,
+    /// `Engine::abort_decides_sent` (D286's tests: no abort follows an early commit
+    /// `Decide`).
+    pub abort_decides: AtomicU64,
     /// Entries read validation visited in the shard's memtables (`Engine::validate_entries`,
     /// D273's tests: a hot row validates in a few entries, not one per version).
     pub validate_entries: AtomicU64,
@@ -1145,6 +1154,32 @@ impl Engine {
         self.inner.shared.metrics[shard]
             .hooks
             .parked_decisions
+            .load(Ordering::Relaxed)
+    }
+
+    /// Switches `Fault::HoldDecisionRecords` off and kicks every shard, so the DECISIONs it
+    /// held join their next group (test hook).
+    #[doc(hidden)]
+    pub fn release_held_decisions(&self) {
+        self.inner
+            .shared
+            .hooks
+            .faults
+            .set(Fault::HoldDecisionRecords, false);
+        if let Some(subs) = self.inner.shared.submitters.get() {
+            for s in subs {
+                let _ = s.submit(crate::shard::ShardMsg::Kick);
+            }
+        }
+    }
+
+    /// How many `Decide { commit: false }` shard `shard` sent as a coordinator (D286, test
+    /// hook).
+    #[doc(hidden)]
+    pub fn abort_decides_sent(&self, shard: usize) -> u64 {
+        self.inner.shared.metrics[shard]
+            .hooks
+            .abort_decides
             .load(Ordering::Relaxed)
     }
 
