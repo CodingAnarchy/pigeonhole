@@ -373,6 +373,9 @@ struct Stats {
     /// Forced commits refused `Busy` before they reached the WAL, so the forced failure was
     /// armed again for the next commit (#897).
     forced_rearms: usize,
+    /// Forced commits that failed `Io` on a store a random write error had already failed
+    /// (D58), with the forced failure unfired: re-armed after that failure's recovery (#897).
+    forced_preempted: usize,
 }
 
 /// The most forced commits in a row that may be refused `Busy` before the WAL (#897) before
@@ -388,18 +391,26 @@ enum Forced {
     /// Refused `Busy` before its WAL write: nothing fired, nothing was logged; force the next
     /// commit instead.
     Rearm,
+    /// Failed `Io` with nothing fired, on an instance a random write error failed first (a
+    /// background manifest commit, D58): that failure's recovery runs, then the next commit
+    /// is forced.
+    Preempted,
     /// Anything else is a harness or engine bug.
     Fail(String),
 }
 
-/// Classifies a forced commit by how many times the forced failure fired and what the commit
-/// returned. Only a `Busy` refusal with no firing re-arms: a commit that fired the failure
-/// and still succeeded, fired it twice, or failed any other way without firing it, fails the
-/// run, as before #897.
-fn forced_outcome(fired: usize, result: Result<(), ErrorCode>) -> Forced {
+/// Classifies a forced commit by how many times the forced failure fired, what the commit
+/// returned, and whether a random fault failed the instance first: `preempted` is that the
+/// instance has failed over and a random write error was injected since it was last opened
+/// or recovered. With nothing fired, only a `Busy` refusal re-arms, or an `Io` failure with
+/// that evidence. A commit that fired the failure and still succeeded, fired it twice, or
+/// failed any other way without firing it (an `Io` with no random write error to blame
+/// included) fails the run, as before #897.
+fn forced_outcome(fired: usize, result: Result<(), ErrorCode>, preempted: bool) -> Forced {
     match (fired, result) {
         (1, Err(_)) => Forced::Fired,
         (0, Err(ErrorCode::Busy)) => Forced::Rearm,
+        (0, Err(ErrorCode::Io)) if preempted => Forced::Preempted,
         _ => Forced::Fail(format!(
             "the forced WAL failure fired {fired} times and the commit returned {result:?}"
         )),
@@ -407,30 +418,41 @@ fn forced_outcome(fired: usize, result: Result<(), ErrorCode>) -> Forced {
 }
 
 #[test]
-fn only_a_busy_refusal_with_nothing_fired_re_arms_the_forced_failure() {
+fn only_a_busy_refusal_or_a_preempting_random_fault_re_arms_the_forced_failure() {
     use ErrorCode::{Busy, Closed, Io, OutcomeUnknown};
-    // The recovery's normal case: the forced write failed, whatever the commit reports.
-    for code in [Io, OutcomeUnknown, Busy, Closed] {
-        assert_eq!(forced_outcome(1, Err(code)), Forced::Fired, "{code:?}");
+    for preempted in [false, true] {
+        // The recovery's normal case: the forced write failed, whatever the commit reports.
+        for code in [Io, OutcomeUnknown, Busy, Closed] {
+            assert_eq!(
+                forced_outcome(1, Err(code), preempted),
+                Forced::Fired,
+                "{code:?}, preempted {preempted}"
+            );
+        }
+        // #897: refused for room before its WAL write.
+        assert_eq!(forced_outcome(0, Err(Busy), preempted), Forced::Rearm);
     }
-    // #897: refused for room before its WAL write.
-    assert_eq!(forced_outcome(0, Err(Busy)), Forced::Rearm);
-    // Everything else stays a failure: no firing with another error, a commit that
-    // succeeded through the failure, or more than one firing.
-    for (fired, result) in [
-        (0, Err(Io)),
-        (0, Err(OutcomeUnknown)),
-        (0, Err(Closed)),
-        (0, Ok(())),
-        (1, Ok(())),
-        (2, Err(Io)),
-        (2, Err(Busy)),
-    ] {
-        assert!(
-            matches!(forced_outcome(fired, result), Forced::Fail(_)),
-            "fired {fired}, {result:?}"
-        );
+    // #897, seed 177: a random write error failed a background manifest commit first.
+    assert_eq!(forced_outcome(0, Err(Io), true), Forced::Preempted);
+    // Everything else stays a failure: an `Io` with no random write error to blame, no
+    // firing with another error, a commit that succeeded through the failure, or more than
+    // one firing.
+    for preempted in [false, true] {
+        for (fired, result) in [
+            (0, Err(OutcomeUnknown)),
+            (0, Err(Closed)),
+            (0, Ok(())),
+            (1, Ok(())),
+            (2, Err(Io)),
+            (2, Err(Busy)),
+        ] {
+            assert!(
+                matches!(forced_outcome(fired, result, preempted), Forced::Fail(_)),
+                "fired {fired}, {result:?}, preempted {preempted}"
+            );
+        }
     }
+    assert!(matches!(forced_outcome(0, Err(Io), false), Forced::Fail(_)));
 }
 
 struct Run {
@@ -457,8 +479,12 @@ struct Run {
     /// The op index at which the forced failure runs (`Stats::forced_faults`), from the seed,
     /// in the run's first half; `None` once it ran or without the recovery option.
     force_at: Option<usize>,
-    /// Forced commits refused `Busy` before the WAL since the last that reached it (#897).
+    /// Forced commits refused `Busy` before the WAL, or preempted by a random fault, since
+    /// the last that reached it (#897).
     forced_rearms_in_a_row: usize,
+    /// `SimVfs::writes_injected` when the store was last opened or recovered: a random write
+    /// error since then may be what failed the instance (#897).
+    writes_injected_at_heal: u64,
     /// The forced failure fired and its recovery has not been counted yet.
     forced_pending: bool,
     /// The index of the op under way (`run` counts).
@@ -747,6 +773,7 @@ impl Run {
             armed: false,
             force_at: None,
             forced_rearms_in_a_row: 0,
+            writes_injected_at_heal: 0,
             forced_pending: false,
             op: 0,
             trace: Vec::new(),
@@ -792,6 +819,7 @@ impl Run {
         let db = Pigeonhole::open(self.root.join(DB), options).map_err(|e| format!("open: {e}"))?;
         let tables = Self::open_tables(&db)?;
         self.generation = db.recovery_stats().generation;
+        self.writes_injected_at_heal = self.vfs.writes_injected();
         self.db = Some((db, tables));
         self.probe = Some(
             self.store
@@ -873,6 +901,7 @@ impl Run {
                     return Ok(Settled::Healthy);
                 }
                 self.generation = stats.generation;
+                self.writes_injected_at_heal = self.vfs.writes_injected();
                 return Ok(Settled::Swapped);
             }
             if failure.is_some_and(|f| !matches!(f.cause, FailureCause::Io)) {
@@ -1651,21 +1680,36 @@ impl Run {
                         "  -> forced WAL failure (fired {fired}): {:?}",
                         result.as_ref().err()
                     ));
-                    match forced_outcome(fired, result.as_ref().map(|_| ()).map_err(|e| e.code())) {
+                    let preempted = self.failed_over()
+                        && self.vfs.writes_injected() > self.writes_injected_at_heal;
+                    let outcome = forced_outcome(
+                        fired,
+                        result.as_ref().map(|_| ()).map_err(|e| e.code()),
+                        preempted,
+                    );
+                    match outcome {
                         Forced::Fired => self.forced_rearms_in_a_row = 0,
-                        Forced::Rearm => {
-                            // Refused for room before it was logged (#897): no WAL write,
-                            // so nothing to fail. The next commit takes the forced failure.
-                            // This commit goes on as any `Busy` one: not committed, and the
-                            // store must still match the model without it (checked below).
-                            // The arm's end check still wants one firing per seed, so a
-                            // re-arm can never stand in for the recovery.
-                            self.stats.forced_rearms += 1;
+                        Forced::Rearm | Forced::Preempted => {
+                            // Refused for room before it was logged, or failed by a random
+                            // write error's earlier failure (D58), #897: nothing fired. The
+                            // next commit takes the forced failure. This commit goes on as any
+                            // other with its error: a `Busy` one is not committed and the
+                            // store must still match the model without it; a preempted one
+                            // takes the random failure's recovery (settle, read back, retry)
+                            // below, counted as a random recovery. The arm's end check still
+                            // wants one firing per seed, so a re-arm can never stand in for
+                            // the forced recovery.
+                            if outcome == Forced::Preempted {
+                                self.stats.forced_preempted += 1;
+                            } else {
+                                self.stats.forced_rearms += 1;
+                            }
                             self.forced_rearms_in_a_row += 1;
                             if self.forced_rearms_in_a_row > MAX_FORCED_REARMS_IN_A_ROW {
                                 return Err(format!(
-                                    "the forced WAL failure was refused Busy {} times in a row: \
-                                     no commit reached the WAL",
+                                    "the forced WAL failure was re-armed {} times in a row \
+                                     (refused Busy, or preempted by a random fault): no commit \
+                                     reached the WAL",
                                     self.forced_rearms_in_a_row
                                 ));
                             }
@@ -1678,7 +1722,13 @@ impl Run {
                             self.force_at = Some(self.op + 1);
                             self.forced_pending = false;
                             self.trace.push(
-                                "  -> refused Busy before the WAL: forced failure re-armed".into(),
+                                if outcome == Forced::Preempted {
+                                    "  -> a random write error failed the instance first: \
+                                     forced failure re-armed after its recovery"
+                                } else {
+                                    "  -> refused Busy before the WAL: forced failure re-armed"
+                                }
+                                .into(),
                             );
                         }
                         Forced::Fail(e) => return Err(e),
