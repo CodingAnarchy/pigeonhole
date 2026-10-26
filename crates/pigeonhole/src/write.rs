@@ -283,9 +283,10 @@ impl Submitted {
         })
     }
 
-    /// Watches `db` for its failed engine's refusals, with the option on (#966).
-    pub(crate) fn watched_by(mut self, db: &Db) -> Self {
-        self.watch = db.watch();
+    /// With `watch` (taken before the engine was chosen, [`Db::watch`]) for its failed
+    /// engine's refusals (#966).
+    pub(crate) fn watched(mut self, watch: crate::db::Watch) -> Self {
+        self.watch = watch;
         self
     }
 }
@@ -592,13 +593,14 @@ impl RowMutation<'_> {
     /// Submits as an async commit (D210; see [`Builder::submit_async`]).
     #[cfg(feature = "async")]
     pub(crate) fn submit_async(self) -> Result<Submitted> {
+        let watch = self.table.db.watch();
         self.builder
             .submit_async(
                 &self.table.engine(),
                 self.table.db.max_value,
                 self.durability,
             )
-            .map(|s| s.watched_by(&self.table.db))
+            .map(|s| s.watched(watch))
     }
 
     /// Submits as an async conditional commit (D210): the condition is resolved now; the
@@ -612,6 +614,7 @@ impl RowMutation<'_> {
         let (db, table) = (&self.table.db, self.table.info.id);
         let (largest_value, max_value) = (self.builder.largest_value, db.max_value);
         let durability = self.durability;
+        let watch = db.watch();
         self.table
             .engine()
             .submit_check_and_mutate_async(
@@ -625,7 +628,7 @@ impl RowMutation<'_> {
                 pending,
                 largest_value,
                 max_value,
-                watch: db.watch(),
+                watch,
             })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
@@ -1003,9 +1006,10 @@ impl WriteBatch {
             builder,
         } = self;
         let generation = db.before_commit()?;
+        let watch = db.watch_at(generation);
         builder
             .submit(&cached.get(&db), db.max_value, durability)
-            .map(|s| s.watched_by(&db))
+            .map(|s| s.watched(watch))
             .map_err(|e| db.after_commit_closed(generation, e))
     }
 
@@ -1017,9 +1021,10 @@ impl WriteBatch {
             cached,
             builder,
         } = self;
+        let watch = db.watch();
         builder
             .submit_async(&cached.get(&db), db.max_value, durability)
-            .map(|s| s.watched_by(&db))
+            .map(|s| s.watched(watch))
     }
 }
 
@@ -1118,10 +1123,8 @@ impl Transaction {
                 max_value,
                 watch: Default::default(),
             })
-            .map(|mut s| {
-                s.watch = self.db.watch().transaction();
-                s
-            })
+            // The transaction runs on the engine it began on: its generation.
+            .map(|s| s.watched(self.db.watch_at(self.generation).transaction()))
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
 

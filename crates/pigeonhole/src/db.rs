@@ -45,17 +45,83 @@ pub(crate) struct Db {
     stall_timeout: Duration,
     /// Transaction outcomes since open (ICR 0061).
     pub(crate) txn_counts: crate::retry::TxnCounts,
-    /// With the option on, this database's entry in [`WATCHED`] (0 otherwise): how a commit
-    /// that resolves later finds it again on its error path only (#966).
+    /// With the option on, this database's entry in the watch registry ([`watched`]; 0
+    /// otherwise): how a commit that resolves later finds it again on its error path only
+    /// (#966).
     watch_id: u64,
 }
 
-/// The supervised databases, by watch id: a commit that resolves after its call returned (an
-/// async commit, a ticket) keeps only the id and looks its database up here if the failed
-/// engine refused it, so its success path takes no reference (perf287's P1 on #968).
-static WATCHED: std::sync::Mutex<Vec<(u64, std::sync::Weak<Db>)>> =
-    std::sync::Mutex::new(Vec::new());
+/// The supervised databases of one process, by watch id: a commit that resolves after its
+/// call returned (an async commit, a ticket) keeps only the id and looks its database up
+/// here if the failed engine refused it, so its success path takes no reference (perf287's
+/// P1 on #968).
+struct Watched {
+    /// The process it belongs to ([`pigeonhole_io::sys::process_id`]).
+    pid: u32,
+    list: std::sync::Mutex<Vec<(u64, std::sync::Weak<Db>)>>,
+}
+
+static WATCHED: arc_swap::ArcSwapOption<Watched> = arc_swap::ArcSwapOption::const_empty();
 static NEXT_WATCH_ID: AtomicU64 = AtomicU64::new(1);
+
+/// This process's watch registry. A forked child gets a fresh one: the parent's lock may
+/// have been copied held into it (perf287's S3 on #968; ICR 0067's forked-child rule), and
+/// none of the parent's databases is the child's to watch. Taken only at a supervised open,
+/// a supervised database's drop, and a refusal's error path.
+fn watched() -> Arc<Watched> {
+    let pid = pigeonhole_io::sys::process_id();
+    WATCHED.rcu(|cur| match cur {
+        Some(w) if w.pid == pid => Some(Arc::clone(w)),
+        _ => Some(Arc::new(Watched {
+            pid,
+            list: std::sync::Mutex::new(Vec::new()),
+        })),
+    });
+    WATCHED.load_full().expect("installed just now")
+}
+
+/// Runs `f` while another thread holds this process's watch registry locked (the fork test's
+/// seam: a fork inside `f` copies the lock held, by a thread the child does not have, into
+/// the child; perf287's S3 on #968).
+pub(crate) fn with_watch_registry_locked_elsewhere<R>(f: impl FnOnce() -> R) -> R {
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let registry = watched();
+        let _held = registry
+            .list
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = locked_tx.send(());
+        let _ = done_rx.recv();
+    });
+    let _ = locked_rx.recv();
+    let pid = pigeonhole_io::sys::process_id();
+    let r = f();
+    if pigeonhole_io::sys::process_id() != pid {
+        // A forked child: the holder is not in this process.
+        std::mem::forget((holder, done_tx));
+        return r;
+    }
+    let _ = done_tx.send(());
+    let _ = holder.join();
+    r
+}
+
+impl Drop for Db {
+    /// Leaves the watch registry (perf287's N1 on #968).
+    fn drop(&mut self) {
+        if self.watch_id == 0 {
+            return;
+        }
+        let registry = watched();
+        registry
+            .list
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(id, d)| *id != self.watch_id && d.strong_count() > 0);
+    }
+}
 
 /// What a commit that resolves later needs to map a refusal by the failed engine
 /// ([`Db::refused_later`]): its database's watch id (0 without the option) and the
@@ -81,7 +147,8 @@ impl Watch {
         if self.id == 0 || !e.refused_unlogged() {
             return e;
         }
-        let db = WATCHED
+        let db = watched()
+            .list
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
@@ -229,7 +296,9 @@ impl Db {
             watch_id,
         });
         if watch_id != 0 {
-            let mut w = WATCHED
+            let registry = watched();
+            let mut w = registry
+                .list
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             w.retain(|(_, d)| d.strong_count() > 0);
@@ -240,14 +309,24 @@ impl Db {
 
     /// What a commit submitted now needs to map a refusal by the failed engine when it
     /// resolves later (#966): nothing without the option.
+    ///
+    /// Take it before choosing the engine the commit runs on (perf287's S2 on #968): taken
+    /// after, a swap in between records the new generation, and a refusal by the failed
+    /// engine then looks as if nothing swapped (`Closed` instead of `Busy`).
     #[inline]
     pub(crate) fn watch(&self) -> Watch {
+        self.watch_at(self.generation())
+    }
+
+    /// [`Db::watch`] for a commit submitted under `generation` (a transaction's).
+    #[inline]
+    pub(crate) fn watch_at(&self, generation: u64) -> Watch {
         if self.watch_id == 0 {
             return Watch::default();
         }
         Watch {
             id: self.watch_id,
-            generation: self.generation(),
+            generation,
             transaction: false,
         }
     }
