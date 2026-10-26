@@ -1,7 +1,8 @@
 //! Shared-memory region layout. See `FORMAT.md` §11.
 //!
 //! ```text
-//! [header 4 KiB][watermarks: 64 B x shards][view area: 2 buffers][reader slots: 64 B x n][arenas]
+//! [header 4 KiB][watermarks: 64 B x shards][view area: 2 buffers][reader slots: 64 B x n]
+//! [row epochs: 8 B x slots][arenas]
 //! ```
 //!
 //! Fields that change while the region is live are accessed as atomics at the offsets given
@@ -10,7 +11,7 @@
 //! ```
 //! use pigeonhole_format::shm::{ARENA_ALIGN, HEADER_LEN, ShmHeader};
 //!
-//! let h = ShmHeader::layout([1; 16], 4, 128, 4 << 20, 64 << 20, 66, 1234);
+//! let h = ShmHeader::layout([1; 16], 4, 128, 4 << 20, 64 << 20, 4096, 66, 1234);
 //! assert_eq!(h.arenas_off % ARENA_ALIGN as u64, 0);
 //! let mut page = [0u8; HEADER_LEN];
 //! h.encode(&mut page);
@@ -32,6 +33,10 @@ pub const WATERMARK_STRIDE: usize = 64;
 pub const READER_SLOT_LEN: usize = 64;
 /// Alignment of each shard arena (so NUMA binding works on whole pages).
 pub const ARENA_ALIGN: usize = 2 * 1024 * 1024;
+/// Size of one row-epoch slot (an atomic `u64`, D281).
+pub const ROW_EPOCH_LEN: usize = 8;
+/// Alignment of the row-epoch table.
+pub const ROW_EPOCHS_ALIGN: usize = 64;
 
 /// Byte offsets of the header fields.
 pub mod header {
@@ -81,6 +86,13 @@ pub mod header {
     pub const FILE_DEVICE: usize = 144;
     /// `u64` inode (file index on Windows) of the main file.
     pub const FILE_INODE: usize = 152;
+    /// `u64` offset of the row-epoch table (layout version 5, D281): the row caches' write
+    /// watermarks, one atomic `u64` per slot.
+    pub const ROW_EPOCHS_OFF: usize = 160;
+    /// `u32` row-epoch slots, a power of two.
+    pub const ROW_EPOCH_SLOTS: usize = 168;
+    /// `u64` seed of the hash that maps a `(table, row)` to its slot, random per generation.
+    pub const ROW_EPOCH_SEED: usize = 176;
 }
 
 /// Byte offsets within a watermark line.
@@ -136,6 +148,12 @@ pub struct ShmHeader {
     pub arenas_off: u64,
     /// Length of each arena.
     pub arena_len: u64,
+    /// Offset of the row-epoch table.
+    pub row_epochs_off: u64,
+    /// Row-epoch slots (a power of two).
+    pub row_epoch_slots: u32,
+    /// Seed of the row-epoch hash (set by the builder; [`ShmHeader::layout`] leaves it 0).
+    pub row_epoch_seed: u64,
     /// Device of the main file.
     pub file_device: u64,
     /// Inode of the main file.
@@ -144,12 +162,14 @@ pub struct ShmHeader {
 
 impl ShmHeader {
     /// Computes a layout for the given sizes, aligning each area.
+    #[allow(clippy::too_many_arguments)]
     pub fn layout(
         db_id: [u8; 16],
         shard_count: u32,
         reader_slot_count: u32,
         view_buffer_len: u32,
         arena_len: u64,
+        row_epoch_slots: u32,
         file_device: u64,
         file_inode: u64,
     ) -> Self {
@@ -160,8 +180,12 @@ impl ShmHeader {
         let watermarks_off = HEADER_LEN as u64;
         let views_off = watermarks_off + WATERMARK_STRIDE as u64 * u64::from(shard_count);
         let reader_slots_off = align(views_off + 2 * u64::from(view_buffer_len), 64);
-        let arenas_off = align(
+        let row_epochs_off = align(
             reader_slots_off + READER_SLOT_LEN as u64 * u64::from(reader_slot_count),
+            ROW_EPOCHS_ALIGN as u64,
+        );
+        let arenas_off = align(
+            row_epochs_off + ROW_EPOCH_LEN as u64 * u64::from(row_epoch_slots),
             ARENA_ALIGN as u64,
         );
         let region_len =
@@ -178,6 +202,9 @@ impl ShmHeader {
             reader_slots_off,
             arenas_off,
             arena_len,
+            row_epochs_off,
+            row_epoch_slots,
+            row_epoch_seed: 0,
             file_device,
             file_inode,
         }
@@ -224,13 +251,32 @@ impl ShmHeader {
         put_at(o, header::ARENA_LEN, &self.arena_len.to_le_bytes());
         put_at(o, header::FILE_DEVICE, &self.file_device.to_le_bytes());
         put_at(o, header::FILE_INODE, &self.file_inode.to_le_bytes());
+        put_at(
+            o,
+            header::ROW_EPOCHS_OFF,
+            &self.row_epochs_off.to_le_bytes(),
+        );
+        put_at(
+            o,
+            header::ROW_EPOCH_SLOTS,
+            &self.row_epoch_slots.to_le_bytes(),
+        );
+        put_at(
+            o,
+            header::ROW_EPOCH_SEED,
+            &self.row_epoch_seed.to_le_bytes(),
+        );
     }
 
     /// Decodes and validates magic, layout version and offsets against `region_len`.
     ///
     /// The layout version must equal [`ShmLayoutVersion::CURRENT`] exactly. The areas must
     /// appear in order without overlapping, arenas must be [`ARENA_ALIGN`]-aligned and sized,
-    /// and everything must lie within `region_len`.
+    /// and everything must lie within `region_len`. The row-epoch table is another process's
+    /// data that every reader indexes with `hash & (slots - 1)` and loads atomically (D281,
+    /// perf287's M1): its slot count must be a nonzero power of two and its offset
+    /// [`ROW_EPOCHS_ALIGN`]-aligned, between the reader slots and the arenas, so a validated
+    /// index never leaves the table.
     pub fn decode(bytes: &[u8]) -> crate::Result<Self> {
         const WHAT: &str = "shm header";
         let Some(b) = bytes.get(..HEADER_LEN) else {
@@ -260,6 +306,9 @@ impl ShmHeader {
             reader_slots_off: le_u64(b, header::READER_SLOTS_OFF),
             arenas_off: le_u64(b, header::ARENAS_OFF),
             arena_len: le_u64(b, header::ARENA_LEN),
+            row_epochs_off: le_u64(b, header::ROW_EPOCHS_OFF),
+            row_epoch_slots: le_u32(b, header::ROW_EPOCH_SLOTS),
+            row_epoch_seed: le_u64(b, header::ROW_EPOCH_SEED),
             file_device: le_u64(b, header::FILE_DEVICE),
             file_inode: le_u64(b, header::FILE_INODE),
         };
@@ -281,6 +330,14 @@ impl ShmHeader {
                 h.reader_slots_off,
                 h.reader_slot_count.into(),
                 READER_SLOT_LEN as u64,
+                h.row_epochs_off,
+            )
+            && h.row_epoch_slots.is_power_of_two()
+            && h.row_epochs_off.is_multiple_of(ROW_EPOCHS_ALIGN as u64)
+            && fits(
+                h.row_epochs_off,
+                h.row_epoch_slots.into(),
+                ROW_EPOCH_LEN as u64,
                 h.arenas_off,
             )
             && h.arenas_off.is_multiple_of(ARENA_ALIGN as u64)
@@ -577,10 +634,81 @@ mod reader_slot_tests {
     #[test]
     fn two_more_default_slots_cost_no_space() {
         for shards in [1u32, 2, 4, 8, 16, 64, 256] {
-            let len = |slots| ShmHeader::layout([0; 16], shards, slots, 4 << 20, 64 << 20, 0, 0);
+            let len =
+                |slots| ShmHeader::layout([0; 16], shards, slots, 4 << 20, 64 << 20, 4096, 0, 0);
             let (old, new) = (len(126), len(128));
             assert_eq!(old.region_len, new.region_len, "{shards} shards");
             assert_eq!(old.arenas_off, new.arenas_off, "{shards} shards");
+        }
+    }
+}
+
+#[cfg(test)]
+mod row_epoch_tests {
+    use super::*;
+
+    /// D281 (perf287's M1): the row-epoch table's fields come from another process, so a bad
+    /// one is refused at decode (every attach decodes the header), never indexed.
+    #[test]
+    fn a_bad_row_epoch_table_is_corrupt() {
+        let good = ShmHeader::layout([0; 16], 2, 4, 4096, 1, 1 << 12, 0, 0);
+        let decode = |h: ShmHeader| {
+            let mut page = [0u8; HEADER_LEN];
+            h.encode(&mut page);
+            ShmHeader::decode(&page)
+        };
+        assert_eq!(decode(good), Ok(good));
+        let slots_end = good.reader_slots_off + READER_SLOT_LEN as u64 * 4;
+        let cases = [
+            (
+                "no slots",
+                ShmHeader {
+                    row_epoch_slots: 0,
+                    ..good
+                },
+            ),
+            (
+                "not a power of two",
+                ShmHeader {
+                    row_epoch_slots: 3,
+                    ..good
+                },
+            ),
+            (
+                "misaligned",
+                ShmHeader {
+                    row_epochs_off: good.row_epochs_off + 8,
+                    ..good
+                },
+            ),
+            (
+                "over the reader slots",
+                ShmHeader {
+                    row_epochs_off: slots_end - 64,
+                    ..good
+                },
+            ),
+            (
+                "into the arenas",
+                ShmHeader {
+                    row_epoch_slots: 1 << 20,
+                    ..good
+                },
+            ),
+            (
+                "past the region",
+                ShmHeader {
+                    row_epochs_off: !63,
+                    ..good
+                },
+            ),
+        ];
+        for (what, h) in cases {
+            assert_eq!(
+                decode(h),
+                Err(Error::Corrupt { what: "shm header" }),
+                "{what}"
+            );
         }
     }
 }

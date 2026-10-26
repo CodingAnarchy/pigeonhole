@@ -1050,6 +1050,10 @@ pub(crate) struct LiveSnapshot {
     /// The slot holding the pin: if the writer judged this process dead and freed it, the
     /// pin protects nothing any more (#834 review).
     pub slot: pigeonhole_shm::SlotOwnership,
+    /// The row cache of the generation the snapshot was taken in (D281), `None` when off.
+    /// It keys on that generation's watermarks only, so a new generation's snapshots get a
+    /// new cache.
+    pub row_cache: Option<Arc<crate::row_cache::RowCaches>>,
 }
 
 impl LiveSnapshot {
@@ -1310,6 +1314,12 @@ impl Snapshot {
     pub(crate) fn checked<T>(&self, result: Result<T>) -> Result<T> {
         self.check_current()?;
         result
+    }
+
+    /// A reader process's row cache for this snapshot's generation (D281); `None` in the
+    /// writer process (its cache is the engine's) or when off.
+    pub(crate) fn reader_row_cache(&self) -> Option<&crate::row_cache::RowCaches> {
+        self._live.as_ref()?.row_cache.as_deref()
     }
 
     /// The same view at an older seqno (a view covers every seqno at or below the one it was

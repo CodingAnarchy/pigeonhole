@@ -328,13 +328,13 @@ fn wal_segment_header_and_fragment() {
 
 #[test]
 fn shm_layout() {
-    let h = ShmHeader::layout([0xD3; 16], 2, 3, 100, 1, 0x77, 0x88);
+    let h = ShmHeader::layout([0xD3; 16], 2, 3, 100, 1, 64, 0x77, 0x88);
     let mut p = [0u8; 4096];
     h.encode(&mut p);
     assert_eq!(&p[0..8], b"PHDBSHM\0");
     assert_eq!(
         (le32(&p, 8), le32(&p, 12), le64(&p, 16)),
-        (4, 4096, h.region_len)
+        (5, 4096, h.region_len)
     );
     // §8.3: reader slot `i`'s liveness lock is byte 2^62 + i (layout version 3, #693).
     assert_eq!(pigeonhole_format::superblock::READER_LOCK_BASE, 1 << 62);
@@ -357,6 +357,12 @@ fn shm_layout() {
     );
     assert_eq!((le64(&p, 120), le64(&p, 128)), (2 << 20, 2 << 20));
     assert_eq!((le64(&p, 144), le64(&p, 152)), (0x77, 0x88));
+    // Layout version 5 (D281): the row-epoch table after the reader slots (64-aligned), its
+    // slot count and its seed (0 from `layout`; the builder sets it).
+    assert_eq!(
+        (le64(&p, 160), le32(&p, 168), le64(&p, 176)),
+        (4096 + 128 + 256 + 3 * 64, 64, 0)
+    );
     assert_eq!(h.region_len, 6 << 20);
 
     let v = ViewRecord {

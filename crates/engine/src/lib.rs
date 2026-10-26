@@ -71,7 +71,7 @@ pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, RowFuture};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
-pub use row_cache::RowCacheStats;
+pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};
 #[doc(hidden)]
 pub use shard::{group_sync_depth, set_tracing};
 pub use snapshot::{Snapshot, TabletMap, View};

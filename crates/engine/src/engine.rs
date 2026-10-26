@@ -405,6 +405,25 @@ struct Attachment {
     shm: ShmRegion,
     /// This generation's slot and the pins its live snapshots hold there (#693 PR 2).
     pins: Arc<crate::snapshot::ReaderPins>,
+    /// This generation's row cache (D281): built at each attach, so a re-attach (a writer
+    /// restart, a recovery, a handover) starts empty and never compares against another
+    /// generation's watermarks. `None` when the reader's row cache is off.
+    row_cache: Option<Arc<crate::row_cache::RowCaches>>,
+}
+
+/// A reader process's row cache over `shm`'s watermarks (D281), `None` when `options` turn
+/// it off.
+fn reader_row_cache(
+    options: &EngineOptions,
+    shm: &ShmRegion,
+) -> Option<Arc<crate::row_cache::RowCaches>> {
+    crate::row_cache::RowCaches::new(
+        options.row_cache_bytes,
+        options.row_cache_max_row,
+        options.row_cache_families.clone(),
+        Arc::new(crate::row_cache::RowEpochs::new(shm.row_epochs())),
+    )
+    .map(Arc::new)
 }
 
 /// Everything behind an [`Engine`] (and the handle a [`Txn`] keeps).
@@ -913,7 +932,11 @@ impl Engine {
         shm_config.reader_slots = options.reader_slots.max(1);
         shm_config.dir = options.shm_dir.clone();
         shm_config.first_seqno = first_seqno(catalog.counters.seqno_ceiling, 0);
+        shm_config.row_epoch_slots = crate::row_cache::table_slots(options.row_cache_bytes);
         let shm = ShmRegion::open(&vfs, &file, identity, db_id, ShmRole::Writer, &shm_config)?;
+        // A new generation, so new zero slots: reader processes re-attach, which clears their
+        // caches (D281; every writer open, a recovery's and a handover's too, builds one).
+        let row_epochs = Arc::new(crate::row_cache::RowEpochs::new(shm.row_epochs()));
         if held.is_none() {
             let presence = Presence::acquire(&file)?;
             *held = Some(Locks {
@@ -975,7 +998,9 @@ impl Engine {
                 options.row_cache_bytes,
                 options.row_cache_max_row,
                 options.row_cache_families.clone(),
+                Arc::clone(&row_epochs),
             ),
+            row_epochs: Some(row_epochs),
             sst_ids: Arc::new(AtomicU64::new(catalog.counters.next_sst.max(1))),
             blob_ids: Arc::new(AtomicU32::new(catalog.counters.next_blob_file.max(1))),
             live_views: Arc::clone(&live_views),
@@ -1587,6 +1612,7 @@ impl Engine {
             cache: Arc::clone(&cache),
             // Reader processes have no write watermarks, so no row cache (D201).
             row_cache: None,
+            row_epochs: None,
             sst_ids: Arc::new(AtomicU64::new(0)),
             blob_ids: Arc::new(AtomicU32::new(0)),
             live_views: Arc::new(LiveViews::default()),
@@ -1647,6 +1673,7 @@ impl Engine {
             file,
             presence: Mutex::new(Some(presence)),
             shm: Mutex::new(Attachment {
+                row_cache: reader_row_cache(&options, &shm),
                 shm,
                 pins: crate::snapshot::ReaderPins::new(slot),
             }),
@@ -1990,6 +2017,21 @@ impl Engine {
             let mut tries = 0;
             loop {
                 let snapshot = inner.snapshot()?;
+                // The generation's row cache first (D281); a hit is owned data.
+                if let Some(rc) = snapshot.reader_row_cache()
+                    && let Some(hit) = crate::row_cache::get_cached(
+                        rc,
+                        &snapshot.view,
+                        snapshot.seqno,
+                        inner.shared.vfs.now_micros(),
+                        table,
+                        family,
+                        row,
+                        qualifier,
+                    )
+                {
+                    return Ok(hit);
+                }
                 match inner.get(&snapshot, table, family, row, qualifier) {
                     Err(Error::SnapshotExpired) if tries < READER_EXPIRED_RETRIES => tries += 1,
                     other => return other,
@@ -2097,6 +2139,38 @@ impl Engine {
         ))
     }
 
+    /// A reader process's latest row read through its generation's row cache (D281): served
+    /// or read at `snapshot`, a fill stored only while the snapshot still protects what it
+    /// read, and the result checked as any snapshot read.
+    #[allow(clippy::too_many_arguments)]
+    fn read_row_cached_at(
+        &self,
+        rc: &crate::row_cache::RowCaches,
+        snapshot: &Snapshot,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: &mut impl read::RowSink,
+    ) -> Result<bool> {
+        snapshot.check_process()?;
+        let families = families_in_order(&snapshot.view, table, families)?;
+        let now = self.inner.shared.vfs.now_micros();
+        snapshot.checked(crate::row_cache::read_row_cached(
+            rc,
+            &snapshot.view,
+            snapshot.seqno,
+            table,
+            row,
+            &families,
+            spec,
+            now,
+            false,
+            sink,
+            || snapshot.check_current().is_ok(),
+        ))
+    }
+
     /// [`Engine::get_latest`] as a future that never blocks on a block the cache does not
     /// hold: it fetches what it misses through the VFS's asynchronous reads and reads again
     /// (D196, ICR 0014). Memtable and cache hits resolve on the first poll.
@@ -2190,7 +2264,13 @@ impl Engine {
             let mut tries = 0;
             loop {
                 let snapshot = inner.snapshot()?;
-                match self.read_row_into_families(&snapshot, table, row, families, spec, sink) {
+                let read = match snapshot.reader_row_cache() {
+                    Some(rc) if crate::row_cache::serves_spec(spec) => {
+                        self.read_row_cached_at(rc, &snapshot, table, row, families, spec, sink)
+                    }
+                    _ => self.read_row_into_families(&snapshot, table, row, families, spec, sink),
+                };
+                match read {
                     Err(Error::SnapshotExpired) if tries < READER_EXPIRED_RETRIES => tries += 1,
                     other => return other,
                 }
@@ -2203,7 +2283,17 @@ impl Engine {
                 && crate::row_cache::serves_spec(spec)
             {
                 return crate::row_cache::read_row_cached(
-                    rc, &view, seqno, table, row, &families, spec, now, false, sink,
+                    rc,
+                    &view,
+                    seqno,
+                    table,
+                    row,
+                    &families,
+                    spec,
+                    now,
+                    false,
+                    sink,
+                    || true,
                 );
             }
             return read::read_row_into(
@@ -2316,11 +2406,21 @@ impl Engine {
         crate::maintenance::shrink(&inner.shared)
     }
 
-    /// What the row cache did since open (D201); all zero when it is off or in a reader
-    /// process. A method rather than [`Metrics`] fields, which would break struct literals.
+    /// What the row cache did since open (D201); all zero when it is off. In a reader process,
+    /// its cache since the last attach to a writer generation (D281). A method rather than [`Metrics`] fields, which would break struct literals.
     pub fn row_cache_stats(&self) -> RowCacheStats {
         if self.inner.forked() {
             return RowCacheStats::default();
+        }
+        if let Some(r) = &self.inner.reader {
+            // A reader process: its current generation's cache (D281), from 0 at each
+            // re-attach.
+            let a = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
+            return a
+                .row_cache
+                .as_ref()
+                .map(|rc| rc.stats())
+                .unwrap_or_default();
         }
         self.inner
             .shared
@@ -4189,6 +4289,7 @@ impl Inner {
                 // Snapshots of the old generation leave the abandoned slot alone: they can no
                 // longer be read, so they must not hold this generation's pin back.
                 *a = Attachment {
+                    row_cache: reader_row_cache(&self.options, &shm),
                     shm,
                     pins: crate::snapshot::ReaderPins::new(slot),
                 };
@@ -4217,6 +4318,7 @@ impl Inner {
                 key,
                 shm: a.shm.clone(),
                 slot: a.pins.slot().ownership(),
+                row_cache: a.row_cache.clone(),
             });
             let shm = a.shm.clone();
             drop(guard);

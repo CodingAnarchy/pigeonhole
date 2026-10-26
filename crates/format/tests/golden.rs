@@ -600,12 +600,17 @@ fn shm() {
         64,
         4 << 20,
         64 << 20,
+        1 << 12,
         0x42,
         0x1234_5678,
     );
+    let h = ShmHeader {
+        row_epoch_seed: 0x5eed_5eed_5eed_5eed,
+        ..h
+    };
     let mut page = [0u8; 4096];
     h.encode(&mut page);
-    check("shm_header.bin", prefix(&page, 160));
+    check("shm_header.bin", prefix(&page, 184));
     let view = ViewRecord {
         view_version: 3,
         manifest_version: 12,

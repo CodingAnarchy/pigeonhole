@@ -2521,3 +2521,19 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 - The loom test of a skip with a concurrent writer, on the node field.
 - `engine/tests/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
 - `shm/tests/sim.rs`: a layout 3 region (and a newer one) is refused while other processes are attached, and rebuilt when the new writer is alone.
+
+## D281 — Reader processes have a row cache, keyed on the writer's write watermarks in shared memory (owner decision, 2026-10-26; cache, shm, engine, pigeonhole, #926; refines D201)
+
+**Decided:** a 1.0 item. Every reader process gets a row cache of its own, run on D201's epoch protocol against the writer's write watermarks, which move from the writer's memory into the shared-memory region (layout version 5). Design on #926, reviewed by perf287, with two must-fixes (M1, M2), both in.
+
+**Why:** #397's measurement put a reader process at 0.09× the writer process on hot rows with the row cache on (the default): 48k against 545k reads per second per reader, with a p50 of about 20 µs against 1 µs. D277 closed the cache-off part of the gap only.
+
+**How:**
+- **One table, shared:** `row_epoch_slots` atomic `u64`s in the region (FORMAT §11.7), sized from the writer's row cache (one per 256 bytes of `max(row_cache, 64 MiB)`, a power of two, at least 4,096), with the slot hash's seed in the header, random per generation. Every process's slot for a row is the same.
+- **The writer** raises a row's slot for every write, before the insert, whether or not its own row cache is on (perf287: a reader caching against slots nobody raises would serve stale rows for ever). Its own cache uses the same table.
+- **Per-process caches** of owned decoded rows: nothing points into the region, so a reader process's crash leaves nothing to repair and its cache pins nothing. Rejected: one cache in the region (a cross-process allocator, robust locks, shared eviction) and a per-process cache dropped whenever the view moves (useless under writes).
+- **A reader's latest row read** takes its snapshot, loads the slot after it, and serves or reads and fills as the writer does. A fill is stored only while the snapshot still protects what it read (the seqlock-style check every reader read makes), so a row read from reclaimed memory is never stored.
+- **Generations:** a reader's cache belongs to one region generation and is built empty at each attach. Every writer open builds a new generation, including D265's in-process recovery and the lock handover (both reopen through `open_writer`), so an entry filled against one generation's slots never meets another's (M2: the new slots start at zero, and a writer crash can lose visible `None` writes whose seqnos the next session reuses).
+- **M1:** the table's offset, slot count and seed are another process's data. `ShmHeader::decode`, run at every attach, refuses a table that is misaligned, not a nonzero power of two, overlapping the reader slots or arenas, or outside the region.
+- **Defaults:** 64 MiB per reader process, as the writer's (owner ruling), so N reader processes use up to N × 64 MiB, plus 16 bytes per slot for the cache's presence and admission tables (4 MiB at the defaults). The region grows by 8 bytes per slot (2 MiB). `ReaderOptions::row_cache*` and `PigeonholeReader::row_cache_stats` (ICR 0072).
+- **Not done:** a "slots maintained" header flag. The writer always maintains the table; the flag is the fallback only if callgrind shows a cost with the writer's own cache off (owner ruling). Async reads in a reader process (`get_async`, `read_row_async`) bypass its cache until #946.

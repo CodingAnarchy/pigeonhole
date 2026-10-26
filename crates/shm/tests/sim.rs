@@ -334,9 +334,10 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
 
 #[test]
 fn layout_version_mismatch_is_refused_unless_alone() {
-    // The previous layout (an older writer's region left behind, D277's upgrade: perf287's
-    // P3) and a newer one.
-    for other in [3, 5] {
+    // The previous layout (an older writer's region left behind: D277's upgrade, perf287's
+    // P3, and D281's) and a newer one.
+    let current = pigeonhole_format::ShmLayoutVersion::CURRENT.0;
+    for other in [current - 1, current + 1] {
         mismatch_refused_unless_alone(other);
     }
 }
@@ -693,4 +694,62 @@ fn a_claim_through_a_handle_holding_a_slots_byte_leaves_that_lock_alone() {
     drop(second);
     drop(first);
     assert_eq!(shm.reader_slot_usage().0, 0);
+}
+
+/// D281 (perf287's M1): the row-epoch table's offset, slot count and seed are another
+/// process's data, which a reader indexes and loads atomically. Each bad field is refused
+/// as corruption when a reader attaches, never mapped and indexed.
+#[test]
+fn a_bad_row_epoch_table_is_refused_at_attach() {
+    let sim = SimVfs::new(281);
+    let w = Proc::start(&sim, pid(1));
+    let (_lock, _wp, shm) = w.open_writer();
+    let r = Proc::start(&sim, pid(12));
+    let _rp = Presence::acquire(&r.file).unwrap();
+    assert!(r.open(Role::Reader).is_ok(), "the good header attaches");
+    w.enter();
+    let name = region_name(w.identity.device, w.identity.inode, shm.generation().0);
+    let region = w
+        .vfs
+        .open_shared(&name, None, 4096, SharedOpen::Attach)
+        .unwrap();
+    let off = region
+        .atomic_u64(header::ROW_EPOCHS_OFF)
+        .load(Ordering::Relaxed);
+    let slots = region
+        .atomic_u32(header::ROW_EPOCH_SLOTS)
+        .load(Ordering::Relaxed);
+    let arenas = region
+        .atomic_u64(header::ARENAS_OFF)
+        .load(Ordering::Relaxed);
+    let bad_off = [
+        ("misaligned", off + 8),
+        ("over the reader slots", off - 64),
+        ("past the arenas", arenas),
+    ];
+    for (what, v) in bad_off {
+        region
+            .atomic_u64(header::ROW_EPOCHS_OFF)
+            .store(v, Ordering::Relaxed);
+        let err = r.open(Role::Reader).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{what}: {err}");
+    }
+    region
+        .atomic_u64(header::ROW_EPOCHS_OFF)
+        .store(off, Ordering::Relaxed);
+    for (what, v) in [
+        ("no slots", 0),
+        ("not a power of two", slots - 1),
+        ("too many", 1 << 31),
+    ] {
+        region
+            .atomic_u32(header::ROW_EPOCH_SLOTS)
+            .store(v, Ordering::Relaxed);
+        let err = r.open(Role::Reader).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{what}: {err}");
+    }
+    region
+        .atomic_u32(header::ROW_EPOCH_SLOTS)
+        .store(slots, Ordering::Relaxed);
+    assert!(r.open(Role::Reader).is_ok(), "restored");
 }

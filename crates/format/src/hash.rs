@@ -25,3 +25,7 @@ pub type FastMap<K, V> = HashMap<K, V, FastBuildHasher>;
 
 /// A `HashSet` with the [`FastBuildHasher`].
 pub type FastSet<T> = HashSet<T, FastBuildHasher>;
+
+/// The same hasher with a chosen seed, for a hash several processes must agree on: the
+/// row-epoch slot of a `(table, row)` (D281), seeded per shared-memory generation.
+pub type SeededBuildHasher = foldhash::fast::FixedState;

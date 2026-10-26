@@ -49,7 +49,15 @@ assert!(rt.get(b"s", "f", b"q")?.is_some());
 - **How the writer tells:** each reader holds a byte-range lock on the database file for its slot, and the operating system releases it when the process exits, however it exits. The writer frees a slot only once it can take that lock itself (#693). It never looks at process ids, so a live reader is never judged dead, whatever its PID namespace.
 
 ## Overwritten rows read as fast as in the writer
-The writer records, in each memtable entry it links in front of an older version of the same column, where that column's versions end (D194). Reader processes jump by the same field (D277), so a row overwritten many times costs a reader process what it costs the writer process: on the 16 hottest rows of ycsb-a it was 3× slower before, with the row cache off. The writer's row cache still has no counterpart in reader processes ([#926](https://github.com/CodingAnarchy/pigeonhole/issues/926)).
+The writer records, in each memtable entry it links in front of an older version of the same column, where that column's versions end (D194). Reader processes jump by the same field (D277), so a row overwritten many times costs a reader process what it costs the writer process: on the 16 hottest rows of ycsb-a it was 3× slower before, with the row cache off.
+
+## Hot rows: each reader process has a row cache
+A reader process keeps the newest version of small, hot rows in a row cache of its own, as the writer does (D281): latest row reads and point gets of a cached row cost about what they cost in the writer process. Results are identical to uncached reads. The writer raises a per-row write watermark in shared memory for every write, and a reader's cached copy of a row misses as soon as the reader can see a newer write to it.
+
+- **Size:** `ReaderOptions::row_cache(bytes)`, 64 MiB by default, as the writer's; `0` turns it off. **Each reader process has its own:** N reader processes use up to N × 64 MiB by default, plus about 4 MiB each for the cache's per-row tables. `row_cache_max_row` and `row_cache_family` work as on `Options`.
+- **Counts:** `PigeonholeReader::row_cache_stats()`: hits, misses and fills.
+- **A new writer empties it:** when the writer restarts, recovers or hands over (a new shared-memory generation), the reader re-attaches with an empty cache and the counts start again.
+- **What bypasses it:** snapshot reads, scans, multi-version reads, and, until [#946](https://github.com/CodingAnarchy/pigeonhole/issues/946), the async reads (`get_async` and the async row read).
 
 ## Long-held snapshots stall the writer
 A reader's oldest live snapshot pins the writer's state as of that snapshot: the memtables and file space the writer would otherwise reclaim. Only live snapshots pin. Once a reader drops its oldest snapshot the pin moves up to its next oldest, and a reader holding no snapshot pins nothing, however long it stays open (#693). A reader that holds one snapshot for a long time while the writer keeps committing eventually fills the writer's memtable budget. The writer's commits then wait for room, and fail with `Busy` after `Options::write_stall_timeout` (30 s by default).
@@ -64,7 +72,7 @@ Every limit is an error, never a hang:
 | Limit | What happens | Remedy |
 |---|---|---|
 | Reader slots: `Options::reader_slots` (default 128, at most 65,536) | One more `open_reader` fails with `NoReaderSlot` at once | Close idle readers, or open the writer with more slots |
-| Shared memory: about `memtable_budget × shards + 10 MiB` | The writer's open fails with `ShmUnavailable` if it can't be allocated | Free space in `/dev/shm`, give the container more, or use `shm_dir` |
+| Shared memory: about `memtable_budget × shards + 12 MiB` | The writer's open fails with `ShmUnavailable` if it can't be allocated | Free space in `/dev/shm`, give the container more, or use `shm_dir` |
 | A view larger than its shared-memory buffer (very many tablets) | `ViewTooLarge` | Fewer tablets |
 | A reader snapshot holding the writer's memory | The writer's commits fail with `Busy` after `write_stall_timeout` | Drop old snapshots (see above) |
 | A published view without its manifest | A new snapshot fails with `Busy` after about 1 s (D149) | Retry |
@@ -78,7 +86,7 @@ Every limit is an error, never a hang:
   - **Keeping the descriptor:** on Linux the slot's lock lives on in the child, so if the parent dies first, its slot stays held until the child exits.
   - **Only `fork(3)` is detected,** through `pthread_atfork`, as Python's `os.fork` and `multiprocessing` use it. `_Fork`, `vfork` and a raw `clone` syscall skip the fork handlers: never use a reader after those without `exec`.
 - **Write permission on the file.** A reader opens the file read-write (D36), because the processes coordinate with byte-range locks, some of them exclusive. It writes nothing.
-- **Same build layout.** The writer and every reader need the same shared-memory layout. Stop reader processes before upgrading the writer: a writer with a newer layout fails with `ShmVersionMismatch` while older readers are attached. Upgrade reader processes in lockstep with the writer: this release's layout (4, D277) gives memtable nodes a stale-tail field, so readers from earlier releases can't attach to a writer from this one, nor the reverse (`ShmVersionMismatch`). Once every older process has closed, the new writer rebuilds the shared memory.
+- **Same build layout.** The writer and every reader need the same shared-memory layout. Stop reader processes before upgrading the writer: a writer with a newer layout fails with `ShmVersionMismatch` while older readers are attached. Upgrade reader processes in lockstep with the writer: this release's layout (5, D281) adds the row caches' write watermarks, and layout 4 (D277) gave memtable nodes a stale-tail field, so readers from earlier releases can't attach to a writer from this one, nor the reverse (`ShmVersionMismatch`). Once every older process has closed, the new writer rebuilds the shared memory.
 - **Windows, across sessions.** Shared memory lives in the session's `Local\` namespace by default, so a reader in another session (a service and a desktop process, for example) can't attach. Give the writer and every reader the same `shm_dir` (`Options::shm_dir`, `ReaderOptions::shm_dir`): a file-backed mapping that any session can open.
 - **Block cache per process.** Each reader has its own block cache, 256 MiB by default (`ReaderOptions::block_cache`), on top of the writer's.
 

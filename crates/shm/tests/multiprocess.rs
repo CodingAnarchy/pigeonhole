@@ -489,7 +489,7 @@ fn mismatched_layout_version_is_refused() {
     let (mapping, _, _) = shm.arena(0);
     mapping
         .atomic_u32(header::LAYOUT_VERSION)
-        .store(5, Ordering::Release);
+        .store(6, Ordering::Release);
     db.vfs
         .open_shared(
             &directory_name(db.identity.device, db.identity.inode),
@@ -499,12 +499,12 @@ fn mismatched_layout_version_is_refused() {
         )
         .unwrap()
         .atomic_u32(directory::LAYOUT_VERSION)
-        .store(5, Ordering::Release);
+        .store(6, Ordering::Release);
 
     let mut reader = Peer::spawn("reader", &db.path);
     let answer = reader.recv();
     assert!(
-        answer.starts_with("ERR VersionMismatch") && answer.contains("found: 5"),
+        answer.starts_with("ERR VersionMismatch") && answer.contains("found: 6"),
         "{answer}"
     );
     drop(reader);

@@ -62,8 +62,10 @@ impl ShmLayoutVersion {
     /// version 2 reader takes no such lock and would look dead to a version 3 writer.
     /// Version 4 gives every memtable node a stale-tail offset (D277; the memtable header's
     /// version 2), so reader processes skip superseded versions as the writer does: a
-    /// version 3 reader would misread every node's tower and key.
-    pub const CURRENT: Self = Self(4);
+    /// version 3 reader would misread every node's tower and key. Version 5 adds the
+    /// row-epoch table the row caches of every process share (D281): a version 4 writer
+    /// would not raise its slots, so a version 5 reader's cache would serve stale rows.
+    pub const CURRENT: Self = Self(5);
 }
 
 /// Magic at offset 0 of each superblock (pages 0 and 1).

@@ -207,7 +207,7 @@ impl Options {
     /// [`ErrorCode::BatchTooLarge`](crate::ErrorCode::BatchTooLarge).
     ///
     /// The shared-memory region holds every shard's arena (each rounded up to 2 MiB) plus
-    /// about 10 MiB of views and reader slots, 266 MiB for the default budget on 4 CPUs: on
+    /// about 12 MiB of views, reader slots and row epochs, 268 MiB for the default budget on 4 CPUs: on
     /// Linux, memory in `/dev/shm` (or a file
     /// in [`shm_dir`](Options::shm_dir)), used only as the memtables fill. Opening checks
     /// that the filesystem has that much free and fails with
@@ -343,8 +343,9 @@ impl Options {
     /// latest row reads (newest version, no time range) and point gets from it, without
     /// merging the row's sources. A family row is stored the second time a read misses it,
     /// so rows read once are never stored. Results are identical to uncached reads; a write
-    /// to a row makes its cached copy miss at once (D201). Writer process only; snapshot
-    /// reads, scans and multi-version reads bypass it.
+    /// to a row makes its cached copy miss at once (D201). Snapshot reads, scans and
+    /// multi-version reads bypass it. Reader processes have their own
+    /// ([`ReaderOptions::row_cache`], D281).
     pub fn row_cache(mut self, bytes: usize) -> Self {
         self.row_cache = bytes;
         self
@@ -577,9 +578,40 @@ pub struct ReaderOptions {
     io_backend: Option<IoBackend>,
     direct_io: Option<bool>,
     vfs: Option<VfsRef>,
+    row_cache: Option<usize>,
+    row_cache_max_row: Option<usize>,
+    row_cache_families: Vec<(String, String)>,
 }
 
 impl ReaderOptions {
+    /// Row cache capacity in bytes (default 64 MiB, as the writer's; 0 turns it off; D281).
+    /// Each reader process has its own, so N reader processes use up to N × 64 MiB by
+    /// default, plus 16 bytes per row-epoch slot of the writer's table (4 MiB at the
+    /// defaults). It serves latest row reads and point gets as
+    /// [`Options::row_cache`] does in the writer, with results identical to uncached reads: a
+    /// write the reader can see makes the row's cached copy miss at once, through the
+    /// writer's write watermarks in shared memory. Emptied whenever the reader re-attaches to
+    /// a new writer (a restart, a recovery).
+    pub fn row_cache(mut self, bytes: usize) -> Self {
+        self.row_cache = Some(bytes);
+        self
+    }
+
+    /// Largest family row the reader's row cache stores, as
+    /// [`Options::row_cache_max_row`] (default 4 KiB).
+    pub fn row_cache_max_row(mut self, bytes: usize) -> Self {
+        self.row_cache_max_row = Some(bytes);
+        self
+    }
+
+    /// Serve only these families from the reader's row cache, as
+    /// [`Options::row_cache_family`]: call once per `(table, family)`.
+    pub fn row_cache_family(mut self, table: &str, family: &str) -> Self {
+        self.row_cache_families
+            .push((table.to_owned(), family.to_owned()));
+        self
+    }
+
     /// Block cache capacity in bytes (each reader process has its own).
     pub fn block_cache(mut self, bytes: usize) -> Self {
         self.block_cache = Some(bytes);
@@ -923,6 +955,11 @@ impl ReaderOptions {
         }
         o.shm_dir.clone_from(&self.shm_dir);
         o.allow_fuse = self.allow_fuse;
+        o.row_cache_bytes = self.row_cache.unwrap_or(DEFAULT_ROW_CACHE);
+        if let Some(bytes) = self.row_cache_max_row {
+            o.row_cache_max_row = bytes;
+        }
+        o.row_cache_families.clone_from(&self.row_cache_families);
         for op in &self.merge_operators {
             o.merge_operators.register(Arc::clone(op));
         }
