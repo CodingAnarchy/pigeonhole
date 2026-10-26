@@ -138,6 +138,22 @@ impl SharedRegion {
         unsafe { AtomicU64::from_ptr(p.cast()) }
     }
 
+    /// The `n` consecutive `AtomicU64`s from `offset` (8-byte aligned), with one bounds and
+    /// one alignment check for all of them: a hot reader of several header words (shm's
+    /// snapshot seqno, D278) pays for one. Panics if out of bounds or misaligned.
+    pub fn atomic_u64s(&self, offset: usize, n: usize) -> &[AtomicU64] {
+        let len = n.checked_mul(8).expect("AtomicU64 run length overflows");
+        let p = self.at(offset, len);
+        assert!(
+            p.cast::<AtomicU64>().is_aligned(),
+            "misaligned AtomicU64 at {offset}"
+        );
+        // SAFETY: `n` words in bounds and aligned (checked above), non-null (inside the
+        // allocation); the memory lives as long as `self` and is only ever accessed
+        // atomically.
+        unsafe { std::slice::from_raw_parts(p.cast::<AtomicU64>(), n) }
+    }
+
     /// Copies `dst.len()` bytes out of the region (relaxed atomic loads, a word at a time; may
     /// observe concurrent writes, which callers detect with checksums or version re-checks).
     /// Panics if out of bounds.
@@ -302,6 +318,21 @@ impl fmt::Debug for SharedRegion {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn a_run_of_atomic_words_is_the_single_words() {
+        let r = SharedRegion::heap(4096);
+        r.atomic_u64(136).store(7, Ordering::Relaxed);
+        r.atomic_u64(192).store(9, Ordering::Relaxed);
+        let words = r.atomic_u64s(136, 8);
+        assert_eq!(words.len(), 8);
+        assert_eq!(words[0].load(Ordering::Relaxed), 7);
+        assert_eq!(words[7].load(Ordering::Relaxed), 9);
+        words[1].store(3, Ordering::Relaxed);
+        assert_eq!(r.atomic_u64(144).load(Ordering::Relaxed), 3);
+        assert!(std::panic::catch_unwind(|| r.atomic_u64s(4088, 2).len()).is_err());
+        assert!(std::panic::catch_unwind(|| r.atomic_u64s(4, 1).len()).is_err());
+    }
 
     #[test]
     fn heap_is_zeroed_and_aligned() {

@@ -119,9 +119,24 @@ impl Inner {
         self.h64(header::VIEW_POINTER).load(order)
     }
 
+    /// `NEXT_SEQNO` then `CROSS_HELD` (Acquire, in that order: FORMAT §11.3), through one
+    /// checked run of header words rather than two checked accesses.
+    #[inline(always)]
+    fn next_and_held(&self) -> (Seqno, Seqno) {
+        const WORDS: usize = (header::CROSS_HELD - header::NEXT_SEQNO) / 8 + 1;
+        const _: () = assert!(
+            header::CROSS_HELD > header::NEXT_SEQNO
+                && (header::CROSS_HELD - header::NEXT_SEQNO).is_multiple_of(8)
+        );
+        let words = self.region.atomic_u64s(header::NEXT_SEQNO, WORDS);
+        let next = words[0].load(Ordering::Acquire);
+        // After `NEXT_SEQNO`: a decision holds its seqno here before the mirror passes it.
+        (next, words[WORDS - 1].load(Ordering::Acquire))
+    }
+
     fn visible_seqno(&self) -> Seqno {
-        let next = self.h64(header::NEXT_SEQNO).load(Ordering::Acquire);
-        let mut lowest = next;
+        let (next, held) = self.next_and_held();
+        let mut lowest = next.min(held);
         for shard in 0..self.header.shard_count {
             lowest = lowest.min(self.pending(shard).load(Ordering::Acquire));
         }
@@ -131,8 +146,8 @@ impl Inner {
     /// As [`visible_seqno`](Self::visible_seqno), also below every shard's durable
     /// watermark: never above the visible seqno.
     fn durable_seqno(&self) -> Seqno {
-        let next = self.h64(header::NEXT_SEQNO).load(Ordering::Acquire);
-        let mut lowest = next;
+        let (next, held) = self.next_and_held();
+        let mut lowest = next.min(held);
         for shard in 0..self.header.shard_count {
             lowest = lowest
                 .min(self.pending(shard).load(Ordering::Acquire))
@@ -247,6 +262,7 @@ fn init_region(
         .copy_from_slice(&writer.start_time.to_le_bytes());
     page[header::NEXT_SEQNO..header::NEXT_SEQNO + 8]
         .copy_from_slice(&first_seqno.max(1).to_le_bytes());
+    page[header::CROSS_HELD..header::CROSS_HELD + 8].copy_from_slice(&u64::MAX.to_le_bytes());
     region.write(0, &page);
     for shard in 0..h.shard_count {
         let off = h.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
@@ -788,17 +804,28 @@ impl ShmRegion {
             .fetch_max(to, Ordering::AcqRel);
     }
 
-    /// Publishes `shard`'s pending watermark with release ordering: the minimum of its current
-    /// group's lower bound and every cross-shard seqno it coordinates and has not released;
-    /// `u64::MAX` when it holds nothing, so an idle shard never holds back snapshots.
+    /// Publishes `shard`'s pending watermark with release ordering: its current group's
+    /// lower bound; `u64::MAX` when it holds nothing, so an idle shard never holds back
+    /// snapshots.
     pub fn publish_pending(&self, shard: u32, pending: Seqno) {
         self.inner.pending(shard).store(pending, Ordering::Release);
     }
 
+    /// Publishes the lowest decided cross-shard seqno not yet applied on every participant
+    /// (layout version 6, D278), with release ordering; `u64::MAX` when none. Snapshots stay
+    /// below it. One writer at a time: the writer process's allocator stores it under its
+    /// lock, before the `NEXT_SEQNO` mirror passes a new decision's seqno.
+    pub fn publish_cross_held(&self, held: Seqno) {
+        self.inner
+            .h64(header::CROSS_HELD)
+            .store(held, Ordering::Release);
+    }
+
     /// The highest seqno a new snapshot may include: every commit at or below it is applied
-    /// on every shard: the minimum of `NEXT_SEQNO` and every shard's pending watermark, so
-    /// one Acquire load per shard plus one. Always inlined: left to the linker it was
-    /// outlined into a call on the point-get path (12 instructions, #836 round 6).
+    /// on every shard: the minimum of `NEXT_SEQNO`, the cross-shard hold (`CROSS_HELD`, D278)
+    /// and every shard's pending watermark, so one Acquire load per shard plus two. Always
+    /// inlined: left to the linker it was outlined into a call on the point-get path (12
+    /// instructions, #836 round 6).
     #[inline(always)]
     pub fn visible_seqno(&self) -> Seqno {
         self.inner.visible_seqno()
@@ -1386,7 +1413,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 5
+                expected: 6
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });

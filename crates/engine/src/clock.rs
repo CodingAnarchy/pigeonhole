@@ -7,7 +7,12 @@
 //! `H` is the largest default timestamp handed out; `F` says the last reservation was a
 //! cross-shard decision, so a group reserved in the same µs takes `H + 1` and cannot tie
 //! with the decision's cells (D271, the owner's ruling on the same-µs tie).
+//!
+//! It also holds every decided cross-shard seqno until its last participant applied
+//! (D278), published as shm `CROSS_HELD` under the same lock, so whichever shard thread
+//! applies last releases it.
 
+use std::collections::BTreeSet;
 use std::sync::{Mutex, PoisonError};
 
 use pigeonhole_format::{Seqno, Timestamp};
@@ -24,9 +29,19 @@ struct State {
     decided: bool,
     /// The drift gauge: the largest lead of `H` over the clock at any reservation.
     max_lead: u64,
+    /// Decided cross-shard seqnos not yet applied on every participant (D278).
+    held: BTreeSet<Seqno>,
 }
 
-/// `(S, H, F)` under one lock.
+impl State {
+    /// Publishes the lowest held seqno (`u64::MAX` when none) as shm `CROSS_HELD`: under
+    /// the lock, so stores never land out of order.
+    fn publish_held(&self, shm: &ShmRegion) {
+        shm.publish_cross_held(self.held.first().copied().unwrap_or(u64::MAX));
+    }
+}
+
+/// `(S, H, F)` and the decided seqnos held from readers, under one lock.
 #[derive(Debug, Default)]
 pub(crate) struct Reservation {
     state: Mutex<State>,
@@ -109,7 +124,9 @@ impl Reservation {
     }
 
     /// A cross-shard decision's seqno and timestamp: strictly above every default timestamp
-    /// handed out before it.
+    /// handed out before it. The seqno is held from readers (shm `CROSS_HELD`) until
+    /// [`release`](Self::release): published before the `NEXT_SEQNO` mirror passes it, so
+    /// a reader that sees the mirror past it sees the hold too (FORMAT §11.3).
     pub(crate) fn reserve_decision(&self, now: Timestamp, shm: &ShmRegion) -> (Seqno, Timestamp) {
         let (s, t) = {
             let mut st = self.lock();
@@ -119,10 +136,28 @@ impl Reservation {
             st.h = t;
             st.decided = true;
             st.max_lead = st.max_lead.max(t - now);
+            st.held.insert(s);
+            st.publish_held(shm);
             (s, t)
         };
         shm.advance_next_seqno(s + 1);
         (s, t)
+    }
+
+    /// Every participant of the decision at `seqno` applied its share (D278): readers may see
+    /// it. Called once per decision, from the shard thread that applied last.
+    pub(crate) fn release(&self, seqno: Seqno, shm: &ShmRegion) {
+        let mut st = self.lock();
+        let held = st.held.remove(&seqno);
+        debug_assert!(held, "decision {seqno} released twice or never held");
+        st.publish_held(shm);
+    }
+
+    /// The lowest decided seqno still held (`u64::MAX` when none): the shard's watermarks
+    /// stay below it (its durable one and its checkpoint's view of what readers may see).
+    #[cfg(test)]
+    pub(crate) fn lowest_held(&self) -> Seqno {
+        self.lock().held.first().copied().unwrap_or(u64::MAX)
     }
 
     /// A tablet changes owner: the next stamp anywhere is strictly above every one handed out,
@@ -173,5 +208,25 @@ mod tests {
         let (_, b) = r.reserve_group(1, 1, 500, a, &shm);
         let (_, c) = r.reserve_group(1, 1, 900, b, &shm);
         assert_eq!((a, b, c), (500, 501, 900));
+    }
+
+    #[test]
+    fn a_decision_is_held_from_snapshots_until_released_in_any_order() {
+        let (r, shm) = (Reservation::default(), shm());
+        r.seed_seqno(5);
+        let (a, _) = r.reserve_decision(10, &shm);
+        let (b, _) = r.reserve_decision(10, &shm);
+        let (g, _) = r.reserve_group(1, 1, 10, 0, &shm);
+        assert_eq!((a, b, g, shm.next_seqno()), (5, 6, 7, 8));
+        // The group's shard published nothing pending: only the holds stop snapshots.
+        assert_eq!(r.lowest_held(), a);
+        assert_eq!(shm.visible_seqno(), a - 1);
+        // The later decision finishing first frees nothing yet.
+        r.release(b, &shm);
+        assert_eq!(shm.visible_seqno(), a - 1);
+        r.release(a, &shm);
+        assert_eq!(r.lowest_held(), u64::MAX);
+        assert_eq!(shm.visible_seqno(), g);
+        assert_eq!(shm.durable_seqno(), g);
     }
 }

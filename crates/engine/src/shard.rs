@@ -1395,6 +1395,10 @@ pub(crate) enum WakeReason {
     Doomed { priority: CommitPriority },
 }
 
+/// A decision as a participant applies it: the seqno and timestamp, the holders and the
+/// completion (D263, D266, D278; all empty for an abort).
+type Decided = (Seqno, Timestamp, Option<Holders>, Option<Arc<Completion>>);
+
 /// Messages a shard handles. An engine enum, so the queue hot path has no boxing.
 #[derive(Debug)]
 pub(crate) enum ShardMsg {
@@ -1435,6 +1439,9 @@ pub(crate) enum ShardMsg {
         /// share's PREPARE leaves the log once each one's flushed-through seqno passes it
         /// (D266). `None` for an abort.
         participants: Option<Holders>,
+        /// A commit's completion (D278): the participant that applies last releases the
+        /// seqno and answers the client. `None` for an abort.
+        completion: Option<Arc<Completion>>,
     },
     Applied {
         seqno: Seqno,
@@ -1750,6 +1757,8 @@ struct Coord {
     commit_ts: Timestamp,
     /// The seqno reserved and held at the decision (D263), 0 before.
     apply_seqno: Seqno,
+    /// Once the DECISION is written to commit: the reply moved here (D278).
+    completion: Option<Arc<Completion>>,
     epoch: u64,
     /// The commit's priority, the same across its retries (D249).
     priority: CommitPriority,
@@ -1758,6 +1767,45 @@ struct Coord {
     gives_up: bool,
     /// This attempt's number, from 1.
     attempt: u32,
+}
+
+/// A cross-shard commit decided to commit, shared by its participants (D278): each one
+/// counts down once its share is applied and in its published view, and the one that
+/// reaches zero releases the seqno (`Reservation::release`) and answers the client, without
+/// a hop back to the coordinator. A participant that cannot apply never counts down, so
+/// the seqno stays held for good, and the coordinator answers `OutcomeUnknown` from its
+/// `Applied` (`on_applied`), as for a shard's death.
+#[derive(Debug)]
+pub(crate) struct Completion {
+    /// Participants yet to apply.
+    remaining: AtomicU32,
+    /// The seqno the commit applies at, held until `remaining` reaches zero.
+    apply_seqno: Seqno,
+    /// The coordinator, whose metrics count the commit.
+    coordinator: ShardId,
+    /// The answer: taken once, by the last participant or by the coordinator when the
+    /// commit cannot finish.
+    done: Mutex<Option<Done>>,
+}
+
+/// What a [`Completion`] answers the client with.
+#[derive(Debug)]
+struct Done {
+    reply: Notifier<Result<Settled>>,
+    durability: Durability,
+    submitted_at: u64,
+    /// The DECISION was written but its sync failed: committed, durability not promised.
+    failed: Option<Error>,
+}
+
+impl Completion {
+    /// Takes the answer, if nobody has yet.
+    fn take(&self) -> Option<Done> {
+        self.done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
 }
 
 /// A PREPARE this shard refused because it overlapped an undecided share (D249).
@@ -2672,8 +2720,6 @@ pub(crate) struct ShardState {
     sync_nanos: u64,
     sync_since: u64,
     next_group: u64,
-    /// Cross-shard seqnos this shard coordinates, not yet applied everywhere.
-    held: BTreeSet<Seqno>,
     /// The lowest seqno of a group whose WAL sync failed (D85): never durable, so the
     /// durable watermark stays below it for good (D227, ICR 0037).
     sync_failed_floor: Seqno,
@@ -3079,7 +3125,6 @@ impl std::fmt::Debug for ShardState {
             .field("memtables", &self.memtables.len())
             .field("pending", &self.pending.len())
             .field("unresolved", &self.unresolved.len())
-            .field("held", &self.held)
             .field("log", &self.log.len())
             .finish_non_exhaustive()
     }
@@ -3131,7 +3176,6 @@ impl ShardState {
             sync_nanos: 0,
             sync_since: 0,
             next_group: 1,
-            held: BTreeSet::new(),
             sync_failed_floor: u64::MAX,
             published_durable: std::cell::Cell::new(u64::MAX),
             coord: HashMap::new(),
@@ -4696,32 +4740,28 @@ impl ShardState {
 
     // ---- watermarks and timestamps ----
 
-    /// The lowest seqno this shard holds back from readers: a cross-shard commit it
-    /// coordinates that is not applied everywhere (`held`), or a group whose records are not
+    /// The lowest seqno this shard holds back from readers: a group whose records are not
     /// yet where a crash recovers them (`Group::unwritten`). A group waiting only for its
     /// sync does not hold it: a commit is visible once written and applied, and its future
-    /// still resolves only when its durability is met (D227, amending D19).
+    /// still resolves only when its durability is met (D227, amending D19). A decided
+    /// cross-shard seqno is held by the allocator instead, until its last participant
+    /// applied (shm `CROSS_HELD`, D278).
     fn watermark(&self) -> Seqno {
-        let held = self.held.first().copied().unwrap_or(u64::MAX);
-        let groups = self
-            .unresolved
+        self.unresolved
             .iter()
             .filter(|g| g.unwritten)
             .filter_map(|g| g.first)
             .min()
-            .unwrap_or(u64::MAX);
-        held.min(groups)
+            .unwrap_or(u64::MAX)
     }
 
-    /// `watermark()`, and the durable watermark, in one pass over `held` and `unresolved`.
-    /// The durable one is the lowest seqno this shard holds that is not yet durable at its
-    /// level: `held`, every unresolved group (its sync has not returned: D19's rule, which
-    /// durable snapshots keep; D227, ICR 0037), and a group whose sync failed
-    /// (`sync_failed_floor`).
+    /// `watermark()`, and the durable watermark, in one pass over `unresolved`. The durable
+    /// one is the lowest seqno this shard holds that is not yet durable at its level: every
+    /// unresolved group (its sync has not returned: D19's rule, which durable snapshots
+    /// keep; D227, ICR 0037), and a group whose sync failed (`sync_failed_floor`).
     #[inline]
     fn watermarks(&self) -> (Seqno, Seqno) {
-        let held = self.held.first().copied().unwrap_or(u64::MAX);
-        let (mut pending, mut durable) = (held, held.min(self.sync_failed_floor));
+        let (mut pending, mut durable) = (u64::MAX, self.sync_failed_floor);
         for g in &self.unresolved {
             if let Some(first) = g.first {
                 durable = durable.min(first);
@@ -7326,10 +7366,39 @@ impl ShardState {
                     (Err(_), true) => false,
                     (Err(_), false) => true,
                 };
+                let mut completion = None;
+                // Without its entry no `Completion` is made and nobody would release the
+                // seqno: every later commit's visibility would stall (perf287's note 1 on
+                // D278). Entries leave only in `on_applied`, after every `Decide`.
+                debug_assert!(
+                    self.coord.contains_key(&m.seqno),
+                    "a DECISION for {} settled with no coordinator entry",
+                    m.seqno
+                );
                 if let Some(c) = self.coord.get_mut(&m.seqno) {
                     c.committing = commit;
                     if let Err(e) = result {
                         c.failed = Some(e);
+                    }
+                    // The answer moves to the participants: the last to apply gives it
+                    // (D278). A written DECISION whose sync failed is committed, but answered
+                    // with that error, as before.
+                    if commit && let Some(reply) = c.reply.take() {
+                        let done = Arc::new(Completion {
+                            remaining: AtomicU32::new(
+                                u32::try_from(participants.len()).expect("few participants"),
+                            ),
+                            apply_seqno,
+                            coordinator: self.id,
+                            done: Mutex::new(Some(Done {
+                                reply,
+                                durability: c.durability,
+                                submitted_at: c.submitted_at,
+                                failed: c.failed.take(),
+                            })),
+                        });
+                        c.completion = Some(Arc::clone(&done));
+                        completion = Some(done);
                     }
                 }
                 if !commit {
@@ -7348,6 +7417,7 @@ impl ShardState {
                             priority,
                             last: true,
                             participants: commit.then(|| Arc::clone(&participants)),
+                            completion: completion.clone(),
                         },
                         ctx,
                     );
@@ -7427,6 +7497,7 @@ impl ShardState {
                 // Picked at the decision (`decide_commit`, D263, D271).
                 commit_ts: 0,
                 apply_seqno: 0,
+                completion: None,
                 epoch: self.shared.tablet_epoch.load(Ordering::Acquire),
                 priority,
                 gives_up: false,
@@ -7518,18 +7589,13 @@ impl ShardState {
 
     /// D263, D271: the decision's seqno and timestamp, from the one allocator: the timestamp
     /// strictly above every default timestamp handed out before it, on any shard, and the
-    /// allocator's flag puts every later one strictly above it. The seqno is held until every
-    /// participant has applied.
+    /// allocator's flag puts every later one strictly above it. The allocator holds the
+    /// seqno from readers until the last participant applied (D278), or the coordinator
+    /// releases it after an abort (`on_applied`).
     fn decide_commit(&mut self) -> (Seqno, Timestamp) {
-        let shm = &self.shared.shm;
-        let shard = u32::from(self.id.0);
-        // The mirror never passes the allocator's `S`, so it is a lower bound (§11.3 step 1).
-        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
         let now = self.shared.vfs.now_micros();
-        let (apply_seqno, commit_ts) = self.shared.clock.reserve_decision(now, shm);
-        self.held.insert(apply_seqno);
+        let (apply_seqno, commit_ts) = self.shared.clock.reserve_decision(now, &self.shared.shm);
         self.note_stamped(commit_ts);
-        self.publish_watermark();
         (apply_seqno, commit_ts)
     }
 
@@ -7609,6 +7675,7 @@ impl ShardState {
                         priority,
                         last,
                         participants: None,
+                        completion: None,
                     },
                     ctx,
                 );
@@ -7645,6 +7712,7 @@ impl ShardState {
                         priority,
                         last: true,
                         participants: None,
+                        completion: None,
                     },
                     ctx,
                 );
@@ -7681,7 +7749,7 @@ impl ShardState {
         &mut self,
         seqno: Seqno,
         commit: bool,
-        at: (Seqno, Timestamp, Option<Holders>),
+        at: Decided,
         coordinator: ShardId,
         priority: CommitPriority,
         last: bool,
@@ -7727,7 +7795,7 @@ impl ShardState {
         &mut self,
         seqno: Seqno,
         commit: bool,
-        (apply_seqno, commit_ts, holders): (Seqno, Timestamp, Option<Holders>),
+        (apply_seqno, commit_ts, holders, completion): Decided,
         coordinator: ShardId,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
@@ -7815,6 +7883,15 @@ impl ShardState {
                     self.poison(crate::health::FailureCause::Internal);
                     error = error.or(Some(PrepareError::Io));
                 }
+                // Applied and in the published view: count down (D278). The decrement is
+                // AcqRel, so the last one sees every other share applied. A share not applied
+                // never counts down, and the seqno stays held.
+                if error.is_none()
+                    && let Some(done) = completion
+                    && done.remaining.fetch_sub(1, Ordering::AcqRel) == 1
+                {
+                    self.complete(&done, ctx);
+                }
                 if self.freeze(false).is_err() {
                     self.poison(crate::health::FailureCause::Internal);
                 }
@@ -7853,6 +7930,37 @@ impl ShardState {
             },
             ctx,
         );
+    }
+
+    /// Every participant of a commit applied its share, this one last (D278): readers may
+    /// see it, and the client hears its outcome, before the coordinator hears `Applied`.
+    fn complete(&self, done: &Completion, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.shared
+            .clock
+            .release(done.apply_seqno, &self.shared.shm);
+        self.shared.wake_visible();
+        let Some(Done {
+            reply,
+            durability,
+            submitted_at,
+            failed,
+        }) = done.take()
+        else {
+            // The coordinator's shard stopped and answered it already.
+            return;
+        };
+        let outcome = match failed {
+            Some(e) => Err(e),
+            None => {
+                let in_flight = ctx.now_nanos().saturating_sub(submitted_at);
+                self.shared.metrics[usize::from(done.coordinator.0)].record(durability, in_flight);
+                Ok(CommitInfo {
+                    seqno: done.apply_seqno,
+                    durability,
+                })
+            }
+        };
+        reply.notify(outcome.map(Settled::from));
     }
 
     /// Whether this shard's close has reported, or gave up flushing because a shard died: it
@@ -7913,17 +8021,27 @@ impl ShardState {
             // good, it would stall every later commit's visibility wait and the close's
             // deferred freezes: treat it as a shard's death (visibility ends, waiters get
             // `OutcomeUnknown`, the close gives up flushing and is unclean). A poisoned shard
-            // already means the database needs reopening.
-            if let Some(reply) = c.reply.take() {
+            // already means the database needs reopening. No participant counted the commit
+            // down to zero (D278), so its answer is still here.
+            let reply = c.reply.take().or_else(|| {
+                c.completion
+                    .as_ref()
+                    .and_then(|done| done.take())
+                    .map(|d| d.reply)
+            });
+            if let Some(reply) = reply {
                 reply.notify(Err(Error::OutcomeUnknown));
             }
             self.shared.shard_died();
             self.try_finish_close(ctx);
             return;
         }
-        if c.apply_seqno != 0 {
-            self.held.remove(&c.apply_seqno);
-            self.publish_watermark();
+        if c.apply_seqno != 0 && c.completion.is_none() {
+            // Reserved, then aborted (its DECISION was never logged, or could not be encoded):
+            // nothing of it is anywhere, so readers may pass it. A commit's last participant
+            // releases its seqno itself (D278).
+            self.shared.clock.release(c.apply_seqno, &self.shared.shm);
+            self.shared.wake_visible();
         }
         if c.refused.is_some()
             && c.failed.is_none()
@@ -7999,6 +8117,11 @@ impl ShardState {
         let in_flight = now.saturating_sub(c.submitted_at);
         let metrics = &self.shared.metrics[usize::from(self.id.0)];
         metrics.count_inflight(inflight_in_window(in_flight, now, self.window_start()));
+        if c.completion.is_some() {
+            // The last participant to apply answered it (D278).
+            self.try_finish_close(ctx);
+            return;
+        }
         let outcome = match c.failed.take() {
             Some(e) => Err(e),
             None => {
@@ -9399,6 +9522,11 @@ impl ShardState {
                     Error::Closed
                 }));
             }
+            // A commit's answer moved to its participants (D278): answered here unless the
+            // last of them got to it first (then it is applied everywhere, and `Ok` stands).
+            if let Some(done) = c.completion.as_ref().and_then(|done| done.take()) {
+                done.reply.notify(Err(Error::OutcomeUnknown));
+            }
         }
         // Every coordinated commit is answered: no doom (D276) is left to act on. Panic-free
         // (no allocation).
@@ -9500,10 +9628,11 @@ impl ShardState {
                 priority,
                 last,
                 participants,
+                completion,
             } => self.on_decide(
                 seqno,
                 commit,
-                (apply_seqno, commit_ts, participants),
+                (apply_seqno, commit_ts, participants, completion),
                 coordinator,
                 priority,
                 last,

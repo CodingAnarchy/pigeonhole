@@ -123,17 +123,22 @@ pub mod header {
     /// `u32` row-epoch flags: bit 0, the writer raises the slots
     /// ([`ROW_EPOCHS_MAINTAINED`](super::ROW_EPOCHS_MAINTAINED)).
     pub const ROW_EPOCH_FLAGS: usize = 184;
+    /// `u64` atomic (layout version 6, D278): the lowest decided cross-shard seqno not yet
+    /// applied on every participant; `u64::MAX` when none. Snapshots stay below it. At 192,
+    /// 8-aligned past D281's row-epoch fields (160..188, then padding).
+    pub const CROSS_HELD: usize = 192;
 }
 
 /// Byte offsets within a watermark line.
 pub mod watermark {
-    /// `u64` atomic: the lowest seqno this shard holds unapplied: the minimum of its current
-    /// group's lower bound and every cross-shard commit seqno it coordinates and has not yet
-    /// released; `u64::MAX` when idle.
+    /// `u64` atomic: the lowest seqno this shard holds unapplied (its current group's lower
+    /// bound); `u64::MAX` when idle. Decided cross-shard seqnos are held in the header's
+    /// [`CROSS_HELD`](super::header::CROSS_HELD) instead (layout version 6, D278).
     pub const PENDING: usize = 0;
     /// `u64` atomic (layout version 2, D227): the lowest seqno this shard holds that is not
     /// yet durable at its commit's level: `PENDING`'s seqnos and every applied group whose
-    /// sync has not returned; `u64::MAX` when idle. Durable snapshots read it.
+    /// sync has not returned; `u64::MAX` when idle. Durable snapshots read it, and
+    /// [`CROSS_HELD`](super::header::CROSS_HELD).
     pub const DURABLE: usize = 8;
 }
 
