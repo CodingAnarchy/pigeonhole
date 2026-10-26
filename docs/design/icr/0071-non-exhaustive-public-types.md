@@ -21,6 +21,8 @@ The 22 other public enums and pub-field structs of `pigeonhole` already were. Th
 
 **What users change:** a `match` on one of the six enums outside the crate needs a `_` arm; `CommitInfo` and `CellEntry` can no longer be built with a struct literal (they are outputs).
 
+**A C ABI later (perf287, #941):** `Recovery` is `#[repr(C)]` and non-exhaustive. When the C ABI exposes it, the C side can pass any integer, so it converts with a checked `TryFrom<u32>` that fails with `InvalidArgument` on an unknown value, never a transmute. The same holds for every `#[repr]` enum the C ABI takes.
+
 ## Why
 
 After 1.0, adding a variant or field to an exhaustive public type is a major release, and marking a type `#[non_exhaustive]` is itself breaking, so it can only happen before 1.0. Each type above can plausibly grow during 1.x.
@@ -28,7 +30,7 @@ After 1.0, adding a variant or field to an exhaustive public type is a major rel
 ## Callers
 
 The workspace crates outside `pigeonhole` that matched exhaustively get wildcard arms:
-- **`pigeonhole-arrow`, `batch.rs`:** an unknown value type exports as bytes (its raw bytes are in the values column already).
+- **`pigeonhole-arrow`, `batch.rs`:** an unknown value type fails the batch with `ArrowError::NotYetImplemented` ("unsupported feature: value type … has no Arrow export"), never exported mislabelled as bytes (perf287's S1).
 - **`pigeonhole-cli`:** `dump` writes `{"unknown_type": true}` (JSON) and type `unknown` (CSV); `schema` writes `unknown` for an unknown priority or compaction style.
 - **Tests:** `arrow/tests/roundtrip.rs` and `pigeonhole/tests/corpus.rs` panic naming an unknown value type.
 

@@ -222,9 +222,16 @@ impl Builder {
             Value::I64(v) => (1, Some(v), None),
             Value::F64(v) => (2, None, Some(v)),
             Value::Varint(v) => (3, Some(v), None),
-            // A value type added after this build (`Value` is non-exhaustive): its raw bytes
-            // are in `values` already, so it exports as bytes.
-            _ => (0, None, None),
+            // A value type added after this build (`Value` is non-exhaustive): refused, never
+            // mislabelled as bytes (perf287's S1 on #941). Arrow is built against its own
+            // `pigeonhole` (exact versions), so only a variant added without updating this
+            // exporter reaches here.
+            other => {
+                return Err(ArrowError::NotYetImplemented(format!(
+                    "unsupported feature: value type {other:?} has no Arrow export in this \
+                     build of pigeonhole-arrow"
+                )));
+            }
         };
         self.type_keys.push(kind);
         if self.options.typed_values {
