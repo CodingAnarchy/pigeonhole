@@ -4944,11 +4944,6 @@ impl ShardState {
                         reader.iter(ScanFilter::all(), pigeonhole_sst::ReadOptions::default());
                     it.seek(&prefix)?;
                     while it.valid() && it.key().starts_with(&prefix) {
-                        #[cfg(feature = "test-hooks")]
-                        self.shared.metrics[usize::from(self.id.0)]
-                            .hooks
-                            .validate_sst_entries
-                            .fetch_add(1, Ordering::Relaxed);
                         let (_, _, seqno, _) = split_suffix(it.key())?;
                         if seqno > snapshot {
                             found = true;
@@ -5070,8 +5065,6 @@ impl ShardState {
             for prefix in [marker, column] {
                 it.seek(prefix)?;
                 while it.valid() && it.key().starts_with(prefix) {
-                    #[cfg(feature = "test-hooks")]
-                    hooks.validate_sst_entries.fetch_add(1, Ordering::Relaxed);
                     if split_suffix(it.key())?.2 > snapshot {
                         return Ok(true);
                     }

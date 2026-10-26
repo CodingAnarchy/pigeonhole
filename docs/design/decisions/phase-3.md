@@ -2378,11 +2378,11 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
   It's a superset, so it stays exact. The decode already in `apply` (dedup's scan) notes the batch-level bit once; `apply` ORs it into each memtable it writes. The flag travels with the memtable when it freezes.
 - **Write-path cost** (x86 callgrind against main): commit-one +21, commit-at +9, commit-sixteen +141 (+0.28%), the lowest worst case of four forms measured. A per-cell flag was +194 on commit-sixteen; a cold after-loop pass was +59 on commit-at, which writes explicit timestamps.
 - **The invariant D273 rests on:** every write path that stamps a *default* timestamp goes through D271's allocator (`reserve_stamps`, `reserve_decision`), and anything else sets `explicit_ts`. Counter families are the standing example: their puts and operands carry D186's fixed timestamp as an explicit one, so a counter memtable is walked whole (needed for bucket increments, `merge_at`, which can land behind a newer bucket). A future ingest or import path writing memtables directly must set the flag (perf287's review).
-- **SSTs keep the full walk.** A per-SST flag would need a format change. Validation already skips every SST whose newest seqno is at or below the snapshot. The SST share is measured (test hook `validate_sst_entries`). If it matters, the format change follows after 1.0 or under D269's `ro_compat` rules.
+- **SSTs keep the full walk.** A per-SST flag would need a format change. Validation already skips every SST whose newest seqno is at or below the snapshot. The SST share is measured (test hook `validate_sst_entries`; removed in #951, as no committed test read it). If it matters, the format change follows after 1.0 or under D269's `ro_compat` rules.
 
 **Why:** #708's box decomposition: transfer at 16 clients, a cross-shard commit cycle of 570–647 µs. Validation was the largest single step (215–231 µs, 35–41%), walking every buffered version of the hot account when no conflict was found. It sits on the hot account's serial path.
 
-**Tests** (`tests/tablets.rs`, test hooks `Engine::{validate_entries, validate_sst_entries}`):
+**Tests** (`tests/tablets.rs`, test hook `Engine::validate_entries`):
 - `a_hot_rows_validation_reads_one_version_and_still_conflicts`: a 2,000-version row validates in at most 2 entries, and a write after the snapshot still conflicts.
 - `an_explicit_older_timestamp_behind_newer_versions_still_conflicts`: an explicitly older write behind 50 newer versions still conflicts.
 - `a_replayed_memtable_is_validated_whole`: after a process crash, the replayed memtable is walked whole (at least 200 entries) and still conflicts.
