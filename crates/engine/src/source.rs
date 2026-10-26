@@ -230,7 +230,8 @@ fn overlaps_range(sst: &OpenSst, start: Option<&[u8]>, end: Option<&[u8]>) -> bo
 /// ones go as one read (D222, from the reference machine's cold scans): 16, unmerged. On the
 /// AX102, 16 blocks ahead scanned fastest on both buffered backends (3.2-3.6 GiB/s against
 /// 2.6 with none), and merging adjacent fetches cost buffered scans 10-26% (with direct I/O,
-/// off by default, merging gained 1-7%).
+/// off by default, merging gained 1-7%). 16 is the ramp's ceiling: a cursor reads ahead only
+/// after two forward blocks past its seek, 2 blocks first and doubling (#712).
 const SCAN_READAHEAD: (u32, bool) = (16, false);
 
 /// Read options for a scan or a point read.
@@ -501,8 +502,11 @@ impl SstSource {
             return Ok(());
         };
         while !self.iter.valid() && level.at + 1 < level.files.len() {
+            // The scan reads on into the next SST: its readahead keeps the ramp's size.
+            let ramp = self.iter.readahead_ramp();
             self.iter = level.open(level.at + 1)?;
             self.iter.seek_to_first()?;
+            self.iter.resume_readahead(ramp);
         }
         Ok(())
     }

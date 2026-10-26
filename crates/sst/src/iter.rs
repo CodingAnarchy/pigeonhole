@@ -91,7 +91,28 @@ pub struct SstIter {
     /// Readahead submitted from the miss path (#402); `None` until the first one, so a scan
     /// that never misses pays one check per block.
     ahead: Option<Box<Ahead>>,
+    /// Data blocks the cursor moved into forward since it was last positioned (saturating),
+    /// and the size of its next readahead batch: readahead ramps up (#712).
+    stepped: u32,
+    window: u32,
 }
+
+/// Where a cursor's readahead ramp stands ([`SstIter::readahead_ramp`]), to carry it to the
+/// cursor of the next SST a level scan reads on into.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadaheadRamp {
+    stepped: u32,
+    window: u32,
+}
+
+/// Forward blocks a cursor reads after a seek before it reads ahead, and the first batch's
+/// size, which doubles with each batch up to [`ReadOptions::readahead_blocks`] (#712). A short
+/// scan (a few rows past its seek, the common case) then fetches nothing it does not read;
+/// at 16 blocks from the first miss, ycsb-e's scans fetched, verified and decompressed
+/// mostly blocks they never reached, and the I/O backend's single completion thread did all
+/// of it.
+const RAMP_AFTER: u32 = 2;
+const RAMP_FIRST: u32 = 2;
 
 /// A cursor's readahead (#402): fetches it submitted from its miss path for the blocks it
 /// reads next ([`SstIter::upcoming`]), each admitted by its completion's continuation, so the
@@ -226,6 +247,8 @@ impl SstIter {
             hint: Vec::new(),
             row: Vec::new(),
             ahead: None,
+            stepped: 0,
+            window: 0,
         }
     }
 
@@ -247,6 +270,21 @@ impl SstIter {
     /// (#402) fetches more from its miss path.
     pub fn upcoming(&self, max: usize, out: &mut Vec<crate::Fetch>) {
         self.upcoming_with(max, true, false, |_, fetch| out.push(fetch));
+    }
+
+    /// Where this cursor's readahead ramp stands (#712), for [`SstIter::resume_readahead`].
+    pub fn readahead_ramp(&self) -> ReadaheadRamp {
+        ReadaheadRamp {
+            stepped: self.stepped,
+            window: self.window,
+        }
+    }
+
+    /// Resumes a ramp taken with [`SstIter::readahead_ramp`] (#712): for a level's cursor
+    /// that read one SST to its end and is now positioned at the next one's first entry. That
+    /// is the scan reading on, not a seek, so readahead keeps the size it had reached.
+    pub fn resume_readahead(&mut self, ramp: ReadaheadRamp) {
+        (self.stepped, self.window) = (ramp.stepped, ramp.window);
     }
 
     /// [`SstIter::upcoming`], each fetch handed to `f` with its block's address. With
@@ -353,12 +391,19 @@ impl SstIter {
     /// scans only, never for seeks).
     fn load_data(&mut self, ahead: bool) -> Result<()> {
         let addr = BlockAddr::decode_varint(loaded(&mut self.index)?.value())?;
+        if ahead {
+            self.stepped = self.stepped.saturating_add(1);
+        }
         let h = match self.ahead.as_mut().and_then(|a| a.take(addr.offset)) {
             Some(h) => h,
             None => match self.reader.inner.blocks.lookup(addr)? {
                 Some(h) => h,
                 None => {
-                    if ahead && self.options.readahead_blocks > 0 && !self.options.cache_only {
+                    if ahead
+                        && self.options.readahead_blocks > 0
+                        && !self.options.cache_only
+                        && self.stepped > RAMP_AFTER
+                    {
                         self.read_ahead();
                     }
                     self.load_missed(addr, BlockKind::Data)?
@@ -381,10 +426,11 @@ impl SstIter {
         blocks.read_uncached(addr, kind, self.options.fill_cache, self.options.priority)
     }
 
-    /// Submits fetches for up to `readahead_blocks` of the blocks past the current one that
-    /// the cache lacks ([`SstIter::upcoming`], the one prediction of what a scan reads next),
-    /// unless this cursor's previous ones are still in flight: one batch at a time. A failed
-    /// fetch is dropped; the block is read when the cursor reaches it.
+    /// Submits fetches for up to the ramp's window (at most `readahead_blocks`) of the blocks
+    /// past the current one that the cache lacks ([`SstIter::upcoming`], the one prediction
+    /// of what a scan reads next), unless this cursor's previous ones are still in flight:
+    /// one batch at a time. A failed fetch is dropped; the block is read when the cursor
+    /// reaches it.
     #[cold]
     #[inline(never)]
     fn read_ahead(&mut self) {
@@ -393,9 +439,16 @@ impl SstIter {
         if !ahead.in_flight.is_empty() {
             return;
         }
+        let max = self.options.readahead_blocks;
+        let window = if self.window == 0 {
+            RAMP_FIRST.min(max)
+        } else {
+            self.window
+        };
+        self.window = window.saturating_mul(2).min(max);
         let mut fetches = Vec::new();
         self.upcoming_with(
-            self.options.readahead_blocks as usize,
+            window as usize,
             self.options.fill_cache,
             // A partition read for a cursor that does not fill the cache would be read again
             // when the scan reaches it: such a walk ends there instead (partitions hold
@@ -472,6 +525,7 @@ impl SstIter {
         if let Some(ahead) = self.ahead.as_mut() {
             ahead.clear();
         }
+        (self.stepped, self.window) = (0, 0);
         if self.top.is_none() {
             load(&mut self.top, self.reader.inner.top.clone())?;
         }
