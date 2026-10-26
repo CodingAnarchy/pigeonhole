@@ -85,5 +85,20 @@ A reader's snapshot survives the writer closing. Once a new writer opens, though
 - **Opening a newer file with an older release.** It works read-write unless the file uses a feature the older release lacks. Then the open fails with `UnsupportedFeature`, naming the feature bits. Some features allow reading only: `Options::read_only_fallback(true)` opens those read-only, writing nothing to the file. Upgrade the library to write.
 - **Shared memory is separate.** The writer and its reader processes must run releases with the same shared-memory layout, which may change in any release (see [Multi-process readers](#multi-process-readers-phase-4-available-now)): stop the readers before upgrading the writer.
 
+## Versions and compatibility
+From 1.0.0 (D282):
+
+- **`pigeonhole` follows [semantic versioning](https://semver.org).** No 1.x release breaks code that compiles against an earlier 1.x. New API arrives in minor releases, and fixes in patch releases.
+  - **Types that can grow are `#[non_exhaustive]`:** `Value`, `Condition`, `ValueFilter`, `Compaction`, `Priority`, `Recovery`, `Durability`, `ErrorCode`, `FailureCause`, and the info, metrics, stats and outcome structs (ICR 0071 and the part-2 ICR). A minor release may add a variant or a field to them, so a `match` on one of the enums needs a `_` arm, and the output structs are read, not built.
+  - **Error codes are stable:** an `ErrorCode`'s number never changes; new codes may appear in minor releases.
+  - **Hidden items are outside the promise:** anything `#[doc(hidden)]` is a test or bench hook (`Options::vfs`, `shard_stats`, the trait impls that name internal crates' types) and may change in any release.
+- **`pigeonhole-arrow` follows semver too.** Its arrow-rs major is part of its API, so moving to a new arrow-rs major is a major release of `pigeonhole-arrow`.
+- **`phdb` (`pigeonhole-cli`) follows semver for its commands, flags, exit statuses and output formats.** The JSON output is versioned (`"phdb": 1`); a breaking change to it takes a new version number and a major release.
+- **The other crates are internal:** `pigeonhole-engine`, `-format`, `-io`, `-sst`, `-wal`, `-memtable`, `-compaction`, `-runtime`, `-shm`, `-cache`, `-pager` and `-sim`.
+  - They're published only because `pigeonhole` depends on them, and they make **no stability promise of their own**.
+  - `pigeonhole` pins each one exactly (`=`), so a `pigeonhole` release always builds with the internal crates it was tested with.
+  - An internal crate may change incompatibly in any `pigeonhole` release, taking a new major version of its own while `pigeonhole` stays 1.x. Depend on `pigeonhole`, not on them.
+- **The file format has its own promise,** separate from the API's: [`FORMAT.md` §13](../../FORMAT.md#13-compatibility-promise), summarized in [File format and upgrades](#file-format-and-upgrades). The shared-memory layout between a writer and its reader processes is in neither promise (stop the readers before upgrading the writer).
+
 ## Where next
 [Getting started](getting-started.md) · [Data modeling](data-modeling.md) · [Agent reference](agent-reference.md)

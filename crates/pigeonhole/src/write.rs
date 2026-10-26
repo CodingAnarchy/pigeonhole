@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{FamilyId, PendingCommit, Predicate, TableId, Txn, ValueRef};
-use pigeonhole_format::Durability;
 use pigeonhole_format::key::MAX_KEY_PART;
 
 use crate::db::Db;
@@ -42,11 +41,54 @@ pub struct CommitInfo {
     pub durability: Durability,
 }
 
-impl From<pigeonhole_engine::CommitInfo> for CommitInfo {
-    fn from(c: pigeonhole_engine::CommitInfo) -> Self {
+impl CommitInfo {
+    pub(crate) fn from_engine(c: pigeonhole_engine::CommitInfo) -> Self {
         Self {
             seqno: c.seqno,
-            durability: c.durability,
+            durability: Durability::from_engine(c.durability),
+        }
+    }
+}
+
+/// How durable a commit must be before it returns. Ordered from weakest to strongest.
+///
+/// Resolution order: per-call override, then the writer default
+/// ([`Options::durability`](crate::Options::durability)), then [`Durability::GroupSync`].
+/// The [durability guide](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/durability.md)
+/// has what each level survives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[repr(u8)]
+#[non_exhaustive]
+pub enum Durability {
+    /// Memtable only. Survives nothing past the last flush.
+    None = 0,
+    /// Handed to the kernel with `write()`, no fsync. Survives a process crash.
+    Buffered = 1,
+    /// fsync shared with every committer in the same group. Survives power loss.
+    #[default]
+    GroupSync = 2,
+    /// A dedicated fsync, never batched. Survives power loss.
+    Sync = 3,
+}
+
+impl Durability {
+    /// The engine's level (D282: the public type is this crate's own).
+    pub(crate) fn engine(self) -> pigeonhole_format::Durability {
+        match self {
+            Durability::None => pigeonhole_format::Durability::None,
+            Durability::Buffered => pigeonhole_format::Durability::Buffered,
+            Durability::GroupSync => pigeonhole_format::Durability::GroupSync,
+            Durability::Sync => pigeonhole_format::Durability::Sync,
+        }
+    }
+
+    /// The public level of an engine level.
+    pub(crate) fn from_engine(d: pigeonhole_format::Durability) -> Self {
+        match d {
+            pigeonhole_format::Durability::None => Durability::None,
+            pigeonhole_format::Durability::Buffered => Durability::Buffered,
+            pigeonhole_format::Durability::GroupSync => Durability::GroupSync,
+            pigeonhole_format::Durability::Sync => Durability::Sync,
         }
     }
 }
@@ -168,7 +210,7 @@ impl Builder {
         }
         let largest_value = self.largest_value;
         engine
-            .submit_async(self.batch, durability)
+            .submit_async(self.batch, durability.map(Durability::engine))
             .map(|pending| Submitted {
                 pending,
                 largest_value,
@@ -188,7 +230,7 @@ impl Builder {
         }
         let largest_value = self.largest_value;
         engine
-            .submit(self.batch, durability)
+            .submit(self.batch, durability.map(Durability::engine))
             .map(|pending| Submitted {
                 pending,
                 largest_value,
@@ -209,8 +251,8 @@ impl Builder {
         }
         let largest = self.largest_value;
         engine
-            .commit(self.batch, durability)
-            .map(CommitInfo::from)
+            .commit(self.batch, durability.map(Durability::engine))
+            .map(CommitInfo::from_engine)
             .map_err(|e| commit_error(e, largest, max_value))
     }
 }
@@ -230,7 +272,7 @@ impl Submitted {
         &self,
         r: pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>,
     ) -> Result<CommitInfo> {
-        r.map(CommitInfo::from)
+        r.map(CommitInfo::from_engine)
             .map_err(|e| commit_error(e, self.largest_value, self.max_value))
     }
 }
@@ -290,7 +332,7 @@ impl CommitTicket {
                 } = s;
                 pending
                     .wait()
-                    .map(CommitInfo::from)
+                    .map(CommitInfo::from_engine)
                     .map_err(|e| commit_error(e, largest_value, max_value))
             }
         }
@@ -561,7 +603,7 @@ impl RowMutation<'_> {
                 &self.row,
                 &predicate,
                 self.builder.batch,
-                durability,
+                durability.map(Durability::engine),
             )
             .map(|pending| SubmittedCheck {
                 pending,
@@ -589,13 +631,13 @@ impl RowMutation<'_> {
                 &self.row,
                 &predicate,
                 self.builder.batch,
-                self.durability,
+                self.durability.map(Durability::engine),
             )
             .map_err(|e| {
                 db.after_commit_closed(generation, commit_error(e, largest, db.max_value))
             })?;
         Ok(if applied {
-            info.map(CommitInfo::from)
+            info.map(CommitInfo::from_engine)
         } else {
             None
         })
@@ -644,7 +686,7 @@ impl SubmittedCheck {
     ) -> Result<Option<CommitInfo>> {
         let (applied, info) = r.map_err(|e| commit_error(e, self.largest_value, self.max_value))?;
         Ok(if applied {
-            info.map(CommitInfo::from)
+            info.map(CommitInfo::from_engine)
         } else {
             None
         })
@@ -1044,7 +1086,7 @@ impl Transaction {
         self.db.check_generation(self.generation)?;
         let (largest_value, max_value) = (self.largest_value, self.db.max_value);
         self.txn
-            .submit_async(durability)
+            .submit_async(durability.map(Durability::engine))
             .map(|pending| Submitted {
                 pending,
                 largest_value,
@@ -1065,8 +1107,8 @@ impl Transaction {
         let (db, generation) = (Arc::clone(&self.db), self.generation);
         let result = self
             .txn
-            .commit(durability)
-            .map(CommitInfo::from)
+            .commit(durability.map(Durability::engine))
+            .map(CommitInfo::from_engine)
             .map_err(|e| {
                 db.after_transaction_commit_closed(generation, commit_error(e, largest, max))
             });

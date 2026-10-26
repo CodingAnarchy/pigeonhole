@@ -58,7 +58,7 @@ use std::future::{Future, IntoFuture};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use pigeonhole_format::Durability;
+use crate::Durability;
 
 use crate::cell::RowBuf;
 use crate::write::{Submitted, SubmittedCheck, TicketState};

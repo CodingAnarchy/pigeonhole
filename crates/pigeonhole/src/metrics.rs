@@ -280,8 +280,8 @@ pub struct CrossShardMetrics {
 
 // The deprecated cross-shard refusal counters are always 0 (D263).
 #[allow(deprecated)]
-impl From<pigeonhole_engine::Metrics> for EngineMetrics {
-    fn from(m: pigeonhole_engine::Metrics) -> Self {
+impl EngineMetrics {
+    pub(crate) fn from_engine(m: pigeonhole_engine::Metrics) -> Self {
         let x = m.cross_shard;
         Self {
             commits: std::array::from_fn(|d| CommitStats {
@@ -361,6 +361,77 @@ impl From<pigeonhole_engine::Metrics> for EngineMetrics {
     }
 }
 
+/// What the row cache did since open
+/// ([`Pigeonhole::row_cache_stats`](crate::Pigeonhole::row_cache_stats)). Cumulative from 0
+/// at open.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RowCacheStats {
+    /// Family rows and gets answered from the cache.
+    pub hits: u64,
+    /// Lookups that found nothing usable (absent, older epoch, expired).
+    pub misses: u64,
+    /// Family rows stored.
+    pub fills: u64,
+}
+
+impl RowCacheStats {
+    pub(crate) fn from_engine(s: pigeonhole_engine::RowCacheStats) -> Self {
+        Self {
+            hits: s.hits,
+            misses: s.misses,
+            fills: s.fills,
+        }
+    }
+}
+
+/// One shard's share of the work, for benchmarks that check writes spread over shards
+/// (ICR 0010, a hidden bench hook outside the semver promise). Counters are cumulative since
+/// open; take two and subtract for a phase. The fields are the engine's
+/// (`pigeonhole_engine::ShardStats`).
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct ShardStats {
+    /// Commits the shard applied, summed over durability levels.
+    pub commits: u64,
+    /// Tablets the shard owns in the current view, over every table.
+    pub tablets: u64,
+    /// Splits the shard completed.
+    pub splits: u64,
+    /// Merges the shard completed.
+    pub merges: u64,
+    /// Moves the shard completed.
+    pub moves: u64,
+    /// Nanoseconds the shard's engine-owned thread spent in work turns (D217).
+    pub busy_nanos: u64,
+    /// Nanoseconds of group-sync in-flight time (D248).
+    pub sync_busy_nanos: u64,
+    /// Nanoseconds the compaction pool spent on this shard's work (D256).
+    pub pool_busy_nanos: u64,
+    /// Nanoseconds the shard's thread spent spinning before parking (D198, D256).
+    pub spin_time_nanos: u64,
+    /// Nanoseconds the shard's client commits spent in flight (D257, D262).
+    pub commit_inflight_nanos: u64,
+}
+
+impl ShardStats {
+    pub(crate) fn from_engine(s: pigeonhole_engine::ShardStats) -> Self {
+        Self {
+            commits: s.commits,
+            tablets: s.tablets,
+            splits: s.splits,
+            merges: s.merges,
+            moves: s.moves,
+            busy_nanos: s.busy_nanos,
+            sync_busy_nanos: s.sync_busy_nanos,
+            pool_busy_nanos: s.pool_busy_nanos,
+            spin_time_nanos: s.spin_time_nanos,
+            commit_inflight_nanos: s.commit_inflight_nanos,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +455,7 @@ mod tests {
         m.cross_shard.rounds = 22;
         m.cross_shard.refused_room = 23;
         m.cross_shard.refused_pending_overlap = 24;
-        let e = EngineMetrics::from(m);
+        let e = EngineMetrics::from_engine(m);
         assert_eq!(e.commits(Durability::None).count, 1);
         assert_eq!(e.commits(Durability::GroupSync).count, 3);
         let sync = e.commits(Durability::Sync);

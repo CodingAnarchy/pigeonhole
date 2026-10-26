@@ -176,6 +176,9 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// Hidden, and outside the semver promise (D282): it names an internal crate's type. The
+/// crate's own `?` uses it.
+#[doc(hidden)]
 impl From<pigeonhole_engine::Error> for Error {
     /// Every engine error maps to exactly one code; the message is the engine's.
     fn from(e: pigeonhole_engine::Error) -> Self {

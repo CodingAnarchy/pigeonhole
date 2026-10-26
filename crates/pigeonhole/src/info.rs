@@ -190,8 +190,8 @@ pub struct LevelInfo {
     pub entries: u64,
 }
 
-impl From<&pigeonhole_engine::FamilyInfo> for FamilyInfo {
-    fn from(f: &pigeonhole_engine::FamilyInfo) -> Self {
+impl FamilyInfo {
+    pub(crate) fn from_engine(f: &pigeonhole_engine::FamilyInfo) -> Self {
         let o = &f.options;
         Self {
             name: f.name.clone(),
@@ -224,8 +224,8 @@ impl From<&pigeonhole_engine::FamilyInfo> for FamilyInfo {
     }
 }
 
-impl From<pigeonhole_engine::DbInfo> for DatabaseInfo {
-    fn from(d: pigeonhole_engine::DbInfo) -> Self {
+impl DatabaseInfo {
+    pub(crate) fn from_engine(d: pigeonhole_engine::DbInfo) -> Self {
         Self {
             db_id: d.db_id,
             format_version: d.format_version,
@@ -241,7 +241,12 @@ impl From<pigeonhole_engine::DbInfo> for DatabaseInfo {
                 .map(|t| TableInfo {
                     name: t.info.name.clone(),
                     tablets: t.tablets,
-                    families: t.info.families.iter().map(FamilyInfo::from).collect(),
+                    families: t
+                        .info
+                        .families
+                        .iter()
+                        .map(FamilyInfo::from_engine)
+                        .collect(),
                     storage: t
                         .info
                         .families

@@ -182,7 +182,7 @@ impl TableCore {
     }
 
     fn family_info(&self, family: &str) -> Option<crate::FamilyInfo> {
-        self.info.family(family).map(crate::FamilyInfo::from)
+        self.info.family(family).map(crate::FamilyInfo::from_engine)
     }
 
     /// The catalog entry as of now: a family added through another handle shows up here.
