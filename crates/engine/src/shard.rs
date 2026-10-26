@@ -1522,8 +1522,8 @@ pub(crate) enum ShardMsg {
     /// A failed flush's backoff passed: retry (issue #141).
     RetryFlush,
     /// Split, merge or move tablets this shard owns (replies when done, if asked). Sent by
-    /// the test hooks only; the balancer starts its own changes.
-    #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
+    /// `Engine::split_table` (benches presplit a table) and the test hooks; the balancer
+    /// starts its own changes.
     TabletOp {
         op: TabletOpKind,
         reply: Option<Notifier<Result<()>>>,
