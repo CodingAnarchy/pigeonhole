@@ -1,0 +1,2 @@
+### Fixed
+- io_uring backend: when the kernel refused the system call that hands a submitted read or write to it (`EAGAIN` under memory pressure, for instance), the operation failed at once and its buffer went back to its pool or was freed. The request was still queued, though, and the next call handed it over, so the kernel could read into memory the operation no longer owned. Such an operation now stays queued and completes normally (#976).
