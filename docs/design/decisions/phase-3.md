@@ -2609,9 +2609,16 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 **Why:** after D278 and D279, waits took ~13.6 µs of a cross-shard commit's 24.8 µs on the box (#708 comment 6422171206): four message hops and two waits for a group. A shard handled messages only at a turn's drain, behind everything queued before them, so a protocol message that landed while the shard ran a group waited for the rest of the batch's work and the next drain. D278 and D279 removed 4.45 µs of work and got ~3.5 µs back as longer waits of this kind.
 
 **What changes:**
-- **A priority lane.** Each shard's inbox has a second queue (`ShardHandler::priority` routes a message to it). Every drain, and the sleep handshake's re-check, takes it first. Order holds within each lane, not across them. The engine routes `Prepare`, `Prepared`, `Decide`, `Applied`, `Wake`, `Released` and `SyncDone` there:
+- **A priority lane.** Each shard's inbox has a second queue (`ShardHandler::priority` routes a message to it). Every drain, and the sleep handshake's re-check, takes it first. Order holds within each lane, not across them. The engine routes `Prepare`, `Prepared`, `Decide`, `Applied`, `Wake` and `Released` there:
   - `Wake` and `Released`, so a protocol message never overtakes them from the same sender: a later refusal would otherwise take an earlier `Wake`, and a `Prepare` would pass the `Released` that lets older commits in first (D249);
-  - `SyncDone`, so a `Decide` parked on a held header's sync (D279) resolves at the next safe point.
+  - **not `SyncDone`** (revision 2 proposed it, so a `Decide` parked on a held header's sync resolves at the next safe point). It comes from the shard's own sync, so nothing overtakes it from a peer. On the lane, it broke 4 `purge_race.rs` cases, and the cause is the test's driver, not the engine's order:
+    - On the simulator a sync completes inline, so a shard's own `SyncDone` reaches its safe point in the same batch.
+    - `ShardDriver::run_once` returns whether work *remains*, not whether it did any. A shard that handled `Prepared`, ran the DECISION group, took its `SyncDone` at the safe point and sent `Decide` returns `false`. Before D285 that `SyncDone` was still queued, so it returned `true`.
+    - The test drives both shards by hand and stops after two passes in which neither returns `true` (`Rig::run`). It stopped with the `Decide` queued at shard 0, so the commit read as pending until after the install, which the test calls waiting.
+    - With a third quiet pass, every `purge_race.rs` test passes with `SyncDone` on the lane (seed replay: scratch branch `scratch/perf2-d285-syncdone`, `dbg_install_here`, seed 318).
+    - A real driver is woken by the `Decide`'s submit, so nothing waits there.
+  
+  `Wake` and `Released` handled at a safe point can shorten a hand-driven run's "work remains" signals the same way. Five test helpers stop after N quiet passes (`purge_race`, `purge_bound`, `full_compaction_purge`, `close_failures` at 2; `cross_checkpoints` at 3), and they pass with D285. `SyncDone` stays on the main lane in this PR, keeping the change small; it can move to the lane once those helpers stop on an empty-queue check rather than a pass count.
   
   The main-lane messages a protocol message may now overtake from the same sender, and why each is safe, are listed at `ShardState::priority`: forwarded commits, tablet operations, `AwaitFlushed`/`FlushedThrough`, `SyncBarrier` and `Unpin`. The lane can't starve the main lane: its traffic is a few messages per cross-shard commit in flight.
 - **A safe point between groups** (`ShardState::safe_point`, right after `run_group` in `end_batch`). No group is in flight there: every member settled or was queued again, and the view is published. In order, it:
@@ -2625,6 +2632,6 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 
 **Tests:**
 - `runtime/tests/lanes.rs`: a drain takes the priority lane first and keeps order within each lane; a bounded take mid-batch leaves the rest queued, and the shard is woken for it.
-- `runtime` signal.rs: a loom model of the two lanes with a bounded take, `#[ignore]`d with its siblings (loom 0.7.2, tokio-rs/loom#254, #533).
+- `runtime` signal.rs: a loom model of the two lanes with a bounded take, runnable on loom 0.7.2 (`sleeping` is a `Mutex<bool>` stand-in, as in the manifest exclusion's model, #533). Re-checking only the main lane before sleeping deadlocks it.
 - `engine/tests/safe_points.rs`: under concurrent cross-shard commits on engine-owned shards, the safe point handles messages, and every commit applies whole; with it off, it never runs. Mutation caught: no `safe_point` call.
 - The engine's sim harness runs the real runtime, so seeded runs use the same lane order.
