@@ -755,6 +755,15 @@ macro_rules! both_modes {
         mod application_owned {
             $(#[test] fn $name() { super::$name(super::Mode::App) })*
         }
+    };
+}
+
+/// Application-owned with 1 and 2 background workers (D284): the suite's tests whose
+/// background tasks may run anywhere. The foreground-latency tests are left out: they
+/// measure how long a message waits behind background slices on the shard, and with
+/// workers none run there.
+macro_rules! with_workers {
+    ($($name:ident),* $(,)?) => {
         mod application_owned_one_worker {
             $(#[test] fn $name() { super::$name(super::Mode::AppWorkers(1)) })*
         }
@@ -763,6 +772,20 @@ macro_rules! both_modes {
         }
     };
 }
+
+with_workers!(
+    echo_sync_and_async,
+    per_producer_fifo_and_batching,
+    cross_shard_forwarding,
+    current_shard_is_set_on_shard_threads,
+    background_task_runs_to_completion,
+    blocked_task_is_woken,
+    shutdown_handles_queued_then_refuses,
+    dropped_notifier_resolves_none,
+    many_round_trips_no_lost_wakeup,
+    sleeping_task_fires_on_time_real,
+    sleeping_task_is_woken_early,
+);
 
 both_modes!(
     echo_sync_and_async,
