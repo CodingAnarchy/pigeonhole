@@ -330,3 +330,66 @@ fn a_decision_whose_write_fails_after_its_append_commits_answered_in_error() {
     assert_eq!(db.engine.abort_decides_sent(0), 0);
     assert!(db.visible(0, b"x") && db.visible(1, b"x"));
 }
+
+/// The question behind the COMMIT's log assertion (coordinator, on #989): can the
+/// coordinator's own PREPARE, decided early, leave the log (be checkpointed out of the WAL)
+/// before its COMMIT is written? If it could, a crash in that window would lose the
+/// coordinator's own share of an answered commit: its data sits only in a held memtable, and
+/// replay would find the COMMIT with no PREPARE here. With the DECISION held, shard 0 commits
+/// and flushes singles until its checkpoint has passed everything it can; the own PREPARE must
+/// still be logged. Then the DECISION is written, the commit answered, and a process crash
+/// (what Buffered survives) must keep both shares.
+#[test]
+fn an_early_decided_own_prepare_stays_logged_until_its_commit_is_written() {
+    let mut db = open(290, None);
+    let mut pc = db.submit(b"x", b"v");
+    db.decide_early_with_decision_held();
+    // Singles on shard 0, then flushes asked for, while the DECISION is held. Not awaited:
+    // the held seqno keeps later commits from becoming visible (D278), and from becoming
+    // durable, so nothing above it can freeze into an SST and no flush can finish: the
+    // checkpoint can't pass the own PREPARE. The test asserts what that argument predicts.
+    let mut flushes = Vec::new();
+    for round in 0..4 {
+        for i in 0..50 {
+            drop(db.single(format!("s{round}-{i:03}").as_bytes()));
+        }
+        flushes.push(db.engine.flush_pending().unwrap());
+        for _ in 0..2_000 {
+            db.step(0);
+            db.step(1);
+        }
+    }
+    assert!(
+        flushes.iter_mut().all(|f| ready(f).is_none()),
+        "a flush finished above a held seqno"
+    );
+    assert!(
+        db.engine.logged_records(0) >= 1,
+        "the coordinator's own PREPARE left the log before its COMMIT was written"
+    );
+    assert!(
+        ready(&mut pc).is_none() && !db.visible(0, b"x") && !db.visible(1, b"x"),
+        "answered or visible before the DECISION was written"
+    );
+    db.engine.release_held_decisions();
+    db.answer(&mut pc, 64)
+        .expect("answered once the DECISION is written")
+        .expect("committed");
+    for f in &mut flushes {
+        let mut done = false;
+        for _ in 0..10_000 {
+            if ready(f).is_some() {
+                done = true;
+                break;
+            }
+            db.step(0);
+            db.step(1);
+        }
+        assert!(done, "a flush never finished once the DECISION was written");
+    }
+    let (a, b) = db.crash_and_reopen(b"x");
+    assert!(
+        a && b,
+        "an answered commit lost a share in a process crash: shard 0 {a}, shard 1 {b}"
+    );
+}

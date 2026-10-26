@@ -345,10 +345,21 @@ fn held_model_with(mirror_first: bool, group: bool) {
 /// D286: the coordinator sends `Decide` before its DECISION is written, and counts down
 /// twice: once for its own share (as a participant) and once when the DECISION is written.
 /// A reader never sees the decision before both shares are applied and the DECISION written,
-/// and the release happens exactly once, by whichever count is last.
+/// and the release happens exactly once, by whichever count is last. Here the coordinator
+/// applies its own share inline before it counts its DECISION, as `on_prepared`'s
+/// self-`Decide` does; the other participant's share may apply before or after either.
 #[test]
 fn loom_an_early_decision_is_visible_only_once_its_decision_is_written() {
-    early_decide_model(true);
+    early_decide_model(true, false);
+}
+
+/// As above, with the coordinator's own share applied on another thread: a share parked on a
+/// held header (D279) applies only when its group settles, so the DECISION's count can come
+/// first, before any share applies, and the last share's count then releases and answers
+/// (perf287's review of #989). Loom explores every order of the three count-downs.
+#[test]
+fn loom_an_early_decision_counted_before_any_share_applies_releases_once() {
+    early_decide_model(true, true);
 }
 
 /// Without the DECISION's count, the shares release the decision while its DECISION is
@@ -356,12 +367,14 @@ fn loom_an_early_decision_is_visible_only_once_its_decision_is_written() {
 #[test]
 #[should_panic(expected = "visible before its DECISION was written")]
 fn loom_an_early_decision_without_the_decisions_count_is_visible_unwritten() {
-    early_decide_model(false);
+    early_decide_model(false, false);
 }
 
-fn early_decide_model(count_decision: bool) {
+fn early_decide_model(count_decision: bool, own_share_parked: bool) {
     let mut model = loom::model::Builder::new();
-    model.preemption_bound = Some(3);
+    // Four threads with the parked share: a bound of 2 keeps the model within loom's branch
+    // budget while still letting each count-down come first.
+    model.preemption_bound = Some(if own_share_parked { 2 } else { 3 });
     model.check(move || {
         let sh = Arc::new(Held {
             clock: Mutex::new((1, Vec::new())),
@@ -392,7 +405,20 @@ fn early_decide_model(count_decision: bool) {
                 };
                 sh.mirror.fetch_max(s + 1, Ordering::AcqRel);
                 sh.decide.store(s, Ordering::Release);
-                applied(&sh, 0, s);
+                // Parked variant: both shares apply on threads of their own, started once
+                // `Decide` is out (no spinning), so the DECISION's count below may come
+                // before either.
+                let appliers: Vec<_> = if own_share_parked {
+                    (0..2)
+                        .map(|i| {
+                            let sh = Arc::clone(&sh);
+                            thread::spawn(move || applied(&sh, i, s))
+                        })
+                        .collect()
+                } else {
+                    applied(&sh, 0, s);
+                    Vec::new()
+                };
                 written.store(true, Ordering::Release);
                 if count_decision && sh.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
                     let mut c = sh.clock.lock().unwrap();
@@ -402,9 +428,12 @@ fn early_decide_model(count_decision: bool) {
                     let before = sh.released_by.swap(3, Ordering::Relaxed);
                     assert_eq!(before, 0, "released twice");
                 }
+                for a in appliers {
+                    a.join().unwrap();
+                }
             })
         };
-        let part = {
+        let part = (!own_share_parked).then(|| {
             let sh = Arc::clone(&sh);
             thread::spawn(move || {
                 let s = loop {
@@ -416,7 +445,7 @@ fn early_decide_model(count_decision: bool) {
                 };
                 applied(&sh, 1, s);
             })
-        };
+        });
         let r = {
             let (sh, written) = (Arc::clone(&sh), Arc::clone(&written));
             thread::spawn(move || {
@@ -442,7 +471,9 @@ fn early_decide_model(count_decision: bool) {
             })
         };
         coord.join().unwrap();
-        part.join().unwrap();
+        if let Some(part) = part {
+            part.join().unwrap();
+        }
         r.join().unwrap();
         assert_ne!(sh.released_by.load(Ordering::Relaxed), 0, "never released");
         assert_eq!(sh.cross_held.load(Ordering::Relaxed), u64::MAX);

@@ -6444,14 +6444,20 @@ impl ShardState {
                     if let Some(t) = m.ticket {
                         // A coordinator is always a participant (the first shard of its
                         // commit's split; a retry re-splits and re-routes), and it logs its
-                        // own PREPARE, a validation-only one too, before it decides. Undecided
-                        // until the `Decide` this record's resolution sends, that PREPARE is
-                        // still in the log: it precedes the COMMIT and waits on every other
-                        // holder, so the COMMIT's own check (`needed`) is defence in depth.
+                        // own PREPARE, a validation-only one too, before it decides. That
+                        // PREPARE is still in the log: it precedes the COMMIT and waits on
+                        // every other holder, so the COMMIT's own check (`needed`) is defence
+                        // in depth. Undecided until the `Decide` this record's resolution
+                        // sends, except after an early `Decide` (D286): then its share is
+                        // already applied (`share_seqnos`), but its seqno is still held, so no
+                        // holder can have flushed through it (D266) and the PREPARE cannot
+                        // have left the log before this COMMIT is written.
+                        let early = self.coord.get(&m.seqno).is_some_and(|c| c.decide_sent);
                         debug_assert!(
                             self.log_cross.contains_key(&m.seqno)
-                                && !self.share_seqnos.contains_key(&m.seqno),
-                            "shard {}: COMMIT {} logged without its own undecided PREPARE",
+                                && (early || !self.share_seqnos.contains_key(&m.seqno)),
+                            "shard {}: COMMIT {} logged without its own PREPARE in the log (or \
+                             with it applied before an ordinary decision)",
                             self.id.0,
                             m.seqno
                         );
@@ -8170,6 +8176,17 @@ impl ShardState {
             if let Some(d) = done.take() {
                 d.reply.notify(Err(Error::OutcomeUnknown));
             }
+            // Both ways a Buffered DECISION goes unlogged (a poison before its group admits
+            // it, `fail_all` after another member's append error) have poisoned this shard,
+            // so this instance can never release the held seqno: end the store's visibility
+            // waits now rather than at the last `Applied`, which a participant parked on a
+            // held header may send late (perf287's review of #989). Idempotent. A third
+            // never-logged path that leaves the shard healthy would hold the seqno for ever.
+            debug_assert!(
+                self.poisoned,
+                "an early DECISION for {seqno} went unlogged on a healthy shard"
+            );
+            self.shared.shard_died();
         } else {
             if let Err(e) = result
                 && let Some(d) = done

@@ -151,7 +151,8 @@ pub enum Fault {
     /// While on, a coordinator sets its DECISION members aside instead of admitting them
     /// (D286's tests: an early `Decide` is applied while its DECISION is unwritten). Switch
     /// it off with `Engine::release_held_decisions`, which kicks the shards: the held
-    /// DECISIONs rejoin the end of their shard's queue at its next group.
+    /// DECISIONs rejoin the end of their shard's queue at its next group. That reorders them
+    /// after anything queued meanwhile, so don't use it to reason about group order.
     HoldDecisionRecords = 10,
 }
 
