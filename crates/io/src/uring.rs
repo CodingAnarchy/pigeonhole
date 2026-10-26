@@ -940,8 +940,10 @@ fn enter_published(uring: &IoUring) {
 /// Resolves `op`, in flight on a ring that failed, with `e`, and leaks its buffer: the kernel
 /// may still read into or write from it until the ring's teardown has cancelled everything,
 /// which happens after the ring is dropped, so the buffer is never freed or given back to its
-/// slot pool (perf287 on #976). Only for a ring that can no longer be entered; an operation
-/// whose entry the kernel never saw goes through [`fail`].
+/// slot pool (perf287 on #976). A leaked slot keeps its pool, so the ring's whole registered
+/// region stays allocated (no longer locked or budgeted once the ring drops): acceptable for a
+/// ring that can no longer be entered, the only one this is for. An operation whose entry the
+/// kernel never saw goes through [`fail`].
 fn abandon(op: Op, e: io::Error) {
     match op.kind {
         Kind::Read { buf, resolver, .. } => {
