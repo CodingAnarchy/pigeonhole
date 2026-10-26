@@ -3705,13 +3705,14 @@ fn a_retry_waiting_for_room_ends_closed_at_close() {
 }
 
 /// A cross-shard commit refused `Moved` while its tablet moves to a shard with a lower
-/// floor, retried while singles queue on its new participant: in either arrival order (the
-/// singles queued there before the retry's PREPARE, or after it, #980), every single's
-/// default timestamp keeps D11's order with the commit's (D271). The commit's cells land at its
-/// DECISION's seqno and timestamp, reserved together (D263: a PREPARE has no timestamp, and
-/// its seqno is the commit's id, never applied), so the order is checked against the COMMIT
-/// record's applied seqno. (Before D263 a retry kept its first timestamp and had to raise its
-/// new participant first, D245; release/0.3.x still works that way and passes both orders.)
+/// floor, retried while singles queue on its new participant. In either order (the singles
+/// all resolved there before the retry runs, or its PREPARE reaching it first, #980), every
+/// single's default timestamp keeps D11's order with the commit's (D271). The commit's cells
+/// land at its DECISION's seqno and timestamp, reserved together (D263: a PREPARE has no
+/// timestamp, and its seqno is the commit's id, never applied), so the order is checked
+/// against the COMMIT record's applied seqno. (Before D263 a retry kept its first timestamp
+/// and had to raise its new participant first, D245; release/0.3.x still works that way and
+/// passes both orders.)
 fn moved_retry_against_queued_singles(retry_first: bool) {
     let mut db = open(3, |o| o.memtable_budget = 64 << 20);
     let (t, f) = (db.table.id, db.table.families[0].id);
@@ -3816,6 +3817,26 @@ fn moved_retry_against_queued_singles(retry_first: bool) {
             db.engine.submit(wb, Some(Durability::Buffered)).unwrap()
         })
         .collect();
+    if !retry_first {
+        // The singles first, explicitly (perf287 on #982): every one resolves on 2 (and 1)
+        // before 0 runs again, whatever room they reserve or a priority lane does with them.
+        for _ in 0..100_000 {
+            let now = db.clock.monotonic_nanos();
+            db.shards[1].run_once(now + 1_000);
+            db.shards[2].run_once(now + 1_000);
+            singles.retain_mut(|s| match poll_commit(s) {
+                Some(r) => {
+                    r.expect("a single on 2");
+                    false
+                }
+                None => true,
+            });
+            if singles.is_empty() {
+                break;
+            }
+        }
+        assert!(singles.is_empty(), "the singles never resolved on 2 alone");
+    }
     let now = db.clock.monotonic_nanos();
     db.shards[0].run_once(now + 1_000);
     db.shards[2].run_once(now + 1_000);
