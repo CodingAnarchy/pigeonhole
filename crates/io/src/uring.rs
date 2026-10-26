@@ -106,86 +106,6 @@ pub fn fail_ring_attaches_unsupported(n: usize) {
     FAIL_ATTACHES.store(n, Ordering::SeqCst);
 }
 
-/// Kernel enters still to fail on purpose ([`fail_ring_enters`]), and with which `errno`.
-static FAIL_ENTERS: AtomicUsize = AtomicUsize::new(0);
-static FAIL_ENTERS_ERRNO: AtomicI32 = AtomicI32::new(0);
-
-/// Makes the next `n` kernel enters that hand a ring's submitted entries over fail with
-/// `errno`, as the kernel refusing them would (`EAGAIN` under memory pressure). A test hook
-/// (perf287's must-fix on #974), not part of the API.
-#[doc(hidden)]
-pub fn fail_ring_enters(n: usize, errno: i32) {
-    FAIL_ENTERS_ERRNO.store(errno, Ordering::SeqCst);
-    FAIL_ENTERS.store(n, Ordering::SeqCst);
-}
-
-/// Reaps' kernel enters still to fail on purpose ([`fail_ring_reaps`]), and with which `errno`.
-static FAIL_REAPS: AtomicUsize = AtomicUsize::new(0);
-static FAIL_REAPS_ERRNO: AtomicI32 = AtomicI32::new(0);
-
-/// As [`fail_ring_enters`], for the next `n` enters of a reap (the shared ring's reaper,
-/// or a thread reaping its own ring), which submit what the queue holds too. A test hook
-/// (perf287's must-fix on #976), not part of the API.
-#[doc(hidden)]
-pub fn fail_ring_reaps(n: usize, errno: i32) {
-    FAIL_REAPS_ERRNO.store(errno, Ordering::SeqCst);
-    FAIL_REAPS.store(n, Ordering::SeqCst);
-}
-
-/// Takes one injected failure from `left` ([`fail_ring_enters`], [`fail_ring_reaps`]).
-fn injected(left: &AtomicUsize, errno: &AtomicI32) -> Option<io::Error> {
-    let mut n = left.load(Ordering::Relaxed);
-    while n > 0 {
-        match left.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::Relaxed) {
-            Ok(_) => return Some(io::Error::from_raw_os_error(errno.load(Ordering::SeqCst))),
-            Err(now) => n = now,
-        }
-    }
-    None
-}
-
-/// A reap's enter, `enter`, failing while [`fail_ring_reaps`] asks.
-fn reap_enter(enter: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
-    match injected(&FAIL_REAPS, &FAIL_REAPS_ERRNO) {
-        Some(e) => Err(e),
-        None => enter(),
-    }
-}
-
-/// The longest pause between enters the kernel refuses for now (`EAGAIN`).
-const ENTER_RETRY_MAX: Duration = Duration::from_millis(1);
-
-/// `io_uring_enter` handing over what the submission queue holds, failing while
-/// [`fail_ring_enters`] asks.
-fn enter(uring: &IoUring) -> io::Result<usize> {
-    match injected(&FAIL_ENTERS, &FAIL_ENTERS_ERRNO) {
-        Some(e) => Err(e),
-        None => uring.submit(),
-    }
-}
-
-/// Hands entries already published to the kernel. Whatever it returns, they stay the
-/// ring's: an operation whose entry is published is never failed here, as some later enter
-/// submits the entry and the kernel then reads into or from its buffer (perf287's must-fix
-/// on #974). A refusal for now (`EAGAIN`, `EINTR`) is retried, backing off up to 1 ms: the
-/// ring's waiter may be blocked in the kernel with nothing else in flight, and would never
-/// enter again on its own. Any other error is left to the next enter: `EBUSY` means
-/// completions wait to be taken, so the reaper (or the owner) is not blocked and enters
-/// again soon, and a broken ring fails that enter too, which resolves everything in flight
-/// (`fail_all`).
-fn enter_published(uring: &IoUring) {
-    let mut pause = Duration::from_micros(1);
-    loop {
-        match enter(uring) {
-            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) => {
-                thread::sleep(pause);
-                pause = (pause * 2).min(ENTER_RETRY_MAX);
-            }
-            _ => return,
-        }
-    }
-}
-
 /// Why a thread got no ring of its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AttachFailure {
@@ -861,6 +781,105 @@ struct Ring {
     shutdown: AtomicBool,
 }
 
+/// Kernel enters still to fail on purpose ([`fail_ring_enters`]), and with which `errno`.
+static FAIL_ENTERS: AtomicUsize = AtomicUsize::new(0);
+static FAIL_ENTERS_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// Makes the next `n` kernel enters that hand a ring's submitted entries over fail with
+/// `errno`, as the kernel refusing them would (`EAGAIN` under memory pressure). A test hook
+/// (perf287's must-fix on #974), not part of the API.
+#[doc(hidden)]
+pub fn fail_ring_enters(n: usize, errno: i32) {
+    FAIL_ENTERS_ERRNO.store(errno, Ordering::SeqCst);
+    FAIL_ENTERS.store(n, Ordering::SeqCst);
+}
+
+/// Reaps' kernel enters still to fail on purpose ([`fail_ring_reaps`]), and with which `errno`.
+static FAIL_REAPS: AtomicUsize = AtomicUsize::new(0);
+static FAIL_REAPS_ERRNO: AtomicI32 = AtomicI32::new(0);
+
+/// As [`fail_ring_enters`], for the next `n` enters of a reap (the shared ring's reaper,
+/// or a thread reaping its own ring), which submit what the queue holds too. A test hook
+/// (perf287's must-fix on #976), not part of the API.
+#[doc(hidden)]
+pub fn fail_ring_reaps(n: usize, errno: i32) {
+    FAIL_REAPS_ERRNO.store(errno, Ordering::SeqCst);
+    FAIL_REAPS.store(n, Ordering::SeqCst);
+}
+
+/// Takes one injected failure from `left` ([`fail_ring_enters`], [`fail_ring_reaps`]).
+fn injected(left: &AtomicUsize, errno: &AtomicI32) -> Option<io::Error> {
+    let mut n = left.load(Ordering::Relaxed);
+    while n > 0 {
+        match left.compare_exchange_weak(n, n - 1, Ordering::SeqCst, Ordering::Relaxed) {
+            Ok(_) => return Some(io::Error::from_raw_os_error(errno.load(Ordering::SeqCst))),
+            Err(now) => n = now,
+        }
+    }
+    None
+}
+
+/// A reap's enter, `enter`, failing while [`fail_ring_reaps`] asks.
+fn reap_enter(enter: impl FnOnce() -> io::Result<usize>) -> io::Result<usize> {
+    match injected(&FAIL_REAPS, &FAIL_REAPS_ERRNO) {
+        Some(e) => Err(e),
+        None => enter(),
+    }
+}
+
+/// The longest pause between enters the kernel refuses for now (`EAGAIN`).
+const ENTER_RETRY_MAX: Duration = Duration::from_millis(1);
+
+/// `io_uring_enter` handing over what the submission queue holds, failing while
+/// [`fail_ring_enters`] asks.
+fn enter(uring: &IoUring) -> io::Result<usize> {
+    match injected(&FAIL_ENTERS, &FAIL_ENTERS_ERRNO) {
+        Some(e) => Err(e),
+        None => uring.submit(),
+    }
+}
+
+/// Hands entries already published to the kernel. Whatever it returns, they stay the
+/// ring's: an operation whose entry is published is never failed here, as some later enter
+/// submits the entry and the kernel then reads into or from its buffer (perf287's must-fix
+/// on #974). A refusal for now (`EAGAIN`, `EINTR`) is retried, backing off up to 1 ms: the
+/// ring's waiter may be blocked in the kernel with nothing else in flight, and would never
+/// enter again on its own. Any other error is left to the next enter: `EBUSY` means
+/// completions wait to be taken, so the reaper (or the owner) is not blocked and enters
+/// again soon, and a broken ring fails that enter too, which resolves everything in flight
+/// (`fail_all`).
+fn enter_published(uring: &IoUring) {
+    let mut pause = Duration::from_micros(1);
+    loop {
+        match enter(uring) {
+            Err(e) if matches!(e.raw_os_error(), Some(libc::EAGAIN | libc::EINTR)) => {
+                thread::sleep(pause);
+                pause = (pause * 2).min(ENTER_RETRY_MAX);
+            }
+            _ => return,
+        }
+    }
+}
+
+/// Resolves `op`, in flight on a ring that failed, with `e`, and leaks its buffer: the kernel
+/// may still read into or write from it until the ring's teardown has cancelled everything,
+/// which happens after the ring is dropped, so the buffer is never freed or given back to its
+/// slot pool (perf287 on #976). Only for a ring that can no longer be entered; an operation
+/// whose entry the kernel never saw goes through [`fail`].
+fn abandon(op: Op, e: io::Error) {
+    match op.kind {
+        Kind::Read { buf, resolver, .. } => {
+            std::mem::forget(buf);
+            resolver.resolve(Err(Error::os("read", e)));
+        }
+        Kind::Write { buf, resolver, .. } => {
+            std::mem::forget(buf);
+            resolver.resolve(Err(Error::os("write", e)));
+        }
+        Kind::Sync { resolver, .. } => resolver.resolve(Err(Error::os("sync", e))),
+    }
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1044,25 +1063,7 @@ impl Ring {
     }
 }
 
-/// Resolves `op`, in flight on a ring that failed, with `e`, and leaks its buffer: the kernel
-/// may still read into or write from it until the ring's teardown has cancelled everything,
-/// which happens after the ring is dropped, so the buffer is never freed or given back to its
-/// slot pool (perf287 on #976). Only for a ring that can no longer be entered.
-fn abandon(op: Op, e: io::Error) {
-    match op.kind {
-        Kind::Read { buf, resolver, .. } => {
-            std::mem::forget(buf);
-            resolver.resolve(Err(Error::os("read", e)));
-        }
-        Kind::Write { buf, resolver, .. } => {
-            std::mem::forget(buf);
-            resolver.resolve(Err(Error::os("write", e)));
-        }
-        Kind::Sync { resolver, .. } => resolver.resolve(Err(Error::os("sync", e))),
-    }
-}
-
-/// Resolves `op`, whose entry the kernel never saw, with `e`.
+/// Resolves `op` with `e`.
 fn fail(op: Op, e: io::Error) {
     match op.kind {
         Kind::Read { resolver, .. } => resolver.resolve(Err(Error::os("read", e))),
