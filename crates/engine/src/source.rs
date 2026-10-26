@@ -759,7 +759,9 @@ impl View {
         }
     }
 
-    /// Sources for a scan of `[start, end)` (row prefixes), newest first.
+    /// Sources for a scan of `[start, end)` (row prefixes), newest first (the test hooks'
+    /// slot scans).
+    #[cfg(feature = "test-hooks")]
     pub(crate) fn scan_sources(
         &self,
         shard: ShardId,
@@ -774,7 +776,8 @@ impl View {
         Ok(out)
     }
 
-    /// [`View::scan_sources`] appended to `out` (a reused source list).
+    /// `View::scan_sources` appended to `out` (a reused source list).
+    #[cfg(feature = "test-hooks")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_sources_into<const CACHE_ONLY: bool>(
         &self,

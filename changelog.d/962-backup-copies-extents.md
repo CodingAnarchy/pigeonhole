@@ -1,0 +1,2 @@
+### Changed
+- `backup` and `backup_durable` copy the database's SST and blob files byte for byte instead of re-merging every entry (#715). A backup now takes about as long as copying the live data, and the copy is about the size of the live data: it no longer carries the source's free space, a block grown ahead of need, or free space from its own temporary files (63 MB of data made a 192–256 MB copy before, 66.5 MB now). The copy keeps the source's level shape and holds a blob file only if the snapshot references a value in it. The file format is unchanged.

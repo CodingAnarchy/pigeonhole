@@ -15,8 +15,8 @@ use std::task::Poll;
 
 use common::{Store, families, poll_commit};
 use pigeonhole_engine::{
-    Engine, EngineOptions, Error, FamilyOptions, PickerOptions, ReadSpec, ScanSpec, ValueRef,
-    WriteBatch,
+    CheckOptions, Engine, EngineOptions, Error, FamilyOptions, PickerOptions, ReadSpec, ScanSpec,
+    Severity, Structure, ValueRef, WriteBatch,
 };
 use pigeonhole_format::Durability;
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
@@ -746,6 +746,179 @@ fn backup_is_a_consistent_single_file_copy() {
     write_rows(&copy, &ct, 2000..2010, Durability::GroupSync);
     copy.close().unwrap();
     assert_eq!(sidecars(&vfs), Vec::<String>::new());
+}
+
+/// The copy's check report, which must find nothing, and its free space: the file's length
+/// less its extents', with the largest extent's length.
+fn check_copy(vfs: &Arc<SimVfs>) -> (pigeonhole_engine::CheckReport, u64, u64) {
+    let v: VfsRef = Arc::clone(vfs) as _;
+    // Deep: every blob pointer is read through, and each blob file's live bytes recounted.
+    let r = Engine::check(
+        &v,
+        Path::new("/db/copy.phdb"),
+        &CheckOptions::default().deep(true),
+    )
+    .unwrap();
+    assert!(r.findings.is_empty(), "{:#?}", r.findings);
+    let used: u64 = r.extents.iter().map(|e| e.len).sum();
+    let largest = r.extents.iter().map(|e| e.len).max().unwrap_or(0);
+    let free = r.file_bytes - used;
+    (r, free, largest)
+}
+
+/// #715: a backup copies the source's SSTs and blob files byte for byte and flushes its
+/// memtables into the copy: a split's shared SSTs, separated values, and commits still in
+/// the memtables all read back, the copy checks clean, and it holds no free space but
+/// what one extent's alignment can leave.
+#[test]
+fn backup_copies_extents_and_flushes_the_memtables() {
+    let vfs = SimVfs::new(29);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let mut f = FamilyOptions::default();
+    f.blob_threshold = 100;
+    let t = db.create_table("t", &[("f".into(), f)]).unwrap();
+    write_rows(&db, &t, 0..300, Durability::Buffered);
+    db.flush().unwrap();
+    // The children share the SSTs written so far.
+    db.split_table(t.id, vec![b"row00150".to_vec()], &[0, 1])
+        .unwrap();
+    // Unflushed: these are in the memtables when the backup runs.
+    write_rows(&db, &t, 300..350, Durability::Buffered);
+    db.backup(Path::new("/db/copy.phdb")).unwrap();
+    db.close().unwrap();
+    let (r, free, largest) = check_copy(&vfs);
+    assert!(
+        free <= largest,
+        "{free} bytes free in the copy (largest extent {largest})"
+    );
+    assert!(
+        r.counts.blob_pointers > 0,
+        "separated values: {:?}",
+        r.counts
+    );
+
+    let copy = Engine::open(Path::new("/db/copy.phdb"), owned(Arc::clone(&vfs), 2)).unwrap();
+    let ct = copy.table("t").unwrap();
+    assert_eq!(row_count(&copy, &ct), 350);
+    for i in [0u32, 149, 150, 299, 300, 349] {
+        assert_eq!(
+            get_bytes(&copy, &ct, format!("row{i:05}").as_bytes(), b"q"),
+            Some(vec![(i % 251) as u8; 300]),
+            "row {i}"
+        );
+    }
+    write_rows(&copy, &ct, 2000..2010, Durability::GroupSync);
+    copy.close().unwrap();
+}
+
+/// #715: an SST holding commits above the backup's snapshot (under a durable snapshot,
+/// commits flushed before they were durable) is rewritten without them, not copied.
+#[test]
+fn backup_below_an_ssts_commits_rewrites_it_without_them() {
+    let vfs = SimVfs::new(30);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    // Separated values: the rewrite keeps the pointers of the commits it keeps.
+    let mut f = FamilyOptions::default();
+    f.blob_threshold = 100;
+    let t = db.create_table("t", &[("f".into(), f)]).unwrap();
+    write_rows(&db, &t, 0..100, Durability::Buffered);
+    // Held, so compaction keeps every version this seqno reads.
+    let before = db.snapshot().unwrap();
+    // Every row again, above `before`; the full compaction then leaves SSTs holding both
+    // versions, so a rewrite keeps half of each.
+    for i in 0..100u32 {
+        let mut wb = WriteBatch::new();
+        put(
+            &mut wb,
+            &t,
+            format!("row{i:05}").as_bytes(),
+            b"q",
+            &[0xEE; 300],
+        );
+        db.commit(wb, Some(Durability::Buffered)).unwrap();
+    }
+    db.flush().unwrap();
+    db.compact(None).unwrap();
+    // The children share the SST the split key falls in: it is rewritten once and listed
+    // under both (stored once: rewritten per child, its kept entries would count twice).
+    db.split_table(t.id, vec![b"row00050".to_vec()], &[0, 0])
+        .unwrap();
+    let at = db.snapshot().unwrap().at_seqno(before.seqno());
+    db.backup_at(at, Path::new("/db/copy.phdb")).unwrap();
+    drop(before);
+    db.close().unwrap();
+    // Stored, not just hidden by the copy's seqno ceiling: its next commits take the seqnos
+    // above the snapshot, which copied entries must not hold.
+    let (r, _, _) = check_copy(&vfs);
+    assert_eq!(r.counts.sst_entries, 100, "{:?}", r.counts);
+
+    let copy = Engine::open(Path::new("/db/copy.phdb"), owned(Arc::clone(&vfs), 1)).unwrap();
+    let ct = copy.table("t").unwrap();
+    assert_eq!(
+        row_count(&copy, &ct),
+        100,
+        "only the commits at or below the snapshot"
+    );
+    assert_eq!(
+        get_bytes(&copy, &ct, b"row00099", b"q"),
+        Some(vec![99u8; 300])
+    );
+    assert_eq!(
+        get_bytes(&copy, &ct, b"row00050", b"q"),
+        Some(vec![50u8; 300])
+    );
+    copy.close().unwrap();
+}
+
+/// #715, perf287's S2: SSTs an older build wrote record no blob references and may point
+/// anywhere in their family, so the copy keeps every blob file of that family, at its
+/// source live bytes.
+#[test]
+fn backup_keeps_a_familys_blob_files_for_ssts_without_recorded_references() {
+    let vfs = SimVfs::new(31);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 1)).unwrap();
+    db.inject(pigeonhole_engine::Fault::OmitBlobRefs, true);
+    let mut f = FamilyOptions::default();
+    f.blob_threshold = 100;
+    let t = db.create_table("t", &[("f".into(), f)]).unwrap();
+    write_rows(&db, &t, 0..200, Durability::Buffered);
+    db.flush().unwrap();
+    db.inject(pigeonhole_engine::Fault::OmitBlobRefs, false);
+    db.backup(Path::new("/db/copy.phdb")).unwrap();
+    db.close().unwrap();
+    let v: VfsRef = Arc::clone(&vfs) as _;
+    let r = Engine::check(
+        &v,
+        Path::new("/db/copy.phdb"),
+        &CheckOptions::default().deep(true),
+    )
+    .unwrap();
+    // Expected: one warning per copied SST, that it records no references (as the source's
+    // own check reports), and no blob finding: the kept live bytes are the source's, which
+    // the deep recount matches. Nothing is corruption.
+    assert!(r.is_ok(), "{:#?}", r.findings);
+    assert!(!r.findings.is_empty());
+    for f in &r.findings {
+        assert!(
+            f.structure == Structure::Sst
+                && f.severity == Severity::Warning
+                && f.message.contains("records no references"),
+            "{f:#?}"
+        );
+    }
+    // Every blob file of the family is kept.
+    let source = Engine::check(&v, Path::new(DB), &CheckOptions::default()).unwrap();
+    assert_eq!(r.counts.blob_files, source.counts.blob_files);
+    assert!(r.counts.blob_files > 0);
+
+    let copy = Engine::open(Path::new("/db/copy.phdb"), owned(Arc::clone(&vfs), 1)).unwrap();
+    let ct = copy.table("t").unwrap();
+    assert_eq!(row_count(&copy, &ct), 200);
+    assert_eq!(
+        get_bytes(&copy, &ct, b"row00123", b"q"),
+        Some(vec![123u8; 300])
+    );
+    copy.close().unwrap();
 }
 
 #[test]

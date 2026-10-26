@@ -1170,9 +1170,10 @@ impl Pigeonhole {
     /// continue. The copy holds exactly the commits visible when this is called and opens
     /// on its own, without WAL replay or sidecar files. Visible is not durable: the copy can
     /// hold commits whose fsync had not finished, which a power loss then removes from this
-    /// database (see the durability guide). Separated values (above a family's
-    /// `blob_threshold`) are copied into the copy's own blob files, which hold only the
-    /// values the copy references.
+    /// database (see the durability guide). The snapshot's memtables are written into the
+    /// copy, and its SST and blob files are copied byte for byte: the copy is about the size
+    /// of the live data, keeps the source's level shape, and holds a blob file only if the
+    /// snapshot references a value in it.
     ///
     /// ```
     /// use pigeonhole::{Family, Options, Pigeonhole};
