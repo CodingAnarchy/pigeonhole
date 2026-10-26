@@ -2366,39 +2366,10 @@ struct ArenaNeed {
 /// coordinator) into room the share's PREPARE reserved in full on its own.
 #[derive(Default)]
 struct GroupRoom {
-    /// The slots reserved for: the first single's, then any later single's new ones. The
-    /// first is held apart, inline: a single-row commit touches one slot, and most groups
-    /// hold one single.
-    first: Option<(TabletId, FamilyId)>,
-    more: smallvec::SmallVec<[(TabletId, FamilyId); 4]>,
+    /// The slots reserved for: the first single's, then any later single's new ones.
+    slots: smallvec::SmallVec<[(TabletId, FamilyId); 4]>,
     /// Whether a single of the group reserved (and with it the fixed two chunks).
     fixed: bool,
-}
-
-impl GroupRoom {
-    fn has(&self, slot: (TabletId, FamilyId)) -> bool {
-        self.first == Some(slot) || self.more.contains(&slot)
-    }
-
-    fn add(&mut self, slot: (TabletId, FamilyId)) {
-        if self.first.is_none() {
-            self.first = Some(slot);
-        } else {
-            self.more.push(slot);
-        }
-    }
-
-    /// Where its slots end now, to undo the additions of a member that is not admitted.
-    fn mark(&self) -> (bool, usize) {
-        (self.first.is_some(), self.more.len())
-    }
-
-    fn undo(&mut self, (first, more): (bool, usize)) {
-        if !first {
-            self.first = None;
-        }
-        self.more.truncate(more);
-    }
 }
 
 /// A wait for a flush to free memtable arena room, with its timers: a commit's (a write
@@ -3931,10 +3902,10 @@ impl ShardState {
                         self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family));
                     new_slots += usize::from(new);
                     if let Some(g) = group.as_deref_mut() {
-                        if g.fixed && g.has((tablet, m.family)) {
+                        if g.fixed && g.slots.contains(&(tablet, m.family)) {
                             shared += 1 + usize::from(new);
                         } else {
-                            g.add((tablet, m.family));
+                            g.slots.push((tablet, m.family));
                         }
                     }
                 }
@@ -4041,7 +4012,7 @@ impl ShardState {
     ) -> std::result::Result<usize, Room> {
         let mut rows = std::mem::take(&mut self.admit_rows);
         rows.clear();
-        let mark = group.as_ref().map(|g| g.mark());
+        let mark = group.as_ref().map(|g| g.slots.len());
         let mut group = group;
         let need = match BatchRef::new(bytes) {
             Ok(batch) => self.arena_needed(batch, &mut rows, group.as_deref_mut()),
@@ -4101,7 +4072,7 @@ impl ShardState {
             let total = self.arena.region().len();
             // Not admitted: the slots it added are not the group's.
             if let (Some(g), Some(mark)) = (group, mark) {
-                g.undo(mark);
+                g.slots.truncate(mark);
             }
             // Whether it could ever fit is judged on its own, as if first in its group.
             return Err(if need.alone + 2 * self.chunk_size > total {
