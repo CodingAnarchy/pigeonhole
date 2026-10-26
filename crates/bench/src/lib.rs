@@ -1350,7 +1350,21 @@ fn pass(
      -> Result<(Histogram, Split), String> {
         let mut hist = Histogram::new();
         let mut split = Split::default();
-        for (op, class) in share {
+        // Scratch (#759, not for merge): PHDB_PACE_OPS paces every client so all of them
+        // together offer that many operations per second; latency stays service time.
+        let pace = std::env::var("PHDB_PACE_OPS")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .map(|r| Duration::from_secs_f64(shares.len().max(1) as f64 / r));
+        let paced_from = Instant::now();
+        for (i, (op, class)) in share.iter().enumerate() {
+            if let Some(gap) = pace {
+                let due = paced_from + gap * u32::try_from(i).unwrap_or(u32::MAX);
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+            }
             let t = Instant::now();
             if deadline.is_some_and(|d| t >= d) {
                 break;
