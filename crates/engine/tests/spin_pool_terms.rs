@@ -175,9 +175,9 @@ fn one_clients_cross_shard_commits_count_at_the_coordinator_and_the_participant(
         );
     };
     // Shard 0 owns each pair's first row, so it coordinates every commit and shard 1
-    // prepares every share (D262): the participant counts the round from the client's
-    // submit to the decision, which the coordinator's reply follows, so its count is above
-    // zero and below the coordinator's.
+    // prepares every share (D262): each counts the round, the participant from the
+    // client's submit to the decision and the coordinator to its reply, so both counts are
+    // above zero.
     let counted: Vec<u64> = db
         .shard_stats()
         .iter()
@@ -191,21 +191,26 @@ fn one_clients_cross_shard_commits_count_at_the_coordinator_and_the_participant(
         counted[1] > 0,
         "the participant counted no cross-shard round's in-flight time: {counted:?}"
     );
-    assert!(
-        counted[1] < counted[0],
-        "the participant's rounds end at the decision, before the coordinator's reply: {counted:?}"
-    );
-    // The coordinator prepares its own share too and must not count it at the decision on
-    // top of its reply: it adds one span per round (its reply), as the participant does (its
-    // decision); counting its own share too would double its spans. Counts, not a ratio of
-    // the nanos: the reply hop's share of a round varies by platform (1.1× the decision span
-    // on the Linux runners, 1.7× on the macOS one).
-    let counts: Vec<u64> = (0..2).map(|s| db.inflight_counts(s)).collect();
+    // One span per round at each shard, by count rather than by comparing the two shard
+    // threads' clocks (#972; #766 did the same for the ratio): the coordinator adds its
+    // reply's, and the participant its decision's, which it may apply just after the
+    // client's commit returned, so wait for it. Counting its own share at the decision too
+    // would give the coordinator two per round; a participant that counted nothing, or
+    // counted at its prepare as well, would not give exactly one.
+    let rounds = 100 * u64::from(n);
+    let settle = Instant::now() + Duration::from_secs(10);
+    let counts = loop {
+        let counts: Vec<u64> = (0..2).map(|s| db.inflight_counts(s)).collect();
+        if counts[1] >= rounds || Instant::now() >= settle {
+            break counts;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
     assert_eq!(
-        counts[0], counts[1],
-        "the coordinator added {} spans and the participant {}: one per round each, or the \
-         coordinator counted its own share at the decision on top of its reply",
-        counts[0], counts[1]
+        counts,
+        vec![rounds, rounds],
+        "{rounds} cross-shard rounds: one span per round at the coordinator (its reply) and \
+         one at the participant (its decision)"
     );
     assert!(
         store_inflight <= 2.1,
