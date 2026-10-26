@@ -1097,7 +1097,8 @@ impl Task for CompactionWork {
     /// a worker's slices run their reads inline, `pigeonhole_io::inline_io`), so the job's
     /// extents go back to the pager now and the shard sees its inputs free to compact again.
     /// After the submit it only waits for the manifest's reply, and keeps waiting, failed
-    /// or not.
+    /// or not: in `Stage::Commit` its state is only the reply's receiver (the output belongs
+    /// to the manifest request), so a slice that panicked there left nothing half-updated.
     fn reclaim(&mut self, _failed: bool) -> bool {
         if !matches!(self.stage, Stage::Run) {
             return true;

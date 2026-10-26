@@ -17,7 +17,7 @@
 //!   slices running at that moment. The only condvar wait in the pool (`slice_done`); the
 //!   caller holds no lock a slice could take (concurrency.md).
 //! - a room wait on the shard ([`ShardContext::reclaim_room`](crate::ShardContext)): its own
-//!   room-freeing tasks (flushes) that could run but have not for [`ROOM_RECLAIM`], never
+//!   commit-path tasks (flushes, the manifest pump, WAL spares) that could run but have not for [`ROOM_RECLAIM`], never
 //!   waiting: a flush a worker is running stays there.
 //! - a dropped driver: everything it held. With no driver left, queued tasks too, and later
 //!   spawns stay on the shards.
@@ -50,7 +50,7 @@ use crate::Wakes;
 use crate::sched::{IdlePark, Moved, Scheduler, Task, TaskPoll};
 use crate::signal::{Signal, WakeTarget};
 
-/// How long a shard's room-freeing task (a flush) may sit runnable on a worker without a
+/// How long a shard's commit-path task (a flush) may sit runnable on a worker without a
 /// slice before a room wait on that shard takes it back (D284): four slices.
 pub(crate) const ROOM_RECLAIM: u64 = 2_000_000;
 
@@ -67,6 +67,9 @@ pub(crate) struct Origin {
     has_back: AtomicBool,
     /// This shard's tasks in the injector.
     queued: AtomicUsize,
+    /// This shard's tasks a driver holds (D284): its turns look for a stopped driver only
+    /// then.
+    pub(crate) held: AtomicUsize,
 }
 
 impl fmt::Debug for Origin {
@@ -84,6 +87,7 @@ impl Origin {
             back: Mutex::new(Vec::new()),
             has_back: AtomicBool::new(false),
             queued: AtomicUsize::new(0),
+            held: AtomicUsize::new(0),
         })
     }
 
@@ -104,6 +108,11 @@ impl Origin {
     /// Whether this shard has tasks waiting in the injector.
     pub(crate) fn queued(&self) -> bool {
         self.queued.load(Ordering::Relaxed) > 0
+    }
+
+    /// Whether a driver holds tasks of this shard's.
+    pub(crate) fn held(&self) -> bool {
+        self.held.load(Ordering::Relaxed) > 0
     }
 
     fn give_back(&self, moved: Moved) {
@@ -127,7 +136,7 @@ struct Queued {
 }
 
 struct PoolState {
-    /// Queued room-freeing tasks (flushes): taken ahead of the rest.
+    /// Queued commit-path tasks (flushes, the manifest pump, WAL spares): taken ahead of the rest.
     room: VecDeque<Queued>,
     rest: VecDeque<Queued>,
     /// Each driver's tasks; `None` once the driver is dropped.
@@ -182,6 +191,9 @@ pub(crate) struct Pool {
     /// The VFS clock at the last pass any driver made: queued tasks fall back to their
     /// shards only when nobody drives (`FALLBACK`).
     last_pass: AtomicU64,
+    /// Each driver's last pass (VFS clock), by driver id: a driver that stopped making passes
+    /// for `FALLBACK` gives its idle held tasks back too (application drivers only).
+    passes: Vec<AtomicU64>,
     /// Engine-owned threads: never taken from.
     builtin: bool,
     vfs: VfsRef,
@@ -222,6 +234,7 @@ impl Pool {
             closed: AtomicBool::new(false),
             live: AtomicUsize::new(k),
             last_pass: AtomicU64::new(0),
+            passes: (0..k).map(|_| AtomicU64::new(0)).collect(),
             builtin,
             vfs,
             time_slice,
@@ -255,7 +268,7 @@ impl Pool {
         if !task.offload() {
             return Err(task);
         }
-        let room = task.frees_room();
+        let room = task.commit_path();
         let at = self.now();
         {
             let mut st = self.lock();
@@ -284,7 +297,7 @@ impl Pool {
     }
 
     /// Moves a queued task into driver `id`'s scheduler if the take policy allows: a
-    /// room-freeing task always (one per call), any other only while the driver has nothing
+    /// commit-path task always (one per call), any other only while the driver has nothing
     /// runnable or holds fewer than two tasks (so the first driver to look does not take
     /// everything), or always on engine-owned threads, which are always driven.
     fn take_new(&self, st: &mut PoolState, id: usize, now: u64) {
@@ -358,7 +371,7 @@ impl Pool {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// A room wait on `origin`'s shard (D284): takes back its room-freeing tasks that could
+    /// A room wait on `origin`'s shard (D284): takes back its commit-path tasks that could
     /// run but have not for [`ROOM_RECLAIM`] (held by an application's driver that is not
     /// running them, or queued with no driver taking them). Never waits. Returns them, and
     /// when to look again for one not yet that idle.
@@ -402,21 +415,39 @@ impl Pool {
         (moved, next)
     }
 
-    /// `origin`'s tasks queued for [`FALLBACK`] while no driver made a pass (workers
-    /// configured but not driven): its shard takes them back.
+    /// What `origin`'s shard takes back because nobody drives it (workers configured but
+    /// not driven, or one the application stopped driving without dropping it): its tasks
+    /// queued for [`FALLBACK`] while no driver made a pass, and every task of its an
+    /// application driver holds without running, once that driver has made no pass for
+    /// [`FALLBACK`] (a compaction is then dropped and picked again, rather than keep its
+    /// inputs busy until the close).
     pub(crate) fn take_stale(&self, origin: &Arc<Origin>, now: u64) -> Vec<Moved> {
         let mut moved = Vec::new();
         let Some(before) = now.checked_sub(FALLBACK) else {
             return moved;
         };
-        if self.last_pass.load(Ordering::Relaxed) > before {
-            return moved;
-        }
+        let mine = |o: &Arc<Origin>, _: bool| Arc::ptr_eq(o, origin);
         let mut st = self.lock();
-        st.take_queued(before, |o, _| Arc::ptr_eq(o, origin), &mut moved);
+        if self.last_pass.load(Ordering::Relaxed) <= before {
+            st.take_queued(before, mine, &mut moved);
+            self.queued.fetch_sub(moved.len(), Ordering::Relaxed);
+        }
+        if !self.builtin {
+            for (id, sched) in st.drivers.iter_mut().enumerate() {
+                if let Some(sched) = sched
+                    && self.passes[id].load(Ordering::Relaxed) <= before
+                {
+                    sched.take_idle(u64::MAX, false, mine, &mut moved);
+                }
+            }
+        }
         drop(st);
-        self.queued.fetch_sub(moved.len(), Ordering::Relaxed);
         moved
+    }
+
+    /// Engine-owned threads' pool (never taken from).
+    pub(crate) fn builtin(&self) -> bool {
+        self.builtin
     }
 
     /// Driver `id` is dropped: everything it held goes back to its shards (dropped, on a
@@ -519,6 +550,7 @@ impl PoolDriver {
         }
         let mut now = pool.now();
         pool.last_pass.store(now, Ordering::Relaxed);
+        pool.passes[self.id].store(now, Ordering::Relaxed);
         self.signal().awake();
         let mut st = pool.lock();
         loop {

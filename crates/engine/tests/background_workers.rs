@@ -464,3 +464,256 @@ fn a_dropped_worker_mid_compaction_leaves_its_inputs_to_compact_again() {
     }
     assert_eq!(engine.unreferenced_bytes(), 0);
 }
+
+/// perf287's must-fix on #983: a driven worker busy with two long compactions (one per
+/// shard, so the take policy alone would not take anything else) still takes a flush's
+/// manifest commit (the pump) and a segment rollover's WAL spare at once: they are on the
+/// commit path (`Task::commit_path`), taken and run ahead of compactions. Commits and a
+/// flush finish within a few worker passes while both compactions are still running.
+#[test]
+fn commit_path_tasks_do_not_wait_behind_compactions_on_a_driven_worker() {
+    let vfs = SimVfs::new(5);
+    let mut o = sim_options(&vfs, 1);
+    o.shards = 2;
+    o.memtable_budget = 64 * CHUNK as u64;
+    o.memtable_freeze_bytes = 16 * CHUNK as u64;
+    // Small segments: commits roll the WAL over, each rollover using a prepared spare.
+    o.wal.segment_size = 64 << 10;
+    let AppOwned {
+        engine,
+        mut shards,
+        mut workers,
+        ..
+    } = Engine::open_application_owned_with(Path::new("/db/commit-path.phdb"), o).expect("open");
+    let mut worker = workers.remove(0);
+    // A table on each shard (a new table's one tablet goes to one shard).
+    let mut tables: [Option<std::sync::Arc<pigeonhole_engine::TableInfo>>; 2] = [None, None];
+    for i in 0..8 {
+        let t = engine
+            .create_table(&format!("t{i}"), &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+        let s = engine.shard_of(t.id, b"x").unwrap();
+        tables[s].get_or_insert(t);
+        if tables.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    let tables = tables.map(|t| t.expect("a table on each shard"));
+    let rows: Vec<Vec<u8>> = (0..20_000u32).map(|i| i.to_be_bytes().to_vec()).collect();
+    let turn_all = |shards: &mut Vec<EngineShard>, worker: Option<&mut BackgroundWorker>| {
+        let now = vfs.monotonic_nanos();
+        for s in shards.iter_mut() {
+            s.run_once(now + 1_000_000);
+        }
+        if let Some(w) = worker {
+            w.run_once(now);
+        }
+    };
+    let commit_wait =
+        |shards: &mut Vec<EngineShard>, worker: &mut BackgroundWorker, b: WriteBatch| {
+            let mut pc: PendingCommit = engine.submit(b, Some(Durability::Buffered)).unwrap();
+            for _ in 0..256 {
+                if ready(&mut pc).is_some() {
+                    break;
+                }
+                turn_all(shards, Some(worker));
+            }
+            ready(&mut pc).expect("committed").expect("ok");
+        };
+    // Four overlapping L0 runs on each shard; the compactions they start wait in the hook.
+    engine.hold_compactions(true);
+    for run in 0..4usize {
+        for t in &tables {
+            let f = t.families[0].id;
+            let mine: Vec<&Vec<u8>> = rows.iter().skip(run).step_by(4).take(4096).collect();
+            for chunk in mine.chunks(64) {
+                let mut b = WriteBatch::new();
+                for r in chunk {
+                    b.put(t.id, f, r, b"q", None, ValueRef::Bytes(&[7u8; 64]))
+                        .unwrap();
+                }
+                commit_wait(&mut shards, &mut worker, b);
+            }
+        }
+        let mut f = engine.flush_pending().unwrap();
+        for _ in 0..1024 {
+            if ready(&mut f).is_some() {
+                break;
+            }
+            turn_all(&mut shards, Some(&mut worker));
+        }
+        ready(&mut f).expect("flushed").expect("ok");
+    }
+    for _ in 0..64 {
+        turn_all(&mut shards, Some(&mut worker));
+    }
+    assert!(engine.compaction_held(), "the worker holds the compactions");
+    // Both compactions run now, a few units per slice: hundreds of slices each.
+    engine.compaction_tiny_slices(true);
+    engine.hold_compactions(false);
+    for _ in 0..4 {
+        turn_all(&mut shards, Some(&mut worker));
+    }
+    let flushes = engine.metrics().flushes;
+    // New commits on both shards (rolling the WAL over), and a flush that needs the pump.
+    let mut passes = 0;
+    for t in &tables {
+        for r in rows.iter().skip(16 * 1024).take(96) {
+            let mut pc: PendingCommit = engine
+                .submit(put(t, r, 1024), Some(Durability::Buffered))
+                .unwrap();
+            while ready(&mut pc).is_none() {
+                turn_all(&mut shards, Some(&mut worker));
+                passes += 1;
+                assert!(passes < 4096, "commits wait behind the compactions");
+            }
+        }
+    }
+    let mut f = engine.flush_pending().unwrap();
+    let mut flush_passes = 0;
+    while ready(&mut f).is_none() {
+        turn_all(&mut shards, Some(&mut worker));
+        flush_passes += 1;
+        assert!(
+            flush_passes < 32,
+            "the flush's commit waits behind the compactions"
+        );
+    }
+    assert!(engine.metrics().flushes > flushes);
+    assert_eq!(
+        engine.compaction_commits_submitted(),
+        0,
+        "the compactions were still running: the test is not vacuous"
+    );
+    engine.compaction_tiny_slices(false);
+    engine.close().unwrap();
+    for _ in 0..4096 {
+        turn_all(&mut shards, Some(&mut worker));
+        if shards.iter().all(|s| s.closed().is_some()) {
+            break;
+        }
+    }
+    assert!(shards.iter().all(|s| s.closed().is_some()));
+}
+
+/// perf287's should-fixes on #983, in one deterministic run (sim):
+/// - **The extent rule** (deviation 2): with deferred I/O, after every slice a worker runs
+///   of a compaction, no write or sync it submitted is still in flight
+///   (`SimVfs::inline_writes_in_flight`), so freeing a taken-back compaction's output at
+///   once never races a late write. A future submitted write on the output path fails here.
+/// - **A stopped worker** (not dropped, no close): once it has made no pass for 10 ms the
+///   shard takes its compaction back, drops it, and compacts the same inputs itself.
+#[test]
+fn a_stopped_worker_mid_compaction_leaves_no_write_in_flight_and_its_compaction_comes_back() {
+    let vfs = SimVfs::new(6);
+    let AppOwned {
+        engine,
+        mut shards,
+        mut workers,
+        ..
+    } = Engine::open_application_owned_with(Path::new("/db/stopped.phdb"), {
+        // One L0 run per explicit flush: no freezes of their own while the compaction is
+        // held (L0 pacing would stall the commits on the simulator's frozen clock).
+        let mut o = sim_options(&vfs, 1);
+        o.memtable_freeze_bytes = 8 << 20;
+        o
+    })
+    .expect("open");
+    let mut shard = shards.remove(0);
+    let mut worker = workers.remove(0);
+    let t = engine
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    engine.hold_compactions(true);
+    for run in 0..4u32 {
+        let f = t.families[0].id;
+        for chunk in (0..1024u32).collect::<Vec<_>>().chunks(64) {
+            let mut b = WriteBatch::new();
+            for i in chunk {
+                b.put(
+                    t.id,
+                    f,
+                    &(i * 4 + run).to_be_bytes(),
+                    b"q",
+                    None,
+                    ValueRef::Bytes(&[1; 64]),
+                )
+                .unwrap();
+            }
+            let mut pc: PendingCommit = engine.submit(b, Some(Durability::Buffered)).unwrap();
+            let mut n = 0;
+            while ready(&mut pc).is_none() {
+                step(&*vfs, &mut shard, Some(&mut worker), 8);
+                n += 1;
+                assert!(
+                    n < 1024,
+                    "a commit never landed (run {run}, rows from {}): {:?}",
+                    chunk[0],
+                    engine.metrics()
+                );
+            }
+        }
+        let mut fl = engine.flush_pending().unwrap();
+        let mut n = 0;
+        while ready(&mut fl).is_none() {
+            step(&*vfs, &mut shard, Some(&mut worker), 8);
+            n += 1;
+            assert!(n < 1024, "a flush never finished");
+        }
+    }
+    step(&*vfs, &mut shard, Some(&mut worker), 64);
+    assert!(engine.compaction_held());
+    let l0: Vec<u64> = engine
+        .sst_levels()
+        .into_iter()
+        .filter(|(_, level, _)| *level == 0)
+        .map(|(_, _, id)| id)
+        .collect();
+    // The job runs a few units per slice under deferred I/O.
+    vfs.set_deferred_io(true);
+    engine.compaction_tiny_slices(true);
+    engine.hold_compactions(false);
+    let base = engine.unreferenced_bytes();
+    let mut slices = 0;
+    while engine.unreferenced_bytes() <= base || slices < 8 {
+        worker.run_once(vfs.monotonic_nanos());
+        assert_eq!(
+            vfs.inline_writes_in_flight(),
+            0,
+            "a worker's slice left a write in flight"
+        );
+        vfs.complete_all_io();
+        shard.run_once(vfs.monotonic_nanos() + 1_000_000);
+        vfs.complete_all_io();
+        slices += 1;
+        assert!(slices < 4096);
+    }
+    assert_eq!(engine.compaction_commits_submitted(), 0, "stopped mid-job");
+    // The application stops driving the worker. Nothing closes; the shard runs on.
+    engine.compaction_tiny_slices(false);
+    let mut turns = 0;
+    while engine.metrics().compactions == 0 {
+        vfs.advance(1_000_000);
+        shard.run_once(vfs.monotonic_nanos() + 1_000_000);
+        vfs.complete_all_io();
+        turns += 1;
+        assert!(turns < 1000, "the stopped worker kept the compaction");
+    }
+    vfs.set_deferred_io(false);
+    let m = engine.metrics();
+    assert_eq!(
+        m.compactions_reclaimed, 1,
+        "the held compaction was dropped"
+    );
+    assert!(m.background_take_backs.0 >= 1, "counted as a fallback");
+    let levels = engine.sst_levels();
+    assert!(
+        l0.iter().all(|id| !levels.iter().any(|(_, _, s)| s == id)),
+        "the same inputs were compacted again"
+    );
+    drop(worker);
+    engine.close().unwrap();
+    step(&*vfs, &mut shard, None, 256);
+    assert!(shard.closed().expect("closed").is_ok());
+    assert_eq!(engine.unreferenced_bytes(), 0);
+}

@@ -2312,6 +2312,12 @@ impl Task for SpareTask {
     fn name(&self) -> &'static str {
         "wal-spares"
     }
+
+    /// A segment rollover waits for its spare (D284): taken ahead of compactions on a
+    /// worker.
+    fn commit_path(&self) -> bool {
+        true
+    }
 }
 
 /// Sends its message to the shard once a deadline on the VFS clock passes (unless

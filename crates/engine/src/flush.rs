@@ -819,7 +819,7 @@ impl Task for FlushTask {
         "flush"
     }
 
-    fn frees_room(&self) -> bool {
+    fn commit_path(&self) -> bool {
         true
     }
 

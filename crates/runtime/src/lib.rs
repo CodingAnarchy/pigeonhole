@@ -271,7 +271,7 @@ impl<M: Send + 'static> ShardContext<'_, M> {
     }
 
     /// For a room wait on this shard (writers waiting for a flush to free memtable room,
-    /// D284): takes back this shard's room-freeing tasks ([`Task::frees_room`]) that an
+    /// D284): takes back this shard's commit-path tasks ([`Task::commit_path`]: flushes, the manifest pump, WAL spares) that an
     /// application's background worker holds but has not run for 2 ms, to run here. Never
     /// waits: a flush a worker is running stays there. Looks again by itself while one is
     /// not yet that idle. Returns how many came back now; 0 without workers, and always on
@@ -373,7 +373,7 @@ impl<M: Send + 'static> Submitter<M> {
 
     /// `(fallbacks, room)`: tasks of the target shard's that came back from the background
     /// workers (D284) because no worker made a pass for 10 ms while they were queued
-    /// (workers configured but not driven), and room-freeing tasks a room wait on the shard
+    /// (workers configured but not driven), and commit-path tasks a room wait on the shard
     /// took back from a worker that held them without running them. Relaxed.
     pub fn background_take_backs(&self) -> (u64, u64) {
         self.inbox.signal.take_back_counts()

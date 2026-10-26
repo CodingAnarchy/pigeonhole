@@ -63,10 +63,12 @@ pub trait Task: Send + 'static {
     /// A short label for metrics.
     fn name(&self) -> &'static str;
 
-    /// Whether finishing this task frees room its shard's writers may be waiting for (a
-    /// flush). A background worker takes and runs such tasks ahead of others, and a shard
-    /// takes one back from a worker that stopped running it (D284).
-    fn frees_room(&self) -> bool {
+    /// Whether this task is on its shard's commit path: commits wait for it, directly or
+    /// for the room it frees (a flush, the manifest pump that commits a flush's output, a
+    /// WAL spare a segment rollover waits for). A background worker takes and runs such tasks
+    /// ahead of others (a compaction may hold it for seconds), and a room wait on the shard
+    /// takes one back from a worker that is not running it (D284).
+    fn commit_path(&self) -> bool {
         false
     }
 
@@ -207,7 +209,7 @@ struct Entry {
     /// its slices' time is counted back to that shard (D256), and it goes back there if
     /// taken back (D284).
     origin: Option<Arc<Origin>>,
-    /// The task frees room on its shard ([`Task::frees_room`]).
+    /// The task is on its shard's commit path ([`Task::commit_path`]).
     room: bool,
     /// When it last ended a slice, or was taken (VFS clock; pool schedulers only).
     idle_since: u64,
@@ -286,8 +288,11 @@ impl Scheduler {
             }
             None => TaskCell::new(Arc::clone(&self.signal)),
         };
+        if let Some(o) = &origin {
+            o.held.fetch_add(1, Ordering::Relaxed);
+        }
         let entry = Entry {
-            room: task.frees_room(),
+            room: task.commit_path(),
             task: Some(task),
             waker: TaskWaker { cell },
             state: State::Runnable,
@@ -380,7 +385,7 @@ impl Scheduler {
         self.end_one(b.slot, task, poll, 0);
     }
 
-    /// Takes the next runnable task out for one slice, room-freeing tasks first when
+    /// Takes the next runnable task out for one slice, commit-path tasks first when
     /// `room_first` (a worker, D284); its slot stays, marked running, until
     /// [`Scheduler::end_one`].
     pub(crate) fn begin_one(&mut self, room_first: bool) -> Option<Begun> {
@@ -432,7 +437,9 @@ impl Scheduler {
                 }
             }
             TaskPoll::Done => {
-                self.slots[i] = None;
+                if let Some(o) = self.slots[i].take().and_then(|e| e.origin) {
+                    o.held.fetch_sub(1, Ordering::Relaxed);
+                }
                 self.free.push(i);
             }
         }
@@ -465,7 +472,7 @@ impl Scheduler {
     }
 
     /// Takes out every task not running that `pick` selects (by origin and
-    /// [`Task::frees_room`]) and that has been idle since `idle_before` or earlier (VFS
+    /// [`Task::commit_path`]) and that has been idle since `idle_before` or earlier (VFS
     /// clock; `u64::MAX`: any), for adoption elsewhere (D284). Only pool schedulers' tasks
     /// (with an origin) are taken.
     pub(crate) fn take_idle(
@@ -497,6 +504,7 @@ impl Scheduler {
                 }
             }
             if let (Some(task), Some(origin)) = (e.task, e.origin) {
+                origin.held.fetch_sub(1, Ordering::Relaxed);
                 out.push(Moved {
                     task,
                     cell: Some(e.waker.cell),
@@ -564,7 +572,7 @@ pub(crate) struct Spawner {
     pub(crate) local: Scheduler,
     pool: Option<Arc<Pool>>,
     origin: Arc<Origin>,
-    /// When to look again for a stalled room-freeing task of this shard's on a worker (a
+    /// When to look again for a stalled commit-path task of this shard's on a worker (a
     /// room wait, D284).
     room_check: Option<u64>,
     /// When this shard's tasks queued on the pool may fall back to it (`pool::FALLBACK`).
@@ -617,7 +625,9 @@ impl Spawner {
             let stale = pool.take_stale(&self.origin, now);
             self.origin.signal.add_take_backs(stale.len() as u64);
             moved.extend(stale);
-            if self.origin.queued() {
+            // Look again while tasks wait in the queue, or an application's driver holds
+            // some (it may stop being driven; engine-owned threads never do).
+            if self.origin.queued() || (!pool.builtin() && self.origin.held()) {
                 self.stale_check = Some(now.saturating_add(crate::pool::FALLBACK));
             }
         }

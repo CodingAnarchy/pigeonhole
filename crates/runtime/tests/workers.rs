@@ -86,7 +86,7 @@ impl Task for Steps {
         "steps"
     }
 
-    fn frees_room(&self) -> bool {
+    fn commit_path(&self) -> bool {
         self.room
     }
 
@@ -388,4 +388,39 @@ fn a_worker_waits_until_work_arrives() {
     owned.pool.clone().unwrap().close();
     driving.join().unwrap();
     assert!(*woken.lock().unwrap() >= 2);
+}
+
+#[test]
+fn a_stopped_worker_gives_its_held_tasks_back_without_a_close() {
+    // perf287's should-fix on #983: a worker the application stops driving (without dropping
+    // it) holds a compaction-like task. Once that worker has made no pass for 10 ms, the
+    // shard takes the task back (telling it, so a compaction is dropped and picked again)
+    // rather than keep it until the close.
+    let (vfs, mut owned) = open(2);
+    let seen = Arc::new(Seen::default());
+    spawn(&mut owned.shards[0], Steps::new(5, &seen));
+    vfs.advance(1_000_000);
+    assert!(one_slice(&mut owned.workers[0], &vfs));
+    // The other worker keeps passing: only the stopped one's tasks come back.
+    let shard = &mut owned.shards[0];
+    let mut waited = 0;
+    while seen.reclaims.load(Ordering::SeqCst) == 0 {
+        vfs.advance(2_000_000);
+        owned.workers[1].run_once(vfs.monotonic_nanos());
+        shard.run_once(u64::MAX);
+        waited += 1;
+        assert!(waited < 16, "the stopped worker's task never came back");
+    }
+    assert!(
+        waited >= 5,
+        "taken back before the worker was stale ({waited} steps)"
+    );
+    while shard.run_once(u64::MAX) {}
+    assert!(seen.done.load(Ordering::SeqCst));
+    assert_eq!(seen.on_worker.load(Ordering::SeqCst), 1);
+    assert_eq!(seen.on_shard.load(Ordering::SeqCst), 4);
+    assert_eq!(
+        shard.submitter(shard.shard()).background_take_backs(),
+        (1, 0)
+    );
 }
