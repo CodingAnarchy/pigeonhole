@@ -215,7 +215,7 @@ impl Builder {
                 pending,
                 largest_value,
                 max_value,
-                watch: None,
+                watch: Default::default(),
             })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
@@ -236,7 +236,7 @@ impl Builder {
                 pending,
                 largest_value,
                 max_value,
-                watch: None,
+                watch: Default::default(),
             })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
@@ -266,9 +266,9 @@ pub(crate) struct Submitted {
     pub(crate) pending: PendingCommit,
     largest_value: usize,
     max_value: usize,
-    /// With `Options::auto_recover`: the database, for a refusal by its failed engine
-    /// (`Db::refused_later`, #966). `None` with the option off.
-    watch: Option<Arc<Db>>,
+    /// With `Options::auto_recover`: how to find the database again for a refusal by its
+    /// failed engine (`Db::refused_later`, #966). Copied, no reference taken.
+    watch: crate::db::Watch,
 }
 
 impl Submitted {
@@ -278,27 +278,15 @@ impl Submitted {
         r: pigeonhole_engine::Result<pigeonhole_engine::CommitInfo>,
     ) -> Result<CommitInfo> {
         r.map(CommitInfo::from_engine).map_err(|e| {
-            refused_later(
-                &self.watch,
-                commit_error(e, self.largest_value, self.max_value),
-            )
+            self.watch
+                .refused(commit_error(e, self.largest_value, self.max_value))
         })
     }
 
     /// Watches `db` for its failed engine's refusals, with the option on (#966).
-    pub(crate) fn watched_by(mut self, db: &Arc<Db>) -> Self {
-        if db.supervision().is_some() {
-            self.watch = Some(Arc::clone(db));
-        }
+    pub(crate) fn watched_by(mut self, db: &Db) -> Self {
+        self.watch = db.watch();
         self
-    }
-}
-
-/// `e`, or `Closed` for a refusal by the failed engine of the watched database (#966).
-fn refused_later(watch: &Option<Arc<Db>>, e: Error) -> Error {
-    match watch {
-        Some(db) => db.refused_later(e),
-        None => e,
     }
 }
 
@@ -359,7 +347,7 @@ impl CommitTicket {
                 pending
                     .wait()
                     .map(CommitInfo::from_engine)
-                    .map_err(|e| refused_later(&watch, commit_error(e, largest_value, max_value)))
+                    .map_err(|e| watch.refused(commit_error(e, largest_value, max_value)))
             }
         }
     }
@@ -637,7 +625,7 @@ impl RowMutation<'_> {
                 pending,
                 largest_value,
                 max_value,
-                watch: db.supervision().is_some().then(|| Arc::clone(db)),
+                watch: db.watch(),
             })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
@@ -705,7 +693,7 @@ pub(crate) struct SubmittedCheck {
     largest_value: usize,
     max_value: usize,
     /// As [`Submitted`]'s.
-    watch: Option<Arc<Db>>,
+    watch: crate::db::Watch,
 }
 
 #[cfg(feature = "async")]
@@ -716,10 +704,8 @@ impl SubmittedCheck {
         r: pigeonhole_engine::Result<(bool, Option<pigeonhole_engine::CommitInfo>)>,
     ) -> Result<Option<CommitInfo>> {
         let (applied, info) = r.map_err(|e| {
-            refused_later(
-                &self.watch,
-                commit_error(e, self.largest_value, self.max_value),
-            )
+            self.watch
+                .refused(commit_error(e, self.largest_value, self.max_value))
         })?;
         Ok(if applied {
             info.map(CommitInfo::from_engine)
@@ -1130,9 +1116,12 @@ impl Transaction {
                 pending,
                 largest_value,
                 max_value,
-                watch: None,
+                watch: Default::default(),
             })
-            .map(|s| s.watched_by(&self.db))
+            .map(|mut s| {
+                s.watch = self.db.watch().transaction();
+                s
+            })
             .map_err(|e| commit_error(e, largest_value, max_value))
     }
 
