@@ -139,6 +139,51 @@ pub fn own_io_fd() -> Option<i32> {
     backends().iter().find_map(|b| b.fd_here())
 }
 
+// ---- inline scopes (D284) ----
+
+thread_local! {
+    /// Depth of the calling thread's [`inline_io`] scopes.
+    static INLINE: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Ends an [`inline_io`] scope, on return or unwind.
+struct InlineScope;
+
+impl Drop for InlineScope {
+    fn drop(&mut self) {
+        let _ = INLINE.try_with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// Runs `f` with every operation the calling thread submits run inline, synchronously, on
+/// this thread (D284): never on a ring of its own (an io_uring thread ring is not used, nor
+/// is one attached), never on the backend's shared ring or its I/O threads. Each submitted
+/// operation has completed when its `submit_*` call returns, so when `f` returns nothing it
+/// submitted is in flight, whichever thread reaps what.
+///
+/// For a background worker an application drives: a task it runs may be taken back
+/// between slices and run elsewhere, which must not leave I/O behind that only this thread
+/// would complete. The simulator keeps deferring operations ([`SimVfs::set_deferred_io`]),
+/// as a slow device would, but in owner-reaps mode no thread owns one submitted here.
+///
+/// [`SimVfs::set_deferred_io`]: crate::sim::SimVfs::set_deferred_io
+///
+/// ```
+/// let inside = pigeonhole_io::inline_io(pigeonhole_io::in_inline_io);
+/// assert!(inside);
+/// assert!(!pigeonhole_io::in_inline_io());
+/// ```
+pub fn inline_io<R>(f: impl FnOnce() -> R) -> R {
+    let _ = INLINE.try_with(|d| d.set(d.get() + 1));
+    let _scope = InlineScope;
+    f()
+}
+
+/// Whether the calling thread is inside an [`inline_io`] scope.
+pub fn in_inline_io() -> bool {
+    INLINE.try_with(|d| d.get() > 0).unwrap_or(false)
+}
+
 // ---- rings no thread reaps on its own (#408) ----
 
 /// A backend whose completions no thread of its own takes (the simulator under deferred I/O):

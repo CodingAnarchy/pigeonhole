@@ -61,6 +61,12 @@ pub(crate) struct Signal {
     /// (D198, D256): awake and polling for the next message, counted as busy by the
     /// balancer, since a shard its clients keep awake has no idle time to give packing.
     spin: AtomicU64,
+    /// Tasks of this consumer's (a shard's) it took back from the background workers' queue
+    /// because no worker was driven (D284).
+    take_backs: AtomicU64,
+    /// Room-freeing tasks of this consumer's a room wait took back from a worker that was not
+    /// running them (D284).
+    room_take_backs: AtomicU64,
 }
 
 impl fmt::Debug for Signal {
@@ -85,6 +91,8 @@ impl Signal {
             busy: AtomicU64::new(0),
             pool_busy: AtomicU64::new(0),
             spin: AtomicU64::new(0),
+            take_backs: AtomicU64::new(0),
+            room_take_backs: AtomicU64::new(0),
         }
     }
 
@@ -210,6 +218,29 @@ impl Signal {
     /// Nanoseconds counted by [`Signal::add_spin`].
     pub(crate) fn spin_nanos(&self) -> u64 {
         self.spin.load(Ordering::Relaxed)
+    }
+
+    /// Counts tasks taken back from the workers' queue (D284).
+    pub(crate) fn add_take_backs(&self, n: u64) {
+        if n > 0 {
+            self.take_backs.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// Counts tasks a room wait took back from a worker (D284).
+    pub(crate) fn add_room_take_backs(&self, n: u64) {
+        if n > 0 {
+            self.room_take_backs.fetch_add(n, Ordering::Relaxed);
+        }
+    }
+
+    /// `(take_backs, room_take_backs)`: see [`Signal::add_take_backs`] and
+    /// [`Signal::add_room_take_backs`].
+    pub(crate) fn take_back_counts(&self) -> (u64, u64) {
+        (
+            self.take_backs.load(Ordering::Relaxed),
+            self.room_take_backs.load(Ordering::Relaxed),
+        )
     }
 
     /// Whether some task was woken since the last call (clears the flag).

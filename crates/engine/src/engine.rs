@@ -24,7 +24,8 @@ use pigeonhole_io::{ErrorKind, FileRef, Locality, OpenOptions};
 use pigeonhole_memtable::{ArenaRegion, MemtableReader, ShardArena};
 use pigeonhole_pager::Pager;
 use pigeonhole_runtime::{
-    Runtime, RuntimeConfig, ShardDriver, ShardId, Submitter, Waiter, completion,
+    PoolDriver, Runtime, RuntimeConfig, ShardDriver, ShardId, Submitter, Waiter, WorkerPool,
+    completion,
 };
 use pigeonhole_shm::{Presence, Role as ShmRole, ShmConfig, ShmRegion, WriterLock};
 use pigeonhole_sst::SstWriterOptions;
@@ -119,6 +120,15 @@ pub struct Metrics {
     pub flush_failures: u64,
     /// Compactions that failed or could not start (their slot backs off, then retries).
     pub compaction_failures: u64,
+    /// Compactions an application's background worker held when the shard took them back
+    /// (the close, or a dropped worker; D284), dropped before their commit: not failures,
+    /// their slots compact again.
+    pub compactions_reclaimed: u64,
+    /// Application-owned background workers (D284), summed over shards: tasks a shard took
+    /// back from the workers' queue because no worker made a pass for 10 ms (workers
+    /// configured but not driven), and flushes a wait for memtable room took back from a
+    /// worker that held them without running them. Both stay 0 while the workers are driven.
+    pub background_take_backs: (u64, u64),
     /// Write stalls and total stalled nanoseconds: the sum of `room_stalls` and
     /// `pacing_stalls`, kept as it was before the split (ICR 0054).
     pub stalls: (u64, u64),
@@ -445,6 +455,11 @@ pub(crate) struct Inner {
     path: PathBuf,
     runtime: Mutex<Option<Runtime<ShardState>>>,
     application_owned: bool,
+    /// Application-owned mode's background workers (D284): closed first by the close, which
+    /// takes what they hold back to the shards; and, until the open hands them out, the
+    /// workers themselves.
+    workers: std::sync::OnceLock<WorkerPool>,
+    unclaimed_workers: Mutex<Vec<PoolDriver>>,
     closing: AtomicBool,
     reader: Option<ReaderState>,
     /// Longest stored value a WAL record and a memtable entry carry (decision D16): a
@@ -760,6 +775,29 @@ impl Engine {
         path: &Path,
         options: EngineOptions,
     ) -> Result<(Arc<Engine>, Vec<EngineShard>)> {
+        if options.background_workers != 0 {
+            return Err(Error::InvalidArgument(
+                "background_workers needs Engine::open_application_owned_with, which hands \
+                 the workers out (D284)"
+                    .to_owned(),
+            ));
+        }
+        let owned = Self::open_application_owned_with(path, options)?;
+        Ok((owned.engine, owned.shards))
+    }
+
+    /// As [`Engine::open_application_owned`], also handing out `options.background_workers`
+    /// background workers (D284) for the application to drive from threads it owns, as it
+    /// drives the shards: flush and compaction then run on them, not in slices on the
+    /// shards. Still starts no threads (decision D40).
+    ///
+    /// The engine's close never waits for the application to drive a worker: it takes
+    /// what the workers hold back to the shards (flushes finish there; compactions are
+    /// dropped and run again after the next open), waiting only for a slice a worker is
+    /// running at that moment. A worker that is never driven delays its tasks until the
+    /// shards take them back (10 ms after a pass by any worker, or 2 ms into a wait for
+    /// memtable room), which `Submitter`-level counters record.
+    pub fn open_application_owned_with(path: &Path, options: EngineOptions) -> Result<AppOwned> {
         if options.compaction_threads != 0 {
             return Err(Error::InvalidArgument(
                 "compaction_cores must be 0 in application-owned mode (decision D40)".to_owned(),
@@ -767,7 +805,24 @@ impl Engine {
         }
         let (engine, shards) =
             Self::open_writer(path, options, Mode::ApplicationOwned, None).map_err(|(e, _)| e)?;
-        Ok((engine, shards.unwrap_or_default()))
+        let workers = std::mem::take(
+            &mut *engine
+                .inner
+                .unclaimed_workers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        )
+        .into_iter()
+        .map(|driver| BackgroundWorker {
+            driver,
+            engine: Arc::clone(&engine.inner),
+        })
+        .collect();
+        Ok(AppOwned {
+            engine,
+            shards: shards.unwrap_or_default(),
+            workers,
+        })
     }
 
     /// `open_writer_inner`, keeping the locks out of the engine until it is fully open: on an
@@ -1508,6 +1563,8 @@ impl Engine {
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
+            workers: std::sync::OnceLock::new(),
+            unclaimed_workers: Mutex::new(Vec::new()),
             application_owned: mode == Mode::ApplicationOwned,
             closing: AtomicBool::new(false),
             reader: None,
@@ -1529,7 +1586,16 @@ impl Engine {
                 None
             }
             Mode::ApplicationOwned => {
-                let drivers = Runtime::application_owned(config, states)?;
+                config.compaction_threads = inner.options.background_workers;
+                let owned = Runtime::application_owned_with_workers(config, states)?;
+                if let Some(pool) = owned.pool {
+                    let _ = inner.workers.set(pool);
+                }
+                *inner
+                    .unclaimed_workers
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = owned.workers;
+                let drivers = owned.shards;
                 let submitters: Vec<Submitter<ShardMsg>> = (0..shards)
                     .map(|i| drivers[0].submitter(ShardId(i as u16)))
                     .collect();
@@ -1701,6 +1767,8 @@ impl Engine {
             options,
             path: path.to_path_buf(),
             runtime: Mutex::new(None),
+            workers: std::sync::OnceLock::new(),
+            unclaimed_workers: Mutex::new(Vec::new()),
             application_owned: false,
             closing: AtomicBool::new(false),
             reader: Some(reader),
@@ -2706,6 +2774,7 @@ impl Engine {
             m.compactions += s.compactions.load(Ordering::Relaxed);
             m.flush_failures += s.flush_failures.load(Ordering::Relaxed);
             m.compaction_failures += s.compaction_failures.load(Ordering::Relaxed);
+            m.compactions_reclaimed += s.compactions_reclaimed.load(Ordering::Relaxed);
             m.room_stalls.0 += s.room_stalls.load(Ordering::Relaxed);
             m.room_stalls.1 += s.room_stall_nanos.load(Ordering::Relaxed);
             m.pacing_stalls.0 += s.pacing_stalls.load(Ordering::Relaxed);
@@ -2773,6 +2842,9 @@ impl Engine {
                 m.shard_busy_nanos += sub.busy_nanos();
                 m.shard_pool_busy_nanos += sub.pool_busy_nanos();
                 m.shard_spin_time_nanos += sub.spin_nanos();
+                let (fallbacks, room) = sub.background_take_backs();
+                m.background_take_backs.0 += fallbacks;
+                m.background_take_backs.1 += room;
             }
         }
         let w = &shared.visibility;
@@ -4153,6 +4225,13 @@ impl Inner {
         if let Some(a) = &self.admission {
             a.close();
         }
+        // Application-owned background workers (D284): everything they hold or have queued
+        // goes back to the shards, which finish the flushes as part of this close; it waits
+        // only for a slice running right now, never for the application to drive a worker.
+        // Nothing is held here that a slice could take.
+        if let Some(workers) = self.workers.get() {
+            workers.close();
+        }
         let (tx, rx) = completion();
         // Every shard may have reported already (dropped, or its thread panicked) and the
         // final close run before this: then it is answered at once (`close_gate`).
@@ -4622,6 +4701,81 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
         Ok(())
     } else {
         Err(Error::UnknownMergeOperator(name.to_owned()))
+    }
+}
+
+/// What [`Engine::open_application_owned_with`] hands the application (D284).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AppOwned {
+    /// The engine.
+    pub engine: Arc<Engine>,
+    /// One per shard, in shard order: drive each from a thread you own.
+    pub shards: Vec<EngineShard>,
+    /// The background workers (`EngineOptions::background_workers` of them): drive each
+    /// from a thread you own too, or flush and compaction wait for the shards to take them
+    /// back.
+    pub workers: Vec<BackgroundWorker>,
+}
+
+/// One application-owned background worker (D284): runs flushes and compactions the shards
+/// hand off. Drive it like an [`EngineShard`]: call [`run_once`](Self::run_once) until it
+/// returns `false`, then [`wait`](Self::wait) (or wait for the
+/// [`set_wakeup`](Self::set_wakeup) callback or [`next_deadline`](Self::next_deadline)).
+/// Each slice runs its I/O inline on the calling thread, so the thread may stop driving it at
+/// any time: the engine's close and a shard waiting for memtable room take its work back.
+/// After the close, [`closed`](Self::closed) is `true` and it can be dropped; dropping it
+/// earlier hands what it holds back to the shards.
+#[derive(Debug)]
+pub struct BackgroundWorker {
+    driver: PoolDriver,
+    engine: Arc<Inner>,
+}
+
+impl BackgroundWorker {
+    fn forked(&self) -> bool {
+        pigeonhole_io::sys::process_id() != self.engine.opened_in
+    }
+
+    /// Runs the worker's tasks until `deadline_nanos` (VFS monotonic clock) or until none is
+    /// runnable. Returns whether work remains. Does nothing once the engine closed, and in a
+    /// forked child (#901).
+    pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
+        if self.forked() {
+            return false;
+        }
+        self.driver.run_once(deadline_nanos)
+    }
+
+    /// Waits until the worker has work again, the next deadline, or `timeout`. It may return
+    /// early: loop on [`run_once`](Self::run_once).
+    pub fn wait(&mut self, timeout: std::time::Duration) {
+        if !self.forked() {
+            self.driver.wait(timeout);
+        }
+    }
+
+    /// A waker that ends this worker's [`wait`](Self::wait) from any thread.
+    pub fn waker(&self) -> std::task::Waker {
+        self.driver.waker()
+    }
+
+    /// Registers a callback for when the worker has work again (called once right away).
+    pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        self.driver.set_wakeup(wake);
+    }
+
+    /// The earliest deadline (VFS monotonic clock) of a task sleeping on this worker.
+    pub fn next_deadline(&self) -> Option<u64> {
+        if self.forked() {
+            return None;
+        }
+        self.driver.next_deadline()
+    }
+
+    /// Whether the engine closed the workers: nothing more to run, drop it.
+    pub fn closed(&self) -> bool {
+        self.driver.closed()
     }
 }
 

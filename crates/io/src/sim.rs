@@ -834,7 +834,11 @@ impl SimVfs {
         let id = st.next_io;
         st.next_io += 1;
         *st.io_pins.entry(file.handle).or_default() += 1;
-        let owner = st.owner_reaps.then(|| std::thread::current().id());
+        // Inside an inline scope (a background worker's slice, D284) the operation stays
+        // deferred, but no thread owns it: the device completes it like any other, so a task
+        // taken back from the worker never waits on that thread.
+        let owner =
+            (st.owner_reaps && !crate::own::in_inline_io()).then(|| std::thread::current().id());
         if owner.is_some() {
             let own: Weak<dyn crate::own::OwnIo> = self.me.clone();
             crate::own::register(own);
@@ -877,7 +881,11 @@ impl SimVfs {
         }
         let id = st.next_io;
         st.next_io += 1;
-        let owner = st.owner_reaps.then(|| std::thread::current().id());
+        // Inside an inline scope (a background worker's slice, D284) the operation stays
+        // deferred, but no thread owns it: the device completes it like any other, so a task
+        // taken back from the worker never waits on that thread.
+        let owner =
+            (st.owner_reaps && !crate::own::in_inline_io()).then(|| std::thread::current().id());
         if owner.is_some() {
             let own: Weak<dyn crate::own::OwnIo> = self.me.clone();
             crate::own::register(own);

@@ -46,6 +46,12 @@ pub struct EngineOptions {
     /// Engine-owned mode only: [`Engine::open_application_owned`](crate::Engine::open_application_owned)
     /// refuses a nonzero value with `InvalidArgument` (decision D40).
     pub compaction_threads: usize,
+    /// Application-owned mode only: background workers for flush and compaction that the
+    /// application drives from threads it owns (D284), handed out by
+    /// [`Engine::open_application_owned_with`](crate::Engine::open_application_owned_with);
+    /// 0 (the default) runs flush and compaction on the shards. Engine-owned opens use
+    /// `compaction_threads` instead and ignore this.
+    pub background_workers: usize,
     /// Writer default durability.
     pub durability: Durability,
     /// Memtable arena per shard, in bytes (default 64 MiB).
@@ -211,6 +217,7 @@ impl EngineOptions {
             shards: 0,
             pin_threads: true,
             compaction_threads: 0,
+            background_workers: 0,
             durability: Durability::GroupSync,
             memtable_budget,
             memtable_freeze_bytes: memtable_budget / 4,

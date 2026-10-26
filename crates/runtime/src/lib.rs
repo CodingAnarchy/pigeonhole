@@ -9,6 +9,9 @@
 //! - **Application-owned:** [`Runtime::application_owned`] returns one [`ShardDriver`] per
 //!   shard; the application calls [`ShardDriver::run_once`] from its own core threads. The
 //!   simulator uses this mode to run shards deterministically.
+//!   [`Runtime::application_owned_with_workers`] also returns background workers
+//!   ([`PoolDriver`], D284) the application drives the same way, so flush and compaction
+//!   leave the shards as engine-owned mode's compaction threads take them off.
 //!
 //! Messages are a type the engine defines (`H::Msg`), so the hot path has no boxing and no
 //! virtual calls. Background tasks are boxed (`Box<dyn Task>`): they are few and long-lived.
@@ -16,7 +19,8 @@
 //! # Shared state
 //! Shards share nothing mutable except their documented queues: each shard's message queue
 //! (a lock-free `std::sync::mpsc` channel plus a closed flag and in-flight counter), its
-//! idle/wake flag, and the task queues of the optional compaction threads. A
+//! idle/wake flag, and the background workers' pool (its queue and the tasks each worker
+//! holds, D284). A
 //! [`Notifier`]/[`Waiter`] pair shares one completion slot between two parties.
 //!
 //! # Example
@@ -55,6 +59,7 @@
 #![forbid(unsafe_code)]
 
 mod completion;
+mod pool;
 mod sched;
 mod signal;
 mod submit_gate;
@@ -69,9 +74,11 @@ use std::time::Duration;
 use pigeonhole_io::{Vfs, VfsRef};
 
 pub use completion::{Notifier, Settle, SlotCache, Waiter, completion, completion_from};
+pub use pool::{PoolDriver, WorkerPool};
 pub use sched::{Task, TaskPoll, TaskWaker};
 
-use sched::{PoolShared, Scheduler, Spawner};
+use pool::{Origin, Pool};
+use sched::{Scheduler, Spawner};
 use signal::{Signal, WakeTarget};
 
 /// Most messages handled before `end_batch` runs, so a flooded queue still commits groups.
@@ -138,11 +145,12 @@ pub struct RuntimeConfig {
     pub shards: usize,
     /// Pin shard threads to CPUs (engine-owned mode).
     pub pin_threads: bool,
-    /// Extra pinned threads dedicated to background tasks; 0 runs them on the shards.
-    /// Engine-owned mode only: application-owned mode starts no threads, so
-    /// [`Runtime::application_owned`] refuses a nonzero value with
-    /// [`Error::InvalidConfig`] (decision D40). As with tasks on shards, tasks still queued
-    /// or running on these threads at shutdown are dropped unfinished.
+    /// Background workers for flush and compaction; 0 runs them on the shards. Engine-owned
+    /// mode starts a pinned thread per worker. Application-owned mode starts no threads
+    /// (decision D40): [`Runtime::application_owned_with_workers`] hands the workers to the
+    /// application to drive (D284), and [`Runtime::application_owned`] refuses a nonzero
+    /// value with [`Error::InvalidConfig`]. As with tasks on shards, tasks still queued or
+    /// running on engine-owned workers at shutdown are dropped unfinished.
     pub compaction_threads: usize,
     /// Longest a background task runs before yielding.
     pub time_slice: Duration,
@@ -247,9 +255,30 @@ impl<M: Send + 'static> ShardContext<'_, M> {
         &self.submitters[usize::from(shard.0)]
     }
 
-    /// Schedules a background task on this shard (or the compaction pool, if configured).
+    /// Schedules a background task on this shard, or on the background workers if
+    /// configured (unless it does not [`offload`](Task::offload)).
     pub fn spawn(&mut self, task: Box<dyn Task>) {
         self.spawner.spawn(task);
+    }
+
+    /// Runs [`Task::reclaim`] on the tasks the background workers have handed back to this
+    /// shard and takes them in, now rather than at the start of the next turn (D284). A
+    /// closing engine calls it on its close message: the workers' close handed them back
+    /// before that message was sent, so everything the close took back is here.
+    pub fn take_back(&mut self) {
+        let now = self.vfs.monotonic_nanos();
+        self.spawner.take_back(now);
+    }
+
+    /// For a room wait on this shard (writers waiting for a flush to free memtable room,
+    /// D284): takes back this shard's room-freeing tasks ([`Task::frees_room`]) that an
+    /// application's background worker holds but has not run for 2 ms, to run here. Never
+    /// waits: a flush a worker is running stays there. Looks again by itself while one is
+    /// not yet that idle. Returns how many came back now; 0 without workers, and always on
+    /// engine-owned workers, which are always driven.
+    pub fn reclaim_room(&mut self) -> usize {
+        let now = self.vfs.monotonic_nanos();
+        self.spawner.reclaim_room(now)
     }
 
     /// Monotonic time in nanoseconds.
@@ -340,6 +369,14 @@ impl<M: Send + 'static> Submitter<M> {
     /// Relaxed, as that one.
     pub fn spin_nanos(&self) -> u64 {
         self.inbox.signal.spin_nanos()
+    }
+
+    /// `(fallbacks, room)`: tasks of the target shard's that came back from the background
+    /// workers (D284) because no worker made a pass for 10 ms while they were queued
+    /// (workers configured but not driven), and room-freeing tasks a room wait on the shard
+    /// took back from a worker that held them without running them. Relaxed.
+    pub fn background_take_backs(&self) -> (u64, u64) {
+        self.inbox.signal.take_back_counts()
     }
 
     /// Enqueues `msg`. Fails only after shutdown.
@@ -653,9 +690,13 @@ impl<H: ShardHandler> ShardCore<H> {
         } else if self.attached == 0 {
             self.attach();
         }
+        // Tasks back from the background workers first (D284): what they report on the
+        // way back is queued before anything this turn handles that a later reclaim (the
+        // engine's close) sent after them.
+        let start = self.vfs.monotonic_nanos();
+        self.spawner.take_back(start);
         self.drain();
         self.spawner.local.collect_woken();
-        let start = self.vfs.monotonic_nanos();
         if self.idle_at.take() == Some(start) && self.vfs.clock_is_simulated() {
             // A simulated clock has not moved since the loop went idle: sleepers check for
             // themselves (a real clock that reads the same only ticks coarsely, #263).
@@ -699,7 +740,7 @@ impl<H: ShardHandler> ShardCore<H> {
             return true;
         }
         let more = self.check_before_sleep();
-        if !more && self.spawner.local.next_deadline().is_some() {
+        if !more && self.next_deadline().is_some() {
             self.idle_at = Some(self.vfs.monotonic_nanos());
         }
         more
@@ -713,9 +754,10 @@ impl<H: ShardHandler> ShardCore<H> {
         self.own_ring = pigeonhole_io::own_io_waker().is_some();
     }
 
-    /// The earliest deadline of a sleeping background task on this shard.
+    /// The earliest deadline of a sleeping background task on this shard, or of its next
+    /// look at the background workers (D284).
     fn next_deadline(&self) -> Option<u64> {
-        self.spawner.local.next_deadline()
+        self.spawner.next_deadline()
     }
 
     /// Announces sleep, then re-checks for work. Returns whether work remains.
@@ -724,7 +766,7 @@ impl<H: ShardHandler> ShardCore<H> {
         if self.stash.is_none() {
             self.stash = self.rx.try_recv().ok();
         }
-        if self.stash.is_some() || self.signal().task_woken() {
+        if self.stash.is_some() || self.signal().task_woken() || self.spawner.has_back() {
             self.signal().awake();
             return true;
         }
@@ -745,13 +787,13 @@ impl<H: ShardHandler> ShardCore<H> {
         }
         let ring = self.own_ring && pigeonhole_io::own_io_in_flight();
         let signal = &self.submitters[usize::from(self.id.0)].inbox.signal;
-        let (stash, rx) = (&mut self.stash, &self.rx);
+        let (stash, rx, spawner) = (&mut self.stash, &self.rx, &self.spawner);
         signal.sleep_unless(
             || {
                 if stash.is_none() {
                     *stash = rx.try_recv().ok();
                 }
-                stash.is_some()
+                stash.is_some() || spawner.has_back()
             },
             || {
                 if ring {
@@ -833,7 +875,7 @@ type Submitters<M> = Arc<[Submitter<M>]>;
 fn build<H: ShardHandler>(
     config: &RuntimeConfig,
     handlers: Vec<H>,
-    pool: Arc<[Arc<PoolShared>]>,
+    pool: Option<&Arc<Pool>>,
 ) -> (Submitters<H::Msg>, Vec<ShardCore<H>>) {
     let n = handlers.len();
     assert_eq!(n, config.shards, "handlers.len() must equal config.shards");
@@ -867,7 +909,8 @@ fn build<H: ShardHandler>(
             stash: None,
             spawner: Spawner::new(
                 Scheduler::new(Arc::clone(&submitters[i].inbox.signal)),
-                Arc::clone(&pool),
+                pool.cloned(),
+                Origin::new(Arc::clone(&submitters[i].inbox.signal)),
             ),
             submitters: Arc::clone(&submitters),
             vfs: Arc::clone(&config.vfs),
@@ -928,7 +971,9 @@ fn spawn_pinned<T: Send + 'static>(
 pub struct Runtime<H: ShardHandler> {
     submitters: Arc<[Submitter<H::Msg>]>,
     shards: Vec<JoinHandle<H>>,
-    pool: Vec<(Arc<PoolShared>, JoinHandle<()>)>,
+    /// The background workers' pool and their threads (engine-owned, D252, D284).
+    pool: Option<Arc<Pool>>,
+    workers: Vec<JoinHandle<()>>,
     /// The CPUs this runtime's threads hold, released once they are joined (D235).
     plan: Option<pigeonhole_io::sys::PinPlan>,
     pinning: Pinning,
@@ -938,7 +983,7 @@ impl<H: ShardHandler> fmt::Debug for Runtime<H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Runtime")
             .field("shards", &self.submitters.len())
-            .field("compaction_threads", &self.pool.len())
+            .field("compaction_threads", &self.workers.len())
             .finish_non_exhaustive()
     }
 }
@@ -961,16 +1006,18 @@ impl<H: ShardHandler> Runtime<H> {
     pub fn start(config: RuntimeConfig, handlers: Vec<H>) -> Result<Self> {
         let slice = config.slice_nanos();
         let mut acks = Vec::new();
-        let mut pool = Vec::with_capacity(config.compaction_threads);
-        let mut pool_threads = Vec::with_capacity(config.compaction_threads);
-        let mut pool_rxs = Vec::with_capacity(config.compaction_threads);
-        for _ in 0..config.compaction_threads {
-            let (shared, rx) = PoolShared::new();
-            pool.push(shared);
-            pool_rxs.push(rx);
-        }
-        let pool: Arc<[Arc<PoolShared>]> = pool.into();
-        let (submitters, cores) = build(&config, handlers, Arc::clone(&pool));
+        let (pool, drivers) = if config.compaction_threads > 0 {
+            let (pool, drivers) = Pool::new(
+                config.compaction_threads,
+                true,
+                Arc::clone(&config.vfs),
+                slice,
+            );
+            (Some(pool), drivers)
+        } else {
+            (None, Vec::new())
+        };
+        let (submitters, cores) = build(&config, handlers, pool.as_ref());
         let threads = config.shards + config.compaction_threads;
         let (plan, unpinned) = if config.pin_threads {
             match pigeonhole_io::sys::pin_plan(threads) {
@@ -991,7 +1038,8 @@ impl<H: ShardHandler> Runtime<H> {
         let mut rt = Runtime {
             submitters,
             shards: Vec::with_capacity(cores.len()),
-            pool: Vec::new(),
+            pool,
+            workers: Vec::new(),
             plan: None,
             pinning: Pinning {
                 threads,
@@ -999,21 +1047,16 @@ impl<H: ShardHandler> Runtime<H> {
                 ..Pinning::default()
             },
         };
-        for (j, rx) in pool_rxs.into_iter().enumerate() {
-            let shared = Arc::clone(&pool[j]);
+        for (j, driver) in drivers.into_iter().enumerate() {
             let vfs = Arc::clone(&config.vfs);
             let (handle, ack) = spawn_pinned(
                 format!("pigeonhole-compaction-{j}"),
                 cpu(config.shards + j),
-                {
-                    let shared = Arc::clone(&shared);
-                    move || sched::pool_main(shared, rx, vfs, slice)
-                },
+                move || pool::worker_main(driver, vfs),
             )?;
-            pool_threads.push((shared, handle));
+            rt.workers.push(handle);
             acks.push(ack);
         }
-        rt.pool = pool_threads;
         for (i, core) in cores.into_iter().enumerate() {
             let (handle, ack) = spawn_pinned(format!("pigeonhole-shard-{i}"), cpu(i), move || {
                 shard_main(core)
@@ -1034,7 +1077,9 @@ impl<H: ShardHandler> Runtime<H> {
     ///
     /// The application owns every thread and background tasks run on the shards, so
     /// `config.pin_threads` is ignored and a nonzero `config.compaction_threads` fails with
-    /// [`Error::InvalidConfig`] (decision D40) rather than being silently dropped.
+    /// [`Error::InvalidConfig`] (decision D40) rather than being silently dropped: for
+    /// background workers the application drives, use
+    /// [`Runtime::application_owned_with_workers`] (D284).
     ///
     /// # Panics
     /// If `handlers.len() != config.shards` or the count is not in `1..=65536`.
@@ -1047,15 +1092,42 @@ impl<H: ShardHandler> Runtime<H> {
                 "compaction_threads must be 0 in application-owned mode",
             ));
         }
-        let (_, cores) = build(&config, handlers, Arc::from(Vec::new()));
-        Ok(cores
-            .into_iter()
-            .map(|core| ShardDriver {
-                _close: CloseOnDrop(core.submitters[usize::from(core.id.0)].clone()),
-                core,
-                wakes: Wakes::default(),
-            })
-            .collect())
+        let (_, cores) = build(&config, handlers, None);
+        Ok(shard_drivers(cores))
+    }
+
+    /// Application-owned mode with background workers (D284): no threads; one driver per
+    /// shard, and `config.compaction_threads` [`PoolDriver`]s the application drives from
+    /// threads it owns, as engine-owned mode's compaction threads drive theirs. With 0 it is
+    /// [`Runtime::application_owned`]. `config.pin_threads` is ignored.
+    ///
+    /// The returned [`WorkerPool`] closes the workers ([`WorkerPool::close`]), taking what
+    /// they hold back to the shards: a closing engine calls it first, so its close never
+    /// waits for the application to drive a worker.
+    ///
+    /// # Panics
+    /// If `handlers.len() != config.shards` or the count is not in `1..=65536`.
+    pub fn application_owned_with_workers(
+        config: RuntimeConfig,
+        handlers: Vec<H>,
+    ) -> Result<AppOwned<H>> {
+        let (pool, workers) = if config.compaction_threads > 0 {
+            let (pool, workers) = Pool::new(
+                config.compaction_threads,
+                false,
+                Arc::clone(&config.vfs),
+                config.slice_nanos(),
+            );
+            (Some(pool), workers)
+        } else {
+            (None, Vec::new())
+        };
+        let (_, cores) = build(&config, handlers, pool.as_ref());
+        Ok(AppOwned {
+            shards: shard_drivers(cores),
+            workers,
+            pool: pool.map(WorkerPool),
+        })
     }
 
     /// Submitter for `shard`.
@@ -1107,10 +1179,10 @@ impl<H: ShardHandler> Runtime<H> {
             }
         }
         // Shards are gone, so nothing spawns onto the pool any more.
-        for (shared, _) in &self.pool {
-            shared.close();
+        if let Some(pool) = &self.pool {
+            pool.close_builtin();
         }
-        for (_, t) in self.pool.drain(..) {
+        for t in self.workers.drain(..) {
             if let Err(p) = t.join() {
                 panic = panic.or(Some(p));
             }
@@ -1126,20 +1198,44 @@ impl<H: ShardHandler> Runtime<H> {
 
 impl<H: ShardHandler> Drop for Runtime<H> {
     fn drop(&mut self) {
-        if !self.shards.is_empty() || !self.pool.is_empty() {
+        if !self.shards.is_empty() || !self.workers.is_empty() {
             if thread::panicking() {
                 // Close without joining: never double-panic.
                 for s in self.submitters.iter() {
                     s.inbox.close();
                 }
-                for (shared, _) in &self.pool {
-                    shared.close();
+                if let Some(pool) = &self.pool {
+                    pool.close_builtin();
                 }
             } else {
                 let _ = self.stop();
             }
         }
     }
+}
+
+/// Wraps each shard's loop in its driver.
+fn shard_drivers<H: ShardHandler>(cores: Vec<ShardCore<H>>) -> Vec<ShardDriver<H>> {
+    cores
+        .into_iter()
+        .map(|core| ShardDriver {
+            _close: CloseOnDrop(core.submitters[usize::from(core.id.0)].clone()),
+            core,
+            wakes: Wakes::default(),
+        })
+        .collect()
+}
+
+/// What [`Runtime::application_owned_with_workers`] hands the application (D284).
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AppOwned<H: ShardHandler> {
+    /// One driver per shard, in shard order.
+    pub shards: Vec<ShardDriver<H>>,
+    /// The background workers, for threads the application owns.
+    pub workers: Vec<PoolDriver>,
+    /// Closes the workers (`None` without any).
+    pub pool: Option<WorkerPool>,
 }
 
 /// Application-owned mode: drives one shard from a thread the application owns.
@@ -1188,19 +1284,20 @@ pub struct ShardDriver<H: ShardHandler> {
     wakes: Wakes,
 }
 
-/// What a wake of an application-owned shard calls, composed into one wake target.
+/// What a wake of an application-owned shard (or worker) calls, composed into one wake
+/// target.
 #[derive(Default)]
-struct Wakes {
-    callback: Option<Arc<dyn Fn() + Send + Sync>>,
+pub(crate) struct Wakes {
+    pub(crate) callback: Option<Arc<dyn Fn() + Send + Sync>>,
     /// The thread that last waited, and its ring's waker if it has a ring.
-    waiter: Option<(thread::Thread, Option<pigeonhole_io::OwnIoWaker>)>,
+    pub(crate) waiter: Option<(thread::Thread, Option<pigeonhole_io::OwnIoWaker>)>,
 }
 
 impl Wakes {
     /// The wake target: the callback, then the waiting thread (its ring's waker and an
     /// unpark: it waits in one or the other). Without a callback, the waiting thread is the
     /// engine-owned thread's own target, so a commit's wake costs no closure call.
-    fn target(&self) -> WakeTarget {
+    pub(crate) fn target(&self) -> WakeTarget {
         let callback = self.callback.clone();
         let waiter = self.waiter.clone();
         match (callback, waiter) {
@@ -1219,8 +1316,8 @@ impl Wakes {
     }
 }
 
-/// Ends a [`ShardDriver::wait`] from any thread ([`ShardDriver::waker`]).
-struct WaitWaker(Arc<Signal>);
+/// Ends a [`ShardDriver::wait`] (or [`PoolDriver::wait`]) from any thread.
+pub(crate) struct WaitWaker(pub(crate) Arc<Signal>);
 
 impl std::task::Wake for WaitWaker {
     fn wake(self: Arc<Self>) {

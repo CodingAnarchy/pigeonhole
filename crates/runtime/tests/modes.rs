@@ -14,13 +14,16 @@ use pigeonhole_io::sim::SimVfs;
 use pigeonhole_io::{Vfs, VfsRef};
 use pigeonhole_runtime::{
     Error, Notifier, Runtime, RuntimeConfig, ShardContext, ShardDriver, ShardHandler, ShardId,
-    Submitter, Task, TaskPoll, TaskWaker, completion,
+    Submitter, Task, TaskPoll, TaskWaker, WorkerPool, completion,
 };
 
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Engine,
     App,
+    /// Application-owned with this many background workers (D284), each driven by a thread
+    /// of the test's.
+    AppWorkers(usize),
 }
 
 /// A running runtime in either mode, behind one interface.
@@ -30,6 +33,8 @@ enum Harness<H: ShardHandler> {
         submitters: Vec<Submitter<H::Msg>>,
         stop: Arc<AtomicBool>,
         threads: Vec<JoinHandle<ShardDriver<H>>>,
+        /// Background workers (D284): their pool and their threads.
+        workers: Option<(WorkerPool, Vec<JoinHandle<()>>)>,
     },
 }
 
@@ -37,10 +42,32 @@ impl<H: ShardHandler> Harness<H> {
     fn start(mode: Mode, config: RuntimeConfig, handlers: Vec<H>) -> Self {
         match mode {
             Mode::Engine => Harness::Engine(Runtime::start(config, handlers).unwrap()),
-            Mode::App => {
+            Mode::App | Mode::AppWorkers(_) => {
                 let slice = config.time_slice.as_nanos() as u64;
                 let vfs = Arc::clone(&config.vfs);
-                let drivers = Runtime::application_owned(config, handlers).unwrap();
+                let mut config = config;
+                config.compaction_threads = match mode {
+                    Mode::AppWorkers(k) => k,
+                    _ => 0,
+                };
+                let owned = Runtime::application_owned_with_workers(config, handlers).unwrap();
+                let workers = owned.pool.map(|pool| {
+                    let threads = owned
+                        .workers
+                        .into_iter()
+                        .map(|mut w| {
+                            thread::spawn(move || {
+                                while !w.closed() {
+                                    if !w.run_once(u64::MAX) {
+                                        w.wait(Duration::from_millis(10));
+                                    }
+                                }
+                            })
+                        })
+                        .collect();
+                    (pool, threads)
+                });
+                let drivers = owned.shards;
                 let submitters = (0..drivers.len())
                     .map(|i| drivers[0].submitter(ShardId(i as u16)))
                     .collect();
@@ -83,6 +110,7 @@ impl<H: ShardHandler> Harness<H> {
                     submitters,
                     stop,
                     threads,
+                    workers,
                 }
             }
         }
@@ -99,7 +127,17 @@ impl<H: ShardHandler> Harness<H> {
     fn finish<R>(self, f: impl Fn(&mut H) -> R) -> Vec<R> {
         match self {
             Harness::Engine(rt) => rt.shutdown().unwrap().iter_mut().map(f).collect(),
-            Harness::App { stop, threads, .. } => {
+            Harness::App {
+                stop,
+                threads,
+                workers,
+                ..
+            } => {
+                // The workers' tasks go back to the shards, which finish them below.
+                if let Some((pool, workers)) = workers {
+                    pool.close();
+                    workers.into_iter().for_each(|w| w.join().unwrap());
+                }
                 stop.store(true, Ordering::SeqCst);
                 threads.iter().for_each(|t| t.thread().unpark());
                 threads
@@ -716,6 +754,12 @@ macro_rules! both_modes {
         }
         mod application_owned {
             $(#[test] fn $name() { super::$name(super::Mode::App) })*
+        }
+        mod application_owned_one_worker {
+            $(#[test] fn $name() { super::$name(super::Mode::AppWorkers(1)) })*
+        }
+        mod application_owned_two_workers {
+            $(#[test] fn $name() { super::$name(super::Mode::AppWorkers(2)) })*
         }
     };
 }

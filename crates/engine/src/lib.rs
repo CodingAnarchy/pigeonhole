@@ -63,8 +63,8 @@ pub use check::{
 pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{
-    CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard, FamilyInfo, FamilyStorage,
-    LevelStorage, Metrics, Role, ShardStats, TableInfo, TableStorage,
+    AppOwned, BackgroundWorker, CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard,
+    FamilyInfo, FamilyStorage, LevelStorage, Metrics, Role, ShardStats, TableInfo, TableStorage,
 };
 pub use error::{Error, Result};
 pub use health::{Failure, FailureCause};

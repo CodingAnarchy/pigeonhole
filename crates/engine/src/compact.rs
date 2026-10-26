@@ -540,6 +540,9 @@ pub(crate) struct CompactionWork {
     stage: Stage,
     waker: StdWaker,
     started: u64,
+    /// Taken back from a background worker and dropped before its commit (D284): its report
+    /// says so (not a failure; the slot compacts again).
+    reclaimed: bool,
 }
 
 impl CompactionWork {
@@ -608,6 +611,7 @@ impl CompactionWork {
             stage: Stage::Run,
             waker: StdWaker::default(),
             started,
+            reclaimed: false,
         })
     }
 
@@ -710,6 +714,7 @@ impl CompactionWork {
                 inputs: self.inputs(),
                 result,
                 nanos,
+                reclaimed: self.reclaimed,
             });
         self.stage = Stage::Done;
     }
@@ -1008,6 +1013,19 @@ impl Task for CompactionWork {
                         self.report(Err(Error::Busy));
                         return TaskPoll::Done;
                     }
+                    // Test hook (D284's tests): slices of a few units each, so a test can
+                    // stop the job part-way at a point of its choosing.
+                    #[cfg(feature = "test-hooks")]
+                    let deadline_nanos = if self
+                        .shared
+                        .hooks
+                        .compaction_tiny_slices
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        0
+                    } else {
+                        deadline_nanos
+                    };
                     let output = match self.job.take() {
                         Some(mut job) => match job.run(deadline_nanos) {
                             Ok(JobPoll::Pending) => {
@@ -1040,6 +1058,11 @@ impl Task for CompactionWork {
                             None
                         }
                     };
+                    #[cfg(feature = "test-hooks")]
+                    self.shared
+                        .hooks
+                        .compaction_commits
+                        .fetch_add(1, std::sync::atomic::Ordering::Release);
                     match self.submit(output) {
                         Ok(rx) => self.stage = Stage::Commit(rx),
                         Err(e) => {
@@ -1066,6 +1089,25 @@ impl Task for CompactionWork {
 
     fn name(&self) -> &'static str {
         "compaction"
+    }
+
+    /// Taken back from a background worker (D284), on its shard. Before its commit is
+    /// submitted it is dropped here: its output was never installed, and nothing it
+    /// submitted is in flight (its output writes complete inside its slices, `write_at`, and
+    /// a worker's slices run their reads inline, `pigeonhole_io::inline_io`), so the job's
+    /// extents go back to the pager now and the shard sees its inputs free to compact again.
+    /// After the submit it only waits for the manifest's reply, and keeps waiting, failed
+    /// or not.
+    fn reclaim(&mut self, _failed: bool) -> bool {
+        if !matches!(self.stage, Stage::Run) {
+            return true;
+        }
+        if let Some(job) = self.job.take() {
+            job.abort();
+        }
+        self.reclaimed = true;
+        self.report(Err(Error::Closed));
+        false
     }
 }
 

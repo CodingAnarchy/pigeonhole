@@ -181,6 +181,9 @@ pub(crate) struct ShardMetrics {
     /// backoff, and nothing else reports them).
     pub flush_failures: AtomicU64,
     pub compaction_failures: AtomicU64,
+    /// Compactions taken back from a background worker and dropped before their commit
+    /// (D284); their slots compact again.
+    pub compactions_reclaimed: AtomicU64,
     pub splits: AtomicU64,
     pub merges: AtomicU64,
     pub moves: AtomicU64,
@@ -227,6 +230,7 @@ impl Default for ShardMetrics {
             compaction_nanos: AtomicU64::new(0),
             flush_failures: AtomicU64::new(0),
             compaction_failures: AtomicU64::new(0),
+            compactions_reclaimed: AtomicU64::new(0),
             splits: AtomicU64::new(0),
             merges: AtomicU64::new(0),
             moves: AtomicU64::new(0),
@@ -1509,6 +1513,9 @@ pub(crate) enum ShardMsg {
         inputs: Vec<SstId>,
         result: Result<ManifestVersion>,
         nanos: u64,
+        /// Taken back from a background worker and dropped before its commit (D284): not
+        /// a failure; the slot compacts again.
+        reclaimed: bool,
     },
     /// Compact every slot of `table` (or all tables) into the last level (`Engine::compact`).
     CompactAll {
@@ -2396,6 +2403,12 @@ impl Task for ClockTimer {
 
     fn name(&self) -> &'static str {
         "timer"
+    }
+
+    /// A timer stays on its shard (D284): it has nothing to offload, and it must fire
+    /// whether or not any background worker is driven.
+    fn offload(&self) -> bool {
+        false
     }
 }
 
@@ -5604,6 +5617,10 @@ impl ShardState {
     #[inline(never)]
     fn wait_for_room(&mut self, admitted: &[Member], ctx: &mut ShardContext<'_, ShardMsg>) {
         self.wait_room = true;
+        // A flush an application's background worker holds without running it comes back
+        // to run here (D284; never waits for one that runs). The runtime looks again by
+        // itself while one is not yet idle long enough.
+        ctx.reclaim_room();
         let now = ctx.now_nanos();
         let timeout = self.shared.write_stall_timeout_nanos;
         // Each member's own wait starts the first time it waits (D240); the members cut
@@ -9557,6 +9574,7 @@ impl ShardState {
         inputs: Vec<SstId>,
         result: Result<ManifestVersion>,
         nanos: u64,
+        reclaimed: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         // Background compactions keep running after the writes stop: they free a dead
@@ -9605,6 +9623,18 @@ impl ShardState {
             // its inputs are retired with the table. Nothing failed; a full compaction goes
             // on with the remaining tables.
             Err(Error::TableNotFound(_)) => {}
+            // Taken back from a background worker before its commit and dropped (D284):
+            // its inputs are free again (above) and the slot compacts again, as after a
+            // voided purge. A full compaction goes on (or ends `Closed` with the close).
+            Err(_) if reclaimed => {
+                self.shared.metrics[usize::from(self.id.0)]
+                    .compactions_reclaimed
+                    .fetch_add(1, Ordering::Relaxed);
+                trace!(
+                    "shard {} compaction taken back from a worker; compacting again",
+                    self.id.0
+                );
+            }
             Err(Error::Busy) if voided => {
                 if let Some(key) = key {
                     *self.purge_voids.entry(key).or_insert(0) += 1;
@@ -10226,7 +10256,8 @@ impl ShardState {
                 inputs,
                 result,
                 nanos,
-            } => self.on_compaction_done(inputs, result, nanos, ctx),
+                reclaimed,
+            } => self.on_compaction_done(inputs, result, nanos, reclaimed, ctx),
             ShardMsg::CompactAll { table, reply } => {
                 if self.closing {
                     reply.notify(Err(Error::Closed));
@@ -10302,6 +10333,9 @@ impl ShardState {
             ShardMsg::TabletOpDone { result } => self.on_tablet_op_done(result, ctx),
             ShardMsg::Balance { reply } => self.maybe_balance(true, reply, ctx),
             ShardMsg::Close => {
+                // What the close took back from application-owned background workers
+                // (D284) runs here from now on: flushes resume, compactions are dropped.
+                ctx.take_back();
                 if !self.closing {
                     self.closing = true;
                     self.close_stage = CloseStage::Draining;
