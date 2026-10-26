@@ -142,6 +142,12 @@ pub enum Fault {
     /// fails: every member of the group fails with `Corruption` and the shard poisons itself.
     /// A Buffered PREPARE in it has voted already (D279), so its commit ends `OutcomeUnknown`.
     NextGroupPublish = 8,
+    /// While on, a coordinator holds every PREPARE it would send another shard (in
+    /// `Hooks::held_prepares`) instead of sending it, until `Engine::release_held_prepares`
+    /// sends them. Hand-driven tests use it to build an arrival order explicitly, rather
+    /// than from the order messages were queued in: a participant's turn between the
+    /// coordinator reserving a commit's seqno and the PREPARE reaching it.
+    HoldPrepares = 9,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).
@@ -182,6 +188,9 @@ pub(crate) struct Hooks {
     pub arena_discard_error: Mutex<Option<String>>,
     /// The faults and forced paths tests switch on (`Engine::inject`).
     pub faults: Faults,
+    /// PREPAREs held by `Fault::HoldPrepares`, with their participant, in send order
+    /// (`Engine::release_held_prepares`).
+    pub held_prepares: Mutex<Vec<(pigeonhole_runtime::ShardId, crate::shard::ShardMsg)>>,
     /// Whether `compactions` and `appended` record (`Engine::record_history`); off until a
     /// test turns it on.
     pub record: AtomicBool,
@@ -435,6 +444,34 @@ impl Engine {
     #[doc(hidden)]
     pub fn inject(&self, fault: Fault, on: bool) {
         self.inner.shared.hooks.faults.set(fault, on);
+    }
+
+    /// Sends the PREPAREs `Fault::HoldPrepares` held, in the order they were held; returns
+    /// how many (test hook). Switch `HoldPrepares` off first, so a hold can't leak into a
+    /// later step. A participant already closed refuses the send (`Closed`) and the PREPARE
+    /// is dropped: the test then sees its commit unanswered.
+    ///
+    /// # Panics
+    /// If `HoldPrepares` is still on.
+    #[doc(hidden)]
+    pub fn release_held_prepares(&self) -> usize {
+        let hooks = &self.inner.shared.hooks;
+        assert!(
+            !hooks.faults.on(Fault::HoldPrepares),
+            "release_held_prepares with Fault::HoldPrepares still on"
+        );
+        let held = std::mem::take(&mut *hooks.held_prepares.lock().unwrap());
+        let n = held.len();
+        let subs = self
+            .inner
+            .shared
+            .submitters
+            .get()
+            .expect("the shards started");
+        for (to, msg) in held {
+            let _ = subs[usize::from(to.0)].submit(msg);
+        }
+        n
     }
 
     /// The flushed-through seqno shard `shard` last published from an unpin that found
