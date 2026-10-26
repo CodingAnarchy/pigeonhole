@@ -12,6 +12,10 @@ use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::Instant;
 
 /// Why the instance failed. The numbers are stable.
+///
+/// A new cause needs its public twin too: add it to `pigeonhole::FailureCause`
+/// (`crates/pigeonhole/src/recovery.rs`), which maps causes it doesn't know to `Internal`
+/// (D282).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 #[non_exhaustive]
