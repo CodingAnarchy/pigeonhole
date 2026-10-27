@@ -2664,7 +2664,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 With the old `None`, 4 of the combining tests fail. The `counters` model-check targets cover the rest under sweeps, including shard-count changes across reopens.
 
 <a id="d288"></a>
-## D288 — A filtered scan's sources settle only up to the merge's frontier (2026-10-27; compaction, engine, format, sst, #711; refines D22)
+## D288 — A filtered scan's sources settle only up to the merge's frontier (2026-10-27; compaction, engine, format, sst, #711; ICR 0080; refines D22)
 
 **Decided:** design on #711 (comment 6433512006), reviewed by perf287 (comment 6433582625) with two must-fixes, both in. A filtered source under a merge keeps a key that is only a lower bound on its next admitted entry, and the merge settles only its top, up to the next source's key. PR 1 covers memtable sources and the merge protocol; PR 2 covers `SstIter` and `LevelIter`.
 
@@ -2678,10 +2678,14 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **A lazy source checks the entry it lands on once,** as an eager one does: an admitted landing settles it at once, and a rejected one parks with its verdict kept, so settling doesn't check that entry again.
 - **The engine** builds every memtable source lazy (`mem_sources_from`). A filtered scan's lane and a filtered row read set their merge lazy.
 - **Results are unchanged by construction:** the filter is a pure function of the key, and snapshots, deletes and TTL are resolved above the merge (`CellResolver`).
-- **PR 2 (planned):**
-  - `SstIter` parks on the index separator without loading the next block, and `LevelIter` on the next file's `smallest_key` without opening it.
-  - The async read-ahead (`upcoming(1)`) predicts from the merge's top only.
-  - These are perf287's points; a parked source that pays a block read per tablet open would keep most of the SST cost.
+- **PR 2 (ICR 0080):** SST sources.
+  - **`SstIter<true>`** (`SstReader::iter_lazy`) lands as a lazy memtable does, and stops before loading a data block. It parks on the separator of the block it leaves (the writer keeps `last <= sep < next`), or on the target of a seek hint or row skip past its block, and loads the block only when the merge's settle reaches that key.
+    - A row skip while parked before a block moves the target past the row, unloaded.
+    - A move from an entry parked on lands afresh: the old verdict is not the new entry's.
+  - **A lazy level** (`SstSource<true>`) that runs out of an SST parks on the next one's `smallest_key` without opening it.
+  - **The engine** builds a filtered range scan's and row read's SST sources lazy, as `Source::LazySst`. Point gets and unfiltered reads keep `Source::Sst`, so their code is unchanged.
+  - **The async scan's one-block prediction** (`upcoming(1)`) skips unsettled sources: a source parked short of the merge's position may never read its next block. Settled sources predict as before. This is how perf287's "from the merge's top only" applies when several settled sources sit below the top.
+  - **What a seek costs:** a lazy SST still loads the block its seek lands in. Only the separator below that block bounds the entries in it, and each source's seek target ties at the top, so parking at a seek would only defer the load. A level's SSTs past the target stay unopened.
 
 **Tests:**
 - `compaction/tests/lazy.rs`:
@@ -2692,5 +2696,6 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
   - the #711 shape: a source with nothing admissible moves at most once past the merge's frontier, where eagerly it walks all 1,050 entries.
 - The pigeonhole model test adds a qualifier-prefix scan after each scan, checked against the model's answer restricted to the prefix. It draws no randomness, but fewer reads shift the shared sim fault RNG, so older failing seeds may not replay.
 - `readshapes`' `scan-interleaved` shape: a memtable source that parks once per row between an SST's admitted entries, the regime where lazy costs one sift per park.
+- PR 2: `compaction/tests/lazy_sst.rs`, a lazy merge of SSTs with 128-byte blocks against the eager one over random entries, filters and moves (block boundaries inside rows and columns; moves that stay in their block and moves that cross). #711's shape over SSTs reads 6 blocks lazily against 643 eagerly. `engine/src/source.rs`'s level test runs a lazy level beside another source under a merge. `readshapes`' `scan-interleaved-sst`: the parking source is an SST.
 
 **Follow-up:** a lazy source left alone in the merge still settles to its end, past a row read's or a bounded scan's upper bound. The merge could settle up to the resolver's upper bound instead. That was not in the reviewed design, so it comes after PR 2.
