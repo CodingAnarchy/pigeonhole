@@ -770,6 +770,13 @@ const RING_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100
 fn driver_main<H: ShardHandler>(mut cores: Vec<ShardCore<H>>) -> Vec<(ShardId, H)> {
     let mut idle_park = sched::IdlePark::default();
     let mut done = Vec::with_capacity(cores.len());
+    // The driver reads the clock and the spin window from its first shard: every shard of
+    // a runtime shares both.
+    debug_assert!(
+        cores
+            .iter()
+            .all(|c| Arc::ptr_eq(&c.vfs, &cores[0].vfs) && c.spin.window == cores[0].spin.window)
+    );
     for core in &mut cores {
         core.attach();
     }
@@ -850,15 +857,9 @@ fn next_deadline<H: ShardHandler>(cores: &[ShardCore<H>]) -> Option<u64> {
 /// move while polling.
 fn spin_before_park<H: ShardHandler>(cores: &mut [ShardCore<H>]) -> bool {
     // `due` consumes each shard's "handled a message" mark and its backoff.
-    let mut due = 0u64;
-    for (k, core) in cores.iter_mut().enumerate().take(64) {
-        if core.spin.due() {
-            due |= 1 << k;
-        }
-    }
-    // Shards past the 64th are polled but never make the poll due: a driver holds that
-    // many only with more than 64 shards per thread.
-    if due == 0 {
+    let due: Vec<bool> = cores.iter_mut().map(|c| c.spin.due()).collect();
+    let n_due = due.iter().filter(|&&d| d).count() as u64;
+    if n_due == 0 {
         return false;
     }
     // A poll that runs counts as busy (D256): the thread is awake and polling, kept so by
@@ -871,12 +872,10 @@ fn spin_before_park<H: ShardHandler>(cores: &mut [ShardCore<H>]) -> bool {
     let window = cores[0].spin.window;
     let hit = spin_poll(cores, window);
     let spun = cores[0].vfs.monotonic_nanos().saturating_sub(spun_from);
-    let share = spun / u64::from(due.count_ones());
-    for (k, core) in cores.iter_mut().enumerate().take(64) {
-        if due & (1 << k) != 0 {
-            core.spin.record(hit);
-            core.signal().add_spin(share);
-        }
+    let share = spun / n_due;
+    for (core, _) in cores.iter_mut().zip(&due).filter(|(_, d)| **d) {
+        core.spin.record(hit);
+        core.signal().add_spin(share);
     }
     hit
 }
@@ -1120,13 +1119,15 @@ impl<H: ShardHandler> Runtime<H> {
             rt.workers.push(handle);
             acks.push(ack);
         }
-        // Shard `i` on driver `i % k` (D289).
+        // Shard `i` on driver `i % k` (D289). Round-robin, not blocks of n/k: packing (D217)
+        // keeps shards `0..active` busy, and round-robin spreads those over the drivers
+        // where blocks would put them all on driver 0.
         let mut held: Vec<Vec<ShardCore<H>>> = (0..k).map(|_| Vec::new()).collect();
         for (i, core) in cores.into_iter().enumerate() {
             held[i % k].push(core);
         }
         for (d, cores) in held.into_iter().enumerate() {
-            // One shard per thread keeps the shard's name, as before D289.
+            // A thread per shard keeps the shard's name, as before D289.
             let name = if k == config.shards {
                 format!("pigeonhole-shard-{d}")
             } else {

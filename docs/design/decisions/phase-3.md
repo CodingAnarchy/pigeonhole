@@ -2707,6 +2707,10 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
   - **Damping:** as D255's.
   - A shard moves between drivers only between its turns, and only at its holder's turn boundary: its I/O completes only on the submitting thread's ring (#402), and `release()` must run there.
 - **Client combining** (D198's C2) stays on hold.
+- **D198's yield stays.** The first step was to stop a pinned shard thread's spin from yielding (#996). On 16 per-shard threads that moved the tail rather than removing it, and #996 closed (comments 6442595313 and 6443366250).
+  - **Never yielding:** sparse-wide put p99 fell 60%, but ycsb-f's p99.9 rose 28–45%: clients woken onto a spinning shard's CPU waited out the window.
+  - **A 50 µs no-yield prefix:** it kept only an 11% put gain.
+  - **Next:** yield against no-yield is one arm of PR 1's fixed-k A/B, where only k threads spin.
 - **Unpinned shard threads** come back to the owner only if a second #760 run and cli692's ycsb-f check agree. On ycsb-f (#759 round 5), unpinned shard threads raised row-read p99 by 8% and p99.9 by 18%, and cut ops/s by 3.5%.
 
 **Why:** #760's put p99 (444–791 µs against a 20.3 µs floor) is queue wait for a parked shard thread whose pinned core a saturating client holds. The wakeup reaches the CPU after one EEVDF slice (p50 987 µs on Linux 6.8).
@@ -2717,7 +2721,13 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **Wakes:** every held shard's wake target is the driver thread. Each shard announces sleep at the end of its own turn, so a message sent after that wakes the driver.
 - **Busy accounting (D256):** each turn's time goes to its shard. The spin's time is split evenly over the shards that handled a message since the last park.
 - **Shutdown** returns the handlers in shard order.
-- **Names:** a driver holding one shard keeps the name `pigeonhole-shard-{i}`.
+- **Names:** with a thread per shard (`shard_threads` 0, or at least the shard count) the threads keep the names `pigeonhole-shard-{i}`. Otherwise every driver is `pigeonhole-driver-{d}`.
+- **Placement is round-robin, not blocks of n/k:** packing (D217) keeps shards `0..active` busy, and round-robin spreads them over the drivers where blocks would put them all on driver 0.
+
+**The invariant: no wait inside a turn may depend on another shard's turn.** A wait inside a turn may depend only on I/O the thread reaps itself, or on other threads. A driver blocked inside shard A's turn runs no sibling, so a wait that needed shard B's turn would deadlock whenever B shares the driver.
+- **Precedent:** application-owned mode already lets one thread drive several shards (the guide's async chapter), so the engine already keeps this.
+- **simp724 checked the in-turn waits** (#997 review): the WAL's `reap_for_wait`, the rollover and slot syncs, and pager growth all wait on I/O and reap the thread's ring, so a sibling's I/O still completes. The manifest writer's `commit_req_from_thread`, which finishes a pump's root commit itself, runs only from application threads.
+- **New code** that waits inside a turn must keep this. PR 2's moves don't lift it, since they happen only at turn boundaries.
 
 **Calls that can block a driver inside a turn (PR 1's inventory).** While one shard's turn blocks, its siblings on that driver wait. Found by reading the code at 2ac77f42. Durations are estimates. The defaults have flush and compaction on D252's compaction threads, off the shards.
 - **Every durable group:**
