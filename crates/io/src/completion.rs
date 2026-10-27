@@ -48,6 +48,25 @@ const ORPHAN_SLICE: std::time::Duration = std::time::Duration::from_millis(1);
 
 pub(crate) type Drive = Arc<dyn Fn() -> bool + Send + Sync>;
 
+/// A cross-ring wait's wakeup: the resolver ends the waiting thread's ring wait (#1002).
+struct RingWake(crate::own::OwnIoWaker);
+
+impl std::task::Wake for RingWake {
+    fn wake(self: Arc<Self>) {
+        self.0.wake();
+    }
+}
+
+/// Slices a blocked wait on another thread's ring spent reaping its own ring with the
+/// operation still pending (#1002): how often a cross-ring wait outlasts a slice.
+static CROSS_RING_SLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// [`CROSS_RING_SLICES`], for benchmarks and tests: not an API.
+#[doc(hidden)]
+pub fn cross_ring_wait_slices() -> u64 {
+    CROSS_RING_SLICES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 struct Shared<T> {
     state: Mutex<State<T>>,
     cond: Condvar,
@@ -162,12 +181,24 @@ impl<T: Send + 'static> Completion<T> {
                     // Only this thread reaps its ring, and the operation waited on may itself
                     // wait for that (#1002): two threads each blocked on the other's ring would
                     // otherwise both sleep forever.
-                    drop(state);
                     if crate::own::own_io_in_flight() {
+                        // The resolver wakes this thread's ring wait (simp724, #1003), so the
+                        // wait ends when the operation completes rather than at the slice.
+                        if let (State::Pending { waker, .. }, Some(w)) =
+                            (&mut *state, crate::own::own_io_waker())
+                            && waker.is_none()
+                        {
+                            *waker = Some(Waker::from(Arc::new(RingWake(w))));
+                        }
+                        drop(state);
                         crate::own::reap_own_io(Some(ORPHAN_SLICE));
                         state = shared.lock();
+                        if matches!(*state, State::Pending { .. }) {
+                            CROSS_RING_SLICES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         continue;
                     }
+                    drop(state);
                     // With backends no thread reaps in this process (the simulator under
                     // deferred I/O), take their completions while waiting, in short slices.
                     let reaped = crate::own::reap_orphans(ORPHAN_SLICE);
