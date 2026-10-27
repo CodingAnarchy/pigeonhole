@@ -166,6 +166,14 @@
 # per compacted cell (0.1%) are the two small vectors a readahead batch now builds (its
 # ranges, and the reads handed to `File::submit_reads_ahead`); on pread, which the workflow
 # measures, the batch is still the reads in turn.
+#
+# Raised for #983 (D284 PR 1: the shard turn takes back tasks the pool hands back) under
+# D195's ceiling rule (owner, 2026-10-13; coordinator, 2026-10-27): commit-async 9695 -> 9736
+# and commit-one 9585 -> 9612, this PR's head counts (run 40458446632: 9706 and 9583) times
+# 1.003. The +29 per commit (0.3%) are the Spawner's per-turn checks (`take_back` at the turn
+# start, `has_back` in the two sleep checks, the merged `next_deadline`), which run on every
+# turn even with no pool configured; #989 had already used the old headroom. D289 PR 1
+# rewrites that loop and puts the checks behind one no-pool branch, recovering them.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -180,7 +188,7 @@ counter 9388 0.5
 rows 19655 0.3
 level-scans 14015 0.6
 short-scans 13564 0.3
-commit-one 9585 0.3
+commit-one 9612 0.3
 commit-sixteen 50224 0.3
 flush 2199 0.3
 compact 2783 0.5
@@ -191,7 +199,7 @@ commit-at 10590 0.3
 scan-narrow 1398 0.3
 scan-small 1374 0.3
 scan-wide 1296 0.3
-commit-async 9695 0.3
+commit-async 9736 0.3
 scan-narrow-q1 5251 0.3
 scan-wide-q10 1784 0.3
 scan-wide-q1 14326 0.3
