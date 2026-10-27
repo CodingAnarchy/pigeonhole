@@ -409,8 +409,10 @@ fn stop_mid_compaction_on(
         let now = vfs.monotonic_nanos();
         match worker.as_mut() {
             Some(w) => w.run_once(now),
-            // A shard turn runs no slice once its deadline has passed: one slice per call.
-            None => shard.run_once(now + 1),
+            // A shard turn runs slices until its deadline: 50 us of a few units each, far
+            // short of the job. (With 1 ns, the turn's own clock read was already past it on
+            // a nanosecond clock, and no slice ran: #1007's Linux and Windows CI.)
+            None => shard.run_once(now + 50_000),
         };
         assert_eq!(
             engine.compaction_commits_submitted(),
@@ -547,12 +549,12 @@ fn a_close_frees_a_shard_run_compaction_stopped_mid_job() {
         engine.unreferenced_bytes() > 0,
         "the job has output written"
     );
-    // Still a few units per slice, and one slice per turn: the close sees the job mid-run
-    // rather than finishing it in one turn.
+    // Still a few units per slice, and 50 us of them per turn: the close sees the job
+    // mid-run rather than finishing it in one turn.
     engine.compaction_tiny_slices(true);
     engine.close().unwrap();
     while shard.closed().is_none() {
-        shard.run_once(vfs.monotonic_nanos() + 1);
+        shard.run_once(vfs.monotonic_nanos() + 50_000);
     }
     assert_eq!(
         engine.compaction_commits_submitted(),
