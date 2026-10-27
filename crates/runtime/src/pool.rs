@@ -593,6 +593,7 @@ impl PoolDriver {
                 task: Some(begun.task),
             };
             let end = now.saturating_add(pool.time_slice);
+            let started = pool.now();
             let poll = match slice.task.as_mut() {
                 Some(task) if inline => inline_io(|| task.run(end, &begun.waker)),
                 Some(task) => task.run(end, &begun.waker),
@@ -601,9 +602,10 @@ impl PoolDriver {
             let task = slice.task.take();
             drop(slice);
             let after = pool.now();
-            // The slice's time counts to the shard that spawned the task (D256).
+            // The slice's time counts to the shard that spawned the task (D256): the task's
+            // run alone, not the pool lock or the takes before it.
             if let Some(origin) = &begun.origin {
-                origin.signal.add_pool_busy(after.saturating_sub(now));
+                origin.signal.add_pool_busy(after.saturating_sub(started));
             }
             // A finished task is dropped here, before the pool lock: its destructor may run
             // engine code (settle callbacks, the release of a view it held), which must not
