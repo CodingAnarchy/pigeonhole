@@ -344,8 +344,11 @@ impl Controller {
         {
             let after =
                 recent(GROW_WINDOWS).map(|w| w.ops).sum::<u64>() as f64 / GROW_WINDOWS as f64;
+            // Back up by doubling, not all the way: one driver cost sparse-wide a few percent
+            // of throughput, and going back to 16 lost the whole tail gain (#1006's fourth A/B:
+            // 16 -> 1 -> 16 four times); its gain is at 2.
             if after < before_ops * (1.0 - SHRINK_REGRET) {
-                return Some(before_k);
+                return Some((2 * k).min(before_k));
             }
         }
         if k < ceiling && self.windows.len() >= GROW_WINDOWS {
@@ -686,6 +689,10 @@ mod tests {
         let mut c = controller(vec![window(0.5, 2.0, 0.0, 0, 9_000); GROW_WINDOWS]);
         c.regret = Some((16, 10_000.0));
         assert_eq!(c.decide(8, 16), Some(16));
+        // From one driver, back to two, not to where it came from.
+        let mut c = controller(vec![window(0.5, 0.5, 0.0, 0, 9_000); GROW_WINDOWS]);
+        c.regret = Some((16, 10_000.0));
+        assert_eq!(c.decide(1, 16), Some(2));
         // Throughput held: the shrink stands.
         let mut c = controller(vec![window(0.5, 2.0, 0.0, 0, 9_900); GROW_WINDOWS]);
         c.regret = Some((16, 10_000.0));
