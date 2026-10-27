@@ -982,6 +982,31 @@ if wp_w:
     print("\nThe WAL files' size counts whole preallocated segments (the disk the WAL holds), not live "
           "records; the reopen replays what the crash left past each stream's checkpoint.")
 
+# Every run's warmup (D242, its third amendment, #993): how long it ran, when the tablet
+# placement settled, and whether it settled before the cap. A run whose warmup did not settle
+# may have measured tablet changes (a first pack, a regrow): read its row with that in mind.
+warm = []
+for name in sorted(os.listdir(R)):
+    if not name.endswith(".json"):
+        continue
+    for r in results(name):
+        d = r.get("detail", {})
+        if d.get("warmup_settled") is None:
+            continue
+        warm.append((name, r, d))
+if warm:
+    unsettled = [w for w in warm if not w[2]["warmup_settled"]]
+    print(f"\n## Warmup per run (D242)\n")
+    print(f"{len(unsettled)} of {len(warm)} runs ended their warmup at the cap without the placement settling"
+          + (" (in bold below)." if unsettled else "."))
+    print("\n| Run | Store | Workload | Threads | Warmup s | Settled at s | Settled |")
+    print("|---|---|---|--:|--:|--:|---|")
+    for name, r, d in warm:
+        at = d.get("warmup_settle_secs")
+        print(f"| {name[:-5]} | {r['store']} | {r['workload']} | {r.get('threads', '-')} | "
+              f"{d.get('warmup_secs') or 0:.1f} | {'-' if at is None else f'{at:.1f}'} | "
+              f"{'yes' if d['warmup_settled'] else '**no**'} |")
+
 try:
     with open(path("durations.tsv")) as f:
         steps = [l.rstrip("\n").split("\t") for l in f if l.strip()]
