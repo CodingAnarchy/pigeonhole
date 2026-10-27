@@ -2600,3 +2600,35 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - **M1:** the table's offset, slot count and seed are another process's data. `ShmHeader::decode`, run at every attach, refuses a table that is misaligned, not a nonzero power of two, overlapping the reader slots or arenas, or outside the region.
 - **Defaults:** 64 MiB per reader process, as the writer's (owner ruling), so N reader processes use up to N × 64 MiB, plus 16 bytes per slot for the cache's presence and admission tables (4 MiB at the defaults). The region grows by 8 bytes per slot (2 MiB). `ReaderOptions::row_cache*` and `PigeonholeReader::row_cache_stats` (ICR 0072).
 - **Async reads** in a reader process (the latest point get and row read futures) go through its cache as the sync ones do (#946): a read future's attempt gets its read point's cache, and a fill passes the same snapshot check.
+
+<a id="d287"></a>
+## D287 — A counter family's flush combines its memtable's operands, guarded by the slot's other sources (perf287; engine, #713, D280; refines D186)
+
+**Decided:** a flush of a counter family passes `GcPolicy::other_sources`, so D186's operand combining applies to the one frozen memtable a flush writes. Before, `flush_gc` left it `None`, which D186 reads as "unknown, no combining": every `incr` reached L0 as its own entry, and a hot counter's read folded every operand since its last compaction. That's the counter-read tail of #713: on the AX102, 62–66% of a slow read's fold was in L0 SSTs.
+
+**Why it's safe:** D186 combines two operands only if no other source of the slot can hold a delete with a seqno between theirs. A frozen memtable M spans seqnos `[lo, hi]`, and every other source of its slot lies entirely below `lo` or above `hi`:
+1. **Older sources (the slot's SSTs, older frozen memtables) are below.** A memtable freezes only once all it holds is durable (D227), so no lower seqno lands in a newer memtable. That holds on every path that queues a flush: size and forced freezes (moves, WAL unpins, `all`), room-wait freezes (D124, `freeze_with::<true>`), and the close's in-place flush (#111, after the same deferral). A moved or merged tablet's SSTs were flushed before the change.
+2. **Newer memtables are above,** by the same rule.
+3. **A cross-shard share not applied here yet lands above.** Once decided, its apply seqno is held (`CROSS_HELD`, D278), and `durable_seqno` stays below it; M froze at or below `durable_seqno`. Undecided, its apply seqno isn't reserved yet. So prepared shares aren't listed: their commit id (D263) is never applied.
+0. **Open and replay** flush recovered memtables without GC (`write_memtable`), including a replay that spills and the open's flush after a spill or a layout change, so they combine nothing. A recovered memtable kept by a same-layout open holds only its slot's records above the slot's flushed-through, with the allocator seeded above them, so its later flush meets 1–3, though replay itself isn't in seqno order.
+
+**Read points:** the flush's GC takes them when it runs: live snapshots, durable snapshots, and the oldest reader process's pin. One created after M was queued (a snapshot, or a reader process pinning a view) reads at `visible_seqno` or `durable_seqno`, both ≥ `hi`, so it never splits M's operands. One released meanwhile only merges stripes nobody reads.
+
+**How:**
+- The shard records the slot's other sources in the `FlushItem` when it queues a counter family's flush (`counter_sources`, in `freeze_with` and `requeue_frozen`): the slot's SSTs with their key and seqno ranges, and its other memtables (exact ranges for frozen ones, unbounded above for the active one). Sources starting above `hi` are left out.
+- Real ranges rather than an empty list: the GC then checks the argument on every pair, and simply doesn't combine across an overlap. Debug builds assert there is none.
+- D187's bottommost purge is untouched: a flush is never bottommost.
+
+**Not in D287:** the active memtable's share (34–38% of a slow read's fold) is a follow-up, which needs its own design.
+
+**Tests:** `engine/tests/flush_fold.rs`:
+- one counter, one combined operand;
+- a snapshot splitting the run;
+- a delete between operands, every read point unchanged;
+- consecutive flushes;
+- a source inside the memtable's range keeps every operand (a test hook, `FlushGcMutation::CounterSourceInside`);
+- a decided share held while the counter slot's freeze defers, then the flush combining it and a reopen;
+- a share decided after a flush landing above it;
+- a replay that spills, then a D287 flush and a compaction.
+
+With the old `None`, 4 of the combining tests fail. The `counters` model-check targets cover the rest under sweeps, including shard-count changes across reopens.

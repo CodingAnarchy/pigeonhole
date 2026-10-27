@@ -201,7 +201,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D183](phase-2.md#d183) — Level outputs are cut into power-of-two pieces so a file at rest stays near its live size · compaction, pager, sst, #185, #276 · refines D160
 - [D184](phase-2.md#d184) — Blob GC follows the blob references each SST records · compaction, engine, format, #240, #285 · refines D180
 - [D185](phase-2.md#d185) — `shrink` relocates blob extents · engine, #231, #286 · amends D160
-- [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments · **refined by D187**
+- [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments · **refined by D187** · **refined by D287**
 - [D187](phase-2.md#d187) — Counter-family deletes purge at the bottom level by seqno · compaction, engine, #290, #298 · refines D70, D186
 - [D188](phase-2.md#d188) — Values above the inline limit are separated into blob files at commit time · engine, runtime, #230, #301 · amends D16
 - [D189](phase-2.md#d189) — Arenas are sized for their slots with tablet changes off too · engine, #283, #307 · amends D136
@@ -295,4 +295,5 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D278](phase-3.md#d278) — The participant that applies a cross-shard commit last releases its seqno (held in the allocator, shm `CROSS_HELD`, layout 6) and answers the client; `Applied` becomes bookkeeping · owner decision, engine, shm, #932, #708 · ICR 0074
 - [D279](phase-3.md#d279) — A Buffered PREPARE votes once appended, before its group's write; a decision that reaches it before it settled (a held header's sync) waits · owner decision, engine, #932, #708
 - [D281](phase-3.md#d281) — Reader processes have a row cache, keyed on the writer's write watermarks moved into shared memory (shm layout 5); every writer generation empties it · owner decision, cache, shm, engine, pigeonhole, #926, ICR 0072 · refines D201
+- [D287](phase-3.md#d287) — A counter family's flush combines its memtable's operands (D186), guarded by the slot's other sources, which all lie below or above it · engine, #713, D280 · refines D186
 _None._

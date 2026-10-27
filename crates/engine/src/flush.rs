@@ -56,6 +56,11 @@ pub(crate) struct FlushItem {
     /// delete in the family voided it meanwhile.
     pub guard: Option<Arc<crate::purge_guard::PurgeGuard>>,
     pub options: FamilyOptions,
+    /// A counter family's other sources of the slot when the memtable was queued (D287):
+    /// its flush combines operands as a compaction does (D186), since every other source
+    /// lies entirely below or above the memtable's seqnos. `None` for other families (and
+    /// on the open and replay paths, which write memtables without GC).
+    pub counter_sources: Option<Vec<pigeonhole_compaction::OtherSource>>,
 }
 
 /// What the shard learns when a flush is done.
@@ -298,6 +303,12 @@ fn flush_gc(
     let mut policy =
         pigeonhole_compaction::GcPolicy::new(crate::compact::gc_snapshots(shared), now, false);
     policy.no_outside_deletes = item.guard.is_some();
+    // D287: a counter family's operands combine, guarded by the slot's other sources. Read
+    // points created since the memtable was queued (snapshots, durable snapshots and reader
+    // processes' pins, whose oldest the GC keeps) are at or above its largest seqno: it froze
+    // at or below `durable_seqno`, and both watermarks only grow. So they never split its
+    // operands.
+    policy.other_sources = item.counter_sources.clone();
     // The record (test hook) describes the real GC, so a deliberate fault below shows up.
     let real = policy.clone();
     #[cfg(feature = "test-hooks")]
@@ -308,6 +319,14 @@ fn flush_gc(
     {
         1 => policy.no_outside_deletes = true,
         2 => policy.snapshots.clear(),
+        4 => {
+            if let Some(o) = policy.other_sources.as_mut() {
+                o.push(pigeonhole_compaction::OtherSource {
+                    keys: None,
+                    seqnos: (0, pigeonhole_format::Seqno::MAX),
+                });
+            }
+        }
         _ => {}
     }
     let merge = view
