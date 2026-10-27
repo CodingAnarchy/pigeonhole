@@ -228,6 +228,11 @@ pub(crate) struct Hooks {
     pub compaction_hold: AtomicBool,
     pub compaction_held: Mutex<Vec<(u64, TaskWaker)>>,
     pub compaction_hold_ids: AtomicU64,
+    /// Compaction jobs that finished and submitted their commit (`Engine::
+    /// compaction_commits_submitted`, D284's tests).
+    pub compaction_commits: AtomicU64,
+    /// Compaction jobs run a few units per slice (`Engine::compaction_tiny_slices`).
+    pub compaction_tiny_slices: AtomicBool,
     /// A deliberate fault in the flush GC (`Engine::mutate_flush_gc`, #287): 1 treats the
     /// guard as always holding, 2 drops the snapshot floor (no live read point is kept), 3
     /// lets writes pass guarded flushes and compactions without voiding them.
@@ -615,6 +620,39 @@ impl Engine {
         let referenced: u64 = live.iter().map(|e| e.len()).sum();
         let stats = shared.pager.stats();
         (stats.allocated_bytes + stats.retired_bytes).saturating_sub(referenced)
+    }
+
+    /// [`unreferenced_bytes`](Self::unreferenced_bytes) split: `(allocated, retired)`, the
+    /// unreferenced bytes still allocated (output in flight or leaked: a compaction or
+    /// flush that never committed and was never abandoned) and those retired, which a
+    /// later reclaim frees once no view reaches them (test hook, D284).
+    #[doc(hidden)]
+    pub fn unreferenced_split(&self) -> (u64, u64) {
+        let shared = &self.inner.shared;
+        let root = shared
+            .manifest
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .root();
+        let mut live: Vec<_> = shared.view.load().catalog.data_extents();
+        live.extend(root.snapshot);
+        live.extend(root.log);
+        live.sort();
+        live.dedup();
+        let referenced: u64 = live.iter().map(|e| e.len()).sum();
+        let stats = shared.pager.stats();
+        (
+            stats.allocated_bytes.saturating_sub(referenced),
+            stats.retired_bytes,
+        )
+    }
+
+    /// Holds the pager's allocator until the guard drops (test hook, D284): a reclaim a
+    /// dropped view only tries (`Shared::try_reclaim`) skips meanwhile, as when another
+    /// thread grows the file or commits.
+    #[doc(hidden)]
+    pub fn hold_pager_alloc(&self) -> impl Sized + '_ {
+        self.inner.shared.pager.hold_alloc_for_test()
     }
 
     /// Every SST the current catalog names, as `(level, length, size class)` (test hook:
@@ -1406,6 +1444,28 @@ impl Engine {
         if let Some((_, w)) = first {
             w.wake();
         }
+    }
+
+    /// Compactions that finished their job and submitted their commit (test hook, D284):
+    /// one stopped before this is still writing its output.
+    #[doc(hidden)]
+    pub fn compaction_commits_submitted(&self) -> u64 {
+        self.inner
+            .shared
+            .hooks
+            .compaction_commits
+            .load(Ordering::Acquire)
+    }
+
+    /// While set, every compaction job's slice does a few units of work (one clock check's
+    /// worth) and yields (test hook, D284): a test can stop it part-way.
+    #[doc(hidden)]
+    pub fn compaction_tiny_slices(&self, on: bool) {
+        self.inner
+            .shared
+            .hooks
+            .compaction_tiny_slices
+            .store(on, Ordering::Release);
     }
 
     /// Whether a compaction job is held before its first slice (test hook).

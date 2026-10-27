@@ -553,6 +553,9 @@ impl File for PreadFile {
         if let Err(e) = self.inner.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
+        if crate::own::in_inline_io() {
+            return Completion::ready(self.inner.read_at(&mut buf, offset).map(|()| buf));
+        }
         let (done, resolver) = Completion::pair();
         let inner = Arc::clone(&self.inner);
         self.inner.pool.submit(Box::new(move || {
@@ -564,6 +567,9 @@ impl File for PreadFile {
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
         if let Err(e) = self.inner.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
+        }
+        if crate::own::in_inline_io() {
+            return Completion::ready(self.inner.write_at(&buf, offset).map(|()| buf));
         }
         let (done, resolver) = Completion::pair();
         let inner = Arc::clone(&self.inner);
@@ -578,6 +584,9 @@ impl File for PreadFile {
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
+        if crate::own::in_inline_io() {
+            return Completion::ready(self.inner.sync_data());
+        }
         let (done, resolver) = Completion::pair();
         let inner = Arc::clone(&self.inner);
         self.inner
@@ -594,6 +603,14 @@ impl File for PreadFile {
     }
 
     fn submit_sync_all(&self) -> Completion<()> {
+        if crate::own::in_inline_io() {
+            return Completion::ready(
+                self.inner
+                    .file()
+                    .sync_all()
+                    .map_err(|e| Error::os("sync", e)),
+            );
+        }
         let (done, resolver) = Completion::pair();
         let inner = Arc::clone(&self.inner);
         self.inner.pool.submit(Box::new(move || {

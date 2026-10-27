@@ -818,4 +818,23 @@ impl Task for FlushTask {
     fn name(&self) -> &'static str {
         "flush"
     }
+
+    fn commit_path(&self) -> bool {
+        true
+    }
+
+    /// Taken back from a background worker (D284): it resumes on the shard where it left
+    /// off (its output so far was written inside its slices). If a slice of it panicked
+    /// before its commit was submitted, its state is not trusted: it fails, which abandons
+    /// its output and queues its memtables to flush again (after a backoff). Once its
+    /// commit is submitted it only waits for the manifest's reply, and keeps waiting.
+    fn reclaim(&mut self, failed: bool) -> bool {
+        if failed && !matches!(self.stage, Stage::Commit(_) | Stage::Done) {
+            self.fail(Error::Corruption(
+                "a flush slice panicked on a background worker".to_owned(),
+            ));
+            return false;
+        }
+        true
+    }
 }

@@ -281,6 +281,9 @@ struct SimState {
 /// A deferred operation: `job` runs it on its file and resolves its completion.
 struct InFlight {
     id: u64,
+    /// A write or sync submitted inside an `inline_io` scope (a background worker's slice,
+    /// D284): [`SimVfs::inline_writes_in_flight`] counts these.
+    inline_write: bool,
     /// The submitting thread, in owner-reaps mode: the only one that completes it.
     owner: Option<std::thread::ThreadId>,
     target: Target,
@@ -776,6 +779,18 @@ impl SimVfs {
         self.state().in_flight.len()
     }
 
+    /// Deferred writes and syncs still in flight that were submitted inside an
+    /// [`inline_io`](crate::inline_io) scope (a background worker's slice, D284). A worker's
+    /// task can be taken back and its output freed between slices only while this is 0
+    /// after each slice: a test's check that no output write is ever submitted from one.
+    pub fn inline_writes_in_flight(&self) -> usize {
+        self.state()
+            .in_flight
+            .iter()
+            .filter(|f| f.inline_write)
+            .count()
+    }
+
     /// Completes one in-flight deferred operation, chosen by the seed, on the calling thread
     /// (its completion's continuations run here too). Returns `false` if none was in flight.
     pub fn complete_io(&self) -> bool {
@@ -824,6 +839,7 @@ impl SimVfs {
     fn submit<T: Send + 'static>(
         &self,
         file: &SimFile,
+        write: bool,
         run: impl FnOnce(&SimFile) -> Result<T> + Send + 'static,
     ) -> Completion<T> {
         let mut st = self.state();
@@ -834,7 +850,11 @@ impl SimVfs {
         let id = st.next_io;
         st.next_io += 1;
         *st.io_pins.entry(file.handle).or_default() += 1;
-        let owner = st.owner_reaps.then(|| std::thread::current().id());
+        // Inside an inline scope (a background worker's slice, D284) the operation stays
+        // deferred, but no thread owns it: the device completes it like any other, so a task
+        // taken back from the worker never waits on that thread.
+        let owner =
+            (st.owner_reaps && !crate::own::in_inline_io()).then(|| std::thread::current().id());
         if owner.is_some() {
             let own: Weak<dyn crate::own::OwnIo> = self.me.clone();
             crate::own::register(own);
@@ -852,6 +872,7 @@ impl SimVfs {
         })));
         st.in_flight.push(InFlight {
             id,
+            inline_write: write && crate::own::in_inline_io(),
             owner,
             target: Target::File {
                 node: file.node,
@@ -877,7 +898,11 @@ impl SimVfs {
         }
         let id = st.next_io;
         st.next_io += 1;
-        let owner = st.owner_reaps.then(|| std::thread::current().id());
+        // Inside an inline scope (a background worker's slice, D284) the operation stays
+        // deferred, but no thread owns it: the device completes it like any other, so a task
+        // taken back from the worker never waits on that thread.
+        let owner =
+            (st.owner_reaps && !crate::own::in_inline_io()).then(|| std::thread::current().id());
         if owner.is_some() {
             let own: Weak<dyn crate::own::OwnIo> = self.me.clone();
             crate::own::register(own);
@@ -894,6 +919,7 @@ impl SimVfs {
         let crashes = st.crashes;
         st.in_flight.push(InFlight {
             id,
+            inline_write: false,
             owner,
             target: Target::Vfs {
                 crashes,
@@ -1215,8 +1241,9 @@ impl File for SimFile {
         if let Err(e) = self.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));
         }
-        self.vfs
-            .submit(self, move |f| f.read_at(&mut buf, offset).map(|()| buf))
+        self.vfs.submit(self, false, move |f| {
+            f.read_at(&mut buf, offset).map(|()| buf)
+        })
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
@@ -1224,7 +1251,7 @@ impl File for SimFile {
             return Completion::ready(Err(e));
         }
         self.vfs
-            .submit(self, move |f| f.write_at(&buf, offset).map(|()| buf))
+            .submit(self, true, move |f| f.write_at(&buf, offset).map(|()| buf))
     }
 
     fn sync_data(&self) -> Result<()> {
@@ -1232,7 +1259,7 @@ impl File for SimFile {
     }
 
     fn submit_sync_data(&self) -> Completion<()> {
-        self.vfs.submit(self, SimFile::sync_data)
+        self.vfs.submit(self, true, SimFile::sync_data)
     }
 
     fn sync_all(&self) -> Result<()> {
@@ -1240,7 +1267,7 @@ impl File for SimFile {
     }
 
     fn submit_sync_all(&self) -> Completion<()> {
-        self.vfs.submit(self, SimFile::sync_all)
+        self.vfs.submit(self, true, SimFile::sync_all)
     }
 
     fn len(&self) -> Result<u64> {

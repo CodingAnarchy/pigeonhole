@@ -1,0 +1,6 @@
+### Added
+- Application-owned mode can run flush and compaction on background workers the application drives from its own threads (D284, #816): `EngineOptions::background_workers` and `Engine::open_application_owned_with`, which returns the engine, the shards and the workers (`BackgroundWorker`: `run_once`, `wait`, `waker`, `set_wakeup`, `next_deadline`, `closed`). No threads are started (D40). A worker's I/O runs inline on the thread that drives it, so the application may stop driving one at any time: the close takes its work back without waiting for it, and a shard waiting for memtable room takes back a flush the worker is not running. The default stays 0 workers (flush and compaction on the shards, as before). `pigeonhole_io::inline_io` is the I/O scope the workers run in.
+- `Metrics::compactions_reclaimed` and `Metrics::background_take_backs`: compactions dropped because their worker was dropped or the engine closed (they compact again), and tasks a shard took back because no worker was driven or a room wait needed the flush.
+
+### Changed
+- Engine-owned compaction threads now take flushes and compactions from one queue, flushes first, instead of each shard's tasks going round-robin to the threads; timers stay on their shards.

@@ -400,6 +400,9 @@ impl UringFile {
     /// The registered pool of the ring this thread's operations go to, if it has one
     /// (registering it on first use). None for a thread that runs them inline (#929).
     fn pool(&self) -> Option<Arc<SlotPool>> {
+        if crate::own::in_inline_io() {
+            return None;
+        }
         match ThreadRing::current(self.ring.id()) {
             Some(ring) => ring
                 .pool
@@ -415,8 +418,10 @@ impl UringFile {
         }
     }
 
-    /// Whether the calling thread runs this file's operations inline (#929): the backend has
-    /// no reaper (application-owned mode) and the thread no ring of its own. Nothing then
+    /// Whether the calling thread runs this file's operations inline: inside an
+    /// [`crate::inline_io`] scope (a background worker's slice, D284), always; otherwise when
+    /// the backend has no reaper (application-owned mode) and the thread no ring of its own
+    /// (#929). Nothing then
     /// waits in a ring for someone to reap, whatever the thread's waits look like. A thread
     /// whose attach failed tries again here once [`ATTACH_RETRY`] has passed.
     ///
@@ -426,6 +431,11 @@ impl UringFile {
     /// (`WalStream::submit_sync`: `let lsn = self.write()?`, `write_buf`'s `write_at`), and a
     /// held segment header's write completes before the sync chained after it.
     fn inline_here(&self) -> bool {
+        // A background worker's slice (D284): inline whatever the thread has, and no attach.
+        if crate::own::in_inline_io() {
+            self.ring.counts.inline.fetch_add(1, Ordering::Relaxed);
+            return true;
+        }
         if self.ring.reaper.is_some() {
             return false;
         }

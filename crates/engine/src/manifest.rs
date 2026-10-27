@@ -1352,6 +1352,11 @@ impl Task for ManifestPump {
     fn name(&self) -> &'static str {
         "manifest"
     }
+
+    /// Every flush's commit waits for it (D284): taken ahead of compactions on a worker.
+    fn commit_path(&self) -> bool {
+        true
+    }
 }
 
 /// A reply closure resolving a [`Notifier`].

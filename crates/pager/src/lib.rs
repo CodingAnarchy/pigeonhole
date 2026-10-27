@@ -1286,6 +1286,13 @@ impl Pager {
         Some(try_lock(&self.inner.alloc)?.reclaim(oldest_live.min(durable)))
     }
 
+    /// Holds the allocator's lock until the guard drops (test hook: makes
+    /// [`Pager::try_reclaim`] skip, as another thread's growth or commit would).
+    #[doc(hidden)]
+    pub fn hold_alloc_for_test(&self) -> impl Sized + '_ {
+        lock(&self.inner.alloc)
+    }
+
     /// Extents past the shrink point that must move before the file can shrink.
     ///
     /// The shrink point is where the live (not retired) extents would end if packed toward

@@ -1,16 +1,16 @@
-//! Cooperative background tasks: the per-shard scheduler and the compaction-thread pool.
+//! Cooperative background tasks: the scheduler shards and background workers run them on.
 
 use std::collections::{BTreeSet, VecDeque};
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use pigeonhole_io::{Vfs, VfsRef};
+use pigeonhole_io::Vfs;
 
-use crate::signal::{Signal, WakeTarget};
+use crate::pool::{Origin, Pool};
+use crate::signal::Signal;
 
 /// What a background task reports after a time slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +62,34 @@ pub trait Task: Send + 'static {
 
     /// A short label for metrics.
     fn name(&self) -> &'static str;
+
+    /// Whether this task is on its shard's commit path: commits wait for it, directly or
+    /// for the room it frees (a flush, the manifest pump that commits a flush's output, a
+    /// WAL spare a segment rollover waits for). A background worker takes and runs such tasks
+    /// ahead of others (a compaction may hold it for seconds), and a room wait on the shard
+    /// takes one back from a worker that is not running it (D284).
+    fn commit_path(&self) -> bool {
+        false
+    }
+
+    /// Whether this task may run on a background worker. `false` keeps it on the shard
+    /// that spawned it: a timer, which has nothing to offload and must fire whether or not
+    /// any worker is driven (D284).
+    fn offload(&self) -> bool {
+        true
+    }
+
+    /// Called on the shard that spawned this task when the runtime takes it back from a
+    /// background worker that held it (D284): the worker was dropped, the engine closed or
+    /// a room wait took it (with `failed: false`), or a slice of it panicked (`failed: true`,
+    /// its state then half-updated). Returns whether to run it on the shard from now on
+    /// (`false`: drop it); whatever it reports to the shard, it reports from here or from
+    /// its next slice there.
+    ///
+    /// The default resumes the task on the shard, or drops it if it failed.
+    fn reclaim(&mut self, failed: bool) -> bool {
+        !failed
+    }
 }
 
 /// Wakes a blocked background task. Cheap to clone; may be called from any thread, any number
@@ -103,17 +131,56 @@ type WokenFlag = loom::sync::atomic::AtomicBool;
 #[cfg(not(loom))]
 type WokenFlag = AtomicBool;
 
+/// The lock over a task's current thread signal (loom's in the `loom` models).
+#[cfg(loom)]
+type TargetLock<T> = loom::sync::Mutex<T>;
+#[cfg(not(loom))]
+type TargetLock<T> = std::sync::Mutex<T>;
+
+/// A task's wake state, kept for the task's whole life: futures it awaits hold wakers built
+/// from it (once), so when a background worker hands the task to another scheduler (D284)
+/// the cell stays and only its signal changes.
 #[derive(Debug)]
-struct TaskCell {
+pub(crate) struct TaskCell {
     woken: WokenFlag,
-    signal: Arc<Signal>,
+    /// The signal of the scheduler that holds the task now. A leaf lock: held only to clone
+    /// or replace the `Arc`.
+    signal: TargetLock<Arc<Signal>>,
+}
+
+impl TaskCell {
+    pub(crate) fn new(signal: Arc<Signal>) -> Arc<Self> {
+        Arc::new(Self {
+            woken: WokenFlag::new(false),
+            signal: TargetLock::new(signal),
+        })
+    }
+
+    fn signal(&self) -> Arc<Signal> {
+        Arc::clone(
+            &self
+                .signal
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Points later wakes at `signal`, the new holder's. A wake that read the old signal
+    /// went to the old holder; the new one runs the task once on adoption anyway, so the
+    /// event behind that wake is seen.
+    fn retarget(&self, signal: Arc<Signal>) {
+        *self
+            .signal
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = signal;
+    }
 }
 
 impl TaskWaker {
     /// Marks the task runnable.
     pub fn wake(&self) {
         self.cell.woken.store(true, Ordering::Release);
-        self.cell.signal.notify_task();
+        self.cell.signal().notify_task();
     }
 }
 
@@ -134,12 +201,36 @@ const MAX_PARK: Duration = Duration::from_millis(10);
 const MAX_PARK_REAL: Duration = Duration::from_secs(1);
 
 struct Entry {
-    task: Box<dyn Task>,
+    /// `None` while a background worker runs a slice of it outside the pool's lock (D284).
+    task: Option<Box<dyn Task>>,
     waker: TaskWaker,
     state: State,
     /// The shard that spawned this task onto the pool (a pool scheduler's entries only):
-    /// its slices' time is counted back to that shard (D256).
-    origin: Option<Arc<Signal>>,
+    /// its slices' time is counted back to that shard (D256), and it goes back there if
+    /// taken back (D284).
+    origin: Option<Arc<Origin>>,
+    /// The task is on its shard's commit path ([`Task::commit_path`]).
+    room: bool,
+    /// When it last ended a slice, or was taken (VFS clock; pool schedulers only).
+    idle_since: u64,
+    /// A slice of it panicked: it never runs here again (D284).
+    poisoned: bool,
+}
+
+/// A task taken out of a scheduler, with its wake cell, to be adopted elsewhere (D284).
+pub(crate) struct Moved {
+    pub(crate) task: Box<dyn Task>,
+    pub(crate) cell: Option<Arc<TaskCell>>,
+    pub(crate) origin: Arc<Origin>,
+    pub(crate) failed: bool,
+}
+
+/// A slice taken out of a scheduler to run without its lock (D284).
+pub(crate) struct Begun {
+    pub(crate) slot: usize,
+    pub(crate) task: Box<dyn Task>,
+    pub(crate) waker: TaskWaker,
+    pub(crate) origin: Option<Arc<Origin>>,
 }
 
 /// Round-robin scheduler over one thread's background tasks. Deterministic: tasks run in
@@ -177,28 +268,37 @@ impl Scheduler {
     }
 
     pub(crate) fn spawn(&mut self, task: Box<dyn Task>) {
-        self.spawn_from(task, None);
+        self.adopt(task, None, None, 0);
     }
 
-    /// The signal of the thread this scheduler runs on (a shard's, or a pool thread's).
-    pub(crate) fn signal(&self) -> &Arc<Signal> {
-        &self.signal
-    }
-
-    /// Spawns `task`, counting its slices' time to `origin` (the shard that handed it to
-    /// the pool, D256) when given.
-    pub(crate) fn spawn_from(&mut self, task: Box<dyn Task>, origin: Option<Arc<Signal>>) {
-        let waker = TaskWaker {
-            cell: Arc::new(TaskCell {
-                woken: WokenFlag::new(false),
-                signal: Arc::clone(&self.signal),
-            }),
+    /// Takes `task` in, runnable, with the wake cell it already has if it ran elsewhere
+    /// (pointed at this scheduler from now on, D284), counting its slices' time to `origin`
+    /// (the shard that handed it to the pool, D256) when given. `now`: the VFS clock.
+    pub(crate) fn adopt(
+        &mut self,
+        task: Box<dyn Task>,
+        cell: Option<Arc<TaskCell>>,
+        origin: Option<Arc<Origin>>,
+        now: u64,
+    ) {
+        let cell = match cell {
+            Some(cell) => {
+                cell.retarget(Arc::clone(&self.signal));
+                cell
+            }
+            None => TaskCell::new(Arc::clone(&self.signal)),
         };
+        if let Some(o) = &origin {
+            o.held.fetch_add(1, Ordering::Relaxed);
+        }
         let entry = Entry {
-            task,
-            waker,
+            room: task.commit_path(),
+            task: Some(task),
+            waker: TaskWaker { cell },
             state: State::Runnable,
             origin,
+            idle_since: now,
+            poisoned: false,
         };
         let idx = match self.free.pop() {
             Some(i) => {
@@ -274,15 +374,59 @@ impl Scheduler {
         }
     }
 
-    /// Runs the next runnable task for one slice ending at `deadline`. Returns the shard
-    /// the task was spawned from when it came through the pool (D256: the caller counts
-    /// the slice's time to it), else `None`.
-    pub(crate) fn run_one(&mut self, deadline: u64) -> Option<Arc<Signal>> {
-        let i = self.runnable.pop_front()?;
+    /// Runs the next runnable task for one slice ending at `deadline` (a shard's own
+    /// scheduler).
+    pub(crate) fn run_one(&mut self, deadline: u64) {
+        let Some(b) = self.begin_one(false) else {
+            return;
+        };
+        let mut task = b.task;
+        let poll = task.run(deadline, &b.waker);
+        self.end_one(b.slot, Some(task), poll, 0);
+    }
+
+    /// Takes the next runnable task out for one slice, commit-path tasks first when
+    /// `room_first` (a worker, D284); its slot stays, marked running, until
+    /// [`Scheduler::end_one`].
+    pub(crate) fn begin_one(&mut self, room_first: bool) -> Option<Begun> {
+        let pick = if room_first {
+            self.runnable
+                .iter()
+                .position(|&i| self.slots[i].as_ref().is_some_and(|e| e.room))
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let i = self.runnable.remove(pick)?;
         let e = self.slots[i].as_mut()?;
-        let origin = e.origin.clone();
         e.waker.cell.woken.store(false, Ordering::Relaxed);
-        match e.task.run(deadline, &e.waker) {
+        Some(Begun {
+            slot: i,
+            task: e.task.take()?,
+            waker: e.waker.clone(),
+            origin: e.origin.clone(),
+        })
+    }
+
+    /// Puts a task back after its slice, as `poll` says (`now`: the VFS clock). A finished
+    /// task is not passed back (`None`): its owner drops it, a worker with no pool lock
+    /// held, since a task's destructor may run engine code (a settle callback, the release
+    /// of the last view it pinned).
+    pub(crate) fn end_one(
+        &mut self,
+        i: usize,
+        task: Option<Box<dyn Task>>,
+        poll: TaskPoll,
+        now: u64,
+    ) {
+        let Some(e) = self.slots[i].as_mut() else {
+            return;
+        };
+        e.idle_since = now;
+        if poll != TaskPoll::Done {
+            e.task = task;
+        }
+        match poll {
             TaskPoll::Pending => self.runnable.push_back(i),
             TaskPoll::Blocked => {
                 // A wake that raced with the slice keeps the task runnable.
@@ -302,147 +446,109 @@ impl Scheduler {
                 }
             }
             TaskPoll::Done => {
-                self.slots[i] = None;
+                if let Some(o) = self.slots[i].take().and_then(|e| e.origin) {
+                    o.held.fetch_sub(1, Ordering::Relaxed);
+                }
                 self.free.push(i);
             }
         }
-        origin
-    }
-}
-
-/// A task handed to the pool with the shard that spawned it (D256).
-pub(crate) struct PoolTask {
-    task: Box<dyn Task>,
-    origin: Arc<Signal>,
-}
-
-/// One dedicated compaction thread's inbox.
-#[derive(Debug)]
-pub(crate) struct PoolShared {
-    tx: Sender<PoolTask>,
-    closed: AtomicBool,
-    signal: Arc<Signal>,
-}
-
-impl PoolShared {
-    pub(crate) fn new() -> (Arc<Self>, Receiver<PoolTask>) {
-        let (tx, rx) = mpsc::channel();
-        let shared = Arc::new(Self {
-            tx,
-            closed: AtomicBool::new(false),
-            signal: Arc::new(Signal::new()),
-        });
-        (shared, rx)
     }
 
-    /// Hands `task` to this thread, from the shard whose signal is `origin` (its slices'
-    /// time is counted to that shard, D256).
-    pub(crate) fn submit(&self, task: Box<dyn Task>, origin: Arc<Signal>) {
-        // After shutdown the receiver is gone and the task is dropped, like any unfinished
-        // background task.
-        if self.tx.send(PoolTask { task, origin }).is_ok() {
-            self.signal.notify();
+    /// A slice of the task in slot `i` panicked (D284): it goes back, never to run here
+    /// again, and is taken back as failed.
+    pub(crate) fn poison(&mut self, i: usize, task: Box<dyn Task>, now: u64) {
+        if let Some(e) = self.slots[i].as_mut() {
+            e.task = Some(task);
+            e.poisoned = true;
+            e.idle_since = now;
+            // Neither runnable nor sleeping: blocked for good, until taken back.
+            e.state = State::Blocked;
+            self.blocked += 1;
         }
     }
 
-    pub(crate) fn close(&self) {
-        self.closed.store(true, Ordering::SeqCst);
-        self.signal.force_wake();
+    /// Tasks held: running, runnable, blocked or sleeping.
+    pub(crate) fn held(&self) -> usize {
+        self.slots.len() - self.free.len()
     }
-}
 
-/// Body of a dedicated compaction thread: back-to-back slices, no foreground queue.
-pub(crate) fn pool_main(
-    shared: Arc<PoolShared>,
-    rx: Receiver<PoolTask>,
-    vfs: VfsRef,
-    time_slice: u64,
-) {
-    // A ring of this thread's own where the backend has them (io_uring, #402), as a shard
-    // thread has: what its tasks submit (a compaction's block reads, a flush's SST writes,
-    // the manifest pump's root commit) completes here, on the thread that waits for it,
-    // not on the backend's shared ring and its one reaper thread, which every other
-    // thread's reads already queue on (D252's stall under io_uring).
-    vfs.attach_thread();
-    let own_ring = pigeonhole_io::own_io_waker().is_some();
-    shared
-        .signal
-        .set_target(match pigeonhole_io::own_io_waker() {
-            Some(w) => WakeTarget::ThreadRing(thread::current(), w),
-            None => WakeTarget::Thread(thread::current()),
-        });
-    let mut sched = Scheduler::new(Arc::clone(&shared.signal));
-    // The clock when this thread last went idle with sleeping tasks.
-    let mut idle_at = None;
-    let mut idle_park = IdlePark::default();
-    loop {
-        if shared.closed.load(Ordering::SeqCst) {
-            return;
-        }
-        while let Ok(t) = rx.try_recv() {
-            sched.spawn_from(t.task, Some(t.origin));
-        }
-        // What completed on this thread's ring resolves now, before the wakes it causes
-        // are collected, so the tasks it unblocks run this pass.
-        if own_ring {
-            pigeonhole_io::reap_own_io(None);
-        }
-        sched.collect_woken();
-        let now = vfs.monotonic_nanos();
-        if idle_at.take() == Some(now) && vfs.clock_is_simulated() {
-            // A simulated clock has not moved since we went idle: sleepers check for
-            // themselves (a real clock that reads the same only ticks coarsely, #263).
-            sched.wake_sleepers();
-        }
-        sched.wake_due(now);
-        if sched.has_runnable() {
-            // The slice's time counts to the shard that spawned the task (D256): the
-            // balancer reads it as that shard's pool busy, beside its turn busy.
-            if let Some(origin) = sched.run_one(now.saturating_add(time_slice)) {
-                origin.add_pool_busy(vfs.monotonic_nanos().saturating_sub(now));
+    /// Whether a slice of a task `pick` selects is running outside the lock.
+    pub(crate) fn running(&self, pick: impl Fn(&Arc<Origin>, bool) -> bool) -> bool {
+        self.slots
+            .iter()
+            .flatten()
+            .any(|e| e.task.is_none() && e.origin.as_ref().is_some_and(|o| pick(o, e.room)))
+    }
+
+    /// Takes out every task not running that `pick` selects (by origin and
+    /// [`Task::commit_path`]) and that has been idle since `idle_before` or earlier (VFS
+    /// clock; `u64::MAX`: any), for adoption elsewhere (D284). Only pool schedulers' tasks
+    /// (with an origin) are taken.
+    pub(crate) fn take_idle(
+        &mut self,
+        idle_before: u64,
+        could_run_only: bool,
+        pick: impl Fn(&Arc<Origin>, bool) -> bool,
+        out: &mut Vec<Moved>,
+    ) {
+        for i in 0..self.slots.len() {
+            let take = self.slots[i].as_ref().is_some_and(|e| {
+                e.task.is_some()
+                    && e.idle_since <= idle_before
+                    && (!could_run_only || e.could_run())
+                    && e.origin.as_ref().is_some_and(|o| pick(o, e.room))
+            });
+            if !take {
+                continue;
             }
-            continue;
-        }
-        shared.signal.prepare_sleep();
-        if let Ok(t) = rx.try_recv() {
-            shared.signal.awake();
-            sched.spawn_from(t.task, Some(t.origin));
-            continue;
-        }
-        if shared.signal.task_woken() {
-            shared.signal.awake();
-            continue;
-        }
-        if shared.closed.load(Ordering::SeqCst) {
-            continue;
-        }
-        if own_ring && pigeonhole_io::own_io_in_flight() {
-            // I/O only this thread completes (its ring): wait on it rather than park, until
-            // a completion, a wake (the ring's eventfd) or the next sleeper's deadline. A
-            // blocked task's completion posts only when this thread enters its ring.
-            let until = sched
-                .next_deadline()
-                .map_or(RING_IDLE_WAIT, |d| {
-                    Duration::from_nanos(d.saturating_sub(now))
-                })
-                .min(RING_IDLE_WAIT);
-            pigeonhole_io::reap_own_io(Some(until));
-            shared.signal.awake();
-            continue;
-        }
-        match sched.next_deadline() {
-            None => thread::park(),
-            Some(deadline) => {
-                idle_at = Some(now);
-                idle_park.park(&*vfs, deadline);
+            let Some(e) = self.slots[i].take() else {
+                continue;
+            };
+            self.free.push(i);
+            match e.state {
+                State::Runnable => self.runnable.retain(|&r| r != i),
+                State::Blocked => self.blocked -= 1,
+                State::Sleeping(d) => {
+                    self.sleeping.remove(&(d, i));
+                }
+            }
+            if let (Some(task), Some(origin)) = (e.task, e.origin) {
+                origin.held.fetch_sub(1, Ordering::Relaxed);
+                out.push(Moved {
+                    task,
+                    cell: Some(e.waker.cell),
+                    origin,
+                    failed: e.poisoned,
+                });
             }
         }
     }
+
+    /// The earliest time (VFS clock) a task `pick` selects that could run but is not
+    /// running became idle: when a room wait could take it back (D284).
+    pub(crate) fn stalled_since(&self, pick: impl Fn(&Arc<Origin>, bool) -> bool) -> Option<u64> {
+        self.slots
+            .iter()
+            .flatten()
+            .filter(|e| {
+                e.task.is_some()
+                    && e.could_run()
+                    && e.origin.as_ref().is_some_and(|o| pick(o, e.room))
+            })
+            .map(|e| e.idle_since)
+            .min()
+    }
 }
 
-/// Longest an idle pool thread waits on its own I/O ring before it looks again (a wake or a
-/// completion ends the wait sooner).
-const RING_IDLE_WAIT: Duration = Duration::from_millis(100);
+impl Entry {
+    /// Whether the task could run now if its scheduler were driven: runnable, woken while
+    /// nobody collected the wake, or failed (taken back as such).
+    fn could_run(&self) -> bool {
+        self.poisoned
+            || self.state == State::Runnable
+            || self.waker.cell.woken.load(Ordering::Acquire)
+    }
+}
 
 /// Parks an idle thread whose earliest sleeping task is due at a VFS-clock deadline.
 #[derive(Debug, Default)]
@@ -468,37 +574,122 @@ impl IdlePark {
     }
 }
 
-/// Where a shard's spawned tasks go: its own scheduler, or round-robin over the pool.
+/// Where a shard's spawned tasks go: its own scheduler, or the background workers' pool
+/// (D284), from which tasks also come back.
 #[derive(Debug)]
 pub(crate) struct Spawner {
     pub(crate) local: Scheduler,
-    pool: Arc<[Arc<PoolShared>]>,
-    next: usize,
+    pool: Option<Arc<Pool>>,
+    origin: Arc<Origin>,
+    /// When to look again for a stalled commit-path task of this shard's on a worker (a
+    /// room wait, D284).
+    room_check: Option<u64>,
+    /// When this shard's tasks queued on the pool may fall back to it (`pool::FALLBACK`).
+    stale_check: Option<u64>,
 }
 
 impl Spawner {
-    pub(crate) fn new(local: Scheduler, pool: Arc<[Arc<PoolShared>]>) -> Self {
+    pub(crate) fn new(local: Scheduler, pool: Option<Arc<Pool>>, origin: Arc<Origin>) -> Self {
         Self {
             local,
             pool,
-            next: 0,
+            origin,
+            room_check: None,
+            stale_check: None,
         }
     }
 
     pub(crate) fn spawn(&mut self, task: Box<dyn Task>) {
-        if self.pool.is_empty() {
+        let Some(pool) = &self.pool else {
             self.local.spawn(task);
-        } else {
-            let p = &self.pool[self.next % self.pool.len()];
-            self.next = self.next.wrapping_add(1);
-            p.submit(task, Arc::clone(self.local.signal()));
+            return;
+        };
+        match pool.submit(task, &self.origin) {
+            Ok(()) => {
+                if self.stale_check.is_none() {
+                    self.stale_check = Some(pool.now().saturating_add(crate::pool::FALLBACK));
+                }
+            }
+            Err(task) => self.local.spawn(task),
         }
+    }
+
+    /// Whether tasks came back from the workers (for the sleep re-check, after its fence).
+    pub(crate) fn has_back(&self) -> bool {
+        self.pool.is_some() && self.origin.has_back()
+    }
+
+    /// At the start of a turn: adopts tasks that came back from the workers, takes back
+    /// tasks queued while nobody drives them, and re-checks a room wait's stalled flush.
+    pub(crate) fn take_back(&mut self, now: u64) {
+        let Some(pool) = &self.pool else {
+            return;
+        };
+        let mut moved = Vec::new();
+        if self.origin.has_back() {
+            moved = self.origin.take_back();
+        }
+        if self.stale_check.is_some_and(|t| t <= now) {
+            self.stale_check = None;
+            let stale = pool.take_stale(&self.origin, now);
+            self.origin.signal.add_take_backs(stale.len() as u64);
+            moved.extend(stale);
+            // Look again while tasks wait in the queue, or an application's driver holds
+            // some (it may stop being driven; engine-owned threads never do).
+            if self.origin.queued() || (!pool.builtin() && self.origin.held()) {
+                self.stale_check = Some(now.saturating_add(crate::pool::FALLBACK));
+            }
+        }
+        if self.room_check.is_some_and(|t| t <= now) {
+            self.room_check = None;
+            let (room, next) = pool.reclaim_room(&self.origin, now);
+            self.origin.signal.add_room_take_backs(room.len() as u64);
+            moved.extend(room);
+            self.room_check = next;
+        }
+        self.adopt_back(moved, now);
+    }
+
+    /// A room wait on this shard (D284): takes back its flushes a worker holds but has not
+    /// run for `pool::ROOM_RECLAIM`, never waiting for one that runs. Returns how many.
+    pub(crate) fn reclaim_room(&mut self, now: u64) -> usize {
+        let Some(pool) = &self.pool else {
+            return 0;
+        };
+        let (moved, next) = pool.reclaim_room(&self.origin, now);
+        let n = moved.len();
+        self.origin.signal.add_room_take_backs(n as u64);
+        self.room_check = next;
+        self.adopt_back(moved, now);
+        n
+    }
+
+    fn adopt_back(&mut self, moved: Vec<Moved>, now: u64) {
+        for mut m in moved {
+            // A task a worker held (it has a wake cell) is told it was taken back; one that
+            // only waited in the queue never ran elsewhere and simply runs here.
+            if m.cell.is_none() || m.task.reclaim(m.failed) {
+                self.local.adopt(m.task, m.cell, None, now);
+            }
+        }
+    }
+
+    /// The earliest of the shard's own sleepers' deadlines and the pool checks above.
+    pub(crate) fn next_deadline(&self) -> Option<u64> {
+        let local = self.local.next_deadline();
+        if self.pool.is_none() {
+            return local;
+        }
+        [local, self.room_check, self.stale_check]
+            .into_iter()
+            .flatten()
+            .min()
     }
 }
 
 #[cfg(all(test, loom))]
 mod loom_tests {
-    use super::{TaskCell, TaskWaker, WokenFlag};
+    use super::{TaskCell, TaskWaker};
     use crate::signal::{Signal, WakeTarget};
     use loom::sync::{Condvar, Mutex};
     use loom::thread;
@@ -542,10 +733,7 @@ mod loom_tests {
                 })));
             }
             let waker = TaskWaker {
-                cell: Arc::new(TaskCell {
-                    woken: WokenFlag::new(false),
-                    signal: Arc::clone(&signal),
-                }),
+                cell: TaskCell::new(Arc::clone(&signal)),
             };
             let event = Arc::new(Mutex::new(false));
             let other = {
