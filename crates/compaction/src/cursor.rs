@@ -176,6 +176,8 @@ impl<C: Cursor> MergingCursor<C> {
     }
 
     /// Finds the smaller child of the top after the heap changed (0 when there is none).
+    /// Always inlined: the lazy settle's call site (D288) otherwise moved it out of line.
+    #[inline(always)]
     fn set_runner(&mut self) {
         self.top = self.heap.first().copied().unwrap_or(0);
         self.runner = match self.heap.len() {
