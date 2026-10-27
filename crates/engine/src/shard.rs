@@ -50,7 +50,7 @@ use crate::compact::{self, CompactionRecord, CompactionWork};
 use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
 use crate::purge_guard::PurgeGuard;
-use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
+use crate::snapshot::{FamilySsts, LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
 use crate::source::{ColumnKey, Probe, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::timer_state::TimerState;
 use crate::waker::StdWaker;
@@ -2067,6 +2067,61 @@ impl MemSlot {
                 (ts.min(m.min_ts), seqno.into_iter().chain(lo).min())
             })
     }
+}
+
+/// The other sources of a counter family's slot when `target` is queued for flushing
+/// (D287), as compaction lists them (D186's `GcPolicy::other_sources`): the slot's SSTs, with
+/// their key and seqno ranges, and its other memtables (`others`; `target` itself is
+/// skipped), any key. Frozen memtables are immutable, so their exact ranges; the active one
+/// takes seqnos above its smallest from now on. Sources entirely above `target` are left
+/// out, as compaction leaves out those above its inputs.
+///
+/// Every source lies entirely below or above `target`'s seqnos, so a flush combines all of
+/// its operands within a stripe:
+/// - older ones (the slot's SSTs, older frozen memtables) are below: a memtable freezes only
+///   once all it holds is durable (D227), so no lower seqno lands in a newer one; a moved or
+///   merged tablet's SSTs were flushed before the change;
+/// - newer memtables are above, by the same rule;
+/// - a cross-shard share not applied here yet lands above too: once decided, its apply
+///   seqno is held (`CROSS_HELD`, D278) and `durable_seqno` stays below it, and `target`
+///   froze at or below `durable_seqno`; undecided, its apply seqno is not reserved yet. So
+///   prepared shares are not listed (their commit id, D263, is never applied).
+///
+/// Debug builds check the first two. Were one ever false, the GC would simply not combine
+/// across the overlap. `None` for an empty memtable.
+fn counter_sources<'a>(
+    fam: Option<&FamilySsts>,
+    target: &MemEntry,
+    others: impl Iterator<Item = &'a MemEntry>,
+) -> Option<Vec<pigeonhole_compaction::OtherSource>> {
+    let (lo, hi) = target.table.seqno_range()?;
+    let root = target.table.root();
+    let ssts = fam
+        .into_iter()
+        .flat_map(|f| f.iter())
+        .map(|s| pigeonhole_compaction::OtherSource {
+            keys: Some((s.meta.smallest_key.clone(), s.meta.largest_key.clone())),
+            seqnos: s.meta.seqno_range,
+        });
+    let mems = others.filter(|m| m.table.root() != root).filter_map(|m| {
+        let (a, b) = m.table.seqno_range()?;
+        let b = if m.table.is_frozen() { b } else { Seqno::MAX };
+        Some(pigeonhole_compaction::OtherSource {
+            keys: None,
+            seqnos: (a, b),
+        })
+    });
+    let sources: Vec<_> = ssts.chain(mems).filter(|o| o.seqnos.0 <= hi).collect();
+    debug_assert!(
+        sources.iter().all(|o| o.seqnos.1 < lo),
+        "a source of the slot overlaps the flushed memtable's seqnos {lo}..={hi}: {:?}",
+        sources
+            .iter()
+            .filter(|o| o.seqnos.1 >= lo)
+            .map(|o| o.seqnos)
+            .collect::<Vec<_>>()
+    );
+    Some(sources)
 }
 
 /// Finds or creates the slot of `(tablet, family)`; a split borrow so the arena stays usable.
@@ -4239,18 +4294,26 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let item = |m: &MemEntry, guard: Option<Arc<PurgeGuard>>| FlushItem {
-                table: meta.table,
-                tablet: key.0,
-                family: key.1,
-                root: m.table.root(),
-                reader: m.table.reader(),
-                bytes: m.table.allocated_bytes() as u64,
-                max_seqno: m.max_seqno(),
-                has_shares: m.has_shares,
-                guard,
-                options: meta.options.clone(),
-            };
+            let counter = meta.options.kind == FamilyKind::Counter;
+            let fam = view.ssts.family(key.0, key.1).cloned();
+            let item =
+                |m: &MemEntry,
+                 guard: Option<Arc<PurgeGuard>>,
+                 counter_sources: Option<Vec<pigeonhole_compaction::OtherSource>>| {
+                    FlushItem {
+                        table: meta.table,
+                        tablet: key.0,
+                        family: key.1,
+                        root: m.table.root(),
+                        reader: m.table.reader(),
+                        bytes: m.table.allocated_bytes() as u64,
+                        max_seqno: m.max_seqno(),
+                        has_shares: m.has_shares,
+                        guard,
+                        options: meta.options.clone(),
+                        counter_sources,
+                    }
+                };
             // The fresh active memtable takes a chunk: never one admitted commits reserved.
             if tablets_on
                 && self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size)
@@ -4297,7 +4360,10 @@ impl ShardState {
                         && !self.voided_roots.contains(&root)
                         && flush_guard(slot, root, &self.prepared, &view, key))
                     .then(|| guard_state(&mut self.guarded, root, key.1));
-                    self.flush_queue.push(item(&slot.active, guard));
+                    let sources = counter
+                        .then(|| counter_sources(fam.as_deref(), &slot.active, slot.frozen.iter()))
+                        .flatten();
+                    self.flush_queue.push(item(&slot.active, guard, sources));
                     slot.seal = Seal::Flushing;
                 }
                 // Otherwise keep writing into this one; the arena-room check defers later
@@ -4318,7 +4384,17 @@ impl ShardState {
                 && !self.voided_roots.contains(&root)
                 && flush_guard(slot, root, &self.prepared, &view, key))
             .then(|| guard_state(&mut self.guarded, root, key.1));
-            self.flush_queue.push(item(&old, guard));
+            // The slot's other memtables: the older frozen ones and the fresh active one.
+            let sources = counter
+                .then(|| {
+                    counter_sources(
+                        fam.as_deref(),
+                        &old,
+                        slot.frozen.iter().chain(std::iter::once(&slot.active)),
+                    )
+                })
+                .flatten();
+            self.flush_queue.push(item(&old, guard, sources));
             slot.frozen.insert(0, old);
             self.view_dirty = true;
         }
@@ -4774,6 +4850,17 @@ impl ShardState {
                         && flush_guard(slot, m.table.root(), &self.prepared, &view, key))
                     .then(|| guard_state(&mut self.guarded, m.table.root(), key.1)),
                     options: meta.options.clone(),
+                    // As when first queued (D287): only other flushes (below) and writes
+                    // (above) changed the slot since.
+                    counter_sources: (meta.options.kind == FamilyKind::Counter)
+                        .then(|| {
+                            counter_sources(
+                                view.ssts.family(key.0, key.1).map(|f| &**f),
+                                m,
+                                slot.frozen.iter().chain(std::iter::once(&slot.active)),
+                            )
+                        })
+                        .flatten(),
                 });
             }
         }

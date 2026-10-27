@@ -242,6 +242,9 @@ pub enum FlushGcMutation {
     /// A delete arriving while a guarded flush is in flight, or a write below a running
     /// bottommost compaction's bound (#316), does not void it or wait for its install.
     IgnoreVoids,
+    /// A counter family's flush is told of another source of the slot whose seqnos span its
+    /// memtable's (D287): it must then keep every operand rather than combine them.
+    CounterSourceInside,
 }
 
 /// A balancer load term a test chooses for a shard (`Engine::set_shard_load`).
@@ -1021,6 +1024,7 @@ impl Engine {
             FlushGcMutation::DropGuard => 1,
             FlushGcMutation::DropSnapshotFloor => 2,
             FlushGcMutation::IgnoreVoids => 3,
+            FlushGcMutation::CounterSourceInside => 4,
         };
         self.inner
             .shared
