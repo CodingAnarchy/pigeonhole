@@ -1235,8 +1235,11 @@ pub const WARMUP_SETTLED_AFTER_SWITCH: Duration = Duration::from_secs(5);
 pub const WARMUP_CAP_AFTER_SWITCH: Duration = Duration::from_secs(60);
 
 /// The longest the warmup waits for the tablet placement to settle (D242): past it the run
-/// measures anyway, with a warning, and the record says it did not settle.
-pub const WARMUP_CAP: Duration = Duration::from_secs(30);
+/// measures anyway, with a warning, and the record says it did not settle. 60 s since D242's
+/// third amendment (owner, 2026-10-27): the first pack from the unpacked start waits for
+/// D255's 30 s window, and at Buffered skewed-multi-shard settled 0.4 s inside the former
+/// 30 s cap.
+pub const WARMUP_CAP: Duration = Duration::from_secs(60);
 
 /// The warmup (D242): the warmup operations, repeated on the measured phase's own client
 /// threads until the store's tablet placement has gone [`WARMUP_SETTLED`] without a split,
