@@ -2674,7 +2674,8 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **`Cursor`** gains three provided methods: `settled()` (default true), `settle_until(bound)` (default no-op) and `may_park()` (default false). `settle_until` parks only on an entry strictly greater than `bound`; an entry equal to it is checked (perf287's must-fix: a source parked on the runner's key with the lower index would otherwise stay on top unsettled for ever).
 - **`FilteredCursor::lazy`:** a move lands without filtering, and `settle_until` runs D22's verdict loop up to the bound. An unfiltered cursor built lazy stays eager, since it has nothing to settle.
 - **`MergingCursor`:** heap keys are lower bounds. After every move, through every exit (the `rebuild` paths, the runner swap, the top that stays, and the pop of an exhausted top), the merge settles its top up to the runner's key until the top is settled or the heap is empty (perf287's must-fix). Each round settles the top, exhausts it, or moves it strictly past the runner's key, so the rounds end.
-- **A `lazy` flag on the merge,** set with `set_lazy` after its sources are filled and cleared by `reset`, so compaction, point gets and unfiltered scans test one bool per move (perf287's should-fix). A debug assertion on each seek catches a lazy source left in a merge that isn't lazy.
+- **A `lazy` flag on the merge,** derived from its sources (`may_park`) at every heap rebuild, so it can't be missed (perf287's nit) and compaction, point gets and unfiltered scans test one bool per move (perf287's should-fix).
+- **A lazy source checks the entry it lands on once,** as an eager one does: an admitted landing settles it at once, and a rejected one parks with its verdict kept, so settling doesn't check that entry again.
 - **The engine** builds every memtable source lazy (`mem_sources_from`). A filtered scan's lane and a filtered row read set their merge lazy.
 - **Results are unchanged by construction:** the filter is a pure function of the key, and snapshots, deletes and TTL are resolved above the merge (`CellResolver`).
 - **PR 2 (planned):**
@@ -2687,6 +2688,7 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
   - a lazy merge against the eager one, over random sources (equal keys across sources included), filters and movement sequences;
   - an error partway through a settle, then a seek;
   - equal keys across lazy sources (this hangs if a source parks on its bound);
+  - every movement method, `skip_column` returning true included (perf287's should-fix);
   - the #711 shape: a source with nothing admissible moves at most once past the merge's frontier, where eagerly it walks all 1,050 entries.
 - The pigeonhole model test adds a qualifier-prefix scan after each scan, checked against the model's answer restricted to the prefix. It draws no randomness, but fewer reads shift the shared sim fault RNG, so older failing seeds may not replay.
 - `readshapes`' `scan-interleaved` shape: a memtable source that parks once per row between an SST's admitted entries, the regime where lazy costs one sift per park.

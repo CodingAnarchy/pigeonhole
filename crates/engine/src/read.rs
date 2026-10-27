@@ -984,8 +984,6 @@ impl ScanCursor {
             }
             opts.skip_columns = skips_columns(resolver.cursor_mut().sources());
             resolver.cursor_mut().reset();
-            // A filtered scan's memtable sources are lazy (D288).
-            resolver.cursor_mut().set_lazy(!filter.is_all());
             resolver.reset(opts);
             resolver.set_upper_bound(end);
             self.lanes.push(Lane {
@@ -1593,9 +1591,6 @@ fn read_row_with(
         }
         opts.skip_columns = skips_columns(cursor.sources());
         cursor.reset();
-        // A filtered row read's memtable sources are lazy (D288): one with nothing in the
-        // row parks past it instead of walking the tablet's later rows.
-        cursor.set_lazy(!filter.is_all());
         resolver.reset(opts);
         resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;

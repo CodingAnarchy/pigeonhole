@@ -16,7 +16,7 @@ use pigeonhole_format::scan::{CompiledFilter, ScanFilter, Verdict};
 /// does not costs no more than a plain sift. With two sources every step is one comparison.
 /// After an error the cursor must be re-seeked before use.
 ///
-/// **Lazy sources (D288).** With [`MergingCursor::set_lazy`], a source may be unsettled
+/// **Lazy sources (D288).** A source may be unsettled
 /// ([`Cursor::settled`]): its key is then only a lower bound on its next entry, and it keeps
 /// its place in the heap by that bound. After every move the merge settles its top up to the
 /// key of the runner (the top's smaller child), until the top is settled or the heap is
@@ -53,8 +53,9 @@ pub struct MergingCursor<C> {
     /// The source at the top of the heap (`heap[0]`), kept beside it so `key` and `value`
     /// read it without a bounds check on the heap; 0 when the heap is empty.
     top: usize,
-    /// Whether a source may be unsettled (D288), so the top needs settling after a move. Set
-    /// by [`MergingCursor::set_lazy`]; a merge of eager sources tests only this.
+    /// Whether a source may be unsettled (D288), so the top needs settling after a move:
+    /// derived from the sources ([`Cursor::may_park`]) at every rebuild of the heap, so it
+    /// cannot be missed. A merge of eager sources tests only this.
     lazy: bool,
 }
 
@@ -70,13 +71,6 @@ impl<C: Cursor> MergingCursor<C> {
             top: 0,
             lazy: false,
         }
-    }
-
-    /// Whether any source may be lazy ([`Cursor::may_park`]): set after filling the sources,
-    /// and after each [`MergingCursor::reset`], which clears it. A lazy source in a merge
-    /// that is not lazy would be read unsettled (a debug assertion checks it on each seek).
-    pub fn set_lazy(&mut self, lazy: bool) {
-        self.lazy = lazy;
     }
 
     /// The source the cursor is on (to pin its current value without copying), or `None` if
@@ -132,6 +126,9 @@ impl<C: Cursor> MergingCursor<C> {
         *lazy = false;
     }
 
+    // Always inlined: the lazy settle's extra call site (D288) otherwise moved it out of
+    // line in every hot caller (+0.8% on the unfiltered row reads).
+    #[inline(always)]
     fn less(&self, a: usize, b: usize) -> bool {
         match compare(self.sources[a].key(), self.sources[b].key()) {
             std::cmp::Ordering::Less => true,
@@ -163,16 +160,15 @@ impl<C: Cursor> MergingCursor<C> {
 
     /// Rebuilds the heap from every valid source.
     fn rebuild(&mut self) {
-        debug_assert!(
-            self.lazy || !self.sources.iter().any(C::may_park),
-            "a lazy source in a merge that is not lazy"
-        );
         self.heap.clear();
+        let mut lazy = false;
         for (i, s) in self.sources.iter().enumerate() {
+            lazy |= s.may_park();
             if s.valid() {
                 self.heap.push(i);
             }
         }
+        self.lazy = lazy;
         for i in (0..self.heap.len() / 2).rev() {
             self.sift_down(i);
         }
@@ -189,10 +185,11 @@ impl<C: Cursor> MergingCursor<C> {
         };
     }
 
-    /// Settles the top after a move, in a lazy merge (D288); one predictable test otherwise.
+    /// Settles the top after a move, in a lazy merge (D288); one predictable test otherwise,
+    /// and one more in a lazy merge whose top landed on an admitted entry.
     #[inline]
     fn settle_top(&mut self) -> Result<(), C::Error> {
-        if self.lazy {
+        if self.lazy && !self.heap.is_empty() && !self.sources[self.top].settled() {
             self.settle_top_lazy()
         } else {
             Ok(())
@@ -221,13 +218,21 @@ impl<C: Cursor> MergingCursor<C> {
                 };
                 top.settle_until(Some(runner.key()))?;
             }
-            if self.sources[t].valid() {
-                self.sift_down(0);
-            } else {
+            let r = self.runner;
+            if !self.sources[t].valid() {
                 let last = self.heap.len() - 1;
                 self.heap.swap(0, last);
                 self.heap.pop();
                 self.sift_down(0);
+            } else if r == 0 || self.less(t, self.heap[r]) {
+                // Settled at or below the runner's key: the heap is unchanged. (Parked, the
+                // top is strictly past the runner's key, so this needs no settled test.)
+                continue;
+            } else {
+                // Parked past the runner's key, or tied with an earlier source: the runner
+                // takes its place, as after `Cursor::next`.
+                self.heap.swap(0, r);
+                self.sift_down(r);
             }
             self.set_runner();
         }
@@ -396,8 +401,11 @@ pub struct FilteredCursor<C> {
     /// Lazy mode (D288): a move only lands, and a merge settles the cursor when it reaches
     /// the merge's top. False for an unfiltered cursor, which has nothing to settle.
     lazy: bool,
-    /// In lazy mode, whether the current entry is unchecked (a lower bound only).
+    /// In lazy mode, whether the current entry is not admitted (a lower bound only).
     parked: bool,
+    /// While parked, the current entry's verdict (with its hint in `hint`), so settling
+    /// does not check it again.
+    verdict: Verdict,
 }
 
 impl<C: Cursor> FilteredCursor<C> {
@@ -410,6 +418,7 @@ impl<C: Cursor> FilteredCursor<C> {
             hint: Vec::new(),
             lazy: false,
             parked: false,
+            verdict: Verdict::Admit,
         }
     }
 
@@ -440,7 +449,6 @@ impl<C: Cursor> FilteredCursor<C> {
     ///     FilteredCursor::lazy(wanted, filter.clone()),
     ///     FilteredCursor::lazy(other, filter),
     /// ]);
-    /// m.set_lazy(true);
     /// m.seek_to_first().unwrap();
     /// assert_eq!(m.key(), &key(b"r1", b"b")[..]);
     /// // The other source parked on its first entry, past the merge's position.
@@ -466,10 +474,24 @@ impl<C: Cursor> FilteredCursor<C> {
             return Ok(());
         }
         if self.lazy {
-            self.parked = true;
+            self.land();
             return Ok(());
         }
         self.settle_filtered()
+    }
+
+    /// Lazy mode: checks the entry a move landed on, once. Admitted, the cursor is settled;
+    /// otherwise it parks there and keeps the verdict for [`Cursor::settle_until`].
+    #[inline]
+    fn land(&mut self) {
+        self.parked = false;
+        if self.inner.valid() {
+            let v = self.filter.check(self.inner.key(), &mut self.hint);
+            if v != Verdict::Admit {
+                self.parked = true;
+                self.verdict = v;
+            }
+        }
     }
 
     fn settle_filtered(&mut self) -> Result<(), C::Error> {
@@ -503,23 +525,31 @@ impl<C: Cursor> Cursor for FilteredCursor<C> {
         self.lazy
     }
 
-    /// The eager filter's loop, parking on the first entry strictly past `bound`.
+    /// The eager filter's loop, parking on the first entry strictly past `bound`. The entry
+    /// it is parked on was checked when the cursor landed there: its verdict is acted on
+    /// without a second check.
     fn settle_until(&mut self, bound: Option<&[u8]>) -> Result<(), C::Error> {
         if !self.parked {
             return Ok(());
         }
-        while self.inner.valid() {
+        let mut verdict = self.verdict;
+        loop {
             if let Some(b) = bound
                 && compare(self.inner.key(), b) == std::cmp::Ordering::Greater
             {
+                self.verdict = verdict;
                 return Ok(());
             }
-            match self.filter.check(self.inner.key(), &mut self.hint) {
+            match verdict {
                 Verdict::Admit => break,
                 Verdict::SkipRow => self.inner.skip_row()?,
                 Verdict::Seek => self.inner.seek(&self.hint)?,
                 Verdict::Next => self.inner.next()?,
             }
+            if !self.inner.valid() {
+                break;
+            }
+            verdict = self.filter.check(self.inner.key(), &mut self.hint);
         }
         self.parked = false;
         Ok(())

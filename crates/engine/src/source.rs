@@ -235,9 +235,9 @@ pub(crate) fn mem_sources(set: &MemSet, filter: &ScanFilter, out: &mut Vec<Sourc
     mem_sources_from(&set.readers, filter, out);
 }
 
-/// Memtable sources over `readers`, in their order. Filtered ones are lazy (D288): the merge
-/// over them must be set lazy (`MergingCursor::set_lazy`) when `filter` is not
-/// [`ScanFilter::all`].
+/// Memtable sources over `readers`, in their order. Filtered ones are lazy (D288): a scan's or
+/// a row read's merge settles them only up to its frontier, so one with nothing in the read's
+/// range near its position parks instead of walking the tablet's later rows.
 pub(crate) fn mem_sources_from(
     readers: &[MemtableReader],
     filter: &ScanFilter,

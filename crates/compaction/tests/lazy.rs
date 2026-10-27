@@ -10,7 +10,7 @@ use std::rc::Rc;
 
 use pigeonhole_compaction::{FilteredCursor, MergingCursor, VecCursor};
 use pigeonhole_format::Cursor;
-use pigeonhole_format::key::{Kind, encode_key};
+use pigeonhole_format::key::{Kind, SUFFIX_LEN, encode_key};
 use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use proptest::prelude::*;
 
@@ -77,6 +77,22 @@ impl Cursor for Probe {
         self.moved()?;
         self.inner.next().map_err(|e| e.to_string())
     }
+
+    /// Passes the rest of `column` in one call (as a memtable's stale-tail index does), so
+    /// the merge's `skip_column -> true` path runs.
+    fn skip_column(&mut self, column: &[u8]) -> Result<bool, String> {
+        self.moved()?;
+        self.inner.next().map_err(|e| e.to_string())?;
+        while self.inner.valid() && in_column(self.inner.key(), column) {
+            self.inner.next().map_err(|e| e.to_string())?;
+        }
+        Ok(true)
+    }
+}
+
+/// Whether `key` is an entry of `column` (an internal key without its suffix).
+fn in_column(key: &[u8], column: &[u8]) -> bool {
+    key.len() == column.len() + SUFFIX_LEN && key.starts_with(column)
 }
 
 /// An internal key from a small space, so sources share keys: three rows, three qualifiers,
@@ -140,6 +156,8 @@ enum Op {
     SeekForward(usize),
     Next,
     SkipRow,
+    /// Past the current entry's column: only the top moves.
+    SkipColumn,
 }
 
 fn ops() -> impl Strategy<Value = Vec<Op>> {
@@ -150,6 +168,7 @@ fn ops() -> impl Strategy<Value = Vec<Op>> {
             3 => (0..KEYS).prop_map(Op::SeekForward),
             8 => Just(Op::Next),
             2 => Just(Op::SkipRow),
+            3 => Just(Op::SkipColumn),
         ],
         1..60,
     )
@@ -174,9 +193,7 @@ fn merge(sources: &[Entries], filter: &ScanFilter, lazy: bool) -> (Merge, Vec<Rc
             }
         })
         .collect();
-    let mut m = MergingCursor::new(cursors);
-    m.set_lazy(lazy);
-    (m, moves)
+    (MergingCursor::new(cursors), moves)
 }
 
 fn at(m: &Merge) -> Option<(Vec<u8>, Vec<u8>)> {
@@ -196,6 +213,13 @@ fn apply(m: &mut Merge, op: &Op, target_floor: Option<&[u8]>) -> Result<(), Stri
         }
         Op::Next => m.next(),
         Op::SkipRow => m.skip_row(),
+        // The column of the eager merge's current entry (the floor), which both merges are on.
+        Op::SkipColumn => match target_floor {
+            Some(k) => m
+                .skip_column(&k[..k.len() - SUFFIX_LEN])
+                .map(|moved| assert!(moved)),
+            None => Ok(()),
+        },
     }
 }
 
