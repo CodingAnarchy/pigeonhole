@@ -203,3 +203,64 @@ fn a_blocking_wait_in_a_turn_leaves_a_siblings_io_to_complete() {
     rt.shutdown().unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }
+
+/// D289 PR 2: shards move between drivers while their reads are in flight on io_uring. A
+/// shard moves only once its driver's ring is quiet, so every read completes on the ring
+/// that submitted it and every task finishes, under a resize every millisecond.
+#[test]
+fn shards_move_between_drivers_with_reads_in_flight() {
+    let dir = std::env::temp_dir().join(format!(
+        "pigeonhole-runtime-driver-ring-moves-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let vfs = UringVfs::new().expect("io_uring is available");
+    let file = vfs
+        .open(&dir.join("f"), OpenOptions::read_write_create())
+        .unwrap();
+    let mut buf = IoBuf::zeroed(4096);
+    buf.fill(7);
+    file.write_at(&buf, 0).unwrap();
+    let mut c = RuntimeConfig::new(vfs);
+    c.shards = 4;
+    c.adaptive_drivers = true;
+    c.pin_threads = false;
+    let rt = Runtime::start(c, (0..4).map(|_| Handler).collect()).unwrap();
+    let force = rt.driver_control();
+    let stop = Arc::new(AtomicBool::new(false));
+    let churn = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut k = 1;
+            while !stop.load(Ordering::Acquire) {
+                force(Some(k));
+                k = if k == 1 { 2 } else { 1 };
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        })
+    };
+    let (report, reports) = mpsc::channel();
+    let tasks = 400;
+    for i in 0..tasks {
+        rt.submitter(ShardId((i % 4) as u16))
+            .submit(Msg::Spawn(Box::new(ReadAndWait {
+                file: Arc::clone(&file),
+                read: None,
+                report: report.clone(),
+            })))
+            .unwrap();
+    }
+    let mut done = 0;
+    while done < tasks {
+        match reports.recv_timeout(Duration::from_secs(10)) {
+            Ok(Report::Done { .. }) => done += 1,
+            Ok(Report::Submitted { .. }) => {}
+            Err(e) => panic!("{done} of {tasks} reads finished: {e}"),
+        }
+    }
+    stop.store(true, Ordering::Release);
+    churn.join().unwrap();
+    assert!(rt.driver_moves() > 0, "no shard moved");
+    rt.shutdown().unwrap();
+    let _ = std::fs::remove_dir_all(dir);
+}

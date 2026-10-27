@@ -22,6 +22,10 @@ enum Mode {
     Engine,
     /// Engine-owned with the shards on this many driver threads (D289).
     EngineDrivers(usize),
+    /// Engine-owned with drivers sized by the controller (D289 PR 2), and a thread forcing
+    /// the target through 1, 2, 3 and back every millisecond, so shards keep moving between
+    /// drivers under the test's traffic.
+    EngineChurn,
     App,
     /// Application-owned with this many background workers (D284), each driven by a thread
     /// of the test's.
@@ -31,6 +35,11 @@ enum Mode {
 /// A running runtime in either mode, behind one interface.
 enum Harness<H: ShardHandler> {
     Engine(Runtime<H>),
+    Churn {
+        rt: Runtime<H>,
+        stop: Arc<AtomicBool>,
+        churn: JoinHandle<()>,
+    },
     App {
         submitters: Vec<Submitter<H::Msg>>,
         stop: Arc<AtomicBool>,
@@ -48,6 +57,25 @@ impl<H: ShardHandler> Harness<H> {
                 let mut config = config;
                 config.shard_threads = k;
                 Harness::Engine(Runtime::start(config, handlers).unwrap())
+            }
+            Mode::EngineChurn => {
+                let mut config = config;
+                config.adaptive_drivers = true;
+                let rt = Runtime::start(config, handlers).unwrap();
+                let force = rt.driver_control();
+                let stop = Arc::new(AtomicBool::new(false));
+                let churn = {
+                    let stop = Arc::clone(&stop);
+                    thread::spawn(move || {
+                        let mut k = 1;
+                        while !stop.load(Ordering::Acquire) {
+                            force(Some(k));
+                            k = k % 3 + 1;
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    })
+                };
+                Harness::Churn { rt, stop, churn }
             }
             Mode::App | Mode::AppWorkers(_) => {
                 let slice = config.time_slice.as_nanos() as u64;
@@ -125,7 +153,7 @@ impl<H: ShardHandler> Harness<H> {
 
     fn submitter(&self, shard: u16) -> Submitter<H::Msg> {
         match self {
-            Harness::Engine(rt) => rt.submitter(ShardId(shard)),
+            Harness::Engine(rt) | Harness::Churn { rt, .. } => rt.submitter(ShardId(shard)),
             Harness::App { submitters, .. } => submitters[usize::from(shard)].clone(),
         }
     }
@@ -134,6 +162,11 @@ impl<H: ShardHandler> Harness<H> {
     fn finish<R>(self, f: impl Fn(&mut H) -> R) -> Vec<R> {
         match self {
             Harness::Engine(rt) => rt.shutdown().unwrap().iter_mut().map(f).collect(),
+            Harness::Churn { rt, stop, churn } => {
+                stop.store(true, Ordering::Release);
+                churn.join().unwrap();
+                rt.shutdown().unwrap().iter_mut().map(f).collect()
+            }
             Harness::App {
                 stop,
                 threads,
@@ -807,6 +840,29 @@ macro_rules! with_drivers {
     };
 }
 
+/// The suite with shards moving between drivers throughout (D289 PR 2's moves).
+macro_rules! with_churn {
+    ($($name:ident),* $(,)?) => {
+        mod engine_owned_churning_drivers {
+            $(#[test] fn $name() { super::$name(super::Mode::EngineChurn) })*
+        }
+    };
+}
+
+with_churn!(
+    echo_sync_and_async,
+    per_producer_fifo_and_batching,
+    cross_shard_forwarding,
+    current_shard_is_set_on_shard_threads,
+    background_task_runs_to_completion,
+    blocked_task_is_woken,
+    shutdown_handles_queued_then_refuses,
+    dropped_notifier_resolves_none,
+    many_round_trips_no_lost_wakeup,
+    sleeping_task_fires_on_time_real,
+    sleeping_task_is_woken_early,
+);
+
 with_drivers!(
     echo_sync_and_async,
     per_producer_fifo_and_batching,
@@ -1114,6 +1170,41 @@ fn a_driver_charges_its_spin_to_the_shards_that_worked() {
         "shard 1 never worked"
     );
     rt.shutdown().unwrap();
+}
+
+/// D289 PR 2: shards move between drivers under traffic. With the target forced through
+/// 1, 2 and 4 drivers while every shard echoes round trips, shards are handed over many
+/// times, every reply arrives, and shutdown returns every handler in shard order.
+#[test]
+fn shards_move_between_drivers_under_traffic() {
+    let (mut cfg, _) = sim_config(4);
+    cfg.adaptive_drivers = true;
+    let rt = Runtime::start(cfg, handlers(4)).unwrap();
+    let force = rt.driver_control();
+    for round in 0..300u64 {
+        force(Some([1, 2, 4][(round % 3) as usize]));
+        for shard in 0..4u16 {
+            let (n, w) = completion();
+            rt.submitter(ShardId(shard))
+                .submit(Msg::Echo(round, n))
+                .unwrap();
+            assert_eq!(w.wait().unwrap(), round, "shard {shard}, round {round}");
+        }
+    }
+    assert!(rt.driver_moves() > 100, "only {} moves", rt.driver_moves());
+    force(None);
+    for shard in 0..4u16 {
+        rt.submitter(ShardId(shard))
+            .submit(Msg::Record {
+                producer: 0,
+                seq: u32::from(shard),
+            })
+            .unwrap();
+    }
+    let hs = rt.shutdown().unwrap();
+    for (i, h) in hs.iter().enumerate() {
+        assert_eq!(h.records, [(0, i as u32)]);
+    }
 }
 
 #[test]
