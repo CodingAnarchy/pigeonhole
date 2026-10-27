@@ -1524,6 +1524,8 @@ pub(crate) fn read_row_into(
         let cpu = crate::phases759::thread_cpu_ns().saturating_sub(c0);
         let miss_ns = pigeonhole_sst::MISS_NS.with(std::cell::Cell::get).saturating_sub(m0);
         crate::phases759::record(total, cpu, misses, miss_ns);
+    } else {
+        let _ = pigeonhole_sst::MISS_LOG.try_with(|m| m.borrow_mut().clear());
     }
     // Whatever happened, the sources (each pins its memtable or SST) and the options (merge
     // operator, blob reader) go now; only the allocations stay, unless a large value grew

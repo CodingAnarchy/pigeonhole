@@ -555,6 +555,9 @@ impl Blocks {
         let data = decode_physical(buf, kind, self.pool(fill_cache))?;
         let h = self.admit(addr, data, fill_cache, priority);
         crate::MISS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+        if FILE_READS_ON() {
+            let _ = crate::MISS_LOG.try_with(|l| l.borrow_mut().push((kind as u8, self.id)));
+        }
         Ok(h)
     }
 
@@ -581,6 +584,9 @@ impl Blocks {
         let data = decode_physical(buf, kind, self.pool(fill_cache))?;
         let h = self.admit(addr, data, fill_cache, priority);
         crate::MISS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+        if FILE_READS_ON() {
+            let _ = crate::MISS_LOG.try_with(|l| l.borrow_mut().push((kind as u8, self.id)));
+        }
         Ok(h)
     }
 
@@ -684,4 +690,10 @@ impl Blocks {
         };
         cache.insert(self.key(addr), data, priority)
     }
+}
+
+/// SCRATCH #759: whether `counting_file_reads` runs on this thread (only reads log misses).
+#[allow(non_snake_case)]
+fn FILE_READS_ON() -> bool {
+    crate::FILE_READS.with(|c| c.get().is_some())
 }

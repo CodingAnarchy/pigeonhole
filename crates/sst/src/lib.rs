@@ -94,6 +94,8 @@ pub fn counting_file_reads<T>(f: impl FnOnce() -> T) -> (T, u64) {
 thread_local! {
     /// SCRATCH #759: nanoseconds this thread spent reading and decoding missed blocks.
     pub static MISS_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// SCRATCH #759: each missed block's kind and SST, for the engine to drain per read.
+    pub static MISS_LOG: std::cell::RefCell<Vec<(u8, pigeonhole_format::SstId)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Counts a block read from the file, if `counting_file_reads` is running.
