@@ -51,6 +51,33 @@ pub trait Cursor {
         Ok(false)
     }
 
+    /// Whether the current entry is one the cursor yields, or only a lower bound on the next
+    /// entry it yields (D288). Only a cursor in a lazy mode ([`Cursor::may_park`]) is ever
+    /// unsettled, and only a merging cursor that knows it may be reads one: it settles a
+    /// source with [`Cursor::settle_until`] when the source reaches its top. The default is
+    /// always settled.
+    #[inline]
+    fn settled(&self) -> bool {
+        true
+    }
+
+    /// Moves an unsettled cursor forward to the next entry it yields, but parks (stays
+    /// unsettled) on the first entry whose key is strictly greater than `bound`, by
+    /// [`crate::key::compare`]; `None` settles fully. An entry equal to `bound` is checked, not
+    /// parked on, so a merge that settles its top up to the next source's key always either
+    /// settles it or passes that key. The default does nothing (always settled).
+    fn settle_until(&mut self, bound: Option<&[u8]>) -> Result<(), Self::Error> {
+        let _ = bound;
+        Ok(())
+    }
+
+    /// Whether the cursor may be unsettled after a move (a lazy filtered source, D288): a
+    /// merging cursor over it must settle its top. The default never is.
+    #[inline]
+    fn may_park(&self) -> bool {
+        false
+    }
+
     /// Advances past every remaining entry of the current row. Sources with a row-start table
     /// override this to skip without decoding; the default steps with [`Cursor::next`].
     fn skip_row(&mut self) -> Result<(), Self::Error> {

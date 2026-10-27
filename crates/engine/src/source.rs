@@ -118,6 +118,31 @@ impl Cursor for Source {
         }
     }
 
+    /// A filtered memtable is lazy under a scan's or a row read's merge (D288); an SST
+    /// settles itself.
+    #[inline]
+    fn settled(&self) -> bool {
+        match self {
+            Source::Mem(it) => it.settled(),
+            _ => true,
+        }
+    }
+
+    fn settle_until(&mut self, bound: Option<&[u8]>) -> Result<()> {
+        match self {
+            Source::Mem(it) => Ok(it.settle_until(bound)?),
+            _ => Ok(()),
+        }
+    }
+
+    #[inline]
+    fn may_park(&self) -> bool {
+        match self {
+            Source::Mem(it) => it.may_park(),
+            _ => false,
+        }
+    }
+
     /// A memtable with a stale-tail index jumps (D194); an SST passes the column's entries
     /// from its block headers (ICR 0041).
     #[inline]
@@ -210,14 +235,16 @@ pub(crate) fn mem_sources(set: &MemSet, filter: &ScanFilter, out: &mut Vec<Sourc
     mem_sources_from(&set.readers, filter, out);
 }
 
-/// Memtable sources over `readers`, in their order.
+/// Memtable sources over `readers`, in their order. Filtered ones are lazy (D288): the merge
+/// over them must be set lazy (`MergingCursor::set_lazy`) when `filter` is not
+/// [`ScanFilter::all`].
 pub(crate) fn mem_sources_from(
     readers: &[MemtableReader],
     filter: &ScanFilter,
     out: &mut Vec<Source>,
 ) {
     for r in readers {
-        out.push(Source::Mem(FilteredCursor::new(r.iter(), filter.clone())));
+        out.push(Source::Mem(FilteredCursor::lazy(r.iter(), filter.clone())));
     }
 }
 

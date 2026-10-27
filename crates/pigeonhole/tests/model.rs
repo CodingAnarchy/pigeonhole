@@ -2039,6 +2039,70 @@ impl Run {
                             ));
                         }
                     }
+                    // The same scan filtered to one qualifier prefix, through the lazy merge
+                    // of filtered sources (D288). A prefix selects whole columns, so the
+                    // model's answer is its unfiltered one restricted to them. The prefix
+                    // comes from the scan's start, so a seed's operations are unchanged.
+                    let prefix = format!("q{}", start.last().map_or(0, |b| b % 4)).into_bytes();
+                    let mut scan = self
+                        .table(i)
+                        .scan_bounds(Bound::Included(&start), Bound::Excluded(&end))
+                        .qualifier_prefix(&prefix);
+                    if let Some((s, _)) = &snap {
+                        scan = scan.snapshot(s);
+                    }
+                    let got: pigeonhole::Result<Rows> = scan.iter().and_then(|it| {
+                        it.map(|r| r.map(|r| (r.key().to_vec(), owned_cells(&r))))
+                            .collect()
+                    });
+                    let want = self
+                        .model
+                        .try_scan(
+                            name,
+                            Bound::Included(&start),
+                            Bound::Excluded(&end),
+                            &[],
+                            ms,
+                            now,
+                        )
+                        .map(|rows| {
+                            rows.into_iter()
+                                .filter_map(|(row, cells)| {
+                                    let cells: Vec<_> = cells
+                                        .into_iter()
+                                        .filter(|c| c.qualifier.starts_with(&prefix))
+                                        .collect();
+                                    (!cells.is_empty()).then_some((row, cells))
+                                })
+                                .collect::<Rows>()
+                        });
+                    match (got, want) {
+                        (Ok(g), Ok(w)) => {
+                            if let Some(d) = first_diff(&g, &w) {
+                                return Err(format!(
+                                    "scan of {name} for prefix {} (model seqno {ms}): {d}",
+                                    text(&prefix)
+                                ));
+                            }
+                        }
+                        (Err(e), _) if self.armed && self.fired() => {
+                            return self.recover_fired(&e);
+                        }
+                        (Err(e), _) if self.failed_over() => {
+                            return self.recover_in_place(&format!("read: {e}"), None);
+                        }
+                        (Err(e), _) if self.injected(&e) => {}
+                        (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
+                            if e.code() == ErrorCode::MergeFailed => {}
+                        (g, w) => {
+                            return Err(format!(
+                                "scan of {name} for prefix {}: store {:?} vs model {:?}",
+                                text(&prefix),
+                                g.map(|_| ()),
+                                w.map(|_| ())
+                            ));
+                        }
+                    }
                 }
             }
             Op::Snapshot => {
