@@ -44,6 +44,12 @@ pub(crate) struct Settings {
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
     pub(crate) shard_threads: Option<usize>,
+    /// Flush and compaction threads (`Options::compaction_cores`, D252); the library
+    /// default when not set.
+    pub(crate) compaction_cores: Option<usize>,
+    /// `Options::cpu_profile(CpuProfile::Server)` (D289) when set; the embedded default
+    /// otherwise.
+    pub(crate) server_profile: bool,
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
@@ -382,6 +388,35 @@ impl PigeonholeRunner {
         self
     }
 
+    /// Flush and compaction threads (`Options::compaction_cores`, D252); the library
+    /// default when not set.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("compaction_cores"));
+    /// let r = PigeonholeRunner::default().compaction_cores(8);
+    /// assert!(r.describe().contains(" compaction_cores=8"));
+    /// ```
+    pub fn compaction_cores(mut self, c: usize) -> Self {
+        self.settings.compaction_cores = Some(c);
+        self
+    }
+
+    /// The server CPU profile (`Options::cpu_profile(CpuProfile::Server)`, D289): the
+    /// engine's threads take all but a small headroom of the cores.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("profile=server"));
+    /// assert!(PigeonholeRunner::default().server_profile().describe().contains(" profile=server"));
+    /// ```
+    pub fn server_profile(mut self) -> Self {
+        self.settings.server_profile = true;
+        self
+    }
+
     /// A blocking `None`/`Buffered` commit's spin before it parks, in microseconds
     /// (`Options::commit_spin`, D253); the library default when not set.
     ///
@@ -617,6 +652,12 @@ pub(crate) fn options(s: &Settings) -> Options {
     }
     if let Some(k) = s.shard_threads {
         options = options.shard_threads(k);
+    }
+    if let Some(c) = s.compaction_cores {
+        options = options.compaction_cores(c);
+    }
+    if s.server_profile {
+        options = options.cpu_profile(pigeonhole::CpuProfile::Server);
     }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
@@ -866,7 +907,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -895,6 +936,13 @@ impl Runner for PigeonholeRunner {
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
             s.shard_threads
                 .map_or_else(String::new, |k| format!(" shard_threads={k}")),
+            s.compaction_cores
+                .map_or_else(String::new, |c| format!(" compaction_cores={c}")),
+            if s.server_profile {
+                " profile=server"
+            } else {
+                ""
+            },
             s.commit_spin_micros
                 .map_or_else(String::new, |us| format!(" commit_spin={us}us")),
             match (s.presplit, s.presplit_writes) {

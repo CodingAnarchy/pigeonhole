@@ -1396,26 +1396,41 @@ fn the_default_shard_count_is_one_per_physical_core() {
 }
 
 #[test]
-fn engine_owned_mode_defaults_to_compaction_threads() {
-    // D252: one compaction thread per four shards, at least one and at most four; an
-    // explicit 0 keeps flush and compaction on the shards.
-    for (shards, cores, started) in [
-        (2, None, 3),
-        (8, None, 10),
-        (20, None, 24),
-        (2, Some(0), 2),
-        (2, Some(3), 5),
+fn engine_owned_mode_sizes_its_threads_from_the_cpu_budget() {
+    // D289 (ICR 0081): with nothing set, the driver and compaction threads come from the
+    // CPU budget of the machine running the test, so only their bounds are checked here
+    // (the formula's tables are unit tests in `options.rs`): at least one of each, at most
+    // one per shard. Explicit settings are kept as given: `shard_threads(0)` is a thread
+    // per shard, `compaction_cores(0)` keeps flush and compaction on the shards.
+    for shards in [2, 8, 20] {
+        let vfs = SimVfs::new(5);
+        let o = sim_options(&vfs).shards(shards).pin_threads(false);
+        let db = Pigeonhole::open("/db/x.phdb", o).unwrap();
+        let started = db.engine_metrics().threads_started;
+        assert!(
+            (2..=2 * shards as u64).contains(&started),
+            "{shards} shards: {started} threads"
+        );
+        db.close().unwrap();
+    }
+    for (shards, drivers, cores, started) in [
+        (2, 0, 0, 2),
+        (2, 0, 3, 5),
+        (8, 2, 1, 3),
+        (20, 4, 4, 8),
+        (20, 0, 4, 24),
     ] {
         let vfs = SimVfs::new(5);
-        let mut o = sim_options(&vfs).shards(shards).pin_threads(false);
-        if let Some(k) = cores {
-            o = o.compaction_cores(k);
-        }
+        let o = sim_options(&vfs)
+            .shards(shards)
+            .pin_threads(false)
+            .shard_threads(drivers)
+            .compaction_cores(cores);
         let db = Pigeonhole::open("/db/x.phdb", o).unwrap();
         assert_eq!(
             db.engine_metrics().threads_started,
             started,
-            "{shards} shards, compaction_cores {cores:?}"
+            "{shards} shards, shard_threads {drivers}, compaction_cores {cores}"
         );
         db.close().unwrap();
     }
