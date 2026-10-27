@@ -304,9 +304,10 @@ fn flush_gc(
         pigeonhole_compaction::GcPolicy::new(crate::compact::gc_snapshots(shared), now, false);
     policy.no_outside_deletes = item.guard.is_some();
     // D287: a counter family's operands combine, guarded by the slot's other sources. Read
-    // points created since the memtable was queued are at or above its largest seqno (it
-    // froze at or below `durable_seqno`, and both watermarks only grow), so they never split
-    // its operands.
+    // points created since the memtable was queued (snapshots, durable snapshots and reader
+    // processes' pins, whose oldest the GC keeps) are at or above its largest seqno: it froze
+    // at or below `durable_seqno`, and both watermarks only grow. So they never split its
+    // operands.
     policy.other_sources = item.counter_sources.clone();
     // The record (test hook) describes the real GC, so a deliberate fault below shows up.
     let real = policy.clone();

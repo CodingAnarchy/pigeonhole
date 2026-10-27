@@ -2612,7 +2612,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 3. **A cross-shard share not applied here yet lands above.** Once decided, its apply seqno is held (`CROSS_HELD`, D278), and `durable_seqno` stays below it; M froze at or below `durable_seqno`. Undecided, its apply seqno isn't reserved yet. So prepared shares aren't listed: their commit id (D263) is never applied.
 0. **Open and replay** flush recovered memtables without GC (`write_memtable`), including a replay that spills and the open's flush after a spill or a layout change, so they combine nothing. A recovered memtable kept by a same-layout open holds only its slot's records above the slot's flushed-through, with the allocator seeded above them, so its later flush meets 1–3, though replay itself isn't in seqno order.
 
-**Read points:** the flush's GC takes them when it runs. One created after M was queued reads at `visible_seqno` or `durable_seqno`, both ≥ `hi`, so it never splits M's operands. One released meanwhile only merges stripes nobody reads.
+**Read points:** the flush's GC takes them when it runs: live snapshots, durable snapshots, and the oldest reader process's pin. One created after M was queued (a snapshot, or a reader process pinning a view) reads at `visible_seqno` or `durable_seqno`, both ≥ `hi`, so it never splits M's operands. One released meanwhile only merges stripes nobody reads.
 
 **How:**
 - The shard records the slot's other sources in the `FlushItem` when it queues a counter family's flush (`counter_sources`, in `freeze_with` and `requeue_frozen`): the slot's SSTs with their key and seqno ranges, and its other memtables (exact ranges for frozen ones, unbounded above for the active one). Sources starting above `hi` are left out.

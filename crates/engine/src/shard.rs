@@ -4295,7 +4295,10 @@ impl ShardState {
                 continue;
             };
             let counter = meta.options.kind == FamilyKind::Counter;
-            let fam = view.ssts.family(key.0, key.1).cloned();
+            // Only a counter family's flush lists the slot's SSTs (D287).
+            let fam = counter
+                .then(|| view.ssts.family(key.0, key.1).cloned())
+                .flatten();
             let item =
                 |m: &MemEntry,
                  guard: Option<Arc<PurgeGuard>>,
@@ -4850,8 +4853,8 @@ impl ShardState {
                         && flush_guard(slot, m.table.root(), &self.prepared, &view, key))
                     .then(|| guard_state(&mut self.guarded, m.table.root(), key.1)),
                     options: meta.options.clone(),
-                    // As when first queued (D287): only other flushes (below) and writes
-                    // (above) changed the slot since.
+                    // As when first queued (D287): only other flushes and compactions of the
+                    // slot's older SSTs (below) and writes (above) changed the slot since.
                     counter_sources: (meta.options.kind == FamilyKind::Counter)
                         .then(|| {
                             counter_sources(
