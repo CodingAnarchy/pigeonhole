@@ -1508,6 +1508,9 @@ pub(crate) enum ShardMsg {
     },
     /// The manifest changed: score the shard's slots for compaction, refresh stalls.
     Maintain,
+    /// The running compaction submitted its commit: its output is the manifest request's
+    /// now, so a close no longer waits for it (#991).
+    CompactionCommitting,
     /// A compaction task finished.
     CompactionDone {
         inputs: Vec<SstId>,
@@ -2864,6 +2867,8 @@ pub(crate) struct ShardState {
     /// land below that bound, among the inputs' timestamps, voids it before it installs and
     /// waits while it installs.
     compaction_guard: Option<CompactionGuard>,
+    /// The running compaction submitted its commit (`CompactionCommitting`).
+    compaction_committing: bool,
     /// Consecutive voided compactions per slot: at `PURGE_VOID_LIMIT` the slot compacts
     /// without the purge below `min_ts_above` (and so without a guard), so a backfill
     /// written newest to oldest cannot keep it from installing.
@@ -3313,6 +3318,7 @@ impl ShardState {
             guarded: Vec::new(),
             voided_roots: HashSet::new(),
             compaction_guard: None,
+            compaction_committing: false,
             purge_voids: HashMap::new(),
             pending_rows: FastMap::default(),
             pending_reads: FastMap::default(),
@@ -9589,6 +9595,7 @@ impl ShardState {
             }
         };
         self.compaction = Some(key);
+        self.compaction_committing = false;
         self.compaction_guard = guard;
         ctx.spawn(Box::new(work));
         Ok(())
@@ -9616,6 +9623,7 @@ impl ShardState {
             }
         }
         let key = self.compaction.take();
+        self.compaction_committing = false;
         let full = std::mem::take(&mut self.compaction_full);
         // A write voided the purge before its commit (#316): the commit was refused, and
         // the slot compacts again at once with a fresh bound (not a failure).
@@ -9674,6 +9682,15 @@ impl ShardState {
                     self.id.0
                 );
             }
+            // Stopped by the close before its commit, its output freed (#991): not a
+            // failure, and nothing compacts again.
+            Err(Error::Closed) if self.closing => {
+                if full && let Some((_, reply, _)) = self.compact_all.pop_front() {
+                    self.full_purged.clear();
+                    reply.notify(Err(Error::Closed));
+                }
+                trace!("shard {} compaction stopped by the close", self.id.0);
+            }
             Err(e) => {
                 // A full compaction reports the failure to its caller. A background one is
                 // nobody's (a later `compact` must not inherit it, issue #141): it backs off,
@@ -9698,6 +9715,8 @@ impl ShardState {
         }
         self.maintain(ctx);
         self.progress_op(ctx);
+        // A close waits for the running compaction (#991).
+        self.try_finish_close(ctx);
     }
 
     // ---- close ----
@@ -9938,7 +9957,13 @@ impl ShardState {
             self.close_stage = CloseStage::Checkpointing;
         }
         if self.close_stage == CloseStage::Checkpointing {
-            if self.checkpoint_inflight {
+            // A running compaction stops at its next slice and frees its output (#991): the
+            // close reports after it, so a closed instance's file holds no extents of a job
+            // that never installed. One that submitted its commit is not waited for here: its
+            // output is the manifest request's, which the final close waits for.
+            if self.checkpoint_inflight
+                || (self.compaction.is_some() && !self.compaction_committing)
+            {
                 return;
             }
             self.close_stage = CloseStage::Reported;
@@ -10277,6 +10302,10 @@ impl ShardState {
                     self.try_finish_close(ctx);
                 }
             }
+            ShardMsg::CompactionCommitting => {
+                self.compaction_committing = true;
+                self.try_finish_close(ctx);
+            }
             ShardMsg::CompactionDone {
                 inputs,
                 result,
@@ -10365,6 +10394,22 @@ impl ShardState {
                     self.closing = true;
                     self.close_stage = CloseStage::Draining;
                     self.shared.closing.store(true, Ordering::Release);
+                    // Held compactions (test hook) run again: they see the close and stop,
+                    // which the close waits for (#991). Woken outside the lock.
+                    #[cfg(feature = "test-hooks")]
+                    {
+                        let held = std::mem::take(
+                            &mut *self
+                                .shared
+                                .hooks
+                                .compaction_held
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner),
+                        );
+                        for (_, w) in held {
+                            w.wake();
+                        }
+                    }
                     // Queued tablet changes never start; the running one finishes if it is
                     // committing and is given up otherwise, so close never waits on the
                     // drain of a change (or the commits parked behind it, #102).
