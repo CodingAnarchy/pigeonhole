@@ -972,6 +972,10 @@ impl Engine {
         let tablets = Arc::new(TabletMap::build(1, &catalog.tablets()));
         let manifest_version = pager.root().manifest_version;
         let cache = block_cache(options.block_cache_bytes, shards);
+        // SCRATCH #759: PHDB_PREPOP=1 has flushes insert their data blocks into the cache.
+        if std::env::var_os("PHDB_PREPOP").is_some() {
+            let _ = pigeonhole_sst::PREPOP_CACHE.set(Arc::clone(&cache));
+        }
         let live_views = Arc::new(LiveViews::default());
         // A memtable's allocation grows a chunk at a time: a threshold at or below one chunk
         // would freeze it at its first insert.
@@ -1022,7 +1026,17 @@ impl Engine {
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
-            picker: options.compaction.clone(),
+            picker: {
+                // SCRATCH #759: PHDB_L0_TRIGGER=<n> overrides the L0 trigger (fewer L0 files per read).
+                let mut p = options.compaction.clone();
+                if let Some(n) = std::env::var("PHDB_L0_TRIGGER")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    p.l0_trigger = n;
+                }
+                p
+            },
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),

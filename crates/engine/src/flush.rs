@@ -507,6 +507,7 @@ impl FlushTask {
                     item.tablet,
                 );
                 options.created_micros = self.shared.vfs.now_micros();
+                options.prepopulate = pigeonhole_sst::PREPOP_CACHE.get().is_some();
                 self.sink = Some(
                     SstSink::new(
                         Arc::clone(&self.shared.pager),

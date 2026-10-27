@@ -102,7 +102,11 @@ impl Stats {
             let c = b.count.max(1) as f64;
             out += &format!(
                 "{lo}-{} {} {:.2}% {:.1} {:.1} {:.1} {:.1} {:.1} {:.2} {:.1}% {:.2} {:.1} {:.1}%\n",
-                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                if hi == u64::MAX {
+                    "inf".into()
+                } else {
+                    hi.to_string()
+                },
                 b.count,
                 100.0 * b.count as f64 / n.max(1) as f64,
                 b.total as f64 / c / 1e3,
@@ -122,10 +126,19 @@ impl Stats {
         let mut lo = 0;
         for (b, &hi) in self.buckets.iter().zip(&EDGES_US) {
             let c = b.count.max(1) as f64;
-            let f = |v: &[u64]| v.iter().map(|x| format!("{:.3}", *x as f64 / c)).collect::<Vec<_>>().join(" ");
+            let f = |v: &[u64]| {
+                v.iter()
+                    .map(|x| format!("{:.3}", *x as f64 / c))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             out += &format!(
                 "{lo}-{} | {} | {} | {} | {}\n",
-                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                if hi == u64::MAX {
+                    "inf".into()
+                } else {
+                    hi.to_string()
+                },
                 f(&b.kind[1..]),
                 f(&b.mlevel),
                 f(&b.probed),
@@ -223,4 +236,9 @@ pub fn add(i: usize, ns: u64) {
         }
         c.set(v);
     });
+}
+
+/// SCRATCH #759: data blocks flushes have inserted into the cache (`PHDB_PREPOP`).
+pub fn prepop_blocks() -> u64 {
+    pigeonhole_sst::PREPOP_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
 }

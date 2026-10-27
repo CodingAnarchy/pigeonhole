@@ -276,12 +276,37 @@ impl Writer {
         )?;
         self.data.reset();
         let len = (self.out.len() - start) as u32;
+        if self.opts.prepopulate {
+            self.prepopulate(offset, start)?;
+        }
         self.props.data_blocks += 1;
         self.pending = Some(BlockAddr { offset, len });
         self.check_room(offset + u64::from(len))?;
         if self.out.len() >= FLUSH_BYTES {
             self.flush()?;
         }
+        Ok(())
+    }
+
+    /// SCRATCH #759: inserts the data block sealed at `out[start..]` (SST offset `offset`)
+    /// into the flush cache, decoded as a read would cache it (RocksDB's kFlushOnly).
+    fn prepopulate(&self, offset: u64, start: usize) -> Result<()> {
+        let Some(cache) = crate::PREPOP_CACHE.get() else {
+            return Ok(());
+        };
+        let physical = &self.out[start..];
+        let data = match crate::reader::decode_slice(physical, BlockKind::Data, None)? {
+            Some(d) => d,
+            None => {
+                pigeonhole_cache::BlockData::from(physical[..physical.len() - TRAILER_LEN].to_vec())
+            }
+        };
+        let key = pigeonhole_cache::BlockKey {
+            file: crate::sst_cache_file(self.id),
+            offset,
+        };
+        drop(cache.insert(key, data, pigeonhole_cache::Priority::Normal));
+        crate::PREPOP_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 

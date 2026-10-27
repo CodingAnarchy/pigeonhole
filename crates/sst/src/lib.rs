@@ -262,7 +262,15 @@ pub struct SstWriterOptions {
     /// Recorded as `Properties::fully_purged`: `Some(max_versions)` when the writer is a
     /// bottommost compaction that nothing held back (D268). Default `None`.
     pub fully_purged: Option<u32>,
+    /// SCRATCH #759: insert each sealed data block into [`PREPOP_CACHE`] (a flush).
+    pub prepopulate: bool,
 }
+
+/// SCRATCH #759: the cache flushes prepopulate (set by the engine when `PHDB_PREPOP` is set).
+pub static PREPOP_CACHE: std::sync::OnceLock<std::sync::Arc<pigeonhole_cache::BlockCache>> =
+    std::sync::OnceLock::new();
+/// SCRATCH #759: data blocks flushes have inserted.
+pub static PREPOP_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 impl SstWriterOptions {
     /// Options derived from a family's persisted policy.
@@ -284,6 +292,7 @@ impl SstWriterOptions {
             merge_operator: options.merge_operator.clone(),
             created_micros: 0,
             fully_purged: None,
+            prepopulate: false,
         }
     }
 }

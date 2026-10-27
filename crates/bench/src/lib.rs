@@ -1196,6 +1196,10 @@ fn measure(
         next = (rest.ceil() as u64).max(MIN_EXTRA_OPS);
     }
     pigeonhole_engine::phases759::ON.store(false, std::sync::atomic::Ordering::Relaxed);
+    eprintln!(
+        "phases759: prepop_blocks={}",
+        pigeonhole_engine::phases759::prepop_blocks()
+    );
     let shards = (
         shares_between(&before.0, &runner.shard_shares()),
         stalls_between(before.1, runner.stalls()),

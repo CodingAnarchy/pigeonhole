@@ -337,7 +337,7 @@ pub(crate) fn decode_physical(
 
 /// [`decode_physical`] over borrowed bytes: the decompressed block, or `None` if the block
 /// is stored uncompressed (its logical bytes are the payload, which the caller keeps).
-fn decode_slice(
+pub(crate) fn decode_slice(
     physical: &[u8],
     kind: BlockKind,
     pool: Option<&Arc<BufPool>>,

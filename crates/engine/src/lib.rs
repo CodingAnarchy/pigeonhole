@@ -22,8 +22,6 @@
 #![forbid(unsafe_code)]
 
 mod admission;
-#[doc(hidden)]
-pub mod phases759;
 mod catalog;
 mod check;
 mod clock;
@@ -45,6 +43,8 @@ mod maintenance;
 mod manifest;
 mod nonblocking;
 mod options;
+#[doc(hidden)]
+pub mod phases759;
 mod purge_guard;
 mod read;
 mod row_cache;
