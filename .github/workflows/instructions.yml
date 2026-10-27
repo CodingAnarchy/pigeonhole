@@ -59,7 +59,7 @@ env:
   # contract of scripts/instructions-per-cell.sh. Add a shape here and it is reported and
   # checked for regressions on every PR.
   SHAPES: >-
-    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved
+    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,scan-interleaved-sst
     writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,flush,compact
     ycsb:ycsb-c,ycsb-a
     scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
