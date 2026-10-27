@@ -105,30 +105,33 @@ pub enum Recovery {
 pub(crate) struct ThreadBudget {
     /// Shards: one per physical core (D220). Data partitions, not threads.
     pub(crate) shards: usize,
-    /// Driver threads the shards run on (`Options::shard_threads`).
+    /// The most driver threads the shards run on: the load controller's ceiling (D289 PR 2),
+    /// or the fixed count `Options::shard_threads` set (`fixed`).
     pub(crate) drivers: usize,
+    /// Whether `drivers` is fixed (`Options::shard_threads`), turning the controller off.
+    pub(crate) fixed: bool,
     /// Flush and compaction threads (`Options::compaction_cores`).
     pub(crate) compaction: usize,
 }
 
-/// The embedded profile's share of the physical cores for the engine's threads, as a
-/// fraction (numerator, denominator). Set by #997's fixed-k A/B at 16 cores.
-const EMBEDDED_SHARE: (usize, usize) = (1, 2);
-
-/// The drivers' share of the engine's cores, the rest going to compaction. Set by #997's
-/// fixed-k A/B at 16 cores.
-const DRIVER_SHARE: (usize, usize) = (1, 2);
-
-/// The cores the server profile leaves for everything else on the box: the OS, a sidecar,
-/// the clients' connections.
-fn server_headroom(cores: usize) -> usize {
-    if cores <= 4 { 1 } else { 2 }
+/// The flush and compaction threads' share of the physical cores, as a fraction (numerator,
+/// denominator), per profile: the profiles differ mainly here (owner, 2026-10-27; #760
+/// comment 6446722456). Set by D289 PR 2's compaction-share arms (c = 2, 4, 8 at 16 cores).
+fn compaction_share(profile: CpuProfile) -> (usize, usize) {
+    match profile {
+        CpuProfile::Embedded => (1, 4),
+        CpuProfile::Server => (1, 2),
+    }
 }
 
-/// D289's CPU budget: the engine's share of `cores` physical cores under `profile`, split
-/// between drivers and compaction. Explicit settings win: `shards`, `drivers` or
-/// `compaction` given are kept, and the budget fills the rest. Every count is at least 1, so a
-/// very small machine runs more engine threads than its share (as before D289).
+/// D289's CPU budget for `cores` physical cores under `profile`.
+/// - **Drivers:** the load controller's ceiling is one per physical core, so a store under full
+///   load keeps a thread per shard's throughput and a light one shrinks to a few (owner,
+///   2026-10-27). An explicit `drivers` fixes the count instead.
+/// - **Compaction:** the profile's share of the cores, scaling with them (D252's fixed cap of
+///   four is gone), at most one per shard: a shard runs one compaction at a time.
+///
+/// Explicit settings win and are kept as given; derived counts are at least 1.
 pub(crate) fn thread_budget(
     cores: usize,
     profile: CpuProfile,
@@ -138,28 +141,12 @@ pub(crate) fn thread_budget(
 ) -> ThreadBudget {
     let cores = cores.max(1);
     let shards = shards.unwrap_or(cores).max(1);
-    let engine = match profile {
-        CpuProfile::Embedded => cores * EMBEDDED_SHARE.0 / EMBEDDED_SHARE.1,
-        CpuProfile::Server => cores.saturating_sub(server_headroom(cores)),
-    }
-    .max(1);
-    // Derived counts are at least 1 and at most one per shard; explicit ones are kept as
-    // given (`shard_threads(0)` is a thread per shard, `compaction_cores(0)` runs flush and
-    // compaction on the shards).
-    let derived = |n: usize| n.clamp(1, shards);
-    let (drivers, compaction) = match (drivers, compaction) {
-        (Some(k), Some(c)) => (k, c),
-        (Some(k), None) => (k, derived(engine.saturating_sub(k.min(shards)))),
-        (None, Some(c)) => (derived(engine.saturating_sub(c)), c),
-        (None, None) => {
-            let k = derived((engine * DRIVER_SHARE.0).div_ceil(DRIVER_SHARE.1));
-            (k, derived(engine.saturating_sub(k)))
-        }
-    };
+    let (num, den) = compaction_share(profile);
     ThreadBudget {
         shards,
-        drivers,
-        compaction,
+        drivers: drivers.unwrap_or(shards),
+        fixed: drivers.is_some(),
+        compaction: compaction.unwrap_or_else(|| (cores * num / den).clamp(1, shards)),
     }
 }
 
@@ -443,13 +430,14 @@ impl Options {
     /// and [`compaction_cores`](Options::compaction_cores) set explicitly still win, and the
     /// profile fills in the rest.
     ///
+    /// - **Shard threads, both profiles:** up to one per physical core under full load. A
+    ///   lighter load runs on fewer (D289's controller), so commits rarely wait for a sleeping
+    ///   thread to be woken.
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
-    ///   and needs CPU too. The engine's threads take a share of the physical cores, and
-    ///   your threads keep the rest and every SMT sibling.
+    ///   and needs CPU too. Flush and compaction take a quarter of the physical cores.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
     ///   and its clients reach it from elsewhere (another container, over IPC or the
-    ///   network). The engine's threads take all but two physical cores (one on four or
-    ///   fewer).
+    ///   network). Flush and compaction take half the physical cores.
     /// - **CPU limits:** "physical cores" means those the process may use: its affinity
     ///   mask and a container's CPU quota both narrow them, so a 4-CPU container sizes the
     ///   engine for 4 whatever the host has.
@@ -1245,63 +1233,68 @@ fn uring_vfs(_application_owned: bool) -> Option<VfsRef> {
 mod tests {
     use super::{CpuProfile, ThreadBudget, thread_budget};
 
-    fn b(shards: usize, drivers: usize, compaction: usize) -> ThreadBudget {
+    fn b(shards: usize, drivers: usize, fixed: bool, compaction: usize) -> ThreadBudget {
         ThreadBudget {
             shards,
             drivers,
+            fixed,
             compaction,
         }
     }
 
     /// D289's tables (the decision's entry and the guide): both profiles from 1 to 128
-    /// physical cores, nothing set explicitly.
+    /// physical cores, nothing set explicitly. The driver ceiling is one per core in both;
+    /// the profiles differ in the compaction share.
     #[test]
     fn the_budget_by_profile_and_core_count() {
         let table = [
-            // cores, embedded (drivers, compaction), server (drivers, compaction)
-            (1, (1, 1), (1, 1)),
-            (2, (1, 1), (1, 1)),
-            (4, (1, 1), (2, 1)),
-            (8, (2, 2), (3, 3)),
-            (16, (4, 4), (7, 7)),
-            (32, (8, 8), (15, 15)),
-            (64, (16, 16), (31, 31)),
-            (128, (32, 32), (63, 63)),
+            // cores, embedded compaction, server compaction
+            (1, 1, 1),
+            (2, 1, 1),
+            (4, 1, 2),
+            (8, 2, 4),
+            (16, 4, 8),
+            (32, 8, 16),
+            (64, 16, 32),
+            (128, 32, 64),
         ];
         for (cores, embedded, server) in table {
             assert_eq!(
                 thread_budget(cores, CpuProfile::Embedded, None, None, None),
-                b(cores, embedded.0, embedded.1),
+                b(cores, cores, false, embedded),
                 "embedded, {cores} cores"
             );
             assert_eq!(
                 thread_budget(cores, CpuProfile::Server, None, None, None),
-                b(cores, server.0, server.1),
+                b(cores, cores, false, server),
                 "server, {cores} cores"
             );
         }
     }
 
-    /// Explicit settings win, and the budget fills the rest; derived counts stay within
-    /// one per shard and at least one.
+    /// Explicit settings win and are kept as given; derived counts stay within one per shard
+    /// and at least one.
     #[test]
     fn explicit_settings_win_and_the_budget_fills_the_rest() {
         let e = CpuProfile::Embedded;
-        // Drivers set: compaction takes the rest of the share.
-        assert_eq!(thread_budget(16, e, None, Some(2), None), b(16, 2, 6));
-        // A thread per shard, explicitly: compaction still at least one.
-        assert_eq!(thread_budget(16, e, None, Some(0), None), b(16, 0, 8));
-        // Compaction set (0: on the shards): drivers take the rest of the share.
-        assert_eq!(thread_budget(16, e, None, None, Some(6)), b(16, 2, 6));
-        assert_eq!(thread_budget(16, e, None, None, Some(0)), b(16, 8, 0));
-        // Both set: kept as given, even past the shard count.
-        assert_eq!(thread_budget(16, e, None, Some(3), Some(20)), b(16, 3, 20));
-        // Fewer shards than the share: derived drivers stay within one per shard.
-        assert_eq!(thread_budget(16, e, Some(2), None, None), b(2, 2, 2));
+        // A fixed driver count turns the controller off.
+        assert_eq!(thread_budget(16, e, None, Some(2), None), b(16, 2, true, 4));
+        assert_eq!(thread_budget(16, e, None, Some(0), None), b(16, 0, true, 4));
+        // Compaction set (0: on the shards), kept as given, even past the shard count.
+        assert_eq!(
+            thread_budget(16, e, None, None, Some(0)),
+            b(16, 16, false, 0)
+        );
+        assert_eq!(
+            thread_budget(16, e, None, None, Some(20)),
+            b(16, 16, false, 20)
+        );
+        // Fewer shards than cores: the ceiling and compaction stay within one per shard.
+        assert_eq!(thread_budget(16, e, Some(2), None, None), b(2, 2, false, 2));
         // A 4-CPU container quota on a big host is 4 cores here (`default_shards`).
         assert_eq!(
             thread_budget(4, CpuProfile::Server, None, None, None),
-            b(4, 2, 1)
+            b(4, 4, false, 2)
         );
     }
 }
