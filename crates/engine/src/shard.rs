@@ -6420,12 +6420,13 @@ impl ShardState {
             match &m.kind {
                 MemberKind::Single => {
                     #[cfg(feature = "test-hooks")]
-                    let applied = if self
-                        .shared
-                        .hooks
-                        .faults
-                        .take(crate::engine::hooks::Fault::NextApply)
-                    {
+                    let fault = {
+                        use crate::engine::hooks::Fault;
+                        let faults = &self.shared.hooks.faults;
+                        faults.take(Fault::NextApply) || faults.take(Fault::NextSingleApply)
+                    };
+                    #[cfg(feature = "test-hooks")]
+                    let applied = if fault {
                         Err(Error::Busy)
                     } else {
                         self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts)
