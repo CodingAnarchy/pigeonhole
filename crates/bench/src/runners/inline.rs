@@ -882,9 +882,9 @@ impl PigeonholeRunner {
                 .iter()
                 .zip(&after)
                 .any(|(b, a)| (a.splits, a.merges, a.moves) != (b.splits, b.merges, b.moves));
-            // A pending growth counts as a change too (D242's amendment): its moves have
-            // not started yet.
-            let growing = db.pack_target().is_some_and(|(k, target)| target > k);
+            // A pending growth or first pack counts as a change too (D242's amendment,
+            // #983): its moves have not started yet.
+            let growing = db.pack_target().is_some_and(|(k, target)| target != k);
             if changed || growing {
                 last_change = Instant::now();
             }
@@ -903,6 +903,7 @@ impl PigeonholeRunner {
             }
         }
         let warmup_secs = started.elapsed().as_secs_f64();
+        let warmup_settle_secs = (last_change - started).as_secs_f64();
         if presplit && n > 1 {
             one_tablet_each(&db, "before the measured phase")?;
         }
@@ -1022,6 +1023,7 @@ impl PigeonholeRunner {
                 stalls: Some(Stalls::between(&stalls_before, &stalls_after)),
                 engine_commit,
                 warmup_secs: Some(warmup_secs),
+                warmup_settle_secs: Some(warmup_settle_secs),
                 warmup_settled: Some(warmup_settled),
                 busy_retries,
                 capped: options_.max_measured.map(|_| capped),

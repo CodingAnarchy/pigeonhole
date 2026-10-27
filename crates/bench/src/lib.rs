@@ -610,11 +610,12 @@ pub trait Runner {
     }
 
     /// The store's active shard count and the count its balancer is heading for, `None`
-    /// (the default) for stores without one. The warm-up does not end while the second
-    /// exceeds the first (D242's amendment): a growth whose passes are still accruing has
-    /// not moved a tablet yet, so the placement reads quiet right before it changes. Nor
-    /// while fewer shards hold a tablet than the first (D242's second amendment): the
-    /// growth's moves come one per dwell and can leave a quiet window between them.
+    /// (the default) for stores without one. The warm-up does not end while the two differ
+    /// (D242's amendment, #983): a growth whose passes are still accruing, or the store's
+    /// first pack from all its shards, has not moved a tablet yet, so the placement reads
+    /// quiet right before it changes. Nor while fewer shards hold a tablet than the first
+    /// (D242's second amendment): the growth's moves come one per dwell and can leave a
+    /// quiet window between them.
     fn pack_target(&self) -> Option<(usize, usize)> {
         None
     }
@@ -924,7 +925,7 @@ pub fn run_detailed(
         stalls,
         settle,
         background_work,
-        (warmup_secs, warmup_settled),
+        warmed,
         seqnos_used,
         txn_conflicts,
         (riders, reader_processes),
@@ -961,8 +962,9 @@ pub fn run_detailed(
             engine_commit: None,
             settle: Some(settle),
             background_work,
-            warmup_secs: Some(warmup_secs),
-            warmup_settled: Some(warmup_settled),
+            warmup_secs: Some(warmed.secs),
+            warmup_settle_secs: Some(warmed.settle_secs),
+            warmup_settled: Some(warmed.settled),
             seqnos_used,
             txn_conflicts,
             riders,
@@ -1082,7 +1084,7 @@ type Measured = (
         Option<Stalls>,
         Settle,
         Option<u64>,
-        (f64, bool),
+        Warmed,
         Option<u64>,
         Option<u64>,
         (Option<Riders>, Option<ReaderProcesses>),
@@ -1233,23 +1235,26 @@ pub const WARMUP_SETTLED_AFTER_SWITCH: Duration = Duration::from_secs(5);
 pub const WARMUP_CAP_AFTER_SWITCH: Duration = Duration::from_secs(60);
 
 /// The longest the warmup waits for the tablet placement to settle (D242): past it the run
-/// measures anyway, with a warning, and the record says it did not settle.
-pub const WARMUP_CAP: Duration = Duration::from_secs(30);
+/// measures anyway, with a warning, and the record says it did not settle. 60 s since D242's
+/// third amendment (owner, 2026-10-27): the first pack from the unpacked start waits for
+/// D255's 30 s window, and at Buffered skewed-multi-shard settled 0.4 s inside the former
+/// 30 s cap.
+pub const WARMUP_CAP: Duration = Duration::from_secs(60);
 
 /// The warmup (D242): the warmup operations, repeated on the measured phase's own client
 /// threads until the store's tablet placement has gone [`WARMUP_SETTLED`] without a split,
 /// merge or move, at most [`WARMUP_CAP`]. Every store takes the same step; a store without
 /// shards never changes placement, so it warms for [`WARMUP_SETTLED`]. After a durability
 /// switch `quiet` and `cap` are [`WARMUP_SETTLED_AFTER_SWITCH`] and
-/// [`WARMUP_CAP_AFTER_SWITCH`]. Returns the warmup's seconds and whether the placement
-/// settled; no warmup operations, no warmup. Tests pass shorter windows.
+/// [`WARMUP_CAP_AFTER_SWITCH`]. Returns how the warmup went; no warmup operations, no
+/// warmup. Tests pass shorter windows.
 fn warm_up(
     runner: &mut dyn Runner,
     clients: &mut [Box<dyn Client>],
     warm: &[Vec<(BenchOp, Class)>],
     quiet: Duration,
     cap: Duration,
-) -> Result<(f64, bool), String> {
+) -> Result<Warmed, String> {
     let origin = Instant::now();
     warm_up_on(runner, clients, warm, quiet, cap, &|| origin.elapsed())
 }
@@ -1264,9 +1269,13 @@ fn warm_up_on(
     quiet: Duration,
     cap: Duration,
     clock: &dyn Fn() -> Duration,
-) -> Result<(f64, bool), String> {
+) -> Result<Warmed, String> {
     if warm.iter().all(Vec::is_empty) {
-        return Ok((0.0, true));
+        return Ok(Warmed {
+            secs: 0.0,
+            settle_secs: 0.0,
+            settled: true,
+        });
     }
     // A pass stops at the cap on the wall clock too.
     let deadline = Instant::now() + cap;
@@ -1276,8 +1285,9 @@ fn warm_up_on(
         let before = runner.shard_shares();
         pass(runner, clients, warm, false, Some(deadline)).map_err(|e| format!("warmup: {e}"))?;
         let after = runner.shard_shares();
-        // A pending growth counts as a change: its moves have not started yet. So does a
-        // growth whose moves have not spread the tablets yet: fewer shards hold one than
+        // A pending growth or first pack counts as a change: its moves have not started
+        // yet (#983: a warm-up that ended before the store's first pack measured its 16-19
+        // moves). So does a growth whose moves have not spread the tablets yet: fewer shards hold one than
         // the active count calls for (as many as there are tablets at most), and the next
         // move may be more than a quiet window away (one per dwell, behind a compaction).
         if unwinding(runner.pack_target(), &after) || placement_changed(&before, &after) {
@@ -1295,18 +1305,35 @@ fn warm_up_on(
             break false;
         }
     };
-    Ok(((clock() - started).as_secs_f64(), settled))
+    Ok(Warmed {
+        secs: (clock() - started).as_secs_f64(),
+        settle_secs: (last_change - started).as_secs_f64(),
+        settled,
+    })
 }
 
-/// Whether the balancer is still heading somewhere (D242's amendments): a growth is
-/// pending (`target > k`), or fewer shards hold a tablet than the active count `k`, bounded
-/// by the tablets there are. A shrink is not waited for: its last steps are slow and the
-/// quiet rule covers their moves.
+/// How a warmup went ([`warm_up`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Warmed {
+    /// The warmup's seconds.
+    secs: f64,
+    /// Seconds into the warmup of the last placement change or pending growth or pack: the
+    /// placement settled there, and the quiet window followed (#983).
+    settle_secs: f64,
+    /// Whether the placement settled within the cap.
+    settled: bool,
+}
+
+/// Whether the balancer is still heading somewhere (D242's amendments, #983): a growth or
+/// the store's first pack from all its shards is pending (`target != k`; the store
+/// publishes no other shrink), or fewer shards hold a tablet than the active count `k`,
+/// bounded by the tablets there are. Later shrinks are not waited for: their last steps are
+/// slow and the quiet rule covers their moves.
 fn unwinding(target: Option<(usize, usize)>, shares: &[ShardShare]) -> bool {
     target.is_some_and(|(k, target)| {
         let holders = shares.iter().filter(|s| s.tablets_end > 0).count() as u64;
         let tablets: u64 = shares.iter().map(|s| s.tablets_end).sum();
-        target > k || holders < (k as u64).min(tablets)
+        target != k || holders < (k as u64).min(tablets)
     })
 }
 
@@ -1450,6 +1477,9 @@ mod tests {
         /// none.
         targets: std::cell::Cell<u64>,
         growing: u64,
+        /// The pending target reads as a first pack (16 shards heading for 5, #983) rather
+        /// than a growth.
+        packing: bool,
         /// Readings of the shares that report the tablets still on one of 4 active shards
         /// (3 there, 1 arriving on the next), then one per shard.
         unwinding: u64,
@@ -1480,7 +1510,11 @@ mod tests {
         fn pack_target(&self) -> Option<(usize, usize)> {
             let n = self.targets.get();
             self.targets.set(n + 1);
-            Some(if n < self.growing { (4, 16) } else { (16, 16) })
+            Some(match (n < self.growing, self.packing) {
+                (true, false) => (4, 16),
+                (true, true) => (16, 5),
+                (false, _) => (16, 16),
+            })
         }
         fn shard_shares(&self) -> Vec<ShardShare> {
             if let Some((every, moves)) = self.spread {
@@ -1534,6 +1568,7 @@ mod tests {
             op_time: Duration::ZERO,
             targets: std::cell::Cell::new(0),
             growing: 0,
+            packing: false,
             unwinding: 0,
         }
     }
@@ -1559,7 +1594,7 @@ mod tests {
         r.op_time = Duration::from_millis(5);
         let warm = warm_ops(4);
         let quiet = Duration::from_millis(100);
-        let (secs, settled) =
+        let Warmed { secs, settled, .. } =
             warm_up(&mut r, &mut [], &warm, quiet, Duration::from_secs(10)).unwrap();
         assert!(settled);
         let passes = r.executed / 4;
@@ -1572,9 +1607,35 @@ mod tests {
         let mut r = fake(0);
         r.growing = u64::MAX;
         let cap = Duration::from_millis(200);
-        let (secs, settled) = warm_up(&mut r, &mut [], &warm, quiet, cap).unwrap();
+        let Warmed { secs, settled, .. } = warm_up(&mut r, &mut [], &warm, quiet, cap).unwrap();
         assert!(!settled);
         assert!(secs >= cap.as_secs_f64());
+    }
+
+    #[test]
+    fn the_warmup_waits_for_a_pending_first_pack_and_reports_when_it_settled() {
+        // #983: a store on all 16 shards whose balancer reports its first pack pending (to
+        // 5) for its first 6 readings, with no tablet change yet. Before, the warm-up ended
+        // on the quiet placement and the pack's moves landed in the measured phase.
+        const PACKING: u64 = 6;
+        let mut r = fake(0);
+        r.growing = PACKING;
+        r.packing = true;
+        r.op_time = Duration::from_millis(5);
+        let warm = warm_ops(4);
+        let quiet = Duration::from_millis(100);
+        let w = warm_up(&mut r, &mut [], &warm, quiet, Duration::from_secs(10)).unwrap();
+        assert!(w.settled);
+        let passes = r.executed / 4;
+        assert!(
+            passes > PACKING,
+            "ended with the first pack pending: {passes} passes, {w:?}"
+        );
+        // It settled at the last pending reading, and the quiet window followed.
+        assert!(w.settle_secs > 0.0, "{w:?}");
+        assert!(w.secs >= w.settle_secs + quiet.as_secs_f64(), "{w:?}");
+        assert!(unwinding(Some((16, 5)), &[]));
+        assert!(!unwinding(Some((5, 5)), &[]));
     }
 
     #[test]
@@ -1591,7 +1652,7 @@ mod tests {
         r.op_time = Duration::from_millis(5);
         let warm = warm_ops(4);
         let quiet = Duration::from_millis(100);
-        let (secs, settled) =
+        let Warmed { secs, settled, .. } =
             warm_up(&mut r, &mut [], &warm, quiet, Duration::from_secs(10)).unwrap();
         assert!(settled);
         let readings = r.readings.get();
@@ -1633,7 +1694,7 @@ mod tests {
         r.op_time = Duration::from_millis(5);
         let warm = warm_ops(4);
         let quiet = Duration::from_millis(100);
-        let (secs, settled) =
+        let Warmed { secs, settled, .. } =
             warm_up(&mut r, &mut [], &warm, quiet, Duration::from_secs(10)).unwrap();
         assert!(settled);
         assert!(
@@ -1646,11 +1707,12 @@ mod tests {
         let mut r = fake(0);
         r.moving = u64::MAX;
         let cap = Duration::from_millis(200);
-        let (secs, settled) = warm_up(&mut r, &mut [], &warm, quiet, cap).unwrap();
+        let Warmed { secs, settled, .. } = warm_up(&mut r, &mut [], &warm, quiet, cap).unwrap();
         assert!(!settled);
         assert!(secs >= cap.as_secs_f64());
         // No warmup operations, no warmup.
-        let (secs, settled) = warm_up(&mut r, &mut [], &warm_ops(0), quiet, cap).unwrap();
+        let Warmed { secs, settled, .. } =
+            warm_up(&mut r, &mut [], &warm_ops(0), quiet, cap).unwrap();
         assert_eq!((secs, settled), (0.0, true));
     }
 
@@ -1685,17 +1747,28 @@ mod tests {
         };
         // 200 ms quiet before the first move at 300 ms: settled at 200 ms, all five to come.
         let mut early = spreading(300, MOVES);
-        let (secs, settled) = run(&mut early, 200, cap);
+        let Warmed {
+            secs,
+            settle_secs,
+            settled,
+        } = run(&mut early, 200, cap);
+        assert_eq!(settle_secs, 0.0, "no change seen");
         let moved = early.shard_shares()[0].moves;
         assert!(
             settled && moved == 0 && secs == 0.2,
             "after move {moved} of {MOVES}, {secs} s"
         );
-        // The last move at 1.5 s, then 500 ms quiet.
-        let (secs, settled) = run(&mut spreading(300, MOVES), 500, cap);
+        // The last move at 1.5 s, then 500 ms quiet: settled at 1.5 s.
+        let Warmed {
+            secs,
+            settle_secs,
+            settled,
+        } = run(&mut spreading(300, MOVES), 500, cap);
         assert!(settled && secs == 1.5 + 0.5, "outlasted the spread: {secs}");
+        assert_eq!(settle_secs, 1.5);
         // A spread longer than the cap ends at the cap, not settled.
-        let (secs, settled) = run(&mut spreading(100, u64::MAX), 500, Duration::from_secs(1));
+        let Warmed { secs, settled, .. } =
+            run(&mut spreading(100, u64::MAX), 500, Duration::from_secs(1));
         assert!(!settled && secs == 1.0, "capped at {secs} s");
     }
 

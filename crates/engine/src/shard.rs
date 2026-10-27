@@ -518,9 +518,11 @@ pub(crate) struct Shared {
     /// first decision): shard 0's balancer decides it for every shard.
     pub pack_k: AtomicUsize,
     /// The active count shard 0's balancer is heading for (D242's amendment, 2026-10-19):
-    /// `pack_k` unless a growth is accruing its passes, then the count that growth reaches.
-    /// 0 before the first decision. Read by `Engine::pack_target` only (a bench hook: the
-    /// warm-up does not end while a growth is pending).
+    /// `pack_k` unless a growth is accruing its passes, then the count that growth reaches,
+    /// or the store reads light enough for its first pack from all `n` shards, then the
+    /// count that pack reaches (#983). 0 before the first decision. Read by
+    /// `Engine::pack_target` only (a bench hook: the warm-up does not end while either is
+    /// pending).
     pub pack_target: AtomicUsize,
     /// Commits (blocking and async) waiting for the visible watermark, and checkpoint fronts
     /// waiting for a cross-shard record's seqno to become visible (D266). Deferred freezes
@@ -3213,8 +3215,9 @@ pub(crate) struct ShardState {
     /// and goes straight back to that count rather than one shard per ten passes.
     shrunk_from: Option<(usize, u64, u64)>,
     pack_k: usize,
-    /// Shard 0 only: `pack_k`, or the count a growth whose passes are accruing would reach
-    /// (published as `Shared::pack_target`).
+    /// Shard 0 only: `pack_k`, or the count a growth whose passes are accruing would reach,
+    /// or the count a first pack from all `n` shards would reach (published as
+    /// `Shared::pack_target`).
     pack_target: usize,
     pack_up: u64,
     pack_down: u64,

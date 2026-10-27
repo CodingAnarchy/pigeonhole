@@ -2581,10 +2581,11 @@ impl Engine {
 
     /// The active shard count shard 0's balancer published at its last pass and the count it
     /// is heading for: the same unless a growth is accruing its passes, then the count that
-    /// growth reaches (D217's `k`, D242's amendment of 2026-10-19). `None` before its first
-    /// decision (packing off, one shard, or no pass yet). A bench hook: the warm-up does not
-    /// end while the second exceeds the first, so a measured phase never starts inside a
-    /// regrow after a packed load.
+    /// growth reaches (D217's `k`, D242's amendment of 2026-10-19), or the store reads light
+    /// enough for its first pack from all its shards, then the count that pack reaches
+    /// (#983). `None` before its first decision (packing off, one shard, or no pass yet). A
+    /// bench hook: the warm-up does not end while the two differ, so a measured phase never
+    /// starts inside a regrow after a packed load or before the store's first pack.
     #[doc(hidden)]
     pub fn pack_target(&self) -> Option<(usize, usize)> {
         if self.inner.forked() {

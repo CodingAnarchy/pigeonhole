@@ -1003,8 +1003,9 @@ impl Pigeonhole {
     }
 
     /// The active shard count the balancer published and the count it is heading for (the
-    /// same unless a growth is pending), `None` before its first decision: a bench hook
-    /// (D242's amendment) so a warm-up does not end inside a regrow.
+    /// same unless a growth or the first pack from all shards is pending), `None` before its
+    /// first decision: a bench hook (D242's amendment, #983) so a warm-up does not end inside
+    /// a regrow or before the first pack.
     #[doc(hidden)]
     pub fn pack_target(&self) -> Option<(usize, usize)> {
         self.engine().pack_target()

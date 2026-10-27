@@ -8190,3 +8190,40 @@ fn a_commit_record_ahead_of_a_failed_append_is_outcome_unknown() {
         "the never-appended single: {single:?}"
     );
 }
+
+/// The first pack from all `n` shards publishes where it is heading while its count accrues
+/// (#983, the bench's warm-up): four shards settled with a lone writer's commits in flight
+/// read light enough for one shard, and `pack_target` reads a target below 4 on the passes
+/// before the pack decides; once packed, later shrinks are not published and the target is
+/// the active count.
+#[test]
+fn a_pending_first_pack_publishes_the_count_it_is_heading_for() {
+    let (mut db, mut written) = spread_and_settled(0.05);
+    assert_eq!(db.engine.pack_target(), Some((4, 4)));
+    for s in 0..4 {
+        db.engine
+            .set_shard_load(s, pigeonhole_engine::LoadTerm::Inflight, Some(0.25));
+    }
+    let mut pending = 0;
+    let mut passes = 0;
+    while db.engine.pack_ks()[0] == Some(4) && passes < 300 {
+        write_and_balance(&mut db, 4, |_| 20, &mut written);
+        passes += 1;
+        if db
+            .engine
+            .pack_target()
+            .is_some_and(|(k, target)| k == 4 && target < 4)
+        {
+            pending += 1;
+        }
+    }
+    let (k, target) = db.engine.pack_target().expect("decided");
+    assert!(k < 4, "no pack in {passes} passes");
+    assert_eq!(target, k, "a packed store publishes no shrink");
+    assert!(
+        pending >= 5,
+        "the pending first pack published its target on {pending} of {passes} passes"
+    );
+    assert_eq!(db.scan_rows().len() as u64, written);
+    db.close();
+}

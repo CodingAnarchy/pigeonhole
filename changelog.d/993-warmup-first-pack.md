@@ -1,0 +1,2 @@
+### Changed
+- The bench's warmup now waits for the store's first pack from all shards (D242's third amendment), so a run that packs measures its packed placement, not its 16-19 tablet moves. The JSON records `detail.warmup_settle_secs`, the seconds into the warmup at which the placement settled. The warmup's cap is now 60 s with or without a durability switch (it was 30 s without one). This changes the gate's methodology: a warmup can now run up to its cap where it used to end after the 2 s quiet window.

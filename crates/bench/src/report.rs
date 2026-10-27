@@ -422,6 +422,12 @@ pub struct RunDetail {
     /// written before it.
     #[serde(default)]
     pub warmup_secs: Option<f64>,
+    /// Seconds into the warmup at which the tablet placement settled (#983): its last
+    /// split, merge or move, or the last reading with a growth or the store's first pack
+    /// pending; 0 when it never changed. The quiet window follows it. `None` in results
+    /// written before it.
+    #[serde(default)]
+    pub warmup_settle_secs: Option<f64>,
     /// Whether the placement settled within [`WARMUP_CAP`](crate::WARMUP_CAP) (D242); false
     /// when the warmup ran out first, so the measured phase may include tablet changes.
     #[serde(default)]
