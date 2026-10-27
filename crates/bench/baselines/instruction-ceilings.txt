@@ -183,6 +183,13 @@
 # `next`), and in filtered reads one filter check where a memtable source lands, kept for its
 # settle. scan-interleaved is new (D193), the head's 3383 times 1.003: lazy settling took it
 # from 39355 on main (-91.4%).
+#
+# Raised for #1004 (the #985 trim: a group's shared-room accounting out of line) under D195's
+# ceiling rule (coordinator for the owner, 2026-10-27): commit-sixteen 50224 -> 50384, the
+# head's 50233 times 1.003. Main read 50215 (run 40550237692); the head's +18 (+0.04%) is
+# run_group's 16-cell loop compiled differently once the group code left it (per function:
+# option -69, zip +60, run_group's own lines +46, SmallVec -45), with no work to remove,
+# while commit-one, commit-at and commit-async fell 29-30 and commit-overwrite 26.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
@@ -198,7 +205,7 @@ rows 19655 0.3
 level-scans 14015 0.6
 short-scans 13564 0.3
 commit-one 9612 0.3
-commit-sixteen 50224 0.3
+commit-sixteen 50384 0.3
 flush 2199 0.3
 compact 2783 0.5
 ycsb-c 43293 1.0

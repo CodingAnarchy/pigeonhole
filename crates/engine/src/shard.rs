@@ -2421,11 +2421,9 @@ impl Task for ClockTimer {
 /// Arena room a batch needs (`ShardState::arena_needed`).
 #[derive(Debug, Clone, Copy)]
 struct ArenaNeed {
-    /// Worst-case bytes of free chunks it uses: in a group, without the chunks an earlier
-    /// single of the group reserved (#749).
+    /// Worst-case bytes of free chunks it uses, on its own (in a group, `reserve_room` takes
+    /// off the chunks an earlier single reserved, #749).
     bytes: usize,
-    /// The same for the batch on its own (whether it could ever fit, `Room::Never`).
-    alone: usize,
     /// Chunks its largest entry takes (contiguous).
     run_chunks: usize,
     /// Chunks its smallest entry larger than a chunk takes (0 without one).
@@ -3942,12 +3940,7 @@ impl ShardState {
     /// With `group` (a single in a group, #749), a slot an earlier single of the group already
     /// reserved for costs no chunk, nor do the fixed two once one did; the slots it touches are
     /// added to the group's (the caller truncates them again if the member is not admitted).
-    fn arena_needed(
-        &self,
-        batch: BatchRef<'_>,
-        rows: &mut Vec<u64>,
-        mut group: Option<&mut GroupRoom>,
-    ) -> ArenaNeed {
+    fn arena_needed(&self, batch: BatchRef<'_>, rows: &mut Vec<u64>) -> ArenaNeed {
         rows.clear();
         let mut total = 0usize;
         let mut waste = 0usize;
@@ -3957,8 +3950,6 @@ impl ShardState {
         // memtable with a chunk of its own; a table split into many tablets has many slots).
         // Inline for a few: admission computes this for every commit (#320).
         let mut touched: smallvec::SmallVec<[(TabletId, FamilyId); 4]> = smallvec::SmallVec::new();
-        // Chunks of slots an earlier single of the group reserved (#749).
-        let mut shared = 0usize;
         let mut unrouted = 0usize;
         let mut new_slots = 0usize;
         // The row of the previous write and its tablet: a run of writes to one row routes
@@ -3988,15 +3979,8 @@ impl ShardState {
             match tablet {
                 Some(tablet) if !touched.contains(&(tablet, m.family)) => {
                     touched.push((tablet, m.family));
-                    let new =
-                        self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family));
-                    new_slots += usize::from(new);
-                    if let Some(g) = group.as_deref_mut() {
-                        if g.fixed && g.slots.contains(&(tablet, m.family)) {
-                            shared += 1 + usize::from(new);
-                        } else {
-                            g.slots.push((tablet, m.family));
-                        }
+                    if self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family)) {
+                        new_slots += 1;
                     }
                 }
                 Some(_) => {}
@@ -4005,16 +3989,8 @@ impl ShardState {
         }
         // A new memtable needs a chunk of its own, and a freeze needs one more.
         let chunks = touched.len() + unrouted + new_slots + 2;
-        let alone = total + waste + chunks * self.chunk_size;
-        // Writes no tablet routes keep their chunk per member: they have no slot to share it
-        // by, and they are rare, so the conservative charge costs nothing that matters.
-        let saved = match group {
-            Some(g) if g.fixed => shared + 2,
-            _ => 0,
-        };
         ArenaNeed {
-            bytes: alone - saved * self.chunk_size,
-            alone,
+            bytes: total + waste + chunks * self.chunk_size,
             run_chunks: (largest + 64).div_ceil(self.chunk_size).max(1),
             min_large: if min_large == usize::MAX {
                 0
@@ -4023,6 +3999,37 @@ impl ShardState {
             },
             alloc_chunks: alloc_chunks + new_slots,
         }
+    }
+
+    /// Records the memtable slots `batch` (a single of a group of several) writes to in the
+    /// group's `GroupRoom`, and returns the chunks of its `arena_needed` the group already
+    /// reserved (#749): every slot an earlier single touched (its run tail, and a new slot's
+    /// first chunk), and the fresh-memtable and freeze chunks, once a single reserved. Writes
+    /// no tablet routes keep their chunk per member: they have no slot to share it by, and
+    /// they are rare, so the conservative charge costs nothing that matters. Out of line, and
+    /// called only for groups of several: a group of one shares nothing, and its commits are
+    /// the hot path (#985's instructions, x86 codegen).
+    #[inline(never)]
+    fn group_saved(&self, batch: BatchRef<'_>, g: &mut GroupRoom) -> usize {
+        let mut touched: smallvec::SmallVec<[(TabletId, FamilyId); 4]> = smallvec::SmallVec::new();
+        let mut shared = 0usize;
+        for m in batch.iter().flatten() {
+            let Some((tablet, _)) = self.tablets.route(m.table, m.row) else {
+                continue;
+            };
+            let slot = (tablet, m.family);
+            if touched.contains(&slot) {
+                continue;
+            }
+            touched.push(slot);
+            if g.fixed && g.slots.contains(&slot) {
+                let new = self.tablets_on() && !self.memtables.contains_key(&slot);
+                shared += 1 + usize::from(new);
+            } else {
+                g.slots.push(slot);
+            }
+        }
+        if g.fixed { shared + 2 } else { 0 }
     }
 
     /// Retires the memtables of slots that hold nothing (an empty active memtable, nothing
@@ -4102,20 +4109,27 @@ impl ShardState {
     ) -> std::result::Result<usize, Room> {
         let mut rows = std::mem::take(&mut self.admit_rows);
         rows.clear();
-        let mark = group.as_ref().map(|g| g.slots.len());
-        let mut group = group;
-        let need = match BatchRef::new(bytes) {
-            Ok(batch) => self.arena_needed(batch, &mut rows, group.as_deref_mut()),
-            Err(_) => ArenaNeed {
+        let batch = BatchRef::new(bytes).ok();
+        let need = match batch {
+            Some(batch) => self.arena_needed(batch, &mut rows),
+            None => ArenaNeed {
                 bytes: 0,
-                alone: 0,
                 run_chunks: 1,
                 min_large: 0,
                 alloc_chunks: 0,
             },
         };
         self.admit_rows = rows;
-        let needed = need.bytes;
+        let mut needed = need.bytes;
+        let mut group = group;
+        let mark = match (group.as_deref_mut(), batch) {
+            (Some(g), Some(batch)) => {
+                let mark = g.slots.len();
+                needed -= self.group_saved(batch, g) * self.chunk_size;
+                Some(mark)
+            }
+            _ => None,
+        };
         // Entries within a chunk fit any free chunk. A larger entry must also find a long
         // enough run (issue #141: a run too short for it, with enough free chunks elsewhere,
         // used to poison the shard at apply). Before any large entry allocates, at most the
@@ -4165,7 +4179,7 @@ impl ShardState {
                 g.slots.truncate(mark);
             }
             // Whether it could ever fit is judged on its own, as if first in its group.
-            return Err(if need.alone + 2 * self.chunk_size > total {
+            return Err(if need.bytes + 2 * self.chunk_size > total {
                 Room::Never
             } else {
                 Room::Wait
@@ -5815,8 +5829,11 @@ impl ShardState {
         // together have no order (D143).
         let mut admitted = self.member_buf();
         admitted.reserve(members.len());
-        // The per-slot chunks the group's singles reserve between them (#749).
-        let mut group_room = GroupRoom::default();
+        // The per-slot chunks the group's singles reserve between them (#749). A group of one
+        // has nothing to share: its single reserves alone, as a first single always does, and
+        // skips the bookkeeping (about 74 instructions a commit on x86).
+        let mut group_room: Option<GroupRoom> = None;
+        let shares_room = members.len() > 1;
         self.touched.clear();
         self.group_k = 1;
         self.group_rank = 0;
@@ -6071,7 +6088,8 @@ impl ShardState {
                 continue;
             }
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                let group = matches!(m.kind, MemberKind::Single).then_some(&mut group_room);
+                let group = (shares_room && matches!(m.kind, MemberKind::Single))
+                    .then(|| group_room.get_or_insert_with(GroupRoom::default));
                 match self.reserve_room(m.bytes.as_slice(), group) {
                     Ok(bytes) => m.reserved = bytes,
                     Err(Room::Never) => {
