@@ -24,6 +24,13 @@ pub struct Bucket {
     pub nsources: u64,
     pub offcpu: u64,
     pub preempted: u64,
+    /// Misses by block kind (index 0 unused; 1 data, 2 index, 3 top index, 4 filter, 5 properties).
+    pub kind: [u64; 6],
+    /// Misses by level (7: level 7 and up, or an SST this read did not probe).
+    pub mlevel: [u64; 8],
+    /// SSTs whose range held the row, by level, and how many of them passed the row filter.
+    pub probed: [u64; 8],
+    pub passed: [u64; 8],
 }
 
 #[derive(Clone)]
@@ -55,6 +62,14 @@ impl Stats {
             a.nsources += b.nsources;
             a.offcpu += b.offcpu;
             a.preempted += b.preempted;
+            for i in 0..6 {
+                a.kind[i] += b.kind[i];
+            }
+            for i in 0..8 {
+                a.mlevel[i] += b.mlevel[i];
+                a.probed[i] += b.probed[i];
+                a.passed[i] += b.passed[i];
+            }
         }
         for (a, b) in self.hist.iter_mut().zip(&o.hist) {
             *a += b;
@@ -103,6 +118,21 @@ impl Stats {
             );
             lo = hi;
         }
+        out += "\nper read, by bucket: misses by kind (data index top-index filter props) | misses by level L0..L6,other | SSTs in range by level | of them past the row filter\n";
+        let mut lo = 0;
+        for (b, &hi) in self.buckets.iter().zip(&EDGES_US) {
+            let c = b.count.max(1) as f64;
+            let f = |v: &[u64]| v.iter().map(|x| format!("{:.3}", *x as f64 / c)).collect::<Vec<_>>().join(" ");
+            out += &format!(
+                "{lo}-{} | {} | {} | {} | {}\n",
+                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                f(&b.kind[1..]),
+                f(&b.mlevel),
+                f(&b.probed),
+                f(&b.passed),
+            );
+            lo = hi;
+        }
         out
     }
 }
@@ -129,6 +159,14 @@ thread_local! {
     static LOCAL: RefCell<Local> = RefCell::new(Local(Stats::default()));
     /// The current read's phase sums: sources, seek, cells, source count.
     pub static CUR: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+    /// The current read's probed SSTs: id, level, past the filter.
+    static PROBED: RefCell<Vec<(pigeonhole_format::SstId, usize, bool)>> = const { RefCell::new(Vec::new()) };
+}
+
+pub fn probed(id: pigeonhole_format::SstId, level: usize, passed: bool) {
+    if ON.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = PROBED.try_with(|p| p.borrow_mut().push((id, level, passed)));
+    }
 }
 
 pub fn thread_cpu_ns() -> u64 {
@@ -156,6 +194,21 @@ pub fn record(total: u64, cpu: u64, misses: u64, miss_ns: u64) {
         b.nsources += nsources;
         b.offcpu += off;
         b.preempted += u64::from(off > 2_000);
+        let _ = PROBED.try_with(|p| {
+            let mut p = p.borrow_mut();
+            for &(_, l, passed) in p.iter() {
+                b.probed[l.min(7)] += 1;
+                b.passed[l.min(7)] += u64::from(passed);
+            }
+            let _ = pigeonhole_sst::MISS_LOG.try_with(|m| {
+                for (kind, id) in m.borrow_mut().drain(..) {
+                    b.kind[(kind as usize).min(5)] += 1;
+                    let l = p.iter().find(|x| x.0 == id).map_or(7, |x| x.1.min(7));
+                    b.mlevel[l] += 1;
+                }
+            });
+            p.clear();
+        });
     });
 }
 

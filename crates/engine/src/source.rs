@@ -749,7 +749,9 @@ pub(crate) fn sst_sources_row<const CACHE_ONLY: bool>(
             } else {
                 sst.reader(set, priority)?
             };
-            if !reader.may_contain_row(hash) {
+            let passed = reader.may_contain_row(hash);
+            crate::phases759::probed(reader.id(), l, passed);
+            if !passed {
                 continue;
             }
             out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
