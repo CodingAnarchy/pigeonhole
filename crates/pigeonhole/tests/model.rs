@@ -42,6 +42,9 @@
 //! (the WAL replays what the OS holds); fault plans and in-commit power losses are off, and
 //! the tests built on a scheduled power loss skip.
 //!
+//! `PIGEONHOLE_SHARD_THREADS=k` runs the shards on `k` shared engine-owned threads
+//! (`Options::shard_threads`, D289), so a shard's turn runs between its siblings'.
+//!
 //! **Failures recovered in place** (`Options::auto_recover`, D265, #620). With the option on
 //! and injected read and write errors (`FaultPlan::io_error_ppm`), a failed WAL write or
 //! manifest commit fails the instance and the supervisor swaps a reopened engine in behind
@@ -246,6 +249,9 @@ struct Config {
     /// never stored (D201). Defaults to `PIGEONHOLE_ROW_CACHE` (`1`: a 64 KiB cache, small
     /// enough to evict), else off.
     row_cache: usize,
+    /// `Options::shard_threads` (D289): the shards share this many engine-owned threads.
+    /// Defaults to `PIGEONHOLE_SHARD_THREADS`, else 0 (a thread per shard).
+    shard_threads: usize,
     /// `Options::auto_recover`: with `Recovery::Io`, a failure on an injected write error
     /// is recovered in place and what survived is decided by reading back (the module doc).
     recovery: Recovery,
@@ -316,6 +322,10 @@ impl Config {
             } else {
                 0
             },
+            shard_threads: std::env::var("PIGEONHOLE_SHARD_THREADS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0),
             recovery: Recovery::Off,
         }
     }
@@ -822,6 +832,7 @@ impl Run {
             .tablet_changes(self.cfg.tablet_changes)
             .row_cache(self.cfg.row_cache)
             .row_cache_max_row(ROW_CACHE_MAX_ROW)
+            .shard_threads(self.cfg.shard_threads)
             .auto_recover(self.cfg.recovery);
         if self.cfg.fast_balancer {
             // The clock moves 1 µs per operation: a balancer pass every ~15 operations.

@@ -133,6 +133,8 @@ OPTIONS:
                            [default: the library's, on (D216)]
     --shard-spin US        Pigeonhole: a shard's idle spin before it parks, in µs (D198)
                            [default: the library's]
+    --shard-threads K      Pigeonhole: run the shards on K threads (D289)
+                           [default: the library's, one per shard]
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
     --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
@@ -193,6 +195,7 @@ struct Args {
     async_in_flight: Option<usize>,
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
+    shard_threads: Option<usize>,
     commit_spin: Option<u64>,
     txn_backoff: Option<u64>,
     dir: Option<PathBuf>,
@@ -262,6 +265,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--async" => a.async_in_flight = Some(parse(&arg, it.next())?),
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
+            "--shard-threads" => a.shard_threads = Some(parse(&arg, it.next())?),
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
             "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
@@ -349,6 +353,9 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if let Some(us) = a.shard_spin {
         r = r.shard_spin_micros(us);
+    }
+    if let Some(k) = a.shard_threads {
+        r = r.shard_threads(k);
     }
     if let Some(us) = a.commit_spin {
         r = r.commit_spin_micros(us);
@@ -768,6 +775,7 @@ mod tests {
         let rc = args("ycsb-c --row-cache 1048576");
         assert_eq!(rc.row_cache, Some(1 << 20));
         assert_eq!(args("ycsb-a --shard-spin 200").shard_spin, Some(200));
+        assert_eq!(args("ycsb-a --shard-threads 4").shard_threads, Some(4));
         assert_eq!(args("ycsb-a --commit-spin 0").commit_spin, Some(0));
         assert_eq!(args("transfer --txn-backoff 0").txn_backoff, Some(0));
         assert!(pigeonhole(&rc, None).describe().contains(" rowcache=1MiB"));

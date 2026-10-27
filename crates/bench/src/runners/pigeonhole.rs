@@ -41,6 +41,9 @@ pub(crate) struct Settings {
     /// A shard's idle spin before it parks (`Options::shard_spin`, D198), in microseconds;
     /// `None`: the library default.
     pub(crate) shard_spin_micros: Option<u64>,
+    /// The threads the shards run on (`Options::shard_threads`, D289); the library default
+    /// when not set.
+    pub(crate) shard_threads: Option<usize>,
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
@@ -364,6 +367,21 @@ impl PigeonholeRunner {
         self
     }
 
+    /// The threads the shards run on (`Options::shard_threads`, D289); the library default
+    /// when not set.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("shard_threads"));
+    /// let r = PigeonholeRunner::default().shard_threads(4);
+    /// assert!(r.describe().contains(" shard_threads=4"));
+    /// ```
+    pub fn shard_threads(mut self, k: usize) -> Self {
+        self.settings.shard_threads = Some(k);
+        self
+    }
+
     /// A blocking `None`/`Buffered` commit's spin before it parks, in microseconds
     /// (`Options::commit_spin`, D253); the library default when not set.
     ///
@@ -596,6 +614,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     }
     if let Some(bytes) = s.row_cache {
         options = options.row_cache(usize::try_from(bytes).unwrap_or(usize::MAX));
+    }
+    if let Some(k) = s.shard_threads {
+        options = options.shard_threads(k);
     }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
@@ -845,7 +866,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -872,6 +893,8 @@ impl Runner for PigeonholeRunner {
             },
             s.shard_spin_micros
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
+            s.shard_threads
+                .map_or_else(String::new, |k| format!(" shard_threads={k}")),
             s.commit_spin_micros
                 .map_or_else(String::new, |us| format!(" commit_spin={us}us")),
             match (s.presplit, s.presplit_writes) {

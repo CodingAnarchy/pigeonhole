@@ -2694,3 +2694,69 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - `readshapes`' `scan-interleaved` shape: a memtable source that parks once per row between an SST's admitted entries, the regime where lazy costs one sift per park.
 
 **Follow-up:** a lazy source left alone in the merge still settles to its end, past a row read's or a bounded scan's upper bound. The merge could settle up to the resolver's upper bound instead. That was not in the reviewed design, so it comes after PR 2.
+
+<a id="d289"></a>
+## D289 — Engine-owned shards run on a load-sized set of pinned driver threads (owner decision, 2026-10-27; runtime, engine, #760, #759; ICR 0079; amends D198, D235)
+
+**Decided:** option (a) of the shard-threading note (#760, perf287's revision 2, comment 6434752774; owner, comment 6441951893).
+- **Drivers:** k pinned driver threads run the n shards' turns. Shards and their data are unchanged.
+- **PR 1:** a fixed k (`shard_threads`, default 0: a thread per shard, as before), plus the inventory of calls that can block inside a shard's turn (below).
+- **PR 1's fixed-k A/B** (#997, comment 6446578729; AX102, 16 shards) found no fixed default; the default stays a thread per shard (coordinator, 2026-10-27).
+  - **Light load (sparse-wide buffered):** k = 1–2 put p99 at 34–38 µs against 395–553 µs at k = 16, at flat ops/s.
+  - **Heavy shapes lose throughput as k shrinks.** At k = 4: ycsb-f −29%, transfer −18%, ycsb-a −9%. At k = 1: −66–70%. At k = 8: −8% and −1.5%.
+  - **Ring waits** end 67–78% of ycsb-f's driver passes at every k, including 16. Spinning with non-blocking reaps while I/O is in flight removes them (+6–11% ops at k ≤ 4).
+  - **No-yield:** D198's yield removed at the driver level reproduced #996's trade, and stays out.
+- **PR 2:** the controller, with moves and steals. It also takes:
+  - the owner's CPU budget (ICR 0081: one function sizes the driver and compaction threads from the cores the process may use, with an embedded and a server profile), whose driver count becomes the controller's ceiling;
+  - the spin through in-flight I/O, with a k = 16 arm;
+  - the compaction-share and server-profile arms.
+  - **Grow** on turns that end with a sibling shard still queued, or awake-busy above 0.75.
+  - **Shrink** on wakes when the busy sum fits on k − 1 threads.
+  - **Damping:** as D255's.
+  - A shard moves between drivers only between its turns, and only at its holder's turn boundary: its I/O completes only on the submitting thread's ring (#402), and `release()` must run there.
+- **Client combining** (D198's C2) stays on hold.
+- **D198's yield stays.** The first step was to stop a pinned shard thread's spin from yielding (#996). On 16 per-shard threads that moved the tail rather than removing it, and #996 closed (comments 6442595313 and 6443366250).
+  - **Never yielding:** sparse-wide put p99 fell 60%, but ycsb-f's p99.9 rose 28–45%: clients woken onto a spinning shard's CPU waited out the window.
+  - **A 50 µs no-yield prefix:** it kept only an 11% put gain.
+  - **Next:** yield against no-yield is one arm of PR 1's fixed-k A/B, where only k threads spin.
+- **Unpinned shard threads** come back to the owner only if a second #760 run and cli692's ycsb-f check agree. On ycsb-f (#759 round 5), unpinned shard threads raised row-read p99 by 8% and p99.9 by 18%, and cut ops/s by 3.5%.
+
+**Why:** #760's put p99 (444–791 µs against a 20.3 µs floor) is queue wait for a parked shard thread whose pinned core a saturating client holds. The wakeup reaches the CPU after one EEVDF slice (p50 987 µs on Linux 6.8).
+- Fewer, busier threads park less. 8 shards gave 27–28 µs at flat ops/s, but they hold half the memtable arena.
+- A 2 ms spin reached the floor, but cost 5% of ops/s and about 5 cores.
+
+**How a driver runs (PR 1):** shard `i` runs on driver `i % k`. Each pass runs every held shard's turn in order, each up to its 500 µs slice. While own-ring I/O of any of them is in flight, the driver waits on its ring. Otherwise it spins once for all of them (D198), and then it parks.
+- **Wakes:** every held shard's wake target is the driver thread. Each shard announces sleep at the end of its own turn, so a message sent after that wakes the driver.
+- **Busy accounting (D256):** each turn's time goes to its shard. The spin's time is split evenly over the shards that handled a message since the last park.
+- **Shutdown** returns the handlers in shard order.
+- **Names:** with a thread per shard (`shard_threads` 0, or at least the shard count) the threads keep the names `pigeonhole-shard-{i}`. Otherwise every driver is `pigeonhole-driver-{d}`.
+- **Placement is round-robin, not blocks of n/k:** packing (D217) keeps shards `0..active` busy, and round-robin spreads them over the drivers where blocks would put them all on driver 0.
+
+**The invariant: no wait inside a turn may depend on another shard's turn.** A wait inside a turn may depend only on I/O the thread reaps itself, or on other threads. A driver blocked inside shard A's turn runs no sibling, so a wait that needed shard B's turn would deadlock whenever B shares the driver.
+- **Precedent:** application-owned mode already lets one thread drive several shards (the guide's async chapter), so the engine already keeps this.
+- **simp724 checked the in-turn waits** (#997 review): the WAL's `reap_for_wait`, the rollover and slot syncs, and pager growth all wait on I/O and reap the thread's ring, so a sibling's I/O still completes. The manifest writer's `commit_req_from_thread`, which finishes a pump's root commit itself, runs only from application threads.
+- **New code** that waits inside a turn must keep this. PR 2's moves don't lift it, since they happen only at turn boundaries.
+
+**Calls that can block a driver inside a turn (PR 1's inventory).** While one shard's turn blocks, its siblings on that driver wait. Found by reading the code at 2ac77f42. Durations are estimates. The defaults have flush and compaction on D252's compaction threads, off the shards.
+- **Every durable group:**
+  - The WAL group write (`wal/src/stream.rs` `write_buf`) is a synchronous `pwrite` into the page cache. That's microseconds, or milliseconds under dirty-page throttling.
+- **Some turns:**
+  - A manifest pump slice writes its delta synchronously (`manifest.rs` `append_delta`). Its `reclaim` takes the pager's allocator lock, which another thread may hold across file growth.
+  - A conditional write's evaluation reads SST blocks synchronously on a cache miss (`shard.rs` `read_latest`).
+- **Rare, in milliseconds:**
+  - **WAL rollover with no spare segment:** an inline `durable_sync` (`stream.rs` `rollover`), when a group is larger than the segment's last quarter or a spare's preparation failed. The WAL holds a group back before that otherwise (`wal_held_back`, which doesn't block).
+  - **Growing a WAL slot:** fallocate plus `sync_all` (`take_slot`).
+  - **A rollover while the previous header's sync is still in flight** (`rollover_waits`).
+  - **A spare segment's fallocate,** once per segment.
+  - **Pager file growth:** fallocate plus `sync_all` under the allocator lock (`pager/src/lib.rs` `allocate_from`).
+  - **io_uring EAGAIN backoff.**
+- **With `compaction_threads = 0`** (the engine crate's own default, and application-owned mode without workers), flush and compaction slices run on the shard and do synchronous SST writes and reads too.
+- **Close and open only:** the final sync and the final close's root commit, and the open's file extension and syncs.
+
+PR 1 changes none of these. PR 2's moves take a blocked driver's other shards only at its turn boundary, so the box A/B's per-turn time decides whether any of these needs to yield to siblings instead.
+
+**Tests:**
+- `runtime/tests/modes.rs` runs the engine-owned suite with every shard on one driver and with two: echo, FIFO, cross-shard forwarding, background tasks, wakes, sleeping tasks, latency bounds, shutdown and lost-wakeup round trips.
+- `drivers_hold_shards_round_robin_and_handlers_return_in_order` checks placement, thread names and the handler order.
+- `a_driver_charges_its_spin_to_the_shards_that_worked` checks the spin split. Charging every shard fails it.
+- `pigeonhole/tests/model.rs` takes `PIGEONHOLE_SHARD_THREADS=k`. Sweeps run it with 1 and 2.

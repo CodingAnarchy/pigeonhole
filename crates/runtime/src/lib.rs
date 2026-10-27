@@ -152,6 +152,12 @@ pub struct RuntimeConfig {
     /// value with [`Error::InvalidConfig`]. As with tasks on shards, tasks still queued or
     /// running on engine-owned workers at shutdown are dropped unfinished.
     pub compaction_threads: usize,
+    /// Engine-owned mode: the driver threads the shards run on (D289). Zero (the default)
+    /// gives each shard a thread of its own; `k` in `1..shards` runs the shards' turns on
+    /// `k` threads, shard `i` on thread `i % k`, each pinned like a shard thread. A larger
+    /// value means one per shard. Fewer threads, each busier, park less: a commit then
+    /// rarely waits for its shard's thread to be woken and scheduled (#760).
+    pub shard_threads: usize,
     /// Longest a background task runs before yielding.
     pub time_slice: Duration,
     /// Engine-owned mode: how long a shard thread that just handled a message keeps
@@ -172,6 +178,7 @@ impl RuntimeConfig {
             shards: pigeonhole_io::sys::default_shards(),
             pin_threads: true,
             compaction_threads: 0,
+            shard_threads: 0,
             time_slice: Duration::from_micros(500),
             idle_spin: Duration::ZERO,
             vfs,
@@ -576,65 +583,6 @@ impl<H: ShardHandler> ShardCore<H> {
         n
     }
 
-    /// Before parking (engine-owned mode, D198): polls the queue for up to the spin window
-    /// if a message was handled since the last park, so a client's next message is taken
-    /// without a wakeup. Returns whether work arrived (the loop runs again at once). The
-    /// window is measured on the real clock: a simulated clock may not move while polling.
-    fn spin_before_park(&mut self) -> bool {
-        if !self.spin.due() {
-            return false;
-        }
-        // A poll that runs counts as busy (D256): the thread is awake and polling, kept so
-        // by its clients. On the VFS clock, as the turns are (a simulated clock does not
-        // move while polling, and counts nothing). A skipped poll (the window is zero, no
-        // message since the last park, or the backoff) adds nothing: timing the skip
-        // counted two clock reads' worth on Linux and macOS and nothing on Windows, where
-        // consecutive reads of the clock can be equal.
-        let spun_from = self.vfs.monotonic_nanos();
-        let hit = self.spin_poll();
-        self.signal()
-            .add_spin(self.vfs.monotonic_nanos().saturating_sub(spun_from));
-        hit
-    }
-
-    /// The poll itself: the queue for up to the spin window, then the sleep handshake on a
-    /// miss. Returns whether work arrived.
-    fn spin_poll(&mut self) -> bool {
-        // Awake while polling, so a producer does not wake the thread (on a ring backend
-        // that is a syscall); sleep is announced again, and checked once more, on a miss.
-        self.signal().awake();
-        let end = std::time::Instant::now() + self.spin.window;
-        let mut polls = 0u32;
-        let mut hit = loop {
-            if self.stash.is_none() {
-                self.stash = self.rx.try_recv().ok();
-            }
-            if self.stash.is_some() || self.signal().task_woken() || self.inbox().is_closed() {
-                break true;
-            }
-            polls = polls.wrapping_add(1);
-            if polls.is_multiple_of(64) {
-                if std::time::Instant::now() >= end {
-                    break false;
-                }
-                // Let another runnable thread in (an oversubscribed machine).
-                thread::yield_now();
-            } else {
-                std::hint::spin_loop();
-            }
-        };
-        if !hit {
-            // The sleep handshake again: whatever a producer published before it read the
-            // flag is found here, and anything later wakes the thread.
-            hit = self.check_before_sleep();
-        }
-        self.spin.record(hit);
-        if hit {
-            self.signal().awake();
-        }
-        hit
-    }
-
     fn run_once(&mut self, deadline: u64) -> bool {
         let more = self.run_turn(deadline);
         #[cfg(debug_assertions)]
@@ -816,56 +764,165 @@ impl<H: ShardHandler> ShardCore<H> {
 /// completion ends the wait sooner).
 const RING_IDLE_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Body of an engine-owned shard thread.
-fn shard_main<H: ShardHandler>(mut core: ShardCore<H>) -> H {
-    let _shard = EnterShard::new(core.id);
+/// Body of an engine-owned driver thread (D289): the turns of the shards it holds, one
+/// after another, then one spin and one park for all of them. With one shard it is that
+/// shard's thread, as before D289. Returns the handlers with their shards' ids.
+fn driver_main<H: ShardHandler>(mut cores: Vec<ShardCore<H>>) -> Vec<(ShardId, H)> {
     let mut idle_park = sched::IdlePark::default();
-    core.attach();
-    core.signal()
-        .set_target(match pigeonhole_io::own_io_waker() {
-            Some(w) => WakeTarget::ThreadRing(thread::current(), w),
+    let mut done = Vec::with_capacity(cores.len());
+    // The driver reads the clock and the spin window from its first shard: every shard of
+    // a runtime shares both.
+    debug_assert!(
+        cores
+            .iter()
+            .all(|c| Arc::ptr_eq(&c.vfs, &cores[0].vfs) && c.spin.window == cores[0].spin.window)
+    );
+    for core in &mut cores {
+        core.attach();
+    }
+    // Every shard wakes this thread: its park, or its wait in its own ring.
+    let waker = pigeonhole_io::own_io_waker();
+    for core in &cores {
+        core.signal().set_target(match &waker {
+            Some(w) => WakeTarget::ThreadRing(thread::current(), w.clone()),
             None => WakeTarget::Thread(thread::current()),
         });
+    }
     loop {
-        let start = core.vfs.monotonic_nanos();
-        let deadline = start.saturating_add(core.time_slice);
-        let more = core.run_once(deadline);
-        // The turn's time, for the balancer's view of how busy this shard is (D217).
-        core.signal()
-            .add_busy(core.vfs.monotonic_nanos().saturating_sub(start));
-        if core.inbox().is_closed() {
-            core.finish();
-            return core.handler;
-        }
-        // No spin while I/O only this thread reaps is in flight: it waits on that below.
-        if !more && !(core.own_ring && pigeonhole_io::own_io_in_flight()) && core.spin_before_park()
-        {
-            continue;
-        }
-        if !more {
-            if core.own_ring && pigeonhole_io::own_io_in_flight() {
-                // I/O only this thread completes (its ring, #402): wait on it rather than
-                // park, until a completion, a wake (the ring's eventfd) or the deadline.
-                let now = core.vfs.monotonic_nanos();
-                let until = core
-                    .next_deadline()
-                    .map_or(RING_IDLE_WAIT, |d| {
-                        std::time::Duration::from_nanos(d.saturating_sub(now))
-                    })
-                    .min(RING_IDLE_WAIT);
-                pigeonhole_io::reap_own_io(Some(until));
+        let mut more = false;
+        let mut i = 0;
+        while i < cores.len() {
+            let core = &mut cores[i];
+            let start = core.vfs.monotonic_nanos();
+            let deadline = start.saturating_add(core.time_slice);
+            more |= core.run_once(deadline);
+            // The turn's time, for the balancer's view of how busy this shard is (D217).
+            core.signal()
+                .add_busy(core.vfs.monotonic_nanos().saturating_sub(start));
+            if core.inbox().is_closed() {
+                let mut core = cores.swap_remove(i);
+                let _shard = EnterShard::new(core.id);
+                core.finish();
+                done.push((core.id, core.handler));
                 continue;
             }
-            // Until the next message, or the earliest sleeping task's deadline (re-checked
-            // sooner while the clock has not shown it keeps real time: a simulated clock
-            // moves without waking anyone).
+            i += 1;
+        }
+        if cores.is_empty() {
+            return done;
+        }
+        if more {
+            continue;
+        }
+        // I/O only this thread completes (its ring, #402), for any of its shards: wait on
+        // it rather than spin or park, until a completion, a wake (the ring's eventfd) or
+        // the earliest deadline.
+        let own_ring = cores.iter().any(|c| c.own_ring);
+        if own_ring && pigeonhole_io::own_io_in_flight() {
+            let now = cores[0].vfs.monotonic_nanos();
+            let until = next_deadline(&cores)
+                .map_or(RING_IDLE_WAIT, |d| {
+                    Duration::from_nanos(d.saturating_sub(now))
+                })
+                .min(RING_IDLE_WAIT);
+            pigeonhole_io::reap_own_io(Some(until));
+            continue;
+        }
+        if spin_before_park(&mut cores) {
+            continue;
+        }
+        // Every shard announced sleep at the end of its turn (or of the spin), so a message
+        // sent since wakes this thread. Until then, or the earliest sleeping task's deadline
+        // (re-checked sooner while the clock has not shown it keeps real time: a simulated
+        // clock moves without waking anyone).
+        for core in &cores {
             core.signal().parked();
-            match core.next_deadline() {
-                None => thread::park(),
-                Some(d) => idle_park.park(&*core.vfs, d),
-            }
+        }
+        match next_deadline(&cores) {
+            None => thread::park(),
+            Some(d) => idle_park.park(&*cores[0].vfs, d),
         }
     }
+}
+
+/// The earliest deadline of a sleeping background task on any of `cores`.
+fn next_deadline<H: ShardHandler>(cores: &[ShardCore<H>]) -> Option<u64> {
+    cores.iter().filter_map(ShardCore::next_deadline).min()
+}
+
+/// Before parking (engine-owned mode, D198): if any of a driver's shards handled a message
+/// since the last park, polls all their queues for up to the spin window, so a client's
+/// next message is taken without a wakeup. Returns whether work arrived (the loop runs
+/// again at once). The window is measured on the real clock: a simulated clock may not
+/// move while polling.
+fn spin_before_park<H: ShardHandler>(cores: &mut [ShardCore<H>]) -> bool {
+    // `due` consumes each shard's "handled a message" mark and its backoff.
+    let due: Vec<bool> = cores.iter_mut().map(|c| c.spin.due()).collect();
+    let n_due = due.iter().filter(|&&d| d).count() as u64;
+    if n_due == 0 {
+        return false;
+    }
+    // A poll that runs counts as busy (D256): the thread is awake and polling, kept so by
+    // its clients. On the VFS clock, as the turns are (a simulated clock does not move
+    // while polling, and counts nothing), split evenly over the shards that made it due.
+    // A skipped poll (the window is zero, no message since the last park, or the backoff)
+    // adds nothing: timing the skip counted two clock reads' worth on Linux and macOS and
+    // nothing on Windows, where consecutive reads of the clock can be equal.
+    let spun_from = cores[0].vfs.monotonic_nanos();
+    let window = cores[0].spin.window;
+    let hit = spin_poll(cores, window);
+    let spun = cores[0].vfs.monotonic_nanos().saturating_sub(spun_from);
+    let share = spun / n_due;
+    for (core, _) in cores.iter_mut().zip(&due).filter(|(_, d)| **d) {
+        core.spin.record(hit);
+        core.signal().add_spin(share);
+    }
+    hit
+}
+
+/// The poll itself: every shard's queue for up to the spin window, then the sleep
+/// handshake on a miss. Returns whether work arrived.
+fn spin_poll<H: ShardHandler>(cores: &mut [ShardCore<H>], window: Duration) -> bool {
+    // Awake while polling, so a producer does not wake the thread (on a ring backend that
+    // is a syscall); sleep is announced again, and checked once more, on a miss.
+    for core in cores.iter() {
+        core.signal().awake();
+    }
+    let end = std::time::Instant::now() + window;
+    let mut polls = 0u32;
+    let mut hit = 'poll: loop {
+        for core in cores.iter_mut() {
+            if core.stash.is_none() {
+                core.stash = core.rx.try_recv().ok();
+            }
+            if core.stash.is_some() || core.signal().task_woken() || core.inbox().is_closed() {
+                break 'poll true;
+            }
+        }
+        polls = polls.wrapping_add(1);
+        if polls.is_multiple_of(64) {
+            if std::time::Instant::now() >= end {
+                break false;
+            }
+            // Let another runnable thread in (an oversubscribed machine).
+            thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    };
+    if !hit {
+        // The sleep handshake again, for every shard: whatever a producer published
+        // before it read the flag is found here, and anything later wakes the thread.
+        for core in cores.iter_mut() {
+            hit |= core.check_before_sleep();
+        }
+    }
+    if hit {
+        for core in cores.iter() {
+            core.signal().awake();
+        }
+    }
+    hit
 }
 
 /// Every shard's submitter, indexed by shard.
@@ -970,7 +1027,8 @@ fn spawn_pinned<T: Send + 'static>(
 /// [`Runtime::shutdown`], discarding the handlers.
 pub struct Runtime<H: ShardHandler> {
     submitters: Arc<[Submitter<H::Msg>]>,
-    shards: Vec<JoinHandle<H>>,
+    /// The driver threads, each returning its shards' handlers (D289).
+    shards: Vec<JoinHandle<Vec<(ShardId, H)>>>,
     /// The background workers' pool and their threads (engine-owned, D252, D284).
     pool: Option<Arc<Pool>>,
     workers: Vec<JoinHandle<()>>,
@@ -1018,16 +1076,20 @@ impl<H: ShardHandler> Runtime<H> {
             (None, Vec::new())
         };
         let (submitters, cores) = build(&config, handlers, pool.as_ref());
-        let threads = config.shards + config.compaction_threads;
+        let k = match config.shard_threads {
+            0 => config.shards,
+            k => k.min(config.shards),
+        };
+        let threads = k + config.compaction_threads;
         let (plan, unpinned) = if config.pin_threads {
             match pigeonhole_io::sys::pin_plan(threads) {
                 Ok(plan) => (Some(plan), None),
-                // Too few CPUs for the compaction threads too: pin the shards, which carry
-                // the commits, and leave the compaction threads unpinned (D252).
+                // Too few CPUs for the compaction threads too: pin the shard threads, which
+                // carry the commits, and leave the compaction threads unpinned (D252).
                 Err(why @ pigeonhole_io::sys::Unpinned::TooFewCpus)
                     if config.compaction_threads > 0 =>
                 {
-                    (pigeonhole_io::sys::pin_plan(config.shards).ok(), Some(why))
+                    (pigeonhole_io::sys::pin_plan(k).ok(), Some(why))
                 }
                 Err(why) => (None, Some(why)),
             }
@@ -1037,7 +1099,7 @@ impl<H: ShardHandler> Runtime<H> {
         let cpu = |k: usize| plan.as_ref().and_then(|p| p.cpu(k));
         let mut rt = Runtime {
             submitters,
-            shards: Vec::with_capacity(cores.len()),
+            shards: Vec::with_capacity(k),
             pool,
             workers: Vec::new(),
             plan: None,
@@ -1051,16 +1113,27 @@ impl<H: ShardHandler> Runtime<H> {
             let vfs = Arc::clone(&config.vfs);
             let (handle, ack) = spawn_pinned(
                 format!("pigeonhole-compaction-{j}"),
-                cpu(config.shards + j),
+                cpu(k + j),
                 move || pool::worker_main(driver, vfs),
             )?;
             rt.workers.push(handle);
             acks.push(ack);
         }
+        // Shard `i` on driver `i % k` (D289). Round-robin, not blocks of n/k: packing (D217)
+        // keeps shards `0..active` busy, and round-robin spreads those over the drivers
+        // where blocks would put them all on driver 0.
+        let mut held: Vec<Vec<ShardCore<H>>> = (0..k).map(|_| Vec::new()).collect();
         for (i, core) in cores.into_iter().enumerate() {
-            let (handle, ack) = spawn_pinned(format!("pigeonhole-shard-{i}"), cpu(i), move || {
-                shard_main(core)
-            })?;
+            held[i % k].push(core);
+        }
+        for (d, cores) in held.into_iter().enumerate() {
+            // A thread per shard keeps the shard's name, as before D289.
+            let name = if k == config.shards {
+                format!("pigeonhole-shard-{d}")
+            } else {
+                format!("pigeonhole-driver-{d}")
+            };
+            let (handle, ack) = spawn_pinned(name, cpu(d), move || driver_main(cores))?;
             rt.shards.push(handle);
             acks.push(ack);
         }
@@ -1170,14 +1243,16 @@ impl<H: ShardHandler> Runtime<H> {
         for s in self.submitters.iter() {
             s.inbox.close();
         }
-        let mut handlers = Vec::with_capacity(self.shards.len());
+        let mut handlers = Vec::with_capacity(self.submitters.len());
         let mut panic = None;
         for t in self.shards.drain(..) {
             match t.join() {
-                Ok(h) => handlers.push(h),
+                Ok(hs) => handlers.extend(hs),
                 Err(p) => panic = panic.or(Some(p)),
             }
         }
+        handlers.sort_unstable_by_key(|&(id, _)| id.0);
+        let handlers = handlers.into_iter().map(|(_, h)| h).collect();
         // Shards are gone, so nothing spawns onto the pool any more.
         if let Some(pool) = &self.pool {
             pool.close_builtin();

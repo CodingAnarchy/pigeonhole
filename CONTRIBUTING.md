@@ -75,6 +75,7 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 | `PIGEONHOLE_SEED` alone | shm `protocol` and `multiprocess`, memtable and pager `tests/common` | The one seed to run. |
 | `PIGEONHOLE_TABLET_CHANGES` | engine harness (`tests/common`), pigeonhole `model` | Engine: `1` adds the fast balancer so tablets change during a run, `0` turns tablet changes off. Pigeonhole: `0` turns them off. |
 | `PIGEONHOLE_DEFERRED_IO` | engine harness, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |
+| `PIGEONHOLE_SHARD_THREADS` | pigeonhole `model` | `k` runs the shards on `k` shared engine-owned driver threads (`Options::shard_threads`, D289); unset or `0`, a thread per shard. |
 | `PIGEONHOLE_SWEEP_STEP` | engine `tablets` and `model_check` crash sweeps | Crash after every Nth mutating operation instead of the default step. |
 | `PIGEONHOLE_SHARDS_64` | engine `model_check` | Runs the 64-shard case, which is skipped otherwise. |
 | `PIGEONHOLE_IO` | pigeonhole library (`Options` and `ReaderOptions` with no `io_backend` set) | `uring` runs on io_uring and fails to open where it is unavailable, `auto` uses it where available, anything else `pread`. The Linux CI job sets `uring` so the suites cover the io_uring backend (#402). |

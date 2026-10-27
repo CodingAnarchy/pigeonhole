@@ -58,6 +58,7 @@ pub struct Options {
     write_stall_timeout: Option<Duration>,
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
+    shard_threads: usize,
     auto_recover: Recovery,
 }
 
@@ -125,6 +126,7 @@ impl Default for Options {
             write_stall_timeout: None,
             commit_spin: None,
             shard_spin: None,
+            shard_threads: 0,
             auto_recover: Recovery::Off,
         }
     }
@@ -329,6 +331,30 @@ impl Options {
     /// by application-owned shards, whose loop the application runs.
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
+        self
+    }
+
+    /// Run the shards on `k` threads rather than one each (D289, ICR 0079): shard `i` runs
+    /// on thread `i % k`, and each thread takes its shards' turns one after another.
+    ///
+    /// - **Why:** a shard thread that waits for work sleeps, and a commit that finds it
+    ///   asleep waits for the operating system to wake and schedule it, up to a scheduler
+    ///   slice (about 1 ms on Linux) when the application's threads keep the CPUs busy.
+    ///   Fewer threads, each busier, sleep less.
+    /// - **Default `0`:** one thread per shard. `k` at or above the shard count means the
+    ///   same.
+    /// - **Pinning:** the `k` threads are pinned as the shard threads are
+    ///   ([`pin_threads`](Options::pin_threads)).
+    /// - Engine-owned mode only: application-owned shards run on threads you choose.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().shards(16).shard_threads(4);
+    /// # let _ = options;
+    /// ```
+    pub fn shard_threads(mut self, k: usize) -> Self {
+        self.shard_threads = k;
         self
     }
 
@@ -900,6 +926,7 @@ impl Options {
             }),
         };
         o.pin_threads = self.pin_threads;
+        o.shard_threads = self.shard_threads;
         o.durability = self.durability.engine();
         o.memtable_budget = self.memtable_budget;
         o.memtable_freeze_bytes = self.memtable_budget / 4;
