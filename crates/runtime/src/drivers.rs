@@ -48,6 +48,13 @@ const SHRINK_BUSY: f64 = 0.5;
 const SHRINK_WAKES_PER_OP: f64 = 0.05;
 /// Slow passes (over [`PASS_BUDGET_NANOS`]) above this fraction grow the set.
 const SLOW_PASSES: f64 = 0.01;
+/// A shrink needs at least this many ops per window on average: an idle store's drivers
+/// park and cost nothing, while shrinking it in a gap between bursts left the next burst
+/// growing back through its first seconds (#1006's third A/B: every heavy run started 16 -> 2).
+const SHRINK_MIN_OPS: u64 = 100;
+/// A shrink after which ops per window fall by more than this fraction is undone (the work
+/// needed the drivers after all: ycsb-f went 16 -> 8 -> 16 at -3%, and loses 8% at a fixed 8).
+const SHRINK_REGRET: f64 = 0.03;
 
 /// One driver's counters, read by the controller (Relaxed: windowed estimates).
 #[derive(Default)]
@@ -230,6 +237,9 @@ struct Controller {
     hold_until: Instant,
     shrink_windows: usize,
     last_shrink: Option<Instant>,
+    /// After a shrink: the target before it and the ops per window that led to it, to undo
+    /// the shrink if throughput falls ([`SHRINK_REGRET`]).
+    regret: Option<(usize, f64)>,
 }
 
 impl Controller {
@@ -243,6 +253,7 @@ impl Controller {
             hold_until: now + HOLD,
             shrink_windows: SHRINK_WINDOWS,
             last_shrink: None,
+            regret: None,
         }
     }
 
@@ -294,6 +305,15 @@ impl Controller {
         if let Some(next) = self.decide(k, drivers.slots.len()) {
             if next < k {
                 self.last_shrink = Some(now);
+                let n = self.shrink_windows.min(self.windows.len()).max(1);
+                let before = self
+                    .windows
+                    .iter()
+                    .rev()
+                    .take(n)
+                    .map(|w| w.ops)
+                    .sum::<u64>();
+                self.regret = Some((k, before as f64 / n as f64));
             } else if self
                 .last_shrink
                 .is_some_and(|at| now.duration_since(at) < UNDO)
@@ -301,15 +321,33 @@ impl Controller {
                 // A shrink undone: wait twice as long before the next one (D255).
                 self.shrink_windows = (self.shrink_windows * 2).min(MAX_SHRINK_WINDOWS);
             }
+            if next > k {
+                self.regret = None;
+            }
             self.windows.clear();
             self.hold_until = now + HOLD;
             drivers.set_target(next);
+        } else if self.windows.len() >= GROW_WINDOWS {
+            // The shrink held its throughput for a second: it stands.
+            self.regret = None;
         }
     }
 
     /// The next target, if the windows since the last resize call for one.
     fn decide(&self, k: usize, ceiling: usize) -> Option<usize> {
         let recent = |n: usize| self.windows.iter().rev().take(n);
+        // A shrink that cost throughput comes back first (the windows were cleared at it, so
+        // these are all after it).
+        if let Some((before_k, before_ops)) = self.regret
+            && before_k > k
+            && self.windows.len() >= GROW_WINDOWS
+        {
+            let after =
+                recent(GROW_WINDOWS).map(|w| w.ops).sum::<u64>() as f64 / GROW_WINDOWS as f64;
+            if after < before_ops * (1.0 - SHRINK_REGRET) {
+                return Some(before_k);
+            }
+        }
         if k < ceiling && self.windows.len() >= GROW_WINDOWS {
             let n = GROW_WINDOWS as f64;
             let busy = recent(GROW_WINDOWS).map(|w| w.max_busy).sum::<f64>() / n;
@@ -328,11 +366,16 @@ impl Controller {
             let wakes: u64 = recent(self.shrink_windows).map(|w| w.wakes).sum();
             let ops: u64 = recent(self.shrink_windows).map(|w| w.ops).sum();
             let wakes_per_op = wakes as f64 / ops.max(1) as f64;
+            let busy_enough = ops >= SHRINK_MIN_OPS * self.shrink_windows as u64;
             // Straight to the drivers the work needs at SHRINK_BUSY each, not one at a time:
             // stepping down one driver per 5 s took a light store about 100 s from 16 to 2,
             // past the bench's warm-up and most of its measured phase (#1006's first A/B).
             let needed = ((sum_busy / SHRINK_BUSY).ceil() as usize).max(1);
-            if wakes_per_op > SHRINK_WAKES_PER_OP && needed < k && slow <= SLOW_PASSES {
+            if wakes_per_op > SHRINK_WAKES_PER_OP
+                && busy_enough
+                && needed < k
+                && slow <= SLOW_PASSES
+            {
                 return Some(needed);
             }
         }
@@ -599,6 +642,7 @@ mod tests {
             hold_until: now,
             shrink_windows: SHRINK_WINDOWS,
             last_shrink: None,
+            regret: None,
         }
     }
 
@@ -627,6 +671,25 @@ mod tests {
         // Slow passes: no shrink, even with wakes.
         let c = controller(vec![window(0.1, 0.6, 0.05, 100, 1000); SHRINK_WINDOWS]);
         assert_eq!(c.decide(16, 16), None);
+    }
+
+    /// An idle store doesn't shrink, whatever its wakes per op: its drivers park.
+    #[test]
+    fn an_idle_store_does_not_shrink() {
+        let c = controller(vec![window(0.0, 0.0, 0.0, 5, 3); SHRINK_WINDOWS]);
+        assert_eq!(c.decide(16, 16), None);
+    }
+
+    /// A shrink whose next second runs more than 3% fewer ops is undone.
+    #[test]
+    fn a_shrink_that_costs_throughput_is_undone() {
+        let mut c = controller(vec![window(0.5, 2.0, 0.0, 0, 9_000); GROW_WINDOWS]);
+        c.regret = Some((16, 10_000.0));
+        assert_eq!(c.decide(8, 16), Some(16));
+        // Throughput held: the shrink stands.
+        let mut c = controller(vec![window(0.5, 2.0, 0.0, 0, 9_900); GROW_WINDOWS]);
+        c.regret = Some((16, 10_000.0));
+        assert_eq!(c.decide(8, 16), None);
     }
 
     /// A busy driver or slow passes double the set, up to the ceiling.
