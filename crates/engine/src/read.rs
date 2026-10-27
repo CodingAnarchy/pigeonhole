@@ -810,10 +810,15 @@ impl ScanCursor {
                 }
             }
             if !nb.sync {
-                // One block ahead per cursor; fetched one at a time.
+                // One block ahead per cursor; fetched one at a time. A lazy source parked
+                // short of the merge's position (D288) may never read its next block: it
+                // predicts nothing until the merge reaches it.
                 let mut upcoming = Vec::new();
                 for lane in &self.lanes {
                     for source in lane.resolver.cursor().sources() {
+                        if !source.settled() {
+                            continue;
+                        }
                         source.upcoming(1, &mut upcoming);
                         if !upcoming.is_empty() {
                             break;
@@ -1754,7 +1759,7 @@ fn skips_columns(sources: &[Source]) -> bool {
     }
     sources.iter().any(|s| match s {
         Source::Mem(m) => m.inner().skips_columns(),
-        Source::Sst(_) => true,
+        Source::Sst(_) | Source::LazySst(_) => true,
         #[cfg(test)]
         Source::Vec(_) => false,
     })
