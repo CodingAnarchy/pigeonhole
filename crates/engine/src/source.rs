@@ -667,6 +667,7 @@ pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
     // The filter probe (three hashes) only once an SST covers the row: a get of a row no
     // SST holds does not pay for it.
     let mut probe: Option<Probe> = None;
+    let mut l0 = 0u32;
     // As `FamilySsts::covering`, written out: building the probe appends to the key's buffer
     // (past the row prefix, which stays as it is), so the row is sliced afresh per SST.
     for l in 0..fam.levels.len() {
@@ -688,9 +689,11 @@ pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
             if !probe.admits(&reader) {
                 continue;
             }
+            l0 += u32::from(l == 0);
             out.push(Source::Sst(reader.iter(ScanFilter::all(), opts).into()));
         }
     }
+    fam.charge_l0(l0);
     Ok(())
 }
 
@@ -708,6 +711,7 @@ pub(crate) fn sst_sources_row<const CACHE_ONLY: bool>(
 ) -> Result<()> {
     let opts = read_options(priority, false, CACHE_ONLY);
     let hash = row_hash(escaped_row);
+    let mut l0 = 0u32;
     for l in 0..fam.levels.len() {
         let (from, search) = fam.level_start(l, row_prefix);
         for sst in &fam.levels[l][from..] {
@@ -725,9 +729,11 @@ pub(crate) fn sst_sources_row<const CACHE_ONLY: bool>(
             if !reader.may_contain_row(hash) {
                 continue;
             }
+            l0 += u32::from(l == 0);
             out.push(Source::Sst(reader.iter(filter.clone(), opts).into()));
         }
     }
+    fam.charge_l0(l0);
     Ok(())
 }
 

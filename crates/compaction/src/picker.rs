@@ -54,11 +54,18 @@ pub struct PickerOptions {
     /// oldest newest timestamps are dropped, expired or not; 0 (the default) never drops by
     /// size.
     pub fifo_max_bytes: u64,
+    /// Leveled: a read-hot slot's L0 trigger is half of `l0_trigger`, at least 2 (#759): a
+    /// slot whose readers keep paying for its L0 files compacts them sooner, so each read
+    /// probes fewer SSTs. The engine decides which slots are read-hot
+    /// ([`CompactionPicker::score_read_hot`]); the write stall keeps `l0_trigger`. Default
+    /// on.
+    pub read_hot_l0: bool,
 }
 
 impl Default for PickerOptions {
-    /// 4 L0 files, 256 MiB at L1, ×10 per level, 7 levels, 64 MiB SSTs; tiered merges take
-    /// in runs up to 1% larger and cap space amplification at 200%; FIFO has no size cap.
+    /// 4 L0 files (2 for a read-hot slot), 256 MiB at L1, ×10 per level, 7 levels, 64 MiB
+    /// SSTs; tiered merges take in runs up to 1% larger and cap space amplification at 200%;
+    /// FIFO has no size cap.
     fn default() -> Self {
         Self {
             l0_trigger: 4,
@@ -69,6 +76,7 @@ impl Default for PickerOptions {
             tiered_size_ratio_percent: 1,
             tiered_max_space_amp_percent: 200,
             fifo_max_bytes: 0,
+            read_hot_l0: true,
         }
     }
 }
@@ -262,15 +270,27 @@ impl CompactionPicker {
         &self.options
     }
 
+    /// The L0 trigger of a slot: half of [`PickerOptions::l0_trigger`] (at least 2, and never
+    /// above it) for a read-hot leveled slot with [`PickerOptions::read_hot_l0`], else
+    /// `l0_trigger`.
+    fn l0_trigger(&self, read_hot: bool) -> u32 {
+        let full = self.options.l0_trigger;
+        if read_hot && self.options.read_hot_l0 && self.style == CompactionStyle::Leveled {
+            (full / 2).max(2).min(full)
+        } else {
+            full
+        }
+    }
+
     /// The deepest level.
     fn last_level(&self) -> usize {
         usize::from(self.options.max_levels.max(2)) - 1
     }
 
-    fn level_score(&self, levels: &Levels, n: usize) -> f64 {
+    fn level_score(&self, levels: &Levels, n: usize, read_hot: bool) -> f64 {
         if n == 0 {
             let files = levels.levels.first().map_or(0, Vec::len);
-            files as f64 / f64::from(self.options.l0_trigger.max(1))
+            files as f64 / f64::from(self.l0_trigger(read_hot).max(1))
         } else if n < self.last_level() {
             levels.level_bytes(n) as f64 / self.options.level_target(n) as f64
         } else {
@@ -285,7 +305,9 @@ impl CompactionPicker {
     /// the longest window of small L0 files a merge would relieve.
     pub fn stall_score(&self, levels: &Levels) -> f64 {
         let depth = match self.style {
-            CompactionStyle::Leveled | CompactionStyle::Tiered => self.level_score(levels, 0),
+            CompactionStyle::Leveled | CompactionStyle::Tiered => {
+                self.level_score(levels, 0, false)
+            }
             CompactionStyle::FifoByTime => {
                 self.fifo_window(levels, &[]).1 as f64 / self.fifo_trigger() as f64
             }
@@ -382,12 +404,25 @@ impl CompactionPicker {
     /// unless that work's SSTs are busy (as for every style: the score does not see `busy`,
     /// and the engine moves on to the next due slot). The other styles ignore the time.
     pub fn score_at(&self, levels: &Levels, now: Timestamp, ttl_micros: u64) -> f64 {
+        self.score_read_hot(levels, now, ttl_micros, false)
+    }
+
+    /// [`score_at`](Self::score_at) for a slot the engine finds read-hot or not: a read-hot
+    /// leveled slot's L0 is due at half the trigger ([`PickerOptions::read_hot_l0`], #759).
+    /// [`stall_score`](Self::stall_score) ignores it.
+    pub fn score_read_hot(
+        &self,
+        levels: &Levels,
+        now: Timestamp,
+        ttl_micros: u64,
+        read_hot: bool,
+    ) -> f64 {
         match self.style {
             CompactionStyle::Leveled => (0..self.last_level())
-                .map(|n| self.level_score(levels, n))
+                .map(|n| self.level_score(levels, n, read_hot))
                 .fold(0.0, f64::max),
             CompactionStyle::Tiered => self
-                .level_score(levels, 0)
+                .level_score(levels, 0, false)
                 .max(self.space_amp_score(levels)),
             CompactionStyle::FifoByTime => {
                 let mut score = self.fifo_window(levels, &[]).1 as f64 / self.fifo_trigger() as f64;
@@ -423,8 +458,24 @@ impl CompactionPicker {
         now: Timestamp,
         ttl_micros: u64,
     ) -> Option<CompactionTask> {
+        self.pick_read_hot(tablet, family, levels, busy, now, ttl_micros, false)
+    }
+
+    /// [`pick`](Self::pick) for a slot the engine finds read-hot or not, as
+    /// [`score_read_hot`](Self::score_read_hot).
+    #[allow(clippy::too_many_arguments)]
+    pub fn pick_read_hot(
+        &self,
+        tablet: TabletId,
+        family: FamilyId,
+        levels: &Levels,
+        busy: &[SstId],
+        now: Timestamp,
+        ttl_micros: u64,
+        read_hot: bool,
+    ) -> Option<CompactionTask> {
         let (inputs, output_level, kind) = match self.style {
-            CompactionStyle::Leveled => self.pick_leveled(levels, busy)?,
+            CompactionStyle::Leveled => self.pick_leveled(levels, busy, read_hot)?,
             CompactionStyle::Tiered => self.pick_tiered(levels, busy)?,
             CompactionStyle::FifoByTime => self.pick_fifo(levels, busy, now, ttl_micros)?,
         };
@@ -440,9 +491,9 @@ impl CompactionPicker {
     }
 
     /// Leveled: the most urgent level's best task.
-    fn pick_leveled(&self, levels: &Levels, busy: &[SstId]) -> Option<Picked> {
+    fn pick_leveled(&self, levels: &Levels, busy: &[SstId], read_hot: bool) -> Option<Picked> {
         let mut due: Vec<(f64, usize)> = (0..self.last_level())
-            .map(|n| (self.level_score(levels, n), n))
+            .map(|n| (self.level_score(levels, n, read_hot), n))
             .filter(|&(s, _)| s >= 1.0)
             .collect();
         due.sort_by(|a, b| b.0.total_cmp(&a.0));
@@ -536,7 +587,7 @@ impl CompactionPicker {
     /// to the last level. Whole runs move, so rows are never split.
     fn pick_tiered(&self, levels: &Levels, busy: &[SstId]) -> Option<Picked> {
         let full = self.space_amp_score(levels) >= 1.0;
-        if !full && self.level_score(levels, 0) < 1.0 {
+        if !full && self.level_score(levels, 0, false) < 1.0 {
             return None;
         }
         let ids = |files: &[Arc<SstMeta>]| files.iter().map(|s| s.id).collect::<Vec<_>>();

@@ -724,6 +724,46 @@ fn busy_inputs_are_not_picked() {
 }
 
 #[test]
+fn a_read_hot_leveled_slot_compacts_l0_at_half_the_trigger_and_the_stall_does_not_move() {
+    let mut id = 0;
+    let mut levels = Levels::default();
+    levels.levels = vec![vec![sst(&mut id, 0, 5, 1000), sst(&mut id, 10, 15, 1000)]];
+    let pick = |picker: &CompactionPicker, hot: bool| {
+        picker.pick_read_hot(TabletId(1), FamilyId(1), &levels, &[], 0, 0, hot)
+    };
+    let leveled = CompactionPicker::new(CompactionStyle::Leveled, PickerOptions::default());
+    // Two L0 files: due for a read-hot slot (trigger 4 / 2), not for any other.
+    assert_eq!(leveled.score_read_hot(&levels, 0, 0, true), 1.0);
+    assert_eq!(leveled.score_read_hot(&levels, 0, 0, false), 0.5);
+    assert_eq!(leveled.score(&levels), 0.5);
+    let task = pick(&leveled, true).expect("a read-hot slot's L0 is due");
+    assert_eq!(task.output_level, 1);
+    assert_eq!(task.inputs[0].1.len(), 2);
+    assert!(pick(&leveled, false).is_none());
+    // Writers are paced on the full trigger either way: 2 files of 8.
+    assert_eq!(leveled.stall_score(&levels), 0.25);
+
+    // Off, a read-hot slot waits for the full trigger.
+    let mut options = PickerOptions::default();
+    options.read_hot_l0 = false;
+    let off = CompactionPicker::new(CompactionStyle::Leveled, options);
+    assert!(pick(&off, true).is_none());
+    // A trigger that turns L0 compaction off stays off (half of it is as far away).
+    let mut options = PickerOptions::default();
+    options.l0_trigger = u32::MAX;
+    assert!(
+        pick(
+            &CompactionPicker::new(CompactionStyle::Leveled, options),
+            true
+        )
+        .is_none()
+    );
+    // Tiered runs keep their trigger: read heat is a leveled rule.
+    let tiered = CompactionPicker::new(CompactionStyle::Tiered, PickerOptions::default());
+    assert!(pick(&tiered, true).is_none());
+}
+
+#[test]
 fn clean_cuts_take_neighbours_sharing_a_row() {
     let mut id = 0;
     let mut options = PickerOptions::default();

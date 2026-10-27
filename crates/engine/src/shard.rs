@@ -3103,6 +3103,12 @@ pub(crate) struct ShardState {
     /// nanoseconds) before which no background compaction picks them again, so one slot
     /// that keeps failing does not stop compaction for the rest of the shard (issue #141).
     slot_backoff: HashMap<(TabletId, FamilyId), (u32, u64)>,
+    /// What each slot's readers have paid for its L0 files since L0 was last empty (#759):
+    /// [`ReadHeat`], kept across the slot's SST sets.
+    read_heat: HashMap<(TabletId, FamilyId), ReadHeat>,
+    /// The slots the last `maintain` found read-hot (their L0 is due at half the trigger,
+    /// `PickerOptions::read_hot_l0`).
+    read_hot: Vec<(TabletId, FamilyId)>,
     /// The slots `maintain` scans, kept from one scan to the next so the scan does not
     /// allocate its list each time (#499).
     scan_slots: Vec<(TabletId, FamilyId)>,
@@ -3406,6 +3412,8 @@ impl ShardState {
             due_backing_off: false,
             backoff_timer: None,
             slot_backoff: HashMap::new(),
+            read_heat: HashMap::new(),
+            read_hot: Vec::new(),
             scan_slots: Vec::new(),
             scan_levels: Levels::default(),
             checkpoint_failures: 0,
@@ -9048,6 +9056,12 @@ impl ShardState {
         let mut slots = std::mem::take(&mut self.scan_slots);
         let mut levels = std::mem::take(&mut self.scan_levels);
         self.owned_slots_into(&view, &mut slots);
+        self.read_hot.clear();
+        if self.read_heat.len() > slots.len() {
+            // Heat of slots this shard no longer has.
+            let owned: std::collections::HashSet<_> = slots.iter().copied().collect();
+            self.read_heat.retain(|k, _| owned.contains(k));
+        }
         for &key in &slots {
             let Some(fam) = view.ssts.family(key.0, key.1) else {
                 continue;
@@ -9058,9 +9072,13 @@ impl ShardState {
             if meta.merge == MergeKind::Unknown {
                 continue;
             }
-            let picker = self.picker(meta.options.compaction);
             fam.levels_meta_into(&mut levels);
-            let s = picker.score_at(&levels, now, meta.options.ttl_micros);
+            let hot = self.read_heat.entry(key).or_default().is_hot(fam, &levels);
+            if hot {
+                self.read_hot.push(key);
+            }
+            let picker = self.picker(meta.options.compaction);
+            let s = picker.score_read_hot(&levels, now, meta.options.ttl_micros, hot);
             score = score.max(picker.stall_score(&levels));
             if let Some(at) = picker.next_expiry(&levels, meta.options.ttl_micros)
                 && at > now
@@ -9265,13 +9283,14 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let Some(task) = self.picker(meta.options.compaction).pick(
+            let Some(task) = self.picker(meta.options.compaction).pick_read_hot(
                 key.0,
                 key.1,
                 &fam.levels_meta(),
                 &busy,
                 now,
                 meta.options.ttl_micros,
+                self.read_hot.contains(&key),
             ) else {
                 continue;
             };
@@ -10484,6 +10503,45 @@ impl ShardHandler for ShardState {
         }
         self.checkpoint_pops = 0;
         self.publish_arena();
+    }
+}
+
+/// Bytes of compaction input one L0 probe a read pays for is worth (#759): a slot is read-hot
+/// once its readers' L0 probes since L0 was last empty reach its L0 and L1 bytes over this,
+/// so compacting L0 sooner costs about what the extra probes do. LevelDB's seek compaction
+/// allows one seek per 16 KiB the same way.
+const READ_HOT_BYTES_PER_PROBE: u64 = 16 << 10;
+
+/// A slot's read heat (#759): the L0 probes its readers paid for (sampled, on each SST set's
+/// `FamilySsts::l0_probes`) since its L0 was last empty.
+#[derive(Debug, Default)]
+pub(crate) struct ReadHeat {
+    /// The current set's counter, and its value when this heat started counting it.
+    set: Arc<AtomicU64>,
+    base: u64,
+    /// Probes charged to earlier sets since L0 was last empty.
+    earlier: u64,
+}
+
+impl ReadHeat {
+    /// Whether the slot whose current set is `fam` (with `levels`) is read-hot.
+    fn is_hot(&mut self, fam: &FamilySsts, levels: &Levels) -> bool {
+        if !Arc::ptr_eq(&self.set, &fam.l0_probes) {
+            let old = self.set.load(Ordering::Relaxed);
+            self.earlier = self.earlier.saturating_add(old.saturating_sub(self.base));
+            self.set = Arc::clone(&fam.l0_probes);
+            self.base = 0;
+        }
+        let now = self.set.load(Ordering::Relaxed);
+        if levels.levels.first().is_none_or(Vec::is_empty) {
+            // Nothing in L0 to compact: reads since are what the next L0 files cost.
+            self.earlier = 0;
+            self.base = now;
+            return false;
+        }
+        let probes = self.earlier.saturating_add(now.saturating_sub(self.base));
+        let bytes = levels.level_bytes(0).saturating_add(levels.level_bytes(1));
+        probes >= (bytes / READ_HOT_BYTES_PER_PROBE).max(1)
     }
 }
 

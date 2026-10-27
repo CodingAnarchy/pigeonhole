@@ -3,7 +3,7 @@
 //! flush and compaction which views and seqnos are still live in this process.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use pigeonhole_cache::{BlockCache, Cell, Priority};
@@ -305,9 +305,41 @@ pub(crate) struct FamilySsts {
     /// built rather than assumed: a read searches such a level and walks any other (level 0
     /// always).
     disjoint: Vec<bool>,
+    /// L0 SSTs that point reads and row reads of this set probed past its filters, sampled
+    /// ([`FamilySsts::charge_l0`]): what the slot's readers pay for its L0 files. The owning
+    /// shard keeps a clone across sets to find read-hot slots (#759); advisory, Relaxed.
+    pub l0_probes: Arc<AtomicU64>,
+}
+
+/// One read in this many that probed an L0 SST past its filters is charged to the set, for
+/// all of them ([`FamilySsts::charge_l0`]): a hot slot's readers do not all contend on its
+/// counter.
+const L0_PROBE_SAMPLE: u32 = 16;
+
+thread_local! {
+    /// Reads left before this thread's next charge to an `l0_probes` counter.
+    static L0_PROBE_COUNTDOWN: std::cell::Cell<u32> = const { std::cell::Cell::new(L0_PROBE_SAMPLE) };
 }
 
 impl FamilySsts {
+    /// Charges a read that probed `n` L0 SSTs past their filters, one read in
+    /// [`L0_PROBE_SAMPLE`] (scaled up by it).
+    #[inline]
+    pub(crate) fn charge_l0(&self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let due = L0_PROBE_COUNTDOWN.with(|c| {
+            let left = c.get() - 1;
+            c.set(if left == 0 { L0_PROBE_SAMPLE } else { left });
+            left == 0
+        });
+        if due {
+            self.l0_probes
+                .fetch_add(u64::from(n * L0_PROBE_SAMPLE), Ordering::Relaxed);
+        }
+    }
+
     /// The levels as given (level 0 newest first, deeper levels sorted by smallest key).
     pub(crate) fn new(levels: Vec<Vec<Arc<OpenSst>>>) -> Self {
         let disjoint = levels
@@ -320,7 +352,11 @@ impl FamilySsts {
                         .all(|w| w[0].meta.largest_key < w[1].meta.smallest_key)
             })
             .collect::<Vec<_>>();
-        Self { levels, disjoint }
+        Self {
+            levels,
+            disjoint,
+            l0_probes: Arc::default(),
+        }
     }
 
     /// Whether every level below 0 is disjoint (or holds fewer than two SSTs).
