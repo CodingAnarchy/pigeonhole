@@ -1077,7 +1077,14 @@ impl Engine {
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
-            picker: options.compaction.clone(),
+            picker: {
+                // SCRATCH #759 A/B: PHDB_READ_HOT=0 turns the read-hot L0 trigger off.
+                let mut p = options.compaction.clone();
+                if std::env::var("PHDB_READ_HOT").is_ok_and(|v| v == "0") {
+                    p.read_hot_l0 = false;
+                }
+                p
+            },
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
@@ -1700,7 +1707,14 @@ impl Engine {
             view_versions: Mutex::new(BTreeMap::new()),
             #[cfg(feature = "test-hooks")]
             hooks: Default::default(),
-            picker: options.compaction.clone(),
+            picker: {
+                // SCRATCH #759 A/B: PHDB_READ_HOT=0 turns the read-hot L0 trigger off.
+                let mut p = options.compaction.clone();
+                if std::env::var("PHDB_READ_HOT").is_ok_and(|v| v == "0") {
+                    p.read_hot_l0 = false;
+                }
+                p
+            },
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),

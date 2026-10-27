@@ -600,6 +600,13 @@ pub(crate) fn options(s: &Settings) -> Options {
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
     }
+    // SCRATCH #759 A/B: PHDB_COMPACTION_CORES=<k> overrides the flush/compaction thread count.
+    if let Some(k) = std::env::var("PHDB_COMPACTION_CORES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+    {
+        options = options.compaction_cores(k);
+    }
     if let Some(us) = s.commit_spin_micros {
         options = options.commit_spin(Duration::from_micros(us));
     }
