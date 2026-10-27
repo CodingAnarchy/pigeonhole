@@ -314,8 +314,11 @@ impl Controller {
             let n = GROW_WINDOWS as f64;
             let busy = recent(GROW_WINDOWS).map(|w| w.max_busy).sum::<f64>() / n;
             let slow = recent(GROW_WINDOWS).map(|w| w.slow).sum::<f64>() / n;
+            // Doubling, not one at a time: a driver's busy saturates at 1, so it can't say how
+            // many more the work needs, and stepping up one per 3 s left transfer at 2-12 of 16
+            // drivers through its measured phase (-10%; #1006's second A/B).
             if busy > GROW_BUSY || slow > SLOW_PASSES {
-                return Some(k + 1);
+                return Some((2 * k).min(ceiling));
             }
         }
         if k > 1 && self.windows.len() >= self.shrink_windows {
@@ -626,13 +629,15 @@ mod tests {
         assert_eq!(c.decide(16, 16), None);
     }
 
-    /// A busy driver or slow passes grow the set by one, up to the ceiling.
+    /// A busy driver or slow passes double the set, up to the ceiling.
     #[test]
     fn a_busy_driver_or_slow_passes_grow_the_set() {
         let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
-        assert_eq!(c.decide(2, 16), Some(3));
+        assert_eq!(c.decide(2, 16), Some(4));
         let c = controller(vec![window(0.3, 0.6, 0.02, 0, 1000); GROW_WINDOWS]);
-        assert_eq!(c.decide(2, 16), Some(3));
+        assert_eq!(c.decide(2, 16), Some(4));
+        let c = controller(vec![window(0.9, 9.0, 0.0, 0, 1000); GROW_WINDOWS]);
+        assert_eq!(c.decide(12, 16), Some(16));
         // At the ceiling: no growth.
         let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
         assert_eq!(c.decide(16, 16), None);
