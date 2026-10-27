@@ -80,7 +80,12 @@ env:
   # collapse on the AX102 (ycsb-a async16 buffered 670-689K ops/s with p99 under 1 ms, against
   # 175-470K and 11-19 ms; default p99.9 2.1-2.4 ms against 10-12 ms). Trimming those
   # instructions is a follow-up; the thresholds go back to the default with it.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 commit-one=1.0 commit-at=1.0 commit-async=1.0
+  # `compacted`, `get-miss`, `scan-wide-q10` and `scan-filtered` get 0.8% for #994 (D288 PR 1,
+  # #711; owner's D195 policy via the coordinator, 2026-10-27): the merge tests its lazy flag once
+  # per move, and a filtered memtable source checks the entry it lands on once (+0.57%, +0.51%,
+  # +0.62%, +0.51%: 1, 1, 3 and 1 instructions per unit over 0.5%, runs 40483245930 and
+  # 40504883826), while scan-interleaved, the shape D288 is for, fell 91%.
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 commit-one=1.0 commit-at=1.0 commit-async=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8
 
 jobs:
   instructions:
