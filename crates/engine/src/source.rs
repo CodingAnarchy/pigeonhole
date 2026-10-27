@@ -19,7 +19,7 @@ use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::{FamilyId, TabletId};
 use pigeonhole_memtable::{ArenaSlice, MemIter, MemtableReader};
 use pigeonhole_runtime::ShardId;
-use pigeonhole_sst::{ReadOptions, SstIter, SstReader};
+use pigeonhole_sst::{LazySstIter, ReadOptions, ReadaheadRamp, SstIter, SstReader};
 use smallvec::SmallVec;
 
 use crate::snapshot::{FamilySsts, MemSet, OpenSst, SstSet, View};
@@ -36,7 +36,7 @@ pub(crate) enum Source {
     Sst(SstSource),
     /// As `Sst`, lazy under a filtered scan's or row read's merge (D288 PR 2): it parks
     /// before a data block, or a level's next SST, until the merge's position reaches it.
-    LazySst(SstSource<true>),
+    LazySst(SstSource<LazySstIter>),
     /// An in-memory source for the resolver tests.
     #[cfg(test)]
     Vec(pigeonhole_compaction::VecCursor),
@@ -447,12 +447,12 @@ pub(crate) fn row_prefix(row: &[u8]) -> Result<SmallVec<[u8; 96]>> {
 /// A level opens an SST's reader when it reaches it, so a failure to open one (I/O,
 /// corruption) surfaces from a scan's `next` or seek, not from creating the scan.
 ///
-/// Lazy (`LAZY`, D288 PR 2), its SST cursor parks as [`SstReader::iter_lazy`] says, and a
+/// Lazy (over a [`LazySstIter`], D288 PR 2), its SST cursor parks as [`SstReader::iter_lazy`] says, and a
 /// level that runs out of an SST parks on the next one's smallest key without opening it.
 #[derive(Debug)]
-pub(crate) struct SstSource<const LAZY: bool = false> {
+pub(crate) struct SstSource<I = SstIter> {
     /// The open SST's cursor.
-    iter: SstIter<LAZY>,
+    iter: I,
     /// The level, when there is more than one SST in it.
     level: Option<Box<Level>>,
     /// Lazy only: parked before the level's next SST (`level.at + 1`), unopened; its
@@ -476,8 +476,8 @@ struct Level {
     past_row: Vec<u8>,
 }
 
-impl<const LAZY: bool> From<SstIter<LAZY>> for SstSource<LAZY> {
-    fn from(iter: SstIter<LAZY>) -> Self {
+impl<I: SstCursor> From<I> for SstSource<I> {
+    fn from(iter: I) -> Self {
         Self {
             iter,
             level: None,
@@ -486,26 +486,65 @@ impl<const LAZY: bool> From<SstIter<LAZY>> for SstSource<LAZY> {
     }
 }
 
-/// How a level opens an SST's cursor, eager or lazy.
-pub(crate) trait OpenIter: Sized {
+/// An SST cursor a source drives, eager ([`SstIter`]) or lazy ([`LazySstIter`], D288).
+pub(crate) trait SstCursor: Cursor<Error = pigeonhole_sst::Error> + Sized {
+    /// Whether the cursor may park (a lazy level parks before its next SST too).
+    const LAZY: bool;
     fn open(reader: &Arc<SstReader>, filter: ScanFilter, opts: ReadOptions) -> Self;
+    fn set_cache_only(&mut self, on: bool);
+    fn upcoming(&self, max: usize, out: &mut Vec<pigeonhole_sst::Fetch>);
+    fn readahead_ramp(&self) -> ReadaheadRamp;
+    fn resume_readahead(&mut self, ramp: ReadaheadRamp);
+    fn at_last_block(&self) -> bool;
 }
 
-impl OpenIter for SstIter {
+impl SstCursor for SstIter {
+    const LAZY: bool = false;
     fn open(reader: &Arc<SstReader>, filter: ScanFilter, opts: ReadOptions) -> Self {
         reader.iter(filter, opts)
     }
+    fn set_cache_only(&mut self, on: bool) {
+        SstIter::set_cache_only(self, on);
+    }
+    fn upcoming(&self, max: usize, out: &mut Vec<pigeonhole_sst::Fetch>) {
+        SstIter::upcoming(self, max, out);
+    }
+    fn readahead_ramp(&self) -> ReadaheadRamp {
+        SstIter::readahead_ramp(self)
+    }
+    fn resume_readahead(&mut self, ramp: ReadaheadRamp) {
+        SstIter::resume_readahead(self, ramp);
+    }
+    fn at_last_block(&self) -> bool {
+        SstIter::at_last_block(self)
+    }
 }
 
-impl OpenIter for SstIter<true> {
+impl SstCursor for LazySstIter {
+    const LAZY: bool = true;
     fn open(reader: &Arc<SstReader>, filter: ScanFilter, opts: ReadOptions) -> Self {
         reader.iter_lazy(filter, opts)
+    }
+    fn set_cache_only(&mut self, on: bool) {
+        LazySstIter::set_cache_only(self, on);
+    }
+    fn upcoming(&self, max: usize, out: &mut Vec<pigeonhole_sst::Fetch>) {
+        LazySstIter::upcoming(self, max, out);
+    }
+    fn readahead_ramp(&self) -> ReadaheadRamp {
+        LazySstIter::readahead_ramp(self)
+    }
+    fn resume_readahead(&mut self, ramp: ReadaheadRamp) {
+        LazySstIter::resume_readahead(self, ramp);
+    }
+    fn at_last_block(&self) -> bool {
+        LazySstIter::at_last_block(self)
     }
 }
 
 impl Level {
     /// The cursor of the SST at `i`, unpositioned; `at` moves only if it opened.
-    fn open<I: OpenIter>(&mut self, i: usize) -> Result<I> {
+    fn open<I: SstCursor>(&mut self, i: usize) -> Result<I> {
         let reader = if self.opts.cache_only {
             self.files[i].reader_cache_only(&self.set, self.opts.priority)?
         } else {
@@ -516,10 +555,7 @@ impl Level {
     }
 }
 
-impl<const LAZY: bool> SstSource<LAZY>
-where
-    SstIter<LAZY>: OpenIter,
-{
+impl<I: SstCursor> SstSource<I> {
     /// Switches cache-only reads on or off for the open SST and the ones the level opens
     /// next (an async scan positions cache-only, then steps reading normally; ICR 0014).
     pub(crate) fn set_cache_only(&mut self, on: bool) {
@@ -611,12 +647,12 @@ where
 
     #[inline]
     fn valid(&self) -> bool {
-        self.iter.valid() || (LAZY && self.file_parked)
+        self.iter.valid() || (I::LAZY && self.file_parked)
     }
 
     #[inline]
     fn key(&self) -> &[u8] {
-        if LAZY && self.file_parked {
+        if I::LAZY && self.file_parked {
             return self.parked_file_key();
         }
         self.iter.key()
@@ -648,7 +684,7 @@ where
 
     #[inline]
     fn settled(&self) -> bool {
-        !(LAZY && self.file_parked) && self.iter.settled()
+        !(I::LAZY && self.file_parked) && self.iter.settled()
     }
 
     #[inline]
@@ -659,7 +695,7 @@ where
     /// Lazy (D288): settles the open SST up to `bound`, and opens the next one only once
     /// `bound` reaches its smallest key.
     fn settle_until(&mut self, bound: Option<&[u8]>) -> Result<()> {
-        if !LAZY {
+        if !I::LAZY {
             return Ok(());
         }
         loop {
@@ -744,7 +780,7 @@ where
     }
 
     fn skip_row(&mut self) -> Result<()> {
-        if LAZY && self.file_parked {
+        if I::LAZY && self.file_parked {
             // Parked inside the row (the merge moves only sources it holds): open the SST.
             self.open_parked_file()?;
         }

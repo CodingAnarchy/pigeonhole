@@ -40,7 +40,7 @@ use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::value::BlobPointer;
 use pigeonhole_format::{BlobFileId, FamilyId, SstId, TableId, TabletId};
 
-pub use iter::{ReadaheadRamp, SstIter};
+pub use iter::{LazySstIter, ReadaheadRamp, SstIter};
 pub use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use pigeonhole_io::FileRef;
 pub use reader::Fetch;
@@ -507,18 +507,14 @@ impl SstReader {
         SstIter::new(Arc::clone(self), filter, options)
     }
 
-    /// A lazy cursor over the SST (D288, ICR 0080), for a source under a merge
-    /// (`pigeonhole-compaction`'s `MergingCursor`): a move lands without filtering past its
-    /// landing entry, and stops before a data block it would have to load, parked on a
-    /// lower bound of what follows (the separator of the block it leaves, or the target of
-    /// a seek past it). The merge settles it ([`Cursor::settle_until`]) only when its
-    /// position reaches that key, so a filtered scan's SST with nothing admissible near the
-    /// merge's position reads no block past it. Unsettled positions must not be read on
-    /// their own: use it only under a merge. With [`ScanFilter::all`] it is the eager cursor.
-    ///
-    /// [`Cursor::settle_until`]: pigeonhole_format::Cursor::settle_until
-    pub fn iter_lazy(self: &Arc<Self>, filter: ScanFilter, options: ReadOptions) -> SstIter<true> {
-        SstIter::new(Arc::clone(self), filter, options)
+    /// A lazy cursor over the SST ([`LazySstIter`], D288, ICR 0080), for a source under a
+    /// merge (`pigeonhole-compaction`'s `MergingCursor`): it stops before a data block it
+    /// would have to load, parked on a lower bound of what follows, and the merge settles it
+    /// only when its position reaches that key. So a filtered scan's SST with nothing
+    /// admissible near the merge's position reads no block past it. With
+    /// [`ScanFilter::all`] it is the eager cursor.
+    pub fn iter_lazy(self: &Arc<Self>, filter: ScanFilter, options: ReadOptions) -> LazySstIter {
+        LazySstIter::new(SstIter::new(Arc::clone(self), filter, options))
     }
 }
 

@@ -19,7 +19,7 @@ use pigeonhole_format::{FamilyId, SstId, TableId, TabletId};
 use pigeonhole_io::VfsRef;
 use pigeonhole_io::sim::SimVfs;
 use pigeonhole_pager::Pager;
-use pigeonhole_sst::{ReadOptions, SstIter, SstReader, SstWriter, SstWriterOptions};
+use pigeonhole_sst::{LazySstIter, ReadOptions, SstIter, SstReader, SstWriter, SstWriterOptions};
 use proptest::prelude::*;
 
 const ROWS: usize = 12;
@@ -191,7 +191,7 @@ fn check(sources: Vec<Entries>, filter: ScanFilter, ops: &[Op]) -> Result<(), Te
     let mut lazy = MergingCursor::new(
         ssts.iter()
             .map(|s| s.iter_lazy(filter.clone(), ReadOptions::default()))
-            .collect::<Vec<SstIter<true>>>(),
+            .collect::<Vec<LazySstIter>>(),
     );
     eager.seek_to_first().unwrap();
     lazy.seek_to_first().unwrap();
