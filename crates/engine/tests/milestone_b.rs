@@ -1899,9 +1899,12 @@ fn close_returns_after_a_room_wait_a_flush_ended_on_a_frozen_clock() {
         let t = engine
             .create_table("t", &[("f".into(), FamilyOptions::default())])
             .unwrap();
-        // A burst far larger than the arena (128 KiB): the later members wait for a flush to
-        // free room, then every commit goes through and no write follows.
-        let value = vec![5u8; 2048];
+        // A burst far larger than the arena (2 MiB here): the later members wait for a flush
+        // to free room, then every commit goes through and no write follows. The values stay
+        // in the memtable (under the 4 KiB blob threshold), so the entries themselves outgrow
+        // the arena, about 2.9 MiB with their run tails (#749: with smaller values it waited
+        // only because each member reserved four chunks of its own).
+        let value = vec![5u8; 3584];
         let mut pending: Vec<_> = (0..400u32)
             .map(|i| {
                 let mut wb = WriteBatch::new();

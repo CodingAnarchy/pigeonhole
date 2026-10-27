@@ -4039,9 +4039,13 @@ fn stamped_in_an_earlier_group(moving_clock: bool, budget: u64) -> (usize, u64) 
     for i in 0..3_000u32 {
         db.put(b"z", &i.to_le_bytes());
     }
+    // 4 KiB values (inline): the 1,024 singles' entries need about 8 MiB, so in a 4 MiB
+    // arena they really run short of room (#749: they used to only through each member
+    // reserving three chunks of its own).
+    let value = vec![7u8; 4096];
     let single = |db: &mut Db, row: &[u8]| {
         let mut wb = WriteBatch::new();
-        wb.put(id, f, row, b"s", None, ValueRef::Bytes(b"single"))
+        wb.put(id, f, row, b"s", None, ValueRef::Bytes(&value))
             .unwrap();
         db.engine
             .submit(wb, Some(Durability::Buffered))

@@ -215,10 +215,13 @@ proptest! {
     /// Whatever the memtables already hold and wherever their runs end, a batch uses at most
     /// `batch_bound` of the free arena, and it never fails for want of space when the bound
     /// fits the free bytes (every entry within a chunk) or the largest free run (otherwise).
+    /// The bound does not depend on how the entries are split into batches, so it is also the
+    /// engine's bound for a group of commits applied one after another (#749): up to 48
+    /// entries here, many to one memtable.
     #[test]
     fn a_batch_stays_within_the_engine_bound(
         before in vec((0usize..4, 0usize..1500, 0u8..12), 0..200),
-        batch in vec((0usize..4, 0usize..8000), 1..8),
+        batch in vec((0usize..4, 0usize..8000), 1..48),
     ) {
         const CHUNK: usize = 1024;
         let mut arena = ShardArena::new(ArenaRegion::heap(128 * CHUNK), CHUNK);

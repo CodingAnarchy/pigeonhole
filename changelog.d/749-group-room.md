@@ -1,0 +1,2 @@
+### Fixed
+- Write stalls at high concurrency: a shard reserved three memtable chunks of arena room for every commit waiting in its group, whatever its size, so about 85 small commits pending on one shard filled the reservation with the arena nearly empty. The rest then waited for room that flushes of near-empty memtables "freed": thousands of tiny flushes, a deep L0, and throughput down to a tenth with 20 ms p99s (#749). A group's commits now reserve each memtable's chunks once between them.

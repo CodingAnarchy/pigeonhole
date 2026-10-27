@@ -74,7 +74,13 @@ env:
   # `compact` gets 1.0%: identical code measured 2660-2678 (0.7%) across nine A/Bs (blob33).
   # `get-sst` gets 1.0% until #909 pins its noise: identical code on main read 17234 and 17280
   # (runs 39856495172, 39859158837), and #910's +0.6% was that noise (owner's D195 policy).
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0
+  # `commit-one`, `commit-at` and `commit-async` get 1.0% for #985 (owner's D195 exception,
+  # 2026-10-26): admission reserves a group's per-slot arena chunks once rather than three per
+  # commit, about 74 instructions per single-commit group (+0.75-0.78%), which ended #749's
+  # collapse on the AX102 (ycsb-a async16 buffered 670-689K ops/s with p99 under 1 ms, against
+  # 175-470K and 11-19 ms; default p99.9 2.1-2.4 ms against 10-12 ms). Trimming those
+  # instructions is a follow-up; the thresholds go back to the default with it.
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 commit-one=1.0 commit-at=1.0 commit-async=1.0
 
 jobs:
   instructions:
