@@ -2601,3 +2601,64 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - **M1:** the table's offset, slot count and seed are another process's data. `ShmHeader::decode`, run at every attach, refuses a table that is misaligned, not a nonzero power of two, overlapping the reader slots or arenas, or outside the region.
 - **Defaults:** 64 MiB per reader process, as the writer's (owner ruling), so N reader processes use up to N × 64 MiB, plus 16 bytes per slot for the cache's presence and admission tables (4 MiB at the defaults). The region grows by 8 bytes per slot (2 MiB). `ReaderOptions::row_cache*` and `PigeonholeReader::row_cache_stats` (ICR 0072).
 - **Async reads** in a reader process (the latest point get and row read futures) go through its cache as the sync ones do (#946): a read future's attempt gets its read point's cache, and a fill passes the same snapshot check.
+
+<a id="d286"></a>
+## D286 — At Buffered, the coordinator sends `Decide` before its DECISION is written (engine, #708 trim 3d)
+
+**Decided:** #708's trim 3d, in the form of the design on #708 (comment 6425876718), as perf287 reviewed it (comment 6425919769).
+
+**Why:** after the last `Prepared` at Buffered, the coordinator's path was serial: queue the DECISION (~1.9 µs), write and settle its group (~2.2 µs), send `Decide` (~1.7–2.0 µs), then the hop (~2.1 µs) and the participant's apply (~1.5 µs) (#708 comments 6422171206 and 6425793394). The DECISION's write and the `Decide` hop and apply now overlap: ~3–4 µs off the commit, and off transfer's hot-row cycle, since the next transaction's snapshot waits for the release.
+
+**What changes:**
+- **The early `Decide`.** `on_prepared`, on a Buffered commit decision, builds the `Completion` with `remaining` = participants + 1 and sends `Decide { commit: true }` to every participant at once (`decide_early`, `Coord::decide_sent`). It then queues the DECISION as before. GroupSync and Sync keep the old order.
+- **The DECISION's count-down** (`settle_early_decision`). A written DECISION counts down its one in its settle, not at the append. That is after the group's write and view publish, and after a held header's sync (D200), so the hold outlasts a header that could still keep the record out of the file. A DECISION appended and then failed in its write (`fail_all(.., true)`) has a ticket and commits, answered `OutcomeUnknown`, as before.
+- **An early-decided DECISION that ends unlogged.** The coordinator was poisoned before the DECISION's group admitted it, or an earlier member's append failed in that group (`fail_all(.., false)`). It sends no abort `Decide` after the commit one and doesn't `mark_aborted`. It leaves its count, so the seqno stays held and the commit is never visible, and it answers `OutcomeUnknown`. The coordinator's `finish_applied` then treats it as a shard's death (`not_applied`), as for a share that can't apply. On reopen there is no COMMIT, so the PREPAREs are dropped, consistent with `OutcomeUnknown`.
+- **What ends the hold's visibility stall** on a poisoned coordinator: inside the failed instance, `shard_died` ends the visibility waits; the poison records the instance's failure, and with automatic recovery the supervisor swaps in a reopened engine (D265), where the commit is absent and later commits are visible. Without recovery the instance stays failed, as for any poison.
+- **`Applied` can now arrive before the DECISION settles.** `on_applied` keeps the coordinator's entry until both are in (`Coord::decision_settled`, `finish_applied`).
+- **Early `release_overlaps` and `doom_overlaps`** (D249, D276) on a commit that then ends unlogged only make waiters retry against a write that never lands: liveness, not correctness.
+
+**Why it is safe:** the seqno stays in the allocator's held set (`CROSS_HELD`, D278) until `remaining` reaches zero, and one count is the DECISION's. So a commit visible or answered `Ok` always has its DECISION written (in the page cache at Buffered, so it survives a process crash), as before. A held share is never durable and never reaches an SST (D279's argument).
+
+**Tests:**
+- `engine/tests/early_decide.rs` (`Fault::HoldDecisionRecords` keeps the DECISION unwritten while the participants apply; `Engine::abort_decides_sent`):
+  - nothing visible or answered until the DECISION is written, then committed and surviving a process crash;
+  - perf287's path 1: the coordinator poisoned by an unrelated single's failed write before the DECISION's group: no abort `Decide`, `OutcomeUnknown`, nothing visible, absent after a reopen;
+  - path 2: an earlier member's append failing in the DECISION's group: the same;
+  - a failed write after the append: committed (visible) and answered `OutcomeUnknown`, as before.
+  
+  Mutations caught: no +1 (all four fail); the unlogged DECISION taking the old abort path (paths 1 and 2 fail).
+- `pigeonhole` `recovery.rs`: the poisoned coordinator's held commit ends with the recovery swap; the commit is absent and a later commit on the other shard is visible.
+- `clock_loom.rs`: the coordinator's two count-downs (its share and its DECISION) racing the participant's; release exactly once, never visible before the DECISION is written. The model without the DECISION's count panics.
+- The D279 parking test (`vote_on_append.rs`) and D278's (`applier_release.rs`) pass unchanged; the early `Decide` reaches a held header's PREPARE and parks.
+
+<a id="d287"></a>
+## D287 — A counter family's flush combines its memtable's operands, guarded by the slot's other sources (perf287; engine, #713, D280; refines D186)
+
+**Decided:** a flush of a counter family passes `GcPolicy::other_sources`, so D186's operand combining applies to the one frozen memtable a flush writes. Before, `flush_gc` left it `None`, which D186 reads as "unknown, no combining": every `incr` reached L0 as its own entry, and a hot counter's read folded every operand since its last compaction. That's the counter-read tail of #713: on the AX102, 62–66% of a slow read's fold was in L0 SSTs.
+
+**Why it's safe:** D186 combines two operands only if no other source of the slot can hold a delete with a seqno between theirs. A frozen memtable M spans seqnos `[lo, hi]`, and every other source of its slot lies entirely below `lo` or above `hi`:
+1. **Older sources (the slot's SSTs, older frozen memtables) are below.** A memtable freezes only once all it holds is durable (D227), so no lower seqno lands in a newer memtable. That holds on every path that queues a flush: size and forced freezes (moves, WAL unpins, `all`), room-wait freezes (D124, `freeze_with::<true>`), and the close's in-place flush (#111, after the same deferral). A moved or merged tablet's SSTs were flushed before the change.
+2. **Newer memtables are above,** by the same rule.
+3. **A cross-shard share not applied here yet lands above.** Once decided, its apply seqno is held (`CROSS_HELD`, D278), and `durable_seqno` stays below it; M froze at or below `durable_seqno`. Undecided, its apply seqno isn't reserved yet. So prepared shares aren't listed: their commit id (D263) is never applied.
+0. **Open and replay** flush recovered memtables without GC (`write_memtable`), including a replay that spills and the open's flush after a spill or a layout change, so they combine nothing. A recovered memtable kept by a same-layout open holds only its slot's records above the slot's flushed-through, with the allocator seeded above them, so its later flush meets 1–3, though replay itself isn't in seqno order.
+
+**Read points:** the flush's GC takes them when it runs: live snapshots, durable snapshots, and the oldest reader process's pin. One created after M was queued (a snapshot, or a reader process pinning a view) reads at `visible_seqno` or `durable_seqno`, both ≥ `hi`, so it never splits M's operands. One released meanwhile only merges stripes nobody reads.
+
+**How:**
+- The shard records the slot's other sources in the `FlushItem` when it queues a counter family's flush (`counter_sources`, in `freeze_with` and `requeue_frozen`): the slot's SSTs with their key and seqno ranges, and its other memtables (exact ranges for frozen ones, unbounded above for the active one). Sources starting above `hi` are left out.
+- Real ranges rather than an empty list: the GC then checks the argument on every pair, and simply doesn't combine across an overlap. Debug builds assert there is none.
+- D187's bottommost purge is untouched: a flush is never bottommost.
+
+**Not in D287:** the active memtable's share (34–38% of a slow read's fold) is a follow-up, which needs its own design.
+
+**Tests:** `engine/tests/flush_fold.rs`:
+- one counter, one combined operand;
+- a snapshot splitting the run;
+- a delete between operands, every read point unchanged;
+- consecutive flushes;
+- a source inside the memtable's range keeps every operand (a test hook, `FlushGcMutation::CounterSourceInside`);
+- a decided share held while the counter slot's freeze defers, then the flush combining it and a reopen;
+- a share decided after a flush landing above it;
+- a replay that spills, then a D287 flush and a compaction.
+
+With the old `None`, 4 of the combining tests fail. The `counters` model-check targets cover the rest under sweeps, including shard-count changes across reopens.

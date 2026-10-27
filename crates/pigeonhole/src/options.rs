@@ -223,7 +223,8 @@ impl Options {
     ///   `compact` with no room for fresh memtables, waits while flushes free room
     ///   (snapshots or a slow disk can hold it). Each call's wait counts from when it began
     ///   waiting, however long the shard has been short of room for the calls ahead of it
-    ///   (D240).
+    ///   (D240). The start is kept to the millisecond, so `Busy` can come up to 1 ms before
+    ///   the timeout as the caller measures it.
     /// - **A tablet change.** A commit whose rows are being split, merged or moved between
     ///   shards waits for the change, and a cross-shard commit that a participant refuses
     ///   because of one is retried, as often as needed (D241). So is a cross-shard commit a

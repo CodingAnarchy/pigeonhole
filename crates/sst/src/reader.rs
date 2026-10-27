@@ -636,10 +636,42 @@ impl Blocks {
         )
     }
 
-    /// Submits one read of `len` bytes at block offset `offset` (a run of adjacent blocks,
-    /// for readahead that merges them).
-    pub(crate) fn submit_run(&self, offset: u64, len: usize) -> pigeonhole_io::Completion {
-        submit_bytes(&self.file, self.base + offset, len)
+    /// Submits reads of `(offset, len)` byte ranges at block offsets, the blocks (or runs of
+    /// adjacent ones) a readahead predicts, as one batch nothing waits on yet
+    /// ([`pigeonhole_io::File::submit_reads_ahead`], ICR 0077). Each resolves to a buffer of
+    /// just its bytes, as [`submit_bytes`] does.
+    pub(crate) fn submit_ahead(&self, ranges: &[(u64, usize)]) -> Vec<pigeonhole_io::Completion> {
+        let file = &self.file;
+        match file.direct_align() {
+            None => file.submit_reads_ahead(
+                ranges
+                    .iter()
+                    .map(|&(offset, len)| (file.read_buf(len), self.base + offset))
+                    .collect(),
+            ),
+            Some(a) => {
+                let spans: Vec<_> = ranges
+                    .iter()
+                    .map(|&(offset, len)| (aligned(self.base + offset, len, a), len))
+                    .collect();
+                let reads = spans
+                    .iter()
+                    .map(|&((start, alen, _), _)| (file.read_buf(alen), start))
+                    .collect();
+                file.submit_reads_ahead(reads)
+                    .into_iter()
+                    .zip(spans)
+                    .map(|(done, ((_, _, head), len))| {
+                        done.map(move |r| {
+                            r.map(|mut b| {
+                                b.keep(head..head + len);
+                                b
+                            })
+                        })
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// The fetch of `addr` (as [`Blocks::fetch_with`]) if the cache does not hold it (and

@@ -50,7 +50,7 @@ use crate::compact::{self, CompactionRecord, CompactionWork};
 use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
 use crate::purge_guard::PurgeGuard;
-use crate::snapshot::{LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
+use crate::snapshot::{FamilySsts, LiveSeqnos, LiveViews, MemSet, ShardMems, TabletMap, View};
 use crate::source::{ColumnKey, Probe, Resolver, Source, mem_sources_from, sst_sources_point};
 use crate::timer_state::TimerState;
 use crate::waker::StdWaker;
@@ -1773,6 +1773,13 @@ struct Coord {
     gives_up: bool,
     /// This attempt's number, from 1.
     attempt: u32,
+    /// D286: a Buffered commit's `Decide`s went out at the decision, before its DECISION
+    /// was written. Its `Completion` counts the DECISION as one more count-down, and the
+    /// DECISION's settle must not send an abort after it.
+    decide_sent: bool,
+    /// D286: the DECISION settled (written or not). With `decide_sent`, every `Applied` can
+    /// arrive first: the entry stays until both have happened (`finish_applied`).
+    decision_settled: bool,
 }
 
 /// A cross-shard commit decided to commit, shared by its participants (D278): each one
@@ -2069,6 +2076,61 @@ impl MemSlot {
                 (ts.min(m.min_ts), seqno.into_iter().chain(lo).min())
             })
     }
+}
+
+/// The other sources of a counter family's slot when `target` is queued for flushing
+/// (D287), as compaction lists them (D186's `GcPolicy::other_sources`): the slot's SSTs, with
+/// their key and seqno ranges, and its other memtables (`others`; `target` itself is
+/// skipped), any key. Frozen memtables are immutable, so their exact ranges; the active one
+/// takes seqnos above its smallest from now on. Sources entirely above `target` are left
+/// out, as compaction leaves out those above its inputs.
+///
+/// Every source lies entirely below or above `target`'s seqnos, so a flush combines all of
+/// its operands within a stripe:
+/// - older ones (the slot's SSTs, older frozen memtables) are below: a memtable freezes only
+///   once all it holds is durable (D227), so no lower seqno lands in a newer one; a moved or
+///   merged tablet's SSTs were flushed before the change;
+/// - newer memtables are above, by the same rule;
+/// - a cross-shard share not applied here yet lands above too: once decided, its apply
+///   seqno is held (`CROSS_HELD`, D278) and `durable_seqno` stays below it, and `target`
+///   froze at or below `durable_seqno`; undecided, its apply seqno is not reserved yet. So
+///   prepared shares are not listed (their commit id, D263, is never applied).
+///
+/// Debug builds check the first two. Were one ever false, the GC would simply not combine
+/// across the overlap. `None` for an empty memtable.
+fn counter_sources<'a>(
+    fam: Option<&FamilySsts>,
+    target: &MemEntry,
+    others: impl Iterator<Item = &'a MemEntry>,
+) -> Option<Vec<pigeonhole_compaction::OtherSource>> {
+    let (lo, hi) = target.table.seqno_range()?;
+    let root = target.table.root();
+    let ssts = fam
+        .into_iter()
+        .flat_map(|f| f.iter())
+        .map(|s| pigeonhole_compaction::OtherSource {
+            keys: Some((s.meta.smallest_key.clone(), s.meta.largest_key.clone())),
+            seqnos: s.meta.seqno_range,
+        });
+    let mems = others.filter(|m| m.table.root() != root).filter_map(|m| {
+        let (a, b) = m.table.seqno_range()?;
+        let b = if m.table.is_frozen() { b } else { Seqno::MAX };
+        Some(pigeonhole_compaction::OtherSource {
+            keys: None,
+            seqnos: (a, b),
+        })
+    });
+    let sources: Vec<_> = ssts.chain(mems).filter(|o| o.seqnos.0 <= hi).collect();
+    debug_assert!(
+        sources.iter().all(|o| o.seqnos.1 < lo),
+        "a source of the slot overlaps the flushed memtable's seqnos {lo}..={hi}: {:?}",
+        sources
+            .iter()
+            .filter(|o| o.seqnos.1 >= lo)
+            .map(|o| o.seqnos)
+            .collect::<Vec<_>>()
+    );
+    Some(sources)
 }
 
 /// Finds or creates the slot of `(tablet, family)`; a split borrow so the arena stays usable.
@@ -2949,6 +3011,10 @@ pub(crate) struct ShardState {
     /// Commits a participant found doomed (`WakeReason::Doomed`) while their round was
     /// undecided or aborting: they fail at the round's end instead of retrying (D276).
     doomed: Vec<CommitPriority>,
+    /// DECISION members set aside while `Fault::HoldDecisionRecords` is on (D286's tests);
+    /// they rejoin the end of `pending` at the first group after it is off.
+    #[cfg(feature = "test-hooks")]
+    held_decisions: Vec<Member>,
     /// Slots a wait for arena room picked to freeze, whatever their size, until their active
     /// memtable freezes: the largest ones, holding about half the arena (D124).
     room_freezes: BTreeSet<(TabletId, FamilyId)>,
@@ -3293,6 +3359,8 @@ impl ShardState {
             reader_fences: Vec::new(),
             overlap_released: Vec::new(),
             doomed: Vec::new(),
+            #[cfg(feature = "test-hooks")]
+            held_decisions: Vec::new(),
             unpin_upto: 0,
             unpin_at: 0,
             last_end: None,
@@ -4242,18 +4310,29 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let item = |m: &MemEntry, guard: Option<Arc<PurgeGuard>>| FlushItem {
-                table: meta.table,
-                tablet: key.0,
-                family: key.1,
-                root: m.table.root(),
-                reader: m.table.reader(),
-                bytes: m.table.allocated_bytes() as u64,
-                max_seqno: m.max_seqno(),
-                has_shares: m.has_shares,
-                guard,
-                options: meta.options.clone(),
-            };
+            let counter = meta.options.kind == FamilyKind::Counter;
+            // Only a counter family's flush lists the slot's SSTs (D287).
+            let fam = counter
+                .then(|| view.ssts.family(key.0, key.1).cloned())
+                .flatten();
+            let item =
+                |m: &MemEntry,
+                 guard: Option<Arc<PurgeGuard>>,
+                 counter_sources: Option<Vec<pigeonhole_compaction::OtherSource>>| {
+                    FlushItem {
+                        table: meta.table,
+                        tablet: key.0,
+                        family: key.1,
+                        root: m.table.root(),
+                        reader: m.table.reader(),
+                        bytes: m.table.allocated_bytes() as u64,
+                        max_seqno: m.max_seqno(),
+                        has_shares: m.has_shares,
+                        guard,
+                        options: meta.options.clone(),
+                        counter_sources,
+                    }
+                };
             // The fresh active memtable takes a chunk: never one admitted commits reserved.
             if tablets_on
                 && self.arena.free_bytes() < self.reserved.saturating_add(self.chunk_size)
@@ -4300,7 +4379,10 @@ impl ShardState {
                         && !self.voided_roots.contains(&root)
                         && flush_guard(slot, root, &self.prepared, &view, key))
                     .then(|| guard_state(&mut self.guarded, root, key.1));
-                    self.flush_queue.push(item(&slot.active, guard));
+                    let sources = counter
+                        .then(|| counter_sources(fam.as_deref(), &slot.active, slot.frozen.iter()))
+                        .flatten();
+                    self.flush_queue.push(item(&slot.active, guard, sources));
                     slot.seal = Seal::Flushing;
                 }
                 // Otherwise keep writing into this one; the arena-room check defers later
@@ -4321,7 +4403,17 @@ impl ShardState {
                 && !self.voided_roots.contains(&root)
                 && flush_guard(slot, root, &self.prepared, &view, key))
             .then(|| guard_state(&mut self.guarded, root, key.1));
-            self.flush_queue.push(item(&old, guard));
+            // The slot's other memtables: the older frozen ones and the fresh active one.
+            let sources = counter
+                .then(|| {
+                    counter_sources(
+                        fam.as_deref(),
+                        &old,
+                        slot.frozen.iter().chain(std::iter::once(&slot.active)),
+                    )
+                })
+                .flatten();
+            self.flush_queue.push(item(&old, guard, sources));
             slot.frozen.insert(0, old);
             self.view_dirty = true;
         }
@@ -4777,6 +4869,17 @@ impl ShardState {
                         && flush_guard(slot, m.table.root(), &self.prepared, &view, key))
                     .then(|| guard_state(&mut self.guarded, m.table.root(), key.1)),
                     options: meta.options.clone(),
+                    // As when first queued (D287): only other flushes and compactions of the
+                    // slot's older SSTs (below) and writes (above) changed the slot since.
+                    counter_sources: (meta.options.kind == FamilyKind::Counter)
+                        .then(|| {
+                            counter_sources(
+                                view.ssts.family(key.0, key.1).map(|f| &**f),
+                                m,
+                                slot.frozen.iter().chain(std::iter::once(&slot.active)),
+                            )
+                        })
+                        .flatten(),
                 });
             }
         }
@@ -5643,6 +5746,17 @@ impl ShardState {
 
     /// Runs the group commit over everything drained since the last one.
     fn run_group(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        #[cfg(feature = "test-hooks")]
+        if !self.held_decisions.is_empty()
+            && !self
+                .shared
+                .hooks
+                .faults
+                .on(crate::engine::hooks::Fault::HoldDecisionRecords)
+        {
+            let held = std::mem::take(&mut self.held_decisions);
+            self.pending.extend(held);
+        }
         if self.pending.is_empty() {
             // Nothing waits for room any more (the waiting commits were parked or
             // forwarded by a tablet change): the stall is over and its timer goes, and so
@@ -5722,6 +5836,17 @@ impl ShardState {
             if self.closing && matches!(m.kind, MemberKind::Single) {
                 m.failed = Some(Error::Closed);
                 self.settle(m, Ok(()), ctx);
+                continue;
+            }
+            #[cfg(feature = "test-hooks")]
+            if matches!(m.kind, MemberKind::CommitRecord { .. })
+                && self
+                    .shared
+                    .hooks
+                    .faults
+                    .on(crate::engine::hooks::Fault::HoldDecisionRecords)
+            {
+                self.held_decisions.push(m);
                 continue;
             }
             if self.poisoned {
@@ -6322,16 +6447,32 @@ impl ShardState {
                     if let Some(t) = m.ticket {
                         // A coordinator is always a participant (the first shard of its
                         // commit's split; a retry re-splits and re-routes), and it logs its
-                        // own PREPARE, a validation-only one too, before it decides. Undecided
-                        // until the `Decide` this record's resolution sends, that PREPARE is
-                        // still in the log: it precedes the COMMIT and waits on every other
-                        // holder, so the COMMIT's own check (`needed`) is defence in depth.
+                        // own PREPARE, a validation-only one too, before it decides. That
+                        // PREPARE is still in the log: it precedes the COMMIT and waits on
+                        // every other holder, so the COMMIT's own check (`needed`) is defence
+                        // in depth. Undecided until the `Decide` this record's resolution
+                        // sends, except after an early `Decide` (D286): then its share is
+                        // already applied (`share_seqnos`), but its seqno is still held, so no
+                        // holder can have flushed through it (D266) and the PREPARE cannot
+                        // have left the log before this COMMIT is written.
+                        let early = self.coord.get(&m.seqno).is_some_and(|c| c.decide_sent);
                         debug_assert!(
                             self.log_cross.contains_key(&m.seqno)
-                                && !self.share_seqnos.contains_key(&m.seqno),
-                            "shard {}: COMMIT {} logged without its own undecided PREPARE",
+                                && (early || !self.share_seqnos.contains_key(&m.seqno)),
+                            "shard {}: COMMIT {} logged without its own PREPARE in the log (or \
+                             with it applied before an ordinary decision)",
                             self.id.0,
                             m.seqno
+                        );
+                        // What makes the early case safe, checked directly (perf287's form):
+                        // the share's apply seqno is still held, so not yet durable.
+                        debug_assert!(
+                            !early || self.shared.shm.durable_seqno() < *apply_seqno,
+                            "shard {}: COMMIT {} logged after an early Decide with its apply \
+                             seqno {} already durable",
+                            self.id.0,
+                            m.seqno,
+                            apply_seqno
                         );
                         let kind = LoggedKind::Commit {
                             holders: Arc::clone(participants),
@@ -7515,6 +7656,11 @@ impl ShardState {
                 participants,
                 apply_seqno,
             } => {
+                // D286: a Buffered commit's `Decide`s went out at its decision.
+                if self.coord.get(&m.seqno).is_some_and(|c| c.decide_sent) {
+                    self.settle_early_decision(m.seqno, result, never_logged, ctx);
+                    return;
+                }
                 // The decision stands once the record is written (a failed sync only means
                 // the caller cannot be promised durability); a record that was never logged
                 // decides abort, since recovery could never find it.
@@ -7585,6 +7731,13 @@ impl ShardState {
 
     /// Sends a message to `shard`, handling our own inline.
     fn send(&mut self, shard: ShardId, msg: ShardMsg, ctx: &mut ShardContext<'_, ShardMsg>) {
+        #[cfg(feature = "test-hooks")]
+        if matches!(msg, ShardMsg::Decide { commit: false, .. }) {
+            self.shared.metrics[usize::from(self.id.0)]
+                .hooks
+                .abort_decides
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if shard == self.id {
             self.handle_msg(msg, ctx);
         } else if let Err(pigeonhole_runtime::Error::Closed) = ctx.submitter(shard).submit(msg) {
@@ -7659,6 +7812,8 @@ impl ShardState {
                 priority,
                 gives_up: false,
                 attempt: req.attempts + 1,
+                decide_sent: false,
+                decision_settled: false,
             },
         );
         // A retry that left a shard of its last attempt behind tells it, so commits waiting
@@ -7913,9 +8068,13 @@ impl ShardState {
             }
             return;
         }
+        let holders: Holders = shards.into();
+        if durability == Durability::Buffered {
+            self.decide_early(seqno, apply_seqno, commit_ts, &holders, ctx);
+        }
         self.pending.push(Member {
             kind: MemberKind::CommitRecord {
-                participants: shards.into(),
+                participants: holders,
                 apply_seqno,
             },
             durability,
@@ -7937,6 +8096,131 @@ impl ShardState {
             voted: false,
         });
         let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
+    }
+
+    /// D286: a Buffered commit decision is sent to the participants at once, before its
+    /// DECISION is written. Its `Completion` counts the DECISION as one more count-down, so
+    /// the seqno stays held (`CROSS_HELD`) and the client unanswered until the record is
+    /// written (`settle_early_decision`) and every share is applied, whichever is last: a
+    /// commit visible or answered always has its DECISION in the file, as before.
+    fn decide_early(
+        &mut self,
+        seqno: Seqno,
+        apply_seqno: Seqno,
+        commit_ts: Timestamp,
+        holders: &Holders,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let Some(c) = self.coord.get_mut(&seqno) else {
+            return;
+        };
+        let Some(reply) = c.reply.take() else {
+            return;
+        };
+        let done = Arc::new(Completion {
+            remaining: AtomicU32::new(u32::try_from(holders.len()).expect("few participants") + 1),
+            apply_seqno,
+            coordinator: self.id,
+            done: Mutex::new(Some(Done {
+                reply,
+                durability: c.durability,
+                submitted_at: c.submitted_at,
+                failed: None,
+            })),
+        });
+        c.completion = Some(Arc::clone(&done));
+        c.decide_sent = true;
+        let priority = c.priority;
+        for &p in holders.iter() {
+            self.send(
+                p,
+                ShardMsg::Decide {
+                    seqno,
+                    commit: true,
+                    apply_seqno,
+                    commit_ts,
+                    coordinator: self.id,
+                    priority,
+                    last: true,
+                    participants: Some(Arc::clone(holders)),
+                    completion: Some(Arc::clone(&done)),
+                },
+                ctx,
+            );
+        }
+    }
+
+    /// D286: the DECISION of a commit whose `Decide`s went out early settled.
+    /// - Written (it has a ticket; a failed write after the append included, which commits
+    ///   answered in error, as before): it counts down its one, after the group's write and
+    ///   view publish, and after a held header's sync (D200). Not at the append: the hold
+    ///   must outlast a header that could still keep the record out of the file (perf287).
+    /// - Never logged (the coordinator was poisoned before the group admitted it, or an
+    ///   earlier member's append failed, `fail_all`): no abort `Decide` after the commit one
+    ///   and no `mark_aborted`. The count stays, so the seqno stays held and the commit is
+    ///   never visible; the client hears `OutcomeUnknown`, and `finish_applied` treats it as
+    ///   a shard's death (the poisoned instance's recovery, D265, ends the hold). On reopen
+    ///   no COMMIT is found, so the PREPAREs are dropped, consistent with `OutcomeUnknown`.
+    ///   Overlaps released and commits doomed by the early `Decide` (D249, D276) only retry
+    ///   against a write that never lands: liveness, not correctness.
+    fn settle_early_decision(
+        &mut self,
+        seqno: Seqno,
+        result: Result<CommitInfo>,
+        never_logged: bool,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        let Some(c) = self.coord.get_mut(&seqno) else {
+            debug_assert!(false, "an early DECISION for {seqno} settled with no entry");
+            return;
+        };
+        c.decision_settled = true;
+        let done = c
+            .completion
+            .clone()
+            .expect("an early decision has its completion");
+        if never_logged {
+            c.not_applied = true;
+            if let Err(e) = result
+                && c.failed.is_none()
+            {
+                c.failed = Some(e);
+            }
+            if let Some(d) = done.take() {
+                d.reply.notify(Err(Error::OutcomeUnknown));
+            }
+            // Both ways a Buffered DECISION goes unlogged (a poison before its group admits
+            // it, `fail_all` after another member's append error) have poisoned this shard,
+            // so this instance can never release the held seqno: end the store's visibility
+            // waits now rather than at the last `Applied`, which a participant parked on a
+            // held header may send late (perf287's review of #989). Idempotent. A third
+            // never-logged path that leaves the shard healthy would hold the seqno for ever.
+            debug_assert!(
+                self.poisoned,
+                "an early DECISION for {seqno} went unlogged on a healthy shard"
+            );
+            self.shared.shard_died();
+        } else {
+            if let Err(e) = result
+                && let Some(d) = done
+                    .done
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .as_mut()
+            {
+                d.failed = Some(e);
+            }
+            if done.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.complete(&done, ctx);
+            }
+        }
+        let all_applied = self
+            .coord
+            .get(&seqno)
+            .is_some_and(|c| c.applied == c.participants);
+        if all_applied {
+            self.finish_applied(seqno, ctx);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -8216,6 +8500,17 @@ impl ShardState {
         if c.applied < c.participants {
             return;
         }
+        // D286: every share applied before the early-decided DECISION settled; its settle
+        // finishes the commit (`settle_early_decision`).
+        if c.decide_sent && !c.decision_settled {
+            return;
+        }
+        self.finish_applied(seqno, ctx);
+    }
+
+    /// Every participant answered `Applied` (and, for an early-decided commit, its DECISION
+    /// settled, D286): the coordinator's entry goes, and the commit is answered or retried.
+    fn finish_applied(&mut self, seqno: Seqno, ctx: &mut ShardContext<'_, ShardMsg>) {
         let mut c = self.coord.remove(&seqno).expect("present");
         // A participant found it doomed while this round ran (D276).
         let doomed = !self.doomed.is_empty() && {

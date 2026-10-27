@@ -159,6 +159,13 @@
 # main's own 50023) times 1.003. The +51 (0.1%) comes with the row cache off, where the commit
 # path does the same work as on main (no slot raise: the writer maintains the row epochs only
 # with its row cache on); main itself stood 21 instructions under the ceiling.
+#
+# Raised for #977 (#974 B, ICR 0077: a readahead goes to the backend as one batch) under
+# D195's ceiling rule (owner, 2026-10-13): compact 2770 -> 2783, the old ceiling times 1.005.
+# The head counted 2773 (run 40391388168) with main at 2770, exactly on the ceiling. The +3
+# per compacted cell (0.1%) are the two small vectors a readahead batch now builds (its
+# ranges, and the reads handed to `File::submit_reads_ahead`); on pread, which the workflow
+# measures, the batch is still the reads in turn.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1234 0.3
@@ -176,7 +183,7 @@ short-scans 13564 0.3
 commit-one 9585 0.3
 commit-sixteen 50224 0.3
 flush 2199 0.3
-compact 2770 0.5
+compact 2783 0.5
 ycsb-c 43293 1.0
 ycsb-a 27239 1.0
 commit-overwrite 11660 0.5
