@@ -2415,6 +2415,13 @@ impl ShardState {
             if !ramping || settled {
                 self.pack_down += 1;
             }
+            // Where the first pack from the unpacked start is heading, for the bench's
+            // warm-up (#983): it moves every tablet, and from all `n` shards the store reads
+            // as settled while it accrues its count. Later shrinks are not published: their
+            // last steps are slow and the warm-up's quiet window covers their moves.
+            if k == n {
+                self.pack_target = want.min(k - 1).max(floor.max(1));
+            }
         } else {
             self.pack_down = 0;
         }
