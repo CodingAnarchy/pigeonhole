@@ -478,6 +478,16 @@ struct IdleSpin {
     /// Polls still to skip after one found nothing, and the backoff exponent.
     skip: u32,
     level: u32,
+    /// How long the poll runs before it starts yielding the CPU every 64 polls (D289):
+    /// [`QUIET_SPIN`] for a thread pinned to a CPU no other thread of the runtime was
+    /// planned, zero otherwise. A yield hands the core to a client for a scheduler slice
+    /// (about 1 ms on Linux 6.8's EEVDF), and work sent meanwhile waits that slice: on the
+    /// AX102 that was 5.5K of #760's 15.2K slow queue waits. Never yielding moved the tail to
+    /// the clients instead: a client woken onto the spinning thread's CPU waited out the
+    /// whole window (ycsb-f's p99.9 +28–45%, #996). The prefix covers the next message of a
+    /// busy shard and bounds a client's wait. An unpinned thread yields from the start: it
+    /// may share its CPU with a thread of the runtime's own, which the yield lets in.
+    quiet: Duration,
 }
 
 impl IdleSpin {
@@ -490,6 +500,7 @@ impl IdleSpin {
             worked: false,
             skip: 0,
             level: 0,
+            quiet: Duration::ZERO,
         }
     }
 
@@ -603,7 +614,8 @@ impl<H: ShardHandler> ShardCore<H> {
         // Awake while polling, so a producer does not wake the thread (on a ring backend
         // that is a syscall); sleep is announced again, and checked once more, on a miss.
         self.signal().awake();
-        let end = std::time::Instant::now() + self.spin.window;
+        let start = std::time::Instant::now();
+        let (end, quiet_end) = (start + self.spin.window, start + self.spin.quiet);
         let mut polls = 0u32;
         let mut hit = loop {
             if self.stash.is_none() {
@@ -614,11 +626,16 @@ impl<H: ShardHandler> ShardCore<H> {
             }
             polls = polls.wrapping_add(1);
             if polls.is_multiple_of(64) {
-                if std::time::Instant::now() >= end {
+                let now = std::time::Instant::now();
+                if now >= end {
                     break false;
                 }
-                // Let another runnable thread in (an oversubscribed machine).
-                thread::yield_now();
+                // Let another runnable thread in (an oversubscribed machine, or a client
+                // woken onto this CPU), after the quiet prefix of a thread that holds a CPU
+                // of its own (D289).
+                if now >= quiet_end {
+                    thread::yield_now();
+                }
             } else {
                 std::hint::spin_loop();
             }
@@ -943,14 +960,29 @@ pub struct Pinning {
     pub unpinned: Option<pigeonhole_io::sys::Unpinned>,
     /// Threads the OS refused to pin; they run unpinned.
     pub failed: usize,
+    /// Shard threads whose spin before parking runs its first 50 µs without yielding the
+    /// CPU (D289): pinned, with every thread of the runtime given a CPU of its own.
+    pub quiet_spins: usize,
+}
+
+/// How long a pinned shard thread's spin before parking runs before it yields the CPU every
+/// 64 polls (D289). Longer only delays a client woken onto the thread's CPU.
+const QUIET_SPIN: Duration = Duration::from_micros(50);
+
+/// Whether a shard thread's spin before parking yields the CPU from its start (D289): not
+/// when it is pinned to a CPU no other thread of the runtime was planned. With too few CPUs
+/// for the compaction threads (D252), those run unpinned and may land on a shard's CPU.
+fn spin_yields(pinned: bool, own_cpus: bool) -> bool {
+    !(pinned && own_cpus)
 }
 
 /// Spawns a named thread that pins itself to CPU id `cpu` if given, reports whether it is
-/// pinned (a refused pin leaves it unpinned, never stops it), then runs `f`.
+/// pinned (a refused pin leaves it unpinned, never stops it), then runs `f`, which is told
+/// the same.
 fn spawn_pinned<T: Send + 'static>(
     name: String,
     cpu: Option<usize>,
-    f: impl FnOnce() -> T + Send + 'static,
+    f: impl FnOnce(bool) -> T + Send + 'static,
 ) -> Result<(JoinHandle<T>, Receiver<bool>)> {
     let (ack_tx, ack_rx) = mpsc::channel();
     let handle = thread::Builder::new()
@@ -958,7 +990,7 @@ fn spawn_pinned<T: Send + 'static>(
         .spawn(move || {
             let pinned = cpu.is_some_and(|c| pigeonhole_io::sys::pin_current_thread_to(c).is_ok());
             let _ = ack_tx.send(pinned);
-            f()
+            f(pinned)
         })
         .map_err(Error::Spawn)?;
     Ok((handle, ack_rx))
@@ -1052,21 +1084,32 @@ impl<H: ShardHandler> Runtime<H> {
             let (handle, ack) = spawn_pinned(
                 format!("pigeonhole-compaction-{j}"),
                 cpu(config.shards + j),
-                move || pool::worker_main(driver, vfs),
+                move |_| pool::worker_main(driver, vfs),
             )?;
             rt.workers.push(handle);
             acks.push(ack);
         }
-        for (i, core) in cores.into_iter().enumerate() {
-            let (handle, ack) = spawn_pinned(format!("pigeonhole-shard-{i}"), cpu(i), move || {
-                shard_main(core)
-            })?;
+        let own_cpus = unpinned.is_none();
+        for (i, mut core) in cores.into_iter().enumerate() {
+            let (handle, ack) =
+                spawn_pinned(format!("pigeonhole-shard-{i}"), cpu(i), move |pinned| {
+                    if !spin_yields(pinned, own_cpus) {
+                        core.spin.quiet = QUIET_SPIN;
+                    }
+                    shard_main(core)
+                })?;
             rt.shards.push(handle);
             acks.push(ack);
         }
         let planned = plan.as_ref().map_or(0, pigeonhole_io::sys::PinPlan::len);
         // A thread that died before reporting surfaces its panic at shutdown.
-        let pinned = acks.into_iter().filter(|a| a.recv() == Ok(true)).count();
+        let acks: Vec<bool> = acks.into_iter().map(|a| a.recv() == Ok(true)).collect();
+        let pinned = acks.iter().filter(|&&p| p).count();
+        // The shard threads' acks come after the compaction threads'.
+        rt.pinning.quiet_spins = acks[config.compaction_threads..]
+            .iter()
+            .filter(|&&p| !spin_yields(p, own_cpus))
+            .count();
         rt.pinning.pinned = pinned;
         rt.pinning.failed = planned.saturating_sub(pinned);
         rt.plan = plan;

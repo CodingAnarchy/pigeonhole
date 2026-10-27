@@ -128,7 +128,7 @@ RocksDB writes on the caller's thread (a write-group leader), which is the main 
 1. **Build C1: a bounded, adaptive spin before parking.**
    - **Client:** `PendingCommit::wait` spin-polls its completion before it parks.
    - **Shard:** an engine-owned shard thread spin-polls its queue, once it drains, before it parks.
-   - **Adaptive:** each side skips the spin when its recent waits were long (a durable commit waiting for a sync, a stalled shard), and a spinning wait yields between polls.
+   - **Adaptive:** each side skips the spin when its recent waits were long (a durable commit waiting for a sync, a stalled shard), and a spinning wait yields between polls. (D289: a pinned shard thread's only after a 50 µs prefix.)
    - **Not covered:** application-owned shards, whose loop is the application's.
 2. **C2 (combining) only on evidence.** A committing thread that runs its idle shard is acceptable in principle only if C1 is measured not to be enough for the Goals-table commit targets.
    - There is no C2 work until then, and it comes back to the owner with that evidence.
@@ -2662,3 +2662,23 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - a replay that spills, then a D287 flush and a compaction.
 
 With the old `None`, 4 of the combining tests fail. The `counters` model-check targets cover the rest under sweeps, including shard-count changes across reopens.
+
+<a id="d289"></a>
+## D289 — Engine-owned shards run on a load-sized set of pinned driver threads; a pinned shard thread's spin starts without yielding (owner decision, 2026-10-27; runtime, engine, #760, #759; amends D198, D235)
+
+**Decided:** option (a) of the shard-threading note (#760, perf287's revision 2, comment 6434752774; owner, comment 6441951893).
+- **Drivers:** k pinned driver threads run the n shards' turns, assignment is sticky, and a driver steals from a sibling whose queue has waited too long. Shards and their data are unchanged; a shard moves between drivers only between its turns.
+- **PR 1:** a fixed k, plus the inventory of calls that can block inside a shard turn. A box A/B at k ∈ {1, 2, 4, 8, 16} sets the default, which starts at n/4. One arm pins the drivers on the CCD without the V-cache.
+- **PR 2:** the controller. It grows on turns that end with a sibling shard still queued, or awake-busy above 0.75; it shrinks on wakes when the busy sum fits on k − 1 threads; it is damped as D255 is.
+- **Client combining** (D198's C2) stays on hold.
+- **Unpinned shard threads** come back to the owner only if a second #760 run and cli692's ycsb-f check agree. On ycsb-f (#759 round 5), unpinned shard threads raised row-read p99 by 8%, p99.9 by 18% and cut ops/s by 3.5%.
+
+**Why:** #760's put p99 (444–791 µs against a 20.3 µs floor) is queue wait for a parked shard thread whose pinned core a saturating client holds. The wakeup reaches the CPU after one EEVDF slice (p50 987 µs on Linux 6.8). Fewer, busier threads park less: 8 shards gave 27–28 µs at flat ops/s, and a 2 ms spin reached the floor but cost 5% of ops/s and about 5 cores.
+
+**First: a pinned thread's spin starts with a quiet prefix.** D198's spin before parking called `thread::yield_now()` every 64 polls, so an oversubscribed machine could run another thread. On a pinned shard thread the yield hands the core to a client for a scheduler slice, and work sent meanwhile waits that slice. On the AX102 that accounted for 5.5K of #760's 15.2K slow queue waits.
+- **Never yielding moved the tail to the clients** (#996's box A/B, comment 6442595313):
+  - **sparse-wide buffered:** put p99 fell from 573–770 to 231–307 µs.
+  - **ycsb-f default:** row-read p99.9 rose 45% and RMW p99.9 28%. ycsb-f's clients park on every GroupSync commit, and one woken onto a spinning shard's CPU waited out the rest of the 200 µs window.
+- **The rule:** a shard thread pinned to a CPU no other thread of the runtime was planned spins its first 50 µs (`QUIET_SPIN`) without yielding, then yields every 64 polls as before (`IdleSpin::quiet`, set at spawn from the pin's outcome). The prefix covers a busy shard's next message, and it bounds a woken client's wait. The window is unchanged (200 µs), so the idle-CPU test holds.
+- **Who yields from the start:** an unpinned thread, one the OS refused to pin, and every shard thread when the compaction threads run unpinned for want of CPUs (D252), since those may land on a shard's CPU.
+- **Counted:** `Pinning::quiet_spins`, which `runtime/tests/pinning.rs` checks in each case.
