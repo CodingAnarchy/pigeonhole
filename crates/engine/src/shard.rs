@@ -9286,7 +9286,10 @@ impl ShardState {
             // The read-hot trigger (#759) starts a compaction only while no other one runs in
             // the engine (no SST is busy): read-hot work fills idle compaction time instead of
             // doubling the compactions that compete with commits for cores and the device.
-            let hot = self.read_hot.contains(&key) && busy.is_empty();
+            // SCRATCH #759 A/B: PHDB_READ_HOT_CAP=0 drops the cap.
+            let hot = self.read_hot.contains(&key)
+                && (busy.is_empty()
+                    || std::env::var_os("PHDB_READ_HOT_CAP").is_some_and(|v| v == "0"));
             let Some(task) = self.picker(meta.options.compaction).pick_read_hot(
                 key.0,
                 key.1,
