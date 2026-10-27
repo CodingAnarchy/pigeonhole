@@ -154,6 +154,10 @@ pub enum Fault {
     /// DECISIONs rejoin the end of their shard's queue at its next group. That reorders them
     /// after anything queued meanwhile, so don't use it to reason about group order.
     HoldDecisionRecords = 10,
+    /// As `NextApply`, but only a single-shard batch's apply takes it: a cross-shard share
+    /// applies as usual. For tests that poison a shard with a share still to apply somewhere,
+    /// which would otherwise take the fault in its place (#998).
+    NextSingleApply = 11,
 }
 
 /// The faults on, a bit per `Fault` (`Hooks::faults`).

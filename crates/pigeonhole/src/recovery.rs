@@ -814,6 +814,17 @@ mod tests {
             .test_hold
             .armed
             .store(true, Ordering::SeqCst);
+        // A failed assertion releases the held DECISIONs as it unwinds: the close in the
+        // database's drop would otherwise wait for them for ever, and the test hang (#998).
+        struct ReleaseOnPanic(Arc<pigeonhole_engine::Engine>);
+        impl Drop for ReleaseOnPanic {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    self.0.release_held_decisions();
+                }
+            }
+        }
+        let _release = ReleaseOnPanic(Arc::clone(&engine));
         // The cross-shard commit, coordinated by `a`'s shard (its first row): its DECISION
         // is held, so it blocks with its shares applied and its seqno held.
         engine.inject(pigeonhole_engine::Fault::HoldDecisionRecords, true);
@@ -833,8 +844,11 @@ mod tests {
             std::thread::sleep(Duration::from_millis(1));
         }
         // The coordinator fails on an unrelated single (its apply), then the DECISION is
-        // let go: it reaches a poisoned shard and settles unlogged.
-        engine.inject(pigeonhole_engine::Fault::NextApply, true);
+        // let go: it reaches a poisoned shard and settles unlogged. Only a single's apply
+        // takes the fault: `rounds` counts at the decision, before the shares apply, and a
+        // share taking it would poison a shard while `s` applied and waited for ever to be
+        // visible behind the held seqno (#998).
+        engine.inject(pigeonhole_engine::Fault::NextSingleApply, true);
         let e = a.mutate(b"s").put("f", b"q", b"s").commit().unwrap_err();
         assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
         engine.release_held_decisions();
