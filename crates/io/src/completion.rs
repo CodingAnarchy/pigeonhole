@@ -157,9 +157,19 @@ impl<T: Send + 'static> Completion<T> {
                         state = shared.lock();
                         continue;
                     }
-                    // No drive: with backends no thread reaps in this process (the simulator
-                    // under deferred I/O), take their completions while waiting, in short slices.
+                    // No drive (the operation is on a ring another thread owns, or on none):
+                    // keep completing this thread's own I/O while waiting, in short slices.
+                    // Only this thread reaps its ring, and the operation waited on may itself
+                    // wait for that (#1002): two threads each blocked on the other's ring would
+                    // otherwise both sleep forever.
                     drop(state);
+                    if crate::own::own_io_in_flight() {
+                        crate::own::reap_own_io(Some(ORPHAN_SLICE));
+                        state = shared.lock();
+                        continue;
+                    }
+                    // With backends no thread reaps in this process (the simulator under
+                    // deferred I/O), take their completions while waiting, in short slices.
                     let reaped = crate::own::reap_orphans(ORPHAN_SLICE);
                     state = shared.lock();
                     if reaped == Some(true) {
