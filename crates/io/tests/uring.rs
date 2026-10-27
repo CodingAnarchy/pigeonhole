@@ -921,3 +921,52 @@ fn a_batch_that_could_not_all_be_published_fails_only_the_rest() {
     }
     assert!(results[ok..].iter().all(|r| r.is_err()), "the rest fail");
 }
+
+/// Two threads each block on I/O in flight on the other's own ring (#1002). A wait on a
+/// ring the waiting thread does not own can't reap that ring, so it must reap the waiter's
+/// own ring meanwhile: otherwise each sleeps on I/O only the other completes, and neither
+/// ever reaps. With engine-owned driver threads (D289), or the shared pager's growth sync on
+/// another shard's ring, this is a deadlock.
+#[test]
+fn threads_waiting_on_each_others_rings_both_complete() {
+    let _serial = serial();
+    let b = Backend::uring("uring-cross-wait");
+    let f = b.create("f");
+    f.write_at(&filled(8192, 4), 0).unwrap();
+    let (to_a, from_b) = mpsc::channel();
+    let (to_b, from_a) = mpsc::channel();
+    let (done, finished) = mpsc::channel();
+    let spawn = |name: &'static str,
+                 at: u64,
+                 give: mpsc::Sender<pigeonhole_io::Completion>,
+                 take: mpsc::Receiver<pigeonhole_io::Completion>| {
+        let (vfs, f, done) = (Arc::clone(&b.vfs), Arc::clone(&f), done.clone());
+        thread::spawn(move || {
+            vfs.attach_thread();
+            let mine = f.submit_read(IoBuf::zeroed(4096), at);
+            // Only this thread completes it now: nothing has reaped its ring.
+            assert!(
+                own_io_in_flight(),
+                "{name}: the read is not on a ring of its own"
+            );
+            give.send(mine).unwrap();
+            let theirs = take.recv().unwrap();
+            let got = theirs.wait().unwrap();
+            assert!(got.iter().all(|&x| x == 4));
+            done.send(name).unwrap();
+            // Drain before the ring goes with the thread.
+            while own_io_in_flight() {
+                reap_own_io(Some(Duration::from_millis(10)));
+            }
+        })
+    };
+    let a = spawn("a", 0, to_b, from_b);
+    let c = spawn("b", 4096, to_a, from_a);
+    for _ in 0..2 {
+        finished
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a thread waiting on the other's ring never finished: they deadlocked");
+    }
+    a.join().unwrap();
+    c.join().unwrap();
+}
