@@ -91,6 +91,11 @@ pub fn counting_file_reads<T>(f: impl FnOnce() -> T) -> (T, u64) {
     (out, n)
 }
 
+thread_local! {
+    /// SCRATCH #759: nanoseconds this thread spent reading and decoding missed blocks.
+    pub static MISS_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// Counts a block read from the file, if `counting_file_reads` is running.
 #[cold]
 pub(crate) fn note_file_read() {

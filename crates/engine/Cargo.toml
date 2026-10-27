@@ -37,6 +37,10 @@ criterion = { workspace = true }
 
 # A test thread's CPU time (`tests/tablets.rs`), which other tests running beside it do not
 # inflate as they do wall-clock time (#795).
+# SCRATCH #759: a read's thread CPU time.
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
 [target.'cfg(unix)'.dev-dependencies]
 rustix = { workspace = true }
 # `fork` for `tests/reader_fork.rs`.
