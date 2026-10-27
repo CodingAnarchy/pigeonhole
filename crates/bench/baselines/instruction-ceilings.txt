@@ -174,16 +174,25 @@
 # start, `has_back` in the two sleep checks, the merged `next_deadline`), which run on every
 # turn even with no pool configured; #989 had already used the old headroom. D289 PR 1
 # rewrites that loop and puts the checks behind one no-pool branch, recovering them.
+#
+# Raised for #994 (D288 PR 1, #711: a filtered scan's memtable sources settle only up to the
+# merge's frontier) under D195's ceiling rule (owner, 2026-10-13), each the old ceiling times
+# 1.005: compacted 1234 -> 1240, versions 5509 -> 5536, scan-narrow-q1 5251 -> 5277. The head
+# counted 1238, 5518 and 5254 (run 40480083001) against main's 1231, 5485 and 5243 (+0.6%,
+# +0.6%, +0.2%). The cost is the merge's lazy flag, tested once per move (a row read's per-cell
+# `next`), and in filtered reads one filter check where a memtable source lands, kept for its
+# settle. scan-interleaved is new (D193), the head's 3383 times 1.003: lazy settling took it
+# from 39355 on main (-91.4%).
 as-written 2028 0.3
 flushed 1842 0.3
-compacted 1234 0.3
+compacted 1240 0.3
 get-mem 5681 0.3
 get-sst 17360 0.5
 get-miss 4190 0.3
 row 2475 1.0
 scan 1358 0.3
 scan-filtered 5776 0.3
-versions 5509 0.3
+versions 5536 0.3
 counter 9388 0.5
 rows 19655 0.3
 level-scans 14015 0.6
@@ -200,6 +209,7 @@ scan-narrow 1398 0.3
 scan-small 1374 0.3
 scan-wide 1296 0.3
 commit-async 9736 0.3
-scan-narrow-q1 5251 0.3
+scan-narrow-q1 5277 0.3
 scan-wide-q10 1784 0.3
 scan-wide-q1 14326 0.3
+scan-interleaved 3394 0.3

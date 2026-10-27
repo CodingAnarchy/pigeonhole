@@ -16,6 +16,16 @@ use pigeonhole_format::scan::{CompiledFilter, ScanFilter, Verdict};
 /// does not costs no more than a plain sift. With two sources every step is one comparison.
 /// After an error the cursor must be re-seeked before use.
 ///
+/// **Lazy sources (D288).** A source may be unsettled
+/// ([`Cursor::settled`]): its key is then only a lower bound on its next entry, and it keeps
+/// its place in the heap by that bound. After every move the merge settles its top up to the
+/// key of the runner (the top's smaller child), until the top is settled or the heap is
+/// empty. Each round either settles the top, exhausts it, or moves it strictly past the
+/// runner's key (a source parks only strictly above its bound), so the rounds end. The top
+/// is then the true smallest entry: every other source's next entry is at or above its own
+/// bound, which is at or above the runner's. A source never walks further ahead of the merge
+/// than one entry, or one seek of its filter, past the runner.
+///
 /// ```
 /// use pigeonhole_compaction::{MergingCursor, VecCursor};
 /// use pigeonhole_format::Cursor;
@@ -43,6 +53,10 @@ pub struct MergingCursor<C> {
     /// The source at the top of the heap (`heap[0]`), kept beside it so `key` and `value`
     /// read it without a bounds check on the heap; 0 when the heap is empty.
     top: usize,
+    /// Whether a source may be unsettled (D288), so the top needs settling after a move:
+    /// derived from the sources ([`Cursor::may_park`]) at every rebuild of the heap, so it
+    /// cannot be missed. A merge of eager sources tests only this.
+    lazy: bool,
 }
 
 impl<C: Cursor> MergingCursor<C> {
@@ -55,6 +69,7 @@ impl<C: Cursor> MergingCursor<C> {
             row: Vec::new(),
             runner: 0,
             top: 0,
+            lazy: false,
         }
     }
 
@@ -101,14 +116,19 @@ impl<C: Cursor> MergingCursor<C> {
             row,
             runner,
             top,
+            lazy,
         } = self;
         heap.clear();
         heap.reserve(sources.len());
         row.clear();
         *runner = 0;
         *top = 0;
+        *lazy = false;
     }
 
+    // Always inlined: the lazy settle's extra call site (D288) otherwise moved it out of
+    // line in every hot caller (+0.8% on the unfiltered row reads).
+    #[inline(always)]
     fn less(&self, a: usize, b: usize) -> bool {
         match compare(self.sources[a].key(), self.sources[b].key()) {
             std::cmp::Ordering::Less => true,
@@ -141,11 +161,14 @@ impl<C: Cursor> MergingCursor<C> {
     /// Rebuilds the heap from every valid source.
     fn rebuild(&mut self) {
         self.heap.clear();
+        let mut lazy = false;
         for (i, s) in self.sources.iter().enumerate() {
+            lazy |= s.may_park();
             if s.valid() {
                 self.heap.push(i);
             }
         }
+        self.lazy = lazy;
         for i in (0..self.heap.len() / 2).rev() {
             self.sift_down(i);
         }
@@ -153,6 +176,8 @@ impl<C: Cursor> MergingCursor<C> {
     }
 
     /// Finds the smaller child of the top after the heap changed (0 when there is none).
+    /// Always inlined: the lazy settle's call site (D288) otherwise moved it out of line.
+    #[inline(always)]
     fn set_runner(&mut self) {
         self.top = self.heap.first().copied().unwrap_or(0);
         self.runner = match self.heap.len() {
@@ -160,6 +185,71 @@ impl<C: Cursor> MergingCursor<C> {
             2 => 1,
             _ => 1 + usize::from(self.less(self.heap[2], self.heap[1])),
         };
+    }
+
+    /// Settles the top after a move, in a lazy merge (D288); one predictable test otherwise,
+    /// and one more in a lazy merge whose top landed on an admitted entry.
+    #[inline]
+    fn settle_top(&mut self) -> Result<(), C::Error> {
+        if self.lazy && !self.heap.is_empty() && !self.sources[self.top].settled() {
+            self.settle_top_lazy()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`Self::settle_top`] for the once-per-read moves (seeks, row skips): only the flag
+    /// test inline, so an eager merge's seek stays as small as before (point gets).
+    #[inline(always)]
+    fn settle_top_after_seek(&mut self) -> Result<(), C::Error> {
+        if self.lazy {
+            self.settle_top_lazy()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Settles the top up to the runner's key until the top is settled or the heap is empty
+    /// (the rounds end: see the type's docs).
+    #[cold]
+    fn settle_top_lazy(&mut self) -> Result<(), C::Error> {
+        while let Some(&t) = self.heap.first() {
+            if self.sources[t].settled() {
+                return Ok(());
+            }
+            if self.runner == 0 {
+                self.sources[t].settle_until(None)?;
+            } else {
+                let r = self.heap[self.runner];
+                // Two distinct sources: the top moves up to the runner's key.
+                let (top, runner) = if t < r {
+                    let (a, b) = self.sources.split_at_mut(r);
+                    (&mut a[t], &b[0])
+                } else {
+                    let (a, b) = self.sources.split_at_mut(t);
+                    (&mut b[0], &a[r])
+                };
+                top.settle_until(Some(runner.key()))?;
+            }
+            let r = self.runner;
+            if !self.sources[t].valid() {
+                let last = self.heap.len() - 1;
+                self.heap.swap(0, last);
+                self.heap.pop();
+                self.sift_down(0);
+            } else if r == 0 || self.less(t, self.heap[r]) {
+                // Settled at or below the runner's key: the heap is unchanged. (Parked, the
+                // top is strictly past the runner's key, so this needs no settled test.)
+                continue;
+            } else {
+                // Parked past the runner's key, or tied with an earlier source: the runner
+                // takes its place, as after `Cursor::next`.
+                self.heap.swap(0, r);
+                self.sift_down(r);
+            }
+            self.set_runner();
+        }
+        Ok(())
     }
 }
 
@@ -184,7 +274,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             s.seek_to_first()?;
         }
         self.rebuild();
-        Ok(())
+        self.settle_top_after_seek()
     }
 
     fn seek(&mut self, target: &[u8]) -> Result<(), C::Error> {
@@ -193,7 +283,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             s.seek(target)?;
         }
         self.rebuild();
-        Ok(())
+        self.settle_top_after_seek()
     }
 
     /// Moves only the sources still behind `target`: past a column with many versions that
@@ -209,7 +299,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
         if moved {
             self.rebuild();
         }
-        Ok(())
+        self.settle_top_after_seek()
     }
 
     fn next(&mut self) -> Result<(), C::Error> {
@@ -227,13 +317,13 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             // one comparison; otherwise that child takes its place and it sinks from there.
             let r = self.runner;
             if r == 0 || self.less(top, self.heap[r]) {
-                return Ok(());
+                return self.settle_top();
             }
             self.heap.swap(0, r);
             self.sift_down(r);
         }
         self.set_runner();
-        Ok(())
+        self.settle_top()
     }
 
     /// Only the top source moves, then the heap settles as after [`Cursor::next`].
@@ -253,12 +343,14 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
         } else {
             let r = self.runner;
             if r == 0 || self.less(top, self.heap[r]) {
+                self.settle_top()?;
                 return Ok(true);
             }
             self.heap.swap(0, r);
             self.sift_down(r);
         }
         self.set_runner();
+        self.settle_top()?;
         Ok(true)
     }
 
@@ -284,7 +376,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
         if moved {
             self.rebuild();
         }
-        Ok(())
+        self.settle_top_after_seek()
     }
 }
 
@@ -319,6 +411,14 @@ pub struct FilteredCursor<C> {
     filter: CompiledFilter,
     all: bool,
     hint: Vec<u8>,
+    /// Lazy mode (D288): a move only lands, and a merge settles the cursor when it reaches
+    /// the merge's top. False for an unfiltered cursor, which has nothing to settle.
+    lazy: bool,
+    /// In lazy mode, whether the current entry is not admitted (a lower bound only).
+    parked: bool,
+    /// While parked, the current entry's verdict (with its hint in `hint`), so settling
+    /// does not check it again.
+    verdict: Verdict,
 }
 
 impl<C: Cursor> FilteredCursor<C> {
@@ -329,7 +429,48 @@ impl<C: Cursor> FilteredCursor<C> {
             filter: filter.into_compiled(),
             inner,
             hint: Vec::new(),
+            lazy: false,
+            parked: false,
+            verdict: Verdict::Admit,
         }
+    }
+
+    /// Wraps `inner` in lazy mode (D288), for a source under a [`MergingCursor`]: a move
+    /// lands on the next entry without filtering, and the merge settles the cursor
+    /// ([`Cursor::settle_until`]) only when it reaches the merge's top, up to the next
+    /// source's key. A source with nothing admissible near the merge's position then stops
+    /// there instead of walking ahead to its next admitted entry, however far that is.
+    /// Unsettled entries must not be read on their own: use it only under a merge.
+    ///
+    /// ```
+    /// use pigeonhole_compaction::{FilteredCursor, MergingCursor, VecCursor};
+    /// use pigeonhole_format::Cursor;
+    /// use pigeonhole_format::key::{Kind, encode_key};
+    /// use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
+    ///
+    /// let key = |row: &[u8], q: &[u8]| {
+    ///     let mut k = Vec::new();
+    ///     encode_key(&mut k, row, q, 1, 1, Kind::Put).unwrap();
+    ///     k
+    /// };
+    /// let mut filter = ScanFilter::all();
+    /// filter.qualifiers = QualifierFilter::Prefix(b"b".to_vec());
+    /// let wanted = VecCursor::new(vec![(key(b"r1", b"b"), vec![]), (key(b"r2", b"b"), vec![])]);
+    /// // Nothing admissible: an eager filter would walk all of it on the first seek.
+    /// let other = VecCursor::new((0..100u8).map(|i| (key(&[b's', i], b"a"), vec![])).collect());
+    /// let mut m = MergingCursor::new(vec![
+    ///     FilteredCursor::lazy(wanted, filter.clone()),
+    ///     FilteredCursor::lazy(other, filter),
+    /// ]);
+    /// m.seek_to_first().unwrap();
+    /// assert_eq!(m.key(), &key(b"r1", b"b")[..]);
+    /// // The other source parked on its first entry, past the merge's position.
+    /// assert!(!m.sources()[1].settled());
+    /// ```
+    pub fn lazy(inner: C, filter: ScanFilter) -> Self {
+        let mut c = Self::new(inner, filter);
+        c.lazy = !c.all;
+        c
     }
 
     /// The wrapped cursor (to pin its current value).
@@ -345,7 +486,25 @@ impl<C: Cursor> FilteredCursor<C> {
         if self.all {
             return Ok(());
         }
+        if self.lazy {
+            self.land();
+            return Ok(());
+        }
         self.settle_filtered()
+    }
+
+    /// Lazy mode: checks the entry a move landed on, once. Admitted, the cursor is settled;
+    /// otherwise it parks there and keeps the verdict for [`Cursor::settle_until`].
+    #[inline]
+    fn land(&mut self) {
+        self.parked = false;
+        if self.inner.valid() {
+            let v = self.filter.check(self.inner.key(), &mut self.hint);
+            if v != Verdict::Admit {
+                self.parked = true;
+                self.verdict = v;
+            }
+        }
     }
 
     fn settle_filtered(&mut self) -> Result<(), C::Error> {
@@ -367,6 +526,46 @@ impl<C: Cursor> Cursor for FilteredCursor<C> {
 
     fn valid(&self) -> bool {
         self.inner.valid()
+    }
+
+    #[inline]
+    fn settled(&self) -> bool {
+        !self.parked
+    }
+
+    #[inline]
+    fn may_park(&self) -> bool {
+        self.lazy
+    }
+
+    /// The eager filter's loop, parking on the first entry strictly past `bound`. The entry
+    /// it is parked on was checked when the cursor landed there: its verdict is acted on
+    /// without a second check.
+    fn settle_until(&mut self, bound: Option<&[u8]>) -> Result<(), C::Error> {
+        if !self.parked {
+            return Ok(());
+        }
+        let mut verdict = self.verdict;
+        loop {
+            if let Some(b) = bound
+                && compare(self.inner.key(), b) == std::cmp::Ordering::Greater
+            {
+                self.verdict = verdict;
+                return Ok(());
+            }
+            match verdict {
+                Verdict::Admit => break,
+                Verdict::SkipRow => self.inner.skip_row()?,
+                Verdict::Seek => self.inner.seek(&self.hint)?,
+                Verdict::Next => self.inner.next()?,
+            }
+            if !self.inner.valid() {
+                break;
+            }
+            verdict = self.filter.check(self.inner.key(), &mut self.hint);
+        }
+        self.parked = false;
+        Ok(())
     }
 
     fn key(&self) -> &[u8] {

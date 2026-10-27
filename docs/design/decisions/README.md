@@ -37,7 +37,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D19](phase-1.md#d19) — read-your-writes: commits return once visible · revised after review · **amended by D227**
 - [D20](phase-1.md#d20) — a changed shard count flushes recovered data before dropping streams
 - [D21](phase-1.md#d21) — lock page byte assignments
-- [D22](phase-1.md#d22) — filter pushdown semantics, uniform across sources · revised after review · **amended by D82**
+- [D22](phase-1.md#d22) — filter pushdown semantics, uniform across sources · revised after review · **amended by D82** · **refined by D288**
 - [D23](phase-1.md#d23) — one shared-memory view record carries the tablet map and memtables
 - [D24](phase-1.md#d24) — WAL checkpoints never strand a prepared commit · **mechanism amended by D266**
 - [D25](phase-1.md#d25) — WAL segments are chained; recovery never appends to a torn segment
@@ -297,4 +297,5 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D281](phase-3.md#d281) — Reader processes have a row cache, keyed on the writer's write watermarks moved into shared memory (shm layout 5); every writer generation empties it · owner decision, cache, shm, engine, pigeonhole, #926, ICR 0072 · refines D201
 - [D286](phase-3.md#d286) — A Buffered cross-shard commit's coordinator sends `Decide` at its decision, before its DECISION is written; the DECISION counts as one more count-down, so nothing is visible or answered until it is written; an early-decided DECISION that ends unlogged sends no abort and answers `OutcomeUnknown` · engine, #708 (3d) · builds on D278, D279
 - [D287](phase-3.md#d287) — A counter family's flush combines its memtable's operands (D186), guarded by the slot's other sources, which all lie below or above it · engine, #713, D280 · refines D186
+- [D288](phase-3.md#d288) — A filtered scan's sources settle only up to the merge's frontier: lower-bound heap keys, the top settled to the runner's key; lazy memtables (PR 1), then SSTs parked on separators (PR 2) · compaction, engine, format, sst, #711 · refines D22
 _None._

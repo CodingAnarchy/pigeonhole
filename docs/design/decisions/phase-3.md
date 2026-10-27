@@ -2662,3 +2662,35 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - a replay that spills, then a D287 flush and a compaction.
 
 With the old `None`, 4 of the combining tests fail. The `counters` model-check targets cover the rest under sweeps, including shard-count changes across reopens.
+
+<a id="d288"></a>
+## D288 — A filtered scan's sources settle only up to the merge's frontier (2026-10-27; compaction, engine, format, sst, #711; refines D22)
+
+**Decided:** design on #711 (comment 6433512006), reviewed by perf287 (comment 6433582625) with two must-fixes, both in. A filtered source under a merge keeps a key that is only a lower bound on its next admitted entry, and the merge settles only its top, up to the next source's key. PR 1 covers memtable sources and the merge protocol; PR 2 covers `SstIter` and `LevelIter`.
+
+**Why:** D22 filters each source on its own, and each source's settle looped until its next admitted entry. A source with nothing admissible near the scan's position therefore walked ahead of the merge, through every later row of the tablet, while other sources supplied the rows the scan returned. On time-series-range (#711), each scan's memtable source walked every later entity's newer points: 23K filter checks per scan against RocksDB's 6.9K steps, about 85% of client CPU. A filtered row read could walk the same way past its row.
+
+**How:**
+- **`Cursor`** gains three provided methods: `settled()` (default true), `settle_until(bound)` (default no-op) and `may_park()` (default false). `settle_until` parks only on an entry strictly greater than `bound`; an entry equal to it is checked (perf287's must-fix: a source parked on the runner's key with the lower index would otherwise stay on top unsettled for ever).
+- **`FilteredCursor::lazy`:** a move lands without filtering, and `settle_until` runs D22's verdict loop up to the bound. An unfiltered cursor built lazy stays eager, since it has nothing to settle.
+- **`MergingCursor`:** heap keys are lower bounds. After every move, through every exit (the `rebuild` paths, the runner swap, the top that stays, and the pop of an exhausted top), the merge settles its top up to the runner's key until the top is settled or the heap is empty (perf287's must-fix). Each round settles the top, exhausts it, or moves it strictly past the runner's key, so the rounds end.
+- **A `lazy` flag on the merge,** derived from its sources (`may_park`) at every heap rebuild, so it can't be missed (perf287's nit) and compaction, point gets and unfiltered scans test one bool per move (perf287's should-fix).
+- **A lazy source checks the entry it lands on once,** as an eager one does: an admitted landing settles it at once, and a rejected one parks with its verdict kept, so settling doesn't check that entry again.
+- **The engine** builds every memtable source lazy (`mem_sources_from`). A filtered scan's lane and a filtered row read set their merge lazy.
+- **Results are unchanged by construction:** the filter is a pure function of the key, and snapshots, deletes and TTL are resolved above the merge (`CellResolver`).
+- **PR 2 (planned):**
+  - `SstIter` parks on the index separator without loading the next block, and `LevelIter` on the next file's `smallest_key` without opening it.
+  - The async read-ahead (`upcoming(1)`) predicts from the merge's top only.
+  - These are perf287's points; a parked source that pays a block read per tablet open would keep most of the SST cost.
+
+**Tests:**
+- `compaction/tests/lazy.rs`:
+  - a lazy merge against the eager one, over random sources (equal keys across sources included), filters and movement sequences;
+  - an error partway through a settle, then a seek;
+  - equal keys across lazy sources (this hangs if a source parks on its bound);
+  - every movement method, `skip_column` returning true included (perf287's should-fix);
+  - the #711 shape: a source with nothing admissible moves at most once past the merge's frontier, where eagerly it walks all 1,050 entries.
+- The pigeonhole model test adds a qualifier-prefix scan after each scan, checked against the model's answer restricted to the prefix. It draws no randomness, but fewer reads shift the shared sim fault RNG, so older failing seeds may not replay.
+- `readshapes`' `scan-interleaved` shape: a memtable source that parks once per row between an SST's admitted entries, the regime where lazy costs one sift per park.
+
+**Follow-up:** a lazy source left alone in the merge still settles to its end, past a row read's or a bounded scan's upper bound. The merge could settle up to the resolver's upper bound instead. That was not in the reviewed design, so it comes after PR 2.
