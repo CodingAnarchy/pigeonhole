@@ -20,6 +20,8 @@ use pigeonhole_runtime::{
 #[derive(Debug, Clone, Copy)]
 enum Mode {
     Engine,
+    /// Engine-owned with the shards on this many driver threads (D289).
+    EngineDrivers(usize),
     App,
     /// Application-owned with this many background workers (D284), each driven by a thread
     /// of the test's.
@@ -42,6 +44,11 @@ impl<H: ShardHandler> Harness<H> {
     fn start(mode: Mode, config: RuntimeConfig, handlers: Vec<H>) -> Self {
         match mode {
             Mode::Engine => Harness::Engine(Runtime::start(config, handlers).unwrap()),
+            Mode::EngineDrivers(k) => {
+                let mut config = config;
+                config.shard_threads = k;
+                Harness::Engine(Runtime::start(config, handlers).unwrap())
+            }
             Mode::App | Mode::AppWorkers(_) => {
                 let slice = config.time_slice.as_nanos() as u64;
                 let vfs = Arc::clone(&config.vfs);
@@ -787,6 +794,35 @@ with_workers!(
     sleeping_task_is_woken_early,
 );
 
+/// Engine-owned with every shard on one driver thread, and with two (D289): the whole
+/// suite, since each test's shards then share a thread's turns, spin and park.
+macro_rules! with_drivers {
+    ($($name:ident),* $(,)?) => {
+        mod engine_owned_one_driver {
+            $(#[test] fn $name() { super::$name(super::Mode::EngineDrivers(1)) })*
+        }
+        mod engine_owned_two_drivers {
+            $(#[test] fn $name() { super::$name(super::Mode::EngineDrivers(2)) })*
+        }
+    };
+}
+
+with_drivers!(
+    echo_sync_and_async,
+    per_producer_fifo_and_batching,
+    cross_shard_forwarding,
+    current_shard_is_set_on_shard_threads,
+    background_task_runs_to_completion,
+    blocked_task_is_woken,
+    foreground_latency_bounded_sim,
+    foreground_latency_bounded_real,
+    shutdown_handles_queued_then_refuses,
+    dropped_notifier_resolves_none,
+    many_round_trips_no_lost_wakeup,
+    sleeping_task_fires_on_time_real,
+    sleeping_task_is_woken_early,
+);
+
 both_modes!(
     echo_sync_and_async,
     per_producer_fifo_and_batching,
@@ -996,6 +1032,88 @@ fn shard_threads_are_named_and_handlers_return_in_order() {
     for (i, h) in hs.iter().enumerate() {
         assert_eq!(h.records, [(0, i as u32)]);
     }
+}
+
+/// D289: with `shard_threads = 2`, five shards run on two driver threads, shard `i` on
+/// driver `i % 2`, and shutdown still returns the handlers in shard order. A value above
+/// the shard count means a thread per shard, as before.
+#[test]
+fn drivers_hold_shards_round_robin_and_handlers_return_in_order() {
+    for (k, names) in [
+        (2, ["pigeonhole-driver-0", "pigeonhole-driver-1"].as_slice()),
+        (
+            9,
+            [
+                "pigeonhole-shard-0",
+                "pigeonhole-shard-1",
+                "pigeonhole-shard-2",
+                "pigeonhole-shard-3",
+                "pigeonhole-shard-4",
+            ]
+            .as_slice(),
+        ),
+    ] {
+        let (mut cfg, _) = sim_config(5);
+        cfg.shard_threads = k;
+        let rt = Runtime::start(cfg, handlers(5)).unwrap();
+        for shard in 0..5u16 {
+            let (n, w) = completion();
+            let task = CountSlices {
+                left: 1,
+                done: Some(n),
+            };
+            rt.submitter(ShardId(shard))
+                .submit(Msg::Spawn(Box::new(task)))
+                .unwrap();
+            assert_eq!(
+                w.wait().unwrap().as_deref(),
+                Some(names[usize::from(shard) % names.len()]),
+                "shard_threads {k}, shard {shard}"
+            );
+            rt.submitter(ShardId(shard))
+                .submit(Msg::Record {
+                    producer: 0,
+                    seq: u32::from(shard),
+                })
+                .unwrap();
+        }
+        let hs = rt.shutdown().unwrap();
+        assert_eq!(hs.len(), 5);
+        for (i, h) in hs.iter().enumerate() {
+            assert_eq!(h.records, [(0, i as u32)], "shard_threads {k}");
+        }
+    }
+}
+
+/// D289: one driver spins once for all its shards and charges the spin to the shards
+/// that handled a message since its last park (D256), so a shard nobody sent to counts
+/// none.
+#[test]
+fn a_driver_charges_its_spin_to_the_shards_that_worked() {
+    let mut cfg = config(2, PreadVfs::new(1));
+    cfg.idle_spin = Duration::from_micros(50);
+    cfg.shard_threads = 1;
+    let rt = Runtime::start(cfg, handlers(2)).unwrap();
+    for i in 0..8 {
+        let (n, w) = completion();
+        rt.submitter(ShardId(0)).submit(Msg::Echo(i, n)).unwrap();
+        assert_eq!(w.wait().unwrap(), i);
+        thread::sleep(Duration::from_millis(1));
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while rt.submitter(ShardId(0)).spin_nanos() == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        rt.submitter(ShardId(0)).spin_nanos() > 0,
+        "shard 0 worked and spun"
+    );
+    assert_eq!(
+        rt.submitter(ShardId(1)).spin_nanos(),
+        0,
+        "shard 1 never worked"
+    );
+    rt.shutdown().unwrap();
 }
 
 #[test]

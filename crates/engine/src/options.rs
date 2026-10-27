@@ -46,6 +46,10 @@ pub struct EngineOptions {
     /// Engine-owned mode only: [`Engine::open_application_owned`](crate::Engine::open_application_owned)
     /// refuses a nonzero value with `InvalidArgument` (decision D40).
     pub compaction_threads: usize,
+    /// Engine-owned mode only: the driver threads the shards run on (D289, ICR 0079). 0
+    /// (the default) gives each shard a thread of its own; `k` runs shard `i` on thread
+    /// `i % k`.
+    pub shard_threads: usize,
     /// Application-owned mode only: background workers for flush and compaction that the
     /// application drives from threads it owns (D284), handed out by
     /// [`Engine::open_application_owned_with`](crate::Engine::open_application_owned_with);
@@ -217,6 +221,7 @@ impl EngineOptions {
             shards: 0,
             pin_threads: true,
             compaction_threads: 0,
+            shard_threads: 0,
             background_workers: 0,
             durability: Durability::GroupSync,
             memtable_budget,
