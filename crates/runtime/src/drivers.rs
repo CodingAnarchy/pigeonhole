@@ -325,11 +325,12 @@ impl Controller {
             let wakes: u64 = recent(self.shrink_windows).map(|w| w.wakes).sum();
             let ops: u64 = recent(self.shrink_windows).map(|w| w.ops).sum();
             let wakes_per_op = wakes as f64 / ops.max(1) as f64;
-            if wakes_per_op > SHRINK_WAKES_PER_OP
-                && sum_busy <= SHRINK_BUSY * (k - 1) as f64
-                && slow <= SLOW_PASSES
-            {
-                return Some(k - 1);
+            // Straight to the drivers the work needs at SHRINK_BUSY each, not one at a time:
+            // stepping down one driver per 5 s took a light store about 100 s from 16 to 2,
+            // past the bench's warm-up and most of its measured phase (#1006's first A/B).
+            let needed = ((sum_busy / SHRINK_BUSY).ceil() as usize).max(1);
+            if wakes_per_op > SHRINK_WAKES_PER_OP && needed < k && slow <= SLOW_PASSES {
+                return Some(needed);
             }
         }
         None
@@ -577,4 +578,63 @@ fn spin_poll<H: ShardHandler>(cores: &mut [ShardCore<H>], window: Duration, reap
         }
     }
     hit
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Controller, GROW_WINDOWS, SHRINK_WINDOWS, Window};
+    use std::collections::VecDeque;
+    use std::time::Instant;
+
+    fn controller(windows: impl IntoIterator<Item = Window>) -> Controller {
+        let now = Instant::now();
+        Controller {
+            at: now,
+            last: Vec::new(),
+            last_wakes: 0,
+            windows: windows.into_iter().collect::<VecDeque<_>>(),
+            hold_until: now,
+            shrink_windows: SHRINK_WINDOWS,
+            last_shrink: None,
+        }
+    }
+
+    fn window(max_busy: f64, sum_busy: f64, slow: f64, wakes: u64, ops: u64) -> Window {
+        Window {
+            max_busy,
+            sum_busy,
+            slow,
+            wakes,
+            ops,
+        }
+    }
+
+    /// A light, wake-heavy load shrinks straight to the drivers its work needs at 0.5 busy
+    /// each, not one at a time.
+    #[test]
+    fn a_light_load_shrinks_to_what_it_needs_in_one_step() {
+        let c = controller(vec![window(0.1, 0.6, 0.0, 100, 1000); SHRINK_WINDOWS]);
+        assert_eq!(c.decide(16, 16), Some(2));
+        // Too little evidence yet: no change.
+        let c = controller(vec![window(0.1, 0.6, 0.0, 100, 1000); SHRINK_WINDOWS - 1]);
+        assert_eq!(c.decide(16, 16), None);
+        // Few producer wakes: the drivers aren't parking, so fewer wouldn't help.
+        let c = controller(vec![window(0.1, 0.6, 0.0, 10, 1000); SHRINK_WINDOWS]);
+        assert_eq!(c.decide(16, 16), None);
+        // Slow passes: no shrink, even with wakes.
+        let c = controller(vec![window(0.1, 0.6, 0.05, 100, 1000); SHRINK_WINDOWS]);
+        assert_eq!(c.decide(16, 16), None);
+    }
+
+    /// A busy driver or slow passes grow the set by one, up to the ceiling.
+    #[test]
+    fn a_busy_driver_or_slow_passes_grow_the_set() {
+        let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
+        assert_eq!(c.decide(2, 16), Some(3));
+        let c = controller(vec![window(0.3, 0.6, 0.02, 0, 1000); GROW_WINDOWS]);
+        assert_eq!(c.decide(2, 16), Some(3));
+        // At the ceiling: no growth.
+        let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
+        assert_eq!(c.decide(16, 16), None);
+    }
 }
