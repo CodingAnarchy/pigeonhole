@@ -772,4 +772,92 @@ mod tests {
         drop(t);
         let _ = db.close();
     }
+
+    /// D286 (perf287's review on #708): a Buffered cross-shard commit whose `Decide` went
+    /// out before its DECISION was written, on a coordinator then poisoned before the
+    /// DECISION's group, keeps its seqno held: nothing of it is visible, and the hold would
+    /// stall every later commit's visibility in that instance. The poison's recovery swap
+    /// ends that: the commit answers `OutcomeUnknown`, is absent after the swap, and a later
+    /// commit on the other shard commits and is visible on the recovered engine.
+    #[test]
+    fn an_early_decided_commit_held_on_a_poisoned_coordinator_ends_with_the_swap() {
+        let vfs = SimVfs::new(2860);
+        let options = Options::default()
+            .shards(2)
+            .pin_threads(false)
+            .memtable_budget(4 << 20)
+            .write_stall_timeout(Duration::from_secs(10))
+            .vfs(Arc::clone(&vfs) as _)
+            .auto_recover(Recovery::Any);
+        let db = Pigeonhole::open("/db/r2860.phdb", options).unwrap();
+        // Two tables on different shards (a new table is one tablet on one shard).
+        let mut tables: Vec<crate::Table> = Vec::new();
+        for i in 0..64 {
+            let t = db
+                .table(&format!("t{i}"))
+                .unwrap()
+                .family("f", Family::default())
+                .create_if_missing()
+                .unwrap();
+            if tables.iter().all(|o| o.shard_of(b"r") != t.shard_of(b"r")) {
+                tables.push(t);
+            }
+            if tables.len() == 2 {
+                break;
+            }
+        }
+        let (a, b) = (tables[0].clone(), tables[1].clone());
+        let engine = db.engine().to_arc();
+        db.db
+            .supervision()
+            .unwrap()
+            .test_hold
+            .armed
+            .store(true, Ordering::SeqCst);
+        // The cross-shard commit, coordinated by `a`'s shard (its first row): its DECISION
+        // is held, so it blocks with its shares applied and its seqno held.
+        engine.inject(pigeonhole_engine::Fault::HoldDecisionRecords, true);
+        let rounds = engine.metrics().cross_shard.rounds;
+        let cross = {
+            let (db, a, b) = (db.clone(), a.clone(), b.clone());
+            std::thread::spawn(move || {
+                let mut wb = db.write_batch();
+                wb.put(&a, b"x", "f", b"q", b"v");
+                wb.put(&b, b"x", "f", b"q", b"v");
+                wb.commit_with(crate::Durability::Buffered)
+            })
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while engine.metrics().cross_shard.rounds == rounds {
+            assert!(std::time::Instant::now() < deadline, "never decided");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // The coordinator fails on an unrelated single (its apply), then the DECISION is
+        // let go: it reaches a poisoned shard and settles unlogged.
+        engine.inject(pigeonhole_engine::Fault::NextApply, true);
+        let e = a.mutate(b"s").put("f", b"q", b"s").commit().unwrap_err();
+        assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
+        engine.release_held_decisions();
+        let e = cross.join().unwrap().unwrap_err();
+        assert_eq!(e.code(), ErrorCode::OutcomeUnknown);
+        assert_eq!(engine.abort_decides_sent(a.shard_of(b"r").unwrap()), 0);
+        // Let the supervisor go, and wait for the swap.
+        db.db.supervision().unwrap().test_hold.release();
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while db.recovery_stats().recoveries < 1 || db.is_failed() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{:?}",
+                db.recovery_stats()
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The early-decided commit is absent; a later commit on the other shard is visible.
+        assert!(a.get(b"x", "f", b"q").unwrap().is_none());
+        assert!(b.get(b"x", "f", b"q").unwrap().is_none());
+        b.mutate(b"later").put("f", b"q", b"l").commit().unwrap();
+        assert!(b.get(b"later", "f", b"q").unwrap().is_some());
+        drop((a, b, tables));
+        db.close().unwrap();
+    }
 }
