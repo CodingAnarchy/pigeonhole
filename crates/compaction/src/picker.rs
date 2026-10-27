@@ -57,8 +57,8 @@ pub struct PickerOptions {
     /// Leveled: a read-hot slot's L0 trigger is half of `l0_trigger`, at least 2 (#759): a
     /// slot whose readers keep paying for its L0 files compacts them sooner, so each read
     /// probes fewer SSTs. The engine decides which slots are read-hot
-    /// ([`CompactionPicker::score_read_hot`]); the write stall keeps `l0_trigger`. Default
-    /// on.
+    /// ([`CompactionPicker::score_read_hot`]) and starts such a compaction only while no
+    /// other compaction runs in the engine; the write stall keeps `l0_trigger`. Default on.
     pub read_hot_l0: bool,
 }
 
