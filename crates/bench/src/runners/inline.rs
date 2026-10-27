@@ -759,22 +759,29 @@ impl PigeonholeRunner {
             ..config.clone()
         });
         let engine_owned = self.settings.inline_engine_owned;
-        let (db, shards) = if engine_owned {
+        let (db, shards, worker_threads) = if engine_owned {
             let db =
                 Pigeonhole::open(dir.join("bench.phdb"), options(&self.settings)).map_err(err)?;
             let n = db.shard_stats().len();
-            (db, (0..n).map(|index| Driver::Engine { index }).collect())
-        } else {
-            let (db, shards) =
-                Pigeonhole::open_application_owned(dir.join("bench.phdb"), options(&self.settings))
-                    .map_err(err)?;
             (
                 db,
-                shards
-                    .into_iter()
-                    .map(|s| Driver::Owned(Box::new(s)))
-                    .collect::<Vec<_>>(),
+                (0..n).map(|index| Driver::Engine { index }).collect(),
+                Vec::new(),
             )
+        } else {
+            // D284: with `background_workers`, flush and compaction run on worker threads of
+            // their own (none by default: on the shards).
+            let mut owned = Pigeonhole::open_application_owned_with(
+                dir.join("bench.phdb"),
+                options(&self.settings),
+            )
+            .map_err(err)?;
+            let workers = owned.spawn_background_threads();
+            let shards = std::mem::take(&mut owned.shards)
+                .into_iter()
+                .map(|s| Driver::Owned(Box::new(s)))
+                .collect::<Vec<_>>();
+            (owned.db, shards, workers)
         };
         let n = shards.len();
         // D235: the judged runs pin each shard's thread to a CPU of its own, one per physical
@@ -966,6 +973,11 @@ impl PigeonholeRunner {
         drop(t);
         let (_, closed) = with_drivers(shards, || db.close().map_err(err));
         closed?;
+        for worker in worker_threads {
+            worker
+                .join()
+                .map_err(|_| "a background worker thread panicked".to_owned())?;
+        }
         let hist = kinds.all();
         let ops = hist.count();
         // D247's app-owned row: singles and batches apart (a single there lands on a hot

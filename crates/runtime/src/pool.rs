@@ -549,7 +549,27 @@ impl PoolDriver {
     /// remains (call again soon); with `false`, wait for the wakeup or
     /// [`next_deadline`](Self::next_deadline). Returns `false` once the pool is closed.
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
-        self.turn(deadline_nanos, !self.pool.builtin)
+        if self.turn(deadline_nanos, !self.pool.builtin) {
+            return true;
+        }
+        // A closed pool runs nothing: `false` for good, whatever its queue count says.
+        if self.pool.closed() {
+            return false;
+        }
+        // As a shard's turn ends (`check_before_sleep`), and as `worker_main` does after its
+        // turns: announce sleep, then look again. A task queued or woken from here on finds
+        // the worker asleep and wakes its target, the `set_wakeup` callback, so an
+        // application that sleeps on its own terms after a `false` hears of new work as it
+        // does for a shard. Before, only `wait` announced sleep, and a worker parked in the
+        // application's own loop slept through new tasks until the shards took them back
+        // (found by D284 PR 2's hand-driven worker test).
+        let signal = self.signal();
+        signal.prepare_sleep();
+        if self.pool.queued.load(Ordering::Acquire) > 0 || signal.task_woken() {
+            signal.awake();
+            return true;
+        }
+        false
     }
 
     fn turn(&mut self, deadline: u64, inline: bool) -> bool {

@@ -844,10 +844,101 @@ impl Pigeonhole {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// [`Options::background_workers`] must be 0 here (the open fails with
+    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) otherwise): use
+    /// [`open_application_owned_with`](Self::open_application_owned_with), which hands the
+    /// workers out.
     pub fn open_application_owned(
         path: impl AsRef<Path>,
         options: Options,
     ) -> Result<(Pigeonhole, Vec<Shard>)> {
+        let owned = Self::open_app(path.as_ref(), options, false)?;
+        Ok((owned.db, owned.shards))
+    }
+
+    /// As [`open_application_owned`](Self::open_application_owned), also handing out
+    /// [`Options::background_workers`] background workers (D284) for flush and compaction,
+    /// which then run on threads you choose rather than in slices on the shards.
+    ///
+    /// - **Why:** a flush or compaction slice on a shard holds up every commit queued
+    ///   behind it for up to half a millisecond. With workers, the shards only commit.
+    /// - **Driving:** a worker runs as a shard does: [`BackgroundWorker::run_once`] until it
+    ///   returns `false`, then sleep until its [`set_wakeup`](BackgroundWorker::set_wakeup)
+    ///   callback fires or [`next_wakeup`](BackgroundWorker::next_wakeup) passes. Any thread
+    ///   may drive one, including a thread that drives shards, and a worker may move between
+    ///   threads: its I/O completes inside `run_once`. Or call
+    ///   [`AppOwned::spawn_background_threads`] to give each a thread of its own.
+    /// - **Close:** [`Pigeonhole::close`] never waits for you to drive a worker. It takes
+    ///   back what the workers hold (a flush finishes on its shard; a compaction is dropped
+    ///   and runs again after the next open), waiting only for a slice a worker is running at
+    ///   that moment. Then [`BackgroundWorker::closed`] is `true` and the worker can be
+    ///   dropped.
+    /// - **A worker you stop driving** delays its tasks until the shards take them back: 10
+    ///   ms after any worker last looked, or 2 ms into a commit's wait for memtable room.
+    ///   [`EngineMetrics::background_fallback_take_backs`](crate::EngineMetrics::background_fallback_take_backs)
+    ///   counts these, so a loop that forgot its workers shows up.
+    ///
+    /// ```
+    /// use std::thread;
+    /// use std::time::Duration;
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let options = Options::default().shards(2).background_workers(1);
+    /// let mut owned = Pigeonhole::open_application_owned_with(dir.join("app.phdb"), options)?;
+    /// // Flush and compaction get a thread each; the shards run on yours, as in
+    /// // `open_application_owned`.
+    /// let workers = owned.spawn_background_threads();
+    /// let shards: Vec<_> = owned
+    ///     .shards
+    ///     .drain(..)
+    ///     .map(|mut shard| {
+    ///         thread::spawn(move || -> pigeonhole::Result<()> {
+    ///             let me = thread::current();
+    ///             shard.set_wakeup(Box::new(move || me.unpark()));
+    ///             loop {
+    ///                 while shard.run_once(Duration::from_micros(200)) {}
+    ///                 if let Some(closed) = shard.closed() {
+    ///                     return closed;
+    ///                 }
+    ///                 match shard.next_wakeup() {
+    ///                     Some(due) => thread::park_timeout(due),
+    ///                     None => thread::park(),
+    ///                 }
+    ///             }
+    ///         })
+    ///     })
+    ///     .collect();
+    ///
+    /// let db = owned.db;
+    /// let t = db.table("t")?.family("f", Family::default()).create_if_missing()?;
+    /// t.mutate(b"row").put("f", b"q", b"v").commit()?;
+    /// db.flush()?; // runs on the worker
+    /// assert_eq!(t.get(b"row", "f", b"q")?.unwrap().value(), b"v");
+    ///
+    /// drop(t);
+    /// db.close()?;
+    /// for thread in shards {
+    ///     thread.join().unwrap()?;
+    /// }
+    /// for thread in workers {
+    ///     thread.join().unwrap();
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn open_application_owned_with(
+        path: impl AsRef<Path>,
+        options: Options,
+    ) -> Result<AppOwned> {
+        Self::open_app(path.as_ref(), options, true)
+    }
+
+    /// The application-owned opens: `with_workers` hands the background workers out; without
+    /// it the engine refuses a nonzero count rather than leave them undriven.
+    fn open_app(path: &Path, options: Options, with_workers: bool) -> Result<AppOwned> {
         if options.recovery() != Recovery::Off {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
@@ -859,8 +950,22 @@ impl Pigeonhole {
         let vfs = Arc::clone(&engine_options.vfs);
         let max_value = max_value(&engine_options);
         let shm = ShmFootprint::of(&engine_options);
-        let (engine, shards) = Engine::open_application_owned(path.as_ref(), engine_options)
-            .map_err(|e| shm.explain(e))?;
+        let (engine, shards, workers) = if with_workers {
+            let owned = Engine::open_application_owned_with(path, engine_options)
+                .map_err(|e| shm.explain(e))?;
+            (owned.engine, owned.shards, owned.workers)
+        } else {
+            let (engine, shards) =
+                Engine::open_application_owned(path, engine_options).map_err(|e| shm.explain(e))?;
+            (engine, shards, Vec::new())
+        };
+        let workers = workers
+            .into_iter()
+            .map(|inner| BackgroundWorker {
+                inner,
+                vfs: Arc::clone(&vfs),
+            })
+            .collect();
         let shards = shards
             .into_iter()
             .map(|inner| Shard {
@@ -871,7 +976,11 @@ impl Pigeonhole {
             .collect();
         let db = Db::new(engine, Arc::clone(&vfs), max_value);
         let cached = Cached::new(&db);
-        Ok((Pigeonhole { db, cached }, shards))
+        Ok(AppOwned {
+            db: Pigeonhole { db, cached },
+            shards,
+            workers,
+        })
     }
 
     /// Starts defining or opening a table: chain `.family(..)` and finish with
@@ -1471,6 +1580,108 @@ impl Snapshot {
     /// The snapshot's sequence number.
     pub fn seqno(&self) -> u64 {
         self.inner.seqno()
+    }
+}
+
+/// What [`Pigeonhole::open_application_owned_with`] hands you: the database, its shards
+/// and its background workers (D284). Move the shards and workers out to the threads that
+/// drive them.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct AppOwned {
+    /// The database.
+    pub db: Pigeonhole,
+    /// One per shard, to drive as [`Pigeonhole::open_application_owned`] describes.
+    pub shards: Vec<Shard>,
+    /// [`Options::background_workers`] of them, for flush and compaction.
+    pub workers: Vec<BackgroundWorker>,
+}
+
+impl AppOwned {
+    /// Gives each background worker a thread of its own (named `pigeonhole-worker-<i>`),
+    /// which drives it until the database's close finishes and then ends. Takes the workers
+    /// out of [`workers`](Self::workers); join the handles after [`Pigeonhole::close`].
+    ///
+    /// For an application that wants its shards on its own threads but has no use for the
+    /// background work's: the workers' threads sleep while there is no flush or compaction.
+    ///
+    /// # Panics
+    /// If the operating system refuses to start a thread.
+    pub fn spawn_background_threads(&mut self) -> Vec<std::thread::JoinHandle<()>> {
+        self.workers
+            .drain(..)
+            .enumerate()
+            .map(|(i, mut worker)| {
+                std::thread::Builder::new()
+                    .name(format!("pigeonhole-worker-{i}"))
+                    .spawn(move || {
+                        while !worker.closed() {
+                            while worker.run_once(Duration::from_millis(1)) {}
+                            // Wakes for new work, the next deadline, or the close.
+                            worker.wait(Duration::from_secs(1));
+                        }
+                    })
+                    .expect("spawn a background worker thread")
+            })
+            .collect()
+    }
+}
+
+/// A background worker in application-owned mode (D284): it runs flushes and compactions
+/// for every shard. Drive it from any thread with [`run_once`](Self::run_once), as you drive
+/// a [`Shard`]. See [`Pigeonhole::open_application_owned_with`].
+///
+/// Dropping it before the close hands what it holds back to the shards, which run it.
+#[derive(Debug)]
+pub struct BackgroundWorker {
+    inner: pigeonhole_engine::BackgroundWorker,
+    vfs: VfsRef,
+}
+
+impl BackgroundWorker {
+    /// Runs flush and compaction slices for up to `budget`. Returns whether work remains.
+    ///
+    /// A worker takes flushes ahead of compactions, and at most two tasks at a time; the
+    /// others stay queued for the other workers. Its I/O completes inside the call, so the
+    /// worker holds none in flight between calls and may move to another thread at any time.
+    /// After the close it does nothing and returns `false`.
+    pub fn run_once(&mut self, budget: Duration) -> bool {
+        let budget = u64::try_from(budget.as_nanos()).unwrap_or(u64::MAX);
+        let deadline = self.vfs.monotonic_nanos().saturating_add(budget);
+        self.inner.run_once(deadline)
+    }
+
+    /// How long until a task this worker holds is due (one sleeping until a time), or
+    /// `None` when none is. After [`run_once`](Self::run_once) returns `false`, sleep until
+    /// the [`set_wakeup`](Self::set_wakeup) callback fires or this much time passes.
+    pub fn next_wakeup(&self) -> Option<Duration> {
+        let deadline = self.inner.next_deadline()?;
+        let now = self.vfs.monotonic_nanos();
+        Some(Duration::from_nanos(deadline.saturating_sub(now)))
+    }
+
+    /// Waits until this worker has work again, a task it holds falls due, the database
+    /// closes, or `timeout` passes. It may return early: loop on [`run_once`](Self::run_once).
+    pub fn wait(&mut self, timeout: Duration) {
+        self.inner.wait(timeout);
+    }
+
+    /// A waker that ends this worker's [`wait`](Self::wait) from any thread.
+    pub fn waker(&self) -> std::task::Waker {
+        self.inner.waker()
+    }
+
+    /// Registers a callback run (on another thread) when work arrives for this worker or the
+    /// database closes: wake the thread that drives it. Called once right away. Keep it short
+    /// and non-blocking.
+    pub fn set_wakeup(&mut self, wake: Box<dyn Fn() + Send + Sync>) {
+        self.inner.set_wakeup(wake);
+    }
+
+    /// Whether the database's close has taken this worker's tasks back: from then on it has
+    /// nothing to do, and can be dropped.
+    pub fn closed(&self) -> bool {
+        self.inner.closed()
     }
 }
 

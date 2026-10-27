@@ -49,6 +49,19 @@ pub struct EngineMetrics {
     pub compactions: u64,
     /// Compactions that failed or could not start. Their slot backs off, then retries.
     pub compaction_failures: u64,
+    /// Compactions an application-owned background worker
+    /// ([`Pigeonhole::open_application_owned_with`](crate::Pigeonhole::open_application_owned_with),
+    /// D284) held when its shard took them back, at the close or when the worker was
+    /// dropped. They were dropped before their commit: not failures, and their slots compact
+    /// again.
+    pub compactions_reclaimed: u64,
+    /// Flushes and compactions the shards took back from the background workers' queue
+    /// because no worker looked at it for 10 ms: workers configured but not driven. 0 while
+    /// the workers are driven; a count that keeps growing means a loop forgot its workers.
+    pub background_fallback_take_backs: u64,
+    /// Flushes a commit's wait for memtable room took back from a background worker that
+    /// held them for 2 ms without running them. 0 while the workers are driven.
+    pub background_room_take_backs: u64,
     /// Write stalls: times a shard paced or held its commits because L0 was too deep, or
     /// because its memtable arena had no room until a flush freed some. The sum of
     /// `room_stalls` and `pacing_stalls`.
@@ -294,6 +307,9 @@ impl EngineMetrics {
             flush_failures: m.flush_failures,
             compactions: m.compactions,
             compaction_failures: m.compaction_failures,
+            compactions_reclaimed: m.compactions_reclaimed,
+            background_fallback_take_backs: m.background_take_backs.0,
+            background_room_take_backs: m.background_take_backs.1,
             write_stalls: m.stalls.0,
             write_stall_nanos: m.stalls.1,
             room_stalls: m.room_stalls.0,
