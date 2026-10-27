@@ -172,8 +172,10 @@
 # and commit-one 9585 -> 9612, this PR's head counts (run 40458446632: 9706 and 9583) times
 # 1.003. The +29 per commit (0.3%) are the Spawner's per-turn checks (`take_back` at the turn
 # start, `has_back` in the two sleep checks, the merged `next_deadline`), which run on every
-# turn even with no pool configured; #989 had already used the old headroom. D289 PR 1
-# rewrites that loop and puts the checks behind one no-pool branch, recovering them.
+# turn even with no pool configured; #989 had already used the old headroom. #1005 put the
+# checks behind one inline no-pool branch (D289 PR 1 didn't touch that loop) and lowered both
+# ceilings with the script from its head's counts (run 40566198775: commit-one 9533,
+# commit-async 9656, -21 each): commit-one 9612 -> 9562, commit-async 9736 -> 9685.
 #
 # Raised for #994 (D288 PR 1, #711: a filtered scan's memtable sources settle only up to the
 # merge's frontier) under D195's ceiling rule (owner, 2026-10-13), each the old ceiling times
@@ -204,7 +206,7 @@ counter 9388 0.5
 rows 19655 0.3
 level-scans 14015 0.6
 short-scans 13564 0.3
-commit-one 9612 0.3
+commit-one 9562 0.3
 commit-sixteen 50384 0.3
 flush 2199 0.3
 compact 2783 0.5
@@ -215,7 +217,7 @@ commit-at 10590 0.3
 scan-narrow 1398 0.3
 scan-small 1374 0.3
 scan-wide 1296 0.3
-commit-async 9736 0.3
+commit-async 9685 0.3
 scan-narrow-q1 5277 0.3
 scan-wide-q10 1784 0.3
 scan-wide-q1 14326 0.3
