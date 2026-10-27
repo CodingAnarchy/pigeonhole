@@ -39,6 +39,16 @@ use crate::{
 /// Submission queue entries of the shared ring (completions get twice as many).
 const RING_ENTRIES: u32 = 256;
 
+/// The most io-wq workers for bounded work (reads and writes of regular files, #974) of each
+/// task that submits to the shared ring; `0` would leave the kernel's default. io-wq is per
+/// task, and an entry's work runs on the io-wq of whichever task's enter submitted it: a
+/// client's, or the reaper's (its wait submits what the queue holds), so a client's batches
+/// use at most twice this. In 6.8 a task takes the cap when the ring registers it (the
+/// registering task, and every task already on the ring), or when its task context is first
+/// created, by its first io_uring submit of any ring: a thread that used another ring first
+/// (its own ring, or another backend's shared ring) keeps that one's limits, or none.
+const IOWQ_BOUNDED_WORKERS: u32 = 4;
+
 /// Registered buffer slots per ring (64 KiB each: an SST block or a run of them), at most:
 /// 1 MiB a ring.
 const POOL_SLOTS: u32 = 16;
@@ -451,6 +461,7 @@ impl UringFile {
                 ring.submit(Op {
                     file: Arc::clone(&self.file),
                     kind: kind(resolver),
+                    flags: squeue::Flags::empty(),
                 });
                 done
             }
@@ -463,6 +474,7 @@ impl UringFile {
                 self.ring.ring.submit(Op {
                     file: Arc::clone(&self.file),
                     kind: kind(resolver),
+                    flags: squeue::Flags::empty(),
                 });
                 done
             }
@@ -507,6 +519,66 @@ impl File for UringFile {
             done: 0,
             resolver,
         })
+    }
+
+    /// One batch on the ring this thread submits to, with one enter for it (ICR 0077). On the
+    /// shared ring every read's entry carries `IOSQE_ASYNC`, so an io-wq worker copies a
+    /// page-cache hit rather than the submitter inside its enter, under the kernel's
+    /// `uring_lock` that every submitter queues on (#974). A thread that runs its I/O inline
+    /// reads each in turn.
+    fn submit_reads_ahead(&self, reads: Vec<(IoBuf, u64)>) -> Vec<Completion> {
+        if self.inline_here() {
+            return reads
+                .into_iter()
+                .map(|(mut buf, offset)| {
+                    let r = self.file.check_aligned(buf.as_ptr(), buf.len(), offset);
+                    Completion::ready(
+                        r.and_then(|()| self.file.read_at(&mut buf, offset))
+                            .map(|()| buf),
+                    )
+                })
+                .collect();
+        }
+        let own = ThreadRing::current(self.ring.id());
+        // `IOSQE_ASYNC` only on the shared ring, where submitters queue on the kernel's
+        // `uring_lock`: a thread's own ring has one submitter, so the copy is its own work
+        // either way, and its io-wq is not capped (perf287 on #977).
+        let flags = if own.is_some() {
+            squeue::Flags::empty()
+        } else {
+            squeue::Flags::ASYNC
+        };
+        let mut out = Vec::with_capacity(reads.len());
+        let mut ops = Vec::with_capacity(reads.len());
+        for (buf, offset) in reads {
+            if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
+                out.push(Completion::ready(Err(e)));
+                continue;
+            }
+            let (done, resolver) = Completion::driven_pair(own.as_ref().map(|r| r.drive()));
+            out.push(done);
+            ops.push(Op {
+                file: Arc::clone(&self.file),
+                kind: Kind::Read {
+                    buf,
+                    offset,
+                    done: 0,
+                    resolver,
+                },
+                flags,
+            });
+        }
+        match own {
+            Some(ring) => ring.submit_batch(ops),
+            None => {
+                debug_assert!(
+                    self.ring.reaper.is_some(),
+                    "an operation reached the shared ring of a backend with no reaper"
+                );
+                self.ring.ring.submit_batch(ops);
+            }
+        }
+        out
     }
 
     fn submit_write(&self, buf: IoBuf, offset: u64) -> Completion {
@@ -594,6 +666,9 @@ impl File for UringFile {
 struct Op {
     file: Arc<PreadFile>,
     kind: Kind,
+    /// Flags of every entry it submits (a short read's rest too): `IOSQE_ASYNC` for a read
+    /// nothing waits on yet ([`File::submit_reads_ahead`], ICR 0077).
+    flags: squeue::Flags,
 }
 
 enum Kind {
@@ -667,6 +742,7 @@ impl Op {
             }
         }
         .user_data(user_data)
+        .flags(self.flags)
     }
 
     /// Applies a completion's result. Returns the operation back when it must continue (a
@@ -864,8 +940,10 @@ fn enter_published(uring: &IoUring) {
 /// Resolves `op`, in flight on a ring that failed, with `e`, and leaks its buffer: the kernel
 /// may still read into or write from it until the ring's teardown has cancelled everything,
 /// which happens after the ring is dropped, so the buffer is never freed or given back to its
-/// slot pool (perf287 on #976). Only for a ring that can no longer be entered; an operation
-/// whose entry the kernel never saw goes through [`fail`].
+/// slot pool (perf287 on #976). A leaked slot keeps its pool, so the ring's whole registered
+/// region stays allocated (no longer locked or budgeted once the ring drops): acceptable for a
+/// ring that can no longer be entered, the only one this is for. An operation whose entry the
+/// kernel never saw goes through [`fail`].
 fn abandon(op: Op, e: io::Error) {
     match op.kind {
         Kind::Read { buf, resolver, .. } => {
@@ -910,6 +988,14 @@ impl Ring {
         if !needed.iter().all(|&op| probe.is_supported(op)) {
             return Err(Error::new(ErrorKind::Unsupported, "io_uring operations"));
         }
+        // Bounds each submitting thread's io-wq (#974): in 6.8 io-wq is per task, so every
+        // client thread gets its own pool, up to `min(entries, 4 x CPUs)` workers, each
+        // created inside that thread's enter. The registering thread takes the cap now, and
+        // every task whose first submit goes to this ring takes it then. Best effort: a
+        // kernel without the call keeps its default.
+        let _ = uring
+            .submitter()
+            .register_iowq_max_workers(&mut [IOWQ_BOUNDED_WORKERS, 0]);
         Ok(Self {
             uring,
             counted: Counted::new(counts),
@@ -938,15 +1024,43 @@ impl Ring {
         }
     }
 
+    /// [`Ring::submit`] for several operations, with one enter for them all (ICR 0077).
+    fn submit_batch(&self, ops: Vec<Op>) {
+        let entries = insert_all(&self.table, ops, self.pool.registered());
+        let published = {
+            let _sq = lock(&self.sq);
+            publish_all(&entries, |entry| self.publish(entry))
+        };
+        if published.is_ok() || published.as_ref().is_err_and(|(n, _)| *n > 0) {
+            enter_published(&self.uring);
+        }
+        fail_unpublished(&self.table, &entries, published);
+    }
+
     /// Pushes `entry` and tells the kernel, waiting for room in a full queue. An error means
     /// the entry was not published (the kernel never sees it); once it is, it is the ring's
-    /// ([`enter_published`]).
+    /// ([`enter_published`]). `sq` covers only the push and the tail's publication: the
+    /// enter runs after it is released, as the reaper's always has (an enter hands over
+    /// whatever tail it sees, so another thread's later enter finds less or nothing), and the
+    /// kernel copies a page-cache hit inline under its own `uring_lock` during the enter
+    /// (#974), which would otherwise hold every other pusher too, as would a retried enter's
+    /// backoff (#976).
     fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
-        let sq = lock(&self.sq);
+        {
+            let _sq = lock(&self.sq);
+            self.publish(entry)?;
+        }
+        enter_published(&self.uring);
+        Ok(())
+    }
+
+    /// Publishes `entry` in the submission queue, handing queued entries to the kernel while
+    /// it is full. The caller holds `sq`.
+    fn publish(&self, entry: &squeue::Entry) -> io::Result<()> {
         loop {
-            // SAFETY: `self.sq` is held, so this is the only submission queue borrowed. The
-            // entry's buffer and descriptor belong to an operation in `self.table`, which
-            // keeps them until the entry's completion is reaped.
+            // SAFETY: the caller holds `self.sq`, so this is the only submission queue
+            // borrowed. The entry's buffer and descriptor belong to an operation in
+            // `self.table`, which keeps them until the entry's completion is reaped.
             let pushed = unsafe {
                 let mut sq = self.uring.submission_shared();
                 let r = sq.push(entry);
@@ -962,11 +1076,6 @@ impl Ring {
                 }
             }
         }
-        // `sq` covers the push and the tail's publication only: an enter hands over whatever
-        // tail it sees (the reaper's always ran without `sq`), and a retried enter would hold
-        // every other submitter for its backoff.
-        drop(sq);
-        enter_published(&self.uring);
         Ok(())
     }
 
@@ -1059,6 +1168,56 @@ impl Ring {
         };
         for op in ops {
             abandon(op, io::Error::other("io_uring failed"));
+        }
+    }
+}
+
+/// Puts `ops` in `table` and builds their entries, tagged with their places there.
+fn insert_all(
+    table: &Mutex<Table>,
+    ops: Vec<Op>,
+    pool: Option<&Arc<SlotPool>>,
+) -> Vec<(u64, squeue::Entry)> {
+    let mut table = lock(table);
+    ops.into_iter()
+        .map(|op| {
+            let user_data = table.insert(op);
+            let entry = table.ops[user_data as usize]
+                .as_mut()
+                .expect("inserted above")
+                .entry(user_data, pool);
+            (user_data, entry)
+        })
+        .collect()
+}
+
+/// Publishes `entries` in order with `publish`, stopping at the first that fails: then how
+/// many were published, and why the next was not.
+fn publish_all(
+    entries: &[(u64, squeue::Entry)],
+    mut publish: impl FnMut(&squeue::Entry) -> io::Result<()>,
+) -> std::result::Result<(), (usize, io::Error)> {
+    for (n, (_, entry)) in entries.iter().enumerate() {
+        publish(entry).map_err(|e| (n, e))?;
+    }
+    Ok(())
+}
+
+/// Fails the operations of `entries` that [`publish_all`] did not publish: the kernel never
+/// sees their buffers. The published ones are the ring's ([`enter_published`]).
+fn fail_unpublished(
+    table: &Mutex<Table>,
+    entries: &[(u64, squeue::Entry)],
+    published: std::result::Result<(), (usize, io::Error)>,
+) {
+    let Err((n, e)) = published else { return };
+    for (user_data, _) in &entries[n..] {
+        if let Some(op) = lock(table).take(*user_data) {
+            let e = match e.raw_os_error() {
+                Some(code) => io::Error::from_raw_os_error(code),
+                None => io::Error::new(e.kind(), e.to_string()),
+            };
+            fail(op, e);
         }
     }
 }
@@ -1346,6 +1505,14 @@ impl ThreadRing {
     /// Pushes `entry` and hands it to the kernel. Only the owner thread calls this. An error
     /// means the entry was not published; once it is, it is the ring's ([`enter_published`]).
     fn push(&self, entry: &squeue::Entry) -> io::Result<()> {
+        self.publish(entry)?;
+        enter_published(&self.uring);
+        Ok(())
+    }
+
+    /// Publishes `entry` in the submission queue, handing queued entries to the kernel while
+    /// it is full. Only the owner thread calls this.
+    fn publish(&self, entry: &squeue::Entry) -> io::Result<()> {
         debug_assert_eq!(thread::current().id(), self.owner);
         loop {
             // SAFETY: only the owner thread borrows this ring's submission queue, and never
@@ -1365,7 +1532,6 @@ impl ThreadRing {
                 }
             }
         }
-        enter_published(&self.uring);
         Ok(())
     }
 
@@ -1382,6 +1548,16 @@ impl ThreadRing {
         {
             fail(op, e);
         }
+    }
+
+    /// [`ThreadRing::submit`] for several operations, with one enter for them all (ICR 0077).
+    fn submit_batch(&self, ops: Vec<Op>) {
+        let entries = insert_all(&self.table, ops, self.pool.registered());
+        let published = publish_all(&entries, |entry| self.publish(entry));
+        if published.is_ok() || published.as_ref().is_err_and(|(n, _)| *n > 0) {
+            enter_published(&self.uring);
+        }
+        fail_unpublished(&self.table, &entries, published);
     }
 
     /// What a blocked [`Completion::wait`] on one of this ring's operations calls: reaps
@@ -1593,5 +1769,52 @@ impl Drop for ThreadRing {
         if self.pool.registered().is_some() {
             let _ = self.uring.submitter().unregister_buffers();
         }
+    }
+}
+
+#[cfg(all(test, not(miri)))]
+mod tests {
+    use super::*;
+
+    /// #974: the shared ring's setup caps the io-wq of the task that set it up (and of every
+    /// task whose first submit goes to it) at `IOWQ_BOUNDED_WORKERS` bounded workers. Zeros
+    /// read the calling task's limits back without changing them.
+    #[test]
+    fn the_shared_ring_caps_its_submitters_io_wq() {
+        let ring = Ring::probe(&Arc::new(RingCounts::default())).expect("io_uring is available");
+        let mut limits = [0, 0];
+        ring.uring
+            .submitter()
+            .register_iowq_max_workers(&mut limits)
+            .expect("the kernel reports io-wq limits");
+        assert_eq!(limits[0], IOWQ_BOUNDED_WORKERS, "{limits:?}");
+    }
+
+    /// The case the cap is for (perf287 on #977): a client thread whose first io_uring submit
+    /// goes to the shared ring takes the cap with the task context that submit creates.
+    #[test]
+    fn a_fresh_thread_submitting_to_the_shared_ring_takes_the_cap() {
+        let ring =
+            Arc::new(Ring::probe(&Arc::new(RingCounts::default())).expect("io_uring is available"));
+        let r = Arc::clone(&ring);
+        let limits = thread::spawn(move || {
+            let mut limits = [0, 0];
+            // Before any submit the thread has no task context: nothing to read back.
+            r.uring
+                .submitter()
+                .register_iowq_max_workers(&mut limits)
+                .expect("the kernel reports io-wq limits");
+            assert_eq!(limits, [0, 0], "a thread that never submitted");
+            r.push(&opcode::Nop::new().build().user_data(SHUTDOWN))
+                .expect("pushed");
+            r.uring
+                .submitter()
+                .register_iowq_max_workers(&mut limits)
+                .expect("the kernel reports io-wq limits");
+            limits
+        })
+        .join()
+        .unwrap();
+        assert_eq!(limits[0], IOWQ_BOUNDED_WORKERS, "{limits:?}");
     }
 }

@@ -2614,8 +2614,10 @@ fn the_write_stall_timeout_bounds_a_wait_for_room() {
         }
     }
     let waited = refused.expect("snapshots holding the arena never stalled a write");
+    // A room wait's start is kept to the millisecond (`room_stamp`), so the refusal can come
+    // up to 1 ms before the timeout by this clock (macOS CI: 199.85 ms of 200).
     assert!(
-        waited >= timeout && waited < Duration::from_secs(10),
+        waited + Duration::from_millis(1) >= timeout && waited < Duration::from_secs(10),
         "refused after {waited:?}, the timeout is {timeout:?}"
     );
     drop(snaps);
