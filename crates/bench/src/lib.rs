@@ -1168,6 +1168,17 @@ fn measure(
     );
     runner.start_riders()?;
     runner.start_reader_processes(config)?;
+    let scratch_phase = |name: &str| {
+        if std::env::var_os("PHDB_CTRACE").is_some() {
+            eprintln!(
+                "PHASE {} {name} hot_only_picks={}",
+                pigeonhole_engine::scratch_unix_ms(),
+                pigeonhole_engine::SCRATCH_HOT_ONLY_PICKS
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            );
+        }
+    };
+    scratch_phase("measured-start");
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
     // D247: past `max_measured` no client starts another operation.
@@ -1195,6 +1206,7 @@ fn measure(
         let rest = (min_measured - elapsed).as_secs_f64() * rate * 1.1;
         next = (rest.ceil() as u64).max(MIN_EXTRA_OPS);
     }
+    scratch_phase("measured-end");
     let shards = (
         shares_between(&before.0, &runner.shard_shares()),
         stalls_between(before.1, runner.stalls()),

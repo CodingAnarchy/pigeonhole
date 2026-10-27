@@ -3109,6 +3109,8 @@ pub(crate) struct ShardState {
     /// The slots the last `maintain` found read-hot (their L0 is due at half the trigger,
     /// `PickerOptions::read_hot_l0`).
     read_hot: Vec<(TabletId, FamilyId)>,
+    /// SCRATCH #759 trace: the running compaction's (read-hot, due only because read-hot).
+    scratch_hot: (bool, bool),
     /// The slots `maintain` scans, kept from one scan to the next so the scan does not
     /// allocate its list each time (#499).
     scan_slots: Vec<(TabletId, FamilyId)>,
@@ -3414,6 +3416,7 @@ impl ShardState {
             slot_backoff: HashMap::new(),
             read_heat: HashMap::new(),
             read_hot: Vec::new(),
+            scratch_hot: (false, false),
             scan_slots: Vec::new(),
             scan_levels: Levels::default(),
             checkpoint_failures: 0,
@@ -9073,7 +9076,8 @@ impl ShardState {
                 continue;
             }
             fam.levels_meta_into(&mut levels);
-            let hot = self.read_heat.entry(key).or_default().is_hot(fam, &levels);
+            let heat = self.read_heat.entry(key).or_default();
+            let hot = heat.is_hot(fam, &levels) && now >= heat.cool_until;
             if hot {
                 self.read_hot.push(key);
             }
@@ -9290,10 +9294,11 @@ impl ShardState {
             let hot = self.read_hot.contains(&key)
                 && (busy.is_empty()
                     || std::env::var_os("PHDB_READ_HOT_CAP").is_some_and(|v| v == "0"));
+            let lv = fam.levels_meta();
             let Some(task) = self.picker(meta.options.compaction).pick_read_hot(
                 key.0,
                 key.1,
-                &fam.levels_meta(),
+                &lv,
                 &busy,
                 now,
                 meta.options.ttl_micros,
@@ -9301,6 +9306,37 @@ impl ShardState {
             ) else {
                 continue;
             };
+            // SCRATCH #759: a pick only the read-hot trigger made (L0 below the full trigger).
+            let l0 = lv.levels.first().map_or(0, Vec::len);
+            let hot_only = hot
+                && task.inputs.first().is_some_and(|(l, _)| *l == 0)
+                && (l0 as u32) < self.picker(meta.options.compaction).options().l0_trigger;
+            self.scratch_hot = (hot, hot_only);
+            if hot_only {
+                SCRATCH_HOT_ONLY_PICKS.fetch_add(1, Ordering::Relaxed);
+                let cool = scratch_hot_cooldown_micros();
+                if cool > 0
+                    && let Some(h) = self.read_heat.get_mut(&key)
+                {
+                    h.cool_until = now.saturating_add(cool);
+                }
+            }
+            if scratch_ctrace() {
+                eprintln!(
+                    "CTRACE {} start shard={} slot={:?} hot={hot} hot_only={hot_only} l0={l0} l1={} l0MB={} l1MB={} inputs={:?} out={}",
+                    scratch_unix_ms(),
+                    self.id.0,
+                    (key.0.0, key.1.0),
+                    lv.levels.get(1).map_or(0, Vec::len),
+                    lv.level_bytes(0) >> 20,
+                    lv.level_bytes(1) >> 20,
+                    task.inputs
+                        .iter()
+                        .map(|(l, v)| (*l, v.len()))
+                        .collect::<Vec<_>>(),
+                    task.output_level
+                );
+            }
             if let Err(e) = self.start_compaction(&view, key, task, ctx) {
                 trace!("shard {} compaction start failed: {e}", self.id.0);
                 self.back_off_compaction(key, ctx);
@@ -9630,6 +9666,16 @@ impl ShardState {
             .compaction_guard
             .take()
             .is_some_and(|g| g.state.voided());
+        if scratch_ctrace() {
+            eprintln!(
+                "CTRACE {} done shard={} hot={} hot_only={} ms={}",
+                scratch_unix_ms(),
+                self.id.0,
+                self.scratch_hot.0,
+                self.scratch_hot.1,
+                nanos / 1_000_000
+            );
+        }
         trace!(
             "shard {} compaction done: {:?} ({nanos} ns)",
             self.id.0,
@@ -10528,6 +10574,36 @@ pub(crate) struct ReadHeat {
     base: u64,
     /// Probes charged to earlier sets since L0 was last empty.
     earlier: u64,
+    /// SCRATCH #759: not read-hot before this (vfs micros) after a read-hot-only pick.
+    cool_until: u64,
+}
+
+/// SCRATCH #759: read-hot-only picks, process-wide.
+pub static SCRATCH_HOT_ONLY_PICKS: AtomicU64 = AtomicU64::new(0);
+
+/// SCRATCH #759: `PHDB_CTRACE` prints each compaction's start and end to stderr.
+pub fn scratch_ctrace() -> bool {
+    static F: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *F.get_or_init(|| std::env::var_os("PHDB_CTRACE").is_some())
+}
+
+/// SCRATCH #759: `PHDB_HOT_COOLDOWN_MS=<ms>` keeps a slot cold that long after a read-hot-only pick.
+fn scratch_hot_cooldown_micros() -> u64 {
+    static C: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *C.get_or_init(|| {
+        std::env::var("PHDB_HOT_COOLDOWN_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1_000
+    })
+}
+
+/// SCRATCH #759: wall-clock milliseconds.
+pub fn scratch_unix_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis())
 }
 
 impl ReadHeat {

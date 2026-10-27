@@ -29,6 +29,8 @@ fjall = ["dep:fjall"]
 pigeonhole = { workspace = true }
 # The default shard count (D220), for the D213 and scaling runs and the report.
 pigeonhole-io = { workspace = true }
+# SCRATCH #759: trace counters.
+pigeonhole-engine = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rocksdb = { version = "0.25", default-features = false, optional = true }

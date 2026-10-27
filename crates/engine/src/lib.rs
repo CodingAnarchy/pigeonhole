@@ -47,6 +47,8 @@ mod purge_guard;
 mod read;
 mod row_cache;
 mod shard;
+#[doc(hidden)]
+pub use shard::{SCRATCH_HOT_ONLY_PICKS, scratch_unix_ms};
 mod snapshot;
 mod source;
 mod timer_state;
