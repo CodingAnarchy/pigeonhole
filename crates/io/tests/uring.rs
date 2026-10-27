@@ -863,3 +863,61 @@ fn a_permanent_attach_failure_is_not_retried() {
     let s = b.vfs.ring_stats().unwrap();
     assert_eq!((s.attach_failures, s.inline, s.rings), (1, 100, 1), "{s:?}");
 }
+
+/// ICR 0077: a batch of reads ahead completes in order with the file's bytes, on the shared
+/// ring and on a thread's own, more of them than either ring has registered slots.
+#[test]
+fn a_batch_of_reads_ahead_completes_in_order() {
+    let _serial = serial();
+    let b = Backend::uring("uring-reads-ahead");
+    let f = b.create("f");
+    for i in 0..40u64 {
+        f.submit_write(filled(4096, i as u8), i * 4096)
+            .wait()
+            .unwrap();
+    }
+    let check = |f: &pigeonhole_io::FileRef| {
+        let reads = (0..40u64).map(|i| (f.read_buf(4096), i * 4096)).collect();
+        for (i, done) in f.submit_reads_ahead(reads).into_iter().enumerate() {
+            assert!(
+                done.wait().unwrap().iter().all(|&x| x == i as u8),
+                "read {i}"
+            );
+        }
+    };
+    let g = Arc::clone(&f);
+    within_10s(move || check(&g));
+    let (vfs, g) = (Arc::clone(&b.vfs), Arc::clone(&f));
+    within_10s(move || {
+        vfs.attach_thread();
+        assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
+        check(&g);
+        assert!(!own_io_in_flight());
+    });
+}
+
+/// A batch larger than the submission queue whose enter to make room is refused: the reads
+/// already published complete (they are the ring's, #976), and only those never published
+/// fail.
+#[test]
+fn a_batch_that_could_not_all_be_published_fails_only_the_rest() {
+    let _serial = serial();
+    let b = Backend::uring("uring-reads-ahead-full");
+    let f = b.create("f");
+    f.submit_write(filled(300 * 512, 3), 0).wait().unwrap();
+    let g = Arc::clone(&f);
+    let results = within_10s(move || {
+        let reads = (0..300u64).map(|i| (IoBuf::zeroed(512), i * 512)).collect();
+        // The first enter is the one that makes room once the queue's 256 entries are in.
+        pigeonhole_io::uring::fail_ring_enters(1, libc::EAGAIN);
+        let done = g.submit_reads_ahead(reads);
+        pigeonhole_io::uring::fail_ring_enters(0, 0);
+        done.into_iter().map(|c| c.wait()).collect::<Vec<_>>()
+    });
+    let ok = results.iter().take_while(|r| r.is_ok()).count();
+    assert_eq!(ok, 256, "the published reads complete");
+    for r in &results[..ok] {
+        assert!(r.as_ref().unwrap().iter().all(|&x| x == 3));
+    }
+    assert!(results[ok..].iter().all(|r| r.is_err()), "the rest fail");
+}
