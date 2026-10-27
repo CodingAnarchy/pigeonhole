@@ -1065,6 +1065,9 @@ impl Options {
         };
         o.pin_threads = self.pin_threads;
         o.shard_threads = budget.drivers;
+        // The load controller (D289 PR 2), unless the count is fixed; application-owned
+        // shards run on the application's threads (D40).
+        o.adaptive_drivers = !budget.fixed && !application_owned;
         if application_owned {
             o.background_workers = self.background_workers;
         }

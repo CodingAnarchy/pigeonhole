@@ -807,6 +807,10 @@ impl Runner for PigeonholeRunner {
         self.open.as_ref().and_then(|o| o.target.db.pack_target())
     }
 
+    fn driver_target(&self) -> Option<(usize, bool)> {
+        self.open.as_ref().and_then(|o| o.target.db.driver_target())
+    }
+
     fn shard_shares(&self) -> Vec<ShardShare> {
         self.open.as_ref().map_or_else(Vec::new, |o| {
             o.target

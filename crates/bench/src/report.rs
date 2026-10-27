@@ -432,6 +432,10 @@ pub struct RunDetail {
     /// when the warmup ran out first, so the measured phase may include tablet changes.
     #[serde(default)]
     pub warmup_settled: Option<bool>,
+    /// The driver threads the shards ran on when the warmup ended (D289 PR 2's load
+    /// controller); `None` for stores without one and in results written before it.
+    #[serde(default)]
+    pub drivers: Option<usize>,
     /// Background work riding on the measured phase (D247: snapshot and durable-snapshot
     /// readers, a durable backup and a compaction), for runs that asked for it
     /// (`--riders`, Pigeonhole); `None` elsewhere.

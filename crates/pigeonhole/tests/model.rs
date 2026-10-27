@@ -44,6 +44,8 @@
 //!
 //! `PIGEONHOLE_SHARD_THREADS=k` runs the shards on `k` shared engine-owned threads
 //! (`Options::shard_threads`, D289), so a shard's turn runs between its siblings'.
+//! `PIGEONHOLE_DRIVER_CHURN=1` forces the load controller's target to a seeded count after
+//! one step in ten (D289 PR 2), so shards move between drivers throughout the run.
 //!
 //! `PIGEONHOLE_CHECKPOINT_STEPS=n` keeps a counter read's result as a base once it folds `n`
 //! entries (`Options::counter_checkpoint_steps`, D291). `1` checkpoints after nearly every
@@ -260,6 +262,9 @@ struct Config {
     /// keep their result as a base. Defaults to `PIGEONHOLE_CHECKPOINT_STEPS`, else the
     /// engine's default; `1` checkpoints after every counter read that folds anything.
     checkpoint_steps: Option<u64>,
+    /// D289 PR 2: force the driver target to a seeded count after one step in ten, so
+    /// shards move between drivers throughout. Defaults to `PIGEONHOLE_DRIVER_CHURN=1`.
+    driver_churn: bool,
     /// `Options::auto_recover`: with `Recovery::Io`, a failure on an injected write error
     /// is recovered in place and what survived is decided by reading back (the module doc).
     recovery: Recovery,
@@ -337,6 +342,7 @@ impl Config {
             checkpoint_steps: std::env::var("PIGEONHOLE_CHECKPOINT_STEPS")
                 .ok()
                 .and_then(|v| v.parse().ok()),
+            driver_churn: std::env::var("PIGEONHOLE_DRIVER_CHURN").is_ok_and(|v| v == "1"),
             recovery: Recovery::Off,
         }
     }
@@ -2214,6 +2220,11 @@ impl Run {
             self.crash_and_recover(kind, false)?;
         } else if !self.armed && rng.chance(self.cfg.reopen_ppm) {
             self.reopen()?;
+        }
+        // Only with churn on, so the default runs draw exactly as before.
+        if self.cfg.driver_churn && rng.chance(100_000) {
+            let k = 1 + rng.below(self.cfg.shards.max(1) as u64) as usize;
+            self.db().force_driver_target(Some(k));
         }
         Ok(())
     }

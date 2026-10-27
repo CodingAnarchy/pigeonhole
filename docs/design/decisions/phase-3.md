@@ -2706,14 +2706,7 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
   - **Heavy shapes lose throughput as k shrinks.** At k = 4: ycsb-f −29%, transfer −18%, ycsb-a −9%. At k = 1: −66–70%. At k = 8: −8% and −1.5%.
   - **Ring waits** end 67–78% of ycsb-f's driver passes at every k, including 16. Spinning with non-blocking reaps while I/O is in flight removes them (+6–11% ops at k ≤ 4).
   - **No-yield:** D198's yield removed at the driver level reproduced #996's trade, and stays out.
-- **PR 2:** the controller, with moves and steals. It also takes:
-  - the owner's CPU budget (ICR 0081: one function sizes the driver and compaction threads from the cores the process may use, with an embedded and a server profile), whose driver count becomes the controller's ceiling;
-  - the spin through in-flight I/O, with a k = 16 arm;
-  - the compaction-share and server-profile arms.
-  - **Grow** on turns that end with a sibling shard still queued, or awake-busy above 0.75.
-  - **Shrink** on wakes when the busy sum fits on k − 1 threads.
-  - **Damping:** as D255's.
-  - A shard moves between drivers only between its turns, and only at its holder's turn boundary: its I/O completes only on the submitting thread's ring (#402), and `release()` must run there.
+- **PR 2:** the load controller, moves at quiet points, the spin through in-flight I/O, and the owner's CPU budget (ICR 0081). Design on #760 (comments 6446658819, 6446737262 and 6446985810), reviewed by simp724 (6446778188). Below: "How the controller runs" and "The CPU budget".
 - **Client combining** (D198's C2) stays on hold.
 - **D198's yield stays.** The first step was to stop a pinned shard thread's spin from yielding (#996). On 16 per-shard threads that moved the tail rather than removing it, and #996 closed (comments 6442595313 and 6443366250).
   - **Never yielding:** sparse-wide put p99 fell 60%, but ycsb-f's p99.9 rose 28–45%: clients woken onto a spinning shard's CPU waited out the window.
@@ -2731,6 +2724,44 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **Shutdown** returns the handlers in shard order.
 - **Names:** with a thread per shard (`shard_threads` 0, or at least the shard count) the threads keep the names `pigeonhole-shard-{i}`. Otherwise every driver is `pigeonhole-driver-{d}`.
 - **Placement is round-robin, not blocks of n/k:** packing (D217) keeps shards `0..active` busy, and round-robin spreads them over the drivers where blocks would put them all on driver 0.
+
+**How the controller runs (PR 2):** `RuntimeConfig::adaptive_drivers`, on for every engine-owned `pigeonhole` open unless `shard_threads` is set.
+- **Start:** all the ceiling's drivers start pinned, and the shards start one per driver (target = ceiling). A heavy load never starts short of threads, and a light one shrinks within seconds. Shard `i` belongs to driver `i % target`.
+- **The controller** runs on driver 0 between its passes, once per 100 ms window. It reads each driver's counters (Relaxed): busy (turn time, excluding spin), passes, slow passes (over 100 µs) and ops (messages and slices), plus every shard's producer wakes.
+  - **Grow** (target + 1, up to the ceiling) when, averaged over 10 windows, the busiest driver's awake-busy is above 0.75, or more than 1% of a driver's passes run over 100 µs. A pass bounds how long a message waits for its shard's turn: #997's heavy rows at one driver had pass p99s of 128–256 µs.
+  - **Shrink** (target − 1) when, over 50 windows, producer wakes per op are above 0.05, the drivers' summed busy fits on k − 1 at 0.5, and no driver has slow passes.
+  - **Damping:** no resize within 2 s of another. A shrink that a grow undoes within 60 s doubles the next shrink's windows, up to 800 (as D255).
+- **Moves happen at quiet points.** A driver hands a shard that belongs elsewhere to its owner only between turns, and only with its own ring quiet (nothing of the thread's in flight).
+  - A moved shard's I/O completes only on the ring that submitted it (#402). So nothing is left on the old ring, and no wait inside a turn comes to depend on another driver's ring (#1002, fixed by #1003).
+  - The source takes the shard out of its list, so it announces no further sleep for it. It pushes the shard onto the adopter's handoff queue, then wakes the adopter.
+  - The adopter drains its queue at the start of each pass, points the shard's wakeups at itself, and runs the shard's turn before it next parks. A producer that read the old target woke the source, and the adopter's turn finds its message (the loom model `loom_a_message_racing_a_driver_move_is_found_by_the_adopter`).
+- **Shutdown:** `Runtime::stop` closes the drivers before the inboxes: no move after that. A driver holding no shard exits once its handoff queue is empty, so a shard is never handed to a driver that has gone.
+- **Spin through in-flight I/O:** with own-ring I/O in flight, a driver spins first, polling its queues and reaping without blocking every 64 polls, before it waits on its ring. In #997's A/B, ring waits ended 67–78% of ycsb-f's passes, and this arm gained 6–11% ops at k ≤ 4.
+- **A cross-ring wait's resolver** wakes the waiter's ring wait (simp724's note on #1003), so the wait ends when the operation completes rather than at its 1 ms slice. `cross_ring_wait_slices` counts the slices that still run out.
+- **Bench and tests:** `driver_target()` / `drivers_settled()` (engine and `pigeonhole`, doc-hidden) report the target and whether every shard is on its driver; the bench's warm-up does not end while either moves, and records `drivers`. `force_driver_target` fixes the target for tests.
+
+**The CPU budget (ICR 0081; owner, 2026-10-27, #760 comments 6443979201, 6444135824 and 6446722456):** one function sizes the engine-owned threads from the physical cores the process may use, after its affinity mask and a container's CPU quota (`pigeonhole_io::sys::default_shards`).
+- **Shards:** one per core, as before (D220).
+- **The driver ceiling:** one per core in both profiles. Under full load a store keeps a thread per shard's throughput (#997's A/B: ycsb-f −8% at 8 of 16), and the controller shrinks a light one.
+- **The profiles differ in the compaction share** (`Options::cpu_profile`). These are placeholders until PR 2's compaction-share arms (c = 2, 4, 8 at 16 cores):
+  - `Embedded` (the default) gives flush and compaction a quarter of the cores, leaving the application the rest and every SMT sibling;
+  - `Server` (the clients are elsewhere: another container, IPC, the network) gives them half.
+  - Both scale with the cores (D252's fixed cap of four is gone), at most one per shard, since a shard runs one compaction at a time.
+- **Explicit settings win:** `shard_threads(k)` fixes the drivers (the controller off), and `compaction_cores(c)` is kept as given.
+- **Application-owned mode** starts no threads (D40).
+
+| Physical cores (after limits) | Shards | Driver ceiling | Embedded compaction | Server compaction |
+|--:|--:|--:|--:|--:|
+| 1 | 1 | 1 | 1 | 1 |
+| 2 | 2 | 2 | 1 | 1 |
+| 4 | 4 | 4 | 1 | 2 |
+| 8 | 8 | 8 | 2 | 4 |
+| **16 (AX102)** | 16 | 16 | 4 | 8 |
+| 32 | 32 | 32 | 8 | 16 |
+| 64 | 64 | 64 | 16 | 32 |
+| 128 | 128 | 128 | 32 | 64 |
+
+The AX102 row is measured: 16 drivers is today's default, and 4 compaction threads D252's. The larger rows are reasoned, since there's no larger box. Compaction work scales with the write rate the drivers carry, and a shard compacts one job at a time, so the share stays useful up to one per shard.
 
 **The invariant: no wait inside a turn may depend on another shard's turn.** A wait inside a turn may depend only on I/O the thread reaps itself, or on other threads. A driver blocked inside shard A's turn runs no sibling, so a wait that needed shard B's turn would deadlock whenever B shares the driver.
 - **Precedent:** application-owned mode already lets one thread drive several shards (the guide's async chapter), so the engine already keeps this.
@@ -2760,6 +2791,11 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
 - `drivers_hold_shards_round_robin_and_handlers_return_in_order` checks placement, thread names and the handler order.
 - `a_driver_charges_its_spin_to_the_shards_that_worked` checks the spin split. Charging every shard fails it.
 - `pigeonhole/tests/model.rs` takes `PIGEONHOLE_SHARD_THREADS=k`. Sweeps run it with 1 and 2.
+- **PR 2:**
+  - `modes.rs` runs the engine-owned suite with the target forced through 1, 2, 3 and back every millisecond, plus `shards_move_between_drivers_under_traffic` (300 resize rounds, more than 100 moves, every reply and the handler order kept).
+  - `driver_ring.rs` moves shards with io_uring reads in flight.
+  - The loom model above.
+  - `pigeonhole/tests/model.rs` takes `PIGEONHOLE_DRIVER_CHURN=1`, forcing seeded resizes after one step in ten.
 
 <a id="d291"></a>
 ## D291 — A counter get that folds many operands keeps its result as a base in the active memtable (ctr274, 2026-10-27; compaction, engine, pigeonhole, #713, D280; refines D186, D287)

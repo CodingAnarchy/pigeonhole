@@ -50,6 +50,10 @@ pub struct EngineOptions {
     /// (the default) gives each shard a thread of its own; `k` runs shard `i` on thread
     /// `i % k`.
     pub shard_threads: usize,
+    /// Engine-owned mode only: size the driver threads to the load (D289 PR 2), up to
+    /// `shard_threads` (one per shard if 0). Off by default here, so this crate's tests run
+    /// on fixed threads; `pigeonhole::Options` turns it on unless `shard_threads` is set.
+    pub adaptive_drivers: bool,
     /// Application-owned mode only: background workers for flush and compaction that the
     /// application drives from threads it owns (D284), handed out by
     /// [`Engine::open_application_owned_with`](crate::Engine::open_application_owned_with);
@@ -227,6 +231,7 @@ impl EngineOptions {
             pin_threads: true,
             compaction_threads: 0,
             shard_threads: 0,
+            adaptive_drivers: false,
             background_workers: 0,
             durability: Durability::GroupSync,
             memtable_budget,

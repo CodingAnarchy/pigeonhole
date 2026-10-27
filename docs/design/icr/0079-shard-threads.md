@@ -31,3 +31,19 @@ PR 1 fixes the count, so the box A/B at k ∈ {1, 2, 4, 8, 16} can choose the de
 - **`pigeonhole-engine`:** `engine.rs` (the runtime config).
 - **`pigeonhole`:** `options.rs`; tests: `model.rs` (`PIGEONHOLE_SHARD_THREADS=k`).
 - **`pigeonhole-bench`:** `runners/pigeonhole.rs`, `main.rs`.
+
+## PR 2 additions (D289's load controller)
+
+- **`pigeonhole-runtime`:**
+  - `RuntimeConfig::adaptive_drivers: bool` (default `false`): engine-owned drivers sized to the load, up to `shard_threads` (one per shard if 0).
+  - `Runtime::driver_target() -> usize` and `Runtime::drivers_settled() -> bool`.
+  - Doc-hidden, for tests: `force_driver_target(Option<usize>)`, `driver_control()` and `driver_moves()`.
+- **`pigeonhole-engine`:**
+  - `EngineOptions::adaptive_drivers: bool`, default `false`, so the crate's own tests run fixed.
+  - Doc-hidden: `Engine::driver_target() -> Option<(usize, bool)>` and `Engine::force_driver_target`.
+- **`pigeonhole`:**
+  - Engine-owned opens turn the controller on unless `shard_threads` is set.
+  - Doc-hidden: `Pigeonhole::driver_target()` and `force_driver_target()`, for the bench's warm-up and the model check's churn.
+- **`pigeonhole-io`:** doc-hidden `cross_ring_wait_slices()`.
+- **`pigeonhole-bench`:** `Runner::driver_target()`, and `RunDetail::drivers`.
+

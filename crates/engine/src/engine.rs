@@ -1569,6 +1569,7 @@ impl Engine {
         config.pin_threads = options.pin_threads;
         config.compaction_threads = options.compaction_threads;
         config.shard_threads = options.shard_threads;
+        config.adaptive_drivers = options.adaptive_drivers;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
         let bound = match options.async_commit_bound {
             0 => options.memtable_budget / 2,
@@ -2695,6 +2696,34 @@ impl Engine {
         }
         let target = self.inner.shared.pack_target.load(Ordering::Acquire);
         (target > 0).then(|| (self.inner.shared.pack_k.load(Ordering::Acquire), target))
+    }
+
+    /// The driver threads the shards run on now and whether every shard is on its driver
+    /// (D289 PR 2), `None` without engine-owned threads. A bench hook: the warm-up does not end
+    /// while the controller is still resizing or moving shards.
+    #[doc(hidden)]
+    pub fn driver_target(&self) -> Option<(usize, bool)> {
+        let rt = self
+            .inner
+            .runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        rt.as_ref()
+            .map(|rt| (rt.driver_target(), rt.drivers_settled()))
+    }
+
+    /// Fixes the driver target at `k`, or with `None` gives it back to the controller (D289
+    /// PR 2). For tests that move shards between drivers under load.
+    #[doc(hidden)]
+    pub fn force_driver_target(&self, k: Option<usize>) {
+        let rt = self
+            .inner
+            .runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(rt) = rt.as_ref() {
+            rt.force_driver_target(k);
+        }
     }
 
     /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,

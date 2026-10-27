@@ -72,7 +72,9 @@ Every observed nesting, outer → inner. The **manifest exclusion** (`manifest_b
 - `Inner::reader_catalog` holds `ReaderState::catalog` across the root reload and manifest read, and `reader_view` holds `view` while it builds a view (long work under one lock).
 - `flushed_roots` is held across `view.load_full()` in `read_latest` (`FlushedRoots::read`). That's not a lock, but the read relies on the ordering (#131); loom-modelled.
 
-**The runtime holds no lock while taking another**, except `Pool::state` → `TaskCell::signal` (item 12).
+13. **A driver's `Slot::handoff` → `Signal::target`** (runtime drivers.rs, D289 PR 2). At the start of a pass, the adopting driver drains its handoff queue under the lock and points each adopted shard's wakeups at itself (`set_target`) before releasing it. `Signal::target` is a leaf, held only to swap the target. The source pushes onto the queue under the same lock and releases it before waking the adopter (`Slot::thread`, cloned out, then the unpark and the ring wake after release).
+
+**The runtime holds no lock while taking another**, except `Pool::state` → `TaskCell::signal` (item 12) and `Slot::handoff` → `Signal::target` (item 13).
 - `Signal::target` is held only to clone the target; the unpark, eventfd write or callback runs after release.
 - `Slot::state` is released before a completion's hook and settle callback (`Waiter::on_settled`) run and before the condvar or waker is signalled.
 - `Waiter::wait` holds `Slot::state` across `cv.wait`, the standard condvar pattern.
@@ -646,7 +648,7 @@ One wait polls because nothing would wake it. It is bounded, takes no lock while
 
 ## Appendix D: `runtime/src`
 
-Scope: `lib.rs`, `signal.rs`, `completion.rs`, `sched.rs`, `pool.rs`, `submit_gate.rs`. `lib.rs` has `#![forbid(unsafe_code)]`. Under `cfg(loom)`, `completion.rs` switches `Arc/Mutex/Condvar` to `loom::sync`, `signal.rs` its `Mutex` and atomics, `submit_gate.rs` its atomics, `sched.rs` the task's woken flag (`WokenFlag`) and its signal's lock (`TargetLock`), and `pool.rs` its `Mutex`, `Condvar` and atomics.
+Scope: `lib.rs`, `drivers.rs`, `signal.rs`, `completion.rs`, `sched.rs`, `pool.rs`, `submit_gate.rs`. `lib.rs` has `#![forbid(unsafe_code)]`. Under `cfg(loom)`, `completion.rs` switches `Arc/Mutex/Condvar` to `loom::sync`, `signal.rs` its `Mutex` and atomics, `submit_gate.rs` its atomics, `sched.rs` the task's woken flag (`WokenFlag`) and its signal's lock (`TargetLock`), and `pool.rs` its `Mutex`, `Condvar` and atomics.
 
 Thread roles used below:
 - **shard thread**: the thread driving a `ShardCore`: an engine-owned driver thread (`driver_main`, D289: `pigeonhole-shard-{i}` when it holds one shard, `pigeonhole-driver-{d}` when `shard_threads` gives it several, which it runs one turn after another; so no wait inside a turn may depend on another shard's turn, only on I/O the thread reaps or on other threads, as application-owned mode already requires), or an application thread inside `ShardDriver::run_once` / `release` / `shutdown` / `with_handler`.
@@ -656,6 +658,21 @@ Thread roles used below:
 - **producer**: any thread holding a `Submitter` (client threads via the engine API, other shards via `ShardContext::submitter`), a `TaskWaker` clone (whoever a background task handed it to: completion hooks, I/O completion paths, other shards), or a shard thread spawning onto the pool (`Spawner::spawn` -> `Pool::submit`).
 - **reclaimer** (D284): the closing thread (`WorkerPool::close`), a shard thread in a room wait or taking back stale queued tasks (`Spawner::take_back`, `reclaim_room`), or the thread dropping a `PoolDriver` (`Pool::retire`).
 - **owner thread**: the thread that calls `Runtime::start` / `shutdown` / drops `Runtime`, or owns a `ShardDriver`.
+
+### Driver threads (D289), `drivers.rs`, one `Drivers` per engine-owned runtime
+
+| Item | Type | Role | Writers | Readers | Ordering | Origin |
+|---|---|---|---|---|---|---|
+| `Drivers::target` | `AtomicUsize` | The drivers the shards run on now: shard `i` belongs to driver `i % target`. | The controller on driver 0 (`Controller::tick` → `set_target`), and `force_target` (tests, any thread). Both wake every driver after a change. | Every driver, between passes, to find shards to hand over; `Runtime::driver_target`. | `swap` AcqRel; loads Acquire. A driver that reads a stale target hands over at its next pass. | D289 PR 2. |
+| `Drivers::forced`, `Drivers::closing` | `AtomicUsize`, `AtomicBool` | A test's fixed target (0: none). Shutdown begun: no more moves, and an empty driver exits. | `force_target`. `close` from `Runtime::stop` and `Drop`, before the inboxes close. | The controller (`forced`); `hand_off` and a driver's exit check (`closing`). | Release / Acquire. | D289 PR 2. |
+| `Drivers::moves` | `AtomicU64` | Shards handed over (diagnostic, tests). | `hand_off`. | `Runtime::driver_moves`. | Relaxed. | D289 PR 2. |
+| `DriverStats` (`busy`, `passes`, `slow`, `ops`, `misplaced`) | `AtomicU64` ×4, `AtomicUsize` | One driver's counters for the controller, and its shards not yet on their owner. | That driver only, per pass. | The controller (windowed deltas), `drivers_settled`. | Relaxed: estimates; a window reads them once. | D289 PR 2. |
+| `Slot::handoff` | `Mutex<Handoff>` (`cores: Vec<ShardCore>`, `exited`) | Shards handed to this driver, not adopted yet; whether it exited. | Source drivers (`hand_off`: refuses when `exited` or closing). The owner itself: drains at each pass start, and sets `exited` at shutdown, once empty. | The owner, before parking (a non-empty queue skips the park). | Mutex. With `exited` under the same lock, a shard is never handed to a driver that has gone. | D289 PR 2. |
+| `Slot::thread` | `Mutex<Option<(Thread, Option<OwnIoWaker>)>>` | How to wake a driver for a handoff or a target change. | The driver at start. | `Drivers::wake` (any thread), which clones the value out and wakes after release. | Leaf. | D289 PR 2. |
+
+A shard moves only between its turns, and only when its driver's own ring is quiet (`own_io_in_flight() == false`). The protocol is in drivers.rs's module doc and D289's "How the controller runs". It keeps protocol 1 below: the adopter runs the shard's turn, ending in `check_before_sleep`, before it can park. That's modelled in signal.rs's `loom_a_message_racing_a_driver_move_is_found_by_the_adopter` (not ignored: it passes on loom 0.7.2). `ShardCore::mark_released` records the quiet handover for #492's debug check.
+
+**`pigeonhole-io`'s `CROSS_RING_SLICES`** (completion.rs, a static `AtomicU64`, Relaxed): slices a blocked wait on another thread's ring reaped its own ring with the operation still pending (#1002), read by `cross_ring_wait_slices()` for benchmarks. The waiting thread also stores its ring's `OwnIoWaker` as the completion's `Waker` (`State::Pending::waker`, under the completion's lock), which the resolver wakes after `notify_all`.
 
 ### Signal (idle/wake handshake), `signal.rs`
 
