@@ -2700,8 +2700,16 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 
 **Decided:** option (a) of the shard-threading note (#760, perf287's revision 2, comment 6434752774; owner, comment 6441951893).
 - **Drivers:** k pinned driver threads run the n shards' turns. Shards and their data are unchanged.
-- **PR 1:** a fixed k (`shard_threads`, default 0: a thread per shard, as before), plus the inventory of calls that can block inside a shard's turn (below). A box A/B at k ∈ {1, 2, 4, 8, 16} sets the default, which starts at n/4. One arm pins the drivers on the CCD without the V-cache.
-- **PR 2:** the controller, with moves and steals.
+- **PR 1:** a fixed k (`shard_threads`, default 0: a thread per shard, as before), plus the inventory of calls that can block inside a shard's turn (below).
+- **PR 1's fixed-k A/B** (#997, comment 6446578729; AX102, 16 shards) found no fixed default; the default stays a thread per shard (coordinator, 2026-10-27).
+  - **Light load (sparse-wide buffered):** k = 1–2 put p99 at 34–38 µs against 395–553 µs at k = 16, at flat ops/s.
+  - **Heavy shapes lose throughput as k shrinks.** At k = 4: ycsb-f −29%, transfer −18%, ycsb-a −9%. At k = 1: −66–70%. At k = 8: −8% and −1.5%.
+  - **Ring waits** end 67–78% of ycsb-f's driver passes at every k, including 16. Spinning with non-blocking reaps while I/O is in flight removes them (+6–11% ops at k ≤ 4).
+  - **No-yield:** D198's yield removed at the driver level reproduced #996's trade, and stays out.
+- **PR 2:** the controller, with moves and steals. It also takes:
+  - the owner's CPU budget (ICR 0081: one function sizes the driver and compaction threads from the cores the process may use, with an embedded and a server profile), whose driver count becomes the controller's ceiling;
+  - the spin through in-flight I/O, with a k = 16 arm;
+  - the compaction-share and server-profile arms.
   - **Grow** on turns that end with a sibling shard still queued, or awake-busy above 0.75.
   - **Shrink** on wakes when the busy sum fits on k − 1 threads.
   - **Damping:** as D255's.
