@@ -1509,8 +1509,11 @@ pub(crate) enum ShardMsg {
     /// The manifest changed: score the shard's slots for compaction, refresh stalls.
     Maintain,
     /// The running compaction submitted its commit: its output is the manifest request's
-    /// now, so a close no longer waits for it (#991).
-    CompactionCommitting,
+    /// now, so a close no longer waits for it (#991). `epoch` names the job (its
+    /// `CompactionWork::epoch`): a stale message for an earlier job is ignored.
+    CompactionCommitting {
+        epoch: u64,
+    },
     /// A compaction task finished.
     CompactionDone {
         inputs: Vec<SstId>,
@@ -2869,6 +2872,8 @@ pub(crate) struct ShardState {
     compaction_guard: Option<CompactionGuard>,
     /// The running compaction submitted its commit (`CompactionCommitting`).
     compaction_committing: bool,
+    /// Compactions started on this shard: the running one's tag for `CompactionCommitting`.
+    compaction_epoch: u64,
     /// Consecutive voided compactions per slot: at `PURGE_VOID_LIMIT` the slot compacts
     /// without the purge below `min_ts_above` (and so without a guard), so a backfill
     /// written newest to oldest cannot keep it from installing.
@@ -3319,6 +3324,7 @@ impl ShardState {
             voided_roots: HashSet::new(),
             compaction_guard: None,
             compaction_committing: false,
+            compaction_epoch: 0,
             purge_voids: HashMap::new(),
             pending_rows: FastMap::default(),
             pending_reads: FastMap::default(),
@@ -9580,6 +9586,8 @@ impl ShardState {
         ) {
             Ok(mut w) => {
                 w.guard = guard.as_ref().map(|g| Arc::clone(&g.state));
+                self.compaction_epoch += 1;
+                w.epoch = self.compaction_epoch;
                 w
             }
             Err(e) => {
@@ -10302,9 +10310,11 @@ impl ShardState {
                     self.try_finish_close(ctx);
                 }
             }
-            ShardMsg::CompactionCommitting => {
-                self.compaction_committing = true;
-                self.try_finish_close(ctx);
+            ShardMsg::CompactionCommitting { epoch } => {
+                if self.compaction.is_some() && epoch == self.compaction_epoch {
+                    self.compaction_committing = true;
+                    self.try_finish_close(ctx);
+                }
             }
             ShardMsg::CompactionDone {
                 inputs,
