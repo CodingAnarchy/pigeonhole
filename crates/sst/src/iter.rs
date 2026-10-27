@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use pigeonhole_cache::{BlockHandle, Cell};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::block::{Block, BlockAddr, BlockIter, BlockKind};
-use pigeonhole_format::key::row_prefix_len;
+use pigeonhole_format::key::{compare, row_prefix_len};
 
 use crate::{Error, Fetch, ReadOptions, Result, ScanFilter, SstReader};
 use pigeonhole_format::scan::{CompiledFilter, Verdict};
@@ -76,7 +76,7 @@ use pigeonhole_format::scan::{CompiledFilter, Verdict};
 /// # }
 /// ```
 #[derive(Debug)]
-pub struct SstIter {
+pub struct SstIter<const LAZY: bool = false> {
     reader: Arc<SstReader>,
     filter: CompiledFilter,
     filter_all: bool,
@@ -95,6 +95,29 @@ pub struct SstIter {
     /// and the size of its next readahead batch: readahead ramps up (#712).
     stepped: u32,
     window: u32,
+    /// Lazy mode only ([`SstReader::iter_lazy`], D288): whether the cursor is parked, and on
+    /// what. Always [`Park::None`] in an eager cursor.
+    park: Park,
+    /// On [`Park::Entry`], the parked entry's verdict (its seek hint in `hint`), so settling
+    /// does not check it again.
+    verdict: Verdict,
+    /// On [`Park::Block`], the key the cursor reports: below every entry it has still to
+    /// read (the separator of the block it left, or the target of a seek past it).
+    park_key: Vec<u8>,
+    /// Scratch for `park_key` while a parked block is loaded.
+    spare_key: Vec<u8>,
+}
+
+/// Where a lazy cursor ([`SstReader::iter_lazy`], D288) stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Park {
+    /// On an admitted entry, or exhausted: settled.
+    None,
+    /// On an entry the filter does not admit, its verdict kept.
+    Entry,
+    /// Before a data block it has not loaded: the index names it, and `park_key` is a lower
+    /// bound on its next entry.
+    Block,
 }
 
 /// Where a cursor's readahead ramp stands ([`SstIter::readahead_ramp`]), to carry it to the
@@ -233,7 +256,7 @@ fn loaded(slot: &mut Option<BlockIter<BlockHandle>>) -> Result<&mut BlockIter<Bl
     })
 }
 
-impl SstIter {
+impl<const LAZY: bool> SstIter<LAZY> {
     #[inline]
     pub(crate) fn new(reader: Arc<SstReader>, filter: ScanFilter, options: ReadOptions) -> Self {
         Self {
@@ -249,7 +272,18 @@ impl SstIter {
             ahead: None,
             stepped: 0,
             window: 0,
+            park: Park::None,
+            verdict: Verdict::Admit,
+            park_key: Vec::new(),
+            spare_key: Vec::new(),
         }
+    }
+
+    /// Whether moves stop short of a data block and of a filter's verdict (D288): a lazy
+    /// cursor with a filter to apply. Constant false in an eager cursor.
+    #[inline(always)]
+    fn defers(&self) -> bool {
+        LAZY && !self.filter_all
     }
 
     /// Switches cache-only reads on or off ([`ReadOptions::cache_only`]): an async scan
@@ -534,6 +568,9 @@ impl SstIter {
             ahead.clear();
         }
         (self.stepped, self.window) = (0, 0);
+        if LAZY {
+            self.park = Park::None;
+        }
         if self.top.is_none() {
             load(&mut self.top, self.reader.inner.top.clone())?;
         }
@@ -588,6 +625,12 @@ impl SstIter {
             return Ok(());
         }
         loop {
+            if self.defers() {
+                // The separator of the block left behind: every later entry sorts above it.
+                let sep = loaded(&mut self.index)?.key();
+                self.park_key.clear();
+                self.park_key.extend_from_slice(sep);
+            }
             loaded(&mut self.index)?.next()?;
             while !valid(&self.index) {
                 loaded(&mut self.top)?.next()?;
@@ -597,6 +640,12 @@ impl SstIter {
                 }
                 self.load_partition()?;
                 loaded(&mut self.index)?.seek_to_first()?;
+            }
+            if self.defers() {
+                // Lazy (D288): the merge loads the block when its position reaches the
+                // separator, if it does.
+                self.park = Park::Block;
+                return Ok(());
             }
             self.load_data(true)?;
             let data = loaded(&mut self.data)?;
@@ -642,6 +691,14 @@ impl SstIter {
         }
         if !index.valid() {
             return self.position(Some(target));
+        }
+        if self.defers() {
+            // Lazy (D288): no entry before `target` is wanted; the block is loaded when the
+            // merge reaches it.
+            self.park_key.clear();
+            self.park_key.extend_from_slice(target);
+            self.park = Park::Block;
+            return Ok(());
         }
         self.load_data(true)?;
         let data = loaded(&mut self.data)?;
@@ -700,24 +757,148 @@ impl SstIter {
         Ok(())
     }
 
-    /// Runs a move and settles; on error the cursor becomes invalid.
+    /// Runs a move and settles (a lazy cursor only lands, D288); on error the cursor
+    /// becomes invalid.
     fn run(&mut self, f: impl FnOnce(&mut Self) -> Result<()>) -> Result<()> {
-        let r = f(self).and_then(|()| self.settle());
+        if LAZY {
+            // A move from an entry parked on (a row skip of a source inside the merge's row)
+            // lands afresh: the old verdict is not the new entry's.
+            self.park = Park::None;
+        }
+        let r = f(self).and_then(|()| {
+            if self.defers() {
+                self.land();
+                Ok(())
+            } else {
+                self.settle()
+            }
+        });
         if r.is_err() {
-            self.data = None;
+            self.invalidate();
         }
         r
     }
+
+    /// Ends the cursor after a failed move.
+    #[cold]
+    fn invalidate(&mut self) {
+        self.data = None;
+        if LAZY {
+            self.park = Park::None;
+        }
+    }
+
+    /// Lazy mode: checks the entry a move landed on, once. Admitted, the cursor is settled;
+    /// otherwise it parks there with the verdict. A move that stopped before a block has
+    /// parked already.
+    fn land(&mut self) {
+        if self.park != Park::None {
+            return;
+        }
+        if let Some(data) = self.data.as_ref().filter(|d| d.valid()) {
+            let v = self.filter.check(data.key(), &mut self.hint);
+            if v != Verdict::Admit {
+                self.park = Park::Entry;
+                self.verdict = v;
+            }
+        }
+    }
+
+    /// Lazy mode: loads the block the cursor parked before, at its first entry at or past
+    /// `park_key`, unfiltered (a move past the block's end parks again).
+    fn resume(&mut self) -> Result<()> {
+        self.park = Park::None;
+        let target = std::mem::replace(&mut self.park_key, std::mem::take(&mut self.spare_key));
+        let r = self.resume_at(&target);
+        self.spare_key = target;
+        r
+    }
+
+    fn resume_at(&mut self, target: &[u8]) -> Result<()> {
+        let index = loaded(&mut self.index)?;
+        // A row skipped while parked can move the target past the block the index names.
+        if index.key() < target {
+            index.seek(target)?;
+            if !index.valid() {
+                return self.position(Some(target));
+            }
+        }
+        self.load_data(true)?;
+        let data = loaded(&mut self.data)?;
+        data.seek(target)?;
+        if !data.valid() {
+            self.advance_block(true)?;
+        }
+        Ok(())
+    }
+
+    /// Lazy mode's settle (D288): D22's loop, stopping on the first entry, or before the
+    /// first unloaded block, strictly past `bound`.
+    fn settle_lazy(&mut self, bound: Option<&[u8]>) -> Result<()> {
+        let past = |key: &[u8]| bound.is_some_and(|b| compare(key, b).is_gt());
+        loop {
+            match self.park {
+                Park::None => return Ok(()),
+                Park::Block => {
+                    if past(&self.park_key) {
+                        return Ok(());
+                    }
+                    self.resume()?;
+                }
+                Park::Entry => {
+                    if past(self.data.as_ref().map_or(&[], |d| d.key())) {
+                        return Ok(());
+                    }
+                    self.park = Park::None;
+                    match self.verdict {
+                        Verdict::Admit => return Ok(()),
+                        Verdict::SkipRow => self.skip_row_raw()?,
+                        Verdict::Seek => {
+                            let hint = std::mem::take(&mut self.hint);
+                            let r = self.seek_forward(&hint);
+                            self.hint = hint;
+                            r?;
+                        }
+                        Verdict::Next => self.next_raw()?,
+                    }
+                }
+            }
+            self.land();
+        }
+    }
+
+    /// Lazy mode, a row skip while parked before a block: the target moves past the row of
+    /// the parked key, the block still unloaded. `false` if that key has no row to skip.
+    fn skip_row_parked(&mut self) -> bool {
+        let Ok(n) = row_prefix_len(&self.park_key) else {
+            return false;
+        };
+        // `escaped row ++ 00 02` sorts after every key of the row (as `skip_row_raw`).
+        let mut past = std::mem::take(&mut self.spare_key);
+        past.clear();
+        past.extend_from_slice(&self.park_key[..n]);
+        if let Some(last) = past.last_mut() {
+            *last = 0x02;
+        }
+        if compare(&past, &self.park_key).is_gt() {
+            std::mem::swap(&mut self.park_key, &mut past);
+        }
+        self.spare_key = past;
+        true
+    }
 }
 
-impl Cursor for SstIter {
+impl<const LAZY: bool> Cursor for SstIter<LAZY> {
     type Error = Error;
 
     fn valid(&self) -> bool {
-        valid(&self.data)
+        valid(&self.data) || (LAZY && self.park == Park::Block)
     }
 
     fn key(&self) -> &[u8] {
+        if LAZY && self.park == Park::Block {
+            return &self.park_key;
+        }
         self.data.as_ref().map_or(&[], |d| d.key())
     }
 
@@ -748,7 +929,7 @@ impl Cursor for SstIter {
                 }
             }),
             Err(e) => {
-                self.data = None;
+                self.invalidate();
                 Err(e.into())
             }
         }
@@ -776,7 +957,7 @@ impl Cursor for SstIter {
                 })
                 .map(|()| true),
             Err(e) => {
-                self.data = None;
+                self.invalidate();
                 Err(e.into())
             }
         }
@@ -788,6 +969,39 @@ impl Cursor for SstIter {
         if !self.valid() {
             return Ok(());
         }
+        if LAZY && self.park == Park::Block {
+            if self.skip_row_parked() {
+                return Ok(());
+            }
+            // A parked key without a row: load the block, then skip as usual.
+            self.resume().inspect_err(|_| self.invalidate())?;
+            if self.park == Park::Block {
+                return Ok(());
+            }
+        }
         self.run(Self::skip_row_raw)
+    }
+
+    #[inline]
+    fn settled(&self) -> bool {
+        !LAZY || self.park == Park::None
+    }
+
+    #[inline]
+    fn may_park(&self) -> bool {
+        self.defers()
+    }
+
+    /// Lazy mode (D288): settles as [`Cursor::settle_until`] says, loading a block it
+    /// parked before only once `bound` reaches that block's lower bound.
+    fn settle_until(&mut self, bound: Option<&[u8]>) -> Result<()> {
+        if !LAZY {
+            return Ok(());
+        }
+        let r = self.settle_lazy(bound);
+        if r.is_err() {
+            self.invalidate();
+        }
+        r
     }
 }
