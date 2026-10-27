@@ -196,6 +196,17 @@ impl<C: Cursor> MergingCursor<C> {
         }
     }
 
+    /// [`Self::settle_top`] for the once-per-read moves (seeks, row skips): only the flag
+    /// test inline, so an eager merge's seek stays as small as before (point gets).
+    #[inline(always)]
+    fn settle_top_after_seek(&mut self) -> Result<(), C::Error> {
+        if self.lazy {
+            self.settle_top_lazy()
+        } else {
+            Ok(())
+        }
+    }
+
     /// Settles the top up to the runner's key until the top is settled or the heap is empty
     /// (the rounds end: see the type's docs).
     #[cold]
@@ -261,7 +272,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             s.seek_to_first()?;
         }
         self.rebuild();
-        self.settle_top()
+        self.settle_top_after_seek()
     }
 
     fn seek(&mut self, target: &[u8]) -> Result<(), C::Error> {
@@ -270,7 +281,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
             s.seek(target)?;
         }
         self.rebuild();
-        self.settle_top()
+        self.settle_top_after_seek()
     }
 
     /// Moves only the sources still behind `target`: past a column with many versions that
@@ -286,7 +297,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
         if moved {
             self.rebuild();
         }
-        self.settle_top()
+        self.settle_top_after_seek()
     }
 
     fn next(&mut self) -> Result<(), C::Error> {
@@ -363,7 +374,7 @@ impl<C: Cursor> Cursor for MergingCursor<C> {
         if moved {
             self.rebuild();
         }
-        self.settle_top()
+        self.settle_top_after_seek()
     }
 }
 
