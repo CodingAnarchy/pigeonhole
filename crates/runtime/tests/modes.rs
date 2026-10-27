@@ -225,6 +225,8 @@ enum Msg {
     },
     /// Drops its notifier on the shard without resolving it.
     Discard(Notifier<u64>),
+    /// Keeps the shard busy for the duration (real time), then replies.
+    Busy(Duration, Notifier<u64>),
 }
 
 #[derive(Default)]
@@ -269,6 +271,13 @@ impl ShardHandler for Handler {
             Msg::Spawn(task) => ctx.spawn(task),
             Msg::Stamp { sent } => self.latencies.push(ctx.now_nanos() - sent),
             Msg::Discard(n) => drop(n),
+            Msg::Busy(d, n) => {
+                let until = Instant::now() + d;
+                while Instant::now() < until {
+                    std::hint::spin_loop();
+                }
+                n.notify(0);
+            }
         }
     }
 
@@ -1205,6 +1214,34 @@ fn shards_move_between_drivers_under_traffic() {
     for (i, h) in hs.iter().enumerate() {
         assert_eq!(h.records, [(0, i as u32)]);
     }
+}
+
+/// D289 PR 2 (#1006 review): any driver runs the controller, not only driver 0. At 2 drivers
+/// with the load on shard 1 alone, driver 0 holds only idle shards and parks; driver 1's
+/// passes must grow the set to the ceiling.
+#[test]
+fn a_load_on_another_drivers_shards_grows_the_set() {
+    let mut cfg = config(4, PreadVfs::new(1));
+    cfg.adaptive_drivers = true;
+    let rt = Runtime::start(cfg, handlers(4)).unwrap();
+    let force = rt.driver_control();
+    force(Some(2));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !rt.drivers_settled() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(rt.drivers_settled(), "never settled at 2 drivers");
+    force(None);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while rt.driver_target() < 4 && Instant::now() < deadline {
+        let (n, w) = completion();
+        rt.submitter(ShardId(1))
+            .submit(Msg::Busy(Duration::from_micros(500), n))
+            .unwrap();
+        assert_eq!(w.wait(), Some(0));
+    }
+    assert_eq!(rt.driver_target(), 4, "the set never grew");
+    rt.shutdown().unwrap();
 }
 
 #[test]

@@ -54,7 +54,16 @@ const SLOW_PASSES: f64 = 0.01;
 const SHRINK_MIN_OPS: u64 = 100;
 /// A shrink after which ops per window fall by more than this fraction is undone (the work
 /// needed the drivers after all: ycsb-f went 16 -> 8 -> 16 at -3%, and loses 8% at a fixed 8).
+/// Also the band within which a load counts as unchanged for a proven level's floor.
 const SHRINK_REGRET: f64 = 0.03;
+/// Sibling wait over busy above which a driver grows the set: its shards' messages wait for
+/// their turns behind other shards' turns about as long as they are served. Transfer's
+/// hops at few drivers cost throughput with neither a busy driver nor slow passes (#1006's
+/// fourth A/B, -6%); this is the cost itself.
+const GROW_WAIT: f64 = 0.5;
+/// A window longer than this ran while every driver that could tick it was parked (an idle
+/// store): it is dropped, not averaged in, so its diluted busy can't read as a light load.
+const IDLE_WINDOW: Duration = Duration::from_millis(200);
 
 /// One driver's counters, read by the controller (Relaxed: windowed estimates).
 #[derive(Default)]
@@ -67,6 +76,10 @@ pub(crate) struct DriverStats {
     slow: AtomicU64,
     /// Messages handled and background slices run by its shards.
     ops: AtomicU64,
+    /// Nanoseconds from each pass's start to the start of each of its turns that handled
+    /// work: how long that work waited behind sibling turns (at most; work that arrived
+    /// mid-pass waited less). Zero for a lone shard.
+    sibling_wait: AtomicU64,
     /// Shards it holds that belong to another driver at the current target (not yet moved:
     /// its ring was never quiet).
     misplaced: AtomicUsize,
@@ -103,6 +116,13 @@ pub(crate) struct Drivers<H: ShardHandler> {
     closing: AtomicBool,
     /// Shards handed from one driver to another.
     moves: AtomicU64,
+    /// The load controller (`adaptive` only), ticked by whichever driver finds its window
+    /// over: driver 0 may be parked while another driver's shards carry the load.
+    controller: Mutex<Option<Controller>>,
+    /// When the controller's window started, in nanoseconds since `epoch`: one Relaxed load
+    /// per pass decides whether to try the controller's lock.
+    window_at: AtomicU64,
+    epoch: Instant,
     vfs: VfsRef,
     submitters: Arc<[Submitter<H::Msg>]>,
 }
@@ -114,6 +134,10 @@ impl<H: ShardHandler> Drivers<H> {
         vfs: VfsRef,
         submitters: Arc<[Submitter<H::Msg>]>,
     ) -> Self {
+        let controller = adaptive.then(|| {
+            let wakes = submitters.iter().map(|s| s.idle_counts().1).sum();
+            Controller::new(drivers, wakes)
+        });
         Self {
             slots: (0..drivers)
                 .map(|_| Slot {
@@ -130,9 +154,30 @@ impl<H: ShardHandler> Drivers<H> {
             forced: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
             moves: AtomicU64::new(0),
+            controller: Mutex::new(controller),
+            window_at: AtomicU64::new(0),
+            epoch: Instant::now(),
             vfs,
             submitters,
         }
+    }
+
+    /// Runs the controller if its window is over and no other driver is running it.
+    fn tick(&self) {
+        let window = WINDOW.as_nanos() as u64;
+        let now = self.epoch.elapsed().as_nanos() as u64;
+        if now.saturating_sub(self.window_at.load(Ordering::Relaxed)) < window {
+            return;
+        }
+        let mut c = match self.controller.try_lock() {
+            Ok(c) => c,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        };
+        if let Some(c) = c.as_mut() {
+            c.tick(self);
+        }
+        self.window_at.store(now, Ordering::Relaxed);
     }
 
     /// The driver shard `id` belongs to at `k` drivers. Round-robin, not blocks of n/k:
@@ -214,7 +259,9 @@ impl<H: ShardHandler> Drivers<H> {
     }
 }
 
-/// One window of the controller's view.
+/// One window of the controller's view. Only drivers below the target count towards
+/// `max_busy`, `sum_busy`, `slow` and `wait`: during a shrink's moves, misplaced shards' time
+/// on drivers at or above it is missed for a window or two.
 #[derive(Clone, Copy, Debug)]
 struct Window {
     /// The busiest driver's awake-busy.
@@ -223,15 +270,27 @@ struct Window {
     sum_busy: f64,
     /// The highest fraction of slow passes over the active drivers.
     slow: f64,
+    /// The highest sibling wait over busy of the active drivers.
+    wait: f64,
     wakes: u64,
     ops: u64,
 }
 
-/// The load controller (D289 PR 2), run by driver 0 between its passes.
+/// Which rule resized the set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Why {
+    /// A shrink cost throughput: back up.
+    Regret,
+    Grow,
+    Shrink,
+}
+
+/// The load controller (D289 PR 2), run between passes by any driver whose pass finds the
+/// window over.
 struct Controller {
     at: Instant,
-    /// Per driver: busy, passes, slow, ops at the window's start.
-    last: Vec<[u64; 4]>,
+    /// Per driver: busy, passes, slow, ops, sibling wait at the window's start.
+    last: Vec<[u64; 5]>,
     last_wakes: u64,
     windows: VecDeque<Window>,
     hold_until: Instant,
@@ -240,20 +299,26 @@ struct Controller {
     /// After a shrink: the target before it and the ops per window that led to it, to undo
     /// the shrink if throughput falls ([`SHRINK_REGRET`]).
     regret: Option<(usize, f64)>,
+    /// A level a regret proved (it beat the level below it) and the ops per window then: no
+    /// shrink goes below it while the load stays within [`SHRINK_REGRET`] of that, else a
+    /// shrink, its regret and the doubling back would repeat, damped only by the shrink
+    /// windows.
+    floor: Option<(usize, f64)>,
 }
 
 impl Controller {
-    fn new<H: ShardHandler>(drivers: &Drivers<H>) -> Self {
+    fn new(drivers: usize, wakes: u64) -> Self {
         let now = Instant::now();
         Self {
             at: now,
-            last: vec![[0; 4]; drivers.slots.len()],
-            last_wakes: drivers.wakes(),
+            last: vec![[0; 5]; drivers],
+            last_wakes: wakes,
             windows: VecDeque::new(),
             hold_until: now + HOLD,
             shrink_windows: SHRINK_WINDOWS,
             last_shrink: None,
             regret: None,
+            floor: None,
         }
     }
 
@@ -266,7 +331,8 @@ impl Controller {
         self.at = now;
         let k = drivers.target();
         let window_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1) as f64;
-        let (mut max_busy, mut sum_busy, mut slow, mut ops) = (0f64, 0f64, 0f64, 0u64);
+        let (mut max_busy, mut sum_busy, mut slow, mut wait, mut ops) =
+            (0f64, 0f64, 0f64, 0f64, 0u64);
         for (d, slot) in drivers.slots.iter().enumerate() {
             let s = &slot.stats;
             let now_counts = [
@@ -274,6 +340,7 @@ impl Controller {
                 s.passes.load(Ordering::Relaxed),
                 s.slow.load(Ordering::Relaxed),
                 s.ops.load(Ordering::Relaxed),
+                s.sibling_wait.load(Ordering::Relaxed),
             ];
             let last = std::mem::replace(&mut self.last[d], now_counts);
             let delta = |i: usize| now_counts[i].saturating_sub(last[i]);
@@ -285,14 +352,23 @@ impl Controller {
                 if delta(1) > 0 {
                     slow = slow.max(delta(2) as f64 / delta(1) as f64);
                 }
+                if delta(0) > 0 {
+                    wait = wait.max(delta(4) as f64 / delta(0) as f64);
+                }
             }
         }
         let wakes_now = drivers.wakes();
         let wakes = wakes_now.saturating_sub(std::mem::replace(&mut self.last_wakes, wakes_now));
+        if elapsed > IDLE_WINDOW {
+            // Every driver parked through most of it: the counters above are the new
+            // baseline, and the window isn't one.
+            return;
+        }
         self.windows.push_back(Window {
             max_busy,
             sum_busy,
             slow,
+            wait,
             wakes,
             ops,
         });
@@ -302,8 +378,17 @@ impl Controller {
         if drivers.forced.load(Ordering::Acquire) != 0 || now < self.hold_until {
             return;
         }
-        if let Some(next) = self.decide(k, drivers.slots.len()) {
+        if let Some((next, why)) = self.decide(k, drivers.slots.len()) {
+            if why == Why::Regret
+                && let Some((_, before_ops)) = self.regret
+            {
+                self.floor = Some((next, before_ops));
+            }
             if next < k {
+                // Below a proven level only when the load changed (`decide` checked).
+                if self.floor.is_some_and(|(f, _)| next < f) {
+                    self.floor = None;
+                }
                 self.last_shrink = Some(now);
                 let n = self.shrink_windows.min(self.windows.len()).max(1);
                 let before = self
@@ -333,8 +418,9 @@ impl Controller {
         }
     }
 
-    /// The next target, if the windows since the last resize call for one.
-    fn decide(&self, k: usize, ceiling: usize) -> Option<usize> {
+    /// The next target and the rule that set it, if the windows since the last resize call
+    /// for one.
+    fn decide(&self, k: usize, ceiling: usize) -> Option<(usize, Why)> {
         let recent = |n: usize| self.windows.iter().rev().take(n);
         // A shrink that cost throughput comes back first (the windows were cleared at it, so
         // these are all after it).
@@ -348,18 +434,19 @@ impl Controller {
             // of throughput, and going back to 16 lost the whole tail gain (#1006's fourth A/B:
             // 16 -> 1 -> 16 four times); its gain is at 2.
             if after < before_ops * (1.0 - SHRINK_REGRET) {
-                return Some((2 * k).min(before_k));
+                return Some(((2 * k).min(before_k), Why::Regret));
             }
         }
         if k < ceiling && self.windows.len() >= GROW_WINDOWS {
             let n = GROW_WINDOWS as f64;
             let busy = recent(GROW_WINDOWS).map(|w| w.max_busy).sum::<f64>() / n;
             let slow = recent(GROW_WINDOWS).map(|w| w.slow).sum::<f64>() / n;
+            let wait = recent(GROW_WINDOWS).map(|w| w.wait).sum::<f64>() / n;
             // Doubling, not one at a time: a driver's busy saturates at 1, so it can't say how
             // many more the work needs, and stepping up one per 3 s left transfer at 2-12 of 16
             // drivers through its measured phase (-10%; #1006's second A/B).
-            if busy > GROW_BUSY || slow > SLOW_PASSES {
-                return Some((2 * k).min(ceiling));
+            if busy > GROW_BUSY || slow > SLOW_PASSES || wait > GROW_WAIT {
+                return Some(((2 * k).min(ceiling), Why::Grow));
             }
         }
         if k > 1 && self.windows.len() >= self.shrink_windows {
@@ -373,13 +460,20 @@ impl Controller {
             // Straight to the drivers the work needs at SHRINK_BUSY each, not one at a time:
             // stepping down one driver per 5 s took a light store about 100 s from 16 to 2,
             // past the bench's warm-up and most of its measured phase (#1006's first A/B).
-            let needed = ((sum_busy / SHRINK_BUSY).ceil() as usize).max(1);
+            let mut needed = ((sum_busy / SHRINK_BUSY).ceil() as usize).max(1);
+            // Not below a proven level while the load is the one that proved it.
+            if let Some((floor, floor_ops)) = self.floor {
+                let level = ops as f64 / n;
+                if (level - floor_ops).abs() <= floor_ops * SHRINK_REGRET {
+                    needed = needed.max(floor);
+                }
+            }
             if wakes_per_op > SHRINK_WAKES_PER_OP
                 && busy_enough
                 && needed < k
                 && slow <= SLOW_PASSES
             {
-                return Some(needed);
+                return Some((needed, Why::Shrink));
             }
         }
         None
@@ -419,7 +513,6 @@ pub(crate) fn driver_main<H: ShardHandler>(
     for core in &cores {
         core.signal().set_target(target());
     }
-    let mut controller = (d == 0 && drivers.adaptive).then(|| Controller::new(&drivers));
     let stats = &drivers.slots[d].stats;
     loop {
         // Shards handed over since the last pass: their wakeups now reach this thread, and
@@ -433,6 +526,7 @@ pub(crate) fn driver_main<H: ShardHandler>(
         }
         let pass_start = vfs.monotonic_nanos();
         let mut more = false;
+        let mut sibling_wait = 0;
         let mut i = 0;
         while i < cores.len() {
             let core = &mut cores[i];
@@ -448,6 +542,9 @@ pub(crate) fn driver_main<H: ShardHandler>(
             stats
                 .ops
                 .fetch_add(core.work_done.saturating_sub(work), Ordering::Relaxed);
+            if core.work_done > work {
+                sibling_wait += start.saturating_sub(pass_start);
+            }
             if core.inbox().is_closed() {
                 let mut core = cores.swap_remove(i);
                 let _shard = EnterShard::new(core.id);
@@ -459,12 +556,17 @@ pub(crate) fn driver_main<H: ShardHandler>(
         }
         if !cores.is_empty() {
             stats.passes.fetch_add(1, Ordering::Relaxed);
+            if sibling_wait > 0 {
+                stats
+                    .sibling_wait
+                    .fetch_add(sibling_wait, Ordering::Relaxed);
+            }
             if vfs.monotonic_nanos().saturating_sub(pass_start) > PASS_BUDGET_NANOS {
                 stats.slow.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if let Some(c) = controller.as_mut() {
-            c.tick(&drivers);
+        if drivers.adaptive {
+            drivers.tick();
         }
         // Shards that belong elsewhere at the current target move once this thread's ring
         // is quiet (see the module doc); until then they stay and run here.
@@ -631,7 +733,7 @@ fn spin_poll<H: ShardHandler>(cores: &mut [ShardCore<H>], window: Duration, reap
 
 #[cfg(test)]
 mod tests {
-    use super::{Controller, GROW_WINDOWS, SHRINK_WINDOWS, Window};
+    use super::{Controller, GROW_WINDOWS, SHRINK_WINDOWS, Why, Window};
     use std::collections::VecDeque;
     use std::time::Instant;
 
@@ -646,6 +748,7 @@ mod tests {
             shrink_windows: SHRINK_WINDOWS,
             last_shrink: None,
             regret: None,
+            floor: None,
         }
     }
 
@@ -654,6 +757,7 @@ mod tests {
             max_busy,
             sum_busy,
             slow,
+            wait: 0.0,
             wakes,
             ops,
         }
@@ -664,7 +768,7 @@ mod tests {
     #[test]
     fn a_light_load_shrinks_to_what_it_needs_in_one_step() {
         let c = controller(vec![window(0.1, 0.6, 0.0, 100, 1000); SHRINK_WINDOWS]);
-        assert_eq!(c.decide(16, 16), Some(2));
+        assert_eq!(c.decide(16, 16), Some((2, Why::Shrink)));
         // Too little evidence yet: no change.
         let c = controller(vec![window(0.1, 0.6, 0.0, 100, 1000); SHRINK_WINDOWS - 1]);
         assert_eq!(c.decide(16, 16), None);
@@ -688,11 +792,11 @@ mod tests {
     fn a_shrink_that_costs_throughput_is_undone() {
         let mut c = controller(vec![window(0.5, 2.0, 0.0, 0, 9_000); GROW_WINDOWS]);
         c.regret = Some((16, 10_000.0));
-        assert_eq!(c.decide(8, 16), Some(16));
+        assert_eq!(c.decide(8, 16), Some((16, Why::Regret)));
         // From one driver, back to two, not to where it came from.
         let mut c = controller(vec![window(0.5, 0.5, 0.0, 0, 9_000); GROW_WINDOWS]);
         c.regret = Some((16, 10_000.0));
-        assert_eq!(c.decide(1, 16), Some(2));
+        assert_eq!(c.decide(1, 16), Some((2, Why::Regret)));
         // Throughput held: the shrink stands.
         let mut c = controller(vec![window(0.5, 2.0, 0.0, 0, 9_900); GROW_WINDOWS]);
         c.regret = Some((16, 10_000.0));
@@ -703,13 +807,54 @@ mod tests {
     #[test]
     fn a_busy_driver_or_slow_passes_grow_the_set() {
         let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
-        assert_eq!(c.decide(2, 16), Some(4));
+        assert_eq!(c.decide(2, 16), Some((4, Why::Grow)));
         let c = controller(vec![window(0.3, 0.6, 0.02, 0, 1000); GROW_WINDOWS]);
-        assert_eq!(c.decide(2, 16), Some(4));
+        assert_eq!(c.decide(2, 16), Some((4, Why::Grow)));
         let c = controller(vec![window(0.9, 9.0, 0.0, 0, 1000); GROW_WINDOWS]);
-        assert_eq!(c.decide(12, 16), Some(16));
+        assert_eq!(c.decide(12, 16), Some((16, Why::Grow)));
         // At the ceiling: no growth.
         let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
         assert_eq!(c.decide(16, 16), None);
+    }
+
+    /// Messages waiting behind sibling turns about as long as they're served double the set,
+    /// with neither a busy driver nor slow passes (transfer's hops at few drivers).
+    #[test]
+    fn sibling_wait_grows_the_set() {
+        let waiting = Window {
+            wait: 0.8,
+            ..window(0.4, 0.8, 0.0, 0, 1000)
+        };
+        let c = controller(vec![waiting; GROW_WINDOWS]);
+        assert_eq!(c.decide(2, 16), Some((4, Why::Grow)));
+        let c = controller(vec![
+            Window {
+                wait: 0.1,
+                ..waiting
+            };
+            GROW_WINDOWS
+        ]);
+        assert_eq!(c.decide(2, 16), None);
+    }
+
+    /// A level a regret proved is a floor for the shrink while the load stays the same: the
+    /// shrink rule that fired before would fire again at the doubled level, and the set would
+    /// shrink, regret and double back over and over.
+    #[test]
+    fn a_proven_level_floors_the_shrink_until_the_load_changes() {
+        // The shrink rule alone takes 4 drivers down to 2 (sum busy 0.6 needs 2 at 0.5).
+        let light = window(0.2, 0.6, 0.0, 100, 1000);
+        let c = controller(vec![light; SHRINK_WINDOWS]);
+        assert_eq!(c.decide(4, 16), Some((2, Why::Shrink)));
+        // A regret proved 4 beats 2 at 1000 ops per window: no shrink below 4.
+        let mut c = controller(vec![light; SHRINK_WINDOWS]);
+        c.floor = Some((4, 1000.0));
+        assert_eq!(c.decide(4, 16), None);
+        // From above the floor, the shrink stops at it.
+        assert_eq!(c.decide(16, 16), Some((4, Why::Shrink)));
+        // A changed load (ops 10% off the proven level) is free to shrink below it.
+        let mut c = controller(vec![window(0.2, 0.6, 0.0, 100, 900); SHRINK_WINDOWS]);
+        c.floor = Some((4, 1000.0));
+        assert_eq!(c.decide(4, 16), Some((2, Why::Shrink)));
     }
 }
