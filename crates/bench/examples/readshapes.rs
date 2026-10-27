@@ -23,7 +23,11 @@
 //!   over a level of several SSTs, of which it reads one or two;
 //! - `scan-filtered`: the same scans with a qualifier prefix (one cell per row);
 //! - `versions`: row reads of `q0` with `versions(3)`;
-//! - `counter`: point gets of counter cells (operands folded on read).
+//! - `counter`: point gets of counter cells (operands folded on read);
+//! - `scan-interleaved`: 200-row scans with qualifier prefix `a` of table `i` (built only for
+//!   this shape, so the others read the same store as before): every row has an `a` cell in
+//!   an SST and a newer `b` cell in the memtable, so the memtable's lazy filtered source
+//!   (D288) parks once per row, between two of the SST's admitted entries.
 //!
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
 //! iteration is one `#[inline(never)]` function named `shape_*` that counts its work with a
@@ -168,6 +172,25 @@ fn shape_scan(t: &Table, rng: &mut Rng, filtered: bool) -> usize {
 }
 
 #[inline(never)]
+fn shape_scan_interleaved(t: &Table, rng: &mut Rng) -> usize {
+    let _measured = Measured::start();
+    let mut n = 0;
+    for _ in 0..4 {
+        let start = row_key(rng.below(ROWS - 200));
+        let scan = t
+            .scan_bounds(Bound::Included(&start[..]), Bound::Unbounded)
+            .family("f")
+            .qualifier_prefix(b"a")
+            .limit(200);
+        let mut it = scan.iter().unwrap();
+        while let Some(r) = it.next_ref().unwrap() {
+            n += std::hint::black_box(r.iter().count());
+        }
+    }
+    n
+}
+
+#[inline(never)]
 fn shape_versions(t: &Table, rng: &mut Rng) -> usize {
     let _measured = Measured::start();
     let mut n = 0;
@@ -283,6 +306,29 @@ fn main() {
     for r in (0..ROWS).step_by(10) {
         t.mutate(&row_key(r)).incr("c", b"n", 2).commit().unwrap();
     }
+    // Table `i`, only for its shape: `a` cells flushed, a newer `b` cell per row in the
+    // memtable.
+    let i = (shape == "scan-interleaved").then(|| {
+        let i = db
+            .table("i")
+            .unwrap()
+            .family("f", Family::default().bloom_bits(10))
+            .create_if_missing()
+            .unwrap();
+        for r in 0..ROWS {
+            i.mutate(&row_key(r)).put("f", b"a", &val).commit().unwrap();
+        }
+        db.flush().unwrap();
+        for r in 0..ROWS {
+            i.mutate(&row_key(r)).put("f", b"b", &val).commit().unwrap();
+        }
+        let mut it = i.scan_prefix(b"").family("f").iter().unwrap();
+        while let Some(r) = it.next_ref().unwrap() {
+            std::hint::black_box(r.iter().count());
+        }
+        drop(it);
+        i
+    });
     warm(&t);
     let mut it = l.scan_prefix(b"").family("f").iter().unwrap();
     while let Some(r) = it.next_ref().unwrap() {
@@ -316,6 +362,9 @@ fn main() {
                 "scan-filtered" => shape_scan(&t, &mut rng, true),
                 "versions" => shape_versions(&t, &mut rng),
                 "counter" => shape_counter(&t, &mut rng),
+                "scan-interleaved" => {
+                    shape_scan_interleaved(i.as_ref().expect("built above"), &mut rng)
+                }
                 other => panic!("unknown shape {other}"),
             };
         }
@@ -325,6 +374,7 @@ fn main() {
     eprintln!("units {units}");
     drop(t);
     drop(l);
+    drop(i);
     db.close().unwrap();
     driver.join();
     std::fs::remove_dir_all(&dir).ok();
