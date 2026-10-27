@@ -600,6 +600,10 @@ pub(crate) fn options(s: &Settings) -> Options {
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
     }
+    // SCRATCH #759: PHDB_UNPIN=1 runs the shard and compaction threads unpinned (#760's lever).
+    if std::env::var_os("PHDB_UNPIN").is_some() {
+        options = options.pin_threads(false);
+    }
     if let Some(us) = s.commit_spin_micros {
         options = options.commit_spin(Duration::from_micros(us));
     }
