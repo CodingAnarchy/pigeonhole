@@ -614,13 +614,24 @@ impl Spawner {
         }
     }
 
+    /// Whether the shard has background workers (D284). Without them, the turn and its
+    /// sleep checks skip the take-back work in one branch (#983's per-turn checks, which
+    /// the commit shapes paid as calls on every turn).
+    #[inline]
+    pub(crate) fn has_pool(&self) -> bool {
+        self.pool.is_some()
+    }
+
     /// Whether tasks came back from the workers (for the sleep re-check, after its fence).
+    #[inline]
     pub(crate) fn has_back(&self) -> bool {
-        self.pool.is_some() && self.origin.has_back()
+        self.has_pool() && self.origin.has_back()
     }
 
     /// At the start of a turn: adopts tasks that came back from the workers, takes back
     /// tasks queued while nobody drives them, and re-checks a room wait's stalled flush.
+    /// Callers check [`has_pool`](Spawner::has_pool) first.
+    #[inline(never)]
     pub(crate) fn take_back(&mut self, now: u64) {
         let Some(pool) = &self.pool else {
             return;
@@ -675,11 +686,17 @@ impl Spawner {
     }
 
     /// The earliest of the shard's own sleepers' deadlines and the pool checks above.
+    #[inline]
     pub(crate) fn next_deadline(&self) -> Option<u64> {
         let local = self.local.next_deadline();
-        if self.pool.is_none() {
+        if !self.has_pool() {
             return local;
         }
+        self.pool_deadline(local)
+    }
+
+    #[inline(never)]
+    fn pool_deadline(&self, local: Option<u64>) -> Option<u64> {
         [local, self.room_check, self.stale_check]
             .into_iter()
             .flatten()

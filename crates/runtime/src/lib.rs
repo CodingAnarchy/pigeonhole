@@ -642,7 +642,9 @@ impl<H: ShardHandler> ShardCore<H> {
         // way back is queued before anything this turn handles that a later reclaim (the
         // engine's close) sent after them.
         let start = self.vfs.monotonic_nanos();
-        self.spawner.take_back(start);
+        if self.spawner.has_pool() {
+            self.spawner.take_back(start);
+        }
         self.drain();
         self.spawner.local.collect_woken();
         if self.idle_at.take() == Some(start) && self.vfs.clock_is_simulated() {
