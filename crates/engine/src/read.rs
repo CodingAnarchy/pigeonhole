@@ -1494,19 +1494,37 @@ pub(crate) fn read_row_into(
         .flatten()
         .unwrap_or_else(point_resolver);
     let mut large = false;
-    let read = read_row_with(
-        &mut resolver,
-        view,
-        seqno,
-        table,
-        row,
-        families,
-        spec,
-        now,
-        cache_only,
-        sink,
-        &mut large,
-    );
+    let on = crate::phases759::ON.load(std::sync::atomic::Ordering::Relaxed);
+    let (t0, c0, m0) = if on {
+        (
+            Some(std::time::Instant::now()),
+            crate::phases759::thread_cpu_ns(),
+            pigeonhole_sst::MISS_NS.with(std::cell::Cell::get),
+        )
+    } else {
+        (None, 0, 0)
+    };
+    let (read, misses) = pigeonhole_sst::counting_file_reads(|| {
+        read_row_with(
+            &mut resolver,
+            view,
+            seqno,
+            table,
+            row,
+            families,
+            spec,
+            now,
+            cache_only,
+            sink,
+            &mut large,
+        )
+    });
+    if let Some(t0) = t0 {
+        let total = t0.elapsed().as_nanos() as u64;
+        let cpu = crate::phases759::thread_cpu_ns().saturating_sub(c0);
+        let miss_ns = pigeonhole_sst::MISS_NS.with(std::cell::Cell::get).saturating_sub(m0);
+        crate::phases759::record(total, cpu, misses, miss_ns);
+    }
     // Whatever happened, the sources (each pins its memtable or SST) and the options (merge
     // operator, blob reader) go now; only the allocations stay, unless a large value grew
     // them.
@@ -1566,6 +1584,7 @@ fn read_row_with(
         let resolver_blobs = ResolverBlobs::attach(&mut opts, &view.ssts);
         let cursor = resolver.cursor_mut();
         cursor.sources_mut().clear();
+        let ts = std::time::Instant::now();
         if cache_only {
             row_sources_cache_only(
                 view,
@@ -1586,14 +1605,20 @@ fn read_row_with(
                 cursor.sources_mut(),
             )?;
         }
+        crate::phases759::add(0, ts.elapsed().as_nanos() as u64);
+        crate::phases759::add(3, cursor.sources().len() as u64);
         if cursor.sources().is_empty() {
             continue;
         }
+        let tk = std::time::Instant::now();
         opts.skip_columns = skips_columns(cursor.sources());
         cursor.reset();
         resolver.reset(opts);
         resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;
+        crate::phases759::add(1, tk.elapsed().as_nanos() as u64);
+        let tc = std::time::Instant::now();
+        let _cells = scopeguard_759(tc);
         loop {
             let (data, qualifier) = {
                 let next = resolver.next_cell();
@@ -2316,4 +2341,15 @@ pub(crate) fn as_async_read<T>(cache_only: bool, f: impl FnOnce() -> T) -> (T, u
     let n = ASYNC_READ.with(|c| c.get()).map_or(0, |(_, n)| n);
     drop(restore);
     (out, n)
+}
+
+/// SCRATCH #759: adds the cell loop's time when dropped (the loop exits by `break` or `?`).
+fn scopeguard_759(t: std::time::Instant) -> impl Drop {
+    struct G(std::time::Instant);
+    impl Drop for G {
+        fn drop(&mut self) {
+            crate::phases759::add(2, self.0.elapsed().as_nanos() as u64);
+        }
+    }
+    G(t)
 }

@@ -1,0 +1,173 @@
+//! SCRATCH #759 (not for merge): a per-read phase breakdown of row reads, bucketed by the
+//! read's engine time. On only while `ON` is set (the bench sets it for the measured phase).
+//! Each thread keeps its own stats and merges them into `GLOBAL` at exit, rewriting the file
+//! `PHDB_PHASES_OUT` names.
+
+use std::cell::RefCell;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+
+pub static ON: AtomicBool = AtomicBool::new(false);
+
+pub const EDGES_US: [u64; 7] = [10, 20, 30, 40, 60, 100, u64::MAX];
+
+#[derive(Clone, Copy, Default)]
+pub struct Bucket {
+    pub count: u64,
+    pub total: u64,
+    pub sources: u64,
+    pub seek: u64,
+    pub cells: u64,
+    pub miss_ns: u64,
+    pub misses: u64,
+    pub with_miss: u64,
+    pub nsources: u64,
+    pub offcpu: u64,
+    pub preempted: u64,
+}
+
+#[derive(Clone)]
+pub struct Stats {
+    pub buckets: [Bucket; 7],
+    pub hist: Vec<u64>,
+}
+
+impl Default for Stats {
+    fn default() -> Self {
+        Stats {
+            buckets: [Bucket::default(); 7],
+            hist: vec![0; 501],
+        }
+    }
+}
+
+impl Stats {
+    fn merge(&mut self, o: &Stats) {
+        for (a, b) in self.buckets.iter_mut().zip(&o.buckets) {
+            a.count += b.count;
+            a.total += b.total;
+            a.sources += b.sources;
+            a.seek += b.seek;
+            a.cells += b.cells;
+            a.miss_ns += b.miss_ns;
+            a.misses += b.misses;
+            a.with_miss += b.with_miss;
+            a.nsources += b.nsources;
+            a.offcpu += b.offcpu;
+            a.preempted += b.preempted;
+        }
+        for (a, b) in self.hist.iter_mut().zip(&o.hist) {
+            *a += b;
+        }
+    }
+
+    fn render(&self) -> String {
+        let mut out = String::new();
+        let n: u64 = self.hist.iter().sum();
+        let pct = |q: f64| {
+            let want = (n as f64 * q).ceil() as u64;
+            let mut acc = 0;
+            for (i, c) in self.hist.iter().enumerate() {
+                acc += c;
+                if acc >= want {
+                    return i;
+                }
+            }
+            500
+        };
+        out += &format!(
+            "engine row reads {n}: p50 {} us, p99 {} us, p99.9 {} us (1 us buckets, 500 = 500+)\n",
+            pct(0.5),
+            pct(0.99),
+            pct(0.999)
+        );
+        out += "bucket_us count share total_us sources_us seek_us cells_us miss_us misses/read with_miss% nsources offcpu_us preempted%\n";
+        let mut lo = 0;
+        for (b, &hi) in self.buckets.iter().zip(&EDGES_US) {
+            let c = b.count.max(1) as f64;
+            out += &format!(
+                "{lo}-{} {} {:.2}% {:.1} {:.1} {:.1} {:.1} {:.1} {:.2} {:.1}% {:.2} {:.1} {:.1}%\n",
+                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                b.count,
+                100.0 * b.count as f64 / n.max(1) as f64,
+                b.total as f64 / c / 1e3,
+                b.sources as f64 / c / 1e3,
+                b.seek as f64 / c / 1e3,
+                b.cells as f64 / c / 1e3,
+                b.miss_ns as f64 / c / 1e3,
+                b.misses as f64 / c,
+                100.0 * b.with_miss as f64 / c,
+                b.nsources as f64 / c,
+                b.offcpu as f64 / c / 1e3,
+                100.0 * b.preempted as f64 / c,
+            );
+            lo = hi;
+        }
+        out
+    }
+}
+
+static GLOBAL: Mutex<Option<Stats>> = Mutex::new(None);
+
+struct Local(Stats);
+
+impl Drop for Local {
+    fn drop(&mut self) {
+        if self.0.hist.iter().sum::<u64>() == 0 {
+            return;
+        }
+        let mut g = GLOBAL.lock().unwrap();
+        let g = g.get_or_insert_with(Stats::default);
+        g.merge(&self.0);
+        if let Ok(path) = std::env::var("PHDB_PHASES_OUT") {
+            let _ = std::fs::write(path, g.render());
+        }
+    }
+}
+
+thread_local! {
+    static LOCAL: RefCell<Local> = RefCell::new(Local(Stats::default()));
+    /// The current read's phase sums: sources, seek, cells, source count.
+    pub static CUR: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
+}
+
+pub fn thread_cpu_ns() -> u64 {
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
+}
+
+pub fn record(total: u64, cpu: u64, misses: u64, miss_ns: u64) {
+    let (sources, seek, cells, nsources) = CUR.with(|c| c.replace((0, 0, 0, 0)));
+    let _ = LOCAL.try_with(|l| {
+        let s = &mut l.borrow_mut().0;
+        let us = total / 1000;
+        s.hist[(us as usize).min(500)] += 1;
+        let i = EDGES_US.iter().position(|&e| us < e).unwrap_or(6);
+        let b = &mut s.buckets[i];
+        let off = total.saturating_sub(cpu);
+        b.count += 1;
+        b.total += total;
+        b.sources += sources;
+        b.seek += seek;
+        b.cells += cells;
+        b.miss_ns += miss_ns;
+        b.misses += misses;
+        b.with_miss += u64::from(misses > 0);
+        b.nsources += nsources;
+        b.offcpu += off;
+        b.preempted += u64::from(off > 2_000);
+    });
+}
+
+pub fn add(i: usize, ns: u64) {
+    CUR.with(|c| {
+        let mut v = c.get();
+        match i {
+            0 => v.0 += ns,
+            1 => v.1 += ns,
+            2 => v.2 += ns,
+            _ => v.3 += ns,
+        }
+        c.set(v);
+    });
+}

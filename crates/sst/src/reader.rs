@@ -550,9 +550,12 @@ impl Blocks {
             return Ok(h);
         }
         crate::note_file_read();
+        let t = std::time::Instant::now();
         let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
         let data = decode_physical(buf, kind, self.pool(fill_cache))?;
-        Ok(self.admit(addr, data, fill_cache, priority))
+        let h = self.admit(addr, data, fill_cache, priority);
+        crate::MISS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+        Ok(h)
     }
 
     /// The block at `addr` if it is cached (pinned), after the same check as
@@ -573,9 +576,12 @@ impl Blocks {
         priority: Priority,
     ) -> Result<BlockHandle> {
         crate::note_file_read();
+        let t = std::time::Instant::now();
         let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
         let data = decode_physical(buf, kind, self.pool(fill_cache))?;
-        Ok(self.admit(addr, data, fill_cache, priority))
+        let h = self.admit(addr, data, fill_cache, priority);
+        crate::MISS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
+        Ok(h)
     }
 
     /// [`Blocks::read_block`] from the cache only: a miss fails with `Error::WouldBlock`

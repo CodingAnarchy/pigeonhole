@@ -27,6 +27,8 @@ fjall = ["dep:fjall"]
 [dependencies]
 # Default features (async included): the instruction counts measure what users get.
 pigeonhole = { workspace = true }
+# SCRATCH #759
+pigeonhole-engine = { workspace = true }
 # The default shard count (D220), for the D213 and scaling runs and the report.
 pigeonhole-io = { workspace = true }
 serde = { version = "1", features = ["derive"] }

@@ -1168,6 +1168,8 @@ fn measure(
     );
     runner.start_riders()?;
     runner.start_reader_processes(config)?;
+    // SCRATCH #759: the phase breakdown counts the measured phase's reads only.
+    pigeonhole_engine::phases759::ON.store(true, std::sync::atomic::Ordering::Relaxed);
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
     // D247: past `max_measured` no client starts another operation.
@@ -1195,6 +1197,7 @@ fn measure(
         let rest = (min_measured - elapsed).as_secs_f64() * rate * 1.1;
         next = (rest.ceil() as u64).max(MIN_EXTRA_OPS);
     }
+    pigeonhole_engine::phases759::ON.store(false, std::sync::atomic::Ordering::Relaxed);
     let shards = (
         shares_between(&before.0, &runner.shard_shares()),
         stalls_between(before.1, runner.stalls()),
