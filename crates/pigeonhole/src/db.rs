@@ -1207,6 +1207,14 @@ impl Pigeonhole {
         self.db.io_rings()
     }
 
+    /// D292's inline page-cache reads on this database's I/O backend so far (hits, misses
+    /// and their times, refusals, breaker trips), or `None` on a backend without them. For
+    /// benchmarks (ICR 0083); not part of the API.
+    #[doc(hidden)]
+    pub fn nowait_reads(&self) -> Option<pigeonhole_io::NowaitReads> {
+        self.db.vfs.nowait_reads()
+    }
+
     /// What the database holds and how it is stored: format version, file and free bytes,
     /// and per table its tablets, its families' stored options and their SSTs per level and
     /// blob files (ICR 0047). Reads the current catalog; cheap, no data I/O.

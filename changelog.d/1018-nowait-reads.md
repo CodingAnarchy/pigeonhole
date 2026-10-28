@@ -1,0 +1,2 @@
+### Changed
+- On Linux, async reads served from the OS page cache are faster (#749, D292). A block read that the page cache already holds is now copied on the thread that asked for it, rather than waiting its turn on the io_uring ring or the read pool; reads it doesn't hold are submitted as before. Results are unchanged. In the benchmark's async ycsb-a, with 16 operations in flight per client, throughput rose by about a third and the read p99 fell from about 1.2 ms to 350 µs.

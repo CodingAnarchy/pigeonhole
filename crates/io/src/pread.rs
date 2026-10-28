@@ -27,7 +27,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::{
     Completion, Error, ErrorKind, File, FileIdentity, FileRef, IoBuf, Locality, LockMode,
-    OpenOptions, ProcessId, Result, SharedOpen, SharedRegion, Vfs, os,
+    OpenOptions, ProcessId, Result, SharedOpen, SharedRegion, Vfs, nowait, os,
 };
 
 /// Real files with a fixed pool of threads serving submitted I/O.
@@ -58,6 +58,8 @@ use crate::{
 /// ```
 pub struct PreadVfs {
     pool: Arc<Pool>,
+    /// D292's switch and counters, shared by this backend's files.
+    nowait: Arc<nowait::Backend>,
     origin: Instant,
     process: ProcessId,
 }
@@ -83,6 +85,7 @@ impl PreadVfs {
     fn with_pool(threads: usize) -> Arc<Self> {
         Arc::new(Self {
             pool: Pool::start(threads),
+            nowait: Arc::default(),
             origin: Instant::now(),
             process: ProcessId {
                 pid: std::process::id(),
@@ -132,6 +135,10 @@ impl PreadVfs {
                 writable: opts.write || opts.create || opts.create_new,
                 direct_align,
                 held: Mutex::new(HashMap::new()),
+                #[cfg(target_os = "linux")]
+                nowait: Arc::clone(&self.nowait),
+                #[cfg(target_os = "linux")]
+                nowait_file: nowait::FileState::default(),
                 #[cfg(all(unix, not(target_os = "linux")))]
                 key,
             }),
@@ -236,6 +243,11 @@ impl PreadFile {
         self.inner.check_aligned(ptr, len, offset)
     }
 
+    /// [`FileInner::read_cached`], for a backend that submits this file's I/O itself.
+    pub(crate) fn read_cached(&self, buf: &mut [u8], offset: u64) -> bool {
+        self.inner.read_cached(buf, offset)
+    }
+
     /// The descriptor, open as long as this handle is.
     pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd;
@@ -252,6 +264,11 @@ struct FileInner {
     direct_align: Option<usize>,
     /// Locks this handle holds, by byte.
     held: Mutex<HashMap<u64, LockMode>>,
+    /// D292: the backend's switch and counters, and this handle's own state.
+    #[cfg(target_os = "linux")]
+    nowait: Arc<nowait::Backend>,
+    #[cfg(target_os = "linux")]
+    nowait_file: nowait::FileState,
     #[cfg(all(unix, not(target_os = "linux")))]
     key: FileIdentity,
 }
@@ -272,6 +289,31 @@ impl FileInner {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {
         self.check_aligned(buf.as_ptr(), buf.len(), offset)?;
         os::read_exact_at(self.file(), buf, offset).map_err(|e| Error::os("read", e))
+    }
+
+    /// D292 (#749): reads `buf` at `offset` on the calling thread if the page cache holds all
+    /// of it; `false` (nothing to rely on in `buf`) otherwise, and the caller submits the read
+    /// as before. Not on a direct handle (no page cache), not for an empty read or one over
+    /// [`nowait::MAX_LEN`], not once the file system refused the flag or while the file's
+    /// breaker is open.
+    #[cfg(target_os = "linux")]
+    fn read_cached(&self, buf: &mut [u8], offset: u64) -> bool {
+        if self.direct_align.is_some()
+            || buf.is_empty()
+            || buf.len() > nowait::MAX_LEN
+            || !self.nowait_file.try_now(&self.nowait)
+        {
+            return false;
+        }
+        let start = Instant::now();
+        let found = os::read_cached_at(self.file(), buf, offset);
+        let nanos = if found == nowait::Cached::Miss {
+            u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+        } else {
+            0
+        };
+        self.nowait_file.record(&self.nowait, found, nanos);
+        found == nowait::Cached::Hit
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
@@ -556,6 +598,10 @@ impl File for PreadFile {
         if crate::own::in_inline_io() {
             return Completion::ready(self.inner.read_at(&mut buf, offset).map(|()| buf));
         }
+        #[cfg(target_os = "linux")]
+        if self.inner.read_cached(&mut buf, offset) {
+            return Completion::ready(Ok(buf));
+        }
         let (done, resolver) = Completion::pair();
         let inner = Arc::clone(&self.inner);
         self.inner.pool.submit(Box::new(move || {
@@ -695,6 +741,14 @@ fn region_path(dir: &Path, name: &str) -> PathBuf {
 }
 
 impl Vfs for PreadVfs {
+    fn set_nowait_reads(&self, on: bool) {
+        self.nowait.set(on);
+    }
+
+    fn nowait_reads(&self) -> Option<crate::NowaitReads> {
+        cfg!(target_os = "linux").then(|| self.nowait.stats())
+    }
+
     fn open(&self, path: &Path, opts: OpenOptions) -> Result<FileRef> {
         Ok(self.open_file(path, opts)?)
     }

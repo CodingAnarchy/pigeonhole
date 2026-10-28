@@ -121,6 +121,9 @@ fn start(tag: &str) -> (Runtime<Handler>, FileRef, std::path::PathBuf) {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let vfs = UringVfs::new().expect("io_uring is available");
+    // Every read goes to a ring, even one the page cache holds (D292): these cases are
+    // about whose ring reaps it.
+    vfs.set_nowait_reads(false);
     let file = vfs
         .open(&dir.join("f"), OpenOptions::read_write_create())
         .unwrap();
