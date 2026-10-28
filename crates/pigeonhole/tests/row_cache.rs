@@ -350,6 +350,55 @@ fn gets_stop_refilling_a_row_written_between_its_reads() {
 }
 
 #[test]
+fn a_commit_writing_one_cached_column_twice_is_sized_in_order() {
+    // simp724's review of #1011: two puts to one cached column in one commit (two
+    // timestamps, both kept) were each sized against the cached cell. With a 100-byte cell
+    // and two empty puts that underflowed and panicked the shard thread; with growing puts
+    // it under-sized the row and let it past `row_cache_max_row`.
+    let vfs = SimVfs::new(415);
+    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs).row_cache_max_row(200)).unwrap();
+    let t = table(&db);
+    let get = || {
+        t.get(b"r", "g", b"a")
+            .unwrap()
+            .map(|c| (c.timestamp(), c.value().to_vec()))
+            .unwrap()
+    };
+    t.mutate(b"r").put("g", b"a", &[7u8; 100]).commit().unwrap();
+    let _ = get();
+    let _ = get();
+    assert_eq!(db.row_cache_stats().fills, 1);
+    let t1 = u64::MAX / 4;
+    let w = db.row_cache_stats().write_throughs;
+    t.mutate(b"r")
+        .put_at("g", b"a", t1, b"")
+        .put_at("g", b"a", t1 + 1, b"")
+        .commit()
+        .unwrap();
+    assert_eq!(get(), (t1 + 1, Vec::new()));
+    assert_eq!(
+        db.row_cache_stats().write_throughs,
+        w + 1,
+        "it fits: written through"
+    );
+    // 10 bytes, then 190 at a later timestamp: the result (190 bytes) is over the 200-byte
+    // cap with the encoding's overhead, so the overlay is refused and the read is uncached.
+    t.mutate(b"r")
+        .put_at("g", b"a", t1 + 2, &[1u8; 10])
+        .put_at("g", b"a", t1 + 3, &[2u8; 190])
+        .commit()
+        .unwrap();
+    assert_eq!(
+        db.row_cache_stats().write_throughs,
+        w + 1,
+        "over the cap: refused"
+    );
+    assert_eq!(get(), (t1 + 3, vec![2u8; 190]));
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
 fn gets_never_fill_a_counter_family() {
     let vfs = SimVfs::new(412);
     let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();

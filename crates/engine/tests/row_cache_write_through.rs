@@ -144,9 +144,13 @@ impl Shards {
     }
 }
 
-#[test]
-fn a_share_applied_after_a_later_single_drops_the_rows_write_through() {
-    let mut s = Shards::open(290);
+/// Caches `b-r` (`q1 = 0`, `q2 = 0`) on shard 1, then forces the order: X, a cross-shard
+/// commit writing `q2 = X`, is decided at `d` with its Decide held behind its Sync DECISION;
+/// S, a Buffered single writing `single` to `b-r`, reserves `e > d` and applies first; then
+/// X's share applies, late. Returns how many write-throughs S made (0 or 1). The reads
+/// after it must see both writes whatever S's write-through did.
+fn late_share(seed: u64, single: (&[u8], &[u8])) -> u64 {
+    let mut s = Shards::open(seed);
     let pc = s.put(
         Durability::Buffered,
         &[(b"b-r", b"q1", b"0"), (b"b-r", b"q2", b"0")],
@@ -159,8 +163,8 @@ fn a_share_applied_after_a_later_single_drops_the_rows_write_through() {
 
     // From here the test thread is the device: syncs complete only when it says so.
     s.vfs.set_deferred_io(true);
-    // X writes b-r's q2 (shard 1), coordinated by shard 0, at Sync: its
-    // Decide goes out only once its DECISION is durable (D286's early Decide is Buffered's).
+    // X writes b-r's q2 (shard 1), coordinated by shard 0, at Sync: its Decide goes out
+    // only once its DECISION is durable (D286's early Decide is Buffered's).
     let mut x = s.put(
         Durability::Sync,
         &[(b"a-x", b"q", b"x"), (b"b-r", b"q2", b"X")],
@@ -184,39 +188,52 @@ fn a_share_applied_after_a_later_single_drops_the_rows_write_through() {
         turns += 1;
         assert!(turns < 64, "X never decided");
     }
-    // S writes b-r's q1 at Buffered. Shard 1 reserves its seqno now, above X's, and applies
-    // it before X's share: S's write-through moves the cached row forward without X's q2.
-    let before = s.db.row_cache_write_throughs();
-    let mut single = s.put(Durability::Buffered, &[(b"b-r", b"q1", b"S")]);
+    // S reserves its seqno now, above X's, and applies before X's share (X's can't apply
+    // with its Decide held, so shard 1's next applied commit is S).
+    let applied = || db.shard_stats()[1].commits;
+    let (before, wrote) = (applied(), s.db.row_cache_write_throughs());
+    let mut single_pc = s.put(Durability::Buffered, &[(b"b-r", single.0, single.1)]);
     let mut turns = 0;
-    while s.db.row_cache_write_throughs() == before {
+    while applied() == before {
         s.run(1);
         turns += 1;
-        assert!(turns < 64, "S never wrote through");
+        assert!(turns < 64, "S never applied");
     }
     assert!(
         poll(&mut x).is_none(),
         "X answered before its DECISION was durable"
     );
     // S is applied but not visible: X's seqno, below it, has not applied.
-    assert!(poll(&mut single).is_none(), "S answered before X applied");
+    assert!(
+        poll(&mut single_pc).is_none(),
+        "S answered before X applied"
+    );
     assert_eq!(s.db.parked_decisions(1), parked);
+    let wrote = s.db.row_cache_write_throughs() - wrote;
     s.drive(&mut x).unwrap();
-    s.drive(&mut single).unwrap();
+    s.drive(&mut single_pc).unwrap();
 
-    // X's share found the slot above its seqno and dropped the row: the reads miss and see
-    // both writes. With the stale entry they'd return q2 = 0.
-    let want = vec![
-        (b"q1".to_vec(), b"S".to_vec()),
+    // Whatever S's write-through did, X's share found the slot above its seqno and dropped
+    // the row: every read sees both writes.
+    let mut want = vec![
+        (b"q1".to_vec(), b"0".to_vec()),
         (b"q2".to_vec(), b"X".to_vec()),
     ];
+    match want.iter_mut().find(|(q, _)| q.as_slice() == single.0) {
+        Some(cell) => cell.1 = single.1.to_vec(),
+        None => {
+            want.push((single.0.to_vec(), single.1.to_vec()));
+            want.sort();
+        }
+    }
     assert_eq!(s.uncached(), want);
-    assert_eq!(s.get(b"q1"), b"S");
-    assert_eq!(
-        s.get(b"q2"),
-        b"X",
-        "a get served the write-through that lacks X"
-    );
+    for (q, v) in &want {
+        assert_eq!(
+            &s.get(q),
+            v,
+            "a get of {q:?} served a row without X's write"
+        );
+    }
     let snap = s.db.snapshot().unwrap();
     let cell = s.db.get(&snap, s.t, s.f, b"b-r", b"q2").unwrap().unwrap();
     assert_eq!(cell.value(), ValueRef::Bytes(b"X"), "a snapshot get");
@@ -229,4 +246,21 @@ fn a_share_applied_after_a_later_single_drops_the_rows_write_through() {
         }
         s.vfs.complete_all_io();
     }
+    wrote
+}
+
+#[test]
+fn a_share_applied_after_a_later_single_drops_the_rows_write_through() {
+    // S overwrites a cached column: its write-through moves the row forward to its seqno
+    // without X's q2, and X's late share must drop it (with the stale entry a get of q2
+    // returns 0).
+    assert_eq!(late_share(290, (b"q1", b"S")), 1, "S wrote through");
+}
+
+#[test]
+fn a_share_applied_after_a_refused_write_through_reads_its_write() {
+    // simp724's review of #1011: S adds a column, so its overlay is refused and the entry
+    // stays where it was (since a68b815a it is no longer dropped); X's late share then
+    // applies. The reads must still see X's write.
+    assert_eq!(late_share(291, (b"q3", b"S")), 0, "S's overlay was refused");
 }

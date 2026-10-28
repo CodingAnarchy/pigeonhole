@@ -593,9 +593,10 @@ impl RowCache {
         })
     }
 
-    /// Whether the row is cached at an epoch other than `epoch` and was never read from
-    /// the cache there (no hit since it was stored, or aged back to none): the row changed
-    /// before its cached copy served anyone, so storing it again would likely be wasted.
+    /// Whether the row is cached at an epoch other than `epoch` and was never read since it
+    /// was stored (no hit, or aged back to none; an entry an `update` moved keeps its count):
+    /// the row changed before its cached copy served anyone, so storing it again would likely
+    /// be wasted.
     ///
     /// ```
     /// use pigeonhole_cache::RowCache;

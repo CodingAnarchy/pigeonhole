@@ -474,17 +474,35 @@ fn overlay_fits<'a>(
     if Encoded::deadline(encoded) == Encoded::OVERSIZE {
         return false;
     }
+    // Sized as `overlay` applies the cells, in order: a column written twice in one commit
+    // (two timestamps) is compared with what the first put left, not with the cached cell
+    // (simp724's review: sizing both against the cached cell underflowed).
+    let mut seen: smallvec::SmallVec<[(&[u8], Timestamp, usize); 4]> = smallvec::SmallVec::new();
     let mut len = encoded.len();
     for (qualifier, ts, stored) in cells {
         if ts <= deletes {
             return false;
         }
-        let Some(at) = Encoded::find(encoded, qualifier) else {
-            return false;
+        let current = match seen.iter_mut().find(|(q, _, _)| *q == qualifier) {
+            Some(cell) => cell,
+            None => {
+                let Some(at) = Encoded::find(encoded, qualifier) else {
+                    return false;
+                };
+                let (cached, old) = cell_at(encoded, at, qualifier);
+                seen.push((qualifier, cached, old));
+                seen.last_mut().expect("just pushed")
+            }
         };
-        let (cached, old) = cell_at(encoded, at, qualifier);
-        if cached <= ts {
-            len = len + stored.len() - old;
+        if current.1 <= ts {
+            let Some(next) = len
+                .checked_sub(current.2)
+                .and_then(|l| l.checked_add(stored.len()))
+            else {
+                return false;
+            };
+            len = next;
+            *current = (qualifier, ts, stored.len());
         }
     }
     len <= max_row
