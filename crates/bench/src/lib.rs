@@ -54,7 +54,7 @@ pub use runners::rocksdb::RocksDbRunner;
 pub use runners::rocksdb_txn::{RocksDbTxnRunner, TxnMode};
 #[cfg(feature = "sqlite")]
 pub use runners::sqlite::SqliteRunner;
-pub use runners::{BLOOM_BITS, MemoryBudget};
+pub use runners::{BLOOM_BITS, CacheModel, MemoryBudget};
 pub use workload::{
     COUNTER_THREADS, CROSS_SHARD_COMMIT, EDGE_FAMILY, FAMILIES, GROUP_COMMIT_CELLS,
     GROUP_COMMIT_ROWS, GROUP_COMMIT_THREADS, METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL,
@@ -594,6 +594,11 @@ pub trait Runner {
     fn busy_retries(&self) -> u64 {
         0
     }
+
+    /// Called with the number of client threads before [`client`](Self::client) is asked for
+    /// them, for a store that sizes per-connection memory from it (SQLite under
+    /// [`CacheModel::Total`]). The default does nothing.
+    fn plan_clients(&mut self, _clients: usize) {}
 
     /// A client for another thread, sharing the open store. `None` (the default) means
     /// the runner serves one client, and [`run`] uses one thread whatever
@@ -1162,6 +1167,7 @@ fn measure(
     let switched = runner.measured_durability()?;
 
     let threads = config.threads.max(1);
+    runner.plan_clients(if threads > 1 { threads } else { 0 });
     let mut clients: Vec<Box<dyn Client>> = if threads > 1 {
         (0..threads).map_while(|_| runner.client()).collect()
     } else {

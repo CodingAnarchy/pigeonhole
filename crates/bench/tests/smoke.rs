@@ -168,6 +168,7 @@ fn describe_reports_memory_budget() {
     let m = MemoryBudget {
         write_buffer: 32 << 20,
         cache: 8 << 20,
+        ..MemoryBudget::default()
     };
     let d = PigeonholeRunner::default().memory(m).describe();
     assert!(d.contains("memtable=32MiB cache=8MiB bloom=10"), "{d}");
@@ -206,6 +207,7 @@ fn larger_than_ram_preset_splits_cold_and_hot_gets() {
     let budget = MemoryBudget {
         write_buffer: 1 << 20,
         cache: 1 << 20,
+        ..MemoryBudget::default()
     };
     assert!(MemoryBudget::larger_than_ram().cache < MemoryBudget::default().cache);
     let mut r = PigeonholeRunner::default().shards(1).memory(budget);

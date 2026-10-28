@@ -101,6 +101,12 @@ OPTIONS:
                            shard) [default: 64 MiB]
     --cache B              every engine's read cache (SQLite: page cache gets
                            write buffer + cache) [default: 256 MiB]
+    --cache-model M        per-store or total [default: per-store]. per-store: each
+                           store's own setting gets --cache (SQLite's page cache is per
+                           connection, one per client; Pigeonhole's row cache comes on
+                           top). total: --cache is each store's whole read-cache memory
+                           (Pigeonhole: block + row cache; SQLite: split across its
+                           connections), so every store caches the same bytes (#759)
     --sync                 fsync every commit on every engine [default: buffered];
                            the same as --durability sync
     --durability MODE      buffered, sync, group-sync or default [default: buffered].
@@ -192,6 +198,7 @@ struct Args {
     shards: Option<usize>,
     write_buffer: Option<u64>,
     cache: Option<u64>,
+    cache_model: Option<pigeonhole_bench::CacheModel>,
     sync: bool,
     /// `--durability`: `None` is buffered (or `--sync`).
     durability: Option<Durability>,
@@ -265,6 +272,15 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 a.write_buffer = Some(parse(&arg, it.next())?)
             }
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
+            "--cache-model" => {
+                a.cache_model = Some(match it.next().as_deref() {
+                    Some("per-store") => pigeonhole_bench::CacheModel::PerStore,
+                    Some("total") => pigeonhole_bench::CacheModel::Total,
+                    other => {
+                        return Err(format!("--cache-model: per-store or total, not {other:?}"));
+                    }
+                })
+            }
             "--sync" => a.sync = true,
             "--durability" => match it.next().as_deref() {
                 Some("buffered") => a.durability = None,
@@ -356,6 +372,7 @@ fn memory(a: &Args) -> MemoryBudget {
     MemoryBudget {
         write_buffer: a.write_buffer.unwrap_or(d.write_buffer),
         cache: a.cache.unwrap_or(d.cache),
+        model: a.cache_model.unwrap_or(d.model),
     }
 }
 
@@ -851,6 +868,15 @@ mod tests {
         assert_eq!(memory(&a).cache, 1 << 20);
         assert_eq!(memory(&a).write_buffer, 8 << 20);
         assert_eq!(memory(&args("ycsb-c")), MemoryBudget::default());
+        // #759: the cache model, per store by default.
+        assert_eq!(
+            memory(&args("ycsb-c")).model,
+            pigeonhole_bench::CacheModel::PerStore
+        );
+        let a = args("ycsb-c --cache 1073741824 --cache-model total");
+        assert_eq!(memory(&a).model, pigeonhole_bench::CacheModel::Total);
+        assert_eq!(memory(&a).cache, 1 << 30);
+        assert!(parse_args(["ycsb-c", "--cache-model", "shared"].map(String::from)).is_err());
     }
 
     #[test]
