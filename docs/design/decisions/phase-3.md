@@ -3060,7 +3060,7 @@ The ring tests that need their reads on a ring turn the switch off: `uring.rs`'s
 
 CI's ext4 runners cover hits. The podman VM's overlay mount covers refusals.
 
-## D-LIMIT-RA — A scan its row limit leaves short reads no blocks ahead (ctr274, 2026-10-28; engine, #712, #974; refines D222)
+## D293 — A scan its row limit leaves short reads no blocks ahead (ctr274, 2026-10-28; engine, #712, #974; refines D222)
 **Why.** ycsb-e's scans (1–100 rows, 16 clients) were ahead of RocksDB on throughput after #975's ramp but 1.27× on p99, against the 1.2× floor. A per-phase profile of each scan (#712 c6475482356) put the largest part of the p99 band in waits on readahead still in flight: 66% at 16 clients and 38% at 4 (VM). A short scan ends within a few blocks, and the ramp starts after two of them, so the readahead has no lead: the scan reaches the block it just asked for while the fetch is still going through io-wq and the ring's reaper, and it waits. With readahead off, the VM's p99 dropped from 1649 to 135 µs at 16 clients and from 182 to 131 µs at 4, and throughput rose 11–13%.
 
 **What.** A scan whose row limit leaves at most `SHORT_SCAN_ROWS` (128) rows to return reads no blocks ahead. Its blocks are read as it reaches them: a cache hit, or a demand read on the scanning thread.

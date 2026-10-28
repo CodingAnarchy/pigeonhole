@@ -261,7 +261,7 @@ fn overlaps_range(sst: &OpenSst, start: Option<&[u8]>, end: Option<&[u8]>) -> bo
 /// after two forward blocks past its seek, 2 blocks first and doubling (#712).
 const SCAN_READAHEAD: (u32, bool) = (16, false);
 
-/// The most rows a scan can still return and read without readahead (D-LIMIT-RA placeholder,
+/// The most rows a scan can still return and read without readahead (D293,
 /// #712): a scan whose row limit leaves at most this many does not read ahead. Short scans
 /// end within a few blocks, so a ramp that starts after two of them has no lead: the scan
 /// reaches the block it just asked for while the fetch is still in flight and waits for it
