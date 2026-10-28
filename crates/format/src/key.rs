@@ -470,7 +470,10 @@ pub fn decode_key_in_row(key: &[u8], row_len: usize) -> crate::Result<KeyParts<'
     })
 }
 
-/// Splits the fixed 17-byte suffix off `key` without parsing the variable part.
+/// Splits the fixed 17-byte suffix off `key` without parsing the variable part. Always
+/// inlined: the resolver's per-entry loop calls it from two instances (D291), and out of
+/// line it cost hot-row reads about 8 instructions a cell (D193).
+#[inline(always)]
 pub fn split_suffix(key: &[u8]) -> crate::Result<(&[u8], Timestamp, Seqno, Kind)> {
     let Some(split) = key.len().checked_sub(SUFFIX_LEN) else {
         return Err(Error::Truncated {

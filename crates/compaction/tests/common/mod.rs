@@ -116,6 +116,8 @@ fn history_of(seed: u64, commits: usize, counter: Option<bool>) -> History {
 /// taken. The model is unchanged: no read at any seqno may tell. Returns how many it added.
 pub fn add_checkpoints(h: &mut History, rng: &mut Rng, reads: usize) -> usize {
     assert!(h.family.counter, "checkpoints are for counter families");
+    // Every fold is recorded, as for an engine checkpointing after one entry.
+    pigeonhole_compaction::COUNTER_FOLD_MIN.fetch_min(1, std::sync::atomic::Ordering::Relaxed);
     let max = h.model.snapshot();
     let mut added = 0;
     for _ in 0..reads {

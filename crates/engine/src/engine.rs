@@ -1164,6 +1164,10 @@ impl Engine {
         // result to the row's shard. Best effort: before the runtime starts, or once the
         // engine is gone or its inbox closed, the checkpoint is dropped.
         if options.counter_checkpoint_steps > 0 {
+            pigeonhole_compaction::COUNTER_FOLD_MIN.fetch_min(
+                options.counter_checkpoint_steps,
+                std::sync::atomic::Ordering::Relaxed,
+            );
             let weak = Arc::downgrade(&shared);
             live_views.on_counter_checkpoint(
                 options.counter_checkpoint_steps,

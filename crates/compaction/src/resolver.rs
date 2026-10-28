@@ -332,8 +332,19 @@ pub struct CellResolver<C> {
 /// instead of a step per version; a column with a few versions keeps the cheaper steps.
 const SKIP_STEPS: u32 = 8;
 
+/// The shortest counter fold any open engine checkpoints (D291, its
+/// `counter_checkpoint_steps`; `u64::MAX` while none does): the resolver records a counter
+/// group's fold ([`CellResolver::counter_fold`]) only at this length or more. Process-wide,
+/// lowered by each engine that opens with checkpoints on and never raised: a lower value only
+/// records folds the engines then decline.
+pub static COUNTER_FOLD_MIN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Whether internal key `k` is in column `col` and in row `row` (`col` starts with `row`
-/// when set), from one comparison with `col`.
+/// when set), from one comparison with `col`. Always inlined: `group` has an instance per
+/// family kind (D291), and with two callers the compiler stopped inlining it into the
+/// resolver's loop (+14 instructions per cell on hot-row reads, D193).
+#[inline(always)]
 fn locate_key(k: &[u8], col: &[u8], row: &[u8]) -> (bool, bool) {
     if col.is_empty() {
         let same_row = !row.is_empty() && common_prefix_len(k, row) == row.len();
@@ -1106,7 +1117,12 @@ where
             self.cursor.next()?;
         }
         if counter {
-            self.fold = top.map(|top| (steps, top));
+            // Only a fold long enough for some open engine's checkpoint: a short one leaves
+            // nothing for the caller to look at (a cold call per counter get measured +25
+            // instructions, D193).
+            if steps >= COUNTER_FOLD_MIN.load(std::sync::atomic::Ordering::Relaxed) {
+                self.fold = top.map(|top| (steps, top));
+            }
         }
         if (if counter { expired } else { hidden }) || (base == Base::None && !ops) {
             return Ok(None);
