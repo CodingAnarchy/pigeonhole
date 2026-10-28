@@ -3059,3 +3059,20 @@ The `counters` model target now checkpoints on every odd seed by default.
 The ring tests that need their reads on a ring turn the switch off: `uring.rs`'s cross-ring wait, and runtime's `driver_ring.rs`.
 
 CI's ext4 runners cover hits. The podman VM's overlay mount covers refusals.
+
+## D-LIMIT-RA — A scan its row limit leaves short reads no blocks ahead (ctr274, 2026-10-28; engine, #712, #974; refines D222)
+**Why.** ycsb-e's scans (1–100 rows, 16 clients) were ahead of RocksDB on throughput after #975's ramp but 1.27× on p99, against the 1.2× floor. A per-phase profile of each scan (#712 c6475482356) put the largest part of the p99 band in waits on readahead still in flight: 66% at 16 clients and 38% at 4 (VM). A short scan ends within a few blocks, and the ramp starts after two of them, so the readahead has no lead: the scan reaches the block it just asked for while the fetch is still going through io-wq and the ring's reaper, and it waits. With readahead off, the VM's p99 dropped from 1649 to 135 µs at 16 clients and from 182 to 131 µs at 4, and throughput rose 11–13%.
+
+**What.** A scan whose row limit leaves at most `SHORT_SCAN_ROWS` (128) rows to return reads no blocks ahead. Its blocks are read as it reaches them: a cache hit, or a demand read on the scanning thread.
+- The check is made per tablet, when the scan opens it, from the rows the limit still allows.
+- A scan with no limit, or more than 128 rows left, keeps D222's readahead and #975's ramp unchanged.
+- 128 covers ycsb-e's longest scan (100 rows). At the default 16 KiB blocks, rows of 1 KiB fill about 8 blocks.
+
+**Measured.** _Pending: a box A/B of main, this change and readahead off, on ycsb-e ×3 at buffered and default, plus time-series-range and adjacency at 16 clients._
+
+**Tests.** `scan_readahead_limit.rs`:
+- scans limited to 1, 50 and 128 rows submit no readahead;
+- a 1000-row scan and an unlimited scan still read ahead.
+
+#974 A (readahead admits on the cursor) stays parked. The same box slot's long-scan profile decides it.
+
