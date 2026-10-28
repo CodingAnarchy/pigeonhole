@@ -357,6 +357,8 @@ fn locate_key(k: &[u8], col: &[u8], row: &[u8]) -> (bool, bool) {
 }
 
 /// The length of the longest common prefix of `a` and `b`, eight bytes at a time.
+// Always inlined, with `locate_key` (D291's two `group` instances, D193).
+#[inline(always)]
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
