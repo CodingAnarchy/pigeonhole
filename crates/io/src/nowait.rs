@@ -146,11 +146,22 @@ impl FileState {
         if !backend.on() || self.refused.load(Relaxed) {
             return false;
         }
-        if self.skip.load(Relaxed) == 0 {
+        let mut skip = self.skip.load(Relaxed);
+        if skip == 0 {
             return true;
         }
-        // Racy by design: concurrent readers may skip a few reads more or fewer.
-        self.skip.fetch_sub(1, Relaxed);
+        // Open: count one skipped read, saturating at 0. Readers racing on the last skips
+        // must not take it below 0, which would wrap it and open the breaker for good
+        // (perf287's review of #1018). A loop of `compare_exchange` only while it is open.
+        while let Some(next) = skip.checked_sub(1) {
+            match self
+                .skip
+                .compare_exchange_weak(skip, next, Relaxed, Relaxed)
+            {
+                Ok(_) => break,
+                Err(now) => skip = now,
+            }
+        }
         false
     }
 
@@ -202,4 +213,41 @@ pub struct NowaitReads {
     pub refused: u64,
     /// Times a file's breaker opened after misses with no hit.
     pub breaks: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    #[test]
+    fn readers_racing_on_an_open_breakers_last_skips_never_wrap_it() {
+        // perf287's review of #1018: two readers that both saw one skip left took the
+        // count from 1 to 0 and then to u32::MAX, opening the breaker for good.
+        let backend = Backend::default();
+        for round in 0..2000 {
+            let file = FileState::default();
+            file.skip.store(2, Relaxed);
+            let start = Barrier::new(8);
+            std::thread::scope(|s| {
+                for _ in 0..8 {
+                    s.spawn(|| {
+                        start.wait();
+                        for _ in 0..4 {
+                            let _ = file.try_now(&backend);
+                        }
+                    });
+                }
+            });
+            assert_eq!(
+                file.skip.load(Relaxed),
+                0,
+                "round {round}: the skip count wrapped"
+            );
+            assert!(
+                file.try_now(&backend),
+                "round {round}: a closed breaker tries"
+            );
+        }
+    }
 }

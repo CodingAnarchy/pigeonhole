@@ -550,7 +550,8 @@ impl Options {
     }
 
     /// Whether a read the page cache holds is copied on the thread that submits it (D292,
-    /// Linux; default on), set on the database's I/O backend at open (ICR 0083). For
+    /// Linux; default on), set on the database's I/O backend at open (ICR 0083). A backend
+    /// passed through [`Options::vfs`] is shared: every database on it sees the change. For
     /// benchmarks comparing the two.
     #[doc(hidden)]
     pub fn nowait_reads(mut self, on: bool) -> Self {
