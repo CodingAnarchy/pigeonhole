@@ -5406,6 +5406,9 @@ impl ShardState {
         let track = !self.replaying
             && self.shared.balance.enabled
             && self.shared.balance.interval_nanos > 0;
+        // D290: the row cache follows the commit (decided once per apply, so the cache-off
+        // loop keeps its one branch on `row_epochs`).
+        let follow = !self.replaying && self.shared.row_cache.is_some();
 
         // The mutations as the scan decoded them (the batch is decoded once).
         let keys = std::mem::take(&mut self.dedup.keys);
@@ -5455,7 +5458,7 @@ impl ShardState {
                     if let Some(epochs) = &self.shared.row_epochs
                         && !self.replaying
                     {
-                        if self.shared.row_cache.is_some() {
+                        if follow {
                             // D290: the slot's value before this commit. `seqno` itself is a
                             // later run of this commit's writes to the row (A, B, A).
                             let p = epochs.note_write_prev(m.table, m.row, seqno);
@@ -5554,7 +5557,7 @@ impl ShardState {
             result = Err(e.into());
         }
         self.key_buf = key_buf;
-        if !self.cache_rows.is_empty() || !self.cache_stale.is_empty() {
+        if follow && !(self.cache_rows.is_empty() && self.cache_stale.is_empty()) {
             self.follow_commit(bytes, seqno, dups, result.is_ok());
         }
         result
