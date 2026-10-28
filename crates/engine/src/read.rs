@@ -948,6 +948,12 @@ impl ScanCursor {
             // No row of the scan is in this tablet: it opens with no lanes.
             return Ok(true);
         }
+        // A scan its limit leaves short reads no blocks ahead (#712).
+        let readahead = crate::source::scan_reads_ahead(if self.spec.limit == 0 {
+            0
+        } else {
+            self.spec.limit.saturating_sub(self.rows_emitted).max(1)
+        });
         for &family in &self.families {
             // Nothing of this family in the tablet: no resolver, options or sources for it (a
             // table's empty families, #406). Located once, for the sources below too.
@@ -969,6 +975,7 @@ impl ScanCursor {
                 &filter,
                 start,
                 end,
+                readahead,
                 resolver.cursor_mut().sources_mut(),
             );
             if let Err(e) = filled {
