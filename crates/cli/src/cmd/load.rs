@@ -27,7 +27,7 @@ pub(crate) fn run(
     input: Option<&Path>,
     create: bool,
 ) -> Result<Report, Failure> {
-    let reader: Box<dyn BufRead> = match input {
+    let mut reader: Box<dyn BufRead> = match input {
         None => Box::new(std::io::stdin().lock()),
         Some(p) if p == Path::new("-") => Box::new(std::io::stdin().lock()),
         Some(p) => Box::new(std::io::BufReader::new(
@@ -35,8 +35,11 @@ pub(crate) fn run(
                 .map_err(|e| Failure::io(&format!("open {}", p.display()), &e))?,
         )),
     };
+    // The header first: an input that isn't a dump (empty, say, from a dump that failed into a
+    // pipe) is refused before the database is opened, so `--create` makes nothing (#1037).
+    let header_line = header(&mut reader)?;
     let db = open::for_write(cli, file, create)?;
-    let loaded = load(&db, reader);
+    let loaded = load(&db, reader, header_line);
     // Close even after a failure: what was committed stays, flushed and checkpointed.
     let closed = db.close().map_err(|e| Failure::db("close", &e));
     let n = loaded?;
@@ -66,7 +69,39 @@ struct Loaded {
     cells: u64,
 }
 
-fn load(db: &Pigeonhole, reader: Box<dyn BufRead>) -> Result<Loaded, Failure> {
+/// Reads up to the first non-blank line, which must be a `phdb dump` header, and returns its
+/// line number. Anything else, an empty input included, is not a dump (exit 2, #1037).
+fn header(reader: &mut Box<dyn BufRead>) -> Result<usize, Failure> {
+    let mut at = 0;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        at += 1;
+        if reader
+            .read_line(&mut line)
+            .map_err(|e| Failure::io("read the dump", &e))?
+            == 0
+        {
+            return Err(Failure::not_a_dump(
+                "the input is empty: not a phdb dump (a dump that failed writes nothing)".into(),
+            ));
+        }
+        if !line.trim().is_empty() {
+            break;
+        }
+    }
+    let v: Value = serde_json::from_str(&line)
+        .map_err(|e| Failure::not_a_dump(format!("line {at}: not a phdb dump (not JSON: {e})")))?;
+    if v["phdb"] != 1 || v["command"] != "dump" {
+        return Err(Failure::not_a_dump(format!(
+            "line {at}: not a phdb dump (the first line is not its header)"
+        )));
+    }
+    Ok(at)
+}
+
+/// Loads the lines after the header, which was line `header_line`.
+fn load(db: &Pigeonhole, reader: Box<dyn BufRead>, header_line: usize) -> Result<Loaded, Failure> {
     let mut n = Loaded::default();
     let mut tables: HashMap<String, Table> = HashMap::new();
     let mut batch = db.write_batch();
@@ -77,19 +112,13 @@ fn load(db: &Pigeonhole, reader: Box<dyn BufRead>) -> Result<Loaded, Failure> {
             .map_err(|e| Failure::db("load: commit", &e))
     };
     for (i, line) in reader.lines().enumerate() {
-        let at = i + 1;
+        let at = header_line + i + 1;
         let line = line.map_err(|e| Failure::io("read the dump", &e))?;
         if line.trim().is_empty() {
             continue;
         }
         let bad = |m: &str| Failure::input(format!("line {at}: {m}"));
         let v: Value = serde_json::from_str(&line).map_err(|e| bad(&format!("not JSON: {e}")))?;
-        if at == 1 {
-            if v["phdb"] != 1 || v["command"] != "dump" {
-                return Err(bad("not a phdb dump (the first line is not its header)"));
-            }
-            continue;
-        }
         if let Some(families) = v.get("families") {
             let name = v["table"]
                 .as_str()
