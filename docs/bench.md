@@ -34,6 +34,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--inline-ops N` | `group-commit`: the D213 run's commits, apart from the client runs' `--ops` (D219; the gate judges it on 2M) |
 | `--in-flight N` | Inline runs: commits each shard's thread keeps in flight (default 16, the judged shape). Fewer trade throughput for latency: the gate reports 4 and 8 beside the judged 16 (D226), and a run at another count prints "reported, not judged" |
 | `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
+| `--cache-model per-store\|total` | How `--cache` maps onto stores whose read memory is not one shared cache (default `per-store`, as before #759; see below) |
 | `--shards N` | Pigeonhole shards |
 | `--sync` | Fsync every commit on every engine (default: buffered, see below) |
 | `--async N` | Pigeonhole: each client thread keeps N operations in flight through the async API (D247, reported): puts as `commit_async`, row reads as `read_async`, gets as `get_async`, polled by the thread itself with no executor; other operations run one at a time in between. Latency is each operation's submission to resolution; the settings read `async=N` |
@@ -138,6 +139,16 @@ Interpretation notes (details and rationale in [`design/questions/bench.md`](des
 | `fjall` | Same key encoding as RocksDB, one keyspace | `max_memtable_size` 64 MiB, block cache 256 MiB | fjall's default bloom filters | `PersistMode::Buffer` / `SyncAll` |
 
 **Memory budget.** Every engine gets the same `MemoryBudget`: a write buffer (`--write-buffer`, 64 MiB by default: Pigeonhole's and RocksDB's default) and a read cache (`--cache`, 256 MiB, Pigeonhole's default block cache). SQLite has no separate write buffer, so its page cache gets the sum. A one-shard table uses one shard's memtable, so the comparison holds whatever `--shards` is. Every engine's other options are its defaults: no tuning on any side. Each result's `Settings` column prints the budget, filter and durability it ran with.
+
+**Cache model (#759).** Two stores' read memory is not one shared cache, so `--cache-model` says how `--cache` maps onto them:
+
+| Store | `per-store` (default) | `total` |
+|---|---|---|
+| Pigeonhole | block cache = `--cache`; the library's row cache (64 MiB by default) on top | block cache + row cache = `--cache` (the row cache from `--row-cache`, else 64 MiB; the block cache gets the rest) |
+| RocksDB, fjall | block cache = `--cache` | the same |
+| SQLite | **every** connection's page cache = write buffer + cache. The bench opens one connection per client thread, so 16 clients hold 17 private caches: up to 17 × 320 MiB ≈ 5.3 GiB by default | write buffer + cache split evenly across the connections (the clients and the runner's own) |
+
+`per-store` keeps results comparable with every run before #759. `total` holds every store to the same read-cache memory (D274's like for like). SQLite's connections can't share pages: each caches its own copy, which is SQLite's design in a multi-threaded process. Its shared-cache mode would share them, but it changes locking to table-level locks (`SQLITE_LOCKED`) and is discouraged, so the bench doesn't use it. Settings print the model: `cache=1024MiB total (block 960MiB + row 64MiB)` for Pigeonhole, `page_cache=1088MiB total` for SQLite.
 
 **Durability.** The default level, written to the OS but not fsynced, survives a process crash in every engine, so the engines compare like with like. Tests check that every comparison runner reads exactly the same cells and bytes as Pigeonhole, operation by operation, for every workload (`runners::agreement`).
 

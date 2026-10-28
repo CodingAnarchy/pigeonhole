@@ -11,7 +11,9 @@ use pigeonhole::{
     RowMutation, Table, Transaction, ValueFilter,
 };
 
-use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified, transfer_balances};
+use super::{
+    BLOOM_BITS, CacheModel, Counted, MemoryBudget, Touched, durability, modified, transfer_balances,
+};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, XSHARD_PARTITIONS, YCSB_FAMILY};
 use crate::{BenchOp, Client, PigeonholeRunner, Runner, ShardShare};
 
@@ -677,6 +679,23 @@ mod riders {
 }
 
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
+/// The library's default row cache (`pigeonhole::Options`, D216), set explicitly under
+/// [`CacheModel::Total`] so the block cache gets exactly the rest of the budget.
+const LIBRARY_ROW_CACHE: u64 = 64 << 20;
+
+/// Block cache and row cache bytes (`None`: the library's row cache). Under
+/// [`CacheModel::Total`] the two share [`MemoryBudget::cache`]; under `PerStore` the block
+/// cache gets all of it and the row cache comes on top.
+fn caches(s: &Settings) -> (u64, Option<u64>) {
+    match s.memory.model {
+        CacheModel::PerStore => (s.memory.cache, s.row_cache),
+        CacheModel::Total => {
+            let row = s.row_cache.unwrap_or(LIBRARY_ROW_CACHE).min(s.memory.cache);
+            (s.memory.cache - row, Some(row))
+        }
+    }
+}
+
 pub(crate) fn options(s: &Settings) -> Options {
     let mut options = Options::default();
     if !s.default_durability {
@@ -688,9 +707,10 @@ pub(crate) fn options(s: &Settings) -> Options {
             Durability::Buffered
         });
     }
+    let (block_cache, row_cache) = caches(s);
     let mut options = options
         .memtable_budget(s.memory.write_buffer)
-        .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
+        .block_cache(usize::try_from(block_cache).unwrap_or(usize::MAX));
     if let Some(yes) = s.tablet_changes {
         options = options.tablet_changes(yes);
     }
@@ -703,7 +723,7 @@ pub(crate) fn options(s: &Settings) -> Options {
     if let Some(n) = s.shards {
         options = options.shards(n);
     }
-    if let Some(bytes) = s.row_cache {
+    if let Some(bytes) = row_cache {
         options = options.row_cache(usize::try_from(bytes).unwrap_or(usize::MAX));
     }
     if let Some(k) = s.shard_threads {
@@ -984,9 +1004,17 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={} bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
-            s.memory.cache >> 20,
+            match (s.memory.model, caches(s)) {
+                (CacheModel::Total, (block, Some(row))) => format!(
+                    "{}MiB total (block {}MiB + row {}MiB)",
+                    s.memory.cache >> 20,
+                    block >> 20,
+                    row >> 20
+                ),
+                _ => format!("{}MiB", s.memory.cache >> 20),
+            },
             if s.default_durability {
                 default_durability()
             } else if s.group_sync {
@@ -1005,10 +1033,11 @@ impl Runner for PigeonholeRunner {
                 (false, true) => " tablets=on packing=off",
             },
             if s.no_nowait_reads { " nowait=off" } else { "" },
-            match s.row_cache {
-                None => String::new(),
-                Some(0) => " rowcache=off".to_owned(),
-                Some(bytes) => format!(" rowcache={}MiB", bytes >> 20),
+            match (s.memory.model, s.row_cache) {
+                // Under the total model the cache field above names the row cache.
+                (CacheModel::Total, _) | (_, None) => String::new(),
+                (_, Some(0)) => " rowcache=off".to_owned(),
+                (_, Some(bytes)) => format!(" rowcache={}MiB", bytes >> 20),
             },
             s.shard_spin_micros
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
@@ -1614,6 +1643,36 @@ mod tests {
             .memtable_budget(16 << 20);
         r.open(&dir).unwrap();
         (r, dir)
+    }
+
+    #[test]
+    fn total_cache_model_shares_the_budget_between_block_and_row_cache() {
+        let total = |cache: u64| MemoryBudget {
+            cache,
+            model: CacheModel::Total,
+            ..MemoryBudget::default()
+        };
+        let r = PigeonholeRunner::default().memory(total(1 << 30));
+        assert_eq!(
+            caches(&r.settings),
+            ((1 << 30) - (64 << 20), Some(64 << 20))
+        );
+        assert!(
+            r.describe()
+                .contains("cache=1024MiB total (block 960MiB + row 64MiB)"),
+            "{}",
+            r.describe()
+        );
+        let r = r.row_cache(0);
+        assert_eq!(caches(&r.settings), (1 << 30, Some(0)));
+        // Per store (the default): the block cache gets it all, the library's row cache on top.
+        let r = PigeonholeRunner::default().memory(MemoryBudget::default());
+        assert_eq!(caches(&r.settings), (256 << 20, None));
+        assert!(
+            r.describe().contains(" cache=256MiB bloom="),
+            "{}",
+            r.describe()
+        );
     }
 
     #[test]
