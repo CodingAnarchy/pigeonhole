@@ -534,6 +534,9 @@ pub(crate) struct CompactionWork {
     /// A bottommost purge's guard (#316): its commit installs only if no write below its
     /// `min_ts_above` voided it since the plan (see `Shard::admit_against_guards`).
     pub guard: Option<Arc<crate::purge_guard::PurgeGuard>>,
+    /// The shard's count of compactions started, at this one's start: tags its
+    /// `CompactionCommitting`, so a stale one cannot mark a later job committing (#991).
+    pub epoch: u64,
     /// Test hook (`Engine::hold_compactions`): held before the first slice, then released.
     #[cfg(feature = "test-hooks")]
     hold: (Option<u64>, bool),
@@ -606,6 +609,7 @@ impl CompactionWork {
             meta,
             record,
             guard: None,
+            epoch: 0,
             #[cfg(feature = "test-hooks")]
             hold: (None, false),
             stage: Stage::Run,
@@ -967,6 +971,26 @@ impl Task for CompactionWork {
         loop {
             match &mut self.stage {
                 Stage::Run => {
+                    // The engine is closing (#991): the job stops here rather than finish
+                    // the rewrite, since there may never be another open to reclaim its
+                    // output. As in `reclaim`, nothing it submitted is in flight (its output
+                    // writes complete inside its slices, `write_at`, and its reads own their
+                    // buffers), so its extents go back to the pager now, before the close
+                    // ends: the shard waits for this report. The check is made only at a
+                    // slice's start: the slice that finishes the job also seals its output
+                    // and submits it, so a close that begins during that slice waits for the
+                    // commit instead.
+                    if self
+                        .shared
+                        .closing
+                        .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        if let Some(job) = self.job.take() {
+                            job.abort();
+                        }
+                        self.report(Err(Error::Closed));
+                        return TaskPoll::Done;
+                    }
                     #[cfg(feature = "test-hooks")]
                     if !self.hold.1
                         && self
@@ -1064,7 +1088,14 @@ impl Task for CompactionWork {
                         .compaction_commits
                         .fetch_add(1, std::sync::atomic::Ordering::Release);
                     match self.submit(output) {
-                        Ok(rx) => self.stage = Stage::Commit(rx),
+                        Ok(rx) => {
+                            self.stage = Stage::Commit(rx);
+                            // A close no longer waits for it (#991).
+                            let _ = self
+                                .shared
+                                .submitter(self.shard)
+                                .submit(ShardMsg::CompactionCommitting { epoch: self.epoch });
+                        }
                         Err(e) => {
                             self.report(Err(e));
                             return TaskPoll::Done;

@@ -333,14 +333,27 @@ fn stop_mid_compaction(
     vfs: &VfsRef,
     path: &Path,
 ) -> (Arc<Engine>, EngineShard, BackgroundWorker, Vec<u64>) {
+    let (engine, shard, worker, l0) = stop_mid_compaction_on(vfs, path, 1);
+    (engine, shard, worker.expect("a worker"), l0)
+}
+
+/// As [`stop_mid_compaction`], with `workers` background workers: with none, the shard
+/// runs the compaction itself, and is stopped in the middle of it.
+fn stop_mid_compaction_on(
+    vfs: &VfsRef,
+    path: &Path,
+    workers: usize,
+) -> (Arc<Engine>, EngineShard, Option<BackgroundWorker>, Vec<u64>) {
+    let mut options = real_options(vfs);
+    options.background_workers = workers;
     let AppOwned {
         engine,
         mut shards,
-        mut workers,
+        workers,
         ..
-    } = Engine::open_application_owned_with(path, real_options(vfs)).expect("open");
+    } = Engine::open_application_owned_with(path, options).expect("open");
     let mut shard = shards.remove(0);
-    let mut worker = workers.remove(0);
+    let mut worker = workers.into_iter().next();
     let t = engine
         .create_table("t", &[("f".into(), FamilyOptions::default())])
         .unwrap();
@@ -361,7 +374,7 @@ fn stop_mid_compaction(
                 // second compaction was mid-job when the close ended).
                 for mut pc in pcs.drain(..) {
                     while ready(&mut pc).is_none() {
-                        step(&**vfs, &mut shard, Some(&mut worker), 8);
+                        step(&**vfs, &mut shard, worker.as_mut(), 8);
                     }
                     ready(&mut pc).expect("resolved").expect("committed");
                 }
@@ -369,11 +382,11 @@ fn stop_mid_compaction(
         }
         let mut f = engine.flush_pending().unwrap();
         while ready(&mut f).is_none() {
-            step(&**vfs, &mut shard, Some(&mut worker), 64);
+            step(&**vfs, &mut shard, worker.as_mut(), 64);
         }
     }
     while !engine.compaction_held() {
-        step(&**vfs, &mut shard, Some(&mut worker), 8);
+        step(&**vfs, &mut shard, worker.as_mut(), 8);
     }
     assert_eq!(
         engine.metrics().commits[Durability::Buffered as usize],
@@ -394,7 +407,13 @@ fn stop_mid_compaction(
     engine.hold_compactions(false);
     while engine.unreferenced_bytes() <= base {
         let now = vfs.monotonic_nanos();
-        worker.run_once(now);
+        match worker.as_mut() {
+            Some(w) => w.run_once(now),
+            // A shard turn runs slices until its deadline: 50 us of a few units each, far
+            // short of the job. (With 1 ns, the turn's own clock read was already past it on
+            // a nanosecond clock, and no slice ran: #1007's Linux and Windows CI.)
+            None => shard.run_once(now + 50_000),
+        };
         assert_eq!(
             engine.compaction_commits_submitted(),
             0,
@@ -502,9 +521,8 @@ fn a_dropped_worker_mid_compaction_leaves_its_inputs_to_compact_again() {
         l0.iter().all(|id| !levels.iter().any(|(_, _, s)| s == id)),
         "the same L0 runs were compacted: {l0:?} vs {levels:?}"
     );
-    // Nothing else is left to compact, so no compaction is mid-job when the close ends (the
-    // close does not wait for one; its output would stay allocated until the next open: #991,
-    // where perf287 suggests the close abort the job as D284's reclaim does).
+    // Nothing else is left to compact. (A job mid-run at the close would stop and free its
+    // output before the close ends, #991: `a_close_frees_a_shard_run_compaction_stopped_mid_job`.)
     assert!(
         levels.iter().filter(|(_, level, _)| *level == 0).count() < 4,
         "a new L0 run formed after the stop: {levels:?}"
@@ -513,6 +531,36 @@ fn a_dropped_worker_mid_compaction_leaves_its_inputs_to_compact_again() {
     while shard.closed().is_none() {
         shard.run_once(u64::MAX);
     }
+    assert_extents_back(&engine, "after the close");
+}
+
+/// #991 (owner, 2026-10-27): a close frees a running compaction's output, since there may
+/// never be another open to reclaim it. With no worker the shard runs the compaction itself;
+/// it is stopped with output written and its commit not submitted, and the close ends with
+/// nothing unreferenced allocated or retired.
+#[test]
+fn a_close_frees_a_shard_run_compaction_stopped_mid_job() {
+    let dir = TempDir::new("shardrun");
+    let path = dir.0.join("s.phdb");
+    let vfs = real_vfs();
+    let (engine, mut shard, worker, _) = stop_mid_compaction_on(&vfs, &path, 0);
+    assert!(worker.is_none());
+    assert!(
+        engine.unreferenced_bytes() > 0,
+        "the job has output written"
+    );
+    // Still a few units per slice, and 50 us of them per turn: the close sees the job
+    // mid-run rather than finishing it in one turn.
+    engine.compaction_tiny_slices(true);
+    engine.close().unwrap();
+    while shard.closed().is_none() {
+        shard.run_once(vfs.monotonic_nanos() + 50_000);
+    }
+    assert_eq!(
+        engine.compaction_commits_submitted(),
+        0,
+        "the job never committed"
+    );
     assert_extents_back(&engine, "after the close");
 }
 
