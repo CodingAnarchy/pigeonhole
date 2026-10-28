@@ -789,8 +789,8 @@ impl Pigeonhole {
     /// until the [`Shard::set_wakeup`] callback fires (work arrived or I/O completed) or
     /// [`Shard::next_wakeup`] passes (background work is due), whichever comes first. An idle
     /// shard then uses no CPU, even while a write stall or a failed compaction's retry is
-    /// pending, beyond a short tablet-balancer pass (with [`Options::tablet_changes`] on, the
-    /// default): every 100 ms after writes, backing off to one every 10 s while idle.
+    /// pending, beyond a short tablet-balancer pass: every 100 ms after writes, backing off to
+    /// one every 10 s while idle.
     ///
     /// To close, call [`Pigeonhole::close`] and keep driving each shard the same way until
     /// [`Shard::closed`] returns `Some`, then drop it: the close's flush and syncs run on
@@ -1841,8 +1841,8 @@ impl Shard {
     /// How long until background work on this shard is due (a write stall's pacing, a wait
     /// for memtable room, a failed compaction's retry, the tablet balancer's next pass), or
     /// `None` when none is waiting for a time. `Some(Duration::ZERO)` means it is due now.
-    /// With [`Options::tablet_changes`] on (the default) the balancer's next pass is always
-    /// pending, so this is never `None`; it is bounded by the balancer's current interval:
+    /// The tablet balancer's next pass is always pending, so this is never `None`; it is
+    /// bounded by the balancer's current interval:
     /// 100 ms after a write or a tablet change, doubling with each idle pass up to 10 s.
     ///
     /// With io_uring (the default on Linux, D218), I/O the shard submitted goes to

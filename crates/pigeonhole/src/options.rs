@@ -704,6 +704,9 @@ impl Options {
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// Let a table's tablets split, merge and move between shards (default on), so the
     /// writes of one table spread over every shard. Off, each table is one tablet on one
     /// shard: writes to a single table use one shard thread whatever [`shards`](Self::shards)
@@ -723,11 +726,16 @@ impl Options {
     /// let options = Options::default().shards(4).tablet_changes(false);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn tablet_changes(mut self, yes: bool) -> Self {
         self.tablet_changes = yes;
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// Pack a lightly written store's tablets onto few shards (default on; D217). While the
     /// shards' threads are mostly idle, the balancer keeps the tablets being written on as few
     /// shards as stay about half busy, so a commit seldom has to wake a sleeping shard
@@ -747,6 +755,8 @@ impl Options {
     /// let options = Options::default().tablet_packing(false);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn tablet_packing(mut self, yes: bool) -> Self {
         self.tablet_packing = yes;
         self
