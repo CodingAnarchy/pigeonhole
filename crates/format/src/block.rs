@@ -953,7 +953,8 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
             let in_column = if e.shared == 0 {
                 unshared == key_len && self.block.bytes[e.unshared.clone()].starts_with(column)
             } else {
-                e.shared >= column.len() && e.shared + unshared == key_len
+                // Not `shared + unshared`: a malformed `shared` can be near `usize::MAX`.
+                e.shared >= column.len() && unshared <= key_len && e.shared == key_len - unshared
             };
             if !in_column {
                 break e;
