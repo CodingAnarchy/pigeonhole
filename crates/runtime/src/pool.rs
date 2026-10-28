@@ -756,11 +756,6 @@ impl WorkerPool {
     pub fn close(&self) {
         self.0.close_and_reclaim();
     }
-
-    /// Whether [`WorkerPool::close`] ran.
-    pub fn closed(&self) -> bool {
-        self.0.closed()
-    }
 }
 
 /// Body of an engine-owned compaction thread (D252): a loop over its driver, with a ring of

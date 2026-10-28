@@ -691,11 +691,6 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
         parsed.map(|_| ())
     }
 
-    /// The block this cursor reads.
-    pub fn block(&self) -> &Block<B> {
-        &self.block
-    }
-
     /// Byte offset of the current entry within the block (for row-start lookups).
     pub fn entry_offset(&self) -> usize {
         self.cur

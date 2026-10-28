@@ -346,11 +346,6 @@ impl<M> Clone for Submitter<M> {
 }
 
 impl<M: Send + 'static> Submitter<M> {
-    /// The target shard.
-    pub fn shard(&self) -> ShardId {
-        self.inbox.shard
-    }
-
     /// `(parks, wakes)` of the target shard since the runtime started (ICR 0027): times its
     /// engine-owned thread parked with nothing to do (after its idle spin), and submits or
     /// notifications that found it announced asleep and woke it. An application-owned
