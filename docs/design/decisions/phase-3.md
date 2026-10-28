@@ -2344,7 +2344,7 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 <a id="d272"></a>
 ## D272 — Transactions in 1.0: no lock mode; conflicts stay at (row, family) granularity; the transfer gap stays open under #708 (owner decision, 2026-10-21; pigeonhole, engine, #694)
 
-**Status: accepted** for C1 and C2 (owner, 2026-10-21). C3 is **open**: the owner rejected accepting the gap, and a perf agent investigates under #708.
+**Status: accepted** for C1 and C2 (owner, 2026-10-21). C3 was left **open** (the owner rejected accepting the gap; a perf agent investigated under #708) until **2026-10-28, when the owner accepted the `transfer` row at `Buffered` for 1.0 as a documented gap**, after #708 showed that its residual is the per-attempt cost of cross-shard optimistic commits on hot rows. Retry policy (#708 c6473225899), a client pre-check (c6473334810) and a lock mode (c6473394647: about ×1.1–1.3, and a reversal of C1) don't close it. At the default durability the row is within 1.2×. The guide documents it (Transactions, "Hot rows across shards"); the work after 1.0 is #1023.
 
 **Decided:**
 - **C1: no pessimistic or lock-based mode in 1.0.**
