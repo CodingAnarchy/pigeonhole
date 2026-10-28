@@ -126,15 +126,17 @@ fn the_oldest_reader_snapshots_lag_is_reported() {
     let snap = r.snapshot().unwrap();
     vfs.enter_process(WRITER);
     let m = db.engine_metrics();
+    let view_lag = internal(&db.internal_metrics(), "reader_pin_view_lag");
     assert_eq!(m.reader_pin_seqno_lag, 0);
-    assert!(m.reader_pin_view_lag <= 1, "{}", m.reader_pin_view_lag);
+    assert!(view_lag <= 1, "{view_lag}");
 
     // The writer commits and publishes new views; the held snapshot falls behind.
     put(&t, 10..50);
     db.flush().unwrap();
     let m = db.engine_metrics();
+    let view_lag = internal(&db.internal_metrics(), "reader_pin_view_lag");
     assert!(m.reader_pin_seqno_lag >= 40, "{}", m.reader_pin_seqno_lag);
-    assert!(m.reader_pin_view_lag >= 1, "{}", m.reader_pin_view_lag);
+    assert!(view_lag >= 1, "{view_lag}");
 
     // A fresh snapshot (the old one dropped) catches the pin up.
     vfs.enter_process(reader_process(30));
@@ -142,10 +144,11 @@ fn the_oldest_reader_snapshots_lag_is_reported() {
     let snap = r.snapshot().unwrap();
     vfs.enter_process(WRITER);
     let m = db.engine_metrics();
+    let view_lag = internal(&db.internal_metrics(), "reader_pin_view_lag");
     // No commit since the snapshot; a background flush or compaction may have published
     // one more view meanwhile.
     assert_eq!(m.reader_pin_seqno_lag, 0);
-    assert!(m.reader_pin_view_lag <= 1, "{}", m.reader_pin_view_lag);
+    assert!(view_lag <= 1, "{view_lag}");
     vfs.enter_process(reader_process(30));
     drop(snap);
     drop(r);
@@ -169,4 +172,9 @@ fn a_reader_with_no_writer_running_gets_no_writer() {
     let after = reader(&vfs, 41).unwrap_err();
     assert_eq!(after.code(), ErrorCode::NoWriter, "{after}");
     assert!(after.message().contains("no writer is running"), "{after}");
+}
+
+/// A counter from `Pigeonhole::internal_metrics` by name (ICR 0087); 0 if absent.
+fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
+    v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
 }

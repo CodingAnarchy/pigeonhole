@@ -632,7 +632,6 @@ impl Db {
     fn io_rings(&self) -> Option<IoRings> {
         self.vfs.ring_stats().map(|s| IoRings {
             rings: s.rings,
-            pooled: s.pooled,
             attach_failures: s.attach_failures,
             inline: s.inline,
         })
@@ -1209,16 +1208,15 @@ impl Pigeonhole {
     }
 
     /// With io_uring (#402; the default on Linux, D218): how many io_uring rings the
-    /// database has now (a shared one, plus one per shard thread that got its own) and how
-    /// many got a registered buffer pool (a ring registers one on the first read that can
-    /// use it: today, an async read's block fetch). `None` on other backends.
+    /// database has now (a shared one, plus one per shard thread that got its own), how
+    /// often a thread could not get one, and how much I/O ran inline on the calling thread
+    /// instead. `None` on other backends.
     ///
-    /// Pools are pinned memory, charged to the user's locked-memory limit (`RLIMIT_MEMLOCK`,
-    /// often 8 MiB) unless the process has `CAP_IPC_LOCK`; a process registers them up to
-    /// half that limit, 1 MiB a ring. Rings past it, or shard threads that run on the shared
-    /// ring, use plain buffers: correct, but each read pins its pages. `pooled < rings`
-    /// says that happened; raise the limit (or grant the capability) for a pool on every
-    /// ring.
+    /// A ring registers a buffer pool on its first read that can use one. Pools are pinned
+    /// memory, charged to the user's locked-memory limit (`RLIMIT_MEMLOCK`, often 8 MiB)
+    /// unless the process has `CAP_IPC_LOCK`; a process registers them up to half that
+    /// limit, 1 MiB a ring. Rings past it use plain buffers: correct, but each read pins its
+    /// pages.
     pub fn io_rings(&self) -> Option<IoRings> {
         self.db.io_rings()
     }
@@ -1230,6 +1228,22 @@ impl Pigeonhole {
     #[doc(hidden)]
     pub fn nowait_reads(&self) -> Option<pigeonhole_io::NowaitReads> {
         self.db.vfs.nowait_reads()
+    }
+
+    /// The counters [`engine_metrics`](Self::engine_metrics) leaves out, by name (ICR 0087):
+    /// the engine's mechanisms (shard parks and wakes, the WAL's unpin passes, visibility
+    /// waits, cross-shard refusals and share waits, io_uring buffer pools, D292's inline
+    /// page-cache reads, and the like), for benchmarks and tests. Not part of the API: names,
+    /// and whether a name is present at all, may change in any release, so treat a missing
+    /// name as absent.
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
+    pub fn internal_metrics(&self) -> Vec<(&'static str, u64)> {
+        crate::metrics::internal(
+            &self.engine().metrics(),
+            self.db.vfs.ring_stats().map(|s| s.pooled),
+            self.db.vfs.nowait_reads(),
+        )
     }
 
     /// What the database holds and how it is stored: format version, file and free bytes,

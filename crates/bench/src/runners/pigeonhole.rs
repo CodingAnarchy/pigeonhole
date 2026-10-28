@@ -1650,6 +1650,10 @@ fn report_nowait_reads(db: &Pigeonhole) {
 /// ICR 0023).
 pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
     let m = db.engine_metrics();
+    // The counters the public metrics leave out, by name (ICR 0087); a name an older or
+    // newer build lacks reads as 0.
+    let inner = db.internal_metrics();
+    let im = |name: &str| internal(&inner, name);
     let rc = db.row_cache_stats();
     let rings = db.io_rings().unwrap_or_default();
     crate::Stalls {
@@ -1663,41 +1667,47 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         pacing_stall_nanos: m.pacing_stall_nanos,
         flushes: m.flushes,
         compactions: m.compactions,
-        unpin_passes: m.wal_unpin_passes,
-        unpin_flushes: m.wal_unpin_flushes,
-        wal_inline_syncs: m.wal_inline_syncs,
+        unpin_passes: im("wal_unpin_passes"),
+        unpin_flushes: im("wal_unpin_flushes"),
+        wal_inline_syncs: im("wal_inline_syncs"),
         file_growths: m.file_growths,
         file_growth_nanos: m.file_growth_nanos,
-        file_growths_ahead: m.file_growths_ahead,
-        shard_parks: m.shard_parks,
-        shard_wakes: m.shard_wakes,
-        commit_parks: m.commit_parks,
-        visibility_waits: m.visibility_waits,
-        visibility_scanned: m.visibility_waiters_ahead,
-        visibility_wake_passes: m.visibility_wake_passes,
-        visibility_woken: m.visibility_woken,
-        visibility_contended: m.visibility_contended,
-        wal_rollover_blocks: m.wal_rollover_blocks,
+        file_growths_ahead: im("file_growths_ahead"),
+        shard_parks: im("shard_parks"),
+        shard_wakes: im("shard_wakes"),
+        commit_parks: im("commit_parks"),
+        visibility_waits: im("visibility_waits"),
+        visibility_scanned: im("visibility_waiters_ahead"),
+        visibility_wake_passes: im("visibility_wake_passes"),
+        visibility_woken: im("visibility_woken"),
+        visibility_contended: im("visibility_contended"),
+        wal_rollover_blocks: im("wal_rollover_blocks"),
         slot_refusals: db.tablet_refusals().0,
         row_cache_hits: rc.hits,
         row_cache_misses: rc.misses,
         row_cache_fills: rc.fills,
         row_cache_write_throughs: rc.write_throughs,
         xshard_rounds: m.cross_shard.rounds,
-        xshard_refused_rounds: m.cross_shard.refused_rounds,
+        xshard_refused_rounds: im("cross_shard.refused_rounds"),
         // Always 0 since D263 (the counters are deprecated); the report keeps its columns.
         xshard_refused_below_floor: 0,
         xshard_refused_move_raise: 0,
-        xshard_refused_moved: m.cross_shard.refused_moved,
-        xshard_refused_room: m.cross_shard.refused_room,
-        xshard_refused_pending_overlap: m.cross_shard.refused_pending_overlap,
-        xshard_share_waits: m.cross_shard.share_waits,
-        xshard_share_wait_nanos: m.cross_shard.share_wait_nanos,
-        xshard_chained: m.cross_shard.chained,
-        xshard_wounds: m.cross_shard.wounds,
-        xshard_max_attempts_blind: m.cross_shard.max_attempts_blind,
-        xshard_max_attempts_reading: m.cross_shard.max_attempts_reading,
+        xshard_refused_moved: im("cross_shard.refused_moved"),
+        xshard_refused_room: im("cross_shard.refused_room"),
+        xshard_refused_pending_overlap: im("cross_shard.refused_pending_overlap"),
+        xshard_share_waits: im("cross_shard.share_waits"),
+        xshard_share_wait_nanos: im("cross_shard.share_wait_nanos"),
+        xshard_chained: im("cross_shard.chained"),
+        xshard_wounds: im("cross_shard.wounds"),
+        xshard_max_attempts_blind: im("cross_shard.max_attempts_blind"),
+        xshard_max_attempts_reading: im("cross_shard.max_attempts_reading"),
     }
+}
+
+/// A counter from `Pigeonhole::internal_metrics` by name (ICR 0087); 0 if this build lacks
+/// it, so the bench runs against any build.
+pub(crate) fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
+    v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
 }
 
 #[cfg(test)]

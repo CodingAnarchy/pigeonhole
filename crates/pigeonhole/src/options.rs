@@ -1256,14 +1256,13 @@ pub struct IoRings {
     /// Rings: the shared one, plus one per shard thread and compaction thread that got its
     /// own.
     pub rings: usize,
-    /// Rings with a registered buffer pool; the rest use plain buffers.
-    pub pooled: usize,
     /// Times a thread could not get a ring of its own (the kernel refused one, `ENOMEM` or a
     /// missing feature), counted per attempt; the thread retries later (#929, ICR 0070).
     pub attach_failures: u64,
-    /// Operations a thread with no ring of its own ran inline, as the pread backend does, in
-    /// application-owned mode (#929, ICR 0070). Nonzero: some I/O ran synchronously on the
-    /// calling thread.
+    /// I/O completed synchronously on the calling thread instead of through a ring: in
+    /// application-owned mode, a thread with no ring of its own runs its I/O inline, as the
+    /// pread backend does (#929, ICR 0070, ICR 0087). Nonzero: some I/O blocked a thread
+    /// your event loop drives.
     pub inline: u64,
 }
 

@@ -1548,33 +1548,34 @@ fn spin_and_pool_time_are_counted_on_an_engine_owned_store() {
     }
     db.flush().unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let settled = loop {
+    let (settled, inner) = loop {
         let m = db.engine_metrics();
-        if m.shard_pool_busy_nanos > 0 && m.shard_spin_time_nanos > 0 {
-            break m;
+        let i = db.internal_metrics();
+        let (pool, spin) = (
+            internal(&i, "shard_pool_busy_nanos"),
+            internal(&i, "shard_spin_time_nanos"),
+        );
+        if pool > 0 && spin > 0 {
+            break (m, i);
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "pool {} spin {} after 10 s",
-            m.shard_pool_busy_nanos,
-            m.shard_spin_time_nanos
+            "pool {pool} spin {spin} after 10 s"
         );
         std::thread::sleep(std::time::Duration::from_millis(5));
     };
     assert!(settled.shard_busy_nanos > 0);
     // D257: the 64 blocking commits' time in flight is counted, and summed per shard.
-    assert!(settled.shard_commit_inflight_nanos > 0);
+    let inflight = internal(&inner, "shard_commit_inflight_nanos");
+    assert!(inflight > 0);
     let stats = db.shard_stats();
     assert_eq!(stats.len(), 1);
     // Two live reads: the pool (the flush's compaction) and the spinning shard thread may
     // add time between them, so the per-shard stat is at least the summed metric. Nothing
     // commits between the reads, so the time in flight is equal.
-    assert!(stats[0].pool_busy_nanos >= settled.shard_pool_busy_nanos);
-    assert!(stats[0].spin_time_nanos >= settled.shard_spin_time_nanos);
-    assert_eq!(
-        stats[0].commit_inflight_nanos,
-        settled.shard_commit_inflight_nanos
-    );
+    assert!(stats[0].pool_busy_nanos >= internal(&inner, "shard_pool_busy_nanos"));
+    assert!(stats[0].spin_time_nanos >= internal(&inner, "shard_spin_time_nanos"));
+    assert_eq!(stats[0].commit_inflight_nanos, inflight);
     drop(t);
     db.close().unwrap();
 }
@@ -1595,7 +1596,11 @@ fn io_rings_report_the_backend() {
         // The shared ring, plus the shard threads' own; how many got pools depends on the
         // locked-memory limit and on the other tests' rings in this process.
         let rings = db.io_rings().expect("io_uring reports its rings");
-        assert!(rings.rings >= 1 && rings.pooled <= rings.rings, "{rings:?}");
+        let pooled = internal(&db.internal_metrics(), "io_rings.pooled");
+        assert!(
+            rings.rings >= 1 && pooled <= rings.rings as u64,
+            "{rings:?} {pooled}"
+        );
         drop(t);
         db.close().unwrap();
     }
@@ -2767,4 +2772,9 @@ fn reads_at_a_snapshot_name_the_families_the_snapshot_saw() {
     drop(txn);
     drop(t);
     db.close().unwrap();
+}
+
+/// A counter from `Pigeonhole::internal_metrics` by name (ICR 0087); 0 if absent.
+fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
+    v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
 }

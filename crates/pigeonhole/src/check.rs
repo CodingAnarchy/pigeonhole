@@ -190,13 +190,26 @@ pub struct WalFile {
     pub segments: u64,
     /// Records the next open would replay.
     pub records: u64,
-    /// Where replay starts (the manifest's checkpoint), as (segment epoch, offset); `(0, 0)`
-    /// is the oldest segment.
-    pub checkpoint: (u32, u32),
-    /// Where the log's valid data ends, as (segment epoch, offset).
-    pub end: (u32, u64),
-    /// The slot of the segment the log ends in.
+    /// Where replay starts (the manifest's checkpoint); epoch 0, offset 0 is the oldest
+    /// segment.
+    pub checkpoint: WalPosition,
+    /// Where the log's valid data ends.
+    pub end: WalPosition,
+    /// The slot of the segment the log ends in: a layout detail for `phdb check`'s output,
+    /// outside the API (ICR 0087).
+    #[doc(hidden)]
     pub end_slot: Option<u64>,
+}
+
+/// A position in a WAL stream ([`WalFile`], ICR 0087): a segment's epoch, which orders the
+/// stream's segments, and a byte offset in that segment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub struct WalPosition {
+    /// The segment's epoch.
+    pub epoch: u32,
+    /// The byte offset in the segment.
+    pub offset: u64,
 }
 
 /// How much [`check`] read.
@@ -326,8 +339,14 @@ impl CheckReport {
                     segment_size: w.segment_size,
                     segments: w.segments,
                     records: w.records,
-                    checkpoint: w.checkpoint,
-                    end: w.end,
+                    checkpoint: WalPosition {
+                        epoch: w.checkpoint.0,
+                        offset: u64::from(w.checkpoint.1),
+                    },
+                    end: WalPosition {
+                        epoch: w.end.0,
+                        offset: w.end.1,
+                    },
                     end_slot: w.end_slot,
                 })
                 .collect(),

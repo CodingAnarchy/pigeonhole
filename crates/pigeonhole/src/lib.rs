@@ -158,7 +158,7 @@ pub mod nonblocking;
 pub use cell::{Cell, CellEntry, CellRef, Row, RowRef, Value};
 pub use check::{
     CheckCounts, CheckOptions, CheckReport, Finding, Region, RegionKind, Severity, Structure,
-    WalFile, check,
+    WalFile, WalPosition, check,
 };
 pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
