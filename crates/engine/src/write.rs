@@ -1102,6 +1102,9 @@ impl Txn {
                 qualifier: Some(qualifier.to_vec()),
             },
         );
+        // A read at the snapshot alone, never overlaid with this transaction's own writes:
+        // a counter's result may be kept as a checkpoint (D291), which must hold committed
+        // operands only. A read-your-writes overlay must not checkpoint.
         self.engine
             .get(&self.snapshot, table, family, row, qualifier)
     }

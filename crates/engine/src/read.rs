@@ -15,7 +15,7 @@ use pigeonhole_format::key::{
 use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
-use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, Timestamp};
+use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, TabletId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
@@ -1698,6 +1698,28 @@ fn point_resolver() -> Resolver {
     Resolver::new(MergingCursor::new(Vec::new()), ResolveOptions::new(0, 0))
 }
 
+/// Entries a counter get folds before it leaves its result behind as a checkpoint (D291,
+/// the default of `EngineOptions::counter_checkpoint_steps`): a hot counter's reads then fold
+/// about this many entries, and the shard keeps at most one checkpoint per this many
+/// operands.
+pub(crate) const CHECKPOINT_STEPS: u64 = 128;
+
+/// A counter get's result, to be kept as a base (D291): `Put` at `(column, ts, seqno)` of
+/// `stored`, the column's value at `seqno`, the newest entry the get's fold read. Sent to the
+/// row's shard, which inserts it only while that entry is in its active memtable.
+#[derive(Debug)]
+pub(crate) struct CounterCheckpoint {
+    pub shard: pigeonhole_runtime::ShardId,
+    pub table: TableId,
+    pub tablet: TabletId,
+    pub family: FamilyId,
+    pub row: Vec<u8>,
+    pub qualifier: Vec<u8>,
+    pub ts: Timestamp,
+    pub seqno: Seqno,
+    pub stored: Vec<u8>,
+}
+
 /// A point get through `view` at `seqno`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_in<const CACHE_ONLY: bool>(
@@ -1714,6 +1736,11 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
         let got = get_with::<CACHE_ONLY>(
             resolver, view, seqno, now, table, family, row, qualifier, pin,
         );
+        // A counter group's fold (D291): only counter families set it, and every get takes
+        // it, so it is always this get's.
+        if let Some(fold) = resolver.take_counter_fold() {
+            note_checkpoint(view, fold, &got, table, family, row, qualifier);
+        }
         // Whatever happened, the sources (each pins its memtable or SST) and the options
         // (merge operator, blob reader) go now; only the allocations stay.
         let cursor = resolver.cursor_mut();
@@ -1858,6 +1885,46 @@ fn get_with<const CACHE_ONLY: bool>(
             }
         }
     }
+}
+
+/// Hands a counter get's result to its row's shard as a checkpoint (D291), when its fold
+/// read at least the writer's checkpoint steps. Out of line: a get pays only for taking the
+/// resolver's fold record, which only a counter group sets.
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn note_checkpoint(
+    view: &View,
+    (steps, top): (u64, Seqno),
+    got: &Result<Option<CellData>>,
+    table: TableId,
+    family: FamilyId,
+    row: &[u8],
+    qualifier: &[u8],
+) {
+    let Some(sink) = view.checkpoint_sink() else {
+        return;
+    };
+    let Ok(Some(cell)) = got else {
+        return;
+    };
+    if steps < sink.steps {
+        return;
+    }
+    let Some((tablet, shard)) = view.tablets().route(table, row) else {
+        return;
+    };
+    (sink.send)(CounterCheckpoint {
+        shard,
+        table,
+        tablet,
+        family,
+        row: row.to_vec(),
+        qualifier: qualifier.to_vec(),
+        ts: cell.timestamp(),
+        seqno: top,
+        stored: cell.stored().to_vec(),
+    });
 }
 
 fn missing_entry() -> Error {

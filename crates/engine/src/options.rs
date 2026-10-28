@@ -67,6 +67,11 @@ pub struct EngineOptions {
     pub block_cache_bytes: usize,
     /// Row cache capacity in bytes (0 disables it; writer process only, D201).
     pub row_cache_bytes: usize,
+    /// A counter get that folds at least this many entries leaves its result in the active
+    /// memtable as a base, so the counter's next reads stop there (D291; default 128, 0
+    /// turns it off). Writer process only. For tests and benchmarks.
+    #[doc(hidden)]
+    pub counter_checkpoint_steps: u64,
     /// Largest encoded family row the row cache stores (default 4 KiB).
     pub row_cache_max_row: usize,
     /// `(table, family)` names the row cache serves; empty means every family.
@@ -228,6 +233,7 @@ impl EngineOptions {
             memtable_freeze_bytes: memtable_budget / 4,
             block_cache_bytes: 256 << 20,
             row_cache_bytes: 0,
+            counter_checkpoint_steps: crate::read::CHECKPOINT_STEPS,
             row_cache_max_row: 4 << 10,
             row_cache_families: Vec::new(),
             shm_dir: None,

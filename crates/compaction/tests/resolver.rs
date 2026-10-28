@@ -17,7 +17,20 @@ use pigeonhole_sim::Rng;
 use proptest::prelude::*;
 
 fn check_history(seed: u64, n: usize) {
-    let h = random_history(seed, commits(n));
+    check_history_of(seed, random_history(seed, commits(n)));
+}
+
+/// D291: counter checkpoints, `Put`s of a read's result at the seqno of the newest entry its
+/// fold read, change no read at any read point, through every read the harness makes.
+fn check_counter_checkpoints(seed: u64, n: usize) {
+    let mut h = counter_history(seed, commits(n));
+    let mut rng = Rng::new(seed ^ 0xc4ec);
+    let reads = 1 + rng.below(6) as usize;
+    add_checkpoints(&mut h, &mut rng, reads);
+    check_history_of(seed, h);
+}
+
+fn check_history_of(seed: u64, h: History) {
     let mut rng = Rng::new(seed ^ 0x5eed);
     let max = h.model.snapshot();
     for _ in 0..if cfg!(miri) { 1 } else { 4 } {
@@ -60,6 +73,12 @@ proptest! {
     #[test]
     fn resolver_matches_model(seed in any::<u64>(), commits in 1usize..40) {
         check_history(seed, commits);
+    }
+
+    /// D291: counter checkpoints change no read.
+    #[test]
+    fn counter_checkpoints_change_no_read(seed in any::<u64>(), commits in 1usize..40) {
+        check_counter_checkpoints(seed, commits);
     }
 }
 

@@ -2760,3 +2760,65 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
 - `drivers_hold_shards_round_robin_and_handlers_return_in_order` checks placement, thread names and the handler order.
 - `a_driver_charges_its_spin_to_the_shards_that_worked` checks the spin split. Charging every shard fails it.
 - `pigeonhole/tests/model.rs` takes `PIGEONHOLE_SHARD_THREADS=k`. Sweeps run it with 1 and 2.
+
+<a id="d291"></a>
+## D291 — A counter get that folds many operands keeps its result as a base in the active memtable (ctr274, 2026-10-27; compaction, engine, pigeonhole, #713, D280; refines D186, D287)
+**Why.** After D287 a hot counter's read still folded every operand in the active memtable, about 26 ns each. On the AX102 the counter-read p99 was 4.0–4.5 ms against RocksDB's 1.5–1.8 ms (#992's A/B). Locally a read over 1 ms folded 2^15–2^18 memtable operands, and only about 1.5 SST entries (#713 comment 6456964876). Cheaper steps can't bound a fold that grows with skew and memtable size, so the fold itself has to be bounded.
+
+**(a) A counter group read for its newest version ends at its base** (`CellResolver::group`).
+- **The condition:** `versions == 1` and no time range (point gets, newest-version row reads and scans).
+- **Why it's safe:** below the base are only older operands, which the base already holds, and older deletes, which in a counter family hide only entries older than themselves (`cover_seqno`, D186).
+- **What it skips:** the resolver seeks past the column. The walk it skips had only one effect, `col_cover` for older timestamp groups, which such a read never returns.
+- **Kept:** multi-version and time-range reads still walk the whole group.
+
+**(b) The checkpoint.**
+- **When:** a writer-process point get of a counter family, sync or in a transaction, folds at least `EngineOptions::counter_checkpoint_steps` entries (default 128; 0 turns it off; `Options::counter_checkpoint_steps`, doc-hidden).
+- **What the get does:** it sends the row's shard `ShardMsg::CounterCheckpoint`, holding its result and the seqno `s_top` of the newest entry its fold read (`CellResolver::counter_fold`).
+- **What the shard does:** it inserts `Put` at `(column, ts, s_top)` with that value into its active memtable.
+  - It isn't logged and raises no row epoch.
+  - It reserves and waits for no room and counts as no write load.
+  - It's dropped unless all of these hold:
+    - the shard is open, not replaying and not poisoned;
+    - the row still routes to this shard and tablet;
+    - the family is still the same table's counter family;
+    - two arena chunks are free beyond what admitted writes reserved;
+    - the slot is open and below its freeze threshold;
+    - **the entry at `(column, ts, s_top)` is in the active memtable, and isn't a `Put`.**
+  - Counters: `Engine::counter_checkpoints` (kept, dropped).
+
+**Why no read can tell.**
+- `v(s_top) == v(S)`. `S` was visible, so the read saw every entry of the column at or below `S` (D201's premise), and none lies in `(s_top, S]`.
+- `Put` (0x01) sorts before every other kind at the same `(ts, seqno)` (FORMAT §2). A read at `T >= s_top` folds what is newer onto the base and stops (a). A read below `s_top` never sees it.
+- **Deletes:** a delete at or below `s_top` is already folded into the value. One above it hides the base as it hides every older entry. This is why checkpoints are for counter families only: a standard family's cell delete hides its timestamp whatever the seqno (FORMAT §2).
+- **The operator:** counter families always use the built-in `i64` add. It's associative, and its result is a valid base. Another operator would need both properties.
+- **Transactions:** `Txn::get` reads the snapshot with no overlay of its own writes, so a checkpoint never holds an uncommitted operand. A read-your-writes overlay must not checkpoint.
+- **D275:** at `s_top` rather than `S`, a checkpoint lies above a transaction's snapshot only when a real operand at `s_top` does, so it adds no conflict (perf287's must-fix in the review, #713 comment 6457133257).
+- **The row caches** (D201, D281): no value changes at any seqno, so no epoch is raised.
+- **Reader processes:** they read the base as an ordinary node of the writer's memtable. Their own gets don't checkpoint: they have no shards to send to.
+
+**Why the guard is the entry at `s_top`.**
+- **The memtable's range is unchanged:** the active memtable already holds `s_top`. So D287's disjoint ranges hold, and D227's freeze point doesn't move.
+- **Rotation races drop the checkpoint:** a read whose world changed before the message arrived (the memtable rotated, flushed or moved, or the active memtable is now empty) finds its entry gone, and the checkpoint is dropped. The insert and the guard run on the shard thread, as freezes and tablet changes do.
+
+**Flush, compaction and durability need no change.** A `Put` under operands is a base: D287's flush and D186's GC fold the operands above it onto it per stripe. Every seqno of a frozen memtable is durable before it freezes (D227), so an SST's checkpoint never holds a lost increment, and replay rebuilds a memtable's operands without it.
+
+**The memtable.** A checkpoint is the first insert that lands inside a column's run rather than at its front. Its stale tail (D194, D277) is its successor's, a later node of the same column. That's valid for a skip that finishes the column, in the writer's process and for a reader that checks every tail.
+
+**Where it runs.** Every point get, sync or async, goes through `get_in`, whose closure takes the resolver's fold record after the get (only counter groups set it). A fold record hands the result to a cold function that sends it through the view's sink. The sink is in the writer's `LiveViews`, reached through the view's pin, and is absent in reader processes and forked children. `get_with` itself is unchanged: a checkpoint argument there changed what the compiler inlined into every point get (+1–3% instructions, D193).
+
+**Cost (CI x86 callgrind, D193).** The resolver reads counter groups in an instance of their own (`group::<true>`). `locate_key`, `common_prefix_len` and `split_suffix` are always inlined: with two instances the compiler stopped inlining them, which cost hot-row reads about 14 instructions a cell. A counter group records its fold only when it reaches `COUNTER_FOLD_MIN`, the shortest `counter_checkpoint_steps` any open engine set, so short folds take no cold call. Net against the base: hot-row and `versions` −0.2% to −0.4%, and `counter` +0.49%, the fold accounting itself. `counter`'s threshold is 0.8% under D195.
+
+**Not covered yet:** row reads of counters. They read through the same resolver, so (a) applies, but they don't send checkpoints. A write-side checkpoint for counters that are written heavily but rarely read is a follow-up, only if the gate's p99.9 shows it matters.
+
+**Measured** (local, `counters --scale full --threads 16`, buffered): counter-read p99 2.5–3.9 ms → 33 µs, p99.9 4–5 ms → 116–161 µs, and throughput 150K → 210–290K ops/s. The box A/B against main follows on the PR.
+
+**Tests:**
+- **compaction:**
+  - `counter_checkpoints_change_no_read`: random counter histories with checkpoints at random read points, every read the harness makes, against the model;
+  - `compaction_preserves_reads_with_counter_checkpoints`: leveled, tiered, and with rows split across another source.
+- **memtable:** `a_node_inserted_inside_a_columns_run_keeps_the_stale_tails_valid`, through the writer's reader and one from shared memory.
+- **engine `counter_checkpoints.rs`:**
+  - kept, with reads above, below and across a flush;
+  - dropped when its entry left the active memtable (empty, or holding newer entries);
+  - a transaction between `s_top` and the read point commits without `Conflict`.
+- **pigeonhole:** `PIGEONHOLE_CHECKPOINT_STEPS=1` runs the model check with a checkpoint after nearly every counter read, under flushes, compactions, tablet changes and reopens.

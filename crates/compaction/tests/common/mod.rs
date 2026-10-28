@@ -110,6 +110,52 @@ fn history_of(seed: u64, commits: usize, counter: Option<bool>) -> History {
     h
 }
 
+/// Adds counter checkpoints to a counter family's history (D291), as the engine keeps them:
+/// at `reads` random read points, every column's newest-version get that produced a value
+/// leaves it as a `Put` at the seqno of the newest entry its fold read, unless that key is
+/// taken. The model is unchanged: no read at any seqno may tell. Returns how many it added.
+pub fn add_checkpoints(h: &mut History, rng: &mut Rng, reads: usize) -> usize {
+    assert!(h.family.counter, "checkpoints are for counter families");
+    // Every fold is recorded, as for an engine checkpointing after one entry.
+    pigeonhole_compaction::COUNTER_FOLD_MIN.fetch_min(1, std::sync::atomic::Ordering::Relaxed);
+    let max = h.model.snapshot();
+    let mut added = 0;
+    for _ in 0..reads {
+        let snapshot = 1 + rng.below(max.max(1));
+        let now = h.last_ts + rng.below(400);
+        for row in ROWS {
+            for q in QUALS {
+                let mut sorted: Vec<(Vec<u8>, Vec<u8>)> = h
+                    .entries
+                    .iter()
+                    .map(|(k, v, _)| (k.clone(), v.clone()))
+                    .collect();
+                sorted.sort();
+                let mut r = CellResolver::new(
+                    MergingCursor::new(vec![VecCursor::new(sorted)]),
+                    options(h, snapshot, now, 1),
+                );
+                r.seek_column(row, q).unwrap();
+                let Ok(Some(cell)) = r.next_cell() else {
+                    continue;
+                };
+                let (ts, value) = (cell.ts, cell.value.to_vec());
+                let Some((_, top)) = r.counter_fold() else {
+                    continue;
+                };
+                let mut key = Vec::new();
+                encode_key(&mut key, row, q, ts, top, Kind::Put).unwrap();
+                if h.entries.iter().any(|e| e.0 == key) {
+                    continue;
+                }
+                h.entries.push((key, value, top));
+                added += 1;
+            }
+        }
+    }
+    added
+}
+
 /// Appends `commits` random commits to `h` and returns their entries. With `later`, only
 /// writes at the commit timestamp (default-timestamp puts, increments, column, family and
 /// row deletes): commit timestamps are multiples of 10 and explicit ones never are, so such

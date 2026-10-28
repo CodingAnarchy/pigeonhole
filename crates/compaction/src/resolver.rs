@@ -320,6 +320,10 @@ pub struct CellResolver<C> {
     out_key: Vec<u8>,
     out_val: Vec<u8>,
     past_col: Vec<u8>,
+
+    /// The last counter group read: how many entries it stepped over, and the seqno of its
+    /// newest entry at or below the read point (D291's checkpoint seqno).
+    fold: Option<(u64, Seqno)>,
 }
 
 /// Entries of a skipped column the resolver steps over before it seeks past the column. A
@@ -328,8 +332,19 @@ pub struct CellResolver<C> {
 /// instead of a step per version; a column with a few versions keeps the cheaper steps.
 const SKIP_STEPS: u32 = 8;
 
+/// The shortest counter fold any open engine checkpoints (D291, its
+/// `counter_checkpoint_steps`; `u64::MAX` while none does): the resolver records a counter
+/// group's fold ([`CellResolver::counter_fold`]) only at this length or more. Process-wide,
+/// lowered by each engine that opens with checkpoints on and never raised: a lower value only
+/// records folds the engines then decline.
+pub static COUNTER_FOLD_MIN: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(u64::MAX);
+
 /// Whether internal key `k` is in column `col` and in row `row` (`col` starts with `row`
-/// when set), from one comparison with `col`.
+/// when set), from one comparison with `col`. Always inlined: `group` has an instance per
+/// family kind (D291), and with two callers the compiler stopped inlining it into the
+/// resolver's loop (+14 instructions per cell on hot-row reads, D193).
+#[inline(always)]
 fn locate_key(k: &[u8], col: &[u8], row: &[u8]) -> (bool, bool) {
     if col.is_empty() {
         let same_row = !row.is_empty() && common_prefix_len(k, row) == row.len();
@@ -342,6 +357,8 @@ fn locate_key(k: &[u8], col: &[u8], row: &[u8]) -> (bool, bool) {
 }
 
 /// The length of the longest common prefix of `a` and `b`, eight bytes at a time.
+// Always inlined, with `locate_key` (D291's two `group` instances, D193).
+#[inline(always)]
 fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let mut i = 0;
@@ -404,6 +421,7 @@ where
             out_key: Vec::new(),
             out_val: Vec::new(),
             past_col: Vec::new(),
+            fold: None,
         };
         debug_assert!(r.is_fresh());
         r
@@ -611,6 +629,21 @@ where
         Ok(())
     }
 
+    /// The last counter group this resolver read (D291): the entries it stepped over, and
+    /// the seqno of its newest entry at or below the read point. A counter's value at the
+    /// read point is its value at that seqno: the read saw every entry of the column at or
+    /// below the read point, and none lies above that one. `None` before any counter group,
+    /// and kept across `reset`: ask only after a counter group was read.
+    pub fn counter_fold(&self) -> Option<(u64, Seqno)> {
+        self.fold
+    }
+
+    /// [`counter_fold`](CellResolver::counter_fold), cleared: a caller that takes it after
+    /// every read knows a fold it finds is that read's.
+    pub fn take_counter_fold(&mut self) -> Option<(u64, Seqno)> {
+        self.fold.take()
+    }
+
     /// The underlying cursor (to pin the current block for a zero-copy value).
     pub fn cursor(&self) -> &C {
         &self.cursor
@@ -672,6 +705,9 @@ where
             out_key,
             out_val,
             past_col,
+            // Set by every counter group before it can be read, so never stale for the read
+            // that asks (and a reset per point get measured 4 instructions, D193).
+            fold: _,
         } = self;
         row.clear();
         *family_cover = None;
@@ -746,6 +782,7 @@ where
             out_key,
             out_val,
             past_col,
+            fold: _,
         } = self;
         [
             row, col, run_key, run_acc, g_acc, g_key, base_key, base_val, out_key, out_val,
@@ -915,7 +952,14 @@ where
                 }
                 continue;
             }
-            if let Some(out) = self.group(ts, seqno, kind)? {
+            // Counter families read their groups in an instance of their own (D291), so the
+            // fold accounting and the stop at the base cost other families nothing.
+            let out = if self.opts.counter {
+                self.group::<true>(ts, seqno, kind)?
+            } else {
+                self.group::<false>(ts, seqno, kind)?
+            };
+            if let Some(out) = out {
                 return Ok(Some(out));
             }
         }
@@ -934,9 +978,14 @@ where
 
     /// Reads the whole `(column, ts)` group the cursor is on and returns its version, if it
     /// produces one now (a group of operands only extends the pending run instead).
-    fn group(&mut self, ts: Timestamp, seqno: Seqno, kind: Kind) -> Result<Option<Out>, C::Error> {
+    fn group<const COUNTER: bool>(
+        &mut self,
+        ts: Timestamp,
+        seqno: Seqno,
+        kind: Kind,
+    ) -> Result<Option<Out>, C::Error> {
         let snapshot = self.opts.snapshot;
-        let counter = self.opts.counter;
+        let counter = COUNTER;
         let expired = self.expired(ts);
         // Timestamp deletes hide the whole group whatever the order. In a counter family a
         // delete hides only older entries: those below `floor`, and those after it in the
@@ -948,6 +997,23 @@ where
         let mut ops_err: Option<MergeError> = None;
         // Copy the base whenever it will be folded (operands above it), not only when small.
         let fold_ready = self.run;
+        // D291: a counter group read for its newest version alone ends at its base. Below the
+        // base are only older entries: operands it already holds, and deletes that in a
+        // counter family hide only entries older than themselves. Their one other effect,
+        // `col_cover`, matters only to older timestamp groups, which such a read never returns.
+        // A visible column delete ends the group too: everything after it is older, so
+        // hidden, and any later delete's cover is within its own. So a counter reset
+        // (`delete_column`) and incremented again doesn't walk its history before the reset.
+        // It may leave the group without a version, so only the group is passed there, not
+        // the column: an older timestamp's version may still be the one returned.
+        let stop_at_base = counter && self.opts.versions == 1 && self.opts.time_range.is_none();
+        let mut stop = false;
+        let mut stop_group = false;
+        // The entries this group read, for D291's checkpoint trigger. Only this group's: a
+        // newer group walked first (hidden, or expired) isn't counted, and needn't be, since
+        // a checkpoint stands in for this group's fold alone.
+        let mut steps = 0u64;
+        let mut top = None;
         // The first entry is in the column (the caller checked); the loop stops on the first
         // that is not, and leaves what it found for the next step.
         let mut first = Some((seqno, kind));
@@ -980,13 +1046,22 @@ where
                     (seqno, kind)
                 }
             };
+            if counter {
+                steps += 1;
+            }
             if seqno <= snapshot && seqno >= floor {
+                if counter && top.is_none() {
+                    top = Some(seqno);
+                }
                 match kind {
                     Kind::ColumnDelete => {
                         raise(&mut self.col_cover, ts);
                         self.col_cover_seqno = self.col_cover_seqno.max(seqno);
                         hidden = true;
+                        stop_group = stop_at_base;
                     }
+                    // Not a cell delete: an older column delete below it in the group still
+                    // raises the cover that older timestamps read.
                     Kind::CellDelete => hidden = true,
                     Kind::Put if !hidden && base == Base::None => {
                         let value = self.cursor.value();
@@ -999,6 +1074,7 @@ where
                         } else {
                             base = Base::Large;
                         }
+                        stop = stop_at_base;
                     }
                     Kind::Merge if !hidden && base == Base::None => {
                         let value = self.cursor.value();
@@ -1018,7 +1094,37 @@ where
                     _ => {}
                 }
             }
+            if stop {
+                // The rest of the column in one seek: the column prefix ends with `00 01`, and
+                // bumping its last byte gives the smallest key past every version of it.
+                self.past_col.clear();
+                self.past_col.extend_from_slice(&self.col);
+                if let Some(last) = self.past_col.last_mut() {
+                    *last += 1;
+                }
+                self.cursor.seek_forward(&self.past_col)?;
+                break;
+            }
+            if stop_group {
+                // The rest of this timestamp's group in one seek: past the largest suffix at
+                // `ts` (seqno 0, the highest kind byte), before the column's older timestamps.
+                self.past_col.clear();
+                self.past_col.extend_from_slice(&self.col);
+                self.past_col
+                    .extend_from_slice(&(Timestamp::MAX - ts).to_be_bytes());
+                self.past_col.extend_from_slice(&[0xff; 9]);
+                self.cursor.seek_forward(&self.past_col)?;
+                break;
+            }
             self.cursor.next()?;
+        }
+        if counter {
+            // Only a fold long enough for some open engine's checkpoint: a short one leaves
+            // nothing for the caller to look at (a cold call per counter get measured +25
+            // instructions, D193).
+            if steps >= COUNTER_FOLD_MIN.load(std::sync::atomic::Ordering::Relaxed) {
+                self.fold = top.map(|top| (steps, top));
+            }
         }
         if (if counter { expired } else { hidden }) || (base == Base::None && !ops) {
             return Ok(None);

@@ -726,9 +726,19 @@ pub(crate) struct LiveViews {
     /// memtable arenas once nothing can read them, D265). Runs after `on_oldest_released`,
     /// outside the lock.
     on_all_released: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// A writer's counter checkpoints (D291): the fold length that asks for one, and where
+    /// it goes (the row's shard). Unset in a reader process, and with checkpoints off.
+    counter_checkpoints: OnceLock<CheckpointSink>,
     /// The process that created it: in a forked child a view dropped leaves the registry
     /// alone and runs no release (#901, perf287's M3).
     owner: u32,
+}
+
+/// Where a writer's counter gets send their checkpoints (D291), and the fold length that asks
+/// for one.
+pub(crate) struct CheckpointSink {
+    pub steps: u64,
+    pub send: Box<dyn Fn(crate::read::CounterCheckpoint) + Send + Sync>,
 }
 
 impl std::fmt::Debug for LiveViews {
@@ -745,6 +755,7 @@ impl Default for LiveViews {
             versions: RegistryLock::new(BTreeMap::new()),
             on_oldest_released: OnceLock::new(),
             on_all_released: OnceLock::new(),
+            counter_checkpoints: OnceLock::new(),
             owner: pigeonhole_io::sys::process_id(),
         }
     }
@@ -785,6 +796,14 @@ impl LiveViews {
     /// Sets what runs when the last live view goes (once; a closed instance's arena
     /// release, D265). It runs on the thread dropping that view, after `on_oldest_released`
     /// and outside this registry's lock.
+    pub(crate) fn on_counter_checkpoint(
+        &self,
+        steps: u64,
+        send: Box<dyn Fn(crate::read::CounterCheckpoint) + Send + Sync>,
+    ) {
+        let _ = self.counter_checkpoints.set(CheckpointSink { steps, send });
+    }
+
     pub(crate) fn on_all_released(&self, f: Box<dyn Fn() + Send + Sync>) {
         let _ = self.on_all_released.set(f);
     }
@@ -963,6 +982,16 @@ impl View {
     /// The tablet map.
     pub fn tablets(&self) -> &TabletMap {
         &self.tablets
+    }
+
+    /// Where a counter get through this view sends its checkpoint (D291): a writer's views,
+    /// in the process that opened it, with checkpoints on.
+    pub(crate) fn checkpoint_sink(&self) -> Option<&CheckpointSink> {
+        let registry = &self._pin.as_ref()?.registry;
+        if registry.owner != pigeonhole_io::sys::process_id() {
+            return None;
+        }
+        registry.counter_checkpoints.get()
     }
 
     pub(crate) fn memtables(

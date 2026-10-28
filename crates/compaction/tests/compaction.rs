@@ -118,9 +118,18 @@ enum Choose {
     Tiered,
 }
 
-fn check_compaction(seed: u64, commits: usize, choose: Choose) {
-    let mut h = random_history(seed, common::commits(commits));
+/// With `checkpoints`, a counter family's history with D291's checkpoints among its entries.
+fn check_compaction(seed: u64, commits: usize, choose: Choose, checkpoints: bool) {
+    let mut h = if checkpoints {
+        counter_history(seed, common::commits(commits))
+    } else {
+        random_history(seed, common::commits(commits))
+    };
     let mut rng = Rng::new(seed ^ 0xc0c0);
+    if checkpoints {
+        let reads = 1 + rng.below(6) as usize;
+        add_checkpoints(&mut h, &mut rng, reads);
+    }
     let mut db = Db::new(seed);
     let mut family = family_options(&h);
     // Separate nothing, the 5000-byte values, or every bytes value longer than two bytes.
@@ -432,9 +441,13 @@ fn drain_resolved<C: pigeonhole_format::Cursor<Error = pigeonhole_compaction::Er
 /// across files), keeps every read at every live snapshot and after later writes. With the
 /// other source listed, bottommost deletes purge by the seqno rule; unlisted (`None`), they
 /// purge only by the timestamp rule.
-fn check_counter_purge(seed: u64, commits: usize) {
+fn check_counter_purge(seed: u64, commits: usize, checkpoints: bool) {
     let mut h = counter_history(seed, common::commits(commits));
     let mut rng = Rng::new(seed ^ 0x290);
+    if checkpoints {
+        let reads = 1 + rng.below(6) as usize;
+        add_checkpoints(&mut h, &mut rng, reads);
+    }
     let mut db = Db::new(seed);
     let family = family_options(&h);
     let max = h.model.snapshot();
@@ -553,27 +566,37 @@ proptest! {
     /// Done-when (2): no compaction changes any read result at any live snapshot.
     #[test]
     fn compaction_preserves_reads_at_live_snapshots(seed in any::<u64>(), commits in 1usize..40) {
-        check_compaction(seed, commits, Choose::Random);
+        check_compaction(seed, commits, Choose::Random, false);
     }
 
     /// #290: counter-family purges with rows split across the inputs and another source.
     #[test]
     fn counter_purges_preserve_reads_with_other_sources(seed in any::<u64>(), commits in 1usize..40) {
-        check_counter_purge(seed, commits);
+        check_counter_purge(seed, commits, false);
+    }
+
+    /// D291: counter checkpoints compact like any base: every read at every live snapshot
+    /// is unchanged, through leveled and tiered compactions and with rows split across the
+    /// inputs and another source.
+    #[test]
+    fn compaction_preserves_reads_with_counter_checkpoints(seed in any::<u64>(), commits in 1usize..40) {
+        check_compaction(seed, commits, Choose::Random, true);
+        check_compaction(seed, commits, Choose::Tiered, true);
+        check_counter_purge(seed, commits, true);
     }
 
     /// Issue #31: the same for the tiered picker's compactions.
     #[test]
     fn tiered_compaction_preserves_reads_at_live_snapshots(seed in any::<u64>(), commits in 1usize..40) {
-        check_compaction(seed, commits, Choose::Tiered);
+        check_compaction(seed, commits, Choose::Tiered, false);
     }
 }
 
 #[test]
 fn compaction_preserves_reads_fixed_seeds() {
     for seed in 0..if cfg!(miri) { 1 } else { 48 } {
-        check_compaction(seed, 35, Choose::Random);
-        check_compaction(seed, 35, Choose::Tiered);
+        check_compaction(seed, 35, Choose::Random, false);
+        check_compaction(seed, 35, Choose::Tiered, false);
     }
 }
 
@@ -585,8 +608,8 @@ fn compaction_preserves_reads_fixed_seeds() {
     ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
 )]
 fn counter_versions_outlive_newer_expired_buckets() {
-    check_compaction(1_601_955_561_661_789_700, 30, Choose::Random);
-    check_compaction(11_470_003_444_189_223_303, 6, Choose::Tiered);
+    check_compaction(1_601_955_561_661_789_700, 30, Choose::Random, false);
+    check_compaction(11_470_003_444_189_223_303, 6, Choose::Tiered, false);
 }
 
 /// Issue #32: the FIFO-by-time picker's drops of expired SSTs, and its merges of L0 files,

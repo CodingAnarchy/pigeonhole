@@ -1160,6 +1160,27 @@ impl Engine {
                 shared.release_memory();
             }
         }));
+        // Counter checkpoints (D291): a get through one of this writer's views hands its
+        // result to the row's shard. Best effort: before the runtime starts, or once the
+        // engine is gone or its inbox closed, the checkpoint is dropped.
+        if options.counter_checkpoint_steps > 0 {
+            pigeonhole_compaction::COUNTER_FOLD_MIN.fetch_min(
+                options.counter_checkpoint_steps,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let weak = Arc::downgrade(&shared);
+            live_views.on_counter_checkpoint(
+                options.counter_checkpoint_steps,
+                Box::new(move |c: crate::read::CounterCheckpoint| {
+                    if let Some(shared) = weak.upgrade()
+                        && let Some(submitters) = shared.submitters.get()
+                    {
+                        let shard = usize::from(c.shard.0);
+                        let _ = submitters[shard].submit(ShardMsg::CounterCheckpoint(Box::new(c)));
+                    }
+                }),
+            );
+        }
         let mut states: Vec<ShardState> = Vec::with_capacity(shards);
         let flushed: HashMap<(TabletId, FamilyId), Seqno> =
             catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect();
@@ -2534,6 +2555,18 @@ impl Engine {
         }
         let _guard = inner.enter_maintenance()?;
         crate::maintenance::shrink(&inner.shared)
+    }
+
+    /// Counter checkpoints (D291) the shards kept, and those they dropped, since open. For
+    /// tests and benchmarks.
+    #[doc(hidden)]
+    pub fn counter_checkpoints(&self) -> (u64, u64) {
+        self.inner.shared.metrics.iter().fold((0, 0), |(k, d), m| {
+            (
+                k + m.checkpoints.load(Ordering::Relaxed),
+                d + m.checkpoints_dropped.load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// What the row cache did since open (D201); all zero when it is off. In a reader process,
