@@ -211,9 +211,12 @@ impl Options {
         self
     }
 
-    /// Number of shard threads (default: one per physical core the process may run on, D220;
-    /// SMT siblings count once, and a cgroup CPU quota still caps it). `1` is a valid
-    /// single-threaded configuration.
+    /// Number of shards, the data partitions each row belongs to (default: one per physical
+    /// core the process may run on, D220; SMT siblings count once, and a cgroup CPU quota
+    /// still caps it). Each shard runs on a thread of its own unless
+    /// [`shard_threads`](Options::shard_threads) or
+    /// [`adaptive_shard_threads`](Options::adaptive_shard_threads) says otherwise (D289).
+    /// `1` is a valid configuration.
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
         self
