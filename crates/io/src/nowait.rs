@@ -225,7 +225,10 @@ mod tests {
         // perf287's review of #1018: two readers that both saw one skip left took the
         // count from 1 to 0 and then to u32::MAX, opening the breaker for good.
         let backend = Backend::default();
-        for round in 0..2000 {
+        // Miri runs threads interleaved one step at a time: a few rounds there (the
+        // thousands are for real threads racing).
+        let rounds = if cfg!(miri) { 4 } else { 2000 };
+        for round in 0..rounds {
             let file = FileState::default();
             file.skip.store(2, Relaxed);
             let start = Barrier::new(8);
