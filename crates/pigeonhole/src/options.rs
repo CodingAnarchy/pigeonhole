@@ -85,7 +85,6 @@ pub enum CpuProfile {
 }
 
 /// Which failures [`Options::auto_recover`] recovers from in place (D265, #620).
-#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[non_exhaustive]
 pub enum Recovery {
@@ -929,10 +928,10 @@ pub enum Compaction {
 /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument).
 ///
 /// ```
-/// use pigeonhole::{days, Family, Priority};
+/// use pigeonhole::{days, Compression, Family, Priority};
 ///
 /// let hot = Family::default().max_versions(1).cache_priority(Priority::High);
-/// let expiring = Family::default().ttl(days(30)).uncompressed();
+/// let expiring = Family::default().ttl(days(30)).compression(Compression::None);
 /// assert_ne!(hot, expiring);
 /// let hits = Family::counter();
 /// let daily = Family::counter().ttl(days(90));
@@ -1026,24 +1025,28 @@ impl Family {
         self
     }
 
-    /// LZ4 block compression (the default).
-    pub fn lz4(mut self) -> Self {
-        self.options.compression = Compression::Lz4;
-        self
-    }
-
-    /// zstd block compression at `level` (libzstd's levels: 1 to 22, higher is smaller and
-    /// slower to write; negative levels are faster; 0 and the default are 3). Smaller files
-    /// than LZ4 for most data, at a higher CPU cost to write and read.
-    pub fn zstd(mut self, level: i8) -> Self {
-        self.options.compression = Compression::Zstd;
-        self.options.compression_level = level;
-        self
-    }
-
-    /// No block compression (hot, small families).
-    pub fn uncompressed(mut self) -> Self {
-        self.options.compression = Compression::None;
+    /// Block compression (ICR 0086; default [`Compression::Lz4`](crate::Compression::Lz4)):
+    /// - [`Compression::Lz4`](crate::Compression::Lz4): fast, the default;
+    /// - [`Compression::Zstd(level)`](crate::Compression::Zstd): smaller files than LZ4 for most
+    ///   data, at a higher CPU cost to write and read, at a libzstd level (1 to 22, higher is
+    ///   smaller and slower to write; negative levels are faster; 0 means 3);
+    /// - [`Compression::None`](crate::Compression::None): stored as is (hot, small families).
+    ///
+    /// ```
+    /// use pigeonhole::{Compression, Family};
+    ///
+    /// let archive = Family::default().compression(Compression::Zstd(9));
+    /// # let _ = archive;
+    /// ```
+    pub fn compression(mut self, compression: crate::Compression) -> Self {
+        match compression {
+            crate::Compression::None => self.options.compression = Compression::None,
+            crate::Compression::Lz4 => self.options.compression = Compression::Lz4,
+            crate::Compression::Zstd(level) => {
+                self.options.compression = Compression::Zstd;
+                self.options.compression_level = level;
+            }
+        }
         self
     }
 

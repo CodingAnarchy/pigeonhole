@@ -49,7 +49,7 @@ fn pass(t: &Table) -> (u64, u64) {
         rows += 1;
         bytes += (0..row.len())
             .filter_map(|i| row.entry(i))
-            .map(|(_, _, c)| c.value().len() as u64)
+            .map(|e| e.cell.value().len() as u64)
             .sum::<u64>();
     }
     (rows, bytes)

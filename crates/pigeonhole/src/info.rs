@@ -134,15 +134,16 @@ pub struct FamilyInfo {
     pub compaction: Compaction,
 }
 
-/// A family's block compression ([`FamilyInfo::compression`]).
+/// A family's block compression: set with [`Family::compression`], read back in
+/// [`FamilyInfo::compression`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Compression {
-    /// Stored as is ([`Family::uncompressed`]).
+    /// Stored as is.
     None,
-    /// LZ4, the default ([`Family::lz4`]).
+    /// LZ4, the default.
     Lz4,
-    /// zstd at this level ([`Family::zstd`]).
+    /// zstd at this libzstd level (1 to 22; 0 means 3).
     Zstd(i8),
 }
 
@@ -289,7 +290,7 @@ mod tests {
             .ttl(days(7))
             .bloom_bits(0)
             .blob_threshold(1024)
-            .zstd(5)
+            .compression(crate::Compression::Zstd(5))
             .block_size(8192)
             .cache_priority(Priority::High)
             .compaction(Compaction::Tiered);

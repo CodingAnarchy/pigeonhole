@@ -105,7 +105,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `backup_durable(&self, dest: impl AsRef<Path>) -> Result<()>` | As `backup`, at a durable snapshot: the copy holds only commits durable here at their level. |
 | `is_failed(&self) -> bool` | Whether the instance failed: a shard panicked, an application-owned driver was dropped before `close`, a shard stopped after a WAL I/O error or an internal error, or a manifest commit failed (ICR 0040). One atomic load. Recovery: [recovery.md](recovery.md). |
 | `recovery_stats(&self) -> RecoveryStats` | What automatic recovery (`Options::auto_recover`, D265) did: `generation` (1 at open, +1 per recovery; engine metrics restart at each), `recoveries`, `gave_up`, `last_failure`, `last_recovery`. All zero and `false` with the option off. One lock, no I/O. |
-| `failure(&self) -> Option<Failure>` | The first failure: `Failure { shard: u32, cause: FailureCause }` (`#[repr(C)]`; `shard` is `Failure::MAIN_FILE` for the main file; `FailureCause` `#[repr(u8)]`: `Panic` 1, `DriverDropped` 2, `Io` 3, `Internal` 4). Later failures don't replace it. |
+| `failure(&self) -> Option<Failure>` | The first failure: `Failure { shard: u32, cause: FailureCause }` (`shard` is `Failure::MAIN_FILE` for the main file; `FailureCause` `#[repr(u8)]`: `Panic` 1, `DriverDropped` 2, `Io` 3, `Internal` 4). Later failures don't replace it. |
 | `close(self) -> Result<()>` | Flushes memtables, checkpoints the WAL; the last handle out removes the sidecars and shm, leaving one file. |
 
 `PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`, `durable_snapshot() -> Result<Snapshot>`, `backup(dest)` / `backup_durable(dest)`, `info() -> Result<DatabaseInfo>`, `row_cache_stats() -> RowCacheStats` (D281; `write_throughs` stays 0, a reader applies no commits), `io_rings()`, `async_sync_reads()`. No write methods.
@@ -156,9 +156,7 @@ Test and bench hooks are not in this table: `vfs`, `wal_segment_size`, `tablet_b
 | `ttl(Duration)` | Expire cells older than this by timestamp. |
 | `bloom_bits(u8)` | Filter bits per key (0 off; default 10). |
 | `blob_threshold(u32)` | Values longer than this go to blob files at flush or compaction (default 4096; `u32::MAX` never). Blob records are not compressed. Blob GC rewrites files that are half garbage; `compact()` empties every file with garbage. |
-| `lz4()` | Default compression. |
-| `zstd(i8)` | zstd blocks at a libzstd level (1–22, higher smaller and slower; default 3). |
-| `uncompressed()` | No compression. |
+| `compression(Compression)` | Block compression (ICR 0086): `Compression::Lz4` (default), `Compression::Zstd(level)` (libzstd level 1–22, higher smaller and slower; 0 means 3), `Compression::None`. `FamilyInfo::compression` reads it back. |
 | `block_size(u32)` | Data block bytes (default 16 KiB). |
 | `merge_operator(&str)` | Name of a registered operator (unregistered: `UnknownMergeOperator`) for `merge` operands. Counters use `Family::counter()` instead; `"pigeonhole.i64_add"` on an ordinary family makes a 0.1.0-style family. |
 | `cache_priority(Priority)` | Block cache priority. |
@@ -235,8 +233,7 @@ Test and bench hooks are not in this table: `vfs`, `wal_segment_size`, `tablet_b
 | `qualifier_range(impl RangeBounds<&K>)`, `qualifier_bounds(Bound<&[u8]>, Bound<&[u8]>)` | ✓ | ✓ |
 | `latest()` (default), `versions(u32)` (0 = all retained) | ✓ | ✓ |
 | `time_range(Range<u64>)` | ✓ | ✓ |
-| `column_limit(u32)` | ✓ | |
-| `columns_per_row(u32)` | | ✓ |
+| `column_limit(u32)` | ✓ | ✓ |
 | `value_filter(ValueFilter)` | ✓ | ✓ |
 | `limit(u64)` rows (0: none) | | ✓ |
 | `snapshot(&Snapshot)` | ✓ | ✓ |
@@ -253,7 +250,7 @@ Pushdown (D22): qualifier and time filters in the block decoder; versions, colum
 | `CellRef<'a>` | `value() -> &[u8]`, `typed() -> Value<'_>`, `as_i64() -> Option<i64>`, `timestamp() -> u64`, `to_owned() -> Cell` |
 | `Cell` (owned, `'static`, `Send + Sync`) | `value`, `typed`, `as_i64`, `timestamp` |
 | `RowRef<'a>` | `key() -> &[u8]`, `len()`, `is_empty()`, `entry(i) -> Option<CellEntry<'_>>`, `iter()`, `get(family, qualifier) -> Option<CellRef<'_>>`, `to_owned() -> Row` |
-| `Row` (owned) | `key()`, `len()`, `is_empty()`, `entry(i) -> Option<(&str, &[u8], &Cell)>`, `get(family, qualifier) -> Option<&Cell>`, `view() -> RowRef<'_>` |
+| `Row` (owned) | `key()`, `len()`, `is_empty()`, `entry(i) -> Option<CellEntry<'_>>` (as on `RowRef`, ICR 0086), `get(family, qualifier) -> Option<&Cell>`, `view() -> RowRef<'_>` |
 | `CellEntry<'a>` | public fields `family: &str`, `qualifier: &[u8]`, `cell: CellRef<'a>` |
 | `Value<'a>` | `Bytes(&[u8])`, `I64(i64)`, `F64(f64)`, `Varint(i64)` |
 | `CommitInfo` | `seqno`, `durability` |
@@ -278,7 +275,7 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 | `Transaction::get_async(&mut self, &Table, row, family, qualifier) -> GetFuture` | Read recorded at the call (a dropped future still counts at commit). |
 | `Pigeonhole::flush_async(&self)` / `compact_async(&self) -> MaintenanceFuture` | `Output = Result<()>`; dropping does not stop it. |
 | `WriteBatch::commit_with_ticket(self, Durability) -> Result<CommitTicket>` | No feature needed. `CommitTicket`: `wait(self)`, `try_result(&mut self) -> Option<Result<CommitInfo>>`, `seqno(&mut self) -> Option<u64>`; `IntoFuture` with `async`. |
-| `Pigeonhole::async_sync_reads(&self) -> u64` (also `PigeonholeReader`) | Reads an async call did synchronously (oversized blob, uncacheable block, unpredicted scan block; #398). |
+| `EngineMetrics::async_sync_reads` (writer; `PigeonholeReader::async_sync_reads(&self) -> u64` in a reader) | Reads an async call did synchronously (oversized blob, uncacheable block, unpredicted scan block; #398). |
 
 Backpressure (D210): each shard holds at most ½ `memtable_budget` of async commits submitted and not yet resolved; over it, a commit future waits (arrival order) and submits when polled with room. Blocking commits and `commit_with_ticket` are never held or counted.
 Dropping a read future or stream: always safe. Dropping a ticket, or a commit future that has submitted: the commit still lands or fails atomically. **Dropping a commit future still waiting for room writes nothing** (fire-and-forget `let _ = ..commit_async()` can lose the commit over the bound; use `commit_with_ticket` to submit without awaiting).

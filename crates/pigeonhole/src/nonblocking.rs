@@ -17,7 +17,7 @@
 //! read runs again once it is cached; such a read, and a read at a snapshot, takes its read
 //! point on the first poll, so every attempt sees the same data. Dropping a read future is
 //! always safe. Two cases read synchronously, counted by
-//! [`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads) (D196, #398):
+//! [`EngineMetrics::async_sync_reads`](crate::EngineMetrics::async_sync_reads) (D196, #398):
 //! - a separated value too large to cache (above an eighth of the block cache, at most
 //!   1 MiB): inside `get_async` or `read_async` itself when the rest of the read hits at
 //!   the call, else inside the future;

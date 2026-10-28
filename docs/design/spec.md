@@ -94,7 +94,7 @@ let db = Pigeonhole::open("crawl.phdb", Options::default())?;
 let pages = db.table("pages")?
     .family("meta", Family::default().max_versions(1))
     .family("links", Family::default().bloom_bits(10))
-    .family("body", Family::default().blob_threshold(4096).zstd(3).ttl(days(30)))
+    .family("body", Family::default().blob_threshold(4096).compression(Compression::Zstd(3)).ttl(days(30)))
     .create_if_missing()?;
 
 // Single-row atomic mutation
@@ -325,7 +325,7 @@ Supporting choices:
 
 ### Scans
 - The block iterator decodes lazily and applies qualifier, version, and time filters before materializing cells.
-- Row-start tables let `columns_per_row(n)` and "latest only" skip the remainder of a wide row in O(1) per block.
+- Row-start tables let `column_limit(n)` and "latest only" skip the remainder of a wide row in O(1) per block.
 - An Arrow export path yields `RecordBatch`es (row, family, qualifier, ts, value) for handoff to DuckDB or Polars without per-cell allocation.
 
 ### How it will be measured

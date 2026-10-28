@@ -27,7 +27,7 @@ Families are declared when a table is created (adding one later is cheap). Each 
 | `ttl(d)` | Cells whose timestamp is older than *d* expire. |
 | `bloom_bits(b)` | Bloom filter bits per key, to skip files on misses. |
 | `blob_threshold(bytes)` | Values larger than this (default 4096; `u32::MAX` never) move to blob files when they are flushed or compacted; the family's tree keeps a 16-byte pointer, so compaction and scans of other columns do not copy them. Blob GC rewrites a blob file once it is about half garbage, and `compact()` empties every file with garbage. Blob records are not compressed: for large compressible values, raise the threshold to keep them inline. |
-| compression | LZ4 by default; `uncompressed()`; `zstd(level)`: smaller blocks than LZ4 for more CPU, at libzstd levels 1–22 (higher is smaller and slower; negative is faster; default 3). |
+| compression | `compression(Compression)`: `Lz4` by default; `None`; `Zstd(level)`: smaller blocks than LZ4 for more CPU, at libzstd levels 1–22 (higher is smaller and slower; negative is faster; default 3). |
 | cache priority | How long the family's blocks stay cached. |
 
 ### Compaction styles
@@ -94,7 +94,7 @@ From 1.0.0 (D282):
   - **The minimum Rust version (D283):** a 1.x minor release may raise `rust-version`, a patch release never does, and the changelog calls out every raise.
   - **Hooks are outside the promise:** test and bench hooks (`Options::vfs`, `shard_stats` and the like) exist only with the `__unstable-hooks` feature (ICR 0085), which an application never turns on, and may change in any release. The few remaining `#[doc(hidden)]` items (the doc-example helpers, the trait impls that name internal crates' types) are outside the promise too.
 - **`pigeonhole-arrow` follows semver too.** Its arrow-rs major is part of its API, so moving to a new arrow-rs major is a major release of `pigeonhole-arrow`.
-- **`phdb` (`pigeonhole-cli`) follows semver for its commands, flags, exit statuses and output formats.** The JSON output is versioned (`"phdb": 1`); a breaking change to it takes a new version number and a major release.
+- **`phdb` (`pigeonhole-cli`) follows semver for its commands, flags, exit statuses and output formats.** The JSON output is versioned (`"phdb": 1`); a breaking change to it takes a new version number and a major release. The promise covers the binary, not the crate's library target, which exists for in-process tests and is hidden (ICR 0086).
 - **The other crates are internal:** `pigeonhole-engine`, `-format`, `-io`, `-sst`, `-wal`, `-memtable`, `-compaction`, `-runtime`, `-shm`, `-cache`, `-pager` and `-sim`.
   - They're published only because `pigeonhole` depends on them, and they make **no stability promise of their own**.
   - `pigeonhole` pins each one exactly (`=`), so a `pigeonhole` release always builds with the internal crates it was tested with.

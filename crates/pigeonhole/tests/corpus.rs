@@ -154,8 +154,18 @@ fn write_values(db: &Pigeonhole) {
         .table("values")
         .unwrap()
         .family("lz4", Family::default().max_versions(0))
-        .family("zstd", Family::default().zstd(3).max_versions(0))
-        .family("raw", Family::default().uncompressed().max_versions(3))
+        .family(
+            "zstd",
+            Family::default()
+                .compression(pigeonhole::Compression::Zstd(3))
+                .max_versions(0),
+        )
+        .family(
+            "raw",
+            Family::default()
+                .compression(pigeonhole::Compression::None)
+                .max_versions(3),
+        )
         .create()
         .unwrap();
     for i in 0..40u64 {

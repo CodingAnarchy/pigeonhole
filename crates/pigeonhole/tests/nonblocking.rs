@@ -530,7 +530,11 @@ fn a_cold_get_waits_on_io_and_reads_what_the_sync_get_reads() {
         vfs.set_deferred_io(true);
         assert_eq!(a, s, "row {row}");
     }
-    assert_eq!(db.async_sync_reads(), 0, "no block was read synchronously");
+    assert_eq!(
+        db.engine_metrics().async_sync_reads,
+        0,
+        "no block was read synchronously"
+    );
     vfs.set_deferred_io(false);
     db.close().unwrap();
 }
@@ -570,7 +574,7 @@ fn a_cold_row_read_waits_on_io_and_matches_the_sync_read() {
         .collect();
     assert_eq!(cells(&row), sync_cells);
     assert_eq!(row.key(), b"r0200");
-    assert_eq!(db.async_sync_reads(), 0);
+    assert_eq!(db.engine_metrics().async_sync_reads, 0);
     db.close().unwrap();
 }
 
@@ -615,7 +619,7 @@ fn a_separated_value_waits_on_io_and_a_cache_that_keeps_nothing_reads_synchronou
     assert_eq!(row.get("big", b"v").unwrap().value(), &[8u8; 200]);
     vfs.set_deferred_io(false);
     assert_eq!(
-        db.async_sync_reads(),
+        db.engine_metrics().async_sync_reads,
         0,
         "a separated value was read synchronously"
     );
@@ -627,7 +631,7 @@ fn a_separated_value_waits_on_io_and_a_cache_that_keeps_nothing_reads_synchronou
     let t = db.table("t").unwrap().open().unwrap();
     let got = block_on(t.get_async(b"r0011", "f", b"q")).unwrap().unwrap();
     assert_eq!(got.value(), &11u32.to_le_bytes());
-    assert!(db.async_sync_reads() > 0);
+    assert!(db.engine_metrics().async_sync_reads > 0);
     db.close().unwrap();
 }
 
@@ -674,7 +678,7 @@ fn a_separated_value_spanning_blob_extents_is_fetched_in_pieces() {
         assert!(v.value().iter().all(|&b| b == i as u8), "row {row}");
     }
     vfs.set_deferred_io(false);
-    assert_eq!(db.async_sync_reads(), 0);
+    assert_eq!(db.engine_metrics().async_sync_reads, 0);
     db.close().unwrap();
 }
 
@@ -695,7 +699,7 @@ fn a_separated_value_too_large_to_cache_reads_synchronously_and_counts() {
         .unwrap();
     assert_eq!(v.value(), &vec![1u8; 200 << 10][..]);
     assert!(
-        db.async_sync_reads() > 0,
+        db.engine_metrics().async_sync_reads > 0,
         "the oversized record's read was not counted"
     );
     db.close().unwrap();
@@ -817,7 +821,7 @@ fn a_cold_scan_stream_waits_on_io_and_yields_what_the_iterator_does() {
     assert_eq!(got.len(), want.len());
     assert_eq!(got, want);
     assert_eq!(
-        db.async_sync_reads(),
+        db.engine_metrics().async_sync_reads,
         0,
         "a forward scan read a block synchronously"
     );

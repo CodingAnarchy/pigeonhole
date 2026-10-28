@@ -1208,14 +1208,6 @@ impl Pigeonhole {
             .collect()
     }
 
-    /// File reads made synchronously inside async reads since open (D196, #398): a
-    /// separated value too large to cache, or a block the cache could not keep. Zero means
-    /// no async read blocked its executor thread on the file.
-    #[cfg(feature = "async")]
-    pub fn async_sync_reads(&self) -> u64 {
-        self.engine().metrics().async_sync_reads
-    }
-
     /// With io_uring (#402; the default on Linux, D218): how many io_uring rings the
     /// database has now (a shared one, plus one per shard thread that got its own) and how
     /// many got a registered buffer pool (a ring registers one on the first read that can

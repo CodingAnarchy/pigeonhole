@@ -72,11 +72,13 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
     }
     f = match v["compression"].as_str() {
         None => f,
-        Some("lz4") => f.lz4(),
-        Some("none") => f.uncompressed(),
+        Some("lz4") => f.compression(Compression::Lz4),
+        Some("none") => f.compression(Compression::None),
         Some("zstd") => {
             let level = v["zstd_level"].as_i64().unwrap_or(3);
-            f.zstd(i8::try_from(level).map_err(|_| bad("zstd_level"))?)
+            f.compression(Compression::Zstd(
+                i8::try_from(level).map_err(|_| bad("zstd_level"))?,
+            ))
         }
         Some(_) => return Err(bad("compression")),
     };
