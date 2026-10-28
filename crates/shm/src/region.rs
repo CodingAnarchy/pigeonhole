@@ -1479,6 +1479,26 @@ impl RowEpochTable {
         self.slot(hash).fetch_max(seqno, Ordering::Release);
     }
 
+    /// As [`note_write`](Self::note_write), returning the slot's value before the raise
+    /// (ICR 0082): below `seqno` for a commit's first write to the row since the slot last
+    /// moved, `seqno` itself for a later write of the same commit, and above it when a commit
+    /// with a higher seqno already wrote a row of this slot. Writer only.
+    ///
+    /// ```
+    /// use pigeonhole_shm::{ShmConfig, ShmRegion};
+    ///
+    /// let shm = ShmRegion::in_memory([1; 16], &ShmConfig::new(1));
+    /// let epochs = shm.row_epochs();
+    /// assert_eq!(epochs.note_write_prev(42, 7), 0);
+    /// assert_eq!(epochs.note_write_prev(42, 7), 7); // the same commit again
+    /// assert_eq!(epochs.note_write_prev(42, 5), 7); // a lower seqno applied later
+    /// assert_eq!(epochs.epoch(42, 10), Some(7));
+    /// ```
+    #[inline]
+    pub fn note_write_prev(&self, hash: u64, seqno: u64) -> u64 {
+        self.slot(hash).fetch_max(seqno, Ordering::Release)
+    }
+
     /// The epoch of the row hashing to `hash` for a read at `seqno` (load it after taking
     /// the read point): `None` when a write to it is applied but not visible at `seqno`.
     #[inline]

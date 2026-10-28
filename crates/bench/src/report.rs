@@ -717,6 +717,9 @@ pub struct Stalls {
     /// See [`Stalls::row_cache_hits`].
     #[serde(default)]
     pub row_cache_fills: u64,
+    /// Cached family rows a commit moved forward (D290's write-through).
+    #[serde(default)]
+    pub row_cache_write_throughs: u64,
     /// Cross-shard two-phase rounds decided, and the rounds a participant refused (ICR 0043,
     /// `Metrics::cross_shard`): the refused rounds over the cross-shard commits are D246's
     /// wasted rounds per commit.
@@ -801,6 +804,10 @@ impl Stalls {
             row_cache_hits: d(before.row_cache_hits, after.row_cache_hits),
             row_cache_misses: d(before.row_cache_misses, after.row_cache_misses),
             row_cache_fills: d(before.row_cache_fills, after.row_cache_fills),
+            row_cache_write_throughs: d(
+                before.row_cache_write_throughs,
+                after.row_cache_write_throughs,
+            ),
             xshard_rounds: d(before.xshard_rounds, after.xshard_rounds),
             xshard_refused_rounds: d(before.xshard_refused_rounds, after.xshard_refused_rounds),
             xshard_refused_below_floor: d(

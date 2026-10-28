@@ -1,6 +1,7 @@
-//! The row cache (#404, D201): what it serves, what makes a cached row miss, and that every
-//! result equals an uncached read. A snapshot read never uses the cache, so a latest read and
-//! a snapshot read taken with no write in between must return the same cells.
+//! The row cache (#404, D201, D290): what it serves, what makes a cached row miss, what a
+//! commit moves forward, and that every result equals an uncached read. A snapshot row read
+//! never uses the cache, so a latest read and a snapshot row read taken with no write in
+//! between must return the same cells.
 
 use std::ops::Bound;
 use std::sync::Arc;
@@ -24,6 +25,7 @@ fn table(db: &Pigeonhole) -> Table {
         .family("f", Family::default().max_versions(3))
         .family("g", Family::default())
         .family("short", Family::default().ttl(Duration::from_secs(10)))
+        .family("n", Family::counter())
         .create_if_missing()
         .unwrap()
 }
@@ -78,16 +80,27 @@ fn a_cached_row_is_served_until_the_row_is_written() {
     let s = db.row_cache_stats();
     assert_eq!(read(), first);
     assert_eq!(delta(&db, s), (1, 0, 0), "then hits");
-    // A write to the row: the next read misses, sees it, and refills at once (the row was
-    // read before); the one after hits.
+    // A put to a cell of the cached row: the commit moves the row forward (D290), so the
+    // next read hits and sees it.
+    let w = db.row_cache_stats().write_throughs;
     t.mutate(b"r").put("f", b"a", b"3").commit().unwrap();
+    assert_eq!(db.row_cache_stats().write_throughs, w + 1);
+    let s = db.row_cache_stats();
+    let after = read();
+    assert_eq!(delta(&db, s), (1, 0, 0));
+    assert_eq!(after[0].3, b"3");
+    assert_eq!(after[1].3, b"2", "the other cell is unchanged");
+    // A put to a new cell is not overlaid: the next read misses, sees it, and refills at
+    // once (the row was read before); the one after hits.
+    t.mutate(b"r").put("f", b"c", b"4").commit().unwrap();
+    assert_eq!(db.row_cache_stats().write_throughs, w + 1);
     let s = db.row_cache_stats();
     let after = read();
     assert_eq!(delta(&db, s), (0, 1, 1));
+    assert_eq!(after.len(), 3);
     let s = db.row_cache_stats();
     assert_eq!(read(), after);
     assert_eq!(delta(&db, s), (1, 0, 0));
-    assert_eq!(after[0].3, b"3");
     // A write to another row leaves it cached, unless the two rows share a write-watermark
     // slot (D201: a shared slot costs a false miss, never a wrong row). The slots are hashed
     // with a per-engine random seed, so any one other row shares `r`'s with probability about
@@ -194,22 +207,127 @@ fn projections_of_a_cached_row_equal_uncached_reads() {
 }
 
 #[test]
-fn gets_are_answered_from_a_cached_row_but_never_fill() {
+fn gets_are_answered_from_a_cached_row_and_fill_on_a_second_miss() {
     let vfs = SimVfs::new(406);
     let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
     let t = table(&db);
-    t.mutate(b"r").put("f", b"a", b"1").commit().unwrap();
+    t.mutate(b"r")
+        .put("f", b"a", b"1")
+        .put("f", b"b", b"2")
+        .commit()
+        .unwrap();
+    let get = |q: &[u8]| t.get(b"r", "f", q).unwrap().map(|c| c.value().to_vec());
     let s = db.row_cache_stats();
-    assert_eq!(t.get(b"r", "f", b"a").unwrap().unwrap().value(), b"1");
-    assert_eq!(delta(&db, s), (0, 1, 0), "a get never fills");
-    let _ = t.row(b"r").family("f").read().unwrap();
-    let _ = t.row(b"r").family("f").read().unwrap();
+    assert_eq!(get(b"a").unwrap(), b"1");
+    assert_eq!(delta(&db, s), (0, 1, 0), "a first miss only marks the row");
     let s = db.row_cache_stats();
-    assert_eq!(t.get(b"r", "f", b"a").unwrap().unwrap().value(), b"1");
-    assert!(t.get(b"r", "f", b"missing").unwrap().is_none());
+    assert_eq!(get(b"a").unwrap(), b"1");
+    assert_eq!(
+        delta(&db, s),
+        (0, 1, 1),
+        "a second miss fills the family row (D290)"
+    );
+    let s = db.row_cache_stats();
+    assert_eq!(get(b"b").unwrap(), b"2");
+    assert!(get(b"missing").is_none());
     assert_eq!(delta(&db, s), (2, 0, 0));
+    // A put to a cached cell moves the row forward: still a hit.
+    t.mutate(b"r").put("f", b"a", b"3").commit().unwrap();
+    let s = db.row_cache_stats();
+    assert_eq!(get(b"a").unwrap(), b"3");
+    assert_eq!(delta(&db, s), (1, 0, 0));
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn snapshot_and_transaction_gets_are_served_at_their_read_point() {
+    let vfs = SimVfs::new(410);
+    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let t = table(&db);
+    t.mutate(b"r").put("f", b"a", b"1").commit().unwrap();
+    let _ = t.get(b"r", "f", b"a").unwrap();
+    let _ = t.get(b"r", "f", b"a").unwrap();
+    let snap = db.snapshot().unwrap();
+    let s = db.row_cache_stats();
+    let at = |snap: &pigeonhole::Snapshot| {
+        t.get_at(snap, b"r", "f", b"a")
+            .unwrap()
+            .map(|c| c.value().to_vec())
+    };
+    assert_eq!(at(&snap).unwrap(), b"1");
+    assert_eq!(delta(&db, s), (1, 0, 0), "a snapshot get hits (D290)");
+    let mut txn = db.transaction().unwrap();
+    let s = db.row_cache_stats();
+    assert_eq!(txn.get(&t, b"r", "f", b"a").unwrap().unwrap().value(), b"1");
+    assert_eq!(delta(&db, s), (1, 0, 0), "so does a transaction's");
+    // A later write moves the cached row past both read points: they miss and read the row
+    // as of their snapshot, not the cached one.
     t.mutate(b"r").put("f", b"a", b"2").commit().unwrap();
-    assert_eq!(t.get(b"r", "f", b"a").unwrap().unwrap().value(), b"2");
+    let s = db.row_cache_stats();
+    assert_eq!(at(&snap).unwrap(), b"1");
+    assert_eq!(txn.get(&t, b"r", "f", b"a").unwrap().unwrap().value(), b"1");
+    assert_eq!(delta(&db, s).0, 0);
+    // The read is in the read set whichever way it was answered: the write conflicts.
+    txn.put(&t, b"r", "f", b"a", b"9");
+    assert!(txn.commit().is_err());
+    let mut txn = db.transaction().unwrap();
+    let s = db.row_cache_stats();
+    assert_eq!(txn.get(&t, b"r", "f", b"a").unwrap().unwrap().value(), b"2");
+    assert_eq!(delta(&db, s), (1, 0, 0));
+    drop(txn);
+    drop(snap);
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_put_a_delete_could_hide_is_not_written_through() {
+    let vfs = SimVfs::new(411);
+    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let t = table(&db);
+    // `a` at 5 is newest once the version at 10 is deleted.
+    t.mutate(b"r")
+        .put_at("f", b"a", 5, b"old")
+        .put_at("f", b"a", 10, b"gone")
+        .commit()
+        .unwrap();
+    t.mutate(b"r").delete_cell("f", b"a", 10).commit().unwrap();
+    let get = || {
+        t.get(b"r", "f", b"a")
+            .unwrap()
+            .map(|c| (c.timestamp(), c.value().to_vec()))
+    };
+    assert_eq!(get().unwrap(), (5, b"old".to_vec()));
+    assert_eq!(get().unwrap(), (5, b"old".to_vec()));
+    // A put exactly at the deleted timestamp is hidden by the delete whatever its seqno. The
+    // cached row doesn't record the delete, so the commit must not overlay it.
+    let w = db.row_cache_stats().write_throughs;
+    t.mutate(b"r")
+        .put_at("f", b"a", 10, b"hidden")
+        .commit()
+        .unwrap();
+    assert_eq!(get().unwrap(), (5, b"old".to_vec()));
+    assert_eq!(db.row_cache_stats().write_throughs, w);
+    // A delete or an increment isn't overlaid either.
+    t.mutate(b"r").delete_cell("f", b"a", 5).commit().unwrap();
+    assert!(get().is_none());
+    t.mutate(b"r").incr("n", b"c", 2).commit().unwrap();
+    assert_eq!(db.row_cache_stats().write_throughs, w);
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn gets_never_fill_a_counter_family() {
+    let vfs = SimVfs::new(412);
+    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let t = table(&db);
+    t.mutate(b"r").incr("n", b"c", 1).commit().unwrap();
+    for _ in 0..3 {
+        assert!(t.get(b"r", "n", b"c").unwrap().is_some());
+    }
+    assert_eq!(db.row_cache_stats().fills, 0);
     drop(t);
     db.close().unwrap();
 }

@@ -2925,6 +2925,13 @@ pub(crate) struct ShardState {
     held_rows: FastSet<u64>,
     /// Slots the last `apply` wrote (deduplicated).
     touched_slots: Vec<(TabletId, FamilyId)>,
+    /// D290, with the row cache on: the rows the last `apply` wrote first in this commit
+    /// (table, row within the batch) with their slot's value before it (`p < seqno`), for
+    /// the write-through once the apply succeeded.
+    cache_rows: Vec<(u32, (u32, u32), Seqno)>,
+    /// D290: rows the last `apply` wrote after a commit with a higher seqno (`p > seqno`):
+    /// their cached families go, applied or not.
+    cache_stale: Vec<(u32, (u32, u32))>,
     closing: bool,
     close_stage: CloseStage,
     spares: Option<SpareSegments>,
@@ -3349,6 +3356,8 @@ impl ShardState {
             group_rank: 0,
             held_rows: FastSet::default(),
             touched_slots: Vec::new(),
+            cache_rows: Vec::new(),
+            cache_stale: Vec::new(),
             closing: false,
             close_stage: CloseStage::Open,
             spares: None,
@@ -5446,7 +5455,18 @@ impl ShardState {
                     if let Some(epochs) = &self.shared.row_epochs
                         && !self.replaying
                     {
-                        epochs.note_write(m.table, m.row, seqno);
+                        if self.shared.row_cache.is_some() {
+                            // D290: the slot's value before this commit. `seqno` itself is a
+                            // later run of this commit's writes to the row (A, B, A).
+                            let p = epochs.note_write_prev(m.table, m.row, seqno);
+                            if p < seqno {
+                                self.cache_rows.push((k.table, k.row, p));
+                            } else if p > seqno {
+                                self.cache_stale.push((k.table, k.row));
+                            }
+                        } else {
+                            epochs.note_write(m.table, m.row, seqno);
+                        }
                     }
                     id
                 }
@@ -5510,6 +5530,10 @@ impl ShardState {
             slot.active.explicit_ts |= unordered;
             if !matches!(m.kind, Kind::Put | Kind::Merge) {
                 slot.active.deletes = true;
+                // D290: before it can be visible, and before a later write to the row.
+                if let Some(rc) = &self.shared.row_cache {
+                    rc.note_delete(ts);
+                }
             }
             if !self.touched_slots.contains(&(tablet, m.family)) {
                 self.touched_slots.push((tablet, m.family));
@@ -5528,6 +5552,9 @@ impl ShardState {
             result = Err(e.into());
         }
         self.key_buf = key_buf;
+        if !self.cache_rows.is_empty() || !self.cache_stale.is_empty() {
+            self.follow_commit(bytes, seqno, dups, result.is_ok());
+        }
         result
     }
 
@@ -5618,6 +5645,95 @@ impl ShardState {
             .table
             .insert(&mut self.arena, &key, &c.stored)
             .is_ok()
+    }
+
+    /// D290: the row cache follows the commit `apply` just applied at `seqno`, before the
+    /// commit can be visible (its count-down and view publish come after `apply` returns).
+    ///
+    /// - Rows written after a commit with a higher seqno lose their cached families, applied
+    ///   or not: a write-through by that commit lacks this write.
+    /// - Only if the apply succeeded (a failed one poisons the shard, and the cache must never
+    ///   be ahead of the memtables): each family of a row this commit wrote first, with only
+    ///   plain puts, moves its cached entry forward (`RowCaches::write_through`). Other
+    ///   families of the row stay at the old epoch and miss (D290 accepts the miss).
+    ///
+    /// Relies on one applier per row: a row's writes all apply on the shard that owns its
+    /// tablet, one at a time, and a tablet changes owner only once no share touching it is in
+    /// flight (`shares_touch_moving`, `progress_op`). `apply` skips rows it doesn't own.
+    fn follow_commit(&mut self, bytes: &[u8], seqno: Seqno, dups: bool, applied: bool) {
+        /// More rows than this in one commit: no write-through (a bulk write's rows miss).
+        const WRITE_THROUGH_ROWS: usize = 16;
+        let rows = std::mem::take(&mut self.cache_rows);
+        let stale = std::mem::take(&mut self.cache_stale);
+        if let Some(rc) = &self.shared.row_cache {
+            let view = self.shared.view.load();
+            for &(table, row) in &stale {
+                if let Some(info) = view.catalog.table(TableId(table)) {
+                    rc.invalidate(span(bytes, row), info.families.iter().map(|f| f.id));
+                }
+            }
+            if applied && rows.len() <= WRITE_THROUGH_ROWS {
+                let keys = &self.dedup.keys;
+                let wins = |i: usize| !dups || self.dedup.wins(i);
+                for &(table, row_span, p) in &rows {
+                    let row = span(bytes, row_span);
+                    debug_assert!(
+                        self.tablets
+                            .route(TableId(table), row)
+                            .is_some_and(|(_, owner)| owner == self.id),
+                        "shard {} wrote through a row it does not own (D290 needs one applier \
+                         per row)",
+                        self.id.0
+                    );
+                    let of_row = |k: &MutKey| k.table == table && span(bytes, k.row) == row;
+                    for (i, k) in keys.iter().enumerate() {
+                        // Each family of the row once, at its first winning write.
+                        if !wins(i)
+                            || !of_row(k)
+                            || keys[..i]
+                                .iter()
+                                .enumerate()
+                                .any(|(j, e)| wins(j) && of_row(e) && e.family == k.family)
+                        {
+                            continue;
+                        }
+                        let family = k.family;
+                        let cells = || {
+                            keys.iter()
+                                .enumerate()
+                                .filter(move |&(j, e)| wins(j) && of_row(e) && e.family == family)
+                                .map(|(_, e)| e)
+                        };
+                        // Plain puts only: a delete, a counter or a separated value can't be
+                        // overlaid on the cached cells.
+                        if !cells().all(|e| {
+                            e.kind == Kind::Put
+                                && span(bytes, e.value).first()
+                                    != Some(&(pigeonhole_format::value::ValueTag::Blob as u8))
+                        }) {
+                            continue;
+                        }
+                        let Some(meta) = view.catalog.family(FamilyId(family)) else {
+                            continue;
+                        };
+                        rc.write_through(
+                            TableId(table),
+                            FamilyId(family),
+                            row,
+                            p,
+                            seqno,
+                            meta.options.ttl_micros,
+                            cells().map(|e| (span(bytes, e.qualifier), e.ts, span(bytes, e.value))),
+                        );
+                    }
+                }
+            }
+        }
+        // The buffers go back for the next apply.
+        self.cache_rows = rows;
+        self.cache_rows.clear();
+        self.cache_stale = stale;
+        self.cache_stale.clear();
     }
 
     // ---- stalls ----

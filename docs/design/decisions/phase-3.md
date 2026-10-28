@@ -2825,6 +2825,41 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
   - The controller's unit tests: the shrink in one step, growth on busy, slow passes and sibling wait, no shrink of an idle store, regret, and a proven level flooring the shrink until the load changes.
   - `pigeonhole/tests/model.rs` takes `PIGEONHOLE_DRIVER_CHURN=1`, forcing seeded resizes after one step in ten.
 
+<a id="d290"></a>
+## D290 — Snapshot and transaction point gets go through the writer's row cache, gets fill on a second miss, and a commit moves a cached row forward (coordinator, 2026-10-27; reviewed by simp724, #708 c6455806598; cache, shm, engine, pigeonhole, #708, ICR 0082; amends D201)
+
+**Why:** transfer's two transaction reads per attempt cost ~8–9 µs, ~7 of them the memtable and SST lookups (#708 c6452124966). D201 made transactions bypass the row cache. And serving them alone would hit almost never: every account a transfer reads it also writes, so the row's watermark has moved past any cached entry by the next read. Design and correctness argument: #708 c6455731499. Review and conditions: c6455806598.
+
+**(A) Serve.** Point gets at a snapshot's seqno `S` (`Inner::get`, so `Txn::get` too) consult the writer's cache under D201's hit rule, as latest gets do at theirs. The rule never needed `S` to be the latest point:
+- Every write at or below a visible `S` was applied, and raised the slot, before `S` became visible.
+- So `entry.epoch == slot_now <= S` means no write to the row lies in `(epoch, S]`.
+- A later write makes `slot_now > S`, so the get misses.
+
+The transaction's read set records keys only (D275), before the read, so a hit is validated as a miss is. Reader processes are unchanged (D281 already serves their snapshots).
+
+**(B) Fill.** A get that misses on a row that missed before (D201's ghost tag) reads the family row whole at its read point, answers from it and stores it, under D201's fill rules: the cap, and the marker for oversize rows. Families with a merge operator (counters among them) are served but never filled by a get. Every increment leaves the cached row behind, so a fill there would be a family-row read per get after each write.
+
+**(C) Write-through.** The shard that applies a commit at `c` moves a cached family row from the slot's previous value `p` to `c`, with the commit's puts overlaid. It does so only when all of these hold:
+- **Timing:** after `apply` returns Ok, in `Shard::follow_commit`, before the commit's count-down and view publish. So it never runs on a half-applied commit (a failed apply poisons the shard), and a reader at `S >= c` sees it only once `c` is visible. Doing it at settle instead would let later commits move the slot first.
+- **`p`:** taken from the commit's first `fetch_max` on the row (`RowEpochTable::note_write_prev`, ICR 0082). A later write of the same commit to the row (A, B, A) returns `c` itself and is ignored.
+- **The cached row:** it is cached at exactly `p`. Then no write lies in `(p, c)`: one applied there would have moved the slot, and one with a lower seqno applying later is the next rule.
+- **A lower seqno applying late:** when `fetch_max` returns above `c`, a commit with a higher seqno already wrote the row, and its write-through lacks this write. The shard drops the row's cached families, applied or not, before this commit's seqno can be visible. The cases are D286's parked decisions, held cross-shard shares (applied at their `apply_seqno`, D263) and D273's explicit timestamps.
+- **What the commit wrote:** only plain puts to the family, no separated values. Every put must be above the **delete ceiling**: the newest timestamp of any delete the file may hold, taken from the SSTs at open and raised by every delete applied since, replay included. A delete hides a put by timestamp whatever their seqnos (a cell delete exactly at its timestamp, a column or family delete at or below), and the cached row doesn't record the deletes behind it.
+- **The overlay:** a put replaces the cached cell of its qualifier unless the cached version is newer (on a timestamp tie the commit wins, with the higher seqno). The row's expiry is recomputed. The row must already hold the qualifier, must not be a marker, and must stay within `row_cache_max_row`. Otherwise the entry is dropped; it would miss anyway.
+- **Other families of the row** stay at `p` and miss: the slot is per row, the entries per family. D290 accepts the miss.
+- **Bulk commits:** a commit writing more than 16 rows moves none. Its rows miss.
+
+**What (C) relies on:**
+- **One applier per row.** A row's writes apply on the shard owning its tablet, one at a time. A tablet changes owner only once no share touching it is in flight (`shares_touch_moving`, `progress_op`), and `apply` skips rows it doesn't own. `follow_commit` debug-asserts the route.
+- **Recovery:** if a future in-process recovery (#620) ever replays into a live `Shared`, it must clear the row cache first. Today the cache starts empty at every open.
+
+**Cost:**
+- **Cache off:** nothing changes on the commit path (`note_write` as before).
+- **Cache on:** the commit path pays `note_write_prev` plus a push per row first written. A row the cache holds also pays the cache shard's lock, and an in-place overlay when no reader holds the entry (a copy otherwise). This is turn time on the shard thread, so the box A/B reports the write-through count (`RowCacheStats::write_throughs`).
+- **CI:** the instruction shapes pin the cache off (D216), so their ceilings are unaffected.
+
+**Measurement:** a box A/B against main on transfer (Buffered and the default), ycsb-a, ycsb-f, ycsb-c, D280's counters row and the gate's row-cache step, 6 reps each. It passes if transfer improves beyond noise and no row regresses beyond noise in throughput or p99.
+
 <a id="d291"></a>
 ## D291 — A counter get that folds many operands keeps its result as a base in the active memtable (ctr274, 2026-10-27; compaction, engine, pigeonhole, #713, D280; refines D186, D287)
 **Why.** After D287 a hot counter's read still folded every operand in the active memtable, about 26 ns each. On the AX102 the counter-read p99 was 4.0–4.5 ms against RocksDB's 1.5–1.8 ms (#992's A/B). Locally a read over 1 ms folded 2^15–2^18 memtable operands, and only about 1.5 SST entries (#713 comment 6456964876). Cheaper steps can't bound a fold that grows with skew and memtable size, so the fold itself has to be bounded.

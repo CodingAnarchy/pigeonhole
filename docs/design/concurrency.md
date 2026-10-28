@@ -480,6 +480,8 @@ use `Shared` fields declared in shard.rs; see "Used here, declared elsewhere" be
 | `RowCaches::hits` row_cache.rs:61 | `AtomicU64` | Row-cache hit counter. | `get` (`fetch_add`, Relaxed), reading threads. | `stats` (`load`, Relaxed) for `Engine::row_cache_stats` (engine.rs:1638). | Relaxed statistic. | #404, D201. |
 | `RowCaches::misses` row_cache.rs:62 | `AtomicU64` | Row-cache miss counter. | `get` (`fetch_add`, Relaxed). | `stats` (Relaxed). | Relaxed statistic. | #404, D201. |
 | `RowCaches::fills` row_cache.rs:63 | `AtomicU64` | Row-cache fill counter. | `insert` (`fetch_add`, Relaxed). | `stats` (Relaxed). | Relaxed statistic. | #404, D201. |
+| `RowCaches::patches` row_cache.rs | `AtomicU64` | Entries a commit moved forward (D290's write-through). | `write_through` (`fetch_add`, Relaxed), shard threads after `apply`. | `patches` (Relaxed) for `Engine::row_cache_write_throughs`. | Relaxed statistic. | D290, ICR 0082. |
+| `RowCaches::delete_ceiling` row_cache.rs | `AtomicU64` | The newest timestamp of any delete the file may hold: the write-through overlays only puts above it (a delete hides a put by timestamp, and a cached row doesn't record the deletes behind it). | `note_delete` (`fetch_max`, Relaxed): the open (the SSTs' newest delete-bearing `ts_range.1`, before any shard runs) and `Shard::apply` for every delete, replay included, before the delete can be visible. | `write_through` (`load`, Relaxed), shard threads after `apply`. | Relaxed: what matters is a delete to the same row, and a row has one applier (D290): its deletes and puts apply in program order on one shard thread, and a tablet changes owner only through the move's handover, which orders the old owner's apply before the new owner's. Another row's delete only makes the bound stricter. | D290. |
 
 ### Async-commit admission (admission.rs, `Inner::admission`; D210, D236)
 
@@ -637,6 +639,12 @@ I/O (`reap_orphan_io`, ICR 0028), and only then `std::thread::park()`s. `commit_
 9. Test hook only: `hooks.compaction_held` Mutex in `CompactionWork::run` (compact.rs:916), leaf; `compaction_hold_ids` is bumped under it.
 10. `RowCaches::store`: the `RowCache`'s internal lock (`cache.insert`) is released before the
     `present` Relaxed store (row_cache.rs:198-202): no nesting.
+11. `RowCaches::write_through` and `RowCaches::invalidate` (D290) run on a shard thread from
+    `Shard::follow_commit`, after `apply` and before the commit's count-down and view publish,
+    holding no engine lock: the `RowCache` shard's write lock (`cache.update`, or
+    `cache.invalidate`) is the only lock taken, and it is released before the `present`
+    Relaxed store. The commit's first write to each row reads the slot's previous value from
+    the same `fetch_max` (`RowEpochTable::note_write_prev`, Release, ICR 0082).
 
 ### Bounded polls (no wake source)
 

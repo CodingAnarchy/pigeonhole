@@ -185,6 +185,31 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         self.evict();
     }
 
+    /// Changes the entry for `key` in place, keeping its queue and hit count: `f` gets the
+    /// value and returns its new charge, or `None` to drop the entry. Then evicts down to
+    /// capacity. Returns whether the entry is still cached.
+    pub(crate) fn update(&mut self, key: &K, f: impl FnOnce(&mut Arc<V>) -> Option<usize>) -> bool {
+        let Some(slot) = self.map.get_mut(key) else {
+            return false;
+        };
+        let Some(charge) = f(&mut slot.value) else {
+            self.remove(key);
+            return false;
+        };
+        let (old, small) = (slot.charge, slot.queue == Queue::Small);
+        slot.charge = charge;
+        self.usage = self.usage - old + charge;
+        if small {
+            self.small_usage = self.small_usage - old + charge;
+        }
+        if charge > self.capacity {
+            self.remove(key);
+            return false;
+        }
+        self.evict();
+        self.map.contains_key(key)
+    }
+
     /// Drops `key` from the index (pinned or not). Outstanding handles stay valid.
     pub(crate) fn remove(&mut self, key: &K) -> bool {
         let Some(slot) = self.map.remove(key) else {

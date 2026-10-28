@@ -481,6 +481,7 @@ pub struct RowCache {
     shards: Sharded<u64, RowEntry>,
 }
 
+#[derive(Clone)]
 struct RowEntry {
     family: u64,
     epoch: u64,
@@ -537,6 +538,60 @@ impl RowCache {
             lock(shard).insert(h, Arc::clone(&entry), charge, Priority::Normal);
         }
         RowHandle { entry }
+    }
+
+    /// Moves the row cached at epoch `from` to epoch `to`, editing its encoding in place:
+    /// `edit` gets the encoding and returns whether the entry stays (`false` drops it).
+    /// Returns whether the row is now cached at `to`; nothing changes when it is not cached
+    /// at `from`. A [`RowHandle`] held meanwhile keeps the old encoding: the entry is copied
+    /// before the edit while one is held.
+    ///
+    /// ```
+    /// use pigeonhole_cache::RowCache;
+    ///
+    /// let rows = RowCache::new(1 << 20);
+    /// let old = rows.insert(3, b"user:42", 10, vec![1, 2, 3]);
+    /// assert!(rows.update(3, b"user:42", 10, 11, |e| {
+    ///     e[0] = 9;
+    ///     true
+    /// }));
+    /// assert_eq!(&rows.get(3, b"user:42", 11).unwrap()[..], &[9, 2, 3]);
+    /// assert_eq!(&old[..], &[1, 2, 3]); // the handle kept its copy
+    /// assert!(rows.get(3, b"user:42", 10).is_none());
+    /// assert!(!rows.update(3, b"user:42", 10, 12, |_| true)); // not cached at 10
+    /// ```
+    pub fn update(
+        &self,
+        family: u64,
+        row: &[u8],
+        from: u64,
+        to: u64,
+        edit: impl FnOnce(&mut Vec<u8>) -> bool,
+    ) -> bool {
+        let h = Self::hash(family, row);
+        let Some(shard) = self.shards.shard(h) else {
+            return false;
+        };
+        let mut shard = lock(shard);
+        if !shard
+            .peek(&h)
+            .is_some_and(|e| e.is(family, row) && e.epoch == from)
+        {
+            return false;
+        }
+        shard.update(&h, |entry| {
+            // Copied first while a handle holds it (`Arc::make_mut`, written out: loom's
+            // `Arc` has no `make_mut`).
+            if Arc::get_mut(entry).is_none() {
+                *entry = Arc::new(RowEntry::clone(entry));
+            }
+            let e = Arc::get_mut(entry)?;
+            if !edit(&mut e.encoded) {
+                return None;
+            }
+            e.epoch = to;
+            Some(e.row.len() + e.encoded.len() + Self::ENTRY_OVERHEAD)
+        })
     }
 
     /// Drops a row (on write to it).
