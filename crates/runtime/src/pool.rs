@@ -59,9 +59,10 @@ pub(crate) const ROOM_RECLAIM: u64 = 2_000_000;
 pub(crate) const FALLBACK: u64 = 10_000_000;
 
 /// How long an application's driver may make no pass (no turn started, no slice ended)
-/// before the shards take back the tasks it holds without running them (D284): long
+/// before the shards take back the tasks it holds that could run but don't (D284): long
 /// enough that a driven worker in one slow slice (an inline sync on a slow device) does not
-/// look stopped, since a compaction taken back is dropped and redone.
+/// usually look stopped, since a compaction taken back is dropped and redone. Its blocked
+/// tasks stay: their wake is what they wait for, not the driver (#1012).
 pub(crate) const STOPPED: u64 = 100_000_000;
 
 /// Where a shard's tasks go back to (D284), and its share of the pool's accounting.
@@ -198,8 +199,8 @@ pub(crate) struct Pool {
     /// shards only when nobody drives (`FALLBACK`).
     last_pass: AtomicU64,
     /// Each driver's last pass (VFS clock: a turn's start or a slice's end), by driver id: a
-    /// driver that made none for `STOPPED` gives its idle held tasks back too (application
-    /// drivers only).
+    /// driver that made none for `STOPPED` gives back the held tasks it could run but doesn't
+    /// (application drivers only).
     passes: Vec<AtomicU64>,
     /// Engine-owned threads: never taken from.
     builtin: bool,
@@ -345,7 +346,7 @@ impl Pool {
         if !self.builtin {
             loop {
                 for sched in st.drivers.iter_mut().flatten() {
-                    sched.take_idle(u64::MAX, false, |_, _| true, &mut moved);
+                    sched.take_idle(u64::MAX, false, 0, |_, _| true, &mut moved);
                 }
                 if !st.drivers.iter().flatten().any(|s| s.running(|_, _| true)) {
                     break;
@@ -398,7 +399,7 @@ impl Pool {
         }
         if now >= ROOM_RECLAIM {
             for sched in st.drivers.iter_mut().flatten() {
-                sched.take_idle(before, true, mine, &mut moved);
+                sched.take_idle(before, true, 0, mine, &mut moved);
             }
         }
         let held = st
@@ -425,9 +426,10 @@ impl Pool {
     /// What `origin`'s shard takes back because nobody drives it (workers configured but
     /// not driven, or one the application stopped driving without dropping it): its tasks
     /// queued for [`FALLBACK`] while no driver made a pass, and every task of its an
-    /// application driver holds without running, once that driver has made no pass for
-    /// [`STOPPED`] (a compaction is then dropped and picked again, rather than keep its
-    /// inputs busy until the close).
+    /// application driver holds that could run (runnable, woken, or asleep past its
+    /// deadline) without running it, once that driver has made no pass for [`STOPPED`] (a
+    /// compaction is then dropped and picked again, rather than keep its inputs busy until
+    /// the close). A blocked task stays until it is woken (#1012).
     pub(crate) fn take_stale(&self, origin: &Arc<Origin>, now: u64) -> Vec<Moved> {
         let mut moved = Vec::new();
         let Some(before) = now.checked_sub(FALLBACK) else {
@@ -443,10 +445,20 @@ impl Pool {
             && let Some(stopped_before) = now.checked_sub(STOPPED)
         {
             for (id, sched) in st.drivers.iter_mut().enumerate() {
+                // A driver with a slice running is being driven, however long the slice
+                // (perf287's review of #1014): its runnable tasks wait for that slice, not
+                // for a driver that stopped. The close still waits for the slice.
                 if let Some(sched) = sched
                     && self.passes[id].load(Ordering::Relaxed) <= stopped_before
+                    && !sched.running(|_, _| true)
                 {
-                    sched.take_idle(u64::MAX, false, mine, &mut moved);
+                    // Only what it could run: a blocked task waits on a wake its driver
+                    // would hear anyway (`notify_task` wakes a sleeping driver), and a
+                    // driver deep in one slow slice (an inline sync on a slow device: over
+                    // 100 ms on Windows CI) has made no pass without having stopped (#1012).
+                    // Once woken, the task is taken at the next look if the driver still
+                    // makes none.
+                    sched.take_idle(u64::MAX, true, now, mine, &mut moved);
                 }
             }
         }
@@ -466,7 +478,7 @@ impl Pool {
         let mut moved = Vec::new();
         let mut st = self.lock();
         if let Some(mut sched) = st.drivers[id].take() {
-            sched.take_idle(u64::MAX, false, |_, _| true, &mut moved);
+            sched.take_idle(u64::MAX, false, 0, |_, _| true, &mut moved);
         }
         if self.live.fetch_sub(1, Ordering::AcqRel) == 1 {
             st.take_queued(u64::MAX, |_, _| true, &mut moved);
