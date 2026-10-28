@@ -943,3 +943,36 @@ fn a_stream_fails_with_closed_after_close() {
     let (end, _) = next_deferred(&vfs, &mut s);
     assert!(end.is_none());
 }
+
+#[test]
+fn a_scan_stream_over_a_cache_that_keeps_nothing_reads_synchronously_and_matches_the_scan() {
+    // As the get above, for a scan stream (#695's coverage report): with a block cache that
+    // keeps nothing, a fetched block is not found again, so the stream goes synchronous
+    // (counted) instead of fetching for ever, and returns what the blocking scan returns.
+    let vfs = SimVfs::new(4213);
+    let db = cold_db(&vfs, "/db/ncs.phdb", 200, sim_options(&vfs).block_cache(0));
+    let t = db.table("t").unwrap().open().unwrap();
+    let want: Vec<Cells> = t
+        .scan_prefix(b"r")
+        .iter()
+        .unwrap()
+        .map(|r| row_cells(&r.unwrap()))
+        .collect();
+    assert_eq!(want.len(), 200);
+    let before = db.async_sync_reads();
+    vfs.set_deferred_io(true);
+    let mut s = t.scan_prefix(b"r").stream();
+    let mut got = Vec::new();
+    while let (Some(r), _) = next_deferred(&vfs, &mut s) {
+        got.push(row_cells(&r.unwrap()));
+    }
+    vfs.set_deferred_io(false);
+    assert_eq!(got, want);
+    assert!(
+        db.async_sync_reads() > before,
+        "the stream never went synchronous"
+    );
+    drop(s);
+    drop(t);
+    db.close().unwrap();
+}
