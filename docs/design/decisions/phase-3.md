@@ -2974,6 +2974,16 @@ The transaction's read set records keys only (D275), before the read, so a hit i
 
 **Flush, compaction and durability need no change.** A `Put` under operands is a base: D287's flush and D186's GC fold the operands above it onto it per stripe. Every seqno of a frozen memtable is durable before it freezes (D227), so an SST's checkpoint never holds a lost increment, and replay rebuilds a memtable's operands without it.
 
+**Amended by #1051 (2026-10-28): one change was needed.** A combine of two operands can be split by a checkpoint outside its inputs, not only by one inside them. Example: a checkpoint `Put@5` in another source of the slot already counts `Merge@5`, while that operand and a `Merge@6` are inputs. D186's guard (`GcPolicy::other_sources`) kept two operands apart only when another source could reach `(older, newer]`, the range where a delete hides the older one alone. It combined them into `Merge@6 = +50`, and a read at 6 counted `Merge@5` a second time above the base: 60 for 50. The guard now covers `[older, newer]`, both operands included, for deletes and checkpoints alike, in compaction and in D287's flush. In the engine, a checkpoint and the operand at its seqno share a stripe, so every combine that sees both drops the operand, and no path that splits them was found. The compaction crate's contract (any other sources) was broken all the same, and `check_counter_purge` found it.
+
+Tests:
+- the seed;
+- `counter_checkpoints_survive_combines_fixed_seeds`, which puts every checkpoint in another source and every other entry in the inputs, entry by entry: the old guard fails 5 of 1,600 of its cases;
+- a unit test of the guard's boundaries;
+- an engine test with checkpoints in every L0 file through flushes and a compaction.
+
+The `counters` model target now checkpoints on every odd seed by default.
+
 **The memtable.** A checkpoint is the first insert that lands inside a column's run rather than at its front. Its stale tail (D194, D277) is its successor's, a later node of the same column. That's valid for a skip that finishes the column, in the writer's process and for a reader that checks every tail.
 
 **Where it runs.** Every point get, sync or async, goes through `get_in`, whose closure takes the resolver's fold record after the get (only counter groups set it). A fold record hands the result to a cold function that sends it through the view's sink. The sink is in the writer's `LiveViews`, reached through the view's pin, and is absent in reader processes and forked children. `get_with` itself is unchanged: a checkpoint argument there changed what the compiler inlined into every point get (+1–3% instructions, D193).
