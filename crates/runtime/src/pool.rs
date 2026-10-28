@@ -445,8 +445,12 @@ impl Pool {
             && let Some(stopped_before) = now.checked_sub(STOPPED)
         {
             for (id, sched) in st.drivers.iter_mut().enumerate() {
+                // A driver with a slice running is being driven, however long the slice
+                // (perf287's review of #1014): its runnable tasks wait for that slice, not
+                // for a driver that stopped. The close still waits for the slice.
                 if let Some(sched) = sched
                     && self.passes[id].load(Ordering::Relaxed) <= stopped_before
+                    && !sched.running(|_, _| true)
                 {
                     // Only what it could run: a blocked task waits on a wake its driver
                     // would hear anyway (`notify_task` wakes a sleeping driver), and a

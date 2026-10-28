@@ -635,3 +635,44 @@ fn a_stopped_workers_sleeping_task_comes_back_once_due() {
 fn spawn_task(shard: &mut ShardDriver<Idle>, task: impl Task + 'static) {
     shard.with_handler(|_, ctx| ctx.spawn(Box::new(task)));
 }
+
+#[test]
+fn a_worker_in_a_long_slice_keeps_its_runnable_tasks() {
+    // perf287's review of #1014: a driver deep in one slow slice (an inline sync over 100 ms
+    // on Windows CI) is being driven, so STOPPED takes nothing from it, its runnable tasks
+    // included. Worker 0 holds a runnable task while its other task's slice is held open for
+    // 300 ms of the clock.
+    let (vfs, mut owned) = open(1);
+    let other = Arc::new(Seen::default());
+    spawn(&mut owned.shards[0], Steps::new(1_000, &other));
+    let seen = Arc::new(Seen::default());
+    let gate = Arc::new(Barrier::new(2));
+    let mut t = Steps::new(3, &seen);
+    t.gate = Some(Arc::clone(&gate));
+    spawn(&mut owned.shards[0], t);
+    vfs.advance(1_000_000);
+    let mut worker = owned.workers.pop().unwrap();
+    let driving = thread::spawn(move || {
+        while worker.run_once(u64::MAX) {}
+        worker
+    });
+    gate.wait(); // the slice runs, with the other task held and runnable
+    let shard = &mut owned.shards[0];
+    for _ in 0..30 {
+        vfs.advance(10_000_000);
+        shard.run_once(u64::MAX);
+    }
+    assert_eq!(
+        other.reclaims.load(Ordering::SeqCst),
+        0,
+        "a runnable task was taken from a worker mid-slice"
+    );
+    assert_eq!(
+        shard.submitter(shard.shard()).background_take_backs(),
+        (0, 0)
+    );
+    gate.wait(); // the slice ends
+    let _worker = driving.join().unwrap();
+    assert!(seen.done.load(Ordering::SeqCst) && other.done.load(Ordering::SeqCst));
+    assert_eq!(other.on_shard.load(Ordering::SeqCst), 0);
+}
