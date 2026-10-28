@@ -90,8 +90,11 @@ OPTIONS:
     --max-secs S           the longest measured phase: past it no client starts another
                            operation, and the record says it was capped (D247)
                            [default: none]
-    --offered-rate R       placement: writes per second offered over every client
-                           [default: 30,000 per shard]
+    --offered-rate R       operations per second offered over every client. placement:
+                           its open-loop writes [default: 30,000 per shard]. Client runs:
+                           the measured operations, each client paced to R / clients (the
+                           warmup is not), so latency is service time at that load instead
+                           of at the store's maximum (#759) [default: unpaced]
     --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
     --in-flight N          inline runs: commits each shard's thread keeps in flight
                            [default: 16, the judged shape]; fewer trade throughput for
@@ -99,12 +102,14 @@ OPTIONS:
     --shards N             Pigeonhole shards (scaling: N; default one per physical core)
     --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
                            shard) [default: 64 MiB]
-    --rate OPS             offer the measured operations at about OPS per second in all
-                           (each client paced to OPS / clients; the warmup is not), so
-                           latency is service time at that load instead of at the
-                           store's maximum (#759: read p99 at equal offered load)
     --cache B              every engine's read cache (SQLite: page cache gets
                            write buffer + cache) [default: 256 MiB]
+    --cache-model M        per-store or total [default: per-store]. per-store: each
+                           store's own setting gets --cache (SQLite's page cache is per
+                           connection, one per client; Pigeonhole's row cache comes on
+                           top). total: --cache is each store's whole read-cache memory
+                           (Pigeonhole: block + row cache; SQLite: split across its
+                           connections), so every store caches the same bytes (#759)
     --sync                 fsync every commit on every engine [default: buffered];
                            the same as --durability sync
     --durability MODE      buffered, sync, group-sync or default [default: buffered].
@@ -150,6 +155,9 @@ OPTIONS:
     --adaptive-shard-threads
                            Pigeonhole: the load controller sizes the shard threads
                            (D289, experimental) [default: a thread per shard]
+    --driver-trace PATH    Pigeonhole: append the driver controller's 100 ms windows and
+                           the run's phase marks to PATH as JSON lines (#1015); without
+                           --adaptive-shard-threads the controller only observes
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
     --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
@@ -193,7 +201,7 @@ struct Args {
     shards: Option<usize>,
     write_buffer: Option<u64>,
     cache: Option<u64>,
-    rate: Option<f64>,
+    cache_model: Option<pigeonhole_bench::CacheModel>,
     sync: bool,
     /// `--durability`: `None` is buffered (or `--sync`).
     durability: Option<Durability>,
@@ -217,6 +225,7 @@ struct Args {
     compaction_cores: Option<usize>,
     server_profile: bool,
     adaptive_shard_threads: bool,
+    driver_trace: Option<std::path::PathBuf>,
     commit_spin: Option<u64>,
     txn_backoff: Option<u64>,
     dir: Option<PathBuf>,
@@ -266,7 +275,15 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 a.write_buffer = Some(parse(&arg, it.next())?)
             }
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
-            "--rate" => a.rate = Some(parse(&arg, it.next())?),
+            "--cache-model" => {
+                a.cache_model = Some(match it.next().as_deref() {
+                    Some("per-store") => pigeonhole_bench::CacheModel::PerStore,
+                    Some("total") => pigeonhole_bench::CacheModel::Total,
+                    other => {
+                        return Err(format!("--cache-model: per-store or total, not {other:?}"));
+                    }
+                })
+            }
             "--sync" => a.sync = true,
             "--durability" => match it.next().as_deref() {
                 Some("buffered") => a.durability = None,
@@ -293,6 +310,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--compaction-cores" => a.compaction_cores = Some(parse(&arg, it.next())?),
             "--server-profile" => a.server_profile = true,
             "--adaptive-shard-threads" => a.adaptive_shard_threads = true,
+            "--driver-trace" => a.driver_trace = Some(parse(&arg, it.next())?),
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
             "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
@@ -357,6 +375,7 @@ fn memory(a: &Args) -> MemoryBudget {
     MemoryBudget {
         write_buffer: a.write_buffer.unwrap_or(d.write_buffer),
         cache: a.cache.unwrap_or(d.cache),
+        model: a.cache_model.unwrap_or(d.model),
     }
 }
 
@@ -396,6 +415,9 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if a.adaptive_shard_threads {
         r = r.adaptive_shard_threads();
+    }
+    if let Some(path) = &a.driver_trace {
+        r = r.driver_trace(path);
     }
     if let Some(us) = a.commit_spin {
         r = r.commit_spin_micros(us);
@@ -538,7 +560,7 @@ fn one(
         }),
         min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
         max_measured: max_measured(a),
-        offered_rate: a.rate,
+        offered_rate: a.offered_rate,
         ..RunOptions::default()
     };
     let result = run_detailed(runner, config, &dir, &options)
@@ -788,8 +810,11 @@ mod tests {
         let c = config(&a, WorkloadKind::YcsbA).unwrap();
         assert_eq!((c.records, c.operations), (10, 20));
         assert!(a.sync);
-        assert_eq!(a.rate, None);
-        assert_eq!(args("ycsb-f --rate 38500").rate, Some(38500.0));
+        assert_eq!(a.offered_rate, None);
+        assert_eq!(
+            args("ycsb-f --offered-rate 38500").offered_rate,
+            Some(38500.0)
+        );
         assert!(!a.no_tablet_changes);
         assert!(!args("scaling --tablet-changes").no_tablet_changes);
         assert!(args("scaling --no-tablet-changes").no_tablet_changes);
@@ -853,6 +878,15 @@ mod tests {
         assert_eq!(memory(&a).cache, 1 << 20);
         assert_eq!(memory(&a).write_buffer, 8 << 20);
         assert_eq!(memory(&args("ycsb-c")), MemoryBudget::default());
+        // #759: the cache model, per store by default.
+        assert_eq!(
+            memory(&args("ycsb-c")).model,
+            pigeonhole_bench::CacheModel::PerStore
+        );
+        let a = args("ycsb-c --cache 1073741824 --cache-model total");
+        assert_eq!(memory(&a).model, pigeonhole_bench::CacheModel::Total);
+        assert_eq!(memory(&a).cache, 1 << 30);
+        assert!(parse_args(["ycsb-c", "--cache-model", "shared"].map(String::from)).is_err());
     }
 
     #[test]

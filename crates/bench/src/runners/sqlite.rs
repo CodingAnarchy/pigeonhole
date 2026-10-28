@@ -1,13 +1,15 @@
 //! SQLite as an entity-attribute-value table: one row per cell in a `WITHOUT ROWID`
 //! table keyed by `(row, family, qualifier)`, WAL journal mode, with a page cache of
-//! the whole [`MemoryBudget`] (SQLite has no separate write buffer).
+//! the whole [`MemoryBudget`] (SQLite has no separate write buffer): on every connection
+//! ([`CacheModel::PerStore`]), or split across the connections ([`CacheModel::Total`]).
 
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
 use super::{
-    Counted, MemoryBudget, Touched, durability, modified, now_micros, transfer_balances, ttl_micros,
+    CacheModel, Counted, MemoryBudget, Touched, durability, modified, now_micros,
+    transfer_balances, ttl_micros,
 };
 use crate::workload::{METRIC_FAMILY, YCSB_FAMILY};
 use crate::{BenchOp, Client, Runner};
@@ -69,6 +71,9 @@ pub struct SqliteRunner {
     memory: MemoryBudget,
     path: Option<PathBuf>,
     conn: Option<Conn>,
+    /// Client threads of the run ([`Runner::plan_clients`]); with the runner's own
+    /// connection, what [`CacheModel::Total`] splits the page cache across.
+    clients: usize,
 }
 
 impl SqliteRunner {
@@ -93,8 +98,18 @@ impl SqliteRunner {
         self
     }
 
-    fn page_cache(&self) -> u64 {
+    /// The whole page-cache budget, `write_buffer + cache`.
+    fn budget(&self) -> u64 {
         self.memory.write_buffer + self.memory.cache
+    }
+
+    /// Page cache bytes of each connection: the budget, or under [`CacheModel::Total`] its
+    /// share among the clients and the runner's own connection.
+    fn page_cache(&self) -> u64 {
+        match self.memory.model {
+            CacheModel::PerStore => self.budget(),
+            CacheModel::Total => self.budget() / (self.clients as u64 + 1),
+        }
     }
 }
 
@@ -165,6 +180,15 @@ impl Runner for SqliteRunner {
         Ok(())
     }
 
+    fn plan_clients(&mut self, clients: usize) {
+        self.clients = clients;
+        if let Some(Conn(c)) = &self.conn {
+            // The runner's own connection keeps its share (it loaded with the whole budget).
+            let kib = i64::try_from(self.page_cache() / 1024).unwrap_or(i64::MAX);
+            let _ = c.pragma_update(None, "cache_size", -kib);
+        }
+    }
+
     fn client(&self) -> Option<Box<dyn Client>> {
         let conn = connect(self.path.as_ref()?, self.sync, self.page_cache()).ok()?;
         Some(Box::new(conn))
@@ -172,8 +196,11 @@ impl Runner for SqliteRunner {
 
     fn describe(&self) -> String {
         format!(
-            "page_cache={}MiB {}{}",
-            self.page_cache() >> 20,
+            "page_cache={} {}{}",
+            match self.memory.model {
+                CacheModel::PerStore => format!("{}MiB", self.budget() >> 20),
+                CacheModel::Total => format!("{}MiB total", self.budget() >> 20),
+            },
             durability(self.sync),
             if self.load_buffered {
                 " load=buffered"
@@ -458,5 +485,38 @@ impl Conn {
             }
         }
         Ok(t)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn total_cache_model_splits_the_page_cache_across_connections() {
+        let total = MemoryBudget {
+            cache: 1024 << 20,
+            write_buffer: 64 << 20,
+            model: CacheModel::Total,
+        };
+        let mut r = SqliteRunner::default().memory(total);
+        // Before the run's clients are known, the runner's own connection has the budget.
+        assert_eq!(r.page_cache(), 1088 << 20);
+        r.plan_clients(16);
+        assert_eq!(r.page_cache(), (1088 << 20) / 17);
+        assert!(
+            r.describe().starts_with("page_cache=1088MiB total "),
+            "{}",
+            r.describe()
+        );
+        // Per store (the default): every connection gets the whole budget.
+        let mut r = SqliteRunner::default();
+        r.plan_clients(16);
+        assert_eq!(r.page_cache(), 320 << 20);
+        assert!(
+            r.describe().starts_with("page_cache=320MiB "),
+            "{}",
+            r.describe()
+        );
     }
 }

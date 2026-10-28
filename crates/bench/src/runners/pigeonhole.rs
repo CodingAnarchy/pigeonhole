@@ -11,7 +11,9 @@ use pigeonhole::{
     RowMutation, Table, Transaction, ValueFilter,
 };
 
-use super::{BLOOM_BITS, Counted, MemoryBudget, Touched, durability, modified, transfer_balances};
+use super::{
+    BLOOM_BITS, CacheModel, Counted, MemoryBudget, Touched, durability, modified, transfer_balances,
+};
 use crate::workload::{FAMILIES, METRIC_FAMILY, TIME_SERIES_TTL, XSHARD_PARTITIONS, YCSB_FAMILY};
 use crate::{BenchOp, Client, PigeonholeRunner, Runner, ShardShare};
 
@@ -58,6 +60,9 @@ pub(crate) struct Settings {
     pub(crate) server_profile: bool,
     /// `Options::adaptive_shard_threads(true)` (D289's controller, experimental) when set.
     pub(crate) adaptive_shard_threads: bool,
+    /// Appends the driver controller's windows and the run's phase marks to this file, one
+    /// JSON object a line (`Pigeonhole::driver_trace`, #1015).
+    pub(crate) driver_trace: Option<std::path::PathBuf>,
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
@@ -103,6 +108,35 @@ pub(crate) struct Open {
     riders: Option<riders::Running>,
     /// The reader processes while the measured phase runs.
     readers: Option<super::reader_process::Running>,
+    /// [`Settings::driver_trace`]'s file.
+    trace: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl Open {
+    /// Writes the driver windows logged since the last call, then `phase`'s mark.
+    fn trace(&mut self, phase: &str, store: Option<&str>) -> Result<(), String> {
+        use std::io::Write;
+        let Some(out) = self.trace.as_mut() else {
+            return Ok(());
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        let mut write = || -> std::io::Result<()> {
+            for line in self.target.db.driver_trace() {
+                writeln!(out, "{line}")?;
+            }
+            match store {
+                Some(s) => writeln!(
+                    out,
+                    r#"{{"phase":"{phase}","at_us":{at},"store":"{}"}}"#,
+                    s.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+                None => writeln!(out, r#"{{"phase":"{phase}","at_us":{at}}}"#),
+            }
+        };
+        write().map_err(|e| format!("driver trace: {e}"))
+    }
 }
 
 /// How many times a write refused with `Busy` is retried (each after the engine's own
@@ -453,6 +487,15 @@ impl PigeonholeRunner {
         self
     }
 
+    /// Appends the driver controller's windows to `path`, one JSON object a line, with the
+    /// run's phase marks between them (`Pigeonhole::driver_trace`, #1015). Without
+    /// [`adaptive_shard_threads`](Self::adaptive_shard_threads) the controller observes:
+    /// it logs what it would decide but never resizes.
+    pub fn driver_trace(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.settings.driver_trace = Some(path.into());
+        self
+    }
+
     /// Application-owned runs ([`run_inline`](Self::run_inline) without
     /// [`inline_engine_owned`](Self::inline_engine_owned)): `n` background workers for flush
     /// and compaction (`Options::background_workers`, D284), each driven on a thread of its
@@ -677,6 +720,23 @@ mod riders {
 }
 
 /// The store's options for `s` (shared by the runner and the inline scaling driver).
+/// The library's default row cache (`pigeonhole::Options`, D216), set explicitly under
+/// [`CacheModel::Total`] so the block cache gets exactly the rest of the budget.
+const LIBRARY_ROW_CACHE: u64 = 64 << 20;
+
+/// Block cache and row cache bytes (`None`: the library's row cache). Under
+/// [`CacheModel::Total`] the two share [`MemoryBudget::cache`]; under `PerStore` the block
+/// cache gets all of it and the row cache comes on top.
+fn caches(s: &Settings) -> (u64, Option<u64>) {
+    match s.memory.model {
+        CacheModel::PerStore => (s.memory.cache, s.row_cache),
+        CacheModel::Total => {
+            let row = s.row_cache.unwrap_or(LIBRARY_ROW_CACHE).min(s.memory.cache);
+            (s.memory.cache - row, Some(row))
+        }
+    }
+}
+
 pub(crate) fn options(s: &Settings) -> Options {
     let mut options = Options::default();
     if !s.default_durability {
@@ -688,9 +748,10 @@ pub(crate) fn options(s: &Settings) -> Options {
             Durability::Buffered
         });
     }
+    let (block_cache, row_cache) = caches(s);
     let mut options = options
         .memtable_budget(s.memory.write_buffer)
-        .block_cache(usize::try_from(s.memory.cache).unwrap_or(usize::MAX));
+        .block_cache(usize::try_from(block_cache).unwrap_or(usize::MAX));
     if let Some(yes) = s.tablet_changes {
         options = options.tablet_changes(yes);
     }
@@ -703,7 +764,7 @@ pub(crate) fn options(s: &Settings) -> Options {
     if let Some(n) = s.shards {
         options = options.shards(n);
     }
-    if let Some(bytes) = s.row_cache {
+    if let Some(bytes) = row_cache {
         options = options.row_cache(usize::try_from(bytes).unwrap_or(usize::MAX));
     }
     if let Some(k) = s.shard_threads {
@@ -807,8 +868,29 @@ impl Runner for PigeonholeRunner {
             dir: dir.to_path_buf(),
             riders: None,
             readers: None,
+            trace: None,
         });
+        if let Some(path) = &self.settings.driver_trace {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("driver trace {}: {e}", path.display()))?;
+            let store = self.describe();
+            let open = self.open.as_mut().expect("just opened");
+            open.trace = Some(std::io::BufWriter::new(file));
+            open.trace("open", Some(&store))?;
+        }
         Ok(())
+    }
+
+    fn mark_phase(&mut self, phase: &str) {
+        if let Some(open) = self.open.as_mut()
+            && let Err(e) = open.trace(phase, None)
+        {
+            eprintln!("{e}");
+            open.trace = None;
+        }
     }
 
     fn execute(&mut self, op: &BenchOp) -> Result<(), String> {
@@ -816,6 +898,14 @@ impl Runner for PigeonholeRunner {
     }
 
     fn close(&mut self) -> Result<(), String> {
+        if let Some(open) = self.open.as_mut()
+            && open.trace.is_some()
+        {
+            open.trace("close", None)?;
+            if let Some(mut out) = open.trace.take() {
+                std::io::Write::flush(&mut out).map_err(|e| format!("driver trace: {e}"))?;
+            }
+        }
         match self.open.take() {
             Some(Open {
                 target:
@@ -984,9 +1074,17 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={} bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
-            s.memory.cache >> 20,
+            match (s.memory.model, caches(s)) {
+                (CacheModel::Total, (block, Some(row))) => format!(
+                    "{}MiB total (block {}MiB + row {}MiB)",
+                    s.memory.cache >> 20,
+                    block >> 20,
+                    row >> 20
+                ),
+                _ => format!("{}MiB", s.memory.cache >> 20),
+            },
             if s.default_durability {
                 default_durability()
             } else if s.group_sync {
@@ -1005,10 +1103,11 @@ impl Runner for PigeonholeRunner {
                 (false, true) => " tablets=on packing=off",
             },
             if s.no_nowait_reads { " nowait=off" } else { "" },
-            match s.row_cache {
-                None => String::new(),
-                Some(0) => " rowcache=off".to_owned(),
-                Some(bytes) => format!(" rowcache={}MiB", bytes >> 20),
+            match (s.memory.model, s.row_cache) {
+                // Under the total model the cache field above names the row cache.
+                (CacheModel::Total, _) | (_, None) => String::new(),
+                (_, Some(0)) => " rowcache=off".to_owned(),
+                (_, Some(bytes)) => format!(" rowcache={}MiB", bytes >> 20),
             },
             s.shard_spin_micros
                 .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
@@ -1617,6 +1716,36 @@ mod tests {
     }
 
     #[test]
+    fn total_cache_model_shares_the_budget_between_block_and_row_cache() {
+        let total = |cache: u64| MemoryBudget {
+            cache,
+            model: CacheModel::Total,
+            ..MemoryBudget::default()
+        };
+        let r = PigeonholeRunner::default().memory(total(1 << 30));
+        assert_eq!(
+            caches(&r.settings),
+            ((1 << 30) - (64 << 20), Some(64 << 20))
+        );
+        assert!(
+            r.describe()
+                .contains("cache=1024MiB total (block 960MiB + row 64MiB)"),
+            "{}",
+            r.describe()
+        );
+        let r = r.row_cache(0);
+        assert_eq!(caches(&r.settings), (1 << 30, Some(0)));
+        // Per store (the default): the block cache gets it all, the library's row cache on top.
+        let r = PigeonholeRunner::default().memory(MemoryBudget::default());
+        assert_eq!(caches(&r.settings), (256 << 20, None));
+        assert!(
+            r.describe().contains(" cache=256MiB bloom="),
+            "{}",
+            r.describe()
+        );
+    }
+
+    #[test]
     fn cells_older_than_the_ttl_are_not_read() {
         let (mut r, dir) = opened("ttl");
         let mut w = Workload::new(WorkloadConfig::smoke(WorkloadKind::TimeSeriesTtl));
@@ -1686,6 +1815,48 @@ mod tests {
             }
         }
         r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #1015: a traced run writes the store's description, then its phase marks in order,
+    /// with the driver windows logged in each phase between them.
+    #[test]
+    fn a_traced_run_marks_its_phases_between_the_driver_windows() {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-trace-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let path = dir.join("drivers.jsonl");
+        let mut r = PigeonholeRunner::default()
+            .shards(2)
+            .memtable_budget(16 << 20)
+            .driver_trace(&path);
+        let config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+        crate::run_detailed(
+            &mut r,
+            &config,
+            &dir.join("db"),
+            &crate::RunOptions::default(),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let phases: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix(r#"{"phase":""#))
+            .map(|l| l.split('"').next().unwrap())
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "open", "load", "settle", "warmup", "measured", "end", "close"
+            ],
+            "{text}"
+        );
+        assert!(
+            text.lines().next().unwrap().contains(r#""store":"#),
+            "{text}"
+        );
+        for l in text.lines().filter(|l| !l.starts_with(r#"{"phase""#)) {
+            assert!(l.starts_with(r#"{"seq":"#) && l.ends_with('}'), "{l}");
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 

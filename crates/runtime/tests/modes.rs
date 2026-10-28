@@ -1273,6 +1273,68 @@ fn a_released_target_without_the_controller_returns_to_a_thread_per_shard() {
     rt.shutdown().unwrap();
 }
 
+/// #1015: a trace without the load controller observes. It logs every driver's window and
+/// what the controller would decide, here a shrink (a light load, a wake per message), but
+/// never resizes.
+#[test]
+fn a_trace_without_the_controller_logs_its_decisions_but_never_resizes() {
+    let rt = Arc::new(Runtime::start(config(4, PreadVfs::new(1)), handlers(4)).unwrap());
+    assert!(
+        rt.driver_trace().is_empty(),
+        "nothing logged before the trace started"
+    );
+    let stop = Arc::new(AtomicBool::new(false));
+    let clients: Vec<_> = (0..4u16)
+        .map(|shard| {
+            let (rt, stop) = (Arc::clone(&rt), Arc::clone(&stop));
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let (n, w) = completion();
+                    rt.submitter(ShardId(shard))
+                        .submit(Msg::Echo(1, n))
+                        .unwrap();
+                    assert_eq!(w.wait(), Some(1));
+                    thread::sleep(Duration::from_micros(200));
+                }
+            })
+        })
+        .collect();
+    let mut lines = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !lines
+        .iter()
+        .any(|l: &String| l.contains(r#""why":"Shrink""#))
+        && Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(100));
+        lines.extend(rt.driver_trace());
+        assert_eq!(rt.driver_target(), 4, "an observing controller resized");
+    }
+    stop.store(true, Ordering::Relaxed);
+    for c in clients {
+        c.join().unwrap();
+    }
+    let shrink = lines
+        .iter()
+        .find(|l| l.contains(r#""why":"Shrink""#))
+        .unwrap_or_else(|| panic!("no shrink decided in {} windows", lines.len()));
+    assert!(shrink.contains(r#""applied":false"#), "{shrink}");
+    assert!(
+        shrink.contains(r#""k":4,"ceiling":4,"adaptive":false"#),
+        "{shrink}"
+    );
+    let first = &lines[0];
+    assert!(first.starts_with(r#"{"seq":0,"#), "{first}");
+    let ops = first
+        .split(r#""ops":["#)
+        .nth(1)
+        .and_then(|r| r.split(']').next())
+        .unwrap();
+    assert_eq!(ops.split(',').count(), 4, "one column per driver: {first}");
+    assert_eq!(rt.driver_target(), 4);
+    Arc::into_inner(rt).unwrap().shutdown().unwrap();
+}
+
 #[test]
 fn drop_without_shutdown_joins_threads() {
     let (cfg, _) = sim_config(2);

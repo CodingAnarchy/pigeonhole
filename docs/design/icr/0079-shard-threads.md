@@ -47,3 +47,12 @@ PR 1 fixes the count, so the box A/B at k ∈ {1, 2, 4, 8, 16} can choose the de
 - **`pigeonhole-io`:** doc-hidden `cross_ring_wait_slices()`.
 - **`pigeonhole-bench`:** `Runner::driver_target()`, `RunDetail::drivers`, and `PigeonholeRunner::adaptive_shard_threads()` / `--adaptive-shard-threads`.
 
+
+## #1015 additions (the controller's trace)
+
+Approved by the coordinator (2026-10-28) as an amendment to this record. All are doc-hidden but public, so semver checks cover them.
+
+- **`pigeonhole-runtime`:** `Runtime::driver_trace() -> Vec<String>`. It returns the controller's windows since the last call, one JSON object each. The first call starts the log. Without `adaptive_drivers`, it also starts an observe-only controller, which logs what it would decide but never resizes.
+- **`pigeonhole-engine`:** `Engine::driver_trace() -> Vec<String>`, which is empty in application-owned mode.
+- **`pigeonhole`:** `Pigeonhole::driver_trace() -> Vec<String>`. It returns JSON lines rather than a struct, so no new public type is added for a bench hook.
+- **`pigeonhole-bench`:** `Runner::mark_phase(&str)`, `PigeonholeRunner::driver_trace(path)` and `--driver-trace PATH`.

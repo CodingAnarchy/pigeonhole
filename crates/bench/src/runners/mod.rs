@@ -27,12 +27,12 @@ pub const BLOOM_BITS: u8 = 10;
 
 /// Memory every store may use, so no engine wins by caching more than another.
 ///
-/// | Store | Write buffer | Read cache |
-/// |---|---|---|
-/// | Pigeonhole | `memtable_budget` (per shard; one table is on one shard) | `block_cache` |
-/// | RocksDB | `write_buffer_size` | LRU block cache |
-/// | fjall | `max_memtable_size` | `cache_size` |
-/// | SQLite | — | page cache (`cache_size`) of `write_buffer + cache` |
+/// | Store | Write buffer | Read cache, [`CacheModel::PerStore`] | Read cache, [`CacheModel::Total`] |
+/// |---|---|---|---|
+/// | Pigeonhole | `memtable_budget` (per shard; one table is on one shard) | `block_cache`, plus the library's row cache | `block_cache` + `row_cache` = `cache` |
+/// | RocksDB | `write_buffer_size` | LRU block cache | the same |
+/// | fjall | `max_memtable_size` | `cache_size` | the same |
+/// | SQLite | — | page cache (`cache_size`) of `write_buffer + cache` per connection | `write_buffer + cache` split across its connections |
 ///
 /// The default is a 64 MiB write buffer (Pigeonhole's and RocksDB's default) and a 256 MiB
 /// read cache (Pigeonhole's default block cache).
@@ -50,6 +50,26 @@ pub struct MemoryBudget {
     pub write_buffer: u64,
     /// Bytes of read cache (block or page cache).
     pub cache: u64,
+    /// How `cache` maps onto stores whose read cache is not one shared pool.
+    pub model: CacheModel,
+}
+
+/// How [`MemoryBudget::cache`] maps onto a store whose read memory is not one shared cache
+/// (#759).
+///
+/// SQLite's page cache (`cache_size`) is private to each connection, and the bench opens one
+/// connection per client thread, so under [`PerStore`](Self::PerStore) 16 clients give SQLite
+/// 17 caches of `write_buffer + cache`. Pigeonhole's row cache comes on top of its block
+/// cache. [`Total`](Self::Total) holds every store to the same read-cache memory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CacheModel {
+    /// Each store's own setting gets `cache`, as the bench did before #759 (the default, so
+    /// earlier results stay comparable).
+    #[default]
+    PerStore,
+    /// `cache` is each store's whole read-cache memory: Pigeonhole's block and row caches
+    /// share it, and SQLite's connections split `write_buffer + cache` between them.
+    Total,
 }
 
 impl MemoryBudget {
@@ -66,6 +86,7 @@ impl MemoryBudget {
         Self {
             write_buffer: 8 << 20,
             cache: 16 << 20,
+            model: CacheModel::PerStore,
         }
     }
 }
@@ -75,6 +96,7 @@ impl Default for MemoryBudget {
         Self {
             write_buffer: 64 << 20,
             cache: 256 << 20,
+            model: CacheModel::PerStore,
         }
     }
 }
@@ -83,9 +105,13 @@ impl std::fmt::Display for MemoryBudget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "write_buffer={}MiB cache={}MiB",
+            "write_buffer={}MiB cache={}MiB{}",
             self.write_buffer >> 20,
-            self.cache >> 20
+            self.cache >> 20,
+            match self.model {
+                CacheModel::PerStore => "",
+                CacheModel::Total => " (total)",
+            }
         )
     }
 }

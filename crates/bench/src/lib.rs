@@ -54,7 +54,7 @@ pub use runners::rocksdb::RocksDbRunner;
 pub use runners::rocksdb_txn::{RocksDbTxnRunner, TxnMode};
 #[cfg(feature = "sqlite")]
 pub use runners::sqlite::SqliteRunner;
-pub use runners::{BLOOM_BITS, MemoryBudget};
+pub use runners::{BLOOM_BITS, CacheModel, MemoryBudget};
 pub use workload::{
     COUNTER_THREADS, CROSS_SHARD_COMMIT, EDGE_FAMILY, FAMILIES, GROUP_COMMIT_CELLS,
     GROUP_COMMIT_ROWS, GROUP_COMMIT_THREADS, METRIC_FAMILY, SPARSE_FAMILY, TIME_SERIES_TTL,
@@ -595,6 +595,11 @@ pub trait Runner {
         0
     }
 
+    /// Called with the number of client threads before [`client`](Self::client) is asked for
+    /// them, for a store that sizes per-connection memory from it (SQLite under
+    /// [`CacheModel::Total`]). The default does nothing.
+    fn plan_clients(&mut self, _clients: usize) {}
+
     /// A client for another thread, sharing the open store. `None` (the default) means
     /// the runner serves one client, and [`run`] uses one thread whatever
     /// [`WorkloadConfig::threads`] asks for.
@@ -633,6 +638,10 @@ pub trait Runner {
     fn pack_target(&self) -> Option<(usize, usize)> {
         None
     }
+
+    /// Marks the start of a run phase (`load`, `settle`, `warmup`, `measured`, then `end`)
+    /// in the store's driver trace, if one was asked for (#1015); the default does nothing.
+    fn mark_phase(&mut self, _phase: &str) {}
 
     /// The driver threads the store's shards run on and whether every shard is on its
     /// driver (D289 PR 2), `None` (the default) for stores without a load controller. The
@@ -1160,14 +1169,17 @@ fn measure(
     offered_rate: Option<f64>,
 ) -> Result<Measured, String> {
     let load_start = Instant::now();
+    runner.mark_phase("load");
     for op in workload.load_ops() {
         runner.execute(&op).map_err(|e| format!("load: {e}"))?;
     }
     let load = load_start.elapsed();
+    runner.mark_phase("settle");
     let settled = settle(runner)?;
     let switched = runner.measured_durability()?;
 
     let threads = config.threads.max(1);
+    runner.plan_clients(if threads > 1 { threads } else { 0 });
     let mut clients: Vec<Box<dyn Client>> = if threads > 1 {
         (0..threads).map_while(|_| runner.client()).collect()
     } else {
@@ -1194,6 +1206,7 @@ fn measure(
     } else {
         (WARMUP_SETTLED, WARMUP_CAP)
     };
+    runner.mark_phase("warmup");
     let warmed = warm_up(runner, &mut clients, &warm, quiet, cap)?;
 
     // The measured operations: the configured count, then, while less than `min_measured`
@@ -1213,6 +1226,7 @@ fn measure(
     // D247: past `max_measured` no client starts another operation.
     let deadline = max_measured.map(|m| Instant::now() + m);
     let mut capped = false;
+    runner.mark_phase("measured");
     loop {
         let chunk: Vec<BenchOp> = ops.by_ref().take(next as usize).collect();
         if chunk.is_empty() {
@@ -1247,6 +1261,7 @@ fn measure(
         let rest = (min_measured - elapsed).as_secs_f64() * rate * 1.1;
         next = (rest.ceil() as u64).max(MIN_EXTRA_OPS);
     }
+    runner.mark_phase("end");
     let shards = (
         shares_between(&before.0, &runner.shard_shares()),
         stalls_between(before.1, runner.stalls()),

@@ -2753,6 +2753,19 @@ impl Engine {
         }
     }
 
+    /// The load controller's windows since the last call, one JSON object each (D289,
+    /// #1015); empty in application-owned mode. The first call starts the log, and without
+    /// the controller an observe-only one that never resizes. A bench hook.
+    #[doc(hidden)]
+    pub fn driver_trace(&self) -> Vec<String> {
+        let rt = self
+            .inner
+            .runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        rt.as_ref().map(|rt| rt.driver_trace()).unwrap_or_default()
+    }
+
     /// Per-shard commits, tablets and tablet changes, indexed by shard (a bench hook,
     /// issue #51).
     #[doc(hidden)]

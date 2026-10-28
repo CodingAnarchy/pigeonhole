@@ -1,0 +1,2 @@
+### Added
+- `pigeonhole-bench` `--cache-model per-store|total`: `total` holds every store to the same read-cache memory (#759). Pigeonhole's block and row caches share `--cache`, and SQLite's per-connection page caches split it across the connections, where before each of SQLite's connections (one per client thread) got the whole budget. `per-store`, the default, keeps today's sizes so earlier results stay comparable.
