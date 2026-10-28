@@ -677,9 +677,18 @@ fn env_count(name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Background workers the checker's runs start (`PIGEONHOLE_BACKGROUND_WORKERS`, D284).
-pub fn background_workers() -> usize {
-    env_count("PIGEONHOLE_BACKGROUND_WORKERS") as usize
+/// Background workers the checker's runs start (`PIGEONHOLE_BACKGROUND_WORKERS`, D284): none
+/// under deferred I/O. The real backends complete a worker's I/O before its slice returns
+/// (`pigeonhole_io::inline_io`); the simulator defers it, and a client then waits behind it
+/// at every synchronous root commit. #1038's first sweep ran 17 times slower and ran its
+/// runners out of memory; the engine on real files does not wait
+/// (`background_workers.rs`, the large-value test).
+pub fn background_workers(cfg: &Config) -> usize {
+    if cfg.deferred_io {
+        0
+    } else {
+        env_count("PIGEONHOLE_BACKGROUND_WORKERS") as usize
+    }
 }
 
 /// Options with the checker's flush and compaction knobs, and the sweep switches for paths
@@ -696,7 +705,7 @@ pub fn options_for(vfs: Arc<SimVfs>, shards: usize, cfg: &Config) -> EngineOptio
     if steps != 0 {
         o.counter_checkpoint_steps = steps;
     }
-    o.background_workers = background_workers();
+    o.background_workers = background_workers(cfg);
     o.memtable_freeze_bytes = cfg.memtable_freeze_bytes;
     o.compaction = cfg.compaction.clone();
     o.tablet_changes = cfg.tablet_changes;
@@ -5216,7 +5225,7 @@ fn run_with(
         );
     }
     // Background workers as scheduler tasks too (none unless `PIGEONHOLE_BACKGROUND_WORKERS`).
-    for i in 0..background_workers() {
+    for i in 0..background_workers(cfg) {
         let world = world.clone();
         let vfs = Arc::clone(&vfs);
         sim.spawn(
