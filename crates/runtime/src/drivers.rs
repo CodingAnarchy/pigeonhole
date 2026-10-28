@@ -25,14 +25,19 @@ use pigeonhole_io::VfsRef;
 use crate::signal::WakeTarget;
 use crate::{EnterShard, RING_IDLE_WAIT, ShardCore, ShardHandler, ShardId, Submitter, sched};
 
-/// A pass longer than this kept a message waiting too long behind its siblings' turns: the
-/// controller grows when more than 1% of a driver's passes run over it (#997's A/B: heavy
-/// rows at one driver had pass p99s of 128-256 µs, light ones far under).
+/// A pass longer than this kept a message waiting too long behind its siblings' turns (#997's
+/// A/B: heavy rows at one driver had pass p99s of 128-256 µs, light ones far under). More
+/// than [`SLOW_PASSES`] of them hold off a shrink.
 const PASS_BUDGET_NANOS: u64 = 100_000;
 /// The controller's window.
 const WINDOW: Duration = Duration::from_millis(100);
 /// Windows a grow condition must hold over (1 s).
 const GROW_WINDOWS: usize = 10;
+/// Windows the sibling-wait rule sums over (2 s): over 10, one spike of sparse-wide's at 2
+/// drivers (0.16) grew it to 4 for 40 s, while over 20 its highest was 0.13, and the loads
+/// that need more drivers held (ycsb-f at 8: 0.27; transfer at 8: 0.15 median; #1015's
+/// first round).
+const WAIT_WINDOWS: usize = 20;
 /// Windows a shrink condition must hold over at first (5 s); doubled by a shrink a grow
 /// undid within [`UNDO`], up to [`MAX_SHRINK_WINDOWS`] (D255's damping).
 const SHRINK_WINDOWS: usize = 50;
@@ -40,14 +45,26 @@ const MAX_SHRINK_WINDOWS: usize = 800;
 /// No resize within this long after another.
 const HOLD: Duration = Duration::from_secs(2);
 const UNDO: Duration = Duration::from_secs(60);
-/// Awake-busy (turn time over the window) above which a driver grows the set.
-const GROW_BUSY: f64 = 0.75;
+/// Awake-busy (turn time over the window) above which a driver grows the set: a backstop
+/// for a saturated driver. Sibling wait is the grow signal; in #1015's first round it fired
+/// wherever busy did, and busy at 0.75 added no grow it missed.
+const GROW_BUSY: f64 = 0.9;
 /// A shrink keeps the remaining drivers at most this busy on average.
 const SHRINK_BUSY: f64 = 0.5;
-/// Producer wakes per message above which fewer drivers would park less.
-const SHRINK_WAKES_PER_OP: f64 = 0.05;
-/// Slow passes (over [`PASS_BUDGET_NANOS`]) above this fraction grow the set.
+/// Producer wakes per message above which fewer drivers would park less. #1015's first
+/// round, over the shrink windows of the measured phases: sparse-wide 0.107-0.82 (where
+/// fewer drivers keep its put tail at 33-43 µs, against 553 at 16), and ycsb-f, transfer and
+/// ycsb-a at most 0.082. At 0.05 ycsb-f shrank 16 -> 8 and regretted (-4% at 8).
+const SHRINK_WAKES_PER_OP: f64 = 0.10;
+/// Slow passes (over [`PASS_BUDGET_NANOS`]) above this fraction hold off a shrink. Not a
+/// grow signal: in #1015's first round it read 50-100% in the settle step on a few ops a
+/// window, and fired in load phases on flush and compaction slices with nothing waiting
+/// (ycsb-a 4 -> 8, wait 0.03); in the measured phases it never fired without sibling wait.
 const SLOW_PASSES: f64 = 0.01;
+/// The fewest drivers the shrink goes to. One driver never paid off: the controller took
+/// sparse-wide to 1 twice in #1015's first round and regretted both within 2 s (sibling wait
+/// 0.27), while 2 holds its tail gain.
+const MIN_DRIVERS: usize = 2;
 /// A shrink needs at least this many ops per window on average: an idle store's drivers
 /// park and cost nothing, while shrinking it in a gap between bursts left the next burst
 /// growing back through its first seconds (#1006's third A/B: every heavy run started 16 -> 2).
@@ -557,16 +574,19 @@ impl Controller {
         if k < ceiling && self.windows.len() >= GROW_WINDOWS {
             let n = GROW_WINDOWS as f64;
             let busy = recent(GROW_WINDOWS).map(|w| w.max_busy).sum::<f64>() / n;
-            let slow = recent(GROW_WINDOWS).map(|w| w.slow).sum::<f64>() / n;
-            let (wait, served, ops) = recent(GROW_WINDOWS).fold((0, 0, 0), |(a, b, o), w| {
-                (a + w.wait_nanos, b + w.busy_nanos, o + w.ops)
-            });
-            let waiting = ops >= SHRINK_MIN_OPS * GROW_WINDOWS as u64
-                && wait as f64 > GROW_WAIT * served as f64;
+            let busy_ops: u64 = recent(GROW_WINDOWS).map(|w| w.ops).sum();
+            let saturated = busy_ops >= SHRINK_MIN_OPS * GROW_WINDOWS as u64 && busy > GROW_BUSY;
+            let waiting = self.windows.len() >= WAIT_WINDOWS && {
+                let (wait, served, ops) = recent(WAIT_WINDOWS).fold((0, 0, 0), |(a, b, o), w| {
+                    (a + w.wait_nanos, b + w.busy_nanos, o + w.ops)
+                });
+                ops >= SHRINK_MIN_OPS * WAIT_WINDOWS as u64
+                    && wait as f64 > GROW_WAIT * served as f64
+            };
             // Doubling, not one at a time: a driver's busy saturates at 1, so it can't say how
             // many more the work needs, and stepping up one per 3 s left transfer at 2-12 of 16
             // drivers through its measured phase (-10%; #1006's second A/B).
-            if busy > GROW_BUSY || slow > SLOW_PASSES || waiting {
+            if saturated || waiting {
                 return Some(((2 * k).min(ceiling), Why::Grow));
             }
         }
@@ -581,7 +601,7 @@ impl Controller {
             // Straight to the drivers the work needs at SHRINK_BUSY each, not one at a time:
             // stepping down one driver per 5 s took a light store about 100 s from 16 to 2,
             // past the bench's warm-up and most of its measured phase (#1006's first A/B).
-            let mut needed = ((sum_busy / SHRINK_BUSY).ceil() as usize).max(1);
+            let mut needed = ((sum_busy / SHRINK_BUSY).ceil() as usize).max(MIN_DRIVERS);
             // Not below a proven level until the load that proved it has fallen by half.
             if let Some((floor, floor_ops)) = self.floor {
                 let level = ops as f64 / n;
@@ -854,7 +874,7 @@ fn spin_poll<H: ShardHandler>(cores: &mut [ShardCore<H>], window: Duration, reap
 
 #[cfg(test)]
 mod tests {
-    use super::{Controller, GROW_WINDOWS, SHRINK_WINDOWS, Why, Window};
+    use super::{Controller, GROW_WINDOWS, SHRINK_WINDOWS, WAIT_WINDOWS, Why, Window};
     use std::collections::VecDeque;
     use std::time::Instant;
 
@@ -891,17 +911,26 @@ mod tests {
     /// each, not one at a time.
     #[test]
     fn a_light_load_shrinks_to_what_it_needs_in_one_step() {
-        let c = controller(vec![window(0.1, 0.6, 0.0, 100, 1000); SHRINK_WINDOWS]);
-        assert_eq!(c.decide(16, 16), Some((2, Why::Shrink)));
+        let c = controller(vec![window(0.1, 1.4, 0.0, 200, 1000); SHRINK_WINDOWS]);
+        assert_eq!(c.decide(16, 16), Some((3, Why::Shrink)));
         // Too little evidence yet: no change.
-        let c = controller(vec![window(0.1, 0.6, 0.0, 100, 1000); SHRINK_WINDOWS - 1]);
+        let c = controller(vec![window(0.1, 1.4, 0.0, 200, 1000); SHRINK_WINDOWS - 1]);
         assert_eq!(c.decide(16, 16), None);
-        // Few producer wakes: the drivers aren't parking, so fewer wouldn't help.
-        let c = controller(vec![window(0.1, 0.6, 0.0, 10, 1000); SHRINK_WINDOWS]);
+        // Few producer wakes: the drivers aren't parking, so fewer wouldn't help. 0.08 a
+        // message is ycsb-f's and transfer's at 8-16 drivers (#1015), which lose 4% at 8.
+        let c = controller(vec![window(0.1, 1.4, 0.0, 80, 1000); SHRINK_WINDOWS]);
         assert_eq!(c.decide(16, 16), None);
         // Slow passes: no shrink, even with wakes.
-        let c = controller(vec![window(0.1, 0.6, 0.05, 100, 1000); SHRINK_WINDOWS]);
+        let c = controller(vec![window(0.1, 1.4, 0.05, 200, 1000); SHRINK_WINDOWS]);
         assert_eq!(c.decide(16, 16), None);
+    }
+
+    /// The shrink stops at two drivers, however light the load: one never paid off (#1015).
+    #[test]
+    fn the_shrink_stops_at_two_drivers() {
+        let c = controller(vec![window(0.05, 0.1, 0.0, 500, 1000); SHRINK_WINDOWS]);
+        assert_eq!(c.decide(16, 16), Some((2, Why::Shrink)));
+        assert_eq!(c.decide(2, 16), None);
     }
 
     /// An idle store doesn't shrink, whatever its wakes per op: its drivers park.
@@ -927,18 +956,25 @@ mod tests {
         assert_eq!(c.decide(8, 16), None);
     }
 
-    /// A busy driver or slow passes double the set, up to the ceiling.
+    /// A saturated driver doubles the set, up to the ceiling. Slow passes alone don't: they
+    /// come with flush and compaction slices that nothing waits behind (#1015).
     #[test]
-    fn a_busy_driver_or_slow_passes_grow_the_set() {
-        let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
+    fn a_saturated_driver_grows_the_set_and_slow_passes_alone_do_not() {
+        let c = controller(vec![window(0.95, 1.9, 0.0, 0, 1000); GROW_WINDOWS]);
         assert_eq!(c.decide(2, 16), Some((4, Why::Grow)));
-        let c = controller(vec![window(0.3, 0.6, 0.02, 0, 1000); GROW_WINDOWS]);
-        assert_eq!(c.decide(2, 16), Some((4, Why::Grow)));
-        let c = controller(vec![window(0.9, 9.0, 0.0, 0, 1000); GROW_WINDOWS]);
+        let c = controller(vec![window(0.95, 9.5, 0.0, 0, 1000); GROW_WINDOWS]);
         assert_eq!(c.decide(12, 16), Some((16, Why::Grow)));
         // At the ceiling: no growth.
-        let c = controller(vec![window(0.9, 1.8, 0.0, 0, 1000); GROW_WINDOWS]);
+        let c = controller(vec![window(0.95, 1.9, 0.0, 0, 1000); GROW_WINDOWS]);
         assert_eq!(c.decide(16, 16), None);
+        // Busy but not saturated, or saturated on a few ops: no growth.
+        let c = controller(vec![window(0.8, 1.6, 0.0, 0, 1000); WAIT_WINDOWS]);
+        assert_eq!(c.decide(2, 16), None);
+        let c = controller(vec![window(0.95, 1.9, 0.0, 0, 50); WAIT_WINDOWS]);
+        assert_eq!(c.decide(2, 16), None);
+        // Slow passes alone.
+        let c = controller(vec![window(0.3, 0.6, 0.5, 0, 1000); WAIT_WINDOWS]);
+        assert_eq!(c.decide(2, 16), None);
     }
 
     /// Messages waiting behind sibling turns about as long as they're served double the set,
@@ -950,14 +986,17 @@ mod tests {
             busy_nanos: 80_000_000,
             ..window(0.4, 0.8, 0.0, 0, 1000)
         };
-        let c = controller(vec![waiting; GROW_WINDOWS]);
+        let c = controller(vec![waiting; WAIT_WINDOWS]);
         assert_eq!(c.decide(2, 16), Some((4, Why::Grow)));
+        // Over two seconds, not one: a second of waiting is not enough.
+        let c = controller(vec![waiting; WAIT_WINDOWS - 1]);
+        assert_eq!(c.decide(2, 16), None);
         let c = controller(vec![
             Window {
                 wait_nanos: 8_000_000,
                 ..waiting
             };
-            GROW_WINDOWS
+            WAIT_WINDOWS
         ]);
         assert_eq!(c.decide(2, 16), None);
     }
@@ -976,11 +1015,11 @@ mod tests {
             busy_nanos: 1_000_000,
             ..window(0.01, 0.01, 0.0, 0, 50)
         };
-        let mut windows = vec![quiet; GROW_WINDOWS - 1];
+        let mut windows = vec![quiet; WAIT_WINDOWS - 1];
         windows.push(idle);
         assert_eq!(controller(windows).decide(2, 16), None);
         // All idle: too few ops for the ratio to count, however high.
-        assert_eq!(controller(vec![idle; GROW_WINDOWS]).decide(2, 16), None);
+        assert_eq!(controller(vec![idle; WAIT_WINDOWS]).decide(2, 16), None);
     }
 
     /// A level a regret proved is a floor for the shrink while the load stays the same: the
@@ -989,7 +1028,7 @@ mod tests {
     #[test]
     fn a_proven_level_floors_the_shrink_until_the_load_halves() {
         // The shrink rule alone takes 4 drivers down to 2 (sum busy 0.6 needs 2 at 0.5).
-        let light = window(0.2, 0.6, 0.0, 100, 1000);
+        let light = window(0.2, 0.6, 0.0, 200, 1000);
         let c = controller(vec![light; SHRINK_WINDOWS]);
         assert_eq!(c.decide(4, 16), Some((2, Why::Shrink)));
         // A regret proved 4 beats 2 at 1000 ops per window: no shrink below 4.
@@ -999,11 +1038,11 @@ mod tests {
         // From above the floor, the shrink stops at it.
         assert_eq!(c.decide(16, 16), Some((4, Why::Shrink)));
         // A load drifting down (ops 40% under the proven level) keeps the floor.
-        let mut c = controller(vec![window(0.2, 0.6, 0.0, 100, 600); SHRINK_WINDOWS]);
+        let mut c = controller(vec![window(0.2, 0.6, 0.0, 200, 600); SHRINK_WINDOWS]);
         c.floor = Some((4, 1000.0));
         assert_eq!(c.decide(4, 16), None);
         // A load that halved is free to shrink below it.
-        let mut c = controller(vec![window(0.2, 0.6, 0.0, 100, 450); SHRINK_WINDOWS]);
+        let mut c = controller(vec![window(0.2, 0.6, 0.0, 200, 450); SHRINK_WINDOWS]);
         c.floor = Some((4, 1000.0));
         assert_eq!(c.decide(4, 16), Some((2, Why::Shrink)));
     }
