@@ -33,7 +33,7 @@ fn options(vfs: &Arc<SimVfs>) -> Options {
 /// the shard; this thread then drives it by hand.
 fn open(seed: u64) -> (Pigeonhole, Shard, Table) {
     let vfs = SimVfs::new(seed);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned("/db/bp.phdb", options(&vfs)).unwrap();
     let mut shard = shards.remove(0);
     let stop = Arc::new(AtomicBool::new(false));

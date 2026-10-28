@@ -771,11 +771,9 @@ impl PigeonholeRunner {
         } else {
             // D284: with `background_workers`, flush and compaction run on worker threads of
             // their own (none by default: on the shards).
-            let mut owned = Pigeonhole::open_application_owned_with(
-                dir.join("bench.phdb"),
-                options(&self.settings),
-            )
-            .map_err(err)?;
+            let mut owned =
+                Pigeonhole::open_application_owned(dir.join("bench.phdb"), options(&self.settings))
+                    .map_err(err)?;
             let workers = owned.spawn_background_threads().map_err(err)?;
             let shards = std::mem::take(&mut owned.shards)
                 .into_iter()

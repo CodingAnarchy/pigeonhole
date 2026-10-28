@@ -112,7 +112,7 @@ fn open(
     if let Some(vfs) = vfs {
         options = options.vfs(vfs);
     }
-    let (db, shards) = Pigeonhole::open_application_owned(
+    let pigeonhole::AppOwned { db, shards, .. } = Pigeonhole::open_application_owned(
         path,
         options
             .shards(1)

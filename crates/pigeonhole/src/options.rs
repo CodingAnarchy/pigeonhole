@@ -507,7 +507,7 @@ impl Options {
 
     /// Application-owned mode only: `n` background workers for flush and compaction (D284),
     /// handed out by
-    /// [`Pigeonhole::open_application_owned_with`](crate::Pigeonhole::open_application_owned_with)
+    /// [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
     /// for you to drive from threads you choose, as you drive the shards.
     ///
     /// - **Why:** with none (the default `0`), flush and compaction run on the shards, in
@@ -515,9 +515,7 @@ impl Options {
     /// - **How many:** a quarter of the shards is a good start. The engine-owned count
     ///   ([`compaction_cores`](Options::compaction_cores)) has its own default, which may
     ///   differ.
-    /// - [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
-    ///   fails with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when
-    ///   `n > 0`, since it hands no workers out. Engine-owned opens ignore it: they start
+    /// - Engine-owned opens ignore it: they start
     ///   [`compaction_cores`](Options::compaction_cores) threads of their own.
     ///
     /// ```

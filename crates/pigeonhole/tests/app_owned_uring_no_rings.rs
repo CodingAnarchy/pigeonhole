@@ -81,7 +81,7 @@ fn with_no_driving_thread_ring_commits_and_flush_barriers_complete() {
         .shards(2)
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
-    let (db, shards) =
+    let pigeonhole::AppOwned { db, shards, .. } =
         Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
     db.set_default_durability(Durability::GroupSync);
     let mut shards = shards;

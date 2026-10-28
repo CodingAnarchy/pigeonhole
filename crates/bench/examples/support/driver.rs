@@ -22,7 +22,7 @@ impl Driver {
     /// Opens `path` with application-owned shards (one shard, no tablet changes, a memtable
     /// budget no setup reaches, so nothing flushes on its own), each driven by a thread.
     pub fn open(path: &Path, options: Options) -> (Pigeonhole, Driver) {
-        let (db, shards) = Pigeonhole::open_application_owned(
+        let pigeonhole::AppOwned { db, shards, .. } = Pigeonhole::open_application_owned(
             path,
             options
                 .shards(1)
