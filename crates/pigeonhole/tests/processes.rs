@@ -20,6 +20,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{
@@ -35,6 +37,55 @@ const VALUE: usize = 1024;
 fn say(line: impl std::fmt::Display) {
     println!("{TAG}{line}");
     std::io::stdout().flush().unwrap();
+}
+
+/// How long one test may run before its watchdog aborts the process. The slowest test takes
+/// about a minute on a loaded Windows runner; a hang there once ate the job's whole timeout
+/// with no trace of where it was (#1028).
+const TEST_LIMIT: Duration = Duration::from_secs(300);
+
+/// Aborts the process if its test outlives [`TEST_LIMIT`], naming the test and the last
+/// step it set. It writes to the stderr handle itself, which the harness's output capture
+/// does not swallow.
+struct Watchdog {
+    step: Arc<Mutex<&'static str>>,
+    done: Arc<AtomicBool>,
+}
+
+impl Watchdog {
+    fn new(test: &'static str) -> Self {
+        let step = Arc::new(Mutex::new("start"));
+        let done = Arc::new(AtomicBool::new(false));
+        let (at, finished) = (Arc::clone(&step), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            while !finished.load(Ordering::Relaxed) {
+                if started.elapsed() > TEST_LIMIT {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "{test} hung: still in step {:?} after {TEST_LIMIT:?}; aborting",
+                        *at.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+                    );
+                    std::process::abort();
+                }
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        });
+        Self { step, done }
+    }
+
+    fn step(&self, step: &'static str) {
+        *self
+            .step
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = step;
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+    }
 }
 
 fn key(i: u64) -> Vec<u8> {
@@ -282,12 +333,23 @@ impl Peer {
         self.recv()
     }
 
-    /// Sends `quit` and waits for a clean exit.
+    /// Sends `quit` and waits for a clean exit, failing (and killing the child, on drop)
+    /// if it has not exited within a minute.
     fn quit(mut self) {
         let stdin = self.stdin.as_mut().expect("stdin open");
         writeln!(stdin, "quit").unwrap();
         drop(self.stdin.take());
-        let status = self.child.wait().unwrap();
+        let asked = Instant::now();
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                asked.elapsed() < Duration::from_secs(60),
+                "the child did not exit within 60 s of quit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
         assert!(status.success(), "child failed: {status}");
     }
 
@@ -339,18 +401,24 @@ const PAST_BUDGET: u64 = 16 * 1024;
 
 #[test]
 fn a_killed_reader_does_not_stall_the_writer() {
+    let watchdog = Watchdog::new("a_killed_reader_does_not_stall_the_writer");
     let dir = Dir::new("killed-reader");
+    // The default 30 s stall timeout, not a short one: on a loaded Windows runner in debug
+    // one flush slice can take over a second and a single commit's room wait over 5 s with
+    // the slot freed (#1028's runs). A pin that never lets go still fails the burst.
     let db = Pigeonhole::open(
         dir.db(),
-        writer_options().write_stall_timeout(Duration::from_secs(5)),
+        writer_options().write_stall_timeout(Duration::from_secs(30)),
     )
     .unwrap();
     let t = table(&db);
     put(&t, 0..1000).unwrap();
+    watchdog.step("reader");
     let mut reader = Peer::spawn("reader", &dir.db());
     assert_eq!(reader.ask("snap"), "SNAP");
     assert_eq!(reader.ask("count"), "COUNT 1000");
     reader.kill();
+    watchdog.step("reclaim");
     // The writer frees the dead reader's slot (the real `process_alive`, not the
     // simulator's) at its next reclaim: at most every 250 ms, run when a flush or a
     // compaction finishes or a commit finds no room. Wait for it, flushing so one runs,
@@ -374,20 +442,25 @@ fn a_killed_reader_does_not_stall_the_writer() {
     }
     // #833's symptom: without the slot freed, the dead reader's pin keeps the first
     // memtables, the arena runs out, and these commits stall and then fail `Busy` after the
-    // 5 s timeout. With it freed, they go through.
+    // timeout. With it freed, they go through.
+    watchdog.step("burst");
     let start = Instant::now();
     put(&t, 1000..1000 + PAST_BUDGET)
         .unwrap_or_else(|(i, e)| panic!("row {i} after {:?}: {e}", start.elapsed()));
     // A new reader attaches and sees everything.
+    watchdog.step("new reader");
     let mut next = Peer::spawn("reader", &dir.db());
     assert_eq!(next.ask("latest"), format!("COUNT {}", 1000 + PAST_BUDGET));
     next.quit();
+    watchdog.step("close");
     drop(t);
     db.close().unwrap();
 }
 
 #[test]
 fn a_live_readers_snapshot_stalls_the_writer_into_busy_until_it_leaves() {
+    let watchdog =
+        Watchdog::new("a_live_readers_snapshot_stalls_the_writer_into_busy_until_it_leaves");
     let dir = Dir::new("live-reader");
     let db = Pigeonhole::open(
         dir.db(),
@@ -396,27 +469,46 @@ fn a_live_readers_snapshot_stalls_the_writer_into_busy_until_it_leaves() {
     .unwrap();
     let t = table(&db);
     put(&t, 0..1000).unwrap();
+    watchdog.step("reader");
     let mut reader = Peer::spawn("reader", &dir.db());
     assert_eq!(reader.ask("snap"), "SNAP");
+    watchdog.step("put until Busy");
     // The held snapshot pins the first memtables: the writer runs out of arena and its
     // commits fail `Busy` after the stall timeout (D1 of #693: the reader's responsibility,
     // documented).
     let (row, e) = put(&t, 1000..1000 + PAST_BUDGET).expect_err("the writer never stalled");
     assert_eq!(e.code(), ErrorCode::Busy, "row {row}: {e}");
     // The snapshot still reads what it saw.
+    watchdog.step("count");
     assert_eq!(reader.ask("count"), "COUNT 1000");
     // The reader leaving releases its slot and the memtables it pinned; the writer goes on.
     // A bounded amount, inside the room that frees: writing the whole rest would depend on
     // flushes keeping pace with the 1 s stall timeout, which a slow CI runner (Windows) does
-    // not always (#840's CI).
+    // not always (#840's CI). Even the first rows may wait past it there, while the flushes
+    // the stall queued run (#1028's runs: one flush slice took over a second), so a `Busy`
+    // is retried for up to 30 s; a pin the reader never let go of would still fail.
+    watchdog.step("quit");
     reader.quit();
-    put(&t, row..row + 1000).unwrap();
+    watchdog.step("put after quit");
+    let left = Instant::now();
+    let mut next = row;
+    while let Err((i, e)) = put(&t, next..row + 1000) {
+        assert!(
+            e.code() == ErrorCode::Busy && left.elapsed() < Duration::from_secs(30),
+            "row {i} {:?} after the reader left: {e}",
+            left.elapsed()
+        );
+        next = i;
+    }
+    watchdog.step("close");
     drop(t);
     db.close().unwrap();
 }
 
 #[test]
 fn a_killed_writer_leaves_readers_serving_and_a_new_writer_expires_them() {
+    let _watchdog =
+        Watchdog::new("a_killed_writer_leaves_readers_serving_and_a_new_writer_expires_them");
     let dir = Dir::new("killed-writer");
     let mut writer = Peer::spawn("writer", &dir.db());
     assert_eq!(writer.ask("put 0 1000"), "PUT 1000");
@@ -454,6 +546,7 @@ fn a_killed_writer_leaves_readers_serving_and_a_new_writer_expires_them() {
 
 #[test]
 fn a_reader_process_sees_commits_whole_and_its_snapshot_stays_put() {
+    let _watchdog = Watchdog::new("a_reader_process_sees_commits_whole_and_its_snapshot_stays_put");
     let dir = Dir::new("commits");
     let db = Pigeonhole::open(dir.db(), writer_options()).unwrap();
     let t = table(&db);
@@ -478,6 +571,7 @@ fn a_reader_process_sees_commits_whole_and_its_snapshot_stays_put() {
 
 #[test]
 fn a_scan_held_across_a_writer_restart_fails_expired() {
+    let _watchdog = Watchdog::new("a_scan_held_across_a_writer_restart_fails_expired");
     let dir = Dir::new("scan-restart");
     let mut writer = Peer::spawn("writer", &dir.db());
     assert_eq!(writer.ask("put 0 3000"), "PUT 3000");
@@ -508,6 +602,7 @@ fn a_scan_held_across_a_writer_restart_fails_expired() {
 
 #[test]
 fn a_writer_killed_mid_stream_leaves_only_whole_commits() {
+    let _watchdog = Watchdog::new("a_writer_killed_mid_stream_leaves_only_whole_commits");
     const K: u64 = 8;
     let dir = Dir::new("stream-kill");
     let mut reader: Option<Peer> = None;
