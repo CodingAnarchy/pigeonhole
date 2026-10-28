@@ -28,6 +28,8 @@ ffi = ["arrow-array/ffi"]
 features = ["ffi"]
 
 [dev-dependencies]
+# The tests use pigeonhole's test hooks (`Options::wal_segment_size`, ICR 0085).
+pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 pigeonhole-io = { workspace = true }
 
 [lints]

@@ -17,6 +17,10 @@ readme = "README.md"
 # `futures-core` dependency; the blocking API is unchanged either way.
 default = ["async"]
 async = ["dep:futures-core"]
+# Test and bench hooks (ICR 0085): hidden methods and options the workspace's tests and the
+# bench use, and the `PIGEONHOLE_IO` / `PIGEONHOLE_DIRECT` test variables. Not part of the
+# API and outside the semver promise; never turn it on in an application.
+__unstable-hooks = []
 
 [dependencies]
 pigeonhole-engine = { workspace = true }
@@ -28,6 +32,8 @@ arc-swap = { workspace = true }
 futures-core = { workspace = true, optional = true }
 
 [dev-dependencies]
+# This crate's own tests use its hooks.
+pigeonhole = { path = ".", features = ["__unstable-hooks"] }
 # The engine's test hooks, for the unit tests that race a read (never in a normal build).
 pigeonhole-engine = { workspace = true, features = ["test-hooks"] }
 pigeonhole-sim = { workspace = true }

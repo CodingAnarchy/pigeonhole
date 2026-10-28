@@ -490,6 +490,7 @@ impl Table {
     /// shards, piece `i` to shard `i % shards`, waiting until done. A bench hook (D213): the
     /// gate's group-commit table starts on every shard instead of waiting for the balancer.
     /// The balancer may still move the pieces later.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn split_over_shards(&self, keys: Vec<Vec<u8>>) -> Result<()> {
         let shards = self.core.engine().shard_stats().len().max(1);

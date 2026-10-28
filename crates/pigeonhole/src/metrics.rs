@@ -410,6 +410,7 @@ impl RowCacheStats {
 /// (ICR 0010, a hidden bench hook outside the semver promise). Counters are cumulative since
 /// open; take two and subtract for a phase. The fields are the engine's
 /// (`pigeonhole_engine::ShardStats`).
+#[cfg(feature = "__unstable-hooks")]
 #[doc(hidden)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
@@ -436,6 +437,7 @@ pub struct ShardStats {
     pub commit_inflight_nanos: u64,
 }
 
+#[cfg(feature = "__unstable-hooks")]
 impl ShardStats {
     pub(crate) fn from_engine(s: pigeonhole_engine::ShardStats) -> Self {
         Self {
