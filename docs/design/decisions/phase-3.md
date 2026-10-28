@@ -3060,19 +3060,27 @@ The ring tests that need their reads on a ring turn the switch off: `uring.rs`'s
 
 CI's ext4 runners cover hits. The podman VM's overlay mount covers refusals.
 
-## D293 — A scan its row limit leaves short reads no blocks ahead (ctr274, 2026-10-28; engine, #712, #974; refines D222)
-**Why.** ycsb-e's scans (1–100 rows, 16 clients) were ahead of RocksDB on throughput after #975's ramp but 1.27× on p99, against the 1.2× floor. A per-phase profile of each scan (#712 c6475482356) put the largest part of the p99 band in waits on readahead still in flight: 66% at 16 clients and 38% at 4 (VM). A short scan ends within a few blocks, and the ramp starts after two of them, so the readahead has no lead: the scan reaches the block it just asked for while the fetch is still going through io-wq and the ring's reaper, and it waits. With readahead off, the VM's p99 dropped from 1649 to 135 µs at 16 clients and from 182 to 131 µs at 4, and throughput rose 11–13%.
+## D293 — A scan its row limit leaves short starts its readahead later (ctr274, 2026-10-28; engine, sst, #712, #974; refines D222)
+**Why.** ycsb-e's scans (1–100 rows, 16 clients) were ahead of RocksDB on throughput after #975's ramp but 1.27× on p99, against the 1.2× floor. A per-phase profile of each scan (#712 c6475482356) put the largest part of the p99 band in waits on readahead still in flight: 66% at 16 clients and 38% at 4 (VM). A short scan ends within a few blocks, and the ramp starts after two of them, so the readahead has no lead: the scan reaches the block it just asked for while the fetch is still in flight, and it waits. With readahead off, the VM's p99 dropped from 1649 to 135 µs at 16 clients and from 182 to 131 µs at 4, and throughput rose 11–13%.
 
-**What.** A scan whose row limit leaves at most `SHORT_SCAN_ROWS` (128) rows to return reads no blocks ahead. Its blocks are read as it reaches them: a cache hit, or a demand read on the scanning thread.
+The root cause is the readahead path's latency, not the scan's length. A demand read costs the scanning thread one read. A block fetched ahead goes through io-wq, then the ring's reaper, then verify, decompress and cache insert on the backend's single completion thread, behind every other cursor's fetches. A scan that reaches a block still on that path waits longer than a demand read would have taken. Short scans always catch up, so they pay it on almost every fetch. A long scan that catches up with its own batch pays it too. That cost is what #974 A (admitting fetched blocks on the cursor, not the completion thread) removes. **Revisit when #974 A is decided:** if admission moves onto the cursor, this rule may be unnecessary.
+
+**What.** A scan whose row limit leaves at most `SHORT_SCAN_ROWS` (128) rows to return starts its readahead ramp after `SHORT_SCAN_AHEAD_AFTER` (8) forward blocks per SST cursor, not two (`ReadOptions::readahead_after`, new in pigeonhole-sst).
 - The check is made per tablet, when the scan opens it, from the rows the limit still allows.
 - A scan with no limit, or more than 128 rows left, keeps D222's readahead and #975's ramp unchanged.
-- 128 covers ycsb-e's longest scan (100 rows). At the default 16 KiB blocks, rows of 1 KiB fill about 8 blocks.
+- 128 covers ycsb-e's longest scan (100 rows).
+- Why 8 blocks: at the default 16 KiB blocks, 128 rows of 1 KiB fill about 8. A scan that the limit really keeps short submits nothing.
+- A row limit doesn't bound the blocks a scan reads. Wide rows, rows a filter skips and runs of deleted rows can make a short scan long in blocks. Those scans get readahead back after at most 8 demand reads per cursor (perf287's review, #1029), where turning it off would have left every block a demand read.
+- With the block bound in place, 128 only decides when the later start applies, so a cut-off 2× either way costs little.
 
-**Measured.** _Pending: a box A/B of main, this change and readahead off, on ycsb-e ×3 at buffered and default, plus time-series-range and adjacency at 16 clients._
+**Measured.** _Pending: a box A/B on ycsb-e ×3 at buffered and default, plus time-series-range and adjacency at 16 clients, with p50 and p99 beside throughput, and wait-on-in-flight for the long-scan arms. Arms: main, this change, and readahead off for short scans._
 
-**Tests.** `scan_readahead_limit.rs`:
-- scans limited to 1, 50 and 128 rows submit no readahead;
-- a 1000-row scan and an unlimited scan still read ahead.
+**Tests.** `scan_readahead_limit.rs` (every scan reads all its cells):
+- scans limited to 1, 50 and 128 narrow rows submit no readahead;
+- a 1000-row scan and an unlimited scan still read ahead;
+- a `limit 1` scan of one row of about 50 blocks reads ahead once past the bound;
+- so does a `limit 1` scan across 2800 deleted rows (tombstones in a newer SST).
 
-#974 A (readahead admits on the cursor) stays parked. The same box slot's long-scan profile decides it.
+Mutations: never reading ahead when short fails the last two; dropping the rule fails the first.
 
+#974 A stays parked. The same box slot's long-scan wait-on-in-flight decides it.
