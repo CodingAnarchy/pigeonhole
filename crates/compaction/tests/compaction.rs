@@ -442,8 +442,22 @@ fn drain_resolved<C: pigeonhole_format::Cursor<Error = pigeonhole_compaction::Er
 /// other source listed, bottommost deletes purge by the seqno rule; unlisted (`None`), they
 /// purge only by the timestamp rule.
 fn check_counter_purge(seed: u64, commits: usize, checkpoints: bool) {
+    check_counter_purge_with(seed, commits, checkpoints, false);
+}
+
+/// [`check_counter_purge`]; with `checkpoints_outside`, every counter checkpoint (D291) goes
+/// to the other source and every other entry to the inputs, entry by entry, with the other
+/// source listed: the layout where a combine of input operands could pass a checkpoint
+/// (#1051), which a random split reaches about once in thousands of cases.
+fn check_counter_purge_with(
+    seed: u64,
+    commits: usize,
+    checkpoints: bool,
+    checkpoints_outside: bool,
+) {
     let mut h = counter_history(seed, common::commits(commits));
     let mut rng = Rng::new(seed ^ 0x290);
+    let first_checkpoint = h.entries.len();
     if checkpoints {
         let reads = 1 + rng.below(6) as usize;
         add_checkpoints(&mut h, &mut rng, reads);
@@ -455,10 +469,19 @@ fn check_counter_purge(seed: u64, commits: usize, checkpoints: bool) {
     // Units go whole to the inputs or to the other source: each column and each row's
     // markers, or each `(column, timestamp)` group, or each entry. The finer splits put
     // cell and column deletes apart from what they hide.
-    let split = rng.below(3);
+    let split = if checkpoints_outside { 2 } else { rng.below(3) };
     let mut outside: BTreeMap<Vec<u8>, bool> = BTreeMap::new();
     let (mut inputs, mut other): (Vec<_>, Vec<_>) = (Vec::new(), Vec::new());
-    for (k, v, _) in &h.entries {
+    for (n, (k, v, _)) in h.entries.iter().enumerate() {
+        if checkpoints_outside {
+            if n >= first_checkpoint {
+                &mut other
+            } else {
+                &mut inputs
+            }
+            .push((k.clone(), v.clone()));
+            continue;
+        }
         let (body, ts, _, kind) = split_suffix(k).unwrap();
         let unit = match split {
             _ if kind == Kind::FamilyDelete && split == 0 => {
@@ -499,7 +522,7 @@ fn check_counter_purge(seed: u64, commits: usize, checkpoints: bool) {
         .map(|s| s.0.seqno_range.1)
         .max()
         .unwrap_or(0);
-    let listed = rng.below(6) != 0;
+    let listed = checkpoints_outside || rng.below(6) != 0;
     gc.other_sources = listed.then(|| {
         other_sst
             .iter()
@@ -610,6 +633,31 @@ fn compaction_preserves_reads_fixed_seeds() {
 fn counter_versions_outlive_newer_expired_buckets() {
     check_compaction(1_601_955_561_661_789_700, 30, Choose::Random, false);
     check_compaction(11_470_003_444_189_223_303, 6, Choose::Tiered, false);
+}
+
+/// #1051: a counter checkpoint (D291) in another source of the slot, a `Put` at the seqno of
+/// the newest operand it folded, sits between two input operands that compaction used to
+/// combine: the combined operand counted the older one a second time above the `Put`.
+#[test]
+fn a_checkpoint_in_another_source_keeps_operands_apart() {
+    check_counter_purge(2_162_023_711_901_054_297, 6, true);
+}
+
+/// #1051's class at a high rate: counter checkpoints (D291) beside every kind of combine a
+/// compaction or flush makes (the inputs split from another source by column, by version or
+/// entry by entry, listed or not, under random snapshots), over fixed seeds and history
+/// lengths, so a sweep of this target covers it and not just one seed.
+#[test]
+#[cfg_attr(miri, ignore = "hundreds of SimVfs pagers; covered natively")]
+fn counter_checkpoints_survive_combines_fixed_seeds() {
+    for seed in 0..1_000u64 {
+        let seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        for commits in [3, 6, 12, 24] {
+            check_counter_purge(seed, commits, true);
+            check_counter_purge_with(seed, commits, true, true);
+        }
+        check_compaction(seed, 20, Choose::Random, true);
+    }
 }
 
 /// Issue #32: the FIFO-by-time picker's drops of expired SSTs, and its merges of L0 files,

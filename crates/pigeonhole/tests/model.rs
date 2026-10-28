@@ -49,7 +49,8 @@
 //!
 //! `PIGEONHOLE_CHECKPOINT_STEPS=n` keeps a counter read's result as a base once it folds `n`
 //! entries (`Options::counter_checkpoint_steps`, D291). `1` checkpoints after nearly every
-//! counter read, under the run's flushes, compactions, tablet changes and reopens.
+//! counter read, under the run's flushes, compactions, tablet changes and reopens. Unset, the
+//! `counters` target does that on every odd seed (#1051).
 //!
 //! **Failures recovered in place** (`Options::auto_recover`, D265, #620). With the option on
 //! and injected read and write errors (`FaultPlan::io_error_ppm`), a failed WAL write or
@@ -807,6 +808,13 @@ impl Vfs for RealFs {
 
 impl Run {
     fn new(seed: u64, mut cfg: Config) -> Result<Self, String> {
+        // The counters target runs every other seed with counter checkpoints after every
+        // counter read (D291) under the run's flushes, compactions and tablet changes, unless
+        // `PIGEONHOLE_CHECKPOINT_STEPS` chose (#1051).
+        if cfg.checkpoint_steps.is_none() && env!("CARGO_CRATE_NAME") == "counters" && seed % 2 == 1
+        {
+            cfg.checkpoint_steps = Some(1);
+        }
         let vfs = SimVfs::new(seed);
         let (store, root, real): (Arc<dyn Vfs>, PathBuf, Option<RealDir>) = if real_fs() {
             // Faults and scheduled power losses need the simulator's files.
