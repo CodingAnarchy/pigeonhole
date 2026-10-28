@@ -1,0 +1,29 @@
+pub mod pigeonhole_arrow
+pub use pigeonhole_arrow::arrow_array
+pub use pigeonhole_arrow::arrow_buffer
+pub use pigeonhole_arrow::arrow_schema
+#[non_exhaustive] pub enum pigeonhole_arrow::TsType
+pub pigeonhole_arrow::TsType::Timestamp
+pub pigeonhole_arrow::TsType::UInt64
+pub struct pigeonhole_arrow::ArrowOptions
+impl pigeonhole_arrow::ArrowOptions
+pub fn pigeonhole_arrow::ArrowOptions::batch_bytes(self, usize) -> Self
+pub fn pigeonhole_arrow::ArrowOptions::batch_cells(self, usize) -> Self
+pub fn pigeonhole_arrow::ArrowOptions::row_dictionary(self, bool) -> Self
+pub fn pigeonhole_arrow::ArrowOptions::ts(self, pigeonhole_arrow::TsType) -> Self
+pub fn pigeonhole_arrow::ArrowOptions::typed_values(self, bool) -> Self
+pub fn pigeonhole_arrow::ArrowOptions::utf8_keys(self, bool) -> Self
+impl core::default::Default for pigeonhole_arrow::ArrowOptions
+pub fn pigeonhole_arrow::ArrowOptions::default() -> Self
+pub struct pigeonhole_arrow::ArrowScan<'t>
+impl pigeonhole_arrow::ArrowScan<'_>
+pub fn pigeonhole_arrow::ArrowScan<'_>::schema(&self) -> arrow_schema::schema::SchemaRef
+impl pigeonhole_arrow::ArrowScan<'static>
+pub fn pigeonhole_arrow::ArrowScan<'static>::into_ffi_stream(self) -> arrow_array::ffi_stream::FFI_ArrowArrayStream
+impl arrow_array::record_batch::RecordBatchReader for pigeonhole_arrow::ArrowScan<'_>
+pub fn pigeonhole_arrow::ArrowScan<'_>::schema(&self) -> arrow_schema::schema::SchemaRef
+impl core::iter::traits::iterator::Iterator for pigeonhole_arrow::ArrowScan<'_>
+pub type pigeonhole_arrow::ArrowScan<'_>::Item = core::result::Result<arrow_array::record_batch::RecordBatch, arrow_schema::error::ArrowError>
+pub fn pigeonhole_arrow::ArrowScan<'_>::next(&mut self) -> core::option::Option<Self::Item>
+pub fn pigeonhole_arrow::scan_to_arrow<'t>(pigeonhole::read::Scan<'t>, &pigeonhole_arrow::ArrowOptions) -> pigeonhole::error::Result<pigeonhole_arrow::ArrowScan<'t>>
+pub fn pigeonhole_arrow::schema(&pigeonhole_arrow::ArrowOptions) -> arrow_schema::schema::SchemaRef
