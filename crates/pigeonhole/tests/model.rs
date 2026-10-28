@@ -414,6 +414,11 @@ struct Stats {
     /// Forced commits that failed `Io` on a store a random write error had already failed
     /// (D58), with the forced failure unfired: re-armed after that failure's recovery (#897).
     forced_preempted: usize,
+    /// Forced failures that fired outside the shard's foreground WAL calls (a spare-slot
+    /// preparation, whose failed writes the stream tolerates) while the commit succeeded:
+    /// harness misses, re-armed (#990). The forced plan matches only foreground calls, so
+    /// this stays 0 unless that matching breaks.
+    forced_misses: usize,
 }
 
 /// The most forced commits in a row that may be refused `Busy` before the WAL (#897) before
@@ -433,6 +438,10 @@ enum Forced {
     /// background manifest commit, D58): that failure's recovery runs, then the next commit
     /// is forced.
     Preempted,
+    /// Fired once, outside the shard's foreground WAL calls (on a spare-slot preparation,
+    /// whose failed writes the stream tolerates), and the commit succeeded: the harness
+    /// missed its target, not a durability bug (#990); force the next commit instead.
+    Missed,
     /// Anything else is a harness or engine bug.
     Fail(String),
 }
@@ -443,14 +452,24 @@ enum Forced {
 /// or recovered. With nothing fired, only a `Busy` refusal re-arms, or an `Io` failure with
 /// that evidence. A commit that fired the failure and still succeeded, fired it twice, or
 /// failed any other way without firing it (an `Io` with no random write error to blame
-/// included) fails the run, as before #897.
-fn forced_outcome(fired: usize, result: Result<(), ErrorCode>, preempted: bool) -> Forced {
+/// included) fails the run, as before #897. `outside` is how many of the firings were
+/// outside the shard's foreground WAL calls: one there with a successful commit is a
+/// harness miss (#990); one on the commit's own write or sync with a successful commit
+/// stays a failure (a commit acknowledged after its WAL failed).
+fn forced_outcome(
+    fired: usize,
+    outside: usize,
+    result: Result<(), ErrorCode>,
+    preempted: bool,
+) -> Forced {
     match (fired, result) {
         (1, Err(_)) => Forced::Fired,
+        (1, Ok(())) if outside == 1 => Forced::Missed,
         (0, Err(ErrorCode::Busy)) => Forced::Rearm,
         (0, Err(ErrorCode::Io)) if preempted => Forced::Preempted,
         _ => Forced::Fail(format!(
-            "the forced WAL failure fired {fired} times and the commit returned {result:?}"
+            "the forced WAL failure fired {fired} times ({outside} outside the shard's \
+             foreground WAL calls) and the commit returned {result:?}"
         )),
     }
 }
@@ -462,16 +481,16 @@ fn only_a_busy_refusal_or_a_preempting_random_fault_re_arms_the_forced_failure()
         // The recovery's normal case: the forced write failed, whatever the commit reports.
         for code in [Io, OutcomeUnknown, Busy, Closed] {
             assert_eq!(
-                forced_outcome(1, Err(code), preempted),
+                forced_outcome(1, 0, Err(code), preempted),
                 Forced::Fired,
                 "{code:?}, preempted {preempted}"
             );
         }
         // #897: refused for room before its WAL write.
-        assert_eq!(forced_outcome(0, Err(Busy), preempted), Forced::Rearm);
+        assert_eq!(forced_outcome(0, 0, Err(Busy), preempted), Forced::Rearm);
     }
     // #897, seed 177: a random write error failed a background manifest commit first.
-    assert_eq!(forced_outcome(0, Err(Io), true), Forced::Preempted);
+    assert_eq!(forced_outcome(0, 0, Err(Io), true), Forced::Preempted);
     // Everything else stays a failure: an `Io` with no random write error to blame, no
     // firing with another error, a commit that succeeded through the failure, or more than
     // one firing.
@@ -485,12 +504,25 @@ fn only_a_busy_refusal_or_a_preempting_random_fault_re_arms_the_forced_failure()
             (2, Err(Busy)),
         ] {
             assert!(
-                matches!(forced_outcome(fired, result, preempted), Forced::Fail(_)),
+                matches!(forced_outcome(fired, 0, result, preempted), Forced::Fail(_)),
                 "fired {fired}, {result:?}, preempted {preempted}"
             );
         }
     }
-    assert!(matches!(forced_outcome(0, Err(Io), false), Forced::Fail(_)));
+    assert!(matches!(
+        forced_outcome(0, 0, Err(Io), false),
+        Forced::Fail(_)
+    ));
+    // #990: fired on a spare-slot preparation (outside the foreground calls) while the
+    // commit succeeded: a harness miss. On the commit's own write it stays a failure.
+    for preempted in [false, true] {
+        assert_eq!(forced_outcome(1, 1, Ok(()), preempted), Forced::Missed);
+        assert_eq!(forced_outcome(1, 1, Err(Io), preempted), Forced::Fired);
+        assert!(matches!(
+            forced_outcome(1, 0, Ok(()), preempted),
+            Forced::Fail(_)
+        ));
+    }
 }
 
 struct Run {
@@ -1679,11 +1711,16 @@ impl Run {
                     && !self.armed
                     && !self.failed_over();
                 let fired_before = self.vfs.scheduled_fired();
+                let outside_before = self.vfs.scheduled_fired_outside_foreground();
                 if forced {
                     self.force_at = None;
                     durability = Durability::GroupSync;
                     let mut plan = self.cfg.faults.clone();
                     plan.fail_on = Some("-wal-");
+                    // Only the shard's own WAL calls: a spare-slot preparation's write may
+                    // fail without failing anything (the slot stays blank), so a fault
+                    // spent there tests nothing (#990).
+                    plan.fail_on_foreground = true;
                     self.vfs.set_faults(plan);
                 }
                 // A forced commit arms no mid-commit crash: arming replaces the fault plan,
@@ -1716,22 +1753,29 @@ impl Run {
                 if forced {
                     self.vfs.set_faults(self.cfg.faults.clone());
                     let fired = (self.vfs.scheduled_fired() - fired_before) as usize;
-                    self.stats.forced_faults += fired;
-                    self.forced_pending = fired > 0;
+                    let outside =
+                        (self.vfs.scheduled_fired_outside_foreground() - outside_before) as usize;
                     self.trace.push(format!(
-                        "  -> forced WAL failure (fired {fired}): {:?}",
+                        "  -> forced WAL failure (fired {fired}, {outside} outside the \
+                         foreground WAL calls): {:?}",
                         result.as_ref().err()
                     ));
                     let preempted = self.failed_over()
                         && self.vfs.writes_injected() > self.writes_injected_at_heal;
                     let outcome = forced_outcome(
                         fired,
+                        outside,
                         result.as_ref().map(|_| ()).map_err(|e| e.code()),
                         preempted,
                     );
+                    // A miss fired on nothing the commit depends on: no recovery follows.
+                    if outcome != Forced::Missed {
+                        self.stats.forced_faults += fired;
+                        self.forced_pending = fired > 0;
+                    }
                     match outcome {
                         Forced::Fired => self.forced_rearms_in_a_row = 0,
-                        Forced::Rearm | Forced::Preempted => {
+                        Forced::Rearm | Forced::Preempted | Forced::Missed => {
                             // Refused for room before it was logged, or failed by a random
                             // write error's earlier failure (D58), #897: nothing fired. The
                             // next commit takes the forced failure. This commit goes on as any
@@ -1741,10 +1785,10 @@ impl Run {
                             // below, counted as a random recovery. The arm's end check still
                             // wants one firing per seed, so a re-arm can never stand in for
                             // the forced recovery.
-                            if outcome == Forced::Preempted {
-                                self.stats.forced_preempted += 1;
-                            } else {
-                                self.stats.forced_rearms += 1;
+                            match outcome {
+                                Forced::Preempted => self.stats.forced_preempted += 1,
+                                Forced::Missed => self.stats.forced_misses += 1,
+                                _ => self.stats.forced_rearms += 1,
                             }
                             self.forced_rearms_in_a_row += 1;
                             if self.forced_rearms_in_a_row > MAX_FORCED_REARMS_IN_A_ROW {
@@ -1764,11 +1808,19 @@ impl Run {
                             self.force_at = Some(self.op + 1);
                             self.forced_pending = false;
                             self.trace.push(
-                                if outcome == Forced::Preempted {
-                                    "  -> a random write error failed the instance first: \
-                                     forced failure re-armed after its recovery"
-                                } else {
-                                    "  -> refused Busy before the WAL: forced failure re-armed"
+                                match outcome {
+                                    Forced::Preempted => {
+                                        "  -> a random write error failed the instance first: \
+                                         forced failure re-armed after its recovery"
+                                    }
+                                    Forced::Missed => {
+                                        "  -> harness miss: fired outside the shard's \
+                                         foreground WAL calls (a spare preparation?): \
+                                         forced failure re-armed"
+                                    }
+                                    _ => {
+                                        "  -> refused Busy before the WAL: forced failure re-armed"
+                                    }
                                 }
                                 .into(),
                             );

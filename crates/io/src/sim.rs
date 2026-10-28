@@ -64,6 +64,39 @@ use crate::{
     ProcessId, Result, SharedOpen, SharedRegion, Vfs,
 };
 
+thread_local! {
+    static WAL_FOREGROUND: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Marks this thread's file operations as a WAL stream's foreground call (`append`, `write`,
+/// `submit_sync`) until dropped, for [`FaultPlan::fail_on_foreground`]. The `pigeonhole-wal`
+/// crate enters it with its `sim-hooks` feature (test builds); nothing else needs it.
+///
+/// ```
+/// let _fg = pigeonhole_io::sim::WalForeground::enter();
+/// ```
+#[must_use = "the scope ends when this is dropped"]
+#[derive(Debug)]
+pub struct WalForeground(());
+
+impl WalForeground {
+    /// Enters the scope (nests).
+    pub fn enter() -> Self {
+        WAL_FOREGROUND.with(|c| c.set(c.get() + 1));
+        WalForeground(())
+    }
+}
+
+impl Drop for WalForeground {
+    fn drop(&mut self) {
+        WAL_FOREGROUND.with(|c| c.set(c.get() - 1));
+    }
+}
+
+fn in_wal_foreground() -> bool {
+    WAL_FOREGROUND.try_with(|c| c.get() > 0).unwrap_or(false)
+}
+
 /// Which faults to inject. Every random decision draws from the seeded RNG, which every
 /// thread's I/O shares: a seed replays the decisions in call order, so where a random fault
 /// lands depends on the threads' interleaving (#880). A scheduled fault (`crash_after_ops`,
@@ -99,6 +132,11 @@ pub struct FaultPlan {
     /// for, whatever the threads do. A test forces a shard's WAL stream to fail at a point
     /// of its own choosing (the model check's recovery arm, #880).
     pub fail_on: Option<&'static str>,
+    /// With `fail_on`: fire only on an operation a WAL stream's foreground call (`append`,
+    /// `write`, `submit_sync`) issues ([`WalForeground`]), not on one of its spare-slot
+    /// preparations, whose failed writes the stream tolerates (#990). Needs the
+    /// `pigeonhole-wal` crate's `sim-hooks` feature, which marks those calls.
+    pub fail_on_foreground: bool,
 }
 
 impl FaultPlan {
@@ -118,6 +156,7 @@ impl FaultPlan {
             io_error_ppm: 1_000,
             crash_after_ops: None,
             fail_on: None,
+            fail_on_foreground: false,
         }
     }
 }
@@ -243,6 +282,8 @@ struct SimState {
     ops: u64,
     /// Scheduled faults (`FaultPlan::fail_on`) fired so far.
     scheduled_fired: u64,
+    /// Of those, the ones that fired outside a WAL stream's foreground call.
+    scheduled_fired_outside: u64,
     /// Random write errors (`FaultPlan::io_error_ppm`) injected so far.
     writes_injected: u64,
     /// Values handed out by `Vfs::random_u64`. A counter of its own, not `rng`, so asking
@@ -416,9 +457,15 @@ impl SimState {
             .names
             .iter()
             .any(|(path, &n)| n == node && path.to_string_lossy().contains(name));
+        if named && self.plan.fail_on_foreground && !in_wal_foreground() {
+            return Ok(());
+        }
         if named {
             self.plan.fail_on = None;
             self.scheduled_fired += 1;
+            if !in_wal_foreground() {
+                self.scheduled_fired_outside += 1;
+            }
             return Err(Error::new(ErrorKind::Other, context));
         }
         Ok(())
@@ -552,6 +599,7 @@ impl SimVfs {
                 bytes_written: 0,
                 ops: 0,
                 scheduled_fired: 0,
+                scheduled_fired_outside: 0,
                 writes_injected: 0,
                 random_draws: 0,
                 trace: None,
@@ -590,6 +638,13 @@ impl SimVfs {
     /// How many scheduled faults ([`FaultPlan::fail_on`]) have fired since the VFS was made.
     pub fn scheduled_fired(&self) -> u64 {
         self.state().scheduled_fired
+    }
+
+    /// How many of [`SimVfs::scheduled_fired`] fired outside a WAL stream's foreground call
+    /// ([`WalForeground`]): on a spare-slot preparation, say, or with the `pigeonhole-wal`
+    /// crate's `sim-hooks` feature off.
+    pub fn scheduled_fired_outside_foreground(&self) -> u64 {
+        self.state().scheduled_fired_outside
     }
 
     /// How many random write errors ([`FaultPlan::io_error_ppm`]) have been injected since
@@ -842,6 +897,12 @@ impl SimVfs {
         write: bool,
         run: impl FnOnce(&SimFile) -> Result<T> + Send + 'static,
     ) -> Completion<T> {
+        // An operation a WAL foreground call submits stays its, wherever it runs.
+        let foreground = in_wal_foreground();
+        let run = move |f: &SimFile| {
+            let _fg = foreground.then(WalForeground::enter);
+            run(f)
+        };
         let mut st = self.state();
         if !st.deferred {
             drop(st);
