@@ -1120,6 +1120,21 @@ impl Pigeonhole {
         self.engine().pack_target()
     }
 
+    /// The driver threads the shards run on now and whether every shard is on its driver
+    /// (D289 PR 2), `None` in application-owned mode: a bench hook, so a warm-up does not end
+    /// while the load controller resizes.
+    #[doc(hidden)]
+    pub fn driver_target(&self) -> Option<(usize, bool)> {
+        self.engine().driver_target()
+    }
+
+    /// Fixes the driver target at `k`, or with `None` gives it back to the controller (D289
+    /// PR 2): for tests that move shards between drivers under load.
+    #[doc(hidden)]
+    pub fn force_driver_target(&self, k: Option<usize>) {
+        self.engine().force_driver_target(k);
+    }
+
     /// What the row cache did since open: hits, misses and fills (D201). All zero when
     /// [`Options::row_cache`](crate::Options::row_cache) is 0.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {

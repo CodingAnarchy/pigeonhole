@@ -36,7 +36,7 @@ pub mod uring;
 mod vfs;
 
 pub use buf::{BufPool, IoBuf};
-pub use completion::{Completion, Resolver};
+pub use completion::{Completion, Resolver, cross_ring_wait_slices};
 pub use error::{Error, ErrorKind, Result};
 pub use file::{File, FileRef, Locality, LockMode, OpenOptions};
 pub use own::{

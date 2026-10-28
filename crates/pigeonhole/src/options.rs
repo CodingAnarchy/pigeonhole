@@ -59,9 +59,27 @@ pub struct Options {
     write_stall_timeout: Option<Duration>,
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
-    shard_threads: usize,
+    shard_threads: Option<usize>,
+    adaptive_shard_threads: bool,
     background_workers: usize,
+    cpu_profile: CpuProfile,
     auto_recover: Recovery,
+}
+
+/// Who the machine's (or container's) CPUs are for: how much of them the engine's threads
+/// take by default (D289, ICR 0081). See [`Options::cpu_profile`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum CpuProfile {
+    /// The application runs in the same process and needs CPU of its own: the engine's
+    /// driver and compaction threads take a share of the physical cores and leave the rest,
+    /// and every SMT sibling, to the application. The default.
+    #[default]
+    Embedded,
+    /// The database has the machine or container to itself, and its clients reach it from
+    /// elsewhere (another container, over IPC or the network): the engine's threads take
+    /// all but a small fixed headroom of the physical cores.
+    Server,
 }
 
 /// Which failures [`Options::auto_recover`] recovers from in place (D265, #620).
@@ -82,10 +100,55 @@ pub enum Recovery {
     Any = 2,
 }
 
-/// Engine-owned mode's flush and compaction threads for `shards` shards (D252): one per
-/// four shards, at least one and at most four.
-fn default_compaction_cores(shards: usize) -> usize {
-    (shards / 4).clamp(1, 4)
+/// The engine-owned threads the defaults give (D289, ICR 0081), from the physical cores the
+/// process may run on (after its affinity mask and cgroup CPU quota).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ThreadBudget {
+    /// Shards: one per physical core (D220). Data partitions, not threads.
+    pub(crate) shards: usize,
+    /// The most driver threads the shards run on: the load controller's ceiling (D289 PR 2),
+    /// or the fixed count `Options::shard_threads` set (`fixed`).
+    pub(crate) drivers: usize,
+    /// Whether `drivers` is fixed (`Options::shard_threads`), turning the controller off.
+    pub(crate) fixed: bool,
+    /// Flush and compaction threads (`Options::compaction_cores`).
+    pub(crate) compaction: usize,
+}
+
+/// The flush and compaction threads' share of the physical cores, as a fraction (numerator,
+/// denominator), per profile: the profiles differ mainly here (owner, 2026-10-27; #760
+/// comment 6446722456). Set by D289 PR 2's compaction-share arms (c = 2, 4, 8 at 16 cores).
+fn compaction_share(profile: CpuProfile) -> (usize, usize) {
+    match profile {
+        CpuProfile::Embedded => (1, 4),
+        CpuProfile::Server => (1, 2),
+    }
+}
+
+/// D289's CPU budget for `cores` physical cores under `profile`.
+/// - **Drivers:** the load controller's ceiling is one per physical core, so a store under full
+///   load keeps a thread per shard's throughput and a light one shrinks to a few (owner,
+///   2026-10-27). An explicit `drivers` fixes the count instead.
+/// - **Compaction:** the profile's share of the cores, scaling with them (D252's fixed cap of
+///   four is gone), at most one per shard: a shard runs one compaction at a time.
+///
+/// Explicit settings win and are kept as given; derived counts are at least 1.
+pub(crate) fn thread_budget(
+    cores: usize,
+    profile: CpuProfile,
+    shards: Option<usize>,
+    drivers: Option<usize>,
+    compaction: Option<usize>,
+) -> ThreadBudget {
+    let cores = cores.max(1);
+    let shards = shards.unwrap_or(cores).max(1);
+    let (num, den) = compaction_share(profile);
+    ThreadBudget {
+        shards,
+        drivers: drivers.unwrap_or(shards),
+        fixed: drivers.is_some(),
+        compaction: compaction.unwrap_or_else(|| (cores * num / den).clamp(1, shards)),
+    }
 }
 
 /// The row cache's default capacity (D216): a quarter of the default block cache. On ycsb-c
@@ -129,8 +192,10 @@ impl Default for Options {
             write_stall_timeout: None,
             commit_spin: None,
             shard_spin: None,
-            shard_threads: 0,
+            shard_threads: None,
+            adaptive_shard_threads: false,
             background_workers: 0,
+            cpu_profile: CpuProfile::Embedded,
             auto_recover: Recovery::Off,
         }
     }
@@ -358,7 +423,65 @@ impl Options {
     /// # let _ = options;
     /// ```
     pub fn shard_threads(mut self, k: usize) -> Self {
-        self.shard_threads = k;
+        self.shard_threads = Some(k);
+        self
+    }
+
+    /// Who this machine's (or container's) CPUs are for, which sets how many threads the
+    /// engine starts by default (D289, ICR 0081). [`shard_threads`](Options::shard_threads)
+    /// and [`compaction_cores`](Options::compaction_cores) set explicitly still win, and the
+    /// profile fills in the rest.
+    ///
+    /// - **Shard threads, both profiles:** one per shard, so one per physical core by
+    ///   default. With [`adaptive_shard_threads`](Options::adaptive_shard_threads) that is
+    ///   the most, and a lighter load runs on fewer.
+    /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
+    ///   and needs CPU too. Flush and compaction take a quarter of the physical cores.
+    /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
+    ///   and its clients reach it from elsewhere (another container, over IPC or the
+    ///   network). Flush and compaction take half the physical cores.
+    /// - **CPU limits:** "physical cores" means those the process may use: its affinity
+    ///   mask and a container's CPU quota both narrow them, so a 4-CPU container sizes the
+    ///   engine for 4 whatever the host has.
+    /// - Engine-owned mode only: application-owned shards and workers run on threads you
+    ///   start yourself (D40).
+    ///
+    /// ```
+    /// use pigeonhole::{CpuProfile, Options};
+    ///
+    /// // A database container the application talks to over the network.
+    /// let options = Options::default().cpu_profile(CpuProfile::Server);
+    /// # let _ = options;
+    /// ```
+    pub fn cpu_profile(mut self, profile: CpuProfile) -> Self {
+        self.cpu_profile = profile;
+        self
+    }
+
+    /// Experimental, off by default: size the shard threads to the load (D289's controller,
+    /// ICR 0081). The engine starts a thread per shard, then moves the shards of a light load
+    /// onto fewer threads, which sleep less, so a commit less often waits for a sleeping thread
+    /// to be woken; under load it spreads them out again, up to one per shard.
+    ///
+    /// - **Why off by default:** the controller resizes on signals that are reliable in a
+    ///   steady load but noisy while a load changes phase (a bulk load ending, a run starting).
+    ///   In D289's box runs a resize at the wrong moment cost up to 5% of throughput, and a
+    ///   light load sometimes grew back and lost its latency gain. It stays opt-in until its
+    ///   policy is tuned across load phases.
+    /// - **What it gains when it settles right:** a light, many-shard load's commit p99 fell
+    ///   from hundreds of microseconds to tens (sparse-wide puts: 236-489 µs to 51 µs).
+    /// - **For a load you know is light,** a fixed [`shard_threads`](Options::shard_threads)
+    ///   gets the same without resizing. An explicit `shard_threads` turns this off.
+    /// - Engine-owned mode only.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().adaptive_shard_threads(true);
+    /// # let _ = options;
+    /// ```
+    pub fn adaptive_shard_threads(mut self, on: bool) -> Self {
+        self.adaptive_shard_threads = on;
         self
     }
 
@@ -955,17 +1078,26 @@ impl Options {
         o.direct_io = direct_io;
         o.create_if_missing = self.create_if_missing;
         o.shards = self.shards;
+        // D289's budget, from the physical cores within the affinity mask and CPU quota.
+        let budget = thread_budget(
+            pigeonhole_io::sys::default_shards(),
+            self.cpu_profile,
+            (self.shards != 0).then_some(self.shards),
+            self.shard_threads,
+            self.compaction_cores,
+        );
         o.compaction_threads = match self.compaction_cores {
             Some(k) => k,
+            // Application-owned mode starts no threads (D40).
             None if application_owned => 0,
-            None => default_compaction_cores(if self.shards == 0 {
-                pigeonhole_io::sys::default_shards()
-            } else {
-                self.shards
-            }),
+            None => budget.compaction,
         };
         o.pin_threads = self.pin_threads;
-        o.shard_threads = self.shard_threads;
+        o.shard_threads = budget.drivers;
+        // The load controller (D289 PR 2), opt-in for now (the owner, #1006: its resize
+        // policy is noisy across load phases), never with a fixed count; application-owned
+        // shards run on the application's threads (D40).
+        o.adaptive_drivers = self.adaptive_shard_threads && !budget.fixed && !application_owned;
         if application_owned {
             o.background_workers = self.background_workers;
         }
@@ -1128,4 +1260,94 @@ fn uring_vfs(application_owned: bool) -> Option<VfsRef> {
 #[cfg(not(target_os = "linux"))]
 fn uring_vfs(_application_owned: bool) -> Option<VfsRef> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CpuProfile, ThreadBudget, thread_budget};
+
+    fn b(shards: usize, drivers: usize, fixed: bool, compaction: usize) -> ThreadBudget {
+        ThreadBudget {
+            shards,
+            drivers,
+            fixed,
+            compaction,
+        }
+    }
+
+    /// D289's load controller is opt-in (the owner, #1006): off by default, on with
+    /// `adaptive_shard_threads(true)`, and never with a fixed `shard_threads` or in
+    /// application-owned mode (D40).
+    #[test]
+    fn the_load_controller_is_opt_in() {
+        use super::Options;
+        let o = || Options::default().vfs(pigeonhole_io::sim::SimVfs::new(1));
+        let adaptive = |o: Options, app: bool| o.to_engine_for(app).unwrap().adaptive_drivers;
+        assert!(!adaptive(o(), false));
+        assert!(adaptive(o().adaptive_shard_threads(true), false));
+        assert!(!adaptive(
+            o().adaptive_shard_threads(true).shard_threads(4),
+            false
+        ));
+        assert!(!adaptive(o().adaptive_shard_threads(true), true));
+        // Off, the engine-owned default is a thread per shard.
+        let e = o().shards(20).to_engine_for(false).unwrap();
+        assert_eq!(e.shard_threads, 20);
+    }
+
+    /// D289's tables (the decision's entry and the guide): both profiles from 1 to 128
+    /// physical cores, nothing set explicitly. The driver ceiling is one per core in both;
+    /// the profiles differ in the compaction share.
+    #[test]
+    fn the_budget_by_profile_and_core_count() {
+        let table = [
+            // cores, embedded compaction, server compaction
+            (1, 1, 1),
+            (2, 1, 1),
+            (4, 1, 2),
+            (8, 2, 4),
+            (16, 4, 8),
+            (32, 8, 16),
+            (64, 16, 32),
+            (128, 32, 64),
+        ];
+        for (cores, embedded, server) in table {
+            assert_eq!(
+                thread_budget(cores, CpuProfile::Embedded, None, None, None),
+                b(cores, cores, false, embedded),
+                "embedded, {cores} cores"
+            );
+            assert_eq!(
+                thread_budget(cores, CpuProfile::Server, None, None, None),
+                b(cores, cores, false, server),
+                "server, {cores} cores"
+            );
+        }
+    }
+
+    /// Explicit settings win and are kept as given; derived counts stay within one per shard
+    /// and at least one.
+    #[test]
+    fn explicit_settings_win_and_the_budget_fills_the_rest() {
+        let e = CpuProfile::Embedded;
+        // A fixed driver count turns the controller off.
+        assert_eq!(thread_budget(16, e, None, Some(2), None), b(16, 2, true, 4));
+        assert_eq!(thread_budget(16, e, None, Some(0), None), b(16, 0, true, 4));
+        // Compaction set (0: on the shards), kept as given, even past the shard count.
+        assert_eq!(
+            thread_budget(16, e, None, None, Some(0)),
+            b(16, 16, false, 0)
+        );
+        assert_eq!(
+            thread_budget(16, e, None, None, Some(20)),
+            b(16, 16, false, 20)
+        );
+        // Fewer shards than cores: the ceiling and compaction stay within one per shard.
+        assert_eq!(thread_budget(16, e, Some(2), None, None), b(2, 2, false, 2));
+        // A 4-CPU container quota on a big host is 4 cores here (`default_shards`).
+        assert_eq!(
+            thread_budget(4, CpuProfile::Server, None, None, None),
+            b(4, 4, false, 2)
+        );
+    }
 }

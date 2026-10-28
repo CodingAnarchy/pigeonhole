@@ -478,4 +478,55 @@ mod loom_tests {
             task.join().unwrap();
         });
     }
+
+    #[test]
+    // Not ignored: unlike the models above it passes on loom 0.7.2 as is (checked against
+    // the adopter parking before its first turn, which loom reports as a deadlock).
+    fn loom_a_message_racing_a_driver_move_is_found_by_the_adopter() {
+        // D289 PR 2's move: the shard announced sleep at its last turn on the source driver
+        // (whose wakeup it still targets), a producer submits while the source hands the
+        // shard to the adopter (queue, then unpark), and the adopter points the shard's
+        // wakeups at itself and runs its turn before it parks. A message whose producer read
+        // the old target woke the source, which no longer polls the shard: the adopter's
+        // first turn must find it, and loom reports a deadlock if it could park first.
+        model(|| {
+            let (shard, _source) = Shard::new();
+            assert!(!shard.check_before_sleep());
+            let adopter = std::sync::Arc::new(Parker::default());
+            let handed = std::sync::Arc::new(Mutex::new(false));
+            let producer = {
+                let shard = std::sync::Arc::clone(&shard);
+                thread::spawn(move || shard.submit(1))
+            };
+            let source = {
+                let (adopter, handed) = (
+                    std::sync::Arc::clone(&adopter),
+                    std::sync::Arc::clone(&handed),
+                );
+                thread::spawn(move || {
+                    *handed.lock().unwrap() = true;
+                    adopter.unpark();
+                })
+            };
+            // The adopter: idle until the handoff, then the shard is its own.
+            while !*handed.lock().unwrap() {
+                adopter.park();
+            }
+            let a = std::sync::Arc::clone(&adopter);
+            shard
+                .signal
+                .set_target(WakeTarget::Callback(Arc::new(move || a.unpark())));
+            loop {
+                shard.signal.awake();
+                if shard.queue.lock().unwrap().pop_front().is_some() {
+                    break;
+                }
+                if !shard.check_before_sleep() {
+                    adopter.park();
+                }
+            }
+            producer.join().unwrap();
+            source.join().unwrap();
+        });
+    }
 }

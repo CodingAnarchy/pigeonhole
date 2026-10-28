@@ -620,6 +620,13 @@ pub trait Runner {
         None
     }
 
+    /// The driver threads the store's shards run on and whether every shard is on its
+    /// driver (D289 PR 2), `None` (the default) for stores without a load controller. The
+    /// warm-up does not end while the controller resizes or still moves shards.
+    fn driver_target(&self) -> Option<(usize, bool)> {
+        None
+    }
+
     /// Cumulative stall counters since open ([`Stalls`]); `None` (the default) for stores
     /// that do not report them. [`run_detailed`] reads it around the measured phase.
     fn stalls(&self) -> Option<Stalls> {
@@ -965,6 +972,7 @@ pub fn run_detailed(
             warmup_secs: Some(warmed.secs),
             warmup_settle_secs: Some(warmed.settle_secs),
             warmup_settled: Some(warmed.settled),
+            drivers: warmed.drivers,
             seqnos_used,
             txn_conflicts,
             riders,
@@ -1275,16 +1283,25 @@ fn warm_up_on(
             secs: 0.0,
             settle_secs: 0.0,
             settled: true,
+            drivers: runner.driver_target().map(|(k, _)| k),
         });
     }
     // A pass stops at the cap on the wall clock too.
     let deadline = Instant::now() + cap;
     let started = clock();
     let mut last_change = started;
+    let mut drivers = runner.driver_target();
     let settled = loop {
         let before = runner.shard_shares();
         pass(runner, clients, warm, false, Some(deadline)).map_err(|e| format!("warmup: {e}"))?;
         let after = runner.shard_shares();
+        // The load controller (D289 PR 2) resizing, or shards still on their way to their
+        // drivers, counts as a placement change too.
+        let now_drivers = runner.driver_target();
+        if now_drivers != drivers || now_drivers.is_some_and(|(_, settled)| !settled) {
+            last_change = clock();
+        }
+        drivers = now_drivers;
         // A pending growth or first pack counts as a change: its moves have not started
         // yet (#983: a warm-up that ended before the store's first pack measured its 16-19
         // moves). So does a growth whose moves have not spread the tablets yet: fewer shards hold one than
@@ -1309,6 +1326,7 @@ fn warm_up_on(
         secs: (clock() - started).as_secs_f64(),
         settle_secs: (last_change - started).as_secs_f64(),
         settled,
+        drivers: drivers.map(|(k, _)| k),
     })
 }
 
@@ -1322,6 +1340,8 @@ struct Warmed {
     settle_secs: f64,
     /// Whether the placement settled within the cap.
     settled: bool,
+    /// The driver threads the shards ran on at the end (D289 PR 2), if the store reports them.
+    drivers: Option<usize>,
 }
 
 /// Whether the balancer is still heading somewhere (D242's amendments, #983): a growth or
@@ -1751,6 +1771,7 @@ mod tests {
             secs,
             settle_secs,
             settled,
+            ..
         } = run(&mut early, 200, cap);
         assert_eq!(settle_secs, 0.0, "no change seen");
         let moved = early.shard_shares()[0].moves;
@@ -1763,6 +1784,7 @@ mod tests {
             secs,
             settle_secs,
             settled,
+            ..
         } = run(&mut spreading(300, MOVES), 500, cap);
         assert!(settled && secs == 1.5 + 0.5, "outlasted the spread: {secs}");
         assert_eq!(settle_secs, 1.5);

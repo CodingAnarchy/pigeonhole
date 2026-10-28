@@ -134,9 +134,16 @@ OPTIONS:
     --shard-spin US        Pigeonhole: a shard's idle spin before it parks, in µs (D198)
                            [default: the library's]
     --shard-threads K      Pigeonhole: run the shards on K threads (D289)
-                           [default: the library's, one per shard]
+                           [default: the library's CPU budget]
     --background-workers N Pigeonhole, application-owned (app-owned, scaling): N background
                            workers for flush and compaction, a thread each (D284) [default: 0]
+    --compaction-cores C   Pigeonhole: flush and compaction threads (D252)
+                           [default: the library's CPU budget]
+    --server-profile       Pigeonhole: the server CPU profile (D289, ICR 0081): flush
+                           and compaction take half the physical cores, not a quarter
+    --adaptive-shard-threads
+                           Pigeonhole: the load controller sizes the shard threads
+                           (D289, experimental) [default: a thread per shard]
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
     --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
@@ -199,6 +206,9 @@ struct Args {
     shard_spin: Option<u64>,
     shard_threads: Option<usize>,
     background_workers: usize,
+    compaction_cores: Option<usize>,
+    server_profile: bool,
+    adaptive_shard_threads: bool,
     commit_spin: Option<u64>,
     txn_backoff: Option<u64>,
     dir: Option<PathBuf>,
@@ -270,6 +280,9 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
             "--shard-threads" => a.shard_threads = Some(parse(&arg, it.next())?),
             "--background-workers" => a.background_workers = parse(&arg, it.next())?,
+            "--compaction-cores" => a.compaction_cores = Some(parse(&arg, it.next())?),
+            "--server-profile" => a.server_profile = true,
+            "--adaptive-shard-threads" => a.adaptive_shard_threads = true,
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
             "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
@@ -363,6 +376,15 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if a.background_workers > 0 {
         r = r.background_workers(a.background_workers);
+    }
+    if let Some(c) = a.compaction_cores {
+        r = r.compaction_cores(c);
+    }
+    if a.server_profile {
+        r = r.server_profile();
+    }
+    if a.adaptive_shard_threads {
+        r = r.adaptive_shard_threads();
     }
     if let Some(us) = a.commit_spin {
         r = r.commit_spin_micros(us);
@@ -786,6 +808,12 @@ mod tests {
         let bw = args("app-owned --background-workers 4");
         assert_eq!(bw.background_workers, 4);
         assert!(pigeonhole(&bw, None).describe().contains(" workers=4"));
+        assert_eq!(
+            args("ycsb-a --compaction-cores 8").compaction_cores,
+            Some(8)
+        );
+        assert!(args("ycsb-a --server-profile").server_profile);
+        assert!(args("ycsb-a --adaptive-shard-threads").adaptive_shard_threads);
         assert_eq!(args("ycsb-a --commit-spin 0").commit_spin, Some(0));
         assert_eq!(args("transfer --txn-backoff 0").txn_backoff, Some(0));
         assert!(pigeonhole(&rc, None).describe().contains(" rowcache=1MiB"));

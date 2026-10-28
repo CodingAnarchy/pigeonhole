@@ -48,6 +48,14 @@ pub(crate) struct Settings {
     /// (`Options::background_workers`, D284), each driven on a thread of its own; 0 runs
     /// them on the shards.
     pub(crate) background_workers: usize,
+    /// Flush and compaction threads (`Options::compaction_cores`, D252); the library
+    /// default when not set.
+    pub(crate) compaction_cores: Option<usize>,
+    /// `Options::cpu_profile(CpuProfile::Server)` (D289) when set; the embedded default
+    /// otherwise.
+    pub(crate) server_profile: bool,
+    /// `Options::adaptive_shard_threads(true)` (D289's controller, experimental) when set.
+    pub(crate) adaptive_shard_threads: bool,
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
@@ -386,6 +394,50 @@ impl PigeonholeRunner {
         self
     }
 
+    /// Flush and compaction threads (`Options::compaction_cores`, D252); the library
+    /// default when not set.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("compaction_cores"));
+    /// let r = PigeonholeRunner::default().compaction_cores(8);
+    /// assert!(r.describe().contains(" compaction_cores=8"));
+    /// ```
+    pub fn compaction_cores(mut self, c: usize) -> Self {
+        self.settings.compaction_cores = Some(c);
+        self
+    }
+
+    /// The server CPU profile (`Options::cpu_profile(CpuProfile::Server)`, D289, ICR 0081):
+    /// flush and compaction take half the physical cores rather than a quarter.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("profile=server"));
+    /// assert!(PigeonholeRunner::default().server_profile().describe().contains(" profile=server"));
+    /// ```
+    pub fn server_profile(mut self) -> Self {
+        self.settings.server_profile = true;
+        self
+    }
+
+    /// D289's load controller sizes the shard threads
+    /// (`Options::adaptive_shard_threads(true)`, experimental).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("adaptive"));
+    /// let r = PigeonholeRunner::default().adaptive_shard_threads();
+    /// assert!(r.describe().contains(" shard_threads=adaptive"));
+    /// ```
+    pub fn adaptive_shard_threads(mut self) -> Self {
+        self.settings.adaptive_shard_threads = true;
+        self
+    }
+
     /// Application-owned runs ([`run_inline`](Self::run_inline) without
     /// [`inline_engine_owned`](Self::inline_engine_owned)): `n` background workers for flush
     /// and compaction (`Options::background_workers`, D284), each driven on a thread of its
@@ -640,6 +692,15 @@ pub(crate) fn options(s: &Settings) -> Options {
         options = options.shard_threads(k);
     }
     options = options.background_workers(s.background_workers);
+    if let Some(c) = s.compaction_cores {
+        options = options.compaction_cores(c);
+    }
+    if s.server_profile {
+        options = options.cpu_profile(pigeonhole::CpuProfile::Server);
+    }
+    if s.adaptive_shard_threads {
+        options = options.adaptive_shard_threads(true);
+    }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
     }
@@ -766,6 +827,10 @@ impl Runner for PigeonholeRunner {
         self.open.as_ref().and_then(|o| o.target.db.pack_target())
     }
 
+    fn driver_target(&self) -> Option<(usize, bool)> {
+        self.open.as_ref().and_then(|o| o.target.db.driver_target())
+    }
+
     fn shard_shares(&self) -> Vec<ShardShare> {
         self.open.as_ref().map_or_else(Vec::new, |o| {
             o.target
@@ -888,7 +953,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -921,6 +986,18 @@ impl Runner for PigeonholeRunner {
                 format!(" workers={}", s.background_workers)
             } else {
                 String::new()
+            },
+            s.compaction_cores
+                .map_or_else(String::new, |c| format!(" compaction_cores={c}")),
+            if s.server_profile {
+                " profile=server"
+            } else {
+                ""
+            },
+            if s.adaptive_shard_threads {
+                " shard_threads=adaptive"
+            } else {
+                ""
             },
             s.commit_spin_micros
                 .map_or_else(String::new, |us| format!(" commit_spin={us}us")),
