@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use pigeonhole_format::{Cursor, Kind, encode_key};
-use pigeonhole_memtable::{ArenaRegion, Memtable, ShardArena};
+use pigeonhole_memtable::{ArenaRegion, Memtable, MemtableReader, ShardArena};
 use proptest::collection::vec;
 use proptest::prelude::*;
 
@@ -371,4 +371,80 @@ fn a_forward_seek_before_the_last_seeks_target_finds_what_seek_would() {
     it.seek(&key(120)).unwrap();
     it.seek_forward(&key(30)).unwrap();
     assert_eq!(it.key(), &key(30)[..]);
+}
+
+/// D291's counter checkpoint is a node inserted inside a column's run, below newer versions
+/// already linked, where every earlier insert landed at a column's front. With stale tails
+/// recorded (D194, D277), every reader still sees every entry in order, and a column skip
+/// from any node of the column, the new one included, lands on the next column: through the
+/// writer's reader and through one opened from shared memory, which checks every tail.
+#[test]
+fn a_node_inserted_inside_a_columns_run_keeps_the_stale_tails_valid() {
+    let mut arena = ShardArena::new(ArenaRegion::heap(1 << 20), 64 * 1024);
+    let mut m = Memtable::create(&mut arena).unwrap().with_tail_index();
+    let key = |q: &[u8], seqno: u64, kind: Kind| {
+        let mut k = Vec::new();
+        encode_key(&mut k, b"row", q, 0, seqno, kind).unwrap();
+        k
+    };
+    let mut expected = BTreeMap::new();
+    let mut put = |m: &mut Memtable, arena: &mut ShardArena, k: Vec<u8>| {
+        m.insert(arena, &k, b"\x01\x01\x00\x00\x00\x00\x00\x00\x00")
+            .unwrap();
+        expected.insert(k, ());
+    };
+    // A counter's operands, oldest first as a shard applies them, between two other columns.
+    put(&mut m, &mut arena, key(b"a", 1, Kind::Merge));
+    for seqno in 2..=40 {
+        put(&mut m, &mut arena, key(b"c", seqno, Kind::Merge));
+    }
+    put(&mut m, &mut arena, key(b"d", 41, Kind::Merge));
+    // Checkpoints inside the run: just below the newest operand, mid-run, and at the oldest.
+    for seqno in [39, 20, 2] {
+        put(&mut m, &mut arena, key(b"c", seqno, Kind::Put));
+    }
+    let column = {
+        let k = key(b"c", 0, Kind::Put);
+        k[..k.len() - 17].to_vec()
+    };
+    let readers = [
+        ("writer", m.reader()),
+        (
+            "shared memory",
+            MemtableReader::open(arena.region().clone(), m.root()).unwrap(),
+        ),
+    ];
+    for (name, reader) in readers {
+        assert!(reader.iter().skips_columns(), "{name}: tails recorded");
+        let mut it = reader.iter();
+        it.seek_to_first().unwrap();
+        let mut seen = Vec::new();
+        while it.valid() {
+            seen.push(it.key().to_vec());
+            it.next().unwrap();
+        }
+        let want: Vec<_> = expected.keys().cloned().collect();
+        assert_eq!(seen, want, "{name}: every entry, in order");
+        // A skip from each of the column's nodes, in turn, lands on column `d`.
+        // Every node but the column's last has a later node of the column to jump to.
+        let in_column: Vec<_> = want.iter().filter(|k| k.starts_with(&column)).collect();
+        let last = in_column.len() - 1;
+        for (i, at) in in_column.into_iter().enumerate() {
+            let mut it = reader.iter();
+            it.seek(at).unwrap();
+            assert_eq!(it.key(), &at[..]);
+            assert_eq!(
+                it.skip_column(&column).unwrap(),
+                i < last,
+                "{name}: a tail at {i}"
+            );
+            if i < last {
+                assert_eq!(
+                    it.key(),
+                    &key(b"d", 41, Kind::Merge)[..],
+                    "{name}: a skip from {at:?} left the column"
+                );
+            }
+        }
+    }
 }
