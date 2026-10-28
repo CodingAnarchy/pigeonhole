@@ -219,7 +219,7 @@ $ python3 -c 'import duckdb, pyarrow.ipc as ipc; t = ipc.open_stream("users.arro
 CI dumps a table this way and reads it with Polars.
 
 **`phdb load`** writes a `jsonl` dump into a database, from a file or standard input:
-- **Writer only:** it opens the database as the writer, so it fails with status 4 while another writer runs. `--create` creates the file if it's missing, but only once the input's first line is a dump header: an input that isn't a dump, an empty one included (a `phdb dump` that failed into a pipe writes nothing), fails with status 2 and creates nothing.
+- **Writer only:** it opens the database as the writer, so it fails with status 4 while another writer runs. `--create` creates the file if it's missing, but only once the input's first line is a dump header: an input that isn't a dump, an empty one included (a `phdb dump` that failed into a pipe writes nothing), fails with status 2 and creates nothing. A dump with only its header creates an empty database: `echo '{"phdb":1,"command":"dump"}' | phdb load --create app.phdb -` (`phdb` has no other command that creates a file).
 - **Tables and families:** each table line creates its table and families. An existing family keeps the options stored in the file.
 - **Cells:** each is written at its timestamp. Counters are set to their dumped value. A family with a merge operator gets the merged values as puts.
 - **Durability:** cells are committed in batches at `Durability::None`, and one flush at the end makes the load durable. If the load fails partway, what was committed stays.

@@ -482,6 +482,22 @@ fn load_refuses_an_input_without_a_dump_header() {
         assert!(!target.exists(), "{what}: --create made a database");
     }
 
+    // A dump with only its header is the way to make an empty database.
+    std::fs::write(&input, "{\"phdb\":1,\"command\":\"dump\"}\n").unwrap();
+    let out = phdb(&[
+        "load",
+        "--create",
+        target.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status, 0, "{out:?}");
+    assert!(target.exists(), "a header-only dump made no database");
+    let info = phdb(&["--format", "json", "info", target.to_str().unwrap()]);
+    assert_eq!(info.status, 0, "{info:?}");
+    let doc: serde_json::Value = serde_json::from_str(&info.stdout).unwrap();
+    assert_eq!(doc["tables"], serde_json::json!([]), "{doc}");
+    std::fs::remove_file(&target).unwrap();
+
     // Blank lines before the header are fine, and errors after it count them.
     std::fs::write(&input, "\n\n{\"phdb\":1,\"command\":\"dump\"}\nnot json\n").unwrap();
     let out = phdb(&[
