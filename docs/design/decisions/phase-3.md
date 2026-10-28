@@ -2886,3 +2886,57 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
   - dropped when its entry left the active memtable (empty, or holding newer entries);
   - a transaction between `s_top` and the read point commits without `Conflict`.
 - **pigeonhole:** `PIGEONHOLE_CHECKPOINT_STEPS=1` runs the model check with a checkpoint after nearly every counter read, under flushes, compactions, tablet changes and reopens.
+
+## D292 — A submitted read the page cache holds is copied on the submitting thread (ctr274, 2026-10-28; io, #709, #749, D280)
+**Why.** Async ycsb-a at 16 in flight ran at 0.58× sync (D280's bar is 0.83×). On the AX102 the async clients spent about 11% of their CPU in the kernel's `uring_lock` (`osq_lock`, `mutex_spin_on_owner`) under `io_uring_enter`. A block miss that the page cache held was copied inside the enter, under the lock every submitter queues on (#749 comment 6460843615). On pread it took a hop to a pool thread instead. Sync clients already read inline and paid neither cost.
+
+**What.** On Linux, `PreadFile::submit_read` and `UringFile::submit_read` first try `preadv2(RWF_NOWAIT)` on the calling thread, after their existing inline checks.
+- **A full-length read** resolves the completion before `submit_read` returns (`Completion::ready`), as the inline paths already do.
+- **Anything else is submitted as before:** `EAGAIN` (not all cached), a short read (partly cached, or past the end) or another error, `EINTR` included (no retry in the fast path). A short read's bytes are discarded, and the submitted read reports end of file or the error as it always has.
+- **A refusal:** `EOPNOTSUPP` (overlay, virtiofs, NFS) or `EINVAL` (a kernel without the flag) sets a flag on the handle, and that handle never tries again.
+- **Not tried:**
+  - direct-I/O handles, which have no page cache;
+  - `submit_reads_ahead`, since a scan's readahead isn't waited on and stays batched with `IOSQE_ASYNC` (ICR 0077);
+  - writes;
+  - `SimFile`, so seed replay is unchanged;
+  - other platforms, which compile it out.
+- **Length cap:** reads over 256 KiB aren't tried (`nowait::MAX_LEN`). Shard and compaction threads reach the attempt too (`sst/reader.rs` `submit_bytes`, and blob extents through the same `submit_read`), and a large extent copied inline would be a long synchronous copy inside a turn, against D289's turn budget (perf287's S2).
+- **Breaker, per file:** after 64 misses in a row with no hit, the file submits its next 4096 reads without trying, then tries again (perf287's S1). This catches a file system that takes the flag but never finds anything cached (some FUSE and network mounts), so it doesn't pay a system call on every read. A file read cold at first (after a restart) trips the breaker and recovers. One that never hits tries 64 reads in every 4160. A miss rate like the cold arm's (13%) practically never makes 64 in a row.
+- **Misses are timed** (perf287's S3). Under `IOCB_NOWAIT` the kernel may start readahead for a missing folio before it returns `EAGAIN`, so a miss can cost more than a failed system call. Each miss's time goes into a sum and a log2 histogram, so a kernel or device that changes this shows up as a number.
+- **Switch and counters, per backend** (ICR 0083):
+  - `Vfs::set_nowait_reads`, set from the doc-hidden `Options::nowait_reads`;
+  - `Vfs::nowait_reads`: hits, misses, miss time and buckets, refusals and breaker trips. Hits go on per-thread stripes, so no line is shared by every reader.
+  - The bench's switch is `--no-nowait-reads`. The bench prints the counters at close.
+
+**Why it's safe.** The bytes are the ones `pread` would return. The call takes no lock of ours and writes only into the caller's buffer, and the handle keeps the descriptor open. Callers already handle a completion that's resolved on return. The only shared state is a per-handle flag that's only ever set.
+
+**Measured** (AX102, ycsb-a, gate settings, on vs `PIGEONHOLE_NOWAIT=0` on scratch a54c60b4, `/root/scratch/ctr274/out-709b`, #749 comment 6463250275):
+
+| Arm | Off | On |
+|---|---|---|
+| async16 io_uring | 798K | 1.04–1.06M |
+| async16 pread | 838K | 1.01M |
+| async16 io_uring, buffered | 868K | 1.15M |
+| cold page cache (caches dropped every 2 s) | 523K | 768K |
+| sync256 control | 1.35M | 1.34M |
+
+- **Against sync:** async16 io_uring rises from 0.59× to 0.78× sync.
+- **Read latency:** p50 175 → 100 µs, p99 1.2 ms → 350 µs.
+- **The cold arm** missed on 13% of attempts and still gained 47%.
+- **The sync control** never reaches the attempt.
+
+**Not covered yet:** the rest of the gap to 0.83×. Lever 2 is next: `IOSQE_ASYNC` per op for the reads that still reach the ring, with io-wq capped.
+
+**Tests:** io `nowait_reads.rs` (Linux, both backends):
+- a cached read resolves inline with the same bytes;
+- a read past the end fails as it did with the switch off, and counts a timed miss rather than a hit;
+- a read the page cache dropped (`POSIX_FADV_DONTNEED`) is a timed miss;
+- with the switch off, nothing is tried;
+- a read over the cap is submitted, and one at the cap is tried;
+- 64 misses open that file's breaker but not another's;
+- a hit on a thread with its own ring operations in flight resolves inline and leaves them to complete (perf287's N4);
+- a handle on a file system that refuses the flag tries once, then never again.
+
+The ring tests that need their reads on a ring turn the switch off: `uring.rs`'s cross-ring wait, and runtime's `driver_ring.rs`.
+
+CI's ext4 runners cover hits. The podman VM's overlay mount covers refusals.
