@@ -23,6 +23,10 @@ arrow-schema = { workspace = true }
 # built on another arrow major or another language (DuckDB, Polars, pyarrow). Adds libc.
 ffi = ["arrow-array/ffi"]
 
+# docs.rs builds default features only: document `into_ffi_stream` too.
+[package.metadata.docs.rs]
+features = ["ffi"]
+
 [dev-dependencies]
 pigeonhole-io = { workspace = true }
 
