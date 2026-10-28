@@ -2804,7 +2804,9 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
 
 **The memtable.** A checkpoint is the first insert that lands inside a column's run rather than at its front. Its stale tail (D194, D277) is its successor's, a later node of the same column. That's valid for a skip that finishes the column, in the writer's process and for a reader that checks every tail.
 
-**Not covered yet:** async gets (`get_async`) and row reads of counters. They read through the same resolver, so (a) applies, but they don't send checkpoints. A write-side checkpoint for counters that are written heavily but rarely read is a follow-up, only if the gate's p99.9 shows it matters.
+**Where it runs.** Every point get, sync or async, goes through `get_in`, whose closure takes the resolver's fold record after the get (only counter groups set it). A fold record hands the result to a cold function that sends it through the view's sink. The sink is in the writer's `LiveViews`, reached through the view's pin, and is absent in reader processes and forked children. `get_with` itself is unchanged: a checkpoint argument there changed what the compiler inlined into every point get (+1–3% instructions, D193).
+
+**Not covered yet:** row reads of counters. They read through the same resolver, so (a) applies, but they don't send checkpoints. A write-side checkpoint for counters that are written heavily but rarely read is a follow-up, only if the gate's p99.9 shows it matters.
 
 **Measured** (local, `counters --scale full --threads 16`, buffered): counter-read p99 2.5–3.9 ms → 33 µs, p99.9 4–5 ms → 116–161 µs, and throughput 150K → 210–290K ops/s. The box A/B against main follows on the PR.
 
