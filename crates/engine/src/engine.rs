@@ -1130,7 +1130,6 @@ impl Engine {
                 Default::default()
             },
             memtable_freeze_bytes: freeze_bytes,
-            counter_checkpoint_steps: options.counter_checkpoint_steps,
             wal_pin_bytes: match options.wal_pin_bytes {
                 0 => options.memtable_budget.saturating_mul(2),
                 n => n,
@@ -1161,6 +1160,23 @@ impl Engine {
                 shared.release_memory();
             }
         }));
+        // Counter checkpoints (D291): a get through one of this writer's views hands its
+        // result to the row's shard. Best effort: before the runtime starts, or once the
+        // engine is gone or its inbox closed, the checkpoint is dropped.
+        if options.counter_checkpoint_steps > 0 {
+            let weak = Arc::downgrade(&shared);
+            live_views.on_counter_checkpoint(
+                options.counter_checkpoint_steps,
+                Box::new(move |c: crate::read::CounterCheckpoint| {
+                    if let Some(shared) = weak.upgrade()
+                        && let Some(submitters) = shared.submitters.get()
+                    {
+                        let shard = usize::from(c.shard.0);
+                        let _ = submitters[shard].submit(ShardMsg::CounterCheckpoint(Box::new(c)));
+                    }
+                }),
+            );
+        }
         let mut states: Vec<ShardState> = Vec::with_capacity(shards);
         let flushed: HashMap<(TabletId, FamilyId), Seqno> =
             catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect();
@@ -1740,7 +1756,6 @@ impl Engine {
             manifest_flight: Default::default(),
             drivers: Default::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
-            counter_checkpoint_steps: 0,
             wal_pin_bytes: 0,
             submitters: std::sync::OnceLock::new(),
             wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
@@ -2169,20 +2184,9 @@ impl Engine {
             {
                 return Ok(hit);
             }
-            let mut checkpoint = None;
-            let got = get_in::<false>(
-                &view,
-                seqno,
-                clock,
-                table,
-                family,
-                row,
-                qualifier,
-                || Arc::clone(&view),
-                Some((inner.shared.counter_checkpoint_steps, &mut checkpoint)),
-            );
-            inner.send_checkpoint(checkpoint);
-            return got;
+            return get_in::<false>(&view, seqno, clock, table, family, row, qualifier, || {
+                Arc::clone(&view)
+            });
         }
         let snapshot = inner.snapshot()?;
         inner.get(&snapshot, table, family, row, qualifier)
@@ -4159,9 +4163,7 @@ impl Inner {
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
         snapshot.check_process()?;
-        // A reader process has no shards to keep a checkpoint (D291).
-        let mut checkpoint = None;
-        let got = snapshot.checked(get_in::<false>(
+        snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,
             || self.shared.vfs.now_micros(),
@@ -4170,23 +4172,7 @@ impl Inner {
             row,
             qualifier,
             || Arc::clone(&snapshot.view),
-            (self.role == Role::Writer)
-                .then_some((self.shared.counter_checkpoint_steps, &mut checkpoint)),
-        ));
-        self.send_checkpoint(checkpoint);
-        got
-    }
-
-    /// Hands a counter get's result to its row's shard to keep as a base (D291). Best effort:
-    /// a closed inbox drops it, as the shard drops one it cannot keep.
-    fn send_checkpoint(&self, checkpoint: Option<crate::read::CounterCheckpoint>) {
-        if let Some(c) = checkpoint {
-            let shard = c.shard;
-            let _ = self
-                .shared
-                .submitter(shard)
-                .submit(ShardMsg::CounterCheckpoint(Box::new(c)));
-        }
+        ))
     }
 
     fn flush_pending(&self) -> Result<PendingMaintenance> {

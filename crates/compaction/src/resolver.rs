@@ -619,9 +619,16 @@ where
     /// The last counter group this resolver read (D291): the entries it stepped over, and
     /// the seqno of its newest entry at or below the read point. A counter's value at the
     /// read point is its value at that seqno: the read saw every entry of the column at or
-    /// below the read point, and none lies above that one. `None` before any counter group.
+    /// below the read point, and none lies above that one. `None` before any counter group,
+    /// and kept across `reset`: ask only after a counter group was read.
     pub fn counter_fold(&self) -> Option<(u64, Seqno)> {
         self.fold
+    }
+
+    /// [`counter_fold`](CellResolver::counter_fold), cleared: a caller that takes it after
+    /// every read knows a fold it finds is that read's.
+    pub fn take_counter_fold(&mut self) -> Option<(u64, Seqno)> {
+        self.fold.take()
     }
 
     /// The underlying cursor (to pin the current block for a zero-copy value).
@@ -685,7 +692,9 @@ where
             out_key,
             out_val,
             past_col,
-            fold,
+            // Set by every counter group before it can be read, so never stale for the read
+            // that asks (and a reset per point get measured 4 instructions, D193).
+            fold: _,
         } = self;
         row.clear();
         *family_cover = None;
@@ -719,7 +728,6 @@ where
         out_key.clear();
         out_val.clear();
         past_col.clear();
-        *fold = None;
     }
 
     /// Whether every field but the cursor and options holds its value in
@@ -761,7 +769,7 @@ where
             out_key,
             out_val,
             past_col,
-            fold,
+            fold: _,
         } = self;
         [
             row, col, run_key, run_acc, g_acc, g_key, base_key, base_val, out_key, out_val,
@@ -788,7 +796,6 @@ where
             && *run_ts == 0
             && run_err.is_none()
             && skip_group.is_none()
-            && fold.is_none()
     }
 
     fn expired(&self, ts: Timestamp) -> bool {
@@ -932,7 +939,14 @@ where
                 }
                 continue;
             }
-            if let Some(out) = self.group(ts, seqno, kind)? {
+            // Counter families read their groups in an instance of their own (D291), so the
+            // fold accounting and the stop at the base cost other families nothing.
+            let out = if self.opts.counter {
+                self.group::<true>(ts, seqno, kind)?
+            } else {
+                self.group::<false>(ts, seqno, kind)?
+            };
+            if let Some(out) = out {
                 return Ok(Some(out));
             }
         }
@@ -951,9 +965,14 @@ where
 
     /// Reads the whole `(column, ts)` group the cursor is on and returns its version, if it
     /// produces one now (a group of operands only extends the pending run instead).
-    fn group(&mut self, ts: Timestamp, seqno: Seqno, kind: Kind) -> Result<Option<Out>, C::Error> {
+    fn group<const COUNTER: bool>(
+        &mut self,
+        ts: Timestamp,
+        seqno: Seqno,
+        kind: Kind,
+    ) -> Result<Option<Out>, C::Error> {
         let snapshot = self.opts.snapshot;
-        let counter = self.opts.counter;
+        let counter = COUNTER;
         let expired = self.expired(ts);
         // Timestamp deletes hide the whole group whatever the order. In a counter family a
         // delete hides only older entries: those below `floor`, and those after it in the

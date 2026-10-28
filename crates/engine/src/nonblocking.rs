@@ -318,7 +318,6 @@ fn get_attempt(
             row,
             qualifier,
             || Arc::clone(view),
-            None,
         )
     } else {
         get_in::<false>(
@@ -330,7 +329,6 @@ fn get_attempt(
             row,
             qualifier,
             || Arc::clone(view),
-            None,
         )
     }
 }

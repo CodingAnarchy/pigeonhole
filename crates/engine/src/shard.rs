@@ -550,8 +550,6 @@ pub(crate) struct Shared {
     /// Which thread drives each application-owned shard (empty in engine-owned mode).
     pub drivers: crate::waker::Drivers,
     pub memtable_freeze_bytes: u64,
-    /// `EngineOptions::counter_checkpoint_steps` (D291; 0: off).
-    pub counter_checkpoint_steps: u64,
     /// Bytes a stream may hold past its oldest needed record before the slots pinning it
     /// are flushed (`EngineOptions::wal_pin_bytes`, resolved; #137).
     pub wal_pin_bytes: u64,
