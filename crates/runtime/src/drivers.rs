@@ -56,11 +56,15 @@ const SHRINK_MIN_OPS: u64 = 100;
 /// needed the drivers after all: ycsb-f went 16 -> 8 -> 16 at -3%, and loses 8% at a fixed 8).
 /// Also the band within which a load counts as unchanged for a proven level's floor.
 const SHRINK_REGRET: f64 = 0.03;
-/// Sibling wait over busy above which a driver grows the set: its shards' messages wait for
-/// their turns behind other shards' turns about as long as they are served. Transfer's
-/// hops at few drivers cost throughput with neither a busy driver nor slow passes (#1006's
-/// fourth A/B, -6%); this is the cost itself.
-const GROW_WAIT: f64 = 0.5;
+/// Sibling wait over busy, summed over the active drivers, above which the set grows: their
+/// shards' work waits behind other shards' turns for this share of the time it is served.
+/// Transfer's hops at few drivers cost throughput with neither a busy driver nor slow passes
+/// (#1006's fourth A/B, -6%); this is the cost itself. #1006's fixed-k round put the line
+/// between the loads that gain from more drivers (transfer 1.6 at 2 drivers and 0.55 at 4,
+/// ycsb-f 0.23-0.27 at 8: +50%, +22% and +5% ops a doubling) and sparse-wide at 2 (0.04-0.08,
+/// where its tail gain is). Summed, not the highest driver's: a nearly idle driver's ratio
+/// is noise (0.57-0.64 for sparse-wide's at 8 of 16, at 2% busy).
+const GROW_WAIT: f64 = 0.15;
 /// A window longer than this ran while every driver that could tick it was parked (an idle
 /// store): it is dropped, not averaged in, so its diluted busy can't read as a light load.
 const IDLE_WINDOW: Duration = Duration::from_millis(200);
@@ -270,7 +274,7 @@ struct Window {
     sum_busy: f64,
     /// The highest fraction of slow passes over the active drivers.
     slow: f64,
-    /// The highest sibling wait over busy of the active drivers.
+    /// The active drivers' sibling wait over their busy, both summed.
     wait: f64,
     wakes: u64,
     ops: u64,
@@ -331,8 +335,8 @@ impl Controller {
         self.at = now;
         let k = drivers.target();
         let window_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1) as f64;
-        let (mut max_busy, mut sum_busy, mut slow, mut wait, mut ops) =
-            (0f64, 0f64, 0f64, 0f64, 0u64);
+        let (mut max_busy, mut sum_busy, mut slow, mut ops) = (0f64, 0f64, 0f64, 0u64);
+        let (mut wait_nanos, mut busy_nanos) = (0u64, 0u64);
         for (d, slot) in drivers.slots.iter().enumerate() {
             let s = &slot.stats;
             let now_counts = [
@@ -352,11 +356,11 @@ impl Controller {
                 if delta(1) > 0 {
                     slow = slow.max(delta(2) as f64 / delta(1) as f64);
                 }
-                if delta(0) > 0 {
-                    wait = wait.max(delta(4) as f64 / delta(0) as f64);
-                }
+                wait_nanos += delta(4);
+                busy_nanos += delta(0);
             }
         }
+        let wait = wait_nanos as f64 / busy_nanos.max(1) as f64;
         let wakes_now = drivers.wakes();
         let wakes = wakes_now.saturating_sub(std::mem::replace(&mut self.last_wakes, wakes_now));
         if elapsed > IDLE_WINDOW {
