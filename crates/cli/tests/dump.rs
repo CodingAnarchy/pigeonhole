@@ -242,7 +242,6 @@ fn errors_and_exit_statuses() {
     assert_eq!(out.status, 5, "without --create: {out:?}");
 
     for (text, needle) in [
-        ("{\"x\":1}\n", "line 1: not a phdb dump"),
         (
             "{\"phdb\":1,\"command\":\"dump\"}\nnot json\n",
             "line 2: not JSON",
@@ -425,4 +424,81 @@ fn arrow_dump_errors() {
         "{err}"
     );
     assert!(dump(&src, &["--table", "a", "--prefix", "late"]).contains("9223372036854775808"));
+}
+
+/// #1037: an input with no dump header is refused with exit 2 before the database is opened,
+/// so `--create` makes nothing: an empty input (a dump that failed into a pipe writes nothing
+/// to standard output), a first line that isn't the header, and one that isn't JSON. A dump
+/// after blank lines still loads, and its line numbers count them.
+#[test]
+fn load_refuses_an_input_without_a_dump_header() {
+    let dir = TempDir::new("load-header");
+    let input = dir.path().join("in.jsonl");
+    let target = dir.path().join("target.phdb");
+
+    // A dump of a missing file fails: the error goes to standard error, standard output is
+    // empty, and that is what a pipe hands `load`.
+    let missing = dir.path().join("missing.phdb");
+    let failed = phdb(&["dump", missing.to_str().unwrap()]);
+    assert_eq!(failed.status, 5, "{failed:?}");
+    assert!(failed.stdout.is_empty(), "{failed:?}");
+
+    for (what, text, needle) in [
+        ("empty", String::new(), "the input is empty"),
+        ("a failed dump", failed.stdout.clone(), "the input is empty"),
+        ("blank lines only", "\n \n".to_owned(), "the input is empty"),
+        (
+            "another document",
+            "{\"x\":1}\n".to_owned(),
+            "line 1: not a phdb dump",
+        ),
+        (
+            "a dump's error document",
+            "{\"phdb\":1,\"error\":{\"code\":\"FileNotFound\"}}\n".to_owned(),
+            "line 1: not a phdb dump",
+        ),
+        (
+            "not JSON",
+            "\nhello\n".to_owned(),
+            "line 2: not a phdb dump",
+        ),
+    ] {
+        std::fs::write(&input, &text).unwrap();
+        let out = phdb(&[
+            "--format",
+            "json",
+            "load",
+            "--create",
+            target.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]);
+        assert_eq!(out.status, 2, "{what}: {out:?}");
+        let err: serde_json::Value = serde_json::from_str(&out.stderr).unwrap();
+        assert_eq!(err["error"]["code"], "BadInput", "{what}");
+        assert!(
+            err["error"]["message"].as_str().unwrap().contains(needle),
+            "{what}: {err}"
+        );
+        assert!(!target.exists(), "{what}: --create made a database");
+    }
+
+    // Blank lines before the header are fine, and errors after it count them.
+    std::fs::write(&input, "\n\n{\"phdb\":1,\"command\":\"dump\"}\nnot json\n").unwrap();
+    let out = phdb(&[
+        "--format",
+        "json",
+        "load",
+        "--create",
+        target.to_str().unwrap(),
+        input.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status, 1, "{out:?}");
+    let err: serde_json::Value = serde_json::from_str(&out.stderr).unwrap();
+    assert!(
+        err["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("line 4: not JSON"),
+        "{err}"
+    );
 }

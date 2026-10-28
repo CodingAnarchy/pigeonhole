@@ -219,7 +219,7 @@ $ python3 -c 'import duckdb, pyarrow.ipc as ipc; t = ipc.open_stream("users.arro
 CI dumps a table this way and reads it with Polars.
 
 **`phdb load`** writes a `jsonl` dump into a database, from a file or standard input:
-- **Writer only:** it opens the database as the writer, so it fails with status 4 while another writer runs. `--create` creates the file if it's missing.
+- **Writer only:** it opens the database as the writer, so it fails with status 4 while another writer runs. `--create` creates the file if it's missing, but only once the input's first line is a dump header: an input that isn't a dump, an empty one included (a `phdb dump` that failed into a pipe writes nothing), fails with status 2 and creates nothing.
 - **Tables and families:** each table line creates its table and families. An existing family keeps the options stored in the file.
 - **Cells:** each is written at its timestamp. Counters are set to their dumped value. A family with a merge operator gets the merged values as puts.
 - **Durability:** cells are committed in batches at `Durability::None`, and one flush at the end makes the load durable. If the load fails partway, what was committed stays.
@@ -334,7 +334,7 @@ u1   profile  name       1761030000000000  Ada
 |---|---|
 | 0 | Success. |
 | 1 | An error not listed below (see the error's code). |
-| 2 | Usage: bad arguments. |
+| 2 | Usage: bad arguments, or a `phdb load` input that isn't a dump (no `phdb dump` header, an empty input included). |
 | 3 | Corruption: the file is damaged (`ErrorCode::Corruption`, or `phdb check` found damage). |
 | 4 | Locked or busy: another process holds the writer lock (`WriterLocked`), the database stayed too busy (`Busy`), every reader slot is taken (`NoReaderSlot`), or `--reader` found no running writer to attach to (`NoWriter`). |
 | 5 | Not found: the file, or a table or family the command names. |
@@ -346,4 +346,4 @@ u1   profile  name       1761030000000000  Ada
 {"phdb":1,"error":{"code":"WriterLocked","code_num":3,"message":"open: another process holds the writer lock"}}
 ```
 
-`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read), `Unsupported` (a cell `dump --format arrow` can't hold; status 6), `Export` (the Arrow writer failed otherwise; status 1) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.
+`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read: status 2 without a dump header, else 1), `Unsupported` (a cell `dump --format arrow` can't hold; status 6), `Export` (the Arrow writer failed otherwise; status 1) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.

@@ -1,0 +1,2 @@
+### Fixed
+- `phdb load` refuses an input without a `phdb dump` header, an empty one included, before it opens the database (#1037). A `phdb dump` that failed into a pipe writes nothing to standard output, and `phdb load --create` used to load that as an empty database with status 0. Now it fails with `BadInput` and status 2, and `--create` creates nothing. A first line that isn't the header, which already failed with status 1, now also fails with status 2. Blank lines before the header are skipped.
