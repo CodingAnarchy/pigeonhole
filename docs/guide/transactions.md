@@ -74,6 +74,20 @@ Transactions are **serializable over what they read with `get` and `get_row`**: 
 - **Conflicts cost a full retry.** `EngineMetrics::transactions`, `transaction_conflicts` and `transaction_retries` show the conflict rate and what retries cost. On a few hot rows, a high conflict rate means the work is serializing on them: split the hot rows, or use a counter family (`incr` is a blind write and doesn't conflict unless you also read the cell).
 - **Under heavy contention on the same rows, every conflict costs a retry.** The `transfer` benchmark (#708) compares this with RocksDB's own transactions: its `OptimisticTransactionDB` is the judged baseline, and its pessimistic `TransactionDB` is reported beside it (D274). There's no lock mode in 1.0 (D272).
 
+### Hot rows across shards: a known gap in 1.0
+
+**The gap.** A transaction on contended rows that sit on different shards costs more per attempt than in a single-process engine. Each attempt is a two-phase commit round across those shards, so losing a conflict wastes a round on both. 1.0 accepts this gap (D272, #1023 tracks the work after 1.0).
+
+**What the `transfer` benchmark measures** (2026-10-28, 16 shards). 16 clients move units between two accounts picked from a million, with a skewed (Zipfian) choice, so a few accounts are hot. Each transfer reads both accounts in a transaction:
+- **At `Buffered`:** Pigeonhole commits about 165 K transfers/s, against about 375 K for RocksDB's `OptimisticTransactionDB`, about 2.3× fewer.
+- **At the default durability:** it's within 1.2×, since the sync dominates both.
+- **Single-shard vs cross-shard:** 94% of the transfers span two shards. Those average 92 µs, against 45 µs for the ones on one shard. Their medians are close (30 against 23 µs): the difference is mostly long retry chains on the hottest accounts.
+
+**What helps:**
+- **Keep rows that are updated together on one shard.** A tablet is a range of rows, so rows that share a key prefix (`customer42/…`) usually share a tablet and a shard, and their transactions commit like single commits. `Table::shard_of(row)` shows where a row is placed; a split can move a range later.
+- **Keep the default retry policy.** Retrying at once (`backoff` with a zero base) or capping the pause low (1–5 ms) measured worse here: up to 28% fewer transfers and a higher p99. Those settings fill the shards with rounds that are bound to lose. The default pauses (5 µs doubling, up to 100 ms, with full jitter) spread the contenders out.
+- **For a value many transactions update,** use a counter family (`incr` is a blind write) or split the row, as above.
+
 ## Errors
 
 | Code | Meaning | Do |
