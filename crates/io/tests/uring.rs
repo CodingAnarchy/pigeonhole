@@ -693,12 +693,17 @@ fn a_blocked_wait_on_a_completion_chained_after_the_shared_ring_completes_with_n
 /// path as a kernel without the support) on a backend with no reaper (application-owned
 /// mode) runs its submitted operations inline, as the pread backend does: they complete at
 /// once, with nothing left in a ring for some other thread to reap.
+///
+/// The refusal is permanent, so the thread never attaches during the test. A transient one
+/// is retried after `ATTACH_RETRY` (10 ms), and an inline write and `fdatasync` on a slow
+/// runner disk can take longer: the read then went to a new ring of the thread's own and was
+/// not ready (#1006's Linux job). `a_failed_attach_is_retried_later` covers the retry.
 #[test]
 fn a_thread_without_its_own_ring_runs_its_io_inline_when_nothing_reaps() {
     let _serial = serial();
     let b = Backend::uring_application_owned("uring-attach-fails");
     let f = b.create("f");
-    pigeonhole_io::uring::fail_ring_attaches(1);
+    pigeonhole_io::uring::fail_ring_attaches_unsupported(1);
     let vfs = Arc::clone(&b.vfs);
     let g = Arc::clone(&f);
     thread::spawn(move || {
