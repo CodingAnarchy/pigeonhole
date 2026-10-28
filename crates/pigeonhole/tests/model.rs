@@ -45,6 +45,10 @@
 //! `PIGEONHOLE_SHARD_THREADS=k` runs the shards on `k` shared engine-owned threads
 //! (`Options::shard_threads`, D289), so a shard's turn runs between its siblings'.
 //!
+//! `PIGEONHOLE_CHECKPOINT_STEPS=n` keeps a counter read's result as a base once it folds `n`
+//! entries (`Options::counter_checkpoint_steps`, D291). `1` checkpoints after nearly every
+//! counter read, under the run's flushes, compactions, tablet changes and reopens.
+//!
 //! **Failures recovered in place** (`Options::auto_recover`, D265, #620). With the option on
 //! and injected read and write errors (`FaultPlan::io_error_ppm`), a failed WAL write or
 //! manifest commit fails the instance and the supervisor swaps a reopened engine in behind
@@ -252,6 +256,10 @@ struct Config {
     /// `Options::shard_threads` (D289): the shards share this many engine-owned threads.
     /// Defaults to `PIGEONHOLE_SHARD_THREADS`, else 0 (a thread per shard).
     shard_threads: usize,
+    /// `Options::counter_checkpoint_steps` (D291): counter reads that fold this many entries
+    /// keep their result as a base. Defaults to `PIGEONHOLE_CHECKPOINT_STEPS`, else the
+    /// engine's default; `1` checkpoints after every counter read that folds anything.
+    checkpoint_steps: Option<u64>,
     /// `Options::auto_recover`: with `Recovery::Io`, a failure on an injected write error
     /// is recovered in place and what survived is decided by reading back (the module doc).
     recovery: Recovery,
@@ -326,6 +334,9 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
+            checkpoint_steps: std::env::var("PIGEONHOLE_CHECKPOINT_STEPS")
+                .ok()
+                .and_then(|v| v.parse().ok()),
             recovery: Recovery::Off,
         }
     }
@@ -834,6 +845,9 @@ impl Run {
             .row_cache_max_row(ROW_CACHE_MAX_ROW)
             .shard_threads(self.cfg.shard_threads)
             .auto_recover(self.cfg.recovery);
+        if let Some(steps) = self.cfg.checkpoint_steps {
+            options = options.counter_checkpoint_steps(steps);
+        }
         if self.cfg.fast_balancer {
             // The clock moves 1 µs per operation: a balancer pass every ~15 operations.
             options = options.tablet_balance(Duration::from_micros(15), 3, 8 << 10);

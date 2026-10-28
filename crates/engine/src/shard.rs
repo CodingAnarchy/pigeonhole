@@ -170,6 +170,9 @@ pub(crate) struct ShardMetrics {
     /// Waits for arena room (D124) begun, and nanoseconds spent in them.
     pub room_stalls: AtomicU64,
     pub room_stall_nanos: AtomicU64,
+    /// Counter checkpoints kept, and those dropped (D291).
+    pub checkpoints: AtomicU64,
+    pub checkpoints_dropped: AtomicU64,
     /// L0 pacing spans (D119) begun, and nanoseconds spent in them.
     pub pacing_stalls: AtomicU64,
     pub pacing_stall_nanos: AtomicU64,
@@ -222,6 +225,8 @@ impl Default for ShardMetrics {
             latency: std::array::from_fn(|_| std::array::from_fn(|_| AtomicU64::new(0))),
             room_stalls: AtomicU64::new(0),
             room_stall_nanos: AtomicU64::new(0),
+            checkpoints: AtomicU64::new(0),
+            checkpoints_dropped: AtomicU64::new(0),
             pacing_stalls: AtomicU64::new(0),
             pacing_stall_nanos: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
@@ -545,6 +550,8 @@ pub(crate) struct Shared {
     /// Which thread drives each application-owned shard (empty in engine-owned mode).
     pub drivers: crate::waker::Drivers,
     pub memtable_freeze_bytes: u64,
+    /// `EngineOptions::counter_checkpoint_steps` (D291; 0: off).
+    pub counter_checkpoint_steps: u64,
     /// Bytes a stream may hold past its oldest needed record before the slots pinning it
     /// are flushed (`EngineOptions::wal_pin_bytes`, resolved; #137).
     pub wal_pin_bytes: u64,
@@ -1538,6 +1545,8 @@ pub(crate) enum ShardMsg {
     Start,
     /// Nothing: forces a drain so deferred members form a group.
     Kick,
+    /// A counter get's result to keep as a base in the active memtable (D291).
+    CounterCheckpoint(Box<crate::read::CounterCheckpoint>),
     /// Run the next slice of WAL pin work: the pass in progress, or background indexing
     /// (D206, #474).
     PinSlice,
@@ -5522,6 +5531,95 @@ impl ShardState {
         }
         self.key_buf = key_buf;
         result
+    }
+
+    // ---- counter checkpoints (D291) ----
+
+    /// Keeps a counter get's result as a `Put` base at the seqno of the newest entry its fold
+    /// read, so later reads of the counter stop there instead of folding every operand. No
+    /// read at any seqno can tell: the value is the column's value at that seqno, and `Put`
+    /// sorts before the same seqno's operands (FORMAT §2), so a read at or above it folds
+    /// what is newer onto it and a read below it never sees it. Counter families only: their
+    /// deletes hide only older entries, so a base below a delete is hidden with the rest.
+    /// Their operator is always the built-in `i64` add, associative, and its result is a
+    /// valid base; a counter family with another operator would need both properties.
+    ///
+    /// Kept only while that entry is still in the active memtable, so the memtable's seqno
+    /// range does not change (D287's disjoint ranges, D227's freeze point) and a rotated or
+    /// moved column drops it. Not logged (replay rebuilds the operands it stands for), no row
+    /// epoch raised (no value changes), no room reserved or waited for, and no write load
+    /// counted: a checkpoint that does not fit with room to spare is dropped.
+    fn counter_checkpoint(&mut self, c: &crate::read::CounterCheckpoint) {
+        let kept = self.try_counter_checkpoint(c);
+        let m = &self.shared.metrics[usize::from(self.id.0)];
+        if kept {
+            m.checkpoints.fetch_add(1, Ordering::Relaxed);
+        } else {
+            m.checkpoints_dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn try_counter_checkpoint(&mut self, c: &crate::read::CounterCheckpoint) -> bool {
+        if self.replaying || self.poisoned || self.close_stage != CloseStage::Open {
+            return false;
+        }
+        // Still this shard's row in the same tablet, not being drained for a tablet change,
+        // and still the same counter family.
+        if self.tablets.route(c.table, &c.row) != Some((c.tablet, self.id))
+            || self.moving.contains(&c.tablet)
+        {
+            return false;
+        }
+        let counter = self
+            .shared
+            .view
+            .load()
+            .catalog
+            .family(c.family)
+            .is_some_and(|m| m.table == c.table && m.options.kind == FamilyKind::Counter);
+        if !counter {
+            return false;
+        }
+        // Room to spare beyond what admitted writes reserved: a checkpoint never makes one
+        // wait, and never pushes the memtable over its freeze threshold.
+        let spare = self.arena.free_bytes().saturating_sub(self.reserved);
+        if spare < 2 * self.chunk_size {
+            return false;
+        }
+        let threshold = self.shared.memtable_freeze_bytes as usize;
+        let Some(slot) = self.memtables.get_mut(&(c.tablet, c.family)) else {
+            return false;
+        };
+        if slot.seal != Seal::Open || slot.active.table.allocated_bytes() >= threshold {
+            return false;
+        }
+        let mut key = Vec::with_capacity(c.row.len() + c.qualifier.len() + 24);
+        if encode_row_prefix(&mut key, &c.row).is_err()
+            || encode_key_after_row(&mut key, &c.qualifier, c.ts, c.seqno, Kind::Put).is_err()
+        {
+            return false;
+        }
+        // The entry the fold read at `seqno` must be in the active memtable, and no `Put`
+        // there yet: the first entry at or after the `Put`'s key is the column's at
+        // `(ts, seqno)` of another kind.
+        {
+            let mut it = slot.active.table.reader().iter();
+            if it.seek(&key).is_err() || !it.valid() {
+                return false;
+            }
+            let found = it.key();
+            let prefix = key.len() - 1;
+            if found.len() != key.len()
+                || found[..prefix] != key[..prefix]
+                || found[prefix] == key[prefix]
+            {
+                return false;
+            }
+        }
+        slot.active
+            .table
+            .insert(&mut self.arena, &key, &c.stored)
+            .is_ok()
     }
 
     // ---- stalls ----
@@ -10352,6 +10450,7 @@ impl ShardState {
                 self.spawn_flush(ctx);
                 self.maintain(ctx);
             }
+            ShardMsg::CounterCheckpoint(c) => self.counter_checkpoint(&c),
             ShardMsg::Kick => {
                 let due = self.continuations.take_on_kick();
                 // The cross record at the checkpoint's front became visible (`await_front`).

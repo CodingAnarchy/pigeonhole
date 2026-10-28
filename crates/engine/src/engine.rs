@@ -1130,6 +1130,7 @@ impl Engine {
                 Default::default()
             },
             memtable_freeze_bytes: freeze_bytes,
+            counter_checkpoint_steps: options.counter_checkpoint_steps,
             wal_pin_bytes: match options.wal_pin_bytes {
                 0 => options.memtable_budget.saturating_mul(2),
                 n => n,
@@ -1739,6 +1740,7 @@ impl Engine {
             manifest_flight: Default::default(),
             drivers: Default::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
+            counter_checkpoint_steps: 0,
             wal_pin_bytes: 0,
             submitters: std::sync::OnceLock::new(),
             wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
@@ -2167,9 +2169,20 @@ impl Engine {
             {
                 return Ok(hit);
             }
-            return get_in::<false>(&view, seqno, clock, table, family, row, qualifier, || {
-                Arc::clone(&view)
-            });
+            let mut checkpoint = None;
+            let got = get_in::<false>(
+                &view,
+                seqno,
+                clock,
+                table,
+                family,
+                row,
+                qualifier,
+                || Arc::clone(&view),
+                Some((inner.shared.counter_checkpoint_steps, &mut checkpoint)),
+            );
+            inner.send_checkpoint(checkpoint);
+            return got;
         }
         let snapshot = inner.snapshot()?;
         inner.get(&snapshot, table, family, row, qualifier)
@@ -2534,6 +2547,18 @@ impl Engine {
         }
         let _guard = inner.enter_maintenance()?;
         crate::maintenance::shrink(&inner.shared)
+    }
+
+    /// Counter checkpoints (D291) the shards kept, and those they dropped, since open. For
+    /// tests and benchmarks.
+    #[doc(hidden)]
+    pub fn counter_checkpoints(&self) -> (u64, u64) {
+        self.inner.shared.metrics.iter().fold((0, 0), |(k, d), m| {
+            (
+                k + m.checkpoints.load(Ordering::Relaxed),
+                d + m.checkpoints_dropped.load(Ordering::Relaxed),
+            )
+        })
     }
 
     /// What the row cache did since open (D201); all zero when it is off. In a reader process,
@@ -4134,7 +4159,9 @@ impl Inner {
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
         snapshot.check_process()?;
-        snapshot.checked(get_in::<false>(
+        // A reader process has no shards to keep a checkpoint (D291).
+        let mut checkpoint = None;
+        let got = snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,
             || self.shared.vfs.now_micros(),
@@ -4143,7 +4170,23 @@ impl Inner {
             row,
             qualifier,
             || Arc::clone(&snapshot.view),
-        ))
+            (self.role == Role::Writer)
+                .then_some((self.shared.counter_checkpoint_steps, &mut checkpoint)),
+        ));
+        self.send_checkpoint(checkpoint);
+        got
+    }
+
+    /// Hands a counter get's result to its row's shard to keep as a base (D291). Best effort:
+    /// a closed inbox drops it, as the shard drops one it cannot keep.
+    fn send_checkpoint(&self, checkpoint: Option<crate::read::CounterCheckpoint>) {
+        if let Some(c) = checkpoint {
+            let shard = c.shard;
+            let _ = self
+                .shared
+                .submitter(shard)
+                .submit(ShardMsg::CounterCheckpoint(Box::new(c)));
+        }
     }
 
     fn flush_pending(&self) -> Result<PendingMaintenance> {

@@ -15,7 +15,7 @@ use pigeonhole_format::key::{
 use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
-use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, Timestamp};
+use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, TabletId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
@@ -1698,7 +1698,31 @@ fn point_resolver() -> Resolver {
     Resolver::new(MergingCursor::new(Vec::new()), ResolveOptions::new(0, 0))
 }
 
-/// A point get through `view` at `seqno`.
+/// Entries a counter get folds before it leaves its result behind as a checkpoint (D291,
+/// the default of `EngineOptions::counter_checkpoint_steps`): a hot counter's reads then fold
+/// about this many entries, and the shard keeps at most one checkpoint per this many
+/// operands.
+pub(crate) const CHECKPOINT_STEPS: u64 = 128;
+
+/// A counter get's result, to be kept as a base (D291): `Put` at `(column, ts, seqno)` of
+/// `stored`, the column's value at `seqno`, the newest entry the get's fold read. Sent to the
+/// row's shard, which inserts it only while that entry is in its active memtable.
+#[derive(Debug)]
+pub(crate) struct CounterCheckpoint {
+    pub shard: pigeonhole_runtime::ShardId,
+    pub table: TableId,
+    pub tablet: TabletId,
+    pub family: FamilyId,
+    pub row: Vec<u8>,
+    pub qualifier: Vec<u8>,
+    pub ts: Timestamp,
+    pub seqno: Seqno,
+    pub stored: Vec<u8>,
+}
+
+/// A point get through `view` at `seqno`. With `checkpoint`, `(steps, out)`, a counter get
+/// that folded at least `steps` entries (0: never) leaves its result in `out` for the caller
+/// to send to the row's shard (D291).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn get_in<const CACHE_ONLY: bool>(
     view: &View,
@@ -1709,10 +1733,11 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
     row: &[u8],
     qualifier: &[u8],
     pin: impl FnOnce() -> Arc<View>,
+    checkpoint: Option<(u64, &mut Option<CounterCheckpoint>)>,
 ) -> Result<Option<CellData>> {
     let mut run = Some(|resolver: &mut Resolver| {
         let got = get_with::<CACHE_ONLY>(
-            resolver, view, seqno, now, table, family, row, qualifier, pin,
+            resolver, view, seqno, now, table, family, row, qualifier, pin, checkpoint,
         );
         // Whatever happened, the sources (each pins its memtable or SST) and the options
         // (merge operator, blob reader) go now; only the allocations stay.
@@ -1791,6 +1816,7 @@ fn get_with<const CACHE_ONLY: bool>(
     row: &[u8],
     qualifier: &[u8],
     pin: impl FnOnce() -> Arc<View>,
+    checkpoint: Option<(u64, &mut Option<CounterCheckpoint>)>,
 ) -> Result<Option<CellData>> {
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return Err(Error::TableNotFound(format!("table {}", table.0)));
@@ -1834,6 +1860,25 @@ fn get_with<const CACHE_ONLY: bool>(
         (&mut key_buf, &mut key_vec, &mut key_len),
         &mut pin,
     );
+    if let Some((min_steps, out)) = checkpoint
+        && min_steps > 0
+        && meta.options.kind == FamilyKind::Counter
+        && let Ok(Resolved::Done(Some(cell))) = &resolved
+        && let Some((steps, top)) = resolver.counter_fold()
+        && steps >= min_steps
+    {
+        *out = Some(CounterCheckpoint {
+            shard,
+            table,
+            tablet,
+            family,
+            row: row.to_vec(),
+            qualifier: qualifier.to_vec(),
+            ts: cell.timestamp(),
+            seqno: top,
+            stored: cell.stored().to_vec(),
+        });
+    }
     let cursor = resolver.cursor_mut();
     match resolved {
         Ok(Resolved::Done(cell)) => Ok(cell),

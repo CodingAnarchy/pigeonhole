@@ -41,6 +41,7 @@ pub struct Options {
     block_cache: Option<usize>,
     row_cache: usize,
     row_cache_max_row: Option<usize>,
+    counter_checkpoint_steps: Option<u64>,
     row_cache_families: Vec<(String, String)>,
     shm_dir: Option<PathBuf>,
     reader_slots: u32,
@@ -110,6 +111,7 @@ impl Default for Options {
             block_cache: None,
             row_cache: DEFAULT_ROW_CACHE,
             row_cache_max_row: None,
+            counter_checkpoint_steps: None,
             row_cache_families: Vec::new(),
             shm_dir: None,
             reader_slots: DEFAULT_READER_SLOTS,
@@ -410,6 +412,15 @@ impl Options {
     /// values plus 16 bytes a cell; default 4 KiB). Larger rows are read as usual.
     pub fn row_cache_max_row(mut self, bytes: usize) -> Self {
         self.row_cache_max_row = Some(bytes);
+        self
+    }
+
+    /// A counter read that folds at least `steps` increments keeps its result as the
+    /// counter's base, so its next reads stop there (D291; default 128, 0 turns it off). For
+    /// tests and benchmarks.
+    #[doc(hidden)]
+    pub fn counter_checkpoint_steps(mut self, steps: u64) -> Self {
+        self.counter_checkpoint_steps = Some(steps);
         self
     }
 
@@ -967,6 +978,9 @@ impl Options {
         o.row_cache_bytes = self.row_cache;
         if let Some(bytes) = self.row_cache_max_row {
             o.row_cache_max_row = bytes;
+        }
+        if let Some(steps) = self.counter_checkpoint_steps {
+            o.counter_checkpoint_steps = steps;
         }
         o.row_cache_families = self.row_cache_families.clone();
         o.shm_dir.clone_from(&self.shm_dir);
