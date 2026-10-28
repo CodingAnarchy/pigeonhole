@@ -147,14 +147,6 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
         self.map.get(key).map(|s| &s.value)
     }
 
-    /// The entry for `key` and its hit count (hits since it was cached, less the eviction
-    /// passes that aged it), without touching the count.
-    pub(crate) fn peek_freq(&self, key: &K) -> Option<(&Arc<V>, u8)> {
-        self.map
-            .get(key)
-            .map(|s| (&s.value, s.freq.load(Ordering::Relaxed)))
-    }
-
     /// Inserts `value` (the caller keeps a clone, so it is pinned while the caller holds it),
     /// replacing any entry for `key`, then evicts down to capacity. An entry larger than the
     /// shard is not cached.

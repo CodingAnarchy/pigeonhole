@@ -481,12 +481,27 @@ pub struct RowCache {
     shards: Sharded<u64, RowEntry>,
 }
 
-#[derive(Clone)]
 struct RowEntry {
     family: u64,
     epoch: u64,
     row: Box<[u8]>,
     encoded: Vec<u8>,
+    /// Read since it was stored or moved to `epoch` (1) or not (0): what
+    /// [`RowCache::stale_unused`] asks. A flag of its own rather than the queue's hit
+    /// count, which eviction passes age back to 0 for rows read all the time.
+    read: AtomicU8,
+}
+
+impl Clone for RowEntry {
+    fn clone(&self) -> Self {
+        Self {
+            family: self.family,
+            epoch: self.epoch,
+            row: self.row.clone(),
+            encoded: self.encoded.clone(),
+            read: AtomicU8::new(self.read.load(Ordering::Relaxed)),
+        }
+    }
 }
 
 impl RowEntry {
@@ -519,9 +534,14 @@ impl RowCache {
     #[inline]
     pub fn get(&self, family: u64, row: &[u8], epoch: u64) -> Option<RowHandle> {
         let h = Self::hash(family, row);
-        read(self.shards.shard(h)?)
-            .get_if(&h, |e| e.is(family, row) && e.epoch == epoch)
-            .map(|entry| RowHandle { entry })
+        let entry =
+            read(self.shards.shard(h)?).get_if(&h, |e| e.is(family, row) && e.epoch == epoch)?;
+        // Written once, not on every hit: a hot row's line stays clean in other cores'
+        // caches (#18).
+        if entry.read.load(Ordering::Relaxed) == 0 {
+            entry.read.store(1, Ordering::Relaxed);
+        }
+        Some(RowHandle { entry })
     }
 
     /// Caches the encoded row (an engine-defined encoding of its visible cells).
@@ -532,6 +552,7 @@ impl RowCache {
             epoch,
             row: row.into(),
             encoded,
+            read: AtomicU8::new(0),
         });
         let h = Self::hash(family, row);
         if let Some(shard) = self.shards.shard(h) {
@@ -589,14 +610,14 @@ impl RowCache {
             let e = Arc::get_mut(entry)?;
             edit(&mut e.encoded);
             e.epoch = to;
+            e.read = AtomicU8::new(0);
             Some(e.row.len() + e.encoded.len() + Self::ENTRY_OVERHEAD)
         })
     }
 
-    /// Whether the row is cached at an epoch other than `epoch` and was never read since it
-    /// was stored (no hit, or aged back to none; an entry an `update` moved keeps its count):
-    /// the row changed before its cached copy served anyone, so storing it again would likely
-    /// be wasted.
+    /// Whether the row is cached at an epoch other than `epoch` and was not read since it
+    /// was stored or [`update`](Self::update)d to that epoch: the row changed before its
+    /// cached copy served anyone, so storing it again would likely be wasted.
     ///
     /// ```
     /// use pigeonhole_cache::RowCache;
@@ -607,6 +628,8 @@ impl RowCache {
     /// assert!(!rows.stale_unused(3, b"user:42", 10)); // current
     /// assert!(rows.get(3, b"user:42", 10).is_some());
     /// assert!(!rows.stale_unused(3, b"user:42", 11)); // read once before it went stale
+    /// assert!(rows.update(3, b"user:42", 10, 11, |_| true, |_| {}));
+    /// assert!(rows.stale_unused(3, b"user:42", 12)); // moved to 11, not read there
     /// assert!(!rows.stale_unused(3, b"other", 11)); // not cached at all
     /// ```
     pub fn stale_unused(&self, family: u64, row: &[u8], epoch: u64) -> bool {
@@ -614,9 +637,9 @@ impl RowCache {
         let Some(shard) = self.shards.shard(h) else {
             return false;
         };
-        read(shard)
-            .peek_freq(&h)
-            .is_some_and(|(e, freq)| e.is(family, row) && e.epoch != epoch && freq == 0)
+        read(shard).peek(&h).is_some_and(|e| {
+            e.is(family, row) && e.epoch != epoch && e.read.load(Ordering::Relaxed) == 0
+        })
     }
 
     /// Drops a row (on write to it).
