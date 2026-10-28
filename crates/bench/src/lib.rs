@@ -1396,7 +1396,11 @@ fn pass(
                 hist.record(latency);
                 split.record(op, *class, latency);
                 if row_read {
-                    scratch759::note(&mut outside, latency.as_nanos() as u64, pigeonhole_engine::phases759::take_last());
+                    scratch759::note(
+                        &mut outside,
+                        latency.as_nanos() as u64,
+                        pigeonhole_engine::phases759::take_last(),
+                    );
                 }
             }
         }
@@ -1908,7 +1912,9 @@ pub mod scratch759 {
             return;
         };
         let n: u64 = all.iter().map(|b| b[0]).sum();
-        let mut out = String::from("bench row reads by bench latency: bucket_us count share bench_us | of reads reaching the engine read: share engine_us outside_us | other reads (row cache hit) bench_us\n");
+        let mut out = String::from(
+            "bench row reads by bench latency: bucket_us count share bench_us | of reads reaching the engine read: share engine_us outside_us | other reads (row cache hit) bench_us\n",
+        );
         let mut lo = 0;
         for (b, &hi) in all.iter().zip(&EDGES_US) {
             let c = b[0].max(1) as f64;
@@ -1916,7 +1922,11 @@ pub mod scratch759 {
             let other = (b[0] - b[3]).max(1) as f64;
             out += &format!(
                 "{lo}-{} {} {:.2}% {:.1} | {:.1}% {:.1} {:.1} | {:.1}\n",
-                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                if hi == u64::MAX {
+                    "inf".into()
+                } else {
+                    hi.to_string()
+                },
                 b[0],
                 100.0 * b[0] as f64 / n.max(1) as f64,
                 b[1] as f64 / c / 1e3,

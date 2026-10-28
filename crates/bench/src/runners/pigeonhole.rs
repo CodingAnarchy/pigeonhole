@@ -638,6 +638,18 @@ pub(crate) fn create_table(db: &Pigeonhole) -> Result<Table, String> {
     let mut builder = db.table("bench").map_err(err)?;
     for family in FAMILIES {
         let mut f = Family::default().max_versions(1).bloom_bits(BLOOM_BITS);
+        // SCRATCH #759: PHDB_BLOCK_SIZE=<bytes>, PHDB_COMPRESSION=none|lz4 (not for merge).
+        if let Some(b) = std::env::var("PHDB_BLOCK_SIZE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            f = f.block_size(b);
+        }
+        match std::env::var("PHDB_COMPRESSION").as_deref() {
+            Ok("none") => f = f.uncompressed(),
+            Ok("lz4") => f = f.lz4(),
+            _ => {}
+        }
         if family == METRIC_FAMILY {
             // Whole SSTs drop once their newest point expires (D163, #236).
             f = f.ttl(TIME_SERIES_TTL).compaction(Compaction::FifoByTime);

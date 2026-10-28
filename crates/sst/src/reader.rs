@@ -239,13 +239,13 @@ fn aligned(offset: u64, len: usize, align: usize) -> (u64, usize, usize) {
 pub(crate) fn read_bytes(file: &FileRef, offset: u64, len: usize) -> Result<IoBuf> {
     match file.direct_align() {
         None => {
-            let mut buf = IoBuf::zeroed(len);
+            let mut buf = IoBuf::for_read(len);
             file.read_at(&mut buf, offset)?;
             Ok(buf)
         }
         Some(a) => {
             let (start, alen, head) = aligned(offset, len, a);
-            let mut buf = IoBuf::zeroed(alen);
+            let mut buf = IoBuf::for_read(alen);
             file.read_at(&mut buf, start)?;
             buf.keep(head..head + len);
             Ok(buf)

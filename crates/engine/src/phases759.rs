@@ -113,7 +113,11 @@ impl Stats {
             let c = b.count.max(1) as f64;
             out += &format!(
                 "{lo}-{} {} {:.2}% {:.1} {:.1} {:.1} {:.1} {:.1} {:.2} {:.1}% {:.2} {:.1} {:.1}%\n",
-                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                if hi == u64::MAX {
+                    "inf".into()
+                } else {
+                    hi.to_string()
+                },
                 b.count,
                 100.0 * b.count as f64 / n.max(1) as f64,
                 b.total as f64 / c / 1e3,
@@ -133,10 +137,19 @@ impl Stats {
         let mut lo = 0;
         for (b, &hi) in self.buckets.iter().zip(&EDGES_US) {
             let c = b.count.max(1) as f64;
-            let f = |v: &[u64]| v.iter().map(|x| format!("{:.3}", *x as f64 / c)).collect::<Vec<_>>().join(" ");
+            let f = |v: &[u64]| {
+                v.iter()
+                    .map(|x| format!("{:.3}", *x as f64 / c))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
             out += &format!(
                 "{lo}-{} | {} | {} | {} | {}\n",
-                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                if hi == u64::MAX {
+                    "inf".into()
+                } else {
+                    hi.to_string()
+                },
                 f(&b.kind[1..]),
                 f(&b.mlevel),
                 f(&b.probed),
@@ -150,7 +163,11 @@ impl Stats {
             let c = b.count.max(1) as f64;
             out += &format!(
                 "{lo}-{} | {:.2} {:.2} {:.1}% | {:.1} of {:.1}\n",
-                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                if hi == u64::MAX {
+                    "inf".into()
+                } else {
+                    hi.to_string()
+                },
                 b.lookups as f64 / c,
                 b.misses as f64 / c,
                 100.0 * (1.0 - b.misses as f64 / (b.lookups.max(1) as f64)),
@@ -173,7 +190,10 @@ impl Stats {
         };
         out += &format!(
             "\nmissed-block file reads {mn}: p50 {} us, p90 {} us, p99 {} us, p99.9 {} us; share >= 20 us {:.2}%\n",
-            mq(0.5), mq(0.9), mq(0.99), mq(0.999),
+            mq(0.5),
+            mq(0.9),
+            mq(0.99),
+            mq(0.999),
             100.0 * self.miss_hist[20..].iter().sum::<u64>() as f64 / mn.max(1) as f64
         );
         out

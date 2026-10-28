@@ -510,14 +510,20 @@ mod scratch759 {
             };
             let mut out = format!(
                 "sqlite row reads {n}: p50 {} us, p99 {} us, p99.9 {} us\nbucket_us count share us | pages/read hit missed | reads with a miss | page cache hit rate\n",
-                pct(0.5), pct(0.99), pct(0.999)
+                pct(0.5),
+                pct(0.99),
+                pct(0.999)
             );
             let mut lo = 0;
             for (b, &hi) in all.0.iter().zip(&EDGES_US) {
                 let c = b[0].max(1) as f64;
                 out += &format!(
                     "{lo}-{} {} {:.2}% {:.1} | {:.2} {:.2} | {:.1}% | {:.1}%\n",
-                    if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                    if hi == u64::MAX {
+                        "inf".into()
+                    } else {
+                        hi.to_string()
+                    },
                     b[0],
                     100.0 * b[0] as f64 / n.max(1) as f64,
                     b[1] as f64 / c / 1e3,

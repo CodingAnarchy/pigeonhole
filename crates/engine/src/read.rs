@@ -1526,8 +1526,12 @@ pub(crate) fn read_row_into(
     if let Some(t0) = t0 {
         let total = t0.elapsed().as_nanos() as u64;
         let cpu = crate::phases759::thread_cpu_ns().saturating_sub(c0);
-        let miss_ns = pigeonhole_sst::MISS_NS.with(std::cell::Cell::get).saturating_sub(m0);
-        let lookups = pigeonhole_sst::LOOKUPS.with(std::cell::Cell::get).saturating_sub(l0_);
+        let miss_ns = pigeonhole_sst::MISS_NS
+            .with(std::cell::Cell::get)
+            .saturating_sub(m0);
+        let lookups = pigeonhole_sst::LOOKUPS
+            .with(std::cell::Cell::get)
+            .saturating_sub(l0_);
         let miss_read_ns = pigeonhole_sst::MISS_READ_NS
             .with(std::cell::Cell::get)
             .saturating_sub(r0_);

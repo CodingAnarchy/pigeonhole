@@ -248,6 +248,31 @@ impl IoBuf {
         }
     }
 
+    /// SCRATCH #759: a buffer for a read to fill completely; with `PHDB_NOZERO=1` its
+    /// bytes are not zeroed first (scratch measurement only, not for merge).
+    pub fn for_read(len: usize) -> Self {
+        static NOZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*NOZERO.get_or_init(|| std::env::var("PHDB_NOZERO").is_ok_and(|v| v == "1")) {
+            return Self::zeroed(len);
+        }
+        let cap = round_up(len);
+        let ptr = if cap == 0 {
+            allocate(0)
+        } else {
+            // SAFETY: `layout(cap)` has a non-zero size.
+            let p = unsafe { alloc::alloc(layout(cap)) };
+            NonNull::new(p).unwrap_or_else(|| alloc::handle_alloc_error(layout(cap)))
+        };
+        Self {
+            ptr,
+            head: 0,
+            len,
+            cap,
+            pool: None,
+            recycle: None,
+        }
+    }
+
     /// Keeps only the bytes of `range`, in place: no copy, so a block read with its aligned
     /// surroundings (direct I/O, #403) stays in the buffer it was read into. The data then
     /// starts `range.start` bytes into the allocation, so it is aligned only if
