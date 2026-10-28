@@ -321,6 +321,7 @@ In `json`, every command prints one document: reads put their cells under `rows`
 
 ```text
 $ phdb shell app.phdb -c "create users profile" -c "put users u1 profile:name Ada" -c "get users u1"
+created  users
 result  ok
 seqno   3
 row  family   qualifier  ts                value

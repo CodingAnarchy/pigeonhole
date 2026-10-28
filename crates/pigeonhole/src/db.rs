@@ -874,10 +874,13 @@ impl Pigeonhole {
     ///   and runs again after the next open), waiting only for a slice a worker is running at
     ///   that moment. Then [`BackgroundWorker::closed`] is `true` and the worker can be
     ///   dropped.
-    /// - **A worker you stop driving** delays its tasks until the shards take them back: 10
-    ///   ms after any worker last looked, or 2 ms into a commit's wait for memtable room.
+    /// - **A worker you stop driving** delays its tasks until the shards take them back: a
+    ///   queued task no worker took, once no worker has looked for 10 ms; the tasks a worker
+    ///   holds that could run, once it has made no pass for 100 ms (never inside a slice);
+    ///   and a flush a worker holds but isn't running, 2 ms into a commit's wait for memtable
+    ///   room.
     ///   [`EngineMetrics::background_fallback_take_backs`](crate::EngineMetrics::background_fallback_take_backs)
-    ///   counts these, so a loop that forgot its workers shows up.
+    ///   counts the first two, so a loop that forgot its workers shows up.
     ///
     /// ```
     /// use std::thread;

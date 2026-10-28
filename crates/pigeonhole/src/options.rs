@@ -78,8 +78,9 @@ pub enum CpuProfile {
     #[default]
     Embedded,
     /// The database has the machine or container to itself, and its clients reach it from
-    /// elsewhere (another container, over IPC or the network): the engine's threads take
-    /// all but a small fixed headroom of the physical cores.
+    /// elsewhere (another container, over IPC or the network): flush and compaction take
+    /// half the physical cores instead of a quarter. Shard threads are the same as with
+    /// `Embedded`, one per shard by default.
     Server,
 }
 
@@ -222,8 +223,9 @@ impl Options {
     /// [`pin_threads`](Options::pin_threads) is on); `0` runs them on the shard threads, in
     /// time slices between commits.
     ///
-    /// - **Default (D252):** engine-owned mode starts one per four shards, at least one and
-    ///   at most four (16 shards: 4; 8: 2; up to 7: 1). On a shard thread a flush or
+    /// - **Default (D289, ICR 0081):** engine-owned mode starts a quarter of the physical
+    ///   cores (half with [`CpuProfile::Server`]), at least one and at most one per shard
+    ///   (16 cores: 4, or 8 with `Server`). On a shard thread a flush or
     ///   compaction slice holds up every commit queued behind it for up to half a
     ///   millisecond, which is most of the write tail on contended workloads.
     /// - **Pinning:** they take the CPUs after the shards' (the shards' SMT siblings first).
@@ -232,7 +234,8 @@ impl Options {
     /// - **Application-owned mode** starts no threads, so its default is `0`, and
     ///   [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
     ///   fails with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when
-    ///   `k > 0` (decision D40); flush and compaction then run on the shards you drive.
+    ///   `k > 0` (decision D40); flush and compaction then run on the shards you drive, or
+    ///   on background workers ([`Options::background_workers`], D284).
     pub fn compaction_cores(mut self, k: usize) -> Self {
         self.compaction_cores = Some(k);
         self
@@ -524,9 +527,11 @@ impl Options {
     /// cache keeps the newest version of each cell of small, hot family rows and serves
     /// latest row reads (newest version, no time range) and point gets from it, without
     /// merging the row's sources. A family row is stored the second time a read misses it,
-    /// so rows read once are never stored. Results are identical to uncached reads; a write
-    /// to a row makes its cached copy miss at once (D201). Snapshot reads, scans and
-    /// multi-version reads bypass it. Reader processes have their own
+    /// so rows read once are never stored. Results are identical to uncached reads. Point
+    /// gets at a snapshot or in a transaction are served from it too (D290). A commit that
+    /// only overwrites cached cells with puts moves the cached copy forward (commits of at
+    /// most 16 rows and 64 mutations; the row's other families miss); any other write makes
+    /// it miss at once (D201). Snapshot row reads, scans and multi-version reads bypass it. Reader processes have their own
     /// ([`ReaderOptions::row_cache`], D281).
     pub fn row_cache(mut self, bytes: usize) -> Self {
         self.row_cache = bytes;
