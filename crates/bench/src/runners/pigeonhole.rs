@@ -1704,10 +1704,59 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
     }
 }
 
-/// A counter from `Pigeonhole::internal_metrics` by name (ICR 0087); 0 if this build lacks
-/// it, so the bench runs against any build.
+/// Every `Pigeonhole::internal_metrics` name the bench reads (ICR 0087). A test checks that
+/// the engine reports each one, so a renamed counter fails the build's tests instead of
+/// zeroing a report column.
+pub(crate) const INTERNAL_NAMES: &[&str] = &[
+    "wal_unpin_passes",
+    "wal_unpin_flushes",
+    "wal_inline_syncs",
+    "wal_rollover_blocks",
+    "file_growths_ahead",
+    "shard_parks",
+    "shard_wakes",
+    "commit_parks",
+    "visibility_waits",
+    "visibility_waiters_ahead",
+    "visibility_wake_passes",
+    "visibility_woken",
+    "visibility_contended",
+    "reader_pin_view_lag",
+    "cross_shard.refused_rounds",
+    "cross_shard.refused_moved",
+    "cross_shard.refused_room",
+    "cross_shard.refused_pending_overlap",
+    "cross_shard.share_waits",
+    "cross_shard.share_wait_nanos",
+    "cross_shard.chained",
+    "cross_shard.wounds",
+    "cross_shard.max_attempts_blind",
+    "cross_shard.max_attempts_reading",
+];
+
+/// A counter from `Pigeonhole::internal_metrics` by name (ICR 0087). A name this build lacks
+/// reads as 0 and is reported on stderr, once per name, so a report built against another
+/// build still runs but never zeroes a column silently.
 pub(crate) fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
-    v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
+    debug_assert!(
+        INTERNAL_NAMES.contains(&name),
+        "add `{name}` to INTERNAL_NAMES so a test checks it exists"
+    );
+    if let Some(&(_, x)) = v.iter().find(|(n, _)| *n == name) {
+        return x;
+    }
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|w| w == name) {
+        eprintln!(
+            "phdb-bench: WARNING: this build reports no internal metric `{name}`; its report \
+             column reads 0"
+        );
+        warned.push(name.to_owned());
+    }
+    0
 }
 
 #[cfg(test)]
@@ -1723,6 +1772,26 @@ mod tests {
             .memtable_budget(16 << 20);
         r.open(&dir).unwrap();
         (r, dir)
+    }
+
+    #[test]
+    fn every_internal_metric_the_bench_reads_exists() {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-internal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Pigeonhole::open(
+            dir.join("db.phdb"),
+            pigeonhole::Options::default().shards(1),
+        )
+        .unwrap();
+        let v = db.internal_metrics();
+        for name in INTERNAL_NAMES {
+            assert!(
+                v.iter().any(|(n, _)| n == name),
+                "the bench reads `{name}`, which internal_metrics() no longer reports"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

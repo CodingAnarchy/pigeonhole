@@ -36,7 +36,9 @@
 `#[non_exhaustive]` lets a 1.x release add a field but never remove one. The moved counters name mechanisms that later work is likely to change or remove: #724's share reports, D289's drivers, D292, the WAL's unpin passes and the visibility waiters. The public set is what an application can act on.
 
 ## Callers changed
-- **The bench** (`runners/pigeonhole.rs` `stalls()` and `reader_process.rs`) reads the moved counters by name through `internal_metrics()`. A missing name reads as 0, and the report's JSON keys are unchanged, so baselines and gate scripts read the same files.
+- **The bench** (`runners/pigeonhole.rs` `stalls()` and `reader_process.rs`) reads the moved counters by name through `internal_metrics()`. The report's JSON keys are unchanged, so baselines and gate scripts read the same files.
+  - Every name it reads is in `INTERNAL_NAMES`, and a bench unit test fails if the engine stops reporting any of them (coordinator, 2026-10-28). A debug assertion keeps the list complete.
+  - A name missing at run time, from a build that lacks it, reads as 0 with a warning on stderr, once per name, so no gate column is zeroed silently.
 - **Tests:** api.rs and readers.rs read them through the hook, and the metrics unit test checks every name once.
 - **The cli** builds its `check` JSON from `WalPosition`; its output is unchanged.
 - **Docs:** the agent reference, durability.md and readers.md.
