@@ -1397,8 +1397,8 @@ fn the_default_shard_count_is_one_per_physical_core() {
 
 #[test]
 fn engine_owned_mode_sizes_its_threads_from_the_cpu_budget() {
-    // D289 (ICR 0081): with nothing set, the driver and compaction threads come from the
-    // CPU budget of the machine running the test, so only their bounds are checked here
+    // D289 (ICR 0081): with nothing set, a thread per shard and the compaction threads from
+    // the CPU budget of the machine running the test, so only their bounds are checked here
     // (the formula's tables are unit tests in `options.rs`): at least one of each, at most
     // one per shard. Explicit settings are kept as given: `shard_threads(0)` is a thread
     // per shard, `compaction_cores(0)` keeps flush and compaction on the shards.
@@ -1407,10 +1407,13 @@ fn engine_owned_mode_sizes_its_threads_from_the_cpu_budget() {
         let o = sim_options(&vfs).shards(shards).pin_threads(false);
         let db = Pigeonhole::open("/db/x.phdb", o).unwrap();
         let started = db.engine_metrics().threads_started;
+        // A thread per shard (the load controller is opt-in), plus at least one for flush
+        // and compaction.
         assert!(
-            (2..=2 * shards as u64).contains(&started),
+            (shards as u64 + 1..=2 * shards as u64).contains(&started),
             "{shards} shards: {started} threads"
         );
+        assert_eq!(db.driver_target(), Some((shards, true)));
         db.close().unwrap();
     }
     for (shards, drivers, cores, started) in [

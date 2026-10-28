@@ -13,7 +13,7 @@ All additions; nothing is removed or renamed.
     - `Embedded`: a quarter;
     - `Server`: a half;
     - either way at least one, and at most one per shard.
-  - The driver ceiling is one per core in both. Explicit `shard_threads` and `compaction_cores` win.
+  - The driver count is a thread per shard in both (one per core with the default shard count). That's the load controller's ceiling when it is opted in (`Options::adaptive_shard_threads`, ICR 0079; off by default). Explicit `shard_threads` and `compaction_cores` win.
   - Application-owned opens ignore it (D40).
 - **`pigeonhole-bench`** (not published): `PigeonholeRunner::compaction_cores(c)` and `server_profile()`; `--compaction-cores C` and `--server-profile`.
 

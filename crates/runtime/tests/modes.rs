@@ -1244,6 +1244,35 @@ fn a_load_on_another_drivers_shards_grows_the_set() {
     rt.shutdown().unwrap();
 }
 
+/// D289 PR 2: without the load controller (the default, `adaptive_drivers` off), a forced
+/// target handed back with `None` returns to the drivers started, rather than staying where
+/// it was forced.
+#[test]
+fn a_released_target_without_the_controller_returns_to_a_thread_per_shard() {
+    let (cfg, _) = sim_config(4);
+    let rt = Runtime::start(cfg, handlers(4)).unwrap();
+    let force = rt.driver_control();
+    let settle = |k: usize| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !(rt.driver_target() == k && rt.drivers_settled()) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!((rt.driver_target(), rt.drivers_settled()), (k, true));
+    };
+    force(Some(2));
+    settle(2);
+    force(None);
+    settle(4);
+    for shard in 0..4u16 {
+        let (n, w) = completion();
+        rt.submitter(ShardId(shard))
+            .submit(Msg::Echo(7, n))
+            .unwrap();
+        assert_eq!(w.wait(), Some(7));
+    }
+    rt.shutdown().unwrap();
+}
+
 #[test]
 fn drop_without_shutdown_joins_threads() {
     let (cfg, _) = sim_config(2);

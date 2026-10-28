@@ -211,12 +211,15 @@ impl<H: ShardHandler> Drivers<H> {
     }
 
     /// Fixes the target at `k` (clamped to the drivers started), or with `None` hands it
-    /// back to the controller. For tests and benchmarks.
+    /// back to the controller, or without one back to the drivers started. For tests and
+    /// benchmarks.
     pub(crate) fn force_target(&self, k: Option<usize>) {
         let k = k.map_or(0, |k| k.clamp(1, self.slots.len()));
         self.forced.store(k, Ordering::Release);
         if k != 0 {
             self.set_target(k);
+        } else if !self.adaptive {
+            self.set_target(self.slots.len());
         }
     }
 

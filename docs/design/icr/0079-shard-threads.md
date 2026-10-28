@@ -42,8 +42,8 @@ PR 1 fixes the count, so the box A/B at k ∈ {1, 2, 4, 8, 16} can choose the de
   - `EngineOptions::adaptive_drivers: bool`, default `false`, so the crate's own tests run fixed.
   - Doc-hidden: `Engine::driver_target() -> Option<(usize, bool)>` and `Engine::force_driver_target`.
 - **`pigeonhole`:**
-  - Engine-owned opens turn the controller on unless `shard_threads` is set.
+  - `Options::adaptive_shard_threads(bool) -> Self`, default `false`: the controller is opt-in (the owner, #1006; its policy is tuned behind the flag in #1015). It applies to engine-owned opens without a fixed `shard_threads`; application-owned opens ignore it (D40).
   - Doc-hidden: `Pigeonhole::driver_target()` and `force_driver_target()`, for the bench's warm-up and the model check's churn.
 - **`pigeonhole-io`:** doc-hidden `cross_ring_wait_slices()`.
-- **`pigeonhole-bench`:** `Runner::driver_target()`, and `RunDetail::drivers`.
+- **`pigeonhole-bench`:** `Runner::driver_target()`, `RunDetail::drivers`, and `PigeonholeRunner::adaptive_shard_threads()` / `--adaptive-shard-threads`.
 

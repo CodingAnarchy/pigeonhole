@@ -139,8 +139,11 @@ OPTIONS:
                            workers for flush and compaction, a thread each (D284) [default: 0]
     --compaction-cores C   Pigeonhole: flush and compaction threads (D252)
                            [default: the library's CPU budget]
-    --server-profile       Pigeonhole: the server CPU profile (D289): the engine's
-                           threads take all but a small headroom of the cores
+    --server-profile       Pigeonhole: the server CPU profile (D289, ICR 0081): flush
+                           and compaction take half the physical cores, not a quarter
+    --adaptive-shard-threads
+                           Pigeonhole: the load controller sizes the shard threads
+                           (D289, experimental) [default: a thread per shard]
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
     --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
@@ -205,6 +208,7 @@ struct Args {
     background_workers: usize,
     compaction_cores: Option<usize>,
     server_profile: bool,
+    adaptive_shard_threads: bool,
     commit_spin: Option<u64>,
     txn_backoff: Option<u64>,
     dir: Option<PathBuf>,
@@ -278,6 +282,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--background-workers" => a.background_workers = parse(&arg, it.next())?,
             "--compaction-cores" => a.compaction_cores = Some(parse(&arg, it.next())?),
             "--server-profile" => a.server_profile = true,
+            "--adaptive-shard-threads" => a.adaptive_shard_threads = true,
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
             "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
@@ -377,6 +382,9 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if a.server_profile {
         r = r.server_profile();
+    }
+    if a.adaptive_shard_threads {
+        r = r.adaptive_shard_threads();
     }
     if let Some(us) = a.commit_spin {
         r = r.commit_spin_micros(us);
@@ -805,6 +813,7 @@ mod tests {
             Some(8)
         );
         assert!(args("ycsb-a --server-profile").server_profile);
+        assert!(args("ycsb-a --adaptive-shard-threads").adaptive_shard_threads);
         assert_eq!(args("ycsb-a --commit-spin 0").commit_spin, Some(0));
         assert_eq!(args("transfer --txn-backoff 0").txn_backoff, Some(0));
         assert!(pigeonhole(&rc, None).describe().contains(" rowcache=1MiB"));

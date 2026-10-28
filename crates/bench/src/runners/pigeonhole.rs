@@ -54,6 +54,8 @@ pub(crate) struct Settings {
     /// `Options::cpu_profile(CpuProfile::Server)` (D289) when set; the embedded default
     /// otherwise.
     pub(crate) server_profile: bool,
+    /// `Options::adaptive_shard_threads(true)` (D289's controller, experimental) when set.
+    pub(crate) adaptive_shard_threads: bool,
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
@@ -407,8 +409,8 @@ impl PigeonholeRunner {
         self
     }
 
-    /// The server CPU profile (`Options::cpu_profile(CpuProfile::Server)`, D289): the
-    /// engine's threads take all but a small headroom of the cores.
+    /// The server CPU profile (`Options::cpu_profile(CpuProfile::Server)`, D289, ICR 0081):
+    /// flush and compaction take half the physical cores rather than a quarter.
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
@@ -418,6 +420,21 @@ impl PigeonholeRunner {
     /// ```
     pub fn server_profile(mut self) -> Self {
         self.settings.server_profile = true;
+        self
+    }
+
+    /// D289's load controller sizes the shard threads
+    /// (`Options::adaptive_shard_threads(true)`, experimental).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("adaptive"));
+    /// let r = PigeonholeRunner::default().adaptive_shard_threads();
+    /// assert!(r.describe().contains(" shard_threads=adaptive"));
+    /// ```
+    pub fn adaptive_shard_threads(mut self) -> Self {
+        self.settings.adaptive_shard_threads = true;
         self
     }
 
@@ -681,6 +698,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.server_profile {
         options = options.cpu_profile(pigeonhole::CpuProfile::Server);
     }
+    if s.adaptive_shard_threads {
+        options = options.adaptive_shard_threads(true);
+    }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
     }
@@ -933,7 +953,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -971,6 +991,11 @@ impl Runner for PigeonholeRunner {
                 .map_or_else(String::new, |c| format!(" compaction_cores={c}")),
             if s.server_profile {
                 " profile=server"
+            } else {
+                ""
+            },
+            if s.adaptive_shard_threads {
+                " shard_threads=adaptive"
             } else {
                 ""
             },

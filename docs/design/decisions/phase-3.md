@@ -2725,7 +2725,13 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **Names:** with a thread per shard (`shard_threads` 0, or at least the shard count) the threads keep the names `pigeonhole-shard-{i}`. Otherwise every driver is `pigeonhole-driver-{d}`.
 - **Placement is round-robin, not blocks of n/k:** packing (D217) keeps shards `0..active` busy, and round-robin spreads them over the drivers where blocks would put them all on driver 0.
 
-**How the controller runs (PR 2):** `RuntimeConfig::adaptive_drivers`, on for every engine-owned `pigeonhole` open unless `shard_threads` is set.
+**How the controller runs (PR 2):** `RuntimeConfig::adaptive_drivers`. In `pigeonhole` it's **opt-in**: `Options::adaptive_shard_threads(true)`, for engine-owned opens without a fixed `shard_threads`. By default, engine-owned keeps one thread per shard, as before D289.
+- **Why opt-in (the owner, 2026-10-28, #1006):** six box rounds showed the mechanism sound but the resize policy noisy across load phases.
+  - **Round 5** (3f83e186): transfer, ycsb-a and ycsb-f level with main; sparse-wide put p99 51/350 µs against 236/489.
+  - **Round 6** (ec922c8c, after round 5's fixes): ycsb-a −5% and sparse-wide's tail gain lost. The slow-pass rule grew the set on idle windows between a load and a run, ycsb-a at 8 drivers sat just under `GROW_BUSY` with no signal, and sparse-wide's warm-up sibling wait (0.2–0.7) exceeded its steady-phase value (0.04–0.08).
+  - Each round fixed one phase-dependent edge and exposed another.
+  - **The follow-up is #1015:** per-phase signal traces, then rules that hold across phases, then default-on once two consecutive unchanged rounds are level.
+- **Without the controller,** `force_driver_target(None)` (tests, the bench) returns the target to the drivers started rather than leaving it where it was forced.
 - **Start:** all the ceiling's drivers start pinned, and the shards start one per driver (target = ceiling). A heavy load never starts short of threads, and a light one shrinks within seconds. Shard `i` belongs to driver `i % target`.
 - **The controller** runs between passes on whichever driver first finds its 100 ms window over (a try-lock, so no driver waits for it; one Relaxed load per pass otherwise). Not only driver 0: driver 0 parks like any driver, and with the load on another driver's shards nothing would grow the set (simp724's review of #1006, `a_load_on_another_drivers_shards_grows_the_set`). A window longer than 200 ms ran with every driver parked, so it is dropped rather than averaged in, where its diluted busy would read as a light load. It reads each driver's counters (Relaxed): busy (turn time, excluding spin), passes, slow passes (over 100 µs), sibling wait and ops (messages and slices), plus every shard's producer wakes. Only drivers below the target count towards busy, slow passes and sibling wait, so during a shrink's moves the misplaced shards' time is missed for a window or two.
   - **Grow** (doubling the target, up to the ceiling: a driver's busy saturates at 1 and can't say how many more the work needs; stepping up by one left transfer at 2–12 of 16 drivers through its measured phase, −10% in #1006's second A/B) when, averaged over 10 windows, the busiest driver's awake-busy is above 0.75, or more than 1% of a driver's passes run over 100 µs, or the active drivers' sibling wait is more than 0.15 of their busy (both summed over the drivers and the 10 windows, with at least 100 ops per window: a nearly idle window's ratio, 1.1–2.2 at 0.1% busy between a bench's load and its run, grew ycsb-a and sparse-wide in #1006's fifth A/B when windows were averaged). A pass bounds how long a message waits for its shard's turn: #997's heavy rows at one driver had pass p99s of 128–256 µs.
@@ -2762,7 +2768,7 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 
 **The CPU budget (ICR 0081; owner, 2026-10-27, #760 comments 6443979201, 6444135824 and 6446722456):** one function sizes the engine-owned threads from the physical cores the process may use, after its affinity mask and a container's CPU quota (`pigeonhole_io::sys::default_shards`).
 - **Shards:** one per core, as before (D220).
-- **The driver ceiling:** one per core in both profiles. Under full load a store keeps a thread per shard's throughput (#997's A/B: ycsb-f −8% at 8 of 16), and the controller shrinks a light one.
+- **The driver count:** a thread per shard by default (one per core with the default shard count). With the controller opted in, that is its ceiling: under full load a store keeps a thread per shard's throughput (#997's A/B: ycsb-f −8% at 8 of 16), and the controller shrinks a light one.
 - **The profiles differ in the compaction share** (`Options::cpu_profile`). These are placeholders until PR 2's compaction-share arms (c = 2, 4, 8 at 16 cores):
   - `Embedded` (the default) gives flush and compaction a quarter of the cores, leaving the application the rest and every SMT sibling;
   - `Server` (the clients are elsewhere: another container, IPC, the network) gives them half.
@@ -2770,7 +2776,7 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **Explicit settings win:** `shard_threads(k)` fixes the drivers (the controller off), and `compaction_cores(c)` is kept as given.
 - **Application-owned mode** starts no threads (D40).
 
-| Physical cores (after limits) | Shards | Driver ceiling | Embedded compaction | Server compaction |
+| Physical cores (after limits) | Shards | Shard threads (the controller's ceiling) | Embedded compaction | Server compaction |
 |--:|--:|--:|--:|--:|
 | 1 | 1 | 1 | 1 | 1 |
 | 2 | 2 | 2 | 1 | 1 |
