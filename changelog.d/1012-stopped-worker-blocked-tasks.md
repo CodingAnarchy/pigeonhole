@@ -1,0 +1,2 @@
+### Fixed
+- **A background worker's blocked tasks are no longer taken back as if it had stopped** (#1012, D284). After 100 ms without a pass, the shards took back everything a worker held, including tasks waiting for a wake rather than for the worker. A worker inside one slow slice (an inline sync on a slow device) lost them although it was being driven: a flush moved back to its shard, and a compaction was dropped and redone. Now only tasks that could run are taken back: runnable, woken, or asleep past their deadline.

@@ -454,3 +454,184 @@ fn a_stopped_worker_gives_its_held_tasks_back_without_a_close() {
         (1, 0)
     );
 }
+
+/// Blocks in its first slice (keeping its waker for the test), then finishes when run again.
+struct Blocks {
+    waker: Arc<Mutex<Option<TaskWaker>>>,
+    seen: Arc<Seen>,
+}
+
+impl Task for Blocks {
+    fn run(&mut self, _deadline: u64, waker: &TaskWaker) -> TaskPoll {
+        if pigeonhole_io::in_inline_io() {
+            self.seen.on_worker.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.seen.on_shard.fetch_add(1, Ordering::SeqCst);
+        }
+        let mut slot = self.waker.lock().unwrap();
+        if slot.is_none() {
+            *slot = Some(waker.clone());
+            return TaskPoll::Blocked;
+        }
+        self.seen.done.store(true, Ordering::SeqCst);
+        TaskPoll::Done
+    }
+
+    fn name(&self) -> &'static str {
+        "blocks"
+    }
+
+    fn reclaim(&mut self, failed: bool) -> bool {
+        self.seen.reclaims.fetch_add(1, Ordering::SeqCst);
+        !failed
+    }
+}
+
+#[test]
+fn a_stopped_workers_blocked_task_stays_until_it_is_woken() {
+    // #1012: a task blocked on a worker waits for its wake, not for the worker. A worker
+    // that made no pass for STOPPED (stopped, or deep in one slow slice: over 100 ms on
+    // Windows CI) keeps it; only once the task is woken and the worker still makes no pass
+    // does the shard take it back. Before #1012 the shard took it at once.
+    let (vfs, mut owned) = open(2);
+    let seen = Arc::new(Seen::default());
+    let waker = Arc::new(Mutex::new(None));
+    owned.shards[0].with_handler(|_, ctx| {
+        ctx.spawn(Box::new(Blocks {
+            waker: Arc::clone(&waker),
+            seen: Arc::clone(&seen),
+        }))
+    });
+    vfs.advance(1_000_000);
+    one_slice(&mut owned.workers[0], &vfs);
+    assert_eq!(
+        seen.on_worker.load(Ordering::SeqCst),
+        1,
+        "it blocked on worker 0"
+    );
+    // Worker 0 makes no pass for 300 ms (three STOPPED spans) while worker 1 and the shard
+    // run: the blocked task stays.
+    let shard = &mut owned.shards[0];
+    for _ in 0..30 {
+        vfs.advance(10_000_000);
+        owned.workers[1].run_once(vfs.monotonic_nanos());
+        shard.run_once(u64::MAX);
+    }
+    assert_eq!(
+        seen.reclaims.load(Ordering::SeqCst),
+        0,
+        "a blocked task was taken back"
+    );
+    assert_eq!(
+        shard.submitter(shard.shard()).background_take_backs(),
+        (0, 0)
+    );
+    // Woken, with worker 0 still making no pass: it comes back at the shard's next look.
+    waker.lock().unwrap().as_ref().unwrap().wake();
+    let mut waited = 0;
+    while seen.reclaims.load(Ordering::SeqCst) == 0 {
+        vfs.advance(10_000_000);
+        owned.workers[1].run_once(vfs.monotonic_nanos());
+        shard.run_once(u64::MAX);
+        waited += 1;
+        assert!(waited < 4, "the woken task never came back");
+    }
+    while shard.run_once(u64::MAX) {}
+    assert!(seen.done.load(Ordering::SeqCst));
+    assert_eq!(
+        seen.on_shard.load(Ordering::SeqCst),
+        1,
+        "it finished on the shard"
+    );
+    assert_eq!(
+        shard.submitter(shard.shard()).background_take_backs(),
+        (1, 0)
+    );
+}
+
+/// Sleeps until `until` (VFS clock) in its first slice, then finishes when run again.
+struct Sleeps {
+    until: u64,
+    slept: bool,
+    seen: Arc<Seen>,
+}
+
+impl Task for Sleeps {
+    fn run(&mut self, _deadline: u64, _waker: &TaskWaker) -> TaskPoll {
+        if pigeonhole_io::in_inline_io() {
+            self.seen.on_worker.fetch_add(1, Ordering::SeqCst);
+        } else {
+            self.seen.on_shard.fetch_add(1, Ordering::SeqCst);
+        }
+        if !self.slept {
+            self.slept = true;
+            return TaskPoll::SleepUntil(self.until);
+        }
+        self.seen.done.store(true, Ordering::SeqCst);
+        TaskPoll::Done
+    }
+
+    fn name(&self) -> &'static str {
+        "sleeps"
+    }
+
+    fn reclaim(&mut self, failed: bool) -> bool {
+        self.seen.reclaims.fetch_add(1, Ordering::SeqCst);
+        !failed
+    }
+}
+
+#[test]
+fn a_stopped_workers_sleeping_task_comes_back_once_due() {
+    // #1012: only the worker's own turn wakes its sleeping tasks, so a stopped worker's task
+    // past its deadline could run but never would. The shard takes it back then, and not
+    // before: until its deadline it waits for the clock, not for the worker.
+    let (vfs, mut owned) = open(2);
+    let seen = Arc::new(Seen::default());
+    let until = vfs.monotonic_nanos() + 500_000_000;
+    spawn_task(
+        &mut owned.shards[0],
+        Sleeps {
+            until,
+            slept: false,
+            seen: Arc::clone(&seen),
+        },
+    );
+    vfs.advance(1_000_000);
+    one_slice(&mut owned.workers[0], &vfs);
+    assert_eq!(
+        seen.on_worker.load(Ordering::SeqCst),
+        1,
+        "it slept on worker 0"
+    );
+    let shard = &mut owned.shards[0];
+    while vfs.monotonic_nanos() + 10_000_000 < until {
+        vfs.advance(10_000_000);
+        owned.workers[1].run_once(vfs.monotonic_nanos());
+        shard.run_once(u64::MAX);
+    }
+    assert_eq!(
+        seen.reclaims.load(Ordering::SeqCst),
+        0,
+        "taken back before its deadline"
+    );
+    let mut waited = 0;
+    while seen.reclaims.load(Ordering::SeqCst) == 0 {
+        vfs.advance(10_000_000);
+        owned.workers[1].run_once(vfs.monotonic_nanos());
+        shard.run_once(u64::MAX);
+        waited += 1;
+        assert!(waited < 4, "the due task never came back");
+    }
+    while shard.run_once(u64::MAX) {}
+    assert!(seen.done.load(Ordering::SeqCst));
+    assert_eq!(
+        seen.on_shard.load(Ordering::SeqCst),
+        1,
+        "it finished on the shard"
+    );
+}
+
+fn spawn_task(shard: &mut ShardDriver<Idle>, task: impl Task + 'static) {
+    shard.with_handler(|_, ctx| ctx.spawn(Box::new(task)));
+}

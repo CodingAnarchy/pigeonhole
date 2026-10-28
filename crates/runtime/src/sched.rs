@@ -483,11 +483,14 @@ impl Scheduler {
     /// Takes out every task not running that `pick` selects (by origin and
     /// [`Task::commit_path`]) and that has been idle since `idle_before` or earlier (VFS
     /// clock; `u64::MAX`: any), for adoption elsewhere (D284). Only pool schedulers' tasks
-    /// (with an origin) are taken.
+    /// (with an origin) are taken. With `could_run_only`, only tasks that could run now:
+    /// runnable, woken, failed, or asleep until `due_by` or earlier (VFS clock; 0: none of
+    /// the sleeping ones), which only the driver's own turn would wake.
     pub(crate) fn take_idle(
         &mut self,
         idle_before: u64,
         could_run_only: bool,
+        due_by: u64,
         pick: impl Fn(&Arc<Origin>, bool) -> bool,
         out: &mut Vec<Moved>,
     ) {
@@ -495,7 +498,9 @@ impl Scheduler {
             let take = self.slots[i].as_ref().is_some_and(|e| {
                 e.task.is_some()
                     && e.idle_since <= idle_before
-                    && (!could_run_only || e.could_run())
+                    && (!could_run_only
+                        || e.could_run()
+                        || matches!(e.state, State::Sleeping(d) if d <= due_by))
                     && e.origin.as_ref().is_some_and(|o| pick(o, e.room))
             });
             if !take {
