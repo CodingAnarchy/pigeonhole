@@ -232,3 +232,27 @@ fn larger_than_ram_preset_splits_cold_and_hot_gets() {
     assert!(rec.detail.reads.is_none());
     std::fs::remove_dir_all(&root).ok();
 }
+
+#[test]
+fn pigeonhole_transfers_are_split_by_shard_locality() {
+    // #708: each transfer records under whether its two accounts were on one shard at the
+    // start of the measured pass (`Runner::op_label`), never under the plain type name.
+    use pigeonhole_bench::{RunOptions, TRANSFER_CROSS_SHARD, TRANSFER_ONE_SHARD, run_detailed};
+    let root = temp_dir("pigeonhole-transfer-locality");
+    let mut config = WorkloadConfig::smoke(WorkloadKind::Transfer);
+    config.operations = 400;
+    let mut r = PigeonholeRunner::default()
+        .shards(2)
+        .memtable_budget(16 << 20);
+    let rec = run_detailed(&mut r, &config, &root, &RunOptions::default()).unwrap();
+    let by_type = &rec.detail.by_type;
+    assert!(
+        by_type
+            .iter()
+            .all(|t| t.op == TRANSFER_ONE_SHARD || t.op == TRANSFER_CROSS_SHARD),
+        "{by_type:?}"
+    );
+    let n: u64 = by_type.iter().map(|t| t.stats.count).sum();
+    assert_eq!(n, rec.operations, "every measured transfer is labelled");
+    std::fs::remove_dir_all(&root).ok();
+}

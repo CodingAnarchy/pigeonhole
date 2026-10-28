@@ -570,6 +570,11 @@ pub trait Client: Send {
     }
 }
 
+/// [`Runner::op_label`] for a transfer whose two accounts are on one shard.
+pub const TRANSFER_ONE_SHARD: &str = "transfer (one shard)";
+/// [`Runner::op_label`] for a transfer whose two accounts are on different shards.
+pub const TRANSFER_CROSS_SHARD: &str = "transfer (cross-shard)";
+
 /// A store under test.
 pub trait Runner {
     /// Store name for reports (`pigeonhole`, `rocksdb`, `sqlite-eav`, `fjall`).
@@ -600,6 +605,15 @@ pub trait Runner {
     /// Store settings that affect results, for reports (shards, durability, ...).
     fn describe(&self) -> String {
         String::new()
+    }
+
+    /// A finer latency class for `op` than its [`BenchOp::type_name`], read before the
+    /// measured pass (outside each operation's timing): `None` (the default) keeps the type
+    /// name. The Pigeonhole runner splits transfers by whether their two accounts are on one
+    /// shard ([`TRANSFER_ONE_SHARD`], [`TRANSFER_CROSS_SHARD`]), as placed at that moment.
+    fn op_label(&self, op: &BenchOp) -> Option<&'static str> {
+        let _ = op;
+        None
     }
 
     /// Cumulative per-shard counters since open, indexed by shard, with `tablets_start`
@@ -1020,14 +1034,20 @@ struct Split {
 }
 
 impl Split {
-    fn record(&mut self, op: &BenchOp, class: Class, latency: Duration) {
+    fn record(
+        &mut self,
+        op: &BenchOp,
+        class: Class,
+        label: Option<&'static str>,
+        latency: Duration,
+    ) {
         match class {
             Class::Cold => self.cold.record(latency),
             Class::Hot => self.hot.record(latency),
             Class::Other => {}
         }
         self.by_type
-            .entry(op.type_name())
+            .entry(label.unwrap_or_else(|| op.type_name()))
             .or_default()
             .record(latency);
     }
@@ -1188,7 +1208,11 @@ fn measure(
         }
         let classes = classify(&chunk, &mut seen);
         let share = deal(chunk.into_iter().zip(classes), lanes);
-        let (e, h, s) = pass(runner, &mut clients, &share, true, deadline)?;
+        let labels: Vec<Vec<Option<&'static str>>> = share
+            .iter()
+            .map(|s| s.iter().map(|(op, _)| runner.op_label(op)).collect())
+            .collect();
+        let (e, h, s) = pass(runner, &mut clients, &share, Some(&labels), true, deadline)?;
         elapsed += e;
         hist.merge(&h);
         split.merge(&s);
@@ -1293,7 +1317,8 @@ fn warm_up_on(
     let mut drivers = runner.driver_target();
     let settled = loop {
         let before = runner.shard_shares();
-        pass(runner, clients, warm, false, Some(deadline)).map_err(|e| format!("warmup: {e}"))?;
+        pass(runner, clients, warm, None, false, Some(deadline))
+            .map_err(|e| format!("warmup: {e}"))?;
         let after = runner.shard_shares();
         // The load controller (D289 PR 2) resizing, or shards still on their way to their
         // drivers, counts as a placement change too.
@@ -1389,15 +1414,19 @@ fn pass(
     runner: &mut dyn Runner,
     clients: &mut [Box<dyn Client>],
     shares: &[Vec<(BenchOp, Class)>],
+    labels: Option<&[Vec<Option<&'static str>>]>,
     record: bool,
     deadline: Option<Instant>,
 ) -> Result<(Duration, Histogram, Split), String> {
+    // A share's labels ([`Runner::op_label`]), `None` each when there are none.
+    let label = |i: usize, j: usize| labels.and_then(|l| l.get(i)?.get(j).copied().flatten());
     let run = |exec: &mut dyn FnMut(&BenchOp) -> Result<(), String>,
-               share: &[(BenchOp, Class)]|
+               share: &[(BenchOp, Class)],
+               i: usize|
      -> Result<(Histogram, Split), String> {
         let mut hist = Histogram::new();
         let mut split = Split::default();
-        for (op, class) in share {
+        for (j, (op, class)) in share.iter().enumerate() {
             let t = Instant::now();
             if deadline.is_some_and(|d| t >= d) {
                 break;
@@ -1406,14 +1435,14 @@ fn pass(
             if record {
                 let latency = t.elapsed();
                 hist.record(latency);
-                split.record(op, *class, latency);
+                split.record(op, *class, label(i, j), latency);
             }
         }
         Ok((hist, split))
     };
     if clients.is_empty() {
         let start = Instant::now();
-        let (hist, split) = run(&mut |op| runner.execute(op), &shares[0])?;
+        let (hist, split) = run(&mut |op| runner.execute(op), &shares[0], 0)?;
         return Ok((start.elapsed(), hist, split));
     }
     let barrier = Arc::new(Barrier::new(clients.len() + 1));
@@ -1421,7 +1450,8 @@ fn pass(
         let handles: Vec<_> = clients
             .iter_mut()
             .zip(shares)
-            .map(|(client, share)| {
+            .enumerate()
+            .map(|(i, (client, share))| {
                 let barrier = Arc::clone(&barrier);
                 scope.spawn(move || {
                     barrier.wait();
@@ -1431,15 +1461,17 @@ fn pass(
                             let latencies = latencies?;
                             let (mut hist, mut split) = (Histogram::new(), Split::default());
                             if record {
-                                for ((op, class), latency) in share.iter().zip(latencies) {
+                                for (j, ((op, class), latency)) in
+                                    share.iter().zip(latencies).enumerate()
+                                {
                                     let Some(latency) = latency else { continue };
                                     hist.record(latency);
-                                    split.record(op, *class, latency);
+                                    split.record(op, *class, label(i, j), latency);
                                 }
                             }
                             Ok((hist, split))
                         }
-                        None => run(&mut |op| client.execute(op), share),
+                        None => run(&mut |op| client.execute(op), share, i),
                     }
                 })
             })

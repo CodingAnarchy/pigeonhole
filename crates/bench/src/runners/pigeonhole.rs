@@ -827,6 +827,18 @@ impl Runner for PigeonholeRunner {
         self.open.as_ref().and_then(|o| o.target.db.pack_target())
     }
 
+    fn op_label(&self, op: &BenchOp) -> Option<&'static str> {
+        let BenchOp::Transfer { from, to, .. } = op else {
+            return None;
+        };
+        let table = &self.open.as_ref()?.target.table;
+        Some(if table.shard_of(from)? == table.shard_of(to)? {
+            crate::TRANSFER_ONE_SHARD
+        } else {
+            crate::TRANSFER_CROSS_SHARD
+        })
+    }
+
     fn driver_target(&self) -> Option<(usize, bool)> {
         self.open.as_ref().and_then(|o| o.target.db.driver_target())
     }
