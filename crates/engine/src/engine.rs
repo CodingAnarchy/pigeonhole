@@ -1140,6 +1140,9 @@ impl Engine {
             identity,
             path: path.to_path_buf(),
         });
+        // Both come from `row_cache_bytes > 0`: a shard's apply follows the epochs only with
+        // the cache (`follow`).
+        debug_assert_eq!(shared.row_epochs.is_some(), shared.row_cache.is_some());
         // D290: the write-through overlays only puts newer than every delete the file holds.
         if let Some(rc) = &shared.row_cache {
             rc.note_delete(

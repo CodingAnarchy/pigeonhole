@@ -5407,7 +5407,7 @@ impl ShardState {
             && self.shared.balance.enabled
             && self.shared.balance.interval_nanos > 0;
         // D290: the row cache follows the commit (decided once per apply, so the cache-off
-        // loop keeps its one branch on `row_epochs`).
+        // loop keeps its one branch on `follow`).
         let follow = !self.replaying && self.shared.row_cache.is_some();
 
         // The mutations as the scan decoded them (the batch is decoded once).
@@ -5455,20 +5455,16 @@ impl ShardState {
                     }
                     // Before the write is inserted, so before it can be visible (D201), whatever
                     // the write's kind: every cache in every process keys on it (D281).
-                    if let Some(epochs) = &self.shared.row_epochs
-                        && !self.replaying
-                    {
-                        if follow {
-                            // D290: the slot's value before this commit. `seqno` itself is a
-                            // later run of this commit's writes to the row (A, B, A).
-                            let p = epochs.note_write_prev(m.table, m.row, seqno);
-                            if p < seqno {
-                                self.cache_rows.push((k.table, k.row, p));
-                            } else if p > seqno {
-                                self.cache_stale.push((k.table, k.row));
-                            }
-                        } else {
-                            epochs.note_write(m.table, m.row, seqno);
+                    // The epochs exist exactly when the row cache does (both from
+                    // `row_cache_bytes > 0`), so outside replay `follow` covers them.
+                    if follow && let Some(epochs) = &self.shared.row_epochs {
+                        // D290: the slot's value before this commit. `seqno` itself is a
+                        // later run of this commit's writes to the row (A, B, A).
+                        let p = epochs.note_write_prev(m.table, m.row, seqno);
+                        if p < seqno {
+                            self.cache_rows.push((k.table, k.row, p));
+                        } else if p > seqno {
+                            self.cache_stale.push((k.table, k.row));
                         }
                     }
                     id
@@ -6215,32 +6211,15 @@ impl ShardState {
             // member waits for the decision; a PREPARE aborts instead, since waiting on
             // another commit's decision could deadlock two coordinators). An earlier write
             // to another cell of its predicate row cannot change the predicate.
-            if m.conditional() {
-                let (same_group, pending_share) = self.conflicts_with_group(&m, &admitted);
-                // Overlapping an earlier member of this group, any conditional member waits
-                // for the next group: that is this shard's own write, waiting on no other
-                // coordinator (D249). A single also waits for an undecided share's decision.
-                let pending_share = pending_share && !waited;
-                if same_group || (pending_share && matches!(m.kind, MemberKind::Single)) {
-                    if !same_group && self.end_share_wait(&mut m) {
-                        self.settle(m, Ok(()), ctx);
-                        continue;
-                    }
-                    if !same_group && m.share_wait == 0 {
-                        self.start_share_wait(&mut m);
-                    }
-                    self.hold_rows(&m);
-                    self.pending.push(m);
-                    continue;
-                }
-                if pending_share {
-                    // A PREPARE does not wait on another commit's decision, which could
-                    // deadlock two coordinators: it is refused, not failed, and retried
-                    // once the overlap clears (D249, ICR 0045). `Conflict` comes only from
-                    // validation, below.
-                    self.refuse_for_overlap(m, ctx);
-                    continue;
-                }
+            // Overlapping an undecided share (its predicate row, or a row it reads) it was
+            // held or refused above by `overlaps_undecided` (D271), unless it had waited.
+            if m.conditional() && self.conflicts_with_group(&m, &admitted) {
+                // Overlapping an earlier member of this group, a conditional member waits for
+                // the next group: that is this shard's own write, waiting on no other
+                // coordinator (D249).
+                self.hold_rows(&m);
+                self.pending.push(m);
+                continue;
             }
             if let Some((table, row, predicate)) = m.predicate.as_deref() {
                 match self.evaluate(*table, row, predicate) {
@@ -6362,14 +6341,14 @@ impl ShardState {
             if let MemberKind::Prepare { .. } = m.kind {
                 // D263: no timestamp yet (it is picked at the decision), so
                 // nothing to raise here (D244's (i)).
-                let mut reads: Vec<u64> = m
+                // Only a single-row `check_and_mutate` carries a predicate, and one row routes
+                // to one shard: never a PREPARE.
+                debug_assert!(m.predicate.is_none(), "a PREPARE with a predicate");
+                let reads: Vec<u64> = m
                     .validate
                     .as_ref()
                     .map(|v| v.reads.iter().map(|r| hash_row(r.table, &r.row)).collect())
                     .unwrap_or_default();
-                if let Some((table, row, _)) = m.predicate.as_deref() {
-                    reads.push(hash_row(*table, row));
-                }
                 // The share lands at its decision's timestamp, above every stamp handed out
                 // before it (D271), so above this shard's last: a lower bound for
                 // compaction's and flush's GC.
@@ -7547,17 +7526,15 @@ impl ShardState {
 
     /// Whether conditional `m` reads what an earlier member of this group (`admitted`)
     /// wrote: its predicate cell or a cell it read (a write to that column, or a delete of
-    /// its family or row), or a row it read whole; and whether any of its rows (written,
-    /// read, or its predicate row) is a prepared, undecided share's.
-    fn conflicts_with_group(&self, m: &Member, admitted: &[Member]) -> (bool, bool) {
+    /// its family or row), or a row it read whole. Its reads and predicate row against an
+    /// undecided share are `overlaps_undecided`'s, checked before (D271).
+    fn conflicts_with_group(&self, m: &Member, admitted: &[Member]) -> bool {
         let mut same = false;
-        let mut pending = false;
         // D271: its writes over an undecided share's writes are ordered by the one allocator;
         // over its reads, `overlaps_undecided` refused them already. What it reads counts.
         if let Some(reads) = m.validate.as_ref().map(|v| &v.reads) {
             for r in reads {
                 let h = hash_row(r.table, &r.row);
-                pending |= self.pending_rows.contains_key(&h);
                 // The row hash first: only a row an earlier member touched is looked at.
                 if same || !self.touched.contains_key(&h) {
                     continue;
@@ -7581,7 +7558,6 @@ impl ShardState {
         }
         if let Some((table, row, predicate)) = m.predicate.as_deref() {
             let h = hash_row(*table, row);
-            pending |= self.pending_rows.contains_key(&h);
             // The row hash first: only a row an earlier member touched is looked at cell
             // by cell.
             if !same && self.touched.contains_key(&h) {
@@ -7595,7 +7571,7 @@ impl ShardState {
                 same = writes_cell(admitted.iter(), *table, row, family, qualifier);
             }
         }
-        (same, pending)
+        same
     }
 
     /// Holds `m`'s rows (written, read, and its predicate row) back for the next group:
