@@ -17,8 +17,6 @@ readme = "README.md"
 # `futures-core` dependency; the blocking API is unchanged either way.
 default = ["async"]
 async = ["dep:futures-core"]
-# Phase 3: optional Tokio conveniences, never requirements.
-tokio = ["async"]
 
 [dependencies]
 pigeonhole-engine = { workspace = true }
