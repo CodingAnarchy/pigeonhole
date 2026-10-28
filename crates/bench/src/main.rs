@@ -99,6 +99,10 @@ OPTIONS:
     --shards N             Pigeonhole shards (scaling: N; default one per physical core)
     --write-buffer B       every engine's write buffer (Pigeonhole: memtable bytes per
                            shard) [default: 64 MiB]
+    --rate OPS             offer the measured operations at about OPS per second in all
+                           (each client paced to OPS / clients; the warmup is not), so
+                           latency is service time at that load instead of at the
+                           store's maximum (#759: read p99 at equal offered load)
     --cache B              every engine's read cache (SQLite: page cache gets
                            write buffer + cache) [default: 256 MiB]
     --sync                 fsync every commit on every engine [default: buffered];
@@ -189,6 +193,7 @@ struct Args {
     shards: Option<usize>,
     write_buffer: Option<u64>,
     cache: Option<u64>,
+    rate: Option<f64>,
     sync: bool,
     /// `--durability`: `None` is buffered (or `--sync`).
     durability: Option<Durability>,
@@ -261,6 +266,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 a.write_buffer = Some(parse(&arg, it.next())?)
             }
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
+            "--rate" => a.rate = Some(parse(&arg, it.next())?),
             "--sync" => a.sync = true,
             "--durability" => match it.next().as_deref() {
                 Some("buffered") => a.durability = None,
@@ -499,6 +505,7 @@ fn one_inline(
         in_flight: a.in_flight.unwrap_or(INLINE_IN_FLIGHT),
         pin,
         max_measured: max_measured(a),
+        offered_rate: None,
     };
     let result = runner
         .run_inline(config, &dir, &options)
@@ -531,6 +538,7 @@ fn one(
         }),
         min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
         max_measured: max_measured(a),
+        offered_rate: a.rate,
         ..RunOptions::default()
     };
     let result = run_detailed(runner, config, &dir, &options)
@@ -780,6 +788,8 @@ mod tests {
         let c = config(&a, WorkloadKind::YcsbA).unwrap();
         assert_eq!((c.records, c.operations), (10, 20));
         assert!(a.sync);
+        assert_eq!(a.rate, None);
+        assert_eq!(args("ycsb-f --rate 38500").rate, Some(38500.0));
         assert!(!a.no_tablet_changes);
         assert!(!args("scaling --tablet-changes").no_tablet_changes);
         assert!(args("scaling --no-tablet-changes").no_tablet_changes);

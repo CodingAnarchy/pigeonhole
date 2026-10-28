@@ -860,6 +860,14 @@ pub struct RunOptions {
     /// ([`RunDetail::capped`]). The warmup is bounded by its own cap. `None` (the default):
     /// unbounded, the configured operations (and `min_measured`) decide.
     pub max_measured: Option<std::time::Duration>,
+    /// Client runs: the measured operations are offered at about this many per second in
+    /// all, each client starting its next operation on a schedule of `rate / clients` (a
+    /// late client catches up without sleeping). Latency is still each operation's own
+    /// time: the store's service time at that offered load, as opposed to at its maximum
+    /// (#759 judges read p99 both ways). The warmup is not paced; a client with a
+    /// pipelined path runs operation by operation instead. `None` (the default): every
+    /// client runs as fast as it can.
+    pub offered_rate: Option<f64>,
 }
 
 impl Default for RunOptions {
@@ -870,6 +878,7 @@ impl Default for RunOptions {
             in_flight: INLINE_IN_FLIGHT,
             pin: false,
             max_measured: None,
+            offered_rate: None,
         }
     }
 }
@@ -934,6 +943,7 @@ pub fn run_detailed(
         warmup,
         options.min_measured,
         options.max_measured,
+        options.offered_rate,
     )
     .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
@@ -993,6 +1003,7 @@ pub fn run_detailed(
             reader_processes,
             close_ms: Some(close_ms),
             capped: options.max_measured.map(|_| capped),
+            offered_rate: options.offered_rate,
         },
     })
 }
@@ -1146,6 +1157,7 @@ fn measure(
     warmup: u64,
     min_measured: Duration,
     max_measured: Option<Duration>,
+    offered_rate: Option<f64>,
 ) -> Result<Measured, String> {
     let load_start = Instant::now();
     for op in workload.load_ops() {
@@ -1212,7 +1224,15 @@ fn measure(
             .iter()
             .map(|s| s.iter().map(|(op, _)| runner.op_label(op)).collect())
             .collect();
-        let (e, h, s) = pass(runner, &mut clients, &share, Some(&labels), true, deadline)?;
+        let (e, h, s) = pass(
+            runner,
+            &mut clients,
+            &share,
+            Some(&labels),
+            true,
+            deadline,
+            offered_rate,
+        )?;
         elapsed += e;
         hist.merge(&h);
         split.merge(&s);
@@ -1317,7 +1337,7 @@ fn warm_up_on(
     let mut drivers = runner.driver_target();
     let settled = loop {
         let before = runner.shard_shares();
-        pass(runner, clients, warm, None, false, Some(deadline))
+        pass(runner, clients, warm, None, false, Some(deadline), None)
             .map_err(|e| format!("warmup: {e}"))?;
         let after = runner.shard_shares();
         // The load controller (D289 PR 2) resizing, or shards still on their way to their
@@ -1409,7 +1429,8 @@ fn deal(
 
 /// Runs one share per client thread (on the runner itself when there are no clients), from
 /// a common start, and returns the wall time and, when `record` is set, each operation's
-/// latency.
+/// latency. With `offered_rate`, each share starts its operations on a schedule of
+/// `offered_rate / shares` per second ([`RunOptions::offered_rate`]).
 fn pass(
     runner: &mut dyn Runner,
     clients: &mut [Box<dyn Client>],
@@ -1417,16 +1438,29 @@ fn pass(
     labels: Option<&[Vec<Option<&'static str>>]>,
     record: bool,
     deadline: Option<Instant>,
+    offered_rate: Option<f64>,
 ) -> Result<(Duration, Histogram, Split), String> {
     // A share's labels ([`Runner::op_label`]), `None` each when there are none.
     let label = |i: usize, j: usize| labels.and_then(|l| l.get(i)?.get(j).copied().flatten());
+    // One share's gap between scheduled starts.
+    let gap = offered_rate
+        .filter(|r| *r > 0.0)
+        .map(|r| Duration::from_secs_f64(shares.len().max(1) as f64 / r));
     let run = |exec: &mut dyn FnMut(&BenchOp) -> Result<(), String>,
                share: &[(BenchOp, Class)],
                i: usize|
      -> Result<(Histogram, Split), String> {
         let mut hist = Histogram::new();
         let mut split = Split::default();
+        let paced_from = Instant::now();
         for (j, (op, class)) in share.iter().enumerate() {
+            if let Some(gap) = gap {
+                let due = paced_from + gap.mul_f64(j as f64);
+                let now = Instant::now();
+                if due > now {
+                    std::thread::sleep(due - now);
+                }
+            }
             let t = Instant::now();
             if deadline.is_some_and(|d| t >= d) {
                 break;
@@ -1456,7 +1490,13 @@ fn pass(
                 scope.spawn(move || {
                     barrier.wait();
                     let ops: Vec<&BenchOp> = share.iter().map(|(op, _)| op).collect();
-                    match client.pipelined(&ops, deadline) {
+                    // A paced share runs operation by operation, on its schedule.
+                    let pipelined = if gap.is_some() {
+                        None
+                    } else {
+                        client.pipelined(&ops, deadline)
+                    };
+                    match pipelined {
                         Some(latencies) => {
                             let latencies = latencies?;
                             let (mut hist, mut split) = (Histogram::new(), Split::default());
@@ -1824,6 +1864,33 @@ mod tests {
         let Warmed { secs, settled, .. } =
             run(&mut spreading(100, u64::MAX), 500, Duration::from_secs(1));
         assert!(!settled && secs == 1.0, "capped at {secs} s");
+    }
+
+    #[test]
+    fn an_offered_rate_paces_the_measured_operations() {
+        // #759: 40 instant operations offered at 200/s take about 195 ms (the first at once,
+        // then every 5 ms), and the record names the rate; unpaced they take no time.
+        let mut config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+        config.records = 10;
+        config.operations = 40;
+        let paced = RunOptions {
+            warmup: 0.0,
+            offered_rate: Some(200.0),
+            ..RunOptions::default()
+        };
+        let dir = std::env::temp_dir().join(format!("phdb-bench-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rec = run_detailed(&mut fake(0), &config, &dir, &paced).unwrap();
+        assert_eq!((rec.operations, rec.detail.offered_rate), (40, Some(200.0)));
+        assert!((0.18..2.0).contains(&rec.run_secs), "{}", rec.run_secs);
+        let free = RunOptions {
+            warmup: 0.0,
+            ..RunOptions::default()
+        };
+        let rec = run_detailed(&mut fake(0), &config, &dir, &free).unwrap();
+        assert_eq!(rec.detail.offered_rate, None);
+        assert!(rec.run_secs < 0.18, "{}", rec.run_secs);
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
