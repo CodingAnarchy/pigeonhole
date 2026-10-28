@@ -83,6 +83,7 @@ fn row_cache_hash_collision_is_a_miss() {
         epoch: 0,
         row: b"b"[..].into(),
         encoded: b"B".to_vec(),
+        read: AtomicU8::new(0),
     });
     let shard = rows.shards.shard(h).expect("shard");
     lock(shard).insert(h, entry, 10, Priority::Normal);
@@ -228,4 +229,32 @@ fn a_disabled_cache_counts_nothing() {
     drop(c.insert(key(0), block(10), Priority::Normal));
     assert!(c.get(key(0)).is_none());
     assert_eq!(c.hits_and_misses(), (0, 0));
+}
+
+#[test]
+fn a_hot_row_still_counts_as_read_after_eviction_passes() {
+    // D290's get-fill safeguard: a row read all the time must stay "read" however many
+    // eviction passes age the queue's hit counts back to 0, so a get refills it once a
+    // write the write-through can't follow leaves it stale. (The hit count alone refused
+    // such refills and cut transfer's row-cache hit rate from 0.69 to 0.31, #1011.)
+    let rows = RowCache::new(64 << 10);
+    drop(rows.insert(1, b"hot", 10, vec![7; 64]));
+    for round in 0..200u32 {
+        assert!(
+            rows.get(1, b"hot", 10).is_some(),
+            "the hot row stays cached"
+        );
+        // Churn: one-off rows push the queues through eviction passes.
+        for i in 0..20u32 {
+            let k = (round * 20 + i).to_le_bytes();
+            drop(rows.insert(2, &k, 1, vec![0; 512]));
+        }
+    }
+    assert!(
+        !rows.stale_unused(1, b"hot", 11),
+        "a hot row aged by eviction passes counts as unread"
+    );
+    // Stored again (a fill) or moved forward, it is unread until the next hit.
+    drop(rows.insert(1, b"hot", 11, vec![8; 64]));
+    assert!(rows.stale_unused(1, b"hot", 12));
 }

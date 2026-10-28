@@ -33,7 +33,7 @@ use pigeonhole_format::{FamilyId, Seqno, TableId, Timestamp};
 use pigeonhole_shm::RowEpochTable;
 
 use crate::Result;
-use crate::read::{CellData, ReadSpec, RowSink, read_row_into};
+use crate::read::{CellData, ReadSpec, RowData, RowSink, read_row_into};
 use crate::snapshot::View;
 
 /// Bytes of row cache per write-watermark slot.
@@ -99,6 +99,13 @@ impl RowEpochs {
         self.table.note_write(self.hash(table, row), seqno);
     }
 
+    /// As [`note_write`](Self::note_write), returning the slot's value before the raise
+    /// (D290's write-through: `p` below, the commit's own seqno, or above).
+    #[inline]
+    pub fn note_write_prev(&self, table: TableId, row: &[u8], seqno: Seqno) -> Seqno {
+        self.table.note_write_prev(self.hash(table, row), seqno)
+    }
+
     /// How many slots the table has.
     pub fn slots(&self) -> usize {
         self.table.slots()
@@ -124,6 +131,14 @@ pub(crate) struct RowCaches {
     hits: AtomicU64,
     misses: AtomicU64,
     fills: AtomicU64,
+    /// Entries a commit moved forward (D290's write-through).
+    patches: AtomicU64,
+    /// The newest timestamp of any delete the file may hold (D290): the largest of the SSTs'
+    /// at open and every delete applied since (replay included). A delete hides a put by
+    /// timestamp whatever their seqnos (a cell delete exactly at its timestamp, a column or
+    /// family delete at or below), and a cached row doesn't record the deletes behind it, so
+    /// the write-through overlays only puts above this.
+    delete_ceiling: AtomicU64,
 }
 
 /// What the row cache did since open ([`Engine::row_cache_stats`](crate::Engine::row_cache_stats)).
@@ -172,6 +187,8 @@ impl RowCaches {
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
             fills: AtomicU64::new(0),
+            patches: AtomicU64::new(0),
+            delete_ceiling: AtomicU64::new(0),
         })
     }
 
@@ -258,6 +275,72 @@ impl RowCaches {
     pub fn insert(&self, family: FamilyId, row: &[u8], key: RowKey, encoded: Vec<u8>) {
         self.fills.fetch_add(1, Ordering::Relaxed);
         self.store(family, row, key, encoded);
+    }
+
+    /// A delete at `ts` is applied (or the file holds one): before it can be visible, and
+    /// before any later write to its row applies (D290).
+    #[inline]
+    pub fn note_delete(&self, ts: Timestamp) {
+        self.delete_ceiling.fetch_max(ts, Ordering::Relaxed);
+    }
+
+    /// Entries a commit moved forward since open (D290's write-through).
+    pub fn patches(&self) -> u64 {
+        self.patches.load(Ordering::Relaxed)
+    }
+
+    /// D290's write-through, on the shard that applied the commit, after its `apply`
+    /// returned Ok and before the commit can be visible. The commit at `c` wrote `family` of
+    /// `row` with `cells` only, all plain puts (`(qualifier, ts, stored)`), and the row's
+    /// slot was `p < c` at the commit's first write to the row. If the family row is cached
+    /// at `p`, no write to the row lies in `(p, c)` (it would have moved the slot), so the
+    /// entry with `cells` overlaid is the family row at `c`: it moves to `c`. A reader hits it
+    /// only at an `S >= c`, so once `c` is visible. Anything that stops the overlay
+    /// (`overlay_fits`) leaves the entry stale at `p`, where it misses (the slot is at `c`)
+    /// and shows, unread, that the row is written between its reads (`get_through`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_through<'a>(
+        &self,
+        table: TableId,
+        family: FamilyId,
+        row: &[u8],
+        p: Seqno,
+        c: Seqno,
+        ttl: u64,
+        cells: impl Iterator<Item = (&'a [u8], Timestamp, &'a [u8])> + Clone,
+    ) {
+        let hash = self.lw.hash(table, row);
+        let from = RowKey { hash, epoch: p }.tag(family);
+        // The tag says whether a lookup at `p` could hit: two atomic loads for a row the
+        // cache doesn't hold.
+        if self.present[self.slot(from)].load(Ordering::Relaxed) != from {
+            return;
+        }
+        let max_row = self.max_row;
+        // Relaxed: a delete to this row applied on this shard thread, in order; another
+        // row's delete only makes the bound stricter.
+        let deletes = self.delete_ceiling.load(Ordering::Relaxed);
+        let fits = cells.clone();
+        if self.cache.update(
+            u64::from(family.0),
+            row,
+            p,
+            c,
+            |encoded| overlay_fits(encoded, fits, deletes, max_row),
+            |encoded| overlay(encoded, cells, ttl),
+        ) {
+            self.patches.fetch_add(1, Ordering::Relaxed);
+            let to = RowKey { hash, epoch: c }.tag(family);
+            self.present[self.slot(to)].store(to, Ordering::Relaxed);
+        }
+    }
+
+    /// Drops `row`'s cached `families`: a commit applied to it after a commit with a higher
+    /// seqno (D290), so a write-through by that later commit may lack this one's write.
+    pub fn invalidate(&self, row: &[u8], families: impl Iterator<Item = FamilyId>) {
+        for family in families {
+            self.cache.invalidate(u64::from(family.0), row);
+        }
     }
 
     fn store(&self, family: FamilyId, row: &[u8], key: RowKey, encoded: Vec<u8>) {
@@ -353,11 +436,128 @@ impl Encoded {
         )
     }
 
+    /// The offset of the cell with `qualifier` (its qualifier length), if the row has one.
+    fn find(encoded: &[u8], qualifier: &[u8]) -> Option<usize> {
+        let mut at = 8;
+        while at < encoded.len() {
+            let qlen = u32::from_le_bytes(encoded.get(at..at + 4)?.try_into().ok()?) as usize;
+            let q = encoded.get(at + 4..at + 4 + qlen)?;
+            let len_at = at + 4 + qlen + 8;
+            let vlen = u32::from_le_bytes(encoded.get(len_at..len_at + 4)?.try_into().ok()?);
+            if q == qualifier {
+                return Some(at);
+            }
+            at = len_at + 4 + vlen as usize;
+        }
+        None
+    }
+
     /// The cells, in read order: `(qualifier, ts, stored)`.
     pub fn cells(encoded: &[u8]) -> Cells<'_> {
         Cells {
             rest: &encoded[8..],
         }
+    }
+}
+
+/// Whether a commit's puts can be overlaid on a cached family row (D290's write-through),
+/// without changing it: not for a marker, a put at or below `deletes` (a delete the entry
+/// doesn't record could hide it), a put to a qualifier the row lacks, or a row the overlay
+/// would grow past `max_row`. A refusal leaves the entry stale where it is, as any write
+/// does without the write-through (D201), so a later get sees that it went unread.
+fn overlay_fits<'a>(
+    encoded: &[u8],
+    cells: impl Iterator<Item = (&'a [u8], Timestamp, &'a [u8])>,
+    deletes: Timestamp,
+    max_row: usize,
+) -> bool {
+    if Encoded::deadline(encoded) == Encoded::OVERSIZE {
+        return false;
+    }
+    // Sized as `overlay` applies the cells, in order: a column written twice in one commit
+    // (two timestamps) is compared with what the first put left, not with the cached cell
+    // (simp724's review: sizing both against the cached cell underflowed).
+    let mut seen: smallvec::SmallVec<[(&[u8], Timestamp, usize); 4]> = smallvec::SmallVec::new();
+    let mut len = encoded.len();
+    for (qualifier, ts, stored) in cells {
+        if ts <= deletes {
+            return false;
+        }
+        let current = match seen.iter_mut().find(|(q, _, _)| *q == qualifier) {
+            Some(cell) => cell,
+            None => {
+                let Some(at) = Encoded::find(encoded, qualifier) else {
+                    return false;
+                };
+                let (cached, old) = cell_at(encoded, at, qualifier);
+                seen.push((qualifier, cached, old));
+                seen.last_mut().expect("just pushed")
+            }
+        };
+        if current.1 <= ts {
+            let Some(next) = len
+                .checked_sub(current.2)
+                .and_then(|l| l.checked_add(stored.len()))
+            else {
+                return false;
+            };
+            len = next;
+            *current = (qualifier, ts, stored.len());
+        }
+    }
+    len <= max_row
+}
+
+/// A cell's timestamp and value length, given its offset ([`Encoded::find`]).
+fn cell_at(encoded: &[u8], at: usize, qualifier: &[u8]) -> (Timestamp, usize) {
+    let ts_at = at + 4 + qualifier.len();
+    let ts = u64::from_le_bytes(
+        encoded[ts_at..ts_at + 8]
+            .try_into()
+            .expect("an encoded cell has a timestamp"),
+    );
+    let len = u32::from_le_bytes(
+        encoded[ts_at + 8..ts_at + 12]
+            .try_into()
+            .expect("an encoded cell has a value length"),
+    ) as usize;
+    (ts, len)
+}
+
+/// Overlays a commit's puts on a cached family row that [`overlay_fits`] accepted: each
+/// replaces the cell with its qualifier unless the cached version is newer (`ts`; on a tie
+/// the commit, with the higher seqno, wins), and the row's expiry is recomputed.
+fn overlay<'a>(
+    encoded: &mut Vec<u8>,
+    cells: impl Iterator<Item = (&'a [u8], Timestamp, &'a [u8])>,
+    ttl: u64,
+) {
+    for (qualifier, ts, stored) in cells {
+        let Some(at) = Encoded::find(encoded, qualifier) else {
+            debug_assert!(false, "overlay_fits checked every qualifier");
+            continue;
+        };
+        let (cached, old) = cell_at(encoded, at, qualifier);
+        if cached > ts {
+            continue;
+        }
+        let ts_at = at + 4 + qualifier.len();
+        encoded[ts_at..ts_at + 8].copy_from_slice(&ts.to_le_bytes());
+        let len_at = ts_at + 8;
+        let value = len_at + 4..len_at + 4 + old;
+        if old == stored.len() {
+            encoded[value].copy_from_slice(stored);
+        } else {
+            encoded[len_at..len_at + 4].copy_from_slice(&(stored.len() as u32).to_le_bytes());
+            encoded.splice(value, stored.iter().copied());
+        }
+    }
+    if ttl != 0 {
+        let deadline = Encoded::cells(encoded)
+            .map(|(_, ts, _)| ts.saturating_add(ttl))
+            .min()
+            .unwrap_or(u64::MAX);
+        encoded[..8].copy_from_slice(&deadline.to_le_bytes());
     }
 }
 
@@ -510,6 +710,97 @@ pub(crate) fn get_cached(
             .find(|(q, _, _)| *q == qualifier)
             .map(|(_, ts, stored)| CellData::copied(ts, stored)),
     )
+}
+
+/// A point get at `seqno` through the writer's row cache (D290): answered from the cached
+/// family row under D201's hit rule, which holds at any visible `seqno` (so snapshot and
+/// transaction gets too: the read point is the snapshot's), or, on a miss of a row that
+/// missed before (D201's ghost tag), from the family row read whole at `seqno` and stored.
+/// `Some(None)` when the row has no such qualifier; `None`: read the cell as usual.
+///
+/// Families with a merge operator (counters among them) are served but never filled by a
+/// get: every increment moves their rows past what D290's write-through can follow, so a
+/// fill would be a family-row read per get after each write.
+#[inline(never)]
+#[allow(clippy::too_many_arguments, clippy::option_option)]
+pub(crate) fn get_through(
+    rc: &RowCaches,
+    view: &Arc<View>,
+    seqno: Seqno,
+    now: Timestamp,
+    table: TableId,
+    family: FamilyId,
+    row: &[u8],
+    qualifier: &[u8],
+) -> Option<Result<Option<CellData>>> {
+    let key = rc.epoch(table, row, seqno)?;
+    if !rc.families.is_empty() {
+        let info = view.catalog.table(table)?;
+        let f = info.families.iter().find(|f| f.id == family)?;
+        if !rc.serves(&info.name, &f.name) {
+            return None;
+        }
+    }
+    match rc.get(family, row, key, now) {
+        Lookup::Hit(hit) => return Some(Ok(cell_of(&hit, qualifier))),
+        Lookup::Oversize => return None,
+        Lookup::Miss => {}
+    }
+    let meta = view.catalog.family(family)?;
+    if meta.merge != crate::catalog::MergeKind::None {
+        return None;
+    }
+    // A row whose last cached copy went stale unread is written between its reads (by
+    // commits the write-through can't follow): refilling it on every get read the whole
+    // family row each time for nothing. The skip is one-shot (simp724's review): the stale
+    // copy goes with it, so the next miss fills under the ghost rule. Otherwise a copy
+    // refilled and then written before any hit would refuse every later fill, leaving a hot
+    // row uncached until evicted (a fill is not a read). Such a row then fills at most every
+    // other get.
+    let cache_family = u64::from(family.0);
+    if rc.cache.stale_unused(cache_family, row, key.epoch) {
+        rc.cache.invalidate(cache_family, row);
+        return None;
+    }
+    if !rc.admit(family, key) {
+        return None;
+    }
+    let mut sink = RowData::default();
+    let spec = ReadSpec {
+        versions: 1,
+        ..ReadSpec::default()
+    };
+    if let Err(e) = read_row_into(
+        view,
+        seqno,
+        table,
+        row,
+        std::slice::from_ref(&family),
+        &spec,
+        now,
+        false,
+        &mut sink,
+    ) {
+        return Some(Err(e));
+    }
+    match encode(&sink, 0, meta.options.ttl_micros, rc.max_row) {
+        Some(encoded) => {
+            let got = cell_of(&encoded, qualifier);
+            rc.insert(family, row, key, encoded);
+            Some(Ok(got))
+        }
+        None => {
+            rc.insert_oversize(family, row, key);
+            None
+        }
+    }
+}
+
+/// The cell with `qualifier` of an encoded family row, copied.
+fn cell_of(encoded: &[u8], qualifier: &[u8]) -> Option<CellData> {
+    Encoded::cells(encoded)
+        .find(|(q, _, _)| *q == qualifier)
+        .map(|(_, ts, stored)| CellData::copied(ts, stored))
 }
 
 /// The cells `sink` holds from `mark` on, encoded, or `None` if they exceed `max_row` (or the

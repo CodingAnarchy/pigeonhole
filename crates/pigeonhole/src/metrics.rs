@@ -389,14 +389,19 @@ pub struct RowCacheStats {
     pub misses: u64,
     /// Family rows stored.
     pub fills: u64,
+    /// Cached family rows a commit moved forward to its own write (D290's write-through),
+    /// instead of leaving them to miss.
+    pub write_throughs: u64,
 }
 
 impl RowCacheStats {
-    pub(crate) fn from_engine(s: pigeonhole_engine::RowCacheStats) -> Self {
+    pub(crate) fn from_engine(engine: &pigeonhole_engine::Engine) -> Self {
+        let s = engine.row_cache_stats();
         Self {
             hits: s.hits,
             misses: s.misses,
             fills: s.fills,
+            write_throughs: engine.row_cache_write_throughs(),
         }
     }
 }

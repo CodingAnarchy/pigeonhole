@@ -1140,6 +1140,19 @@ impl Engine {
             identity,
             path: path.to_path_buf(),
         });
+        // D290: the write-through overlays only puts newer than every delete the file holds.
+        if let Some(rc) = &shared.row_cache {
+            rc.note_delete(
+                catalog
+                    .ssts
+                    .values()
+                    .flat_map(|list| list.iter())
+                    .filter(|(_, m)| m.deletes > 0)
+                    .map(|(_, m)| m.ts_range.1)
+                    .max()
+                    .unwrap_or(0),
+            );
+        }
         // Extents the oldest live in-process view alone kept retired are reclaimed as soon
         // as it goes, not at the next manifest commit (a shard's momentary view would
         // otherwise leave them retired on an idle database). Never blocking: it runs on the
@@ -2176,7 +2189,7 @@ impl Engine {
             }
             let clock = || inner.shared.vfs.now_micros();
             if let Some(rc) = &inner.shared.row_cache
-                && let Some(hit) = crate::row_cache::get_cached(
+                && let Some(got) = crate::row_cache::get_through(
                     rc,
                     &view,
                     seqno,
@@ -2187,7 +2200,7 @@ impl Engine {
                     qualifier,
                 )
             {
-                return Ok(hit);
+                return got;
             }
             return get_in::<false>(&view, seqno, clock, table, family, row, qualifier, || {
                 Arc::clone(&view)
@@ -2592,6 +2605,20 @@ impl Engine {
             .as_ref()
             .map(|rc| rc.stats())
             .unwrap_or_default()
+    }
+
+    /// Cached family rows a commit moved forward since open (D290's write-through, ICR
+    /// 0082): 0 with the row cache off and in a reader process. A method of its own: a
+    /// [`RowCacheStats`] field would break struct literals.
+    pub fn row_cache_write_throughs(&self) -> u64 {
+        if self.inner.forked() {
+            return 0;
+        }
+        self.inner
+            .shared
+            .row_cache
+            .as_ref()
+            .map_or(0, |rc| rc.patches())
     }
 
     /// The shard that owns `row` of `table` in the current tablet map, or `None` if the
@@ -4196,6 +4223,22 @@ impl Inner {
         qualifier: &[u8],
     ) -> Result<Option<CellData>> {
         snapshot.check_process()?;
+        // D290: a snapshot's (and so a transaction's) gets go through the writer's row cache
+        // at the snapshot's seqno, as latest gets do at theirs.
+        if let Some(rc) = &self.shared.row_cache
+            && let Some(got) = crate::row_cache::get_through(
+                rc,
+                &snapshot.view,
+                snapshot.seqno,
+                self.shared.vfs.now_micros(),
+                table,
+                family,
+                row,
+                qualifier,
+            )
+        {
+            return snapshot.checked(got);
+        }
         snapshot.checked(get_in::<false>(
             &snapshot.view,
             snapshot.seqno,

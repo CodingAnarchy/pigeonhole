@@ -235,3 +235,92 @@ fn loom_row_epochs_never_serve_a_stale_row() {
         }
     });
 }
+
+/// D290's write-through, beside D201's protocol: the one applier of a row applies seqno 3
+/// before seqno 2 (a held share applying late), moving the cached row forward at 3 from the
+/// slot's previous value, then dropping it when 2 finds the slot already above it; a filler
+/// stores what it read at its read point; a reader hits only on an equal epoch at or below
+/// its read point. A row state is the set of writes it includes (bit `s` for the write at
+/// seqno `s`), so the write-through at 3, made from the row at 1, lacks the write at 2: a
+/// reader that hit it would see `0b1010` where the row at 3 is `0b1110`. Whatever the
+/// interleaving, a hit returns the row as of the reader's read point.
+///
+/// The slot is a bare atomic (the engine's is `pigeonhole_shm::RowEpochTable`, the same
+/// `fetch_max`), and the entry is packed as in the model above.
+#[test]
+fn loom_write_through_never_serves_a_stale_row() {
+    use loom::sync::atomic::{AtomicU64, Ordering};
+
+    let mut model = loom::model::Builder::new();
+    model.preemption_bound = Some(3);
+    model.check(|| {
+        // The row at each read point the store can publish: 1, then 3 (2 and 3 visible
+        // together, as visibility is contiguous).
+        let at = |s: u64| if s >= 3 { 0b1110 } else { 0b0010 };
+        let slot = Arc::new(AtomicU64::new(1));
+        let entry = Arc::new(AtomicU64::new(1 << 32 | at(1)));
+        let unpack = |v: u64| (v >> 32, v & 0xffff_ffff);
+        let visible = Arc::new(AtomicU64::new(1));
+
+        let applier = {
+            let (slot, entry, visible) =
+                (Arc::clone(&slot), Arc::clone(&entry), Arc::clone(&visible));
+            thread::spawn(move || {
+                // Seqno 3 first: its first touch reads p, a second touch (A, B, A) reads 3.
+                let p = slot.fetch_max(3, Ordering::Release);
+                assert_eq!(slot.fetch_max(3, Ordering::Release), 3);
+                if p < 3 {
+                    // `RowCache::update`: only an entry cached at exactly p moves.
+                    let v = entry.load(Ordering::SeqCst);
+                    let (epoch, state) = unpack(v);
+                    if epoch == p {
+                        let _ = entry.compare_exchange(
+                            v,
+                            3 << 32 | state | 0b1000,
+                            Ordering::SeqCst,
+                            Ordering::SeqCst,
+                        );
+                    }
+                }
+                // Then seqno 2, late: the slot is above it, so the row's entry goes.
+                if slot.fetch_max(2, Ordering::Release) > 2 {
+                    entry.store(0, Ordering::SeqCst);
+                }
+                visible.store(3, Ordering::Release);
+            })
+        };
+        let filler = {
+            let (slot, entry, visible) =
+                (Arc::clone(&slot), Arc::clone(&entry), Arc::clone(&visible));
+            thread::spawn(move || {
+                let s = visible.load(Ordering::Acquire);
+                let e = slot.load(Ordering::Acquire);
+                if e <= s {
+                    entry.store(e << 32 | at(s), Ordering::SeqCst);
+                }
+            })
+        };
+        let reader = {
+            let (slot, entry, visible) =
+                (Arc::clone(&slot), Arc::clone(&entry), Arc::clone(&visible));
+            thread::spawn(move || {
+                let s = visible.load(Ordering::Acquire);
+                let e = slot.load(Ordering::Acquire);
+                if e <= s {
+                    let (epoch, state) = unpack(entry.load(Ordering::SeqCst));
+                    if epoch == e {
+                        assert_eq!(state, at(s), "a stale row served at read point {s}");
+                    }
+                }
+            })
+        };
+        applier.join().unwrap();
+        filler.join().unwrap();
+        reader.join().unwrap();
+        let s = visible.load(Ordering::Acquire);
+        let (epoch, state) = unpack(entry.load(Ordering::SeqCst));
+        if epoch == slot.load(Ordering::Acquire) {
+            assert_eq!(state, at(s));
+        }
+    });
+}

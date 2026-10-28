@@ -1138,7 +1138,7 @@ impl Pigeonhole {
     /// What the row cache did since open: hits, misses and fills (D201). All zero when
     /// [`Options::row_cache`](crate::Options::row_cache) is 0.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
-        crate::RowCacheStats::from_engine(self.engine().row_cache_stats())
+        crate::RowCacheStats::from_engine(&self.engine())
     }
 
     /// The writer's counters since this instance opened: commits and their latency,
@@ -1501,7 +1501,7 @@ impl PigeonholeReader {
     /// [`ReaderOptions::row_cache`](crate::ReaderOptions::row_cache) is 0. A re-attach (the
     /// writer restarted or recovered) empties the cache and starts the counts again.
     pub fn row_cache_stats(&self) -> crate::RowCacheStats {
-        crate::RowCacheStats::from_engine(self.engine().row_cache_stats())
+        crate::RowCacheStats::from_engine(&self.engine())
     }
 
     /// Opens an existing table for reading.
