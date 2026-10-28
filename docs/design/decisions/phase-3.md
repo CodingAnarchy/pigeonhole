@@ -2287,6 +2287,19 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
   - `hot_rows_mix_reading_commits_and_blind_writers`: transactions and conditional writes beside blind batches on the hot rows, on 3 and 6 shards, with no commit allowed to give up with `Busy`.
 - **The existing sweeps** run unchanged.
 
+<a id="d269"></a>
+## D269 — The 1.0 format freeze: format 4 is the only 1.x format, and later 1.x features take feature bits (owner decision, 2026-10-21; format, pager, manifest, wal, sst, engine; blob33, #496, ICR 0058, ICR 0059)
+
+**Decided:** format 4 is the format every 1.x build reads and writes. Later 1.x features use the room it reserves, never a new version; 2.0 is format 5. FORMAT §13 states the compatibility promise, which takes effect with 1.0.0, and is the authority. In summary:
+- **Feature sets:** `compat`, `ro_compat` and `incompat` bits in the superblock (§8.2), in the SST footer's `flags` (§5.1) and in the WAL segment header, which grows to 128 bytes (§10.2). A bit is set in both superblock pages before the first structure that uses its feature is written, so a file that doesn't use a feature stays readable and writable by every older 1.x build.
+- **Unknown features:** an unknown `incompat` bit refuses the open with `UnsupportedFeature`. An unknown `ro_compat` bit refuses a writable open; reader processes open the file, and a writer opens it read-only with `read_only_fallback` (ICR 0059). Unknown `compat` bits are ignored and kept. A frozen enum's unknown value in bytes whose checksum passes is `UnsupportedFeature`, never corruption (ICR 0058).
+- **Room:** the superblock's extension area (bytes 128..4088, TLV records with an xxh3 at 4088 once the first feature uses it); the manifest's must-understand (1..=127) and skippable (128..=255) edit-tag ranges (§9.3); and the reserved bytes listed in §13.1. §13.2 maps each tracked post-1.0 feature to its path.
+- **Older files:** `MIN_READABLE` stays 1, so every 1.x build opens every file from 0.1.0 on. A writable open upgrades the file to format 4 first (both superblock pages), one way.
+- **Not promised:** the shared-memory layout (§11), which must match exactly between processes.
+- **#487** (min, max and HLL families) lands after the freeze, behind the first real `incompat` bit.
+
+**Checked by:** golden files for every structure, frozen at 1.0 by `crates/format/tests/golden-frozen.txt`; a corpus of files written by the 1.0 release that every later build opens in CI; and, once 1.0.0 is published, a job that opens files from `main` with 1.0.0.
+
 <a id="d270"></a>
 ## D270 — A packing move leaves a claimed shard alone and claims nothing itself; a change that waits on a compaction claims no shard (owner decision, 2026-10-21; tablets, engine, #724 area 2; amends D217, D224)
 
