@@ -533,6 +533,7 @@ impl Blocks {
 
     /// Whether `addr` is cached (pins it if so).
     pub(crate) fn cached(&self, addr: BlockAddr) -> Option<BlockHandle> {
+        crate::LOOKUPS.with(|c| c.set(c.get() + 1));
         self.cache.get(self.key(addr))
     }
 
@@ -552,6 +553,7 @@ impl Blocks {
         crate::note_file_read();
         let t = std::time::Instant::now();
         let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
+        crate::note_miss_read(t.elapsed().as_nanos() as u64);
         let data = decode_physical(buf, kind, self.pool(fill_cache))?;
         let h = self.admit(addr, data, fill_cache, priority);
         crate::MISS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));
@@ -581,6 +583,7 @@ impl Blocks {
         crate::note_file_read();
         let t = std::time::Instant::now();
         let buf = read_bytes(&self.file, self.base + addr.offset, addr.len as usize)?;
+        crate::note_miss_read(t.elapsed().as_nanos() as u64);
         let data = decode_physical(buf, kind, self.pool(fill_cache))?;
         let h = self.admit(addr, data, fill_cache, priority);
         crate::MISS_NS.with(|c| c.set(c.get() + t.elapsed().as_nanos() as u64));

@@ -23,7 +23,7 @@
 //! ```
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)] // SCRATCH #759: was forbid (the SQLite page probe).
 
 use std::path::Path;
 use std::str::FromStr;
@@ -1380,18 +1380,27 @@ fn pass(
      -> Result<(Histogram, Split), String> {
         let mut hist = Histogram::new();
         let mut split = Split::default();
+        let mut outside = [[0u64; 5]; 7];
         for (op, class) in share {
             let t = Instant::now();
             if deadline.is_some_and(|d| t >= d) {
                 break;
+            }
+            let row_read = record && matches!(op, BenchOp::GetRow { .. });
+            if row_read {
+                pigeonhole_engine::phases759::take_last();
             }
             exec(op)?;
             if record {
                 let latency = t.elapsed();
                 hist.record(latency);
                 split.record(op, *class, latency);
+                if row_read {
+                    scratch759::note(&mut outside, latency.as_nanos() as u64, pigeonhole_engine::phases759::take_last());
+                }
             }
         }
+        scratch759::merge(&outside);
         Ok((hist, split))
     };
     if clients.is_empty() {
@@ -1860,5 +1869,64 @@ mod tests {
         .unwrap();
         assert!(!s.settled);
         assert!(s.millis >= 300);
+    }
+}
+
+/// SCRATCH #759: a row read's time outside the engine's read (bench latency minus the engine's
+/// `read_row_into` time), by bench latency bucket. Written to `PHDB_OUTSIDE_OUT`.
+pub mod scratch759 {
+    use std::sync::Mutex;
+
+    const EDGES_US: [u64; 7] = [10, 20, 30, 40, 60, 100, u64::MAX];
+    static ALL: Mutex<[[u64; 5]; 7]> = Mutex::new([[0; 5]; 7]);
+
+    /// Per bucket: reads, bench ns, engine ns, reads that reached the engine's read, and
+    /// those reads' bench ns.
+    pub fn note(o: &mut [[u64; 5]; 7], total: u64, engine: u64) {
+        let i = EDGES_US.iter().position(|&e| total / 1000 < e).unwrap_or(6);
+        let b = &mut o[i];
+        b[0] += 1;
+        b[1] += total;
+        b[2] += engine;
+        b[3] += u64::from(engine > 0);
+        if engine > 0 {
+            b[4] += total;
+        }
+    }
+
+    pub fn merge(o: &[[u64; 5]; 7]) {
+        if o.iter().all(|b| b[0] == 0) {
+            return;
+        }
+        let mut all = ALL.lock().unwrap();
+        for (a, b) in all.iter_mut().zip(o) {
+            for (x, y) in a.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+        let Ok(path) = std::env::var("PHDB_OUTSIDE_OUT") else {
+            return;
+        };
+        let n: u64 = all.iter().map(|b| b[0]).sum();
+        let mut out = String::from("bench row reads by bench latency: bucket_us count share bench_us | of reads reaching the engine read: share engine_us outside_us | other reads (row cache hit) bench_us\n");
+        let mut lo = 0;
+        for (b, &hi) in all.iter().zip(&EDGES_US) {
+            let c = b[0].max(1) as f64;
+            let e = b[3].max(1) as f64;
+            let other = (b[0] - b[3]).max(1) as f64;
+            out += &format!(
+                "{lo}-{} {} {:.2}% {:.1} | {:.1}% {:.1} {:.1} | {:.1}\n",
+                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                b[0],
+                100.0 * b[0] as f64 / n.max(1) as f64,
+                b[1] as f64 / c / 1e3,
+                100.0 * b[3] as f64 / c,
+                b[2] as f64 / e / 1e3,
+                (b[4] as f64 - b[2] as f64) / e / 1e3,
+                (b[1] - b[4]) as f64 / other / 1e3,
+            );
+            lo = hi;
+        }
+        let _ = std::fs::write(path, out);
     }
 }

@@ -31,12 +31,17 @@ pub struct Bucket {
     /// SSTs whose range held the row, by level, and how many of them passed the row filter.
     pub probed: [u64; 8],
     pub passed: [u64; 8],
+    /// Block cache lookups, and the misses' file-read time alone.
+    pub lookups: u64,
+    pub miss_read_ns: u64,
 }
 
 #[derive(Clone)]
 pub struct Stats {
     pub buckets: [Bucket; 7],
     pub hist: Vec<u64>,
+    /// Each missed block's file read, 1 us buckets.
+    pub miss_hist: Vec<u64>,
 }
 
 impl Default for Stats {
@@ -44,6 +49,7 @@ impl Default for Stats {
         Stats {
             buckets: [Bucket::default(); 7],
             hist: vec![0; 501],
+            miss_hist: vec![0; 128],
         }
     }
 }
@@ -62,6 +68,8 @@ impl Stats {
             a.nsources += b.nsources;
             a.offcpu += b.offcpu;
             a.preempted += b.preempted;
+            a.lookups += b.lookups;
+            a.miss_read_ns += b.miss_read_ns;
             for i in 0..6 {
                 a.kind[i] += b.kind[i];
             }
@@ -72,6 +80,9 @@ impl Stats {
             }
         }
         for (a, b) in self.hist.iter_mut().zip(&o.hist) {
+            *a += b;
+        }
+        for (a, b) in self.miss_hist.iter_mut().zip(&o.miss_hist) {
             *a += b;
         }
     }
@@ -133,6 +144,38 @@ impl Stats {
             );
             lo = hi;
         }
+        out += "\nper read, by bucket: block lookups, misses, hit rate, miss file-read us (of miss_us)\n";
+        let mut lo = 0;
+        for (b, &hi) in self.buckets.iter().zip(&EDGES_US) {
+            let c = b.count.max(1) as f64;
+            out += &format!(
+                "{lo}-{} | {:.2} {:.2} {:.1}% | {:.1} of {:.1}\n",
+                if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                b.lookups as f64 / c,
+                b.misses as f64 / c,
+                100.0 * (1.0 - b.misses as f64 / (b.lookups.max(1) as f64)),
+                b.miss_read_ns as f64 / c / 1e3,
+                b.miss_ns as f64 / c / 1e3,
+            );
+            lo = hi;
+        }
+        let mn: u64 = self.miss_hist.iter().sum();
+        let mq = |q: f64| {
+            let want = (mn as f64 * q).ceil() as u64;
+            let mut acc = 0;
+            for (i, c) in self.miss_hist.iter().enumerate() {
+                acc += c;
+                if acc >= want {
+                    return i;
+                }
+            }
+            127
+        };
+        out += &format!(
+            "\nmissed-block file reads {mn}: p50 {} us, p90 {} us, p99 {} us, p99.9 {} us; share >= 20 us {:.2}%\n",
+            mq(0.5), mq(0.9), mq(0.99), mq(0.999),
+            100.0 * self.miss_hist[20..].iter().sum::<u64>() as f64 / mn.max(1) as f64
+        );
         out
     }
 }
@@ -161,6 +204,13 @@ thread_local! {
     pub static CUR: std::cell::Cell<(u64, u64, u64, u64)> = const { std::cell::Cell::new((0, 0, 0, 0)) };
     /// The current read's probed SSTs: id, level, past the filter.
     static PROBED: RefCell<Vec<(pigeonhole_format::SstId, usize, bool)>> = const { RefCell::new(Vec::new()) };
+    /// The last engine row read's time on this thread, for the bench to take (0 = none).
+    pub static LAST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// SCRATCH #759: takes this thread's last engine row read time (0 if none since the last take).
+pub fn take_last() -> u64 {
+    LAST.with(|c| c.replace(0))
 }
 
 pub fn probed(id: pigeonhole_format::SstId, level: usize, passed: bool) {
@@ -174,7 +224,8 @@ pub fn thread_cpu_ns() -> u64 {
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
-pub fn record(total: u64, cpu: u64, misses: u64, miss_ns: u64) {
+pub fn record(total: u64, cpu: u64, misses: u64, miss_ns: u64, lookups: u64, miss_read_ns: u64) {
+    LAST.with(|c| c.set(total));
     let (sources, seek, cells, nsources) = CUR.with(|c| c.replace((0, 0, 0, 0)));
     let _ = LOCAL.try_with(|l| {
         let s = &mut l.borrow_mut().0;
@@ -194,6 +245,14 @@ pub fn record(total: u64, cpu: u64, misses: u64, miss_ns: u64) {
         b.nsources += nsources;
         b.offcpu += off;
         b.preempted += u64::from(off > 2_000);
+        b.lookups += lookups;
+        b.miss_read_ns += miss_read_ns;
+        let _ = pigeonhole_sst::MISS_READ_HIST.try_with(|h| {
+            let mut h = h.borrow_mut();
+            for (a, x) in s.miss_hist.iter_mut().zip(h.iter_mut()) {
+                *a += std::mem::take(x);
+            }
+        });
         let _ = PROBED.try_with(|p| {
             let mut p = p.borrow_mut();
             for &(_, l, passed) in p.iter() {

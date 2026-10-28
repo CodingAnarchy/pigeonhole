@@ -256,6 +256,7 @@ impl Conn {
                 }
             }
             BenchOp::GetRow { row, family } => {
+                let _probe = scratch759::Probe::start(&self.0);
                 let mut stmt = self.0.prepare_cached(GET_ROW).map_err(e)?;
                 let live = oldest_live(family, now_micros());
                 let mut rows = stmt.query(params![row, family, live]).map_err(e)?;
@@ -458,5 +459,128 @@ impl Conn {
             }
         }
         Ok(t)
+    }
+}
+
+/// SCRATCH #759: per row read, the pages SQLite's page cache served and the ones it read
+/// from the file (`sqlite3_db_status` CACHE_HIT / CACHE_MISS), by latency bucket, during the
+/// measured phase. Written to `PHDB_SQLITE_OUT`.
+mod scratch759 {
+    use std::cell::RefCell;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use rusqlite::{Connection, ffi};
+
+    const EDGES_US: [u64; 7] = [10, 20, 30, 40, 60, 100, u64::MAX];
+    /// Per bucket: reads, ns, pages hit, pages missed, reads with a miss.
+    type Stats = ([[u64; 5]; 7], Vec<u64>);
+    static ALL: Mutex<Option<Stats>> = Mutex::new(None);
+
+    struct Local(Stats);
+    impl Drop for Local {
+        fn drop(&mut self) {
+            if self.0.0.iter().all(|b| b[0] == 0) {
+                return;
+            }
+            let mut all = ALL.lock().unwrap();
+            let all = all.get_or_insert_with(|| ([[0; 5]; 7], vec![0; 501]));
+            for (a, b) in all.0.iter_mut().zip(&self.0.0) {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x += y;
+                }
+            }
+            for (a, b) in all.1.iter_mut().zip(&self.0.1) {
+                *a += b;
+            }
+            let Ok(path) = std::env::var("PHDB_SQLITE_OUT") else {
+                return;
+            };
+            let n: u64 = all.1.iter().sum();
+            let pct = |q: f64| {
+                let want = (n as f64 * q).ceil() as u64;
+                let mut acc = 0;
+                for (i, c) in all.1.iter().enumerate() {
+                    acc += c;
+                    if acc >= want {
+                        return i;
+                    }
+                }
+                500
+            };
+            let mut out = format!(
+                "sqlite row reads {n}: p50 {} us, p99 {} us, p99.9 {} us\nbucket_us count share us | pages/read hit missed | reads with a miss | page cache hit rate\n",
+                pct(0.5), pct(0.99), pct(0.999)
+            );
+            let mut lo = 0;
+            for (b, &hi) in all.0.iter().zip(&EDGES_US) {
+                let c = b[0].max(1) as f64;
+                out += &format!(
+                    "{lo}-{} {} {:.2}% {:.1} | {:.2} {:.2} | {:.1}% | {:.1}%\n",
+                    if hi == u64::MAX { "inf".into() } else { hi.to_string() },
+                    b[0],
+                    100.0 * b[0] as f64 / n.max(1) as f64,
+                    b[1] as f64 / c / 1e3,
+                    b[2] as f64 / c,
+                    b[3] as f64 / c,
+                    100.0 * b[4] as f64 / c,
+                    100.0 * b[2] as f64 / ((b[2] + b[3]).max(1) as f64),
+                );
+                lo = hi;
+            }
+            let _ = std::fs::write(path, out);
+        }
+    }
+
+    thread_local! {
+        static LOCAL: RefCell<Local> = RefCell::new(Local(([[0; 5]; 7], vec![0; 501])));
+    }
+
+    #[allow(unsafe_code)]
+    fn status(c: &Connection, op: i32) -> u64 {
+        let (mut cur, mut hi) = (0, 0);
+        // SAFETY: the handle is the open connection's; db_status only reads counters.
+        unsafe { ffi::sqlite3_db_status(c.handle(), op, &mut cur, &mut hi, 0) };
+        cur as u64
+    }
+
+    pub struct Probe<'a> {
+        c: &'a Connection,
+        t: Instant,
+        hit: u64,
+        miss: u64,
+    }
+
+    impl<'a> Probe<'a> {
+        pub fn start(c: &'a Connection) -> Option<Self> {
+            pigeonhole_engine::phases759::ON
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then(|| Probe {
+                    c,
+                    hit: status(c, ffi::SQLITE_DBSTATUS_CACHE_HIT),
+                    miss: status(c, ffi::SQLITE_DBSTATUS_CACHE_MISS),
+                    t: Instant::now(),
+                })
+        }
+    }
+
+    impl Drop for Probe<'_> {
+        fn drop(&mut self) {
+            let ns = self.t.elapsed().as_nanos() as u64;
+            let hit = status(self.c, ffi::SQLITE_DBSTATUS_CACHE_HIT).saturating_sub(self.hit);
+            let miss = status(self.c, ffi::SQLITE_DBSTATUS_CACHE_MISS).saturating_sub(self.miss);
+            let _ = LOCAL.try_with(|l| {
+                let s = &mut l.borrow_mut().0;
+                let us = ns / 1000;
+                s.1[(us as usize).min(500)] += 1;
+                let i = EDGES_US.iter().position(|&e| us < e).unwrap_or(6);
+                let b = &mut s.0[i];
+                b[0] += 1;
+                b[1] += ns;
+                b[2] += hit;
+                b[3] += miss;
+                b[4] += u64::from(miss > 0);
+            });
+        }
     }
 }

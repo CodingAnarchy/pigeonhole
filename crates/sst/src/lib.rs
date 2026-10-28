@@ -96,6 +96,18 @@ thread_local! {
     pub static MISS_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     /// SCRATCH #759: each missed block's kind and SST, for the engine to drain per read.
     pub static MISS_LOG: std::cell::RefCell<Vec<(u8, pigeonhole_format::SstId)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// SCRATCH #759: block cache lookups (hits and misses) on this thread.
+    pub static LOOKUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// SCRATCH #759: nanoseconds of missed blocks' file reads alone (no decode or admit).
+    pub static MISS_READ_NS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// SCRATCH #759: each missed block's file read, in 1 us buckets (127 = 127+).
+    pub static MISS_READ_HIST: std::cell::RefCell<[u64; 128]> = const { std::cell::RefCell::new([0; 128]) };
+}
+
+/// SCRATCH #759: records one missed block's file read time.
+pub(crate) fn note_miss_read(ns: u64) {
+    MISS_READ_NS.with(|c| c.set(c.get() + ns));
+    let _ = MISS_READ_HIST.try_with(|h| h.borrow_mut()[((ns / 1000) as usize).min(127)] += 1);
 }
 
 /// Counts a block read from the file, if `counting_file_reads` is running.

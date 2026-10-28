@@ -1504,6 +1504,10 @@ pub(crate) fn read_row_into(
     } else {
         (None, 0, 0)
     };
+    let (l0_, r0_) = (
+        pigeonhole_sst::LOOKUPS.with(std::cell::Cell::get),
+        pigeonhole_sst::MISS_READ_NS.with(std::cell::Cell::get),
+    );
     let (read, misses) = pigeonhole_sst::counting_file_reads(|| {
         read_row_with(
             &mut resolver,
@@ -1523,7 +1527,11 @@ pub(crate) fn read_row_into(
         let total = t0.elapsed().as_nanos() as u64;
         let cpu = crate::phases759::thread_cpu_ns().saturating_sub(c0);
         let miss_ns = pigeonhole_sst::MISS_NS.with(std::cell::Cell::get).saturating_sub(m0);
-        crate::phases759::record(total, cpu, misses, miss_ns);
+        let lookups = pigeonhole_sst::LOOKUPS.with(std::cell::Cell::get).saturating_sub(l0_);
+        let miss_read_ns = pigeonhole_sst::MISS_READ_NS
+            .with(std::cell::Cell::get)
+            .saturating_sub(r0_);
+        crate::phases759::record(total, cpu, misses, miss_ns, lookups, miss_read_ns);
     } else {
         let _ = pigeonhole_sst::MISS_LOG.try_with(|m| m.borrow_mut().clear());
     }
