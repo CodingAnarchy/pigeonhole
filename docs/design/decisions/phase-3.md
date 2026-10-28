@@ -2806,6 +2806,8 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
 
 **Where it runs.** Every point get, sync or async, goes through `get_in`, whose closure takes the resolver's fold record after the get (only counter groups set it). A fold record hands the result to a cold function that sends it through the view's sink. The sink is in the writer's `LiveViews`, reached through the view's pin, and is absent in reader processes and forked children. `get_with` itself is unchanged: a checkpoint argument there changed what the compiler inlined into every point get (+1–3% instructions, D193).
 
+**Cost (CI x86 callgrind, D193).** The resolver reads counter groups in an instance of their own (`group::<true>`). `locate_key`, `common_prefix_len` and `split_suffix` are always inlined: with two instances the compiler stopped inlining them, which cost hot-row reads about 14 instructions a cell. A counter group records its fold only when it reaches `COUNTER_FOLD_MIN`, the shortest `counter_checkpoint_steps` any open engine set, so short folds take no cold call. Net against the base: hot-row and `versions` −0.2% to −0.4%, and `counter` +0.49%, the fold accounting itself. `counter`'s threshold is 0.8% under D195.
+
 **Not covered yet:** row reads of counters. They read through the same resolver, so (a) applies, but they don't send checkpoints. A write-side checkpoint for counters that are written heavily but rarely read is a follow-up, only if the gate's p99.9 shows it matters.
 
 **Measured** (local, `counters --scale full --threads 16`, buffered): counter-read p99 2.5–3.9 ms → 33 µs, p99.9 4–5 ms → 116–161 µs, and throughput 150K → 210–290K ops/s. The box A/B against main follows on the PR.
