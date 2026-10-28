@@ -116,6 +116,8 @@ OPTIONS:
     --async N              Pigeonhole: each client thread keeps N operations in flight
                            through the async API (commit_async, read_async, get_async;
                            D247) [default: 0, one at a time]
+    --no-nowait-reads      Pigeonhole, Linux: submit every read, even one the page cache
+                           holds (D292 copies those on the submitting thread by default)
     --mixed                app-owned: every other cross-shard batch is a transaction that
                            reads a cold row beside each of its rows and writes the rows,
                            so commits that read and blind writes meet on the same hot
@@ -192,6 +194,7 @@ struct Args {
     durability: Option<Durability>,
     no_tablet_changes: bool,
     no_packing: bool,
+    no_nowait_reads: bool,
     riders: bool,
     /// `--reader-processes`: reader processes beside the measured phase (#683).
     reader_processes: Option<usize>,
@@ -272,6 +275,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             },
             "--no-tablet-changes" => a.no_tablet_changes = true,
             "--no-packing" => a.no_packing = true,
+            "--no-nowait-reads" => a.no_nowait_reads = true,
             "--riders" => a.riders = true,
             "--mixed" => a.mixed = true,
             "--engine-owned" => a.engine_owned = true,
@@ -361,7 +365,8 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
         .async_in_flight(a.async_in_flight.unwrap_or(0))
         .memory(memory(a))
         .tablet_changes(!a.no_tablet_changes)
-        .packing(!a.no_packing);
+        .packing(!a.no_packing)
+        .nowait_reads(!a.no_nowait_reads);
     if let Some(bytes) = a.row_cache {
         r = r.row_cache(bytes);
     }

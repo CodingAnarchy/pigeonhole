@@ -936,6 +936,8 @@ fn a_batch_that_could_not_all_be_published_fails_only_the_rest() {
 fn threads_waiting_on_each_others_rings_both_complete() {
     let _serial = serial();
     let b = Backend::uring("uring-cross-wait");
+    // Each read must wait on the ring, even one the page cache holds (D292).
+    b.vfs.set_nowait_reads(false);
     let f = b.create("f");
     f.write_at(&filled(8192, 4), 0).unwrap();
     let (to_a, from_b) = mpsc::channel();

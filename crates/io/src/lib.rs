@@ -23,6 +23,7 @@ mod buf;
 mod completion;
 mod error;
 mod file;
+mod nowait;
 mod os;
 mod own;
 pub mod pread;
@@ -39,6 +40,8 @@ pub use buf::{BufPool, IoBuf};
 pub use completion::{Completion, Resolver, cross_ring_wait_slices};
 pub use error::{Error, ErrorKind, Result};
 pub use file::{File, FileRef, Locality, LockMode, OpenOptions};
+#[doc(hidden)]
+pub use nowait::{MISS_BUCKETS, NowaitReads};
 pub use own::{
     OwnIoWaker, in_inline_io, inline_io, own_io_enters, own_io_fd, own_io_in_flight, own_io_waker,
     reap_orphan_io, reap_own_io,

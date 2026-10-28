@@ -12,6 +12,40 @@ pub(crate) fn read_exact_at(file: &fs::File, buf: &mut [u8], offset: u64) -> io:
     file.read_exact_at(buf, offset)
 }
 
+/// Reads `buf` at `offset` only if the page cache holds all of it, without waiting on a
+/// device (`preadv2` with `RWF_NOWAIT`, D292).
+#[cfg(target_os = "linux")]
+pub(crate) fn read_cached_at(
+    file: &fs::File,
+    buf: &mut [u8],
+    offset: u64,
+) -> crate::nowait::Cached {
+    use crate::nowait::Cached;
+    use std::os::fd::AsRawFd;
+    let Ok(off) = libc::off_t::try_from(offset) else {
+        return Cached::Miss;
+    };
+    let iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    // SAFETY: one iovec over `buf`, valid for writes of its length; `file` keeps the
+    // descriptor open for the call.
+    let n = unsafe { libc::preadv2(file.as_raw_fd(), &iov, 1, off, libc::RWF_NOWAIT) };
+    if usize::try_from(n) == Ok(buf.len()) {
+        return Cached::Hit;
+    }
+    if n < 0
+        && matches!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::EOPNOTSUPP | libc::EINVAL)
+        )
+    {
+        return Cached::Refused;
+    }
+    Cached::Miss
+}
+
 pub(crate) fn write_all_at(file: &fs::File, buf: &[u8], offset: u64) -> io::Result<()> {
     file.write_all_at(buf, offset)
 }

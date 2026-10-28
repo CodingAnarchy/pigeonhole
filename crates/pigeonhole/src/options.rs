@@ -42,6 +42,7 @@ pub struct Options {
     row_cache: usize,
     row_cache_max_row: Option<usize>,
     counter_checkpoint_steps: Option<u64>,
+    nowait_reads: Option<bool>,
     row_cache_families: Vec<(String, String)>,
     shm_dir: Option<PathBuf>,
     reader_slots: u32,
@@ -175,6 +176,7 @@ impl Default for Options {
             row_cache: DEFAULT_ROW_CACHE,
             row_cache_max_row: None,
             counter_checkpoint_steps: None,
+            nowait_reads: None,
             row_cache_families: Vec::new(),
             shm_dir: None,
             reader_slots: DEFAULT_READER_SLOTS,
@@ -544,6 +546,15 @@ impl Options {
     #[doc(hidden)]
     pub fn counter_checkpoint_steps(mut self, steps: u64) -> Self {
         self.counter_checkpoint_steps = Some(steps);
+        self
+    }
+
+    /// Whether a read the page cache holds is copied on the thread that submits it (D292,
+    /// Linux; default on), set on the database's I/O backend at open (ICR 0083). For
+    /// benchmarks comparing the two.
+    #[doc(hidden)]
+    pub fn nowait_reads(mut self, on: bool) -> Self {
+        self.nowait_reads = Some(on);
         self
     }
 
@@ -1073,6 +1084,9 @@ impl Options {
             Some(v) => Arc::clone(v),
             None => backend_vfs(self.io_backend, application_owned)?,
         };
+        if let Some(on) = self.nowait_reads {
+            vfs.set_nowait_reads(on);
+        }
         let direct_io = self.direct_io.unwrap_or_else(env_direct_io);
         let mut o = EngineOptions::new(vfs);
         o.direct_io = direct_io;

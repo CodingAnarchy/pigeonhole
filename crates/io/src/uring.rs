@@ -307,6 +307,14 @@ impl Vfs for UringVfs {
         ThreadRing::attach(self.ring.id(), &self.ring.counts);
     }
 
+    fn set_nowait_reads(&self, on: bool) {
+        self.files.set_nowait_reads(on);
+    }
+
+    fn nowait_reads(&self) -> Option<crate::NowaitReads> {
+        self.files.nowait_reads()
+    }
+
     fn ring_stats(&self) -> Option<crate::RingStats> {
         let counts = &self.ring.counts;
         Some(crate::RingStats {
@@ -522,6 +530,11 @@ impl File for UringFile {
         }
         if self.inline_here() {
             return Completion::ready(self.file.read_at(&mut buf, offset).map(|()| buf));
+        }
+        // D292: a page-cache hit is copied here, not inside an enter under the kernel's
+        // `uring_lock` that every submitter queues on (#749).
+        if self.file.read_cached(&mut buf, offset) {
+            return Completion::ready(Ok(buf));
         }
         self.submit(|resolver| Kind::Read {
             buf,

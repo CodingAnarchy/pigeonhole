@@ -121,6 +121,21 @@ pub trait Vfs: Send + Sync + Debug {
         None
     }
 
+    /// Turns D292's inline page-cache reads on or off for this backend (on by default where
+    /// a backend has them: the Linux pread and io_uring backends). For benches comparing the
+    /// two (ICR 0083); not part of the API. The default does nothing.
+    #[doc(hidden)]
+    fn set_nowait_reads(&self, on: bool) {
+        let _ = on;
+    }
+
+    /// D292's inline page-cache reads on this backend so far, or `None` for a backend
+    /// without them (the default). For benches and tests (ICR 0083); not part of the API.
+    #[doc(hidden)]
+    fn nowait_reads(&self) -> Option<crate::NowaitReads> {
+        None
+    }
+
     /// A random 64-bit value, for identifiers that must be unique (a new database's id).
     ///
     /// The default mixes the standard library's per-process random hash keys (`RandomState`,

@@ -35,6 +35,8 @@ pub(crate) struct Settings {
     pub(crate) tablet_changes: Option<bool>,
     /// Packing (`Options::tablet_packing`, D217); on, the library default.
     pub(crate) no_packing: bool,
+    /// Inline page-cache reads (`Options::nowait_reads`, D292); on, the library default.
+    pub(crate) no_nowait_reads: bool,
     /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
     /// turns it off.
     pub(crate) row_cache: Option<u64>,
@@ -344,6 +346,19 @@ impl PigeonholeRunner {
     /// ```
     pub fn packing(mut self, yes: bool) -> Self {
         self.settings.no_packing = !yes;
+        self
+    }
+
+    /// Inline page-cache reads (`Options::nowait_reads`, D292, Linux); on without a call.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().nowait_reads(false);
+    /// assert!(r.describe().contains("nowait=off"));
+    /// ```
+    pub fn nowait_reads(mut self, yes: bool) -> Self {
+        self.settings.no_nowait_reads = !yes;
         self
     }
 
@@ -682,6 +697,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.no_packing {
         options = options.tablet_packing(false);
     }
+    if s.no_nowait_reads {
+        options = options.nowait_reads(false);
+    }
     if let Some(n) = s.shards {
         options = options.shards(n);
     }
@@ -811,6 +829,7 @@ impl Runner for PigeonholeRunner {
                 ..
             }) => {
                 drop((table, parts, counters));
+                report_nowait_reads(&db);
                 db.close().map_err(err)
             }
             None => Ok(()),
@@ -965,7 +984,7 @@ impl Runner for PigeonholeRunner {
             |n| n.to_string(),
         );
         format!(
-            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
+            "shards={shards} memtable={}MiB cache={}MiB bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
             s.memory.cache >> 20,
             if s.default_durability {
@@ -985,6 +1004,7 @@ impl Runner for PigeonholeRunner {
                 (false, false) => " tablets=on",
                 (false, true) => " tablets=on packing=off",
             },
+            if s.no_nowait_reads { " nowait=off" } else { "" },
             match s.row_cache {
                 None => String::new(),
                 Some(0) => " rowcache=off".to_owned(),
@@ -1488,6 +1508,43 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
         }
     }
     Ok(t)
+}
+
+/// D292's inline page-cache reads over the database's life, on stderr: hits, misses, the
+/// misses' mean and bucketed p50/p99 (perf287's S3), refusals and breaker trips.
+fn report_nowait_reads(db: &Pigeonhole) {
+    let Some(n) = db.nowait_reads() else {
+        return;
+    };
+    // The upper bound of the bucket holding the `q`th quantile of misses, in µs.
+    let quantile = |q: f64| {
+        let want = (n.misses as f64 * q).ceil() as u64;
+        let mut seen = 0;
+        for (i, &c) in n.miss_buckets.iter().enumerate() {
+            seen += c;
+            if seen >= want.max(1) {
+                return if i + 1 == n.miss_buckets.len() {
+                    format!(">={}", 1u64 << (i - 1))
+                } else {
+                    format!("<{}", 1u64 << i)
+                };
+            }
+        }
+        "-".to_owned()
+    };
+    eprintln!(
+        "nowait reads: on={} hits {} misses {} (mean {:.1} us, p50 {} us, p99 {} us) \
+         refused {} breaks {} buckets {:?}",
+        n.on,
+        n.hits,
+        n.misses,
+        n.miss_nanos as f64 / n.misses.max(1) as f64 / 1000.0,
+        quantile(0.5),
+        quantile(0.99),
+        n.refused,
+        n.breaks,
+        n.miss_buckets,
+    );
 }
 
 /// The engine's cumulative stall and visibility counters ([`crate::Stalls`], ICR 0015,
