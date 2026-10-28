@@ -501,7 +501,10 @@ fn one(
     };
     let result = run_detailed(runner, config, &dir, &options)
         .map_err(|e| format!("{} on {}: {e}", config.kind.name(), runner.name()));
-    let _ = std::fs::remove_dir_all(&dir);
+    // SCRATCH #759: PHDB_KEEP_STORE=1 leaves the store for a compacted-size check (not for merge).
+    if std::env::var("PHDB_KEEP_STORE").as_deref() != Ok("1") {
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     result
 }
 
