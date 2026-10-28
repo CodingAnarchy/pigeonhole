@@ -28,7 +28,7 @@ smallvec = { workspace = true }
 [features]
 # Test-only hooks (`src/engine/hooks.rs`), enabled by the dev-dependency below for the
 # engine's own tests and benches; never by the public crate.
-test-hooks = []
+test-hooks = ["pigeonhole-wal/sim-hooks"]
 
 [dev-dependencies]
 pigeonhole-sim = { workspace = true }

@@ -48,14 +48,22 @@ impl Drop for StrictForeground {
 }
 
 /// A foreground WAL call (`append`, `write`, `submit_sync`) in progress on this thread.
-pub(crate) struct Foreground(());
+/// With the `sim-hooks` feature it also marks the call's file operations for the
+/// simulator's foreground-only scheduled faults (#990).
+pub(crate) struct Foreground {
+    #[cfg(feature = "sim-hooks")]
+    _sim: pigeonhole_io::sim::WalForeground,
+}
 
 impl Foreground {
     pub(crate) fn enter() -> Self {
         if cfg!(debug_assertions) {
             bump(&FOREGROUND, 1);
         }
-        Foreground(())
+        Foreground {
+            #[cfg(feature = "sim-hooks")]
+            _sim: pigeonhole_io::sim::WalForeground::enter(),
+        }
     }
 }
 

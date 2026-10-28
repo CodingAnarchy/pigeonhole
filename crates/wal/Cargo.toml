@@ -15,6 +15,12 @@ readme = "README.md"
 pigeonhole-io = { workspace = true }
 pigeonhole-format = { workspace = true }
 
+[features]
+# Marks foreground WAL calls for the simulator's foreground-only scheduled faults
+# (`FaultPlan::fail_on_foreground`, #990). Test builds only: the engine's `test-hooks`
+# enables it.
+sim-hooks = []
+
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
