@@ -319,11 +319,12 @@ fn a_put_a_delete_could_hide_is_not_written_through() {
 }
 
 #[test]
-fn gets_stop_refilling_a_row_written_between_its_reads() {
+fn gets_refill_a_row_written_between_its_reads_at_most_every_other_get() {
     // D290's get-fill safeguard: a row that changes between its reads by writes the
     // write-through can't follow (here a new column each time) would otherwise be read whole
-    // and stored again by every other get. Once its cached copy goes stale unread, gets
-    // stop refilling it; reads stay correct.
+    // and stored again by every get. A get that finds its cached copy stale and unread skips
+    // the fill and drops the copy; the next miss fills under the ghost rule. Reads stay
+    // correct throughout.
     let vfs = SimVfs::new(413);
     let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
     let t = table(&db);
@@ -338,12 +339,46 @@ fn gets_stop_refilling_a_row_written_between_its_reads() {
             .commit()
             .unwrap();
         assert_eq!(get().unwrap(), b"1");
-        assert_eq!(get().unwrap(), b"1");
     }
+    // Without the skip every one of the ten gets refills (11 in all).
     assert_eq!(
         db.row_cache_stats().fills,
-        1,
-        "a row whose cached copy went stale unread is not stored again"
+        6,
+        "one fill for every other get of a row written between its reads"
+    );
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_row_refilled_and_written_before_a_hit_is_cached_again() {
+    // simp724's review of aca874d4 (seed 416): a fill is not a read, so a copy refilled and
+    // then written before any hit is stale and unread for good, and a skip that kept it
+    // refused every later fill: the row stayed uncached until evicted. With the skip
+    // one-shot, the gets after it fill and hit again.
+    let vfs = SimVfs::new(416);
+    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let t = table(&db);
+    let get = || t.get(b"r", "g", b"a").unwrap().map(|c| c.value().to_vec());
+    t.mutate(b"r").put("g", b"a", b"1").commit().unwrap();
+    for _ in 0..3 {
+        assert_eq!(get().unwrap(), b"1"); // fill, then a hit: read
+    }
+    t.mutate(b"r").put("g", b"q1", b"x").commit().unwrap(); // refused; stale but read
+    assert_eq!(get().unwrap(), b"1"); // refills, unread
+    t.mutate(b"r").put("g", b"q2", b"x").commit().unwrap(); // refused before any hit
+    let s = db.row_cache_stats();
+    for _ in 0..5 {
+        assert_eq!(get().unwrap(), b"1");
+    }
+    let now = db.row_cache_stats();
+    assert!(
+        now.fills > s.fills,
+        "the row is stored again: {s:?} -> {now:?}"
+    );
+    assert!(
+        now.hits > s.hits,
+        "and served from the cache again: {s:?} -> {now:?}"
     );
     drop(t);
     db.close().unwrap();

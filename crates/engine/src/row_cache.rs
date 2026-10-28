@@ -747,14 +747,22 @@ pub(crate) fn get_through(
         Lookup::Miss => {}
     }
     let meta = view.catalog.family(family)?;
-    // Not a family the write-through can follow by its operator, nor a row whose last
-    // cached copy went stale unread: such a row is written between its reads (by commits the
-    // write-through can't follow), and refilling it on every get read the whole family row
-    // each time for nothing.
-    if meta.merge != crate::catalog::MergeKind::None
-        || rc.cache.stale_unused(u64::from(family.0), row, key.epoch)
-        || !rc.admit(family, key)
-    {
+    if meta.merge != crate::catalog::MergeKind::None {
+        return None;
+    }
+    // A row whose last cached copy went stale unread is written between its reads (by
+    // commits the write-through can't follow): refilling it on every get read the whole
+    // family row each time for nothing. The skip is one-shot (simp724's review): the stale
+    // copy goes with it, so the next miss fills under the ghost rule. Otherwise a copy
+    // refilled and then written before any hit would refuse every later fill, leaving a hot
+    // row uncached until evicted (a fill is not a read). Such a row then fills at most every
+    // other get.
+    let cache_family = u64::from(family.0);
+    if rc.cache.stale_unused(cache_family, row, key.epoch) {
+        rc.cache.invalidate(cache_family, row);
+        return None;
+    }
+    if !rc.admit(family, key) {
         return None;
     }
     let mut sink = RowData::default();
