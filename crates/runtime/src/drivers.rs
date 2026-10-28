@@ -76,6 +76,8 @@ const GROW_WAIT: f64 = 0.15;
 /// A window longer than this ran while every driver that could tick it was parked (an idle
 /// store): it is dropped, not averaged in, so its diluted busy can't read as a light load.
 const IDLE_WINDOW: Duration = Duration::from_millis(200);
+/// Windows a trace keeps before its reader drains them ([`Drivers::trace`]): an hour's.
+const TRACE_WINDOWS: usize = 36_000;
 
 /// One driver's counters, read by the controller (Relaxed: windowed estimates).
 #[derive(Default)]
@@ -95,6 +97,19 @@ pub(crate) struct DriverStats {
     /// Shards it holds that belong to another driver at the current target (not yet moved:
     /// its ring was never quiet).
     misplaced: AtomicUsize,
+}
+
+impl DriverStats {
+    /// Busy, passes, slow, ops and sibling wait, as the controller reads them.
+    fn counts(&self) -> [u64; 5] {
+        [
+            self.busy.load(Ordering::Relaxed),
+            self.passes.load(Ordering::Relaxed),
+            self.slow.load(Ordering::Relaxed),
+            self.ops.load(Ordering::Relaxed),
+            self.sibling_wait.load(Ordering::Relaxed),
+        ]
+    }
 }
 
 struct Handoff<H: ShardHandler> {
@@ -135,6 +150,9 @@ pub(crate) struct Drivers<H: ShardHandler> {
     /// per pass decides whether to try the controller's lock.
     window_at: AtomicU64,
     epoch: Instant,
+    /// A trace was asked for ([`Drivers::trace`], #1015): the controller runs, deciding
+    /// without resizing unless `adaptive`, and logs every window.
+    tracing: AtomicBool,
     vfs: VfsRef,
     submitters: Arc<[Submitter<H::Msg>]>,
 }
@@ -169,6 +187,7 @@ impl<H: ShardHandler> Drivers<H> {
             controller: Mutex::new(controller),
             window_at: AtomicU64::new(0),
             epoch: Instant::now(),
+            tracing: AtomicBool::new(false),
             vfs,
             submitters,
         }
@@ -268,6 +287,25 @@ impl<H: ShardHandler> Drivers<H> {
         self.moves.load(Ordering::Relaxed)
     }
 
+    /// The controller's windows since the last call, one JSON object each (#1015). The
+    /// first call starts the log, and without the load controller starts an observe-only
+    /// one: it reads the same windows and logs what it would decide, but never resizes. For
+    /// benchmarks: not an API.
+    pub(crate) fn trace(&self) -> Vec<String> {
+        let wakes = self.wakes();
+        let mut c = lock(&self.controller);
+        let c = c.get_or_insert_with(|| {
+            let mut c = Controller::new(self.slots.len(), wakes);
+            for (last, slot) in c.last.iter_mut().zip(self.slots.iter()) {
+                *last = slot.stats.counts();
+            }
+            c
+        });
+        let out = c.log.get_or_insert_with(VecDeque::new).drain(..).collect();
+        self.tracing.store(true, Ordering::Relaxed);
+        out
+    }
+
     /// Producer wakes of every shard so far (the sum of their `(parks, wakes)` second half).
     fn wakes(&self) -> u64 {
         self.submitters.iter().map(|s| s.idle_counts().1).sum()
@@ -320,6 +358,9 @@ struct Controller {
     /// shrink, its regret and the doubling back would repeat, damped only by the shrink
     /// windows.
     floor: Option<(usize, f64)>,
+    /// The trace's windows not yet read ([`Drivers::trace`]), and how many it has logged.
+    log: Option<VecDeque<String>>,
+    logged: u64,
 }
 
 impl Controller {
@@ -335,6 +376,8 @@ impl Controller {
             last_shrink: None,
             regret: None,
             floor: None,
+            log: None,
+            logged: 0,
         }
     }
 
@@ -349,17 +392,14 @@ impl Controller {
         let window_nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX).max(1) as f64;
         let (mut max_busy, mut sum_busy, mut slow, mut ops) = (0f64, 0f64, 0f64, 0u64);
         let (mut wait_nanos, mut busy_nanos) = (0u64, 0u64);
+        let mut deltas = Vec::new();
         for (d, slot) in drivers.slots.iter().enumerate() {
-            let s = &slot.stats;
-            let now_counts = [
-                s.busy.load(Ordering::Relaxed),
-                s.passes.load(Ordering::Relaxed),
-                s.slow.load(Ordering::Relaxed),
-                s.ops.load(Ordering::Relaxed),
-                s.sibling_wait.load(Ordering::Relaxed),
-            ];
+            let now_counts = slot.stats.counts();
             let last = std::mem::replace(&mut self.last[d], now_counts);
             let delta = |i: usize| now_counts[i].saturating_sub(last[i]);
+            if self.log.is_some() {
+                deltas.push(std::array::from_fn::<u64, 5, _>(delta));
+            }
             ops += delta(3);
             if d < k {
                 let busy = delta(0) as f64 / window_nanos;
@@ -377,6 +417,7 @@ impl Controller {
         if elapsed > IDLE_WINDOW {
             // Every driver parked through most of it: the counters above are the new
             // baseline, and the window isn't one.
+            self.log_window(drivers, elapsed, k, &deltas, wakes, None, false);
             return;
         }
         self.windows.push_back(Window {
@@ -391,10 +432,21 @@ impl Controller {
         while self.windows.len() > MAX_SHRINK_WINDOWS {
             self.windows.pop_front();
         }
-        if drivers.forced.load(Ordering::Acquire) != 0 || now < self.hold_until {
+        let held = drivers.forced.load(Ordering::Acquire) != 0 || now < self.hold_until;
+        let decision = if held && self.log.is_none() {
+            None
+        } else {
+            self.decide(k, drivers.slots.len())
+        };
+        let apply = drivers.adaptive && !held;
+        if self.log.is_some() {
+            let logged = decision.map(|d| (d, apply));
+            self.log_window(drivers, elapsed, k, &deltas, wakes, logged, true);
+        }
+        if !apply {
             return;
         }
-        if let Some((next, why)) = self.decide(k, drivers.slots.len()) {
+        if let Some((next, why)) = decision {
             if why == Why::Regret
                 && let Some((_, before_ops)) = self.regret
             {
@@ -431,6 +483,55 @@ impl Controller {
         } else if self.windows.len() >= GROW_WINDOWS {
             // The shrink held its throughput for a second: it stands.
             self.regret = None;
+        }
+    }
+
+    /// Logs one window: each driver's busy, passes, slow passes, ops and sibling wait over
+    /// it, the producer wakes, and what the controller decided and whether it resized.
+    #[allow(clippy::too_many_arguments)]
+    fn log_window<H: ShardHandler>(
+        &mut self,
+        drivers: &Drivers<H>,
+        elapsed: Duration,
+        k: usize,
+        deltas: &[[u64; 5]],
+        wakes: u64,
+        decision: Option<((usize, Why), bool)>,
+        counted: bool,
+    ) {
+        let Some(log) = self.log.as_mut() else {
+            return;
+        };
+        let column = |i: usize| {
+            let v: Vec<String> = deltas.iter().map(|d| d[i].to_string()).collect();
+            v.join(",")
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        let decided = match decision {
+            None => "null".to_owned(),
+            Some(((to, why), applied)) => {
+                format!(r#"{{"to":{to},"why":"{why:?}","applied":{applied}}}"#)
+            }
+        };
+        log.push_back(format!(
+            r#"{{"seq":{},"at_us":{at},"window_us":{},"k":{k},"ceiling":{},"adaptive":{},"forced":{},"counted":{counted},"busy_ns":[{}],"passes":[{}],"slow":[{}],"ops":[{}],"wait_ns":[{}],"wakes":{wakes},"floor":{},"decided":{decided}}}"#,
+            self.logged,
+            elapsed.as_micros(),
+            drivers.slots.len(),
+            drivers.adaptive,
+            drivers.forced.load(Ordering::Acquire),
+            column(0),
+            column(1),
+            column(2),
+            column(3),
+            column(4),
+            self.floor.map_or(0, |(f, _)| f),
+        ));
+        self.logged += 1;
+        while log.len() > TRACE_WINDOWS {
+            log.pop_front();
         }
     }
 
@@ -585,7 +686,7 @@ pub(crate) fn driver_main<H: ShardHandler>(
                 stats.slow.fetch_add(1, Ordering::Relaxed);
             }
         }
-        if drivers.adaptive {
+        if drivers.adaptive || drivers.tracing.load(Ordering::Relaxed) {
             drivers.tick();
         }
         // Shards that belong elsewhere at the current target move once this thread's ring
@@ -769,6 +870,8 @@ mod tests {
             last_shrink: None,
             regret: None,
             floor: None,
+            log: None,
+            logged: 0,
         }
     }
 
