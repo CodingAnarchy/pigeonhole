@@ -890,7 +890,7 @@ impl Pigeonhole {
     /// let mut owned = Pigeonhole::open_application_owned_with(dir.join("app.phdb"), options)?;
     /// // Flush and compaction get a thread each; the shards run on yours, as in
     /// // `open_application_owned`.
-    /// let workers = owned.spawn_background_threads();
+    /// let workers = owned.spawn_background_threads()?;
     /// let shards: Vec<_> = owned
     ///     .shards
     ///     .drain(..)
@@ -1605,25 +1605,48 @@ impl AppOwned {
     /// For an application that wants its shards on its own threads but has no use for the
     /// background work's: the workers' threads sleep while there is no flush or compaction.
     ///
-    /// # Panics
-    /// If the operating system refuses to start a thread.
-    pub fn spawn_background_threads(&mut self) -> Vec<std::thread::JoinHandle<()>> {
-        self.workers
-            .drain(..)
-            .enumerate()
-            .map(|(i, mut worker)| {
-                std::thread::Builder::new()
-                    .name(format!("pigeonhole-worker-{i}"))
-                    .spawn(move || {
-                        while !worker.closed() {
-                            while worker.run_once(Duration::from_millis(1)) {}
-                            // Wakes for new work, the next deadline, or the close.
-                            worker.wait(Duration::from_secs(1));
-                        }
-                    })
-                    .expect("spawn a background worker thread")
-            })
-            .collect()
+    /// # Errors
+    /// [`ErrorCode::Io`](crate::ErrorCode::Io) when the operating system refuses a thread
+    /// (a thread limit, a container's pids cap). The workers that got no thread are back in
+    /// [`workers`](Self::workers), to drive yourself or drop; those already started keep
+    /// running, and their handles are lost with the error, so join nothing: they end at the
+    /// close.
+    pub fn spawn_background_threads(&mut self) -> Result<Vec<std::thread::JoinHandle<()>>> {
+        let mut handles = Vec::with_capacity(self.workers.len());
+        let mut workers = std::mem::take(&mut self.workers).into_iter().enumerate();
+        while let Some((i, worker)) = workers.next() {
+            // The worker reaches its thread only once the thread exists: a refused spawn
+            // leaves it here to hand back.
+            let (tx, rx) = std::sync::mpsc::channel::<BackgroundWorker>();
+            let spawned = std::thread::Builder::new()
+                .name(format!("pigeonhole-worker-{i}"))
+                .spawn(move || {
+                    let Ok(mut worker) = rx.recv() else {
+                        return;
+                    };
+                    while !worker.closed() {
+                        while worker.run_once(Duration::from_millis(1)) {}
+                        // Wakes for new work, the next deadline, or the close.
+                        worker.wait(Duration::from_secs(1));
+                    }
+                });
+            match spawned {
+                Ok(handle) => {
+                    // The thread holds `rx` until it receives.
+                    let _ = tx.send(worker);
+                    handles.push(handle);
+                }
+                Err(e) => {
+                    self.workers.push(worker);
+                    self.workers.extend(workers.map(|(_, w)| w));
+                    return Err(Error::new(
+                        crate::ErrorCode::Io,
+                        format!("could not start background worker thread {i}: {e}"),
+                    ));
+                }
+            }
+        }
+        Ok(handles)
     }
 }
 

@@ -26,7 +26,8 @@ All additions; nothing is removed or renamed.
   - `Metrics::compactions_reclaimed: u64` and `Metrics::background_take_backs: (u64, u64)`.
 - **`pigeonhole`** (PR 2, the shape agreed on #816 in comment 6424076592):
   - `Pigeonhole::open_application_owned_with(path, Options) -> Result<AppOwned>`. `#[non_exhaustive] AppOwned { db: Pigeonhole, shards: Vec<Shard>, workers: Vec<BackgroundWorker> }`. `open_application_owned`'s tuple form stays, refuses a nonzero worker count (`InvalidArgument`), and its docs point to the new one.
-  - `AppOwned::spawn_background_threads(&mut self) -> Vec<JoinHandle<()>>`: opt-in, one std thread per worker (`pigeonhole-worker-<i>`), each driving its worker until the close finishes.
+  - `AppOwned::spawn_background_threads(&mut self) -> Result<Vec<JoinHandle<()>>>`: opt-in, one std thread per worker (`pigeonhole-worker-<i>`), each driving its worker until the close finishes.
+    - A refused thread (a thread limit, a container's pids cap) is `ErrorCode::Io`, not a panic. The workers that got no thread go back to `AppOwned::workers` for the caller to drive or drop (perf287's review of #1010).
   - `BackgroundWorker`: `run_once(budget: Duration) -> bool`, `next_wakeup() -> Option<Duration>`, `wait(timeout)`, `waker() -> Waker`, `set_wakeup(Box<dyn Fn() + Send + Sync>)`, `closed() -> bool`, the `Duration` forms of the engine's, as `Shard`'s are.
   - `Options::background_workers(n)`, default 0. Application-owned opens only; engine-owned `open` ignores it (`compaction_cores` instead).
   - `EngineMetrics::compactions_reclaimed`, `background_fallback_take_backs` and `background_room_take_backs` (the engine's `background_take_backs` pair, named).

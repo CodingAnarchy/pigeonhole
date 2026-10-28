@@ -565,6 +565,12 @@ impl PoolDriver {
         // (found by D284 PR 2's hand-driven worker test).
         let signal = self.signal();
         signal.prepare_sleep();
+        // As `worker_main` and `wait` re-check: a close landing between the check above and
+        // the announce returns `false` here, whatever the application's wake does with a
+        // `force_wake` that came before its wait (perf287's review of #1010).
+        if self.pool.closed() {
+            return false;
+        }
         if self.pool.queued.load(Ordering::Acquire) > 0 || signal.task_woken() {
             signal.awake();
             return true;
@@ -903,7 +909,10 @@ mod loom_tests {
                 producer.join().unwrap();
                 driver.run_once(0);
             } else {
+                // `true` says work remains: either the turn ran the task, or the sleep
+                // handshake's re-check found it queued, and the next call runs it.
                 producer.join().unwrap();
+                driver.run_once(0);
             }
             assert!(runs.load(Ordering::SeqCst) >= 1);
             pool.close_and_reclaim();

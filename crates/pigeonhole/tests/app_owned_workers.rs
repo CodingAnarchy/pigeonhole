@@ -72,7 +72,7 @@ fn flushes_run_on_spawned_worker_threads_and_the_close_ends_them() {
         Pigeonhole::open_application_owned_with(dir.0.join("db.phdb"), options).unwrap();
     assert_eq!(owned.shards.len(), 2);
     assert_eq!(owned.workers.len(), 2);
-    let workers = owned.spawn_background_threads();
+    let workers = owned.spawn_background_threads().unwrap();
     assert!(owned.workers.is_empty(), "the threads took the workers");
     let shards: Vec<_> = owned.shards.drain(..).map(drive).collect();
     let db = owned.db;
@@ -165,10 +165,18 @@ fn a_worker_driven_by_hand_runs_until_the_close() {
     let mut owned =
         Pigeonhole::open_application_owned_with(dir.0.join("db.phdb"), options).unwrap();
     let mut worker = owned.workers.pop().unwrap();
+    // The commit below waits until the driver has its wakeup set and made a pass: work
+    // queued before that wakes nobody, and on a loaded runner the thread can start more
+    // than the 10 ms after which the shards take queued work back (Windows CI on #1010).
+    let (ready_tx, ready) = std::sync::mpsc::channel();
     let driver = thread::spawn(move || {
         let me = thread::current();
         worker.set_wakeup(Box::new(move || me.unpark()));
         let mut turns = 0u64;
+        while worker.run_once(Duration::from_millis(1)) {
+            turns += 1;
+        }
+        ready_tx.send(()).unwrap();
         while !worker.closed() {
             while worker.run_once(Duration::from_millis(1)) {
                 turns += 1;
@@ -180,6 +188,7 @@ fn a_worker_driven_by_hand_runs_until_the_close() {
         }
         turns
     });
+    ready.recv().unwrap();
     let shards: Vec<_> = owned.shards.drain(..).map(drive).collect();
     let db = owned.db;
     let t = db

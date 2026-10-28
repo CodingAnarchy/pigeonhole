@@ -776,7 +776,7 @@ impl PigeonholeRunner {
                 options(&self.settings),
             )
             .map_err(err)?;
-            let workers = owned.spawn_background_threads();
+            let workers = owned.spawn_background_threads().map_err(err)?;
             let shards = std::mem::take(&mut owned.shards)
                 .into_iter()
                 .map(|s| Driver::Owned(Box::new(s)))

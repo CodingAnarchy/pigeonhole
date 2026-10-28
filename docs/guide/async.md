@@ -190,7 +190,7 @@ By default, flush and compaction run on the shards you drive, in the slices of s
 let options = Options::default().shards(4).background_workers(1);
 let mut owned = Pigeonhole::open_application_owned_with(dir.join("bg.phdb"), options)?;
 // Either drive each worker yourself (below), or give each a thread:
-let worker_threads = owned.spawn_background_threads();
+let worker_threads = owned.spawn_background_threads()?;
 # // The close needs the shards driven: give each a thread (the loop of step 4, simplified).
 # let shards: Vec<_> = owned.shards.drain(..).map(|mut shard| thread::spawn(move || {
 #     while shard.closed().is_none() {
@@ -210,7 +210,7 @@ for t in worker_threads {
 
 - **Driving a worker yourself:** the same loop as a shard's. Call `BackgroundWorker::run_once(budget)` until it returns `false`, then wait (`wait(timeout)`, or `set_wakeup` plus `next_wakeup` in your own event loop). `closed()` turns `true` once the database's close has taken the worker's tasks back; then drop it.
 - **Any thread may drive one,** including a thread that drives shards, and a worker may move between threads with no `release()`: its I/O completes inside `run_once`, synchronously, so it never leaves any in a thread's ring.
-- **How many:** one per four shards (the engine-owned default for `compaction_cores`) is a good start. A worker takes flushes ahead of compactions, and at most two tasks at a time, leaving the rest to the other workers.
+- **How many:** a quarter of the shards is a good start. A worker takes flushes ahead of compactions, and at most two tasks at a time, leaving the rest to the other workers.
 - **The close never waits for you to drive a worker.** It takes back what the workers hold: a flush finishes on its shard; a compaction is dropped and runs again after the next open. It waits only for a slice a worker is running at that moment.
 - **A worker you stop driving** delays its tasks until the shards take them back: 10 ms after any worker last looked at the queue, or 2 ms into a commit's wait for memtable room. `EngineMetrics::background_fallback_take_backs` and `background_room_take_backs` count these; both stay 0 while the workers are driven.
 - `open_application_owned` (the tuple form) hands no workers out, so it refuses `background_workers(n)` with `n > 0` (`InvalidArgument`). Engine-owned `open` ignores the option: it starts `compaction_cores` threads of its own.

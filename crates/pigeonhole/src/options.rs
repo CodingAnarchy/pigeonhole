@@ -367,8 +367,9 @@ impl Options {
     ///
     /// - **Why:** with none (the default `0`), flush and compaction run on the shards, in
     ///   slices of up to half a millisecond that hold up the commits queued behind them.
-    /// - **How many:** one per four shards is the engine-owned default
-    ///   ([`compaction_cores`](Options::compaction_cores)) and a good start.
+    /// - **How many:** a quarter of the shards is a good start. The engine-owned count
+    ///   ([`compaction_cores`](Options::compaction_cores)) has its own default, which may
+    ///   differ.
     /// - [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
     ///   fails with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when
     ///   `n > 0`, since it hands no workers out. Engine-owned opens ignore it: they start
