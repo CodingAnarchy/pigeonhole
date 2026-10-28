@@ -33,6 +33,7 @@ cargo run -p pigeonhole-bench --release -- compare a.json b.json
 | `--max-secs S` | The longest measured phase (D247): past it no client (or inline shard thread) starts another operation, the run reports what it measured, and the record's `capped` says it hit the bound. The warmup is bounded by its own cap. Without it the configured operations, and `--min-secs`, decide |
 | `--inline-ops N` | `group-commit`: the D213 run's commits, apart from the client runs' `--ops` (D219; the gate judges it on 2M) |
 | `--in-flight N` | Inline runs: commits each shard's thread keeps in flight (default 16, the judged shape). Fewer trade throughput for latency: the gate reports 4 and 8 beside the judged 16 (D226), and a run at another count prints "reported, not judged" |
+| `--offered-rate R` (client runs) | Offer the measured operations at about R per second in all (the placement check uses the same flag for its open-loop writes), each client paced to R / clients (the warmup is not paced). Latency is then the store's service time at that offered load rather than at its maximum: #759 reports read p99 both at each store's maximum and with Pigeonhole paced to SQLite's rate. The JSON record carries `detail.offered_rate` |
 | `--write-buffer B`, `--cache B` | Every engine's memory budget (default 64 MiB write buffer, 256 MiB read cache; see below) |
 | `--cache-model per-store\|total` | How `--cache` maps onto stores whose read memory is not one shared cache (default `per-store`, as before #759; see below) |
 | `--shards N` | Pigeonhole shards |

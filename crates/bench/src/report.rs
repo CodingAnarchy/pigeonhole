@@ -450,6 +450,11 @@ pub struct RunDetail {
     /// written before it.
     #[serde(default)]
     pub capped: Option<bool>,
+    /// The measured phase's offered rate in operations per second
+    /// (`RunOptions::offered_rate`, #759); `None` for an unpaced run and in results written
+    /// before it.
+    #[serde(default)]
+    pub offered_rate: Option<f64>,
     /// Milliseconds the store took to close after the measured phase (D247: the flush and
     /// drain of a store that was just under load); `None` in results written before it.
     #[serde(default)]

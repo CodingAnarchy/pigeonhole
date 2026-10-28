@@ -90,8 +90,11 @@ OPTIONS:
     --max-secs S           the longest measured phase: past it no client starts another
                            operation, and the record says it was capped (D247)
                            [default: none]
-    --offered-rate R       placement: writes per second offered over every client
-                           [default: 30,000 per shard]
+    --offered-rate R       operations per second offered over every client. placement:
+                           its open-loop writes [default: 30,000 per shard]. Client runs:
+                           the measured operations, each client paced to R / clients (the
+                           warmup is not), so latency is service time at that load instead
+                           of at the store's maximum (#759) [default: unpaced]
     --inline-ops N         group-commit: the D213 run's commits (D219) [default: --ops]
     --in-flight N          inline runs: commits each shard's thread keeps in flight
                            [default: 16, the judged shape]; fewer trade throughput for
@@ -524,6 +527,7 @@ fn one_inline(
         in_flight: a.in_flight.unwrap_or(INLINE_IN_FLIGHT),
         pin,
         max_measured: max_measured(a),
+        offered_rate: None,
     };
     let result = runner
         .run_inline(config, &dir, &options)
@@ -556,6 +560,7 @@ fn one(
         }),
         min_measured: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(0.0).max(0.0)),
         max_measured: max_measured(a),
+        offered_rate: a.offered_rate,
         ..RunOptions::default()
     };
     let result = run_detailed(runner, config, &dir, &options)
@@ -805,6 +810,11 @@ mod tests {
         let c = config(&a, WorkloadKind::YcsbA).unwrap();
         assert_eq!((c.records, c.operations), (10, 20));
         assert!(a.sync);
+        assert_eq!(a.offered_rate, None);
+        assert_eq!(
+            args("ycsb-f --offered-rate 38500").offered_rate,
+            Some(38500.0)
+        );
         assert!(!a.no_tablet_changes);
         assert!(!args("scaling --tablet-changes").no_tablet_changes);
         assert!(args("scaling --no-tablet-changes").no_tablet_changes);
