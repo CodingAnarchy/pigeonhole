@@ -59,6 +59,7 @@ pub struct Options {
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
     shard_threads: usize,
+    background_workers: usize,
     auto_recover: Recovery,
 }
 
@@ -127,6 +128,7 @@ impl Default for Options {
             commit_spin: None,
             shard_spin: None,
             shard_threads: 0,
+            background_workers: 0,
             auto_recover: Recovery::Off,
         }
     }
@@ -355,6 +357,32 @@ impl Options {
     /// ```
     pub fn shard_threads(mut self, k: usize) -> Self {
         self.shard_threads = k;
+        self
+    }
+
+    /// Application-owned mode only: `n` background workers for flush and compaction (D284),
+    /// handed out by
+    /// [`Pigeonhole::open_application_owned_with`](crate::Pigeonhole::open_application_owned_with)
+    /// for you to drive from threads you choose, as you drive the shards.
+    ///
+    /// - **Why:** with none (the default `0`), flush and compaction run on the shards, in
+    ///   slices of up to half a millisecond that hold up the commits queued behind them.
+    /// - **How many:** a quarter of the shards is a good start. The engine-owned count
+    ///   ([`compaction_cores`](Options::compaction_cores)) has its own default, which may
+    ///   differ.
+    /// - [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
+    ///   fails with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when
+    ///   `n > 0`, since it hands no workers out. Engine-owned opens ignore it: they start
+    ///   [`compaction_cores`](Options::compaction_cores) threads of their own.
+    ///
+    /// ```
+    /// use pigeonhole::Options;
+    ///
+    /// let options = Options::default().shards(16).background_workers(4);
+    /// # let _ = options;
+    /// ```
+    pub fn background_workers(mut self, n: usize) -> Self {
+        self.background_workers = n;
         self
     }
 
@@ -927,6 +955,9 @@ impl Options {
         };
         o.pin_threads = self.pin_threads;
         o.shard_threads = self.shard_threads;
+        if application_owned {
+            o.background_workers = self.background_workers;
+        }
         o.durability = self.durability.engine();
         o.memtable_budget = self.memtable_budget;
         o.memtable_freeze_bytes = self.memtable_budget / 4;

@@ -549,7 +549,33 @@ impl PoolDriver {
     /// remains (call again soon); with `false`, wait for the wakeup or
     /// [`next_deadline`](Self::next_deadline). Returns `false` once the pool is closed.
     pub fn run_once(&mut self, deadline_nanos: u64) -> bool {
-        self.turn(deadline_nanos, !self.pool.builtin)
+        if self.turn(deadline_nanos, !self.pool.builtin) {
+            return true;
+        }
+        // A closed pool runs nothing: `false` for good, whatever its queue count says.
+        if self.pool.closed() {
+            return false;
+        }
+        // As a shard's turn ends (`check_before_sleep`), and as `worker_main` does after its
+        // turns: announce sleep, then look again. A task queued or woken from here on finds
+        // the worker asleep and wakes its target, the `set_wakeup` callback, so an
+        // application that sleeps on its own terms after a `false` hears of new work as it
+        // does for a shard. Before, only `wait` announced sleep, and a worker parked in the
+        // application's own loop slept through new tasks until the shards took them back
+        // (found by D284 PR 2's hand-driven worker test).
+        let signal = self.signal();
+        signal.prepare_sleep();
+        // As `worker_main` and `wait` re-check: a close landing between the check above and
+        // the announce returns `false` here, whatever the application's wake does with a
+        // `force_wake` that came before its wait (perf287's review of #1010).
+        if self.pool.closed() {
+            return false;
+        }
+        if self.pool.queued.load(Ordering::Acquire) > 0 || signal.task_woken() {
+            signal.awake();
+            return true;
+        }
+        false
     }
 
     fn turn(&mut self, deadline: u64, inline: bool) -> bool {
@@ -883,7 +909,10 @@ mod loom_tests {
                 producer.join().unwrap();
                 driver.run_once(0);
             } else {
+                // `true` says work remains: either the turn ran the task, or the sleep
+                // handshake's re-check found it queued, and the next call runs it.
                 producer.join().unwrap();
+                driver.run_once(0);
             }
             assert!(runs.load(Ordering::SeqCst) >= 1);
             pool.close_and_reclaim();

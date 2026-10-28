@@ -147,7 +147,7 @@ pub use check::{
     CheckCounts, CheckOptions, CheckReport, Finding, Region, RegionKind, Severity, Structure,
     WalFile, check,
 };
-pub use db::{Pigeonhole, PigeonholeReader, Shard, Snapshot};
+pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
 pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FileFeatures, LevelInfo, TableInfo,

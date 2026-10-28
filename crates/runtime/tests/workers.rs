@@ -391,6 +391,36 @@ fn a_worker_waits_until_work_arrives() {
 }
 
 #[test]
+fn a_worker_idle_after_run_once_is_woken_by_new_work_without_wait() {
+    // An application that sleeps on its own terms (its own park or poll, not `wait`) after
+    // `run_once` returns `false` hears of new work through the `set_wakeup` callback, as it
+    // does for a shard (D284 PR 2's hand-driven worker test found it slept through it).
+    let (_vfs, mut owned) = open(1);
+    let worker = &mut owned.workers[0];
+    let woken = Arc::new(AtomicU32::new(0));
+    {
+        let woken = Arc::clone(&woken);
+        worker.set_wakeup(Box::new(move || {
+            woken.fetch_add(1, Ordering::SeqCst);
+        }));
+    }
+    let at_registration = woken.load(Ordering::SeqCst);
+    assert!(!worker.run_once(u64::MAX));
+    let seen = Arc::new(Seen::default());
+    spawn(&mut owned.shards[0], Steps::new(1, &seen));
+    assert!(
+        woken.load(Ordering::SeqCst) > at_registration,
+        "the spawn called the idle worker's wakeup"
+    );
+    let worker = &mut owned.workers[0];
+    while worker.run_once(u64::MAX) {}
+    assert!(seen.done.load(Ordering::SeqCst));
+    // After the close it stays `false`, whatever was queued.
+    owned.pool.clone().unwrap().close();
+    assert!(!owned.workers[0].run_once(u64::MAX));
+}
+
+#[test]
 fn a_stopped_worker_gives_its_held_tasks_back_without_a_close() {
     // perf287's should-fix on #983: a worker the application stops driving (without dropping
     // it) holds a compaction-like task. Once that worker has made no pass for 100 ms, the
