@@ -803,9 +803,15 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
     /// search nor the landing steps over cells. Returns `false`, with the cursor untouched,
     /// for any other target or for a block written before (a row start that shares a prefix),
     /// so the caller seeks through the restarts.
-    #[inline]
+    ///
+    /// Out of line, and positioning without `apply`: as a second caller it would move `apply`
+    /// out of `load` and `next`, which every step of a scan runs (#1020's callgrind).
+    #[inline(never)]
     fn seek_row_start(&mut self, target: &[u8]) -> crate::Result<bool> {
-        if !matches!(crate::key::row_prefix_len(target), Ok(n) if n == target.len()) {
+        // A point read's seek key ends with its suffix, not a terminator: no scan for it.
+        if !target.ends_with(&crate::key::TERMINATOR)
+            || !matches!(crate::key::row_prefix_len(target), Ok(n) if n == target.len())
+        {
             return Ok(false);
         }
         // A key at a row start is >= the target iff its row is at or after the target's.
@@ -838,7 +844,10 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
         if e.shared != 0 {
             return Ok(false);
         }
-        self.apply(at, e)?;
+        self.key = KeySrc::Block(e.unshared);
+        self.cur = at;
+        self.next = e.value.end;
+        self.value = e.value;
         Ok(true)
     }
 
