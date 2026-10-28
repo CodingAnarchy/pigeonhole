@@ -261,28 +261,36 @@ fn overlaps_range(sst: &OpenSst, start: Option<&[u8]>, end: Option<&[u8]>) -> bo
 /// after two forward blocks past its seek, 2 blocks first and doubling (#712).
 const SCAN_READAHEAD: (u32, bool) = (16, false);
 
-/// The most rows a scan can still return and read without readahead (D293,
-/// #712): a scan whose row limit leaves at most this many does not read ahead. Short scans
-/// end within a few blocks, so a ramp that starts after two of them has no lead: the scan
-/// reaches the block it just asked for while the fetch is still in flight and waits for it
-/// (in ycsb-e, scans of 1-100 rows at 16 clients, those waits were the largest part of the
-/// p99). Its blocks are read as it reaches them instead. 128 covers ycsb-e's longest scan.
+/// The most rows a scan can still return and count as short (D293, #712): a scan whose row
+/// limit leaves at most this many starts its readahead ramp only after
+/// [`SHORT_SCAN_AHEAD_AFTER`] forward blocks instead of two. Short scans end within a few
+/// blocks, so a ramp that starts after two of them has no lead: the scan reaches the block it
+/// just asked for while the fetch is still in flight and waits for it (in ycsb-e, scans of
+/// 1-100 rows at 16 clients, those waits were the largest part of the p99). 128 covers
+/// ycsb-e's longest scan.
 pub(crate) const SHORT_SCAN_ROWS: u64 = 128;
 
-/// Whether a scan that can still return `remaining` rows (0: no limit) reads ahead.
-pub(crate) fn scan_reads_ahead(remaining: u64) -> bool {
-    remaining == 0 || remaining > SHORT_SCAN_ROWS
+/// Forward blocks a short scan's SST cursor reads past its seek before it reads ahead
+/// (D293): 128 rows of 1 KiB fill about 8 blocks of the default 16 KiB, so a scan the limit
+/// really keeps short submits nothing, and one whose rows turn out long in blocks (wide rows,
+/// rows a filter skips, a run of deleted rows) reads ahead again after at most 8 demand reads
+/// per cursor.
+pub(crate) const SHORT_SCAN_AHEAD_AFTER: u32 = 8;
+
+/// Whether a scan that can still return `remaining` rows (0: no limit) is short.
+pub(crate) fn scan_is_short(remaining: u64) -> bool {
+    remaining != 0 && remaining <= SHORT_SCAN_ROWS
 }
 
-/// Read options for a scan or a point read. `readahead` (scans only): whether the scan
-/// reads ahead ([`scan_reads_ahead`]).
-fn read_options(priority: Priority, scan: bool, readahead: bool, cache_only: bool) -> ReadOptions {
+/// Read options for a scan or a point read. `short` (scans only): the scan's limit leaves it
+/// short ([`scan_is_short`]), so its readahead starts later.
+fn read_options(priority: Priority, scan: bool, short: bool, cache_only: bool) -> ReadOptions {
     let mut o = ReadOptions::default();
     o.priority = priority;
     if scan {
         (o.readahead_blocks, o.readahead_merge) = SCAN_READAHEAD;
-        if !readahead {
-            o.readahead_blocks = 0;
+        if short {
+            o.readahead_after = SHORT_SCAN_AHEAD_AFTER;
         }
     } else {
         // A point get or a single-row read stops at its row's end: an SST cursor need not
@@ -304,10 +312,10 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     start: Option<&[u8]>,
     end: Option<&[u8]>,
     priority: Priority,
-    readahead: bool,
+    short: bool,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, true, readahead, CACHE_ONLY);
+    let opts = read_options(priority, true, short, CACHE_ONLY);
     let reader = |sst: &OpenSst| {
         if CACHE_ONLY {
             sst.reader_cache_only(set, priority)
@@ -836,11 +844,11 @@ impl View {
         out: &mut Vec<Source>,
     ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
-        self.scan_sources_located::<CACHE_ONLY>(&l, filter, start, end, true, out)
+        self.scan_sources_located::<CACHE_ONLY>(&l, filter, start, end, false, out)
     }
 
     /// [`View::scan_sources_into`] from a [`View::locate`] the caller already made, its SST
-    /// cursors reading ahead as `readahead` says ([`scan_reads_ahead`]).
+    /// cursors' readahead starting later if the scan is `short` ([`scan_is_short`]).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_sources_located<const CACHE_ONLY: bool>(
         &self,
@@ -848,7 +856,7 @@ impl View {
         filter: &ScanFilter,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
-        readahead: bool,
+        short: bool,
         out: &mut Vec<Source>,
     ) -> Result<()> {
         if let Some(set) = l.mems {
@@ -856,7 +864,7 @@ impl View {
         }
         if let Some(fam) = l.ssts {
             sst_sources_range::<CACHE_ONLY>(
-                fam, &self.ssts, filter, start, end, l.priority, readahead, out,
+                fam, &self.ssts, filter, start, end, l.priority, short, out,
             )?;
         }
         Ok(())
@@ -1114,7 +1122,7 @@ mod level_tests {
                 f.time_range = Some((2, 4));
                 f
             };
-            let opts = read_options(Priority::Normal, true, true, false);
+            let opts = read_options(Priority::Normal, true, false, false);
             let mut lazy = Source::Sst(
                 SstSource::level(files.clone(), Arc::clone(&set), filter.clone(), opts).unwrap(),
             );

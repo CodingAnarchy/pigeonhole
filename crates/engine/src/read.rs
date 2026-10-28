@@ -948,8 +948,10 @@ impl ScanCursor {
             // No row of the scan is in this tablet: it opens with no lanes.
             return Ok(true);
         }
-        // A scan its limit leaves short reads no blocks ahead (#712).
-        let readahead = crate::source::scan_reads_ahead(if self.spec.limit == 0 {
+        // A scan its limit leaves short starts its readahead later (D293). `.max(1)`: a scan
+        // that reached its limit opens no tablet (`advance_row_impl` stops first), so a 0
+        // here would only mean "no limit".
+        let short = crate::source::scan_is_short(if self.spec.limit == 0 {
             0
         } else {
             self.spec.limit.saturating_sub(self.rows_emitted).max(1)
@@ -975,7 +977,7 @@ impl ScanCursor {
                 &filter,
                 start,
                 end,
-                readahead,
+                short,
                 resolver.cursor_mut().sources_mut(),
             );
             if let Err(e) = filled {

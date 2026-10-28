@@ -508,6 +508,10 @@ pub struct ReadOptions {
     /// Never on seeks. With `fill_cache` false the blocks are held by the cursor, not cached,
     /// and a seek drops them.
     pub readahead_blocks: u32,
+    /// Forward blocks a cursor reads past its seek before it reads ahead (2 by default,
+    /// #712): a scan that ends sooner submits no fetch. Raised for a scan expected to be
+    /// short (D293), which then reads ahead only once it proves long.
+    pub readahead_after: u32,
     /// Readahead submits each run of blocks adjacent on disk as one read instead of one read
     /// per block (#402; off by default, measured before it is decided).
     #[doc(hidden)]
@@ -528,6 +532,7 @@ impl Default for ReadOptions {
             fill_cache: true,
             priority: Priority::Normal,
             readahead_blocks: 0,
+            readahead_after: iter::RAMP_AFTER,
             readahead_merge: false,
             cache_only: false,
             one_row: false,
