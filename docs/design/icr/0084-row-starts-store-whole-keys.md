@@ -1,6 +1,6 @@
-# XXXX: row starts store their whole key (#759)
+# 0084: row starts store their whole key (#759)
 
-**Status:** Proposed (blob33, 2026-10-28); number pending from the coordinator. Not approved.
+**Status:** Approved (coordinator, 2026-10-28, with the new frozen golden sibling and the FORMAT.md §4.2 wording). It lands in #1020; perf287 reviews.
 
 ## Change
 
@@ -12,7 +12,7 @@ A writer-side choice within format 4, plus a reader fast path. Nothing is added,
 
 ## Compatibility
 
-No format version or feature bit. Every reader since format 1 takes `shared` as written: a smaller `shared` is a valid encoding of the same key. So 1.x builds before this change read the new blocks, and this build reads the old ones (the frozen `data_block.bin` golden stays and is seek-checked; the new encoding is the frozen sibling `data_block_row_starts.bin`).
+No format version or feature bit. Every reader since format 1 takes `shared` as written: a smaller `shared` is a valid encoding of the same key. So 1.x builds before this change read the new blocks (checked in `tests/block.rs`, `older_readers_decode_row_starts_stored_whole`, and once out of tree against the published 0.3.3 crate), and this build reads the old ones (the frozen `data_block.bin` golden stays and is seek-checked; the new encoding is the frozen sibling `data_block_row_starts.bin`).
 
 ## Why
 
@@ -20,5 +20,5 @@ No format version or feature bit. Every reader since format 1 takes `shared` as 
 
 ## Callers
 
-- **`pigeonhole-format`:** `block.rs` (`BlockBuilder::add`, `BlockIter::seek`, `seek_row_start`); tests `tests/block.rs` (`row_seek_matches_model_across_blocks` against a model and against old-style blocks, `row_seek_in_a_block_that_continues_a_row`), `tests/golden.rs` (`blocks`), `tests/format_literals.rs` (`logical_data_block`).
+- **`pigeonhole-format`:** `block.rs` (`BlockBuilder::add`, `BlockIter::seek`, `seek_row_start`); tests `tests/block.rs` (`row_seek_matches_model_across_blocks` against a model and against old-style blocks, `row_seek_in_a_block_that_continues_a_row`, `older_readers_decode_row_starts_stored_whole`), `tests/golden.rs` (`blocks`), `tests/format_literals.rs` (`logical_data_block`).
 - Every block reader goes through `BlockIter::seek`; no other crate changes.

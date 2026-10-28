@@ -150,6 +150,40 @@ proptest! {
         }
     }
 
+    /// Readers before ICR 0084 decode what this build writes (0.3.x included): a row start
+    /// stored whole is a valid entry to a reader that walks the block as FORMAT §4.2 states,
+    /// rebuilding each key from the one before, and to the restart search, which is how every
+    /// earlier build seeks (its block decoding is unchanged since 0.3.3). Checked once more
+    /// out of tree against the published 0.3.3 crate (#1020).
+    #[test]
+    fn older_readers_decode_row_starts_stored_whole(
+        model in entries(),
+        interval in 1usize..20,
+        cut in any::<prop::sample::Index>(),
+    ) {
+        let keys: Vec<(&Vec<u8>, &Vec<u8>)> = model.iter().collect();
+        let cut = cut.index(keys.len() + 1);
+        let mut b = BlockBuilder::data(interval);
+        for part in [&keys[..cut], &keys[cut..]] {
+            b.reset();
+            for (k, v) in part {
+                b.add(k, v).unwrap();
+            }
+            let bytes = b.finish().to_vec();
+            let want: Vec<(Vec<u8>, Vec<u8>)> =
+                part.iter().map(|(k, v)| ((*k).clone(), (*v).clone())).collect();
+            prop_assert_eq!(&walk_as_format_states(&bytes), &want);
+            // Full keys are not row prefixes, so these seeks take the restart search.
+            let mut it = Block::new(bytes.as_slice()).unwrap().into_cursor();
+            it.seek_to_first().unwrap();
+            prop_assert_eq!(&collect(&mut it), &want);
+            for (i, (k, _)) in part.iter().enumerate() {
+                it.seek(k).unwrap();
+                prop_assert_eq!(collect(&mut it), want[i..].to_vec());
+            }
+        }
+    }
+
     /// A forward seek from any entry lands where a seek does, for every target at or past
     /// the current key, and so does each following forward seek (#29).
     #[test]
@@ -308,6 +342,33 @@ proptest! {
             }
         }
     }
+}
+
+/// Decodes a logical data block entry by entry, as FORMAT §4.2 states it and as every reader
+/// has: each key is the previous key's first `shared` bytes followed by the stored bytes. It
+/// never assumes `shared` is the longest common prefix.
+fn walk_as_format_states(b: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let n = b.len();
+    let s = u32::from_le_bytes(b[n - 4..].try_into().unwrap()) as usize;
+    let r = u32::from_le_bytes(b[n - 8..n - 4].try_into().unwrap()) as usize;
+    let data_end = n - 8 - 4 * (r + s);
+    let (mut pos, mut key, mut out) = (0, Vec::new(), Vec::new());
+    while pos < data_end {
+        let mut field = || {
+            let (v, len) = pigeonhole_format::varint::get_u64(&b[pos..]).unwrap();
+            pos += len;
+            v as usize
+        };
+        let (shared, unshared, value_len) = (field(), field(), field());
+        assert!(shared <= key.len(), "shared past the previous key");
+        key.truncate(shared);
+        key.extend_from_slice(&b[pos..pos + unshared]);
+        pos += unshared;
+        out.push((key.clone(), b[pos..pos + value_len].to_vec()));
+        pos += value_len;
+    }
+    assert_eq!(pos, data_end);
+    out
 }
 
 /// A data block as format 4 wrote it before #759: a row start that is not a restart shares

@@ -329,7 +329,7 @@ impl BlockBuilder {
             self.row_starts.push(offset);
         }
         // Row starts store their whole key too, so a seek to a row binary-searches the
-        // row-start table and lands on its answer without stepping (#759, ICR XXXX).
+        // row-start table and lands on its answer without stepping (#759, ICR 0084).
         let shared = if restart || row_start { 0 } else { lcp };
         crate::varint::put_u64(&mut self.buf, shared as u64);
         crate::varint::put_u64(&mut self.buf, (key.len() - shared) as u64);
@@ -799,7 +799,7 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
     /// Seeks a target that is a whole row prefix (a row read's, a scan bound's) through the
     /// row-start table (#759): the first key at or after it is the first entry of a row at or
     /// after that row, which is either a row start or, for a row continuing from the previous
-    /// block, entry 0. Writers since ICR XXXX store row-start keys whole, so neither the
+    /// block, entry 0. Writers since ICR 0084 store row-start keys whole, so neither the
     /// search nor the landing steps over cells. Returns `false`, with the cursor untouched,
     /// for any other target or for a block written before (a row start that shares a prefix),
     /// so the caller seeks through the restarts.
