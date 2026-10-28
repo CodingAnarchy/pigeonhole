@@ -6,11 +6,11 @@ mod common;
 use std::collections::BTreeMap;
 use std::ops::Bound;
 
-use common::{Cell, cell, config, sized};
+use common::{Cell, cell, config, part, sized};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::block::{Block, BlockBuilder, BlockKind, seal_with_level, verify};
 use pigeonhole_format::compress::{Compression, decompress};
-use pigeonhole_format::key::{decode_key, row_prefix_len};
+use pigeonhole_format::key::{common_prefix_len, decode_key, encode_row_prefix, row_prefix_len};
 use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
 use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
@@ -98,6 +98,53 @@ proptest! {
                     let rest = collect(&mut it);
                     let pos = keys.iter().position(|x| x == n).unwrap();
                     prop_assert_eq!(rest.len(), keys.len() - pos);
+                }
+            }
+        }
+    }
+
+    /// A seek to a row prefix (the row-start search, #759) lands where the model does and
+    /// iterates on from there: in blocks cut at random entries, so rows continue from one
+    /// block into the next, and in the same blocks as format 4 wrote them before row starts
+    /// stored their keys whole (the restart search).
+    #[test]
+    fn row_seek_matches_model_across_blocks(
+        model in entries(),
+        interval in 1usize..20,
+        cuts in vec(any::<prop::sample::Index>(), 0..4),
+        rows in vec(part(), 0..sized(10, 3)),
+    ) {
+        let keys: Vec<(&Vec<u8>, &Vec<u8>)> = model.iter().collect();
+        let mut cut: Vec<usize> = cuts.iter().map(|c| c.index(keys.len() + 1)).collect();
+        cut.extend([0, keys.len()]);
+        cut.sort_unstable();
+        cut.dedup();
+        let mut targets: Vec<Vec<u8>> =
+            model.keys().map(|k| k[..row_prefix_len(k).unwrap()].to_vec()).collect();
+        for r in &rows {
+            let mut t = Vec::new();
+            encode_row_prefix(&mut t, r).unwrap();
+            targets.push(t);
+        }
+        let mut b = BlockBuilder::data(interval);
+        for w in cut.windows(2) {
+            let part = &keys[w[0]..w[1]];
+            b.reset();
+            for (k, v) in part {
+                b.add(k, v).unwrap();
+            }
+            let new = b.finish().to_vec();
+            let prev = w[0].checked_sub(1).map(|i| keys[i].0.as_slice());
+            let old = legacy_data_block(prev, part, interval);
+            let local: BTreeMap<Vec<u8>, Vec<u8>> =
+                part.iter().map(|(k, v)| ((*k).clone(), (*v).clone())).collect();
+            for bytes in [&new, &old] {
+                let mut it = Block::new(bytes.as_slice()).unwrap().into_cursor();
+                for t in &targets {
+                    it.seek(t).unwrap();
+                    let want: Vec<_> =
+                        local.range(t.clone()..).map(|(k, v)| (k.clone(), v.clone())).collect();
+                    prop_assert_eq!(collect(&mut it), want, "target {:?}", t);
                 }
             }
         }
@@ -261,6 +308,42 @@ proptest! {
             }
         }
     }
+}
+
+/// A data block as format 4 wrote it before #759: a row start that is not a restart shares
+/// its prefix with the key before it, `prev` (the previous block's last key) for the first.
+fn legacy_data_block(
+    prev: Option<&[u8]>,
+    entries: &[(&Vec<u8>, &Vec<u8>)],
+    interval: usize,
+) -> Vec<u8> {
+    let row = |k: &[u8]| k[..row_prefix_len(k).unwrap()].to_vec();
+    let (mut buf, mut restarts, mut row_starts) = (Vec::new(), Vec::new(), Vec::new());
+    let mut last = prev.map(<[u8]>::to_vec);
+    for (i, (k, v)) in entries.iter().enumerate() {
+        let off = buf.len() as u32;
+        let shared = if i % interval == 0 {
+            restarts.push(off);
+            0
+        } else {
+            common_prefix_len(k, last.as_deref().unwrap())
+        };
+        if last.as_deref().map(row) != Some(row(k)) {
+            row_starts.push(off);
+        }
+        for n in [shared, k.len() - shared, v.len()] {
+            pigeonhole_format::varint::put_u64(&mut buf, n as u64);
+        }
+        buf.extend_from_slice(&k[shared..]);
+        buf.extend_from_slice(v);
+        last = Some(k.to_vec());
+    }
+    for x in restarts.iter().chain(&row_starts) {
+        buf.extend(x.to_le_bytes());
+    }
+    buf.extend((restarts.len() as u32).to_le_bytes());
+    buf.extend((row_starts.len() as u32).to_le_bytes());
+    buf
 }
 
 fn scan_filter() -> impl Strategy<Value = ScanFilter> {
@@ -495,4 +578,47 @@ fn one_byte_entry_header_past_the_block_is_corrupt() {
         Err(pigeonhole_format::Error::Corrupt { .. })
     ));
     assert!(!it.valid());
+}
+
+#[test]
+fn row_seek_in_a_block_that_continues_a_row() {
+    use pigeonhole_format::key::encode_key;
+    let k = |row: &[u8], q: u8| {
+        let mut k = Vec::new();
+        encode_key(&mut k, row, &[q], 1, 1, pigeonhole_format::Kind::Put).unwrap();
+        k
+    };
+    let p = |row: &[u8]| {
+        let mut t = Vec::new();
+        encode_row_prefix(&mut t, row).unwrap();
+        t
+    };
+    // Row a's first two cells end the previous block; this one starts with its third.
+    let mut b = BlockBuilder::data(16);
+    for q in *b"xy" {
+        b.add(&k(b"a", q), b"").unwrap();
+    }
+    b.reset();
+    for (row, q) in [(&b"a"[..], b'z'), (b"c", b'x'), (b"c", b'y'), (b"e", b'x')] {
+        b.add(&k(row, q), b"").unwrap();
+    }
+    let bytes = b.finish().to_vec();
+    let block = Block::new(bytes.as_slice()).unwrap();
+    assert_eq!(block.row_start_count(), 2);
+    let mut it = block.into_cursor();
+    for (target, want) in [
+        (&b""[..], Some(k(b"a", b'z'))),
+        (b"a", Some(k(b"a", b'z'))),
+        (b"b", Some(k(b"c", b'x'))),
+        (b"c", Some(k(b"c", b'x'))),
+        (b"d", Some(k(b"e", b'x'))),
+        (b"e", Some(k(b"e", b'x'))),
+        (b"f", None),
+    ] {
+        it.seek(&p(target)).unwrap();
+        match want {
+            Some(w) => assert_eq!(it.key(), w.as_slice(), "{target:?}"),
+            None => assert!(!it.valid(), "{target:?}"),
+        }
+    }
 }

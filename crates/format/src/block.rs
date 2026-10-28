@@ -320,15 +320,17 @@ impl BlockBuilder {
         } else {
             Some(crate::key::row_prefix_len(key)?)
         };
-        let shared = if self.entries.is_multiple_of(self.restart_interval) {
+        let restart = self.entries.is_multiple_of(self.restart_interval);
+        if restart {
             self.restarts.push(offset);
-            0
-        } else {
-            lcp
-        };
-        if self.data && !same_row {
+        }
+        let row_start = self.data && !same_row;
+        if row_start {
             self.row_starts.push(offset);
         }
+        // Row starts store their whole key too, so a seek to a row binary-searches the
+        // row-start table and lands on its answer without stepping (#759, ICR XXXX).
+        let shared = if restart || row_start { 0 } else { lcp };
         crate::varint::put_u64(&mut self.buf, shared as u64);
         crate::varint::put_u64(&mut self.buf, (key.len() - shared) as u64);
         crate::varint::put_u64(&mut self.buf, value.len() as u64);
@@ -794,6 +796,52 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
         Ok(&self.block.bytes[e.unshared])
     }
 
+    /// Seeks a target that is a whole row prefix (a row read's, a scan bound's) through the
+    /// row-start table (#759): the first key at or after it is the first entry of a row at or
+    /// after that row, which is either a row start or, for a row continuing from the previous
+    /// block, entry 0. Writers since ICR XXXX store row-start keys whole, so neither the
+    /// search nor the landing steps over cells. Returns `false`, with the cursor untouched,
+    /// for any other target or for a block written before (a row start that shares a prefix),
+    /// so the caller seeks through the restarts.
+    #[inline]
+    fn seek_row_start(&mut self, target: &[u8]) -> crate::Result<bool> {
+        if !matches!(crate::key::row_prefix_len(target), Ok(n) if n == target.len()) {
+            return Ok(false);
+        }
+        // A key at a row start is >= the target iff its row is at or after the target's.
+        let n = self.block.row_start_count;
+        let (mut lo, mut hi) = (0, n);
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let e = self.block.entry(self.block.row_start(mid)?)?;
+            if e.shared != 0 {
+                return Ok(false);
+            }
+            if self.block.bytes[e.unshared] < *target {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        // Entries before the first row start continue the previous block's row; entry 0 is a
+        // restart, its key whole.
+        if lo == 0 && self.block.row_start(0)? != 0 && self.restart_key(0)? >= target {
+            self.load_restart(0)?;
+            return Ok(true);
+        }
+        if lo == n {
+            self.invalidate();
+            return Ok(true);
+        }
+        let at = self.block.row_start(lo)?;
+        let e = self.block.entry(at)?;
+        if e.shared != 0 {
+            return Ok(false);
+        }
+        self.apply(at, e)?;
+        Ok(true)
+    }
+
     /// The first row start after the current entry, if any.
     fn next_row_start(&self) -> crate::Result<Option<usize>> {
         let (mut lo, mut hi) = (0, self.block.row_start_count);
@@ -851,6 +899,12 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
         if self.block.restart_count == 0 {
             self.invalidate();
             return Ok(());
+        }
+        if self.block.row_start_count > 0 {
+            let r = self.seek_row_start(target);
+            if self.or_invalidate(r)? {
+                return Ok(());
+            }
         }
         // Last restart whose key is < target; scanning forward from it finds the answer.
         let (mut lo, mut hi) = (0, self.block.restart_count);

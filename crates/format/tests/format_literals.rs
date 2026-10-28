@@ -131,9 +131,10 @@ fn logical_data_block() {
     want.extend(&k1);
     want.push(b'V');
     let off2 = want.len() as u32;
-    // k1 and k2 share only "a" (k1 continues 00 01, k2 continues 'b').
-    want.extend([1, k2.len() as u8 - 1, 0]);
-    want.extend(&k2[1..]);
+    // k1 and k2 share "a" (k1 continues 00 01, k2 continues 'b'), but k2 starts a row, and a
+    // row start stores its whole key.
+    want.extend([0, k2.len() as u8, 0]);
+    want.extend(&k2);
     for v in [0u32, 0, off2, 1, 2] {
         // restarts [0]; row_starts [0, off2]; R = 1; S = 2
         want.extend(v.to_le_bytes());

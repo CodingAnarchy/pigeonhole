@@ -166,12 +166,54 @@ fn data_block() -> Vec<u8> {
     b.finish().to_vec()
 }
 
+/// Every row prefix of the sample keys, and the rows between and around them.
+fn sample_row_targets() -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    for row in [
+        &b""[..],
+        b"com.example",
+        b"com.example\x00page",
+        b"com.example\x00page\x00",
+        b"com.example\x00pagf",
+        b"com.example/",
+        b"com.example0",
+    ] {
+        let mut t = Vec::new();
+        pigeonhole_format::key::encode_row_prefix(&mut t, row).unwrap();
+        out.push(t);
+    }
+    out
+}
+
+/// Seeks every sample row in `data`, checking each lands on the first sample key at or after
+/// it.
+fn check_row_seeks(data: &[u8]) {
+    use pigeonhole_format::Cursor;
+    let keys = sample_keys();
+    let mut it = Block::new(data).unwrap().into_cursor();
+    for t in sample_row_targets() {
+        it.seek(&t).unwrap();
+        match keys.iter().find(|k| k.as_slice() >= t.as_slice()) {
+            Some(k) => assert_eq!(it.key(), k.as_slice(), "{t:?}"),
+            None => assert!(!it.valid(), "{t:?}"),
+        }
+    }
+}
+
 #[test]
 fn blocks() {
+    // The data block format 4 wrote before row starts stored their keys whole (#759): it
+    // still reads, its row seeks through the restarts.
+    let frozen = golden("data_block.bin");
+    let block = Block::new(frozen.as_slice()).unwrap();
+    assert_eq!((block.restart_count(), block.row_start_count()), (4, 3));
+    check_row_seeks(&frozen);
+
     let data = data_block();
-    check("data_block.bin", &data);
+    check("data_block_row_starts.bin", &data);
     let block = Block::new(data.as_slice()).unwrap();
     assert_eq!((block.restart_count(), block.row_start_count()), (4, 3));
+    check_row_seeks(&data);
 
     let mut index = BlockBuilder::index();
     let mut addr = Vec::new();
@@ -193,7 +235,7 @@ fn blocks() {
     check("index_block.bin", index.finish());
 
     let mut sealed = Vec::new();
-    seal(BlockKind::Data, Compression::None, &data, &mut sealed).unwrap();
+    seal(BlockKind::Data, Compression::None, &frozen, &mut sealed).unwrap();
     check("sealed_block_none.bin", &sealed);
     let mut sealed = Vec::new();
     seal(
