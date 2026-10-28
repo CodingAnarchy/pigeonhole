@@ -257,6 +257,48 @@ fn replay_happens_even_after_a_clean_close() {
     db.close().unwrap();
 }
 
+#[test]
+fn replay_after_drop_table_skips_the_dropped_tables_records() {
+    // Rows of a table dropped after they were logged, and never flushed, are still in the
+    // WAL at a process crash: replay must skip them (their table has no tablet any more),
+    // keep the other table's, and a table created later under the same name starts empty.
+    let vfs = SimVfs::new(6);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    let keep = db
+        .create_table("keep", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let gone = db
+        .create_table("gone", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..20u8 {
+        let mut wb = WriteBatch::new();
+        let row = [b'r', i];
+        put(&mut wb, &keep, "f", &row, b"q", b"kept");
+        put(&mut wb, &gone, "f", &row, b"q", b"dropped");
+        db.commit(wb, Some(Durability::Buffered)).unwrap();
+    }
+    db.drop_table(gone.id).unwrap();
+    vfs.crash(CrashKind::Process);
+    drop(db);
+    let db = Engine::open(Path::new(DB), owned(Arc::clone(&vfs), 2)).unwrap();
+    assert!(db.table("gone").is_none());
+    let keep = db.table("keep").unwrap();
+    for i in 0..20u8 {
+        assert_eq!(
+            get_bytes(&db, &keep, "f", &[b'r', i], b"q").as_deref(),
+            Some(&b"kept"[..])
+        );
+    }
+    let again = db
+        .create_table("gone", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    assert_ne!(again.id, gone.id);
+    for i in 0..20u8 {
+        assert_eq!(get_bytes(&db, &again, "f", &[b'r', i], b"q"), None);
+    }
+    db.close().unwrap();
+}
+
 // ---- #23 / D58 ----
 
 #[test]

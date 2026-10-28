@@ -1212,3 +1212,43 @@ fn a_written_header_whose_sync_is_in_flight_and_the_held_one_after_it_are_both_l
         fails.join("\n")
     );
 }
+
+#[test]
+fn a_rollover_waits_for_the_previous_rollovers_header_sync_and_loses_nothing() {
+    // The engine checks `blocked` before each group, so a segment rarely fills while its
+    // own header still waits for the previous rollover's sync. This appends without that
+    // check and completes no I/O, so the second rollover finds the first's sync in flight:
+    // it waits for it (counted, `rollover_waits`), reaping the device itself, and every
+    // record still replays, in order.
+    let opts = opts(4, 2);
+    let sim = SimVfs::new(9);
+    let vfs: VfsRef = sim.clone();
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, opts).unwrap();
+    wal.spares().prepare(2).unwrap();
+    sim.set_deferred_io(true);
+    let counters = wal.counters();
+    let mut seqno = 0;
+    while counters.rollover_waits() == 0 && seqno < 200 {
+        seqno += 1;
+        wal.append(&batch(seqno, 20_000).record(), Durability::Buffered)
+            .unwrap();
+        wal.write().unwrap();
+    }
+    assert!(
+        counters.rollover_waits() > 0,
+        "no rollover waited in {seqno} appends"
+    );
+    // A few more under the new segment, then everything made durable.
+    for _ in 0..3 {
+        seqno += 1;
+        wal.append(&batch(seqno, 20_000).record(), Durability::Buffered)
+            .unwrap();
+    }
+    let c = wal.submit_sync().unwrap();
+    drive(&sim, || c.is_ready());
+    c.wait().unwrap();
+    drop(wal);
+    sim.set_deferred_io(false);
+    let (r, _) = replay(&vfs, Lsn::default()).unwrap();
+    assert_eq!(r.seqnos(), (1..=seqno).collect::<Vec<_>>());
+}

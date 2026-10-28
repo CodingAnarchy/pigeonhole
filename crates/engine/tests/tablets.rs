@@ -5524,6 +5524,89 @@ fn a_commit_refused_many_times_before_the_timeout_still_commits() {
 }
 
 #[test]
+fn a_commit_refused_again_after_the_write_stall_timeout_gives_up_at_its_decision() {
+    // As the test below, but the commit is retried after its timeout has passed: shard 0
+    // still holds a split of t, the commit waits to retry, the clock passes the write-stall
+    // timeout before any turn, and a change of u's tablet on shard 1 then retries it. Shard
+    // 0 refuses that round again, and the round's decision, taken with the abort, is its
+    // last: the commit fails `Busy` from the decision itself (D241, D249), not from the
+    // retry timer.
+    let mut db = open(2, |o| {
+        o.write_stall_timeout_nanos = 50_000_000;
+        ticking(o);
+    });
+    let u = two_shards_with_a_lost_tablet(&mut db);
+    let t = Arc::clone(&db.table);
+    let mut rows: Vec<Vec<u8>> = (0..20).map(key).collect();
+    rows.sort();
+    let m = db.engine.flush_pending().unwrap();
+    db.drive(m).unwrap();
+    db.engine.hold_compactions(true);
+    let compact = db.engine.compact_pending(Some(t.id)).unwrap();
+    for _ in 0..1_000 {
+        if db.engine.compaction_held() {
+            break;
+        }
+        db.step();
+    }
+    assert!(db.engine.compaction_held());
+    let split = db.engine.split_tablet_pending(t.id, &rows[5]).unwrap();
+    for _ in 0..50 {
+        db.step();
+    }
+    let mut wb = WriteBatch::new();
+    wb.put(
+        u.id,
+        u.families[0].id,
+        b"x",
+        b"q",
+        None,
+        ValueRef::Bytes(b"u"),
+    )
+    .unwrap();
+    wb.put(
+        t.id,
+        t.families[0].id,
+        &rows[1],
+        b"q",
+        None,
+        ValueRef::Bytes(b"t"),
+    )
+    .unwrap();
+    let before = db.engine.metrics().cross_shard;
+    let mut pc = db.engine.submit(wb, Some(Durability::Buffered)).unwrap();
+    for _ in 0..20 {
+        db.step();
+    }
+    assert!(
+        poll_commit(&mut pc).is_none(),
+        "the commit should wait to retry"
+    );
+    let refused = db.engine.metrics().cross_shard.refused_rounds - before.refused_rounds;
+    assert!(refused >= 1, "the first round was not refused");
+    // Just before the timeout, a change on shard 1 retries it; the timeout passes while
+    // that round is out, so the round is decided after it.
+    db.vfs.advance(45_000_000);
+    let m = db.engine.split_tablet_pending(u.id, b"k00").unwrap();
+    let _ = db.drive(m);
+    db.vfs.advance(20_000_000);
+    let r = step_until(&mut db, &mut pc, 1_000_000);
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Busy)), "{r:?}");
+    let after = db.engine.metrics().cross_shard;
+    assert!(
+        after.refused_rounds - before.refused_rounds > refused,
+        "the retry after the timeout was not refused again: {} rounds",
+        after.refused_rounds - before.refused_rounds
+    );
+    // Neither row took the commit's write.
+    assert_eq!(db.get(&rows[1]).map(|(_, v)| v), Some(b"v".to_vec()));
+    db.engine.hold_compactions(false);
+    db.drive(compact).unwrap();
+    db.drive(split).unwrap();
+    close(db);
+}
+
+#[test]
 fn a_commit_refused_while_a_change_waits_fails_busy_after_the_write_stall_timeout() {
     // Shard 0 holds a split of t's left child in its drain (the child's compaction is
     // parked). A cross-shard commit touching that child is refused with `Moved` and waits
@@ -7192,6 +7275,79 @@ fn drain(db: &mut Db, stream: Vec<pigeonhole_engine::PendingCommit>) {
             .expect("resolved")
             .expect("commits");
     }
+}
+
+/// D267: a single waiting on an undecided share is parked by a tablet change of its row
+/// (here a move of `a`'s tablet starting while it waits): it stops ordering the shares
+/// behind it and starts again once the change is done. A, a blind cross-shard commit
+/// coordinated by `high`, stays undecided while only `low` runs; C, a conditional single on
+/// `a` reading it, waits for A; the move then parks C. Both commit, and `a` holds both
+/// writes.
+#[test]
+fn a_waiting_single_parked_by_a_tablet_change_commits_after_it() {
+    let (mut db, low, high) = overlap_db();
+    let (id, f) = (db.table.id, db.table.families[0].id);
+    let a = blind_txn(&db, &[b"z", b"a"], b"from-a");
+    let mut pa = a.submit(Some(Durability::Buffered)).unwrap();
+    turn(&mut db, high);
+    turn(&mut db, low);
+    let before = db.engine.metrics().cross_shard.share_waits;
+    let mut wb = WriteBatch::new();
+    wb.put(id, f, b"a", b"c", None, ValueRef::Bytes(b"from-c"))
+        .unwrap();
+    let absent = pigeonhole_engine::Predicate::Absent {
+        family: f,
+        qualifier: b"p".to_vec(),
+    };
+    let mut pc = db
+        .engine
+        .submit_check_and_mutate(id, b"a", &absent, wb, Some(Durability::Buffered))
+        .unwrap();
+    turn(&mut db, low);
+    assert!(
+        db.engine.metrics().cross_shard.share_waits > before,
+        "C did not wait for A"
+    );
+    // The move of `a`'s tablet to `high` starts on `low` while A is undecided (only `low`
+    // runs): C is parked for it.
+    let m = db
+        .engine
+        .move_tablet_pending(id, b"a", high as u16)
+        .unwrap();
+    for _ in 0..20 {
+        turn(&mut db, low);
+    }
+    let mut cx = Context::from_waker(Waker::noop());
+    assert!(
+        Pin::new(&mut pc).poll(&mut cx).is_pending(),
+        "C resolved while A was undecided"
+    );
+    db.drive(m).unwrap();
+    poll_until(&mut db, &mut pa, 200_000)
+        .expect("A resolved")
+        .expect("A commits");
+    let mut rc = None;
+    for _ in 0..200_000 {
+        if let Poll::Ready(r) = Pin::new(&mut pc).poll(&mut cx) {
+            rc = Some(r);
+            break;
+        }
+        db.step();
+    }
+    let (applied, _) = rc.expect("C resolved").expect("C resolves without error");
+    assert!(applied, "C's predicate held (a:p absent)");
+    let cell = |q: &[u8]| {
+        db.engine
+            .get_latest(id, f, b"a", q)
+            .unwrap()
+            .map(|c| match c.value() {
+                ValueRef::Bytes(b) => b.to_vec(),
+                v => panic!("not bytes: {v:?}"),
+            })
+    };
+    assert_eq!(cell(b"q"), Some(b"from-a".to_vec()));
+    assert_eq!(cell(b"c"), Some(b"from-c".to_vec()));
+    close(db);
 }
 
 /// D271 (perf287's M1): a waiting conditional single C on `a` (it waits for A's undecided
