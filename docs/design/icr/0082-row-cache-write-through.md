@@ -11,6 +11,8 @@
   - It moves the row cached at epoch `from` to `to`, editing its encoding in place under the shard's lock.
   - It keeps the entry's queue position and hit count. A held `RowHandle` keeps the old encoding: the entry is copied first while one is held.
   - `edit` returning `false` drops the entry.
+- **`pigeonhole-cache`:** `RowCache::stale_unused(&self, family: u64, row: &[u8], epoch: u64) -> bool`.
+  - Whether the row is cached at another epoch and was never read there. A get then skips its fill (D290's get-fill safeguard).
 - **`pigeonhole-engine`:** `Engine::row_cache_write_throughs(&self) -> u64`, the entries a commit moved forward since open.
   - It's a method rather than a `RowCacheStats` field, because that struct isn't `#[non_exhaustive]`.
 - **`pigeonhole`:** `RowCacheStats::write_throughs` (the struct is `#[non_exhaustive]`).

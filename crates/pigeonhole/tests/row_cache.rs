@@ -319,6 +319,37 @@ fn a_put_a_delete_could_hide_is_not_written_through() {
 }
 
 #[test]
+fn gets_stop_refilling_a_row_written_between_its_reads() {
+    // D290's get-fill safeguard: a row that changes between its reads by writes the
+    // write-through can't follow (here a new column each time) would otherwise be read whole
+    // and stored again by every other get. Once its cached copy goes stale unread, gets
+    // stop refilling it; reads stay correct.
+    let vfs = SimVfs::new(413);
+    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let t = table(&db);
+    t.mutate(b"r").put("g", b"a", b"1").commit().unwrap();
+    let get = || t.get(b"r", "g", b"a").unwrap().map(|c| c.value().to_vec());
+    assert_eq!(get().unwrap(), b"1");
+    assert_eq!(get().unwrap(), b"1");
+    assert_eq!(db.row_cache_stats().fills, 1, "the second miss fills");
+    for i in 0..10u32 {
+        t.mutate(b"r")
+            .put("g", format!("q{i}").as_bytes(), b"x")
+            .commit()
+            .unwrap();
+        assert_eq!(get().unwrap(), b"1");
+        assert_eq!(get().unwrap(), b"1");
+    }
+    assert_eq!(
+        db.row_cache_stats().fills,
+        1,
+        "a row whose cached copy went stale unread is not stored again"
+    );
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
 fn gets_never_fill_a_counter_family() {
     let vfs = SimVfs::new(412);
     let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
