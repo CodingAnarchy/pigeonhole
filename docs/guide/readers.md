@@ -55,7 +55,7 @@ The writer records, in each memtable entry it links in front of an older version
 A reader process keeps the newest version of small, hot rows in a row cache of its own, as the writer does (D281): latest row reads and point gets of a cached row cost about what they cost in the writer process. Results are identical to uncached reads. The writer raises a per-row write watermark in shared memory for every write, and a reader's cached copy of a row misses as soon as the reader can see a newer write to it.
 
 - **Size:** `ReaderOptions::row_cache(bytes)`, 64 MiB by default, as the writer's; `0` turns it off. **Each reader process has its own:** N reader processes use up to N × 64 MiB by default, plus about 4 MiB each for the cache's per-row tables. `row_cache_max_row` and `row_cache_family` work as on `Options`.
-- **Counts:** `PigeonholeReader::row_cache_stats()`: hits, misses and fills.
+- **Counts:** `PigeonholeReader::row_cache_stats()`: hits, misses and fills (`write_throughs` stays 0: a reader applies no commits).
 - **A new writer empties it:** when the writer restarts, recovers or hands over (a new shared-memory generation), the reader re-attaches with an empty cache and the counts start again.
 - **It needs the writer's row cache on** (`Options::row_cache`, on by default): only then does the writer raise the watermarks. A writer opened with `row_cache(0)` gives its readers no cache (their reads are uncached, and still right).
 - **What bypasses it:** snapshot reads, scans and multi-version reads. Latest reads go through it, sync and async alike.
