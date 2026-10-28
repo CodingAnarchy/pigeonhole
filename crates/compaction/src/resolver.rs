@@ -320,6 +320,10 @@ pub struct CellResolver<C> {
     out_key: Vec<u8>,
     out_val: Vec<u8>,
     past_col: Vec<u8>,
+
+    /// The last counter group read: how many entries it stepped over, and the seqno of its
+    /// newest entry at or below the read point (D291's checkpoint seqno).
+    fold: Option<(u64, Seqno)>,
 }
 
 /// Entries of a skipped column the resolver steps over before it seeks past the column. A
@@ -404,6 +408,7 @@ where
             out_key: Vec::new(),
             out_val: Vec::new(),
             past_col: Vec::new(),
+            fold: None,
         };
         debug_assert!(r.is_fresh());
         r
@@ -611,6 +616,14 @@ where
         Ok(())
     }
 
+    /// The last counter group this resolver read (D291): the entries it stepped over, and
+    /// the seqno of its newest entry at or below the read point. A counter's value at the
+    /// read point is its value at that seqno: the read saw every entry of the column at or
+    /// below the read point, and none lies above that one. `None` before any counter group.
+    pub fn counter_fold(&self) -> Option<(u64, Seqno)> {
+        self.fold
+    }
+
     /// The underlying cursor (to pin the current block for a zero-copy value).
     pub fn cursor(&self) -> &C {
         &self.cursor
@@ -672,6 +685,7 @@ where
             out_key,
             out_val,
             past_col,
+            fold,
         } = self;
         row.clear();
         *family_cover = None;
@@ -705,6 +719,7 @@ where
         out_key.clear();
         out_val.clear();
         past_col.clear();
+        *fold = None;
     }
 
     /// Whether every field but the cursor and options holds its value in
@@ -746,6 +761,7 @@ where
             out_key,
             out_val,
             past_col,
+            fold,
         } = self;
         [
             row, col, run_key, run_acc, g_acc, g_key, base_key, base_val, out_key, out_val,
@@ -772,6 +788,7 @@ where
             && *run_ts == 0
             && run_err.is_none()
             && skip_group.is_none()
+            && fold.is_none()
     }
 
     fn expired(&self, ts: Timestamp) -> bool {
@@ -948,6 +965,14 @@ where
         let mut ops_err: Option<MergeError> = None;
         // Copy the base whenever it will be folded (operands above it), not only when small.
         let fold_ready = self.run;
+        // D291: a counter group read for its newest version alone ends at its base. Below the
+        // base are only older entries: operands it already holds, and deletes that in a
+        // counter family hide only entries older than themselves. Their one other effect,
+        // `col_cover`, matters only to older timestamp groups, which such a read never returns.
+        let stop_at_base = counter && self.opts.versions == 1 && self.opts.time_range.is_none();
+        let mut stop = false;
+        let mut steps = 0u64;
+        let mut top = None;
         // The first entry is in the column (the caller checked); the loop stops on the first
         // that is not, and leaves what it found for the next step.
         let mut first = Some((seqno, kind));
@@ -980,7 +1005,13 @@ where
                     (seqno, kind)
                 }
             };
+            if counter {
+                steps += 1;
+            }
             if seqno <= snapshot && seqno >= floor {
+                if counter && top.is_none() {
+                    top = Some(seqno);
+                }
                 match kind {
                     Kind::ColumnDelete => {
                         raise(&mut self.col_cover, ts);
@@ -999,6 +1030,7 @@ where
                         } else {
                             base = Base::Large;
                         }
+                        stop = stop_at_base;
                     }
                     Kind::Merge if !hidden && base == Base::None => {
                         let value = self.cursor.value();
@@ -1018,7 +1050,21 @@ where
                     _ => {}
                 }
             }
+            if stop {
+                // The rest of the column in one seek: the column prefix ends with `00 01`, and
+                // bumping its last byte gives the smallest key past every version of it.
+                self.past_col.clear();
+                self.past_col.extend_from_slice(&self.col);
+                if let Some(last) = self.past_col.last_mut() {
+                    *last += 1;
+                }
+                self.cursor.seek_forward(&self.past_col)?;
+                break;
+            }
             self.cursor.next()?;
+        }
+        if counter {
+            self.fold = top.map(|top| (steps, top));
         }
         if (if counter { expired } else { hidden }) || (base == Base::None && !ops) {
             return Ok(None);
