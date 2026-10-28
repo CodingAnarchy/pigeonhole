@@ -5531,6 +5531,8 @@ impl ShardState {
             if !matches!(m.kind, Kind::Put | Kind::Merge) {
                 slot.active.deletes = true;
                 // D290: before it can be visible, and before a later write to the row.
+                // Replay too (not gated on `replaying`): a delete recovered from the WAL is in
+                // no SST yet, so only this raises the ceiling over it.
                 if let Some(rc) = &self.shared.row_cache {
                     rc.note_delete(ts);
                 }
@@ -5663,6 +5665,10 @@ impl ShardState {
     fn follow_commit(&mut self, bytes: &[u8], seqno: Seqno, dups: bool, applied: bool) {
         /// More rows than this in one commit: no write-through (a bulk write's rows miss).
         const WRITE_THROUGH_ROWS: usize = 16;
+        /// More mutations than this in one commit: no write-through either. The family and
+        /// cell scans below go over the commit's mutations once per mutation of a row, so
+        /// this bounds the shard thread's work at 64 x 64 comparisons (simp724's review).
+        const WRITE_THROUGH_KEYS: usize = 64;
         let rows = std::mem::take(&mut self.cache_rows);
         let stale = std::mem::take(&mut self.cache_stale);
         if let Some(rc) = &self.shared.row_cache {
@@ -5672,7 +5678,10 @@ impl ShardState {
                     rc.invalidate(span(bytes, row), info.families.iter().map(|f| f.id));
                 }
             }
-            if applied && rows.len() <= WRITE_THROUGH_ROWS {
+            if applied
+                && rows.len() <= WRITE_THROUGH_ROWS
+                && self.dedup.keys.len() <= WRITE_THROUGH_KEYS
+            {
                 let keys = &self.dedup.keys;
                 let wins = |i: usize| !dups || self.dedup.wins(i);
                 for &(table, row_span, p) in &rows {
