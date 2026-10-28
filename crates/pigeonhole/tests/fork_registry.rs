@@ -19,8 +19,7 @@ fn a_forked_child_opens_a_supervised_database_while_the_parent_held_the_registry
     // SAFETY: the fork runs while another thread, which the child does not have, holds the
     // registry's lock; the child opens, closes and `_exit`s without running the parent's
     // destructors.
-    let child =
-        pigeonhole::doc_support::with_watch_registry_locked_elsewhere(|| unsafe { libc::fork() });
+    let child = pigeonhole::hooks::with_watch_registry_locked_elsewhere(|| unsafe { libc::fork() });
     assert!(child >= 0, "fork failed");
     if child == 0 {
         std::thread::spawn(|| {

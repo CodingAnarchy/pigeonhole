@@ -381,6 +381,9 @@ impl Options {
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// How long a thread waiting for its buffered (or non-durable) commit polls for the
     /// result before it sleeps (default 50 µs). A shard usually answers within a few
     /// microseconds, and putting the thread to sleep and waking it costs that again or more
@@ -395,17 +398,24 @@ impl Options {
     /// let options = Options::default().commit_spin(Duration::ZERO).shard_spin(Duration::ZERO);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn commit_spin(mut self, window: Duration) -> Self {
         self.commit_spin = Some(window);
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// How long a shard thread that just handled a commit keeps polling for the next one
     /// before it sleeps (default 200 µs, D198 as amended on 2026-10-19), so a steady stream
     /// of commits is taken without waking the thread each time, and a store whose clients
     /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
     /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
     /// by application-owned shards, whose loop the application runs.
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
         self
@@ -441,8 +451,7 @@ impl Options {
     /// profile fills in the rest.
     ///
     /// - **Shard threads, both profiles:** one per shard, so one per physical core by
-    ///   default. With [`adaptive_shard_threads`](Options::adaptive_shard_threads) that is
-    ///   the most, and a lighter load runs on fewer.
+    ///   default.
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
     ///   and needs CPU too. Flush and compaction take a quarter of the physical cores.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
@@ -466,6 +475,9 @@ impl Options {
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// Experimental, off by default: size the shard threads to the load (D289's controller,
     /// ICR 0081). The engine starts a thread per shard, then moves the shards of a light load
     /// onto fewer threads, which sleep less, so a commit less often waits for a sleeping thread
@@ -488,6 +500,8 @@ impl Options {
     /// let options = Options::default().adaptive_shard_threads(true);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn adaptive_shard_threads(mut self, on: bool) -> Self {
         self.adaptive_shard_threads = on;
         self
@@ -551,6 +565,7 @@ impl Options {
     /// A counter read that folds at least `steps` increments keeps its result as the
     /// counter's base, so its next reads stop there (D291; default 128, 0 turns it off). For
     /// tests and benchmarks.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn counter_checkpoint_steps(mut self, steps: u64) -> Self {
         self.counter_checkpoint_steps = Some(steps);
@@ -561,6 +576,7 @@ impl Options {
     /// Linux; default on), set on the database's I/O backend at open (ICR 0083). A backend
     /// passed through [`Options::vfs`] is shared: every database on it sees the change. For
     /// benchmarks comparing the two.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn nowait_reads(mut self, on: bool) -> Self {
         self.nowait_reads = Some(on);
@@ -638,12 +654,6 @@ impl Options {
     pub fn read_only_fallback(mut self, yes: bool) -> Self {
         self.read_only_fallback = yes;
         self
-    }
-
-    /// Open even if a family names an unregistered merge operator.
-    #[deprecated(note = "use `read_only_fallback`, which also covers this case")]
-    pub fn allow_unregistered_merge_operators(self, yes: bool) -> Self {
-        self.read_only_fallback(yes)
     }
 
     /// Accept a database on a FUSE filesystem (default off; decision D173). Use it only for a
@@ -744,6 +754,7 @@ impl Options {
 
     /// Run on a custom filesystem implementation. Used by the deterministic simulation
     /// suites; applications never need it.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn vfs(mut self, vfs: pigeonhole_io::VfsRef) -> Self {
         self.vfs = Some(vfs);
@@ -753,6 +764,7 @@ impl Options {
     /// WAL segment size in bytes (default 64 MiB; a multiple of 32 KiB, decision D43). A test
     /// hook (ICR 0005): small segments keep simulated opens fast. It also lowers the largest
     /// value a commit may carry (decision D16). Applications never need it.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn wal_segment_size(mut self, bytes: u64) -> Self {
         self.wal_segment_size = Some(bytes);
@@ -763,6 +775,7 @@ impl Options {
     /// once a shard writes `min_writes` rows in one, and size splits at `split_bytes`. The
     /// simulation suites use tiny values so tablets change during short runs. Only read with
     /// [`tablet_changes`](Self::tablet_changes) on. Applications never need it.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn tablet_balance(mut self, interval: Duration, min_writes: u64, split_bytes: u64) -> Self {
         self.tablet_balance = Some((interval, min_writes, split_bytes));
@@ -859,6 +872,7 @@ impl ReaderOptions {
     }
 
     /// Custom filesystem (simulation).
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn vfs(mut self, vfs: pigeonhole_io::VfsRef) -> Self {
         self.vfs = Some(vfs);
@@ -1241,18 +1255,14 @@ pub struct IoRings {
     pub inline: u64,
 }
 
-/// The backend `backend` names; unset, the one `PIGEONHOLE_IO` names (a test variable:
-/// `pread`, `uring` or `auto`), else [`IoBackend::Auto`] (D218). For an application-owned open,
-/// an io_uring backend without a reaper thread.
+/// The backend `backend` names; unset, [`IoBackend::Auto`] (D218), or with the
+/// `__unstable-hooks` feature the one `PIGEONHOLE_IO` names (a test variable: `pread`, `uring`
+/// or `auto`). For an application-owned open, an io_uring backend without a reaper thread.
 fn backend_vfs(
     backend: Option<IoBackend>,
     application_owned: bool,
 ) -> Result<VfsRef, pigeonhole_engine::Error> {
-    let backend = backend.unwrap_or_else(|| match std::env::var("PIGEONHOLE_IO").as_deref() {
-        Ok("pread") => IoBackend::Pread,
-        Ok("uring") => IoBackend::Uring,
-        _ => IoBackend::Auto,
-    });
+    let backend = backend.unwrap_or_else(env_io_backend);
     let pread = || -> VfsRef { pigeonhole_io::pread::PreadVfs::new(0) };
     match backend {
         IoBackend::Pread => Ok(pread()),
@@ -1263,10 +1273,22 @@ fn backend_vfs(
     }
 }
 
-/// `PIGEONHOLE_DIRECT=1` (a test variable) turns direct I/O on where the options leave it
-/// unset.
+/// The backend `PIGEONHOLE_IO` names (a test variable, read only with the
+/// `__unstable-hooks` feature), else [`IoBackend::Auto`].
+fn env_io_backend() -> IoBackend {
+    #[cfg(feature = "__unstable-hooks")]
+    match std::env::var("PIGEONHOLE_IO").as_deref() {
+        Ok("pread") => return IoBackend::Pread,
+        Ok("uring") => return IoBackend::Uring,
+        _ => {}
+    }
+    IoBackend::Auto
+}
+
+/// `PIGEONHOLE_DIRECT=1` (a test variable, read only with the `__unstable-hooks` feature)
+/// turns direct I/O on where the options leave it unset.
 fn env_direct_io() -> bool {
-    std::env::var("PIGEONHOLE_DIRECT").as_deref() == Ok("1")
+    cfg!(feature = "__unstable-hooks") && std::env::var("PIGEONHOLE_DIRECT").as_deref() == Ok("1")
 }
 
 /// An io_uring backend, if the kernel offers one.

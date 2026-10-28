@@ -25,6 +25,8 @@ pigeonhole-arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 
 [dev-dependencies]
+# The tests use pigeonhole's test hooks (`Options::wal_segment_size`, ICR 0085).
+pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 insta = { version = "1.49", features = ["filters"] }
 
 [lints]
