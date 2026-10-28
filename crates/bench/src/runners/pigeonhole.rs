@@ -60,6 +60,9 @@ pub(crate) struct Settings {
     pub(crate) server_profile: bool,
     /// `Options::adaptive_shard_threads(true)` (D289's controller, experimental) when set.
     pub(crate) adaptive_shard_threads: bool,
+    /// Appends the driver controller's windows and the run's phase marks to this file, one
+    /// JSON object a line (`Pigeonhole::driver_trace`, #1015).
+    pub(crate) driver_trace: Option<std::path::PathBuf>,
     /// A blocking `None`/`Buffered` commit's spin before it parks (`Options::commit_spin`,
     /// D253), in microseconds; `None`: the library default.
     pub(crate) commit_spin_micros: Option<u64>,
@@ -105,6 +108,35 @@ pub(crate) struct Open {
     riders: Option<riders::Running>,
     /// The reader processes while the measured phase runs.
     readers: Option<super::reader_process::Running>,
+    /// [`Settings::driver_trace`]'s file.
+    trace: Option<std::io::BufWriter<std::fs::File>>,
+}
+
+impl Open {
+    /// Writes the driver windows logged since the last call, then `phase`'s mark.
+    fn trace(&mut self, phase: &str, store: Option<&str>) -> Result<(), String> {
+        use std::io::Write;
+        let Some(out) = self.trace.as_mut() else {
+            return Ok(());
+        };
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        let mut write = || -> std::io::Result<()> {
+            for line in self.target.db.driver_trace() {
+                writeln!(out, "{line}")?;
+            }
+            match store {
+                Some(s) => writeln!(
+                    out,
+                    r#"{{"phase":"{phase}","at_us":{at},"store":"{}"}}"#,
+                    s.replace('\\', "\\\\").replace('"', "\\\"")
+                ),
+                None => writeln!(out, r#"{{"phase":"{phase}","at_us":{at}}}"#),
+            }
+        };
+        write().map_err(|e| format!("driver trace: {e}"))
+    }
 }
 
 /// How many times a write refused with `Busy` is retried (each after the engine's own
@@ -452,6 +484,15 @@ impl PigeonholeRunner {
     /// ```
     pub fn adaptive_shard_threads(mut self) -> Self {
         self.settings.adaptive_shard_threads = true;
+        self
+    }
+
+    /// Appends the driver controller's windows to `path`, one JSON object a line, with the
+    /// run's phase marks between them (`Pigeonhole::driver_trace`, #1015). Without
+    /// [`adaptive_shard_threads`](Self::adaptive_shard_threads) the controller observes:
+    /// it logs what it would decide but never resizes.
+    pub fn driver_trace(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.settings.driver_trace = Some(path.into());
         self
     }
 
@@ -827,8 +868,29 @@ impl Runner for PigeonholeRunner {
             dir: dir.to_path_buf(),
             riders: None,
             readers: None,
+            trace: None,
         });
+        if let Some(path) = &self.settings.driver_trace {
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .map_err(|e| format!("driver trace {}: {e}", path.display()))?;
+            let store = self.describe();
+            let open = self.open.as_mut().expect("just opened");
+            open.trace = Some(std::io::BufWriter::new(file));
+            open.trace("open", Some(&store))?;
+        }
         Ok(())
+    }
+
+    fn mark_phase(&mut self, phase: &str) {
+        if let Some(open) = self.open.as_mut()
+            && let Err(e) = open.trace(phase, None)
+        {
+            eprintln!("{e}");
+            open.trace = None;
+        }
     }
 
     fn execute(&mut self, op: &BenchOp) -> Result<(), String> {
@@ -836,6 +898,14 @@ impl Runner for PigeonholeRunner {
     }
 
     fn close(&mut self) -> Result<(), String> {
+        if let Some(open) = self.open.as_mut()
+            && open.trace.is_some()
+        {
+            open.trace("close", None)?;
+            if let Some(mut out) = open.trace.take() {
+                std::io::Write::flush(&mut out).map_err(|e| format!("driver trace: {e}"))?;
+            }
+        }
         match self.open.take() {
             Some(Open {
                 target:
@@ -1745,6 +1815,48 @@ mod tests {
             }
         }
         r.close().unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// #1015: a traced run writes the store's description, then its phase marks in order,
+    /// with the driver windows logged in each phase between them.
+    #[test]
+    fn a_traced_run_marks_its_phases_between_the_driver_windows() {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-ph-trace-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("db")).unwrap();
+        let path = dir.join("drivers.jsonl");
+        let mut r = PigeonholeRunner::default()
+            .shards(2)
+            .memtable_budget(16 << 20)
+            .driver_trace(&path);
+        let config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+        crate::run_detailed(
+            &mut r,
+            &config,
+            &dir.join("db"),
+            &crate::RunOptions::default(),
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let phases: Vec<&str> = text
+            .lines()
+            .filter_map(|l| l.strip_prefix(r#"{"phase":""#))
+            .map(|l| l.split('"').next().unwrap())
+            .collect();
+        assert_eq!(
+            phases,
+            [
+                "open", "load", "settle", "warmup", "measured", "end", "close"
+            ],
+            "{text}"
+        );
+        assert!(
+            text.lines().next().unwrap().contains(r#""store":"#),
+            "{text}"
+        );
+        for l in text.lines().filter(|l| !l.starts_with(r#"{"phase""#)) {
+            assert!(l.starts_with(r#"{"seq":"#) && l.ends_with('}'), "{l}");
+        }
         std::fs::remove_dir_all(dir).ok();
     }
 

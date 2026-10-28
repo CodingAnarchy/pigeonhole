@@ -152,6 +152,9 @@ OPTIONS:
     --adaptive-shard-threads
                            Pigeonhole: the load controller sizes the shard threads
                            (D289, experimental) [default: a thread per shard]
+    --driver-trace PATH    Pigeonhole: append the driver controller's 100 ms windows and
+                           the run's phase marks to PATH as JSON lines (#1015); without
+                           --adaptive-shard-threads the controller only observes
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
     --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
@@ -219,6 +222,7 @@ struct Args {
     compaction_cores: Option<usize>,
     server_profile: bool,
     adaptive_shard_threads: bool,
+    driver_trace: Option<std::path::PathBuf>,
     commit_spin: Option<u64>,
     txn_backoff: Option<u64>,
     dir: Option<PathBuf>,
@@ -303,6 +307,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--compaction-cores" => a.compaction_cores = Some(parse(&arg, it.next())?),
             "--server-profile" => a.server_profile = true,
             "--adaptive-shard-threads" => a.adaptive_shard_threads = true,
+            "--driver-trace" => a.driver_trace = Some(parse(&arg, it.next())?),
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
             "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
             // The default since tablet changes turned on (#38); still accepted.
@@ -407,6 +412,9 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if a.adaptive_shard_threads {
         r = r.adaptive_shard_threads();
+    }
+    if let Some(path) = &a.driver_trace {
+        r = r.driver_trace(path);
     }
     if let Some(us) = a.commit_spin {
         r = r.commit_spin_micros(us);

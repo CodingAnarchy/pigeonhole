@@ -1133,6 +1133,15 @@ impl<H: ShardHandler> Runtime<H> {
         self.drivers.moves()
     }
 
+    /// The load controller's windows since the last call, one JSON object each (#1015). The
+    /// first call starts the log; without the controller
+    /// ([`RuntimeConfig::adaptive_drivers`]) it starts an observe-only one, which logs what
+    /// it would decide but never resizes.
+    #[doc(hidden)]
+    pub fn driver_trace(&self) -> Vec<String> {
+        self.drivers.trace()
+    }
+
     /// [`force_driver_target`](Runtime::force_driver_target) as a handle another thread can
     /// call (a test's churn of resizes under traffic).
     #[doc(hidden)]
