@@ -45,9 +45,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{
-    AppendedKind, CompactionRecord, Compression, Engine, EngineOptions, EngineShard, Error,
-    FamilyId, FamilyOptions, PendingCommit, PendingMaintenance, PickerOptions, Predicate, ScanSpec,
-    Snapshot, TableInfo, ValueRef, WriteBatch,
+    AppendedKind, BackgroundWorker, CompactionRecord, Compression, Engine, EngineOptions,
+    EngineShard, Error, FamilyId, FamilyOptions, PendingCommit, PendingMaintenance, PickerOptions,
+    Predicate, ScanSpec, Snapshot, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::key::decode_key;
 use pigeonhole_format::manifest::{CompactionStyle, FamilyKind};
@@ -627,6 +627,9 @@ fn first_diff(store: &Rows, model: &Rows) -> Option<String> {
 pub struct Store {
     pub engine: Arc<Engine>,
     pub shards: Vec<EngineShard>,
+    /// Application-owned background workers (D284), `PIGEONHOLE_BACKGROUND_WORKERS` of them
+    /// in the checker's runs ([`options_for`]); driven beside the shards.
+    pub workers: Vec<BackgroundWorker>,
     pub tables: HashMap<String, Arc<TableInfo>>,
     /// `(table, family) -> id`.
     pub family_ids: HashMap<(String, String), FamilyId>,
@@ -666,9 +669,34 @@ pub fn options(vfs: Arc<SimVfs>, shards: usize, memtable_budget: u64) -> EngineO
     o
 }
 
-/// Options with the checker's flush and compaction knobs.
+/// A `PIGEONHOLE_*` count from the environment (0 when unset or not a number).
+fn env_count(name: &str) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Background workers the checker's runs start (`PIGEONHOLE_BACKGROUND_WORKERS`, D284).
+pub fn background_workers() -> usize {
+    env_count("PIGEONHOLE_BACKGROUND_WORKERS") as usize
+}
+
+/// Options with the checker's flush and compaction knobs, and the sweep switches for paths
+/// the defaults leave off: `PIGEONHOLE_ROW_CACHE=1` (the writer's row cache, D290),
+/// `PIGEONHOLE_CHECKPOINT_STEPS=n` (counter checkpoints, D291) and
+/// `PIGEONHOLE_BACKGROUND_WORKERS=n` (D284).
 pub fn options_for(vfs: Arc<SimVfs>, shards: usize, cfg: &Config) -> EngineOptions {
     let mut o = options(vfs, shards, cfg.memtable_budget);
+    if std::env::var("PIGEONHOLE_ROW_CACHE").as_deref() == Ok("1") {
+        // Small enough to evict.
+        o.row_cache_bytes = 64 << 10;
+    }
+    let steps = env_count("PIGEONHOLE_CHECKPOINT_STEPS");
+    if steps != 0 {
+        o.counter_checkpoint_steps = steps;
+    }
+    o.background_workers = background_workers();
     o.memtable_freeze_bytes = cfg.memtable_freeze_bytes;
     o.compaction = cfg.compaction.clone();
     o.tablet_changes = cfg.tablet_changes;
@@ -705,12 +733,21 @@ impl Store {
         options: EngineOptions,
         fams: &[ModelFamily],
     ) -> Result<Self, Error> {
-        let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), options)?;
+        let pigeonhole_engine::AppOwned {
+            engine,
+            mut shards,
+            mut workers,
+            ..
+        } = Engine::open_application_owned_with(Path::new(DB), options)?;
         // The harness reads the append order and the compactions back (`take_appended`,
         // `take_compactions`).
         engine.record_history(true);
         let woke = Arc::new(AtomicBool::new(false));
         for s in &mut shards {
+            let w = Arc::clone(&woke);
+            s.set_wakeup(Box::new(move || w.store(true, Ordering::Release)));
+        }
+        for s in &mut workers {
             let w = Arc::clone(&woke);
             s.set_wakeup(Box::new(move || w.store(true, Ordering::Release)));
         }
@@ -737,6 +774,7 @@ impl Store {
         Ok(Store {
             engine,
             shards,
+            workers,
             tables,
             family_ids,
             family_names,
@@ -755,6 +793,7 @@ impl Store {
             for s in &mut self.shards {
                 more |= s.run_once(u64::MAX);
             }
+            more |= self.run_workers(u64::MAX);
             more |= self.vfs.complete_io();
             if !more && !self.woke.load(Ordering::Acquire) {
                 return;
@@ -827,7 +866,17 @@ impl Store {
         for s in &mut self.shards {
             s.run_once(now + 1_000);
         }
+        self.run_workers(now + 1_000);
         self.vfs.complete_io();
+    }
+
+    /// Runs every background worker once; whether any has work left.
+    pub fn run_workers(&mut self, deadline: u64) -> bool {
+        let mut more = false;
+        for w in &mut self.workers {
+            more |= w.run_once(deadline);
+        }
+        more
     }
 
     /// Drives the shards until `m` resolves (or the engine dies).
@@ -5166,6 +5215,27 @@ fn run_with(
             }),
         );
     }
+    // Background workers as scheduler tasks too (none unless `PIGEONHOLE_BACKGROUND_WORKERS`).
+    for i in 0..background_workers() {
+        let world = world.clone();
+        let vfs = Arc::clone(&vfs);
+        sim.spawn(
+            "worker",
+            Box::new(move |_rng| {
+                let mut w = world.borrow_mut();
+                if w.done {
+                    return Step::Done;
+                }
+                let now = vfs.monotonic_nanos();
+                if let Some(store) = w.store.as_mut()
+                    && let Some(worker) = store.workers.get_mut(i)
+                {
+                    worker.run_once(now + 1_000);
+                }
+                Step::Ready
+            }),
+        );
+    }
     {
         let world = world.clone();
         sim.spawn(
@@ -5473,7 +5543,9 @@ pub fn undecided_prepare_passes(seed: u64, cfg: &Config, acked: bool) -> Result<
         };
         let step = |w: &mut World, shard: usize| {
             let now = w.vfs.monotonic_nanos();
-            w.store.as_mut().expect("store open").shards[shard].run_once(now + 1_000);
+            let store = w.store.as_mut().expect("store open");
+            store.shards[shard].run_once(now + 1_000);
+            store.run_workers(now + 1_000);
             w.drain_appended();
         };
         // A commit on the coordinator's stream that no flush persists: its checkpoint stays
@@ -5689,7 +5761,9 @@ pub fn lost_decision_reuses_its_seqno(
             for _ in 0..10_000 {
                 for shard in 0..cfg.shards {
                     let now = w.vfs.monotonic_nanos();
-                    w.store.as_mut().expect("store open").shards[shard].run_once(now + 1_000);
+                    let store = w.store.as_mut().expect("store open");
+                    store.shards[shard].run_once(now + 1_000);
+                    store.run_workers(now + 1_000);
                     w.drain_appended();
                     if done(w) {
                         return true;

@@ -78,6 +78,13 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 | `PIGEONHOLE_DEFERRED_IO` | engine harness, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |
 | `PIGEONHOLE_SHARD_THREADS` | pigeonhole `model` | `k` runs the shards on `k` shared engine-owned driver threads (`Options::shard_threads`, D289); unset or `0`, a thread per shard. |
 | `PIGEONHOLE_DRIVER_CHURN` | pigeonhole `model` | `1` forces the load controller's driver target to a seeded count after one step in ten (D289 PR 2), so shards move between drivers throughout. |
+| `PIGEONHOLE_ADAPTIVE_SHARD_THREADS` | pigeonhole `model` | `1` turns the load controller on (`Options::adaptive_shard_threads`, D289) when `PIGEONHOLE_SHARD_THREADS` is unset or `0`. With churn, a forced target goes back to the controller one time in three. |
+| `PIGEONHOLE_ROW_CACHE` | engine harness (checker runs), pigeonhole `model` | `1` turns on a 64 KiB writer row cache (D201, D290), small enough to evict. |
+| `PIGEONHOLE_CHECKPOINT_STEPS` | engine harness (checker runs), pigeonhole `model` | `n` sets `counter_checkpoint_steps` (D291); `1` checkpoints after every counter read that folds anything. Counter-kind families exist only in the `counters` targets. |
+| `PIGEONHOLE_BACKGROUND_WORKERS` | engine harness (checker runs) | `n` application-owned background workers (D284), driven beside the shards (as scheduler tasks in the crash runs). |
+| `PIGEONHOLE_FRONT` | pigeonhole `model` | `async` or `mixed` routes operations through the async front door (all of them, or a seeded choice per operation); anything else is sync. |
+| `PIGEONHOLE_REAL_FS` | pigeonhole `model` | `1` runs on real files in a temporary directory instead of `SimVfs`. Fault plans and power-loss crashes are off, and the tests that need them skip. |
+| `PIGEONHOLE_HUNG_STACKS` | pigeonhole `model` | `1` makes the hang watchdog print every thread's stack (on by itself when `CI` is set). |
 | `PIGEONHOLE_SWEEP_STEP` | engine `tablets` and `model_check` crash sweeps | Crash after every Nth mutating operation instead of the default step. |
 | `PIGEONHOLE_SHARDS_64` | engine `model_check` | Runs the 64-shard case, which is skipped otherwise. |
 | `PIGEONHOLE_IO` | pigeonhole library with `__unstable-hooks` (`Options` and `ReaderOptions` with no `io_backend` set) | `uring` runs on io_uring and fails to open where it is unavailable, `pread` runs on the thread pool, and anything else uses io_uring where available (`auto`). The Linux CI job sets `uring` so the suites cover the io_uring backend (#402). |
