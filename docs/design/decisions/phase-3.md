@@ -2586,6 +2586,20 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - `clock.rs` unit tests cover holds released out of order.
 - `blocking_waits`' failed-share-apply test is unchanged and passes. freeze_wake's hold helper now makes shard 1 the last applier.
 
+<a id="d280"></a>
+## D280 — The 1.0 performance bars beside #708 (owner decision, 2026-10-26; bench, engine, pigeonhole; amended 2026-10-26 and 2026-10-28)
+
+**Decided:** besides #708 (D274), these are 1.0 criteria. Each is judged at the gate's configs on throughput **and** p99, with a goal of 1.0× and a floor of 1.2×:
+- **Competitor rows:** #711, #712, #713, #759 and #760, against the gate's comparison store (RocksDB or SQLite).
+- **Async (#709, #749):** 16 in flight per client reaches at least 0.83× the synchronous run at the same total in flight.
+- **Application-owned (#816, #710):** at least 0.83× engine-owned mode on the same workload.
+- **Backup (#715):** within 1.2× of RocksDB's time at the same size under load. Judged like for like against RocksDB BackupEngine's full copy, since a Checkpoint on the same filesystem hard-links table files; both are reported (#945; the coordinator's amendment, 2026-10-26).
+
+**Amended (owner, 2026-10-28):**
+- **#759:** judged at equal cache memory for both stores, at each store's maximum throughput, provided SQLite is confirmed saturated there. It is also judged and reported at equal offered load. The guide reports the latency-against-throughput tradeoff truthfully.
+- **#708:** transfer at Buffered is accepted for 1.0 as a documented gap (the default durability passes at 1.20×). Cross-shard commit cost continues after 1.0 in #1023.
+
+<a id="d281"></a>
 ## D281 — Reader processes have a row cache, keyed on the writer's write watermarks in shared memory (owner decision, 2026-10-26; cache, shm, engine, pigeonhole, #926; refines D201)
 
 **Decided:** a 1.0 item. Every reader process gets a row cache of its own, run on D201's epoch protocol against the writer's write watermarks, which move from the writer's memory into the shared-memory region (layout version 5). Design on #926, reviewed by perf287, with two must-fixes (M1, M2), both in.
@@ -2601,6 +2615,38 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - **M1:** the table's offset, slot count and seed are another process's data. `ShmHeader::decode`, run at every attach, refuses a table that is misaligned, not a nonzero power of two, overlapping the reader slots or arenas, or outside the region.
 - **Defaults:** 64 MiB per reader process, as the writer's (owner ruling), so N reader processes use up to N × 64 MiB, plus 16 bytes per slot for the cache's presence and admission tables (4 MiB at the defaults). The region grows by 8 bytes per slot (2 MiB). `ReaderOptions::row_cache*` and `PigeonholeReader::row_cache_stats` (ICR 0072).
 - **Async reads** in a reader process (the latest point get and row read futures) go through its cache as the sync ones do (#946): a read future's attempt gets its read point's cache, and a fill passes the same snapshot check.
+
+<a id="d282"></a>
+## D282 — The 1.0 semver policy (owner decision, 2026-10-26; pigeonhole, pigeonhole-arrow, phdb; #695, #942)
+
+**Decided:** from 1.0, `pigeonhole`'s public API, `pigeonhole-arrow`'s public API, and `phdb`'s commands and output follow semver. The internal `pigeonhole-*` crates make no stability promise, but they follow semver honestly with majors of their own. `pigeonhole` pins each of them with `=` and wraps every internal type it re-exports in a `pigeonhole`-owned type, as ICR 0044 did (#942).
+
+<a id="d283"></a>
+## D283 — The MSRV policy (owner decision, 2026-10-26; workspace; #695, #942)
+
+**Decided:** a 1.x minor release may raise `rust-version`; a patch release never does. The changelog calls out every raise.
+
+<a id="d284"></a>
+## D284 — Application-owned mode gets background workers the application drives; engine-owned compaction threads drive the same pool (owner decision, 2026-10-26; runtime, engine, io, pigeonhole, bench; #816, #710, ICR 0078; keeps D40)
+
+**Why:** in application-owned mode D40 starts no threads, so flushes and compactions ran in 500 µs slices on the shard threads. At the default level, #816's box check put app-owned at 0.68× engine-owned's throughput and 6.8× its p99 (a D280 bar).
+
+**Decided:** application-owned mode still starts no threads (D40). The engine exposes its flush and compaction work as background workers the application drives from threads it chooses, like the shards.
+- **API:** `Options::background_workers(n)` (default 0: the work stays on the shards) and `Pigeonhole::open_application_owned_with`, which returns `AppOwned { db, shards, workers }`. Each `BackgroundWorker` is driven with `run_once`, `wait` and `set_wakeup` (ICR 0078; `EngineOptions::background_workers` and `Engine::open_application_owned_with` in the engine). The guide tells application-owned users to give background work at least one thread.
+- **One mechanism:** engine-owned mode's compaction threads drive the same runtime pool (`PoolDriver`) as built-in callers (#983).
+- **Commit-path work first:** flushes, the manifest pump and spare segments (`Task::commit_path`) run ahead of compactions, and a shard waiting for memtable room takes them back.
+- **Take-back:** queued tasks fall back to their shard after 10 ms. An application driver that has made no pass for 100 ms (`pool::STOPPED`) gives back the held tasks that could run (runnable, woken, failed, or asleep past their deadline), and none while it is in the middle of a slice (#1012). A taken-back compaction is dropped and picked again.
+- **Inline I/O:** a worker's slice completes its I/O inside the call (`inline_io`), so the application may stop driving a worker at any time. Dropping a worker, or the engine's close, hands its work back.
+- **Concurrency:** the pool's primitives and lock-order item 12 are in concurrency.md (appendix D).
+
+**PRs:** #983 (runtime and engine, PR 1), #1010 (public API and bench flag, PR 2), #1012 (blocked tasks are not taken back).
+
+<a id="d285"></a>
+## D285 — Cross-shard protocol messages handled at safe points mid-turn on shard threads (withdrawn, 2026-10-26; perf2, #708 trim 2d, #932)
+
+**Proposed:** cross-shard protocol messages would ride a priority lane, handled at a safe point after each group in the middle of a shard's turn, rather than waiting for the turn to end.
+
+**Withdrawn:** step 0 measured the wait it would save at about 1–2 µs, and the lane's safe point hung the model on 5 seeds. #984 was closed. The test infrastructure it brought (`Fault::HoldPrepares`, which builds a cross-shard arrival order explicitly) was kept in #988.
 
 <a id="d286"></a>
 ## D286 — At Buffered, the coordinator sends `Decide` before its DECISION is written (engine, #708 trim 3d)
@@ -2936,6 +2982,7 @@ The transaction's read set records keys only (D275), before the read, so a hit i
   - a transaction between `s_top` and the read point commits without `Conflict`.
 - **pigeonhole:** `PIGEONHOLE_CHECKPOINT_STEPS=1` runs the model check with a checkpoint after nearly every counter read, under flushes, compactions, tablet changes and reopens.
 
+<a id="d292"></a>
 ## D292 — A submitted read the page cache holds is copied on the submitting thread (ctr274, 2026-10-28; io, #709, #749, D280)
 **Why.** Async ycsb-a at 16 in flight ran at 0.58× sync (D280's bar is 0.83×). On the AX102 the async clients spent about 11% of their CPU in the kernel's `uring_lock` (`osq_lock`, `mutex_spin_on_owner`) under `io_uring_enter`. A block miss that the page cache held was copied inside the enter, under the lock every submitter queues on (#749 comment 6460843615). On pread it took a hop to a pool thread instead. Sync clients already read inline and paid neither cost.
 
@@ -2957,7 +3004,7 @@ The transaction's read set records keys only (D275), before the read, so a hit i
   - `Vfs::nowait_reads`: hits, misses, miss time and buckets, refusals and breaker trips. Hits go on per-thread stripes, so no line is shared by every reader.
   - The bench's switch is `--no-nowait-reads`. The bench prints the counters at close.
 
-**Why it's safe.** The bytes are the ones `pread` would return. The call takes no lock of ours and writes only into the caller's buffer, and the handle keeps the descriptor open. Callers already handle a completion that's resolved on return. The only shared state is a per-handle flag that's only ever set.
+**Why it's safe.** The bytes are the ones `pread` would return. The call takes no lock of ours and writes only into the caller's buffer, and the handle keeps the descriptor open. Callers already handle a completion that's resolved on return. Its shared state is a per-handle flag that's only ever set, the per-file breaker's two counters (`FileState::{streak, skip}`, Relaxed; the skip count saturates at 0 under a `compare_exchange_weak` loop, and a lost `streak` update only delays a trip) and the per-backend hit and miss counters (Relaxed statistics). All of it is in `pigeonhole-io`, beside concurrency.md's inventory rather than in it.
 
 **Measured** (AX102, ycsb-a, gate settings, on vs `PIGEONHOLE_NOWAIT=0` on scratch a54c60b4, `/root/scratch/ctr274/out-709b`, #749 comment 6463250275):
 
