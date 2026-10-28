@@ -388,7 +388,7 @@ impl RowData {
     }
 }
 
-/// Where a row read puts the cells it resolves ([`Engine::read_row_into`](crate::Engine::read_row_into)),
+/// Where a row read puts the cells it resolves ([`Engine::read_row_into_families`](crate::Engine::read_row_into_families)),
 /// in order: by family (in [`ReadSpec::families`] order), then qualifier, newest version
 /// first. A caller's own row buffer can take them directly, without an intermediate
 /// [`RowData`] (#287).
@@ -1213,9 +1213,9 @@ impl ScanCursor {
     }
 
     /// Appends the current row's next cell to `sink`, its qualifier unescaped into
-    /// [`RowSink::qualifiers`]: [`ScanCursor::next_cell_into`] and
-    /// [`ScanCursor::push_current`] in one step, which reads the resolver's cell once rather
-    /// than once for its column and again for its value (#287). Returns `false` when the row
+    /// [`RowSink::qualifiers`]: [`ScanCursor::next_cell_into`] and pushing the cell in one
+    /// step, which reads the resolver's cell once rather than once for its column and again
+    /// for its value (#287). Returns `false` when the row
     /// is done.
     pub fn push_next_cell(&mut self, sink: &mut impl RowSink) -> Result<bool> {
         if !self.in_row {
@@ -1278,29 +1278,6 @@ impl ScanCursor {
     pub fn current_data(&self) -> CellData {
         let i = self.last_lane.expect("current_data before next_cell");
         self.lanes[i].data(|| Arc::clone(&self.snapshot.view))
-    }
-
-    /// Appends the cell last returned by [`ScanCursor::next_cell`] to `sink`, as `family`
-    /// with `qualifier` (a range of the sink's qualifiers): the cell of
-    /// [`ScanCursor::current_data`], but a small value is copied straight into the sink's
-    /// cell rather than moved there in a [`CellData`] (#287).
-    ///
-    /// # Panics
-    /// If no cell has been returned for the current row.
-    pub fn push_current(
-        &self,
-        family: FamilyId,
-        qualifier: std::ops::Range<usize>,
-        sink: &mut impl RowSink,
-    ) {
-        let i = self.last_lane.expect("push_current before next_cell");
-        let lane = &self.lanes[i];
-        let bytes = lane.value();
-        if bytes.len() <= CellData::INLINE_MAX {
-            sink.push_inline(family, qualifier, lane.ts, bytes);
-        } else {
-            sink.push(family, qualifier, self.current_data());
-        }
     }
 }
 

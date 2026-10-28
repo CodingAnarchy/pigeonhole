@@ -61,12 +61,6 @@ impl std::task::Wake for RingWake {
 /// operation still pending (#1002): how often a cross-ring wait outlasts a slice.
 static CROSS_RING_SLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// [`CROSS_RING_SLICES`], for benchmarks and tests: not an API.
-#[doc(hidden)]
-pub fn cross_ring_wait_slices() -> u64 {
-    CROSS_RING_SLICES.load(std::sync::atomic::Ordering::Relaxed)
-}
-
 struct Shared<T> {
     state: Mutex<State<T>>,
     cond: Condvar,

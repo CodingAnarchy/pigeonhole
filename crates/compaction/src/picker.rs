@@ -257,11 +257,6 @@ impl CompactionPicker {
         Self { style, options }
     }
 
-    /// The options.
-    pub fn options(&self) -> &PickerOptions {
-        &self.options
-    }
-
     /// The deepest level.
     fn last_level(&self) -> usize {
         usize::from(self.options.max_levels.max(2)) - 1

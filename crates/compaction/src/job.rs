@@ -166,11 +166,6 @@ impl StreamGc {
     pub fn blob_delta(&self) -> &[(BlobFileId, i64)] {
         &self.gc.blob_delta
     }
-
-    /// Entries read and kept so far.
-    pub fn counts(&self) -> (u64, u64) {
-        (self.gc.read, self.gc.kept)
-    }
 }
 
 /// Everything a job needs from the engine.
@@ -716,11 +711,6 @@ impl CompactionJob {
     /// Entries read from the inputs so far.
     pub fn entries_read(&self) -> u64 {
         self.gc.read
-    }
-
-    /// Entries written to the outputs so far (combined operands count once).
-    pub fn entries_written(&self) -> u64 {
-        self.gc.kept
     }
 
     /// Works until `deadline_nanos` (monotonic, from the Vfs clock) or completion.
