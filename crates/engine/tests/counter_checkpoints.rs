@@ -162,3 +162,65 @@ fn a_transaction_below_the_read_point_does_not_conflict_with_a_checkpoint() {
     }
     assert_eq!(r.latest(b"r"), 12);
 }
+
+/// D287's flush of a memtable holding a checkpoint, with a snapshot stripe below it (perf287's
+/// should-fix): the flush combines each stripe around the base, every read point reads what it
+/// read before, and the SST holds a few entries rather than every operand.
+#[test]
+fn a_flush_of_a_memtable_holding_a_checkpoint_combines_each_stripe() {
+    use pigeonhole_format::Kind;
+    use pigeonhole_format::key::decode_key;
+
+    let r = Rig::open(4, 1);
+    for _ in 0..100 {
+        r.incr(b"r", 1);
+    }
+    let mid = r.db.snapshot().unwrap();
+    for _ in 0..100 {
+        r.incr(b"r", 2);
+    }
+    // The checkpoint, at the newest operand, above the snapshot.
+    assert_eq!(r.latest(b"r"), 300);
+    assert_eq!(r.handled(1), (1, 0));
+    for _ in 0..50 {
+        r.incr(b"r", 4);
+    }
+    let entries = |r: &Rig| -> Vec<(Kind, u64)> {
+        let snap = r.db.snapshot().unwrap();
+        r.db.raw_entries(&snap)
+            .unwrap()
+            .iter()
+            .filter(|e| e.family == r.c)
+            .map(|e| {
+                let k = decode_key(&e.key).unwrap();
+                (k.kind, k.seqno)
+            })
+            .collect()
+    };
+    let before = entries(&r);
+    assert_eq!(before.len(), 251, "250 operands and the checkpoint");
+    let puts: Vec<u64> = before
+        .iter()
+        .filter(|(k, _)| *k == Kind::Put)
+        .map(|(_, s)| *s)
+        .collect();
+    assert_eq!(puts.len(), 1);
+    assert!(
+        puts[0] > mid.seqno(),
+        "the checkpoint is above the snapshot"
+    );
+
+    r.db.flush().unwrap();
+    assert_eq!(r.at(&mid, b"r"), 100, "the snapshot's stripe");
+    assert_eq!(r.latest(b"r"), 500, "the newest read");
+    let after = entries(&r);
+    assert!(
+        after.len() <= 3,
+        "each stripe combined around the base: {after:?}"
+    );
+    // The snapshot's stripe kept its own (combined) operand below it.
+    assert!(
+        after.iter().any(|(_, s)| *s <= mid.seqno()),
+        "the snapshot stripe's operands: {after:?}"
+    );
+}

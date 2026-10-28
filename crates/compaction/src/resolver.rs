@@ -988,8 +988,17 @@ where
         // base are only older entries: operands it already holds, and deletes that in a
         // counter family hide only entries older than themselves. Their one other effect,
         // `col_cover`, matters only to older timestamp groups, which such a read never returns.
+        // A visible column delete ends the group too: everything after it is older, so
+        // hidden, and any later delete's cover is within its own. So a counter reset
+        // (`delete_column`) and incremented again doesn't walk its history before the reset.
+        // It may leave the group without a version, so only the group is passed there, not
+        // the column: an older timestamp's version may still be the one returned.
         let stop_at_base = counter && self.opts.versions == 1 && self.opts.time_range.is_none();
         let mut stop = false;
+        let mut stop_group = false;
+        // The entries this group read, for D291's checkpoint trigger. Only this group's: a
+        // newer group walked first (hidden, or expired) isn't counted, and needn't be, since
+        // a checkpoint stands in for this group's fold alone.
         let mut steps = 0u64;
         let mut top = None;
         // The first entry is in the column (the caller checked); the loop stops on the first
@@ -1036,7 +1045,10 @@ where
                         raise(&mut self.col_cover, ts);
                         self.col_cover_seqno = self.col_cover_seqno.max(seqno);
                         hidden = true;
+                        stop_group = stop_at_base;
                     }
+                    // Not a cell delete: an older column delete below it in the group still
+                    // raises the cover that older timestamps read.
                     Kind::CellDelete => hidden = true,
                     Kind::Put if !hidden && base == Base::None => {
                         let value = self.cursor.value();
@@ -1077,6 +1089,17 @@ where
                 if let Some(last) = self.past_col.last_mut() {
                     *last += 1;
                 }
+                self.cursor.seek_forward(&self.past_col)?;
+                break;
+            }
+            if stop_group {
+                // The rest of this timestamp's group in one seek: past the largest suffix at
+                // `ts` (seqno 0, the highest kind byte), before the column's older timestamps.
+                self.past_col.clear();
+                self.past_col.extend_from_slice(&self.col);
+                self.past_col
+                    .extend_from_slice(&(Timestamp::MAX - ts).to_be_bytes());
+                self.past_col.extend_from_slice(&[0xff; 9]);
                 self.cursor.seek_forward(&self.past_col)?;
                 break;
             }
