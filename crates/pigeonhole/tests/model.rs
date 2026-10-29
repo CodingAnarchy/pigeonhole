@@ -266,6 +266,11 @@ struct Config {
     /// D289 PR 2: force the driver target to a seeded count after one step in ten, so
     /// shards move between drivers throughout. Defaults to `PIGEONHOLE_DRIVER_CHURN=1`.
     driver_churn: bool,
+    /// `Options::adaptive_shard_threads` (D289): the load controller sizes the drivers. Only
+    /// without `shard_threads`, which fixes the count. With churn, a forced target is handed
+    /// back to the controller one time in three. Defaults to
+    /// `PIGEONHOLE_ADAPTIVE_SHARD_THREADS=1`.
+    adaptive: bool,
     /// `Options::auto_recover`: with `Recovery::Io`, a failure on an injected write error
     /// is recovered in place and what survived is decided by reading back (the module doc).
     recovery: Recovery,
@@ -344,6 +349,7 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             driver_churn: std::env::var("PIGEONHOLE_DRIVER_CHURN").is_ok_and(|v| v == "1"),
+            adaptive: std::env::var("PIGEONHOLE_ADAPTIVE_SHARD_THREADS").is_ok_and(|v| v == "1"),
             recovery: Recovery::Off,
         }
     }
@@ -889,8 +895,13 @@ impl Run {
             .tablet_changes(self.cfg.tablet_changes)
             .row_cache(self.cfg.row_cache)
             .row_cache_max_row(ROW_CACHE_MAX_ROW)
-            .shard_threads(self.cfg.shard_threads)
             .auto_recover(self.cfg.recovery);
+        // Set at all, `shard_threads` fixes the count and keeps the controller off.
+        if self.cfg.adaptive && self.cfg.shard_threads == 0 {
+            options = options.adaptive_shard_threads(true);
+        } else {
+            options = options.shard_threads(self.cfg.shard_threads);
+        }
         if let Some(steps) = self.cfg.checkpoint_steps {
             options = options.counter_checkpoint_steps(steps);
         }
@@ -2284,7 +2295,10 @@ impl Run {
         // Only with churn on, so the default runs draw exactly as before.
         if self.cfg.driver_churn && rng.chance(100_000) {
             let k = 1 + rng.below(self.cfg.shards.max(1) as u64) as usize;
-            self.db().force_driver_target(Some(k));
+            // With the controller on, hand the target back to it one time in three; the
+            // draw only with it on, so churn runs without it draw as before.
+            let k = (!self.cfg.adaptive || !rng.chance(333_333)).then_some(k);
+            self.db().force_driver_target(k);
         }
         Ok(())
     }
