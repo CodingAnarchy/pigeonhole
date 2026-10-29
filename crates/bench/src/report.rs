@@ -432,6 +432,11 @@ pub struct RunDetail {
     /// when the warmup ran out first, so the measured phase may include tablet changes.
     #[serde(default)]
     pub warmup_settled: Option<bool>,
+    /// The settle step after the warmup (D243's amendment of 2026-10-29): the store flushed
+    /// again and its background work stopped, so the measured phase starts on an empty write
+    /// buffer. `None` for the inline drivers and in results written before it.
+    #[serde(default)]
+    pub settle_after_warmup: Option<Settle>,
     /// The driver threads the shards ran on when the warmup ended (D289 PR 2's load
     /// controller); `None` for stores without one and in results written before it.
     #[serde(default)]

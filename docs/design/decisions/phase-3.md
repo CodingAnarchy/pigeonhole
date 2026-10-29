@@ -1390,6 +1390,7 @@ The AX102 confirms at 64 GiB.
 - **The short runs are lengthened.** `--min-secs S` now applies to client runs as well as inline ones. A client run whose configured operations measure under S seconds continues with the workload stream's next operations, in passes sized from the rate so far, until S seconds are measured. Each pass's operations are generated before its clock starts.
 - **In the gate.** `run-window.sh` runs every `all` (both io_uring runs and pread) with `--min-secs 10`, and the D213 group-commit run inside it with the judged run's 2M commits (`--inline-ops`). The dry run (`--scale small`) uses 1 s.
 - The tolerance itself (±20% throughput and p50, ±40% p99) is unchanged. (D259 later added absolute floors for the latencies.)
+- **The measured phase starts on a settled store** (amendment of 2026-10-29). D233's settle step (flush, then wait for the background work to stop) runs again after the warmup, so every client run's measured phase starts on an empty write buffer. A flush inside the measured phase then lands at the same operation in both runs of a pair. The JSON records it as `detail.settle_after_warmup`. The inline drivers have no settle step and are unchanged.
 
 **Why:** the 2026-10-13 gate's second pair failed only on short runs:
 - the D213 shape inside `all` measured 0.16 s (+53% throughput, −41% p50);
@@ -1401,6 +1402,8 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 *History: amended by [D258](#d258), 2026-10-19: the gate window trims the data file system before every step, so the reproducibility pair doesn't also differ in how much of the NVMe the drive maps.*
 
 *History: amended by [D259](#d259), 2026-10-19: a judged latency fails only past both its relative tolerance and an absolute floor (p50 3 µs, p99 6 µs at the default tolerance).*
+
+*History: amended 2026-10-29 (owner, via the coordinator; `.coord/d243-misses-2026-10-29.md`): the settle step also runs after the warmup. In both the 10-26 and 10-28 gates, `adjacency/pigeonhole` t=1 missed on p50 in opposite directions. Each run had one flush, and how long the warmup waited for the placement (D242) decided whether it landed in the warmup (p50 about 17 µs) or the measured phase (about 12 µs), 4 runs for 4. Every `all` and `contended` number moves to a new baseline from the first gate after this, so that gate is compared with its own pair, not with 10-26 or 10-28.*
 
 <a id="d244"></a>
 ## D244 — A participant keeps a cross-shard commit's timestamp in seqno order with the writes it already stamped, with tablet changes on or off (owner decision, 2026-10-13; engine, tablets, #653; amends D142 and D192's note)

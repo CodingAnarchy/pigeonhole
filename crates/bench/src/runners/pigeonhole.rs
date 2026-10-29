@@ -1958,13 +1958,19 @@ mod tests {
             .memtable_budget(16 << 20)
             .driver_trace(&path);
         let config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
-        crate::run_detailed(
+        let record = crate::run_detailed(
             &mut r,
             &config,
             &dir.join("db"),
             &crate::RunOptions::default(),
         )
         .unwrap();
+        // D243's amendment: the settle step ran again after the warmup, and settled.
+        let after = record
+            .detail
+            .settle_after_warmup
+            .expect("a settle after the warmup");
+        assert!(after.settled, "{after:?}");
         let text = std::fs::read_to_string(&path).unwrap();
         let phases: Vec<&str> = text
             .lines()
@@ -1974,7 +1980,14 @@ mod tests {
         assert_eq!(
             phases,
             [
-                "open", "load", "settle", "warmup", "measured", "end", "close"
+                "open",
+                "load",
+                "settle",
+                "warmup",
+                "warmup-settle",
+                "measured",
+                "end",
+                "close"
             ],
             "{text}"
         );
