@@ -309,3 +309,76 @@ fn a_miss_at_the_call_is_resumed_by_the_future_not_read_twice() {
     drop(t);
     db.close().unwrap();
 }
+
+#[test]
+fn a_handed_off_read_keeps_its_sst_until_it_lands() {
+    // perf287 on #1086: the read a miss at the call hands to its future is in flight in an
+    // SST no view of the future pinned. A compaction could retire that SST and a flush reuse
+    // its extent before the read landed, which then failed its checksum: a spurious
+    // `Corrupt`. The future reads at the call's view, which holds the SST.
+    let vfs = SimVfs::new(7092);
+    let path = "/db/inplace.phdb";
+    let writes: Vec<Write> = (0..400u32)
+        .map(|i| (i % ROWS, 1, (i % 4) as u8, 1, 900))
+        .collect();
+    let (want, want7) = {
+        let db = build_at(path, options(&vfs), &writes, 3);
+        // One run of SSTs and no free space: once a compaction retires them and they are
+        // reclaimed, theirs is the only free space, so the next flushes reuse it.
+        db.compact().unwrap();
+        db.shrink().unwrap();
+        let t = db.table("t").unwrap().open().unwrap();
+        let want = t
+            .get(&row_key(3), "d", &[1])
+            .unwrap()
+            .map(|c| c.value().to_vec());
+        let want7 = sync_row(&t, &row_key(7), 1);
+        drop(t);
+        db.close().unwrap();
+        (want, want7)
+    };
+    // Reopened cold: the get and the row read both miss at the call, their reads deferred.
+    let db = Pigeonhole::open(path, options(&vfs)).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    // A row far from 3 and 7: the SSTs' readers open and their indexes are cached, so the
+    // calls below miss on data blocks, whose reads they submit and leave in flight.
+    let _ = sync_row(&t, &row_key(39), 1);
+    vfs.set_deferred_io(true);
+    let get = t.get_async(&row_key(3), "d", &[1]);
+    let read = t.row(&row_key(7)).read_async();
+    assert!(
+        vfs.io_in_flight() >= 1,
+        "the calls left their reads in flight"
+    );
+    // With the reads still in flight: the compaction retires every SST, and the shrink moves
+    // the live data into the lowest free space, which is the retired SSTs' unless something
+    // still pins them. The flushes after churn the space some more.
+    vfs.set_deferred_io(false);
+    // New cells in the same rows, so the compaction merges them into the existing run and
+    // retires its SSTs.
+    for r in (0..ROWS).filter(|r| ![3, 7].contains(r)) {
+        t.mutate(&row_key(r))
+            .put("d", &[9], b"new")
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    // Moves live extents into the lowest free space: the retired run's, unless pinned.
+    db.shrink().unwrap();
+    for round in 0..8u32 {
+        for i in 0..400u32 {
+            t.mutate(&format!("zz{round}-{i:04}").into_bytes())
+                .put("d", b"x", &[round as u8 + 1; 90])
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    let got = drive(&vfs, get).unwrap().map(|c| c.value().to_vec());
+    assert_eq!(got, want);
+    let got7 = drive(&vfs, read).unwrap().map(|r| cells(&r.view()));
+    assert_eq!(got7, want7);
+    drop(t);
+    db.close().unwrap();
+}
