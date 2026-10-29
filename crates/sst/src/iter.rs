@@ -21,8 +21,7 @@ use pigeonhole_format::scan::{CompiledFilter, Verdict};
 ///
 /// The cursor only ever stops on entries its [`ScanFilter`] admits: excluded qualifiers are
 /// skipped with seeks (the compiled filter's hints, [`ScanFilter::compile`]), so a filtered
-/// scan returns exactly the unfiltered entries for which [`ScanFilter::admits`] holds
-/// (decision D22).
+/// scan returns exactly the unfiltered entries the compiled filter admits (decision D22).
 /// [`Cursor::skip_row`] uses each block's row-start table and crosses into the next block only
 /// if the row continues there.
 ///

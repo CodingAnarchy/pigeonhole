@@ -11,7 +11,7 @@ use pigeonhole_format::Cursor;
 use pigeonhole_format::block::{Block, BlockBuilder, BlockKind, seal_with_level, verify};
 use pigeonhole_format::compress::{Compression, decompress};
 use pigeonhole_format::key::{decode_key, row_prefix_len};
-use pigeonhole_format::scan::{QualifierFilter, ScanFilter};
+use pigeonhole_format::scan::{QualifierFilter, ScanFilter, Verdict};
 use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
 
@@ -230,33 +230,36 @@ proptest! {
         prop_assert!(verify(&bad).is_err());
     }
 
-    /// `next_admissible` never skips an admitted entry, and `admits` follows D22.
+    /// The compiled filter's seeks and row skips never pass an admitted entry, and markers
+    /// always pass (D22).
     #[test]
     fn scan_filter_hints_are_safe(
         model in entries(),
         filter in scan_filter(),
     ) {
+        let c = filter.compile();
+        let admits = |k: &[u8]| c.check(k, &mut Vec::new()) == Verdict::Admit;
         let keys: Vec<_> = model.keys().cloned().collect();
         for (i, k) in keys.iter().enumerate() {
             let parts = decode_key(k).unwrap();
-            let admitted = filter.admits(k);
-            if parts.qualifier.is_none() {
-                prop_assert!(admitted, "markers always pass");
-            }
             let mut hint = Vec::new();
+            let verdict = c.check(k, &mut hint);
+            if parts.qualifier.is_none() {
+                prop_assert_eq!(verdict, Verdict::Admit, "markers always pass");
+            }
             let row = &k[..row_prefix_len(k).unwrap()];
-            if filter.next_admissible(k, &mut hint) {
-                prop_assert!(hint.as_slice() >= k.as_slice());
-                if admitted {
-                    prop_assert_eq!(&hint, k);
+            match verdict {
+                Verdict::Admit | Verdict::Next => {}
+                Verdict::Seek => {
+                    prop_assert!(hint.as_slice() > k.as_slice());
+                    for skipped in keys[i..].iter().filter(|x| x.as_slice() < hint.as_slice()) {
+                        prop_assert!(!admits(skipped));
+                    }
                 }
-                for skipped in keys[i..].iter().filter(|x| x.as_slice() < hint.as_slice()) {
-                    prop_assert!(!filter.admits(skipped));
-                }
-            } else {
-                prop_assert!(!admitted);
-                for same_row in keys[i..].iter().filter(|x| x.starts_with(row)) {
-                    prop_assert!(!filter.admits(same_row));
+                Verdict::SkipRow => {
+                    for same_row in keys[i..].iter().filter(|x| x.starts_with(row)) {
+                        prop_assert!(!admits(same_row));
+                    }
                 }
             }
         }
@@ -298,20 +301,22 @@ fn time_range_applies_to_puts_only() {
     use pigeonhole_format::key::{Kind, encode_key, encode_marker_key};
     let mut f = ScanFilter::all();
     f.time_range = Some((10, 20));
+    let c = f.compile();
+    let admits = |k: &[u8]| c.check(k, &mut Vec::new()) == Verdict::Admit;
     let key = |ts, kind| {
         let mut k = Vec::new();
         encode_key(&mut k, b"r", b"q", ts, 1, kind).unwrap();
         k
     };
-    assert!(f.admits(&key(10, Kind::Put)));
-    assert!(!f.admits(&key(20, Kind::Put)));
-    assert!(!f.admits(&key(5, Kind::Put)));
+    assert!(admits(&key(10, Kind::Put)));
+    assert!(!admits(&key(20, Kind::Put)));
+    assert!(!admits(&key(5, Kind::Put)));
     for kind in [Kind::Merge, Kind::CellDelete, Kind::ColumnDelete] {
-        assert!(f.admits(&key(5, kind)));
+        assert!(admits(&key(5, kind)));
     }
     let mut m = Vec::new();
     encode_marker_key(&mut m, b"r", 5, 1).unwrap();
-    assert!(f.admits(&m));
+    assert!(admits(&m));
     assert!(!f.is_all());
     assert!(ScanFilter::all().is_all());
 }

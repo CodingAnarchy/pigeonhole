@@ -636,11 +636,18 @@ fn keys_out_of_order_in_a_data_block_are_corrupt() {
     let (mut logical, _) = block(&path, &meta, addr);
     // The second entry shares the first's prefix up to the row's last digit; its unshared
     // bytes start there. A smaller digit puts it before the first.
+    // The second entry starts where the first ends: the first is a restart (nothing shared),
+    // so its length is three varints (0, its key's length, its value's length), then its key
+    // and value (FORMAT §4.2).
     let offset = {
         let mut it = Block::new(logical.as_slice()).unwrap().into_cursor();
         it.seek_to_first().unwrap();
-        it.next().unwrap();
-        it.entry_offset()
+        let (k, v) = (it.key().len(), it.value().len());
+        let mut head = Vec::new();
+        for n in [0, k, v] {
+            pigeonhole_format::varint::put_u64(&mut head, n as u64);
+        }
+        head.len() + k + v
     };
     let (shared, unshared) = (logical[offset], logical[offset + 1]);
     assert!(shared > 0 && shared < 0x80 && unshared < 0x80);

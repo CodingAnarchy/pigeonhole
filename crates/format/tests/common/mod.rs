@@ -8,11 +8,32 @@ pub mod harness;
 use std::cmp::Reverse;
 
 use pigeonhole_format::compress::Compression;
-use pigeonhole_format::key::{Kind, encode_key, encode_marker_key};
+use pigeonhole_format::key::{Kind, encode_column_prefix, encode_key, encode_marker_key};
 use pigeonhole_format::manifest::{
     CachePriority, CompactionStyle, Edit, FamilyKind, FamilyOptions, SstMeta,
 };
 use pigeonhole_format::superblock::ExtentRef;
+
+/// The kind byte of a seek key (FORMAT §2): `0x00`, below every real kind.
+pub const SEEK_KIND: u8 = 0x00;
+
+/// Appends a seek key (FORMAT §2): `[row][00 01][qual][00 01][!ts][!seqno][00]`, the first
+/// possible entry of column `(row, qualifier)` with timestamp `<= ts` and, at `ts`, seqno
+/// `<= seqno`. No read path builds one; the golden `keys.bin` holds one, so this keeps its
+/// bytes.
+pub fn encode_seek_key(
+    out: &mut Vec<u8>,
+    row: &[u8],
+    qualifier: &[u8],
+    ts: u64,
+    seqno: u64,
+) -> pigeonhole_format::Result<()> {
+    encode_column_prefix(out, row, qualifier)?;
+    out.extend_from_slice(&(u64::MAX - ts).to_be_bytes());
+    out.extend_from_slice(&(u64::MAX - seqno).to_be_bytes());
+    out.push(SEEK_KIND);
+    Ok(())
+}
 use pigeonhole_format::{BlobFileId, FamilyId, Lsn, SstId, StreamId, TableId, TabletId};
 use proptest::collection::vec;
 use proptest::prelude::*;
