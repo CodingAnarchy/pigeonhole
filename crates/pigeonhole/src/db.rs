@@ -83,6 +83,7 @@ fn watched() -> Arc<Watched> {
 /// Runs `f` while another thread holds this process's watch registry locked (the fork test's
 /// seam: a fork inside `f` copies the lock held, by a thread the child does not have, into
 /// the child; perf287's S3 on #968).
+#[cfg(feature = "__unstable-hooks")]
 pub(crate) fn with_watch_registry_locked_elsewhere<R>(f: impl FnOnce() -> R) -> R {
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
@@ -788,8 +789,8 @@ impl Pigeonhole {
     /// until the [`Shard::set_wakeup`] callback fires (work arrived or I/O completed) or
     /// [`Shard::next_wakeup`] passes (background work is due), whichever comes first. An idle
     /// shard then uses no CPU, even while a write stall or a failed compaction's retry is
-    /// pending, beyond a short tablet-balancer pass (with [`Options::tablet_changes`] on, the
-    /// default): every 100 ms after writes, backing off to one every 10 s while idle.
+    /// pending, beyond a short tablet-balancer pass: every 100 ms after writes, backing off to
+    /// one every 10 s while idle.
     ///
     /// To close, call [`Pigeonhole::close`] and keep driving each shard the same way until
     /// [`Shard::closed`] returns `Some`, then drop it: the close's flush and syncs run on
@@ -874,10 +875,13 @@ impl Pigeonhole {
     ///   and runs again after the next open), waiting only for a slice a worker is running at
     ///   that moment. Then [`BackgroundWorker::closed`] is `true` and the worker can be
     ///   dropped.
-    /// - **A worker you stop driving** delays its tasks until the shards take them back: 10
-    ///   ms after any worker last looked, or 2 ms into a commit's wait for memtable room.
+    /// - **A worker you stop driving** delays its tasks until the shards take them back: a
+    ///   queued task no worker took, once no worker has looked for 10 ms; the tasks a worker
+    ///   holds that could run, once it has made no pass for 100 ms (never inside a slice);
+    ///   and a flush a worker holds but isn't running, 2 ms into a commit's wait for memtable
+    ///   room.
     ///   [`EngineMetrics::background_fallback_take_backs`](crate::EngineMetrics::background_fallback_take_backs)
-    ///   counts these, so a loop that forgot its workers shows up.
+    ///   counts the first two, so a loop that forgot its workers shows up.
     ///
     /// ```
     /// use std::thread;
@@ -1102,6 +1106,7 @@ impl Pigeonhole {
 
     /// Per-shard commits, tablets and tablet changes since open, indexed by shard: a bench
     /// hook (ICR 0010) that shows whether one table's writes spread over the shards.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn shard_stats(&self) -> Vec<crate::ShardStats> {
         self.engine()
@@ -1115,6 +1120,7 @@ impl Pigeonhole {
     /// same unless a growth or the first pack from all shards is pending), `None` before its
     /// first decision: a bench hook (D242's amendment, #983) so a warm-up does not end inside
     /// a regrow or before the first pack.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn pack_target(&self) -> Option<(usize, usize)> {
         self.engine().pack_target()
@@ -1123,6 +1129,7 @@ impl Pigeonhole {
     /// The driver threads the shards run on now and whether every shard is on its driver
     /// (D289 PR 2), `None` in application-owned mode: a bench hook, so a warm-up does not end
     /// while the load controller resizes.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn driver_target(&self) -> Option<(usize, bool)> {
         self.engine().driver_target()
@@ -1130,6 +1137,7 @@ impl Pigeonhole {
 
     /// Fixes the driver target at `k`, or with `None` gives it back to the controller (D289
     /// PR 2): for tests that move shards between drivers under load.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn force_driver_target(&self, k: Option<usize>) {
         self.engine().force_driver_target(k);
@@ -1141,6 +1149,7 @@ impl Pigeonhole {
     /// call starts the log; without
     /// [`Options::adaptive_shard_threads`](crate::Options::adaptive_shard_threads) it starts an
     /// observe-only controller that logs what it would decide but never resizes. A bench hook.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn driver_trace(&self) -> Vec<String> {
         self.engine().driver_trace()
@@ -1166,6 +1175,7 @@ impl Pigeonhole {
     /// Commit latency histograms per durability level since open, summed over shards: a
     /// bench hook (D213). Bucket `b` starts at
     /// [`commit_latency_floor(b)`](Self::commit_latency_floor) nanoseconds; subtract two readings for a phase.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn commit_latency_buckets(&self) -> [[u64; 64]; 4] {
         self.engine().commit_latency_buckets()
@@ -1173,6 +1183,7 @@ impl Pigeonhole {
 
     /// The lower bound in nanoseconds of [`commit_latency_buckets`](Self::commit_latency_buckets)'
     /// bucket `b`.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn commit_latency_floor(b: usize) -> u64 {
         pigeonhole_engine::Engine::commit_latency_floor(b)
@@ -1180,6 +1191,7 @@ impl Pigeonhole {
 
     /// Tablet changes refused for lack of room since open, as `(slot budget, view size)`:
     /// see the engine's `tablet_refusals`. A bench hook (#123).
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn tablet_refusals(&self) -> (u64, u64) {
         self.engine().tablet_refusals()
@@ -1188,6 +1200,7 @@ impl Pigeonhole {
     /// Bytes of async commits each shard holds submitted and not yet resolved (D210): a
     /// test hook. At most half `memtable_budget` a shard, or one commit larger than that
     /// alone.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn async_commit_inflight(&self) -> Vec<u64> {
         (0..self.engine().shard_stats().len())
@@ -1221,6 +1234,7 @@ impl Pigeonhole {
     /// D292's inline page-cache reads on this database's I/O backend so far (hits, misses
     /// and their times, refusals, breaker trips), or `None` on a backend without them. For
     /// benchmarks (ICR 0083); not part of the API.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn nowait_reads(&self) -> Option<pigeonhole_io::NowaitReads> {
         self.db.vfs.nowait_reads()
@@ -1827,8 +1841,8 @@ impl Shard {
     /// How long until background work on this shard is due (a write stall's pacing, a wait
     /// for memtable room, a failed compaction's retry, the tablet balancer's next pass), or
     /// `None` when none is waiting for a time. `Some(Duration::ZERO)` means it is due now.
-    /// With [`Options::tablet_changes`] on (the default) the balancer's next pass is always
-    /// pending, so this is never `None`; it is bounded by the balancer's current interval:
+    /// The tablet balancer's next pass is always pending, so this is never `None`; it is
+    /// bounded by the balancer's current interval:
     /// 100 ms after a write or a tablet change, doubling with each idle pass up to 10 s.
     ///
     /// With io_uring (the default on Linux, D218), I/O the shard submitted goes to

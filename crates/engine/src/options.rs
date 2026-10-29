@@ -41,8 +41,8 @@ pub struct EngineOptions {
     /// affinity mask, a cpuset) or turn this off.
     pub pin_threads: bool,
     /// Extra threads dedicated to flush and compaction; 0 (the default here) runs them on the
-    /// shards. `pigeonhole::Options` defaults engine-owned opens to one per four shards, 1 to
-    /// 4 (D252); this crate keeps 0 so its deterministic tests run flush on the shard.
+    /// shards. `pigeonhole::Options` defaults engine-owned opens to a quarter of the physical
+    /// cores (half with `CpuProfile::Server`), 1 to one per shard (D289); this crate keeps 0 so its deterministic tests run flush on the shard.
     /// Engine-owned mode only: [`Engine::open_application_owned`](crate::Engine::open_application_owned)
     /// refuses a nonzero value with `InvalidArgument` (decision D40).
     pub compaction_threads: usize,
@@ -52,7 +52,8 @@ pub struct EngineOptions {
     pub shard_threads: usize,
     /// Engine-owned mode only: size the driver threads to the load (D289 PR 2), up to
     /// `shard_threads` (one per shard if 0). Off by default here, so this crate's tests run
-    /// on fixed threads; `pigeonhole::Options` turns it on unless `shard_threads` is set.
+    /// on fixed threads; `pigeonhole::Options::adaptive_shard_threads` turns it on (opt-in,
+    /// #1015).
     pub adaptive_drivers: bool,
     /// Application-owned mode only: background workers for flush and compaction that the
     /// application drives from threads it owns (D284), handed out by
@@ -213,7 +214,6 @@ pub struct EngineOptions {
     /// and scans pass a finished column's superseded memtable versions in one jump (D194,
     /// on by default per D199). Same results either way. It costs a write that overwrites a
     /// column about 200 instructions (D199). Reader processes have no index and step.
-    /// `PIGEONHOLE_TAIL_INDEX=0` sets the default to off, for A/B runs.
     pub memtable_tail_index: bool,
     /// Bytes of async commits a shard holds submitted and not yet resolved before the next
     /// one waits to submit (D210). 0 (the default) means half `memtable_budget`.
@@ -265,7 +265,7 @@ impl EngineOptions {
             room_recheck_nanos: 1_000_000,
             commit_spin_nanos: 50_000,
             shard_spin_nanos: 200_000,
-            memtable_tail_index: std::env::var_os("PIGEONHOLE_TAIL_INDEX").is_none_or(|v| v != "0"),
+            memtable_tail_index: true,
             async_commit_bound: 0,
         }
     }

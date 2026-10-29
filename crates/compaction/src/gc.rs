@@ -28,8 +28,10 @@
 //! beyond `max_versions` are never purged there: a later delete of a newer bucket, or its
 //! expiry, would show an older one again, and compaction never changes a counter family's
 //! reads (reads apply the limit; the TTL and deletes reclaim the space). Two
-//! operands are combined only if no other source of the slot can hold a delete with a seqno
-//! between theirs (`GcPolicy::other_sources`), which would hide one but not the other.
+//! operands are combined only if no other source of the slot can hold an entry with a seqno
+//! between theirs, either one included (`GcPolicy::other_sources`): a delete would hide one
+//! but not the other, and a counter checkpoint (D291), a `Put` at the seqno of the newest
+//! operand it folded, already counts the older one (#1051).
 //!
 //! A counter delete hides only entries with a lower seqno, so besides the `min_ts_above` rule
 //! (useless there: every source holding a counter has timestamp 0) a bottommost delete
@@ -316,12 +318,13 @@ impl Gc {
         self.purgeable(ts) || (self.bottommost && self.row_guard.iter().all(|&(lo, _)| lo > seqno))
     }
 
-    /// Counter families: whether a delete from another source could have a seqno in
-    /// `(older, newer]`.
+    /// Counter families: whether another source could hold, between two operands at `older`
+    /// and `newer`, an entry that splits them: a delete with a seqno in `(older, newer]`
+    /// (hiding the older only), or a counter checkpoint (D291), a `Put` base at the seqno of
+    /// the newest operand it folded, with a seqno in `[older, newer)` (counting the older
+    /// already). Either way the two must stay apart (#1051).
     fn guarded(&self, older: Seqno, newer: Seqno) -> bool {
-        self.row_guard
-            .iter()
-            .any(|&(lo, hi)| lo <= newer && hi > older)
+        splits(&self.row_guard, older, newer)
     }
 
     /// Processes the next unit at the cursor (one family marker or one `(column, ts)` group),
@@ -658,5 +661,34 @@ impl Gc {
         if pending.is_some() {
             out.push(&self.acc_key, &self.acc);
         }
+    }
+}
+
+/// Whether a source with seqnos in one of `ranges` could split operands at `older` and
+/// `newer` ([`Gc::guarded`]): it reaches into `[older, newer]`.
+fn splits(ranges: &[(Seqno, Seqno)], older: Seqno, newer: Seqno) -> bool {
+    ranges.iter().any(|&(lo, hi)| lo <= newer && hi >= older)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::splits;
+
+    #[test]
+    fn a_source_reaching_either_operand_keeps_them_apart() {
+        // Operands at 5 and 6.
+        assert!(
+            splits(&[(2, 5)], 5, 6),
+            "a checkpoint at 5 already counts the older (#1051)"
+        );
+        assert!(
+            splits(&[(6, 9)], 5, 6),
+            "a delete at 6 hides the older only"
+        );
+        assert!(splits(&[(5, 6)], 5, 6));
+        assert!(splits(&[(0, u64::MAX)], 5, 6), "unknown sources");
+        assert!(!splits(&[(2, 4)], 5, 6), "entirely below both");
+        assert!(!splits(&[(7, 9)], 5, 6), "entirely above both");
+        assert!(!splits(&[], 5, 6));
     }
 }

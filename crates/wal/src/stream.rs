@@ -204,22 +204,11 @@ pub struct IoTracker(Arc<Shared>);
 
 impl fmt::Debug for IoTracker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("IoTracker")
-            .field("in_flight", &self.in_flight())
-            .finish()
+        f.debug_struct("IoTracker").finish()
     }
 }
 
 impl IoTracker {
-    /// How many submitted operations have not finished.
-    pub fn in_flight(&self) -> usize {
-        *self
-            .0
-            .in_flight
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
     /// Blocks until no submitted operation is in flight. Sets `closing_io` first, under the
     /// count's lock, so nothing is granted a token after this saw the count at zero: a
     /// spare preparation still running (one nobody polls meanwhile, on an application-owned

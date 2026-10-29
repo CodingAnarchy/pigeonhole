@@ -212,7 +212,12 @@ for t in worker_threads {
 - **Any thread may drive one,** including a thread that drives shards, and a worker may move between threads with no `release()`: its I/O completes inside `run_once`, synchronously, so it never leaves any in a thread's ring.
 - **How many:** a quarter of the shards is a good start. A worker takes flushes ahead of compactions, and at most two tasks at a time, leaving the rest to the other workers.
 - **The close never waits for you to drive a worker.** It takes back what the workers hold: a flush finishes on its shard; a compaction is dropped and runs again after the next open. It waits only for a slice a worker is running at that moment.
-- **A worker you stop driving** delays its tasks until the shards take them back: 10 ms after any worker last looked at the queue, or 2 ms into a commit's wait for memtable room. `EngineMetrics::background_fallback_take_backs` and `background_room_take_backs` count these; both stay 0 while the workers are driven.
+- **A worker you stop driving** delays its tasks until the shards take them back (D284):
+  - a queued task no worker has taken, once no worker has looked at the queue for 10 ms;
+  - the tasks a worker holds that could run (runnable, woken, or asleep past their deadline), once that worker has made no pass for 100 ms, and never while it is inside a slice (#1012);
+  - a flush a worker holds but isn't running, 2 ms into a commit's wait for memtable room.
+
+  `EngineMetrics::background_fallback_take_backs` (the first two) and `background_room_take_backs` (the third) count these; both stay 0 while the workers are driven.
 - `open_application_owned` (the tuple form) hands no workers out, so it refuses `background_workers(n)` with `n > 0` (`InvalidArgument`). Engine-owned `open` ignores the option: it starts `compaction_cores` threads of its own.
 
 ## Sync-only calls
@@ -226,7 +231,7 @@ These calls have no async form (owner decision recorded in [D196](../design/deci
   ```
 
 - **Open, close and schema calls:** `open`, `open_reader`, `open_application_owned`, `close`, `table(..)` with `create`, `create_if_missing` or `open`, and `drop_table`. They are short, and you usually call them at startup and shutdown.
-- **Cheap calls** that never wait on I/O in a writer process: `snapshot`, `write_batch`, `transaction`, the builders, `tables`, `shard_stats`, `engine_metrics`, and the durability getters and setters.
+- **Cheap calls** that never wait on I/O in a writer process: `snapshot`, `write_batch`, `transaction`, the builders, `tables`, `engine_metrics`, and the durability getters and setters.
 
 ## Next
 [Durability](durability.md) · [Scans and filters](scans-and-filters.md) · [Agent reference](agent-reference.md)

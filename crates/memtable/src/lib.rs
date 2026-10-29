@@ -440,11 +440,6 @@ impl ShardArena {
         blocks.saturating_sub(broken)
     }
 
-    /// The chunk size in bytes.
-    pub fn chunk_size(&self) -> usize {
-        self.chunk_size
-    }
-
     /// Calls `f(first, count)` for each run of free chunks.
     fn free_runs_each(&self, mut f: impl FnMut(usize, usize)) {
         let n = self.free.len();

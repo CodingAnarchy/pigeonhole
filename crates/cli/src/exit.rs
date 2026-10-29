@@ -80,6 +80,17 @@ impl Failure {
         }
     }
 
+    /// An input `phdb load` refuses before it opens anything: no `phdb dump` header, an empty
+    /// input included (exit 2, #1037).
+    pub(crate) fn not_a_dump(message: String) -> Self {
+        Self {
+            code: "BadInput".into(),
+            code_num: None,
+            message,
+            status: ExitStatus::USAGE,
+        }
+    }
+
     /// Bad input: a dump file `phdb load` can't read (exit 1).
     pub(crate) fn input(message: String) -> Self {
         Self {

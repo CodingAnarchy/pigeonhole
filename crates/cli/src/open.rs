@@ -201,7 +201,7 @@ pub(crate) fn for_write(cli: &Cli, path: &Path, create: bool) -> Result<Pigeonho
     })
 }
 
-/// The writer phdb opens as: one unpinned shard with no tablet changes, small caches, never
+/// The writer phdb opens as: one unpinned shard (so no tablet moves), small caches, never
 /// creating the file, and falling back to a read-only open (ICR 0059) for a database phdb
 /// cannot write: families whose merge operator phdb cannot know, or a feature a newer build
 /// added that this one may only read. That open writes nothing to the file.
@@ -214,7 +214,6 @@ fn options(cli: &Cli, create: bool) -> Options {
         .create_if_missing(create)
         .shards(1)
         .pin_threads(false)
-        .tablet_changes(false)
         .block_cache(BLOCK_CACHE)
         .row_cache(0)
         .read_only_fallback(true);

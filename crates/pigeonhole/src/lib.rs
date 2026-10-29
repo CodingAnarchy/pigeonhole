@@ -107,6 +107,19 @@ mod write;
 #[doc(hidden)]
 pub mod doc_support;
 
+/// Test hooks that are not methods (ICR 0085): only with the `__unstable-hooks` feature,
+/// hidden, unstable, and never needed by applications.
+#[cfg(feature = "__unstable-hooks")]
+#[doc(hidden)]
+pub mod hooks {
+    /// Runs `f` while another thread holds this process's registry of databases opened with
+    /// `Options::auto_recover` locked: a test forks inside `f` to check a forked child does
+    /// not wait for the lock it copied held (#968).
+    pub fn with_watch_registry_locked_elsewhere<R>(f: impl FnOnce() -> R) -> R {
+        crate::db::with_watch_registry_locked_elsewhere(f)
+    }
+}
+
 /// The user guide's and the READMEs' code samples, compiled and run as doctests.
 #[cfg(doctest)]
 mod guide {
@@ -165,6 +178,7 @@ pub use write::{CommitInfo, CommitTicket, Durability, RowMutation, Transaction, 
 
 pub use merge::{MergeError, MergeOperator};
 pub use metrics::RowCacheStats;
+#[cfg(feature = "__unstable-hooks")]
 #[doc(hidden)]
 pub use metrics::ShardStats;
 pub use recovery::{Failure, FailureCause};

@@ -224,3 +224,40 @@ fn a_flush_of_a_memtable_holding_a_checkpoint_combines_each_stripe() {
         "the snapshot stripe's operands: {after:?}"
     );
 }
+
+/// #1051's hazard at the engine (D287's flush combine and the compaction of L0 files): each
+/// round leaves a checkpoint above that round's operands, then more operands, a snapshot and
+/// a flush, so every L0 file holds a checkpoint between combinable operands, and the slot's
+/// other files sit beside it. Every snapshot reads its own total after the flushes and after
+/// a full compaction.
+#[test]
+fn checkpoints_in_l0_files_keep_every_read_through_flushes_and_compaction() {
+    let r = Rig::open(5, 1);
+    let mut total = 0i64;
+    let mut snaps = Vec::new();
+    let mut asked = 0;
+    for round in 0..6i64 {
+        for i in 0..20 {
+            r.incr(b"r", round * 100 + i + 1);
+            total += round * 100 + i + 1;
+        }
+        assert_eq!(r.latest(b"r"), total);
+        asked += 1;
+        r.handled(asked);
+        for _ in 0..5 {
+            r.incr(b"r", 1);
+            total += 1;
+        }
+        snaps.push((r.db.snapshot().unwrap(), total));
+        r.db.flush().unwrap();
+        for (s, want) in &snaps {
+            assert_eq!(r.at(s, b"r"), *want, "after flush {round}");
+        }
+    }
+    assert!(r.db.counter_checkpoints().0 >= 1, "no checkpoint was kept");
+    r.db.compact(None).unwrap();
+    for (s, want) in &snaps {
+        assert_eq!(r.at(s, b"r"), *want, "after the compaction");
+    }
+    assert_eq!(r.latest(b"r"), total);
+}

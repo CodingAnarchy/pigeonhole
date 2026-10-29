@@ -265,11 +265,6 @@ impl OpenedPager {
         self.superblock.flags & FLAG_CLEAN != 0
     }
 
-    /// The file's feature sets, from the current superblock (D269).
-    pub fn features(&self) -> Features {
-        self.superblock.features
-    }
-
     /// Turns a writable open into a read-only one after the manifest was read (a writer
     /// process that may not write this file, ICR 0059): `finish` then neither syncs nor
     /// upgrades, and the pager refuses root commits. The file handle stays as opened.

@@ -1815,11 +1815,6 @@ impl Engine {
         Ok(Arc::new(Engine { inner }))
     }
 
-    /// Writer or reader.
-    pub fn role(&self) -> Role {
-        self.inner.role
-    }
-
     // ---- catalog ----
 
     /// Creates a table with its families (a manifest commit).
@@ -2225,22 +2220,9 @@ impl Engine {
     }
 
     /// Reads one row, projected by `spec`, into `sink`: the cells go straight into the
-    /// caller's buffer, with no intermediate [`RowData`]. Returns whether the row has a
-    /// visible cell.
-    pub fn read_row_into(
-        &self,
-        snapshot: &Snapshot,
-        table: TableId,
-        row: &[u8],
-        spec: &ReadSpec,
-        sink: &mut impl read::RowSink,
-    ) -> Result<bool> {
-        self.read_row_into_families(snapshot, table, row, &spec.families, spec, sink)
-    }
-
-    /// As [`Engine::read_row_into`], reading `families` (empty: every family of the table)
-    /// instead of `spec.families`, so a caller with the ids at hand need not build a `Vec`
-    /// for them.
+    /// caller's buffer, with no intermediate [`RowData`]. Reads `families` (empty: every
+    /// family of the table) instead of `spec.families`, so a caller with the ids at hand need
+    /// not build a `Vec` for them. Returns whether the row has a visible cell.
     pub fn read_row_into_families(
         &self,
         snapshot: &Snapshot,

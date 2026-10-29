@@ -86,7 +86,9 @@ jobs:
           phdb="$RUNNER_TEMP/phdb/bin/phdb"
           "$phdb" --version
           db="$RUNNER_TEMP/smoke.phdb"
-          printf '' | "$phdb" load --create "$db" -
+          # A new, empty database: a dump with only its header (#1037; an empty input is
+          # refused).
+          echo '{"phdb":1,"command":"dump"}' | "$phdb" load --create "$db" -
           "$phdb" shell "$db" -c "create t f" -c "put t r f:q v" -c "get t r f:q" | grep -q 'v$'
           "$phdb" --format json info "$db" | grep -q '"name": "t"'
           "$phdb" check "$db"

@@ -78,8 +78,9 @@ pub enum CpuProfile {
     #[default]
     Embedded,
     /// The database has the machine or container to itself, and its clients reach it from
-    /// elsewhere (another container, over IPC or the network): the engine's threads take
-    /// all but a small fixed headroom of the physical cores.
+    /// elsewhere (another container, over IPC or the network): flush and compaction take
+    /// half the physical cores instead of a quarter. Shard threads are the same as with
+    /// `Embedded`, one per shard by default.
     Server,
 }
 
@@ -210,9 +211,11 @@ impl Options {
         self
     }
 
-    /// Number of shard threads (default: one per physical core the process may run on, D220;
-    /// SMT siblings count once, and a cgroup CPU quota still caps it). `1` is a valid
-    /// single-threaded configuration.
+    /// Number of shards, the data partitions each row belongs to (default: one per physical
+    /// core the process may run on, D220; SMT siblings count once, and a cgroup CPU quota
+    /// still caps it). Each shard runs on a thread of its own unless
+    /// [`shard_threads`](Options::shard_threads) says otherwise (D289).
+    /// `1` is a valid configuration.
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
         self
@@ -222,8 +225,9 @@ impl Options {
     /// [`pin_threads`](Options::pin_threads) is on); `0` runs them on the shard threads, in
     /// time slices between commits.
     ///
-    /// - **Default (D252):** engine-owned mode starts one per four shards, at least one and
-    ///   at most four (16 shards: 4; 8: 2; up to 7: 1). On a shard thread a flush or
+    /// - **Default (D289, ICR 0081):** engine-owned mode starts a quarter of the physical
+    ///   cores (half with [`CpuProfile::Server`]), at least one and at most one per shard
+    ///   (16 cores: 4, or 8 with `Server`). On a shard thread a flush or
     ///   compaction slice holds up every commit queued behind it for up to half a
     ///   millisecond, which is most of the write tail on contended workloads.
     /// - **Pinning:** they take the CPUs after the shards' (the shards' SMT siblings first).
@@ -232,7 +236,8 @@ impl Options {
     /// - **Application-owned mode** starts no threads, so its default is `0`, and
     ///   [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
     ///   fails with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when
-    ///   `k > 0` (decision D40); flush and compaction then run on the shards you drive.
+    ///   `k > 0` (decision D40); flush and compaction then run on the shards you drive, or
+    ///   on background workers ([`Options::background_workers`], D284).
     pub fn compaction_cores(mut self, k: usize) -> Self {
         self.compaction_cores = Some(k);
         self
@@ -375,6 +380,9 @@ impl Options {
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// How long a thread waiting for its buffered (or non-durable) commit polls for the
     /// result before it sleeps (default 50 µs). A shard usually answers within a few
     /// microseconds, and putting the thread to sleep and waking it costs that again or more
@@ -389,17 +397,24 @@ impl Options {
     /// let options = Options::default().commit_spin(Duration::ZERO).shard_spin(Duration::ZERO);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn commit_spin(mut self, window: Duration) -> Self {
         self.commit_spin = Some(window);
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// How long a shard thread that just handled a commit keeps polling for the next one
     /// before it sleeps (default 200 µs, D198 as amended on 2026-10-19), so a steady stream
     /// of commits is taken without waking the thread each time, and a store whose clients
     /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
     /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
     /// by application-owned shards, whose loop the application runs.
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
         self
@@ -435,8 +450,7 @@ impl Options {
     /// profile fills in the rest.
     ///
     /// - **Shard threads, both profiles:** one per shard, so one per physical core by
-    ///   default. With [`adaptive_shard_threads`](Options::adaptive_shard_threads) that is
-    ///   the most, and a lighter load runs on fewer.
+    ///   default.
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
     ///   and needs CPU too. Flush and compaction take a quarter of the physical cores.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
@@ -460,6 +474,9 @@ impl Options {
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// Experimental, off by default: size the shard threads to the load (D289's controller,
     /// ICR 0081). The engine starts a thread per shard, then moves the shards of a light load
     /// onto fewer threads, which sleep less, so a commit less often waits for a sleeping thread
@@ -482,6 +499,8 @@ impl Options {
     /// let options = Options::default().adaptive_shard_threads(true);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn adaptive_shard_threads(mut self, on: bool) -> Self {
         self.adaptive_shard_threads = on;
         self
@@ -524,9 +543,11 @@ impl Options {
     /// cache keeps the newest version of each cell of small, hot family rows and serves
     /// latest row reads (newest version, no time range) and point gets from it, without
     /// merging the row's sources. A family row is stored the second time a read misses it,
-    /// so rows read once are never stored. Results are identical to uncached reads; a write
-    /// to a row makes its cached copy miss at once (D201). Snapshot reads, scans and
-    /// multi-version reads bypass it. Reader processes have their own
+    /// so rows read once are never stored. Results are identical to uncached reads. Point
+    /// gets at a snapshot or in a transaction are served from it too (D290). A commit that
+    /// only overwrites cached cells with puts moves the cached copy forward (commits of at
+    /// most 16 rows and 64 mutations; the row's other families miss); any other write makes
+    /// it miss at once (D201). Snapshot row reads, scans and multi-version reads bypass it. Reader processes have their own
     /// ([`ReaderOptions::row_cache`], D281).
     pub fn row_cache(mut self, bytes: usize) -> Self {
         self.row_cache = bytes;
@@ -543,6 +564,7 @@ impl Options {
     /// A counter read that folds at least `steps` increments keeps its result as the
     /// counter's base, so its next reads stop there (D291; default 128, 0 turns it off). For
     /// tests and benchmarks.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn counter_checkpoint_steps(mut self, steps: u64) -> Self {
         self.counter_checkpoint_steps = Some(steps);
@@ -553,6 +575,7 @@ impl Options {
     /// Linux; default on), set on the database's I/O backend at open (ICR 0083). A backend
     /// passed through [`Options::vfs`] is shared: every database on it sees the change. For
     /// benchmarks comparing the two.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn nowait_reads(mut self, on: bool) -> Self {
         self.nowait_reads = Some(on);
@@ -632,12 +655,6 @@ impl Options {
         self
     }
 
-    /// Open even if a family names an unregistered merge operator.
-    #[deprecated(note = "use `read_only_fallback`, which also covers this case")]
-    pub fn allow_unregistered_merge_operators(self, yes: bool) -> Self {
-        self.read_only_fallback(yes)
-    }
-
     /// Accept a database on a FUSE filesystem (default off; decision D173). Use it only for a
     /// **local** FUSE mount you trust, such as ntfs-3g or an encrypted home directory
     /// (gocryptfs). FUSE byte-range locks may be local to one host, so two hosts could
@@ -686,6 +703,9 @@ impl Options {
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// Let a table's tablets split, merge and move between shards (default on), so the
     /// writes of one table spread over every shard. Off, each table is one tablet on one
     /// shard: writes to a single table use one shard thread whatever [`shards`](Self::shards)
@@ -705,11 +725,16 @@ impl Options {
     /// let options = Options::default().shards(4).tablet_changes(false);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn tablet_changes(mut self, yes: bool) -> Self {
         self.tablet_changes = yes;
         self
     }
 
+    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
+    /// the API: the default suits applications.
+    ///
     /// Pack a lightly written store's tablets onto few shards (default on; D217). While the
     /// shards' threads are mostly idle, the balancer keeps the tablets being written on as few
     /// shards as stay about half busy, so a commit seldom has to wake a sleeping shard
@@ -729,6 +754,8 @@ impl Options {
     /// let options = Options::default().tablet_packing(false);
     /// # let _ = options;
     /// ```
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
     pub fn tablet_packing(mut self, yes: bool) -> Self {
         self.tablet_packing = yes;
         self
@@ -736,6 +763,7 @@ impl Options {
 
     /// Run on a custom filesystem implementation. Used by the deterministic simulation
     /// suites; applications never need it.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn vfs(mut self, vfs: pigeonhole_io::VfsRef) -> Self {
         self.vfs = Some(vfs);
@@ -745,6 +773,7 @@ impl Options {
     /// WAL segment size in bytes (default 64 MiB; a multiple of 32 KiB, decision D43). A test
     /// hook (ICR 0005): small segments keep simulated opens fast. It also lowers the largest
     /// value a commit may carry (decision D16). Applications never need it.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn wal_segment_size(mut self, bytes: u64) -> Self {
         self.wal_segment_size = Some(bytes);
@@ -755,6 +784,7 @@ impl Options {
     /// once a shard writes `min_writes` rows in one, and size splits at `split_bytes`. The
     /// simulation suites use tiny values so tablets change during short runs. Only read with
     /// [`tablet_changes`](Self::tablet_changes) on. Applications never need it.
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn tablet_balance(mut self, interval: Duration, min_writes: u64, split_bytes: u64) -> Self {
         self.tablet_balance = Some((interval, min_writes, split_bytes));
@@ -851,6 +881,7 @@ impl ReaderOptions {
     }
 
     /// Custom filesystem (simulation).
+    #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn vfs(mut self, vfs: pigeonhole_io::VfsRef) -> Self {
         self.vfs = Some(vfs);
@@ -1233,18 +1264,14 @@ pub struct IoRings {
     pub inline: u64,
 }
 
-/// The backend `backend` names; unset, the one `PIGEONHOLE_IO` names (a test variable:
-/// `pread`, `uring` or `auto`), else [`IoBackend::Auto`] (D218). For an application-owned open,
-/// an io_uring backend without a reaper thread.
+/// The backend `backend` names; unset, [`IoBackend::Auto`] (D218), or with the
+/// `__unstable-hooks` feature the one `PIGEONHOLE_IO` names (a test variable: `pread`, `uring`
+/// or `auto`). For an application-owned open, an io_uring backend without a reaper thread.
 fn backend_vfs(
     backend: Option<IoBackend>,
     application_owned: bool,
 ) -> Result<VfsRef, pigeonhole_engine::Error> {
-    let backend = backend.unwrap_or_else(|| match std::env::var("PIGEONHOLE_IO").as_deref() {
-        Ok("pread") => IoBackend::Pread,
-        Ok("uring") => IoBackend::Uring,
-        _ => IoBackend::Auto,
-    });
+    let backend = backend.unwrap_or_else(env_io_backend);
     let pread = || -> VfsRef { pigeonhole_io::pread::PreadVfs::new(0) };
     match backend {
         IoBackend::Pread => Ok(pread()),
@@ -1255,10 +1282,22 @@ fn backend_vfs(
     }
 }
 
-/// `PIGEONHOLE_DIRECT=1` (a test variable) turns direct I/O on where the options leave it
-/// unset.
+/// The backend `PIGEONHOLE_IO` names (a test variable, read only with the
+/// `__unstable-hooks` feature), else [`IoBackend::Auto`].
+fn env_io_backend() -> IoBackend {
+    #[cfg(feature = "__unstable-hooks")]
+    match std::env::var("PIGEONHOLE_IO").as_deref() {
+        Ok("pread") => return IoBackend::Pread,
+        Ok("uring") => return IoBackend::Uring,
+        _ => {}
+    }
+    IoBackend::Auto
+}
+
+/// `PIGEONHOLE_DIRECT=1` (a test variable, read only with the `__unstable-hooks` feature)
+/// turns direct I/O on where the options leave it unset.
 fn env_direct_io() -> bool {
-    std::env::var("PIGEONHOLE_DIRECT").as_deref() == Ok("1")
+    cfg!(feature = "__unstable-hooks") && std::env::var("PIGEONHOLE_DIRECT").as_deref() == Ok("1")
 }
 
 /// An io_uring backend, if the kernel offers one.
