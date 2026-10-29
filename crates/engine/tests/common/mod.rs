@@ -3362,12 +3362,23 @@ impl World {
                 Err(e) => return fail(FailureClass::Protocol, format!("get: {e}")),
             };
             let model = match self.model.try_get(table, row, family, qualifier, ms, now) {
-                Ok(m) => m.map(|c| c.value),
+                Ok(m) => m,
                 Err(_) => return Ok(()),
             };
-            let is_commit = got.as_deref() == Some(value.as_slice());
+            // D179: a default-timestamp put in a counter family lands at the counter's fixed
+            // timestamp 0, so under any version with a later timestamp (a bucket), and already
+            // expired in a family with a TTL. There a read is the same with or without the
+            // commit: the cell cannot show it (#1071).
+            let hidden = is_sum(family)
+                && (model.as_ref().is_some_and(|c| c.ts > 0)
+                    || families()
+                        .iter()
+                        .any(|f| f.name == *family && f.ttl_micros > 0));
+            let model = model.map(|c| c.value);
+            let is_commit = !hidden && got.as_deref() == Some(value.as_slice());
             let is_model = got == model;
             seen.push(match (is_commit, is_model) {
+                (true, true) | (false, true) if hidden => None,
                 (true, true) => None,
                 (true, false) => Some(true),
                 (false, true) => Some(false),
