@@ -268,3 +268,44 @@ fn checkpoints_in_l0_files_keep_every_read_through_flushes_and_compaction() {
     }
     assert_eq!(r.latest(b"r"), total);
 }
+
+/// A read at an old snapshot counts toward the checkpoint trigger only the entries its fold
+/// reads, not the newer ones it steps over: 100 operands under the snapshot and 200 above
+/// it ask for nothing at the default 128. A latest read of all 300 then asks for one, and
+/// the only checkpoint is that read's, above the snapshot (the shard handles a client's
+/// checkpoints in the order sent).
+#[test]
+fn an_old_snapshot_read_does_not_count_the_entries_above_it() {
+    use pigeonhole_format::Kind;
+    use pigeonhole_format::key::decode_key;
+
+    let r = Rig::open(6, 128);
+    for _ in 0..100 {
+        r.incr(b"r", 1);
+    }
+    let old = r.db.snapshot().unwrap();
+    for _ in 0..200 {
+        r.incr(b"r", 1);
+    }
+    assert_eq!(r.at(&old, b"r"), 100);
+    assert_eq!(r.latest(b"r"), 300);
+    assert_eq!(r.handled(1), (1, 0));
+    let snap = r.db.snapshot().unwrap();
+    let puts: Vec<u64> =
+        r.db.raw_entries(&snap)
+            .unwrap()
+            .iter()
+            .filter(|e| e.family == r.c)
+            .filter_map(|e| {
+                let k = decode_key(&e.key).unwrap();
+                (k.kind == Kind::Put).then_some(k.seqno)
+            })
+            .collect();
+    assert_eq!(puts.len(), 1, "one checkpoint: {puts:?}");
+    assert!(
+        puts[0] > old.seqno(),
+        "the old snapshot's read asked for a checkpoint: {puts:?}"
+    );
+    assert_eq!(r.db.counter_checkpoints(), (1, 0));
+    assert_eq!(r.at(&old, b"r"), 100);
+}
