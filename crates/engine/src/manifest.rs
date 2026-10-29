@@ -444,6 +444,15 @@ impl ManifestQueue {
         std::mem::take(&mut *self.reqs.lock().unwrap_or_else(PoisonError::into_inner))
     }
 
+    /// Requests waiting (test hook).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn len(&self) -> usize {
+        self.reqs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.reqs
             .lock()
@@ -665,6 +674,20 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 req.readers.retain(|(id, _)| !ids.contains(id));
                 abandon_ssts(shared, &added_ssts(&gone));
                 abandon_blobs(shared, &added_blobs(&catalog, &gone));
+                // Freed now, so no longer the request's to free if it is refused later
+                // (simp724's N1 on #1056: the refusal arm frees `on_refusal`).
+                let blob_files: Vec<BlobFileId> = gone
+                    .iter()
+                    .filter_map(|e| match e {
+                        Edit::PutBlobFile { blob_file, .. } => Some(*blob_file),
+                        _ => None,
+                    })
+                    .collect();
+                req.on_refusal.retain(|e| match e {
+                    Edit::AddSst { meta, .. } => !ids.contains(&meta.id),
+                    Edit::PutBlobFile { blob_file, .. } => !blob_files.contains(blob_file),
+                    _ => true,
+                });
             }
             kept
         });
@@ -688,6 +711,10 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             }
         }
         let readers_of_req = &mut req.readers;
+        // A closure request names what to free if it is refused (`on_refusal`); the refusal
+        // below frees that, so the orphan check must not free the same output too (#1056:
+        // the second free could hand back another task's output allocated meanwhile).
+        let refusal_frees = !req.on_refusal.is_empty();
         let own = own.and_then(|own| {
             // Tablets the request itself creates (a split's or merge's outputs) are not
             // orphans.
@@ -701,7 +728,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             if own.iter().any(|e| orphaned(&catalog, e, &created)) {
                 // Output for a dropped table is never published: free it now. A tablet
                 // change only re-references SSTs it does not own, so it frees nothing.
-                if !is_tablets {
+                if !is_tablets && !refusal_frees {
                     readers_of_req.clear();
                     abandon_ssts(shared, &added_ssts(&own));
                     abandon_blobs(shared, &added_blobs(&catalog, &own));

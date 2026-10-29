@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+- **A compaction's output is freed once, not twice, when its table is dropped just before the compaction commits** (#1056). If a `drop_table` committed after a compaction had checked its table but before the compaction's own manifest commit, the manifest freed the compaction's output SST twice: once as an orphan, and again as the refused request's output, for a compaction with a purge guard or new blob files. Another flush or compaction allocating space between the two could lose an extent it still used, which it then published over free space. Present since 0.2.0.
+
 ### Security
 - zstd is now 0.14.3, with zstd-safe 8.2 and zstd-sys 2.1.2, up from 0.13.3. The upgrade clears RUSTSEC-2026-0391, 0398, 0403 and 0410. Pigeonhole called only zstd's one-shot `bulk` API and never the stream encoders or decoders those advisories describe. The bundled libzstd is still 1.5.7, so compressed blocks are byte-identical. Files written by earlier releases read as before, and a test now decodes a zstd-sealed block written by 0.13.
 
