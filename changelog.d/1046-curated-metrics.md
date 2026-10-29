@@ -3,4 +3,4 @@
 - **Breaking:** `WalFile::checkpoint` and `end` are a `WalPosition { epoch, offset }` instead of tuples.
 
 ### Removed
-- **Breaking:** `CrossShardMetrics::refused_below_floor` and `refused_move_raise`, which were deprecated and always 0.
+- **Breaking:** `CrossShardMetrics::refused_below_floor` and `refused_move_raise`, always 0 since cross-shard commits pick their timestamp at their decision (D263), so no participant refuses a round for its timestamp.
