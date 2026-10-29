@@ -1,2 +1,0 @@
-### Fixed
-- **Point gets on wide rows are fast again** (#1059). Since D290, a get that missed a row twice read the whole family row to fill the row cache, even a row too wide for the cache (over `row_cache_max_row`, 4 KiB by default), which it then didn't store. A get on such a row cost a row read: on the reference machine, sparse-wide's get p99 went from 11 µs to about 300 µs. A get's fill now stops reading as soon as the row passes the cap, marks the row oversize, and reads its cell as usual; later gets don't try again until the row is written.
