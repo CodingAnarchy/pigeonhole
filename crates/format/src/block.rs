@@ -794,8 +794,9 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
     }
 
     /// Positions on the entry at `offset`, whose header `e` is already decoded, taking its
-    /// shared prefix from the current key.
-    #[inline]
+    /// shared prefix from the current key. Always inlined: `load` (every `next`) and `seek`
+    /// both call it, and a call per entry stepped costs more than the copy.
+    #[inline(always)]
     fn apply(&mut self, offset: usize, e: Entry) -> crate::Result<()> {
         let bytes: &[u8] = &self.block.bytes;
         if e.shared == 0 {
@@ -836,13 +837,21 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
     /// (`seek_forward`) must not move it out of line.
     #[inline(always)]
     fn restart_key(&self, i: usize) -> crate::Result<&[u8]> {
-        let e = self.block.entry(self.block.restart(i)?)?;
+        let (_, e) = self.restart_entry(i)?;
+        Ok(&self.block.bytes[e.unshared])
+    }
+
+    /// Restart entry `i`: its offset and decoded header (its key is stored whole).
+    #[inline(always)]
+    fn restart_entry(&self, i: usize) -> crate::Result<(usize, Entry)> {
+        let at = self.block.restart(i)?;
+        let e = self.block.entry(at)?;
         if e.shared != 0 {
             return Err(Error::Corrupt {
                 what: "block restart entry",
             });
         }
-        Ok(&self.block.bytes[e.unshared])
+        Ok((at, e))
     }
 
     /// The first row start after the current entry, if any.
@@ -904,11 +913,17 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
             return Ok(());
         }
         // Last restart whose key is < target; scanning forward from it finds the answer.
+        // The search keeps the entry it last moved `lo` to, so it is positioned on without
+        // decoding it again (restart 0 is decoded only if `lo` never moved).
         let (mut lo, mut hi) = (0, self.block.restart_count);
+        let mut lo_entry = None;
         while hi - lo > 1 {
             let mid = lo + (hi - lo) / 2;
-            match self.restart_key(mid) {
-                Ok(k) if k < target => lo = mid,
+            match self.restart_entry(mid) {
+                Ok((at, e)) if self.block.bytes[e.unshared.clone()] < *target => {
+                    lo = mid;
+                    lo_entry = Some((at, e));
+                }
                 Ok(_) => hi = mid,
                 Err(e) => {
                     self.invalidate();
@@ -916,7 +931,13 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
                 }
             }
         }
-        self.load_restart(lo)?;
+        match lo_entry {
+            Some((at, e)) => {
+                self.key = KeySrc::Block(0..0);
+                self.apply(at, e)?;
+            }
+            None => self.load_restart(lo)?,
+        }
         while self.valid() && self.key() < target {
             self.next()?;
         }
