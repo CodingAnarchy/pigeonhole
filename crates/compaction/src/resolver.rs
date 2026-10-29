@@ -4,7 +4,8 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use pigeonhole_format::key::{
-    Kind, MARKER_QUALIFIER, SUFFIX_LEN, TERMINATOR, escape_into, row_prefix_len, split_suffix,
+    Kind, MARKER_QUALIFIER, SUFFIX_LEN, TERMINATOR, common_prefix_len, escape_into, row_prefix_len,
+    split_suffix,
 };
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{ValueRef, ValueTag, decode_value};
@@ -354,26 +355,6 @@ fn locate_key(k: &[u8], col: &[u8], row: &[u8]) -> (bool, bool) {
     let in_col = cp == col.len() && k.len() == col.len() + SUFFIX_LEN;
     let same_row = !row.is_empty() && cp >= row.len();
     (in_col, same_row)
-}
-
-/// The length of the longest common prefix of `a` and `b`, eight bytes at a time.
-// Always inlined, with `locate_key` (D291's two `group` instances, D193).
-#[inline(always)]
-fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
-    let n = a.len().min(b.len());
-    let mut i = 0;
-    while i + 8 <= n {
-        let x = u64::from_le_bytes(a[i..i + 8].try_into().expect("8 bytes"));
-        let y = u64::from_le_bytes(b[i..i + 8].try_into().expect("8 bytes"));
-        if x != y {
-            return i + ((x ^ y).trailing_zeros() / 8) as usize;
-        }
-        i += 8;
-    }
-    while i < n && a[i] == b[i] {
-        i += 1;
-    }
-    i
 }
 
 /// `max(a, b)` over optional timestamps.
@@ -1294,24 +1275,5 @@ where
             self.col_skip = true;
         }
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::common_prefix_len;
-
-    #[test]
-    fn common_prefix_len_finds_the_first_difference() {
-        let a: Vec<u8> = (0..40).collect();
-        for at in 0..40 {
-            let mut b = a.clone();
-            b[at] ^= 0x80;
-            assert_eq!(common_prefix_len(&a, &b), at, "differ at {at}");
-        }
-        assert_eq!(common_prefix_len(&a, &a), 40);
-        assert_eq!(common_prefix_len(&a[..13], &a), 13);
-        assert_eq!(common_prefix_len(&a, &a[..21]), 21);
-        assert_eq!(common_prefix_len(&[], &a), 0);
     }
 }

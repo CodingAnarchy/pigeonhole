@@ -63,7 +63,8 @@ pub fn compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
 /// assert_eq!(common_prefix_len(b"row", b"row:1"), 3);
 /// assert_eq!(common_prefix_len(b"", b"x"), 0);
 /// ```
-#[inline]
+// Always inlined: the compaction resolver compares every cell's key with it (D193).
+#[inline(always)]
 pub fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
     let n = a.len().min(b.len());
     let (mut x, mut y) = (&a[..n], &b[..n]);
