@@ -1768,10 +1768,6 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
 /// SST source can (ICR 0041), or a memtable source with the stale-tail index (D194), so a
 /// read of index-less memtables alone never pays for a try that cannot succeed.
 fn skips_columns(sources: &[Source]) -> bool {
-    #[cfg(feature = "test-hooks")]
-    if crate::shard::READS_STEP.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
     sources.iter().any(|s| match s {
         Source::Mem(m) => m.inner().skips_columns(),
         Source::Sst(_) => true,

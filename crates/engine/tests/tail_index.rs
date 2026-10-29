@@ -2,9 +2,11 @@
 //! versions, never what they return. Random overwrite-heavy histories (puts at newer, older
 //! and equal timestamps, cell deletes at a put's timestamp, column deletes, merge operands
 //! and counter buckets), partly flushed, are read at several snapshots with several specs,
-//! once jumping and once stepping over the same memtables (`Engine::set_tail_index`), and
-//! the results must be identical. The jump count makes sure the jumps ran. One
-//! application-owned shard over `SimVfs`; prints the seed on failure.
+//! once over memtables with the index (jumping) and once without (stepping,
+//! `EngineOptions::memtable_tail_index` off), and the results must be identical. The jump
+//! count makes sure the jumps ran. SST column skips (ICR 0041) run in both, and
+//! `pigeonhole-sst`'s tests check them against stepping. One application-owned shard over
+//! `SimVfs`; prints the seed on failure.
 
 mod common;
 
@@ -44,12 +46,13 @@ const READER: pigeonhole_io::ProcessId = pigeonhole_io::ProcessId {
 type Cells = Vec<(u32, Vec<u8>, u64, Vec<u8>)>;
 
 impl Rig {
-    fn open(seed: u64) -> Self {
+    /// One shard over a fresh `SimVfs`, its memtables with the stale-tail index or without.
+    fn open(seed: u64, tail_index: bool) -> Self {
         let vfs = SimVfs::new(seed);
         let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
         o.tablet_changes = false;
         o.compaction.l0_trigger = u32::MAX;
-        o.memtable_tail_index = true;
+        o.memtable_tail_index = tail_index;
         let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
         let mut shard = shards.remove(0);
         while shard.run_once(u64::MAX) {}
@@ -178,9 +181,20 @@ impl Rng {
     }
 }
 
-/// One seeded history; returns the jumps the reader process took (D277).
-fn history(seed: u64) -> u64 {
-    let mut rig = Rig::open(seed);
+/// What one run of a seeded history read: each snapshot's reads, then the final state's
+/// reads by the writer and by a reader process, and the memtable jumps the reader took.
+struct Played {
+    snaps: Vec<Vec<Cells>>,
+    writer: Vec<Cells>,
+    reader: Vec<Cells>,
+    reader_jumps: u64,
+}
+
+/// One seeded history over memtables with the stale-tail index (`tail_index`), whose reads
+/// jump a finished column's superseded versions, or without it, whose reads step over them.
+/// The same writes and flushes either way.
+fn play(seed: u64, tail_index: bool) -> Played {
+    let mut rig = Rig::open(seed, tail_index);
     let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
     let fams: Vec<_> = rig.t.families.iter().map(|f| f.id).collect();
     let (f, v, m, c) = (fams[0], fams[1], fams[2], fams[3]);
@@ -240,24 +254,14 @@ fn history(seed: u64) -> u64 {
         }
     }
     snaps.push(rig.db.snapshot().unwrap());
-    for (i, snap) in snaps.iter().enumerate() {
-        Engine::set_tail_index(true);
-        let jumping = rig.read_all(snap);
-        Engine::set_tail_index(false);
-        let stepping = rig.read_all(snap);
-        Engine::set_tail_index(true);
-        for (j, (a, b)) in jumping.iter().zip(&stepping).enumerate() {
-            assert_eq!(a, b, "seed {seed}, snapshot {i}, read {j}");
-        }
-    }
+    let snap_reads = snaps.iter().map(|snap| rig.read_all(snap)).collect();
     drop(snaps);
 
     // D277: a reader process reads the same memtables through the shared arena, jumping by
-    // the tails the writer stored in the nodes. Its reads (jumping and stepping) return
-    // exactly what the writer's do at the same state.
+    // the tails the writer stored in the nodes (with the index) or stepping (without).
     let writer = pigeonhole_io::Vfs::current_process(&*rig.vfs);
     let writer_snap = rig.db.snapshot().unwrap();
-    let want = rig.read_all(&writer_snap);
+    let writer_reads = rig.read_all(&writer_snap);
     drop(writer_snap);
     rig.vfs.enter_process(READER);
     let reader = Engine::open_reader(
@@ -267,29 +271,56 @@ fn history(seed: u64) -> u64 {
     .unwrap();
     let snap = reader.snapshot().unwrap();
     let before = Engine::tail_skips();
-    Engine::set_tail_index(true);
-    let jumping = read_all_on(&reader, &rig.t, &snap, rig.specs());
+    let reader_reads = read_all_on(&reader, &rig.t, &snap, rig.specs());
     let reader_jumps = Engine::tail_skips() - before;
-    Engine::set_tail_index(false);
-    let stepping = read_all_on(&reader, &rig.t, &snap, rig.specs());
-    Engine::set_tail_index(true);
     drop(snap);
     drop(reader);
     rig.vfs.enter_process(writer);
-    for (j, ((a, b), w)) in jumping.iter().zip(&stepping).zip(&want).enumerate() {
-        assert_eq!(a, b, "seed {seed}, reader read {j}: jumping vs stepping");
-        assert_eq!(a, w, "seed {seed}, reader read {j}: reader vs writer");
-    }
 
     let Rig { db, mut shard, .. } = rig;
     db.close().unwrap();
     while shard.closed().is_none() {
         shard.run_once(u64::MAX);
     }
-    reader_jumps
+    Played {
+        snaps: snap_reads,
+        writer: writer_reads,
+        reader: reader_reads,
+        reader_jumps,
+    }
 }
 
-/// One test, so nothing else in this binary flips the process-wide switch meanwhile.
+/// One seeded history, played with the index and without: every read returns the same
+/// cells, the writer's and a reader process's alike. Returns the jumps the reader process
+/// took with the index (D277).
+fn history(seed: u64) -> u64 {
+    let jumping = play(seed, true);
+    let stepping = play(seed, false);
+    assert_eq!(
+        stepping.reader_jumps, 0,
+        "seed {seed}: jumps without the index"
+    );
+    for (i, (a, b)) in jumping.snaps.iter().zip(&stepping.snaps).enumerate() {
+        for (j, (a, b)) in a.iter().zip(b).enumerate() {
+            assert_eq!(a, b, "seed {seed}, snapshot {i}, read {j}");
+        }
+    }
+    for (j, (((a, b), w), v)) in jumping
+        .reader
+        .iter()
+        .zip(&stepping.reader)
+        .zip(&jumping.writer)
+        .zip(&stepping.writer)
+        .enumerate()
+    {
+        assert_eq!(a, b, "seed {seed}, reader read {j}: jumping vs stepping");
+        assert_eq!(a, w, "seed {seed}, reader read {j}: reader vs writer");
+        assert_eq!(w, v, "seed {seed}, writer read {j}: jumping vs stepping");
+    }
+    jumping.reader_jumps
+}
+
+/// One test: the jump counters are process-wide.
 #[test]
 fn jumping_reads_return_what_stepping_reads_return() {
     // At least the default 12 seeds, whatever `PIGEONHOLE_SEEDS` asks (#810): the counts

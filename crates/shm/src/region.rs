@@ -728,13 +728,6 @@ impl ShmRegion {
         (self.inner.region.clone(), offset, len)
     }
 
-    /// Binds `shard`'s arena to NUMA node `node` (writer, at shard start). `mbind` on Linux;
-    /// a no-op elsewhere and for heap regions.
-    pub fn bind_arena(&self, shard: u32, node: u32) -> Result<()> {
-        let (region, offset, len) = self.arena(shard);
-        Ok(region.bind_numa(offset, len, node)?)
-    }
-
     /// The `(offset, len)` of every arena together: the region's tail, from the first
     /// arena's start to the end.
     fn arenas_range(&self) -> (usize, usize) {
@@ -1364,7 +1357,6 @@ mod tests {
         assert_eq!(len, 2 << 20);
         assert_eq!(off % (2 << 20), 0);
         assert!(off + len <= region.len());
-        shm.bind_arena(1, 0).unwrap();
     }
 
     #[test]

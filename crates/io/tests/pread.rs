@@ -265,7 +265,6 @@ fn default_shared_memory_location() {
         .unwrap();
     region.atomic_u64(4096).store(9, Ordering::Release);
     assert_eq!(attached.atomic_u64(4096).load(Ordering::Acquire), 9);
-    region.bind_numa(0, 1 << 16, 0).ok();
     vfs.remove_shared(&name, None).unwrap();
     assert_eq!(attached.atomic_u64(4096).load(Ordering::Acquire), 9);
     drop((region, attached));
