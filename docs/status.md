@@ -47,7 +47,7 @@ Main is versioned 0.4.0 (#775) because Phase 4 changes public API and the file f
 | Issue | State |
 |---|---|
 | #708 transfer | **accepted gap** at `Buffered` for 1.0 (owner, 2026-10-28; [guide note](guide/transactions.md), #1024). Post-1.0 work: #1023. |
-| #709, #749 async at 16 in flight | **Owner decision (2026-10-29): judged at equal client threads** ([D280](design/decisions/phase-3.md#d280) amended). Async 16×16 against sync on the same 16 threads, with sync at 256 threads reported beside it. Gate 3 (main cba09184): GATE3. #1086 and #1088 merged. |
+| #709, #749 async at 16 in flight | **Owner decision (2026-10-29): judged at equal client threads** ([D280](design/decisions/phase-3.md#d280) amended). Async 16×16 against sync on the same 16 threads, with sync at 256 threads reported beside it. **Met on gate 3** (main cba09184): async16 against sync t16 is 1.02×/1.04× on ycsb-c and 3.11×/1.14× on ycsb-a (default/buffered; bar 0.83×). Async p99 is 0.08× (ycsb-c) and 0.57–0.60× (ycsb-a) of sync t256's. Against sync t256, throughput is 0.73×/0.72× and 1.03×/0.99×. #1086 and #1088 merged. |
 | #710, #816 application-owned | **passed** (owner): 1.06×/0.94× of engine-owned with 4 background workers ([D284](design/decisions/phase-3.md#d284)). The `Buffered` p99.9 follow-up is #1013. |
 | #711 time-series-range | **passed:** RocksDB 0.68×/0.57× throughput, Pigeonhole p99 0.40×/0.36× RocksDB's ([D288](design/decisions/phase-3.md#d288), #994). |
 | #712 ycsb-e short scans | **done** ([D293](design/decisions/phase-3.md#d293), #1029). On the box, buffered went from 178.6K to 207.4K ops/s and p99 from 285 to 182 µs. #974 part A stays parked. |
