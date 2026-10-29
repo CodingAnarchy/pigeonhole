@@ -5055,6 +5055,7 @@ impl Shared {
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
             tail_index: false,
+            // The writer's open fills it as its last step (`held`).
             locks: Mutex::new(None),
             keep_locks: AtomicBool::new(false),
             arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),

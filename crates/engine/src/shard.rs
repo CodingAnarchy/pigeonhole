@@ -418,6 +418,10 @@ fn new_memtable(
 }
 
 /// Engine-wide state every shard and every caller shares.
+///
+/// Built by `Shared::base` as a reader process has it; the writer's open
+/// (`open_writer_inner`) overrides its own fields. A new field whose writer value differs
+/// from a reader's must be added to that override list too.
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,
