@@ -1966,7 +1966,10 @@ mod tests {
         )
         .unwrap();
         // D243's amendment: the settle step ran again after the warmup, and settled.
-        let after = record.detail.settle_after_warmup.expect("a settle after the warmup");
+        let after = record
+            .detail
+            .settle_after_warmup
+            .expect("a settle after the warmup");
         assert!(after.settled, "{after:?}");
         let text = std::fs::read_to_string(&path).unwrap();
         let phases: Vec<&str> = text
