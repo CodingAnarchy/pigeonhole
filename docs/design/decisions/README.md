@@ -308,6 +308,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D290](phase-3.md#d290) — Snapshot and transaction point gets go through the writer's row cache; gets fill on a second miss (not in merge-operator families); the shard applying a commit moves a cached family row forward to it, after `apply` returns Ok, when the row was cached at the slot's previous value and the commit wrote only puts above every delete's timestamp; a late lower seqno drops the row · cache, shm, engine, pigeonhole, #708, ICR 0082 · amends D201
 - [D291](phase-3.md#d291) — A counter get that folds many operands keeps its result as a `Put` base at the newest folded entry's seqno, in the active memtable while that entry is there; a counter group read for its newest version ends at its base · compaction, engine, pigeonhole, #713, D280 · refines D186, D287 · **amended by #1051** (combines stop at either operand of another source's range)
 - [D292](phase-3.md#d292) — A submitted read the page cache holds is copied on the submitting thread with `RWF_NOWAIT` (Linux); a miss is submitted as before · io, #709, #749, D280
+- [D293](phase-3.md#d293) — A scan whose row limit leaves at most 128 rows starts its readahead after 8 forward blocks, not 2 (short scans waited on fetches they had just submitted; the block bound keeps wide, filtered or deleted runs reading ahead) · engine, sst, #712, #974 · refines D222
 
 ## Open questions
 _None._

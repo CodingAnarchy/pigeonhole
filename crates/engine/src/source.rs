@@ -261,12 +261,37 @@ fn overlaps_range(sst: &OpenSst, start: Option<&[u8]>, end: Option<&[u8]>) -> bo
 /// after two forward blocks past its seek, 2 blocks first and doubling (#712).
 const SCAN_READAHEAD: (u32, bool) = (16, false);
 
-/// Read options for a scan or a point read.
-fn read_options(priority: Priority, scan: bool, cache_only: bool) -> ReadOptions {
+/// The most rows a scan can still return and count as short (D293, #712): a scan whose row
+/// limit leaves at most this many starts its readahead ramp only after
+/// [`SHORT_SCAN_AHEAD_AFTER`] forward blocks instead of two. Short scans end within a few
+/// blocks, so a ramp that starts after two of them has no lead: the scan reaches the block it
+/// just asked for while the fetch is still in flight and waits for it (in ycsb-e, scans of
+/// 1-100 rows at 16 clients, those waits were the largest part of the p99). 128 covers
+/// ycsb-e's longest scan.
+pub(crate) const SHORT_SCAN_ROWS: u64 = 128;
+
+/// Forward blocks a short scan's SST cursor reads past its seek before it reads ahead
+/// (D293): 128 rows of 1 KiB fill about 8 blocks of the default 16 KiB, so a scan the limit
+/// really keeps short submits nothing, and one whose rows turn out long in blocks (wide rows,
+/// rows a filter skips, a run of deleted rows) reads ahead again after at most 8 demand reads
+/// per cursor.
+pub(crate) const SHORT_SCAN_AHEAD_AFTER: u32 = 8;
+
+/// Whether a scan that can still return `remaining` rows (0: no limit) is short.
+pub(crate) fn scan_is_short(remaining: u64) -> bool {
+    remaining != 0 && remaining <= SHORT_SCAN_ROWS
+}
+
+/// Read options for a scan or a point read. `short` (scans only): the scan's limit leaves it
+/// short ([`scan_is_short`]), so its readahead starts later.
+fn read_options(priority: Priority, scan: bool, short: bool, cache_only: bool) -> ReadOptions {
     let mut o = ReadOptions::default();
     o.priority = priority;
     if scan {
         (o.readahead_blocks, o.readahead_merge) = SCAN_READAHEAD;
+        if short {
+            o.readahead_after = SHORT_SCAN_AHEAD_AFTER;
+        }
     } else {
         // A point get or a single-row read stops at its row's end: an SST cursor need not
         // read the block after a row-end separator (ICR 0039).
@@ -279,6 +304,7 @@ fn read_options(priority: Priority, scan: bool, cache_only: bool) -> ReadOptions
 /// SST sources for a scan of `[start, end)` (row prefixes), newest first: one per SST of
 /// level 0 (they overlap), and one per deeper level (its SSTs are sorted and disjoint, so a
 /// [`LevelIter`] opens and seeks only the ones the scan reaches).
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     fam: &FamilySsts,
     set: &Arc<SstSet>,
@@ -286,9 +312,10 @@ pub(crate) fn sst_sources_range<const CACHE_ONLY: bool>(
     start: Option<&[u8]>,
     end: Option<&[u8]>,
     priority: Priority,
+    short: bool,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, true, CACHE_ONLY);
+    let opts = read_options(priority, true, short, CACHE_ONLY);
     let reader = |sst: &OpenSst| {
         if CACHE_ONLY {
             sst.reader_cache_only(set, priority)
@@ -690,7 +717,7 @@ pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
     if key.oversized {
         return Err(pigeonhole_format::Error::KeyTooLarge.into());
     }
-    let opts = read_options(priority, false, CACHE_ONLY);
+    let opts = read_options(priority, false, false, CACHE_ONLY);
     // The filter probe (three hashes) only once an SST covers the row: a get of a row no
     // SST holds does not pay for it.
     let mut probe: Option<Probe> = None;
@@ -733,7 +760,7 @@ pub(crate) fn sst_sources_row<const CACHE_ONLY: bool>(
     priority: Priority,
     out: &mut Vec<Source>,
 ) -> Result<()> {
-    let opts = read_options(priority, false, CACHE_ONLY);
+    let opts = read_options(priority, false, false, CACHE_ONLY);
     let hash = row_hash(escaped_row);
     for l in 0..fam.levels.len() {
         let (from, search) = fam.level_start(l, row_prefix);
@@ -817,23 +844,28 @@ impl View {
         out: &mut Vec<Source>,
     ) -> Result<()> {
         let l = self.locate(shard, tablet, family);
-        self.scan_sources_located::<CACHE_ONLY>(&l, filter, start, end, out)
+        self.scan_sources_located::<CACHE_ONLY>(&l, filter, start, end, false, out)
     }
 
-    /// [`View::scan_sources_into`] from a [`View::locate`] the caller already made.
+    /// [`View::scan_sources_into`] from a [`View::locate`] the caller already made, its SST
+    /// cursors' readahead starting later if the scan is `short` ([`scan_is_short`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan_sources_located<const CACHE_ONLY: bool>(
         &self,
         l: &Located<'_>,
         filter: &ScanFilter,
         start: Option<&[u8]>,
         end: Option<&[u8]>,
+        short: bool,
         out: &mut Vec<Source>,
     ) -> Result<()> {
         if let Some(set) = l.mems {
             mem_sources(set, filter, out);
         }
         if let Some(fam) = l.ssts {
-            sst_sources_range::<CACHE_ONLY>(fam, &self.ssts, filter, start, end, l.priority, out)?;
+            sst_sources_range::<CACHE_ONLY>(
+                fam, &self.ssts, filter, start, end, l.priority, short, out,
+            )?;
         }
         Ok(())
     }
@@ -1090,7 +1122,7 @@ mod level_tests {
                 f.time_range = Some((2, 4));
                 f
             };
-            let opts = read_options(Priority::Normal, true, false);
+            let opts = read_options(Priority::Normal, true, false, false);
             let mut lazy = Source::Sst(
                 SstSource::level(files.clone(), Arc::clone(&set), filter.clone(), opts).unwrap(),
             );
@@ -1196,6 +1228,7 @@ mod level_tests {
                 start.as_deref(),
                 end.as_deref(),
                 Priority::Normal,
+                true,
                 &mut out,
             )
             .unwrap();

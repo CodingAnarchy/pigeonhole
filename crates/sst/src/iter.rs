@@ -105,13 +105,13 @@ pub struct ReadaheadRamp {
     window: u32,
 }
 
-/// Forward blocks a cursor reads after a seek before it reads ahead, and the first batch's
-/// size, which doubles with each batch up to [`ReadOptions::readahead_blocks`] (#712). A short
-/// scan (a few rows past its seek, the common case) then fetches nothing it does not read;
-/// at 16 blocks from the first miss, ycsb-e's scans fetched, verified and decompressed
-/// mostly blocks they never reached, and the I/O backend's single completion thread did all
-/// of it.
-const RAMP_AFTER: u32 = 2;
+/// Forward blocks a cursor reads after a seek before it reads ahead, by default
+/// ([`ReadOptions::readahead_after`]), and the first batch's size, which doubles with each
+/// batch up to [`ReadOptions::readahead_blocks`] (#712). A short scan (a few rows past its
+/// seek, the common case) then fetches nothing it does not read; at 16 blocks from the first
+/// miss, ycsb-e's scans fetched, verified and decompressed mostly blocks they never reached,
+/// and the I/O backend's single completion thread did all of it.
+pub(crate) const RAMP_AFTER: u32 = 2;
 const RAMP_FIRST: u32 = 2;
 
 /// A cursor's readahead (#402): fetches it submitted from its miss path for the blocks it
@@ -402,7 +402,7 @@ impl SstIter {
                     if ahead
                         && self.options.readahead_blocks > 0
                         && !self.options.cache_only
-                        && self.stepped > RAMP_AFTER
+                        && self.stepped > self.options.readahead_after
                     {
                         self.read_ahead();
                     }
