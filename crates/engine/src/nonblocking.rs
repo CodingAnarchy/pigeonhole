@@ -215,13 +215,14 @@ impl Reading {
                     .fetch_add(sync_reads, Ordering::Relaxed);
             }
             match at.checked(r) {
-                Err(Error::WouldBlock(fetch)) => {
+                Err(Error::WouldBlock(mut fetch)) => {
                     self.fetches += 1;
                     if self.fetches > MAX_FETCHES {
                         self.go_sync();
                         continue;
                     }
-                    let completion = fetch.submit();
+                    // The read the cursor submitted when it missed, if it did (#709).
+                    let completion = fetch.start();
                     self.fetch = Some((completion, fetch));
                 }
                 Err(Error::SnapshotExpired)
@@ -283,6 +284,9 @@ pub(crate) fn try_latest_now<T>(
             .fetch_add(sync_reads, Ordering::Relaxed);
     }
     match r {
+        // A page-cache miss the cursor read in place never gets here (#709). This is a read
+        // that must wait on the device: dropped with its read in flight, which still fills
+        // the page cache, so the future's own read of the block is usually a cache hit.
         Err(Error::WouldBlock(_)) => None,
         other => Some(other),
     }

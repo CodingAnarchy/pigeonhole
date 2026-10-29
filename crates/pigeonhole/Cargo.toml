@@ -41,6 +41,8 @@ pigeonhole-sim = { workspace = true }
 pigeonhole-wal = { workspace = true }
 futures-core = { workspace = true }
 criterion = { workspace = true }
+# `tests/inplace_reads.rs` compares async and sync reads over random data (#709).
+proptest = { workspace = true }
 # The app-owned io_uring test waits in `poll` on the shard's completion fd (#408).
 libc = { workspace = true }
 

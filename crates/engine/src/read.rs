@@ -780,7 +780,7 @@ impl ScanCursor {
                     Ok(more)
                 });
                 match positioned {
-                    Err(Error::WouldBlock(fetch)) => {
+                    Err(Error::WouldBlock(mut fetch)) => {
                         self.recycle_lanes();
                         self.next_tablet = tablet;
                         nb.fetches += 1;
@@ -788,7 +788,7 @@ impl ScanCursor {
                             nb.sync = true;
                             nb.shared.async_sync_reads.fetch_add(1, Ordering::Relaxed);
                         } else {
-                            let completion = fetch.submit();
+                            let completion = fetch.start();
                             nb.fetch = Some((completion, fetch));
                         }
                         continue;

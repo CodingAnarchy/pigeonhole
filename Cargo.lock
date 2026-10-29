@@ -1160,6 +1160,7 @@ dependencies = [
  "pigeonhole-shm",
  "pigeonhole-sim",
  "pigeonhole-wal",
+ "proptest",
  "smallvec",
 ]
 

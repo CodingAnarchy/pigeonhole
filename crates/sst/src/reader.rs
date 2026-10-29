@@ -20,16 +20,31 @@ pub(crate) fn corrupt(what: &'static str) -> crate::Error {
 
 /// What a cache-only read missed (`Error::WouldBlock`, ICR 0014): the read of the file it
 /// needs (one range, or the pieces of a blob record that spans extents) and what to do with
-/// the bytes. The caller submits the read ([`Fetch::submit`]), admits the bytes when it
-/// completes ([`Fetch::admit`], which verifies them, keeps them, and returns a pinned handle
-/// when there is one to hold), and reads again.
-#[derive(Clone)]
+/// the bytes. The caller starts the read ([`Fetch::start`]: the one already in flight, else
+/// a new one), admits the bytes when it completes ([`Fetch::admit`], which verifies them,
+/// keeps them, and returns a pinned handle when there is one to hold), and reads again.
 pub struct Fetch {
     file: FileRef,
     /// Absolute file offset of each piece, and where it goes in the assembled bytes.
     pieces: Vec<(u64, std::ops::Range<usize>)>,
     len: usize,
     then: Then,
+    /// The read, when the cache-only read that missed already submitted it (#709): a data
+    /// or index block a cursor could not read in place ([`Blocks::fetch_now`]).
+    submitted: Option<pigeonhole_io::Completion>,
+}
+
+/// A copy describes the same read but does not share the one in flight: it submits its own.
+impl Clone for Fetch {
+    fn clone(&self) -> Self {
+        Self {
+            file: self.file.clone(),
+            pieces: self.pieces.clone(),
+            len: self.len,
+            then: self.then.clone(),
+            submitted: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -75,6 +90,7 @@ impl std::fmt::Debug for Fetch {
             .field("len", &self.len)
             .field("pieces", &self.pieces.len())
             .field("kind", &kind)
+            .field("submitted", &self.submitted.is_some())
             .finish()
     }
 }
@@ -86,6 +102,7 @@ impl Fetch {
             pieces: vec![(offset, 0..len)],
             len,
             then,
+            submitted: None,
         }
     }
 
@@ -111,6 +128,7 @@ impl Fetch {
             pieces,
             len,
             then: Then::BlobRecord { reader, ptr },
+            submitted: None,
         }
     }
 
@@ -120,8 +138,16 @@ impl Fetch {
         submit_bytes(&self.file, offset, len)
     }
 
+    /// Starts the read: the one already in flight when the cache-only read that missed
+    /// submitted it (a data or index block whose read did not complete at once, #709), else a
+    /// new one ([`Fetch::submit`]).
+    pub fn start(&mut self) -> pigeonhole_io::Completion {
+        self.submitted.take().unwrap_or_else(|| self.submit())
+    }
+
     /// Submits the read through the VFS's asynchronous reads: one completion that wakes its
-    /// poller once every piece has arrived.
+    /// poller once every piece has arrived. Submits a new read even if one is in flight
+    /// ([`Fetch::start`] resumes that one).
     pub fn submit(&self) -> pigeonhole_io::Completion {
         if let [(offset, _)] = self.pieces.as_slice() {
             return self.submit_piece(*offset, self.len);
@@ -601,6 +627,35 @@ impl Blocks {
         priority: Priority,
     ) -> crate::Error {
         crate::Error::WouldBlock(Box::new(self.fetch(addr, kind, priority)))
+    }
+
+    /// A cache-only read's miss of the block at `addr` (#709): the block's read, submitted
+    /// at once. A read that is done when `submit` returns (a page-cache hit copied on this
+    /// thread, D292, under its breaker, size cap and refusal of direct handles; or a backend
+    /// that completes reads at submit) is admitted and returned, so the cursor goes on as a
+    /// synchronous read would, without unwinding the read to fetch and run it again. Any
+    /// other read fails with `Error::WouldBlock` carrying the read in flight, which the
+    /// caller resumes ([`Fetch::start`]) instead of submitting it again.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn fetch_now(
+        &self,
+        addr: BlockAddr,
+        kind: BlockKind,
+        priority: Priority,
+    ) -> Result<BlockHandle> {
+        let mut fetch = self.fetch(addr, kind, priority);
+        let done = fetch.submit();
+        if done.is_ready() {
+            crate::note_file_read();
+            // Done: `wait` takes the result without blocking.
+            if let Some(h) = fetch.admit(done.wait()?)? {
+                return Ok(h);
+            }
+            unreachable!("a block fetch admits a handle");
+        }
+        fetch.submitted = Some(done);
+        Err(crate::Error::WouldBlock(Box::new(fetch)))
     }
 
     /// The fetch of the block at `addr`, admitted to the cache.
