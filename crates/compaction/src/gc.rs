@@ -386,7 +386,9 @@ impl Gc {
             self.col_del_seqno.fill(0);
         }
         self.read_group(cursor, ts)?;
-        if self.counter {
+        if self.expired(ts) {
+            self.drop_group();
+        } else if self.counter {
             self.decide_counter(ts, out);
         } else {
             self.decide(ts, out);
@@ -429,18 +431,19 @@ impl Gc {
         Ok(())
     }
 
+    /// Drops a whole expired group.
+    fn drop_group(&mut self) {
+        for e in &self.group {
+            account_drop(
+                &mut self.blob_delta,
+                e.kind,
+                &self.group_data[e.val_start..e.end],
+            );
+        }
+    }
+
     fn decide(&mut self, ts: Timestamp, out: &mut OutBuf) {
         let n_points = self.points.len();
-        if self.expired(ts) {
-            for e in &self.group {
-                account_drop(
-                    &mut self.blob_delta,
-                    e.kind,
-                    &self.group_data[e.val_start..e.end],
-                );
-            }
-            return;
-        }
         let cover = self.col_stripe.min(self.marker_stripe(ts));
         let mut cell_min = NONE;
         let mut coldel_min = NONE;
@@ -486,8 +489,7 @@ impl Gc {
         let mut put_min = NONE;
         let mut earlier_cell = NONE;
         let mut earlier_coldel = NONE;
-        // A pending combined operand: its stripe.
-        let mut pending: Option<usize> = None;
+        let mut pending = None;
         for idx in 0..self.group.len() {
             let e = self.group[idx];
             let i = e.stripe;
@@ -520,66 +522,18 @@ impl Gc {
                 // Markers never share a group with cells.
                 Kind::FamilyDelete => true,
             };
-            let key = e.key_start..e.val_start;
-            let value = e.val_start..e.end;
-            if !keep {
-                account_drop(&mut self.blob_delta, e.kind, &self.group_data[value]);
-                continue;
-            }
-            self.kept += 1;
-            // Combine consecutive kept operands of one stripe (no put between them, or it
+            // Consecutive kept operands of one stripe combine (no put between them, or it
             // would shadow the older one).
-            if e.kind == Kind::Merge
-                && let Some(op) = &self.merge
-            {
-                if pending == Some(i) {
-                    // Merge into a scratch copy: a failed merge may leave its accumulator
-                    // half-written, and the operands are then kept apart unchanged.
-                    self.scratch.clear();
-                    self.scratch.extend_from_slice(&self.acc);
-                    if op
-                        .merge(&mut self.scratch, &self.group_data[value.clone()])
-                        .is_ok()
-                    {
-                        std::mem::swap(&mut self.acc, &mut self.scratch);
-                        self.kept -= 1;
-                        continue;
-                    }
-                }
-                if pending.is_some() {
-                    out.push(&self.acc_key, &self.acc);
-                }
-                pending = Some(i);
-                self.acc_key.clear();
-                self.acc_key.extend_from_slice(&self.group_data[key]);
-                self.acc.clear();
-                self.acc.extend_from_slice(&self.group_data[value]);
-                continue;
-            }
-            if pending.take().is_some() {
-                out.push(&self.acc_key, &self.acc);
-            }
-            out.push_group(key.start, value.start, value.end);
+            let combine = pending.is_some_and(|(stripe, _)| stripe == i);
+            self.emit(e, keep, combine, &mut pending, out);
         }
-        if pending.is_some() {
-            out.push(&self.acc_key, &self.acc);
-        }
+        self.flush_pending(pending, out);
         self.col_stripe = self.col_stripe.min(coldel_min);
     }
 
     /// [`Gc::decide`] for a counter family (D179): seqno-scoped deletes, one version per
     /// timestamp, no version purge.
     fn decide_counter(&mut self, ts: Timestamp, out: &mut OutBuf) {
-        if self.expired(ts) {
-            for e in &self.group {
-                account_drop(
-                    &mut self.blob_delta,
-                    e.kind,
-                    &self.group_data[e.val_start..e.end],
-                );
-            }
-            return;
-        }
         // Per stripe, the newest seqno of a delete from outside the group covering `ts`:
         // the column's deletes at newer timestamps and the row's markers at or above `ts`.
         self.c_cover.copy_from_slice(&self.col_del_seqno);
@@ -590,8 +544,7 @@ impl Gc {
         self.c_any.fill(0);
         self.c_col.fill(0);
         let mut put_min = NONE;
-        // A pending combined operand: its stripe and newest seqno.
-        let mut pending: Option<(usize, Seqno)> = None;
+        let mut pending = None;
         for idx in 0..self.group.len() {
             let e = self.group[idx];
             let i = e.stripe;
@@ -618,46 +571,65 @@ impl Gc {
                 }
                 Kind::FamilyDelete => true,
             };
-            let key = e.key_start..e.val_start;
-            let value = e.val_start..e.end;
-            if !keep {
-                account_drop(&mut self.blob_delta, e.kind, &self.group_data[value]);
-                continue;
-            }
-            self.kept += 1;
-            if e.kind == Kind::Merge
-                && let Some(op) = &self.merge
-            {
-                if let Some((stripe, newest)) = pending
-                    && stripe == i
-                    && !self.guarded(e.seqno, newest)
+            // As in `decide`, unless another source could split the two operands (#1051).
+            let combine = pending
+                .is_some_and(|(stripe, newest)| stripe == i && !self.guarded(e.seqno, newest));
+            self.emit(e, keep, combine, &mut pending, out);
+        }
+        self.flush_pending(pending, out);
+    }
+
+    /// Appends `e` to `out` if `keep`, else accounts for its drop. A kept merge operand
+    /// becomes the pending combined operand, `(stripe, seqno)` of its newest operand, or
+    /// with `combine` merges into the pending one.
+    fn emit(
+        &mut self,
+        e: GEntry,
+        keep: bool,
+        combine: bool,
+        pending: &mut Option<(usize, Seqno)>,
+        out: &mut OutBuf,
+    ) {
+        let key = e.key_start..e.val_start;
+        let value = e.val_start..e.end;
+        if !keep {
+            account_drop(&mut self.blob_delta, e.kind, &self.group_data[value]);
+            return;
+        }
+        self.kept += 1;
+        if e.kind == Kind::Merge
+            && let Some(op) = &self.merge
+        {
+            if combine {
+                // Merge into a scratch copy: a failed merge may leave its accumulator
+                // half-written, and the operands are then kept apart unchanged.
+                self.scratch.clear();
+                self.scratch.extend_from_slice(&self.acc);
+                if op
+                    .merge(&mut self.scratch, &self.group_data[value.clone()])
+                    .is_ok()
                 {
-                    self.scratch.clear();
-                    self.scratch.extend_from_slice(&self.acc);
-                    if op
-                        .merge(&mut self.scratch, &self.group_data[value.clone()])
-                        .is_ok()
-                    {
-                        std::mem::swap(&mut self.acc, &mut self.scratch);
-                        self.kept -= 1;
-                        continue;
-                    }
+                    std::mem::swap(&mut self.acc, &mut self.scratch);
+                    self.kept -= 1;
+                    return;
                 }
-                if pending.is_some() {
-                    out.push(&self.acc_key, &self.acc);
-                }
-                pending = Some((i, e.seqno));
-                self.acc_key.clear();
-                self.acc_key.extend_from_slice(&self.group_data[key]);
-                self.acc.clear();
-                self.acc.extend_from_slice(&self.group_data[value]);
-                continue;
             }
-            if pending.take().is_some() {
+            if pending.is_some() {
                 out.push(&self.acc_key, &self.acc);
             }
-            out.push_group(key.start, value.start, value.end);
+            *pending = Some((e.stripe, e.seqno));
+            self.acc_key.clear();
+            self.acc_key.extend_from_slice(&self.group_data[key]);
+            self.acc.clear();
+            self.acc.extend_from_slice(&self.group_data[value]);
+            return;
         }
+        self.flush_pending(pending.take(), out);
+        out.push_group(key.start, value.start, value.end);
+    }
+
+    /// Appends the pending combined operand, if any.
+    fn flush_pending(&self, pending: Option<(usize, Seqno)>, out: &mut OutBuf) {
         if pending.is_some() {
             out.push(&self.acc_key, &self.acc);
         }
