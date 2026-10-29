@@ -160,6 +160,13 @@ fn harness_regressions_from_the_seed_sweep() {
             check(seed, &cfg);
         }
     }
+    // Seeds 680069 and 680171 (#1071, the `counters` target): a read beside an in-flight
+    // commit took a counter family's default-timestamp put, which lands at timestamp 0
+    // under a later bucket, for a cell that should show the commit, and called the commit
+    // partly visible. Such a cell reads the same either way; it shows nothing now.
+    for seed in [680_069, 680_171] {
+        check(seed, &flight_read_config());
+    }
     // Seeds 114 and 274 (issue #162): a refused attempt's PREPARE, settled at one recovery,
     // was still in the WAL at the next, fit an unacknowledged commit made in between (a row
     // delete of the same row) and took it from the commit whose share really survived.
