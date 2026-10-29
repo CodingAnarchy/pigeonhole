@@ -137,8 +137,13 @@ impl BuildHasher for BuildPrehashed {
 pub(crate) struct PassThrough(u64);
 
 impl Hasher for PassThrough {
-    fn write(&mut self, _: &[u8]) {
-        unreachable!("a prehashed map's keys hash as one u64");
+    fn write(&mut self, bytes: &[u8]) {
+        // Nothing hashes bytes into a prehashed map; if something ever does, it still gets a
+        // well-mixed hash in release builds.
+        debug_assert!(false, "a prehashed map's keys hash as one u64");
+        let mut h = KeyHasher(self.0);
+        h.write(bytes);
+        self.0 = h.finish();
     }
 
     #[inline]
