@@ -5895,13 +5895,7 @@ impl ShardState {
         }
         // The oldest waiter's deadline: the pending queue keeps submission order, so the
         // oldest waiter is also the first to be admitted once room frees.
-        let oldest = self
-            .pending
-            .iter()
-            .filter(|m| m.room_since > 0)
-            .map(|m| room_since(m.room_since, now))
-            .min()
-            .unwrap_or(now);
+        let oldest = self.oldest_room_wait(now);
         // The clock has stopped if either of the wait's timers gave up on this reading.
         let frozen = self.room_wait.as_ref().is_some_and(|w| w.stopped(now));
         let me = self.id;
@@ -5972,30 +5966,11 @@ impl ShardState {
             // Refuse the waiting members; this group's admitted ones still apply.
             self.end_room_wait(now);
             self.wait_room = false;
-            let waiting = std::mem::take(&mut self.pending);
-            for mut m in waiting {
-                if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                    self.pending.push(m);
-                    continue;
-                }
-                m.failed = Some(Error::Busy);
-                self.settle(m, Ok(()), ctx);
-            }
+            self.refuse_room_waiters(now, None, ctx);
         } else if now.saturating_sub(oldest) >= timeout {
             // The members that waited the whole timeout themselves are refused (D124,
             // D240); the rest keep their place, and the wait goes on for them.
-            let waiting = std::mem::take(&mut self.pending);
-            for mut m in waiting {
-                if m.room_since > 0
-                    && now.saturating_sub(room_since(m.room_since, now)) >= timeout
-                    && !matches!(m.kind, MemberKind::CommitRecord { .. })
-                {
-                    m.failed = Some(Error::Busy);
-                    self.settle(m, Ok(()), ctx);
-                } else {
-                    self.pending.push(m);
-                }
-            }
+            self.refuse_room_waiters(now, Some(timeout), ctx);
             if !self
                 .pending
                 .iter()
@@ -6005,16 +5980,43 @@ impl ShardState {
                 self.wait_room = false;
             } else {
                 // The next deadline: the timer that fired for this one is done.
-                let next = self
-                    .pending
-                    .iter()
-                    .filter(|m| m.room_since > 0)
-                    .map(|m| room_since(m.room_since, now))
-                    .min()
-                    .unwrap_or(now);
+                let next = self.oldest_room_wait(now);
                 if let Some(w) = &mut self.room_wait {
                     w.arm_timeout(next.saturating_add(timeout), &self.shared.vfs, ctx, me);
                 }
+            }
+        }
+    }
+
+    /// When the oldest member waiting for room began to wait (`now` if none waits).
+    fn oldest_room_wait(&self, now: u64) -> u64 {
+        self.pending
+            .iter()
+            .filter(|m| m.room_since > 0)
+            .map(|m| room_since(m.room_since, now))
+            .min()
+            .unwrap_or(now)
+    }
+
+    /// Refuses (`Busy`) the members waiting for room, all of them or, with `timeout`, those
+    /// whose own wait reached it. A `CommitRecord` is never refused: it keeps its place, as
+    /// the members not refused do, in order.
+    fn refuse_room_waiters(
+        &mut self,
+        now: u64,
+        timeout: Option<u64>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        for mut m in std::mem::take(&mut self.pending) {
+            let refused = !matches!(m.kind, MemberKind::CommitRecord { .. })
+                && timeout.is_none_or(|t| {
+                    m.room_since > 0 && now.saturating_sub(room_since(m.room_since, now)) >= t
+                });
+            if refused {
+                m.failed = Some(Error::Busy);
+                self.settle(m, Ok(()), ctx);
+            } else {
+                self.pending.push(m);
             }
         }
     }
