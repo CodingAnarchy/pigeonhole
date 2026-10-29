@@ -27,7 +27,6 @@ pub fn key(data: &[u8]) {
     if let Ok(p) = key::decode_key(data) {
         let mut out = Vec::new();
         p.row.unescape_into(&mut out);
-        let _ = p.row.eq_raw(&out);
         if let Some(q) = p.qualifier {
             q.unescape_into(&mut out);
         }
@@ -44,9 +43,7 @@ pub fn key(data: &[u8]) {
     let _ = (key::compare(a, b), key::common_prefix_len(a, b));
     let _ = key::split_suffix(data);
     let _ = key::row_prefix_len(data);
-    let _ = key::column_prefix_len(data);
     let e = Escaped::new(data);
-    let _ = (e.is_verbatim(), e.eq_raw(data));
     let mut out = Vec::new();
     e.unescape_long_into(&mut out);
     let split = data.len() / 2;
@@ -68,9 +65,7 @@ pub fn key(data: &[u8]) {
         },
     ];
     for f in &filters {
-        let _ = f.admits(data);
         let mut hint = Vec::new();
-        let _ = f.next_admissible(data, &mut hint);
         let _ = f.compile().check(data, &mut hint);
     }
     let _ = value::decode_value(data);
@@ -92,7 +87,7 @@ pub fn block(data: &[u8]) {
             if !it.valid() {
                 break;
             }
-            let _ = (it.key(), it.value(), it.value_range(), it.entry_offset());
+            let _ = (it.key(), it.value(), it.value_range());
             // A data block's entries are internal keys and stored values; an index block's
             // values are block addresses.
             if let Ok(p) = key::decode_key(it.key()) {

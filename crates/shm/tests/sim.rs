@@ -78,7 +78,7 @@ impl Proc {
     fn open_reader(&self) -> (Presence, ShmRegion, ReaderSlot) {
         let presence = Presence::acquire(&self.file).unwrap();
         let shm = self.open(Role::Reader).unwrap();
-        let slot = shm.claim_reader_slot(self.id).unwrap();
+        let slot = shm.claim_reader_slot_locked(self.id, &self.file).unwrap();
         (presence, shm, slot)
     }
 
@@ -169,7 +169,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
 
     // Group of two on shard 0.
     publish(0, shm.next_seqno(), held);
-    let first = shm.reserve_seqnos(2);
+    let first = reserve(&shm, 2);
     publish(0, first, held);
     let visible = check(&shm1, &shm2);
     assert_eq!(visible, 0, "reserved but unapplied: invisible");
@@ -185,7 +185,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
 
     // Cross-shard commit q coordinated by shard 0 with shard 1.
     publish(0, shm.next_seqno(), held);
-    let q = shm.reserve_seqnos(1);
+    let q = reserve(&shm, 1);
     held = Some(q);
     publish(0, u64::MAX, held);
     set_mask(&shm, q, 0b11);
@@ -195,7 +195,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
 
     // Shard 1 runs its own group meanwhile: visible stays below q.
     publish(1, shm.next_seqno(), None);
-    let g = shm.reserve_seqnos(1);
+    let g = reserve(&shm, 1);
     publish(1, g, None);
     set_mask(&shm, g, 0b10);
     mark_applied(&shm, 1, g);
@@ -205,7 +205,7 @@ fn readers_see_commits_in_order_and_never_half_a_cross_shard_commit() {
 
     // Shard 0 runs another group while still holding q.
     publish(0, shm.next_seqno(), held);
-    let h = shm.reserve_seqnos(1);
+    let h = reserve(&shm, 1);
     publish(0, h, held);
     set_mask(&shm, h, 0b01);
     mark_applied(&shm, 0, h);
@@ -241,19 +241,23 @@ fn killed_readers_slots_are_reclaimed() {
     slot1.pin(4, 0);
     slot2.pin(3, 0);
     assert_eq!(shm.oldest_reader_pin(), Some((3, 0)));
-    assert_eq!(shm.reclaim_dead_slots(&w.vfs), 0);
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 0);
 
     r2.crash();
     std::mem::forget(slot2); // a dead process never runs its destructor
-    assert_eq!(shm.reclaim_dead_slots(&w.vfs), 1);
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 1);
     assert_eq!(shm.oldest_reader_pin(), Some((4, 0)));
-    assert_eq!(shm.reclaim_dead_slots(&w.vfs), 0);
+    assert_eq!(shm.reclaim_dead_slots_locked(&w.file), 0);
 
     // The slot is free for the next reader, and r2's presence lock died with it.
     let r3 = Proc::start(&sim, pid(13));
     let (_p3, _shm3, _slot3) = r3.open_reader();
+    let r4 = Proc::start(&sim, pid(99));
     assert_eq!(
-        shm.claim_reader_slot(pid(99)).unwrap().index() + 1,
+        shm.claim_reader_slot_locked(r4.id, &r4.file)
+            .unwrap()
+            .index()
+            + 1,
         4 - 1,
         "4 slots: r1, r3, this one, one left"
     );
@@ -266,7 +270,7 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
     let (lock, wp, shm) = w.open_writer();
     shm.publish_view(&view(1, 3, 8)).unwrap();
     shm.set_manifest_version(10);
-    shm.reserve_seqnos(9);
+    reserve(&shm, 9);
 
     let r = Proc::start(&sim, pid(11));
     let (_rp, shm_r, slot) = r.open_reader();
@@ -313,7 +317,7 @@ fn writer_kill_and_restart_leaves_readers_on_a_valid_snapshot_then_remaps() {
     assert_eq!(shm_r2.generation(), Generation(2));
     assert!(!shm_r2.is_stale());
     drop(slot);
-    let slot2 = shm_r2.claim_reader_slot(r.id).unwrap();
+    let slot2 = shm_r2.claim_reader_slot_locked(r.id, &r.file).unwrap();
     assert!(shm_r2.visible_seqno() >= 9, "monotone across the restart");
     assert_eq!(
         slot2.pin(shm_r2.visible_seqno(), shm_r2.view_version()),

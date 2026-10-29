@@ -421,42 +421,6 @@ pub(crate) fn remove_default_shared(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
-pub(crate) fn bind_numa(ptr: *mut u8, len: usize, node: u32) -> Result<()> {
-    if len == 0 {
-        return Ok(());
-    }
-    let page = pigeonhole_format::PAGE_SIZE;
-    let addr = ptr as usize;
-    let start = addr & !(page - 1);
-    let span = (addr + len - start).next_multiple_of(page);
-    let bits = libc::c_ulong::BITS as usize;
-    let mut mask = vec![0 as libc::c_ulong; node as usize / bits + 1];
-    mask[node as usize / bits] |= 1 << (node as usize % bits);
-    // SAFETY: `[start, start + span)` covers whole pages of a live mapping we own; `mask` is
-    // valid for `mask.len() * bits` bits (the kernel reads `maxnode - 1` bits).
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_mbind,
-            start as *mut libc::c_void,
-            span,
-            libc::MPOL_BIND,
-            mask.as_ptr(),
-            mask.len() * bits + 1,
-            0 as libc::c_uint,
-        )
-    };
-    if rc != 0 {
-        return Err(last_error("mbind"));
-    }
-    Ok(())
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn bind_numa(_ptr: *mut u8, _len: usize, _node: u32) -> Result<()> {
-    Ok(())
-}
-
 /// The kernel's page size (`sysconf(_SC_PAGESIZE)`: 4 KiB, or 16 or 64 KiB on some arm64
 /// kernels), which `madvise` and `mincore` work in; `pigeonhole_format::PAGE_SIZE` is the
 /// file's page.

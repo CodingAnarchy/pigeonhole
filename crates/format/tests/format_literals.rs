@@ -2,12 +2,15 @@
 //! golden files only freeze what the encoders produce). Offsets here are the literal numbers
 //! from the FORMAT tables, not the crate's constants.
 
+mod common;
+
+use common::encode_seek_key;
 use pigeonhole_format::blob::{BlobExtentHeader, encode_record_header};
 use pigeonhole_format::block::{Block, BlockAddr, BlockBuilder, BlockKind, seal};
 use pigeonhole_format::checksum::{crc32c, xxh3_64};
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::filter::FilterBuilder;
-use pigeonhole_format::key::{Kind, encode_key, encode_marker_key, encode_seek_key};
+use pigeonhole_format::key::{Kind, encode_key, encode_marker_key};
 use pigeonhole_format::manifest::{Edit, ManifestBlockKind, ManifestHeader, encode_block};
 use pigeonhole_format::shm::{ShmHeader, ViewMemtable, ViewRecord, ViewTablet};
 use pigeonhole_format::sst::Footer;

@@ -1,5 +1,5 @@
 //! Latency of the commit-path and snapshot-path operations on the heap-backed region:
-//! `visible_seqno` (one cache line per shard), `reserve_seqnos`, `publish_pending`, the pin
+//! `visible_seqno` (one cache line per shard), `advance_next_seqno`, `publish_pending`, the pin
 //! handshake, `oldest_reader_pin` over a full slot table, and view publish/read.
 
 use std::hint::black_box;
@@ -7,7 +7,8 @@ use std::hint::black_box;
 use criterion::{Criterion, criterion_group, criterion_main};
 use pigeonhole_format::shm::{ViewMemtable, ViewRecord, ViewTablet};
 use pigeonhole_format::{FamilyId, TableId, TabletId};
-use pigeonhole_io::ProcessId;
+use pigeonhole_io::sim::SimVfs;
+use pigeonhole_io::{OpenOptions, ProcessId, Vfs};
 use pigeonhole_shm::{ShmConfig, ShmRegion};
 
 fn region(shards: u32) -> ShmRegion {
@@ -49,8 +50,12 @@ fn seqnos(c: &mut Criterion) {
         });
     }
     let shm = region(8);
-    c.bench_function("reserve_seqnos/1", |b| {
-        b.iter(|| black_box(shm.reserve_seqnos(black_box(1))))
+    let mut next = shm.next_seqno();
+    c.bench_function("advance_next_seqno/1", |b| {
+        b.iter(|| {
+            next += 1;
+            shm.advance_next_seqno(black_box(next))
+        })
     });
     c.bench_function("publish_pending", |b| {
         b.iter(|| shm.publish_pending(black_box(3), black_box(42)))
@@ -59,11 +64,19 @@ fn seqnos(c: &mut Criterion) {
 
 fn slots(c: &mut Criterion) {
     let shm = region(8);
+    // The readers' handle on the database file, holding the slots' liveness locks.
+    let vfs = SimVfs::new(1);
+    let file = vfs
+        .open("/db".as_ref(), OpenOptions::read_write_create())
+        .unwrap();
     let slot = shm
-        .claim_reader_slot(ProcessId {
-            pid: 1,
-            start_time: 1,
-        })
+        .claim_reader_slot_locked(
+            ProcessId {
+                pid: 1,
+                start_time: 1,
+            },
+            &file,
+        )
         .unwrap();
     shm.publish_view(&view(1, 1)).unwrap();
     c.bench_function("pin_unpin", |b| {
@@ -76,10 +89,13 @@ fn slots(c: &mut Criterion) {
     let others: Vec<_> = (0..125)
         .map(|i| {
             let s = shm
-                .claim_reader_slot(ProcessId {
-                    pid: 100 + i,
-                    start_time: 1,
-                })
+                .claim_reader_slot_locked(
+                    ProcessId {
+                        pid: 100 + i,
+                        start_time: 1,
+                    },
+                    &file,
+                )
                 .unwrap();
             s.pin(u64::from(i) + 10, 1);
             s

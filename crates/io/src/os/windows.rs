@@ -365,10 +365,6 @@ pub(crate) fn remove_default_shared(_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn bind_numa(_ptr: *mut u8, _len: usize, _node: u32) -> Result<()> {
-    Ok(())
-}
-
 pub(crate) fn discard(_ptr: *mut u8, _len: usize) -> Result<()> {
     Err(Error::new(
         ErrorKind::Unsupported,

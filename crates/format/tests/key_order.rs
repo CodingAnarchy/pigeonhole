@@ -2,15 +2,30 @@
 
 mod common;
 
-use common::{Cell, cell, config, num, part, sized};
+use common::{Cell, cell, config, encode_seek_key, num, part, sized};
 use pigeonhole_format::key::{
-    Escaped, Kind, column_prefix_len, common_prefix_len, compare, decode_key, decode_key_in_row,
-    encode_column_prefix, encode_key, encode_key_after_row, encode_marker_after_row,
-    encode_marker_prefix, encode_row_prefix, encode_seek_key, escape_into, row_prefix_len,
-    split_suffix,
+    Escaped, Kind, common_prefix_len, compare, decode_key, decode_key_in_row, encode_column_prefix,
+    encode_key, encode_key_after_row, encode_marker_after_row, encode_marker_prefix,
+    encode_row_prefix, escape_into, row_prefix_len, split_suffix,
 };
 use proptest::collection::vec;
 use proptest::prelude::*;
+
+/// The raw bytes of an escaped string.
+fn raw(e: Escaped<'_>) -> Vec<u8> {
+    let mut out = Vec::new();
+    e.unescape_into(&mut out);
+    out
+}
+
+/// The column prefix of a valid key: the row prefix, then the escaped qualifier and its
+/// terminator, or a marker's two bytes (FORMAT §2, §5).
+fn column_prefix(key: &[u8]) -> &[u8] {
+    let parts = decode_key(key).unwrap();
+    let row = parts.row.as_escaped().len() + 2;
+    let len = row + parts.qualifier.map_or(2, |q| q.as_escaped().len() + 2);
+    &key[..len]
+}
 
 proptest! {
     #![proptest_config(config(2000))]
@@ -42,7 +57,7 @@ proptest! {
 
     /// `unescape_into` drops the `FF` after every `00` and keeps everything else, malformed
     /// input included (a `00` not followed by `FF` is kept as is), at every length across
-    /// the eight-byte steps of its zero search, and agrees with `eq_raw` (#406).
+    /// the eight-byte steps of its zero search (#406).
     #[test]
     fn unescape_matches_bytewise(
         bytes in vec(prop_oneof![3 => any::<u8>(), 1 => Just(0u8), 1 => Just(0xFF)], 0..40),
@@ -61,7 +76,6 @@ proptest! {
         let mut got = prefix.clone();
         e.unescape_into(&mut got);
         prop_assert_eq!(&got, &expect);
-        prop_assert!(e.eq_raw(&got[prefix.len()..]));
         let mut long = prefix.clone();
         e.unescape_long_into(&mut long);
         prop_assert_eq!(&long, &expect);
@@ -91,8 +105,8 @@ proptest! {
         let mut key = Vec::new();
         encode_key(&mut key, &row, &qual, 7, 9, Kind::Put).unwrap();
         let parts = decode_key(&key).unwrap();
-        prop_assert!(parts.row.eq_raw(&row));
-        prop_assert!(parts.qualifier.unwrap().eq_raw(&qual));
+        prop_assert_eq!(raw(parts.row), row);
+        prop_assert_eq!(raw(parts.qualifier.unwrap()), qual);
         prop_assert_eq!(row_prefix_len(&key).unwrap(), expect.len() + 2);
     }
 
@@ -101,14 +115,14 @@ proptest! {
     fn decode_and_prefixes(c in cell()) {
         let key = c.encode();
         let parts = decode_key(&key).unwrap();
-        prop_assert!(parts.row.eq_raw(&c.row));
+        prop_assert_eq!(raw(parts.row), c.row.clone());
         let mut row = Vec::new();
         parts.row.unescape_into(&mut row);
         prop_assert_eq!(&row, &c.row);
         prop_assert_eq!((parts.ts, parts.seqno, parts.kind), (c.ts, c.seqno, c.kind));
         match parts.qualifier {
             None => prop_assert_eq!(c.kind, Kind::FamilyDelete),
-            Some(q) => prop_assert!(q.eq_raw(&c.qual)),
+            Some(q) => prop_assert_eq!(raw(q), c.qual.clone()),
         }
         let (_, ts, seqno, kind) = split_suffix(&key).unwrap();
         prop_assert_eq!((ts, seqno, kind), (c.ts, c.seqno, c.kind));
@@ -124,8 +138,7 @@ proptest! {
         } else {
             encode_column_prefix(&mut cp, &c.row, &c.qual).unwrap();
         }
-        prop_assert_eq!(column_prefix_len(&key).unwrap(), cp.len());
-        prop_assert!(key.starts_with(&cp));
+        prop_assert_eq!(column_prefix(&key), &cp[..]);
     }
 
     /// Two keys share a row prefix iff they have the same row, and a column prefix iff they
@@ -136,8 +149,7 @@ proptest! {
         let ra = &ka[..row_prefix_len(&ka).unwrap()];
         let rb = &kb[..row_prefix_len(&kb).unwrap()];
         prop_assert_eq!(ra == rb, a.row == b.row);
-        let ca = &ka[..column_prefix_len(&ka).unwrap()];
-        let cb = &kb[..column_prefix_len(&kb).unwrap()];
+        let (ca, cb) = (column_prefix(&ka), column_prefix(&kb));
         let col = |c: &Cell| (c.row.clone(), (c.kind != Kind::FamilyDelete).then(|| c.qual.clone()));
         prop_assert_eq!(ca == cb, col(&a) == col(&b));
     }
@@ -285,6 +297,5 @@ proptest! {
         let mut got = vec![9u8];
         Escaped::new(&bytes).unescape_into(&mut got);
         prop_assert_eq!(&got[1..], &want[..]);
-        prop_assert!(Escaped::new(&bytes).eq_raw(&want));
     }
 }

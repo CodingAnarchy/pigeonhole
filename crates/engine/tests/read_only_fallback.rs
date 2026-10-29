@@ -15,8 +15,7 @@ use pigeonhole_engine::{Engine, Error, FamilyOptions, ValueRef, WriteBatch};
 use pigeonhole_format::superblock::{Features, SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B, Superblock};
 use pigeonhole_format::{Durability, FormatVersion};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
-use pigeonhole_io::{OpenOptions, Vfs, VfsRef};
-use pigeonhole_pager::Pager;
+use pigeonhole_io::{OpenOptions, Vfs};
 
 const DB: &str = "/db/data.phdb";
 const PAGE: u64 = 4096;
@@ -252,21 +251,14 @@ fn edit_superblocks(vfs: &SimVfs, edit: impl Fn(&mut Superblock)) {
 fn an_unknown_ro_compat_bit_refuses_a_writer_unless_it_falls_back() {
     let vfs = crashed_db(5904, 1, 10, 10);
     // As a newer build would leave it: a ro_compat feature this build does not know, set
-    // in both pages (registry semantics, `Pager::set_features`). Use the pager directly
-    // with the bit this build will never define in a test.
-    let v: VfsRef = vfs.clone();
-    let pager = Pager::open(&v, Path::new(DB), true)
-        .unwrap()
-        .finish(Vec::new())
-        .unwrap();
+    // in both pages (D269's registry semantics), with the bit this build will never define.
     let bit = 1 << 63;
-    pager
-        .set_features(Features {
+    edit_superblocks(&vfs, |sb| {
+        sb.features = Features {
             ro_compat: bit,
             ..Features::default()
-        })
-        .unwrap();
-    drop(pager);
+        }
+    });
     let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
     o.merge_operators.register(Arc::new(Concat));
     match Engine::open(Path::new(DB), o.clone()) {

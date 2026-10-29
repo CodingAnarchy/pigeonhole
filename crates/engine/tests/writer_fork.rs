@@ -328,7 +328,7 @@ fn a_forked_childs_application_owned_shards_run_nothing_and_its_futures_refuse()
         if !first(poll_once(&mut flush)) {
             failed |= 8;
         }
-        let local = shards[0].commit_local(batch(&t, b"local", b"x"), Some(Durability::Sync));
+        let local = db.submit(batch(&t, b"local", b"x"), Some(Durability::Sync));
         if !refused(local.map(drop)) {
             failed |= 16;
         }
@@ -356,7 +356,7 @@ fn a_forked_childs_application_owned_shards_run_nothing_and_its_futures_refuse()
     assert_eq!(
         code, 0,
         "exit bits {code}: 1 a shard ran, 2 commit, 4 check, 8 flush did not refuse, \
-         16 commit_local did not refuse, 32 an accessor was not inert"
+         16 submit did not refuse, 32 an accessor was not inert"
     );
     assert!(
         before == files_of(&dir.0),

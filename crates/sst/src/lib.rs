@@ -6,7 +6,7 @@
 //! [`SstReader`] opens one with its top-level index and filters pinned in memory, so a point
 //! lookup is at most one cached index-partition lookup plus one data-block read.
 //! [`SstIter`] is a zero-copy [`Cursor`](pigeonhole_format::Cursor) that applies a [`ScanFilter`] inside the block
-//! decoder (the same `ScanFilter::admits` rule every source uses) and skips rows using the
+//! decoder (the same `CompiledFilter::check` every source uses) and skips rows using the
 //! row-start table. It owns an `Arc<SstReader>` and a pinned block, so it can be stored
 //! anywhere (scan cursors, compaction jobs) without borrowing.
 //!

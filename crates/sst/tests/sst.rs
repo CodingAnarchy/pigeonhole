@@ -10,6 +10,7 @@ use common::*;
 use pigeonhole_cache::{BlockCache, Priority};
 use pigeonhole_format::filter::{column_hash, row_hash};
 use pigeonhole_format::key::{Kind, SUFFIX_LEN, decode_key, encode_key};
+use pigeonhole_format::scan::Verdict;
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{Cursor, SstId};
 use pigeonhole_sst::{Error, ReadOptions, ScanFilter, SstReader, SstWriter};
@@ -115,7 +116,7 @@ proptest! {
     }
 
     /// Every cursor move on a filtered SST lands where the same move lands on the unfiltered
-    /// entries filtered afterwards with `ScanFilter::admits`.
+    /// entries filtered afterwards, entry by entry, with `CompiledFilter::check`.
     #[test]
     fn pushdown_equals_filter_after(
         cells in prop::collection::vec(raw_cell(), 0..300),
@@ -128,9 +129,10 @@ proptest! {
         let meta = write_sst(&file, EXTENT, &m, &l);
         let r = open(&file, &meta);
 
+        let compiled = filter.compile();
         let admitted: Vec<_> = m
             .iter()
-            .filter(|(k, _)| filter.admits(k))
+            .filter(|(k, _)| compiled.check(k, &mut Vec::new()) == Verdict::Admit)
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         prop_assert_eq!(scan(&mut r.iter(filter.clone(), ReadOptions::default())), admitted.clone());
