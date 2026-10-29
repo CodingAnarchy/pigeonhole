@@ -175,8 +175,8 @@ fn offline(file: &Path, r: &CheckReport, deep: bool, map: bool) -> Report {
                 "segment_size": w.segment_size,
                 "segments": w.segments,
                 "records": w.records,
-                "checkpoint": {"epoch": w.checkpoint.0, "offset": w.checkpoint.1},
-                "end": {"epoch": w.end.0, "offset": w.end.1},
+                "checkpoint": {"epoch": w.checkpoint.epoch, "offset": w.checkpoint.offset},
+                "end": {"epoch": w.end.epoch, "offset": w.end.offset},
                 "end_slot": w.end_slot,
             })
         })

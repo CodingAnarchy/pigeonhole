@@ -1650,6 +1650,10 @@ fn report_nowait_reads(db: &Pigeonhole) {
 /// ICR 0023).
 pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
     let m = db.engine_metrics();
+    // The counters the public metrics leave out, by name (ICR 0087); a name an older or
+    // newer build lacks reads as 0.
+    let inner = db.internal_metrics();
+    let im = |name: &str| internal(&inner, name);
     let rc = db.row_cache_stats();
     let rings = db.io_rings().unwrap_or_default();
     crate::Stalls {
@@ -1663,41 +1667,96 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         pacing_stall_nanos: m.pacing_stall_nanos,
         flushes: m.flushes,
         compactions: m.compactions,
-        unpin_passes: m.wal_unpin_passes,
-        unpin_flushes: m.wal_unpin_flushes,
-        wal_inline_syncs: m.wal_inline_syncs,
+        unpin_passes: im("wal_unpin_passes"),
+        unpin_flushes: im("wal_unpin_flushes"),
+        wal_inline_syncs: im("wal_inline_syncs"),
         file_growths: m.file_growths,
         file_growth_nanos: m.file_growth_nanos,
-        file_growths_ahead: m.file_growths_ahead,
-        shard_parks: m.shard_parks,
-        shard_wakes: m.shard_wakes,
-        commit_parks: m.commit_parks,
-        visibility_waits: m.visibility_waits,
-        visibility_scanned: m.visibility_waiters_ahead,
-        visibility_wake_passes: m.visibility_wake_passes,
-        visibility_woken: m.visibility_woken,
-        visibility_contended: m.visibility_contended,
-        wal_rollover_blocks: m.wal_rollover_blocks,
+        file_growths_ahead: im("file_growths_ahead"),
+        shard_parks: im("shard_parks"),
+        shard_wakes: im("shard_wakes"),
+        commit_parks: im("commit_parks"),
+        visibility_waits: im("visibility_waits"),
+        visibility_scanned: im("visibility_waiters_ahead"),
+        visibility_wake_passes: im("visibility_wake_passes"),
+        visibility_woken: im("visibility_woken"),
+        visibility_contended: im("visibility_contended"),
+        wal_rollover_blocks: im("wal_rollover_blocks"),
         slot_refusals: db.tablet_refusals().0,
         row_cache_hits: rc.hits,
         row_cache_misses: rc.misses,
         row_cache_fills: rc.fills,
         row_cache_write_throughs: rc.write_throughs,
         xshard_rounds: m.cross_shard.rounds,
-        xshard_refused_rounds: m.cross_shard.refused_rounds,
+        xshard_refused_rounds: im("cross_shard.refused_rounds"),
         // Always 0 since D263 (the counters are deprecated); the report keeps its columns.
         xshard_refused_below_floor: 0,
         xshard_refused_move_raise: 0,
-        xshard_refused_moved: m.cross_shard.refused_moved,
-        xshard_refused_room: m.cross_shard.refused_room,
-        xshard_refused_pending_overlap: m.cross_shard.refused_pending_overlap,
-        xshard_share_waits: m.cross_shard.share_waits,
-        xshard_share_wait_nanos: m.cross_shard.share_wait_nanos,
-        xshard_chained: m.cross_shard.chained,
-        xshard_wounds: m.cross_shard.wounds,
-        xshard_max_attempts_blind: m.cross_shard.max_attempts_blind,
-        xshard_max_attempts_reading: m.cross_shard.max_attempts_reading,
+        xshard_refused_moved: im("cross_shard.refused_moved"),
+        xshard_refused_room: im("cross_shard.refused_room"),
+        xshard_refused_pending_overlap: im("cross_shard.refused_pending_overlap"),
+        xshard_share_waits: im("cross_shard.share_waits"),
+        xshard_share_wait_nanos: im("cross_shard.share_wait_nanos"),
+        xshard_chained: im("cross_shard.chained"),
+        xshard_wounds: im("cross_shard.wounds"),
+        xshard_max_attempts_blind: im("cross_shard.max_attempts_blind"),
+        xshard_max_attempts_reading: im("cross_shard.max_attempts_reading"),
     }
+}
+
+/// Every `Pigeonhole::internal_metrics` name the bench reads (ICR 0087). A test checks that
+/// the engine reports each one, so a renamed counter fails the build's tests instead of
+/// zeroing a report column.
+pub(crate) const INTERNAL_NAMES: &[&str] = &[
+    "wal_unpin_passes",
+    "wal_unpin_flushes",
+    "wal_inline_syncs",
+    "wal_rollover_blocks",
+    "file_growths_ahead",
+    "shard_parks",
+    "shard_wakes",
+    "commit_parks",
+    "visibility_waits",
+    "visibility_waiters_ahead",
+    "visibility_wake_passes",
+    "visibility_woken",
+    "visibility_contended",
+    "reader_pin_view_lag",
+    "cross_shard.refused_rounds",
+    "cross_shard.refused_moved",
+    "cross_shard.refused_room",
+    "cross_shard.refused_pending_overlap",
+    "cross_shard.share_waits",
+    "cross_shard.share_wait_nanos",
+    "cross_shard.chained",
+    "cross_shard.wounds",
+    "cross_shard.max_attempts_blind",
+    "cross_shard.max_attempts_reading",
+];
+
+/// A counter from `Pigeonhole::internal_metrics` by name (ICR 0087). A name this build lacks
+/// reads as 0 and is reported on stderr, once per name, so a report built against another
+/// build still runs but never zeroes a column silently.
+pub(crate) fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
+    debug_assert!(
+        INTERNAL_NAMES.contains(&name),
+        "add `{name}` to INTERNAL_NAMES so a test checks it exists"
+    );
+    if let Some(&(_, x)) = v.iter().find(|(n, _)| *n == name) {
+        return x;
+    }
+    static WARNED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut warned = WARNED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !warned.iter().any(|w| w == name) {
+        eprintln!(
+            "phdb-bench: WARNING: this build reports no internal metric `{name}`; its report \
+             column reads 0"
+        );
+        warned.push(name.to_owned());
+    }
+    0
 }
 
 #[cfg(test)]
@@ -1713,6 +1772,26 @@ mod tests {
             .memtable_budget(16 << 20);
         r.open(&dir).unwrap();
         (r, dir)
+    }
+
+    #[test]
+    fn every_internal_metric_the_bench_reads_exists() {
+        let dir = std::env::temp_dir().join(format!("phdb-bench-internal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Pigeonhole::open(
+            dir.join("db.phdb"),
+            pigeonhole::Options::default().shards(1),
+        )
+        .unwrap();
+        let v = db.internal_metrics();
+        for name in INTERNAL_NAMES {
+            assert!(
+                v.iter().any(|(n, _)| n == name),
+                "the bench reads `{name}`, which internal_metrics() no longer reports"
+            );
+        }
+        db.close().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

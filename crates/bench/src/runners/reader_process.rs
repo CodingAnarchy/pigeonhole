@@ -110,7 +110,9 @@ pub(crate) fn spawn(
             let mut max: Lag = (0, 0, 0);
             loop {
                 let m = writer.engine_metrics();
-                max.0 = max.0.max(m.reader_pin_view_lag);
+                let view_lag =
+                    super::pigeonhole::internal(&writer.internal_metrics(), "reader_pin_view_lag");
+                max.0 = max.0.max(view_lag);
                 max.1 = max.1.max(m.reader_pin_seqno_lag);
                 max.2 = max.2.max(m.reader_slots_active);
                 if stop.load(Ordering::Acquire) {
