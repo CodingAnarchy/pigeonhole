@@ -218,6 +218,19 @@ impl Runner for RocksDbTxnRunner {
         }
     }
 
+    /// The optimistic baseline's background work (D233), as [`super::rocksdb`] reads it.
+    /// The pessimistic store reports none: this RocksDB crate exposes properties on a
+    /// `TransactionDB` only in its multi-threaded mode.
+    fn background(&self) -> Option<crate::Background> {
+        match self.db.as_deref()? {
+            Db::Optimistic(db) => Some(super::rocksdb::background(
+                |name| db.property_int_value(name).ok().flatten(),
+                |name| db.property_value(name).ok().flatten(),
+            )),
+            Db::Pessimistic(_) => None,
+        }
+    }
+
     fn client(&self) -> Option<Box<dyn Client>> {
         Some(Box::new(self.handle(self.db.as_ref()?, self.sync)))
     }

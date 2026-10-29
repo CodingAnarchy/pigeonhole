@@ -315,17 +315,10 @@ impl Runner for RocksDbRunner {
 
     fn background(&self) -> Option<crate::Background> {
         let db = self.db.as_ref()?;
-        let prop = |name: &str| db.property_int_value(name).ok().flatten().unwrap_or(0);
-        let running = prop("rocksdb.num-running-compactions")
-            + prop("rocksdb.num-running-flushes")
-            + prop("rocksdb.compaction-pending")
-            + prop("rocksdb.mem-table-flush-pending");
-        Some(crate::Background {
-            work: None,
-            marker: prop("rocksdb.total-sst-files-size"),
-            running: Some(running > 0),
-            busy_nanos: None,
-        })
+        Some(background(
+            |name| db.property_int_value(name).ok().flatten(),
+            |name| db.property_value(name).ok().flatten(),
+        ))
     }
 
     fn client(&self) -> Option<Box<dyn Client>> {
@@ -581,5 +574,99 @@ impl<A: Iterator<Item = Kv>, B: Iterator<Item = Kv>> Iterator for Merged<A, B> {
             (Some(Ok((ka, _))), Some(Ok((kb, _)))) => ka <= kb,
         };
         if take_a { self.a.next() } else { self.b.next() }
+    }
+}
+
+/// A RocksDB store's background work (D233), from its properties: `int` and `text` read one
+/// integer or string property. Statistics stay off (they would cost every operation), so the
+/// completed work comes from the compaction table in `rocksdb.stats`.
+pub(crate) fn background(
+    int: impl Fn(&str) -> Option<u64>,
+    text: impl Fn(&str) -> Option<String>,
+) -> crate::Background {
+    let prop = |name: &str| int(name).unwrap_or(0);
+    let running = prop("rocksdb.num-running-compactions")
+        + prop("rocksdb.num-running-flushes")
+        + prop("rocksdb.compaction-pending")
+        + prop("rocksdb.mem-table-flush-pending");
+    crate::Background {
+        work: text("rocksdb.stats").as_deref().and_then(completed_work),
+        marker: prop("rocksdb.total-sst-files-size"),
+        running: Some(running > 0),
+        busy_nanos: None,
+    }
+}
+
+/// Flushes and compactions completed since open, from `rocksdb.stats`: the sum over every
+/// column family of its compaction table's `Sum` row, column `Comp(cnt)` (a flush counts
+/// at L0; a trivial move counts nothing, and does no work). `None` if no table parses.
+pub(crate) fn completed_work(stats: &str) -> Option<u64> {
+    let mut total = None;
+    let mut column = None;
+    for line in stats.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.first() {
+            Some(&"Level") => column = words.iter().position(|w| *w == "Comp(cnt)"),
+            Some(&"Sum") => {
+                // `Size` is two words in a row ("668.95 KB") and one in the header.
+                let Some(i) = column else { continue };
+                if let Some(n) = words.get(i + 1).and_then(|w| w.parse::<u64>().ok()) {
+                    *total.get_or_insert(0) += n;
+                }
+            }
+            _ => {}
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::completed_work;
+
+    /// `rocksdb.stats` as this RocksDB writes it: two column families, three flushes in
+    /// one and two compactions in the other.
+    const STATS: &str = "
+** Compaction Stats [default] **
+Level    Files   Size     Score Read(GB)  Rn(GB) Rnp1(GB) Write(GB) WPreComp(GB) Wnew(GB) Moved(GB) W-Amp Rd(MB/s) Wr(MB/s) Comp(sec) CompMergeCPU(sec) Comp(cnt) Avg(sec) KeyIn KeyDrop Rblob(GB) Wblob(GB)
+----------------------------------------------------------------------------------------------------
+  L0      0/0      0.00 KB   0.0      0.0     0.0      0.0       0.0       0.0      0.0       0.0   1.0      0.0    491.5      0.00              0.00         3    0.000    6000      0       0.0       0.0
+ Sum      3/0    668.95 KB   0.0      0.0     0.0      0.0       0.0       0.0      0.0       0.0   1.0      0.0    491.5      0.00              0.00         3    0.000    6000      0       0.0       0.0
+ Int      0/0      0.00 KB   0.0      0.0     0.0      0.0       0.0       0.0      0.0       0.0   1.0      0.0    491.5      0.00              0.00         3    0.000    6000      0       0.0       0.0
+
+** Compaction Stats [default] **
+Priority    Files   Size     Score Read(GB)  Rn(GB) Rnp1(GB) Write(GB) WPreComp(GB) Wnew(GB) Moved(GB) W-Amp Rd(MB/s) Wr(MB/s) Comp(sec) CompMergeCPU(sec) Comp(cnt) Avg(sec) KeyIn KeyDrop Rblob(GB) Wblob(GB)
+High      0/0      0.00 KB   0.0      0.0     0.0      0.0       0.0       0.0      0.0       0.0   0.0      0.0    491.5      0.00              0.00         3    0.000    6000      0       0.0       0.0
+
+** Compaction Stats [metric] **
+Level    Files   Size     Score Read(GB)  Rn(GB) Rnp1(GB) Write(GB) WPreComp(GB) Wnew(GB) Moved(GB) W-Amp Rd(MB/s) Wr(MB/s) Comp(sec) CompMergeCPU(sec) Comp(cnt) Avg(sec) KeyIn KeyDrop Rblob(GB) Wblob(GB)
+ Sum      1/0     12.00 MB   0.0      0.1     0.0      0.0       0.1       0.1      0.0       0.0   1.0      9.0      9.0      0.20              0.18         2    0.100    9000    100       0.0       0.0
+";
+
+    #[test]
+    fn completed_work_sums_every_column_familys_sum_row() {
+        assert_eq!(completed_work(STATS), Some(5));
+        assert_eq!(completed_work("Uptime(secs): 1.0 total"), None);
+    }
+
+    /// The live format: a flush shows up in the count (the parser follows the RocksDB this
+    /// crate builds, not only the sample above).
+    #[test]
+    fn completed_work_counts_a_real_flush() {
+        let dir = std::env::temp_dir().join(format!("phdb-rocksdb-work-{}", std::process::id()));
+        let mut o = rocksdb::Options::default();
+        o.create_if_missing(true);
+        let db = rocksdb::DB::open(&o, &dir).unwrap();
+        let work = || completed_work(&db.property_value("rocksdb.stats").unwrap().unwrap());
+        let before = work().unwrap_or(0);
+        for round in 0..2u32 {
+            for i in 0..1000u32 {
+                db.put(format!("k{round}-{i}"), [7u8; 100]).unwrap();
+            }
+            db.flush().unwrap();
+        }
+        assert_eq!(work(), Some(before + 2));
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
