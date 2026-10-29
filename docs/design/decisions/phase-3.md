@@ -2600,7 +2600,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - `blocking_waits`' failed-share-apply test is unchanged and passes. freeze_wake's hold helper now makes shard 1 the last applier.
 
 <a id="d280"></a>
-## D280 — The 1.0 performance bars beside #708 (owner decision, 2026-10-26; bench, engine, pigeonhole; amended 2026-10-26 and 2026-10-28)
+## D280 — The 1.0 performance bars beside #708 (owner decision, 2026-10-26; bench, engine, pigeonhole; amended 2026-10-26, 2026-10-28 and 2026-10-29)
 
 **Decided:** besides #708 (D274), these are 1.0 criteria. Each is judged at the gate's configs on throughput **and** p99, with a goal of 1.0× and a floor of 1.2×:
 - **Competitor rows:** #711, #712, #713, #759 and #760, against the gate's comparison store (RocksDB or SQLite).
@@ -2611,6 +2611,9 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 **Amended (owner, 2026-10-28):**
 - **#759:** judged at equal cache memory for both stores, at each store's maximum throughput, provided SQLite is confirmed saturated there. It is also judged and reported at equal offered load. The guide reports the latency-against-throughput tradeoff truthfully.
 - **#708:** transfer at Buffered is accepted for 1.0 as a documented gap (the default durability passes at 1.20×). Cross-shard commit cost continues after 1.0 in #1023.
+
+**Amended (owner, 2026-10-29):**
+- **Async (#709, #749):** judged at equal client threads. 16 client threads with 16 operations in flight each must reach at least 0.83× the throughput of the synchronous run on the same 16 threads (the contended step's row). Async p99 is judged against the synchronous run with the same total in flight (256 threads), since 16 times as many operations in flight can't match the 16-thread run's latency. The 256-thread run's throughput is reported beside it. That gap is the hardware threads 256 blocking clients keep busy (all 32 on the reference machine, against 16 client threads), not an async overhead: after #1086 an async ycsb-c read costs less CPU than a blocking one (6.2 against 6.8 µs per operation).
 
 <a id="d281"></a>
 ## D281 — Reader processes have a row cache, keyed on the writer's write watermarks in shared memory (owner decision, 2026-10-26; cache, shm, engine, pigeonhole, #926; refines D201)
