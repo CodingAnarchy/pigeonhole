@@ -773,7 +773,13 @@ pub(crate) fn get_through(
     if !rc.admit(family, key) {
         return None;
     }
-    let mut sink = RowData::default();
+    // Read only as far as the row fits the cache: past `max_row` it is oversize, and the get
+    // reads its cell as usual (#1059: a wide row read whole cost a get a row read's p99).
+    let mut sink = CappedFill {
+        row: RowData::default(),
+        len: 8,
+        cap: rc.max_row,
+    };
     let spec = ReadSpec {
         versions: 1,
         ..ReadSpec::default()
@@ -791,6 +797,10 @@ pub(crate) fn get_through(
     ) {
         return Some(Err(e));
     }
+    if sink.full() {
+        rc.insert_oversize(family, row, key);
+        return None;
+    }
     match encode(&sink, 0, meta.options.ttl_micros, rc.max_row) {
         Some(encoded) => {
             let got = cell_of(&encoded, qualifier);
@@ -801,6 +811,60 @@ pub(crate) fn get_through(
             rc.insert_oversize(family, row, key);
             None
         }
+    }
+}
+
+/// A get's fill (#1059): the family row as [`encode`] sizes it, full once it is past the
+/// cache's row cap, so the read stops there rather than read an oversize row whole.
+struct CappedFill {
+    row: RowData,
+    /// The row's encoded length so far, as `encode` counts it.
+    len: usize,
+    cap: usize,
+}
+
+impl CappedFill {
+    fn count_last(&mut self) {
+        if let Some(n) = self.row.cell_count()
+            && let Some(i) = n.checked_sub(1)
+            && let Some((qualifier, data)) = self.row.cell(i)
+        {
+            self.len += qualifier.len() + data.stored().len() + Encoded::CELL_OVERHEAD;
+        }
+    }
+}
+
+impl RowSink for CappedFill {
+    fn qualifiers(&mut self) -> &mut Vec<u8> {
+        self.row.qualifiers()
+    }
+
+    fn push(&mut self, family: FamilyId, qualifier: std::ops::Range<usize>, data: CellData) {
+        self.row.push(family, qualifier, data);
+        self.count_last();
+    }
+
+    fn push_inline(
+        &mut self,
+        family: FamilyId,
+        qualifier: std::ops::Range<usize>,
+        ts: Timestamp,
+        stored: &[u8],
+    ) {
+        self.row.push_inline(family, qualifier, ts, stored);
+        self.count_last();
+    }
+
+    fn full(&self) -> bool {
+        self.len > self.cap
+    }
+
+    fn cell_count(&self) -> Option<usize> {
+        self.row.cell_count()
+    }
+
+    fn cell(&self, i: usize) -> Option<(&[u8], &CellData)> {
+        self.row.cell(i)
     }
 }
 
@@ -916,6 +980,38 @@ mod tests {
                 (&b"long"[..], 3, &[2u8; 300][..]),
             ]
         );
+    }
+
+    #[test]
+    fn a_capped_fill_is_full_exactly_where_encode_refuses_the_row() {
+        // #1059: the fill stops reading at the first cell that takes the row past the cap,
+        // and that is where `encode` refuses it (so no row that fits is cut short).
+        for cap in [64usize, 200, 1000, 4096] {
+            let mut sink = CappedFill {
+                row: RowData::default(),
+                len: 8,
+                cap,
+            };
+            let mut stopped = None;
+            for i in 0..1000usize {
+                if sink.full() {
+                    stopped = Some(i);
+                    break;
+                }
+                let q = format!("q{i:04}");
+                let qs = sink.qualifiers();
+                let start = qs.len();
+                qs.extend_from_slice(q.as_bytes());
+                let end = qs.len();
+                sink.push_inline(FamilyId(1), start..end, 1, &[0u8; 7]);
+                assert_eq!(
+                    sink.full(),
+                    encode(&sink, 0, 0, cap).is_none(),
+                    "cap {cap}, after cell {i}"
+                );
+            }
+            assert!(stopped.is_some(), "cap {cap}: never full");
+        }
     }
 
     #[test]

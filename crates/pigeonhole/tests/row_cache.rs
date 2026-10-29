@@ -534,3 +534,70 @@ fn the_row_cache_is_off_by_default() {
     drop(t);
     db.close().unwrap();
 }
+
+#[test]
+fn a_get_never_fills_an_oversize_row_and_reads_it_right() {
+    // #1059: a get's fill reads a row only as far as the cache's row cap; a wider row is
+    // marked oversize and never filled, and every get still reads its cell, the last one
+    // included.
+    let vfs = SimVfs::new(1059);
+    let db = Pigeonhole::open("/db/rc-wide.phdb", options(&vfs)).unwrap();
+    let t = table(&db);
+    for chunk in 0..10u32 {
+        let mut m = t.mutate(b"wide");
+        for i in chunk * 100..chunk * 100 + 100 {
+            m = m.put("g", format!("q{i:05}").as_bytes(), &[i as u8; 64]);
+        }
+        m.commit().unwrap();
+    }
+    db.flush().unwrap();
+    let get = |q: &str| {
+        t.get(b"wide", "g", q.as_bytes())
+            .unwrap()
+            .map(|c| c.value().to_vec())
+    };
+    let s = db.row_cache_stats();
+    for _ in 0..4 {
+        assert_eq!(get("q00000").unwrap(), [0u8; 64]);
+        assert_eq!(get("q00999").unwrap(), [999u32 as u8; 64]);
+        assert_eq!(get("q00500").unwrap(), [500u32 as u8; 64]);
+        assert!(get("q01000").is_none());
+    }
+    let (hits, _, fills) = delta(&db, s);
+    assert_eq!((hits, fills), (0, 0), "an oversize row was cached");
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn with_the_get_fill_off_gets_fill_nothing_but_are_served_from_cached_rows() {
+    // #1059's switch: off, a get never fills; a row a latest row read cached is still served.
+    let vfs = SimVfs::new(10591);
+    let db = Pigeonhole::open(
+        "/db/rc-nofill.phdb",
+        options(&vfs).row_cache_get_fill(false),
+    )
+    .unwrap();
+    let t = table(&db);
+    t.mutate(b"r")
+        .put("f", b"a", b"1")
+        .put("f", b"b", b"2")
+        .commit()
+        .unwrap();
+    let get = |q: &[u8]| t.get(b"r", "f", q).unwrap().map(|c| c.value().to_vec());
+    let s = db.row_cache_stats();
+    for _ in 0..3 {
+        assert_eq!(get(b"a").unwrap(), b"1");
+    }
+    assert_eq!(delta(&db, s).2, 0, "a get filled with the fill off");
+    // Two latest row reads fill the row (D201), and gets then hit it.
+    for _ in 0..2 {
+        let row = t.row(b"r").families(["f"]).latest().read().unwrap();
+        assert!(row.is_some());
+    }
+    let s = db.row_cache_stats();
+    assert_eq!(get(b"b").unwrap(), b"2");
+    assert_eq!(delta(&db, s).0, 1, "a get missed a cached row");
+    drop(t);
+    db.close().unwrap();
+}
