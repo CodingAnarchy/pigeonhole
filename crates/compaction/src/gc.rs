@@ -582,7 +582,9 @@ impl Gc {
 
     /// Appends `e` to `out` if `keep`, else accounts for its drop. A kept merge operand
     /// becomes the pending combined operand, `(stripe, seqno)` of its newest operand, or
-    /// with `combine` merges into the pending one.
+    /// with `combine` merges into the pending one. Always inlined: it ran inline in both
+    /// decides' per-entry loops (flush and compaction instructions, D193).
+    #[inline(always)]
     fn emit(
         &mut self,
         e: GEntry,
@@ -630,6 +632,7 @@ impl Gc {
     }
 
     /// Appends the pending combined operand, if any.
+    #[inline(always)]
     fn flush_pending(&self, pending: Option<(usize, Seqno)>, out: &mut OutBuf) {
         if pending.is_some() {
             out.push(&self.acc_key, &self.acc);
