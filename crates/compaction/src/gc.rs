@@ -572,8 +572,9 @@ impl Gc {
                 Kind::FamilyDelete => true,
             };
             // As in `decide`, unless another source could split the two operands (#1051).
-            let combine = pending
-                .is_some_and(|(stripe, newest)| stripe == i && !self.guarded(e.seqno, newest));
+            let combine = e.kind == Kind::Merge
+                && pending
+                    .is_some_and(|(stripe, newest)| stripe == i && !self.guarded(e.seqno, newest));
             self.emit(e, keep, combine, &mut pending, out);
         }
         self.flush_pending(pending, out);
