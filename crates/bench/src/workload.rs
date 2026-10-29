@@ -673,6 +673,50 @@ mod tests {
         (load, run)
     }
 
+    /// Every workload's operation stream, pinned: an FNV-1a checksum over each operation's
+    /// `Debug` form, the load and the measured run, at seed 11. A change to what a workload
+    /// generates (or to the order it draws from its RNG) changes what every run measures, so
+    /// it must be deliberate: update the checksums with the change.
+    #[test]
+    fn operation_streams_are_pinned() {
+        let fnv = |ops: &[BenchOp]| {
+            ops.iter().fold(0xcbf2_9ce4_8422_2325_u64, |h, op| {
+                format!("{op:?}")
+                    .bytes()
+                    .fold(h, |h, b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+            })
+        };
+        let got: String = WorkloadKind::EVERY
+            .iter()
+            .map(|&kind| {
+                let (load, run) = ops(kind, 11);
+                format!("{kind:?} {:016x} {:016x}\n", fnv(&load), fnv(&run))
+            })
+            .collect();
+        assert_eq!(got, PINNED);
+    }
+
+    /// `operation_streams_are_pinned`'s checksums: workload, load, measured run.
+    const PINNED: &str = "\
+YcsbA 2a5548aa352f708f d586d59b183a02e9
+YcsbB 2a5548aa352f708f 57e0edc2aa92d266
+YcsbC 2a5548aa352f708f d55a24604846e2cb
+YcsbD 2a5548aa352f708f 40c019ffb8310030
+YcsbE 2a5548aa352f708f 6937116132e97724
+YcsbF 2a5548aa352f708f fe2c7a0bc8411e64
+SparseWide a4e056fa586848e5 936df031cc1d8e38
+TimeSeriesTtl fd1a186352eb86bb 0bb70d72b5ec0363
+Adjacency 5f5788f059265648 7237dc50bec2e2fb
+SkewedMultiShard 49961b1ebf3a8d4e aba46d4bc9e3fe1b
+GroupCommit 963c2845c35a1a66 7bac988cb70e7465
+CrossShardContention 2cb9190fe23af4c5 ee77c195e12e80d1
+Counters 0a85bb597758c85a 93cbeb7646b9a4a6
+Transfer ce5a1aa63651f0d6 d4823e0372c4ed1e
+SparseWideDeletes a4e056fa586848e5 466837d14101c796
+AdjacencyPrefix 5f5788f059265648 72030ff86ccb14ee
+TimeSeriesRange fd1a186352eb86bb 799106b6cb9985b0
+";
+
     #[test]
     fn deterministic_per_seed() {
         for kind in WorkloadKind::EVERY {
