@@ -63,7 +63,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-deny,cargo-semver-checks
+          tool: cargo-deny,cargo-semver-checks,cargo-public-api@0.52.0
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --exclude pigeonhole-bench --all-targets --all-features -- -D warnings
       - run: cargo clippy -p pigeonhole-bench --all-targets --features "$BENCH_FEATURES" -- -D warnings
@@ -144,6 +144,14 @@ jobs:
         env:
           PIGEONHOLE_DIRECT: "1"
       - run: cargo deny check
+      # The semver crates' public API against their committed snapshots (#695): any added,
+      # changed or removed item fails until `scripts/public-api.sh bless` records it, so new
+      # API is reviewed (and has an ICR) before 1.x freezes it. The nightly is pinned with the
+      # tool, since rustdoc's JSON changes between nightlies.
+      - name: public API snapshots
+        run: |
+          rustup toolchain install nightly-2026-10-05 --profile minimal
+          scripts/public-api.sh check
       - name: semver checks (published crates only)
         shell: bash
         run: |
