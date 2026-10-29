@@ -546,6 +546,11 @@ impl<B: Deref<Target = [u8]>> Block<B> {
             usize::try_from(v).map_err(|_| corrupt())
         };
         let shared = field()?;
+        // Every key is rebuilt from this block's bytes, so no valid prefix is longer than the
+        // block: this bounds `shared` (#1035), so sums with it don't overflow.
+        if shared > b.len() {
+            return Err(corrupt());
+        }
         let unshared = field()?;
         let value_len = field()?;
         let key_end = pos.checked_add(unshared).ok_or_else(corrupt)?;
@@ -948,8 +953,7 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
             let in_column = if e.shared == 0 {
                 unshared == key_len && self.block.bytes[e.unshared.clone()].starts_with(column)
             } else {
-                // Not `shared + unshared`: a malformed `shared` can be near `usize::MAX`.
-                e.shared >= column.len() && unshared <= key_len && e.shared == key_len - unshared
+                e.shared >= column.len() && e.shared + unshared == key_len
             };
             if !in_column {
                 break e;
