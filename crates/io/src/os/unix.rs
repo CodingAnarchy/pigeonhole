@@ -771,14 +771,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn own_process_is_alive_and_has_stable_start() {
-        let pid = std::process::id();
+    fn own_start_time_is_stable() {
         let start = current_start_time();
-        assert!(super::super::process_alive(pid, start));
         assert_eq!(current_start_time(), start);
-        if start != 0 {
-            assert!(!super::super::process_alive(pid, start + 1));
-        }
     }
 }
 

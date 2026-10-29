@@ -419,8 +419,8 @@ fn a_killed_reader_does_not_stall_the_writer() {
     assert_eq!(reader.ask("count"), "COUNT 1000");
     reader.kill();
     watchdog.step("reclaim");
-    // The writer frees the dead reader's slot (the real `process_alive`, not the
-    // simulator's) at its next reclaim: at most every 250 ms, run when a flush or a
+    // The writer frees the dead reader's slot (its liveness lock released by the real OS,
+    // not the simulator) at its next reclaim: at most every 250 ms, run when a flush or a
     // compaction finishes or a commit finds no room. Wait for it, flushing so one runs,
     // before the burst (#887): the burst then measures that the freed pin lets the writer
     // through, not how fast a slow runner flushes its way out of a stall that began before

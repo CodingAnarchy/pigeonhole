@@ -129,9 +129,6 @@ impl Vfs for Gate {
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.sim.current_process()
     }
-    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
-        self.sim.process_alive(process)
-    }
     fn random_u64(&self) -> u64 {
         self.sim.random_u64()
     }
