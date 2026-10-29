@@ -541,12 +541,13 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         shared.reclaim();
         shared.pager.truncate_tail()?;
         // What this round retires stays allocated until the call ends if a view keeps
-        // retired extents from being reclaimed now, or a snapshot (or a backup) will once
-        // this round retires more. Its commit must not grow the file then: the space would
+        // retired extents from being reclaimed now, or a snapshot (or a backup), or a
+        // reader process's slot, will once this round retires more. Its commit must not grow the file then: the space would
         // stay past the end, and the next round would plan to move the manifest out of it
         // again (#1098).
-        let pinned =
-            shared.pager.stats().retired_bytes > 0 || !shared.live_seqnos.list().is_empty();
+        let pinned = shared.pager.stats().retired_bytes > 0
+            || !shared.live_seqnos.list().is_empty()
+            || shared.shm.oldest_reader_pin().is_some();
         let plan = shared.pager.shrink_plan();
         if held.as_ref().is_some_and(|h| !plan.contains(&h.big)) {
             // Moved or replaced otherwise: the region is not needed.

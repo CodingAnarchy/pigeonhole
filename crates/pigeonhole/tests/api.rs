@@ -2334,11 +2334,31 @@ fn shrink_never_grows_the_file_while_a_snapshot_pins_retired_space() {
 
 #[test]
 fn shrink_never_grows_the_file_while_a_snapshot_taken_just_before_it_is_held() {
-    // #1098: a snapshot taken just before the shrink pins nothing yet, but keeps what the
-    // shrink's own first round retires. Unpinned, that round rewrites the manifest past the
-    // end of the file here and gives the space back once the old extents are reclaimed;
-    // with the snapshot held they are not, so the shrink must not grow the file at all.
+    shrink_with_a_snapshot_taken_just_before(false);
+}
+
+#[test]
+fn shrink_never_grows_the_file_while_a_reader_process_holds_a_snapshot() {
+    shrink_with_a_snapshot_taken_just_before(true);
+}
+
+/// #1098: a snapshot taken just before the shrink pins nothing yet, but keeps what the
+/// shrink's own first round retires. Unpinned, that round rewrites the manifest past the
+/// end of the file here and gives the space back once the old extents are reclaimed; with
+/// the snapshot held they are not, so the shrink must not grow the file at all. With
+/// `reader`, a reader process holds the snapshot: its slot pins the view, and the writer
+/// sees no seqno pin.
+fn shrink_with_a_snapshot_taken_just_before(reader: bool) {
+    let writer = pigeonhole_io::ProcessId {
+        pid: 1,
+        start_time: 1,
+    };
+    let reader_process = pigeonhole_io::ProcessId {
+        pid: 2,
+        start_time: 1,
+    };
     let vfs = SimVfs::new(7092);
+    vfs.enter_process(writer);
     let opts = Options::default()
         .vfs(Arc::clone(&vfs) as _)
         .shards(1)
@@ -2370,7 +2390,19 @@ fn shrink_never_grows_the_file_while_a_snapshot_taken_just_before_it_is_held() {
     }
     db.flush().unwrap();
     db.compact().unwrap();
-    let snapshot = db.snapshot().unwrap();
+    let (snapshot, reader_snapshot) = if reader {
+        vfs.enter_process(reader_process);
+        let r = Pigeonhole::open_reader(
+            "/db/s.phdb",
+            pigeonhole::ReaderOptions::default().vfs(Arc::clone(&vfs) as _),
+        )
+        .unwrap();
+        let snap = r.snapshot().unwrap();
+        vfs.enter_process(writer);
+        (None, Some((r, snap)))
+    } else {
+        (Some(db.snapshot().unwrap()), None)
+    };
     let file = |db: &Pigeonhole| db.info().unwrap().file_bytes;
     let (compacted, grown) = (file(&db), db.engine_metrics().file_growths);
     db.shrink().unwrap();
@@ -2379,6 +2411,12 @@ fn shrink_never_grows_the_file_while_a_snapshot_taken_just_before_it_is_held() {
     assert_eq!(value(&t, b"row0004", "d", &[0]).map(|v| v.len()), Some(900));
     assert_eq!(value(&t, b"row0003", "d", &[0]), None);
     drop(snapshot);
+    if let Some((r, snap)) = reader_snapshot {
+        vfs.enter_process(reader_process);
+        drop(snap);
+        drop(r);
+        vfs.enter_process(writer);
+    }
     drop(t);
     db.close().unwrap();
 }
