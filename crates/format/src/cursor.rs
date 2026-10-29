@@ -88,11 +88,21 @@ pub trait Cursor {
             return self.next();
         };
         // The row prefix ends with a terminator that never occurs inside an escaped row, so
-        // a key starting with it belongs to the same row.
-        let row = self.key()[..n].to_vec();
+        // a key starting with it belongs to the same row. Copied to the stack, which holds
+        // most row prefixes: a cursor that skips rows (a column limit, a filter's `SkipRow`)
+        // allocated one per skip.
+        let mut inline = [0u8; 64];
+        let heap;
+        let row: &[u8] = if let Some(buf) = inline.get_mut(..n) {
+            buf.copy_from_slice(&self.key()[..n]);
+            buf
+        } else {
+            heap = self.key()[..n].to_vec();
+            &heap
+        };
         loop {
             self.next()?;
-            if !self.valid() || !self.key().starts_with(&row) {
+            if !self.valid() || !self.key().starts_with(row) {
                 return Ok(());
             }
         }
