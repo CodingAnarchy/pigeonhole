@@ -16,6 +16,11 @@
 # (COUNTS from the workflow's head run). It only lowers. Never raise a ceiling without an
 # owner decision; a raise edits this file by hand and cites that decision.
 #
+# Raised under D195 (release/0.3.x, 0.3.4's version bump #1081; the coordinator's standing
+# approval of 2026-10-28 for pure-codegen raises up to 0.5%): compact 2692 -> 2705. The bump
+# changes no code, only crate versions, and compact went 2689 -> 2703 (run 40831854181):
+# placement, not work.
+#
 # Raised by D195 (owner decision, 2026-10-09): flushed 1905 -> 1912 and compacted 1282 -> 1288
 # (#384 merged after these ceilings were measured), get-sst 17883 -> 17983 with headroom 0.5%
 # (placement drift on main after #392/#396). Each is main 99f8929's count times (1 + headroom).
@@ -136,7 +141,7 @@ short-scans 13564 0.3
 commit-one 9585 0.3
 commit-sixteen 50044 0.3
 flush 2199 0.3
-compact 2692 0.5
+compact 2705 0.5
 ycsb-c 43293 1.0
 ycsb-a 27239 1.0
 commit-overwrite 11660 0.5
