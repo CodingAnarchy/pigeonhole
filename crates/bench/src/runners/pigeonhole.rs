@@ -39,6 +39,9 @@ pub(crate) struct Settings {
     pub(crate) no_packing: bool,
     /// Inline page-cache reads (`Options::nowait_reads`, D292); on, the library default.
     pub(crate) no_nowait_reads: bool,
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); on, the library
+    /// default.
+    pub(crate) no_get_fill: bool,
     /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
     /// turns it off.
     pub(crate) row_cache: Option<u64>,
@@ -393,6 +396,20 @@ impl PigeonholeRunner {
     /// ```
     pub fn nowait_reads(mut self, yes: bool) -> Self {
         self.settings.no_nowait_reads = !yes;
+        self
+    }
+
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290, #1059); on without
+    /// a call.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().get_fill(false);
+    /// assert!(r.describe().contains("get-fill=off"));
+    /// ```
+    pub fn get_fill(mut self, yes: bool) -> Self {
+        self.settings.no_get_fill = !yes;
         self
     }
 
@@ -761,6 +778,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.no_nowait_reads {
         options = options.nowait_reads(false);
     }
+    if s.no_get_fill {
+        options = options.row_cache_get_fill(false);
+    }
     if let Some(n) = s.shards {
         options = options.shards(n);
     }
@@ -1073,6 +1093,11 @@ impl Runner for PigeonholeRunner {
             || format!("default({})", pigeonhole_io::sys::default_shards()),
             |n| n.to_string(),
         );
+        let reads = format!(
+            "{}{}",
+            if s.no_nowait_reads { " nowait=off" } else { "" },
+            if s.no_get_fill { " get-fill=off" } else { "" }
+        );
         format!(
             "shards={shards} memtable={}MiB cache={} bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
@@ -1102,7 +1127,7 @@ impl Runner for PigeonholeRunner {
                 (false, false) => " tablets=on",
                 (false, true) => " tablets=on packing=off",
             },
-            if s.no_nowait_reads { " nowait=off" } else { "" },
+            reads,
             match (s.memory.model, s.row_cache) {
                 // Under the total model the cache field above names the row cache.
                 (CacheModel::Total, _) | (_, None) => String::new(),

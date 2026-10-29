@@ -413,6 +413,14 @@ pub trait RowSink {
         self.push(family, qualifier, data);
     }
 
+    /// Whether the sink takes no more cells: a row read stops before its next cell. The row
+    /// cache's fill uses it to stop reading a row once it is past the cache's row cap (an
+    /// oversize row is never stored, so reading it whole is waste, #1059). Never, by default.
+    #[inline]
+    fn full(&self) -> bool {
+        false
+    }
+
     /// How many cells this sink holds, for the row cache to read back what a read pushed
     /// (D201). `None` (the default): the sink cannot report them, and its reads are not
     /// stored in the row cache.
@@ -1581,6 +1589,9 @@ fn read_row_with(
         resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;
         loop {
+            if sink.full() {
+                break;
+            }
             let (data, qualifier) = {
                 let next = resolver.next_cell();
                 ResolverBlobs::check(resolver_blobs.as_ref())?;
