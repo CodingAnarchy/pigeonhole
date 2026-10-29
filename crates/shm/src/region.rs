@@ -311,6 +311,13 @@ fn open_directory(
     Ok(region)
 }
 
+/// The database id in the header of `region` (mapped for at least [`HEADER_LEN`] bytes).
+fn region_db_id(region: &SharedRegion) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    region.read(header::DB_ID, &mut id);
+    id
+}
+
 /// Reads and validates the header of `region` (mapped for at least [`HEADER_LEN`] bytes).
 fn read_header(
     region: &SharedRegion,
@@ -330,7 +337,10 @@ fn read_header(
         return Err(Error::Corrupt("region generation does not match its name"));
     }
     if h.db_id != db_id {
-        return Err(Error::Corrupt("region belongs to another database"));
+        // Left by another database whose file had this file's (device, inode): the inode was
+        // reused after that file was deleted (#1133). No writer of this database has built a
+        // region yet.
+        return Err(Error::NoWriter);
     }
     if h.file_device != identity.device || h.file_inode != identity.inode {
         return Err(Error::Corrupt("region belongs to another file"));
@@ -418,11 +428,21 @@ fn build(
     current: u64,
 ) -> Result<Inner> {
     let dir = config.dir.as_deref();
+    let mut current = current;
     let old = if current == 0 {
         None
     } else {
         let name = region_name(identity.device, identity.inode, current);
         match vfs.open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach) {
+            Ok(old) if region_db_id(&old) != db_id => {
+                // Left by another database whose file had this file's (device, inode): the
+                // inode was reused after that file was deleted, and an inode is not reused
+                // while any process has the file open, so nothing maps this region for its
+                // own database (#1133). Remove it and start this database at generation 1.
+                vfs.remove_shared(&name, dir)?;
+                current = 0;
+                None
+            }
             Ok(old) => {
                 // A live region with another layout version is refused unless no other
                 // process has the database open (then nobody can be attached to it).
@@ -537,7 +557,9 @@ impl ShmRegion {
     /// guard. Taking `Presence` first would make the probe upgrade a lock the writer must
     /// keep, which Windows cannot do atomically. If this fails, the presence byte may stay
     /// held until `file` is closed. A reader with no region to attach to (no writer has built one yet) gets
-    /// [`Error::Io`] with `ErrorKind::NotFound`. A writer's new generation starts its seqno
+    /// [`Error::NoWriter`], as does a reader that finds only a region left by another database
+    /// whose deleted file had this file's (device, inode); a writer removes such a region and
+    /// starts at generation 1 (#1133). A writer's new generation starts its seqno
     /// counter at `config.first_seqno` (ICR 0002). `config` must pass
     /// [`ShmConfig::validate`].
     pub fn open(

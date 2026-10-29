@@ -1,6 +1,9 @@
 //! The multi-process suite on real processes: the test binary re-executes itself as writer,
-//! reader and probe children (as `pigeonhole-io`'s `tests/pread.rs` does) over `PreadVfs`
-//! and the platform's default shared-memory location. Real syscalls, so not run under Miri.
+//! reader and probe children (as `pigeonhole-io`'s `tests/pread.rs` does) over `PreadVfs`.
+//! Each test's regions live in a directory of its own beside its data file
+//! ([`ShmConfig::dir`], file-backed): a region is named by its data file's (device, inode),
+//! and a deleted temp file's inode is reused, so in the shared default location a test could
+//! find another test's leftover region (#1133). Real syscalls, so not run under Miri.
 #![cfg(not(miri))]
 
 mod common;
@@ -55,8 +58,8 @@ fn child_main() {
                 EXIT_FAILED
             }
         },
-        "writer" => writer_child(&vfs, &file, identity),
-        "reader" => reader_child(&vfs, &file, identity),
+        "writer" => writer_child(&vfs, &file, identity, &config(&path)),
+        "reader" => reader_child(&vfs, &file, identity, &config(&path)),
         other => panic!("unknown child role {other}"),
     };
     std::process::exit(code);
@@ -67,9 +70,17 @@ fn commands() -> impl Iterator<Item = String> {
 }
 
 /// Builds a generation, publishes view 1, then waits for `quit` (or to be killed).
-fn writer_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
+/// The suite's region config for the database at `path`: [`small_config`] in the test's own
+/// shm directory, `shm` beside the data file, which the parent and its children share.
+fn config(path: &Path) -> ShmConfig {
+    let mut config = small_config();
+    config.dir = Some(path.parent().unwrap().join("shm"));
+    config
+}
+
+fn writer_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity, config: &ShmConfig) -> i32 {
     let _lock = WriterLock::acquire(file).unwrap();
-    let shm = ShmRegion::open(vfs, file, identity, DB_ID, Role::Writer, &small_config()).unwrap();
+    let shm = ShmRegion::open(vfs, file, identity, DB_ID, Role::Writer, config).unwrap();
     let _presence = Presence::acquire(file).unwrap();
     shm.publish_view(&view(1, 3, 8)).unwrap();
     shm.set_manifest_version(10);
@@ -85,9 +96,9 @@ fn writer_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
 
 /// Attaches as a reader and serves commands from stdin: `pin <seqno>`, `check <n>`,
 /// `status`, `view`, `reattach`, `quit`.
-fn reader_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
+fn reader_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity, config: &ShmConfig) -> i32 {
     let _presence = Presence::acquire(file).unwrap();
-    let mut shm = match ShmRegion::open(vfs, file, identity, DB_ID, Role::Reader, &small_config()) {
+    let mut shm = match ShmRegion::open(vfs, file, identity, DB_ID, Role::Reader, config) {
         Ok(shm) => shm,
         Err(e) => {
             say(format!("ERR {e:?}"));
@@ -271,7 +282,7 @@ impl Db {
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("shm")).unwrap();
         let path = dir.join("data.phdb");
         let vfs: VfsRef = PreadVfs::new(1);
         let (_, identity) = open_db(&vfs, &path);
@@ -288,7 +299,7 @@ impl Db {
     }
 
     fn open_writer(&self, file: &FileRef) -> (WriterLock, Presence, ShmRegion) {
-        self.open_writer_with(file, &small_config())
+        self.open_writer_with(file, &self.config())
     }
 
     fn open_writer_with(
@@ -303,9 +314,22 @@ impl Db {
         (lock, presence, shm)
     }
 
+    /// The region config of this test's database: see [`config`].
+    fn config(&self) -> ShmConfig {
+        config(&self.path)
+    }
+
+    /// The test's own shm directory.
+    fn shm_dir(&self) -> PathBuf {
+        self.dir.join("shm")
+    }
+
     fn region_exists(&self, generation: u64) -> bool {
         let name = region_name(self.identity.device, self.identity.inode, generation);
-        match self.vfs.open_shared(&name, None, 4096, SharedOpen::Attach) {
+        match self
+            .vfs
+            .open_shared(&name, Some(&self.shm_dir()), 4096, SharedOpen::Attach)
+        {
             Ok(_) => true,
             Err(e) if e.kind == ErrorKind::NotFound => false,
             Err(e) => panic!("{e}"),
@@ -315,7 +339,7 @@ impl Db {
 
 impl Drop for Db {
     fn drop(&mut self) {
-        let _ = ShmRegion::remove(&self.vfs, self.identity, None);
+        let _ = ShmRegion::remove(&self.vfs, self.identity, Some(&self.shm_dir()));
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -435,7 +459,7 @@ fn writer_process_kill_and_restart_remaps_readers() {
     // The next writer rebuilds under generation 2, seeding seqnos past the ceiling it
     // recovered (9), so readers never see the visible seqno go backwards.
     let file = db.open();
-    let mut config = small_config();
+    let mut config = db.config();
     config.first_seqno = 10;
     let (_lock, _presence, shm) = db.open_writer_with(&file, &config);
     assert_eq!(shm.generation(), Generation(2));
@@ -492,7 +516,7 @@ fn mismatched_layout_version_is_refused() {
     db.vfs
         .open_shared(
             &directory_name(db.identity.device, db.identity.inode),
-            None,
+            Some(&db.shm_dir()),
             directory::LEN as u64,
             SharedOpen::Attach,
         )
@@ -515,7 +539,7 @@ fn mismatched_layout_version_is_refused() {
         db.identity,
         DB_ID,
         Role::Writer,
-        &small_config(),
+        &db.config(),
     )
     .unwrap();
     assert_eq!(rebuilt.generation(), Generation(2));
@@ -597,7 +621,7 @@ fn a_forked_child_dropping_the_slot_leaves_the_parents_alone() {
         db.identity,
         DB_ID,
         Role::Reader,
-        &small_config(),
+        &db.config(),
     )
     .unwrap();
     let slot = reader
