@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.2.6] - 2026-10-29
+One engine fix from `main` (#1056), also released as 0.3.4, and the zstd security update 0.3.3 shipped. **Upgrade recommended** for every 0.2.x user: if a table was dropped just after a compaction of it had finished its work but before the compaction committed, the compaction's output space could be freed twice, and another flush or compaction writing at the same moment could then lose space it was still using, which corrupts the data it writes. zstd moves to 0.14.3, clearing RUSTSEC-2026-0391, 0398, 0403 and 0410 (Pigeonhole never used the affected stream API; compressed blocks are byte-identical). The file format is unchanged; files written by 0.2.0 to 0.2.5 open as before.
+
 ### Fixed
 - **A compaction's output is freed once, not twice, when its table is dropped just before the compaction commits** (#1056). If a `drop_table` committed after a compaction had checked its table but before the compaction's own manifest commit, the manifest freed the compaction's output SST twice: once as an orphan, and again as the refused request's output, for a compaction with a purge guard or new blob files. Another flush or compaction allocating space between the two could lose an extent it still used, which it then published over free space. Present since 0.2.0.
 
@@ -138,7 +141,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.2...v0.2.3
