@@ -692,14 +692,17 @@ pub fn background_workers(cfg: &Config) -> usize {
 }
 
 /// Options with the checker's flush and compaction knobs, and the sweep switches for paths
-/// the defaults leave off: `PIGEONHOLE_ROW_CACHE=1` (the writer's row cache, D290),
+/// the defaults leave off: `PIGEONHOLE_ROW_CACHE=1` (the writer's row cache, D290; `2`
+/// with its get fill on too, off by default since #1059),
 /// `PIGEONHOLE_CHECKPOINT_STEPS=n` (counter checkpoints, D291) and
 /// `PIGEONHOLE_BACKGROUND_WORKERS=n` (D284).
 pub fn options_for(vfs: Arc<SimVfs>, shards: usize, cfg: &Config) -> EngineOptions {
     let mut o = options(vfs, shards, cfg.memtable_budget);
-    if std::env::var("PIGEONHOLE_ROW_CACHE").as_deref() == Ok("1") {
+    let row_cache = std::env::var("PIGEONHOLE_ROW_CACHE");
+    if matches!(row_cache.as_deref(), Ok("1" | "2")) {
         // Small enough to evict.
         o.row_cache_bytes = 64 << 10;
+        o.row_cache_get_fill = row_cache.as_deref() == Ok("2");
     }
     let steps = env_count("PIGEONHOLE_CHECKPOINT_STEPS");
     if steps != 0 {

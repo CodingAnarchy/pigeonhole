@@ -570,8 +570,9 @@ impl Options {
     }
 
     /// Whether a point get that misses a row twice fills the row cache with the family row
-    /// (D290; default on). Off, gets are served from cached rows but never fill them. For
-    /// benchmarks comparing the two (#1059).
+    /// (D290; default off since the owner's 2026-10-29 amendment, #1059). Off, gets are
+    /// served from cached rows, which row reads fill, but never fill them. For benchmarks
+    /// comparing the two.
     #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn row_cache_get_fill(mut self, on: bool) -> Self {

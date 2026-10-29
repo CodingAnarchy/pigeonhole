@@ -39,9 +39,9 @@ pub(crate) struct Settings {
     pub(crate) no_packing: bool,
     /// Inline page-cache reads (`Options::nowait_reads`, D292); on, the library default.
     pub(crate) no_nowait_reads: bool,
-    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); on, the library
-    /// default.
-    pub(crate) no_get_fill: bool,
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); off, the library
+    /// default (#1059).
+    pub(crate) get_fill: bool,
     /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
     /// turns it off.
     pub(crate) row_cache: Option<u64>,
@@ -400,17 +400,18 @@ impl PigeonholeRunner {
         self
     }
 
-    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290, #1059); on without
-    /// a call.
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); off without a
+    /// call, the library default (#1059).
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
     ///
-    /// let r = PigeonholeRunner::default().get_fill(false);
-    /// assert!(r.describe().contains("get-fill=off"));
+    /// let r = PigeonholeRunner::default().get_fill(true);
+    /// assert!(r.describe().contains("get-fill=on"));
+    /// assert!(!PigeonholeRunner::default().describe().contains("get-fill"));
     /// ```
     pub fn get_fill(mut self, yes: bool) -> Self {
-        self.settings.no_get_fill = !yes;
+        self.settings.get_fill = yes;
         self
     }
 
@@ -797,8 +798,8 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.no_nowait_reads {
         options = options.nowait_reads(false);
     }
-    if s.no_get_fill {
-        options = options.row_cache_get_fill(false);
+    if s.get_fill {
+        options = options.row_cache_get_fill(true);
     }
     if let Some(n) = s.shards {
         options = options.shards(n);
@@ -1119,7 +1120,7 @@ impl Runner for PigeonholeRunner {
         let reads = format!(
             "{}{}",
             if s.no_nowait_reads { " nowait=off" } else { "" },
-            if s.no_get_fill { " get-fill=off" } else { "" }
+            if s.get_fill { " get-fill=on" } else { "" }
         );
         format!(
             "shards={shards} memtable={}MiB cache={} bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",

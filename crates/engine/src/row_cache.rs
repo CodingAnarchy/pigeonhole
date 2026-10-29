@@ -120,8 +120,8 @@ pub(crate) struct RowCaches {
     mask: usize,
     /// Largest encoded family row filled.
     pub max_row: usize,
-    /// Whether a get that misses twice fills the row (D290's get fill); off, gets only read
-    /// what is cached. For A/Bs (#1059).
+    /// Whether a get that misses twice fills the row (D290's get fill; off by default since
+    /// the owner's 2026-10-29 amendment, #1059); off, gets only read what is cached.
     pub get_fill: bool,
     /// `(table, family)` names the cache serves; empty means every family.
     families: Vec<(String, String)>,
@@ -180,7 +180,7 @@ impl RowCaches {
             ghost: table(),
             mask: slots - 1,
             max_row,
-            get_fill: true,
+            get_fill: false,
             families,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),

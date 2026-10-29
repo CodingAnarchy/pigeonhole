@@ -19,6 +19,12 @@ fn options(vfs: &Arc<SimVfs>) -> Options {
         .row_cache(1 << 20)
 }
 
+/// [`options`] with D290's get fill on (off by default since #1059), for the tests of what a
+/// filling get does.
+fn get_fill_options(vfs: &Arc<SimVfs>) -> Options {
+    options(vfs).row_cache_get_fill(true)
+}
+
 fn table(db: &Pigeonhole) -> Table {
     db.table("t")
         .unwrap()
@@ -216,7 +222,7 @@ fn projections_of_a_cached_row_equal_uncached_reads() {
 #[test]
 fn gets_are_answered_from_a_cached_row_and_fill_on_a_second_miss() {
     let vfs = SimVfs::new(406);
-    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let db = Pigeonhole::open("/db/rc.phdb", get_fill_options(&vfs)).unwrap();
     let t = table(&db);
     t.mutate(b"r")
         .put("f", b"a", b"1")
@@ -250,7 +256,7 @@ fn gets_are_answered_from_a_cached_row_and_fill_on_a_second_miss() {
 #[test]
 fn snapshot_and_transaction_gets_are_served_at_their_read_point() {
     let vfs = SimVfs::new(410);
-    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let db = Pigeonhole::open("/db/rc.phdb", get_fill_options(&vfs)).unwrap();
     let t = table(&db);
     t.mutate(b"r").put("f", b"a", b"1").commit().unwrap();
     let _ = t.get(b"r", "f", b"a").unwrap();
@@ -333,7 +339,7 @@ fn gets_refill_a_row_written_between_its_reads_at_most_every_other_get() {
     // the fill and drops the copy; the next miss fills under the ghost rule. Reads stay
     // correct throughout.
     let vfs = SimVfs::new(413);
-    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let db = Pigeonhole::open("/db/rc.phdb", get_fill_options(&vfs)).unwrap();
     let t = table(&db);
     t.mutate(b"r").put("g", b"a", b"1").commit().unwrap();
     let get = || t.get(b"r", "g", b"a").unwrap().map(|c| c.value().to_vec());
@@ -364,7 +370,7 @@ fn a_row_refilled_and_written_before_a_hit_is_cached_again() {
     // refused every later fill: the row stayed uncached until evicted. With the skip
     // one-shot, the gets after it fill and hit again.
     let vfs = SimVfs::new(416);
-    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs)).unwrap();
+    let db = Pigeonhole::open("/db/rc.phdb", get_fill_options(&vfs)).unwrap();
     let t = table(&db);
     let get = || t.get(b"r", "g", b"a").unwrap().map(|c| c.value().to_vec());
     t.mutate(b"r").put("g", b"a", b"1").commit().unwrap();
@@ -398,7 +404,8 @@ fn a_commit_writing_one_cached_column_twice_is_sized_in_order() {
     // and two empty puts that underflowed and panicked the shard thread; with growing puts
     // it under-sized the row and let it past `row_cache_max_row`.
     let vfs = SimVfs::new(415);
-    let db = Pigeonhole::open("/db/rc.phdb", options(&vfs).row_cache_max_row(200)).unwrap();
+    let db =
+        Pigeonhole::open("/db/rc.phdb", get_fill_options(&vfs).row_cache_max_row(200)).unwrap();
     let t = table(&db);
     let get = || {
         t.get(b"r", "g", b"a")
@@ -621,14 +628,11 @@ fn a_cold_get_of_a_wide_row_reads_only_the_blocks_under_the_row_cap() {
 }
 
 #[test]
-fn with_the_get_fill_off_gets_fill_nothing_but_are_served_from_cached_rows() {
-    // #1059's switch: off, a get never fills; a row a latest row read cached is still served.
+fn by_default_gets_fill_nothing_but_are_served_from_cached_rows() {
+    // D290 as amended after #1059's A/B: by default a get never fills; a row a latest row read
+    // cached is still served.
     let vfs = SimVfs::new(10591);
-    let db = Pigeonhole::open(
-        "/db/rc-nofill.phdb",
-        options(&vfs).row_cache_get_fill(false),
-    )
-    .unwrap();
+    let db = Pigeonhole::open("/db/rc-nofill.phdb", options(&vfs)).unwrap();
     let t = table(&db);
     t.mutate(b"r")
         .put("f", b"a", b"1")
@@ -640,7 +644,7 @@ fn with_the_get_fill_off_gets_fill_nothing_but_are_served_from_cached_rows() {
     for _ in 0..3 {
         assert_eq!(get(b"a").unwrap(), b"1");
     }
-    assert_eq!(delta(&db, s).2, 0, "a get filled with the fill off");
+    assert_eq!(delta(&db, s).2, 0, "a get filled by default");
     // Two latest row reads fill the row (D201), and gets then hit it.
     for _ in 0..2 {
         let row = t.row(b"r").families(["f"]).latest().read().unwrap();

@@ -1,0 +1,2 @@
+### Changed
+- Point gets no longer store rows in the row cache by default (#1059, D290 amended). They are still served from rows the cache holds, and latest row reads fill it as before. Storing a whole family row on a get's second miss cost write-heavy point-get workloads more at the tail than it saved: in the box A/B, transfer's p99 fell from 224 to 181 µs without it, ycsb-f gained 3.6% throughput, and sparse-wide get p99 fell from 18 to 10 µs. Results are unchanged either way.
