@@ -429,3 +429,160 @@ fn corpus_entries_open_read_check_and_write() {
     }
     assert_eq!(seen, entries().len());
 }
+
+/// The upgrade corpus (FORMAT §13): databases written by released 0.2.x and 0.3.x builds
+/// from crates.io, in `tests/corpus/v<version>/<entry>/`, written once by
+/// `tests/corpus/legacy-gen` and frozen. A 1.x build opens every one: read-only it reads it
+/// without writing a byte, writable it upgrades it to format 4 and reads it exactly.
+const UPGRADE_VERSIONS: [&str; 2] = ["0.2.5", "0.3.3"];
+const UPGRADE_ENTRIES: [&str; 6] = [
+    "wal_only",
+    "flushed",
+    "compacted",
+    "counters",
+    "blobs",
+    "merge_crash",
+];
+
+/// Both superblock slots' format versions (a slot never written reads `None`).
+fn slot_versions(path: &Path) -> [Option<u32>; 2] {
+    let bytes = std::fs::read(path).unwrap();
+    [0usize, 1].map(|slot| {
+        let page = &bytes[slot * 4096..(slot + 1) * 4096];
+        pigeonhole_format::superblock::Superblock::decode(page)
+            .ok()
+            .map(|s| s.version.0)
+    })
+}
+
+/// Every file of the entry copied to `dir`, by name, with its bytes.
+fn files(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|f| {
+            let f = f.unwrap();
+            (
+                f.file_name().into_string().unwrap(),
+                std::fs::read(f.path()).unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn upgrade_corpus_entries_open_upgrade_and_read_exactly() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    for version in UPGRADE_VERSIONS {
+        for entry in UPGRADE_ENTRIES {
+            let name = format!("v{version}/{entry}");
+            let src = root.join(format!("v{version}")).join(entry);
+            assert!(src.join("expected.txt").exists(), "{name} is missing");
+            let tmp = TempDir::new(&format!("upgrade-{version}-{entry}"));
+            for f in std::fs::read_dir(&src).unwrap() {
+                let f = f.unwrap();
+                std::fs::copy(f.path(), tmp.0.join(f.file_name())).unwrap();
+            }
+            let path = tmp.0.join(DB);
+            let expected: Vec<String> = std::fs::read_to_string(src.join("expected.txt"))
+                .unwrap()
+                .lines()
+                .filter(|l| !l.is_empty())
+                .map(str::to_owned)
+                .collect();
+            let before = slot_versions(&path);
+            assert!(
+                before.iter().flatten().all(|&v| v < 4),
+                "{name}: written by a 0.x build, so an older format: {before:?}"
+            );
+
+            // Read-only (`read_only_fallback`, taken because this process doesn't register the
+            // entry's merge operator): reads what it can, replays the WAL into memory, and
+            // writes nothing, so the old build could still open the file.
+            if entry == "merge_crash" {
+                let untouched = files(&tmp.0);
+                let options = real_options_without_merge().read_only_fallback(true);
+                let db = Pigeonhole::open(&path, options)
+                    .unwrap_or_else(|err| panic!("{name}: read-only open: {err}"));
+                assert!(
+                    db.info().unwrap().read_only,
+                    "{name}: the fallback was taken"
+                );
+                let t = db.table("log").unwrap().open().unwrap();
+                let mut plain = Vec::new();
+                let scan = t.scan_prefix(b"").family("p").versions(0);
+                let mut it = scan.iter().unwrap();
+                while let Some(row) = it.next_ref().unwrap() {
+                    for e in row.iter() {
+                        let Value::Bytes(b) = e.cell.typed() else {
+                            panic!("{name}: a plain cell")
+                        };
+                        plain.push(format!(
+                            "log\t{}\t{}\t{}\t{}\tbytes:{}",
+                            hex(row.key()),
+                            e.family,
+                            hex(e.qualifier),
+                            e.cell.timestamp(),
+                            hex(b)
+                        ));
+                    }
+                }
+                drop(it);
+                let want: Vec<_> = expected
+                    .iter()
+                    .filter(|l| l.split('\t').nth(2) == Some("p"))
+                    .cloned()
+                    .collect();
+                assert_eq!(plain, want, "{name}: the plain family, read-only");
+                assert!(
+                    t.mutate(b"x").put("p", b"n", b"no").commit().is_err(),
+                    "{name}: a read-only handle refuses writes"
+                );
+                db.close().unwrap();
+                assert_eq!(slot_versions(&path), before, "{name}: not upgraded");
+                assert!(
+                    files(&tmp.0) == untouched,
+                    "{name}: the read-only open changed a file"
+                );
+            }
+
+            // Writable: upgrades both superblock slots to format 4 and reads every cell as
+            // the old build read it.
+            let db = Pigeonhole::open(&path, real_options())
+                .unwrap_or_else(|err| panic!("{name}: open: {err}"));
+            assert_eq!(contents(&db), expected, "{name}: contents");
+            assert_eq!(slot_versions(&path), [Some(4), Some(4)], "{name}: upgraded");
+            let t = db
+                .table("corpus_writes")
+                .unwrap()
+                .family("f", Family::default())
+                .create_if_missing()
+                .unwrap();
+            t.mutate(b"written")
+                .put("f", b"q", b"by this build")
+                .commit()
+                .unwrap();
+            db.flush().unwrap();
+            db.compact().unwrap();
+            db.close().unwrap();
+            let report = pigeonhole::check(&path, pigeonhole::CheckOptions::default())
+                .unwrap_or_else(|err| panic!("{name}: check: {err}"));
+            assert!(report.is_ok(), "{name}: {:#?}", report.findings);
+            let db = Pigeonhole::open(&path, real_options()).unwrap();
+            let (old, new): (Vec<_>, Vec<_>) = contents(&db)
+                .into_iter()
+                .partition(|l| !l.starts_with("corpus_writes\t"));
+            assert_eq!(old, expected, "{name}: contents after the write");
+            assert_eq!(new.len(), 1, "{name}: {new:?}");
+            db.close().unwrap();
+        }
+    }
+}
+
+fn real_options_without_merge() -> Options {
+    Options::default()
+        .shards(2)
+        .pin_threads(false)
+        .memtable_budget(8 << 20)
+        .block_cache(8 << 20)
+        .create_if_missing(false)
+}
