@@ -24,7 +24,7 @@ use std::sync::atomic::Ordering;
 
 use pigeonhole_io::IoBuf;
 
-use crate::hash::hash_of;
+use crate::hash::{BuildPrehashed, Prehashed, hash_of};
 use crate::s3fifo::Sharded;
 use crate::sync::{Arc, AtomicU8, AtomicU64, lock, read};
 
@@ -121,7 +121,7 @@ impl From<Vec<u8>> for BlockData {
 /// assert_eq!(cache.usage(), 0);
 /// ```
 pub struct BlockCache {
-    shards: Sharded<BlockKey, BlockData>,
+    shards: Sharded<Prehashed<BlockKey>, BlockData, BuildPrehashed>,
     /// Bytes of blocks their readers keep pinned for as long as they are open (an SST's top
     /// index and filters; [`add_pinned`](Self::add_pinned)), D215.
     pinned: AtomicU64,
@@ -147,7 +147,7 @@ impl BlockCache {
         Self::with_shards(Sharded::empty())
     }
 
-    fn with_shards(shards: Sharded<BlockKey, BlockData>) -> Self {
+    fn with_shards(shards: Sharded<Prehashed<BlockKey>, BlockData, BuildPrehashed>) -> Self {
         Self {
             shards,
             pinned: AtomicU64::new(0),
@@ -160,7 +160,9 @@ impl BlockCache {
     /// ([`hits_and_misses`](Self::hits_and_misses)). Allocation-free.
     #[inline]
     pub fn get(&self, key: BlockKey) -> Option<BlockHandle> {
-        let shard = self.shards.padded(hash_of(&key))?;
+        // Hashed once: the hash picks the shard and is the shard map's hash.
+        let key = Prehashed::new(key);
+        let shard = self.shards.padded(key.hash)?;
         let found = read(&shard.lock).get(&key).map(BlockHandle::new);
         let counter = if found.is_some() {
             &shard.hits
@@ -192,7 +194,8 @@ impl BlockCache {
     pub fn insert(&self, key: BlockKey, data: BlockData, priority: Priority) -> BlockHandle {
         let charge = data.charge();
         let block = Arc::new(data);
-        if let Some(shard) = self.shards.shard(hash_of(&key)) {
+        let key = Prehashed::new(key);
+        if let Some(shard) = self.shards.shard(key.hash) {
             lock(shard).insert(key, Arc::clone(&block), charge, priority);
         }
         BlockHandle::new(block)
@@ -220,12 +223,13 @@ impl BlockCache {
     pub fn erase_files(&self, files: &[u64]) {
         if files.len() <= 8 {
             self.shards
-                .for_each(|s| s.remove_unpinned_where(|k| files.contains(&k.file)));
+                .for_each(|s| s.remove_unpinned_where(|k| files.contains(&k.key.file)));
         } else {
             let mut sorted = files.to_vec();
             sorted.sort_unstable();
-            self.shards
-                .for_each(|s| s.remove_unpinned_where(|k| sorted.binary_search(&k.file).is_ok()));
+            self.shards.for_each(|s| {
+                s.remove_unpinned_where(|k| sorted.binary_search(&k.key.file).is_ok())
+            });
         }
     }
 
@@ -500,7 +504,8 @@ impl fmt::Debug for Cell {
 /// assert!(rows.get(3, b"user:42", 10).is_none());
 /// ```
 pub struct RowCache {
-    shards: Sharded<u64, RowEntry>,
+    /// Keyed by `hash(family, row)`, which the shard maps take as is.
+    shards: Sharded<u64, RowEntry, BuildPrehashed>,
 }
 
 struct RowEntry {

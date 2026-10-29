@@ -117,13 +117,15 @@ fn row_cache_new_epoch_replaces() {
 
 /// Whether `k` is cached, without counting a hit.
 fn cached(c: &BlockCache, k: BlockKey) -> bool {
-    let shard = c.shards.shard(hash::hash_of(&k)).expect("shard");
+    let k = hash::Prehashed::new(k);
+    let shard = c.shards.shard(k.hash).expect("shard");
     lock(shard).peek(&k).is_some()
 }
 
 /// Whether `k` is cached in the main queue.
 fn in_main(c: &BlockCache, k: BlockKey) -> bool {
-    let shard = c.shards.shard(hash::hash_of(&k)).expect("shard");
+    let k = hash::Prehashed::new(k);
+    let shard = c.shards.shard(k.hash).expect("shard");
     lock(shard).in_main(&k)
 }
 

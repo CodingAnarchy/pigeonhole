@@ -30,7 +30,7 @@
 //! or erased from the shard's books).
 
 use std::collections::{HashMap, VecDeque};
-use std::hash::Hash;
+use std::hash::{BuildHasher, Hash};
 
 use crate::Priority;
 use crate::hash::BuildKeyHasher;
@@ -89,12 +89,12 @@ enum Step {
 }
 
 /// One shard: an index plus the three queues.
-pub(crate) struct Shard<K, V> {
-    map: HashMap<K, Slot<V>, BuildKeyHasher>,
+pub(crate) struct Shard<K, V, S = BuildKeyHasher> {
+    map: HashMap<K, Slot<V>, S>,
     small: VecDeque<(K, u64)>,
     main: VecDeque<(K, u64)>,
     ghost: VecDeque<(K, u64)>,
-    ghost_set: HashMap<K, u64, BuildKeyHasher>,
+    ghost_set: HashMap<K, u64, S>,
     capacity: usize,
     small_target: usize,
     usage: usize,
@@ -102,14 +102,14 @@ pub(crate) struct Shard<K, V> {
     next_id: u64,
 }
 
-impl<K: Copy + Eq + Hash, V> Shard<K, V> {
+impl<K: Copy + Eq + Hash, V, S: BuildHasher + Default> Shard<K, V, S> {
     fn new(capacity: usize) -> Self {
         Self {
-            map: HashMap::with_hasher(BuildKeyHasher),
+            map: HashMap::with_hasher(S::default()),
             small: VecDeque::new(),
             main: VecDeque::new(),
             ghost: VecDeque::new(),
-            ghost_set: HashMap::with_hasher(BuildKeyHasher),
+            ghost_set: HashMap::with_hasher(S::default()),
             capacity,
             small_target: capacity / (100 / SMALL_PERCENT),
             usage: 0,
@@ -426,21 +426,21 @@ impl<K: Copy + Eq + Hash, V> Shard<K, V> {
 /// (first, so they share the lock word's 64-byte line: a lookup that took the lock adds to
 /// a line it already holds).
 #[repr(C, align(128))]
-pub(crate) struct Padded<K, V> {
+pub(crate) struct Padded<K, V, S = BuildKeyHasher> {
     /// Lookups that found their entry (the block cache counts them; [`Sharded::lookups`]).
     pub(crate) hits: AtomicU64,
     /// Lookups that did not.
     pub(crate) misses: AtomicU64,
-    pub(crate) lock: RwLock<Shard<K, V>>,
+    pub(crate) lock: RwLock<Shard<K, V, S>>,
 }
 
 /// A fixed set of shards, picked by key hash.
-pub(crate) struct Sharded<K, V> {
-    shards: Box<[Padded<K, V>]>,
+pub(crate) struct Sharded<K, V, S = BuildKeyHasher> {
+    shards: Box<[Padded<K, V, S>]>,
     capacity: usize,
 }
 
-impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
+impl<K: Copy + Eq + Hash, V, S: BuildHasher + Default> Sharded<K, V, S> {
     /// `shards == 0` picks `min(64, capacity / min_shard_bytes)`, at least 1.
     pub(crate) fn new(capacity: usize, shards: usize, min_shard_bytes: usize) -> Self {
         let n = if shards == 0 {
@@ -468,13 +468,13 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
 
     /// The shard for `hash`, or `None` when there are no shards.
     #[inline]
-    pub(crate) fn shard(&self, hash: u64) -> Option<&RwLock<Shard<K, V>>> {
+    pub(crate) fn shard(&self, hash: u64) -> Option<&RwLock<Shard<K, V, S>>> {
         self.padded(hash).map(|s| &s.lock)
     }
 
     /// [`Sharded::shard`] with its lookup counters.
     #[inline]
-    pub(crate) fn padded(&self, hash: u64) -> Option<&Padded<K, V>> {
+    pub(crate) fn padded(&self, hash: u64) -> Option<&Padded<K, V, S>> {
         let n = self.shards.len() as u64;
         // Lemire's multiply-shift range reduction over hash bits 16..48. The shard's HashMap
         // hashes the same key to the same value and uses the low bits for the bucket and the
@@ -484,7 +484,7 @@ impl<K: Copy + Eq + Hash, V> Sharded<K, V> {
         self.shards.get(((mid * n) >> 32) as usize)
     }
 
-    pub(crate) fn for_each(&self, mut f: impl FnMut(&mut Shard<K, V>)) {
+    pub(crate) fn for_each(&self, mut f: impl FnMut(&mut Shard<K, V, S>)) {
         for s in self.shards.iter() {
             f(&mut lock(&s.lock));
         }
