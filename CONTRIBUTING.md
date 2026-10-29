@@ -55,13 +55,14 @@ Several agents often build and test on one machine, so local runs stay small:
   gh run list --workflow sweep.yml --branch <branch> --limit 1   # then: gh run watch <id>
   ```
   Each chunk sets `PIGEONHOLE_SEED`/`PIGEONHOLE_SEEDS`; a failing chunk's log names the seed. Reproduce that one seed locally.
-- **The standard sweeps for engine, WAL and I/O changes** (300 seeds, 6 chunks each), all four on the PR's head:
+- **The standard sweeps for engine, WAL and I/O changes** (300 seeds, 6 chunks each), all five on the PR's head:
   - engine `model_check` with `PIGEONHOLE_DEFERRED_IO=1`;
   - engine `model_check` plain;
+  - engine `counters` plain (`model_check` with counter families: `sum`, `sum_ttl`);
   - `pigeonhole` `model`;
   - engine `tablets` with `PIGEONHOLE_DEFERRED_IO=1`.
 
-  The last one is the only standard sweep that crashes around tablet changes and new streams with the device's completion order shuffled. It found #520 (D211), which the other three missed.
+  The `tablets` sweep is the only standard sweep that crashes around tablet changes and new streams with the device's completion order shuffled. It found #520 (D211), which the others missed. The `counters` sweep is the only one with counter-kind families, the only families D186/D287 combining and D291 checkpoints touch. Nobody ran it until perf287's long sweeps of 2026-10-28 found a live-read failure there.
 - Whoever dispatches a sweep watches it to completion and reports the result.
 - Agent worktrees carry an untracked `.cargo/config.toml` that caps build jobs and test threads; don't override it.
 - Build through [`cargo-quota`](https://crates.io/crates/cargo-quota) (`cargo install cargo-quota`): `cargo quota build`, `cargo quota test`, and so on, or a shell wrapper that routes them. It prunes the least recently used build artifacts before each build, keeping every worktree's `target/` together under the budget in `[workspace.metadata.quota]` (2% of the disk, shared across worktrees). `cargo quota status` shows where things stand. Plain `cargo` still works; the next `cargo quota` run catches up.
