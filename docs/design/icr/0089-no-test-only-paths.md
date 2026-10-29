@@ -24,6 +24,8 @@
   - `key::encode_seek_key`, `key::SEEK_KIND`, `key::column_prefix_len`, `Escaped::eq_raw` and `Escaped::is_verbatim` are removed. FORMAT §2 still defines seek keys, and the golden `keys.bin` still holds one, now built by the tests.
   - `BlockIter::entry_offset` is removed.
 
+**A third PR** (coordinator, 2026-10-29): `pigeonhole-io`'s `Vfs::process_alive` is removed from the trait and every backend, with `SimVfs::kill_process`. Its only production caller was the pid-judged reclaim the second PR removed. Reader liveness is the slot's lock byte (#693). A custom `Vfs` drops the method.
+
 ## What a re-implementation of `Pager::set_features` must keep (simp724's S1 on #1087)
 D269 and FORMAT §13 still describe flagging a feature, and #487 is its first user. The `set_features` that #1087 removes, and its two tests, held four constraints:
 1. **Two commits.** Both superblock pages carry the new sets before the first structure that uses the feature.
