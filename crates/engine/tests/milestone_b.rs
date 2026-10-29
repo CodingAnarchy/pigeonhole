@@ -636,6 +636,95 @@ fn drop_table_during_compaction(seed: u64, gone_ssts: u32) {
     db.close().unwrap();
 }
 
+/// The drop commits between a compaction's own check and its manifest commit (#695's
+/// coverage report): the compaction found its table at submit, but the manifest drains the
+/// drop's request first. The compaction's output is then an orphan the manifest frees, once:
+/// its request also names that output to free on refusal (a purge guard makes it a closure),
+/// and freeing it twice handed back an extent another task could have taken meanwhile
+/// (#1056; in debug, the pager's "not pending output" assertion). Nothing it wrote stays
+/// referenced or leaks, and the kept table reopens whole.
+#[test]
+fn a_drop_committed_after_a_compactions_check_frees_its_output_at_the_manifest() {
+    let vfs = SimVfs::new(37);
+    let mut o = owned(Arc::clone(&vfs), 2);
+    o.compaction.l0_trigger = u32::MAX;
+    o.compaction.level_base_bytes = u64::MAX;
+    o.memtable_freeze_bytes = 512 << 10;
+    let db = Engine::open(Path::new(DB), o.clone()).unwrap();
+    let family = || vec![("f".into(), FamilyOptions::default())];
+    let keep = db.create_table("keep", &family()).unwrap();
+    let gone = db.create_table("gone", &family()).unwrap();
+    write_rows(&db, &keep, 0..200, Durability::GroupSync);
+    db.flush().unwrap();
+    for i in 0..2 {
+        write_rows(&db, &gone, i * 100..i * 100 + 100, Durability::GroupSync);
+        db.flush().unwrap();
+    }
+    db.close().unwrap();
+    drop(db);
+
+    o.compaction_threads = 0;
+    let (db, mut shards) = Engine::open_application_owned(Path::new(DB), o.clone()).unwrap();
+    // The manifest's exclusion held here: requests queue, in order, until it is released.
+    assert!(db.hold_manifest());
+    // The drop's request queues first (its caller waits for it on a thread of its own).
+    let dropper = {
+        let db = Arc::clone(&db);
+        let id = gone.id;
+        std::thread::spawn(move || db.drop_table(id))
+    };
+    let asked = std::time::Instant::now();
+    while db.manifest_queue_len() == 0 {
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(10),
+            "the drop never queued its manifest request"
+        );
+        std::thread::yield_now();
+    }
+    // The compaction runs, finds its table at submit, and queues behind the drop.
+    let mut compaction = db.compact_pending(Some(gone.id)).unwrap();
+    for _ in 0..10_000 {
+        if db.manifest_queue_len() >= 2 {
+            break;
+        }
+        for s in &mut shards {
+            s.run_once(u64::MAX);
+        }
+    }
+    assert_eq!(
+        db.manifest_queue_len(),
+        2,
+        "the compaction never queued its commit"
+    );
+    db.release_manifest();
+    dropper.join().unwrap().unwrap();
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let result = loop {
+        if let Poll::Ready(r) = std::pin::Pin::new(&mut compaction).poll(&mut cx) {
+            break r;
+        }
+        for s in &mut shards {
+            s.run_once(u64::MAX);
+        }
+    };
+    // The table went with the drop: nothing failed (the shard takes the manifest's
+    // `TableNotFound` as done).
+    result.unwrap();
+    assert!(db.table("gone").is_none());
+    db.shrink().unwrap();
+    assert_eq!(db.unreferenced_bytes(), 0, "the orphaned output leaked");
+    db.close().unwrap();
+    while shards.iter_mut().any(|s| s.run_once(u64::MAX)) {}
+    drop(shards);
+    drop(db);
+
+    let db = Engine::open(Path::new(DB), o).unwrap();
+    assert!(db.table("gone").is_none());
+    let keep = db.table("keep").unwrap();
+    assert_eq!(row_count(&db, &keep), 200);
+    db.close().unwrap();
+}
+
 // ---- #23: shrink never relocates in-flight output; reclaim after commits ----
 
 #[test]
