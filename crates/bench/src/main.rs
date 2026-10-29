@@ -840,7 +840,10 @@ mod tests {
             describe("ycsb-a --durability group-sync", WorkloadKind::YcsbA).contains(" group-sync")
         );
         assert!(describe("ycsb-a --durability sync", WorkloadKind::YcsbA).contains(" sync"));
-        assert_eq!(args("all --engine all").engines, ["pigeonhole", "rocksdb", "sqlite"]);
+        assert_eq!(
+            args("all --engine all").engines,
+            ["pigeonhole", "rocksdb", "sqlite"]
+        );
         assert_eq!(args("").command, "help");
         let rc = args("ycsb-c --row-cache 1048576");
         assert_eq!(rc.row_cache, Some(1 << 20));
