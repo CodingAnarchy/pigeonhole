@@ -3070,7 +3070,7 @@ The root cause is the readahead path's latency, not the scan's length. A demand 
 - A scan with no limit, or more than 128 rows left, keeps D222's readahead and #975's ramp unchanged.
 - 128 covers ycsb-e's longest scan (100 rows).
 - Why 8 blocks: at the default 16 KiB blocks, 128 rows of 1 KiB fill about 8. A scan that the limit really keeps short submits nothing.
-- A row limit doesn't bound the blocks a scan reads. Wide rows, rows a filter skips and runs of deleted rows can make a short scan long in blocks. Those scans get readahead back after at most 8 demand reads per cursor (perf287's review, #1029), where turning it off would have left every block a demand read.
+- A row limit doesn't bound the blocks a scan reads. Wide rows, rows a filter skips and runs of deleted rows can make a short scan long in blocks. Those scans get readahead back after at most 8 demand reads per SST cursor (perf287's review, #1029), where turning it off would have left every block a demand read. The bound is per cursor, so a short scan merging N level-0 files may do up to 8×N demand reads before any cursor ramps; that is fine at today's level-0 sizes (perf287).
 - With the block bound in place, 128 only decides when the later start applies, so a cut-off 2× either way costs little.
 
 **Measured** (AX102, 2026-10-29, #1029 c6487018873; 16 clients, full scale, ycsb-e ×3 interleaved, medians):
@@ -3078,7 +3078,7 @@ The root cause is the readahead path's latency, not the scan's length. A demand 
 - **ycsb-e at default:** 167.4K → 183.4K ops/s, p99 293 → 214 µs, scan p99.9 about 440 → 250 µs.
 - **The wait is gone:** the readahead wait that made up the p99–99.9 band (110–153 µs) is 0.
 - **Same as fully off:** this rule is within noise of reading nothing ahead for short scans, and of readahead off for every scan.
-- **Default level's overall p99.9:** it rises with every faster arm, fully-off ones included, because the 5% puts queue on group syncs at the higher request rate. It isn't the scans.
+- **Default level's overall p99.9 (553 → 1237 µs):** it rises with every faster arm, fully-off ones included, because the 5% puts queue on group syncs at the higher request rate. It isn't a scan regression, and the scans' own p99.9 falls. D280 judges p99.
 - **Long-scan shapes** (one run per arm): no regression. time-series-range p99 is 4145 → 2228 µs; adjacency's is 1638 → 1376 µs. Fully off was a little worse on time-series-range.
 - **Long scans' wait-on-in-flight is unmeasured:** adjacency is cache-resident at full scale (no data misses), and time-series-range's filtered scans weren't timed. #974 A stays parked until a cold long-scan profile shows such a wait.
 
