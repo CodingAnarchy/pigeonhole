@@ -1,0 +1,11 @@
+[package]
+name = "legacy-gen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+p02 = { package = "pigeonhole", version = "=0.2.5" }
+p03 = { package = "pigeonhole", version = "=0.3.3" }
