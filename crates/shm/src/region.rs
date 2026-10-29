@@ -228,8 +228,15 @@ fn io_error(kind: ErrorKind, context: &'static str) -> Error {
     Error::Io(pigeonhole_io::Error::new(kind, context))
 }
 
-/// Writes the header, including the fields `ShmHeader` leaves to this crate, and idles every
-/// watermark. `state` stays `initializing`; the caller stores `ready` once everything is in.
+/// `None` for a name that does not exist; any other failure is an error.
+fn unless_missing<T>(r: pigeonhole_io::Result<T>) -> Result<Option<T>> {
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.kind == ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// A seed for a new generation's row-epoch hash (D281): unpredictable from outside the
 /// process (`foldhash`'s per-process random state), different per generation.
 fn row_epoch_seed(generation: Generation, writer: ProcessId) -> u64 {
@@ -245,6 +252,34 @@ fn row_epoch_seed(generation: Generation, writer: ProcessId) -> u64 {
     ))
 }
 
+/// The header of a new generation laid out as `config` says, with its row-epoch seed and
+/// flags.
+fn new_header(
+    db_id: [u8; 16],
+    config: &ShmConfig,
+    identity: FileIdentity,
+    generation: Generation,
+    writer: ProcessId,
+) -> ShmHeader {
+    let mut h = ShmHeader::layout(
+        db_id,
+        config.shards,
+        config.reader_slots,
+        config.view_buffer_bytes,
+        config.arena_bytes,
+        config.row_epoch_slots,
+        identity.device,
+        identity.inode,
+    );
+    h.row_epoch_seed = row_epoch_seed(generation, writer);
+    if config.row_epochs_maintained {
+        h.row_epoch_flags |= pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED;
+    }
+    h
+}
+
+/// Writes the header, including the fields `ShmHeader` leaves to this crate, idles every
+/// watermark, then marks the region `ready`.
 fn init_region(
     region: &SharedRegion,
     h: &ShmHeader,
@@ -270,6 +305,9 @@ fn init_region(
                 .store(u64::MAX, Ordering::Relaxed);
         }
     }
+    region
+        .atomic_u32(header::STATE)
+        .store(STATE_READY, Ordering::Release);
 }
 
 /// Attaches to the directory region, creating and initializing it if absent. The caller
@@ -429,38 +467,34 @@ fn build(
 ) -> Result<Inner> {
     let dir = config.dir.as_deref();
     let mut current = current;
-    let old = if current == 0 {
+    let mut old = if current == 0 {
         None
     } else {
         let name = region_name(identity.device, identity.inode, current);
-        match vfs.open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach) {
-            Ok(old) if region_db_id(&old) != db_id => {
-                // Left by another database whose file had this file's (device, inode): the
-                // inode was reused after that file was deleted, and an inode is not reused
-                // while any process has the file open, so nothing maps this region for its
-                // own database (#1133). Remove it and start this database at generation 1.
-                vfs.remove_shared(&name, dir)?;
-                current = 0;
-                None
-            }
-            Ok(old) => {
-                // A live region with another layout version is refused unless no other
-                // process has the database open (then nobody can be attached to it).
-                let found = old
-                    .atomic_u32(header::LAYOUT_VERSION)
-                    .load(Ordering::Acquire);
-                if found != ShmLayoutVersion::CURRENT.0 && !alone(file)? {
-                    return Err(Error::VersionMismatch {
-                        found,
-                        expected: ShmLayoutVersion::CURRENT.0,
-                    });
-                }
-                Some(old)
-            }
-            Err(e) if e.kind == ErrorKind::NotFound => None,
-            Err(e) => return Err(e.into()),
-        }
+        unless_missing(vfs.open_shared(&name, dir, HEADER_LEN as u64, SharedOpen::Attach))?
     };
+    if old.as_ref().is_some_and(|old| region_db_id(old) != db_id) {
+        // Left by another database whose file had this file's (device, inode): the inode was
+        // reused after that file was deleted, and an inode is not reused while any process
+        // has the file open, so nothing maps this region for its own database (#1133).
+        // Remove it and start this database at generation 1.
+        vfs.remove_shared(&region_name(identity.device, identity.inode, current), dir)?;
+        current = 0;
+        old = None;
+    }
+    if let Some(old) = &old {
+        // A live region with another layout version is refused unless no other process has
+        // the database open (then nobody can be attached to it).
+        let found = old
+            .atomic_u32(header::LAYOUT_VERSION)
+            .load(Ordering::Acquire);
+        if found != ShmLayoutVersion::CURRENT.0 && !alone(file)? {
+            return Err(Error::VersionMismatch {
+                found,
+                expected: ShmLayoutVersion::CURRENT.0,
+            });
+        }
+    }
     // Present before the new generation is published, so a closing process cannot pass
     // `Presence::try_become_last` and remove it. After the probe above this is a no-op.
     present(file)?;
@@ -477,20 +511,8 @@ fn build(
             "shared-memory region name exceeds 30 bytes (31 with the leading `/`)",
         ));
     }
-    let mut h = ShmHeader::layout(
-        db_id,
-        config.shards,
-        config.reader_slots,
-        config.view_buffer_bytes,
-        config.arena_bytes,
-        config.row_epoch_slots,
-        identity.device,
-        identity.inode,
-    );
-    h.row_epoch_seed = row_epoch_seed(generation, vfs.current_process());
-    if config.row_epochs_maintained {
-        h.row_epoch_flags |= pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED;
-    }
+    let writer = vfs.current_process();
+    let h = new_header(db_id, config, identity, generation, writer);
     let region = match vfs.open_shared(&name, dir, h.region_len, SharedOpen::CreateNew) {
         Ok(r) => r,
         Err(e) if e.kind == ErrorKind::AlreadyExists => {
@@ -502,16 +524,7 @@ fn build(
         }
         Err(e) => return Err(unavailable(e)),
     };
-    init_region(
-        &region,
-        &h,
-        generation,
-        vfs.current_process(),
-        config.first_seqno,
-    );
-    region
-        .atomic_u32(header::STATE)
-        .store(STATE_READY, Ordering::Release);
+    init_region(&region, &h, generation, writer, config.first_seqno);
     if let Some(old) = &old {
         old.atomic_u32(header::STATE)
             .store(STATE_ABANDONED, Ordering::Release);
@@ -597,42 +610,15 @@ impl ShmRegion {
             device: 0,
             inode: 0,
         };
-        let mut h = ShmHeader::layout(
-            db_id,
-            config.shards,
-            config.reader_slots,
-            config.view_buffer_bytes,
-            config.arena_bytes,
-            config.row_epoch_slots,
-            identity.device,
-            identity.inode,
-        );
-        h.row_epoch_seed = row_epoch_seed(
-            Generation(1),
-            ProcessId {
-                pid: 0,
-                start_time: 0,
-            },
-        );
-        if config.row_epochs_maintained {
-            h.row_epoch_flags |= pigeonhole_format::shm::ROW_EPOCHS_MAINTAINED;
-        }
+        let generation = Generation(1);
+        let writer = ProcessId {
+            pid: 0,
+            start_time: 0,
+        };
+        let h = new_header(db_id, config, identity, generation, writer);
         let len = usize::try_from(h.region_len).expect("region fits in memory");
         let region = SharedRegion::heap(len);
-        let generation = Generation(1);
-        init_region(
-            &region,
-            &h,
-            generation,
-            ProcessId {
-                pid: 0,
-                start_time: 0,
-            },
-            config.first_seqno,
-        );
-        region
-            .atomic_u32(header::STATE)
-            .store(STATE_READY, Ordering::Release);
+        init_region(&region, &h, generation, writer, config.first_seqno);
         ShmRegion {
             inner: Arc::new(Inner {
                 region,
@@ -652,11 +638,10 @@ impl ShmRegion {
     /// processes still hold stay valid. Nothing to remove is not an error.
     pub fn remove(vfs: &VfsRef, identity: FileIdentity, dir: Option<&Path>) -> Result<()> {
         let name = directory_name(identity.device, identity.inode);
-        let directory = match vfs.open_shared(&name, dir, directory::LEN as u64, SharedOpen::Attach)
-        {
-            Ok(d) => d,
-            Err(e) if e.kind == ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e.into()),
+        let Some(directory) =
+            unless_missing(vfs.open_shared(&name, dir, directory::LEN as u64, SharedOpen::Attach))?
+        else {
+            return Ok(());
         };
         let mut magic = [0u8; 8];
         directory.read(directory::MAGIC, &mut magic);
@@ -666,18 +651,11 @@ impl ShmRegion {
                 .load(Ordering::Acquire);
             if generation != 0 {
                 let region = region_name(identity.device, identity.inode, generation);
-                match vfs.remove_shared(&region, dir) {
-                    Ok(()) => {}
-                    Err(e) if e.kind == ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
+                unless_missing(vfs.remove_shared(&region, dir))?;
             }
         }
-        match vfs.remove_shared(&name, dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind == ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        unless_missing(vfs.remove_shared(&name, dir))?;
+        Ok(())
     }
 
     /// Whether a newer generation replaced this mapping (its state is abandoned or the
