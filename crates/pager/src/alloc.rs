@@ -538,62 +538,14 @@ impl Alloc {
     ) -> Option<(Extent, Vec<Extent>)> {
         let limit = unit_of(big)?;
         let size = units(big.size_class);
-        let mut tried = 0;
-        let mut best: Option<Candidate> = None;
-        for at in (size..limit.saturating_sub(size - 1))
+        // The first minimum: the lowest region on a tie.
+        let (_, at, occupants) = (size..limit.saturating_sub(size - 1))
             .step_by(size as usize)
             .take(scan)
-        {
-            if tried >= tries {
-                break;
-            }
-            // Inside a used extent that starts below it: nothing to clear.
-            if self
-                .used
-                .range(..at)
-                .next_back()
-                .is_some_and(|(&u, used)| u + units(used.class) > at)
-            {
-                continue;
-            }
-            let occupants: Vec<(u64, Used)> = self
-                .used
-                .range(at..at + size)
-                .map(|(&u, used)| (u, *used))
-                .collect();
-            if occupants.is_empty()
-                || occupants.iter().any(|(u, used)| {
-                    used.retired.is_some()
-                        || used.placeholder
-                        || used.class >= big.size_class
-                        || !movable(extent(*u, used.class))
-                })
-            {
-                continue;
-            }
-            tried += 1;
-            let mut free = self.free.clone();
-            for set in &mut free {
-                let inside: Vec<u64> = set.range(at..at + size).copied().collect();
-                for u in inside {
-                    set.remove(&u);
-                }
-            }
-            let mut by_size: Vec<(u64, u8)> =
-                occupants.iter().map(|(u, used)| (*u, used.class)).collect();
-            by_size.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-            let fits = by_size.iter().all(|&(_, class)| {
-                take_lowest(&mut free, class).is_some_and(|t| t + units(class) <= limit)
-            });
-            if !fits {
-                continue;
-            }
-            let cost: u64 = by_size.iter().map(|&(_, c)| units(c)).sum();
-            if best.as_ref().is_none_or(|(c, _, _)| cost < *c) {
-                best = Some((cost, at, by_size));
-            }
-        }
-        let (_, at, occupants) = best?;
+            .filter_map(|at| Some((at, self.occupants_to_move(at, big.size_class, movable)?)))
+            .take(tries)
+            .filter_map(|(at, occupants)| self.relocate(at, size, limit, occupants))
+            .min_by_key(|(cost, ..)| *cost)?;
         self.held.insert(at, big.size_class);
         for class in 0..CLASSES {
             let inside: Vec<u64> = self.free[class].range(at..at + size).copied().collect();
@@ -605,6 +557,61 @@ impl Alloc {
         }
         let occupants = occupants.into_iter().map(|(u, c)| extent(u, c)).collect();
         Some((extent(at, big.size_class), occupants))
+    }
+
+    /// The occupants of the region of `class` at unit `at`, if `clear_for` may clear it: the
+    /// region is not inside a used extent that starts below it, and it holds at least one
+    /// occupant, each live, not a placeholder, smaller than `class` and `movable`.
+    fn occupants_to_move(
+        &self,
+        at: u64,
+        class: u8,
+        movable: &dyn Fn(Extent) -> bool,
+    ) -> Option<Vec<(u64, Used)>> {
+        let inside_below = self
+            .used
+            .range(..at)
+            .next_back()
+            .is_some_and(|(&u, used)| u + units(used.class) > at);
+        if inside_below {
+            return None;
+        }
+        let occupants: Vec<(u64, Used)> = self
+            .used
+            .range(at..at + units(class))
+            .map(|(&u, used)| (u, *used))
+            .collect();
+        let all_movable = occupants.iter().all(|(u, used)| {
+            used.retired.is_none()
+                && !used.placeholder
+                && used.class < class
+                && movable(extent(*u, used.class))
+        });
+        (!occupants.is_empty() && all_movable).then_some(occupants)
+    }
+
+    /// The candidate for clearing the region of `size` units at `at`, if its occupants fit
+    /// below `limit` with the region taken: placed largest first (the lowest unit on a tie),
+    /// each as `alloc_lowest` would.
+    fn relocate(
+        &self,
+        at: u64,
+        size: u64,
+        limit: u64,
+        occupants: Vec<(u64, Used)>,
+    ) -> Option<Candidate> {
+        let mut free = self.free.clone();
+        for set in &mut free {
+            set.retain(|u| !(at..at + size).contains(u));
+        }
+        let mut by_size: Vec<(u64, u8)> =
+            occupants.iter().map(|(u, used)| (*u, used.class)).collect();
+        by_size.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let fits = by_size.iter().all(|&(_, class)| {
+            take_lowest(&mut free, class).is_some_and(|t| t + units(class) <= limit)
+        });
+        let cost = by_size.iter().map(|&(_, c)| units(c)).sum();
+        fits.then_some((cost, at, by_size))
     }
 
     /// Takes the held `region` as one used (pending) extent once nothing but placeholders
