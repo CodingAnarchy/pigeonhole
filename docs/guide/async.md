@@ -140,7 +140,7 @@ With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `
 # use std::time::Duration;
 # use pigeonhole::{Options, Pigeonhole};
 # let dir = pigeonhole::doc_support::temp_dir();
-# let (_db, mut shards) =
+# let pigeonhole::AppOwned { mut shards, .. } =
 #     Pigeonhole::open_application_owned(dir.join("app.phdb"), Options::default().shards(1))?;
 # let mut shard = shards.pop().expect("one shard");
 let waker = shard.waker();
@@ -179,7 +179,7 @@ loop {
 - **Moving a shard to another thread: call `Shard::release()` on the old thread first** (#492). Each driving thread has its own ring, and only that thread can complete what was submitted to it, so a shard moved with I/O still on the old thread's ring would wait on it for ever once that thread stops running turns. `release()` drives the shard until the thread has nothing in flight. Then take `io_fd` again on the new thread (the descriptor belongs to the thread's ring). Debug builds panic on a move that skipped it. On the pread backend and in engine-owned mode, `release()` does nothing.
 
 ### Background workers: flush and compaction off the shards
-By default, flush and compaction run on the shards you drive, in the slices of step 4 above. Each slice holds up the commits queued behind it for up to half a millisecond, which is most of an application-owned store's write tail. **Background workers** (D284) take that work off the shards: set `Options::background_workers(n)` and open with `open_application_owned_with`, which returns an `AppOwned { db, shards, workers }`.
+By default, flush and compaction run on the shards you drive, in the slices of step 4 above. Each slice holds up the commits queued behind it for up to half a millisecond, which is most of an application-owned store's write tail. **Background workers** (D284) take that work off the shards: set `Options::background_workers(n)`, and `open_application_owned`'s `AppOwned { db, shards, workers }` hands them out.
 
 ```rust
 # use std::thread;
@@ -188,7 +188,7 @@ By default, flush and compaction run on the shards you drive, in the slices of s
 # fn main() -> pigeonhole::Result<()> {
 # let dir = pigeonhole::doc_support::temp_dir();
 let options = Options::default().shards(4).background_workers(1);
-let mut owned = Pigeonhole::open_application_owned_with(dir.join("bg.phdb"), options)?;
+let mut owned = Pigeonhole::open_application_owned(dir.join("bg.phdb"), options)?;
 // Either drive each worker yourself (below), or give each a thread:
 let worker_threads = owned.spawn_background_threads()?;
 # // The close needs the shards driven: give each a thread (the loop of step 4, simplified).
@@ -218,7 +218,7 @@ for t in worker_threads {
   - a flush a worker holds but isn't running, 2 ms into a commit's wait for memtable room.
 
   `EngineMetrics::background_fallback_take_backs` (the first two) and `background_room_take_backs` (the third) count these; both stay 0 while the workers are driven.
-- `open_application_owned` (the tuple form) hands no workers out, so it refuses `background_workers(n)` with `n > 0` (`InvalidArgument`). Engine-owned `open` ignores the option: it starts `compaction_cores` threads of its own.
+- Engine-owned `open` ignores the option: it starts `compaction_cores` threads of its own.
 
 ## Sync-only calls
 These calls have no async form (owner decision recorded in [D196](../design/decisions/phase-3.md#d196)):

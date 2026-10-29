@@ -180,16 +180,6 @@ impl SharedRegion {
         self.inner.ptr
     }
 
-    /// Binds `[offset, offset + len)` to NUMA node `node` (`mbind` on Linux; a no-op
-    /// elsewhere and for heap regions). Panics if the range is out of bounds.
-    pub fn bind_numa(&self, offset: usize, len: usize, node: u32) -> Result<()> {
-        let p = self.at(offset, len);
-        match &self.inner.backing {
-            Backing::Heap(_) => Ok(()),
-            Backing::Mapped { .. } => crate::os::bind_numa(p, len, node),
-        }
-    }
-
     /// Frees the memory of `[offset, offset + len)`: a later read of the range sees zeros,
     /// and the mapping stays valid, so nothing can fault. On Linux the whole pages inside
     /// the range and their backing store go (`madvise(MADV_REMOVE)`: a hole in the region's
@@ -370,7 +360,6 @@ mod tests {
         let t = std::thread::spawn(move || c.atomic_u64(8).fetch_add(1, Ordering::AcqRel));
         t.join().unwrap();
         assert_eq!(r.atomic_u64(8).load(Ordering::Acquire), 1);
-        r.bind_numa(0, 64, 0).unwrap();
     }
 
     #[test]

@@ -1064,7 +1064,11 @@ impl Engine {
                 options.row_cache_max_row,
                 options.row_cache_families.clone(),
                 Arc::clone(&row_epochs),
-            ),
+            )
+            .map(|mut rc| {
+                rc.get_fill = options.row_cache_get_fill;
+                rc
+            }),
             row_epochs: row_epochs.maintained().then_some(row_epochs),
             sst_ids: Arc::new(AtomicU64::new(catalog.counters.next_sst.max(1))),
             blob_ids: Arc::new(AtomicU32::new(catalog.counters.next_blob_file.max(1))),
@@ -1916,8 +1920,8 @@ impl Engine {
             .map_or(0, |a| a.inflight(shard))
     }
 
-    /// Submits a batch: routes each row to its shard (inline if called on the owning shard),
-    /// single-shard fast path or two-phase commit. `None` uses the writer default.
+    /// Submits a batch: routes each row to its shard, single-shard fast path or two-phase
+    /// commit. `None` uses the writer default.
     ///
     /// **Order.** A commit submitted after an earlier one was acknowledged is applied after
     /// it. Commits still in flight together have no order between them, even from one
@@ -4956,7 +4960,7 @@ pub struct EngineShard {
 
 impl EngineShard {
     /// In a forked child (#901): the shard is the parent's, and every driving method does
-    /// nothing (`run_once` returns `false`, `commit_local` fails `Unsupported`).
+    /// nothing (`run_once` returns `false`).
     fn forked(&self) -> bool {
         pigeonhole_io::sys::process_id() != self.engine.opened_in
     }
@@ -5070,57 +5074,6 @@ impl EngineShard {
             return None;
         }
         self.driver.as_ref().and_then(ShardDriver::next_deadline)
-    }
-
-    /// Commits `batch` inline if every row belongs to this shard; otherwise submits it.
-    pub fn commit_local(
-        &mut self,
-        batch: WriteBatch,
-        durability: Option<Durability>,
-    ) -> Result<PendingCommit> {
-        let engine = Arc::clone(&self.engine);
-        engine.check_writable()?;
-        let durability = durability.unwrap_or_else(|| engine.shared.default_durability());
-        let view = engine.shared.view.load();
-        let (builder, shards) = engine.route(batch, &view)?;
-        let me = ShardId(self.index());
-        let Some(driver) = self.driver.as_mut() else {
-            return Err(Error::Closed);
-        };
-        if shards.len() > 1 || shards.first().is_some_and(|s| *s != me) {
-            // Not ours: the regular path (a queue hop, or two-phase commit).
-            let mut wb = WriteBatch::new();
-            wb.builder = builder;
-            return engine
-                .submit(wb, Some(durability), None, None)
-                .map(PendingCommit::from);
-        }
-        let (builder, large) = engine.separate_large(builder)?;
-        let submitted_at = engine.shared.vfs.monotonic_nanos();
-        let (tx, waiter) = crate::write::commit_completion();
-        if let Some(large) = large {
-            large.settle_on(&tx, crate::large::commit_succeeded);
-        }
-        driver.with_handler(|h, ctx| {
-            h.commit_inline(
-                CommitReq {
-                    bytes: builder,
-                    durability,
-                    reply: Reply::Commit(tx),
-                    submitted_at,
-                    validate: None,
-                    predicate: None,
-                    retry: None,
-                    map_version: view.tablets().version(),
-                },
-                ctx,
-            )
-        });
-        Ok(PendingCommit::from(Submission {
-            waiter,
-            shared: engine.shard_ref(me),
-            spins: false,
-        }))
     }
 
     /// Registers a callback the engine calls when work arrives for this shard.

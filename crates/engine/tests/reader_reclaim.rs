@@ -170,9 +170,8 @@ fn a_reader_whose_pid_looks_dead_keeps_its_slot() {
         panic!("the reader pins nothing");
     };
 
-    // Its pid looks dead to the writer, but its handle still holds the slot's lock: past the
+    // Its handle still holds the slot's liveness lock (whatever its pid says): past the
     // interval, reclamations keep the slot and its pin.
-    vfs.kill_process(READER);
     for round in 0..3u32 {
         vfs.advance(PAST_INTERVAL);
         write_rows(&db, &t, 500 + round * 300..800 + round * 300);
@@ -181,7 +180,7 @@ fn a_reader_whose_pid_looks_dead_keeps_its_slot() {
     assert_eq!(
         db.reader_pin_and_view().0,
         Some(pinned),
-        "a live reader's slot was freed by its pid"
+        "a live reader's slot was freed"
     );
 
     // Its old snapshot still reads, and a new one reads the newest rows.

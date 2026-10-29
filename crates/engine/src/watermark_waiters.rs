@@ -106,13 +106,6 @@ impl<W> List<W> {
     }
 }
 
-impl<W> Default for WatermarkWaiters<W> {
-    /// One part (the registry's tests and loom models).
-    fn default() -> Self {
-        Self::new(1)
-    }
-}
-
 impl<W> WatermarkWaiters<W> {
     /// A registry of `parts` parts (at least one): the engine makes one per shard.
     pub(crate) fn new(parts: usize) -> Self {
@@ -198,26 +191,19 @@ impl<W> WatermarkWaiters<W> {
             self.mark(i, true);
         }
         drop(list);
-        // Pairs with the fence in `wake_ready`: either the publisher sees this registration
-        // or the caller's re-read sees its watermark.
+        // Pairs with the publisher's fence before `wake_ready_fenced`: either it sees this
+        // registration or the caller's re-read sees its watermark.
         fence(Ordering::SeqCst);
         listed
     }
 
-    /// After a watermark publish: hands `wake` every entry whose seqno is at or below what
-    /// `visible` reads, forgotten, and runs it outside the locks. Returns whether the pass
-    /// took a lock. With nobody registered it is one fence and one load of `listed` (plus
-    /// one per further 64 parts), and it visits only the parts that list someone. The engine
-    /// fences once for both registries and calls `wake_ready_fenced`; this stays for tests.
-    #[cfg(test)]
-    pub(crate) fn wake_ready(&self, visible: impl Fn() -> Seqno, wake: impl FnMut(W)) -> bool {
-        // Pairs with the fence in `register`.
-        fence(Ordering::SeqCst);
-        self.wake_ready_fenced(visible, wake)
-    }
-
-    /// `wake_ready` for a caller that has already issued the SeqCst fence after its
-    /// watermark publish: one fence then serves every registry it wakes.
+    /// After a watermark publish and a SeqCst fence (which pairs with the one in `register`:
+    /// either the publisher sees a registration or the registrant's re-read sees its
+    /// watermark): hands `wake` every entry whose seqno is at or below what `visible` reads,
+    /// forgotten, and runs it outside the locks. Returns whether the pass took a lock. With
+    /// nobody registered it is one load of `listed` (plus one per further 64 parts), and it
+    /// visits only the parts that list someone. The caller fences once for every registry
+    /// it wakes (`Shard::wake_visible`).
     #[inline]
     pub(crate) fn wake_ready_fenced(
         &self,
@@ -231,8 +217,8 @@ impl<W> WatermarkWaiters<W> {
         self.wake_listed(first, &visible, &mut wake)
     }
 
-    /// `wake_ready` past its check: visits every part the `listed` bits mark, starting
-    /// from the first word's bits as `wake_ready` loaded them. Kept out of line, so a
+    /// `wake_ready_fenced` past its check: visits every part the `listed` bits mark, starting
+    /// from the first word's bits as `wake_ready_fenced` loaded them. Kept out of line, so a
     /// publish with nobody registered stays a fence and a load.
     #[inline(never)]
     fn wake_listed(
@@ -258,7 +244,7 @@ impl<W> WatermarkWaiters<W> {
         }
     }
 
-    /// `wake_ready`'s pass over part `i`, which `listed` says lists someone. Returns
+    /// `wake_ready_fenced`'s pass over part `i`, which `listed` says lists someone. Returns
     /// whether it took the part's lock.
     fn wake_part(
         &self,
@@ -393,7 +379,9 @@ mod loom_tests {
         /// (it is the smallest of the shards' pending seqnos).
         fn publish(&self, v: u64) {
             self.visible.fetch_max(v, Ordering::Release);
-            self.waiters.wake_ready(
+            // `Shard::wake_visible`'s fence, which pairs with the one in `register`.
+            loom::sync::atomic::fence(Ordering::SeqCst);
+            self.waiters.wake_ready_fenced(
                 || self.visible.load(Ordering::Acquire),
                 |w| {
                     self.woken[w].fetch_add(1, Ordering::Relaxed);
@@ -523,7 +511,8 @@ mod tests {
 
     fn take(w: &WatermarkWaiters<u16>, visible: u64) -> Vec<u16> {
         let mut out = Vec::new();
-        w.wake_ready(|| visible, |s| out.push(s));
+        std::sync::atomic::fence(Ordering::SeqCst);
+        w.wake_ready_fenced(|| visible, |s| out.push(s));
         out.sort_unstable();
         quiescent(w);
         out
@@ -543,7 +532,7 @@ mod tests {
 
     #[test]
     fn a_waiter_wakes_only_once_its_seqno_is_visible() {
-        let w = WatermarkWaiters::default();
+        let w = WatermarkWaiters::new(1);
         register(&w, 3, 10);
         register(&w, 1, 5);
         // A watermark that did not reach either seqno wakes nobody.
@@ -562,18 +551,21 @@ mod tests {
 
     #[test]
     fn a_pass_with_nobody_ready_takes_no_lock() {
-        let w = WatermarkWaiters::default();
-        assert!(!w.wake_ready(|| 100, |_: u16| unreachable!()));
+        let w = WatermarkWaiters::new(1);
+        assert!(!w.wake_ready_fenced(|| 100, |_: u16| unreachable!()));
         register(&w, 1, 50);
-        assert!(!w.wake_ready(|| 49, |_| unreachable!()));
-        assert!(w.wake_ready(|| 50, |_| {}));
-        assert!(!w.wake_ready(|| 100, |_| unreachable!()), "forgotten");
+        assert!(!w.wake_ready_fenced(|| 49, |_| unreachable!()));
+        assert!(w.wake_ready_fenced(|| 50, |_| {}));
+        assert!(
+            !w.wake_ready_fenced(|| 100, |_| unreachable!()),
+            "forgotten"
+        );
     }
 
     #[test]
     fn a_duplicate_registration_is_listed_once_and_every_entry_wakes_all_at_once() {
         // A key registered again is listed once, with its latest wake and seqno.
-        let w = WatermarkWaiters::default();
+        let w = WatermarkWaiters::new(1);
         assert_eq!(w.register(7, 5, 1), 0);
         assert_eq!(w.register(7, 5, 2), 1, "listed once, wake replaced");
         assert_eq!(w.register(7, 6, 3), 1, "seqno raised");
@@ -603,11 +595,14 @@ mod tests {
             // Part key % 4; seqnos 10, 11, ... so each part has early and late waiters.
             w.register(u64::from(key), 10 + u64::from(key), key);
         }
-        assert!(!w.wake_ready(|| 9, |_| unreachable!()));
+        assert!(!w.wake_ready_fenced(|| 9, |_| unreachable!()));
         assert_eq!(take(&w, 13), [0, 1, 2, 3]);
         assert_eq!(take(&w, 20), [4, 5, 6, 7, 8, 9, 10]);
         assert_eq!(take(&w, 100), [11, 12, 13, 14, 15]);
-        assert!(!w.wake_ready(|| 100, |_| unreachable!()), "all forgotten");
+        assert!(
+            !w.wake_ready_fenced(|| 100, |_| unreachable!()),
+            "all forgotten"
+        );
         assert_ne!(super::commit_key(5) >> 63, super::shard_key(0) >> 63);
     }
 
@@ -618,12 +613,12 @@ mod tests {
         for key in [0u16, 63, 64, 127, 128, 129] {
             register(&w, key, 10 + u64::from(key));
         }
-        assert!(!w.wake_ready(|| 9, |_| unreachable!()));
+        assert!(!w.wake_ready_fenced(|| 9, |_| unreachable!()));
         assert_eq!(take(&w, 73), [0, 63]);
         assert_eq!(take(&w, 137), [64, 127]);
         assert_eq!(take(&w, 139), [128, 129]);
         assert!(
-            !w.wake_ready(|| u64::MAX - 1, |_| unreachable!()),
+            !w.wake_ready_fenced(|| u64::MAX - 1, |_| unreachable!()),
             "all forgotten"
         );
         register(&w, 129, 200);
@@ -639,7 +634,7 @@ mod tests {
         // minimum is never above the list's smallest seqno, so a registration racing a pass
         // is never hidden from later publishers.
         const WAITERS: u16 = 4;
-        let w = WatermarkWaiters::default();
+        let w = WatermarkWaiters::new(1);
         let stop = AtomicUsize::new(0);
         let failure = Mutex::new(None);
         std::thread::scope(|s| {
@@ -657,7 +652,8 @@ mod tests {
                 let mut v = 0u64;
                 while stop.load(Ordering::Acquire) == 0 {
                     v += 1;
-                    w.wake_ready(|| v, |_| {});
+                    std::sync::atomic::fence(Ordering::SeqCst);
+                    w.wake_ready_fenced(|| v, |_| {});
                 }
             });
             for _ in 0..200_000 {

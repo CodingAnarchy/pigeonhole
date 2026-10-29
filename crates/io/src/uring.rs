@@ -386,10 +386,6 @@ impl Vfs for UringVfs {
     fn current_process(&self) -> ProcessId {
         self.files.current_process()
     }
-
-    fn process_alive(&self, process: ProcessId) -> bool {
-        self.files.process_alive(process)
-    }
 }
 
 /// A file of [`UringVfs`]: synchronous calls as [`PreadFile`]'s, submitted ones on the ring.

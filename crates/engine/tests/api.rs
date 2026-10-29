@@ -8,7 +8,6 @@ mod common;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::{Store, families, poll_commit};
 use pigeonhole_engine::{
     COUNTER_TS, Engine, EngineOptions, Error, FamilyKind, FamilyOptions, Predicate, ReadSpec,
     ScanSpec, ValuePredicate, ValueRef, WriteBatch,
@@ -18,7 +17,6 @@ use pigeonhole_format::shm::directory_name;
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{OpenOptions, ProcessId, SharedOpen, Vfs, VfsRef};
 use pigeonhole_shm::WriterLock;
-use pigeonhole_sim::Sim;
 
 const DB: &str = "/db/data.phdb";
 
@@ -1141,84 +1139,6 @@ fn engine_owned_mode_on_real_files() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
-
-// ---- application-owned inline commits ----
-
-#[test]
-fn commit_local_runs_inline_on_the_owning_shard() {
-    let sim = Sim::new(16);
-    let vfs = sim.vfs();
-    let mut store = Store::open(&vfs, 2, 4 << 20, &families()).unwrap();
-    let rows: Vec<(String, u16)> = (0..40)
-        .map(|i| {
-            let r = format!("row{i:06}");
-            let view = store.engine.snapshot().unwrap().view().clone();
-            let t = store.tables[common::table_of(r.as_bytes())].id;
-            let shard = view.tablets().route(t, r.as_bytes()).unwrap().1.0;
-            (r, shard)
-        })
-        .collect();
-    let (row0, shard0) = rows.iter().find(|(_, s)| *s == 0).unwrap().clone();
-    let (row1, _) = rows.iter().find(|(_, s)| *s == 1).unwrap().clone();
-    let batch = store
-        .batch(&[pigeonhole_sim::ModelOp::Put {
-            table: common::table_of(row0.as_bytes()).into(),
-            row: row0.clone().into_bytes(),
-            family: "f".into(),
-            qualifier: b"q".to_vec(),
-            ts: None,
-            value: b"inline".to_vec(),
-        }])
-        .unwrap();
-    // Own row: committed inline (the group runs before `commit_local` returns), durable
-    // once the shard's sync completes.
-    let mut pc = store.shards[shard0 as usize]
-        .commit_local(batch, Some(Durability::Buffered))
-        .unwrap();
-    let info = loop {
-        match poll_commit(&mut pc) {
-            std::task::Poll::Ready(r) => break r.unwrap(),
-            std::task::Poll::Pending => store.step_shards(vfs.monotonic_nanos()),
-        }
-    };
-    assert_eq!(info.seqno, 1);
-    // Another shard's row: submitted through the queue instead.
-    let batch = store
-        .batch(&[pigeonhole_sim::ModelOp::Put {
-            table: common::table_of(row1.as_bytes()).into(),
-            row: row1.into_bytes(),
-            family: "f".into(),
-            qualifier: b"q".to_vec(),
-            ts: None,
-            value: b"queued".to_vec(),
-        }])
-        .unwrap();
-    let mut pc = store.shards[shard0 as usize]
-        .commit_local(batch, None)
-        .unwrap();
-    let info = loop {
-        match poll_commit(&mut pc) {
-            std::task::Poll::Ready(r) => break r.unwrap(),
-            std::task::Poll::Pending => store.step_shards(vfs.monotonic_nanos()),
-        }
-    };
-    assert_eq!(info.seqno, 2);
-    let snap = store.engine.snapshot().unwrap();
-    assert_eq!(
-        store
-            .get(&snap, row0.as_bytes(), "f", b"q")
-            .unwrap()
-            .unwrap()
-            .value,
-        b"inline"
-    );
-    store.engine.close().unwrap();
-    for _ in 0..4 {
-        store.step_shards(vfs.monotonic_nanos());
-    }
-}
-
-// ---- #148 / D164: test-hook recording is opt-in ----
 
 #[test]
 fn test_hook_history_records_only_once_turned_on() {

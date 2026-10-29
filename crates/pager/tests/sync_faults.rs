@@ -254,9 +254,6 @@ impl Vfs for FaultVfs {
     fn current_process(&self) -> ProcessId {
         self.inner.current_process()
     }
-    fn process_alive(&self, process: ProcessId) -> bool {
-        self.inner.process_alive(process)
-    }
 }
 
 /// A pager over a fault-injecting `SimVfs`, with root 1 committed.

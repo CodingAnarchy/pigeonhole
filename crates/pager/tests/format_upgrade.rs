@@ -250,38 +250,6 @@ fn the_extension_area_is_carried_into_every_commit() {
 }
 
 #[test]
-fn set_features_reaches_both_pages_before_it_returns() {
-    let vfs = prepare();
-    let v: VfsRef = vfs.clone();
-    let pager = Pager::open(&v, path(), true)
-        .unwrap()
-        .finish(Vec::new())
-        .unwrap();
-    let f = Features {
-        compat: 1 << 4,
-        ..Features::default()
-    };
-    vfs.record_ops();
-    pager.set_features(f).unwrap();
-    assert_eq!(pager.features(), f);
-    assert_eq!(features(&vfs), [f; 2]);
-    assert_eq!(pager.root().manifest_version, 2, "the same root");
-    // Equal sets commit nothing.
-    vfs.record_ops();
-    pager.set_features(f).unwrap();
-    assert!(
-        !vfs.recorded_ops()
-            .iter()
-            .any(|op| matches!(op, SimOp::Write { .. })),
-        "an unchanged set wrote"
-    );
-    // Clearing goes to both pages the same way.
-    pager.set_features(Features::default()).unwrap();
-    drop(pager);
-    assert_eq!(features(&vfs), [Features::default(); 2]);
-}
-
-#[test]
 fn pages_left_disagreeing_by_a_crash_are_rewritten_at_a_writable_open() {
     // A crash between `set_features`' two commits: one page has the new sets.
     let f = Features {

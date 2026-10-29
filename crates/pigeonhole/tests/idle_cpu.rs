@@ -98,9 +98,6 @@ impl Vfs for FailingReads {
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
     }
-    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
-        self.inner.process_alive(process)
-    }
 }
 
 impl pigeonhole_io::File for FailingFile {
@@ -220,7 +217,8 @@ fn the_public_loop_idles_through_a_compaction_backoff() {
         // The injected failure targets reads of 1 KiB and more, which only compaction makes
         // on buffered handles; direct I/O reads whole pages (#403), so every read would fail.
         .direct_io(false);
-    let (db, shards) = Pigeonhole::open_application_owned(DB, options).unwrap();
+    let pigeonhole::AppOwned { db, shards, .. } =
+        Pigeonhole::open_application_owned(DB, options).unwrap();
     // The documented loop: run until idle, then sleep until work arrives or background work
     // is due.
     let stop = Arc::new(AtomicBool::new(false));

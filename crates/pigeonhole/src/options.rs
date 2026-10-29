@@ -42,6 +42,7 @@ pub struct Options {
     row_cache: usize,
     row_cache_max_row: Option<usize>,
     counter_checkpoint_steps: Option<u64>,
+    row_cache_get_fill: Option<bool>,
     nowait_reads: Option<bool>,
     row_cache_families: Vec<(String, String)>,
     shm_dir: Option<PathBuf>,
@@ -80,7 +81,8 @@ pub enum CpuProfile {
     /// The database has the machine or container to itself, and its clients reach it from
     /// elsewhere (another container, over IPC or the network): flush and compaction take
     /// half the physical cores instead of a quarter. Shard threads are the same as with
-    /// `Embedded`, one per shard by default.
+    /// `Embedded`: up to one per shard, sized to the load by default
+    /// ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     Server,
 }
 
@@ -176,6 +178,7 @@ impl Default for Options {
             row_cache: DEFAULT_ROW_CACHE,
             row_cache_max_row: None,
             counter_checkpoint_steps: None,
+            row_cache_get_fill: None,
             nowait_reads: None,
             row_cache_families: Vec::new(),
             shm_dir: None,
@@ -195,7 +198,7 @@ impl Default for Options {
             commit_spin: None,
             shard_spin: None,
             shard_threads: None,
-            adaptive_shard_threads: false,
+            adaptive_shard_threads: true,
             background_workers: 0,
             cpu_profile: CpuProfile::Embedded,
             auto_recover: Recovery::Off,
@@ -212,8 +215,9 @@ impl Options {
 
     /// Number of shards, the data partitions each row belongs to (default: one per physical
     /// core the process may run on, D220; SMT siblings count once, and a cgroup CPU quota
-    /// still caps it). Each shard runs on a thread of its own unless
-    /// [`shard_threads`](Options::shard_threads) says otherwise (D289).
+    /// still caps it). Engine-owned shards run on up to a thread each, as few as the load
+    /// needs ([`adaptive_shard_threads`](Options::adaptive_shard_threads), on by default),
+    /// unless [`shard_threads`](Options::shard_threads) fixes the count (D289).
     /// `1` is a valid configuration.
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
@@ -426,8 +430,10 @@ impl Options {
     ///   asleep waits for the operating system to wake and schedule it, up to a scheduler
     ///   slice (about 1 ms on Linux) when the application's threads keep the CPUs busy.
     ///   Fewer threads, each busier, sleep less.
-    /// - **Default `0`:** one thread per shard. `k` at or above the shard count means the
-    ///   same.
+    /// - **Default `0`:** up to one thread per shard, sized to the load
+    ///   ([`adaptive_shard_threads`](Options::adaptive_shard_threads), on by default). A
+    ///   set `k` fixes the count and turns the sizing off; `k` at or above the shard count
+    ///   means a thread per shard.
     /// - **Pinning:** the `k` threads are pinned as the shard threads are
     ///   ([`pin_threads`](Options::pin_threads)).
     /// - Engine-owned mode only: application-owned shards run on threads you choose.
@@ -448,8 +454,9 @@ impl Options {
     /// and [`compaction_cores`](Options::compaction_cores) set explicitly still win, and the
     /// profile fills in the rest.
     ///
-    /// - **Shard threads, both profiles:** one per shard, so one per physical core by
-    ///   default.
+    /// - **Shard threads, both profiles:** up to one per shard, so one per physical core at
+    ///   most by default, and fewer while the load is light
+    ///   ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
     ///   and needs CPU too. Flush and compaction take a quarter of the physical cores.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
@@ -473,33 +480,27 @@ impl Options {
         self
     }
 
-    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
-    /// the API: the default suits applications.
+    /// Size the shard threads to the load (D289's controller, ICR 0081). **On by default.**
+    /// The engine starts a thread per shard, then moves the shards of a light load onto
+    /// fewer threads, which sleep less, so a commit less often waits for a sleeping thread to
+    /// be woken; under load it spreads them out again, up to one per shard.
     ///
-    /// Experimental, off by default: size the shard threads to the load (D289's controller,
-    /// ICR 0081). The engine starts a thread per shard, then moves the shards of a light load
-    /// onto fewer threads, which sleep less, so a commit less often waits for a sleeping thread
-    /// to be woken; under load it spreads them out again, up to one per shard.
-    ///
-    /// - **Why off by default:** the controller resizes on signals that are reliable in a
-    ///   steady load but noisy while a load changes phase (a bulk load ending, a run starting).
-    ///   In D289's box runs a resize at the wrong moment cost up to 5% of throughput, and a
-    ///   light load sometimes grew back and lost its latency gain. It stays opt-in until its
-    ///   policy is tuned across load phases.
-    /// - **What it gains when it settles right:** a light, many-shard load's commit p99 fell
-    ///   from hundreds of microseconds to tens (sparse-wide puts: 236-489 µs to 51 µs).
-    /// - **For a load you know is light,** a fixed [`shard_threads`](Options::shard_threads)
-    ///   gets the same without resizing. An explicit `shard_threads` turns this off.
-    /// - Engine-owned mode only.
+    /// - **What it gains:** a light, many-shard load's commit p99 falls from hundreds of
+    ///   microseconds to tens. In the 2026-10-28 gate, sparse-wide's put p99 at `Buffered`
+    ///   was 66-107 µs with the controller against 545-909 µs without, at the same
+    ///   throughput; transfer, ycsb-a and ycsb-f were level (D289, #1015).
+    /// - **When to turn it off (`false`):** for a fixed thread per shard, which is the
+    ///   behaviour before 1.0. An explicit [`shard_threads`](Options::shard_threads) also
+    ///   turns it off: the count you set is kept.
+    /// - Engine-owned mode only: application-owned shards run on threads you start (D40).
     ///
     /// ```
     /// use pigeonhole::Options;
     ///
-    /// let options = Options::default().adaptive_shard_threads(true);
+    /// // A thread per shard, never resized.
+    /// let options = Options::default().adaptive_shard_threads(false);
     /// # let _ = options;
     /// ```
-    #[cfg(feature = "__unstable-hooks")]
-    #[doc(hidden)]
     pub fn adaptive_shard_threads(mut self, on: bool) -> Self {
         self.adaptive_shard_threads = on;
         self
@@ -507,7 +508,7 @@ impl Options {
 
     /// Application-owned mode only: `n` background workers for flush and compaction (D284),
     /// handed out by
-    /// [`Pigeonhole::open_application_owned_with`](crate::Pigeonhole::open_application_owned_with)
+    /// [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
     /// for you to drive from threads you choose, as you drive the shards.
     ///
     /// - **Why:** with none (the default `0`), flush and compaction run on the shards, in
@@ -515,9 +516,7 @@ impl Options {
     /// - **How many:** a quarter of the shards is a good start. The engine-owned count
     ///   ([`compaction_cores`](Options::compaction_cores)) has its own default, which may
     ///   differ.
-    /// - [`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned)
-    ///   fails with [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) when
-    ///   `n > 0`, since it hands no workers out. Engine-owned opens ignore it: they start
+    /// - Engine-owned opens ignore it: they start
     ///   [`compaction_cores`](Options::compaction_cores) threads of their own.
     ///
     /// ```
@@ -567,6 +566,16 @@ impl Options {
     #[doc(hidden)]
     pub fn counter_checkpoint_steps(mut self, steps: u64) -> Self {
         self.counter_checkpoint_steps = Some(steps);
+        self
+    }
+
+    /// Whether a point get that misses a row twice fills the row cache with the family row
+    /// (D290; default on). Off, gets are served from cached rows but never fill them. For
+    /// benchmarks comparing the two (#1059).
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
+    pub fn row_cache_get_fill(mut self, on: bool) -> Self {
+        self.row_cache_get_fill = Some(on);
         self
     }
 
@@ -1143,9 +1152,9 @@ impl Options {
         };
         o.pin_threads = self.pin_threads;
         o.shard_threads = budget.drivers;
-        // The load controller (D289 PR 2), opt-in for now (the owner, #1006: its resize
-        // policy is noisy across load phases), never with a fixed count; application-owned
-        // shards run on the application's threads (D40).
+        // The load controller (D289 PR 2), on by default since #1015's tuning (the owner,
+        // 2026-10-28), never with a fixed count; application-owned shards run on the
+        // application's threads (D40).
         o.adaptive_drivers = self.adaptive_shard_threads && !budget.fixed && !application_owned;
         if application_owned {
             o.background_workers = self.background_workers;
@@ -1159,6 +1168,9 @@ impl Options {
         o.row_cache_bytes = self.row_cache;
         if let Some(bytes) = self.row_cache_max_row {
             o.row_cache_max_row = bytes;
+        }
+        if let Some(on) = self.row_cache_get_fill {
+            o.row_cache_get_fill = on;
         }
         if let Some(steps) = self.counter_checkpoint_steps {
             o.counter_checkpoint_steps = steps;
@@ -1331,22 +1343,23 @@ mod tests {
         }
     }
 
-    /// D289's load controller is opt-in (the owner, #1006): off by default, on with
-    /// `adaptive_shard_threads(true)`, and never with a fixed `shard_threads` or in
-    /// application-owned mode (D40).
+    /// D289's load controller is on by default (the owner, 2026-10-28, after #1015's box
+    /// rounds), off with `adaptive_shard_threads(false)`, and never with a fixed
+    /// `shard_threads` or in application-owned mode (D40).
     #[test]
-    fn the_load_controller_is_opt_in() {
+    fn the_load_controller_is_on_by_default() {
         use super::Options;
         let o = || Options::default().vfs(pigeonhole_io::sim::SimVfs::new(1));
         let adaptive = |o: Options, app: bool| o.to_engine_for(app).unwrap().adaptive_drivers;
-        assert!(!adaptive(o(), false));
+        assert!(adaptive(o(), false));
+        assert!(!adaptive(o().adaptive_shard_threads(false), false));
         assert!(adaptive(o().adaptive_shard_threads(true), false));
         assert!(!adaptive(
             o().adaptive_shard_threads(true).shard_threads(4),
             false
         ));
-        assert!(!adaptive(o().adaptive_shard_threads(true), true));
-        // Off, the engine-owned default is a thread per shard.
+        assert!(!adaptive(o(), true));
+        // The engine-owned default starts a thread per shard: the controller's ceiling.
         let e = o().shards(20).to_engine_for(false).unwrap();
         assert_eq!(e.shard_threads, 20);
     }

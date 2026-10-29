@@ -72,9 +72,6 @@ impl Vfs for RemoteVfs {
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
     }
-    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
-        self.inner.process_alive(process)
-    }
 }
 
 impl pigeonhole_io::File for RemoteFile {

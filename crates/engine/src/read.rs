@@ -122,8 +122,6 @@ impl CellData {
                     _view: pin(),
                 },
                 Some(Pinned::Block(c)) => CellValue::Block(c),
-                #[cfg(test)]
-                Some(Pinned::Owned(v)) => CellValue::Owned(v),
                 None => CellValue::Owned(stored.to_vec()),
             }
         } else {
@@ -186,8 +184,6 @@ impl CellData {
                 _view: pin(),
             },
             LaneValue::Pinned(Pinned::Block(c)) => CellValue::Block(c.clone()),
-            #[cfg(test)]
-            LaneValue::Pinned(Pinned::Owned(v)) => CellValue::Owned(v.clone()),
         };
         Self { ts, value }
     }
@@ -411,6 +407,14 @@ pub trait RowSink {
         let mut data = CellData::EMPTY;
         data.set_inline(ts, stored);
         self.push(family, qualifier, data);
+    }
+
+    /// Whether the sink takes no more cells: a row read stops before its next cell. The row
+    /// cache's fill uses it to stop reading a row once it is past the cache's row cap (an
+    /// oversize row is never stored, so reading it whole is waste, #1059). Never, by default.
+    #[inline]
+    fn full(&self) -> bool {
+        false
     }
 
     /// How many cells this sink holds, for the row cache to read back what a read pushed
@@ -948,6 +952,14 @@ impl ScanCursor {
             // No row of the scan is in this tablet: it opens with no lanes.
             return Ok(true);
         }
+        // A scan its limit leaves short starts its readahead later (D293). `.max(1)`: a scan
+        // that reached its limit opens no tablet (`advance_row_impl` stops first), so a 0
+        // here would only mean "no limit".
+        let short = crate::source::scan_is_short(if self.spec.limit == 0 {
+            0
+        } else {
+            self.spec.limit.saturating_sub(self.rows_emitted).max(1)
+        });
         for &family in &self.families {
             // Nothing of this family in the tablet: no resolver, options or sources for it (a
             // table's empty families, #406). Located once, for the sources below too.
@@ -969,6 +981,7 @@ impl ScanCursor {
                 &filter,
                 start,
                 end,
+                short,
                 resolver.cursor_mut().sources_mut(),
             );
             if let Err(e) = filled {
@@ -1572,6 +1585,9 @@ fn read_row_with(
         resolver.set_upper_bound(Some(&past));
         resolver.seek(&prefix)?;
         loop {
+            if sink.full() {
+                break;
+            }
             let (data, qualifier) = {
                 let next = resolver.next_cell();
                 ResolverBlobs::check(resolver_blobs.as_ref())?;
@@ -1752,15 +1768,9 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
 /// SST source can (ICR 0041), or a memtable source with the stale-tail index (D194), so a
 /// read of index-less memtables alone never pays for a try that cannot succeed.
 fn skips_columns(sources: &[Source]) -> bool {
-    #[cfg(feature = "test-hooks")]
-    if crate::shard::READS_STEP.load(std::sync::atomic::Ordering::Relaxed) {
-        return false;
-    }
     sources.iter().any(|s| match s {
         Source::Mem(m) => m.inner().skips_columns(),
         Source::Sst(_) => true,
-        #[cfg(test)]
-        Source::Vec(_) => false,
     })
 }
 
@@ -1987,7 +1997,10 @@ mod tests {
     use pigeonhole_format::key::{Kind, decode_key, encode_key, encode_marker_key};
     use pigeonhole_format::value::{ValueRef, decode_value, encode_value};
 
-    use crate::source::{Resolver, Source};
+    use pigeonhole_format::scan::ScanFilter;
+    use pigeonhole_memtable::{ArenaRegion, Memtable, ShardArena};
+
+    use crate::source::{Resolver, mem_sources_from};
     use crate::{Error, ValuePredicate};
 
     fn put(row: &str, q: &str, ts: u64, seqno: u64, v: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -2042,12 +2055,23 @@ mod tests {
         )
     }
 
+    /// A resolver over one memtable per entry list, built as a read builds its memtable
+    /// sources (`mem_sources_from`, unfiltered).
     fn resolver(sources: Vec<Vec<(Vec<u8>, Vec<u8>)>>, opts: ResolveOptions) -> Resolver {
-        let sources = sources
+        let readers: Vec<_> = sources
             .into_iter()
-            .map(|e| Source::Vec(VecCursor::new(e)))
+            .map(|entries| {
+                let mut arena = ShardArena::new(ArenaRegion::heap(1 << 20), 64 << 10);
+                let mut mem = Memtable::create(&mut arena).unwrap();
+                for (k, v) in &entries {
+                    mem.insert(&mut arena, k, v).unwrap();
+                }
+                mem.reader()
+            })
             .collect();
-        Resolver::new(MergingCursor::new(sources), opts)
+        let mut out = Vec::new();
+        mem_sources_from(&readers, &ScanFilter::all(), &mut out);
+        Resolver::new(MergingCursor::new(out), opts)
     }
 
     fn collect(src: Vec<(Vec<u8>, Vec<u8>)>, opts: ResolveOptions) -> Vec<Cell> {

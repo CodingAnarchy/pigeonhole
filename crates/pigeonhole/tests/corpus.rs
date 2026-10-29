@@ -1,14 +1,23 @@
 //! The format corpus (#496 PR 6, D269): small database files that every later build must
-//! open, read, check and write. They live in `tests/corpus/format4/<entry>/`: the main file,
-//! its WAL files, and `expected.txt`, every cell the generating build read back. The corpus
-//! is regenerated once, by the 1.0 release candidate, and never again: a build that cannot
-//! read a 1.0 file breaks FORMAT §13's promise.
+//! open, read, check and write. Each entry is a directory: the main file, its WAL files, and
+//! `expected.txt`, every cell the generating build read back.
 //!
-//! `corpus_entries_open_read_check_and_write` runs in CI. `generate_corpus` is ignored;
-//! regenerate with
-//! `cargo test -p pigeonhole --test corpus -- --ignored generate_corpus` (it rewrites the
-//! directory). Entries are written through the simulator, so a crash state is exact, and
-//! their files exported as they were left.
+//! - `tests/corpus/format4/<entry>/` is written by the current build. It is regenerated
+//!   whenever an entry is added, and `corpus_entries_open_read_check_and_write` checks it.
+//! - `tests/corpus/v<release>/<entry>/` is written once by a release build
+//!   (`scripts/release-corpus.sh`, FORMAT §13) and frozen: `frozen.txt` holds each file's
+//!   length and xxh3-64. `release_corpus_entries_open_read_check_and_write` checks every one.
+//!   A build that can't read a release's files breaks the promise: fix the build, never the
+//!   corpus.
+//! - `tests/corpus/v0.*/` is the upgrade corpus, written by released 0.x builds
+//!   (`upgrade_corpus_entries_open_upgrade_and_read_exactly`).
+//!
+//! `generate_corpus` is ignored; `cargo test -p pigeonhole --test corpus -- --ignored
+//! generate_corpus` rewrites `format4/`. `PIGEONHOLE_CORPUS_OUT=<dir>` writes the entries to
+//! another directory instead (CI's 1.0.0 job opens them with the published 1.0.0), and
+//! `PIGEONHOLE_CORPUS_RELEASE=<version>` writes and freezes `v<version>/` (only from that
+//! version's build). Entries are written through the simulator, so a crash state is exact,
+//! and their files exported as they were left.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -22,6 +31,13 @@ use pigeonhole_io::{OpenOptions, Vfs};
 fn corpus_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus/format4")
 }
+
+/// The release corpora: written by each release's build, then frozen. A directory holding
+/// only its README is a placeholder until that release writes it.
+const RELEASE_CORPORA: [&str; 1] = ["1.0.0"];
+
+/// The frozen hash list's name inside a release corpus.
+const FROZEN: &str = "frozen.txt";
 
 /// The database file's name inside an entry.
 const DB: &str = "data.phdb";
@@ -143,6 +159,24 @@ fn entries() -> Vec<Entry> {
             shards: 2,
             write: write_wal_crash,
             crash: true,
+        },
+        Entry {
+            name: "families",
+            shards: 1,
+            write: write_families,
+            crash: false,
+        },
+        Entry {
+            name: "wal_ops",
+            shards: 2,
+            write: write_wal_ops,
+            crash: true,
+        },
+        Entry {
+            name: "checkpoints",
+            shards: 1,
+            write: write_checkpoints,
+            crash: false,
         },
     ]
 }
@@ -289,6 +323,161 @@ fn write_wal_crash(db: &Pigeonhole) {
     }
 }
 
+/// Every family setting the manifest records (TTL, version and column limits, bloom bits,
+/// block size, cache priority, compaction styles), flushed and compacted, beside a table
+/// created, written, flushed and dropped.
+fn write_families(db: &Pigeonhole) {
+    // A TTL long enough that no cell written at T0 expires while the corpus is in use.
+    let century = std::time::Duration::from_secs(100 * 365 * 24 * 3600);
+    let t = db
+        .table("settings")
+        .unwrap()
+        .family("ttl", Family::default().ttl(century))
+        .family("versions", Family::default().max_versions(2))
+        .family("bloom", Family::default().bloom_bits(16))
+        .family("blocks", Family::default().block_size(1024))
+        .family(
+            "hot",
+            Family::default().cache_priority(pigeonhole::Priority::High),
+        )
+        .family(
+            "tiered",
+            Family::default().compaction(pigeonhole::Compaction::Tiered),
+        )
+        .family(
+            "fifo",
+            Family::default().compaction(pigeonhole::Compaction::FifoByTime),
+        )
+        .create()
+        .unwrap();
+    let gone = db
+        .table("dropped")
+        .unwrap()
+        .family("d", Family::default())
+        .create()
+        .unwrap();
+    for i in 0..30u64 {
+        gone.mutate(format!("gone{i:02}").as_bytes())
+            .put_at("d", b"q", T0 + i, b"dropped with its table")
+            .commit()
+            .unwrap();
+    }
+    for round in 0..3u64 {
+        for i in 0..30u64 {
+            let ts = T0 + round * 100 + i;
+            let v = format!("r{round} v{i}");
+            t.mutate(format!("set{i:02}").as_bytes())
+                .put_at("ttl", b"q", ts, v.as_bytes())
+                .put_at("versions", b"q", ts, v.as_bytes())
+                .put_at("bloom", b"q", ts, v.as_bytes())
+                .put_at("blocks", b"q", ts, &[round as u8; 200])
+                .put_at("hot", b"q", ts, v.as_bytes())
+                .put_at("tiered", b"q", ts, v.as_bytes())
+                .put_at("fifo", b"q", ts, v.as_bytes())
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    drop(gone);
+    db.drop_table("dropped").unwrap();
+    db.compact().unwrap();
+}
+
+/// Two shards, a flushed base, then one synced batch per operation kind (every value type,
+/// every delete kind, counter increments, merge operands, a separated value, rows on both
+/// shards), which a process crash leaves only in the WAL.
+fn write_wal_ops(db: &Pigeonhole) {
+    let t = db
+        .table("ops")
+        .unwrap()
+        .family("v", Family::default().max_versions(0))
+        .family("c", Family::counter())
+        .family("l", Family::default().merge_operator("corpus.concat"))
+        .family("b", Family::default().blob_threshold(256))
+        .create()
+        .unwrap();
+    for i in 0..16u64 {
+        let row = format!("op{i:02}");
+        t.mutate(row.as_bytes())
+            .put_at("v", b"base", T0 + i, b"flushed")
+            .put_at("v", b"gone", T0 + i, b"deleted in the WAL")
+            .incr_at("c", b"n", T0, 1)
+            .merge("l", b"m", b"<flushed>")
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    let sync = Durability::Sync;
+    for i in 0..16u64 {
+        let row = format!("op{i:02}");
+        let row = row.as_bytes();
+        let ts = T0 + 100 + i;
+        let mut b = db.write_batch();
+        match i % 8 {
+            0 => b.put_at(&t, row, "v", b"bytes", ts, b"logged bytes"),
+            1 => b.put_i64_at(&t, row, "v", b"i64", ts, -(i as i64) * 7_000_001),
+            2 => b.put_f64_at(&t, row, "v", b"f64", ts, i as f64 / 3.0),
+            3 => b.delete_cell(&t, row, "v", b"gone", T0 + i),
+            4 => b.delete_column(&t, row, "v", b"gone"),
+            5 => b.delete_family(&t, row, "v"),
+            6 => b.incr_at(&t, row, "c", b"n", T0, 41),
+            _ => b.merge(&t, row, "l", b"m", b"<logged>"),
+        };
+        b.commit_with(sync).unwrap();
+    }
+    let big: Vec<u8> = (0..4000u32).map(|b| (b * 13) as u8).collect();
+    let mut b = db.write_batch();
+    b.put_at(&t, b"op00", "b", b"blob", T0 + 200, &big);
+    b.commit_with(sync).unwrap();
+    // Rows on both shards in one batch, then a row deleted whole.
+    let mut b = db.write_batch();
+    for i in 0..8u64 {
+        b.put_at(
+            &t,
+            format!("x{i}").as_bytes(),
+            "v",
+            b"x",
+            T0 + 300,
+            b"cross",
+        );
+    }
+    b.commit_with(sync).unwrap();
+    let mut b = db.write_batch();
+    b.delete_row(&t, b"op15");
+    b.commit_with(sync).unwrap();
+}
+
+/// A counter read that folds many increments keeps its result as the counter's base (D291,
+/// at the default step count): two rounds of increments, each read and flushed, so level 0
+/// holds the bases (a `Put` in a counter family) beside increments flushed after them.
+fn write_checkpoints(db: &Pigeonhole) {
+    let t = db
+        .table("tallies")
+        .unwrap()
+        .family("c", Family::counter())
+        .create()
+        .unwrap();
+    for round in 0..2u64 {
+        for i in 0..300u64 {
+            t.mutate(format!("hot{}", i % 2).as_bytes())
+                .incr_at("c", b"n", T0 + round, 1)
+                .commit()
+                .unwrap();
+        }
+        for row in [&b"hot0"[..], b"hot1"] {
+            assert!(t.get(row, "c", b"n").unwrap().is_some());
+        }
+        db.flush().unwrap();
+    }
+    for i in 0..10u64 {
+        t.mutate(b"hot0")
+            .incr_at("c", b"n", T0 + 1, i as i64)
+            .commit()
+            .unwrap();
+    }
+}
+
 /// The database's files in the simulator's `/db`, by name (no shared memory).
 fn sim_files(vfs: &SimVfs) -> BTreeMap<String, Vec<u8>> {
     vfs.list_dir(Path::new("/db"))
@@ -307,10 +496,39 @@ fn sim_files(vfs: &SimVfs) -> BTreeMap<String, Vec<u8>> {
         .collect()
 }
 
+/// One line of a release corpus's `frozen.txt`: path, length and xxh3-64.
+fn frozen_line(path: &str, bytes: &[u8]) -> String {
+    format!(
+        "{path} {} {:016x}",
+        bytes.len(),
+        pigeonhole_format::checksum::xxh3_64(bytes)
+    )
+}
+
 #[test]
-#[ignore = "rewrites tests/corpus; run once at the 1.0 release candidate"]
+#[ignore = "rewrites tests/corpus/format4, or writes the directory the environment names"]
 fn generate_corpus() {
-    let root = corpus_dir();
+    let release = std::env::var("PIGEONHOLE_CORPUS_RELEASE").ok();
+    let root = match (&release, std::env::var_os("PIGEONHOLE_CORPUS_OUT")) {
+        (Some(version), _) => {
+            assert_eq!(
+                version,
+                env!("CARGO_PKG_VERSION"),
+                "a release corpus is written by that release's own build"
+            );
+            let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/corpus")
+                .join(format!("v{version}"));
+            assert!(
+                !dir.join(FROZEN).exists(),
+                "v{version} is frozen: never rewrite a release corpus"
+            );
+            dir
+        }
+        (None, Some(out)) => PathBuf::from(out),
+        (None, None) => corpus_dir(),
+    };
+    let mut frozen = Vec::new();
     for (seed, e) in entries().into_iter().enumerate() {
         let vfs = SimVfs::new(9_000 + seed as u64);
         let path = format!("/db/{DB}");
@@ -337,7 +555,14 @@ fn generate_corpus() {
         for (name, bytes) in &files {
             std::fs::write(dir.join(name), bytes).unwrap();
         }
-        std::fs::write(dir.join("expected.txt"), expected).unwrap();
+        std::fs::write(dir.join("expected.txt"), &expected).unwrap();
+        for (name, bytes) in &files {
+            frozen.push(frozen_line(&format!("{}/{name}", e.name), bytes));
+        }
+        frozen.push(frozen_line(
+            &format!("{}/expected.txt", e.name),
+            expected.as_bytes(),
+        ));
         eprintln!(
             "{}: {}",
             e.name,
@@ -347,6 +572,18 @@ fn generate_corpus() {
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+    }
+    if let Some(version) = release {
+        let mut text = format!(
+            "# The v{version} corpus, written by the {version} build: path, length, xxh3-64.\n\
+             # Frozen: no file or line ever changes (FORMAT.md §13).\n"
+        );
+        frozen.sort();
+        for line in frozen {
+            text.push_str(&line);
+            text.push('\n');
+        }
+        std::fs::write(root.join(FROZEN), text).unwrap();
     }
 }
 
@@ -379,65 +616,130 @@ fn real_options() -> Options {
         .merge_operator(Arc::new(Concat))
 }
 
+/// Opens a copy of the entry in `src`, reads every cell exactly as `expected.txt` says,
+/// writes through a flush and a compaction, passes the offline check, and reads everything
+/// again after a reopen.
+fn check_entry(label: &str, src: &Path) {
+    assert!(
+        src.join("expected.txt").exists(),
+        "corpus entry {label} is missing: run generate_corpus"
+    );
+    // A copy: opening writes (WAL replay, the format upgrade of an older file).
+    let tmp = TempDir::new(&label.replace('/', "-"));
+    for f in std::fs::read_dir(src).unwrap() {
+        let f = f.unwrap();
+        std::fs::copy(f.path(), tmp.0.join(f.file_name())).unwrap();
+    }
+    let path = tmp.0.join(DB);
+    let expected: Vec<String> = std::fs::read_to_string(src.join("expected.txt"))
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_owned)
+        .collect();
+
+    // Read: every cell, as the generating build read it.
+    let db = Pigeonhole::open(&path, real_options())
+        .unwrap_or_else(|err| panic!("{label}: open: {err}"));
+    assert_eq!(contents(&db), expected, "{label}: contents");
+    // Write on top, through a flush and a compaction.
+    let t = db
+        .table("corpus_writes")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    t.mutate(b"written")
+        .put("f", b"q", b"by this build")
+        .commit()
+        .unwrap();
+    db.flush().unwrap();
+    db.compact().unwrap();
+    db.close().unwrap();
+
+    // The offline check finds nothing, and a reopen reads both.
+    let report = pigeonhole::check(&path, pigeonhole::CheckOptions::default())
+        .unwrap_or_else(|err| panic!("{label}: check: {err}"));
+    assert!(report.is_ok(), "{label}: {:#?}", report.findings);
+    let db = Pigeonhole::open(&path, real_options()).unwrap();
+    let after = contents(&db);
+    let (old, new): (Vec<_>, Vec<_>) = after
+        .into_iter()
+        .partition(|l| !l.starts_with("corpus_writes\t"));
+    assert_eq!(old, expected, "{label}: contents after the write");
+    assert_eq!(new.len(), 1, "{label}: {new:?}");
+    db.close().unwrap();
+}
+
 #[test]
 fn corpus_entries_open_read_check_and_write() {
     let root = corpus_dir();
-    let mut seen = 0;
     for e in entries() {
-        let src = root.join(e.name);
-        assert!(
-            src.join("expected.txt").exists(),
-            "corpus entry {} is missing: run generate_corpus",
-            e.name
-        );
-        seen += 1;
-        // A copy: opening writes (WAL replay, the format upgrade of an older file).
-        let tmp = TempDir::new(e.name);
-        for f in std::fs::read_dir(&src).unwrap() {
-            let f = f.unwrap();
-            std::fs::copy(f.path(), tmp.0.join(f.file_name())).unwrap();
+        check_entry(e.name, &root.join(e.name));
+    }
+}
+
+/// Every release corpus (FORMAT §13): its files match `frozen.txt` byte for byte, and every
+/// entry opens, reads exactly, writes and checks. A corpus not written yet is a directory
+/// holding only its README.
+#[test]
+fn release_corpus_entries_open_read_check_and_write() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
+    for version in RELEASE_CORPORA {
+        let dir = root.join(format!("v{version}"));
+        let present: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("v{version}: {err}"))
+            .map(|f| f.unwrap().file_name().into_string().unwrap())
+            .collect();
+        if !dir.join(FROZEN).exists() {
+            assert_eq!(
+                present,
+                ["README.md"],
+                "v{version} holds files but no {FROZEN}: write it with scripts/release-corpus.sh"
+            );
+            eprintln!("v{version}: not written yet (placeholder)");
+            continue;
         }
-        let path = tmp.0.join(DB);
-        let expected: Vec<String> = std::fs::read_to_string(src.join("expected.txt"))
+        let listed: BTreeMap<String, (usize, u64)> = std::fs::read_to_string(dir.join(FROZEN))
             .unwrap()
             .lines()
-            .filter(|l| !l.is_empty())
-            .map(str::to_owned)
+            .filter(|l| !l.is_empty() && !l.starts_with('#'))
+            .map(|l| {
+                let mut f = l.split(' ');
+                let (path, len, hash) = (f.next().unwrap(), f.next().unwrap(), f.next().unwrap());
+                (
+                    path.to_owned(),
+                    (len.parse().unwrap(), u64::from_str_radix(hash, 16).unwrap()),
+                )
+            })
             .collect();
-
-        // Read: every cell, as the generating build read it.
-        let db = Pigeonhole::open(&path, real_options())
-            .unwrap_or_else(|err| panic!("{}: open: {err}", e.name));
-        assert_eq!(contents(&db), expected, "{}: contents", e.name);
-        // Write on top, through a flush and a compaction.
-        let t = db
-            .table("corpus_writes")
-            .unwrap()
-            .family("f", Family::default())
-            .create_if_missing()
-            .unwrap();
-        t.mutate(b"written")
-            .put("f", b"q", b"by this build")
-            .commit()
-            .unwrap();
-        db.flush().unwrap();
-        db.compact().unwrap();
-        db.close().unwrap();
-
-        // The offline check finds nothing, and a reopen reads both.
-        let report = pigeonhole::check(&path, pigeonhole::CheckOptions::default())
-            .unwrap_or_else(|err| panic!("{}: check: {err}", e.name));
-        assert!(report.is_ok(), "{}: {:#?}", e.name, report.findings);
-        let db = Pigeonhole::open(&path, real_options()).unwrap();
-        let after = contents(&db);
-        let (old, new): (Vec<_>, Vec<_>) = after
-            .into_iter()
-            .partition(|l| !l.starts_with("corpus_writes\t"));
-        assert_eq!(old, expected, "{}: contents after the write", e.name);
-        assert_eq!(new.len(), 1, "{}: {new:?}", e.name);
-        db.close().unwrap();
+        let mut entries: Vec<&str> = present
+            .iter()
+            .filter(|n| dir.join(n).is_dir())
+            .map(String::as_str)
+            .collect();
+        entries.sort_unstable();
+        assert!(!entries.is_empty(), "v{version}: no entries");
+        let mut on_disk = BTreeMap::new();
+        for entry in &entries {
+            for f in std::fs::read_dir(dir.join(entry)).unwrap() {
+                let f = f.unwrap();
+                let bytes = std::fs::read(f.path()).unwrap();
+                let path = format!("{entry}/{}", f.file_name().into_string().unwrap());
+                on_disk.insert(
+                    path,
+                    (bytes.len(), pigeonhole_format::checksum::xxh3_64(&bytes)),
+                );
+            }
+        }
+        assert_eq!(
+            on_disk, listed,
+            "v{version} no longer matches {FROZEN}: a release corpus never changes"
+        );
+        for entry in entries {
+            check_entry(&format!("v{version}/{entry}"), &dir.join(entry));
+        }
     }
-    assert_eq!(seen, entries().len());
 }
 
 /// The upgrade corpus (FORMAT §13): databases written by released 0.2.x and 0.3.x builds

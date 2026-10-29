@@ -402,7 +402,6 @@ fn shared_memory_in_a_directory(b: &Backend) {
     assert_eq!(attached.atomic_u64(8).load(Ordering::Acquire), 77);
     attached.atomic_u32(4).fetch_add(3, Ordering::AcqRel);
     assert_eq!(region.atomic_u32(4).load(Ordering::Acquire), 3);
-    region.bind_numa(0, 4096, 0).ok(); // may be refused on non-NUMA hosts; must not crash
 
     // Removing the name leaves existing mappings valid.
     b.vfs.remove_shared(&name, dir).unwrap();
@@ -441,7 +440,6 @@ fn clocks_and_processes(b: &Backend) {
 
     let me = b.vfs.current_process();
     assert_eq!(me, b.vfs.current_process());
-    assert!(b.vfs.process_alive(me));
 }
 
 /// Direct I/O (#403): aligned reads and writes round-trip; a misaligned offset, length or

@@ -52,8 +52,9 @@ pub struct EngineOptions {
     pub shard_threads: usize,
     /// Engine-owned mode only: size the driver threads to the load (D289 PR 2), up to
     /// `shard_threads` (one per shard if 0). Off by default here, so this crate's tests run
-    /// on fixed threads; `pigeonhole::Options::adaptive_shard_threads` turns it on (opt-in,
-    /// #1015).
+    /// on fixed threads; `pigeonhole::Options` turns it on unless the application turns
+    /// `adaptive_shard_threads` off or fixes `shard_threads` (on by default since #1015's box
+    /// rounds, the owner, 2026-10-28).
     pub adaptive_drivers: bool,
     /// Application-owned mode only: background workers for flush and compaction that the
     /// application drives from threads it owns (D284), handed out by
@@ -77,6 +78,11 @@ pub struct EngineOptions {
     /// turns it off). Writer process only. For tests and benchmarks.
     #[doc(hidden)]
     pub counter_checkpoint_steps: u64,
+    /// Whether a point get that misses a row twice fills the row cache with the family row
+    /// (D290; default on). Off, gets are served from cached rows but never fill them.
+    /// Writer process only. For A/Bs (#1059).
+    #[doc(hidden)]
+    pub row_cache_get_fill: bool,
     /// Largest encoded family row the row cache stores (default 4 KiB).
     pub row_cache_max_row: usize,
     /// `(table, family)` names the row cache serves; empty means every family.
@@ -239,6 +245,7 @@ impl EngineOptions {
             block_cache_bytes: 256 << 20,
             row_cache_bytes: 0,
             counter_checkpoint_steps: crate::read::CHECKPOINT_STEPS,
+            row_cache_get_fill: true,
             row_cache_max_row: 4 << 10,
             row_cache_families: Vec::new(),
             shm_dir: None,

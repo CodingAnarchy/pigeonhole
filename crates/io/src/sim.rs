@@ -30,9 +30,8 @@
 //!   shared-memory regions survive, as `/dev/shm` and `shm_open` objects do. (A Windows named
 //!   mapping would vanish once no process holds it; the simulator does not model that.)
 //! - **One process crashing** ([`SimVfs::crash_process`]): only the handles opened by that
-//!   process (see [`SimVfs::enter_process`]) die and release their locks; the process is
-//!   marked dead for [`Vfs::process_alive`]. Data, other processes and shared memory are
-//!   untouched.
+//!   process (see [`SimVfs::enter_process`]) die and release their locks. Data, other
+//!   processes and shared memory are untouched.
 //! - **Handles** killed by a crash fail with `Crashed`, and their locks are released.
 //!   Reopening through the same `SimVfs` is the restart.
 //! - **Size.** Files are limited to 4 GiB; a write or length past that fails with `Other`
@@ -292,7 +291,6 @@ struct SimState {
     /// Mutating operations recorded since [`SimVfs::record_ops`], if recording.
     trace: Option<Vec<SimOp>>,
     shm: BTreeMap<(Option<PathBuf>, String), SharedRegion>,
-    killed: HashSet<ProcessId>,
     nanos: u64,
     /// Whether `submit_*` defers its operation (see [`SimVfs::set_deferred_io`]).
     deferred: bool,
@@ -604,7 +602,6 @@ impl SimVfs {
                 random_draws: 0,
                 trace: None,
                 shm: BTreeMap::new(),
-                killed: HashSet::new(),
                 nanos: 0,
                 deferred: false,
                 owner_reaps: false,
@@ -661,8 +658,8 @@ impl SimVfs {
     }
 
     /// Simulates one process crashing (as by `SIGKILL`): the handles it opened fail with
-    /// `Crashed` and lose their locks, and [`Vfs::process_alive`] reports it dead. Written
-    /// data, shared memory and every other process's handles are untouched.
+    /// `Crashed` and lose their locks. Written data, shared memory and every other process's
+    /// handles are untouched.
     pub fn crash_process(&self, process: ProcessId) {
         let mut st = self.state();
         for node in st.nodes.values_mut() {
@@ -681,7 +678,6 @@ impl SimVfs {
             }
             node.locks.retain(|_, holders| !holders.is_empty());
         }
-        st.killed.insert(process);
         st.gc();
     }
 
@@ -724,11 +720,6 @@ impl SimVfs {
     /// completed (empty if not recording). Recording continues.
     pub fn recorded_ops(&self) -> Vec<SimOp> {
         self.state().trace.clone().unwrap_or_default()
-    }
-
-    /// Marks a simulated process as dead for [`Vfs::process_alive`].
-    pub fn kill_process(&self, process: ProcessId) {
-        self.state().killed.insert(process);
     }
 
     /// Makes [`Vfs::current_process`] return `process` on the calling thread (to simulate
@@ -1542,10 +1533,6 @@ impl Vfs for SimVfs {
 
     fn current_process(&self) -> ProcessId {
         CURRENT_PROCESS.with(|m| m.borrow().get(&self.id).copied().unwrap_or(DEFAULT_PROCESS))
-    }
-
-    fn process_alive(&self, process: ProcessId) -> bool {
-        !self.state().killed.contains(&process)
     }
 
     /// Derived from the seed and a counter of its own (not the fault generator), so a seed

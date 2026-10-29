@@ -395,13 +395,6 @@ pub(crate) struct VisibilityCounts {
     pub woken: AtomicU64,
 }
 
-/// Engine-wide state every shard and every caller shares.
-/// Test hook: reads step over a finished column's entries even where a memtable's
-/// stale-tail index (D194) or an SST's block headers (ICR 0041) could skip them, so a test
-/// reads the same data both ways.
-#[cfg(feature = "test-hooks")]
-pub(crate) static READS_STEP: AtomicBool = AtomicBool::new(false);
-
 /// Memtable jumps taken by reads (test hook).
 #[cfg(feature = "test-hooks")]
 pub(crate) static TAIL_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -419,6 +412,7 @@ fn new_memtable(
     Ok(if tail_index { m.with_tail_index() } else { m })
 }
 
+/// Engine-wide state every shard and every caller shares.
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,
@@ -10329,13 +10323,6 @@ impl ShardState {
         // Every coordinated commit is answered: no doom (D276) is left to act on. Panic-free
         // (no allocation).
         self.doomed.clear();
-    }
-
-    /// Commits inline on the shard's own thread (application-owned mode): the member joins
-    /// whatever is pending and the group runs now.
-    pub(crate) fn commit_inline(&mut self, req: CommitReq, ctx: &mut ShardContext<'_, ShardMsg>) {
-        self.pending.push(Member::single(req));
-        self.run_group(ctx);
     }
 
     fn on_sync_barrier(

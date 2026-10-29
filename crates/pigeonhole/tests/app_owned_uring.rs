@@ -158,7 +158,7 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
         .shards(1)
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options.clone())
             .expect("io_uring");
     // The engine starts no threads in application-owned mode (#408): not even io_uring's
@@ -203,7 +203,7 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
     #[cfg(feature = "async")]
     {
         step("reopen");
-        let (db, mut shards) =
+        let pigeonhole::AppOwned { db, mut shards, .. } =
             Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).unwrap();
         let driver = std::thread::spawn({
             let shard = shards.pop().unwrap();
@@ -263,7 +263,7 @@ fn a_shard_moved_to_another_thread_gets_a_ring_there_and_its_durable_commits_com
         .shards(1)
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
     db.set_default_durability(Durability::GroupSync);
     let mut shard = shards.pop().unwrap();
@@ -313,7 +313,7 @@ fn a_released_shard_moves_off_a_thread_that_stays_alive_and_its_io_completes() {
         .shards(1)
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
     db.set_default_durability(Durability::GroupSync);
     let shard = shards.pop().unwrap();
@@ -372,7 +372,7 @@ fn release_drains_a_sync_in_flight_on_the_old_threads_ring_before_the_shard_move
         .shards(1)
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
     db.set_default_durability(Durability::GroupSync);
     let mut shard = shards.pop().unwrap();
@@ -433,7 +433,7 @@ fn debug_builds_reject_a_shard_moved_with_its_io_left_on_the_old_thread() {
         .shards(1)
         .memtable_budget(4 << 20)
         .io_backend(IoBackend::Uring);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).expect("io_uring");
     db.set_default_durability(Durability::GroupSync);
     let mut shard = shards.pop().unwrap();

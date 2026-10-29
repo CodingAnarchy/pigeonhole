@@ -816,3 +816,170 @@ fn a_stopped_worker_mid_compaction_leaves_no_write_in_flight_and_its_compaction_
     assert!(shard.closed().expect("closed").is_ok());
     assert_eq!(engine.unreferenced_bytes(), 0);
 }
+
+#[test]
+fn an_engine_dropped_without_a_close_with_a_flush_in_the_pool_frees_everything() {
+    // #1070: with a task in the workers' pool, dropping the shards before the engine (no
+    // `close`) left the task parked on its shard's `Origin`, holding the `Origin` and the
+    // engine's state and VFS: a cycle. The engine harness's crash runs leaked their whole
+    // simulated store that way. Every drop order of the engine, its shards and its workers
+    // must free everything.
+    let orders = [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ];
+    // The flush only queued, and held by the worker: taken and one slice run, unfinished
+    // (perf2's review).
+    for held in [false, true] {
+        for (n, order) in orders.iter().enumerate() {
+            let vfs = SimVfs::new(3);
+            drop_with_a_flush_in_the_pool(&vfs, order, held);
+            assert_eq!(
+                Arc::strong_count(&vfs),
+                1,
+                "drop order {order:?} (#{n}, held {held}): the VFS is still held after the \
+                 engine, its shards and its workers were dropped"
+            );
+        }
+    }
+}
+
+/// An engine, its shards and its workers, each dropped on its turn.
+type Parts = (
+    Option<Arc<Engine>>,
+    Option<Vec<EngineShard>>,
+    Option<Vec<BackgroundWorker>>,
+);
+
+/// Opens with one worker, commits, leaves a flush queued for the worker (and with `held`,
+/// taken by it and unfinished), then drops the engine (0), its shards (1) and its workers
+/// (2) in `order`, without a close.
+fn drop_with_a_flush_in_the_pool(vfs: &Arc<SimVfs>, order: &[usize; 3], held: bool) {
+    let AppOwned {
+        engine,
+        mut shards,
+        mut workers,
+        ..
+    } = Engine::open_application_owned_with(Path::new("/db/drop.phdb"), sim_options(vfs, 1))
+        .expect("open");
+    let t = engine
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..8u8 {
+        let mut pc: PendingCommit = engine
+            .submit(put(&t, &[b'a', i], 64), Some(Durability::Buffered))
+            .unwrap();
+        step(&**vfs, &mut shards[0], None, 32);
+        ready(&mut pc).expect("committed").expect("ok");
+    }
+    let mut flush = engine.flush_pending().unwrap();
+    step(&**vfs, &mut shards[0], None, 8);
+    if held {
+        // A deadline already past: the worker takes the flush and runs one slice of it.
+        workers[0].run_once(vfs.monotonic_nanos());
+        assert!(
+            ready(&mut flush).is_none(),
+            "the flush finished in one slice"
+        );
+    }
+    drop(flush);
+    let mut parts: Parts = (Some(engine), Some(shards), Some(workers));
+    for &k in order {
+        match k {
+            0 => drop(parts.0.take()),
+            1 => drop(parts.1.take()),
+            _ => drop(parts.2.take()),
+        }
+    }
+}
+
+#[test]
+fn a_large_value_submitted_while_a_worker_holds_the_manifest_pump_does_not_wait_for_the_worker() {
+    // #1038's sweep: on the simulator a client blocked in a large value's manifest commit
+    // while the pump sat on a background worker the same thread drives. On real files the
+    // worker's slice completes the pump's root commit inline, so the blocked thread finishes
+    // it (`take_done`) without the worker running again. One thread drives the shard and the
+    // worker here, so a wait on the worker would never end: every submit returning is the
+    // check, and a watchdog fails a hang. (No time bound: the submit's own root commit syncs,
+    // which a slow runner's disk takes tens of ms to do; Windows CI saw 5 of 200 over 50 ms.)
+    let dir = TempDir::new("pump");
+    let vfs = real_vfs();
+    let mut o = real_options(&vfs);
+    o.memtable_freeze_bytes = 64 << 10;
+    let AppOwned {
+        engine,
+        mut shards,
+        mut workers,
+        ..
+    } = Engine::open_application_owned_with(&dir.0.join("pump.phdb"), o).expect("open");
+    let mut worker = workers.remove(0);
+    let mut shard = shards.remove(0);
+    engine.set_inline_value_limit(64);
+    let t = engine
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx
+            .recv_timeout(std::time::Duration::from_secs(120))
+            .is_err()
+        {
+            eprintln!("a submit waited on the undriven worker for 120 s");
+            std::process::abort();
+        }
+    });
+    for i in 0..200u32 {
+        // Small rows, then a flush whose manifest commit goes to the worker's pump.
+        for j in 0..32u32 {
+            let mut pc = engine
+                .submit(
+                    put(&t, &(i * 64 + j).to_be_bytes(), 32),
+                    Some(Durability::Buffered),
+                )
+                .unwrap();
+            for _ in 0..64 {
+                if ready(&mut pc).is_some() {
+                    break;
+                }
+                step(&*vfs, &mut shard, Some(&mut worker), 1);
+            }
+            ready(&mut pc).expect("committed").expect("ok");
+        }
+        let mut f = engine.flush_pending().unwrap();
+        // A few turns: the worker may now hold the pump between its slices.
+        step(&*vfs, &mut shard, Some(&mut worker), 1 + (i as usize % 3));
+        // A large value from the same thread: its manifest commit must not need the worker.
+        let mut pc = engine
+            .submit(
+                put(&t, &(1_000_000 + i).to_be_bytes(), 4096),
+                Some(Durability::Buffered),
+            )
+            .unwrap();
+        for _ in 0..1024 {
+            if ready(&mut pc).is_some() && ready(&mut f).is_some() {
+                break;
+            }
+            step(&*vfs, &mut shard, Some(&mut worker), 1);
+        }
+        ready(&mut pc).expect("committed").expect("ok");
+    }
+    done_tx.send(()).unwrap();
+    watchdog.join().unwrap();
+    engine.close().unwrap();
+    let closing = std::time::Instant::now();
+    // The close finishes on the shard's turns within the take-back windows (real time).
+    while shard.closed().is_none() && closing.elapsed() < std::time::Duration::from_secs(20) {
+        step(&*vfs, &mut shard, Some(&mut worker), 1);
+    }
+    assert!(
+        shard.closed().is_some(),
+        "not closed: worker closed {}, metrics {:?}",
+        worker.closed(),
+        engine.metrics()
+    );
+    assert!(shard.closed().expect("closed").is_ok());
+}

@@ -831,10 +831,6 @@ impl Vfs for PreadVfs {
     fn current_process(&self) -> ProcessId {
         self.process
     }
-
-    fn process_alive(&self, process: ProcessId) -> bool {
-        process == self.process || os::process_alive(process.pid, process.start_time)
-    }
 }
 
 #[cfg(test)]
