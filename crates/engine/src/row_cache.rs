@@ -95,6 +95,7 @@ impl RowEpochs {
     /// A commit at `seqno` writes `row` (before the write is inserted, so before it can be
     /// visible).
     #[inline]
+    #[cfg(test)]
     pub fn note_write(&self, table: TableId, row: &[u8], seqno: Seqno) {
         self.table.note_write(self.hash(table, row), seqno);
     }
