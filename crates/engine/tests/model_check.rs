@@ -137,6 +137,12 @@ fn harness_regressions_from_the_seed_sweep() {
             check(seed, &cfg);
         }
     }
+    // Seed 73 (#1071 on release/0.3.x, the `counters` target; main's #1076 found it at seeds
+    // 680069 and 680171): a read beside an in-flight commit took a counter family's
+    // default-timestamp put, which lands at timestamp 0 under a later bucket, for a cell
+    // that should show the commit, and called the commit partly visible. Such a cell reads
+    // the same either way; it shows nothing now.
+    check(73, &flight_read_config());
     // Seeds 114 and 274 (issue #162): a refused attempt's PREPARE, settled at one recovery,
     // was still in the WAL at the next, fit an unacknowledged commit made in between (a row
     // delete of the same row) and took it from the commit whose share really survived.
@@ -682,16 +688,7 @@ fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant()
     // commits must survive at their level and reads must match the model; a commit readers
     // may have seen but nobody was told committed may be lost to a power loss, never to a
     // process crash.
-    let mut cfg = Config::standard(250);
-    cfg.shards = 3;
-    cfg.deferred_io = true;
-    cfg.flight_read_ppm = 300_000;
-    cfg.mid_commit_crash_ppm = 120_000;
-    // Reads of in-flight commits' own cells (visible whole or not at all), and a process
-    // crash after some of them: recovery must keep what a read saw. (Crashes this frequent
-    // leave no segment time to fill, so the D200 held-header window is covered by
-    // `held_header_visibility.rs` instead.)
-    cfg.observed_crash_ppm = 200_000;
+    let cfg = flight_read_config();
     let (mut reads, mut observed, mut crashes) = (0, 0, 0);
     for seed in seeds() {
         let s = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
@@ -702,4 +699,19 @@ fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant()
     assert!(reads > 0, "no read ran beside an in-flight commit");
     assert!(observed > 0, "no read saw an in-flight commit whole");
     eprintln!("{reads} reads beside commits, {observed} saw one whole, {crashes} crashes after");
+}
+
+/// `reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant`'s config.
+fn flight_read_config() -> Config {
+    let mut cfg = Config::standard(250);
+    cfg.shards = 3;
+    cfg.deferred_io = true;
+    cfg.flight_read_ppm = 300_000;
+    cfg.mid_commit_crash_ppm = 120_000;
+    // Reads of in-flight commits' own cells (visible whole or not at all), and a process
+    // crash after some of them: recovery must keep what a read saw. (Crashes this frequent
+    // leave no segment time to fill, so the D200 held-header window is covered by
+    // `held_header_visibility.rs` instead.)
+    cfg.observed_crash_ppm = 200_000;
+    cfg
 }
