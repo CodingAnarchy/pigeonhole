@@ -190,8 +190,7 @@ impl TableCore {
     pub(crate) fn current_info(&self) -> Arc<TableInfo> {
         // By id: a table dropped, or dropped and created again under its name (a new id),
         // is not this handle's.
-        self.engine()
-            .table_by_id(self.info.id)
+        self.with(|e| e.table_by_id(self.info.id))
             .unwrap_or_else(|| Arc::clone(&self.info))
     }
 

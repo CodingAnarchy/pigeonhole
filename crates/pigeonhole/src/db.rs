@@ -647,14 +647,14 @@ impl Db {
         }
     }
 
-    pub(crate) fn snapshot(self: &Arc<Self>) -> Result<Snapshot> {
+    pub(crate) fn snapshot(self: &Arc<Self>, cached: &Cached) -> Result<Snapshot> {
         self.check_open()?;
         // The generation before the engine, inside the retry (perf287's R2 on #836): a swap
         // in between leaves a snapshot that fails its check rather than one that passes it
         // with an old view, and a snapshot retried on the new engine carries that one's.
         let (inner, generation) = self.retry_closed(|| {
             let generation = self.generation();
-            let inner = self.engine().snapshot()?;
+            let inner = cached.with(self, Engine::snapshot)?;
             Ok((inner, generation))
         })?;
         Ok(Snapshot {
@@ -664,11 +664,11 @@ impl Db {
         })
     }
 
-    pub(crate) fn durable_snapshot(self: &Arc<Self>) -> Result<Snapshot> {
+    pub(crate) fn durable_snapshot(self: &Arc<Self>, cached: &Cached) -> Result<Snapshot> {
         self.check_open()?;
         let (inner, generation) = self.retry_closed(|| {
             let generation = self.generation();
-            let inner = self.engine().durable_snapshot()?;
+            let inner = cached.with(self, Engine::durable_snapshot)?;
             Ok((inner, generation))
         })?;
         Ok(Snapshot {
@@ -1053,7 +1053,7 @@ impl Pigeonhole {
     /// A consistent snapshot of everything committed so far. It sees a commit once the commit
     /// is applied, possibly before its fsync (D227): a power loss can remove what it read.
     pub fn snapshot(&self) -> Result<Snapshot> {
-        self.db.snapshot()
+        self.db.snapshot(&self.cached)
     }
 
     /// A consistent snapshot that sees a commit only once it is durable at its commit's level
@@ -1079,7 +1079,7 @@ impl Pigeonhole {
     /// # }
     /// ```
     pub fn durable_snapshot(&self) -> Result<Snapshot> {
-        self.db.durable_snapshot()
+        self.db.durable_snapshot(&self.cached)
     }
 
     /// Per-shard commits, tablets and tablet changes since open, indexed by shard: a bench
@@ -1547,13 +1547,13 @@ impl PigeonholeReader {
     /// a writer restart and reload the manifest if it changed. It sees commits once applied,
     /// possibly before their fsync (D227).
     pub fn snapshot(&self) -> Result<Snapshot> {
-        self.db.snapshot()
+        self.db.snapshot(&self.cached)
     }
 
     /// A snapshot that sees only commits durable at their level (D227, ICR 0037), as
     /// [`Pigeonhole::durable_snapshot`]. May do I/O, as [`snapshot`](Self::snapshot).
     pub fn durable_snapshot(&self) -> Result<Snapshot> {
-        self.db.durable_snapshot()
+        self.db.durable_snapshot(&self.cached)
     }
 
     /// As [`Pigeonhole::backup`], from this reader process while the writer runs (ICR 0049):
