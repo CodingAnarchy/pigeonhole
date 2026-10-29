@@ -209,7 +209,7 @@ fn async_commits_from_many_threads_join_the_same_groups() {
 #[test]
 fn a_commit_future_resolves_on_its_shards_own_event_loop() {
     let vfs = SimVfs::new(4206);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned("/db/app.phdb", sim_options(&vfs).shards(1)).unwrap();
     let mut shard: Shard = shards.remove(0);
     // Setup (table creation waits on the shard) with a helper thread driving it.
@@ -264,7 +264,7 @@ fn on_event_loop<F: Future + Unpin>(shard: &mut Shard, mut fut: F) -> F::Output 
 #[test]
 fn conditional_commits_flushes_and_compactions_resolve_on_the_event_loop() {
     let vfs = SimVfs::new(4207);
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned("/db/app.phdb", sim_options(&vfs).shards(1)).unwrap();
     let mut shard: Shard = shards.remove(0);
     let stop = Arc::new(AtomicBool::new(false));
@@ -874,7 +874,7 @@ fn the_documented_wait_loop_completes_durable_commits_without_spinning() {
     // wait must complete it without the application taking `io_fd`.
     let dir = std::env::temp_dir().join(format!("phdb-wait-loop-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let (db, mut shards) = Pigeonhole::open_application_owned(
+    let pigeonhole::AppOwned { db, mut shards, .. } = Pigeonhole::open_application_owned(
         dir.join("w.phdb"),
         Options::default()
             .shards(1)

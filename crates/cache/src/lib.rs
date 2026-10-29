@@ -112,11 +112,11 @@ impl From<Vec<u8>> for BlockData {
 /// let hit = cache.get(key).expect("cached");
 /// assert_eq!(hit.bytes(), &[1, 2, 3]);
 ///
-/// // Eviction and `erase_file` skip pinned blocks; once unpinned, the block can go.
-/// cache.erase_file(7);
+/// // Eviction and `erase_files` skip pinned blocks; once unpinned, the block can go.
+/// cache.erase_files(&[7]);
 /// assert_eq!(&hit[..], &[1, 2, 3]);
 /// drop((pinned, hit));
-/// cache.erase_file(7);
+/// cache.erase_files(&[7]);
 /// assert!(cache.get(key).is_none());
 /// assert_eq!(cache.usage(), 0);
 /// ```
@@ -200,16 +200,12 @@ impl BlockCache {
         BlockHandle { block }
     }
 
-    /// Drops every unpinned block of `file` (after its SST or blob file is deleted).
+    /// Drops every unpinned block of `files` (after their SSTs or blob files are deleted), in
+    /// one pass over each shard, so a compaction that removes many SSTs pays one scan, not
+    /// one per file.
     ///
-    /// Pinned blocks of `file` stay indexed until a later eviction; file ids are never reused,
-    /// so they can only be found by holders of the old file's keys.
-    pub fn erase_file(&self, file: u64) {
-        self.erase_files(&[file]);
-    }
-
-    /// [`erase_file`](Self::erase_file) for a batch of files (one pass over each shard, so a
-    /// compaction that removes many SSTs pays one scan, not one per file).
+    /// Pinned blocks stay indexed until a later eviction; file ids are never reused, so they
+    /// can only be found by holders of the old file's keys.
     ///
     /// ```
     /// use pigeonhole_cache::{BlockCache, BlockKey, Priority};
@@ -684,76 +680,6 @@ impl fmt::Debug for RowCache {
             .field("shards", &self.shards.len())
             .field("capacity", &self.shards.capacity())
             .field("usage", &self.shards.usage())
-            .finish()
-    }
-}
-
-/// The row cache's epochs (D201): write watermarks for rows, indexed by a hash of the row
-/// the caller computes, so a row's cached copy can be checked against later writes without
-/// invalidating it.
-///
-/// A writer raises a row's watermark to its commit's sequence number ([`RowEpochs::note_write`],
-/// Release) before the write can become visible. A reader takes its read point first, then
-/// the row's epoch ([`RowEpochs::epoch`], Acquire): every write at or below the read point
-/// has raised the watermark by then, so a [`RowCache`] entry stored under that epoch is
-/// current until the next write to the row raises the watermark past it. Rows that share a
-/// slot only cost each other misses.
-///
-/// ```
-/// use pigeonhole_cache::RowEpochs;
-///
-/// let epochs = RowEpochs::new(1024);
-/// let h = 0xfeed;
-/// epochs.note_write(h, 5);
-/// assert_eq!(epochs.epoch(h, 7), Some(5)); // a read at 7 sees the write at 5
-/// epochs.note_write(h, 9);
-/// assert_eq!(epochs.epoch(h, 7), None); // applied, not yet visible at 7: no hit, no fill
-/// ```
-pub struct RowEpochs {
-    slots: Box<[AtomicU64]>,
-    mask: usize,
-}
-
-impl RowEpochs {
-    /// A table of at least `slots` watermarks (rounded up to a power of two), all zero.
-    pub fn new(slots: usize) -> Self {
-        let n = slots.max(1).next_power_of_two();
-        Self {
-            slots: (0..n).map(|_| AtomicU64::new(0)).collect(),
-            mask: n - 1,
-        }
-    }
-
-    /// The row hashing to `hash` is written at `seqno` (call before the write can be
-    /// visible).
-    #[inline]
-    pub fn note_write(&self, hash: u64, seqno: u64) {
-        self.slots[hash as usize & self.mask].fetch_max(seqno, Ordering::Release);
-    }
-
-    /// The epoch of the row hashing to `hash` for a read at `seqno` (load it after taking
-    /// the read point): `None` when a write to it is applied but not visible at `seqno`.
-    #[inline]
-    pub fn epoch(&self, hash: u64, seqno: u64) -> Option<u64> {
-        let e = self.slots[hash as usize & self.mask].load(Ordering::Acquire);
-        (e <= seqno).then_some(e)
-    }
-
-    /// How many watermarks the table holds.
-    pub fn len(&self) -> usize {
-        self.slots.len()
-    }
-
-    /// Never: a table has at least one watermark.
-    pub fn is_empty(&self) -> bool {
-        false
-    }
-}
-
-impl fmt::Debug for RowEpochs {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("RowEpochs")
-            .field("slots", &self.slots.len())
             .finish()
     }
 }

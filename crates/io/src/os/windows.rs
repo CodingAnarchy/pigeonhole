@@ -7,8 +7,8 @@ use std::path::Path;
 use std::ptr::NonNull;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, ERROR_INVALID_FUNCTION,
-    ERROR_LOCK_VIOLATION, FILETIME, GetLastError, HANDLE, INVALID_HANDLE_VALUE, STILL_ACTIVE,
+    CloseHandle, ERROR_ALREADY_EXISTS, ERROR_INVALID_FUNCTION, ERROR_LOCK_VIOLATION, FILETIME,
+    GetLastError, HANDLE, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_NAME_NORMALIZED, GetDriveTypeW,
@@ -24,11 +24,10 @@ use windows_sys::Win32::System::SystemInformation::{
     GetLogicalProcessorInformation, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION,
 };
 use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetCurrentThread, GetExitCodeProcess, GetProcessAffinityMask,
-    GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SetThreadAffinityMask,
+    GetCurrentProcess, GetCurrentThread, GetProcessAffinityMask, GetProcessTimes,
+    SetThreadAffinityMask,
 };
 
-use super::Liveness;
 use crate::{Error, ErrorKind, FileIdentity, LockMode, Result, SharedOpen};
 
 /// `GetDriveTypeW` result for a network drive (WindowsProgramming, a feature we don't enable).
@@ -365,10 +364,6 @@ pub(crate) fn remove_default_shared(_name: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn bind_numa(_ptr: *mut u8, _len: usize, _node: u32) -> Result<()> {
-    Ok(())
-}
-
 pub(crate) fn discard(_ptr: *mut u8, _len: usize) -> Result<()> {
     Err(Error::new(
         ErrorKind::Unsupported,
@@ -399,29 +394,6 @@ fn creation_time(h: HANDLE) -> Option<u64> {
         return None;
     }
     Some(filetime(times[0]))
-}
-
-pub(crate) fn process_liveness(pid: u32) -> Liveness {
-    // SAFETY: plain call; the returned handle is closed below.
-    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if h.is_null() {
-        // SAFETY: reads the calling thread's last-error value set by `OpenProcess`.
-        return if unsafe { GetLastError() } == ERROR_ACCESS_DENIED {
-            Liveness::Alive(None)
-        } else {
-            Liveness::Dead
-        };
-    }
-    let mut code = 0u32;
-    // SAFETY: `h` is a live process handle; `code` is a valid out pointer.
-    let ok = unsafe { GetExitCodeProcess(h, &mut code) } != 0;
-    let start = creation_time(h);
-    // SAFETY: we own `h` and close it once.
-    unsafe { CloseHandle(h) };
-    if ok && code != STILL_ACTIVE as u32 {
-        return Liveness::Dead;
-    }
-    Liveness::Alive(start)
 }
 
 /// The calling process's start time (0 if unknown).

@@ -1388,7 +1388,8 @@ fn the_default_shard_count_is_one_per_physical_core() {
     let options = Options::default()
         .vfs(Arc::clone(&vfs) as _)
         .memtable_budget(4 << 20);
-    let (db, mut shards) = Pigeonhole::open_application_owned("/db/cores.phdb", options).unwrap();
+    let pigeonhole::AppOwned { db, mut shards, .. } =
+        Pigeonhole::open_application_owned("/db/cores.phdb", options).unwrap();
     // D220: SMT siblings count once, within the CPUs the process may use.
     assert_eq!(shards.len(), pigeonhole_io::sys::default_shards());
     // The close needs every shard's turn: drive them all until each has closed.
@@ -1454,7 +1455,7 @@ fn application_owned_mode() {
     assert_eq!(err.code(), ErrorCode::InvalidArgument);
 
     // The default starts compaction threads only in engine-owned mode (D252): here it is 0.
-    let (db, mut shards) =
+    let pigeonhole::AppOwned { db, mut shards, .. } =
         Pigeonhole::open_application_owned("/db/app.phdb", sim_options(&vfs)).unwrap();
     assert_eq!(shards.len(), 2);
     assert_eq!(shards.iter().map(|s| s.index()).collect::<Vec<_>>(), [0, 1]);
@@ -2441,7 +2442,8 @@ fn compact_after_drop_table_covers_the_live_tables() {
     // held there, so no background work (a compaction of the dropped table still finishing,
     // a shard's momentary view) keeps the dropped table's extents retired (#366: on
     // engine-owned threads that happened once in CI and left the file unshrunk).
-    let (db, shards) = Pigeonhole::open_application_owned(path, sim_options(&vfs)).unwrap();
+    let pigeonhole::AppOwned { db, shards, .. } =
+        Pigeonhole::open_application_owned(path, sim_options(&vfs)).unwrap();
     let driver = Driver::start(shards);
     let make = |name: &str| {
         db.table(name)

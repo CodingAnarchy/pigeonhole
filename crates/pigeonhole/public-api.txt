@@ -1,0 +1,650 @@
+pub mod pigeonhole
+pub mod pigeonhole::nonblocking
+pub struct pigeonhole::nonblocking::CheckFuture
+impl core::future::future::Future for pigeonhole::nonblocking::CheckFuture
+pub type pigeonhole::nonblocking::CheckFuture::Output = core::result::Result<core::option::Option<pigeonhole::CommitInfo>, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::CheckFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::CommitFuture
+impl core::future::future::Future for pigeonhole::nonblocking::CommitFuture
+pub type pigeonhole::nonblocking::CommitFuture::Output = core::result::Result<pigeonhole::CommitInfo, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::CommitFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::GetFuture
+impl core::future::future::Future for pigeonhole::nonblocking::GetFuture
+pub type pigeonhole::nonblocking::GetFuture::Output = core::result::Result<core::option::Option<pigeonhole::Cell>, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::GetFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::MaintenanceFuture
+impl core::future::future::Future for pigeonhole::nonblocking::MaintenanceFuture
+pub type pigeonhole::nonblocking::MaintenanceFuture::Output = core::result::Result<(), pigeonhole::Error>
+pub fn pigeonhole::nonblocking::MaintenanceFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::RowFuture
+impl core::future::future::Future for pigeonhole::nonblocking::RowFuture
+pub type pigeonhole::nonblocking::RowFuture::Output = core::result::Result<core::option::Option<pigeonhole::Row>, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::RowFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::RowStream<'t>
+impl core::fmt::Debug for pigeonhole::nonblocking::RowStream<'_>
+pub fn pigeonhole::nonblocking::RowStream<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl futures_core::stream::Stream for pigeonhole::nonblocking::RowStream<'_>
+pub type pigeonhole::nonblocking::RowStream<'_>::Item = core::result::Result<pigeonhole::Row, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::RowStream<'_>::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
+pub struct pigeonhole::nonblocking::TransactionCommitFuture
+impl core::future::future::Future for pigeonhole::nonblocking::TransactionCommitFuture
+pub type pigeonhole::nonblocking::TransactionCommitFuture::Output = core::result::Result<pigeonhole::CommitInfo, pigeonhole::Error>
+pub fn pigeonhole::nonblocking::TransactionCommitFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+#[non_exhaustive] pub enum pigeonhole::Compaction
+pub pigeonhole::Compaction::FifoByTime
+pub pigeonhole::Compaction::Leveled
+pub pigeonhole::Compaction::Tiered
+#[non_exhaustive] pub enum pigeonhole::Compression
+pub pigeonhole::Compression::Lz4
+pub pigeonhole::Compression::None
+pub pigeonhole::Compression::Zstd(i8)
+#[non_exhaustive] pub enum pigeonhole::Condition
+pub pigeonhole::Condition::Absent
+pub pigeonhole::Condition::Absent::family: alloc::string::String
+pub pigeonhole::Condition::Absent::qualifier: alloc::vec::Vec<u8>
+pub pigeonhole::Condition::Exists
+pub pigeonhole::Condition::Exists::family: alloc::string::String
+pub pigeonhole::Condition::Exists::qualifier: alloc::vec::Vec<u8>
+pub pigeonhole::Condition::Value
+pub pigeonhole::Condition::Value::family: alloc::string::String
+pub pigeonhole::Condition::Value::filter: pigeonhole::ValueFilter
+pub pigeonhole::Condition::Value::qualifier: alloc::vec::Vec<u8>
+#[non_exhaustive] pub enum pigeonhole::CpuProfile
+pub pigeonhole::CpuProfile::Embedded
+pub pigeonhole::CpuProfile::Server
+#[non_exhaustive] #[repr(u8)] pub enum pigeonhole::Durability
+pub pigeonhole::Durability::Buffered = 1
+pub pigeonhole::Durability::GroupSync = 2
+pub pigeonhole::Durability::None = 0
+pub pigeonhole::Durability::Sync = 3
+#[non_exhaustive] #[repr(u32)] pub enum pigeonhole::ErrorCode
+pub pigeonhole::ErrorCode::BatchTooLarge = 27
+pub pigeonhole::ErrorCode::Busy = 24
+pub pigeonhole::ErrorCode::Closed = 21
+pub pigeonhole::ErrorCode::Conflict = 14
+pub pigeonhole::ErrorCode::Corruption = 2
+pub pigeonhole::ErrorCode::FamilyExists = 11
+pub pigeonhole::ErrorCode::FamilyNotFound = 10
+pub pigeonhole::ErrorCode::InvalidArgument = 19
+pub pigeonhole::ErrorCode::Io = 1
+pub pigeonhole::ErrorCode::KeyTooLarge = 16
+pub pigeonhole::ErrorCode::MergeFailed = 13
+pub pigeonhole::ErrorCode::NetworkFilesystem = 7
+pub pigeonhole::ErrorCode::NoReaderSlot = 22
+pub pigeonhole::ErrorCode::NoSpace = 18
+pub pigeonhole::ErrorCode::NoWriter = 29
+pub pigeonhole::ErrorCode::OutcomeUnknown = 28
+pub pigeonhole::ErrorCode::ReadOnly = 15
+pub pigeonhole::ErrorCode::RecordTooLarge = 23
+pub pigeonhole::ErrorCode::ShmUnavailable = 5
+pub pigeonhole::ErrorCode::ShmVersionMismatch = 4
+pub pigeonhole::ErrorCode::SnapshotExpired = 25
+pub pigeonhole::ErrorCode::TableExists = 9
+pub pigeonhole::ErrorCode::TableNotFound = 8
+pub pigeonhole::ErrorCode::UnknownMergeOperator = 12
+pub pigeonhole::ErrorCode::Unsupported = 20
+pub pigeonhole::ErrorCode::UnsupportedFeature = 30
+pub pigeonhole::ErrorCode::UnsupportedFormat = 6
+pub pigeonhole::ErrorCode::ValueTooLarge = 17
+pub pigeonhole::ErrorCode::WouldDeadlock = 26
+pub pigeonhole::ErrorCode::WriterLocked = 3
+#[non_exhaustive] #[repr(u8)] pub enum pigeonhole::FailureCause
+pub pigeonhole::FailureCause::DriverDropped = 2
+pub pigeonhole::FailureCause::Internal = 4
+pub pigeonhole::FailureCause::Io = 3
+pub pigeonhole::FailureCause::Panic = 1
+#[non_exhaustive] pub enum pigeonhole::IoBackend
+pub pigeonhole::IoBackend::Auto
+pub pigeonhole::IoBackend::Pread
+pub pigeonhole::IoBackend::Uring
+#[non_exhaustive] pub enum pigeonhole::Priority
+pub pigeonhole::Priority::High
+pub pigeonhole::Priority::Low
+pub pigeonhole::Priority::Normal
+#[non_exhaustive] pub enum pigeonhole::Recovery
+pub pigeonhole::Recovery::Any = 2
+pub pigeonhole::Recovery::Io = 1
+pub pigeonhole::Recovery::Off = 0
+#[non_exhaustive] pub enum pigeonhole::RegionKind
+pub pigeonhole::RegionKind::Blob
+pub pigeonhole::RegionKind::Blob::blob_file: u32
+pub pigeonhole::RegionKind::Blob::family: alloc::string::String
+pub pigeonhole::RegionKind::Blob::index: u32
+pub pigeonhole::RegionKind::ManifestLog
+pub pigeonhole::RegionKind::ManifestSnapshot
+pub pigeonhole::RegionKind::Sst
+pub pigeonhole::RegionKind::Sst::family: alloc::string::String
+pub pigeonhole::RegionKind::Sst::level: u8
+pub pigeonhole::RegionKind::Sst::sst: u64
+pub pigeonhole::RegionKind::Sst::table: alloc::string::String
+pub pigeonhole::RegionKind::Sst::used: u64
+pub pigeonhole::RegionKind::Superblock
+pub pigeonhole::RegionKind::Superblock::slot: u8
+#[non_exhaustive] pub enum pigeonhole::Severity
+pub pigeonhole::Severity::Corruption
+pub pigeonhole::Severity::Info
+pub pigeonhole::Severity::Warning
+#[non_exhaustive] pub enum pigeonhole::Structure
+pub pigeonhole::Structure::Allocation
+pub pigeonhole::Structure::Blob
+pub pigeonhole::Structure::Manifest
+pub pigeonhole::Structure::Sst
+pub pigeonhole::Structure::Superblock
+pub pigeonhole::Structure::Wal
+#[non_exhaustive] pub enum pigeonhole::Value<'a>
+pub pigeonhole::Value::Bytes(&'a [u8])
+pub pigeonhole::Value::F64(f64)
+pub pigeonhole::Value::I64(i64)
+pub pigeonhole::Value::Varint(i64)
+#[non_exhaustive] pub enum pigeonhole::ValueFilter
+pub pigeonhole::ValueFilter::Equals(alloc::vec::Vec<u8>)
+pub pigeonhole::ValueFilter::I64(core::cmp::Ordering, i64)
+pub pigeonhole::ValueFilter::Prefix(alloc::vec::Vec<u8>)
+#[non_exhaustive] pub struct pigeonhole::AppOwned
+pub pigeonhole::AppOwned::db: pigeonhole::Pigeonhole
+pub pigeonhole::AppOwned::shards: alloc::vec::Vec<pigeonhole::Shard>
+pub pigeonhole::AppOwned::workers: alloc::vec::Vec<pigeonhole::BackgroundWorker>
+impl pigeonhole::AppOwned
+pub fn pigeonhole::AppOwned::spawn_background_threads(&mut self) -> pigeonhole::Result<alloc::vec::Vec<std::thread::join_handle::JoinHandle<()>>>
+pub struct pigeonhole::BackgroundWorker
+impl pigeonhole::BackgroundWorker
+pub fn pigeonhole::BackgroundWorker::closed(&self) -> bool
+pub fn pigeonhole::BackgroundWorker::next_wakeup(&self) -> core::option::Option<core::time::Duration>
+pub fn pigeonhole::BackgroundWorker::run_once(&mut self, core::time::Duration) -> bool
+pub fn pigeonhole::BackgroundWorker::set_wakeup(&mut self, alloc::boxed::Box<(dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync)>)
+pub fn pigeonhole::BackgroundWorker::wait(&mut self, core::time::Duration)
+pub fn pigeonhole::BackgroundWorker::waker(&self) -> core::task::wake::Waker
+pub struct pigeonhole::Cell
+impl pigeonhole::Cell
+pub fn pigeonhole::Cell::as_i64(&self) -> core::option::Option<i64>
+pub fn pigeonhole::Cell::timestamp(&self) -> u64
+pub fn pigeonhole::Cell::typed(&self) -> pigeonhole::Value<'_>
+pub fn pigeonhole::Cell::value(&self) -> &[u8]
+#[non_exhaustive] pub struct pigeonhole::CellEntry<'a>
+pub pigeonhole::CellEntry::cell: pigeonhole::CellRef<'a>
+pub pigeonhole::CellEntry::family: &'a str
+pub pigeonhole::CellEntry::qualifier: &'a [u8]
+pub struct pigeonhole::CellRef<'a>
+impl<'a> pigeonhole::CellRef<'a>
+pub fn pigeonhole::CellRef<'a>::as_i64(&self) -> core::option::Option<i64>
+pub fn pigeonhole::CellRef<'a>::timestamp(&self) -> u64
+pub fn pigeonhole::CellRef<'a>::to_owned(&self) -> pigeonhole::Cell
+pub fn pigeonhole::CellRef<'a>::typed(&self) -> pigeonhole::Value<'_>
+pub fn pigeonhole::CellRef<'a>::value(&self) -> &[u8]
+#[non_exhaustive] pub struct pigeonhole::CheckCounts
+pub pigeonhole::CheckCounts::blob_files: u64
+pub pigeonhole::CheckCounts::blob_pointers: u64
+pub pigeonhole::CheckCounts::blob_records: u64
+pub pigeonhole::CheckCounts::sst_entries: u64
+pub pigeonhole::CheckCounts::ssts: u64
+pub pigeonhole::CheckCounts::superblocks: u64
+pub pigeonhole::CheckCounts::tables: u64
+pub pigeonhole::CheckCounts::wal_files: u64
+pub pigeonhole::CheckCounts::wal_records: u64
+pub struct pigeonhole::CheckOptions
+impl pigeonhole::CheckOptions
+pub fn pigeonhole::CheckOptions::allow_fuse(self, bool) -> Self
+pub fn pigeonhole::CheckOptions::deep(self, bool) -> Self
+impl core::fmt::Debug for pigeonhole::CheckOptions
+pub fn pigeonhole::CheckOptions::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole::CheckReport
+pub pigeonhole::CheckReport::clean_shutdown: bool
+pub pigeonhole::CheckReport::counts: pigeonhole::CheckCounts
+pub pigeonhole::CheckReport::file_bytes: u64
+pub pigeonhole::CheckReport::findings: alloc::vec::Vec<pigeonhole::Finding>
+pub pigeonhole::CheckReport::regions: alloc::vec::Vec<pigeonhole::Region>
+pub pigeonhole::CheckReport::wal: alloc::vec::Vec<pigeonhole::WalFile>
+impl pigeonhole::CheckReport
+pub fn pigeonhole::CheckReport::is_ok(&self) -> bool
+#[non_exhaustive] pub struct pigeonhole::CommitInfo
+pub pigeonhole::CommitInfo::durability: pigeonhole::Durability
+pub pigeonhole::CommitInfo::seqno: u64
+#[non_exhaustive] pub struct pigeonhole::CommitStats
+pub pigeonhole::CommitStats::count: u64
+pub pigeonhole::CommitStats::p50_nanos: u64
+pub pigeonhole::CommitStats::p999_nanos: u64
+pub pigeonhole::CommitStats::p99_nanos: u64
+pub struct pigeonhole::CommitTicket
+impl pigeonhole::CommitTicket
+pub fn pigeonhole::CommitTicket::seqno(&mut self) -> core::option::Option<u64>
+pub fn pigeonhole::CommitTicket::try_result(&mut self) -> core::option::Option<pigeonhole::Result<pigeonhole::CommitInfo>>
+pub fn pigeonhole::CommitTicket::wait(self) -> pigeonhole::Result<pigeonhole::CommitInfo>
+impl core::future::into_future::IntoFuture for pigeonhole::CommitTicket
+pub type pigeonhole::CommitTicket::IntoFuture = pigeonhole::nonblocking::CommitFuture
+pub type pigeonhole::CommitTicket::Output = core::result::Result<pigeonhole::CommitInfo, pigeonhole::Error>
+pub fn pigeonhole::CommitTicket::into_future(self) -> pigeonhole::nonblocking::CommitFuture
+#[non_exhaustive] pub struct pigeonhole::CrossShardMetrics
+pub pigeonhole::CrossShardMetrics::failed_fast: u64
+pub pigeonhole::CrossShardMetrics::rounds: u64
+#[non_exhaustive] pub struct pigeonhole::DatabaseInfo
+pub pigeonhole::DatabaseInfo::db_id: [u8; 16]
+pub pigeonhole::DatabaseInfo::features: pigeonhole::FileFeatures
+pub pigeonhole::DatabaseInfo::file_bytes: u64
+pub pigeonhole::DatabaseInfo::format_version: u32
+pub pigeonhole::DatabaseInfo::free_bytes: core::option::Option<u64>
+pub pigeonhole::DatabaseInfo::read_only: bool
+pub pigeonhole::DatabaseInfo::reader: bool
+pub pigeonhole::DatabaseInfo::shards: usize
+pub pigeonhole::DatabaseInfo::tables: alloc::vec::Vec<pigeonhole::TableInfo>
+#[non_exhaustive] pub struct pigeonhole::EngineMetrics
+pub pigeonhole::EngineMetrics::async_sync_reads: u64
+pub pigeonhole::EngineMetrics::background_fallback_take_backs: u64
+pub pigeonhole::EngineMetrics::background_room_take_backs: u64
+pub pigeonhole::EngineMetrics::block_cache_capacity_bytes: u64
+pub pigeonhole::EngineMetrics::block_cache_hits: u64
+pub pigeonhole::EngineMetrics::block_cache_misses: u64
+pub pigeonhole::EngineMetrics::block_cache_pinned_bytes: u64
+pub pigeonhole::EngineMetrics::block_cache_pinned_warnings: u64
+pub pigeonhole::EngineMetrics::compaction_failures: u64
+pub pigeonhole::EngineMetrics::compactions: u64
+pub pigeonhole::EngineMetrics::compactions_reclaimed: u64
+pub pigeonhole::EngineMetrics::cross_shard: pigeonhole::CrossShardMetrics
+pub pigeonhole::EngineMetrics::file_growth_nanos: u64
+pub pigeonhole::EngineMetrics::file_growths: u64
+pub pigeonhole::EngineMetrics::flush_failures: u64
+pub pigeonhole::EngineMetrics::flushes: u64
+pub pigeonhole::EngineMetrics::pacing_stall_nanos: u64
+pub pigeonhole::EngineMetrics::pacing_stalls: u64
+pub pigeonhole::EngineMetrics::reader_pin_seqno_lag: u64
+pub pigeonhole::EngineMetrics::reader_slots: u64
+pub pigeonhole::EngineMetrics::reader_slots_active: u64
+pub pigeonhole::EngineMetrics::reader_slots_reclaimed: u64
+pub pigeonhole::EngineMetrics::room_stall_nanos: u64
+pub pigeonhole::EngineMetrics::room_stalls: u64
+pub pigeonhole::EngineMetrics::shard_busy_nanos: u64
+pub pigeonhole::EngineMetrics::threads_pinned: u64
+pub pigeonhole::EngineMetrics::threads_started: u64
+pub pigeonhole::EngineMetrics::transaction_conflicts: u64
+pub pigeonhole::EngineMetrics::transaction_retries: u64
+pub pigeonhole::EngineMetrics::transactions: u64
+pub pigeonhole::EngineMetrics::unpinned_reason: core::option::Option<&'static str>
+pub pigeonhole::EngineMetrics::write_stall_nanos: u64
+pub pigeonhole::EngineMetrics::write_stalls: u64
+impl pigeonhole::EngineMetrics
+pub fn pigeonhole::EngineMetrics::commits(&self, pigeonhole::Durability) -> pigeonhole::CommitStats
+pub struct pigeonhole::Error
+impl pigeonhole::Error
+pub fn pigeonhole::Error::code(&self) -> pigeonhole::ErrorCode
+pub fn pigeonhole::Error::message(&self) -> &str
+impl core::cmp::Eq for pigeonhole::Error
+impl core::cmp::PartialEq for pigeonhole::Error
+pub fn pigeonhole::Error::eq(&self, &Self) -> bool
+impl core::error::Error for pigeonhole::Error
+impl core::fmt::Debug for pigeonhole::Error
+pub fn pigeonhole::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for pigeonhole::Error
+pub fn pigeonhole::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole::Failure
+pub pigeonhole::Failure::cause: pigeonhole::FailureCause
+pub pigeonhole::Failure::shard: u32
+impl pigeonhole::Failure
+pub const pigeonhole::Failure::MAIN_FILE: u32
+pub struct pigeonhole::Family
+impl pigeonhole::Family
+pub fn pigeonhole::Family::blob_threshold(self, u32) -> Self
+pub fn pigeonhole::Family::block_size(self, u32) -> Self
+pub fn pigeonhole::Family::bloom_bits(self, u8) -> Self
+pub fn pigeonhole::Family::cache_priority(self, pigeonhole::Priority) -> Self
+pub fn pigeonhole::Family::compaction(self, pigeonhole::Compaction) -> Self
+pub fn pigeonhole::Family::compression(self, pigeonhole::Compression) -> Self
+pub fn pigeonhole::Family::counter() -> Self
+pub fn pigeonhole::Family::max_versions(self, u32) -> Self
+pub fn pigeonhole::Family::merge_operator(self, &str) -> Self
+pub fn pigeonhole::Family::ttl(self, core::time::Duration) -> Self
+#[non_exhaustive] pub struct pigeonhole::FamilyInfo
+pub pigeonhole::FamilyInfo::blob_threshold: u32
+pub pigeonhole::FamilyInfo::block_size: u32
+pub pigeonhole::FamilyInfo::bloom_bits: u8
+pub pigeonhole::FamilyInfo::cache_priority: pigeonhole::Priority
+pub pigeonhole::FamilyInfo::compaction: pigeonhole::Compaction
+pub pigeonhole::FamilyInfo::compression: pigeonhole::Compression
+pub pigeonhole::FamilyInfo::counter: bool
+pub pigeonhole::FamilyInfo::family: pigeonhole::Family
+pub pigeonhole::FamilyInfo::max_versions: u32
+pub pigeonhole::FamilyInfo::merge_operator: core::option::Option<alloc::string::String>
+pub pigeonhole::FamilyInfo::name: alloc::string::String
+pub pigeonhole::FamilyInfo::ttl: core::option::Option<core::time::Duration>
+#[non_exhaustive] pub struct pigeonhole::FamilyStorage
+pub pigeonhole::FamilyStorage::blob_bytes: u64
+pub pigeonhole::FamilyStorage::blob_files: u64
+pub pigeonhole::FamilyStorage::blob_live_bytes: u64
+pub pigeonhole::FamilyStorage::family: alloc::string::String
+pub pigeonhole::FamilyStorage::levels: alloc::vec::Vec<pigeonhole::LevelInfo>
+impl pigeonhole::FamilyStorage
+pub fn pigeonhole::FamilyStorage::sst_bytes(&self) -> u64
+pub fn pigeonhole::FamilyStorage::ssts(&self) -> u64
+#[non_exhaustive] pub struct pigeonhole::FileFeatures
+pub pigeonhole::FileFeatures::compat: u64
+pub pigeonhole::FileFeatures::incompat: u64
+pub pigeonhole::FileFeatures::ro_compat: u64
+#[non_exhaustive] pub struct pigeonhole::Finding
+pub pigeonhole::Finding::message: alloc::string::String
+pub pigeonhole::Finding::object: core::option::Option<u64>
+pub pigeonhole::Finding::offset: core::option::Option<u64>
+pub pigeonhole::Finding::severity: pigeonhole::Severity
+pub pigeonhole::Finding::structure: pigeonhole::Structure
+#[non_exhaustive] pub struct pigeonhole::IoRings
+pub pigeonhole::IoRings::attach_failures: u64
+pub pigeonhole::IoRings::inline: u64
+pub pigeonhole::IoRings::rings: usize
+#[non_exhaustive] pub struct pigeonhole::LevelInfo
+pub pigeonhole::LevelInfo::bytes: u64
+pub pigeonhole::LevelInfo::entries: u64
+pub pigeonhole::LevelInfo::level: u8
+pub pigeonhole::LevelInfo::ssts: u64
+#[non_exhaustive] pub struct pigeonhole::MergeError
+pub pigeonhole::MergeError::message: alloc::string::String
+pub pigeonhole::MergeError::operator: alloc::string::String
+impl pigeonhole::MergeError
+pub fn pigeonhole::MergeError::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::error::Error for pigeonhole::MergeError
+impl core::fmt::Display for pigeonhole::MergeError
+pub fn pigeonhole::MergeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole::Options
+impl pigeonhole::Options
+pub fn pigeonhole::Options::adaptive_shard_threads(self, bool) -> Self
+pub fn pigeonhole::Options::allow_fuse(self, bool) -> Self
+pub fn pigeonhole::Options::auto_recover(self, pigeonhole::Recovery) -> Self
+pub fn pigeonhole::Options::background_workers(self, usize) -> Self
+pub fn pigeonhole::Options::block_cache(self, usize) -> Self
+pub fn pigeonhole::Options::compaction_cores(self, usize) -> Self
+pub fn pigeonhole::Options::cpu_profile(self, pigeonhole::CpuProfile) -> Self
+pub fn pigeonhole::Options::create_if_missing(self, bool) -> Self
+pub fn pigeonhole::Options::direct_io(self, bool) -> Self
+pub fn pigeonhole::Options::durability(self, pigeonhole::Durability) -> Self
+pub fn pigeonhole::Options::io_backend(self, pigeonhole::IoBackend) -> Self
+pub fn pigeonhole::Options::memtable_budget(self, u64) -> Self
+pub fn pigeonhole::Options::merge_operator(self, alloc::rcs::arc::Arc<dyn pigeonhole::MergeOperator>) -> Self
+pub fn pigeonhole::Options::pin_threads(self, bool) -> Self
+pub fn pigeonhole::Options::read_only_fallback(self, bool) -> Self
+pub fn pigeonhole::Options::reader_slots(self, u32) -> Self
+pub fn pigeonhole::Options::row_cache(self, usize) -> Self
+pub fn pigeonhole::Options::row_cache_family(self, &str, &str) -> Self
+pub fn pigeonhole::Options::row_cache_max_row(self, usize) -> Self
+pub fn pigeonhole::Options::shard_threads(self, usize) -> Self
+pub fn pigeonhole::Options::shards(self, usize) -> Self
+pub fn pigeonhole::Options::shm_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+pub fn pigeonhole::Options::write_stall_timeout(self, core::time::Duration) -> Self
+impl core::default::Default for pigeonhole::Options
+pub fn pigeonhole::Options::default() -> Self
+pub struct pigeonhole::Pigeonhole
+impl pigeonhole::Pigeonhole
+pub fn pigeonhole::Pigeonhole::backup(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
+pub fn pigeonhole::Pigeonhole::backup_durable(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
+pub fn pigeonhole::Pigeonhole::close(self) -> pigeonhole::Result<()>
+pub fn pigeonhole::Pigeonhole::compact(&self) -> pigeonhole::Result<()>
+pub fn pigeonhole::Pigeonhole::default_durability(&self) -> pigeonhole::Durability
+pub fn pigeonhole::Pigeonhole::drop_table(&self, &str) -> pigeonhole::Result<()>
+pub fn pigeonhole::Pigeonhole::durable_snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
+pub fn pigeonhole::Pigeonhole::engine_metrics(&self) -> pigeonhole::EngineMetrics
+pub fn pigeonhole::Pigeonhole::failure(&self) -> core::option::Option<pigeonhole::Failure>
+pub fn pigeonhole::Pigeonhole::flush(&self) -> pigeonhole::Result<()>
+pub fn pigeonhole::Pigeonhole::info(&self) -> pigeonhole::Result<pigeonhole::DatabaseInfo>
+pub fn pigeonhole::Pigeonhole::io_rings(&self) -> core::option::Option<pigeonhole::IoRings>
+pub fn pigeonhole::Pigeonhole::is_failed(&self) -> bool
+pub fn pigeonhole::Pigeonhole::open(impl core::convert::AsRef<std::path::Path>, pigeonhole::Options) -> pigeonhole::Result<pigeonhole::Pigeonhole>
+pub fn pigeonhole::Pigeonhole::open_application_owned(impl core::convert::AsRef<std::path::Path>, pigeonhole::Options) -> pigeonhole::Result<pigeonhole::AppOwned>
+pub fn pigeonhole::Pigeonhole::open_reader(impl core::convert::AsRef<std::path::Path>, pigeonhole::ReaderOptions) -> pigeonhole::Result<pigeonhole::PigeonholeReader>
+pub fn pigeonhole::Pigeonhole::recovery_stats(&self) -> pigeonhole::RecoveryStats
+pub fn pigeonhole::Pigeonhole::row_cache_stats(&self) -> pigeonhole::RowCacheStats
+pub fn pigeonhole::Pigeonhole::set_default_durability(&self, pigeonhole::Durability)
+pub fn pigeonhole::Pigeonhole::shrink(&self) -> pigeonhole::Result<u64>
+pub fn pigeonhole::Pigeonhole::snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
+pub fn pigeonhole::Pigeonhole::table(&self, &str) -> pigeonhole::Result<pigeonhole::TableBuilder<'_>>
+pub fn pigeonhole::Pigeonhole::tables(&self) -> alloc::vec::Vec<alloc::string::String>
+pub fn pigeonhole::Pigeonhole::transaction(&self) -> pigeonhole::Result<pigeonhole::Transaction>
+pub fn pigeonhole::Pigeonhole::write_batch(&self) -> pigeonhole::WriteBatch
+impl pigeonhole::Pigeonhole
+pub fn pigeonhole::Pigeonhole::compact_async(&self) -> pigeonhole::nonblocking::MaintenanceFuture
+pub fn pigeonhole::Pigeonhole::flush_async(&self) -> pigeonhole::nonblocking::MaintenanceFuture
+impl pigeonhole::Pigeonhole
+pub fn pigeonhole::Pigeonhole::transact<T, E>(&self, &pigeonhole::RetryPolicy, impl core::ops::function::FnMut(&mut pigeonhole::Transaction) -> core::result::Result<T, E>) -> core::result::Result<(T, pigeonhole::CommitInfo), E> where E: core::convert::From<pigeonhole::Error>
+pub struct pigeonhole::PigeonholeReader
+impl pigeonhole::PigeonholeReader
+pub fn pigeonhole::PigeonholeReader::async_sync_reads(&self) -> u64
+pub fn pigeonhole::PigeonholeReader::backup(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
+pub fn pigeonhole::PigeonholeReader::backup_durable(&self, impl core::convert::AsRef<std::path::Path>) -> pigeonhole::Result<()>
+pub fn pigeonhole::PigeonholeReader::durable_snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
+pub fn pigeonhole::PigeonholeReader::info(&self) -> pigeonhole::Result<pigeonhole::DatabaseInfo>
+pub fn pigeonhole::PigeonholeReader::io_rings(&self) -> core::option::Option<pigeonhole::IoRings>
+pub fn pigeonhole::PigeonholeReader::row_cache_stats(&self) -> pigeonhole::RowCacheStats
+pub fn pigeonhole::PigeonholeReader::snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
+pub fn pigeonhole::PigeonholeReader::table(&self, &str) -> pigeonhole::Result<pigeonhole::ReadTable>
+pub fn pigeonhole::PigeonholeReader::tables(&self) -> alloc::vec::Vec<alloc::string::String>
+pub struct pigeonhole::ReadTable
+impl pigeonhole::ReadTable
+pub fn pigeonhole::ReadTable::families(&self) -> alloc::vec::Vec<&str>
+pub fn pigeonhole::ReadTable::family_info(&self, &str) -> core::option::Option<pigeonhole::FamilyInfo>
+pub fn pigeonhole::ReadTable::get(&self, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
+pub fn pigeonhole::ReadTable::get_async(&self, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
+pub fn pigeonhole::ReadTable::get_at(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
+pub fn pigeonhole::ReadTable::get_at_async(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
+pub fn pigeonhole::ReadTable::name(&self) -> &str
+pub fn pigeonhole::ReadTable::row<'t>(&'t self, &[u8]) -> pigeonhole::RowRead<'t>
+pub fn pigeonhole::ReadTable::scan<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(&self, impl core::ops::range::RangeBounds<&'k K>) -> pigeonhole::Scan<'_>
+pub fn pigeonhole::ReadTable::scan_bounds(&self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> pigeonhole::Scan<'_>
+pub fn pigeonhole::ReadTable::scan_prefix(&self, &[u8]) -> pigeonhole::Scan<'_>
+pub struct pigeonhole::ReaderOptions
+impl pigeonhole::ReaderOptions
+pub fn pigeonhole::ReaderOptions::allow_fuse(self, bool) -> Self
+pub fn pigeonhole::ReaderOptions::block_cache(self, usize) -> Self
+pub fn pigeonhole::ReaderOptions::direct_io(self, bool) -> Self
+pub fn pigeonhole::ReaderOptions::io_backend(self, pigeonhole::IoBackend) -> Self
+pub fn pigeonhole::ReaderOptions::merge_operator(self, alloc::rcs::arc::Arc<dyn pigeonhole::MergeOperator>) -> Self
+pub fn pigeonhole::ReaderOptions::row_cache(self, usize) -> Self
+pub fn pigeonhole::ReaderOptions::row_cache_family(self, &str, &str) -> Self
+pub fn pigeonhole::ReaderOptions::row_cache_max_row(self, usize) -> Self
+pub fn pigeonhole::ReaderOptions::shm_dir(self, impl core::convert::Into<std::path::PathBuf>) -> Self
+#[non_exhaustive] pub struct pigeonhole::RecoveryStats
+pub pigeonhole::RecoveryStats::gave_up: bool
+pub pigeonhole::RecoveryStats::generation: u64
+pub pigeonhole::RecoveryStats::last_failure: core::option::Option<pigeonhole::Failure>
+pub pigeonhole::RecoveryStats::last_recovery: core::time::Duration
+pub pigeonhole::RecoveryStats::recoveries: u64
+#[non_exhaustive] pub struct pigeonhole::Region
+pub pigeonhole::Region::kind: pigeonhole::RegionKind
+pub pigeonhole::Region::len: u64
+pub pigeonhole::Region::offset: u64
+pub struct pigeonhole::RetryPolicy
+impl pigeonhole::RetryPolicy
+pub fn pigeonhole::RetryPolicy::backoff(self, core::time::Duration, core::time::Duration) -> Self
+pub fn pigeonhole::RetryPolicy::deadline(self, core::time::Duration) -> Self
+pub fn pigeonhole::RetryPolicy::delay(&self, u32) -> core::time::Duration
+pub fn pigeonhole::RetryPolicy::durability(self, pigeonhole::Durability) -> Self
+pub fn pigeonhole::RetryPolicy::max_attempts(self, u32) -> Self
+pub fn pigeonhole::RetryPolicy::next_pause(&self, pigeonhole::ErrorCode, u32, core::time::Duration) -> core::option::Option<core::time::Duration>
+pub fn pigeonhole::RetryPolicy::no_deadline(self) -> Self
+pub fn pigeonhole::RetryPolicy::retries(&self, &pigeonhole::Error) -> bool
+pub fn pigeonhole::RetryPolicy::retries_code(&self, pigeonhole::ErrorCode) -> bool
+pub fn pigeonhole::RetryPolicy::retry_busy(self, bool) -> Self
+pub fn pigeonhole::RetryPolicy::unlimited_attempts(self) -> Self
+impl core::default::Default for pigeonhole::RetryPolicy
+pub fn pigeonhole::RetryPolicy::default() -> Self
+pub struct pigeonhole::Row
+impl pigeonhole::Row
+pub fn pigeonhole::Row::entry(&self, usize) -> core::option::Option<pigeonhole::CellEntry<'_>>
+pub fn pigeonhole::Row::get(&self, &str, &[u8]) -> core::option::Option<&pigeonhole::Cell>
+pub fn pigeonhole::Row::is_empty(&self) -> bool
+pub fn pigeonhole::Row::key(&self) -> &[u8]
+pub fn pigeonhole::Row::len(&self) -> usize
+pub fn pigeonhole::Row::view(&self) -> pigeonhole::RowRef<'_>
+#[non_exhaustive] pub struct pigeonhole::RowCacheStats
+pub pigeonhole::RowCacheStats::fills: u64
+pub pigeonhole::RowCacheStats::hits: u64
+pub pigeonhole::RowCacheStats::misses: u64
+pub pigeonhole::RowCacheStats::write_throughs: u64
+pub struct pigeonhole::RowIter<'t>
+impl pigeonhole::RowIter<'_>
+pub fn pigeonhole::RowIter<'_>::next_ref(&mut self) -> pigeonhole::Result<core::option::Option<pigeonhole::RowRef<'_>>>
+impl core::iter::traits::iterator::Iterator for pigeonhole::RowIter<'_>
+pub type pigeonhole::RowIter<'_>::Item = core::result::Result<pigeonhole::Row, pigeonhole::Error>
+pub fn pigeonhole::RowIter<'_>::next(&mut self) -> core::option::Option<Self::Item>
+pub struct pigeonhole::RowMutation<'t>
+impl pigeonhole::RowMutation<'_>
+pub fn pigeonhole::RowMutation<'_>::commit(self) -> pigeonhole::Result<pigeonhole::CommitInfo>
+pub fn pigeonhole::RowMutation<'_>::commit_if(self, &pigeonhole::Condition) -> pigeonhole::Result<core::option::Option<pigeonhole::CommitInfo>>
+pub fn pigeonhole::RowMutation<'_>::delete_cell(self, &str, &[u8], u64) -> Self
+pub fn pigeonhole::RowMutation<'_>::delete_column(self, &str, &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::delete_family(self, &str) -> Self
+pub fn pigeonhole::RowMutation<'_>::delete_row(self) -> Self
+pub fn pigeonhole::RowMutation<'_>::durability(self, pigeonhole::Durability) -> Self
+pub fn pigeonhole::RowMutation<'_>::incr(self, &str, &[u8], i64) -> Self
+pub fn pigeonhole::RowMutation<'_>::incr_at(self, &str, &[u8], u64, i64) -> Self
+pub fn pigeonhole::RowMutation<'_>::merge(self, &str, &[u8], &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put(self, &str, &[u8], &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_at(self, &str, &[u8], u64, &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_f64(self, &str, &[u8], f64) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_f64_at(self, &str, &[u8], u64, f64) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_i64(self, &str, &[u8], i64) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_i64_at(self, &str, &[u8], u64, i64) -> Self
+impl pigeonhole::RowMutation<'_>
+pub fn pigeonhole::RowMutation<'_>::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
+impl pigeonhole::RowMutation<'_>
+pub fn pigeonhole::RowMutation<'_>::commit_if_async(self, &pigeonhole::Condition) -> pigeonhole::nonblocking::CheckFuture
+pub struct pigeonhole::RowRead<'t>
+impl pigeonhole::RowRead<'_>
+pub fn pigeonhole::RowRead<'_>::read_async(self) -> pigeonhole::nonblocking::RowFuture
+impl<'t> pigeonhole::RowRead<'t>
+pub fn pigeonhole::RowRead<'t>::column_limit(self, u32) -> Self
+pub fn pigeonhole::RowRead<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
+pub fn pigeonhole::RowRead<'t>::family(self, &str) -> Self
+pub fn pigeonhole::RowRead<'t>::latest(self) -> Self
+pub fn pigeonhole::RowRead<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> Self
+pub fn pigeonhole::RowRead<'t>::qualifier_prefix(self, &[u8]) -> Self
+pub fn pigeonhole::RowRead<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
+pub fn pigeonhole::RowRead<'t>::read(self) -> pigeonhole::Result<core::option::Option<pigeonhole::RowRef<'t>>>
+pub fn pigeonhole::RowRead<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
+pub fn pigeonhole::RowRead<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
+pub fn pigeonhole::RowRead<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
+pub fn pigeonhole::RowRead<'t>::versions(self, u32) -> Self
+pub struct pigeonhole::RowRef<'a>
+impl<'a> pigeonhole::RowRef<'a>
+pub fn pigeonhole::RowRef<'a>::entry(&self, usize) -> core::option::Option<pigeonhole::CellEntry<'_>>
+pub fn pigeonhole::RowRef<'a>::get(&self, &str, &[u8]) -> core::option::Option<pigeonhole::CellRef<'_>>
+pub fn pigeonhole::RowRef<'a>::is_empty(&self) -> bool
+pub fn pigeonhole::RowRef<'a>::iter(&self) -> impl core::iter::traits::iterator::Iterator<Item = pigeonhole::CellEntry<'_>> + '_
+pub fn pigeonhole::RowRef<'a>::key(&self) -> &[u8]
+pub fn pigeonhole::RowRef<'a>::len(&self) -> usize
+pub fn pigeonhole::RowRef<'a>::to_owned(&self) -> pigeonhole::Row
+pub struct pigeonhole::Scan<'t>
+impl<'t> pigeonhole::Scan<'t>
+pub fn pigeonhole::Scan<'t>::column_limit(self, u32) -> Self
+pub fn pigeonhole::Scan<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
+pub fn pigeonhole::Scan<'t>::family(self, &str) -> Self
+pub fn pigeonhole::Scan<'t>::into_owned(self) -> pigeonhole::Scan<'static>
+pub fn pigeonhole::Scan<'t>::iter(self) -> pigeonhole::Result<pigeonhole::RowIter<'t>>
+pub fn pigeonhole::Scan<'t>::latest(self) -> Self
+pub fn pigeonhole::Scan<'t>::limit(self, u64) -> Self
+pub fn pigeonhole::Scan<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> Self
+pub fn pigeonhole::Scan<'t>::qualifier_prefix(self, &[u8]) -> Self
+pub fn pigeonhole::Scan<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
+pub fn pigeonhole::Scan<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
+pub fn pigeonhole::Scan<'t>::stream(self) -> pigeonhole::nonblocking::RowStream<'t>
+pub fn pigeonhole::Scan<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
+pub fn pigeonhole::Scan<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
+pub fn pigeonhole::Scan<'t>::versions(self, u32) -> Self
+pub struct pigeonhole::Shard
+impl pigeonhole::Shard
+pub fn pigeonhole::Shard::closed(&self) -> core::option::Option<pigeonhole::Result<()>>
+pub fn pigeonhole::Shard::index(&self) -> usize
+pub fn pigeonhole::Shard::io_fd(&self) -> core::option::Option<i32>
+pub fn pigeonhole::Shard::next_wakeup(&self) -> core::option::Option<core::time::Duration>
+pub fn pigeonhole::Shard::release(&mut self)
+pub fn pigeonhole::Shard::run_once(&mut self, core::time::Duration) -> bool
+pub fn pigeonhole::Shard::set_wakeup(&mut self, alloc::boxed::Box<(dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync)>)
+pub fn pigeonhole::Shard::wait(&mut self, core::time::Duration)
+pub fn pigeonhole::Shard::waker(&self) -> core::task::wake::Waker
+pub struct pigeonhole::Snapshot
+impl pigeonhole::Snapshot
+pub fn pigeonhole::Snapshot::seqno(&self) -> u64
+pub struct pigeonhole::Table
+impl pigeonhole::Table
+pub fn pigeonhole::Table::families(&self) -> alloc::vec::Vec<&str>
+pub fn pigeonhole::Table::family_info(&self, &str) -> core::option::Option<pigeonhole::FamilyInfo>
+pub fn pigeonhole::Table::get(&self, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
+pub fn pigeonhole::Table::get_async(&self, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
+pub fn pigeonhole::Table::get_at(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
+pub fn pigeonhole::Table::get_at_async(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
+pub fn pigeonhole::Table::mutate<'t>(&'t self, &[u8]) -> pigeonhole::RowMutation<'t>
+pub fn pigeonhole::Table::name(&self) -> &str
+pub fn pigeonhole::Table::row<'t>(&'t self, &[u8]) -> pigeonhole::RowRead<'t>
+pub fn pigeonhole::Table::scan<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(&self, impl core::ops::range::RangeBounds<&'k K>) -> pigeonhole::Scan<'_>
+pub fn pigeonhole::Table::scan_bounds(&self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> pigeonhole::Scan<'_>
+pub fn pigeonhole::Table::scan_prefix(&self, &[u8]) -> pigeonhole::Scan<'_>
+pub fn pigeonhole::Table::shard_of(&self, &[u8]) -> core::option::Option<usize>
+pub struct pigeonhole::TableBuilder<'db>
+impl pigeonhole::TableBuilder<'_>
+pub fn pigeonhole::TableBuilder<'_>::create(self) -> pigeonhole::Result<pigeonhole::Table>
+pub fn pigeonhole::TableBuilder<'_>::create_if_missing(self) -> pigeonhole::Result<pigeonhole::Table>
+pub fn pigeonhole::TableBuilder<'_>::family(self, &str, pigeonhole::Family) -> Self
+pub fn pigeonhole::TableBuilder<'_>::open(self) -> pigeonhole::Result<pigeonhole::Table>
+#[non_exhaustive] pub struct pigeonhole::TableInfo
+pub pigeonhole::TableInfo::families: alloc::vec::Vec<pigeonhole::FamilyInfo>
+pub pigeonhole::TableInfo::name: alloc::string::String
+pub pigeonhole::TableInfo::storage: alloc::vec::Vec<pigeonhole::FamilyStorage>
+pub pigeonhole::TableInfo::tablets: usize
+pub struct pigeonhole::Transaction
+impl pigeonhole::Transaction
+pub fn pigeonhole::Transaction::commit(self) -> pigeonhole::Result<pigeonhole::CommitInfo>
+pub fn pigeonhole::Transaction::commit_with(self, pigeonhole::Durability) -> pigeonhole::Result<pigeonhole::CommitInfo>
+pub fn pigeonhole::Transaction::delete_cell(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self
+pub fn pigeonhole::Transaction::delete_column(&mut self, &pigeonhole::Table, &[u8], &str, &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::delete_family(&mut self, &pigeonhole::Table, &[u8], &str) -> &mut Self
+pub fn pigeonhole::Transaction::delete_row(&mut self, &pigeonhole::Table, &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::get(&mut self, &pigeonhole::Table, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
+pub fn pigeonhole::Transaction::get_async(&mut self, &pigeonhole::Table, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
+pub fn pigeonhole::Transaction::get_row(&mut self, &pigeonhole::Table, &[u8], &[&str]) -> pigeonhole::Result<core::option::Option<pigeonhole::RowRef<'_>>>
+pub fn pigeonhole::Transaction::incr(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], i64) -> &mut Self
+pub fn pigeonhole::Transaction::incr_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
+pub fn pigeonhole::Transaction::merge(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::put(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::put_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::put_f64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], f64) -> &mut Self
+pub fn pigeonhole::Transaction::put_f64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, f64) -> &mut Self
+pub fn pigeonhole::Transaction::put_i64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], i64) -> &mut Self
+pub fn pigeonhole::Transaction::put_i64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
+impl pigeonhole::Transaction
+pub fn pigeonhole::Transaction::commit_async(self) -> pigeonhole::nonblocking::TransactionCommitFuture
+pub fn pigeonhole::Transaction::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::TransactionCommitFuture
+#[non_exhaustive] pub struct pigeonhole::WalFile
+pub pigeonhole::WalFile::checkpoint: pigeonhole::WalPosition
+pub pigeonhole::WalFile::end: pigeonhole::WalPosition
+pub pigeonhole::WalFile::len: u64
+pub pigeonhole::WalFile::path: std::path::PathBuf
+pub pigeonhole::WalFile::records: u64
+pub pigeonhole::WalFile::segment_size: u64
+pub pigeonhole::WalFile::segments: u64
+pub pigeonhole::WalFile::stream: u32
+#[non_exhaustive] pub struct pigeonhole::WalPosition
+pub pigeonhole::WalPosition::epoch: u32
+pub pigeonhole::WalPosition::offset: u64
+pub struct pigeonhole::WriteBatch
+impl pigeonhole::WriteBatch
+pub fn pigeonhole::WriteBatch::commit(self) -> pigeonhole::Result<pigeonhole::CommitInfo>
+pub fn pigeonhole::WriteBatch::commit_with(self, pigeonhole::Durability) -> pigeonhole::Result<pigeonhole::CommitInfo>
+pub fn pigeonhole::WriteBatch::commit_with_ticket(self, pigeonhole::Durability) -> pigeonhole::Result<pigeonhole::CommitTicket>
+pub fn pigeonhole::WriteBatch::delete_cell(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self
+pub fn pigeonhole::WriteBatch::delete_column(&mut self, &pigeonhole::Table, &[u8], &str, &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::delete_family(&mut self, &pigeonhole::Table, &[u8], &str) -> &mut Self
+pub fn pigeonhole::WriteBatch::delete_row(&mut self, &pigeonhole::Table, &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::incr(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], i64) -> &mut Self
+pub fn pigeonhole::WriteBatch::incr_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
+pub fn pigeonhole::WriteBatch::is_empty(&self) -> bool
+pub fn pigeonhole::WriteBatch::len(&self) -> usize
+pub fn pigeonhole::WriteBatch::merge(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_f64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], f64) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_f64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, f64) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_i64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], i64) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_i64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
+impl pigeonhole::WriteBatch
+pub fn pigeonhole::WriteBatch::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
+pub fn pigeonhole::WriteBatch::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::CommitFuture
+pub trait pigeonhole::MergeOperator: core::marker::Send + core::marker::Sync + core::fmt::Debug
+pub fn pigeonhole::MergeOperator::finish(&self, core::option::Option<&[u8]>, &mut alloc::vec::Vec<u8>) -> core::result::Result<(), pigeonhole::MergeError>
+pub fn pigeonhole::MergeOperator::merge(&self, &mut alloc::vec::Vec<u8>, &[u8]) -> core::result::Result<(), pigeonhole::MergeError>
+pub fn pigeonhole::MergeOperator::name(&self) -> &str
+pub fn pigeonhole::check(impl core::convert::AsRef<std::path::Path>, pigeonhole::CheckOptions) -> pigeonhole::Result<pigeonhole::CheckReport>
+pub fn pigeonhole::days(u64) -> core::time::Duration
+pub type pigeonhole::Result<T, E> = core::result::Result<T, E>

@@ -1,11 +1,11 @@
 //! Application-owned background workers through the public API (D284, ICR 0078):
-//! `open_application_owned_with`, `AppOwned::spawn_background_threads`, a worker the
+//! `open_application_owned`, `AppOwned::spawn_background_threads`, a worker the
 //! application never drives, and the options the other opens refuse or ignore.
 
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pigeonhole::{ErrorCode, Family, Options, Pigeonhole, Shard};
+use pigeonhole::{Family, Options, Pigeonhole, Shard};
 
 /// A temporary directory, removed on drop.
 struct TempDir(std::path::PathBuf);
@@ -68,8 +68,7 @@ fn flushes_run_on_spawned_worker_threads_and_the_close_ends_them() {
     let _watchdog = Watchdog::new("spawned workers", 120);
     let dir = TempDir::new("spawned");
     let options = Options::default().shards(2).background_workers(2);
-    let mut owned =
-        Pigeonhole::open_application_owned_with(dir.0.join("db.phdb"), options).unwrap();
+    let mut owned = Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).unwrap();
     assert_eq!(owned.shards.len(), 2);
     assert_eq!(owned.workers.len(), 2);
     let workers = owned.spawn_background_threads().unwrap();
@@ -124,8 +123,7 @@ fn a_worker_nobody_drives_delays_its_flush_until_the_shard_takes_it_back() {
     let _watchdog = Watchdog::new("undriven worker", 120);
     let dir = TempDir::new("undriven");
     let options = Options::default().shards(1).background_workers(1);
-    let mut owned =
-        Pigeonhole::open_application_owned_with(dir.0.join("db.phdb"), options).unwrap();
+    let mut owned = Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).unwrap();
     // Kept, never driven.
     let worker = owned.workers.pop().unwrap();
     let shards: Vec<_> = owned.shards.drain(..).map(drive).collect();
@@ -162,8 +160,7 @@ fn a_worker_driven_by_hand_runs_until_the_close() {
     let _watchdog = Watchdog::new("hand-driven worker", 120);
     let dir = TempDir::new("byhand");
     let options = Options::default().shards(1).background_workers(1);
-    let mut owned =
-        Pigeonhole::open_application_owned_with(dir.0.join("db.phdb"), options).unwrap();
+    let mut owned = Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).unwrap();
     let mut worker = owned.workers.pop().unwrap();
     // The commit below waits until the driver has its wakeup set and made a pass: work
     // queued before that wakes nobody, and on a loaded runner the thread can start more
@@ -209,20 +206,15 @@ fn a_worker_driven_by_hand_runs_until_the_close() {
 }
 
 #[test]
-fn the_tuple_open_refuses_workers_and_the_engine_owned_open_ignores_them() {
+fn the_engine_owned_open_ignores_workers_and_zero_workers_hands_none() {
     let dir = TempDir::new("refuse");
     let options = Options::default().shards(1).background_workers(1);
-    let Err(err) = Pigeonhole::open_application_owned(dir.0.join("a.phdb"), options.clone()) else {
-        panic!("refused");
-    };
-    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
-
     let db = Pigeonhole::open(dir.0.join("b.phdb"), options).unwrap();
     db.close().unwrap();
 
-    // Zero workers: the new open behaves as the tuple form.
+    // Zero workers (the default): the application-owned open hands none out (ICR 0088).
     let owned =
-        Pigeonhole::open_application_owned_with(dir.0.join("c.phdb"), Options::default().shards(1))
+        Pigeonhole::open_application_owned(dir.0.join("c.phdb"), Options::default().shards(1))
             .unwrap();
     assert!(owned.workers.is_empty());
     assert_eq!(owned.shards.len(), 1);

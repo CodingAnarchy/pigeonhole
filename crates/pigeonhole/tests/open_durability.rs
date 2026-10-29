@@ -269,9 +269,6 @@ impl Vfs for Counting {
     fn current_process(&self) -> ProcessId {
         self.inner.current_process()
     }
-    fn process_alive(&self, process: ProcessId) -> bool {
-        self.inner.process_alive(process)
-    }
     fn attach_thread(&self) {
         self.inner.attach_thread();
     }

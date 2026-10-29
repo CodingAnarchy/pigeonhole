@@ -768,9 +768,9 @@ impl Pigeonhole {
         Ok(PigeonholeReader { db, cached })
     }
 
-    /// Opens as the writer in application-owned mode: no shard or compaction threads are
-    /// started; drive each returned [`Shard`] from one of your own (typically pinned)
-    /// threads. The default I/O backend still runs a pool of 2-16 I/O threads for WAL syncs
+    /// Opens as the writer in application-owned mode (ICR 0088): no shard or compaction
+    /// threads are started; drive each [`Shard`] in the returned [`AppOwned`] from one of your
+    /// own (typically pinned) threads. The default I/O backend still runs a pool of 2-16 I/O threads for WAL syncs
     /// and reads; a threadless mode is planned for Phase 3. Because no compaction thread
     /// is started, [`Options::compaction_cores`] with `k > 0` is refused with
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) (decision D40).
@@ -803,11 +803,12 @@ impl Pigeonhole {
     /// ```
     /// use std::thread;
     /// use std::time::Duration;
-    /// use pigeonhole::{Family, Options, Pigeonhole};
+    /// use pigeonhole::{AppOwned, Family, Options, Pigeonhole};
     ///
     /// # fn main() -> pigeonhole::Result<()> {
     /// # let dir = pigeonhole::doc_support::temp_dir();
-    /// let (db, shards) = Pigeonhole::open_application_owned(dir.join("app.phdb"), Options::default().shards(2))?;
+    /// let AppOwned { db, shards, .. } =
+    ///     Pigeonhole::open_application_owned(dir.join("app.phdb"), Options::default().shards(2))?;
     /// let threads: Vec<_> = shards
     ///     .into_iter()
     ///     .map(|mut shard| {
@@ -845,21 +846,10 @@ impl Pigeonhole {
     /// # }
     /// ```
     ///
-    /// [`Options::background_workers`] must be 0 here (the open fails with
-    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument) otherwise): use
-    /// [`open_application_owned_with`](Self::open_application_owned_with), which hands the
-    /// workers out.
-    pub fn open_application_owned(
-        path: impl AsRef<Path>,
-        options: Options,
-    ) -> Result<(Pigeonhole, Vec<Shard>)> {
-        let owned = Self::open_app(path.as_ref(), options, false)?;
-        Ok((owned.db, owned.shards))
-    }
-
-    /// As [`open_application_owned`](Self::open_application_owned), also handing out
-    /// [`Options::background_workers`] background workers (D284) for flush and compaction,
-    /// which then run on threads you choose rather than in slices on the shards.
+    /// # Background workers
+    /// With [`Options::background_workers`] above 0 (the default is 0), [`AppOwned::workers`]
+    /// holds that many background workers (D284) for flush and compaction, which then run on
+    /// threads you choose rather than in slices on the shards.
     ///
     /// - **Why:** a flush or compaction slice on a shard holds up every commit queued
     ///   behind it for up to half a millisecond. With workers, the shards only commit.
@@ -890,9 +880,8 @@ impl Pigeonhole {
     /// # fn main() -> pigeonhole::Result<()> {
     /// # let dir = pigeonhole::doc_support::temp_dir();
     /// let options = Options::default().shards(2).background_workers(1);
-    /// let mut owned = Pigeonhole::open_application_owned_with(dir.join("app.phdb"), options)?;
-    /// // Flush and compaction get a thread each; the shards run on yours, as in
-    /// // `open_application_owned`.
+    /// let mut owned = Pigeonhole::open_application_owned(dir.join("app.phdb"), options)?;
+    /// // Flush and compaction get a thread each; the shards run on yours, as above.
     /// let workers = owned.spawn_background_threads()?;
     /// let shards: Vec<_> = owned
     ///     .shards
@@ -932,16 +921,12 @@ impl Pigeonhole {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn open_application_owned_with(
-        path: impl AsRef<Path>,
-        options: Options,
-    ) -> Result<AppOwned> {
-        Self::open_app(path.as_ref(), options, true)
+    pub fn open_application_owned(path: impl AsRef<Path>, options: Options) -> Result<AppOwned> {
+        Self::open_app(path.as_ref(), options)
     }
 
-    /// The application-owned opens: `with_workers` hands the background workers out; without
-    /// it the engine refuses a nonzero count rather than leave them undriven.
-    fn open_app(path: &Path, options: Options, with_workers: bool) -> Result<AppOwned> {
+    /// The application-owned open: the shards and any background workers are handed out.
+    fn open_app(path: &Path, options: Options) -> Result<AppOwned> {
         if options.recovery() != Recovery::Off {
             return Err(Error::new(
                 ErrorCode::InvalidArgument,
@@ -953,15 +938,9 @@ impl Pigeonhole {
         let vfs = Arc::clone(&engine_options.vfs);
         let max_value = max_value(&engine_options);
         let shm = ShmFootprint::of(&engine_options);
-        let (engine, shards, workers) = if with_workers {
-            let owned = Engine::open_application_owned_with(path, engine_options)
-                .map_err(|e| shm.explain(e))?;
-            (owned.engine, owned.shards, owned.workers)
-        } else {
-            let (engine, shards) =
-                Engine::open_application_owned(path, engine_options).map_err(|e| shm.explain(e))?;
-            (engine, shards, Vec::new())
-        };
+        let owned = Engine::open_application_owned_with(path, engine_options)
+            .map_err(|e| shm.explain(e))?;
+        let (engine, shards, workers) = (owned.engine, owned.shards, owned.workers);
         let workers = workers
             .into_iter()
             .map(|inner| BackgroundWorker {
@@ -1145,9 +1124,10 @@ impl Pigeonhole {
     /// The load controller's windows since the last call, one JSON object each (D289,
     /// #1015): every driver's busy, passes, slow passes, ops and sibling wait, the producer
     /// wakes, and what the controller decided. Empty in application-owned mode. The first
-    /// call starts the log; without
-    /// [`Options::adaptive_shard_threads`](crate::Options::adaptive_shard_threads) it starts an
-    /// observe-only controller that logs what it would decide but never resizes. A bench hook.
+    /// call starts the log; with
+    /// [`Options::adaptive_shard_threads`](crate::Options::adaptive_shard_threads) off it starts
+    /// an observe-only controller that logs what it would decide but never resizes. A bench
+    /// hook.
     #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn driver_trace(&self) -> Vec<String> {
@@ -1637,8 +1617,8 @@ impl Snapshot {
     }
 }
 
-/// What [`Pigeonhole::open_application_owned_with`] hands you: the database, its shards
-/// and its background workers (D284). Move the shards and workers out to the threads that
+/// What [`Pigeonhole::open_application_owned`] hands you: the database, its shards and its
+/// background workers (D284; none unless [`Options::background_workers`] asks for them). Move the shards and workers out to the threads that
 /// drive them.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -1706,7 +1686,7 @@ impl AppOwned {
 
 /// A background worker in application-owned mode (D284): it runs flushes and compactions
 /// for every shard. Drive it from any thread with [`run_once`](Self::run_once), as you drive
-/// a [`Shard`]. See [`Pigeonhole::open_application_owned_with`].
+/// a [`Shard`]. See [`Pigeonhole::open_application_owned`].
 ///
 /// Dropping it before the close hands what it holds back to the shards, which run it.
 #[derive(Debug)]
@@ -1800,7 +1780,7 @@ impl Shard {
     ///
     /// let dir = std::env::temp_dir().join(format!("phdb-release-{}", std::process::id()));
     /// std::fs::create_dir_all(&dir).unwrap();
-    /// let (db, mut shards) =
+    /// let pigeonhole::AppOwned { db, mut shards, .. } =
     ///     Pigeonhole::open_application_owned(dir.join("db.phdb"), Options::default().shards(1))?;
     /// let mut shard = shards.pop().unwrap();
     /// shard.run_once(std::time::Duration::from_millis(1));
@@ -1869,7 +1849,7 @@ impl Shard {
     ///
     /// # fn main() -> pigeonhole::Result<()> {
     /// # let dir = pigeonhole::doc_support::temp_dir();
-    /// let (db, mut shards) = Pigeonhole::open_application_owned(dir.join("w.phdb"), Options::default().shards(1))?;
+    /// let pigeonhole::AppOwned { db, mut shards, .. } = Pigeonhole::open_application_owned(dir.join("w.phdb"), Options::default().shards(1))?;
     /// let shard = &mut shards[0];
     /// while shard.run_once(Duration::from_micros(200)) {}
     /// // Idle: only the tablet balancer's next pass is waiting for a time (at most 10 s).
@@ -1929,7 +1909,7 @@ impl Shard {
     /// # fn main() -> pigeonhole::Result<()> {
     /// # let dir = pigeonhole::doc_support::temp_dir();
     /// let options = Options::default().shards(1).io_backend(IoBackend::Auto);
-    /// let (db, mut shards) = Pigeonhole::open_application_owned(dir.join("w.phdb"), options)?;
+    /// let pigeonhole::AppOwned { db, mut shards, .. } = Pigeonhole::open_application_owned(dir.join("w.phdb"), options)?;
     /// let shard = &mut shards[0];
     /// while shard.run_once(Duration::from_micros(200)) {}
     /// if let Some(fd) = shard.io_fd() {
@@ -1960,7 +1940,7 @@ impl Shard {
     ///
     /// # fn main() -> pigeonhole::Result<()> {
     /// # let dir = pigeonhole::doc_support::temp_dir();
-    /// let (db, mut shards) =
+    /// let pigeonhole::AppOwned { db, mut shards, .. } =
     ///     Pigeonhole::open_application_owned(dir.join("w.phdb"), Options::default().shards(1))?;
     /// let shard = &mut shards[0];
     /// for _ in 0..3 {

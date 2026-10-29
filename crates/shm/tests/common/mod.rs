@@ -13,6 +13,8 @@ use std::time::{Duration, Instant};
 
 use pigeonhole_format::shm::{ViewRecord, ViewTablet};
 use pigeonhole_format::{TableId, TabletId};
+use pigeonhole_io::sim::SimVfs;
+use pigeonhole_io::{FileRef, OpenOptions, ProcessId, Vfs};
 use pigeonhole_shm::{ShmConfig, ShmRegion};
 
 /// Database id every test uses.
@@ -168,6 +170,51 @@ impl Rng {
     }
 }
 
+/// A handle on the database file opened as `process`, as a reader (or the writer) holds
+/// one: reader slots take their liveness locks through it, and `SimVfs::crash_process`
+/// closes it, releasing them.
+pub fn file_as(sim: &SimVfs, process: ProcessId) -> FileRef {
+    let before = sim.current_process();
+    sim.enter_process(process);
+    let file = sim
+        .open("/db".as_ref(), OpenOptions::read_write_create())
+        .unwrap();
+    sim.enter_process(before);
+    file
+}
+
+/// Reserves `n` seqnos as the engine's single writer thread would, and returns the first:
+/// the mirror's next seqno is the writer's own, raised past the reservation
+/// (`advance_next_seqno`, D271, ICR 0063). For tests with one writing thread.
+pub fn reserve(shm: &ShmRegion, n: u64) -> u64 {
+    let first = shm.next_seqno();
+    shm.advance_next_seqno(first + n);
+    first
+}
+
+/// The writer process's seqno allocator, as the engine's clock runs it for several shard
+/// threads: reservations under one lock, then the shared mirror raised past each one after
+/// the lock is released (`advance_next_seqno`, a `fetch_max`, so raises arriving out of
+/// order never move it back). The mirror may lag the allocator, never lead it.
+pub struct Seqnos(Mutex<u64>);
+
+impl Seqnos {
+    pub fn new(shm: &ShmRegion) -> Self {
+        Self(Mutex::new(shm.next_seqno()))
+    }
+
+    pub fn reserve(&self, shm: &ShmRegion, n: u64) -> u64 {
+        let first = {
+            let mut next = self.0.lock().unwrap();
+            let first = *next;
+            *next += n;
+            first
+        };
+        shm.advance_next_seqno(first + n);
+        first
+    }
+}
+
 /// Runs one thread per shard for `duration` (or until the seqno budget is spent), each
 /// doing single-shard groups and, now and then, coordinating a cross-shard commit. Returns
 /// the number of seqnos reserved. Stops early if `stop` is set.
@@ -177,6 +224,7 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
         (0..shards).map(|_| channel()).unzip();
     let receivers: Vec<Mutex<Receiver<Share>>> = receivers.into_iter().map(Mutex::new).collect();
     let reserved = AtomicU32::new(0);
+    let seqnos = Seqnos::new(shm);
     // Shards that stopped issuing new commits; a shard exits only once every shard has, so
     // no share it must apply is left behind.
     let stopped = AtomicU32::new(0);
@@ -186,6 +234,7 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
             let senders = &senders;
             let receivers = &receivers;
             let reserved = &reserved;
+            let seqnos = &seqnos;
             let stopped = &stopped;
             let mut rng = Rng(seed ^ (u64::from(shard) << 32));
             scope.spawn(move || {
@@ -241,7 +290,7 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
                         // Cross-shard commit: reserve one seqno, hold it, hand shares out.
                         me.group = Some(shm.next_seqno());
                         me.publish(shm);
-                        let seqno = shm.reserve_seqnos(1);
+                        let seqno = seqnos.reserve(shm, 1);
                         reserved.fetch_add(1, Ordering::Relaxed);
                         me.held.insert(seqno);
                         me.group = None;
@@ -276,7 +325,7 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
                         let n = 1 + rng.below(4);
                         me.group = Some(shm.next_seqno());
                         me.publish(shm);
-                        let first = shm.reserve_seqnos(n);
+                        let first = seqnos.reserve(shm, n);
                         reserved.fetch_add(n as u32, Ordering::Relaxed);
                         me.group = Some(first);
                         me.publish(shm);

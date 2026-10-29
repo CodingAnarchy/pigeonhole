@@ -454,10 +454,6 @@ fn simulated_processes() {
     });
     assert_eq!(seen, reader);
     assert_eq!(vfs.current_process(), main, "other threads are unaffected");
-    assert!(vfs.process_alive(reader));
-    vfs.kill_process(reader);
-    assert!(!vfs.process_alive(reader));
-    assert!(vfs.process_alive(main));
     assert_eq!(vfs.seed(), 12);
 }
 
@@ -495,8 +491,6 @@ fn crashing_one_process_spares_the_others() {
 
     vfs.crash_process(writer);
     assert_eq!(w.write_at(b"x", 0).unwrap_err().kind, ErrorKind::Crashed);
-    assert!(!vfs.process_alive(writer));
-    assert!(vfs.process_alive(reader));
     // The reader keeps working and sees the dead writer's data (still in the kernel).
     let mut buf = [0u8; 8];
     r.read_at(&mut buf, 0).unwrap();

@@ -126,7 +126,18 @@ impl Reading {
     /// the cursor already submitted is resumed, not submitted again, and the first poll
     /// waits on it instead of running the read once more just to find the same miss.
     fn with_missed(mut self, missed: MissedRead) -> Self {
-        if let Some(mut fetch) = missed.0 {
+        if let Some(m) = missed.0 {
+            let Missed {
+                mut fetch,
+                view,
+                seqno,
+                now,
+            } = *m;
+            // The read point of the call: its view keeps the SST the read is in flight in
+            // (and so the extent it reads) from being retired and reused before the read
+            // lands; a view taken later need not hold it (perf287, #1086).
+            self.at = Some(At::Latest { view, seqno });
+            self.now = now;
             self.fetches = 1;
             let completion = fetch.start();
             self.fetch = Some((completion, fetch));
@@ -272,14 +283,23 @@ impl Reading {
 /// [`Engine::try_read_row_latest`](crate::Engine::try_read_row_latest) to
 /// [`Engine::read_row_latest_async_after`](crate::Engine::read_row_latest_async_after).
 #[derive(Debug, Default)]
-pub struct MissedRead(Option<Box<Fetch>>);
+pub struct MissedRead(Option<Box<Missed>>);
+
+/// What [`MissedRead`] carries: the fetch, and the read point of the call that missed.
+#[derive(Debug)]
+struct Missed {
+    fetch: Box<Fetch>,
+    view: Arc<View>,
+    seqno: Seqno,
+    now: Timestamp,
+}
 
 /// A latest read at the call, in a writer process (#709): `attempt` runs once in cache-only
 /// mode under the view's guard, as the sync read reads, with the writer's row cache. Its
 /// result, an error included; or, when it would wait on the device (a page-cache miss the
 /// cursor could not read in place), in a reader process, or when the visible seqno kept
-/// moving, the miss: the future takes it over with its read in flight
-/// ([`Reading::with_missed`]), and takes its own read point on the first poll.
+/// moving, the miss: the future takes it over with its read in flight and the call's read
+/// point ([`Reading::with_missed`]), so the result is as of the call, as a hit's is.
 pub(crate) fn try_latest_now<T>(
     inner: &Inner,
     attempt: impl FnOnce(
@@ -308,7 +328,12 @@ pub(crate) fn try_latest_now<T>(
             .fetch_add(sync_reads, Ordering::Relaxed);
     }
     match r {
-        Err(Error::WouldBlock(fetch)) => Err(MissedRead(Some(fetch))),
+        Err(Error::WouldBlock(fetch)) => Err(MissedRead(Some(Box::new(Missed {
+            fetch,
+            view: arc_swap::Guard::into_inner(view),
+            seqno,
+            now,
+        })))),
         other => Ok(other),
     }
 }

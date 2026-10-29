@@ -1009,9 +1009,10 @@ where
         let stop_at_base = counter && self.opts.versions == 1 && self.opts.time_range.is_none();
         let mut stop = false;
         let mut stop_group = false;
-        // The entries this group read, for D291's checkpoint trigger. Only this group's: a
-        // newer group walked first (hidden, or expired) isn't counted, and needn't be, since
-        // a checkpoint stands in for this group's fold alone.
+        // The entries this group's fold read, for D291's checkpoint trigger: only this group's
+        // (a newer group walked first, hidden or expired, isn't counted, and needn't be, since a
+        // checkpoint stands in for this group's fold alone), and only those at or below the
+        // snapshot.
         let mut steps = 0u64;
         let mut top = None;
         // The first entry is in the column (the caller checked); the loop stops on the first
@@ -1046,12 +1047,15 @@ where
                     (seqno, kind)
                 }
             };
-            if counter {
-                steps += 1;
-            }
             if seqno <= snapshot && seqno >= floor {
-                if counter && top.is_none() {
-                    top = Some(seqno);
+                if counter {
+                    // Only the entries the fold reads count: a checkpoint saves later reads at
+                    // this snapshot those alone, while entries above the snapshot are stepped
+                    // over by every such read either way.
+                    steps += 1;
+                    if top.is_none() {
+                        top = Some(seqno);
+                    }
                 }
                 match kind {
                     Kind::ColumnDelete => {

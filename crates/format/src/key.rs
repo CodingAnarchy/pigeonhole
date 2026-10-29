@@ -135,9 +135,6 @@ impl Kind {
     }
 }
 
-/// Byte placed in the kind position of a seek key; sorts before every real [`Kind`].
-pub const SEEK_KIND: u8 = 0x00;
-
 fn check_part(part: &[u8]) -> crate::Result<()> {
     if part.len() > MAX_KEY_PART {
         Err(Error::KeyTooLarge)
@@ -168,7 +165,7 @@ fn put_suffix(out: &mut Vec<u8>, ts: Timestamp, seqno: Seqno, kind: u8) {
 /// assert!(newer < older); // newer timestamps sort first
 ///
 /// let parts = decode_key(&older).unwrap();
-/// assert!(parts.row.eq_raw(b"row"));
+/// assert_eq!(parts.row.as_escaped(), b"row");
 /// assert_eq!((parts.ts, parts.seqno, parts.kind), (10, 1, Kind::Put));
 /// ```
 pub fn encode_key(
@@ -264,21 +261,6 @@ pub fn encode_column_prefix(out: &mut Vec<u8>, row: &[u8], qualifier: &[u8]) -> 
     encode_row_prefix(out, row)?;
     escape_into(out, qualifier);
     out.extend_from_slice(&TERMINATOR);
-    Ok(())
-}
-
-/// Appends a key that sorts immediately before the newest version of `(row, qualifier)`
-/// visible at `(ts, seqno)`: seeking to it lands on the first entry with timestamp `<= ts`
-/// and, at equal timestamp, seqno `<= seqno`.
-pub fn encode_seek_key(
-    out: &mut Vec<u8>,
-    row: &[u8],
-    qualifier: &[u8],
-    ts: Timestamp,
-    seqno: Seqno,
-) -> crate::Result<()> {
-    encode_column_prefix(out, row, qualifier)?;
-    put_suffix(out, ts, seqno, SEEK_KIND);
     Ok(())
 }
 
@@ -500,25 +482,12 @@ pub fn row_prefix_len(key: &[u8]) -> crate::Result<usize> {
     Ok(scan_escaped(key)?.0 + TERMINATOR.len())
 }
 
-/// Length of the column prefix of `key` (row prefix, escaped qualifier and its terminator,
-/// or the marker bytes). Two keys address the same column iff these prefixes are equal.
-pub fn column_prefix_len(key: &[u8]) -> crate::Result<usize> {
-    let row = row_prefix_len(key)?;
-    let rest = &key[row..];
-    if rest.starts_with(&MARKER_QUALIFIER) {
-        return Ok(row + MARKER_QUALIFIER.len());
-    }
-    Ok(row + scan_escaped(rest)?.0 + TERMINATOR.len())
-}
-
 /// An escaped byte string borrowed from an internal key.
 ///
 /// ```
 /// use pigeonhole_format::key::Escaped;
 ///
 /// let e = Escaped::new(b"a\x00\xFFb");
-/// assert!(!e.is_verbatim());
-/// assert!(e.eq_raw(b"a\x00b"));
 /// let mut raw = Vec::new();
 /// e.unescape_into(&mut raw);
 /// assert_eq!(raw, b"a\x00b");
@@ -535,11 +504,6 @@ impl<'a> Escaped<'a> {
     /// The escaped bytes, as stored.
     pub fn as_escaped(&self) -> &'a [u8] {
         self.0
-    }
-
-    /// Whether the escaped form contains no escape sequences, so it equals the raw bytes.
-    pub fn is_verbatim(&self) -> bool {
-        !self.0.contains(&0)
     }
 
     /// Appends the unescaped bytes to `out`.
@@ -559,11 +523,6 @@ impl<'a> Escaped<'a> {
         } else {
             unescape_runs(self.0, out);
         }
-    }
-
-    /// Compares with raw (unescaped) bytes without allocating.
-    pub fn eq_raw(&self, raw: &[u8]) -> bool {
-        self.raw_bytes().eq(raw.iter().copied())
     }
 
     /// Orders the unescaped bytes against `raw` without allocating.

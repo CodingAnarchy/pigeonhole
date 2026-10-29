@@ -39,6 +39,9 @@ pub(crate) struct Settings {
     pub(crate) no_packing: bool,
     /// Inline page-cache reads (`Options::nowait_reads`, D292); on, the library default.
     pub(crate) no_nowait_reads: bool,
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); on, the library
+    /// default.
+    pub(crate) no_get_fill: bool,
     /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
     /// turns it off.
     pub(crate) row_cache: Option<u64>,
@@ -58,8 +61,9 @@ pub(crate) struct Settings {
     /// `Options::cpu_profile(CpuProfile::Server)` (D289) when set; the embedded default
     /// otherwise.
     pub(crate) server_profile: bool,
-    /// `Options::adaptive_shard_threads(true)` (D289's controller, experimental) when set.
-    pub(crate) adaptive_shard_threads: bool,
+    /// `Options::adaptive_shard_threads` (D289's controller) when set; the library's default
+    /// (on since #1015) otherwise.
+    pub(crate) adaptive_shard_threads: Option<bool>,
     /// Appends the driver controller's windows and the run's phase marks to this file, one
     /// JSON object a line (`Pigeonhole::driver_trace`, #1015).
     pub(crate) driver_trace: Option<std::path::PathBuf>,
@@ -396,6 +400,20 @@ impl PigeonholeRunner {
         self
     }
 
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290, #1059); on without
+    /// a call.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().get_fill(false);
+    /// assert!(r.describe().contains("get-fill=off"));
+    /// ```
+    pub fn get_fill(mut self, yes: bool) -> Self {
+        self.settings.no_get_fill = !yes;
+        self
+    }
+
     /// Row cache bytes (`Options::row_cache`, D201); 0 turns it off. Without a call the
     /// library default applies (on, D216), and the description names no row cache, so runs
     /// stay comparable with results from before D216 under the same key.
@@ -434,9 +452,11 @@ impl PigeonholeRunner {
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
     ///
-    /// assert!(!PigeonholeRunner::default().describe().contains("shard_threads"));
+    /// assert!(!PigeonholeRunner::default().describe().contains("shard_threads=4"));
     /// let r = PigeonholeRunner::default().shard_threads(4);
+    /// // A fixed count turns the load controller off: no adaptive label beside it.
     /// assert!(r.describe().contains(" shard_threads=4"));
+    /// assert!(!r.describe().contains("adaptive"));
     /// ```
     pub fn shard_threads(mut self, k: usize) -> Self {
         self.settings.shard_threads = Some(k);
@@ -472,25 +492,41 @@ impl PigeonholeRunner {
         self
     }
 
-    /// D289's load controller sizes the shard threads
-    /// (`Options::adaptive_shard_threads(true)`, experimental).
+    /// D289's load controller sizes the shard threads, set explicitly
+    /// (`Options::adaptive_shard_threads(true)`, the library's default since #1015).
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
     ///
-    /// assert!(!PigeonholeRunner::default().describe().contains("adaptive"));
+    /// // The library's default, labelled as such: earlier unlabelled baselines ran a thread
+    /// // per shard.
+    /// assert!(PigeonholeRunner::default().describe().contains(" shard_threads=adaptive"));
     /// let r = PigeonholeRunner::default().adaptive_shard_threads();
     /// assert!(r.describe().contains(" shard_threads=adaptive"));
     /// ```
     pub fn adaptive_shard_threads(mut self) -> Self {
-        self.settings.adaptive_shard_threads = true;
+        self.settings.adaptive_shard_threads = Some(true);
+        self
+    }
+
+    /// A thread per shard, never resized (`Options::adaptive_shard_threads(false)`): the
+    /// behaviour before the controller became the default, for A/B runs.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().fixed_shard_threads();
+    /// assert!(r.describe().contains(" shard_threads=per-shard"));
+    /// ```
+    pub fn fixed_shard_threads(mut self) -> Self {
+        self.settings.adaptive_shard_threads = Some(false);
         self
     }
 
     /// Appends the driver controller's windows to `path`, one JSON object a line, with the
-    /// run's phase marks between them (`Pigeonhole::driver_trace`, #1015). Without
-    /// [`adaptive_shard_threads`](Self::adaptive_shard_threads) the controller observes:
-    /// it logs what it would decide but never resizes.
+    /// run's phase marks between them (`Pigeonhole::driver_trace`, #1015). With
+    /// [`fixed_shard_threads`](Self::fixed_shard_threads) the controller observes: it logs
+    /// what it would decide but never resizes.
     pub fn driver_trace(mut self, path: impl Into<std::path::PathBuf>) -> Self {
         self.settings.driver_trace = Some(path.into());
         self
@@ -761,6 +797,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.no_nowait_reads {
         options = options.nowait_reads(false);
     }
+    if s.no_get_fill {
+        options = options.row_cache_get_fill(false);
+    }
     if let Some(n) = s.shards {
         options = options.shards(n);
     }
@@ -777,8 +816,8 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.server_profile {
         options = options.cpu_profile(pigeonhole::CpuProfile::Server);
     }
-    if s.adaptive_shard_threads {
-        options = options.adaptive_shard_threads(true);
+    if let Some(on) = s.adaptive_shard_threads {
+        options = options.adaptive_shard_threads(on);
     }
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
@@ -1073,6 +1112,11 @@ impl Runner for PigeonholeRunner {
             || format!("default({})", pigeonhole_io::sys::default_shards()),
             |n| n.to_string(),
         );
+        let reads = format!(
+            "{}{}",
+            if s.no_nowait_reads { " nowait=off" } else { "" },
+            if s.no_get_fill { " get-fill=off" } else { "" }
+        );
         format!(
             "shards={shards} memtable={}MiB cache={} bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
             s.memory.write_buffer >> 20,
@@ -1102,7 +1146,7 @@ impl Runner for PigeonholeRunner {
                 (false, false) => " tablets=on",
                 (false, true) => " tablets=on packing=off",
             },
-            if s.no_nowait_reads { " nowait=off" } else { "" },
+            reads,
             match (s.memory.model, s.row_cache) {
                 // Under the total model the cache field above names the row cache.
                 (CacheModel::Total, _) | (_, None) => String::new(),
@@ -1125,10 +1169,17 @@ impl Runner for PigeonholeRunner {
             } else {
                 ""
             },
-            if s.adaptive_shard_threads {
-                " shard_threads=adaptive"
-            } else {
-                ""
+            // The option's setting (the library's default is on), labelled even when it is
+            // the default, so baselines from before #1082 (a thread per shard, unlabelled)
+            // never match runs with the controller. Application-owned runs ignore it (D40).
+            // A fixed `shard_threads` turns the controller off and is labelled on its own.
+            match (
+                s.adaptive_shard_threads,
+                s.shard_threads.is_some_and(|k| k != 0)
+            ) {
+                (_, true) => "",
+                (Some(false), false) => " shard_threads=per-shard",
+                (Some(true) | None, false) => " shard_threads=adaptive",
             },
             s.commit_spin_micros
                 .map_or_else(String::new, |us| format!(" commit_spin={us}us")),

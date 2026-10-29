@@ -2784,8 +2784,8 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **Names:** with a thread per shard (`shard_threads` 0, or at least the shard count) the threads keep the names `pigeonhole-shard-{i}`. Otherwise every driver is `pigeonhole-driver-{d}`.
 - **Placement is round-robin, not blocks of n/k:** packing (D217) keeps shards `0..active` busy, and round-robin spreads them over the drivers where blocks would put them all on driver 0.
 
-**How the controller runs (PR 2):** `RuntimeConfig::adaptive_drivers`. In `pigeonhole` it's **opt-in**: `Options::adaptive_shard_threads(true)`, for engine-owned opens without a fixed `shard_threads`. By default, engine-owned keeps one thread per shard, as before D289.
-- **Why opt-in (the owner, 2026-10-28, #1006):** six box rounds showed the mechanism sound but the resize policy noisy across load phases.
+**How the controller runs (PR 2):** `RuntimeConfig::adaptive_drivers`. In `pigeonhole` it's **on by default** (amended below, 2026-10-28): `Options::adaptive_shard_threads`, for engine-owned opens without a fixed `shard_threads`. `adaptive_shard_threads(false)` keeps one thread per shard, as before D289.
+- **Why it was opt-in at first (the owner, 2026-10-28, #1006):** six box rounds showed the mechanism sound but the resize policy noisy across load phases.
   - **Round 5** (3f83e186): transfer, ycsb-a and ycsb-f level with main; sparse-wide put p99 51/350 µs against 236/489.
   - **Round 6** (ec922c8c, after round 5's fixes): ycsb-a −5% and sparse-wide's tail gain lost. The slow-pass rule grew the set on idle windows between a load and a run, ycsb-a at 8 drivers sat just under `GROW_BUSY` with no signal, and sparse-wide's warm-up sibling wait (0.2–0.7) exceeded its steady-phase value (0.04–0.08).
   - Each round fixed one phase-dependent edge and exposed another.
@@ -2837,7 +2837,7 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 
 **The CPU budget (ICR 0081; owner, 2026-10-27, #760 comments 6443979201, 6444135824 and 6446722456):** one function sizes the engine-owned threads from the physical cores the process may use, after its affinity mask and a container's CPU quota (`pigeonhole_io::sys::default_shards`).
 - **Shards:** one per core, as before (D220).
-- **The driver count:** a thread per shard by default (one per core with the default shard count). With the controller opted in, that is its ceiling: under full load a store keeps a thread per shard's throughput (#997's A/B: ycsb-f −8% at 8 of 16), and the controller shrinks a light one.
+- **The driver count:** a thread per shard at most (one per core with the default shard count). That is the controller's ceiling: under full load a store keeps a thread per shard's throughput (#997's A/B: ycsb-f −8% at 8 of 16), and the controller shrinks a light one.
 - **The profiles differ in the compaction share** (`Options::cpu_profile`). These are placeholders until PR 2's compaction-share arms (c = 2, 4, 8 at 16 cores):
   - `Embedded` (the default) gives flush and compaction a quarter of the cores, leaving the application the rest and every SMT sibling;
   - `Server` (the clients are elsewhere: another container, IPC, the network) gives them half.
@@ -2894,6 +2894,12 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
   - The controller's unit tests: the shrink in one step and no lower than two, growth on a saturated driver and on sibling wait over 20 windows (not on slow passes alone), no shrink of an idle store, and a shrink that stands through an ops dip without sibling wait and grows back with it.
   - #1015: `a_trace_without_the_controller_logs_its_decisions_but_never_resizes` (runtime), and the bench's `a_traced_run_marks_its_phases_between_the_driver_windows`.
   - `pigeonhole/tests/model.rs` takes `PIGEONHOLE_DRIVER_CHURN=1`, forcing seeded resizes after one step in ten.
+
+**Amended (owner, 2026-10-28): the controller is on by default.** After #1015's tuning (#1017) passed two consecutive unchanged box rounds, the owner made default-on conditional on a ycsb-a `Buffered` ×3 off/on run being level.
+- **That run** (main 70e0175a): off 1443K/1536K/1530K ops/s, on 1516K/1467K/1516K, with p99 level.
+- **The fresh gate:** sparse-wide's `Buffered` put p99 was 66–107 µs on against 545–909 µs off, at level throughput; transfer, ycsb-a and ycsb-f were level.
+- **The change:** `adaptive_shard_threads` became public and defaults to true (#1082; ICR 0081 and 0085 amended). A fixed `shard_threads`, `adaptive_shard_threads(false)` and application-owned mode keep fixed threads.
+- **History:** opt-in at PR 2 (#1006); on by default from #1082.
 
 <a id="d290"></a>
 ## D290 — Snapshot and transaction point gets go through the writer's row cache, gets fill on a second miss, and a commit moves a cached row forward (coordinator, 2026-10-27; reviewed by simp724, #708 c6455806598; cache, shm, engine, pigeonhole, #708, ICR 0082; amends D201)
@@ -3059,3 +3065,35 @@ The `counters` model target now checkpoints on every odd seed by default.
 The ring tests that need their reads on a ring turn the switch off: `uring.rs`'s cross-ring wait, and runtime's `driver_ring.rs`.
 
 CI's ext4 runners cover hits. The podman VM's overlay mount covers refusals.
+
+## D293 — A scan its row limit leaves short starts its readahead later (ctr274, 2026-10-28; engine, sst, #712, #974; refines D222)
+**Why.** ycsb-e's scans (1–100 rows, 16 clients) were ahead of RocksDB on throughput after #975's ramp but 1.27× on p99, against the 1.2× floor. A per-phase profile of each scan (#712 c6475482356) put the largest part of the p99 band in waits on readahead still in flight: 66% at 16 clients and 38% at 4 (VM). A short scan ends within a few blocks, and the ramp starts after two of them, so the readahead has no lead: the scan reaches the block it just asked for while the fetch is still in flight, and it waits. With readahead off, the VM's p99 dropped from 1649 to 135 µs at 16 clients and from 182 to 131 µs at 4, and throughput rose 11–13%.
+
+The root cause is the readahead path's latency, not the scan's length. A demand read costs the scanning thread one read. A block fetched ahead goes through io-wq, then the ring's reaper, then verify, decompress and cache insert on the backend's single completion thread, behind every other cursor's fetches. A scan that reaches a block still on that path waits longer than a demand read would have taken. Short scans always catch up, so they pay it on almost every fetch. A long scan that catches up with its own batch pays it too. That cost is what #974 A (admitting fetched blocks on the cursor, not the completion thread) removes. **Revisit when #974 A is decided:** if admission moves onto the cursor, this rule may be unnecessary.
+
+**What.** A scan whose row limit leaves at most `SHORT_SCAN_ROWS` (128) rows to return starts its readahead ramp after `SHORT_SCAN_AHEAD_AFTER` (8) forward blocks per SST cursor, not two (`ReadOptions::readahead_after`, new in pigeonhole-sst).
+- The check is made per tablet, when the scan opens it, from the rows the limit still allows.
+- A scan with no limit, or more than 128 rows left, keeps D222's readahead and #975's ramp unchanged.
+- 128 covers ycsb-e's longest scan (100 rows).
+- Why 8 blocks: at the default 16 KiB blocks, 128 rows of 1 KiB fill about 8. A scan that the limit really keeps short submits nothing.
+- A row limit doesn't bound the blocks a scan reads. Wide rows, rows a filter skips and runs of deleted rows can make a short scan long in blocks. Those scans get readahead back after at most 8 demand reads per SST cursor (perf287's review, #1029), where turning it off would have left every block a demand read. The bound is per cursor, so a short scan merging N level-0 files may do up to 8×N demand reads before any cursor ramps; that is fine at today's level-0 sizes (perf287).
+- With the block bound in place, 128 only decides when the later start applies, so a cut-off 2× either way costs little.
+
+**Measured** (AX102, 2026-10-29, #1029 c6487018873; 16 clients, full scale, ycsb-e ×3 interleaved, medians):
+- **ycsb-e at buffered:** 178.6K → 207.4K ops/s, p99 285 → 182 µs, p99.9 467 → 251 µs.
+- **ycsb-e at default:** 167.4K → 183.4K ops/s, p99 293 → 214 µs, scan p99.9 about 440 → 250 µs.
+- **The wait is gone:** the readahead wait that made up the p99–99.9 band (110–153 µs) is 0.
+- **Same as fully off:** this rule is within noise of reading nothing ahead for short scans, and of readahead off for every scan.
+- **Default level's overall p99.9 (553 → 1237 µs):** it rises with every faster arm, fully-off ones included, because the 5% puts queue on group syncs at the higher request rate. It isn't a scan regression, and the scans' own p99.9 falls. D280 judges p99.
+- **Long-scan shapes** (one run per arm): no regression. time-series-range p99 is 4145 → 2228 µs; adjacency's is 1638 → 1376 µs. Fully off was a little worse on time-series-range.
+- **Long scans' wait-on-in-flight is unmeasured:** adjacency is cache-resident at full scale (no data misses), and time-series-range's filtered scans weren't timed. #974 A stays parked until a cold long-scan profile shows such a wait.
+
+**Tests.** `scan_readahead_limit.rs` (every scan reads all its cells):
+- scans limited to 1, 50 and 128 narrow rows submit no readahead;
+- a 1000-row scan and an unlimited scan still read ahead;
+- a `limit 1` scan of one row of about 50 blocks reads ahead once past the bound;
+- so does a `limit 1` scan across 2800 deleted rows (tombstones in a newer SST).
+
+Mutations: never reading ahead when short fails the last two; dropping the rule fails the first.
+
+#974 A stays parked. The same box slot's long-scan wait-on-in-flight decides it.

@@ -5,7 +5,7 @@
 ## Change
 - **pigeonhole-sst:** `Fetch::start(&mut self) -> Completion`. It returns the read already in flight when the cache-only read that missed submitted one (a data or index block whose read did not complete at once, from `Blocks::fetch_now`), or else submits a new one, as `Fetch::submit` does. A `Fetch` now carries that optional in-flight `Completion`. Its `Clone` doesn't share it: a copy submits its own read.
 - **pigeonhole-engine:**
-  - `MissedRead`: an opaque `#[derive(Debug, Default)]` struct holding the fetch a latest read at the call missed on.
+  - `MissedRead`: an opaque `#[derive(Debug, Default)]` struct holding the fetch a latest read at the call missed on, and the call's read point (its view, seqno and time). The future reads at that point. The view keeps the SST the handed-off read is in flight in, so a compaction can't retire it and a later allocation can't reuse its extent before the read lands. Without that, the read could land on reused bytes and fail its checksum: a spurious `Corrupt` (perf287's hold on #1086). A result is then as of the call, as a hit's is.
   - `Engine::try_read_row_latest(..) -> Result<Result<bool>, MissedRead>`: as `try_read_row_latest_into`, but `Err` keeps the miss.
   - `Engine::read_row_latest_async_after(missed, ..) -> RowFuture<S>`: as `read_row_latest_async`, but the future starts by waiting on the miss's read.
   - The existing `try_read_row_latest_into` and `read_row_latest_async` stay, as wrappers: the first drops the miss, the second passes `MissedRead::default()`.
@@ -19,4 +19,4 @@
 ## Callers changed
 - **`pigeonhole::RowRead::read_async`** uses `try_read_row_latest` and `read_row_latest_async_after`.
 - **The engine's read futures and async scans** start a `WouldBlock`'s fetch with `start`.
-- **Tests:** `crates/pigeonhole/tests/inplace_reads.rs` (one read in flight, not two) and `crates/sst/tests/sst.rs` (a miss that must wait carries its read).
+- **Tests:** `crates/pigeonhole/tests/inplace_reads.rs` (one read in flight, not two; a handed-off read's SST is retired and its space reused mid-read, which returned `Corrupt` without the call's view) and `crates/sst/tests/sst.rs` (a miss that must wait carries its read).

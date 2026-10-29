@@ -696,11 +696,6 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
         parsed.map(|_| ())
     }
 
-    /// Byte offset of the current entry within the block (for row-start lookups).
-    pub fn entry_offset(&self) -> usize {
-        self.cur
-    }
-
     /// The byte owner (to hand out pinned value ranges).
     pub fn bytes(&self) -> &B {
         &self.block.bytes

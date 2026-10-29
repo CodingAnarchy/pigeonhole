@@ -28,7 +28,8 @@
 //!
 //! ```
 //! use pigeonhole_format::shm::ViewRecord;
-//! use pigeonhole_io::ProcessId;
+//! use pigeonhole_io::sim::SimVfs;
+//! use pigeonhole_io::{OpenOptions, ProcessId, Vfs};
 //! use pigeonhole_shm::{ShmConfig, ShmRegion};
 //!
 //! let mut config = ShmConfig::new(2);
@@ -38,7 +39,8 @@
 //!
 //! // Writer side: a group of three commits on shard 0.
 //! shm.publish_pending(0, shm.visible_seqno() + 1);
-//! let first = shm.reserve_seqnos(3);
+//! let first = shm.next_seqno(); // the writer's own allocator, mirrored here
+//! shm.advance_next_seqno(first + 3);
 //! shm.publish_pending(0, first);
 //! // ... apply the group ...
 //! shm.publish_pending(0, u64::MAX);
@@ -46,8 +48,13 @@
 //!
 //! shm.publish_view(&ViewRecord { view_version: 1, ..Default::default() }).unwrap();
 //!
-//! // Reader side: pin, then read through the pinned view.
-//! let slot = shm.claim_reader_slot(ProcessId { pid: 42, start_time: 1 }).unwrap();
+//! // Reader side: claim a slot (its liveness lock held through the reader's handle on the
+//! // database file), pin, then read through the pinned view.
+//! let vfs = SimVfs::new(1);
+//! let file = vfs.open("/db".as_ref(), OpenOptions::read_write_create()).unwrap();
+//! let slot = shm
+//!     .claim_reader_slot_locked(ProcessId { pid: 42, start_time: 1 }, &file)
+//!     .unwrap();
 //! slot.pin(shm.visible_seqno(), shm.view_version());
 //! let view = shm.read_view().unwrap();
 //! assert_eq!(view.view_version, 1);
@@ -353,18 +360,22 @@ pub enum Role {
 /// One reader process's slot. Released on drop.
 ///
 /// ```
-/// use pigeonhole_io::ProcessId;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_io::{OpenOptions, ProcessId, Vfs};
 /// use pigeonhole_shm::{ShmConfig, ShmRegion};
 ///
 /// let mut config = ShmConfig::new(1);
 /// config.arena_bytes = 2 << 20;
 /// config.reader_slots = 1;
 /// let shm = ShmRegion::in_memory([1; 16], &config);
+/// // The reader's handle on the database file holds the slot's liveness lock.
+/// let vfs = SimVfs::new(1);
+/// let file = vfs.open("/db".as_ref(), OpenOptions::read_write_create()).unwrap();
 /// let me = ProcessId { pid: 7, start_time: 1 };
 ///
-/// let slot = shm.claim_reader_slot(me).unwrap();
+/// let slot = shm.claim_reader_slot_locked(me, &file).unwrap();
 /// assert_eq!(slot.index(), 0);
-/// assert!(shm.claim_reader_slot(me).is_err(), "one slot, already taken");
+/// assert!(shm.claim_reader_slot_locked(me, &file).is_err(), "one slot, already taken");
 /// assert_eq!(slot.pin(10, 0), (10, 0));
 /// assert_eq!(shm.oldest_reader_pin(), Some((10, 0)));
 /// slot.unpin();
@@ -374,14 +385,12 @@ pub enum Role {
 pub struct ReaderSlot {
     region: Arc<region::Inner>,
     index: u32,
-    /// The process that claimed it: the writer may judge that process dead and free the
-    /// slot under it ([`ShmRegion::reclaim_dead_slots`]); the slot is this handle's only
-    /// while its owner fields still name this process.
+    /// The process that claimed it: the slot is this handle's only while its owner fields
+    /// still name this process.
     owner: ProcessId,
     /// The database file handle holding the slot's liveness lock (layout 3,
-    /// [`ShmRegion::claim_reader_slot_locked`]), released after the slot is freed; `None`
-    /// for a slot claimed without one (in-memory regions and tests, liveness by pid).
-    lock: Option<FileRef>,
+    /// [`ShmRegion::claim_reader_slot_locked`]), released after the slot is freed.
+    lock: FileRef,
     /// Set by [`ReaderSlot::abandon`]: the handle no longer owns the slot and leaves it
     /// alone. Shared with every [`SlotOwnership`] taken from this handle.
     abandoned: Arc<AtomicBool>,

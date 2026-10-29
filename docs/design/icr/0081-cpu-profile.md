@@ -27,3 +27,6 @@ The owner's D289 scope: one budget function derives every thread default from th
 
 - **`pigeonhole`:** `options.rs` (`CpuProfile`, `thread_budget`, `to_engine_for`; unit tables for 1–128 cores and the explicit cases); `lib.rs` re-exports `CpuProfile`; tests `api.rs` (`engine_owned_mode_sizes_its_threads_from_the_cpu_budget`).
 - **`pigeonhole-bench`:** `runners/pigeonhole.rs`, `main.rs`.
+
+## Amendment (owner, 2026-10-28; #1015, ICR 0085's amendment)
+The load controller is on by default (`Options::adaptive_shard_threads`, now public). The engine-owned driver count above, a thread per shard, is the controller's ceiling by default rather than only when it is opted in. `adaptive_shard_threads(false)` keeps that count fixed, as does a set `shard_threads`.

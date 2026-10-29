@@ -73,7 +73,7 @@ fn writer_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
     let _presence = Presence::acquire(file).unwrap();
     shm.publish_view(&view(1, 3, 8)).unwrap();
     shm.set_manifest_version(10);
-    shm.reserve_seqnos(9);
+    reserve(&shm, 9);
     say(format!("READY gen={}", shm.generation().0));
     for cmd in commands() {
         if cmd.trim() == "quit" {
@@ -95,7 +95,7 @@ fn reader_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
         }
     };
     let me = vfs.current_process();
-    let mut slot = shm.claim_reader_slot(me).unwrap();
+    let mut slot = shm.claim_reader_slot_locked(me, file).unwrap();
     say(format!(
         "READY slot={} gen={} pid={} start={}",
         slot.index(),
@@ -143,7 +143,10 @@ fn reader_child(vfs: &VfsRef, file: &FileRef, identity: FileIdentity) -> i32 {
             },
             (Some("reattach"), _) => {
                 shm = shm.reattach(vfs, file).unwrap();
-                slot = shm.claim_reader_slot(me).unwrap();
+                // The old generation's slot keeps its byte until dropped: give it up first,
+                // or this handle's new claim would skip that byte.
+                slot.abandon();
+                slot = shm.claim_reader_slot_locked(me, file).unwrap();
                 say(format!(
                     "REATTACHED gen={} slot={}",
                     shm.generation().0,
@@ -394,23 +397,19 @@ fn killed_reader_process_slot_is_reclaimed() {
     let ready = reader.recv();
     let owner = ready_process(&ready);
     assert_eq!(owner.pid, reader.pid());
-    assert!(db.vfs.process_alive(owner));
     assert_eq!(reader.ask("pin 5"), "PINNED seqno=5 view=1");
     assert_eq!(shm.oldest_reader_pin(), Some((5, 1)));
     assert_eq!(
-        shm.reclaim_dead_slots(&db.vfs),
+        shm.reclaim_dead_slots_locked(&file),
         0,
         "alive: nothing to reclaim"
     );
 
+    // The killed process's handle closes, releasing its slot's liveness lock.
     reader.kill();
-    assert!(
-        !db.vfs.process_alive(owner),
-        "the recorded pid plus start time names a process that is gone"
-    );
-    assert_eq!(shm.reclaim_dead_slots(&db.vfs), 1);
+    assert_eq!(shm.reclaim_dead_slots_locked(&file), 1);
     assert_eq!(shm.oldest_reader_pin(), None);
-    assert_eq!(shm.reclaim_dead_slots(&db.vfs), 0);
+    assert_eq!(shm.reclaim_dead_slots_locked(&file), 0);
 }
 
 #[test]
@@ -471,7 +470,7 @@ fn writer_process_kill_and_restart_remaps_readers() {
     assert_eq!(shm.oldest_reader_pin(), Some((9, 7)));
     reader.quit();
     assert_eq!(
-        shm.reclaim_dead_slots(&db.vfs),
+        shm.reclaim_dead_slots_locked(&file),
         0,
         "a clean quit frees its slot itself"
     );
@@ -546,8 +545,10 @@ fn concurrent_reader_processes_claim_distinct_slots_until_exhausted() {
             .map(|i| format!("READY slot={i} gen=1"))
             .collect::<Vec<_>>()
     );
+    // The parent claims as another reader would, through its own handle.
+    let mine = db.open();
     assert!(matches!(
-        shm.claim_reader_slot(db.vfs.current_process()),
+        shm.claim_reader_slot_locked(db.vfs.current_process(), &mine),
         Err(Error::NoReaderSlot)
     ));
     let first = readers.remove(0);
@@ -559,7 +560,7 @@ fn concurrent_reader_processes_claim_distinct_slots_until_exhausted() {
     first.quit();
     let deadline = Instant::now() + Duration::from_secs(5);
     let slot = loop {
-        match shm.claim_reader_slot(db.vfs.current_process()) {
+        match shm.claim_reader_slot_locked(db.vfs.current_process(), &mine) {
             Ok(slot) => break slot,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
             Err(e) => panic!("slot never freed: {e}"),

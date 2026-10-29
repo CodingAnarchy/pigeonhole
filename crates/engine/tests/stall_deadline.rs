@@ -237,7 +237,4 @@ impl pigeonhole_io::Vfs for Ticking {
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.inner.current_process()
     }
-    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
-        self.inner.process_alive(process)
-    }
 }

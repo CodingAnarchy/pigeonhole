@@ -593,6 +593,17 @@ pub(crate) struct Spawner {
     stale_check: Option<u64>,
 }
 
+impl Drop for Spawner {
+    /// The shard is gone (dropped, possibly without a close): tasks its workers give back
+    /// from now on are dropped rather than parked on its `Origin`, where they would keep the
+    /// engine alive (#1070).
+    fn drop(&mut self) {
+        if self.pool.is_some() {
+            self.origin.shard_gone();
+        }
+    }
+}
+
 impl Spawner {
     pub(crate) fn new(local: Scheduler, pool: Option<Arc<Pool>>, origin: Arc<Origin>) -> Self {
         Self {

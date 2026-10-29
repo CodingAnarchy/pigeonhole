@@ -32,3 +32,4 @@ cargo deny check
 - Integers on disk are little-endian except ordering fields inside internal keys, which are big-endian.
 - Tests that use randomness take a seed and print it on failure.
 - Keep Rust-only types (borrowed lifetimes, generics, closures, trait objects) out of anything that will become the C ABI boundary.
+- No test-only production paths: code under `src/` that tests call must be the code production runs. `#[cfg(test)]` (and the `test-hooks` feature) in `src/` is only for small read-only inspection helpers (counts, invariant checks) and fault-injection or hold seams, never an alternate operation. When a production path changes, move its tests to the new path and delete the old one rather than keeping it under `cfg(test)`. Don't keep types or methods alive only for loom models or doctests: model the shipped type, or, where loom can't instrument it (mapped memory), its exact operations and orderings.

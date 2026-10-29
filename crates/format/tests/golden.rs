@@ -10,14 +10,17 @@
 //! decodes it. Regenerating never rewrites a frozen file. The shared-memory files (`shm_*`)
 //! are not frozen: the layout is outside the compatibility promise.
 
+mod common;
+
 use std::path::{Path, PathBuf};
 
+use common::encode_seek_key;
 use pigeonhole_format::blob::{BlobExtentHeader, encode_record_header};
 use pigeonhole_format::block::{Block, BlockAddr, BlockBuilder, BlockKind, seal, verify};
 use pigeonhole_format::checksum::xxh3_64;
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::filter::{Filter, FilterBuilder, column_hash, row_hash};
-use pigeonhole_format::key::{Kind, decode_key, encode_key, encode_marker_key, encode_seek_key};
+use pigeonhole_format::key::{Kind, decode_key, encode_key, encode_marker_key};
 use pigeonhole_format::manifest::{
     Edit, FamilyKind, FamilyOptions, ManifestBlockKind, ManifestHeader, SstMeta, decode_block,
     encode_block,
