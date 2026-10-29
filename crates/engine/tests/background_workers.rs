@@ -824,11 +824,6 @@ fn an_engine_dropped_without_a_close_with_a_flush_in_the_pool_frees_everything()
     // engine's state and VFS: a cycle. The engine harness's crash runs leaked their whole
     // simulated store that way. Every drop order of the engine, its shards and its workers
     // must free everything.
-    type Parts = (
-        Option<Arc<Engine>>,
-        Option<Vec<EngineShard>>,
-        Option<Vec<BackgroundWorker>>,
-    );
     let orders = [
         [0, 1, 2],
         [0, 2, 1],
@@ -837,46 +832,67 @@ fn an_engine_dropped_without_a_close_with_a_flush_in_the_pool_frees_everything()
         [2, 0, 1],
         [2, 1, 0],
     ];
-    for (n, order) in orders.iter().enumerate() {
-        let vfs = SimVfs::new(3);
-        {
-            let AppOwned {
-                engine,
-                mut shards,
-                workers,
-                ..
-            } = Engine::open_application_owned_with(
-                Path::new("/db/drop.phdb"),
-                sim_options(&vfs, 1),
-            )
-            .expect("open");
-            let t = engine
-                .create_table("t", &[("f".into(), FamilyOptions::default())])
-                .unwrap();
-            for i in 0..8u8 {
-                let mut pc: PendingCommit = engine
-                    .submit(put(&t, &[b'a', i], 64), Some(Durability::Buffered))
-                    .unwrap();
-                step(&*vfs, &mut shards[0], None, 32);
-                ready(&mut pc).expect("committed").expect("ok");
-            }
-            // A flush queued for the worker, which never runs it.
-            let _flush = engine.flush_pending().unwrap();
-            step(&*vfs, &mut shards[0], None, 8);
-            let mut parts: Parts = (Some(engine), Some(shards), Some(workers));
-            for &k in order {
-                match k {
-                    0 => drop(parts.0.take()),
-                    1 => drop(parts.1.take()),
-                    _ => drop(parts.2.take()),
-                }
-            }
+    // The flush only queued, and held by the worker: taken and one slice run, unfinished
+    // (perf2's review).
+    for held in [false, true] {
+        for (n, order) in orders.iter().enumerate() {
+            let vfs = SimVfs::new(3);
+            drop_with_a_flush_in_the_pool(&vfs, order, held);
+            assert_eq!(
+                Arc::strong_count(&vfs),
+                1,
+                "drop order {order:?} (#{n}, held {held}): the VFS is still held after the \
+                 engine, its shards and its workers were dropped"
+            );
         }
-        assert_eq!(
-            Arc::strong_count(&vfs),
-            1,
-            "drop order {order:?} (#{n}): the VFS is still held after the engine, its shards \
-             and its workers were dropped"
+    }
+}
+
+/// An engine, its shards and its workers, each dropped on its turn.
+type Parts = (
+    Option<Arc<Engine>>,
+    Option<Vec<EngineShard>>,
+    Option<Vec<BackgroundWorker>>,
+);
+
+/// Opens with one worker, commits, leaves a flush queued for the worker (and with `held`,
+/// taken by it and unfinished), then drops the engine (0), its shards (1) and its workers
+/// (2) in `order`, without a close.
+fn drop_with_a_flush_in_the_pool(vfs: &Arc<SimVfs>, order: &[usize; 3], held: bool) {
+    let AppOwned {
+        engine,
+        mut shards,
+        mut workers,
+        ..
+    } = Engine::open_application_owned_with(Path::new("/db/drop.phdb"), sim_options(vfs, 1))
+        .expect("open");
+    let t = engine
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    for i in 0..8u8 {
+        let mut pc: PendingCommit = engine
+            .submit(put(&t, &[b'a', i], 64), Some(Durability::Buffered))
+            .unwrap();
+        step(&**vfs, &mut shards[0], None, 32);
+        ready(&mut pc).expect("committed").expect("ok");
+    }
+    let mut flush = engine.flush_pending().unwrap();
+    step(&**vfs, &mut shards[0], None, 8);
+    if held {
+        // A deadline already past: the worker takes the flush and runs one slice of it.
+        workers[0].run_once(vfs.monotonic_nanos());
+        assert!(
+            ready(&mut flush).is_none(),
+            "the flush finished in one slice"
         );
+    }
+    drop(flush);
+    let mut parts: Parts = (Some(engine), Some(shards), Some(workers));
+    for &k in order {
+        match k {
+            0 => drop(parts.0.take()),
+            1 => drop(parts.1.take()),
+            _ => drop(parts.2.take()),
+        }
     }
 }
