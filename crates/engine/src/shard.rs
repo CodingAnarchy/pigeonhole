@@ -90,6 +90,11 @@ const COMPACTION_BACKOFF_CAP: u64 = 60;
 const FLUSH_BACKOFF_CAP: u64 = 100;
 const ROOM_RECHECK_CAP: u64 = 100;
 
+/// How soon a wait for memtable arena room on a moving clock first looks again for room
+/// that nothing announced (a snapshot dropped on another thread, a reader process's unpin):
+/// 1 ms, doubling up to `ROOM_RECHECK_CAP` times this.
+const ROOM_RECHECK_NANOS: u64 = 1_000_000;
+
 /// A member's `room_since`: the shard clock in milliseconds (wrapping after 49 days, never
 /// 0) when it first waited for arena room.
 fn room_stamp(now: u64) -> u32 {
@@ -474,7 +479,6 @@ pub(crate) struct Shared {
     /// Backoff bases (`EngineOptions`; issue #141).
     pub compaction_backoff_nanos: u64,
     pub flush_backoff_nanos: u64,
-    pub room_recheck_nanos: u64,
     /// `EngineOptions::commit_spin_nanos` (D198).
     pub commit_spin_nanos: u64,
     /// The writer keeps a stale-tail index beside each memtable (D194, D199).
@@ -1649,6 +1653,21 @@ enum Bytes {
 }
 
 impl Bytes {
+    /// The batch: a builder's as it stands (it checked every mutation it took, so it needs
+    /// no validating decode), anything else decoded as `BatchRef::new` does.
+    fn batch(&self) -> pigeonhole_format::Result<BatchRef<'_>> {
+        let built = match self {
+            Bytes::Own(b) => b.batch(),
+            Bytes::Shared(b) => b.batch(),
+            Bytes::Streams(v) => return BatchRef::new(v),
+        };
+        debug_assert!(
+            BatchRef::new(built.as_bytes()).is_ok(),
+            "a builder holds only mutations it checked"
+        );
+        Ok(built)
+    }
+
     fn as_slice(&self) -> &[u8] {
         match self {
             Bytes::Own(b) => b.batch().as_bytes(),
@@ -1687,13 +1706,13 @@ impl Member {
             MemberKind::Single => WalRecord::Batch {
                 seqno: self.seqno,
                 commit_ts: self.commit_ts,
-                batch: BatchRef::new(self.bytes.as_slice())?,
+                batch: self.bytes.batch()?,
             },
             MemberKind::Prepare { coordinator } => WalRecord::Prepare {
                 seqno: self.seqno,
                 commit_ts: self.commit_ts,
                 coordinator: StreamId(u32::from(coordinator.0)),
-                batch: BatchRef::new(self.bytes.as_slice())?,
+                batch: self.bytes.batch()?,
             },
             MemberKind::CommitRecord { apply_seqno, .. } => WalRecord::Decision {
                 seqno: self.seqno,
@@ -1725,7 +1744,7 @@ fn writes_cell<'a>(
     // routing, D10) writes every cell of its family.
     members
         .filter(|m| !matches!(m.kind, MemberKind::CommitRecord { .. }))
-        .filter_map(|m| BatchRef::new(m.bytes.as_slice()).ok())
+        .filter_map(|m| m.bytes.batch().ok())
         .any(|batch| {
             batch.iter().flatten().any(|mu| {
                 mu.table == table
@@ -2552,25 +2571,19 @@ impl StallWait {
         }
     }
 
-    /// Arms the re-check timer unless one is pending: it kicks the shard after `base` (1 ms
-    /// by default), then twice as long each time up to 100 times `base`, so freed room is
-    /// seen within about 100 ms.
-    fn arm_recheck(
-        &mut self,
-        vfs: &VfsRef,
-        base: u64,
-        ctx: &mut ShardContext<'_, ShardMsg>,
-        me: ShardId,
-    ) {
+    /// Arms the re-check timer unless one is pending: it kicks the shard after 1 ms
+    /// (`ROOM_RECHECK_NANOS`), then twice as long each time up to 100 times that, so freed
+    /// room is seen within about 100 ms.
+    fn arm_recheck(&mut self, vfs: &VfsRef, ctx: &mut ShardContext<'_, ShardMsg>, me: ShardId) {
         if self.recheck.as_ref().is_some_and(|t| !t.finished()) {
             return;
         }
         self.recheck_nanos = if self.recheck_nanos == 0 {
-            base
+            ROOM_RECHECK_NANOS
         } else {
             self.recheck_nanos
                 .saturating_mul(2)
-                .min(base.saturating_mul(ROOM_RECHECK_CAP))
+                .min(ROOM_RECHECK_NANOS * ROOM_RECHECK_CAP)
         };
         let at = ctx.now_nanos().saturating_add(self.recheck_nanos);
         self.recheck = Some(arm_kick(vfs, at, ctx, me));
@@ -2976,7 +2989,7 @@ pub(crate) struct ShardState {
     /// would loop (it gives up within microseconds when the shard is driven in a loop).
     flush_retry: Option<Arc<TimerState>>,
     /// Tablets dropped since open: their records need no flush before a checkpoint.
-    dropped: HashSet<TabletId>,
+    dropped: FastSet<TabletId>,
 
     // ---- checkpoints ----
     /// Records the checkpoint cannot pass, in log order.
@@ -3118,7 +3131,7 @@ pub(crate) struct ShardState {
     /// Slots whose compaction failed: failures in a row and the time (VFS monotonic
     /// nanoseconds) before which no background compaction picks them again, so one slot
     /// that keeps failing does not stop compaction for the rest of the shard (issue #141).
-    slot_backoff: HashMap<(TabletId, FamilyId), (u32, u64)>,
+    slot_backoff: FastMap<(TabletId, FamilyId), (u32, u64)>,
     /// The slots `maintain` scans, kept from one scan to the next so the scan does not
     /// allocate its list each time (#499).
     scan_slots: Vec<(TabletId, FamilyId)>,
@@ -3132,7 +3145,7 @@ pub(crate) struct ShardState {
 
     // ---- tablet changes and the balancer ----
     /// Tablets the running change splits, merges or moves.
-    moving: HashSet<TabletId>,
+    moving: FastSet<TabletId>,
     op: Option<ActiveOp>,
     op_queue: VecDeque<(TabletOpKind, Option<Notifier<Result<()>>>)>,
     /// Single-shard commits touching `moving` tablets, held (unlogged) until the change is
@@ -3155,7 +3168,7 @@ pub(crate) struct ShardState {
     /// compactions, so a busy shard never starves them).
     cleanup_turn: bool,
     /// Writes per tablet in the current balancer interval.
-    loads: HashMap<TabletId, TabletLoad>,
+    loads: FastMap<TabletId, TabletLoad>,
     window_writes: u64,
     next_balance: u64,
     rng: u64,
@@ -3164,9 +3177,9 @@ pub(crate) struct ShardState {
     /// Balancer passes run so far.
     balance_pass: u64,
     /// The pass at which each owned tablet arrived on this shard (0: held at the first pass).
-    arrived: HashMap<TabletId, u64>,
+    arrived: FastMap<TabletId, u64>,
     /// The clock when each owned tablet arrived on this shard (0: held at the first pass).
-    arrived_at: HashMap<TabletId, u64>,
+    arrived_at: FastMap<TabletId, u64>,
     /// The pass at which the balancer last started a move or a split over shards.
     skew_pass: Option<u64>,
     /// Consecutive balancer passes this shard's load was skewed (D214).
@@ -3373,7 +3386,7 @@ impl ShardState {
             flush_failed: false,
             flush_failures: 0,
             flush_retry: None,
-            dropped: HashSet::new(),
+            dropped: FastSet::default(),
             log: VecDeque::new(),
             log_cross: FastMap::default(),
             log_bytes: 0,
@@ -3425,13 +3438,13 @@ impl ShardState {
             blob_gc: compact::BlobGc,
             due_backing_off: false,
             backoff_timer: None,
-            slot_backoff: HashMap::new(),
+            slot_backoff: FastMap::default(),
             scan_slots: Vec::new(),
             scan_levels: Levels::default(),
             checkpoint_failures: 0,
             checkpoint_timer: None,
             stall: Stall::default(),
-            moving: HashSet::new(),
+            moving: FastSet::default(),
             op: None,
             op_queue: VecDeque::new(),
             parked: Vec::new(),
@@ -3441,14 +3454,14 @@ impl ShardState {
             retries: Vec::new(),
             cleanups: Vec::new(),
             cleanup_turn: false,
-            loads: HashMap::new(),
+            loads: FastMap::default(),
             window_writes: 0,
             next_balance: 0,
             rng: 0x9E37_79B9_7F4A_7C15 ^ (u64::from(id.0) + 1),
             load_ewma: 0.0,
             balance_pass: 0,
-            arrived: HashMap::new(),
-            arrived_at: HashMap::new(),
+            arrived: FastMap::default(),
+            arrived_at: FastMap::default(),
             skew_pass: None,
             skew_run: 0,
             skew_active: false,
@@ -3753,7 +3766,7 @@ impl ShardState {
         commit_ts: Timestamp,
     ) -> Result<Vec<(TabletId, FamilyId)>> {
         self.note_stamped(commit_ts);
-        self.apply(bytes, seqno, commit_ts)?;
+        self.apply(BatchRef::new(bytes)?, seqno, commit_ts)?;
         Ok(self.touched_slots.clone())
     }
 
@@ -3882,11 +3895,8 @@ impl ShardState {
     }
 
     /// The slots `bytes` writes on this shard (routing only, no apply).
-    fn slots_of(&mut self, bytes: &[u8]) -> Vec<(TabletId, FamilyId)> {
+    fn slots_of(&mut self, batch: BatchRef<'_>) -> Vec<(TabletId, FamilyId)> {
         let mut out: Vec<(TabletId, FamilyId)> = Vec::new();
-        let Ok(batch) = BatchRef::new(bytes) else {
-            return out;
-        };
         let tablets = Arc::clone(&self.tablets);
         for m in batch.iter().flatten() {
             let Some((tablet, owner)) = tablets.route(m.table, m.row) else {
@@ -4126,12 +4136,11 @@ impl ShardState {
     /// on its own.
     fn reserve_room(
         &mut self,
-        bytes: &[u8],
+        batch: Option<BatchRef<'_>>,
         group: Option<&mut GroupRoom>,
     ) -> std::result::Result<usize, Room> {
         let mut rows = std::mem::take(&mut self.admit_rows);
         rows.clear();
-        let batch = BatchRef::new(bytes).ok();
         let need = match batch {
             Some(batch) => self.arena_needed(batch, &mut rows),
             None => ArenaNeed {
@@ -4648,7 +4657,7 @@ impl ShardState {
             w.rearm_if_fired(frozen, now, oldest, timeout, &self.shared.vfs, ctx, me);
             if !frozen {
                 // As for a room wait: freed chunks are announced to nobody (issue #141).
-                w.arm_recheck(&self.shared.vfs, self.shared.room_recheck_nanos, ctx, me);
+                w.arm_recheck(&self.shared.vfs, ctx, me);
             }
         }
         if idle {
@@ -5378,7 +5387,7 @@ impl ShardState {
     /// Applies `bytes` at `seqno`/`commit_ts` to this shard's memtables, last write winning
     /// per `(column, timestamp)` (decision D34). Records the slots written in
     /// `touched_slots`.
-    fn apply(&mut self, bytes: &[u8], seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
+    fn apply(&mut self, batch: BatchRef<'_>, seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
         // Nothing is applied once the close reported: no flush would persist it (a late
         // cross-shard decision is left to the WAL, `on_decide`).
         debug_assert_ne!(
@@ -5387,7 +5396,7 @@ impl ShardState {
             "shard {} applied {seqno} after its close reported",
             self.id.0
         );
-        let batch = BatchRef::new(bytes)?;
+        let bytes = batch.as_bytes();
         let dups = self.dedup.scan(batch, bytes, commit_ts);
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let tablets = Arc::clone(&self.tablets);
@@ -5948,12 +5957,7 @@ impl ShardState {
             // Room freed by a snapshot dropped on another thread or a reader process's
             // unpin is announced to nobody: look again soon (issue #141).
             if let Some(w) = &mut self.room_wait {
-                w.arm_recheck(
-                    &self.shared.vfs,
-                    self.shared.room_recheck_nanos,
-                    ctx,
-                    self.id,
-                );
+                w.arm_recheck(&self.shared.vfs, ctx, self.id);
             }
         }
         if refuse || idle {
@@ -6299,7 +6303,7 @@ impl ShardState {
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
                 let group = (shares_room && matches!(m.kind, MemberKind::Single))
                     .then(|| group_room.get_or_insert_with(GroupRoom::default));
-                match self.reserve_room(m.bytes.as_slice(), group) {
+                match self.reserve_room(m.bytes.batch().ok(), group) {
                     Ok(bytes) => m.reserved = bytes,
                     Err(Room::Never) => {
                         // Not a stall: no flush could ever make room. The caller must split
@@ -6355,7 +6359,7 @@ impl ShardState {
                     share.reads = reads;
                     let bytes = Arc::clone(&share.bytes);
                     let reads = share.reads.clone();
-                    self.track_share_rows(bytes.batch().as_bytes(), true);
+                    self.track_share_rows(bytes.batch(), true);
                     self.track_share_reads(&reads, true);
                 }
             }
@@ -6656,10 +6660,17 @@ impl ShardState {
                     let applied = if fault {
                         Err(Error::Busy)
                     } else {
-                        self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts)
+                        m.bytes
+                            .batch()
+                            .map_err(Error::from)
+                            .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts))
                     };
                     #[cfg(not(feature = "test-hooks"))]
-                    let applied = self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts);
+                    let applied = m
+                        .bytes
+                        .batch()
+                        .map_err(Error::from)
+                        .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts));
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
                         self.poison(crate::health::FailureCause::Internal);
@@ -6685,7 +6696,11 @@ impl ShardState {
                         m.reserved = 0;
                     }
                     if let Some(t) = m.ticket {
-                        let slots = self.slots_of(m.bytes.as_slice());
+                        let slots = m
+                            .bytes
+                            .batch()
+                            .map(|batch| self.slots_of(batch))
+                            .unwrap_or_default();
                         let kind = LoggedKind::Prepare { slots };
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                         self.log_cross_record(m.seqno);
@@ -7571,7 +7586,7 @@ impl ShardState {
     /// Holds `m`'s rows (written, read, and its predicate row) back for the next group:
     /// later singles on them wait too (`hold_if_overlapping`).
     fn hold_rows(&mut self, m: &Member) {
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+        if let Ok(batch) = m.bytes.batch() {
             for mu in batch.iter().flatten() {
                 self.held_rows.insert(hash_row(mu.table, mu.row));
             }
@@ -7590,7 +7605,7 @@ impl ShardState {
     /// held too, so a still later single on one of them waits behind it.
     fn hold_if_overlapping(&mut self, m: &Member) -> bool {
         let mut overlaps = false;
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+        if let Ok(batch) = m.bytes.batch() {
             for mu in batch.iter().flatten() {
                 overlaps |= self.held_rows.contains(&hash_row(mu.table, mu.row));
             }
@@ -7665,7 +7680,7 @@ impl ShardState {
         if self.shared.hooks.flush_gc_mutation.load(Ordering::Acquire) == 3 {
             return true;
         }
-        let Ok(batch) = BatchRef::new(m.bytes.as_slice()) else {
+        let Ok(batch) = m.bytes.batch() else {
             // An undecodable batch fails its apply; it writes nothing.
             return true;
         };
@@ -7778,7 +7793,7 @@ impl ShardState {
         // seqno and timestamp against the share's decision), so only the optimistic checks
         // remain: a write to a row the share read, and a read of a row it writes.
         if !self.pending_reads.is_empty()
-            && let Ok(batch) = BatchRef::new(m.bytes.as_slice())
+            && let Ok(batch) = m.bytes.batch()
         {
             for mu in batch.iter().flatten() {
                 if self.pending_reads.contains_key(&hash_row(mu.table, mu.row)) {
@@ -7801,10 +7816,7 @@ impl ShardState {
         false
     }
 
-    fn track_share_rows(&mut self, bytes: &[u8], add: bool) {
-        let Ok(batch) = BatchRef::new(bytes) else {
-            return;
-        };
+    fn track_share_rows(&mut self, batch: BatchRef<'_>, add: bool) {
         for mu in batch.iter().flatten() {
             let h = hash_row(mu.table, mu.row);
             if add {
@@ -7863,7 +7875,7 @@ impl ShardState {
                 if error.is_some() {
                     if let Some(mut share) = self.prepared.remove(&m.seqno) {
                         if share.tracked {
-                            self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                            self.track_share_rows(share.bytes.batch(), false);
                             self.track_share_reads(&share.reads, false);
                         }
                         self.release_room(share.reserved);
@@ -8508,14 +8520,13 @@ impl ShardState {
                 .get(&seqno)
                 .filter(|share| share.tracked)
                 .map(|share| {
-                    let mut rows: Vec<u64> = BatchRef::new(share.bytes.batch().as_bytes())
-                        .map(|b| {
-                            b.iter()
-                                .flatten()
-                                .map(|mu| hash_row(mu.table, mu.row))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let mut rows: Vec<u64> = share
+                        .bytes
+                        .batch()
+                        .iter()
+                        .flatten()
+                        .map(|mu| hash_row(mu.table, mu.row))
+                        .collect();
                     rows.sort_unstable();
                     rows.dedup();
                     rows
@@ -8555,7 +8566,7 @@ impl ShardState {
             // COMMIT (D83, D116).
             if let Some(share) = self.prepared.remove(&seqno) {
                 if share.tracked {
-                    self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                    self.track_share_rows(share.bytes.batch(), false);
                     self.track_share_reads(&share.reads, false);
                 }
                 self.release_room(share.reserved);
@@ -8575,7 +8586,7 @@ impl ShardState {
         }
         if let Some(share) = self.prepared.remove(&seqno) {
             if share.tracked {
-                self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                self.track_share_rows(share.bytes.batch(), false);
                 self.track_share_reads(&share.reads, false);
             }
             self.release_room(share.reserved);
@@ -8608,10 +8619,10 @@ impl ShardState {
                 {
                     Err(Error::Busy)
                 } else {
-                    self.apply(share.bytes.batch().as_bytes(), apply_seqno, commit_ts)
+                    self.apply(share.bytes.batch(), apply_seqno, commit_ts)
                 };
                 #[cfg(not(feature = "test-hooks"))]
-                let applied = self.apply(share.bytes.batch().as_bytes(), apply_seqno, commit_ts);
+                let applied = self.apply(share.bytes.batch(), apply_seqno, commit_ts);
                 match applied {
                     Ok(()) => {
                         for key in &self.touched_slots {

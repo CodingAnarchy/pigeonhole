@@ -255,6 +255,8 @@ pub struct BlockBuilder {
     /// first entry of the next block is listed as a row start only if it starts a new row.
     last_row_len: Option<usize>,
     finished: bool,
+    /// Fed through [`add_prefixed`](Self::add_prefixed), which keeps no `last_key`.
+    prefixed: bool,
 }
 
 impl BlockBuilder {
@@ -269,6 +271,7 @@ impl BlockBuilder {
             last_key: Vec::new(),
             last_row_len: None,
             finished: false,
+            prefixed: false,
         }
     }
 
@@ -354,8 +357,61 @@ impl BlockBuilder {
         self.entries == 0
     }
 
-    /// The last key added.
+    /// [`add`](Self::add) for a data block, with the work the caller has already done
+    /// (ICR 0093): `lcp` is `key`'s common prefix length with the previous key added (the
+    /// last key of the previous block too, across [`reset`](Self::reset)), `row_len` is
+    /// `key`'s row prefix length, and the caller has checked that `key` sorts after the
+    /// previous key. Writes exactly what [`add`](Self::add) writes for the same keys, without
+    /// comparing keys or keeping a copy of the last one, so a builder is fed through one of
+    /// the two, never both; [`last_key`](Self::last_key) is not kept by this one.
+    pub fn add_prefixed(
+        &mut self,
+        key: &[u8],
+        value: &[u8],
+        lcp: usize,
+        row_len: usize,
+    ) -> crate::Result<()> {
+        if self.finished {
+            return Err(Error::InvalidArgument {
+                what: "block builder: add after finish",
+            });
+        }
+        if !self.data {
+            return Err(Error::InvalidArgument {
+                what: "block builder: add_prefixed on an index block",
+            });
+        }
+        if self.buf.len() > MAX_BLOCK_LEN {
+            return Err(Error::ValueTooLarge);
+        }
+        self.prefixed = true;
+        let offset = self.buf.len() as u32;
+        // As in `add`: a key sharing the previous key's whole row prefix is in the same row.
+        let same_row = matches!(self.last_row_len, Some(n) if lcp >= n);
+        let shared = if self.entries.is_multiple_of(self.restart_interval) {
+            self.restarts.push(offset);
+            0
+        } else {
+            lcp
+        };
+        if !same_row {
+            self.row_starts.push(offset);
+        }
+        crate::varint::put_u64(&mut self.buf, shared as u64);
+        crate::varint::put_u64(&mut self.buf, (key.len() - shared) as u64);
+        crate::varint::put_u64(&mut self.buf, value.len() as u64);
+        self.buf.extend_from_slice(&key[shared..]);
+        self.buf.extend_from_slice(value);
+        self.last_row_len = Some(row_len);
+        self.entries += 1;
+        Ok(())
+    }
+
+    /// The last key added through [`add`](Self::add). Not kept by
+    /// [`add_prefixed`](Self::add_prefixed): calling this on a builder it fed panics in debug
+    /// builds.
     pub fn last_key(&self) -> &[u8] {
+        debug_assert!(!self.prefixed, "last_key on a builder fed by add_prefixed");
         &self.last_key
     }
 

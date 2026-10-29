@@ -1741,8 +1741,6 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         xshard_rounds: m.cross_shard.rounds,
         xshard_refused_rounds: im("cross_shard.refused_rounds"),
         // Always 0 since D263 (the counters are deprecated); the report keeps its columns.
-        xshard_refused_below_floor: 0,
-        xshard_refused_move_raise: 0,
         xshard_refused_moved: im("cross_shard.refused_moved"),
         xshard_refused_room: im("cross_shard.refused_room"),
         xshard_refused_pending_overlap: im("cross_shard.refused_pending_overlap"),
@@ -1960,13 +1958,19 @@ mod tests {
             .memtable_budget(16 << 20)
             .driver_trace(&path);
         let config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
-        crate::run_detailed(
+        let record = crate::run_detailed(
             &mut r,
             &config,
             &dir.join("db"),
             &crate::RunOptions::default(),
         )
         .unwrap();
+        // D243's amendment: the settle step ran again after the warmup, and settled.
+        let after = record
+            .detail
+            .settle_after_warmup
+            .expect("a settle after the warmup");
+        assert!(after.settled, "{after:?}");
         let text = std::fs::read_to_string(&path).unwrap();
         let phases: Vec<&str> = text
             .lines()
@@ -1976,7 +1980,14 @@ mod tests {
         assert_eq!(
             phases,
             [
-                "open", "load", "settle", "warmup", "measured", "end", "close"
+                "open",
+                "load",
+                "settle",
+                "warmup",
+                "warmup-settle",
+                "measured",
+                "end",
+                "close"
             ],
             "{text}"
         );

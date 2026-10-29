@@ -70,17 +70,25 @@ impl Bytes {
         if !utf8 {
             return Ok(Arc::new(BinaryArray::try_new(offsets, data, None)?));
         }
-        let invalid = offsets
-            .windows(2)
-            .map(|w| &data[w[0] as usize..w[1] as usize])
-            .find(|k| std::str::from_utf8(k).is_err());
-        if let Some(key) = invalid {
-            return Err(ArrowError::InvalidArgumentError(format!(
-                "the {what} {} is not valid UTF-8 (utf8_keys)",
-                display_key(key)
-            )));
+        // Arrow validates the whole buffer once (valid UTF-8, every offset on a character
+        // boundary), which holds exactly when every key is valid; only a failure walks the
+        // keys, to name the first invalid one. The clones are reference counts.
+        match StringArray::try_new(offsets.clone(), data.clone(), None) {
+            Ok(array) => Ok(Arc::new(array)),
+            Err(e) => {
+                let invalid = offsets
+                    .windows(2)
+                    .map(|w| &data[w[0] as usize..w[1] as usize])
+                    .find(|k| std::str::from_utf8(k).is_err());
+                Err(match invalid {
+                    Some(key) => ArrowError::InvalidArgumentError(format!(
+                        "the {what} {} is not valid UTF-8 (utf8_keys)",
+                        display_key(key)
+                    )),
+                    None => e,
+                })
+            }
         }
-        Ok(Arc::new(StringArray::try_new(offsets, data, None)?))
     }
 }
 

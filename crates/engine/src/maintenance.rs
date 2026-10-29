@@ -528,13 +528,18 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     // kept the occupants' old extents): clear no other this call.
     let mut wasted = false;
     // A rewrite that could not grow the file found no free space below the manifest's
-    // extents: ask for none again this call.
+    // extents: ask for none again while rounds stay pinned.
     let mut manifest_stays = false;
     for _round in 0..8 {
         if shared.closing.load(Ordering::Acquire) {
             // The close waits for this call: stop between rounds.
             return Ok(shrunk());
         }
+        #[cfg(feature = "test-hooks")]
+        shared
+            .hooks
+            .sites
+            .run(crate::engine::hooks::HookSite::ShrinkRound);
         // Retired extents no view uses any more are free space: at the tail they are cut
         // off now, below it the relocations can move into them (without this the targets
         // would be allocated past the end of the file).
@@ -548,6 +553,9 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         let pinned = shared.pager.stats().retired_bytes > 0
             || !shared.live_seqnos.list().is_empty()
             || shared.shm.oldest_reader_pin().is_some();
+        // An unpinned round may grow the file, so a pin that held the manifest in place in
+        // an earlier round (a view dropped since, #1107) no longer keeps it there.
+        manifest_stays &= pinned;
         let plan = shared.pager.shrink_plan();
         if held.as_ref().is_some_and(|h| !plan.contains(&h.big)) {
             // Moved or replaced otherwise: the region is not needed.

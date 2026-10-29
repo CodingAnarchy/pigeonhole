@@ -3489,7 +3489,6 @@ fn a_bottommost_compaction_counts_a_prepared_share_above_its_inputs() {
 }
 
 #[test]
-#[allow(deprecated)] // the D263-deprecated refusal counters stay 0
 fn a_cross_shard_commit_lands_above_a_participants_earlier_stamps() {
     // Issue #105, under D271: a participant stamps default timestamps on its own before a
     // cross-shard commit over its tablet. The decision's timestamp comes from the one
@@ -3524,11 +3523,9 @@ fn a_cross_shard_commit_lands_above_a_participants_earlier_stamps() {
     // D271: the timestamp is picked at the decision, above every default timestamp handed
     // out: one round, and the commit lands above the participant's stamps.
     let after = db.engine.metrics().cross_shard;
-    assert_eq!(after.refused_below_floor, before.refused_below_floor);
     assert_eq!(after.refused_rounds, before.refused_rounds);
     assert_eq!(after.rounds - before.rounds, 1);
     assert_eq!(after.refused_moved, before.refused_moved);
-    assert_eq!(after.refused_move_raise, before.refused_move_raise);
     let (ts, v) = db.get(b"z").unwrap();
     assert_eq!(v, b"both");
     assert!(
@@ -4491,7 +4488,6 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
 }
 
 #[test]
-#[allow(deprecated)] // the D263-deprecated refusal counters stay 0
 fn a_cross_shard_commit_no_participant_refuses_counts_one_round() {
     // ICR 0043: `Metrics::cross_shard` counts the coordinator's decided rounds, and only
     // refused ones as refused.
@@ -4523,16 +4519,8 @@ fn a_cross_shard_commit_no_participant_refuses_counts_one_round() {
     assert_eq!(after.rounds - before.rounds, 1);
     assert_eq!(after.refused_rounds, before.refused_rounds);
     assert_eq!(
-        (
-            after.refused_below_floor,
-            after.refused_moved,
-            after.refused_room
-        ),
-        (
-            before.refused_below_floor,
-            before.refused_moved,
-            before.refused_room
-        )
+        (after.refused_moved, after.refused_room),
+        (before.refused_moved, before.refused_room)
     );
     db.engine.close().unwrap();
     for _ in 0..8 {
@@ -5440,7 +5428,6 @@ fn a_prepare_routed_with_an_older_map_runs_when_none_of_its_rows_moved() {
 }
 
 #[test]
-#[allow(deprecated)] // the D263-deprecated refusal counters stay 0
 fn a_commit_refused_many_times_before_the_timeout_still_commits() {
     // As below, but other tablet changes complete many times while the split waits: each
     // one retries the commit, and shard 0 refuses it again. It used to
@@ -5516,7 +5503,6 @@ fn a_commit_refused_many_times_before_the_timeout_still_commits() {
         "{moved} refusals in {refused} rounds"
     );
     assert_eq!(after.rounds - before.rounds, refused + 1);
-    assert_eq!(after.refused_below_floor, before.refused_below_floor);
     close(db);
 }
 

@@ -261,6 +261,64 @@ fn shrink_gives_back_the_space_of_deleted_rows() {
 }
 
 #[test]
+fn shrink_moves_the_manifest_once_a_pin_of_its_first_round_is_gone() {
+    // #1107's CI failure: a view held briefly (here a snapshot dropped between the first
+    // two rounds) kept the compaction's retired SSTs allocated when the first round began, so
+    // that round could not move the manifest down without growing the file (#1098). It
+    // stopped asking for the rest of the call, and the next rounds, no longer pinned, left
+    // the manifest where it was: the file kept 4 MiB with no row left.
+    let vfs = SimVfs::new(1107);
+    let rig = Rig::open(&vfs);
+    let db = &rig.db;
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    write_rows(&rig, &t, 0..3000);
+    rig.flush();
+    rig.compact(None);
+    delete_rows(&rig, t.id, 0..3000);
+    rig.flush();
+    // Taken before the compaction, so it pins the SSTs the compaction retires.
+    let snapshot = Arc::new(Mutex::new(Some(db.snapshot().unwrap())));
+    rig.compact(None);
+    assert_eq!(row_count(db, &t), 0);
+
+    let before = file_len(&vfs);
+    assert!(before >= 4 << 20, "the load grew the file: {before}");
+    // The first round runs pinned, commit included; the second starts with the pin gone.
+    let (db2, dropped) = (Arc::clone(db), Arc::clone(&snapshot));
+    db.on_next(
+        pigeonhole_engine::HookSite::ShrinkRound,
+        Box::new(move || {
+            db2.on_next(
+                pigeonhole_engine::HookSite::ShrinkRound,
+                Box::new(move || {
+                    dropped
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take();
+                }),
+            );
+        }),
+    );
+    db.shrink().unwrap();
+    assert!(
+        snapshot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_none(),
+        "the hook ran inside shrink"
+    );
+    let after = file_len(&vfs);
+    assert!(
+        after <= 512 << 10,
+        "only the manifest is live, yet the file is {after} bytes"
+    );
+    assert_eq!(db.unreferenced_bytes(), 0);
+    rig.close();
+}
+
+#[test]
 fn shrink_skips_an_sst_a_compaction_retired_under_it() {
     // 7 F7-5: a compaction that committed between shrink's catalog read and its relocation
     // retired the input, and `relocate` refused it: shrink failed with "relocate of an

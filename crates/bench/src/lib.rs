@@ -1001,6 +1001,7 @@ pub fn run_detailed(
             warmup_secs: Some(warmed.secs),
             warmup_settle_secs: Some(warmed.settle_secs),
             warmup_settled: Some(warmed.settled),
+            settle_after_warmup: warmed.settle_after,
             drivers: warmed.drivers,
             seqnos_used,
             txn_conflicts,
@@ -1203,7 +1204,15 @@ fn measure(
         (WARMUP_SETTLED, WARMUP_CAP)
     };
     runner.mark_phase("warmup");
-    let warmed = warm_up(runner, &mut clients, &warm, quiet, cap)?;
+    let mut warmed = warm_up(runner, &mut clients, &warm, quiet, cap)?;
+    // D243 (amended 2026-10-29): the settle step again, after the warmup, so the measured
+    // phase starts on an empty write buffer whatever the warmup wrote. How long the warmup
+    // waits for the placement varies run to run, and with it whether a flush lands in the
+    // warmup or the measured phase: adjacency's p50 went 12 or 17 µs with it, 4 for 4,
+    // across the 10-26 and 10-28 gates. A flush inside the measured phase now lands at the
+    // same operation in both runs of a pair.
+    runner.mark_phase("warmup-settle");
+    warmed.settle_after = Some(settle(runner)?);
 
     // The measured operations: the configured count, then, while less than `min_measured`
     // has been measured, the stream's next operations, about enough for the rest at the rate
@@ -1339,6 +1348,7 @@ fn warm_up_on(
             settle_secs: 0.0,
             settled: true,
             drivers: runner.driver_target().map(|(k, _)| k),
+            settle_after: None,
         });
     }
     // A pass stops at the cap on the wall clock too.
@@ -1383,6 +1393,7 @@ fn warm_up_on(
         settle_secs: (last_change - started).as_secs_f64(),
         settled,
         drivers: drivers.map(|(k, _)| k),
+        settle_after: None,
     })
 }
 
@@ -1398,6 +1409,8 @@ struct Warmed {
     settled: bool,
     /// The driver threads the shards ran on at the end (D289 PR 2), if the store reports them.
     drivers: Option<usize>,
+    /// The settle step after the warmup (D243's amendment), once it has run.
+    settle_after: Option<Settle>,
 }
 
 /// Whether the balancer is still heading somewhere (D242's amendments, #983): a growth or

@@ -116,6 +116,55 @@ fn reader_before_any_writer_finds_no_region() {
     }
 }
 
+/// #1133: a new database whose file reuses a deleted database's (device, inode) finds that
+/// database's leftover directory and region, which a killed writer leaves behind. Its reader
+/// gets `NoWriter`, not `Corrupt`, and its writer removes the region and starts at
+/// generation 1 instead of continuing the old database's count.
+#[test]
+fn a_new_database_on_a_reused_inode_ignores_the_old_databases_region() {
+    const NEW_DB_ID: [u8; 16] = [0xCD; 16];
+    let sim = SimVfs::new(9);
+    // The old database's writer builds generations 1 and 2, then dies.
+    let old = Proc::start(&sim, pid(1));
+    drop(old.open_writer());
+    let (lock, presence, shm) = old.open_writer();
+    assert_eq!(shm.generation(), Generation(2));
+    old.crash();
+    std::mem::forget((lock, presence, shm));
+    assert!(old.region_exists(2));
+
+    // The new database: the same file identity, another database id.
+    let new = Proc::start(&sim, pid(2));
+    let open = |role| {
+        new.enter();
+        ShmRegion::open(
+            &new.vfs,
+            &new.file,
+            new.identity,
+            NEW_DB_ID,
+            role,
+            &small_config(),
+        )
+    };
+    match open(Role::Reader) {
+        Err(Error::NoWriter) => {}
+        other => panic!("expected NoWriter before the new database's writer, got {other:?}"),
+    }
+    let _lock = WriterLock::acquire(&new.file).unwrap();
+    let shm = open(Role::Writer).unwrap();
+    let _presence = Presence::acquire(&new.file).unwrap();
+    assert_eq!(shm.generation(), Generation(1));
+    assert_eq!(new.directory_generation(), 1);
+    assert!(
+        !new.region_exists(2),
+        "the old database's region is removed"
+    );
+
+    // Readers of the new database attach to it, and the old database's id no longer does.
+    assert_eq!(open(Role::Reader).unwrap().generation(), Generation(1));
+    assert!(matches!(new.open(Role::Reader), Err(Error::NoWriter)));
+}
+
 #[test]
 fn writer_builds_generations_and_a_second_writer_is_refused() {
     let sim = SimVfs::new(2);
@@ -440,6 +489,11 @@ fn last_process_removes_the_region() {
     assert_eq!(shm2.generation(), Generation(1));
 }
 
+/// A reader whose database id is not the region's is refused. It reports `NoWriter`, not
+/// `Corrupt`, since a region of another database is never this database's live region
+/// (#1133: the usual way here is a deleted database's leftover on a reused inode). With a
+/// live writer, as here, the file must have been replaced under it; telling that apart would
+/// mean probing the writer's lock byte, which a process that holds it would release.
 #[test]
 fn region_belonging_to_another_database_is_refused() {
     let sim = SimVfs::new(8);
@@ -456,7 +510,7 @@ fn region_belonging_to_another_database_is_refused() {
         &small_config(),
     )
     .unwrap_err();
-    assert!(matches!(err, Error::Corrupt(_)), "{err}");
+    assert!(matches!(err, Error::NoWriter), "{err}");
 }
 
 #[test]

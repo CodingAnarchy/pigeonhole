@@ -209,7 +209,9 @@ fn a_blocking_wait_in_a_turn_leaves_a_siblings_io_to_complete() {
 
 /// D289 PR 2: shards move between drivers while their reads are in flight on io_uring. A
 /// shard moves only once its driver's ring is quiet, so every read completes on the ring
-/// that submitted it and every task finishes, under a resize every millisecond.
+/// that submitted it and every task finishes, under a resize every millisecond. Rounds of
+/// reads go on until a move lands while a round's reads are outstanding (at most 10 s): one
+/// round can finish before the churn thread's first move does.
 #[test]
 fn shards_move_between_drivers_with_reads_in_flight() {
     let dir = std::env::temp_dir().join(format!(
@@ -218,6 +220,9 @@ fn shards_move_between_drivers_with_reads_in_flight() {
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let vfs = UringVfs::new().expect("io_uring is available");
+    // Every read goes to a ring, even one the page cache holds (D292): a read copied on the
+    // submitting thread is never in flight when its shard moves.
+    vfs.set_nowait_reads(false);
     let file = vfs
         .open(&dir.join("f"), OpenOptions::read_write_create())
         .unwrap();
@@ -244,26 +249,40 @@ fn shards_move_between_drivers_with_reads_in_flight() {
     };
     let (report, reports) = mpsc::channel();
     let tasks = 400;
-    for i in 0..tasks {
-        rt.submitter(ShardId((i % 4) as u16))
-            .submit(Msg::Spawn(Box::new(ReadAndWait {
-                file: Arc::clone(&file),
-                read: None,
-                report: report.clone(),
-            })))
-            .unwrap();
-    }
-    let mut done = 0;
-    while done < tasks {
-        match reports.recv_timeout(Duration::from_secs(10)) {
-            Ok(Report::Done { .. }) => done += 1,
-            Ok(Report::Submitted { .. }) => {}
-            Err(e) => panic!("{done} of {tasks} reads finished: {e}"),
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let (mut rounds, mut moved_mid_round) = (0, false);
+    while !moved_mid_round && std::time::Instant::now() < deadline {
+        let moves = rt.driver_moves();
+        for i in 0..tasks {
+            rt.submitter(ShardId((i % 4) as u16))
+                .submit(Msg::Spawn(Box::new(ReadAndWait {
+                    file: Arc::clone(&file),
+                    read: None,
+                    report: report.clone(),
+                })))
+                .unwrap();
         }
+        let mut done = 0;
+        while done < tasks {
+            match reports.recv_timeout(Duration::from_secs(10)) {
+                Ok(Report::Done { .. }) => done += 1,
+                Ok(Report::Submitted { .. }) => {
+                    // Read before the round's last read reports done: a move seen here landed
+                    // while some of the round's reads were outstanding.
+                    moved_mid_round |= rt.driver_moves() > moves;
+                }
+                Err(e) => panic!("round {rounds}: {done} of {tasks} reads finished: {e}"),
+            }
+        }
+        rounds += 1;
     }
     stop.store(true, Ordering::Release);
     churn.join().unwrap();
-    assert!(rt.driver_moves() > 0, "no shard moved");
+    assert!(
+        moved_mid_round,
+        "no shard moved while reads were in flight in {rounds} rounds ({} moves)",
+        rt.driver_moves()
+    );
     rt.shutdown().unwrap();
     let _ = std::fs::remove_dir_all(dir);
 }

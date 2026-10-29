@@ -30,7 +30,7 @@ pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 # The default shard count (D220), for the D213 and scaling runs and the report.
 pigeonhole-io = { workspace = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { workspace = true }
 rocksdb = { version = "0.25", default-features = false, optional = true }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
 
@@ -46,6 +46,3 @@ pigeonhole-sst = { workspace = true }
 # The `arrowexport` example measures the Arrow export (#691).
 pigeonhole-arrow = { workspace = true }
 
-[[example]]
-name = "hotrow_runners"
-required-features = ["sqlite"]

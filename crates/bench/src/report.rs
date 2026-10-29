@@ -432,6 +432,11 @@ pub struct RunDetail {
     /// when the warmup ran out first, so the measured phase may include tablet changes.
     #[serde(default)]
     pub warmup_settled: Option<bool>,
+    /// The settle step after the warmup (D243's amendment of 2026-10-29): the store flushed
+    /// again and its background work stopped, so the measured phase starts on an empty write
+    /// buffer. `None` for the inline drivers and in results written before it.
+    #[serde(default)]
+    pub settle_after_warmup: Option<Settle>,
     /// The driver threads the shards ran on when the warmup ended (D289 PR 2's load
     /// controller); `None` for stores without one and in results written before it.
     #[serde(default)]
@@ -733,18 +738,11 @@ pub struct Stalls {
     /// See [`Stalls::xshard_rounds`].
     #[serde(default)]
     pub xshard_refused_rounds: u64,
-    /// Refused PREPAREs by reason: below a timestamp the participant assigned (D11), below a
-    /// tablet move's raised floor, a tablet being changed or moved (D145), no arena room
+    /// Refused PREPAREs by reason: a tablet being changed or moved (D145), or no arena room
     /// (ICR 0042). One refused round can hold several.
     #[serde(default)]
-    pub xshard_refused_below_floor: u64,
-    /// See [`Stalls::xshard_refused_below_floor`].
-    #[serde(default)]
-    pub xshard_refused_move_raise: u64,
-    /// See [`Stalls::xshard_refused_below_floor`].
-    #[serde(default)]
     pub xshard_refused_moved: u64,
-    /// See [`Stalls::xshard_refused_below_floor`].
+    /// See [`Stalls::xshard_refused_moved`].
     #[serde(default)]
     pub xshard_refused_room: u64,
     /// PREPAREs refused because they overlapped another commit's undecided share and retried
@@ -815,14 +813,6 @@ impl Stalls {
             ),
             xshard_rounds: d(before.xshard_rounds, after.xshard_rounds),
             xshard_refused_rounds: d(before.xshard_refused_rounds, after.xshard_refused_rounds),
-            xshard_refused_below_floor: d(
-                before.xshard_refused_below_floor,
-                after.xshard_refused_below_floor,
-            ),
-            xshard_refused_move_raise: d(
-                before.xshard_refused_move_raise,
-                after.xshard_refused_move_raise,
-            ),
             xshard_refused_moved: d(before.xshard_refused_moved, after.xshard_refused_moved),
             xshard_refused_room: d(before.xshard_refused_room, after.xshard_refused_room),
             xshard_refused_pending_overlap: d(
@@ -1268,11 +1258,24 @@ impl Suite {
         Ok(suite)
     }
 
-    /// A markdown summary: environment line, one table row per result, and the
-    /// scaling verdict.
+    /// A markdown summary: environment line, one table row per result, the detail tables
+    /// the results carry, and the gate verdicts.
     pub fn to_markdown(&self) -> String {
-        let env = &self.environment;
         let mut s = String::new();
+        self.environment_md(&mut s);
+        self.results_md(&mut s);
+        self.reads_md(&mut s);
+        self.op_types_md(&mut s);
+        self.rounds_md(&mut s);
+        self.shards_md(&mut s);
+        self.stalls_md(&mut s);
+        self.gates_md(&mut s);
+        self.reported_md(&mut s);
+        s
+    }
+
+    fn environment_md(&self, s: &mut String) {
+        let env = &self.environment;
         let _ = writeln!(s, "**Environment:** {}", env.summary());
         let _ = writeln!(
             s,
@@ -1288,6 +1291,10 @@ impl Suite {
                 "Not reference hardware: reported, never gates a phase (D5)."
             }
         );
+    }
+
+    /// One row per result.
+    fn results_md(&self, s: &mut String) {
         s.push('\n');
         s.push_str("| Workload | Store | Settings | Records | Ops | Threads | Ops/s | p50 µs | p99 µs | p99.9 µs |\n");
         s.push_str("|---|---|---|--:|--:|--:|--:|--:|--:|--:|\n");
@@ -1307,17 +1314,20 @@ impl Suite {
                 us(r.p999_ns)
             );
         }
-        let split: Vec<&RunRecord> = self
+    }
+
+    /// Cold and hot gets and `Busy` retries, for the results that record them.
+    fn reads_md(&self, s: &mut String) {
+        let rows = self
             .results
             .iter()
-            .filter(|r| r.detail.reads.is_some() || r.detail.busy_retries > 0)
-            .collect();
-        if !split.is_empty() {
-            s.push_str(
-                "\n| Workload | Store | Store size | Busy retries | Cold gets | Cold p50 µs | Cold p99 µs | Cold p99.9 µs | Hot gets | Hot p50 µs | Hot p99 µs | Hot p99.9 µs |\n",
-            );
-            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
-            for r in split {
+            .filter(|r| r.detail.reads.is_some() || r.detail.busy_retries > 0);
+        table(
+            s,
+            "| Workload | Store | Store size | Busy retries | Cold gets | Cold p50 µs | Cold p99 µs | Cold p99.9 µs | Hot gets | Hot p50 µs | Hot p99 µs | Hot p99.9 µs |",
+            "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
+            rows,
+            |s, r| {
                 let d = &r.detail;
                 let reads = d.reads.unwrap_or_default();
                 let _ = writeln!(
@@ -1336,19 +1346,19 @@ impl Suite {
                     us(reads.hot.p99_ns),
                     us(reads.hot.p999_ns),
                 );
-            }
-        }
-        let typed: Vec<&RunRecord> = self
-            .results
-            .iter()
-            .filter(|r| r.detail.by_type.len() > 1)
-            .collect();
-        if !typed.is_empty() {
-            s.push_str(
-                "\n| Workload | Store | Op | Count | Mean µs | p50 µs | p99 µs | p99.9 µs |\n",
-            );
-            s.push_str("|---|---|---|--:|--:|--:|--:|--:|\n");
-            for r in typed {
+            },
+        );
+    }
+
+    /// Latency by operation type, for the results with more than one type.
+    fn op_types_md(&self, s: &mut String) {
+        let rows = self.results.iter().filter(|r| r.detail.by_type.len() > 1);
+        table(
+            s,
+            "| Workload | Store | Op | Count | Mean µs | p50 µs | p99 µs | p99.9 µs |",
+            "|---|---|---|--:|--:|--:|--:|--:|",
+            rows,
+            |s, r| {
                 for t in &r.detail.by_type {
                     let _ = writeln!(
                         s,
@@ -1363,25 +1373,28 @@ impl Suite {
                         us(t.stats.p999_ns),
                     );
                 }
-            }
-        }
-        let rounds: Vec<(&RunRecord, Rounds)> = self
+            },
+        );
+    }
+
+    /// Cross-shard two-phase rounds, for the results with cross-shard commits.
+    fn rounds_md(&self, s: &mut String) {
+        let opt = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
+        let rows = self
             .results
             .iter()
-            .filter_map(|r| r.rounds().map(|x| (r, x)))
-            .collect();
-        if !rounds.is_empty() {
-            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: below floor, move raise, moved, room, pending overlap | Seqnos used | Inferred wasted rounds | Share waits, ms held |\n");
-            s.push_str("|---|---|---|--:|--:|--:|--:|---|--:|--:|---|\n");
-            let opt = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
-            for (r, x) in rounds {
+            .filter_map(|r| r.rounds().map(|x| (r, x)));
+        table(
+            s,
+            "| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: moved, room, pending overlap | Seqnos used | Inferred wasted rounds | Share waits, ms held |",
+            "|---|---|---|--:|--:|--:|--:|---|--:|--:|---|",
+            rows,
+            |s, (r, x)| {
                 let reasons = r.detail.stalls.as_ref().map_or_else(
                     || "-".to_owned(),
                     |st| {
                         format!(
-                            "{}, {}, {}, {}, {}",
-                            st.xshard_refused_below_floor,
-                            st.xshard_refused_move_raise,
+                            "{}, {}, {}",
                             st.xshard_refused_moved,
                             st.xshard_refused_room,
                             st.xshard_refused_pending_overlap
@@ -1413,17 +1426,19 @@ impl Suite {
                     opt(x.inferred()),
                     share_waits,
                 );
-            }
-        }
-        let spread: Vec<&RunRecord> = self
-            .results
-            .iter()
-            .filter(|r| r.detail.shards.len() > 1)
-            .collect();
-        if !spread.is_empty() {
-            s.push_str("\n| Workload | Store | Settings | Shard | Commits | Share | Tablets (start → end) | Splits | Merges | Moves |\n");
-            s.push_str("|---|---|---|--:|--:|--:|--:|--:|--:|--:|\n");
-            for r in spread {
+            },
+        );
+    }
+
+    /// Each shard's share of the commits, for the results on more than one shard.
+    fn shards_md(&self, s: &mut String) {
+        let rows = self.results.iter().filter(|r| r.detail.shards.len() > 1);
+        table(
+            s,
+            "| Workload | Store | Settings | Shard | Commits | Share | Tablets (start → end) | Splits | Merges | Moves |",
+            "|---|---|---|--:|--:|--:|--:|--:|--:|--:|",
+            rows,
+            |s, r| {
                 let total: u64 = r.detail.shards.iter().map(|d| d.commits).sum();
                 for (i, d) in r.detail.shards.iter().enumerate() {
                     let _ = writeln!(
@@ -1441,17 +1456,22 @@ impl Suite {
                         d.moves,
                     );
                 }
-            }
-        }
-        let stalled: Vec<(&RunRecord, &Stalls)> = self
+            },
+        );
+    }
+
+    /// Write stalls, background work and parking, for the results that record them.
+    fn stalls_md(&self, s: &mut String) {
+        let rows = self
             .results
             .iter()
-            .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)))
-            .collect();
-        if !stalled.is_empty() {
-            s.push_str("\n| Workload | Store | Threads | Write stalls (room / pacing) | Stalled ms (room / pacing) | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | WAL rollover blocks | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) | Slot refusals |\n");
-            s.push_str("|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|\n");
-            for (r, st) in stalled {
+            .filter_map(|r| r.detail.stalls.as_ref().map(|st| (r, st)));
+        table(
+            s,
+            "| Workload | Store | Threads | Write stalls (room / pacing) | Stalled ms (room / pacing) | Flushes | Compactions | Unpin passes (small flushes) | Inline WAL syncs | WAL rollover blocks | File growths | Growth ms | Shard parks / op | Shard wakes / op | Commit parks / op | Visibility waits (contended) | Slot refusals |",
+            "|---|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|--:|",
+            rows,
+            |s, (r, st)| {
                 let ms = |ns: u64| format!("{:.1}", ns as f64 / 1e6);
                 let per_op = |n: u64| format!("{:.2}", n as f64 / r.operations.max(1) as f64);
                 let _ = writeln!(
@@ -1481,8 +1501,12 @@ impl Suite {
                     st.visibility_contended,
                     st.slot_refusals,
                 );
-            }
-        }
+            },
+        );
+    }
+
+    /// The scaling, placement and group-commit gate verdicts, for the runs that measured them.
+    fn gates_md(&self, s: &mut String) {
         if let Some(sc) = &self.scaling {
             let _ = writeln!(
                 s,
@@ -1564,6 +1588,10 @@ impl Suite {
                 }
             );
         }
+    }
+
+    /// The reported, not judged, unpinned and synchronous-client lines.
+    fn reported_md(&self, s: &mut String) {
         if let Some(sc) = &self.scaling_unpinned {
             let _ = writeln!(
                 s,
@@ -1597,7 +1625,25 @@ impl Suite {
                 sc.efficiency,
             );
         }
-        s
+    }
+}
+
+/// Appends a table: a blank line, `header`, `align`, then `row`'s lines for each of
+/// `rows`; nothing at all if `rows` is empty.
+fn table<T>(
+    s: &mut String,
+    header: &str,
+    align: &str,
+    rows: impl IntoIterator<Item = T>,
+    mut row: impl FnMut(&mut String, T),
+) {
+    let mut rows = rows.into_iter().peekable();
+    if rows.peek().is_none() {
+        return;
+    }
+    let _ = writeln!(s, "\n{header}\n{align}");
+    for r in rows {
+        row(s, r);
     }
 }
 
