@@ -903,7 +903,9 @@ fn a_large_value_submitted_while_a_worker_holds_the_manifest_pump_does_not_wait_
     // while the pump sat on a background worker the same thread drives. On real files the
     // worker's slice completes the pump's root commit inline, so the blocked thread finishes
     // it (`take_done`) without the worker running again. One thread drives the shard and the
-    // worker here, so a wait on the worker would never end: a watchdog fails the test.
+    // worker here, so a wait on the worker would never end: every submit returning is the
+    // check, and a watchdog fails a hang. (No time bound: the submit's own root commit syncs,
+    // which a slow runner's disk takes tens of ms to do; Windows CI saw 5 of 200 over 50 ms.)
     let dir = TempDir::new("pump");
     let vfs = real_vfs();
     let mut o = real_options(&vfs);
@@ -930,7 +932,6 @@ fn a_large_value_submitted_while_a_worker_holds_the_manifest_pump_does_not_wait_
             std::process::abort();
         }
     });
-    let mut slow = 0;
     for i in 0..200u32 {
         // Small rows, then a flush whose manifest commit goes to the worker's pump.
         for j in 0..32u32 {
@@ -952,16 +953,12 @@ fn a_large_value_submitted_while_a_worker_holds_the_manifest_pump_does_not_wait_
         // A few turns: the worker may now hold the pump between its slices.
         step(&*vfs, &mut shard, Some(&mut worker), 1 + (i as usize % 3));
         // A large value from the same thread: its manifest commit must not need the worker.
-        let started = std::time::Instant::now();
         let mut pc = engine
             .submit(
                 put(&t, &(1_000_000 + i).to_be_bytes(), 4096),
                 Some(Durability::Buffered),
             )
             .unwrap();
-        if started.elapsed() > std::time::Duration::from_millis(50) {
-            slow += 1;
-        }
         for _ in 0..1024 {
             if ready(&mut pc).is_some() && ready(&mut f).is_some() {
                 break;
@@ -972,7 +969,6 @@ fn a_large_value_submitted_while_a_worker_holds_the_manifest_pump_does_not_wait_
     }
     done_tx.send(()).unwrap();
     watchdog.join().unwrap();
-    assert_eq!(slow, 0, "submits that took over 50 ms");
     engine.close().unwrap();
     let closing = std::time::Instant::now();
     // The close finishes on the shard's turns within the take-back windows (real time).
