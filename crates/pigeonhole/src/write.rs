@@ -372,7 +372,9 @@ impl CommitTicket {
     }
 
     /// The commit's sequence number once it has resolved successfully (D196: a seqno is
-    /// assigned by the owning shard after submission, so it is not known at once).
+    /// assigned by the owning shard after submission, so it is not known at once). It takes
+    /// `&mut self` because it polls the commit, as [`try_result`](Self::try_result) does: a
+    /// `None` may become `Some` on a later call, and never changes back.
     pub fn seqno(&mut self) -> Option<u64> {
         self.try_result()?.ok().map(|c| c.seqno)
     }

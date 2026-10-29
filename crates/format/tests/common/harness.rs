@@ -32,11 +32,23 @@ pub fn key(data: &[u8]) {
             q.unescape_into(&mut out);
         }
     }
+    // The row length a scan or point read already knows (the in-row decoder trusts none of it).
+    for row_len in [
+        0,
+        data.len() / 3,
+        usize::from(data.first().copied().unwrap_or(0)),
+    ] {
+        let _ = key::decode_key_in_row(data, row_len);
+    }
+    let (a, b) = data.split_at(data.len() / 2);
+    let _ = (key::compare(a, b), key::common_prefix_len(a, b));
     let _ = key::split_suffix(data);
     let _ = key::row_prefix_len(data);
     let _ = key::column_prefix_len(data);
     let e = Escaped::new(data);
     let _ = (e.is_verbatim(), e.eq_raw(data));
+    let mut out = Vec::new();
+    e.unescape_long_into(&mut out);
     let split = data.len() / 2;
     let filters = [
         ScanFilter::all(),
@@ -59,6 +71,7 @@ pub fn key(data: &[u8]) {
         let _ = f.admits(data);
         let mut hint = Vec::new();
         let _ = f.next_admissible(data, &mut hint);
+        let _ = f.compile().check(data, &mut hint);
     }
     let _ = value::decode_value(data);
     let _ = value::BlobPointer::decode(data);
@@ -80,6 +93,14 @@ pub fn block(data: &[u8]) {
                 break;
             }
             let _ = (it.key(), it.value(), it.value_range(), it.entry_offset());
+            // A data block's entries are internal keys and stored values; an index block's
+            // values are block addresses.
+            if let Ok(p) = key::decode_key(it.key()) {
+                let row_len = p.row.as_escaped().len();
+                assert!(key::decode_key_in_row(it.key(), row_len).is_ok());
+            }
+            let _ = value::decode_value(it.value());
+            let _ = BlockAddr::decode_varint(it.value());
             if it.next().is_err() {
                 break;
             }
@@ -89,6 +110,16 @@ pub fn block(data: &[u8]) {
         let _ = it.seek(&data[..data.len().min(9)]);
         let _ = it.skip_row();
         let _ = it.next();
+        // Filtered-scan moves: a forward seek from the current entry and a column skip.
+        let _ = it.seek_to_first();
+        let _ = it.seek_forward(&data[data.len() / 2..]);
+        let _ = it.skip_column(&data[..data.len().min(5)]);
+        let _ = it.seek_forward(&data[data.len() / 3..]);
+        let _ = it.next();
+        if it.reset(data).is_ok() {
+            let _ = it.seek(&data[data.len() / 2..]);
+            let _ = it.skip_column(&data[data.len() / 2..]);
+        }
     }
     physical(data);
     let mut sealed = data.to_vec();
@@ -196,6 +227,13 @@ pub fn manifest(data: &[u8]) {
         let sum = xxh3_64(&[&block[..48], &block[64..]].concat());
         block[48..56].copy_from_slice(&sum.to_le_bytes());
         let _ = decode_block(&block);
+    }
+    if let Ok(s) = superblock::Superblock::decode(data) {
+        let _ = (
+            s.features.check_read(),
+            s.features.check_write(),
+            s.version.is_readable(),
+        );
     }
     let _ = superblock::Superblock::choose(
         superblock::Superblock::decode(data),

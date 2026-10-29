@@ -13,8 +13,7 @@ Both `Table::row(key)` (a `RowRead`) and `Table::scan*` (a `Scan`) are builders.
 | `latest()` | ✓ | ✓ | Newest version of each column (default). |
 | `versions(n)` | ✓ | ✓ | Up to `n` versions per column (0: all retained). |
 | `time_range(a..b)` | ✓ | ✓ | Only versions with timestamp in `[a, b)` (microseconds). |
-| `column_limit(n)` | ✓ |  | At most `n` columns per family. |
-| `columns_per_row(n)` |  | ✓ | At most `n` columns per family per row; the rest of the row is skipped without decoding. |
+| `column_limit(n)` | ✓ | ✓ | At most `n` columns per family; a scan applies it to each row and skips the rest of the row without decoding. |
 | `value_filter(f)` | ✓ | ✓ | Only cells whose value matches. |
 | `limit(n)` |  | ✓ | Stop after `n` rows (`limit(0)` returns none). |
 | `snapshot(&snap)` | ✓ | ✓ | Read as of a snapshot instead of now. |
@@ -122,7 +121,7 @@ let it = t.scan_prefix(b"sensor:").time_range(t0_us..t1_us).versions(0).iter()?;
 
 ## Limiting work
 - `limit(n)` stops after `n` rows. Use it for pagination: remember the last key and resume with `scan_bounds(Bound::Excluded(last_key), ...)`.
-- `columns_per_row(n)` caps columns per family per row and skips the rest of each row without decoding. Use it to read "the first few attributes" of very wide rows.
+- `column_limit(n)` caps columns per family in each row and skips the rest of each row without decoding. Use it to read "the first few attributes" of very wide rows.
 
 ```rust
 # use pigeonhole::*;
@@ -134,7 +133,7 @@ let it = t.scan_prefix(b"sensor:").time_range(t0_us..t1_us).versions(0).iter()?;
 let page = t
     .scan_bounds(Bound::Excluded(last_key.as_slice()), Bound::Unbounded)
     .family("meta")
-    .columns_per_row(5)
+    .column_limit(5)
     .limit(100)
     .iter()?;
 # Ok::<(), pigeonhole::Error>(())
@@ -186,7 +185,7 @@ Filters run **before values are materialized**, and every data source (memtables
 | Family projection | Choosing which trees to open | Unprojected families cost nothing. |
 | Qualifier prefix / range | Inside the block decoder | |
 | Time range | Inside the block decoder, on puts | |
-| `versions`, `columns_per_row` / `column_limit` | In version resolution, after snapshot visibility | Counted over versions **visible** at the snapshot. |
+| `versions`, `column_limit` | In version resolution, after snapshot visibility | Counted over versions **visible** at the snapshot. |
 | Value predicates | In version resolution, before materialization | Test the newest visible value of a column. |
 
 Consequences you should know:

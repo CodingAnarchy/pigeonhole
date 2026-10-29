@@ -438,8 +438,8 @@ impl<'a> RowRef<'a> {
 ///
 /// let rows: Vec<Row> = t.scan_prefix(b"").iter()?.collect::<pigeonhole::Result<_>>()?;
 /// assert_eq!(rows.len(), 2);
-/// let (family, qualifier, cell) = rows[1].entry(0).unwrap();
-/// assert_eq!((family, qualifier, cell.value()), ("f", &b"q"[..], &b"2"[..]));
+/// let e = rows[1].entry(0).unwrap();
+/// assert_eq!((e.family, e.qualifier, e.cell.value()), ("f", &b"q"[..], &b"2"[..]));
 /// assert_eq!(rows[0].get("f", b"q").unwrap().value(), b"1");
 /// # db.close()?;
 /// # Ok(())
@@ -470,9 +470,14 @@ impl Row {
         self.len() == 0
     }
 
-    /// The `i`th cell: family name, qualifier and version.
-    pub fn entry(&self, i: usize) -> Option<(&str, &[u8], &Cell)> {
-        self.buf.entry(i)
+    /// The `i`th cell, as [`RowRef::entry`] gives it (ICR 0086).
+    pub fn entry(&self, i: usize) -> Option<CellEntry<'_>> {
+        let (family, qualifier, cell) = self.buf.entry(i)?;
+        Some(CellEntry {
+            family,
+            qualifier,
+            cell: CellRef::borrowed(&cell.data),
+        })
     }
 
     /// The newest version of one column.

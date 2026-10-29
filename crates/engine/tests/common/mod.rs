@@ -1406,8 +1406,10 @@ struct World {
     /// Per stream, parallel to `stream_records`: how many crashes had happened when each
     /// record was appended (a seqno may be reused only across a crash).
     stream_epochs: BTreeMap<u32, Vec<usize>>,
-    /// Commit timestamps of the batch records the engine appended, by seqno, with the crash
-    /// count when appended (seqnos are reused only across a crash).
+    /// Commit timestamps of the batch records the engine appended, and of the DECISIONs at
+    /// the seqno each applies its commit at (D263), by seqno, with the crash count when
+    /// appended: seqnos are reused only across a crash, so an entry from an earlier crash
+    /// count is another commit's (#1063).
     appended_ts: HashMap<Seqno, (usize, Timestamp)>,
     /// D263: each decided commit's id, with the seqno and timestamp its
     /// DECISION applies it at, from the engine's append order.
@@ -1608,6 +1610,9 @@ impl World {
             let seqno = if kind == RecKind::Commit && r.apply_seqno != 0 {
                 self.decided_ids
                     .insert(r.seqno, (r.apply_seqno, r.commit_ts));
+                // A decided commit has no batch record at the seqno it applies at, so a lost
+                // commit's entry there from before a crash would otherwise stand (#1063).
+                self.appended_ts.insert(r.apply_seqno, (epoch, r.commit_ts));
                 // Only this run's PREPAREs: an id whose PREPAREs a crash lost (or a seqno a
                 // lost DECISION reserved) may be taken again after it, as a lost seqno may.
                 let crashes = epoch;
@@ -3671,8 +3676,9 @@ impl World {
             self.check_acked(seqno, &c, &info.expect("successes carry info"))?;
             if c.durability != Durability::None {
                 let ts = match self.appended_ts.get(&seqno) {
-                    Some((_, ts)) => Some(*ts),
-                    None => {
+                    // Only this crash count's: an earlier one's is a lost commit's (#1063).
+                    Some(&(epoch, ts)) if epoch == self.stats.crashes => Some(ts),
+                    _ => {
                         if logged.is_none() {
                             logged = self.logged_timestamps().ok();
                         }

@@ -15,7 +15,10 @@ fn sample(dir: &TempDir) -> std::path::PathBuf {
     let events = db
         .table("events")
         .unwrap()
-        .family("e", Family::default().zstd(3))
+        .family(
+            "e",
+            Family::default().compression(pigeonhole::Compression::Zstd(3)),
+        )
         .create()
         .unwrap();
     for i in 0..50u32 {
@@ -39,7 +42,7 @@ fn sample(dir: &TempDir) -> std::path::PathBuf {
             "history",
             Family::default()
                 .ttl(days(30))
-                .uncompressed()
+                .compression(pigeonhole::Compression::None)
                 .compaction(Compaction::Tiered),
         )
         .create()

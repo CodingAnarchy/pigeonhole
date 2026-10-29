@@ -44,7 +44,7 @@ let pages = db
 
 | Family holds | Settings that help |
 |---|---|
-| Small, hot attributes (status) | `max_versions(1)`, `Priority::High`, `uncompressed()` if tiny |
+| Small, hot attributes (status) | `max_versions(1)`, `Priority::High`, `compression(Compression::None)` if tiny |
 | Counters | `Family::counter()`; a `ttl` to keep only recent buckets |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. `blob_threshold` keeps them out of the family's tree |

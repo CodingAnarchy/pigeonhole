@@ -190,7 +190,7 @@ fn public_family(f: &ModelFamily) -> Family {
         .blob_threshold(blob_threshold);
     // `f` stores its blocks with zstd (#44).
     let family = if f.name == "f" {
-        family.zstd(3)
+        family.compression(pigeonhole::Compression::Zstd(3))
     } else {
         family
     };
@@ -608,12 +608,12 @@ fn ref_cells(row: &pigeonhole::RowRef<'_>) -> Vec<ModelCell> {
 fn owned_cells(row: &pigeonhole::Row) -> Vec<ModelCell> {
     (0..row.len())
         .map(|i| {
-            let (family, qualifier, cell) = row.entry(i).expect("in range");
+            let e = row.entry(i).expect("in range");
             ModelCell {
-                family: family.to_owned(),
-                qualifier: qualifier.to_vec(),
-                ts: cell.timestamp(),
-                value: cell.value().to_vec(),
+                family: e.family.to_owned(),
+                qualifier: e.qualifier.to_vec(),
+                ts: e.cell.timestamp(),
+                value: e.cell.value().to_vec(),
             }
         })
         .collect()

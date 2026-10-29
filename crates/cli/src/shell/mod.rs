@@ -431,7 +431,7 @@ impl Session {
                     s = s.limit(n);
                 }
                 if let Some(n) = args.num("columns-per-row")? {
-                    s = s.columns_per_row(n as u32);
+                    s = s.column_limit(n as u32);
                 }
                 if let Some(snap) = snapshot {
                     s = s.snapshot(snap);

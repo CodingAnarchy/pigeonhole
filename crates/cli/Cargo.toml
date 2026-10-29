@@ -28,6 +28,8 @@ arrow-ipc = { workspace = true }
 # The tests use pigeonhole's test hooks (`Options::wal_segment_size`, ICR 0085).
 pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
 insta = { version = "1.49", features = ["filters"] }
+# `tests/check_fixtures.rs` rewrites structures with valid checksums.
+pigeonhole-format = { workspace = true }
 
 [lints]
 workspace = true

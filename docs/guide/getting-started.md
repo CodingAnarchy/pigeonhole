@@ -120,7 +120,7 @@ On an existing table, a declared family that is not yet present is added (cheap)
 
 The returned `Table` is cheap to clone and `Send + Sync`. Also available: `db.tables()`, `db.drop_table(name)`, `table.name()`, `table.families()`.
 
-`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `lz4()` (default), `uncompressed()`, `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`, `zstd(level)` (smaller blocks than LZ4, for more CPU), and `merge_operator(name)`, which names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`). `Family::counter()` declares a counter family, the only kind that takes `incr` (see [Counters](data-modeling.md#counters)). `blob_threshold(bytes)` (default 4096) moves larger values to blob files.
+`Family` settings you will use first: `max_versions(n)` (0 keeps all), `ttl(Duration)`, `bloom_bits(u8)`, `compression(Compression)` (`Lz4` by default; `Zstd(level)`, smaller blocks than LZ4 for more CPU; or `None`), `block_size(u32)`, `cache_priority(Priority)`, `compaction(Compaction::Leveled | Tiered | FifoByTime)`, and `merge_operator(name)`, which names an operator registered with `Options::merge_operator` (an unregistered name fails with `ErrorCode::UnknownMergeOperator`). `Family::counter()` declares a counter family, the only kind that takes `incr` (see [Counters](data-modeling.md#counters)). `blob_threshold(bytes)` (default 4096) moves larger values to blob files.
 
 ## Write one row atomically
 ```rust

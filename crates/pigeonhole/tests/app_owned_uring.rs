@@ -216,7 +216,7 @@ fn an_event_loop_waiting_on_the_completion_fd_completes_the_shards_io() {
             .expect("the row is there");
         assert_eq!(cell.value(), &[7u8; 512]);
         assert_eq!(
-            db.async_sync_reads(),
+            db.engine_metrics().async_sync_reads,
             0,
             "every block was fetched asynchronously"
         );
