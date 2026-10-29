@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+### Fixed
+- **A compaction's output is freed once, not twice, when its table is dropped just before the compaction commits** (#1056). If a `drop_table` committed after a compaction had checked its table but before the compaction's own manifest commit, the manifest freed the compaction's output SST twice: once as an orphan, and again as the refused request's output, for a compaction with a purge guard or new blob files. Another flush or compaction allocating space between the two could lose an extent it still used, which it then published over free space. Present since 0.2.0.
+
 ## [0.3.3] - 2026-10-26
 One io_uring fix from `main` (#976) and a dependency update (#979). **Upgrade recommended** for every 0.3.x user on Linux, where io_uring is the default backend: when the kernel refused an io_uring submission for now (`EAGAIN` under memory pressure), the backend could free or reuse a buffer the kernel still read into or wrote from. zstd moves to 0.14.3, clearing four RustSec advisories (none reachable from Pigeonhole's use of it). The file format and the shared-memory layout are unchanged; files written by 0.3.0 through 0.3.2 open as before, and 0.3.2 opens files written by 0.3.3.
 

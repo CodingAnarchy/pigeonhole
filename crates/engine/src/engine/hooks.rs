@@ -1081,6 +1081,13 @@ impl Engine {
         manifest::claim(&self.inner.shared)
     }
 
+    /// How many manifest requests wait in the queue, behind a held exclusion
+    /// ([`hold_manifest`](Self::hold_manifest)) or a commit in progress (test hook).
+    #[doc(hidden)]
+    pub fn manifest_queue_len(&self) -> usize {
+        self.inner.shared.manifest_queue.len()
+    }
+
     /// Commits every queued manifest request on this thread, which holds the exclusion
     /// ([`hold_manifest`](Self::hold_manifest)) (test hook).
     #[doc(hidden)]
