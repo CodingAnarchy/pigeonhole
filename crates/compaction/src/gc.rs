@@ -524,7 +524,7 @@ impl Gc {
             };
             // Consecutive kept operands of one stripe combine (no put between them, or it
             // would shadow the older one).
-            let combine = pending.is_some_and(|(stripe, _)| stripe == i);
+            let combine = e.kind == Kind::Merge && pending.is_some_and(|(stripe, _)| stripe == i);
             self.emit(e, keep, combine, &mut pending, out);
         }
         self.flush_pending(pending, out);
