@@ -1,0 +1,23 @@
+# Performance compared with SQLite
+
+Pigeonhole is often weighed against SQLite: both are embedded, single-file stores. This page states the tradeoff for point reads under a mixed read-write load, measured as #759 judges it.
+
+**Setup:** 16 threads on one machine (AMD Ryzen 9 7950X3D, NVMe, Linux 6.8). YCSB A (50% reads, 50% updates) and F (50% reads, 50% read-modify-writes) over 1 million rows. Each store has the same 1 GiB of read cache. Both run at their default durability: Pigeonhole's `Durability::GroupSync`, and SQLite in WAL mode with `synchronous=FULL`.
+
+| | SQLite | Pigeonhole, as fast as it goes | Pigeonhole, at SQLite's rate |
+|---|--:|--:|--:|
+| Operations per second (YCSB A) | 39K | 497K | 39K |
+| Operations per second (YCSB F) | 38K | 361K | 38K |
+| Row read p50 | 8 µs | 3–4 µs | 2–3 µs |
+| Row read p99 | 19 µs | 28–30 µs | 26–29 µs |
+| Row read p99.9 | 44–47 µs | 41–42 µs | 37–40 µs |
+| Write p99.9 | 129 ms | 0.16–0.22 ms | 0.14–0.20 ms |
+
+- **Throughput:** Pigeonhole does 9–13× SQLite's operations per second. SQLite commits through a single writer with an fsync per transaction, so more threads don't make it faster. It reaches its ceiling at 4 threads.
+- **Typical reads:** Pigeonhole is 2–4× faster at the median.
+- **Read p99:** Pigeonhole's is about 10 µs higher (1.4–1.6×), whatever the load. It comes from Pigeonhole's read path for a row held in cache, not from cache misses: a larger cache doesn't remove it (27 µs at 5 GiB). Nor does slowing Pigeonhole down to SQLite's rate.
+- **The far tail:** Pigeonhole's read p99.9 is lower. SQLite's writes have a 129 ms p99.9. That's its default busy handler: a writer that finds the database locked sleeps and retries, and the sleeps grow while other writers hold the lock.
+
+If your reads must stay under ~20 µs at the 99th percentile and SQLite's single-writer throughput is enough, SQLite meets that and Pigeonhole doesn't yet. If you need more write throughput, a lower median, or bounded write tails under contention, Pigeonhole is ahead on each.
+
+The benchmark is `phdb-bench` in this repository (`--cache-model total --cache 1073741824`, plus `--offered-rate` for the paced runs; [`docs/bench.md`](../bench.md) has the options). The full results are on [#759](https://github.com/CodingAnarchy/pigeonhole/issues/759).
