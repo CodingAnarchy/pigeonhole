@@ -343,7 +343,15 @@ fn scan_escaped(b: &[u8]) -> crate::Result<(usize, usize)> {
     let mut i = 0;
     let mut raw = 0;
     loop {
-        let Some(z) = b[i..].iter().position(|&c| c == 0) else {
+        // `find_zero`'s split, written here so it inlines whatever the call site's size: the
+        // byte loop for a short remainder (most parts), eight bytes a step for a long one.
+        let rest = &b[i..];
+        let found = if rest.len() < 16 {
+            rest.iter().position(|&c| c == 0)
+        } else {
+            find_zero_words(rest)
+        };
+        let Some(z) = found else {
             return Err(Error::Corrupt {
                 what: "key: missing terminator",
             });
