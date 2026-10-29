@@ -1473,7 +1473,9 @@ impl World {
                 AppendedKind::Prepare => RecKind::Prepare,
                 AppendedKind::Commit => RecKind::Commit,
             };
-            if kind == RecKind::Batch {
+            // A cross-shard commit's PREPAREs carry its timestamp: recorded too, so a batch a
+            // crash lost at the same seqno doesn't stand for it (#1063).
+            if kind == RecKind::Batch || kind == RecKind::Prepare {
                 self.appended_ts
                     .insert(r.seqno, (self.stats.crashes, r.commit_ts));
             }
