@@ -452,9 +452,11 @@ impl PigeonholeRunner {
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
     ///
-    /// assert!(!PigeonholeRunner::default().describe().contains("shard_threads"));
+    /// assert!(!PigeonholeRunner::default().describe().contains("shard_threads=4"));
     /// let r = PigeonholeRunner::default().shard_threads(4);
+    /// // A fixed count turns the load controller off: no adaptive label beside it.
     /// assert!(r.describe().contains(" shard_threads=4"));
+    /// assert!(!r.describe().contains("adaptive"));
     /// ```
     pub fn shard_threads(mut self, k: usize) -> Self {
         self.settings.shard_threads = Some(k);
@@ -496,7 +498,9 @@ impl PigeonholeRunner {
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
     ///
-    /// assert!(!PigeonholeRunner::default().describe().contains("shard_threads="));
+    /// // The library's default, labelled as such: earlier unlabelled baselines ran a thread
+    /// // per shard.
+    /// assert!(PigeonholeRunner::default().describe().contains(" shard_threads=adaptive"));
     /// let r = PigeonholeRunner::default().adaptive_shard_threads();
     /// assert!(r.describe().contains(" shard_threads=adaptive"));
     /// ```
@@ -1165,10 +1169,17 @@ impl Runner for PigeonholeRunner {
             } else {
                 ""
             },
-            match s.adaptive_shard_threads {
-                Some(true) => " shard_threads=adaptive",
-                Some(false) => " shard_threads=per-shard",
-                None => "",
+            // The option's setting (the library's default is on), labelled even when it is
+            // the default, so baselines from before #1082 (a thread per shard, unlabelled)
+            // never match runs with the controller. Application-owned runs ignore it (D40).
+            // A fixed `shard_threads` turns the controller off and is labelled on its own.
+            match (
+                s.adaptive_shard_threads,
+                s.shard_threads.is_some_and(|k| k != 0)
+            ) {
+                (_, true) => "",
+                (Some(false), false) => " shard_threads=per-shard",
+                (Some(true) | None, false) => " shard_threads=adaptive",
             },
             s.commit_spin_micros
                 .map_or_else(String::new, |us| format!(" commit_spin={us}us")),

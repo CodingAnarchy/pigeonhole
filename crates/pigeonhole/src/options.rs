@@ -81,7 +81,8 @@ pub enum CpuProfile {
     /// The database has the machine or container to itself, and its clients reach it from
     /// elsewhere (another container, over IPC or the network): flush and compaction take
     /// half the physical cores instead of a quarter. Shard threads are the same as with
-    /// `Embedded`, one per shard by default.
+    /// `Embedded`: up to one per shard, sized to the load by default
+    /// ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     Server,
 }
 
@@ -214,8 +215,9 @@ impl Options {
 
     /// Number of shards, the data partitions each row belongs to (default: one per physical
     /// core the process may run on, D220; SMT siblings count once, and a cgroup CPU quota
-    /// still caps it). Each shard runs on a thread of its own unless
-    /// [`shard_threads`](Options::shard_threads) says otherwise (D289).
+    /// still caps it). Engine-owned shards run on up to a thread each, as few as the load
+    /// needs ([`adaptive_shard_threads`](Options::adaptive_shard_threads), on by default),
+    /// unless [`shard_threads`](Options::shard_threads) fixes the count (D289).
     /// `1` is a valid configuration.
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
@@ -428,8 +430,10 @@ impl Options {
     ///   asleep waits for the operating system to wake and schedule it, up to a scheduler
     ///   slice (about 1 ms on Linux) when the application's threads keep the CPUs busy.
     ///   Fewer threads, each busier, sleep less.
-    /// - **Default `0`:** one thread per shard. `k` at or above the shard count means the
-    ///   same.
+    /// - **Default `0`:** up to one thread per shard, sized to the load
+    ///   ([`adaptive_shard_threads`](Options::adaptive_shard_threads), on by default). A
+    ///   set `k` fixes the count and turns the sizing off; `k` at or above the shard count
+    ///   means a thread per shard.
     /// - **Pinning:** the `k` threads are pinned as the shard threads are
     ///   ([`pin_threads`](Options::pin_threads)).
     /// - Engine-owned mode only: application-owned shards run on threads you choose.
@@ -450,8 +454,9 @@ impl Options {
     /// and [`compaction_cores`](Options::compaction_cores) set explicitly still win, and the
     /// profile fills in the rest.
     ///
-    /// - **Shard threads, both profiles:** one per shard, so one per physical core by
-    ///   default.
+    /// - **Shard threads, both profiles:** up to one per shard, so one per physical core at
+    ///   most by default, and fewer while the load is light
+    ///   ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
     ///   and needs CPU too. Flush and compaction take a quarter of the physical cores.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
