@@ -32,7 +32,8 @@ fn suite_markdown_matches_the_golden_file() {
         std::fs::write(&golden, &got).unwrap();
         return;
     }
-    let want = std::fs::read_to_string(&golden).unwrap();
+    // A Windows checkout may turn the golden file's line endings into CRLF.
+    let want = std::fs::read_to_string(&golden).unwrap().replace("\r\n", "\n");
     if got != want {
         let line = got.lines().zip(want.lines()).position(|(g, w)| g != w);
         panic!(
