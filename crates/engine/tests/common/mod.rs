@@ -1473,7 +1473,9 @@ impl World {
                 AppendedKind::Prepare => RecKind::Prepare,
                 AppendedKind::Commit => RecKind::Commit,
             };
-            if kind == RecKind::Batch {
+            // A cross-shard commit's PREPAREs carry its timestamp: recorded too, so a batch a
+            // crash lost at the same seqno doesn't stand for it (#1063).
+            if kind == RecKind::Batch || kind == RecKind::Prepare {
                 self.appended_ts
                     .insert(r.seqno, (self.stats.crashes, r.commit_ts));
             }
@@ -3260,8 +3262,11 @@ impl World {
             self.check_acked(seqno, &c, &info.expect("successes carry info"))?;
             if c.durability != Durability::None {
                 let ts = match self.appended_ts.get(&seqno) {
-                    Some((_, ts)) => Some(*ts),
-                    None => {
+                    // Only this crash count's: an earlier one's is a lost commit's at a seqno
+                    // a crash freed, and a cross-shard commit there has no batch record to
+                    // replace it (#1063).
+                    Some(&(epoch, ts)) if epoch == self.stats.crashes => Some(ts),
+                    _ => {
                         if logged.is_none() {
                             logged = self.logged_timestamps().ok();
                         }
