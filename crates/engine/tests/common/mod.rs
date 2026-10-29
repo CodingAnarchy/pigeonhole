@@ -3260,8 +3260,11 @@ impl World {
             self.check_acked(seqno, &c, &info.expect("successes carry info"))?;
             if c.durability != Durability::None {
                 let ts = match self.appended_ts.get(&seqno) {
-                    Some((_, ts)) => Some(*ts),
-                    None => {
+                    // Only this crash count's: an earlier one's is a lost commit's at a seqno
+                    // a crash freed, and a cross-shard commit there has no batch record to
+                    // replace it (#1063).
+                    Some(&(epoch, ts)) if epoch == self.stats.crashes => Some(ts),
+                    _ => {
                         if logged.is_none() {
                             logged = self.logged_timestamps().ok();
                         }
