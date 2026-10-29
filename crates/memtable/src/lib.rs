@@ -137,10 +137,28 @@ const MAX_HEIGHT: usize = layout::MAX_HEIGHT;
 /// levels keep the cursor small: it is built and moved for every read.
 const FINGER_LEVELS: usize = 4;
 
-/// A search's step count, against a budget that catches a link cycle.
+/// A walk's step count, against a budget that catches a link cycle.
+#[derive(Debug, Default)]
 struct Walk {
     steps: usize,
     budget: usize,
+}
+
+impl Walk {
+    /// Counts a step: [`Error::Corrupt`] once the walk has taken more steps than `reader`
+    /// has entries (plus [`STEP_SLACK`]). Entries may have been published since the last
+    /// check, so the count is re-read before deciding.
+    #[inline(always)]
+    fn step(&mut self, reader: &MemtableReader) -> Result<()> {
+        self.steps += 1;
+        if self.steps > self.budget {
+            self.budget = reader.len() + STEP_SLACK;
+            if self.steps > self.budget {
+                return Err(Error::Corrupt("link cycle"));
+            }
+        }
+        Ok(())
+    }
 }
 /// Bytes reserved at the start of every arena; offset `0` is null.
 const RESERVED: usize = 64;
@@ -520,12 +538,9 @@ impl ShardArena {
                 continue;
             }
             let mut count = 1;
-            while self.usable(first, count) < bytes {
-                if first + count < n && self.free[first + count] {
-                    count += 1;
-                } else {
-                    break;
-                }
+            while self.usable(first, count) < bytes && first + count < n && self.free[first + count]
+            {
+                count += 1;
             }
             if self.usable(first, count) >= bytes {
                 for c in first..first + count {
@@ -1121,8 +1136,7 @@ impl MemtableReader {
             reader: self.clone(),
             node: None,
             preds: [NULL; FINGER_LEVELS],
-            steps: 0,
-            budget: 0,
+            walk: Walk::default(),
             #[cfg(loom)]
             key_buf: Vec::new(),
             #[cfg(loom)]
@@ -1277,14 +1291,7 @@ impl MemtableReader {
             if level >= n.height {
                 return Err(Error::Corrupt("node linked above its height"));
             }
-            walk.steps += 1;
-            if walk.steps > walk.budget {
-                // Entries may have been published meanwhile; re-read before deciding.
-                walk.budget = self.len() + STEP_SLACK;
-                if walk.steps > walk.budget {
-                    return Err(Error::Corrupt("link cycle"));
-                }
-            }
+            walk.step(self)?;
             if mem.cmp(n.key_off, n.key_len, target) == Cmp::Less {
                 *cur = next;
             } else {
@@ -1354,8 +1361,7 @@ pub struct MemIter {
     preds: [u32; FINGER_LEVELS],
     /// Nodes stepped to since the last seek, and how many are plausible before the walk is
     /// declared a cycle.
-    steps: usize,
-    budget: usize,
+    walk: Walk,
     #[cfg(loom)]
     key_buf: Vec<u8>,
     #[cfg(loom)]
@@ -1379,13 +1385,7 @@ impl MemIter {
     /// bug) is [`Error::Corrupt`], never a fault or a silent skip of live entries.
     fn jump(&mut self, mut at: u32, column: &[u8]) -> Result<bool> {
         loop {
-            self.steps += 1;
-            if self.steps > self.budget {
-                self.budget = self.reader.len() + STEP_SLACK;
-                if self.steps > self.budget {
-                    return Err(Error::Corrupt("link cycle"));
-                }
-            }
+            self.walk.step(&self.reader)?;
             if self.reader.trusted {
                 // This process wrote the tail: checked in debug builds only, so a
                 // `record_tail` bug still fails the tests.
@@ -1540,7 +1540,7 @@ impl Cursor for MemIter {
 
     fn seek_to_first(&mut self) -> Result<()> {
         let first = self.reader.successor(self.reader.head)?;
-        self.steps = 0;
+        self.walk.steps = 0;
         self.preds[0] = NULL;
         self.set(first);
         Ok(())
@@ -1548,7 +1548,7 @@ impl Cursor for MemIter {
 
     fn seek(&mut self, target: &[u8]) -> Result<()> {
         let found = self.reader.search(target, &mut self.preds, false)?;
-        self.steps = 0;
+        self.walk.steps = 0;
         self.set(found);
         Ok(())
     }
@@ -1559,7 +1559,7 @@ impl Cursor for MemIter {
     fn seek_forward(&mut self, target: &[u8]) -> Result<()> {
         let finger = self.preds[0] != NULL;
         let found = self.reader.search(target, &mut self.preds, finger)?;
-        self.steps = 0;
+        self.walk.steps = 0;
         self.set(found);
         Ok(())
     }
@@ -1586,14 +1586,7 @@ impl Cursor for MemIter {
         let Some(node) = self.node else {
             return Ok(());
         };
-        self.steps += 1;
-        if self.steps > self.budget {
-            // Entries may have been published since the last check; re-read the count.
-            self.budget = self.reader.len() + STEP_SLACK;
-            if self.steps > self.budget {
-                return Err(Error::Corrupt("link cycle"));
-            }
-        }
+        self.walk.step(&self.reader)?;
         let next = self.reader.successor(node.off)?;
         self.set(next);
         Ok(())
