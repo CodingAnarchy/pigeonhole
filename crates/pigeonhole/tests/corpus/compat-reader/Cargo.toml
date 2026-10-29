@@ -1,0 +1,13 @@
+[package]
+name = "compat-reader"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace: CI's "main's files with 1.0.0" job builds it against the published
+# 1.0.0 (FORMAT.md §13). Never a member of the main workspace, whose `pigeonhole` is the
+# build under test.
+[workspace]
+
+[dependencies]
+pigeonhole = "=1.0.0"
