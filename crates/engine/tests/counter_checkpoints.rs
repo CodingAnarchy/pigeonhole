@@ -103,8 +103,11 @@ fn a_long_fold_leaves_a_checkpoint_and_no_read_changes() {
     assert_eq!(r.latest(b"r"), 300);
     r.incr(b"r", 5);
     assert_eq!(r.latest(b"r"), 305);
+    assert_eq!(r.db.counter_checkpoints(), (1, 0), "only the first fold asked for one");
+    // The snapshot read below the checkpoint passes the ~200 entries above its snapshot too,
+    // and may send a second checkpoint, at its own newest folded entry, asynchronously: its
+    // outcome is not asserted (a race with this thread, perf2 on #1055); only the reads.
     assert_eq!(r.at(&old, b"r"), 100, "a snapshot below the checkpoint");
-    assert_eq!(r.db.counter_checkpoints(), (1, 0));
     // The checkpoint flushes as a base under the later operand (D287's combine).
     r.db.flush().unwrap();
     assert_eq!(r.latest(b"r"), 305);
