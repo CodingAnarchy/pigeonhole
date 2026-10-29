@@ -658,8 +658,23 @@ fn pump_commit_in_flight(
 fn complete_root_commit(rig: &Rig, now: bool) -> Option<thread::JoinHandle<()>> {
     let dev = Arc::clone(&rig.dev);
     let device = move || {
+        // The count drops in an op's completion, after `SimVfs` has taken the op off its
+        // list: while another thread completes it (a thread blocked on it runs it itself),
+        // the count still shows it and there is nothing left to complete. Wait for the count
+        // then, bounded (about 1 s) so a root commit nobody completes still fails. A
+        // `complete_io` that finds nothing draws no seeded choice, so a seed still replays.
+        let mut idle = 0;
         while dev.in_flight(Path::new(DB)) > 0 {
-            assert!(dev.sim.complete_io());
+            if dev.sim.complete_io() {
+                idle = 0;
+                continue;
+            }
+            idle += 1;
+            assert!(
+                idle < 10_000,
+                "a root commit in flight that nothing completes"
+            );
+            thread::sleep(Duration::from_micros(100));
         }
     };
     if now {
