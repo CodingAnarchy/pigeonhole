@@ -412,15 +412,15 @@ impl SstIter {
         load(&mut self.data, h)
     }
 
-    /// A block `lookup` did not find: read from the file, or, in cache-only mode, the
-    /// `Error::WouldBlock` that names it (ICR 0014). Out of line, so a hit never reads the
-    /// mode.
+    /// A block `lookup` did not find: read from the file, or, in cache-only mode, read in
+    /// place if that doesn't wait on the device, else the `Error::WouldBlock` that names it
+    /// with its read in flight (ICR 0014, #709). Out of line, so a hit never reads the mode.
     #[cold]
     #[inline(never)]
     fn load_missed(&self, addr: BlockAddr, kind: BlockKind) -> Result<BlockHandle> {
         let blocks = &self.reader.inner.blocks;
         if self.options.cache_only {
-            return Err(blocks.would_block(addr, kind, self.options.priority));
+            return blocks.fetch_now(addr, kind, self.options.priority);
         }
         blocks.read_uncached(addr, kind, self.options.fill_cache, self.options.priority)
     }

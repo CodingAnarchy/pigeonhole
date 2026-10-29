@@ -642,14 +642,16 @@ fn readahead_fetches_ahead_and_the_scan_uses_what_it_fetched() {
             "fill {fill}: {reads} reads with readahead, {plain_reads} without"
         );
         // A cursor that must not fill the cache leaves it as it was: the first block (read
-        // synchronously) is cached only when filling.
+        // synchronously) is cached only when filling, so only then does a cache-only cursor
+        // reach it without reading the file (it reads a missing block in place, #709).
         let mut cached = r.iter(ScanFilter::all(), {
             let mut o = ReadOptions::default();
             o.cache_only = true;
             o
         });
-        let first = cached.seek_to_first();
-        assert_eq!(first.is_ok(), fill, "fill {fill}: {first:?}");
+        let (first, probe_reads) = pigeonhole_sst::counting_file_reads(|| cached.seek_to_first());
+        first.unwrap();
+        assert_eq!(probe_reads == 0, fill, "fill {fill}: {probe_reads} reads");
     }
 }
 
@@ -722,13 +724,42 @@ fn a_resumed_ramp_reads_ahead_at_the_size_it_had_reached() {
 
 #[test]
 fn a_cache_only_cursor_never_fetches_ahead() {
-    let (_vfs, r, _) = many_blocks(22);
+    // It reads a missing block in place when the read completes at once, as the simulator's
+    // reads do (a page-cache hit on a real file, #709), and submits no readahead.
+    let (_vfs, r, want) = many_blocks(22);
     let mut o = readahead(4, true, false);
     o.cache_only = true;
-    let (res, counts) =
-        pigeonhole_sst::counting_readahead(|| r.iter(ScanFilter::all(), o).seek_to_first());
-    assert!(matches!(res, Err(Error::WouldBlock(_))), "{res:?}");
+    let mut it = r.iter(ScanFilter::all(), o);
+    let (res, counts) = pigeonhole_sst::counting_readahead(|| it.seek_to_first());
+    res.unwrap();
+    assert_eq!(it.key(), &want[0].0[..]);
     assert_eq!(counts.issued, 0);
+}
+
+#[test]
+fn a_cache_only_miss_that_must_wait_carries_its_read_in_flight() {
+    // #709: a read that does not complete at once (deferred here; a device read on a real
+    // file) fails the cursor with `WouldBlock` carrying the read it submitted. Starting the
+    // fetch resumes that read instead of submitting another.
+    let (vfs, r, want) = many_blocks(27);
+    vfs.set_deferred_io(true);
+    let mut o = ReadOptions::default();
+    o.cache_only = true;
+    let mut it = r.iter(ScanFilter::all(), o);
+    let Err(Error::WouldBlock(mut fetch)) = it.seek_to_first() else {
+        panic!("a deferred read completes later");
+    };
+    let done = fetch.start();
+    assert!(vfs.complete_io());
+    assert!(
+        !vfs.complete_io(),
+        "starting the fetch submitted a second read"
+    );
+    fetch.admit(done.wait().unwrap()).unwrap();
+    // The rest of the seek reads in place once reads complete at once again.
+    vfs.set_deferred_io(false);
+    it.seek_to_first().unwrap();
+    assert_eq!(it.key(), &want[0].0[..]);
 }
 
 #[test]

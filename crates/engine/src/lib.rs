@@ -68,7 +68,7 @@ pub use engine::{
 };
 pub use error::{Error, Result};
 pub use health::{Failure, FailureCause};
-pub use nonblocking::{GetFuture, RowFuture};
+pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::EngineOptions;
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};

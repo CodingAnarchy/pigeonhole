@@ -25,6 +25,9 @@
 //! beside them, about 0.5-0.7% of the data at this row shape. With less, each get also reads
 //! its index partition: about two I/Os.
 //!
+//! `COLDGET_ASYNC=1` reads each row through `read_async` instead (blocked on in place), to
+//! count an async read's device reads (#709).
+//!
 //! It measures nothing about the page cache: open with direct I/O (`PIGEONHOLE_DIRECT=1`),
 //! or cap the process's memory (a cgroup) and empty the page cache before each `get`, as
 //! `baselines/phase3-io/cold-get.sh` does. The backend comes from `PIGEONHOLE_IO` (`pread`,
@@ -168,6 +171,11 @@ fn device_reads(dev: Option<&str>) -> Option<u64> {
     stat.split_whitespace().next()?.parse().ok()
 }
 
+/// Whether gets go through the async API (`COLDGET_ASYNC=1`).
+fn is_async() -> bool {
+    std::env::var("COLDGET_ASYNC").is_ok_and(|v| v == "1")
+}
+
 fn env_or(k: &str, default: u64) -> u64 {
     std::env::var(k)
         .ok()
@@ -194,9 +202,14 @@ fn run(
                     for _ in 0..gets / threads {
                         let k = row(rng.below(rows));
                         let start = Instant::now();
-                        let row = t.row(&k).family("f").read().unwrap();
+                        let some = if is_async() {
+                            let read = t.row(&k).family("f").read_async();
+                            pigeonhole::doc_support::block_on(read).unwrap().is_some()
+                        } else {
+                            t.row(&k).family("f").read().unwrap().is_some()
+                        };
                         hist.record(start.elapsed());
-                        found += u64::from(std::hint::black_box(row).is_some());
+                        found += u64::from(std::hint::black_box(some));
                     }
                     (hist, found)
                 })
@@ -249,7 +262,7 @@ fn get(dir: &Path) {
              \"p50_us\":{:.1},\"p99_us\":{:.1},\"p999_us\":{:.1},\"max_us\":{:.1},\
              \"found\":{:.4},\"gets_per_sec\":{:.0},\"cache_misses_per_get\":{:.3},\
              \"device_reads_per_get\":{device},\"cache_mib\":{cache_mib},\"io\":\"{}\",\
-             \"direct\":\"{}\"}}",
+             \"direct\":\"{}\",\"async\":{}}}",
             hist.count(),
             us(0.5),
             us(0.99),
@@ -260,6 +273,7 @@ fn get(dir: &Path) {
             (misses_after - misses_before) as f64 / n,
             env("PIGEONHOLE_IO"),
             env("PIGEONHOLE_DIRECT"),
+            is_async(),
         );
     }
     drop(t);
