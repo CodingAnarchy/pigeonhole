@@ -6,6 +6,9 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-10-29
+One engine fix from `main` (#1056), also released as 0.2.6. **Upgrade recommended** for every 0.3.x user: if a table was dropped just after a compaction of it had finished its work but before the compaction committed, the compaction's output space could be freed twice, and another flush or compaction writing at the same moment could then lose space it was still using, which corrupts the data it writes. The file format and the shared-memory layout are unchanged; files written by 0.3.0 through 0.3.3 open as before, and 0.3.3 opens files written by 0.3.4.
+
 ### Fixed
 - **A compaction's output is freed once, not twice, when its table is dropped just before the compaction commits** (#1056). If a `drop_table` committed after a compaction had checked its table but before the compaction's own manifest commit, the manifest freed the compaction's output SST twice: once as an orphan, and again as the refused request's output, for a compaction with a purge guard or new blob files. Another flush or compaction allocating space between the two could lose an extent it still used, which it then published over free space. Present since 0.2.0.
 
@@ -362,7 +365,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.3...v0.3.4
 [0.3.3]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.0...v0.3.1
