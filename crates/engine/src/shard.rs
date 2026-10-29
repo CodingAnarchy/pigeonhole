@@ -10644,10 +10644,6 @@ pub fn set_tracing(on: bool) {
     TRACING.store(if on { TRACE_ON } else { TRACE_OFF }, Ordering::Relaxed);
 }
 
-/// Logs to stderr when `PIGEONHOLE_TRACE` is set (CONTRIBUTING.md, "Test environment variables"):
-/// the only output the engine library writes. It writes to the stderr handle itself, not
-/// through `eprintln!`, so a test harness's output capture (which shard threads spawned by
-/// a test inherit) cannot swallow it when a hung test aborts the process.
 /// Whether test fault `Fault::$fault` fires here (a one-shot fault switches itself off);
 /// always false without the `test-hooks` feature, so the branch it guards compiles away.
 macro_rules! fault {
@@ -10676,6 +10672,10 @@ fn accepted<T>(result: &std::result::Result<T, pigeonhole_wal::Error>) -> bool {
     )
 }
 
+/// Logs to stderr when `PIGEONHOLE_TRACE` is set (CONTRIBUTING.md, "Test environment variables"):
+/// the only output the engine library writes. It writes to the stderr handle itself, not
+/// through `eprintln!`, so a test harness's output capture (which shard threads spawned by
+/// a test inherit) cannot swallow it when a hung test aborts the process.
 macro_rules! trace {
     ($($arg:tt)*) => {
         if $crate::shard::tracing() {
