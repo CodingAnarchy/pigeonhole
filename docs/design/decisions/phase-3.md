@@ -2784,8 +2784,8 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 - **Names:** with a thread per shard (`shard_threads` 0, or at least the shard count) the threads keep the names `pigeonhole-shard-{i}`. Otherwise every driver is `pigeonhole-driver-{d}`.
 - **Placement is round-robin, not blocks of n/k:** packing (D217) keeps shards `0..active` busy, and round-robin spreads them over the drivers where blocks would put them all on driver 0.
 
-**How the controller runs (PR 2):** `RuntimeConfig::adaptive_drivers`. In `pigeonhole` it's **opt-in**: `Options::adaptive_shard_threads(true)`, for engine-owned opens without a fixed `shard_threads`. By default, engine-owned keeps one thread per shard, as before D289.
-- **Why opt-in (the owner, 2026-10-28, #1006):** six box rounds showed the mechanism sound but the resize policy noisy across load phases.
+**How the controller runs (PR 2):** `RuntimeConfig::adaptive_drivers`. In `pigeonhole` it's **on by default** (amended below, 2026-10-28): `Options::adaptive_shard_threads`, for engine-owned opens without a fixed `shard_threads`. `adaptive_shard_threads(false)` keeps one thread per shard, as before D289.
+- **Why it was opt-in at first (the owner, 2026-10-28, #1006):** six box rounds showed the mechanism sound but the resize policy noisy across load phases.
   - **Round 5** (3f83e186): transfer, ycsb-a and ycsb-f level with main; sparse-wide put p99 51/350 µs against 236/489.
   - **Round 6** (ec922c8c, after round 5's fixes): ycsb-a −5% and sparse-wide's tail gain lost. The slow-pass rule grew the set on idle windows between a load and a run, ycsb-a at 8 drivers sat just under `GROW_BUSY` with no signal, and sparse-wide's warm-up sibling wait (0.2–0.7) exceeded its steady-phase value (0.04–0.08).
   - Each round fixed one phase-dependent edge and exposed another.
@@ -2837,7 +2837,7 @@ With the old `None`, 4 of the combining tests fail. The `counters` model-check t
 
 **The CPU budget (ICR 0081; owner, 2026-10-27, #760 comments 6443979201, 6444135824 and 6446722456):** one function sizes the engine-owned threads from the physical cores the process may use, after its affinity mask and a container's CPU quota (`pigeonhole_io::sys::default_shards`).
 - **Shards:** one per core, as before (D220).
-- **The driver count:** a thread per shard by default (one per core with the default shard count). With the controller opted in, that is its ceiling: under full load a store keeps a thread per shard's throughput (#997's A/B: ycsb-f −8% at 8 of 16), and the controller shrinks a light one.
+- **The driver count:** a thread per shard at most (one per core with the default shard count). That is the controller's ceiling: under full load a store keeps a thread per shard's throughput (#997's A/B: ycsb-f −8% at 8 of 16), and the controller shrinks a light one.
 - **The profiles differ in the compaction share** (`Options::cpu_profile`). These are placeholders until PR 2's compaction-share arms (c = 2, 4, 8 at 16 cores):
   - `Embedded` (the default) gives flush and compaction a quarter of the cores, leaving the application the rest and every SMT sibling;
   - `Server` (the clients are elsewhere: another container, IPC, the network) gives them half.
@@ -2894,6 +2894,12 @@ PR 1 changes none of these. PR 2's moves take a blocked driver's other shards on
   - The controller's unit tests: the shrink in one step and no lower than two, growth on a saturated driver and on sibling wait over 20 windows (not on slow passes alone), no shrink of an idle store, and a shrink that stands through an ops dip without sibling wait and grows back with it.
   - #1015: `a_trace_without_the_controller_logs_its_decisions_but_never_resizes` (runtime), and the bench's `a_traced_run_marks_its_phases_between_the_driver_windows`.
   - `pigeonhole/tests/model.rs` takes `PIGEONHOLE_DRIVER_CHURN=1`, forcing seeded resizes after one step in ten.
+
+**Amended (owner, 2026-10-28): the controller is on by default.** After #1015's tuning (#1017) passed two consecutive unchanged box rounds, the owner made default-on conditional on a ycsb-a `Buffered` ×3 off/on run being level.
+- **That run** (main 70e0175a): off 1443K/1536K/1530K ops/s, on 1516K/1467K/1516K, with p99 level.
+- **The fresh gate:** sparse-wide's `Buffered` put p99 was 66–107 µs on against 545–909 µs off, at level throughput; transfer, ycsb-a and ycsb-f were level.
+- **The change:** `adaptive_shard_threads` became public and defaults to true (#1082; ICR 0081 and 0085 amended). A fixed `shard_threads`, `adaptive_shard_threads(false)` and application-owned mode keep fixed threads.
+- **History:** opt-in at PR 2 (#1006); on by default from #1082.
 
 <a id="d290"></a>
 ## D290 — Snapshot and transaction point gets go through the writer's row cache, gets fill on a second miss, and a commit moves a cached row forward (coordinator, 2026-10-27; reviewed by simp724, #708 c6455806598; cache, shm, engine, pigeonhole, #708, ICR 0082; amends D201)

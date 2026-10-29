@@ -342,6 +342,7 @@ impl core::fmt::Display for pigeonhole::MergeError
 pub fn pigeonhole::MergeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole::Options
 impl pigeonhole::Options
+pub fn pigeonhole::Options::adaptive_shard_threads(self, bool) -> Self
 pub fn pigeonhole::Options::allow_fuse(self, bool) -> Self
 pub fn pigeonhole::Options::auto_recover(self, pigeonhole::Recovery) -> Self
 pub fn pigeonhole::Options::background_workers(self, usize) -> Self

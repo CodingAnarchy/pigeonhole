@@ -45,3 +45,6 @@ A process that inherited `PIGEONHOLE_IO` or `PIGEONHOLE_DIRECT` silently switche
 - **Docs:** the agent reference, getting-started, async.md, concepts.md, the crate README and CONTRIBUTING's environment table.
 
 The applications this breaks are those that called `commit_spin`, `shard_spin`, `adaptive_shard_threads`, `tablet_changes`, `tablet_packing` or `allow_unregistered_merge_operators`. They drop the call: the defaults stand, and `read_only_fallback` replaces the alias. The upgrade notes in release-1.0 say so.
+
+## Amendment (owner, 2026-10-28; #1015, perf287)
+`Options::adaptive_shard_threads` leaves the feature and becomes public and **on by default**. R3 hid it because D289's controller was still being tuned (#1015). The tuning merged in #1017, and the owner made default-on conditional on a ycsb-a `Buffered` ×3 off/on run being level. On the box (main 70e0175a), off ran at 1443K/1536K/1530K ops/s and on at 1516K/1467K/1516K, with p99 level. In the fresh gate, sparse-wide's `Buffered` put p99 was 66–107 µs on against 545–909 µs off, and transfer, ycsb-a and ycsb-f were level. `adaptive_shard_threads(false)` keeps a thread per shard; a set `shard_threads` still turns it off. The applications R3 broke can call it again.

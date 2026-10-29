@@ -155,11 +155,13 @@ OPTIONS:
     --server-profile       Pigeonhole: the server CPU profile (D289, ICR 0081): flush
                            and compaction take half the physical cores, not a quarter
     --adaptive-shard-threads
-                           Pigeonhole: the load controller sizes the shard threads
-                           (D289, experimental) [default: a thread per shard]
+                           Pigeonhole: the load controller sizes the shard threads, set
+                           explicitly (D289) [default: the library's, on]
+    --no-adaptive-shard-threads
+                           Pigeonhole: a thread per shard, never resized (A/B runs)
     --driver-trace PATH    Pigeonhole: append the driver controller's 100 ms windows and
-                           the run's phase marks to PATH as JSON lines (#1015); without
-                           --adaptive-shard-threads the controller only observes
+                           the run's phase marks to PATH as JSON lines (#1015); with
+                           --no-adaptive-shard-threads the controller only observes
     --commit-spin US       Pigeonhole: a blocking None/Buffered commit's spin before it
                            parks, in µs (D253) [default: the library's]
     --txn-backoff US       Pigeonhole: transactions (transfer, ycsb-f's pigeonhole-txn)
@@ -227,7 +229,7 @@ struct Args {
     background_workers: usize,
     compaction_cores: Option<usize>,
     server_profile: bool,
-    adaptive_shard_threads: bool,
+    adaptive_shard_threads: Option<bool>,
     driver_trace: Option<std::path::PathBuf>,
     commit_spin: Option<u64>,
     txn_backoff: Option<u64>,
@@ -313,7 +315,8 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--background-workers" => a.background_workers = parse(&arg, it.next())?,
             "--compaction-cores" => a.compaction_cores = Some(parse(&arg, it.next())?),
             "--server-profile" => a.server_profile = true,
-            "--adaptive-shard-threads" => a.adaptive_shard_threads = true,
+            "--adaptive-shard-threads" => a.adaptive_shard_threads = Some(true),
+            "--no-adaptive-shard-threads" => a.adaptive_shard_threads = Some(false),
             "--driver-trace" => a.driver_trace = Some(parse(&arg, it.next())?),
             "--commit-spin" => a.commit_spin = Some(parse(&arg, it.next())?),
             "--txn-backoff" => a.txn_backoff = Some(parse(&arg, it.next())?),
@@ -418,8 +421,10 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     if a.server_profile {
         r = r.server_profile();
     }
-    if a.adaptive_shard_threads {
-        r = r.adaptive_shard_threads();
+    match a.adaptive_shard_threads {
+        Some(true) => r = r.adaptive_shard_threads(),
+        Some(false) => r = r.fixed_shard_threads(),
+        None => {}
     }
     if let Some(path) = &a.driver_trace {
         r = r.driver_trace(path);
@@ -858,7 +863,15 @@ mod tests {
             Some(8)
         );
         assert!(args("ycsb-a --server-profile").server_profile);
-        assert!(args("ycsb-a --adaptive-shard-threads").adaptive_shard_threads);
+        assert_eq!(args("ycsb-a").adaptive_shard_threads, None);
+        assert_eq!(
+            args("ycsb-a --adaptive-shard-threads").adaptive_shard_threads,
+            Some(true)
+        );
+        assert_eq!(
+            args("ycsb-a --no-adaptive-shard-threads").adaptive_shard_threads,
+            Some(false)
+        );
         assert_eq!(args("ycsb-a --commit-spin 0").commit_spin, Some(0));
         assert_eq!(args("transfer --txn-backoff 0").txn_backoff, Some(0));
         assert!(pigeonhole(&rc, None).describe().contains(" rowcache=1MiB"));

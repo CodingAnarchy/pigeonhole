@@ -1124,9 +1124,10 @@ impl Pigeonhole {
     /// The load controller's windows since the last call, one JSON object each (D289,
     /// #1015): every driver's busy, passes, slow passes, ops and sibling wait, the producer
     /// wakes, and what the controller decided. Empty in application-owned mode. The first
-    /// call starts the log; without
-    /// [`Options::adaptive_shard_threads`](crate::Options::adaptive_shard_threads) it starts an
-    /// observe-only controller that logs what it would decide but never resizes. A bench hook.
+    /// call starts the log; with
+    /// [`Options::adaptive_shard_threads`](crate::Options::adaptive_shard_threads) off it starts
+    /// an observe-only controller that logs what it would decide but never resizes. A bench
+    /// hook.
     #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn driver_trace(&self) -> Vec<String> {
