@@ -1107,102 +1107,101 @@ impl Runner for PigeonholeRunner {
     }
 
     fn describe(&self) -> String {
+        use std::fmt::Write as _;
         let s = &self.settings;
         let shards = s.shards.map_or_else(
             || format!("default({})", pigeonhole_io::sys::default_shards()),
             |n| n.to_string(),
         );
-        let reads = format!(
-            "{}{}",
-            if s.no_nowait_reads { " nowait=off" } else { "" },
-            if s.no_get_fill { " get-fill=off" } else { "" }
+        let cache = match (s.memory.model, caches(s)) {
+            (CacheModel::Total, (block, Some(row))) => format!(
+                "{}MiB total (block {}MiB + row {}MiB)",
+                s.memory.cache >> 20,
+                block >> 20,
+                row >> 20
+            ),
+            _ => format!("{}MiB", s.memory.cache >> 20),
+        };
+        let durability = if s.default_durability {
+            default_durability()
+        } else if s.group_sync {
+            "group-sync"
+        } else {
+            durability(s.sync)
+        };
+        let mut d = format!(
+            "shards={shards} memtable={}MiB cache={cache} bloom={BLOOM_BITS} {durability}",
+            s.memory.write_buffer >> 20
         );
-        format!(
-            "shards={shards} memtable={}MiB cache={} bloom={BLOOM_BITS} {}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}{}",
-            s.memory.write_buffer >> 20,
-            match (s.memory.model, caches(s)) {
-                (CacheModel::Total, (block, Some(row))) => format!(
-                    "{}MiB total (block {}MiB + row {}MiB)",
-                    s.memory.cache >> 20,
-                    block >> 20,
-                    row >> 20
-                ),
-                _ => format!("{}MiB", s.memory.cache >> 20),
-            },
-            if s.default_durability {
-                default_durability()
-            } else if s.group_sync {
-                "group-sync"
-            } else {
-                durability(s.sync)
-            },
-            if s.load_buffered {
-                " load=buffered"
-            } else {
-                ""
-            },
-            match (s.tablet_changes == Some(false), s.no_packing) {
-                (true, _) => "",
-                (false, false) => " tablets=on",
-                (false, true) => " tablets=on packing=off",
-            },
-            reads,
-            match (s.memory.model, s.row_cache) {
-                // Under the total model the cache field above names the row cache.
-                (CacheModel::Total, _) | (_, None) => String::new(),
-                (_, Some(0)) => " rowcache=off".to_owned(),
-                (_, Some(bytes)) => format!(" rowcache={}MiB", bytes >> 20),
-            },
-            s.shard_spin_micros
-                .map_or_else(String::new, |us| format!(" shard_spin={us}us")),
-            s.shard_threads
-                .map_or_else(String::new, |k| format!(" shard_threads={k}")),
-            if s.background_workers > 0 {
-                format!(" workers={}", s.background_workers)
-            } else {
-                String::new()
-            },
-            s.compaction_cores
-                .map_or_else(String::new, |c| format!(" compaction_cores={c}")),
-            if s.server_profile {
-                " profile=server"
-            } else {
-                ""
-            },
-            // The option's setting (the library's default is on), labelled even when it is
-            // the default, so baselines from before #1082 (a thread per shard, unlabelled)
-            // never match runs with the controller. Application-owned runs ignore it (D40).
-            // A fixed `shard_threads` turns the controller off and is labelled on its own.
-            match (
-                s.adaptive_shard_threads,
-                s.shard_threads.is_some_and(|k| k != 0)
-            ) {
-                (_, true) => "",
-                (Some(false), false) => " shard_threads=per-shard",
-                (Some(true) | None, false) => " shard_threads=adaptive",
-            },
-            s.commit_spin_micros
-                .map_or_else(String::new, |us| format!(" commit_spin={us}us")),
-            match (s.presplit, s.presplit_writes) {
-                (_, true) => " presplit=writes",
-                (true, false) => " presplit",
-                _ => "",
-            },
-            if s.riders { " riders" } else { "" },
-            if s.reader_processes > 0 {
-                format!(" readers={}", s.reader_processes)
-            } else {
-                String::new()
-            },
-            if s.async_in_flight > 0 {
-                format!(" async={}", s.async_in_flight)
-            } else {
-                String::new()
-            },
-            if s.rmw_txn { " rmw=txn" } else { "" },
-            s.txn_backoff_micros
-                .map_or_else(String::new, |us| format!(" txn_backoff={us}us")),
-        )
+        // Each label in its fixed place: the string is part of `RunRecord::key`.
+        let mut flag = |on: bool, label: &str| {
+            if on {
+                d.push_str(label);
+            }
+        };
+        flag(s.load_buffered, " load=buffered");
+        flag(s.tablet_changes != Some(false), " tablets=on");
+        flag(
+            s.tablet_changes != Some(false) && s.no_packing,
+            " packing=off",
+        );
+        flag(s.no_nowait_reads, " nowait=off");
+        flag(s.no_get_fill, " get-fill=off");
+        match (s.memory.model, s.row_cache) {
+            // Under the total model the cache field above names the row cache.
+            (CacheModel::Total, _) | (_, None) => {}
+            (_, Some(0)) => d.push_str(" rowcache=off"),
+            (_, Some(bytes)) => _ = write!(d, " rowcache={}MiB", bytes >> 20),
+        }
+        if let Some(us) = s.shard_spin_micros {
+            _ = write!(d, " shard_spin={us}us");
+        }
+        if let Some(k) = s.shard_threads {
+            _ = write!(d, " shard_threads={k}");
+        }
+        if s.background_workers > 0 {
+            _ = write!(d, " workers={}", s.background_workers);
+        }
+        if let Some(c) = s.compaction_cores {
+            _ = write!(d, " compaction_cores={c}");
+        }
+        if s.server_profile {
+            d.push_str(" profile=server");
+        }
+        // The option's setting (the library's default is on), labelled even when it is
+        // the default, so baselines from before #1082 (a thread per shard, unlabelled)
+        // never match runs with the controller. Application-owned runs ignore it (D40).
+        // A fixed `shard_threads` turns the controller off and is labelled on its own.
+        if !s.shard_threads.is_some_and(|k| k != 0) {
+            d.push_str(match s.adaptive_shard_threads {
+                Some(false) => " shard_threads=per-shard",
+                Some(true) | None => " shard_threads=adaptive",
+            });
+        }
+        if let Some(us) = s.commit_spin_micros {
+            _ = write!(d, " commit_spin={us}us");
+        }
+        if s.presplit_writes {
+            d.push_str(" presplit=writes");
+        } else if s.presplit {
+            d.push_str(" presplit");
+        }
+        if s.riders {
+            d.push_str(" riders");
+        }
+        if s.reader_processes > 0 {
+            _ = write!(d, " readers={}", s.reader_processes);
+        }
+        if s.async_in_flight > 0 {
+            _ = write!(d, " async={}", s.async_in_flight);
+        }
+        if s.rmw_txn {
+            d.push_str(" rmw=txn");
+        }
+        if let Some(us) = s.txn_backoff_micros {
+            _ = write!(d, " txn_backoff={us}us");
+        }
+        d
     }
 }
 
@@ -1814,6 +1813,76 @@ pub(crate) fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
 mod tests {
     use super::*;
     use crate::{Workload, WorkloadConfig, WorkloadKind};
+
+    /// `describe` is the store's `store_config`, part of `RunRecord::key`, the key
+    /// `phdb-bench compare` matches baselines on: every label, exactly as written.
+    #[test]
+    fn describe_labels_every_setting_exactly() {
+        let describe = |f: &dyn Fn(&mut Settings)| {
+            let mut r = PigeonholeRunner::default();
+            f(&mut r.settings);
+            r.describe()
+        };
+        let shards = pigeonhole_io::sys::default_shards();
+        let cases = [
+            describe(&|_| {}),
+            describe(&|s| {
+                s.shards = Some(4);
+                s.sync = true;
+                s.load_buffered = true;
+                s.no_packing = true;
+                s.no_nowait_reads = true;
+                s.no_get_fill = true;
+                s.row_cache = Some(0);
+                s.shard_spin_micros = Some(50);
+                s.shard_threads = Some(2);
+                s.background_workers = 4;
+                s.compaction_cores = Some(3);
+                s.server_profile = true;
+                s.commit_spin_micros = Some(10);
+                s.presplit = true;
+                s.riders = true;
+                s.reader_processes = 2;
+                s.async_in_flight = 16;
+                s.rmw_txn = true;
+                s.txn_backoff_micros = Some(100);
+            }),
+            describe(&|s| {
+                s.memory.model = CacheModel::Total;
+                s.group_sync = true;
+                s.tablet_changes = Some(false);
+                s.row_cache = Some(64 << 20);
+                s.adaptive_shard_threads = Some(false);
+                s.presplit_writes = true;
+            }),
+            describe(&|s| {
+                s.default_durability = true;
+                s.tablet_changes = Some(true);
+                s.row_cache = Some(32 << 20);
+                s.adaptive_shard_threads = Some(true);
+                s.shard_threads = Some(0);
+                s.no_get_fill = true;
+            }),
+        ];
+        let expected = [
+            "shards=default(N) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on \
+             shard_threads=adaptive",
+            "shards=4 memtable=64MiB cache=256MiB bloom=10 sync load=buffered tablets=on \
+             packing=off nowait=off get-fill=off rowcache=off shard_spin=50us shard_threads=2 \
+             workers=4 compaction_cores=3 profile=server commit_spin=10us presplit riders \
+             readers=2 async=16 rmw=txn txn_backoff=100us",
+            "shards=default(N) memtable=64MiB cache=256MiB total (block 192MiB + row 64MiB) \
+             bloom=10 group-sync shard_threads=per-shard presplit=writes",
+            "shards=default(N) memtable=64MiB cache=256MiB bloom=10 group-sync(default) \
+             tablets=on get-fill=off rowcache=32MiB shard_threads=0 shard_threads=adaptive",
+        ];
+        for (got, want) in cases.iter().zip(expected) {
+            assert_eq!(
+                got.replace(&format!("default({shards})"), "default(N)"),
+                want
+            );
+        }
+    }
 
     fn opened(tag: &str) -> (PigeonholeRunner, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("phdb-bench-ph-{tag}-{}", std::process::id()));
