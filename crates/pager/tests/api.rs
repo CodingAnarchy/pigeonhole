@@ -447,6 +447,32 @@ fn relocate_moves_bytes_toward_the_start() {
 }
 
 #[test]
+fn allocate_lowest_below_never_grows_the_file() {
+    // #1098: shrink rewrites the manifest's snapshot this way, so a rewrite with no room
+    // below the old extents leaves the file as it is.
+    let pager = Pager::create(&sim(), path()).unwrap();
+    let low = pager.allocate(128 << 10).unwrap();
+    let high = pager.allocate(128 << 10).unwrap();
+    let (file, allocated) = (pager.stats().file_bytes, pager.stats().allocated_bytes);
+    // Nothing free below `high`: refused, the file and the allocations as they were, and
+    // free space past `high` (growth ahead of need) is not taken.
+    assert!(matches!(
+        pager.allocate_lowest_below(128 << 10, high),
+        Err(Error::NoSpace)
+    ));
+    assert_eq!(pager.stats().file_bytes, file);
+    assert_eq!(pager.stats().allocated_bytes, allocated);
+    pager.abandon(low);
+    // The limit is exclusive.
+    assert!(matches!(
+        pager.allocate_lowest_below(128 << 10, low),
+        Err(Error::NoSpace)
+    ));
+    assert_eq!(pager.allocate_lowest_below(128 << 10, high).unwrap(), low);
+    assert_eq!(pager.stats().file_bytes, file);
+}
+
+#[test]
 fn errors_display() {
     let msgs = [
         Error::NoSpace.to_string(),

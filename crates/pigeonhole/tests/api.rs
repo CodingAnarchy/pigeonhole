@@ -2259,6 +2259,163 @@ fn shrink_releases_file_space_after_deletes_and_keeps_data() {
 }
 
 #[test]
+fn shrink_never_grows_the_file_while_a_snapshot_pins_retired_space() {
+    // Issue #1098: with a snapshot pinning the SSTs a compaction retired, every shrink round
+    // rewrote the manifest's snapshot into new space past the end of the file (the space
+    // below was pinned), and the next round planned to move it again: 1 MiB grew to 3.5 MiB.
+    // Sizes are compared within a run only: with two shards' background flushes and
+    // compactions, how far a shrink gets varies between runs (512 KiB or 1 MiB unpinned).
+    let file = |db: &Pigeonhole| db.info().unwrap().file_bytes;
+    for pin in [false, true] {
+        let vfs = SimVfs::new(7092);
+        let opts = Options::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .shards(2)
+            .pin_threads(false)
+            .block_cache(16 << 10)
+            .row_cache(0);
+        let db = Pigeonhole::open("/db/s.phdb", opts).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("d", Family::default().max_versions(3))
+            .create()
+            .unwrap();
+        for round in 0..3u32 {
+            for i in 0..400u32 {
+                t.mutate(format!("row{:03}", i % 40).as_bytes())
+                    .put_at("d", &[(i % 4) as u8], 1, &[(i % 251) as u8; 900])
+                    .commit()
+                    .unwrap();
+            }
+            if round < 2 {
+                db.flush().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+        db.shrink().unwrap();
+        let snapshot = pin.then(|| db.snapshot().unwrap());
+        for r in (0..40u32).filter(|r| ![3, 7].contains(r)) {
+            t.mutate(format!("row{r:03}").as_bytes())
+                .put("d", &[9], b"new")
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+        let (compacted, grown) = (file(&db), db.engine_metrics().file_growths);
+        db.shrink().unwrap();
+        let shrunk = file(&db);
+        assert!(shrunk <= compacted, "pin {pin}: {compacted} -> {shrunk}");
+        if pin {
+            // Not even for a while.
+            assert_eq!(db.engine_metrics().file_growths, grown);
+        }
+        drop(snapshot);
+        // Once the snapshot is gone, the next shrink may give back what the pin kept.
+        db.shrink().unwrap();
+        assert!(file(&db) <= shrunk, "pin {pin}: {shrunk} -> {}", file(&db));
+        assert_eq!(
+            value(&t, b"row000", "d", &[9]).as_deref(),
+            Some(&b"new"[..])
+        );
+        assert_eq!(value(&t, b"row003", "d", &[3]).map(|v| v.len()), Some(900));
+        drop(t);
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn shrink_never_grows_the_file_while_a_snapshot_taken_just_before_it_is_held() {
+    shrink_with_a_snapshot_taken_just_before(false);
+}
+
+#[test]
+fn shrink_never_grows_the_file_while_a_reader_process_holds_a_snapshot() {
+    shrink_with_a_snapshot_taken_just_before(true);
+}
+
+/// #1098: a snapshot taken just before the shrink pins nothing yet, but keeps what the
+/// shrink's own first round retires. Unpinned, that round rewrites the manifest past the
+/// end of the file here and gives the space back once the old extents are reclaimed; with
+/// the snapshot held they are not, so the shrink must not grow the file at all. With
+/// `reader`, a reader process holds the snapshot: its slot pins the view, and the writer
+/// sees no seqno pin.
+fn shrink_with_a_snapshot_taken_just_before(reader: bool) {
+    let writer = pigeonhole_io::ProcessId {
+        pid: 1,
+        start_time: 1,
+    };
+    let reader_process = pigeonhole_io::ProcessId {
+        pid: 2,
+        start_time: 1,
+    };
+    let vfs = SimVfs::new(7092);
+    vfs.enter_process(writer);
+    let opts = Options::default()
+        .vfs(Arc::clone(&vfs) as _)
+        .shards(1)
+        .pin_threads(false)
+        .block_cache(16 << 10)
+        .row_cache(0);
+    let db = Pigeonhole::open("/db/s.phdb", opts).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("d", Family::default().max_versions(1))
+        .create()
+        .unwrap();
+    for round in 0..3u32 {
+        for i in 0..40u32 {
+            t.mutate(format!("row{:04}", (i * 7 + round) % 10).as_bytes())
+                .put("d", &[(i % 4) as u8], &[(i % 251) as u8; 900])
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.compact().unwrap();
+    for r in (0..10u32).filter(|r| r % 2 != 0) {
+        t.mutate(format!("row{r:04}").as_bytes())
+            .delete_row()
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    let (snapshot, reader_snapshot) = if reader {
+        vfs.enter_process(reader_process);
+        let r = Pigeonhole::open_reader(
+            "/db/s.phdb",
+            pigeonhole::ReaderOptions::default().vfs(Arc::clone(&vfs) as _),
+        )
+        .unwrap();
+        let snap = r.snapshot().unwrap();
+        vfs.enter_process(writer);
+        (None, Some((r, snap)))
+    } else {
+        (Some(db.snapshot().unwrap()), None)
+    };
+    let file = |db: &Pigeonhole| db.info().unwrap().file_bytes;
+    let (compacted, grown) = (file(&db), db.engine_metrics().file_growths);
+    db.shrink().unwrap();
+    assert!(file(&db) <= compacted, "{compacted} -> {}", file(&db));
+    assert_eq!(db.engine_metrics().file_growths, grown);
+    assert_eq!(value(&t, b"row0004", "d", &[0]).map(|v| v.len()), Some(900));
+    assert_eq!(value(&t, b"row0003", "d", &[0]), None);
+    drop(snapshot);
+    if let Some((r, snap)) = reader_snapshot {
+        vfs.enter_process(reader_process);
+        drop(snap);
+        drop(r);
+        vfs.enter_process(writer);
+    }
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
 fn shrink_after_deleting_every_row_leaves_a_small_file() {
     // Issue #138: with every row deleted and compacted away nothing live was left to move,
     // and shrink returned 0 without truncating: the file kept the length the load gave it,

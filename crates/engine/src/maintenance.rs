@@ -45,7 +45,7 @@ use pigeonhole_sst::{ReadOptions, SstReader, SstWriterOptions};
 
 use crate::catalog::Catalog;
 use crate::flush::SstSink;
-use crate::manifest::{self, ManifestReq, ManifestWriter, ReqKind};
+use crate::manifest::{self, ManifestReq, ManifestWriter, ReqKind, Rewrite};
 use crate::shard::Shared;
 use crate::snapshot::{ShardMems, Snapshot, SstSet, View, ViewPin};
 use crate::source::{Source, mem_sources};
@@ -527,6 +527,9 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
     // A cleared region went unused (the large extent left the plan, or a pinned version
     // kept the occupants' old extents): clear no other this call.
     let mut wasted = false;
+    // A rewrite that could not grow the file found no free space below the manifest's
+    // extents: ask for none again this call.
+    let mut manifest_stays = false;
     for _round in 0..8 {
         if shared.closing.load(Ordering::Acquire) {
             // The close waits for this call: stop between rounds.
@@ -537,6 +540,14 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         // would be allocated past the end of the file).
         shared.reclaim();
         shared.pager.truncate_tail()?;
+        // What this round retires stays allocated until the call ends if a view keeps
+        // retired extents from being reclaimed now, or a snapshot (or a backup), or a
+        // reader process's slot, will once this round retires more. Its commit must not grow the file then: the space would
+        // stay past the end, and the next round would plan to move the manifest out of it
+        // again (#1098).
+        let pinned = shared.pager.stats().retired_bytes > 0
+            || !shared.live_seqnos.list().is_empty()
+            || shared.shm.oldest_reader_pin().is_some();
         let plan = shared.pager.shrink_plan();
         if held.as_ref().is_some_and(|h| !plan.contains(&h.big)) {
             // Moved or replaced otherwise: the region is not needed.
@@ -581,7 +592,8 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             blobs: Vec::new(),
         };
         let mut readers = Vec::new();
-        let mut rewrite = false;
+        // Rewrite the manifest snapshot, to below this extent.
+        let mut rewrite: Option<ExtentRef> = None;
         let mut claimed: Vec<SstId> = Vec::new();
         // An extent retired since the catalog was read: the plan is stale, so a round with
         // nothing to move plans again instead of stopping.
@@ -593,8 +605,16 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
         };
         let mut move_to = |extent: ExtentRef, to: Target| -> Result<Moved> {
             if roots.contains(&extent) {
-                // The manifest's own extents move by a snapshot rewrite.
-                rewrite = true;
+                // The manifest's own extents move by a snapshot rewrite: below the limit
+                // while pinned, else into the lowest free space. Never into a held region:
+                // a root never runs out of room, so none is cleared for one.
+                let (Target::Below(limit), false) = (to, manifest_stays) else {
+                    return Ok(Moved::Skipped);
+                };
+                rewrite = Some(match rewrite {
+                    Some(r) if r.page > limit.page => r,
+                    _ => limit,
+                });
                 return Ok(Moved::Yes);
             }
             if let Some(&(blob_file, index)) = blob_by_extent.get(&(extent.page, extent.size_class))
@@ -731,7 +751,7 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             unclaim(shared, &claimed);
             return Err(e);
         }
-        if moves.list.is_empty() && moves.blobs.is_empty() && !rewrite {
+        if moves.list.is_empty() && moves.blobs.is_empty() && rewrite.is_none() {
             unclaim(shared, &claimed);
             if stale {
                 continue;
@@ -753,10 +773,26 @@ pub(crate) fn shrink(shared: &Shared) -> Result<u64> {
             })));
         let req = ManifestReq {
             readers,
-            rewrite_snapshot: rewrite,
+            rewrite_snapshot: match (rewrite, pinned) {
+                (limit, true) => Rewrite::NoGrowth(limit),
+                (Some(_), false) => Rewrite::Lowest,
+                (None, false) => Rewrite::AsNeeded,
+            },
             ..req
         };
         let committed = manifest::commit_req_from_thread(shared, req, waiter);
+        if pinned && rewrite.is_some() {
+            let now = shared
+                .manifest
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .root();
+            // Still where they were: the rewrite found no room below them.
+            manifest_stays |= [now.snapshot, now.log]
+                .into_iter()
+                .flatten()
+                .any(|e| roots.contains(&e));
+        }
         unclaim(shared, &claimed);
         drop(view);
         drop(catalog);

@@ -1,0 +1,2 @@
+### Fixed
+- `Pigeonhole::shrink` no longer grows the file while a snapshot or backup is held. Before, with a snapshot pinning space a compaction had freed, each shrink round moved the manifest past the end of the file and planned to move it again, so a call could add megabytes (1 MiB grew to 3.5 MiB in the report, #1098). A shrink now moves the manifest only into free space below it while anything pinned would keep the old copy, and gives back less in that case; a shrink after the snapshot is dropped gives back the rest.

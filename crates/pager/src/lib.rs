@@ -974,6 +974,29 @@ impl Pager {
         self.allocate_from(bytes, true)
     }
 
+    /// As [`Pager::allocate_lowest`], but only from free space that starts below `limit`:
+    /// never grows the file. Fails with [`Error::NoSpace`], allocating nothing, if the
+    /// lowest free block that fits does not lie below it. `shrink` rewrites the manifest's
+    /// snapshot this way, so a rewrite that cannot move it down leaves it where it is.
+    pub fn allocate_lowest_below(&self, bytes: u64, limit: Extent) -> Result<Extent> {
+        let class = class_for(bytes)?;
+        if !self.inner.writable {
+            return Err(io_err(
+                ErrorKind::Unsupported,
+                "allocate on a read-only pager",
+            ));
+        }
+        let mut alloc = lock(&self.inner.alloc);
+        match alloc.alloc_lowest(class) {
+            Some(e) if e.page < limit.page => Ok(e),
+            Some(e) => {
+                alloc.release_live(e);
+                Err(Error::NoSpace)
+            }
+            None => Err(Error::NoSpace),
+        }
+    }
+
     fn allocate_from(&self, bytes: u64, lowest: bool) -> Result<Extent> {
         let class = class_for(bytes)?;
         if !self.inner.writable {
@@ -1264,8 +1287,9 @@ impl Pager {
     /// Picks a region of `big`'s class below it whose occupants are all live, smaller and
     /// `movable`, and can each be relocated outside the region and below `big` (by
     /// [`Pager::relocate_below`], or for the manifest's, a snapshot rewrite's
-    /// [`Pager::allocate_lowest`]: both take the lowest free block); of the first few such
-    /// regions (among the lowest few hundred), the one with the least to move.
+    /// [`Pager::allocate_lowest`] or [`Pager::allocate_lowest_below`]: all take the lowest
+    /// free block); of the first few such regions (among the lowest few hundred), the one
+    /// with the least to move.
     ///
     /// The region is then held: its free space, and the occupants' old extents once they
     /// are reclaimed, stay unallocatable (placeholders, never published, so free again at
