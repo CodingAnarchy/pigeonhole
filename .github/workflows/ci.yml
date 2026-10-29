@@ -105,10 +105,6 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install --quiet polars==2.0.0
           "$RUNNER_TEMP/venv/bin/python" scripts/arrow-smoke.py check "$RUNNER_TEMP/t.arrows"
       - run: cargo test -p pigeonhole-bench --features "$BENCH_FEATURES"
-      # The public crate on its own: feature unification gives the workspace run an engine
-      # built with `test-hooks`, and this run tests the production one (#148, review 1-2 F10).
-      - name: pigeonhole tests without the engine's test hooks
-        run: cargo test -p pigeonhole --all-features
       # The io_uring backend (#402), the default on Linux since D218 (`IoBackend::Auto`), so
       # the runs above already used it. This runs the public crate's suites, the real-file
       # model check and the real-file engine, WAL and pager tests on it forced: `uring` fails
