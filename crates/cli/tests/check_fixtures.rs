@@ -232,7 +232,7 @@ fn sample(dir: &TempDir) -> PathBuf {
             "f",
             Family::default()
                 .blob_threshold(100)
-                .uncompressed()
+                .compression(pigeonhole::Compression::None)
                 .block_size(4096),
         )
         .family("g", Family::default())

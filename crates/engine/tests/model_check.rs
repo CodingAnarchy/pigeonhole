@@ -223,6 +223,11 @@ fn harness_regressions_from_the_seed_sweep() {
     for seed in [19, 88, 240] {
         check(seed, &cfg);
     }
+    // Seed 660370 of the flight-read runs (#1063, perf287's long sweeps): a power loss lost
+    // a batch at seqno 177; after the reopen a cross-shard commit's DECISION applied it at
+    // 177 and was acknowledged, and the harness took the lost batch's timestamp for it (a
+    // decided commit has no batch record at its applied seqno). The engine was right.
+    check(660_370, &flight_read_config());
 }
 
 #[test]
@@ -828,16 +833,7 @@ fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant()
     // commits must survive at their level and reads must match the model; a commit readers
     // may have seen but nobody was told committed may be lost to a power loss, never to a
     // process crash.
-    let mut cfg = Config::standard(250);
-    cfg.shards = 3;
-    cfg.deferred_io = true;
-    cfg.flight_read_ppm = 300_000;
-    cfg.mid_commit_crash_ppm = 120_000;
-    // Reads of in-flight commits' own cells (visible whole or not at all), and a process
-    // crash after some of them: recovery must keep what a read saw. (Crashes this frequent
-    // leave no segment time to fill, so the D200 held-header window is covered by
-    // `held_header_visibility.rs` instead.)
-    cfg.observed_crash_ppm = 200_000;
+    let cfg = flight_read_config();
     let (mut reads, mut observed, mut crashes) = (0, 0, 0);
     for seed in seeds() {
         let s = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
@@ -848,6 +844,22 @@ fn reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant()
     assert!(reads > 0, "no read ran beside an in-flight commit");
     assert!(observed > 0, "no read saw an in-flight commit whole");
     eprintln!("{reads} reads beside commits, {observed} saw one whole, {crashes} crashes after");
+}
+
+/// [`reads_beside_in_flight_commits_and_crashes_inside_them_keep_every_invariant`]'s
+/// configuration.
+fn flight_read_config() -> Config {
+    let mut cfg = Config::standard(250);
+    cfg.shards = 3;
+    cfg.deferred_io = true;
+    cfg.flight_read_ppm = 300_000;
+    cfg.mid_commit_crash_ppm = 120_000;
+    // Reads of in-flight commits' own cells (visible whole or not at all), and a process
+    // crash after some of them: recovery must keep what a read saw. (Crashes this frequent
+    // leave no segment time to fill, so the D200 held-header window is covered by
+    // `held_header_visibility.rs` instead.)
+    cfg.observed_crash_ppm = 200_000;
+    cfg
 }
 
 #[test]

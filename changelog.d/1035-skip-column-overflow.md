@@ -1,0 +1,2 @@
+### Fixed
+- A malformed data block whose entry claims a huge shared-key length now fails with a corruption error during a filtered scan's column skip. Previously, a debug build panicked on the overflow, and a release build could skip the malformed entries without reporting them. Only a deliberately crafted block with a valid checksum could reach this; random damage fails the checksum first. Found by fuzzing (#1035).

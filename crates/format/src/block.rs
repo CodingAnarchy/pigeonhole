@@ -546,6 +546,11 @@ impl<B: Deref<Target = [u8]>> Block<B> {
             usize::try_from(v).map_err(|_| corrupt())
         };
         let shared = field()?;
+        // Every key is rebuilt from this block's bytes, so no valid prefix is longer than the
+        // block: this bounds `shared` (#1035), so sums with it don't overflow.
+        if shared > b.len() {
+            return Err(corrupt());
+        }
         let unshared = field()?;
         let value_len = field()?;
         let key_end = pos.checked_add(unshared).ok_or_else(corrupt)?;
