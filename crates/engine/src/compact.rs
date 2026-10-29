@@ -884,7 +884,7 @@ impl CompactionWork {
             readers,
             flushed_roots: Vec::new(),
             compactions: self.record.take().into_iter().collect(),
-            rewrite_snapshot: false,
+            rewrite_snapshot: manifest::Rewrite::AsNeeded,
             dropped_ok: Vec::new(),
             on_refusal,
             reply: Box::new(manifest::notify(tx)),

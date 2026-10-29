@@ -1632,7 +1632,7 @@ impl ShardState {
             readers: Vec::new(),
             flushed_roots: Vec::new(),
             compactions: Vec::new(),
-            rewrite_snapshot: false,
+            rewrite_snapshot: manifest::Rewrite::AsNeeded,
             dropped_ok: Vec::new(),
             on_refusal: Vec::new(),
             reply: Box::new(move |result| {

@@ -176,15 +176,14 @@ impl ManifestWriter {
 
     /// Writes `edits` as manifest version `current + 1` (a delta, or a new snapshot when the
     /// delta does not fit the log, outgrows the snapshot, or `rewrite` asks for one) and
-    /// returns the root to commit. `catalog` is the state *after* `edits`. A failure poisons
-    /// the writer, except a snapshot rewrite that could not allocate its extents (a full
-    /// disk): nothing was written, so the caller refuses the batch and later commits may
-    /// succeed once space is freed.
+    /// returns the root to commit. `catalog` is the state *after* `edits`. A failure poisons the writer, except a snapshot rewrite
+    /// that could not allocate its extents (a full disk): nothing was written, so the
+    /// caller refuses the batch and later commits may succeed once space is freed.
     pub(crate) fn prepare(
         &mut self,
         catalog: &Catalog,
         edits: &[Edit],
-        rewrite: bool,
+        rewrite: Rewrite,
     ) -> Result<Prepared> {
         if self.poisoned {
             return Err(Self::poisoned_error());
@@ -203,21 +202,34 @@ impl ManifestWriter {
             edits,
             &mut delta,
         );
-        let fits_log = !rewrite
+        let moved = match rewrite {
+            Rewrite::NoGrowth(Some(limit)) => {
+                let mut block = Vec::new();
+                match self.write_snapshot(catalog, version, &mut block, Some(limit)) {
+                    Err(Error::NoSpace) => None,
+                    r => Some(r),
+                }
+            }
+            _ => None,
+        };
+        let fits_log = rewrite != Rewrite::Lowest
             && match self.root.log {
                 Some(_) if self.root.snapshot.is_some() => {
                     let end = self.root.log_len as usize + delta.len();
                     end <= LOG_EXTENT_LEN
-                        && end <= self.snapshot_len.max(MANIFEST_HEADER_LEN as u32) as usize
+                        && (matches!(rewrite, Rewrite::NoGrowth(_))
+                            || end <= self.snapshot_len.max(MANIFEST_HEADER_LEN as u32) as usize)
                 }
                 _ => false,
             };
-        let prepared = if fits_log {
+        let prepared = if let Some(moved) = moved {
+            moved
+        } else if fits_log {
             self.append_delta(&delta, version)
                 .inspect_err(|_| self.poisoned = true)
         } else {
             delta.clear();
-            self.write_snapshot(catalog, version, &mut delta)
+            self.write_snapshot(catalog, version, &mut delta, None)
         };
         if delta.capacity() <= KEEP_BLOCK_BUFFER {
             self.block = delta;
@@ -239,12 +251,15 @@ impl ManifestWriter {
         })
     }
 
-    /// Writes a snapshot of `catalog`, encoded into `block` (empty).
+    /// Writes a snapshot of `catalog`, encoded into `block` (empty). With `below`, only into
+    /// free space below that extent: [`Error::NoSpace`], with nothing written, if there is
+    /// none.
     fn write_snapshot(
         &mut self,
         catalog: &Catalog,
         version: ManifestVersion,
         block: &mut Vec<u8>,
+        below: Option<ExtentRef>,
     ) -> Result<Prepared> {
         encode_block(
             &ManifestHeader {
@@ -261,18 +276,19 @@ impl ManifestWriter {
         // (a failed growth sync poisoned the pager) or a failed write poisons it. Lowest
         // first: the manifest settles low in the file, and `shrink` counts on a rewrite to
         // move it into the lowest hole that fits (#314).
-        let allocated = self
-            .pager
-            .allocate_lowest(block.len() as u64)
-            .and_then(
-                |snapshot| match self.pager.allocate_lowest(LOG_EXTENT_LEN as u64) {
-                    Ok(log) => Ok((snapshot, log)),
-                    Err(e) => {
-                        self.pager.abandon(snapshot);
-                        Err(e)
-                    }
-                },
-            );
+        let allocate = |bytes: u64| match below {
+            Some(limit) => self.pager.allocate_lowest_below(bytes, limit),
+            None => self.pager.allocate_lowest(bytes),
+        };
+        let allocated = allocate(block.len() as u64).and_then(|snapshot| {
+            match allocate(LOG_EXTENT_LEN as u64) {
+                Ok(log) => Ok((snapshot, log)),
+                Err(e) => {
+                    self.pager.abandon(snapshot);
+                    Err(e)
+                }
+            }
+        });
         let (snapshot, log) = match allocated {
             Ok(extents) => extents,
             Err(e) => {
@@ -332,7 +348,7 @@ impl ManifestWriter {
 
     /// Commits synchronously (open-time flushes, before the shards run).
     pub(crate) fn commit(&mut self, catalog: &Catalog, edits: &[Edit]) -> Result<ManifestVersion> {
-        let p = self.prepare(catalog, edits, false)?;
+        let p = self.prepare(catalog, edits, Rewrite::AsNeeded)?;
         let r = self.pager.commit_root(p.root).map_err(pager_io);
         self.complete(p, r)
     }
@@ -381,8 +397,8 @@ pub(crate) struct ManifestReq {
     /// records nothing (5-6 6.2).
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))]
     pub compactions: Vec<CompactionRecord>,
-    /// Rewrite the manifest snapshot (shrink relocates the manifest extents).
-    pub rewrite_snapshot: bool,
+    /// When to rewrite the manifest snapshot (shrink relocates the manifest's extents).
+    pub rewrite_snapshot: Rewrite,
     /// The table of each tablet the edits touch, for a request whose slots are independent
     /// (a flush): the edits of a tablet whose table was dropped meanwhile are skipped and
     /// the rest commit, instead of the whole request being refused. Empty: refuse.
@@ -393,6 +409,38 @@ pub(crate) struct ManifestReq {
     pub on_refusal: Vec<Edit>,
     /// Called with the outcome once the commit is durable (or failed).
     pub reply: Box<dyn FnOnce(Result<ManifestVersion>) + Send>,
+}
+
+/// When a commit rewrites the manifest snapshot (and starts a new log).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rewrite {
+    /// When the delta does not fit the log or the log outgrows the snapshot.
+    AsNeeded,
+    /// Now, into the lowest free space, growing the file if there is none: `shrink` moving
+    /// the manifest's extents when the old ones are reclaimed within the call, so a
+    /// growth is given back.
+    Lowest,
+    /// Without growing the file: `shrink` while a view pins what it retires, so space it
+    /// grew into stays past the end (#1098). With an extent, rewrite into free space below
+    /// it if there is any; otherwise (or without one) the delta goes into the log if the
+    /// extent has room, even past the snapshot's length (a later commit rewrites).
+    NoGrowth(Option<ExtentRef>),
+}
+
+impl Rewrite {
+    /// Both requests' rewrites, for a batch: not growing wins, then the higher limit.
+    fn and(self, other: Self) -> Self {
+        use Rewrite::*;
+        match (self, other) {
+            (NoGrowth(Some(a)), NoGrowth(Some(b))) => {
+                NoGrowth(Some(if b.page > a.page { b } else { a }))
+            }
+            (NoGrowth(a), NoGrowth(b)) => NoGrowth(a.or(b)),
+            (NoGrowth(a), _) | (_, NoGrowth(a)) => NoGrowth(a),
+            (Lowest, _) | (_, Lowest) => Lowest,
+            (AsNeeded, AsNeeded) => AsNeeded,
+        }
+    }
 }
 
 impl std::fmt::Debug for ManifestReq {
@@ -415,7 +463,7 @@ impl ManifestReq {
             readers: Vec::new(),
             flushed_roots: Vec::new(),
             compactions: Vec::new(),
-            rewrite_snapshot: false,
+            rewrite_snapshot: Rewrite::AsNeeded,
             dropped_ok: Vec::new(),
             on_refusal: Vec::new(),
             reply: Box::new(reply),
@@ -430,7 +478,7 @@ impl ManifestReq {
             readers: Vec::new(),
             flushed_roots: Vec::new(),
             compactions: Vec::new(),
-            rewrite_snapshot: false,
+            rewrite_snapshot: Rewrite::AsNeeded,
             dropped_ok: Vec::new(),
             on_refusal: Vec::new(),
             reply: Box::new(move |r| tx.notify(r)),
@@ -634,7 +682,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let mut sst_changed = false;
     let mut checkpoints_changed = false;
     let mut flushed_changed = false;
-    let mut rewrite = false;
+    let mut rewrite = Rewrite::AsNeeded;
     // What the accepted requests wrote (freed if the whole batch is refused), and the
     // compactions they record (kept only once the batch is prepared).
     let mut added = Vec::new();
@@ -797,7 +845,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                             readers.insert(id, r);
                         }
                         flushed_roots.append(&mut req.flushed_roots);
-                        rewrite |= req.rewrite_snapshot;
+                        rewrite = rewrite.and(req.rewrite_snapshot);
                         #[cfg(feature = "test-hooks")]
                         for mut c in std::mem::take(&mut req.compactions) {
                             c.manifest_version = writer.next_version();

@@ -2259,6 +2259,131 @@ fn shrink_releases_file_space_after_deletes_and_keeps_data() {
 }
 
 #[test]
+fn shrink_never_grows_the_file_while_a_snapshot_pins_retired_space() {
+    // Issue #1098: with a snapshot pinning the SSTs a compaction retired, every shrink round
+    // rewrote the manifest's snapshot into new space past the end of the file (the space
+    // below was pinned), and the next round planned to move it again: 1 MiB grew to 3.5 MiB.
+    let file = |db: &Pigeonhole| db.info().unwrap().file_bytes;
+    let mut sizes = Vec::new();
+    for pin in [false, true] {
+        let vfs = SimVfs::new(7092);
+        let opts = Options::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .shards(2)
+            .pin_threads(false)
+            .block_cache(16 << 10)
+            .row_cache(0);
+        let db = Pigeonhole::open("/db/s.phdb", opts).unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("d", Family::default().max_versions(3))
+            .create()
+            .unwrap();
+        for round in 0..3u32 {
+            for i in 0..400u32 {
+                t.mutate(format!("row{:03}", i % 40).as_bytes())
+                    .put_at("d", &[(i % 4) as u8], 1, &[(i % 251) as u8; 900])
+                    .commit()
+                    .unwrap();
+            }
+            if round < 2 {
+                db.flush().unwrap();
+            }
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+        db.shrink().unwrap();
+        let snapshot = pin.then(|| db.snapshot().unwrap());
+        for r in (0..40u32).filter(|r| ![3, 7].contains(r)) {
+            t.mutate(format!("row{r:03}").as_bytes())
+                .put("d", &[9], b"new")
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        db.compact().unwrap();
+        let (compacted, grown) = (file(&db), db.engine_metrics().file_growths);
+        db.shrink().unwrap();
+        let shrunk = file(&db);
+        assert!(shrunk <= compacted, "pin {pin}: {compacted} -> {shrunk}");
+        if pin {
+            // Not even for a while.
+            assert_eq!(db.engine_metrics().file_growths, grown);
+        }
+        drop(snapshot);
+        db.shrink().unwrap();
+        sizes.push((shrunk, file(&db)));
+        assert_eq!(
+            value(&t, b"row000", "d", &[9]).as_deref(),
+            Some(&b"new"[..])
+        );
+        assert_eq!(value(&t, b"row003", "d", &[3]).map(|v| v.len()), Some(900));
+        drop(t);
+        db.close().unwrap();
+    }
+    // Pinned, the shrink gave back less; once the snapshot is gone, the next one gives back
+    // what the unpinned shrink did.
+    let [(free, free_after), (pinned, pinned_after)] = sizes[..] else {
+        unreachable!()
+    };
+    assert_eq!(free, free_after);
+    assert!(pinned > free, "{pinned} <= {free}");
+    assert_eq!(pinned_after, free_after);
+}
+
+#[test]
+fn shrink_never_grows_the_file_while_a_snapshot_taken_just_before_it_is_held() {
+    // #1098: a snapshot taken just before the shrink pins nothing yet, but keeps what the
+    // shrink's own first round retires. Unpinned, that round rewrites the manifest past the
+    // end of the file here and gives the space back once the old extents are reclaimed;
+    // with the snapshot held they are not, so the shrink must not grow the file at all.
+    let vfs = SimVfs::new(7092);
+    let opts = Options::default()
+        .vfs(Arc::clone(&vfs) as _)
+        .shards(1)
+        .pin_threads(false)
+        .block_cache(16 << 10)
+        .row_cache(0);
+    let db = Pigeonhole::open("/db/s.phdb", opts).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("d", Family::default().max_versions(1))
+        .create()
+        .unwrap();
+    for round in 0..3u32 {
+        for i in 0..40u32 {
+            t.mutate(format!("row{:04}", (i * 7 + round) % 10).as_bytes())
+                .put("d", &[(i % 4) as u8], &[(i % 251) as u8; 900])
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+    }
+    db.compact().unwrap();
+    for r in (0..10u32).filter(|r| r % 2 != 0) {
+        t.mutate(format!("row{r:04}").as_bytes())
+            .delete_row()
+            .commit()
+            .unwrap();
+    }
+    db.flush().unwrap();
+    db.compact().unwrap();
+    let snapshot = db.snapshot().unwrap();
+    let file = |db: &Pigeonhole| db.info().unwrap().file_bytes;
+    let (compacted, grown) = (file(&db), db.engine_metrics().file_growths);
+    db.shrink().unwrap();
+    assert!(file(&db) <= compacted, "{compacted} -> {}", file(&db));
+    assert_eq!(db.engine_metrics().file_growths, grown);
+    assert_eq!(value(&t, b"row0004", "d", &[0]).map(|v| v.len()), Some(900));
+    assert_eq!(value(&t, b"row0003", "d", &[0]), None);
+    drop(snapshot);
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
 fn shrink_after_deleting_every_row_leaves_a_small_file() {
     // Issue #138: with every row deleted and compacted away nothing live was left to move,
     // and shrink returned 0 without truncating: the file kept the length the load gave it,

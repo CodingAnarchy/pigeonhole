@@ -700,7 +700,7 @@ impl FlushTask {
             compactions: std::mem::take(&mut self.records),
             #[cfg(not(feature = "test-hooks"))]
             compactions: Vec::new(),
-            rewrite_snapshot: false,
+            rewrite_snapshot: manifest::Rewrite::AsNeeded,
             dropped_ok: self.items.iter().map(|i| (i.tablet, i.table)).collect(),
             on_refusal,
             reply: Box::new(manifest::notify(tx)),
