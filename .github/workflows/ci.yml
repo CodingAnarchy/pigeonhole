@@ -104,7 +104,6 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/venv"
           "$RUNNER_TEMP/venv/bin/pip" install --quiet polars==2.0.0
           "$RUNNER_TEMP/venv/bin/python" scripts/arrow-smoke.py check "$RUNNER_TEMP/t.arrows"
-      - run: cargo test -p pigeonhole-bench --features "$BENCH_FEATURES"
       # The io_uring backend (#402), the default on Linux since D218 (`IoBackend::Auto`), so
       # the runs above already used it. This runs the public crate's suites, the real-file
       # model check and the real-file engine, WAL and pager tests on it forced: `uring` fails
@@ -165,9 +164,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, windows-latest]
+        include:
+          - os: macos-latest
+            timeout: 45
+          # Windows' workspace tests run 29-43 min (#1156); 60 leaves room on slow runners.
+          - os: windows-latest
+            timeout: 60
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: ${{ matrix.timeout }}
     env:
       RUSTFLAGS: -D warnings
     steps:
@@ -175,6 +179,24 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace --exclude pigeonhole-bench --all-features
+
+  # The bench crate's own tests, beside the workspace tests rather than after them (#1156):
+  # its group-commit and scaling tests take about a minute each, so on Windows they pushed
+  # the test job toward its limit. Same features as before (`BENCH_FEATURES`).
+  bench-tests:
+    name: bench tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      RUSTFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test -p pigeonhole-bench --features "${{ env.BENCH_FEATURES }}"
 
   analysis:

@@ -1195,13 +1195,8 @@ mod tests {
                 .iter()
                 .all(|r| r.store_config.contains(" group-sync"))
         );
-        // `--threads` picks one count for the sweep.
-        let a = args(&format!(
-            "group-commit --scale smoke --ops 64 --threads 2 --shards 2 --write-buffer 16777216 --dir {}",
-            dir.display()
-        ));
-        // The D213 run pinned and unpinned (D235), then the one client run.
-        assert_eq!(bench(&a).unwrap().results.len(), 3);
+        // `--threads` picking one count for the sweep is `inline_runs_take_their_own_length`'s
+        // first check (three runs fewer here, #1156).
         std::fs::remove_dir_all(&dir).ok();
     }
 
