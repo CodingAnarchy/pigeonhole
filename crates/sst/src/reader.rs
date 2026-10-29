@@ -358,7 +358,8 @@ pub(crate) fn decode_physical(
         None => {
             let n = buf.len() - TRAILER_LEN;
             buf.resize(n);
-            // Kept by the cache: a registered buffer slot goes back to its pool (#402).
+            // Kept by the cache: a registered buffer slot goes back to its pool (#402), and a
+            // reused buffer larger than the block needs is copied (#709).
             Ok(BlockData::Io(buf.detached()))
         }
     }
@@ -385,12 +386,11 @@ fn decode_slice(
             decompress(codec, payload, &mut out)?;
             Ok(Some(BlockData::Io(out)))
         }
-        // The same for a block the cache keeps, from this thread's buffers (#709): it goes
-        // back when the cache evicts it, and is charged at its whole capacity meanwhile.
+        // A block the cache keeps: a new buffer of exactly its length, charged as such.
         (codec, None) => {
-            let mut out = IoBuf::reused(len);
+            let mut out = vec![0; len];
             decompress(codec, payload, &mut out)?;
-            Ok(Some(BlockData::Io(out)))
+            Ok(Some(BlockData::from(out)))
         }
     }
 }
@@ -769,5 +769,40 @@ impl Blocks {
             &*self.uncached
         };
         cache.insert(self.key(addr), data, priority)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pigeonhole_cache::BlockKey;
+    use pigeonhole_format::block::seal;
+
+    /// The charge of a block decoded from `physical` read into a reused buffer of `cap`
+    /// bytes, once the cache keeps it.
+    fn charged(physical: &[u8], cap: usize) -> usize {
+        // A thread-pool buffer of `cap` bytes, reused for this read (#709).
+        drop(IoBuf::reused(cap));
+        let mut buf = IoBuf::reused(physical.len());
+        buf.copy_from_slice(physical);
+        let data = decode_physical(buf, BlockKind::Data, None).unwrap();
+        let cache = BlockCache::new(1 << 20, 1);
+        let key = BlockKey { file: 1, offset: 0 };
+        cache.insert(key, data, Priority::Normal).charge()
+    }
+
+    #[test]
+    fn a_cached_block_is_charged_as_before_reused_read_buffers() {
+        // A compressed block: decompressed into a new buffer of exactly its length.
+        let logical: Vec<u8> = (0..16_500u32).map(|i| (i % 251) as u8).collect();
+        let mut lz4 = Vec::new();
+        seal(BlockKind::Data, Compression::Lz4, &logical, &mut lz4).unwrap();
+        assert_eq!(charged(&lz4, 40 << 10), logical.len());
+        // An uncompressed block keeps its read buffer: a reused one larger than the block's
+        // pages is copied, so it is charged its own pages, as a new buffer was.
+        let mut raw = Vec::new();
+        seal(BlockKind::Data, Compression::None, &logical, &mut raw).unwrap();
+        let pages = raw.len().next_multiple_of(IoBuf::ALIGN);
+        assert_eq!(charged(&raw, 2 * pages - IoBuf::ALIGN), pages);
     }
 }

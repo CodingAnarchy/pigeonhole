@@ -67,8 +67,9 @@ pub trait File: Send + Sync + Debug {
 
     /// A buffer of `len` bytes for a submitted read ([`File::submit_read`]): on a backend
     /// with registered buffers (io_uring, #402), a slot of the pool the read will use, so the
-    /// kernel skips pinning its pages. Its contents are unspecified (the read overwrites
-    /// them). Keep a slot-backed buffer only for its I/O: one stored for longer goes through
+    /// kernel skips pinning its pages. Its contents are unspecified (old bytes of an earlier
+    /// read may be there): fill it fully before anyone reads it, as an exact read does, or
+    /// drop it. Keep a slot-backed buffer only for its I/O: one stored for longer goes through
     /// [`IoBuf::detached`]. The default is [`IoBuf::reused`].
     fn read_buf(&self, len: usize) -> IoBuf {
         IoBuf::reused(len)
