@@ -6,7 +6,7 @@ use pigeonhole_format::compress::Compression;
 use pigeonhole_format::compress::Compressor;
 use pigeonhole_format::filter::{FilterBuilder, column_hash, row_hash};
 use pigeonhole_format::key::{
-    SUFFIX_LEN, common_prefix_len, decode_key, decode_key_in_row, row_prefix_len,
+    SUFFIX_LEN, TERMINATOR, common_prefix_len, decode_key, decode_key_in_row, row_prefix_len,
 };
 use pigeonhole_format::manifest::SstMeta;
 use pigeonhole_format::sst::{FOOTER_LEN, Footer, Properties};
@@ -209,7 +209,10 @@ impl Writer {
         if let Some(addr) = self.pending.take() {
             self.add_index_entry(Some(key), addr)?;
         }
-        self.data.add(key, value)?;
+        // The data builder takes this key's common prefix and row prefix from here (ICR 0093):
+        // it saw the same previous key, and the order is checked above.
+        self.data
+            .add_prefixed(key, value, lcp, row_len + TERMINATOR.len())?;
 
         let new_column =
             first || !(lcp >= column_len && self.last_key.len() - SUFFIX_LEN == column_len);
