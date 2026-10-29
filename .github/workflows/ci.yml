@@ -44,9 +44,9 @@ env:
   RUSTDOCFLAGS: -D warnings
   PROPTEST_CASES: 256
   # pigeonhole-bench's `rocksdb` feature builds RocksDB from C++ source, so CI builds
-  # the bench crate with its other comparison runners only. bench-rocksdb.yml builds
+  # the bench crate with its other comparison runner (SQLite) only. bench-rocksdb.yml builds
   # and tests the rocksdb feature weekly and on bench changes to main (docs/bench.md).
-  BENCH_FEATURES: sqlite,fjall
+  BENCH_FEATURES: sqlite
 
 jobs:
   linux:

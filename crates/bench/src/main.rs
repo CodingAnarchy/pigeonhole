@@ -62,7 +62,7 @@ WORKLOADS:
               the table, and once settled the busiest shard's share is judged
 
 OPTIONS:
-    --engine LIST          pigeonhole,rocksdb,sqlite,fjall or all [default: pigeonhole];
+    --engine LIST          pigeonhole,rocksdb,sqlite or all [default: pigeonhole];
                            rocksdb-txn: RocksDB's pessimistic TransactionDB on transfer
                            and ycsb-f, reported beside rocksdb's optimistic one (D274); pigeonhole-txn: ycsb-f's
                            read-modify-write in a Pigeonhole transaction (D274's judged row)
@@ -340,7 +340,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
         a.engines = vec!["pigeonhole".into()];
     }
     if a.engines.iter().any(|e| e == "all") {
-        a.engines = ["pigeonhole", "rocksdb", "sqlite", "fjall"]
+        a.engines = ["pigeonhole", "rocksdb", "sqlite"]
             .map(String::from)
             .to_vec();
     }
@@ -438,7 +438,7 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     r
 }
 
-#[cfg(not(all(feature = "rocksdb", feature = "sqlite", feature = "fjall")))]
+#[cfg(not(all(feature = "rocksdb", feature = "sqlite")))]
 fn missing(feature: &str) -> Result<Box<dyn Runner>, String> {
     Err(format!(
         "engine {feature} is not compiled in; rebuild with `--features {feature}`"
@@ -500,15 +500,6 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
         )),
         #[cfg(not(feature = "sqlite"))]
         "sqlite" | "sqlite-eav" => missing("sqlite"),
-        #[cfg(feature = "fjall")]
-        "fjall" => Ok(Box::new(
-            pigeonhole_bench::FjallRunner::default()
-                .sync(a.sync)
-                .load_buffered(a.durability.is_some())
-                .memory(memory(a)),
-        )),
-        #[cfg(not(feature = "fjall"))]
-        "fjall" => missing("fjall"),
         other => Err(format!("unknown engine {other:?}")),
     }
 }
@@ -849,7 +840,7 @@ mod tests {
             describe("ycsb-a --durability group-sync", WorkloadKind::YcsbA).contains(" group-sync")
         );
         assert!(describe("ycsb-a --durability sync", WorkloadKind::YcsbA).contains(" sync"));
-        assert_eq!(args("all --engine all").engines.len(), 4);
+        assert_eq!(args("all --engine all").engines, ["pigeonhole", "rocksdb", "sqlite"]);
         assert_eq!(args("").command, "help");
         let rc = args("ycsb-c --row-cache 1048576");
         assert_eq!(rc.row_cache, Some(1 << 20));

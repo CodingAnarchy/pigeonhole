@@ -330,7 +330,7 @@ Supporting choices:
 
 ### How it will be measured
 
-A benchmark harness is built in the first phase, before any optimization work: YCSB A–F, a sparse-wide workload (1M rows × 0 to 10K qualifiers, Zipfian), a time-series workload with TTL, and a scan-heavy adjacency workload, each reporting p50/p99/p99.9 and throughput against RocksDB (with a hand-written wide-column key encoding), SQLite EAV, and fjall.
+A benchmark harness is built in the first phase, before any optimization work: YCSB A–F, a sparse-wide workload (1M rows × 0 to 10K qualifiers, Zipfian), a time-series workload with TTL, and a scan-heavy adjacency workload, each reporting p50/p99/p99.9 and throughput against RocksDB (with a hand-written wide-column key encoding) and SQLite EAV. (A fjall runner was dropped by the owner on 2026-10-29: no gate or D280 bar used it. A pure-Rust comparison with rebuilt fjall and redb runners returns after 1.0 in [#1106](https://github.com/CodingAnarchy/pigeonhole/issues/1106).)
 
 ## Crate breakdown
 
@@ -369,7 +369,7 @@ Each layer may use any layer beneath it; the simulator drives the public API fro
 | `pigeonhole-cli` | `phdb` binary: `shell`, `dump`, `compact`, `check`, `backup` | pigeonhole | CLI commands | Snapshot tests of CLI output; `phdb check` detects injected corruption | 4 |
 | `pigeonhole-capi` | Stable C ABI and `pigeonhole.h` (future; see Language scope) | pigeonhole | `extern "C"` functions | ABI compatibility checks; C test program | Future |
 | `pigeonhole-sim` | Deterministic simulation harness: seeded scheduler, simulated VFS, crash points, and the `BTreeMap` reference model | io (sim backend), pigeonhole | `Sim`, `Model`, `Workload` | Detects known bugs seeded into a test build (mutation testing of the checker) | 1 |
-| `pigeonhole-bench` | Benchmark workloads and comparison runners against RocksDB, SQLite and Fjall; p50/p99/p99.9 reporting | pigeonhole | Workload definitions | Reproducible results within a set tolerance on the reference hardware | 1 |
+| `pigeonhole-bench` | Benchmark workloads and comparison runners against RocksDB and SQLite (fjall dropped by the owner, 2026-10-29; pure-Rust comparisons return in #1106); p50/p99/p99.9 reporting | pigeonhole | Workload definitions | Reproducible results within a set tolerance on the reference hardware | 1 |
 
 The Phase column maps each crate to the roadmap; a crate listed in several phases gains features in each.
 

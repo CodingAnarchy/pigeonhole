@@ -6,8 +6,6 @@ pub(crate) mod pigeonhole;
 pub(crate) mod placement;
 pub(crate) mod reader_process;
 
-#[cfg(feature = "fjall")]
-pub(crate) mod fjall;
 #[cfg(feature = "rocksdb")]
 pub(crate) mod rocksdb;
 #[cfg(feature = "rocksdb")]
@@ -16,13 +14,13 @@ pub(crate) mod rocksdb_txn;
 pub(crate) mod sqlite;
 
 use crate::BenchOp;
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+#[cfg(feature = "rocksdb")]
 use crate::workload::FAMILIES;
-#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "sqlite"))]
+#[cfg(any(feature = "rocksdb", feature = "sqlite"))]
 use crate::workload::{METRIC_FAMILY, TIME_SERIES_TTL};
 
 /// Bloom filter bits per key: Pigeonhole's default (`Family::bloom_bits`), which the
-/// RocksDB runner matches. fjall builds filters by default; SQLite has none.
+/// RocksDB runner matches; SQLite has none.
 pub const BLOOM_BITS: u8 = 10;
 
 /// Memory every store may use, so no engine wins by caching more than another.
@@ -31,7 +29,6 @@ pub const BLOOM_BITS: u8 = 10;
 /// |---|---|---|---|
 /// | Pigeonhole | `memtable_budget` (per shard; one table is on one shard) | `block_cache`, plus the library's row cache | `block_cache` + `row_cache` = `cache` |
 /// | RocksDB | `write_buffer_size` | LRU block cache | the same |
-/// | fjall | `max_memtable_size` | `cache_size` | the same |
 /// | SQLite | — | page cache (`cache_size`) of `write_buffer + cache` per connection | `write_buffer + cache` split across its connections |
 ///
 /// The default is a 64 MiB write buffer (Pigeonhole's and RocksDB's default) and a 256 MiB
@@ -163,7 +160,7 @@ pub(crate) fn now_micros() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX))
 }
 
-#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "sqlite"))]
+#[cfg(any(feature = "rocksdb", feature = "sqlite"))]
 /// TTL of `family` in microseconds (0: none).
 pub(crate) fn ttl_micros(family: &str) -> u64 {
     if family == METRIC_FAMILY {
@@ -173,7 +170,7 @@ pub(crate) fn ttl_micros(family: &str) -> u64 {
     }
 }
 
-#[cfg(any(feature = "rocksdb", feature = "fjall", feature = "sqlite"))]
+#[cfg(feature = "rocksdb")]
 /// Whether a cell of `family` written at `ts` is expired at `now`: the same rule the
 /// engine applies (`ts + ttl <= now`).
 pub(crate) fn expired(family: &str, ts: u64, now: u64) -> bool {
@@ -201,7 +198,7 @@ pub(crate) fn modified(old: Option<&[u8]>) -> Vec<u8> {
 /// `escape` turns each `0x00` in the row into `0x00 0xFF`, so the terminator `0x00 0x01`
 /// sorts below any continuation and the byte order of encoded keys is (row, family,
 /// qualifier) order. Families are numbered by their index in [`FAMILIES`].
-#[cfg(any(feature = "rocksdb", feature = "fjall", test))]
+#[cfg(any(feature = "rocksdb", test))]
 pub(crate) mod keys {
     pub(crate) fn row_prefix(row: &[u8]) -> Vec<u8> {
         let mut out = Vec::with_capacity(row.len() + 2);
@@ -240,7 +237,7 @@ pub(crate) mod keys {
     }
 }
 
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+#[cfg(feature = "rocksdb")]
 pub(crate) fn family_id(family: &str) -> Result<u8, String> {
     FAMILIES
         .iter()
@@ -252,7 +249,7 @@ pub(crate) fn family_id(family: &str) -> Result<u8, String> {
 /// A stored cell value in the key-value runners: the cell's timestamp (µs, big-endian)
 /// then the value. Eight bytes per cell is what a hand-written wide-column layout needs to
 /// support TTL, and what Pigeonhole stores in every cell too.
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+#[cfg(feature = "rocksdb")]
 pub(crate) fn encode_value(ts: u64, value: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + value.len());
     out.extend_from_slice(&ts.to_be_bytes());
@@ -263,7 +260,7 @@ pub(crate) fn encode_value(ts: u64, value: &[u8]) -> Vec<u8> {
 /// The value of a stored cell of family `family` (an index into [`FAMILIES`]), or `None`
 /// when its TTL has expired at `now`. This is the hand-written TTL filter of the
 /// key-value runners: it runs on every read and nothing ever deletes the expired cell.
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+#[cfg(feature = "rocksdb")]
 pub(crate) fn live_value(family: u8, stored: &[u8], now: u64) -> Result<Option<&[u8]>, String> {
     let (ts, value) = stored
         .split_first_chunk::<8>()
@@ -276,7 +273,7 @@ pub(crate) fn live_value(family: u8, stored: &[u8], now: u64) -> Result<Option<&
 
 /// Walks sorted `(key, value)` pairs from a seek to `keys::row_prefix(start)`, counting
 /// the live cells of the first `len` rows. A row whose cells have all expired is not a row.
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+#[cfg(feature = "rocksdb")]
 pub(crate) fn scan_rows<K: AsRef<[u8]>, V: AsRef<[u8]>, E: std::fmt::Display>(
     iter: impl Iterator<Item = Result<(K, V), E>>,
     len: u32,
@@ -312,7 +309,7 @@ pub(crate) fn scan_rows<K: AsRef<[u8]>, V: AsRef<[u8]>, E: std::fmt::Display>(
 /// [`scan_rows`] for [`BenchOp::ScanFiltered`]: only the cells of family `family` whose
 /// qualifier starts with `prefix` and whose timestamp is in `range`; a row with none of them
 /// is not counted (D247).
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+#[cfg(feature = "rocksdb")]
 pub(crate) fn scan_rows_filtered<K: AsRef<[u8]>, V: AsRef<[u8]>, E: std::fmt::Display>(
     iter: impl Iterator<Item = Result<(K, V), E>>,
     len: u32,
@@ -363,7 +360,7 @@ pub(crate) fn scan_rows_filtered<K: AsRef<[u8]>, V: AsRef<[u8]>, E: std::fmt::Di
 
 /// Walks sorted `(key, value)` pairs from a seek to `prefix` (a row prefix plus a family
 /// id), counting the live cells until the keys leave the prefix: one family of one row.
-#[cfg(any(feature = "rocksdb", feature = "fjall"))]
+#[cfg(feature = "rocksdb")]
 pub(crate) fn read_family<K: AsRef<[u8]>, V: AsRef<[u8]>, E: std::fmt::Display>(
     iter: impl Iterator<Item = Result<(K, V), E>>,
     prefix: &[u8],
@@ -622,17 +619,11 @@ mod concurrent_rmw {
     fn sqlite_runs_concurrent_rmw() {
         done(hammer(crate::SqliteRunner::default(), "sqlite"));
     }
-
-    #[cfg(feature = "fjall")]
-    #[test]
-    fn fjall_runs_concurrent_rmw() {
-        done(hammer(crate::FjallRunner::default(), "fjall"));
-    }
 }
 
 /// Every store must read the same cells for the same workload, or the comparison is
 /// meaningless.
-#[cfg(all(test, any(feature = "rocksdb", feature = "sqlite", feature = "fjall")))]
+#[cfg(all(test, any(feature = "rocksdb", feature = "sqlite")))]
 mod agreement {
     use super::{Counted, Touched};
     use crate::{BenchOp, PigeonholeRunner, Runner, Workload, WorkloadConfig, WorkloadKind};
@@ -763,11 +754,5 @@ mod agreement {
     #[test]
     fn sqlite_reads_what_pigeonhole_reads() {
         agree(crate::SqliteRunner::default, "sqlite");
-    }
-
-    #[cfg(feature = "fjall")]
-    #[test]
-    fn fjall_reads_what_pigeonhole_reads() {
-        agree(crate::FjallRunner::default, "fjall");
     }
 }

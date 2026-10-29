@@ -610,11 +610,13 @@ fjall (2.x and 3.x) depends on `varint-rs` (0BSD) and `xxhash-rust` (BSL-1.0). B
 
 **Status:** confirmed in the coordinator's review of PR #55. The exceptions are scoped to pigeonhole-bench only (`publish = false`), and `deny.toml`'s comments say so. A published crate that pulls either crate in needs its own review.
 
+**Retired (owner, 2026-10-29):** the fjall runner is gone, since no gate or D280 bar used it, and both exceptions went with it.
+
 <a id="d111"></a>
 ## D111 — CI builds the bench crate without the `rocksdb` feature (approved; bench)
 `ci.yml` runs `--all-features`, which would build RocksDB from C++ source on Linux, macOS and Windows (several minutes per job, plus libclang for bindgen).
 
-**Decision:** CI runs every `--workspace --all-features` step with `--exclude pigeonhole-bench`, then builds and tests the bench crate with `--features sqlite,fjall`, which needs only a C compiler. `cargo deny` still covers every feature (`[graph] all-features = true`). A separate workflow, `bench-rocksdb.yml`, builds and tests the bench crate with every feature, RocksDB included. It runs weekly, on pushes to `main` that touch `crates/bench/**`, and on demand, outside the PR-gating workflow, so the `rocksdb` feature cannot rot.
+**Decision:** CI runs every `--workspace --all-features` step with `--exclude pigeonhole-bench`, then builds and tests the bench crate with `--features sqlite,fjall`, which needs only a C compiler (`sqlite` alone since the fjall runner was dropped, 2026-10-29). `cargo deny` still covers every feature (`[graph] all-features = true`). A separate workflow, `bench-rocksdb.yml`, builds and tests the bench crate with every feature, RocksDB included. It runs weekly, on pushes to `main` that touch `crates/bench/**`, and on demand, outside the PR-gating workflow, so the `rocksdb` feature cannot rot.
 
 **Status:** confirmed in the coordinator's review of PR #55. Includes the build job.
 
