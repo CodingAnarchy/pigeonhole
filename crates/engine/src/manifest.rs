@@ -696,6 +696,20 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 req.readers.retain(|(id, _)| !ids.contains(id));
                 abandon_ssts(shared, &added_ssts(&gone));
                 abandon_blobs(shared, &added_blobs(&catalog, &gone));
+                // Freed now, so no longer the request's to free if it is refused later
+                // (simp724's N1 on #1056: the refusal arm frees `on_refusal`).
+                let blob_files: Vec<BlobFileId> = gone
+                    .iter()
+                    .filter_map(|e| match e {
+                        Edit::PutBlobFile { blob_file, .. } => Some(*blob_file),
+                        _ => None,
+                    })
+                    .collect();
+                req.on_refusal.retain(|e| match e {
+                    Edit::AddSst { meta, .. } => !ids.contains(&meta.id),
+                    Edit::PutBlobFile { blob_file, .. } => !blob_files.contains(blob_file),
+                    _ => true,
+                });
             }
             kept
         });
