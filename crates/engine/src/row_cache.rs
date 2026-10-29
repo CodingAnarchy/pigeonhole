@@ -93,15 +93,8 @@ impl RowEpochs {
     }
 
     /// A commit at `seqno` writes `row` (before the write is inserted, so before it can be
-    /// visible).
-    #[inline]
-    #[cfg(test)]
-    pub fn note_write(&self, table: TableId, row: &[u8], seqno: Seqno) {
-        self.table.note_write(self.hash(table, row), seqno);
-    }
-
-    /// As [`note_write`](Self::note_write), returning the slot's value before the raise
-    /// (D290's write-through: `p` below, the commit's own seqno, or above).
+    /// visible): raises the row's slot, returning its value before the raise (D290's
+    /// write-through: `p` below, the commit's own seqno, or above).
     #[inline]
     pub fn note_write_prev(&self, table: TableId, row: &[u8], seqno: Seqno) -> Seqno {
         self.table.note_write_prev(self.hash(table, row), seqno)
@@ -403,23 +396,8 @@ impl Encoded {
     /// The header of a marker entry: the row is over `max_row` (no real row expires at 0).
     pub const OVERSIZE: u64 = 0;
 
-    /// A fresh encoding, expiring never until a cell says otherwise.
-    #[cfg(test)]
-    pub fn start(buf: &mut Vec<u8>) {
-        buf.clear();
-        buf.extend_from_slice(&u64::MAX.to_le_bytes());
-    }
-
     /// Bytes a cell takes beyond its qualifier and value.
     pub const CELL_OVERHEAD: usize = 16;
-
-    /// Appends a cell; `expires` is when it expires (`u64::MAX` for never).
-    #[cfg(test)]
-    pub fn push(buf: &mut Vec<u8>, qualifier: &[u8], ts: Timestamp, stored: &[u8], expires: u64) {
-        let deadline = Self::deadline(buf).min(expires);
-        buf[..8].copy_from_slice(&deadline.to_le_bytes());
-        Self::push_cell(buf, qualifier, ts, stored);
-    }
 
     /// Appends a cell, leaving the header alone.
     #[inline]
@@ -962,15 +940,28 @@ mod tests {
         RowCaches::new(1 << 20, 4096, families, lw).unwrap()
     }
 
+    /// `cells` (qualifier, timestamp, stored value) encoded as a fill encodes a read row:
+    /// through `encode`, with the family's `ttl` (0: none).
+    fn encoded(cells: &[(&[u8], Timestamp, &[u8])], ttl: u64) -> Vec<u8> {
+        let mut row = RowData::default();
+        for &(qualifier, ts, stored) in cells {
+            let start = row.qualifiers.len();
+            row.qualifiers.extend_from_slice(qualifier);
+            let end = row.qualifiers.len();
+            row.push(FamilyId(1), start..end, CellData::copied(ts, stored));
+        }
+        encode(&row, 0, ttl, usize::MAX).unwrap()
+    }
+
     #[test]
     fn an_encoded_row_round_trips_and_keeps_the_earliest_expiry() {
-        let mut buf = Vec::new();
-        Encoded::start(&mut buf);
-        assert_eq!(Encoded::deadline(&buf), u64::MAX);
-        Encoded::push(&mut buf, b"a", 7, b"\x01x", 500);
-        Encoded::push(&mut buf, b"", 9, b"", u64::MAX);
-        Encoded::push(&mut buf, b"long", 3, &[2; 300], 200);
-        assert_eq!(Encoded::deadline(&buf), 200);
+        assert_eq!(Encoded::deadline(&encoded(&[], 100)), u64::MAX);
+        let cells: &[(&[u8], Timestamp, &[u8])] =
+            &[(b"a", 7, b"\x01x"), (b"", 9, b""), (b"long", 3, &[2; 300])];
+        assert_eq!(Encoded::deadline(&encoded(cells, 0)), u64::MAX);
+        // Each cell expires `ttl` after its timestamp: the oldest first.
+        let buf = encoded(cells, 100);
+        assert_eq!(Encoded::deadline(&buf), 103);
         let cells: Vec<_> = Encoded::cells(&buf).collect();
         assert_eq!(
             cells,
@@ -1018,19 +1009,17 @@ mod tests {
     fn a_write_after_a_fill_makes_the_entry_miss() {
         let rc = caches(Vec::new());
         let (t, f) = (TableId(1), FamilyId(2));
-        rc.lw.note_write(t, b"r", 5);
+        assert_eq!(rc.lw.note_write_prev(t, b"r", 5), 0);
         // A read at 10 sees the write at 5 and fills under epoch 5.
         let k = rc.epoch(t, b"r", 10).unwrap();
         assert_eq!(k.epoch, 5);
-        let mut buf = Vec::new();
-        Encoded::start(&mut buf);
-        rc.insert(f, b"r", k, buf);
+        rc.insert(f, b"r", k, encoded(&[], 0));
         assert!(matches!(
             rc.get(f, b"r", rc.epoch(t, b"r", 10).unwrap(), 0),
             Lookup::Hit(_)
         ));
         // A write at 11, applied: a read at 10 may neither hit nor fill; a read at 11 misses.
-        rc.lw.note_write(t, b"r", 11);
+        assert_eq!(rc.lw.note_write_prev(t, b"r", 11), 5);
         assert!(rc.epoch(t, b"r", 10).is_none());
         let k = rc.epoch(t, b"r", 11).unwrap();
         assert!(matches!(rc.get(f, b"r", k, 0), Lookup::Miss));
@@ -1048,10 +1037,7 @@ mod tests {
         let (t, f) = (TableId(1), FamilyId(2));
         let fill = |row: &[u8], at: Seqno| {
             let k = rc.epoch(t, row, at).unwrap();
-            let mut buf = Vec::new();
-            Encoded::start(&mut buf);
-            Encoded::push_cell(&mut buf, b"q", 1, row);
-            rc.insert(f, row, k, buf);
+            rc.insert(f, row, k, encoded(&[(b"q", 1, row)], 0));
         };
         fill(b"a", 10);
         fill(b"b", 10);
@@ -1066,7 +1052,7 @@ mod tests {
         fill(b"a", 10);
         assert_eq!(hit(b"a", 10).as_deref(), Some(&b"a"[..]));
         // A write to `b` raises the shared slot: `a` misses too, and nothing crosses.
-        rc.lw.note_write(t, b"b", 11);
+        assert_eq!(rc.lw.note_write_prev(t, b"b", 11), 0);
         assert_eq!(hit(b"a", 11), None);
         assert_eq!(hit(b"b", 11), None);
     }
@@ -1079,7 +1065,7 @@ mod tests {
         assert!(!rc.admit(f, k));
         assert!(rc.admit(f, k));
         // After a write, the row has been seen: its next miss fills.
-        rc.lw.note_write(t, b"r", 2);
+        assert_eq!(rc.lw.note_write_prev(t, b"r", 2), 0);
         let k = rc.epoch(t, b"r", 2).unwrap();
         assert!(rc.admit(f, k));
         // Another family of the row has not.
@@ -1091,10 +1077,7 @@ mod tests {
         let rc = caches(Vec::new());
         let (t, f) = (TableId(1), FamilyId(1));
         let k = rc.epoch(t, b"r", 0).unwrap();
-        let mut buf = Vec::new();
-        Encoded::start(&mut buf);
-        Encoded::push(&mut buf, b"q", 1, b"v", 100);
-        rc.insert(f, b"r", k, buf);
+        rc.insert(f, b"r", k, encoded(&[(b"q", 1, b"v")], 99));
         assert!(matches!(rc.get(f, b"r", k, 99), Lookup::Hit(_)));
         assert!(matches!(rc.get(f, b"r", k, 100), Lookup::Miss));
         rc.insert_oversize(f, b"r", k);
