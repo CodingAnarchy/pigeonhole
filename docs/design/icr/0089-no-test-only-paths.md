@@ -24,6 +24,15 @@
   - `key::encode_seek_key`, `key::SEEK_KIND`, `key::column_prefix_len`, `Escaped::eq_raw` and `Escaped::is_verbatim` are removed. FORMAT §2 still defines seek keys, and the golden `keys.bin` still holds one, now built by the tests.
   - `BlockIter::entry_offset` is removed.
 
+## What a re-implementation of `Pager::set_features` must keep (simp724's S1 on #1087)
+D269 and FORMAT §13 still describe flagging a feature, and #487 is its first user. The `set_features` that #1087 removes, and its two tests, held four constraints:
+1. **Two commits.** Both superblock pages carry the new sets before the first structure that uses the feature.
+2. **Each commit names the root current when it starts**, read under the state lock as the commit slot is claimed, so a root committed between the two is never replaced by an older one. That was perf287's S1 on #858; the removed test was `a_feature_change_keeps_a_root_committed_between_its_two_commits`.
+3. **The sets become current only once the page is durable.** A failed commit leaves them as they were and poisons the pager, as any failed commit does; the removed test was `a_failed_feature_commit_leaves_the_sets_as_they_were`.
+4. **The engine routes the change through its manifest writer as a request**, so it never interleaves with a manifest commit (an overlapping root commit fails "root commits overlap").
+
+The open-time repair of pages whose sets disagree stays in the pager (`OpenedPager::finish`), since another build can leave them.
+
 ## Why
 The owner's rule, now in AGENTS.md and CONTRIBUTING.md: code under `src/` that tests call must be the code production runs. A method only tests call keeps passing tests while the production path beside it changes untested (#1055 left `note_write` under `cfg(test)` while production called `note_write_prev`).
 

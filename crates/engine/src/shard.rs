@@ -395,7 +395,6 @@ pub(crate) struct VisibilityCounts {
     pub woken: AtomicU64,
 }
 
-/// Engine-wide state every shard and every caller shares.
 /// Memtable jumps taken by reads (test hook).
 #[cfg(feature = "test-hooks")]
 pub(crate) static TAIL_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -413,6 +412,7 @@ fn new_memtable(
     Ok(if tail_index { m.with_tail_index() } else { m })
 }
 
+/// Engine-wide state every shard and every caller shares.
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,

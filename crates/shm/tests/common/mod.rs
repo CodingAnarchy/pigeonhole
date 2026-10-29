@@ -170,9 +170,6 @@ impl Rng {
     }
 }
 
-/// Runs one thread per shard for `duration` (or until the seqno budget is spent), each
-/// doing single-shard groups and, now and then, coordinating a cross-shard commit. Returns
-/// the number of seqnos reserved. Stops early if `stop` is set.
 /// A handle on the database file opened as `process`, as a reader (or the writer) holds
 /// one: reader slots take their liveness locks through it, and `SimVfs::crash_process`
 /// closes it, releasing them.
@@ -218,6 +215,9 @@ impl Seqnos {
     }
 }
 
+/// Runs one thread per shard for `duration` (or until the seqno budget is spent), each
+/// doing single-shard groups and, now and then, coordinating a cross-shard commit. Returns
+/// the number of seqnos reserved. Stops early if `stop` is set.
 pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicBool) -> u64 {
     let shards = shm.shard_count();
     let (senders, receivers): (Vec<Sender<Share>>, Vec<Receiver<Share>>) =

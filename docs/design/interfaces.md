@@ -118,7 +118,7 @@ Additions after review (additive): `Wal::spares() -> Option<SpareSegments>` (def
 7. Assign tablets to shards, publish the first view, start the runtime.
 
 ### Reader process (Phase 4)
-`vfs.open(path)` read-write (D36; the reader writes nothing), `Presence::acquire`, `ShmRegion::open(.., Role::Reader, ..)` (refuses a layout mismatch), `claim_reader_slot`, load the manifest named by `manifest_version` through its own `Pager::open` (read-only) and `BlockCache`; memtables via `MemtableReader::open(arena, root)` from `read_view`. When `is_stale()`, `reattach`, re-claim a slot and re-pin.
+`vfs.open(path)` read-write (D36; the reader writes nothing), `Presence::acquire`, `ShmRegion::open(.., Role::Reader, ..)` (refuses a layout mismatch), `claim_reader_slot_locked` (through that handle), load the manifest named by `manifest_version` through its own `Pager::open` (read-only) and `BlockCache`; memtables via `MemtableReader::open(arena, root)` from `read_view`. When `is_stale()`, `reattach`, re-claim a slot and re-pin.
 
 ## External dependencies
 
