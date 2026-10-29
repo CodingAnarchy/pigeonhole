@@ -3073,7 +3073,14 @@ The root cause is the readahead path's latency, not the scan's length. A demand 
 - A row limit doesn't bound the blocks a scan reads. Wide rows, rows a filter skips and runs of deleted rows can make a short scan long in blocks. Those scans get readahead back after at most 8 demand reads per cursor (perf287's review, #1029), where turning it off would have left every block a demand read.
 - With the block bound in place, 128 only decides when the later start applies, so a cut-off 2× either way costs little.
 
-**Measured.** _Pending: a box A/B on ycsb-e ×3 at buffered and default, plus time-series-range and adjacency at 16 clients, with p50 and p99 beside throughput, and wait-on-in-flight for the long-scan arms. Arms: main, this change, and readahead off for short scans._
+**Measured** (AX102, 2026-10-29, #1029 c6487018873; 16 clients, full scale, ycsb-e ×3 interleaved, medians):
+- **ycsb-e at buffered:** 178.6K → 207.4K ops/s, p99 285 → 182 µs, p99.9 467 → 251 µs.
+- **ycsb-e at default:** 167.4K → 183.4K ops/s, p99 293 → 214 µs, scan p99.9 about 440 → 250 µs.
+- **The wait is gone:** the readahead wait that made up the p99–99.9 band (110–153 µs) is 0.
+- **Same as fully off:** this rule is within noise of reading nothing ahead for short scans, and of readahead off for every scan.
+- **Default level's overall p99.9:** it rises with every faster arm, fully-off ones included, because the 5% puts queue on group syncs at the higher request rate. It isn't the scans.
+- **Long-scan shapes** (one run per arm): no regression. time-series-range p99 is 4145 → 2228 µs; adjacency's is 1638 → 1376 µs. Fully off was a little worse on time-series-range.
+- **Long scans' wait-on-in-flight is unmeasured:** adjacency is cache-resident at full scale (no data misses), and time-series-range's filtered scans weren't timed. #974 A stays parked until a cold long-scan profile shows such a wait.
 
 **Tests.** `scan_readahead_limit.rs` (every scan reads all its cells):
 - scans limited to 1, 50 and 128 narrow rows submit no readahead;
