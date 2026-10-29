@@ -397,9 +397,21 @@ impl BlockBuilder {
         if !same_row {
             self.row_starts.push(offset);
         }
-        crate::varint::put_u64(&mut self.buf, shared as u64);
-        crate::varint::put_u64(&mut self.buf, (key.len() - shared) as u64);
-        crate::varint::put_u64(&mut self.buf, value.len() as u64);
+        let (shared_len, rest_len, value_len) = (
+            shared as u64,
+            (key.len() - shared) as u64,
+            value.len() as u64,
+        );
+        // A varint below 0x80 is that one byte: the usual entry's three header fields in one
+        // copy, as the reader's fast path decodes them.
+        if (shared_len | rest_len | value_len) < 0x80 {
+            self.buf
+                .extend_from_slice(&[shared_len as u8, rest_len as u8, value_len as u8]);
+        } else {
+            crate::varint::put_u64(&mut self.buf, shared_len);
+            crate::varint::put_u64(&mut self.buf, rest_len);
+            crate::varint::put_u64(&mut self.buf, value_len);
+        }
         self.buf.extend_from_slice(&key[shared..]);
         self.buf.extend_from_slice(value);
         self.last_row_len = Some(row_len);
