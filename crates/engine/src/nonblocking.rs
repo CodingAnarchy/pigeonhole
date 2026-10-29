@@ -122,6 +122,18 @@ struct Reading {
 }
 
 impl Reading {
+    /// Starts with the fetch a latest read at the call missed on, if any (#709): the read
+    /// the cursor already submitted is resumed, not submitted again, and the first poll
+    /// waits on it instead of running the read once more just to find the same miss.
+    fn with_missed(mut self, missed: MissedRead) -> Self {
+        if let Some(mut fetch) = missed.0 {
+            self.fetches = 1;
+            let completion = fetch.start();
+            self.fetch = Some((completion, fetch));
+        }
+        self
+    }
+
     fn new(inner: Arc<Inner>, snapshot: Option<Snapshot>) -> Self {
         let given = snapshot.is_some();
         Self {
@@ -218,6 +230,9 @@ impl Reading {
                 Err(Error::WouldBlock(mut fetch)) => {
                     self.fetches += 1;
                     if self.fetches > MAX_FETCHES {
+                        // Drops `fetch`, maybe with its read in flight (#709). That is safe: a
+                        // dropped `Completion` leaves the buffer with the backend until the
+                        // device is done with it (pigeonhole-io's completion contract, #976).
                         self.go_sync();
                         continue;
                     }
@@ -251,11 +266,20 @@ impl Reading {
     }
 }
 
+/// The fetch a latest read at the call missed on (#709), for the future to take over:
+/// `None` when the call did not run the read (a reader process, or no read point yet), or
+/// the miss carried no fetch. Opaque outside the engine: from
+/// [`Engine::try_read_row_latest`](crate::Engine::try_read_row_latest) to
+/// [`Engine::read_row_latest_async_after`](crate::Engine::read_row_latest_async_after).
+#[derive(Debug, Default)]
+pub struct MissedRead(Option<Box<Fetch>>);
+
 /// A latest read at the call, in a writer process (#709): `attempt` runs once in cache-only
-/// mode under the view's guard, as the sync read reads, with the writer's row cache.
-/// `None` when it would miss a block (the caller builds the future, which takes its own
-/// read point on the first poll), in a reader process, or when the visible seqno kept
-/// moving; otherwise its result, an error included.
+/// mode under the view's guard, as the sync read reads, with the writer's row cache. Its
+/// result, an error included; or, when it would wait on the device (a page-cache miss the
+/// cursor could not read in place), in a reader process, or when the visible seqno kept
+/// moving, the miss: the future takes it over with its read in flight
+/// ([`Reading::with_missed`]), and takes its own read point on the first poll.
 pub(crate) fn try_latest_now<T>(
     inner: &Inner,
     attempt: impl FnOnce(
@@ -264,14 +288,14 @@ pub(crate) fn try_latest_now<T>(
         Timestamp,
         Option<&crate::row_cache::RowCaches>,
     ) -> Result<T>,
-) -> Option<Result<T>> {
+) -> std::result::Result<Result<T>, MissedRead> {
     if inner.is_reader() {
-        return None;
+        return Err(MissedRead::default());
     }
     let (view, seqno) = match inner.latest_view() {
         Ok(Some(point)) => point,
-        Ok(None) => return None,
-        Err(e) => return Some(Err(e)),
+        Ok(None) => return Err(MissedRead::default()),
+        Err(e) => return Ok(Err(e)),
     };
     let now = inner.shared.vfs.now_micros();
     let (r, sync_reads) = as_async_read(true, || {
@@ -284,11 +308,8 @@ pub(crate) fn try_latest_now<T>(
             .fetch_add(sync_reads, Ordering::Relaxed);
     }
     match r {
-        // A page-cache miss the cursor read in place never gets here (#709). This is a read
-        // that must wait on the device: dropped with its read in flight, which still fills
-        // the page cache, so the future's own read of the block is usually a cache hit.
-        Err(Error::WouldBlock(_)) => None,
-        other => Some(other),
+        Err(Error::WouldBlock(fetch)) => Err(MissedRead(Some(fetch))),
+        other => Ok(other),
     }
 }
 
@@ -385,18 +406,22 @@ impl GetFuture {
         row: &[u8],
         qualifier: &[u8],
     ) -> Self {
-        if snapshot.is_none()
-            && let Some(r) = try_latest_now(inner, |view, seqno, now, rc| {
+        let mut missed = MissedRead::default();
+        if snapshot.is_none() {
+            match try_latest_now(inner, |view, seqno, now, rc| {
                 get_attempt(view, seqno, now, true, rc, table, family, row, qualifier)
-            })
-        {
-            return Self {
-                state: GetState::Done(Some(r)),
-            };
+            }) {
+                Ok(r) => {
+                    return Self {
+                        state: GetState::Done(Some(r)),
+                    };
+                }
+                Err(m) => missed = m,
+            }
         }
         Self {
             state: GetState::Reading {
-                reading: Reading::new(Arc::clone(inner), snapshot),
+                reading: Reading::new(Arc::clone(inner), snapshot).with_missed(missed),
                 table,
                 family,
                 row: row.to_vec(),
@@ -468,9 +493,11 @@ impl<S> std::fmt::Debug for RowFuture<S> {
 }
 
 impl<S: RowSink + Clone> RowFuture<S> {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: Arc<Inner>,
         snapshot: Option<Snapshot>,
+        missed: MissedRead,
         table: TableId,
         row: &[u8],
         families: &[FamilyId],
@@ -478,7 +505,7 @@ impl<S: RowSink + Clone> RowFuture<S> {
         sink: S,
     ) -> Self {
         Self {
-            reading: Reading::new(inner, snapshot),
+            reading: Reading::new(inner, snapshot).with_missed(missed),
             table,
             row: row.to_vec(),
             families: families.to_vec(),

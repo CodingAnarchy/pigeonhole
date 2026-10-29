@@ -2321,7 +2321,9 @@ impl Engine {
     /// mode, through the row cache, and returns `None` when it would need a block the cache
     /// does not hold (and in a reader process). `sink` may then hold some of the row's cells;
     /// start [`Engine::read_row_latest_async`] with an empty one. A memtable or cache hit is
-    /// the async read's fast path: no future, no reference counted (#709).
+    /// the async read's fast path: no future, no reference counted (#709). The miss is
+    /// dropped, with any read the cursor submitted for it; [`Engine::try_read_row_latest`]
+    /// keeps it for the future.
     pub fn try_read_row_latest_into(
         &self,
         table: TableId,
@@ -2330,6 +2332,24 @@ impl Engine {
         spec: &ReadSpec,
         sink: &mut impl read::RowSink,
     ) -> Option<Result<bool>> {
+        // Dropping the miss's read in flight is safe: a dropped `Completion` leaves the buffer
+        // with the backend until the device is done with it (pigeonhole-io's completion
+        // contract, #976).
+        self.try_read_row_latest(table, row, families, spec, sink)
+            .ok()
+    }
+
+    /// [`Engine::try_read_row_latest_into`] that keeps its miss (#709): `Err` carries the
+    /// block the read missed on, with the read the cursor submitted for it, for
+    /// [`Engine::read_row_latest_async_after`] to resume instead of submitting again.
+    pub fn try_read_row_latest(
+        &self,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: &mut impl read::RowSink,
+    ) -> std::result::Result<Result<bool>, crate::MissedRead> {
         crate::nonblocking::try_latest_now(&self.inner, |view, seqno, now, rc| {
             let families = families_in_order(view, table, families)?;
             if let Some(rc) = rc
@@ -2363,9 +2383,31 @@ impl Engine {
         spec: &ReadSpec,
         sink: S,
     ) -> crate::RowFuture<S> {
+        self.read_row_latest_async_after(
+            crate::MissedRead::default(),
+            table,
+            row,
+            families,
+            spec,
+            sink,
+        )
+    }
+
+    /// [`Engine::read_row_latest_async`] after [`Engine::try_read_row_latest`] missed: the
+    /// future starts by waiting on the read the call submitted (#709).
+    pub fn read_row_latest_async_after<S: read::RowSink + Clone + Unpin>(
+        &self,
+        missed: crate::MissedRead,
+        table: TableId,
+        row: &[u8],
+        families: &[FamilyId],
+        spec: &ReadSpec,
+        sink: S,
+    ) -> crate::RowFuture<S> {
         crate::RowFuture::new(
             Arc::clone(&self.inner),
             None,
+            missed,
             table,
             row,
             families,
@@ -2388,6 +2430,7 @@ impl Engine {
         crate::RowFuture::new(
             Arc::clone(&self.inner),
             Some(snapshot.clone()),
+            crate::MissedRead::default(),
             table,
             row,
             families,

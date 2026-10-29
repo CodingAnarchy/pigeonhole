@@ -37,9 +37,12 @@ fn row_key(r: u32) -> Vec<u8> {
 /// Writes `writes` in `batches`, flushing after each but the last (so later batches shadow
 /// earlier SSTs and the last stays in the memtable), and reopens with a cold cache.
 fn build(vfs: &Arc<SimVfs>, writes: &[Write], batches: usize) -> Pigeonhole {
-    let path = "/db/inplace.phdb";
+    build_at("/db/inplace.phdb", options(vfs), writes, batches)
+}
+
+fn build_at(path: &str, options: Options, writes: &[Write], batches: usize) -> Pigeonhole {
     {
-        let db = Pigeonhole::open(path, options(vfs)).unwrap();
+        let db = Pigeonhole::open(path, options.clone()).unwrap();
         let t = db
             .table("t")
             .unwrap()
@@ -65,7 +68,7 @@ fn build(vfs: &Arc<SimVfs>, writes: &[Write], batches: usize) -> Pigeonhole {
         }
         db.close().unwrap();
     }
-    Pigeonhole::open(path, options(vfs)).unwrap()
+    Pigeonhole::open(path, options).unwrap()
 }
 
 /// One cell: family, qualifier, timestamp, value.
@@ -203,6 +206,97 @@ fn both_paths_are_exercised() {
     }
     vfs.set_deferred_io(false);
     assert!(waited > 0, "the deferred reads waited on their reads");
+    drop(t);
+    db.close().unwrap();
+}
+
+#[test]
+fn async_reads_on_real_files_read_what_sync_reads() {
+    // On real files with the backend `PIGEONHOLE_IO` picks (CI runs this on io_uring, on
+    // pread and with direct I/O): a reopened store's blocks are in the OS page cache, so on
+    // Linux a buffered miss is a D292 page-cache hit read in place; elsewhere, and with
+    // direct I/O, the read is in flight and the future resumes it.
+    for seed in [1u64, 2, 3, 4] {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let path = dir.join("inplace.phdb");
+        // A small linear congruential sequence, so each seed writes different data.
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = |m: u64| {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (x >> 33) % m
+        };
+        let writes: Vec<Write> = (0..300)
+            .map(|_| {
+                let len = if next(8) == 0 {
+                    0
+                } else {
+                    1 + next(89) as usize
+                };
+                (
+                    next(u64::from(ROWS)) as u32,
+                    next(2) as u8,
+                    next(4) as u8,
+                    1 + next(5),
+                    len,
+                )
+            })
+            .collect();
+        let options = Options::default()
+            .shards(2)
+            .pin_threads(false)
+            .block_cache(16 << 10)
+            .row_cache(0);
+        let db = build_at(path.to_str().unwrap(), options, &writes, 4);
+        let t = db.table("t").unwrap().open().unwrap();
+        for r in 0..ROWS {
+            let row = row_key(r);
+            let got = pigeonhole::doc_support::block_on(t.row(&row).versions(3).read_async())
+                .unwrap()
+                .map(|r| cells(&r.view()));
+            assert_eq!(got, sync_row(&t, &row, 3), "seed {seed} row {r}");
+        }
+        drop(t);
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn a_miss_at_the_call_is_resumed_by_the_future_not_read_twice() {
+    // #709 (perf287's S1): a latest get or row read that must wait at the call hands the
+    // read its cursor submitted to the future, which waits on it: one read in flight, not
+    // a second of the same block.
+    let vfs = SimVfs::new(7091);
+    let writes: Vec<Write> = (0..200u32)
+        .map(|i| (i % ROWS, 1, (i % 4) as u8, 1, 60))
+        .collect();
+    let db = build(&vfs, &writes, 2);
+    let t = db.table("t").unwrap().open().unwrap();
+    let mut cx = Context::from_waker(Waker::noop());
+    vfs.set_deferred_io(true);
+    let mut get = t.get_async(&row_key(3), "d", &[1]);
+    assert_eq!(vfs.io_in_flight(), 1, "the call submitted the block's read");
+    assert!(Pin::new(&mut get).poll(&mut cx).is_pending());
+    assert_eq!(vfs.io_in_flight(), 1, "the future waits on that read");
+    let got = drive(&vfs, get).unwrap();
+    let mut row = t.row(&row_key(5)).read_async();
+    let in_flight = vfs.io_in_flight();
+    assert!(Pin::new(&mut row).poll(&mut cx).is_pending());
+    assert_eq!(
+        vfs.io_in_flight(),
+        in_flight,
+        "the row read's future waits on the call's read"
+    );
+    let read = drive(&vfs, row).unwrap();
+    vfs.set_deferred_io(false);
+    assert_eq!(
+        got.map(|c| c.value().to_vec()),
+        t.get(&row_key(3), "d", &[1])
+            .unwrap()
+            .map(|c| c.value().to_vec())
+    );
+    assert_eq!(read.map(|r| cells(&r.view())), sync_row(&t, &row_key(5), 1));
     drop(t);
     db.close().unwrap();
 }

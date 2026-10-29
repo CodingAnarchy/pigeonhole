@@ -414,24 +414,28 @@ impl RowRead<'_> {
                     // First at the call, as the sync read (#709): a hit needs no future, so
                     // concurrent readers share no reference count beyond the sync read's.
                     let mut buf = RowBuf::new(info, 0);
-                    if let Some(r) = engine.try_read_row_latest_into(
+                    let missed = match engine.try_read_row_latest(
                         table,
                         &self.row,
                         &families,
                         &self.sel.spec,
                         &mut buf,
                     ) {
-                        return Ok(Err(r.map_err(crate::Error::from).map(|any| {
-                            any.then(|| {
-                                buf.key = std::mem::take(&mut self.row);
-                                Row::new(buf)
-                            })
-                        })));
-                    }
+                        Ok(r) => {
+                            return Ok(Err(r.map_err(crate::Error::from).map(|any| {
+                                any.then(|| {
+                                    buf.key = std::mem::take(&mut self.row);
+                                    Row::new(buf)
+                                })
+                            })));
+                        }
+                        Err(missed) => missed,
+                    };
                     // A miss may have left cells in `buf`: the future starts from an empty
-                    // row for the same table entry.
+                    // row for the same table entry, waiting on the read the miss submitted.
                     let info = buf.info.take().expect("set by RowBuf::new");
-                    engine.read_row_latest_async(
+                    engine.read_row_latest_async_after(
+                        missed,
                         table,
                         &self.row,
                         &families,
