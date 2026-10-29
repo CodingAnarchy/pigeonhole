@@ -1435,7 +1435,7 @@ mod tests {
 /// let shm = ShmRegion::in_memory([1; 16], &ShmConfig::new(1));
 /// let epochs = shm.row_epochs();
 /// assert_eq!(epochs.epoch(42, 10), Some(0));
-/// epochs.note_write(42, 7);
+/// epochs.note_write_prev(42, 7);
 /// assert_eq!(epochs.epoch(42, 10), Some(7));
 /// assert_eq!(epochs.epoch(42, 6), None); // written, not visible at 6
 /// ```
@@ -1473,16 +1473,10 @@ impl RowEpochTable {
     }
 
     /// The row hashing to `hash` is written at `seqno` (call before the write can be
-    /// visible). Writer only.
-    #[inline]
-    pub fn note_write(&self, hash: u64, seqno: u64) {
-        self.slot(hash).fetch_max(seqno, Ordering::Release);
-    }
-
-    /// As [`note_write`](Self::note_write), returning the slot's value before the raise
-    /// (ICR 0082): below `seqno` for a commit's first write to the row since the slot last
-    /// moved, `seqno` itself for a later write of the same commit, and above it when a commit
-    /// with a higher seqno already wrote a row of this slot. Writer only.
+    /// visible): raises its slot to `seqno`, returning the slot's value before the raise
+    /// (ICR 0082). That is below `seqno` for a commit's first write to the row since the slot
+    /// last moved, `seqno` itself for a later write of the same commit, and above it when a
+    /// commit with a higher seqno already wrote a row of this slot. Writer only.
     ///
     /// ```
     /// use pigeonhole_shm::{ShmConfig, ShmRegion};

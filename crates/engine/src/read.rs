@@ -122,8 +122,6 @@ impl CellData {
                     _view: pin(),
                 },
                 Some(Pinned::Block(c)) => CellValue::Block(c),
-                #[cfg(test)]
-                Some(Pinned::Owned(v)) => CellValue::Owned(v),
                 None => CellValue::Owned(stored.to_vec()),
             }
         } else {
@@ -186,8 +184,6 @@ impl CellData {
                 _view: pin(),
             },
             LaneValue::Pinned(Pinned::Block(c)) => CellValue::Block(c.clone()),
-            #[cfg(test)]
-            LaneValue::Pinned(Pinned::Owned(v)) => CellValue::Owned(v.clone()),
         };
         Self { ts, value }
     }
@@ -1779,8 +1775,6 @@ fn skips_columns(sources: &[Source]) -> bool {
     sources.iter().any(|s| match s {
         Source::Mem(m) => m.inner().skips_columns(),
         Source::Sst(_) => true,
-        #[cfg(test)]
-        Source::Vec(_) => false,
     })
 }
 
@@ -2007,7 +2001,10 @@ mod tests {
     use pigeonhole_format::key::{Kind, decode_key, encode_key, encode_marker_key};
     use pigeonhole_format::value::{ValueRef, decode_value, encode_value};
 
-    use crate::source::{Resolver, Source};
+    use pigeonhole_format::scan::ScanFilter;
+    use pigeonhole_memtable::{ArenaRegion, Memtable, ShardArena};
+
+    use crate::source::{Resolver, mem_sources_from};
     use crate::{Error, ValuePredicate};
 
     fn put(row: &str, q: &str, ts: u64, seqno: u64, v: &[u8]) -> (Vec<u8>, Vec<u8>) {
@@ -2062,12 +2059,23 @@ mod tests {
         )
     }
 
+    /// A resolver over one memtable per entry list, built as a read builds its memtable
+    /// sources (`mem_sources_from`, unfiltered).
     fn resolver(sources: Vec<Vec<(Vec<u8>, Vec<u8>)>>, opts: ResolveOptions) -> Resolver {
-        let sources = sources
+        let readers: Vec<_> = sources
             .into_iter()
-            .map(|e| Source::Vec(VecCursor::new(e)))
+            .map(|entries| {
+                let mut arena = ShardArena::new(ArenaRegion::heap(1 << 20), 64 << 10);
+                let mut mem = Memtable::create(&mut arena).unwrap();
+                for (k, v) in &entries {
+                    mem.insert(&mut arena, k, v).unwrap();
+                }
+                mem.reader()
+            })
             .collect();
-        Resolver::new(MergingCursor::new(sources), opts)
+        let mut out = Vec::new();
+        mem_sources_from(&readers, &ScanFilter::all(), &mut out);
+        Resolver::new(MergingCursor::new(out), opts)
     }
 
     fn collect(src: Vec<(Vec<u8>, Vec<u8>)>, opts: ResolveOptions) -> Vec<Cell> {

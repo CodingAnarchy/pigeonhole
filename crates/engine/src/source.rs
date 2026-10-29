@@ -34,9 +34,6 @@ pub(crate) enum Source {
     Mem(FilteredCursor<MemIter>),
     /// An SST, or the SSTs of one level below 0 (the filter runs inside the block decoder).
     Sst(SstSource),
-    /// An in-memory source for the resolver tests.
-    #[cfg(test)]
-    Vec(pigeonhole_compaction::VecCursor),
 }
 
 impl Cursor for Source {
@@ -47,8 +44,6 @@ impl Cursor for Source {
         match self {
             Source::Mem(it) => it.valid(),
             Source::Sst(it) => it.valid(),
-            #[cfg(test)]
-            Source::Vec(it) => it.valid(),
         }
     }
 
@@ -57,8 +52,6 @@ impl Cursor for Source {
         match self {
             Source::Mem(it) => it.key(),
             Source::Sst(it) => it.key(),
-            #[cfg(test)]
-            Source::Vec(it) => it.key(),
         }
     }
 
@@ -67,8 +60,6 @@ impl Cursor for Source {
         match self {
             Source::Mem(it) => it.value(),
             Source::Sst(it) => it.value(),
-            #[cfg(test)]
-            Source::Vec(it) => it.value(),
         }
     }
 
@@ -76,8 +67,6 @@ impl Cursor for Source {
         match self {
             Source::Mem(it) => Ok(it.seek_to_first()?),
             Source::Sst(it) => it.seek_to_first(),
-            #[cfg(test)]
-            Source::Vec(it) => Ok(it.seek_to_first()?),
         }
     }
 
@@ -85,8 +74,6 @@ impl Cursor for Source {
         match self {
             Source::Mem(it) => Ok(it.seek(target)?),
             Source::Sst(it) => it.seek(target),
-            #[cfg(test)]
-            Source::Vec(it) => Ok(it.seek(target)?),
         }
     }
 
@@ -95,8 +82,6 @@ impl Cursor for Source {
             // A finger search from the memtable cursor's last seek.
             Source::Mem(it) => Ok(it.seek_forward(target)?),
             Source::Sst(it) => it.seek(target),
-            #[cfg(test)]
-            Source::Vec(it) => Ok(it.seek_forward(target)?),
         }
     }
 
@@ -104,8 +89,6 @@ impl Cursor for Source {
         match self {
             Source::Mem(it) => Ok(it.next()?),
             Source::Sst(it) => it.next(),
-            #[cfg(test)]
-            Source::Vec(it) => Ok(it.next()?),
         }
     }
 
@@ -113,8 +96,6 @@ impl Cursor for Source {
         match self {
             Source::Mem(it) => Ok(it.skip_row()?),
             Source::Sst(it) => it.skip_row(),
-            #[cfg(test)]
-            Source::Vec(it) => Ok(it.skip_row()?),
         }
     }
 
@@ -164,8 +145,6 @@ impl Cursor for Source {
                 }
                 Ok(skipped)
             }
-            #[cfg(test)]
-            Source::Vec(it) => Ok(it.skip_column(column)?),
         }
     }
 }
@@ -177,9 +156,6 @@ pub(crate) enum Pinned {
     Arena(ArenaSlice),
     /// A range of a cached block.
     Block(Cell),
-    /// An owned copy (the resolver tests' in-memory sources).
-    #[cfg(test)]
-    Owned(Vec<u8>),
 }
 
 impl Deref for Pinned {
@@ -189,8 +165,6 @@ impl Deref for Pinned {
         match self {
             Pinned::Arena(s) => s,
             Pinned::Block(c) => c,
-            #[cfg(test)]
-            Pinned::Owned(v) => v,
         }
     }
 }
@@ -219,8 +193,6 @@ impl Source {
         match self {
             Source::Mem(it) => Pinned::Arena(it.inner().value_slice()),
             Source::Sst(it) => Pinned::Block(it.iter.value_cell()),
-            #[cfg(test)]
-            Source::Vec(it) => Pinned::Owned(it.value().to_vec()),
         }
     }
 }
@@ -721,8 +693,9 @@ pub(crate) fn sst_sources_point<const CACHE_ONLY: bool>(
     // The filter probe (three hashes) only once an SST covers the row: a get of a row no
     // SST holds does not pay for it.
     let mut probe: Option<Probe> = None;
-    // As `FamilySsts::covering`, written out: building the probe appends to the key's buffer
-    // (past the row prefix, which stays as it is), so the row is sliced afresh per SST.
+    // The walk `sst_sources_row` makes, but with the row sliced afresh per SST: building the
+    // probe appends to the key's buffer (past the row prefix, which stays as it is). Both are
+    // checked against a walk of every SST (`the_ssts_a_read_picks_are_the_ones_a_walk_finds`).
     for l in 0..fam.levels.len() {
         let (from, search) = fam.level_start(l, &key.buf[..key.row_len]);
         for sst in &fam.levels[l][from..] {
@@ -979,7 +952,10 @@ mod level_tests {
     use pigeonhole_io::{OpenOptions, Vfs};
     use pigeonhole_sst::{SstReader, SstWriter, SstWriterOptions};
 
-    use super::{Source, SstSource, read_options, sst_sources_range};
+    use super::{
+        ColumnKey, Source, SstSource, TERMINATOR, read_options, sst_sources_point,
+        sst_sources_range, sst_sources_row,
+    };
     use crate::snapshot::{FamilySsts, OpenSst, SstSet};
 
     /// xorshift64*, seeded per case.
@@ -1237,6 +1213,162 @@ mod level_tests {
                 .filter(|s| matches!(s, Source::Sst(s) if s.level.is_some()))
                 .count();
             assert_eq!((out.len(), lazy), (sources, levels), "{start:?}..{end:?}");
+        }
+    }
+    /// One SST of a layout: its first row and qualifier, and its last.
+    type Span = (u64, &'static [u8], u64, &'static [u8]);
+
+    fn row_name(i: u64) -> Vec<u8> {
+        format!("r{i:02}").into_bytes()
+    }
+
+    /// An SST's entries: one in each row of its range (its edge qualifiers in the edge rows,
+    /// `c` between), each with the SST's `id` as its value.
+    fn span_entries((lo, lo_q, hi, hi_q): Span, id: u8) -> Entries {
+        let mut out = Vec::new();
+        for r in lo..=hi {
+            let mut qs: Vec<&[u8]> = Vec::new();
+            if r == lo {
+                qs.push(lo_q);
+            }
+            if r != lo && r != hi {
+                qs.push(b"c");
+            }
+            if r == hi && !(r == lo && hi_q == lo_q) {
+                qs.push(hi_q);
+            }
+            for q in qs {
+                let mut key = Vec::new();
+                encode_key(&mut key, &row_name(r), q, 1, 1, Kind::Put).unwrap();
+                out.push((key, vec![0, id]));
+            }
+        }
+        out
+    }
+
+    /// A random layout: level 0 with overlapping SSTs, deeper levels cut into disjoint SSTs
+    /// whose edges may split a row (one SST's last key and the next one's first in one row),
+    /// and with `overlapping`, a deeper level that is not disjoint (never installed, but read
+    /// correctly).
+    fn spans(rng: &mut Rng, overlapping: bool) -> Vec<Vec<Span>> {
+        let mut levels = Vec::new();
+        let mut l0 = Vec::new();
+        for _ in 0..rng.below(4) {
+            let a = rng.below(20);
+            l0.push((a, &b"a"[..], a + rng.below(20 - a), &b"z"[..]));
+        }
+        levels.push(l0);
+        for _ in 0..1 + rng.below(3) {
+            let mut files = Vec::new();
+            let mut r = rng.below(4);
+            let mut mid = false;
+            while r < 20 && rng.below(6) != 0 {
+                let end = (r + rng.below(4)).min(19);
+                let split = rng.below(3) == 0 && !(mid && end == r);
+                let lo: &[u8] = if mid { b"m" } else { b"b" };
+                let hi: &[u8] = if split { b"f" } else { b"z" };
+                files.push((r, lo, end, hi));
+                (r, mid) = if split {
+                    (end, true)
+                } else {
+                    (end + 1 + rng.below(2), false)
+                };
+            }
+            levels.push(files);
+        }
+        if overlapping {
+            let a = rng.below(10);
+            levels.push(vec![
+                (a, &b"a"[..], a + 5, &b"a"[..]),
+                (a + 2, &b"a"[..], a + 8, &b"a"[..]),
+            ]);
+        }
+        levels
+    }
+
+    /// The SST ids of `sources`, from the value every entry of an SST holds.
+    fn ids(sources: &mut [Source]) -> Vec<u64> {
+        sources
+            .iter_mut()
+            .map(|s| {
+                s.seek_to_first().unwrap();
+                u64::from(s.value()[1])
+            })
+            .collect()
+    }
+
+    /// A row read's SST sources (`sst_sources_row`) are exactly the SSTs, in order, that a
+    /// walk of every SST checking its row range finds, for rows inside, between and outside
+    /// them: every SST holds each row of its range, so its row filter admits it. A point
+    /// read's (`sst_sources_point`) are those of them its filters admit: in the walk's
+    /// order, and at least every one holding the column.
+    #[test]
+    fn the_ssts_a_read_picks_are_the_ones_a_walk_finds() {
+        let cases = if cfg!(miri) { 4 } else { 300 };
+        for seed in 0..cases {
+            let mut rng = Rng(seed * 2 + 1);
+            let layout = spans(&mut rng, seed % 5 == 0);
+            let mut chunks = Vec::new();
+            for span in layout.iter().flatten() {
+                chunks.push(span_entries(*span, chunks.len() as u8 + 1));
+            }
+            let refs: Vec<&[(Vec<u8>, Vec<u8>)]> = chunks.iter().map(Vec::as_slice).collect();
+            let (set, files) = ssts(&refs);
+            let mut files = files.into_iter();
+            let fam = FamilySsts::new(
+                layout
+                    .iter()
+                    .map(|l| files.by_ref().take(l.len()).collect())
+                    .collect(),
+            );
+            for i in 0..22 {
+                let mut prefix = Vec::new();
+                encode_row_prefix(&mut prefix, &row_name(i)).unwrap();
+                let walk: Vec<u64> = fam
+                    .iter()
+                    .filter(|s| s.first_row() <= &prefix[..] && &prefix[..] <= s.last_row())
+                    .map(|s| s.meta.id.0)
+                    .collect();
+                let escaped = &prefix[..prefix.len() - TERMINATOR.len()];
+                let mut out = Vec::new();
+                sst_sources_row::<false>(
+                    &fam,
+                    &set,
+                    &ScanFilter::all(),
+                    escaped,
+                    &prefix,
+                    Priority::Normal,
+                    &mut out,
+                )
+                .unwrap();
+                assert_eq!(ids(&mut out), walk, "seed {seed} row {i}: row read");
+
+                let q: &[u8] = [&b"a"[..], b"b", b"c", b"f", b"m", b"z"][rng.below(6) as usize];
+                let holding: Vec<u64> = chunks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| {
+                        let mut key = Vec::new();
+                        encode_key(&mut key, &row_name(i), q, 1, 1, Kind::Put).unwrap();
+                        c.iter().any(|(k, _)| *k == key)
+                    })
+                    .map(|(n, _)| n as u64 + 1)
+                    .collect();
+                let mut key = ColumnKey::new(&row_name(i), q);
+                let mut out = Vec::new();
+                sst_sources_point::<false>(&fam, &set, &mut key, Priority::Normal, &mut out)
+                    .unwrap();
+                let got = ids(&mut out);
+                let mut rest = walk.iter();
+                assert!(
+                    got.iter().all(|id| rest.any(|w| w == id)),
+                    "seed {seed} row {i}: point read {got:?} not in the walk's order {walk:?}"
+                );
+                assert!(
+                    holding.iter().all(|id| got.contains(id)),
+                    "seed {seed} row {i}: point read {got:?} misses one of {holding:?}"
+                );
+            }
         }
     }
 }

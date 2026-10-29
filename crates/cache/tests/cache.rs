@@ -44,7 +44,7 @@ fn disabled_cache_stores_nothing() {
     assert!(c.get(key(1, 0)).is_none());
     assert_eq!(c.usage(), 0);
     assert_eq!(c.capacity(), 0);
-    c.erase_file(1);
+    c.erase_files(&[1]);
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn erase_file_drops_only_that_files_unpinned_blocks() {
         drop(c.insert(key(2, off * 4096), vec![2; 10].into(), Priority::Normal));
     }
     let pinned = c.get(key(1, 0)).expect("hit");
-    c.erase_file(1);
+    c.erase_files(&[1]);
     assert_eq!(c.usage(), 50 * 10 + 10);
     for off in 1..50 {
         assert!(c.get(key(1, off * 4096)).is_none());
@@ -75,7 +75,7 @@ fn erase_file_drops_only_that_files_unpinned_blocks() {
         pinned.bytes()
     );
     drop(pinned);
-    c.erase_file(1);
+    c.erase_files(&[1]);
     assert!(c.get(key(1, 0)).is_none());
     assert_eq!(c.usage(), 50 * 10);
 }
@@ -256,7 +256,7 @@ proptest! {
                     }
                 }
                 Op::Erase(file) => {
-                    cache.erase_file(file);
+                    cache.erase_files(&[file]);
                     latest.retain(|k, v| {
                         k.file != file || pins.iter().any(|(pk, pv, _)| pk == k && pv == v)
                     });

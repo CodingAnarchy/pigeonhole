@@ -1,9 +1,9 @@
 //! Loom models: a pinned `BlockHandle` or `Cell` outlives eviction, replacement and
-//! `erase_file` racing on other threads, and its bytes never change underneath it.
+//! `erase_files` racing on other threads, and its bytes never change underneath it.
 //!
 //! Memory safety itself (no use-after-free of evicted bytes) comes from `Arc` ownership:
 //! eviction only drops the shard's reference. What these models check is the protocol on
-//! top: a handle is never handed out for an entry that eviction or `erase_file` has already
+//! top: a handle is never handed out for an entry that eviction or `erase_files` has already
 //! removed from the shard's index and accounting, pinned entries stay indexed and charged,
 //! and the bytes a handle sees are the ones that were inserted.
 //!
@@ -61,7 +61,7 @@ fn loom_pinned_handle_survives_replace_and_erase() {
             drop(c.insert(key(0), block(2), Priority::Normal));
         });
         let c = Arc::clone(&cache);
-        let eraser = thread::spawn(move || c.erase_file(1));
+        let eraser = thread::spawn(move || c.erase_files(&[1]));
 
         let cell = Cell::in_block(pinned.clone(), 0..64);
         drop(pinned);
@@ -146,7 +146,7 @@ fn loom_get_races_erase_file_and_eviction() {
             }
         });
         let c = Arc::clone(&cache);
-        let eraser = thread::spawn(move || c.erase_file(1));
+        let eraser = thread::spawn(move || c.erase_files(&[1]));
         let c = Arc::clone(&cache);
         let evictor = thread::spawn(move || {
             drop(c.insert(BlockKey { file: 3, offset: 0 }, block(3), Priority::High));
@@ -168,29 +168,43 @@ fn loom_get_races_erase_file_and_eviction() {
 /// point. The row's state at seqno `s` is `s` itself (the write at seqno 2 replaces the
 /// state at 1), so a stale hit would return 1 to a reader at 2.
 ///
-/// The entry stands for `RowCache`'s (one entry per row, exact epoch match), packed into one
-/// atomic `epoch << 32 | state` that is replaced whole: the cache's own concurrency is
-/// modelled above, and its shards and locks would only multiply the interleavings.
+/// The row's watermark slot is a bare atomic with the operations of the engine's
+/// (`pigeonhole_shm::RowEpochTable`, which lives in mapped memory loom can't model): a
+/// write raises it with `fetch_max` (Release), and a read point loads it (Acquire) and
+/// accepts it only at or below itself. The entry stands for `RowCache`'s (one entry per
+/// row, exact epoch match), packed into one atomic `epoch << 32 | state` that is replaced
+/// whole: the cache's own concurrency is modelled above, and its shards and locks would only
+/// multiply the interleavings.
 #[test]
 fn loom_row_epochs_never_serve_a_stale_row() {
     use loom::sync::atomic::{AtomicU64, Ordering};
+
+    struct Slot(AtomicU64);
+    impl Slot {
+        fn note_write_prev(&self, seqno: u64) -> u64 {
+            self.0.fetch_max(seqno, Ordering::Release)
+        }
+        fn epoch(&self, seqno: u64) -> Option<u64> {
+            let e = self.0.load(Ordering::Acquire);
+            (e <= seqno).then_some(e)
+        }
+    }
 
     // Bounded as the memtable's models are: the stale-hit schedules need two preemptions.
     let mut model = loom::model::Builder::new();
     model.preemption_bound = Some(3);
     model.check(|| {
-        let epochs = Arc::new(RowEpochs::new(1));
+        let epochs = Arc::new(Slot(AtomicU64::new(0)));
         // The cached entry: `(epoch, row state)`. The state at seqno 1 is cached already.
         let entry = Arc::new(AtomicU64::new(1 << 32 | 1));
         let unpack = |v: u64| (v >> 32, v & 0xffff_ffff);
         let visible = Arc::new(AtomicU64::new(1));
-        let h = 7;
-        epochs.note_write(h, 1);
+        epochs.note_write_prev(1);
 
         let writer = {
             let (epochs, visible) = (Arc::clone(&epochs), Arc::clone(&visible));
             thread::spawn(move || {
-                epochs.note_write(h, 2);
+                epochs.note_write_prev(2);
                 visible.store(2, Ordering::Release);
             })
         };
@@ -202,7 +216,7 @@ fn loom_row_epochs_never_serve_a_stale_row() {
             );
             thread::spawn(move || {
                 let s = visible.load(Ordering::Acquire);
-                if let Some(e) = epochs.epoch(h, s) {
+                if let Some(e) = epochs.epoch(s) {
                     entry.store(e << 32 | s, Ordering::SeqCst);
                 }
             })
@@ -215,7 +229,7 @@ fn loom_row_epochs_never_serve_a_stale_row() {
             );
             thread::spawn(move || {
                 let s = visible.load(Ordering::Acquire);
-                if let Some(e) = epochs.epoch(h, s) {
+                if let Some(e) = epochs.epoch(s) {
                     let (epoch, state) = unpack(entry.load(Ordering::SeqCst));
                     if epoch == e {
                         assert_eq!(state, s, "a stale row served at read point {s}");
@@ -228,7 +242,7 @@ fn loom_row_epochs_never_serve_a_stale_row() {
         reader.join().unwrap();
         // Once the write is visible, a hit is the new state.
         let s = visible.load(Ordering::Acquire);
-        let e = epochs.epoch(h, s).expect("visible");
+        let e = epochs.epoch(s).expect("visible");
         let (epoch, state) = unpack(entry.load(Ordering::SeqCst));
         if epoch == e {
             assert_eq!(state, 2);
