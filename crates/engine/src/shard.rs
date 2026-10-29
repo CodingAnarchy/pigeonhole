@@ -6025,6 +6025,33 @@ impl ShardState {
         }
     }
 
+    /// Parks single `m` behind the undecided shares on its rows (D263, D267), starting its
+    /// wait if `start`, unless its wait has ended: then it is settled now. True if parked.
+    #[cold]
+    #[inline(never)]
+    fn wait_for_shares(
+        &mut self,
+        mut m: Member,
+        start: bool,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) -> bool {
+        if self.end_share_wait(&mut m) {
+            self.settle(m, Ok(()), ctx);
+            return false;
+        }
+        if start {
+            trace!(
+                "shard {} single waits for an undecided share (pending {})",
+                self.id.0,
+                self.prepared.len()
+            );
+            self.start_share_wait(&mut m);
+        }
+        self.hold_rows(&m);
+        self.pending.push(m);
+        true
+    }
+
     /// Runs the group commit over everything drained since the last one.
     fn run_group(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
         #[cfg(feature = "test-hooks")]
@@ -6160,13 +6187,7 @@ impl ShardState {
                 if !self.waiting_singles.contains_key(&m.share_wait) {
                     m.share_wait = 0;
                 } else if self.single_ahead_undecided(&m) {
-                    if self.end_share_wait(&mut m) {
-                        self.settle(m, Ok(()), ctx);
-                        continue;
-                    }
-                    self.hold_rows(&m);
-                    self.pending.push(m);
-                    share_waits += 1;
+                    share_waits += usize::from(self.wait_for_shares(m, false, ctx));
                     continue;
                 } else {
                     waited = true;
@@ -6177,19 +6198,7 @@ impl ShardState {
                 && self.overlaps_undecided(&m)
             {
                 if matches!(m.kind, MemberKind::Single) {
-                    if self.end_share_wait(&mut m) {
-                        self.settle(m, Ok(()), ctx);
-                        continue;
-                    }
-                    trace!(
-                        "shard {} single waits for an undecided share (pending {})",
-                        self.id.0,
-                        self.prepared.len()
-                    );
-                    self.start_share_wait(&mut m);
-                    self.hold_rows(&m);
-                    self.pending.push(m);
-                    share_waits += 1;
+                    share_waits += usize::from(self.wait_for_shares(m, true, ctx));
                     continue;
                 }
                 // D271: what overlaps now is an optimistic conflict, refused as D263 did
@@ -6386,10 +6395,7 @@ impl ShardState {
         if need_room {
             self.wait_for_room(&admitted, ctx);
         } else {
-            if let Some(w) = &self.room_wait
-                && !self.wait_room
-            {
-                let _ = w;
+            if self.room_wait.is_some() && !self.wait_room {
                 self.end_room_wait(ctx.now_nanos());
             }
             // A member waiting for a guarded flush's install is woken by its outcome
@@ -6493,11 +6499,7 @@ impl ShardState {
             // accepted (even one whose write then fails: it may have landed) may be applied
             // or replayed, so its blob files must stay (#230).
             if self.shared.large_open.load(Ordering::Acquire) > 0
-                && !matches!(
-                    result,
-                    Err(pigeonhole_wal::Error::RecordTooLarge
-                        | pigeonhole_wal::Error::InvalidArgument { .. })
-                )
+                && accepted(&result)
                 && let WalRecord::Batch { batch, .. } | WalRecord::Prepare { batch, .. } = &record
             {
                 crate::large::note_logged(&self.shared, *batch);
@@ -6505,13 +6507,7 @@ impl ShardState {
             // Test hook: the append order. A failed write may still have landed (a crash
             // or an I/O error mid-write), so every attempt the stream accepted counts.
             #[cfg(feature = "test-hooks")]
-            if self.shared.hooks.record.load(Ordering::Acquire)
-                && !matches!(
-                    result,
-                    Err(pigeonhole_wal::Error::RecordTooLarge
-                        | pigeonhole_wal::Error::InvalidArgument { .. })
-                )
-            {
+            if self.shared.hooks.record.load(Ordering::Acquire) && accepted(&result) {
                 use crate::engine::hooks::{AppendedKind, AppendedRecord};
                 self.shared
                     .hooks
@@ -6664,14 +6660,7 @@ impl ShardState {
             }
             match &m.kind {
                 MemberKind::Single => {
-                    #[cfg(feature = "test-hooks")]
-                    let fault = {
-                        use crate::engine::hooks::Fault;
-                        let faults = &self.shared.hooks.faults;
-                        faults.take(Fault::NextApply) || faults.take(Fault::NextSingleApply)
-                    };
-                    #[cfg(feature = "test-hooks")]
-                    let applied = if fault {
+                    let applied = if fault!(self, NextApply) || fault!(self, NextSingleApply) {
                         Err(Error::Busy)
                     } else {
                         m.bytes
@@ -6679,12 +6668,6 @@ impl ShardState {
                             .map_err(Error::from)
                             .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts))
                     };
-                    #[cfg(not(feature = "test-hooks"))]
-                    let applied = m
-                        .bytes
-                        .batch()
-                        .map_err(Error::from)
-                        .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts));
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
                         self.poison(crate::health::FailureCause::Internal);
@@ -6765,24 +6748,11 @@ impl ShardState {
                 }
             }
         }
-        #[cfg(feature = "test-hooks")]
-        let published = if self.view_dirty
-            && self
-                .shared
-                .hooks
-                .faults
-                .take(crate::engine::hooks::Fault::NextGroupPublish)
-        {
+        let published = if self.view_dirty && fault!(self, NextGroupPublish) {
             Err(Error::Corruption(
                 "injected view publish failure (Fault::NextGroupPublish)".into(),
             ))
         } else if self.view_dirty {
-            self.publish_memtables()
-        } else {
-            Ok(())
-        };
-        #[cfg(not(feature = "test-hooks"))]
-        let published = if self.view_dirty {
             self.publish_memtables()
         } else {
             Ok(())
@@ -10672,6 +10642,34 @@ const TRACE_ON: u8 = 2;
 #[doc(hidden)]
 pub fn set_tracing(on: bool) {
     TRACING.store(if on { TRACE_ON } else { TRACE_OFF }, Ordering::Relaxed);
+}
+
+/// Whether test fault `Fault::$fault` fires here (a one-shot fault switches itself off);
+/// always false without the `test-hooks` feature, so the branch it guards compiles away.
+macro_rules! fault {
+    ($self:ident, $fault:ident) => {{
+        #[cfg(feature = "test-hooks")]
+        let on = $self
+            .shared
+            .hooks
+            .faults
+            .take(crate::engine::hooks::Fault::$fault);
+        #[cfg(not(feature = "test-hooks"))]
+        let on = false;
+        on
+    }};
+}
+use fault;
+
+/// Whether the stream accepted a record its append returned `result` for: anything but a
+/// record refused before it was written (too large, or invalid). An accepted record may be
+/// in the file even if its write failed.
+#[inline(always)]
+fn accepted<T>(result: &std::result::Result<T, pigeonhole_wal::Error>) -> bool {
+    !matches!(
+        result,
+        Err(pigeonhole_wal::Error::RecordTooLarge | pigeonhole_wal::Error::InvalidArgument { .. })
+    )
 }
 
 /// Logs to stderr when `PIGEONHOLE_TRACE` is set (CONTRIBUTING.md, "Test environment variables"):
