@@ -1653,6 +1653,16 @@ enum Bytes {
 }
 
 impl Bytes {
+    /// The batch: a builder's as it stands (it checked every mutation it took, so it needs
+    /// no validating decode), anything else decoded as `BatchRef::new` does.
+    fn batch(&self) -> pigeonhole_format::Result<BatchRef<'_>> {
+        match self {
+            Bytes::Own(b) => Ok(b.batch()),
+            Bytes::Shared(b) => Ok(b.batch()),
+            Bytes::Streams(v) => BatchRef::new(v),
+        }
+    }
+
     fn as_slice(&self) -> &[u8] {
         match self {
             Bytes::Own(b) => b.batch().as_bytes(),
@@ -1691,13 +1701,13 @@ impl Member {
             MemberKind::Single => WalRecord::Batch {
                 seqno: self.seqno,
                 commit_ts: self.commit_ts,
-                batch: BatchRef::new(self.bytes.as_slice())?,
+                batch: self.bytes.batch()?,
             },
             MemberKind::Prepare { coordinator } => WalRecord::Prepare {
                 seqno: self.seqno,
                 commit_ts: self.commit_ts,
                 coordinator: StreamId(u32::from(coordinator.0)),
-                batch: BatchRef::new(self.bytes.as_slice())?,
+                batch: self.bytes.batch()?,
             },
             MemberKind::CommitRecord { apply_seqno, .. } => WalRecord::Decision {
                 seqno: self.seqno,
@@ -1729,7 +1739,7 @@ fn writes_cell<'a>(
     // routing, D10) writes every cell of its family.
     members
         .filter(|m| !matches!(m.kind, MemberKind::CommitRecord { .. }))
-        .filter_map(|m| BatchRef::new(m.bytes.as_slice()).ok())
+        .filter_map(|m| m.bytes.batch().ok())
         .any(|batch| {
             batch.iter().flatten().any(|mu| {
                 mu.table == table
@@ -3751,7 +3761,7 @@ impl ShardState {
         commit_ts: Timestamp,
     ) -> Result<Vec<(TabletId, FamilyId)>> {
         self.note_stamped(commit_ts);
-        self.apply(bytes, seqno, commit_ts)?;
+        self.apply(BatchRef::new(bytes)?, seqno, commit_ts)?;
         Ok(self.touched_slots.clone())
     }
 
@@ -3880,11 +3890,8 @@ impl ShardState {
     }
 
     /// The slots `bytes` writes on this shard (routing only, no apply).
-    fn slots_of(&mut self, bytes: &[u8]) -> Vec<(TabletId, FamilyId)> {
+    fn slots_of(&mut self, batch: BatchRef<'_>) -> Vec<(TabletId, FamilyId)> {
         let mut out: Vec<(TabletId, FamilyId)> = Vec::new();
-        let Ok(batch) = BatchRef::new(bytes) else {
-            return out;
-        };
         let tablets = Arc::clone(&self.tablets);
         for m in batch.iter().flatten() {
             let Some((tablet, owner)) = tablets.route(m.table, m.row) else {
@@ -4124,12 +4131,11 @@ impl ShardState {
     /// on its own.
     fn reserve_room(
         &mut self,
-        bytes: &[u8],
+        batch: Option<BatchRef<'_>>,
         group: Option<&mut GroupRoom>,
     ) -> std::result::Result<usize, Room> {
         let mut rows = std::mem::take(&mut self.admit_rows);
         rows.clear();
-        let batch = BatchRef::new(bytes).ok();
         let need = match batch {
             Some(batch) => self.arena_needed(batch, &mut rows),
             None => ArenaNeed {
@@ -5376,7 +5382,7 @@ impl ShardState {
     /// Applies `bytes` at `seqno`/`commit_ts` to this shard's memtables, last write winning
     /// per `(column, timestamp)` (decision D34). Records the slots written in
     /// `touched_slots`.
-    fn apply(&mut self, bytes: &[u8], seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
+    fn apply(&mut self, batch: BatchRef<'_>, seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
         // Nothing is applied once the close reported: no flush would persist it (a late
         // cross-shard decision is left to the WAL, `on_decide`).
         debug_assert_ne!(
@@ -5385,7 +5391,7 @@ impl ShardState {
             "shard {} applied {seqno} after its close reported",
             self.id.0
         );
-        let batch = BatchRef::new(bytes)?;
+        let bytes = batch.as_bytes();
         let dups = self.dedup.scan(batch, bytes, commit_ts);
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let tablets = Arc::clone(&self.tablets);
@@ -6292,7 +6298,7 @@ impl ShardState {
             if !matches!(m.kind, MemberKind::CommitRecord { .. }) {
                 let group = (shares_room && matches!(m.kind, MemberKind::Single))
                     .then(|| group_room.get_or_insert_with(GroupRoom::default));
-                match self.reserve_room(m.bytes.as_slice(), group) {
+                match self.reserve_room(m.bytes.batch().ok(), group) {
                     Ok(bytes) => m.reserved = bytes,
                     Err(Room::Never) => {
                         // Not a stall: no flush could ever make room. The caller must split
@@ -6348,7 +6354,7 @@ impl ShardState {
                     share.reads = reads;
                     let bytes = Arc::clone(&share.bytes);
                     let reads = share.reads.clone();
-                    self.track_share_rows(bytes.batch().as_bytes(), true);
+                    self.track_share_rows(bytes.batch(), true);
                     self.track_share_reads(&reads, true);
                 }
             }
@@ -6649,10 +6655,17 @@ impl ShardState {
                     let applied = if fault {
                         Err(Error::Busy)
                     } else {
-                        self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts)
+                        m.bytes
+                            .batch()
+                            .map_err(Error::from)
+                            .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts))
                     };
                     #[cfg(not(feature = "test-hooks"))]
-                    let applied = self.apply(m.bytes.as_slice(), m.seqno, m.commit_ts);
+                    let applied = m
+                        .bytes
+                        .batch()
+                        .map_err(Error::from)
+                        .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts));
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
                         self.poison(crate::health::FailureCause::Internal);
@@ -6678,7 +6691,11 @@ impl ShardState {
                         m.reserved = 0;
                     }
                     if let Some(t) = m.ticket {
-                        let slots = self.slots_of(m.bytes.as_slice());
+                        let slots = m
+                            .bytes
+                            .batch()
+                            .map(|batch| self.slots_of(batch))
+                            .unwrap_or_default();
                         let kind = LoggedKind::Prepare { slots };
                         self.log_record(t.end, m.seqno, m.bytes.as_slice().len(), kind);
                         self.log_cross_record(m.seqno);
@@ -7564,7 +7581,7 @@ impl ShardState {
     /// Holds `m`'s rows (written, read, and its predicate row) back for the next group:
     /// later singles on them wait too (`hold_if_overlapping`).
     fn hold_rows(&mut self, m: &Member) {
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+        if let Ok(batch) = m.bytes.batch() {
             for mu in batch.iter().flatten() {
                 self.held_rows.insert(hash_row(mu.table, mu.row));
             }
@@ -7583,7 +7600,7 @@ impl ShardState {
     /// held too, so a still later single on one of them waits behind it.
     fn hold_if_overlapping(&mut self, m: &Member) -> bool {
         let mut overlaps = false;
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+        if let Ok(batch) = m.bytes.batch() {
             for mu in batch.iter().flatten() {
                 overlaps |= self.held_rows.contains(&hash_row(mu.table, mu.row));
             }
@@ -7658,7 +7675,7 @@ impl ShardState {
         if self.shared.hooks.flush_gc_mutation.load(Ordering::Acquire) == 3 {
             return true;
         }
-        let Ok(batch) = BatchRef::new(m.bytes.as_slice()) else {
+        let Ok(batch) = m.bytes.batch() else {
             // An undecodable batch fails its apply; it writes nothing.
             return true;
         };
@@ -7771,7 +7788,7 @@ impl ShardState {
         // seqno and timestamp against the share's decision), so only the optimistic checks
         // remain: a write to a row the share read, and a read of a row it writes.
         if !self.pending_reads.is_empty()
-            && let Ok(batch) = BatchRef::new(m.bytes.as_slice())
+            && let Ok(batch) = m.bytes.batch()
         {
             for mu in batch.iter().flatten() {
                 if self.pending_reads.contains_key(&hash_row(mu.table, mu.row)) {
@@ -7794,10 +7811,7 @@ impl ShardState {
         false
     }
 
-    fn track_share_rows(&mut self, bytes: &[u8], add: bool) {
-        let Ok(batch) = BatchRef::new(bytes) else {
-            return;
-        };
+    fn track_share_rows(&mut self, batch: BatchRef<'_>, add: bool) {
         for mu in batch.iter().flatten() {
             let h = hash_row(mu.table, mu.row);
             if add {
@@ -7856,7 +7870,7 @@ impl ShardState {
                 if error.is_some() {
                     if let Some(mut share) = self.prepared.remove(&m.seqno) {
                         if share.tracked {
-                            self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                            self.track_share_rows(share.bytes.batch(), false);
                             self.track_share_reads(&share.reads, false);
                         }
                         self.release_room(share.reserved);
@@ -8501,14 +8515,13 @@ impl ShardState {
                 .get(&seqno)
                 .filter(|share| share.tracked)
                 .map(|share| {
-                    let mut rows: Vec<u64> = BatchRef::new(share.bytes.batch().as_bytes())
-                        .map(|b| {
-                            b.iter()
-                                .flatten()
-                                .map(|mu| hash_row(mu.table, mu.row))
-                                .collect()
-                        })
-                        .unwrap_or_default();
+                    let mut rows: Vec<u64> = share
+                        .bytes
+                        .batch()
+                        .iter()
+                        .flatten()
+                        .map(|mu| hash_row(mu.table, mu.row))
+                        .collect();
                     rows.sort_unstable();
                     rows.dedup();
                     rows
@@ -8548,7 +8561,7 @@ impl ShardState {
             // COMMIT (D83, D116).
             if let Some(share) = self.prepared.remove(&seqno) {
                 if share.tracked {
-                    self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                    self.track_share_rows(share.bytes.batch(), false);
                     self.track_share_reads(&share.reads, false);
                 }
                 self.release_room(share.reserved);
@@ -8568,7 +8581,7 @@ impl ShardState {
         }
         if let Some(share) = self.prepared.remove(&seqno) {
             if share.tracked {
-                self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                self.track_share_rows(share.bytes.batch(), false);
                 self.track_share_reads(&share.reads, false);
             }
             self.release_room(share.reserved);
@@ -8601,10 +8614,10 @@ impl ShardState {
                 {
                     Err(Error::Busy)
                 } else {
-                    self.apply(share.bytes.batch().as_bytes(), apply_seqno, commit_ts)
+                    self.apply(share.bytes.batch(), apply_seqno, commit_ts)
                 };
                 #[cfg(not(feature = "test-hooks"))]
-                let applied = self.apply(share.bytes.batch().as_bytes(), apply_seqno, commit_ts);
+                let applied = self.apply(share.bytes.batch(), apply_seqno, commit_ts);
                 match applied {
                     Ok(()) => {
                         for key in &self.touched_slots {

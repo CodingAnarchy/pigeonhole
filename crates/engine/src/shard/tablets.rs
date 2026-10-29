@@ -383,7 +383,7 @@ impl ShardState {
                 }
             }
         };
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+        if let Ok(batch) = m.bytes.batch() {
             for mu in batch.iter().flatten() {
                 look(mu.table, mu.row, false);
             }
@@ -463,7 +463,7 @@ impl ShardState {
     /// `conflicts_with_group` checks against undecided shares.
     fn member_row_hashes(m: &Member) -> Vec<u64> {
         let mut rows = Vec::new();
-        if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+        if let Ok(batch) = m.bytes.batch() {
             for mu in batch.iter().flatten() {
                 rows.push(hash_row(mu.table, mu.row));
             }
@@ -517,7 +517,7 @@ impl ShardState {
             if *seqno == m.seqno || !share.tracked {
                 continue;
             }
-            let overlaps = BatchRef::new(share.bytes.batch().as_bytes()).is_ok_and(|b| {
+            let overlaps = Some(share.bytes.batch()).is_some_and(|b| {
                 b.iter()
                     .flatten()
                     .any(|mu| rows.binary_search(&hash_row(mu.table, mu.row)).is_ok())
@@ -560,7 +560,9 @@ impl ShardState {
 
     /// The rows `m` writes (`hash_row`), sorted and deduplicated.
     fn written_rows(m: &Member) -> Vec<u64> {
-        let mut rows: Vec<u64> = BatchRef::new(m.bytes.as_slice())
+        let mut rows: Vec<u64> = m
+            .bytes
+            .batch()
             .map(|b| {
                 b.iter()
                     .flatten()
@@ -598,7 +600,7 @@ impl ShardState {
                 **seqno != skip
                     && share.tracked
                     && (share.reads.iter().any(|h| rows.binary_search(h).is_ok())
-                        || BatchRef::new(share.bytes.batch().as_bytes()).is_ok_and(|b| {
+                        || Some(share.bytes.batch()).is_some_and(|b| {
                             b.iter()
                                 .flatten()
                                 .any(|mu| rows.binary_search(&hash_row(mu.table, mu.row)).is_ok())
@@ -656,7 +658,7 @@ impl ShardState {
         // A row it reads waits only for the shares writing it.
         for (seqno, share) in &self.prepared {
             if share.tracked
-                && BatchRef::new(share.bytes.batch().as_bytes()).is_ok_and(|b| {
+                && Some(share.bytes.batch()).is_some_and(|b| {
                     b.iter()
                         .flatten()
                         .any(|mu| reads.binary_search(&hash_row(mu.table, mu.row)).is_ok())
@@ -991,7 +993,7 @@ impl ShardState {
         };
         if let Some(share) = self.prepared.remove(&m.seqno) {
             if share.tracked {
-                self.track_share_rows(share.bytes.batch().as_bytes(), false);
+                self.track_share_rows(share.bytes.batch(), false);
                 self.track_share_reads(&share.reads, false);
             }
             self.release_room(share.reserved);
@@ -1591,7 +1593,7 @@ impl ShardState {
     /// Whether a prepared, undecided share writes or reads a tablet being changed.
     fn shares_touch_moving(&self) -> bool {
         self.prepared.values().any(|share| {
-            BatchRef::new(share.bytes.batch().as_bytes()).is_ok_and(|b| {
+            Some(share.bytes.batch()).is_some_and(|b| {
                 b.iter().flatten().any(|mu| {
                     self.tablets
                         .route(mu.table, mu.row)
@@ -3200,7 +3202,7 @@ fn live_bytes(view: &View, t: &TabletEntry, refs: &HashMap<SstId, usize>) -> (u6
 /// The rows (hashed with their table) a member writes or reads.
 fn member_rows(m: &Member) -> Vec<u64> {
     let mut out = Vec::new();
-    if let Ok(batch) = BatchRef::new(m.bytes.as_slice()) {
+    if let Ok(batch) = m.bytes.batch() {
         for mu in batch.iter().flatten() {
             out.push(hash_row(mu.table, mu.row));
         }
