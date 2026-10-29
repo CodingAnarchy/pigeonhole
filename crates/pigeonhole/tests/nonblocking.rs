@@ -963,7 +963,7 @@ fn a_scan_stream_over_a_cache_that_keeps_nothing_reads_synchronously_and_matches
         .map(|r| row_cells(&r.unwrap()))
         .collect();
     assert_eq!(want.len(), 200);
-    let before = db.async_sync_reads();
+    let before = db.engine_metrics().async_sync_reads;
     vfs.set_deferred_io(true);
     let mut s = t.scan_prefix(b"r").stream();
     let mut got = Vec::new();
@@ -973,7 +973,7 @@ fn a_scan_stream_over_a_cache_that_keeps_nothing_reads_synchronously_and_matches
     vfs.set_deferred_io(false);
     assert_eq!(got, want);
     assert!(
-        db.async_sync_reads() > before,
+        db.engine_metrics().async_sync_reads > before,
         "the stream never went synchronous"
     );
     drop(s);
