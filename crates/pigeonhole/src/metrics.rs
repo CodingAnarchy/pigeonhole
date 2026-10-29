@@ -50,7 +50,7 @@ pub struct EngineMetrics {
     /// Compactions that failed or could not start. Their slot backs off, then retries.
     pub compaction_failures: u64,
     /// Compactions an application-owned background worker
-    /// ([`Pigeonhole::open_application_owned_with`](crate::Pigeonhole::open_application_owned_with),
+    /// ([`Pigeonhole::open_application_owned`](crate::Pigeonhole::open_application_owned),
     /// D284) held when its shard took them back, at the close or when the worker was
     /// dropped. They were dropped before their commit: not failures, and their slots compact
     /// again.
