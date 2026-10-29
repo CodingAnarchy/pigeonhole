@@ -1020,6 +1020,49 @@ impl fmt::Debug for SparePrep {
 }
 
 impl SparePrep {
+    /// Collects finished writes and submits more, a step's worth per poll: ready once every
+    /// write is submitted (or a failure stops them) and none is in flight.
+    fn write_slots(&mut self, to_fill: &[usize], cx: &mut Context<'_>) -> Poll<()> {
+        if self.failed.is_none() && self.spares.shared.closing_io.load(Ordering::Acquire) {
+            // A close waits for the stream's I/O: finish what is in flight, submit no more
+            // (`track` refuses anyway; this skips the allocation of the next slot).
+            self.failed = Some(Error::Io(Shared::closing_error()));
+        }
+        let (mut submitted, mut allocated) = (0, false);
+        loop {
+            // Collect finished writes, oldest first.
+            while let Some(w) = self.writes.front_mut() {
+                match Pin::new(w).poll(cx) {
+                    Poll::Ready(Ok(buf)) => self.buffers.push(buf),
+                    Poll::Ready(Err(e)) => {
+                        self.failed.get_or_insert(e.into());
+                    }
+                    Poll::Pending => break,
+                }
+                self.writes.pop_front();
+            }
+            if self.writes.len() >= PREP_IN_FLIGHT {
+                return Poll::Pending;
+            }
+            if self.submitted_all(to_fill) {
+                return if self.writes.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                };
+            }
+            let allocates = self.needs_allocation();
+            if submitted == PREP_WRITES_PER_POLL || (allocates && allocated) {
+                // A step's worth: yield, and run again at once.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.submit_next(to_fill);
+            allocated |= allocates;
+            submitted += 1;
+        }
+    }
+
     /// Whether every write has been submitted, or a failure stops them.
     fn submitted_all(&self, to_fill: &[usize]) -> bool {
         self.failed.is_some() || self.next_slot == to_fill.len()
@@ -1087,46 +1130,9 @@ impl Future for SparePrep {
             };
             return Poll::Ready(this.spares.settle(slots, r.map_err(Error::from)));
         }
-        let (mut submitted, mut allocated) = (0, false);
-        if this.failed.is_none() && this.spares.shared.closing_io.load(Ordering::Acquire) {
-            // A close waits for the stream's I/O: finish what is in flight, submit no more
-            // (`track` refuses anyway; this skips the allocation of the next slot).
-            this.failed = Some(Error::Io(Shared::closing_error()));
-        }
-        loop {
-            // Collect finished writes, oldest first.
-            while let Some(w) = this.writes.front_mut() {
-                match Pin::new(w).poll(cx) {
-                    Poll::Ready(Ok(buf)) => this.buffers.push(buf),
-                    Poll::Ready(Err(e)) => {
-                        this.failed.get_or_insert(e.into());
-                    }
-                    Poll::Pending => break,
-                }
-                this.writes.pop_front();
-            }
-            if this.writes.len() >= PREP_IN_FLIGHT {
-                this.slots = Some(slots);
-                return Poll::Pending;
-            }
-            if !this.submitted_all(&slots.to_fill) {
-                let allocates = this.needs_allocation();
-                if submitted == PREP_WRITES_PER_POLL || (allocates && allocated) {
-                    // A step's worth: yield, and run again at once.
-                    cx.waker().wake_by_ref();
-                    this.slots = Some(slots);
-                    return Poll::Pending;
-                }
-                this.submit_next(&slots.to_fill);
-                allocated |= allocates;
-                submitted += 1;
-                continue;
-            }
-            if !this.writes.is_empty() {
-                this.slots = Some(slots);
-                return Poll::Pending;
-            }
-            break;
+        if this.write_slots(&slots.to_fill, cx).is_pending() {
+            this.slots = Some(slots);
+            return Poll::Pending;
         }
         if let Some(e) = this.failed.take() {
             // A failed allocation or write leaves the stream usable (the slots stay blank).
