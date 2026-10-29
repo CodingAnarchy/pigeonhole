@@ -536,15 +536,48 @@ pub(crate) struct Commit {
     prepared: Prepared,
     readers: HashMap<SstId, Arc<SstReader>>,
     flushed_roots: Vec<(u16, u32)>,
-    tablets_changed: bool,
+    changes: Changes,
+}
+
+/// What a commit's edits changed, for what `end` rebuilds and tells the shards.
+#[derive(Debug, Default, Clone, Copy)]
+struct Changes {
+    /// Tables or tablets were added or dropped: the view needs a new tablet map.
+    tablets: bool,
     /// A split, merge or move (`ReqKind::Tablets`) committed: shards re-check what waited on
     /// the tablet map.
     tablet_change: bool,
-    sst_changed: bool,
-    checkpoints_changed: bool,
+    /// SSTs were added or removed (a dropped table's with it).
+    ssts: bool,
+    checkpoints: bool,
     /// A slot's flushed-through seqno moved without an SST (`SetFlushed`): shards waiting to
     /// report a share it covers re-check (#597).
-    flushed_changed: bool,
+    flushed: bool,
+}
+
+impl Changes {
+    /// Notes an edit applied to the catalog.
+    fn note(&mut self, edit: &Edit) {
+        match edit {
+            Edit::DropTable { .. } => {
+                self.tablets = true;
+                self.ssts = true;
+            }
+            Edit::CreateTable { .. } | Edit::PutTablet { .. } | Edit::DropTablet { .. } => {
+                self.tablets = true;
+            }
+            Edit::AddSst { .. } | Edit::RemoveSst { .. } => self.ssts = true,
+            Edit::WalCheckpoint { .. } => self.checkpoints = true,
+            Edit::SetFlushed { .. } => self.flushed = true,
+            _ => {}
+        }
+    }
+
+    /// Whether what is flushed may have changed (an SST or not): another shard's flush may
+    /// cover a share a shard waits to report (moved tablets).
+    fn flushed_may_move(&self) -> bool {
+        self.ssts || self.checkpoints || self.tablet_change || self.flushed
+    }
 }
 
 impl std::fmt::Debug for Commit {
@@ -677,11 +710,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let mut outcomes: Vec<(ManifestReq, Result<()>)> = Vec::with_capacity(reqs.len());
     let mut readers = HashMap::new();
     let mut flushed_roots = Vec::new();
-    let mut tablets_changed = false;
-    let mut tablet_change = false;
-    let mut sst_changed = false;
-    let mut checkpoints_changed = false;
-    let mut flushed_changed = false;
+    let mut changes = Changes::default();
     let mut rewrite = Rewrite::AsNeeded;
     // What the accepted requests wrote (freed if the whole batch is refused), and the
     // compactions they record (kept only once the batch is prepared).
@@ -700,8 +729,8 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             ReqKind::Catalog(f) => f(&mut catalog),
             ReqKind::Tablets(f) => f(&mut catalog).map(|(edits, o)| {
                 owners = o;
-                tablets_changed = true;
-                tablet_change = true;
+                changes.tablets = true;
+                changes.tablet_change = true;
                 edits
             }),
         };
@@ -816,19 +845,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                         applied = Err(err);
                         break;
                     }
-                    match e {
-                        Edit::CreateTable { .. }
-                        | Edit::DropTable { .. }
-                        | Edit::PutTablet { .. }
-                        | Edit::DropTablet { .. } => tablets_changed = true,
-                        Edit::AddSst { .. } | Edit::RemoveSst { .. } => sst_changed = true,
-                        Edit::WalCheckpoint { .. } => checkpoints_changed = true,
-                        Edit::SetFlushed { .. } => flushed_changed = true,
-                        _ => {}
-                    }
-                    if matches!(e, Edit::DropTable { .. }) {
-                        sst_changed = true;
-                    }
+                    changes.note(e);
                 }
                 match applied {
                     Ok(()) => {
@@ -938,11 +955,7 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
                 prepared,
                 readers,
                 flushed_roots,
-                tablets_changed,
-                tablet_change,
-                sst_changed,
-                checkpoints_changed,
-                flushed_changed,
+                changes,
             })
         }
         Err(e) => {
@@ -986,11 +999,7 @@ pub(crate) fn end(
         prepared,
         mut readers,
         flushed_roots,
-        tablets_changed,
-        tablet_change,
-        sst_changed,
-        checkpoints_changed,
-        flushed_changed,
+        changes,
     } = commit;
     let version = {
         let mut writer = shared
@@ -1019,7 +1028,7 @@ pub(crate) fn end(
     };
     // Only a commit that changed tablets needs a new tablet map (#499: no list built for
     // the others).
-    let tablets = tablets_changed.then(|| catalog.tablets());
+    let tablets = changes.tablets.then(|| catalog.tablets());
     // Memtables whose SSTs this commit adds leave this view and, through
     // `Shared::flushed_roots`, every later one until their shards retire them. The roots join
     // `flushed_roots` only with the view stored: a failed publish keeps the old view, which
@@ -1122,9 +1131,8 @@ pub(crate) fn end(
     for (req, r) in reqs {
         (req.reply)(r.map(|()| version));
     }
-    // Another shard's flush may cover a share a shard waits to report (moved tablets): any
-    // change to what is flushed tells every shard, an SST or not.
-    if sst_changed || checkpoints_changed || tablet_change || flushed_changed {
+    // Any change to what is flushed tells every shard, an SST or not.
+    if changes.flushed_may_move() {
         shared.broadcast(|| ShardMsg::Maintain);
     }
 }
@@ -1303,7 +1311,7 @@ fn parked(shared: &Shared, generation: u64, waker: &TaskWaker) -> bool {
 #[cfg(feature = "test-hooks")]
 fn parks(shared: &Shared, commit: &Commit) -> bool {
     shared.hooks.manifest_park.load(Ordering::Acquire)
-        && commit.sst_changed
+        && commit.changes.ssts
         && commit.flushed_roots.is_empty()
 }
 
