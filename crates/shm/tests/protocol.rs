@@ -115,20 +115,23 @@ fn concurrent_readers_never_decode_a_torn_view() {
 #[test]
 fn reader_slots_claim_pin_release_and_exhaustion() {
     let shm = ShmRegion::in_memory(DB_ID, &small_config());
+    let sim = SimVfs::new(1);
+    // One reader's handle: a claim skips the bytes it already holds.
+    let file = file_as(&sim, proc(100));
     let slots: Vec<_> = (0..4)
-        .map(|i| shm.claim_reader_slot(proc(100 + i)).unwrap())
+        .map(|i| shm.claim_reader_slot_locked(proc(100 + i), &file).unwrap())
         .collect();
     let mut indexes: Vec<u32> = slots.iter().map(|s| s.index()).collect();
     indexes.sort_unstable();
     assert_eq!(indexes, vec![0, 1, 2, 3]);
     assert!(matches!(
-        shm.claim_reader_slot(proc(200)),
+        shm.claim_reader_slot_locked(proc(200), &file_as(&sim, proc(200))),
         Err(Error::NoReaderSlot)
     ));
 
     assert_eq!(shm.oldest_reader_pin(), None);
     shm.publish_view(&view(3, 1, 4)).unwrap();
-    shm.reserve_seqnos(40); // idle shards: 40 visible
+    reserve(&shm, 40); // idle shards: 40 visible
     assert_eq!(slots[0].pin(30, 3), (30, 3));
     assert_eq!(slots[1].pin(20, 3), (20, 3));
     // Older than the current view: the pin moves up to view 3 with a fresh seqno.
@@ -140,14 +143,17 @@ fn reader_slots_claim_pin_release_and_exhaustion() {
     let freed = slots[2].index();
     drop(slots);
     assert_eq!(shm.oldest_reader_pin(), None, "dropping a slot unpins it");
-    let again = shm.claim_reader_slot(proc(300)).unwrap();
+    let again = shm.claim_reader_slot_locked(proc(300), &file).unwrap();
     assert!(again.index() <= freed, "freed slots are reused");
 }
 
 #[test]
 fn pin_moves_up_when_the_writer_published_a_newer_view() {
     let shm = ShmRegion::in_memory(DB_ID, &small_config());
-    let slot = shm.claim_reader_slot(proc(1)).unwrap();
+    let sim = SimVfs::new(1);
+    let slot = shm
+        .claim_reader_slot_locked(proc(1), &file_as(&sim, proc(1)))
+        .unwrap();
     assert_eq!(slot.pin(3, 0), (3, 0));
     assert_eq!(shm.oldest_reader_pin(), Some((3, 0)), "no view yet: view 0");
 
@@ -155,7 +161,7 @@ fn pin_moves_up_when_the_writer_published_a_newer_view() {
     let v = shm.view_version();
     let s = shm.visible_seqno();
     // The writer commits and publishes between the reader's snapshot and its pin.
-    shm.reserve_seqnos(12);
+    reserve(&shm, 12);
     shm.publish_view(&view(2, 1, 4)).unwrap();
     assert_eq!(
         slot.pin(s, v),
@@ -168,35 +174,37 @@ fn pin_moves_up_when_the_writer_published_a_newer_view() {
 }
 
 #[test]
-fn dead_reader_slots_are_reclaimed_by_liveness() {
+fn dead_reader_slots_are_reclaimed_by_their_liveness_lock() {
     let sim = SimVfs::new(1);
-    let vfs: VfsRef = sim.clone();
     let shm = ShmRegion::in_memory(DB_ID, &small_config());
-    let alive = shm.claim_reader_slot(proc(10)).unwrap();
-    let dead = shm.claim_reader_slot(proc(11)).unwrap();
-    let recycled = shm.claim_reader_slot(proc(12)).unwrap();
+    let writer = file_as(&sim, proc(1));
+    let claim = |p: ProcessId| shm.claim_reader_slot_locked(p, &file_as(&sim, p)).unwrap();
+    let alive = claim(proc(10));
+    let crashed = claim(proc(11));
+    let abandoned = claim(proc(12));
     alive.pin(5, 0);
-    dead.pin(2, 0);
-    recycled.pin(3, 0);
+    crashed.pin(2, 0);
+    abandoned.pin(3, 0);
     assert_eq!(shm.oldest_reader_pin(), Some((2, 0)));
-    assert_eq!(shm.reclaim_dead_slots(&vfs), 0);
+    assert_eq!(shm.reclaim_dead_slots_locked(&writer), 0);
 
-    sim.kill_process(proc(11));
-    // Same pid, different start time: the recorded process is gone.
-    sim.kill_process(proc(12));
-    assert_eq!(shm.reclaim_dead_slots(&vfs), 2);
-    assert_eq!(shm.reclaim_dead_slots(&vfs), 0, "nothing left to reclaim");
-    assert_eq!(shm.oldest_reader_pin(), Some((5, 0)));
-    let (a, b) = (
-        shm.claim_reader_slot(proc(13)).unwrap(),
-        shm.claim_reader_slot(proc(14)).unwrap(),
+    // A process that crashes loses its handles and their locks; a slot abandoned with its
+    // lock released (a reader that moved on) is judged the same way.
+    sim.crash_process(proc(11));
+    abandoned.abandon();
+    assert_eq!(shm.reclaim_dead_slots_locked(&writer), 2);
+    assert_eq!(
+        shm.reclaim_dead_slots_locked(&writer),
+        0,
+        "nothing left to reclaim"
     );
+    assert_eq!(shm.oldest_reader_pin(), Some((5, 0)));
+    let (a, b) = (claim(proc(13)), claim(proc(14)));
     assert_ne!(a.index(), b.index());
     assert_ne!(a.index(), alive.index());
-    // The dropped `ReaderSlot`s of dead processes write into slots now owned by others; the
-    // writer reset them, so the originals must not free them again.
-    std::mem::forget(dead);
-    std::mem::forget(recycled);
+    // The crashed process's handle writes into a slot now owned by another; the writer
+    // reset it, so the original must not free it again.
+    std::mem::forget(crashed);
 }
 
 #[test]
@@ -210,7 +218,7 @@ fn in_memory_region_is_never_stale() {
     assert_eq!(shm.generation(), Generation(1));
     let again = shm.reattach(&vfs, &file).unwrap();
     assert_eq!(again.generation(), Generation(1));
-    shm.reserve_seqnos(5);
+    reserve(&shm, 5);
     assert_eq!(again.visible_seqno(), shm.visible_seqno(), "same mapping");
 }
 
@@ -220,7 +228,7 @@ fn in_memory_region_is_never_stale() {
 fn idle_shards_never_hold_back_snapshots() {
     let shm = ShmRegion::in_memory(DB_ID, &small_config());
     assert_eq!(shm.visible_seqno(), 0);
-    assert_eq!(shm.reserve_seqnos(4), 1, "seqnos start at 1");
+    assert_eq!(reserve(&shm, 4), 1, "seqnos start at 1");
     // Reserved without a prior lower bound: visible at once (the caller broke the protocol,
     // but idle shards publish `u64::MAX`).
     assert_eq!(shm.visible_seqno(), 4);
@@ -239,7 +247,7 @@ fn cross_shard_commit_is_all_or_nothing_only_with_min_held() {
         let mut last = 0;
         // Shard 0 coordinates seqno q with shard 1 as participant.
         shm.publish_pending(0, shm.next_seqno());
-        let q = shm.reserve_seqnos(1);
+        let q = reserve(&shm, 1);
         assert_eq!(q, 1);
         let held = q;
         shm.publish_pending(0, held);
@@ -251,7 +259,7 @@ fn cross_shard_commit_is_all_or_nothing_only_with_min_held() {
         // Shard 0's next group while shard 1 has not applied q.
         let min = |x: u64| if with_min_held { held.min(x) } else { x };
         shm.publish_pending(0, min(shm.next_seqno()));
-        let first = shm.reserve_seqnos(2);
+        let first = reserve(&shm, 2);
         shm.publish_pending(0, min(first));
         for s in first..first + 2 {
             set_mask(&shm, s, 0b01);
@@ -353,7 +361,7 @@ impl Machine {
                 }
                 Phase::Bounded => {
                     let n = 1 + u64::from(choice >> 6);
-                    let first = self.shm.reserve_seqnos(n);
+                    let first = reserve(&self.shm, n);
                     self.reserved += n;
                     for q in first..first + n {
                         set_mask(&self.shm, q, 1 << shard);
@@ -385,7 +393,7 @@ impl Machine {
                 }
                 self.shards[s].phase = Phase::Bounded;
                 self.publish(shard);
-                let seqno = self.shm.reserve_seqnos(1);
+                let seqno = reserve(&self.shm, 1);
                 self.reserved += 1;
                 self.shards[s].held.insert(seqno);
                 self.shards[s].phase = Phase::Idle;
@@ -599,7 +607,7 @@ fn first_seqno_seeds_the_counter() {
     let shm = ShmRegion::in_memory(DB_ID, &config);
     assert_eq!(shm.next_seqno(), 1000);
     assert_eq!(shm.visible_seqno(), 999);
-    assert_eq!(shm.reserve_seqnos(2), 1000);
+    assert_eq!(reserve(&shm, 2), 1000);
     assert_eq!(shm.next_seqno(), 1002);
     config.first_seqno = 0;
     assert_eq!(
@@ -615,10 +623,9 @@ fn first_seqno_seeds_the_counter() {
 #[test]
 fn reclaim_never_frees_a_live_slot_under_churn() {
     let sim = SimVfs::new(3);
-    let vfs: VfsRef = sim.clone();
     let shm = ShmRegion::in_memory(DB_ID, &small_config());
     let dead = proc(666);
-    sim.kill_process(dead);
+    let writer = file_as(&sim, proc(1));
     let stop = AtomicBool::new(false);
     // Who holds each slot right now, by reader thread id (0 = nobody).
     let owners: Vec<AtomicU64> = (0..4).map(|_| AtomicU64::new(0)).collect();
@@ -626,10 +633,11 @@ fn reclaim_never_frees_a_live_slot_under_churn() {
     std::thread::scope(|s| {
         for reader in 1..=2u64 {
             let (shm, owners, stop) = (&shm, &owners, &stop);
+            let file = file_as(&sim, proc(1 + reader as u32));
             s.spawn(move || {
                 let mut held = 0u64;
                 while !stop.load(Ordering::Relaxed) {
-                    let Ok(slot) = shm.claim_reader_slot(proc(reader as u32)) else {
+                    let Ok(slot) = shm.claim_reader_slot_locked(proc(reader as u32), &file) else {
                         std::thread::yield_now();
                         continue;
                     };
@@ -651,21 +659,24 @@ fn reclaim_never_frees_a_live_slot_under_churn() {
                 assert!(held > 0);
             });
         }
-        // A dead process keeps "claiming" slots and never releasing them.
+        // A reader that keeps claiming slots and dying with them: each is left active with
+        // its liveness lock released, never freed by its owner.
         let (shm_ref, stop_ref) = (&shm, &stop);
+        let dead_file = file_as(&sim, dead);
         s.spawn(move || {
             while !stop_ref.load(Ordering::Relaxed) {
-                if let Ok(slot) = shm_ref.claim_reader_slot(dead) {
+                if let Ok(slot) = shm_ref.claim_reader_slot_locked(dead, &dead_file) {
+                    slot.abandon();
                     std::mem::forget(slot);
                 }
                 std::thread::yield_now();
             }
         });
-        let (shm_ref, vfs_ref, stop_ref, reclaimed_ref) = (&shm, &vfs, &stop, &reclaimed);
+        let (shm_ref, writer_ref, stop_ref, reclaimed_ref) = (&shm, &writer, &stop, &reclaimed);
         s.spawn(move || {
             while !stop_ref.load(Ordering::Relaxed) {
                 reclaimed_ref.fetch_add(
-                    shm_ref.reclaim_dead_slots(vfs_ref) as u64,
+                    shm_ref.reclaim_dead_slots_locked(writer_ref) as u64,
                     Ordering::Relaxed,
                 );
             }
@@ -678,9 +689,10 @@ fn reclaim_never_frees_a_live_slot_under_churn() {
         "the writer did reclaim dead slots"
     );
     // Afterwards every slot is free (or reclaimable) for live readers.
-    shm.reclaim_dead_slots(&vfs);
+    shm.reclaim_dead_slots_locked(&writer);
+    let file = file_as(&sim, proc(10));
     let all: Vec<_> = (0..4)
-        .map(|i| shm.claim_reader_slot(proc(10 + i)).unwrap())
+        .map(|i| shm.claim_reader_slot_locked(proc(10 + i), &file).unwrap())
         .collect();
     assert_eq!(all.len(), 4);
 }
