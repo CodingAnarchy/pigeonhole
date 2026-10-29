@@ -101,14 +101,6 @@ pub trait Vfs: Send + Sync + Debug {
     /// The calling process.
     fn current_process(&self) -> ProcessId;
 
-    /// Whether `process` is still running (pid present and start time unchanged). No longer
-    /// used by the engine (reader liveness is a slot's lock byte), and removed by the next
-    /// change (ICR 0089); the default lets an implementation leave it out meanwhile.
-    fn process_alive(&self, process: ProcessId) -> bool {
-        let _ = process;
-        true
-    }
-
     /// Gives the calling thread an I/O queue of its own, if this backend has them (an
     /// io_uring ring per shard thread, #402): operations it submits from then on go there,
     /// and it completes them by reaping ([`reap_own_io`](crate::reap_own_io)), in its turns

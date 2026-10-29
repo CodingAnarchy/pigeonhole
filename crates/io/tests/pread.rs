@@ -11,7 +11,7 @@ use std::sync::atomic::Ordering;
 
 use common::{TempDir, unique};
 use pigeonhole_io::pread::PreadVfs;
-use pigeonhole_io::{ErrorKind, IoBuf, LockMode, OpenOptions, ProcessId, SharedOpen, Vfs};
+use pigeonhole_io::{ErrorKind, IoBuf, LockMode, OpenOptions, SharedOpen, Vfs};
 
 const CHILD_ENV: &str = "PIGEONHOLE_IO_LOCK_PROBE";
 
@@ -287,30 +287,15 @@ fn attach_to_missing_default_region_fails() {
 }
 
 #[test]
-fn process_liveness() {
+fn the_current_process_is_this_one() {
     let vfs = PreadVfs::new(1);
     let me = vfs.current_process();
     assert_eq!(me.pid, std::process::id());
-    assert!(vfs.process_alive(me));
-
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "no_such_test", "--test-threads=1"])
-        .spawn()
-        .unwrap();
-    let pid = child.id();
-    child.wait().unwrap();
-    // The reaped child is gone, unless its pid was already recycled (rare; then only the
-    // start time could tell, which `start_time: 0` deliberately does not check).
-    if vfs.process_alive(ProcessId { pid, start_time: 0 }) {
-        eprintln!("pid {pid} was recycled; skipping the dead-pid check");
-    }
-    // A recorded start time that differs means a different process behind the same pid.
-    if me.start_time != 0 {
-        assert!(!vfs.process_alive(ProcessId {
-            pid: me.pid,
-            start_time: me.start_time + 1,
-        }));
-    }
+    assert_eq!(
+        me,
+        vfs.current_process(),
+        "the same pid and start time each time"
+    );
 }
 
 #[test]

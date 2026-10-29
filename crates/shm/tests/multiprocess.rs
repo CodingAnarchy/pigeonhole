@@ -397,7 +397,6 @@ fn killed_reader_process_slot_is_reclaimed() {
     let ready = reader.recv();
     let owner = ready_process(&ready);
     assert_eq!(owner.pid, reader.pid());
-    assert!(db.vfs.process_alive(owner));
     assert_eq!(reader.ask("pin 5"), "PINNED seqno=5 view=1");
     assert_eq!(shm.oldest_reader_pin(), Some((5, 1)));
     assert_eq!(
@@ -406,11 +405,8 @@ fn killed_reader_process_slot_is_reclaimed() {
         "alive: nothing to reclaim"
     );
 
+    // The killed process's handle closes, releasing its slot's liveness lock.
     reader.kill();
-    assert!(
-        !db.vfs.process_alive(owner),
-        "the recorded pid plus start time names a process that is gone"
-    );
     assert_eq!(shm.reclaim_dead_slots_locked(&file), 1);
     assert_eq!(shm.oldest_reader_pin(), None);
     assert_eq!(shm.reclaim_dead_slots_locked(&file), 0);

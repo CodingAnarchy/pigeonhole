@@ -440,7 +440,6 @@ fn clocks_and_processes(b: &Backend) {
 
     let me = b.vfs.current_process();
     assert_eq!(me, b.vfs.current_process());
-    assert!(b.vfs.process_alive(me));
 }
 
 /// Direct I/O (#403): aligned reads and writes round-trip; a misaligned offset, length or

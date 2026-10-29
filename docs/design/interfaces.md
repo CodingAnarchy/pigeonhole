@@ -30,7 +30,7 @@ Pure encode/decode; never panics on input.
 - **`compress`, `checksum`, `varint`; `Cursor` trait.**
 
 ### `pigeonhole-io` (uses format)
-- **`Vfs`** (`VfsRef = Arc<dyn Vfs>`): `open`, `remove`, `exists`, `list_dir`, `sync_dir`, `open_shared`/`remove_shared`, `now_micros`, `monotonic_nanos`, `clock_is_simulated` (ICR 0012), `current_process`, `process_alive`. Clocks and process liveness live here so the simulator controls them.
+- **`Vfs`** (`VfsRef = Arc<dyn Vfs>`): `open`, `remove`, `exists`, `list_dir`, `sync_dir`, `open_shared`/`remove_shared`, `now_micros`, `monotonic_nanos`, `clock_is_simulated` (ICR 0012), `current_process`. Clocks and the process identity live here so the simulator controls them (`process_alive` was removed as test-only, ICR 0089: reader liveness is a lock byte, #693).
 - **`File`** (`FileRef = Arc<dyn File>`): positional `read_at`/`write_at`, `submit_read`/`submit_write -> Completion`, `sync_data`, `submit_sync_data -> Completion<()>`, `sync_all`, `len`, `set_len`, `allocate`, non-blocking single-byte `lock`/`unlock` (`LockMode::{Shared, Exclusive}`), `identity` (device, inode), `is_local`.
 - **`IoBuf`** (4096-aligned owned buffer), **`Completion<T = IoBuf>`** (`wait()` for sync callers, `Future` for async, `map`, and `Completion::pair -> (Completion, Resolver)` for layers that build their own async operations).
 - **`SharedRegion`**: mapped shared memory (or `heap(len)`), accessed only via `atomic_u32/atomic_u64(offset)`, `read`/`write` copies, `base_ptr` (for memtable's `unsafe`).
@@ -129,7 +129,7 @@ All MIT/Apache-2.0 compatible (D6); none is a storage engine (spec: Pigeonhole o
 | `crc32c` | Apache-2.0/MIT | format | WAL CRC32C with hardware acceleration and a safe fallback; the spec mandates CRC32C. |
 | `twox-hash` (`xxhash3_64` only) | MIT | format | xxh3-64 block, footer, manifest and filter hashing; the spec mandates xxh3. Chosen over `xxhash-rust`, which is BSL-1.0 and outside D6's license list. |
 | `lz4_flex` (safe encode/decode, no frame) | MIT | format | Default block codec, pure safe Rust. |
-| `libc` (unix) | MIT/Apache-2.0 | io | `pread`/`pwrite`, OFD and `fcntl` locks, `shm_open`/`mmap`, affinity, process liveness. |
+| `libc` (unix) | MIT/Apache-2.0 | io | `pread`/`pwrite`, OFD and `fcntl` locks, `shm_open`/`mmap`, affinity, process start time. |
 | `windows-sys` (windows) | MIT/Apache-2.0 | io | `LockFileEx`, file mappings, `FlushFileBuffers`, affinity on Windows. |
 | `arc-swap` | MIT/Apache-2.0 | engine | Lock-free publication of the current view and tablet map (`Arc` swap without a reader lock). |
 | `proptest` (dev) | MIT/Apache-2.0 | declared | Property tests (format order, round trips, model checks). Crates add it as a dev-dependency when they write those tests. |

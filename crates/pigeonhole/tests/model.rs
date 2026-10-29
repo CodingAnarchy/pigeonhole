@@ -801,9 +801,6 @@ impl Vfs for RealFs {
     fn current_process(&self) -> pigeonhole_io::ProcessId {
         self.files.current_process()
     }
-    fn process_alive(&self, process: pigeonhole_io::ProcessId) -> bool {
-        self.files.process_alive(process)
-    }
     fn attach_thread(&self) {
         self.files.attach_thread();
     }

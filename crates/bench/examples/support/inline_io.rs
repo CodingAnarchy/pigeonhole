@@ -102,10 +102,6 @@ impl Vfs for InlineVfs {
     fn current_process(&self) -> ProcessId {
         self.inner.current_process()
     }
-
-    fn process_alive(&self, process: ProcessId) -> bool {
-        self.inner.process_alive(process)
-    }
 }
 
 /// A pread file whose submitted operations run on the calling thread.
