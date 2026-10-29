@@ -197,7 +197,7 @@ impl Default for Options {
             commit_spin: None,
             shard_spin: None,
             shard_threads: None,
-            adaptive_shard_threads: false,
+            adaptive_shard_threads: true,
             background_workers: 0,
             cpu_profile: CpuProfile::Embedded,
             auto_recover: Recovery::Off,
@@ -475,33 +475,27 @@ impl Options {
         self
     }
 
-    /// A test and bench hook (ICR 0085), only with the `__unstable-hooks` feature and outside
-    /// the API: the default suits applications.
+    /// Size the shard threads to the load (D289's controller, ICR 0081). **On by default.**
+    /// The engine starts a thread per shard, then moves the shards of a light load onto
+    /// fewer threads, which sleep less, so a commit less often waits for a sleeping thread to
+    /// be woken; under load it spreads them out again, up to one per shard.
     ///
-    /// Experimental, off by default: size the shard threads to the load (D289's controller,
-    /// ICR 0081). The engine starts a thread per shard, then moves the shards of a light load
-    /// onto fewer threads, which sleep less, so a commit less often waits for a sleeping thread
-    /// to be woken; under load it spreads them out again, up to one per shard.
-    ///
-    /// - **Why off by default:** the controller resizes on signals that are reliable in a
-    ///   steady load but noisy while a load changes phase (a bulk load ending, a run starting).
-    ///   In D289's box runs a resize at the wrong moment cost up to 5% of throughput, and a
-    ///   light load sometimes grew back and lost its latency gain. It stays opt-in until its
-    ///   policy is tuned across load phases.
-    /// - **What it gains when it settles right:** a light, many-shard load's commit p99 fell
-    ///   from hundreds of microseconds to tens (sparse-wide puts: 236-489 µs to 51 µs).
-    /// - **For a load you know is light,** a fixed [`shard_threads`](Options::shard_threads)
-    ///   gets the same without resizing. An explicit `shard_threads` turns this off.
-    /// - Engine-owned mode only.
+    /// - **What it gains:** a light, many-shard load's commit p99 falls from hundreds of
+    ///   microseconds to tens. In the 2026-10-28 gate, sparse-wide's put p99 at `Buffered`
+    ///   was 66-107 µs with the controller against 545-909 µs without, at the same
+    ///   throughput; transfer, ycsb-a and ycsb-f were level (D289, #1015).
+    /// - **When to turn it off (`false`):** for a fixed thread per shard, which is the
+    ///   behaviour before 1.0. An explicit [`shard_threads`](Options::shard_threads) also
+    ///   turns it off: the count you set is kept.
+    /// - Engine-owned mode only: application-owned shards run on threads you start (D40).
     ///
     /// ```
     /// use pigeonhole::Options;
     ///
-    /// let options = Options::default().adaptive_shard_threads(true);
+    /// // A thread per shard, never resized.
+    /// let options = Options::default().adaptive_shard_threads(false);
     /// # let _ = options;
     /// ```
-    #[cfg(feature = "__unstable-hooks")]
-    #[doc(hidden)]
     pub fn adaptive_shard_threads(mut self, on: bool) -> Self {
         self.adaptive_shard_threads = on;
         self
@@ -1153,9 +1147,9 @@ impl Options {
         };
         o.pin_threads = self.pin_threads;
         o.shard_threads = budget.drivers;
-        // The load controller (D289 PR 2), opt-in for now (the owner, #1006: its resize
-        // policy is noisy across load phases), never with a fixed count; application-owned
-        // shards run on the application's threads (D40).
+        // The load controller (D289 PR 2), on by default since #1015's tuning (the owner,
+        // 2026-10-28), never with a fixed count; application-owned shards run on the
+        // application's threads (D40).
         o.adaptive_drivers = self.adaptive_shard_threads && !budget.fixed && !application_owned;
         if application_owned {
             o.background_workers = self.background_workers;
@@ -1344,22 +1338,23 @@ mod tests {
         }
     }
 
-    /// D289's load controller is opt-in (the owner, #1006): off by default, on with
-    /// `adaptive_shard_threads(true)`, and never with a fixed `shard_threads` or in
-    /// application-owned mode (D40).
+    /// D289's load controller is on by default (the owner, 2026-10-28, after #1015's box
+    /// rounds), off with `adaptive_shard_threads(false)`, and never with a fixed
+    /// `shard_threads` or in application-owned mode (D40).
     #[test]
-    fn the_load_controller_is_opt_in() {
+    fn the_load_controller_is_on_by_default() {
         use super::Options;
         let o = || Options::default().vfs(pigeonhole_io::sim::SimVfs::new(1));
         let adaptive = |o: Options, app: bool| o.to_engine_for(app).unwrap().adaptive_drivers;
-        assert!(!adaptive(o(), false));
+        assert!(adaptive(o(), false));
+        assert!(!adaptive(o().adaptive_shard_threads(false), false));
         assert!(adaptive(o().adaptive_shard_threads(true), false));
         assert!(!adaptive(
             o().adaptive_shard_threads(true).shard_threads(4),
             false
         ));
-        assert!(!adaptive(o().adaptive_shard_threads(true), true));
-        // Off, the engine-owned default is a thread per shard.
+        assert!(!adaptive(o(), true));
+        // The engine-owned default starts a thread per shard: the controller's ceiling.
         let e = o().shards(20).to_engine_for(false).unwrap();
         assert_eq!(e.shard_threads, 20);
     }
