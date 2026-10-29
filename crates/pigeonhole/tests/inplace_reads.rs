@@ -88,6 +88,15 @@ fn cells(r: &RowRef<'_>) -> Vec<CellRow> {
         .collect()
 }
 
+/// Ends a deferred window: reads complete at submit again, and whatever is still in flight is
+/// completed now. A background flush or compaction that submitted I/O during the window waits
+/// on it, and nothing else would complete it once deferral is off; the engine's close would
+/// then wait on that worker forever.
+fn end_deferred(vfs: &SimVfs) {
+    vfs.set_deferred_io(false);
+    vfs.complete_all_io();
+}
+
 /// Polls `fut` to completion, completing the simulator's deferred I/O whenever it waits.
 fn drive<F: Future + Unpin>(vfs: &SimVfs, mut fut: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
@@ -133,7 +142,7 @@ proptest! {
             let got = drive(&vfs, t.row(&row).versions(versions).read_async())
                 .unwrap()
                 .map(|r| cells(&r.view()));
-            vfs.set_deferred_io(false);
+            end_deferred(&vfs);
             let want = sync_row(&t, &row, versions);
             prop_assert_eq!(got, want, "row {} deferred {} seed {}", r, deferred[r as usize], seed);
         }
@@ -197,14 +206,14 @@ fn both_paths_are_exercised() {
     for r in ROWS / 2..ROWS {
         let (got, waits) = drive_counting(&vfs, t.row(&row_key(r)).read_async());
         waited += waits;
-        vfs.set_deferred_io(false);
+        end_deferred(&vfs);
         assert_eq!(
             got.unwrap().map(|r| cells(&r.view())),
             sync_row(&t, &row_key(r), 1)
         );
         vfs.set_deferred_io(true);
     }
-    vfs.set_deferred_io(false);
+    end_deferred(&vfs);
     assert!(waited > 0, "the deferred reads waited on their reads");
     drop(t);
     db.close().unwrap();
@@ -289,7 +298,7 @@ fn a_miss_at_the_call_is_resumed_by_the_future_not_read_twice() {
         "the row read's future waits on the call's read"
     );
     let read = drive(&vfs, row).unwrap();
-    vfs.set_deferred_io(false);
+    end_deferred(&vfs);
     assert_eq!(
         got.map(|c| c.value().to_vec()),
         t.get(&row_key(3), "d", &[1])
