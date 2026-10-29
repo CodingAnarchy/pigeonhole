@@ -715,6 +715,14 @@ pub trait Runner {
     fn seqno(&self) -> Option<u64> {
         None
     }
+
+    /// The store's engine-side commit latency histograms since open, for stores that keep
+    /// them (Pigeonhole's `commit_latency_buckets`, D213); `None` (the default) elsewhere.
+    /// [`run_detailed`] reads it around the measured phase, so a client run's commit latency
+    /// splits into the engine's part and the hand-back to the client (#760).
+    fn commit_latency_buckets(&self) -> Option<[[u64; 64]; 4]> {
+        None
+    }
 }
 
 /// A store's background work so far ([`Runner::background`]), sampled while settling after
@@ -966,6 +974,7 @@ pub fn run_detailed(
         txn_conflicts,
         (riders, reader_processes),
         capped,
+        engine_commit,
     ) = detail;
     closed?;
     let ops = hist.count();
@@ -995,7 +1004,7 @@ pub fn run_detailed(
             by_type,
             shards,
             stalls,
-            engine_commit: None,
+            engine_commit,
             settle: Some(settle),
             background_work,
             warmup_secs: Some(warmed.secs),
@@ -1134,6 +1143,7 @@ type Measured = (
         Option<u64>,
         (Option<Riders>, Option<ReaderProcesses>),
         bool,
+        Option<EngineCommit>,
     ),
 );
 
@@ -1223,6 +1233,7 @@ fn measure(
         runner.background(),
         runner.seqno(),
         runner.txn_conflicts(),
+        runner.commit_latency_buckets(),
     );
     runner.start_riders()?;
     runner.start_reader_processes(config)?;
@@ -1283,6 +1294,12 @@ fn measure(
             .map(|(b, a)| a.saturating_sub(b)),
         (runner.stop_riders()?, runner.stop_reader_processes()?),
         capped,
+        before
+            .5
+            .zip(runner.commit_latency_buckets())
+            .and_then(|(b, a)| {
+                EngineCommit::between(&b, &a, pigeonhole::Pigeonhole::commit_latency_floor)
+            }),
     );
     Ok((load, elapsed, lanes, hist, split, shards))
 }

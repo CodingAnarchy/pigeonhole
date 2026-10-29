@@ -1087,6 +1087,10 @@ impl Runner for PigeonholeRunner {
         Some(self.open.as_ref()?.target.conflicts.load(Ordering::Relaxed))
     }
 
+    fn commit_latency_buckets(&self) -> Option<[[u64; 64]; 4]> {
+        Some(self.open.as_ref()?.target.db.commit_latency_buckets())
+    }
+
     fn seqno(&self) -> Option<u64> {
         self.open
             .as_ref()?

@@ -61,6 +61,18 @@ pub(crate) struct Grid {
     pub(crate) headers: Vec<Option<SegmentHeader>>,
 }
 
+/// The segment header in `probe`, or `None` where there is none (a blank or torn slot). A
+/// header whose checksum passed but whose version is newer was written by a newer build:
+/// refused, never read as a blank or torn slot with its records skipped, nor the stream as
+/// empty (#496, the #774 hazard).
+fn decode_header(probe: &[u8]) -> Result<Option<SegmentHeader>> {
+    match SegmentHeader::decode(probe) {
+        Ok(h) => Ok(Some(h)),
+        Err(e @ pigeonhole_format::Error::UnsupportedVersion { .. }) => Err(e.into()),
+        Err(_) => Ok(None),
+    }
+}
+
 impl Grid {
     /// Reads every slot header. Returns `None` if no valid header exists anywhere in the
     /// file, in which case its slot size is unknown and nothing in it is reachable.
@@ -73,17 +85,11 @@ impl Grid {
         let mut off = 0;
         while off + probe.len() as u64 <= len {
             file.read_at(&mut probe, off)?;
-            match SegmentHeader::decode(&probe) {
-                Ok(h) if off.is_multiple_of(h.segment_size) => {
-                    segment_size = Some(h.segment_size);
-                    break;
-                }
-                // A newer build's segment (its CRC passed): refuse rather than find no
-                // segment and read the stream as empty (#496, the #774 hazard).
-                Err(e @ pigeonhole_format::Error::UnsupportedVersion { .. }) => {
-                    return Err(e.into());
-                }
-                _ => {}
+            if let Some(h) = decode_header(&probe)?
+                && off.is_multiple_of(h.segment_size)
+            {
+                segment_size = Some(h.segment_size);
+                break;
             }
             off += FRAME;
         }
@@ -94,27 +100,19 @@ impl Grid {
         let mut headers = Vec::with_capacity(slots);
         for slot in 0..slots {
             file.read_at(&mut probe, slot as u64 * segment_size)?;
-            headers.push(match SegmentHeader::decode(&probe) {
-                Ok(h) => {
-                    if h.db_id != db_id {
-                        return Err(Error::ForeignSegment);
-                    }
-                    if h.stream != stream {
-                        return Err(corrupt("wal segment stream id"));
-                    }
-                    if h.segment_size != segment_size {
-                        return Err(corrupt("wal segment size"));
-                    }
-                    Some(h)
+            let h = decode_header(&probe)?;
+            if let Some(h) = &h {
+                if h.db_id != db_id {
+                    return Err(Error::ForeignSegment);
                 }
-                // A header whose checksum passed but whose version is newer was written by a
-                // newer build: refuse, never treat it as a blank or torn slot and skip its
-                // records (#496, the #774 hazard).
-                Err(e @ pigeonhole_format::Error::UnsupportedVersion { .. }) => {
-                    return Err(e.into());
+                if h.stream != stream {
+                    return Err(corrupt("wal segment stream id"));
                 }
-                Err(_) => None,
-            });
+                if h.segment_size != segment_size {
+                    return Err(corrupt("wal segment size"));
+                }
+            }
+            headers.push(h);
         }
         Ok(Some(Self {
             segment_size,
@@ -130,6 +128,27 @@ impl Grid {
             .map(|h| h.epoch)
             .max()
             .unwrap_or(0)
+    }
+
+    /// Where replay of the stream starts, as `(slot, epoch, offset)`: with no checkpoint
+    /// (epoch 0), the first frame of the oldest segment; else the checkpoint's place in its
+    /// segment (past the header frame). `None` when there is no such segment.
+    pub(crate) fn start(&self, checkpoint: Lsn) -> Option<(usize, u32, u64)> {
+        if checkpoint.epoch() == 0 {
+            return self
+                .headers
+                .iter()
+                .enumerate()
+                .filter_map(|(i, h)| h.map(|h| (h.epoch, i)))
+                .min()
+                .map(|(epoch, slot)| (slot, epoch, FRAME));
+        }
+        let slot = self.slot_of(checkpoint.epoch())?;
+        Some((
+            slot,
+            checkpoint.epoch(),
+            u64::from(checkpoint.offset()).max(FRAME),
+        ))
     }
 
     /// The slot holding the segment with `epoch`.
@@ -1001,6 +1020,49 @@ impl fmt::Debug for SparePrep {
 }
 
 impl SparePrep {
+    /// Collects finished writes and submits more, a step's worth per poll: ready once every
+    /// write is submitted (or a failure stops them) and none is in flight.
+    fn write_slots(&mut self, to_fill: &[usize], cx: &mut Context<'_>) -> Poll<()> {
+        if self.failed.is_none() && self.spares.shared.closing_io.load(Ordering::Acquire) {
+            // A close waits for the stream's I/O: finish what is in flight, submit no more
+            // (`track` refuses anyway; this skips the allocation of the next slot).
+            self.failed = Some(Error::Io(Shared::closing_error()));
+        }
+        let (mut submitted, mut allocated) = (0, false);
+        loop {
+            // Collect finished writes, oldest first.
+            while let Some(w) = self.writes.front_mut() {
+                match Pin::new(w).poll(cx) {
+                    Poll::Ready(Ok(buf)) => self.buffers.push(buf),
+                    Poll::Ready(Err(e)) => {
+                        self.failed.get_or_insert(e.into());
+                    }
+                    Poll::Pending => break,
+                }
+                self.writes.pop_front();
+            }
+            if self.writes.len() >= PREP_IN_FLIGHT {
+                return Poll::Pending;
+            }
+            if self.submitted_all(to_fill) {
+                return if self.writes.is_empty() {
+                    Poll::Ready(())
+                } else {
+                    Poll::Pending
+                };
+            }
+            let allocates = self.needs_allocation();
+            if submitted == PREP_WRITES_PER_POLL || (allocates && allocated) {
+                // A step's worth: yield, and run again at once.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.submit_next(to_fill);
+            allocated |= allocates;
+            submitted += 1;
+        }
+    }
+
     /// Whether every write has been submitted, or a failure stops them.
     fn submitted_all(&self, to_fill: &[usize]) -> bool {
         self.failed.is_some() || self.next_slot == to_fill.len()
@@ -1068,46 +1130,9 @@ impl Future for SparePrep {
             };
             return Poll::Ready(this.spares.settle(slots, r.map_err(Error::from)));
         }
-        let (mut submitted, mut allocated) = (0, false);
-        if this.failed.is_none() && this.spares.shared.closing_io.load(Ordering::Acquire) {
-            // A close waits for the stream's I/O: finish what is in flight, submit no more
-            // (`track` refuses anyway; this skips the allocation of the next slot).
-            this.failed = Some(Error::Io(Shared::closing_error()));
-        }
-        loop {
-            // Collect finished writes, oldest first.
-            while let Some(w) = this.writes.front_mut() {
-                match Pin::new(w).poll(cx) {
-                    Poll::Ready(Ok(buf)) => this.buffers.push(buf),
-                    Poll::Ready(Err(e)) => {
-                        this.failed.get_or_insert(e.into());
-                    }
-                    Poll::Pending => break,
-                }
-                this.writes.pop_front();
-            }
-            if this.writes.len() >= PREP_IN_FLIGHT {
-                this.slots = Some(slots);
-                return Poll::Pending;
-            }
-            if !this.submitted_all(&slots.to_fill) {
-                let allocates = this.needs_allocation();
-                if submitted == PREP_WRITES_PER_POLL || (allocates && allocated) {
-                    // A step's worth: yield, and run again at once.
-                    cx.waker().wake_by_ref();
-                    this.slots = Some(slots);
-                    return Poll::Pending;
-                }
-                this.submit_next(&slots.to_fill);
-                allocated |= allocates;
-                submitted += 1;
-                continue;
-            }
-            if !this.writes.is_empty() {
-                this.slots = Some(slots);
-                return Poll::Pending;
-            }
-            break;
+        if this.write_slots(&slots.to_fill, cx).is_pending() {
+            this.slots = Some(slots);
+            return Poll::Pending;
         }
         if let Some(e) = this.failed.take() {
             // A failed allocation or write leaves the stream usable (the slots stay blank).

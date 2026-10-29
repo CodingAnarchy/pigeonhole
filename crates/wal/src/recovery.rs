@@ -165,48 +165,26 @@ impl Recovery {
         writable: bool,
     ) -> Result<Recovery> {
         let path = stream_path(db_path, stream);
-        if !writable {
-            let file = vfs.open(&path, pigeonhole_io::OpenOptions::read())?;
-            return Self::replay_from(vfs, file, path, stream, db_id, checkpoint, false);
-        }
-        let file = vfs.open(&path, open_existing())?;
-        // A process that died between a slot's `allocate` and its `sync_all` left the page
-        // cache's length longer than the disk's. The grid (and the blank slots the stream
-        // adopts) come from that length, and appends sync with `sync_data`: make it durable.
-        file.sync_all()?;
-        // Likewise its directory entry: an open no longer waits for the directory sync of
-        // the stream files it creates (#158, D203), so a process that died before that sync
-        // finished left this file's name in the page cache only. The stream is adopted and
-        // appended to, and its new commits would vanish with the name in a power loss.
-        crate::sync_parent(vfs, &path)?;
-        Self::replay_from(vfs, file, path, stream, db_id, checkpoint, true)
-    }
-
-    fn replay_from(
-        vfs: &VfsRef,
-        file: FileRef,
-        path: PathBuf,
-        stream: StreamId,
-        db_id: [u8; 16],
-        checkpoint: Lsn,
-        writable: bool,
-    ) -> Result<Recovery> {
+        let file = if writable {
+            let file = vfs.open(&path, open_existing())?;
+            // A process that died between a slot's `allocate` and its `sync_all` left the
+            // page cache's length longer than the disk's. The grid (and the blank slots the
+            // stream adopts) come from that length, and appends sync with `sync_data`: make
+            // it durable.
+            file.sync_all()?;
+            // Likewise its directory entry: an open no longer waits for the directory sync of
+            // the stream files it creates (#158, D203), so a process that died before that
+            // sync finished left this file's name in the page cache only. The stream is
+            // adopted and appended to, and its new commits would vanish with the name in a
+            // power loss.
+            crate::sync_parent(vfs, &path)?;
+            file
+        } else {
+            vfs.open(&path, pigeonhole_io::OpenOptions::read())?
+        };
         let grid = Grid::read(&file, stream, db_id)?;
         let start = match &grid {
-            Some(g) if checkpoint.epoch() == 0 => g
-                .headers
-                .iter()
-                .enumerate()
-                .filter_map(|(i, h)| h.map(|h| (h.epoch, i)))
-                .min()
-                .map(|(epoch, slot)| (slot, epoch, FRAME)),
-            Some(g) => g.slot_of(checkpoint.epoch()).map(|slot| {
-                (
-                    slot,
-                    checkpoint.epoch(),
-                    u64::from(checkpoint.offset()).max(FRAME),
-                )
-            }),
+            Some(g) => g.start(checkpoint),
             None if checkpoint.epoch() == 0 => None,
             None => return Err(corrupt("wal checkpoint segment missing")),
         };
