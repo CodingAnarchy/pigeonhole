@@ -338,6 +338,13 @@ pub struct BlockHandle {
     len: usize,
 }
 
+// The impls below rest on this: a `BlockData` variant that stops being thread-safe fails
+// to build here instead of being hidden by them.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<Arc<BlockData>>();
+};
+
 // SAFETY: `ptr`/`len` are a shared view of bytes `block` owns and never changes (a
 // `BlockData` is not mutated once in an `Arc`), so the handle is as `Send` and `Sync` as the
 // `Arc<BlockData>` it holds and a `&[u8]` into it.
