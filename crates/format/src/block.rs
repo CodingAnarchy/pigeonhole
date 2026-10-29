@@ -738,8 +738,9 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
     }
 
     /// Positions on the entry at `offset`, whose header `e` is already decoded, taking its
-    /// shared prefix from the current key.
-    #[inline]
+    /// shared prefix from the current key. Always inlined: `load` (every `next`) and `seek`
+    /// both call it, and a call per entry stepped costs more than the copy.
+    #[inline(always)]
     fn apply(&mut self, offset: usize, e: Entry) -> crate::Result<()> {
         let bytes: &[u8] = &self.block.bytes;
         if e.shared == 0 {
