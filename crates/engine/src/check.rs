@@ -343,10 +343,16 @@ impl Checker {
             .iter()
             .map(|(_, _, read, page)| read.then(|| Superblock::decode(page)))
             .collect();
-        // A file a newer build wrote isn't damaged: this build can't check it.
+        // A file a newer build wrote isn't damaged: this build can't check it. Nor can it
+        // check one using an incompatible feature it doesn't know (FORMAT §13: refused at
+        // open, in either slot, as `Superblock::choose` refuses it).
         for d in decoded.iter().flatten() {
-            if let Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) = d {
-                return Err(Error::UnsupportedFormat(*found));
+            match d {
+                Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) => {
+                    return Err(Error::UnsupportedFormat(*found));
+                }
+                Ok(s) => s.features.check_read()?,
+                Err(_) => {}
             }
         }
         let valid: Vec<&Superblock> = decoded.iter().flatten().flatten().collect();
@@ -512,8 +518,9 @@ impl Checker {
                 ));
             }
         }
+        // Not deduplicated: two structures on the same extent overlap (an SST shared by
+        // tablets is mapped once, in `map`).
         spans.sort_unstable();
-        spans.dedup_by_key(|s| (s.0, s.1));
         for w in spans.windows(2) {
             let ((_, a_end, a), (b_start, _, b)) = (w[0], w[1]);
             if b_start < a_end {
@@ -1244,6 +1251,9 @@ impl WalScan {
                 Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) => {
                     return Err(Error::UnsupportedFormat(found));
                 }
+                Err(e @ pigeonhole_format::Error::UnsupportedFeature { .. }) => {
+                    return Err(e.into());
+                }
                 _ => {}
             }
             off += FRAME;
@@ -1281,6 +1291,9 @@ impl WalScan {
                 // A newer build's segment: the check can't judge it (as for the superblock).
                 Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) => {
                     return Err(Error::UnsupportedFormat(found));
+                }
+                Err(e @ pigeonhole_format::Error::UnsupportedFeature { .. }) => {
+                    return Err(e.into());
                 }
                 // Blank, or a torn header write: an unused slot.
                 Err(_) => None,
@@ -1348,4 +1361,29 @@ fn names(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::valid_extent;
+
+    /// The pager's extent rules. Unreachable from a file (the manifest and superblock
+    /// decoders refuse such an extent first), so tested here.
+    #[test]
+    fn extents_follow_the_pager_rules() {
+        const K64: u64 = 64 * 1024;
+        assert_eq!(valid_extent(K64, K64), Ok(()));
+        assert_eq!(valid_extent(4 * K64, 2 * K64), Ok(()));
+        let reserved = Err("it starts inside the reserved header");
+        assert_eq!(valid_extent(0, K64), reserved);
+        assert_eq!(valid_extent(K64 + 1, K64), reserved);
+        let size = Err("its size is not a power of two from 64 KiB to 64 MiB");
+        assert_eq!(valid_extent(K64, 4096), size);
+        assert_eq!(valid_extent(K64, 3 * K64), size);
+        assert_eq!(valid_extent(K64 << 11, K64 << 11), size);
+        assert_eq!(
+            valid_extent(3 * K64, 2 * K64),
+            Err("it is not aligned to its size")
+        );
+    }
 }
