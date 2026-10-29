@@ -733,18 +733,11 @@ pub struct Stalls {
     /// See [`Stalls::xshard_rounds`].
     #[serde(default)]
     pub xshard_refused_rounds: u64,
-    /// Refused PREPAREs by reason: below a timestamp the participant assigned (D11), below a
-    /// tablet move's raised floor, a tablet being changed or moved (D145), no arena room
+    /// Refused PREPAREs by reason: a tablet being changed or moved (D145), or no arena room
     /// (ICR 0042). One refused round can hold several.
     #[serde(default)]
-    pub xshard_refused_below_floor: u64,
-    /// See [`Stalls::xshard_refused_below_floor`].
-    #[serde(default)]
-    pub xshard_refused_move_raise: u64,
-    /// See [`Stalls::xshard_refused_below_floor`].
-    #[serde(default)]
     pub xshard_refused_moved: u64,
-    /// See [`Stalls::xshard_refused_below_floor`].
+    /// See [`Stalls::xshard_refused_moved`].
     #[serde(default)]
     pub xshard_refused_room: u64,
     /// PREPAREs refused because they overlapped another commit's undecided share and retried
@@ -815,14 +808,6 @@ impl Stalls {
             ),
             xshard_rounds: d(before.xshard_rounds, after.xshard_rounds),
             xshard_refused_rounds: d(before.xshard_refused_rounds, after.xshard_refused_rounds),
-            xshard_refused_below_floor: d(
-                before.xshard_refused_below_floor,
-                after.xshard_refused_below_floor,
-            ),
-            xshard_refused_move_raise: d(
-                before.xshard_refused_move_raise,
-                after.xshard_refused_move_raise,
-            ),
             xshard_refused_moved: d(before.xshard_refused_moved, after.xshard_refused_moved),
             xshard_refused_room: d(before.xshard_refused_room, after.xshard_refused_room),
             xshard_refused_pending_overlap: d(
@@ -1371,7 +1356,7 @@ impl Suite {
             .filter_map(|r| r.rounds().map(|x| (r, x)))
             .collect();
         if !rounds.is_empty() {
-            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: below floor, move raise, moved, room, pending overlap | Seqnos used | Inferred wasted rounds | Share waits, ms held |\n");
+            s.push_str("\n| Workload | Store | Settings | Commits | Cross-shard commits | Refused rounds | Per cross-shard commit | Refusals: moved, room, pending overlap | Seqnos used | Inferred wasted rounds | Share waits, ms held |\n");
             s.push_str("|---|---|---|--:|--:|--:|--:|---|--:|--:|---|\n");
             let opt = |v: Option<u64>| v.map_or_else(|| "-".to_owned(), |v| v.to_string());
             for (r, x) in rounds {
@@ -1379,9 +1364,7 @@ impl Suite {
                     || "-".to_owned(),
                     |st| {
                         format!(
-                            "{}, {}, {}, {}, {}",
-                            st.xshard_refused_below_floor,
-                            st.xshard_refused_move_raise,
+                            "{}, {}, {}",
                             st.xshard_refused_moved,
                             st.xshard_refused_room,
                             st.xshard_refused_pending_overlap

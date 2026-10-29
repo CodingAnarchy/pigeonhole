@@ -412,8 +412,7 @@ def xshard(run, level="buffered"):
     inferred = None if seqnos is None or not n else max(seqnos - commits, 0) / n
     counted = st["xshard_refused_rounds"] / n if n and "xshard_refused_rounds" in st else None
     wasted = counted if counted is not None else inferred
-    reasons = (f"below floor {st.get('xshard_refused_below_floor', 0)}, move raise {st.get('xshard_refused_move_raise', 0)}, "
-               f"moved {st.get('xshard_refused_moved', 0)}, room {st.get('xshard_refused_room', 0)}, "
+    reasons = (f"moved {st.get('xshard_refused_moved', 0)}, room {st.get('xshard_refused_room', 0)}, "
                f"pending overlap {st.get('xshard_refused_pending_overlap', 0)} (D249)"
                if counted is not None else "")
     check = f"{inferred:.3f}" if inferred is not None else "-"

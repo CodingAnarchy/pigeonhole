@@ -1741,8 +1741,6 @@ pub(crate) fn stalls(db: &Pigeonhole) -> crate::Stalls {
         xshard_rounds: m.cross_shard.rounds,
         xshard_refused_rounds: im("cross_shard.refused_rounds"),
         // Always 0 since D263 (the counters are deprecated); the report keeps its columns.
-        xshard_refused_below_floor: 0,
-        xshard_refused_move_raise: 0,
         xshard_refused_moved: im("cross_shard.refused_moved"),
         xshard_refused_room: im("cross_shard.refused_room"),
         xshard_refused_pending_overlap: im("cross_shard.refused_pending_overlap"),
