@@ -1853,6 +1853,20 @@ impl Engine {
         self.inner.catalog().table_by_name(name).cloned()
     }
 
+    /// The table with id `id` (ICR 0092): [`Engine::table`] by id, for a handle that knows
+    /// its table's id and wants its current entry without hashing its name on every call.
+    /// `None` once the table is dropped (a table created again under the name has a new id).
+    pub fn table_by_id(&self, id: TableId) -> Option<Arc<TableInfo>> {
+        if self.inner.forked() {
+            return None;
+        }
+        // In a writer, under the view's guard, as `table` (#709).
+        if !self.inner.is_reader() {
+            return self.inner.shared.view.load().catalog.table(id).cloned();
+        }
+        self.inner.catalog().table(id).cloned()
+    }
+
     /// Every table.
     pub fn tables(&self) -> Vec<Arc<TableInfo>> {
         if self.inner.forked() {
