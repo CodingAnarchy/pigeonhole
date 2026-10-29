@@ -343,7 +343,7 @@ fn scan_escaped(b: &[u8]) -> crate::Result<(usize, usize)> {
     let mut i = 0;
     let mut raw = 0;
     loop {
-        let Some(z) = b[i..].iter().position(|&c| c == 0) else {
+        let Some(z) = find_zero(&b[i..]) else {
             return Err(Error::Corrupt {
                 what: "key: missing terminator",
             });
