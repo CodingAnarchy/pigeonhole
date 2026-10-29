@@ -262,15 +262,6 @@ pub struct CrossShardMetrics {
     pub rounds: u64,
     /// Rounds that a participant refused.
     pub refused_rounds: u64,
-    /// Always 0 since D263: a PREPARE carries no timestamp, so none is refused for its
-    /// order with the participant's writes (D11, D244, D245 before it). Removed at the 1.0
-    /// API freeze.
-    #[deprecated(note = "always 0 since D263; removed at the 1.0 API freeze")]
-    pub refused_below_floor: u64,
-    /// Always 0 since D263: a PREPARE carries no timestamp, so none is refused below a
-    /// tablet move's raise (D11 before it). Removed at the 1.0 API freeze.
-    #[deprecated(note = "always 0 since D263; removed at the 1.0 API freeze")]
-    pub refused_move_raise: u64,
     /// PREPAREs refused because a row's tablet was being split, merged or moved, or had
     /// moved to another shard (D145).
     pub refused_moved: u64,
@@ -1085,7 +1076,6 @@ impl Engine {
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
-            room_recheck_nanos: options.room_recheck_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
             tail_index: options.memtable_tail_index,
             // Filled as the last step of the open (`held`).
@@ -1747,7 +1737,6 @@ impl Engine {
             write_stall_timeout_nanos: options.write_stall_timeout_nanos,
             compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
             flush_backoff_nanos: options.flush_backoff_nanos.max(1),
-            room_recheck_nanos: options.room_recheck_nanos.max(1),
             commit_spin_nanos: options.commit_spin_nanos,
             tail_index: false,
             locks: Mutex::new(None),
@@ -2322,30 +2311,13 @@ impl Engine {
     }
 
     /// [`Engine::read_row_latest_into`] that never blocks: the read runs now in cache-only
-    /// mode, through the row cache, and returns `None` when it would need a block the cache
-    /// does not hold (and in a reader process). `sink` may then hold some of the row's cells;
-    /// start [`Engine::read_row_latest_async`] with an empty one. A memtable or cache hit is
-    /// the async read's fast path: no future, no reference counted (#709). The miss is
-    /// dropped, with any read the cursor submitted for it; [`Engine::try_read_row_latest`]
-    /// keeps it for the future.
-    pub fn try_read_row_latest_into(
-        &self,
-        table: TableId,
-        row: &[u8],
-        families: &[FamilyId],
-        spec: &ReadSpec,
-        sink: &mut impl read::RowSink,
-    ) -> Option<Result<bool>> {
-        // Dropping the miss's read in flight is safe: a dropped `Completion` leaves the buffer
-        // with the backend until the device is done with it (pigeonhole-io's completion
-        // contract, #976).
-        self.try_read_row_latest(table, row, families, spec, sink)
-            .ok()
-    }
-
-    /// [`Engine::try_read_row_latest_into`] that keeps its miss (#709): `Err` carries the
-    /// block the read missed on, with the read the cursor submitted for it, for
-    /// [`Engine::read_row_latest_async_after`] to resume instead of submitting again.
+    /// mode, through the row cache. A memtable or cache hit is the async read's fast path: no
+    /// future, no reference counted (#709). When the read would need a block the cache does
+    /// not hold (and in a reader process), `Err` carries the block it missed on, with the
+    /// read the cursor submitted for it, for [`Engine::read_row_latest_async_after`] to resume
+    /// instead of submitting again; `sink` may then hold some of the row's cells. Dropping
+    /// the miss is safe: a dropped `Completion` leaves the buffer with the backend until the
+    /// device is done with it (pigeonhole-io's completion contract, #976).
     pub fn try_read_row_latest(
         &self,
         table: TableId,
