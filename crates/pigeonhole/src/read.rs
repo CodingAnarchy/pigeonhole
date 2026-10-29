@@ -52,10 +52,15 @@ pub enum ValueFilter {
 
 impl ValueFilter {
     pub(crate) fn to_engine(&self) -> ValuePredicate {
+        self.clone().into_engine()
+    }
+
+    /// [`ValueFilter::to_engine`] without the copy, for a filter the caller owns.
+    pub(crate) fn into_engine(self) -> ValuePredicate {
         match self {
-            ValueFilter::Equals(v) => ValuePredicate::Equals(v.clone()),
-            ValueFilter::Prefix(v) => ValuePredicate::Prefix(v.clone()),
-            ValueFilter::I64(o, v) => ValuePredicate::I64(*o, *v),
+            ValueFilter::Equals(v) => ValuePredicate::Equals(v),
+            ValueFilter::Prefix(v) => ValuePredicate::Prefix(v),
+            ValueFilter::I64(o, v) => ValuePredicate::I64(o, v),
         }
     }
 }
@@ -92,7 +97,7 @@ pub enum Condition {
 }
 
 /// A read's selected families, resolved: inline for up to four.
-type FamilyIds = SmallVec<[FamilyId; 4]>;
+pub(crate) type FamilyIds = SmallVec<[FamilyId; 4]>;
 
 /// The selection shared by row reads and scans, with family names kept until the read
 /// starts (builders never fail; errors surface at `read`/`iter`).
@@ -263,7 +268,7 @@ macro_rules! selection_methods {
 
         /// Only cells whose value matches.
         pub fn value_filter(mut self, filter: ValueFilter) -> Self {
-            self.sel.spec.value = Some(filter.to_engine());
+            self.sel.spec.value = Some(filter.into_engine());
             self
         }
 
