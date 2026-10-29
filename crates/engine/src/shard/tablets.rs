@@ -517,11 +517,12 @@ impl ShardState {
             if *seqno == m.seqno || !share.tracked {
                 continue;
             }
-            let overlaps = Some(share.bytes.batch()).is_some_and(|b| {
-                b.iter()
-                    .flatten()
-                    .any(|mu| rows.binary_search(&hash_row(mu.table, mu.row)).is_ok())
-            });
+            let overlaps = share
+                .bytes
+                .batch()
+                .iter()
+                .flatten()
+                .any(|mu| rows.binary_search(&hash_row(mu.table, mu.row)).is_ok());
             if overlaps && oldest.is_none_or(|(p, _)| share.priority < p) {
                 oldest = Some((share.priority, *seqno));
             }
@@ -600,11 +601,12 @@ impl ShardState {
                 **seqno != skip
                     && share.tracked
                     && (share.reads.iter().any(|h| rows.binary_search(h).is_ok())
-                        || Some(share.bytes.batch()).is_some_and(|b| {
-                            b.iter()
-                                .flatten()
-                                .any(|mu| rows.binary_search(&hash_row(mu.table, mu.row)).is_ok())
-                        }))
+                        || share
+                            .bytes
+                            .batch()
+                            .iter()
+                            .flatten()
+                            .any(|mu| rows.binary_search(&hash_row(mu.table, mu.row)).is_ok()))
             })
             .map(|(seqno, share)| (*seqno, share.priority))
             .collect();
@@ -658,11 +660,12 @@ impl ShardState {
         // A row it reads waits only for the shares writing it.
         for (seqno, share) in &self.prepared {
             if share.tracked
-                && Some(share.bytes.batch()).is_some_and(|b| {
-                    b.iter()
-                        .flatten()
-                        .any(|mu| reads.binary_search(&hash_row(mu.table, mu.row)).is_ok())
-                })
+                && share
+                    .bytes
+                    .batch()
+                    .iter()
+                    .flatten()
+                    .any(|mu| reads.binary_search(&hash_row(mu.table, mu.row)).is_ok())
             {
                 ahead.push(*seqno);
             }
@@ -1593,12 +1596,10 @@ impl ShardState {
     /// Whether a prepared, undecided share writes or reads a tablet being changed.
     fn shares_touch_moving(&self) -> bool {
         self.prepared.values().any(|share| {
-            Some(share.bytes.batch()).is_some_and(|b| {
-                b.iter().flatten().any(|mu| {
-                    self.tablets
-                        .route(mu.table, mu.row)
-                        .is_some_and(|(t, _)| self.moving.contains(&t))
-                })
+            share.bytes.batch().iter().flatten().any(|mu| {
+                self.tablets
+                    .route(mu.table, mu.row)
+                    .is_some_and(|(t, _)| self.moving.contains(&t))
             })
         })
     }

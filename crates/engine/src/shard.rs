@@ -1656,11 +1656,16 @@ impl Bytes {
     /// The batch: a builder's as it stands (it checked every mutation it took, so it needs
     /// no validating decode), anything else decoded as `BatchRef::new` does.
     fn batch(&self) -> pigeonhole_format::Result<BatchRef<'_>> {
-        match self {
-            Bytes::Own(b) => Ok(b.batch()),
-            Bytes::Shared(b) => Ok(b.batch()),
-            Bytes::Streams(v) => BatchRef::new(v),
-        }
+        let built = match self {
+            Bytes::Own(b) => b.batch(),
+            Bytes::Shared(b) => b.batch(),
+            Bytes::Streams(v) => return BatchRef::new(v),
+        };
+        debug_assert!(
+            BatchRef::new(built.as_bytes()).is_ok(),
+            "a builder holds only mutations it checked"
+        );
+        Ok(built)
     }
 
     fn as_slice(&self) -> &[u8] {
