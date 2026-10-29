@@ -22,7 +22,7 @@ impl Driver {
     /// Opens `path` with application-owned shards (one shard, no tablet changes, a memtable
     /// budget no setup reaches, so nothing flushes on its own), each driven by a thread.
     pub fn open(path: &Path, options: Options) -> (Pigeonhole, Driver) {
-        let (db, shards) = Pigeonhole::open_application_owned(
+        let pigeonhole::AppOwned { db, shards, .. } = Pigeonhole::open_application_owned(
             path,
             options
                 .shards(1)
@@ -30,8 +30,7 @@ impl Driver {
                 .memtable_budget(1 << 30)
                 .row_cache(row_cache()),
         )
-        .expect("open")
-        .into_parts();
+        .expect("open");
         let busy = Arc::new(AtomicUsize::new(0));
         let threads = shards
             .into_iter()
@@ -94,24 +93,4 @@ fn row_cache() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
-}
-
-/// The application-owned open's result as `(db, shards)`, whichever form the library returns:
-/// `AppOwned` since ICR 0088, a tuple before. The callgrind workflow builds these sources
-/// against the base commit too, so they must compile against both.
-trait IntoParts {
-    fn into_parts(self) -> (Pigeonhole, Vec<pigeonhole::Shard>);
-}
-
-impl IntoParts for (Pigeonhole, Vec<pigeonhole::Shard>) {
-    fn into_parts(self) -> (Pigeonhole, Vec<pigeonhole::Shard>) {
-        self
-    }
-}
-
-impl IntoParts for pigeonhole::AppOwned {
-    fn into_parts(self) -> (Pigeonhole, Vec<pigeonhole::Shard>) {
-        let pigeonhole::AppOwned { db, shards, .. } = self;
-        (db, shards)
-    }
 }
