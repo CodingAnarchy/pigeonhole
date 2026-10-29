@@ -53,6 +53,9 @@ pub enum HookSite {
     /// `read_row_latest_into`), after its first visible-seqno read and before it loads the
     /// view. The callback may set this site again, to run in the read's next try too.
     LatestViewLoad,
+    /// At the start of the next `shrink` round, before it reclaims and checks what pins
+    /// retired space: where a test releases a pin between rounds (#1107).
+    ShrinkRound,
     /// In the next `shrink` round, after it has read the catalog and before it relocates
     /// anything: where a compaction or `drop_table` can commit under it.
     ShrinkRelocates,

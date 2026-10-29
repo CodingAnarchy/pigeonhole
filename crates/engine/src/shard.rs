@@ -90,6 +90,11 @@ const COMPACTION_BACKOFF_CAP: u64 = 60;
 const FLUSH_BACKOFF_CAP: u64 = 100;
 const ROOM_RECHECK_CAP: u64 = 100;
 
+/// How soon a wait for memtable arena room on a moving clock first looks again for room
+/// that nothing announced (a snapshot dropped on another thread, a reader process's unpin):
+/// 1 ms, doubling up to `ROOM_RECHECK_CAP` times this.
+const ROOM_RECHECK_NANOS: u64 = 1_000_000;
+
 /// A member's `room_since`: the shard clock in milliseconds (wrapping after 49 days, never
 /// 0) when it first waited for arena room.
 fn room_stamp(now: u64) -> u32 {
@@ -474,7 +479,6 @@ pub(crate) struct Shared {
     /// Backoff bases (`EngineOptions`; issue #141).
     pub compaction_backoff_nanos: u64,
     pub flush_backoff_nanos: u64,
-    pub room_recheck_nanos: u64,
     /// `EngineOptions::commit_spin_nanos` (D198).
     pub commit_spin_nanos: u64,
     /// The writer keeps a stale-tail index beside each memtable (D194, D199).
@@ -2552,25 +2556,19 @@ impl StallWait {
         }
     }
 
-    /// Arms the re-check timer unless one is pending: it kicks the shard after `base` (1 ms
-    /// by default), then twice as long each time up to 100 times `base`, so freed room is
-    /// seen within about 100 ms.
-    fn arm_recheck(
-        &mut self,
-        vfs: &VfsRef,
-        base: u64,
-        ctx: &mut ShardContext<'_, ShardMsg>,
-        me: ShardId,
-    ) {
+    /// Arms the re-check timer unless one is pending: it kicks the shard after 1 ms
+    /// (`ROOM_RECHECK_NANOS`), then twice as long each time up to 100 times that, so freed
+    /// room is seen within about 100 ms.
+    fn arm_recheck(&mut self, vfs: &VfsRef, ctx: &mut ShardContext<'_, ShardMsg>, me: ShardId) {
         if self.recheck.as_ref().is_some_and(|t| !t.finished()) {
             return;
         }
         self.recheck_nanos = if self.recheck_nanos == 0 {
-            base
+            ROOM_RECHECK_NANOS
         } else {
             self.recheck_nanos
                 .saturating_mul(2)
-                .min(base.saturating_mul(ROOM_RECHECK_CAP))
+                .min(ROOM_RECHECK_NANOS * ROOM_RECHECK_CAP)
         };
         let at = ctx.now_nanos().saturating_add(self.recheck_nanos);
         self.recheck = Some(arm_kick(vfs, at, ctx, me));
@@ -4648,7 +4646,7 @@ impl ShardState {
             w.rearm_if_fired(frozen, now, oldest, timeout, &self.shared.vfs, ctx, me);
             if !frozen {
                 // As for a room wait: freed chunks are announced to nobody (issue #141).
-                w.arm_recheck(&self.shared.vfs, self.shared.room_recheck_nanos, ctx, me);
+                w.arm_recheck(&self.shared.vfs, ctx, me);
             }
         }
         if idle {
@@ -5948,12 +5946,7 @@ impl ShardState {
             // Room freed by a snapshot dropped on another thread or a reader process's
             // unpin is announced to nobody: look again soon (issue #141).
             if let Some(w) = &mut self.room_wait {
-                w.arm_recheck(
-                    &self.shared.vfs,
-                    self.shared.room_recheck_nanos,
-                    ctx,
-                    self.id,
-                );
+                w.arm_recheck(&self.shared.vfs, ctx, self.id);
             }
         }
         if refuse || idle {

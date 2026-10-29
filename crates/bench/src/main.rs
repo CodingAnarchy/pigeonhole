@@ -276,9 +276,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 a.in_flight = Some(n);
             }
             "--offered-rate" => a.offered_rate = Some(parse(&arg, it.next())?),
-            "--write-buffer" | "--memtable-budget" => {
-                a.write_buffer = Some(parse(&arg, it.next())?)
-            }
+            "--write-buffer" => a.write_buffer = Some(parse(&arg, it.next())?),
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
             "--cache-model" => {
                 a.cache_model = Some(match it.next().as_deref() {
@@ -590,143 +588,167 @@ fn bench(a: &Args) -> Result<Suite, String> {
         eprintln!("warning: debug build; numbers are meaningless. Use --release.");
     }
     let mut seq = 0;
-    let result = (|| -> Result<(), String> {
-        if a.command == "placement" {
-            let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
-            let c = config(a, WorkloadKind::SkewedMultiShard)?;
-            let runner = pigeonhole(a, Some(n));
-            seq += 1;
-            let dir = root.join(format!("placement-{seq}"));
-            std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-            let opts = PlacementOptions {
-                offered_rate: a
-                    .offered_rate
-                    .unwrap_or(PLACEMENT_RATE_PER_SHARD * n as f64),
-                clients: a.threads.unwrap_or(n.max(2)),
-                settle_bound: PLACEMENT_SETTLE_BOUND,
-                window: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(10.0).max(1.0)),
-            };
-            eprintln!(
-                "running the placement check on pigeonhole ({}), {:.0} writes/s offered ...",
-                runner.describe(),
-                opts.offered_rate
-            );
-            let p = runner.run_placement(&c, &dir, &opts);
-            let _ = std::fs::remove_dir_all(&dir);
-            suite.placement = Some(p?);
-            return Ok(());
-        }
-        if a.command == "app-owned" {
-            // D247 (perf287's L): the application-owned API on the defaults, which the judged
-            // inline runs (pre-split, balancer off) do not measure. Pinned, as engine-owned
-            // shards are by default (D235).
-            let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
-            let c = config(a, WorkloadKind::SkewedMultiShard)?;
-            let r = pigeonhole(a, Some(n))
-                .cross_batches(true)
-                .cross_readers(a.mixed)
-                .inline_engine_owned(a.engine_owned);
-            // Engine-owned, the engine pins its own shard threads (D235); the issuing threads
-            // are left unpinned so they don't take the shards' CPUs.
-            let run = one_inline(a, &root, &mut seq, &r, &c, !a.engine_owned)?;
-            suite.results.push(run);
-            return Ok(());
-        }
-        if a.command == "scaling" {
-            // The gate (D204): application-owned shards, each thread writing its share
-            // inline, at 1 shard and at N (default: one per physical core, D220). D231: the
-            // table is split at the measured writes' quantiles up front and the balancer stays
-            // off, so the run measures per-shard throughput; placement is judged on its own
-            // (`placement`).
-            let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
-            let c = config(a, WorkloadKind::SkewedMultiShard)?;
-            let gate = |shards| pigeonhole(a, Some(shards)).presplit_writes(true);
-            // D235: judged with each shard's thread pinned to a CPU of its own (D220's
-            // order), as a thread-per-core application runs; the same runs unpinned are
-            // reported beside it.
-            let single = one_inline(a, &root, &mut seq, &gate(1), &c, true)?;
-            let multi = one_inline(a, &root, &mut seq, &gate(n), &c, true)?;
-            suite.scaling = Some(Scaling::new(n, &single, &multi));
-            suite.results.extend([single, multi]);
-            let single = one_inline(a, &root, &mut seq, &gate(1), &c, false)?;
-            let multi = one_inline(a, &root, &mut seq, &gate(n), &c, false)?;
-            suite.scaling_unpinned = Some(Scaling::new(n, &single, &multi));
-            suite.results.extend([single, multi]);
-            // Reported beside it, not gating (D204): engine-owned with synchronous clients,
-            // four per shard, at half the shards, so the clients have cores of their own.
-            let half = (n / 2).max(1);
-            let mut c = c;
-            c.threads = a.threads.unwrap_or(4 * half);
-            let single = one(a, &root, &mut seq, &mut pigeonhole(a, Some(1)), &c)?;
-            let multi = one(a, &root, &mut seq, &mut pigeonhole(a, Some(half)), &c)?;
-            suite.scaling_sync = Some(Scaling::new(half, &single, &multi));
-            suite.results.extend([single, multi]);
-            return Ok(());
-        }
-        let kinds: Vec<WorkloadKind> = if a.command == "all" {
-            WorkloadKind::ALL.to_vec()
-        } else {
-            vec![a.command.parse()?]
-        };
-        for kind in kinds {
-            let c = config(a, kind)?;
-            if kind == WorkloadKind::GroupCommit && a.engines.iter().any(|e| e == "pigeonhole") {
-                // The target's shape (D213): one shard per core (physical, D220), the table
-                // split over all of them, each shard's thread keeping commits in flight inline
-                // (D204's driver). The client-thread sweep below stays as a secondary report.
-                let cores = pigeonhole_io::sys::default_shards();
-                let n = a.shards.unwrap_or(cores);
-                let r = pigeonhole(a, Some(n)).group_sync(true).presplit(true);
-                let inline = WorkloadConfig {
-                    operations: a.inline_ops.unwrap_or(c.operations),
-                    ..c.clone()
-                };
-                // D235: judged pinned, reported unpinned.
-                let run = one_inline(a, &root, &mut seq, &r, &inline, true)?;
-                let in_flight = a.in_flight.unwrap_or(INLINE_IN_FLIGHT);
-                suite.group_commit = Some(GroupCommit::new(n, cores, in_flight, &run));
-                suite.results.push(run);
-                let run = one_inline(a, &root, &mut seq, &r, &inline, false)?;
-                suite.group_commit_unpinned = Some(GroupCommit::new(n, cores, in_flight, &run));
-                suite.results.push(run);
-            }
-            let threads = match (kind, a.threads) {
-                (WorkloadKind::GroupCommit, None) => GROUP_COMMIT_THREADS.to_vec(),
-                _ => vec![c.threads],
-            };
-            for engine in &a.engines {
-                for &t in &threads {
-                    let c = WorkloadConfig {
-                        threads: t,
-                        ..c.clone()
-                    };
-                    let mut r = runner(a, engine, kind)?;
-                    suite.results.push(one(a, &root, &mut seq, r.as_mut(), &c)?);
-                    // D246: the default (tablet changes on) is judged against the same build
-                    // with tablet changes off, its partitions one per shard.
-                    if kind == WorkloadKind::CrossShardContention
-                        && engine == "pigeonhole"
-                        && !a.no_tablet_changes
-                    {
-                        let mut off = pigeonhole(a, None).tablet_changes(false);
-                        suite.results.push(one(a, &root, &mut seq, &mut off, &c)?);
-                        // D246 (owner, 2026-10-14): tablets on against off is judged with
-                        // packing off, since packing's half-load target caps how many shards
-                        // the load spreads over; the default run stays RocksDB's comparison.
-                        let mut unpacked = pigeonhole(a, None).packing(false);
-                        suite
-                            .results
-                            .push(one(a, &root, &mut seq, &mut unpacked, &c)?);
-                    }
-                }
-            }
-        }
-        Ok(())
-    })();
+    let result = match a.command.as_str() {
+        "placement" => bench_placement(a, &root, &mut seq, &mut suite),
+        "app-owned" => bench_app_owned(a, &root, &mut seq, &mut suite),
+        "scaling" => bench_scaling(a, &root, &mut seq, &mut suite),
+        _ => bench_workloads(a, &root, &mut seq, &mut suite),
+    };
     if a.dir.is_none() {
         let _ = std::fs::remove_dir_all(&root);
     }
     result.map(|()| suite)
+}
+
+/// `placement`: the balancer placement check (D231).
+fn bench_placement(a: &Args, root: &Path, seq: &mut u32, suite: &mut Suite) -> Result<(), String> {
+    let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
+    let c = config(a, WorkloadKind::SkewedMultiShard)?;
+    let runner = pigeonhole(a, Some(n));
+    *seq += 1;
+    let dir = root.join(format!("placement-{seq}"));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let opts = PlacementOptions {
+        offered_rate: a
+            .offered_rate
+            .unwrap_or(PLACEMENT_RATE_PER_SHARD * n as f64),
+        clients: a.threads.unwrap_or(n.max(2)),
+        settle_bound: PLACEMENT_SETTLE_BOUND,
+        window: std::time::Duration::from_secs_f64(a.min_secs.unwrap_or(10.0).max(1.0)),
+    };
+    eprintln!(
+        "running the placement check on pigeonhole ({}), {:.0} writes/s offered ...",
+        runner.describe(),
+        opts.offered_rate
+    );
+    let p = runner.run_placement(&c, &dir, &opts);
+    let _ = std::fs::remove_dir_all(&dir);
+    suite.placement = Some(p?);
+    Ok(())
+}
+
+/// `app-owned`: the application-owned row on the defaults (D247).
+fn bench_app_owned(a: &Args, root: &Path, seq: &mut u32, suite: &mut Suite) -> Result<(), String> {
+    // D247 (perf287's L): the application-owned API on the defaults, which the judged
+    // inline runs (pre-split, balancer off) do not measure. Pinned, as engine-owned
+    // shards are by default (D235).
+    let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
+    let c = config(a, WorkloadKind::SkewedMultiShard)?;
+    let r = pigeonhole(a, Some(n))
+        .cross_batches(true)
+        .cross_readers(a.mixed)
+        .inline_engine_owned(a.engine_owned);
+    // Engine-owned, the engine pins its own shard threads (D235); the issuing threads
+    // are left unpinned so they don't take the shards' CPUs.
+    let run = one_inline(a, root, seq, &r, &c, !a.engine_owned)?;
+    suite.results.push(run);
+    Ok(())
+}
+
+/// `scaling`: the scaling gate (D204), pinned and unpinned, and the synchronous-client report.
+fn bench_scaling(a: &Args, root: &Path, seq: &mut u32, suite: &mut Suite) -> Result<(), String> {
+    // The gate (D204): application-owned shards, each thread writing its share
+    // inline, at 1 shard and at N (default: one per physical core, D220). D231: the
+    // table is split at the measured writes' quantiles up front and the balancer stays
+    // off, so the run measures per-shard throughput; placement is judged on its own
+    // (`placement`).
+    let n = a.shards.unwrap_or_else(pigeonhole_io::sys::default_shards);
+    let c = config(a, WorkloadKind::SkewedMultiShard)?;
+    let gate = |shards| pigeonhole(a, Some(shards)).presplit_writes(true);
+    // D235: judged with each shard's thread pinned to a CPU of its own (D220's
+    // order), as a thread-per-core application runs; the same runs unpinned are
+    // reported beside it.
+    let single = one_inline(a, root, seq, &gate(1), &c, true)?;
+    let multi = one_inline(a, root, seq, &gate(n), &c, true)?;
+    suite.scaling = Some(Scaling::new(n, &single, &multi));
+    suite.results.extend([single, multi]);
+    let single = one_inline(a, root, seq, &gate(1), &c, false)?;
+    let multi = one_inline(a, root, seq, &gate(n), &c, false)?;
+    suite.scaling_unpinned = Some(Scaling::new(n, &single, &multi));
+    suite.results.extend([single, multi]);
+    // Reported beside it, not gating (D204): engine-owned with synchronous clients,
+    // four per shard, at half the shards, so the clients have cores of their own.
+    let half = (n / 2).max(1);
+    let mut c = c;
+    c.threads = a.threads.unwrap_or(4 * half);
+    let single = one(a, root, seq, &mut pigeonhole(a, Some(1)), &c)?;
+    let multi = one(a, root, seq, &mut pigeonhole(a, Some(half)), &c)?;
+    suite.scaling_sync = Some(Scaling::new(half, &single, &multi));
+    suite.results.extend([single, multi]);
+    Ok(())
+}
+
+/// A workload, or `all` of them, on every engine asked for.
+fn bench_workloads(a: &Args, root: &Path, seq: &mut u32, suite: &mut Suite) -> Result<(), String> {
+    let kinds: Vec<WorkloadKind> = if a.command == "all" {
+        WorkloadKind::ALL.to_vec()
+    } else {
+        vec![a.command.parse()?]
+    };
+    for kind in kinds {
+        let c = config(a, kind)?;
+        if kind == WorkloadKind::GroupCommit && a.engines.iter().any(|e| e == "pigeonhole") {
+            bench_group_commit_inline(a, root, seq, suite, &c)?;
+        }
+        let threads = match (kind, a.threads) {
+            (WorkloadKind::GroupCommit, None) => GROUP_COMMIT_THREADS.to_vec(),
+            _ => vec![c.threads],
+        };
+        for engine in &a.engines {
+            for &t in &threads {
+                let c = WorkloadConfig {
+                    threads: t,
+                    ..c.clone()
+                };
+                let mut r = runner(a, engine, kind)?;
+                suite.results.push(one(a, root, seq, r.as_mut(), &c)?);
+                // D246: the default (tablet changes on) is judged against the same build
+                // with tablet changes off, its partitions one per shard.
+                if kind == WorkloadKind::CrossShardContention
+                    && engine == "pigeonhole"
+                    && !a.no_tablet_changes
+                {
+                    let mut off = pigeonhole(a, None).tablet_changes(false);
+                    suite.results.push(one(a, root, seq, &mut off, &c)?);
+                    // D246 (owner, 2026-10-14): tablets on against off is judged with
+                    // packing off, since packing's half-load target caps how many shards
+                    // the load spreads over; the default run stays RocksDB's comparison.
+                    let mut unpacked = pigeonhole(a, None).packing(false);
+                    suite.results.push(one(a, root, seq, &mut unpacked, &c)?);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `group-commit`'s judged shape (D213), pinned and unpinned (D235).
+fn bench_group_commit_inline(
+    a: &Args,
+    root: &Path,
+    seq: &mut u32,
+    suite: &mut Suite,
+    c: &WorkloadConfig,
+) -> Result<(), String> {
+    // The target's shape (D213): one shard per core (physical, D220), the table
+    // split over all of them, each shard's thread keeping commits in flight inline
+    // (D204's driver). The client-thread sweep below stays as a secondary report.
+    let cores = pigeonhole_io::sys::default_shards();
+    let n = a.shards.unwrap_or(cores);
+    let r = pigeonhole(a, Some(n)).group_sync(true).presplit(true);
+    let inline = WorkloadConfig {
+        operations: a.inline_ops.unwrap_or(c.operations),
+        ..c.clone()
+    };
+    // D235: judged pinned, reported unpinned.
+    let run = one_inline(a, root, seq, &r, &inline, true)?;
+    let in_flight = a.in_flight.unwrap_or(INLINE_IN_FLIGHT);
+    suite.group_commit = Some(GroupCommit::new(n, cores, in_flight, &run));
+    suite.results.push(run);
+    let run = one_inline(a, root, seq, &r, &inline, false)?;
+    suite.group_commit_unpinned = Some(GroupCommit::new(n, cores, in_flight, &run));
+    suite.results.push(run);
+    Ok(())
 }
 
 fn write(path: &Option<PathBuf>, contents: &str) -> Result<(), String> {
