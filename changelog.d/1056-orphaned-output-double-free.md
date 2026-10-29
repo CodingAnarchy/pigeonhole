@@ -1,2 +1,0 @@
-### Fixed
-- **A compaction's output is freed once, not twice, when its table is dropped just before the compaction commits** (#1056). If a `drop_table` committed after a compaction had checked its table but before the compaction's own manifest commit, the manifest freed the compaction's output SST twice: once as an orphan, and again as the refused request's output, for a compaction with a purge guard or new blob files. Another flush or compaction allocating space between the two could lose an extent it still used, which it then published over free space. Present since 0.2.0.
