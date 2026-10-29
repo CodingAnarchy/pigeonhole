@@ -221,6 +221,34 @@ fn larger_than_ram_preset_splits_cold_and_hot_gets() {
 }
 
 #[test]
+fn pigeonhole_client_runs_report_the_engine_side_commit_latency() {
+    // #760: a client run reads the engine's commit latency histograms around the measured
+    // phase, so each measured put is one engine commit and the warmup's are not counted.
+    use pigeonhole_bench::{RunOptions, run_detailed};
+    let root = temp_dir("pigeonhole-engine-commit");
+    let config = WorkloadConfig::smoke(WorkloadKind::YcsbA);
+    let mut r = PigeonholeRunner::default()
+        .shards(2)
+        .memtable_budget(16 << 20);
+    let rec = run_detailed(&mut r, &config, &root, &RunOptions::default()).unwrap();
+    let puts = rec
+        .detail
+        .by_type
+        .iter()
+        .find(|t| t.op == "put")
+        .expect("ycsb-a has puts")
+        .stats
+        .count;
+    let engine = rec
+        .detail
+        .engine_commit
+        .expect("a Pigeonhole client run reports it");
+    assert_eq!(engine.commits, puts, "{engine:?}");
+    assert!(engine.p50_ns <= engine.p99_ns && engine.p99_ns <= engine.p999_ns);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+#[test]
 fn pigeonhole_transfers_are_split_by_shard_locality() {
     // #708: each transfer records under whether its two accounts were on one shard at the
     // start of the measured pass (`Runner::op_label`), never under the plain type name.
