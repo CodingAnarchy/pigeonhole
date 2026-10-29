@@ -62,14 +62,22 @@ pub struct IoBuf {
 /// ```
 pub struct BufPool {
     max: usize,
+    /// The largest capacity it keeps: a bigger buffer is freed when dropped.
+    max_capacity: usize,
     free: Mutex<Vec<IoBuf>>,
 }
 
 impl BufPool {
     /// A pool keeping at most `max` buffers.
     pub fn new(max: usize) -> Arc<BufPool> {
+        Self::with_max_capacity(max, usize::MAX)
+    }
+
+    /// A pool keeping at most `max` buffers of at most `max_capacity` bytes each.
+    fn with_max_capacity(max: usize, max_capacity: usize) -> Arc<BufPool> {
         Arc::new(Self {
             max,
+            max_capacity,
             free: Mutex::new(Vec::new()),
         })
     }
@@ -95,9 +103,33 @@ impl BufPool {
         buf
     }
 
+    /// As [`BufPool::take`], but a recycled buffer more than twice the capacity `len` needs
+    /// is freed instead, so a block the cache keeps is never charged for much more than its
+    /// bytes ([`IoBuf::reused`]).
+    fn take_fitting(self: &Arc<Self>, len: usize) -> IoBuf {
+        let recycled = self
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .filter(|b| b.capacity() <= 2 * round_up(len).max(IoBuf::ALIGN));
+        let mut buf = match recycled {
+            Some(mut b) => {
+                b.resize(len);
+                b
+            }
+            None => IoBuf::zeroed(len),
+        };
+        buf.recycle = Some(Arc::clone(self));
+        buf
+    }
+
     /// Takes back `buf` (its handle already cleared, so the pool never holds an `Arc` of
     /// itself), or lets it go if the pool is full.
     fn put(&self, buf: IoBuf) {
+        if buf.capacity() > self.max_capacity {
+            return;
+        }
         let mut free = self.free.lock().unwrap_or_else(PoisonError::into_inner);
         if free.len() < self.max {
             free.push(buf);
@@ -112,6 +144,21 @@ impl BufPool {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Free buffers each thread's pool keeps ([`IoBuf::reused`]): a read path holds a buffer or
+/// two at a time, and a block kept by the cache comes back when it is evicted.
+const THREAD_POOL_MAX: usize = 4;
+
+/// The largest buffer a thread's pool keeps: a block read (16 KiB by default) and then some,
+/// not a large blob record's or a merged readahead run's buffer, which would otherwise sit
+/// idle in every reading thread's pool.
+const THREAD_POOL_MAX_CAPACITY: usize = 64 << 10;
+
+thread_local! {
+    /// This thread's [`IoBuf::reused`] buffers.
+    static THREAD_POOL: Arc<BufPool> =
+        BufPool::with_max_capacity(THREAD_POOL_MAX, THREAD_POOL_MAX_CAPACITY);
 }
 
 impl fmt::Debug for BufPool {
@@ -235,6 +282,28 @@ impl IoBuf {
     /// Alignment of every buffer.
     pub const ALIGN: usize = pigeonhole_format::PAGE_SIZE;
 
+    /// A buffer of `len` initialized bytes for the caller to overwrite (#709): one this
+    /// thread used before, from its small [`BufPool`], with whatever bytes a previous read
+    /// left (zeros past its old length), or a new zeroed one; one more than twice the size
+    /// needed is freed rather than reused. It goes back to that pool when
+    /// dropped, on any thread. For buffers a read or a decoder fills completely before
+    /// anyone reads them; skips the allocation and zero-fill of [`IoBuf::zeroed`].
+    ///
+    /// ```
+    /// use pigeonhole_io::IoBuf;
+    ///
+    /// let mut a = IoBuf::reused(4096);
+    /// a.fill(7);
+    /// let p = a.as_ptr();
+    /// drop(a);
+    /// let b = IoBuf::reused(100);
+    /// assert_eq!(b.as_ptr(), p);
+    /// assert_eq!(b.len(), 100);
+    /// ```
+    pub fn reused(len: usize) -> Self {
+        THREAD_POOL.with(|pool| pool.take_fitting(len))
+    }
+
     /// A zeroed buffer of `len` bytes (capacity rounded up to [`IoBuf::ALIGN`]).
     pub fn zeroed(len: usize) -> Self {
         let cap = round_up(len);
@@ -281,7 +350,9 @@ impl IoBuf {
     /// buffer in a registered slot is copied to the heap and its slot given back, so the
     /// pool does not run dry; a heap buffer is returned as is.
     pub fn detached(self) -> IoBuf {
-        if self.pool.is_none() {
+        // A reused buffer more than its length needs (#709) is copied too, so what keeps it
+        // (the block cache charges a buffer's whole capacity) is charged as for a new one.
+        if self.pool.is_none() && (self.recycle.is_none() || self.cap <= round_up(self.len)) {
             return self;
         }
         let mut heap = IoBuf::zeroed(self.len);
@@ -429,6 +500,62 @@ impl fmt::Debug for IoBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_pool_with_a_capacity_cap_frees_larger_buffers() {
+        let pool = BufPool::with_max_capacity(4, 64 << 10);
+        drop(pool.take_fitting(128 << 10));
+        assert_eq!(pool.held(), 0, "a buffer over the cap is freed, not kept");
+        drop(pool.take_fitting(64 << 10));
+        assert_eq!(pool.held(), 1);
+        // One that grew past the cap while reused is freed too.
+        drop(pool.take_fitting(100 << 10));
+        assert_eq!(pool.held(), 0);
+    }
+
+    #[test]
+    fn detaching_a_reused_buffer_copies_it_only_if_it_is_larger_than_needed() {
+        let pool = BufPool::new(2);
+        drop(pool.take_fitting(32 << 10));
+        // Reused for 20 KiB: capacity 32 KiB, more than the 20 KiB it needs, so detaching
+        // copies it into a buffer of just that.
+        let mut a = pool.take_fitting(20 << 10);
+        a.fill(3);
+        let p = a.as_ptr();
+        let kept = a.detached();
+        assert_ne!(kept.as_ptr(), p);
+        assert_eq!(kept.capacity(), 20 << 10);
+        assert!(kept.iter().all(|&x| x == 3));
+        // One that fits stays where it is (a pool of its own: the 32 KiB buffer went back to
+        // the first when it was copied).
+        let fits = BufPool::new(2);
+        drop(fits.take_fitting(20 << 10));
+        let b = fits.take_fitting(20 << 10);
+        let p = b.as_ptr();
+        assert_eq!(b.detached().as_ptr(), p);
+    }
+
+    #[test]
+    fn reused_buffers_come_back_and_never_much_larger_than_needed() {
+        let pool = BufPool::new(2);
+        let mut a = pool.take_fitting(64 << 10);
+        a.fill(9);
+        let p = a.as_ptr();
+        drop(a);
+        // Within twice the capacity it needs: the same allocation, its bytes as left.
+        let b = pool.take_fitting(40 << 10);
+        assert_eq!(b.as_ptr(), p);
+        assert_eq!(b.len(), 40 << 10);
+        assert!(b.iter().all(|&x| x == 9));
+        drop(b);
+        // More than twice: freed, and a fresh zeroed buffer of just the size needed.
+        let c = pool.take_fitting(4 << 10);
+        assert_eq!(c.capacity(), 4 << 10);
+        assert!(c.iter().all(|&x| x == 0));
+        assert_eq!(pool.held(), 0);
+        drop(c);
+        assert_eq!(pool.held(), 1);
+    }
+
     use super::*;
 
     #[test]

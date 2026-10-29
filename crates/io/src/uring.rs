@@ -505,11 +505,11 @@ impl File for UringFile {
     /// read without pinning its pages), or a plain buffer when none is free.
     fn read_buf(&self, len: usize) -> IoBuf {
         if len > POOL_SLOT_LEN {
-            return IoBuf::zeroed(len);
+            return IoBuf::reused(len);
         }
         self.pool()
             .and_then(|p| p.take(len))
-            .unwrap_or_else(|| IoBuf::zeroed(len))
+            .unwrap_or_else(|| IoBuf::reused(len))
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {

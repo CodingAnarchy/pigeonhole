@@ -205,10 +205,17 @@ fn a_scan_that_does_not_fill_the_cache_recycles_its_decompression_buffers() {
         };
         let (blocks, filled) = scan(true);
         let (_, uncached) = scan(false);
-        // Filling the cache: a read buffer and a decompression buffer per block, so the
-        // blocks are compressed and the test measures what it claims.
+        // Filling the cache: a new decompression buffer per block, which the cache keeps at
+        // exactly the block's length (so the blocks are compressed and the test measures what
+        // it claims), so at least one zeroed buffer per block. The read buffers are this
+        // thread's reused ones (#709), so few of those are new. The ceiling is 1.5 per block,
+        // not 1 plus a constant: a merged readahead reads runs of up to 4 blocks here, whose
+        // buffers vary in size, and a reused buffer more than twice a run's, or over the
+        // thread pool's 64 KiB cap, is replaced by a new one. That cost one more per run
+        // (about a quarter of a buffer per block) in practice; 1.5 leaves room, and stays
+        // well under the two zeroed buffers per block before #709.
         assert!(
-            filled >= 2 * blocks,
+            filled >= blocks && filled <= blocks * 3 / 2,
             "ahead {ahead} merge {merge}: {filled} zeroed for {blocks} blocks"
         );
         // Not filling it: the read buffers only (fewer when merged), and the pool's first
