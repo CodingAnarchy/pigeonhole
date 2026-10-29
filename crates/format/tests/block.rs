@@ -554,3 +554,83 @@ fn add_prefixed_refuses_an_index_block() {
     let mut b = BlockBuilder::index();
     assert!(b.add_prefixed(b"k", b"v", 0, 1).is_err());
 }
+
+/// `add_prefixed`'s one-copy header (all three varints below 0x80) and its varint fallback
+/// write what `add` writes when exactly one header field crosses 127/128: the shared
+/// prefix, the non-shared key bytes (with values and with empty ones), or the value length,
+/// each swept across the boundary.
+#[test]
+fn add_prefixed_matches_add_where_a_header_varint_crosses_0x80() {
+    let key = |row: &[u8], qual: &[u8]| {
+        Cell {
+            row: row.to_vec(),
+            qual: qual.to_vec(),
+            ts: 7,
+            seqno: 9,
+            kind: pigeonhole_format::key::Kind::Put,
+        }
+        .encode()
+    };
+    let mut cases: Vec<Vec<(Vec<u8>, Vec<u8>)>> = Vec::new();
+    // Value length 120..=136 with short keys: only the value varint crosses.
+    cases.push(
+        (120..=136u8)
+            .map(|n| (key(b"r", &[b'a' + n % 26, n]), vec![n; n as usize]))
+            .collect(),
+    );
+    // Non-shared key bytes across 128: keys of about 115..=145 bytes; at a restart (shared 0)
+    // the whole key is non-shared.
+    cases.push(
+        (110..=140usize)
+            .map(|n| {
+                let mut qual = vec![b'x'; n];
+                qual.push(n as u8);
+                (key(b"r", &qual), b"v".to_vec())
+            })
+            .collect(),
+    );
+    // Empty values (deletes) with whole keys of every length across 128 at restarts: shared 0,
+    // non-shared 128 and value 0 OR to exactly 0x80, which a guard admitting 0x80 would write
+    // as a lone byte (simp724's review). It is one of the fields-each-0-or-128 cases (a delete
+    // between restarts with shared 128 is another); one is enough to fail such a guard.
+    cases.push(
+        (100..=150usize)
+            .map(|n| {
+                let mut qual = vec![b'y'; n];
+                qual.push(n as u8);
+                (key(b"r", &qual), Vec::new())
+            })
+            .collect(),
+    );
+    // Shared prefix across 128: rows of 120..=136 bytes sharing all but their last byte.
+    cases.push(
+        (120..=136usize)
+            .flat_map(|n| {
+                let mut row = vec![b'p'; n];
+                row.push(b'z');
+                [
+                    (key(&row, b"a"), b"1".to_vec()),
+                    (key(&row, b"b"), b"2".to_vec()),
+                ]
+            })
+            .collect(),
+    );
+    for entries in &mut cases {
+        entries.sort();
+        entries.dedup_by(|a, b| a.0 == b.0);
+        for interval in [1, 2, 16] {
+            let mut plain = BlockBuilder::data(interval);
+            let mut prefixed = BlockBuilder::data(interval);
+            let mut prev: Vec<u8> = Vec::new();
+            for (k, v) in entries.iter() {
+                plain.add(k, v).unwrap();
+                let lcp = common_prefix_len(k, &prev);
+                prefixed
+                    .add_prefixed(k, v, lcp, row_prefix_len(k).unwrap())
+                    .unwrap();
+                prev.clone_from(k);
+            }
+            assert_eq!(plain.finish(), prefixed.finish(), "interval {interval}");
+        }
+    }
+}
