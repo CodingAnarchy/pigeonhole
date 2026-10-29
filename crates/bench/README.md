@@ -1,6 +1,6 @@
 # pigeonhole-bench
 
-Benchmark workloads and comparison runners for Pigeonhole: YCSB A–F, sparse-wide, time series with TTL, graph adjacency and skewed multi-shard writes. They run against Pigeonhole and, behind the cargo features `rocksdb`, `sqlite` and `fjall`, against RocksDB, SQLite (EAV) and fjall. Results include p50/p99/p99.9 latency and throughput, as JSON and markdown.
+Benchmark workloads and comparison runners for Pigeonhole: YCSB A–F, sparse-wide, time series with TTL, graph adjacency and skewed multi-shard writes. They run against Pigeonhole and, behind the cargo features `rocksdb` and `sqlite`, against RocksDB and SQLite (EAV). Results include p50/p99/p99.9 latency and throughput, as JSON and markdown.
 
 ```sh
 cargo run -p pigeonhole-bench --release -- all --json out.json

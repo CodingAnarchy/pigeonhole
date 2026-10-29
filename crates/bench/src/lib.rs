@@ -1,9 +1,9 @@
 //! Benchmark workloads and comparison runners for Pigeonhole.
 //!
 //! A [`Workload`] generates operations; a [`Runner`] executes them against one store; a
-//! [`Report`] summarizes latency percentiles and throughput. Runners for RocksDB, SQLite
-//! (EAV) and fjall sit behind the cargo features `rocksdb`, `sqlite` and `fjall`, so their
-//! dependencies never enter the default build.
+//! [`Report`] summarizes latency percentiles and throughput. Runners for RocksDB and SQLite
+//! (EAV) sit behind the cargo features `rocksdb` and `sqlite`, so their dependencies never
+//! enter the default build.
 //!
 //! Every run records its seed and hardware description; results are labeled non-reference
 //! until reference hardware exists (decision D5). The `phdb-bench` binary drives the
@@ -42,8 +42,6 @@ pub use report::{
     LatencyStats, OpTypeStats, Placement, ReadSplit, ReaderProcesses, Riders, Rounds, RunDetail,
     RunRecord, SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
 };
-#[cfg(feature = "fjall")]
-pub use runners::fjall::FjallRunner;
 pub use runners::inline::INLINE_IN_FLIGHT;
 pub use runners::pigeonhole::DEFAULT_MEMTABLE_BUDGET;
 pub use runners::placement::{PLACEMENT_RATE_PER_SHARD, PLACEMENT_SETTLE_BOUND, PlacementOptions};
@@ -100,16 +98,14 @@ pub enum WorkloadKind {
     /// Counters (D247): from [`COUNTER_THREADS`] clients, 90% increments of a Zipfian row's
     /// counter ([`BenchOp::Incr`]) and 10% reads of one ([`BenchOp::ReadCounter`]). Pigeonhole
     /// increments a counter family without reading it; RocksDB uses a merge operator (an
-    /// `i64` add), SQLite an upsert, fjall a locked read-modify-write. Not in `all`: the gate's
-    /// `contended` step runs it.
+    /// `i64` add), SQLite an upsert. Not in `all`: the gate's `contended` step runs it.
     Counters,
     /// Transfers (D247, reported): from [`COUNTER_THREADS`] clients, each operation moves one
     /// unit between two Zipfian accounts in one transaction that reads both
     /// ([`BenchOp::Transfer`]). Pigeonhole runs an optimistic `Transaction`, retried on a
     /// conflict (counted, [`RunDetail::txn_conflicts`]); RocksDB runs an
-    /// `OptimisticTransactionDB` transaction (or `TransactionDB`'s, as `rocksdb-txn`) and fjall
-    /// an optimistic write transaction, each retried on a conflict (D274); SQLite uses an
-    /// immediate transaction. Not in `all`.
+    /// `OptimisticTransactionDB` transaction (or `TransactionDB`'s, as `rocksdb-txn`), retried on
+    /// a conflict (D274); SQLite uses an immediate transaction. Not in `all`.
     Transfer,
     /// Sparse-wide with deletes (D247, reported): [`WorkloadKind::SparseWide`]'s mix with 5% of
     /// the operations deleting, half a column ([`BenchOp::DeleteColumn`]) and half a whole row
@@ -577,7 +573,7 @@ pub const TRANSFER_CROSS_SHARD: &str = "transfer (cross-shard)";
 
 /// A store under test.
 pub trait Runner {
-    /// Store name for reports (`pigeonhole`, `rocksdb`, `sqlite-eav`, `fjall`).
+    /// Store name for reports (`pigeonhole`, `rocksdb`, `sqlite-eav`).
     fn name(&self) -> &'static str;
 
     /// Opens a fresh store in `dir`.

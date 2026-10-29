@@ -125,7 +125,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D107](phase-1.md#d107) — Sparse-wide: what does "1M rows × 0 to 10K qualifiers, Zipfian" mean · bench; sizes grow in #52
 - [D108](phase-1.md#d108) — comparison durability is "written to the OS, not fsynced" unless `--sync` · bench
 - [D109](phase-1.md#d109) — reproducibility tolerance · bench
-- [D110](phase-1.md#d110) — license exceptions for fjall's dependencies · bench
+- [D110](phase-1.md#d110) — license exceptions for fjall's dependencies · bench · **retired 2026-10-29** (fjall runner dropped)
 - [D111](phase-1.md#d111) — CI builds the bench crate without the `rocksdb` feature · bench
 - [D112](phase-1.md#d112) — YCSB fidelity limits imposed by `BenchOp` · deferred to #54 (Phase 2)
 - [D113](phase-1.md#d113) — Time series: TTL never expires during a run · deferred to #54 (Phase 2)

@@ -117,14 +117,6 @@ fn every_workload_on_sqlite() {
     });
 }
 
-#[cfg(feature = "fjall")]
-#[test]
-fn every_workload_on_fjall() {
-    smoke_all("fjall", |_| {
-        Box::new(pigeonhole_bench::FjallRunner::default())
-    });
-}
-
 #[test]
 fn warmup_is_run_but_not_recorded() {
     use pigeonhole_bench::{RunOptions, run_detailed};
@@ -185,13 +177,6 @@ fn describe_reports_memory_budget() {
             .memory(m)
             .describe()
             .contains("page_cache=40MiB")
-    );
-    #[cfg(feature = "fjall")]
-    assert!(
-        pigeonhole_bench::FjallRunner::default()
-            .memory(m)
-            .describe()
-            .contains("write_buffer=32MiB cache=8MiB")
     );
 }
 
