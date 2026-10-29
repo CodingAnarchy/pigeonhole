@@ -66,6 +66,7 @@ A reader's oldest live snapshot pins the writer's state as of that snapshot: the
 - **This is the reader's responsibility.** Take a snapshot per unit of work, drop it when done, and take a new one for the next.
 - **Watch it from the writer:** `engine_metrics()` reports `reader_slots_active` out of `reader_slots`, `reader_slots_reclaimed`, and how far the oldest reader snapshot lags the current state, as `reader_pin_seqno_lag` (commits). A lag that only grows is a reader holding a snapshot.
 - A reader process's backup holds its snapshot for the whole copy (ICR 0049), so plan for that on a busy writer.
+- **It also holds file space.** A reader's snapshot or backup keeps the SST space it reads, so a `shrink` meanwhile gives back less. It never grows the file to work around the pin; call `shrink` again once the snapshot is dropped for the rest.
 
 ## Limits
 Every limit is an error, never a hang:
@@ -87,7 +88,7 @@ Every limit is an error, never a hang:
   - **Keeping the descriptor:** on Linux the slot's lock lives on in the child, so if the parent dies first, its slot stays held until the child exits.
   - **Only `fork(3)` is detected,** through `pthread_atfork`, as Python's `os.fork` and `multiprocessing` use it. `_Fork`, `vfork` and a raw `clone` syscall skip the fork handlers: never use a reader after those without `exec`.
 - **Write permission on the file.** A reader opens the file read-write (D36), because the processes coordinate with byte-range locks, some of them exclusive. It writes nothing.
-- **Same build layout.** The writer and every reader need the same shared-memory layout. Stop reader processes before upgrading the writer: a writer with a newer layout fails with `ShmVersionMismatch` while older readers are attached. Upgrade reader processes in lockstep with the writer: this release's layout (5, D281) adds the row caches' write watermarks, and layout 4 (D277) gave memtable nodes a stale-tail field, so readers from earlier releases can't attach to a writer from this one, nor the reverse (`ShmVersionMismatch`). Once every older process has closed, the new writer rebuilds the shared memory.
+- **Same build layout.** The writer and every reader need the same shared-memory layout. Stop reader processes before upgrading the writer: a writer with a newer layout fails with `ShmVersionMismatch` while older readers are attached. Upgrade reader processes in lockstep with the writer: this release's layout (6, D278) holds decided cross-shard commits in a new shared-memory word, layout 5 (D281) added the row caches' write watermarks, and layout 4 (D277) gave memtable nodes a stale-tail field, so readers from earlier releases can't attach to a writer from this one, nor the reverse (`ShmVersionMismatch`). Once every older process has closed, the new writer rebuilds the shared memory.
 - **Windows, across sessions.** Shared memory lives in the session's `Local\` namespace by default, so a reader in another session (a service and a desktop process, for example) can't attach. Give the writer and every reader the same `shm_dir` (`Options::shm_dir`, `ReaderOptions::shm_dir`): a file-backed mapping that any session can open.
 - **Block cache per process.** Each reader has its own block cache, 256 MiB by default (`ReaderOptions::block_cache`), on top of the writer's.
 

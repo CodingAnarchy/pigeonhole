@@ -1,6 +1,6 @@
 # Data modeling
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.3.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.3.4, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Pigeonhole is a sorted map. Good models make the reads you do most **one point get or one contiguous scan**. Everything below follows from three facts:
 
@@ -47,7 +47,7 @@ let pages = db
 | Small, hot attributes (status) | `max_versions(1)`, `Priority::High`, `compression(Compression::None)` if tiny |
 | Counters | `Family::counter()`; a `ttl` to keep only recent buckets |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
-| Large payloads read rarely | its own family; scan other families without touching it. `blob_threshold` keeps them out of the family's tree |
+| Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
 
 Do not split just to organize: every family is another tree to flush and compact. A `delete_row` also writes one marker per family.
@@ -143,7 +143,7 @@ let total = pages.get(b"com.example/a", "hits", b"total")?.and_then(|c| c.as_i64
 # assert_eq!(total, Some(3));
 # Ok::<(), pigeonhole::Error>(())
 ```
-- **One cell per counter.** `incr` writes at one fixed timestamp (0), so all increments of a counter are one version. Reads add up the increments not yet combined, and compaction combines them, so a hot counter stays one cell however often it is incremented.
+- **One cell per counter.** `incr` writes at one fixed timestamp (0), so all increments of a counter are one version. A read adds up the increments not yet combined. Flushes and compactions combine them, and a read that adds up many leaves its sum in memory, so the next reads of that counter start from there (D287, D291). A hot counter stays one cell, and its reads stay fast, however often it is incremented.
 - **Buckets.** `incr_at(family, qualifier, ts, delta)` adds to the version at timestamp `ts`: use it for per-period counts (hourly, daily). Each bucket is a version of its own, so read them with `.versions(n)` and window them with `.time_range(a..b)`. A TTL expires each bucket on its own; `max_versions(n)` makes reads return the newest `n` buckets but does not shrink storage, because compaction never changes what a counter family reads (deleting a newer bucket shows the older ones again). Bound the number of stored buckets with a TTL.
 
 ```rust
@@ -173,7 +173,7 @@ assert_eq!(days, [(today, 2), (today - DAY, 4)]);
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 
-- **Default:** each `put` gets the commit timestamp. Default timestamps never go backwards for a tablet, even across a clock step or restart.
+- **Default:** each `put` gets the commit timestamp. Default timestamps come from one allocator per database, so a later commit never gets an earlier default timestamp on any shard, even across a clock step or restart (D271).
 - **Event time:** `put_at(.., ts, ..)` for data that arrives late or out of order. A read of the newest version then returns the one with the **largest timestamp**, not the most recently written.
 - **Limit retention** with `max_versions(n)` (0 keeps all) and `ttl`.
 - **Read history** with `.versions(n)`, `.time_range(a..b)`.
@@ -182,7 +182,7 @@ A cell has many versions, newest first, each with a `u64` microsecond timestamp.
 **Deletes and version limits are not permanent for writes with older timestamps** (HBase semantics). Until compaction purges them, a delete keeps hiding any later write at or below its timestamp, and `max_versions` only limits what reads return. Once a compaction at the bottom of the tree has run with no open snapshot that still needs them, the delete markers and the versions beyond `max_versions` are gone for good. After that, a write with an older explicit timestamp (`put_at`, `delete_cell`) behaves as if they never existed: a `put_at` below a purged delete becomes visible, and deleting the newest version does not bring back a purged older one. Writes with default timestamps are never affected, because their timestamps are newer than anything a purge removes. If you rewrite history with explicit timestamps, write the replacement at a timestamp newer than the delete instead of relying on the delete to keep hiding it.
 
 ## Wide, overwritten rows
-An overwrite adds a version; it does not replace the old one in place. Older versions stay in the tree until a flush or compaction drops them. In the writer process, reads pass a column's older versions in the memtable in one jump (D194, D199), but in SSTs not yet compacted a read still steps over every version it passes, and it merges the row from each memtable and SST that holds part of it. A row that is wide (thousands of columns), overwritten often and read whole therefore has a higher read tail than a store that updates in place. This is the Phase 2 gate's documented gap ([D193](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-2.md#d193), [#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)), judged against SQLite on the reference machine ([D208](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-3.md#d208)). To keep it down:
+An overwrite adds a version; it does not replace the old one in place. Older versions stay in the tree until a flush or compaction drops them. In the writer and in reader processes alike, reads pass a column's older versions in the memtable in one jump (D194, D199, D277), but in SSTs not yet compacted a read still steps over every version it passes, and it merges the row from each memtable and SST that holds part of it. A row that is wide (thousands of columns), overwritten often and read whole therefore has a higher read tail than a store that updates in place. This is the Phase 2 gate's documented gap ([D193](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-2.md#d193), [#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)), judged against SQLite on the reference machine ([D208](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-3.md#d208)). To keep it down:
 
 - **Read only the columns you need.** `get` for one cell, or `qualifier_prefix` / `qualifier_range` on a row read or scan, seeks past the rest of the row instead of stepping through it.
 - **Set `max_versions`.** The default, 0, keeps every version, so not even compaction drops them. `max_versions(1)` lets flushes and compactions drop the older ones (unless an open snapshot still needs them).
@@ -214,9 +214,9 @@ db.compact()?;
 | One huge row for unbounded data | Row reads grow without limit | Bucket rows by time or hash |
 | Read-modify-write counters (`get`, add, `put`) | Races, extra reads | `incr` in a counter family |
 | One family per attribute | Many trees to flush and compact | Qualifiers inside a few families by access pattern |
-| Large payload in the same family as hot metadata | Scans of metadata decode payload blocks | Separate family, or a `blob_threshold` below the payload size |
+| Large payload in the same family as hot metadata | Scans of metadata decode payload blocks | Separate family, or a `blob_threshold` below the payload size (the default separates values over 4 KiB) |
 | Value predicates as a query engine over big ranges | They save materialization, not block reads | An inverted row keyed by the value |
-| Long-lived snapshots | Pin memory and space | Take, read, drop |
+| Long-lived snapshots | Pin memory and space; `shrink` gives back less while one is held | Take, read, drop |
 | `scan` with different-length byte-array literals (`b"a"..b"bcd"`) | Does not compile (end types differ) | Slices, `scan_prefix` or `scan_bounds` |
 | Relying on cross-family or cross-row atomicity beyond a row without a batch | Only a single row, or a `WriteBatch`, is atomic | Put it in one row, or use `write_batch()` |
-| Multi-row read-then-write invariants | Separate reads and writes race | `Transaction` (optimistic, retry on `Conflict`), or one row and `commit_if` |
+| Multi-row read-then-write invariants | Separate reads and writes race | `db.transact(...)` (optimistic; retries `Conflict` for you; see [Transactions](transactions.md)), or one row and `commit_if` |
