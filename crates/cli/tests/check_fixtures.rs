@@ -200,16 +200,47 @@ fn first_data_block(path: &Path, meta: &SstMeta) -> BlockAddr {
     addr
 }
 
-/// A database with one SST (uncompressed, so blocks can be rewritten in place), a blob file
-/// and a second, empty family, closed cleanly.
+/// Every data block of the SST, in order.
+fn data_blocks(path: &Path, meta: &SstMeta) -> Vec<BlockAddr> {
+    let addrs = |addr| {
+        let (logical, _) = block(path, meta, addr);
+        let mut it = Block::new(logical).unwrap().into_cursor();
+        it.seek_to_first().unwrap();
+        let mut out = Vec::new();
+        while it.valid() {
+            out.push(BlockAddr::decode_varint(it.value()).unwrap());
+            it.next().unwrap();
+        }
+        out
+    };
+    addrs(footer(path, meta).top_index)
+        .into_iter()
+        .flat_map(addrs)
+        .collect()
+}
+
+/// A database with one SST (uncompressed 4 KiB blocks, so blocks can be rewritten in place),
+/// a blob file,
+/// a second, empty family and a second table, closed cleanly.
 fn sample(dir: &TempDir) -> PathBuf {
     let path = dir.path().join("c.phdb");
     let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
     let t = db
         .table("t")
         .unwrap()
-        .family("f", Family::default().blob_threshold(100).uncompressed())
+        .family(
+            "f",
+            Family::default()
+                .blob_threshold(100)
+                .uncompressed()
+                .block_size(4096),
+        )
         .family("g", Family::default())
+        .create()
+        .unwrap();
+    db.table("u")
+        .unwrap()
+        .family("h", Family::default())
         .create()
         .unwrap();
     for i in 0..200u64 {
@@ -496,11 +527,40 @@ type ManifestEdit = fn(&mut Vec<Edit>);
 
 #[test]
 fn sst_properties_that_disagree_with_the_manifest_are_corrupt() {
-    let cases: [(&str, ManifestEdit); 5] = [
+    let cases: [(&str, ManifestEdit); 6] = [
         ("key range", |e| live_sst(e).largest_key.push(0)),
         ("seqnos", |e| live_sst(e).seqno_range.1 += 1),
         ("timestamps", |e| live_sst(e).ts_range.0 -= 1),
         ("entries", |e| live_sst(e).entries += 1),
+        ("table", |e| {
+            // The other table's tablet and family.
+            let u = e
+                .iter()
+                .find_map(|x| match x {
+                    Edit::CreateTable { table, name } if name == "u" => Some(*table),
+                    _ => None,
+                })
+                .unwrap();
+            let (tablet_u, h) = (
+                e.iter()
+                    .find_map(|x| match x {
+                        Edit::PutTablet { tablet, table, .. } if *table == u => Some(*tablet),
+                        _ => None,
+                    })
+                    .unwrap(),
+                e.iter()
+                    .find_map(|x| match x {
+                        Edit::PutFamily { table, family, .. } if *table == u => Some(*family),
+                        _ => None,
+                    })
+                    .unwrap(),
+            );
+            for x in e.iter_mut() {
+                if let Edit::AddSst { tablet, family, .. } = x {
+                    (*tablet, *family) = (tablet_u, h);
+                }
+            }
+        }),
         ("family", |e| {
             // The table's other family.
             let g = e
@@ -969,4 +1029,77 @@ fn a_file_that_is_not_a_database_is_an_error_not_a_report() {
     // Neither slot has the magic: no root, reported as such.
     let doc = corrupt(&path, &[], "superblock", "bad magic");
     assert_eq!(doc["superblocks"], 0);
+}
+
+#[test]
+fn a_deep_check_skips_an_sst_it_cannot_read_for_live_bytes() {
+    // A damaged first data block: the SST opens, its first seek fails. A damaged last one:
+    // the scan fails part way. Either is an SST finding; the live-bytes pass skips the SST.
+    for last in [false, true] {
+        let dir = TempDir::new("fx-deep-damaged");
+        let path = sample(&dir);
+        let meta = live_sst(&mut edits(&path)).clone();
+        let blocks = data_blocks(&path, &meta);
+        assert!(blocks.len() >= 2, "{blocks:?}");
+        let addr = if last {
+            blocks[blocks.len() - 1]
+        } else {
+            blocks[0]
+        };
+        write_at(&path, meta.extent.offset() + addr.offset + 5, &[0xEE]);
+        corrupt(&path, &["--deep"], "sst", "SST");
+    }
+}
+
+/// Offsets (in the WAL file) of the fragments in frame 1 of `epoch`'s segment.
+fn fragments_in_frame_one(path: &Path, epoch: u32) -> Vec<u64> {
+    let base = first_fragment(path, epoch);
+    let frame = read_at(&wal_path(path), base, FRAME_SIZE);
+    let mut at = 0;
+    let mut out = Vec::new();
+    while at + FRAGMENT_HEADER_LEN <= FRAME_SIZE {
+        let h = &frame[at..at + FRAGMENT_HEADER_LEN];
+        if h.iter().all(|&b| b == 0) {
+            break;
+        }
+        out.push(base + at as u64);
+        at += FRAGMENT_HEADER_LEN + usize::from(u16::from_le_bytes([h[8], h[9]]));
+    }
+    out
+}
+
+#[test]
+fn records_in_a_later_frame_after_a_damaged_last_fragment_are_a_warning() {
+    let dir = TempDir::new("fx-wal-gap-frame");
+    let path = crashed(&dir);
+    let last = chain(&segment_headers(&path)).pop().unwrap().epoch;
+    // The last fragment of frame 1 continues in frame 2; damaged, nothing valid follows it
+    // in its frame, and frame 2 starts with the rest of its record.
+    let at = *fragments_in_frame_one(&path, last).last().unwrap();
+    let wal = wal_path(&path);
+    let b = read_at(&wal, at + FRAGMENT_HEADER_LEN as u64, 1)[0];
+    write_at(&wal, at + FRAGMENT_HEADER_LEN as u64, &[b ^ 0xFF]);
+    let (status, doc) = check(&path, &[]);
+    has(&doc, "wal", "warning", "but valid records follow");
+    assert_eq!(status, 0, "{doc:#}");
+}
+
+#[test]
+fn records_a_recovery_already_dropped_are_info() {
+    let dir = TempDir::new("fx-wal-resolved");
+    let path = crashed(&dir);
+    let headers = segment_headers(&path);
+    let c = chain(&headers);
+    // Damage at the start of the second segment's data, and the third chained right there,
+    // as a recovery chains a new segment at the stop.
+    let at = first_fragment(&path, c[1].epoch);
+    let wal = wal_path(&path);
+    let b = read_at(&wal, at + FRAGMENT_HEADER_LEN as u64, 1)[0];
+    write_at(&wal, at + FRAGMENT_HEADER_LEN as u64, &[b ^ 0xFF]);
+    let mut third = c[2];
+    third.prev_end = FRAME_SIZE as u32;
+    write_segment_header(&path, slot_of(&headers, c[2].epoch), &third);
+    let (status, doc) = check(&path, &[]);
+    has(&doc, "wal", "info", "a recovery already continued the log");
+    assert_eq!(status, 0, "{doc:#}");
 }
