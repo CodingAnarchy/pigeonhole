@@ -2974,7 +2974,7 @@ pub(crate) struct ShardState {
     /// would loop (it gives up within microseconds when the shard is driven in a loop).
     flush_retry: Option<Arc<TimerState>>,
     /// Tablets dropped since open: their records need no flush before a checkpoint.
-    dropped: HashSet<TabletId>,
+    dropped: FastSet<TabletId>,
 
     // ---- checkpoints ----
     /// Records the checkpoint cannot pass, in log order.
@@ -3116,7 +3116,7 @@ pub(crate) struct ShardState {
     /// Slots whose compaction failed: failures in a row and the time (VFS monotonic
     /// nanoseconds) before which no background compaction picks them again, so one slot
     /// that keeps failing does not stop compaction for the rest of the shard (issue #141).
-    slot_backoff: HashMap<(TabletId, FamilyId), (u32, u64)>,
+    slot_backoff: FastMap<(TabletId, FamilyId), (u32, u64)>,
     /// The slots `maintain` scans, kept from one scan to the next so the scan does not
     /// allocate its list each time (#499).
     scan_slots: Vec<(TabletId, FamilyId)>,
@@ -3130,7 +3130,7 @@ pub(crate) struct ShardState {
 
     // ---- tablet changes and the balancer ----
     /// Tablets the running change splits, merges or moves.
-    moving: HashSet<TabletId>,
+    moving: FastSet<TabletId>,
     op: Option<ActiveOp>,
     op_queue: VecDeque<(TabletOpKind, Option<Notifier<Result<()>>>)>,
     /// Single-shard commits touching `moving` tablets, held (unlogged) until the change is
@@ -3153,7 +3153,7 @@ pub(crate) struct ShardState {
     /// compactions, so a busy shard never starves them).
     cleanup_turn: bool,
     /// Writes per tablet in the current balancer interval.
-    loads: HashMap<TabletId, TabletLoad>,
+    loads: FastMap<TabletId, TabletLoad>,
     window_writes: u64,
     next_balance: u64,
     rng: u64,
@@ -3162,9 +3162,9 @@ pub(crate) struct ShardState {
     /// Balancer passes run so far.
     balance_pass: u64,
     /// The pass at which each owned tablet arrived on this shard (0: held at the first pass).
-    arrived: HashMap<TabletId, u64>,
+    arrived: FastMap<TabletId, u64>,
     /// The clock when each owned tablet arrived on this shard (0: held at the first pass).
-    arrived_at: HashMap<TabletId, u64>,
+    arrived_at: FastMap<TabletId, u64>,
     /// The pass at which the balancer last started a move or a split over shards.
     skew_pass: Option<u64>,
     /// Consecutive balancer passes this shard's load was skewed (D214).
@@ -3371,7 +3371,7 @@ impl ShardState {
             flush_failed: false,
             flush_failures: 0,
             flush_retry: None,
-            dropped: HashSet::new(),
+            dropped: FastSet::default(),
             log: VecDeque::new(),
             log_cross: FastMap::default(),
             log_bytes: 0,
@@ -3423,13 +3423,13 @@ impl ShardState {
             blob_gc: compact::BlobGc,
             due_backing_off: false,
             backoff_timer: None,
-            slot_backoff: HashMap::new(),
+            slot_backoff: FastMap::default(),
             scan_slots: Vec::new(),
             scan_levels: Levels::default(),
             checkpoint_failures: 0,
             checkpoint_timer: None,
             stall: Stall::default(),
-            moving: HashSet::new(),
+            moving: FastSet::default(),
             op: None,
             op_queue: VecDeque::new(),
             parked: Vec::new(),
@@ -3439,14 +3439,14 @@ impl ShardState {
             retries: Vec::new(),
             cleanups: Vec::new(),
             cleanup_turn: false,
-            loads: HashMap::new(),
+            loads: FastMap::default(),
             window_writes: 0,
             next_balance: 0,
             rng: 0x9E37_79B9_7F4A_7C15 ^ (u64::from(id.0) + 1),
             load_ewma: 0.0,
             balance_pass: 0,
-            arrived: HashMap::new(),
-            arrived_at: HashMap::new(),
+            arrived: FastMap::default(),
+            arrived_at: FastMap::default(),
             skew_pass: None,
             skew_run: 0,
             skew_active: false,
