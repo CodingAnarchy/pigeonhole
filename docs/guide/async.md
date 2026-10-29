@@ -122,6 +122,20 @@ for i in 0..100u32 {
 # Ok::<(), pigeonhole::Error>(())
 ```
 
+## Throughput against blocking calls
+Async calls let a few threads keep many operations in flight. Measured on the reference machine (AMD Ryzen 9 7950X3D, 16 cores and 32 hardware threads, NVMe, Linux 6.8), YCSB over 1 million rows with a 256 MiB block cache, at the default durability (`Durability::GroupSync`) and at `Durability::Buffered`. "Async" is 16 client threads with 16 operations in flight each:
+
+| Workload, durability | Async, 16 threads | Blocking, 16 threads | Blocking, 256 threads |
+|---|--:|--:|--:|
+| YCSB C (all reads), `GroupSync` | GATE3 | GATE3 | GATE3 |
+| YCSB C, `Buffered` | GATE3 | GATE3 | GATE3 |
+| YCSB A (50% updates), `GroupSync` | GATE3 | GATE3 | GATE3 |
+| YCSB A, `Buffered` | GATE3 | GATE3 | GATE3 |
+
+- **On the same threads,** async does GATE3 the blocking calls' operations per second. Each of its threads keeps working while its reads and commits are in flight.
+- **Against 256 blocking threads,** async does GATE3. 256 blocking threads keep all 32 hardware threads busy, and 16 async threads use at most 16 of them. That is a difference in threads, not an async overhead: an async read costs less CPU than a blocking one. To use the whole machine with async calls, run more client threads, one per hardware thread for example.
+- **Latency:** an async operation waits behind the other operations in flight on its thread, so its p99 is GATE3, about that of the 256 blocking threads with the same number in flight.
+
 ## When an async read blocks
 A few rare cases still read synchronously, inside the future or, for a read whose other blocks are cached, inside the `get_async` or `read_async` call itself. Each one is counted in `engine_metrics().async_sync_reads` (in a reader process, `PigeonholeReader::async_sync_reads()`), so you can see whether your workload hits them:
 
