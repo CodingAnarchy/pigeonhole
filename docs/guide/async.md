@@ -2,7 +2,7 @@
 
 > **Status:** this page describes `main`; the async API is new in 0.3.0. In 0.2.x the `async` feature is off by default and gates an empty module.
 
-Every data operation has two forms over the same engine: a blocking method, and an async method with the same semantics. Pick per call site; one table handle serves both. The async forms are behind the `async` feature, which is **on by default**. To build without them and without their one dependency (`futures-core`), use `pigeonhole = { version = "0.3", default-features = false }`.
+Every data operation has two forms over the same engine: a blocking method, and an async method with the same semantics. Pick per call site; one table handle serves both. The async forms are behind the `async` feature, which is **on by default**. To build without them and without their one dependency (`futures-core`), use `pigeonhole = { version = "0.4", default-features = false }`.
 
 | Blocking | Async | Resolves to |
 |---|---|---|
@@ -23,7 +23,7 @@ Every data operation has two forms over the same engine: a blocking method, and 
 ## Any executor, no blocking pool
 The futures depend only on `std::task`, so they run on Tokio, smol, async-std or your own executor. None of them spawns a thread or uses `spawn_blocking`:
 
-- A **read** as of now runs at the call first, as the blocking call does. If it hits the memtable or the block cache, it is read there, as of the call, and the future resolves to it on its first poll. A read that needs a block the cache does not hold submits that block's read to the I/O backend and returns `Pending`; the completion wakes the task, the block goes into the cache, and the read runs again. Such a read, and a read at a snapshot, takes its read point on the first poll, so every attempt sees the same data.
+- A **read** as of now runs at the call first, as the blocking call does. If it hits the memtable or the block cache, it is read there, as of the call, and the future resolves to it on its first poll. On Linux, a block the operating system's page cache already holds is copied on the calling thread and the read carries on, as a blocking read does. Only a block that must come from the device makes the future `Pending`: its read is already submitted, the completion wakes the task, and the future picks the read up from there. Such a read keeps the call's read point, so its result is as of the call too. A read at a snapshot reads at that snapshot.
 - A **commit** is submitted when you call `commit_async`, not when you first poll it. It joins the same commit groups as blocking commits and resolves exactly when the blocking `commit` would return: durable at its level and visible to reads.
 - A **scan stream** fetches the blocks its next step will read before it steps, and only as you poll it, so a slow consumer never makes it read ahead.
 
@@ -132,7 +132,7 @@ A few rare cases still read synchronously, inside the future or, for a read whos
 Making scan steps resumable, so the last case never blocks, is tracked in [#398](https://github.com/CodingAnarchy/pigeonhole/issues/398).
 
 ## Application-owned mode
-With `open_application_owned`, the blocking `commit`, `commit_if`, `flush` and `compact` refuse to run on a thread that drives a shard, because they could wait on that same shard (D88). The async forms are how you call them from the event loop: submit with `commit_async`, `commit_if_async`, `flush_async` or `compact_async` and await the future there.
+With `open_application_owned`, the blocking `commit`, `commit_if`, a transaction's `commit` (and so `transact`), `flush` and `compact` refuse to run on a thread that drives a shard, because they could wait on that same shard (D88). The async forms are how you call them from the event loop: submit with `commit_async`, `commit_if_async`, `flush_async` or `compact_async` and await the future there.
 
 **The loop for one shard per thread: `run_once`, poll your futures with `shard.waker()`, and `shard.wait(timeout)` once `run_once` returns `false`** (#553):
 
@@ -230,6 +230,7 @@ These calls have no async form (owner decision recorded in [D196](../design/deci
   tokio::task::spawn_blocking(move || db.backup("/backups/app.phdb")).await??;
   ```
 
+- **`Transaction::get_row` and `Pigeonhole::transact`:** a transaction's row read is blocking, and so is `transact`'s retry loop. Async code drives the loop itself with `Pigeonhole::transaction`, `Transaction::get_async`, `commit_async` and `RetryPolicy::next_pause` ([Transactions](transactions.md)).
 - **Open, close and schema calls:** `open`, `open_reader`, `open_application_owned`, `close`, `table(..)` with `create`, `create_if_missing` or `open`, and `drop_table`. They are short, and you usually call them at startup and shutdown.
 - **Cheap calls** that never wait on I/O in a writer process: `snapshot`, `write_batch`, `transaction`, the builders, `tables`, `engine_metrics`, and the durability getters and setters.
 

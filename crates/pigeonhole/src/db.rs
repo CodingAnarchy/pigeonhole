@@ -1141,8 +1141,9 @@ impl Pigeonhole {
     }
 
     /// The writer's counters since this instance opened: commits and their latency,
-    /// flushes, compactions, write stalls, the block cache, the WAL, file growth, the shard
-    /// threads, and cross-shard commits' rounds and refusals (ICR 0044). Most are cumulative
+    /// flushes, compactions, write stalls, the block cache, file growth, the shard threads,
+    /// reader slots, transactions, and cross-shard commits' rounds and fast failures
+    /// (ICR 0044, ICR 0087). Most are cumulative
     /// from 0 at open, so take two readings and subtract for an interval; see
     /// [`EngineMetrics`](crate::EngineMetrics) for each field. Cheap and non-blocking.
     pub fn engine_metrics(&self) -> crate::EngineMetrics {
@@ -1371,8 +1372,9 @@ impl Pigeonhole {
     /// writes, flushes and compactions continue on other threads, and in-flight flush or
     /// compaction output is never moved. It returns `0` when there is nothing to release,
     /// for example before `compact` has freed anything. Space still held by an open
-    /// snapshot or scan is not released until that handle is dropped; call `shrink` again
-    /// afterwards.
+    /// snapshot or scan, a backup in progress or a reader process's snapshot is not released
+    /// until that handle is dropped. While one is held, `shrink` never grows the file, even
+    /// for a while, and so may give back less; call it again afterwards for the rest.
     ///
     /// The file can end no earlier than its live data packed toward the start. Data lives in
     /// extents of a power of two from 64 KiB to 64 MiB, each aligned to its size, and the

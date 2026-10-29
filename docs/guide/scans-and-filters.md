@@ -1,8 +1,8 @@
 # Scans and filters
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.3.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics come from the spec and decision D22. `Scan::stream` (async) is new in 0.3.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.3.4, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics come from the spec and decision D22. `Scan::stream` (async) is new in 0.3.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
-Both `Table::row(key)` (a `RowRead`) and `Table::scan*` (a `Scan`) are builders. Nothing happens until you call `.read()` or `.iter()`. They share most of their methods.
+Both `Table::row(key)` (a `RowRead`) and `Table::scan*` (a `Scan`) are builders. Nothing happens until you call `.read()` or `.iter()` (or `.read_async()` and `.stream()`; see [Async](async.md)). They share most of their methods.
 
 | Method | `RowRead` | `Scan` | Effect |
 |---|---|---|---|
@@ -121,6 +121,7 @@ let it = t.scan_prefix(b"sensor:").time_range(t0_us..t1_us).versions(0).iter()?;
 
 ## Limiting work
 - `limit(n)` stops after `n` rows. Use it for pagination: remember the last key and resume with `scan_bounds(Bound::Excluded(last_key), ...)`.
+- `limit(n)` also sets how early a scan reads ahead. With at most 128 rows left to return, it reads blocks ahead only after 8 blocks, so a short page doesn't wait for blocks it never reaches; without a limit, it starts after 2 (D293). Set `limit` on short scans rather than dropping the iterator early.
 - `column_limit(n)` caps columns per family in each row and skips the rest of each row without decoding. Use it to read "the first few attributes" of very wide rows.
 
 ```rust
@@ -174,7 +175,7 @@ println!("{}", snap.seqno());
 - A snapshot never shows part of a commit, including a cross-shard batch.
 - Use one snapshot for several reads that must agree with each other.
 - Without `.snapshot(..)`, a read uses the data committed as of when it starts; pass a snapshot when several reads must agree.
-- **A snapshot pins what it can see. Drop it promptly**: long-lived snapshots delay reclaiming space and memory.
+- **A snapshot pins what it can see. Drop it promptly**: long-lived snapshots delay reclaiming space and memory. While one is held, `shrink` gives back less; call it again after the snapshot is dropped.
 - `Snapshot` is cheap to clone.
 
 ## Pushdown semantics (D22)

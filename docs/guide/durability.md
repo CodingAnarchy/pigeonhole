@@ -1,6 +1,6 @@
 # Durability
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.3.0, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics here come from the spec and decisions D12 and D19. The async commit forms are new in 0.3.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
+> **Status:** this guide describes `main`; the current release on crates.io is 0.3.4, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Semantics here come from the spec and decisions D12 and D19. The async commit forms are new in 0.3.0 ([Async](async.md)). Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup).
 
 Every commit says how durable it must be before it returns. The default is the strongest batched level, so a commit that returns is on disk unless you asked for less.
 
@@ -67,13 +67,14 @@ So you can run a mostly-`Buffered` ingest path and put a periodic `GroupSync` co
 
 ```rust
 # use pigeonhole::Durability;
+#[non_exhaustive]
 pub struct CommitInfo {
     pub seqno: u64,             // the commit's sequence number
     pub durability: Durability, // the level actually applied
 }
 ```
 
-Log or assert on `info.durability` if your correctness depends on it.
+It's read, not built: a later release may add fields. Log or assert on `info.durability` if your correctness depends on it.
 
 ## Visibility and durability (D227)
 A commit returns only once it is durable at its level **and** visible to readers, so a thread always reads its own write immediately after `commit()` returns.
@@ -119,7 +120,7 @@ Unchanged:
 ## Cross-shard batches
 A `WriteBatch` whose rows live on different shards is atomic across them (two-phase commit over the shards' WAL streams). It returns only when every participant's record, and the coordinator's decision record, meet the requested level. After a crash, the batch is applied in full or not at all.
 
-A participant can refuse a round: its rows' tablet is being split, merged or moved, another cross-shard commit still undecided there writes or reads the same rows, or it has no memtable room for its share. The round then aborts everywhere and the commit runs again in a new one, until it commits or the write-stall timeout ends it with `Busy` (D241). Refused rounds cost latency and throughput but nothing else. `engine_metrics().cross_shard.rounds` counts the rounds (ICR 0043): over the cross-shard commits in an interval, it is the rounds each commit took, so anything above one is refused rounds.
+A participant can refuse a round: its rows' tablet is being split, merged or moved, it has no memtable room for its share, or the commit reads a row another undecided cross-shard commit writes there (or writes a row one read). A commit that only writes rows another is still deciding is not refused (D271). The round then aborts everywhere and the commit runs again in a new one, until it commits or the write-stall timeout ends it with `Busy` (D241). A transaction whose retry could only fail validation gets `Conflict` at once instead (D276). Refused rounds cost latency and throughput but nothing else. `engine_metrics().cross_shard.rounds` counts the rounds (ICR 0043): over the cross-shard commits in an interval, it is the rounds each commit took, so anything above one is refused rounds.
 
 ## Choosing a level
 | If losing the last few commits … | Use |
@@ -139,7 +140,7 @@ Right after a clean reopen, the first `GroupSync` or `Sync` commit also waits fo
 
 Each shard's WAL sidecar holds at most twice `memtable_budget` of writes past the oldest one not yet in the file (128 MiB per shard at the defaults; D155). Past that, the shard flushes the memtables holding the old writes, small ones included, so the WAL and the next open's replay stay bounded however long the process runs.
 
-That flushing work runs beside the commits (on the flush and compaction threads, D252, or in short slices between commits where it runs on the shard, D206), so a WAL can briefly grow past the bound by what is written while it runs: a few MB at most at the defaults. When sizing disk space for the sidecars, allow per shard the bound plus that margin, and plus a spare segment.
+That flushing work runs beside the commits (on the flush and compaction threads, D252; on background workers in application-owned mode, D284; or in short slices between commits where it runs on the shard, D206), so a WAL can briefly grow past the bound by what is written while it runs: a few MB at most at the defaults. When sizing disk space for the sidecars, allow per shard the bound plus that margin, and plus a spare segment.
 
 ## Failure modes
 - `ErrorCode::NoSpace`: the device filled; the commit did not apply.

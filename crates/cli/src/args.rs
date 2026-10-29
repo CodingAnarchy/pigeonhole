@@ -13,8 +13,8 @@ use clap::{Parser, Subcommand, ValueEnum};
 pub(crate) struct Cli {
     /// Output format: `table` for people; `json` (one document) and `jsonl` (a header line,
     /// then one object per row) for programs; `csv` with a header line.
-    /// `dump` defaults to `jsonl` and takes `jsonl` or `csv`; every other command defaults
-    /// to `table`.
+    /// `dump` defaults to `jsonl` and takes `jsonl`, `csv` or `arrow`; every other command
+    /// defaults to `table`.
     #[arg(long, global = true, value_enum)]
     pub format: Option<Format>,
 
@@ -43,10 +43,9 @@ pub(crate) enum Command {
         /// The database file (`*.phdb`).
         file: PathBuf,
     },
-    /// Check the database for damage, offline: superblocks, manifest, extents, every SST
-    /// block, every blob record and the WAL a crash left. Exits 3 if anything is damaged.
     /// Export every cell (all retained versions) at one snapshot: `jsonl` (the default;
-    /// `phdb load` reads it back) or `csv`, to standard output.
+    /// `phdb load` reads it back), `csv`, or `arrow` (an Arrow IPC stream of one table), to
+    /// standard output.
     Dump {
         /// The database file (`*.phdb`).
         file: PathBuf,
@@ -113,6 +112,8 @@ pub(crate) enum Command {
         #[arg(long)]
         read_only: bool,
     },
+    /// Check the database for damage, offline: superblocks, manifest, extents, every SST
+    /// block, every blob record and the WAL a crash left. Exits 3 if anything is damaged.
     Check {
         /// The database file (`*.phdb`).
         file: PathBuf,

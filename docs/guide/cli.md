@@ -39,7 +39,7 @@ A database has one writer process at a time and any number of reader processes (
   - While `phdb` holds the writer lock, your application can't open as the writer: its open fails with `WriterLocked` until `phdb` exits.
 - **A writer is running:** `phdb` opens as a reader process. It sees everything the writer has committed and changes nothing.
 
-`phdb` opens with one unpinned shard and small caches, and never creates a file. A database `phdb` can't write opens read-only (`read_only_fallback`): families that name a merge operator `phdb` doesn't know, or a feature from a newer version that this one may only read. Such an open writes nothing to the file.
+`phdb` opens with one unpinned shard and a 16 MiB block cache (as the writer, with no row cache), and never creates a file. A database `phdb` can't write opens read-only (`read_only_fallback`): families that name a merge operator `phdb` doesn't know, or a feature from a newer version that this one may only read. Such an open writes nothing to the file.
 
 `--reader` and `--writer` force one role, and fail rather than fall back.
 
@@ -132,10 +132,11 @@ users   history  1        0     0          0        0           0             25
 It is the library's [`pigeonhole::check`](agent-reference.md#check-offline-integrity-check-icr-0048).
 
 - **Offline, and it changes nothing.** It takes the writer lock, so it can't run while a writer process has the database open (exit 4). It never replays the WAL and never writes: a crashed database is checked as it was left. The lock needs write access to the file, so to check a copy on read-only media, copy it somewhere writable first.
+- **A file from a newer build:** a newer format version, or an incompatible feature this `phdb` doesn't know (in a superblock or a WAL segment header), is refused with `UnsupportedFormat` or `UnsupportedFeature` (status 6), not reported as damage. Check it with a `phdb` at least as new.
 - **`--online`:** if a writer process has the database open, read every table through a reader process instead, all versions at one snapshot. It's a weaker check: it reaches only the data a scan reads, not index or filter blocks, the other superblock slot or the WAL. With no writer running, `--online` runs the offline check.
 - **`--deep`:** also read every separated value (blob) through its pointer, and recount each blob file's live bytes.
 - **`--map`:** list the file's regions instead of the findings: superblock pages, the manifest, each SST with its table, family and level, and each blob extent. In `json` they're added as `regions`.
-- **Exit status:** 3 if any finding is `corruption`. Warnings and info findings exit 0.
+- **Exit status:** 3 if any finding is `corruption`. Warnings and info findings exit 0, except with `--online`: a read that failed for another reason is a `warning` and exits 1.
 
 **A finding** (each row of `table`, `csv` and `jsonl`, and each entry of `findings` in `json`):
 
@@ -204,7 +205,7 @@ How values are written:
 - A row key or qualifier that isn't UTF-8 prints as `b64:` followed by base64. A key that really starts with `b64:` is ambiguous here, so use `jsonl` to round-trip.
 
 **`arrow`** is an [Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format) of one table, for DuckDB, Polars, pyarrow and other Arrow readers (#691). Name the table with `--table`: a stream has one schema, so `dump --format arrow` without exactly one table fails with status 2.
-- **Schema:** the [Arrow export's](arrow.md) long schema, one Arrow row per cell: `row`, `family`, `qualifier`, `ts` (a UTC microsecond timestamp), `value` (the bytes, or a typed value's little-endian encoding), `value_type` (`bytes`, `i64`, `f64`), and the typed columns `value_i64` (also every counter) and `value_f64`, null for other cells.
+- **Schema:** the [Arrow export's](arrow.md) long schema, one Arrow row per cell: `row`, `family`, `qualifier`, `ts` (a UTC microsecond timestamp), `value` (the bytes, or a typed value's little-endian encoding), `value_type` (`bytes`, `i64`, `f64`, `varint`), and the typed columns `value_i64` (i64 and varint cells, so every counter) and `value_f64`, null for other cells.
 - **Order:** as `jsonl`. Every retained version, at one snapshot.
 - **Limit:** a timestamp above `i64::MAX` doesn't fit an Arrow timestamp: the dump fails with status 6 (`Unsupported`), naming the row. `jsonl` dumps it. Any other failure of the Arrow writer is status 1 (`Export`).
 - **Check the status.** A dump that fails partway, in any format, leaves what it wrote so far on standard output, and an Arrow stream cut short has no end-of-stream marker: pyarrow and Polars read it as a shorter table without complaint. Treat the output as complete only when `phdb` exits 0.
@@ -221,7 +222,7 @@ CI dumps a table this way and reads it with Polars.
 **`phdb load`** writes a `jsonl` dump into a database, from a file or standard input:
 - **Writer only:** it opens the database as the writer, so it fails with status 4 while another writer runs. `--create` creates the file if it's missing, but only once the input's first line is a dump header: an input that isn't a dump, an empty one included (a `phdb dump` that failed into a pipe writes nothing), fails with status 2 and creates nothing. A dump with only its header creates an empty database: `echo '{"phdb":1,"command":"dump"}' | phdb load --create app.phdb -` (`phdb` has no other command that creates a file).
 - **Tables and families:** each table line creates its table and families. An existing family keeps the options stored in the file.
-- **Cells:** each is written at its timestamp. Counters are set to their dumped value. A family with a merge operator gets the merged values as puts.
+- **Cells:** each is written at its timestamp. Counters are set to their dumped value. A family with the built-in `pigeonhole.i64_add` operator gets its merged values as puts. `phdb` registers no other merge operator, so a family that names one can't be dumped (its first merged cell fails with `UnknownMergeOperator`, status 1) or created by `load`.
 - **Durability:** cells are committed in batches at `Durability::None`, and one flush at the end makes the load durable. If the load fails partway, what was committed stays.
 
 A malformed dump fails with status 1 and the code `BadInput`, naming the line.
@@ -247,11 +248,11 @@ $ phdb dump copy.phdb | tail -n +2 | diff - <(tail -n +2 app.jsonl)    # identic
 | `path`, `dest` | The database and the copy. |
 | `mode` | `writer` or `reader`: how `phdb` opened the database. |
 | `snapshot` | `durable` or `latest`. |
-| `bytes` | The copy's size. |
+| `bytes` | The copy's size: about the size of the live data. The copy keeps none of the source's free space. |
 | `elapsed_ms` | How long the copy took. |
 | `check` | With `--check`: `ok` or `corrupt`. |
 
-**`phdb compact <file>`** is `Pigeonhole::compact`: it flushes, then merges every level of every table into the last. The merge drops versions past `max_versions`, expired cells and deleted data, as the engine's compaction rules allow. The API reports no progress, so with `--format table` `phdb` prints one line every half second to standard error (`compacting: 2.5 s, 1 flushes, 3 compactions done`). Other formats print nothing there. `--shrink` then runs `Pigeonhole::shrink`, which releases free space at the end of the file.
+**`phdb compact <file>`** is `Pigeonhole::compact`: it flushes, then merges every level of every table into the last. The merge drops versions past `max_versions`, expired cells and deleted data, as the engine's compaction rules allow. The API reports no progress, so with `--format table` `phdb` prints one line every half second to standard error (`compacting: 2.5 s, 1 flushes, 3 compactions done`). Other formats print nothing there. `--shrink` then runs `Pigeonhole::shrink`, which releases free space at the end of the file. If a reader process attached to `phdb` holds a snapshot, it gives back less; run it again once the snapshot is dropped.
 
 | Field | Meaning |
 |---|---|
@@ -295,7 +296,8 @@ snapshot [--durable] <name>     release <name>
 - **The read flags** map to the API's `RowRead` and `Scan` builders:
   - `--versions 0` returns every retained version;
   - `--time A..B` is a half-open microsecond range;
-  - `--i64 >30` (also `<n` and `=n`) keeps `i64` values that compare as given.
+  - `--i64 >30` (also `<n` and `=n`) keeps `i64` values that compare as given;
+  - `--columns-per-row N` is `Scan::column_limit(N)`.
 - **`--at`** reads at a named snapshot. `snapshot` takes one (`--durable` for a durable one); `release` drops it.
 - **Output:** reads print one row per cell, `row`, `family`, `qualifier`, `ts`, `value`, in the current `\format`.
 
@@ -314,7 +316,7 @@ snapshot [--durable] <name>     release <name>
 
 **Meta commands:**
 - **`\tables`** lists the tables; **`\schema`** shows the families' options; **`\info`** is `phdb info`.
-- **`\metrics`** shows the writer's counters since the shell opened, and **`\health`** shows whether the instance failed.
+- **`\metrics`** shows the writer's counters since the shell opened. It needs the shell to be the writer: a reader process has no writer counters. **`\health`** shows whether the instance failed (always `false` in a reader).
 - **`\format`** changes the output format, and **`\timing on`** prints each command's time to standard error.
 
 In `json`, every command prints one document: reads put their cells under `rows`, and writes print `result` and `seqno`.
@@ -346,4 +348,4 @@ u1   profile  name       1761030000000000  Ada
 {"phdb":1,"error":{"code":"WriterLocked","code_num":3,"message":"open: another process holds the writer lock"}}
 ```
 
-`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (a dump `phdb load` can't read: status 2 without a dump header, else 1), `Unsupported` (a cell `dump --format arrow` can't hold; status 6), `Export` (the Arrow writer failed otherwise; status 1) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.
+`code` is the [`ErrorCode`](errors.md) name and `code_num` its number. For a failure outside the database, the code is a `phdb` name with `code_num` `null`. The codes are `FileNotFound` (a missing file), `BadInput` (input `phdb` can't use: a dump `phdb load` can't read, status 2 without a dump header and 1 otherwise; a `backup` destination that exists; an unknown snapshot name in the shell; status 1), `Unsupported` (a cell `dump --format arrow` can't hold; status 6), `Export` (the Arrow writer failed otherwise; status 1) and `Usage` (a combination of flags clap doesn't catch, such as `dump --format table`). The message is for people; its wording may change.

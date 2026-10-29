@@ -68,7 +68,7 @@ Transactions are **serializable over what they read with `get` and `get_row`**: 
 
 ## What a transaction costs
 
-- **Reads cost the same as outside a transaction,** plus one read-set entry per cell (`get`) or per family (`get_row`).
+- **Reads cost the same as outside a transaction,** plus one read-set entry per cell (`get`) or per family (`get_row`). A point `get` of a hot row is served from the writer's row cache when the cached row is current at the transaction's snapshot (D290), as outside a transaction.
 - **A transaction whose reads and writes all fall on one shard** commits like a single commit: one log record, no two-phase commit.
 - **One that spans shards** commits with two-phase commit: a PREPARE on each shard involved, including shards it only read from, then a decision. It costs about two commits' latency, and more at `Sync`.
 - **Conflicts cost a full retry.** `EngineMetrics::transactions`, `transaction_conflicts` and `transaction_retries` show the conflict rate and what retries cost. On a few hot rows, a high conflict rate means the work is serializing on them: split the hot rows, or use a counter family (`incr` is a blind write and doesn't conflict unless you also read the cell).
