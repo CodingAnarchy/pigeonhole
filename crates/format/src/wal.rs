@@ -750,7 +750,8 @@ impl BatchBuilder {
         self.count == 0
     }
 
-    /// The encoded batch.
+    /// The encoded batch. Valid as [`BatchRef::new`] would find it: every push checked its
+    /// mutation before writing it, so a reader of this needs no validating decode.
     pub fn batch(&self) -> BatchRef<'_> {
         BatchRef {
             bytes: &self.buf,
