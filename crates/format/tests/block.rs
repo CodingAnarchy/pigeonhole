@@ -26,6 +26,26 @@ fn build_data(entries: &BTreeMap<Vec<u8>, Vec<u8>>, interval: usize) -> Vec<u8> 
     out
 }
 
+/// A data block of `entries` built through `add_prefixed` with each entry's shared prefix cut
+/// to a length `shorten` picks in `0..=` its real common prefix with the key before it (cycling
+/// through `shorten`): a valid encoding whose `shared` is not always the longest shared
+/// prefix (FORMAT §4 does not promise it is).
+fn build_shortened(
+    entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+    interval: usize,
+    shorten: &[prop::sample::Index],
+) -> Vec<u8> {
+    let mut b = BlockBuilder::data(interval);
+    let mut last: &[u8] = &[];
+    for (i, (k, v)) in entries.iter().enumerate() {
+        let lcp = shorten[i % shorten.len()].index(common_prefix_len(k, last) + 1);
+        b.add_prefixed(k, v, lcp, row_prefix_len(k).unwrap())
+            .unwrap();
+        last = k;
+    }
+    b.finish().to_vec()
+}
+
 fn entries() -> impl Strategy<Value = BTreeMap<Vec<u8>, Vec<u8>>> {
     btree_map(
         cell().prop_map(|c: Cell| c.encode()),
@@ -72,15 +92,22 @@ proptest! {
     /// target (`step_to`): `seek` and `seek_forward` from every entry land where a linear
     /// scan of the model lands, for keys with long shared prefixes, every restart interval,
     /// and targets that are keys, their prefixes and extensions, a key with one byte nudged
-    /// either way, and arbitrary bytes.
+    /// either way, and arbitrary bytes. Half the blocks store shorter shared prefixes than the
+    /// longest (`build_shortened`), so a step that assumed `shared` is maximal would fail.
     #[test]
     fn seek_steps_land_where_a_linear_scan_lands(
         model in row_heavy_entries(),
         interval in 1usize..=16,
         picks in vec((any::<prop::sample::Index>(), 0u8..6, any::<u8>(), any::<prop::sample::Index>()), 1..24),
         raw in vec(vec(any::<u8>(), 0..24), 0..4),
+        shortened in any::<bool>(),
+        shorten in vec(any::<prop::sample::Index>(), 1..32),
     ) {
-        let bytes = build_data(&model, interval);
+        let bytes = if shortened {
+            build_shortened(&model, interval, &shorten)
+        } else {
+            build_data(&model, interval)
+        };
         let keys: Vec<&Vec<u8>> = model.keys().collect();
         let mut targets: Vec<Vec<u8>> = raw;
         if !keys.is_empty() {
