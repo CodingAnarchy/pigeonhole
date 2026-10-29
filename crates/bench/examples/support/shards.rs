@@ -112,7 +112,7 @@ fn open(
     if let Some(vfs) = vfs {
         options = options.vfs(vfs);
     }
-    let pigeonhole::AppOwned { db, shards, .. } = Pigeonhole::open_application_owned(
+    let (db, shards) = Pigeonhole::open_application_owned(
         path,
         options
             .shards(1)
@@ -125,7 +125,8 @@ fn open(
             .commit_spin(std::time::Duration::ZERO)
             .row_cache(row_cache()),
     )
-    .expect("open");
+    .expect("open")
+    .into_parts();
     let ctl = Arc::new(Ctl {
         shards: shards.len(),
         ..Ctl::default()
@@ -219,4 +220,24 @@ fn row_cache() -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
+}
+
+/// The application-owned open's result as `(db, shards)`, whichever form the library returns:
+/// `AppOwned` since ICR 0088, a tuple before. The callgrind workflow builds these sources
+/// against the base commit too, so they must compile against both.
+trait IntoParts {
+    fn into_parts(self) -> (Pigeonhole, Vec<pigeonhole::Shard>);
+}
+
+impl IntoParts for (Pigeonhole, Vec<pigeonhole::Shard>) {
+    fn into_parts(self) -> (Pigeonhole, Vec<pigeonhole::Shard>) {
+        self
+    }
+}
+
+impl IntoParts for pigeonhole::AppOwned {
+    fn into_parts(self) -> (Pigeonhole, Vec<pigeonhole::Shard>) {
+        let pigeonhole::AppOwned { db, shards, .. } = self;
+        (db, shards)
+    }
 }
