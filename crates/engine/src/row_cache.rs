@@ -677,6 +677,24 @@ pub(crate) fn get_cached(
     row: &[u8],
     qualifier: &[u8],
 ) -> Option<Option<CellData>> {
+    let key = served_key(rc, view, table, family, row, seqno)?;
+    let Lookup::Hit(hit) = rc.get(family, row, key, now) else {
+        return None;
+    };
+    Some(cell_of(&hit, qualifier))
+}
+
+/// The cache key of `row` at `seqno` for a point get in `family`, or `None` when the row has
+/// no epoch to key it by or the cache does not serve the family.
+#[inline(always)]
+fn served_key(
+    rc: &RowCaches,
+    view: &View,
+    table: TableId,
+    family: FamilyId,
+    row: &[u8],
+    seqno: Seqno,
+) -> Option<RowKey> {
     let key = rc.epoch(table, row, seqno)?;
     if !rc.families.is_empty() {
         let info = view.catalog.table(table)?;
@@ -685,14 +703,7 @@ pub(crate) fn get_cached(
             return None;
         }
     }
-    let Lookup::Hit(hit) = rc.get(family, row, key, now) else {
-        return None;
-    };
-    Some(
-        Encoded::cells(&hit)
-            .find(|(q, _, _)| *q == qualifier)
-            .map(|(_, ts, stored)| CellData::copied(ts, stored)),
-    )
+    Some(key)
 }
 
 /// A point get at `seqno` through the writer's row cache (D290): answered from the cached
@@ -716,14 +727,7 @@ pub(crate) fn get_through(
     row: &[u8],
     qualifier: &[u8],
 ) -> Option<Result<Option<CellData>>> {
-    let key = rc.epoch(table, row, seqno)?;
-    if !rc.families.is_empty() {
-        let info = view.catalog.table(table)?;
-        let f = info.families.iter().find(|f| f.id == family)?;
-        if !rc.serves(&info.name, &f.name) {
-            return None;
-        }
-    }
+    let key = served_key(rc, view, table, family, row, seqno)?;
     match rc.get(family, row, key, now) {
         Lookup::Hit(hit) => return Some(Ok(cell_of(&hit, qualifier))),
         Lookup::Oversize => return None,
