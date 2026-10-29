@@ -54,7 +54,7 @@ crc32c = "0.6"
 foldhash = "0.2"
 twox-hash = { version = "2", default-features = false, features = ["std", "xxhash3_64"] }
 lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-encode", "safe-decode", "checked-decode"] }
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.14.3", default-features = false }
 arc-swap = "1"
 smallvec = "1"
 libc = "0.2"

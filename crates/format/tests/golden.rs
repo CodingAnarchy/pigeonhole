@@ -615,3 +615,28 @@ fn shm() {
     );
     check("shm_names.txt", names.as_bytes());
 }
+
+/// A zstd-sealed data block written by zstd 0.13 (libzstd 1.5.7): a build on a newer zstd
+/// must still read it. Decode only: zstd's encoder may produce other bytes for the same
+/// input across versions, and those frames are fine as long as every version decodes them.
+#[test]
+fn a_zstd_block_from_an_older_zstd_still_decodes() {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let data = std::fs::read(dir.join("data_block.bin")).unwrap();
+    let plain: Vec<u8> = data.iter().copied().cycle().take(data.len() * 8).collect();
+    let frozen = std::fs::read(dir.join("sealed_block_zstd.bin")).unwrap();
+    let (trailer, payload) = verify(&frozen).unwrap();
+    assert_eq!(trailer.kind, BlockKind::Data);
+    assert_eq!(trailer.compression, Compression::Zstd);
+    assert_eq!(trailer.uncompressed_len as usize, plain.len());
+    let mut back = vec![0; plain.len()];
+    pigeonhole_format::compress::decompress(Compression::Zstd, payload, &mut back).unwrap();
+    assert_eq!(back, plain);
+    // What this build writes for the same block decodes to it too.
+    let mut sealed = Vec::new();
+    seal(BlockKind::Data, Compression::Zstd, &plain, &mut sealed).unwrap();
+    let (_, payload) = verify(&sealed).unwrap();
+    let mut back = vec![0; plain.len()];
+    pigeonhole_format::compress::decompress(Compression::Zstd, payload, &mut back).unwrap();
+    assert_eq!(back, plain);
+}
