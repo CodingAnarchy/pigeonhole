@@ -10,8 +10,8 @@
 //! The mock for the layer above is the real cache, small or [`BlockCache::disabled`].
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
-// The crate needs no `unsafe` today: pins are `Arc`s. CONTRIBUTING permits it here, with a
-// `// SAFETY:` argument per block, should Phase 3 tuning need it.
+// Pins are `Arc`s. The one `unsafe` is `BlockHandle`'s cached view of its block's bytes
+// (CONTRIBUTING permits it here, with a `// SAFETY:` argument per block).
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod hash;
@@ -161,9 +161,7 @@ impl BlockCache {
     #[inline]
     pub fn get(&self, key: BlockKey) -> Option<BlockHandle> {
         let shard = self.shards.padded(hash_of(&key))?;
-        let found = read(&shard.lock)
-            .get(&key)
-            .map(|block| BlockHandle { block });
+        let found = read(&shard.lock).get(&key).map(BlockHandle::new);
         let counter = if found.is_some() {
             &shard.hits
         } else {
@@ -197,7 +195,7 @@ impl BlockCache {
         if let Some(shard) = self.shards.shard(hash_of(&key)) {
             lock(shard).insert(key, Arc::clone(&block), charge, priority);
         }
-        BlockHandle { block }
+        BlockHandle::new(block)
     }
 
     /// Drops every unpinned block of `files` (after their SSTs or blob files are deleted), in
@@ -334,9 +332,33 @@ impl fmt::Debug for BlockCache {
 #[derive(Clone)]
 pub struct BlockHandle {
     block: Arc<BlockData>,
+    /// `block`'s bytes, resolved once: a block reader derefs the handle for every entry it
+    /// decodes, and this skips the `Arc` and the `BlockData` variant each time.
+    ptr: *const u8,
+    len: usize,
 }
 
+// The impls below rest on this: a `BlockData` variant that stops being thread-safe fails
+// to build here instead of being hidden by them.
+const _: () = {
+    const fn send_sync<T: Send + Sync>() {}
+    send_sync::<Arc<BlockData>>();
+};
+
+// SAFETY: `ptr`/`len` are a shared view of bytes `block` owns and never changes (a
+// `BlockData` is not mutated once in an `Arc`), so the handle is as `Send` and `Sync` as the
+// `Arc<BlockData>` it holds and a `&[u8]` into it.
+unsafe impl Send for BlockHandle {}
+// SAFETY: as for `Send`.
+unsafe impl Sync for BlockHandle {}
+
 impl BlockHandle {
+    fn new(block: Arc<BlockData>) -> Self {
+        let bytes = block.bytes();
+        let (ptr, len) = (bytes.as_ptr(), bytes.len());
+        Self { block, ptr, len }
+    }
+
     /// Bytes the block counts against a cache's capacity (an aligned I/O buffer's capacity,
     /// a heap buffer's length).
     pub fn charge(&self) -> usize {
@@ -346,7 +368,11 @@ impl BlockHandle {
     /// The block's bytes.
     #[inline]
     pub fn bytes(&self) -> &[u8] {
-        self.block.bytes()
+        // SAFETY: `ptr`/`len` were taken from `self.block.bytes()`, which the `Arc` keeps
+        // alive while `self` does. The bytes never change and never move: a `BlockData` is
+        // immutable once shared, and its buffer (an `IoBuf`'s allocation or a boxed slice)
+        // stays where it is when the `Arc` or the handle moves.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
 }
 

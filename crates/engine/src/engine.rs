@@ -20,7 +20,7 @@ use pigeonhole_format::wal::{BatchBuilder, Mutation, WalRecord};
 use pigeonhole_format::{
     Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, StreamId, TableId, TabletId, Timestamp,
 };
-use pigeonhole_io::{ErrorKind, FileRef, Locality, OpenOptions};
+use pigeonhole_io::{ErrorKind, FileRef, Locality, OpenOptions, VfsRef};
 use pigeonhole_memtable::{ArenaRegion, MemtableReader, ShardArena};
 use pigeonhole_pager::Pager;
 use pigeonhole_runtime::{
@@ -262,15 +262,6 @@ pub struct CrossShardMetrics {
     pub rounds: u64,
     /// Rounds that a participant refused.
     pub refused_rounds: u64,
-    /// Always 0 since D263: a PREPARE carries no timestamp, so none is refused for its
-    /// order with the participant's writes (D11, D244, D245 before it). Removed at the 1.0
-    /// API freeze.
-    #[deprecated(note = "always 0 since D263; removed at the 1.0 API freeze")]
-    pub refused_below_floor: u64,
-    /// Always 0 since D263: a PREPARE carries no timestamp, so none is refused below a
-    /// tablet move's raise (D11 before it). Removed at the 1.0 API freeze.
-    #[deprecated(note = "always 0 since D263; removed at the 1.0 API freeze")]
-    pub refused_move_raise: u64,
     /// PREPAREs refused because a row's tablet was being split, merged or moved, or had
     /// moved to another shard (D145).
     pub refused_moved: u64,
@@ -1031,34 +1022,8 @@ impl Engine {
         // A memtable's allocation grows a chunk at a time: a threshold at or below one chunk
         // would freeze it at its first insert.
         let freeze_bytes = options.memtable_freeze_bytes.max(2 * chunk as u64);
-        let empty_view = Arc::new(View {
-            version: 0,
-            manifest_version,
-            tablets: Arc::new(TabletMap::default()),
-            catalog: Arc::new(Catalog::with_registry(Arc::clone(&registry))),
-            mems: (0..shards)
-                .map(|_| Arc::new(ShardMems::default()))
-                .collect(),
-            ssts: Arc::new(SstSet::empty(pager.data_file().clone(), Arc::clone(&cache))),
-            _pin: None,
-            released: false,
-        });
+        let empty_view = View::empty(manifest_version, shards, &registry, &pager, &cache);
         let shared = Arc::new(Shared {
-            vfs: Arc::clone(&vfs),
-            shm: shm.clone(),
-            reader_reclaim_at: AtomicU64::new(0),
-            reader_slots_reclaimed: AtomicU64::new(0),
-            shards,
-            view: ArcSwap::new(empty_view),
-            async_sync_reads: AtomicU64::new(0),
-            commit_parks: AtomicU64::new(0),
-            view_lock: Mutex::new(0),
-            view_record: Mutex::default(),
-            manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
-            manifest_queue: Default::default(),
-            manifest_busy: AtomicBool::new(false),
-            pager: Arc::clone(&pager),
-            cache: Arc::clone(&cache),
             row_cache: crate::row_cache::RowCaches::new(
                 options.row_cache_bytes,
                 options.row_cache_max_row,
@@ -1073,39 +1038,13 @@ impl Engine {
             sst_ids: Arc::new(AtomicU64::new(catalog.counters.next_sst.max(1))),
             blob_ids: Arc::new(AtomicU32::new(catalog.counters.next_blob_file.max(1))),
             live_views: Arc::clone(&live_views),
-            live_seqnos: Arc::new(LiveSeqnos::default()),
-            flushed_roots: Default::default(),
-            busy_ssts: Mutex::new(HashSet::new()),
-            large: Default::default(),
-            large_open: AtomicUsize::new(0),
-            view_versions: Mutex::new(BTreeMap::new()),
-            #[cfg(feature = "test-hooks")]
-            hooks: Default::default(),
-            picker: options.compaction.clone(),
-            write_stall_timeout_nanos: options.write_stall_timeout_nanos,
-            compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
-            flush_backoff_nanos: options.flush_backoff_nanos.max(1),
-            room_recheck_nanos: options.room_recheck_nanos.max(1),
-            commit_spin_nanos: options.commit_spin_nanos,
             tail_index: options.memtable_tail_index,
-            // Filled as the last step of the open (`held`).
-            locks: Mutex::new(None),
-            keep_locks: AtomicBool::new(false),
-            arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
-            close_done: AtomicBool::new(false),
             application_owned: mode == Mode::ApplicationOwned,
             no_writes,
             lock_file: Some(file.clone()),
-            opened_in: pigeonhole_io::sys::process_id(),
-            default_durability: AtomicU8::new(options.durability as u8),
-            closed: AtomicBool::new(false),
-            closing: AtomicBool::new(false),
-            pager_poisoned: AtomicBool::new(false),
-            failure: Default::default(),
             close: CloseState::new(shards),
             metrics: (0..shards).map(|_| ShardMetrics::default()).collect(),
             flushed_through: (0..shards).map(|_| Padded(AtomicU64::new(0))).collect(),
-            clock: Default::default(),
             loads: (0..shards).map(|_| LoadSlot::default()).collect(),
             balance: BalanceConfig {
                 enabled: options.tablet_changes,
@@ -1118,16 +1057,6 @@ impl Engine {
                 pack: options.balance_pack,
                 cold_passes: options.balance_cold_passes.unwrap_or(COLD_PASSES),
             },
-            view_capacity: shm_config.view_buffer_bytes as usize,
-            tablet_epoch: AtomicU64::new(0),
-            full_compactions: AtomicUsize::new(0),
-            pack_k: AtomicUsize::new(0),
-            pack_target: AtomicUsize::new(0),
-            waiters: WatermarkWaiters::new(shards),
-            durable_waiters: WatermarkWaiters::new(shards),
-            visibility: VisibilityCounts::default(),
-            shard_died: AtomicBool::new(false),
-            manifest_flight: Default::default(),
             drivers: if mode == Mode::ApplicationOwned {
                 crate::waker::Drivers::new(shards)
             } else {
@@ -1138,11 +1067,18 @@ impl Engine {
                 0 => options.memtable_budget.saturating_mul(2),
                 n => n,
             },
-            submitters: std::sync::OnceLock::new(),
-            wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
-            shm_dir: options.shm_dir.clone(),
-            identity,
-            path: path.to_path_buf(),
+            ..Shared::base(
+                &vfs,
+                &shm,
+                shards,
+                empty_view,
+                &pager,
+                &cache,
+                &options,
+                shm_config.view_buffer_bytes as usize,
+                identity,
+                path,
+            )
         });
         // Both come from `row_cache_bytes > 0`: a shard's apply follows the epochs only with
         // the cache (`follow`).
@@ -1701,93 +1637,20 @@ impl Engine {
         open_data_file(&vfs, path, &pager, options.direct_io, false)?;
         let cache = block_cache(options.block_cache_bytes, shards);
         // The read-only pager is kept by the manifest writer (which never commits here).
-        let empty_view = Arc::new(View {
-            version: 0,
-            manifest_version,
-            tablets: Arc::new(TabletMap::default()),
-            catalog: Arc::new(Catalog::with_registry(Arc::clone(&registry))),
-            mems: (0..shards)
-                .map(|_| Arc::new(ShardMems::default()))
-                .collect(),
-            ssts: Arc::new(SstSet::empty(pager.data_file().clone(), Arc::clone(&cache))),
-            _pin: None,
-            released: false,
-        });
-        let shared = Arc::new(Shared {
-            vfs: Arc::clone(&vfs),
-            shm: shm.clone(),
-            reader_reclaim_at: AtomicU64::new(0),
-            reader_slots_reclaimed: AtomicU64::new(0),
+        let empty_view = View::empty(manifest_version, shards, &registry, &pager, &cache);
+        // Reader processes have no write watermarks, so no row cache (D201).
+        let shared = Arc::new(Shared::base(
+            &vfs,
+            &shm,
             shards,
-            view: ArcSwap::new(empty_view),
-            async_sync_reads: AtomicU64::new(0),
-            commit_parks: AtomicU64::new(0),
-            view_lock: Mutex::new(0),
-            view_record: Mutex::default(),
-            manifest: Mutex::new(ManifestWriter::new(Arc::clone(&pager))),
-            manifest_queue: Default::default(),
-            manifest_busy: AtomicBool::new(false),
-            pager: Arc::clone(&pager),
-            cache: Arc::clone(&cache),
-            // Reader processes have no write watermarks, so no row cache (D201).
-            row_cache: None,
-            row_epochs: None,
-            sst_ids: Arc::new(AtomicU64::new(0)),
-            blob_ids: Arc::new(AtomicU32::new(0)),
-            live_views: Arc::new(LiveViews::default()),
-            live_seqnos: Arc::new(LiveSeqnos::default()),
-            flushed_roots: Default::default(),
-            busy_ssts: Mutex::new(HashSet::new()),
-            large: Default::default(),
-            large_open: AtomicUsize::new(0),
-            view_versions: Mutex::new(BTreeMap::new()),
-            #[cfg(feature = "test-hooks")]
-            hooks: Default::default(),
-            picker: options.compaction.clone(),
-            write_stall_timeout_nanos: options.write_stall_timeout_nanos,
-            compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
-            flush_backoff_nanos: options.flush_backoff_nanos.max(1),
-            room_recheck_nanos: options.room_recheck_nanos.max(1),
-            commit_spin_nanos: options.commit_spin_nanos,
-            tail_index: false,
-            locks: Mutex::new(None),
-            keep_locks: AtomicBool::new(false),
-            arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
-            close_done: AtomicBool::new(false),
-            application_owned: false,
-            no_writes: true,
-            lock_file: None,
-            opened_in: pigeonhole_io::sys::process_id(),
-            default_durability: AtomicU8::new(options.durability as u8),
-            closed: AtomicBool::new(false),
-            closing: AtomicBool::new(false),
-            pager_poisoned: AtomicBool::new(false),
-            failure: Default::default(),
-            close: CloseState::new(0),
-            metrics: Vec::new(),
-            clock: Default::default(),
-            flushed_through: Vec::new(),
-            loads: Vec::new(),
-            balance: BalanceConfig::default(),
-            view_capacity: shm_config.view_buffer_bytes as usize,
-            tablet_epoch: AtomicU64::new(0),
-            full_compactions: AtomicUsize::new(0),
-            pack_k: AtomicUsize::new(0),
-            pack_target: AtomicUsize::new(0),
-            waiters: WatermarkWaiters::new(shards),
-            durable_waiters: WatermarkWaiters::new(shards),
-            visibility: VisibilityCounts::default(),
-            shard_died: AtomicBool::new(false),
-            manifest_flight: Default::default(),
-            drivers: Default::default(),
-            memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
-            wal_pin_bytes: 0,
-            submitters: std::sync::OnceLock::new(),
-            wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
-            shm_dir: options.shm_dir.clone(),
+            empty_view,
+            &pager,
+            &cache,
+            &options,
+            shm_config.view_buffer_bytes as usize,
             identity,
-            path: path.to_path_buf(),
-        });
+            path,
+        ));
         let reader = ReaderState {
             file,
             presence: Mutex::new(Some(presence)),
@@ -1862,6 +1725,20 @@ impl Engine {
                 .cloned();
         }
         self.inner.catalog().table_by_name(name).cloned()
+    }
+
+    /// The table with id `id` (ICR 0092): [`Engine::table`] by id, for a handle that knows
+    /// its table's id and wants its current entry without hashing its name on every call.
+    /// `None` once the table is dropped (a table created again under the name has a new id).
+    pub fn table_by_id(&self, id: TableId) -> Option<Arc<TableInfo>> {
+        if self.inner.forked() {
+            return None;
+        }
+        // In a writer, under the view's guard, as `table` (#709).
+        if !self.inner.is_reader() {
+            return self.inner.shared.view.load().catalog.table(id).cloned();
+        }
+        self.inner.catalog().table(id).cloned()
     }
 
     /// Every table.
@@ -2322,30 +2199,13 @@ impl Engine {
     }
 
     /// [`Engine::read_row_latest_into`] that never blocks: the read runs now in cache-only
-    /// mode, through the row cache, and returns `None` when it would need a block the cache
-    /// does not hold (and in a reader process). `sink` may then hold some of the row's cells;
-    /// start [`Engine::read_row_latest_async`] with an empty one. A memtable or cache hit is
-    /// the async read's fast path: no future, no reference counted (#709). The miss is
-    /// dropped, with any read the cursor submitted for it; [`Engine::try_read_row_latest`]
-    /// keeps it for the future.
-    pub fn try_read_row_latest_into(
-        &self,
-        table: TableId,
-        row: &[u8],
-        families: &[FamilyId],
-        spec: &ReadSpec,
-        sink: &mut impl read::RowSink,
-    ) -> Option<Result<bool>> {
-        // Dropping the miss's read in flight is safe: a dropped `Completion` leaves the buffer
-        // with the backend until the device is done with it (pigeonhole-io's completion
-        // contract, #976).
-        self.try_read_row_latest(table, row, families, spec, sink)
-            .ok()
-    }
-
-    /// [`Engine::try_read_row_latest_into`] that keeps its miss (#709): `Err` carries the
-    /// block the read missed on, with the read the cursor submitted for it, for
-    /// [`Engine::read_row_latest_async_after`] to resume instead of submitting again.
+    /// mode, through the row cache. A memtable or cache hit is the async read's fast path: no
+    /// future, no reference counted (#709). When the read would need a block the cache does
+    /// not hold (and in a reader process), `Err` carries the block it missed on, with the
+    /// read the cursor submitted for it, for [`Engine::read_row_latest_async_after`] to resume
+    /// instead of submitting again; `sink` may then hold some of the row's cells. Dropping
+    /// the miss is safe: a dropped `Completion` leaves the buffer with the backend until the
+    /// device is done with it (pigeonhole-io's completion contract, #976).
     pub fn try_read_row_latest(
         &self,
         table: TableId,
@@ -5140,5 +5000,124 @@ fn open_data_file(
             Ok(())
         }
         Err(e) => Err(e.into()),
+    }
+}
+
+impl Shared {
+    /// What the writer's open and a reader process's build alike, as a reader process has
+    /// it: no row cache, no shard state, no lock file. The writer's open replaces its own
+    /// fields with struct update syntax.
+    #[allow(clippy::too_many_arguments)]
+    fn base(
+        vfs: &VfsRef,
+        shm: &ShmRegion,
+        shards: usize,
+        view: Arc<View>,
+        pager: &Arc<Pager>,
+        cache: &Arc<BlockCache>,
+        options: &EngineOptions,
+        view_capacity: usize,
+        identity: pigeonhole_io::FileIdentity,
+        path: &Path,
+    ) -> Self {
+        Shared {
+            vfs: Arc::clone(vfs),
+            shm: shm.clone(),
+            reader_reclaim_at: AtomicU64::new(0),
+            reader_slots_reclaimed: AtomicU64::new(0),
+            shards,
+            view: ArcSwap::new(view),
+            async_sync_reads: AtomicU64::new(0),
+            commit_parks: AtomicU64::new(0),
+            view_lock: Mutex::new(0),
+            view_record: Mutex::default(),
+            manifest: Mutex::new(ManifestWriter::new(Arc::clone(pager))),
+            manifest_queue: Default::default(),
+            manifest_busy: AtomicBool::new(false),
+            pager: Arc::clone(pager),
+            cache: Arc::clone(cache),
+            row_cache: None,
+            row_epochs: None,
+            sst_ids: Arc::new(AtomicU64::new(0)),
+            blob_ids: Arc::new(AtomicU32::new(0)),
+            live_views: Arc::new(LiveViews::default()),
+            live_seqnos: Arc::new(LiveSeqnos::default()),
+            flushed_roots: Default::default(),
+            busy_ssts: Mutex::new(HashSet::new()),
+            large: Default::default(),
+            large_open: AtomicUsize::new(0),
+            view_versions: Mutex::new(BTreeMap::new()),
+            #[cfg(feature = "test-hooks")]
+            hooks: Default::default(),
+            picker: options.compaction.clone(),
+            write_stall_timeout_nanos: options.write_stall_timeout_nanos,
+            compaction_backoff_nanos: options.compaction_backoff_nanos.max(1),
+            flush_backoff_nanos: options.flush_backoff_nanos.max(1),
+            commit_spin_nanos: options.commit_spin_nanos,
+            tail_index: false,
+            // The writer's open fills it as its last step (`held`).
+            locks: Mutex::new(None),
+            keep_locks: AtomicBool::new(false),
+            arena_discard: AtomicU8::new(crate::shard::ARENAS_PENDING),
+            close_done: AtomicBool::new(false),
+            application_owned: false,
+            no_writes: true,
+            lock_file: None,
+            opened_in: pigeonhole_io::sys::process_id(),
+            default_durability: AtomicU8::new(options.durability as u8),
+            closed: AtomicBool::new(false),
+            closing: AtomicBool::new(false),
+            pager_poisoned: AtomicBool::new(false),
+            failure: Default::default(),
+            close: CloseState::new(0),
+            metrics: Vec::new(),
+            clock: Default::default(),
+            flushed_through: Vec::new(),
+            loads: Vec::new(),
+            balance: BalanceConfig::default(),
+            view_capacity,
+            tablet_epoch: AtomicU64::new(0),
+            full_compactions: AtomicUsize::new(0),
+            pack_k: AtomicUsize::new(0),
+            pack_target: AtomicUsize::new(0),
+            waiters: WatermarkWaiters::new(shards),
+            durable_waiters: WatermarkWaiters::new(shards),
+            visibility: VisibilityCounts::default(),
+            shard_died: AtomicBool::new(false),
+            manifest_flight: Default::default(),
+            drivers: Default::default(),
+            memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
+            wal_pin_bytes: 0,
+            submitters: std::sync::OnceLock::new(),
+            wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
+            shm_dir: options.shm_dir.clone(),
+            identity,
+            path: path.to_path_buf(),
+        }
+    }
+}
+
+impl View {
+    /// The view an open starts from, before the first publish: no tablets, an empty catalog,
+    /// empty memtables for each of `shards` and no SSTs.
+    fn empty(
+        manifest_version: u64,
+        shards: usize,
+        registry: &Arc<MergeRegistry>,
+        pager: &Pager,
+        cache: &Arc<BlockCache>,
+    ) -> Arc<View> {
+        Arc::new(View {
+            version: 0,
+            manifest_version,
+            tablets: Arc::new(TabletMap::default()),
+            catalog: Arc::new(Catalog::with_registry(Arc::clone(registry))),
+            mems: (0..shards)
+                .map(|_| Arc::new(ShardMems::default()))
+                .collect(),
+            ssts: Arc::new(SstSet::empty(pager.data_file().clone(), Arc::clone(cache))),
+            _pin: None,
+            released: false,
+        })
     }
 }

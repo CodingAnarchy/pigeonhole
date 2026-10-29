@@ -112,7 +112,7 @@ Project-level deviations from the original briefs are recorded in [decisions](de
 ## pigeonhole-bench
 - **Goal:** Measure every gate reproducibly.
 - **Read:** Goals; How it will be measured; Reference hardware.
-- **Owns:** YCSB A to F, sparse-wide, time-series with TTL, adjacency scans, skewed multi-shard writes; runners for RocksDB, SQLite and Fjall; p50, p99 and p99.9 reports.
+- **Owns:** YCSB A to F, sparse-wide, time-series with TTL, adjacency scans, skewed multi-shard writes; runners for RocksDB and SQLite (fjall dropped by the owner, 2026-10-29); p50, p99 and p99.9 reports.
 - **Uses:** pigeonhole.
 - **Done when:** repeated runs on the reference hardware agree within a set tolerance.
 - **Out of scope:** tuning the engine.

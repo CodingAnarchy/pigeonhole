@@ -1,9 +1,9 @@
 //! Benchmark workloads and comparison runners for Pigeonhole.
 //!
 //! A [`Workload`] generates operations; a [`Runner`] executes them against one store; a
-//! [`Report`] summarizes latency percentiles and throughput. Runners for RocksDB, SQLite
-//! (EAV) and fjall sit behind the cargo features `rocksdb`, `sqlite` and `fjall`, so their
-//! dependencies never enter the default build.
+//! [`Report`] summarizes latency percentiles and throughput. Runners for RocksDB and SQLite
+//! (EAV) sit behind the cargo features `rocksdb` and `sqlite`, so their dependencies never
+//! enter the default build.
 //!
 //! Every run records its seed and hardware description; results are labeled non-reference
 //! until reference hardware exists (decision D5). The `phdb-bench` binary drives the
@@ -42,8 +42,6 @@ pub use report::{
     LatencyStats, OpTypeStats, Placement, ReadSplit, ReaderProcesses, Riders, Rounds, RunDetail,
     RunRecord, SUITE_FORMAT, Scaling, Settle, ShardShare, Stalls, Suite, Tolerance, compare,
 };
-#[cfg(feature = "fjall")]
-pub use runners::fjall::FjallRunner;
 pub use runners::inline::INLINE_IN_FLIGHT;
 pub use runners::pigeonhole::DEFAULT_MEMTABLE_BUDGET;
 pub use runners::placement::{PLACEMENT_RATE_PER_SHARD, PLACEMENT_SETTLE_BOUND, PlacementOptions};
@@ -100,16 +98,14 @@ pub enum WorkloadKind {
     /// Counters (D247): from [`COUNTER_THREADS`] clients, 90% increments of a Zipfian row's
     /// counter ([`BenchOp::Incr`]) and 10% reads of one ([`BenchOp::ReadCounter`]). Pigeonhole
     /// increments a counter family without reading it; RocksDB uses a merge operator (an
-    /// `i64` add), SQLite an upsert, fjall a locked read-modify-write. Not in `all`: the gate's
-    /// `contended` step runs it.
+    /// `i64` add), SQLite an upsert. Not in `all`: the gate's `contended` step runs it.
     Counters,
     /// Transfers (D247, reported): from [`COUNTER_THREADS`] clients, each operation moves one
     /// unit between two Zipfian accounts in one transaction that reads both
     /// ([`BenchOp::Transfer`]). Pigeonhole runs an optimistic `Transaction`, retried on a
     /// conflict (counted, [`RunDetail::txn_conflicts`]); RocksDB runs an
-    /// `OptimisticTransactionDB` transaction (or `TransactionDB`'s, as `rocksdb-txn`) and fjall
-    /// an optimistic write transaction, each retried on a conflict (D274); SQLite uses an
-    /// immediate transaction. Not in `all`.
+    /// `OptimisticTransactionDB` transaction (or `TransactionDB`'s, as `rocksdb-txn`), retried on
+    /// a conflict (D274); SQLite uses an immediate transaction. Not in `all`.
     Transfer,
     /// Sparse-wide with deletes (D247, reported): [`WorkloadKind::SparseWide`]'s mix with 5% of
     /// the operations deleting, half a column ([`BenchOp::DeleteColumn`]) and half a whole row
@@ -577,7 +573,7 @@ pub const TRANSFER_CROSS_SHARD: &str = "transfer (cross-shard)";
 
 /// A store under test.
 pub trait Runner {
-    /// Store name for reports (`pigeonhole`, `rocksdb`, `sqlite-eav`, `fjall`).
+    /// Store name for reports (`pigeonhole`, `rocksdb`, `sqlite-eav`).
     fn name(&self) -> &'static str;
 
     /// Opens a fresh store in `dir`.
@@ -1005,6 +1001,7 @@ pub fn run_detailed(
             warmup_secs: Some(warmed.secs),
             warmup_settle_secs: Some(warmed.settle_secs),
             warmup_settled: Some(warmed.settled),
+            settle_after_warmup: warmed.settle_after,
             drivers: warmed.drivers,
             seqnos_used,
             txn_conflicts,
@@ -1207,7 +1204,15 @@ fn measure(
         (WARMUP_SETTLED, WARMUP_CAP)
     };
     runner.mark_phase("warmup");
-    let warmed = warm_up(runner, &mut clients, &warm, quiet, cap)?;
+    let mut warmed = warm_up(runner, &mut clients, &warm, quiet, cap)?;
+    // D243 (amended 2026-10-29): the settle step again, after the warmup, so the measured
+    // phase starts on an empty write buffer whatever the warmup wrote. How long the warmup
+    // waits for the placement varies run to run, and with it whether a flush lands in the
+    // warmup or the measured phase: adjacency's p50 went 12 or 17 µs with it, 4 for 4,
+    // across the 10-26 and 10-28 gates. A flush inside the measured phase now lands at the
+    // same operation in both runs of a pair.
+    runner.mark_phase("warmup-settle");
+    warmed.settle_after = Some(settle(runner)?);
 
     // The measured operations: the configured count, then, while less than `min_measured`
     // has been measured, the stream's next operations, about enough for the rest at the rate
@@ -1343,6 +1348,7 @@ fn warm_up_on(
             settle_secs: 0.0,
             settled: true,
             drivers: runner.driver_target().map(|(k, _)| k),
+            settle_after: None,
         });
     }
     // A pass stops at the cap on the wall clock too.
@@ -1387,6 +1393,7 @@ fn warm_up_on(
         settle_secs: (last_change - started).as_secs_f64(),
         settled,
         drivers: drivers.map(|(k, _)| k),
+        settle_after: None,
     })
 }
 
@@ -1402,6 +1409,8 @@ struct Warmed {
     settled: bool,
     /// The driver threads the shards ran on at the end (D289 PR 2), if the store reports them.
     drivers: Option<usize>,
+    /// The settle step after the warmup (D243's amendment), once it has run.
+    settle_after: Option<Settle>,
 }
 
 /// Whether the balancer is still heading somewhere (D242's amendments, #983): a growth or

@@ -1390,6 +1390,7 @@ The AX102 confirms at 64 GiB.
 - **The short runs are lengthened.** `--min-secs S` now applies to client runs as well as inline ones. A client run whose configured operations measure under S seconds continues with the workload stream's next operations, in passes sized from the rate so far, until S seconds are measured. Each pass's operations are generated before its clock starts.
 - **In the gate.** `run-window.sh` runs every `all` (both io_uring runs and pread) with `--min-secs 10`, and the D213 group-commit run inside it with the judged run's 2M commits (`--inline-ops`). The dry run (`--scale small`) uses 1 s.
 - The tolerance itself (±20% throughput and p50, ±40% p99) is unchanged. (D259 later added absolute floors for the latencies.)
+- **The measured phase starts on a settled store** (amendment of 2026-10-29). D233's settle step (flush, then wait for the background work to stop) runs again after the warmup, so every client run's measured phase starts on an empty write buffer. A flush inside the measured phase then lands at the same operation in both runs of a pair. The JSON records it as `detail.settle_after_warmup`. The inline drivers have no settle step and are unchanged.
 
 **Why:** the 2026-10-13 gate's second pair failed only on short runs:
 - the D213 shape inside `all` measured 0.16 s (+53% throughput, −41% p50);
@@ -1401,6 +1402,8 @@ At those lengths, one flush or compaction more or less, or a placement change, m
 *History: amended by [D258](#d258), 2026-10-19: the gate window trims the data file system before every step, so the reproducibility pair doesn't also differ in how much of the NVMe the drive maps.*
 
 *History: amended by [D259](#d259), 2026-10-19: a judged latency fails only past both its relative tolerance and an absolute floor (p50 3 µs, p99 6 µs at the default tolerance).*
+
+*History: amended 2026-10-29 (owner, via the coordinator; `.coord/d243-misses-2026-10-29.md`): the settle step also runs after the warmup. In both the 10-26 and 10-28 gates, `adjacency/pigeonhole` t=1 missed on p50 in opposite directions. Each run had one flush, and how long the warmup waited for the placement (D242) decided whether it landed in the warmup (p50 about 17 µs) or the measured phase (about 12 µs), 4 runs for 4. Every `all` and `contended` number moves to a new baseline from the first gate after this, so that gate is compared with its own pair, not with 10-26 or 10-28.*
 
 <a id="d244"></a>
 ## D244 — A participant keeps a cross-shard commit's timestamp in seqno order with the writes it already stamped, with tablet changes on or off (owner decision, 2026-10-13; engine, tablets, #653; amends D142 and D192's note)
@@ -2600,7 +2603,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - `blocking_waits`' failed-share-apply test is unchanged and passes. freeze_wake's hold helper now makes shard 1 the last applier.
 
 <a id="d280"></a>
-## D280 — The 1.0 performance bars beside #708 (owner decision, 2026-10-26; bench, engine, pigeonhole; amended 2026-10-26 and 2026-10-28)
+## D280 — The 1.0 performance bars beside #708 (owner decision, 2026-10-26; bench, engine, pigeonhole; amended 2026-10-26, 2026-10-28 and 2026-10-29)
 
 **Decided:** besides #708 (D274), these are 1.0 criteria. Each is judged at the gate's configs on throughput **and** p99, with a goal of 1.0× and a floor of 1.2×:
 - **Competitor rows:** #711, #712, #713, #759 and #760, against the gate's comparison store (RocksDB or SQLite).
@@ -2611,6 +2614,9 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 **Amended (owner, 2026-10-28):**
 - **#759:** judged at equal cache memory for both stores, at each store's maximum throughput, provided SQLite is confirmed saturated there. It is also judged and reported at equal offered load. The guide reports the latency-against-throughput tradeoff truthfully.
 - **#708:** transfer at Buffered is accepted for 1.0 as a documented gap (the default durability passes at 1.20×). Cross-shard commit cost continues after 1.0 in #1023.
+
+**Amended (owner, 2026-10-29):**
+- **Async (#709, #749):** judged at equal client threads. 16 client threads with 16 operations in flight each must reach at least 0.83× the throughput of the synchronous run on the same 16 threads (the contended step's row). Async p99 is judged against the synchronous run with the same total in flight (256 threads), since 16 times as many operations in flight can't match the 16-thread run's latency. The 256-thread run's throughput is reported beside it. That gap is the hardware threads 256 blocking clients keep busy (all 32 on the reference machine, against 16 client threads), not an async overhead: after #1086 an async ycsb-c read costs less CPU than a blocking one (6.2 against 6.8 µs per operation).
 
 <a id="d281"></a>
 ## D281 — Reader processes have a row cache, keyed on the writer's write watermarks in shared memory (owner decision, 2026-10-26; cache, shm, engine, pigeonhole, #926; refines D201)

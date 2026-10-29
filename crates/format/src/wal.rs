@@ -750,7 +750,8 @@ impl BatchBuilder {
         self.count == 0
     }
 
-    /// The encoded batch.
+    /// The encoded batch. Valid as [`BatchRef::new`] would find it: every push checked its
+    /// mutation before writing it, so a reader of this needs no validating decode.
     pub fn batch(&self) -> BatchRef<'_> {
         BatchRef {
             bytes: &self.buf,
@@ -784,6 +785,7 @@ impl<'a> BatchRef<'a> {
         let mut it = BatchIter {
             rest: r.rest(),
             remaining: count,
+            validate: true,
         };
         for m in &mut it {
             m?;
@@ -816,6 +818,7 @@ impl<'a> BatchRef<'a> {
         BatchIter {
             rest: self.bytes.get(4..).unwrap_or_default(),
             remaining: self.count,
+            validate: false,
         }
     }
 }
@@ -844,6 +847,11 @@ pub struct Mutation<'a> {
 pub struct BatchIter<'a> {
     rest: &'a [u8],
     remaining: u32,
+    /// Whether each mutation's fields are checked: only in [`BatchRef::new`]'s pass. A
+    /// `BatchRef` exists only once its bytes passed that check (or were built by
+    /// [`BatchBuilder`], which checks each mutation as it is pushed), so its own iterators
+    /// skip it.
+    validate: bool,
 }
 
 impl<'a> BatchIter<'a> {
@@ -877,9 +885,11 @@ impl<'a> BatchIter<'a> {
             qualifier: take_bytes(&mut rest)?,
             value: take_bytes(&mut rest)?,
         };
-        check_mutation(m.kind, m.row, m.qualifier, m.value.len(), |what| {
-            Error::Corrupt { what }
-        })?;
+        if self.validate {
+            check_mutation(m.kind, m.row, m.qualifier, m.value.len(), |what| {
+                Error::Corrupt { what }
+            })?;
+        }
         self.rest = rest;
         Ok(m)
     }

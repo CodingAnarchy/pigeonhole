@@ -10,7 +10,7 @@ use common::{Cell, cell, config, sized};
 use pigeonhole_format::Cursor;
 use pigeonhole_format::block::{Block, BlockBuilder, BlockKind, seal_with_level, verify};
 use pigeonhole_format::compress::{Compression, decompress};
-use pigeonhole_format::key::{decode_key, row_prefix_len};
+use pigeonhole_format::key::{common_prefix_len, decode_key, row_prefix_len};
 use pigeonhole_format::scan::{QualifierFilter, ScanFilter, Verdict};
 use proptest::collection::{btree_map, vec};
 use proptest::prelude::*;
@@ -45,8 +45,54 @@ fn collect<B: std::ops::Deref<Target = [u8]>>(
     out
 }
 
+/// Entries whose rows come from a small pool (several cells a row, rows with long shared
+/// prefixes), for `add_prefixed_writes_what_add_writes`.
+fn row_heavy_entries() -> impl Strategy<Value = BTreeMap<Vec<u8>, Vec<u8>>> {
+    const ROWS: [&[u8]; 5] = [
+        b"r",
+        b"row-0000000000-a",
+        b"row-0000000000-b",
+        b"row-0000000000",
+        b"z\x00y",
+    ];
+    btree_map(
+        (0..ROWS.len(), cell()).prop_map(|(i, mut c): (usize, Cell)| {
+            c.row = ROWS[i].to_vec();
+            c.encode()
+        }),
+        vec(any::<u8>(), 0..20),
+        0..sized(80, 6),
+    )
+}
+
 proptest! {
     #![proptest_config(config(400))]
+
+    /// ICR 0093: a data builder fed through `add_prefixed` (the caller's common prefix with
+    /// the previous key, across resets, and row prefix length) writes byte for byte what one
+    /// fed through `add` writes, block after block.
+    #[test]
+    fn add_prefixed_writes_what_add_writes(
+        model in prop_oneof![entries(), row_heavy_entries()],
+        interval in 1usize..20,
+        cuts in vec(0usize..80, 0..4),
+    ) {
+        let mut plain = BlockBuilder::data(interval);
+        let mut prefixed = BlockBuilder::data(interval);
+        let mut prev: Vec<u8> = Vec::new();
+        for (i, (k, v)) in model.iter().enumerate() {
+            if i > 0 && cuts.contains(&i) {
+                prop_assert_eq!(plain.finish(), prefixed.finish(), "block ending before entry {}", i);
+                plain.reset();
+                prefixed.reset();
+            }
+            plain.add(k, v).unwrap();
+            let lcp = common_prefix_len(k, &prev);
+            prefixed.add_prefixed(k, v, lcp, row_prefix_len(k).unwrap()).unwrap();
+            prev.clone_from(k);
+        }
+        prop_assert_eq!(plain.finish(), prefixed.finish());
+    }
 
     #[test]
     fn data_block_matches_model(
@@ -500,4 +546,11 @@ fn one_byte_entry_header_past_the_block_is_corrupt() {
         Err(pigeonhole_format::Error::Corrupt { .. })
     ));
     assert!(!it.valid());
+}
+
+/// ICR 0093: `add_prefixed` is for data blocks only.
+#[test]
+fn add_prefixed_refuses_an_index_block() {
+    let mut b = BlockBuilder::index();
+    assert!(b.add_prefixed(b"k", b"v", 0, 1).is_err());
 }

@@ -1884,6 +1884,38 @@ fn snapshots_from_another_database_are_refused() {
     assert!(t.get_at(&own, b"r", "a", b"q").unwrap().is_some());
 }
 
+/// A transaction begun before the database closed fails every later operation with
+/// `Closed`: its reads, its row read, its async read and both commit forms. (The generation
+/// check alone decides this since the separate open check went, perf-nit PR-b.)
+#[test]
+fn transaction_operations_after_close_fail_with_closed() {
+    let db = db();
+    let t = table(&db);
+    t.mutate(b"r").put("a", b"q", b"v").commit().unwrap();
+    let mut reads = db.transaction().unwrap();
+    let commit = db.transaction().unwrap();
+    let commit_async = db.transaction().unwrap();
+    db.clone().close().unwrap();
+    let code = |r: pigeonhole::Result<()>| r.unwrap_err().code();
+    assert_eq!(
+        code(reads.get(&t, b"r", "a", b"q").map(|_| ())),
+        ErrorCode::Closed
+    );
+    assert_eq!(
+        code(reads.get_row(&t, b"r", &["a"]).map(|_| ())),
+        ErrorCode::Closed
+    );
+    assert_eq!(
+        code(pigeonhole::doc_support::block_on(reads.get_async(&t, b"r", "a", b"q")).map(|_| ())),
+        ErrorCode::Closed
+    );
+    assert_eq!(code(commit.commit().map(|_| ())), ErrorCode::Closed);
+    assert_eq!(
+        code(pigeonhole::doc_support::block_on(commit_async.commit_async()).map(|_| ())),
+        ErrorCode::Closed
+    );
+}
+
 #[test]
 fn reads_after_close_fail_with_closed() {
     let db = db();

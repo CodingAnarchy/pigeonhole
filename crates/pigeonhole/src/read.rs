@@ -52,10 +52,15 @@ pub enum ValueFilter {
 
 impl ValueFilter {
     pub(crate) fn to_engine(&self) -> ValuePredicate {
+        self.clone().into_engine()
+    }
+
+    /// [`ValueFilter::to_engine`] without the copy, for a filter the caller owns.
+    pub(crate) fn into_engine(self) -> ValuePredicate {
         match self {
-            ValueFilter::Equals(v) => ValuePredicate::Equals(v.clone()),
-            ValueFilter::Prefix(v) => ValuePredicate::Prefix(v.clone()),
-            ValueFilter::I64(o, v) => ValuePredicate::I64(*o, *v),
+            ValueFilter::Equals(v) => ValuePredicate::Equals(v),
+            ValueFilter::Prefix(v) => ValuePredicate::Prefix(v),
+            ValueFilter::I64(o, v) => ValuePredicate::I64(o, v),
         }
     }
 }
@@ -92,7 +97,7 @@ pub enum Condition {
 }
 
 /// A read's selected families, resolved: inline for up to four.
-type FamilyIds = SmallVec<[FamilyId; 4]>;
+pub(crate) type FamilyIds = SmallVec<[FamilyId; 4]>;
 
 /// The selection shared by row reads and scans, with family names kept until the read
 /// starts (builders never fail; errors surface at `read`/`iter`).
@@ -186,7 +191,7 @@ impl Selection {
             }
             // The retry only with a supervisor (`Db::supervised`).
             None if core.db.supervised() => core.snapshot_supervised()?,
-            None => core.engine().snapshot()?,
+            None => core.with(pigeonhole_engine::Engine::snapshot)?,
         };
         // The catalog as of the snapshot names every family it can return, and resolves a
         // family dropped (or dropped and created again) since as the snapshot saw it; a name
@@ -263,7 +268,7 @@ macro_rules! selection_methods {
 
         /// Only cells whose value matches.
         pub fn value_filter(mut self, filter: ValueFilter) -> Self {
-            self.sel.spec.value = Some(filter.to_engine());
+            self.sel.spec.value = Some(filter.into_engine());
             self
         }
 
@@ -373,21 +378,19 @@ impl<'t> RowRead<'t> {
             None if self.core.db.supervised() => {
                 self.read_latest_supervised(table, &families, &mut buf)?
             }
-            None => self.core.engine().read_row_latest_into(
-                table,
-                &self.row,
-                &families,
-                &self.sel.spec,
-                &mut buf,
-            )?,
-            Some(snapshot) => self.core.engine().read_row_into_families(
-                snapshot,
-                table,
-                &self.row,
-                &families,
-                &self.sel.spec,
-                &mut buf,
-            )?,
+            None => self.core.with(|e| {
+                e.read_row_latest_into(table, &self.row, &families, &self.sel.spec, &mut buf)
+            })?,
+            Some(snapshot) => self.core.with(|e| {
+                e.read_row_into_families(
+                    snapshot,
+                    table,
+                    &self.row,
+                    &families,
+                    &self.sel.spec,
+                    &mut buf,
+                )
+            })?,
         };
         if !any {
             return Ok(None);
@@ -585,9 +588,7 @@ impl<'t> Scan<'t> {
         spec.limit = self.limit.unwrap_or(0);
         let cursor = self
             .core
-            .db
-            .engine()
-            .scan(&snapshot, self.core.info.id, spec)?;
+            .with(|e| e.scan(&snapshot, self.core.info.id, spec))?;
         Ok(RowIter {
             cursor,
             buf: RowBuf::new(info, 0),
@@ -615,9 +616,7 @@ impl<'t> Scan<'t> {
             spec.limit = self.limit.unwrap_or(0);
             let cursor = self
                 .core
-                .db
-                .engine()
-                .scan_async(&snapshot, self.core.info.id, spec)?;
+                .with(|e| e.scan_async(&snapshot, self.core.info.id, spec))?;
             Ok((cursor, RowBuf::new(info, 0)))
         })();
         crate::nonblocking::RowStream::new(started, limit_zero, self.core, generation)

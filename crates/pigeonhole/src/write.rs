@@ -1118,7 +1118,6 @@ impl Transaction {
         if let Some(e) = self.error {
             return Err(e);
         }
-        self.db.check_open()?;
         self.db.check_generation(self.generation)?;
         let (largest_value, max_value) = (self.largest_value, self.db.max_value);
         // The transaction runs on the engine it began on: its generation.
@@ -1139,7 +1138,6 @@ impl Transaction {
         if let Some(e) = self.error {
             return Err(e);
         }
-        self.db.check_open()?;
         self.db.check_generation(self.generation)?;
         let (largest, max) = (self.largest_value, self.db.max_value);
         // A transaction's engine is the one it began on: a recovery running means its
@@ -1168,7 +1166,6 @@ impl Transaction {
     ) -> Result<Option<CellRef<'_>>> {
         let read = (|| {
             check_table(&self.db, table)?;
-            self.db.check_open()?;
             self.db.check_generation(self.generation)?;
             let family = table.core.family_id_at(self.txn.snapshot(), family)?;
             Ok(self.txn.get(table.core.info.id, family, row, qualifier)?)
@@ -1202,14 +1199,13 @@ impl Transaction {
     ) -> Result<Option<crate::RowRef<'_>>> {
         let read = (|| {
             check_table(&self.db, table)?;
-            self.db.check_open()?;
             self.db.check_generation(self.generation)?;
             // The families as the transaction's snapshot saw them, which name its cells (#892).
             let snapshot = self.txn.snapshot();
             let ids = families
                 .iter()
                 .map(|f| table.core.family_id_at(snapshot, f))
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<crate::read::FamilyIds>>()?;
             let mut spec = pigeonhole_engine::ReadSpec::default();
             spec.versions = 1;
             let mut buf = crate::cell::RowBuf::new(table.core.info_at(snapshot), 0);
@@ -1247,7 +1243,6 @@ impl Transaction {
         qualifier: &[u8],
     ) -> crate::nonblocking::GetFuture {
         let started = check_table(&self.db, table)
-            .and_then(|()| self.db.check_open())
             .and_then(|()| self.db.check_generation(self.generation))
             .and_then(|()| table.core.family_id_at(self.txn.snapshot(), family))
             .map(|family| {

@@ -685,12 +685,7 @@ impl Model {
         let Some(t) = self.tables.get(table) else {
             return Ok(Vec::new());
         };
-        let to_owned = |b: Bound<&[u8]>| match b {
-            Bound::Included(k) => Bound::Included(k.to_vec()),
-            Bound::Excluded(k) => Bound::Excluded(k.to_vec()),
-            Bound::Unbounded => Bound::Unbounded,
-        };
-        let (start, end) = (to_owned(start), to_owned(end));
+        let (start, end) = (start.map(<[u8]>::to_vec), end.map(<[u8]>::to_vec));
         // `BTreeMap::range` panics on an empty or inverted range; the model returns nothing.
         let inverted = match (&start, &end) {
             (Bound::Included(s), Bound::Included(e)) => s > e,
@@ -1187,15 +1182,8 @@ fn resolve(
     // A version whose fold failed is `None`; it is an error only if it is returned.
     let mut out: Vec<(Timestamp, Option<Vec<u8>>)> = Vec::new();
     let mut run: Option<(Timestamp, i64)> = None;
-    let mut i = 0;
-    while i < live.len() {
-        let ts = live[i].ts;
-        let end = live[i..]
-            .iter()
-            .position(|e| e.ts != ts)
-            .map_or(live.len(), |n| i + n);
-        let group = &live[i..end];
-        i = end;
+    for group in live.chunk_by(|a, b| a.ts == b.ts) {
+        let ts = group[0].ts;
         let base = group.iter().position(|e| matches!(e.kind, Kind::Put(_)));
         let operands = group[..base.unwrap_or(group.len())]
             .iter()
@@ -1224,15 +1212,7 @@ fn resolve(
     if let Some((run_ts, sum)) = run {
         out.push((run_ts, Some(sum.to_le_bytes().to_vec())));
     }
-    let mut cap = if family.max_versions == 0 {
-        usize::MAX
-    } else {
-        family.max_versions as usize
-    };
-    if limit != 0 {
-        cap = cap.min(limit as usize);
-    }
-    out.truncate(cap);
+    out.truncate(version_cap(family, limit));
     out.into_iter()
         .map(|(ts, value)| {
             value
@@ -1280,46 +1260,45 @@ fn resolve_counter(
         })
         .collect();
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.seqno)));
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < live.len() {
-        let ts = live[i].ts;
-        let end = live[i..]
-            .iter()
-            .position(|e| e.ts != ts)
-            .map_or(live.len(), |n| i + n);
-        let group = &live[i..end];
-        i = end;
+    // A timestamp's version: the operands newer than its newest put, added to that put
+    // (`None` if the put is not an `i64`), or the sum of its operands if it has no put.
+    let version = |group: &[&Entry]| {
         let mut sum = 0i64;
-        let mut value = None;
         for e in group {
             match &e.kind {
                 Kind::Merge(d) => sum = sum.wrapping_add(*d),
-                Kind::Put(v) => {
-                    value = as_i64(v).map(|base| sum.wrapping_add(base));
-                    break;
-                }
+                Kind::Put(v) => return as_i64(v).map(|base| sum.wrapping_add(base)),
                 _ => {}
             }
         }
-        let base_put = group.iter().any(|e| matches!(e.kind, Kind::Put(_)));
-        out.push((ts, if base_put { value } else { Some(sum) }));
-    }
-    let mut cap = if family.max_versions == 0 {
-        usize::MAX
-    } else {
-        family.max_versions as usize
+        Some(sum)
     };
-    if limit != 0 {
-        cap = cap.min(limit as usize);
-    }
-    out.truncate(cap);
+    let mut out: Vec<(Timestamp, Option<i64>)> = live
+        .chunk_by(|a, b| a.ts == b.ts)
+        .map(|group| (group[0].ts, version(group)))
+        .collect();
+    out.truncate(version_cap(family, limit));
     out.into_iter()
         .map(|(ts, v)| {
             v.map(|v| (ts, v.to_le_bytes().to_vec()))
                 .ok_or_else(|| ModelError::MergeFailed(family.name.clone()))
         })
         .collect()
+}
+
+/// How many versions a read of `family` returns: its `max_versions` (0 = all), at most
+/// `limit` (0 = no limit).
+fn version_cap(family: &ModelFamily, limit: u32) -> usize {
+    let cap = if family.max_versions == 0 {
+        usize::MAX
+    } else {
+        family.max_versions as usize
+    };
+    if limit == 0 {
+        cap
+    } else {
+        cap.min(limit as usize)
+    }
 }
 
 /// `ops` with the writes of counter families combined as the store combines them within

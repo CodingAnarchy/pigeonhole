@@ -4,8 +4,8 @@
 use std::path::Path;
 
 use pigeonhole::{
-    CheckOptions, CheckReport, ErrorCode, Finding, Pigeonhole, ReaderOptions, Region, RegionKind,
-    Severity, Structure,
+    CheckOptions, CheckReport, ErrorCode, Finding, Pigeonhole, PigeonholeReader, ReaderOptions,
+    Region, RegionKind, Severity, Snapshot, Structure,
 };
 use serde_json::{Map, Value, json};
 
@@ -219,6 +219,28 @@ fn offline(file: &Path, r: &CheckReport, deep: bool, map: bool) -> Report {
     }
 }
 
+/// Reads every version of every row of table `name` at `snapshot`, counting rows and cells
+/// as it goes. The first failed read ends the table.
+fn scan_table(
+    db: &PigeonholeReader,
+    name: &str,
+    snapshot: &Snapshot,
+    rows: &mut u64,
+    cells: &mut u64,
+) -> pigeonhole::Result<()> {
+    let table = db.table(name)?;
+    let mut iter = table
+        .scan_prefix(b"")
+        .versions(0)
+        .snapshot(snapshot)
+        .iter()?;
+    while let Some(row) = iter.next_ref()? {
+        *rows += 1;
+        *cells += row.len() as u64;
+    }
+    Ok(())
+}
+
 /// `--online` with a writer running: every table read through a reader process, all
 /// versions, at one snapshot. A failed read is a finding (`structure` is `data`): this sees
 /// only what a scan reaches.
@@ -236,37 +258,8 @@ fn online_scan(cli: &Cli, file: &Path) -> Result<Report, Failure> {
     let (mut tables, mut rows_read, mut cells) = (0u64, 0u64, 0u64);
     for name in db.tables() {
         tables += 1;
-        let table = match db.table(&name) {
-            Ok(t) => t,
-            Err(e) => {
-                findings.push((name.clone(), e));
-                continue;
-            }
-        };
-        let iter = table
-            .scan_prefix(b"")
-            .versions(0)
-            .snapshot(&snapshot)
-            .iter();
-        let mut iter = match iter {
-            Ok(i) => i,
-            Err(e) => {
-                findings.push((name.clone(), e));
-                continue;
-            }
-        };
-        loop {
-            match iter.next_ref() {
-                Ok(Some(row)) => {
-                    rows_read += 1;
-                    cells += row.len() as u64;
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    findings.push((name.clone(), e));
-                    break;
-                }
-            }
+        if let Err(e) = scan_table(&db, &name, &snapshot, &mut rows_read, &mut cells) {
+            findings.push((name, e));
         }
     }
     drop(snapshot);

@@ -23,6 +23,10 @@
 # group-commit row came back once only after the namespace was re-mapped. A missing or
 # failing fstrim is logged, not fatal. `--scale small` doesn't trim.
 #
+# After the trim, setup and the judged steps (all-uring-1, all-uring-2, all-pread, contended)
+# wait up to 3 minutes for the 1-minute load to fall to 1.0 (D243), logged in the output and
+# in RESULTS_DIR/quiet.tsv (step, time, load, seconds waited).
+#
 # Steps (estimated minutes at full scale, from laptop runs scaled; the log records the real
 # ones in RESULTS_DIR/durations.tsv):
 #   setup          machine, kernel, drive and file-system checks; machine.json        1
@@ -191,18 +195,27 @@ trim_data() {
         trimmed="$(sed -n 's/.*(\([0-9]*\) bytes) trimmed.*/\1/p' <<< "$out")"
         echo "-- trim before $name: $out (${secs} s)"
         printf '%s\t%s\t%s\t%d\n' "$name" "$(date -u +%H:%M:%SZ)" "${trimmed:-?}" "$secs" >> "$results/fstrim.tsv"
-        # fstrim waits in D state, which counts in the load average, and setup refuses a
-        # 1-minute load above 1.0: give the average up to 3 minutes to fall back first.
-        if [[ "$name" == setup ]]; then
-            local i
-            for ((i = 0; i < 36; i++)); do
-                awk '{ exit !($1 > 1.0) }' /proc/loadavg || break
-                sleep 5
-            done
-        fi
     else
         echo "-- trim before $name: fstrim $data_mount did not succeed, not fatal (D258): $out"
     fi
+}
+
+# Before setup and the judged steps (D243): waits up to 3 minutes for the 1-minute load to
+# fall to 1.0, so a step doesn't start inside the previous step's tail. Gates 10-26 and
+# 10-28 started all-uring-2 at load 14-15 right after all-uring-1's multi-threaded runs,
+# and its second workload (ycsb-a on RocksDB) missed D243's bound at 10-26. fstrim's D state
+# counts in the load too, and setup refuses a load above 1.0. Logged; never fails the window.
+quiet_steps=" setup all-uring-1 all-uring-2 all-pread contended "
+wait_quiet() {
+    local name="$1" i load
+    [[ "$scale" == full && "$quiet_steps" == *" $name "* ]] || return 0
+    for ((i = 0; i < 36; i++)); do
+        awk '{ exit !($1 > 1.0) }' /proc/loadavg || break
+        sleep 5
+    done
+    load="$(cut -d' ' -f1 /proc/loadavg)"
+    echo "-- quiet before $name: 1-minute load $load after $((i * 5)) s (D243)"
+    printf '%s\t%s\t%s\t%d\n' "$name" "$(date -u +%H:%M:%SZ)" "$load" "$((i * 5))" >> "$results/quiet.tsv"
 }
 
 # Runs step NAME (the function step_NAME) unless it is done, logging its output and time. A
@@ -221,6 +234,7 @@ run() {
         limit=$((minutes[$name] > 20 ? minutes[$name] : 20))
     fi
     trim_data "$name"
+    wait_quiet "$name"
     echo "== $name ($(date -u +%H:%MZ); about ${minutes[$name]} min, limit $limit; then about $(remaining "$name") min left)"
     start=$(date +%s)
     local status=0 pid

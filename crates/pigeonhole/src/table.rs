@@ -188,10 +188,10 @@ impl TableCore {
     /// The catalog entry as of now: a family added through another handle shows up here.
     /// Falls back to the handle's own entry if the table was dropped or replaced.
     pub(crate) fn current_info(&self) -> Arc<TableInfo> {
-        match self.engine().table(&self.info.name) {
-            Some(info) if info.id == self.info.id => info,
-            _ => Arc::clone(&self.info),
-        }
+        // By id: a table dropped, or dropped and created again under its name (a new id),
+        // is not this handle's.
+        self.with(|e| e.table_by_id(self.info.id))
+            .unwrap_or_else(|| Arc::clone(&self.info))
     }
 
     /// The table as `snapshot` saw it, which names every family a read at it can return; the

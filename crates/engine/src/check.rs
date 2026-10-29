@@ -201,8 +201,6 @@ pub struct WalFile {
 pub struct CheckCounts {
     /// Superblock slots holding a valid superblock.
     pub superblocks: u64,
-    /// Extents the manifest itself occupies (snapshot and log).
-    pub manifest_extents: u64,
     /// Tables in the manifest.
     pub tables: u64,
     /// SSTs, each counted once.
@@ -431,8 +429,7 @@ impl Checker {
             self.extent(ExtentKind::ManifestLog, e.offset(), e.len());
         }
         match crate::manifest::load(&opened, 1, Arc::default()) {
-            Ok((catalog, own)) => {
-                self.report.counts.manifest_extents = own.len() as u64;
+            Ok((catalog, _)) => {
                 self.report.counts.tables = catalog.tables().count() as u64;
                 Ok(Some(catalog))
             }

@@ -76,7 +76,7 @@ impl std::fmt::Debug for RowEpochs {
 
 impl RowEpochs {
     /// The epochs of `table`, hashed with its generation's seed.
-    pub fn new(table: RowEpochTable) -> Self {
+    pub(crate) fn new(table: RowEpochTable) -> Self {
         let seed = table.seed();
         Self { table, seed }
     }
@@ -88,7 +88,7 @@ impl RowEpochs {
     }
 
     /// Whether the writer raises the slots (a reader caches only then).
-    pub fn maintained(&self) -> bool {
+    pub(crate) fn maintained(&self) -> bool {
         self.table.maintained()
     }
 
@@ -96,12 +96,12 @@ impl RowEpochs {
     /// visible): raises the row's slot, returning its value before the raise (D290's
     /// write-through: `p` below, the commit's own seqno, or above).
     #[inline]
-    pub fn note_write_prev(&self, table: TableId, row: &[u8], seqno: Seqno) -> Seqno {
+    pub(crate) fn note_write_prev(&self, table: TableId, row: &[u8], seqno: Seqno) -> Seqno {
         self.table.note_write_prev(self.hash(table, row), seqno)
     }
 
     /// How many slots the table has.
-    pub fn slots(&self) -> usize {
+    pub(crate) fn slots(&self) -> usize {
         self.table.slots()
     }
 }
@@ -162,7 +162,7 @@ impl std::fmt::Debug for RowCaches {
 
 impl RowCaches {
     /// A row cache of `bytes` over the watermarks `lw`, or `None` when `bytes` is 0.
-    pub fn new(
+    pub(crate) fn new(
         bytes: usize,
         max_row: usize,
         families: Vec<(String, String)>,
@@ -194,7 +194,7 @@ impl RowCaches {
     /// when a write to the row is applied but not visible at `seqno` (no lookup can hit, and
     /// no fill may store).
     #[inline]
-    pub fn epoch(&self, table: TableId, row: &[u8], seqno: Seqno) -> Option<RowKey> {
+    pub(crate) fn epoch(&self, table: TableId, row: &[u8], seqno: Seqno) -> Option<RowKey> {
         let hash = self.lw.hash(table, row);
         let epoch = self.lw.table.epoch(hash, seqno)?;
         Some(RowKey { hash, epoch })
@@ -208,20 +208,20 @@ impl RowCaches {
     /// Whether a family row that just missed should be stored: it missed before (at any
     /// epoch), until another row's miss takes the slot.
     #[inline]
-    pub fn admit(&self, family: FamilyId, key: RowKey) -> bool {
+    pub(crate) fn admit(&self, family: FamilyId, key: RowKey) -> bool {
         let tag = key.row_tag(family);
         self.ghost[self.slot(tag)].swap(tag, Ordering::Relaxed) == tag
     }
 
     /// Whether the cache serves `family` of `table` (by name, as the options list them).
-    pub fn serves(&self, table: &str, family: &str) -> bool {
+    pub(crate) fn serves(&self, table: &str, family: &str) -> bool {
         self.families.is_empty() || self.families.iter().any(|(t, f)| t == table && f == family)
     }
 
     /// The family row at `epoch`: cached and not expired at `now`, known to be over
     /// `max_row`, or neither.
     #[inline]
-    pub fn get(&self, family: FamilyId, row: &[u8], key: RowKey, now: Timestamp) -> Lookup {
+    pub(crate) fn get(&self, family: FamilyId, row: &[u8], key: RowKey, now: Timestamp) -> Lookup {
         let tag = key.tag(family);
         let found = if self.present[self.slot(tag)].load(Ordering::Relaxed) != tag {
             Lookup::Miss
@@ -244,17 +244,17 @@ impl RowCaches {
     /// The counters.
     /// Drops every cached row (a closed instance releasing its memory, D265). The watermark
     /// and hint tables are fixed allocations and stay.
-    pub fn clear(&self) {
+    pub(crate) fn clear(&self) {
         self.cache.clear();
     }
 
     /// Bytes the rows and their encodings take (the `memory_release` test hook).
     #[cfg(feature = "test-hooks")]
-    pub fn usage(&self) -> usize {
+    pub(crate) fn usage(&self) -> usize {
         self.cache.usage()
     }
 
-    pub fn stats(&self) -> RowCacheStats {
+    pub(crate) fn stats(&self) -> RowCacheStats {
         RowCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -264,13 +264,13 @@ impl RowCaches {
 
     /// Records that the family row at `epoch` is over `max_row`, so reads until the next
     /// write to it skip the fill instead of encoding it again.
-    pub fn insert_oversize(&self, family: FamilyId, row: &[u8], key: RowKey) {
+    pub(crate) fn insert_oversize(&self, family: FamilyId, row: &[u8], key: RowKey) {
         let marker = Encoded::OVERSIZE.to_le_bytes().to_vec();
         self.store(family, row, key, marker);
     }
 
     /// Stores an encoded family row read at the key's epoch.
-    pub fn insert(&self, family: FamilyId, row: &[u8], key: RowKey, encoded: Vec<u8>) {
+    pub(crate) fn insert(&self, family: FamilyId, row: &[u8], key: RowKey, encoded: Vec<u8>) {
         self.fills.fetch_add(1, Ordering::Relaxed);
         self.store(family, row, key, encoded);
     }
@@ -278,12 +278,12 @@ impl RowCaches {
     /// A delete at `ts` is applied (or the file holds one): before it can be visible, and
     /// before any later write to its row applies (D290).
     #[inline]
-    pub fn note_delete(&self, ts: Timestamp) {
+    pub(crate) fn note_delete(&self, ts: Timestamp) {
         self.delete_ceiling.fetch_max(ts, Ordering::Relaxed);
     }
 
     /// Entries a commit moved forward since open (D290's write-through).
-    pub fn patches(&self) -> u64 {
+    pub(crate) fn patches(&self) -> u64 {
         self.patches.load(Ordering::Relaxed)
     }
 
@@ -297,7 +297,7 @@ impl RowCaches {
     /// (`overlay_fits`) leaves the entry stale at `p`, where it misses (the slot is at `c`)
     /// and shows, unread, that the row is written between its reads (`get_through`).
     #[allow(clippy::too_many_arguments)]
-    pub fn write_through<'a>(
+    pub(crate) fn write_through<'a>(
         &self,
         table: TableId,
         family: FamilyId,
@@ -335,7 +335,7 @@ impl RowCaches {
 
     /// Drops `row`'s cached `families`: a commit applied to it after a commit with a higher
     /// seqno (D290), so a write-through by that later commit may lack this one's write.
-    pub fn invalidate(&self, row: &[u8], families: impl Iterator<Item = FamilyId>) {
+    pub(crate) fn invalidate(&self, row: &[u8], families: impl Iterator<Item = FamilyId>) {
         for family in families {
             self.cache.invalidate(u64::from(family.0), row);
         }
@@ -394,14 +394,14 @@ pub(crate) struct Encoded;
 
 impl Encoded {
     /// The header of a marker entry: the row is over `max_row` (no real row expires at 0).
-    pub const OVERSIZE: u64 = 0;
+    pub(crate) const OVERSIZE: u64 = 0;
 
     /// Bytes a cell takes beyond its qualifier and value.
-    pub const CELL_OVERHEAD: usize = 16;
+    pub(crate) const CELL_OVERHEAD: usize = 16;
 
     /// Appends a cell, leaving the header alone.
     #[inline]
-    pub fn push_cell(buf: &mut Vec<u8>, qualifier: &[u8], ts: Timestamp, stored: &[u8]) {
+    pub(crate) fn push_cell(buf: &mut Vec<u8>, qualifier: &[u8], ts: Timestamp, stored: &[u8]) {
         buf.extend_from_slice(&(qualifier.len() as u32).to_le_bytes());
         buf.extend_from_slice(qualifier);
         buf.extend_from_slice(&ts.to_le_bytes());
@@ -411,7 +411,7 @@ impl Encoded {
 
     /// When the first of the row's cells expires.
     #[inline]
-    pub fn deadline(encoded: &[u8]) -> u64 {
+    pub(crate) fn deadline(encoded: &[u8]) -> u64 {
         u64::from_le_bytes(
             encoded[..8]
                 .try_into()
@@ -436,7 +436,7 @@ impl Encoded {
     }
 
     /// The cells, in read order: `(qualifier, ts, stored)`.
-    pub fn cells(encoded: &[u8]) -> Cells<'_> {
+    pub(crate) fn cells(encoded: &[u8]) -> Cells<'_> {
         Cells {
             rest: &encoded[8..],
         }
@@ -677,6 +677,24 @@ pub(crate) fn get_cached(
     row: &[u8],
     qualifier: &[u8],
 ) -> Option<Option<CellData>> {
+    let key = served_key(rc, view, table, family, row, seqno)?;
+    let Lookup::Hit(hit) = rc.get(family, row, key, now) else {
+        return None;
+    };
+    Some(cell_of(&hit, qualifier))
+}
+
+/// The cache key of `row` at `seqno` for a point get in `family`, or `None` when the row has
+/// no epoch to key it by or the cache does not serve the family.
+#[inline(always)]
+fn served_key(
+    rc: &RowCaches,
+    view: &View,
+    table: TableId,
+    family: FamilyId,
+    row: &[u8],
+    seqno: Seqno,
+) -> Option<RowKey> {
     let key = rc.epoch(table, row, seqno)?;
     if !rc.families.is_empty() {
         let info = view.catalog.table(table)?;
@@ -685,14 +703,7 @@ pub(crate) fn get_cached(
             return None;
         }
     }
-    let Lookup::Hit(hit) = rc.get(family, row, key, now) else {
-        return None;
-    };
-    Some(
-        Encoded::cells(&hit)
-            .find(|(q, _, _)| *q == qualifier)
-            .map(|(_, ts, stored)| CellData::copied(ts, stored)),
-    )
+    Some(key)
 }
 
 /// A point get at `seqno` through the writer's row cache (D290): answered from the cached
@@ -716,14 +727,7 @@ pub(crate) fn get_through(
     row: &[u8],
     qualifier: &[u8],
 ) -> Option<Result<Option<CellData>>> {
-    let key = rc.epoch(table, row, seqno)?;
-    if !rc.families.is_empty() {
-        let info = view.catalog.table(table)?;
-        let f = info.families.iter().find(|f| f.id == family)?;
-        if !rc.serves(&info.name, &f.name) {
-            return None;
-        }
-    }
+    let key = served_key(rc, view, table, family, row, seqno)?;
     match rc.get(family, row, key, now) {
         Lookup::Hit(hit) => return Some(Ok(cell_of(&hit, qualifier))),
         Lookup::Oversize => return None,
