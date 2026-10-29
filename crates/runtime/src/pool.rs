@@ -65,12 +65,22 @@ pub(crate) const FALLBACK: u64 = 10_000_000;
 /// tasks stay: their wake is what they wait for, not the driver (#1012).
 pub(crate) const STOPPED: u64 = 100_000_000;
 
+/// Tasks on their way back to a shard (D284), and whether the shard is gone.
+#[derive(Default)]
+struct Back {
+    tasks: Vec<Moved>,
+    /// The shard's spawner was dropped: nothing will take tasks back, so they are dropped
+    /// instead of kept. A kept one would hold the `Origin` it names (`Moved::origin`) and,
+    /// through the task, the engine's state and VFS, a cycle nothing breaks (#1070).
+    gone: bool,
+}
+
 /// Where a shard's tasks go back to (D284), and its share of the pool's accounting.
 pub(crate) struct Origin {
     /// The shard's signal: slices' time counts to it (D256), and it is notified when tasks
     /// come back.
     pub(crate) signal: Arc<Signal>,
-    back: Mutex<Vec<Moved>>,
+    back: Mutex<Back>,
     has_back: AtomicBool,
     /// This shard's tasks in the injector.
     queued: AtomicUsize,
@@ -91,7 +101,7 @@ impl Origin {
     pub(crate) fn new(signal: Arc<Signal>) -> Arc<Self> {
         Arc::new(Self {
             signal,
-            back: Mutex::new(Vec::new()),
+            back: Mutex::new(Back::default()),
             has_back: AtomicBool::new(false),
             queued: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
@@ -109,7 +119,26 @@ impl Origin {
         if !self.has_back.swap(false, Ordering::Acquire) {
             return Vec::new();
         }
-        std::mem::take(&mut *self.back.lock().unwrap_or_else(PoisonError::into_inner))
+        std::mem::take(
+            &mut self
+                .back
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .tasks,
+        )
+    }
+
+    /// The shard's spawner is dropped (#1070): drops the tasks waiting to come back, and
+    /// every later one. Their destructors run after the lock is released (a task's drop
+    /// runs engine code).
+    pub(crate) fn shard_gone(&self) {
+        let tasks = {
+            let mut back = self.back.lock().unwrap_or_else(PoisonError::into_inner);
+            back.gone = true;
+            std::mem::take(&mut back.tasks)
+        };
+        self.has_back.store(false, Ordering::Relaxed);
+        drop(tasks);
     }
 
     /// Whether this shard has tasks waiting in the injector.
@@ -123,14 +152,20 @@ impl Origin {
     }
 
     fn give_back(&self, moved: Moved) {
-        self.back
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(moved);
-        self.has_back.store(true, Ordering::Release);
-        // The shard checks `has_back` after announcing sleep: either it sees this or the
-        // notify sees it asleep and wakes it.
-        self.signal.notify();
+        {
+            let mut back = self.back.lock().unwrap_or_else(PoisonError::into_inner);
+            if !back.gone {
+                back.tasks.push(moved);
+                drop(back);
+                self.has_back.store(true, Ordering::Release);
+                // The shard checks `has_back` after announcing sleep: either it sees this or
+                // the notify sees it asleep and wakes it.
+                self.signal.notify();
+                return;
+            }
+        }
+        // Nobody will take it back: dropped here, outside the lock (#1070).
+        drop(moved);
     }
 }
 
