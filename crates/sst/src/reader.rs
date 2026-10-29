@@ -161,7 +161,9 @@ impl Fetch {
         }
         let (done, resolver) = pigeonhole_io::Completion::pair();
         let join = Arc::new(std::sync::Mutex::new(Join {
-            buf: Some(IoBuf::zeroed(self.len)),
+            // Every piece is copied into its range before the join resolves; a failed piece
+            // drops the buffer, so a reused one never shows its old bytes (#709).
+            buf: Some(IoBuf::reused(self.len)),
             left: self.pieces.len(),
             resolver: Some(resolver),
         }));
@@ -214,14 +216,14 @@ impl Fetch {
     }
 
     /// A buffer of `len` bytes for this fetch's bytes to be copied into (a piece of a merged
-    /// readahead run): from the reader's pool for a block that does not fill the cache, as
-    /// its decoded bytes are (#372).
+    /// readahead run, copied whole): from the reader's pool for a block that does not fill
+    /// the cache, as its decoded bytes are (#372), else this thread's reused buffers (#709).
     pub(crate) fn buffer(&self, len: usize) -> IoBuf {
         match &self.then {
             Then::Block {
                 pool: Some(pool), ..
             } => pool.take(len),
-            _ => IoBuf::zeroed(len),
+            _ => IoBuf::reused(len),
         }
     }
 
@@ -265,7 +267,8 @@ fn aligned(offset: u64, len: usize, align: usize) -> (u64, usize, usize) {
 pub(crate) fn read_bytes(file: &FileRef, offset: u64, len: usize) -> Result<IoBuf> {
     match file.direct_align() {
         None => {
-            let mut buf = IoBuf::zeroed(len);
+            // Reused, not zeroed (#709): the read fills all of it or fails.
+            let mut buf = IoBuf::reused(len);
             file.read_at(&mut buf, offset)?;
             Ok(buf)
         }
@@ -382,10 +385,12 @@ fn decode_slice(
             decompress(codec, payload, &mut out)?;
             Ok(Some(BlockData::Io(out)))
         }
+        // The same for a block the cache keeps, from this thread's buffers (#709): it goes
+        // back when the cache evicts it, and is charged at its whole capacity meanwhile.
         (codec, None) => {
-            let mut out = vec![0; len];
+            let mut out = IoBuf::reused(len);
             decompress(codec, payload, &mut out)?;
-            Ok(Some(BlockData::from(out)))
+            Ok(Some(BlockData::Io(out)))
         }
     }
 }

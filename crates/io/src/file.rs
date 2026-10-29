@@ -69,9 +69,9 @@ pub trait File: Send + Sync + Debug {
     /// with registered buffers (io_uring, #402), a slot of the pool the read will use, so the
     /// kernel skips pinning its pages. Its contents are unspecified (the read overwrites
     /// them). Keep a slot-backed buffer only for its I/O: one stored for longer goes through
-    /// [`IoBuf::detached`]. The default is [`IoBuf::zeroed`].
+    /// [`IoBuf::detached`]. The default is [`IoBuf::reused`].
     fn read_buf(&self, len: usize) -> IoBuf {
-        IoBuf::zeroed(len)
+        IoBuf::reused(len)
     }
 
     /// Submits a read of `buf.len()` bytes at `offset` and returns at once.

@@ -95,6 +95,27 @@ impl BufPool {
         buf
     }
 
+    /// As [`BufPool::take`], but a recycled buffer more than twice the capacity `len` needs
+    /// is freed instead, so a block the cache keeps is never charged for much more than its
+    /// bytes ([`IoBuf::reused`]).
+    fn take_fitting(self: &Arc<Self>, len: usize) -> IoBuf {
+        let recycled = self
+            .free
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
+            .filter(|b| b.capacity() <= 2 * round_up(len).max(IoBuf::ALIGN));
+        let mut buf = match recycled {
+            Some(mut b) => {
+                b.resize(len);
+                b
+            }
+            None => IoBuf::zeroed(len),
+        };
+        buf.recycle = Some(Arc::clone(self));
+        buf
+    }
+
     /// Takes back `buf` (its handle already cleared, so the pool never holds an `Arc` of
     /// itself), or lets it go if the pool is full.
     fn put(&self, buf: IoBuf) {
@@ -112,6 +133,15 @@ impl BufPool {
             .unwrap_or_else(PoisonError::into_inner)
             .len()
     }
+}
+
+/// Free buffers each thread's pool keeps ([`IoBuf::reused`]): a read path holds a buffer or
+/// two at a time, and a block kept by the cache comes back when it is evicted.
+const THREAD_POOL_MAX: usize = 4;
+
+thread_local! {
+    /// This thread's [`IoBuf::reused`] buffers.
+    static THREAD_POOL: Arc<BufPool> = BufPool::new(THREAD_POOL_MAX);
 }
 
 impl fmt::Debug for BufPool {
@@ -234,6 +264,28 @@ unsafe impl Sync for IoBuf {}
 impl IoBuf {
     /// Alignment of every buffer.
     pub const ALIGN: usize = pigeonhole_format::PAGE_SIZE;
+
+    /// A buffer of `len` initialized bytes for the caller to overwrite (#709): one this
+    /// thread used before, from its small [`BufPool`], with whatever bytes a previous read
+    /// left (zeros past its old length), or a new zeroed one; one more than twice the size
+    /// needed is freed rather than reused. It goes back to that pool when
+    /// dropped, on any thread. For buffers a read or a decoder fills completely before
+    /// anyone reads them; skips the allocation and zero-fill of [`IoBuf::zeroed`].
+    ///
+    /// ```
+    /// use pigeonhole_io::IoBuf;
+    ///
+    /// let mut a = IoBuf::reused(4096);
+    /// a.fill(7);
+    /// let p = a.as_ptr();
+    /// drop(a);
+    /// let b = IoBuf::reused(100);
+    /// assert_eq!(b.as_ptr(), p);
+    /// assert_eq!(b.len(), 100);
+    /// ```
+    pub fn reused(len: usize) -> Self {
+        THREAD_POOL.with(|pool| pool.take_fitting(len))
+    }
 
     /// A zeroed buffer of `len` bytes (capacity rounded up to [`IoBuf::ALIGN`]).
     pub fn zeroed(len: usize) -> Self {
@@ -429,6 +481,28 @@ impl fmt::Debug for IoBuf {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reused_buffers_come_back_and_never_much_larger_than_needed() {
+        let pool = BufPool::new(2);
+        let mut a = pool.take_fitting(64 << 10);
+        a.fill(9);
+        let p = a.as_ptr();
+        drop(a);
+        // Within twice the capacity it needs: the same allocation, its bytes as left.
+        let b = pool.take_fitting(40 << 10);
+        assert_eq!(b.as_ptr(), p);
+        assert_eq!(b.len(), 40 << 10);
+        assert!(b.iter().all(|&x| x == 9));
+        drop(b);
+        // More than twice: freed, and a fresh zeroed buffer of just the size needed.
+        let c = pool.take_fitting(4 << 10);
+        assert_eq!(c.capacity(), 4 << 10);
+        assert!(c.iter().all(|&x| x == 0));
+        assert_eq!(pool.held(), 0);
+        drop(c);
+        assert_eq!(pool.held(), 1);
+    }
+
     use super::*;
 
     #[test]
