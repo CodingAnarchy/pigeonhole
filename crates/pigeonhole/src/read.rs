@@ -186,7 +186,7 @@ impl Selection {
             }
             // The retry only with a supervisor (`Db::supervised`).
             None if core.db.supervised() => core.snapshot_supervised()?,
-            None => core.engine().snapshot()?,
+            None => core.with(pigeonhole_engine::Engine::snapshot)?,
         };
         // The catalog as of the snapshot names every family it can return, and resolves a
         // family dropped (or dropped and created again) since as the snapshot saw it; a name
@@ -373,21 +373,19 @@ impl<'t> RowRead<'t> {
             None if self.core.db.supervised() => {
                 self.read_latest_supervised(table, &families, &mut buf)?
             }
-            None => self.core.engine().read_row_latest_into(
-                table,
-                &self.row,
-                &families,
-                &self.sel.spec,
-                &mut buf,
-            )?,
-            Some(snapshot) => self.core.engine().read_row_into_families(
-                snapshot,
-                table,
-                &self.row,
-                &families,
-                &self.sel.spec,
-                &mut buf,
-            )?,
+            None => self.core.with(|e| {
+                e.read_row_latest_into(table, &self.row, &families, &self.sel.spec, &mut buf)
+            })?,
+            Some(snapshot) => self.core.with(|e| {
+                e.read_row_into_families(
+                    snapshot,
+                    table,
+                    &self.row,
+                    &families,
+                    &self.sel.spec,
+                    &mut buf,
+                )
+            })?,
         };
         if !any {
             return Ok(None);
@@ -585,9 +583,7 @@ impl<'t> Scan<'t> {
         spec.limit = self.limit.unwrap_or(0);
         let cursor = self
             .core
-            .db
-            .engine()
-            .scan(&snapshot, self.core.info.id, spec)?;
+            .with(|e| e.scan(&snapshot, self.core.info.id, spec))?;
         Ok(RowIter {
             cursor,
             buf: RowBuf::new(info, 0),
@@ -615,9 +611,7 @@ impl<'t> Scan<'t> {
             spec.limit = self.limit.unwrap_or(0);
             let cursor = self
                 .core
-                .db
-                .engine()
-                .scan_async(&snapshot, self.core.info.id, spec)?;
+                .with(|e| e.scan_async(&snapshot, self.core.info.id, spec))?;
             Ok((cursor, RowBuf::new(info, 0)))
         })();
         crate::nonblocking::RowStream::new(started, limit_zero, self.core, generation)

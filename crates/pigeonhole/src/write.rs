@@ -587,8 +587,8 @@ impl RowMutation<'_> {
         } = self;
         // A recovery running: wait for its swap, then commit on the new engine (D265).
         let generation = table.db.before_commit()?;
-        builder
-            .commit(&table.engine(), table.db.max_value, durability)
+        table
+            .with(|e| builder.commit(e, table.db.max_value, durability))
             .map_err(|e| table.db.after_commit_closed(generation, e))
     }
 
@@ -978,8 +978,8 @@ impl WriteBatch {
             builder,
         } = self;
         let generation = db.before_commit()?;
-        builder
-            .commit(&cached.get(&db), db.max_value, None)
+        cached
+            .with(&db, |e| builder.commit(e, db.max_value, None))
             .map_err(|e| db.after_commit_closed(generation, e))
     }
 
@@ -991,8 +991,8 @@ impl WriteBatch {
             builder,
         } = self;
         let generation = db.before_commit()?;
-        builder
-            .commit(&cached.get(&db), db.max_value, Some(durability))
+        cached
+            .with(&db, |e| builder.commit(e, db.max_value, Some(durability)))
             .map_err(|e| db.after_commit_closed(generation, e))
     }
 
@@ -1012,8 +1012,8 @@ impl WriteBatch {
         } = self;
         let generation = db.before_commit()?;
         let watch = db.watch_at(generation);
-        builder
-            .submit(&cached.get(&db), db.max_value, durability)
+        cached
+            .with(&db, |e| builder.submit(e, db.max_value, durability))
             .map(|s| s.watched(watch))
             .map_err(|e| db.after_commit_closed(generation, e))
     }
