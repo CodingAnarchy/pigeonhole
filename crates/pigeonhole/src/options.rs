@@ -42,6 +42,7 @@ pub struct Options {
     row_cache: usize,
     row_cache_max_row: Option<usize>,
     counter_checkpoint_steps: Option<u64>,
+    row_cache_get_fill: Option<bool>,
     nowait_reads: Option<bool>,
     row_cache_families: Vec<(String, String)>,
     shm_dir: Option<PathBuf>,
@@ -176,6 +177,7 @@ impl Default for Options {
             row_cache: DEFAULT_ROW_CACHE,
             row_cache_max_row: None,
             counter_checkpoint_steps: None,
+            row_cache_get_fill: None,
             nowait_reads: None,
             row_cache_families: Vec::new(),
             shm_dir: None,
@@ -565,6 +567,16 @@ impl Options {
     #[doc(hidden)]
     pub fn counter_checkpoint_steps(mut self, steps: u64) -> Self {
         self.counter_checkpoint_steps = Some(steps);
+        self
+    }
+
+    /// Whether a point get that misses a row twice fills the row cache with the family row
+    /// (D290; default on). Off, gets are served from cached rows but never fill them. For
+    /// benchmarks comparing the two (#1059).
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
+    pub fn row_cache_get_fill(mut self, on: bool) -> Self {
+        self.row_cache_get_fill = Some(on);
         self
     }
 
@@ -1157,6 +1169,9 @@ impl Options {
         o.row_cache_bytes = self.row_cache;
         if let Some(bytes) = self.row_cache_max_row {
             o.row_cache_max_row = bytes;
+        }
+        if let Some(on) = self.row_cache_get_fill {
+            o.row_cache_get_fill = on;
         }
         if let Some(steps) = self.counter_checkpoint_steps {
             o.counter_checkpoint_steps = steps;

@@ -1064,7 +1064,11 @@ impl Engine {
                 options.row_cache_max_row,
                 options.row_cache_families.clone(),
                 Arc::clone(&row_epochs),
-            ),
+            )
+            .map(|mut rc| {
+                rc.get_fill = options.row_cache_get_fill;
+                rc
+            }),
             row_epochs: row_epochs.maintained().then_some(row_epochs),
             sst_ids: Arc::new(AtomicU64::new(catalog.counters.next_sst.max(1))),
             blob_ids: Arc::new(AtomicU32::new(catalog.counters.next_blob_file.max(1))),

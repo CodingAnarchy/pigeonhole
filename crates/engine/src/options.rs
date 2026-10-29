@@ -77,6 +77,11 @@ pub struct EngineOptions {
     /// turns it off). Writer process only. For tests and benchmarks.
     #[doc(hidden)]
     pub counter_checkpoint_steps: u64,
+    /// Whether a point get that misses a row twice fills the row cache with the family row
+    /// (D290; default on). Off, gets are served from cached rows but never fill them.
+    /// Writer process only. For A/Bs (#1059).
+    #[doc(hidden)]
+    pub row_cache_get_fill: bool,
     /// Largest encoded family row the row cache stores (default 4 KiB).
     pub row_cache_max_row: usize,
     /// `(table, family)` names the row cache serves; empty means every family.
@@ -239,6 +244,7 @@ impl EngineOptions {
             block_cache_bytes: 256 << 20,
             row_cache_bytes: 0,
             counter_checkpoint_steps: crate::read::CHECKPOINT_STEPS,
+            row_cache_get_fill: true,
             row_cache_max_row: 4 << 10,
             row_cache_families: Vec::new(),
             shm_dir: None,

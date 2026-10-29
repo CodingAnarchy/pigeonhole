@@ -127,6 +127,9 @@ pub(crate) struct RowCaches {
     mask: usize,
     /// Largest encoded family row filled.
     pub max_row: usize,
+    /// Whether a get that misses twice fills the row (D290's get fill); off, gets only read
+    /// what is cached. For A/Bs (#1059).
+    pub get_fill: bool,
     /// `(table, family)` names the cache serves; empty means every family.
     families: Vec<(String, String)>,
     hits: AtomicU64,
@@ -184,6 +187,7 @@ impl RowCaches {
             ghost: table(),
             mask: slots - 1,
             max_row,
+            get_fill: true,
             families,
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
@@ -746,6 +750,9 @@ pub(crate) fn get_through(
         Lookup::Hit(hit) => return Some(Ok(cell_of(&hit, qualifier))),
         Lookup::Oversize => return None,
         Lookup::Miss => {}
+    }
+    if !rc.get_fill {
+        return None;
     }
     let meta = view.catalog.family(family)?;
     if meta.merge != crate::catalog::MergeKind::None {
