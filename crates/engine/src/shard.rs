@@ -45,7 +45,7 @@ mod tablets;
 use tablets::{ActiveOp, TabletLoad};
 pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
 
-use crate::catalog::{Catalog, MergeKind};
+use crate::catalog::{Catalog, FamilyMeta, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
 use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
@@ -1373,6 +1373,14 @@ impl From<PrepareError> for Error {
 
 /// A failed shard's error for work that is not a commit (maintenance, a durability wait). A
 /// commit it refuses, never logged, gets [`Error::ShardFailed`] instead (#921).
+/// The SSTs and metadata of slot `key` in `view`, or `None` for a slot gone from it or of a
+/// family whose merge operator is not registered (it is never compacted).
+fn slot_family(view: &View, key: (TabletId, FamilyId)) -> Option<(&Arc<FamilySsts>, &FamilyMeta)> {
+    let fam = view.ssts.family(key.0, key.1)?;
+    let meta = view.catalog.family(key.1)?;
+    (meta.merge != MergeKind::Unknown).then_some((fam, meta))
+}
+
 fn poisoned_error() -> Error {
     Error::Io(pigeonhole_io::Error::new(
         ErrorKind::Other,
@@ -9285,15 +9293,9 @@ impl ShardState {
         let mut levels = std::mem::take(&mut self.scan_levels);
         self.owned_slots_into(&view, &mut slots);
         for &key in &slots {
-            let Some(fam) = view.ssts.family(key.0, key.1) else {
+            let Some((fam, meta)) = slot_family(&view, key) else {
                 continue;
             };
-            let Some(meta) = view.catalog.family(key.1) else {
-                continue;
-            };
-            if meta.merge == MergeKind::Unknown {
-                continue;
-            }
             let picker = self.picker(meta.options.compaction);
             fam.levels_meta_into(&mut levels);
             let s = picker.score_at(&levels, now, meta.options.ttl_micros);
@@ -9369,30 +9371,97 @@ impl ShardState {
             self.arm_compaction_retry(now_nanos.saturating_add(wait), ctx);
         }
         // Full compactions first (a caller waits), one slot at a time.
+        if self.run_full_compactions(&view, now, ctx) {
+            return;
+        }
+        // A slot whose compaction failed is not picked again until its backoff ends (or,
+        // on a frozen clock, a flush completes or a group is admitted), so a dead device
+        // does not loop, and one bad slot does not stop the others (issues #70, #79, #141).
+        // A poisoned shard starts none: it is dead until reopen.
+        if self.poisoned {
+            return;
+        }
+        if due.is_empty() && self.cleanups.is_empty() {
+            self.start_blob_gc(&view, ctx);
+            return;
+        }
+        let busy = self.busy_snapshot();
+        // A queued cleanup takes every other compaction, so writes elsewhere on the shard
+        // never starve it (and the merge waiting on it); not while writers stall on L0.
+        if self.cleanup_turn && self.stall.since == 0 && !self.cleanups.is_empty() {
+            self.start_cleanup(&view, &busy, ctx);
+            if self.compaction.is_some() {
+                self.cleanup_turn = false;
+                return;
+            }
+        }
+        // The earliest end of a quarantine that kept a due slot from being picked.
+        let mut quarantined: Option<u64> = None;
+        // The most urgent slot the picker finds work in (another one's inputs may be busy,
+        // or its compactions keep failing: it waits out its own backoff, issue #141).
+        for (_, key) in due {
+            if let Some(&(_, until)) = self.slot_backoff.get(&key)
+                && until > now_nanos
+            {
+                quarantined = Some(quarantined.map_or(until, |q: u64| q.min(until)));
+                continue;
+            }
+            let Some((fam, meta)) = slot_family(&view, key) else {
+                continue;
+            };
+            let Some(task) = self.picker(meta.options.compaction).pick(
+                key.0,
+                key.1,
+                &fam.levels_meta(),
+                &busy,
+                now,
+                meta.options.ttl_micros,
+            ) else {
+                continue;
+            };
+            if let Err(e) = self.start_compaction(&view, key, task, ctx) {
+                trace!("shard {} compaction start failed: {e}", self.id.0);
+                self.back_off_compaction(key, ctx);
+            }
+            self.cleanup_turn = true;
+            return;
+        }
+        // Nothing urgent: rewrite an inherited SST that blocks a merge (#95), or empty blob
+        // files that are mostly garbage.
+        self.start_cleanup(&view, &busy, ctx);
+        if self.compaction.is_none() {
+            self.start_blob_gc(&view, ctx);
+        }
+        // A slot passed over for its backoff is retried when the backoff ends, even if
+        // nothing else happens on the shard by then.
+        if let Some(until) = quarantined {
+            self.arm_compaction_retry(until, ctx);
+        }
+    }
+
+    /// Runs the queued full compactions (`compact_all`), one slot at a time: starts the next
+    /// slot's, or answers the front request once no slot needs one. True when `maintain`
+    /// stops here: a compaction started, or a flush has to come first.
+    fn run_full_compactions(
+        &mut self,
+        view: &Arc<View>,
+        now: Timestamp,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) -> bool {
         while let Some((filter, _, _)) = self.compact_all.front() {
             if !self.flush_idle() || self.freeze_all_pending || self.starved_all {
                 self.spawn_flush(ctx);
-                return;
+                return true;
             }
             let filter = *filter;
             let last = self.shared.picker.max_levels.max(2) - 1;
-            let busy: Vec<SstId> = self
-                .shared
-                .busy_ssts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .copied()
-                .collect();
+            let busy = self.busy_snapshot();
             let mut task = None;
-            for key in self.owned_slots(&view) {
-                let Some(fam) = view.ssts.family(key.0, key.1) else {
+            for key in self.owned_slots(view) {
+                let Some((fam, meta)) = slot_family(view, key) else {
                     continue;
                 };
-                let Some(meta) = view.catalog.family(key.1) else {
-                    continue;
-                };
-                if filter.is_some_and(|t| t != meta.table) || meta.merge == MergeKind::Unknown {
+                if filter.is_some_and(|t| t != meta.table) {
                     continue;
                 }
                 let Some(tablet) = view.tablets.entry(key.0) else {
@@ -9436,99 +9505,37 @@ impl ShardState {
                 }
             }
             match task {
-                Some((key, task)) => match self.start_compaction(&view, key, task, ctx) {
+                Some((key, task)) => match self.start_compaction(view, key, task, ctx) {
                     Ok(()) => {
                         self.compaction_full = true;
-                        return;
+                        return true;
                     }
-                    Err(e) => {
-                        let (_, reply, _) = self.compact_all.pop_front().expect("front");
-                        self.full_purged.clear();
-                        reply.notify(Err(e));
-                    }
+                    Err(e) => self.finish_full(Err(e)),
                 },
-                None => {
-                    // Every slot is fully compacted. A background failure meanwhile is not
-                    // this caller's (issue #141): its own failures were reported at once.
-                    let (_, reply, _) = self.compact_all.pop_front().expect("front");
-                    self.full_purged.clear();
-                    reply.notify(Ok(()));
-                }
+                // Every slot is fully compacted. A background failure meanwhile is not this
+                // caller's (issue #141): its own failures were reported at once.
+                None => self.finish_full(Ok(())),
             }
         }
-        // A slot whose compaction failed is not picked again until its backoff ends (or,
-        // on a frozen clock, a flush completes or a group is admitted), so a dead device
-        // does not loop, and one bad slot does not stop the others (issues #70, #79, #141).
-        // A poisoned shard starts none: it is dead until reopen.
-        if self.poisoned {
-            return;
-        }
-        if due.is_empty() && self.cleanups.is_empty() {
-            self.start_blob_gc(&view, ctx);
-            return;
-        }
-        let busy: Vec<SstId> = self
-            .shared
+        false
+    }
+
+    /// Answers the front full-compaction request with `result`.
+    fn finish_full(&mut self, result: Result<()>) {
+        let (_, reply, _) = self.compact_all.pop_front().expect("front");
+        self.full_purged.clear();
+        reply.notify(result);
+    }
+
+    /// The SSTs running compactions hold now.
+    fn busy_snapshot(&self) -> Vec<SstId> {
+        self.shared
             .busy_ssts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .copied()
-            .collect();
-        // A queued cleanup takes every other compaction, so writes elsewhere on the shard
-        // never starve it (and the merge waiting on it); not while writers stall on L0.
-        if self.cleanup_turn && self.stall.since == 0 && !self.cleanups.is_empty() {
-            self.start_cleanup(&view, &busy, ctx);
-            if self.compaction.is_some() {
-                self.cleanup_turn = false;
-                return;
-            }
-        }
-        // The earliest end of a quarantine that kept a due slot from being picked.
-        let mut quarantined: Option<u64> = None;
-        // The most urgent slot the picker finds work in (another one's inputs may be busy,
-        // or its compactions keep failing: it waits out its own backoff, issue #141).
-        for (_, key) in due {
-            if let Some(&(_, until)) = self.slot_backoff.get(&key)
-                && until > now_nanos
-            {
-                quarantined = Some(quarantined.map_or(until, |q: u64| q.min(until)));
-                continue;
-            }
-            let Some(fam) = view.ssts.family(key.0, key.1) else {
-                continue;
-            };
-            let Some(meta) = view.catalog.family(key.1) else {
-                continue;
-            };
-            let Some(task) = self.picker(meta.options.compaction).pick(
-                key.0,
-                key.1,
-                &fam.levels_meta(),
-                &busy,
-                now,
-                meta.options.ttl_micros,
-            ) else {
-                continue;
-            };
-            if let Err(e) = self.start_compaction(&view, key, task, ctx) {
-                trace!("shard {} compaction start failed: {e}", self.id.0);
-                self.back_off_compaction(key, ctx);
-            }
-            self.cleanup_turn = true;
-            return;
-        }
-        // Nothing urgent: rewrite an inherited SST that blocks a merge (#95), or empty blob
-        // files that are mostly garbage.
-        self.start_cleanup(&view, &busy, ctx);
-        if self.compaction.is_none() {
-            self.start_blob_gc(&view, ctx);
-        }
-        // A slot passed over for its backoff is retried when the backoff ends, even if
-        // nothing else happens on the shard by then.
-        if let Some(until) = quarantined {
-            self.arm_compaction_retry(until, ctx);
-        }
+            .collect()
     }
 
     /// Starts a blob GC of a slot that may point into a blob file that is mostly garbage
@@ -9551,14 +9558,7 @@ impl ShardState {
                         .is_some_and(|&(_, until)| until > now_nanos)
             })
             .collect();
-        let busy: Vec<SstId> = self
-            .shared
-            .busy_ssts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .copied()
-            .collect();
+        let busy = self.busy_snapshot();
         let last = self.shared.picker.max_levels.max(2) - 1;
         let min_garbage = self.shared.picker.target_sst_bytes / 16;
         let Some((key, task)) = self.blob_gc.plan(view, &slots, last, &busy, min_garbage) else {
