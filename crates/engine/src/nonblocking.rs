@@ -98,7 +98,7 @@ pub(crate) struct Attempt<'a> {
 impl Attempt<'_> {
     /// Whether a fill may be stored: always in the writer; in a reader process, while its
     /// snapshot is current (checked after the read).
-    pub fn still_valid(&self) -> bool {
+    pub(crate) fn still_valid(&self) -> bool {
         self.at.checked(Ok(())).is_ok()
     }
 }

@@ -88,11 +88,6 @@ impl PartialEq for SeqnoCell {
 
 impl Eq for SeqnoCell {}
 
-/// The row prefix of an internal key (the whole key if it has none).
-fn row_of(key: &[u8]) -> &[u8] {
-    &key[..pigeonhole_format::key::row_prefix_len(key).unwrap_or(key.len())]
-}
-
 /// The tablet's row range as a key range of row prefixes.
 pub(crate) fn tablet_range(tablet: &TabletEntry) -> Result<KeyRange> {
     let start = if tablet.start.is_empty() {
@@ -256,7 +251,7 @@ pub(crate) fn plan_full(
         .flatten();
     let one_piece = lone.is_none_or(|s| {
         pigeonhole_compaction::output_piece_bytes(s.len, target) >= s.len
-            || row_of(&s.smallest_key) == row_of(&s.largest_key)
+            || crate::snapshot::row_of(&s.smallest_key) == crate::snapshot::row_of(&s.largest_key)
     });
     // Asked only where the answer changes the plan: a run already at the bottom, or a lone
     // SST that would be moved.
