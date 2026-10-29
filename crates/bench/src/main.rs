@@ -276,9 +276,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
                 a.in_flight = Some(n);
             }
             "--offered-rate" => a.offered_rate = Some(parse(&arg, it.next())?),
-            "--write-buffer" | "--memtable-budget" => {
-                a.write_buffer = Some(parse(&arg, it.next())?)
-            }
+            "--write-buffer" => a.write_buffer = Some(parse(&arg, it.next())?),
             "--cache" => a.cache = Some(parse(&arg, it.next())?),
             "--cache-model" => {
                 a.cache_model = Some(match it.next().as_deref() {
