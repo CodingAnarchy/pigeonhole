@@ -550,7 +550,6 @@ fn upgrade_corpus_entries_open_upgrade_and_read_exactly() {
             let db = Pigeonhole::open(&path, real_options())
                 .unwrap_or_else(|err| panic!("{name}: open: {err}"));
             assert_eq!(contents(&db), expected, "{name}: contents");
-            assert_eq!(slot_versions(&path), [Some(4), Some(4)], "{name}: upgraded");
             let t = db
                 .table("corpus_writes")
                 .unwrap()
@@ -564,6 +563,8 @@ fn upgrade_corpus_entries_open_upgrade_and_read_exactly() {
             db.flush().unwrap();
             db.compact().unwrap();
             db.close().unwrap();
+            // Read once closed: on Windows the open database's lock range refuses reads.
+            assert_eq!(slot_versions(&path), [Some(4), Some(4)], "{name}: upgraded");
             let report = pigeonhole::check(&path, pigeonhole::CheckOptions::default())
                 .unwrap_or_else(|err| panic!("{name}: check: {err}"));
             assert!(report.is_ok(), "{name}: {:#?}", report.findings);
