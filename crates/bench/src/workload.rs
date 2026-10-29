@@ -474,6 +474,119 @@ impl RunIter<'_> {
             },
         }
     }
+    /// YCSB D's read: a recently inserted record.
+    fn ycsb_read_latest(&mut self) -> BenchOp {
+        let g = self.g;
+        // Read latest: recently inserted records are the most popular.
+        let back = g.items.sample(&mut self.rng);
+        let i = self.inserted.saturating_sub(1 + back);
+        BenchOp::GetRow {
+            row: ycsb_key(i),
+            family: YCSB_FAMILY,
+        }
+    }
+
+    /// Time series: 40% puts of an entity's next point, 40% scans of ten of its points, 20%
+    /// gets of a recent one.
+    fn time_series_op(&mut self, p: f64) -> BenchOp {
+        let g = self.g;
+        let e = g.items.sample_scrambled(&mut self.rng);
+        let clock = &mut self.clocks[e as usize];
+        if p < 0.4 {
+            let t = *clock;
+            *clock += 1;
+            BenchOp::PutAt {
+                row: point_key(e, t),
+                family: METRIC_FAMILY,
+                ts: g.point_ts(t),
+                cells: vec![(b"v".to_vec(), g.value(&mut self.rng))],
+            }
+        } else if p < 0.8 && g.config.kind == WorkloadKind::TimeSeriesRange {
+            // D247: up to ten points of one entity from 12 to 6 hours ago.
+            BenchOp::ScanFiltered {
+                start: entity_prefix(e).into_bytes(),
+                len: 10,
+                family: METRIC_FAMILY,
+                qualifier_prefix: None,
+                time_range: Some((
+                    g.epoch - TIME_RANGE.0.as_micros() as u64,
+                    g.epoch - TIME_RANGE.1.as_micros() as u64,
+                )),
+            }
+        } else if p < 0.8 {
+            // The newest ten points of one entity.
+            BenchOp::Scan {
+                start: entity_prefix(e).into_bytes(),
+                len: 10,
+            }
+        } else {
+            let t = clock.saturating_sub(1 + self.rng.below(POINTS_PER_ENTITY));
+            BenchOp::Get {
+                row: point_key(e, t),
+                family: METRIC_FAMILY,
+                qualifier: b"v".to_vec(),
+            }
+        }
+    }
+
+    /// D247: one vertex's out-edges to about a tenth of the vertices: a qualifier prefix
+    /// fixing every digit but the lowest `k` of the destination, 10^k about n/10.
+    fn adjacency_prefix_scan(&mut self) -> BenchOp {
+        let g = self.g;
+        let start = vertex_key(g.items.sample_scrambled(&mut self.rng));
+        let k = ((g.n_items as f64 / 10.0).max(1.0).log10().floor() as u32).min(9);
+        let buckets = g.n_items.div_ceil(10u64.pow(k)).max(1);
+        let bucket = self.rng.below(buckets);
+        BenchOp::ScanFiltered {
+            start,
+            len: 1,
+            family: EDGE_FAMILY,
+            qualifier_prefix: Some(
+                format!("edge:{bucket:0w$}", w = (10 - k) as usize).into_bytes(),
+            ),
+            time_range: None,
+        }
+    }
+
+    /// D247: one unit between two distinct Zipfian accounts, so hot ones conflict.
+    fn transfer_op(&mut self) -> BenchOp {
+        let g = self.g;
+        let from = g.items.sample_scrambled(&mut self.rng);
+        let mut to = g.items.sample_scrambled(&mut self.rng);
+        if to == from {
+            to = (from + 1) % g.n_items.max(2);
+        }
+        BenchOp::Transfer {
+            from: account_key(from),
+            to: account_key(to),
+            amount: 1,
+        }
+    }
+
+    /// D246: a row in one partition, or one row in each of 2-4 consecutive partitions
+    /// (distinct, so on different shards when the partitions sit one per shard), the rows
+    /// uniform within their partitions.
+    fn cross_shard_op(&mut self, p: f64) -> BenchOp {
+        let g = self.g;
+        let n = XSHARD_PARTITIONS as u64;
+        let parts = if p < XSHARD_CROSS_FRACTION {
+            2 + self.rng.below(3)
+        } else {
+            1
+        };
+        let first = self.rng.below(n);
+        let per = g.rows_per_partition();
+        let rows = (0..parts)
+            .map(|k| {
+                let i = self.rng.below(per);
+                g.partition_row(((first + k) % n) as usize, i, &mut self.rng)
+            })
+            .collect();
+        BenchOp::Commit {
+            family: YCSB_FAMILY,
+            rows,
+        }
+    }
 }
 
 impl Iterator for RunIter<'_> {
@@ -492,15 +605,7 @@ impl Iterator for RunIter<'_> {
             WorkloadKind::YcsbB if p < 0.95 => self.ycsb_read(),
             WorkloadKind::YcsbB => self.ycsb_update(),
             WorkloadKind::YcsbC => self.ycsb_read(),
-            WorkloadKind::YcsbD if p < 0.95 => {
-                // Read latest: recently inserted records are the most popular.
-                let back = g.items.sample(&mut self.rng);
-                let i = self.inserted.saturating_sub(1 + back);
-                BenchOp::GetRow {
-                    row: ycsb_key(i),
-                    family: YCSB_FAMILY,
-                }
-            }
+            WorkloadKind::YcsbD if p < 0.95 => self.ycsb_read_latest(),
             WorkloadKind::YcsbD => self.ycsb_insert(),
             WorkloadKind::YcsbE if p < 0.95 => BenchOp::Scan {
                 start: ycsb_key(g.items.sample_scrambled(&mut self.rng)),
@@ -525,62 +630,8 @@ impl Iterator for RunIter<'_> {
                 row: sparse_key(g.items.sample_scrambled(&mut self.rng)),
             },
             WorkloadKind::SparseWide | WorkloadKind::SparseWideDeletes => self.sparse_op(p),
-            WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange => {
-                let e = g.items.sample_scrambled(&mut self.rng);
-                let clock = &mut self.clocks[e as usize];
-                if p < 0.4 {
-                    let t = *clock;
-                    *clock += 1;
-                    BenchOp::PutAt {
-                        row: point_key(e, t),
-                        family: METRIC_FAMILY,
-                        ts: g.point_ts(t),
-                        cells: vec![(b"v".to_vec(), g.value(&mut self.rng))],
-                    }
-                } else if p < 0.8 && g.config.kind == WorkloadKind::TimeSeriesRange {
-                    // D247: up to ten points of one entity from 12 to 6 hours ago.
-                    BenchOp::ScanFiltered {
-                        start: entity_prefix(e).into_bytes(),
-                        len: 10,
-                        family: METRIC_FAMILY,
-                        qualifier_prefix: None,
-                        time_range: Some((
-                            g.epoch - TIME_RANGE.0.as_micros() as u64,
-                            g.epoch - TIME_RANGE.1.as_micros() as u64,
-                        )),
-                    }
-                } else if p < 0.8 {
-                    // The newest ten points of one entity.
-                    BenchOp::Scan {
-                        start: entity_prefix(e).into_bytes(),
-                        len: 10,
-                    }
-                } else {
-                    let t = clock.saturating_sub(1 + self.rng.below(POINTS_PER_ENTITY));
-                    BenchOp::Get {
-                        row: point_key(e, t),
-                        family: METRIC_FAMILY,
-                        qualifier: b"v".to_vec(),
-                    }
-                }
-            }
-            // D247: one vertex's out-edges to about a tenth of the vertices: a qualifier prefix
-            // fixing every digit but the lowest `k` of the destination, 10^k about n/10.
-            WorkloadKind::AdjacencyPrefix if p < 0.8 => {
-                let start = vertex_key(g.items.sample_scrambled(&mut self.rng));
-                let k = ((g.n_items as f64 / 10.0).max(1.0).log10().floor() as u32).min(9);
-                let buckets = g.n_items.div_ceil(10u64.pow(k)).max(1);
-                let bucket = self.rng.below(buckets);
-                BenchOp::ScanFiltered {
-                    start,
-                    len: 1,
-                    family: EDGE_FAMILY,
-                    qualifier_prefix: Some(
-                        format!("edge:{bucket:0w$}", w = (10 - k) as usize).into_bytes(),
-                    ),
-                    time_range: None,
-                }
-            }
+            WorkloadKind::TimeSeriesTtl | WorkloadKind::TimeSeriesRange => self.time_series_op(p),
+            WorkloadKind::AdjacencyPrefix if p < 0.8 => self.adjacency_prefix_scan(),
             WorkloadKind::Adjacency if p < 0.8 => BenchOp::Scan {
                 // Out-edges of one vertex.
                 start: vertex_key(g.items.sample_scrambled(&mut self.rng)),
@@ -608,19 +659,7 @@ impl Iterator for RunIter<'_> {
                 let row = ycsb_key(self.rng.below(g.n_items));
                 g.commit(row, &mut self.rng)
             }
-            // D247: two distinct Zipfian accounts, so hot ones conflict.
-            WorkloadKind::Transfer => {
-                let from = g.items.sample_scrambled(&mut self.rng);
-                let mut to = g.items.sample_scrambled(&mut self.rng);
-                if to == from {
-                    to = (from + 1) % g.n_items.max(2);
-                }
-                BenchOp::Transfer {
-                    from: account_key(from),
-                    to: account_key(to),
-                    amount: 1,
-                }
-            }
+            WorkloadKind::Transfer => self.transfer_op(),
             // D247: Zipfian rows, so hot counters take many increments.
             WorkloadKind::Counters if p < COUNTER_INCR_FRACTION => BenchOp::Incr {
                 row: counter_key(g.items.sample_scrambled(&mut self.rng)),
@@ -629,29 +668,7 @@ impl Iterator for RunIter<'_> {
             WorkloadKind::Counters => BenchOp::ReadCounter {
                 row: counter_key(g.items.sample_scrambled(&mut self.rng)),
             },
-            // D246: a row in one partition, or one row in each of 2-4 consecutive partitions
-            // (distinct, so on different shards when the partitions sit one per shard), the
-            // rows uniform within their partitions.
-            WorkloadKind::CrossShardContention => {
-                let n = XSHARD_PARTITIONS as u64;
-                let parts = if p < XSHARD_CROSS_FRACTION {
-                    2 + self.rng.below(3)
-                } else {
-                    1
-                };
-                let first = self.rng.below(n);
-                let per = g.rows_per_partition();
-                let rows = (0..parts)
-                    .map(|k| {
-                        let i = self.rng.below(per);
-                        g.partition_row(((first + k) % n) as usize, i, &mut self.rng)
-                    })
-                    .collect();
-                BenchOp::Commit {
-                    family: YCSB_FAMILY,
-                    rows,
-                }
-            }
+            WorkloadKind::CrossShardContention => self.cross_shard_op(p),
         };
         Some(op)
     }
