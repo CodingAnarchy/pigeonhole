@@ -1,10 +1,11 @@
 //! phdb: the command-line tool for Pigeonhole databases (#692).
 //!
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). The binary is the
-//! product; this library exists so the commands can be tested in process. Its one public
-//! item is [`run`]: the command language, the output shapes and the exit codes are
-//! documented in the [CLI guide](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/cli.md),
-//! not in this crate's API.
+//! product; this library exists so the commands can be tested in process, and its items are
+//! hidden and outside the semver promise (ICR 0086). The command language, the output shapes
+//! and the exit codes are documented in the
+//! [CLI guide](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/cli.md), and
+//! those are what the promise covers.
 #![forbid(unsafe_code)]
 
 use std::ffi::OsString;
@@ -17,11 +18,13 @@ mod open;
 mod output;
 mod shell;
 
+#[doc(hidden)]
 pub use exit::ExitStatus;
 
 /// Runs `phdb` with `args` (the program name first, as from [`std::env::args_os`]), writing
 /// command output to `stdout` and errors to `stderr`, and returns the exit status the
 /// process should end with.
+#[doc(hidden)]
 pub fn run<I, T>(args: I, stdout: &mut dyn Write, stderr: &mut dyn Write) -> ExitStatus
 where
     I: IntoIterator<Item = T>,

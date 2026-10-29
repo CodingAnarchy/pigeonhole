@@ -123,7 +123,7 @@ for i in 0..100u32 {
 ```
 
 ## When an async read blocks
-A few rare cases still read synchronously, inside the future or, for a read whose other blocks are cached, inside the `get_async` or `read_async` call itself. Each one is counted in `Pigeonhole::async_sync_reads()` (and on `PigeonholeReader`), so you can see whether your workload hits them:
+A few rare cases still read synchronously, inside the future or, for a read whose other blocks are cached, inside the `get_async` or `read_async` call itself. Each one is counted in `engine_metrics().async_sync_reads` (in a reader process, `PigeonholeReader::async_sync_reads()`), so you can see whether your workload hits them:
 
 - a separated (blob) value larger than the blob cache limit (an eighth of the block cache, capped at 1 MiB);
 - a block the cache cannot keep (a cache of size 0, or a block larger than a cache shard), or a single read needing more than 64 fetches;

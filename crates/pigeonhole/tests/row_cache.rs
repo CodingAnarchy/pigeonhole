@@ -37,7 +37,14 @@ fn cells(r: Option<pigeonhole::Row>) -> Cells {
     r.map(|r| {
         (0..r.len())
             .filter_map(|i| r.entry(i))
-            .map(|(f, q, c)| (f.to_owned(), q.to_vec(), c.timestamp(), c.value().to_vec()))
+            .map(|e| {
+                (
+                    e.family.to_owned(),
+                    e.qualifier.to_vec(),
+                    e.cell.timestamp(),
+                    e.cell.value().to_vec(),
+                )
+            })
             .collect()
     })
     .unwrap_or_default()

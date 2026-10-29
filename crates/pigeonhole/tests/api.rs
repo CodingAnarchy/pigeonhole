@@ -162,8 +162,8 @@ fn family_settings_are_stored_and_unregistered_operators_refused() {
                 .ttl(days(30))
                 .bloom_bits(0)
                 .blob_threshold(1 << 20)
-                .uncompressed()
-                .lz4()
+                .compression(pigeonhole::Compression::None)
+                .compression(pigeonhole::Compression::Lz4)
                 .block_size(4096)
                 .cache_priority(Priority::High)
                 .compaction(Compaction::Leveled),
@@ -182,7 +182,10 @@ fn family_settings_are_stored_and_unregistered_operators_refused() {
                 .ttl(days(1))
                 .compaction(Compaction::FifoByTime),
         )
-        .family("zstd", Family::default().zstd(19))
+        .family(
+            "zstd",
+            Family::default().compression(pigeonhole::Compression::Zstd(19)),
+        )
         .create()
         .unwrap();
     assert_eq!(u.families(), ["tiered", "fifo", "zstd"]);
@@ -547,10 +550,10 @@ fn scans_bounds_prefixes_limits_and_both_iterator_forms() {
         .unwrap()
         .unwrap();
     assert_eq!(row.len(), 1);
-    assert_eq!(row.entry(0).unwrap().0, "b");
+    assert_eq!(row.entry(0).unwrap().family, "b");
     let row = t
         .scan_prefix(b"a")
-        .columns_per_row(1)
+        .column_limit(1)
         .iter()
         .unwrap()
         .next()
@@ -615,12 +618,15 @@ fn row_and_rowref_agree_and_cells_outlive_their_handles() {
     assert_eq!(row.len(), 3);
     assert!(!row.is_empty() && !view.is_empty());
     for i in 0..3 {
-        let (f, q, c) = row.entry(i).unwrap();
+        let o = row.entry(i).unwrap();
         let e = view.entry(i).unwrap();
         let e2 = r.entry(i).unwrap();
-        assert_eq!((f, q, c.value()), (e.family, e.qualifier, e.cell.value()));
+        assert_eq!(
+            (o.family, o.qualifier, o.cell.value()),
+            (e.family, e.qualifier, e.cell.value())
+        );
         assert_eq!((e.family, e.qualifier), (e2.family, e2.qualifier));
-        assert_eq!(c.timestamp(), e2.cell.timestamp());
+        assert_eq!(o.cell.timestamp(), e2.cell.timestamp());
     }
     assert!(row.entry(3).is_none() && r.entry(3).is_none());
     assert_eq!(row.get("a", b"n").unwrap().as_i64(), Some(-5));
@@ -2740,7 +2746,7 @@ fn reads_at_a_snapshot_name_the_families_the_snapshot_saw() {
         .map(|row| row.unwrap())
         .flat_map(|row| {
             (0..row.len())
-                .filter_map(|i| row.entry(i).map(|(f, _, _)| f.to_owned()))
+                .filter_map(|i| row.entry(i).map(|e| e.family.to_owned()))
                 .collect::<Vec<_>>()
         })
         .collect();

@@ -60,7 +60,6 @@ pub enum FailureCause {
 /// The first failure of an instance ([`Pigeonhole::failure`](crate::Pigeonhole::failure),
 /// ICR 0040).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[repr(C)]
 #[non_exhaustive]
 pub struct Failure {
     /// The shard that failed, or [`Failure::MAIN_FILE`] when a manifest commit to the main

@@ -342,7 +342,8 @@ impl<'t> RowRead<'t> {
         self
     }
 
-    /// At most `n` columns per family.
+    /// At most `n` columns per family. The same limit as [`Scan::column_limit`], which
+    /// applies it to each row.
     pub fn column_limit(mut self, n: u32) -> Self {
         self.sel.spec.columns_per_row = n;
         self
@@ -524,9 +525,9 @@ impl<'t> Scan<'t> {
         self
     }
 
-    /// At most `n` columns per family per row; the rest of each row is skipped without
-    /// decoding.
-    pub fn columns_per_row(mut self, n: u32) -> Self {
+    /// At most `n` columns per family in each row; the rest of each row is skipped without
+    /// decoding. The same limit as [`RowRead::column_limit`] (ICR 0086).
+    pub fn column_limit(mut self, n: u32) -> Self {
         self.sel.spec.columns_per_row = n;
         self
     }
@@ -596,7 +597,7 @@ impl<'t> Scan<'t> {
     /// [`nonblocking`](crate::nonblocking)): each tablet is positioned without blocking, and
     /// the blocks each step will read are fetched asynchronously first, only as the stream
     /// is polled. A block a step reads that was not predicted is read synchronously and
-    /// counted ([`Pigeonhole::async_sync_reads`](crate::Pigeonhole::async_sync_reads); D196,
+    /// counted ([`EngineMetrics::async_sync_reads`](crate::EngineMetrics::async_sync_reads); D196,
     /// #398). An error setting the scan up is the stream's first item.
     #[cfg(feature = "async")]
     pub fn stream(mut self) -> crate::nonblocking::RowStream<'t> {

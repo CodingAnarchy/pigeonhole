@@ -76,7 +76,7 @@ fn run(path: &Path) -> pigeonhole::Result<()> {
     let mut it = g
         .scan_prefix(b"node:")
         .family("in")
-        .columns_per_row(2)
+        .column_limit(2)
         .iter()?;
     let mut total = 0;
     while let Some(row) = it.next_ref()? {

@@ -29,7 +29,7 @@ fn rich(path: &Path) {
             "p",
             Family::default()
                 .max_versions(3)
-                .zstd(5)
+                .compression(pigeonhole::Compression::Zstd(5))
                 .cache_priority(Priority::High),
         )
         .family("c", Family::counter())
