@@ -2211,35 +2211,28 @@ impl ShardState {
         }
         self.pack_target = self.pack_k;
         let stale = self.shared.balance.interval_nanos.saturating_mul(3).max(1);
-        let busy: f64 = self
-            .shared
-            .loads
-            .iter()
-            .map(|l| l.read_busy_fresh(now, stale).unwrap_or(0) as f64 / 1e6)
-            .sum();
-        let writes: u64 = self
-            .shared
-            .loads
-            .iter()
-            .map(|l| l.read_fresh(now, stale).unwrap_or(0))
-            .sum();
-        let writes_slow: u64 = self
-            .shared
-            .loads
-            .iter()
-            .map(|l| l.read_slow_fresh(now, stale).unwrap_or(0))
-            .sum();
+        // Over every shard's fresh report (a stale one reads 0): the sum, and the sum of the
+        // fractions (millionths each).
+        let loads = &self.shared.loads;
+        let sum = |read: fn(&LoadSlot, u64, u64) -> Option<u64>| -> u64 {
+            loads.iter().map(|l| read(l, now, stale).unwrap_or(0)).sum()
+        };
+        let sum_fractions = |read: fn(&LoadSlot, u64, u64) -> Option<u64>| -> f64 {
+            loads
+                .iter()
+                .map(|l| read(l, now, stale).unwrap_or(0) as f64 / 1e6)
+                .sum()
+        };
+        let busy = sum_fractions(LoadSlot::read_busy_fresh);
+        let writes = sum(LoadSlot::read_fresh);
+        let writes_slow = sum(LoadSlot::read_slow_fresh);
         // D257: the store's concurrency, the mean client commits in flight over every shard,
         // and the active shards it calls for. For `t` closed-loop clients it is at most `t`
         // whatever `k` is, so unlike the spin term it replaced it never justifies the spread
         // it caused.
-        let inflight: f64 = self
-            .shared
-            .loads
-            .iter()
-            .map(|l| l.read_inflight_fresh(now, stale).unwrap_or(0) as f64 / 1e6)
-            .sum();
-        let k_c = ((inflight / PACK_CONCURRENCY).round() as usize).clamp(1, n);
+        let inflight = sum_fractions(LoadSlot::read_inflight_fresh);
+        let k_for = |inflight: f64| ((inflight / PACK_CONCURRENCY).round() as usize).clamp(1, n);
+        let k_c = k_for(inflight);
         // The slow concurrency (D257): when it calls for the same active shards as the
         // fast one, the concurrency has held for the slow window and the first shrink from
         // the unpacked start need not wait for `PACK_FIRST_SHRINK_PASSES`. A dip after a
@@ -2247,7 +2240,7 @@ impl ShardState {
         // window. A concurrency that reads 0 (the simulated clock, an application-owned
         // store) settles nothing, so the window applies as before.
         self.inflight_slow = SLOW_ALPHA * inflight + (1.0 - SLOW_ALPHA) * self.inflight_slow;
-        let k_c_slow = ((self.inflight_slow / PACK_CONCURRENCY).round() as usize).clamp(1, n);
+        let k_c_slow = k_for(self.inflight_slow);
         // Agreement must hold for a shrink count: the fast average crosses the slow one on
         // its way back up after a dip, and a count the dip accrued must not fire then.
         self.settled_passes = if inflight > 0.0 && k_c_slow == k_c {
@@ -2256,10 +2249,11 @@ impl ShardState {
             0
         };
         let settled = self.settled_passes >= PACK_SHRINK_PASSES;
-        if writes >= self.shared.balance.min_writes.max(1) {
+        let writing = writes >= self.shared.balance.min_writes.max(1);
+        if writing {
             self.writing_passes = self.writing_passes.saturating_add(1);
         }
-        if busy <= 0.0 || writes < self.shared.balance.min_writes.max(1) {
+        if busy <= 0.0 || !writing {
             self.pack_up = 0;
             self.pack_down = 0;
             return false;
@@ -2760,7 +2754,10 @@ impl ShardState {
         //    still shares SSTs with a sibling: their bytes would count twice).
         for t in &owned {
             let (bytes, shared) = live_bytes(&view, t, &refs);
-            if bytes >= cfg.split_bytes && !shared && !room_for(t) {
+            if bytes < cfg.split_bytes || shared {
+                continue;
+            }
+            if !room_for(t) {
                 self.shared.metrics[usize::from(self.id.0)]
                     .refused_slots
                     .fetch_add(1, Ordering::Relaxed);
@@ -2772,12 +2769,9 @@ impl ShardState {
                     Self::slots_in(&view, self.id),
                     self.max_slots()
                 );
+                continue;
             }
-            if bytes >= cfg.split_bytes
-                && !shared
-                && room_for(t)
-                && let Some(key) = self.size_split_key(&view, t)
-            {
+            if let Some(key) = self.size_split_key(&view, t) {
                 return Some(TabletOpKind::Split {
                     tablet: t.id,
                     keys: vec![key],
@@ -2893,6 +2887,9 @@ impl ShardState {
             }
         }
         // 3. Merge two adjacent cold tablets of one table that are small together.
+        let small_together = |a: &TabletEntry, b: &TabletEntry| {
+            live_bytes(&view, a, &refs).0 + live_bytes(&view, b, &refs).0 < cfg.split_bytes / 4
+        };
         let cold_nanos = cfg.interval_nanos.saturating_mul(cfg.cold_passes);
         let long_ago = |(pass, clock): (u64, u64)| {
             pass + cfg.cold_passes <= self.balance_pass || clock.saturating_add(cold_nanos) <= now
@@ -2916,9 +2913,7 @@ impl ShardState {
             {
                 continue;
             }
-            let (lb, _) = live_bytes(&view, l, &refs);
-            let (rb, _) = live_bytes(&view, r, &refs);
-            if lb + rb >= cfg.split_bytes / 4 {
+            if !small_together(l, r) {
                 continue;
             }
             if merged_ssts(&view.catalog, l, r).is_ok() {
@@ -2961,10 +2956,8 @@ impl ShardState {
             if left.shard == self.id || usize::from(left.shard.0) >= active {
                 continue;
             }
-            let (lb, _) = live_bytes(&view, left, &refs);
-            let (tb, _) = live_bytes(&view, t, &refs);
             let families = view.catalog.family_ids_of(t.table).len();
-            if lb + tb < cfg.split_bytes / 4 && self.slots_fit(&view, left.shard, families) {
+            if small_together(left, t) && self.slots_fit(&view, left.shard, families) {
                 return Some(TabletOpKind::Move {
                     tablet: t.id,
                     to: left.shard,

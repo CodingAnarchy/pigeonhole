@@ -45,7 +45,7 @@ mod tablets;
 use tablets::{ActiveOp, TabletLoad};
 pub(crate) use tablets::{BalanceConfig, COLD_PASSES, LoadSlot, TabletOpKind, split_by_shard};
 
-use crate::catalog::{Catalog, MergeKind};
+use crate::catalog::{Catalog, FamilyMeta, MergeKind};
 use crate::compact::{self, CompactionRecord, CompactionWork};
 use crate::flush::{FlushItem, FlushTask, FlushedItem};
 use crate::manifest::{self, ManifestPump, ManifestQueue, ManifestReq, ManifestWriter};
@@ -418,6 +418,10 @@ fn new_memtable(
 }
 
 /// Engine-wide state every shard and every caller shares.
+///
+/// Built by `Shared::base` as a reader process has it; the writer's open
+/// (`open_writer_inner`) overrides its own fields. A new field whose writer value differs
+/// from a reader's must be added to that override list too.
 pub(crate) struct Shared {
     pub vfs: VfsRef,
     pub shm: ShmRegion,
@@ -1369,6 +1373,14 @@ impl From<PrepareError> for Error {
             PrepareError::Io => Error::ShardFailed,
         }
     }
+}
+
+/// The SSTs and metadata of slot `key` in `view`, or `None` for a slot gone from it or of a
+/// family whose merge operator is not registered (it is never compacted).
+fn slot_family(view: &View, key: (TabletId, FamilyId)) -> Option<(&Arc<FamilySsts>, &FamilyMeta)> {
+    let fam = view.ssts.family(key.0, key.1)?;
+    let meta = view.catalog.family(key.1)?;
+    (meta.merge != MergeKind::Unknown).then_some((fam, meta))
 }
 
 /// A failed shard's error for work that is not a commit (maintenance, a durability wait). A
@@ -5887,13 +5899,7 @@ impl ShardState {
         }
         // The oldest waiter's deadline: the pending queue keeps submission order, so the
         // oldest waiter is also the first to be admitted once room frees.
-        let oldest = self
-            .pending
-            .iter()
-            .filter(|m| m.room_since > 0)
-            .map(|m| room_since(m.room_since, now))
-            .min()
-            .unwrap_or(now);
+        let oldest = self.oldest_room_wait(now);
         // The clock has stopped if either of the wait's timers gave up on this reading.
         let frozen = self.room_wait.as_ref().is_some_and(|w| w.stopped(now));
         let me = self.id;
@@ -5964,30 +5970,11 @@ impl ShardState {
             // Refuse the waiting members; this group's admitted ones still apply.
             self.end_room_wait(now);
             self.wait_room = false;
-            let waiting = std::mem::take(&mut self.pending);
-            for mut m in waiting {
-                if matches!(m.kind, MemberKind::CommitRecord { .. }) {
-                    self.pending.push(m);
-                    continue;
-                }
-                m.failed = Some(Error::Busy);
-                self.settle(m, Ok(()), ctx);
-            }
+            self.refuse_room_waiters(now, None, ctx);
         } else if now.saturating_sub(oldest) >= timeout {
             // The members that waited the whole timeout themselves are refused (D124,
             // D240); the rest keep their place, and the wait goes on for them.
-            let waiting = std::mem::take(&mut self.pending);
-            for mut m in waiting {
-                if m.room_since > 0
-                    && now.saturating_sub(room_since(m.room_since, now)) >= timeout
-                    && !matches!(m.kind, MemberKind::CommitRecord { .. })
-                {
-                    m.failed = Some(Error::Busy);
-                    self.settle(m, Ok(()), ctx);
-                } else {
-                    self.pending.push(m);
-                }
-            }
+            self.refuse_room_waiters(now, Some(timeout), ctx);
             if !self
                 .pending
                 .iter()
@@ -5997,18 +5984,72 @@ impl ShardState {
                 self.wait_room = false;
             } else {
                 // The next deadline: the timer that fired for this one is done.
-                let next = self
-                    .pending
-                    .iter()
-                    .filter(|m| m.room_since > 0)
-                    .map(|m| room_since(m.room_since, now))
-                    .min()
-                    .unwrap_or(now);
+                let next = self.oldest_room_wait(now);
                 if let Some(w) = &mut self.room_wait {
                     w.arm_timeout(next.saturating_add(timeout), &self.shared.vfs, ctx, me);
                 }
             }
         }
+    }
+
+    /// When the oldest member waiting for room began to wait (`now` if none waits).
+    fn oldest_room_wait(&self, now: u64) -> u64 {
+        self.pending
+            .iter()
+            .filter(|m| m.room_since > 0)
+            .map(|m| room_since(m.room_since, now))
+            .min()
+            .unwrap_or(now)
+    }
+
+    /// Refuses (`Busy`) the members waiting for room, all of them or, with `timeout`, those
+    /// whose own wait reached it. A `CommitRecord` is never refused: it keeps its place, as
+    /// the members not refused do, in order.
+    fn refuse_room_waiters(
+        &mut self,
+        now: u64,
+        timeout: Option<u64>,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) {
+        for mut m in std::mem::take(&mut self.pending) {
+            let refused = !matches!(m.kind, MemberKind::CommitRecord { .. })
+                && timeout.is_none_or(|t| {
+                    m.room_since > 0 && now.saturating_sub(room_since(m.room_since, now)) >= t
+                });
+            if refused {
+                m.failed = Some(Error::Busy);
+                self.settle(m, Ok(()), ctx);
+            } else {
+                self.pending.push(m);
+            }
+        }
+    }
+
+    /// Parks single `m` behind the undecided shares on its rows (D263, D267), starting its
+    /// wait if `start`, unless its wait has ended: then it is settled now. True if parked.
+    #[cold]
+    #[inline(never)]
+    fn wait_for_shares(
+        &mut self,
+        mut m: Member,
+        start: bool,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) -> bool {
+        if self.end_share_wait(&mut m) {
+            self.settle(m, Ok(()), ctx);
+            return false;
+        }
+        if start {
+            trace!(
+                "shard {} single waits for an undecided share (pending {})",
+                self.id.0,
+                self.prepared.len()
+            );
+            self.start_share_wait(&mut m);
+        }
+        self.hold_rows(&m);
+        self.pending.push(m);
+        true
     }
 
     /// Runs the group commit over everything drained since the last one.
@@ -6146,13 +6187,7 @@ impl ShardState {
                 if !self.waiting_singles.contains_key(&m.share_wait) {
                     m.share_wait = 0;
                 } else if self.single_ahead_undecided(&m) {
-                    if self.end_share_wait(&mut m) {
-                        self.settle(m, Ok(()), ctx);
-                        continue;
-                    }
-                    self.hold_rows(&m);
-                    self.pending.push(m);
-                    share_waits += 1;
+                    share_waits += usize::from(self.wait_for_shares(m, false, ctx));
                     continue;
                 } else {
                     waited = true;
@@ -6163,19 +6198,7 @@ impl ShardState {
                 && self.overlaps_undecided(&m)
             {
                 if matches!(m.kind, MemberKind::Single) {
-                    if self.end_share_wait(&mut m) {
-                        self.settle(m, Ok(()), ctx);
-                        continue;
-                    }
-                    trace!(
-                        "shard {} single waits for an undecided share (pending {})",
-                        self.id.0,
-                        self.prepared.len()
-                    );
-                    self.start_share_wait(&mut m);
-                    self.hold_rows(&m);
-                    self.pending.push(m);
-                    share_waits += 1;
+                    share_waits += usize::from(self.wait_for_shares(m, true, ctx));
                     continue;
                 }
                 // D271: what overlaps now is an optimistic conflict, refused as D263 did
@@ -6372,10 +6395,7 @@ impl ShardState {
         if need_room {
             self.wait_for_room(&admitted, ctx);
         } else {
-            if let Some(w) = &self.room_wait
-                && !self.wait_room
-            {
-                let _ = w;
+            if self.room_wait.is_some() && !self.wait_room {
                 self.end_room_wait(ctx.now_nanos());
             }
             // A member waiting for a guarded flush's install is woken by its outcome
@@ -6479,11 +6499,7 @@ impl ShardState {
             // accepted (even one whose write then fails: it may have landed) may be applied
             // or replayed, so its blob files must stay (#230).
             if self.shared.large_open.load(Ordering::Acquire) > 0
-                && !matches!(
-                    result,
-                    Err(pigeonhole_wal::Error::RecordTooLarge
-                        | pigeonhole_wal::Error::InvalidArgument { .. })
-                )
+                && accepted(&result)
                 && let WalRecord::Batch { batch, .. } | WalRecord::Prepare { batch, .. } = &record
             {
                 crate::large::note_logged(&self.shared, *batch);
@@ -6491,13 +6507,7 @@ impl ShardState {
             // Test hook: the append order. A failed write may still have landed (a crash
             // or an I/O error mid-write), so every attempt the stream accepted counts.
             #[cfg(feature = "test-hooks")]
-            if self.shared.hooks.record.load(Ordering::Acquire)
-                && !matches!(
-                    result,
-                    Err(pigeonhole_wal::Error::RecordTooLarge
-                        | pigeonhole_wal::Error::InvalidArgument { .. })
-                )
-            {
+            if self.shared.hooks.record.load(Ordering::Acquire) && accepted(&result) {
                 use crate::engine::hooks::{AppendedKind, AppendedRecord};
                 self.shared
                     .hooks
@@ -6650,14 +6660,7 @@ impl ShardState {
             }
             match &m.kind {
                 MemberKind::Single => {
-                    #[cfg(feature = "test-hooks")]
-                    let fault = {
-                        use crate::engine::hooks::Fault;
-                        let faults = &self.shared.hooks.faults;
-                        faults.take(Fault::NextApply) || faults.take(Fault::NextSingleApply)
-                    };
-                    #[cfg(feature = "test-hooks")]
-                    let applied = if fault {
+                    let applied = if fault!(self, NextApply) || fault!(self, NextSingleApply) {
                         Err(Error::Busy)
                     } else {
                         m.bytes
@@ -6665,12 +6668,6 @@ impl ShardState {
                             .map_err(Error::from)
                             .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts))
                     };
-                    #[cfg(not(feature = "test-hooks"))]
-                    let applied = m
-                        .bytes
-                        .batch()
-                        .map_err(Error::from)
-                        .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts));
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
                         self.poison(crate::health::FailureCause::Internal);
@@ -6751,24 +6748,11 @@ impl ShardState {
                 }
             }
         }
-        #[cfg(feature = "test-hooks")]
-        let published = if self.view_dirty
-            && self
-                .shared
-                .hooks
-                .faults
-                .take(crate::engine::hooks::Fault::NextGroupPublish)
-        {
+        let published = if self.view_dirty && fault!(self, NextGroupPublish) {
             Err(Error::Corruption(
                 "injected view publish failure (Fault::NextGroupPublish)".into(),
             ))
         } else if self.view_dirty {
-            self.publish_memtables()
-        } else {
-            Ok(())
-        };
-        #[cfg(not(feature = "test-hooks"))]
-        let published = if self.view_dirty {
             self.publish_memtables()
         } else {
             Ok(())
@@ -9285,15 +9269,9 @@ impl ShardState {
         let mut levels = std::mem::take(&mut self.scan_levels);
         self.owned_slots_into(&view, &mut slots);
         for &key in &slots {
-            let Some(fam) = view.ssts.family(key.0, key.1) else {
+            let Some((fam, meta)) = slot_family(&view, key) else {
                 continue;
             };
-            let Some(meta) = view.catalog.family(key.1) else {
-                continue;
-            };
-            if meta.merge == MergeKind::Unknown {
-                continue;
-            }
             let picker = self.picker(meta.options.compaction);
             fam.levels_meta_into(&mut levels);
             let s = picker.score_at(&levels, now, meta.options.ttl_micros);
@@ -9369,30 +9347,97 @@ impl ShardState {
             self.arm_compaction_retry(now_nanos.saturating_add(wait), ctx);
         }
         // Full compactions first (a caller waits), one slot at a time.
+        if self.run_full_compactions(&view, now, ctx) {
+            return;
+        }
+        // A slot whose compaction failed is not picked again until its backoff ends (or,
+        // on a frozen clock, a flush completes or a group is admitted), so a dead device
+        // does not loop, and one bad slot does not stop the others (issues #70, #79, #141).
+        // A poisoned shard starts none: it is dead until reopen.
+        if self.poisoned {
+            return;
+        }
+        if due.is_empty() && self.cleanups.is_empty() {
+            self.start_blob_gc(&view, ctx);
+            return;
+        }
+        let busy = self.busy_snapshot();
+        // A queued cleanup takes every other compaction, so writes elsewhere on the shard
+        // never starve it (and the merge waiting on it); not while writers stall on L0.
+        if self.cleanup_turn && self.stall.since == 0 && !self.cleanups.is_empty() {
+            self.start_cleanup(&view, &busy, ctx);
+            if self.compaction.is_some() {
+                self.cleanup_turn = false;
+                return;
+            }
+        }
+        // The earliest end of a quarantine that kept a due slot from being picked.
+        let mut quarantined: Option<u64> = None;
+        // The most urgent slot the picker finds work in (another one's inputs may be busy,
+        // or its compactions keep failing: it waits out its own backoff, issue #141).
+        for (_, key) in due {
+            if let Some(&(_, until)) = self.slot_backoff.get(&key)
+                && until > now_nanos
+            {
+                quarantined = Some(quarantined.map_or(until, |q: u64| q.min(until)));
+                continue;
+            }
+            let Some((fam, meta)) = slot_family(&view, key) else {
+                continue;
+            };
+            let Some(task) = self.picker(meta.options.compaction).pick(
+                key.0,
+                key.1,
+                &fam.levels_meta(),
+                &busy,
+                now,
+                meta.options.ttl_micros,
+            ) else {
+                continue;
+            };
+            if let Err(e) = self.start_compaction(&view, key, task, ctx) {
+                trace!("shard {} compaction start failed: {e}", self.id.0);
+                self.back_off_compaction(key, ctx);
+            }
+            self.cleanup_turn = true;
+            return;
+        }
+        // Nothing urgent: rewrite an inherited SST that blocks a merge (#95), or empty blob
+        // files that are mostly garbage.
+        self.start_cleanup(&view, &busy, ctx);
+        if self.compaction.is_none() {
+            self.start_blob_gc(&view, ctx);
+        }
+        // A slot passed over for its backoff is retried when the backoff ends, even if
+        // nothing else happens on the shard by then.
+        if let Some(until) = quarantined {
+            self.arm_compaction_retry(until, ctx);
+        }
+    }
+
+    /// Runs the queued full compactions (`compact_all`), one slot at a time: starts the next
+    /// slot's, or answers the front request once no slot needs one. True when `maintain`
+    /// stops here: a compaction started, or a flush has to come first.
+    fn run_full_compactions(
+        &mut self,
+        view: &Arc<View>,
+        now: Timestamp,
+        ctx: &mut ShardContext<'_, ShardMsg>,
+    ) -> bool {
         while let Some((filter, _, _)) = self.compact_all.front() {
             if !self.flush_idle() || self.freeze_all_pending || self.starved_all {
                 self.spawn_flush(ctx);
-                return;
+                return true;
             }
             let filter = *filter;
             let last = self.shared.picker.max_levels.max(2) - 1;
-            let busy: Vec<SstId> = self
-                .shared
-                .busy_ssts
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .iter()
-                .copied()
-                .collect();
+            let busy = self.busy_snapshot();
             let mut task = None;
-            for key in self.owned_slots(&view) {
-                let Some(fam) = view.ssts.family(key.0, key.1) else {
+            for key in self.owned_slots(view) {
+                let Some((fam, meta)) = slot_family(view, key) else {
                     continue;
                 };
-                let Some(meta) = view.catalog.family(key.1) else {
-                    continue;
-                };
-                if filter.is_some_and(|t| t != meta.table) || meta.merge == MergeKind::Unknown {
+                if filter.is_some_and(|t| t != meta.table) {
                     continue;
                 }
                 let Some(tablet) = view.tablets.entry(key.0) else {
@@ -9436,99 +9481,37 @@ impl ShardState {
                 }
             }
             match task {
-                Some((key, task)) => match self.start_compaction(&view, key, task, ctx) {
+                Some((key, task)) => match self.start_compaction(view, key, task, ctx) {
                     Ok(()) => {
                         self.compaction_full = true;
-                        return;
+                        return true;
                     }
-                    Err(e) => {
-                        let (_, reply, _) = self.compact_all.pop_front().expect("front");
-                        self.full_purged.clear();
-                        reply.notify(Err(e));
-                    }
+                    Err(e) => self.finish_full(Err(e)),
                 },
-                None => {
-                    // Every slot is fully compacted. A background failure meanwhile is not
-                    // this caller's (issue #141): its own failures were reported at once.
-                    let (_, reply, _) = self.compact_all.pop_front().expect("front");
-                    self.full_purged.clear();
-                    reply.notify(Ok(()));
-                }
+                // Every slot is fully compacted. A background failure meanwhile is not this
+                // caller's (issue #141): its own failures were reported at once.
+                None => self.finish_full(Ok(())),
             }
         }
-        // A slot whose compaction failed is not picked again until its backoff ends (or,
-        // on a frozen clock, a flush completes or a group is admitted), so a dead device
-        // does not loop, and one bad slot does not stop the others (issues #70, #79, #141).
-        // A poisoned shard starts none: it is dead until reopen.
-        if self.poisoned {
-            return;
-        }
-        if due.is_empty() && self.cleanups.is_empty() {
-            self.start_blob_gc(&view, ctx);
-            return;
-        }
-        let busy: Vec<SstId> = self
-            .shared
+        false
+    }
+
+    /// Answers the front full-compaction request with `result`.
+    fn finish_full(&mut self, result: Result<()>) {
+        let (_, reply, _) = self.compact_all.pop_front().expect("front");
+        self.full_purged.clear();
+        reply.notify(result);
+    }
+
+    /// The SSTs running compactions hold now.
+    fn busy_snapshot(&self) -> Vec<SstId> {
+        self.shared
             .busy_ssts
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .iter()
             .copied()
-            .collect();
-        // A queued cleanup takes every other compaction, so writes elsewhere on the shard
-        // never starve it (and the merge waiting on it); not while writers stall on L0.
-        if self.cleanup_turn && self.stall.since == 0 && !self.cleanups.is_empty() {
-            self.start_cleanup(&view, &busy, ctx);
-            if self.compaction.is_some() {
-                self.cleanup_turn = false;
-                return;
-            }
-        }
-        // The earliest end of a quarantine that kept a due slot from being picked.
-        let mut quarantined: Option<u64> = None;
-        // The most urgent slot the picker finds work in (another one's inputs may be busy,
-        // or its compactions keep failing: it waits out its own backoff, issue #141).
-        for (_, key) in due {
-            if let Some(&(_, until)) = self.slot_backoff.get(&key)
-                && until > now_nanos
-            {
-                quarantined = Some(quarantined.map_or(until, |q: u64| q.min(until)));
-                continue;
-            }
-            let Some(fam) = view.ssts.family(key.0, key.1) else {
-                continue;
-            };
-            let Some(meta) = view.catalog.family(key.1) else {
-                continue;
-            };
-            let Some(task) = self.picker(meta.options.compaction).pick(
-                key.0,
-                key.1,
-                &fam.levels_meta(),
-                &busy,
-                now,
-                meta.options.ttl_micros,
-            ) else {
-                continue;
-            };
-            if let Err(e) = self.start_compaction(&view, key, task, ctx) {
-                trace!("shard {} compaction start failed: {e}", self.id.0);
-                self.back_off_compaction(key, ctx);
-            }
-            self.cleanup_turn = true;
-            return;
-        }
-        // Nothing urgent: rewrite an inherited SST that blocks a merge (#95), or empty blob
-        // files that are mostly garbage.
-        self.start_cleanup(&view, &busy, ctx);
-        if self.compaction.is_none() {
-            self.start_blob_gc(&view, ctx);
-        }
-        // A slot passed over for its backoff is retried when the backoff ends, even if
-        // nothing else happens on the shard by then.
-        if let Some(until) = quarantined {
-            self.arm_compaction_retry(until, ctx);
-        }
+            .collect()
     }
 
     /// Starts a blob GC of a slot that may point into a blob file that is mostly garbage
@@ -9551,14 +9534,7 @@ impl ShardState {
                         .is_some_and(|&(_, until)| until > now_nanos)
             })
             .collect();
-        let busy: Vec<SstId> = self
-            .shared
-            .busy_ssts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .iter()
-            .copied()
-            .collect();
+        let busy = self.busy_snapshot();
         let last = self.shared.picker.max_levels.max(2) - 1;
         let min_garbage = self.shared.picker.target_sst_bytes / 16;
         let Some((key, task)) = self.blob_gc.plan(view, &slots, last, &busy, min_garbage) else {
@@ -10666,6 +10642,34 @@ const TRACE_ON: u8 = 2;
 #[doc(hidden)]
 pub fn set_tracing(on: bool) {
     TRACING.store(if on { TRACE_ON } else { TRACE_OFF }, Ordering::Relaxed);
+}
+
+/// Whether test fault `Fault::$fault` fires here (a one-shot fault switches itself off);
+/// always false without the `test-hooks` feature, so the branch it guards compiles away.
+macro_rules! fault {
+    ($self:ident, $fault:ident) => {{
+        #[cfg(feature = "test-hooks")]
+        let on = $self
+            .shared
+            .hooks
+            .faults
+            .take(crate::engine::hooks::Fault::$fault);
+        #[cfg(not(feature = "test-hooks"))]
+        let on = false;
+        on
+    }};
+}
+use fault;
+
+/// Whether the stream accepted a record its append returned `result` for: anything but a
+/// record refused before it was written (too large, or invalid). An accepted record may be
+/// in the file even if its write failed.
+#[inline(always)]
+fn accepted<T>(result: &std::result::Result<T, pigeonhole_wal::Error>) -> bool {
+    !matches!(
+        result,
+        Err(pigeonhole_wal::Error::RecordTooLarge | pigeonhole_wal::Error::InvalidArgument { .. })
+    )
 }
 
 /// Logs to stderr when `PIGEONHOLE_TRACE` is set (CONTRIBUTING.md, "Test environment variables"):
