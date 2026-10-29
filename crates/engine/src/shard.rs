@@ -1371,8 +1371,6 @@ impl From<PrepareError> for Error {
     }
 }
 
-/// A failed shard's error for work that is not a commit (maintenance, a durability wait). A
-/// commit it refuses, never logged, gets [`Error::ShardFailed`] instead (#921).
 /// The SSTs and metadata of slot `key` in `view`, or `None` for a slot gone from it or of a
 /// family whose merge operator is not registered (it is never compacted).
 fn slot_family(view: &View, key: (TabletId, FamilyId)) -> Option<(&Arc<FamilySsts>, &FamilyMeta)> {
@@ -1381,6 +1379,8 @@ fn slot_family(view: &View, key: (TabletId, FamilyId)) -> Option<(&Arc<FamilySst
     (meta.merge != MergeKind::Unknown).then_some((fam, meta))
 }
 
+/// A failed shard's error for work that is not a commit (maintenance, a durability wait). A
+/// commit it refuses, never logged, gets [`Error::ShardFailed`] instead (#921).
 fn poisoned_error() -> Error {
     Error::Io(pigeonhole_io::Error::new(
         ErrorKind::Other,
