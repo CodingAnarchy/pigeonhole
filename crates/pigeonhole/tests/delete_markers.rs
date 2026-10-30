@@ -7,7 +7,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use pigeonhole::{Family, Options, Pigeonhole};
+use pigeonhole::{Durability, Family, Options, Pigeonhole};
 
 fn row(i: u64) -> Vec<u8> {
     format!("row{i:08}").into_bytes()
@@ -18,7 +18,15 @@ fn row(i: u64) -> Vec<u8> {
 /// often, so many fresh memtables (flag clear) see their first delete while readers read.
 fn race(delete_family: bool) {
     let dir = pigeonhole::doc_support::temp_dir();
-    let db = Pigeonhole::open(dir.join("m.phdb"), Options::default().shards(2)).unwrap();
+    // Buffered: the race is between a delete and the memtable's has-markers flag, which an
+    // fsync per commit (the default) does not touch, and fsyncs cost minutes on Windows CI.
+    let db = Pigeonhole::open(
+        dir.join("m.phdb"),
+        Options::default()
+            .shards(2)
+            .durability(Durability::Buffered),
+    )
+    .unwrap();
     let t = db
         .table("t")
         .unwrap()
@@ -39,6 +47,9 @@ fn race(delete_family: bool) {
                         let got = t.get(&row(i), "f", b"q").unwrap();
                         assert!(got.is_none(), "row {i} read after its delete (phase {p})");
                     }
+                    // Readers that never yield starve the writer and the shard threads on a
+                    // runner with few cores.
+                    std::thread::yield_now();
                 }
             });
         }
