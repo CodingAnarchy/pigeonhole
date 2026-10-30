@@ -5,6 +5,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// A directory under the system temp dir, removed when dropped.
@@ -29,6 +30,35 @@ impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
     }
+}
+
+/// A copy in `dir` of the fixture database `build` makes at the path it is given (named
+/// `name`), built once per test binary under the target's temporary directory: the files a
+/// crash or a clean close left (the data file, and any WAL sidecars), each test with its own
+/// (device, inode). Fixtures many tests start from cost one build instead of one each.
+pub fn fixture(
+    template: &'static OnceLock<PathBuf>,
+    name: &str,
+    build: impl FnOnce(&Path),
+    dir: &TempDir,
+) -> PathBuf {
+    let template = template.get_or_init(|| {
+        let at = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+            "{}-{}-{name}",
+            env!("CARGO_CRATE_NAME"),
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&at);
+        std::fs::create_dir_all(&at).unwrap();
+        let path = at.join(name);
+        build(&path);
+        path
+    });
+    for entry in std::fs::read_dir(template.parent().unwrap()).unwrap() {
+        let entry = entry.unwrap();
+        std::fs::copy(entry.path(), dir.path().join(entry.file_name())).unwrap();
+    }
+    dir.path().join(name)
 }
 
 /// What a `phdb` run produced.

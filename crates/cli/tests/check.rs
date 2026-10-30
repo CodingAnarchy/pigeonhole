@@ -8,18 +8,24 @@ mod common;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use common::{TempDir, phdb};
-use pigeonhole::{Family, Options, Pigeonhole};
+use common::{TempDir, fixture, phdb};
+use pigeonhole::{Durability, Family, Options, Pigeonhole};
 use serde_json::Value;
 
 const CHILD: &str = "PHDB_TEST_CRASH_CHILD";
 
+/// [`build_sample`]'s database (built once per test binary, each caller getting a copy).
+fn sample(dir: &TempDir) -> PathBuf {
+    static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
+    fixture(&TEMPLATE, "c.phdb", build_sample, dir)
+}
+
 /// A database with SSTs and a blob file, closed cleanly. Fixed timestamps keep its bytes the
 /// same every run.
-fn sample(dir: &TempDir) -> PathBuf {
-    let path = dir.path().join("c.phdb");
-    let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
+fn build_sample(path: &Path) {
+    let db = Pigeonhole::open(path, Options::default().shards(1).pin_threads(false)).unwrap();
     let t = db
         .table("t")
         .unwrap()
@@ -39,7 +45,6 @@ fn sample(dir: &TempDir) -> PathBuf {
     }
     db.flush().unwrap();
     db.close().unwrap();
-    path
 }
 
 /// Run by the child process: commits about 700 KiB of log in 256 KiB WAL segments, with no
@@ -54,7 +59,11 @@ fn crash_child() {
         Options::default()
             .shards(1)
             .pin_threads(false)
-            .wal_segment_size(256 << 10),
+            .wal_segment_size(256 << 10)
+            // A process crash keeps what was handed to the kernel; an fsync per commit
+            // (the default) adds nothing a process crash shows and costs minutes on
+            // Windows CI.
+            .durability(Durability::Buffered),
     )
     .unwrap();
     let t = db
@@ -73,16 +82,23 @@ fn crash_child() {
     std::process::exit(0);
 }
 
-/// A crashed database: `crash_child` run in a child process.
+/// A crashed database: `crash_child` run in a child process (once per test binary, each
+/// caller getting a copy).
 fn crashed(dir: &TempDir) -> PathBuf {
-    let path = dir.path().join("crashed.phdb");
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crash_child", "--nocapture", "--test-threads=1"])
-        .env(CHILD, &path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    path
+    static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
+    fixture(
+        &TEMPLATE,
+        "crashed.phdb",
+        |path| {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "crash_child", "--nocapture", "--test-threads=1"])
+                .env(CHILD, path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        },
+        dir,
+    )
 }
 
 fn check_json(args: &[&str]) -> (u8, Value) {
