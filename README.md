@@ -7,7 +7,7 @@
 [![docs.rs](https://img.shields.io/docsrs/pigeonhole)](https://docs.rs/pigeonhole)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Maturity: 1.0.** The public API of `pigeonhole`, `pigeonhole-arrow` and `phdb` follows semver from 1.0.0 ([D282](docs/design/decisions/phase-3.md#d282)), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) is the compatibility promise). All four phases are complete: the core engine (Phase 1), the wide-column model (Phase 2), the latency engine (Phase 3) and hardening (Phase 4), each with its performance gate on the reference machine. <!-- GATE 4: the release gate's verdict in one clause (date, main commit). --> 1.0 ships with documented gaps, listed in [`docs/status.md`](docs/status.md).
+> **Maturity: 1.0.** The public API of `pigeonhole`, `pigeonhole-arrow` and `phdb` follows semver from 1.0.0 ([D282](docs/design/decisions/phase-3.md#d282)), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) is the compatibility promise). All four phases are complete: the core engine (Phase 1), the wide-column model (Phase 2), the latency engine (Phase 3) and hardening (Phase 4), each with its performance gate on the reference machine. The 1.0 release gate passed on 2026-10-30 at `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0): the Phase 2 floors, and within 1.5× of RocksDB on every workload. 1.0 ships with documented gaps, listed in [`docs/status.md`](docs/status.md).
 
 > **Status: usable and disk-backed.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. The current release is 1.0.0 (see the [changelog](CHANGELOG.md)): every data operation has a blocking form and an async form, on by default ([async guide](docs/guide/async.md)).
 
@@ -61,37 +61,35 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 | **Value** | Bytes, up to 4 GiB − 2. Values above a family's blob threshold live in blob files; one too large for the WAL and memtable (above the smaller of 64 MiB and half a shard's memtable arena) is written to a blob file as it is committed. Optional typed merge operators. |
 
 ## Performance
-<!-- GATE 4 (release PR): replace every figure in this section from gate 4: the commit and date, both tables, the durable-commit line, and add the Sync rows marked below. -->
-Measured on the reference machine (Hetzner AX102: AMD Ryzen 9 7950X3D, 16 cores, NVMe, Linux), in the release gate of 2026-10-29 on `main` [`cba09184`](https://github.com/CodingAnarchy/pigeonhole/commit/cba09184). 1 million rows (about 1 GB, so reads that miss the 256 MiB block cache hit the OS page cache). [Performance compared with SQLite](docs/guide/performance.md) and [`docs/bench.md`](docs/bench.md) have the full tables and method.
+Measured on the reference machine (Hetzner AX102: AMD Ryzen 9 7950X3D, 16 cores, NVMe, Linux), in the 1.0 release gate of 2026-10-30 on `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0). 1 million rows (about 1 GB, so reads that miss the 256 MiB block cache hit the OS page cache). [Performance compared with SQLite](docs/guide/performance.md) and [`docs/bench.md`](docs/bench.md) have the full tables and method.
 
 **One client** (`Durability::Buffered`):
 
 | Operation | Throughput | p50 | p99 |
 |---|--:|--:|--:|
-| Row read (YCSB C) | 392K ops/s | 0.90 µs | 11.8 µs |
-| Point get, wide rows (sparse-wide) | — | 3.5 µs | 20.1 µs |
-| Put (YCSB A) | — | 5.4 µs | 9.1 µs |
-| Scan of up to 100 rows (YCSB E) | 20K ops/s | 48 µs | 112 µs |
+| Row read (YCSB C) | 385K ops/s | 0.94 µs | 12.0 µs |
+| Point get, wide rows (sparse-wide) | — | 2.5 µs | 9.6 µs |
+| Put (YCSB A) | — | 5.4 µs | 8.3 µs |
+| Scan of up to 100 rows (YCSB E) | 20K ops/s | 48 µs | 111 µs |
+| Reads and read-modify-writes (YCSB F) | 88.9K ops/s | 12.4 µs | 27.6 µs |
 
 **16 clients**, against RocksDB and SQLite (EAV) with the same memory. Throughput, then p99 over every operation:
 
 | Workload | Durability | Pigeonhole | RocksDB | SQLite |
 |---|---|--:|--:|--:|
-| Reads (YCSB C) | Buffered | 2.26M/s, 27 µs | 1.60M/s, 21 µs | 215K/s, 180 µs |
-| | GroupSync (default) | 2.37M/s, 27 µs | 1.42M/s, 23 µs | 212K/s, 174 µs |
-| 50% updates (YCSB A) | Buffered | 1.46M/s, 39 µs | 699K/s, 68 µs | 85K/s, 1.1 ms |
-| | GroupSync (default) | 488K/s, 98 µs | 191K/s, 211 µs | 39K/s, 82 µs |
-| Scans (YCSB E) | Buffered | 220K/s, 190 µs | 132K/s, 270 µs | 44K/s, 1.6 ms |
-| | GroupSync (default) | 192K/s, 209 µs | 108K/s, 362 µs | 43K/s, 3.4 ms |
-| Sparse wide rows | Buffered | 91K/s, 2.4 ms | 72K/s, 3.3 ms | 41K/s, 3.6 ms |
-| | GroupSync (default) | 78K/s, 2.7 ms | 59K/s, 3.5 ms | 34K/s, 8.3 ms |
+| Reads (YCSB C) | Buffered | 2.42M/s, 26 µs | 1.62M/s, 21 µs | 212K/s, 174 µs |
+| | GroupSync (default) | 2.46M/s, 25 µs | 1.42M/s, 23 µs | 212K/s, 177 µs |
+| 50% updates (YCSB A) | Buffered | 1.55M/s, 34 µs | 698K/s, 69 µs | 86K/s, 1.1 ms |
+| | GroupSync (default) | 486K/s, 98 µs | 193K/s, 214 µs | 39K/s, 82 µs |
+| | Sync | 422K/s, 165 µs | 191K/s, 212 µs\* | 39K/s, 81 µs |
+| Scans (YCSB E) | Buffered | 226K/s, 183 µs | 133K/s, 270 µs | 43K/s, 1.6 ms |
+| | GroupSync (default) | 199K/s, 202 µs | 106K/s, 383 µs | 43K/s, 3.4 ms |
+| Sparse wide rows | Buffered | 97K/s, 2.2 ms | 74K/s, 3.1 ms | 42K/s, 3.4 ms |
+| | GroupSync (default) | 84K/s, 2.6 ms | 59K/s, 3.5 ms | 34K/s, 8.3 ms |
 
-<!-- Release PR: add a `Sync` row under each workload from gate 4's Durability::Sync arm, e.g.
-| | Sync | gate 4 | gate 4 | gate 4 |
-and update the commit, date and figures above from gate 4. -->
-`Durability::Sync` (a dedicated fsync per commit, never shared) is measured in the 1.0 release gate; its rows are added then.
+`Durability::Sync` gives each commit its own fsync, never shared; SQLite's row is `synchronous=FULL` in WAL mode, whose single writer also fsyncs each commit. \*RocksDB's `sync=true` shares one fsync across a write group, so it compares with `GroupSync`. At one client (YCSB A at `Sync`), Pigeonhole does 44K ops/s at p99 50 µs and SQLite 42K at 71 µs.
 
-**Durable commits** (`GroupSync`, 16 shards, 16 commits in flight per shard): 11.1M cells/s, commit p50 72 µs, p99 127 µs.
+**Durable commits** (`GroupSync`, 16 shards, 16 commits in flight per shard): 11.2M cells/s, commit p50 71 µs, p99 127 µs.
 
 ## Configuration
 `Options::default()` is a valid configuration. The options most users set, with their defaults:
@@ -102,7 +100,7 @@ and update the commit, date and figures above from gate 4. -->
 - **`memtable_budget`**: 64 MiB of write buffer per shard.
 - **`shards`**: one per physical core.
 - **`adaptive_shard_threads`**: on, sizing the shard threads to the load; `shard_threads(k)` fixes the count instead.
-- **`cpu_profile`**: `CpuProfile::Embedded`, leaving CPU for your application; `Server` gives flush and compaction twice the cores.
+- **`cpu_profile`**: `CpuProfile::Embedded`, leaving CPU for your application; `Server` gives flush and compaction twice the cores, and a shard thread polls 1 ms for the next commit before it sleeps instead of 200 µs (a lower commit tail for up to about two more cores under a moderate steady load).
 - **Compression**, per family: `Family::compression(..)`, LZ4 by default (also `Zstd(level)` or `None`).
 - **`io_backend`**: `IoBackend::Auto`, io_uring where the kernel offers it (Linux) and a `pread` pool elsewhere.
 - **`direct_io`**: off; worth turning on only for data much larger than RAM with a block cache of at least about 1/64 of it.

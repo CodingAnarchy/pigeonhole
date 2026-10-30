@@ -1,7 +1,5 @@
 # Performance compared with SQLite
 
-<!-- GATE 4 (release PR): refresh this page's figures from gate 4's #759 runs (equal cache memory, YCSB A and F, SQLite / Pigeonhole max / paced). -->
-
 Pigeonhole is often weighed against SQLite: both are embedded, single-file stores. This page states the tradeoff for point reads under a mixed read-write load, measured as #759 judges it.
 
 **Setup:** 16 threads on one machine (AMD Ryzen 9 7950X3D, NVMe, Linux 6.8). YCSB A (50% reads, 50% updates) and F (50% reads, 50% read-modify-writes) over 1 million rows. Each store has the same 1 GiB of read cache. Both run at their default durability: Pigeonhole's `Durability::GroupSync`, and SQLite in WAL mode with `synchronous=FULL`. Pigeonhole runs its defaults, including the shard-thread load controller, which is on by default. Measured on 2026-10-29 at commit `cba09184`, three runs of each arm; the ranges below span the runs.
@@ -22,4 +20,4 @@ Pigeonhole is often weighed against SQLite: both are embedded, single-file store
 
 If your reads must stay under ~20 µs at the 99th percentile and SQLite's single-writer throughput is enough, SQLite meets that and Pigeonhole doesn't yet. If you need more write throughput, a lower median, or bounded write tails under contention, Pigeonhole is ahead on each.
 
-The benchmark is `phdb-bench` in this repository (`--cache-model total --cache 1073741824`, plus `--offered-rate` for the paced runs; [`docs/bench.md`](../bench.md) has the options). The full results are on [#759](https://github.com/CodingAnarchy/pigeonhole/issues/759); these numbers are its 2026-10-29 re-run on `cba09184`.
+The benchmark is `phdb-bench` in this repository (`--cache-model total --cache 1073741824`, plus `--offered-rate` for the paced runs; [`docs/bench.md`](../bench.md) has the options). The full results are on [#759](https://github.com/CodingAnarchy/pigeonhole/issues/759); these numbers are its 2026-10-29 re-run on `cba09184`. The 1.0 release gate (2026-10-30, `790ae3a0`) didn't repeat this equal-cache comparison; in its contended runs with a 256 MiB cache, YCSB A's row-read p99 was 37 µs at `Buffered` and 35 µs at `GroupSync`, against 43 and 33 µs on `cba09184`.

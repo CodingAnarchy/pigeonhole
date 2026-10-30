@@ -12,7 +12,7 @@ Pigeonhole 1.0.0 is the first stable release of an embedded, single-file, wide-c
 - **Engine:** transactions you can run and retry in one call, reader processes with their own row cache, automatic recovery in place, background workers for application-owned mode, and a load controller that sizes the shard threads.
 - **Performance:** most of the contended gaps the Phase 3 gate found are closed.
 
-<!-- GATE 4: one sentence on the release gate (AX102, date, main commit, verdict) from gate 4's results. -->
+The release gate ran on the reference machine (Hetzner AX102) on 2026-10-30 at `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0): the Phase 2 floors hold and every workload is within 1.5× of RocksDB, with the remaining gaps documented in [`docs/status.md`](docs/status.md).
 
 ### Upgrading from 0.3.x
 - **Back up before the first writable open.** 1.0 writes **file format 4**, the format every 1.x release reads and writes (D269). A writable open upgrades a 0.x file in place, and then 0.3.x (and any earlier release) refuses it with `UnsupportedFormat`. The upgrade is one-way: take a `backup` (or copy the closed file) first if you may need to roll back. A read-only open never upgrades (reader processes, and `read_only_fallback`). 1.0 opens every file written by 0.1.0 or later.

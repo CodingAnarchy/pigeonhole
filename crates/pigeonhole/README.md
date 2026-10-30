@@ -9,7 +9,7 @@ SQLite's deployment model (one file, a library, no server).
 > [compatibility promise](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md#13-compatibility-promise)).
 > All four phases are complete, each with its performance gate on the reference machine:
 > the core engine, the wide-column model, the latency engine and hardening.
-> <!-- GATE 4: the release gate's verdict in one clause (date, main commit). -->
+> The 1.0 release gate passed on 2026-10-30 at `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0).
 > 1.0 ships with documented gaps, listed in the
 > [status page](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md).
 
