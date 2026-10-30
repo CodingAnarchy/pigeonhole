@@ -82,13 +82,15 @@ use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{
-    Compaction, ErrorCode, FailureCause, Family, Options, Pigeonhole, Recovery, Snapshot, Table,
+    Aggregation, Compaction, ErrorCode, FailureCause, Family, Options, Pigeonhole, Recovery,
+    Snapshot, Table,
 };
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimVfs};
 use pigeonhole_io::{FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
-    COUNTER_TS, CommitStreams, Model, ModelCell, ModelFamily, ModelOp, Op, Rng, StreamCommit,
-    StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive, recovered_from_records,
+    COUNTER_TS, CommitStreams, Model, ModelAggregation, ModelCell, ModelFamily, ModelOp, Op, Rng,
+    StreamCommit, StreamRecord, Workload, WorkloadSpec, aggregation_of_name,
+    check_acknowledged_survive, recovered_from_records,
 };
 // The simulator's model and operations carry the engine's level; `public` converts at the
 // public API (D282: `pigeonhole::Durability` is the public crate's own type).
@@ -126,14 +128,15 @@ fn table_index(row: &[u8]) -> usize {
 
 /// `counter` is a family as 0.1.0 created them (the `i64` add operator, standard kind:
 /// operands at the commit timestamp, D41). The `counters` test target swaps `g` and `ttl`
-/// for the counter families `sum` and `sum_ttl` (D179), keeping four families per table.
+/// for the counter families `sum` and `sum_ttl` (D179) and adds the aggregate families `min`
+/// and `max_ttl` (D294).
 fn families() -> Vec<ModelFamily> {
     let f = |name: &str, max_versions, ttl_micros, i64_add| {
         ModelFamily::new(name)
             .max_versions(max_versions)
             .ttl_micros(ttl_micros)
             .i64_add(i64_add)
-            .counter(is_sum(name))
+            .aggregation(aggregation_of_name(name))
     };
     if env!("CARGO_CRATE_NAME") == "counters" {
         vec![
@@ -141,6 +144,8 @@ fn families() -> Vec<ModelFamily> {
             f("counter", 3, 0, true),
             f("sum", 2, 0, false),
             f("sum_ttl", 0, 40, false),
+            f("min", 2, 0, false),
+            f("max_ttl", 0, 40, false),
         ]
     } else {
         vec![
@@ -152,14 +157,22 @@ fn families() -> Vec<ModelFamily> {
     }
 }
 
-/// A counter family of decision D179.
-fn is_sum(family: &str) -> bool {
-    family.starts_with("sum")
+/// An aggregate family: a counter family of decision D179, or a min or max family of D294.
+fn is_aggregate(family: &str) -> bool {
+    aggregation_of_name(family).is_some()
+}
+
+/// A min or max family (D294), whose inputs `aggregate` writes (`incr` is refused there).
+fn is_min_max(family: &str) -> bool {
+    matches!(
+        aggregation_of_name(family),
+        Some(ModelAggregation::Min | ModelAggregation::Max)
+    )
 }
 
 /// A family holding only `i64`s.
 fn is_i64(family: &str) -> bool {
-    family.starts_with("counter") || is_sum(family)
+    family.starts_with("counter") || is_aggregate(family)
 }
 
 /// `g` compacts tiered and `ttl` FIFO by time (#31, #32), and `f` uses zstd (#44); the
@@ -178,10 +191,11 @@ fn public_family(f: &ModelFamily) -> Family {
         "ttl" => 60,
         _ => 4096,
     };
-    let family = if f.counter {
-        Family::counter()
-    } else {
-        Family::default()
+    let family = match (f.counter, f.aggregation) {
+        (false, _) => Family::default(),
+        (true, ModelAggregation::Sum) => Family::counter(),
+        (true, ModelAggregation::Min) => Family::aggregate(Aggregation::Min),
+        (true, ModelAggregation::Max) => Family::aggregate(Aggregation::Max),
     };
     let family = family
         .max_versions(f.max_versions)
@@ -1134,7 +1148,21 @@ impl Run {
                         ts: None,
                         delta,
                         ..
+                    } if is_min_max(family) => m.aggregate(family, qualifier, *delta),
+                    ModelOp::Incr {
+                        family,
+                        qualifier,
+                        ts: None,
+                        delta,
+                        ..
                     } => m.incr(family, qualifier, *delta),
+                    ModelOp::Incr {
+                        family,
+                        qualifier,
+                        ts: Some(ts),
+                        delta,
+                        ..
+                    } if is_min_max(family) => m.aggregate_at(family, qualifier, *ts, *delta),
                     ModelOp::Incr {
                         family,
                         qualifier,
@@ -1200,7 +1228,23 @@ impl Run {
                         ts: None,
                         delta,
                         ..
+                    } if is_min_max(family) => wb.aggregate(t, &row, family, qualifier, *delta),
+                    ModelOp::Incr {
+                        family,
+                        qualifier,
+                        ts: None,
+                        delta,
+                        ..
                     } => wb.incr(t, &row, family, qualifier, *delta),
+                    ModelOp::Incr {
+                        family,
+                        qualifier,
+                        ts: Some(ts),
+                        delta,
+                        ..
+                    } if is_min_max(family) => {
+                        wb.aggregate_at(t, &row, family, qualifier, *ts, *delta)
+                    }
                     ModelOp::Incr {
                         family,
                         qualifier,
@@ -1256,7 +1300,7 @@ impl Run {
                     ..
                 }
                 | ModelOp::DeleteCell { ts: t, family, .. } = &mut op
-                    && !(is_sum(family) && *t == COUNTER_TS)
+                    && !(is_aggregate(family) && *t == COUNTER_TS)
                 {
                     *t += self.base;
                 }
@@ -1267,7 +1311,9 @@ impl Run {
         let now = self.now();
         let d = &self.deletes;
         ops.retain(|op| match op {
-            ModelOp::Put { family, .. } | ModelOp::DeleteCell { family, .. } if is_sum(family) => {
+            ModelOp::Put { family, .. } | ModelOp::DeleteCell { family, .. }
+                if is_aggregate(family) =>
+            {
                 true
             }
             ModelOp::Put {

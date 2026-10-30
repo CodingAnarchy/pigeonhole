@@ -11,7 +11,7 @@ use pigeonhole_compaction::{
     JobPoll, KeyRange, Levels, NewBlobFile, OtherSource, TaskKind, pick_blob_gc,
 };
 use pigeonhole_format::key::encode_row_prefix;
-use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{
     BlobFileId, FamilyId, ManifestVersion, Seqno, SstId, TableId, TabletId, Timestamp,
@@ -181,7 +181,7 @@ pub(crate) fn may_hold_purgeable(
     if family.ttl_micros > 0 && sst.ts_range.0.saturating_add(family.ttl_micros) <= now {
         return true;
     }
-    let counter = family.kind == FamilyKind::Counter;
+    let counter = family.kind.is_aggregate();
     let versions = !counter && family.max_versions > 0;
     if sst.deletes == 0 && !versions {
         return false;

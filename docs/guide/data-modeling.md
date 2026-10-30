@@ -46,6 +46,7 @@ let pages = db
 |---|---|
 | Small, hot attributes (status) | `max_versions(1)`, `Priority::High`, `compression(Compression::None)` if tiny |
 | Counters | `Family::counter()`; a `ttl` to keep only recent buckets |
+| Running minimum or maximum | `Family::aggregate(Aggregation::Min)` or `Max`; buckets as for counters |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -168,7 +169,37 @@ assert_eq!(days, [(today, 2), (today - DAY, 4)]);
 - **TTL.** With a TTL the fixed timestamp would expire at once, so a counter family with a TTL takes only buckets: `incr` and `put_i64` fail with `InvalidArgument`; use `incr_at` and `put_i64_at`.
 - A missing counter counts as 0; overflow wraps.
 - **Families from 0.1.0.** In 0.1.0 every family had the `pigeonhole.i64_add` operator and `incr` worked anywhere. Those families keep their 0.1.0 behavior: `incr` writes at the commit timestamp, each increment is its own operand, and runs of them fold across timestamps when read. To move a counter to a counter family, read its value and `put_i64` it there (see the changelog). `Family::default().merge_operator("pigeonhole.i64_add")` still creates such a family.
+- **Min and max.** See [Min and max](#min-and-max).
 - **Custom operators.** Implement `pigeonhole::MergeOperator` (an associative fold: `merge(acc, older)` then `finish(base, acc)`), register it with `Options::merge_operator(Arc::new(op))`, and name it on the family with `Family::merge_operator("name")`, then write operands with `RowMutation::merge`. The operator's name is stored in the file; opening without it registered fails with `ErrorCode::UnknownMergeOperator` unless you set `Options::read_only_fallback(true)`: the handle is then read-only (writes, table changes, `flush`, `compact` and `shrink` fail with `ReadOnly`, and nothing is written to the file), and reads of their merged cells fail with `UnknownMergeOperator`. A family naming an operator that is not registered is refused at creation. Reader processes register operators with `ReaderOptions::merge_operator`. Operators must be associative; non-associative operators are not supported. The operator sees stored values: a tag byte (`0x00` for bytes), then the payload.
+
+## Min and max
+A counter is the `Sum` case of an **aggregate family**: every cell combines the `i64` inputs written to it, with an aggregation fixed when the family is created (after Bigtable's aggregate families; D294). `Family::aggregate(Aggregation::Min)` keeps the smallest input of each cell and `Aggregation::Max` the largest; `Family::counter()` is `Family::aggregate(Aggregation::Sum)`.
+
+```rust
+use pigeonhole::{Aggregation, Family};
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = pigeonhole::Pigeonhole::open(dir.join("app.phdb"), pigeonhole::Options::default())?;
+let t = db
+    .table("sensors")?
+    .family("low", Family::aggregate(Aggregation::Min))
+    .family("high", Family::aggregate(Aggregation::Max))
+    .create_if_missing()?;
+t.mutate(b"s1").aggregate("low", b"temp", 21).aggregate("high", b"temp", 21).commit()?;
+t.mutate(b"s1").aggregate("low", b"temp", 17).aggregate("high", b"temp", 17).commit()?;
+assert_eq!(t.get(b"s1", "low", b"temp")?.unwrap().as_i64(), Some(17));
+assert_eq!(t.get(b"s1", "high", b"temp")?.unwrap().as_i64(), Some(21));
+# Ok(())
+# }
+```
+
+Everything in [Counters](#counters) holds, with the family's aggregation in place of the sum:
+- **Writes.** `aggregate(family, qualifier, value)` writes an input without reading the cell, at the fixed timestamp 0; `aggregate_at(.., ts, value)` writes to the bucket at `ts`. Inputs combine at read and in compaction, and a read that combines many leaves its result in memory. `incr` and `incr_at` are refused in a min or max family (`InvalidArgument`); in a counter family `aggregate` is `incr`.
+- **Setting and deleting.** `put_i64` sets the cell (`put_i64_at` a bucket), and later inputs combine with it: `put_i64(c, 5).aggregate(c, 9)` leaves 5 in a min family. A delete removes what earlier commits wrote, so the next input starts the cell again.
+- **Missing cells.** A cell nothing was written to, or whose inputs were all deleted, reads as absent (`None`), never as 0.
+- **TTL, `max_versions`, values.** As for counters: buckets only with a TTL, and only `i64`s.
+- **`FamilyInfo::aggregation`** says a family's aggregation (`None` for an ordinary family; a counter family's is `Some(Sum)`).
+- **The file can no longer be opened by 1.0.x.** Min and max families came after 1.0: creating the first one marks the file (a feature bit), and from then on pigeonhole 1.0.x refuses to open it (`UnsupportedFeature`), even after the family is dropped. Back up first if you may roll back ([upgrades](concepts.md#file-format-and-upgrades)).
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

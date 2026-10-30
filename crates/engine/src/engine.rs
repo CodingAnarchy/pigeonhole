@@ -3759,7 +3759,7 @@ impl Inner {
                     m.family.0, m.table.0
                 )));
             }
-            if meta.options.kind == FamilyKind::Counter {
+            if meta.options.kind.is_aggregate() {
                 fixed_ts |= check_counter_write(&m, meta, catalog)?;
                 counter_writes += usize::from(matches!(m.kind, Kind::Put | Kind::Merge));
             } else if m.kind == Kind::Merge && m.ts.is_some() {
@@ -3782,7 +3782,7 @@ impl Inner {
                             meta.options.merge_operator.clone(),
                         ));
                     }
-                    MergeKind::I64Add | MergeKind::Registered => {}
+                    MergeKind::Builtin | MergeKind::Registered => {}
                 }
             }
             let shard = match last {
@@ -4376,8 +4376,13 @@ impl Inner {
                 .hooks
                 .sites
                 .run(hooks::HookSite::ReaderManifestLoad);
-            let (catalog, _) =
-                manifest::load_root(pager.file(), &root, r.shards, Arc::clone(&r.registry))?;
+            let (catalog, _) = manifest::load_root(
+                pager.file(),
+                &root,
+                pager.features().incompat,
+                r.shards,
+                Arc::clone(&r.registry),
+            )?;
             *cached = (version, Arc::new(catalog), pager.data_file().clone());
         }
         Ok(Some((Arc::clone(&cached.1), cached.2.clone())))
@@ -4596,16 +4601,22 @@ fn view_from_record(
     })
 }
 
-/// Checks a put or operand into a counter family (D179): its value must be a stored `i64`,
-/// and one without a timestamp takes the fixed counter timestamp, which a family with a TTL
-/// refuses (it would expire at once). Returns whether the mutation needs that timestamp.
+/// Checks a put or operand into an aggregate family (D179, D294): its value must be a
+/// stored `i64`, and one without a timestamp takes the fixed counter timestamp, which a
+/// family with a TTL refuses (it would expire at once). Returns whether the mutation needs
+/// that timestamp.
 fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> Result<bool> {
     if !matches!(m.kind, Kind::Put | Kind::Merge) {
         return Ok(false);
     }
     if m.value.len() != 9 || m.value[0] != ValueTag::I64 as u8 {
+        let what = match meta.options.kind {
+            FamilyKind::Min => "a min family",
+            FamilyKind::Max => "a max family",
+            _ => "a counter family",
+        };
         return Err(Error::InvalidArgument(format!(
-            "{} is a counter family: it holds only i64 values (put_i64 / incr)",
+            "{} is {what}: it holds only i64 values (put_i64 / aggregate)",
             family_name(catalog, m.table, m.family)
         )));
     }
@@ -4636,11 +4647,12 @@ fn family_name(catalog: &Catalog, table: TableId, family: FamilyId) -> String {
 /// `(table, family, row, qualifier, timestamp)` of a cell in a batch.
 type CellKey<'a> = (TableId, FamilyId, &'a [u8], &'a [u8], Timestamp);
 
-/// `batch` with its counter-family writes prepared (D179, #295): a put or operand without a
-/// timestamp moves to the fixed counter timestamp, [`COUNTER_TS`], and an operand of a cell
-/// (column and timestamp) that an earlier put or operand of this batch wrote combines into
-/// that write: the put's value or the operand grows by it, in write order. Deletes do not
-/// stop a combination; D34 then collapses what is left of one cell to the last write.
+/// `batch` with its aggregate-family writes prepared (D179, #295, D294): a put or operand
+/// without a timestamp moves to the fixed counter timestamp, [`COUNTER_TS`], and an operand
+/// of a cell (column and timestamp) that an earlier put or operand of this batch wrote
+/// combines into that write with the family's aggregation (a sum, min or max), in write
+/// order. Deletes do not stop a combination; D34 then collapses what is left of one cell to
+/// the last write.
 fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<BatchBuilder> {
     struct Write<'a> {
         m: Mutation<'a>,
@@ -4652,10 +4664,10 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
     let mut latest: HashMap<CellKey<'_>, usize> = HashMap::new();
     for m in batch.batch().iter() {
         let mut m = m?;
-        let counter = catalog
+        let kind = catalog
             .family(m.family)
-            .is_some_and(|f| f.options.kind == FamilyKind::Counter);
-        if !(counter && matches!(m.kind, Kind::Put | Kind::Merge)) {
+            .map_or(FamilyKind::Standard, |f| f.options.kind);
+        if !(kind.is_aggregate() && matches!(m.kind, Kind::Put | Kind::Merge)) {
             writes.push(Write { m, value: None });
             continue;
         }
@@ -4665,10 +4677,17 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
             && let Some(&i) = latest.get(&key)
         {
             let w = &mut writes[i];
-            let sum = stored_i64(w.value.as_deref().unwrap_or(w.m.value))
-                .wrapping_add(stored_i64(m.value));
+            let (earlier, this) = (
+                stored_i64(w.value.as_deref().unwrap_or(w.m.value)),
+                stored_i64(m.value),
+            );
+            let combined = match kind {
+                FamilyKind::Min => earlier.min(this),
+                FamilyKind::Max => earlier.max(this),
+                _ => earlier.wrapping_add(this),
+            };
             let mut v = Vec::with_capacity(9);
-            encode_value(&mut v, ValueRef::I64(sum));
+            encode_value(&mut v, ValueRef::I64(combined));
             w.value = Some(v);
             continue;
         }
@@ -4702,10 +4721,12 @@ fn stored_i64(v: &[u8]) -> i64 {
 
 fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Result<()> {
     let name = options.merge_operator.as_str();
-    if options.kind == FamilyKind::Counter && name != crate::catalog::I64_ADD {
+    if let Some(op) = crate::catalog::aggregate_operator(options.kind)
+        && name != op
+    {
         return Err(Error::InvalidArgument(format!(
-            "a counter family sums i64s with {}, not {name:?}",
-            crate::catalog::I64_ADD
+            "a {:?} family folds i64s with {op}, not {name:?}",
+            options.kind
         )));
     }
     if name.is_empty() || registry.get(name).is_some() {

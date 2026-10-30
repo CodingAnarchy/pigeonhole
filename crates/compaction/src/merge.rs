@@ -186,6 +186,107 @@ impl MergeOperator for I64Add {
     }
 }
 
+/// Built-in `i64` minimum, the operator of a `FamilyKind::Min` family (D294): operands and
+/// values are `ValueTag::I64`, and the result is the smallest of the operands and the base.
+/// A missing base leaves the operands' minimum: the identity is no value, never 0. Name:
+/// `pigeonhole.i64_min`.
+///
+/// A base or operand that is not a stored `i64` is a [`MergeError`], as for [`I64Add`].
+///
+/// ```
+/// use pigeonhole_compaction::{I64Min, MergeOperator};
+///
+/// let i64v = |v: i64| [&[1u8][..], &v.to_le_bytes()].concat();
+/// let mut acc = i64v(5); // newest operand
+/// I64Min.merge(&mut acc, &i64v(-2)).unwrap();
+/// I64Min.finish(None, &mut acc).unwrap();
+/// assert_eq!(acc, i64v(-2));
+/// I64Min.finish(Some(&i64v(-7)), &mut acc).unwrap();
+/// assert_eq!(acc, i64v(-7));
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct I64Min;
+
+/// Built-in `i64` maximum, the operator of a `FamilyKind::Max` family (D294): as
+/// [`I64Min`], keeping the largest. Name: `pigeonhole.i64_max`.
+///
+/// ```
+/// use pigeonhole_compaction::{I64Max, MergeOperator};
+///
+/// let i64v = |v: i64| [&[1u8][..], &v.to_le_bytes()].concat();
+/// let mut acc = i64v(5);
+/// I64Max.merge(&mut acc, &i64v(9)).unwrap();
+/// I64Max.finish(Some(&i64v(7)), &mut acc).unwrap();
+/// assert_eq!(acc, i64v(9));
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct I64Max;
+
+/// [`I64Min`]'s and [`I64Max`]'s steps: `pick` chooses between two values.
+fn select(
+    name: &str,
+    pick: fn(i64, i64) -> i64,
+    acc: &mut Vec<u8>,
+    other: Option<&[u8]>,
+    what: &str,
+) -> Result<(), MergeError> {
+    let operands = stored_i64(acc).ok_or_else(|| MergeError::new(name, "operand is not an i64"))?;
+    let Some(other) = other else {
+        return Ok(());
+    };
+    let other = stored_i64(other).ok_or_else(|| MergeError::new(name, what))?;
+    put_i64(acc, pick(operands, other));
+    Ok(())
+}
+
+impl I64Min {
+    const NAME: &'static str = "pigeonhole.i64_min";
+}
+
+impl MergeOperator for I64Min {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        select(
+            Self::NAME,
+            i64::min,
+            acc,
+            Some(older),
+            "operand is not an i64",
+        )
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        select(Self::NAME, i64::min, acc, base, "base value is not an i64")
+    }
+}
+
+impl I64Max {
+    const NAME: &'static str = "pigeonhole.i64_max";
+}
+
+impl MergeOperator for I64Max {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        select(
+            Self::NAME,
+            i64::max,
+            acc,
+            Some(older),
+            "operand is not an i64",
+        )
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        select(Self::NAME, i64::max, acc, base, "base value is not an i64")
+    }
+}
+
 /// Operators available to this process, by name. Built-ins are always present.
 ///
 /// ```
@@ -216,6 +317,8 @@ impl MergeRegistry {
             ops: HashMap::new(),
         };
         r.register(Arc::new(I64Add));
+        r.register(Arc::new(I64Min));
+        r.register(Arc::new(I64Max));
         r
     }
 

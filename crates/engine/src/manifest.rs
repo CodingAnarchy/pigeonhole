@@ -21,7 +21,7 @@ use pigeonhole_format::manifest::{
     Edit, LOG_EXTENT_LEN, MANIFEST_HEADER_LEN, ManifestBlockKind, ManifestHeader, decode_block,
     encode_block,
 };
-use pigeonhole_format::superblock::ExtentRef;
+use pigeonhole_format::superblock::{ExtentRef, Features};
 use pigeonhole_format::{BlobFileId, FormatVersion, ManifestVersion, SstId, TableId, TabletId};
 use pigeonhole_io::{Completion, FileRef};
 use pigeonhole_pager::{Extent, OpenedPager, Pager, Root};
@@ -42,13 +42,16 @@ pub(crate) fn load(
     shards: usize,
     registry: Arc<pigeonhole_compaction::MergeRegistry>,
 ) -> Result<(Catalog, Vec<Extent>)> {
-    load_root(opened.file(), &opened.root(), shards, registry)
+    let incompat = opened.features().incompat;
+    load_root(opened.file(), &opened.root(), incompat, shards, registry)
 }
 
-/// [`load`] from `root` read through `file` (a reader process's own pager handle).
+/// [`load`] from `root` read through `file` (a reader process's own pager handle), in a
+/// file whose superblock carries the `incompat` feature bits `incompat`.
 pub(crate) fn load_root(
     file: &FileRef,
     root: &Root,
+    incompat: u64,
     shards: usize,
     registry: Arc<pigeonhole_compaction::MergeRegistry>,
 ) -> Result<(Catalog, Vec<Extent>)> {
@@ -91,6 +94,20 @@ pub(crate) fn load_root(
         return Err(Error::Corruption(
             "superblock names a manifest version without a snapshot".to_owned(),
         ));
+    }
+    // A family of a kind that needs a feature bit the superblock lacks: a writer flags the
+    // file before it writes such a family (D294), so only a bug or a forged file gets here.
+    for table in catalog.tables() {
+        for f in &table.families {
+            let missing = f.options.kind.required_incompat() & !incompat;
+            if missing != 0 {
+                return Err(Error::Corruption(format!(
+                    "manifest: family {:?} of table {:?} is of kind {:?}, but the superblock \
+                     lacks its incompat feature bits {missing:#x}",
+                    f.name, table.name, f.options.kind
+                )));
+            }
+        }
     }
     catalog.prune_blob_refs();
     Ok((catalog, live))
@@ -346,8 +363,39 @@ impl ManifestWriter {
         }
     }
 
+    /// Sets the `incompat` feature bits `edits` need in both superblock pages, before the
+    /// commit that writes them (D294; FORMAT §8.2): a family of a kind added after 1.0 needs
+    /// its kind's bit, so a build that does not know the kind refuses the file at open
+    /// instead of meeting the family. Called under the writer's exclusion with no root commit
+    /// in flight, once every request of the batch is validated and applied, so a refused
+    /// request never flags the file (perf287's S1 on D294). `Pager::set_features` keeps ICR
+    /// 0089's constraints: two commits, each naming the root current when it starts, the sets
+    /// current only once durable. The bits are sticky: nothing clears them (D294).
+    pub(crate) fn flag_features(&mut self, edits: &[Edit]) -> Result<()> {
+        if self.poisoned {
+            return Err(Self::poisoned_error());
+        }
+        let needed = edits.iter().fold(0, |bits, e| match e {
+            Edit::PutFamily { options, .. } => bits | options.kind.required_incompat(),
+            _ => bits,
+        });
+        let features = self.pager.features();
+        if needed & !features.incompat == 0 {
+            return Ok(());
+        }
+        let flagged = Features {
+            incompat: features.incompat | needed,
+            ..features
+        };
+        self.pager.set_features(flagged).map_err(|e| {
+            self.poisoned = true;
+            e.into()
+        })
+    }
+
     /// Commits synchronously (open-time flushes, before the shards run).
     pub(crate) fn commit(&mut self, catalog: &Catalog, edits: &[Edit]) -> Result<ManifestVersion> {
+        self.flag_features(edits)?;
         let p = self.prepare(catalog, edits, Rewrite::AsNeeded)?;
         let r = self.pager.commit_root(p.root).map_err(pager_io);
         self.complete(p, r)
@@ -936,7 +984,9 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
     let prepared = if refused {
         Err(Error::NoSpace)
     } else {
-        writer.prepare(&catalog, &edits, rewrite)
+        writer
+            .flag_features(&edits)
+            .and_then(|()| writer.prepare(&catalog, &edits, rewrite))
     };
     match prepared {
         Ok(prepared) => {

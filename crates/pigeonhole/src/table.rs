@@ -221,6 +221,35 @@ impl TableCore {
     /// Resolves a family name: from the handle's entry (no allocation), else from the
     /// current catalog.
     #[inline]
+    /// [`family_id`](Self::family_id) for an `incr`, which a min or max family refuses
+    /// (D294): "increment" would mislead there, so its inputs are written with `aggregate`.
+    pub(crate) fn incr_family_id(&self, name: &str) -> Result<FamilyId> {
+        use pigeonhole_engine::FamilyKind;
+        let current;
+        let f = match self.info.family(name) {
+            Some(f) => f,
+            None => {
+                current = self.current_info();
+                current
+                    .family(name)
+                    .ok_or_else(|| family_not_found(&self.info.name, name))?
+            }
+        };
+        let what = match f.options.kind {
+            FamilyKind::Min => "min",
+            FamilyKind::Max => "max",
+            _ => return Ok(f.id),
+        };
+        Err(Error::new(
+            ErrorCode::InvalidArgument,
+            format!(
+                "family {name:?} of table {:?} is a {what} family: write its inputs with \
+                 aggregate, not incr",
+                self.info.name
+            ),
+        ))
+    }
+
     pub(crate) fn family_id(&self, name: &str) -> Result<FamilyId> {
         if let Some(f) = self.info.family(name) {
             return Ok(f.id);

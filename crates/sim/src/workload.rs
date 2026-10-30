@@ -11,7 +11,9 @@ use crate::{ModelOp, Rng};
 /// generator writes only [`ModelOp::Incr`], 8-byte little-endian puts and deletes there, so
 /// a store configured with the `i64` add operator for those families never sees a malformed
 /// operand. A family whose name starts with `sum` is a counter family of decision D179 (the
-/// model's [`ModelFamily::counter`](crate::ModelFamily::counter)): the same writes, some at
+/// model's [`ModelFamily::counter`](crate::ModelFamily::counter)), and one starting with
+/// `min` or `max` an aggregate family of D294 ([`aggregation_of_name`](crate::aggregation_of_name)):
+/// the same writes, some at
 /// the fixed counter timestamp and some at bucket timestamps (multiples of 4); if its name
 /// contains `ttl`, every put and `Incr` there takes a bucket timestamp (a counter family with
 /// a TTL refuses the fixed one).
@@ -213,7 +215,7 @@ impl Workload {
         let table = self.table.clone();
         let row = self.row();
         let family = self.family();
-        let sum = family.starts_with("sum");
+        let sum = crate::aggregation_of_name(&family).is_some();
         let counter = sum || family.starts_with("counter");
         if self.rng.unit() < self.spec.delete_fraction {
             return match self.rng.below(10) {
@@ -299,7 +301,7 @@ impl Workload {
             | ModelOp::DeleteColumn { qualifier, .. } => qualifier.clone(),
             _ => self.qualifier(),
         };
-        let sum = family.starts_with("sum");
+        let sum = crate::aggregation_of_name(&family).is_some();
         let counter = sum || family.starts_with("counter");
         // In a counter family a put or operand without a timestamp is at the counter's, so
         // a same-column companion uses that or a bucket (the tick's).

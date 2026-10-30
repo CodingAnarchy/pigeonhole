@@ -35,6 +35,8 @@ D269 and FORMAT §13 still describe flagging a feature, and #487 is its first us
 
 The open-time repair of pages whose sets disagree stays in the pager (`OpenedPager::finish`), since another build can leave them.
 
+**Restored by D294 (#487 PR 1, 2026-10-30)** with its first production caller: the engine's manifest writer (`ManifestWriter::flag_features`) sets `incompat` bit 0 under its exclusion, before the commit that writes the first min or max family. `Pager::set_features`, `Inner::commit_features`, `begin_with` and the three tests come back as #1084 had them, holding the four constraints above.
+
 ## Why
 The owner's rule, now in AGENTS.md and CONTRIBUTING.md: code under `src/` that tests call must be the code production runs. A method only tests call keeps passing tests while the production path beside it changes untested (#1055 left `note_write` under `cfg(test)` while production called `note_write_prev`).
 

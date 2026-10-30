@@ -7,9 +7,9 @@ created  a
 table
 a
 b
-table  name  counter  max_versions  ttl_micros  compression  merge_operator
-a      x     false    0             -           lz4          -
-a      y     true     0             -           lz4          -
+table  name  counter  aggregation  max_versions  ttl_micros  compression  merge_operator
+a      x     false    -            0             -           lz4          -
+a      y     true     sum          0             -           lz4          -
 mode      writer
 writable  true
 failed    false
@@ -29,8 +29,9 @@ commands (one per line; values are bytes: "quoted\n", 0xhex, b64:base64):
          [--limit N] [--columns-per-row N] [--at SNAP]
   put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
   incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
+  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]
   delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-  create <table> <family>[:counter]...
+  create <table> <family>[:counter|:min|:max]...
   snapshot [--durable] <name>     release <name>
   \tables  \schema [table]  \info  \metrics  \health
   \format table|json|jsonl|csv  \timing on|off  \help  \quit

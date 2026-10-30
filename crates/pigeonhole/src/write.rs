@@ -157,11 +157,13 @@ struct Builder {
 }
 
 impl Builder {
-    /// Runs `f` against the batch with `family` resolved, unless an earlier call failed.
+    /// Runs `f` against the batch with `family` resolved, unless an earlier call failed. For
+    /// an `incr` (`incr`), a min or max family is refused ([`TableCore::incr_family_id`]).
     fn with(
         &mut self,
         table: &TableCore,
         family: &str,
+        incr: bool,
         sizes: Sizes,
         f: impl FnOnce(&mut EngineBatch, FamilyId) -> pigeonhole_engine::Result<()>,
     ) {
@@ -170,9 +172,13 @@ impl Builder {
         }
         self.largest_value = self.largest_value.max(sizes.value);
         let max_value = table.db.max_value;
-        let r = table
-            .family_id(family)
-            .and_then(|id| f(&mut self.batch, id).map_err(|e| size_error(e, sizes, max_value)));
+        let id = if incr {
+            table.incr_family_id(family)
+        } else {
+            table.family_id(family)
+        };
+        let r =
+            id.and_then(|id| f(&mut self.batch, id).map_err(|e| size_error(e, sizes, max_value)));
         if let Err(e) = r {
             self.error = Some(e);
         }
@@ -458,7 +464,19 @@ impl<'t> RowMutation<'t> {
 
     /// Adds one mutation of this row in `family` (`qualifier` and `value` only size errors).
     fn op(
+        self,
+        family: &str,
+        qualifier: &[u8],
+        value: usize,
+        f: impl FnOnce(&mut EngineBatch, TableId, FamilyId, &[u8]) -> pigeonhole_engine::Result<()>,
+    ) -> Self {
+        self.op_as(false, family, qualifier, value, f)
+    }
+
+    /// [`op`](Self::op), refusing a min or max family when `incr` (D294).
+    fn op_as(
         mut self,
+        incr: bool,
         family: &str,
         qualifier: &[u8],
         value: usize,
@@ -467,7 +485,9 @@ impl<'t> RowMutation<'t> {
         let (table, row) = (self.table.info.id, &self.row);
         let sizes = Sizes::new(row, qualifier, value);
         self.builder
-            .with(self.table, family, sizes, |b, fam| f(b, table, fam, row));
+            .with(self.table, family, incr, sizes, |b, fam| {
+                f(b, table, fam, row)
+            });
         self
     }
 }
@@ -520,9 +540,10 @@ impl RowMutation<'_> {
     /// ([`Family::counter`](crate::Family::counter)) without reading it. Increments of one
     /// counter combine into one cell. Within one mutation (or batch) the writes of a counter
     /// apply in order: `incr(c, 1).incr(c, 2)` adds 3, and `put_i64(c, 5).incr(c, 1)` sets
-    /// 6 (decision D186). Other families fail with `InvalidArgument` at commit.
+    /// 6 (decision D186). In a counter family it is [`aggregate`](Self::aggregate). Other
+    /// families fail with `InvalidArgument` at commit, min and max families included.
     pub fn incr(self, family: &str, qualifier: &[u8], delta: i64) -> Self {
-        self.op(family, qualifier, 8, |b, t, f, row| {
+        self.op_as(true, family, qualifier, 8, |b, t, f, row| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))
         })
     }
@@ -530,8 +551,29 @@ impl RowMutation<'_> {
     /// Adds `delta` to the bucket at timestamp `ts` of a counter family (hourly or daily
     /// totals, say): each bucket is a version of its own.
     pub fn incr_at(self, family: &str, qualifier: &[u8], ts: u64, delta: i64) -> Self {
-        self.op(family, qualifier, 8, |b, t, f, row| {
+        self.op_as(true, family, qualifier, 8, |b, t, f, row| {
             b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(delta))
+        })
+    }
+
+    /// Writes the input `value` to the cell of an aggregate family
+    /// ([`Family::aggregate`](crate::Family::aggregate)) without reading it: the cell
+    /// combines it with the family's aggregation (added to a sum, kept by a min or max if it
+    /// is the smallest or largest). The cell lives at one fixed timestamp (0), as a
+    /// counter's does. Within one mutation (or batch) the writes of a cell apply in order:
+    /// `put_i64(c, 5).aggregate(c, 9)` in a min family sets 5. Other families fail with
+    /// `InvalidArgument` at commit.
+    pub fn aggregate(self, family: &str, qualifier: &[u8], value: i64) -> Self {
+        self.op(family, qualifier, 8, |b, t, f, row| {
+            b.merge(t, f, row, qualifier, ValueRef::I64(value))
+        })
+    }
+
+    /// Writes the input `value` to the bucket at timestamp `ts` of an aggregate family (an
+    /// hourly minimum, say): each bucket is a version of its own.
+    pub fn aggregate_at(self, family: &str, qualifier: &[u8], ts: u64, value: i64) -> Self {
+        self.op(family, qualifier, 8, |b, t, f, row| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value))
         })
     }
 
@@ -777,11 +819,26 @@ impl WriteBatch {
         value: usize,
         f: impl FnOnce(&mut EngineBatch, TableId, FamilyId) -> pigeonhole_engine::Result<()>,
     ) -> &mut Self {
+        self.op_as(false, table, row, family, qualifier, value, f)
+    }
+
+    /// [`op`](Self::op), refusing a min or max family when `incr` (D294).
+    #[allow(clippy::too_many_arguments)]
+    fn op_as(
+        &mut self,
+        incr: bool,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: usize,
+        f: impl FnOnce(&mut EngineBatch, TableId, FamilyId) -> pigeonhole_engine::Result<()>,
+    ) -> &mut Self {
         if self.builder.check_table(&self.db, table) {
             let id = table.core.info.id;
             let sizes = Sizes::new(row, qualifier, value);
             self.builder
-                .with(&table.core, family, sizes, |b, fam| f(b, id, fam));
+                .with(&table.core, family, incr, sizes, |b, fam| f(b, id, fam));
         }
         self
     }
@@ -882,7 +939,7 @@ impl WriteBatch {
         qualifier: &[u8],
         delta: i64,
     ) -> &mut Self {
-        self.op(table, row, family, qualifier, 8, |b, t, f| {
+        self.op_as(true, table, row, family, qualifier, 8, |b, t, f| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))
         })
     }
@@ -897,8 +954,39 @@ impl WriteBatch {
         ts: u64,
         delta: i64,
     ) -> &mut Self {
-        self.op(table, row, family, qualifier, 8, |b, t, f| {
+        self.op_as(true, table, row, family, qualifier, 8, |b, t, f| {
             b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(delta))
+        })
+    }
+
+    /// Writes an input to the cell of an aggregate family (see
+    /// [`RowMutation::aggregate`]).
+    pub fn aggregate(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.merge(t, f, row, qualifier, ValueRef::I64(value))
+        })
+    }
+
+    /// Writes an input to the bucket at `ts` of an aggregate family (see
+    /// [`RowMutation::aggregate_at`]).
+    pub fn aggregate_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value))
         })
     }
 
@@ -1094,6 +1182,21 @@ impl Transaction {
         value: usize,
         f: impl FnOnce(&mut EngineBatch, TableId, FamilyId) -> pigeonhole_engine::Result<()>,
     ) -> &mut Self {
+        self.op_as(false, table, row, family, qualifier, value, f)
+    }
+
+    /// [`op`](Self::op), refusing a min or max family when `incr` (D294).
+    #[allow(clippy::too_many_arguments)]
+    fn op_as(
+        &mut self,
+        incr: bool,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: usize,
+        f: impl FnOnce(&mut EngineBatch, TableId, FamilyId) -> pigeonhole_engine::Result<()>,
+    ) -> &mut Self {
         if self.error.is_some() {
             return self;
         }
@@ -1101,7 +1204,11 @@ impl Transaction {
         let sizes = Sizes::new(row, qualifier, value);
         let max_value = self.db.max_value;
         let r = check_table(&self.db, table).and_then(|()| {
-            let fam = table.core.family_id(family)?;
+            let fam = if incr {
+                table.core.incr_family_id(family)?
+            } else {
+                table.core.family_id(family)?
+            };
             f(self.txn.batch(), table.core.info.id, fam)
                 .map_err(|e| size_error(e, sizes, max_value))
         });
@@ -1333,8 +1440,39 @@ impl Transaction {
         qualifier: &[u8],
         delta: i64,
     ) -> &mut Self {
-        self.op(table, row, family, qualifier, 8, |b, t, f| {
+        self.op_as(true, table, row, family, qualifier, 8, |b, t, f| {
             b.merge(t, f, row, qualifier, ValueRef::I64(delta))
+        })
+    }
+
+    /// Buffers an input to the cell of an aggregate family (see
+    /// [`RowMutation::aggregate`]). Like [`incr`](Self::incr), a blind write.
+    pub fn aggregate(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.merge(t, f, row, qualifier, ValueRef::I64(value))
+        })
+    }
+
+    /// Buffers an input to the bucket at `ts` of an aggregate family (see
+    /// [`RowMutation::aggregate_at`]).
+    pub fn aggregate_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: i64,
+    ) -> &mut Self {
+        self.op(table, row, family, qualifier, 8, |b, t, f| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value))
         })
     }
 
@@ -1379,7 +1517,7 @@ impl Transaction {
         ts: u64,
         delta: i64,
     ) -> &mut Self {
-        self.op(table, row, family, qualifier, 8, |b, t, f| {
+        self.op_as(true, table, row, family, qualifier, 8, |b, t, f| {
             b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(delta))
         })
     }

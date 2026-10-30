@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use pigeonhole::{Durability, Family, Options, Pigeonhole, Value};
+use pigeonhole::{Aggregation, Durability, Family, Options, Pigeonhole, Value};
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 use pigeonhole_io::{OpenOptions, Vfs};
 
@@ -114,12 +114,19 @@ fn sim_options(vfs: &Arc<SimVfs>, shards: usize) -> Options {
 /// Timestamps fixed, so `expected.txt` does not depend on a clock.
 const T0: u64 = 1_767_225_600_000_000;
 
-/// One corpus entry: how it is written, and whether it is left crashed (WAL replay needed).
+/// The marker file of an entry that 1.0.0 must refuse: it holds the `incompat` feature
+/// bits the refusal names (decimal). CI's 1.0.0 job fails if such an entry opens, or if
+/// the refusal names other bits (`tests/corpus/compat-reader`).
+const REFUSED_BY: &str = "refused-by-1.0.0.txt";
+
+/// One corpus entry: how it is written, whether it is left crashed (WAL replay needed), and
+/// the `incompat` feature bits it uses that 1.0.0 lacks (0: 1.0.0 opens it).
 struct Entry {
     name: &'static str,
     shards: usize,
     write: fn(&Pigeonhole),
     crash: bool,
+    refused_by_1_0_0: u64,
 }
 
 fn entries() -> Vec<Entry> {
@@ -129,56 +136,116 @@ fn entries() -> Vec<Entry> {
             shards: 1,
             write: |_| {},
             crash: false,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "values",
             shards: 1,
             write: write_values,
             crash: false,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "counters",
             shards: 2,
             write: write_counters,
             crash: false,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "blobs",
             shards: 1,
             write: write_blobs,
             crash: false,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "merge",
             shards: 1,
             write: write_merge,
             crash: false,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "wal_crash",
             shards: 2,
             write: write_wal_crash,
             crash: true,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "families",
             shards: 1,
             write: write_families,
             crash: false,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "wal_ops",
             shards: 2,
             write: write_wal_ops,
             crash: true,
+            refused_by_1_0_0: 0,
         },
         Entry {
             name: "checkpoints",
             shards: 1,
             write: write_checkpoints,
             crash: false,
+            refused_by_1_0_0: 0,
+        },
+        Entry {
+            name: "aggregates",
+            shards: 2,
+            write: write_aggregates,
+            crash: true,
+            refused_by_1_0_0: pigeonhole_format::manifest::INCOMPAT_AGGREGATES,
         },
     ]
+}
+
+/// Min and max families (D294, the first `incompat` feature bit): inputs at the fixed
+/// timestamp and in buckets, puts, deletes and checkpointed reads; flushed, then more in
+/// the WAL that the crash leaves for replay.
+fn write_aggregates(db: &Pigeonhole) {
+    let t = db
+        .table("aggregates")
+        .unwrap()
+        .family("lo", Family::aggregate(Aggregation::Min))
+        .family("hi", Family::aggregate(Aggregation::Max).max_versions(3))
+        .create()
+        .unwrap();
+    for i in 0..40u64 {
+        let row = format!("a{:02}", i % 6);
+        let v = (i as i64 * 37) % 101 - 50;
+        t.mutate(row.as_bytes())
+            .aggregate("lo", b"all", v)
+            .aggregate("hi", b"all", v)
+            .aggregate_at("lo", b"hourly", T0 + (i % 4) * 3_600_000_000, v)
+            .aggregate_at("hi", b"hourly", T0 + (i % 4) * 3_600_000_000, v)
+            .commit()
+            .unwrap();
+        match i {
+            10 => {
+                t.mutate(b"a01")
+                    .put_i64("lo", b"all", -1_000)
+                    .put_i64("hi", b"all", 1_000)
+                    .commit()
+                    .unwrap();
+            }
+            20 => {
+                t.mutate(b"a02")
+                    .delete_column("lo", b"all")
+                    .delete_column("hi", b"all")
+                    .commit()
+                    .unwrap();
+                // A read that folds what the flush below writes as a base.
+                let _ = t.get(b"a03", "lo", b"all").unwrap();
+                db.flush().unwrap();
+            }
+            _ => {}
+        }
+    }
 }
 
 /// Every value type, every delete kind, several versions, three codecs; flushed and
@@ -558,6 +625,14 @@ fn generate_corpus() {
         std::fs::write(dir.join("expected.txt"), &expected).unwrap();
         for (name, bytes) in &files {
             frozen.push(frozen_line(&format!("{}/{name}", e.name), bytes));
+        }
+        if e.refused_by_1_0_0 != 0 {
+            let marker = format!("{}\n", e.refused_by_1_0_0);
+            std::fs::write(dir.join(REFUSED_BY), &marker).unwrap();
+            frozen.push(frozen_line(
+                &format!("{}/{REFUSED_BY}", e.name),
+                marker.as_bytes(),
+            ));
         }
         frozen.push(frozen_line(
             &format!("{}/expected.txt", e.name),

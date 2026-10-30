@@ -12,14 +12,13 @@ use pigeonhole_compaction::{
 use pigeonhole_format::key::{
     Escaped, Kind, SUFFIX_LEN, TERMINATOR, decode_key, encode_row_prefix, row_prefix_len,
 };
-use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value};
 use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, TabletId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
-use crate::catalog::{FamilyMeta, I64_ADD, MergeKind};
+use crate::catalog::{FamilyMeta, I64_ADD, I64_MAX, I64_MIN, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
 use crate::source::{ColumnKey, Pinned, Resolver, Source, row_prefix};
 use crate::{Error, Result};
@@ -259,7 +258,7 @@ impl ReadSpec {
         opts.columns_per_row = self.columns_per_row;
         opts.value = self.value.clone();
         opts.merge = meta.merge_op.clone();
-        opts.counter = meta.options.kind == FamilyKind::Counter;
+        opts.counter = meta.options.kind.is_aggregate();
         let mut filter = ScanFilter::all();
         filter.qualifiers = self.qualifiers.clone();
         opts.route_time_range(&mut filter, self.time_range);
@@ -280,13 +279,16 @@ pub(crate) struct ResolverBlobs {
 impl ResolverBlobs {
     /// Sets `opts.blobs` when the resolver may need a separated value and `ssts` names blob
     /// files; returns the handle to check after each resolver step. It may need one for a
-    /// value predicate, or to fold operands onto a separated base. The built-in `i64` add
-    /// is the exception: it rejects every base that is not a stored `i64`, with the same
-    /// error, and a separated value never is one (only `Bytes` are separated), so loading
-    /// the base could not change its result. Skipping it keeps a default family's reads
-    /// free of the hook.
+    /// value predicate, or to fold operands onto a separated base. The built-in `i64`
+    /// operators (add, min, max) are the exception: they reject every base that is not a
+    /// stored `i64`, with the same error, and a separated value never is one (only `Bytes`
+    /// are separated), so loading the base could not change their result. Skipping it keeps
+    /// a default family's reads free of the hook.
     pub(crate) fn attach(opts: &mut ResolveOptions, ssts: &Arc<SstSet>) -> Option<Arc<Self>> {
-        let folds = opts.merge.as_ref().is_some_and(|m| m.name() != I64_ADD);
+        let folds = opts
+            .merge
+            .as_ref()
+            .is_some_and(|m| ![I64_ADD, I64_MIN, I64_MAX].contains(&m.name()));
         if !(opts.value.is_some() || folds) || !ssts.has_blobs() {
             return None;
         }
@@ -1782,7 +1784,7 @@ fn point_opts(meta: &FamilyMeta, seqno: Seqno, now: Timestamp) -> ResolveOptions
     // `versions: 1` folded with the family's `max_versions` (0 = unlimited): always 1.
     opts.versions = 1;
     opts.merge = meta.merge_op.clone();
-    opts.counter = meta.options.kind == FamilyKind::Counter;
+    opts.counter = meta.options.kind.is_aggregate();
     opts
 }
 

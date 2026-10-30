@@ -135,6 +135,39 @@ fn snapshots_read_as_of_when_they_were_taken() {
 }
 
 #[test]
+fn min_and_max_families() {
+    // D294: `create` takes `:min` and `:max`, `aggregate` writes their inputs, and `incr`
+    // is refused there.
+    let dir = TempDir::new("shell-aggregates");
+    let path = empty(&dir);
+    let (status, out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s lo:min hi:max",
+            "aggregate s r lo:t 7",
+            "aggregate s r hi:t 7",
+            "aggregate s r lo:t -2",
+            "aggregate s r hi:t -2",
+            "aggregate s r hi:t 3 --ts 3600",
+            "get s r lo:t",
+            "get s r hi:t --versions 0",
+            "incr s r lo:t 1",
+        ],
+    );
+    assert_eq!(status, 1, "the incr is refused: {err}");
+    assert!(err.contains("write its inputs with aggregate"), "{err}");
+    let docs = rows(&out);
+    assert_eq!(docs[6][0]["value"], serde_json::json!({"i64": -2}));
+    let hi: Vec<_> = docs[7].iter().map(|c| c["value"].clone()).collect();
+    assert_eq!(
+        hi,
+        [serde_json::json!({"i64": 3}), serde_json::json!({"i64": 7})],
+        "the 3600 bucket, then the fixed-timestamp cell"
+    );
+}
+
+#[test]
 fn meta_commands() {
     let dir = TempDir::new("shell-meta");
     let path = empty(&dir);

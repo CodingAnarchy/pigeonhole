@@ -3120,6 +3120,54 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 
 #974 A stays parked. The same box slot's long-scan wait-on-in-flight decides it.
 
+<a id="d294"></a>
+## D294 — Min, Max and HyperLogLog aggregate families behind the first `incompat` feature bit (perf2, 2026-10-30; owner accepted the design note and revision 1, #487 c6528386385, c6528480655; reviewed by perf287, c6528433979; format, pager, compaction, engine, pigeonhole, cli, #487, #488, ICR 0094; extends D179)
+**Why.** D179 modelled counter families on Bigtable's aggregate families and shipped Sum only. The owner's 2026-10-10 decision on #487 adds Bigtable's other `i64` aggregations, Min, Max and HyperLogLog, fixed per family at creation. Their family kinds are the first post-1.0 format change, so they take the first real feature bit (D269, #496).
+
+**What (PR 1: Min and Max).**
+- **Kinds.** `FamilyKind` gains Min (2) and Max (3). Every kind but Standard is an aggregate family (`FamilyKind::is_aggregate`), and every Counter-only path (read, flush, compaction, checkpoint and write checks) now applies to all of them.
+  - Each kind fixes its built-in operator: `pigeonhole.i64_add`, `pigeonhole.i64_min`, `pigeonhole.i64_max`. The catalog binds the operator from the kind, never from the registry.
+  - Inputs are blind `Merge` operands holding an `i64` (9 bytes), combined within one `(column, timestamp)` bucket as D179 combines a counter's.
+- **Semantics** (D179, D186, D187, D291 unchanged).
+  - A missing bucket is absent, never 0.
+  - `put_i64` sets the bucket; later inputs combine with it.
+  - In-commit writes of a cell combine in order with the family's operator.
+  - A delete hides what earlier commits wrote, so the next input starts the bucket again.
+  - D291 checkpoints apply unchanged: min and max are associative, and their result is a valid base. They are also idempotent, so the #1051 guard can't change their results; they keep it anyway, on one code path.
+- **Feature bit.** `incompat` bit 0 (`INCOMPAT_AGGREGATES`) covers kinds 2 and 3, through `FamilyKind::required_incompat`. Kinds that ship together share a bit; a later kind takes the next free bit.
+  - **Setting it.** The manifest writer sets the bit in both superblock pages with `Pager::set_features`, restored from #1084 under ICR 0089's four constraints. It does so under its exclusion, once the batch's requests are validated and applied, and before the commit that writes the first such family.
+  - **Refused calls** never flag the file (perf287's S1).
+  - **The bit is sticky:** nothing clears it, so FORMAT §8.2 now says a build "may" clear a bit.
+- **What older and newer files do.**
+  - **1.0.x and any build that doesn't know the bit** refuse the file at the superblock (`UnsupportedFeature`), before any `PutFamily` is decoded. A reader process is refused at its next reload.
+  - **A known kind whose bit the superblock lacks** is `Corruption` at catalog load.
+  - **An unknown kind byte** is `UnsupportedFeature`, as ICR 0058 made it. FORMAT.md's `Corrupt` was stale.
+- **API** (ICR 0094).
+  - `pigeonhole::Aggregation` is a `#[non_exhaustive]` enum, so #488's kinds arrive as minor releases; a variant with parameters carries a params struct.
+  - Families: `Family::aggregate`; `Family::counter()` is `aggregate(Sum)`.
+  - Writes: `aggregate` and `aggregate_at` on `RowMutation`, `WriteBatch` and `Transaction`. `incr` and `incr_at` are refused in min and max families.
+  - Info: `FamilyInfo::aggregation`, with `counter` still meaning Sum.
+  - phdb: schema JSON `"aggregation"`, the shell's `:min`/`:max` and `aggregate`, and an `info` column.
+
+**What (PR 2: HyperLogLog, planned).** Kind 4. It takes bit 0 if it ships in the release that ships Min and Max, the next free bit otherwise. The design is in the note on #487:
+- p = 12;
+- a canonical sparse/dense byte encoding of at most 3076 bytes;
+- an in-place merge;
+- Ertl's estimator with pinned constants;
+- `i64` input, with a domain tag reserved for a later bytes form;
+- a hot-cell benchmark for its own D291 step (owner, 2026-10-30).
+
+**Tests.**
+- `aggregates.rs` (engine):
+  - folds, puts, deletes and buckets; in-commit order; checkpoints at every fold; refused values and operators;
+  - the bit set in both pages by the first such family and kept after its drop;
+  - refused creations leaving both pages at 0;
+  - a family without its bit read as corruption;
+  - an unknown bit refused before decoding.
+- **Model checks:** the `counters` targets of the engine and `pigeonhole` model checks add the `min` and `max_ttl` families, which the model folds with `ModelAggregation`. So the five standard sweeps cover them, checkpoints on odd seeds included.
+- **API and phdb:** `pigeonhole` API and phdb shell tests.
+- **Corpus:** a corpus entry `aggregates` (crashed, so its tail replays) carries `refused-by-1.0.0.txt`. The Compatibility workflow fails if the published 1.0.0 opens it or refuses it for other bits.
+
 <a id="d295"></a>
 ## D295 — Two version lines: the internal crates share one, apart from the public crates (owner decision, 2026-10-30; workspace, release tooling, CI; #487, #1194; applies D282)
 **Why.** #1194 (D294) added `Min` and `Max` to `pigeonhole_format::FamilyKind`, an exhaustive public enum, so `cargo semver-checks` requires a new major of `pigeonhole-format`. D282 already lets internal crates change incompatibly, "taking a new major version of their own while `pigeonhole` stays 1.x". The tooling couldn't express that, though: every crate took the one workspace version, so a breaking change to an internal crate would have forced `pigeonhole` 2.0, or failed CI.

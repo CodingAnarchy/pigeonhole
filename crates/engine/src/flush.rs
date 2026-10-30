@@ -347,14 +347,13 @@ fn flush_record(
     item: &FlushItem,
     policy: &pigeonhole_compaction::GcPolicy,
 ) -> Result<Option<crate::compact::CompactionRecord>> {
-    use pigeonhole_format::manifest::FamilyKind;
     let view = shared.view.load();
     let Some(tablet) = view.tablets.entry(item.tablet) else {
         return Ok(None);
     };
     let versions_purge = policy.no_outside_deletes
         && item.options.max_versions != 0
-        && item.options.kind != FamilyKind::Counter;
+        && !item.options.kind.is_aggregate();
     let mut seqnos = std::collections::BTreeSet::new();
     if versions_purge {
         let mut it = item.reader.iter();

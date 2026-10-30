@@ -28,8 +28,52 @@ pub struct ModelFamily {
     /// operands at the commit timestamp, folded across timestamps, D41).
     pub i64_add: bool,
     /// A counter family (decision D179): `i64` values only, operands combine per timestamp,
-    /// deletes hide only older writes. Implies the `i64` add operator.
+    /// deletes hide only older writes. Implies the `i64` add operator, unless
+    /// `aggregation` names another (D294).
     pub counter: bool,
+    /// How a counter family's operands combine: `Sum` (D179), `Min` or `Max` (D294).
+    /// Ignored unless `counter`.
+    pub aggregation: ModelAggregation,
+}
+
+/// How the operands of an aggregate family combine (decisions D179, D294).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelAggregation {
+    /// Wrapping `i64` sum (a counter family).
+    #[default]
+    Sum,
+    /// The smallest `i64`.
+    Min,
+    /// The largest `i64`.
+    Max,
+}
+
+impl ModelAggregation {
+    /// `a` combined with `b`.
+    pub fn combine(self, a: i64, b: i64) -> i64 {
+        match self {
+            ModelAggregation::Sum => a.wrapping_add(b),
+            ModelAggregation::Min => a.min(b),
+            ModelAggregation::Max => a.max(b),
+        }
+    }
+}
+
+/// The aggregation of the test families named by convention ([`WorkloadSpec`]): a name
+/// starting with `sum` is a counter family, `min` and `max` the D294 families; `None` for
+/// any other name.
+///
+/// [`WorkloadSpec`]: crate::WorkloadSpec
+pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
+    if family.starts_with("sum") {
+        Some(ModelAggregation::Sum)
+    } else if family.starts_with("min") {
+        Some(ModelAggregation::Min)
+    } else if family.starts_with("max") {
+        Some(ModelAggregation::Max)
+    } else {
+        None
+    }
 }
 
 impl ModelFamily {
@@ -67,6 +111,15 @@ impl ModelFamily {
     #[must_use]
     pub fn counter(mut self, yes: bool) -> Self {
         self.counter = yes;
+        self
+    }
+
+    /// Makes the family an aggregate family combining with `aggregation` (D179, D294), or
+    /// an ordinary one for `None`.
+    #[must_use]
+    pub fn aggregation(mut self, aggregation: Option<ModelAggregation>) -> Self {
+        self.counter = aggregation.is_some();
+        self.aggregation = aggregation.unwrap_or_default();
         self
     }
 }
@@ -363,7 +416,7 @@ impl Model {
         for op in ops {
             self.validate(op)?;
         }
-        let combined = combine_counter_writes(ops, |table, family| self.is_counter(table, family));
+        let combined = combine_counter_writes(ops, |table, family| self.aggregation(table, family));
         let ops = combined.as_slice();
         self.commits.push(durability);
         let seqno = self.commits.len() as Seqno;
@@ -430,10 +483,15 @@ impl Model {
 
     /// Whether `family` of `table` is a counter family.
     fn is_counter(&self, table: &str, family: &str) -> bool {
+        self.aggregation(table, family).is_some()
+    }
+
+    /// The aggregation of `family` of `table`, `None` unless it is an aggregate family.
+    fn aggregation(&self, table: &str, family: &str) -> Option<ModelAggregation> {
         self.tables
             .get(table)
             .and_then(|t| t.families.get(family))
-            .is_some_and(|f| f.counter)
+            .and_then(|f| f.counter.then_some(f.aggregation))
     }
 
     /// The collapse key of a column-level mutation (see [`column_key`]), with counter-family
@@ -1260,18 +1318,21 @@ fn resolve_counter(
         })
         .collect();
     live.sort_by_key(|e| std::cmp::Reverse((e.ts, e.seqno)));
-    // A timestamp's version: the operands newer than its newest put, added to that put
-    // (`None` if the put is not an `i64`), or the sum of its operands if it has no put.
+    // A timestamp's version: the operands newer than its newest put, combined with that put
+    // (`None` if the put is not an `i64`), or its operands combined if it has no put. A
+    // group holds at least one put or operand.
+    let agg = family.aggregation;
     let version = |group: &[&Entry]| {
-        let mut sum = 0i64;
+        let mut acc: Option<i64> = None;
+        let fold = |acc: Option<i64>, v: i64| Some(acc.map_or(v, |a| agg.combine(a, v)));
         for e in group {
             match &e.kind {
-                Kind::Merge(d) => sum = sum.wrapping_add(*d),
-                Kind::Put(v) => return as_i64(v).map(|base| sum.wrapping_add(base)),
+                Kind::Merge(d) => acc = fold(acc, *d),
+                Kind::Put(v) => return as_i64(v).and_then(|base| fold(acc, base)),
                 _ => {}
             }
         }
-        Some(sum)
+        acc
     };
     let mut out: Vec<(Timestamp, Option<i64>)> = live
         .chunk_by(|a, b| a.ts == b.ts)
@@ -1304,17 +1365,18 @@ fn version_cap(family: &ModelFamily, limit: u32) -> usize {
 /// `ops` with the writes of counter families combined as the store combines them within
 /// one commit (decision D186, #295): an `Incr` of a cell (table, row, family, qualifier and
 /// timestamp, [`COUNTER_TS`] when it has none) that an earlier put or `Incr` of `ops` wrote
-/// is added to that write (wrapping), in order, and dropped. Deletes do not stop a
-/// combination; D34 then collapses what is left of a cell to the last write. `counter`
-/// tells whether `(table, family)` is a counter family; other families' ops are unchanged.
+/// is combined into that write with the family's aggregation (a wrapping add for a counter,
+/// D294's min or max), in order, and dropped. Deletes do not stop a combination; D34 then
+/// collapses what is left of a cell to the last write. `aggregation` gives the aggregation
+/// of `(table, family)`, `None` for an ordinary family, whose ops are unchanged.
 pub fn combine_counter_writes(
     ops: &[ModelOp],
-    counter: impl Fn(&str, &str) -> bool,
+    aggregation: impl Fn(&str, &str) -> Option<ModelAggregation>,
 ) -> Vec<ModelOp> {
     let mut out: Vec<ModelOp> = Vec::with_capacity(ops.len());
     let mut latest: BTreeMap<CollapseKey<'_>, usize> = BTreeMap::new();
     for op in ops {
-        let (table, row, family, qualifier, ts) = match op {
+        let (table, row, family, qualifier, ts, agg) = match op {
             ModelOp::Put {
                 table,
                 row,
@@ -1330,7 +1392,13 @@ pub fn combine_counter_writes(
                 qualifier,
                 ts,
                 ..
-            } if counter(table, family) => (table, row, family, qualifier, ts),
+            } => match aggregation(table, family) {
+                Some(agg) => (table, row, family, qualifier, ts, agg),
+                None => {
+                    out.push(op.clone());
+                    continue;
+                }
+            },
             _ => {
                 out.push(op.clone());
                 continue;
@@ -1347,10 +1415,10 @@ pub fn combine_counter_writes(
             && let Some(&i) = latest.get(&key)
         {
             match &mut out[i] {
-                ModelOp::Incr { delta: d, .. } => *d = d.wrapping_add(*delta),
+                ModelOp::Incr { delta: d, .. } => *d = agg.combine(*d, *delta),
                 ModelOp::Put { value, .. } => {
                     let base = as_i64(value).unwrap_or(0);
-                    *value = base.wrapping_add(*delta).to_le_bytes().to_vec();
+                    *value = agg.combine(base, *delta).to_le_bytes().to_vec();
                 }
                 _ => unreachable!("only puts and increments are combined into"),
             }
@@ -1424,6 +1492,7 @@ mod tests {
             ttl_micros,
             i64_add,
             counter: false,
+            aggregation: ModelAggregation::Sum,
         }
     }
 

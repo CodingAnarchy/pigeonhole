@@ -254,6 +254,11 @@ impl OpenedPager {
         Root::from_superblock(&self.superblock)
     }
 
+    /// The feature sets of the newest valid superblock (D269).
+    pub fn features(&self) -> Features {
+        self.superblock.features
+    }
+
     /// The database id.
     pub fn db_id(&self) -> [u8; 16] {
         self.superblock.db_id
@@ -290,8 +295,8 @@ impl OpenedPager {
     /// refuses the file with an unsupported-version error instead of falling back to the
     /// page it can still decode. A crash between the two commits leaves one older page
     /// naming the same root, and the next writable open finishes the upgrade. Two pages
-    /// whose feature sets differ (another build crashed between a feature change's two
-    /// commits, D269) are rewritten the same way, with the current page's sets.
+    /// whose feature sets differ (a crash inside [`Pager::set_features`]) are rewritten the
+    /// same way, with the current page's sets.
     pub fn finish(self, live: impl IntoIterator<Item = Extent>) -> Result<Pager> {
         let upgrade = self.writable && self.older;
         let pager = self.load(live)?;
@@ -629,8 +634,8 @@ fn read_superblocks_with(file: &FileRef) -> Result<(Superblock, u64, bool, Exten
     let [page_a, page_b] = &mut pages;
     let a = read_slot(file, SUPERBLOCK_PAGE_A, page_a)?;
     let b = read_slot(file, SUPERBLOCK_PAGE_B, page_b)?;
-    // A page of an older format, or two pages whose feature sets differ (another build
-    // crashed between a feature change's two commits, D269): a writable open rewrites both.
+    // A page of an older format, or two pages whose feature sets differ (a crash between a
+    // feature change's two commits, `Pager::set_features`): a writable open rewrites both.
     let older = [&a, &b]
         .iter()
         .any(|r| matches!(r, Ok(sb) if sb.version < FormatVersion::CURRENT))
@@ -665,9 +670,20 @@ impl fmt::Debug for Extension {
 }
 
 impl Inner {
-    /// Validates and encodes a commit of `root` (with the current feature sets) and claims
-    /// the commit slot.
+    /// Validates and encodes a commit of `root` and claims the commit slot.
     fn begin(&self, root: Root, clean: bool) -> pigeonhole_io::Result<PendingCommit> {
+        self.begin_with(Some(root), clean, None)
+    }
+
+    /// [`Inner::begin`], with `root` and `features` defaulting to the current ones, read
+    /// under the state lock as the commit slot is claimed (a feature change commits the root
+    /// that is current then, never one read earlier; perf287's S1 on #858).
+    fn begin_with(
+        &self,
+        root: Option<Root>,
+        clean: bool,
+        features: Option<Features>,
+    ) -> pigeonhole_io::Result<PendingCommit> {
         use pigeonhole_io::Error as IoError;
         if !self.writable {
             return Err(IoError::new(
@@ -686,7 +702,8 @@ impl Inner {
         }
         let sequence = st.sequence + 1;
         let slot = st.slot ^ 1;
-        let features = st.features;
+        let root = root.unwrap_or(st.root);
+        let features = features.unwrap_or(st.features);
         let file_pages = self.frontier.load(Ordering::Acquire) * UNIT_PAGES;
         let sb = Superblock {
             version: FormatVersion::CURRENT,
@@ -784,6 +801,14 @@ impl Inner {
     /// Sync, write the non-current superblock, sync; blocking.
     fn commit(&self, root: Root, clean: bool) -> pigeonhole_io::Result<()> {
         let p = self.begin(root, clean)?;
+        self.commit_pending(p)
+    }
+
+    /// A blocking commit of the current root with `features` ([`Pager::set_features`]):
+    /// the root and sets are taken as the commit slot is claimed, and `features` becomes
+    /// current only once the page is durable.
+    fn commit_features(&self, features: Features) -> pigeonhole_io::Result<()> {
+        let p = self.begin_with(None, false, Some(features))?;
         self.commit_pending(p)
     }
 
@@ -958,6 +983,28 @@ impl Pager {
     /// read-only pager, which never upgrades.
     pub fn format_version(&self) -> FormatVersion {
         lock(&self.inner.state).version
+    }
+
+    /// Replaces the file's feature sets (D269; FORMAT §8.2), committing twice so both
+    /// superblock pages carry them before this returns. Call it before the first write that
+    /// uses a newly set feature, and after the last write that used a cleared one: then no
+    /// page a build may choose disagrees with what the file holds. Each commit names the
+    /// root current when it starts, so a root committed between them is kept, and the new
+    /// sets become current only once the first page is durable: a failed commit leaves them
+    /// as they were (and poisons the pager, as any failed commit does). A crash between the
+    /// two commits leaves the pages disagreeing, and the next writable open rewrites both
+    /// with the current page's sets ([`OpenedPager::finish`]).
+    ///
+    /// The caller serializes it with root commits, as root commits are with each other: an
+    /// overlapping one fails ("root commits overlap"). The engine's manifest writer calls it
+    /// under its exclusion, before the commit whose edits first use the feature (D294), so it
+    /// never interleaves with a manifest commit. Equal sets commit nothing.
+    pub fn set_features(&self, features: Features) -> Result<()> {
+        if self.features() == features {
+            return Ok(());
+        }
+        self.inner.commit_features(features)?;
+        Ok(self.inner.commit_features(features)?)
     }
 
     /// Allocates the smallest extent of at least `bytes` (64 KiB minimum), growing the file
@@ -1548,5 +1595,60 @@ mod tests {
         drop(held);
         t.join().unwrap();
         assert_eq!(pager.try_reclaim(u64::MAX), Some(0));
+    }
+
+    fn page_of(vfs: &VfsRef, page: u64) -> Superblock {
+        let f = vfs.open("/db".as_ref(), OpenOptions::read()).unwrap();
+        let mut buf = [0u8; PAGE_SIZE];
+        f.read_at(&mut buf, page * PAGE_SIZE as u64).unwrap();
+        Superblock::decode(&buf).unwrap()
+    }
+
+    #[test]
+    fn a_feature_change_keeps_a_root_committed_between_its_two_commits() {
+        // perf287's S1 on #858: each of `set_features`' commits names the root current when
+        // it starts, so a root committed between them is never replaced by an older one.
+        let vfs: VfsRef = SimVfs::new(3);
+        let pager = Pager::create(&vfs, "/db".as_ref()).unwrap();
+        let root = |manifest_version| Root {
+            manifest_version,
+            ..Root::default()
+        };
+        pager.commit_root(root(1)).unwrap();
+        let f = Features {
+            compat: 1 << 2,
+            ..Features::default()
+        };
+        // `set_features`' two steps, with the manifest writer's R2 between them.
+        pager.inner.commit_features(f).unwrap();
+        assert_eq!(pager.features(), f);
+        pager.commit_root(root(2)).unwrap();
+        pager.inner.commit_features(f).unwrap();
+        assert_eq!(pager.root().manifest_version, 2, "R2 was replaced");
+        let pages = [SUPERBLOCK_PAGE_A, SUPERBLOCK_PAGE_B].map(|p| page_of(&vfs, p));
+        assert!(pages.iter().all(|sb| sb.features == f), "{pages:?}");
+        let newest = pages.iter().max_by_key(|sb| sb.sequence).unwrap();
+        assert_eq!(newest.manifest_version, 2, "the newest page names R2");
+        assert!(
+            pages.iter().all(|sb| sb.manifest_version == 2),
+            "a page went back to R1: {pages:?}"
+        );
+    }
+
+    #[test]
+    fn a_failed_feature_commit_leaves_the_sets_as_they_were() {
+        let sim = SimVfs::new(4);
+        let vfs: VfsRef = sim.clone();
+        let pager = Pager::create(&vfs, "/db".as_ref()).unwrap();
+        // Every write from here on fails: the first commit's superblock write among them.
+        let mut plan = pigeonhole_io::sim::FaultPlan::none();
+        plan.enospc_after_bytes = Some(0);
+        sim.set_faults(plan);
+        let f = Features {
+            compat: 1,
+            ..Features::default()
+        };
+        assert!(pager.set_features(f).is_err());
+        assert_eq!(pager.features(), Features::default());
     }
 }
