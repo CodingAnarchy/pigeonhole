@@ -4,7 +4,7 @@
 //! superblock pages first; a refused creation sets nothing; a file whose family lacks its
 //! bit is corrupt. One engine-owned shard over `SimVfs`.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

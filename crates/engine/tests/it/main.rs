@@ -18,6 +18,7 @@ mod common;
 mod gate;
 
 mod admission;
+mod aggregates;
 mod applier_release;
 mod background_workers;
 mod blobs;
