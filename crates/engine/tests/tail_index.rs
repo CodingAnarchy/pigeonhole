@@ -8,7 +8,7 @@
 //! `pigeonhole-sst`'s tests check them against stepping. One application-owned shard over
 //! `SimVfs`; prints the seed on failure.
 
-use crate::common;
+mod common;
 
 use std::future::Future;
 use std::ops::Bound;
