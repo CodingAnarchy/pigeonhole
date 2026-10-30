@@ -221,10 +221,11 @@ fn both_paths_are_exercised() {
 
 #[test]
 fn async_reads_on_real_files_read_what_sync_reads() {
-    // On real files with the backend `PIGEONHOLE_IO` picks (CI runs this on io_uring, on
-    // pread and with direct I/O): a reopened store's blocks are in the OS page cache, so on
-    // Linux a buffered miss is a D292 page-cache hit read in place; elsewhere, and with
-    // direct I/O, the read is in flight and the future resumes it.
+    // On real files with the backend `PIGEONHOLE_IO` picks (CI runs this in its workspace
+    // run: io_uring on Linux, `pread` on macOS and Windows; `PIGEONHOLE_DIRECT=1` runs it
+    // with direct I/O, which no CI step does): a reopened store's blocks are in the OS page
+    // cache, so on Linux a buffered miss is a D292 page-cache hit read in place; elsewhere,
+    // and with direct I/O, the read is in flight and the future resumes it.
     for seed in [1u64, 2, 3, 4] {
         let dir = pigeonhole::doc_support::temp_dir();
         let path = dir.join("inplace.phdb");
