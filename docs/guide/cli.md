@@ -85,7 +85,7 @@ Choose with `--format`:
 | `table`, `family` | Names (`jsonl` and `csv` rows; `json` nests families under their table and calls the family's field `name`). |
 | `tablets` | Tablets the table is split into now (rows only). |
 | `counter` | A counter family (`Family::counter`). |
-| `aggregation` | An aggregate family's aggregation, `sum`, `min` or `max` (`Family::aggregate`, D294); `null` for an ordinary family. |
+| `aggregation` | An aggregate family's aggregation, `sum`, `min`, `max` or `hll` (`Family::aggregate`, D294); `null` for an ordinary family. |
 | `max_versions` | Versions kept per column; 0 keeps all. |
 | `ttl_micros` | Time to live; `null` for none. |
 | `bloom_bits`, `block_size`, `blob_threshold` | As set with `Family`. |
@@ -286,7 +286,7 @@ put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
 incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
 aggregate <table> <row> <family>:<qualifier> <value> [--ts US]
 delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-create <table> <family>[:counter|:min|:max]...
+create <table> <family>[:counter|:min|:max|:hll]...
 snapshot [--durable] <name>     release <name>
 \tables  \schema [table]  \info  \metrics  \health
 \format table|json|jsonl|csv  \timing on|off  \help  \quit
@@ -308,7 +308,7 @@ snapshot [--durable] <name>     release <name>
 - **`incr`** adds to a counter.
 - **`aggregate`** writes an input to an aggregate family's cell: a min or max family (where `incr` is refused), or a counter.
 - **`delete`** removes a row, a family, a column, or with `--ts` one version.
-- **`create`** makes a table with default family options. Append `:counter` to a family name for a counter family, `:min` or `:max` for a min or max family.
+- **`create`** makes a table with default family options. Append `:counter` to a family name for a counter family, `:min` or `:max` for a min or max family, `:hll` for an HLL family (its cells print as the sketch's bytes).
 
 **Values:** words are bytes, so keys and values can be anything.
 - A bare word is its UTF-8.

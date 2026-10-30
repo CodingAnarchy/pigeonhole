@@ -16,6 +16,8 @@ pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
 const I64_MIN: &str = "pigeonhole.i64_min";
 /// The built-in `i64` maximum, the operator of a max family (D294).
 const I64_MAX: &str = "pigeonhole.i64_max";
+/// The built-in HyperLogLog union, the operator of an HLL family (D294).
+const HLL: &str = "pigeonhole.hll";
 
 /// `n` days, for TTLs: `Family::default().ttl(days(30))`. Saturates instead of overflowing.
 pub fn days(n: u64) -> Duration {
@@ -996,6 +998,11 @@ pub enum Aggregation {
     Min,
     /// The largest input.
     Max,
+    /// The distinct inputs, as a HyperLogLog sketch: read with
+    /// [`CellRef::hll_estimate`](crate::CellRef::hll_estimate) (4096 registers, about 1.6%
+    /// standard error). A bucket's sketch is up to 3 KiB; reads and the row cache carry it
+    /// whole, so bound a wide row's buckets with a TTL or `max_versions`.
+    Hll,
 }
 
 impl Aggregation {
@@ -1004,6 +1011,7 @@ impl Aggregation {
             Aggregation::Sum => FamilyKind::Counter,
             Aggregation::Min => FamilyKind::Min,
             Aggregation::Max => FamilyKind::Max,
+            Aggregation::Hll => FamilyKind::Hll,
         }
     }
 
@@ -1013,6 +1021,7 @@ impl Aggregation {
             FamilyKind::Counter => Some(Aggregation::Sum),
             FamilyKind::Min => Some(Aggregation::Min),
             FamilyKind::Max => Some(Aggregation::Max),
+            FamilyKind::Hll => Some(Aggregation::Hll),
             _ => None,
         }
     }
@@ -1022,6 +1031,7 @@ impl Aggregation {
             Aggregation::Sum => I64_ADD,
             Aggregation::Min => I64_MIN,
             Aggregation::Max => I64_MAX,
+            Aggregation::Hll => HLL,
         }
     }
 }
@@ -1037,12 +1047,15 @@ impl Family {
     ///   later inputs combine with the value it set. Other puts, and
     ///   [`incr`](crate::RowMutation::incr) outside a `Sum` family, are refused with
     ///   `InvalidArgument`.
+    /// - An `Hll` family counts distinct inputs: its cells are sketches, read with
+    ///   [`CellRef::hll_estimate`](crate::CellRef::hll_estimate). `put_i64` is refused there;
+    ///   `put` sets a bucket only to a well-formed sketch (as `phdb load` writes one back).
     /// - A delete removes what earlier commits wrote, so the next input starts the cell
     ///   again: after `delete_column`, a `Min` cell holds the smallest input written since.
     ///   A bucket with no input reads as absent.
     /// - TTL and `max_versions` work as for counters.
     ///
-    /// A family of an aggregation added after 1.0 (`Min`, `Max`) marks the file: from its
+    /// A family of an aggregation added after 1.0 (`Min`, `Max`, `Hll`) marks the file: from its
     /// creation on, pigeonhole 1.0.x refuses to open the file (`UnsupportedFeature`), even
     /// after the family is dropped.
     ///

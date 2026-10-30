@@ -1134,6 +1134,96 @@ fn min_and_max_families() {
     assert_eq!(copy.family_info("f").unwrap().aggregation, None);
 }
 
+/// D294: an HLL family counts distinct `aggregate` inputs per bucket, read with
+/// `hll_estimate`; `incr` and `put_i64` are refused; its info names it.
+#[test]
+fn hll_families_estimate_distinct_inputs() {
+    let db = db();
+    let t = db
+        .table("visits")
+        .unwrap()
+        .family("users", Family::aggregate(Aggregation::Hll))
+        .create()
+        .unwrap();
+    let estimate = |q: &[u8]| {
+        t.get(b"page", "users", q)
+            .unwrap()
+            .map(|c| c.hll_estimate().unwrap())
+    };
+    assert_eq!(estimate(b"all"), None, "no input: absent");
+    // 3000 inputs of 1000 distinct users, in batches.
+    for chunk in 0..30i64 {
+        let mut m = t.mutate(b"page");
+        for i in 0..100 {
+            m = m.aggregate("users", b"all", (chunk * 100 + i) % 1_000);
+        }
+        m.commit().unwrap();
+    }
+    let n = estimate(b"all").unwrap();
+    assert!((950..=1_050).contains(&n), "{n}");
+    // Hourly buckets.
+    let hour = 3_600_000_000;
+    t.mutate(b"page")
+        .aggregate_at("users", b"hourly", hour, 1)
+        .aggregate_at("users", b"hourly", hour, 2)
+        .aggregate_at("users", b"hourly", 2 * hour, 1)
+        .commit()
+        .unwrap();
+    let row = t
+        .row(b"page")
+        .family("users")
+        .qualifier_range(&b"hourly"[..]..=&b"hourly"[..])
+        .versions(0)
+        .read()
+        .unwrap()
+        .unwrap();
+    let hourly: Vec<(u64, u64)> = row
+        .iter()
+        .map(|e| (e.cell.timestamp(), e.cell.hll_estimate().unwrap()))
+        .collect();
+    assert_eq!(hourly, [(2 * hour, 1), (hour, 2)]);
+    // A non-sketch value has no estimate.
+    let c = db
+        .table("c")
+        .unwrap()
+        .family("n", Family::counter())
+        .create()
+        .unwrap();
+    c.mutate(b"r").incr("n", b"q", 5).commit().unwrap();
+    assert_eq!(
+        c.get(b"r", "n", b"q").unwrap().unwrap().hll_estimate(),
+        None
+    );
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    refused(
+        t.mutate(b"page").incr("users", b"all", 1).commit(),
+        "is an hll family",
+    );
+    refused(
+        t.mutate(b"page").put_i64("users", b"all", 1).commit(),
+        "hll family",
+    );
+    refused(
+        t.mutate(b"page").put("users", b"all", b"x").commit(),
+        "hll family",
+    );
+    let info = t.family_info("users").unwrap();
+    assert_eq!(info.aggregation, Some(Aggregation::Hll));
+    assert!(!info.counter && info.merge_operator.is_none());
+    // Sketches stay inline: a lower blob threshold is refused at creation.
+    let err = db
+        .table("small")
+        .unwrap()
+        .family("u", Family::aggregate(Aggregation::Hll).blob_threshold(100))
+        .create()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+}
+
 /// A family that names `pigeonhole.i64_add` without being a counter family reads and writes
 /// as 0.1.0 created them (D41): increments at the commit timestamp, folded across
 /// timestamps, and bytes on top of a counter fail at read.

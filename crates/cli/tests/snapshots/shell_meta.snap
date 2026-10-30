@@ -31,7 +31,7 @@ commands (one per line; values are bytes: "quoted\n", 0xhex, b64:base64):
   incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
   aggregate <table> <row> <family>:<qualifier> <value> [--ts US]
   delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-  create <table> <family>[:counter|:min|:max]...
+  create <table> <family>[:counter|:min|:max|:hll]...
   snapshot [--durable] <name>     release <name>
   \tables  \schema [table]  \info  \metrics  \health
   \format table|json|jsonl|csv  \timing on|off  \help  \quit

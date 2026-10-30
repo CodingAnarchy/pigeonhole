@@ -76,6 +76,23 @@ The largest value is `2^32 - 1` bytes (decision D16).
 | 4 | 4 | `len` u32: length of the stored value the pointer replaced (tag byte included) |
 | 8 | 8 | `offset` u64: logical offset of the blob record within the blob file (§7) |
 
+### 3.1 HyperLogLog sketch
+
+The value of an HLL family's cell (§9.2 `kind` 4, D294) is a `Bytes` value holding a sketch: 4096 registers (precision 12, about 1.6% standard error). Inputs are `i64` elements. An element's hash is xxh3-64 with seed 0 over its 8 little-endian bytes (no tag: a later bytes input must hash a leading type byte first, so the two forms never collide). The hash's top 12 bits pick the register, and the rank is one plus the number of leading zeros of the remaining 52 bits, at most 53. A register keeps the largest rank merged into it, so merging is the register-wise maximum: associative, commutative and idempotent.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 1 (anything else is malformed) |
+| 1 | 1 | precision: 12 |
+| 2 | 1 | representation: 0 sparse, 1 dense |
+| 3 | 1 | reserved: 0 |
+| 4 | 4·n | sparse: `n` (1..=767) `u32` LE entries `index << 8 \| rank`, strictly increasing by index, rank 1..=53 |
+| 4 | 3072 | dense: 4096 six-bit registers packed little-endian, register `i` in bits `6i .. 6i+6` |
+
+- **Canonical:** a sketch is sparse if and only if at most 767 registers are nonzero, so equal registers have equal bytes. A dense sketch with 767 or fewer nonzero registers is malformed. The largest sketch is 3076 bytes; an HLL family's `blob_threshold` is at least that, so sketches are never separated.
+- **Estimate:** Ertl's improved estimator (2017, algorithm 6) over the register histogram `C`, with `m = 4096` and `q = 52`: `z = m·τ(1 − C[q+1]/m)`, then `z = (z + C[k])/2` for `k = q` down to 1, then `z += m·σ(C[0]/m)`, and the estimate is `α∞·m²/z` rounded, with `α∞ = 1/(2 ln 2)` taken as the `f64` bit pattern `0x3fe71547652b82fe`. `σ` and `τ` are Ertl's series, iterated until they stop changing; they use only multiplication, halving, addition and `√`, so an estimate is the same on every platform. No register set: no sketch (the cell is absent).
+- **Merge:** registers merge in place; a sparse sketch turns dense when the union passes 767 registers, and never back.
+
 ## 4. Blocks
 
 ### 4.1 Physical block
@@ -227,7 +244,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 
 | Set | Bit | Feature |
 |---|---|---|
-| `incompat` | 0 | Aggregate families of kinds Min and Max (D294; §9.2 `kind` 2 and 3). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
 
@@ -286,7 +303,7 @@ The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log
 
 Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know, where §9.3's tag ranges allow it. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
 
-*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, decision D294). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max); another name is `Corrupt`. Kinds 2 and 3 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1); another name is `Corrupt`. Kinds 2, 3 and 4 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
 
 *SstMeta* = `id` u64, `extent` extent, `len` u64, `smallest_key` bytes, `largest_key` bytes, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `entries` u64, `deletes` u64.
 
@@ -599,7 +616,7 @@ How each feature tracked for after 1.0 fits format 4 (D269 §3). The bit numbers
 
 | Feature | Path |
 |---|---|
-| Min, Max and HLL families (#487) | Min and Max: `FamilyKind` 2 and 3 behind `incompat` bit 0, the first real feature bit (D294, §8.2). HLL: `FamilyKind` 4, a byte value with a fixed sketch encoding, behind bit 0 if it ships in the release that ships Min and Max and behind the next free bit otherwise |
+| Min, Max and HLL families (#487) | `FamilyKind` 2, 3 and 4 behind `incompat` bit 0, the first real feature bit (D294, §8.2); an HLL value is a `Bytes` sketch with a fixed encoding (§3.1) |
 | More aggregations (#488) | more `FamilyKind` values, plus an optional `kind_params` byte field appended to `PutFamily` (must-understand when present, under the same bit) |
 | Adjacency sets, roaring (#489) | a `FamilyKind` value and a value encoding, behind a bit |
 | Vector values (#490) | a value tag (0x04) behind an `incompat` bit; payload alignment as a data-block kind (6) or an entry flag under the same bit; dimension and metric in `kind_params` |

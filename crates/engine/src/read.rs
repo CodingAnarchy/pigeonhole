@@ -18,7 +18,7 @@ use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, TabletId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
-use crate::catalog::{FamilyMeta, I64_ADD, I64_MAX, I64_MIN, MergeKind};
+use crate::catalog::{FamilyMeta, HLL, I64_ADD, I64_MAX, I64_MIN, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
 use crate::source::{ColumnKey, Pinned, Resolver, Source, row_prefix};
 use crate::{Error, Result};
@@ -279,16 +279,17 @@ pub(crate) struct ResolverBlobs {
 impl ResolverBlobs {
     /// Sets `opts.blobs` when the resolver may need a separated value and `ssts` names blob
     /// files; returns the handle to check after each resolver step. It may need one for a
-    /// value predicate, or to fold operands onto a separated base. The built-in `i64`
-    /// operators (add, min, max) are the exception: they reject every base that is not a
+    /// value predicate, or to fold operands onto a separated base. The built-in operators
+    /// are the exception. The `i64` ones (add, min, max) reject every base that is not a
     /// stored `i64`, with the same error, and a separated value never is one (only `Bytes`
-    /// are separated), so loading the base could not change their result. Skipping it keeps
-    /// a default family's reads free of the hook.
+    /// are separated), so loading the base could not change their result; an HLL family's
+    /// sketches are never separated (its `blob_threshold` passes the largest, D294). Skipping
+    /// it keeps a default family's reads free of the hook.
     pub(crate) fn attach(opts: &mut ResolveOptions, ssts: &Arc<SstSet>) -> Option<Arc<Self>> {
         let folds = opts
             .merge
             .as_ref()
-            .is_some_and(|m| ![I64_ADD, I64_MIN, I64_MAX].contains(&m.name()));
+            .is_some_and(|m| ![I64_ADD, I64_MIN, I64_MAX, HLL].contains(&m.name()));
         if !(opts.value.is_some() || folds) || !ssts.has_blobs() {
             return None;
         }

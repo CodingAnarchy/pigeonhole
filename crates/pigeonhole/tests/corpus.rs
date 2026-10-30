@@ -204,27 +204,34 @@ fn entries() -> Vec<Entry> {
     ]
 }
 
-/// Min and max families (D294, the first `incompat` feature bit): inputs at the fixed
-/// timestamp and in buckets, puts, deletes and checkpointed reads; flushed, then more in
-/// the WAL that the crash leaves for replay.
+/// Min, max and HLL families (D294, the first `incompat` feature bit): inputs at the fixed
+/// timestamp and in buckets, puts, deletes and checkpointed reads, sparse and dense
+/// sketches; flushed, then more in the WAL that the crash leaves for replay.
 fn write_aggregates(db: &Pigeonhole) {
     let t = db
         .table("aggregates")
         .unwrap()
         .family("lo", Family::aggregate(Aggregation::Min))
         .family("hi", Family::aggregate(Aggregation::Max).max_versions(3))
+        .family("users", Family::aggregate(Aggregation::Hll))
         .create()
         .unwrap();
     for i in 0..40u64 {
         let row = format!("a{:02}", i % 6);
         let v = (i as i64 * 37) % 101 - 50;
-        t.mutate(row.as_bytes())
+        let mut m = t
+            .mutate(row.as_bytes())
             .aggregate("lo", b"all", v)
             .aggregate("hi", b"all", v)
             .aggregate_at("lo", b"hourly", T0 + (i % 4) * 3_600_000_000, v)
             .aggregate_at("hi", b"hourly", T0 + (i % 4) * 3_600_000_000, v)
-            .commit()
-            .unwrap();
+            .aggregate_at("users", b"hourly", T0 + (i % 4) * 3_600_000_000, v);
+        // Row a00's distinct users pass the sparse/dense boundary; the others stay sparse.
+        let users = if i % 6 == 0 { 400 } else { 3 };
+        for u in 0..users {
+            m = m.aggregate("users", b"all", (i * 1_000 + u) as i64);
+        }
+        m.commit().unwrap();
         match i {
             10 => {
                 t.mutate(b"a01")

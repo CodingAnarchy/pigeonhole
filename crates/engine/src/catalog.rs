@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use pigeonhole_compaction::{I64Add, I64Max, I64Min, MergeOperator, MergeRegistry};
+use pigeonhole_compaction::{HllUnion, I64Add, I64Max, I64Min, MergeOperator, MergeRegistry};
 use pigeonhole_format::hash::{FastMap, FastSet};
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
@@ -22,6 +22,8 @@ pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
 pub(crate) const I64_MIN: &str = "pigeonhole.i64_min";
 /// Name of the built-in `i64` maximum (`pigeonhole_compaction::I64Max`, D294).
 pub(crate) const I64_MAX: &str = "pigeonhole.i64_max";
+/// Name of the built-in HyperLogLog union (`pigeonhole_compaction::HllUnion`, D294).
+pub(crate) const HLL: &str = "pigeonhole.hll";
 
 /// The operator an aggregate family of `kind` folds with, by name (D179, D294); `None` for
 /// a standard family, whose operator is its own choice.
@@ -31,6 +33,7 @@ pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
         FamilyKind::Counter => Some(I64_ADD),
         FamilyKind::Min => Some(I64_MIN),
         FamilyKind::Max => Some(I64_MAX),
+        FamilyKind::Hll => Some(HLL),
     }
 }
 
@@ -41,6 +44,7 @@ fn builtin_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
         FamilyKind::Counter => Some(Arc::new(I64Add)),
         FamilyKind::Min => Some(Arc::new(I64Min)),
         FamilyKind::Max => Some(Arc::new(I64Max)),
+        FamilyKind::Hll => Some(Arc::new(HllUnion)),
     }
 }
 
@@ -49,8 +53,8 @@ fn builtin_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
 pub(crate) enum MergeKind {
     /// No operator: merge operands are refused at write time.
     None,
-    /// A built-in `i64` operator: the add of a counter family or of a 0.1.0 family that
-    /// names it (D41), or an aggregate family's min or max (D294).
+    /// A built-in operator: the `i64` add of a counter family or of a 0.1.0 family that
+    /// names it (D41), or an aggregate family's min, max or HLL union (D294).
     Builtin,
     /// An operator registered in `EngineOptions::merge_operators`.
     Registered,

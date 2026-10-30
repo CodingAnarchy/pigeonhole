@@ -146,6 +146,8 @@ fn families() -> Vec<ModelFamily> {
             f("sum_ttl", 0, 40, false),
             f("min", 2, 0, false),
             f("max_ttl", 0, 40, false),
+            f("hll", 2, 0, false),
+            f("hll_ttl", 0, 40, false),
         ]
     } else {
         vec![
@@ -162,17 +164,19 @@ fn is_aggregate(family: &str) -> bool {
     aggregation_of_name(family).is_some()
 }
 
-/// A min or max family (D294), whose inputs `aggregate` writes (`incr` is refused there).
+/// A min, max or HLL family (D294), whose inputs `aggregate` writes (`incr` is refused
+/// there).
 fn is_min_max(family: &str) -> bool {
     matches!(
         aggregation_of_name(family),
-        Some(ModelAggregation::Min | ModelAggregation::Max)
+        Some(ModelAggregation::Min | ModelAggregation::Max | ModelAggregation::Hll)
     )
 }
 
-/// A family holding only `i64`s.
+/// A family holding only `i64`s (an HLL family's cells are sketches).
 fn is_i64(family: &str) -> bool {
-    family.starts_with("counter") || is_aggregate(family)
+    family.starts_with("counter")
+        || (is_aggregate(family) && aggregation_of_name(family) != Some(ModelAggregation::Hll))
 }
 
 /// `g` compacts tiered and `ttl` FIFO by time (#31, #32), and `f` uses zstd (#44); the
@@ -196,6 +200,7 @@ fn public_family(f: &ModelFamily) -> Family {
         (true, ModelAggregation::Sum) => Family::counter(),
         (true, ModelAggregation::Min) => Family::aggregate(Aggregation::Min),
         (true, ModelAggregation::Max) => Family::aggregate(Aggregation::Max),
+        (true, ModelAggregation::Hll) => Family::aggregate(Aggregation::Hll),
     };
     let family = family
         .max_versions(f.max_versions)

@@ -248,6 +248,9 @@ pub enum FamilyKind {
     /// An `i64` maximum family (D294): a bucket holds the largest value written to it.
     /// Needs [`INCOMPAT_AGGREGATES`].
     Max = 3,
+    /// A HyperLogLog family (D294): a bucket holds a sketch of the distinct `i64` elements
+    /// written to it ([`crate::hll`]). Needs [`INCOMPAT_AGGREGATES`].
+    Hll = 4,
 }
 
 impl FamilyKind {
@@ -277,13 +280,13 @@ impl FamilyKind {
     pub fn required_incompat(self) -> u64 {
         match self {
             FamilyKind::Standard | FamilyKind::Counter => 0,
-            FamilyKind::Min | FamilyKind::Max => INCOMPAT_AGGREGATES,
+            FamilyKind::Min | FamilyKind::Max | FamilyKind::Hll => INCOMPAT_AGGREGATES,
         }
     }
 }
 
-/// The `incompat` feature bit of the aggregate kinds added after 1.0 (bit 0, D294): Min
-/// and Max.
+/// The `incompat` feature bit of the aggregate kinds added after 1.0 (bit 0, D294): Min,
+/// Max and Hll.
 pub const INCOMPAT_AGGREGATES: u64 = 1 << 0;
 
 /// The persisted policy of one family. Stored in the manifest so another binary interprets
@@ -488,6 +491,7 @@ impl FamilyOptions {
                     1 => FamilyKind::Counter,
                     2 => FamilyKind::Min,
                     3 => FamilyKind::Max,
+                    4 => FamilyKind::Hll,
                     k => {
                         return Err(Error::UnsupportedFeature {
                             what: "family kind",

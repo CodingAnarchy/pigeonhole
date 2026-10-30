@@ -287,6 +287,67 @@ impl MergeOperator for I64Max {
     }
 }
 
+/// Built-in HyperLogLog union, the operator of a `FamilyKind::Hll` family (D294): operands
+/// and values are `ValueTag::Bytes` sketches (`pigeonhole_format::hll`), and the result is
+/// their register-wise maximum, in canonical form. It folds in place: no decode, no re-encode,
+/// no allocation once the accumulator is dense. A missing base leaves the operands' union.
+/// Name: `pigeonhole.hll`.
+///
+/// A base or operand that is not a well-formed sketch is a [`MergeError`].
+///
+/// ```
+/// use pigeonhole_compaction::{HllUnion, MergeOperator};
+/// use pigeonhole_format::hll;
+///
+/// let stored = |v: i64| {
+///     let mut s = Vec::new();
+///     hll::encode_element(&mut s, v);
+///     [&[0u8][..], &s].concat() // the Bytes tag, then the sketch
+/// };
+/// let mut acc = stored(1);
+/// HllUnion.merge(&mut acc, &stored(2)).unwrap();
+/// HllUnion.finish(Some(&stored(3)), &mut acc).unwrap();
+/// assert_eq!(hll::estimate(&acc[1..]).unwrap(), 3);
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HllUnion;
+
+impl HllUnion {
+    const NAME: &'static str = "pigeonhole.hll";
+
+    fn sketch<'a>(v: &'a [u8], what: &str) -> Result<&'a [u8], MergeError> {
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => Ok(rest),
+            _ => Err(MergeError::new(Self::NAME, what)),
+        }
+    }
+
+    fn merge_into(acc: &mut Vec<u8>, other: &[u8]) -> Result<(), MergeError> {
+        Self::sketch(acc, "operand is not a sketch")?;
+        pigeonhole_format::hll::merge_at(acc, 1, other)
+            .map_err(|e| MergeError::new(Self::NAME, e.0))
+    }
+}
+
+impl MergeOperator for HllUnion {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        Self::merge_into(acc, Self::sketch(older, "operand is not a sketch")?)
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        if let Some(base) = base {
+            Self::merge_into(acc, Self::sketch(base, "base value is not a sketch")?)?;
+        }
+        // The accumulator's own registers are checked here, once per fold.
+        let sketch = Self::sketch(acc, "operand is not a sketch")?;
+        pigeonhole_format::hll::validate(sketch).map_err(|e| MergeError::new(Self::NAME, e.0))
+    }
+}
+
 /// Operators available to this process, by name. Built-ins are always present.
 ///
 /// ```
@@ -319,6 +380,7 @@ impl MergeRegistry {
         r.register(Arc::new(I64Add));
         r.register(Arc::new(I64Min));
         r.register(Arc::new(I64Max));
+        r.register(Arc::new(HllUnion));
         r
     }
 

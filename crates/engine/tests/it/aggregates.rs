@@ -31,6 +31,7 @@ fn family(kind: FamilyKind) -> FamilyOptions {
     let op = match kind {
         FamilyKind::Min => "pigeonhole.i64_min",
         FamilyKind::Max => "pigeonhole.i64_max",
+        FamilyKind::Hll => "pigeonhole.hll",
         _ => "pigeonhole.i64_add",
     };
     FamilyOptions::default().merge_operator(op).kind(kind)
@@ -464,4 +465,174 @@ fn a_creation_queued_behind_a_background_commit_flags_the_file() {
     let cell = db.get_latest(t.id, min, b"r", b"q").unwrap().unwrap();
     assert_eq!(cell.value(), ValueRef::I64(4));
     db.close().unwrap();
+}
+
+/// An HLL family `h` (D294) in table `t`.
+struct HllRig {
+    db: Arc<Engine>,
+    t: TableId,
+    h: FamilyId,
+}
+
+impl HllRig {
+    fn open(vfs: &Arc<SimVfs>, steps: u64) -> Self {
+        let db = Engine::open(Path::new(DB), options(vfs, steps)).unwrap();
+        let info = db
+            .create_table("t", &[("h".into(), family(FamilyKind::Hll))])
+            .unwrap();
+        Self {
+            t: info.id,
+            h: info.family("h").unwrap().id,
+            db,
+        }
+    }
+
+    fn inputs(&self, row: &[u8], elements: impl IntoIterator<Item = i64>) {
+        let mut wb = WriteBatch::new();
+        for e in elements {
+            wb.merge(self.t, self.h, row, b"q", ValueRef::I64(e))
+                .unwrap();
+        }
+        self.db.commit(wb, None).unwrap();
+    }
+
+    fn sketch(&self, row: &[u8]) -> Option<Vec<u8>> {
+        let cell = self.db.get_latest(self.t, self.h, row, b"q").unwrap()?;
+        match cell.value() {
+            ValueRef::Bytes(b) => Some(b.to_vec()),
+            v => panic!("not a sketch: {v:?}"),
+        }
+    }
+}
+
+#[test]
+fn an_hll_family_folds_elements_into_the_canonical_sketch() {
+    let vfs = SimVfs::new(21);
+    let r = HllRig::open(&vfs, 128);
+    assert_eq!(r.sketch(b"r"), None, "no input: absent");
+    // One element per commit, then many per commit (combined in the commit), past the
+    // sparse/dense boundary, then repeats (idempotent).
+    for e in 0..300 {
+        r.inputs(b"r", [e]);
+    }
+    assert_eq!(r.sketch(b"r"), pigeonhole_sim::hll_sketch(0..300));
+    r.inputs(b"r", 300..2_000);
+    r.db.flush().unwrap();
+    r.inputs(b"r", 0..2_000);
+    let want = pigeonhole_sim::hll_sketch(0..2_000).unwrap();
+    assert_eq!(
+        want.len(),
+        pigeonhole_format::hll::DENSE_LEN,
+        "dense by now"
+    );
+    assert_eq!(r.sketch(b"r").unwrap(), want);
+    let estimate = pigeonhole_format::hll::estimate(&want).unwrap();
+    assert!((1_900..=2_100).contains(&estimate), "{estimate}");
+    // Buckets are sketches of their own.
+    let mut wb = WriteBatch::new();
+    for (ts, e) in [(8, 1), (8, 2), (16, 3)] {
+        wb.merge_at(r.t, r.h, b"b", b"q", ts, ValueRef::I64(e))
+            .unwrap();
+    }
+    r.db.commit(wb, None).unwrap();
+    let snap = r.db.snapshot().unwrap();
+    let mut spec = ReadSpec::default();
+    spec.families = vec![r.h];
+    let row = r.db.read_row(&snap, r.t, b"b", &spec).unwrap().unwrap();
+    let versions: Vec<(u64, Vec<u8>)> = row
+        .cells
+        .iter()
+        .map(|c| (c.data.timestamp(), common::value_bytes(c.data.value())))
+        .collect();
+    assert_eq!(
+        versions,
+        [
+            (16, pigeonhole_sim::hll_sketch([3]).unwrap()),
+            (8, pigeonhole_sim::hll_sketch([1, 2]).unwrap())
+        ]
+    );
+    // A delete starts the cell again.
+    let mut wb = WriteBatch::new();
+    wb.delete_column(r.t, r.h, b"r", b"q", None).unwrap();
+    r.db.commit(wb, None).unwrap();
+    assert_eq!(r.sketch(b"r"), None);
+    r.inputs(b"r", [7]);
+    assert_eq!(r.sketch(b"r"), pigeonhole_sim::hll_sketch([7]));
+    r.db.close().unwrap();
+}
+
+#[test]
+fn hll_checkpoints_keep_reads_unchanged() {
+    // D291 with every fold checkpointed: a sketch base, sparse then dense, through a flush.
+    let vfs = SimVfs::new(22);
+    let r = HllRig::open(&vfs, 1);
+    for e in 0..1_500 {
+        r.inputs(b"r", [e * 13]);
+        if e % 97 == 0 {
+            assert_eq!(
+                r.sketch(b"r"),
+                pigeonhole_sim::hll_sketch((0..=e).map(|x| x * 13))
+            );
+        }
+        if e == 700 {
+            r.db.flush().unwrap();
+        }
+    }
+    let want = pigeonhole_sim::hll_sketch((0..1_500).map(|x| x * 13));
+    assert_eq!(r.sketch(b"r"), want);
+    r.db.flush().unwrap();
+    assert_eq!(r.sketch(b"r"), want);
+    r.db.close().unwrap();
+}
+
+#[test]
+fn an_hll_family_takes_elements_and_well_formed_sketch_puts_only() {
+    let vfs = SimVfs::new(23);
+    let r = HllRig::open(&vfs, 128);
+    let refused = |wb: WriteBatch| match r.db.commit(wb, None) {
+        Err(Error::InvalidArgument(why)) => assert!(why.contains("hll family"), "{why}"),
+        other => panic!("{other:?}"),
+    };
+    let mut wb = WriteBatch::new();
+    wb.put(r.t, r.h, b"r", b"q", None, ValueRef::I64(5))
+        .unwrap();
+    refused(wb);
+    let mut wb = WriteBatch::new();
+    wb.merge(r.t, r.h, b"r", b"q", ValueRef::Bytes(b"x"))
+        .unwrap();
+    refused(wb);
+    let mut wb = WriteBatch::new();
+    wb.put(r.t, r.h, b"r", b"q", None, ValueRef::Bytes(b"not a sketch"))
+        .unwrap();
+    refused(wb);
+    // A put of a well-formed sketch sets the cell (`phdb load` writes one back); later
+    // inputs merge into it, in the same commit too.
+    let base = pigeonhole_sim::hll_sketch(0..10).unwrap();
+    let mut wb = WriteBatch::new();
+    wb.put(r.t, r.h, b"r", b"q", None, ValueRef::Bytes(&base))
+        .unwrap();
+    wb.merge(r.t, r.h, b"r", b"q", ValueRef::I64(10)).unwrap();
+    r.db.commit(wb, None).unwrap();
+    assert_eq!(r.sketch(b"r"), pigeonhole_sim::hll_sketch(0..11));
+    // The operator belongs to the kind, and sketches stay inline.
+    let standard = FamilyOptions::default().merge_operator("pigeonhole.hll");
+    assert!(matches!(
+        r.db.add_family(r.t, "s", standard),
+        Err(Error::InvalidArgument(_))
+    ));
+    match r
+        .db
+        .add_family(r.t, "small", family(FamilyKind::Hll).blob_threshold(1024))
+    {
+        Err(Error::InvalidArgument(why)) => assert!(why.contains("3076"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    r.db.add_family(
+        r.t,
+        "never",
+        family(FamilyKind::Hll).blob_threshold(u32::MAX),
+    )
+    .unwrap();
+    assert_eq!(incompat(&vfs), [INCOMPAT_AGGREGATES; 2]);
+    r.db.close().unwrap();
 }

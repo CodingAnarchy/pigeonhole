@@ -20,7 +20,7 @@ mod workload;
 
 pub use model::{
     COUNTER_TS, CrashWindow, Model, ModelAggregation, ModelCell, ModelError, ModelFamily, ModelOp,
-    ModelPurge, aggregation_of_name, combine_counter_writes,
+    ModelPurge, aggregation_of_name, combine_aggregate_writes, combine_counter_writes, hll_sketch,
 };
 pub use sim::{Rng, Sim, Step, TaskId};
 pub use streams::{

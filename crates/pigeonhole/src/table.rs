@@ -227,8 +227,8 @@ impl TableCore {
         self.family_id(name)
     }
 
-    /// [`family_id`](Self::family_id) for a typed operand: `incr` is refused in a min or
-    /// max family ("increment" would mislead there) and `aggregate` outside an aggregate
+    /// [`family_id`](Self::family_id) for a typed operand: `incr` is refused in a min, max
+    /// or HLL family ("increment" would mislead there) and `aggregate` outside an aggregate
     /// family (D294). One lookup, the one the write does anyway.
     pub(crate) fn operand_family_id(&self, name: &str, operand: Operand) -> Result<FamilyId> {
         use pigeonhole_engine::FamilyKind;
@@ -248,6 +248,9 @@ impl TableCore {
             }
             (Operand::Incr, FamilyKind::Max) => {
                 "is a max family: write its inputs with aggregate, not incr"
+            }
+            (Operand::Incr, FamilyKind::Hll) => {
+                "is an hll family: write its inputs with aggregate, not incr"
             }
             (Operand::Aggregate, kind) if !kind.is_aggregate() => {
                 "is not an aggregate family: aggregate needs Family::aggregate or Family::counter"
