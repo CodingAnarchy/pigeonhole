@@ -2550,7 +2550,7 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 **Tests:**
 - `memtable` unit tests: a bad tail (past the arena, misaligned, inside the header, at a height-0 node, at another column, backward) is `Corrupt`; reused chunks never show an earlier memtable's tails, with tails recorded or not. These run under Miri too.
 - The loom test of a skip with a concurrent writer, on the node field.
-- `engine/tests/it/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
+- `engine/tests/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
 - `shm/tests/sim.rs`: a layout 3 region (and a newer one) is refused while other processes are attached, and rebuilt when the new writer is alone.
 
 <a id="d279"></a>

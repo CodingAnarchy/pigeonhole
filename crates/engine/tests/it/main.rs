@@ -7,7 +7,9 @@
 //! step names with `--test` (`model_check`, `counters`, `tablets`, `slots`, `deferred_waits`,
 //! `api`), and the tests that need a process to themselves: `alloc_budget` (its own global
 //! allocator), `footprint` (the process's memory), `idle_cpu`, `idle_spin` and `wait_parks`
-//! (the process's CPU time), and `reader_fork` and `writer_fork` (they fork). A new
+//! (the process's CPU time), `reader_fork` and `writer_fork` (they fork), `manifest_wake` (a
+//! reaper-less backend registered anywhere in the process hides the wake it tests) and
+//! `tail_index` (it asserts on the process-wide jump counters). A new
 //! integration test goes here, as a module below, unless it is one of those kinds.
 
 #[path = "../common/mod.rs"]
@@ -54,7 +56,6 @@ mod huge_value;
 mod idle_counts;
 mod inflight_window;
 mod large_values;
-mod manifest_wake;
 mod milestone_b;
 mod network_fs;
 mod open_cost;
@@ -82,7 +83,6 @@ mod spin_pool_terms;
 mod stall_backoff;
 mod stall_deadline;
 mod sync_faults;
-mod tail_index;
 mod vote_on_append;
 mod wal_pin;
 mod wal_spares_steps;
