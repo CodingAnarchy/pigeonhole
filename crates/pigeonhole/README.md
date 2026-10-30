@@ -94,7 +94,8 @@ doctest.)
 ## Documentation
 
 - [User guide](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/README.md):
-  concepts, getting started, durability, scans and filters, data modeling, errors.
+  concepts, getting started, durability, transactions, scans and filters, data modeling,
+  async, reader processes, recovery, errors, the `phdb` CLI, Arrow export and performance.
 - [Agent reference](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/agent-reference.md):
   every type and method, limits and error codes on one page.
 - [API docs](https://docs.rs/pigeonhole) and the

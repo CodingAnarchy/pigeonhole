@@ -87,7 +87,9 @@ pub enum ErrorCode {
     /// A reader process found no running writer to attach to
     /// ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader), or a reader's next read
     /// after its writer's shared memory went away): a reader attaches to a running writer.
-    /// Open the reader again once a writer runs (ICR 0057).
+    /// Also a reader of a new database whose file reuses the inode of a deleted one that left
+    /// shared memory behind, until the new database's own writer runs (#1133). Open the
+    /// reader again once a writer runs (ICR 0057).
     NoWriter = 29,
     /// The file uses a feature this build does not support: a value written by a newer
     /// version (a value type, family kind, compression codec, block or log record kind) that

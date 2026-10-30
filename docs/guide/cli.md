@@ -39,7 +39,7 @@ A database has one writer process at a time and any number of reader processes (
   - While `phdb` holds the writer lock, your application can't open as the writer: its open fails with `WriterLocked` until `phdb` exits.
 - **A writer is running:** `phdb` opens as a reader process. It sees everything the writer has committed and changes nothing.
 
-`phdb` opens with one unpinned shard and a 16 MiB block cache (as the writer, with no row cache), and never creates a file. A database `phdb` can't write opens read-only (`read_only_fallback`): families that name a merge operator `phdb` doesn't know, or a feature from a newer version that this one may only read. Such an open writes nothing to the file.
+`phdb` opens with one unpinned shard and a 16 MiB block cache (as the writer with no row cache; as a reader process with `ReaderOptions`' default row cache), and never creates a file. A database `phdb` can't write opens read-only (`read_only_fallback`): families that name a merge operator `phdb` doesn't know, or a feature from a newer version that this one may only read. Such an open writes nothing to the file.
 
 `--reader` and `--writer` force one role, and fail rather than fall back.
 
@@ -299,7 +299,7 @@ snapshot [--durable] <name>     release <name>
   - `--i64 >30` (also `<n` and `=n`) keeps `i64` values that compare as given;
   - `--columns-per-row N` is `Scan::column_limit(N)`.
 - **`--at`** reads at a named snapshot. `snapshot` takes one (`--durable` for a durable one); `release` drops it.
-- **Output:** reads print one row per cell, `row`, `family`, `qualifier`, `ts`, `value`, in the current `\format`.
+- **Output:** reads print one row per cell, `row`, `family`, `qualifier`, `ts`, `value`, in the current `\format`. A read that finds nothing prints nothing, not even the header.
 
 **Writing:**
 - **`put`** writes bytes, or with `--i64` or `--f64` a typed value. `--ts` sets the timestamp.

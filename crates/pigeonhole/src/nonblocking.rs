@@ -13,10 +13,11 @@
 //! ([`Cell`], [`Row`]), safe to hold across `.await`. A read as of now (no snapshot) runs
 //! at the call first, as the sync one does: a memtable or cache hit is read there, as of
 //! the call, and the future resolves to it on its first poll, holding nothing else (#709).
-//! A block the cache does not hold is read through the VFS's asynchronous reads, and the
-//! read runs again once it is cached; such a read, and a read at a snapshot, takes its read
-//! point on the first poll, so every attempt sees the same data. Dropping a read future is
-//! always safe. Two cases read synchronously, counted by
+//! On Linux, a block the operating system's page cache holds is copied on the calling thread
+//! and the read carries on (D292). A block that must come from the device has its read
+//! submitted at the call: the future waits for it and keeps the call's read point, so its
+//! result is as of the call too. A read at a snapshot reads at that snapshot. Dropping a
+//! read future is always safe. Two cases read synchronously, counted by
 //! [`EngineMetrics::async_sync_reads`](crate::EngineMetrics::async_sync_reads) (D196, #398):
 //! - a separated value too large to cache (above an eighth of the block cache, at most
 //!   1 MiB): inside `get_async` or `read_async` itself when the rest of the read hits at
