@@ -1350,13 +1350,13 @@ impl ShardState {
             self.refresh_tablets();
             match self.validate_op(&kind) {
                 Err(e) => {
-                    trace!("shard {} tablet change {kind:?} refused: {e}", self.id.0);
+                    balance!("shard {} tablet change {kind:?} refused: {e}", self.id.0);
                     if let Some(r) = reply {
                         r.notify(Err(e));
                     }
                 }
                 Ok((entries, reserved)) => {
-                    trace!("shard {} tablet change {kind:?} starts", self.id.0);
+                    balance!("shard {} tablet change {kind:?} starts", self.id.0);
                     self.moving = kind.tablets().into_iter().collect();
                     self.op = Some(ActiveOp {
                         kind,
@@ -1625,7 +1625,7 @@ impl ShardState {
         // D11, D271: default timestamps never go backwards on a tablet. The new owner's next
         // stamp is above every one the allocator handed out, so above the tablet's own.
         self.shared.clock.raise();
-        trace!("shard {} tablet change {kind:?} commits", self.id.0);
+        balance!("shard {} tablet change {kind:?} commits", self.id.0);
         let me = self.id;
         let change: TabletChange =
             Box::new(move |catalog| tablet_change(catalog, &kind, &entries, me));
@@ -1661,7 +1661,7 @@ impl ShardState {
         self.release_slots(&op.reserved);
         match result {
             Ok(_) => {
-                trace!("shard {} tablet change {:?} done", self.id.0, op.kind);
+                balance!("shard {} tablet change {:?} done", self.id.0, op.kind);
                 self.refresh_tablets();
                 if self.drop_tablets(&moving).is_err() {
                     self.poison(crate::health::FailureCause::Internal);
@@ -1685,9 +1685,10 @@ impl ShardState {
                 }
             }
             Err(e) => {
-                trace!(
+                balance!(
                     "shard {} tablet change {:?} failed: {e}",
-                    self.id.0, op.kind
+                    self.id.0,
+                    op.kind
                 );
                 self.release_parked(ctx);
                 if let Some(r) = op.reply {
@@ -1900,7 +1901,7 @@ impl ShardState {
         let decision_none = decision.is_none();
         match decision {
             Some(kind) => {
-                trace!("shard {} balancer: {kind:?}", self.id.0);
+                balance!("shard {} balancer: {kind:?}", self.id.0);
                 self.start_change(kind, reply, ctx);
             }
             None => {
@@ -1970,7 +1971,7 @@ impl ShardState {
         let (_, mem_per) = self.mem_bytes();
         let (kind, _) = self.decide(ctx.now_nanos(), &mem_per);
         if let Some(kind) = kind {
-            trace!("shard {} balancer, after a compaction: {kind:?}", self.id.0);
+            balance!("shard {} balancer, after a compaction: {kind:?}", self.id.0);
             self.start_change(kind, None, ctx);
         }
     }
@@ -2277,7 +2278,7 @@ impl ShardState {
         if k < floor {
             self.pack_k = want;
             self.pack_target = want;
-            trace!(
+            balance!(
                 "shard {} balancer: active shards {k} -> {want} (slots need {floor})",
                 self.id.0
             );
@@ -2374,6 +2375,34 @@ impl ShardState {
             0
         };
         let ramping = ramping && self.ramp_passes <= PACK_RAMP_MAX;
+        // Shard 0 decides the packing (D217): its pass state, when an input to the decision
+        // changes or once a second (#1188).
+        if self.id.0 == 0 && balance_logging() {
+            let key = format!(
+                "k {k} k_c {k_c}/{k_c_slow} settled {} ramping {ramping} hottest {} floor {floor} up {} down {}",
+                self.settled_passes >= PACK_SHRINK_PASSES,
+                hottest.is_some(),
+                self.pack_up > 0,
+                self.pack_down > 0
+            );
+            let due = self.balance_logged.as_ref().is_none_or(|(last, at)| {
+                *last != key || at.elapsed() >= std::time::Duration::from_secs(1)
+            });
+            if due {
+                balance!(
+                    "shard 0 pass {}: k {k} busy {busy:.2} in flight {inflight:.2} (k_c {k_c}, slow {:.2} k_c {k_c_slow}, settled {} of {}) writes {writes} (slow {writes_slow}, ramping {ramping}) floor {floor} hottest {:?} up {} down {} stall floor {:?}",
+                    self.balance_pass,
+                    self.inflight_slow,
+                    self.settled_passes,
+                    PACK_SHRINK_PASSES,
+                    hottest,
+                    self.pack_up,
+                    self.pack_down,
+                    self.stall_floor
+                );
+                self.balance_logged = Some((key, std::time::Instant::now()));
+            }
+        }
         trace!(
             "shard {} balancer pass: k {k} busy {busy:.2} in flight {inflight:.2} (k_c {k_c}, slow {:.2} k_c {k_c_slow}, settled {} of {}) writes {writes} (slow {writes_slow}, ramping {ramping}) floor {floor} (quiet {} of {}) hottest {:?} up {} down {}",
             self.id.0,
@@ -2497,9 +2526,10 @@ impl ShardState {
         } else {
             self.pack_target.max(self.pack_k)
         };
-        trace!(
+        balance!(
             "shard {} balancer: active shards {k} -> {} (busy {busy:.2}, in flight {inflight:.2}, floor {floor}, writes {writes}): {why}",
-            self.id.0, self.pack_k
+            self.id.0,
+            self.pack_k
         );
         self.pack_up = 0;
         self.pack_down = 0;
@@ -2536,6 +2566,10 @@ impl ShardState {
         let min = cfg.min_writes.max(1) as f64;
         if self.skew_active {
             if my < min || my < Self::skew_stop(cfg.skew) * mean {
+                balance!(
+                    "shard {} write skew ends: writes {my:.0} against a mean of {mean:.0}",
+                    self.id.0
+                );
                 self.skew_active = false;
                 self.skew_run = 0;
             }
@@ -2544,6 +2578,7 @@ impl ShardState {
         // A pass while the mean is falling neither counts nor resets the persistence (D224):
         // under a closed-loop load it is a phase's tail, which must not trigger, and a bursty
         // load whose mean dips between bursts must still reach `SKEW_PERSIST`.
+        let run_before = self.skew_run;
         if !self.mean_falling {
             if my >= min && my > cfg.skew * mean {
                 self.skew_run += 1;
@@ -2552,7 +2587,23 @@ impl ShardState {
             }
         }
         if self.skew_run >= SKEW_PERSIST {
+            balance!(
+                "shard {} write skew: writes {my:.0} against a mean of {mean:.0} for {} passes",
+                self.id.0,
+                self.skew_run
+            );
             self.skew_active = true;
+        } else if run_before == 0 && self.skew_run == 1 {
+            balance!(
+                "shard {} write skew starts: writes {my:.0} against a mean of {mean:.0}",
+                self.id.0
+            );
+        } else if run_before > 0 && self.skew_run == 0 {
+            balance!(
+                "shard {} write skew run resets after {run_before} passes: writes {my:.0} \
+                 against a mean of {mean:.0}",
+                self.id.0
+            );
         }
     }
 
@@ -2761,7 +2812,7 @@ impl ShardState {
                 self.shared.metrics[usize::from(self.id.0)]
                     .refused_slots
                     .fetch_add(1, Ordering::Relaxed);
-                trace!(
+                balance!(
                     "shard {} balancer: tablet {} is due a size split but the shard holds \
                      {} of its {} slots",
                     self.id.0,

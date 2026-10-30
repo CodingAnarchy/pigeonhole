@@ -925,6 +925,14 @@ impl Runner for PigeonholeRunner {
     }
 
     fn mark_phase(&mut self, phase: &str) {
+        // The phase in the engine's balance log (#1188), on its clock: the log then shows
+        // which tablet changes fell in the warmup and which in the measured phase.
+        if std::env::var_os("PIGEONHOLE_BALANCE_LOG").is_some() {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0.0, |d| d.as_secs_f64());
+            eprintln!("balance {secs:.3} phase {phase}");
+        }
         if let Some(open) = self.open.as_mut()
             && let Err(e) = open.trace(phase, None)
         {

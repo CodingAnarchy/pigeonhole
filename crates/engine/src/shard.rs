@@ -3199,6 +3199,9 @@ pub(crate) struct ShardState {
     /// Whether this shard acts on write skew: from `SKEW_PERSIST` skewed passes until its
     /// load falls below the stop ratio (D214).
     skew_active: bool,
+    /// Shard 0's packing state as the balance log last printed it, and when (#1188): it
+    /// prints on a change, else once a second. Untouched while the log is off.
+    balance_logged: Option<(String, std::time::Instant)>,
     /// A slow moving average of the mean write load over the active shards, and whether the
     /// mean now is falling below it: then skewed passes don't count and no skew change is
     /// made (D224).
@@ -3477,6 +3480,7 @@ impl ShardState {
             skew_pass: None,
             skew_run: 0,
             skew_active: false,
+            balance_logged: None,
             mean_slow: 0.0,
             mean_falling: false,
             load_slow: 0.0,
@@ -10688,6 +10692,54 @@ macro_rules! trace {
     };
 }
 pub(crate) use trace;
+
+/// Whether `PIGEONHOLE_BALANCE_LOG` is set (CONTRIBUTING.md, "Test environment variables"):
+/// the balancer logs its decisions, tablet changes, write skew and shard 0's packing state
+/// (#1188). Read once, as `tracing` is; separate from it because a full trace of a bench run
+/// is gigabytes, and this log is a few hundred lines.
+pub(crate) fn balance_logging() -> bool {
+    match BALANCE_LOGGING.load(Ordering::Relaxed) {
+        TRACE_UNSET => {
+            let on = std::env::var_os("PIGEONHOLE_BALANCE_LOG").is_some();
+            let _ = BALANCE_LOGGING.compare_exchange(
+                TRACE_UNSET,
+                if on { TRACE_ON } else { TRACE_OFF },
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            BALANCE_LOGGING.load(Ordering::Relaxed) == TRACE_ON
+        }
+        state => state == TRACE_ON,
+    }
+}
+
+/// `balance_logging`'s state, as `TRACING`'s.
+static BALANCE_LOGGING: AtomicU8 = AtomicU8::new(TRACE_UNSET);
+
+/// Seconds since the Unix epoch, for the balance log's lines: wall-clock time lines them up
+/// with the bench's phase marks and with system samplers (`mpstat`) in another process.
+pub(crate) fn balance_log_secs() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Logs a balancer line to stderr when `PIGEONHOLE_BALANCE_LOG` or `PIGEONHOLE_TRACE` is set,
+/// prefixed `balance <unix seconds>`, as [`trace!`] writes (#1188).
+macro_rules! balance {
+    ($($arg:tt)*) => {
+        if $crate::shard::balance_logging() || $crate::shard::tracing() {
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
+                "balance {:.3} {}",
+                $crate::shard::balance_log_secs(),
+                format_args!($($arg)*)
+            );
+        }
+    };
+}
+pub(crate) use balance;
 
 /// Why a member could not reserve arena room.
 enum Room {
