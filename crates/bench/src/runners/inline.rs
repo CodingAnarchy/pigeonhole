@@ -21,7 +21,7 @@ use super::pigeonhole::{create_table, err, options, retry_policy};
 use crate::{
     BenchOp, EngineCommit, Histogram, LatencyStats, OpTypeStats, PigeonholeRunner, RunDetail,
     RunOptions, RunRecord, Runner, ShardShare, Stalls, WARMUP_CAP, WARMUP_CAP_AFTER_SWITCH,
-    WARMUP_SETTLED, WARMUP_SETTLED_AFTER_SWITCH, Workload, WorkloadConfig,
+    Workload, WorkloadConfig,
 };
 
 /// Commits each shard thread keeps in flight (D204).
@@ -854,9 +854,9 @@ impl PigeonholeRunner {
         // D242, D247: after a buffered load the run commits at its durable level, and packing
         // re-places the tablets for it over tens of seconds; the warmup waits longer then.
         let (quiet, cap) = if load_buffered {
-            (WARMUP_SETTLED_AFTER_SWITCH, WARMUP_CAP_AFTER_SWITCH)
+            (config.quiet.warmup_after_switch, WARMUP_CAP_AFTER_SWITCH)
         } else {
-            (WARMUP_SETTLED, WARMUP_CAP)
+            (config.quiet.warmup, WARMUP_CAP)
         };
         let started = Instant::now();
         let mut last_change = started;
