@@ -203,6 +203,7 @@ The registry has one part per shard (`WatermarkWaiters::new(shards)`), each on i
 | `static TAIL_SKIPS` shard.rs:309 (test-hooks) | `AtomicU64` | Memtable tail jumps taken by reads | source.rs:129 (readers) | hooks.rs:738 | Relaxed | D194, D199; 2cb8a28 (#439) |
 | `static SST_SKIPS` shard.rs:254 (test-hooks) | `AtomicU64` | SST column skips taken by reads from block headers | source.rs:138 (readers, `fetch_add`) | hooks.rs:741 | Relaxed | ICR 0041 (#627) |
 | `static TRACING` shard.rs:7366 | `AtomicU8` | `PIGEONHOLE_TRACE` state: unset, off or on | `tracing()` (CAS from unset), `set_tracing` (test hook, #244) | `tracing()`, on every thread that traces | Relaxed for all, including the CAS | #244; 25d95ad (#252) |
+| `static BALANCE_LOGGING` shard.rs | `AtomicU8` | `PIGEONHOLE_BALANCE_LOG` state: unset, off or on | `balance_logging()` (CAS from unset) | `balance_logging()`, on shard threads in the balancer | Relaxed for all, including the CAS | #1188 |
 
 `static ROWS` (shard.rs:1587) is a `LazyLock<FastBuildHasher>`. It is initialized once and is read-only after that. It is not counted, since `LazyLock` is not in the listed categories (#287, 79e1fa6).
 
