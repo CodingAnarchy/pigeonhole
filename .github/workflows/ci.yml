@@ -44,7 +44,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUSTDOCFLAGS: -D warnings
-  PROPTEST_CASES: 256
+  # No PROPTEST_CASES here: it would override every test's own case count (proptest's
+  # default is 256; the format and compaction properties ask for up to 20,000, the costly
+  # ones for 32-128). Extra cases for the costly ones run as long sweeps (CONTRIBUTING.md).
   # pigeonhole-bench's `rocksdb` feature builds RocksDB from C++ source, so CI builds
   # the bench crate with its other comparison runner (SQLite) only. bench-rocksdb.yml builds
   # and tests the rocksdb feature weekly and on bench changes to main (docs/bench.md).
