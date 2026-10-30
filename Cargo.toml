@@ -23,9 +23,8 @@ members = [
 [workspace.package]
 # The public version line (D295): `pigeonhole`, `pigeonhole-arrow` and `pigeonhole-cli`, which
 # follow semver from 1.0; the unpublished `pigeonhole-capi` and `pigeonhole-bench` take the
-# public line's version too. The 12
-# internal crates set their own `version`, one shared internal line that takes a new major
-# for any incompatible change to any of them. `scripts/versions.py check` (CI) keeps each
+# public line's version too. The 12 internal crates set their own `version`, one shared
+# internal line that takes a new major for any incompatible change to any of them. `scripts/versions.py check` (CI) keeps each
 # line and every pin below in step.
 version = "1.0.0"
 edition = "2024"
