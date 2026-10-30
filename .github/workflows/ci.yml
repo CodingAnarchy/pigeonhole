@@ -105,13 +105,13 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install --quiet polars==2.0.0
           "$RUNNER_TEMP/venv/bin/python" scripts/arrow-smoke.py check "$RUNNER_TEMP/t.arrows"
       # The io_uring backend (#402), the default on Linux since D218 (`IoBackend::Auto`), so
-      # the runs above already used it. This runs the public crate's suites, the real-file
-      # model check and the real-file engine, WAL and pager tests on it forced: `uring` fails
-      # to open rather than fall back, so a runner without io_uring fails here instead of
-      # passing on `pread`.
+      # the workspace run above already ran the public crate's suites on it (its
+      # `the_default_backend_is_io_uring_where_the_kernel_offers_it` fails there if the
+      # default fell back to `pread`). This runs the real-file model check and the real-file
+      # engine, WAL and pager tests on it forced: `uring` fails to open rather than fall
+      # back, so a runner without io_uring fails here instead of passing on `pread`.
       - name: tests on io_uring
         run: |
-          cargo test -p pigeonhole --all-features
           # The model check on real files (shard rings, real fsyncs; #402's suites criterion).
           PIGEONHOLE_REAL_FS=1 cargo test -p pigeonhole --all-features --test model
           # The engine, WAL and pager tests that run on real files.
