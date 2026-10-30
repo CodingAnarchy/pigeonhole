@@ -1,0 +1,2 @@
+### Changed
+- The internal crates (`pigeonhole-format`, `-io`, `-sim`, `-pager`, `-wal`, `-memtable`, `-cache`, `-runtime`, `-shm`, `-sst`, `-compaction`, `-engine`) now share a version line of their own, at 2.0.0, apart from `pigeonhole`, `pigeonhole-arrow` and `pigeonhole-cli`, which stay 1.x under semver (D295). `pigeonhole` pins each internal crate exactly, so depending on `pigeonhole` alone, as recommended, is unaffected. Code that depends on an internal crate directly gets 2.0.0's changes: several `pigeonhole-format` enums are now `#[non_exhaustive]`.

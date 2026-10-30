@@ -3144,4 +3144,4 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 
 **CI.** The semver step still checks every published crate against crates.io:
 - the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
-- a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #PR).
+- a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #1196).
