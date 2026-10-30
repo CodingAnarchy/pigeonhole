@@ -47,6 +47,8 @@ impl Shards {
         o.balance_interval_nanos = 0;
         o.compaction.l0_trigger = u32::MAX;
         o.row_cache_bytes = 1 << 20;
+        // The rows under test are cached by gets (D290's fill, off by default since #1059).
+        o.row_cache_get_fill = true;
         let (db, shards) = Engine::open_application_owned(Path::new(DB), o).expect("open");
         let info = db
             .create_table("t", &[("f".into(), FamilyOptions::default())])

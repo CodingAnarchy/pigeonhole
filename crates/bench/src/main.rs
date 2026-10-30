@@ -127,8 +127,10 @@ OPTIONS:
                            D247) [default: 0, one at a time]
     --no-nowait-reads      Pigeonhole, Linux: submit every read, even one the page cache
                            holds (D292 copies those on the submitting thread by default)
-    --no-get-fill          Pigeonhole: point gets never fill the row cache (D290 fills a
-                           row on its second miss by default; #1059 A/B)
+    --get-fill             Pigeonhole: point gets fill the row cache, a row on its second
+                           miss (D290; off by default since #1059's A/B)
+    --no-get-fill          Pigeonhole: point gets never fill the row cache (the default;
+                           kept so older scripts still run)
     --mixed                app-owned: every other cross-shard batch is a transaction that
                            reads a cold row beside each of its rows and writes the rows,
                            so commits that read and blind writes meet on the same hot
@@ -212,7 +214,7 @@ struct Args {
     no_tablet_changes: bool,
     no_packing: bool,
     no_nowait_reads: bool,
-    no_get_fill: bool,
+    get_fill: bool,
     riders: bool,
     /// `--reader-processes`: reader processes beside the measured phase (#683).
     reader_processes: Option<usize>,
@@ -302,7 +304,8 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--no-tablet-changes" => a.no_tablet_changes = true,
             "--no-packing" => a.no_packing = true,
             "--no-nowait-reads" => a.no_nowait_reads = true,
-            "--no-get-fill" => a.no_get_fill = true,
+            "--get-fill" => a.get_fill = true,
+            "--no-get-fill" => a.get_fill = false,
             "--riders" => a.riders = true,
             "--mixed" => a.mixed = true,
             "--engine-owned" => a.engine_owned = true,
@@ -397,7 +400,7 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
         .tablet_changes(!a.no_tablet_changes)
         .packing(!a.no_packing)
         .nowait_reads(!a.no_nowait_reads)
-        .get_fill(!a.no_get_fill);
+        .get_fill(a.get_fill);
     if let Some(bytes) = a.row_cache {
         r = r.row_cache(bytes);
     }
@@ -1192,13 +1195,8 @@ mod tests {
                 .iter()
                 .all(|r| r.store_config.contains(" group-sync"))
         );
-        // `--threads` picks one count for the sweep.
-        let a = args(&format!(
-            "group-commit --scale smoke --ops 64 --threads 2 --shards 2 --write-buffer 16777216 --dir {}",
-            dir.display()
-        ));
-        // The D213 run pinned and unpinned (D235), then the one client run.
-        assert_eq!(bench(&a).unwrap().results.len(), 3);
+        // `--threads` picking one count for the sweep is `inline_runs_take_their_own_length`'s
+        // first check (three runs fewer here, #1156).
         std::fs::remove_dir_all(&dir).ok();
     }
 

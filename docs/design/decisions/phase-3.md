@@ -2945,6 +2945,8 @@ The transaction's read set records keys only (D275), before the read, so a hit i
 
 **Measurement:** a box A/B against main on transfer (Buffered and the default), ycsb-a, ycsb-f, ycsb-c, D280's counters row and the gate's row-cache step, 6 reps each. It passes if transfer improves beyond noise and no row regresses beyond noise in throughput or p99.
 
+**Amended 2026-10-29 (owner decision, after the get-fill A/B on #1059): point gets do not fill by default.** `EngineOptions::row_cache_get_fill` (`Options::row_cache_get_fill`, an unstable hook) is off by default; (B) applies only with it on. Gets are still served from cached rows (A), row reads still fill (D201), and the write-through (C) still moves cached rows forward. The box A/B (main 1233616f, ×3 interleaved, io_uring) found fill-off equal or better on p99 on every row and on throughput everywhere but transfer: transfer +4% throughput with fills, but p99 224 vs 181 µs and p999 2.41 vs 1.67 ms; ycsb-f +3.6% throughput and p99 121 vs 129 µs without; sparse-wide's get p99 10 vs 18 µs (1 client) and 30 vs 79 µs (16). ycsb-b and ycsb-c were level. Table: #1059.
+
 <a id="d291"></a>
 ## D291 — A counter get that folds many operands keeps its result as a base in the active memtable (ctr274, 2026-10-27; compaction, engine, pigeonhole, #713, D280; refines D186, D287)
 **Why.** After D287 a hot counter's read still folded every operand in the active memtable, about 26 ns each. On the AX102 the counter-read p99 was 4.0–4.5 ms against RocksDB's 1.5–1.8 ms (#992's A/B). Locally a read over 1 ms folded 2^15–2^18 memtable operands, and only about 1.5 SST entries (#713 comment 6456964876). Cheaper steps can't bound a fold that grows with skew and memtable size, so the fold itself has to be bounded.

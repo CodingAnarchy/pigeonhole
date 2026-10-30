@@ -1,6 +1,6 @@
 ### Removed
 - **Breaking (before the 1.0 API freeze; ICR 0085):** `pigeonhole`'s test and bench hooks now exist only with its new, non-default `__unstable-hooks` feature, which applications never turn on:
-  - `Options::{commit_spin, shard_spin, adaptive_shard_threads, tablet_changes, tablet_packing}`. The spin windows keep their defaults (50 and 200 µs), the experimental load controller stays off, and tablet changes and packing are always on. Drop these calls.
+  - `Options::{commit_spin, shard_spin, tablet_changes, tablet_packing}`. The spin windows keep their defaults (50 and 200 µs), and tablet changes and packing are always on. Drop these calls.
   - The hidden test hooks (`Options::vfs`, `wal_segment_size`, `shard_stats` and the like).
   - The `PIGEONHOLE_IO` and `PIGEONHOLE_DIRECT` test variables: without the feature, the library ignores them.
 - **Breaking:** `Options::allow_unregistered_merge_operators`, a deprecated alias. Use `read_only_fallback`.

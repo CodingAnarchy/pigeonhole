@@ -39,9 +39,9 @@ pub(crate) struct Settings {
     pub(crate) no_packing: bool,
     /// Inline page-cache reads (`Options::nowait_reads`, D292); on, the library default.
     pub(crate) no_nowait_reads: bool,
-    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); on, the library
-    /// default.
-    pub(crate) no_get_fill: bool,
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); off, the library
+    /// default (#1059).
+    pub(crate) get_fill: bool,
     /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
     /// turns it off.
     pub(crate) row_cache: Option<u64>,
@@ -400,17 +400,18 @@ impl PigeonholeRunner {
         self
     }
 
-    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290, #1059); on without
-    /// a call.
+    /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); off without a
+    /// call, the library default (#1059).
     ///
     /// ```
     /// use pigeonhole_bench::{PigeonholeRunner, Runner};
     ///
-    /// let r = PigeonholeRunner::default().get_fill(false);
-    /// assert!(r.describe().contains("get-fill=off"));
+    /// let r = PigeonholeRunner::default().get_fill(true);
+    /// assert!(r.describe().contains("get-fill=on"));
+    /// assert!(!PigeonholeRunner::default().describe().contains("get-fill"));
     /// ```
     pub fn get_fill(mut self, yes: bool) -> Self {
-        self.settings.no_get_fill = !yes;
+        self.settings.get_fill = yes;
         self
     }
 
@@ -797,8 +798,8 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.no_nowait_reads {
         options = options.nowait_reads(false);
     }
-    if s.no_get_fill {
-        options = options.row_cache_get_fill(false);
+    if s.get_fill {
+        options = options.row_cache_get_fill(true);
     }
     if let Some(n) = s.shards {
         options = options.shards(n);
@@ -1150,7 +1151,7 @@ impl Runner for PigeonholeRunner {
             " packing=off",
         );
         flag(s.no_nowait_reads, " nowait=off");
-        flag(s.no_get_fill, " get-fill=off");
+        flag(s.get_fill, " get-fill=on");
         match (s.memory.model, s.row_cache) {
             // Under the total model the cache field above names the row cache.
             (CacheModel::Total, _) | (_, None) => {}
@@ -1834,7 +1835,7 @@ mod tests {
                 s.load_buffered = true;
                 s.no_packing = true;
                 s.no_nowait_reads = true;
-                s.no_get_fill = true;
+                s.get_fill = true;
                 s.row_cache = Some(0);
                 s.shard_spin_micros = Some(50);
                 s.shard_threads = Some(2);
@@ -1863,20 +1864,20 @@ mod tests {
                 s.row_cache = Some(32 << 20);
                 s.adaptive_shard_threads = Some(true);
                 s.shard_threads = Some(0);
-                s.no_get_fill = true;
+                s.get_fill = true;
             }),
         ];
         let expected = [
             "shards=default(N) memtable=64MiB cache=256MiB bloom=10 buffered tablets=on \
              shard_threads=adaptive",
             "shards=4 memtable=64MiB cache=256MiB bloom=10 sync load=buffered tablets=on \
-             packing=off nowait=off get-fill=off rowcache=off shard_spin=50us shard_threads=2 \
+             packing=off nowait=off get-fill=on rowcache=off shard_spin=50us shard_threads=2 \
              workers=4 compaction_cores=3 profile=server commit_spin=10us presplit riders \
              readers=2 async=16 rmw=txn txn_backoff=100us",
             "shards=default(N) memtable=64MiB cache=256MiB total (block 192MiB + row 64MiB) \
              bloom=10 group-sync shard_threads=per-shard presplit=writes",
             "shards=default(N) memtable=64MiB cache=256MiB bloom=10 group-sync(default) \
-             tablets=on get-fill=off rowcache=32MiB shard_threads=0 shard_threads=adaptive",
+             tablets=on get-fill=on rowcache=32MiB shard_threads=0 shard_threads=adaptive",
         ];
         for (got, want) in cases.iter().zip(expected) {
             assert_eq!(

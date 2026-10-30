@@ -254,8 +254,11 @@ struct Config {
     front: Front,
     /// `Options::row_cache` bytes (0: off), with a small per-row cap so some family rows are
     /// never stored (D201). Defaults to `PIGEONHOLE_ROW_CACHE` (`1`: a 64 KiB cache, small
-    /// enough to evict), else off.
+    /// enough to evict; `2`: the same with D290's get fill on, off by default since #1059),
+    /// else off.
     row_cache: usize,
+    /// `Options::row_cache_get_fill` (D290): `PIGEONHOLE_ROW_CACHE=2`.
+    get_fill: bool,
     /// `Options::shard_threads` (D289): the shards share this many engine-owned threads.
     /// Defaults to `PIGEONHOLE_SHARD_THREADS`, else 0 (a thread per shard).
     shard_threads: usize,
@@ -336,11 +339,13 @@ impl Config {
             fast_balancer: true,
             deferred_io: std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1"),
             front: Front::from_env(),
-            row_cache: if std::env::var("PIGEONHOLE_ROW_CACHE").is_ok_and(|v| v == "1") {
+            row_cache: if std::env::var("PIGEONHOLE_ROW_CACHE").is_ok_and(|v| v == "1" || v == "2")
+            {
                 ROW_CACHE
             } else {
                 0
             },
+            get_fill: std::env::var("PIGEONHOLE_ROW_CACHE").is_ok_and(|v| v == "2"),
             shard_threads: std::env::var("PIGEONHOLE_SHARD_THREADS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -892,6 +897,7 @@ impl Run {
             .tablet_changes(self.cfg.tablet_changes)
             .row_cache(self.cfg.row_cache)
             .row_cache_max_row(ROW_CACHE_MAX_ROW)
+            .row_cache_get_fill(self.cfg.get_fill)
             .auto_recover(self.cfg.recovery);
         // Set at all, `shard_threads` fixes the count and keeps the controller off.
         if self.cfg.adaptive && self.cfg.shard_threads == 0 {
