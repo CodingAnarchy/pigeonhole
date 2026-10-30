@@ -80,8 +80,11 @@ pub enum CpuProfile {
     Embedded,
     /// The database has the machine or container to itself, and its clients reach it from
     /// elsewhere (another container, over IPC or the network): flush and compaction take
-    /// half the physical cores instead of a quarter. Shard threads are the same as with
-    /// `Embedded`: up to one per shard, sized to the load by default
+    /// half the physical cores instead of a quarter, and a shard thread that handled a
+    /// commit keeps polling 1 ms for the next one before it sleeps, instead of 200 µs.
+    /// Under a moderate steady load that costs up to about two cores and trims the commit
+    /// tail (D198 as amended on 2026-10-30). Shard threads are the same as with `Embedded`:
+    /// up to one per shard, sized to the load by default
     /// ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     Server,
 }
@@ -125,6 +128,19 @@ fn compaction_share(profile: CpuProfile) -> (usize, usize) {
     match profile {
         CpuProfile::Embedded => (1, 4),
         CpuProfile::Server => (1, 2),
+    }
+}
+
+/// How long a shard thread that handled a commit polls for the next one before it sleeps,
+/// per profile (D198, amended 2026-10-30; #760). `Embedded` keeps the engine's 200 µs: a
+/// longer window costs up to about two cores under a moderate steady load, which an
+/// application sharing the CPU (a laptop, a CPU-limited container) should not pay. `Server`
+/// polls 1 ms, which took sparse-wide's `Buffered` put p99 from 49.8 to 27.4 µs on the
+/// reference machine.
+fn shard_spin_default(profile: CpuProfile) -> Option<Duration> {
+    match profile {
+        CpuProfile::Embedded => None,
+        CpuProfile::Server => Some(Duration::from_millis(1)),
     }
 }
 
@@ -411,7 +427,8 @@ impl Options {
     /// the API: the default suits applications.
     ///
     /// How long a shard thread that just handled a commit keeps polling for the next one
-    /// before it sleeps (default 200 µs, D198 as amended on 2026-10-19), so a steady stream
+    /// before it sleeps (default 200 µs, or 1 ms with [`CpuProfile::Server`]; D198 as amended
+    /// on 2026-10-19 and 2026-10-30), so a steady stream
     /// of commits is taken without waking the thread each time, and a store whose clients
     /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
     /// keep finding nothing poll less often. `Duration::ZERO` always sleeps at once. Ignored
@@ -458,10 +475,13 @@ impl Options {
     ///   most by default, and fewer while the load is light
     ///   ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
-    ///   and needs CPU too. Flush and compaction take a quarter of the physical cores.
+    ///   and needs CPU too. Flush and compaction take a quarter of the physical cores, and a
+    ///   shard thread polls 200 µs for the next commit before it sleeps.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
     ///   and its clients reach it from elsewhere (another container, over IPC or the
-    ///   network). Flush and compaction take half the physical cores.
+    ///   network). Flush and compaction take half the physical cores, and a shard thread
+    ///   polls 1 ms for the next commit before it sleeps: a lower commit tail for up to
+    ///   about two more cores under a moderate steady load.
     /// - **CPU limits:** "physical cores" means those the process may use: its affinity
     ///   mask and a container's CPU quota both narrow them, so a 4-CPU container sizes the
     ///   engine for 4 whatever the host has.
@@ -1189,7 +1209,8 @@ impl Options {
         if let Some(window) = self.commit_spin {
             o.commit_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         }
-        if let Some(window) = self.shard_spin {
+        // An explicit window wins over the profile's (D198, amended 2026-10-30).
+        if let Some(window) = self.shard_spin.or(shard_spin_default(self.cpu_profile)) {
             o.shard_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         }
         if let Some(timeout) = self.write_stall_timeout {
@@ -1363,6 +1384,28 @@ mod tests {
         // The engine-owned default starts a thread per shard: the controller's ceiling.
         let e = o().shards(20).to_engine_for(false).unwrap();
         assert_eq!(e.shard_threads, 20);
+    }
+
+    /// The shard's spin window by profile (D198, amended 2026-10-30): `Embedded` keeps the
+    /// engine's 200 µs, `Server` polls 1 ms, and an explicit window wins over either.
+    #[test]
+    fn the_shard_spin_follows_the_profile() {
+        use super::Options;
+        let o = || Options::default().vfs(pigeonhole_io::sim::SimVfs::new(1));
+        let spin = |o: Options| o.to_engine_for(false).unwrap().shard_spin_nanos;
+        assert_eq!(spin(o()), 200_000);
+        assert_eq!(spin(o().cpu_profile(CpuProfile::Embedded)), 200_000);
+        assert_eq!(spin(o().cpu_profile(CpuProfile::Server)), 1_000_000);
+        #[cfg(feature = "__unstable-hooks")]
+        {
+            use std::time::Duration;
+            let set = Duration::from_micros(300);
+            assert_eq!(
+                spin(o().cpu_profile(CpuProfile::Server).shard_spin(set)),
+                300_000
+            );
+            assert_eq!(spin(o().shard_spin(Duration::ZERO)), 0);
+        }
     }
 
     /// D289's tables (the decision's entry and the guide): both profiles from 1 to 128

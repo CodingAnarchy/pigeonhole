@@ -45,7 +45,7 @@ let db = Pigeonhole::open(dir.join("crawl.phdb"), Options::default())?;
   These are ceilings: the write buffers fill only under write load and the caches only as reads miss, so a lightly used database stays far below them. Each reader process adds its own block and row caches. On a small device or a shared host, set `shards`, `memtable_budget`, `block_cache` and `row_cache` explicitly. A single memory budget is planned after 1.0 (#1041).
 - **Threads: start with `cpu_profile`.** `Options::cpu_profile` says who the machine's (or container's) CPUs are for, and from that the engine sizes its threads: up to a shard thread per shard, as few as the load needs, and a share of the cores for flush and compaction (D289). For most databases this is the only thread setting to choose. `shards`, `shard_threads` and `compaction_cores` below override one part of it each; an explicit value always wins over the profile.
   - **`CpuProfile::Embedded` (the default)** leaves CPU for your application in the same process.
-  - **`CpuProfile::Server`** is for a database whose clients are elsewhere, such as another container or over the network.
+  - **`CpuProfile::Server`** is for a database whose clients are elsewhere, such as another container or over the network. It also has a shard thread that handled a commit poll longer for the next one before it sleeps (1 ms instead of 200 µs), which lowers the commit tail and costs up to about two more cores under a moderate steady load.
   - **Physical cores** means those the process may use: an affinity mask or a container's CPU limit narrows them.
 
   | Physical cores | Shard threads (default: at most, sized to the load) | Flush and compaction, Embedded | Flush and compaction, Server |
