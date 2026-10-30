@@ -9,9 +9,10 @@ mod common;
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-use common::{TempDir, phdb};
-use pigeonhole::{Family, Options, Pigeonhole};
+use common::{TempDir, fixture, phdb};
+use pigeonhole::{Durability, Family, Options, Pigeonhole};
 use pigeonhole_format::block::{Block, BlockAddr, BlockKind, seal, verify};
 use pigeonhole_format::compress::Compression;
 use pigeonhole_format::cursor::Cursor;
@@ -219,12 +220,17 @@ fn data_blocks(path: &Path, meta: &SstMeta) -> Vec<BlockAddr> {
         .collect()
 }
 
+/// [`build_sample`]'s database (built once per test binary, each caller getting a copy).
+fn sample(dir: &TempDir) -> PathBuf {
+    static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
+    fixture(&TEMPLATE, "c.phdb", build_sample, dir)
+}
+
 /// A database with one SST (uncompressed 4 KiB blocks, so blocks can be rewritten in place),
 /// a blob file,
 /// a second, empty family and a second table, closed cleanly.
-fn sample(dir: &TempDir) -> PathBuf {
-    let path = dir.path().join("c.phdb");
-    let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
+fn build_sample(path: &Path) {
+    let db = Pigeonhole::open(path, Options::default().shards(1).pin_threads(false)).unwrap();
     let t = db
         .table("t")
         .unwrap()
@@ -256,7 +262,6 @@ fn sample(dir: &TempDir) -> PathBuf {
     }
     db.flush().unwrap();
     db.close().unwrap();
-    path
 }
 
 /// Run by the child process: about 700 KiB of log in 256 KiB WAL segments, no flush, then
@@ -271,7 +276,11 @@ fn fixture_crash_child() {
         Options::default()
             .shards(1)
             .pin_threads(false)
-            .wal_segment_size(256 << 10),
+            .wal_segment_size(256 << 10)
+            // A process crash keeps what was handed to the kernel; an fsync per commit
+            // (the default) adds nothing a process crash shows and costs minutes on
+            // Windows CI.
+            .durability(Durability::Buffered),
     )
     .unwrap();
     let t = db
@@ -290,21 +299,28 @@ fn fixture_crash_child() {
     std::process::exit(0);
 }
 
-/// A crashed database with a WAL of several segments.
+/// A crashed database: `fixture_crash_child` run in a child process (once per test binary, each
+/// caller getting a copy).
 fn crashed(dir: &TempDir) -> PathBuf {
-    let path = dir.path().join("crashed.phdb");
-    let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "fixture_crash_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(CHILD, &path)
-        .status()
-        .unwrap();
-    assert!(status.success());
-    path
+    static TEMPLATE: OnceLock<PathBuf> = OnceLock::new();
+    fixture(
+        &TEMPLATE,
+        "crashed.phdb",
+        |path| {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "fixture_crash_child",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        },
+        dir,
+    )
 }
 
 fn wal_path(db: &Path) -> PathBuf {
