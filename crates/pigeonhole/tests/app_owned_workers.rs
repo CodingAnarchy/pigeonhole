@@ -5,7 +5,7 @@
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use pigeonhole::{Family, Options, Pigeonhole, Shard};
+use pigeonhole::{EngineMetrics, Family, Options, Pigeonhole, Shard};
 
 /// A temporary directory, removed on drop.
 struct TempDir(std::path::PathBuf);
@@ -63,6 +63,12 @@ fn drive(mut shard: Shard) -> JoinHandle<pigeonhole::Result<()>> {
     })
 }
 
+/// Tasks the shards took back from the workers' queue so far (D284): after 10 ms unlooked-at,
+/// or from a room wait. A task can be taken back more than once.
+fn take_backs(m: &EngineMetrics) -> u64 {
+    m.background_fallback_take_backs + m.background_room_take_backs
+}
+
 #[test]
 fn flushes_run_on_spawned_worker_threads_and_the_close_ends_them() {
     let _watchdog = Watchdog::new("spawned workers", 120);
@@ -82,22 +88,33 @@ fn flushes_run_on_spawned_worker_threads_and_the_close_ends_them() {
         .family("f", Family::default())
         .create_if_missing()
         .unwrap();
-    for round in 0..3u32 {
+    // Take-backs are allowed (a loaded runner can leave a worker thread unscheduled for the
+    // shards' 10 ms fallback); a round whose flushes took nothing back shows the workers ran
+    // them. At least three rounds, then until such a round, at most 100.
+    let mut before = db.engine_metrics();
+    let mut rounds = 0u32;
+    let ran_on_workers = loop {
         for i in 0..200u32 {
-            let row = (round * 1000 + i).to_be_bytes();
+            let row = (rounds * 1000 + i).to_be_bytes();
             t.mutate(&row).put("f", b"q", &[7; 64]).commit().unwrap();
         }
         db.flush().unwrap();
-    }
-    let m = db.engine_metrics();
-    assert!(m.flushes >= 3, "every round flushed: {}", m.flushes);
-    assert_eq!(
-        (
-            m.background_fallback_take_backs,
-            m.background_room_take_backs
-        ),
-        (0, 0),
-        "the workers are driven, so the shards took nothing back"
+        rounds += 1;
+        let m = db.engine_metrics();
+        assert!(m.flushes > before.flushes, "every round flushed: {m:?}");
+        let clean = take_backs(&m) == take_backs(&before);
+        if rounds >= 3 && clean {
+            break true;
+        }
+        if rounds == 100 {
+            break false;
+        }
+        before = m;
+    };
+    assert!(
+        ran_on_workers,
+        "the shards took back work in each of {rounds} rounds: {:?}",
+        db.engine_metrics()
     );
     assert_eq!(
         t.get(&5u32.to_be_bytes(), "f", b"q")
@@ -162,9 +179,8 @@ fn a_worker_driven_by_hand_runs_until_the_close() {
     let options = Options::default().shards(1).background_workers(1);
     let mut owned = Pigeonhole::open_application_owned(dir.0.join("db.phdb"), options).unwrap();
     let mut worker = owned.workers.pop().unwrap();
-    // The commit below waits until the driver has its wakeup set and made a pass: work
-    // queued before that wakes nobody, and on a loaded runner the thread can start more
-    // than the 10 ms after which the shards take queued work back (Windows CI on #1010).
+    // The commits below wait until the driver has its wakeup set and made a pass: work
+    // queued before that wakes nobody.
     let (ready_tx, ready) = std::sync::mpsc::channel();
     let driver = thread::spawn(move || {
         let me = thread::current();
@@ -194,11 +210,42 @@ fn a_worker_driven_by_hand_runs_until_the_close() {
         .family("f", Family::default())
         .create_if_missing()
         .unwrap();
-    t.mutate(b"row").put("f", b"q", b"v").commit().unwrap();
-    db.flush().unwrap();
-    assert_eq!(db.engine_metrics().background_fallback_take_backs, 0);
+    // Each flush is a task on the workers' queue: the worker runs it, or the shard takes it
+    // back (after 10 ms unlooked-at, or from a room wait; a task can be taken back more than
+    // once) and runs it itself. Take-backs are allowed, since a loaded runner (Windows CI)
+    // can leave the driver unscheduled for 10 ms; a round whose flush took nothing back
+    // shows the worker ran it.
+    let mut before = db.engine_metrics();
+    let mut rounds = 0u32;
+    let ran_on_worker = loop {
+        t.mutate(&rounds.to_be_bytes())
+            .put("f", b"q", b"v")
+            .commit()
+            .unwrap();
+        db.flush().unwrap();
+        rounds += 1;
+        let m = db.engine_metrics();
+        assert!(m.flushes > before.flushes, "every round flushed: {m:?}");
+        if take_backs(&m) == take_backs(&before) {
+            break true;
+        }
+        if rounds == 100 {
+            break false;
+        }
+        before = m;
+    };
+    assert!(
+        ran_on_worker,
+        "the shard took back work in each of {rounds} rounds: {:?}",
+        db.engine_metrics()
+    );
+    for round in 0..rounds {
+        let cell = t.get(&round.to_be_bytes(), "f", b"q").unwrap().unwrap();
+        assert_eq!(cell.value(), b"v");
+    }
     drop(t);
     db.close().unwrap();
+    // The close ended the driver's loop: the worker has nothing left to run.
     driver.join().unwrap();
     for shard in shards {
         shard.join().unwrap().unwrap();
