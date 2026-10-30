@@ -725,7 +725,7 @@ SparseWide a4e056fa586848e5 936df031cc1d8e38
 TimeSeriesTtl fd1a186352eb86bb 0bb70d72b5ec0363
 Adjacency 5f5788f059265648 7237dc50bec2e2fb
 SkewedMultiShard 49961b1ebf3a8d4e aba46d4bc9e3fe1b
-GroupCommit 963c2845c35a1a66 7bac988cb70e7465
+GroupCommit 11d92692cf715458 690344348ad2a93f
 CrossShardContention 2cb9190fe23af4c5 ee77c195e12e80d1
 Counters 0a85bb597758c85a 93cbeb7646b9a4a6
 Transfer ce5a1aa63651f0d6 d4823e0372c4ed1e
@@ -821,8 +821,12 @@ TimeSeriesRange fd1a186352eb86bb 799106b6cb9985b0
             assert!(rows.contains(row), "seed 7");
             touched.insert(row.clone());
         }
-        // Uniform: 2,000 commits over 1,000 rows touch most of them.
-        assert!(touched.len() > 800, "seed 7: {} rows", touched.len());
+        // Uniform: 2,000 commits touch most of the loaded rows.
+        assert!(
+            touched.len() > rows.len() * 8 / 10,
+            "seed 7: {} rows",
+            touched.len()
+        );
     }
 
     #[test]

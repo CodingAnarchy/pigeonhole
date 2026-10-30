@@ -227,6 +227,39 @@ pub struct WorkloadConfig {
     /// the wall clock when the [`Workload`] is created; set it to make the generated
     /// operations identical across runs.
     pub epoch_micros: u64,
+    /// How long the settle and warmup steps wait for quiet: [`QuietWindows::GATE`] for every
+    /// preset but [`WorkloadConfig::smoke`]'s.
+    pub quiet: QuietWindows,
+}
+
+/// How long a run's settle step (D233, D243) and warmup (D242) wait for the store to stay
+/// quiet. The gate and every full or small run use [`QuietWindows::GATE`]; only
+/// `--scale smoke` (the CI unit tests) uses [`QuietWindows::SMOKE`], whose few thousand
+/// operations measure nothing and would otherwise spend most of their time waiting (#1156).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QuietWindows {
+    /// The settle step's quiet time, before and after the warmup.
+    pub settle: Duration,
+    /// The warmup's placement quiet time.
+    pub warmup: Duration,
+    /// The warmup's placement quiet time after a durability switch.
+    pub warmup_after_switch: Duration,
+}
+
+impl QuietWindows {
+    /// D233, D242, D243's windows: [`SETTLE_QUIET`], [`WARMUP_SETTLED`] and
+    /// [`WARMUP_SETTLED_AFTER_SWITCH`].
+    pub const GATE: Self = Self {
+        settle: SETTLE_QUIET,
+        warmup: WARMUP_SETTLED,
+        warmup_after_switch: WARMUP_SETTLED_AFTER_SWITCH,
+    };
+    /// A tenth of the gate's, for `--scale smoke`.
+    pub const SMOKE: Self = Self {
+        settle: Duration::from_millis(100),
+        warmup: Duration::from_millis(200),
+        warmup_after_switch: Duration::from_millis(500),
+    };
 }
 
 impl WorkloadConfig {
@@ -238,7 +271,13 @@ impl WorkloadConfig {
         Self {
             kind,
             seed: 0x5EED,
-            records: 1_000,
+            // Group commit loads its rows one durable commit each (an fsync apiece): 128 keep
+            // a smoke run's load in a few hundred milliseconds instead of seconds (#1156).
+            records: if kind == WorkloadKind::GroupCommit {
+                128
+            } else {
+                1_000
+            },
             operations: 2_000,
             value_len: 100,
             threads: match kind {
@@ -250,6 +289,7 @@ impl WorkloadConfig {
                 _ => 1,
             },
             epoch_micros: 0,
+            quiet: QuietWindows::SMOKE,
         }
     }
 
@@ -280,6 +320,7 @@ impl WorkloadConfig {
                 _ => 1,
             },
             epoch_micros: 0,
+            quiet: QuietWindows::GATE,
         }
     }
 
@@ -1182,7 +1223,7 @@ fn measure(
     }
     let load = load_start.elapsed();
     runner.mark_phase("settle");
-    let settled = settle(runner)?;
+    let settled = settle_within(runner, config.quiet.settle, SETTLE_BOUND)?;
     let switched = runner.measured_durability()?;
 
     let threads = config.threads.max(1);
@@ -1209,9 +1250,9 @@ fn measure(
     // D242, D247: after a durability switch packing re-places the tablets over 30-40 s, one
     // move per dwell with gaps longer than the usual quiet window, so the warmup waits longer.
     let (quiet, cap) = if switched {
-        (WARMUP_SETTLED_AFTER_SWITCH, WARMUP_CAP_AFTER_SWITCH)
+        (config.quiet.warmup_after_switch, WARMUP_CAP_AFTER_SWITCH)
     } else {
-        (WARMUP_SETTLED, WARMUP_CAP)
+        (config.quiet.warmup, WARMUP_CAP)
     };
     runner.mark_phase("warmup");
     let mut warmed = warm_up(runner, &mut clients, &warm, quiet, cap)?;
@@ -1222,7 +1263,7 @@ fn measure(
     // across the 10-26 and 10-28 gates. A flush inside the measured phase now lands at the
     // same operation in both runs of a pair.
     runner.mark_phase("warmup-settle");
-    warmed.settle_after = Some(settle(runner)?);
+    warmed.settle_after = Some(settle_within(runner, config.quiet.settle, SETTLE_BOUND)?);
 
     // The measured operations: the configured count, then, while less than `min_measured`
     // has been measured, the stream's next operations, about enough for the rest at the rate
