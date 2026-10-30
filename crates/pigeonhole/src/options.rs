@@ -67,6 +67,7 @@ pub struct Options {
     write_stall_timeout: Option<Duration>,
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
+    shard_spin_cap: Option<Duration>,
     shard_threads: Option<usize>,
     adaptive_shard_threads: bool,
     background_workers: usize,
@@ -219,6 +220,7 @@ impl Default for Options {
             write_stall_timeout: None,
             commit_spin: None,
             shard_spin: None,
+            shard_spin_cap: None,
             shard_threads: None,
             adaptive_shard_threads: true,
             background_workers: 0,
@@ -443,6 +445,20 @@ impl Options {
     #[doc(hidden)]
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
+        self
+    }
+
+    /// A test and bench hook (#1176), only with the `__unstable-hooks` feature and outside
+    /// the API.
+    ///
+    /// Sizes each shard thread's poll from its recent idle gaps, up to `cap`: the longest
+    /// poll whose expected cost per gap is no more than the [`shard_spin`](Self::shard_spin)
+    /// window's could be. A cap at or under that window keeps the window fixed (the
+    /// default).
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
+    pub fn shard_spin_cap(mut self, cap: Duration) -> Self {
+        self.shard_spin_cap = Some(cap);
         self
     }
 
@@ -1328,6 +1344,9 @@ impl Options {
         // An explicit window wins over the profile's (D198, amended 2026-10-30).
         if let Some(window) = self.shard_spin.or(shard_spin_default(self.cpu_profile)) {
             o.shard_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
+        }
+        if let Some(cap) = self.shard_spin_cap {
+            o.shard_spin_cap_nanos = u64::try_from(cap.as_nanos()).unwrap_or(u64::MAX);
         }
         if let Some(timeout) = self.write_stall_timeout {
             o.write_stall_timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
