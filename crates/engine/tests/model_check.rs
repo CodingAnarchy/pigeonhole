@@ -634,13 +634,22 @@ fn acknowledged_commits_resolved_beside_a_crash_are_checked() {
     cfg.crash_ppm = 100_000;
     cfg.mid_commit_crash_ppm = 100_000;
     cfg.tasks = 8;
+    // Per PR, seeds 1..=20: about one seed in ten reaches the case, and 5 of these do here
+    // (4, 10, 15, 16, 18) and 4 under `counters` (3, 6, 12, 13). A sweep sets
+    // `PIGEONHOLE_SEEDS` and runs its own range instead (3 to 11 seeds of each 50 reach it,
+    // over seeds 1..=300), so it adds new seeds rather than repeating these; it reports how
+    // many reached the case but doesn't require one, since a short range may hold none.
+    let swept = std::env::var("PIGEONHOLE_SEEDS").is_ok();
+    let seeds = if swept { seeds() } else { (1..=20).collect() };
     let mut reached = 0;
-    for seed in 1..=200u64 {
-        let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
+    for &seed in &seeds {
+        let stats = run(seed, &cfg).unwrap_or_else(|f| panic!("seed {seed}: {f}"));
         reached += stats.crash_poll_acked;
     }
+    let (first, last) = (seeds.first().unwrap_or(&0), seeds.last().unwrap_or(&0));
+    eprintln!("{reached} acknowledged commits resolved beside a crash over seeds {first}..={last}");
     assert!(
-        reached > 0,
+        swept || reached > 0,
         "no seed resolved an acknowledged commit beside a crash"
     );
 }
