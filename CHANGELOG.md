@@ -12,7 +12,7 @@ Pigeonhole 1.0.0 is the first stable release of an embedded, single-file, wide-c
 - **Engine:** transactions you can run and retry in one call, reader processes with their own row cache, automatic recovery in place, background workers for application-owned mode, and a load controller that sizes the shard threads.
 - **Performance:** most of the contended gaps the Phase 3 gate found are closed.
 
-The release gate ran on the reference machine (Hetzner AX102) on 2026-10-30 at `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0): the Phase 2 floors hold and every workload is within 1.5× of RocksDB, with the remaining gaps documented in [`docs/status.md`](docs/status.md).
+The release gate ran on the reference machine, a Hetzner AX102, on 2026-10-30 at `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0). It found no regression against the Phase 4 gate of 2026-10-29, and no FAIL that isn't a known, accepted gap. The gaps 1.0 ships with are listed in [`docs/status.md`](docs/status.md).
 
 ### Upgrading from 0.3.x
 - **Back up before the first writable open.** 1.0 writes **file format 4**, the format every 1.x release reads and writes (D269). A writable open upgrades a 0.x file in place, and then 0.3.x (and any earlier release) refuses it with `UnsupportedFormat`. The upgrade is one-way: take a `backup` (or copy the closed file) first if you may need to roll back. A read-only open never upgrades (reader processes, and `read_only_fallback`). 1.0 opens every file written by 0.1.0 or later.
@@ -24,7 +24,7 @@ The release gate ran on the reference machine (Hetzner AX102) on 2026-10-30 at `
   - **Exact pins:** `pigeonhole` pins its internal crates exactly (`=`). Depend on `pigeonhole`, not on `pigeonhole-engine` and the other internal crates.
   - **The `tokio` feature is gone** (owner, 2026-10-28). It gated no code and only turned on `async`, which is on by default. Drop `features = ["tokio"]` from your `Cargo.toml`, or name `async`.
   - **Tuning hooks moved out of the API (ICR 0085).**
-    - `Options::commit_spin`, `shard_spin`, `tablet_changes` and `tablet_packing` are gone from the public API, along with the hidden test hooks. They now exist only behind a test feature that applications don't use. Drop these calls: the spin windows keep their defaults (50 and 200 µs), and tablet changes and packing are always on.
+    - `Options::commit_spin`, `shard_spin`, `tablet_changes` and `tablet_packing` are gone from the public API, along with the hidden test hooks. They now exist only behind a test feature that applications don't use. Drop these calls: the spin windows keep their defaults (50 and 200 µs; the shard spin is 1 ms under `CpuProfile::Server`), and tablet changes and packing are always on.
     - `Options::adaptive_shard_threads` stays public (#1082); see the behaviour changes below.
     - `Options::allow_unregistered_merge_operators` is removed; use `read_only_fallback`.
     - The library no longer reads the `PIGEONHOLE_IO` and `PIGEONHOLE_DIRECT` test variables: set `io_backend` and `direct_io` instead.

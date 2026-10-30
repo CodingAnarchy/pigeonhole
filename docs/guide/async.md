@@ -123,18 +123,18 @@ for i in 0..100u32 {
 ```
 
 ## Throughput against blocking calls
-Async calls let a few threads keep many operations in flight. Measured on the reference machine in the 2026-10-29 gate (main cba09184; AMD Ryzen 9 7950X3D, 16 cores and 32 hardware threads, NVMe, Linux 6.8), YCSB over 1 million rows with a 256 MiB block cache, at the default durability (`Durability::GroupSync`) and at `Durability::Buffered`. "Async" is 16 client threads with 16 operations in flight each:
+Async calls let a few threads keep many operations in flight. Measured on the reference machine in the 1.0 release gate of 2026-10-30 (main 790ae3a0; AMD Ryzen 9 7950X3D, 16 cores and 32 hardware threads, NVMe, Linux 6.8), YCSB over 1 million rows with a 256 MiB block cache, at the default durability (`Durability::GroupSync`) and at `Durability::Buffered`. "Async" is 16 client threads with 16 operations in flight each:
 
 | Workload, durability | Async, 16 threads | Blocking, 16 threads | Blocking, 256 threads |
 |---|--:|--:|--:|
-| YCSB C (all reads), `GroupSync` | 2.41M ops/s, p99 135 µs | 2.37M ops/s, p99 27 µs | 3.29M ops/s, p99 1.64 ms |
-| YCSB C, `Buffered` | 2.34M ops/s, p99 141 µs | 2.26M ops/s, p99 27 µs | 3.23M ops/s, p99 1.67 ms |
-| YCSB A (50% updates), `GroupSync` | 1.52M ops/s, p99 496 µs | 0.49M ops/s, p99 98 µs | 1.47M ops/s, p99 827 µs |
-| YCSB A, `Buffered` | 1.67M ops/s, p99 479 µs | 1.46M ops/s, p99 39 µs | 1.69M ops/s, p99 836 µs |
+| YCSB C (all reads), `GroupSync` | 2.52M ops/s, p99 134 µs | 2.46M ops/s, p99 25 µs | 3.40M ops/s, p99 1.62 ms |
+| YCSB C, `Buffered` | 2.42M ops/s, p99 139 µs | 2.42M ops/s, p99 26 µs | 3.29M ops/s, p99 1.66 ms |
+| YCSB A (50% updates), `GroupSync` | 1.55M ops/s, p99 467 µs | 0.49M ops/s, p99 98 µs | 1.50M ops/s, p99 819 µs |
+| YCSB A, `Buffered` | 1.62M ops/s, p99 465 µs | 1.55M ops/s, p99 34 µs | 1.77M ops/s, p99 795 µs |
 
-- **On the same threads,** async does 1.02–1.14× the blocking calls' operations per second, and 3.1× on YCSB A at `GroupSync`, where each blocking thread waits out its commit's fsync. Each async thread keeps working while its reads and commits are in flight.
-- **Against 256 blocking threads,** async does 0.72–0.73× on YCSB C and 0.99–1.03× on YCSB A. 256 blocking threads keep all 32 hardware threads busy, and 16 async threads use at most 16 of them. That is a difference in threads, not an async overhead: an async read costs less CPU than a blocking one. To use the whole machine with async calls, run more client threads, one per hardware thread for example.
-- **Latency:** an async operation waits behind the other operations in flight on its thread, so its p99 (135–496 µs) is above that of 16 blocking threads with one operation each (27–98 µs), and well below that of 256 blocking threads with the same number in flight (0.83–1.67 ms).
+- **On the same threads,** async does 1.00–1.05× the blocking calls' operations per second, and 3.2× on YCSB A at `GroupSync`, where each blocking thread waits out its commit's fsync. Each async thread keeps working while its reads and commits are in flight.
+- **Against 256 blocking threads,** async does 0.74× on YCSB C and 0.92–1.03× on YCSB A. 256 blocking threads keep all 32 hardware threads busy, and 16 async threads use at most 16 of them. That is a difference in threads, not an async overhead: an async read costs less CPU than a blocking one. To use the whole machine with async calls, run more client threads, one per hardware thread for example.
+- **Latency:** an async operation waits behind the other operations in flight on its thread, so its p99 (134–467 µs) is above that of 16 blocking threads with one operation each (25–98 µs), and well below that of 256 blocking threads with the same number in flight (0.80–1.66 ms).
 
 ## When an async read blocks
 A few rare cases still read synchronously, inside the future or, for a read whose other blocks are cached, inside the `get_async` or `read_async` call itself. Each one is counted in `engine_metrics().async_sync_reads` (in a reader process, `PigeonholeReader::async_sync_reads()`), so you can see whether your workload hits them:
