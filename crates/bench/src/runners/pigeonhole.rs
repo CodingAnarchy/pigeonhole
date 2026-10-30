@@ -49,7 +49,7 @@ pub(crate) struct Settings {
     /// `None`: the library default.
     pub(crate) shard_spin_micros: Option<u64>,
     /// The cap of a shard's adaptive idle spin (`Options::shard_spin_cap`, #1176), in
-    /// microseconds; `None`: the library default (a fixed window).
+    /// microseconds; `None`: the library default.
     pub(crate) shard_spin_cap_micros: Option<u64>,
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
@@ -451,10 +451,13 @@ impl PigeonholeRunner {
     }
 
     /// The cap of a shard's adaptive idle spin, in microseconds (`Options::shard_spin_cap`,
-    /// #1176); the library default (a fixed window) when not set.
+    /// #1176); the library default when not set (1 ms under `CpuProfile::Embedded`, a fixed
+    /// window under `Server` or with [`shard_spin_micros`](Self::shard_spin_micros)).
     ///
     /// ```
-    /// use pigeonhole_bench::runners::pigeonhole::PigeonholeRunner;
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("shard_spin_cap"));
     /// let r = PigeonholeRunner::default().shard_spin_cap_micros(1000);
     /// assert!(r.describe().contains(" shard_spin_cap=1000us"));
     /// ```

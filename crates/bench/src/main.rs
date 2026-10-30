@@ -152,7 +152,9 @@ OPTIONS:
                            [default: the library's]
     --shard-spin-cap US    Pigeonhole: size each shard thread's idle spin from its recent
                            gaps, up to US µs, at no more poll per gap than --shard-spin's
-                           window (#1176) [default: off, the window is fixed]
+                           window (#1176) [default: the library's: 1 ms under the
+                           Embedded profile; none, a fixed window, with --shard-spin
+                           or --server-profile]
     --shard-threads K      Pigeonhole: run the shards on K threads (D289)
                            [default: the library's CPU budget]
     --background-workers N Pigeonhole, application-owned (app-owned, scaling): N background
