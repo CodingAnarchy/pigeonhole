@@ -65,6 +65,16 @@ Several agents often build and test on one machine, so local runs stay small:
   - engine `tablets` with `PIGEONHOLE_DEFERRED_IO=1`.
 
   The `tablets` sweep is the only standard sweep that crashes around tablet changes and new streams with the device's completion order shuffled. It found #520 (D211), which the others missed. The `counters` sweep is the only one with counter-kind families, the only families D186/D287 combining and D291 checkpoints touch. Nobody ran it until perf287's long sweeps of 2026-10-28 found a live-read failure there.
+- **Long sweeps for proptests with a small per-PR case count.** CI runs each property at its own case count (`ProptestConfig::with_cases`, or 256 by default). A few costly ones ask for fewer, and get more cases here, with fresh random inputs in each chunk (6 chunks of 2,000 cases each; these targets don't read `PIGEONHOLE_SEED`):
+  ```sh
+  gh workflow run sweep.yml --ref <branch> -f package=pigeonhole -f test=inplace_reads \
+    -f first=1 -f count=6 -f chunks=6 -f env="PROPTEST_CASES=2000"
+  gh workflow run sweep.yml --ref <branch> -f package=pigeonhole-compaction -f test=compaction \
+    -f first=1 -f count=6 -f chunks=6 -f env="PROPTEST_CASES=2000"
+  gh workflow run sweep.yml --ref <branch> -f package=pigeonhole-compaction -f test=picker \
+    -f first=1 -f count=6 -f chunks=6 -f env="PROPTEST_CASES=2000"
+  ```
+  `PROPTEST_CASES` overrides every property's own count in the target, so don't set it in CI's environment.
 - Whoever dispatches a sweep watches it to completion and reports the result.
 - Agent worktrees carry an untracked `.cargo/config.toml` that caps build jobs and test threads; don't override it.
 - Build through [`cargo-quota`](https://crates.io/crates/cargo-quota) (`cargo install cargo-quota`): `cargo quota build`, `cargo quota test`, and so on, or a shell wrapper that routes them. It prunes the least recently used build artifacts before each build, keeping every worktree's `target/` together under the budget in `[workspace.metadata.quota]` (2% of the disk, shared across worktrees). `cargo quota status` shows where things stand. Plain `cargo` still works; the next `cargo quota` run catches up.
