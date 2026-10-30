@@ -993,23 +993,9 @@ impl Runner for PigeonholeRunner {
     }
 
     fn shard_shares(&self) -> Vec<ShardShare> {
-        self.open.as_ref().map_or_else(Vec::new, |o| {
-            o.target
-                .db
-                .shard_stats()
-                .into_iter()
-                .map(|s| ShardShare {
-                    commits: s.commits,
-                    tablets_start: s.tablets,
-                    tablets_end: s.tablets,
-                    splits: s.splits,
-                    merges: s.merges,
-                    moves: s.moves,
-                    busy_nanos: s.busy_nanos,
-                    commit_inflight_nanos: s.commit_inflight_nanos,
-                })
-                .collect()
-        })
+        self.open
+            .as_ref()
+            .map_or_else(Vec::new, |o| shard_shares(&o.target.db))
     }
 
     fn stalls(&self) -> Option<crate::Stalls> {
@@ -1699,6 +1685,24 @@ fn report_nowait_reads(db: &Pigeonhole) {
         n.breaks,
         n.miss_buckets,
     );
+}
+
+/// Each shard's cumulative counters as a [`ShardShare`], for [`ShardShare::between`] to
+/// subtract.
+pub(crate) fn shard_shares(db: &Pigeonhole) -> Vec<ShardShare> {
+    db.shard_stats()
+        .into_iter()
+        .map(|s| ShardShare {
+            commits: s.commits,
+            tablets_start: s.tablets,
+            tablets_end: s.tablets,
+            splits: s.splits,
+            merges: s.merges,
+            moves: s.moves,
+            busy_nanos: s.busy_nanos,
+            commit_inflight_nanos: s.commit_inflight_nanos,
+        })
+        .collect()
 }
 
 /// The engine's cumulative stall and visibility counters ([`crate::Stalls`], ICR 0015,
