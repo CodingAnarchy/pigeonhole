@@ -226,6 +226,43 @@ impl Client for Conn {
     }
 }
 
+/// Column `i` of a result row, as the blob it holds.
+fn blob<'r>(r: &'r rusqlite::Row<'_>, i: usize) -> Result<&'r [u8], String> {
+    r.get_ref(i)
+        .map_err(|e| e.to_string())?
+        .as_blob()
+        .map_err(|e| e.to_string())
+}
+
+/// A scan's row limit over cells ordered by row: admits every cell of the first `len` rows.
+struct RowLimit {
+    len: u32,
+    seen: u32,
+    current: Option<Vec<u8>>,
+}
+
+impl RowLimit {
+    fn new(len: u32) -> RowLimit {
+        RowLimit {
+            len,
+            seen: 0,
+            current: None,
+        }
+    }
+
+    /// Whether a cell of row `key` is inside the limit; `false` at the first cell past it.
+    fn admit(&mut self, key: &[u8]) -> bool {
+        if self.current.as_deref() != Some(key) {
+            if self.seen == self.len {
+                return false;
+            }
+            self.seen += 1;
+            self.current = Some(key.to_vec());
+        }
+        true
+    }
+}
+
 impl Conn {
     /// One transaction of cells of one row, all stamped `ts`.
     fn put(
@@ -274,12 +311,7 @@ impl Conn {
                     .query(params![row, family, qualifier, live])
                     .map_err(e)?;
                 if let Some(r) = rows.next().map_err(e)? {
-                    t.cell(
-                        r.get_ref(0)
-                            .map_err(e)?
-                            .as_blob()
-                            .map_err(|e| e.to_string())?,
-                    );
+                    t.cell(blob(r, 0)?);
                 }
             }
             BenchOp::GetRow { row, family } => {
@@ -287,12 +319,7 @@ impl Conn {
                 let live = oldest_live(family, now_micros());
                 let mut rows = stmt.query(params![row, family, live]).map_err(e)?;
                 while let Some(r) = rows.next().map_err(e)? {
-                    t.cell(
-                        r.get_ref(0)
-                            .map_err(e)?
-                            .as_blob()
-                            .map_err(|e| e.to_string())?,
-                    );
+                    t.cell(blob(r, 0)?);
                 }
             }
             BenchOp::Put { row, family, cells } => {
@@ -392,27 +419,12 @@ impl Conn {
                 let mut stmt = self.0.prepare_cached(SCAN).map_err(e)?;
                 let live = oldest_live(METRIC_FAMILY, now_micros());
                 let mut rows = stmt.query(params![start, live, METRIC_FAMILY]).map_err(e)?;
-                let mut seen = 0u32;
-                let mut current: Option<Vec<u8>> = None;
+                let mut limit = RowLimit::new(*len);
                 while let Some(r) = rows.next().map_err(e)? {
-                    let key = r
-                        .get_ref(0)
-                        .map_err(e)?
-                        .as_blob()
-                        .map_err(|e| e.to_string())?;
-                    if current.as_deref() != Some(key) {
-                        if seen == *len {
-                            break;
-                        }
-                        seen += 1;
-                        current = Some(key.to_vec());
+                    if !limit.admit(blob(r, 0)?) {
+                        break;
                     }
-                    t.cell(
-                        r.get_ref(1)
-                            .map_err(e)?
-                            .as_blob()
-                            .map_err(|e| e.to_string())?,
-                    );
+                    t.cell(blob(r, 1)?);
                 }
             }
             BenchOp::ScanFiltered {
@@ -429,29 +441,18 @@ impl Conn {
                 let mut rows = stmt
                     .query(params![start, family, live, ts(a), ts(b)])
                     .map_err(e)?;
-                let (mut seen, mut current): (u32, Option<Vec<u8>>) = (0, None);
+                let mut limit = RowLimit::new(*len);
                 while let Some(r) = rows.next().map_err(e)? {
-                    let blob = |i: usize| -> Result<&[u8], String> {
-                        r.get_ref(i)
-                            .map_err(e)?
-                            .as_blob()
-                            .map_err(|e| e.to_string())
-                    };
                     if qualifier_prefix
                         .as_deref()
-                        .is_some_and(|q| !blob(1).is_ok_and(|v| v.starts_with(q)))
+                        .is_some_and(|q| !blob(r, 1).is_ok_and(|v| v.starts_with(q)))
                     {
                         continue;
                     }
-                    let key = blob(0)?;
-                    if current.as_deref() != Some(key) {
-                        if seen == *len {
-                            break;
-                        }
-                        seen += 1;
-                        current = Some(key.to_vec());
+                    if !limit.admit(blob(r, 0)?) {
+                        break;
                     }
-                    t.cell(blob(2)?);
+                    t.cell(blob(r, 2)?);
                 }
             }
             BenchOp::ReadModifyWrite { row, qualifier } => {
@@ -491,6 +492,16 @@ impl Conn {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn row_limit_admits_every_cell_of_the_first_len_rows_and_stops_at_the_next() {
+        let cells: [&[u8]; 6] = [b"a", b"a", b"b", b"c", b"c", b"d"];
+        let mut limit = RowLimit::new(2);
+        let admitted = cells.iter().take_while(|k| limit.admit(k)).count();
+        assert_eq!(admitted, 3, "a, a, b; stops at c");
+        let mut none = RowLimit::new(0);
+        assert!(!none.admit(b"a"));
+    }
 
     #[test]
     fn total_cache_model_splits_the_page_cache_across_connections() {
