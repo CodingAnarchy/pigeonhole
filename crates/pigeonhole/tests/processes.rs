@@ -583,8 +583,13 @@ fn a_scan_held_across_a_writer_restart_fails_expired() {
     // A new writer rewrites the file under the scan: deletes, compacts, writes anew.
     let db = Pigeonhole::open(dir.db(), writer_options()).unwrap();
     let t = table(&db);
+    // Buffered, as `put` writes: the scan's expiry, not durability, is under test.
     for i in 0..3000 {
-        t.mutate(&key(i)).delete_row().commit().unwrap();
+        t.mutate(&key(i))
+            .delete_row()
+            .durability(Durability::Buffered)
+            .commit()
+            .unwrap();
     }
     db.flush().unwrap();
     db.compact().unwrap();
