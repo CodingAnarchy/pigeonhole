@@ -211,7 +211,7 @@ The review of #90 (3-4 4.3) found two gaps in network-filesystem detection.
 **Interim behavior:**
 - Linux treats FUSE (`0x65735546`) and GPFS (`0x47504653`) as non-local. That includes local FUSE filesystems such as ntfs-3g, which are refused until an explicit opt-in exists. None is planned; it is a follow-up if anyone asks.
 - `Engine::open` checks `is_local` (a read-only `fstatfs`) before `WriterLock::acquire`. D37 orders the presence lock and shared memory, not this check. Reader processes already checked first.
-- Regression test: `engine/tests/network_fs.rs` uses a VFS whose files are remote and whose locks fail like `ENOLCK`.
+- Regression test: `engine/tests/it/network_fs.rs` uses a VFS whose files are remote and whose locks fail like `ENOLCK`.
 
 **Coordinator:** confirmed as the safe default. Refusing *local* FUSE filesystems too (ntfs-3g, encrypted home directories such as gocryptfs) is flagged to the owner; an opt-in for trusted local FUSE mounts is the likely follow-up if they want it.
 
@@ -250,7 +250,7 @@ D126's fallbacks for a clock that does not move (admit writers when no compactio
 - On a real clock, `ClockTimer` sleeps to its deadline and never gives up, and the runtime never wakes sleepers early on matching readings. Waits end by their timers and timeouts, as D124 and D161 describe for a moving clock.
 - On a simulated clock nothing changes: the poll count still detects a stopped clock, and D126, D161 and D171 apply as before.
 - Test wrappers around `SimVfs` forward the method; wrappers that substitute a real clock keep the default.
-- Regression test: `engine/tests/coarse_clock.rs` uses a real clock in 4 ms steps. A commit waiting for room that snapshots hold gets `Busy` only after the 300 ms stall timeout; with the old behavior it was refused after 1.6 ms.
+- Regression test: `engine/tests/it/coarse_clock.rs` uses a real clock in 4 ms steps. A commit waiting for room that snapshots hold gets `Busy` only after the 300 ms stall timeout; with the old behavior it was refused after 1.6 ms.
 
 **Coordinator:** confirmed; ICR 0012 (`Vfs::clock_is_simulated`, an additive provided method) approved on #267.
 
@@ -652,7 +652,7 @@ On the full sparse-wide gate (`--scale full`, back to back, load 3.0 → 1.5): P
    - **A snapshot pins its seqno before it loads the view.** `Engine::snapshot` reads the visible seqno and registers it under the live-seqno lock that `gc_snapshots` reads under (`SeqnoPin::pin_visible`), then loads the view. A GC that read the list earlier saw only inputs at or below that seqno, and one that reads it later keeps its versions. Before this, the pin was registered after the view loaded, so a snapshot could read its seqno through a view whose flush GC never saw it. Every flush drops history now, which makes that likely. `Engine::get_latest` takes no pin: it reads the visible seqno, loads the view, and uses them only if the visible seqno has not moved (then no flush in between had inputs above it). Otherwise it reads again, and after four tries it takes a pinned snapshot. Seqno before view is kept everywhere (blob visibility relies on it).
 
 **Tests.**
-- **`crates/engine/tests/flush_gc.rs`** (application-owned shard, SimVfs):
+- **`crates/engine/tests/it/flush_gc.rs`** (application-owned shard, SimVfs):
   - a snapshot taken before the flush still reads every version it saw, through the view the flush publishes;
   - an older SST's cell delete keeps the version it exposes;
   - a delete admitted while a guarded flush is in flight voids its purge (the review's scenario);

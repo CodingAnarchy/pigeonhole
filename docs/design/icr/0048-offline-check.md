@@ -69,7 +69,7 @@ It touches no commit, cross-shard (#724) or share-reporting (#777) code.
 
 ## Tests
 
-`crates/engine/tests/check.rs`, on the simulated filesystem:
+`crates/engine/tests/it/check.rs`, on the simulated filesystem:
 - A healthy database (plain and `deep`), and a crashed one with a WAL, check clean.
 - After a crashed one checks clean, it opens and recovers every commit, so the check changed nothing.
 - A live writer refuses the check, and a newer format version is refused with `UnsupportedFormat`.

@@ -410,7 +410,7 @@ What a pass forces is otherwise unchanged; the mixed-temperature harness gives m
 - **Interim defaults:** 1 on macOS, 2 elsewhere. They're an internal constant, with `PIGEONHOLE_GROUP_SYNC_DEPTH` (a measurement variable; 0 is unlimited, the behavior before D207) so the gate run on the reference machine (#405) can compare 1, 2 and unlimited. That run decides the default (#476), and the variable is then removed or becomes an option.
 
 **Checked by:**
-- **`engine/tests/group_sync_batch.rs`:** 16 clients committing one at a time with the platform's depth. The first *depth* groups each start a sync; the rest batch. No commit is acknowledged before a sync that covers it. There are *depth* + 1 syncs in all. Mutation-checked: without the batching, it fails.
+- **`engine/tests/it/group_sync_batch.rs`:** 16 clients committing one at a time with the platform's depth. The first *depth* groups each start a sync; the rest batch. No commit is acknowledged before a sync that covers it. There are *depth* + 1 syncs in all. Mutation-checked: without the batching, it fails.
 - **The crash sweeps:** `model_check` with and without deferred I/O, and the pigeonhole `model`. They're merge gates.
 
 <a id="d208"></a>
@@ -497,7 +497,7 @@ The engine's `admission` tests cover a commit larger than the bound. The blockin
   - *A recovery repair of stale checkpoints*: not needed while the invariant holds.
 
 **Checked by:**
-- `engine/tests/checkpoint_creation.rs`, deterministic, with the directory sync held:
+- `engine/tests/it/checkpoint_creation.rs`, deterministic, with the directory sync held:
   1. a fresh database's dropped-table rows make the stream's records unneeded;
   2. no checkpoint is committed;
   3. a power loss takes the stream file's name;
@@ -966,7 +966,7 @@ The hottest row alone takes 6.5% of the writes, so 1.25/N can't be met at 32 sha
 - `model_check` has a case for it (`settled_commits_trimmed_by_participants_survive_crashes`: 16 cross-shard commits in flight, frequent flushes, crashes between and inside commits, at 2–4 shards).
 - The same case runs a second loop with tablets splitting, merging and moving (`tablet_ops_ppm` 20 000, the fast balancer), where a moved slot or a retired tablet reads as flushed through the published catalog.
 - Telling participants before the shares are settled fails that case with `LostAckedCommit`. A tablet change that commits before the moving tablet's frozen memtables are flushed (the `frozen.is_empty()` wait in `progress_op` dropped) fails its tablet loop.
-- `engine/tests/close_crossed.rs` closes after concurrent cross-shard commits on real files, under a watchdog.
+- `engine/tests/it/close_crossed.rs` closes after concurrent cross-shard commits on real files, under a watchdog.
 
 *Amended by [D254](#d254): the reports and settlements go as `SharesFlushed { seqnos }` and `CommitsSettled { seqnos }`, one message per peer per pass, with the same rules.*
 
@@ -1911,7 +1911,7 @@ The remaining long shard turns are the flush install and its `ShareFlushed` mess
 **Tests:**
 - `runtime/tests/modes.rs` `pool_slices_count_to_the_spawning_shard` (a pool task's three 1 ms slices on the simulated clock show as shard 0's pool busy, none of shard 1's, and not as its turns) and `a_shard_counts_its_spin_before_parking` (after a handled message on the real clock, `spin_nanos` rises and `busy_nanos` keeps its meaning).
 - `engine/tests/tablets.rs` `pool_work_counts_toward_the_busy_sum` (packed onto one shard with every thread 10% busy, a pool term of 1.5 on it grows the active shards to three or more within 100 passes), `a_shard_kept_awake_by_its_clients_counts_as_busy` (four shards settled, each 5% in turns and 90% in its spin, hold at four through 150 passes and pack once the spin stops), `a_saturated_growth_holds_while_the_writes_go_on` (a thread-saturated growth's count holds through 100 passes at 5% busy and releases at a quarter of the write rate). Each fails with its term or the floor removed (mutations M20–M22 beside D255's).
-- Real counters, not the overrides (ctr274's review): `engine/tests/spin_pool_terms.rs` (engine-owned on real files with one compaction thread: after commits and a flush the balancer's published busy exceeds its turn-only fraction, read through the `shard_busy_terms` hook, and both counters are above zero; with the counter reads zeroed the two fractions are equal, mutation M23) and `pigeonhole/tests/api.rs` `spin_and_pool_time_are_counted_on_an_engine_owned_store` (the public `Metrics` and `ShardStats` carry both).
+- Real counters, not the overrides (ctr274's review): `engine/tests/it/spin_pool_terms.rs` (engine-owned on real files with one compaction thread: after commits and a flush the balancer's published busy exceeds its turn-only fraction, read through the `shard_busy_terms` hook, and both counters are above zero; with the counter reads zeroed the two fractions are equal, mutation M23) and `pigeonhole/tests/api.rs` `spin_and_pool_time_are_counted_on_an_engine_owned_store` (the public `Metrics` and `ShardStats` carry both).
 
 **Acceptance (AX102, perf2, on ea0b5c8e, 2026-10-15; the columns busy / pool / spin are each counter's rise over the measured phase divided by its length, in shards' worth):**
 - **No riders, buffered, 16 clients ×3:** 1,092–1,127K, p99 44–46 µs, p99.9 98–101 µs; moves 3 / 3 / 0 and splits 2 / 2 / 0 in the measured phase (build 7: 24–60 moves), 0 write stalls, all 16 shards active throughout: the drop and the regrowth are gone. Terms: turn 1.73–1.76, pool 0.21–0.23, spin 4.71–4.73, sum 6.68–6.69. The spin term reads 4.7 shards' worth, not 16: the idle spin backs off after misses, so the shards park about 70% of the time; 6.7 against the 0.81 before is what holds `k`. The put p99.9 is 108–112 µs (main 106; #730's builds 3–5 84–88 µs with the load packed onto 4–5 shards): with no moves to blame, a commit landing on a parked shard pays its wakeup at the tail, the trade this decision records showing where it does (#738, Phase 4). Reads flat at 90–93 µs.
@@ -2030,7 +2030,7 @@ Shard parks fell 650K → 98K at one client and 9.08M → 2.12M on no riders. co
 
 **Why:** gate 19 (5933e23e, `.coord/bench/results-20261019/`) measured contended ycsb-f at default durability (GroupSync) with Pigeonhole's p99 at 2.13× SQLite's (gate 18: 1.92×). The read side is a plain row read (p50 14.7 µs, p99 41 µs), and the run had no stalls, `Busy` retries or conflicts. The tail is the commit wait: read-modify-write minus its read was about 75 µs mean against a ycsb-a put's 59, and its p99 191 µs against 118. Under D91's row-level check, two read-modify-writes on one hot Zipfian row in one group put the second in the next group, behind the first group's sync, with every later single of the group, about one extra sync each. A local Linux repro (16 clients, scratch counters) deferred 6.4% of conditional commits at 16 shards and 11% at 4, where they were about 30% of the commits above p99. ycsb-f picks one of 10 fields, so about 90% of those overlaps were on another cell.
 
-**Tests:** `crates/engine/tests/conditional_groups.rs`, application-owned on one shard, one WAL sync per group:
+**Tests:** `crates/engine/tests/it/conditional_groups.rs`, application-owned on one shard, one WAL sync per group:
 - a predicate on another cell of a row the group wrote joins the group (one sync);
 - a predicate on the cell the group wrote waits, and `Exists` then holds (two syncs);
 - the same after a family delete and a row delete;
@@ -2123,7 +2123,7 @@ The owner first asked for per-type verdicts. On gate 2026-10-19's results these 
 - `crossing_commits_regressions_from_the_seed_sweep` (seed 277, fails with the abort wake) and `model_check.rs::harness_regressions_from_the_seed_sweep` (seeds 266, and 19, 88, 240 with deferred I/O; fails without the `Released`);
 - `blocking_waits.rs::singles_held_behind_a_share_end_closed_when_its_coordinator_panics` (the gate panics the coordinator's DECISION sync; hangs without the `Closed`);
 - the D142 sweeps, `cross_shard_commits_converge_on_a_frozen_clock`, `purge_race.rs` unmodified, and `model_check.rs` with a harness that pairs a PREPARE with its DECISION by id (`tests/common/mod.rs`: a decided commit's PREPAREs are rekeyed from id to `S` within the run that appended them, and an alias whose `S` a crash lost is reverted to the id, history included);
-- `crates/pager/tests/format_upgrade.rs`, `crates/engine/tests/format_upgrade.rs`: ICR 0046's upgrade;
+- `crates/pager/tests/format_upgrade.rs`, `crates/engine/tests/it/format_upgrade.rs`: ICR 0046's upgrade;
 - loom (`src/ts_order_loom.rs`): raise→reserve at the decision keeps every later-seqno single above `T`; the straddle and crossing decisions are reachable.
 
 <a id="d264"></a>
@@ -2550,7 +2550,7 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 **Tests:**
 - `memtable` unit tests: a bad tail (past the arena, misaligned, inside the header, at a height-0 node, at another column, backward) is `Corrupt`; reused chunks never show an earlier memtable's tails, with tails recorded or not. These run under Miri too.
 - The loom test of a skip with a concurrent writer, on the node field.
-- `engine/tests/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
+- `engine/tests/it/tail_index.rs`: D194's seeded equivalence, plus the same state read through a reader process (jumping and stepping equal, and equal to the writer's reads; the reader must jump).
 - `shm/tests/sim.rs`: a layout 3 region (and a newer one) is refused while other processes are attached, and rebuilt when the new writer is alone.
 
 <a id="d279"></a>
@@ -2569,7 +2569,7 @@ Every rep of head is above every rep of base on all four rows. ycsb-f's conflict
 - **An acknowledged commit has both PREPAREs and the DECISION written.** The client's `Ok` comes only from the last count-down (D278), each participant counts down only after its PREPARE settled `Ok` and its share applied, and the DECISION is written before any `Decide` is sent.
 - **No torn commit after a failure.** A participant that voted and then failed never applies its share. The other shares are applied but held (`CROSS_HELD`), so they never become durable (`durable_seqno` includes the hold) and never freeze into an SST. Behind that, a PREPARE with a ticket raised its shard's `cross_end`, and a poisoned shard answers a peer flush's `SyncBarrier` with `cross_records_durable()`, false then (perf287's point). Replay is all or nothing for Buffered (a COMMIT whose participant lost its PREPARE is dropped whole), so the next open finds the commit whole or not at all, consistent with `OutcomeUnknown`.
 
-**Tests:** `engine/tests/vote_on_append.rs`:
+**Tests:** `engine/tests/it/vote_on_append.rs`:
 - a failed PREPARE write after the vote answers `OutcomeUnknown` (it answered `ShardFailed` before), shows nothing, holds back a peer flush, and reopens whole or empty (perf287's T1);
 - a failed view publish after the vote (`Fault::NextGroupPublish`), the same route through `Corruption` (T2);
 - a decision reaching a PREPARE under a held header waits for its sync (`Engine::parked_decisions` shows it is reached); a commit answered before its I/O completed survives a process crash.
@@ -2606,7 +2606,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 - **D266, recovery and the WAL format:** unchanged.
 
 **Tests:**
-- `engine/tests/applier_release.rs` covers:
+- `engine/tests/it/applier_release.rs` covers:
   - the last participant answers without the coordinator running;
   - a participant that can't apply (`Fault::NextApply`);
   - a dropped participant applies its queued decision;
@@ -2699,7 +2699,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 **Why it is safe:** the seqno stays in the allocator's held set (`CROSS_HELD`, D278) until `remaining` reaches zero, and one count is the DECISION's. So a commit visible or answered `Ok` always has its DECISION written (in the page cache at Buffered, so it survives a process crash), as before. A held share is never durable and never reaches an SST (D279's argument).
 
 **Tests:**
-- `engine/tests/early_decide.rs` (`Fault::HoldDecisionRecords` keeps the DECISION unwritten while the participants apply; `Engine::abort_decides_sent`):
+- `engine/tests/it/early_decide.rs` (`Fault::HoldDecisionRecords` keeps the DECISION unwritten while the participants apply; `Engine::abort_decides_sent`):
   - nothing visible or answered until the DECISION is written, then committed and surviving a process crash;
   - perf287's path 1: the coordinator poisoned by an unrelated single's failed write before the DECISION's group: no abort `Decide`, `OutcomeUnknown`, nothing visible, absent after a reopen;
   - path 2: an earlier member's append failing in the DECISION's group: the same;
@@ -2730,7 +2730,7 @@ Mutations caught: no early vote (all three), no parking (a commit answered `Ok` 
 
 **Not in D287:** the active memtable's share (34–38% of a slow read's fold) is a follow-up, which needs its own design.
 
-**Tests:** `engine/tests/flush_fold.rs`:
+**Tests:** `engine/tests/it/flush_fold.rs`:
 - one counter, one combined operand;
 - a snapshot splitting the run;
 - a delete between operands, every read point unchanged;
@@ -2939,7 +2939,7 @@ The transaction's read set records keys only (D275), before the read, so a hit i
 - **Timing:** after `apply` returns Ok, in `Shard::follow_commit`, before the commit's count-down and view publish. So it never runs on a half-applied commit (a failed apply poisons the shard), and a reader at `S >= c` sees it only once `c` is visible. Doing it at settle instead would let later commits move the slot first.
 - **`p`:** taken from the commit's first `fetch_max` on the row (`RowEpochTable::note_write_prev`, ICR 0082). A later write of the same commit to the row (A, B, A) returns `c` itself and is ignored.
 - **The cached row:** it is cached at exactly `p`. Then no write lies in `(p, c)`: one applied there would have moved the slot, and one with a lower seqno applying later is the next rule.
-- **A lower seqno applying late** is reachable (`engine/tests/row_cache_write_through.rs`: a cross-shard share decided at `d`, held behind its Sync DECISION, and a Buffered single to the row reserved at `e > d` that applies first). When `fetch_max` returns above `c`, a commit with a higher seqno already wrote the row, and its write-through lacks this write. The shard drops the row's cached families, applied or not, before this commit's seqno can be visible. The cases are D286's parked decisions, held cross-shard shares (applied at their `apply_seqno`, D263) and D273's explicit timestamps.
+- **A lower seqno applying late** is reachable (`engine/tests/it/row_cache_write_through.rs`: a cross-shard share decided at `d`, held behind its Sync DECISION, and a Buffered single to the row reserved at `e > d` that applies first). When `fetch_max` returns above `c`, a commit with a higher seqno already wrote the row, and its write-through lacks this write. The shard drops the row's cached families, applied or not, before this commit's seqno can be visible. The cases are D286's parked decisions, held cross-shard shares (applied at their `apply_seqno`, D263) and D273's explicit timestamps.
 - **What the commit wrote:** only plain puts to the family, no separated values. Every put must be above the **delete ceiling**: the newest timestamp of any delete the file may hold, taken from the SSTs at open and raised by every delete applied since, replay included. A delete hides a put by timestamp whatever their seqnos (a cell delete exactly at its timestamp, a column or family delete at or below), and the cached row doesn't record the deletes behind it.
 - **The overlay:** a put replaces the cached cell of its qualifier unless the cached version is newer (on a timestamp tie the commit wins, with the higher seqno). The row's expiry is recomputed. The row must already hold the qualifier, must not be a marker, and must stay within `row_cache_max_row`. Otherwise the entry is left stale at `p`, where it misses (as after any write without the write-through).
 - **Other families of the row** stay at `p` and miss: the slot is per row, the entries per family. D290 accepts the miss.

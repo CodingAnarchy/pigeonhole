@@ -60,5 +60,5 @@ An application learns of a failed shard today only when a commit fails, and then
   - `write.rs` (`dropped_reply`, `dropped_reply_now`);
   - the `fail_next_apply` hook docs.
 - `pigeonhole`: `Pigeonhole::is_failed`, `failure`, and the re-exports.
-- Tests: `engine/tests/health.rs` (one per cause, plus the main file and "the first failure stays"); `large_values.rs` now expects `OutcomeUnknown`.
+- Tests: `engine/tests/it/health.rs` (one per cause, plus the main file and "the first failure stays"); `large_values.rs` now expects `OutcomeUnknown`.
 - Docs: the user guide's new "Recovering from a failed shard" page (doctested), linked from the errors page, the agent reference and getting-started; changelog.

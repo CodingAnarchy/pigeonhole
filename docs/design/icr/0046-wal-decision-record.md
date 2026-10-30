@@ -34,6 +34,6 @@ D263 moves the commit's seqno and timestamp to the decision, so the decision rec
 - `pigeonhole-engine`: `shard.rs` (the coordinator's `decide_commit`, the record a `CommitRecord` member appends), `engine.rs` (replay pairs Prepares with Decisions by id and applies them at `apply_seqno`/`commit_ts`; Commits as before).
 - **Tests:**
   - `crates/pager/tests/format_upgrade.rs`: both pages upgraded, a reader never writes, a crash mid-upgrade finished at the next open, a new file untouched (the first two fail with the upgrade disabled);
-  - `crates/engine/tests/format_upgrade.rs`: an older file's pages are both upgraded before any write to another file (fails with the upgrade disabled);
+  - `crates/engine/tests/it/format_upgrade.rs`: an older file's pages are both upgraded before any write to another file (fails with the upgrade disabled);
   - `crates/engine/tests/tablets.rs`: `a_cross_shard_commit_in_a_0_3_0_wal_replays` (hand-written type-2/3 records), `an_undecided_prepare_left_by_a_crash_is_never_applied_after_more_commits_and_a_crash`;
   - `crates/format/tests/golden.rs`, `roundtrip.rs`.

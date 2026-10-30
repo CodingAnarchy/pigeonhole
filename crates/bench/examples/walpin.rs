@@ -7,7 +7,7 @@
 //! ```
 //!
 //! `write` creates `DIR/walpin.phdb` with slots of mixed temperature, the workload of
-//! #175's harness (`engine/tests/wal_pin.rs`) at the default memtable budget:
+//! #175's harness (`engine/tests/it/wal_pin.rs`) at the default memtable budget:
 //! - 4 shards, 8 tables (one tablet each, two per shard) of 4 families: 32 slots;
 //! - each commit writes a 1 KB value to a slot drawn with weight `1 / (rank + 1)`;
 //! - one commit in 10 also writes a slot of another table, most often on another shard (a

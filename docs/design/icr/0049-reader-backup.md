@@ -37,7 +37,7 @@ A reader's slot pin also moves forward to a newer view when that reader takes a 
 
 ## Tests
 
-`crates/engine/tests/reader_backup.rs`, on the simulated filesystem, with writer and reader as separate processes:
+`crates/engine/tests/it/reader_backup.rs`, on the simulated filesystem, with writer and reader as separate processes:
 - **The copy is the reader's snapshot.** Mid-copy, the reader reads at a new snapshot, and the writer commits, flushes, compacts and flushes again. The copy checks clean and holds exactly the 1500 rows from before. The SSTs the compaction replaced stay retired, not reclaimed.
 - **The reader's backup holds the writer's memtables for the whole copy.** This is the documented cost, the mirror of milestone_b's #262 test for the writer.
 - **A writer restart mid-copy** fails the backup with `SnapshotExpired` and removes the partial file.
