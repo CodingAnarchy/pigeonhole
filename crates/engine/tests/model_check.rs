@@ -235,6 +235,23 @@ fn harness_regressions_from_the_seed_sweep() {
     // 177 and was acknowledged, and the harness took the lost batch's timestamp for it (a
     // decided commit has no batch record at its applied seqno). The engine was right.
     check(660_370, &flight_read_config());
+    // Seed 784 of the commits crash sweep (the 1.0 soak): a power loss
+    // left an undecided cross-shard commit's PREPAREs and, after them, the Batch of a later
+    // single-shard commit that put a cell and deleted its column. That Batch's keys reduced
+    // to the column marker, a subset of both commits, and the harness took the cross-shard
+    // commit for it. The engine was right: it dropped the undecided commit as a whole. The
+    // same seed without deferred I/O reaches it one operation earlier.
+    for (deferred_io, crash_at) in [(true, 66), (false, 65)] {
+        let mut cfg = crash_sweep_commits();
+        cfg.tablet_changes = true;
+        cfg.deferred_io = deferred_io;
+        cfg.crash_at = Some(crash_at);
+        if let Err(f) = run(784, &cfg) {
+            panic!(
+                "seed 784 (deferred I/O {deferred_io}), crash after mutating op {crash_at}: {f}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -506,18 +523,23 @@ fn durability_matrix() {
     }
 }
 
-#[test]
-fn crash_at_every_write_point() {
-    // Short runs whose batches span shards (rows spread over 4 shards, big batches, groups
-    // of concurrent commits), so the sweep crosses every step of two-phase commits: PREPARE
-    // writes, syncs, the COMMIT record, and the applies after it. Every mutating operation
-    // of each run is a crash point.
+/// Short runs whose batches span shards (rows spread over 4 shards, big batches, groups of
+/// concurrent commits), so a crash sweep crosses every step of two-phase commits: PREPARE
+/// writes, syncs, the COMMIT record, and the applies after it.
+fn crash_sweep_commits() -> Config {
     let mut cfg = Config::quiet(30);
     cfg.shards = 4;
     cfg.spec.read_fraction = 0.2;
     cfg.spec.max_batch = 6;
     cfg.spec.rows = 12;
     cfg.faults.torn_writes = true;
+    cfg
+}
+
+#[test]
+fn crash_at_every_write_point() {
+    // Every mutating operation of each run is a crash point.
+    let cfg = crash_sweep_commits();
     // The same, flush-heavy: tiny memtables, frequent flushes and compactions, so the
     // sweep crosses SST writes, manifest commits, checkpoints and compaction outputs.
     let mut heavy = Config::quiet(20);
