@@ -4708,10 +4708,9 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
         let key = (m.table, m.family, m.row, m.qualifier, ts);
         // An HLL input's stored operand is the sketch of its element (D294).
         let own = (kind == FamilyKind::Hll && m.kind == Kind::Merge).then(|| {
-            let mut v = vec![ValueTag::Bytes as u8];
-            let mut sketch = Vec::new();
-            pigeonhole_format::hll::encode_element(&mut sketch, stored_i64(m.value));
-            v.extend_from_slice(&sketch);
+            let mut v = Vec::with_capacity(9);
+            v.push(ValueTag::Bytes as u8);
+            pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
             v
         });
         if m.kind == Kind::Merge

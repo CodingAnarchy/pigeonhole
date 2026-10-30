@@ -299,11 +299,23 @@ fn malformed_sketches_are_refused() {
             reference(0..10).bytes().pipe_dense(),
         ),
     ];
+    // As the accumulator too, merged with a small sketch, one that pushes a sparse union past
+    // 767 registers, and a dense one: an error, never a panic (perf287's S1 on #1200).
+    let wide = sketch(0..700);
     for (what, s) in bad {
         assert!(hll::validate(&s).is_err(), "{what} validated");
         assert!(hll::estimate(&s).is_err(), "{what} estimated");
         let mut acc = good.clone();
         assert!(hll::merge(&mut acc, &s).is_err(), "{what} merged");
+        for other in [&good, &wide, &dense] {
+            let mut acc = s.clone();
+            let merged = hll::merge(&mut acc, other).and_then(|()| hll::validate(&acc));
+            // A dense accumulator with few registers set may become a canonical dense sketch
+            // once merged with a dense one: no panic is what matters there.
+            if what != "dense, not canonical" {
+                assert!(merged.is_err(), "{what} as the accumulator merged");
+            }
+        }
     }
 }
 

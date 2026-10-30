@@ -112,9 +112,10 @@ impl<'a> CellRef<'a> {
         as_i64(&self.data)
     }
 
-    /// The estimated number of distinct elements in a cell of an HLL family
-    /// ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard error;
-    /// `None` if the value is not a sketch.
+    /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
+    /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
+    /// error. The value's shape decides, not its family: `None` unless it is a well-formed
+    /// sketch.
     pub fn hll_estimate(&self) -> Option<u64> {
         hll_estimate(&self.data)
     }
@@ -166,9 +167,10 @@ impl Cell {
         as_i64(&self.data)
     }
 
-    /// The estimated number of distinct elements in a cell of an HLL family
-    /// ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard error;
-    /// `None` if the value is not a sketch.
+    /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
+    /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
+    /// error. The value's shape decides, not its family: `None` unless it is a well-formed
+    /// sketch.
     pub fn hll_estimate(&self) -> Option<u64> {
         hll_estimate(&self.data)
     }

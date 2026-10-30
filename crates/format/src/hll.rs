@@ -1,7 +1,8 @@
 //! HyperLogLog sketches, the values of an HLL aggregate family (decision D294; FORMAT §3.1).
 //!
 //! A sketch has 4096 registers (precision 12, about 1.6% standard error). An `i64` element
-//! is hashed with xxh3-64 (seed 0) over its 8 little-endian bytes: the top 12 bits pick the
+//! is hashed with [`crate::checksum::xxh3_64`] (xxh3-64, seed 0: the format fixes it, so a
+//! change to that function breaks every sketch) over its 8 little-endian bytes: the top 12 bits pick the
 //! register, and the rank is one plus the leading zeros of the remaining 52 bits, at most
 //! 53. A register keeps the largest rank it has seen.
 //!
@@ -96,8 +97,13 @@ pub fn register_of(v: i64) -> (u16, u8) {
 /// Writes the sketch of the one element `v` into `out` (cleared first): a sparse sketch of
 /// one entry, 8 bytes.
 pub fn encode_element(out: &mut Vec<u8>, v: i64) {
-    let (index, rank) = register_of(v);
     out.clear();
+    append_element(out, v);
+}
+
+/// [`encode_element`], appended to `out` (after a tag byte, say).
+pub fn append_element(out: &mut Vec<u8>, v: i64) {
+    let (index, rank) = register_of(v);
     out.extend_from_slice(&[ENCODING, PRECISION, SPARSE, 0]);
     out.extend_from_slice(&entry(index, rank).to_le_bytes());
 }
@@ -229,13 +235,18 @@ pub fn validate(s: &[u8]) -> Result<()> {
 }
 
 /// Merges the sketch `other` into the sketch `acc[start..]`, in place: afterwards it holds
-/// the larger rank of every register, in canonical form. `other` is checked completely,
-/// `acc` by its header and length (its registers are checked when it is read, [`estimate`],
-/// or by [`validate`]). On error `acc` is unspecified.
+/// the larger rank of every register, in canonical form. `other` is checked completely, and
+/// so is a sparse `acc` (its entries are read anyway: a bad index would otherwise reach the
+/// dense area, perf287's S1 on #1200). A dense `acc` is checked by its header and length:
+/// any six-bit register is in bounds, and its ranks are checked when it is read
+/// ([`estimate`], [`validate`]). On error `acc` is unspecified.
 pub fn merge_at(acc: &mut Vec<u8>, start: usize, other: &[u8]) -> Result<()> {
     let other = view(other)?;
     let (n, dense) = match header(&acc[start..])? {
-        View::Sparse(_, n) => (n, false),
+        View::Sparse(..) => match view(&acc[start..])? {
+            View::Sparse(_, n) => (n, false),
+            View::Dense(_) => unreachable!("the header said sparse"),
+        },
         View::Dense(_) => (0, true),
     };
     if dense {
