@@ -124,7 +124,7 @@ Every option, with its default and limits, is in the agent reference's [`Options
 | `pigeonhole-{format,io,pager,wal,memtable,cache,runtime,shm,sst,compaction}` | Engine components. | internal: none |
 | `pigeonhole-sim` | Deterministic simulation and reference model. | internal: none |
 
-The internal crates are published only as `pigeonhole`'s dependencies, which pins each exactly; any release may change them incompatibly. [Versions and compatibility](docs/guide/concepts.md#versions-and-compatibility) has the full policy, and [`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) the file format's promise.
+The internal crates are published only as `pigeonhole`'s dependencies, which pins each exactly; any release may change them incompatibly, and they have a version line of their own (D295: `pigeonhole` 1.x may depend on internal crates at 2.x). [Versions and compatibility](docs/guide/concepts.md#versions-and-compatibility) has the full policy, and [`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) the file format's promise.
 
 ## License
 MIT. See [LICENSE](LICENSE).

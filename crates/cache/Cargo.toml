@@ -1,7 +1,7 @@
 [package]
 name = "pigeonhole-cache"
 description = "Block and row caches with pinned, ref-counted handles for Pigeonhole."
-version.workspace = true
+version = "2.0.0" # the internal version line (D295): scripts/versions.py
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

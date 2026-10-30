@@ -3119,3 +3119,26 @@ The root cause is the readahead path's latency, not the scan's length. A demand 
 Mutations: never reading ahead when short fails the last two; dropping the rule fails the first.
 
 #974 A stays parked. The same box slot's long-scan wait-on-in-flight decides it.
+
+<a id="d295"></a>
+## D295 — Two version lines: the internal crates share one, apart from the public crates (owner decision, 2026-10-30; workspace, release tooling, CI; #487, #1194; applies D282)
+**Why.** #1194 (D294) added `Min` and `Max` to `pigeonhole_format::FamilyKind`, an exhaustive public enum, so `cargo semver-checks` requires a new major of `pigeonhole-format`. D282 already lets internal crates change incompatibly, "taking a new major version of their own while `pigeonhole` stays 1.x". The tooling couldn't express that, though: every crate took the one workspace version, so a breaking change to an internal crate would have forced `pigeonhole` 2.0, or failed CI.
+
+**Decided.**
+- **The internal line.** The 12 internal crates (`format`, `io`, `sim`, `pager`, `wal`, `memtable`, `cache`, `runtime`, `shm`, `sst`, `compaction`, `engine`) share one version, set in each crate's `Cargo.toml`.
+  - An incompatible change to any of them takes the whole line's next major. One number keeps the exact pins simple and makes "which internal crates go with this `pigeonhole`" obvious.
+  - It moves to **2.0.0** now, for `FamilyKind`.
+- **The public line.** `pigeonhole`, `pigeonhole-arrow` and `pigeonhole-cli`, and the unpublished `pigeonhole-capi` and `pigeonhole-bench`, keep `[workspace.package] version`, under semver (D282). They stay 1.x.
+- **Pins.** `[workspace.dependencies]` pins each internal crate at `=<internal line>`, and each public crate at the public line.
+  - `scripts/versions.py check` (CI) fails if either line or any pin is out of step.
+  - `versions.py list` gives each published crate's version, which `.coord/publish.sh` publishes; it then checks all 15 are on crates.io at their versions.
+  - `versions.py release-check <previous tag>`, which `publish.sh` runs first, fails if a line's crates changed since that release (`src/`, a `build.rs`, a manifest, or the workspace's shared settings) while the line's version didn't move. Publishing would otherwise skip them, since they're already on crates.io at that version, and ship stale code (perf287's S2 on #1196).
+- **Releases.** Tags, `CHANGELOG.md` and the release corpus follow `pigeonhole`'s version. The bump PR bumps the public line every release, and the internal line only if an internal crate changed (CONTRIBUTING.md, Releases). The next release would be, for example, `pigeonhole` 1.1.0 with the internals at 2.0.0.
+- **Internal enums stay exhaustive** (owner, 2026-10-30, on perf287's S1 on #1196). A new variant of an internal public enum (`FamilyKind`, `ValueTag`, `ValueRef`, `Compression`, `BlockKind`, the key `Kind` and the rest) takes the internal line's next major, and that's expected.
+  - **Cost:** a major on the internal line costs nothing under exact pins: one number in the bump PR.
+  - **What it keeps:** the workspace's matches on those enums stay exhaustive. When a feature adds a variant (#487's HLL, a vector value tag), the compiler lists every site that must handle it, rather than routing it silently into a wildcard arm. For format kinds behind feature bits, that turns a possible data bug into a compile error.
+  - `#[non_exhaustive]` stays where it already was: `Edit`, `RecordType`, `WalRecord` and the error enums.
+
+**CI.** The semver step still checks every published crate against crates.io:
+- the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
+- a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #1196).

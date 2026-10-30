@@ -151,6 +151,9 @@ jobs:
         run: |
           rustup toolchain install nightly-2026-10-05 --profile minimal
           scripts/public-api.sh check
+      # The two version lines (D295): the internal crates share one version, the public crates
+      # take the workspace's, and every pin follows its line.
+      - run: python3 scripts/versions.py check
       - name: semver checks (published crates only)
         shell: bash
         run: |
