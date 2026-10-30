@@ -533,7 +533,8 @@ contended_run() {
     fi
     local status=0
     PIGEONHOLE_BALANCE_LOG=1 "$bench" "${args[@]}" 2> "$out.balance.log" || status=$?
-    [[ -z "$mp" ]] || { kill "$mp" 2> /dev/null; wait "$mp" 2> /dev/null; } || true
+    # SIGINT, not SIGTERM: mpstat then flushes its samples and prints its Average block.
+    [[ -z "$mp" ]] || { kill -INT "$mp" 2> /dev/null; wait "$mp" 2> /dev/null; } || true
     machine_state > "$out.machine-after.txt"
     grep -v '^balance ' "$out.balance.log" >&2 || true
     return "$status"
