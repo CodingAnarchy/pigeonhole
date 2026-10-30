@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pigeonhole::{
-    Cell, Compaction, Condition, Durability, ErrorCode, Family, IoBackend, Options, Pigeonhole,
-    Priority, Row, Table, Value, ValueFilter, days,
+    Aggregation, Cell, Compaction, Condition, Durability, ErrorCode, Family, IoBackend, Options,
+    Pigeonhole, Priority, Row, Table, Value, ValueFilter, days,
 };
 use pigeonhole_io::sim::SimVfs;
 
@@ -1003,6 +1003,135 @@ fn counter_family_write_rules() {
     assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
     // Nothing refused was written.
     assert!(t.row(b"r").read().unwrap().is_none());
+}
+
+/// D294: min and max families keep the smallest and largest input of each bucket; a put
+/// sets a bucket; `incr` is refused there (`aggregate` writes their inputs); their info
+/// round-trips through `FamilyInfo::family`.
+#[test]
+fn min_and_max_families() {
+    let db = db();
+    let t = db
+        .table("agg")
+        .unwrap()
+        .family("lo", Family::aggregate(Aggregation::Min))
+        .family("hi", Family::aggregate(Aggregation::Max))
+        .family("c", Family::counter())
+        .create()
+        .unwrap();
+    let get = |f: &str, q: &[u8]| t.get(b"r", f, q).unwrap().map(|c| c.as_i64().unwrap());
+    assert_eq!(get("lo", b"x"), None, "no input: absent");
+    for v in [4, -9, 2] {
+        t.mutate(b"r")
+            .aggregate("lo", b"x", v)
+            .aggregate("hi", b"x", v)
+            .aggregate("c", b"x", v)
+            .commit()
+            .unwrap();
+    }
+    assert_eq!((get("lo", b"x"), get("hi", b"x")), (Some(-9), Some(4)));
+    assert_eq!(
+        get("c", b"x"),
+        Some(-3),
+        "aggregate in a counter family is incr"
+    );
+    // A put sets the cell, and later inputs combine with it, in one mutation too.
+    t.mutate(b"r")
+        .put_i64("lo", b"x", 100)
+        .aggregate("lo", b"x", 50)
+        .commit()
+        .unwrap();
+    assert_eq!(get("lo", b"x"), Some(50));
+    // Buckets.
+    let mut wb = db.write_batch();
+    for (ts, v) in [(10, 3), (10, 7), (20, 1)] {
+        wb.aggregate_at(&t, b"r", "hi", b"b", ts, v);
+    }
+    wb.commit().unwrap();
+    let versions: Vec<(u64, i64)> = t
+        .row(b"r")
+        .family("hi")
+        .qualifier_range(&b"b"[..]..=&b"b"[..])
+        .versions(0)
+        .read()
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|e| (e.cell.timestamp(), e.cell.as_i64().unwrap()))
+        .collect();
+    assert_eq!(versions, [(20, 1), (10, 7)]);
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate(&t, b"r", "lo", b"x", -60);
+    txn.commit().unwrap();
+    assert_eq!(get("lo", b"x"), Some(-60));
+    // `incr` is refused in a min or max family, through every write path.
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    refused(
+        t.mutate(b"r").incr("lo", b"x", 1).commit(),
+        "is a min family: write its inputs with aggregate",
+    );
+    refused(
+        t.mutate(b"r").incr_at("hi", b"x", 5, 1).commit(),
+        "is a max family",
+    );
+    let mut wb = db.write_batch();
+    wb.incr(&t, b"r", "hi", b"x", 1);
+    refused(wb.commit(), "is a max family");
+    let mut txn = db.transaction().unwrap();
+    txn.incr_at(&t, b"r", "lo", b"x", 5, 1);
+    refused(txn.commit(), "is a min family");
+    // `aggregate` needs an aggregate family (perf287's S3 on #1194), even one whose operator
+    // would take the operand.
+    let plain = db
+        .table("plain")
+        .unwrap()
+        .family("f", Family::default())
+        .family(
+            "legacy",
+            Family::default().merge_operator("pigeonhole.i64_add"),
+        )
+        .create()
+        .unwrap();
+    for f in ["f", "legacy"] {
+        refused(
+            plain.mutate(b"r").aggregate(f, b"x", 1).commit(),
+            "is not an aggregate family",
+        );
+    }
+    let mut wb = db.write_batch();
+    wb.aggregate_at(&plain, b"r", "legacy", b"x", 5, 1);
+    refused(wb.commit(), "is not an aggregate family");
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate(&plain, b"r", "f", b"x", 1);
+    refused(txn.commit(), "is not an aggregate family");
+    // Only i64s; a counter family's message still points at incr.
+    refused(
+        t.mutate(b"r").put("lo", b"x", b"text").commit(),
+        "only i64 values",
+    );
+    refused(
+        t.mutate(b"r").put("c", b"x", b"text").commit(),
+        "(put_i64 / incr)",
+    );
+    assert_eq!(get("lo", b"x"), Some(-60), "nothing refused was written");
+    // The info names the aggregation, and recreates the family.
+    let lo = t.family_info("lo").unwrap();
+    assert_eq!(lo.aggregation, Some(Aggregation::Min));
+    assert!(!lo.counter);
+    assert_eq!(lo.merge_operator, None);
+    let c = t.family_info("c").unwrap();
+    assert_eq!((c.counter, c.aggregation), (true, Some(Aggregation::Sum)));
+    let a = db.table("copy").unwrap().family("f", Family::default());
+    let copy = a.family("lo", lo.family.clone()).create().unwrap();
+    assert_eq!(
+        copy.family_info("lo").unwrap().aggregation,
+        Some(Aggregation::Min)
+    );
+    assert_eq!(copy.family_info("f").unwrap().aggregation, None);
 }
 
 /// A family that names `pigeonhole.i64_add` without being a counter family reads and writes

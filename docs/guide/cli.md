@@ -85,6 +85,7 @@ Choose with `--format`:
 | `table`, `family` | Names (`jsonl` and `csv` rows; `json` nests families under their table and calls the family's field `name`). |
 | `tablets` | Tablets the table is split into now (rows only). |
 | `counter` | A counter family (`Family::counter`). |
+| `aggregation` | An aggregate family's aggregation, `sum`, `min` or `max` (`Family::aggregate`, D294); `null` for an ordinary family. |
 | `max_versions` | Versions kept per column; 0 keeps all. |
 | `ttl_micros` | Time to live; `null` for none. |
 | `bloom_bits`, `block_size`, `blob_threshold` | As set with `Family`. |
@@ -191,7 +192,7 @@ $ echo $?
 **`jsonl`** (the default) is what `phdb load` reads. Its lines are, in order:
 
 1. **A header:** `{"phdb": 1, "command": "dump", "format_version", "snapshot": "latest" | "durable", "seqno", "mode"}`.
-2. **Per table, before its cells:** `{"table", "families": [...]}`. Each family has the same fields as in `phdb info`: `name`, `counter`, `max_versions`, `ttl_micros`, `bloom_bits`, `blob_threshold`, `compression`, `zstd_level`, `block_size`, `merge_operator`, `cache_priority` and `compaction`.
+2. **Per table, before its cells:** `{"table", "families": [...]}`. Each family has the same fields as in `phdb info`: `name`, `counter`, `aggregation`, `max_versions`, `ttl_micros`, `bloom_bits`, `blob_threshold`, `compression`, `zstd_level`, `block_size`, `merge_operator`, `cache_priority` and `compaction`.
 3. **Per cell:** `{"table", "row", "family", "qualifier", "ts", "value"}`. Within a row, cells are ordered by family, then qualifier, newest version first.
 
 How values are written:
@@ -283,8 +284,9 @@ scan   <table> [<start> [<end>]] [--prefix P] [--family F]... [--qualifier-prefi
        [--limit N] [--columns-per-row N] [--at SNAP]
 put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
 incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
+aggregate <table> <row> <family>:<qualifier> <value> [--ts US]
 delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-create <table> <family>[:counter]...
+create <table> <family>[:counter|:min|:max]...
 snapshot [--durable] <name>     release <name>
 \tables  \schema [table]  \info  \metrics  \health
 \format table|json|jsonl|csv  \timing on|off  \help  \quit
@@ -304,8 +306,9 @@ snapshot [--durable] <name>     release <name>
 **Writing:**
 - **`put`** writes bytes, or with `--i64` or `--f64` a typed value. `--ts` sets the timestamp.
 - **`incr`** adds to a counter.
+- **`aggregate`** writes an input to an aggregate family's cell: a min or max family (where `incr` is refused), or a counter.
 - **`delete`** removes a row, a family, a column, or with `--ts` one version.
-- **`create`** makes a table with default family options. Append `:counter` to a family name for a counter family.
+- **`create`** makes a table with default family options. Append `:counter` to a family name for a counter family, `:min` or `:max` for a min or max family.
 
 **Values:** words are bytes, so keys and values can be anything.
 - A bare word is its UTF-8.

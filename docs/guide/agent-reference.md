@@ -37,6 +37,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Files at rest | One file after a clean last `close`. While open, or after a crash: the file plus WAL sidecars and the shm region. Open replays the sidecars. |
 | `None` durability (D94) | A `None` commit buffers its WAL record. A later `GroupSync`/`Sync` commit on the same shard, a `flush`, or a clean close makes it durable; a crash before then loses it. |
 | Counters (D179) | Only a counter family (`Family::counter()`) takes `incr`; elsewhere `InvalidArgument`. `incr` writes at a fixed timestamp (0), so a counter is one cell; `incr_at(.., ts, ..)` adds to the bucket (version) at `ts`. Increments combine at read and in compaction; a read that folds many leaves its sum in memory as a base, so later reads fold only what came after (D291). A counter family holds only `i64`s (`put_i64` sets, `put_i64_at` sets a bucket; other puts and untyped `merge`: `InvalidArgument`). A delete there hides only what was written before it, so `incr` after `delete_column` starts from 0. With a TTL: buckets only (`incr`/`put_i64`: `InvalidArgument`). TTL expires each bucket; `max_versions` limits reads per column but compaction keeps the rest (it never changes a counter family's reads), so bound storage with a TTL. |
+| Min and max (D294) | `Family::aggregate(Aggregation::Min | Max)`: as a counter family, combining with min or max instead of a sum. Inputs with `aggregate(.., v)` / `aggregate_at(.., ts, v)` (`incr`: `InvalidArgument`); `put_i64` sets a cell; a cell with no input is absent, not 0. Creating the first min or max family sets `incompat` feature bit 0 (`DatabaseInfo::features`), so pigeonhole 1.0.x refuses the file (`UnsupportedFeature`) from then on, even after the family is dropped. |
 | 0.1.0 families | Families created by 0.1.0 store `pigeonhole.i64_add` without the counter kind and keep 0.1.0 behavior: `incr` at the commit timestamp, runs folded across timestamps (D41), bytes under an `incr` fail with `MergeFailed`. Migrate a counter by reading it and `put_i64` into a counter family. |
 | Typed values | `merge` writes untyped operands (custom operators); the built-in `i64` add refuses them. |
 
@@ -155,7 +156,8 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 | Method | Meaning |
 |---|---|
 | `Family::default()` | Ordinary family, no merge operator. |
-| `Family::counter()` | Counter family: `i64` sums (`incr`, `incr_at`, `put_i64`, `put_i64_at`); D179. Chain the methods below on it. |
+| `Family::counter()` | Counter family: `i64` sums (`incr`, `incr_at`, `put_i64`, `put_i64_at`); D179. Chain the methods below on it. Same as `Family::aggregate(Aggregation::Sum)`. |
+| `Family::aggregate(Aggregation)` | Aggregate family (D294): `Sum`, `Min` or `Max` of the `i64` inputs (`aggregate`, `aggregate_at`, `put_i64`, `put_i64_at`). `Aggregation` is `#[non_exhaustive]`. |
 | `max_versions(u32)` | Keep ≤ n versions per column (0 = all). |
 | `ttl(Duration)` | Expire cells older than this by timestamp. |
 | `bloom_bits(u8)` | Filter bits per key (0 off; default 10). |
@@ -175,7 +177,7 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 | `TableBuilder::open(self) -> Result<Table>` | `TableNotFound` if absent. |
 | `Table::name(&self) -> &str` | |
 | `Table::families(&self) -> Vec<&str>` | |
-| `Table::family_info(&self, &str) -> Option<FamilyInfo>` | A family's stored options as of when the handle opened (ICR 0047; also on `ReadTable`, with `ReadTable::families`): `name`, `family: Family` (the same options as a builder: pass it to `TableBuilder::family` to define an identical family), `counter`, `max_versions`, `ttl: Option<Duration>`, `bloom_bits`, `blob_threshold`, `compression: Compression` (`None`, `Lz4`, `Zstd(i8)`), `block_size`, `merge_operator: Option<String>` (`None` for counters), `cache_priority`, `compaction`. `None` if no such family. |
+| `Table::family_info(&self, &str) -> Option<FamilyInfo>` | A family's stored options as of when the handle opened (ICR 0047; also on `ReadTable`, with `ReadTable::families`): `name`, `family: Family` (the same options as a builder: pass it to `TableBuilder::family` to define an identical family), `counter`, `aggregation: Option<Aggregation>` (D294; `Some(Sum)` for a counter family), `max_versions`, `ttl: Option<Duration>`, `bloom_bits`, `blob_threshold`, `compression: Compression` (`None`, `Lz4`, `Zstd(i8)`), `block_size`, `merge_operator: Option<String>` (`None` for every aggregate family), `cache_priority`, `compaction`. `None` if no such family. |
 | `Table::mutate(&self, row: &[u8]) -> RowMutation<'_>` | Start single-row mutation. |
 | `Table::get(&self, row: &[u8], family: &str, qualifier: &[u8]) -> Result<Option<CellRef<'_>>>` | Newest version; zero-copy. |
 | `Table::get_at(&self, &Snapshot, row, family, qualifier) -> Result<Option<CellRef<'_>>>` | As of snapshot. |
@@ -197,6 +199,8 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 | `put_i64_at(family, qualifier, ts, i64)` | Typed `i64` at `ts` (a counter family's bucket). |
 | `incr(family, qualifier, delta: i64)` | Blind atomic wrapping `i64` add; counter families only. |
 | `incr_at(family, qualifier, ts: u64, delta: i64)` | Add to the bucket at `ts`; counter families only. |
+| `aggregate(family, qualifier, value: i64)` | Blind input to an aggregate family's cell (D294): added in a counter family, kept if smallest (min) or largest (max); other families: `InvalidArgument`. |
+| `aggregate_at(family, qualifier, ts: u64, value: i64)` | Input to the bucket at `ts` of an aggregate family. |
 | `merge(family, qualifier, operand: &[u8])` | Operand for the family's registered operator. |
 | `delete_cell(family, qualifier, ts: u64)` | Delete the version at `ts`; later puts at that `ts` stay hidden (D38). |
 | `delete_column(family, qualifier)` | Delete all versions. |

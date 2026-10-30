@@ -4,9 +4,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use pigeonhole_compaction::{MergeOperator, MergeRegistry};
+use pigeonhole_compaction::{I64Add, I64Max, I64Min, MergeOperator, MergeRegistry};
 use pigeonhole_format::hash::{FastMap, FastSet};
-use pigeonhole_format::manifest::{Edit, FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{
     BlobFileId, FamilyId, Lsn, Seqno, SstId, StreamId, TableId, TabletId, Timestamp,
@@ -18,14 +18,40 @@ use crate::{Error, FamilyInfo, Result, TableInfo};
 
 /// Name of the built-in `i64` add operator (`pigeonhole_compaction::I64Add`).
 pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
+/// Name of the built-in `i64` minimum (`pigeonhole_compaction::I64Min`, D294).
+pub(crate) const I64_MIN: &str = "pigeonhole.i64_min";
+/// Name of the built-in `i64` maximum (`pigeonhole_compaction::I64Max`, D294).
+pub(crate) const I64_MAX: &str = "pigeonhole.i64_max";
+
+/// The operator an aggregate family of `kind` folds with, by name (D179, D294); `None` for
+/// a standard family, whose operator is its own choice.
+pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
+    match kind {
+        FamilyKind::Standard => None,
+        FamilyKind::Counter => Some(I64_ADD),
+        FamilyKind::Min => Some(I64_MIN),
+        FamilyKind::Max => Some(I64_MAX),
+    }
+}
+
+/// The built-in operator of an aggregate kind (never a registered one: the kind fixes it).
+fn builtin_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
+    match kind {
+        FamilyKind::Standard => None,
+        FamilyKind::Counter => Some(Arc::new(I64Add)),
+        FamilyKind::Min => Some(Arc::new(I64Min)),
+        FamilyKind::Max => Some(Arc::new(I64Max)),
+    }
+}
 
 /// How merge operands of a family are resolved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MergeKind {
     /// No operator: merge operands are refused at write time.
     None,
-    /// The built-in wrapping `i64` add.
-    I64Add,
+    /// A built-in `i64` operator: the add of a counter family or of a 0.1.0 family that
+    /// names it (D41), or an aggregate family's min or max (D294).
+    Builtin,
     /// An operator registered in `EngineOptions::merge_operators`.
     Registered,
     /// An operator this process has not registered: reads of merged cells fail.
@@ -169,19 +195,32 @@ impl Catalog {
                     None => info.families.push(new),
                 }
                 let name = options.merge_operator.as_str();
-                let merge_op = if name.is_empty() {
-                    None
-                } else {
-                    self.registry.get(name)
-                };
-                let merge = match (name, &merge_op) {
-                    ("", _) => MergeKind::None,
-                    (I64_ADD, _) => MergeKind::I64Add,
-                    (_, Some(_)) => MergeKind::Registered,
-                    (_, None) => {
-                        self.has_unknown_merge = true;
-                        MergeKind::Unknown
+                let (merge, merge_op) = if let Some(op) = builtin_operator(options.kind) {
+                    // An aggregate family folds with its kind's operator (writes refuse any
+                    // other name, `check_merge_operator`).
+                    if aggregate_operator(options.kind) != Some(name) {
+                        return Err(Error::Corruption(format!(
+                            "manifest: family {} of kind {:?} names operator {name:?}",
+                            family.0, options.kind
+                        )));
                     }
+                    (MergeKind::Builtin, Some(op))
+                } else {
+                    let merge_op = if name.is_empty() {
+                        None
+                    } else {
+                        self.registry.get(name)
+                    };
+                    let merge = match (name, &merge_op) {
+                        ("", _) => MergeKind::None,
+                        (I64_ADD, _) => MergeKind::Builtin,
+                        (_, Some(_)) => MergeKind::Registered,
+                        (_, None) => {
+                            self.has_unknown_merge = true;
+                            MergeKind::Unknown
+                        }
+                    };
+                    (merge, merge_op)
                 };
                 Arc::make_mut(&mut self.families).insert(
                     *family,

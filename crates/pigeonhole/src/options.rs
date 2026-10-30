@@ -12,6 +12,10 @@ use crate::MergeOperator;
 
 /// Name of the built-in `i64` add operator, which counter families sum with.
 pub(crate) const I64_ADD: &str = "pigeonhole.i64_add";
+/// The built-in `i64` minimum, the operator of a min family (D294).
+const I64_MIN: &str = "pigeonhole.i64_min";
+/// The built-in `i64` maximum, the operator of a max family (D294).
+const I64_MAX: &str = "pigeonhole.i64_max";
 
 /// `n` days, for TTLs: `Family::default().ttl(days(30))`. Saturates instead of overflowing.
 pub fn days(n: u64) -> Duration {
@@ -972,7 +976,110 @@ pub struct Family {
     options: FamilyOptions,
 }
 
+/// How an aggregate family combines the values written to a cell, fixed when the family is
+/// created, as in Bigtable's aggregate families (decisions D179, D294; [`Family::aggregate`]).
+///
+/// Every aggregation takes `i64` inputs, written with
+/// [`aggregate`](crate::RowMutation::aggregate) (and [`aggregate_at`] for a bucket), and
+/// combines them within one bucket: a column at one timestamp. A bucket nothing was written
+/// to (or whose writes were all deleted) reads as absent, never as 0.
+///
+/// Non-exhaustive: later releases add aggregations (#488).
+///
+/// [`aggregate_at`]: crate::RowMutation::aggregate_at
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum Aggregation {
+    /// The sum of the inputs, wrapping on overflow: a counter ([`Family::counter`]).
+    Sum,
+    /// The smallest input.
+    Min,
+    /// The largest input.
+    Max,
+}
+
+impl Aggregation {
+    fn kind(self) -> FamilyKind {
+        match self {
+            Aggregation::Sum => FamilyKind::Counter,
+            Aggregation::Min => FamilyKind::Min,
+            Aggregation::Max => FamilyKind::Max,
+        }
+    }
+
+    /// The aggregation of an engine family kind (`None` for a standard family).
+    pub(crate) fn of_kind(kind: FamilyKind) -> Option<Self> {
+        match kind {
+            FamilyKind::Counter => Some(Aggregation::Sum),
+            FamilyKind::Min => Some(Aggregation::Min),
+            FamilyKind::Max => Some(Aggregation::Max),
+            _ => None,
+        }
+    }
+
+    fn operator(self) -> &'static str {
+        match self {
+            Aggregation::Sum => I64_ADD,
+            Aggregation::Min => I64_MIN,
+            Aggregation::Max => I64_MAX,
+        }
+    }
+}
+
 impl Family {
+    /// An aggregate family: every cell combines the `i64` inputs written to it with
+    /// `aggregation` (decision D294). It works as a [counter](Family::counter) does, which
+    /// is the `Sum` case: [`aggregate`](crate::RowMutation::aggregate) writes an input to
+    /// the column's cell at one fixed timestamp, [`aggregate_at`] to a bucket at a
+    /// timestamp you choose, and inputs combine when read and when compacted.
+    ///
+    /// - [`put_i64`](crate::RowMutation::put_i64) sets the cell (`put_i64_at` a bucket):
+    ///   later inputs combine with the value it set. Other puts, and
+    ///   [`incr`](crate::RowMutation::incr) outside a `Sum` family, are refused with
+    ///   `InvalidArgument`.
+    /// - A delete removes what earlier commits wrote, so the next input starts the cell
+    ///   again: after `delete_column`, a `Min` cell holds the smallest input written since.
+    ///   A bucket with no input reads as absent.
+    /// - TTL and `max_versions` work as for counters.
+    ///
+    /// A family of an aggregation added after 1.0 (`Min`, `Max`) marks the file: from its
+    /// creation on, pigeonhole 1.0.x refuses to open the file (`UnsupportedFeature`), even
+    /// after the family is dropped.
+    ///
+    /// ```
+    /// use pigeonhole::{Aggregation, Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let t = db
+    ///     .table("sensors")?
+    ///     .family("low", Family::aggregate(Aggregation::Min))
+    ///     .family("high", Family::aggregate(Aggregation::Max))
+    ///     .create_if_missing()?;
+    /// for reading in [21, 17, 25] {
+    ///     t.mutate(b"s1")
+    ///         .aggregate("low", b"temp", reading)
+    ///         .aggregate("high", b"temp", reading)
+    ///         .commit()?;
+    /// }
+    /// assert_eq!(t.get(b"s1", "low", b"temp")?.unwrap().as_i64(), Some(17));
+    /// assert_eq!(t.get(b"s1", "high", b"temp")?.unwrap().as_i64(), Some(25));
+    /// assert!(t.get(b"s2", "low", b"temp")?.is_none()); // no input: absent, not 0
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// [`aggregate_at`]: crate::RowMutation::aggregate_at
+    pub fn aggregate(aggregation: Aggregation) -> Self {
+        Self {
+            options: FamilyOptions::default()
+                .merge_operator(aggregation.operator().to_owned())
+                .kind(aggregation.kind()),
+        }
+    }
+
     /// A counter family: every cell is an `i64` sum (decision D179).
     ///
     /// - [`incr`](crate::RowMutation::incr) adds to the column's counter, which lives at
@@ -1021,11 +1128,7 @@ impl Family {
     /// # }
     /// ```
     pub fn counter() -> Self {
-        Self {
-            options: FamilyOptions::default()
-                .merge_operator(I64_ADD.to_owned())
-                .kind(FamilyKind::Counter),
-        }
+        Self::aggregate(Aggregation::Sum)
     }
 
     /// Keep at most `n` versions per column (0 keeps all).

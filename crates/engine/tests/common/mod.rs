@@ -56,9 +56,10 @@ use pigeonhole_format::{Durability, Lsn, ManifestVersion, Seqno, StreamId, Table
 use pigeonhole_io::sim::{CrashKind, FaultPlan, SimOp, SimVfs};
 use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
-    COUNTER_TS, CommitStreams, Model, ModelCell, ModelFamily, ModelOp, ModelPurge, Op, Rng, Sim,
-    Step, StreamCommit, StreamRecord, Workload, WorkloadSpec, check_acknowledged_survive,
-    combine_counter_writes, recovered_from_records,
+    COUNTER_TS, CommitStreams, Model, ModelAggregation, ModelCell, ModelFamily, ModelOp,
+    ModelPurge, Op, Rng, Sim, Step, StreamCommit, StreamRecord, Workload, WorkloadSpec,
+    aggregation_of_name, check_acknowledged_survive, combine_counter_writes,
+    recovered_from_records,
 };
 
 pub const TABLE: &str = "t";
@@ -127,15 +128,15 @@ pub fn new_model() -> Model {
 /// The families every model-check run uses. `counter` is a 0.1.0-style family with the
 /// `i64` add operator (operands at the commit timestamp, D41). The `counters` test target
 /// swaps `g` and `ttl` for the counter families `sum` and `sum_ttl` (D179; the workload
-/// writes buckets only in `sum_ttl`), keeping four families per table; the `slots` target
-/// has all six (#283).
+/// writes buckets only in `sum_ttl`) and adds the aggregate families `min` and `max_ttl`
+/// (D294); the `slots` target has six (#283).
 pub fn families() -> Vec<ModelFamily> {
     let f = |name: &str, max_versions, ttl_micros, i64_add| {
         ModelFamily::new(name)
             .max_versions(max_versions)
             .ttl_micros(ttl_micros)
             .i64_add(i64_add)
-            .counter(is_sum(name))
+            .aggregation(aggregation_of_name(name))
     };
     if env!("CARGO_CRATE_NAME") == "slots" {
         // Six families: 24 slots on a shard holding every table (#283).
@@ -153,6 +154,8 @@ pub fn families() -> Vec<ModelFamily> {
             f("counter", 3, 0, true),
             f("sum", 2, 0, false),
             f("sum_ttl", 0, 40, false),
+            f("min", 2, 0, false),
+            f("max_ttl", 0, 40, false),
         ]
     } else {
         vec![
@@ -164,20 +167,20 @@ pub fn families() -> Vec<ModelFamily> {
     }
 }
 
-/// A counter family of decision D179.
-fn is_sum(family: &str) -> bool {
-    family.starts_with("sum")
+/// An aggregate family: a counter family of decision D179, or a min or max family of D294.
+fn is_aggregate(family: &str) -> bool {
+    aggregation_of_name(family).is_some()
 }
 
 /// A family holding only `i64`s (what `put_i64` writes).
 fn is_i64(family: &str) -> bool {
-    family.starts_with("counter") || is_sum(family)
+    family.starts_with("counter") || is_aggregate(family)
 }
 
 /// Where a put or operand without a timestamp lands: the counter's timestamp in a counter
 /// family, else the commit's.
 fn default_ts(family: &str, commit_ts: Timestamp) -> Timestamp {
-    if is_sum(family) {
+    if is_aggregate(family) {
         COUNTER_TS
     } else {
         commit_ts
@@ -198,7 +201,7 @@ fn shift_ts(op: &mut ModelOp, base: Timestamp) {
         ..
     }
     | ModelOp::DeleteCell { ts: t, family, .. } = op
-        && !(is_sum(family) && *t == COUNTER_TS)
+        && !(is_aggregate(family) && *t == COUNTER_TS)
     {
         *t += base;
     }
@@ -208,7 +211,7 @@ fn shift_ts(op: &mut ModelOp, base: Timestamp) {
 fn takes_commit_ts(op: &ModelOp) -> bool {
     match op {
         ModelOp::Put { ts, family, .. } | ModelOp::Incr { ts, family, .. } => {
-            ts.is_none() && !is_sum(family)
+            ts.is_none() && !is_aggregate(family)
         }
         ModelOp::DeleteCell { .. } => false,
         _ => true,
@@ -244,15 +247,18 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
         .blob_threshold(blob_threshold)
         .max_versions(f.max_versions)
         .ttl_micros(f.ttl_micros)
-        .merge_operator(if f.i64_add || f.counter {
-            "pigeonhole.i64_add"
-        } else {
-            ""
+        .merge_operator(match (f.counter, f.aggregation) {
+            (true, ModelAggregation::Min) => "pigeonhole.i64_min",
+            (true, ModelAggregation::Max) => "pigeonhole.i64_max",
+            (true, ModelAggregation::Sum) => "pigeonhole.i64_add",
+            (false, _) if f.i64_add => "pigeonhole.i64_add",
+            (false, _) => "",
         })
-        .kind(if f.counter {
-            FamilyKind::Counter
-        } else {
-            FamilyKind::Standard
+        .kind(match (f.counter, f.aggregation) {
+            (false, _) => FamilyKind::Standard,
+            (true, ModelAggregation::Sum) => FamilyKind::Counter,
+            (true, ModelAggregation::Min) => FamilyKind::Min,
+            (true, ModelAggregation::Max) => FamilyKind::Max,
         })
 }
 
@@ -2164,7 +2170,7 @@ impl World {
     fn mutation_keys(ops: &[ModelOp]) -> BTreeSet<MutationKey> {
         let mut out = BTreeSet::new();
         // Counter writes of one cell combine before they are logged (#295).
-        for op in &combine_counter_writes(ops, |_, f| is_sum(f)) {
+        for op in &combine_counter_writes(ops, |_, f| aggregation_of_name(f)) {
             let t = op_table(op).to_owned();
             match op {
                 ModelOp::Put {
@@ -2176,7 +2182,7 @@ impl World {
                     ..
                 } => {
                     // The engine logs a counter family's default timestamp as explicit.
-                    let ts = ts.or(is_sum(family).then_some(COUNTER_TS));
+                    let ts = ts.or(is_aggregate(family).then_some(COUNTER_TS));
                     out.insert((
                         t,
                         family.clone(),
@@ -2195,7 +2201,7 @@ impl World {
                     delta,
                     ..
                 } => {
-                    let ts = ts.or(is_sum(family).then_some(COUNTER_TS));
+                    let ts = ts.or(is_aggregate(family).then_some(COUNTER_TS));
                     out.insert((
                         t,
                         family.clone(),
@@ -3289,7 +3295,7 @@ impl World {
         #[allow(clippy::type_complexity)]
         let mut last: BTreeMap<(String, String, Vec<u8>, Vec<u8>, Timestamp), MutationKey> =
             BTreeMap::new();
-        for op in &combine_counter_writes(ops, |_, f| is_sum(f)) {
+        for op in &combine_counter_writes(ops, |_, f| aggregation_of_name(f)) {
             let t = op_table(op).to_owned();
             let mut push = |family: String,
                             kind: u8,
@@ -3508,7 +3514,12 @@ impl World {
                             qualifier: q,
                             ts: None,
                             ..
-                        } => f == &family && q == &qualifier && is_sum(f) && parts.ts == COUNTER_TS,
+                        } => {
+                            f == &family
+                                && q == &qualifier
+                                && is_aggregate(f)
+                                && parts.ts == COUNTER_TS
+                        }
                         _ => false,
                     }
             });
@@ -3881,7 +3892,7 @@ impl World {
             // timestamp 0, so under any version with a later timestamp (a bucket), and already
             // expired in a family with a TTL. There a read is the same with or without the
             // commit: the cell cannot show it (#1071).
-            let hidden = is_sum(family)
+            let hidden = is_aggregate(family)
                 && (model.as_ref().is_some_and(|c| c.ts > 0)
                     || families()
                         .iter()
@@ -4657,7 +4668,7 @@ impl World {
                 b"interferer".to_vec()
             };
             // A counter family with a TTL refuses its fixed timestamp: a bucket instead.
-            let ts = (is_sum(&f) && f.contains("ttl")).then_some(now);
+            let ts = (is_aggregate(&f) && f.contains("ttl")).then_some(now);
             let op = ModelOp::Put {
                 table: t,
                 row: r,

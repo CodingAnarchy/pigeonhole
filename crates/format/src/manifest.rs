@@ -225,7 +225,14 @@ pub enum CachePriority {
 }
 
 /// What a family's columns hold, which decides how merge operands and deletes resolve
-/// (decision D179). Numbers are frozen.
+/// (decisions D179, D294). Numbers are frozen.
+///
+/// Every kind but `Standard` is an *aggregate* family (Bigtable's aggregate families):
+/// operands combine with the kind's built-in operator only within one `(column, timestamp)`
+/// bucket, each bucket is one version, and a delete hides only entries written before it
+/// (lower seqno) within its timestamp scope. A kind added after 1.0 needs an `incompat`
+/// feature bit ([`FamilyKind::required_incompat`]), set before the first family of the kind
+/// is written, so a build that does not know the kind refuses the file at open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
 pub enum FamilyKind {
@@ -233,11 +240,51 @@ pub enum FamilyKind {
     /// deletes hide by timestamp. Families written before the kind was stored read as this.
     #[default]
     Standard = 0,
-    /// An `i64` sum counter family (Bigtable's aggregate families): operands combine only
-    /// within one `(column, timestamp)` bucket, each bucket is one version, and a delete
-    /// hides only entries written before it (lower seqno) within its timestamp scope.
+    /// An `i64` sum counter family (D179): operands add, wrapping.
     Counter = 1,
+    /// An `i64` minimum family (D294): a bucket holds the smallest value written to it.
+    /// Needs [`INCOMPAT_AGGREGATES`].
+    Min = 2,
+    /// An `i64` maximum family (D294): a bucket holds the largest value written to it.
+    /// Needs [`INCOMPAT_AGGREGATES`].
+    Max = 3,
 }
+
+impl FamilyKind {
+    /// Whether the kind is an aggregate family (every kind but `Standard`): operands combine
+    /// within one bucket, and the kind fixes the operator.
+    ///
+    /// ```
+    /// use pigeonhole_format::manifest::FamilyKind;
+    ///
+    /// assert!(!FamilyKind::Standard.is_aggregate());
+    /// assert!(FamilyKind::Counter.is_aggregate() && FamilyKind::Min.is_aggregate());
+    /// ```
+    pub fn is_aggregate(self) -> bool {
+        self != FamilyKind::Standard
+    }
+
+    /// The `incompat` feature bits a file must carry, in both superblock pages, before a
+    /// family of this kind is written (D294; FORMAT §8.2): 0 for the kinds 1.0 knows. Kinds
+    /// that land together share one bit, and a kind's later parameters fall under its bit.
+    ///
+    /// ```
+    /// use pigeonhole_format::manifest::{FamilyKind, INCOMPAT_AGGREGATES};
+    ///
+    /// assert_eq!(FamilyKind::Counter.required_incompat(), 0);
+    /// assert_eq!(FamilyKind::Max.required_incompat(), INCOMPAT_AGGREGATES);
+    /// ```
+    pub fn required_incompat(self) -> u64 {
+        match self {
+            FamilyKind::Standard | FamilyKind::Counter => 0,
+            FamilyKind::Min | FamilyKind::Max => INCOMPAT_AGGREGATES,
+        }
+    }
+}
+
+/// The `incompat` feature bit of the aggregate kinds added after 1.0 (bit 0, D294): Min
+/// and Max.
+pub const INCOMPAT_AGGREGATES: u64 = 1 << 0;
 
 /// The persisted policy of one family. Stored in the manifest so another binary interprets
 /// the data the same way.
@@ -439,6 +486,8 @@ impl FamilyOptions {
                 match r.u8()? {
                     0 => FamilyKind::Standard,
                     1 => FamilyKind::Counter,
+                    2 => FamilyKind::Min,
+                    3 => FamilyKind::Max,
                     k => {
                         return Err(Error::UnsupportedFeature {
                             what: "family kind",

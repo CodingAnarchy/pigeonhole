@@ -26,6 +26,7 @@ expression: text
         {
           "name": "e",
           "counter": false,
+          "aggregation": null,
           "max_versions": 0,
           "ttl_micros": null,
           "bloom_bits": 10,
@@ -60,6 +61,7 @@ expression: text
         {
           "name": "profile",
           "counter": false,
+          "aggregation": null,
           "max_versions": 1,
           "ttl_micros": null,
           "bloom_bits": 10,
@@ -81,6 +83,7 @@ expression: text
         {
           "name": "logins",
           "counter": true,
+          "aggregation": "sum",
           "max_versions": 0,
           "ttl_micros": null,
           "bloom_bits": 10,
@@ -102,6 +105,7 @@ expression: text
         {
           "name": "history",
           "counter": false,
+          "aggregation": null,
           "max_versions": 0,
           "ttl_micros": 2592000000000,
           "bloom_bits": 10,

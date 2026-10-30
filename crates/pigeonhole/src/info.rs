@@ -111,8 +111,12 @@ pub struct FamilyInfo {
     /// [`TableBuilder::family`](crate::TableBuilder::family) defines an identical family, in
     /// this database or another.
     pub family: Family,
-    /// A counter family ([`Family::counter`]).
+    /// A counter family ([`Family::counter`]): the aggregate family of
+    /// [`Aggregation::Sum`](crate::Aggregation::Sum).
     pub counter: bool,
+    /// The aggregation of an aggregate family ([`Family::aggregate`]), `None` for an
+    /// ordinary family. A counter family's is `Some(Aggregation::Sum)`.
+    pub aggregation: Option<crate::Aggregation>,
     /// Versions kept per column; 0 keeps all.
     pub max_versions: u32,
     /// Cells older than this by timestamp expire; `None` keeps them.
@@ -198,6 +202,7 @@ impl FamilyInfo {
             name: f.name.clone(),
             family: Family::from_engine(o.clone()),
             counter: o.kind == FamilyKind::Counter,
+            aggregation: crate::Aggregation::of_kind(o.kind),
             max_versions: o.max_versions,
             ttl: (o.ttl_micros != 0).then(|| Duration::from_micros(o.ttl_micros)),
             bloom_bits: o.bloom_bits,
@@ -208,8 +213,8 @@ impl FamilyInfo {
                 _ => Compression::Lz4,
             },
             block_size: o.block_size,
-            // A counter family's operator is the engine's own: `counter` says it.
-            merge_operator: (!o.merge_operator.is_empty() && o.kind != FamilyKind::Counter)
+            // An aggregate family's operator is the engine's own: `aggregation` says it.
+            merge_operator: (!o.merge_operator.is_empty() && !o.kind.is_aggregate())
                 .then(|| o.merge_operator.clone()),
             cache_priority: match o.cache_priority {
                 CachePriority::Low => Priority::Low,

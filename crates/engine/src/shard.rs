@@ -24,7 +24,7 @@ use pigeonhole_format::key::{
     MARKER_QUALIFIER, SUFFIX_LEN, compare, encode_column_prefix, encode_key_after_row,
     encode_marker_after_row, encode_marker_prefix, encode_row_prefix, split_suffix,
 };
-use pigeonhole_format::manifest::{CompactionStyle, Edit, FamilyKind};
+use pigeonhole_format::manifest::{CompactionStyle, Edit};
 use pigeonhole_format::scan::ScanFilter;
 use pigeonhole_format::wal::{BatchBuilder, BatchRef, StreamList, WalRecord};
 use pigeonhole_format::{
@@ -4386,7 +4386,7 @@ impl ShardState {
             let Some(meta) = view.catalog.family(key.1) else {
                 continue;
             };
-            let counter = meta.options.kind == FamilyKind::Counter;
+            let counter = meta.options.kind.is_aggregate();
             // Only a counter family's flush lists the slot's SSTs (D287).
             let fam = counter
                 .then(|| view.ssts.family(key.0, key.1).cloned())
@@ -4947,7 +4947,10 @@ impl ShardState {
                     options: meta.options.clone(),
                     // As when first queued (D287): only other flushes and compactions of the
                     // slot's older SSTs (below) and writes (above) changed the slot since.
-                    counter_sources: (meta.options.kind == FamilyKind::Counter)
+                    counter_sources: meta
+                        .options
+                        .kind
+                        .is_aggregate()
                         .then(|| {
                             counter_sources(
                                 view.ssts.family(key.0, key.1).map(|f| &**f),
@@ -5151,7 +5154,7 @@ impl ShardState {
         opts.ttl_micros = meta.options.ttl_micros;
         opts.versions = 1;
         opts.merge = meta.merge_op.clone();
-        opts.counter = meta.options.kind == FamilyKind::Counter;
+        opts.counter = meta.options.kind.is_aggregate();
         let resolver_blobs = crate::read::ResolverBlobs::attach(&mut opts, &view.ssts);
         let mut resolver = Resolver::new(MergingCursor::new(sources), opts);
         resolver.seek_column(row, qualifier)?;
@@ -5617,7 +5620,7 @@ impl ShardState {
             .load()
             .catalog
             .family(c.family)
-            .is_some_and(|m| m.table == c.table && m.options.kind == FamilyKind::Counter);
+            .is_some_and(|m| m.table == c.table && m.options.kind.is_aggregate());
         if !counter {
             return false;
         }
@@ -9673,7 +9676,7 @@ impl ShardState {
             &task,
             (mem_min_ts, mem_min_seqno),
             self.prepared.keys().copied(),
-            meta.options.kind == FamilyKind::Counter,
+            meta.options.kind.is_aggregate(),
             now,
         );
         // A slot whose purge writes kept voiding compacts once without it (#316).
@@ -9738,7 +9741,7 @@ impl ShardState {
         // could land among its inputs below that bound before it installs voids it.
         let guard = (gc.bottommost
             && gc.min_ts_above > 0
-            && meta.options.kind != FamilyKind::Counter
+            && !meta.options.kind.is_aggregate()
             && matches!(
                 task.kind,
                 pigeonhole_compaction::TaskKind::Rewrite

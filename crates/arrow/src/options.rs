@@ -71,8 +71,8 @@ impl ArrowOptions {
         self
     }
 
-    /// Adds the nullable columns `value_i64` (i64 and varint cells, so counters) and
-    /// `value_f64` (f64 cells). Default off.
+    /// Adds the nullable columns `value_i64` (i64 and varint cells, so counters and min and
+    /// max families) and `value_f64` (f64 cells). Default off.
     pub fn typed_values(mut self, on: bool) -> Self {
         self.typed_values = on;
         self

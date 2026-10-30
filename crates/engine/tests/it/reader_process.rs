@@ -530,3 +530,60 @@ fn a_reader_folds_operands_onto_a_separated_base() {
     vfs.enter_process(WRITER);
     w.close();
 }
+
+/// D294 (perf287's N4 on #1194): a reader process open before the writer creates the first
+/// min family reloads the root that carries the new feature bit (`reload_root`, then
+/// `features()`), and reads the family: this build knows the bit, so the reload neither
+/// refuses the file nor finds the family corrupt.
+#[test]
+fn a_reader_open_while_the_first_min_family_appears_reads_it() {
+    use pigeonhole_format::manifest::{FamilyKind, INCOMPAT_AGGREGATES};
+    let vfs = SimVfs::new(29);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs);
+    let t =
+        w.db.create_table("t", &[("f".into(), FamilyOptions::default())])
+            .unwrap();
+    write_rows(&mut w, &t, "row", "old", 0..20);
+
+    vfs.enter_process(READER);
+    let reader =
+        Engine::open_reader(Path::new(DB), common::options(Arc::clone(&vfs), 1, 4 << 20)).unwrap();
+    let snap = reader.snapshot().unwrap();
+    assert_eq!(
+        get(&reader, &snap, &t, "row00003").unwrap(),
+        Some(value("old", 3))
+    );
+    drop(snap);
+
+    vfs.enter_process(WRITER);
+    let family = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_min")
+        .kind(FamilyKind::Min);
+    let t = w.db.add_family(t.id, "min", family).unwrap();
+    assert_eq!(w.db.info().unwrap().features.incompat, INCOMPAT_AGGREGATES);
+    let min = t.family("min").unwrap().id;
+    for v in [5, -3, 8] {
+        let mut wb = WriteBatch::new();
+        wb.merge(t.id, min, b"r", b"q", ValueRef::I64(v)).unwrap();
+        w.commit(wb);
+    }
+
+    vfs.enter_process(READER);
+    let snap = reader.snapshot().unwrap();
+    let cell = reader.get(&snap, t.id, min, b"r", b"q").unwrap().unwrap();
+    assert_eq!(cell.value(), ValueRef::I64(-3));
+    assert_eq!(
+        get(&reader, &snap, &t, "row00003").unwrap(),
+        Some(value("old", 3))
+    );
+    assert_eq!(
+        reader.info().unwrap().features.incompat,
+        INCOMPAT_AGGREGATES
+    );
+    drop(snap);
+    drop(reader);
+
+    vfs.enter_process(WRITER);
+    w.close();
+}

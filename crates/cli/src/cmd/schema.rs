@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use pigeonhole::{Compaction, Compression, Family, FamilyInfo, Priority};
+use pigeonhole::{Aggregation, Compaction, Compression, Family, FamilyInfo, Priority};
 use serde_json::{Map, Value, json};
 
 /// A family's stored options as JSON fields (`name` first).
@@ -17,6 +17,12 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
     let v = json!({
         "name": f.name,
         "counter": f.counter,
+        "aggregation": f.aggregation.map(|a| match a {
+            Aggregation::Sum => "sum",
+            Aggregation::Min => "min",
+            Aggregation::Max => "max",
+            _ => "unknown",
+        }),
         "max_versions": f.max_versions,
         "ttl_micros": f.ttl.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX)),
         "bloom_bits": f.bloom_bits,
@@ -51,10 +57,13 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
         .as_str()
         .ok_or("a family without a name")?
         .to_owned();
-    let mut f = if v["counter"].as_bool() == Some(true) {
-        Family::counter()
-    } else {
-        Family::default()
+    // `aggregation` (D294) names the kind; files dumped before it say `counter` only.
+    let mut f = match (v["aggregation"].as_str(), v["counter"].as_bool()) {
+        (Some("sum"), _) | (None, Some(true)) => Family::counter(),
+        (Some("min"), _) => Family::aggregate(Aggregation::Min),
+        (Some("max"), _) => Family::aggregate(Aggregation::Max),
+        (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
+        (None, _) => Family::default(),
     };
     let num = |key: &str| v[key].as_u64();
     let bad = |key: &str| format!("family {name}: bad {key}");

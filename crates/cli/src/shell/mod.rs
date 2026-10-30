@@ -9,7 +9,7 @@
 //! put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
 //! incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
 //! delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-//! create <table> <family>[:counter]...
+//! create <table> <family>[:counter|:min|:max]...
 //! snapshot [--durable] <name>        release <name>
 //! \tables  \schema [table]  \info  \metrics  \health  \format F  \timing on|off  \help  \quit
 //! ```
@@ -23,7 +23,9 @@ use std::ops::Bound;
 use std::path::Path;
 use std::time::Instant;
 
-use pigeonhole::{Family, ReadTable, RowMutation, RowRef, Snapshot, Table, ValueFilter};
+use pigeonhole::{
+    Aggregation, Family, ReadTable, RowMutation, RowRef, Snapshot, Table, ValueFilter,
+};
 use serde_json::{Map, Value, json};
 
 use crate::ExitStatus;
@@ -46,8 +48,9 @@ commands (one per line; values are bytes: \"quoted\\n\", 0xhex, b64:base64):
          [--limit N] [--columns-per-row N] [--at SNAP]
   put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
   incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
+  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]
   delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-  create <table> <family>[:counter]...
+  create <table> <family>[:counter|:min|:max]...
   snapshot [--durable] <name>     release <name>
   \\tables  \\schema [table]  \\info  \\metrics  \\health
   \\format table|json|jsonl|csv  \\timing on|off  \\help  \\quit
@@ -224,7 +227,8 @@ impl Session {
             "get" => self.get(&args)?,
             "scan" => self.scan(&args)?,
             "put" => self.put(&args)?,
-            "incr" => self.incr(&args)?,
+            "incr" => self.incr(&args, false)?,
+            "aggregate" => self.incr(&args, true)?,
             "delete" => self.delete(&args)?,
             "create" => self.create(&args)?,
             "snapshot" => {
@@ -505,22 +509,29 @@ impl Session {
         Self::commit(m)
     }
 
-    fn incr(&self, args: &Args) -> Result<Report, Failure> {
+    /// `incr`, or with `aggregate` an input to an aggregate family (min and max families
+    /// refuse `incr`, D294).
+    fn incr(&self, args: &Args, aggregate: bool) -> Result<Report, Failure> {
         args.only(&["ts"])?;
         let table = args.text(0, "table")?;
         let row = args.bytes(1, "row")?;
         let (family, qualifier) = column(args.word(2, "family:qualifier")?, false)?;
         let qualifier = qualifier.expect("required");
-        let delta: i64 = args
-            .text(3, "delta")?
-            .parse()
-            .map_err(|_| Failure::usage("incr takes an integer delta"))?;
+        let delta: i64 = args.text(3, "delta")?.parse().map_err(|_| {
+            Failure::usage(if aggregate {
+                "aggregate takes an integer value"
+            } else {
+                "incr takes an integer delta"
+            })
+        })?;
         args.max_positional(4)?;
         let t = self.writable(table)?;
         let m = t.mutate(row);
-        let m = match args.num("ts")? {
-            Some(ts) => m.incr_at(&family, &qualifier, ts, delta),
-            None => m.incr(&family, &qualifier, delta),
+        let m = match (args.num("ts")?, aggregate) {
+            (Some(ts), false) => m.incr_at(&family, &qualifier, ts, delta),
+            (None, false) => m.incr(&family, &qualifier, delta),
+            (Some(ts), true) => m.aggregate_at(&family, &qualifier, ts, delta),
+            (None, true) => m.aggregate(&family, &qualifier, delta),
         };
         Self::commit(m)
     }
@@ -563,16 +574,20 @@ impl Session {
         };
         let table = args.text(0, "table")?;
         if args.positional.len() < 2 {
-            return Err(Failure::usage("create <table> <family>[:counter]..."));
+            return Err(Failure::usage(
+                "create <table> <family>[:counter|:min|:max]...",
+            ));
         }
         let mut b = db.table(table).map_err(|e| Failure::db("create", &e))?;
         for w in &args.positional[1..] {
             let spec = w
                 .text()
                 .ok_or_else(|| Failure::usage("a family name is UTF-8"))?;
-            b = match spec.strip_suffix(":counter") {
-                Some(name) => b.family(name, Family::counter()),
-                None => b.family(spec, Family::default()),
+            b = match spec.rsplit_once(':') {
+                Some((name, "counter")) => b.family(name, Family::counter()),
+                Some((name, "min")) => b.family(name, Family::aggregate(Aggregation::Min)),
+                Some((name, "max")) => b.family(name, Family::aggregate(Aggregation::Max)),
+                _ => b.family(spec, Family::default()),
             };
         }
         b.create().map_err(|e| Failure::db("create", &e))?;
@@ -607,6 +622,7 @@ impl Session {
             "table",
             "name",
             "counter",
+            "aggregation",
             "max_versions",
             "ttl_micros",
             "compression",

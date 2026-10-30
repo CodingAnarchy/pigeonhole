@@ -51,7 +51,7 @@ assert_eq!(names, [b"Ada".to_vec(), b"Grace".to_vec()]);
 
 | `ArrowOptions` | Effect |
 |---|---|
-| `typed_values(true)` | adds nullable `value_i64: Int64` (i64 and varint cells, so counters) and `value_f64: Float64` (f64 cells) |
+| `typed_values(true)` | adds nullable `value_i64: Int64` (i64 and varint cells, so counters and min and max families) and `value_f64: Float64` (f64 cells) |
 | `utf8_keys(true)` | `row` and `qualifier` as `Utf8`. A key that isn't valid UTF-8 fails its batch with an error naming the key; nothing is replaced |
 | `row_dictionary(true)` | `row` as `Dictionary<Int32, Binary>` (or `Utf8`): each key stored once per batch |
 | `ts(TsType::UInt64)` | `ts` as stored. With the default `Timestamp`, a timestamp above `i64::MAX` fails its batch with an error naming the row |

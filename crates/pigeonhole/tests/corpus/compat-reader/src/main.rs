@@ -6,7 +6,9 @@
 //! writes through a flush and a compaction, passes the offline check, and reads everything
 //! again after a reopen. An entry that uses a feature 1.0.0 lacks may be refused with
 //! `UnsupportedFeature`, as the promise allows: an `ro_compat` one is then read read-only
-//! with `read_only_fallback`, an `incompat` one is reported and skipped. Exits 1 if any
+//! with `read_only_fallback`, an `incompat` one is reported and skipped. An entry with a
+//! `refused-by-1.0.0.txt` (D294: it names the `incompat` bits it uses) must be refused, for
+//! exactly those bits: opening it, read-write or read-only, fails the entry. Exits 1 if any
 //! entry fails.
 
 use std::path::{Path, PathBuf};
@@ -193,11 +195,28 @@ fn main() {
     let mut failed = 0;
     for src in &entries {
         let name = src.file_name().unwrap().to_string_lossy().into_owned();
-        match check(src, &scratch.join(&name)) {
-            Ok(Outcome::Passed) => println!("{name}: ok"),
-            Ok(Outcome::ReadOnly) => println!("{name}: ok, read-only (an ro_compat feature)"),
-            Ok(Outcome::Refused(why)) => println!("{name}: refused, as allowed: {why}"),
-            Err(why) => {
+        // The bits a marked entry must be refused for.
+        let must_refuse = std::fs::read_to_string(src.join("refused-by-1.0.0.txt"))
+            .ok()
+            .map(|bits| format!("incompatible feature bits {})", bits.trim()));
+        match (check(src, &scratch.join(&name)), &must_refuse) {
+            (Ok(Outcome::Refused(why)), Some(bits)) if why.contains(bits.as_str()) => {
+                println!("{name}: refused, as it must be: {why}");
+            }
+            (Ok(Outcome::Refused(why)), Some(bits)) => {
+                println!("{name}: FAILED: refused, but not for {bits}: {why}");
+                failed += 1;
+            }
+            (Ok(_), Some(bits)) => {
+                println!("{name}: FAILED: opened, but must be refused for {bits}");
+                failed += 1;
+            }
+            (Ok(Outcome::Passed), None) => println!("{name}: ok"),
+            (Ok(Outcome::ReadOnly), None) => {
+                println!("{name}: ok, read-only (an ro_compat feature)");
+            }
+            (Ok(Outcome::Refused(why)), None) => println!("{name}: refused, as allowed: {why}"),
+            (Err(why), _) => {
                 println!("{name}: FAILED: {why}");
                 failed += 1;
             }

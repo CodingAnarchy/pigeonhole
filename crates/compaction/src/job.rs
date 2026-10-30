@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use pigeonhole_cache::BlockCache;
 use pigeonhole_format::key::{row_prefix_len, split_suffix};
-use pigeonhole_format::manifest::{FamilyKind, FamilyOptions, SstMeta};
+use pigeonhole_format::manifest::{FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
 use pigeonhole_format::{BlobFileId, Cursor, Seqno, SstId, TableId, Timestamp};
 use pigeonhole_io::VfsRef;
@@ -132,7 +132,7 @@ impl StreamGc {
                 ttl_micros: family.ttl_micros,
                 max_versions: family.max_versions,
                 merge,
-                counter: family.kind == FamilyKind::Counter,
+                counter: family.kind.is_aggregate(),
                 other_sources: policy.other_sources.clone(),
                 no_outside_deletes: policy.no_outside_deletes,
             }),
@@ -629,7 +629,7 @@ impl CompactionJob {
             ttl_micros: context.family.ttl_micros,
             max_versions: context.family.max_versions,
             merge: context.merge.clone(),
-            counter: context.family.kind == FamilyKind::Counter,
+            counter: context.family.kind.is_aggregate(),
             other_sources: context.gc.other_sources.clone(),
             no_outside_deletes: context.gc.no_outside_deletes,
         });
@@ -643,7 +643,7 @@ impl CompactionJob {
         options.fully_purged = (context.gc.bottommost
             && context.gc.snapshots.is_empty()
             && context.gc.min_ts_above == Timestamp::MAX
-            && (context.family.kind != FamilyKind::Counter
+            && (!context.family.kind.is_aggregate()
                 || context.gc.other_sources.as_ref().is_some_and(Vec::is_empty)))
         .then_some(context.family.max_versions);
         let subranges = if task.subranges.is_empty() {

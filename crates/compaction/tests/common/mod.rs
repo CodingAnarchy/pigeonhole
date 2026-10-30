@@ -265,7 +265,9 @@ fn commit_ops(
 ) -> Vec<Entry> {
     let seqno = model.commit(ops, commit_ts, Durability::Sync);
     // Counter writes of one cell combine within a commit, as the store does them (#295).
-    let ops = &combine_counter_writes(ops, |_, _| counter);
+    let ops = &combine_counter_writes(ops, |_, _| {
+        counter.then_some(pigeonhole_sim::ModelAggregation::Sum)
+    });
     // Where a put or operand without a timestamp lands.
     let default_ts = if counter { COUNTER_TS } else { commit_ts };
     // The same commit as stored entries, collapsed like the model (D34).

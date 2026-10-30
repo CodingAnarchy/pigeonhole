@@ -103,7 +103,7 @@ impl ExtentRef {
 /// use pigeonhole_format::superblock::Features;
 ///
 /// assert!(Features::default().check_read().is_ok());
-/// assert!(Features { incompat: 1, ..Features::default() }.check_read().is_err());
+/// assert!(Features { incompat: 1 << 40, ..Features::default() }.check_read().is_err());
 /// let ro = Features { ro_compat: 1 << 5, ..Features::default() };
 /// assert!(ro.check_read().is_ok() && ro.check_write().is_err());
 /// assert!(Features { compat: 1, ..Features::default() }.check_write().is_ok());
@@ -119,13 +119,13 @@ pub struct Features {
 }
 
 impl Features {
-    /// The `compat` bits this build knows (none yet: format 4's first release defines no
-    /// feature).
+    /// The `compat` bits this build knows (none yet).
     pub const KNOWN_COMPAT: u64 = 0;
-    /// The `ro_compat` bits this build knows.
+    /// The `ro_compat` bits this build knows (none yet).
     pub const KNOWN_RO_COMPAT: u64 = 0;
-    /// The `incompat` bits this build knows.
-    pub const KNOWN_INCOMPAT: u64 = 0;
+    /// The `incompat` bits this build knows: bit 0, the Min and Max family kinds
+    /// ([`INCOMPAT_AGGREGATES`](crate::manifest::INCOMPAT_AGGREGATES), D294).
+    pub const KNOWN_INCOMPAT: u64 = crate::manifest::INCOMPAT_AGGREGATES;
 
     /// `incompat` bits this build does not know.
     pub fn unknown_incompat(&self) -> u64 {
