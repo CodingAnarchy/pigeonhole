@@ -13,9 +13,11 @@ on:
     paths:
       - "crates/bench/**"
 
+# A newer push to a pull request supersedes its older run (cancelled); a push to main never
+# cancels the run before it, or with merges landing faster than a run main never finishes one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always

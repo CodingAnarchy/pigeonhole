@@ -24,9 +24,11 @@ on:
     - cron: "23 5 * * 1"
   workflow_dispatch:
 
+# A newer push to a pull request supersedes its older run (cancelled); a push to main never
+# cancels the run before it, or with merges landing faster than a run main never finishes one.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
