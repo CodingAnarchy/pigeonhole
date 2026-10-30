@@ -519,9 +519,6 @@ impl Gc {
                 }
                 // Markers never share a group with cells.
                 Kind::FamilyDelete => true,
-                // A kind this build doesn't know is refused as its key is decoded
-                // (`UnsupportedFeature`): never reached. Keep it rather than drop it.
-                _ => true,
             };
             let key = e.key_start..e.val_start;
             let value = e.val_start..e.end;
@@ -620,8 +617,6 @@ impl Gc {
                     !redundant && !(i == 0 && self.counter_purgeable(ts, e.seqno))
                 }
                 Kind::FamilyDelete => true,
-                // Never reached (see above): keep it.
-                _ => true,
             };
             let key = e.key_start..e.val_start;
             let value = e.val_start..e.end;

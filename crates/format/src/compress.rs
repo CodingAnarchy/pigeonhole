@@ -16,9 +16,6 @@ use crate::Error;
 /// A block compression codec. Numbers are frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
-// D295: later 1.x releases add codecs, behind a feature bit (FORMAT §13.2: a time-series codec,
-// #491)
-#[non_exhaustive]
 pub enum Compression {
     /// Stored as is.
     None = 0,

@@ -1025,7 +1025,6 @@ pub fn value_bytes(v: ValueRef<'_>) -> Vec<u8> {
         ValueRef::I64(x) | ValueRef::Varint(x) => x.to_le_bytes().to_vec(),
         ValueRef::F64(x) => x.to_le_bytes().to_vec(),
         ValueRef::Blob(_) => panic!("blob pointer returned"),
-        other => panic!("a value type this test doesn't know: {other:?}"),
     }
 }
 

@@ -61,9 +61,6 @@ const MAX_LZ4_RATIO: usize = 255;
 /// What a block holds. Numbers are frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
-// D295: later 1.x releases add kinds, behind a feature bit (FORMAT §13.2: a vector data block,
-// #490)
-#[non_exhaustive]
 pub enum BlockKind {
     /// Cells: internal key to stored value.
     Data = 1,

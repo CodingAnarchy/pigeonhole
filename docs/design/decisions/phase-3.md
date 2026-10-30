@@ -3132,15 +3132,12 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Pins.** `[workspace.dependencies]` pins each internal crate at `=<internal line>`, and each public crate at the public line.
   - `scripts/versions.py check` (CI) fails if either line or any pin is out of step.
   - `versions.py list` gives each published crate's version, which `.coord/publish.sh` publishes; it then checks all 15 are on crates.io at their versions.
+  - `versions.py release-check <previous tag>`, which `publish.sh` runs first, fails if a line's crates changed since that release (`src/`, a `build.rs`, a manifest, or the workspace's shared settings) while the line's version didn't move. Publishing would otherwise skip them, since they're already on crates.io at that version, and ship stale code (perf287's S2 on #1196).
 - **Releases.** Tags, `CHANGELOG.md` and the release corpus follow `pigeonhole`'s version. The bump PR bumps the public line every release, and the internal line only if an internal crate changed (CONTRIBUTING.md, Releases). The next release would be, for example, `pigeonhole` 1.1.0 with the internals at 2.0.0.
-- **Fewer majors.** The internal enums with foreseeable growth become `#[non_exhaustive]` in the same major, so the post-1.0 features FORMAT §13.2 tracks add variants without another one:
-  - `FamilyKind` (#487's HLL, #488, #489);
-  - `ValueTag` and `ValueRef` (vector values #490, blob pointers #491);
-  - `Compression` (a time-series codec, #491);
-  - `BlockKind` (a vector data block, #490);
-  - the key `Kind`.
-
-  The others (`CompactionStyle`, `CachePriority`, `FilterKind`, `ManifestBlockKind`, `FragmentType`, `Durability`, `QualifierFilter`, `Verdict` and `Decoded`) have no planned growth and stay exhaustive. `Edit`, `RecordType`, `WalRecord` and the error enums already were non-exhaustive.
+- **Internal enums stay exhaustive** (owner, 2026-10-30, on perf287's S1 on #1196). A new variant of an internal public enum (`FamilyKind`, `ValueTag`, `ValueRef`, `Compression`, `BlockKind`, the key `Kind` and the rest) takes the internal line's next major, and that's expected.
+  - **Cost:** a major on the internal line costs nothing under exact pins: one number in the bump PR.
+  - **What it keeps:** the workspace's matches on those enums stay exhaustive. When a feature adds a variant (#487's HLL, a vector value tag), the compiler lists every site that must handle it, rather than routing it silently into a wildcard arm. For format kinds behind feature bits, that turns a possible data bug into a compile error.
+  - `#[non_exhaustive]` stays where it already was: `Edit`, `RecordType`, `WalRecord` and the error enums.
 
 **CI.** The semver step still checks every published crate against crates.io:
 - the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
