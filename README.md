@@ -69,7 +69,7 @@ Measured on the reference machine (Hetzner AX102: AMD Ryzen 9 7950X3D, 16 cores,
 |---|--:|--:|--:|
 | Row read (YCSB C) | 385K ops/s | 0.94 µs | 12.0 µs |
 | Point get, wide rows (sparse-wide) | — | 2.5 µs | 9.6 µs |
-| Put (YCSB A) | — | 5.5 µs | 8.5 µs |
+| Put (YCSB A) | — | 5.4 µs | 8.3 µs |
 | Scan of up to 100 rows (YCSB E) | 20K ops/s | 48 µs | 111 µs |
 | Reads and read-modify-writes (YCSB F) | 88.9K ops/s | 12.4 µs | 27.6 µs |
 
