@@ -1,5 +1,7 @@
 # Performance compared with SQLite
 
+<!-- GATE 4 (release PR): refresh this page's figures from gate 4's #759 runs (equal cache memory, YCSB A and F, SQLite / Pigeonhole max / paced). -->
+
 Pigeonhole is often weighed against SQLite: both are embedded, single-file stores. This page states the tradeoff for point reads under a mixed read-write load, measured as #759 judges it.
 
 **Setup:** 16 threads on one machine (AMD Ryzen 9 7950X3D, NVMe, Linux 6.8). YCSB A (50% reads, 50% updates) and F (50% reads, 50% read-modify-writes) over 1 million rows. Each store has the same 1 GiB of read cache. Both run at their default durability: Pigeonhole's `Durability::GroupSync`, and SQLite in WAL mode with `synchronous=FULL`. Pigeonhole runs its defaults, including the shard-thread load controller, which is on by default. Measured on 2026-10-29 at commit `cba09184`, three runs of each arm; the ranges below span the runs.

@@ -1,2 +1,0 @@
-### Changed
-- `pigeonhole`, `pigeonhole-engine`: a transaction's `get` now conflicts per cell (D275, #917). A commit that writes another column of the same family in that row no longer makes it conflict; one that writes the cell, or deletes its family or row, still does. `get_row` still conflicts with any write to the families it read. Concurrent read-modify-writes of different fields of a hot row now commit side by side.

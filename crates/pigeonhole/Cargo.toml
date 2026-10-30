@@ -1,6 +1,6 @@
 [package]
 name = "pigeonhole"
-description = "Embedded, single-file, wide-column store: BigTable's data model with SQLite's deployment model. Pre-1.0: the file format is frozen for 1.x; the API may still change before 1.0."
+description = "Embedded, single-file, wide-column store: BigTable's data model with SQLite's deployment model."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,10 @@ authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
+# The tests stay in the repository: the compatibility corpus under tests/corpus is most of the
+# crate's size (about 29 MiB, and every release corpus adds more), and the published crate needs
+# none of it.
+exclude = ["tests/"]
 
 [features]
 # The async front door (`get_async`, `commit_async`, scan streams), default-on per the

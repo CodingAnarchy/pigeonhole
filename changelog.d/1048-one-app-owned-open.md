@@ -1,2 +1,0 @@
-### Changed
-- **Breaking (before the 1.0 API freeze; ICR 0088):** `Pigeonhole::open_application_owned` returns an `AppOwned { db, shards, workers }` instead of `(Pigeonhole, Vec<Shard>)`, and `open_application_owned_with` is gone. Write `let AppOwned { db, shards, .. } = Pigeonhole::open_application_owned(path, options)?;`. With `Options::background_workers(n)`, `workers` holds the background workers; the old tuple form refused them.

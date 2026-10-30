@@ -1,6 +1,6 @@
 # Agent reference
 
-> **Status:** describes `main`; crates.io has 0.3.4 (what `main` adds: [changelog](../../CHANGELOG.md), [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). **P2/P3/P4** mark the phase a feature ships in; "early" marks one that already works. If this page and the rustdoc disagree, the rustdoc wins.
+> **Status:** describes `main`; crates.io has 1.0.0 (what `main` adds after it: [`changelog.d/`](../../changelog.d/README.md)). Signatures are authoritative (from `crates/pigeonhole/src`). Samples run as doctests (`#` lines are hidden setup). If this page and the rustdoc disagree, the rustdoc wins.
 
 Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Errors: [`errors.md`](errors.md).
 
@@ -44,7 +44,7 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | Type | Role |
 |---|---|
 | `Pigeonhole` | Writer handle. |
-| `PigeonholeReader` | Read-only handle in another process (P4, early). |
+| `PigeonholeReader` | Read-only handle in another process. |
 | `Shard` | One shard in application-owned mode. |
 | `AppOwned` | `#[non_exhaustive]` `{ db: Pigeonhole, shards: Vec<Shard>, workers: Vec<BackgroundWorker> }`, from `open_application_owned` (D284, ICR 0078, ICR 0088); destructure with `..`. |
 | `BackgroundWorker` | One background worker for flush and compaction in application-owned mode (D284). |
@@ -55,8 +55,8 @@ Import: `use pigeonhole::{...}`. Everything is re-exported at the crate root. Er
 | `IoRings { rings: usize, attach_failures: u64, inline: u64 }` | `#[non_exhaustive]`; `Pigeonhole::io_rings` and `PigeonholeReader::io_rings` result. |
 | `Compaction` | `Leveled` (default; read-heavy), `Tiered` (write-heavy), `FifoByTime` (TTL'd time series: drops whole expired files). See [Compaction styles](concepts.md#compaction-styles). |
 | `Durability` | `None`, `Buffered`, `GroupSync` (default), `Sync`. |
-| `TableBuilder`, `Table`, `ReadTable` | Define/open a table; read-write handle; read-only handle (P4, early). |
-| `RowMutation`, `WriteBatch`, `Transaction` | Writes; `Transaction` is P4, early. |
+| `TableBuilder`, `Table`, `ReadTable` | Define/open a table; read-write handle; read-only handle. |
+| `RowMutation`, `WriteBatch`, `Transaction` | Writes. |
 | `CommitInfo { seqno: u64, durability: Durability }` | Commit result. |
 | `RowRead`, `Scan`, `RowIter` | Read builders; scan iterator. |
 | `CommitTicket` | A submitted commit to wait on or check later (`commit_with_ticket`). |
@@ -82,7 +82,7 @@ Every public enum is `#[non_exhaustive]` (ICR 0071, ICR 0073): a `match` outside
 | Signature | Semantics |
 |---|---|
 | `open(path: impl AsRef<Path>, Options) -> Result<Pigeonhole>` | Open or create as writer; replays WAL. |
-| `open_reader(path, ReaderOptions) -> Result<PigeonholeReader>` | P4, early. Read-only, any number of processes. Needs write permission on the file (D36). |
+| `open_reader(path, ReaderOptions) -> Result<PigeonholeReader>` | Read-only, any number of processes. Needs write permission on the file (D36). |
 | `PigeonholeReader::backup(dest)` / `backup_durable(dest)` | ICR 0049: as the writer's, from a reader process while the writer runs. Its shm pin holds the whole view, memtables included, for the copy's length: on a write-heavy database the writer's commits can wait (`write_stall_timeout`, then `Busy`). A writer restart mid-copy gives `SnapshotExpired` and removes the partial copy. |
 | `open_application_owned(path, Options) -> Result<AppOwned>` (ICR 0088) | Writer with no shard or compaction threads (with io_uring, the default on Linux, it runs no threads at all; with `pread` it runs 2–16 I/O threads); you drive each `Shard`. `compaction_cores(k > 0)` → `InvalidArgument` (D40). With `background_workers(n)`, `AppOwned::workers` holds `n` workers that run flush and compaction off the shards, driven like shards from any thread (D284, ICR 0078). The close takes their tasks back and never waits for them to be driven. |
 | `table(&self, name: &str) -> Result<TableBuilder<'_>>` | Start define/open. |
@@ -109,7 +109,7 @@ Every public enum is `#[non_exhaustive]` (ICR 0071, ICR 0073): a `match` outside
 | `failure(&self) -> Option<Failure>` | The first failure: `Failure { shard: u32, cause: FailureCause }` (`shard` is `Failure::MAIN_FILE` for the main file; `FailureCause` `#[repr(u8)]`: `Panic` 1, `DriverDropped` 2, `Io` 3, `Internal` 4). Later failures don't replace it. |
 | `close(self) -> Result<()>` | Flushes memtables, checkpoints the WAL; the last handle out removes the sidecars and shm, leaving one file. |
 
-`PigeonholeReader` (P4, early): `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`, `durable_snapshot() -> Result<Snapshot>`, `backup(dest)` / `backup_durable(dest)`, `info() -> Result<DatabaseInfo>`, `row_cache_stats() -> RowCacheStats` (D281; `write_throughs` stays 0, a reader applies no commits), `io_rings()`, `async_sync_reads()`. No write methods.
+`PigeonholeReader`: `table(&self, &str) -> Result<ReadTable>`, `tables() -> Vec<String>`, `snapshot() -> Result<Snapshot>`, `durable_snapshot() -> Result<Snapshot>`, `backup(dest)` / `backup_durable(dest)`, `info() -> Result<DatabaseInfo>`, `row_cache_stats() -> RowCacheStats` (D281; `write_throughs` stays 0, a reader applies no commits), `io_rings()`, `async_sync_reads()`. No write methods.
 `Snapshot`: `seqno(&self) -> u64`.
 `Shard`: `index() -> usize`, `run_once(&mut self, budget: Duration) -> bool` (true if work remains; background work waiting for a time does not count. A call: completes this thread's finished io_uring I/O; handles up to 1,024 queued messages and commits them as one group, not bounded by `budget`; then, unless that completed a future woken through `waker()` (then it returns `true` at once, at most 8 calls in a row, D237), runs background work in slices of at most 500 µs until `budget` is spent, handling new messages between slices), `next_wakeup(&self) -> Option<Duration>` (time until that background work is due; the tablet balancer's next pass keeps it `Some`: at most 100 ms after a write, backing off to 10 s while idle), `set_wakeup(&mut self, Box<dyn Fn() + Send + Sync>)` (fires when work arrives, not when background work falls due). `wait(&mut self, timeout: Duration)` (#553: blocks until work arrives, a `waker()` wake, this thread's own I/O completes, background work falls due, or the timeout; every backend, no fd needed; the loop for one shard per thread) and `waker(&self) -> Waker` (ends `wait` from any thread: give it to the futures the driving thread polls). `io_fd(&self) -> Option<i32>` (with io_uring, the default on Linux: a descriptor that turns readable when I/O this thread submitted has finished and waits for `run_once`; take it on the driving thread after its first `run_once`. Taking it is the opt-in that stops `next_wakeup` reporting in-flight I/O as due now, so wait on it from then on; `None` on `Pread`, without io_uring or with a custom VFS; D202). `closed(&self) -> Option<Result<()>>` (the close's outcome once the whole close has finished), `release(&mut self)` (before handing the shard to another thread: drives it until the calling thread has none of its I/O in flight; required with io_uring (the default on Linux) in application-owned mode, where only the submitting thread completes its ring's I/O, and a no-op on pread and in engine-owned mode; debug builds panic on a move that skipped it; #492). Loop: `run_once`, poll this thread's futures with `waker()` after every call, and `wait(timeout)` once `run_once` returned `false`; or, in your own event loop, sleep until the wakeup fires (work arrived), `io_fd` turns readable (I/O completed) or `next_wakeup` passes. After `close()`, keep looping until `closed()` is `Some`, then drop the shard; `close()` on a thread that drives no shard (once every shard has been run) waits for this and returns the outcome; on a driving thread, or before every shard has run, it returns `Ok(())` at once and the outcome is only in `closed()`. On a thread that drives a shard (it last called `run_once`), `commit`, `commit_if`, transaction commits, `flush` and `compact` fail with `InvalidArgument` before submitting anything; awaiting an already-submitted commit there blocking fails with `WouldDeadlock` (it will apply: poll it from the event loop). A thread holding a shard it never ran is not detected: run the shard first.
 `BackgroundWorker` (D284): `run_once(&mut self, budget: Duration) -> bool` (flush and compaction slices for up to `budget`, flushes first, at most two tasks held; its I/O completes inside the call, so it may move between threads freely; true if work remains), `next_wakeup(&self) -> Option<Duration>`, `wait(&mut self, timeout)`, `waker() -> Waker`, `set_wakeup(Box<dyn Fn() + Send + Sync>)` (called once right away, then on new work and on the close), `closed() -> bool` (the close took its tasks back: drop it). Dropping it earlier hands its tasks back to the shards. `AppOwned::spawn_background_threads(&mut self) -> Result<Vec<JoinHandle<()>>>` gives each worker a thread (`pigeonhole-worker-<i>`) that drives it until the close; `Io` if the OS refuses a thread, with the workers that got none back in `workers`.
@@ -148,7 +148,7 @@ Every public enum is `#[non_exhaustive]` (ICR 0071, ICR 0073): a `match` outside
 
 Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wal_segment_size`, `tablet_balance`, `counter_checkpoint_steps`, `row_cache_get_fill`, `nowait_reads`, `commit_spin`, `shard_spin`, `tablet_changes` and `tablet_packing` exist only with the `__unstable-hooks` feature (ICR 0085), which applications never turn on.
 
-`ReaderOptions` (P4, early): `block_cache(usize)` (default 256 MiB **per reader process**, on top of the writer's), `row_cache(usize)` (default 64 MiB **per reader process**, 0 = off; needs the writer's row cache on; D281), `row_cache_max_row(usize)`, `row_cache_family(&str, &str)`, `shm_dir(..)`, `merge_operator(..)`, `allow_fuse(bool)`, `io_backend(IoBackend)`, `direct_io(bool)` (as on `Options`).
+`ReaderOptions`: `block_cache(usize)` (default 256 MiB **per reader process**, on top of the writer's), `row_cache(usize)` (default 64 MiB **per reader process**, 0 = off; needs the writer's row cache on; D281), `row_cache_max_row(usize)`, `row_cache_family(&str, &str)`, `shm_dir(..)`, `merge_operator(..)`, `allow_fuse(bool)`, `io_backend(IoBackend)`, `direct_io(bool)` (as on `Options`).
 
 <a id="family"></a>
 ## `Family` (all `self -> Self`; stored in file)
@@ -185,7 +185,7 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 | `Table::scan_bounds(&self, Bound<&[u8]>, Bound<&[u8]>) -> Scan<'_>` | Explicit bounds. |
 | `Table::shard_of(&self, row: &[u8]) -> Option<usize>` | The shard owning `row` now (`Shard::index`): a routing hint for application-owned mode (commit owned rows inline); may change after a split or move; commits are correct either way (ICR 0022). |
 
-`ReadTable` (P4, early) has `name`, `get`, `get_at`, `row`, `scan`, `scan_prefix`, `scan_bounds` with the same signatures.
+`ReadTable` has `name`, `get`, `get_at`, `row`, `scan`, `scan_prefix`, `scan_bounds` with the same signatures.
 
 ## `RowMutation` (builder; each `self -> Self`)
 | Method | Semantics |
@@ -227,7 +227,7 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 | `commit(self) -> Result<CommitInfo>` | Writer default durability. |
 | `commit_with(self, Durability) -> Result<CommitInfo>` | Override. |
 
-`Transaction` (P4, early): `get(&mut self, &Table, row, family, qualifier) -> Result<Option<CellRef<'_>>>`, `get_row(..)`, `get_async(..)`, every `RowMutation` write op (as `WriteBatch`, `&mut Self`), `commit(self)`, `commit_with(self, Durability)`; `Conflict` on a conflicting commit. See `transaction` above.
+`Transaction`: `get(&mut self, &Table, row, family, qualifier) -> Result<Option<CellRef<'_>>>`, `get_row(..)`, `get_async(..)`, every `RowMutation` write op (as `WriteBatch`, `&mut Self`), `commit(self)`, `commit_with(self, Durability)`; `Conflict` on a conflicting commit. See `transaction` above.
 
 ## `RowRead` / `Scan` (builders, `self -> Self`)
 | Method | `RowRead` | `Scan` |

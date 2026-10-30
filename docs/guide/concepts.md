@@ -1,6 +1,6 @@
 # Concepts
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.3.4, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Features from later phases are labeled.
+> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it.
 
 Pigeonhole stores a sorted, sparse, versioned map:
 
@@ -62,7 +62,7 @@ In a counter family a delete hides only what earlier commits wrote, so counting 
 
 These rules hold only until compaction purges the markers (HBase semantics, decision D74). A bottommost compaction with no open snapshot that needs them removes delete markers and versions beyond `max_versions` for good. After that, a write with an **older explicit timestamp** (`put_at`, `delete_cell`) behaves as if they never existed: a `put_at` below a purged delete becomes visible, and deleting the newest version does not bring back a purged older one. Writes with default timestamps are never affected. See [Data modeling](data-modeling.md#versions).
 
-## Multi-process readers (Phase 4; available now)
+## Multi-process readers
 One writer process and any number of reader processes on the same host can open the same `.phdb` file; readers see each commit as soon as the writer publishes it. A reader's handle (`Pigeonhole::open_reader`) has no write methods, but the reader process still opens the file **read-write** and writes nothing to it: the processes coordinate with byte-range locks on the file, and some of those locks are exclusive, which POSIX grants only on a writable file descriptor. This is the same requirement SQLite has in WAL mode. So every reader process needs write permission on the database file, and a database on read-only media cannot be opened by readers.
 
 **Upgrades:** the writer and every reader process must run builds with the same shared-memory layout. **Stop reader processes before upgrading the writer.** A writer of a newer layout (this release's is 6) fails to open with `ShmVersionMismatch` while readers of an older build are still attached, and an older reader can't attach to a newer writer.
@@ -83,7 +83,7 @@ A reader's snapshot survives the writer closing. Once a new writer opens, though
 - **One format for 1.x.** Every 1.x release reads and writes file format 4 (`DatabaseInfo::format_version`), and opens every file written by 0.1.0 or later. Features added after 1.0 don't change the format version: a file sets a feature bit once it uses one (`DatabaseInfo::features`), and a file that uses none stays openable by every 1.x release. [`FORMAT.md` §13](../../FORMAT.md#13-compatibility-promise) is the full promise.
 - **Upgrading is one-way. Back up first.** Opening an older file writable with a newer release upgrades it (to format 4 from 0.x files), and the older release then refuses it with `UnsupportedFormat`. Take a `backup` (or copy the closed file) before the first writable open with a new release if you may need to roll back. A read-only open never upgrades: reader processes, and `Options::read_only_fallback`.
 - **Opening a newer file with an older release.** It works read-write unless the file uses a feature the older release lacks. Then the open fails with `UnsupportedFeature`, naming the feature bits. Some features allow reading only: `Options::read_only_fallback(true)` opens those read-only, writing nothing to the file. Upgrade the library to write.
-- **Shared memory is separate.** The writer and its reader processes must run releases with the same shared-memory layout, which may change in any release (see [Multi-process readers](#multi-process-readers-phase-4-available-now)): stop the readers before upgrading the writer.
+- **Shared memory is separate.** The writer and its reader processes must run releases with the same shared-memory layout, which may change in any release (see [Multi-process readers](#multi-process-readers)): stop the readers before upgrading the writer.
 
 ## Versions and compatibility
 From 1.0.0 (D282):

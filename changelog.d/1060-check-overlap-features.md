@@ -1,3 +1,0 @@
-### Fixed
-- `phdb check` (and `pigeonhole::check`) now reports two structures that the manifest places on exactly the same extent as an allocation overlap. Previously, only partial overlaps were reported, so a double allocation went unreported unless one of the structures also failed to parse.
-- `phdb check` now refuses a file that uses an incompatible feature it doesn't know, in either superblock slot or in a WAL segment header, as it refuses a newer format version. Previously, it reported the superblock case as corruption (exit 3), and it treated such a WAL segment as a blank slot, so the segments after it were reported as unreachable (#1060).

@@ -1,2 +1,0 @@
-### Changed
-- A transaction that writes nothing now commits at once and never fails with `Conflict` (#694, ICR 0060). Its reads all come from one snapshot, so it's serializable there. It used to be validated like a writing transaction, which could abort it for nothing. Its `CommitInfo` names the snapshot's seqno and `Durability::None`, because it wrote nothing. A read-only transaction at `Sync` no longer makes what it read durable as a side effect: use `durable_snapshot` for reads that must be durable.

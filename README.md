@@ -7,9 +7,9 @@
 [![docs.rs](https://img.shields.io/docsrs/pigeonhole)](https://docs.rs/pigeonhole)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in simulation, and the wide-column model (Phase 2: counter families, blob separation, compaction styles, zstd) is complete in 0.2.0: its performance gate is met as amended by [D193](docs/design/decisions/phase-2.md#d193), with one documented gap, the read tail of wide, heavily overwritten rows ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The latency engine (Phase 3: io_uring, direct I/O, the async API, apply-time visibility, group syncs, pinned thread-per-core shards) is complete in 0.3.0: its gate passed on the reference machine, with the remaining contended gaps carried to Phase 4 ([status](docs/status.md#phase-3-gate-results)). The file format is frozen for 1.x at format 4 ([`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) is the compatibility promise, from 1.0.0); the API may still change before 1.0. Pigeonhole is **not recommended for production use yet**. See [`docs/status.md`](docs/status.md) for the roadmap.
+> **Maturity: 1.0.** The public API of `pigeonhole`, `pigeonhole-arrow` and `phdb` follows semver from 1.0.0 ([D282](docs/design/decisions/phase-3.md#d282)), and every 1.x release reads and writes file format 4 ([`FORMAT.md` §13](FORMAT.md#13-compatibility-promise) is the compatibility promise). All four phases are complete: the core engine (Phase 1), the wide-column model (Phase 2), the latency engine (Phase 3) and hardening (Phase 4), each with its performance gate on the reference machine. <!-- GATE 4: the release gate's verdict in one clause (date, main commit). --> 1.0 ships with documented gaps, listed in [`docs/status.md`](docs/status.md).
 
-> **Status: usable and disk-backed.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. The current release is 0.3.4 (see the [changelog](CHANGELOG.md)): every data operation has a blocking form and an async form, on by default ([async guide](docs/guide/async.md)).
+> **Status: usable and disk-backed.** Memtables flush into the file and compact, so data is bounded by the disk, not memory; commits are crash-safe through the write-ahead log, and a clean close leaves one file. The current release is 1.0.0 (see the [changelog](CHANGELOG.md)): every data operation has a blocking form and an async form, on by default ([async guide](docs/guide/async.md)).
 
 SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missing quadrant: local **sparse, versioned, row-scan-heavy** data — feature stores, time series keyed by entity, crawl and event caches, graph adjacency, per-user state. `cargo add pigeonhole`, open a file, and get rows of arbitrary sparse columns grouped into families, with versions, TTLs, prefix and range scans, and no server.
 
@@ -17,7 +17,7 @@ SQLite owns local OLTP and DuckDB owns local OLAP. Pigeonhole targets the missin
 ```sh
 cargo add pigeonhole
 ```
-or `pigeonhole = "0.3"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on [docs.rs](https://docs.rs/pigeonhole); what changed is in the [changelog](CHANGELOG.md) and the [0.3.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.0).
+or `pigeonhole = "1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on [docs.rs](https://docs.rs/pigeonhole); what changed is in the [changelog](CHANGELOG.md) and the [1.0.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0).
 
 ```rust
 use pigeonhole::{Pigeonhole, Options, Family};
@@ -61,6 +61,7 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 | **Value** | Bytes, up to 4 GiB − 2. Values above a family's blob threshold live in blob files; one too large for the WAL and memtable (above the smaller of 64 MiB and half a shard's memtable arena) is written to a blob file as it is committed. Optional typed merge operators. |
 
 ## Performance
+<!-- GATE 4 (release PR): replace every figure in this section from gate 4: the commit and date, both tables, the durable-commit line, and add the Sync rows marked below. -->
 Measured on the reference machine (Hetzner AX102: AMD Ryzen 9 7950X3D, 16 cores, NVMe, Linux), in the release gate of 2026-10-29 on `main` [`cba09184`](https://github.com/CodingAnarchy/pigeonhole/commit/cba09184). 1 million rows (about 1 GB, so reads that miss the 256 MiB block cache hit the OS page cache). [Performance compared with SQLite](docs/guide/performance.md) and [`docs/bench.md`](docs/bench.md) have the full tables and method.
 
 **One client** (`Durability::Buffered`):

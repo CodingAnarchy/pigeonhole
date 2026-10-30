@@ -1,2 +1,0 @@
-### Fixed
-- On a stopped clock (the simulator's, or a test's), a `flush` or `compact` waiting for arena room that in-process snapshots hold no longer gets `Busy` while a cross-shard commit's share is still undecided on that shard, or a group's sync is in flight there (#839). It waits for them, as a write waiting for room already did, since the decision may free room. On a running clock nothing changes: the callers wait up to `write_stall_timeout` as before.

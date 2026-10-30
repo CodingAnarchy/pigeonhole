@@ -1,2 +1,0 @@
-### Fixed
-- Reader processes: opening a database whose file reuses a deleted database's inode now fails with `ErrorCode::NoWriter`, not `ErrorCode::Corruption`, until that database's writer runs (#1133). Shared memory is named by the data file's device and inode, so a writer killed before deleting its database left a region the new file found. The new database's writer now removes that region and starts its own at generation 1. A reader never mapped the old database's data: its database id check refused it.

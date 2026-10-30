@@ -1,4 +1,0 @@
-### Added
-- `Pigeonhole::info` and `PigeonholeReader::info`: what a database holds and how it is stored. They give the format version, the file and free bytes, and per table its tablets, its families' stored options, and their SSTs per level and blob files (`DatabaseInfo`, `TableInfo`, `FamilyInfo`, `FamilyStorage`, `LevelInfo`, `Compression`; ICR 0047).
-- `Table::family_info`, `ReadTable::family_info` and `ReadTable::families`: a family's stored options read back. `FamilyInfo::family` is a `Family` that defines an identical family elsewhere (ICR 0047).
-- The `phdb` command-line tool (`pigeonhole-cli`, #692), starting with `phdb info`. It offers `table`, `json`, `jsonl` and `csv` output, stable JSON for programs (`"phdb": 1`) and documented exit statuses. It opens as a reader process while a writer runs, and otherwise as the writer for the command. See [the CLI guide](docs/guide/cli.md).

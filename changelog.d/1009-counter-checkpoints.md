@@ -1,2 +1,0 @@
-### Changed
-- Reads of hot counters no longer slow down with the number of increments since the last flush (#713, D291). A counter read that folds many increments now leaves its result in memory, so the next reads of that counter fold only what came after it. Read results are unchanged at every snapshot. In the counters benchmark, the counter-read p99 fell from milliseconds to tens of microseconds.

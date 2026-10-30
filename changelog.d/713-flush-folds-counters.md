@@ -1,2 +1,0 @@
-### Changed
-- Counter families: a flush now combines a memtable's increments of each counter into one operand, as compaction already did (D287, #713). Before, every increment reached the first level as its own entry, and reading a hot counter folded every increment since its last compaction: on the reference machine, counter reads over 1 ms spent about two-thirds of their time on those entries. Reads return the same values; the files the flush writes are smaller.
