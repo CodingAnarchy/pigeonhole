@@ -1320,7 +1320,7 @@ mod pipeline {
     use std::task::{Context, Poll, Wake, Waker};
     use std::time::{Duration, Instant};
 
-    use super::{PigeonholeClient, err, execute};
+    use super::{PigeonholeClient, err, execute, put_cells};
     use crate::BenchOp;
 
     /// Unparks the client thread.
@@ -1342,11 +1342,7 @@ mod pipeline {
         let table = &c.target.table;
         Some(match op {
             BenchOp::Put { row, family, cells } => {
-                let mut m = table.mutate(row);
-                for (q, v) in cells {
-                    m = m.put(family, q, v);
-                }
-                let f = m.commit_async();
+                let f = put_cells(table.mutate(row), family, cells).commit_async();
                 Box::pin(async move { f.await.map(drop).map_err(err) })
             }
             BenchOp::Get {
@@ -1442,11 +1438,7 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
         }
         BenchOp::Put { row, family, cells } => {
             retry_busy(busy, || {
-                let mut m = level(buffered, table.mutate(row));
-                for (q, v) in cells {
-                    m = m.put(family, q, v);
-                }
-                m.commit()
+                put_cells(level(buffered, table.mutate(row)), family, cells).commit()
             })?;
         }
         BenchOp::PutAt {
@@ -1620,11 +1612,7 @@ fn execute(target: &Target, busy: &AtomicU64, op: &BenchOp) -> Result<Touched, S
             if let [r] = rows.as_slice() {
                 let table = part(r.partition)?;
                 retry_busy(busy, || {
-                    let mut m = level(buffered, table.mutate(&r.row));
-                    for (q, v) in &r.cells {
-                        m = m.put(family, q, v);
-                    }
-                    m.commit()
+                    put_cells(level(buffered, table.mutate(&r.row)), family, &r.cells).commit()
                 })?;
             } else {
                 let tables = rows
@@ -1685,6 +1673,15 @@ fn report_nowait_reads(db: &Pigeonhole) {
         n.breaks,
         n.miss_buckets,
     );
+}
+
+/// `m` with a put of each of `cells` in `family`: one row's cells, committed together.
+pub(crate) fn put_cells<'t>(
+    m: pigeonhole::RowMutation<'t>,
+    family: &str,
+    cells: &[(Vec<u8>, Vec<u8>)],
+) -> pigeonhole::RowMutation<'t> {
+    cells.iter().fold(m, |m, (q, v)| m.put(family, q, v))
 }
 
 /// Each shard's cumulative counters as a [`ShardShare`], for [`ShardShare::between`] to

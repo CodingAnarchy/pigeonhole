@@ -17,7 +17,7 @@ use pigeonhole::nonblocking::{CommitFuture, TransactionCommitFuture};
 use pigeonhole::{ErrorCode, Pigeonhole, RetryPolicy, Shard, Table};
 use pigeonhole_io::sys::PinPlan;
 
-use super::pigeonhole::{create_table, err, options, retry_policy};
+use super::pigeonhole::{create_table, err, options, put_cells, retry_policy};
 use crate::{
     BenchOp, EngineCommit, Histogram, LatencyStats, OpTypeStats, PigeonholeRunner, RunDetail,
     RunOptions, RunRecord, Runner, ShardShare, Stalls, WARMUP_CAP, WARMUP_CAP_AFTER_SWITCH,
@@ -244,11 +244,7 @@ impl std::future::Future for Flight {
 }
 
 fn submit(t: &Table, w: &Write) -> CommitFuture {
-    let mut m = t.mutate(&w.row);
-    for (q, v) in &w.cells {
-        m = m.put(w.family, q, v);
-    }
-    m.commit_async()
+    put_cells(t.mutate(&w.row), w.family, &w.cells).commit_async()
 }
 
 /// Every this-many commits of a thread with cross-shard batches (D247's app-owned row), one is
@@ -1048,10 +1044,7 @@ impl PigeonholeRunner {
                 if load_buffered {
                     m = m.durability(pigeonhole::Durability::Buffered);
                 }
-                for (q, v) in &w.cells {
-                    m = m.put(w.family, q, v);
-                }
-                m.commit().map_err(err)?;
+                put_cells(m, w.family, &w.cells).commit().map_err(err)?;
             }
             Ok(t)
         })

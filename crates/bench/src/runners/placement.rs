@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use pigeonhole::{Pigeonhole, ShardStats};
 
-use super::pigeonhole::{create_table, err, options};
+use super::pigeonhole::{create_table, err, options, put_cells};
 use crate::{BenchOp, PigeonholeRunner, Placement, Workload, WorkloadConfig};
 
 /// How the placement check runs (D231).
@@ -70,11 +70,9 @@ impl PigeonholeRunner {
         let mut load = Workload::new(config.clone());
         for op in load.load_ops() {
             if let BenchOp::Put { row, family, cells } = op {
-                let mut m = t.mutate(&row);
-                for (q, v) in &cells {
-                    m = m.put(family, q, v);
-                }
-                m.commit().map_err(err)?;
+                put_cells(t.mutate(&row), family, &cells)
+                    .commit()
+                    .map_err(err)?;
             }
         }
         let clients = opts.clients.max(1);
@@ -109,11 +107,7 @@ impl PigeonholeRunner {
                             let Some(BenchOp::Put { row, family, cells }) = ops.next() else {
                                 return;
                             };
-                            let mut m = t.mutate(&row);
-                            for (q, v) in &cells {
-                                m = m.put(family, q, v);
-                            }
-                            if let Err(e) = m.commit() {
+                            if let Err(e) = put_cells(t.mutate(&row), family, &cells).commit() {
                                 *failed.lock().unwrap() = Some(err(e));
                                 stop.store(true, Ordering::Release);
                                 return;
