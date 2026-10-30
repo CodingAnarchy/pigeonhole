@@ -1,0 +1,4 @@
+### Added
+- Min and max aggregate families (D294, ICR 0094): `Family::aggregate(Aggregation::Min)` and `Aggregation::Max` keep the smallest or largest `i64` written to each cell, as a counter family keeps the sum (`Family::counter()` is `Family::aggregate(Aggregation::Sum)`). Inputs are written with `aggregate` and `aggregate_at` on `RowMutation`, `WriteBatch` and `Transaction`; `put_i64` sets a cell; a cell with no input reads as absent. `FamilyInfo::aggregation` names a family's aggregation. `incr` is refused in a min or max family.
+  - **The file can no longer be opened by 1.0.x** once its first min or max family is created (`incompat` feature bit 0), even after the family is dropped. Back up first if you may roll back.
+- `phdb`: an `aggregation` field in `info`, `dump` and `load`, `:min` and `:max` on the shell's `create`, and a shell `aggregate` command.
