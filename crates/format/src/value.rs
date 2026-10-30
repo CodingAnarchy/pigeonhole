@@ -9,6 +9,9 @@ pub const MAX_VALUE_LEN: u64 = u32::MAX as u64;
 /// The first byte of every non-empty stored value. Numbers are frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
+// D295: later 1.x releases add tags, behind a feature bit (FORMAT §13.2: vector values #490, blob
+// pointers #491)
+#[non_exhaustive]
 pub enum ValueTag {
     /// Opaque bytes.
     Bytes = 0x00,
@@ -24,6 +27,8 @@ pub enum ValueTag {
 
 /// A decoded stored value, borrowing from the input.
 #[derive(Debug, Clone, Copy, PartialEq)]
+// D295: later 1.x releases add value types with them (vector values, #490)
+#[non_exhaustive]
 pub enum ValueRef<'a> {
     /// Opaque bytes.
     Bytes(&'a [u8]),

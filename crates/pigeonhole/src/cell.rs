@@ -32,6 +32,9 @@ fn typed(data: &CellData) -> Value<'_> {
         ValueRef::Varint(v) => Value::Varint(v),
         // The engine resolves blob pointers on read; never reached.
         ValueRef::Blob(_) => Value::Bytes(&[]),
+        // A value type this build doesn't know fails as it is decoded (`UnsupportedFeature`);
+        // never reached.
+        _ => Value::Bytes(payload(data)),
     }
 }
 

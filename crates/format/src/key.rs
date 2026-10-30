@@ -96,6 +96,8 @@ pub const MARKER_QUALIFIER: [u8; 2] = [0x00, 0x00];
 /// What an internal key records. Values are frozen; new kinds take new numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u8)]
+// D295: later 1.x releases add key kinds, behind a feature bit (FORMAT §13.2)
+#[non_exhaustive]
 pub enum Kind {
     /// A value for one cell version. The value may be inline or a blob pointer.
     Put = 0x01,

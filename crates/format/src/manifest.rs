@@ -228,6 +228,8 @@ pub enum CachePriority {
 /// (decision D179). Numbers are frozen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 #[repr(u8)]
+// D295: later 1.x releases add kinds, behind a feature bit (#487's HLL, #488, #489)
+#[non_exhaustive]
 pub enum FamilyKind {
     /// Plain cells. Merge operands (with a named operator) fold across timestamps (D41) and
     /// deletes hide by timestamp. Families written before the kind was stored read as this.

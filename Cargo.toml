@@ -21,6 +21,11 @@ members = [
 ]
 
 [workspace.package]
+# The public version line (D295): `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli` and the
+# unpublished `pigeonhole-capi` and `pigeonhole-bench`, which follow semver from 1.0. The 12
+# internal crates set their own `version`, one shared internal line that takes a new major
+# for any incompatible change to any of them. `scripts/versions.py check` (CI) keeps each
+# line and every pin below in step.
 version = "1.0.0"
 edition = "2024"
 rust-version = "1.96"
@@ -31,21 +36,22 @@ keywords = ["database", "wide-column", "embedded", "lsm", "bigtable"]
 categories = ["database-implementations", "data-structures"]
 
 [workspace.dependencies]
-# The internal crates are pinned exactly (D282): `pigeonhole` is the stable API, and an
-# internal crate may change incompatibly in any release (its own major then), so a build of
-# one `pigeonhole` release always gets the internal crates it was tested with.
-pigeonhole-format = { path = "crates/format", version = "=1.0.0" }
-pigeonhole-io = { path = "crates/io", version = "=1.0.0" }
-pigeonhole-sim = { path = "crates/sim", version = "=1.0.0" }
-pigeonhole-pager = { path = "crates/pager", version = "=1.0.0" }
-pigeonhole-wal = { path = "crates/wal", version = "=1.0.0" }
-pigeonhole-memtable = { path = "crates/memtable", version = "=1.0.0" }
-pigeonhole-cache = { path = "crates/cache", version = "=1.0.0" }
-pigeonhole-runtime = { path = "crates/runtime", version = "=1.0.0" }
-pigeonhole-shm = { path = "crates/shm", version = "=1.0.0" }
-pigeonhole-sst = { path = "crates/sst", version = "=1.0.0" }
-pigeonhole-compaction = { path = "crates/compaction", version = "=1.0.0" }
-pigeonhole-engine = { path = "crates/engine", version = "=1.0.0" }
+# The internal crates are pinned exactly (D282) at the internal line's version (D295):
+# `pigeonhole` is the stable API, and the internal crates may change incompatibly in any
+# release (the internal line's major then), so a build of one `pigeonhole` release always gets
+# the internal crates it was tested with.
+pigeonhole-format = { path = "crates/format", version = "=2.0.0" }
+pigeonhole-io = { path = "crates/io", version = "=2.0.0" }
+pigeonhole-sim = { path = "crates/sim", version = "=2.0.0" }
+pigeonhole-pager = { path = "crates/pager", version = "=2.0.0" }
+pigeonhole-wal = { path = "crates/wal", version = "=2.0.0" }
+pigeonhole-memtable = { path = "crates/memtable", version = "=2.0.0" }
+pigeonhole-cache = { path = "crates/cache", version = "=2.0.0" }
+pigeonhole-runtime = { path = "crates/runtime", version = "=2.0.0" }
+pigeonhole-shm = { path = "crates/shm", version = "=2.0.0" }
+pigeonhole-sst = { path = "crates/sst", version = "=2.0.0" }
+pigeonhole-compaction = { path = "crates/compaction", version = "=2.0.0" }
+pigeonhole-engine = { path = "crates/engine", version = "=2.0.0" }
 pigeonhole = { path = "crates/pigeonhole", version = "1.0.0" }
 pigeonhole-bench = { path = "crates/bench", version = "1.0.0" }
 pigeonhole-arrow = { path = "crates/arrow", version = "1.0.0" }
