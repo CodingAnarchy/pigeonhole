@@ -990,22 +990,18 @@ pub fn run_detailed(
         ..config.clone()
     });
     runner.open(dir)?;
-    let result = measure(
-        runner,
-        config,
-        &mut workload,
-        warmup,
-        options.min_measured,
-        options.max_measured,
-        options.offered_rate,
-    )
-    .and_then(|measured| workload.check_epoch_age().map(|()| measured));
+    let result = measure(runner, config, &mut workload, warmup, options)
+        .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
     let closing = Instant::now();
     let closed = runner.close();
     let close_ms = closing.elapsed().as_secs_f64() * 1e3;
-    let (load, elapsed, threads, hist, split, detail) = result?;
-    let (
+    let Measured {
+        load,
+        elapsed,
+        threads,
+        hist,
+        split,
         shards,
         stalls,
         settle,
@@ -1013,10 +1009,11 @@ pub fn run_detailed(
         warmed,
         seqnos_used,
         txn_conflicts,
-        (riders, reader_processes),
+        riders,
+        reader_processes,
         capped,
         engine_commit,
-    ) = detail;
+    } = result?;
     closed?;
     let ops = hist.count();
     let (reads, by_type) = split.into_split();
@@ -1168,25 +1165,37 @@ fn row_hash(row: &[u8]) -> u64 {
     h.finish()
 }
 
-type Measured = (
-    Duration,
-    Duration,
-    usize,
-    Histogram,
-    Split,
-    (
-        Vec<ShardShare>,
-        Option<Stalls>,
-        Settle,
-        Option<u64>,
-        Warmed,
-        Option<u64>,
-        Option<u64>,
-        (Option<Riders>, Option<ReaderProcesses>),
-        bool,
-        Option<EngineCommit>,
-    ),
-);
+/// What [`measure`] found: the load and measured-phase timings and latencies, and the
+/// store's counters over the measured phase.
+struct Measured {
+    load: Duration,
+    elapsed: Duration,
+    threads: usize,
+    hist: Histogram,
+    split: Split,
+    shards: Vec<ShardShare>,
+    stalls: Option<Stalls>,
+    settle: Settle,
+    background_work: Option<u64>,
+    warmed: Warmed,
+    seqnos_used: Option<u64>,
+    txn_conflicts: Option<u64>,
+    riders: Option<Riders>,
+    reader_processes: Option<ReaderProcesses>,
+    capped: bool,
+    engine_commit: Option<EngineCommit>,
+}
+
+/// The store's counters as the measured phase starts, which [`measure`] subtracts from
+/// their values at its end.
+struct Baseline {
+    shares: Vec<ShardShare>,
+    stalls: Option<Stalls>,
+    background: Option<Background>,
+    seqno: Option<u64>,
+    txn_conflicts: Option<u64>,
+    commit_buckets: Option<[[u64; 64]; 4]>,
+}
 
 /// Background work completed between two [`Runner::background`] readings (D233).
 fn work_between(before: Option<Background>, after: Option<Background>) -> Option<u64> {
@@ -1212,9 +1221,7 @@ fn measure(
     config: &WorkloadConfig,
     workload: &mut Workload,
     warmup: u64,
-    min_measured: Duration,
-    max_measured: Option<Duration>,
-    offered_rate: Option<f64>,
+    options: &RunOptions,
 ) -> Result<Measured, String> {
     let load_start = Instant::now();
     runner.mark_phase("load");
@@ -1268,20 +1275,20 @@ fn measure(
     // The measured operations: the configured count, then, while less than `min_measured`
     // has been measured, the stream's next operations, about enough for the rest at the rate
     // so far (D243). Each pass's operations are generated before its clock starts.
-    let before = (
-        runner.shard_shares(),
-        runner.stalls(),
-        runner.background(),
-        runner.seqno(),
-        runner.txn_conflicts(),
-        runner.commit_latency_buckets(),
-    );
+    let before = Baseline {
+        shares: runner.shard_shares(),
+        stalls: runner.stalls(),
+        background: runner.background(),
+        seqno: runner.seqno(),
+        txn_conflicts: runner.txn_conflicts(),
+        commit_buckets: runner.commit_latency_buckets(),
+    };
     runner.start_riders()?;
     runner.start_reader_processes(config)?;
     let (mut elapsed, mut hist, mut split) = (Duration::ZERO, Histogram::new(), Split::default());
     let mut next = config.operations;
     // D247: past `max_measured` no client starts another operation.
-    let deadline = max_measured.map(|m| Instant::now() + m);
+    let deadline = options.max_measured.map(|m| Instant::now() + m);
     let mut capped = false;
     runner.mark_phase("measured");
     loop {
@@ -1300,9 +1307,8 @@ fn measure(
             &mut clients,
             &share,
             Some(&labels),
-            true,
             deadline,
-            offered_rate,
+            options.offered_rate,
         )?;
         elapsed += e;
         hist.merge(&h);
@@ -1311,38 +1317,43 @@ fn measure(
             capped = true;
             break;
         }
-        if elapsed >= min_measured {
+        if elapsed >= options.min_measured {
             break;
         }
         let rate = hist.count() as f64 / elapsed.as_secs_f64().max(1e-9);
-        let rest = (min_measured - elapsed).as_secs_f64() * rate * 1.1;
+        let rest = (options.min_measured - elapsed).as_secs_f64() * rate * 1.1;
         next = (rest.ceil() as u64).max(MIN_EXTRA_OPS);
     }
     runner.mark_phase("end");
-    let shards = (
-        shares_between(&before.0, &runner.shard_shares()),
-        stalls_between(before.1, runner.stalls()),
-        settled,
-        work_between(before.2, runner.background()),
+    Ok(Measured {
+        load,
+        elapsed,
+        threads: lanes,
+        hist,
+        split,
+        shards: shares_between(&before.shares, &runner.shard_shares()),
+        stalls: stalls_between(before.stalls, runner.stalls()),
+        settle: settled,
+        background_work: work_between(before.background, runner.background()),
         warmed,
-        before
-            .3
+        seqnos_used: before
+            .seqno
             .zip(runner.seqno())
             .map(|(b, a)| a.saturating_sub(b)),
-        before
-            .4
+        txn_conflicts: before
+            .txn_conflicts
             .zip(runner.txn_conflicts())
             .map(|(b, a)| a.saturating_sub(b)),
-        (runner.stop_riders()?, runner.stop_reader_processes()?),
+        riders: runner.stop_riders()?,
+        reader_processes: runner.stop_reader_processes()?,
         capped,
-        before
-            .5
+        engine_commit: before
+            .commit_buckets
             .zip(runner.commit_latency_buckets())
             .and_then(|(b, a)| {
                 EngineCommit::between(&b, &a, pigeonhole::Pigeonhole::commit_latency_floor)
             }),
-    );
-    Ok((load, elapsed, lanes, hist, split, shards))
+    })
 }
 
 /// The fewest operations a pass that lengthens the measured phase runs (D243).
@@ -1416,7 +1427,7 @@ fn warm_up_on(
     let mut drivers = runner.driver_target();
     let settled = loop {
         let before = runner.shard_shares();
-        pass(runner, clients, warm, None, false, Some(deadline), None)
+        pass(runner, clients, warm, None, Some(deadline), None)
             .map_err(|e| format!("warmup: {e}"))?;
         let after = runner.shard_shares();
         // The load controller (D289 PR 2) resizing, or shards still on their way to their
@@ -1510,7 +1521,7 @@ fn deal(
 }
 
 /// Runs one share per client thread (on the runner itself when there are no clients), from
-/// a common start, and returns the wall time and, when `record` is set, each operation's
+/// a common start, and returns the wall time and, when `labels` is given, each operation's
 /// latency. With `offered_rate`, each share starts its operations on a schedule of
 /// `offered_rate / shares` per second ([`RunOptions::offered_rate`]).
 fn pass(
@@ -1518,10 +1529,11 @@ fn pass(
     clients: &mut [Box<dyn Client>],
     shares: &[Vec<(BenchOp, Class)>],
     labels: Option<&[Vec<Option<&'static str>>]>,
-    record: bool,
     deadline: Option<Instant>,
     offered_rate: Option<f64>,
 ) -> Result<(Duration, Histogram, Split), String> {
+    // The measured passes record latencies; the warmup's, which have no labels, don't.
+    let record = labels.is_some();
     // A share's labels ([`Runner::op_label`]), `None` each when there are none.
     let label = |i: usize, j: usize| labels.and_then(|l| l.get(i)?.get(j).copied().flatten());
     // One share's gap between scheduled starts.
