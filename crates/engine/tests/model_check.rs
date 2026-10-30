@@ -235,16 +235,22 @@ fn harness_regressions_from_the_seed_sweep() {
     // 177 and was acknowledged, and the harness took the lost batch's timestamp for it (a
     // decided commit has no batch record at its applied seqno). The engine was right.
     check(660_370, &flight_read_config());
-    // Seed 784 of the commits crash sweep with deferred I/O (the 1.0 soak): a power loss
+    // Seed 784 of the commits crash sweep (the 1.0 soak): a power loss
     // left an undecided cross-shard commit's PREPAREs and, after them, the Batch of a later
     // single-shard commit that put a cell and deleted its column. That Batch's keys reduced
     // to the column marker, a subset of both commits, and the harness took the cross-shard
-    // commit for it. The engine was right: it dropped the undecided commit as a whole.
-    let mut cfg = crash_sweep_commits();
-    cfg.deferred_io = true;
-    cfg.crash_at = Some(66);
-    if let Err(f) = run(784, &cfg) {
-        panic!("seed 784, crash after mutating op 66: {f}");
+    // commit for it. The engine was right: it dropped the undecided commit as a whole. The
+    // same seed without deferred I/O reaches it one operation earlier.
+    for (deferred_io, crash_at) in [(true, 66), (false, 65)] {
+        let mut cfg = crash_sweep_commits();
+        cfg.tablet_changes = true;
+        cfg.deferred_io = deferred_io;
+        cfg.crash_at = Some(crash_at);
+        if let Err(f) = run(784, &cfg) {
+            panic!(
+                "seed 784 (deferred I/O {deferred_io}), crash after mutating op {crash_at}: {f}"
+            );
+        }
     }
 }
 

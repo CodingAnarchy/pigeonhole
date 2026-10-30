@@ -2662,9 +2662,11 @@ impl World {
                 }
                 continue;
             }
-            // Only a commit that writes every surviving record of the seqno can own it: a Batch
+            // A commit that writes every surviving record of the seqno is tried first: a Batch
             // is a single-shard commit's record on its stream, a PREPARE a cross-shard
-            // commit's share on one of its participants. Keys alone are not enough: a share
+            // commit's share on one of its participants. The others stay as fits, last, since
+            // `streams` is the submit-time routing, which a tablet move or split during the
+            // commit can make stale. Keys alone are not enough: a share
             // whose keys reduced to a marker (a put then a column delete of the same cell) is
             // a subset of every commit that deletes that column (seed 784 of
             // `crash_at_every_write_point` took an undecided cross-shard commit for a
@@ -2682,11 +2684,17 @@ impl World {
                 let records = records_of(&unacked[i].streams);
                 held.iter().all(|r| records.contains(r))
             };
-            let exact = (0..unacked.len()).filter(|&i| unacked_keys[i] == keys && writes(i));
-            let within = (0..unacked.len()).filter(|&i| {
-                unacked_keys[i] != keys && keys.is_subset(&unacked_keys[i]) && writes(i)
-            });
-            let fits = exact.chain(within).collect();
+            let exact: Vec<usize> = (0..unacked.len())
+                .filter(|&i| unacked_keys[i] == keys)
+                .collect();
+            let within: Vec<usize> = (0..unacked.len())
+                .filter(|&i| unacked_keys[i] != keys && keys.is_subset(&unacked_keys[i]))
+                .collect();
+            let (exact_writes, exact_other): (Vec<usize>, Vec<usize>) =
+                exact.into_iter().partition(|&i| writes(i));
+            let (within_writes, within_other): (Vec<usize>, Vec<usize>) =
+                within.into_iter().partition(|&i| writes(i));
+            let fits = [exact_writes, within_writes, exact_other, within_other].concat();
             unknown.push((*seqno, sv.commit_ts, keys, fits));
         }
         // A seqno an aborted attempt also explains (its PREPARE) is matched last: a refused
