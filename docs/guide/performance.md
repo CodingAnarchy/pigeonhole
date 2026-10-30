@@ -15,7 +15,7 @@ Pigeonhole is often weighed against SQLite: both are embedded, single-file store
 
 - **Throughput:** Pigeonhole does 9–13× SQLite's operations per second. SQLite commits through a single writer with an fsync per transaction, so more threads don't make it faster. It reaches its ceiling at 4 threads.
 - **Typical reads:** Pigeonhole is 2–4× faster at the median.
-- **Read p99:** Pigeonhole's is about 10 µs higher (1.4–1.6×), whatever the load. It comes from Pigeonhole's read path for a row held in cache, not from cache misses: a larger cache doesn't remove it (26–28 µs at 5 GiB). Nor does slowing Pigeonhole down to SQLite's rate. 1.0 ships with this gap documented; narrowing it is tracked in [#1069](https://github.com/CodingAnarchy/pigeonhole/issues/1069).
+- **Read p99:** Pigeonhole's is about 10 µs higher (about 1.4–1.7×), whatever the load. It comes from Pigeonhole's read path for a row held in cache, not from cache misses: a larger cache doesn't remove it (26–28 µs at 5 GiB). Nor does slowing Pigeonhole down to SQLite's rate. 1.0 ships with this gap documented; narrowing it is tracked in [#1069](https://github.com/CodingAnarchy/pigeonhole/issues/1069).
 - **The far tail:** Pigeonhole's read p99.9 is slightly lower (42 against 45–46 µs on average). SQLite's writes have a 129 ms p99.9. That's its default busy handler: a writer that finds the database locked sleeps and retries, and the sleeps grow while other writers hold the lock.
 
 If your reads must stay under ~20 µs at the 99th percentile and SQLite's single-writer throughput is enough, SQLite meets that and Pigeonhole doesn't yet. If you need more write throughput, a lower median, or bounded write tails under contention, Pigeonhole is ahead on each.
