@@ -209,7 +209,8 @@ pub struct EngineOptions {
     pub commit_spin_nanos: u64,
     /// How long an engine-owned shard thread that just handled a message keeps polling its
     /// queue before it parks: nanoseconds, default 200 µs (D198, amended 2026-10-19 from
-    /// 50 µs). An idle shard never polls.
+    /// 50 µs; `pigeonhole`'s server CPU profile sets 1 ms, amended 2026-10-30). An idle shard
+    /// never polls.
     /// Zero always parks. Application-owned shards are driven by the application and ignore
     /// it.
     pub shard_spin_nanos: u64,

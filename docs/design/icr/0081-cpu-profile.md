@@ -30,3 +30,6 @@ The owner's D289 scope: one budget function derives every thread default from th
 
 ## Amendment (owner, 2026-10-28; #1015, ICR 0085's amendment)
 The load controller is on by default (`Options::adaptive_shard_threads`, now public). The engine-owned driver count above, a thread per shard, is the controller's ceiling by default rather than only when it is opted in. `adaptive_shard_threads(false)` keeps that count fixed, as does a set `shard_threads`.
+
+## Amendment (owner, 2026-10-30; #760, D198's 2026-10-30 amendment)
+`CpuProfile::Server` also sets the shard's spin before parking to 1 ms; `Embedded` keeps the engine's 200 µs. The documented behaviour of `CpuProfile::Server` and `Options::cpu_profile` grows by that sentence; no signature changes. The window's own setter, `Options::shard_spin`, stays a hidden `__unstable-hooks` hook (ICR 0085), and an explicit window wins over the profile's.
