@@ -26,6 +26,26 @@ fn build_data(entries: &BTreeMap<Vec<u8>, Vec<u8>>, interval: usize) -> Vec<u8> 
     out
 }
 
+/// A data block of `entries` built through `add_prefixed` with each entry's shared prefix cut
+/// to a length `shorten` picks in `0..=` its real common prefix with the key before it (cycling
+/// through `shorten`): a valid encoding whose `shared` is not always the longest shared
+/// prefix (FORMAT §4 does not promise it is).
+fn build_shortened(
+    entries: &BTreeMap<Vec<u8>, Vec<u8>>,
+    interval: usize,
+    shorten: &[prop::sample::Index],
+) -> Vec<u8> {
+    let mut b = BlockBuilder::data(interval);
+    let mut last: &[u8] = &[];
+    for (i, (k, v)) in entries.iter().enumerate() {
+        let lcp = shorten[i % shorten.len()].index(common_prefix_len(k, last) + 1);
+        b.add_prefixed(k, v, lcp, row_prefix_len(k).unwrap())
+            .unwrap();
+        last = k;
+    }
+    b.finish().to_vec()
+}
+
 fn entries() -> impl Strategy<Value = BTreeMap<Vec<u8>, Vec<u8>>> {
     btree_map(
         cell().prop_map(|c: Cell| c.encode()),
@@ -67,6 +87,73 @@ fn row_heavy_entries() -> impl Strategy<Value = BTreeMap<Vec<u8>, Vec<u8>>> {
 
 proptest! {
     #![proptest_config(config(400))]
+
+    /// A seek's forward step compares only the bytes past what an entry shares with the
+    /// target (`step_to`): `seek` and `seek_forward` from every entry land where a linear
+    /// scan of the model lands, for keys with long shared prefixes, every restart interval,
+    /// and targets that are keys, their prefixes and extensions, a key with one byte nudged
+    /// either way, and arbitrary bytes. Half the blocks store shorter shared prefixes than the
+    /// longest (`build_shortened`), so a step that assumed `shared` is maximal would fail.
+    #[test]
+    fn seek_steps_land_where_a_linear_scan_lands(
+        model in row_heavy_entries(),
+        interval in 1usize..=16,
+        picks in vec((any::<prop::sample::Index>(), 0u8..6, any::<u8>(), any::<prop::sample::Index>()), 1..24),
+        raw in vec(vec(any::<u8>(), 0..24), 0..4),
+        shortened in any::<bool>(),
+        shorten in vec(any::<prop::sample::Index>(), 1..32),
+    ) {
+        let bytes = if shortened {
+            build_shortened(&model, interval, &shorten)
+        } else {
+            build_data(&model, interval)
+        };
+        let keys: Vec<&Vec<u8>> = model.keys().collect();
+        let mut targets: Vec<Vec<u8>> = raw;
+        if !keys.is_empty() {
+            for (i, how, b, at) in &picks {
+                let k = keys[i.index(keys.len())].clone();
+                let pos = at.index(k.len().max(1)).min(k.len().saturating_sub(1));
+                targets.push(match how {
+                    0 => k,
+                    1 => k[..pos].to_vec(),
+                    2 => [k.as_slice(), &[*b]].concat(),
+                    3 if !k.is_empty() => { let mut t = k; t[pos] = t[pos].wrapping_add(1); t }
+                    4 if !k.is_empty() => { let mut t = k; t[pos] = t[pos].wrapping_sub(1); t }
+                    _ => { let mut t = k[..pos].to_vec(); t.push(*b); t }
+                });
+            }
+        }
+        for target in &targets {
+            let want = model
+                .range::<[u8], _>((Bound::Included(target.as_slice()), Bound::Unbounded))
+                .next();
+            let mut it = Block::new(bytes.as_slice()).unwrap().into_cursor();
+            it.seek(target).unwrap();
+            let got = it.valid().then(|| (it.key().to_vec(), it.value().to_vec()));
+            prop_assert_eq!(got.as_ref().map(|(k, v)| (k, v)), want, "seek {:?}", target);
+            // From every entry, a forward seek stays put when `target` is at or before it
+            // (it never moves back) and lands on the answer otherwise.
+            for (start, start_value) in &model {
+                let mut it = Block::new(bytes.as_slice()).unwrap().into_cursor();
+                it.seek(start).unwrap();
+                it.seek_forward(target).unwrap();
+                let got = it.valid().then(|| (it.key().to_vec(), it.value().to_vec()));
+                let expect = if target.as_slice() <= start.as_slice() {
+                    Some((start, start_value))
+                } else {
+                    want
+                };
+                prop_assert_eq!(
+                    got.as_ref().map(|(k, v)| (k, v)),
+                    expect,
+                    "seek_forward {:?} from {:?}",
+                    target,
+                    start
+                );
+            }
+        }
+    }
 
     /// ICR 0093: a data builder fed through `add_prefixed` (the caller's common prefix with
     /// the previous key, across resets, and row prefix length) writes byte for byte what one

@@ -634,6 +634,17 @@ impl<B: Deref<Target = [u8]>> Block<B> {
     }
 }
 
+/// Whether `key < target`, given that they agree on their first `m` bytes and no more (`m` is
+/// their common prefix length): decided by the byte at `m`, or by which one ends there.
+#[inline(always)]
+fn below(key: &[u8], target: &[u8], m: usize) -> bool {
+    match (key.get(m), target.get(m)) {
+        (Some(k), Some(t)) => k < t,
+        (None, Some(_)) => true,
+        _ => false,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum KeySrc {
     /// The key is a range of the block (restart entries).
@@ -866,6 +877,45 @@ impl<B: Deref<Target = [u8]>> BlockIter<B> {
         Ok((at, e))
     }
 
+    /// Steps forward from the current entry to the first whose key is `>= target` (or past the
+    /// end). Each step compares only the bytes the entry may not share with `target`: `m` is a
+    /// lower bound on the current key's common prefix with `target` (exact at the start), and
+    /// an entry sharing `s` bytes with the key before it agrees with `target` on its first
+    /// `k = min(s, m)`, so one slice compare from `k` decides it and `k` becomes the bound. A
+    /// restart entry (`s == 0`) compares from its start. Exact for any valid encoding: it does
+    /// not assume `shared` is the longest shared prefix. (Growing `m` byte by byte each step
+    /// cost more than the vectorised compare it saved on keys with long shared prefixes.)
+    #[inline]
+    fn step_to(&mut self, target: &[u8]) -> crate::Result<()> {
+        if !self.valid() {
+            return Ok(());
+        }
+        let mut m = crate::key::common_prefix_len(self.key(), target);
+        if !below(self.key(), target, m) {
+            return Ok(());
+        }
+        loop {
+            let at = self.next;
+            if at >= self.block.data_end {
+                self.invalidate();
+                return Ok(());
+            }
+            let e = match self.block.entry(at) {
+                Ok(e) => e,
+                Err(err) => {
+                    self.invalidate();
+                    return Err(err);
+                }
+            };
+            let k = m.min(e.shared);
+            self.apply(at, e)?;
+            if self.key()[k..] >= target[k..] {
+                return Ok(());
+            }
+            m = k;
+        }
+    }
+
     /// The first row start after the current entry, if any.
     fn next_row_start(&self) -> crate::Result<Option<usize>> {
         let (mut lo, mut hi) = (0, self.block.row_start_count);
@@ -950,10 +1000,7 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
             }
             None => self.load_restart(lo)?,
         }
-        while self.valid() && self.key() < target {
-            self.next()?;
-        }
-        Ok(())
+        self.step_to(target)
     }
 
     fn next(&mut self) -> crate::Result<()> {
@@ -1009,10 +1056,7 @@ impl<B: Deref<Target = [u8]>> Cursor for BlockIter<B> {
             };
             self.load_restart(from)?;
         }
-        while self.valid() && self.key() < target {
-            self.next()?;
-        }
-        Ok(())
+        self.step_to(target)
     }
 
     /// Passes the column's later entries in this block from their headers alone (ICR 0041):
