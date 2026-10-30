@@ -8,7 +8,8 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 keywords.workspace = true
-categories.workspace = true
+# phdb is a tool rather than a library: command-line-utilities instead of data-structures.
+categories = ["database-implementations", "command-line-utilities"]
 readme = "README.md"
 
 [[bin]]

@@ -1,6 +1,6 @@
 [package]
 name = "pigeonhole-io"
-description = "Vfs abstraction for Pigeonhole: files, aligned buffers, completions, pread pool and fault-injecting simulated backend."
+description = "Vfs abstraction for Pigeonhole: files, aligned buffers, completions, direct I/O, a pread pool, an io_uring backend (Linux) and a fault-injecting simulated backend."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
