@@ -8,7 +8,8 @@
   - `Family::aggregate(Aggregation) -> Family`. `Family::counter()` is now `Family::aggregate(Aggregation::Sum)`, with the same options as before.
   - `aggregate(family, qualifier, i64)` and `aggregate_at(family, qualifier, ts, i64)` on `RowMutation`, and the same on `WriteBatch` and `Transaction` (with `table` and `row` first, like their `incr`). They write an input to an aggregate family's cell (the same operand `incr` writes).
   - `FamilyInfo::aggregation: Option<Aggregation>` is added to a `#[non_exhaustive]` struct. `counter: bool` keeps meaning Sum.
-  - **Behaviour:** `incr` and `incr_at` in a min or max family fail with `InvalidArgument` ("write its inputs with aggregate"). In a counter family, `aggregate` is `incr`.
+  - **Behaviour:** `incr` and `incr_at` in a min or max family fail with `InvalidArgument` ("write its inputs with aggregate"). `aggregate` and `aggregate_at` outside an aggregate family fail the same way ("is not an aggregate family"), a 0.1.0-style family with the `i64` add included. In a counter family, `aggregate` is `incr`.
+  - **Engine:** a standard family naming `pigeonhole.i64_min` or `pigeonhole.i64_max` is refused at creation (`InvalidArgument`).
 - **phdb** (D282's CLI surface):
   - schema JSON (`info`, `dump`, `load`) gains `"aggregation": "sum" | "min" | "max" | null`. `load` reads it, and falls back to `"counter"` for files dumped before it;
   - the shell gains `aggregate <table> <row> <family>:<qualifier> <value> [--ts US]`, and `create` takes `:min` and `:max`;

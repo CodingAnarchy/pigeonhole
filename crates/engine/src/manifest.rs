@@ -371,6 +371,12 @@ impl ManifestWriter {
     /// request never flags the file (perf287's S1 on D294). `Pager::set_features` keeps ICR
     /// 0089's constraints: two commits, each naming the root current when it starts, the sets
     /// current only once durable. The bits are sticky: nothing clears them (D294).
+    ///
+    /// **It blocks**, once in the file's life: two root commits, each a sync, a superblock
+    /// write and a sync. The caller of `begin` may be a background commit's pump on a shard
+    /// thread (a creation that found the exclusion held may be drained there), whose turn
+    /// then waits on four syncs, against D30's rule for that loop: accepted for a one-time step
+    /// (perf287's S2 on #1194; `a_creation_queued_behind_a_background_commit_flags_the_file`).
     pub(crate) fn flag_features(&mut self, edits: &[Edit]) -> Result<()> {
         if self.poisoned {
             return Err(Self::poisoned_error());

@@ -3137,6 +3137,8 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Feature bit.** `incompat` bit 0 (`INCOMPAT_AGGREGATES`) covers kinds 2 and 3, through `FamilyKind::required_incompat`. Kinds that ship together share a bit; a later kind takes the next free bit.
   - **Setting it.** The manifest writer sets the bit in both superblock pages with `Pager::set_features`, restored from #1084 under ICR 0089's four constraints. It does so under its exclusion, once the batch's requests are validated and applied, and before the commit that writes the first such family.
   - **Refused calls** never flag the file (perf287's S1).
+  - **It blocks, once in the file's life.** The two commits are synchronous (a sync, a superblock write and a sync each). When a background commit's pump drains the creation (it found the exclusion held), they run on that shard thread's turn, against D30's rule for the foreground loop. That cost is accepted for a one-time step (perf287's S2 on #1194).
+  - **The operators belong to their kinds:** a standard family naming `pigeonhole.i64_min` or `i64_max` is refused at creation (it would need no bit, so 1.0.x would open the file and fail its reads; perf287's S1 on #1194). `pigeonhole.i64_add` keeps its 0.1.0 meaning (D41).
   - **The bit is sticky:** nothing clears it, so FORMAT §8.2 now says a build "may" clear a bit.
 - **What older and newer files do.**
   - **1.0.x and any build that doesn't know the bit** refuse the file at the superblock (`UnsupportedFeature`), before any `PutFamily` is decoded. A reader process is refused at its next reload.
@@ -3145,7 +3147,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **API** (ICR 0094).
   - `pigeonhole::Aggregation` is a `#[non_exhaustive]` enum, so #488's kinds arrive as minor releases; a variant with parameters carries a params struct.
   - Families: `Family::aggregate`; `Family::counter()` is `aggregate(Sum)`.
-  - Writes: `aggregate` and `aggregate_at` on `RowMutation`, `WriteBatch` and `Transaction`. `incr` and `incr_at` are refused in min and max families.
+  - Writes: `aggregate` and `aggregate_at` on `RowMutation`, `WriteBatch` and `Transaction`, refused outside aggregate families (perf287's S3 on #1194). `incr` and `incr_at` are refused in min and max families.
   - Info: `FamilyInfo::aggregation`, with `counter` still meaning Sum.
   - phdb: schema JSON `"aggregation"`, the shell's `:min`/`:max` and `aggregate`, and an `info` column.
 

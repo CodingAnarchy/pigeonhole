@@ -4610,14 +4610,15 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
         return Ok(false);
     }
     if m.value.len() != 9 || m.value[0] != ValueTag::I64 as u8 {
-        let what = match meta.options.kind {
-            FamilyKind::Min => "a min family",
-            FamilyKind::Max => "a max family",
-            _ => "a counter family",
+        let hint = if meta.options.kind == FamilyKind::Counter {
+            "put_i64 / incr"
+        } else {
+            "put_i64 / aggregate"
         };
         return Err(Error::InvalidArgument(format!(
-            "{} is {what}: it holds only i64 values (put_i64 / aggregate)",
-            family_name(catalog, m.table, m.family)
+            "{} is a {} family: it holds only i64 values ({hint})",
+            family_name(catalog, m.table, m.family),
+            kind_name(meta.options.kind)
         )));
     }
     if m.ts.is_some() {
@@ -4631,6 +4632,16 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
         )));
     }
     Ok(true)
+}
+
+/// An aggregate kind's name in messages.
+fn kind_name(kind: FamilyKind) -> &'static str {
+    match kind {
+        FamilyKind::Counter => "counter",
+        FamilyKind::Min => "min",
+        FamilyKind::Max => "max",
+        FamilyKind::Standard => "standard",
+    }
 }
 
 /// `family "name" of table "name"` for messages (ids if the catalog does not know them).
@@ -4725,8 +4736,24 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
         && name != op
     {
         return Err(Error::InvalidArgument(format!(
-            "a {:?} family folds i64s with {op}, not {name:?}",
-            options.kind
+            "a {} family folds i64s with {op}, not {name:?}",
+            kind_name(options.kind)
+        )));
+    }
+    // The min and max operators belong to their kinds (D294): a standard family naming one
+    // would fold across timestamps with no feature bit, so 1.0.x would open it and fail its
+    // reads instead of refusing the file (perf287's S1 on #1194). `pigeonhole.i64_add` keeps
+    // its 0.1.0 meaning on a standard family (D41).
+    if options.kind == FamilyKind::Standard
+        && [crate::catalog::I64_MIN, crate::catalog::I64_MAX].contains(&name)
+    {
+        return Err(Error::InvalidArgument(format!(
+            "{name} is the operator of a {} family: create it with that kind",
+            if name == crate::catalog::I64_MIN {
+                "min"
+            } else {
+                "max"
+            }
         )));
     }
     if name.is_empty() || registry.get(name).is_some() {

@@ -269,6 +269,45 @@ fn values_other_than_i64_are_refused() {
 }
 
 #[test]
+fn the_min_and_max_operators_belong_to_their_kinds() {
+    // perf287's S1 on #1194: a standard family naming pigeonhole.i64_min or i64_max would
+    // fold across timestamps, with no feature bit, so 1.0.x would open the file and fail its
+    // reads instead of refusing it. Refused at creation, as a table or an added family.
+    let vfs = SimVfs::new(9);
+    let db = Engine::open(Path::new(DB), options(&vfs, 128)).unwrap();
+    for op in ["pigeonhole.i64_min", "pigeonhole.i64_max"] {
+        let standard = FamilyOptions::default().merge_operator(op);
+        match db.create_table("s", &[("f".into(), standard.clone())]) {
+            Err(Error::InvalidArgument(why)) => {
+                assert!(why.contains("create it with that kind"), "{why}")
+            }
+            other => panic!("{op}: {other:?}"),
+        }
+        let t = match db.table("plain") {
+            Some(t) => t,
+            None => db
+                .create_table("plain", &[("f".into(), FamilyOptions::default())])
+                .unwrap(),
+        };
+        match db.add_family(t.id, "g", standard) {
+            Err(Error::InvalidArgument(why)) => assert!(why.contains(op), "{why}"),
+            other => panic!("{op}: {other:?}"),
+        }
+    }
+    // The add keeps its 0.1.0 meaning on a standard family (D41).
+    db.create_table(
+        "legacy",
+        &[(
+            "c".into(),
+            FamilyOptions::default().merge_operator("pigeonhole.i64_add"),
+        )],
+    )
+    .unwrap();
+    assert_eq!(incompat(&vfs), [0, 0]);
+    db.close().unwrap();
+}
+
+#[test]
 fn the_first_min_or_max_family_flags_both_superblock_pages() {
     let vfs = SimVfs::new(5);
     let db = Engine::open(Path::new(DB), options(&vfs, 128)).unwrap();
@@ -358,4 +397,71 @@ fn an_unknown_incompat_bit_refuses_the_file_before_its_families_are_read() {
         Ok(_) => panic!("opened a file with an unknown incompat bit"),
         Err(e) => panic!("{e:?}"),
     }
+}
+
+fn wait_for(what: &str, mut cond: impl FnMut() -> bool) {
+    for _ in 0..20_000 {
+        if cond() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_micros(500));
+    }
+    panic!("timed out waiting for {what}");
+}
+
+#[test]
+fn a_creation_queued_behind_a_background_commit_flags_the_file() {
+    // perf287's S2 on #1194: a creation that finds the manifest writer's exclusion held by a
+    // background commit queues behind it. Whoever finishes that commit drains the queue,
+    // the pump on its shard thread or the waiting thread (`take_done`), and runs the
+    // blocking feature commits inside `begin` (once in the file's life). Which one wins is a
+    // race the engine leaves open by design; either way the feature commits complete, with
+    // no root commit in flight, and both pages carry the bit before the family is visible.
+    let vfs = SimVfs::new(10);
+    let db = Engine::open(Path::new(DB), options(&vfs, 128)).unwrap();
+    let t = db
+        .create_table("t", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.family("f").unwrap().id;
+    for round in 0..2u8 {
+        let mut wb = WriteBatch::new();
+        for i in 0..50u8 {
+            wb.put(t.id, f, &[round, i], b"q", None, ValueRef::Bytes(b"v"))
+                .unwrap();
+        }
+        db.commit(wb, None).unwrap();
+        db.flush().unwrap();
+    }
+    // A compaction's commit holds the exclusion, parked before it publishes.
+    db.park_manifest_commits(true);
+    let compact = {
+        let db = Arc::clone(&db);
+        std::thread::spawn(move || db.compact(None))
+    };
+    wait_for("the compaction's commit to park", || {
+        db.manifest_commit_parked()
+    });
+    let create = {
+        let (db, table) = (Arc::clone(&db), t.id);
+        std::thread::spawn(move || db.add_family(table, "min", family(FamilyKind::Min)))
+    };
+    wait_for("the creation to queue behind the pump", || {
+        db.manifest_queue_len() > 0
+    });
+    assert_eq!(incompat(&vfs), [0, 0], "flagged before its turn");
+    db.park_manifest_commits(false);
+    let info = create.join().unwrap().unwrap();
+    compact.join().unwrap().unwrap();
+    assert!(info.family("min").is_some());
+    assert_eq!(incompat(&vfs), [INCOMPAT_AGGREGATES; 2]);
+    // Writable and readable on, and after a reopen.
+    let min = info.family("min").unwrap().id;
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, min, b"r", b"q", ValueRef::I64(4)).unwrap();
+    db.commit(wb, None).unwrap();
+    db.close().unwrap();
+    let db = Engine::open(Path::new(DB), options(&vfs, 128)).unwrap();
+    let cell = db.get_latest(t.id, min, b"r", b"q").unwrap().unwrap();
+    assert_eq!(cell.value(), ValueRef::I64(4));
+    db.close().unwrap();
 }

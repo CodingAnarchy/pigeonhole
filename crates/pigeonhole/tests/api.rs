@@ -1084,10 +1084,38 @@ fn min_and_max_families() {
     let mut txn = db.transaction().unwrap();
     txn.incr_at(&t, b"r", "lo", b"x", 5, 1);
     refused(txn.commit(), "is a min family");
-    // Only i64s.
+    // `aggregate` needs an aggregate family (perf287's S3 on #1194), even one whose operator
+    // would take the operand.
+    let plain = db
+        .table("plain")
+        .unwrap()
+        .family("f", Family::default())
+        .family(
+            "legacy",
+            Family::default().merge_operator("pigeonhole.i64_add"),
+        )
+        .create()
+        .unwrap();
+    for f in ["f", "legacy"] {
+        refused(
+            plain.mutate(b"r").aggregate(f, b"x", 1).commit(),
+            "is not an aggregate family",
+        );
+    }
+    let mut wb = db.write_batch();
+    wb.aggregate_at(&plain, b"r", "legacy", b"x", 5, 1);
+    refused(wb.commit(), "is not an aggregate family");
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate(&plain, b"r", "f", b"x", 1);
+    refused(txn.commit(), "is not an aggregate family");
+    // Only i64s; a counter family's message still points at incr.
     refused(
         t.mutate(b"r").put("lo", b"x", b"text").commit(),
         "only i64 values",
+    );
+    refused(
+        t.mutate(b"r").put("c", b"x", b"text").commit(),
+        "(put_i64 / incr)",
     );
     assert_eq!(get("lo", b"x"), Some(-60), "nothing refused was written");
     // The info names the aggregation, and recreates the family.

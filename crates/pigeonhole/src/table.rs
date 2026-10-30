@@ -156,6 +156,15 @@ impl TableBuilder<'_> {
     }
 }
 
+/// A typed operand a write resolves its family for ([`TableCore::operand_family_id`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Operand {
+    /// `incr`: a counter, or a 0.1.0 family's add.
+    Incr,
+    /// `aggregate`: an input to an aggregate family (D294).
+    Aggregate,
+}
+
 /// What every table handle shares: the database and the catalog entry it was opened with.
 #[derive(Debug)]
 pub(crate) struct TableCore {
@@ -218,12 +227,10 @@ impl TableCore {
         self.family_id(name)
     }
 
-    /// Resolves a family name: from the handle's entry (no allocation), else from the
-    /// current catalog.
-    #[inline]
-    /// [`family_id`](Self::family_id) for an `incr`, which a min or max family refuses
-    /// (D294): "increment" would mislead there, so its inputs are written with `aggregate`.
-    pub(crate) fn incr_family_id(&self, name: &str) -> Result<FamilyId> {
+    /// [`family_id`](Self::family_id) for a typed operand: `incr` is refused in a min or
+    /// max family ("increment" would mislead there) and `aggregate` outside an aggregate
+    /// family (D294). One lookup, the one the write does anyway.
+    pub(crate) fn operand_family_id(&self, name: &str, operand: Operand) -> Result<FamilyId> {
         use pigeonhole_engine::FamilyKind;
         let current;
         let f = match self.info.family(name) {
@@ -235,21 +242,27 @@ impl TableCore {
                     .ok_or_else(|| family_not_found(&self.info.name, name))?
             }
         };
-        let what = match f.options.kind {
-            FamilyKind::Min => "min",
-            FamilyKind::Max => "max",
+        let why = match (operand, f.options.kind) {
+            (Operand::Incr, FamilyKind::Min) => {
+                "is a min family: write its inputs with aggregate, not incr"
+            }
+            (Operand::Incr, FamilyKind::Max) => {
+                "is a max family: write its inputs with aggregate, not incr"
+            }
+            (Operand::Aggregate, kind) if !kind.is_aggregate() => {
+                "is not an aggregate family: aggregate needs Family::aggregate or Family::counter"
+            }
             _ => return Ok(f.id),
         };
         Err(Error::new(
             ErrorCode::InvalidArgument,
-            format!(
-                "family {name:?} of table {:?} is a {what} family: write its inputs with \
-                 aggregate, not incr",
-                self.info.name
-            ),
+            format!("family {name:?} of table {:?} {why}", self.info.name),
         ))
     }
 
+    /// Resolves a family name: from the handle's entry (no allocation), else from the
+    /// current catalog.
+    #[inline]
     pub(crate) fn family_id(&self, name: &str) -> Result<FamilyId> {
         if let Some(f) = self.info.family(name) {
             return Ok(f.id);

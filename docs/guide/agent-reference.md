@@ -199,7 +199,7 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 | `put_i64_at(family, qualifier, ts, i64)` | Typed `i64` at `ts` (a counter family's bucket). |
 | `incr(family, qualifier, delta: i64)` | Blind atomic wrapping `i64` add; counter families only. |
 | `incr_at(family, qualifier, ts: u64, delta: i64)` | Add to the bucket at `ts`; counter families only. |
-| `aggregate(family, qualifier, value: i64)` | Blind input to an aggregate family's cell (D294): added in a counter family, kept if smallest (min) or largest (max). |
+| `aggregate(family, qualifier, value: i64)` | Blind input to an aggregate family's cell (D294): added in a counter family, kept if smallest (min) or largest (max); other families: `InvalidArgument`. |
 | `aggregate_at(family, qualifier, ts: u64, value: i64)` | Input to the bucket at `ts` of an aggregate family. |
 | `merge(family, qualifier, operand: &[u8])` | Operand for the family's registered operator. |
 | `delete_cell(family, qualifier, ts: u64)` | Delete the version at `ts`; later puts at that `ts` stay hidden (D38). |
