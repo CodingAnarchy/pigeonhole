@@ -2578,6 +2578,7 @@ impl ShardState {
         // A pass while the mean is falling neither counts nor resets the persistence (D224):
         // under a closed-loop load it is a phase's tail, which must not trigger, and a bursty
         // load whose mean dips between bursts must still reach `SKEW_PERSIST`.
+        let run_before = self.skew_run;
         if !self.mean_falling {
             if my >= min && my > cfg.skew * mean {
                 self.skew_run += 1;
@@ -2592,9 +2593,15 @@ impl ShardState {
                 self.skew_run
             );
             self.skew_active = true;
-        } else if self.skew_run == 1 {
+        } else if run_before == 0 && self.skew_run == 1 {
             balance!(
                 "shard {} write skew starts: writes {my:.0} against a mean of {mean:.0}",
+                self.id.0
+            );
+        } else if run_before > 0 && self.skew_run == 0 {
+            balance!(
+                "shard {} write skew run resets after {run_before} passes: writes {my:.0} \
+                 against a mean of {mean:.0}",
                 self.id.0
             );
         }
