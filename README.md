@@ -60,13 +60,48 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 | **Timestamp** | `u64`, newest first. Hybrid logical clock by default; user-supplied for event time. |
 | **Value** | Bytes, up to 4 GiB − 2. Values above a family's blob threshold live in blob files; one too large for the WAL and memtable (above the smaller of 64 MiB and half a shard's memtable arena) is written to a blob file as it is committed. Optional typed merge operators. |
 
-## Targets
-| Goal | Target (NVMe, hot cache) |
-|---|---|
-| Point get | p50 < 2 µs, p99 < 10 µs; one I/O when cold |
-| Batched durable writes | > 1M cells/s across cores |
-| Ordered single-family scan | > 1 GB/s decoded per core |
-| Open to first read | < 5 ms |
+## Performance
+Measured on the reference machine (Hetzner AX102: AMD Ryzen 9 7950X3D, 16 cores, NVMe, Linux), in the release gate of 2026-10-29 on `main` [`cba09184`](https://github.com/CodingAnarchy/pigeonhole/commit/cba09184). 1 million rows (about 1 GB, so reads that miss the 256 MiB block cache hit the OS page cache). [Performance compared with SQLite](docs/guide/performance.md) and [`docs/bench.md`](docs/bench.md) have the full tables and method.
+
+**One client** (`Durability::Buffered`):
+
+| Operation | Throughput | p50 | p99 |
+|---|--:|--:|--:|
+| Row read (YCSB C) | 392K ops/s | 0.90 µs | 11.8 µs |
+| Point get, wide rows (sparse-wide) | — | 3.5 µs | 20.1 µs |
+| Put (YCSB A) | — | 5.4 µs | 9.1 µs |
+| Scan of up to 100 rows (YCSB E) | 20K ops/s | 48 µs | 112 µs |
+
+**16 clients**, against RocksDB and SQLite (EAV) with the same memory. Throughput, then p99 over every operation:
+
+| Workload | Durability | Pigeonhole | RocksDB | SQLite |
+|---|---|--:|--:|--:|
+| Reads (YCSB C) | Buffered | 2.26M/s, 27 µs | 1.60M/s, 21 µs | 215K/s, 180 µs |
+| | GroupSync (default) | 2.37M/s, 27 µs | 1.42M/s, 23 µs | 212K/s, 174 µs |
+| 50% updates (YCSB A) | Buffered | 1.46M/s, 39 µs | 699K/s, 68 µs | 85K/s, 1.1 ms |
+| | GroupSync (default) | 488K/s, 98 µs | 191K/s, 211 µs | 39K/s, 82 µs |
+| Scans (YCSB E) | Buffered | 220K/s, 190 µs | 132K/s, 270 µs | 44K/s, 1.6 ms |
+| | GroupSync (default) | 192K/s, 209 µs | 108K/s, 362 µs | 43K/s, 3.4 ms |
+| Sparse wide rows | Buffered | 91K/s, 2.4 ms | 72K/s, 3.3 ms | 41K/s, 3.6 ms |
+| | GroupSync (default) | 78K/s, 2.7 ms | 59K/s, 3.5 ms | 34K/s, 8.3 ms |
+
+**Durable commits** (`GroupSync`, 16 shards, 16 commits in flight per shard): 11.1M cells/s, commit p50 72 µs, p99 127 µs.
+
+## Configuration
+`Options::default()` is a valid configuration. The options most users set, with their defaults:
+
+- **`durability`**: `GroupSync`, a commit returns once it is fsynced, with concurrent commits sharing the fsync. `Buffered` skips the fsync (survives a process crash, not power loss); `Sync` fsyncs each commit alone ([Durability](docs/guide/durability.md)).
+- **`block_cache`**: 256 MiB, decoded SST blocks.
+- **`row_cache`**: 64 MiB, hot rows of small families (`0` turns it off).
+- **`memtable_budget`**: 64 MiB of write buffer per shard.
+- **`shards`**: one per physical core.
+- **`adaptive_shard_threads`**: on, sizing the shard threads to the load; `shard_threads(k)` fixes the count instead.
+- **`cpu_profile`**: `CpuProfile::Embedded`, leaving CPU for your application; `Server` gives flush and compaction twice the cores.
+- **Compression**, per family: `Family::compression(..)`, LZ4 by default (also `Zstd(level)` or `None`).
+- **`io_backend`**: `IoBackend::Auto`, io_uring where the kernel offers it (Linux) and a `pread` pool elsewhere.
+- **`direct_io`**: off; worth turning on only for data much larger than RAM with a block cache of at least about 1/64 of it.
+
+Every option, with its default and limits, is in the agent reference's [`Options`](docs/guide/agent-reference.md#options) and [`Family`](docs/guide/agent-reference.md#family) sections; [Getting started](docs/guide/getting-started.md#open-a-database) explains the memory and thread ones.
 
 ## Documentation
 - **Using Pigeonhole** (people and agents integrating it): [`docs/guide/`](docs/guide/README.md)
