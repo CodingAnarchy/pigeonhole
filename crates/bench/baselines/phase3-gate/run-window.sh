@@ -200,15 +200,18 @@ trim_data() {
     fi
 }
 
-# Before setup and the judged steps (D243): waits up to 3 minutes for the 1-minute load to
-# fall to 1.0, so a step doesn't start inside the previous step's tail. Gates 10-26 and
-# 10-28 started all-uring-2 at load 14-15 right after all-uring-1's multi-threaded runs,
-# and its second workload (ycsb-a on RocksDB) missed D243's bound at 10-26. fstrim's D state
-# counts in the load too, and setup refuses a load above 1.0. Logged; never fails the window.
-quiet_steps=" setup all-uring-1 all-uring-2 all-pread contended "
+# Before every full-scale step but build and report (D243): waits up to 3 minutes for the
+# 1-minute load to fall to 1.0, so a step doesn't start inside the previous step's tail.
+# Gates 10-26 and 10-28 started all-uring-2 at load 14-15 right after all-uring-1's
+# multi-threaded runs, and its second workload (ycsb-a on RocksDB) missed D243's bound at
+# 10-26; gate 3 started memtable-lookup right after the build and latency right after
+# all-pread the same way (perf287's review of #1096). fstrim's D state counts in the load
+# too, and setup refuses a load above 1.0. build makes its own load and report measures
+# nothing. Logged; never fails the window.
+quiet_skip=" build report "
 wait_quiet() {
     local name="$1" i load
-    [[ "$scale" == full && "$quiet_steps" == *" $name "* ]] || return 0
+    [[ "$scale" == full && "$quiet_skip" != *" $name "* ]] || return 0
     for ((i = 0; i < 36; i++)); do
         awk '{ exit !($1 > 1.0) }' /proc/loadavg || break
         sleep 5
