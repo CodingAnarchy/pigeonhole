@@ -501,15 +501,48 @@ engines_for() {
     *) echo pigeonhole,rocksdb,sqlite ;;
     esac
 }
+# The machine's memory and pressure state, for the contended cross-shard rows (#1188):
+# `/proc/vmstat` (compaction and THP counters among them), `/proc/buddyinfo` and PSI.
+machine_state() {
+    local f
+    echo "== $(date -u +%Y-%m-%dT%H:%M:%S.%NZ)"
+    for f in /proc/vmstat /proc/buddyinfo /proc/pressure/cpu /proc/pressure/memory /proc/pressure/io; do
+        echo "-- $f"
+        cat "$f" 2> /dev/null || echo "(unreadable)"
+    done
+}
+# One contended run. The cross-shard-contention rows (#1188: inside the window only, their
+# tablet placement changed late in the warmup) also log the balancer's decisions
+# (`PIGEONHOLE_BALANCE_LOG`, kept apart from the step log, its other stderr lines copied
+# back), snapshot the machine state before and after, and sample every core each second.
+contended_run() {
+    local level="$1" w="$2" out="$results/contended-$1-$2"
+    local args=("$w" --engine "$(engines_for "$w")" --scale "$scale" --threads 16
+        --durability "$level" --ops "$contended_ops" --min-secs "$contended_secs"
+        --max-secs "$contended_max_secs"
+        --dir "$data/bench" --json "$out.json" --markdown "$out.md")
+    if [[ "$w" != cross-shard-contention ]]; then
+        "$bench" "${args[@]}"
+        return
+    fi
+    machine_state > "$out.machine-before.txt"
+    local mp=""
+    if command -v mpstat > /dev/null; then
+        mpstat -P ALL 1 > "$out.mpstat.txt" 2>&1 &
+        mp=$!
+    fi
+    local status=0
+    PIGEONHOLE_BALANCE_LOG=1 "$bench" "${args[@]}" 2> "$out.balance.log" || status=$?
+    [[ -z "$mp" ]] || { kill "$mp" 2> /dev/null; wait "$mp" 2> /dev/null; } || true
+    machine_state > "$out.machine-after.txt"
+    grep -v '^balance ' "$out.balance.log" >&2 || true
+    return "$status"
+}
 step_contended() {
     local level w
     for level in "${contended_levels[@]}"; do
         for w in "${contended_workloads[@]}"; do
-            "$bench" "$w" --engine "$(engines_for "$w")" --scale "$scale" --threads 16 \
-                --durability "$level" --ops "$contended_ops" --min-secs "$contended_secs" \
-                --max-secs "$contended_max_secs" \
-                --dir "$data/bench" --json "$results/contended-$level-$w.json" \
-                --markdown "$results/contended-$level-$w.md"
+            contended_run "$level" "$w"
             rm -r "$data/bench"
         done
         for w in "${contended_reported[@]}"; do

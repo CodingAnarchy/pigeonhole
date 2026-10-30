@@ -14,11 +14,11 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -q
 # build-essential, clang and libclang: RocksDB's bindings (bindgen) and the C parts of the
 # workspace; nvme-cli and xfsprogs: the drive; gdb and elfutils: stacks of a hung step;
-# linux-tools: cpupower.
+# linux-tools: cpupower; sysstat: mpstat beside the contended cross-shard rows (#1188).
 apt-get install -y -q build-essential clang libclang-dev pkg-config python3 git curl \
-    nvme-cli xfsprogs tmux gdb elfutils "linux-tools-$(uname -r)" linux-tools-common || \
+    nvme-cli xfsprogs tmux gdb elfutils sysstat "linux-tools-$(uname -r)" linux-tools-common || \
     apt-get install -y -q build-essential clang libclang-dev pkg-config python3 git curl \
-        nvme-cli xfsprogs tmux gdb elfutils
+        nvme-cli xfsprogs tmux gdb elfutils sysstat
 
 if ! command -v cargo >/dev/null && [[ ! -x "$HOME/.cargo/bin/cargo" ]]; then
     curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
