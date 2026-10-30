@@ -110,14 +110,16 @@ OPTIONS:
                            top). total: --cache is each store's whole read-cache memory
                            (Pigeonhole: block + row cache; SQLite: split across its
                            connections), so every store caches the same bytes (#759)
-    --sync                 fsync every commit on every engine [default: buffered];
-                           the same as --durability sync
+    --sync                 fsync every commit on every engine, the load too
+                           [default: buffered]
     --durability MODE      buffered, sync, group-sync or default [default: buffered].
+                           sync: every engine fsyncs every commit (Pigeonhole commits
+                           Sync, group-commit included, no shared fsyncs);
                            group-sync: Pigeonhole commits GroupSync, the others fsync
                            every write; default: Pigeonhole keeps Options::default()'s
                            durability (GroupSync), the others fsync every write. With
-                           either, every engine loads buffered and switches after the
-                           settle step (D247)
+                           any of the three, every engine loads buffered and switches
+                           after the settle step (D247)
     --no-tablet-changes    Pigeonhole: keep each table one tablet on one shard (tablets
                            split, merge and move between shards by default)
     --no-packing           Pigeonhole: spread tablets over every shard even under light
@@ -178,9 +180,12 @@ OPTIONS:
                            and T × 30 µs at p99 (D259) [default: 0.20]
 ";
 
-/// A `--durability` beyond buffered and sync.
+/// A `--durability` beyond buffered.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Durability {
+    /// Every engine fsyncs every commit, Pigeonhole's group-commit runs included (`Sync`,
+    /// no shared fsyncs), after a buffered load.
+    Sync,
     /// Pigeonhole commits `GroupSync`.
     GroupSync,
     /// Pigeonhole keeps `Options::default()`'s durability (D247).
@@ -292,7 +297,10 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--sync" => a.sync = true,
             "--durability" => match it.next().as_deref() {
                 Some("buffered") => a.durability = None,
-                Some("sync") => a.sync = true,
+                Some("sync") => {
+                    a.sync = true;
+                    a.durability = Some(Durability::Sync);
+                }
                 Some("group-sync") => a.durability = Some(Durability::GroupSync),
                 Some("default") => a.durability = Some(Durability::Default),
                 other => {
@@ -447,8 +455,8 @@ fn missing(feature: &str) -> Result<Box<dyn Runner>, String> {
 }
 
 /// The runner for `engine`. [`WorkloadKind::GroupCommit`] commits durably: `GroupSync` on
-/// Pigeonhole, fsync on every write elsewhere (RocksDB's concurrent writers then share a
-/// write group, its group commit).
+/// Pigeonhole (`Sync` with `--durability sync`), fsync on every write elsewhere (RocksDB's
+/// concurrent writers then share a write group, its group commit).
 fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>, String> {
     let group = kind == WorkloadKind::GroupCommit;
     // A durable Pigeonhole commit (group sync, or the default's) is matched by an fsync per
@@ -460,7 +468,8 @@ fn runner(a: &Args, engine: &str, kind: WorkloadKind) -> Result<Box<dyn Runner>,
     match engine {
         "pigeonhole" => {
             let r = pigeonhole(a, None);
-            Ok(Box::new(if group { r.group_sync(true) } else { r }))
+            let group_sync = group && a.durability != Some(Durability::Sync);
+            Ok(Box::new(if group_sync { r.group_sync(true) } else { r }))
         }
         // D274: ycsb-f's read-modify-write in a transaction, judged against RocksDB's
         // OptimisticTransactionDB (`pigeonhole`'s `commit_if` is reported beside it).
@@ -681,7 +690,12 @@ fn bench_workloads(a: &Args, root: &Path, seq: &mut u32, suite: &mut Suite) -> R
     };
     for kind in kinds {
         let c = config(a, kind)?;
-        if kind == WorkloadKind::GroupCommit && a.engines.iter().any(|e| e == "pigeonhole") {
+        // D213's target is a GroupSync shape; at `--durability sync` only the client-thread
+        // sweep runs (per-commit fsyncs, compared like for like).
+        if kind == WorkloadKind::GroupCommit
+            && a.engines.iter().any(|e| e == "pigeonhole")
+            && a.durability != Some(Durability::Sync)
+        {
             bench_group_commit_inline(a, root, seq, suite, &c)?;
         }
         let threads = match (kind, a.threads) {
@@ -847,6 +861,11 @@ mod tests {
         assert_eq!(args("all").durability, None);
         assert!(args("all --durability sync").sync);
         assert_eq!(
+            args("all --durability sync").durability,
+            Some(Durability::Sync)
+        );
+        assert_eq!(args("all --sync").durability, None);
+        assert_eq!(
             args("all --durability default").durability,
             Some(Durability::Default)
         );
@@ -864,7 +883,15 @@ mod tests {
         assert!(
             describe("ycsb-a --durability group-sync", WorkloadKind::YcsbA).contains(" group-sync")
         );
-        assert!(describe("ycsb-a --durability sync", WorkloadKind::YcsbA).contains(" sync"));
+        assert!(
+            describe("ycsb-a --durability sync", WorkloadKind::YcsbA)
+                .contains(" sync load=buffered")
+        );
+        // group-commit is GroupSync unless --durability sync asks for Sync.
+        let gc = describe("group-commit", WorkloadKind::GroupCommit);
+        assert!(gc.contains(" group-sync"), "{gc}");
+        let gc = describe("group-commit --durability sync", WorkloadKind::GroupCommit);
+        assert!(gc.contains(" sync") && !gc.contains("group-sync"), "{gc}");
         assert_eq!(
             args("all --engine all").engines,
             ["pigeonhole", "rocksdb", "sqlite"]
