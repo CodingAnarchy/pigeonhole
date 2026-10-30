@@ -85,6 +85,11 @@ Measured on the reference machine (Hetzner AX102: AMD Ryzen 9 7950X3D, 16 cores,
 | Sparse wide rows | Buffered | 91K/s, 2.4 ms | 72K/s, 3.3 ms | 41K/s, 3.6 ms |
 | | GroupSync (default) | 78K/s, 2.7 ms | 59K/s, 3.5 ms | 34K/s, 8.3 ms |
 
+<!-- Release PR: add a `Sync` row under each workload from gate 4's Durability::Sync arm, e.g.
+| | Sync | gate 4 | gate 4 | gate 4 |
+and update the commit, date and figures above from gate 4. -->
+`Durability::Sync` (a dedicated fsync per commit, never shared) is measured in the 1.0 release gate; its rows are added then.
+
 **Durable commits** (`GroupSync`, 16 shards, 16 commits in flight per shard): 11.1M cells/s, commit p50 72 µs, p99 127 µs.
 
 ## Configuration
