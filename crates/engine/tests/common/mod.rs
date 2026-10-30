@@ -423,10 +423,13 @@ pub struct Stats {
     pub unowned_records: usize,
     /// Earlier copies of a `(seqno, kind)` whose seqno recovery reused after a crash.
     pub reused_records: usize,
-    /// Surviving seqnos with only PREPAREs and no COMMIT on any stream (an attempt a shard
-    /// changing a tablet refused, retried under a new seqno; D83 never recovers them), kept
-    /// out of the match with unacknowledged commits. Tablet changes only.
+    /// Surviving seqnos with only PREPAREs and no COMMIT on any stream that a participant
+    /// refused (`Engine::take_refused_attempts`; the commit ran again under a new seqno, or
+    /// gave up; D83 never recovers them), kept out of the match with unacknowledged commits.
     pub refused_attempts: usize,
+    /// The same for an attempt nobody refused, which the crash cut off before any COMMIT
+    /// (tablet changes only).
+    pub undecided_attempts: usize,
     /// Commits recovered only from SSTs (their WAL records were checkpointed away).
     pub sst_only: usize,
     /// PREPAREs of an unacknowledged or aborted cross-shard commit with no COMMIT on any stream
@@ -2648,14 +2651,41 @@ impl World {
                 && !committed_anywhere
             {
                 self.settled_seqnos.insert(*seqno);
-                self.stats.refused_attempts += 1;
-                self.trace
-                    .push(format!("  seqno {seqno}: PREPAREs of a refused attempt"));
+                if self.refused_seqnos.contains(seqno) {
+                    self.stats.refused_attempts += 1;
+                    self.trace
+                        .push(format!("  seqno {seqno}: PREPAREs of a refused attempt"));
+                } else {
+                    self.stats.undecided_attempts += 1;
+                    self.trace
+                        .push(format!("  seqno {seqno}: PREPAREs of an undecided attempt"));
+                }
                 continue;
             }
-            let exact = (0..unacked.len()).filter(|&i| unacked_keys[i] == keys);
-            let within = (0..unacked.len())
-                .filter(|&i| unacked_keys[i] != keys && keys.is_subset(&unacked_keys[i]));
+            // Only a commit that writes every surviving record of the seqno can own it: a Batch
+            // is a single-shard commit's record on its stream, a PREPARE a cross-shard
+            // commit's share on one of its participants. Keys alone are not enough: a share
+            // whose keys reduced to a marker (a put then a column delete of the same cell) is
+            // a subset of every commit that deletes that column (seed 784 of
+            // `crash_at_every_write_point` took an undecided cross-shard commit for a
+            // single-shard commit's Batch).
+            let held: Vec<(u32, RecKind)> = wal
+                .streams
+                .iter()
+                .flat_map(|(stream, list)| {
+                    list.iter()
+                        .filter(|(s, _)| *s == *seqno)
+                        .map(|(_, kind)| (*stream, *kind))
+                })
+                .collect();
+            let writes = |i: usize| {
+                let records = records_of(&unacked[i].streams);
+                held.iter().all(|r| records.contains(r))
+            };
+            let exact = (0..unacked.len()).filter(|&i| unacked_keys[i] == keys && writes(i));
+            let within = (0..unacked.len()).filter(|&i| {
+                unacked_keys[i] != keys && keys.is_subset(&unacked_keys[i]) && writes(i)
+            });
             let fits = exact.chain(within).collect();
             unknown.push((*seqno, sv.commit_ts, keys, fits));
         }
