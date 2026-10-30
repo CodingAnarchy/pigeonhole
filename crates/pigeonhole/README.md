@@ -4,19 +4,14 @@
 column families, sparse qualifiers, timestamped versions, TTLs, prefix and range scans) with
 SQLite's deployment model (one file, a library, no server).
 
-> **Maturity: experimental 0.x.** The core engine (Phase 1) is complete and fault-tested in
-> simulation, and the wide-column model (Phase 2: counter families, blob separation,
-> compaction styles, zstd) is complete since 0.2.0: its performance gate is met as amended
-> by [D193](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/design/decisions/phase-2.md#d193), with one documented
-> gap, the read tail of wide, heavily overwritten rows
-> ([#387](https://github.com/CodingAnarchy/pigeonhole/issues/387)). The latency engine
-> (Phase 3: io_uring, direct I/O, the async API, pinned thread-per-core shards) is complete in
-> 0.3.0, its gate passed on the reference machine (contended gaps carried to Phase 4). The
-> file format is frozen for 1.x at format 4 (the
-> [compatibility promise](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md#13-compatibility-promise)
-> takes effect at 1.0.0); the API may still change before 1.0.
-> Pigeonhole is **not recommended for production use yet**. See the
-> [status and roadmap](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md).
+> **Maturity: 1.0.** The public API of `pigeonhole`, `pigeonhole-arrow` and `phdb` follows
+> semver from 1.0.0 (D282), and every 1.x release reads and writes file format 4 (the
+> [compatibility promise](https://github.com/CodingAnarchy/pigeonhole/blob/main/FORMAT.md#13-compatibility-promise)).
+> All four phases are complete, each with its performance gate on the reference machine:
+> the core engine, the wide-column model, the latency engine and hardening.
+> The 1.0 release gate passed on 2026-10-30 at `main` [`790ae3a0`](https://github.com/CodingAnarchy/pigeonhole/commit/790ae3a0).
+> 1.0 ships with documented gaps, listed in the
+> [status page](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/status.md).
 
 > **Status.** The blocking API is implemented, disk-backed and crash-safe through the
 > write-ahead log: memtables flush into the file and compact, so data is bounded by the disk,
@@ -41,10 +36,10 @@ exactly. The file format's promise is separate. Details:
 cargo add pigeonhole
 ```
 
-or `pigeonhole = "0.3"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on
+or `pigeonhole = "1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on
 [docs.rs](https://docs.rs/pigeonhole). See the
 [changelog](https://github.com/CodingAnarchy/pigeonhole/blob/main/CHANGELOG.md) and the
-[0.3.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.3.0).
+[1.0.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0).
 
 ## Quickstart
 

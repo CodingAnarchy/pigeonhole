@@ -1,18 +1,18 @@
 # Getting started
 
-> **Status:** this guide describes `main`; the current release on crates.io is 0.3.4, and the [changelog](../../CHANGELOG.md) and [`changelog.d/`](../../changelog.d/README.md) list what `main` adds. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). Features from later phases are labeled with their phase; [the last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
+> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. Code samples run as doctests of the `pigeonhole` crate (lines starting with `#` are hidden setup). Track progress in [`../status.md`](../status.md). [The last section](#what-the-current-build-does-not-do-yet) lists what the current build does not do yet.
 
 ## Install
 Pigeonhole is published on [crates.io](https://crates.io/crates/pigeonhole). Add it with `cargo add pigeonhole`, or in `Cargo.toml`:
 
 ```toml
 [dependencies]
-pigeonhole = "0.3"
+pigeonhole = "1"
 ```
 
-This is an experimental 0.x release: the API may change before 1.0, and the file format is frozen for 1.x at format 4 (see [the maturity note](README.md) and [file format and upgrades](concepts.md#file-format-and-upgrades)). Upgrading from 0.2.x: the changelog's [Upgrading from 0.2.x](../../CHANGELOG.md#upgrading-from-02x) lists the behaviour changes you will notice (pinned threads, apply-time visibility, `OutcomeUnknown`, `Busy`, application-owned loops). From 0.1.0, [Migrating from 0.1.0](../../CHANGELOG.md#migrating-from-010) comes first (counter families, the version 2 file format, the FUSE opt-in). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
+From 1.0.0 the API follows semver and every 1.x release reads and writes file format 4 (see [the maturity note](README.md) and [file format and upgrades](concepts.md#file-format-and-upgrades)). Upgrading from 0.3.x: the changelog's [Upgrading from 0.3.x](../../CHANGELOG.md#upgrading-from-03x) lists what to do first (back up before the first writable open, upgrade reader processes with the writer) and the API changes. Upgrading from 0.2.x: the changelog's [Upgrading from 0.2.x](../../CHANGELOG.md#upgrading-from-02x) lists the behaviour changes you will notice (pinned threads, apply-time visibility, `OutcomeUnknown`, `Busy`, application-owned loops). From 0.1.0, [Migrating from 0.1.0](../../CHANGELOG.md#migrating-from-010) comes first (counter families, the version 2 file format, the FUSE opt-in). The full API reference is on [docs.rs](https://docs.rs/pigeonhole); this guide covers concepts and usage, and the [agent reference](agent-reference.md) is the one-page summary.
 
-This guide follows `main`, whose API is frozen for 1.0 (ICR 0085–0088). The 0.3.x releases have the API from before the freeze: for example `Family::lz4()` and `zstd(level)` instead of `compression(..)`, and `open_application_owned` returning `(Pigeonhole, Vec<Shard>)` instead of `AppOwned`. The changelog lists every breaking change.
+The 0.3.x releases have the API from before the 1.0 freeze (ICR 0085–0088): for example `Family::lz4()` and `zstd(level)` instead of `compression(..)`, and `open_application_owned` returning `(Pigeonhole, Vec<Shard>)` instead of `AppOwned`. The changelog lists every breaking change.
 
 Requirements: Rust 2024 edition, MSRV 1.96. The blocking API needs no async runtime. The `async` feature is on by default (since 0.3.0; off in 0.2.x) and adds an async form of every data operation (see [Async](async.md)); `default-features = false` drops it.
 
@@ -290,7 +290,7 @@ assert!(jobs.mutate(b"job:1").put("meta", b"state", b"done").commit_if(&is_w1)?.
 ```
 `Condition::Exists` and `Condition::Absent` test a column, `Condition::Value` its newest value. The condition and the mutation are on one row.
 
-For invariants across rows, a `Transaction` (P4, available now) reads, buffers writes and commits them atomically. It is optimistic: if a commit changed anything it read before it commits, `commit` fails with `ErrorCode::Conflict` and nothing is written, so retry the whole transaction. A transaction that only reads never conflicts: all its reads come from one snapshot, and its commit returns at once.
+For invariants across rows, a `Transaction` reads, buffers writes and commits them atomically. It is optimistic: if a commit changed anything it read before it commits, `commit` fails with `ErrorCode::Conflict` and nothing is written, so retry the whole transaction. A transaction that only reads never conflicts: all its reads come from one snapshot, and its commit returns at once.
 
 ```rust
 # use pigeonhole::*;
@@ -392,7 +392,7 @@ Reopening after a crash with fewer shards or a smaller `memtable_budget` than be
 |---|---|
 | `Durability::None` commits | Durable once flushed (`flush`, a clean close, or a background flush), or once a later stronger commit on the same shard returns (decision D94, see [Durability](durability.md#mixed-levels)). A crash before either loses them. |
 
-Available ahead of their phase: `Transaction` and reader processes (`open_reader`) (P4).
+Available ahead of their phase: `Transaction` and reader processes (`open_reader`).
 
 ## Next
 [Durability](durability.md) · [Transactions](transactions.md) · [Async](async.md) · [Scans and filters](scans-and-filters.md) · [Data modeling](data-modeling.md) · [Reader processes](readers.md) · [Recovery](recovery.md) · [Errors](errors.md) · [Command line](cli.md) · [Arrow export](arrow.md) · [Performance](performance.md) · [Agent reference](agent-reference.md)

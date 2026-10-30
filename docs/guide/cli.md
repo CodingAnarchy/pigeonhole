@@ -2,9 +2,9 @@
 
 `phdb` inspects and maintains Pigeonhole databases from the shell, in the spirit of `sqlite3` and `duckdb`.
 
-> **Status: on `main`, not released yet** ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). Every command works: `info`, `check`, `dump`, `load`, `backup`, `compact` and the interactive `shell`. CI installs it from a checkout and runs it.
+> **Status:** released in 1.0.0 ([#692](https://github.com/CodingAnarchy/pigeonhole/issues/692)). Every command works: `info`, `check`, `dump`, `load`, `backup`, `compact` and the interactive `shell`. CI installs it from a checkout and runs it.
 
-**Install:** `cargo install pigeonhole-cli` installs the `phdb` binary. Until the next release, build it from a checkout with `cargo install --path crates/cli`.
+**Install:** `cargo install pigeonhole-cli` installs the `phdb` binary; from a checkout, `cargo install --path crates/cli`.
 
 ## Commands
 
@@ -32,7 +32,7 @@
 
 `check` is the exception: it never opens the database (see [`phdb check`](#phdb-check)). The rest:
 
-A database has one writer process at a time and any number of reader processes (see [Concepts](concepts.md#multi-process-readers-phase-4-available-now)). A read-only command such as `info` works either way:
+A database has one writer process at a time and any number of reader processes (see [Concepts](concepts.md#multi-process-readers)). A read-only command such as `info` works either way:
 
 - **No writer running:** `phdb` opens the database as the writer for the length of the command, then closes it.
   - If the last writer crashed, opening **replays its WAL**, exactly as your application's next open would, like `sqlite3` rolling back a hot journal. The close then checkpoints it, so the database is one file again.

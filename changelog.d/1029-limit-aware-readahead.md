@@ -1,2 +1,0 @@
-### Changed
-- Scans: a scan whose row limit leaves at most 128 rows to return now starts reading blocks ahead only after 8 blocks, instead of 2 (#1029, #712). Short scans finished before their readahead arrived and then waited for it, which made up most of ycsb-e's p99. A short scan that turns out long in blocks still reads ahead (a wide row, rows a filter skips, a run of deleted rows). Scans with no limit, or a larger one, read ahead as before.

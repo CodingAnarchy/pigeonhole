@@ -1,2 +1,0 @@
-### Fixed
-- **Application-owned mode with background workers: an engine dropped without `close()` after its shards no longer leaks** (#1070, D284). A flush or compaction a worker held or had queued was handed back to its shard's queue after the shard was gone, and kept the engine's state, its files and the shard's queue alive in a cycle. Tasks handed back to a dropped shard are now dropped. No release contains D284.

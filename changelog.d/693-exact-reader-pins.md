@@ -1,2 +1,0 @@
-### Fixed
-- A reader process pins only what its live snapshots need (#693, #39). An idle reader, with no snapshot alive, used to keep its last snapshot's memtables and file space pinned until it took another snapshot, and a reader whose snapshots overlapped never let go of its oldest. A long-lived, mostly idle reader could fill the writer's memtable budget and make its commits fail with `Busy`. Now the pin is always the oldest live snapshot's, it moves up as snapshots are dropped, and a reader with none pins nothing.

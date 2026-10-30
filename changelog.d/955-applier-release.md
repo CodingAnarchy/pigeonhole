@@ -1,2 +1,0 @@
-### Changed
-- **A cross-shard commit is answered by the shard that applies it last** (D278, ICR 0074, #932). That shard makes the commit visible and answers the caller itself, instead of telling the coordinating shard, which then did both. The client's answer and every later commit's visibility skip one hand-off between shards. The hold on a decided commit moved from the coordinator's watermark into a new shared-memory word, so the shared-memory layout changes: reader processes must run the same build as the writer, as with every layout change.

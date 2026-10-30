@@ -2,12 +2,10 @@
 
 The `pigeonhole-arrow` crate turns a scan into [Apache Arrow](https://arrow.apache.org/) record batches, so you can hand a table to DuckDB, Polars, DataFusion or anything else that reads Arrow. It reads through the public API only, so the core crates never depend on Arrow.
 
-> **Not released yet:** this is on `main` (#691). It ships in the next release.
-
 ```toml
 [dependencies]
-pigeonhole = "0.4"
-pigeonhole-arrow = "0.4"
+pigeonhole = "1"
+pigeonhole-arrow = "1"
 ```
 
 ## A scan as batches
@@ -128,7 +126,7 @@ The export costs about a fifth to a quarter on top of the scan that feeds it. Th
 The [Arrow C stream interface](https://arrow.apache.org/docs/format/CStreamInterface.html) passes a stream between libraries without sharing an arrow-rs version, or a language. With the `ffi` feature, `ArrowScan<'static>::into_ffi_stream()` gives an `FFI_ArrowArrayStream`: start from `Scan::into_owned()`, then hand the stream over. The consumer owns it and calls its `release` callback when done.
 
 ```toml
-pigeonhole-arrow = { version = "0.4", features = ["ffi"] }
+pigeonhole-arrow = { version = "1", features = ["ffi"] }
 ```
 
 ```rust,ignore

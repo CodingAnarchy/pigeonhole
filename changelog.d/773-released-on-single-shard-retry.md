@@ -1,2 +1,0 @@
-### Fixed
-- A cross-shard transaction or `commit_if` refused because it overlapped an older cross-shard commit's undecided share waits for that older commit to move on (D249). If the older commit was retried after a tablet split, merge or move and all its rows now lived on one shard, it never said so, and the younger commit waited until the write-stall timeout and failed with `Busy` (for ever with a stopped clock). It is now released as soon as the older commit leaves two-phase commit. Nothing was lost or reordered: the commit was only delayed, then refused (#772).

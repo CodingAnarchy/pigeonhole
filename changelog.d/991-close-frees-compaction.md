@@ -1,2 +1,0 @@
-### Fixed
-- **A close frees a running compaction's output** (#991). A compaction still writing when `close()` began kept running, and the close could end without it, so its output stayed allocated in the file until the next open reclaimed it. A running compaction now stops at its next slice once the close begins and frees what it wrote, and the close ends only after that, so the file holds no dead extents after `close()`. A compaction that has already submitted its result is not stopped: the close waits for its commit, as before.

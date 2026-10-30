@@ -1,0 +1,24 @@
+# The v1.0.0 corpus, written by the 1.0.0 build: path, length, xxh3-64.
+# Frozen: no file or line ever changes (FORMAT.md §13).
+blobs/data.phdb 786432 4699bab1719b23ec
+blobs/expected.txt 69888 0219ff8414f4c89a
+checkpoints/data.phdb 786432 19cfe416bf1e8277
+checkpoints/expected.txt 188 20252a31ce368b7d
+counters/data.phdb 1048576 7a10edde7ede70df
+counters/expected.txt 1521 6c96691916a11af5
+empty/data.phdb 524288 e91dda4930e05b72
+empty/expected.txt 1 384868fba0c21fdc
+families/data.phdb 1310720 7901417e578c89a2
+families/expected.txt 73490 7a94632d27a11fc1
+merge/data.phdb 1048576 d21237b3fd61aca7
+merge/expected.txt 202 b687b0caffd3e007
+values/data.phdb 1048576 57b84d9aafae93fc
+values/expected.txt 8914 1e42c20bd79f0200
+wal_crash/data.phdb 1048576 24b61bde572a7721
+wal_crash/data.phdb-wal-0 262144 d7024694dfc171ab
+wal_crash/data.phdb-wal-1 262144 f5b1b6130f002e5e
+wal_crash/expected.txt 8300 43bda1f8adc840a7
+wal_ops/data.phdb 1310720 35a9d208ed663eb9
+wal_ops/data.phdb-wal-0 262144 458005e1070da19f
+wal_ops/data.phdb-wal-1 262144 c29c6fc288e51a4b
+wal_ops/expected.txt 11900 7a121a6063126f78

@@ -2,7 +2,7 @@
 
 One writer process and any number of reader processes on the same host can open the same `.phdb` file. Readers see each commit as soon as the writer publishes it. This page covers what a reader sees, what happens when either side crashes or restarts, and the limits.
 
-> **Status:** reader processes work today and are being hardened for 1.0 (#693). This page describes `main`.
+> **Status:** reader processes are part of 1.0 (#693). This page describes `main`.
 
 ## Opening a reader
 `Pigeonhole::open_reader(path, ReaderOptions)` returns a `PigeonholeReader`: tables (`ReadTable`) with `get`, `row`, `scan`, snapshots, `backup`, and `info`. There are no write methods. It reads memtables in place from the writer's shared-memory file and SSTs from the database file through its own block cache. It never replays the WAL.
@@ -93,4 +93,4 @@ Every limit is an error, never a hang:
 - **Block cache per process.** Each reader has its own block cache, 256 MiB by default (`ReaderOptions::block_cache`), on top of the writer's.
 
 ## Where next
-[Concepts](concepts.md#multi-process-readers-phase-4-available-now) · [Errors](errors.md) · [Agent reference](agent-reference.md)
+[Concepts](concepts.md#multi-process-readers) · [Errors](errors.md) · [Agent reference](agent-reference.md)
