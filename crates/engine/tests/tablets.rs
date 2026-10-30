@@ -4237,6 +4237,10 @@ fn crossing_commits_regressions_from_the_seed_sweep() {
     // next attempt to commit, or its last (D263).
     d142_sweep(277, true, false);
     d142_sweep(277, false, false);
+    // Seed 594 (the 1.0 soak): the placement put all six tablets on shard 2, and the
+    // workload's moves never spread them, so no commit crossed shards.
+    d142_sweep(594, true, false);
+    d142_sweep(594, true, true);
 }
 
 /// The same with tablet changes off (D244): three tables, one per shard (placement is
@@ -4282,6 +4286,17 @@ fn d142_sweep(seed: u64, tablet_changes: bool, moving_clock: bool) {
             if let Ok(m) = db.engine.move_tablet_pending(id, &[s], to) {
                 let _ = db.drive(m);
             }
+        }
+        // Six draws of one shard leave every tablet there, and a seed whose later moves never
+        // spread them makes no cross-shard commit (seed 594). Move "a" to the next shard then,
+        // without a draw, so every seed whose tablets already spread keeps its workload.
+        let per_shard = tablets_per_shard(&db, 3);
+        if let Some(shard) = per_shard.iter().position(|&n| n == per_shard.iter().sum()) {
+            let m = db
+                .engine
+                .move_tablet_pending(id, b"a", ((shard + 1) % 3) as u16)
+                .unwrap();
+            db.drive(m).unwrap();
         }
     } else {
         for i in 0..2 {
