@@ -55,7 +55,7 @@ A database is a sorted, sparse, versioned map: `(table, row, family, qualifier, 
 |---|---|
 | **Table** | A namespace with its own families. Many tables share one file. |
 | **Row key** | Arbitrary bytes (≤ 64 KiB), sorted lexicographically. Unit of atomicity and locality. |
-| **Family** | Declared up front; its own physical LSM tree with its own policy (compression, bloom bits, versions, TTL, blob threshold, cache priority, compaction style). A counter family holds `i64` sums. |
+| **Family** | Declared up front; its own physical LSM tree with its own policy (compression, bloom bits, versions, TTL, blob threshold, cache priority, compaction style). An aggregate family keeps one value per cell from blind writes: an `i64` sum (a counter), minimum or maximum, or a distinct count (HyperLogLog). |
 | **Qualifier** | Arbitrary bytes created on write, sorted within the family. Absent cells cost nothing. |
 | **Timestamp** | `u64`, newest first. Hybrid logical clock by default; user-supplied for event time. |
 | **Value** | Bytes, up to 4 GiB − 2. Values above a family's blob threshold live in blob files; one too large for the WAL and memtable (above the smaller of 64 MiB and half a shard's memtable arena) is written to a blob file as it is committed. Optional typed merge operators. |

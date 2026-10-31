@@ -12,7 +12,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 3. [Durability](durability.md): the four levels, how they resolve, what each survives, mixed levels, commit results.
 4. [Async](async.md): the async front door (on by default): futures and streams for every data operation, cancellation, backpressure on async commits, the sync-only calls.
 5. [Scans and filters](scans-and-filters.md): row, prefix and range scans, projection, versions, time ranges, snapshots, pushdown semantics.
-6. [Data modeling](data-modeling.md): row-key design, family split, time series with TTL, adjacency lists, counters, versions, anti-patterns.
+6. [Data modeling](data-modeling.md): row-key design, family split, time series with TTL, adjacency lists, aggregate families (counters, min and max, distinct counts), versions, anti-patterns.
 7. [Errors](errors.md): every `ErrorCode` with cause and remedy.
 8. [Recovering from a failed shard](recovery.md): detect a failed instance (`is_failed`), close, reopen, settle the commits in flight; or let `Options::auto_recover` do it in place.
 9. [Agent reference](agent-reference.md): every public type and method, limits, error codes and copy-paste recipes on one page.

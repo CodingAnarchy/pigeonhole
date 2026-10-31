@@ -103,6 +103,10 @@ The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2
 - **Considered and not adopted:** [D228](design/decisions/phase-3.md#d228), [D232](design/decisions/phase-3.md#d232).
 - **Releases from `release/0.2.x`, also in 0.3.0:** [0.2.1](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.1) (D209) and [0.2.2](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.2) (the cross-shard close fixes, [D225](design/decisions/phase-3.md#d225), #591, #597) and [0.2.3](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v0.2.3) (the cross-shard timestamp order, D244 and D245 without the room refusal).
 
+## On main since 1.0.0
+- **Aggregate families** ([D294](design/decisions/phase-3.md#d294), #487): min, max and HyperLogLog (distinct count) families beside counters (#1194, #1200, #1202). They're behind the first `incompat` feature bit, so a file holding one is refused by 1.0.x. ICR 0094; the guide's [Data modeling](guide/data-modeling.md#min-and-max).
+- **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
+
 ## Tracked follow-ups
 Deferred work is one GitHub issue each, labeled with its crate and phase and assigned to the phase's milestone (D62). The open list is the milestone itself:
 [Phase 2](https://github.com/CodingAnarchy/pigeonhole/milestone/2) ·
