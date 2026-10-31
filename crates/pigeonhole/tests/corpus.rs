@@ -205,8 +205,8 @@ fn entries() -> Vec<Entry> {
 }
 
 /// Min, max and HLL families (D294, the first `incompat` feature bit), and the bitwise, `f64`,
-/// exact-sum, mean-variance, histogram and quantile families (D298, the same bit; the last
-/// two with `kind_params`): inputs at the fixed timestamp and in buckets, puts,
+/// exact-sum, mean-variance, histogram, quantile and bloom families (D298, the same bit; the
+/// last three with `kind_params`), with bytes elements into HLL and bloom families: inputs at the fixed timestamp and in buckets, puts,
 /// deletes and checkpointed reads, sparse and dense sketches, signed zeros and infinities;
 /// flushed, then more in the WAL that the crash leaves for replay.
 fn write_aggregates(db: &Pigeonhole) {
@@ -227,6 +227,12 @@ fn write_aggregates(db: &Pigeonhole) {
             "latency_h",
             Family::aggregate(Aggregation::Histogram(
                 pigeonhole::HistogramParams::new([-1.0, 0.0, 10.0, 100.0]).unwrap(),
+            )),
+        )
+        .family(
+            "seen_b",
+            Family::aggregate(Aggregation::Bloom(
+                pigeonhole::BloomParams::new(512, 3).unwrap(),
             )),
         )
         .family(
@@ -279,7 +285,10 @@ fn write_aggregates(db: &Pigeonhole) {
             .aggregate_f64("spread", b"all", y)
             .aggregate_f64("latency_h", b"all", x)
             .aggregate_f64_at("latency_h", b"hourly", T0 + (i % 4) * 3_600_000_000, y)
-            .aggregate_f64("latency_q", b"all", y);
+            .aggregate_f64("latency_q", b"all", y)
+            .aggregate("seen_b", b"all", v)
+            .aggregate_bytes("seen_b", b"names", format!("user-{}", i % 7).as_bytes())
+            .aggregate_bytes("users", b"names", format!("user-{}", i % 7).as_bytes());
         // Row a00's distinct users pass the sparse/dense boundary; the others stay sparse.
         let users = if i % 6 == 0 { 400 } else { 3 };
         for u in 0..users {

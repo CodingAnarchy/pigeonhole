@@ -631,6 +631,31 @@ impl RowMutation<'_> {
         })
     }
 
+    /// Writes the bytes element `value` (a string key, say) to the cell of an HLL or bloom
+    /// family ([`Aggregation::Hll`](crate::Aggregation::Hll),
+    /// [`Aggregation::Bloom`](crate::Aggregation::Bloom); D298). It hashes apart from any
+    /// `i64` element, behind a domain tag. Other families fail with `InvalidArgument`.
+    pub fn aggregate_bytes(self, family: &str, qualifier: &[u8], value: &[u8]) -> Self {
+        self.op_as(
+            Some(Operand::Bytes),
+            family,
+            qualifier,
+            value.len(),
+            |b, t, f, row| b.merge(t, f, row, qualifier, ValueRef::Bytes(value)),
+        )
+    }
+
+    /// [`aggregate_bytes`](Self::aggregate_bytes) to the bucket at timestamp `ts`.
+    pub fn aggregate_bytes_at(self, family: &str, qualifier: &[u8], ts: u64, value: &[u8]) -> Self {
+        self.op_as(
+            Some(Operand::Bytes),
+            family,
+            qualifier,
+            value.len(),
+            |b, t, f, row| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(value)),
+        )
+    }
+
     /// Writes an untyped operand for the family's merge operator (custom operators, Phase 2).
     /// The built-in `i64` add takes typed operands only: use `incr`, or the read fails with
     /// [`ErrorCode::MergeFailed`](crate::ErrorCode::MergeFailed).
@@ -1172,6 +1197,47 @@ impl WriteBatch {
             qualifier,
             8,
             |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::F64(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_bytes`]: a bytes element for an HLL or bloom family.
+    pub fn aggregate_bytes(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u8],
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::Bytes),
+            table,
+            row,
+            family,
+            qualifier,
+            value.len(),
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::Bytes(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_bytes_at`].
+    pub fn aggregate_bytes_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u8],
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::Bytes),
+            table,
+            row,
+            family,
+            qualifier,
+            value.len(),
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(value)),
         )
     }
 
@@ -1782,6 +1848,47 @@ impl Transaction {
             qualifier,
             8,
             |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::F64(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_bytes`]: a bytes element for an HLL or bloom family.
+    pub fn aggregate_bytes(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u8],
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::Bytes),
+            table,
+            row,
+            family,
+            qualifier,
+            value.len(),
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::Bytes(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_bytes_at`].
+    pub fn aggregate_bytes_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u8],
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::Bytes),
+            table,
+            row,
+            family,
+            qualifier,
+            value.len(),
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(value)),
         )
     }
 

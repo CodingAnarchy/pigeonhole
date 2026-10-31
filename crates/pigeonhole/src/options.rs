@@ -1069,6 +1069,61 @@ pub enum Aggregation {
     /// with [`CellRef::quantile`](crate::CellRef::quantile)). The same inputs give the same
     /// sketch in any order.
     Quantiles(QuantileParams),
+    /// A bloom filter of `i64` or bytes elements ([`BloomParams`];
+    /// [`aggregate`](crate::RowMutation::aggregate),
+    /// [`aggregate_bytes`](crate::RowMutation::aggregate_bytes); read with
+    /// [`CellRef::bloom_contains`](crate::CellRef::bloom_contains)): no false negatives,
+    /// false positives at the configured rate.
+    Bloom(BloomParams),
+}
+
+/// A bloom family's parameters ([`Aggregation::Bloom`], D298): `bits` (a power of two,
+/// 2^6 to 2^24) and `hashes` positions per element (1 to 16). With `n` elements the
+/// false-positive rate is about `(1 − e^(−hashes·n/bits))^hashes`. A filter is stored whole
+/// in its cell: up to `bits / 8` bytes once dense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BloomParams {
+    log2_bits: u8,
+    hashes: u8,
+}
+
+impl BloomParams {
+    /// `bits` bits and `hashes` positions; `InvalidArgument` out of range.
+    pub fn new(bits: u32, hashes: u8) -> crate::Result<Self> {
+        if !bits.is_power_of_two() {
+            return Err(crate::Error::new(
+                crate::ErrorCode::InvalidArgument,
+                "bloom bits must be a power of two, 2^6 to 2^24".to_owned(),
+            ));
+        }
+        let p = pigeonhole_format::bloom::BloomParams {
+            log2_bits: bits.trailing_zeros() as u8,
+            hashes,
+        };
+        p.check()
+            .map_err(|e| crate::Error::new(crate::ErrorCode::InvalidArgument, e.0.to_owned()))?;
+        Ok(BloomParams {
+            log2_bits: p.log2_bits,
+            hashes,
+        })
+    }
+
+    /// The bits.
+    pub fn bits(&self) -> u32 {
+        1 << self.log2_bits
+    }
+
+    /// The positions per element.
+    pub fn hashes(&self) -> u8 {
+        self.hashes
+    }
+
+    fn format(&self) -> pigeonhole_format::bloom::BloomParams {
+        pigeonhole_format::bloom::BloomParams {
+            log2_bits: self.log2_bits,
+            hashes: self.hashes,
+        }
+    }
 }
 
 /// A histogram family's bucket bounds ([`Aggregation::Histogram`], D298): `n` bounds
@@ -1174,6 +1229,7 @@ impl Aggregation {
             Aggregation::MeanVar => FamilyKind::MeanVar,
             Aggregation::Histogram(_) => FamilyKind::Histogram,
             Aggregation::Quantiles(_) => FamilyKind::Quantiles,
+            Aggregation::Bloom(_) => FamilyKind::Bloom,
         }
     }
 
@@ -1183,6 +1239,7 @@ impl Aggregation {
         match self {
             Aggregation::Histogram(h) => pigeonhole_format::buckets::histogram_params(&h.bounds()),
             Aggregation::Quantiles(q) => q.format().encode(),
+            Aggregation::Bloom(b) => b.format().encode(),
             _ => Vec::new(),
         }
     }
@@ -1205,6 +1262,14 @@ impl Aggregation {
                         max_buckets: q.max_buckets,
                     })
                 }),
+            FamilyKind::Bloom => pigeonhole_format::bloom::BloomParams::parse(&o.kind_params)
+                .ok()
+                .map(|b| {
+                    Aggregation::Bloom(BloomParams {
+                        log2_bits: b.log2_bits,
+                        hashes: b.hashes,
+                    })
+                }),
             kind => Self::of_kind(kind),
         }
     }
@@ -1225,7 +1290,7 @@ impl Aggregation {
             FamilyKind::MaxF64 => Some(Aggregation::MaxF64),
             FamilyKind::SumF64 => Some(Aggregation::SumF64),
             FamilyKind::MeanVar => Some(Aggregation::MeanVar),
-            FamilyKind::Histogram | FamilyKind::Quantiles => None,
+            FamilyKind::Histogram | FamilyKind::Quantiles | FamilyKind::Bloom => None,
         }
     }
 
@@ -1244,6 +1309,7 @@ impl Aggregation {
             Aggregation::MeanVar => "pigeonhole.f64_mean_var",
             Aggregation::Histogram(_) => "pigeonhole.f64_histogram",
             Aggregation::Quantiles(_) => "pigeonhole.f64_quantiles",
+            Aggregation::Bloom(_) => "pigeonhole.bloom",
         }
     }
 }

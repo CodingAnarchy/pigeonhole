@@ -39,6 +39,7 @@ pub fn pigeonhole::nonblocking::TransactionCommitFuture::poll(core::pin::Pin<&mu
 pub pigeonhole::Aggregation::BitAnd
 pub pigeonhole::Aggregation::BitOr
 pub pigeonhole::Aggregation::BitXor
+pub pigeonhole::Aggregation::Bloom(pigeonhole::BloomParams)
 pub pigeonhole::Aggregation::Histogram(pigeonhole::HistogramParams)
 pub pigeonhole::Aggregation::Hll
 pub pigeonhole::Aggregation::Max
@@ -173,11 +174,19 @@ pub fn pigeonhole::BackgroundWorker::run_once(&mut self, core::time::Duration) -
 pub fn pigeonhole::BackgroundWorker::set_wakeup(&mut self, alloc::boxed::Box<(dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync)>)
 pub fn pigeonhole::BackgroundWorker::wait(&mut self, core::time::Duration)
 pub fn pigeonhole::BackgroundWorker::waker(&self) -> core::task::wake::Waker
+pub struct pigeonhole::BloomParams
+impl pigeonhole::BloomParams
+pub fn pigeonhole::BloomParams::bits(&self) -> u32
+pub fn pigeonhole::BloomParams::hashes(&self) -> u8
+pub fn pigeonhole::BloomParams::new(u32, u8) -> pigeonhole::Result<Self>
 pub struct pigeonhole::Cell
 impl pigeonhole::Cell
 pub fn pigeonhole::Cell::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::Cell::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::Cell::as_u64(&self) -> core::option::Option<u64>
+pub fn pigeonhole::Cell::bloom_contains(&self, i64) -> core::option::Option<bool>
+pub fn pigeonhole::Cell::bloom_contains_bytes(&self, &[u8]) -> core::option::Option<bool>
+pub fn pigeonhole::Cell::bloom_fill(&self) -> core::option::Option<f64>
 pub fn pigeonhole::Cell::histogram_counts(&self) -> core::option::Option<alloc::vec::Vec<u64>>
 pub fn pigeonhole::Cell::hll_estimate(&self) -> core::option::Option<u64>
 pub fn pigeonhole::Cell::mean_var(&self) -> core::option::Option<pigeonhole::MeanVar>
@@ -196,6 +205,9 @@ impl<'a> pigeonhole::CellRef<'a>
 pub fn pigeonhole::CellRef<'a>::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::CellRef<'a>::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::CellRef<'a>::as_u64(&self) -> core::option::Option<u64>
+pub fn pigeonhole::CellRef<'a>::bloom_contains(&self, i64) -> core::option::Option<bool>
+pub fn pigeonhole::CellRef<'a>::bloom_contains_bytes(&self, &[u8]) -> core::option::Option<bool>
+pub fn pigeonhole::CellRef<'a>::bloom_fill(&self) -> core::option::Option<f64>
 pub fn pigeonhole::CellRef<'a>::histogram_counts(&self) -> core::option::Option<alloc::vec::Vec<u64>>
 pub fn pigeonhole::CellRef<'a>::hll_estimate(&self) -> core::option::Option<u64>
 pub fn pigeonhole::CellRef<'a>::mean_var(&self) -> core::option::Option<pigeonhole::MeanVar>
@@ -564,6 +576,8 @@ pub struct pigeonhole::RowMutation<'t>
 impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::aggregate(self, &str, &[u8], i64) -> Self
 pub fn pigeonhole::RowMutation<'_>::aggregate_at(self, &str, &[u8], u64, i64) -> Self
+pub fn pigeonhole::RowMutation<'_>::aggregate_bytes(self, &str, &[u8], &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::aggregate_bytes_at(self, &str, &[u8], u64, &[u8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::aggregate_f64(self, &str, &[u8], f64) -> Self
 pub fn pigeonhole::RowMutation<'_>::aggregate_f64_at(self, &str, &[u8], u64, f64) -> Self
 pub fn pigeonhole::RowMutation<'_>::aggregate_u64(self, &str, &[u8], u64) -> Self
@@ -693,6 +707,8 @@ pub struct pigeonhole::Transaction
 impl pigeonhole::Transaction
 pub fn pigeonhole::Transaction::aggregate(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], i64) -> &mut Self
 pub fn pigeonhole::Transaction::aggregate_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
+pub fn pigeonhole::Transaction::aggregate_bytes(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::aggregate_bytes_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
 pub fn pigeonhole::Transaction::aggregate_f64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], f64) -> &mut Self
 pub fn pigeonhole::Transaction::aggregate_f64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, f64) -> &mut Self
 pub fn pigeonhole::Transaction::aggregate_u64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self
@@ -736,6 +752,8 @@ pub struct pigeonhole::WriteBatch
 impl pigeonhole::WriteBatch
 pub fn pigeonhole::WriteBatch::aggregate(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], i64) -> &mut Self
 pub fn pigeonhole::WriteBatch::aggregate_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
+pub fn pigeonhole::WriteBatch::aggregate_bytes(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::aggregate_bytes_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
 pub fn pigeonhole::WriteBatch::aggregate_f64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], f64) -> &mut Self
 pub fn pigeonhole::WriteBatch::aggregate_f64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, f64) -> &mut Self
 pub fn pigeonhole::WriteBatch::aggregate_u64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self

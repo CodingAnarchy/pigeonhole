@@ -248,3 +248,94 @@ mod tests {
         assert!(bucket_state_valid(true, &fq) && bucket_state_valid(false, &fh));
     }
 }
+
+/// The model's bloom families' bits (`bloom*`): 2^10, so a few dozen elements turn a filter
+/// dense (sparse while fewer than 32 bits are set).
+pub const MODEL_BLOOM_LOG2_BITS: u8 = 10;
+/// The model's bloom families' hash positions per element.
+pub const MODEL_BLOOM_HASHES: u8 = 3;
+
+/// The model bloom filter's set bits for `inputs` (`i64` elements) and `base` (if any),
+/// written from FORMAT §3.6 rather than with the store's code: positions `(h1 + i·h2) mod m`
+/// over the format's element hash, a sorted set, and its own encoder and decoder.
+pub fn bloom_state(base: Option<&[u8]>, inputs: impl IntoIterator<Item = i64>) -> Option<Vec<u8>> {
+    let m = 1u64 << MODEL_BLOOM_LOG2_BITS;
+    let mut set = match base {
+        Some(b) => decode_bloom(b)?,
+        None => std::collections::BTreeSet::new(),
+    };
+    let mut any = base.is_some();
+    for v in inputs {
+        let h = pigeonhole_format::hll::hash_i64(v);
+        let (h1, h2) = (h & 0xffff_ffff, (h >> 32) | 1);
+        for i in 0..u64::from(MODEL_BLOOM_HASHES) {
+            set.insert(((h1 + i * h2) % m) as u32);
+        }
+        any = true;
+    }
+    any.then(|| encode_bloom(&set))
+}
+
+fn encode_bloom(set: &std::collections::BTreeSet<u32>) -> Vec<u8> {
+    let m = 1usize << MODEL_BLOOM_LOG2_BITS;
+    let mut out = vec![6, MODEL_BLOOM_LOG2_BITS, MODEL_BLOOM_HASHES];
+    if 4 * set.len() < m / 8 {
+        out.push(0);
+        for b in set {
+            out.extend_from_slice(&b.to_le_bytes());
+        }
+    } else {
+        out.push(1);
+        let mut bitmap = vec![0u8; m / 8];
+        for &b in set {
+            bitmap[b as usize / 8] |= 1 << (b % 8);
+        }
+        out.extend_from_slice(&bitmap);
+    }
+    out
+}
+
+fn decode_bloom(s: &[u8]) -> Option<std::collections::BTreeSet<u32>> {
+    if s.len() < 4 || s[..3] != [6, MODEL_BLOOM_LOG2_BITS, MODEL_BLOOM_HASHES] {
+        return None;
+    }
+    let set: std::collections::BTreeSet<u32> = match s[3] {
+        0 => s[4..]
+            .chunks(4)
+            .map(|c| u32::from_le_bytes(c.try_into().unwrap_or([0xff; 4])))
+            .collect(),
+        1 => (0..(s.len() - 4) * 8)
+            .filter(|&j| s[4 + j / 8] >> (j % 8) & 1 == 1)
+            .map(|j| j as u32)
+            .collect(),
+        _ => return None,
+    };
+    (!set.is_empty() && encode_bloom(&set) == s).then_some(set)
+}
+
+/// Whether `s` is a well-formed, canonical bloom state of the model's parameters.
+pub fn bloom_state_valid(s: &[u8]) -> bool {
+    decode_bloom(s).is_some()
+}
+
+#[cfg(test)]
+mod bloom_tests {
+    use super::*;
+    use pigeonhole_format::bloom::{self, BloomParams};
+
+    #[test]
+    fn matches_the_format_codec() {
+        let p = BloomParams {
+            log2_bits: MODEL_BLOOM_LOG2_BITS,
+            hashes: MODEL_BLOOM_HASHES,
+        };
+        for n in [1i64, 5, 40] {
+            let mut fmt = Vec::new();
+            for v in 0..n {
+                bloom::add(&mut fmt, p, pigeonhole_format::hll::hash_i64(v)).unwrap();
+            }
+            assert_eq!(bloom_state(None, 0..n).as_deref(), Some(&fmt[..]), "{n}");
+            assert!(bloom_state_valid(&fmt));
+        }
+    }
+}

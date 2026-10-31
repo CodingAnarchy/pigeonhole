@@ -53,6 +53,7 @@ let pages = db
 | Totals of decimals (amounts, durations) | `Family::aggregate(Aggregation::SumF64)`: an exact sum, read with `sum_f64` |
 | Averages and spread (latency mean and variance) | `Family::aggregate(Aggregation::MeanVar)`; read with `mean_var` |
 | Distributions in fixed buckets (response codes, latency bands) | `Family::aggregate(Aggregation::Histogram(HistogramParams::new(bounds)?))`; read with `histogram_counts` |
+| Membership checks (seen this user? this URL?) | `Family::aggregate(Aggregation::Bloom(BloomParams::new(bits, hashes)?))`; write with `aggregate` or `aggregate_bytes`, read with `bloom_contains` |
 | Percentiles (p50, p99 latency) | `Family::aggregate(Aggregation::Quantiles(QuantileParams::default()))`; read with `quantile(0.99)` |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
@@ -282,7 +283,15 @@ assert_eq!(labelled, [(f64::NEG_INFINITY, 1), (10.0, 2), (100.0, 1)]);
 # }
 ```
 
-These cells are never moved to blob files, whatever `blob_threshold` says.
+## Bloom filters and string elements
+`Bloom(BloomParams::new(bits, hashes)?)` answers "may this element be in the cell?" without storing the elements (D298):
+- **Writing:** `aggregate(i64)` and `aggregate_bytes(&[u8])` add an element.
+- **Reading:** `CellRef::bloom_contains(i64)` and `bloom_contains_bytes(&[u8])` never answer `false` for an element that was added. They answer `true` for one that wasn't at about `(1 − e^(−hashes·n/bits))^hashes` for `n` elements: for 10,000 elements, 2^18 bits (32 KiB once dense) and 7 hashes, about 1 in 26,000.
+- **Size:** a filter is stored sparse while few bits are set, and up to `bits / 8` bytes once dense.
+
+`aggregate_bytes` also feeds an HLL family. Hash a string key there with it, rather than converting it to an `i64` yourself. A bytes element and an `i64` hash apart, so `aggregate_bytes(&7i64.to_le_bytes())` and `aggregate(7)` are two elements.
+
+These cells are never moved to blob files, whatever `blob_threshold` says (until a later release lets large bloom filters move).
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

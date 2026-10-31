@@ -597,9 +597,9 @@ fn an_hll_family_takes_elements_and_well_formed_sketch_puts_only() {
     wb.put(r.t, r.h, b"r", b"q", None, ValueRef::I64(5))
         .unwrap();
     refused(wb);
+    // An f64 is no element (a bytes input is one, D298's aggregate_bytes).
     let mut wb = WriteBatch::new();
-    wb.merge(r.t, r.h, b"r", b"q", ValueRef::Bytes(b"x"))
-        .unwrap();
+    wb.merge(r.t, r.h, b"r", b"q", ValueRef::F64(1.0)).unwrap();
     refused(wb);
     let mut wb = WriteBatch::new();
     wb.put(r.t, r.h, b"r", b"q", None, ValueRef::Bytes(b"not a sketch"))

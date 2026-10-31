@@ -147,6 +147,47 @@ fn inputs_fold_into_the_same_state_through_flushes_checkpoints_and_compactions()
 }
 
 #[test]
+fn a_lone_f64_put_at_a_bucket_is_stored_as_its_state() {
+    // As `exact_aggregates.rs`'s test of the same name: an `f64` put alone in its commit, at
+    // an explicit timestamp, becomes its one-input state before the WAL, so a read, a flush
+    // and a reopen all see a state, never the raw `f64`.
+    let vfs = SimVfs::new(6);
+    let r = Rig::open(&vfs, 128);
+    for f in [r.h, r.q] {
+        r.commit(|wb| {
+            wb.put(r.t, f, b"b", b"q", Some(3_600), ValueRef::F64(2.5))
+                .unwrap();
+        })
+        .unwrap();
+    }
+    let (mut h, mut q) = (Vec::new(), Vec::new());
+    buckets::histogram_add(&mut h, &BOUNDS, 2.5).unwrap();
+    buckets::quantiles_add(&mut q, Q, 2.5).unwrap();
+    let at = |r: &Rig, f: FamilyId| {
+        let snap = r.db.snapshot().unwrap();
+        let c =
+            r.db.get(&snap, r.t, f, b"b", b"q")
+                .unwrap()
+                .expect("the bucket");
+        assert_eq!(c.timestamp(), 3_600);
+        match c.value() {
+            ValueRef::Bytes(b) => b.to_vec(),
+            v => panic!("not a state: {v:?}"),
+        }
+    };
+    assert_eq!((at(&r, r.h), at(&r, r.q)), (h.clone(), q.clone()));
+    r.db.flush().unwrap();
+    assert_eq!((at(&r, r.h), at(&r, r.q)), (h.clone(), q.clone()));
+    r.db.close().unwrap();
+    let r = Rig {
+        db: Engine::open(Path::new(DB), options(&vfs, 128)).unwrap(),
+        ..r
+    };
+    assert_eq!((at(&r, r.h), at(&r, r.q)), (h, q));
+    r.db.close().unwrap();
+}
+
+#[test]
 fn puts_take_an_f64_or_the_familys_own_state() {
     let vfs = SimVfs::new(2);
     let r = Rig::open(&vfs, 128);
