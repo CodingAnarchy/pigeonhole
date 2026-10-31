@@ -1,0 +1,2 @@
+### Fixed
+- **A cross-shard commit refused for memtable room no longer waits forever on a stopped clock** (#1205, D301). When a participant refused a cross-shard commit's share for arena room that nothing could free (the memtables pinned by snapshots), and the clock had stopped, the commit waited for a timeout that never came. It now fails with `Busy` at once, as a single-shard commit already did (#70). On a moving clock nothing changes: such a commit fails with `Busy` at the write-stall timeout. Stopped clocks come only from custom `Vfs` clocks (a test hook).
