@@ -159,6 +159,44 @@ fn values() {
     check("blob_pointer.bin", &ptr.encode());
 }
 
+/// Vector values of each element (D303), in a sibling of the frozen `values.bin`, and a
+/// vector family's `PutFamily`.
+#[test]
+fn vector_values_and_family() {
+    use pigeonhole_format::vector::{Element, Metric, Params, VectorRef};
+    let f32s: Vec<u8> = [1.5f32, -0.25, 3.0]
+        .iter()
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    let mut out = Vec::new();
+    for v in [
+        VectorRef::new(Element::F32, 3, &f32s).unwrap(),
+        VectorRef::new(Element::I8, 4, &[0x80, 0xff, 0x00, 0x7f]).unwrap(),
+        VectorRef::new(Element::Bit, 16, &[0b1010_0101, 0x01]).unwrap(),
+    ] {
+        let mut one = Vec::new();
+        encode_value(&mut one, ValueRef::Vector(v));
+        assert_eq!(decode_value(&one).unwrap(), ValueRef::Vector(v));
+        pigeonhole_format::varint::put_bytes(&mut out, &one);
+    }
+    check("values_vector.bin", &out);
+
+    let params = Params::new(Element::F32, 768, Metric::Cosine).unwrap();
+    let edit = Edit::PutFamily {
+        table: TableId(1),
+        family: FamilyId(4),
+        name: "embedding".into(),
+        options: FamilyOptions::default()
+            .kind(FamilyKind::Vector)
+            .kind_params(params.encode()),
+    };
+    let mut bytes = Vec::new();
+    edit.encode(&mut bytes);
+    check("edit_put_family_vector.bin", &bytes);
+    let (back, _) = Edit::decode(&bytes).unwrap();
+    assert_eq!(back, edit);
+}
+
 fn data_block() -> Vec<u8> {
     let mut b = BlockBuilder::data(2);
     for (i, k) in sample_keys().iter().enumerate() {

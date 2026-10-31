@@ -4878,6 +4878,7 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::Histogram => "histogram",
         FamilyKind::Quantiles => "quantiles",
         FamilyKind::Bloom => "bloom",
+        FamilyKind::Vector => "vector",
         FamilyKind::Standard => "standard",
     }
 }
@@ -5060,6 +5061,13 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
             kind_name(options.kind)
         ))
     })?;
+    // The format knows vector families (D303 PR 1); creating one waits for its write checks
+    // (#490 B PR 2).
+    if options.kind == FamilyKind::Vector {
+        return Err(Error::Unsupported(
+            "vector families are not writable yet (#490 B PR 2)",
+        ));
+    }
     // An HLL family's sketches, and an exact sum's or mean-variance state, are never
     // separated into blob files (D294, D298): a payload longer than the threshold is, so the
     // threshold must reach the largest one (3076, 274 or 821 bytes).

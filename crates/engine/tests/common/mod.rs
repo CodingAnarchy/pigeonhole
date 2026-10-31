@@ -1187,6 +1187,7 @@ pub fn value_bytes(v: ValueRef<'_>) -> Vec<u8> {
         ValueRef::Bytes(b) => b.to_vec(),
         ValueRef::I64(x) | ValueRef::Varint(x) => x.to_le_bytes().to_vec(),
         ValueRef::F64(x) => x.to_le_bytes().to_vec(),
+        ValueRef::Vector(v) => v.as_bytes().to_vec(),
         ValueRef::Blob(_) => panic!("blob pointer returned"),
     }
 }

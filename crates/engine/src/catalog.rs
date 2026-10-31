@@ -48,7 +48,7 @@ pub(crate) const BLOOM: &str = BloomUnion::NAME;
 /// a standard family, whose operator is its own choice.
 pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
     match kind {
-        FamilyKind::Standard => None,
+        FamilyKind::Standard | FamilyKind::Vector => None,
         FamilyKind::Counter => Some(I64_ADD),
         FamilyKind::Min => Some(I64_MIN),
         FamilyKind::Max => Some(I64_MAX),
@@ -114,6 +114,11 @@ pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
             pigeonhole_format::bloom::TAG_BITS,
             pigeonhole_format::bloom::TAG_HASHES,
         ],
+        FamilyKind::Vector => &[
+            pigeonhole_format::vector::TAG_ELEMENT,
+            pigeonhole_format::vector::TAG_DIM,
+            pigeonhole_format::vector::TAG_METRIC,
+        ],
     }
 }
 
@@ -134,6 +139,11 @@ pub(crate) fn builtin_operator(
         FamilyKind::Bloom => Some(Arc::new(BloomUnion::new(
             pigeonhole_format::bloom::BloomParams::parse(&options.kind_params).map_err(|e| e.0)?,
         ))),
+        // No operator, but its parameters are checked here all the same (D303).
+        FamilyKind::Vector => {
+            pigeonhole_format::vector::Params::parse(&options.kind_params).map_err(|e| e.0)?;
+            None
+        }
         kind => fixed_operator(kind),
     })
 }
@@ -141,7 +151,7 @@ pub(crate) fn builtin_operator(
 /// The operator of a kind without parameters.
 fn fixed_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
     match kind {
-        FamilyKind::Standard => None,
+        FamilyKind::Standard | FamilyKind::Vector => None,
         FamilyKind::Counter => Some(Arc::new(I64Add)),
         FamilyKind::Min => Some(Arc::new(I64Min)),
         FamilyKind::Max => Some(Arc::new(I64Max)),

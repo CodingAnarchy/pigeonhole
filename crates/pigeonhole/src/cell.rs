@@ -30,6 +30,9 @@ fn typed(data: &CellData) -> Value<'_> {
         ValueRef::I64(v) => Value::I64(v),
         ValueRef::F64(v) => Value::F64(v),
         ValueRef::Varint(v) => Value::Varint(v),
+        // Only in a vector family, which can't be created until #490 B PR 2 adds
+        // `Value::Vector`; never reached.
+        ValueRef::Vector(_) => Value::Bytes(payload(data)),
         // The engine resolves blob pointers on read; never reached.
         ValueRef::Blob(_) => Value::Bytes(&[]),
     }
