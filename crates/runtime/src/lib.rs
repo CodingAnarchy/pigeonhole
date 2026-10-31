@@ -871,10 +871,12 @@ pub struct Pinning {
 }
 
 /// Spawns a named thread that pins itself to CPU id `cpu` if given, reports whether it is
-/// pinned (a refused pin leaves it unpinned, never stops it), then runs `f`.
+/// pinned (a refused pin leaves it unpinned, never stops it), then runs `f`. A pinned thread
+/// names `io_workers` as its kernel I/O workers' CPUs (D305; empty leaves them).
 fn spawn_pinned<T: Send + 'static>(
     name: String,
     cpu: Option<usize>,
+    io_workers: Vec<usize>,
     f: impl FnOnce() -> T + Send + 'static,
 ) -> Result<(JoinHandle<T>, Receiver<bool>)> {
     let (ack_tx, ack_rx) = mpsc::channel();
@@ -882,6 +884,9 @@ fn spawn_pinned<T: Send + 'static>(
         .name(name)
         .spawn(move || {
             let pinned = cpu.is_some_and(|c| pigeonhole_io::sys::pin_current_thread_to(c).is_ok());
+            if pinned {
+                pigeonhole_io::sys::set_io_worker_cpus(io_workers);
+            }
             let _ = ack_tx.send(pinned);
             f()
         })
@@ -993,11 +998,15 @@ impl<H: ShardHandler> Runtime<H> {
             let (handle, ack) = spawn_pinned(
                 format!("pigeonhole-compaction-{j}"),
                 cpu(k + j),
+                Vec::new(),
                 move || pool::worker_main(driver, vfs),
             )?;
             rt.workers.push(handle);
             acks.push(ack);
         }
+        // The drivers' io_uring workers stay off the drivers' CPUs (D305): the opener's
+        // affinity set less the first `k` CPUs of the plan, which the drivers take.
+        let io_workers = plan.as_ref().map_or_else(Vec::new, |p| p.io_worker_cpus(k));
         let mut held: Vec<Vec<ShardCore<H>>> = (0..k).map(|_| Vec::new()).collect();
         for core in cores {
             held[drivers::Drivers::<H>::owner(core.id, k)].push(core);
@@ -1011,8 +1020,9 @@ impl<H: ShardHandler> Runtime<H> {
                 format!("pigeonhole-driver-{d}")
             };
             let shared = Arc::clone(&shared);
-            let (handle, ack) =
-                spawn_pinned(name, cpu(d), move || drivers::driver_main(shared, d, cores))?;
+            let (handle, ack) = spawn_pinned(name, cpu(d), io_workers.clone(), move || {
+                drivers::driver_main(shared, d, cores)
+            })?;
             rt.shards.push(handle);
             acks.push(ack);
         }

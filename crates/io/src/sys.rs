@@ -98,6 +98,8 @@ static CLAIMED: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new())
 #[derive(Debug)]
 pub struct PinPlan {
     cpus: Vec<usize>,
+    /// The affinity set it was planned from.
+    allowed: Vec<usize>,
 }
 
 impl PinPlan {
@@ -114,6 +116,18 @@ impl PinPlan {
     /// Whether the plan covers no thread.
     pub fn is_empty(&self) -> bool {
         self.cpus.is_empty()
+    }
+
+    /// The CPUs for the kernel's I/O workers of the plan's first `drivers` threads (D305):
+    /// the affinity set it was planned from, less those threads' own CPUs. Empty when
+    /// nothing is left.
+    pub fn io_worker_cpus(&self, drivers: usize) -> Vec<usize> {
+        let own = &self.cpus[..drivers.min(self.cpus.len())];
+        self.allowed
+            .iter()
+            .copied()
+            .filter(|c| !own.contains(c))
+            .collect()
     }
 }
 
@@ -154,7 +168,10 @@ fn plan_from(
     threads: usize,
 ) -> std::result::Result<PinPlan, Unpinned> {
     if threads == 0 {
-        return Ok(PinPlan { cpus: Vec::new() });
+        return Ok(PinPlan {
+            cpus: Vec::new(),
+            allowed: order.to_vec(),
+        });
     }
     if quota < order.len() {
         return Err(Unpinned::CpuQuota);
@@ -172,13 +189,38 @@ fn plan_from(
         return Err(Unpinned::TooFewCpus);
     }
     claimed.extend_from_slice(&cpus);
-    Ok(PinPlan { cpus })
+    Ok(PinPlan {
+        cpus,
+        allowed: order.to_vec(),
+    })
 }
 
 /// Pins the calling thread to CPU id `cpu` (from [`PinPlan::cpu`]). `Unsupported` on
 /// platforms without hard affinity.
 pub fn pin_current_thread_to(cpu: usize) -> Result<()> {
     crate::os::pin_current_thread_to(cpu)
+}
+
+thread_local! {
+    static IO_WORKER_CPUS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Names the CPUs (ids, as [`PinPlan::io_worker_cpus`] gives them) the kernel's I/O workers
+/// for the calling thread may run on (D305): a pinned shard driver keeps its io_uring
+/// workers, which would otherwise preempt it on its own CPU, off the drivers' CPUs. Applied,
+/// best effort, when the thread's io_uring ring is made ([`crate::Vfs::attach_thread`]); a
+/// ring made before keeps its workers where they are. Empty, the default, leaves them where
+/// the kernel puts them. No effect on other backends and platforms.
+pub fn set_io_worker_cpus(cpus: Vec<usize>) {
+    let _ = IO_WORKER_CPUS.try_with(|c| *c.borrow_mut() = cpus);
+}
+
+/// The calling thread's [`set_io_worker_cpus`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn io_worker_cpus() -> Vec<usize> {
+    IO_WORKER_CPUS
+        .try_with(|c| c.borrow().clone())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -210,5 +252,19 @@ mod tests {
         assert_eq!(plan_from(&order, 2, 3).unwrap_err(), Unpinned::TooFewCpus);
         assert_eq!(plan_from(&order, 1, 1).unwrap_err(), Unpinned::CpuQuota);
         assert!(plan_from(&order, 2, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn io_workers_go_to_the_affinity_set_less_the_drivers_cpus() {
+        let order = [9200, 9202, 9201, 9203];
+        let plan = plan_from(&order, 4, 3).unwrap();
+        // Two drivers and a compaction thread: the workers may use the compaction thread's
+        // CPU and the free one, not the drivers'.
+        assert_eq!(plan.io_worker_cpus(2), [9201, 9203]);
+        assert_eq!(plan.io_worker_cpus(0), order);
+        // Every CPU a driver's: nothing left.
+        let all = plan_from(&[9300, 9301], 2, 2).unwrap();
+        assert!(all.io_worker_cpus(2).is_empty());
+        assert!(all.io_worker_cpus(5).is_empty());
     }
 }

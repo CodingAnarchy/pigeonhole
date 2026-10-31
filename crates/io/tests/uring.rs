@@ -977,3 +977,84 @@ fn threads_waiting_on_each_others_rings_both_complete() {
     a.join().unwrap();
     c.join().unwrap();
 }
+
+/// The CPUs of a `Cpus_allowed_list` (`0-3,8,10-11`).
+fn cpu_list(list: &str) -> Vec<usize> {
+    let mut cpus = Vec::new();
+    for part in list.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => cpus.extend(a.parse::<usize>().unwrap()..=b.parse::<usize>().unwrap()),
+            None => cpus.push(part.parse().unwrap()),
+        }
+    }
+    cpus
+}
+
+/// This process's io-wq worker threads (`iou-wrk-*`) and their `Cpus_allowed_list`s.
+fn io_workers() -> Vec<(String, Vec<usize>)> {
+    let mut workers = Vec::new();
+    for task in std::fs::read_dir("/proc/self/task").unwrap() {
+        let dir = task.unwrap().path();
+        let comm = std::fs::read_to_string(dir.join("comm")).unwrap_or_default();
+        if !comm.starts_with("iou-wrk-") {
+            continue;
+        }
+        let Ok(status) = std::fs::read_to_string(dir.join("status")) else {
+            continue;
+        };
+        let list = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Cpus_allowed_list:"))
+            .expect("a CPU list");
+        workers.push((dir.display().to_string(), cpu_list(list)));
+    }
+    workers
+}
+
+/// D305: a pinned thread that names its I/O workers' CPUs before it attaches gets a ring
+/// whose io-wq workers may run on those CPUs only, not on its own. A sync always goes to an
+/// io-wq worker; the workers that appear across it are this thread's (one test at a time).
+/// They're named `iou-wrk-<tid>` with the tid of the kernel's root namespace, so they're
+/// found as new rather than by name.
+#[test]
+fn a_pinned_threads_io_workers_run_off_its_cpu() {
+    let _serial = serial();
+    let Ok(plan) = pigeonhole_io::sys::pin_plan(1) else {
+        eprintln!("skipped: this process cannot pin a thread");
+        return;
+    };
+    let own = plan.cpu(0).expect("one CPU planned");
+    let workers = plan.io_worker_cpus(1);
+    if workers.is_empty() {
+        eprintln!("skipped: a single CPU in the affinity set");
+        return;
+    }
+    let b = Backend::uring("uring-io-worker-cpus");
+    let f = b.create("f");
+    let (vfs, g, named) = (Arc::clone(&b.vfs), Arc::clone(&f), workers.clone());
+    let before: Vec<String> = io_workers().into_iter().map(|(t, _)| t).collect();
+    let new = within_10s(move || {
+        pigeonhole_io::sys::pin_current_thread_to(own).expect("pinned");
+        pigeonhole_io::sys::set_io_worker_cpus(named);
+        vfs.attach_thread();
+        assert!(own_io_waker().is_some(), "the kernel offers a thread ring");
+        g.submit_write(filled(4096, 9), 0).wait().unwrap();
+        g.submit_sync_data().wait().unwrap();
+        io_workers()
+            .into_iter()
+            .filter(|(t, _)| !before.contains(t))
+            .collect::<Vec<_>>()
+    });
+    drop(plan);
+    assert!(!new.is_empty(), "the sync ran on a new io-wq worker");
+    for (task, cpus) in new {
+        assert!(
+            !cpus.contains(&own),
+            "{task} may run on its thread's CPU {own}: {cpus:?}"
+        );
+        assert!(
+            cpus.iter().all(|c| workers.contains(c)),
+            "{task}: {cpus:?} not within {workers:?}"
+        );
+    }
+}

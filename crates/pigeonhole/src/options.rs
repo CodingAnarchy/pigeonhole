@@ -302,6 +302,9 @@ impl Options {
     ///   the OS refuses a pin. [`Pigeonhole::engine_metrics`](crate::Pigeonhole::engine_metrics)
     ///   reports how many threads are pinned (`threads_started`, `threads_pinned`) and why
     ///   not (`unpinned_reason`).
+    /// - **The kernel's I/O workers:** on Linux with io_uring, a pinned shard thread's
+    ///   io_uring workers run on the rest of the affinity set, off the shard threads' CPUs,
+    ///   so they don't preempt them (D305).
     /// - **Several databases in one process** share the set: each pins to CPUs the others
     ///   don't hold, and one that finds too few free runs unpinned.
     /// - **Several processes on one host** don't see each other's pins and would pin onto
