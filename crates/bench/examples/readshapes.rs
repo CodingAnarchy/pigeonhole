@@ -27,12 +27,18 @@
 //! - `scan-interleaved`: 200-row scans with qualifier prefix `a` of table `i` (built only for
 //!   this shape, so the others read the same store as before): every row has an `a` cell in
 //!   an SST and a newer `b` cell in the memtable, so the memtable's lazy filtered source
-//!   (D288) parks once per row, between two of the SST's admitted entries.
+//!   (D288) parks once per row, between two of the SST's admitted entries;
+//! - `wide-row-cells`, `wide-row-pages`: a walk of one 2,000-column row of table `w` (built
+//!   only for these shapes, flushed) with `RowRead::cells()` and with `pages(500)` (D297);
+//! - `multi-get-dense`, `multi-get-sparse`: a multi-get (`Table::keys`, D299) of 200 rows of
+//!   table `t`, contiguous or spread over the table, counted per row (the key set is built
+//!   outside the measured function).
 //!
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
 //! iteration is one `#[inline(never)]` function named `shape_*` that counts its work with a
 //! `Measured` guard (`support/measure.rs`), and on stderr the run prints `units N`: one per
-//! point get (hit or miss), one per row for `rows`, `short-scans` and `level-scans`, one per
+//! point get (hit or miss), one per row for `rows`, `short-scans`, `level-scans` and the
+//! multi-gets, one per
 //! returned cell
 //! otherwise. A full scan before the
 //! measured iterations warms the block cache, so every shape measures steady-state reads.
@@ -47,7 +53,7 @@ use measure::Measured;
 
 use std::ops::Bound;
 
-use pigeonhole::{Durability, Family, Options, Table};
+use pigeonhole::{Durability, Family, KeySet, Options, Table};
 
 const ROWS: u32 = 20_000;
 const CELLS: u32 = 8;
@@ -236,6 +242,53 @@ fn warm(t: &Table) {
     }
 }
 
+/// Columns of table `w`'s one row.
+const WIDE: u64 = 2_000;
+
+#[inline(never)]
+fn shape_wide_cells(w: &Table) -> usize {
+    let _measured = Measured::start();
+    let mut cells = w.row(b"w:hub").family("f").cells().unwrap();
+    let mut n = 0;
+    while let Some(e) = cells.next().unwrap() {
+        std::hint::black_box(&e);
+        n += 1;
+    }
+    n
+}
+
+#[inline(never)]
+fn shape_wide_pages(w: &Table) -> usize {
+    let _measured = Measured::start();
+    let mut pages = w.row(b"w:hub").family("f").pages(500).unwrap();
+    let mut n = 0;
+    while let Some(page) = pages.next().unwrap() {
+        n += std::hint::black_box(page.iter().count());
+    }
+    n
+}
+
+#[inline(never)]
+fn shape_multi_get(t: &Table, keys: &KeySet) -> usize {
+    let _measured = Measured::start();
+    let mut rows = t.keys(keys).family("f").read().unwrap();
+    let mut n = 0;
+    while let Some((_, row)) = rows.next().unwrap() {
+        n += usize::from(std::hint::black_box(row.iter().count() == 8));
+    }
+    n
+}
+
+/// 200 keys of table `t` for a multi-get shape: contiguous from a random row, or spread.
+fn multi_get_keys(rng: &mut Rng, dense: bool) -> KeySet {
+    if dense {
+        let from = rng.below(ROWS - 200);
+        KeySet::from_unsorted((from..from + 200).map(row_key))
+    } else {
+        KeySet::from_unsorted((0..200).map(|_| row_key(rng.below(ROWS))))
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let shape = args.next().expect("SHAPE");
@@ -329,6 +382,25 @@ fn main() {
         drop(it);
         i
     });
+    // Table `w`, only for its shapes: one row of `WIDE` columns, flushed.
+    let w = shape.starts_with("wide-row").then(|| {
+        let w = db
+            .table("w")
+            .unwrap()
+            .family("f", Family::default().bloom_bits(10))
+            .create_if_missing()
+            .unwrap();
+        let mut m = w.mutate(b"w:hub");
+        for q in 0..WIDE {
+            m = m.put("f", &q.to_be_bytes(), b"");
+        }
+        m.commit().unwrap();
+        db.flush().unwrap();
+        let mut cells = w.row(b"w:hub").family("f").cells().unwrap();
+        while cells.next().unwrap().is_some() {}
+        drop(cells);
+        w
+    });
     warm(&t);
     let mut it = l.scan_prefix(b"").family("f").iter().unwrap();
     while let Some(r) = it.next_ref().unwrap() {
@@ -365,6 +437,12 @@ fn main() {
                 "scan-interleaved" => {
                     shape_scan_interleaved(i.as_ref().expect("built above"), &mut rng)
                 }
+                "wide-row-cells" => shape_wide_cells(w.as_ref().expect("built above")),
+                "wide-row-pages" => shape_wide_pages(w.as_ref().expect("built above")),
+                "multi-get-dense" | "multi-get-sparse" => {
+                    let keys = multi_get_keys(&mut rng, shape == "multi-get-dense");
+                    shape_multi_get(&t, &keys)
+                }
                 other => panic!("unknown shape {other}"),
             };
         }
@@ -375,6 +453,7 @@ fn main() {
     drop(t);
     drop(l);
     drop(i);
+    drop(w);
     db.close().unwrap();
     driver.join();
     std::fs::remove_dir_all(&dir).ok();

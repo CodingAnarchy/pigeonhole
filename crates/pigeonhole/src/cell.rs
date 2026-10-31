@@ -514,6 +514,49 @@ impl RowBuf {
         self.cells.len()
     }
 
+    /// Whether cells `i` and `j` are versions of one column (family and qualifier).
+    pub(crate) fn same_column(&self, i: usize, j: usize) -> bool {
+        let (a, b) = (&self.cells[i], &self.cells[j]);
+        a.family == b.family
+            && self.qualifiers[a.qualifier.clone()] == self.qualifiers[b.qualifier.clone()]
+    }
+
+    /// Moves the cells from `from` on (versions of one column) out to `out`, with their family
+    /// (as an index into `info`), and the column's qualifier to `qualifier`; the row keeps the
+    /// cells before `from`.
+    pub(crate) fn split_off_column(
+        &mut self,
+        from: usize,
+        out: &mut Vec<(usize, CellData)>,
+        qualifier: &mut Vec<u8>,
+    ) {
+        let range = self.cells[from].qualifier.clone();
+        qualifier.clear();
+        qualifier.extend_from_slice(&self.qualifiers[range.clone()]);
+        out.extend(self.cells.drain(from..).map(|c| (c.family, c.cell.data)));
+        self.qualifiers.truncate(range.start);
+    }
+
+    /// Appends the versions of one column taken out by [`RowBuf::split_off_column`].
+    pub(crate) fn push_column(&mut self, cells: &mut Vec<(usize, CellData)>, qualifier: &[u8]) {
+        let start = self.qualifiers.len();
+        self.qualifiers.extend_from_slice(qualifier);
+        let range = start..self.qualifiers.len();
+        self.cells
+            .extend(cells.drain(..).map(|(family, data)| RowCell {
+                family,
+                qualifier: range.clone(),
+                cell: Cell { data },
+            }));
+    }
+
+    /// The last cell's family and qualifier.
+    pub(crate) fn last_column(&self) -> Option<(FamilyId, &[u8])> {
+        let c = self.cells.last()?;
+        let family = self.info.as_ref()?.families.get(c.family)?.id;
+        Some((family, &self.qualifiers[c.qualifier.clone()]))
+    }
+
     /// Appends a cell whose qualifier is `qualifier` within `qualifiers`.
     pub(crate) fn push(&mut self, family: FamilyId, qualifier: Range<usize>, data: CellData) {
         let family = self.family_index(family);
