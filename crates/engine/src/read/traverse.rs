@@ -394,7 +394,10 @@ pub(crate) fn traverse(
 }
 
 /// Cells an async traversal reads in one poll before it yields (D304 rev 1, A2): no poll
-/// runs long, whatever a hub's degree.
+/// runs long, whatever a hub's degree. It counts the cells that reach the visitor: edges
+/// the read drops on its way (a value filter's misses, deleted or expired versions) and the
+/// keys `poll_next_key` passes over for having no edge are not counted, so a hub whose edges
+/// are mostly dropped can read more than 4,096 entries in one poll (#1237).
 pub const TRAVERSE_POLL_CELLS: u32 = 4_096;
 
 /// An async traversal ([`Engine::traverse_async`](crate::Engine::traverse_async), D304 PR
@@ -518,6 +521,8 @@ impl PendingTraversal {
             Arc::clone(&self.frontier),
             Arc::clone(&self.shared),
         )?;
+        // Every hop runs on the polling task.
+        self.out.stats.threads = 1;
         self.hop = Some(HopRead {
             cursor,
             visitor: EdgeVisitor {

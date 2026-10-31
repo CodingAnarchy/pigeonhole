@@ -2510,12 +2510,14 @@ impl Run {
                 }
                 // A two-hop traversal (D304) from the same keys, with limits taken from the
                 // model's seqno (not the RNG; 0 is no limit): the hops as a BFS over the
-                // model's rows gives them. It reads the graph family, whose qualifiers name
-                // rows, where the target has one (#1232); elsewhere it reads the get's family,
-                // whose qualifiers never name rows, so it checks hop 1. Through the async
+                // model's rows gives them. Where the target has a graph family it reads that
+                // (whose qualifiers name rows, #1232) on even seqnos; otherwise the get's
+                // family, whose qualifiers never name rows, so it checks hop 1. Through the async
                 // front door (`run_async`, D304 PR 2) with `async_front`.
                 let (m, n) = ((ms % 4) as u32, (ms / 4) % 4);
-                let tf = if has_graph_family() {
+                // Every other seqno it reads the get's family instead, so counter, TTL and
+                // versioned families keep their traversal coverage.
+                let tf = if has_graph_family() && ms % 2 == 0 {
                     GRAPH_FAMILY
                 } else {
                     family.as_str()

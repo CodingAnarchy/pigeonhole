@@ -3533,7 +3533,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Fan-out:** `parallel(n)` over the frontier's tablets, past 1,000 keys per thread.
 - **PR 2: `run_async`** (`Engine::traverse_async`, `PendingTraversal`). Each hop is read on the polling task through one multi-get cursor over the frontier (`KeyCursor::poll_next_key`: cache-only positioning, the next keys' blocks fetched ahead), with the same `EdgeVisitor` and `DedupeLimit` run inline on its borrowed cells.
   - **One group, no fan-out.** D296's determinism makes the hops and parents equal to `run`'s.
-  - **Budget:** a poll yields (`wake_by_ref`, then `Pending`) after 4,096 cells, so an uncapped hub never holds the executor for long.
+  - **Budget:** a poll yields (`wake_by_ref`, then `Pending`) after 4,096 cells, so an uncapped hub never holds the executor for long. It counts the cells that reach the visitor. Edges the read drops on its way (a value filter's misses, deleted or expired versions) and keys with no kept edge aren't counted yet (#1237).
   - **State:** the hop's reducer, the visitor's row and count, the cursor and the visited set all survive each `Pending`. Dropping the future releases the cursor's pins and the snapshot.
   - **Synchronous reads:** a key's cells past the first are read synchronously where a block misses, counted in `async_sync_reads`.
 
@@ -3545,6 +3545,6 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **The pigeonhole model:** a two-hop traversal from each multi-get's keys against a BFS over the model's rows, under faults and concurrent changes.
   - The workload's qualifiers (`q…`) never name rows (`row…`), so in PR 1 it checked hop 1's limits, dedupe and ranking.
   - **#1232 (with PR 2):** the default pigeonhole model has a graph family, `adj`, whose qualifiers the workload draws from the row-key space (`Workload::qualifier_in`). Other families draw as before, so targets without `adj` replay unchanged.
-    - The traversal check reads `adj`, through `run_async` on the async front door.
+    - The traversal check reads `adj` on even model seqnos and the get's family on odd ones, so counter, TTL and versioned families keep their coverage. On the async front door it goes through `run_async`.
     - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
 

@@ -874,8 +874,8 @@ impl<'t> Traverse<'t> {
 
     /// [`Traverse::run`] as a future that never blocks on the device: each hop's keys are
     /// positioned from the block cache, with the blocks they and the next keys need fetched
-    /// asynchronously, and a poll yields after 4,096 edges, so a hub never holds the
-    /// executor's thread for long (cap hubs with [`per_node_limit`](Traverse::per_node_limit)
+    /// asynchronously, and a poll yields after 4,096 edges read, so a hub never holds the
+    /// executor's thread for long (edges the selection drops on the way are not counted) (cap hubs with [`per_node_limit`](Traverse::per_node_limit)
     /// all the same: edges past a key's first block are read synchronously where the cache
     /// misses). Hops run on the polling task, never fanned out; the result equals `run`'s.
     ///
