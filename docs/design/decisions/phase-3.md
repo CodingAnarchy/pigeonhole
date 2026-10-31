@@ -3499,7 +3499,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Decided (owner, #1212):**
 1. **1024 chunks per arena** (`arena_len / 1024`, at most 256 KiB): 64 KiB at the default 64 MiB budget, 256 KiB before. `max_slots` stays 64 per shard: 16 chunks per slot, 4 for the slot's own memtables (as before) and 12 of headroom for snapshot-pinned generations. When the slots placed at open need more, chunks shrink to `arena_len / (16 × slots)`, never below 1 KiB.
 2. **The flush cost on shards with many idle slots is accepted.** Idle slots keep their empty memtables without arena pressure, and `publish_memtables` rebuilds every slot: `alloc_budget`'s 256-slot flush row goes from 323 to 1,091 allocations (budget raised to 1,150, with a note). #1228 makes the publish incremental.
-3. **A 16 KiB minimum chunk size** to limit tail waste. **Open:** below 16 MiB arenas a floor leaves fewer than 1024 chunks, and at the harness's 2 MiB a 16 KiB floor leaves 128 chunks, fewer than the 256 that stalled. `snapshot_room`, `counters` and `scalar_counters` all fail with it. The owner's call on how the floor applies is pending (perf2's inbox note), so #1219 ships without the floor until then.
+3. **No minimum chunk size** beyond the existing 1 KiB clamp (owner, #1212; a 16 KiB floor was proposed and withdrawn). A floor only changes arenas under 16 MiB, where it would leave fewer than 1024 chunks: at the harness's 2 MiB, a 16 KiB floor left 128, fewer than the 256 that stalled, and `snapshot_room`, `counters` and `scalar_counters` all failed with it. Tail waste per chunk (up to about 6.5% for 4 KiB values at the default budget) is accepted.
 
 **Measured:**
 - **Callgrind:** all 30 shapes within ±0.2%.
