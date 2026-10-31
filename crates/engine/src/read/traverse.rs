@@ -22,7 +22,7 @@ use pigeonhole_format::{FamilyId, TableId, Timestamp};
 
 use super::keys::{KeyCursor, KeySet};
 use super::reduce::{CellKey, CellRef, CellVisitor, ReadInput, ReduceSpec, Reducer, Visit};
-use super::{ReadSpec, reduce::reduce_into};
+use super::{ReadSpec, ValuePredicate, reduce::reduce_into};
 use crate::snapshot::Snapshot;
 use crate::{Error, Result};
 
@@ -394,10 +394,12 @@ pub(crate) fn traverse(
 }
 
 /// Cells an async traversal reads in one poll before it yields (D304 rev 1, A2): no poll
-/// runs long, whatever a hub's degree. It counts the cells that reach the visitor: edges
-/// the read drops on its way (a value filter's misses, deleted or expired versions) and the
-/// keys `poll_next_key` passes over for having no edge are not counted, so a hub whose edges
-/// are mostly dropped can read more than 4,096 entries in one poll (#1237).
+/// runs long, whatever a hub's degree. It counts every edge the read returns, the value
+/// predicate's misses included (#1237), and the multi-get cursor yields after
+/// [`POLL_ABSENT_KEYS`](crate::POLL_ABSENT_KEYS) keys without a row. Versions the read
+/// resolves away (deleted, expired, outside the time range) are still stepped over inside
+/// one cell's read, uncounted: a hub of mostly deleted edges (until compaction drops them)
+/// can read more in one poll.
 pub const TRAVERSE_POLL_CELLS: u32 = 4_096;
 
 /// An async traversal ([`Engine::traverse_async`](crate::Engine::traverse_async), D304 PR
@@ -407,7 +409,9 @@ pub const TRAVERSE_POLL_CELLS: u32 = 4_096;
 /// reducer run on its borrowed cells. It never fans out, and D296's determinism makes its
 /// result the sync one. A key's cells past the first are read synchronously where a block
 /// misses (counted in `async_sync_reads`), and a poll yields after
-/// [`TRAVERSE_POLL_CELLS`] cells. Its state (the hop's reducer, the visitor's row and count,
+/// [`TRAVERSE_POLL_CELLS`] cells, the value predicate's misses included (it is applied here,
+/// not in the read), or after [`POLL_ABSENT_KEYS`](crate::POLL_ABSENT_KEYS) keys without a
+/// row. Its state (the hop's reducer, the visitor's row and count,
 /// the cursor) survives each `Pending`; dropping it releases the cursor's pins and the
 /// snapshot.
 #[must_use = "a future does nothing unless polled"]
@@ -424,6 +428,10 @@ pub struct PendingTraversal {
     hops_done: u32,
     out: Traversal,
     hop: Option<HopRead>,
+    /// The edges' value predicate, applied to each cell before the visitor rather than in
+    /// the read, so the edges it drops count toward a poll's budget (#1237), with the SSTs to
+    /// read a separated value from.
+    filter: Option<(ValuePredicate, Arc<crate::snapshot::SstSet>)>,
     /// The checks failed, or the result was handed out.
     failed: Option<Error>,
     done: bool,
@@ -468,10 +476,16 @@ impl PendingTraversal {
         now: Timestamp,
         shared: Arc<crate::shard::Shared>,
     ) -> Self {
-        let (families, read, failed) = match checked(&snapshot, table, &spec) {
+        let (families, mut read, failed) = match checked(&snapshot, table, &spec) {
             Ok((f, r)) => (f, r, None),
             Err(e) => (Vec::new(), ReadSpec::default(), Some(e)),
         };
+        // With one version per column, the read's predicate tests the version the visitor
+        // sees (D22), so testing it here keeps the result.
+        let filter = read
+            .value
+            .take()
+            .map(|p| (p, Arc::clone(&snapshot.view.ssts)));
         let visited = Arc::new(seeds.iter().map(<[u8]>::to_vec).collect());
         Self {
             snapshot,
@@ -486,6 +500,7 @@ impl PendingTraversal {
             frontier: seeds,
             out: Traversal::default(),
             hop: None,
+            filter,
             failed,
             done: false,
         }
@@ -604,7 +619,9 @@ impl PendingTraversal {
                     } = hop;
                     let row = frontier.get(i);
                     let before = budget;
-                    let ended = cursor.counted(|c| read_key(c, row, visitor, reducer, &mut budget));
+                    let filter = self.filter.as_ref();
+                    let ended =
+                        cursor.counted(|c| read_key(c, row, visitor, reducer, filter, &mut budget));
                     self.out.stats.edges += u64::from(before - budget);
                     match ended {
                         Ok(KeyEnd::Done) => {
@@ -638,12 +655,14 @@ impl PendingTraversal {
     }
 }
 
-/// Runs the visitor and reducer over the current key's cells, within `budget` cells.
+/// Runs the visitor and reducer over the current key's cells, within `budget` cells: those
+/// `filter` drops count too, and never reach the visitor (nor its per-node count).
 fn read_key(
     c: &mut KeyCursor,
     row: &[u8],
     visitor: &mut EdgeVisitor,
     reducer: &mut DedupeLimit,
+    filter: Option<&(ValuePredicate, Arc<crate::snapshot::SstSet>)>,
     budget: &mut u32,
 ) -> Result<KeyEnd> {
     loop {
@@ -654,6 +673,15 @@ fn read_key(
             return Ok(KeyEnd::Done);
         };
         *budget -= 1;
+        if let Some((p, ssts)) = filter {
+            let kept = match pigeonhole_compaction::blob_pointer(cell.stored) {
+                Some(ptr) => p.matches(&ssts.read_pointer(&ptr)?),
+                None => p.matches(cell.stored),
+            };
+            if !kept {
+                continue;
+            }
+        }
         let cref = CellRef {
             row,
             family_rank: 0,
