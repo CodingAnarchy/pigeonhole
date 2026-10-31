@@ -453,7 +453,14 @@ where
     ctx.snapshot.check_process()?;
     let mut lanes = Vec::new();
     let opened = open_lanes(ctx, g, &mut lanes);
-    let read = opened.and_then(|()| visit_lanes(ctx, g, &mut lanes, visitor, reducer, stats));
+    // Each lane's family position in the read's family order, once per group (perf287's
+    // nit on #1209: not a search per cell).
+    let ranks: Vec<u32> = lanes
+        .iter()
+        .map(|l| rank_of(ctx.families, l.family))
+        .collect();
+    let read =
+        opened.and_then(|()| visit_lanes(ctx, g, &mut lanes, &ranks, visitor, reducer, stats));
     for lane in lanes {
         if !lane.grew {
             give_back(lane.resolver);
@@ -467,6 +474,7 @@ fn visit_lanes<V, R>(
     ctx: &Ctx<'_>,
     g: &Group<'_>,
     lanes: &mut [Lane],
+    ranks: &[u32],
     visitor: &mut V,
     reducer: &mut R,
     stats: &mut ReduceStats,
@@ -516,7 +524,7 @@ where
         }
         let row_len = row_esc.len() + TERMINATOR.len();
         let mut next_row = false;
-        'lanes: for lane in lanes.iter_mut() {
+        'lanes: for (lane, &family_rank) in lanes.iter_mut().zip(ranks) {
             while in_row(lane, &row_esc) {
                 let col = lane.col();
                 let end = col.len().saturating_sub(2).max(row_len);
@@ -526,7 +534,7 @@ where
                 let visit = visitor.visit(&row, lane.family, &qualifier, lane.ts, lane.value());
                 let cell = CellRef {
                     row: &row,
-                    family_rank: rank_of(ctx.families, lane.family),
+                    family_rank,
                     family: lane.family,
                     qualifier: &qualifier,
                     ts: lane.ts,

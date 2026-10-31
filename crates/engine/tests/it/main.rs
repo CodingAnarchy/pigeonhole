@@ -58,6 +58,7 @@ mod held_header_visibility;
 mod huge_value;
 mod idle_counts;
 mod inflight_window;
+mod knn;
 mod large_values;
 mod milestone_b;
 mod network_fs;
