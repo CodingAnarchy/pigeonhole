@@ -3491,3 +3491,20 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - `tablets`' `a_retry_waiting_for_room_fails_busy_on_a_frozen_clock_once_room_cannot_free` replaces `a_retry_waiting_for_room_ends_closed_at_close`, which recorded the old wait until the close.
 - `RetryWait::woken_by`'s unit test covers `RoomGone`.
 - Seed 183 of `counters` passes.
+
+<a id="d302"></a>
+## D302 — Arenas are cut into 1024 chunks, 16 per slot, so snapshots held across flushes leave room for writes (owner decision, 2026-10-31; engine; #1212, #1219; amends D136 and D189)
+**Why.** A held in-process snapshot pins the memtables of its generation, and a memtable holds at least one arena chunk however little it holds. So snapshots held across flushes pin `snapshots × slots` chunks. With 256 chunks per arena, 8 held snapshots on a 32-slot shard took the whole arena: the `counters` harness stalled (seed 130), and so would an application holding 8 snapshots on a 32-slot shard at the default budget. The analysis is on #1212.
+
+**Decided (owner, #1212):**
+1. **1024 chunks per arena** (`arena_len / 1024`, at most 256 KiB): 64 KiB at the default 64 MiB budget, 256 KiB before. `max_slots` stays 64 per shard: 16 chunks per slot, 4 for the slot's own memtables (as before) and 12 of headroom for snapshot-pinned generations. When the slots placed at open need more, chunks shrink to `arena_len / (16 × slots)`, never below 1 KiB.
+2. **The flush cost on shards with many idle slots is accepted.** Idle slots keep their empty memtables without arena pressure, and `publish_memtables` rebuilds every slot: `alloc_budget`'s 256-slot flush row goes from 323 to 1,091 allocations (budget raised to 1,150, with a note). #1228 makes the publish incremental.
+3. **A 16 KiB minimum chunk size** to limit tail waste. **Open:** below 16 MiB arenas a floor leaves fewer than 1024 chunks, and at the harness's 2 MiB a 16 KiB floor leaves 128 chunks, fewer than the 256 that stalled. `snapshot_room`, `counters` and `scalar_counters` all fail with it. The owner's call on how the floor applies is pending (perf2's inbox note), so #1219 ships without the floor until then.
+
+**Measured:**
+- **Callgrind:** all 30 shapes within ±0.2%.
+- **Box A/B** (AX102, default budget, medians of 3 interleaved runs): throughput within ±1.5% on group-commit, ycsb-a, ycsb-c, counters, time-series-ttl and sparse-wide, and p99 level. The raw data is in `.coord/out-1212-20261031`.
+
+**Checks.**
+- `it/snapshot_room.rs`: 8 snapshots held across 8 flushes on a 64-slot shard, then 4 more rounds of writes to every slot. It fails on the old geometry at round 2 with the write-stall timeout.
+- Tests that hard-coded the old geometry keep their intent: `milestone_b` (no freeze), `api` (a batch larger than the whole arena), `read_only_fallback` (nothing flushed before the crash), and `pigeonhole`'s `processes` (a reader process's held snapshot gets room for its 3,510 rows).

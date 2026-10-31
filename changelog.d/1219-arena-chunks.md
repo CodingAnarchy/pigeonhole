@@ -1,0 +1,2 @@
+### Fixed
+- Snapshots held across flushes no longer stall writes (D302, #1212). Each held snapshot pins one memtable generation, at least one arena chunk per `(tablet, family)` slot. With 256 chunks per arena, 8 snapshots held on a shard of 32 slots took the whole arena, and commits failed `Busy` until one was dropped. Arenas are now cut into 1024 chunks (64 KiB at the default budget, down from 256 KiB). A shard still serves 64 slots, now with 16 chunks each, so placement and slot limits don't change.

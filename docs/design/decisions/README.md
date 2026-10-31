@@ -151,7 +151,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D133](phase-1.md#d133) — the default-timestamp floor of a moved tablet · tablets, #97
 - [D134](phase-1.md#d134) — what the balancer does, and its options · tablets, #97; stability work in #103 · **amended by D144, D146, D214, D217, D224**
 - [D135](phase-1.md#d135) — a split's children and the view buffer (D28) · tablets, #97
-- [D136](phase-1.md#d136) — arena room for many tablet slots · tablets, #97; refinement in #104 · **amended by D189**
+- [D136](phase-1.md#d136) — arena room for many tablet slots · tablets, #97; refinement in #104 · **amended by D189, D302**
 - [D137](phase-1.md#d137) — What does `Engine::compact` guarantee while tablets split, merge and move · engine
 - [D138](phase-1.md#d138) — What do `flush` and `compact` do when the arena has no chunk for the fresh memtables they need · engine, #116 · amends D124
 - [D139](phase-1.md#d139) — Where do tablets go at open, now that owners are not persisted (D130) · engine
@@ -204,7 +204,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D186](phase-2.md#d186) — Counter families: stored kind, 0.1.0 semantics, seqno-scoped deletes, compaction never changes reads · pigeonhole, engine, compaction, format, sim, #274, #289 · refines D179 · owner: #284 no purge, #295 combine same-mutation increments · **refined by D187** · **refined by D287** · **refined by D291**
 - [D187](phase-2.md#d187) — Counter-family deletes purge at the bottom level by seqno · compaction, engine, #290, #298 · refines D70, D186
 - [D188](phase-2.md#d188) — Values above the inline limit are separated into blob files at commit time · engine, runtime, #230, #301 · amends D16
-- [D189](phase-2.md#d189) — Arenas are sized for their slots with tablet changes off too · engine, #283, #307 · amends D136
+- [D189](phase-2.md#d189) — Arenas are sized for their slots with tablet changes off too · engine, #283, #307 · amends D136 · **amended by D302**
 - [D190](phase-2.md#d190) — `shrink` clears a region when a large extent has no hole below it · pager, engine, #314, #319 · amends D160
 - [D191](phase-2.md#d191) — Flush-time version GC, and a guarded purge of versions beyond `max_versions` · engine, compaction, sim, #287, #315 · refines D70, D74 · **refined by D192**
 - [D192](phase-2.md#d192) — A bottommost compaction's purge runs under the D191 guard, with a fallback after repeated voids · engine, #316, #328 · refines D70, D191
@@ -316,6 +316,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D299](phase-3.md#d299) — Frontier multi-get: `Table::keys(&KeySet)` reads many rows in key order under one snapshot, each tablet's sources set up once and moved forward from key to key (row filters prune per key); `KeyCursor` lends borrowed cells to `KeyRows` and D296's `Keys` input · perf287, #489, ICR 0097
 - [D300](phase-3.md#d300) — A group's hold (`pending[shard] = min(watermark, first)`) is stored under the allocator's lock before the `NEXT_SEQNO` mirror passes it, replacing FORMAT §11.3's step-1 bound read from the mirror, which could land below a visible seqno and move snapshots back (#1208) · coordinator decision, shm, engine · amends D271's reservation protocol
 - [D301](phase-3.md#d301) — A shard that refused PREPAREs for room and whose room wait reaches #70's frozen-and-idle condition tells their coordinators `RoomGone`, and the retries fail `Busy` instead of waiting for a timeout a frozen clock never reaches (#1205, seed 183); moving clocks unchanged · coordinator decision, engine · amends D245
+- [D302](phase-3.md#d302) — Arenas are cut into 1024 chunks (64 KiB at the default budget), 16 per slot, so snapshots held across flushes leave room for writes; `max_slots` stays 64; the many-idle-slot flush cost is accepted (#1228); the 16 KiB chunk floor is pending · engine, #1212, #1219 · owner decision · amends D136, D189
 
 ## Open questions
 _None._
