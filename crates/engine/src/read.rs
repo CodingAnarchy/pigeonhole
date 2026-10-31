@@ -24,6 +24,7 @@ use crate::source::{ColumnKey, Pinned, Resolver, Source, row_prefix};
 use crate::{Error, Result};
 
 pub(crate) mod keys;
+pub(crate) mod knn;
 pub(crate) mod reduce;
 
 /// How a [`CellData`] keeps its value alive.
