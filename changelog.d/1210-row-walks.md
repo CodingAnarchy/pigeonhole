@@ -1,0 +1,2 @@
+### Added
+- Wide rows can be read cell by cell or in pages without materialising them (D297): `RowRead::cells()` lends one cell at a time, `RowRead::pages(n)` lends pages of whole columns from one reused buffer, `RowRead::resume_after(&RowPosition)` continues an earlier walk (with `RowPosition::to_bytes`/`from_bytes` for a stable token), and `Scan::cells()` walks a scan cell by cell. A graph hub of millions of edges no longer needs its whole row in memory.

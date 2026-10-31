@@ -43,6 +43,7 @@ mod maintenance;
 mod manifest;
 mod nonblocking;
 mod options;
+mod position;
 mod purge_guard;
 mod read;
 mod row_cache;
@@ -70,6 +71,7 @@ pub use error::{Error, Result};
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::EngineOptions;
+pub use position::ColumnPosition;
 pub use read::keys::{KeyCursor, KeySet};
 pub use read::reduce::{
     CellKey, CellRef, CellVisitor, Dedupe, Limit, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec,

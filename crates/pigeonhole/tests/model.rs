@@ -758,6 +758,70 @@ fn multi_get_rows(
     Ok(out)
 }
 
+/// How [`walk_row`] reads a row (D297).
+#[derive(Debug, Clone, Copy)]
+enum WalkMode {
+    /// `RowRead::cells`.
+    Cells,
+    /// `RowRead::pages(n)`, one walk.
+    Pages(usize),
+    /// `RowRead::pages(n)`, one page per call, each resumed after the last page's position.
+    Resumed(usize),
+}
+
+/// Every version of `row`'s cells, as a walk reads them.
+fn walk_row(
+    t: &pigeonhole::Table,
+    row: &[u8],
+    snap: Option<&pigeonhole::Snapshot>,
+    mode: WalkMode,
+) -> pigeonhole::Result<Vec<ModelCell>> {
+    let read = |position: Option<&pigeonhole::RowPosition>| {
+        let mut r = t.row(row).versions(0);
+        if let Some(s) = snap {
+            r = r.snapshot(s);
+        }
+        if let Some(p) = position {
+            r = r.resume_after(p);
+        }
+        r
+    };
+    let cell = |family: &str, qualifier: &[u8], c: &pigeonhole::CellRef<'_>| ModelCell {
+        family: family.to_owned(),
+        qualifier: qualifier.to_vec(),
+        ts: c.timestamp(),
+        value: c.value().to_vec(),
+    };
+    let mut out = Vec::new();
+    match mode {
+        WalkMode::Cells => {
+            let mut cells = read(None).cells()?;
+            while let Some(e) = cells.next()? {
+                out.push(cell(e.family, e.qualifier, &e.cell));
+            }
+        }
+        WalkMode::Pages(n) => {
+            let mut pages = read(None).pages(n)?;
+            while let Some(page) = pages.next()? {
+                out.extend(page.iter().map(|e| cell(e.family, e.qualifier, &e.cell)));
+            }
+        }
+        WalkMode::Resumed(n) => {
+            let mut position = None;
+            loop {
+                let mut pages = read(position.as_ref()).pages(n)?;
+                let Some(page) = pages.next()? else { break };
+                out.extend(page.iter().map(|e| cell(e.family, e.qualifier, &e.cell)));
+                position = pages.position();
+                // The token's byte form round-trips.
+                let bytes = position.as_ref().expect("a page was read").to_bytes();
+                position = Some(pigeonhole::RowPosition::from_bytes(&bytes)?);
+            }
+        }
+    }
+    Ok(out)
+}
+
 fn owned_cells(row: &pigeonhole::Row) -> Vec<ModelCell> {
     (0..row.len())
         .map(|i| {
@@ -2226,6 +2290,38 @@ impl Run {
                             "row read {} (model seqno {ms}): store {g:?} vs model {w:?}",
                             text(&row)
                         ));
+                    }
+                }
+                // The same all-versions read walked cell by cell, in pages, and (under a
+                // snapshot) as a chain of pages resumed by position (D297). The page size
+                // comes from the row and seqno, not the RNG, so a seed's operations are
+                // unchanged.
+                let n = 1 + (row.len() + ms as usize) % 5;
+                let modes: &[WalkMode] = if snap.is_some() {
+                    &[WalkMode::Cells, WalkMode::Pages(n), WalkMode::Resumed(n)]
+                } else {
+                    &[WalkMode::Cells, WalkMode::Pages(n)]
+                };
+                for &mode in modes {
+                    let walked = walk_row(t, &row, snap.as_ref().map(|(s, _)| s), mode);
+                    let want = self.model.try_read_row(TABLES[ti], &row, &[], 0, ms, now);
+                    match (walked, want) {
+                        (Ok(g), Ok(w)) if g == w => {}
+                        (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
+                            if e.code() == ErrorCode::MergeFailed => {}
+                        (Err(e), _) if self.armed && self.fired() => {
+                            return self.recover_fired(&e);
+                        }
+                        (Err(e), _) if self.failed_over() => {
+                            return self.recover_in_place(&format!("read: {e}"), None);
+                        }
+                        (Err(e), _) if self.injected(&e) => {}
+                        (g, w) => {
+                            return Err(format!(
+                                "row walk {mode:?} {} (model seqno {ms}): store {g:?} vs model {w:?}",
+                                text(&row)
+                            ));
+                        }
                     }
                 }
                 // A multi-get (D299) of this row and the rows read last in the same table,
