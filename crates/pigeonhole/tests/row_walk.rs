@@ -375,3 +375,87 @@ fn scan_cells_return_what_the_scan_returns() {
     assert!(!got.is_empty());
     db.close().expect("close");
 }
+
+/// cli692's B1 on #1210: a position in a family the read does not select is refused, not
+/// placed by family id (the walk's order is the selection's, here b before a).
+#[test]
+fn a_position_in_a_family_the_read_does_not_select_is_refused() {
+    let (_dir, db, t) = open(&["a", "b", "c"]);
+    fill(&t, b"r");
+    let at = {
+        let mut pages = t.row(b"r").family("c").pages(1).expect("pages");
+        pages.next().expect("next");
+        pages.position().expect("position")
+    };
+    let err = t
+        .row(b"r")
+        .families(["b", "a"])
+        .resume_after(&at)
+        .pages(3)
+        .expect_err("a family the read does not select");
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    db.close().expect("close");
+}
+
+/// The column limit counts columns per family over one walk, across pages, and afresh in a
+/// resumed call.
+#[test]
+fn column_limit_is_per_family_per_call() {
+    let (_dir, db, t) = open(&["a", "b", "c"]);
+    fill(&t, b"r");
+    let columns = |pages: &[Cells]| {
+        let mut cols: Vec<(String, Vec<u8>)> = pages
+            .concat()
+            .into_iter()
+            .map(|(f, q, _, _)| (f, q))
+            .collect();
+        cols.dedup();
+        cols
+    };
+    let mut got = Vec::new();
+    let mut pages = t
+        .row(b"r")
+        .families(["a", "b"])
+        .column_limit(2)
+        .pages(1)
+        .expect("pages");
+    while let Some(p) = pages.next().expect("next") {
+        got.push(
+            p.iter()
+                .map(|e| {
+                    (
+                        e.family.to_owned(),
+                        e.qualifier.to_vec(),
+                        e.cell.timestamp(),
+                        e.cell.value().to_vec(),
+                    )
+                })
+                .collect::<Cells>(),
+        );
+    }
+    let want: Vec<(String, Vec<u8>)> = [("a", 0u8), ("a", 1), ("b", 0), ("b", 1)]
+        .map(|(f, q)| (f.to_owned(), vec![q]))
+        .to_vec();
+    assert_eq!(
+        columns(&got),
+        want,
+        "two columns per family over the whole walk"
+    );
+    // Resumed after a/0 in a new call: the limit counts afresh, so a's next two columns.
+    let at = {
+        let mut pages = t.row(b"r").family("a").pages(1).expect("pages");
+        pages.next().expect("next");
+        pages.position().expect("position")
+    };
+    let rest = t
+        .row(b"r")
+        .family("a")
+        .column_limit(2)
+        .resume_after(&at)
+        .read()
+        .expect("read")
+        .expect("row");
+    let q: Vec<Vec<u8>> = rest.iter().map(|e| e.qualifier.to_vec()).collect();
+    assert_eq!(q, [vec![1u8], vec![2u8]]);
+    db.close().expect("close");
+}

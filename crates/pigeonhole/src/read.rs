@@ -349,8 +349,8 @@ impl<'t> RowRead<'t> {
     /// at ([`RowPages::position`], [`RowCells::position`]; D297): the families the selection
     /// names before the position's family are skipped, the position's family starts after
     /// its column (all its versions), and later families start at the selection's own
-    /// qualifier bound. A position whose family the selection does not name resumes at the
-    /// first named family with a higher id.
+    /// qualifier bound. A position whose family the read does not select (one dropped
+    /// since, or not named) fails the read with `InvalidArgument`.
     ///
     /// A chain of calls is one consistent read of the row only under one
     /// [`snapshot`](RowRead::snapshot); without one, each call reads as of its own start,
@@ -726,10 +726,15 @@ fn row_walk(
             cursors.push(scan(vec![at.family()], past)?);
             i + 1
         }
-        None => order
-            .iter()
-            .position(|&f| f > at.family())
-            .unwrap_or(order.len()),
+        // The walk's order is the selection's (or the table's), not the ids': a position
+        // in a family this read does not select has no place in it (cli692's B1 on #1210).
+        None => {
+            return Err(crate::Error::from(
+                pigeonhole_engine::Error::InvalidArgument(
+                    "the row position's family is not one this read selects".to_owned(),
+                ),
+            ));
+        }
     };
     if rest < order.len() {
         cursors.push(scan(order[rest..].to_vec(), sel.spec.qualifiers.clone())?);
@@ -1095,14 +1100,16 @@ fn push_cell(buf: &mut RowBuf, family: FamilyId, qualifier: &[u8], data: CellDat
 impl<'t> RowRead<'t> {
     /// The row's cells, one at a time ([`RowCells`], D297): for a row too wide to read
     /// whole. It reads like a scan of one row (the row cache is not consulted), with this
-    /// read's selection, versions and column limit.
+    /// read's selection, versions and column limit. The column limit counts columns per
+    /// family, per call: a walk resumed in a later call counts afresh.
     pub fn cells(self) -> Result<RowCells<'t>> {
         let walk = CellWalk::new(self.core, &self.row, self.sel, self.resume.as_ref())?;
         Ok(RowCells { walk })
     }
 
     /// The row's cells in pages of at most `n` cells, each ending at a column boundary
-    /// ([`RowPages`], D297). `n` of 0 is taken as 1.
+    /// ([`RowPages`], D297). `n` of 0 is taken as 1. The column limit counts columns per
+    /// family over the whole walk (not per page), and afresh in each resumed call.
     pub fn pages(self, n: usize) -> Result<RowPages<'t>> {
         let walk = CellWalk::new(self.core, &self.row, self.sel, self.resume.as_ref())?;
         let buf = RowBuf::new(Arc::clone(&walk.info), 0);

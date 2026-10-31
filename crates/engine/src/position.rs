@@ -1,6 +1,7 @@
 //! A position within a row: the column (family and qualifier) a walk last handed out, so a
 //! later read resumes after it (D297, ICR 0095). D296's reads may start at one too.
 
+use pigeonhole_format::key::MAX_KEY_PART;
 use pigeonhole_format::varint;
 
 use crate::{Error, FamilyId, Result, TableId};
@@ -68,7 +69,7 @@ impl ColumnPosition {
     }
 
     /// Decodes [`ColumnPosition::to_bytes`]'s form. An unknown version, a truncated or
-    /// overlong input is `InvalidArgument`.
+    /// overlong input, or a qualifier over the 64 KiB key-part limit is `InvalidArgument`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let bad = |why: &str| Error::InvalidArgument(format!("column position: {why}"));
         let (&version, rest) = bytes.split_first().ok_or_else(|| bad("empty"))?;
@@ -81,6 +82,9 @@ impl ColumnPosition {
         let table = u32::from_le_bytes(rest[..4].try_into().expect("4 bytes"));
         let family = u32::from_le_bytes(rest[4..8].try_into().expect("4 bytes"));
         let (qualifier, used) = varint::get_bytes(&rest[8..]).map_err(|_| bad("truncated"))?;
+        if qualifier.len() > MAX_KEY_PART {
+            return Err(bad("qualifier longer than 64 KiB"));
+        }
         if 8 + used != rest.len() {
             return Err(bad("trailing bytes"));
         }
@@ -109,6 +113,11 @@ mod tests {
             &[&good[..], &[0u8][..]].concat()[..],
             &[&[9u8][..], &good[1..]].concat()[..],
             &good[..5],
+            &{
+                let mut long = vec![1u8, 1, 0, 0, 0, 2, 0, 0, 0];
+                varint::put_bytes(&mut long, &vec![0u8; MAX_KEY_PART + 1]);
+                long
+            }[..],
         ] {
             assert!(ColumnPosition::from_bytes(bad).is_err(), "{bad:?}");
         }
