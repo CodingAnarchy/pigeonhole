@@ -300,8 +300,8 @@ fn filtered_knn_ranks_only_the_selected_cells() {
 /// out over three tablets (asserted). Ties, frequent with `i8`, go by row.
 #[test]
 fn typed_knn_ranks_as_the_familys_distance_at_any_fan_out() {
-    use pigeonhole_engine::{KeySet, KnnQuery};
-    use pigeonhole_format::vector::{Element, Params, Query, VectorRef};
+    use pigeonhole_engine::KeySet;
+    use pigeonhole_format::vector::{Element, Params, Query, QueryBuf, VectorRef};
     let vfs = SimVfs::new(4913);
     let opts = || common::options(Arc::clone(&vfs), 4, BUDGET);
     let db = Engine::open(Path::new(DB), opts()).unwrap();
@@ -384,8 +384,8 @@ fn typed_knn_ranks_as_the_familys_distance_at_any_fan_out() {
     for (name, _, p) in &families {
         let f = t.family(name).unwrap().id;
         let (query, q) = match p.element {
-            Element::F32 => (KnnQuery::F32(Arc::clone(&qf)), Query::F32(&qf)),
-            _ => (KnnQuery::I8(Arc::clone(&qi)), Query::I8(&qi)),
+            Element::F32 => (QueryBuf::F32(Arc::clone(&qf)), Query::F32(&qf)),
+            _ => (QueryBuf::I8(Arc::clone(&qi)), Query::I8(&qi)),
         };
         // Brute force over a scan, ranked by (distance, row).
         let mut spec = ScanSpec::new(Bound::Unbounded, Bound::Unbounded);
@@ -434,8 +434,10 @@ fn typed_knn_ranks_as_the_familys_distance_at_any_fan_out() {
                                 t.id,
                                 &rspec,
                                 || {
-                                    KnnVisitor::typed(*p, query.clone(), Arc::clone(&skips))
-                                        .unwrap()
+                                    KnnVisitor::typed(
+                                        p.prepare(query.clone()).unwrap(),
+                                        Arc::clone(&skips),
+                                    )
                                 },
                                 || TopK::new(25),
                             )

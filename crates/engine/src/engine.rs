@@ -5027,7 +5027,8 @@ fn stored_i64(v: &[u8]) -> i64 {
 /// A put into a vector family, or of a vector (D303): a vector of the family's element type
 /// and dimension, with components the format allows (finite, at most 2^56, a nonzero norm
 /// under cosine), only ever into a vector family. That keeps tag 0x04 inside vector
-/// families, whose creation set `incompat` bit 0. The public API refuses the same when a write is built; this is the engine's gate.
+/// families, whose creation set `incompat` bit 0. The public API refuses the same when a
+/// write is built; this is the engine's gate.
 fn check_vector_put(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> Result<()> {
     use pigeonhole_format::vector::Params;
     let refuse = |why: String| {

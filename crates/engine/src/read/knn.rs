@@ -3,7 +3,7 @@
 //! kernels, and a [`super::reduce::TopK`] of [`Score`]s keeps the k nearest.
 //!
 //! A typed visitor ([`KnnVisitor::typed`]) reads a vector family's values (D303, tag `0x04`)
-//! and scores them with [`Params::distance`], the same function `VectorSpec::distance_*`
+//! and scores them with `Params::distance`, the same function `VectorSpec::distance_*`
 //! uses, so a ranking and a client's own scoring agree exactly. The engine-level fallback
 //! ([`KnnVisitor::new`]) reads `Bytes` values of little-endian `f32`s (D296 §2.4; never part
 //! of the public API). A cell whose value doesn't fit is skipped and counted, as is one whose
@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use pigeonhole_format::distance::{cosine_from, dot_norm_f32_le, l2_f32_le, norm2_f32};
 use pigeonhole_format::value::{ValueRef, decode_value};
-use pigeonhole_format::vector::{Params, Query};
+use pigeonhole_format::vector::Prepared;
 use pigeonhole_format::{FamilyId, Timestamp};
 
 use super::reduce::{CellVisitor, Visit};
@@ -89,28 +89,6 @@ pub struct KnnVisitor {
     nan: u64,
 }
 
-/// A typed query, in the vector family's element type.
-#[derive(Debug, Clone)]
-#[non_exhaustive]
-pub enum KnnQuery {
-    /// `f32` components.
-    F32(Arc<[f32]>),
-    /// `i8` components.
-    I8(Arc<[i8]>),
-    /// Packed bits.
-    Bits(Arc<[u8]>),
-}
-
-impl KnnQuery {
-    fn as_query(&self) -> Query<'_> {
-        match self {
-            KnnQuery::F32(q) => Query::F32(q),
-            KnnQuery::I8(q) => Query::I8(q),
-            KnnQuery::Bits(q) => Query::Bits(q),
-        }
-    }
-}
-
 /// What a visitor scores against.
 #[derive(Debug)]
 enum Target {
@@ -120,8 +98,8 @@ enum Target {
         q_norm2: f32,
         metric: Metric,
     },
-    /// A vector family's values (D303).
-    Typed { params: Params, query: KnnQuery },
+    /// A vector family's values (D303), against a query checked and prepared once.
+    Typed(Prepared),
 }
 
 impl KnnVisitor {
@@ -140,13 +118,11 @@ impl KnnVisitor {
         )
     }
 
-    /// A visitor for a vector family of `params` (D303): `query` must fit them (its element
-    /// type and dimension, finite, and not all zeros under cosine), else `InvalidArgument`.
-    pub fn typed(params: Params, query: KnnQuery, skips: Arc<KnnSkips>) -> crate::Result<Self> {
-        params
-            .check(query.as_query())
-            .map_err(|e| crate::Error::InvalidArgument(format!("the query: {e}")))?;
-        Ok(Self::with(Target::Typed { params, query }, skips))
+    /// A visitor for a vector family, scoring with a query prepared for it once
+    /// ([`Params::prepare`](pigeonhole_format::vector::Params::prepare): checked, its norm
+    /// computed), shared by every group's visitor.
+    pub fn typed(query: Prepared, skips: Arc<KnnSkips>) -> Self {
+        Self::with(Target::Typed(query), skips)
     }
 
     fn with(query: Target, skips: Arc<KnnSkips>) -> Self {
@@ -182,13 +158,11 @@ impl KnnVisitor {
                     }
                 }))
             }
-            Target::Typed { params, query } => {
+            Target::Typed(query) => {
                 let Ok(ValueRef::Vector(v)) = decode_value(value) else {
                     return None;
                 };
-                params
-                    .accepts(&v)
-                    .then(|| params.distance(query.as_query(), &v))
+                query.params().accepts(&v).then(|| query.distance(&v))
             }
         }
     }

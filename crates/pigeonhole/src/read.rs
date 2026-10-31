@@ -3,11 +3,11 @@ use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
 use pigeonhole_engine::{
-    CellData, ColumnPosition, FamilyId, KeyCursor, KeySet, KnnQuery, KnnSkips, KnnVisitor,
-    QualifierFilter, ReadInput, ReadSpec, ReduceSpec, ScanCursor, ScanSpec, TableInfo, TopK,
-    ValuePredicate,
+    CellData, ColumnPosition, FamilyId, KeyCursor, KeySet, KnnSkips, KnnVisitor, QualifierFilter,
+    ReadInput, ReadSpec, ReduceSpec, ScanCursor, ScanSpec, TableInfo, TopK, ValuePredicate,
 };
 
+use pigeonhole_format::vector::QueryBuf;
 use smallvec::SmallVec;
 
 use crate::cell::RowBuf;
@@ -545,21 +545,21 @@ impl<'t> KeysRead<'t> {
     /// then qualifier. The read's selection applies (qualifiers, time range, value filter),
     /// with the newest version of each cell.
     pub fn nearest_f32(self, query: &[f32], k: usize) -> Nearest<'t> {
-        self.nearest(KnnQuery::F32(query.into()), k)
+        self.nearest(QueryBuf::F32(query.into()), k)
     }
 
     /// [`nearest_f32`](Self::nearest_f32) for an `i8` vector family.
     pub fn nearest_i8(self, query: &[i8], k: usize) -> Nearest<'t> {
-        self.nearest(KnnQuery::I8(query.into()), k)
+        self.nearest(QueryBuf::I8(query.into()), k)
     }
 
     /// [`nearest_f32`](Self::nearest_f32) for a bit vector family (`query` packed eight bits
     /// to a byte, least significant first).
     pub fn nearest_bits(self, query: &[u8], k: usize) -> Nearest<'t> {
-        self.nearest(KnnQuery::Bits(query.into()), k)
+        self.nearest(QueryBuf::Bits(query.into()), k)
     }
 
-    fn nearest(self, query: KnnQuery, k: usize) -> Nearest<'t> {
+    fn nearest(self, query: QueryBuf, k: usize) -> Nearest<'t> {
         Nearest {
             core: Cow::Borrowed(self.core),
             input: NearestInput::Keys(Arc::new(self.keys)),
@@ -1635,21 +1635,21 @@ impl<'t> Scan<'t> {
     /// then qualifier. The read's selection applies (qualifiers, time range, value filter),
     /// with the newest version of each cell.
     pub fn nearest_f32(self, query: &[f32], k: usize) -> Nearest<'t> {
-        self.nearest(KnnQuery::F32(query.into()), k)
+        self.nearest(QueryBuf::F32(query.into()), k)
     }
 
     /// [`nearest_f32`](Self::nearest_f32) for an `i8` vector family.
     pub fn nearest_i8(self, query: &[i8], k: usize) -> Nearest<'t> {
-        self.nearest(KnnQuery::I8(query.into()), k)
+        self.nearest(QueryBuf::I8(query.into()), k)
     }
 
     /// [`nearest_f32`](Self::nearest_f32) for a bit vector family (`query` packed eight bits
     /// to a byte, least significant first).
     pub fn nearest_bits(self, query: &[u8], k: usize) -> Nearest<'t> {
-        self.nearest(KnnQuery::Bits(query.into()), k)
+        self.nearest(QueryBuf::Bits(query.into()), k)
     }
 
-    fn nearest(self, query: KnnQuery, k: usize) -> Nearest<'t> {
+    fn nearest(self, query: QueryBuf, k: usize) -> Nearest<'t> {
         Nearest {
             core: self.core,
             input: NearestInput::Range(self.start, self.end),
@@ -2139,7 +2139,7 @@ pub struct Nearest<'t> {
     core: Cow<'t, Arc<TableCore>>,
     input: NearestInput,
     sel: Selection,
-    query: KnnQuery,
+    query: QueryBuf,
     k: usize,
     parallelism: usize,
 }
@@ -2183,13 +2183,10 @@ impl Nearest<'_> {
             .flatten()
             .ok_or_else(|| invalid(format!("family {name:?} is not a vector family")))?;
         let skips = Arc::new(KnnSkips::default());
-        // Checks the query once; each group's visitor is then built the same way.
-        KnnVisitor::typed(params, self.query.clone(), Arc::clone(&skips)).map_err(|e| {
-            invalid(format!(
-                "family {name:?}: {}",
-                crate::Error::from(e).message()
-            ))
-        })?;
+        // Checked and prepared once (the query's norm too); every group's visitor shares it.
+        let prepared = params
+            .prepare(self.query.clone())
+            .map_err(|e| invalid(format!("family {name:?}: the query: {e}")))?;
         if self.k == 0 {
             return Ok(Vec::new());
         }
@@ -2208,16 +2205,13 @@ impl Nearest<'_> {
             // A key set's floor counts keys; an IVF query reads a few wide rows (#490 D).
             spec.parallel_floor = 0;
         }
-        let (query, k) = (self.query.clone(), self.k);
+        let k = self.k;
         let reduced = core.with(|e| {
             e.reduce(
                 &snapshot,
                 core.info.id,
                 &spec,
-                || {
-                    KnnVisitor::typed(params, query.clone(), Arc::clone(&skips))
-                        .expect("checked above")
-                },
+                || KnnVisitor::typed(prepared.clone(), Arc::clone(&skips)),
                 || TopK::new(k),
             )
         })?;

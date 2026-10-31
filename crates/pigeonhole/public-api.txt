@@ -811,6 +811,14 @@ pub pigeonhole::TraverseStats::cut_by_max_nodes: bool
 pub pigeonhole::TraverseStats::edges: u64
 pub pigeonhole::TraverseStats::hops_cut: u32
 pub pigeonhole::TraverseStats::rows: u64
+pub struct pigeonhole::Vector
+impl pigeonhole::Vector
+pub fn pigeonhole::Vector::as_ref(&self) -> pigeonhole::VectorRef<'_>
+pub fn pigeonhole::Vector::dim(&self) -> u32
+pub fn pigeonhole::Vector::element(&self) -> pigeonhole::Element
+pub fn pigeonhole::Vector::from_bits(u32, &[u8]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::Vector::from_f32(&[f32]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::Vector::from_i8(&[i8]) -> pigeonhole::Result<Self>
 pub struct pigeonhole::VectorRef<'a>
 impl<'a> pigeonhole::VectorRef<'a>
 pub fn pigeonhole::VectorRef<'a>::as_bytes(&self) -> &'a [u8]

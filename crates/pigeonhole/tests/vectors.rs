@@ -8,7 +8,7 @@
 
 use pigeonhole::{
     Element, ErrorCode, Family, KeySet, Metric, Neighbour, Options, Pigeonhole, Table, Value,
-    VectorSpec,
+    Vector, VectorSpec,
 };
 
 fn open() -> (pigeonhole::doc_support::TempDir, Pigeonhole, Table) {
@@ -400,6 +400,51 @@ fn nearest_refuses_what_doesnt_fit() {
         t.scan_prefix(b"").nearest_f32(&[1.0; 8], 3).run(),
     ] {
         assert_eq!(code(r), ErrorCode::InvalidArgument);
+    }
+    db.close().expect("close");
+}
+
+/// An owned `Vector` (#490 D: centroids and means aren't cells) scores as a stored vector
+/// does, and widening an `i8` vector to `f32` against an `f32` spec is exact.
+#[test]
+fn owned_vectors_score_as_stored_ones() {
+    let (_dir, db, t) = open();
+    t.mutate(b"r")
+        .put_vector_f32("f", b"", &f32s(3))
+        .put_vector_i8("q", b"", &[4, -2, 0, 1])
+        .commit()
+        .expect("put");
+    let fs = t.family_info("f").and_then(|f| f.vector).expect("spec");
+    let stored = t.get(b"r", "f", b"").expect("get").expect("written");
+    let owned = Vector::from_f32(&f32s(3)).expect("vector");
+    assert_eq!((owned.element(), owned.dim()), (Element::F32, 8));
+    let q = [0.5f32, -1.0, 2.0, 0.25, 3.0, -2.5, 1.5, 0.75];
+    assert_eq!(
+        fs.distance_f32(&q, owned.as_ref()).unwrap().to_bits(),
+        fs.distance_f32(&q, stored.as_vector().unwrap())
+            .unwrap()
+            .to_bits(),
+    );
+    assert_eq!(owned.as_ref(), stored.as_vector().unwrap());
+    // An i8 vector widened, against an f32 centroid of an f32 L2 spec.
+    let centroid = Vector::from_f32(&[1.0, 1.0, 1.0, 1.0]).expect("vector");
+    let spec = VectorSpec::new(4, Element::F32, Metric::L2).unwrap();
+    let i8v = t.get(b"r", "q", b"").expect("get").expect("written");
+    let widened = i8v.as_vector().unwrap().to_f32_vec().unwrap();
+    assert_eq!(
+        spec.distance_f32(&widened, centroid.as_ref()).unwrap(),
+        9.0 + 9.0 + 1.0
+    );
+    let bits = Vector::from_bits(16, &[0xff, 0x00]).expect("bits");
+    assert_eq!(bits.dim(), 16);
+    for bad in [
+        Vector::from_f32(&[]),
+        Vector::from_f32(&[0.0; 4097]),
+        Vector::from_i8(&[]),
+        Vector::from_bits(12, &[0, 0]),
+        Vector::from_bits(16, &[0]),
+    ] {
+        assert_eq!(bad.expect_err("refused").code(), ErrorCode::InvalidArgument);
     }
     db.close().expect("close");
 }
