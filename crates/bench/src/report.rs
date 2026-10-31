@@ -441,6 +441,12 @@ pub struct RunDetail {
     /// controller); `None` for stores without one and in results written before it.
     #[serde(default)]
     pub drivers: Option<usize>,
+    /// The CPUs the client threads ran on, when the runner placed them
+    /// ([`crate::Runner::client_cpus`]): the Pigeonhole runner keeps them off the shard
+    /// threads' pinned CPUs (#1206, ICR 0101). `None` where the OS placed them, and in
+    /// results written before it.
+    #[serde(default)]
+    pub client_cpus: Option<Vec<usize>>,
     /// Background work riding on the measured phase (D247: snapshot and durable-snapshot
     /// readers, a durable backup and a compaction), for runs that asked for it
     /// (`--riders`, Pigeonhole); `None` elsewhere.
@@ -1264,6 +1270,7 @@ impl Suite {
         let mut s = String::new();
         self.environment_md(&mut s);
         self.results_md(&mut s);
+        self.placement_md(&mut s);
         self.reads_md(&mut s);
         self.op_types_md(&mut s);
         self.rounds_md(&mut s);
@@ -1313,6 +1320,23 @@ impl Suite {
                 us(r.p99_ns),
                 us(r.p999_ns)
             );
+        }
+    }
+
+    /// Where the client threads ran, for the results whose runner placed them.
+    fn placement_md(&self, s: &mut String) {
+        for r in &self.results {
+            if let Some(cpus) = &r.detail.client_cpus {
+                let _ = writeln!(
+                    s,
+                    "\n**Client placement** ({}, {}): {} client threads on CPUs {}, off the \
+                     store's pinned shard CPUs.",
+                    r.workload,
+                    r.store,
+                    r.threads,
+                    cpu_ranges(cpus)
+                );
+            }
         }
     }
 
@@ -1964,6 +1988,28 @@ fn background_differs(a: u64, b: u64) -> bool {
     (lo == 0 && hi > 0) || hi > 2 * lo
 }
 
+/// CPU ids as ranges: `[0, 1, 2, 5]` is `0-2,5`.
+fn cpu_ranges(cpus: &[usize]) -> String {
+    let mut sorted = cpus.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < sorted.len() {
+        let mut j = i;
+        while j + 1 < sorted.len() && sorted[j + 1] == sorted[j] + 1 {
+            j += 1;
+        }
+        out.push(if i == j {
+            sorted[i].to_string()
+        } else {
+            format!("{}-{}", sorted[i], sorted[j])
+        });
+        i = j + 1;
+    }
+    out.join(",")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2193,6 +2239,25 @@ mod tests {
         assert!(md.contains("efficiency 0.90"));
         assert!(md.contains("pass"));
         assert!(Suite::from_json("{}").is_err());
+    }
+
+    #[test]
+    fn placed_clients_are_reported_with_their_cpus() {
+        // #1206: the runner keeps its clients off the pinned shard CPUs, and says so.
+        let mut placed = rec("sparse-wide", 9e4, 10_000, 28_000);
+        placed.threads = 16;
+        placed.detail.client_cpus = Some(vec![17, 16, 18, 19, 31, 20]);
+        let a = suite(vec![placed, rec("ycsb-a", 1.5e6, 1500, 25_000)]);
+        assert_eq!(Suite::from_json(&a.to_json()).unwrap(), a);
+        let md = a.to_markdown();
+        assert!(md.contains(
+            "**Client placement** (sparse-wide, pigeonhole): 16 client threads on CPUs 16-20,31, \
+             off the store's pinned shard CPUs."
+        ));
+        assert_eq!(md.matches("Client placement").count(), 1, "{md}");
+        // Results written before the field read as unplaced.
+        assert_eq!(cpu_ranges(&[]), "");
+        assert_eq!(cpu_ranges(&[3]), "3");
     }
 
     #[test]

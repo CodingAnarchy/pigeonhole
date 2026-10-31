@@ -181,9 +181,39 @@ pub fn pin_current_thread_to(cpu: usize) -> Result<()> {
     crate::os::pin_current_thread_to(cpu)
 }
 
+/// The CPU ids in the calling thread's affinity set, ascending, or `None` where the
+/// platform has no hard thread affinity (macOS).
+pub fn affinity_cpus() -> Option<Vec<usize>> {
+    let mut cpus = crate::os::pin_order()?;
+    cpus.sort_unstable();
+    Some(cpus)
+}
+
+/// Restricts the calling thread to CPU ids `cpus` (for example [`affinity_cpus`] less
+/// `Pigeonhole::pinned_shard_cpus`, ICR 0101). `Unsupported` on platforms without hard
+/// affinity; an error for an empty set or an id the OS refuses.
+pub fn set_current_thread_cpus(cpus: &[usize]) -> Result<()> {
+    crate::os::set_current_thread_cpus(cpus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Unpinned, plan_from};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_thread_restricted_to_a_cpu_set_reads_it_back() {
+        let allowed = super::affinity_cpus().expect("Linux has hard affinity");
+        let want = vec![allowed[allowed.len() - 1]];
+        let got = std::thread::spawn(move || {
+            super::set_current_thread_cpus(&want).expect("a CPU of the set");
+            (super::affinity_cpus().unwrap(), want)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(got.0, got.1);
+        assert!(super::set_current_thread_cpus(&[]).is_err());
+    }
 
     #[test]
     fn plans_take_distinct_free_cpus_and_release_them() {

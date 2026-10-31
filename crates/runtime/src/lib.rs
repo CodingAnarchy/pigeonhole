@@ -905,6 +905,8 @@ pub struct Runtime<H: ShardHandler> {
     /// The CPUs this runtime's threads hold, released once they are joined (D235).
     plan: Option<pigeonhole_io::sys::PinPlan>,
     pinning: Pinning,
+    /// The CPUs the driver threads pinned themselves to, in driver order (ICR 0101).
+    driver_cpus: Vec<usize>,
 }
 
 impl<H: ShardHandler> fmt::Debug for Runtime<H> {
@@ -982,6 +984,7 @@ impl<H: ShardHandler> Runtime<H> {
             pool,
             workers: Vec::new(),
             plan: None,
+            driver_cpus: Vec::new(),
             pinning: Pinning {
                 threads,
                 unpinned,
@@ -1017,8 +1020,18 @@ impl<H: ShardHandler> Runtime<H> {
             acks.push(ack);
         }
         let planned = plan.as_ref().map_or(0, pigeonhole_io::sys::PinPlan::len);
-        // A thread that died before reporting surfaces its panic at shutdown.
-        let pinned = acks.into_iter().filter(|a| a.recv() == Ok(true)).count();
+        // A thread that died before reporting surfaces its panic at shutdown. The compaction
+        // threads' acks come first, then the drivers' in driver order.
+        let first_driver = acks.len() - k;
+        let mut pinned = 0;
+        for (i, ack) in acks.into_iter().enumerate() {
+            if ack.recv() == Ok(true) {
+                pinned += 1;
+                if let Some(c) = i.checked_sub(first_driver).and_then(cpu) {
+                    rt.driver_cpus.push(c);
+                }
+            }
+        }
         rt.pinning.pinned = pinned;
         rt.pinning.failed = planned.saturating_sub(pinned);
         rt.plan = plan;
@@ -1116,6 +1129,13 @@ impl<H: ShardHandler> Runtime<H> {
     /// CPU of their own, and why none did when pinning was asked for and refused.
     pub fn pinning(&self) -> Pinning {
         self.pinning
+    }
+
+    /// The CPUs the shard driver threads are pinned to, one per pinned driver, in driver
+    /// order (D235, ICR 0101). Empty when none is pinned: `pin_threads` off, a platform or
+    /// CPU set where pinning is unsafe, or every pin refused.
+    pub fn pinned_driver_cpus(&self) -> &[usize] {
+        &self.driver_cpus
     }
 
     /// The driver threads the shards run on now (D289): the controller's choice with

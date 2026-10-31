@@ -1127,6 +1127,20 @@ impl Runner for PigeonholeRunner {
         }))
     }
 
+    fn client_cpus(&self) -> Option<Vec<usize>> {
+        // The owner's call on #1206: the clients stay off the shard threads' pinned CPUs,
+        // as the guide advises applications (ICR 0101).
+        let shards = self.open.as_ref()?.target.db.pinned_shard_cpus();
+        if shards.is_empty() {
+            return None;
+        }
+        let rest: Vec<usize> = pigeonhole_io::sys::affinity_cpus()?
+            .into_iter()
+            .filter(|c| !shards.contains(c))
+            .collect();
+        (!rest.is_empty()).then_some(rest)
+    }
+
     fn describe(&self) -> String {
         use std::fmt::Write as _;
         let s = &self.settings;

@@ -1140,6 +1140,31 @@ impl Pigeonhole {
         crate::RowCacheStats::from_engine(&self.engine())
     }
 
+    /// The CPUs the engine pinned its shard threads to (D235, ICR 0101): one per pinned
+    /// shard thread, in thread order. Keep the application's busy threads off them, for
+    /// example by setting their affinity to the process's CPUs less these: a thread the OS
+    /// places on a shard's CPU preempts the shard and delays the commits it serves (#1206).
+    /// Empty when no shard thread is pinned: [`Options::pin_threads`](crate::Options::pin_threads)
+    /// off, application-owned mode, a platform without hard thread affinity (macOS), a CPU
+    /// quota or too few free CPUs, or every pin refused.
+    ///
+    /// ```
+    /// use pigeonhole::{Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// // Each one is a pinned shard thread's own CPU; none on macOS.
+    /// let shard_cpus = db.pinned_shard_cpus();
+    /// assert!(shard_cpus.len() as u64 <= db.engine_metrics().threads_pinned);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn pinned_shard_cpus(&self) -> Vec<usize> {
+        self.engine().pinned_shard_cpus()
+    }
+
     /// The writer's counters since this instance opened: commits and their latency,
     /// flushes, compactions, write stalls, the block cache, file growth, the shard threads,
     /// reader slots, transactions, and cross-shard commits' rounds and fast failures
