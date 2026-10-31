@@ -668,7 +668,15 @@ impl<H: ShardHandler> ShardCore<H> {
         if self.spawner.has_pool() {
             self.spawner.take_back(start);
         }
-        self.drain();
+        let t = std::time::Instant::now();
+        let n = self.drain();
+        if n > 0 {
+            scratch_slices::record(
+                "drain (foreground turn)",
+                t.elapsed().as_nanos() as u64,
+                false,
+            );
+        }
         self.spawner.local.collect_woken();
         if self.idle_at.take() == Some(start) && self.vfs.clock_is_simulated() {
             // A simulated clock has not moved since the loop went idle: sleepers check for
@@ -695,13 +703,19 @@ impl<H: ShardHandler> ShardCore<H> {
                 if now >= deadline {
                     break;
                 }
-                self.spawner
+                let t = std::time::Instant::now();
+                let name = self
+                    .spawner
                     .local
-                    .run_one(now.saturating_add(self.time_slice).min(deadline));
+                    .run_one_named(now.saturating_add(self.time_slice).min(deadline));
+                let took = t.elapsed().as_nanos() as u64;
                 self.work_done += 1;
                 // Foreground first: whatever queued during the slice runs before the next
                 // one.
-                self.drain();
+                let held = self.drain();
+                if let Some(name) = name {
+                    scratch_slices::record(name, took, held > 0);
+                }
                 self.spawner.local.collect_woken();
                 self.spawner.local.wake_due(self.vfs.monotonic_nanos());
                 if !self.spawner.local.has_runnable() {
@@ -1554,4 +1568,81 @@ thread_local! {
 /// last call; clears it.
 pub fn scratch_take_woke() -> bool {
     SCRATCH_WOKE.with(|w| w.replace(false))
+}
+
+/// SCRATCH #1206 (not for merge): background slices on shard threads by task name, and the
+/// ones foreground messages queued behind.
+pub mod scratch_slices {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    #[derive(Default)]
+    struct S {
+        n: u64,
+        total: u64,
+        held: u64,
+        over100: u64,
+        over300: u64,
+        held_ns: Vec<u64>,
+    }
+    static M: Mutex<Option<HashMap<&'static str, S>>> = Mutex::new(None);
+    static ON: AtomicBool = AtomicBool::new(false);
+    /// Starts (clears) or stops recording.
+    pub fn record_on(on: bool) {
+        if on {
+            *M.lock().unwrap() = Some(HashMap::new());
+        }
+        ON.store(on, Ordering::Relaxed);
+    }
+    pub(crate) fn record(name: &'static str, ns: u64, held: bool) {
+        if !ON.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut g = M.lock().unwrap();
+        let s = g.get_or_insert_with(HashMap::new).entry(name).or_default();
+        s.n += 1;
+        s.total += ns;
+        if ns > 100_000 {
+            s.over100 += 1;
+        }
+        if ns > 300_000 {
+            s.over300 += 1;
+        }
+        if held {
+            s.held += 1;
+            s.held_ns.push(ns);
+        }
+    }
+    /// Prints the table to stderr.
+    pub fn report() {
+        let mut g = M.lock().unwrap();
+        let Some(m) = g.as_mut() else { return };
+        let mut v: Vec<_> = m.iter_mut().collect();
+        v.sort_by_key(|(_, s)| std::cmp::Reverse(s.total));
+        for (name, s) in v {
+            s.held_ns.sort_unstable();
+            let q = |p: f64| {
+                s.held_ns
+                    .get(
+                        ((s.held_ns.len() as f64 * p) as usize)
+                            .min(s.held_ns.len().saturating_sub(1)),
+                    )
+                    .copied()
+                    .unwrap_or(0) as f64
+                    / 1000.0
+            };
+            eprintln!(
+                "SCRATCH-SLICES {name:24} | slices {:9} | total {:9.1} ms | mean {:7.1} us | >100us {:7} | >300us {:7} | held fg {:8} | held p50 {:7.1} p99 {:7.1} p999 {:7.1} us",
+                s.n,
+                s.total as f64 / 1e6,
+                s.total as f64 / s.n.max(1) as f64 / 1000.0,
+                s.over100,
+                s.over300,
+                s.held,
+                q(0.5),
+                q(0.99),
+                q(0.999)
+            );
+        }
+    }
 }

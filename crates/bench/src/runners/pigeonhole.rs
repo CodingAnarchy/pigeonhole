@@ -1007,11 +1007,16 @@ impl Runner for PigeonholeRunner {
     fn mark_phase(&mut self, phase: &str) {
         // SCRATCH #1206: the commit stage histograms cover the measured phase only.
         match phase {
-            "measured" => pigeonhole_engine::scratch_stages_record(true),
+            "measured" => {
+                pigeonhole_engine::scratch_stages_record(true);
+                pigeonhole_engine::scratch_slices::record_on(true);
+            }
             "end" => {
                 pigeonhole_engine::scratch_stages_record(false);
                 pigeonhole_engine::scratch_stages_report();
                 pigeonhole_engine::scratch_outer_report();
+                pigeonhole_engine::scratch_slices::record_on(false);
+                pigeonhole_engine::scratch_slices::report();
             }
             _ => {}
         }

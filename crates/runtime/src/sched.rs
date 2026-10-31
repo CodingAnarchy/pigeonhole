@@ -377,12 +377,17 @@ impl Scheduler {
     /// Runs the next runnable task for one slice ending at `deadline` (a shard's own
     /// scheduler).
     pub(crate) fn run_one(&mut self, deadline: u64) {
-        let Some(b) = self.begin_one(false) else {
-            return;
-        };
+        let _ = self.run_one_named(deadline);
+    }
+
+    /// SCRATCH #1206: [`run_one`](Self::run_one), returning the task's name.
+    pub(crate) fn run_one_named(&mut self, deadline: u64) -> Option<&'static str> {
+        let b = self.begin_one(false)?;
         let mut task = b.task;
+        let name = task.name();
         let poll = task.run(deadline, &b.waker);
         self.end_one(b.slot, Some(task), poll, 0);
+        Some(name)
     }
 
     /// Takes the next runnable task out for one slice, commit-path tasks first when
