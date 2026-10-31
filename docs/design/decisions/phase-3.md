@@ -3221,6 +3221,29 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
 - a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #1196).
 
+<a id="d296"></a>
+## D296 — Bounded-result reads: a visitor and a reducer pushed into the read, stopped per group, merged to the sequential result (cli692, 2026-10-31; owner accepted revision 1.2, #490 c6537191252, c6537521450, c6537538630, c6537576507; reviewed by perf287 and ctr274; engine, format, #490 A and C, #489; PRs #1209, #1229, #1222)
+**Why.** A read that wants a small result out of many cells (the k nearest vectors, the first n cells, one per key, a traversal hop's new nodes) materialised every row and threw almost all of it away. The engine can run the selection on resolved cells in place and keep only what the result needs.
+
+**Decided.**
+- **`Engine::reduce(snapshot, table, &ReduceSpec, visitor_factory, reducer_factory) -> Reduced { items, stats }`**, engine-internal in 1.1 (closures don't fit the C ABI; the public consumers are `nearest_*` and D304's traversal).
+  - **Input** (`ReadInput`): sorted, disjoint row ranges (`InvalidArgument` otherwise), or (PR 2, #1229) a D299 `KeySet`, read per tablet with its own forward `KeyCursor`.
+  - **`CellVisitor::visit(row, family, qualifier, ts, value) -> Visit`**: `Skip`, `Emit(item)`, `EmitAndNextRow(item)`, `NextRow` (the rest of the row is skipped by a seek, never decoded) or `Stop`. It sees resolved cells only: deletes, TTL, merges and the read's selection and value predicate are applied first.
+  - **`Reducer::{push(CellRef, item) -> ControlFlow, merge, finish}`**. `merge` is associative and commutative; `Break` from `push` ends that group. Built in: `TopK<S: Ord>` (ties by cell order), `Limit(n)` (the first n cells in scan order) and `Dedupe` (the first cell per item key, with an optional exclude set).
+  - **Cell order** is the scan's: (row, family rank in the read's family order, qualifier, newest version first), via `CellRef`/`CellKey`. Every tie-break uses it, so results are deterministic.
+- **Groups stop only on their own account (rev 1.2).** Work is cut into tablet groups (a range's share of a tablet, or a tablet's run of keys). Each has its own visitor and reducer and stops on its visitor's `Stop` or its reducer's `Break`, never because of another group. Groups are disjoint key ranges in key order, so the merged result is exactly the sequential one for `Limit`, `TopK` and `Dedupe` (and D304's `DedupeLimit`, §2.3 of its note). The shared flag only aborts: an error in any group ends the call with that error, and no partial result is returned. Rev 1.1's shared cut key, which would trim a fanned-out `Limit`'s per-group reads, is a later optimisation.
+- **Fan-out** is caller-owned scoped threads (`parallelism`, default 1), only past a work floor (`parallel_floor`, 20,000 estimated entries per thread by default; for a `Keys` input it counts keys), and never on a thread that drives a shard (D88).
+- **`reduce_into`** (PR 2) hands back the merged reducer unfinished, for a caller that takes the result in another form (D304's `DedupeLimit::into_nodes`).
+- **Versions:** `reduce` takes the read's `ReadSpec` as given; `nearest` forces one version per cell.
+- **KNN (PR 3, #490 C):** `pigeonhole_format::distance`'s safe 16-lane kernels (`f32` L2, dot with norm, cosine from parts; exact `i8` L2 and dot; Hamming), with a fixed pairwise summation order and no FMA, so a kernel gives the same bits on every run and fan-out. `KnnVisitor` scores each cell against the query; `TopK<Score>` (`f32::total_cmp`) keeps the k nearest; malformed values and NaN distances are skipped and counted (`KnnSkips`). Until D303's typed vectors, a vector is a `Bytes` value of little-endian `f32`s (engine-level only).
+- **PR 4:** the public `nearest_f32`, `nearest_i8` and `nearest_bits` (and `_async`) on scans and `KeysRead`, typed by D303's vector families, returning `Neighbour { row, qualifier, distance: f64, ts }` in (distance, row, qualifier) order; an explicit `parallel(n)` on a key set fans out over its groups (#490 D's seam, c6548060686).
+
+**Checks.**
+- `it/reduce.rs`: `TopK`, `Limit` and `Dedupe` against brute force over a scan of the same snapshot (SSTs and memtables, overwrites, deletes, a counter family's merges, value predicates); `NextRow` visits only each row's first cell; `Stop`; refused ranges; fan-out equal to sequential with threads asserted. For `Keys` (PR 2): equal to one-row scans of each key and to `multi_get`, fan-out over three tablets equal to sequential, `NextRow` and per-group `Stop`.
+- `it/knn.rs` (PR 3): exact KNN equal to a brute-force scan scored by the same kernels for every metric and k, sequential and fanned out, and filtered KNN.
+- `format::distance`: the kernels against an `f64` reference for lengths around the lane width, bit-identical on repeat; the integer kernels exact, with no overflow at 4,096 dimensions.
+- PR 1's acceptance included the x86 per-function callgrind A/B with `ScanCursor` untouched (R3: new paths are siblings of the scan and read loops).
+
 <a id="d297"></a>
 ## D297 — Wide rows read cell by cell or in pages, resumed by position (perf287, 2026-10-31; owner accepted revision 2, #489 c6537678922, c6537699771, c6537762158; reviewed by ctr274 and cli692; pigeonhole, engine, #489 item 1, ICR 0095)
 **Why.** A whole-row read builds every cell into one buffer, so a graph hub costs memory in proportion to its edges: a 2M-edge row allocated 824 MB in #489's baseline (AX102). Paging inside a row already worked through the index, but only by hand (`qualifier_range` plus `column_limit`, a fresh read per page).
