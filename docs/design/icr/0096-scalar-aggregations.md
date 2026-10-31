@@ -28,3 +28,20 @@ D298 (#488): the owner's minimum set of further aggregations for 1.1.0, and the 
 ## Callers changed
 - **phdb:** the schema and shell changes above.
 - **Tests:** the engine and `pigeonhole` model harnesses (new `scalar_counters` targets, families named `bor`, `band`, `bxor*`, `fmin`, `fmax*`), and the corpus's `aggregates` entry.
+
+## PR 2: exact `f64` sum and mean/variance
+- **pigeonhole:**
+  - `Aggregation::SumF64` and `Aggregation::MeanVar` (new variants of the non-exhaustive enum). Their inputs are written with `aggregate_f64` / `aggregate_f64_at`, which already exist.
+  - `CellRef::as_f64` and `Cell::as_f64` now also read an exact-sum state, as the correctly rounded sum. The value's shape decides: a `Bytes` value that is a well-formed state, with encoding byte 2.
+  - `CellRef::mean_var()` and `Cell::mean_var() -> Option<MeanVar>`, and the new `pigeonhole::MeanVar`, with accessors `count`, `mean`, `variance` and `sample_variance`. It is owned by `pigeonhole`, not re-exported from the format crate.
+  - **Behaviour:**
+    - Inputs and `put_f64` values must be finite (NaN and ±∞: `InvalidArgument`).
+    - `put` takes a well-formed state of the kind.
+    - `incr` and `aggregate(i64)` are refused, naming `aggregate_f64`.
+    - A `blob_threshold` below 274 (sum) or 821 (mean/variance) is refused at creation.
+  - **Engine:** puts in aggregate families are never separated at commit time, whatever the inline limit.
+- **phdb:** `"aggregation": "sum_f64" | "mean_var"`; the shell's `create` suffixes; `aggregate` parses an `f64` there.
+- **Internal crates:**
+  - **pigeonhole-format:** `exact` (sum and mean/variance states: add, merge, validate, read; `MeanVar`, `StateError`); `FamilyKind::{SumF64, MeanVar}`.
+  - **pigeonhole-compaction:** `ExactF64` (`SUM`, `MEAN_VAR`).
+  - **pigeonhole-sim:** `exact_state`, `exact_state_valid`, `exact_merge`; `ModelAggregation::{SumF64, MeanVar}`, `is_state`, `state_of`, `state_valid`.

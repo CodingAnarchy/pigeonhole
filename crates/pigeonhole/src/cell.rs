@@ -46,7 +46,57 @@ fn hll_estimate(data: &CellData) -> Option<u64> {
 fn as_f64(data: &CellData) -> Option<f64> {
     match data.value() {
         ValueRef::F64(x) => Some(x),
+        ValueRef::Bytes(b) if b.first() == Some(&pigeonhole_format::exact::SUM_ENCODING) => {
+            pigeonhole_format::exact::sum_read(b).ok()
+        }
         _ => None,
+    }
+}
+
+fn mean_var(data: &CellData) -> Option<MeanVar> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::exact::mean_var_read(b)
+            .ok()
+            .map(|r| MeanVar {
+                count: r.count,
+                mean: r.mean,
+                variance: r.variance,
+                sample_variance: r.sample_variance,
+            }),
+        _ => None,
+    }
+}
+
+/// What a mean-variance cell reads as ([`Aggregation::MeanVar`](crate::Aggregation::MeanVar),
+/// D298): each figure is computed exactly from the inputs' count, sum and sum of squares, and
+/// rounded once, so the same inputs read the same figures in any order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeanVar {
+    count: u64,
+    mean: f64,
+    variance: f64,
+    sample_variance: Option<f64>,
+}
+
+impl MeanVar {
+    /// How many inputs the cell holds.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Their mean.
+    pub fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    /// Their population variance (divided by the count).
+    pub fn variance(&self) -> f64 {
+        self.variance
+    }
+
+    /// Their sample variance (divided by the count less one); `None` for a single input.
+    pub fn sample_variance(&self) -> Option<f64> {
+        self.sample_variance
     }
 }
 
@@ -125,9 +175,18 @@ impl<'a> CellRef<'a> {
         as_i64(&self.data).map(|v| v as u64)
     }
 
-    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
+    /// The value as an `f64`: an `f64` value, or the sum an exact-sum state holds, rounded
+    /// once ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298; the value's shape
+    /// decides, as for [`hll_estimate`](Self::hll_estimate)); `None` otherwise.
     pub fn as_f64(&self) -> Option<f64> {
         as_f64(&self.data)
+    }
+
+    /// The count, mean and variance a mean-variance state holds
+    /// ([`Aggregation::MeanVar`](crate::Aggregation::MeanVar), D298); `None` unless the value
+    /// is a well-formed one.
+    pub fn mean_var(&self) -> Option<MeanVar> {
+        mean_var(&self.data)
     }
 
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
@@ -191,9 +250,18 @@ impl Cell {
         as_i64(&self.data).map(|v| v as u64)
     }
 
-    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
+    /// The value as an `f64`: an `f64` value, or the sum an exact-sum state holds, rounded
+    /// once ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298; the value's shape
+    /// decides, as for [`hll_estimate`](Self::hll_estimate)); `None` otherwise.
     pub fn as_f64(&self) -> Option<f64> {
         as_f64(&self.data)
+    }
+
+    /// The count, mean and variance a mean-variance state holds
+    /// ([`Aggregation::MeanVar`](crate::Aggregation::MeanVar), D298); `None` unless the value
+    /// is a well-formed one.
+    pub fn mean_var(&self) -> Option<MeanVar> {
+        mean_var(&self.data)
     }
 
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's

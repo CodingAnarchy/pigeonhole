@@ -37,9 +37,11 @@ pub pigeonhole::Aggregation::BitXor
 pub pigeonhole::Aggregation::Hll
 pub pigeonhole::Aggregation::Max
 pub pigeonhole::Aggregation::MaxF64
+pub pigeonhole::Aggregation::MeanVar
 pub pigeonhole::Aggregation::Min
 pub pigeonhole::Aggregation::MinF64
 pub pigeonhole::Aggregation::Sum
+pub pigeonhole::Aggregation::SumF64
 #[non_exhaustive] pub enum pigeonhole::Compaction
 pub pigeonhole::Compaction::FifoByTime
 pub pigeonhole::Compaction::Leveled
@@ -170,6 +172,7 @@ pub fn pigeonhole::Cell::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::Cell::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::Cell::as_u64(&self) -> core::option::Option<u64>
 pub fn pigeonhole::Cell::hll_estimate(&self) -> core::option::Option<u64>
+pub fn pigeonhole::Cell::mean_var(&self) -> core::option::Option<pigeonhole::MeanVar>
 pub fn pigeonhole::Cell::timestamp(&self) -> u64
 pub fn pigeonhole::Cell::typed(&self) -> pigeonhole::Value<'_>
 pub fn pigeonhole::Cell::value(&self) -> &[u8]
@@ -183,6 +186,7 @@ pub fn pigeonhole::CellRef<'a>::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::CellRef<'a>::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::CellRef<'a>::as_u64(&self) -> core::option::Option<u64>
 pub fn pigeonhole::CellRef<'a>::hll_estimate(&self) -> core::option::Option<u64>
+pub fn pigeonhole::CellRef<'a>::mean_var(&self) -> core::option::Option<pigeonhole::MeanVar>
 pub fn pigeonhole::CellRef<'a>::timestamp(&self) -> u64
 pub fn pigeonhole::CellRef<'a>::to_owned(&self) -> pigeonhole::Cell
 pub fn pigeonhole::CellRef<'a>::typed(&self) -> pigeonhole::Value<'_>
@@ -350,6 +354,12 @@ pub pigeonhole::LevelInfo::bytes: u64
 pub pigeonhole::LevelInfo::entries: u64
 pub pigeonhole::LevelInfo::level: u8
 pub pigeonhole::LevelInfo::ssts: u64
+pub struct pigeonhole::MeanVar
+impl pigeonhole::MeanVar
+pub fn pigeonhole::MeanVar::count(&self) -> u64
+pub fn pigeonhole::MeanVar::mean(&self) -> f64
+pub fn pigeonhole::MeanVar::sample_variance(&self) -> core::option::Option<f64>
+pub fn pigeonhole::MeanVar::variance(&self) -> f64
 #[non_exhaustive] pub struct pigeonhole::MergeError
 pub pigeonhole::MergeError::message: alloc::string::String
 pub pigeonhole::MergeError::operator: alloc::string::String

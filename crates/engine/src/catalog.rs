@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use pigeonhole_compaction::{
-    Bitwise, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeOperator, MergeRegistry,
+    Bitwise, ExactF64, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeOperator, MergeRegistry,
 };
 use pigeonhole_format::hash::{FastMap, FastSet};
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
@@ -33,6 +33,9 @@ pub(crate) const U64_XOR: &str = "pigeonhole.u64_xor";
 /// Names of the built-in `f64` extremes (`pigeonhole_compaction::F64Extreme`, D298).
 pub(crate) const F64_MIN: &str = "pigeonhole.f64_min";
 pub(crate) const F64_MAX: &str = "pigeonhole.f64_max";
+/// Names of the built-in exact `f64` aggregations (`pigeonhole_compaction::ExactF64`, D298).
+pub(crate) const F64_SUM: &str = "pigeonhole.f64_sum";
+pub(crate) const F64_MEAN_VAR: &str = "pigeonhole.f64_mean_var";
 
 /// The operator an aggregate family of `kind` folds with, by name (D179, D294); `None` for
 /// a standard family, whose operator is its own choice.
@@ -48,6 +51,8 @@ pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
         FamilyKind::BitXor => Some(U64_XOR),
         FamilyKind::MinF64 => Some(F64_MIN),
         FamilyKind::MaxF64 => Some(F64_MAX),
+        FamilyKind::SumF64 => Some(F64_SUM),
+        FamilyKind::MeanVar => Some(F64_MEAN_VAR),
     }
 }
 
@@ -65,6 +70,8 @@ pub(crate) fn builtin_kind(name: &str) -> Option<FamilyKind> {
         U64_XOR => FamilyKind::BitXor,
         F64_MIN => FamilyKind::MinF64,
         F64_MAX => FamilyKind::MaxF64,
+        F64_SUM => FamilyKind::SumF64,
+        F64_MEAN_VAR => FamilyKind::MeanVar,
         _ => return None,
     })
 }
@@ -81,7 +88,9 @@ pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
         | FamilyKind::BitAnd
         | FamilyKind::BitXor
         | FamilyKind::MinF64
-        | FamilyKind::MaxF64 => &[],
+        | FamilyKind::MaxF64
+        | FamilyKind::SumF64
+        | FamilyKind::MeanVar => &[],
     }
 }
 
@@ -98,6 +107,8 @@ fn builtin_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
         FamilyKind::BitXor => Some(Arc::new(Bitwise::XOR)),
         FamilyKind::MinF64 => Some(Arc::new(F64Extreme::MIN)),
         FamilyKind::MaxF64 => Some(Arc::new(F64Extreme::MAX)),
+        FamilyKind::SumF64 => Some(Arc::new(ExactF64::SUM)),
+        FamilyKind::MeanVar => Some(Arc::new(ExactF64::MEAN_VAR)),
     }
 }
 
@@ -881,6 +892,8 @@ mod cow_tests {
             K::BitXor,
             K::MinF64,
             K::MaxF64,
+            K::SumF64,
+            K::MeanVar,
         ];
         for kind in kinds {
             if let Some(name) = aggregate_operator(kind) {

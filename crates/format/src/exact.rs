@@ -419,11 +419,11 @@ fn sub_in_place(a: &mut Vec<u64>, b: &[u64]) {
         return;
     }
     let mut borrow = false;
-    for i in 0..a.len() {
+    for (i, x) in a.iter_mut().enumerate() {
         let y = b.get(i).copied().unwrap_or(0);
-        let (d1, b1) = a[i].overflowing_sub(y);
+        let (d1, b1) = x.overflowing_sub(y);
         let (d2, b2) = d1.overflowing_sub(u64::from(borrow));
-        a[i] = d2;
+        *x = d2;
         borrow = b1 || b2;
     }
     trim(a);

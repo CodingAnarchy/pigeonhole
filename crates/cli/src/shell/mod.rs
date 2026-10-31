@@ -9,7 +9,7 @@
 //! put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
 //! incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
 //! delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-//! create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64]...
+//! create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var]...
 //! snapshot [--durable] <name>        release <name>
 //! \tables  \schema [table]  \info  \metrics  \health  \format F  \timing on|off  \help  \quit
 //! ```
@@ -48,9 +48,9 @@ commands (one per line; values are bytes: \"quoted\\n\", 0xhex, b64:base64):
          [--limit N] [--columns-per-row N] [--at SNAP]
   put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
   incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
-  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]  (f64 in *_f64, u64 in bit_*)
+  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]  (f64 in *_f64 and mean_var, u64 in bit_*)
   delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-  create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64]...
+  create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var]...
   snapshot [--durable] <name>     release <name>
   \\tables  \\schema [table]  \\info  \\metrics  \\health
   \\format table|json|jsonl|csv  \\timing on|off  \\help  \\quit
@@ -528,7 +528,12 @@ impl Session {
             .then(|| t.family_info(&family).and_then(|f| f.aggregation))
             .flatten();
         let m = match kind {
-            Some(Aggregation::MinF64 | Aggregation::MaxF64) => {
+            Some(
+                Aggregation::MinF64
+                | Aggregation::MaxF64
+                | Aggregation::SumF64
+                | Aggregation::MeanVar,
+            ) => {
                 let x: f64 = text
                     .parse()
                     .map_err(|_| Failure::usage("an f64 family's aggregate takes a number"))?;
@@ -604,7 +609,7 @@ impl Session {
         let table = args.text(0, "table")?;
         if args.positional.len() < 2 {
             return Err(Failure::usage(
-                "create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64]...",
+                "create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var]...",
             ));
         }
         let mut b = db.table(table).map_err(|e| Failure::db("create", &e))?;
@@ -622,6 +627,8 @@ impl Session {
                 Some((name, "bit_xor")) => b.family(name, Family::aggregate(Aggregation::BitXor)),
                 Some((name, "min_f64")) => b.family(name, Family::aggregate(Aggregation::MinF64)),
                 Some((name, "max_f64")) => b.family(name, Family::aggregate(Aggregation::MaxF64)),
+                Some((name, "sum_f64")) => b.family(name, Family::aggregate(Aggregation::SumF64)),
+                Some((name, "mean_var")) => b.family(name, Family::aggregate(Aggregation::MeanVar)),
                 _ => b.family(spec, Family::default()),
             };
         }

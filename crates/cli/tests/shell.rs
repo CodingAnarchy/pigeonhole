@@ -204,6 +204,29 @@ fn bitwise_and_f64_families() {
 }
 
 #[test]
+fn exact_sum_and_mean_var_families() {
+    // D298 PR 2: `create` takes `:sum_f64` and `:mean_var`, and `aggregate` takes an f64
+    // input there; NaN is refused.
+    let dir = TempDir::new("shell-exact");
+    let path = empty(&dir);
+    let (status, _out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s total:sum_f64 lat:mean_var",
+            "aggregate s r total:t 1e300",
+            "aggregate s r total:t 1",
+            "aggregate s r total:t -1e300",
+            "aggregate s r lat:t 2.5",
+            "\\schema s",
+            "aggregate s r total:t NaN",
+        ],
+    );
+    assert_eq!(status, 1, "the NaN is refused: {err}");
+    assert!(err.contains("finite f64"), "{err}");
+}
+
+#[test]
 fn meta_commands() {
     let dir = TempDir::new("shell-meta");
     let path = empty(&dir);

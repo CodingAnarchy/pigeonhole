@@ -252,9 +252,12 @@ impl TableCore {
         let accepted = match operand {
             // A standard family's `incr` is the engine's to judge (D41).
             Operand::Incr => matches!(kind, K::Standard | K::Counter),
-            Operand::Aggregate => kind.is_aggregate() && !matches!(kind, K::MinF64 | K::MaxF64),
+            Operand::Aggregate => {
+                kind.is_aggregate()
+                    && !matches!(kind, K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar)
+            }
             Operand::U64 => matches!(kind, K::BitOr | K::BitAnd | K::BitXor),
-            Operand::F64 => matches!(kind, K::MinF64 | K::MaxF64),
+            Operand::F64 => matches!(kind, K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar),
         };
         if accepted {
             return Ok(f.id);
@@ -285,6 +288,8 @@ impl TableCore {
             K::BitXor => ("a bit_xor", "aggregate_u64"),
             K::MinF64 => ("a min_f64", "aggregate_f64"),
             K::MaxF64 => ("a max_f64", "aggregate_f64"),
+            K::SumF64 => ("a sum_f64", "aggregate_f64"),
+            K::MeanVar => ("a mean_var", "aggregate_f64"),
         };
         Err(Error::new(
             ErrorCode::InvalidArgument,

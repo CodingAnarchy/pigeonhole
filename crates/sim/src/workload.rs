@@ -12,10 +12,11 @@ use crate::{ModelOp, Rng};
 /// a store configured with the `i64` add operator for those families never sees a malformed
 /// operand. A family whose name starts with `sum` is a counter family of decision D179 (the
 /// model's [`ModelFamily::counter`](crate::ModelFamily::counter)), and one starting with
-/// `min`, `max` or `hll` an aggregate family of D294
+/// `min`, `max` or `hll` an aggregate family of D294, or one of D298's
 /// ([`aggregation_of_name`](crate::aggregation_of_name)): the same writes, some at the fixed
-/// counter timestamp and some at bucket timestamps (multiples of 4), an `hll` family's puts
-/// being sketches of a few elements ([`hll_sketch`](crate::hll_sketch)); if its name
+/// counter timestamp and some at bucket timestamps (multiples of 4), a state family's puts
+/// being states of a few inputs (an `hll` family's sketches, [`hll_sketch`](crate::hll_sketch);
+/// an exact `f64` family's, [`exact_state`](crate::exact_state)); if its name
 /// contains `ttl`, every put and `Incr` there takes a bucket timestamp (a counter family with
 /// a TTL refuses the fixed one).
 #[derive(Debug, Clone, PartialEq)]
@@ -243,8 +244,10 @@ impl Workload {
         }
         let qualifier = self.qualifier();
         // An HLL family's puts are sketches (of a few elements), its inputs elements.
-        let hll = crate::aggregation_of_name(&family) == Some(crate::ModelAggregation::Hll);
-        if counter && self.rng.chance(if hll { 850_000 } else { 800_000 }) {
+        // A state family's puts are states (an HLL sketch, an exact sum's or mean-variance
+        // state of a few inputs), its inputs elements.
+        let state = crate::aggregation_of_name(&family).is_some_and(|a| a.is_state());
+        if counter && self.rng.chance(if state { 850_000 } else { 800_000 }) {
             let delta = self.scalar(&family);
             let ts = if sum { self.sum_ts(&family) } else { None };
             return ModelOp::Incr {
@@ -261,8 +264,8 @@ impl Workload {
         } else {
             self.rng.chance(150_000).then(|| self.recent_ts())
         };
-        let value = if hll {
-            self.sketch()
+        let value = if state {
+            self.state_put(&family)
         } else if counter {
             self.scalar(&family).to_le_bytes().to_vec()
         } else {
@@ -288,6 +291,18 @@ impl Workload {
             Some(A::BitOr) => (1u64 << self.rng.below(64)) as i64,
             Some(A::BitAnd) => !(1u64 << self.rng.below(64)) as i64,
             Some(A::BitXor) => (self.rng.next_u64() & self.rng.next_u64()) as i64,
+            // Finite only, at magnitudes that cancel and span subnormals to near the range's
+            // top, so the exact sum and the squares are exercised.
+            Some(A::SumF64 | A::MeanVar) => {
+                let x = match self.rng.below(8) {
+                    0 => -0.0,
+                    1 => 1e300,
+                    2 => -1e300,
+                    3 => 5e-324,
+                    _ => (self.rng.below(2001) as f64 - 1000.0) / 8.0,
+                };
+                x.to_bits() as i64
+            }
             Some(A::MinF64 | A::MaxF64) => {
                 let x = match self.rng.below(10) {
                     0 => 0.0,
@@ -302,11 +317,13 @@ impl Workload {
         }
     }
 
-    /// A sketch of one to three elements, for an HLL family's put.
-    fn sketch(&mut self) -> Vec<u8> {
+    /// The state of one to three inputs, for a state family's put: an HLL sketch of `i64`
+    /// elements, or an exact sum's or mean-variance state of finite `f64`s.
+    fn state_put(&mut self, family: &str) -> Vec<u8> {
+        let agg = crate::aggregation_of_name(family).expect("a state family");
         let n = 1 + self.rng.below(3);
-        let elements: Vec<i64> = (0..n).map(|_| self.rng.below(2001) as i64 - 1000).collect();
-        crate::hll_sketch(elements).expect("at least one element")
+        let elements: Vec<i64> = (0..n).map(|_| self.scalar(family)).collect();
+        agg.state_of(None, elements).expect("at least one element")
     }
 
     /// A mutation to the same column as `prev` that collides with it: same timestamp (the
@@ -344,7 +361,9 @@ impl Workload {
         let tick = (self.tick / 4 * 4).max(4);
         let sum_ts =
             |rng: &mut Rng| (family.contains("ttl") || rng.chance(500_000)).then_some(tick);
-        let hll = crate::aggregation_of_name(&family) == Some(crate::ModelAggregation::Hll);
+        // A state family's puts are states (an HLL sketch, an exact sum's or mean-variance
+        // state of a few inputs), its inputs elements.
+        let state = crate::aggregation_of_name(&family).is_some_and(|a| a.is_state());
         match self.rng.below(6) {
             0 if counter => ModelOp::Incr {
                 ts: if sum { sum_ts(&mut self.rng) } else { None },
@@ -360,8 +379,8 @@ impl Workload {
                 } else {
                     self.rng.chance(500_000).then_some(self.tick)
                 };
-                let value = if hll {
-                    self.sketch()
+                let value = if state {
+                    self.state_put(&family)
                 } else if counter {
                     7i64.to_le_bytes().to_vec()
                 } else {

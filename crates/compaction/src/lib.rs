@@ -42,7 +42,8 @@ pub use job::{
     OtherSource, StreamGc, output_piece_bytes,
 };
 pub use merge::{
-    Bitwise, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeError, MergeOperator, MergeRegistry,
+    Bitwise, ExactF64, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeError, MergeOperator,
+    MergeRegistry,
 };
 pub use picker::{CompactionPicker, CompactionTask, KeyRange, Levels, PickerOptions, TaskKind};
 pub use resolver::{COUNTER_FOLD_MIN, CellResolver, ResolveOptions, ResolvedCell, ValuePredicate};

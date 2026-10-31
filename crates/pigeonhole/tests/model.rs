@@ -150,18 +150,20 @@ fn families() -> Vec<ModelFamily> {
             f("hll_ttl", 0, 40, false),
         ]
     } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
-        // D298's bitwise and `f64` families beside a counter, eight families in all (32
-        // slots), as `counters` has: more stall a one-shard run with tablet changes off
-        // (#1212). They join `counters` once that is fixed (#1214).
+        // D298's families beside a counter, eight in all (32 slots), as `counters` has:
+        // more stall a one-shard run with tablet changes off (#1212). The exact sum and
+        // mean-variance families (PR 2) take `bor`'s and `fmin`'s places, whose kinds share
+        // their code with `band`'s and `fmax_ttl`'s. They all join `counters` once #1212 is
+        // fixed (#1214, #1219).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
             f("sum", 2, 0, false),
-            f("bor", 2, 0, false),
             f("band", 0, 0, false),
             f("bxor_ttl", 0, 40, false),
-            f("fmin", 2, 0, false),
             f("fmax_ttl", 0, 40, false),
+            f("fsum", 2, 0, false),
+            f("fmv_ttl", 0, 40, false),
         ]
     } else {
         vec![
@@ -245,7 +247,8 @@ fn batch_input(
 /// A family holding only `i64`s (an HLL family's cells are sketches).
 fn is_i64(family: &str) -> bool {
     family.starts_with("counter")
-        || (is_aggregate(family) && aggregation_of_name(family) != Some(ModelAggregation::Hll))
+        || (is_aggregate(family)
+            && !aggregation_of_name(family).is_some_and(ModelAggregation::is_state))
 }
 
 /// `g` compacts tiered and `ttl` FIFO by time (#31, #32), and `f` uses zstd (#44); the
@@ -275,6 +278,8 @@ fn public_family(f: &ModelFamily) -> Family {
         (true, ModelAggregation::BitXor) => Family::aggregate(Aggregation::BitXor),
         (true, ModelAggregation::MinF64) => Family::aggregate(Aggregation::MinF64),
         (true, ModelAggregation::MaxF64) => Family::aggregate(Aggregation::MaxF64),
+        (true, ModelAggregation::SumF64) => Family::aggregate(Aggregation::SumF64),
+        (true, ModelAggregation::MeanVar) => Family::aggregate(Aggregation::MeanVar),
     };
     let family = family
         .max_versions(f.max_versions)
@@ -1279,14 +1284,16 @@ impl Run {
                         ts: None,
                         value,
                         ..
-                    } if is_f64(family) => wb.put_f64(t, &row, family, qualifier, f64_value(value)),
+                    } if is_f64(family) && is_i64(family) => {
+                        wb.put_f64(t, &row, family, qualifier, f64_value(value))
+                    }
                     ModelOp::Put {
                         family,
                         qualifier,
                         ts: Some(ts),
                         value,
                         ..
-                    } if is_f64(family) => {
+                    } if is_f64(family) && is_i64(family) => {
                         wb.put_f64_at(t, &row, family, qualifier, *ts, f64_value(value))
                     }
                     ModelOp::Put {

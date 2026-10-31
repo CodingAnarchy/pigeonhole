@@ -1372,6 +1372,105 @@ fn bitwise_and_f64_families() {
     }
 }
 
+/// D298 PR 2: an exact-sum family reads the correctly rounded sum of its `f64` inputs with
+/// `as_f64`; a mean-variance family reads count, mean and variances with `mean_var`. Both
+/// take finite inputs only, `put_f64` sets a bucket, `incr` and `aggregate(i64)` are refused,
+/// and each info names its kind.
+#[test]
+fn exact_sum_and_mean_var_families() {
+    let db = db();
+    let t = db
+        .table("stats")
+        .unwrap()
+        .family("total", Family::aggregate(Aggregation::SumF64))
+        .family("lat", Family::aggregate(Aggregation::MeanVar))
+        .create()
+        .unwrap();
+    let total = || {
+        t.get(b"r", "total", b"q")
+            .unwrap()
+            .map(|c| c.as_f64().unwrap())
+    };
+    let lat = || {
+        t.get(b"r", "lat", b"q")
+            .unwrap()
+            .map(|c| c.mean_var().unwrap())
+    };
+    assert_eq!(total(), None, "no input: absent");
+    assert!(lat().is_none());
+    for x in [1e300, 1.0, -1e300, 2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+        t.mutate(b"r")
+            .aggregate_f64("total", b"q", x)
+            .commit()
+            .unwrap();
+    }
+    // Floating-point addition would give 40 (1e300 + 1.0 is 1e300); the exact sum keeps the
+    // 1.0.
+    assert_eq!(total(), Some(41.0));
+    let mut wb = db.write_batch();
+    for x in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+        wb.aggregate_f64(&t, b"r", "lat", b"q", x);
+    }
+    wb.commit().unwrap();
+    let m = lat().unwrap();
+    assert_eq!((m.count(), m.mean(), m.variance()), (8, 5.0, 4.0));
+    assert_eq!(m.sample_variance(), Some(32.0 / 7.0));
+    // A put sets the bucket; later inputs fold onto it. Transactions and buckets too.
+    t.mutate(b"r")
+        .put_f64("total", b"q", 0.5)
+        .aggregate_f64("total", b"q", 0.25)
+        .commit()
+        .unwrap();
+    assert_eq!(total(), Some(0.75));
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate_f64_at(&t, b"r", "lat", b"hour", 3_600, 10.0);
+    txn.commit().unwrap();
+    let cell = t.get(b"r", "lat", b"hour").unwrap().unwrap();
+    let one = cell.mean_var().unwrap();
+    assert_eq!(
+        (
+            cell.timestamp(),
+            one.count(),
+            one.mean(),
+            one.sample_variance()
+        ),
+        (3_600, 1, 10.0, None)
+    );
+    // Refused: non-finite inputs, incr, and i64 inputs.
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    for bad in [f64::NAN, f64::INFINITY] {
+        refused(
+            t.mutate(b"r").aggregate_f64("total", b"q", bad).commit(),
+            "finite f64",
+        );
+        refused(
+            t.mutate(b"r").put_f64("lat", b"q", bad).commit(),
+            "finite f64",
+        );
+    }
+    refused(
+        t.mutate(b"r").incr("total", b"q", 1).commit(),
+        "is a sum_f64 family: write its inputs with aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r").aggregate("lat", b"q", 1).commit(),
+        "is a mean_var family: write its inputs with aggregate_f64, not aggregate",
+    );
+    assert_eq!(total(), Some(0.75), "nothing refused was written");
+    for (f, a) in [
+        ("total", Aggregation::SumF64),
+        ("lat", Aggregation::MeanVar),
+    ] {
+        let info = t.family_info(f).unwrap();
+        assert_eq!(info.aggregation, Some(a), "{f}");
+        assert!(!info.counter && info.merge_operator.is_none(), "{f}");
+    }
+}
+
 /// A family that names `pigeonhole.i64_add` without being a counter family reads and writes
 /// as 0.1.0 created them (D41): increments at the commit timestamp, folded across
 /// timestamps, and bytes on top of a counter fail at read.
