@@ -149,6 +149,10 @@ pub fn families() -> Vec<ModelFamily> {
             f("sum_ttl", 0, 40, false),
         ]
     } else if env!("CARGO_CRATE_NAME") == "counters" {
+        // Every aggregate kind (D179, D294, D298) beside `f` and a 0.1.0-style `counter`:
+        // eighteen families, 72 slots on a shard with tablet changes off. The tables are
+        // created after the open, so until a reopen resizes the chunks for them the 72 slots
+        // share the 64-slot geometry, about 14 chunks each (perf287 on #1233; #1212, D302).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
@@ -158,20 +162,12 @@ pub fn families() -> Vec<ModelFamily> {
             f("max_ttl", 0, 40, false),
             f("hll", 2, 0, false),
             f("hll_ttl", 0, 40, false),
-        ]
-    } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
-        // D298's families beside a counter, eight in all (32 slots), as `counters` has:
-        // more stall a one-shard run with tablet changes off (#1212). PR 2's exact sum and
-        // mean-variance families took `bor`'s and `fmin`'s places; PR 3's histogram and
-        // quantile families take `sum`'s and `band`'s (the counter kind runs in `counters`,
-        // and XOR covers the bitwise operator's code); PR 4's bloom family takes `fsum`'s
-        // (mean/variance runs the same exact-sum code). They all join `counters` once #1212
-        // is fixed (#1214, #1219).
-        vec![
-            f("f", 0, 0, false),
-            f("counter", 3, 0, true),
+            f("bor", 2, 0, false),
+            f("band", 0, 0, false),
             f("bxor_ttl", 0, 40, false),
+            f("fmin", 2, 0, false),
             f("fmax_ttl", 0, 40, false),
+            f("fsum", 2, 0, false),
             f("fmv_ttl", 0, 40, false),
             f("fhist", 2, 0, false),
             f("fq_ttl", 0, 40, false),
@@ -1758,6 +1754,15 @@ impl World {
             return;
         }
         self.stats.large_puts += large;
+        self.note_blob_files();
+    }
+
+    /// Counts the blob files in the catalog not seen before (`Stats::blob_files`). Called at
+    /// every step as well as at each acknowledged large put: with deferred I/O an ack is
+    /// handled later, and by then a compaction or blob GC may have dropped a file the
+    /// commit separated into (its value overwritten), which an ack-time look alone missed
+    /// (#1233, seed 190). No draws, so every seed runs as before.
+    fn note_blob_files(&mut self) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
@@ -5033,6 +5038,7 @@ impl World {
             eprintln!("op #{} {op:?}", self.op_index);
         }
         self.vfs.advance(1_000);
+        self.note_blob_files();
         if self.cfg.tablet_changes && !self.alive() {
             // An armed crash fired in the background (a flush, a compaction, or a tablet
             // change running while the workload goes on): recover before going on, whatever
