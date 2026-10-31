@@ -22,8 +22,9 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 13. [Transactions](transactions.md): optimistic multi-row transactions: `transact` and retries, what is read and what conflicts (per cell for `get`, per family for `get_row`), the isolation level and anomalies, read-only transactions, the cost model.
 14. [Performance compared with SQLite](performance.md): point reads under a mixed load at equal cache memory: throughput, median, p99 and the far tail, and when each store fits.
 15. [Graphs](graphs.md): adjacency rows, reverse edges and degree, walking a hub's row cell by cell or in pages, frontier multi-gets, and breadth-first traversal inside the engine (sync and async).
+16. [Using Pigeonhole from AI agents](ai-agents.md): `phdb mcp`, an MCP server that gives an agent tools to list, read, scan, traverse and write a database; client configuration, cursors for long results, and modelling agent memory.
 
 Multi-process readers have their own page, [Reader processes](readers.md); [Concepts](concepts.md#multi-process-readers) has the overview.
 
 ## For agents integrating Pigeonhole
-Start with [`agent-reference.md`](agent-reference.md): dense tables, no prose padding. Use [`errors.md`](errors.md) to decide what to do about a failure. Signatures in `crates/pigeonhole/src/*.rs` are the final authority.
+Start with [`agent-reference.md`](agent-reference.md): dense tables, no prose padding. An agent that should use a database as a tool, rather than write code against one, wants [`phdb mcp`](ai-agents.md). Use [`errors.md`](errors.md) to decide what to do about a failure. Signatures in `crates/pigeonhole/src/*.rs` are the final authority.

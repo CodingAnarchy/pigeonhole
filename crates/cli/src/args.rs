@@ -129,6 +129,28 @@ pub(crate) enum Command {
         #[arg(long)]
         online: bool,
     },
+    /// A Model Context Protocol server on standard input and output, for AI agents: tools to
+    /// list tables, read rows, scan, traverse graphs, write in atomic batches and create
+    /// tables. Opens as `phdb shell` does, and holds the database until its input ends.
+    Mcp {
+        /// The database file (`*.phdb`).
+        file: PathBuf,
+        /// Open as a reader process (a writer process must have the database open): the
+        /// write tools are left out.
+        #[arg(long)]
+        read_only: bool,
+        /// Create the database file if it does not exist (not with `--read-only`).
+        #[arg(long, conflicts_with = "read_only")]
+        create: bool,
+        /// A tool result's size, about, in bytes of JSON: a longer one is cut at a column
+        /// boundary and returns a cursor to continue from.
+        #[arg(long, value_name = "BYTES", default_value_t = 32 << 10)]
+        max_result_bytes: usize,
+        /// The longest value a read returns whole by default; a longer one is replaced by its
+        /// length (a read may ask for more, up to `--max-result-bytes`).
+        #[arg(long, value_name = "BYTES", default_value_t = 4 << 10)]
+        max_value_bytes: usize,
+    },
 }
 
 impl Cli {

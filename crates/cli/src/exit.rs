@@ -138,6 +138,12 @@ impl Failure {
         self
     }
 
+    /// The same failure, naming the part of a request it came from (`ops[3]: …`).
+    pub(crate) fn within(mut self, what: &str) -> Self {
+        self.message = format!("{what}: {}", self.message);
+        self
+    }
+
     /// An I/O error outside the database (writing the output).
     pub(crate) fn io(what: &str, e: &std::io::Error) -> Self {
         Self {
@@ -171,6 +177,11 @@ impl Failure {
         self.status
     }
 
+    /// The failure as `{"code", "code_num", "message"}`.
+    pub(crate) fn json(&self) -> serde_json::Value {
+        serde_json::json!({"code": self.code, "code_num": self.code_num, "message": self.message})
+    }
+
     /// Writes the failure to `out`: one line for people, or with `--format json`/`jsonl` a
     /// JSON object `{"phdb":1,"error":{"code","code_num","message"}}`.
     pub(crate) fn render(&self, format: Format, out: &mut dyn Write) {
@@ -178,10 +189,7 @@ impl Failure {
             Format::Json | Format::Jsonl => writeln!(
                 out,
                 "{}",
-                serde_json::json!({
-                    "phdb": 1,
-                    "error": {"code": self.code, "code_num": self.code_num, "message": self.message},
-                })
+                serde_json::json!({"phdb": 1, "error": self.json()})
             ),
             Format::Table | Format::Csv | Format::Arrow => {
                 writeln!(out, "phdb: error: {}", self.message)
