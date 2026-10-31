@@ -26,9 +26,11 @@ The server speaks MCP's stdio transport: one JSON-RPC message per line on standa
 
 **How it opens the database.** Without `--read-only`, the server opens as `phdb shell` does. With no writer running, it becomes the writer: it holds the writer lock for as long as the client keeps it running, so your application can't open the database as the writer meanwhile (its open fails with `WriterLocked`). With your application running, it opens as a reader process, and the write tools are left out.
 
-So pick one of two setups:
-- **The agent owns the database** (its memory, a scratch store): run `phdb mcp` without `--read-only`. Nothing else writes the file while the server runs; other processes can still open it as readers.
-- **Your application owns the database**, and the agent inspects it: run `phdb mcp --read-only` while the application runs. The agent sees every commit the application makes, and can't write.
+**A writer-mode session holds the writer lock for its whole lifetime:** from the moment the client starts the server until it stops it, which for most clients is as long as the client runs. Nothing else can open the database as the writer meanwhile, not your application, not another `phdb` command that writes, not a second agent.
+
+So for most setups, prefer `--read-only` with a separate writer:
+- **Recommended: a writer process plus `phdb mcp --read-only`.** Your application, or a small service of your own, is the one writer, and the agent reads through a reader process. The agent sees every commit the writer makes, can't write, and never blocks the writer. If the agent should record things too, have it go through the writer (an endpoint, a queue, or a tool of your own) rather than through the MCP server.
+- **Only when the agent alone owns the database** (a scratch store or a private memory nothing else writes): run `phdb mcp` without `--read-only`. Other processes can still open the file as readers, but nothing else can write it until the client stops the server.
 
 ## Client configuration
 Use an absolute path to the database: clients start servers from a directory of their choosing.
