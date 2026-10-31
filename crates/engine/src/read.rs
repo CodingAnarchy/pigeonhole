@@ -26,6 +26,7 @@ use crate::{Error, Result};
 pub(crate) mod keys;
 pub(crate) mod knn;
 pub(crate) mod reduce;
+pub(crate) mod traverse;
 
 /// How a [`CellData`] keeps its value alive.
 #[derive(Clone)]

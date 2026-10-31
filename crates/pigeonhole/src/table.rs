@@ -652,6 +652,13 @@ impl Table {
         crate::KeysRead::new(&self.core, keys)
     }
 
+    /// Starts a breadth-first traversal from `seeds` ([`Traverse`](crate::Traverse), D304):
+    /// hops over an edge family whose qualifiers name the destination rows, run in the
+    /// engine under one snapshot.
+    pub fn traverse<'t>(&'t self, seeds: &crate::KeySet) -> crate::Traverse<'t> {
+        crate::Traverse::new(&self.core, seeds)
+    }
+
     /// Starts a scan from explicit bounds (the form a C ABI exports).
     pub fn scan_bounds(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Scan<'_> {
         self.core.scan(start, end)
@@ -750,6 +757,13 @@ impl ReadTable {
     /// order under one snapshot, each tablet's read set up once for all of its keys.
     pub fn keys<'t>(&'t self, keys: &crate::KeySet) -> crate::KeysRead<'t> {
         crate::KeysRead::new(&self.core, keys)
+    }
+
+    /// Starts a breadth-first traversal from `seeds` ([`Traverse`](crate::Traverse), D304):
+    /// hops over an edge family whose qualifiers name the destination rows, run in the
+    /// engine under one snapshot.
+    pub fn traverse<'t>(&'t self, seeds: &crate::KeySet) -> crate::Traverse<'t> {
+        crate::Traverse::new(&self.core, seeds)
     }
 
     /// Starts a scan from explicit bounds.

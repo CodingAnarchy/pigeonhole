@@ -751,6 +751,215 @@ impl<'t> KeyRows<'t> {
     }
 }
 
+/// A breadth-first traversal under construction ([`Table::traverse`](crate::Table::traverse),
+/// D304). Finish with [`Traverse::run`].
+///
+/// A node is a row; its edges are the columns of one family, and an edge's qualifier is the
+/// destination's row key. From the seeds, each hop reads the frontier's edges in key order
+/// (by source row, then qualifier, the newest version of each), with the selection applied
+/// to the edges, and keeps every destination not visited before, once. One snapshot covers
+/// every hop. The hops run in the engine: no row is materialised, duplicates and visited
+/// nodes never leave it, and a capped hub costs its first `per_node_limit` edges, not the
+/// row.
+///
+/// - [`per_node_limit(m)`](Traverse::per_node_limit): at most the first `m` edges of each
+///   node, in qualifier order (edges to visited nodes count); the rest of the row is skipped
+///   with a seek.
+/// - [`hop_limit(n)`](Traverse::hop_limit): at most `n` new nodes per hop, the ones whose
+///   first edge comes first in that order. Deterministic, not a sample.
+/// - [`max_nodes(t)`](Traverse::max_nodes): at most `t` nodes visited in all, the seeds
+///   included; 10,000,000 by default. The visited set is held in memory, about (key length
+///   + 48) bytes per node.
+///
+/// ```
+/// use pigeonhole::{Family, KeySet, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+/// g.mutate(b"a").put("out", b"b", b"").put("out", b"c", b"").commit()?;
+/// g.mutate(b"b").put("out", b"a", b"").put("out", b"d", b"").commit()?;
+/// g.mutate(b"c").put("out", b"d", b"").commit()?;
+///
+/// let t = g.traverse(&KeySet::from_unsorted([b"a"])).family("out").hops(2).parents(true).run()?;
+/// let hops = t.hops();
+/// assert_eq!(hops[0].nodes().iter().collect::<Vec<_>>(), [&b"b"[..], b"c"]);
+/// // `a` was visited, and `d` is reached from `b` first (b sorts before c).
+/// assert_eq!(hops[1].nodes().iter().collect::<Vec<_>>(), [&b"d"[..]]);
+/// assert_eq!(hops[1].parents(), Some(&[0][..]));
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "a traversal does nothing until .run()"]
+pub struct Traverse<'t> {
+    core: &'t TableCore,
+    seeds: KeySet,
+    sel: Selection,
+    hops: u32,
+    per_node_limit: u32,
+    hop_limit: u64,
+    max_nodes: u64,
+    parents: bool,
+    parallelism: usize,
+}
+
+impl<'t> Traverse<'t> {
+    pub(crate) fn new(core: &'t TableCore, seeds: &KeySet) -> Self {
+        Self {
+            core,
+            seeds: seeds.clone(),
+            sel: Selection::new(),
+            hops: 1,
+            per_node_limit: 0,
+            hop_limit: 0,
+            max_nodes: pigeonhole_engine::DEFAULT_MAX_NODES,
+            parents: false,
+            parallelism: 1,
+        }
+    }
+
+    selection_methods!();
+
+    /// Hops to take, 1 to 64 (default 1).
+    pub fn hops(mut self, n: u32) -> Self {
+        self.hops = n;
+        self
+    }
+
+    /// At most `m` edges read from each node per hop, in qualifier order (0: all, the
+    /// default).
+    pub fn per_node_limit(mut self, m: u32) -> Self {
+        self.per_node_limit = m;
+        self
+    }
+
+    /// At most `n` new nodes per hop (0: all, the default).
+    pub fn hop_limit(mut self, n: u64) -> Self {
+        self.hop_limit = n;
+        self
+    }
+
+    /// At most `t` nodes visited in all, the seeds included (default 10,000,000;
+    /// `u64::MAX` for no limit).
+    pub fn max_nodes(mut self, t: u64) -> Self {
+        self.max_nodes = t;
+        self
+    }
+
+    /// Record, for each node, which node of the previous hop reached it ([`Hop::parents`]).
+    pub fn parents(mut self, on: bool) -> Self {
+        self.parents = on;
+        self
+    }
+
+    /// Read each hop on up to `n` threads owned by the call, when the frontier spans
+    /// several tablets and has at least 1,000 keys per thread (default 1).
+    pub fn parallel(mut self, n: usize) -> Self {
+        self.parallelism = n.max(1);
+        self
+    }
+
+    /// Runs the traversal. The edge family must be selected, and only it
+    /// (`InvalidArgument` otherwise); empty seeds give no hops.
+    pub fn run(mut self) -> Result<Traversal> {
+        if self.sel.ends.len() != 1 {
+            return Err(crate::Error::new(
+                crate::ErrorCode::InvalidArgument,
+                "a traversal reads exactly one edge family: select it with .family()",
+            ));
+        }
+        let (_, snapshot, families) = self.sel.start(self.core)?;
+        let mut spec = pigeonhole_engine::TraverseSpec::new(families[0]);
+        spec.hops = self.hops;
+        spec.per_node_limit = self.per_node_limit;
+        spec.hop_limit = self.hop_limit;
+        spec.max_nodes = self.max_nodes;
+        spec.read = self.sel.spec.clone();
+        spec.parallelism = self.parallelism;
+        let t = self
+            .core
+            .with(|e| e.traverse(&snapshot, self.core.info.id, &self.seeds, &spec))?;
+        let parents = self.parents;
+        Ok(Traversal {
+            hops: t
+                .hops
+                .into_iter()
+                .map(|h| Hop {
+                    nodes: h.nodes,
+                    parents: parents.then_some(h.parents),
+                })
+                .collect(),
+            stats: TraverseStats {
+                rows: t.stats.rows,
+                edges: t.stats.edges,
+                hops_cut: t.stats.hops_cut,
+                cut_by_max_nodes: t.stats.cut_by_max_nodes,
+            },
+        })
+    }
+}
+
+/// A traversal's result ([`Traverse::run`]): its hops, in order. There are fewer than asked
+/// when a frontier ran empty or `max_nodes` was reached.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Traversal {
+    hops: Vec<Hop>,
+    stats: TraverseStats,
+}
+
+impl Traversal {
+    /// The hops: hop 1 first.
+    pub fn hops(&self) -> &[Hop] {
+        &self.hops
+    }
+
+    /// Counts.
+    pub fn stats(&self) -> TraverseStats {
+        self.stats
+    }
+}
+
+/// One hop's new nodes ([`Traversal::hops`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Hop {
+    nodes: KeySet,
+    parents: Option<Vec<u32>>,
+}
+
+impl Hop {
+    /// The nodes first reached at this hop, sorted: ready for the next read
+    /// ([`Table::keys`](crate::Table::keys), say).
+    pub fn nodes(&self) -> &KeySet {
+        &self.nodes
+    }
+
+    /// With [`Traverse::parents`]: for each node, the index in the previous hop's nodes (the
+    /// seeds for the first hop) of the source of the first edge that reached it, enough to
+    /// rebuild one shortest path per node.
+    pub fn parents(&self) -> Option<&[u32]> {
+        self.parents.as_deref()
+    }
+}
+
+/// Counts of a traversal ([`Traversal::stats`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TraverseStats {
+    /// Frontier rows with an edge the selection keeps.
+    pub rows: u64,
+    /// Edges read.
+    pub edges: u64,
+    /// Hops that `hop_limit` or `max_nodes` cut short.
+    pub hops_cut: u32,
+    /// Whether `max_nodes` cut the traversal short.
+    pub cut_by_max_nodes: bool,
+}
+
 /// Reads the cells of the key `cursor` is on into `buf` (cleared first).
 fn fill_key(cursor: &mut KeyCursor, buf: &mut RowBuf) -> Result<()> {
     buf.clear();

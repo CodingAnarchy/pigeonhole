@@ -3509,3 +3509,36 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Checks.**
 - `it/snapshot_room.rs`: 8 snapshots held across 8 flushes on a 64-slot shard, then 4 more rounds of writes to every slot. It fails on the old geometry at round 2 with the write-stall timeout.
 - Tests that hard-coded the old geometry keep their intent: `milestone_b` (no freeze), `api` (a batch larger than the whole arena), `read_only_fallback` (nothing flushed before the crash), and `pigeonhole`'s `processes` (a reader process's held snapshot gets room for its 3,510 rows).
+
+<a id="d304"></a>
+## D304 — Traversal pushdown: breadth-first hops run in the engine, each a bounded read of the frontier (perf287, 2026-10-31; owner accepted revision 2, #489 c6544597002, c6544636857, c6544708521; reviewed by simp724 and cli692; engine, pigeonhole, #489 item 3, ICR 0099; on D296 and D299)
+**Why.** A BFS over adjacency rows was a client loop over `keys()`: every edge was materialised and copied into the client's neighbour list, duplicates and visited nodes included, and a hub could not be capped without reading it whole (283 ms and 824 MB for a 2M-edge hub through `read()`).
+
+**Decided.**
+- **Model.** A node is a row, its edges are the columns of one family, and an edge's qualifier is the destination's row key. Every qualifier is a valid row key, since both are limited to 64 KiB.
+- **`Table::traverse(&KeySet)`**, with the edge family, the edge selection, `hops`, `per_node_limit`, `hop_limit`, `max_nodes` (default 10,000,000, the seeds included; owner), `parents` and `parallel`, returns per-hop nodes (`KeySet`s) and optional parent indexes. Its semantics are exact at a snapshot:
+  - one snapshot for all hops;
+  - per hop, the frontier's rows in key order and each row's newest versions in qualifier order;
+  - the first `per_node_limit` edges per row, visited destinations included, after which the rest of the row is skipped by a seek;
+  - each destination not visited before kept once, ranked by its first edge;
+  - at most `hop_limit` new nodes per hop (the first in that ranking) and `max_nodes` in all.
+
+  Empty seeds give no hops.
+- **Engine.** Each hop is `reduce_into` over D296's `Keys` input, which is D299's multi-get cursor per tablet:
+  - `EdgeVisitor` emits the source's index in the frontier and returns `EmitAndNextRow` at the cap;
+  - `DedupeLimit` keeps destination → smallest source index, borrowing the qualifier for the visited and kept checks. It stops a group at its (n+1)-th distinct destination, and merges by union, then the n smallest (source, destination), which is commutative and associative;
+  - `into_nodes()` returns the next frontier and the parents without a `CellKey`.
+
+  §2.3 of the note (with rev 2's two cases) shows local stops keep `hop_limit` exact under fan-out. The visited set is held in memory, about (key length + 48) B per node. It grows in place between hops, with a debug assertion that no clone outlives a hop.
+- **Fan-out:** `parallel(n)` over the frontier's tablets, past 1,000 keys per thread.
+- **PR 2:** `run_async`, which polls the multi-get cursor with a 4,096-cell budget per poll.
+
+**Checks.**
+- `tests/traverse.rs`: a client BFS over `keys()` implementing the semantics independently, on a graph with hubs, self-loops, deletes of every scope, several SSTs and levels, and tablets on two shards. Every limit alone and combined, the edge selection, parents and stats, `parallel(4)`, and the argument errors are all checked.
+- The engine's `it/traverse.rs`: fan-out (asserted) equals the sequential traversal, hop by hop and parent by parent.
+- `DedupeLimit`'s unit test: any cut into groups, merged in any order, equals the sequential result.
+- `alloc.rs`: a hop's allocations don't grow with edges (450 calls for 4,000 and for 40,000 edges with no new node), nor with a capped hub's size (508 calls for 2,000 and 20,000 edges at `per_node_limit(100)`).
+- **The pigeonhole model:** a two-hop traversal from each multi-get's keys against a BFS over the model's rows, under faults and concurrent changes.
+  - The workload's qualifiers (`q…`) never name rows (`row…`), so there it checks hop 1's limits, dedupe and ranking.
+  - Multi-hop is checked by the integration and engine tests. A graph-shaped workload family would change every seed's RNG stream; that can come with D304 PR 2 if wanted.
+
