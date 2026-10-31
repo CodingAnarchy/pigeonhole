@@ -14,9 +14,10 @@ use crate::{ModelOp, Rng};
 /// model's [`ModelFamily::counter`](crate::ModelFamily::counter)), and one starting with
 /// `min`, `max` or `hll` an aggregate family of D294
 /// ([`aggregation_of_name`](crate::aggregation_of_name)): the same writes, some at the fixed
-/// counter timestamp and some at bucket timestamps (multiples of 4), except that an `hll`
-/// family gets inputs where the others get puts; if its name contains `ttl`, every put and
-/// `Incr` there takes a bucket timestamp (a counter family with a TTL refuses the fixed one).
+/// counter timestamp and some at bucket timestamps (multiples of 4), an `hll` family's puts
+/// being sketches of a few elements ([`hll_sketch`](crate::hll_sketch)); if its name
+/// contains `ttl`, every put and `Incr` there takes a bucket timestamp (a counter family with
+/// a TTL refuses the fixed one).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct WorkloadSpec {
@@ -241,9 +242,9 @@ impl Workload {
             };
         }
         let qualifier = self.qualifier();
-        // An HLL family takes inputs only: the model writes no sketch puts there.
+        // An HLL family's puts are sketches (of a few elements), its inputs elements.
         let hll = crate::aggregation_of_name(&family) == Some(crate::ModelAggregation::Hll);
-        if counter && (hll || self.rng.chance(800_000)) {
+        if counter && self.rng.chance(if hll { 850_000 } else { 800_000 }) {
             let delta = self.rng.below(2001) as i64 - 1000;
             let ts = if sum { self.sum_ts(&family) } else { None };
             return ModelOp::Incr {
@@ -260,7 +261,9 @@ impl Workload {
         } else {
             self.rng.chance(150_000).then(|| self.recent_ts())
         };
-        let value = if counter {
+        let value = if hll {
+            self.sketch()
+        } else if counter {
             (self.rng.below(2001) as i64 - 1000).to_le_bytes().to_vec()
         } else {
             self.value()
@@ -273,6 +276,13 @@ impl Workload {
             ts,
             value,
         }
+    }
+
+    /// A sketch of one to three elements, for an HLL family's put.
+    fn sketch(&mut self) -> Vec<u8> {
+        let n = 1 + self.rng.below(3);
+        let elements: Vec<i64> = (0..n).map(|_| self.rng.below(2001) as i64 - 1000).collect();
+        crate::hll_sketch(elements).expect("at least one element")
     }
 
     /// A mutation to the same column as `prev` that collides with it: same timestamp (the
@@ -310,10 +320,9 @@ impl Workload {
         let tick = (self.tick / 4 * 4).max(4);
         let sum_ts =
             |rng: &mut Rng| (family.contains("ttl") || rng.chance(500_000)).then_some(tick);
-        // An HLL family takes inputs only (no puts), so its put case is an input too.
         let hll = crate::aggregation_of_name(&family) == Some(crate::ModelAggregation::Hll);
         match self.rng.below(6) {
-            n if counter && (n == 0 || (hll && n == 1)) => ModelOp::Incr {
+            0 if counter => ModelOp::Incr {
                 ts: if sum { sum_ts(&mut self.rng) } else { None },
                 table,
                 row,
@@ -327,7 +336,9 @@ impl Workload {
                 } else {
                     self.rng.chance(500_000).then_some(self.tick)
                 };
-                let value = if counter {
+                let value = if hll {
+                    self.sketch()
+                } else if counter {
                     7i64.to_le_bytes().to_vec()
                 } else {
                     self.value()

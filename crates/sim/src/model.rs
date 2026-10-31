@@ -71,11 +71,27 @@ impl ModelAggregation {
 /// `None` for no elements.
 pub fn hll_sketch(elements: impl IntoIterator<Item = i64>) -> Option<Vec<u8>> {
     let mut registers = [0u8; 4096];
+    add_elements(&mut registers, elements);
+    encode_registers(&registers)
+}
+
+/// The sketch `base` with `elements` merged into it, `None` if `base` is not a well-formed,
+/// canonical sketch (decoded here, apart from the store's code).
+pub fn hll_union(base: &[u8], elements: impl IntoIterator<Item = i64>) -> Option<Vec<u8>> {
+    let mut registers = decode_registers(base)?;
+    add_elements(&mut registers, elements);
+    encode_registers(&registers)
+}
+
+fn add_elements(registers: &mut [u8; 4096], elements: impl IntoIterator<Item = i64>) {
     for v in elements {
         let (i, r) = pigeonhole_format::hll::register_of(v);
         let slot = &mut registers[usize::from(i)];
         *slot = (*slot).max(r);
     }
+}
+
+fn encode_registers(registers: &[u8; 4096]) -> Option<Vec<u8>> {
     let set: Vec<(usize, u8)> = (0..4096)
         .filter(|&i| registers[i] != 0)
         .map(|i| (i, registers[i]))
@@ -102,6 +118,37 @@ pub fn hll_sketch(elements: impl IntoIterator<Item = i64>) -> Option<Vec<u8>> {
     }
     out.extend_from_slice(&bits);
     Some(out)
+}
+
+/// The registers of a well-formed, canonical sketch (FORMAT §3.1), `None` otherwise: the
+/// bytes must be exactly what [`encode_registers`] writes for them.
+fn decode_registers(s: &[u8]) -> Option<[u8; 4096]> {
+    let mut registers = [0u8; 4096];
+    match s {
+        [1, 12, 0, 0, entries @ ..] if !entries.is_empty() && entries.len() % 4 == 0 => {
+            for e in entries.chunks(4) {
+                let e = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                let (i, r) = ((e >> 8) as usize, e as u8);
+                if i >= 4096 || r == 0 || r > 53 {
+                    return None;
+                }
+                registers[i] = r;
+            }
+        }
+        [1, 12, 1, 0, bits @ ..] if bits.len() == 3072 => {
+            for (i, slot) in registers.iter_mut().enumerate() {
+                for b in 0..6 {
+                    let bit = 6 * i + b;
+                    *slot |= (bits[bit / 8] >> (bit % 8) & 1) << b;
+                }
+                if *slot > 53 {
+                    return None;
+                }
+            }
+        }
+        _ => return None,
+    }
+    (encode_registers(&registers).as_deref() == Some(s)).then_some(registers)
 }
 
 /// The aggregation of the test families named by convention ([`WorkloadSpec`]): a name
@@ -486,10 +533,21 @@ impl Model {
             .collect();
         for (i, (op, collapsed)) in ops.iter().zip(collapsed).enumerate() {
             if !collapsed {
+                let combined = elements.get(&i);
+                if let (ModelOp::Put { value, .. }, Some(extra)) = (op, combined) {
+                    // An HLL put that later inputs of its cell combined into: one put of the
+                    // union, as the store logs it.
+                    let mut put = op.clone();
+                    if let ModelOp::Put { value: v, .. } = &mut put {
+                        *v = hll_union(value, extra.iter().copied()).expect("a validated sketch");
+                    }
+                    self.apply(&put, commit_ts, seqno);
+                    continue;
+                }
                 self.apply(op, commit_ts, seqno);
                 // An HLL input that combined later inputs of its cell: theirs too, as one
                 // operand (the same seqno).
-                for &e in elements.get(&i).into_iter().flatten() {
+                for &e in combined.into_iter().flatten() {
                     let mut more = op.clone();
                     if let ModelOp::Incr { delta, .. } = &mut more {
                         *delta = e;
@@ -529,9 +587,16 @@ impl Model {
             ModelOp::Incr { .. } if f.counter => Ok(()),
             ModelOp::Incr { ts: Some(_), .. } => refused(),
             ModelOp::Incr { .. } if !f.i64_add => Err(ModelError::NoMergeOperator(family.clone())),
-            // The model writes no sketch puts into an HLL family (the store takes only
-            // well-formed sketches there; the workload writes inputs).
-            ModelOp::Put { .. } if f.counter && f.aggregation == ModelAggregation::Hll => refused(),
+            // An HLL family takes puts of a well-formed, canonical sketch only (D294).
+            ModelOp::Put { ts, value, .. }
+                if f.counter && f.aggregation == ModelAggregation::Hll =>
+            {
+                if decode_registers(value).is_none() || fixed_with_ttl(ts) {
+                    refused()
+                } else {
+                    Ok(())
+                }
+            }
             ModelOp::Put { ts, value, .. }
                 if f.counter && (value.len() != 8 || fixed_with_ttl(ts)) =>
             {
@@ -1384,12 +1449,12 @@ fn resolve_counter(
     let agg = family.aggregation;
     let version = |group: &[&Entry]| -> Option<Vec<u8>> {
         if agg == ModelAggregation::Hll {
-            // The elements newer than the newest put; the model writes no HLL puts.
+            // The elements newer than the newest put, merged into that put's sketch.
             let mut elements = Vec::new();
             for e in group {
                 match &e.kind {
                     Kind::Merge(d) => elements.push(*d),
-                    Kind::Put(_) => return None,
+                    Kind::Put(v) => return hll_union(v, elements),
                     _ => {}
                 }
             }
@@ -1455,7 +1520,7 @@ pub fn combine_counter_writes(
 }
 
 /// [`combine_counter_writes`], with the elements of the HLL inputs combined into an earlier
-/// one, by the index of that one in the returned ops.
+/// input or put of their cell, by the index of that one in the returned ops.
 pub fn combine_aggregate_writes(
     ops: &[ModelOp],
     aggregation: impl Fn(&str, &str) -> Option<ModelAggregation>,
