@@ -70,6 +70,9 @@ pub fn key(data: &[u8]) {
     }
     let _ = value::decode_value(data);
     let _ = value::BlobPointer::decode(data);
+    // The vector decoder behind its tag (D303), and a vector family's parameters.
+    let _ = value::decode_value(&[&[0x04], data].concat());
+    let _ = pigeonhole_format::vector::Params::parse(data);
     let _ = varint::get_u64(data);
     let _ = varint::get_u32(data);
     let _ = varint::get_bytes(data);
