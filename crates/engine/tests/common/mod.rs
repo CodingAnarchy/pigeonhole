@@ -541,13 +541,15 @@ pub struct Stats {
     /// Reads at a held snapshot checked against the model rebuilt for its view, because a
     /// compaction published after it purged something (`World::model_at`).
     pub reads_at_older_views: usize,
-    /// Puts in acknowledged commits with a value above the inline limit (`LARGE_VALUE`).
+    /// Puts in acknowledged commits with a value above the inline limit (`LARGE_VALUE`),
+    /// into families whose values may be separated (not an aggregate family's).
     pub large_puts: usize,
-    /// Blob files seen in the catalog after those commits: values separated at commit time
-    /// (#230) and blob GC's rewrites of them. Flushes never separate model values (the
-    /// families' blob threshold is far above them), so none exists without a commit-time
-    /// separation (#306).
-    pub blob_files: usize,
+    /// Values the engine separated into blob files at commit time (#230), summed across
+    /// reopens (`Engine::commit_separations`): the path a deferred run must take as a plain
+    /// one does (#306). A direct count, so no flush, compaction or blob GC file is in it
+    /// (#1233: the blob files a catalog showed mixed those in, and missed commit-time files
+    /// dropped before an ack was handled).
+    pub commit_separations: u64,
 }
 
 /// What kind of divergence the checker saw.
@@ -1086,10 +1088,55 @@ impl Store {
 /// The payload length above which `Store::open_cfg` separates values at commit time.
 const LARGE_VALUE: usize = 120;
 
-/// Puts in `ops` with a value above [`LARGE_VALUE`].
+/// Puts in `ops` with a value above [`LARGE_VALUE`] into a family whose values may be
+/// separated (an aggregate family's stay inline), and that the commit keeps: a later write
+/// of the same column at the same timestamp in the commit replaces it, so it is never
+/// applied or separated (D34; #1233, seed 265's put and column delete).
 fn large_puts(ops: &[ModelOp]) -> usize {
+    /// Table, row, family, qualifier and timestamp (`None`: the commit's).
+    type Slot<'a> = (&'a str, &'a [u8], &'a str, &'a [u8], Option<u64>);
+    // The column and timestamp a write takes in a commit.
+    fn slot(op: &ModelOp) -> Option<Slot<'_>> {
+        match op {
+            ModelOp::Put {
+                table,
+                row,
+                family,
+                qualifier,
+                ts,
+                ..
+            }
+            | ModelOp::Incr {
+                table,
+                row,
+                family,
+                qualifier,
+                ts,
+                ..
+            } => Some((table, row, family, qualifier, *ts)),
+            ModelOp::DeleteCell {
+                table,
+                row,
+                family,
+                qualifier,
+                ts,
+            } => Some((table, row, family, qualifier, Some(*ts))),
+            ModelOp::DeleteColumn {
+                table,
+                row,
+                family,
+                qualifier,
+            } => Some((table, row, family, qualifier, None)),
+            _ => None,
+        }
+    }
     ops.iter()
-        .filter(|op| matches!(op, ModelOp::Put { value, .. } if value.len() > LARGE_VALUE))
+        .enumerate()
+        .filter(|(i, op)| {
+            matches!(op, ModelOp::Put { family, value, .. }
+                if value.len() > LARGE_VALUE && !is_aggregate(family))
+                && !ops[i + 1..].iter().any(|later| slot(later) == slot(op))
+        })
         .count()
 }
 
@@ -1613,8 +1660,9 @@ struct World {
     /// The commit's ops are kept beside them: a seqno a crash freed can come back for
     /// another commit, which must not take these owners.
     ack_owners: HashMap<Seqno, (Vec<ModelOp>, Vec<Option<u16>>)>,
-    /// Blob files seen in the catalog after a commit with a large value (`Stats::blob_files`).
-    blob_files_seen: HashSet<(FamilyId, u32)>,
+    /// The open engine's `commit_separations` as last read, and which engine that was
+    /// (`Stats::commit_separations`, summed across reopens).
+    separations_seen: (usize, u64),
     /// Bottommost compactions applied to the model, by manifest version.
     purges: Vec<PurgeEvent>,
     /// Compactions reported by the engine whose manifest version is not published yet.
@@ -1677,7 +1725,7 @@ impl World {
             decided_ids: HashMap::new(),
             revert_aliases: true,
             ack_owners: HashMap::new(),
-            blob_files_seen: HashSet::new(),
+            separations_seen: (0, 0),
             purges: Vec::new(),
             pending_purges: Vec::new(),
             compaction_floor: 0,
@@ -1747,30 +1795,32 @@ impl World {
         out
     }
 
-    /// Counts an acknowledged commit's large puts and the blob files that appeared for them
-    /// (`Stats::large_puts`, `Stats::blob_files`).
+    /// Counts an acknowledged commit's large puts, and the commit-time separations since the
+    /// last look (`Stats::large_puts`, `Stats::commit_separations`).
     fn note_separations(&mut self, large: usize) {
-        if large == 0 {
-            return;
-        }
         self.stats.large_puts += large;
-        self.note_blob_files();
+        self.note_commit_separations();
     }
 
-    /// Counts the blob files in the catalog not seen before (`Stats::blob_files`). Called at
-    /// every step as well as at each acknowledged large put: with deferred I/O an ack is
-    /// handled later, and by then a compaction or blob GC may have dropped a file the
-    /// commit separated into (its value overwritten), which an ack-time look alone missed
-    /// (#1233, seed 190). No draws, so every seed runs as before.
-    fn note_blob_files(&mut self) {
+    /// Adds the open engine's commit-time separations since the last look to
+    /// `Stats::commit_separations`. A reopened engine counts from 0. Called at every step as
+    /// well as at each ack, so few are lost to a crash. No draws: every seed runs as before.
+    fn note_commit_separations(&mut self) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        for (family, id, ..) in store.engine.blob_files() {
-            if self.blob_files_seen.insert((family, id)) {
-                self.stats.blob_files += 1;
-            }
-        }
+        let engine = Arc::as_ptr(&store.engine) as usize;
+        let now = store.engine.commit_separations();
+        let (seen, last) = self.separations_seen;
+        // A reopened engine may take the dropped one's address: one whose count went down
+        // is a new engine too.
+        let since = if seen == engine && now >= last {
+            now - last
+        } else {
+            now
+        };
+        self.stats.commit_separations += since;
+        self.separations_seen = (engine, now);
     }
 
     fn trace_on(&self) -> bool {
@@ -5038,7 +5088,7 @@ impl World {
             eprintln!("op #{} {op:?}", self.op_index);
         }
         self.vfs.advance(1_000);
-        self.note_blob_files();
+        self.note_commit_separations();
         if self.cfg.tablet_changes && !self.alive() {
             // An armed crash fired in the background (a flush, a compaction, or a tablet
             // change running while the workload goes on): recover before going on, whatever

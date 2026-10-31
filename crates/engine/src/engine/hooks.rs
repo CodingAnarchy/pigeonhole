@@ -225,6 +225,9 @@ pub(crate) struct Hooks {
     /// Threads that parked in `manifest::commit_req_from_thread`, counted after their last
     /// look and just before `park` (`Engine::manifest_thread_parks`).
     pub manifest_thread_parks: AtomicUsize,
+    /// Values `large::separate` wrote to a blob file at commit time (#230, #306;
+    /// `Engine::commit_separations`).
+    pub commit_separations: AtomicU64,
     /// Parks background manifest commits before `end` (`manifest::parked`,
     /// `Engine::park_manifest_commits`), and the parked pump's waker.
     pub manifest_park: AtomicBool,
@@ -1498,6 +1501,18 @@ impl Engine {
             .hooks
             .manifest_thread_parks
             .load(Ordering::Acquire)
+    }
+
+    /// Values separated into blob files at commit time since open (`large::separate`, #230):
+    /// the commit-time separation path a deferred run must take as a plain one does (#306;
+    /// test hook).
+    #[doc(hidden)]
+    pub fn commit_separations(&self) -> u64 {
+        self.inner
+            .shared
+            .hooks
+            .commit_separations
+            .load(Ordering::Relaxed)
     }
 
     /// Whether a manifest pump's root commit is in flight, not yet completed (test hook).
