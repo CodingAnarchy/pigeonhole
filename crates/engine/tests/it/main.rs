@@ -91,6 +91,7 @@ mod spin_pool_terms;
 mod stall_backoff;
 mod stall_deadline;
 mod sync_faults;
+mod vector_family;
 mod vote_on_append;
 mod wal_pin;
 mod wal_spares_steps;

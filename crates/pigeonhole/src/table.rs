@@ -284,7 +284,7 @@ impl TableCore {
             Operand::Bytes => "aggregate_bytes",
         };
         let (what, method) = match kind {
-            K::Standard => {
+            K::Standard | K::Vector => {
                 return Err(Error::new(
                     ErrorCode::InvalidArgument,
                     format!(

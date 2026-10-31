@@ -18,6 +18,9 @@ pub enum ValueTag {
     F64 = 0x02,
     /// A zigzag LEB128 signed integer.
     Varint = 0x03,
+    /// A vector ([`crate::vector`], D303): element, `dim` varint, payload. Only in a vector
+    /// family.
+    Vector = 0x04,
     /// A 16-byte [`BlobPointer`]; the bytes live in a blob extent.
     Blob = 0x80,
 }
@@ -33,6 +36,8 @@ pub enum ValueRef<'a> {
     F64(f64),
     /// A varint-encoded signed integer.
     Varint(i64),
+    /// A vector.
+    Vector(crate::vector::VectorRef<'a>),
     /// A pointer to a separated blob.
     Blob(BlobPointer),
 }
@@ -63,6 +68,10 @@ pub fn encode_value(out: &mut Vec<u8>, value: ValueRef<'_>) {
         ValueRef::Varint(v) => {
             out.push(ValueTag::Varint as u8);
             crate::varint::put_u64(out, ((v << 1) ^ (v >> 63)) as u64);
+        }
+        ValueRef::Vector(v) => {
+            out.push(ValueTag::Vector as u8);
+            v.encode(out);
         }
         ValueRef::Blob(p) => {
             out.push(ValueTag::Blob as u8);
@@ -96,6 +105,7 @@ pub fn decode_value(stored: &[u8]) -> crate::Result<ValueRef<'_>> {
             }
             Ok(ValueRef::Varint(((z >> 1) as i64) ^ -((z & 1) as i64)))
         }
+        0x04 => Ok(ValueRef::Vector(crate::vector::VectorRef::decode(payload)?)),
         0x80 => Ok(ValueRef::Blob(BlobPointer::decode(payload)?)),
         t => Err(Error::UnsupportedFeature {
             what: "value tag",
