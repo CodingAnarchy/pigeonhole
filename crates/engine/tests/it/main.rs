@@ -86,6 +86,7 @@ mod scalar_aggregates;
 mod scan_readahead_limit;
 mod shrink;
 mod smoke;
+mod snapshot_room;
 mod spin_pool_terms;
 mod stall_backoff;
 mod stall_deadline;
