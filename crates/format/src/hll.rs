@@ -2,9 +2,9 @@
 //!
 //! A sketch has 4096 registers (precision 12, about 1.6% standard error). An `i64` element
 //! is hashed with [`crate::checksum::xxh3_64`] (xxh3-64, seed 0: the format fixes it, so a
-//! change to that function breaks every sketch) over its 8 little-endian bytes: the top 12 bits pick the
-//! register, and the rank is one plus the leading zeros of the remaining 52 bits, at most
-//! 53. A register keeps the largest rank it has seen.
+//! change to that function breaks every sketch) over its 8 little-endian bytes: the top 12
+//! bits pick the register, and the rank is one plus the leading zeros of the remaining 52
+//! bits, at most 53. A register keeps the largest rank it has seen.
 //!
 //! **Encoding**, a 4-byte header then the registers:
 //!

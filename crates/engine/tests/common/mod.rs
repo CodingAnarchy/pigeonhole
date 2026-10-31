@@ -59,7 +59,7 @@ use pigeonhole_sim::{
     COUNTER_TS, CommitStreams, Model, ModelAggregation, ModelCell, ModelFamily, ModelOp,
     ModelPurge, Op, Rng, Sim, Step, StreamCommit, StreamRecord, Workload, WorkloadSpec,
     aggregation_of_name, check_acknowledged_survive, combine_aggregate_writes, hll_sketch,
-    recovered_from_records,
+    hll_union, recovered_from_records,
 };
 
 pub const TABLE: &str = "t";
@@ -1023,12 +1023,23 @@ fn large_puts(ops: &[ModelOp]) -> usize {
 
 /// A put's value as the recovery oracle compares it: itself, or for a value above
 /// [`LARGE_VALUE`] (logged as a blob pointer when separated at commit time) its length.
+/// The value a put leaves in the WAL and the store: its own, or in an HLL family the union
+/// of its sketch with the elements of the cell's later inputs it combined (D294).
+fn put_value(family: &str, value: &[u8], combined: Option<&Vec<i64>>) -> Vec<u8> {
+    match combined {
+        Some(elements) if is_hll(family) => record_value(
+            &hll_union(value, elements.iter().copied()).expect("a well-formed sketch put"),
+        ),
+        _ => record_value(value),
+    }
+}
+
 /// The value an `Incr` leaves in the WAL and the store: its delta, or in an HLL family the
 /// sketch of its element and the elements of the cell's later inputs it combined (D294).
-fn incr_value(family: &str, delta: i64, combined: Option<&Vec<i64>>) -> Vec<u8> {
+fn incr_bytes(family: &str, delta: i64, combined: Option<&Vec<i64>>) -> Vec<u8> {
     if is_hll(family) {
         let elements = std::iter::once(delta).chain(combined.into_iter().flatten().copied());
-        record_value(&hll_sketch(elements).expect("one element"))
+        hll_sketch(elements).expect("one element")
     } else {
         delta.to_le_bytes().to_vec()
     }
@@ -2212,7 +2223,7 @@ impl World {
                         row.clone(),
                         qualifier.clone(),
                         ts,
-                        record_value(value),
+                        put_value(family, value, elements.get(&i)),
                     ));
                 }
                 ModelOp::Incr {
@@ -2231,7 +2242,7 @@ impl World {
                         row.clone(),
                         qualifier.clone(),
                         ts,
-                        incr_value(family, *delta, elements.get(&i)),
+                        record_value(&incr_bytes(family, *delta, elements.get(&i))),
                     ));
                 }
                 ModelOp::DeleteCell {
@@ -3359,7 +3370,13 @@ impl World {
                     row,
                     qualifier,
                     ts.unwrap_or(default_ts(family, commit_ts)),
-                    value.clone(),
+                    match elements.get(&i) {
+                        // An HLL put that later inputs of its cell combined into (D294).
+                        Some(e) if is_hll(family) => {
+                            hll_union(value, e.iter().copied()).expect("a well-formed sketch put")
+                        }
+                        _ => value.clone(),
+                    },
                 ),
                 ModelOp::Incr {
                     row,
@@ -3374,7 +3391,7 @@ impl World {
                     row,
                     qualifier,
                     ts.unwrap_or(default_ts(family, commit_ts)),
-                    incr_value(family, *delta, elements.get(&i)),
+                    incr_bytes(family, *delta, elements.get(&i)),
                 ),
                 ModelOp::DeleteCell {
                     row,
