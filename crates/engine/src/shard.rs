@@ -2101,6 +2101,33 @@ impl MemSlot {
         })
     }
 
+    /// [`MemSlot::set`] for a view publish (#1228): `current`, the slot's set in the view
+    /// being replaced, if it still lists exactly the slot's unflushed memtables, in order
+    /// (the same memtables, compared by their pins, under the same #131 filter), else a new
+    /// set. A reader is a live handle on its memtable, so an unchanged set reads exactly as
+    /// a rebuilt one would. Taking it from the view, not a copy the slot keeps, leaves every
+    /// pin to the views alone: a memtable a manifest commit dropped from the view
+    /// (`ShardMems::without`) is released as before.
+    fn published_set(
+        &self,
+        shard: ShardId,
+        flushed: &HashSet<(u16, u32)>,
+        current: Option<&Arc<MemSet>>,
+    ) -> Arc<MemSet> {
+        if let Some(c) = current {
+            let mut now = self.unflushed(shard, flushed);
+            let same = c
+                .readers
+                .iter()
+                .all(|r| now.next().is_some_and(|m| r.reads(&m.table)))
+                && now.next().is_none();
+            if same {
+                return Arc::clone(c);
+            }
+        }
+        self.set(shard, flushed)
+    }
+
     /// The readers of the memtables not yet in SSTs, active first.
     fn readers(&self, shard: ShardId, flushed: &HashSet<(u16, u32)>) -> Vec<MemtableReader> {
         self.unflushed(shard, flushed)
@@ -3953,14 +3980,23 @@ impl ShardState {
     fn publish_memtables(&mut self) -> Result<()> {
         self.view_dirty = false;
         let i = usize::from(self.id.0);
-        let this = &*self;
-        this.shared.publish_view(&[], |current, version| {
+        let (shared, id, memtables) = (&self.shared, self.id, &self.memtables);
+        shared.publish_view(&[], |current, version| {
             // Built under the publish lock: built before it, the piece could miss a manifest
             // commit that published the SST of one of these memtables in between, and put
-            // the memtable back beside its SST (issue #131).
-            let piece = Arc::new(ShardMems {
-                map: this.mem_sets().into_iter().collect(),
+            // the memtable back beside its SST (issue #131). A slot whose memtables are
+            // unchanged keeps the current view's set (#1228).
+            let prev = current.mems.get(i);
+            let map = shared.flushed_roots.read(|flushed| {
+                memtables
+                    .iter()
+                    .map(|(k, slot)| {
+                        let cur = prev.and_then(|p| p.map.get(k));
+                        (*k, slot.published_set(id, flushed, cur))
+                    })
+                    .collect()
             });
+            let piece = Arc::new(ShardMems { map });
             let mut mems = current.mems.clone();
             if i < mems.len() {
                 mems[i] = piece;
@@ -3973,7 +4009,7 @@ impl ShardState {
                 mems,
                 ssts: Arc::clone(&current.ssts),
                 _pin: Some(crate::snapshot::ViewPin::new(
-                    &this.shared.live_views,
+                    &shared.live_views,
                     current.manifest_version,
                 )),
                 released: false,
