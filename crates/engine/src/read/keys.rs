@@ -461,6 +461,7 @@ impl KeyCursor {
     /// more than 64 fetches, the rest is read synchronously (counted), as an async scan does
     /// (D196).
     pub fn poll_next_key(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<usize>>> {
+        let _poll = pigeonhole_io::async_poll_scope();
         let mut nb = self.nb.take().unwrap_or_default();
         self.current = None;
         let out = loop {
@@ -481,10 +482,14 @@ impl KeyCursor {
                     continue;
                 }
                 if nb.in_flight.iter().any(|f| f.0 <= i) {
-                    // Poll the reads waited on once more, as the last thing before `Pending`
-                    // (as a scan returns right after its poll): if anything since the first
-                    // poll parked this thread, it used up a wake that arrived meanwhile, and
-                    // an executor that parks would sleep for ever (seen under deferred I/O).
+                    // Invariant: the wakers are registered last. Poll the reads waited on
+                    // once more, as the last thing before `Pending`, as a scan or a get
+                    // returns right after its one poll. The work since the first poll takes
+                    // the block cache's shard locks, and a contended std `RwLock` waits with
+                    // `Thread::park` where std has no futex (macOS and other non-Linux Unix,
+                    // its queue lock), using up an unpark a read's waker delivered meanwhile:
+                    // an executor that parks its thread on `Pending` then sleeps for ever
+                    // (#1226, seen with deferred I/O in the model test).
                     let waiting = nb.in_flight.len();
                     if let Err(e) = admit_arrived(&mut nb, &self.shared, cx) {
                         break Err(e);

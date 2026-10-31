@@ -443,6 +443,10 @@ impl<P, R: Send> Deferred<P, R> {
             if let Poll::Ready(r) = Self::poll_submit(slot, &mut cx) {
                 return r;
             }
+            debug_assert!(
+                !pigeonhole_io::in_async_poll(),
+                "a commit wait parks inside an async poll (a lost wake, #1226)"
+            );
             std::thread::park();
         }
     }
@@ -694,6 +698,10 @@ fn park_for_reply<T: Send>(
                     parked = true;
                     shared.commit_parks.fetch_add(1, Ordering::Relaxed);
                 }
+                debug_assert!(
+                    !pigeonhole_io::in_async_poll(),
+                    "a commit wait parks inside an async poll (a lost wake, #1226)"
+                );
                 std::thread::park();
             }
         }
@@ -788,6 +796,10 @@ pub(crate) fn wait_visible(
         if shared.visibility_ended() {
             return Err(Error::OutcomeUnknown);
         }
+        debug_assert!(
+            !pigeonhole_io::in_async_poll(),
+            "a commit wait parks inside an async poll (a lost wake, #1226)"
+        );
         std::thread::park();
     }
     Ok(())
@@ -813,6 +825,10 @@ fn wait_visible_spinning(
         if shared.visibility_ended() {
             return Err(Error::OutcomeUnknown);
         }
+        debug_assert!(
+            !pigeonhole_io::in_async_poll(),
+            "a commit wait parks inside an async poll (a lost wake, #1226)"
+        );
         std::thread::park();
     }
     Ok(())
@@ -861,6 +877,7 @@ impl Future for PendingCommit {
     type Output = crate::Result<CommitInfo>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _poll = pigeonhole_io::async_poll_scope();
         let this = &mut *self;
         if this.deferred.is_some() {
             if forked(&this.sub.shared) {
@@ -972,6 +989,7 @@ impl Future for PendingCheck {
     type Output = crate::Result<(bool, Option<CommitInfo>)>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _poll = pigeonhole_io::async_poll_scope();
         let this = &mut *self;
         if this.deferred.is_some() {
             if forked(&this.shared) {

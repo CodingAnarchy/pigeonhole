@@ -460,6 +460,7 @@ impl Future for GetFuture {
     type Output = Result<Option<CellData>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _poll = pigeonhole_io::async_poll_scope();
         match &mut self.state {
             GetState::Done(r) => Poll::Ready(r.take().unwrap_or_else(|| {
                 Err(Error::InvalidArgument(
@@ -545,6 +546,7 @@ impl<S: RowSink + Clone + Unpin> Future for RowFuture<S> {
     type Output = Result<Option<S>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let _poll = pigeonhole_io::async_poll_scope();
         let this = &mut *self;
         let Some(sink) = this.sink.as_mut() else {
             return Poll::Ready(Err(Error::InvalidArgument(
