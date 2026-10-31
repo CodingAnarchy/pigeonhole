@@ -22,4 +22,4 @@ wal_files       0
 wal_records     0
 
 structure  severity    object  offset  message
-blob       corruption  1       262208  blob file 1: the record at 0: blob record: checksum mismatch
+blob       corruption  1       65600   blob file 1: the record at 0: blob record: checksum mismatch

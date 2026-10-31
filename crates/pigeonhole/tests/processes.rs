@@ -548,7 +548,10 @@ fn a_killed_writer_leaves_readers_serving_and_a_new_writer_expires_them() {
 fn a_reader_process_sees_commits_whole_and_its_snapshot_stays_put() {
     let _watchdog = Watchdog::new("a_reader_process_sees_commits_whole_and_its_snapshot_stays_put");
     let dir = Dir::new("commits");
-    let db = Pigeonhole::open(dir.db(), writer_options()).unwrap();
+    // The reader's held snapshot pins every memtable the writer retires after it (a reader
+    // process pins by view version), so the arena must hold all 3,510 rows: about 3.5 MiB
+    // of 1 KiB values, plus each chunk's lost tail (13% with D302's 4 KiB chunks here).
+    let db = Pigeonhole::open(dir.db(), writer_options().memtable_budget(8 << 20)).unwrap();
     let t = table(&db);
     let mut reader = Peer::spawn("reader", &dir.db());
     assert_eq!(reader.ask("snap"), "SNAP");

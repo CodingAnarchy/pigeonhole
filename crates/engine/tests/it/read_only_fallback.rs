@@ -204,8 +204,11 @@ fn a_read_only_open_takes_any_shard_count() {
 #[test]
 fn a_replay_that_does_not_fit_fails_read_only_open() {
     let vfs = crashed_db(5903, 1, 0, 0);
-    // More WAL than a small budget's arena holds.
+    // More WAL than a small budget's arena holds: nothing freezes, so all of it is left to
+    // replay (with D302's 16 KiB chunks an 8 KiB value fills a chunk, and the default freeze
+    // threshold would flush most of it first).
     let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
+    o.memtable_freeze_bytes = 16 << 20;
     o.merge_operators.register(Arc::new(Concat));
     let db = Engine::open(Path::new(DB), o).unwrap();
     let t = db.table("t").unwrap();

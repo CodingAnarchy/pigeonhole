@@ -3,4 +3,4 @@ source: crates/cli/tests/common/mod.rs
 expression: text
 ---
 {"phdb":1,"command":"check","path":"[DIR]/c.phdb","mode":"offline","result":"corrupt","corruption":1,"warnings":0,"info":0,"deep":false,"clean_shutdown":true,"file_bytes":[BYTES],"superblocks":2,"tables":1,"ssts":1,"sst_entries":200,"blob_files":1,"blob_records":0,"blob_pointers":0,"wal_files":0,"wal_records":0}
-{"structure":"blob","severity":"corruption","object":1,"offset":262208,"message":"blob file 1: the record at 0: blob record: checksum mismatch"}
+{"structure":"blob","severity":"corruption","object":1,"offset":65600,"message":"blob file 1: the record at 0: blob record: checksum mismatch"}
