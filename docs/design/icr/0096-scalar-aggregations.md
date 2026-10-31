@@ -45,3 +45,24 @@ D298 (#488): the owner's minimum set of further aggregations for 1.1.0, and the 
   - **pigeonhole-format:** `exact` (sum and mean/variance states: add, merge, validate, read; `MeanVar`, `StateError`); `FamilyKind::{SumF64, MeanVar}`.
   - **pigeonhole-compaction:** `ExactF64` (`SUM`, `MEAN_VAR`).
   - **pigeonhole-sim:** `exact_state`, `exact_state_valid`, `exact_merge`; `ModelAggregation::{SumF64, MeanVar}`, `is_state`, `state_of`, `state_valid`.
+
+## PR 3: histograms and quantiles
+- **pigeonhole:**
+  - `Aggregation::Histogram(HistogramParams)` and `Aggregation::Quantiles(QuantileParams)`, the first variants with parameters.
+  - `HistogramParams::new(impl Into<Vec<f64>>) -> Result<Self>` (finite, strictly increasing, 1 to 1023 bounds, never `-0.0`), `bounds()` and `bucket_of(x)`.
+  - `QuantileParams`: `Default` (7 mantissa bits, 2048 buckets), the builders `mantissa_bits(p)` and `max_buckets(n)`, and the getters `get_mantissa_bits()` and `get_max_buckets()`. Out-of-range values are refused when the family is created.
+  - Both are `Clone`, `Eq` and `Hash`, owned by `pigeonhole`.
+  - `CellRef::histogram_counts() -> Option<Vec<u64>>`, `quantile(q) -> Option<f64>` and `quantiles_count() -> Option<u64>`, and the same on `Cell`.
+  - `FamilyInfo::aggregation` carries the parameters back.
+  - **Behaviour:**
+    - Inputs come from `aggregate_f64`, and `put_f64` sets a cell. Histograms refuse NaN; quantiles refuse any non-finite input.
+    - `incr` and `aggregate(i64)` are refused.
+    - These families' values are never separated into blob files, whatever their `blob_threshold`.
+- **phdb:**
+  - `"aggregation": "histogram" | "quantiles"` and `"aggregation_params"` (`{"bounds": […]}`, `{"mantissa_bits", "max_buckets"}`) in the schema JSON, which `load` reads back;
+  - the shell's `create … name:histogram=b0,b1,…` and `name:quantiles[=p,n]`;
+  - a `\schema` column for the parameters.
+- **Internal crates:**
+  - **pigeonhole-format:** `buckets` (histogram and quantile states and parameters); `FamilyKind::{Histogram, Quantiles}`; `FamilyOptions::separation_threshold`.
+  - **pigeonhole-compaction:** `Buckets` (`histogram(bounds)`, `quantiles(params)`).
+  - **pigeonhole-sim:** `bucket_state`, `bucket_state_valid`, `MODEL_HISTOGRAM_BOUNDS`, `MODEL_QUANTILE_BITS`, `MODEL_QUANTILE_MAX`, and `ModelAggregation::{Histogram, Quantiles, finite_inputs}`.

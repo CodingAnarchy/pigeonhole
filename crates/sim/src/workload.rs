@@ -293,7 +293,18 @@ impl Workload {
             Some(A::BitXor) => (self.rng.next_u64() & self.rng.next_u64()) as i64,
             // Finite only, at magnitudes that cancel and span subnormals to near the range's
             // top, so the exact sum and the squares are exercised.
-            Some(A::SumF64 | A::MeanVar) => {
+            // A histogram's inputs straddle its bounds, infinities included.
+            Some(A::Histogram) => {
+                let x = match self.rng.below(8) {
+                    0 => f64::INFINITY,
+                    1 => f64::NEG_INFINITY,
+                    2 => -0.0,
+                    3 => 1.0,
+                    _ => (self.rng.below(2001) as f64 - 1000.0) / 4.0,
+                };
+                x.to_bits() as i64
+            }
+            Some(A::SumF64 | A::MeanVar | A::Quantiles) => {
                 let x = match self.rng.below(8) {
                     0 => -0.0,
                     1 => 1e300,

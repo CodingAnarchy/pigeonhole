@@ -1487,6 +1487,103 @@ fn exact_sum_and_mean_var_families() {
     }
 }
 
+/// D298 PR 3: a histogram family counts `f64` inputs in the buckets of its
+/// `HistogramParams`; a quantile family reads quantiles within 2^-p. Their parameters
+/// round-trip through `FamilyInfo`, bad ones are refused, and `incr` is refused.
+#[test]
+fn histogram_and_quantile_families() {
+    use pigeonhole::{HistogramParams, QuantileParams};
+    let db = db();
+    let bounds = HistogramParams::new([0.0, 10.0, 100.0]).unwrap();
+    let q = QuantileParams::default().mantissa_bits(6);
+    let t = db
+        .table("lat")
+        .unwrap()
+        .family(
+            "h",
+            Family::aggregate(Aggregation::Histogram(bounds.clone())),
+        )
+        .family("q", Family::aggregate(Aggregation::Quantiles(q)))
+        .create()
+        .unwrap();
+    let mut wb = db.write_batch();
+    for x in 1..=1000 {
+        let x = f64::from(x) / 4.0; // 0.25 to 250
+        wb.aggregate_f64(&t, b"r", "h", b"ms", x)
+            .aggregate_f64(&t, b"r", "q", b"ms", x);
+    }
+    wb.aggregate_f64(&t, b"r", "h", b"ms", f64::INFINITY);
+    wb.commit().unwrap();
+    let h = t.get(b"r", "h", b"ms").unwrap().unwrap();
+    // [-inf, 0): 0; [0, 10): 0.25..9.75 = 39; [10, 100): 40..399 = 360; [100, inf): 601 + inf.
+    assert_eq!(h.histogram_counts(), Some(vec![0, 39, 360, 602]));
+    assert_eq!(bounds.bucket_of(10.0), 2);
+    assert_eq!(bounds.bucket_of(-0.0), 1, "-0.0 shares 0.0's bucket (IEEE)");
+    let c = t.get(b"r", "q", b"ms").unwrap().unwrap();
+    assert_eq!(c.quantiles_count(), Some(1000));
+    for (qq, exact) in [(0.0, 0.25), (0.5, 125.0), (0.99, 247.5), (1.0, 250.0)] {
+        let got = c.quantile(qq).unwrap();
+        assert!(
+            (got - exact).abs() / exact <= 2f64.powi(-6),
+            "q {qq}: {got} vs {exact}"
+        );
+    }
+    assert_eq!(c.quantile(2.0), None);
+    // Parameters round-trip through FamilyInfo, and recreate the family.
+    assert_eq!(
+        t.family_info("h").unwrap().aggregation,
+        Some(Aggregation::Histogram(bounds))
+    );
+    let info = t.family_info("q").unwrap();
+    assert_eq!(info.aggregation, Some(Aggregation::Quantiles(q)));
+    let copy = db
+        .table("copy")
+        .unwrap()
+        .family("q", info.family.clone())
+        .create()
+        .unwrap();
+    assert_eq!(
+        copy.family_info("q").unwrap().aggregation,
+        Some(Aggregation::Quantiles(q))
+    );
+    // Refused: bad bounds at construction, bad quantile parameters at creation, incr, NaN.
+    for bad in [&[][..], &[1.0, 1.0], &[2.0, 1.0], &[f64::NAN], &[-0.0]] {
+        let err = HistogramParams::new(bad).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{bad:?}: {err}");
+    }
+    let err = db
+        .table("bad")
+        .unwrap()
+        .family(
+            "q",
+            Family::aggregate(Aggregation::Quantiles(
+                QuantileParams::default().max_buckets(4),
+            )),
+        )
+        .create()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    refused(
+        t.mutate(b"r").incr("h", b"ms", 1).commit(),
+        "is a histogram family: write its inputs with aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r").aggregate_f64("h", b"ms", f64::NAN).commit(),
+        "never NaN",
+    );
+    refused(
+        t.mutate(b"r")
+            .aggregate_f64("q", b"ms", f64::INFINITY)
+            .commit(),
+        "finite f64",
+    );
+}
+
 /// A family that names `pigeonhole.i64_add` without being a counter family reads and writes
 /// as 0.1.0 created them (D41): increments at the commit timestamp, folded across
 /// timestamps, and bytes on top of a counter fail at read.

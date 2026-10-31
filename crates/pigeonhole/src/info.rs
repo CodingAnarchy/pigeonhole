@@ -202,7 +202,7 @@ impl FamilyInfo {
             name: f.name.clone(),
             family: Family::from_engine(o.clone()),
             counter: o.kind == FamilyKind::Counter,
-            aggregation: crate::Aggregation::of_kind(o.kind),
+            aggregation: crate::Aggregation::of_options(o),
             max_versions: o.max_versions,
             ttl: (o.ttl_micros != 0).then(|| Duration::from_micros(o.ttl_micros)),
             bloom_bits: o.bloom_bits,

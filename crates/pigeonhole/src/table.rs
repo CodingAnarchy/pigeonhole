@@ -254,10 +254,21 @@ impl TableCore {
             Operand::Incr => matches!(kind, K::Standard | K::Counter),
             Operand::Aggregate => {
                 kind.is_aggregate()
-                    && !matches!(kind, K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar)
+                    && !matches!(
+                        kind,
+                        K::MinF64
+                            | K::MaxF64
+                            | K::SumF64
+                            | K::MeanVar
+                            | K::Histogram
+                            | K::Quantiles
+                    )
             }
             Operand::U64 => matches!(kind, K::BitOr | K::BitAnd | K::BitXor),
-            Operand::F64 => matches!(kind, K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar),
+            Operand::F64 => matches!(
+                kind,
+                K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar | K::Histogram | K::Quantiles
+            ),
         };
         if accepted {
             return Ok(f.id);
@@ -290,6 +301,8 @@ impl TableCore {
             K::MaxF64 => ("a max_f64", "aggregate_f64"),
             K::SumF64 => ("a sum_f64", "aggregate_f64"),
             K::MeanVar => ("a mean_var", "aggregate_f64"),
+            K::Histogram => ("a histogram", "aggregate_f64"),
+            K::Quantiles => ("a quantiles", "aggregate_f64"),
         };
         Err(Error::new(
             ErrorCode::InvalidArgument,

@@ -151,19 +151,20 @@ fn families() -> Vec<ModelFamily> {
         ]
     } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
         // D298's families beside a counter, eight in all (32 slots), as `counters` has:
-        // more stall a one-shard run with tablet changes off (#1212). The exact sum and
-        // mean-variance families (PR 2) take `bor`'s and `fmin`'s places, whose kinds share
-        // their code with `band`'s and `fmax_ttl`'s. They all join `counters` once #1212 is
-        // fixed (#1214, #1219).
+        // more stall a one-shard run with tablet changes off (#1212). PR 2's exact sum and
+        // mean-variance families took `bor`'s and `fmin`'s places; PR 3's histogram and
+        // quantile families take `sum`'s and `band`'s (the counter kind runs in `counters`,
+        // and XOR covers the bitwise operator's code). They all join `counters` once #1212
+        // is fixed (#1214, #1219).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
-            f("sum", 2, 0, false),
-            f("band", 0, 0, false),
             f("bxor_ttl", 0, 40, false),
             f("fmax_ttl", 0, 40, false),
             f("fsum", 2, 0, false),
             f("fmv_ttl", 0, 40, false),
+            f("fhist", 2, 0, false),
+            f("fq_ttl", 0, 40, false),
         ]
     } else {
         vec![
@@ -280,6 +281,14 @@ fn public_family(f: &ModelFamily) -> Family {
         (true, ModelAggregation::MaxF64) => Family::aggregate(Aggregation::MaxF64),
         (true, ModelAggregation::SumF64) => Family::aggregate(Aggregation::SumF64),
         (true, ModelAggregation::MeanVar) => Family::aggregate(Aggregation::MeanVar),
+        (true, ModelAggregation::Histogram) => Family::aggregate(Aggregation::Histogram(
+            pigeonhole::HistogramParams::new(pigeonhole_sim::MODEL_HISTOGRAM_BOUNDS).unwrap(),
+        )),
+        (true, ModelAggregation::Quantiles) => Family::aggregate(Aggregation::Quantiles(
+            pigeonhole::QuantileParams::default()
+                .mantissa_bits(pigeonhole_sim::MODEL_QUANTILE_BITS)
+                .max_buckets(pigeonhole_sim::MODEL_QUANTILE_MAX),
+        )),
     };
     let family = family
         .max_versions(f.max_versions)

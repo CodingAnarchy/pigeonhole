@@ -6,7 +6,9 @@
 //! cargo run --release -p pigeonhole-bench --example hotagg -- KIND STEPS [WRITES] [DIR]
 //! ```
 //!
-//! `KIND` is `sum` or `hll`; `STEPS` is `counter_checkpoint_steps` (D291: a get that folds
+//! `KIND` is `sum`, `hll` or `quantiles` (#488 PR 3, perf287's N1 on #1221: a sketch of the
+//! default 7 mantissa bits and 2048 buckets, fed values over about ten binades, so a cell
+//! grows to about 1300 buckets, tens of KiB); `STEPS` is `counter_checkpoint_steps` (D291: a get that folds
 //! that many entries leaves its result as a base; 0 turns it off). `CELLS` hot cells of one
 //! row take `WRITES` blind inputs round-robin, one per commit; every `READ_EVERY`-th write is
 //! followed by a timed get of one of them. An HLL cell gets a new element with every input,
@@ -41,7 +43,7 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let kind = args.next().expect("KIND: sum or hll");
+    let kind = args.next().expect("KIND: sum, hll or quantiles");
     let steps: u64 = args.next().expect("STEPS").parse().expect("STEPS");
     let writes: usize = args.next().map_or(200_000, |s| s.parse().expect("WRITES"));
     let base = args
@@ -60,6 +62,7 @@ fn main() {
     o.compaction.l0_trigger = u32::MAX;
     o.counter_checkpoint_steps = steps;
     let db = Engine::open(&dir.join("hotagg.phdb"), o).unwrap();
+    let quantiles = kind == "quantiles";
     let (family, hll) = match kind.as_str() {
         "sum" => (
             FamilyOptions::default()
@@ -73,7 +76,15 @@ fn main() {
                 .kind(FamilyKind::Hll),
             true,
         ),
-        other => panic!("KIND {other:?}: sum or hll"),
+        "quantiles" => (
+            FamilyOptions::default()
+                .merge_operator("pigeonhole.f64_quantiles")
+                .kind(FamilyKind::Quantiles)
+                // No parameters: the defaults, 7 mantissa bits and 2048 buckets.
+                .kind_params(Vec::new()),
+            false,
+        ),
+        other => panic!("KIND {other:?}: sum, hll or quantiles"),
     };
     let t = db.create_table("t", &[("a".into(), family)]).unwrap();
     let f = t.families[0].id;
@@ -88,9 +99,13 @@ fn main() {
     for i in 0..writes {
         let c = i % CELLS;
         let mut wb = WriteBatch::new();
-        let input = if hll { i as i64 } else { 1 };
-        wb.merge(t.id, f, b"hot", &qualifiers[c], ValueRef::I64(input))
-            .unwrap();
+        let input = if quantiles {
+            // 0.001 to 1000, scattered.
+            ValueRef::F64((i as u64).wrapping_mul(2_654_435_761) as f64 % 1e6 * 1e-3 + 1e-3)
+        } else {
+            ValueRef::I64(if hll { i as i64 } else { 1 })
+        };
+        wb.merge(t.id, f, b"hot", &qualifiers[c], input).unwrap();
         let w0 = Instant::now();
         db.commit(wb, None).unwrap();
         write_nanos += w0.elapsed().as_nanos();

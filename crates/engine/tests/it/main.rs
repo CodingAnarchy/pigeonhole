@@ -24,6 +24,7 @@ mod background_workers;
 mod blobs;
 mod blocking_commits;
 mod blocking_waits;
+mod bucket_aggregates;
 mod busy_nanos;
 mod check;
 mod checkpoint_budget;

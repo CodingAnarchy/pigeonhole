@@ -227,6 +227,38 @@ fn exact_sum_and_mean_var_families() {
 }
 
 #[test]
+fn histogram_and_quantile_families() {
+    // D298 PR 3: `create` takes `:histogram=b0,b1,…` and `:quantiles[=p,n]`, `aggregate`
+    // takes an f64 there, and the schema names the parameters.
+    let dir = TempDir::new("shell-buckets");
+    let path = empty(&dir);
+    let (status, out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s h:histogram=0,10 q:quantiles=5,64",
+            "aggregate s r h:t 3",
+            "aggregate s r q:t 3",
+            "\\schema s",
+            "create bad q:quantiles=13,64",
+        ],
+    );
+    assert_eq!(status, 1, "the bad parameters are refused: {err}");
+    assert!(err.contains("mantissa bits"), "{err}");
+    let docs = rows(&out);
+    let schema = serde_json::to_string(&docs[3]).unwrap();
+    for want in [
+        "histogram",
+        "\"bounds\":[0.0,10.0]",
+        "quantiles",
+        "\"mantissa_bits\":5",
+        "\"max_buckets\":64",
+    ] {
+        assert!(schema.contains(want), "{want}: {schema}");
+    }
+}
+
+#[test]
 fn meta_commands() {
     let dir = TempDir::new("shell-meta");
     let path = empty(&dir);

@@ -52,6 +52,8 @@ let pages = db
 | Lowest or highest reading (temperatures, latencies) | `Family::aggregate(Aggregation::MinF64)` or `MaxF64`; write with `aggregate_f64`, read with `as_f64` |
 | Totals of decimals (amounts, durations) | `Family::aggregate(Aggregation::SumF64)`: an exact sum, read with `sum_f64` |
 | Averages and spread (latency mean and variance) | `Family::aggregate(Aggregation::MeanVar)`; read with `mean_var` |
+| Distributions in fixed buckets (response codes, latency bands) | `Family::aggregate(Aggregation::Histogram(HistogramParams::new(bounds)?))`; read with `histogram_counts` |
+| Percentiles (p50, p99 latency) | `Family::aggregate(Aggregation::Quantiles(QuantileParams::default()))`; read with `quantile(0.99)` |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -247,6 +249,40 @@ These combine like min and max (buckets, puts, deletes, TTL), over other value t
 - **`MeanVar`** keeps the count, the exact sum and the exact sum of squares. `mean_var()` reads the count, mean, population variance and sample variance, each computed exactly and rounded once.
 
 Write inputs with `aggregate_f64`. A `put_f64` sets a cell. Inputs must be finite (NaN and infinities are refused). A cell is up to 274 bytes for a sum and 821 for mean/variance, against 9 for a counter. Like the others, these families mark the file (1.0.x refuses it).
+
+## Histograms and percentiles
+Both take `f64` inputs with `aggregate_f64`, and both have parameters, fixed when the family is created (D298):
+- **`Histogram(HistogramParams)`** counts inputs in fixed buckets. `HistogramParams::new([0.0, 10.0, 100.0])` makes four: below 0, `[0, 10)`, `[10, 100)` and 100 and up. `CellRef::histogram_counts` reads one count per bucket, and the family's info gives the bounds back. Infinities fall in the end buckets; NaN is refused. A cell is about 10 bytes per bucket.
+- **`Quantiles(QuantileParams)`** keeps a log-linear sketch. `quantile(0.99)` reads within a relative error of 2^-p (`mantissa_bits`, 7 by default, so 0.8%). The same inputs give the same sketch in any order. Inputs must be finite. Each sign keeps at most `max_buckets` buckets (2048 by default). Past that, the smallest magnitudes fold together, in both signs: for data spread over many orders of magnitude, the quantiles nearest zero lose precision first (not the low tail, for signed data). A cell holds about 20 bytes per bucket in use.
+
+`n` bounds give `n + 1` counts. Zip them with the bounds from the family's info rather than indexing by hand:
+
+```rust
+use pigeonhole::{Aggregation, Family, HistogramParams};
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = pigeonhole::Pigeonhole::open(dir.join("app.phdb"), pigeonhole::Options::default())?;
+let t = db
+    .table("api")?
+    .family("ms", Family::aggregate(Aggregation::Histogram(HistogramParams::new([10.0, 100.0])?)))
+    .create_if_missing()?;
+for ms in [3.0, 42.0, 57.0, 250.0] {
+    t.mutate(b"GET /").aggregate_f64("ms", b"latency", ms).commit()?;
+}
+let counts = t.get(b"GET /", "ms", b"latency")?.unwrap().histogram_counts().unwrap();
+let Some(Aggregation::Histogram(params)) = t.family_info("ms").unwrap().aggregation else {
+    unreachable!("a histogram family");
+};
+// Bucket i holds inputs below bounds[i] and at or above bounds[i - 1].
+let bounds = params.bounds();
+let lower = std::iter::once(f64::NEG_INFINITY).chain(bounds.iter().copied());
+let labelled: Vec<(f64, u64)> = lower.zip(counts).collect();
+assert_eq!(labelled, [(f64::NEG_INFINITY, 1), (10.0, 2), (100.0, 1)]);
+# Ok(())
+# }
+```
+
+These cells are never moved to blob files, whatever `blob_threshold` says.
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

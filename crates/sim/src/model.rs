@@ -66,6 +66,13 @@ pub enum ModelAggregation {
     /// The count, exact sum and exact sum of squares of finite `f64` inputs (D298), as
     /// [`SumF64`](Self::SumF64).
     MeanVar,
+    /// Counts of `f64` inputs (never NaN) in the buckets of
+    /// [`MODEL_HISTOGRAM_BOUNDS`](crate::MODEL_HISTOGRAM_BOUNDS) (D298), as the store's
+    /// histogram state, which [`bucket_state`](crate::bucket_state) writes independently.
+    Histogram,
+    /// A quantile sketch of finite `f64` inputs with the model's parameters (D298), as
+    /// [`Histogram`](Self::Histogram).
+    Quantiles,
 }
 
 impl ModelAggregation {
@@ -78,6 +85,17 @@ impl ModelAggregation {
                 | ModelAggregation::MaxF64
                 | ModelAggregation::SumF64
                 | ModelAggregation::MeanVar
+                | ModelAggregation::Histogram
+                | ModelAggregation::Quantiles
+        )
+    }
+
+    /// Whether the family's inputs must be finite (an exact sum's, a mean-variance or
+    /// quantile family's); a histogram's may be infinite, an `f64` min's or max's too.
+    pub fn finite_inputs(self) -> bool {
+        matches!(
+            self,
+            ModelAggregation::SumF64 | ModelAggregation::MeanVar | ModelAggregation::Quantiles
         )
     }
 
@@ -87,7 +105,11 @@ impl ModelAggregation {
     pub fn is_state(self) -> bool {
         matches!(
             self,
-            ModelAggregation::Hll | ModelAggregation::SumF64 | ModelAggregation::MeanVar
+            ModelAggregation::Hll
+                | ModelAggregation::SumF64
+                | ModelAggregation::MeanVar
+                | ModelAggregation::Histogram
+                | ModelAggregation::Quantiles
         )
     }
 
@@ -105,6 +127,8 @@ impl ModelAggregation {
             },
             ModelAggregation::SumF64 => crate::exact_state(false, base, elements),
             ModelAggregation::MeanVar => crate::exact_state(true, base, elements),
+            ModelAggregation::Histogram => crate::bucket_state(false, base, elements),
+            ModelAggregation::Quantiles => crate::bucket_state(true, base, elements),
             _ => unreachable!("not a state kind"),
         }
     }
@@ -115,6 +139,8 @@ impl ModelAggregation {
             ModelAggregation::Hll => decode_registers(s).is_some(),
             ModelAggregation::SumF64 => crate::exact_state_valid(false, s),
             ModelAggregation::MeanVar => crate::exact_state_valid(true, s),
+            ModelAggregation::Histogram => crate::bucket_state_valid(false, s),
+            ModelAggregation::Quantiles => crate::bucket_state_valid(true, s),
             _ => false,
         }
     }
@@ -126,7 +152,11 @@ impl ModelAggregation {
             ModelAggregation::Sum => a.wrapping_add(b),
             ModelAggregation::Min => a.min(b),
             ModelAggregation::Max => a.max(b),
-            ModelAggregation::Hll | ModelAggregation::SumF64 | ModelAggregation::MeanVar => {
+            ModelAggregation::Hll
+            | ModelAggregation::SumF64
+            | ModelAggregation::MeanVar
+            | ModelAggregation::Histogram
+            | ModelAggregation::Quantiles => {
                 unreachable!("a state kind's inputs are not combined into an i64")
             }
             ModelAggregation::BitOr => a | b,
@@ -233,8 +263,9 @@ fn decode_registers(s: &[u8]) -> Option<[u8; 4096]> {
 
 /// The aggregation of the test families named by convention ([`WorkloadSpec`]): a name
 /// starting with `sum` is a counter family, `min`, `max` and `hll` the D294 families, `bor`,
-/// `band`, `bxor`, `fmin`, `fmax`, `fsum` and `fmv` the D298 bitwise, `f64` and exact `f64`
-/// families; `None` for any other name.
+/// `band`, `bxor`, `fmin`, `fmax`, `fsum`, `fmv`, `fhist` and `fq` the D298 bitwise, `f64`,
+/// exact `f64`, histogram and quantile families (the last two with the model's fixed
+/// parameters); `None` for any other name.
 ///
 /// [`WorkloadSpec`]: crate::WorkloadSpec
 pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
@@ -260,6 +291,10 @@ pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
         Some(ModelAggregation::SumF64)
     } else if family.starts_with("fmv") {
         Some(ModelAggregation::MeanVar)
+    } else if family.starts_with("fhist") {
+        Some(ModelAggregation::Histogram)
+    } else if family.starts_with("fq") {
+        Some(ModelAggregation::Quantiles)
     } else {
         None
     }
@@ -691,13 +726,10 @@ impl Model {
         let fixed_with_ttl = |ts: &Option<Timestamp>| ts.is_none() && f.ttl_micros != 0;
         match op {
             ModelOp::Incr { ts, .. } if f.counter && fixed_with_ttl(ts) => refused(),
-            // An exact f64 family takes finite inputs only (D298).
+            // An exact f64 or quantile family takes finite inputs only (D298).
             ModelOp::Incr { delta, .. }
                 if f.counter
-                    && matches!(
-                        f.aggregation,
-                        ModelAggregation::SumF64 | ModelAggregation::MeanVar
-                    )
+                    && f.aggregation.finite_inputs()
                     && !f64::from_bits(*delta as u64).is_finite() =>
             {
                 refused()

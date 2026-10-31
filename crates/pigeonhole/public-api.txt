@@ -34,12 +34,14 @@ pub fn pigeonhole::nonblocking::TransactionCommitFuture::poll(core::pin::Pin<&mu
 pub pigeonhole::Aggregation::BitAnd
 pub pigeonhole::Aggregation::BitOr
 pub pigeonhole::Aggregation::BitXor
+pub pigeonhole::Aggregation::Histogram(pigeonhole::HistogramParams)
 pub pigeonhole::Aggregation::Hll
 pub pigeonhole::Aggregation::Max
 pub pigeonhole::Aggregation::MaxF64
 pub pigeonhole::Aggregation::MeanVar
 pub pigeonhole::Aggregation::Min
 pub pigeonhole::Aggregation::MinF64
+pub pigeonhole::Aggregation::Quantiles(pigeonhole::QuantileParams)
 pub pigeonhole::Aggregation::Sum
 pub pigeonhole::Aggregation::SumF64
 #[non_exhaustive] pub enum pigeonhole::Compaction
@@ -171,8 +173,11 @@ impl pigeonhole::Cell
 pub fn pigeonhole::Cell::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::Cell::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::Cell::as_u64(&self) -> core::option::Option<u64>
+pub fn pigeonhole::Cell::histogram_counts(&self) -> core::option::Option<alloc::vec::Vec<u64>>
 pub fn pigeonhole::Cell::hll_estimate(&self) -> core::option::Option<u64>
 pub fn pigeonhole::Cell::mean_var(&self) -> core::option::Option<pigeonhole::MeanVar>
+pub fn pigeonhole::Cell::quantile(&self, f64) -> core::option::Option<f64>
+pub fn pigeonhole::Cell::quantiles_count(&self) -> core::option::Option<u64>
 pub fn pigeonhole::Cell::sum_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::Cell::timestamp(&self) -> u64
 pub fn pigeonhole::Cell::typed(&self) -> pigeonhole::Value<'_>
@@ -186,8 +191,11 @@ impl<'a> pigeonhole::CellRef<'a>
 pub fn pigeonhole::CellRef<'a>::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::CellRef<'a>::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::CellRef<'a>::as_u64(&self) -> core::option::Option<u64>
+pub fn pigeonhole::CellRef<'a>::histogram_counts(&self) -> core::option::Option<alloc::vec::Vec<u64>>
 pub fn pigeonhole::CellRef<'a>::hll_estimate(&self) -> core::option::Option<u64>
 pub fn pigeonhole::CellRef<'a>::mean_var(&self) -> core::option::Option<pigeonhole::MeanVar>
+pub fn pigeonhole::CellRef<'a>::quantile(&self, f64) -> core::option::Option<f64>
+pub fn pigeonhole::CellRef<'a>::quantiles_count(&self) -> core::option::Option<u64>
 pub fn pigeonhole::CellRef<'a>::sum_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::CellRef<'a>::timestamp(&self) -> u64
 pub fn pigeonhole::CellRef<'a>::to_owned(&self) -> pigeonhole::Cell
@@ -347,6 +355,11 @@ pub pigeonhole::Finding::object: core::option::Option<u64>
 pub pigeonhole::Finding::offset: core::option::Option<u64>
 pub pigeonhole::Finding::severity: pigeonhole::Severity
 pub pigeonhole::Finding::structure: pigeonhole::Structure
+pub struct pigeonhole::HistogramParams
+impl pigeonhole::HistogramParams
+pub fn pigeonhole::HistogramParams::bounds(&self) -> alloc::vec::Vec<f64>
+pub fn pigeonhole::HistogramParams::bucket_of(&self, f64) -> usize
+pub fn pigeonhole::HistogramParams::new(impl core::convert::Into<alloc::vec::Vec<f64>>) -> pigeonhole::Result<Self>
 #[non_exhaustive] pub struct pigeonhole::IoRings
 pub pigeonhole::IoRings::attach_failures: u64
 pub pigeonhole::IoRings::inline: u64
@@ -441,6 +454,14 @@ pub fn pigeonhole::PigeonholeReader::row_cache_stats(&self) -> pigeonhole::RowCa
 pub fn pigeonhole::PigeonholeReader::snapshot(&self) -> pigeonhole::Result<pigeonhole::Snapshot>
 pub fn pigeonhole::PigeonholeReader::table(&self, &str) -> pigeonhole::Result<pigeonhole::ReadTable>
 pub fn pigeonhole::PigeonholeReader::tables(&self) -> alloc::vec::Vec<alloc::string::String>
+pub struct pigeonhole::QuantileParams
+impl pigeonhole::QuantileParams
+pub fn pigeonhole::QuantileParams::get_mantissa_bits(&self) -> u8
+pub fn pigeonhole::QuantileParams::get_max_buckets(&self) -> u16
+pub fn pigeonhole::QuantileParams::mantissa_bits(self, u8) -> Self
+pub fn pigeonhole::QuantileParams::max_buckets(self, u16) -> Self
+impl core::default::Default for pigeonhole::QuantileParams
+pub fn pigeonhole::QuantileParams::default() -> Self
 pub struct pigeonhole::ReadTable
 impl pigeonhole::ReadTable
 pub fn pigeonhole::ReadTable::families(&self) -> alloc::vec::Vec<&str>

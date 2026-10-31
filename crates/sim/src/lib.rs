@@ -13,12 +13,17 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod bucket_state;
 mod exact_state;
 mod model;
 mod sim;
 mod streams;
 mod workload;
 
+pub use bucket_state::{
+    MODEL_HISTOGRAM_BOUNDS, MODEL_QUANTILE_BITS, MODEL_QUANTILE_MAX, bucket_state,
+    bucket_state_valid,
+};
 pub use exact_state::{exact_merge, exact_state, exact_state_valid};
 pub use model::{
     COUNTER_TS, CrashWindow, Model, ModelAggregation, ModelCell, ModelError, ModelFamily, ModelOp,

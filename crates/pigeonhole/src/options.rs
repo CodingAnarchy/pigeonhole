@@ -1060,6 +1060,102 @@ pub enum Aggregation {
     /// [`CellRef::mean_var`](crate::CellRef::mean_var)), each computed exactly and rounded
     /// once. A cell is a state of up to 821 bytes.
     MeanVar,
+    /// Counts of `f64` inputs (NaN refused) in fixed buckets between the bounds of
+    /// [`HistogramParams`] ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read with
+    /// [`CellRef::histogram_counts`](crate::CellRef::histogram_counts)).
+    Histogram(HistogramParams),
+    /// A log-linear quantile sketch of finite `f64` inputs, within a relative error of
+    /// 2^-p ([`QuantileParams`]; [`aggregate_f64`](crate::RowMutation::aggregate_f64); read
+    /// with [`CellRef::quantile`](crate::CellRef::quantile)). The same inputs give the same
+    /// sketch in any order.
+    Quantiles(QuantileParams),
+}
+
+/// A histogram family's bucket bounds ([`Aggregation::Histogram`], D298): `n` bounds
+/// `b0 < b1 < … < b(n-1)` make `n + 1` buckets, `(-∞, b0)`, `[b0, b1)`, …, `[b(n-1), +∞)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HistogramParams {
+    bounds: Vec<u64>,
+}
+
+impl HistogramParams {
+    /// Bounds that are finite, strictly increasing, 1 to 1023 of them, and never `-0.0`;
+    /// `InvalidArgument` otherwise.
+    pub fn new(bounds: impl Into<Vec<f64>>) -> crate::Result<Self> {
+        let bounds: Vec<f64> = bounds.into();
+        pigeonhole_format::buckets::histogram_bounds(
+            &pigeonhole_format::buckets::histogram_params(&bounds),
+        )
+        .map_err(|e| crate::Error::new(crate::ErrorCode::InvalidArgument, e.0.to_owned()))?;
+        Ok(HistogramParams {
+            bounds: bounds.iter().map(|b| b.to_bits()).collect(),
+        })
+    }
+
+    /// The bounds.
+    pub fn bounds(&self) -> Vec<f64> {
+        self.bounds.iter().map(|&b| f64::from_bits(b)).collect()
+    }
+
+    /// The bucket an input `x` falls in: how many bounds lie at or below it (IEEE `<=`, so
+    /// `-0.0` and `0.0` share a bucket). Counts from
+    /// [`CellRef::histogram_counts`](crate::CellRef::histogram_counts) are indexed the same
+    /// way: `n` bounds give `n + 1` counts.
+    pub fn bucket_of(&self, x: f64) -> usize {
+        pigeonhole_format::buckets::bucket_of(&self.bounds(), x)
+    }
+}
+
+/// A quantile family's parameters ([`Aggregation::Quantiles`], D298): the mantissa bits
+/// `p` an input keeps (1 to 12; a relative error of at most 2^-p; 7 by default) and the
+/// buckets each sign's store keeps (16 to 4096; 2048 by default) before its smallest
+/// magnitudes collapse into one bucket. Out-of-range values are refused when the family is
+/// created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuantileParams {
+    mantissa_bits: u8,
+    max_buckets: u16,
+}
+
+impl Default for QuantileParams {
+    fn default() -> Self {
+        let d = pigeonhole_format::buckets::QuantileParams::default();
+        QuantileParams {
+            mantissa_bits: d.mantissa_bits,
+            max_buckets: d.max_buckets,
+        }
+    }
+}
+
+impl QuantileParams {
+    /// With `p` mantissa bits.
+    pub fn mantissa_bits(mut self, p: u8) -> Self {
+        self.mantissa_bits = p;
+        self
+    }
+
+    /// With `n` buckets per store.
+    pub fn max_buckets(mut self, n: u16) -> Self {
+        self.max_buckets = n;
+        self
+    }
+
+    /// The mantissa bits.
+    pub fn get_mantissa_bits(&self) -> u8 {
+        self.mantissa_bits
+    }
+
+    /// The buckets per store.
+    pub fn get_max_buckets(&self) -> u16 {
+        self.max_buckets
+    }
+
+    fn format(&self) -> pigeonhole_format::buckets::QuantileParams {
+        pigeonhole_format::buckets::QuantileParams {
+            mantissa_bits: self.mantissa_bits,
+            max_buckets: self.max_buckets,
+        }
+    }
 }
 
 impl Aggregation {
@@ -1076,11 +1172,46 @@ impl Aggregation {
             Aggregation::MaxF64 => FamilyKind::MaxF64,
             Aggregation::SumF64 => FamilyKind::SumF64,
             Aggregation::MeanVar => FamilyKind::MeanVar,
+            Aggregation::Histogram(_) => FamilyKind::Histogram,
+            Aggregation::Quantiles(_) => FamilyKind::Quantiles,
         }
     }
 
-    /// The aggregation of an engine family kind (`None` for a standard family).
-    pub(crate) fn of_kind(kind: FamilyKind) -> Option<Self> {
+    /// The family's `kind_params` (D298): a histogram's bounds, a quantile sketch's
+    /// parameters; none for the other aggregations.
+    fn kind_params(&self) -> Vec<u8> {
+        match self {
+            Aggregation::Histogram(h) => pigeonhole_format::buckets::histogram_params(&h.bounds()),
+            Aggregation::Quantiles(q) => q.format().encode(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The aggregation of an engine family's options (`None` for a standard family), its
+    /// parameters read back from `kind_params`.
+    pub(crate) fn of_options(o: &pigeonhole_format::manifest::FamilyOptions) -> Option<Self> {
+        use pigeonhole_format::buckets;
+        match o.kind {
+            FamilyKind::Histogram => buckets::histogram_bounds(&o.kind_params).ok().map(|b| {
+                Aggregation::Histogram(HistogramParams {
+                    bounds: b.iter().map(|x| x.to_bits()).collect(),
+                })
+            }),
+            FamilyKind::Quantiles => buckets::QuantileParams::parse(&o.kind_params)
+                .ok()
+                .map(|q| {
+                    Aggregation::Quantiles(QuantileParams {
+                        mantissa_bits: q.mantissa_bits,
+                        max_buckets: q.max_buckets,
+                    })
+                }),
+            kind => Self::of_kind(kind),
+        }
+    }
+
+    /// The aggregation of an engine family kind without parameters (`None` for a standard
+    /// family).
+    fn of_kind(kind: FamilyKind) -> Option<Self> {
         match kind {
             FamilyKind::Standard => None,
             FamilyKind::Counter => Some(Aggregation::Sum),
@@ -1094,6 +1225,7 @@ impl Aggregation {
             FamilyKind::MaxF64 => Some(Aggregation::MaxF64),
             FamilyKind::SumF64 => Some(Aggregation::SumF64),
             FamilyKind::MeanVar => Some(Aggregation::MeanVar),
+            FamilyKind::Histogram | FamilyKind::Quantiles => None,
         }
     }
 
@@ -1110,6 +1242,8 @@ impl Aggregation {
             Aggregation::MaxF64 => "pigeonhole.f64_max",
             Aggregation::SumF64 => "pigeonhole.f64_sum",
             Aggregation::MeanVar => "pigeonhole.f64_mean_var",
+            Aggregation::Histogram(_) => "pigeonhole.f64_histogram",
+            Aggregation::Quantiles(_) => "pigeonhole.f64_quantiles",
         }
     }
 }
@@ -1167,7 +1301,8 @@ impl Family {
         Self {
             options: FamilyOptions::default()
                 .merge_operator(aggregation.operator().to_owned())
-                .kind(aggregation.kind()),
+                .kind(aggregation.kind())
+                .kind_params(aggregation.kind_params()),
         }
     }
 
