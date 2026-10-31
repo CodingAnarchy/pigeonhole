@@ -350,6 +350,31 @@ impl KeyCursor {
         ))
     }
 
+    /// [`KeyCursor::new`] over a shared key set (D304's async traversal reads each hop's
+    /// frontier, which it also keeps).
+    pub(crate) fn over(
+        snapshot: Snapshot,
+        table: TableId,
+        families: Vec<FamilyId>,
+        spec: ReadSpec,
+        now: Timestamp,
+        keys: Arc<KeySet>,
+        shared: Arc<crate::shard::Shared>,
+    ) -> Result<Self> {
+        let groups = key_groups(&snapshot, table, &keys)?;
+        let end = keys.len();
+        Ok(Self::with_groups(
+            snapshot,
+            families,
+            spec,
+            now,
+            keys,
+            groups,
+            (0, end),
+            shared,
+        ))
+    }
+
     /// A cursor over one key group of `keys` (D296's `Keys` input: each tablet group of a
     /// bounded read gets its own cursor, all sharing one key set).
     pub(crate) fn for_group(

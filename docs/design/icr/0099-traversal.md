@@ -19,8 +19,11 @@ D304 rev 1 listed two more counts. **Not added:**
 - **Unusable destinations:** every qualifier is a valid row key, since both are limited to 64 KiB (`MAX_KEY_PART`).
 - **Rows cut by `per_node_limit`:** the visitor's counts don't come back from a bounded read.
 
-## PR 2 (planned): async
-`Traverse::run_async()`, polling the multi-get cursor hop by hop, with a 4,096-cell budget per poll (D304 rev 1, A2).
+## PR 2: async
+- **pigeonhole** (behind the `async` feature): `Traverse::run_async(self) -> Result<Traversal>`, an `async fn` whose future is `Send`. It has `run`'s semantics and result, never fans out (`parallel(n)` is ignored), and a poll yields after 4,096 edges.
+- **Internal crates** (no promise):
+  - **pigeonhole-engine:** `Engine::traverse_async(&Snapshot, TableId, Arc<KeySet>, TraverseSpec) -> Result<PendingTraversal>` (a `Future<Output = Result<Traversal>>`), and `TRAVERSE_POLL_CELLS`.
+  - Its `TraverseStats::{rows, edges}` count the work it did. They equal `run`'s when no hop was cut, and are lower when one was: a cut hop's sync read runs each tablet group to its own stop.
 
 ## Why
 D304 (#489 item 3): a client BFS over `keys()` materialises every edge and sees every duplicate. In the engine, a hop keeps only new destinations, and a capped hub costs its first edges.

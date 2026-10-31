@@ -187,6 +187,18 @@ impl Workload {
         format!("q{}", self.rng.below(self.spec.qualifiers)).into_bytes()
     }
 
+    /// A qualifier of `family`: a row key in a graph family (`adj…`, whose columns are edges
+    /// to the rows they name, D304's traversal model), else [`Workload::qualifier`]. Other
+    /// families draw exactly as before, so a workload without a graph family is unchanged.
+    fn qualifier_in(&mut self, family: &str) -> Vec<u8> {
+        if family.starts_with("adj") {
+            let i = self.row_index();
+            Self::row_key(i)
+        } else {
+            self.qualifier()
+        }
+    }
+
     fn recent_ts(&mut self) -> u64 {
         self.tick.saturating_sub(self.rng.below(8)).max(1)
     }
@@ -224,8 +236,8 @@ impl Workload {
                 0..=2 => ModelOp::DeleteCell {
                     table,
                     row,
+                    qualifier: self.qualifier_in(&family),
                     family,
-                    qualifier: self.qualifier(),
                     ts: match (sum, self.rng.below(2)) {
                         (true, 0) => crate::COUNTER_TS,
                         (true, _) => self.bucket(),
@@ -235,14 +247,14 @@ impl Workload {
                 3..=5 => ModelOp::DeleteColumn {
                     table,
                     row,
+                    qualifier: self.qualifier_in(&family),
                     family,
-                    qualifier: self.qualifier(),
                 },
                 6..=7 => ModelOp::DeleteFamily { table, row, family },
                 _ => ModelOp::DeleteRow { table, row },
             };
         }
-        let qualifier = self.qualifier();
+        let qualifier = self.qualifier_in(&family);
         // An HLL family's puts are sketches (of a few elements), its inputs elements.
         // A state family's puts are states (an HLL sketch, an exact sum's or mean-variance
         // state of a few inputs), its inputs elements.
@@ -363,7 +375,7 @@ impl Workload {
             | ModelOp::Incr { qualifier, .. }
             | ModelOp::DeleteCell { qualifier, .. }
             | ModelOp::DeleteColumn { qualifier, .. } => qualifier.clone(),
-            _ => self.qualifier(),
+            _ => self.qualifier_in(&family),
         };
         let sum = crate::aggregation_of_name(&family).is_some();
         let counter = sum || family.starts_with("counter");
@@ -445,11 +457,15 @@ impl Iterator for Workload {
         self.tick += 1;
         if self.rng.unit() < self.spec.read_fraction {
             return Some(match self.rng.below(100) {
-                0..=59 => Op::Get {
-                    row: self.row(),
-                    family: self.family(),
-                    qualifier: self.qualifier(),
-                },
+                0..=59 => {
+                    let (row, family) = (self.row(), self.family());
+                    let qualifier = self.qualifier_in(&family);
+                    Op::Get {
+                        row,
+                        family,
+                        qualifier,
+                    }
+                }
                 60..=84 => {
                     let (a, b) = (self.row_index(), self.row_index());
                     Op::Scan {

@@ -79,8 +79,8 @@ pub use read::reduce::{
     ReduceStats, Reduced, Reducer, RowRange, TopK, Visit,
 };
 pub use read::traverse::{
-    DEFAULT_MAX_NODES, Hop, MAX_HOPS, TRAVERSE_PARALLEL_FLOOR, Traversal, TraverseSpec,
-    TraverseStats,
+    DEFAULT_MAX_NODES, Hop, MAX_HOPS, PendingTraversal, TRAVERSE_PARALLEL_FLOOR,
+    TRAVERSE_POLL_CELLS, Traversal, TraverseSpec, TraverseStats,
 };
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};

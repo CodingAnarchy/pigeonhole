@@ -3531,7 +3531,11 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 
   §2.3 of the note (with rev 2's two cases) shows local stops keep `hop_limit` exact under fan-out. The visited set is held in memory, about (key length + 48) B per node. It grows in place between hops, with a debug assertion that no clone outlives a hop.
 - **Fan-out:** `parallel(n)` over the frontier's tablets, past 1,000 keys per thread.
-- **PR 2:** `run_async`, which polls the multi-get cursor with a 4,096-cell budget per poll.
+- **PR 2: `run_async`** (`Engine::traverse_async`, `PendingTraversal`). Each hop is read on the polling task through one multi-get cursor over the frontier (`KeyCursor::poll_next_key`: cache-only positioning, the next keys' blocks fetched ahead), with the same `EdgeVisitor` and `DedupeLimit` run inline on its borrowed cells.
+  - **One group, no fan-out.** D296's determinism makes the hops and parents equal to `run`'s.
+  - **Budget:** a poll yields (`wake_by_ref`, then `Pending`) after 4,096 cells, so an uncapped hub never holds the executor for long. It counts the cells that reach the visitor. Edges the read drops on its way (a value filter's misses, deleted or expired versions) and keys with no kept edge aren't counted yet (#1237).
+  - **State:** the hop's reducer, the visitor's row and count, the cursor and the visited set all survive each `Pending`. Dropping the future releases the cursor's pins and the snapshot.
+  - **Synchronous reads:** a key's cells past the first are read synchronously where a block misses, counted in `async_sync_reads`.
 
 **Checks.**
 - `tests/traverse.rs`: a client BFS over `keys()` implementing the semantics independently, on a graph with hubs, self-loops, deletes of every scope, several SSTs and levels, and tablets on two shards. Every limit alone and combined, the edge selection, parents and stats, `parallel(4)`, and the argument errors are all checked.
@@ -3539,6 +3543,8 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - `DedupeLimit`'s unit test: any cut into groups, merged in any order, equals the sequential result.
 - `alloc.rs`: a hop's allocations don't grow with edges (450 calls for 4,000 and for 40,000 edges with no new node), nor with a capped hub's size (508 calls for 2,000 and 20,000 edges at `per_node_limit(100)`).
 - **The pigeonhole model:** a two-hop traversal from each multi-get's keys against a BFS over the model's rows, under faults and concurrent changes.
-  - The workload's qualifiers (`q…`) never name rows (`row…`), so there it checks hop 1's limits, dedupe and ranking.
-  - Multi-hop is checked by the integration and engine tests. A graph-shaped workload family would change every seed's RNG stream; that can come with D304 PR 2 if wanted.
+  - The workload's qualifiers (`q…`) never name rows (`row…`), so in PR 1 it checked hop 1's limits, dedupe and ranking.
+  - **#1232 (with PR 2):** the default pigeonhole model has a graph family, `adj`, whose qualifiers the workload draws from the row-key space (`Workload::qualifier_in`). Other families draw as before, so targets without `adj` replay unchanged.
+    - The traversal check reads `adj` on half the model seqnos (bit 4, independent of the limits' bits 0–3) and the get's family on the rest, so counter, TTL and versioned families keep their coverage. On the async front door it goes through `run_async`.
+    - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
 

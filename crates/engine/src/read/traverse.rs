@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use pigeonhole_format::{FamilyId, TableId, Timestamp};
 
-use super::keys::KeySet;
+use super::keys::{KeyCursor, KeySet};
 use super::reduce::{CellKey, CellRef, CellVisitor, ReadInput, ReduceSpec, Reducer, Visit};
 use super::{ReadSpec, reduce::reduce_into};
 use crate::snapshot::Snapshot;
@@ -287,14 +287,12 @@ impl Reducer for DedupeLimit {
     }
 }
 
-/// [`Engine::traverse`](crate::Engine::traverse).
-pub(crate) fn traverse(
+/// Checks a traversal's arguments: its families (the edge family alone) and the edges' read.
+fn checked(
     snapshot: &Snapshot,
     table: TableId,
-    seeds: Arc<KeySet>,
     spec: &TraverseSpec,
-    ctx: (Timestamp, bool, &Arc<crate::shard::Shared>),
-) -> Result<Traversal> {
+) -> Result<(Vec<FamilyId>, ReadSpec)> {
     if !(1..=MAX_HOPS).contains(&spec.hops) {
         return Err(Error::InvalidArgument(format!(
             "a traversal takes 1 to {MAX_HOPS} hops, not {}",
@@ -308,14 +306,26 @@ pub(crate) fn traverse(
             spec.family.0, table.0
         )));
     }
-    let mut out = Traversal::default();
-    if seeds.is_empty() {
-        return Ok(out);
-    }
     let mut read = spec.read.clone();
     read.families = vec![spec.family];
     read.versions = 1;
     read.columns_per_row = 0;
+    Ok((families.into_vec(), read))
+}
+
+/// [`Engine::traverse`](crate::Engine::traverse).
+pub(crate) fn traverse(
+    snapshot: &Snapshot,
+    table: TableId,
+    seeds: Arc<KeySet>,
+    spec: &TraverseSpec,
+    ctx: (Timestamp, bool, &Arc<crate::shard::Shared>),
+) -> Result<Traversal> {
+    let (families, read) = checked(snapshot, table, spec)?;
+    let mut out = Traversal::default();
+    if seeds.is_empty() {
+        return Ok(out);
+    }
     let mut visited: Arc<HashSet<Vec<u8>>> = Arc::new(seeds.iter().map(<[u8]>::to_vec).collect());
     let mut frontier = seeds;
     for _ in 0..spec.hops {
@@ -381,6 +391,317 @@ pub(crate) fn traverse(
         out.hops.push(Hop { nodes, parents });
     }
     Ok(out)
+}
+
+/// Cells an async traversal reads in one poll before it yields (D304 rev 1, A2): no poll
+/// runs long, whatever a hub's degree. It counts the cells that reach the visitor: edges
+/// the read drops on its way (a value filter's misses, deleted or expired versions) and the
+/// keys `poll_next_key` passes over for having no edge are not counted, so a hub whose edges
+/// are mostly dropped can read more than 4,096 entries in one poll (#1237).
+pub const TRAVERSE_POLL_CELLS: u32 = 4_096;
+
+/// An async traversal ([`Engine::traverse_async`](crate::Engine::traverse_async), D304 PR
+/// 2): the hops of [`Engine::traverse`](crate::Engine::traverse), each read on the caller's
+/// task through one multi-get cursor over the frontier ([`KeyCursor::poll_next_key`]: keys
+/// positioned cache-only, the next keys' blocks fetched ahead), with the same visitor and
+/// reducer run on its borrowed cells. It never fans out, and D296's determinism makes its
+/// result the sync one. A key's cells past the first are read synchronously where a block
+/// misses (counted in `async_sync_reads`), and a poll yields after
+/// [`TRAVERSE_POLL_CELLS`] cells. Its state (the hop's reducer, the visitor's row and count,
+/// the cursor) survives each `Pending`; dropping it releases the cursor's pins and the
+/// snapshot.
+#[must_use = "a future does nothing unless polled"]
+pub struct PendingTraversal {
+    snapshot: Snapshot,
+    table: TableId,
+    families: Vec<FamilyId>,
+    read: ReadSpec,
+    spec: TraverseSpec,
+    now: Timestamp,
+    shared: Arc<crate::shard::Shared>,
+    visited: Arc<HashSet<Vec<u8>>>,
+    frontier: Arc<KeySet>,
+    hops_done: u32,
+    out: Traversal,
+    hop: Option<HopRead>,
+    /// The checks failed, or the result was handed out.
+    failed: Option<Error>,
+    done: bool,
+}
+
+impl std::fmt::Debug for PendingTraversal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingTraversal")
+            .field("hops_done", &self.hops_done)
+            .field("reading", &self.hop.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// One hop being read.
+struct HopRead {
+    cursor: KeyCursor,
+    visitor: EdgeVisitor,
+    reducer: DedupeLimit,
+    /// The key whose cells are being read.
+    key: Option<usize>,
+    /// The hop's limit came from `max_nodes`.
+    by_room: bool,
+}
+
+/// Where reading a key's cells stopped.
+enum KeyEnd {
+    /// The key's cells are done.
+    Done,
+    /// The poll's budget ran out mid-key.
+    Budget,
+    /// The reducer is full: the hop is done.
+    Full,
+}
+
+impl PendingTraversal {
+    pub(crate) fn new(
+        snapshot: Snapshot,
+        table: TableId,
+        seeds: Arc<KeySet>,
+        spec: TraverseSpec,
+        now: Timestamp,
+        shared: Arc<crate::shard::Shared>,
+    ) -> Self {
+        let (families, read, failed) = match checked(&snapshot, table, &spec) {
+            Ok((f, r)) => (f, r, None),
+            Err(e) => (Vec::new(), ReadSpec::default(), Some(e)),
+        };
+        let visited = Arc::new(seeds.iter().map(<[u8]>::to_vec).collect());
+        Self {
+            snapshot,
+            table,
+            families,
+            read,
+            hops_done: if seeds.is_empty() { spec.hops } else { 0 },
+            spec,
+            now,
+            shared,
+            visited,
+            frontier: seeds,
+            out: Traversal::default(),
+            hop: None,
+            failed,
+            done: false,
+        }
+    }
+
+    /// Starts the next hop: `false` when the traversal is over.
+    fn start_hop(&mut self) -> Result<bool> {
+        if self.hops_done >= self.spec.hops {
+            return Ok(false);
+        }
+        self.snapshot.check_process()?;
+        self.snapshot.check_current()?;
+        let room = self
+            .spec
+            .max_nodes
+            .saturating_sub(self.visited.len() as u64);
+        if room == 0 {
+            self.out.stats.cut_by_max_nodes = true;
+            return Ok(false);
+        }
+        let by_hop = if self.spec.hop_limit == 0 {
+            u64::MAX
+        } else {
+            self.spec.hop_limit
+        };
+        let limit = usize::try_from(by_hop.min(room)).unwrap_or(usize::MAX);
+        let cursor = KeyCursor::over(
+            self.snapshot.clone(),
+            self.table,
+            self.families.clone(),
+            self.read.clone(),
+            self.now,
+            Arc::clone(&self.frontier),
+            Arc::clone(&self.shared),
+        )?;
+        // Every hop runs on the polling task.
+        self.out.stats.threads = 1;
+        self.hop = Some(HopRead {
+            cursor,
+            visitor: EdgeVisitor {
+                frontier: Arc::clone(&self.frontier),
+                per_node_limit: self.spec.per_node_limit,
+                src: None,
+                count: 0,
+            },
+            reducer: DedupeLimit::new(
+                limit,
+                Arc::clone(&self.visited),
+                Arc::clone(&self.frontier),
+                self.spec.family,
+            ),
+            key: None,
+            by_room: room < by_hop,
+        });
+        Ok(true)
+    }
+
+    /// Ends the hop being read: its nodes join the visited set and become the frontier.
+    /// `false` when it found none (the traversal is over).
+    fn finish_hop(&mut self) -> bool {
+        let hop = self.hop.take().expect("a hop is being read");
+        let HopRead {
+            cursor,
+            visitor,
+            reducer,
+            by_room,
+            ..
+        } = hop;
+        drop((cursor, visitor));
+        let (nodes, parents, full) = reducer.into_nodes();
+        self.hops_done += 1;
+        if full {
+            self.out.stats.hops_cut += 1;
+            if by_room {
+                self.out.stats.cut_by_max_nodes = true;
+            }
+        }
+        if nodes.is_empty() {
+            return false;
+        }
+        // The hop's reducer, the one other holder, was consumed above.
+        debug_assert_eq!(
+            Arc::strong_count(&self.visited),
+            1,
+            "the visited set is shared"
+        );
+        Arc::make_mut(&mut self.visited).extend(nodes.iter().map(<[u8]>::to_vec));
+        self.frontier = Arc::new(nodes.clone());
+        self.out.hops.push(Hop { nodes, parents });
+        true
+    }
+
+    fn step(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<Result<Traversal>> {
+        use std::task::Poll;
+        if let Some(e) = self.failed.take() {
+            return Poll::Ready(Err(e));
+        }
+        let mut budget = TRAVERSE_POLL_CELLS;
+        loop {
+            if self.hop.is_none() {
+                match self.start_hop() {
+                    Ok(true) => {}
+                    Ok(false) => return Poll::Ready(Ok(std::mem::take(&mut self.out))),
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+            let frontier = Arc::clone(&self.frontier);
+            let hop = self.hop.as_mut().expect("started above");
+            let ended = match hop.key {
+                Some(i) => {
+                    let HopRead {
+                        cursor,
+                        visitor,
+                        reducer,
+                        ..
+                    } = hop;
+                    let row = frontier.get(i);
+                    let before = budget;
+                    let ended = cursor.counted(|c| read_key(c, row, visitor, reducer, &mut budget));
+                    self.out.stats.edges += u64::from(before - budget);
+                    match ended {
+                        Ok(KeyEnd::Done) => {
+                            hop.key = None;
+                            false
+                        }
+                        Ok(KeyEnd::Budget) => {
+                            // Yield: the key's state is kept, and this task polled again.
+                            cx.waker().wake_by_ref();
+                            return Poll::Pending;
+                        }
+                        Ok(KeyEnd::Full) => true,
+                        Err(e) => return Poll::Ready(Err(e)),
+                    }
+                }
+                None => match hop.cursor.poll_next_key(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(None)) => true,
+                    Poll::Ready(Ok(Some(i))) => {
+                        hop.key = Some(i);
+                        self.out.stats.rows += 1;
+                        false
+                    }
+                },
+            };
+            if ended && !self.finish_hop() {
+                self.hops_done = self.spec.hops;
+            }
+        }
+    }
+}
+
+/// Runs the visitor and reducer over the current key's cells, within `budget` cells.
+fn read_key(
+    c: &mut KeyCursor,
+    row: &[u8],
+    visitor: &mut EdgeVisitor,
+    reducer: &mut DedupeLimit,
+    budget: &mut u32,
+) -> Result<KeyEnd> {
+    loop {
+        if *budget == 0 {
+            return Ok(KeyEnd::Budget);
+        }
+        let Some(cell) = c.next_cell()? else {
+            return Ok(KeyEnd::Done);
+        };
+        *budget -= 1;
+        let cref = CellRef {
+            row,
+            family_rank: 0,
+            family: cell.family,
+            qualifier: cell.qualifier,
+            ts: cell.ts,
+        };
+        let (item, next_row) =
+            match visitor.visit(row, cell.family, cell.qualifier, cell.ts, cell.stored) {
+                Visit::Emit(src) => (Some(src), false),
+                Visit::EmitAndNextRow(src) => (Some(src), true),
+                Visit::NextRow => (None, true),
+                Visit::Skip => (None, false),
+                Visit::Stop => return Ok(KeyEnd::Full),
+            };
+        if let Some(src) = item
+            && reducer.push(cref, src).is_break()
+        {
+            return Ok(KeyEnd::Full);
+        }
+        if next_row {
+            c.skip_rest_of_key();
+            return Ok(KeyEnd::Done);
+        }
+    }
+}
+
+impl std::future::Future for PendingTraversal {
+    type Output = Result<Traversal>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let _poll = pigeonhole_io::async_poll_scope();
+        let this = self.get_mut();
+        if this.done {
+            return std::task::Poll::Ready(Err(Error::InvalidArgument(
+                "a traversal polled after it resolved".to_owned(),
+            )));
+        }
+        let r = this.step(cx);
+        if r.is_ready() {
+            this.done = true;
+            this.hop = None;
+        }
+        r
+    }
 }
 
 #[cfg(test)]

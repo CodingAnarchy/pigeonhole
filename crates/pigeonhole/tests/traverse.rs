@@ -337,3 +337,171 @@ fn limits_and_arguments() {
     assert_eq!(e.code(), ErrorCode::FamilyNotFound, "{e}");
     db.close().expect("close");
 }
+
+/// D304 PR 2: `run_async` returns `run`'s hops and parents, from a cold block cache (a
+/// reopen) so its keys' blocks are fetched, for every limit set. The work counts (`rows`,
+/// `edges`) match too when no hop was cut: a cut hop's sync read may run on in other
+/// tablets' groups up to their own stop, where the async one reads a single group.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_traversal_returns_what_the_sync_one_returns() {
+    let (dir, db, t) = open();
+    let mut rng = Rng(SEED ^ 3);
+    build(&db, &t, &mut rng);
+    t.split_over_shards((1..6).map(|i| node(i * 100)).collect())
+        .expect("split");
+    db.compact().expect("compact");
+    db.close().expect("close");
+    let limits = [
+        Limits {
+            hops: 3,
+            per_node: 0,
+            per_hop: 0,
+            max_nodes: u64::MAX,
+        },
+        Limits {
+            hops: 4,
+            per_node: 3,
+            per_hop: 0,
+            max_nodes: u64::MAX,
+        },
+        Limits {
+            hops: 4,
+            per_node: 0,
+            per_hop: 10,
+            max_nodes: u64::MAX,
+        },
+        Limits {
+            hops: 5,
+            per_node: 5,
+            per_hop: 25,
+            max_nodes: 120,
+        },
+    ];
+    for l in limits {
+        // Cold for the async run.
+        let db =
+            Pigeonhole::open(dir.join("g.phdb"), Options::default().shards(2)).expect("reopen");
+        let t = db.table("g").expect("table").open().expect("open table");
+        let s = db.snapshot().expect("snapshot");
+        let seeds = KeySet::from_unsorted([node(7), node(301), node(450)]);
+        let go = |r| with_limits(r, &s, l);
+        let a = pigeonhole::doc_support::block_on(go(t.traverse(&seeds)).run_async())
+            .expect("run_async");
+        let b = go(t.traverse(&seeds)).run().expect("run");
+        assert_eq!(a.hops(), b.hops(), "{l:?}");
+        let (sa, sb) = (a.stats(), b.stats());
+        assert_eq!(
+            (sa.hops_cut, sa.cut_by_max_nodes),
+            (sb.hops_cut, sb.cut_by_max_nodes)
+        );
+        if sb.hops_cut == 0 {
+            assert_eq!((sa.rows, sa.edges), (sb.rows, sb.edges), "{l:?}");
+        }
+        db.close().expect("close");
+    }
+}
+
+/// A poll reads at most 4,096 edges, then yields (D304 rev 1, A2): an uncapped hub of 10,000
+/// edges, every block cached, takes at least three polls, and the result is `run`'s.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_traversal_yields_within_a_hub() {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
+    struct Count(AtomicUsize);
+    impl Wake for Count {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let (_dir, db, t) = open();
+    for chunk in (0..10_000u32).collect::<Vec<_>>().chunks(1_000) {
+        let mut m = t.mutate(b"hub");
+        for &e in chunk {
+            m = m.put("out", format!("x{e:05}").as_bytes(), b"");
+        }
+        m.commit().expect("commit");
+    }
+    let seeds = KeySet::from_unsorted([b"hub"]);
+    let want = t
+        .traverse(&seeds)
+        .family("out")
+        .run()
+        .expect("run (warms the cache)");
+    let count = Arc::new(Count(AtomicUsize::new(0)));
+    let waker = Waker::from(Arc::clone(&count));
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(t.traverse(&seeds).family("out").run_async());
+    let mut pending = 0;
+    let got = loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => break r.expect("run_async"),
+            Poll::Pending => pending += 1,
+        }
+        assert!(pending < 1_000, "never finished");
+    };
+    assert_eq!(got.hops(), want.hops());
+    assert_eq!(got.hops()[0].nodes().len(), 10_000);
+    assert!(pending >= 2, "{pending} yields for 10,000 edges");
+    assert!(
+        count.0.load(Ordering::Relaxed) >= 2,
+        "each yield woke the task"
+    );
+    db.close().expect("close");
+}
+
+/// Dropping an async traversal between a `Pending` and the next poll (D304 rev 1, A3)
+/// releases what it holds: the database flushes, compacts, traverses and closes after.
+#[cfg(feature = "async")]
+#[test]
+fn a_dropped_async_traversal_releases_what_it_holds() {
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+    let (dir, db, t) = open();
+    let mut rng = Rng(SEED ^ 4);
+    build(&db, &t, &mut rng);
+    db.close().expect("close");
+    let db = Pigeonhole::open(dir.join("g.phdb"), Options::default().shards(2)).expect("reopen");
+    let t = db.table("g").expect("table").open().expect("open table");
+    let seeds = KeySet::from_unsorted((0..NODES).step_by(3).map(node));
+    {
+        let mut fut = std::pin::pin!(t.traverse(&seeds).family("out").hops(4).run_async());
+        let mut cx = Context::from_waker(Waker::noop());
+        // A cold cache: the first poll waits on a fetch (or the budget).
+        assert!(matches!(fut.as_mut().poll(&mut cx), Poll::Pending));
+    }
+    t.mutate(&node(1))
+        .put("out", &node(2), b"after")
+        .commit()
+        .expect("commit");
+    db.flush().expect("flush");
+    db.compact().expect("compact");
+    let r = t.traverse(&seeds).family("out").run().expect("run");
+    assert!(!r.hops().is_empty());
+    db.close().expect("close");
+}
+
+fn with_limits<'t>(
+    r: pigeonhole::Traverse<'t>,
+    s: &Snapshot,
+    l: Limits,
+) -> pigeonhole::Traverse<'t> {
+    r.family("out")
+        .snapshot(s)
+        .hops(l.hops)
+        .per_node_limit(l.per_node)
+        .hop_limit(l.per_hop)
+        .max_nodes(l.max_nodes)
+        .parents(true)
+}
+
+/// `run_async`'s future is `Send`, so a multi-threaded executor can run it (compile-time).
+#[cfg(feature = "async")]
+#[allow(dead_code)]
+fn run_async_is_send(t: &Table, seeds: &KeySet) {
+    fn send<T: Send>(_: T) {}
+    send(t.traverse(seeds).family("out").run_async());
+}
