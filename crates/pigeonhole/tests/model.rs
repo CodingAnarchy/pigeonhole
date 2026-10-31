@@ -845,6 +845,88 @@ fn walk_row(
     Ok(out)
 }
 
+/// Per hop, the nodes (sorted) and their parents' indexes in the previous hop.
+type TraversalHops = Vec<Vec<(Vec<u8>, u32)>>;
+
+/// Two hops of `Table::traverse` (D304) over `family`, with parents.
+fn traverse_hops(
+    t: &pigeonhole::Table,
+    seeds: &pigeonhole::KeySet,
+    family: &str,
+    per_node: u32,
+    per_hop: u64,
+    snap: Option<&pigeonhole::Snapshot>,
+) -> pigeonhole::Result<TraversalHops> {
+    let mut r = t
+        .traverse(seeds)
+        .family(family)
+        .hops(2)
+        .per_node_limit(per_node)
+        .hop_limit(per_hop)
+        .parents(true);
+    if let Some(s) = snap {
+        r = r.snapshot(s);
+    }
+    let out = r.run()?;
+    Ok(out
+        .hops()
+        .iter()
+        .map(|h| {
+            h.nodes()
+                .iter()
+                .map(<[u8]>::to_vec)
+                .zip(h.parents().expect("asked for").iter().copied())
+                .collect()
+        })
+        .collect())
+}
+
+/// D304 §2.1 over the model: per hop, the frontier's rows in key order and each row's newest
+/// versions in qualifier order, the first `per_node` of them (0: all), each destination not visited
+/// before kept once with its first source, at most `per_hop` (0: all).
+fn model_traversal(
+    model: &pigeonhole_sim::Model,
+    table: &str,
+    seeds: &pigeonhole::KeySet,
+    family: &str,
+    (per_node, per_hop): (u32, u64),
+    ms: u64,
+    now: u64,
+) -> Result<TraversalHops, pigeonhole_sim::ModelError> {
+    let mut visited: std::collections::HashSet<Vec<u8>> =
+        seeds.iter().map(<[u8]>::to_vec).collect();
+    let mut frontier: Vec<Vec<u8>> = seeds.iter().map(<[u8]>::to_vec).collect();
+    let mut out = Vec::new();
+    for _ in 0..2 {
+        let mut kept: Vec<(Vec<u8>, u32)> = Vec::new();
+        'rows: for (i, k) in frontier.iter().enumerate() {
+            let cells = model.try_read_row(table, k, &[family], 1, ms, now)?;
+            let cap = if per_node == 0 {
+                usize::MAX
+            } else {
+                per_node as usize
+            };
+            for c in cells.iter().take(cap) {
+                if visited.contains(&c.qualifier) || kept.iter().any(|(d, _)| *d == c.qualifier) {
+                    continue;
+                }
+                if per_hop != 0 && kept.len() as u64 == per_hop {
+                    break 'rows;
+                }
+                kept.push((c.qualifier.clone(), i as u32));
+            }
+        }
+        if kept.is_empty() {
+            break;
+        }
+        kept.sort();
+        visited.extend(kept.iter().map(|(d, _)| d.clone()));
+        frontier = kept.iter().map(|(d, _)| d.clone()).collect();
+        out.push(kept);
+    }
+    Ok(out)
+}
+
 /// An owned public row as model cells (through `Row::entry`).
 fn owned_cells(row: &pigeonhole::Row) -> Vec<ModelCell> {
     (0..row.len())
@@ -2393,6 +2475,33 @@ impl Run {
                     (g, w) => {
                         return Err(format!(
                             "multi-get of {} keys (model seqno {ms}): store {g:?} vs model {w:?}",
+                            keys.len()
+                        ));
+                    }
+                }
+                // A two-hop traversal (D304) from the same keys over the get's family, with
+                // limits taken from the model's seqno (not the RNG; 0 is no limit): the hops
+                // as a BFS over the model's rows gives them. The workload's qualifiers never
+                // name rows, so this checks hop 1; #1232 adds a graph-shaped table.
+                let (m, n) = ((ms % 4) as u32, (ms / 4) % 4);
+                let got = traverse_hops(t, &keys, &family, m, n, snap.as_ref().map(|(s, _)| s));
+                let want =
+                    model_traversal(&self.model, TABLES[ti], &keys, &family, (m, n), ms, now);
+                match (got, want) {
+                    (Ok(g), Ok(w)) if g == w => {}
+                    (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
+                        if e.code() == ErrorCode::MergeFailed => {}
+                    (Err(e), _) if self.armed && self.fired() => {
+                        return self.recover_fired(&e);
+                    }
+                    (Err(e), _) if self.failed_over() => {
+                        return self.recover_in_place(&format!("read: {e}"), None);
+                    }
+                    (Err(e), _) if self.injected(&e) => {}
+                    (g, w) => {
+                        return Err(format!(
+                            "traversal from {} keys over {family}, per node {m}, per hop {n} \
+                             (model seqno {ms}): store {g:?} vs model {w:?}",
                             keys.len()
                         ));
                     }

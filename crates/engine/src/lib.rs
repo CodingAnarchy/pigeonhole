@@ -78,6 +78,10 @@ pub use read::reduce::{
     CellKey, CellRef, CellVisitor, Dedupe, Limit, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec,
     ReduceStats, Reduced, Reducer, RowRange, TopK, Visit,
 };
+pub use read::traverse::{
+    DEFAULT_MAX_NODES, Hop, MAX_HOPS, TRAVERSE_PARALLEL_FLOOR, Traversal, TraverseSpec,
+    TraverseStats,
+};
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};
 #[doc(hidden)]

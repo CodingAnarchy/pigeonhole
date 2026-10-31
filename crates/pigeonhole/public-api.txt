@@ -377,6 +377,10 @@ impl pigeonhole::HistogramParams
 pub fn pigeonhole::HistogramParams::bounds(&self) -> alloc::vec::Vec<f64>
 pub fn pigeonhole::HistogramParams::bucket_of(&self, f64) -> usize
 pub fn pigeonhole::HistogramParams::new(impl core::convert::Into<alloc::vec::Vec<f64>>) -> pigeonhole::Result<Self>
+#[non_exhaustive] pub struct pigeonhole::Hop
+impl pigeonhole::Hop
+pub fn pigeonhole::Hop::nodes(&self) -> &pigeonhole_engine::read::keys::KeySet
+pub fn pigeonhole::Hop::parents(&self) -> core::option::Option<&[u32]>
 #[non_exhaustive] pub struct pigeonhole::IoRings
 pub pigeonhole::IoRings::attach_failures: u64
 pub pigeonhole::IoRings::inline: u64
@@ -513,6 +517,7 @@ pub fn pigeonhole::ReadTable::row<'t>(&'t self, &[u8]) -> pigeonhole::RowRead<'t
 pub fn pigeonhole::ReadTable::scan<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(&self, impl core::ops::range::RangeBounds<&'k K>) -> pigeonhole::Scan<'_>
 pub fn pigeonhole::ReadTable::scan_bounds(&self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> pigeonhole::Scan<'_>
 pub fn pigeonhole::ReadTable::scan_prefix(&self, &[u8]) -> pigeonhole::Scan<'_>
+pub fn pigeonhole::ReadTable::traverse<'t>(&'t self, &pigeonhole_engine::read::keys::KeySet) -> pigeonhole::Traverse<'t>
 pub struct pigeonhole::ReaderOptions
 impl pigeonhole::ReaderOptions
 pub fn pigeonhole::ReaderOptions::allow_fuse(self, bool) -> Self
@@ -692,6 +697,7 @@ pub fn pigeonhole::Table::scan<'k, K: core::convert::AsRef<[u8]> + ?core::marker
 pub fn pigeonhole::Table::scan_bounds(&self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> pigeonhole::Scan<'_>
 pub fn pigeonhole::Table::scan_prefix(&self, &[u8]) -> pigeonhole::Scan<'_>
 pub fn pigeonhole::Table::shard_of(&self, &[u8]) -> core::option::Option<usize>
+pub fn pigeonhole::Table::traverse<'t>(&'t self, &pigeonhole_engine::read::keys::KeySet) -> pigeonhole::Traverse<'t>
 pub struct pigeonhole::TableBuilder<'db>
 impl pigeonhole::TableBuilder<'_>
 pub fn pigeonhole::TableBuilder<'_>::create(self) -> pigeonhole::Result<pigeonhole::Table>
@@ -736,6 +742,33 @@ pub fn pigeonhole::Transaction::put_u64_at(&mut self, &pigeonhole::Table, &[u8],
 impl pigeonhole::Transaction
 pub fn pigeonhole::Transaction::commit_async(self) -> pigeonhole::nonblocking::TransactionCommitFuture
 pub fn pigeonhole::Transaction::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::TransactionCommitFuture
+#[non_exhaustive] pub struct pigeonhole::Traversal
+impl pigeonhole::Traversal
+pub fn pigeonhole::Traversal::hops(&self) -> &[pigeonhole::Hop]
+pub fn pigeonhole::Traversal::stats(&self) -> pigeonhole::TraverseStats
+pub struct pigeonhole::Traverse<'t>
+impl<'t> pigeonhole::Traverse<'t>
+pub fn pigeonhole::Traverse<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
+pub fn pigeonhole::Traverse<'t>::family(self, &str) -> Self
+pub fn pigeonhole::Traverse<'t>::hop_limit(self, u64) -> Self
+pub fn pigeonhole::Traverse<'t>::hops(self, u32) -> Self
+pub fn pigeonhole::Traverse<'t>::latest(self) -> Self
+pub fn pigeonhole::Traverse<'t>::max_nodes(self, u64) -> Self
+pub fn pigeonhole::Traverse<'t>::parallel(self, usize) -> Self
+pub fn pigeonhole::Traverse<'t>::parents(self, bool) -> Self
+pub fn pigeonhole::Traverse<'t>::per_node_limit(self, u32) -> Self
+pub fn pigeonhole::Traverse<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> Self
+pub fn pigeonhole::Traverse<'t>::qualifier_prefix(self, &[u8]) -> Self
+pub fn pigeonhole::Traverse<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
+pub fn pigeonhole::Traverse<'t>::run(self) -> pigeonhole::Result<pigeonhole::Traversal>
+pub fn pigeonhole::Traverse<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
+pub fn pigeonhole::Traverse<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
+pub fn pigeonhole::Traverse<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
+#[non_exhaustive] pub struct pigeonhole::TraverseStats
+pub pigeonhole::TraverseStats::cut_by_max_nodes: bool
+pub pigeonhole::TraverseStats::edges: u64
+pub pigeonhole::TraverseStats::hops_cut: u32
+pub pigeonhole::TraverseStats::rows: u64
 #[non_exhaustive] pub struct pigeonhole::WalFile
 pub pigeonhole::WalFile::checkpoint: pigeonhole::WalPosition
 pub pigeonhole::WalFile::end: pigeonhole::WalPosition
