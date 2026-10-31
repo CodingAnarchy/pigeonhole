@@ -33,3 +33,6 @@ The load controller is on by default (`Options::adaptive_shard_threads`, now pub
 
 ## Amendment (owner, 2026-10-30; #760, D198's 2026-10-30 amendment)
 `CpuProfile::Server` also sets the shard's spin before parking to 1 ms; `Embedded` keeps the engine's 200 µs. The documented behaviour of `CpuProfile::Server` and `Options::cpu_profile` grows by that sentence; no signature changes. The window's own setter, `Options::shard_spin`, stays a hidden `__unstable-hooks` hook (ICR 0085), and an explicit window wins over the profile's.
+
+## Amendment (owner, 2026-10-30; #1176, #1201, D198's third amendment)
+`CpuProfile::Embedded`'s shard spin adapts: a 200 µs window that each shard thread may stretch up to 1 ms when its recent gaps between commits make that cost no more poll per gap than 200 µs. `CpuProfile::Server` keeps its fixed 1 ms. The documented behaviour of `CpuProfile::Embedded`, `CpuProfile::Server` and `Options::cpu_profile` changes to say so; no signature changes. A new hidden `__unstable-hooks` hook, `Options::shard_spin_cap`, sets the cap (ICR 0085). An explicit `Options::shard_spin` is a fixed window unless a cap comes with it.

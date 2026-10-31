@@ -150,6 +150,11 @@ OPTIONS:
                            [default: the library's, on (D216)]
     --shard-spin US        Pigeonhole: a shard's idle spin before it parks, in µs (D198)
                            [default: the library's]
+    --shard-spin-cap US    Pigeonhole: size each shard thread's idle spin from its recent
+                           gaps, up to US µs, at no more poll per gap than --shard-spin's
+                           window (#1176) [default: the library's: 1 ms under the
+                           Embedded profile; none, a fixed window, with --shard-spin
+                           or --server-profile]
     --shard-threads K      Pigeonhole: run the shards on K threads (D289)
                            [default: the library's CPU budget]
     --background-workers N Pigeonhole, application-owned (app-owned, scaling): N background
@@ -232,6 +237,7 @@ struct Args {
     async_in_flight: Option<usize>,
     row_cache: Option<u64>,
     shard_spin: Option<u64>,
+    shard_spin_cap: Option<u64>,
     shard_threads: Option<usize>,
     background_workers: usize,
     compaction_cores: Option<usize>,
@@ -320,6 +326,7 @@ fn parse_args(raw: impl IntoIterator<Item = String>) -> Result<Args, String> {
             "--async" => a.async_in_flight = Some(parse(&arg, it.next())?),
             "--row-cache" => a.row_cache = Some(parse(&arg, it.next())?),
             "--shard-spin" => a.shard_spin = Some(parse(&arg, it.next())?),
+            "--shard-spin-cap" => a.shard_spin_cap = Some(parse(&arg, it.next())?),
             "--shard-threads" => a.shard_threads = Some(parse(&arg, it.next())?),
             "--background-workers" => a.background_workers = parse(&arg, it.next())?,
             "--compaction-cores" => a.compaction_cores = Some(parse(&arg, it.next())?),
@@ -417,6 +424,9 @@ fn pigeonhole(a: &Args, shards: Option<usize>) -> PigeonholeRunner {
     }
     if let Some(us) = a.shard_spin {
         r = r.shard_spin_micros(us);
+    }
+    if let Some(us) = a.shard_spin_cap {
+        r = r.shard_spin_cap_micros(us);
     }
     if let Some(k) = a.shard_threads {
         r = r.shard_threads(k);
@@ -900,6 +910,10 @@ mod tests {
         let rc = args("ycsb-c --row-cache 1048576");
         assert_eq!(rc.row_cache, Some(1 << 20));
         assert_eq!(args("ycsb-a --shard-spin 200").shard_spin, Some(200));
+        assert_eq!(
+            args("ycsb-a --shard-spin-cap 1000").shard_spin_cap,
+            Some(1000)
+        );
         assert_eq!(args("ycsb-a --shard-threads 4").shard_threads, Some(4));
         let bw = args("app-owned --background-workers 4");
         assert_eq!(bw.background_workers, 4);

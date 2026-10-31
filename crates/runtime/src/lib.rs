@@ -172,6 +172,13 @@ pub struct RuntimeConfig {
     /// A window that finds nothing backs off: the thread skips the next 1, 2, 4, ... up to 32
     /// windows, and an idle shard (no message since its last park) never polls.
     pub idle_spin: Duration,
+    /// Engine-owned mode: the longest window a driver may poll for (#1176). Above
+    /// `idle_spin`, each driver sizes its window from its recent idle gaps: the longest, up
+    /// to this cap, whose expected poll per gap costs no more than `idle_spin`'s could. A
+    /// steady stream of messages then waits for a wake about as rarely as under the cap, and
+    /// a sparse one polls no longer per message than under `idle_spin`. Zero (the default),
+    /// or at most `idle_spin`: the window is `idle_spin`, fixed.
+    pub idle_spin_cap: Duration,
     /// Clock source (simulated under test).
     pub vfs: VfsRef,
 }
@@ -188,6 +195,7 @@ impl RuntimeConfig {
             adaptive_drivers: false,
             time_slice: Duration::from_micros(500),
             idle_spin: Duration::ZERO,
+            idle_spin_cap: Duration::ZERO,
             vfs,
         }
     }
@@ -482,6 +490,8 @@ struct ShardCore<H: ShardHandler> {
 #[derive(Debug)]
 struct IdleSpin {
     window: Duration,
+    /// The adaptive window's cap (`RuntimeConfig::idle_spin_cap`); at most `window`: fixed.
+    cap: Duration,
     /// A message was handled since the thread last parked or polled.
     worked: bool,
     /// Polls still to skip after one found nothing, and the backoff exponent.
@@ -493,9 +503,10 @@ impl IdleSpin {
     /// The most polls skipped after polls kept finding nothing.
     const MAX_SKIP: u32 = 64;
 
-    fn new(window: Duration) -> Self {
+    fn new(window: Duration, cap: Duration) -> Self {
         Self {
             window,
+            cap,
             worked: false,
             skip: 0,
             level: 0,
@@ -834,7 +845,7 @@ fn build<H: ShardHandler>(
             #[cfg(debug_assertions)]
             released: false,
             own_ring: false,
-            spin: IdleSpin::new(config.idle_spin),
+            spin: IdleSpin::new(config.idle_spin, config.idle_spin_cap),
         })
         .collect();
     (submitters, cores)

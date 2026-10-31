@@ -1527,6 +1527,7 @@ impl Engine {
         config.shard_threads = options.shard_threads;
         config.adaptive_drivers = options.adaptive_drivers;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
+        config.idle_spin_cap = std::time::Duration::from_nanos(options.shard_spin_cap_nanos);
         let bound = match options.async_commit_bound {
             0 => options.memtable_budget / 2,
             b => b,

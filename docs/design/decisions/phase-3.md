@@ -154,7 +154,25 @@ RocksDB writes on the caller's thread (a write-group leader), which is the main 
 
 RocksDB's sparse-wide `Buffered` put p99 is 17 µs: about 2.9× under `Embedded` and 1.6× under `Server`; the remainder is the cross-thread hand-off and is #760's 1.0 gap. Why per profile: the cost lands on whoever shares the CPU. An application in the same process, a laptop or a CPU-limited container should not pay about two cores for the tail; a database with the machine to itself (D289's `Server`) should. Cost of 1 ms: up to about 2 more cores at a moderate steady rate (a few thousand commits per second per driver keep its window from closing), about 1.6 at full load on sparse-wide with 6% fewer of its ops/s, and nothing measurable idle or below 4,000 ops/s; the idle-CPU test (`crates/engine/tests/idle_spin.rs`) passes. `shard_spin(Duration::ZERO)` or a shorter window still trades the tail back for CPU.
 
-*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above).*
+- **Third amendment (owner, 2026-10-30; #1176 option 1, #1201): under `CpuProfile::Embedded` the shard's window adapts, 200 µs up to 1 ms; `CpuProfile::Server` keeps a fixed 1 ms.**
+  - **How the window is sized.** Each engine-owned driver keeps a log2 histogram of its recent idle gaps, halved every 1024 gaps. A gap runs from the end of a pass with nothing left to the next pass. Every 32 gaps the driver picks the longest window, up to the cap, whose expected poll per gap, E[min(gap, W)], is at most the base window's 200 µs.
+  - **What that guarantees.** The window is never shorter than 200 µs, and a driver never polls more per gap than the fixed 200 µs window could. Steady streams, whose gaps are mostly short, get the full 1 ms and catch the rare long gap a fixed 200 µs parks through.
+  - **Where it lives.** The state is local to the driver thread, so there's no new shared state. The engine's knob is `EngineOptions::shard_spin_cap_nanos`, whose own default of 0 keeps a fixed window. `pigeonhole` maps `Embedded` to a 200 µs window with a 1 ms cap (ICR 0081 amended). An explicit `Options::shard_spin` (the hidden hook, ICR 0085) is fixed unless `Options::shard_spin_cap`, also hidden, comes with it.
+  - **What doesn't change:** the client's 50 µs (D253), the backoff, and the rule that an idle shard never polls.
+  - **Why:** the 1 ms window's tail without its cost at a moderate load. The box A/Bs (ctr274, 2026-10-30, AX102, 16 clients, full scale; `.coord/out-1176a-20261030`, `.coord/out-1176b-20261030`; #1176 c6530541983, c6535521825):
+
+| row | fixed 200 µs | fixed 1 ms (`Server`) | adaptive 200 µs → 1 ms |
+|---|--:|--:|--:|
+| sparse-wide default put p99 (×3) | 390 µs | 133 µs | 122 µs |
+| sparse-wide `Buffered` put p99 | 38.1 µs (×3) | 26.6 µs (×3) | 27 µs (median of 6) |
+| ycsb-a `Buffered` paced to 1,000 / 4,000 ops/s: cores | 0.11 / 0.32 | 0.12 / 0.38 | 0.11 / 0.34 |
+| ycsb-a `Buffered` paced to 20,000 ops/s: cores, put p99 | 0.65, 37 µs | 3.49, 24 µs | 0.98, 29–36 µs |
+| cores, sparse-wide full-load rows | 15.2–15.6 | 16.8–17.3 | 16.3–16.6 |
+| ycsb-a, ycsb-f, ycsb-f transactional, transfer, counters (both levels, ×3; `.coord/out-1176c-20261031`) | | | ops/s 0.996–1.020×, p99 level within run spread; cores −0.15 to +0.29 at `Buffered`, +0.3 to +1.2 at the default durability |
+
+At 20K ops/s spread over 16 drivers, each driver's gaps average about 800 µs. So a window past about 256 µs would cost more poll per gap than 200 µs, and the windows stay at 200–256 µs. That's what keeps the CPU near `Embedded`'s.
+
+*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above). Amended by the owner, 2026-10-30 (under `Embedded` the window adapts from 200 µs up to 1 ms; the third amendment above).*
 
 <a id="d199"></a>
 ## D199 — The stale-tail index is on by default; its write cost is accepted for its read gains (owner decision, 2026-10-09; memtable, engine, bench, #387; amends D194)

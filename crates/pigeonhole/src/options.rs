@@ -67,6 +67,7 @@ pub struct Options {
     write_stall_timeout: Option<Duration>,
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
+    shard_spin_cap: Option<Duration>,
     shard_threads: Option<usize>,
     adaptive_shard_threads: bool,
     background_workers: usize,
@@ -81,15 +82,19 @@ pub struct Options {
 pub enum CpuProfile {
     /// The application runs in the same process and needs CPU of its own: the engine's
     /// driver and compaction threads take a share of the physical cores and leave the rest,
-    /// and every SMT sibling, to the application. The default.
+    /// and every SMT sibling, to the application. A shard thread that handled a commit
+    /// polls for the next one before it sleeps for a window sized from its recent gaps
+    /// between commits: up to 1 ms when they come steadily, and never more poll per gap
+    /// than a 200 µs window would cost (D198 as amended again on 2026-10-30; #1176). The
+    /// default.
     #[default]
     Embedded,
     /// The database has the machine or container to itself, and its clients reach it from
     /// elsewhere (another container, over IPC or the network): flush and compaction take
     /// half the physical cores instead of a quarter, and a shard thread that handled a
-    /// commit keeps polling 1 ms for the next one before it sleeps, instead of 200 µs.
-    /// Under a moderate steady load that costs up to about two cores and trims the commit
-    /// tail (D198 as amended on 2026-10-30). Shard threads are the same as with `Embedded`:
+    /// commit always polls 1 ms for the next one before it sleeps. Under a moderate steady
+    /// load that costs up to about two cores more than `Embedded` and trims the commit
+    /// tail further (D198 as amended on 2026-10-30). Shard threads are the same as with `Embedded`:
     /// up to one per shard, sized to the load by default
     /// ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     Server,
@@ -147,6 +152,18 @@ fn shard_spin_default(profile: CpuProfile) -> Option<Duration> {
     match profile {
         CpuProfile::Embedded => None,
         CpuProfile::Server => Some(Duration::from_millis(1)),
+    }
+}
+
+/// The cap of `Embedded`'s adaptive window (D198's third amendment, #1176): each shard thread polls up to 1 ms when
+/// its recent gaps between commits make that cost no more poll per gap than the fixed 200
+/// µs window could. On the reference machine that took sparse-wide's default-durability put
+/// p99 from 390 to 122 µs and its `Buffered` put p99 to `Server`'s, at `Embedded`'s CPU under
+/// a paced 1K and 4K commits/s, and 0.3 cores more at 20K. `Server` keeps its fixed 1 ms.
+fn shard_spin_cap_default(profile: CpuProfile) -> Option<Duration> {
+    match profile {
+        CpuProfile::Embedded => Some(Duration::from_millis(1)),
+        CpuProfile::Server => None,
     }
 }
 
@@ -219,6 +236,7 @@ impl Default for Options {
             write_stall_timeout: None,
             commit_spin: None,
             shard_spin: None,
+            shard_spin_cap: None,
             shard_threads: None,
             adaptive_shard_threads: true,
             background_workers: 0,
@@ -433,7 +451,8 @@ impl Options {
     /// the API: the default suits applications.
     ///
     /// How long a shard thread that just handled a commit keeps polling for the next one
-    /// before it sleeps (default 200 µs, or 1 ms with [`CpuProfile::Server`]; D198 as amended
+    /// before it sleeps (default 200 µs, sized up to 1 ms from the shard's recent gaps; a fixed
+    /// 1 ms with [`CpuProfile::Server`]; a window set here is fixed; D198 as amended
     /// on 2026-10-19 and 2026-10-30), so a steady stream
     /// of commits is taken without waking the thread each time, and a store whose clients
     /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
@@ -443,6 +462,20 @@ impl Options {
     #[doc(hidden)]
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
+        self
+    }
+
+    /// A test and bench hook (#1176), only with the `__unstable-hooks` feature and outside
+    /// the API.
+    ///
+    /// Sizes each shard thread's poll from its recent idle gaps, up to `cap`: the longest
+    /// poll whose expected cost per gap is no more than the [`shard_spin`](Self::shard_spin)
+    /// window's could be. A cap at or below that window keeps the window fixed, as with no
+    /// cap (the default under [`CpuProfile::Server`] or with an explicit window).
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
+    pub fn shard_spin_cap(mut self, cap: Duration) -> Self {
+        self.shard_spin_cap = Some(cap);
         self
     }
 
@@ -482,12 +515,13 @@ impl Options {
     ///   ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
     ///   and needs CPU too. Flush and compaction take a quarter of the physical cores, and a
-    ///   shard thread polls 200 µs for the next commit before it sleeps.
+    ///   shard thread polls for the next commit before it sleeps: up to 1 ms while commits
+    ///   come steadily, at no more poll per gap than 200 µs would cost.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
     ///   and its clients reach it from elsewhere (another container, over IPC or the
     ///   network). Flush and compaction take half the physical cores, and a shard thread
-    ///   polls 1 ms for the next commit before it sleeps: a lower commit tail for up to
-    ///   about two more cores under a moderate steady load.
+    ///   always polls 1 ms for the next commit before it sleeps: a lower commit tail at a
+    ///   moderate steady load, for up to about two more cores.
     /// - **CPU limits:** "physical cores" means those the process may use: its affinity
     ///   mask and a container's CPU quota both narrow them, so a 4-CPU container sizes the
     ///   engine for 4 whatever the host has.
@@ -1329,6 +1363,16 @@ impl Options {
         if let Some(window) = self.shard_spin.or(shard_spin_default(self.cpu_profile)) {
             o.shard_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         }
+        // An explicit window is fixed unless a cap is set with it; otherwise the profile's
+        // cap applies (#1176).
+        let cap = match (self.shard_spin_cap, self.shard_spin) {
+            (Some(cap), _) => Some(cap),
+            (None, Some(_)) => None,
+            (None, None) => shard_spin_cap_default(self.cpu_profile),
+        };
+        if let Some(cap) = cap {
+            o.shard_spin_cap_nanos = u64::try_from(cap.as_nanos()).unwrap_or(u64::MAX);
+        }
         if let Some(timeout) = self.write_stall_timeout {
             o.write_stall_timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         }
@@ -1502,25 +1546,44 @@ mod tests {
         assert_eq!(e.shard_threads, 20);
     }
 
-    /// The shard's spin window by profile (D198, amended 2026-10-30): `Embedded` keeps the
-    /// engine's 200 µs, `Server` polls 1 ms, and an explicit window wins over either.
+    /// The shard's spin window by profile (D198, amended 2026-10-30; #1176): `Embedded`
+    /// polls 200 µs adaptive up to 1 ms, `Server` a fixed 1 ms, and an explicit window wins
+    /// over either.
     #[test]
     fn the_shard_spin_follows_the_profile() {
         use super::Options;
         let o = || Options::default().vfs(pigeonhole_io::sim::SimVfs::new(1));
-        let spin = |o: Options| o.to_engine_for(false).unwrap().shard_spin_nanos;
-        assert_eq!(spin(o()), 200_000);
-        assert_eq!(spin(o().cpu_profile(CpuProfile::Embedded)), 200_000);
-        assert_eq!(spin(o().cpu_profile(CpuProfile::Server)), 1_000_000);
+        let spin = |o: Options| {
+            let e = o.to_engine_for(false).unwrap();
+            (e.shard_spin_nanos, e.shard_spin_cap_nanos)
+        };
+        // `Embedded`: 200 µs, adaptive up to 1 ms (#1176); `Server`: a fixed 1 ms.
+        assert_eq!(spin(o()), (200_000, 1_000_000));
+        assert_eq!(
+            spin(o().cpu_profile(CpuProfile::Embedded)),
+            (200_000, 1_000_000)
+        );
+        assert_eq!(spin(o().cpu_profile(CpuProfile::Server)), (1_000_000, 0));
         #[cfg(feature = "__unstable-hooks")]
         {
             use std::time::Duration;
             let set = Duration::from_micros(300);
+            // An explicit window is fixed, under either profile, unless a cap comes with it.
             assert_eq!(
                 spin(o().cpu_profile(CpuProfile::Server).shard_spin(set)),
-                300_000
+                (300_000, 0)
             );
-            assert_eq!(spin(o().shard_spin(Duration::ZERO)), 0);
+            assert_eq!(spin(o().shard_spin(set)), (300_000, 0));
+            assert_eq!(spin(o().shard_spin(Duration::ZERO)), (0, 0));
+            assert_eq!(
+                spin(o().shard_spin(set).shard_spin_cap(Duration::from_millis(2))),
+                (300_000, 2_000_000)
+            );
+            // A cap alone keeps the profile's window.
+            assert_eq!(
+                spin(o().shard_spin_cap(Duration::from_micros(200))),
+                (200_000, 200_000)
+            );
         }
     }
 

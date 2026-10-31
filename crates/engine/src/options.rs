@@ -214,6 +214,12 @@ pub struct EngineOptions {
     /// Zero always parks. Application-owned shards are driven by the application and ignore
     /// it.
     pub shard_spin_nanos: u64,
+    /// The longest an engine-owned shard thread's poll may run, in nanoseconds (#1176).
+    /// Above `shard_spin_nanos`, each thread sizes its poll from its recent idle gaps: the
+    /// longest, up to this cap, whose expected poll per gap costs no more than
+    /// `shard_spin_nanos`'s could. Zero (the default), or at most `shard_spin_nanos`: the
+    /// poll is `shard_spin_nanos`, fixed.
+    pub shard_spin_cap_nanos: u64,
     /// The writer keeps a process-local stale-tail index beside each memtable, and row reads
     /// and scans pass a finished column's superseded memtable versions in one jump (D194,
     /// on by default per D199). Same results either way. It costs a write that overwrites a
@@ -269,6 +275,7 @@ impl EngineOptions {
             flush_backoff_nanos: 10_000_000,
             commit_spin_nanos: 50_000,
             shard_spin_nanos: 200_000,
+            shard_spin_cap_nanos: 0,
             memtable_tail_index: true,
             async_commit_bound: 0,
         }
