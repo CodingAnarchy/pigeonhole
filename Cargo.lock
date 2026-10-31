@@ -1213,6 +1213,7 @@ name = "pigeonhole-vector"
 version = "1.0.0"
 dependencies = [
  "pigeonhole",
+ "pigeonhole-vector",
 ]
 
 [[package]]
