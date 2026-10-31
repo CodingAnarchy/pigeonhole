@@ -505,3 +505,70 @@ fn run_async_is_send(t: &Table, seeds: &KeySet) {
     fn send<T: Send>(_: T) {}
     send(t.traverse(seeds).family("out").run_async());
 }
+
+/// Polls `fut` to completion with a counting waker: its output, and how often it was
+/// `Pending`.
+#[cfg(feature = "async")]
+fn poll_counting<F: std::future::Future>(fut: F) -> (F::Output, usize) {
+    use std::task::{Context, Poll, Waker};
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut pending = 0;
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => return (r, pending),
+            Poll::Pending => pending += 1,
+        }
+        assert!(pending < 100_000, "never finished");
+    }
+}
+
+/// #1237: the poll budget counts the edges a value filter drops (it is applied before the
+/// visitor, not in the read), and a run of frontier keys without a row yields too. A hub of
+/// 10,000 edges of which 1% pass the filter, and 20,000 absent seeds, each take several
+/// polls, and give `run`'s result.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_traversal_yields_over_filtered_edges_and_absent_keys() {
+    let (_dir, db, t) = open();
+    for chunk in (0..10_000u32).collect::<Vec<_>>().chunks(1_000) {
+        let mut m = t.mutate(b"hub");
+        for &e in chunk {
+            let v: &[u8] = if e % 100 == 0 { b"keep" } else { b"drop" };
+            m = m.put("out", format!("x{e:05}").as_bytes(), v);
+        }
+        m.commit().expect("commit");
+    }
+    db.flush().expect("flush");
+    let hub = KeySet::from_unsorted([b"hub"]);
+    let keep = || ValueFilter::Equals(b"keep".to_vec());
+    let want = t
+        .traverse(&hub)
+        .family("out")
+        .value_filter(keep())
+        .run()
+        .expect("run");
+    assert_eq!(want.hops()[0].nodes().len(), 100);
+    let (got, pending) = poll_counting(
+        t.traverse(&hub)
+            .family("out")
+            .value_filter(keep())
+            .run_async(),
+    );
+    assert_eq!(got.expect("run_async").hops(), want.hops());
+    assert!(
+        pending >= 2,
+        "{pending} yields over 10,000 edges, 9,900 filtered out"
+    );
+    // 20,000 seeds without a row, then the hub.
+    let seeds = KeySet::from_unsorted(
+        (0..20_000u32)
+            .map(|i| format!("a{i:05}").into_bytes())
+            .chain([b"hub".to_vec()]),
+    );
+    let want = t.traverse(&seeds).family("out").run().expect("run");
+    let (got, pending) = poll_counting(t.traverse(&seeds).family("out").run_async());
+    assert_eq!(got.expect("run_async").hops(), want.hops());
+    assert!(pending >= 4, "{pending} yields over 20,000 absent keys");
+    db.close().expect("close");
+}
