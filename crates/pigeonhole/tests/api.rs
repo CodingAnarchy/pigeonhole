@@ -1584,6 +1584,71 @@ fn histogram_and_quantile_families() {
     );
 }
 
+/// D298 PR 4: a bloom family takes `i64` and bytes elements and never misses one; an HLL
+/// family takes bytes elements too, apart from `i64`s; the parameters round-trip through
+/// `FamilyInfo`; bytes elements outside those two kinds are refused.
+#[test]
+fn bloom_families_and_bytes_elements() {
+    use pigeonhole::BloomParams;
+    let db = db();
+    let p = BloomParams::new(1 << 12, 4).unwrap();
+    let t = db
+        .table("seen")
+        .unwrap()
+        .family("b", Family::aggregate(Aggregation::Bloom(p)))
+        .family("u", Family::aggregate(Aggregation::Hll))
+        .family("c", Family::counter())
+        .create()
+        .unwrap();
+    let mut wb = db.write_batch();
+    for i in 0..200i64 {
+        wb.aggregate(&t, b"r", "b", b"ids", i);
+        wb.aggregate_bytes(&t, b"r", "b", b"names", format!("user-{i}").as_bytes());
+        wb.aggregate_bytes(
+            &t,
+            b"r",
+            "u",
+            b"names",
+            format!("user-{}", i % 50).as_bytes(),
+        );
+    }
+    wb.commit().unwrap();
+    let ids = t.get(b"r", "b", b"ids").unwrap().unwrap();
+    let names = t.get(b"r", "b", b"names").unwrap().unwrap();
+    assert!(
+        (0..200).all(|i| ids.bloom_contains(i) == Some(true)),
+        "no false negatives"
+    );
+    assert!(
+        (0..200).all(|i| names.bloom_contains_bytes(format!("user-{i}").as_bytes()) == Some(true))
+    );
+    let fp = (1000..3000)
+        .filter(|&i| ids.bloom_contains(i) == Some(true))
+        .count();
+    assert!(fp < 100, "false positives: {fp} of 2000");
+    assert!(ids.bloom_fill().unwrap() > 0.0);
+    let u = t.get(b"r", "u", b"names").unwrap().unwrap();
+    assert_eq!(u.hll_estimate(), Some(50));
+    // The parameters round-trip; bad ones are refused.
+    assert_eq!(
+        t.family_info("b").unwrap().aggregation,
+        Some(Aggregation::Bloom(p))
+    );
+    assert_eq!((p.bits(), p.hashes()), (4096, 4));
+    for (bits, k) in [(100, 3), (32, 3), (1 << 25, 3), (1024, 0), (1024, 17)] {
+        let err = BloomParams::new(bits, k).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{bits} {k}: {err}");
+    }
+    // aggregate_bytes only in an HLL or bloom family.
+    let err = t
+        .mutate(b"r")
+        .aggregate_bytes("c", b"q", b"x")
+        .commit()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+    assert!(err.message().contains("not aggregate_bytes"), "{err}");
+}
+
 /// A family that names `pigeonhole.i64_add` without being a counter family reads and writes
 /// as 0.1.0 created them (D41): increments at the commit timestamp, folded across
 /// timestamps, and bytes on top of a counter fail at read.

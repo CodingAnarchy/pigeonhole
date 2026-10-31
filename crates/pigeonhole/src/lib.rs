@@ -164,8 +164,8 @@ pub use info::{
 };
 pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
 pub use options::{
-    Aggregation, Compaction, CpuProfile, Family, HistogramParams, IoBackend, IoRings, Options,
-    Priority, QuantileParams, ReaderOptions, Recovery, days,
+    Aggregation, BloomParams, Compaction, CpuProfile, Family, HistogramParams, IoBackend, IoRings,
+    Options, Priority, QuantileParams, ReaderOptions, Recovery, days,
 };
 /// A sorted set of distinct row keys, the input of [`Table::keys`] (D299).
 pub use pigeonhole_engine::KeySet;

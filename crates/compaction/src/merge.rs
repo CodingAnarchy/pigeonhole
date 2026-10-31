@@ -654,6 +654,77 @@ impl MergeOperator for Buckets {
     }
 }
 
+/// Bloom filter union (D298), the operator of a `FamilyKind::Bloom` family, built from the
+/// family's parameters (`kind_params`): operands and values are `ValueTag::Bytes` filter
+/// states (`pigeonhole_format::bloom`; an element becomes its one-element state before the
+/// WAL), and a merge is their bitwise OR in canonical form. It folds in place: a dense
+/// accumulator takes each operand's bits without allocating, so a fold costs the size of its
+/// operands, not `m` per operand. A state of other parameters, a malformed one or another tag
+/// is a [`MergeError`].
+///
+/// ```
+/// use pigeonhole_compaction::{BloomUnion, MergeOperator};
+/// use pigeonhole_format::bloom::{self, BloomParams};
+///
+/// let p = BloomParams { log2_bits: 10, hashes: 3 };
+/// let state = |v: i64| {
+///     let mut s = vec![0u8]; // ValueTag::Bytes
+///     bloom::append_element(&mut s, p, pigeonhole_format::hll::hash_i64(v));
+///     s
+/// };
+/// let op = BloomUnion::new(p);
+/// let mut acc = state(1);
+/// op.merge(&mut acc, &state(2)).unwrap();
+/// assert!(bloom::contains(&acc[1..], pigeonhole_format::hll::hash_i64(2)).unwrap());
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct BloomUnion {
+    params: pigeonhole_format::bloom::BloomParams,
+}
+
+impl BloomUnion {
+    /// The operator's name.
+    pub const NAME: &'static str = "pigeonhole.bloom";
+
+    /// The union for filters of `params` (checked by the caller).
+    pub fn new(params: pigeonhole_format::bloom::BloomParams) -> Self {
+        BloomUnion { params }
+    }
+
+    fn state<'a>(v: &'a [u8], what: &str) -> Result<&'a [u8], MergeError> {
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => Ok(rest),
+            _ => Err(MergeError::new(Self::NAME, what)),
+        }
+    }
+
+    fn merge_into(&self, acc: &mut Vec<u8>, other: &[u8]) -> Result<(), MergeError> {
+        Self::state(acc, "operand is not a bloom state")?;
+        pigeonhole_format::bloom::merge_at(acc, 1, self.params, other)
+            .map_err(|e| MergeError::new(Self::NAME, e.0))
+    }
+}
+
+impl MergeOperator for BloomUnion {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        self.merge_into(acc, Self::state(older, "operand is not a bloom state")?)
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        if let Some(base) = base {
+            self.merge_into(acc, Self::state(base, "base value is not a bloom state")?)?;
+        }
+        // The accumulator's own bits are checked here, once per fold.
+        let state = Self::state(acc, "operand is not a bloom state")?;
+        pigeonhole_format::bloom::validate(state, self.params)
+            .map_err(|e| MergeError::new(Self::NAME, e.0))
+    }
+}
+
 /// Built-in HyperLogLog union, the operator of a `FamilyKind::Hll` family (D294): operands
 /// and values are `ValueTag::Bytes` sketches (`pigeonhole_format::hll`), and the result is
 /// their register-wise maximum, in canonical form. It folds in place: no decode, no re-encode,
@@ -760,6 +831,12 @@ impl MergeRegistry {
         // Their names only: a family of these kinds binds its own, from its parameters.
         r.register(Arc::new(Buckets::histogram(vec![0.0])));
         r.register(Arc::new(Buckets::quantiles(Default::default())));
+        r.register(Arc::new(BloomUnion::new(
+            pigeonhole_format::bloom::BloomParams {
+                log2_bits: 6,
+                hashes: 1,
+            },
+        )));
         r
     }
 

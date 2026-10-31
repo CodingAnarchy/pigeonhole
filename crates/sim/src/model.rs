@@ -73,6 +73,9 @@ pub enum ModelAggregation {
     /// A quantile sketch of finite `f64` inputs with the model's parameters (D298), as
     /// [`Histogram`](Self::Histogram).
     Quantiles,
+    /// A bloom filter of `i64` elements with the model's parameters (D298), as the store's
+    /// state, which [`bloom_state`](crate::bloom_state) writes independently.
+    Bloom,
 }
 
 impl ModelAggregation {
@@ -110,6 +113,7 @@ impl ModelAggregation {
                 | ModelAggregation::MeanVar
                 | ModelAggregation::Histogram
                 | ModelAggregation::Quantiles
+                | ModelAggregation::Bloom
         )
     }
 
@@ -129,6 +133,7 @@ impl ModelAggregation {
             ModelAggregation::MeanVar => crate::exact_state(true, base, elements),
             ModelAggregation::Histogram => crate::bucket_state(false, base, elements),
             ModelAggregation::Quantiles => crate::bucket_state(true, base, elements),
+            ModelAggregation::Bloom => crate::bloom_state(base, elements),
             _ => unreachable!("not a state kind"),
         }
     }
@@ -141,6 +146,7 @@ impl ModelAggregation {
             ModelAggregation::MeanVar => crate::exact_state_valid(true, s),
             ModelAggregation::Histogram => crate::bucket_state_valid(false, s),
             ModelAggregation::Quantiles => crate::bucket_state_valid(true, s),
+            ModelAggregation::Bloom => crate::bloom_state_valid(s),
             _ => false,
         }
     }
@@ -156,7 +162,8 @@ impl ModelAggregation {
             | ModelAggregation::SumF64
             | ModelAggregation::MeanVar
             | ModelAggregation::Histogram
-            | ModelAggregation::Quantiles => {
+            | ModelAggregation::Quantiles
+            | ModelAggregation::Bloom => {
                 unreachable!("a state kind's inputs are not combined into an i64")
             }
             ModelAggregation::BitOr => a | b,
@@ -295,6 +302,8 @@ pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
         Some(ModelAggregation::Histogram)
     } else if family.starts_with("fq") {
         Some(ModelAggregation::Quantiles)
+    } else if family.starts_with("bloom") {
+        Some(ModelAggregation::Bloom)
     } else {
         None
     }

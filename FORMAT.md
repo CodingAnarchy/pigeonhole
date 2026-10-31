@@ -78,7 +78,7 @@ The largest value is `2^32 - 1` bytes (decision D16).
 
 ### 3.1 HyperLogLog sketch
 
-The value of an HLL family's cell (§9.2 `kind` 4, D294) is a `Bytes` value holding a sketch: 4096 registers (precision 12, about 1.6% standard error). Inputs are `i64` elements. An element's hash is xxh3-64 with seed 0 over its 8 little-endian bytes (no tag: a later bytes input must hash a leading type byte first, so the two forms never collide). The hash's top 12 bits pick the register, and the rank is one plus the number of leading zeros of the remaining 52 bits, at most 53. A register keeps the largest rank merged into it, so merging is the register-wise maximum: associative, commutative and idempotent.
+The value of an HLL family's cell (§9.2 `kind` 4, D294) is a `Bytes` value holding a sketch: 4096 registers (precision 12, about 1.6% standard error). Inputs are `i64` or bytes elements. An `i64` element's hash is xxh3-64 with seed 0 over its 8 little-endian bytes. A bytes element's hash (D298) is xxh3-64 over the domain tag `0x01` followed by its bytes, so the two forms never collide. The hash's top 12 bits pick the register, and the rank is one plus the number of leading zeros of the remaining 52 bits, at most 53. A register keeps the largest rank merged into it, so merging is the register-wise maximum: associative, commutative and idempotent.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -164,7 +164,26 @@ The value of a quantile family's cell (§9.2 `kind` 13, D298) is a log-linear sk
 
 **Read:** the `q`-quantile is the midpoint of the bucket holding the input of rank `⌊q·(n−1)⌋`, in increasing order. The midpoint is the bucket's lower edge's bits with the bit below the kept ones set, which is exact. It is within 2^-p of the input while its store has not collapsed. A zero reads `0.0`, a negative bucket its midpoint negated.
 
-**Storage:** an aggregate family's values are never separated into blob files, at flush, compaction or commit (D298): the built-in operators fold stored values, never blob pointers. A family's `blob_threshold` therefore does not apply to them.
+### 3.6 Bloom filter
+
+The value of a bloom family's cell (§9.2 `kind` 14, D298) is a filter of `m` bits (§9.2.1 tag 1: a power of two, 2^6 to 2^24) with `k` positions per element (tag 2: 1 to 16).
+- **Hashing:** an element's hash `h` is the HLL family's (§3.1: `i64` or bytes). Its positions are `(h1 + i·h2) mod m` for `i` in `0..k`, with `h1` the hash's low 32 bits and `h2` its high 32 bits with bit 0 set (Kirsch–Mitzenmacher double hashing). They are exact integers, so every platform sets the same bits.
+- **Merge:** a bitwise OR, which is associative, commutative and idempotent.
+- **Read:** a lookup never misses an element that was added. Its false-positive rate is about `(1 − e^(−kn/m))^k` for `n` elements.
+- **Inputs:** an input becomes the one-element filter of its element before the WAL.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 6 |
+| 1 | 1 | `log2 m` (the family's) |
+| 2 | 1 | `k` (the family's) |
+| 3 | 1 | representation: 0 sparse, 1 dense |
+| 4 | 4·n | sparse: the `n` set bits, `u32` LE, strictly increasing |
+| 4 | m/8 | dense: the bitmap, bit `j` in byte `j / 8` at bit `j % 8` |
+
+**Canonical form:** sparse if and only if `4·n < m/8` (the smaller form). A state that holds no bit, is dense below that threshold, has unsorted or out-of-range bits, or carries other parameters than the family's is malformed. A filter only gains bits, so it turns dense once and never back.
+
+**Storage:** the values of the kinds listed by `FamilyKind::values_stay_inline` (every aggregate kind so far) are never separated into blob files, at flush, compaction or commit (D298): their built-in operators fold stored values, never blob pointers, so a family's `blob_threshold` does not apply to them. #488 PR 5 takes Bloom out of the list once its operator folds a separated base. A whole state larger than one WAL record (a dense bloom filter of 2^21 bits or more) cannot be put in a commit until then.
 
 ## 4. Blocks
 
@@ -317,7 +336,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 
 | Set | Bit | Feature |
 |---|---|---|
-| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 13 so far, and a family's `kind_params`, §9.2.1). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 14 so far, and a family's `kind_params`, §9.2.1). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
 
@@ -376,7 +395,7 @@ The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log
 
 Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know, where §9.3's tag ranges allow it. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
 
-*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, 10 SumF64, 11 MeanVar, 12 Histogram, 13 Quantiles, decision D298), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`), `pigeonhole.f64_sum`, `pigeonhole.f64_mean_var` (SumF64, MeanVar: finite `F64` inputs, values the states of §3.2 and §3.3), `pigeonhole.f64_histogram`, `pigeonhole.f64_quantiles` (Histogram, Quantiles: `F64` inputs, values the states of §3.4 and §3.5, built from the family's `kind_params`); another name is `Corrupt`. Kinds 2 to 13 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, 10 SumF64, 11 MeanVar, 12 Histogram, 13 Quantiles, 14 Bloom, decision D298), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`), `pigeonhole.f64_sum`, `pigeonhole.f64_mean_var` (SumF64, MeanVar: finite `F64` inputs, values the states of §3.2 and §3.3), `pigeonhole.f64_histogram`, `pigeonhole.f64_quantiles` (Histogram, Quantiles: `F64` inputs, values the states of §3.4 and §3.5, built from the family's `kind_params`), `pigeonhole.bloom` (Bloom: `Bytes` filter states of §3.6, from its `kind_params`); another name is `Corrupt`. Kinds 2 to 14 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
 
 #### 9.2.1 Kind parameters
 
@@ -395,8 +414,9 @@ A reader takes both as no parameters, and ignores bytes after the field (later a
 The tags defined so far (D298):
 - **Histogram** (`kind` 12): tag 1, its bounds, as `n` `f64` LE (1 ≤ `n` ≤ 1023; finite, strictly increasing, never `-0.0`). Required.
 - **Quantiles** (`kind` 13): tag 1, the mantissa bits `p` (u8, 1–12, default 7); tag 2, the bucket limit per store (u16 LE, 16–4096, default 2048). Both optional.
+- **Bloom** (`kind` 14): tag 1, the bits `m` (u32 LE, a power of two, 2^6 to 2^24); tag 2, the positions per element `k` (u8, 1–16). Both required.
 
-Values out of range are `Corrupt` at read. A writer refuses them, and any tag the family's kind doesn't define. #488's bloom kind and #490's vector kind will add their own tags.
+Values out of range are `Corrupt` at read. A writer refuses them, and any tag the family's kind doesn't define. #490's vector kind will add its own tags.
 
 *SstMeta* = `id` u64, `extent` extent, `len` u64, `smallest_key` bytes, `largest_key` bytes, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `entries` u64, `deletes` u64.
 
@@ -712,7 +732,7 @@ How each feature tracked for after 1.0 fits format 4 (D269 §3). The bit numbers
 | Feature | Path |
 |---|---|
 | Min, Max and HLL families (#487) | `FamilyKind` 2, 3 and 4 behind `incompat` bit 0, the first real feature bit (D294, §8.2); an HLL value is a `Bytes` sketch with a fixed encoding (§3.1) |
-| More aggregations (#488) | more `FamilyKind` values under `incompat` bit 0 (5 to 13: bitwise, `f64` min/max, exact sum, mean/variance, histograms and quantiles, D298), plus the optional `kind_params` field appended to `PutFamily` (§9.2.1) |
+| More aggregations (#488) | more `FamilyKind` values under `incompat` bit 0 (5 to 14: bitwise, `f64` min/max, exact sum, mean/variance, histograms, quantiles and bloom filters, D298), plus the optional `kind_params` field appended to `PutFamily` (§9.2.1) |
 | Adjacency sets, roaring (#489) | a `FamilyKind` value and a value encoding, behind a bit |
 | Vector values (#490) | a value tag (0x04) behind an `incompat` bit; payload alignment as a data-block kind (6) or an entry flag under the same bit; dimension and metric in `kind_params` |
 | Time-series codec (#491) | a compression code (3..) or a block kind, behind an `incompat` bit |

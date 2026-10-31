@@ -9,7 +9,7 @@
 //! put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
 //! incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
 //! delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-//! create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]]...
+//! create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K]...
 //! snapshot [--durable] <name>        release <name>
 //! \tables  \schema [table]  \info  \metrics  \health  \format F  \timing on|off  \help  \quit
 //! ```
@@ -48,9 +48,9 @@ commands (one per line; values are bytes: \"quoted\\n\", 0xhex, b64:base64):
          [--limit N] [--columns-per-row N] [--at SNAP]
   put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
   incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
-  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]  (f64 in *_f64, mean_var, histogram, quantiles; u64 in bit_*)
+  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]  (f64 in *_f64, mean_var, histogram, quantiles; u64 in bit_*; hll, bloom: an integer, else bytes)
   delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-  create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]]...
+  create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K]...
   snapshot [--durable] <name>     release <name>
   \\tables  \\schema [table]  \\info  \\metrics  \\health
   \\format table|json|jsonl|csv  \\timing on|off  \\help  \\quit
@@ -544,6 +544,15 @@ impl Session {
                     None => m.aggregate_f64(&family, &qualifier, x),
                 }
             }
+            // An HLL or bloom family's element: an integer is an i64 element, any other word
+            // a bytes element (D298's aggregate_bytes).
+            Some(Aggregation::Hll | Aggregation::Bloom(_)) if text.parse::<i64>().is_err() => {
+                let bytes = args.bytes(3, "value")?;
+                match ts {
+                    Some(ts) => m.aggregate_bytes_at(&family, &qualifier, ts, bytes),
+                    None => m.aggregate_bytes(&family, &qualifier, bytes),
+                }
+            }
             Some(Aggregation::BitOr | Aggregation::BitAnd | Aggregation::BitXor) => {
                 let bits: u64 = text
                     .parse()
@@ -611,7 +620,7 @@ impl Session {
         let table = args.text(0, "table")?;
         if args.positional.len() < 2 {
             return Err(Failure::usage(
-                "create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]]...",
+                "create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K]...",
             ));
         }
         let mut b = db.table(table).map_err(|e| Failure::db("create", &e))?;
@@ -641,6 +650,16 @@ impl Session {
                     let params = pigeonhole::HistogramParams::new(bounds)
                         .map_err(|e| Failure::db("create", &e))?;
                     b.family(name, Family::aggregate(Aggregation::Histogram(params)))
+                }
+                // `:bloom=bits,hashes` (D298).
+                Some((name, kind)) if kind.starts_with("bloom=") => {
+                    let mut it = kind["bloom=".len()..].split(',');
+                    let usage = || Failure::usage("bloom=bits,hashes takes two integers");
+                    let bits = it.next().and_then(|x| x.parse().ok()).ok_or_else(usage)?;
+                    let hashes = it.next().and_then(|x| x.parse().ok()).ok_or_else(usage)?;
+                    let params = pigeonhole::BloomParams::new(bits, hashes)
+                        .map_err(|e| Failure::db("create", &e))?;
+                    b.family(name, Family::aggregate(Aggregation::Bloom(params)))
                 }
                 Some((name, kind)) if kind == "quantiles" || kind.starts_with("quantiles=") => {
                     let mut q = pigeonhole::QuantileParams::default();
