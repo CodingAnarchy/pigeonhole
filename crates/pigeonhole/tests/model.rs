@@ -140,8 +140,9 @@ fn families() -> Vec<ModelFamily> {
     };
     if env!("CARGO_CRATE_NAME") == "counters" {
         // Every aggregate kind (D179, D294, D298) beside `f` and a 0.1.0-style `counter`:
-        // eighteen families, 72 slots on a shard with tablet changes off, which the arena's
-        // 1024 chunks serve with snapshots held across flushes (#1212, D302).
+        // eighteen families, 72 slots on a shard with tablet changes off. The tables are
+        // created after the open, so until a reopen resizes the chunks for them the 72 slots
+        // share the 64-slot geometry, about 14 chunks each (perf287 on #1233; #1212, D302).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
