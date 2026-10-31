@@ -50,8 +50,9 @@ use crate::write::{COUNTER_TS, Submission, Validate};
 /// The shards a commit writes to: inline for up to four (no allocation per commit, #320).
 pub(crate) type Shards = smallvec::SmallVec<[ShardId; 4]>;
 use crate::{
-    CellData, EngineOptions, Error, PendingCheck, PendingCommit, Predicate, ReadSpec, Result,
-    RowCacheStats, RowData, ScanCursor, ScanSpec, Snapshot, Txn, WriteBatch,
+    CellData, CellVisitor, EngineOptions, Error, PendingCheck, PendingCommit, Predicate, ReadSpec,
+    ReduceSpec, Reduced, Reducer, Result, RowCacheStats, RowData, ScanCursor, ScanSpec, Snapshot,
+    Txn, WriteBatch,
 };
 
 /// Whether this handle may write.
@@ -2373,6 +2374,43 @@ impl Engine {
             families.into_vec(),
             now,
         ))
+    }
+
+    /// A bounded-result read (D296): runs a visitor from `visitor` on every resolved cell of
+    /// `spec.input`, where a scan would hand it out, and keeps what reducers from `reducer`
+    /// keep (the k best, the first n, one per key). Each tablet group gets its own visitor
+    /// and reducer and stops only on its own account; their results merge into exactly the
+    /// sequential result at any `spec.parallelism`. Fan-out uses scoped threads owned by the
+    /// call, and only on a thread that does not drive a shard (D88).
+    pub fn reduce<V, R>(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        spec: &ReduceSpec,
+        visitor: impl Fn() -> V + Sync,
+        reducer: impl Fn() -> R + Sync,
+    ) -> Result<Reduced<R::Item>>
+    where
+        V: CellVisitor<Item = R::Item>,
+        R: Reducer,
+    {
+        snapshot.check_process()?;
+        let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
+        let now = self.inner.shared.vfs.now_micros();
+        let may_fan_out = self
+            .inner
+            .shared
+            .refuse_blocking_on_driver("reduce")
+            .is_ok();
+        read::reduce::reduce(
+            snapshot,
+            table,
+            &families,
+            spec,
+            (now, may_fan_out),
+            &visitor,
+            &reducer,
+        )
     }
 
     /// [`Engine::scan`] for an async scan: its rows are polled with
