@@ -3906,6 +3906,11 @@ impl Inner {
                     ) => m.value.first() == Some(&(ValueTag::F64 as u8)),
                     _ => false,
                 };
+            } else if m.kind == Kind::Put
+                && (meta.options.kind == FamilyKind::Vector
+                    || m.value.first() == Some(&(ValueTag::Vector as u8)))
+            {
+                check_vector_put(&m, meta, catalog)?;
             } else if m.kind == Kind::Merge && m.ts.is_some() {
                 return Err(Error::InvalidArgument(format!(
                     "{} is not a counter family: only a counter family takes increments at a \
@@ -5019,6 +5024,44 @@ fn stored_i64(v: &[u8]) -> i64 {
         .map_or(0, i64::from_le_bytes)
 }
 
+/// A put into a vector family, or of a vector (D303): a vector of the family's element type
+/// and dimension, with components the format allows (finite, at most 2^56, a nonzero norm under cosine), only ever into a
+/// vector family. That keeps tag 0x04 inside vector families, whose creation set `incompat`
+/// bit 0. The public API refuses the same when a write is built; this is the engine's gate.
+fn check_vector_put(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -> Result<()> {
+    use pigeonhole_format::vector::Params;
+    let refuse = |why: String| {
+        Err(Error::InvalidArgument(format!(
+            "{}: {why}",
+            family_name(catalog, m.table, m.family)
+        )))
+    };
+    if meta.options.kind != FamilyKind::Vector {
+        return refuse("not a vector family: a vector goes only into a vector family".into());
+    }
+    let params = Params::parse(&meta.options.kind_params)
+        .map_err(|e| Error::Corruption(format!("a vector family's parameters: {e}")))?;
+    let Ok(pigeonhole_format::value::ValueRef::Vector(v)) =
+        pigeonhole_format::value::decode_value(m.value)
+    else {
+        return refuse(format!(
+            "a vector family takes vectors of {} {:?}, not this value",
+            params.dim, params.element
+        ));
+    };
+    if !params.accepts(&v) {
+        return refuse(format!(
+            "a vector family of {} {:?} takes no vector of {} {:?}",
+            params.dim,
+            params.element,
+            v.dim(),
+            v.element()
+        ));
+    }
+    v.check_components(params.metric)
+        .or_else(|e| refuse(e.to_string()))
+}
+
 fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Result<()> {
     let name = options.merge_operator.as_str();
     if let Some(op) = crate::catalog::aggregate_operator(options.kind)
@@ -5061,12 +5104,13 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
             kind_name(options.kind)
         ))
     })?;
-    // The format knows vector families (D303 PR 1); creating one waits for its write checks
-    // (#490 B PR 2).
-    if options.kind == FamilyKind::Vector {
-        return Err(Error::Unsupported(
-            "vector families are not writable yet (#490 B PR 2)",
-        ));
+    // A vector family takes puts of its vectors only (D303): no operator, so no merge can
+    // fold its values.
+    if options.kind == FamilyKind::Vector && !options.merge_operator.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "a vector family takes no merge operator, not {:?}",
+            options.merge_operator
+        )));
     }
     // An HLL family's sketches, and an exact sum's or mean-variance state, are never
     // separated into blob files (D294, D298): a payload longer than the threshold is, so the

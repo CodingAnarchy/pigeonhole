@@ -121,12 +121,34 @@ pub fn cosine_from(dot: f32, q_norm2: f32, v_norm2: f32) -> f32 {
     1.0 - dot / (q_norm2.sqrt() * v_norm2.sqrt())
 }
 
-/// Squared Euclidean distance between two `i8` vectors, exact.
-pub fn l2_i8(a: &[i8], b: &[i8]) -> u32 {
+/// A signed byte: an `i8`, or a stored byte read as one (a vector's `i8` payload), so the
+/// exact integer kernels take either without reinterpreting a slice.
+pub trait SignedByte: Copy {
+    /// The byte's value.
+    fn value(self) -> i32;
+}
+
+impl SignedByte for i8 {
+    #[inline(always)]
+    fn value(self) -> i32 {
+        i32::from(self)
+    }
+}
+
+impl SignedByte for u8 {
+    #[inline(always)]
+    fn value(self) -> i32 {
+        i32::from(self as i8)
+    }
+}
+
+/// Squared Euclidean distance between two `i8` vectors (either as `i8`s or as the bytes of a
+/// stored `i8` vector), exact.
+pub fn l2_i8<A: SignedByte, B: SignedByte>(a: &[A], b: &[B]) -> u32 {
     debug_assert_eq!(a.len(), b.len());
     let ((ga, ta), (gb, tb)) = (a.as_chunks::<LANES>(), b.as_chunks::<LANES>());
-    let sq = |x: i8, y: i8| {
-        let d = (i32::from(x) - i32::from(y)).unsigned_abs();
+    let sq = |x: A, y: B| {
+        let d = (x.value() - y.value()).unsigned_abs();
         d * d
     };
     let mut acc = [0u32; LANES];
@@ -138,20 +160,20 @@ pub fn l2_i8(a: &[i8], b: &[i8]) -> u32 {
     acc.iter().sum::<u32>() + ta.iter().zip(tb).map(|(x, y)| sq(*x, *y)).sum::<u32>()
 }
 
-/// The inner product of two `i8` vectors, exact.
-pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+/// The inner product of two `i8` vectors (either as `i8`s or as stored bytes), exact.
+pub fn dot_i8<A: SignedByte, B: SignedByte>(a: &[A], b: &[B]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     let ((ga, ta), (gb, tb)) = (a.as_chunks::<LANES>(), b.as_chunks::<LANES>());
     let mut acc = [0i32; LANES];
     for (ca, cb) in ga.iter().zip(gb) {
         for i in 0..LANES {
-            acc[i] += i32::from(ca[i]) * i32::from(cb[i]);
+            acc[i] += ca[i].value() * cb[i].value();
         }
     }
     acc.iter().sum::<i32>()
         + ta.iter()
             .zip(tb)
-            .map(|(x, y)| i32::from(*x) * i32::from(*y))
+            .map(|(x, y)| x.value() * y.value())
             .sum::<i32>()
 }
 
@@ -249,6 +271,12 @@ mod tests {
             .map(|(x, y)| i32::from(*x) * i32::from(*y))
             .sum();
         assert_eq!((l2_i8(&a, &b), dot_i8(&a, &b)), (l2, dot));
+        let stored: Vec<u8> = b.iter().map(|x| *x as u8).collect();
+        assert_eq!(
+            (l2_i8(&a, &stored), dot_i8(&a, &stored)),
+            (l2, dot),
+            "a stored i8 vector's bytes score as its i8s"
+        );
         let extremes = [i8::MIN; 4096];
         let other = [i8::MAX; 4096];
         assert_eq!(

@@ -99,6 +99,7 @@ mod read;
 mod recovery;
 mod retry;
 mod table;
+mod vector;
 mod write;
 
 #[doc(hidden)]
@@ -179,6 +180,7 @@ pub use read::{
 pub use recovery::RecoveryStats;
 pub use retry::RetryPolicy;
 pub use table::{ReadTable, Table, TableBuilder};
+pub use vector::{Element, Metric, VectorRef, VectorSpec};
 pub use write::{CommitInfo, CommitTicket, Durability, RowMutation, Transaction, WriteBatch};
 
 pub use merge::{MergeError, MergeOperator};

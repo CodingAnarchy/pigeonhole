@@ -214,6 +214,129 @@ impl Params {
     }
 }
 
+/// A vector given by a caller (a write's value, or a query), in its element's own type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Query<'a> {
+    /// `f32` components.
+    F32(&'a [f32]),
+    /// `i8` components.
+    I8(&'a [i8]),
+    /// Bits, packed eight to a byte, LSB first.
+    Bits(&'a [u8]),
+}
+
+impl Query<'_> {
+    /// The element type.
+    pub fn element(&self) -> Element {
+        match self {
+            Query::F32(_) => Element::F32,
+            Query::I8(_) => Element::I8,
+            Query::Bits(_) => Element::Bit,
+        }
+    }
+
+    /// The dimension (eight per byte for bits).
+    pub fn dim(&self) -> usize {
+        match self {
+            Query::F32(q) => q.len(),
+            Query::I8(q) => q.len(),
+            Query::Bits(q) => 8 * q.len(),
+        }
+    }
+}
+
+impl Params {
+    /// Checks a caller's vector against the family (D303): its element type and dimension,
+    /// and its components as [`VectorRef::check_components`] does.
+    pub fn check(&self, q: Query<'_>) -> Result<(), VectorError> {
+        if q.element() != self.element || q.dim() != self.dim as usize {
+            return Err(VectorError(
+                "the vector's element type or dimension is not the family's",
+            ));
+        }
+        match q {
+            Query::F32(q) => check_f32(q, self.metric),
+            Query::I8(q) => check_bytes(q.iter().all(|x| *x == 0), self.metric),
+            Query::Bits(q) => check_bytes(q.iter().all(|x| *x == 0), self.metric),
+        }
+    }
+
+    /// [`Params::check`], then the vector's payload (`f32` LE, `i8` or bits) appended to
+    /// `out`: what a put of it stores after the element and dimension.
+    pub fn payload(&self, q: Query<'_>, out: &mut Vec<u8>) -> Result<(), VectorError> {
+        self.check(q)?;
+        match q {
+            Query::F32(q) => out.extend(q.iter().flat_map(|x| x.to_le_bytes())),
+            Query::I8(q) => out.extend(q.iter().map(|x| *x as u8)),
+            Query::Bits(q) => out.extend_from_slice(q),
+        }
+        Ok(())
+    }
+
+    /// The distance from `q` to the stored vector `v` under the family's metric, smaller
+    /// nearer, with the `distance` kernels the engine ranks by (D296): `f32` kernels widened
+    /// exactly, `i8` and Hamming distances as exact integers. The caller has checked `q`
+    /// ([`Params::check`]) and `v` is the family's ([`Params::accepts`]); a mismatched
+    /// element pairing is NaN.
+    pub fn distance(&self, q: Query<'_>, v: &VectorRef<'_>) -> f64 {
+        use crate::distance as k;
+        let p = v.payload;
+        match (q, self.metric) {
+            (Query::F32(q), Metric::L2) => f64::from(k::l2_f32_le(q, p)),
+            (Query::F32(q), Metric::InnerProduct) => -f64::from(k::dot_norm_f32_le(q, p).0),
+            (Query::F32(q), Metric::Cosine) => {
+                let (dot, n2) = k::dot_norm_f32_le(q, p);
+                f64::from(k::cosine_from(dot, k::norm2_f32(q), n2))
+            }
+            (Query::I8(q), Metric::L2) => f64::from(k::l2_i8(q, p)),
+            (Query::I8(q), Metric::InnerProduct) => -f64::from(k::dot_i8(q, p)),
+            (Query::I8(q), Metric::Cosine) => {
+                let dot = f64::from(k::dot_i8(q, p));
+                let (nq, nv) = (f64::from(k::dot_i8(q, q)), f64::from(k::dot_i8(p, p)));
+                1.0 - dot / (nq.sqrt() * nv.sqrt())
+            }
+            (Query::Bits(q), Metric::Hamming) => f64::from(k::hamming(q, p)),
+            _ => f64::NAN,
+        }
+    }
+}
+
+/// Whether every component is zero (`-0.0` included).
+/// The largest `f32` component magnitude a vector may hold: 2^56. With at most 4096
+/// components, every kernel's sum stays below `f32::MAX` (Σ(2x)² ≤ 4096 × 4 × 2^112 = 2^126),
+/// so no distance overflows to infinity or NaN (perf287's B1 on #1255).
+pub const MAX_F32_COMPONENT: f32 = 72_057_594_037_927_936.0;
+
+/// The `f32` components a vector may hold under `metric` (D303): finite and at most
+/// [`MAX_F32_COMPONENT`] in magnitude, and under cosine a squared norm (as the kernels sum
+/// it) of at least `f32::MIN_POSITIVE`, so the norms' product can't round to zero. Every
+/// distance between two such vectors is finite.
+fn check_f32(q: &[f32], metric: Metric) -> Result<(), VectorError> {
+    if q.iter()
+        .any(|x| !x.is_finite() || x.abs() > MAX_F32_COMPONENT)
+    {
+        return Err(VectorError(
+            "a vector's components must be finite and at most 2^56 in magnitude",
+        ));
+    }
+    if metric == Metric::Cosine && crate::distance::norm2_f32(q) < f32::MIN_POSITIVE {
+        return Err(VectorError(
+            "a cosine vector needs a nonzero norm (not all zeros, nor so small its square \
+             underflows)",
+        ));
+    }
+    Ok(())
+}
+
+/// [`check_f32`]'s cosine rule for `i8` and bit vectors, whose norm is zero only when every
+/// component is.
+fn check_bytes(all_zero: bool, metric: Metric) -> Result<(), VectorError> {
+    if metric == Metric::Cosine && all_zero {
+        return Err(VectorError("a cosine vector must not be all zeros"));
+    }
+    Ok(())
+}
+
 /// A decoded vector value, borrowing its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorRef<'a> {
@@ -259,6 +382,25 @@ impl<'a> VectorRef<'a> {
         self.payload
     }
 
+    /// Checks the components a writer must refuse (D303): an `f32` that isn't finite or is
+    /// above 2^56 in magnitude, and under cosine a zero norm (all zeros, `-0.0` included, or an
+    /// `f32` norm whose square underflows). With these refused, every distance is finite.
+    pub fn check_components(&self, metric: Metric) -> Result<(), VectorError> {
+        let p = self.payload;
+        match self.element {
+            Element::F32 => {
+                let xs: Vec<f32> = p
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
+                    .collect();
+                check_f32(&xs, metric)
+            }
+            Element::I8 | Element::Bit => check_bytes(p.iter().all(|b| *b == 0), metric),
+        }
+    }
+
     /// Appends the encoding after the value tag: element, `dim` varint, payload.
     pub(crate) fn encode(&self, out: &mut Vec<u8>) {
         out.push(self.element as u8);
@@ -284,6 +426,10 @@ impl<'a> VectorRef<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn le_bytes(xs: &[f32]) -> Vec<u8> {
+        xs.iter().flat_map(|x| x.to_le_bytes()).collect()
+    }
 
     #[test]
     fn params_round_trip_and_refuse_bad_ranges_and_pairings() {
@@ -366,6 +512,84 @@ mod tests {
                 what: "vector element"
             })
         ));
+        // Components: non-finite f32 refused; cosine refuses all zeros (-0.0 too).
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let ok = f(&[0.0, 1.0]);
+        let zero = f(&[0.0, -0.0]);
+        let nan = f(&[1.0, f32::NAN]);
+        let inf = f(&[f32::INFINITY, 1.0]);
+        let v = |b| VectorRef::new(Element::F32, 2, b).unwrap();
+        assert!(v(&ok).check_components(Metric::Cosine).is_ok());
+        assert!(v(&zero).check_components(Metric::Cosine).is_err());
+        assert!(v(&zero).check_components(Metric::L2).is_ok());
+        assert!(v(&nan).check_components(Metric::L2).is_err());
+        assert!(v(&inf).check_components(Metric::InnerProduct).is_err());
+        let i8z = VectorRef::new(Element::I8, 2, &[0, 0]).unwrap();
+        assert!(i8z.check_components(Metric::Cosine).is_err());
+        assert!(i8z.check_components(Metric::L2).is_ok());
+        // A caller's vector: checked, encoded, scored with the shared kernels.
+        let p = Params::new(Element::F32, 2, Metric::Cosine).unwrap();
+        assert!(p.check(Query::F32(&[1.0])).is_err(), "wrong dimension");
+        assert!(p.check(Query::I8(&[1, 2])).is_err(), "wrong element");
+        assert!(p.check(Query::F32(&[0.0, -0.0])).is_err(), "cosine zero");
+        assert!(p.check(Query::F32(&[f32::NAN, 1.0])).is_err(), "NaN");
+        let mut payload = Vec::new();
+        p.payload(Query::F32(&[3.0, 4.0]), &mut payload).unwrap();
+        let v = VectorRef::new(Element::F32, 2, &payload).unwrap();
+        assert!(p.distance(Query::F32(&[3.0, 4.0]), &v).abs() < 1e-7);
+        let q8 = Params::new(Element::I8, 2, Metric::L2).unwrap();
+        let mut b8 = Vec::new();
+        q8.payload(Query::I8(&[-128, 127]), &mut b8).unwrap();
+        let v8 = VectorRef::new(Element::I8, 2, &b8).unwrap();
+        assert_eq!(
+            q8.distance(Query::I8(&[127, -128]), &v8),
+            2.0 * 255.0 * 255.0
+        );
+        let qb = Params::new(Element::Bit, 8, Metric::Hamming).unwrap();
+        let vb = VectorRef::new(Element::Bit, 8, &[0b1010_1010]).unwrap();
+        assert_eq!(qb.distance(Query::Bits(&[0b0101_0101]), &vb), 8.0);
+        // perf287's B1: finite components that would overflow a kernel, or a cosine norm that
+        // underflows, are refused; at the bound every distance is finite.
+        let ip = Params::new(Element::F32, 2, Metric::InnerProduct).unwrap();
+        assert!(ip.check(Query::F32(&[1e30, 1e30])).is_err(), "above 2^56");
+        let cos1 = Params::new(Element::F32, 1, Metric::Cosine).unwrap();
+        assert!(cos1.check(Query::F32(&[1e30])).is_err(), "above 2^56");
+        let cos4 = Params::new(Element::F32, 4, Metric::Cosine).unwrap();
+        assert!(
+            cos4.check(Query::F32(&[1e-45, 0.0, 0.0, 0.0])).is_err(),
+            "a nonzero vector whose squared norm underflows"
+        );
+        let tiny = le_bytes(&[1e-45, 0.0, 0.0, 0.0]);
+        assert!(
+            VectorRef::new(Element::F32, 4, &tiny)
+                .unwrap()
+                .check_components(Metric::Cosine)
+                .is_err(),
+            "the same rule for a stored vector"
+        );
+        let big = MAX_F32_COMPONENT;
+        let wide = Params::new(Element::F32, 4096, Metric::InnerProduct).unwrap();
+        let (q, v) = (vec![big; 4096], vec![-big; 4096]);
+        let vb = le_bytes(&v);
+        let vr = VectorRef::new(Element::F32, 4096, &vb).unwrap();
+        wide.check(Query::F32(&q)).unwrap();
+        vr.check_components(Metric::InnerProduct).unwrap();
+        for m in [Metric::L2, Metric::InnerProduct, Metric::Cosine] {
+            let p = Params::new(Element::F32, 4096, m).unwrap();
+            assert!(
+                p.distance(Query::F32(&q), &vr).is_finite(),
+                "{m:?} at the bound"
+            );
+        }
+        let small = Params::new(Element::F32, 1, Metric::Cosine).unwrap();
+        let s1 = le_bytes(&[1.1e-19]);
+        let sv = VectorRef::new(Element::F32, 1, &s1).unwrap();
+        small.check(Query::F32(&[1.1e-19])).unwrap();
+        sv.check_components(Metric::Cosine).unwrap();
+        assert!(
+            small.distance(Query::F32(&[1.1e-19]), &sv).is_finite(),
+            "at the norm floor"
+        );
         // 4096 dimensions fit; 4097 do not.
         let big = vec![0u8; 4 * 4096];
         assert!(VectorRef::new(Element::F32, 4096, &big).is_ok());
