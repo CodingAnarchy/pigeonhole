@@ -1389,7 +1389,7 @@ fn exact_sum_and_mean_var_families() {
     let total = || {
         t.get(b"r", "total", b"q")
             .unwrap()
-            .map(|c| c.as_f64().unwrap())
+            .map(|c| c.sum_f64().unwrap())
     };
     let lat = || {
         t.get(b"r", "lat", b"q")
@@ -1407,6 +1407,22 @@ fn exact_sum_and_mean_var_families() {
     // Floating-point addition would give 40 (1e300 + 1.0 is 1e300); the exact sum keeps the
     // 1.0.
     assert_eq!(total(), Some(41.0));
+    // `as_f64` reads `f64` values only: a state is not one (perf287's answer on #1220), so a
+    // standard family's bytes that happen to parse as a state never read as a number.
+    let cell = t.get(b"r", "total", b"q").unwrap().unwrap();
+    assert_eq!(cell.as_f64(), None);
+    let plain = db
+        .table("plain_bytes")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    plain
+        .mutate(b"r")
+        .put("f", b"q", b"\x02\x00")
+        .commit()
+        .unwrap();
+    assert_eq!(plain.get(b"r", "f", b"q").unwrap().unwrap().as_f64(), None);
     let mut wb = db.write_batch();
     for x in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
         wb.aggregate_f64(&t, b"r", "lat", b"q", x);

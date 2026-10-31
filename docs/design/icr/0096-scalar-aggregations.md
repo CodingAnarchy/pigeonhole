@@ -32,7 +32,7 @@ D298 (#488): the owner's minimum set of further aggregations for 1.1.0, and the 
 ## PR 2: exact `f64` sum and mean/variance
 - **pigeonhole:**
   - `Aggregation::SumF64` and `Aggregation::MeanVar` (new variants of the non-exhaustive enum). Their inputs are written with `aggregate_f64` / `aggregate_f64_at`, which already exist.
-  - `CellRef::as_f64` and `Cell::as_f64` now also read an exact-sum state, as the correctly rounded sum. The value's shape decides: a `Bytes` value that is a well-formed state, with encoding byte 2.
+  - `CellRef::sum_f64()` and `Cell::sum_f64() -> Option<f64>` read an exact-sum state as the correctly rounded sum. The value's shape decides, as for `hll_estimate`: a `Bytes` value that is a well-formed state. `as_f64` keeps reading `F64` values only (perf287 on #1220), so no standard family's bytes read as a number.
   - `CellRef::mean_var()` and `Cell::mean_var() -> Option<MeanVar>`, and the new `pigeonhole::MeanVar`, with accessors `count`, `mean`, `variance` and `sample_variance`. It is owned by `pigeonhole`, not re-exported from the format crate.
   - **Behaviour:**
     - Inputs and `put_f64` values must be finite (NaN and ±∞: `InvalidArgument`).

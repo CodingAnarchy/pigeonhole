@@ -311,6 +311,8 @@ pub fn mean_var_add(acc: &mut Vec<u8>, x: f64) -> Result<()> {
     // x² = m² · 2^(2·shift - 2148): exact, at the squares' scale of 2^-2148.
     s.squares
         .add_shifted(u128::from(m) * u128::from(m), 2 * shift, false);
+    // Squares only add, below 2^4196 of 4288 bits (perf287's N2 on #1220).
+    debug_assert!(!s.squares.negative());
     s.encode(acc);
     Ok(())
 }

@@ -3298,7 +3298,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Commit-time separation keeps aggregate families inline** (`large::separate`, #230):
   - Built-in operators never read blob pointers, and their values are bounded (an HLL sketch, at 3,076 bytes, is the largest), far below the WAL segment payload that the inline limit is in practice.
   - Only the harness's lowered limit (120 bytes) reached them. With PR 2's states it separated them, and the read then failed with `MergeFailed`. Before PR 2 the gap was latent: HLL puts in the harness are 1 to 3 elements.
-- **API** (ICR 0096): `Aggregation::SumF64` and `MeanVar`; `aggregate_f64` writes their inputs; `CellRef::as_f64` reads a sum state (the value's shape decides, as for `hll_estimate`); `CellRef::mean_var` gives `MeanVar` (`count`, `mean`, `variance`, `sample_variance`). In phdb: `sum_f64`, `mean_var`.
+- **API** (ICR 0096): `Aggregation::SumF64` and `MeanVar`; `aggregate_f64` writes their inputs; `CellRef::sum_f64` reads a sum state (the value's shape decides, as for `hll_estimate`), and `as_f64` stays tag-only (perf287 on #1220: shape decoding in `as_f64` would read a standard family's `b"\x02\x00"` as 0.0; the design note's table said `as_f64`); `CellRef::mean_var` gives `MeanVar` (`count`, `mean`, `variance`, `sample_variance`). In phdb: `sum_f64`, `mean_var`.
 
 **Tests (PR 2).**
 - **Format (`tests/exact.rs`):**

@@ -103,7 +103,11 @@ The value of an exact-sum family's cell (§9.2 `kind` 10, D298) is a `Bytes` val
 | 1 | 1 | `n`: limbs that follow (0..=34) |
 | 2 | 8·n | Σx, `u64` LE limbs, least significant first |
 
-**Canonical form:** high limbs that only extend the sign of the limb below are trimmed. A top limb of 0 goes if the limb below has bit 63 clear, and a top limb of `u64::MAX` goes if it has bit 63 set. Zero is `n = 0`, and a lone limb of 0 is never written. Reading a state sign-extends it to 34 limbs. A state that is not canonical, or has more than 34 limbs, is malformed.
+**Canonical form** (two's complement, sign-extended; perf287's N3 on #1220):
+- While `n ≥ 2`, the top limb is dropped if it is 0 and the limb below it has bit 63 clear, or if it is `u64::MAX` and the limb below it has bit 63 set.
+- A lone limb (`n = 1`) is dropped only if it is 0, so zero is `n = 0` and −1 is the lone limb `u64::MAX`.
+- For example, +2^63 is the two limbs `[2^63, 0]`, and −2^63 the one limb `[2^63]`.
+- Reading a state sign-extends its top limb's bit 63 through the missing limbs, to 34 limbs. A state that is not canonical, or has more than 34 limbs, is malformed.
 
 **Read:** the integer times 2^-1074, rounded once to the nearest `f64` (ties to even), or ±∞ past the range. Inputs that cancel exactly read +0.0. A state is at most 274 bytes. Inputs are finite: NaN and ±∞ are refused at write.
 

@@ -46,9 +46,13 @@ fn hll_estimate(data: &CellData) -> Option<u64> {
 fn as_f64(data: &CellData) -> Option<f64> {
     match data.value() {
         ValueRef::F64(x) => Some(x),
-        ValueRef::Bytes(b) if b.first() == Some(&pigeonhole_format::exact::SUM_ENCODING) => {
-            pigeonhole_format::exact::sum_read(b).ok()
-        }
+        _ => None,
+    }
+}
+
+fn sum_f64(data: &CellData) -> Option<f64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::exact::sum_read(b).ok(),
         _ => None,
     }
 }
@@ -175,11 +179,17 @@ impl<'a> CellRef<'a> {
         as_i64(&self.data).map(|v| v as u64)
     }
 
-    /// The value as an `f64`: an `f64` value, or the sum an exact-sum state holds, rounded
-    /// once ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298; the value's shape
-    /// decides, as for [`hll_estimate`](Self::hll_estimate)); `None` otherwise.
+    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
     pub fn as_f64(&self) -> Option<f64> {
         as_f64(&self.data)
+    }
+
+    /// The sum an exact-sum state holds, rounded once to the nearest `f64`, as an exact-sum
+    /// family's cells hold ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298). The
+    /// value's shape decides, as for [`hll_estimate`](Self::hll_estimate): `None` unless it
+    /// is a well-formed state.
+    pub fn sum_f64(&self) -> Option<f64> {
+        sum_f64(&self.data)
     }
 
     /// The count, mean and variance a mean-variance state holds
@@ -250,11 +260,17 @@ impl Cell {
         as_i64(&self.data).map(|v| v as u64)
     }
 
-    /// The value as an `f64`: an `f64` value, or the sum an exact-sum state holds, rounded
-    /// once ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298; the value's shape
-    /// decides, as for [`hll_estimate`](Self::hll_estimate)); `None` otherwise.
+    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
     pub fn as_f64(&self) -> Option<f64> {
         as_f64(&self.data)
+    }
+
+    /// The sum an exact-sum state holds, rounded once to the nearest `f64`, as an exact-sum
+    /// family's cells hold ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298). The
+    /// value's shape decides, as for [`hll_estimate`](Self::hll_estimate): `None` unless it
+    /// is a well-formed state.
+    pub fn sum_f64(&self) -> Option<f64> {
+        sum_f64(&self.data)
     }
 
     /// The count, mean and variance a mean-variance state holds

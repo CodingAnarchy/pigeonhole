@@ -1052,7 +1052,7 @@ pub enum Aggregation {
     MaxF64,
     /// The exact sum of finite `f64` inputs
     /// ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read with
-    /// [`CellRef::as_f64`](crate::CellRef::as_f64)), rounded once when read: the same
+    /// [`CellRef::sum_f64`](crate::CellRef::sum_f64)), rounded once when read: the same
     /// inputs read the same sum in any order. A cell is a state of up to 274 bytes.
     SumF64,
     /// The count, mean and variance of finite `f64` inputs

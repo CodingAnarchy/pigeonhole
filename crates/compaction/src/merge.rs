@@ -498,17 +498,26 @@ impl ExactF64 {
         }
     }
 
-    /// `acc` as the state of `acc` and `other`, tagged `ValueTag::Bytes`.
+    /// `acc` as the state of `acc` and `other`, tagged `ValueTag::Bytes`. The state is built
+    /// in a scratch buffer the thread keeps (perf287's N1 on #1220): a fold of many operands
+    /// allocates nothing once the buffer has grown to the largest state.
     fn combine(&self, acc: &mut Vec<u8>, other: Option<&[u8]>) -> Result<(), MergeError> {
-        let mut state = Vec::with_capacity(pigeonhole_format::exact::MEAN_VAR_MAX_LEN);
-        self.fold(&mut state, acc)?;
-        if let Some(o) = other {
-            self.fold(&mut state, o)?;
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(pigeonhole_format::exact::MEAN_VAR_MAX_LEN));
         }
-        acc.clear();
-        acc.push(ValueTag::Bytes as u8);
-        acc.extend_from_slice(&state);
-        Ok(())
+        SCRATCH.with(|scratch| {
+            let mut state = scratch.borrow_mut();
+            state.clear();
+            self.fold(&mut state, acc)?;
+            if let Some(o) = other {
+                self.fold(&mut state, o)?;
+            }
+            acc.clear();
+            acc.push(ValueTag::Bytes as u8);
+            acc.extend_from_slice(&state);
+            Ok(())
+        })
     }
 }
 
