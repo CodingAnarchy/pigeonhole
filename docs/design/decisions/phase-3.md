@@ -154,7 +154,25 @@ RocksDB writes on the caller's thread (a write-group leader), which is the main 
 
 RocksDB's sparse-wide `Buffered` put p99 is 17 µs: about 2.9× under `Embedded` and 1.6× under `Server`; the remainder is the cross-thread hand-off and is #760's 1.0 gap. Why per profile: the cost lands on whoever shares the CPU. An application in the same process, a laptop or a CPU-limited container should not pay about two cores for the tail; a database with the machine to itself (D289's `Server`) should. Cost of 1 ms: up to about 2 more cores at a moderate steady rate (a few thousand commits per second per driver keep its window from closing), about 1.6 at full load on sparse-wide with 6% fewer of its ops/s, and nothing measurable idle or below 4,000 ops/s; the idle-CPU test (`crates/engine/tests/idle_spin.rs`) passes. `shard_spin(Duration::ZERO)` or a shorter window still trades the tail back for CPU.
 
-*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above).*
+- **Third amendment (owner, 2026-10-30; #1176 option 1, #1201): under `CpuProfile::Embedded` the shard's window adapts, 200 µs up to 1 ms; `CpuProfile::Server` keeps a fixed 1 ms.**
+  - **How the window is sized.** Each engine-owned driver keeps a log2 histogram of its recent idle gaps, halved every 1024 gaps. A gap runs from the end of a pass with nothing left to the next pass. Every 32 gaps the driver picks the longest window, up to the cap, whose expected poll per gap, E[min(gap, W)], is at most the base window's 200 µs.
+  - **What that guarantees.** The window is never shorter than 200 µs, and a driver never polls more per gap than the fixed 200 µs window could. Steady streams, whose gaps are mostly short, get the full 1 ms and catch the rare long gap a fixed 200 µs parks through.
+  - **Where it lives.** The state is local to the driver thread, so there's no new shared state. The engine's knob is `EngineOptions::shard_spin_cap_nanos`, whose own default of 0 keeps a fixed window. `pigeonhole` maps `Embedded` to a 200 µs window with a 1 ms cap (ICR 0081 amended). An explicit `Options::shard_spin` (the hidden hook, ICR 0085) is fixed unless `Options::shard_spin_cap`, also hidden, comes with it.
+  - **What doesn't change:** the client's 50 µs (D253), the backoff, and the rule that an idle shard never polls.
+  - **Why:** the 1 ms window's tail without its cost at a moderate load. The box A/Bs (ctr274, 2026-10-30, AX102, 16 clients, full scale; `.coord/out-1176a-20261030`, `.coord/out-1176b-20261030`; #1176 c6530541983, c6535521825):
+
+| row | fixed 200 µs | fixed 1 ms (`Server`) | adaptive 200 µs → 1 ms |
+|---|--:|--:|--:|
+| sparse-wide default put p99 (×3) | 390 µs | 133 µs | 122 µs |
+| sparse-wide `Buffered` put p99 | 38.1 µs (×3) | 26.6 µs (×3) | 27 µs (median of 6) |
+| ycsb-a `Buffered` paced to 1,000 / 4,000 ops/s: cores | 0.11 / 0.32 | 0.12 / 0.38 | 0.11 / 0.34 |
+| ycsb-a `Buffered` paced to 20,000 ops/s: cores, put p99 | 0.65, 37 µs | 3.49, 24 µs | 0.98, 29–36 µs |
+| cores, sparse-wide full-load rows | 15.2–15.6 | 16.8–17.3 | 16.3–16.6 |
+| ycsb-a, ycsb-f, ycsb-f transactional, transfer, counters (both levels, ×3; `.coord/out-1176c-20261031`) | | | ops/s 0.996–1.020×, p99 level within run spread; cores −0.15 to +0.29 at `Buffered`, +0.3 to +1.2 at the default durability |
+
+At 20K ops/s spread over 16 drivers, each driver's gaps average about 800 µs. So a window past about 256 µs would cost more poll per gap than 200 µs, and the windows stay at 200–256 µs. That's what keeps the CPU near `Embedded`'s.
+
+*History: Amended by D253 (the client's window is 50 µs). Amended by the coordinator, 2026-10-19 (the shard's window is 200 µs; the bullet above). Amended by the owner, 2026-10-30 (the shard's window is 1 ms under `CpuProfile::Server`, 200 µs under `Embedded`; the second amendment above). Amended by the owner, 2026-10-30 (under `Embedded` the window adapts from 200 µs up to 1 ms; the third amendment above).*
 
 <a id="d199"></a>
 ## D199 — The stale-tail index is on by default; its write cost is accepted for its read gains (owner decision, 2026-10-09; memtable, engine, bench, #387; amends D194)
@@ -3202,3 +3220,187 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **CI.** The semver step still checks every published crate against crates.io:
 - the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
 - a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #1196).
+
+<a id="d298"></a>
+## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D186 for aggregate families in PR 5)
+**Why.** The owner's minimum set for #488, on D294's machinery: bitwise OR, AND and XOR; `f64` min and max; an exact `f64` sum; mean and variance; fixed-bucket histograms; bloom union. Also log-linear quantiles, and #489's roaring `u32` set. Kinds with parameters need a field on `PutFamily`; cli692's #490 vector kind needs one too, so the two share it.
+
+**Decided (the design note, with revision 1).**
+- **Kinds** (`FamilyKind` 5 to 15): BitOr, BitAnd, BitXor (5–7), MinF64, MaxF64 (8–9), SumF64 (10), MeanVar (11), Histogram (12), Quantiles (13), Bloom (14), Set (15). Each fixes its built-in operator, as D294's do.
+  - Values reuse the `I64`, `F64` and `Bytes` tags: no new tag, key kind or block kind.
+  - Every kind follows D294: an absent bucket is the identity; a put sets a bucket; in-commit writes combine in order; deletes (D186, D187) and checkpoints (D291) apply unchanged.
+- **Feature bit:** all of them, and `kind_params`, share `incompat` bit 0 with D294, since everything ships in 1.1.0 (owner, 2026-10-31). A kind that misses 1.1.0 takes a new bit from the owner.
+- **`kind_params`** (FORMAT §9.2.1, agreed with cli692): a canonical list of `(tag u8, len varint, bytes)` entries, appended to `PutFamily` only when the kind has parameters.
+  - Tags 1–127 are must-understand (an unknown one is `UnsupportedFeature`), 128–255 are skippable, and 0 is never written.
+  - A kind fixes its tags when it lands; a later must-understand tag on an existing kind takes a new bit.
+- **Exact sums:** SumF64 is a 2176-bit two's-complement accumulator, so the sum is deterministic under any grouping, with one rounding at read. MeanVar adds a 4288-bit Σx² accumulator of exact integer squares (revision 1's S1), with the trim rule of S2.
+- **Quantiles** collapse below the threshold `t = max_index − max_buckets + 1` into bucket `t` (S3), so collapsing is associative.
+- **Engine (PR 5):** built-in operators fold onto blob-separated bases. Compaction folds an aggregate bucket's operands into a same-stripe base under the widened guard `[P.seqno, newest.seqno]`, never across an in-run delete (S4; D73's restriction stays for standard families). D291 checkpoints are capped at 4 KiB.
+- **Not taken** (§6): KLL and t-digest (randomised or merge-order-sensitive), Space-Saving top-K, decayed counters as a kind. Count-Min, Theta sketches, a bounded recent list, `u64`/bytes sets and per-column types go to a tracking issue (PR 6).
+- **PRs:** 1 `kind_params` and the scalar kinds; 2 exact sum and MeanVar; 3 histogram and quantiles; 4 bloom and `aggregate_bytes`; 5 separated bases, the compaction fold, the checkpoint cap and Set; 6 docs and the tracking issue. perf287 reviews each, and each runs the five sweeps.
+
+**What (PR 1: `kind_params`, bitwise and `f64` min/max).**
+- **`kind_params`:** `FamilyOptions::kind_params` (empty for "absent") and `pigeonhole_format::kind_params`.
+  - Decode checks the list is canonical (`Corrupt` otherwise). A present field of length 0 is no parameters, the slot a later appended field needs, which a writer emits only then (perf287's S1 on #1213).
+  - The catalog refuses a must-understand tag the kind doesn't define with `UnsupportedFeature`, and ignores skippable ones.
+  - A writer refuses any tag its kind doesn't define (`InvalidArgument`); no kind defines one yet. A family without parameters encodes exactly as before.
+- **Bitwise kinds:** operators `pigeonhole.u64_or`, `u64_and` and `u64_xor` (`Bitwise`), over the `I64` tag's bits.
+  - Inputs come from `aggregate_u64` and puts from `put_u64` (or `aggregate`/`put_i64` with the same bits), read with `as_u64`.
+  - XOR isn't idempotent, so the #1051 guard matters for it as it does for Sum. Every kind keeps the guard.
+- **`f64` kinds:** operators `pigeonhole.f64_min` and `f64_max` (`F64Extreme`), ordered by `f64::total_cmp`, so `-0.0 < +0.0` and the result is deterministic.
+  - Inputs come from `aggregate_f64`, puts from `put_f64`, and reads from `as_f64`.
+  - NaN is refused at write, so none is ever stored; ±∞ are allowed. An operator meeting a NaN or another tag fails with `MergeError`.
+- **In-commit combine** (`prepare_counter_writes`) now goes through the family's bound operator for every kind but HLL's element step, instead of a per-kind `i64` match.
+- **The operators belong to their kinds:** a standard family naming any built-in operator but `pigeonhole.i64_add` (D41) is refused at creation (`builtin_kind`), extending perf287's S1 on #1194.
+- **Typed inputs are checked at the builder** (perf287's N2 on #1213), with one catalog lookup, and a mismatch is refused with a message naming the method that writes that kind's inputs:
+  - `incr` outside a counter;
+  - `aggregate` in an `f64` family;
+  - `aggregate_u64` outside a bitwise family (a counter would otherwise have added its bits);
+  - `aggregate_f64` outside an `f64` family.
+- **API** (ICR 0096): `Aggregation`'s five variants, minus `Copy`; `aggregate_u64`, `aggregate_f64`, `put_u64` and their `_at` forms on `RowMutation`, `WriteBatch` and `Transaction`; `as_u64`/`as_f64` on `CellRef` and `Cell`. In phdb: the schema names, the shell's `create` suffixes, and `aggregate` parsing by kind.
+
+**Tests (PR 1).**
+- **Format:** `kind_params` canonical-form tests; kinds 5–9 and `kind_params` round-trip through `PutFamily`; non-canonical lists are `Corrupt`; unknown kinds now start at 10.
+- **Compaction:** doctests for both operator types (XOR's `finish` onto a base, signed zeros, NaN refused).
+- **Engine (`it/scalar_aggregates.rs`):**
+  - inputs fold through flushes, compactions, and checkpoints at every fold;
+  - puts as bases, in one commit and across a flush;
+  - NaN and wrong-tag refusals;
+  - operators bound to their kinds;
+  - `kind_params` tags refused at creation;
+  - the shared bit set in both pages.
+- **Engine catalog:** an unknown must-understand tag is `UnsupportedFeature` and a skippable one is accepted; `builtin_kind` (a direct match) inverts `aggregate_operator`.
+- **Format, S1:** a length-0 `kind_params`, with and without bytes after it, decodes as no parameters.
+- **Model checks:** `ModelAggregation` gains the five kinds, folding `f64`s by their bits with `total_cmp`. The workload writes one-bit OR words, one-clear AND words, random XOR words, and finite `f64`s, signed zeros and infinities.
+  - **New `scalar_counters` targets** (engine and `pigeonhole`) rerun the model checks with all five kinds (`bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`) beside `f`, `counter` and `sum`. The `counters` targets keep main's eight families.
+  - **Why not `counters`:** a one-shard run with tablet changes off must stay at main's 32 slots (owner, 2026-10-31; a larger harness budget would hide #1212). With 13 families on 4 tables, seed 6 gave up with `Busy`, even with standard families in their place. At 10 families (40 slots), 7 of 300 engine `counters` seeds gave up (run 41166497479), against `max_slots`' promised 64.
+  - **Later:** the families join `counters` once #1212 is fixed (#1214). Until then, a change to aggregate families also sweeps engine `scalar_counters` (CONTRIBUTING.md).
+  - **Mutation:** making XOR compute OR fails 10 of the 33 engine `scalar_counters` tests.
+- **API and phdb:** a `pigeonhole` API test; a phdb shell test.
+- **Corpus:** the `aggregates` entry gains one family per kind (signed zeros, infinities, a put, a delete), still refused by 1.0.0.
+
+**What (PR 2: exact `f64` sum and mean/variance).**
+- **Kinds:** `SumF64` (10) and `MeanVar` (11), with operators `pigeonhole.f64_sum` and `pigeonhole.f64_mean_var` (`ExactF64`), under bit 0.
+- **States** (`pigeonhole_format::exact`, FORMAT §3.2, §3.3):
+  - Σx is a 2176-bit two's-complement integer in units of 2^-1074, and Σx² a 4288-bit one in units of 2^-2148 (revision 1's S1: exact integer squares, no double-double);
+  - limbs are trimmed by S2's rule (zero is no limbs);
+  - encoding bytes 2 and 3 keep the states apart from HLL sketches.
+- **Reads round once** (to nearest, ties to even), from exact big-integer arithmetic:
+  - the sum;
+  - the mean `Σx/n`;
+  - the population and sample variances, from `n·Σx² − (Σx)²`. The quotient keeps at least 56 bits, and a division's remainder breaks ties.
+- **Values:**
+  - Inputs stay `F64` operands (9 bytes in the WAL and memtable). The operator folds them into a state, and its `finish` always leaves the canonical state, even for a single operand with no base (the resolver finishes those too), so a bucket reads the same bytes however its inputs were grouped.
+  - A `put_f64` is turned into the state of its one input when the commit is prepared, so every stored value is a state.
+  - A put may also carry a well-formed state of the family's kind (`phdb load`).
+  - Inputs and `f64` puts must be finite: NaN and ±∞ are refused.
+  - A `blob_threshold` below the largest state (274 and 821 bytes) is refused, as for HLL.
+- **Commit-time separation keeps aggregate families inline** (`large::separate`, #230):
+  - Built-in operators never read blob pointers, and their values are bounded (an HLL sketch, at 3,076 bytes, is the largest), far below the WAL segment payload that the inline limit is in practice.
+  - Only the harness's lowered limit (120 bytes) reached them. With PR 2's states it separated them, and the read then failed with `MergeFailed`. Before PR 2 the gap was latent: HLL puts in the harness are 1 to 3 elements.
+- **API** (ICR 0096): `Aggregation::SumF64` and `MeanVar`; `aggregate_f64` writes their inputs; `CellRef::sum_f64` reads a sum state (the value's shape decides, as for `hll_estimate`), and `as_f64` stays tag-only (perf287 on #1220: shape decoding in `as_f64` would read a standard family's `b"\x02\x00"` as 0.0; the design note's table said `as_f64`); `CellRef::mean_var` gives `MeanVar` (`count`, `mean`, `variance`, `sample_variance`). In phdb: `sum_f64`, `mean_var`.
+
+**Tests (PR 2).**
+- **Format (`tests/exact.rs`):**
+  - sums against Shewchuk's exactly rounded summation (`math.fsum`'s algorithm) over random and adversarial inputs (±max, subnormals, cancellation), with at least 200 of 400 seeds in range;
+  - mean and variances of integer inputs against `f64` division of their exact ratios;
+  - any grouping of merges gives the same bytes;
+  - extremes, refusals and canonical form.
+  - **Mutations:** truncating instead of rounding fails five tests. Ignoring a division's remainder fails `a_division_remainder_breaks_a_tie`, a crafted near-tie no random input reaches.
+- **Engine (`it/exact_aggregates.rs`):**
+  - folds through flushes, compactions and checkpoints at every fold, compared with the format's states;
+  - puts as bases;
+  - refusals;
+  - the blob-threshold floor;
+  - operators bound to their kinds;
+  - a state kept inline under a lowered commit-time limit. Reverting that fix fails the test.
+- **Model checks:**
+  - `ModelAggregation::{SumF64, MeanVar}` are state kinds, with an oracle (`pigeonhole_sim::exact_state`) written apart from the format crate's: its own 32-bit limbs, trimming and decoder. A test checks that the two agree.
+  - The workload writes finite inputs at cancelling magnitudes, and puts of states of a few inputs.
+  - The `scalar_counters` targets trade `bor` and `fmin` for `fsum` and `fmv_ttl`, staying at 32 slots until #1219.
+  - **Mutation:** a sum that drops merged operands fails 26 of the 33 engine `scalar_counters` tests.
+- **API, phdb and corpus:** a `pigeonhole` API test and a phdb shell test. The `aggregates` corpus entry gains `total` (SumF64) and `spread` (MeanVar).
+
+**What (PR 3: histograms and quantiles, the first `kind_params` tags).**
+- **Kinds:** `Histogram` (12) and `Quantiles` (13), with operators `pigeonhole.f64_histogram` and `pigeonhole.f64_quantiles` (`Buckets`), under bit 0.
+- **Parameters** (FORMAT §9.2.1): a histogram's bounds (tag 1, required: finite, strictly increasing, 1 to 1023, never `-0.0`); a quantile sketch's mantissa bits (tag 1, 1–12, default 7) and bucket limit per store (tag 2, 16–4096, default 2048).
+  - The catalog builds each family's operator from its parameters: `builtin_operator` now takes the family's options.
+  - Bad values are `InvalidArgument` at creation and `Corruption` when a manifest is read.
+- **States** (`pigeonhole_format::buckets`, FORMAT §3.4, §3.5):
+  - **Histogram:** the bucket count and per-bucket counts, with trailing zeros dropped. Buckets are found by binary search with `total_cmp`.
+  - **Quantiles:** `p`, a zero count, and sparse positive and negative stores. An index is `bits(x) >> (52 − p)` (log-linear, no `ln`). Each store collapses at the threshold of revision 1's S3. A quantile is the exact midpoint of the bucket at rank `⌊q·(n−1)⌋`.
+  - Both states carry what a read needs except a histogram's bounds, which come from the family's parameters, since a `CellRef` has no family context. So a read is `histogram_counts()` plus `HistogramParams::bounds()`, not one `histogram()` accessor.
+- **Values, as PR 2:**
+  - Inputs stay `F64` operands, which the operator folds into the canonical state.
+  - A `put_f64` becomes the one-input state through the family's operator, which also judges a state put (the parameters must match).
+  - Histograms take infinities; quantiles take finite inputs only. NaN is refused in both.
+- **An aggregate family's values are never separated into blob files** (`FamilyOptions::separation_threshold`, at flush and compaction, as at commit since PR 2). A quantile sketch at the default limit can reach about 80 KiB, so a `blob_threshold` floor like HLL's would be hostile. PR 5's separated bases for Bloom and Set will refine this rule.
+- **API** (ICR 0096):
+  - `Aggregation::Histogram(HistogramParams)` and `Aggregation::Quantiles(QuantileParams)`. These are the first data-carrying variants, which is why PR 1 dropped `Copy`.
+  - `HistogramParams::new(bounds) -> Result`, `bounds()`, `bucket_of(x)`. `QuantileParams::default().mantissa_bits(p).max_buckets(n)`.
+  - `CellRef::histogram_counts`, `quantile(q)` and `quantiles_count`.
+  - `FamilyInfo::aggregation` carries the parameters back.
+  - phdb: `"aggregation_params"` in the schema JSON (`dump`/`load` round-trip it), and the shell's `:histogram=b0,…` and `:quantiles[=p,n]`.
+
+**Tests (PR 3).**
+- **Format:**
+  - quantile merges in random groupings give the bytes of one-shot adding, through frequent collapses (S3's test);
+  - quantiles within 2^-p of the exact order statistic over 30 binades;
+  - histogram counts against a direct count, in any grouping;
+  - malformed states and parameters.
+  - **Mutation:** collapsing into the lowest kept bucket instead of `t` fails the grouping test and a unit test.
+- **Engine (`it/bucket_aggregates.rs`):**
+  - folds through flushes, compactions and checkpoints, compared with the format's states;
+  - puts of an `f64` or the family's own state, and another family's state refused;
+  - input refusals;
+  - parameter checks at creation;
+  - a collapsed sketch past a `blob_threshold` of 8 staying inline. Making aggregate values separate again fails the test.
+- **Model checks:**
+  - `ModelAggregation::{Histogram, Quantiles}` are state kinds with fixed model parameters (`MODEL_HISTOGRAM_BOUNDS`; `p = 3`, 16 buckets, so the workload's magnitudes collapse).
+  - Their oracle (`pigeonhole_sim::bucket_state`) is written apart from the format crate: plain counts and `BTreeMap` stores, one collapse at the end, its own codec. A test checks that the two agree.
+  - `scalar_counters` trades `sum` and `band` for `fhist` and `fq_ttl`, staying at 32 slots until #1219.
+  - **Mutations:** a histogram bound check off by one, and a collapse threshold off by one, each fail 27 of 33 engine `scalar_counters` tests.
+- **API, phdb and corpus:** a `pigeonhole` API test; a phdb shell test; snapshots updated for `aggregation_params`. The corpus `aggregates` entry gains `latency_h` and `latency_q`.
+- **Review (perf287 on #1221):**
+  - **S1:** histogram buckets compare by IEEE `<=`, not `total_cmp`, so `-0.0` shares `0.0`'s bucket, as `x >= 0.0` puts it. NaN is refused and no bound is `-0.0`, so the comparison is total and deterministic. `total_cmp` stays right for `MinF64`/`MaxF64`, which return the value.
+  - **N2:** collapse folds the smallest magnitudes in both stores, so it coarsens the quantiles nearest zero.
+- **A hot quantile cell (perf287's N1; `hotagg quantiles`, local, 4 cells, 40,000 inputs).** The default parameters and inputs over about 20 binades give a sketch of about 920 buckets (3.7 KB).
+  - **With D291 checkpoints at 128:** reads are p50 25 µs, p99 60 µs, close to HLL's 27 µs and 54 µs.
+  - **With checkpoints off:** a read refolds every pending input with a full decode and encode of the sketch, giving p50 10.4 ms and p99 26 ms.
+  - **Consequence for PR 5:** its 4 KiB checkpoint cap must not come without §4.2's compaction fold, or a fold of many `F64` inputs into one decoded sketch. A larger sketch would otherwise lose its checkpoints and read in milliseconds.
+
+<a id="d300"></a>
+## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)
+**Why.** On macOS CI a reader process saw the visible seqno go from 21169 to 21162 (`crates/shm/tests/multiprocess.rs`, seed 1592590338). FORMAT §11.3's step 1, `pending[shard].store(next_seqno.load())`, was a load and a separate store. Another shard could reserve a seqno, raise the mirror, apply it and release its hold in between, so the visible seqno passed it. The stale bound then landed below it, and the visible seqno went back until the first shard published its reservation. It's an interleaving, not a memory-ordering effect: it reproduces in one thread, through the public API. Nothing unapplied ever became visible, but snapshots weren't monotonic: a later snapshot, in-process or in a reader process, could miss a commit an earlier one included, including a writer's own acknowledged commit.
+
+**Decided.**
+- **Where the hold is stored.** A group's hold, `pending[shard] = min(its lowest unapplied seqno, first)` (Release), is stored **under the allocator's lock**, as `first` is reserved and before `next_seqno.fetch_max` passes it. That's the way a cross-shard decision's `cross_held` already was (D278).
+  - The step-1 lower bound read from the mirror is gone.
+  - `first`, read under the lock, is above every seqno a reader can see, so the store never lowers the visible seqno.
+  - Every `fetch_max` past `first` comes after the store, so §11.3's safety argument is unchanged: every seqno below the mirror is applied or held.
+- **Scope.** The writer side only (`Clock::reserve_group`, `ShardState::reserve_stamps`). Readers, the shm layout and the snapshot computation are unchanged.
+- **Checks.**
+  - `clock_loom`'s reader now takes two readings and requires the second to be at least the first. With the old step 1 restored, that check fails.
+  - `shm/tests/protocol.rs`'s `a_reservation_never_moves_the_visible_seqno_back` places another shard's whole group at every step of a reservation, and keeps the old step 1's counterexample.
+
+<a id="d301"></a>
+## D301 — A shard whose room will not free tells the coordinators it refused for room, and their retries fail `Busy` (coordinator decision, 2026-10-31; engine; #1205; amends D245, applies #70)
+**Why.** The `pigeonhole` `counters` target hung at seed 183 (2 shards), with the client parked for a reply and both shards idle.
+- **What happened:** a cross-shard commit's PREPARE was refused for arena room (D245), because the harness's snapshots pinned the participant's memtables. Its coordinator's retry then waited for that participant's room wake.
+- **Why it never came, on the model's frozen clock:**
+  - No member waited in the participant's room wait (the PREPARE was refused, not queued). So nothing brought the wait back to #70's frozen-and-idle check, which refuses a waiting single with `Busy` there.
+  - The retry's own way out is D241's timeout, which a frozen clock never reaches.
+- **On a moving clock** the retry fails `Busy` at the write-stall timeout, as before.
+
+**Decided.**
+- **The participant looks again.** While a shard has coordinators it refused for room and its room wait's timers have given up on a frozen clock (`StallWait::stopped`), a kick finds the wait again even with no member pending.
+- **The same condition as for singles.** When it reaches #70's condition (refuse, or frozen and idle), it ends the wait and sends those coordinators `WakeReason::RoomGone` in a new room generation.
+- **The coordinator gives up.** A retry waiting on that shard's room from an earlier generation fails `Busy`, whether it is queued (`on_wake`) or still in its abort round (`room_gone`, checked as `room_freed` is), and is not committed. The caller may drop what pins the arena and commit again, as the model does after a `Busy` single.
+- **Moving clocks are unchanged:** `stopped` is false there, so nothing new runs.
+- **Gone wins over an earlier free** within one abort round. Say a refusal at generation g is followed by `Room` at g+1 and `RoomGone` at g+2 before the round ends. The retry then fails `Busy`, though room freed once: conservative and legal, since `Busy` is always allowed there (perf287's P1).
+- **Scope:** #1205 stays open for its other hang (seed 289 of `io_failures_are_recovered_in_place_and_match_a_durable_prefix`, a 1-shard `Sync` commit). It involves no cross-shard PREPARE, so D301 doesn't touch it.
+
+**Checks.**
+- `tablets`' `a_retry_waiting_for_room_fails_busy_on_a_frozen_clock_once_room_cannot_free` replaces `a_retry_waiting_for_room_ends_closed_at_close`, which recorded the old wait until the close.
+- `RetryWait::woken_by`'s unit test covers `RoomGone`.
+- Seed 183 of `counters` passes.

@@ -1224,6 +1224,366 @@ fn hll_families_estimate_distinct_inputs() {
     assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
 }
 
+/// D298: bitwise families fold `u64` inputs (`aggregate_u64`, read with `as_u64`) with OR,
+/// AND or XOR; `f64` families keep the smallest or largest `f64` (`aggregate_f64`, read with
+/// `as_f64`) by total order, never NaN; `incr` is refused, and each info names its kind.
+#[test]
+fn bitwise_and_f64_families() {
+    let db = db();
+    let t = db
+        .table("scalars")
+        .unwrap()
+        .family("or", Family::aggregate(Aggregation::BitOr))
+        .family("and", Family::aggregate(Aggregation::BitAnd))
+        .family("xor", Family::aggregate(Aggregation::BitXor))
+        .family("cold", Family::aggregate(Aggregation::MinF64))
+        .family("warm", Family::aggregate(Aggregation::MaxF64))
+        .create()
+        .unwrap();
+    let bits = |f: &str| t.get(b"r", f, b"q").unwrap().map(|c| c.as_u64().unwrap());
+    let float = |f: &str| t.get(b"r", f, b"q").unwrap().map(|c| c.as_f64().unwrap());
+    assert_eq!(bits("or"), None, "no input: absent");
+    for (b, x) in [(0b1100u64, 0.0), (0b1010, -0.0), (u64::MAX - 1, 2.5)] {
+        t.mutate(b"r")
+            .aggregate_u64("or", b"q", b)
+            .aggregate_u64("and", b"q", b)
+            .aggregate_u64("xor", b"q", b)
+            .aggregate_f64("cold", b"q", x)
+            .aggregate_f64("warm", b"q", x)
+            .commit()
+            .unwrap();
+    }
+    assert_eq!(bits("or"), Some(u64::MAX - 1));
+    assert_eq!(bits("and"), Some(0b1000));
+    assert_eq!(bits("xor"), Some(0b0110 ^ (u64::MAX - 1)));
+    // -0.0 orders below +0.0.
+    assert_eq!(float("cold").map(f64::to_bits), Some((-0.0f64).to_bits()));
+    assert_eq!(float("warm"), Some(2.5));
+    // A put sets the cell; later inputs combine with it. Batches, transactions, buckets.
+    t.mutate(b"r")
+        .put_f64("warm", b"q", f64::NEG_INFINITY)
+        .aggregate_f64("warm", b"q", -1.0)
+        .commit()
+        .unwrap();
+    assert_eq!(float("warm"), Some(-1.0));
+    let mut wb = db.write_batch();
+    wb.aggregate_u64(&t, b"r", "xor", b"q", 0b0110)
+        .aggregate_f64_at(&t, b"r", "cold", b"b", 10, 4.0)
+        .aggregate_f64_at(&t, b"r", "cold", b"b", 10, f64::INFINITY);
+    wb.commit().unwrap();
+    assert_eq!(bits("xor"), Some(u64::MAX - 1));
+    let cell = t.get(b"r", "cold", b"b").unwrap().unwrap();
+    assert_eq!((cell.timestamp(), cell.as_f64()), (10, Some(4.0)));
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate_u64(&t, b"r", "and", b"q", 0).aggregate_f64(
+        &t,
+        b"r",
+        "cold",
+        b"q",
+        f64::NEG_INFINITY,
+    );
+    txn.commit().unwrap();
+    assert_eq!(bits("and"), Some(0));
+    // put_u64 sets a bitwise bucket.
+    t.mutate(b"r")
+        .put_u64("and", b"q", u64::MAX)
+        .aggregate_u64("and", b"q", 0xf0)
+        .commit()
+        .unwrap();
+    assert_eq!(bits("and"), Some(0xf0));
+    let mut wb = db.write_batch();
+    wb.put_u64_at(&t, b"r", "or", b"b", 5, 1 << 63);
+    wb.commit().unwrap();
+    let cell = t.get(b"r", "or", b"b").unwrap().unwrap();
+    assert_eq!((cell.timestamp(), cell.as_u64()), (5, Some(1 << 63)));
+    assert_eq!(float("cold"), Some(f64::NEG_INFINITY));
+    // Refused: incr, NaN, and the other numeric type.
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    refused(
+        t.mutate(b"r").incr("or", b"q", 1).commit(),
+        "is a bit_or family: write its inputs with aggregate_u64",
+    );
+    refused(
+        t.mutate(b"r").incr("warm", b"q", 1).commit(),
+        "is a max_f64 family: write its inputs with aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r")
+            .aggregate_f64("cold", b"q", f64::NAN)
+            .commit(),
+        "never NaN",
+    );
+    refused(
+        t.mutate(b"r").put_f64("warm", b"q", f64::NAN).commit(),
+        "never NaN",
+    );
+    refused(t.mutate(b"r").aggregate("cold", b"q", 1).commit(), "f64");
+    refused(
+        t.mutate(b"r").aggregate_f64("xor", b"q", 1.0).commit(),
+        "aggregate_u64",
+    );
+    // Typed inputs of the wrong type are refused at the builder, naming the method to use
+    // (perf287's N2 on #1213): a u64 into a counter would otherwise add its bits.
+    let other = db
+        .table("other")
+        .unwrap()
+        .family("c", Family::counter())
+        .family("lo", Family::aggregate(Aggregation::Min))
+        .create()
+        .unwrap();
+    refused(
+        other.mutate(b"r").aggregate_u64("c", b"q", 1).commit(),
+        "is a counter family: write its inputs with incr, not aggregate_u64",
+    );
+    refused(
+        other.mutate(b"r").aggregate_f64("lo", b"q", 1.0).commit(),
+        "is a min family: write its inputs with aggregate, not aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r").aggregate("warm", b"q", 1).commit(),
+        "is a max_f64 family: write its inputs with aggregate_f64, not aggregate",
+    );
+    let mut wb = db.write_batch();
+    wb.aggregate_u64_at(&other, b"r", "lo", b"q", 5, 1);
+    refused(wb.commit(), "not aggregate_u64");
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate_f64(&other, b"r", "c", b"q", 1.0);
+    refused(txn.commit(), "not aggregate_f64");
+    assert!(other.get(b"r", "c", b"q").unwrap().is_none());
+    assert_eq!(
+        float("cold"),
+        Some(f64::NEG_INFINITY),
+        "nothing refused was written"
+    );
+    for (f, a) in [
+        ("or", Aggregation::BitOr),
+        ("and", Aggregation::BitAnd),
+        ("xor", Aggregation::BitXor),
+        ("cold", Aggregation::MinF64),
+        ("warm", Aggregation::MaxF64),
+    ] {
+        let info = t.family_info(f).unwrap();
+        assert_eq!(info.aggregation, Some(a), "{f}");
+        assert!(!info.counter && info.merge_operator.is_none(), "{f}");
+    }
+}
+
+/// D298 PR 2: an exact-sum family reads the correctly rounded sum of its `f64` inputs with
+/// `as_f64`; a mean-variance family reads count, mean and variances with `mean_var`. Both
+/// take finite inputs only, `put_f64` sets a bucket, `incr` and `aggregate(i64)` are refused,
+/// and each info names its kind.
+#[test]
+fn exact_sum_and_mean_var_families() {
+    let db = db();
+    let t = db
+        .table("stats")
+        .unwrap()
+        .family("total", Family::aggregate(Aggregation::SumF64))
+        .family("lat", Family::aggregate(Aggregation::MeanVar))
+        .create()
+        .unwrap();
+    let total = || {
+        t.get(b"r", "total", b"q")
+            .unwrap()
+            .map(|c| c.sum_f64().unwrap())
+    };
+    let lat = || {
+        t.get(b"r", "lat", b"q")
+            .unwrap()
+            .map(|c| c.mean_var().unwrap())
+    };
+    assert_eq!(total(), None, "no input: absent");
+    assert!(lat().is_none());
+    for x in [1e300, 1.0, -1e300, 2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+        t.mutate(b"r")
+            .aggregate_f64("total", b"q", x)
+            .commit()
+            .unwrap();
+    }
+    // Floating-point addition would give 40 (1e300 + 1.0 is 1e300); the exact sum keeps the
+    // 1.0.
+    assert_eq!(total(), Some(41.0));
+    // `as_f64` reads `f64` values only: a state is not one (perf287's answer on #1220), so a
+    // standard family's bytes that happen to parse as a state never read as a number.
+    let cell = t.get(b"r", "total", b"q").unwrap().unwrap();
+    assert_eq!(cell.as_f64(), None);
+    let plain = db
+        .table("plain_bytes")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    plain
+        .mutate(b"r")
+        .put("f", b"q", b"\x02\x00")
+        .commit()
+        .unwrap();
+    assert_eq!(plain.get(b"r", "f", b"q").unwrap().unwrap().as_f64(), None);
+    let mut wb = db.write_batch();
+    for x in [2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0] {
+        wb.aggregate_f64(&t, b"r", "lat", b"q", x);
+    }
+    wb.commit().unwrap();
+    let m = lat().unwrap();
+    assert_eq!((m.count(), m.mean(), m.variance()), (8, 5.0, 4.0));
+    assert_eq!(m.sample_variance(), Some(32.0 / 7.0));
+    // A put sets the bucket; later inputs fold onto it. Transactions and buckets too.
+    t.mutate(b"r")
+        .put_f64("total", b"q", 0.5)
+        .aggregate_f64("total", b"q", 0.25)
+        .commit()
+        .unwrap();
+    assert_eq!(total(), Some(0.75));
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate_f64_at(&t, b"r", "lat", b"hour", 3_600, 10.0);
+    txn.commit().unwrap();
+    let cell = t.get(b"r", "lat", b"hour").unwrap().unwrap();
+    let one = cell.mean_var().unwrap();
+    assert_eq!(
+        (
+            cell.timestamp(),
+            one.count(),
+            one.mean(),
+            one.sample_variance()
+        ),
+        (3_600, 1, 10.0, None)
+    );
+    // Refused: non-finite inputs, incr, and i64 inputs.
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    for bad in [f64::NAN, f64::INFINITY] {
+        refused(
+            t.mutate(b"r").aggregate_f64("total", b"q", bad).commit(),
+            "finite f64",
+        );
+        refused(
+            t.mutate(b"r").put_f64("lat", b"q", bad).commit(),
+            "finite f64",
+        );
+    }
+    refused(
+        t.mutate(b"r").incr("total", b"q", 1).commit(),
+        "is a sum_f64 family: write its inputs with aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r").aggregate("lat", b"q", 1).commit(),
+        "is a mean_var family: write its inputs with aggregate_f64, not aggregate",
+    );
+    assert_eq!(total(), Some(0.75), "nothing refused was written");
+    for (f, a) in [
+        ("total", Aggregation::SumF64),
+        ("lat", Aggregation::MeanVar),
+    ] {
+        let info = t.family_info(f).unwrap();
+        assert_eq!(info.aggregation, Some(a), "{f}");
+        assert!(!info.counter && info.merge_operator.is_none(), "{f}");
+    }
+}
+
+/// D298 PR 3: a histogram family counts `f64` inputs in the buckets of its
+/// `HistogramParams`; a quantile family reads quantiles within 2^-p. Their parameters
+/// round-trip through `FamilyInfo`, bad ones are refused, and `incr` is refused.
+#[test]
+fn histogram_and_quantile_families() {
+    use pigeonhole::{HistogramParams, QuantileParams};
+    let db = db();
+    let bounds = HistogramParams::new([0.0, 10.0, 100.0]).unwrap();
+    let q = QuantileParams::default().mantissa_bits(6);
+    let t = db
+        .table("lat")
+        .unwrap()
+        .family(
+            "h",
+            Family::aggregate(Aggregation::Histogram(bounds.clone())),
+        )
+        .family("q", Family::aggregate(Aggregation::Quantiles(q)))
+        .create()
+        .unwrap();
+    let mut wb = db.write_batch();
+    for x in 1..=1000 {
+        let x = f64::from(x) / 4.0; // 0.25 to 250
+        wb.aggregate_f64(&t, b"r", "h", b"ms", x)
+            .aggregate_f64(&t, b"r", "q", b"ms", x);
+    }
+    wb.aggregate_f64(&t, b"r", "h", b"ms", f64::INFINITY);
+    wb.commit().unwrap();
+    let h = t.get(b"r", "h", b"ms").unwrap().unwrap();
+    // [-inf, 0): 0; [0, 10): 0.25..9.75 = 39; [10, 100): 40..399 = 360; [100, inf): 601 + inf.
+    assert_eq!(h.histogram_counts(), Some(vec![0, 39, 360, 602]));
+    assert_eq!(bounds.bucket_of(10.0), 2);
+    assert_eq!(bounds.bucket_of(-0.0), 1, "-0.0 shares 0.0's bucket (IEEE)");
+    let c = t.get(b"r", "q", b"ms").unwrap().unwrap();
+    assert_eq!(c.quantiles_count(), Some(1000));
+    for (qq, exact) in [(0.0, 0.25), (0.5, 125.0), (0.99, 247.5), (1.0, 250.0)] {
+        let got = c.quantile(qq).unwrap();
+        assert!(
+            (got - exact).abs() / exact <= 2f64.powi(-6),
+            "q {qq}: {got} vs {exact}"
+        );
+    }
+    assert_eq!(c.quantile(2.0), None);
+    // Parameters round-trip through FamilyInfo, and recreate the family.
+    assert_eq!(
+        t.family_info("h").unwrap().aggregation,
+        Some(Aggregation::Histogram(bounds))
+    );
+    let info = t.family_info("q").unwrap();
+    assert_eq!(info.aggregation, Some(Aggregation::Quantiles(q)));
+    let copy = db
+        .table("copy")
+        .unwrap()
+        .family("q", info.family.clone())
+        .create()
+        .unwrap();
+    assert_eq!(
+        copy.family_info("q").unwrap().aggregation,
+        Some(Aggregation::Quantiles(q))
+    );
+    // Refused: bad bounds at construction, bad quantile parameters at creation, incr, NaN.
+    for bad in [&[][..], &[1.0, 1.0], &[2.0, 1.0], &[f64::NAN], &[-0.0]] {
+        let err = HistogramParams::new(bad).unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{bad:?}: {err}");
+    }
+    let err = db
+        .table("bad")
+        .unwrap()
+        .family(
+            "q",
+            Family::aggregate(Aggregation::Quantiles(
+                QuantileParams::default().max_buckets(4),
+            )),
+        )
+        .create()
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    refused(
+        t.mutate(b"r").incr("h", b"ms", 1).commit(),
+        "is a histogram family: write its inputs with aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r").aggregate_f64("h", b"ms", f64::NAN).commit(),
+        "never NaN",
+    );
+    refused(
+        t.mutate(b"r")
+            .aggregate_f64("q", b"ms", f64::INFINITY)
+            .commit(),
+        "finite f64",
+    );
+}
+
 /// A family that names `pigeonhole.i64_add` without being a counter family reads and writes
 /// as 0.1.0 created them (D41): increments at the commit timestamp, folded across
 /// timestamps, and bytes on top of a counter fail at read.

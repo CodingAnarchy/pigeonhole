@@ -129,7 +129,7 @@ fn table_index(row: &[u8]) -> usize {
 /// `counter` is a family as 0.1.0 created them (the `i64` add operator, standard kind:
 /// operands at the commit timestamp, D41). The `counters` test target swaps `g` and `ttl`
 /// for the counter families `sum` and `sum_ttl` (D179) and adds the aggregate families `min`
-/// and `max_ttl` (D294).
+/// and `max_ttl`, the HLL families (D294), and the bitwise and `f64` families (D298).
 fn families() -> Vec<ModelFamily> {
     let f = |name: &str, max_versions, ttl_micros, i64_add| {
         ModelFamily::new(name)
@@ -149,6 +149,23 @@ fn families() -> Vec<ModelFamily> {
             f("hll", 2, 0, false),
             f("hll_ttl", 0, 40, false),
         ]
+    } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
+        // D298's families beside a counter, eight in all (32 slots), as `counters` has:
+        // more stall a one-shard run with tablet changes off (#1212). PR 2's exact sum and
+        // mean-variance families took `bor`'s and `fmin`'s places; PR 3's histogram and
+        // quantile families take `sum`'s and `band`'s (the counter kind runs in `counters`,
+        // and XOR covers the bitwise operator's code). They all join `counters` once #1212
+        // is fixed (#1214, #1219).
+        vec![
+            f("f", 0, 0, false),
+            f("counter", 3, 0, true),
+            f("bxor_ttl", 0, 40, false),
+            f("fmax_ttl", 0, 40, false),
+            f("fsum", 2, 0, false),
+            f("fmv_ttl", 0, 40, false),
+            f("fhist", 2, 0, false),
+            f("fq_ttl", 0, 40, false),
+        ]
     } else {
         vec![
             f("f", 0, 0, false),
@@ -164,19 +181,75 @@ fn is_aggregate(family: &str) -> bool {
     aggregation_of_name(family).is_some()
 }
 
-/// A min, max or HLL family (D294), whose inputs `aggregate` writes (`incr` is refused
-/// there).
+/// An aggregate family other than a counter (D294, D298), whose inputs `aggregate` (or its
+/// `u64` and `f64` forms) writes; `incr` is refused there.
 fn is_min_max(family: &str) -> bool {
+    is_aggregate(family) && aggregation_of_name(family) != Some(ModelAggregation::Sum)
+}
+
+/// An `f64` family (D298): its puts and inputs are `f64`s, the model's `i64` their bits.
+fn is_f64(family: &str) -> bool {
+    aggregation_of_name(family).is_some_and(ModelAggregation::is_f64)
+}
+
+/// A bitwise family (D298), whose inputs `aggregate_u64` writes.
+fn is_bitwise(family: &str) -> bool {
     matches!(
         aggregation_of_name(family),
-        Some(ModelAggregation::Min | ModelAggregation::Max | ModelAggregation::Hll)
+        Some(ModelAggregation::BitOr | ModelAggregation::BitAnd | ModelAggregation::BitXor)
     )
+}
+
+/// `m` with the aggregate input `delta` (at the bucket `ts`, if any) in the form its
+/// family takes: `aggregate_f64` of its bits in an `f64` family, `aggregate_u64` in a
+/// bitwise one, else `aggregate`.
+fn mutation_input<'t>(
+    m: pigeonhole::RowMutation<'t>,
+    family: &str,
+    qualifier: &[u8],
+    ts: Option<u64>,
+    delta: i64,
+) -> pigeonhole::RowMutation<'t> {
+    match ts {
+        None if is_f64(family) => m.aggregate_f64(family, qualifier, f64::from_bits(delta as u64)),
+        Some(ts) if is_f64(family) => {
+            m.aggregate_f64_at(family, qualifier, ts, f64::from_bits(delta as u64))
+        }
+        None if is_bitwise(family) => m.aggregate_u64(family, qualifier, delta as u64),
+        Some(ts) if is_bitwise(family) => m.aggregate_u64_at(family, qualifier, ts, delta as u64),
+        None => m.aggregate(family, qualifier, delta),
+        Some(ts) => m.aggregate_at(family, qualifier, ts, delta),
+    }
+}
+
+/// [`mutation_input`] into a write batch.
+fn batch_input(
+    wb: &mut pigeonhole::WriteBatch,
+    t: &Table,
+    row: &[u8],
+    family: &str,
+    qualifier: &[u8],
+    ts: Option<u64>,
+    delta: i64,
+) {
+    let x = f64::from_bits(delta as u64);
+    match ts {
+        None if is_f64(family) => wb.aggregate_f64(t, row, family, qualifier, x),
+        Some(ts) if is_f64(family) => wb.aggregate_f64_at(t, row, family, qualifier, ts, x),
+        None if is_bitwise(family) => wb.aggregate_u64(t, row, family, qualifier, delta as u64),
+        Some(ts) if is_bitwise(family) => {
+            wb.aggregate_u64_at(t, row, family, qualifier, ts, delta as u64)
+        }
+        None => wb.aggregate(t, row, family, qualifier, delta),
+        Some(ts) => wb.aggregate_at(t, row, family, qualifier, ts, delta),
+    };
 }
 
 /// A family holding only `i64`s (an HLL family's cells are sketches).
 fn is_i64(family: &str) -> bool {
     family.starts_with("counter")
-        || (is_aggregate(family) && aggregation_of_name(family) != Some(ModelAggregation::Hll))
+        || (is_aggregate(family)
+            && !aggregation_of_name(family).is_some_and(ModelAggregation::is_state))
 }
 
 /// `g` compacts tiered and `ttl` FIFO by time (#31, #32), and `f` uses zstd (#44); the
@@ -201,6 +274,21 @@ fn public_family(f: &ModelFamily) -> Family {
         (true, ModelAggregation::Min) => Family::aggregate(Aggregation::Min),
         (true, ModelAggregation::Max) => Family::aggregate(Aggregation::Max),
         (true, ModelAggregation::Hll) => Family::aggregate(Aggregation::Hll),
+        (true, ModelAggregation::BitOr) => Family::aggregate(Aggregation::BitOr),
+        (true, ModelAggregation::BitAnd) => Family::aggregate(Aggregation::BitAnd),
+        (true, ModelAggregation::BitXor) => Family::aggregate(Aggregation::BitXor),
+        (true, ModelAggregation::MinF64) => Family::aggregate(Aggregation::MinF64),
+        (true, ModelAggregation::MaxF64) => Family::aggregate(Aggregation::MaxF64),
+        (true, ModelAggregation::SumF64) => Family::aggregate(Aggregation::SumF64),
+        (true, ModelAggregation::MeanVar) => Family::aggregate(Aggregation::MeanVar),
+        (true, ModelAggregation::Histogram) => Family::aggregate(Aggregation::Histogram(
+            pigeonhole::HistogramParams::new(pigeonhole_sim::MODEL_HISTOGRAM_BOUNDS).unwrap(),
+        )),
+        (true, ModelAggregation::Quantiles) => Family::aggregate(Aggregation::Quantiles(
+            pigeonhole::QuantileParams::default()
+                .mantissa_bits(pigeonhole_sim::MODEL_QUANTILE_BITS)
+                .max_buckets(pigeonhole_sim::MODEL_QUANTILE_MAX),
+        )),
     };
     let family = family
         .max_versions(f.max_versions)
@@ -218,6 +306,11 @@ fn public_family(f: &ModelFamily) -> Family {
     } else {
         family
     }
+}
+
+/// An `f64` family's model value (the `f64`'s 8 little-endian bytes).
+fn f64_value(value: &[u8]) -> f64 {
+    f64::from_bits(counter_value(value) as u64)
 }
 
 /// A counter family's model value (8 little-endian bytes) as an `i64`.
@@ -835,11 +928,11 @@ impl Vfs for RealFs {
 
 impl Run {
     fn new(seed: u64, mut cfg: Config) -> Result<Self, String> {
-        // The counters target runs every other seed with counter checkpoints after every
-        // counter read (D291) under the run's flushes, compactions and tablet changes, unless
-        // `PIGEONHOLE_CHECKPOINT_STEPS` chose (#1051).
-        if cfg.checkpoint_steps.is_none() && env!("CARGO_CRATE_NAME") == "counters" && seed % 2 == 1
-        {
+        // The counters targets (and `scalar_counters`, D298) run every other seed with counter
+        // checkpoints after every counter read (D291) under the run's flushes, compactions
+        // and tablet changes, unless `PIGEONHOLE_CHECKPOINT_STEPS` chose (#1051).
+        let counters = matches!(env!("CARGO_CRATE_NAME"), "counters" | "scalar_counters");
+        if cfg.checkpoint_steps.is_none() && counters && seed % 2 == 1 {
             cfg.checkpoint_steps = Some(1);
         }
         let vfs = SimVfs::new(seed);
@@ -1140,6 +1233,12 @@ impl Run {
                         value,
                         ..
                     } => match (is_i64(family), ts) {
+                        (true, None) if is_f64(family) => {
+                            m.put_f64(family, qualifier, f64_value(value))
+                        }
+                        (true, Some(ts)) if is_f64(family) => {
+                            m.put_f64_at(family, qualifier, *ts, f64_value(value))
+                        }
                         (true, None) => m.put_i64(family, qualifier, counter_value(value)),
                         (true, Some(ts)) => {
                             m.put_i64_at(family, qualifier, *ts, counter_value(value))
@@ -1150,10 +1249,10 @@ impl Run {
                     ModelOp::Incr {
                         family,
                         qualifier,
-                        ts: None,
+                        ts,
                         delta,
                         ..
-                    } if is_min_max(family) => m.aggregate(family, qualifier, *delta),
+                    } if is_min_max(family) => mutation_input(m, family, qualifier, *ts, *delta),
                     ModelOp::Incr {
                         family,
                         qualifier,
@@ -1161,13 +1260,6 @@ impl Run {
                         delta,
                         ..
                     } => m.incr(family, qualifier, *delta),
-                    ModelOp::Incr {
-                        family,
-                        qualifier,
-                        ts: Some(ts),
-                        delta,
-                        ..
-                    } if is_min_max(family) => m.aggregate_at(family, qualifier, *ts, *delta),
                     ModelOp::Incr {
                         family,
                         qualifier,
@@ -1195,6 +1287,24 @@ impl Run {
                 let (ti, row) = key(op);
                 let t = self.table(ti);
                 match op {
+                    ModelOp::Put {
+                        family,
+                        qualifier,
+                        ts: None,
+                        value,
+                        ..
+                    } if is_f64(family) && is_i64(family) => {
+                        wb.put_f64(t, &row, family, qualifier, f64_value(value))
+                    }
+                    ModelOp::Put {
+                        family,
+                        qualifier,
+                        ts: Some(ts),
+                        value,
+                        ..
+                    } if is_f64(family) && is_i64(family) => {
+                        wb.put_f64_at(t, &row, family, qualifier, *ts, f64_value(value))
+                    }
                     ModelOp::Put {
                         family,
                         qualifier,
@@ -1230,10 +1340,13 @@ impl Run {
                     ModelOp::Incr {
                         family,
                         qualifier,
-                        ts: None,
+                        ts,
                         delta,
                         ..
-                    } if is_min_max(family) => wb.aggregate(t, &row, family, qualifier, *delta),
+                    } if is_min_max(family) => {
+                        batch_input(&mut wb, t, &row, family, qualifier, *ts, *delta);
+                        &mut wb
+                    }
                     ModelOp::Incr {
                         family,
                         qualifier,
@@ -1241,15 +1354,6 @@ impl Run {
                         delta,
                         ..
                     } => wb.incr(t, &row, family, qualifier, *delta),
-                    ModelOp::Incr {
-                        family,
-                        qualifier,
-                        ts: Some(ts),
-                        delta,
-                        ..
-                    } if is_min_max(family) => {
-                        wb.aggregate_at(t, &row, family, qualifier, *ts, *delta)
-                    }
                     ModelOp::Incr {
                         family,
                         qualifier,

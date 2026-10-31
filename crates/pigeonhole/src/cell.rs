@@ -43,6 +43,88 @@ fn hll_estimate(data: &CellData) -> Option<u64> {
     }
 }
 
+fn as_f64(data: &CellData) -> Option<f64> {
+    match data.value() {
+        ValueRef::F64(x) => Some(x),
+        _ => None,
+    }
+}
+
+fn histogram_counts(data: &CellData) -> Option<Vec<u64>> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::buckets::histogram_counts(b, None).ok(),
+        _ => None,
+    }
+}
+
+fn quantile(data: &CellData, q: f64) -> Option<f64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::buckets::quantile(b, q),
+        _ => None,
+    }
+}
+
+fn quantiles_count(data: &CellData) -> Option<u64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::buckets::quantiles_count(b).ok(),
+        _ => None,
+    }
+}
+
+fn sum_f64(data: &CellData) -> Option<f64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::exact::sum_read(b).ok(),
+        _ => None,
+    }
+}
+
+fn mean_var(data: &CellData) -> Option<MeanVar> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::exact::mean_var_read(b)
+            .ok()
+            .map(|r| MeanVar {
+                count: r.count,
+                mean: r.mean,
+                variance: r.variance,
+                sample_variance: r.sample_variance,
+            }),
+        _ => None,
+    }
+}
+
+/// What a mean-variance cell reads as ([`Aggregation::MeanVar`](crate::Aggregation::MeanVar),
+/// D298): each figure is computed exactly from the inputs' count, sum and sum of squares, and
+/// rounded once, so the same inputs read the same figures in any order.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MeanVar {
+    count: u64,
+    mean: f64,
+    variance: f64,
+    sample_variance: Option<f64>,
+}
+
+impl MeanVar {
+    /// How many inputs the cell holds.
+    pub fn count(&self) -> u64 {
+        self.count
+    }
+
+    /// Their mean.
+    pub fn mean(&self) -> f64 {
+        self.mean
+    }
+
+    /// Their population variance (divided by the count).
+    pub fn variance(&self) -> f64 {
+        self.variance
+    }
+
+    /// Their sample variance (divided by the count less one); `None` for a single input.
+    pub fn sample_variance(&self) -> Option<f64> {
+        self.sample_variance
+    }
+}
+
 fn as_i64(data: &CellData) -> Option<i64> {
     match data.value() {
         ValueRef::I64(v) | ValueRef::Varint(v) => Some(v),
@@ -112,6 +194,53 @@ impl<'a> CellRef<'a> {
         as_i64(&self.data)
     }
 
+    /// The value as a `u64`: an `i64` value's bits, as a bitwise aggregate family holds them
+    /// ([`Aggregation::BitOr`](crate::Aggregation::BitOr), D298); `None` if it isn't one.
+    pub fn as_u64(&self) -> Option<u64> {
+        as_i64(&self.data).map(|v| v as u64)
+    }
+
+    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
+    pub fn as_f64(&self) -> Option<f64> {
+        as_f64(&self.data)
+    }
+
+    /// The sum an exact-sum state holds, rounded once to the nearest `f64`, as an exact-sum
+    /// family's cells hold ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298). The
+    /// value's shape decides, as for [`hll_estimate`](Self::hll_estimate): `None` unless it
+    /// is a well-formed state.
+    pub fn sum_f64(&self) -> Option<f64> {
+        sum_f64(&self.data)
+    }
+
+    /// The count, mean and variance a mean-variance state holds
+    /// ([`Aggregation::MeanVar`](crate::Aggregation::MeanVar), D298); `None` unless the value
+    /// is a well-formed one.
+    pub fn mean_var(&self) -> Option<MeanVar> {
+        mean_var(&self.data)
+    }
+
+    /// The per-bucket counts a histogram state holds, one per bucket of the family's
+    /// [`HistogramParams`](crate::HistogramParams) (D298); `None` unless the value is a
+    /// well-formed one.
+    pub fn histogram_counts(&self) -> Option<Vec<u64>> {
+        histogram_counts(&self.data)
+    }
+
+    /// The `q`-quantile (`0 ≤ q ≤ 1`) a quantile sketch holds
+    /// ([`Aggregation::Quantiles`](crate::Aggregation::Quantiles), D298): its bucket's
+    /// midpoint for the input of rank `⌊q·(n−1)⌋`, within a relative error of 2^-p while
+    /// nothing has collapsed. `None` unless the value is a well-formed sketch and `q` is in
+    /// range.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        quantile(&self.data, q)
+    }
+
+    /// The number of inputs a quantile sketch holds.
+    pub fn quantiles_count(&self) -> Option<u64> {
+        quantiles_count(&self.data)
+    }
+
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
     /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
     /// error. The value's shape decides, not its family: `None` unless it is a well-formed
@@ -165,6 +294,53 @@ impl Cell {
     /// The value as an `i64`, if it is one.
     pub fn as_i64(&self) -> Option<i64> {
         as_i64(&self.data)
+    }
+
+    /// The value as a `u64`: an `i64` value's bits, as a bitwise aggregate family holds them
+    /// ([`Aggregation::BitOr`](crate::Aggregation::BitOr), D298); `None` if it isn't one.
+    pub fn as_u64(&self) -> Option<u64> {
+        as_i64(&self.data).map(|v| v as u64)
+    }
+
+    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
+    pub fn as_f64(&self) -> Option<f64> {
+        as_f64(&self.data)
+    }
+
+    /// The sum an exact-sum state holds, rounded once to the nearest `f64`, as an exact-sum
+    /// family's cells hold ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298). The
+    /// value's shape decides, as for [`hll_estimate`](Self::hll_estimate): `None` unless it
+    /// is a well-formed state.
+    pub fn sum_f64(&self) -> Option<f64> {
+        sum_f64(&self.data)
+    }
+
+    /// The count, mean and variance a mean-variance state holds
+    /// ([`Aggregation::MeanVar`](crate::Aggregation::MeanVar), D298); `None` unless the value
+    /// is a well-formed one.
+    pub fn mean_var(&self) -> Option<MeanVar> {
+        mean_var(&self.data)
+    }
+
+    /// The per-bucket counts a histogram state holds, one per bucket of the family's
+    /// [`HistogramParams`](crate::HistogramParams) (D298); `None` unless the value is a
+    /// well-formed one.
+    pub fn histogram_counts(&self) -> Option<Vec<u64>> {
+        histogram_counts(&self.data)
+    }
+
+    /// The `q`-quantile (`0 ≤ q ≤ 1`) a quantile sketch holds
+    /// ([`Aggregation::Quantiles`](crate::Aggregation::Quantiles), D298): its bucket's
+    /// midpoint for the input of rank `⌊q·(n−1)⌋`, within a relative error of 2^-p while
+    /// nothing has collapsed. `None` unless the value is a well-formed sketch and `q` is in
+    /// range.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        quantile(&self.data, q)
+    }
+
+    /// The number of inputs a quantile sketch holds.
+    pub fn quantiles_count(&self) -> Option<u64> {
+        quantiles_count(&self.data)
     }
 
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's

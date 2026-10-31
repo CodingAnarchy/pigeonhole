@@ -696,3 +696,77 @@ fn reclaim_never_frees_a_live_slot_under_churn() {
         .collect();
     assert_eq!(all.len(), 4);
 }
+
+/// #1208, D300: a group's hold, stored under the allocator's lock before the mirror passes
+/// it, never lowers the visible seqno, wherever another shard's whole group falls in its
+/// reservation. The old step 1 (a bound read from the mirror, stored outside the lock) did:
+/// shard 0's stale bound landed below shard 1's commit, already visible.
+#[test]
+fn a_reservation_never_moves_the_visible_seqno_back() {
+    /// Shard 1's whole group of one: hold, reserve, raise the mirror, apply, release.
+    fn other_group(shm: &ShmRegion, next: &mut u64) {
+        let first = *next;
+        shm.publish_pending(1, first);
+        *next += 1;
+        shm.advance_next_seqno(first + 1);
+        shm.publish_pending(1, u64::MAX);
+    }
+    // Shard 0's group, in the steps another shard's group can fall between; `next` is the
+    // allocator's next seqno (the mirror may lag it).
+    for at in 0..4 {
+        let mut config = small_config();
+        config.shards = 2;
+        let shm = ShmRegion::in_memory(DB_ID, &config);
+        let mut next = shm.next_seqno();
+        let mut last = shm.visible_seqno();
+        let mut check = |shm: &ShmRegion, step: &str| {
+            let v = shm.visible_seqno();
+            assert!(
+                v >= last,
+                "at {at}, {step}: visible went back {last} -> {v}"
+            );
+            last = v;
+        };
+        if at == 0 {
+            other_group(&shm, &mut next);
+            check(&shm, "the other group");
+        }
+        // Under the lock: the hold, then the reservation.
+        let first = next;
+        shm.publish_pending(0, first);
+        next += 1;
+        check(&shm, "hold stored");
+        if at == 1 {
+            other_group(&shm, &mut next);
+            check(&shm, "the other group");
+        }
+        shm.advance_next_seqno(first + 1);
+        check(&shm, "mirror raised");
+        if at == 2 {
+            other_group(&shm, &mut next);
+            check(&shm, "the other group");
+        }
+        shm.publish_pending(0, u64::MAX);
+        check(&shm, "applied");
+        if at == 3 {
+            other_group(&shm, &mut next);
+            check(&shm, "the other group");
+        }
+        assert_eq!(shm.visible_seqno(), next - 1, "at {at}: all applied");
+    }
+
+    // The old step 1, for the record: a bound loaded from the mirror, then shard 1's whole
+    // group, then the stale bound stored.
+    let mut config = small_config();
+    config.shards = 2;
+    let shm = ShmRegion::in_memory(DB_ID, &config);
+    let mut next = shm.next_seqno();
+    let stale = shm.next_seqno();
+    other_group(&shm, &mut next);
+    let seen = shm.visible_seqno();
+    shm.publish_pending(0, stale);
+    assert!(
+        shm.visible_seqno() < seen,
+        "the old step 1 moved the visible seqno back"
+    );
+}

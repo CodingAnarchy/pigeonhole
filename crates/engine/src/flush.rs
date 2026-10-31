@@ -515,7 +515,7 @@ impl FlushTask {
                     )
                     .separating(
                         Arc::clone(&self.shared.blob_ids),
-                        item.options.blob_threshold,
+                        item.options.separation_threshold(),
                         self.shared.picker.target_sst_bytes,
                     ),
                 );

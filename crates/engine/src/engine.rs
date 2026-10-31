@@ -15,7 +15,7 @@ use pigeonhole_compaction::MergeRegistry;
 use pigeonhole_format::key::compare;
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions};
 use pigeonhole_format::shm::ViewRecord;
-use pigeonhole_format::value::{ValueRef, ValueTag, encode_value};
+use pigeonhole_format::value::ValueTag;
 use pigeonhole_format::wal::{BatchBuilder, Mutation, WalRecord};
 use pigeonhole_format::{
     Durability, FamilyId, Kind, Lsn, ManifestVersion, Seqno, StreamId, TableId, TabletId, Timestamp,
@@ -1528,6 +1528,7 @@ impl Engine {
         config.shard_threads = options.shard_threads;
         config.adaptive_drivers = options.adaptive_drivers;
         config.idle_spin = std::time::Duration::from_nanos(options.shard_spin_nanos);
+        config.idle_spin_cap = std::time::Duration::from_nanos(options.shard_spin_cap_nanos);
         let bound = match options.async_commit_bound {
             0 => options.memtable_budget / 2,
             b => b,
@@ -4668,11 +4669,62 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
                 family_name(catalog, m.table, m.family)
             )));
         }
+    } else if matches!(meta.options.kind, FamilyKind::MinF64 | FamilyKind::MaxF64) {
+        // `f64` inputs and puts, never NaN (D298: ordered by `total_cmp`).
+        let f64_value = m.value.len() == 9
+            && m.value[0] == ValueTag::F64 as u8
+            && !f64::from_le_bytes(m.value[1..9].try_into().expect("9 bytes")).is_nan();
+        if !f64_value {
+            return Err(Error::InvalidArgument(format!(
+                "{} is a {} family: it holds only f64 values, never NaN (put_f64 / \
+                 aggregate_f64)",
+                family_name(catalog, m.table, m.family),
+                kind_name(meta.options.kind)
+            )));
+        }
+    } else if matches!(
+        meta.options.kind,
+        FamilyKind::SumF64 | FamilyKind::MeanVar | FamilyKind::Histogram | FamilyKind::Quantiles
+    ) {
+        // `f64` inputs and puts (finite, or for a histogram anything but NaN); a put may also
+        // set a bucket to a well-formed state of the family, as `phdb load` writes one back
+        // (D298). Only the family's operator knows its parameters, so it judges a state.
+        let x = (m.value.len() == 9 && m.value[0] == ValueTag::F64 as u8)
+            .then(|| f64::from_le_bytes(m.value[1..9].try_into().expect("9 bytes")));
+        let input_ok = x.is_some_and(|x| {
+            if meta.options.kind == FamilyKind::Histogram {
+                !x.is_nan()
+            } else {
+                x.is_finite()
+            }
+        });
+        let state = || {
+            m.value.first() == Some(&(ValueTag::Bytes as u8))
+                && meta.merge_op.as_ref().is_some_and(|op| {
+                    let mut v = m.value.to_vec();
+                    op.finish(None, &mut v).is_ok() && v == m.value
+                })
+        };
+        if !(input_ok || (m.kind == Kind::Put && state())) {
+            let what = if meta.options.kind == FamilyKind::Histogram {
+                "f64 inputs, never NaN,"
+            } else {
+                "finite f64 inputs"
+            };
+            return Err(Error::InvalidArgument(format!(
+                "{} is a {} family: it takes {what} (aggregate_f64) and puts of such an f64 \
+                 or a well-formed state of the family",
+                family_name(catalog, m.table, m.family),
+                kind_name(meta.options.kind)
+            )));
+        }
     } else if !i64_value {
-        let hint = if meta.options.kind == FamilyKind::Counter {
-            "put_i64 / incr"
-        } else {
-            "put_i64 / aggregate"
+        let hint = match meta.options.kind {
+            FamilyKind::Counter => "put_i64 / incr",
+            FamilyKind::BitOr | FamilyKind::BitAnd | FamilyKind::BitXor => {
+                "put_i64 / aggregate_u64, a u64's bits"
+            }
+            _ => "put_i64 / aggregate",
         };
         return Err(Error::InvalidArgument(format!(
             "{} is a {} family: it holds only i64 values ({hint})",
@@ -4700,6 +4752,15 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::Min => "min",
         FamilyKind::Max => "max",
         FamilyKind::Hll => "hll",
+        FamilyKind::BitOr => "bit_or",
+        FamilyKind::BitAnd => "bit_and",
+        FamilyKind::BitXor => "bit_xor",
+        FamilyKind::MinF64 => "min_f64",
+        FamilyKind::MaxF64 => "max_f64",
+        FamilyKind::SumF64 => "sum_f64",
+        FamilyKind::MeanVar => "mean_var",
+        FamilyKind::Histogram => "histogram",
+        FamilyKind::Quantiles => "quantiles",
         FamilyKind::Standard => "standard",
     }
 }
@@ -4744,38 +4805,55 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
         }
         let ts = *m.ts.get_or_insert(COUNTER_TS);
         let key = (m.table, m.family, m.row, m.qualifier, ts);
-        // An HLL input's stored operand is the sketch of its element (D294).
-        let own = (kind == FamilyKind::Hll && m.kind == Kind::Merge).then(|| {
-            let mut v = Vec::with_capacity(9);
-            v.push(ValueTag::Bytes as u8);
-            pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
-            v
-        });
+        // An HLL input's stored operand is the sketch of its element (D294); an exact sum's
+        // or mean-variance put of an `f64` is the state of that one input (D298), so every
+        // value a bucket holds is a state (inputs stay `f64` operands until a fold).
+        let own = match (kind, m.kind) {
+            (FamilyKind::Hll, Kind::Merge) => {
+                let mut v = Vec::with_capacity(9);
+                v.push(ValueTag::Bytes as u8);
+                pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
+                Some(v)
+            }
+            (
+                FamilyKind::SumF64
+                | FamilyKind::MeanVar
+                | FamilyKind::Histogram
+                | FamilyKind::Quantiles,
+                Kind::Put,
+            ) if m.value.first() == Some(&(ValueTag::F64 as u8)) => {
+                // The family's operator makes the one-input state (it holds the parameters).
+                let op = catalog
+                    .family(m.family)
+                    .and_then(|f| f.merge_op.clone())
+                    .expect("an aggregate family binds its built-in operator");
+                let mut v = m.value.to_vec();
+                op.finish(None, &mut v)
+                    .expect("check_counter_write admitted the f64");
+                Some(v)
+            }
+            _ => None,
+        };
         if m.kind == Kind::Merge
             && let Some(&i) = latest.get(&key)
         {
+            // The family's built-in operator combines them, as a read would (D298): this
+            // newer operand onto the earlier operand, or onto the earlier put as its base.
+            // Both were validated (`check_counter_write`).
+            let op = catalog
+                .family(m.family)
+                .and_then(|f| f.merge_op.clone())
+                .expect("an aggregate family binds its built-in operator");
             let w = &mut writes[i];
-            let combined = if let Some(own) = &own {
-                // The earlier write is a validated put of a sketch, or an input's sketch.
-                let mut v = w.value.take().unwrap_or_else(|| w.m.value.to_vec());
-                pigeonhole_format::hll::merge_at(&mut v, 1, &own[1..])
-                    .map_err(|e| Error::InvalidArgument(e.to_string()))?;
-                v
+            let earlier = w.value.take().unwrap_or_else(|| w.m.value.to_vec());
+            let mut acc = own.unwrap_or_else(|| m.value.to_vec());
+            let combined = if w.m.kind == Kind::Put {
+                op.finish(Some(&earlier), &mut acc)
             } else {
-                let (earlier, this) = (
-                    stored_i64(w.value.as_deref().unwrap_or(w.m.value)),
-                    stored_i64(m.value),
-                );
-                let combined = match kind {
-                    FamilyKind::Min => earlier.min(this),
-                    FamilyKind::Max => earlier.max(this),
-                    _ => earlier.wrapping_add(this),
-                };
-                let mut v = Vec::with_capacity(9);
-                encode_value(&mut v, ValueRef::I64(combined));
-                v
+                op.merge(&mut acc, &earlier)
             };
-            w.value = Some(combined);
+            combined.map_err(|e| Error::InvalidArgument(e.to_string()))?;
+            w.value = Some(acc);
             continue;
         }
         latest.insert(key, writes.len());
@@ -4820,26 +4898,57 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
     // would fold across timestamps with no feature bit, so 1.0.x would open it and fail its
     // reads instead of refusing the file (perf287's S1 on #1194). `pigeonhole.i64_add` keeps
     // its 0.1.0 meaning on a standard family (D41).
-    let kind_of = |n: &str| match n {
-        crate::catalog::I64_MIN => Some("min"),
-        crate::catalog::I64_MAX => Some("max"),
-        crate::catalog::HLL => Some("hll"),
-        _ => None,
-    };
     if options.kind == FamilyKind::Standard
-        && let Some(kind) = kind_of(name)
+        && let Some(kind) = crate::catalog::builtin_kind(name)
+        && kind != FamilyKind::Counter
     {
         return Err(Error::InvalidArgument(format!(
-            "{name} is the operator of a {kind} family: create it with that kind"
+            "{name} is the operator of a {} family: create it with that kind",
+            kind_name(kind)
         )));
     }
-    // An HLL family's sketches are never separated into blob files (D294): a payload longer
-    // than the threshold is, so the threshold must reach the largest sketch (3076 bytes).
-    let largest = pigeonhole_format::hll::MAX_LEN as u64;
-    if options.kind == FamilyKind::Hll && u64::from(options.blob_threshold) < largest {
+    // `kind_params` (D298): only the tags the kind defines (a histogram's bounds, a quantile
+    // sketch's mantissa bits and bucket limit), with values in range.
+    if !options.kind_params.is_empty() {
+        let defined = crate::catalog::kind_param_tags(options.kind);
+        let entries = pigeonhole_format::kind_params::parse(&options.kind_params)
+            .map_err(|_| Error::InvalidArgument("kind_params is not a canonical list".into()))?;
+        if let Some((tag, _)) = entries.iter().find(|(t, _)| !defined.contains(t)) {
+            return Err(Error::InvalidArgument(format!(
+                "a {} family takes no parameter tag {tag}",
+                kind_name(options.kind)
+            )));
+        }
+    }
+    crate::catalog::builtin_operator(options).map_err(|why| {
+        Error::InvalidArgument(format!(
+            "a {} family's parameters: {why}",
+            kind_name(options.kind)
+        ))
+    })?;
+    // An HLL family's sketches, and an exact sum's or mean-variance state, are never
+    // separated into blob files (D294, D298): a payload longer than the threshold is, so the
+    // threshold must reach the largest one (3076, 274 or 821 bytes).
+    let largest = match options.kind {
+        FamilyKind::Hll => Some((
+            "an hll family keeps its sketches",
+            pigeonhole_format::hll::MAX_LEN,
+        )),
+        FamilyKind::SumF64 => Some((
+            "a sum_f64 family keeps its states",
+            pigeonhole_format::exact::SUM_MAX_LEN,
+        )),
+        FamilyKind::MeanVar => Some((
+            "a mean_var family keeps its states",
+            pigeonhole_format::exact::MEAN_VAR_MAX_LEN,
+        )),
+        _ => None,
+    };
+    if let Some((what, largest)) = largest
+        && u64::from(options.blob_threshold) < largest as u64
+    {
         return Err(Error::InvalidArgument(format!(
-            "an hll family keeps its sketches inline: blob_threshold must be at least {largest}, \
-             not {}",
+            "{what} inline: blob_threshold must be at least {largest}, not {}",
             options.blob_threshold
         )));
     }

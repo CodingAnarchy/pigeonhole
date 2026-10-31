@@ -287,6 +287,373 @@ impl MergeOperator for I64Max {
     }
 }
 
+/// A bitwise operator over `u64` (D298), the operator of a `FamilyKind::BitOr`, `BitAnd` or
+/// `BitXor` family: values and operands are `ValueTag::I64`, read as the `u64`'s bits. A
+/// missing base leaves the operands' combination.
+///
+/// ```
+/// use pigeonhole_compaction::{Bitwise, MergeOperator};
+///
+/// let v = |x: u64| [&[1u8][..], &x.to_le_bytes()].concat();
+/// let mut acc = v(0b0101);
+/// Bitwise::OR.merge(&mut acc, &v(0b0011)).unwrap();
+/// assert_eq!(acc, v(0b0111));
+/// let mut acc = v(0b0101);
+/// Bitwise::XOR.finish(Some(&v(0b0110)), &mut acc).unwrap();
+/// assert_eq!(acc, v(0b0011));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct Bitwise {
+    name: &'static str,
+    op: fn(u64, u64) -> u64,
+}
+
+impl Bitwise {
+    /// `pigeonhole.u64_or`.
+    pub const OR: Bitwise = Bitwise {
+        name: "pigeonhole.u64_or",
+        op: |a, b| a | b,
+    };
+    /// `pigeonhole.u64_and`.
+    pub const AND: Bitwise = Bitwise {
+        name: "pigeonhole.u64_and",
+        op: |a, b| a & b,
+    };
+    /// `pigeonhole.u64_xor`.
+    pub const XOR: Bitwise = Bitwise {
+        name: "pigeonhole.u64_xor",
+        op: |a, b| a ^ b,
+    };
+
+    fn combine(
+        &self,
+        acc: &mut Vec<u8>,
+        other: Option<&[u8]>,
+        what: &str,
+    ) -> Result<(), MergeError> {
+        let a =
+            stored_i64(acc).ok_or_else(|| MergeError::new(self.name, "operand is not an i64"))?;
+        let Some(other) = other else {
+            return Ok(());
+        };
+        let b = stored_i64(other).ok_or_else(|| MergeError::new(self.name, what))?;
+        put_i64(acc, (self.op)(a as u64, b as u64) as i64);
+        Ok(())
+    }
+}
+
+impl MergeOperator for Bitwise {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        self.combine(acc, Some(older), "operand is not an i64")
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        self.combine(acc, base, "base value is not an i64")
+    }
+}
+
+/// The `f64` in a stored `ValueTag::F64` value that is not NaN, or `None`.
+fn stored_f64(stored: &[u8]) -> Option<f64> {
+    match stored {
+        [tag, rest @ ..] if *tag == ValueTag::F64 as u8 => <[u8; 8]>::try_from(rest)
+            .ok()
+            .map(f64::from_le_bytes)
+            .filter(|x| !x.is_nan()),
+        _ => None,
+    }
+}
+
+/// An `f64` minimum or maximum (D298), the operator of a `FamilyKind::MinF64` or `MaxF64`
+/// family: values and operands are `ValueTag::F64`, never NaN, ordered by `f64::total_cmp`
+/// (`-0.0 < +0.0`), so the result is exact and deterministic. A NaN or another tag is a
+/// [`MergeError`].
+///
+/// ```
+/// use pigeonhole_compaction::{F64Extreme, MergeOperator};
+///
+/// let v = |x: f64| [&[2u8][..], &x.to_le_bytes()].concat();
+/// let mut acc = v(0.0);
+/// F64Extreme::MIN.merge(&mut acc, &v(-0.0)).unwrap();
+/// assert_eq!(acc, v(-0.0));
+/// assert!(F64Extreme::MAX.merge(&mut acc, &v(f64::NAN)).is_err());
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct F64Extreme {
+    name: &'static str,
+    keep: std::cmp::Ordering,
+}
+
+impl F64Extreme {
+    /// `pigeonhole.f64_min`.
+    pub const MIN: F64Extreme = F64Extreme {
+        name: "pigeonhole.f64_min",
+        keep: std::cmp::Ordering::Less,
+    };
+    /// `pigeonhole.f64_max`.
+    pub const MAX: F64Extreme = F64Extreme {
+        name: "pigeonhole.f64_max",
+        keep: std::cmp::Ordering::Greater,
+    };
+
+    fn combine(
+        &self,
+        acc: &mut Vec<u8>,
+        other: Option<&[u8]>,
+        what: &str,
+    ) -> Result<(), MergeError> {
+        let a =
+            stored_f64(acc).ok_or_else(|| MergeError::new(self.name, "operand is not an f64"))?;
+        let Some(other) = other else {
+            return Ok(());
+        };
+        let b = stored_f64(other).ok_or_else(|| MergeError::new(self.name, what))?;
+        if b.total_cmp(&a) == self.keep {
+            acc.clear();
+            acc.push(ValueTag::F64 as u8);
+            acc.extend_from_slice(&b.to_le_bytes());
+        }
+        Ok(())
+    }
+}
+
+impl MergeOperator for F64Extreme {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        self.combine(acc, Some(older), "operand is not an f64")
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        self.combine(acc, base, "base value is not an f64")
+    }
+}
+
+/// Exact `f64` aggregation (D298), the operator of a `FamilyKind::SumF64` or `MeanVar`
+/// family. Operands are `ValueTag::F64` inputs (finite) or `ValueTag::Bytes` states
+/// (`pigeonhole_format::exact`); a merge or finish always leaves the canonical state, so a
+/// bucket reads the same bytes however its inputs were grouped. A NaN or infinite input, a
+/// malformed state or another tag is a [`MergeError`].
+///
+/// ```
+/// use pigeonhole_compaction::{ExactF64, MergeOperator};
+///
+/// let f = |x: f64| [&[2u8][..], &x.to_le_bytes()].concat();
+/// let mut acc = f(1e100);
+/// ExactF64::SUM.merge(&mut acc, &f(1.0)).unwrap();
+/// ExactF64::SUM.finish(Some(&f(-1e100)), &mut acc).unwrap();
+/// assert_eq!(pigeonhole_format::exact::sum_read(&acc[1..]).unwrap(), 1.0);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ExactF64 {
+    name: &'static str,
+    mean_var: bool,
+}
+
+impl ExactF64 {
+    /// `pigeonhole.f64_sum`.
+    pub const SUM: ExactF64 = ExactF64 {
+        name: "pigeonhole.f64_sum",
+        mean_var: false,
+    };
+    /// `pigeonhole.f64_mean_var`.
+    pub const MEAN_VAR: ExactF64 = ExactF64 {
+        name: "pigeonhole.f64_mean_var",
+        mean_var: true,
+    };
+
+    /// Folds the stored value `v` (an input or a state) into the raw state `state`.
+    fn fold(&self, state: &mut Vec<u8>, v: &[u8]) -> Result<(), MergeError> {
+        use pigeonhole_format::exact;
+        let bad = |e: exact::StateError| MergeError::new(self.name, e.0);
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::F64 as u8 => {
+                let x = <[u8; 8]>::try_from(rest)
+                    .map(f64::from_le_bytes)
+                    .map_err(|_| MergeError::new(self.name, "operand is not an f64"))?;
+                if self.mean_var {
+                    exact::mean_var_add(state, x).map_err(bad)
+                } else {
+                    exact::sum_add(state, x).map_err(bad)
+                }
+            }
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => {
+                if self.mean_var {
+                    exact::mean_var_validate(rest).map_err(bad)?;
+                    exact::mean_var_merge(state, rest).map_err(bad)
+                } else {
+                    exact::sum_validate(rest).map_err(bad)?;
+                    exact::sum_merge(state, rest).map_err(bad)
+                }
+            }
+            _ => Err(MergeError::new(
+                self.name,
+                "operand is not an f64 or a state",
+            )),
+        }
+    }
+
+    /// `acc` as the state of `acc` and `other`, tagged `ValueTag::Bytes`. The state is built
+    /// in a scratch buffer the thread keeps (perf287's N1 on #1220): a fold of many operands
+    /// allocates nothing once the buffer has grown to the largest state.
+    fn combine(&self, acc: &mut Vec<u8>, other: Option<&[u8]>) -> Result<(), MergeError> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(pigeonhole_format::exact::MEAN_VAR_MAX_LEN));
+        }
+        SCRATCH.with(|scratch| {
+            let mut state = scratch.borrow_mut();
+            state.clear();
+            self.fold(&mut state, acc)?;
+            if let Some(o) = other {
+                self.fold(&mut state, o)?;
+            }
+            acc.clear();
+            acc.push(ValueTag::Bytes as u8);
+            acc.extend_from_slice(&state);
+            Ok(())
+        })
+    }
+}
+
+impl MergeOperator for ExactF64 {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        self.combine(acc, Some(older))
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        self.combine(acc, base)
+    }
+}
+
+/// A histogram's or quantile sketch's operator (D298), the operator of a
+/// `FamilyKind::Histogram` or `Quantiles` family, built from the family's parameters
+/// (`kind_params`): operands are `ValueTag::F64` inputs or `ValueTag::Bytes` states
+/// (`pigeonhole_format::buckets`), and a merge or finish always leaves the canonical state.
+/// A refused input (NaN; for quantiles any non-finite value), a malformed state or one of
+/// other parameters, or another tag is a [`MergeError`].
+///
+/// ```
+/// use pigeonhole_compaction::{Buckets, MergeOperator};
+///
+/// let f = |x: f64| [&[2u8][..], &x.to_le_bytes()].concat();
+/// let op = Buckets::histogram(vec![0.0, 10.0]);
+/// let mut acc = f(5.0);
+/// op.merge(&mut acc, &f(-1.0)).unwrap();
+/// op.finish(Some(&f(50.0)), &mut acc).unwrap();
+/// let counts = pigeonhole_format::buckets::histogram_counts(&acc[1..], Some(3)).unwrap();
+/// assert_eq!(counts, [1, 1, 1]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Buckets {
+    kind: BucketsKind,
+}
+
+#[derive(Debug, Clone)]
+enum BucketsKind {
+    Histogram(Arc<[f64]>),
+    Quantiles(pigeonhole_format::buckets::QuantileParams),
+}
+
+impl Buckets {
+    /// The name of the histogram operator.
+    pub const HISTOGRAM: &'static str = "pigeonhole.f64_histogram";
+    /// The name of the quantile sketch operator.
+    pub const QUANTILES: &'static str = "pigeonhole.f64_quantiles";
+
+    /// A histogram's operator over `bounds` (checked by the caller: finite, strictly
+    /// increasing, 1 to 1023 of them).
+    pub fn histogram(bounds: Vec<f64>) -> Self {
+        Buckets {
+            kind: BucketsKind::Histogram(bounds.into()),
+        }
+    }
+
+    /// A quantile sketch's operator with `params` (checked by the caller).
+    pub fn quantiles(params: pigeonhole_format::buckets::QuantileParams) -> Self {
+        Buckets {
+            kind: BucketsKind::Quantiles(params),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.kind {
+            BucketsKind::Histogram(_) => Self::HISTOGRAM,
+            BucketsKind::Quantiles(_) => Self::QUANTILES,
+        }
+    }
+
+    /// Folds the stored value `v` (an input or a state) into the raw state `state`.
+    fn fold(&self, state: &mut Vec<u8>, v: &[u8]) -> Result<(), MergeError> {
+        use pigeonhole_format::buckets;
+        let bad = |e: buckets::BucketError| MergeError::new(self.label(), e.0);
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::F64 as u8 => {
+                let x = <[u8; 8]>::try_from(rest)
+                    .map(f64::from_le_bytes)
+                    .map_err(|_| MergeError::new(self.label(), "operand is not an f64"))?;
+                match &self.kind {
+                    BucketsKind::Histogram(b) => buckets::histogram_add(state, b, x),
+                    BucketsKind::Quantiles(p) => buckets::quantiles_add(state, *p, x),
+                }
+                .map_err(bad)
+            }
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => match &self.kind {
+                BucketsKind::Histogram(b) => buckets::histogram_merge(state, b, rest),
+                BucketsKind::Quantiles(p) => buckets::quantiles_merge(state, *p, rest),
+            }
+            .map_err(bad),
+            _ => Err(MergeError::new(
+                self.label(),
+                "operand is not an f64 or a state",
+            )),
+        }
+    }
+
+    /// `acc` as the state of `acc` and `other`, tagged `ValueTag::Bytes`, built in the
+    /// thread's scratch buffer.
+    fn combine(&self, acc: &mut Vec<u8>, other: Option<&[u8]>) -> Result<(), MergeError> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|scratch| {
+            let mut state = scratch.borrow_mut();
+            state.clear();
+            self.fold(&mut state, acc)?;
+            if let Some(o) = other {
+                self.fold(&mut state, o)?;
+            }
+            acc.clear();
+            acc.push(ValueTag::Bytes as u8);
+            acc.extend_from_slice(&state);
+            Ok(())
+        })
+    }
+}
+
+impl MergeOperator for Buckets {
+    fn name(&self) -> &str {
+        self.label()
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        self.combine(acc, Some(older))
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        self.combine(acc, base)
+    }
+}
+
 /// Built-in HyperLogLog union, the operator of a `FamilyKind::Hll` family (D294): operands
 /// and values are `ValueTag::Bytes` sketches (`pigeonhole_format::hll`), and the result is
 /// their register-wise maximum, in canonical form. It folds in place: no decode, no re-encode,
@@ -381,6 +748,18 @@ impl MergeRegistry {
         r.register(Arc::new(I64Min));
         r.register(Arc::new(I64Max));
         r.register(Arc::new(HllUnion));
+        for op in [Bitwise::OR, Bitwise::AND, Bitwise::XOR] {
+            r.register(Arc::new(op));
+        }
+        for op in [F64Extreme::MIN, F64Extreme::MAX] {
+            r.register(Arc::new(op));
+        }
+        for op in [ExactF64::SUM, ExactF64::MEAN_VAR] {
+            r.register(Arc::new(op));
+        }
+        // Their names only: a family of these kinds binds its own, from its parameters.
+        r.register(Arc::new(Buckets::histogram(vec![0.0])));
+        r.register(Arc::new(Buckets::quantiles(Default::default())));
         r
     }
 

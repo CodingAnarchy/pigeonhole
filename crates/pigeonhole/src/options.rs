@@ -67,6 +67,7 @@ pub struct Options {
     write_stall_timeout: Option<Duration>,
     commit_spin: Option<Duration>,
     shard_spin: Option<Duration>,
+    shard_spin_cap: Option<Duration>,
     shard_threads: Option<usize>,
     adaptive_shard_threads: bool,
     background_workers: usize,
@@ -81,15 +82,19 @@ pub struct Options {
 pub enum CpuProfile {
     /// The application runs in the same process and needs CPU of its own: the engine's
     /// driver and compaction threads take a share of the physical cores and leave the rest,
-    /// and every SMT sibling, to the application. The default.
+    /// and every SMT sibling, to the application. A shard thread that handled a commit
+    /// polls for the next one before it sleeps for a window sized from its recent gaps
+    /// between commits: up to 1 ms when they come steadily, and never more poll per gap
+    /// than a 200 µs window would cost (D198 as amended again on 2026-10-30; #1176). The
+    /// default.
     #[default]
     Embedded,
     /// The database has the machine or container to itself, and its clients reach it from
     /// elsewhere (another container, over IPC or the network): flush and compaction take
     /// half the physical cores instead of a quarter, and a shard thread that handled a
-    /// commit keeps polling 1 ms for the next one before it sleeps, instead of 200 µs.
-    /// Under a moderate steady load that costs up to about two cores and trims the commit
-    /// tail (D198 as amended on 2026-10-30). Shard threads are the same as with `Embedded`:
+    /// commit always polls 1 ms for the next one before it sleeps. Under a moderate steady
+    /// load that costs up to about two cores more than `Embedded` and trims the commit
+    /// tail further (D198 as amended on 2026-10-30). Shard threads are the same as with `Embedded`:
     /// up to one per shard, sized to the load by default
     /// ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     Server,
@@ -147,6 +152,18 @@ fn shard_spin_default(profile: CpuProfile) -> Option<Duration> {
     match profile {
         CpuProfile::Embedded => None,
         CpuProfile::Server => Some(Duration::from_millis(1)),
+    }
+}
+
+/// The cap of `Embedded`'s adaptive window (D198's third amendment, #1176): each shard thread polls up to 1 ms when
+/// its recent gaps between commits make that cost no more poll per gap than the fixed 200
+/// µs window could. On the reference machine that took sparse-wide's default-durability put
+/// p99 from 390 to 122 µs and its `Buffered` put p99 to `Server`'s, at `Embedded`'s CPU under
+/// a paced 1K and 4K commits/s, and 0.3 cores more at 20K. `Server` keeps its fixed 1 ms.
+fn shard_spin_cap_default(profile: CpuProfile) -> Option<Duration> {
+    match profile {
+        CpuProfile::Embedded => Some(Duration::from_millis(1)),
+        CpuProfile::Server => None,
     }
 }
 
@@ -219,6 +236,7 @@ impl Default for Options {
             write_stall_timeout: None,
             commit_spin: None,
             shard_spin: None,
+            shard_spin_cap: None,
             shard_threads: None,
             adaptive_shard_threads: true,
             background_workers: 0,
@@ -433,7 +451,8 @@ impl Options {
     /// the API: the default suits applications.
     ///
     /// How long a shard thread that just handled a commit keeps polling for the next one
-    /// before it sleeps (default 200 µs, or 1 ms with [`CpuProfile::Server`]; D198 as amended
+    /// before it sleeps (default 200 µs, sized up to 1 ms from the shard's recent gaps; a fixed
+    /// 1 ms with [`CpuProfile::Server`]; a window set here is fixed; D198 as amended
     /// on 2026-10-19 and 2026-10-30), so a steady stream
     /// of commits is taken without waking the thread each time, and a store whose clients
     /// wait on each other across shards does not settle into every message costing a wake. An idle database never polls, and polls that
@@ -443,6 +462,20 @@ impl Options {
     #[doc(hidden)]
     pub fn shard_spin(mut self, window: Duration) -> Self {
         self.shard_spin = Some(window);
+        self
+    }
+
+    /// A test and bench hook (#1176), only with the `__unstable-hooks` feature and outside
+    /// the API.
+    ///
+    /// Sizes each shard thread's poll from its recent idle gaps, up to `cap`: the longest
+    /// poll whose expected cost per gap is no more than the [`shard_spin`](Self::shard_spin)
+    /// window's could be. A cap at or below that window keeps the window fixed, as with no
+    /// cap (the default under [`CpuProfile::Server`] or with an explicit window).
+    #[cfg(feature = "__unstable-hooks")]
+    #[doc(hidden)]
+    pub fn shard_spin_cap(mut self, cap: Duration) -> Self {
+        self.shard_spin_cap = Some(cap);
         self
     }
 
@@ -482,12 +515,13 @@ impl Options {
     ///   ([`adaptive_shard_threads`](Options::adaptive_shard_threads)).
     /// - **[`CpuProfile::Embedded`] (the default):** your application runs in this process
     ///   and needs CPU too. Flush and compaction take a quarter of the physical cores, and a
-    ///   shard thread polls 200 µs for the next commit before it sleeps.
+    ///   shard thread polls for the next commit before it sleeps: up to 1 ms while commits
+    ///   come steadily, at no more poll per gap than 200 µs would cost.
     /// - **[`CpuProfile::Server`]:** the database has the machine or container to itself,
     ///   and its clients reach it from elsewhere (another container, over IPC or the
     ///   network). Flush and compaction take half the physical cores, and a shard thread
-    ///   polls 1 ms for the next commit before it sleeps: a lower commit tail for up to
-    ///   about two more cores under a moderate steady load.
+    ///   always polls 1 ms for the next commit before it sleeps: a lower commit tail at a
+    ///   moderate steady load, for up to about two more cores.
     /// - **CPU limits:** "physical cores" means those the process may use: its affinity
     ///   mask and a container's CPU quota both narrow them, so a 4-CPU container sizes the
     ///   engine for 4 whatever the host has.
@@ -979,17 +1013,17 @@ pub struct Family {
 }
 
 /// How an aggregate family combines the values written to a cell, fixed when the family is
-/// created, as in Bigtable's aggregate families (decisions D179, D294; [`Family::aggregate`]).
+/// created, as in Bigtable's aggregate families (decisions D179, D294, D298;
+/// [`Family::aggregate`]).
 ///
-/// Every aggregation takes `i64` inputs, written with
-/// [`aggregate`](crate::RowMutation::aggregate) (and [`aggregate_at`] for a bucket), and
-/// combines them within one bucket: a column at one timestamp. A bucket nothing was written
-/// to (or whose writes were all deleted) reads as absent, never as 0.
+/// Inputs are written with [`aggregate`](crate::RowMutation::aggregate) (`i64`),
+/// [`aggregate_u64`](crate::RowMutation::aggregate_u64) (the bitwise kinds) or
+/// [`aggregate_f64`](crate::RowMutation::aggregate_f64) (the `f64` kinds), and `_at` forms for
+/// a bucket. They combine within one bucket: a column at one timestamp. A bucket nothing was
+/// written to (or whose writes were all deleted) reads as absent, never as 0.
 ///
-/// Non-exhaustive: later releases add aggregations (#488).
-///
-/// [`aggregate_at`]: crate::RowMutation::aggregate_at
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Non-exhaustive: later releases add aggregations, some carrying parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Aggregation {
     /// The sum of the inputs, wrapping on overflow: a counter ([`Family::counter`]).
@@ -1003,35 +1037,213 @@ pub enum Aggregation {
     /// standard error). A bucket's sketch is up to 3 KiB; reads and the row cache carry it
     /// whole, so bound a wide row's buckets with a TTL or `max_versions`.
     Hll,
+    /// The bitwise OR of `u64` inputs ([`aggregate_u64`](crate::RowMutation::aggregate_u64);
+    /// read with [`CellRef::as_u64`](crate::CellRef::as_u64)): a set of flags.
+    BitOr,
+    /// The bitwise AND of `u64` inputs.
+    BitAnd,
+    /// The bitwise XOR of `u64` inputs.
+    BitXor,
+    /// The smallest `f64` input ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read
+    /// with [`CellRef::as_f64`](crate::CellRef::as_f64)), by `f64::total_cmp`: `-0.0` is
+    /// below `+0.0`, infinities are allowed, NaN is refused.
+    MinF64,
+    /// The largest `f64` input, as [`Aggregation::MinF64`].
+    MaxF64,
+    /// The exact sum of finite `f64` inputs
+    /// ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read with
+    /// [`CellRef::sum_f64`](crate::CellRef::sum_f64)), rounded once when read: the same
+    /// inputs read the same sum in any order. A cell is a state of up to 274 bytes.
+    SumF64,
+    /// The count, mean and variance of finite `f64` inputs
+    /// ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read with
+    /// [`CellRef::mean_var`](crate::CellRef::mean_var)), each computed exactly and rounded
+    /// once. A cell is a state of up to 821 bytes.
+    MeanVar,
+    /// Counts of `f64` inputs (NaN refused) in fixed buckets between the bounds of
+    /// [`HistogramParams`] ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read with
+    /// [`CellRef::histogram_counts`](crate::CellRef::histogram_counts)).
+    Histogram(HistogramParams),
+    /// A log-linear quantile sketch of finite `f64` inputs, within a relative error of
+    /// 2^-p ([`QuantileParams`]; [`aggregate_f64`](crate::RowMutation::aggregate_f64); read
+    /// with [`CellRef::quantile`](crate::CellRef::quantile)). The same inputs give the same
+    /// sketch in any order.
+    Quantiles(QuantileParams),
+}
+
+/// A histogram family's bucket bounds ([`Aggregation::Histogram`], D298): `n` bounds
+/// `b0 < b1 < … < b(n-1)` make `n + 1` buckets, `(-∞, b0)`, `[b0, b1)`, …, `[b(n-1), +∞)`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct HistogramParams {
+    bounds: Vec<u64>,
+}
+
+impl HistogramParams {
+    /// Bounds that are finite, strictly increasing, 1 to 1023 of them, and never `-0.0`;
+    /// `InvalidArgument` otherwise.
+    pub fn new(bounds: impl Into<Vec<f64>>) -> crate::Result<Self> {
+        let bounds: Vec<f64> = bounds.into();
+        pigeonhole_format::buckets::histogram_bounds(
+            &pigeonhole_format::buckets::histogram_params(&bounds),
+        )
+        .map_err(|e| crate::Error::new(crate::ErrorCode::InvalidArgument, e.0.to_owned()))?;
+        Ok(HistogramParams {
+            bounds: bounds.iter().map(|b| b.to_bits()).collect(),
+        })
+    }
+
+    /// The bounds.
+    pub fn bounds(&self) -> Vec<f64> {
+        self.bounds.iter().map(|&b| f64::from_bits(b)).collect()
+    }
+
+    /// The bucket an input `x` falls in: how many bounds lie at or below it (IEEE `<=`, so
+    /// `-0.0` and `0.0` share a bucket). Counts from
+    /// [`CellRef::histogram_counts`](crate::CellRef::histogram_counts) are indexed the same
+    /// way: `n` bounds give `n + 1` counts.
+    pub fn bucket_of(&self, x: f64) -> usize {
+        pigeonhole_format::buckets::bucket_of(&self.bounds(), x)
+    }
+}
+
+/// A quantile family's parameters ([`Aggregation::Quantiles`], D298): the mantissa bits
+/// `p` an input keeps (1 to 12; a relative error of at most 2^-p; 7 by default) and the
+/// buckets each sign's store keeps (16 to 4096; 2048 by default) before its smallest
+/// magnitudes collapse into one bucket. Out-of-range values are refused when the family is
+/// created.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuantileParams {
+    mantissa_bits: u8,
+    max_buckets: u16,
+}
+
+impl Default for QuantileParams {
+    fn default() -> Self {
+        let d = pigeonhole_format::buckets::QuantileParams::default();
+        QuantileParams {
+            mantissa_bits: d.mantissa_bits,
+            max_buckets: d.max_buckets,
+        }
+    }
+}
+
+impl QuantileParams {
+    /// With `p` mantissa bits.
+    pub fn mantissa_bits(mut self, p: u8) -> Self {
+        self.mantissa_bits = p;
+        self
+    }
+
+    /// With `n` buckets per store.
+    pub fn max_buckets(mut self, n: u16) -> Self {
+        self.max_buckets = n;
+        self
+    }
+
+    /// The mantissa bits.
+    pub fn get_mantissa_bits(&self) -> u8 {
+        self.mantissa_bits
+    }
+
+    /// The buckets per store.
+    pub fn get_max_buckets(&self) -> u16 {
+        self.max_buckets
+    }
+
+    fn format(&self) -> pigeonhole_format::buckets::QuantileParams {
+        pigeonhole_format::buckets::QuantileParams {
+            mantissa_bits: self.mantissa_bits,
+            max_buckets: self.max_buckets,
+        }
+    }
 }
 
 impl Aggregation {
-    fn kind(self) -> FamilyKind {
+    fn kind(&self) -> FamilyKind {
         match self {
             Aggregation::Sum => FamilyKind::Counter,
             Aggregation::Min => FamilyKind::Min,
             Aggregation::Max => FamilyKind::Max,
             Aggregation::Hll => FamilyKind::Hll,
+            Aggregation::BitOr => FamilyKind::BitOr,
+            Aggregation::BitAnd => FamilyKind::BitAnd,
+            Aggregation::BitXor => FamilyKind::BitXor,
+            Aggregation::MinF64 => FamilyKind::MinF64,
+            Aggregation::MaxF64 => FamilyKind::MaxF64,
+            Aggregation::SumF64 => FamilyKind::SumF64,
+            Aggregation::MeanVar => FamilyKind::MeanVar,
+            Aggregation::Histogram(_) => FamilyKind::Histogram,
+            Aggregation::Quantiles(_) => FamilyKind::Quantiles,
         }
     }
 
-    /// The aggregation of an engine family kind (`None` for a standard family).
-    pub(crate) fn of_kind(kind: FamilyKind) -> Option<Self> {
+    /// The family's `kind_params` (D298): a histogram's bounds, a quantile sketch's
+    /// parameters; none for the other aggregations.
+    fn kind_params(&self) -> Vec<u8> {
+        match self {
+            Aggregation::Histogram(h) => pigeonhole_format::buckets::histogram_params(&h.bounds()),
+            Aggregation::Quantiles(q) => q.format().encode(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The aggregation of an engine family's options (`None` for a standard family), its
+    /// parameters read back from `kind_params`.
+    pub(crate) fn of_options(o: &pigeonhole_format::manifest::FamilyOptions) -> Option<Self> {
+        use pigeonhole_format::buckets;
+        match o.kind {
+            FamilyKind::Histogram => buckets::histogram_bounds(&o.kind_params).ok().map(|b| {
+                Aggregation::Histogram(HistogramParams {
+                    bounds: b.iter().map(|x| x.to_bits()).collect(),
+                })
+            }),
+            FamilyKind::Quantiles => buckets::QuantileParams::parse(&o.kind_params)
+                .ok()
+                .map(|q| {
+                    Aggregation::Quantiles(QuantileParams {
+                        mantissa_bits: q.mantissa_bits,
+                        max_buckets: q.max_buckets,
+                    })
+                }),
+            kind => Self::of_kind(kind),
+        }
+    }
+
+    /// The aggregation of an engine family kind without parameters (`None` for a standard
+    /// family).
+    fn of_kind(kind: FamilyKind) -> Option<Self> {
         match kind {
+            FamilyKind::Standard => None,
             FamilyKind::Counter => Some(Aggregation::Sum),
             FamilyKind::Min => Some(Aggregation::Min),
             FamilyKind::Max => Some(Aggregation::Max),
             FamilyKind::Hll => Some(Aggregation::Hll),
-            _ => None,
+            FamilyKind::BitOr => Some(Aggregation::BitOr),
+            FamilyKind::BitAnd => Some(Aggregation::BitAnd),
+            FamilyKind::BitXor => Some(Aggregation::BitXor),
+            FamilyKind::MinF64 => Some(Aggregation::MinF64),
+            FamilyKind::MaxF64 => Some(Aggregation::MaxF64),
+            FamilyKind::SumF64 => Some(Aggregation::SumF64),
+            FamilyKind::MeanVar => Some(Aggregation::MeanVar),
+            FamilyKind::Histogram | FamilyKind::Quantiles => None,
         }
     }
 
-    fn operator(self) -> &'static str {
+    fn operator(&self) -> &'static str {
         match self {
             Aggregation::Sum => I64_ADD,
             Aggregation::Min => I64_MIN,
             Aggregation::Max => I64_MAX,
             Aggregation::Hll => HLL,
+            Aggregation::BitOr => "pigeonhole.u64_or",
+            Aggregation::BitAnd => "pigeonhole.u64_and",
+            Aggregation::BitXor => "pigeonhole.u64_xor",
+            Aggregation::MinF64 => "pigeonhole.f64_min",
+            Aggregation::MaxF64 => "pigeonhole.f64_max",
+            Aggregation::SumF64 => "pigeonhole.f64_sum",
+            Aggregation::MeanVar => "pigeonhole.f64_mean_var",
+            Aggregation::Histogram(_) => "pigeonhole.f64_histogram",
+            Aggregation::Quantiles(_) => "pigeonhole.f64_quantiles",
         }
     }
 }
@@ -1089,7 +1301,8 @@ impl Family {
         Self {
             options: FamilyOptions::default()
                 .merge_operator(aggregation.operator().to_owned())
-                .kind(aggregation.kind()),
+                .kind(aggregation.kind())
+                .kind_params(aggregation.kind_params()),
         }
     }
 
@@ -1329,6 +1542,16 @@ impl Options {
         if let Some(window) = self.shard_spin.or(shard_spin_default(self.cpu_profile)) {
             o.shard_spin_nanos = u64::try_from(window.as_nanos()).unwrap_or(u64::MAX);
         }
+        // An explicit window is fixed unless a cap is set with it; otherwise the profile's
+        // cap applies (#1176).
+        let cap = match (self.shard_spin_cap, self.shard_spin) {
+            (Some(cap), _) => Some(cap),
+            (None, Some(_)) => None,
+            (None, None) => shard_spin_cap_default(self.cpu_profile),
+        };
+        if let Some(cap) = cap {
+            o.shard_spin_cap_nanos = u64::try_from(cap.as_nanos()).unwrap_or(u64::MAX);
+        }
         if let Some(timeout) = self.write_stall_timeout {
             o.write_stall_timeout_nanos = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
         }
@@ -1502,25 +1725,44 @@ mod tests {
         assert_eq!(e.shard_threads, 20);
     }
 
-    /// The shard's spin window by profile (D198, amended 2026-10-30): `Embedded` keeps the
-    /// engine's 200 µs, `Server` polls 1 ms, and an explicit window wins over either.
+    /// The shard's spin window by profile (D198, amended 2026-10-30; #1176): `Embedded`
+    /// polls 200 µs adaptive up to 1 ms, `Server` a fixed 1 ms, and an explicit window wins
+    /// over either.
     #[test]
     fn the_shard_spin_follows_the_profile() {
         use super::Options;
         let o = || Options::default().vfs(pigeonhole_io::sim::SimVfs::new(1));
-        let spin = |o: Options| o.to_engine_for(false).unwrap().shard_spin_nanos;
-        assert_eq!(spin(o()), 200_000);
-        assert_eq!(spin(o().cpu_profile(CpuProfile::Embedded)), 200_000);
-        assert_eq!(spin(o().cpu_profile(CpuProfile::Server)), 1_000_000);
+        let spin = |o: Options| {
+            let e = o.to_engine_for(false).unwrap();
+            (e.shard_spin_nanos, e.shard_spin_cap_nanos)
+        };
+        // `Embedded`: 200 µs, adaptive up to 1 ms (#1176); `Server`: a fixed 1 ms.
+        assert_eq!(spin(o()), (200_000, 1_000_000));
+        assert_eq!(
+            spin(o().cpu_profile(CpuProfile::Embedded)),
+            (200_000, 1_000_000)
+        );
+        assert_eq!(spin(o().cpu_profile(CpuProfile::Server)), (1_000_000, 0));
         #[cfg(feature = "__unstable-hooks")]
         {
             use std::time::Duration;
             let set = Duration::from_micros(300);
+            // An explicit window is fixed, under either profile, unless a cap comes with it.
             assert_eq!(
                 spin(o().cpu_profile(CpuProfile::Server).shard_spin(set)),
-                300_000
+                (300_000, 0)
             );
-            assert_eq!(spin(o().shard_spin(Duration::ZERO)), 0);
+            assert_eq!(spin(o().shard_spin(set)), (300_000, 0));
+            assert_eq!(spin(o().shard_spin(Duration::ZERO)), (0, 0));
+            assert_eq!(
+                spin(o().shard_spin(set).shard_spin_cap(Duration::from_millis(2))),
+                (300_000, 2_000_000)
+            );
+            // A cap alone keeps the profile's window.
+            assert_eq!(
+                spin(o().shard_spin_cap(Duration::from_micros(200))),
+                (200_000, 200_000)
+            );
         }
     }
 

@@ -1305,7 +1305,7 @@ impl RetryWait {
                     from: p,
                     generation: g,
                 },
-                WakeReason::Room { generation },
+                WakeReason::Room { generation } | WakeReason::RoomGone { generation },
             ) => p == from && g < generation,
             (RetryWait::Overlap { from: p }, WakeReason::Overlap { priority: woken }) => {
                 p == from && woken == priority
@@ -1408,6 +1408,10 @@ fn prepare_error_of(e: &Error) -> PrepareError {
 pub(crate) enum WakeReason {
     /// It has room again, in room generation `generation` (D245).
     Room { generation: u64 },
+    /// Its room will not free: it waits for room on a frozen clock with nothing in flight,
+    /// the condition on which it refuses a waiting single (#70). The retries waiting on its
+    /// room from before generation `generation` give up with `Busy` (D301).
+    RoomGone { generation: u64 },
     /// The undecided shares the commit of `priority` overlapped are decided, or the older
     /// commit it waited behind has run its next attempt here (D249).
     Overlap { priority: CommitPriority },
@@ -3053,6 +3057,9 @@ pub(crate) struct ShardState {
     /// Per shard, the latest room generation its room `Wake` reported: a room retry waits
     /// for a later one than its refusal's.
     room_freed: Vec<u64>,
+    /// Per shard, the latest room generation its `RoomGone` wake reported (D301): a room
+    /// retry refused in an earlier generation gives up with `Busy`.
+    room_gone: Vec<u64>,
     /// Coordinators whose PREPAREs this shard refused because they overlapped an undecided
     /// share (D249), told when the overlap clears.
     overlap_refused: Vec<OverlapRefusal>,
@@ -3419,6 +3426,7 @@ impl ShardState {
             room_refused_free: 0,
             room_generation: 0,
             room_freed: vec![0; shards],
+            room_gone: vec![0; shards],
             overlap_refused: Vec::new(),
             waiting_singles: FastMap::default(),
             single_rows: FastMap::default(),
@@ -5070,20 +5078,22 @@ impl ShardState {
         self.shared.wake_visible();
     }
 
-    /// Reserves a group's `n` seqnos and `k` default timestamps per FORMAT §11.3 (publish
-    /// the lower bound, reserve, publish the reservation) from the one allocator (D271).
-    /// Returns the first seqno and the first timestamp.
+    /// Reserves a group's `n` seqnos and `k` default timestamps per FORMAT §11.3 from the one
+    /// allocator (D271), which stores the group's hold in this shard's pending watermark under
+    /// its lock (D300). Returns the first seqno and the first timestamp.
     fn reserve_stamps(&mut self, n: u64, k: u64) -> (Seqno, Timestamp) {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
-        // The mirror never passes the allocator's `S`, so it is a lower bound (§11.3 step 1).
-        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
         let now = self.shared.vfs.now_micros();
-        let (first, t0) = self
-            .shared
-            .clock
-            .reserve_group(n, k, now, self.last_stamp, shm);
-        shm.publish_pending(shard, self.watermark().min(first));
+        let (first, t0) = self.shared.clock.reserve_group(
+            n,
+            k,
+            now,
+            self.last_stamp,
+            shm,
+            shard,
+            self.watermark(),
+        );
         trace!(
             "shard {} reserves {first}+{n} at {t0}+{k} (now {now}, last {})",
             self.id.0, self.last_stamp
@@ -5974,10 +5984,15 @@ impl ShardState {
             }
         }
         if refuse || idle {
-            // Refuse the waiting members; this group's admitted ones still apply.
+            // Refuse the waiting members; this group's admitted ones still apply. The
+            // coordinators of PREPAREs refused for room give up too: nothing will free it
+            // (D301).
             self.end_room_wait(now);
             self.wait_room = false;
             self.refuse_room_waiters(now, None, ctx);
+            if !self.room_refused.is_empty() {
+                self.notify_room_gone(ctx);
+            }
         } else if now.saturating_sub(oldest) >= timeout {
             // The members that waited the whole timeout themselves are refused (D124,
             // D240); the rest keep their place, and the wait goes on for them.
@@ -6073,11 +6088,21 @@ impl ShardState {
             self.pending.extend(held);
         }
         if self.pending.is_empty() {
+            let now = ctx.now_nanos();
+            // A room wait whose only waiters were PREPAREs it refused (D245) has no member
+            // to bring it back here, but its coordinators wait on it: on a frozen clock,
+            // where its timers gave up, it looks again, so it reaches #70's frozen-and-idle
+            // refusal and tells them (D301).
+            if self.wait_room
+                && !self.room_refused.is_empty()
+                && self.room_wait.as_ref().is_some_and(|w| w.stopped(now))
+            {
+                self.wait_for_room(&[], ctx);
+            }
             // Nothing waits for room any more (the waiting commits were parked or
             // forwarded by a tablet change): the stall is over and its timer goes, and so
             // does L0 pacing's (D255 counts both as busy; left open they read as a stall
             // with no writer).
-            let now = ctx.now_nanos();
             if self.tablets_on() && self.room_wait.is_some() && !self.wait_room {
                 self.end_room_wait(now);
             }
@@ -8845,6 +8870,19 @@ impl ShardState {
                 attempts: c.attempt,
                 wait: c.refused,
             };
+            // Room reported gone in a later generation than the refusal's, during the abort
+            // round: it will not free (D301).
+            if let Some(RetryWait::Room { from, generation }) = req.wait
+                && self.room_gone[usize::from(from.0)] > generation
+            {
+                trace!(
+                    "shard {} gives up on {seqno}: room gone on {}",
+                    self.id.0, from.0
+                );
+                req.reply.notify(Err(Error::Busy));
+                self.try_finish_close(ctx);
+                return;
+            }
             // A wake that came first (during the abort round) counts: an overlap wake for
             // this commit, or room reported in a later generation than the refusal's.
             let woken = match req.wait {
@@ -10993,6 +11031,10 @@ mod tests {
         assert!(room.woken_by(a, WakeReason::Room { generation: 4 }, prio));
         assert!(!room.woken_by(a, WakeReason::Room { generation: 3 }, prio));
         assert!(!room.woken_by(b, WakeReason::Room { generation: 4 }, prio));
+        // D301: room gone in a later generation wakes it too (to give up), from that shard only.
+        assert!(room.woken_by(a, WakeReason::RoomGone { generation: 4 }, prio));
+        assert!(!room.woken_by(a, WakeReason::RoomGone { generation: 3 }, prio));
+        assert!(!room.woken_by(b, WakeReason::RoomGone { generation: 4 }, prio));
         assert!(!room.woken_by(a, WakeReason::Overlap { priority: prio }, prio));
         // An overlap wait wakes only on that shard's wake for this commit.
         let overlap = RetryWait::Overlap { from: b };

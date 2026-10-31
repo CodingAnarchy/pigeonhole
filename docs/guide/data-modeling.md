@@ -48,6 +48,12 @@ let pages = db
 | Counters | `Family::counter()`; a `ttl` to keep only recent buckets |
 | Running minimum or maximum | `Family::aggregate(Aggregation::Min)` or `Max`; buckets as for counters |
 | Distinct counts | `Family::aggregate(Aggregation::Hll)`; read with `hll_estimate` |
+| Flags seen, or common to all writers | `Family::aggregate(Aggregation::BitOr)` (or `BitAnd`, `BitXor`); write with `aggregate_u64`, read with `as_u64` |
+| Lowest or highest reading (temperatures, latencies) | `Family::aggregate(Aggregation::MinF64)` or `MaxF64`; write with `aggregate_f64`, read with `as_f64` |
+| Totals of decimals (amounts, durations) | `Family::aggregate(Aggregation::SumF64)`: an exact sum, read with `sum_f64` |
+| Averages and spread (latency mean and variance) | `Family::aggregate(Aggregation::MeanVar)`; read with `mean_var` |
+| Distributions in fixed buckets (response codes, latency bands) | `Family::aggregate(Aggregation::Histogram(HistogramParams::new(bounds)?))`; read with `histogram_counts` |
+| Percentiles (p50, p99 latency) | `Family::aggregate(Aggregation::Quantiles(QuantileParams::default()))`; read with `quantile(0.99)` |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -127,7 +133,7 @@ let page = g.row(b"node:a").family("out").column_limit(100).read()?;
 - Writing both directions in one `WriteBatch` makes them atomic even if the rows live on different shards.
 
 ## Counters
-Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). A counter is one kind of aggregate family; [Min and max](#min-and-max) and [Distinct counts (HLL)](#distinct-counts-hll) cover the others. `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
+Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). A counter is one kind of aggregate family; [Min and max](#min-and-max), [Distinct counts (HLL)](#distinct-counts-hll) and [Bitwise and `f64` aggregations](#bitwise-and-f64-aggregations) cover the others. `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
 
 ```rust
 # use pigeonhole::*;
@@ -229,6 +235,54 @@ As for counters and min/max: `aggregate_at` writes a bucket, a delete starts the
 - **Writes:** `incr` and `put_i64` are refused. `put` takes only a well-formed sketch, as `phdb load` writes one back.
 - **Storage:** sketches are never moved to blob files (`blob_threshold` below 3076 is refused).
 - **The file can no longer be opened by 1.0.x**, as with min and max ([Min and max](#min-and-max)).
+
+## Bitwise and `f64` aggregations
+These combine like min and max (buckets, puts, deletes, TTL), over other value types (D298):
+- **`BitOr`, `BitAnd`, `BitXor`** fold `u64` inputs bit by bit: the flags any writer set, the flags every writer kept, or a parity. Write inputs with `aggregate_u64` and set a cell with `put_u64`; read with `CellRef::as_u64`. The value is stored as the `i64` with the same bits.
+- **`MinF64`, `MaxF64`** keep the smallest or largest `f64` input. Write with `aggregate_f64` and set with `put_f64`; read with `as_f64`. They order by `f64::total_cmp`: `-0.0` is below `+0.0`, infinities are allowed, and NaN is refused (`InvalidArgument`).
+
+`incr` is refused in all five, and each marks the file like min and max (1.0.x refuses it).
+
+## Exact sums and mean/variance
+`f64` addition rounds at every step, so a floating-point total depends on the order its inputs arrive in, and loses small terms beside large ones. These two aggregations don't:
+- **`SumF64`** keeps the exact sum of its `f64` inputs (an integer in units of the smallest `f64`). `CellRef::sum_f64` reads it rounded once. The same inputs read the same total in any order: `1e300 + 1.0 - 1e300` reads 1.0.
+- **`MeanVar`** keeps the count, the exact sum and the exact sum of squares. `mean_var()` reads the count, mean, population variance and sample variance, each computed exactly and rounded once.
+
+Write inputs with `aggregate_f64`. A `put_f64` sets a cell. Inputs must be finite (NaN and infinities are refused). A cell is up to 274 bytes for a sum and 821 for mean/variance, against 9 for a counter. Like the others, these families mark the file (1.0.x refuses it).
+
+## Histograms and percentiles
+Both take `f64` inputs with `aggregate_f64`, and both have parameters, fixed when the family is created (D298):
+- **`Histogram(HistogramParams)`** counts inputs in fixed buckets. `HistogramParams::new([0.0, 10.0, 100.0])` makes four: below 0, `[0, 10)`, `[10, 100)` and 100 and up. `CellRef::histogram_counts` reads one count per bucket, and the family's info gives the bounds back. Infinities fall in the end buckets; NaN is refused. A cell is about 10 bytes per bucket.
+- **`Quantiles(QuantileParams)`** keeps a log-linear sketch. `quantile(0.99)` reads within a relative error of 2^-p (`mantissa_bits`, 7 by default, so 0.8%). The same inputs give the same sketch in any order. Inputs must be finite. Each sign keeps at most `max_buckets` buckets (2048 by default). Past that, the smallest magnitudes fold together, in both signs: for data spread over many orders of magnitude, the quantiles nearest zero lose precision first (not the low tail, for signed data). A cell holds about 20 bytes per bucket in use.
+
+`n` bounds give `n + 1` counts. Zip them with the bounds from the family's info rather than indexing by hand:
+
+```rust
+use pigeonhole::{Aggregation, Family, HistogramParams};
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = pigeonhole::Pigeonhole::open(dir.join("app.phdb"), pigeonhole::Options::default())?;
+let t = db
+    .table("api")?
+    .family("ms", Family::aggregate(Aggregation::Histogram(HistogramParams::new([10.0, 100.0])?)))
+    .create_if_missing()?;
+for ms in [3.0, 42.0, 57.0, 250.0] {
+    t.mutate(b"GET /").aggregate_f64("ms", b"latency", ms).commit()?;
+}
+let counts = t.get(b"GET /", "ms", b"latency")?.unwrap().histogram_counts().unwrap();
+let Some(Aggregation::Histogram(params)) = t.family_info("ms").unwrap().aggregation else {
+    unreachable!("a histogram family");
+};
+// Bucket i holds inputs below bounds[i] and at or above bounds[i - 1].
+let bounds = params.bounds();
+let lower = std::iter::once(f64::NEG_INFINITY).chain(bounds.iter().copied());
+let labelled: Vec<(f64, u64)> = lower.zip(counts).collect();
+assert_eq!(labelled, [(f64::NEG_INFINITY, 1), (10.0, 2), (100.0, 1)]);
+# Ok(())
+# }
+```
+
+These cells are never moved to blob files, whatever `blob_threshold` says.
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

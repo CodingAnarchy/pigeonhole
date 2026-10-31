@@ -571,11 +571,11 @@ pub(crate) fn driver_main<H: ShardHandler>(
     let vfs = Arc::clone(&drivers.vfs);
     // The driver reads the spin window from its first shard: every shard of a runtime
     // shares it.
-    debug_assert!(
-        cores
-            .iter()
-            .all(|c| Arc::ptr_eq(&c.vfs, &vfs) && c.spin.window == cores[0].spin.window)
-    );
+    debug_assert!(cores.iter().all(|c| Arc::ptr_eq(&c.vfs, &vfs)
+        && (c.spin.window, c.spin.cap) == (cores[0].spin.window, cores[0].spin.cap)));
+    // Sized from this thread's idle gaps (#1176); made at the first spin, from a shard's
+    // settings (a driver may start with none).
+    let mut gaps: Option<GapWindow> = None;
     vfs.attach_thread();
     for core in &mut cores {
         core.attach();
@@ -685,8 +685,16 @@ pub(crate) fn driver_main<H: ShardHandler>(
         // I/O only this thread completes (its ring, #402), for any of its shards: spin
         // first, reaping without blocking, then wait on the ring until a completion, a wake
         // (the ring's eventfd) or the earliest deadline.
+        let idle_from = Instant::now();
+        if gaps.is_none()
+            && let Some(c) = cores.first()
+        {
+            gaps = Some(GapWindow::new(c.spin.window, c.spin.cap));
+        }
+        let window = gaps.as_ref().map_or(Duration::ZERO, GapWindow::window);
         if pigeonhole_io::own_io_in_flight() {
-            if spin_before_park(&mut cores, true) {
+            if spin_before_park(&mut cores, window, true) {
+                record_gap(&mut gaps, idle_from);
                 continue;
             }
             let now = vfs.monotonic_nanos();
@@ -696,9 +704,11 @@ pub(crate) fn driver_main<H: ShardHandler>(
                 })
                 .min(RING_IDLE_WAIT);
             pigeonhole_io::reap_own_io(Some(until));
+            record_gap(&mut gaps, idle_from);
             continue;
         }
-        if spin_before_park(&mut cores, false) {
+        if spin_before_park(&mut cores, window, false) {
+            record_gap(&mut gaps, idle_from);
             continue;
         }
         // Every shard announced sleep at the end of its turn (or of the spin), so a message
@@ -715,6 +725,123 @@ pub(crate) fn driver_main<H: ShardHandler>(
             None => thread::park(),
             Some(at) => idle_park.park(&*vfs, at),
         }
+        record_gap(&mut gaps, idle_from);
+    }
+}
+
+fn record_gap(gaps: &mut Option<GapWindow>, idle_from: Instant) {
+    if let Some(g) = gaps {
+        g.record(idle_from.elapsed());
+    }
+}
+
+/// A driver's spin window sized from its recent idle gaps (#1176): each gap runs from the
+/// end of a pass with nothing left to the next pass, whether a spin, a ring wait or a park
+/// ended it. A pass a timer starts (a balance pass, a flush deadline, a ring wait's timeout)
+/// ends a gap too, and a parked gap includes the wake: both count gaps as no shorter than
+/// the commits' own, so they bias the window short, never long. The window is the longest, up to the cap, whose expected poll per gap is at
+/// most the base window: a poll ends when the gap does or the window runs out, so it costs
+/// `min(gap, window)`. The base window always qualifies (it costs at most itself), so the
+/// window is never shorter than the base. Gaps mostly short (a steady stream, however
+/// bursty) allow the cap and catch the rare long gap a fixed base would park through;
+/// gaps mostly long allow little more than the base, which then polls no longer per gap
+/// than a fixed one.
+#[derive(Debug)]
+struct GapWindow {
+    base: Duration,
+    cap: Duration,
+    /// Gaps by power-of-two microseconds (bucket `b`: from 2^b to 2^(b+1) µs, bucket 0 from
+    /// 0), and their sum in nanoseconds, halved every [`Self::DECAY`] gaps.
+    counts: [u32; Self::BUCKETS],
+    sums: [u64; Self::BUCKETS],
+    /// Gaps since the last halving, and since the window was last chosen.
+    seen: u32,
+    since: u32,
+    window: Duration,
+}
+
+impl GapWindow {
+    const BUCKETS: usize = 16;
+    /// Gaps between choices of the window: the first comes after this many too.
+    const CHOOSE: u32 = 32;
+    const DECAY: u32 = 1024;
+
+    fn new(base: Duration, cap: Duration) -> Self {
+        Self {
+            base,
+            cap,
+            counts: [0; Self::BUCKETS],
+            sums: [0; Self::BUCKETS],
+            seen: 0,
+            since: 0,
+            window: base,
+        }
+    }
+
+    fn window(&self) -> Duration {
+        self.window
+    }
+
+    fn record(&mut self, gap: Duration) {
+        if self.cap <= self.base {
+            return;
+        }
+        let nanos = u64::try_from(gap.as_nanos()).unwrap_or(u64::MAX);
+        let b = (nanos / 1000).checked_ilog2().unwrap_or(0) as usize;
+        let b = b.min(Self::BUCKETS - 1);
+        self.counts[b] += 1;
+        self.sums[b] = self.sums[b].saturating_add(nanos);
+        self.seen += 1;
+        if self.seen >= Self::DECAY {
+            self.seen /= 2;
+            for (c, s) in self.counts.iter_mut().zip(&mut self.sums) {
+                *c /= 2;
+                *s /= 2;
+            }
+        }
+        self.since += 1;
+        if self.since >= Self::CHOOSE {
+            self.since = 0;
+            self.window = self.choose();
+        }
+    }
+
+    /// The expected poll per gap of a `window`, in nanoseconds, from the buckets: exact
+    /// at a bucket edge, and over the bucket it falls inside an upper bound.
+    fn cost(&self, window: u64) -> u64 {
+        let n: u64 = self.counts.iter().map(|&c| u64::from(c)).sum();
+        if n == 0 {
+            return 0;
+        }
+        let mut total: u64 = 0;
+        for (b, (&c, &s)) in self.counts.iter().zip(&self.sums).enumerate() {
+            let below = if b + 1 < Self::BUCKETS {
+                (1000u64 << (b + 1)) <= window
+            } else {
+                false
+            };
+            let poll = if below {
+                s
+            } else {
+                s.min(window.saturating_mul(u64::from(c)))
+            };
+            total = total.saturating_add(poll);
+        }
+        total / n
+    }
+
+    fn choose(&self) -> Duration {
+        let nanos = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let (base, cap) = (nanos(self.base), nanos(self.cap));
+        let mut best = base;
+        // The cap, then each bucket edge above the base and below the cap.
+        let edges = (0..Self::BUCKETS).map(|b| 1000u64 << b);
+        for w in std::iter::once(cap).chain(edges.filter(|&e| e > base && e < cap)) {
+            if w > best && self.cost(w) <= base {
+                best = w;
+            }
+        }
+        Duration::from_nanos(best)
     }
 }
 
@@ -730,7 +857,11 @@ fn next_deadline<H: ShardHandler>(cores: &[ShardCore<H>]) -> Option<u64> {
 /// ring wait (#997's A/B: ring waits ended 67-78% of ycsb-f's passes). Returns whether work
 /// arrived (the loop runs again at once). The window is measured on the real clock: a
 /// simulated clock may not move while polling.
-fn spin_before_park<H: ShardHandler>(cores: &mut [ShardCore<H>], reap: bool) -> bool {
+fn spin_before_park<H: ShardHandler>(
+    cores: &mut [ShardCore<H>],
+    window: Duration,
+    reap: bool,
+) -> bool {
     if cores.is_empty() {
         return false;
     }
@@ -747,7 +878,6 @@ fn spin_before_park<H: ShardHandler>(cores: &mut [ShardCore<H>], reap: bool) -> 
     // adds nothing: timing the skip counted two clock reads' worth on Linux and macOS and
     // nothing on Windows, where consecutive reads of the clock can be equal.
     let spun_from = cores[0].vfs.monotonic_nanos();
-    let window = cores[0].spin.window;
     let hit = spin_poll(cores, window, reap);
     let spun = cores[0].vfs.monotonic_nanos().saturating_sub(spun_from);
     let share = spun / n_due;
@@ -810,8 +940,9 @@ fn spin_poll<H: ShardHandler>(cores: &mut [ShardCore<H>], window: Duration, reap
 
 #[cfg(test)]
 mod tests {
-    use super::{Controller, GROW_WINDOWS, SHRINK_WINDOWS, WAIT_WINDOWS, Why, Window};
+    use super::{Controller, GROW_WINDOWS, GapWindow, SHRINK_WINDOWS, WAIT_WINDOWS, Why, Window};
     use std::collections::VecDeque;
+    use std::time::Duration;
     use std::time::Instant;
 
     fn controller(windows: impl IntoIterator<Item = Window>) -> Controller {
@@ -958,5 +1089,78 @@ mod tests {
         assert_eq!(controller(windows).decide(2, 16), None);
         // All idle: too few ops for the ratio to count, however high.
         assert_eq!(controller(vec![idle; WAIT_WINDOWS]).decide(2, 16), None);
+    }
+
+    fn gaps(base_us: u64, cap_us: u64, gaps_us: impl IntoIterator<Item = u64>) -> GapWindow {
+        let mut g = GapWindow::new(
+            Duration::from_micros(base_us),
+            Duration::from_micros(cap_us),
+        );
+        for us in gaps_us {
+            g.record(Duration::from_micros(us));
+        }
+        g
+    }
+
+    #[test]
+    fn the_spin_window_starts_at_the_base_and_never_falls_below_it() {
+        assert_eq!(gaps(200, 1000, []).window(), Duration::from_micros(200));
+        // Gaps far over the cap: nothing longer than the base pays for itself.
+        let sparse = gaps(200, 1000, std::iter::repeat_n(5000, 256));
+        assert_eq!(sparse.window(), Duration::from_micros(200));
+    }
+
+    #[test]
+    fn a_steady_stream_spins_to_the_cap() {
+        // sparse-wide's shape: mostly short gaps and the odd long one, which a 200 µs window
+        // parks through. Polling 1 ms costs 0.98 × 20 + 0.02 × 1000 = 40 µs a gap.
+        let g = (0..512).map(|i| if i % 50 == 0 { 700 } else { 20 });
+        assert_eq!(gaps(200, 1000, g).window(), Duration::from_micros(1000));
+    }
+
+    #[test]
+    fn gaps_near_the_base_extend_the_window_only_as_far_as_it_pays() {
+        // Every gap 300 µs: a window of 256 µs or more costs at least 256 µs a gap, over the
+        // base, so the window stays at the base; at 150 µs gaps, polling to the cap costs
+        // 150 µs a gap and catches them all.
+        let at = |us| gaps(200, 1000, std::iter::repeat_n(us, 256)).window();
+        assert_eq!(at(300), Duration::from_micros(200));
+        assert_eq!(at(150), Duration::from_micros(1000));
+    }
+
+    #[test]
+    fn the_window_follows_a_change_of_load() {
+        let mut g = gaps(200, 1000, std::iter::repeat_n(20, 256));
+        assert_eq!(g.window(), Duration::from_micros(1000));
+        for _ in 0..2048 {
+            g.record(Duration::from_micros(5000));
+        }
+        assert_eq!(g.window(), Duration::from_micros(200));
+    }
+
+    #[test]
+    fn the_window_grows_back_when_the_load_returns() {
+        // Slow to fast: the long gaps still weigh until the short ones outnumber them (and
+        // the decay halves them), then the window is the cap again.
+        let mut g = gaps(200, 1000, std::iter::repeat_n(5000, 256));
+        assert_eq!(g.window(), Duration::from_micros(200));
+        for _ in 0..32 {
+            g.record(Duration::from_micros(20));
+        }
+        assert_eq!(g.window(), Duration::from_micros(200), "one choice in");
+        for _ in 0..2048 {
+            g.record(Duration::from_micros(20));
+        }
+        assert_eq!(g.window(), Duration::from_micros(1000));
+    }
+
+    #[test]
+    fn a_cap_at_or_under_the_base_keeps_the_window_fixed() {
+        let g = gaps(200, 200, std::iter::repeat_n(20, 256));
+        assert_eq!(g.window(), Duration::from_micros(200));
+        assert_eq!(
+            gaps(0, 1000, std::iter::repeat_n(20, 256)).window(),
+            Duration::ZERO
+        );
     }
 }

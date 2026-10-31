@@ -9,7 +9,7 @@
 //! put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
 //! incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
 //! delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-//! create <table> <family>[:counter|:min|:max|:hll]...
+//! create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]]...
 //! snapshot [--durable] <name>        release <name>
 //! \tables  \schema [table]  \info  \metrics  \health  \format F  \timing on|off  \help  \quit
 //! ```
@@ -48,9 +48,9 @@ commands (one per line; values are bytes: \"quoted\\n\", 0xhex, b64:base64):
          [--limit N] [--columns-per-row N] [--at SNAP]
   put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
   incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
-  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]
+  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]  (f64 in *_f64, mean_var, histogram, quantiles; u64 in bit_*)
   delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-  create <table> <family>[:counter|:min|:max|:hll]...
+  create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]]...
   snapshot [--durable] <name>     release <name>
   \\tables  \\schema [table]  \\info  \\metrics  \\health
   \\format table|json|jsonl|csv  \\timing on|off  \\help  \\quit
@@ -517,21 +517,57 @@ impl Session {
         let row = args.bytes(1, "row")?;
         let (family, qualifier) = column(args.word(2, "family:qualifier")?, false)?;
         let qualifier = qualifier.expect("required");
-        let delta: i64 = args.text(3, "delta")?.parse().map_err(|_| {
-            Failure::usage(if aggregate {
-                "aggregate takes an integer value"
-            } else {
-                "incr takes an integer delta"
-            })
-        })?;
+        let text = args.text(3, "delta")?;
         args.max_positional(4)?;
         let t = self.writable(table)?;
+        let ts = args.num("ts")?;
         let m = t.mutate(row);
-        let m = match (args.num("ts")?, aggregate) {
-            (Some(ts), false) => m.incr_at(&family, &qualifier, ts, delta),
-            (None, false) => m.incr(&family, &qualifier, delta),
-            (Some(ts), true) => m.aggregate_at(&family, &qualifier, ts, delta),
-            (None, true) => m.aggregate(&family, &qualifier, delta),
+        // An `f64` family's inputs are `f64`s, a bitwise family's decimal `u64`s (D298; a
+        // `0x` word is a bytes literal here); every other family takes an `i64`.
+        let kind = aggregate
+            .then(|| t.family_info(&family).and_then(|f| f.aggregation))
+            .flatten();
+        let m = match kind {
+            Some(
+                Aggregation::MinF64
+                | Aggregation::MaxF64
+                | Aggregation::SumF64
+                | Aggregation::MeanVar
+                | Aggregation::Histogram(_)
+                | Aggregation::Quantiles(_),
+            ) => {
+                let x: f64 = text
+                    .parse()
+                    .map_err(|_| Failure::usage("an f64 family's aggregate takes a number"))?;
+                match ts {
+                    Some(ts) => m.aggregate_f64_at(&family, &qualifier, ts, x),
+                    None => m.aggregate_f64(&family, &qualifier, x),
+                }
+            }
+            Some(Aggregation::BitOr | Aggregation::BitAnd | Aggregation::BitXor) => {
+                let bits: u64 = text
+                    .parse()
+                    .map_err(|_| Failure::usage("a bitwise family's aggregate takes a u64"))?;
+                match ts {
+                    Some(ts) => m.aggregate_u64_at(&family, &qualifier, ts, bits),
+                    None => m.aggregate_u64(&family, &qualifier, bits),
+                }
+            }
+            _ => {
+                let delta: i64 = text.parse().map_err(|_| {
+                    Failure::usage(if aggregate {
+                        "aggregate takes an integer value"
+                    } else {
+                        "incr takes an integer delta"
+                    })
+                })?;
+                match (ts, aggregate) {
+                    (Some(ts), false) => m.incr_at(&family, &qualifier, ts, delta),
+                    (None, false) => m.incr(&family, &qualifier, delta),
+                    (Some(ts), true) => m.aggregate_at(&family, &qualifier, ts, delta),
+                    (None, true) => m.aggregate(&family, &qualifier, delta),
+                }
+            }
         };
         Self::commit(m)
     }
@@ -575,7 +611,7 @@ impl Session {
         let table = args.text(0, "table")?;
         if args.positional.len() < 2 {
             return Err(Failure::usage(
-                "create <table> <family>[:counter|:min|:max|:hll]...",
+                "create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]]...",
             ));
         }
         let mut b = db.table(table).map_err(|e| Failure::db("create", &e))?;
@@ -588,6 +624,35 @@ impl Session {
                 Some((name, "min")) => b.family(name, Family::aggregate(Aggregation::Min)),
                 Some((name, "max")) => b.family(name, Family::aggregate(Aggregation::Max)),
                 Some((name, "hll")) => b.family(name, Family::aggregate(Aggregation::Hll)),
+                Some((name, "bit_or")) => b.family(name, Family::aggregate(Aggregation::BitOr)),
+                Some((name, "bit_and")) => b.family(name, Family::aggregate(Aggregation::BitAnd)),
+                Some((name, "bit_xor")) => b.family(name, Family::aggregate(Aggregation::BitXor)),
+                Some((name, "min_f64")) => b.family(name, Family::aggregate(Aggregation::MinF64)),
+                Some((name, "max_f64")) => b.family(name, Family::aggregate(Aggregation::MaxF64)),
+                Some((name, "sum_f64")) => b.family(name, Family::aggregate(Aggregation::SumF64)),
+                Some((name, "mean_var")) => b.family(name, Family::aggregate(Aggregation::MeanVar)),
+                // `:histogram=b0,b1,…` and `:quantiles[=p,max_buckets]` (D298).
+                Some((name, kind)) if kind.starts_with("histogram=") => {
+                    let bounds = kind["histogram=".len()..]
+                        .split(',')
+                        .map(|b| b.parse::<f64>())
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|_| Failure::usage("histogram=b0,b1,… takes numbers"))?;
+                    let params = pigeonhole::HistogramParams::new(bounds)
+                        .map_err(|e| Failure::db("create", &e))?;
+                    b.family(name, Family::aggregate(Aggregation::Histogram(params)))
+                }
+                Some((name, kind)) if kind == "quantiles" || kind.starts_with("quantiles=") => {
+                    let mut q = pigeonhole::QuantileParams::default();
+                    if let Some(args) = kind.strip_prefix("quantiles=") {
+                        let mut it = args.split(',');
+                        let usage = || Failure::usage("quantiles=p,max_buckets takes two integers");
+                        let p = it.next().and_then(|x| x.parse().ok()).ok_or_else(usage)?;
+                        let n = it.next().and_then(|x| x.parse().ok()).ok_or_else(usage)?;
+                        q = q.mantissa_bits(p).max_buckets(n);
+                    }
+                    b.family(name, Family::aggregate(Aggregation::Quantiles(q)))
+                }
                 _ => b.family(spec, Family::default()),
             };
         }
@@ -624,6 +689,7 @@ impl Session {
             "name",
             "counter",
             "aggregation",
+            "aggregation_params",
             "max_versions",
             "ttl_micros",
             "compression",

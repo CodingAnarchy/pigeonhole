@@ -161,8 +161,12 @@ impl TableBuilder<'_> {
 pub(crate) enum Operand {
     /// `incr`: a counter, or a 0.1.0 family's add.
     Incr,
-    /// `aggregate`: an input to an aggregate family (D294).
+    /// `aggregate`: an `i64` input to an aggregate family (D294).
     Aggregate,
+    /// `aggregate_u64`: an input to a bitwise family (D298).
+    U64,
+    /// `aggregate_f64`: an input to an `f64` family (D298).
+    F64,
 }
 
 /// What every table handle shares: the database and the catalog entry it was opened with.
@@ -227,11 +231,13 @@ impl TableCore {
         self.family_id(name)
     }
 
-    /// [`family_id`](Self::family_id) for a typed operand: `incr` is refused in a min, max
-    /// or HLL family ("increment" would mislead there) and `aggregate` outside an aggregate
-    /// family (D294). One lookup, the one the write does anyway.
+    /// [`family_id`](Self::family_id) for a typed operand, refused where its type isn't the
+    /// family's inputs (D294, D298): `incr` outside a counter (and a 0.1.0 family's add),
+    /// `aggregate` outside an `i64`-input aggregate family, `aggregate_u64` outside a bitwise
+    /// family and `aggregate_f64` outside an `f64` family, each naming the method to use.
+    /// One lookup, the one the write does anyway.
     pub(crate) fn operand_family_id(&self, name: &str, operand: Operand) -> Result<FamilyId> {
-        use pigeonhole_engine::FamilyKind;
+        use pigeonhole_engine::FamilyKind as K;
         let current;
         let f = match self.info.family(name) {
             Some(f) => f,
@@ -242,24 +248,69 @@ impl TableCore {
                     .ok_or_else(|| family_not_found(&self.info.name, name))?
             }
         };
-        let why = match (operand, f.options.kind) {
-            (Operand::Incr, FamilyKind::Min) => {
-                "is a min family: write its inputs with aggregate, not incr"
+        let kind = f.options.kind;
+        let accepted = match operand {
+            // A standard family's `incr` is the engine's to judge (D41).
+            Operand::Incr => matches!(kind, K::Standard | K::Counter),
+            Operand::Aggregate => {
+                kind.is_aggregate()
+                    && !matches!(
+                        kind,
+                        K::MinF64
+                            | K::MaxF64
+                            | K::SumF64
+                            | K::MeanVar
+                            | K::Histogram
+                            | K::Quantiles
+                    )
             }
-            (Operand::Incr, FamilyKind::Max) => {
-                "is a max family: write its inputs with aggregate, not incr"
+            Operand::U64 => matches!(kind, K::BitOr | K::BitAnd | K::BitXor),
+            Operand::F64 => matches!(
+                kind,
+                K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar | K::Histogram | K::Quantiles
+            ),
+        };
+        if accepted {
+            return Ok(f.id);
+        }
+        let used = match operand {
+            Operand::Incr => "incr",
+            Operand::Aggregate => "aggregate",
+            Operand::U64 => "aggregate_u64",
+            Operand::F64 => "aggregate_f64",
+        };
+        let (what, method) = match kind {
+            K::Standard => {
+                return Err(Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "family {name:?} of table {:?} is not an aggregate family: {used} \
+                         needs Family::aggregate or Family::counter",
+                        self.info.name
+                    ),
+                ));
             }
-            (Operand::Incr, FamilyKind::Hll) => {
-                "is an hll family: write its inputs with aggregate, not incr"
-            }
-            (Operand::Aggregate, kind) if !kind.is_aggregate() => {
-                "is not an aggregate family: aggregate needs Family::aggregate or Family::counter"
-            }
-            _ => return Ok(f.id),
+            K::Counter => ("a counter", "incr"),
+            K::Min => ("a min", "aggregate"),
+            K::Max => ("a max", "aggregate"),
+            K::Hll => ("an hll", "aggregate"),
+            K::BitOr => ("a bit_or", "aggregate_u64"),
+            K::BitAnd => ("a bit_and", "aggregate_u64"),
+            K::BitXor => ("a bit_xor", "aggregate_u64"),
+            K::MinF64 => ("a min_f64", "aggregate_f64"),
+            K::MaxF64 => ("a max_f64", "aggregate_f64"),
+            K::SumF64 => ("a sum_f64", "aggregate_f64"),
+            K::MeanVar => ("a mean_var", "aggregate_f64"),
+            K::Histogram => ("a histogram", "aggregate_f64"),
+            K::Quantiles => ("a quantiles", "aggregate_f64"),
         };
         Err(Error::new(
             ErrorCode::InvalidArgument,
-            format!("family {name:?} of table {:?} {why}", self.info.name),
+            format!(
+                "family {name:?} of table {:?} is {what} family: write its inputs with \
+                 {method}, not {used}",
+                self.info.name
+            ),
         ))
     }
 

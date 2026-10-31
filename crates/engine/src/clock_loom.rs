@@ -3,14 +3,16 @@
 //!
 //! The protocol's shared state, with the orderings the engine uses:
 //! - the allocator (`Shared::clock`): `(next, h, decided)` under a lock;
-//! - each writer's pending watermark (shm): stored Release, first a lower bound read from
-//!   the mirror (never past the allocator's next seqno), then the reservation's first
-//!   seqno, then `u64::MAX` once applied;
+//! - each writer's pending watermark (shm): the reservation's first seqno, stored Release
+//!   under the allocator's lock (D300), then `u64::MAX` once applied;
 //! - the mirror (shm `NEXT_SEQNO`): `fetch_max(first + n, AcqRel)` after the reservation;
 //! - a reader's `visible_seqno`: `min(mirror, every pending) − 1`, each loaded Acquire.
 //!
 //! The claims:
 //! - a reader never sees a seqno visible before the writer that reserved it applied it;
+//! - the visible seqno never goes back: a reader's second reading is at least its first
+//!   (#1208: the old step 1, a lower bound read from the mirror and stored outside the lock,
+//!   could land below a seqno already visible);
 //! - default timestamps never go back as seqnos go up, and a decision's is strictly above
 //!   every stamp before it.
 //!
@@ -42,11 +44,11 @@ struct Shared {
 /// Writer `i`: one reservation (a group of one when `!decision`, else a decision), stamped
 /// at clock `now`, then applied.
 fn write(sh: &Shared, i: usize, decision: bool, now: u64) {
-    let lb = sh.mirror.load(Ordering::Acquire);
-    sh.pending[i].store(lb, Ordering::Release);
     let (s, t) = {
         let mut c = sh.clock.lock().unwrap();
         let s = c.next;
+        // FORMAT §11.3 (D300): the hold is stored under the lock, before the mirror passes it.
+        sh.pending[i].store(s, Ordering::Release);
         c.next += 1;
         let t = if decision {
             let t = now.max(c.h + 1);
@@ -61,7 +63,6 @@ fn write(sh: &Shared, i: usize, decision: bool, now: u64) {
         };
         (s, t)
     };
-    sh.pending[i].store(s, Ordering::Release);
     sh.mirror.fetch_max(s + 1, Ordering::AcqRel);
     sh.stamps[i][0].store(s, Ordering::Relaxed);
     sh.stamps[i][1].store(t, Ordering::Relaxed);
@@ -125,6 +126,8 @@ fn loom_the_mirror_never_shows_an_unapplied_seqno_and_stamps_follow_seqnos() {
                 if v > 0 {
                     SAW_PROGRESS.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
+                let again = visible(&sh);
+                assert!(again >= v, "visible seqno went backwards: {v} -> {again}");
             })
         };
         a.join().unwrap();
@@ -168,7 +171,7 @@ struct Held {
     /// third thread's group applied (it has seqno 1 or 2).
     decision: AtomicU64,
     group_applied: AtomicBool,
-    /// The group's shard's pending watermark (FORMAT §11.3 steps 1 and 3).
+    /// The group's shard's pending watermark (FORMAT §11.3: its hold, stored under the lock; D300).
     group_pending: AtomicU64,
 }
 
@@ -277,16 +280,14 @@ fn held_model_with(mirror_first: bool, group: bool) {
         let g = group.then(|| {
             let sh = Arc::clone(&sh);
             thread::spawn(move || {
-                // §11.3: a lower bound first, then the reservation, then applied.
-                let lb = sh.mirror.load(Ordering::Acquire);
-                sh.group_pending.store(lb, Ordering::Release);
+                // §11.3 (D300): the hold under the lock, then the mirror, then applied.
                 let s = {
                     let mut c = sh.clock.lock().unwrap();
                     let s = c.0;
+                    sh.group_pending.store(s, Ordering::Release);
                     c.0 += 1;
                     s
                 };
-                sh.group_pending.store(s, Ordering::Release);
                 sh.mirror.fetch_max(s + 1, Ordering::AcqRel);
                 sh.group_applied.store(true, Ordering::Release);
                 sh.group_pending.store(u64::MAX, Ordering::Release);

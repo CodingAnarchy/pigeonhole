@@ -12,16 +12,19 @@
 
 pub mod blob;
 pub mod block;
+pub mod buckets;
 mod bytes;
 pub mod checksum;
 pub mod compress;
 pub mod cursor;
 pub mod error;
+pub mod exact;
 pub mod filter;
 pub mod hash;
 pub mod hll;
 pub mod ids;
 pub mod key;
+pub mod kind_params;
 pub mod manifest;
 pub mod scan;
 pub mod shm;

@@ -193,9 +193,10 @@ pub fn reserve(shm: &ShmRegion, n: u64) -> u64 {
 }
 
 /// The writer process's seqno allocator, as the engine's clock runs it for several shard
-/// threads: reservations under one lock, then the shared mirror raised past each one after
-/// the lock is released (`advance_next_seqno`, a `fetch_max`, so raises arriving out of
-/// order never move it back). The mirror may lag the allocator, never lead it.
+/// threads: reservations under one lock, each storing its hold there (FORMAT §11.3, D300),
+/// then the shared mirror raised past each one after the lock is released
+/// (`advance_next_seqno`, a `fetch_max`, so raises arriving out of order never move it
+/// back). The mirror may lag the allocator, never lead it.
 pub struct Seqnos(Mutex<u64>);
 
 impl Seqnos {
@@ -203,10 +204,13 @@ impl Seqnos {
         Self(Mutex::new(shm.next_seqno()))
     }
 
-    pub fn reserve(&self, shm: &ShmRegion, n: u64) -> u64 {
+    /// Reserves `n` seqnos and returns the first; `hold(first)` stores the reservation's
+    /// hold (the shard's pending watermark) under the lock, before the mirror passes it.
+    pub fn reserve(&self, shm: &ShmRegion, n: u64, hold: impl FnOnce(u64)) -> u64 {
         let first = {
             let mut next = self.0.lock().unwrap();
             let first = *next;
+            hold(first);
             *next += n;
             first
         };
@@ -288,13 +292,11 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
                     }
                     if shards > 1 && rng.below(8) == 0 {
                         // Cross-shard commit: reserve one seqno, hold it, hand shares out.
-                        me.group = Some(shm.next_seqno());
-                        me.publish(shm);
-                        let seqno = seqnos.reserve(shm, 1);
+                        let seqno = seqnos.reserve(shm, 1, |s| {
+                            me.held.insert(s);
+                            me.publish(shm);
+                        });
                         reserved.fetch_add(1, Ordering::Relaxed);
-                        me.held.insert(seqno);
-                        me.group = None;
-                        me.publish(shm);
                         let mut mask = 1u64 << shard;
                         let mut others = Vec::new();
                         for other in 0..shards {
@@ -323,12 +325,11 @@ pub fn run_writer(shm: &ShmRegion, seed: u64, duration: Duration, stop: &AtomicB
                     } else {
                         // Single-shard group of 1..=4 commits.
                         let n = 1 + rng.below(4);
-                        me.group = Some(shm.next_seqno());
-                        me.publish(shm);
-                        let first = seqnos.reserve(shm, n);
+                        let first = seqnos.reserve(shm, n, |first| {
+                            me.group = Some(first);
+                            me.publish(shm);
+                        });
                         reserved.fetch_add(n as u32, Ordering::Relaxed);
-                        me.group = Some(first);
-                        me.publish(shm);
                         for seqno in first..first + n {
                             set_mask(shm, seqno, 1 << shard);
                             if rng.below(4) == 0 {

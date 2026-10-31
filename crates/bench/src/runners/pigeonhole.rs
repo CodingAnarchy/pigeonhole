@@ -48,6 +48,9 @@ pub(crate) struct Settings {
     /// A shard's idle spin before it parks (`Options::shard_spin`, D198), in microseconds;
     /// `None`: the library default.
     pub(crate) shard_spin_micros: Option<u64>,
+    /// The cap of a shard's adaptive idle spin (`Options::shard_spin_cap`, #1176), in
+    /// microseconds; `None`: the library default.
+    pub(crate) shard_spin_cap_micros: Option<u64>,
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
     pub(crate) shard_threads: Option<usize>,
@@ -447,6 +450,22 @@ impl PigeonholeRunner {
         self
     }
 
+    /// The cap of a shard's adaptive idle spin, in microseconds (`Options::shard_spin_cap`,
+    /// #1176); the library default when not set (1 ms under `CpuProfile::Embedded`, a fixed
+    /// window under `Server` or with [`shard_spin_micros`](Self::shard_spin_micros)).
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// assert!(!PigeonholeRunner::default().describe().contains("shard_spin_cap"));
+    /// let r = PigeonholeRunner::default().shard_spin_cap_micros(1000);
+    /// assert!(r.describe().contains(" shard_spin_cap=1000us"));
+    /// ```
+    pub fn shard_spin_cap_micros(mut self, micros: u64) -> Self {
+        self.settings.shard_spin_cap_micros = Some(micros);
+        self
+    }
+
     /// The threads the shards run on (`Options::shard_threads`, D289); the library default
     /// when not set.
     ///
@@ -823,6 +842,9 @@ pub(crate) fn options(s: &Settings) -> Options {
     if let Some(us) = s.shard_spin_micros {
         options = options.shard_spin(Duration::from_micros(us));
     }
+    if let Some(us) = s.shard_spin_cap_micros {
+        options = options.shard_spin_cap(Duration::from_micros(us));
+    }
     if let Some(us) = s.commit_spin_micros {
         options = options.commit_spin(Duration::from_micros(us));
     }
@@ -1154,6 +1176,9 @@ impl Runner for PigeonholeRunner {
         }
         if let Some(us) = s.shard_spin_micros {
             _ = write!(d, " shard_spin={us}us");
+        }
+        if let Some(us) = s.shard_spin_cap_micros {
+            _ = write!(d, " shard_spin_cap={us}us");
         }
         if let Some(k) = s.shard_threads {
             _ = write!(d, " shard_threads={k}");

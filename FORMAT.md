@@ -93,6 +93,79 @@ The value of an HLL family's cell (§9.2 `kind` 4, D294) is a `Bytes` value hold
 - **Estimate:** Ertl's improved estimator (2017, algorithm 6) over the register histogram `C`, with `m = 4096` and `q = 52`: `z = m·τ(1 − C[q+1]/m)`, then `z = (z + C[k])/2` for `k = q` down to 1, then `z += m·σ(C[0]/m)`, and the estimate is `α∞·m²/z` rounded, with `α∞ = 1/(2 ln 2)` taken as the `f64` bit pattern `0x3fe71547652b82fe`. `σ` and `τ` are Ertl's series, iterated until they stop changing; they use only multiplication, halving, addition and `√`, so an estimate is the same on every platform. No register set: no sketch (the cell is absent).
 - **Merge:** registers merge in place; a sparse sketch turns dense when the union passes 767 registers, and never back.
 
+### 3.2 Exact f64 sum
+
+The value of an exact-sum family's cell (§9.2 `kind` 10, D298) is a `Bytes` value holding a sum state. Every finite `f64` is `±m·2^e` with an integer `m < 2^53`, so it is an integer number of 2^-1074 units, fewer than 2^2098 of them. The state holds Σx in those units, exactly, as a 2176-bit two's-complement integer (34 `u64` limbs, room for 2^64 inputs). Adding an input is a shifted add of its significand; merging two states adds their integers. Both are exact, so a state does not depend on the order or grouping of its inputs.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 2 |
+| 1 | 1 | `n`: limbs that follow (0..=34) |
+| 2 | 8·n | Σx, `u64` LE limbs, least significant first |
+
+**Canonical form** (two's complement, sign-extended; perf287's N3 on #1220):
+- While `n ≥ 2`, the top limb is dropped if it is 0 and the limb below it has bit 63 clear, or if it is `u64::MAX` and the limb below it has bit 63 set.
+- A lone limb (`n = 1`) is dropped only if it is 0, so zero is `n = 0` and −1 is the lone limb `u64::MAX`.
+- For example, +2^63 is the two limbs `[2^63, 0]`, and −2^63 the one limb `[2^63]`.
+- Reading a state sign-extends its top limb's bit 63 through the missing limbs, to 34 limbs. A state that is not canonical, or has more than 34 limbs, is malformed.
+
+**Read:** the integer times 2^-1074, rounded once to the nearest `f64` (ties to even), or ±∞ past the range. Inputs that cancel exactly read +0.0. A state is at most 274 bytes. Inputs are finite: NaN and ±∞ are refused at write.
+
+### 3.3 Mean and variance
+
+The value of a mean-variance family's cell (§9.2 `kind` 11, D298) holds the inputs' count, Σx (as §3.2) and Σx². A square `m²·2^2e` is an integer number of 2^-2148 units below 2^4196, so Σx² is a 4288-bit two's-complement integer (67 limbs) in those units, never negative.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 3 |
+| 1 | varint | count, at least 1 |
+| … | | Σx, encoded as §3.2's limbs (count byte, then at most 34 limbs) |
+| … | | Σx², the same with at most 67 limbs |
+
+**Read:** each figure is computed exactly and rounded once, to nearest with ties to even:
+- `mean = Σx / n`;
+- `variance = (n·Σx² − (Σx)²) / n²` (population);
+- `sample variance = (n·Σx² − (Σx)²) / (n(n−1))`, for `n ≥ 2`.
+
+A state is at most 821 bytes. The encoding bytes 2 and 3 keep these states apart from an HLL sketch (§3.1, encoding 1).
+
+### 3.4 Histogram
+
+The value of a histogram family's cell (§9.2 `kind` 12, D298) counts its inputs in the buckets the family's bounds give (§9.2.1 tag 1). `n` bounds `b0 < … < b(n-1)` make `n + 1` buckets, `(-∞, b0)`, `[b0, b1)`, …, `[b(n-1), +∞)`. An input's bucket is the number of bounds at or below it by IEEE `<=`, so `-0.0` and `0.0` share a bucket. NaN is refused and no bound is `-0.0`, so the comparison is total and deterministic (perf287's S1 on #1221). Infinities fall in the end buckets; NaN is refused at write.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 4 |
+| 1 | varint | bucket count `n + 1` (the family's) |
+| … | varints | the counts, first bucket first, trailing zero counts dropped (so the last is nonzero) |
+
+Merging adds the counts. A state with the wrong bucket count, a trailing zero, or no input is malformed.
+
+### 3.5 Quantile sketch
+
+The value of a quantile family's cell (§9.2 `kind` 13, D298) is a log-linear sketch of its finite inputs, with the family's mantissa bits `p` (1–12, default 7) and bucket limit (16–4096 per store, default 2048; §9.2.1 tags 1 and 2).
+- **Index:** a positive `x` maps to `bits(x) >> (52 − p)`, its binary exponent and top `p` mantissa bits. A bucket's values then lie within a factor `1 + 2^-p`, with no logarithm computed.
+- **Stores:** negative inputs map their magnitude into a second store, and zeros (either sign) are counted apart.
+- **Collapse** (D298 revision 1's S3): when a store's indexes span more than the limit, set `t = max_index − limit + 1`; every bucket below `t` folds into bucket `t`, which is created if absent. `t` depends only on the store's largest index, which only grows, so collapsing after every merge gives what one collapse at the end would. Merges are associative and commutative. Indexes grow with magnitude, so a collapse folds the **smallest magnitudes** in both stores: in a signed distribution it coarsens the quantiles nearest zero, not the low tail.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 5 |
+| 1 | 1 | `p` (the family's) |
+| 2 | varint | the zero count |
+| … | | the positive store, then the negative store: each a bucket count `k` (varint), then `k` pairs (varints): the first bucket's index and count, then each later bucket's index gap (at least 1) and count (at least 1) |
+
+**Malformed:** a state is malformed if any of these hold:
+- its `p` is not the family's;
+- a store is not collapsed;
+- a count is zero;
+- an index lies past the `f64` range (`≥ 2^(11 + p)`);
+- it holds no input.
+
+**Read:** the `q`-quantile is the midpoint of the bucket holding the input of rank `⌊q·(n−1)⌋`, in increasing order. The midpoint is the bucket's lower edge's bits with the bit below the kept ones set, which is exact. It is within 2^-p of the input while its store has not collapsed. A zero reads `0.0`, a negative bucket its midpoint negated.
+
+**Storage:** an aggregate family's values are never separated into blob files, at flush, compaction or commit (D298): the built-in operators fold stored values, never blob pointers. A family's `blob_threshold` therefore does not apply to them.
+
 ## 4. Blocks
 
 ### 4.1 Physical block
@@ -244,7 +317,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 
 | Set | Bit | Feature |
 |---|---|---|
-| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 13 so far, and a family's `kind_params`, §9.2.1). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
 
@@ -303,7 +376,27 @@ The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log
 
 Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know, where §9.3's tag ranges allow it. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
 
-*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1); another name is `Corrupt`. Kinds 2, 3 and 4 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, 10 SumF64, 11 MeanVar, 12 Histogram, 13 Quantiles, decision D298), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`), `pigeonhole.f64_sum`, `pigeonhole.f64_mean_var` (SumF64, MeanVar: finite `F64` inputs, values the states of §3.2 and §3.3), `pigeonhole.f64_histogram`, `pigeonhole.f64_quantiles` (Histogram, Quantiles: `F64` inputs, values the states of §3.4 and §3.5, built from the family's `kind_params`); another name is `Corrupt`. Kinds 2 to 13 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+
+#### 9.2.1 Kind parameters
+
+`kind_params` (D298) holds a kind's parameters as a list of entries, each `tag` u8, `len` varint, then `len` bytes. The list is canonical: tags strictly increasing (each at most once), tag 0 never written, every length within the field. A list that breaks any of these is `Corrupt`.
+
+**No parameters** is the empty list, and it has two encodings, each used in one case:
+- **Absent:** when nothing follows the field. The body ends at `kind`, as before the field existed.
+- **A present field of length 0:** only when a later appended `FamilyOptions` field needs this slot.
+
+A reader takes both as no parameters, and ignores bytes after the field (later appended fields), so a field can still be appended after `kind_params` (perf287's S1 on #1213).
+
+- Tags 1 to 127 are must-understand: a build whose kind doesn't define the tag refuses the family with `UnsupportedFeature`, the backstop behind the kind's feature bit.
+- Tags 128 to 255 are skippable hints, ignored by a build that doesn't know them.
+- A kind fixes its tags and their value encodings when it lands. A later must-understand tag on an existing kind takes a new `incompat` bit.
+
+The tags defined so far (D298):
+- **Histogram** (`kind` 12): tag 1, its bounds, as `n` `f64` LE (1 ≤ `n` ≤ 1023; finite, strictly increasing, never `-0.0`). Required.
+- **Quantiles** (`kind` 13): tag 1, the mantissa bits `p` (u8, 1–12, default 7); tag 2, the bucket limit per store (u16 LE, 16–4096, default 2048). Both optional.
+
+Values out of range are `Corrupt` at read. A writer refuses them, and any tag the family's kind doesn't define. #488's bloom kind and #490's vector kind will add their own tags.
 
 *SstMeta* = `id` u64, `extent` extent, `len` u64, `smallest_key` bytes, `largest_key` bytes, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `entries` u64, `deletes` u64.
 
@@ -476,15 +569,17 @@ One 64-byte line per shard at `watermarks_off + 64 x shard`. The rest of the lin
 
 A group's seqnos are held back by its shard's `pending`; a cross-shard commit's decided seqno (the seqno a Decision applies at, §10.3) by the header's `cross_held` (layout version 6, D278). A commit's id is reserved like any seqno and never held, since nothing is written at it.
 
-1. `pending[shard].store(next_seqno.load())` (Release): a lower bound, published before reserving.
-2. `first` = the next `n` seqnos from the writer process's one allocator (D271: reserved under its lock, with the group's default timestamps), then `next_seqno.fetch_max(first + n)` (AcqRel): `next_seqno` is a mirror of the allocator and never passes a reservation.
-3. `pending[shard].store(first)`; apply the group; then store the next unapplied seqno, which is `u64::MAX` when nothing is pending.
+1. Under the writer process's one allocator lock (D271): `first` = the allocator's next seqno; `pending[shard].store(min(pending, first))` (Release), the group's hold, where `pending` is the shard's lowest unapplied seqno before this group (the value `pending[shard]` already holds, or `u64::MAX`, so the `min` never lowers it); then the `n` seqnos and the group's default timestamps are reserved.
+2. After the lock, `next_seqno.fetch_max(first + n)` (AcqRel): `next_seqno` is a mirror of the allocator and never passes a reservation, and every `fetch_max` past `first`, by any thread, comes after the hold.
+3. Apply the group; then store the next unapplied seqno, which is `u64::MAX` when nothing is pending.
 
-A cross-shard commit's decision reserves `n = 1` differently. The allocator keeps the set of decided seqnos not yet applied on every participant, and under its lock it adds the new seqno to the set and stores `cross_held = min(set)` (Release), before the `fetch_max` of step 2. No lower bound is published first: the hold is stored in the same critical section that reserves the seqno, so every `fetch_max` past it, by any thread, comes after it. Once every participant has applied its share, the one that applied last removes the seqno under the lock and stores `cross_held` again (`u64::MAX` when the set is empty). A participant that cannot apply never removes it: the seqno stays held for good, and nothing of the commit becomes visible.
+The hold is stored under the lock, not as a bound read from `next_seqno` beforehand (D300, #1208). A bound loaded from the mirror and stored later could land below a seqno another shard reserved, applied and released in between, already visible, and the snapshot seqno would go back. `first`, read under the lock, is above every seqno any reader can see, so the store never lowers the snapshot seqno: snapshots never go back.
+
+A cross-shard commit's decision reserves `n = 1` the same way, but holds it in the header rather than its shard's `pending`. The allocator keeps the set of decided seqnos not yet applied on every participant, and under its lock it adds the new seqno to the set and stores `cross_held = min(set)` (Release), before the `fetch_max` of step 2. Once every participant has applied its share, the one that applied last removes the seqno under the lock and stores `cross_held` again (`u64::MAX` when the set is empty). A participant that cannot apply never removes it: the seqno stays held for good, and nothing of the commit becomes visible.
 
 Snapshot (writer threads and reader processes alike): `n = next_seqno.load()` (Acquire) **first**, then `c = cross_held.load()` (Acquire), then `m = min over shards of pending.load()` (Acquire); the snapshot seqno is `min(n, c, m) - 1`. A *durable* snapshot (D227) loads each shard's `pending` and then its `durable` (Acquire both), and takes `min(n, c, every pending, every durable) - 1`. A shard stores `durable` first, so a reader that sees a raised `pending` also sees the `durable` covering what is applied but not yet synced.
 
-The order matters. Every seqno below `n` was reserved by a shard that published a lower bound first (step 1), or is a decision whose hold was stored before the mirror passed it. So it is either applied, or held at or below it in `pending` or `cross_held`. A reader that loaded `cross_held` before `next_seqno` could see no hold, then a mirror past a decision made in between, and include the held seqno (perf287's M1 on D278; the engine's `clock_loom` model checks both orders).
+The order matters. Every seqno below `n` was reserved by a shard that stored its hold before the mirror passed it (step 1), or is a decision whose hold was stored the same way. So it is either applied, or held at or below it in `pending` or `cross_held`. A reader that loaded `cross_held` before `next_seqno` could see no hold, then a mirror past a decision made in between, and include the held seqno (perf287's M1 on D278; the engine's `clock_loom` model checks both orders).
 
 ### 11.4 View buffers
 
@@ -617,7 +712,7 @@ How each feature tracked for after 1.0 fits format 4 (D269 §3). The bit numbers
 | Feature | Path |
 |---|---|
 | Min, Max and HLL families (#487) | `FamilyKind` 2, 3 and 4 behind `incompat` bit 0, the first real feature bit (D294, §8.2); an HLL value is a `Bytes` sketch with a fixed encoding (§3.1) |
-| More aggregations (#488) | more `FamilyKind` values, plus an optional `kind_params` byte field appended to `PutFamily` (must-understand when present, under the same bit) |
+| More aggregations (#488) | more `FamilyKind` values under `incompat` bit 0 (5 to 13: bitwise, `f64` min/max, exact sum, mean/variance, histograms and quantiles, D298), plus the optional `kind_params` field appended to `PutFamily` (§9.2.1) |
 | Adjacency sets, roaring (#489) | a `FamilyKind` value and a value encoding, behind a bit |
 | Vector values (#490) | a value tag (0x04) behind an `incompat` bit; payload alignment as a data-block kind (6) or an entry flag under the same bit; dimension and metric in `kind_params` |
 | Time-series codec (#491) | a compression code (3..) or a block kind, behind an `incompat` bit |

@@ -58,8 +58,8 @@ use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
     COUNTER_TS, CommitStreams, Model, ModelAggregation, ModelCell, ModelFamily, ModelOp,
     ModelPurge, Op, Rng, Sim, Step, StreamCommit, StreamRecord, Workload, WorkloadSpec,
-    aggregation_of_name, check_acknowledged_survive, combine_aggregate_writes, hll_sketch,
-    hll_union, recovered_from_records,
+    aggregation_of_name, check_acknowledged_survive, combine_aggregate_writes,
+    recovered_from_records,
 };
 
 pub const TABLE: &str = "t";
@@ -159,6 +159,23 @@ pub fn families() -> Vec<ModelFamily> {
             f("hll", 2, 0, false),
             f("hll_ttl", 0, 40, false),
         ]
+    } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
+        // D298's families beside a counter, eight in all (32 slots), as `counters` has:
+        // more stall a one-shard run with tablet changes off (#1212). PR 2's exact sum and
+        // mean-variance families took `bor`'s and `fmin`'s places; PR 3's histogram and
+        // quantile families take `sum`'s and `band`'s (the counter kind runs in `counters`,
+        // and XOR covers the bitwise operator's code). They all join `counters` once #1212
+        // is fixed (#1214, #1219).
+        vec![
+            f("f", 0, 0, false),
+            f("counter", 3, 0, true),
+            f("bxor_ttl", 0, 40, false),
+            f("fmax_ttl", 0, 40, false),
+            f("fsum", 2, 0, false),
+            f("fmv_ttl", 0, 40, false),
+            f("fhist", 2, 0, false),
+            f("fq_ttl", 0, 40, false),
+        ]
     } else {
         vec![
             f("f", 0, 0, false),
@@ -174,15 +191,34 @@ fn is_aggregate(family: &str) -> bool {
     aggregation_of_name(family).is_some()
 }
 
-/// A family holding only `i64`s (what `put_i64` writes): not an HLL family, whose cells
-/// are sketches.
+/// A family whose puts are `i64`s or `f64`s (what `put_i64`/`put_f64` write): not a state
+/// family, whose puts are states.
 fn is_i64(family: &str) -> bool {
-    family.starts_with("counter") || (is_aggregate(family) && !is_hll(family))
+    family.starts_with("counter") || (is_aggregate(family) && !is_state(family))
+}
+
+/// An `f64` family (D298): its puts and operands are `f64`s, the model's `i64` their bits.
+fn is_f64(family: &str) -> bool {
+    aggregation_of_name(family).is_some_and(ModelAggregation::is_f64)
 }
 
 /// An HLL family (D294): it takes inputs (`Incr` elements), never `i64` puts.
 fn is_hll(family: &str) -> bool {
     aggregation_of_name(family) == Some(ModelAggregation::Hll)
+}
+
+/// A state family (an HLL family, D294; an exact `f64` family, D298): its puts are states,
+/// its inputs elements the model folds with its oracle.
+fn is_state(family: &str) -> bool {
+    aggregation_of_name(family).is_some_and(ModelAggregation::is_state)
+}
+
+/// The state of `base` (if any) with `elements` folded in, in state family `family`.
+fn state_of(family: &str, base: Option<&[u8]>, elements: impl IntoIterator<Item = i64>) -> Vec<u8> {
+    aggregation_of_name(family)
+        .expect("a state family")
+        .state_of(base, elements)
+        .expect("a well-formed state")
 }
 
 /// Where a put or operand without a timestamp lands: the counter's timestamp in a counter
@@ -260,6 +296,15 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Min) => "pigeonhole.i64_min",
             (true, ModelAggregation::Max) => "pigeonhole.i64_max",
             (true, ModelAggregation::Sum) => "pigeonhole.i64_add",
+            (true, ModelAggregation::BitOr) => "pigeonhole.u64_or",
+            (true, ModelAggregation::BitAnd) => "pigeonhole.u64_and",
+            (true, ModelAggregation::BitXor) => "pigeonhole.u64_xor",
+            (true, ModelAggregation::MinF64) => "pigeonhole.f64_min",
+            (true, ModelAggregation::MaxF64) => "pigeonhole.f64_max",
+            (true, ModelAggregation::SumF64) => "pigeonhole.f64_sum",
+            (true, ModelAggregation::MeanVar) => "pigeonhole.f64_mean_var",
+            (true, ModelAggregation::Histogram) => "pigeonhole.f64_histogram",
+            (true, ModelAggregation::Quantiles) => "pigeonhole.f64_quantiles",
             (false, _) if f.i64_add => "pigeonhole.i64_add",
             (false, _) => "",
         })
@@ -269,6 +314,27 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Min) => FamilyKind::Min,
             (true, ModelAggregation::Max) => FamilyKind::Max,
             (true, ModelAggregation::Hll) => FamilyKind::Hll,
+            (true, ModelAggregation::BitOr) => FamilyKind::BitOr,
+            (true, ModelAggregation::BitAnd) => FamilyKind::BitAnd,
+            (true, ModelAggregation::BitXor) => FamilyKind::BitXor,
+            (true, ModelAggregation::MinF64) => FamilyKind::MinF64,
+            (true, ModelAggregation::MaxF64) => FamilyKind::MaxF64,
+            (true, ModelAggregation::SumF64) => FamilyKind::SumF64,
+            (true, ModelAggregation::MeanVar) => FamilyKind::MeanVar,
+            (true, ModelAggregation::Histogram) => FamilyKind::Histogram,
+            (true, ModelAggregation::Quantiles) => FamilyKind::Quantiles,
+        })
+        // The model's fixed parameters (D298).
+        .kind_params(match (f.counter, f.aggregation) {
+            (true, ModelAggregation::Histogram) => pigeonhole_format::buckets::histogram_params(
+                &pigeonhole_sim::MODEL_HISTOGRAM_BOUNDS,
+            ),
+            (true, ModelAggregation::Quantiles) => pigeonhole_format::buckets::QuantileParams {
+                mantissa_bits: pigeonhole_sim::MODEL_QUANTILE_BITS,
+                max_buckets: pigeonhole_sim::MODEL_QUANTILE_MAX,
+            }
+            .encode(),
+            _ => Vec::new(),
         })
 }
 
@@ -847,8 +913,10 @@ impl Store {
                     value,
                     ..
                 } => {
-                    // Counter families hold tagged `i64`s (what `put_i64` writes).
+                    // Counter families hold tagged `i64`s (what `put_i64` writes), `f64`
+                    // families tagged `f64`s.
                     let value = match (is_i64(family), <[u8; 8]>::try_from(value.as_slice())) {
+                        (true, Ok(b)) if is_f64(family) => ValueRef::F64(f64::from_le_bytes(b)),
                         (true, Ok(b)) => ValueRef::I64(i64::from_le_bytes(b)),
                         _ => ValueRef::Bytes(value),
                     };
@@ -861,7 +929,7 @@ impl Store {
                     ts: None,
                     delta,
                     ..
-                } => wb.merge(t, fam(family), row, qualifier, ValueRef::I64(*delta))?,
+                } => wb.merge(t, fam(family), row, qualifier, operand(family, *delta))?,
                 ModelOp::Incr {
                     row,
                     family,
@@ -869,7 +937,7 @@ impl Store {
                     ts: Some(ts),
                     delta,
                     ..
-                } => wb.merge_at(t, fam(family), row, qualifier, *ts, ValueRef::I64(*delta))?,
+                } => wb.merge_at(t, fam(family), row, qualifier, *ts, operand(family, *delta))?,
                 ModelOp::DeleteCell {
                     row,
                     family,
@@ -1023,23 +1091,24 @@ fn large_puts(ops: &[ModelOp]) -> usize {
 
 /// A put's value as the recovery oracle compares it: itself, or for a value above
 /// [`LARGE_VALUE`] (logged as a blob pointer when separated at commit time) its length.
-/// The value a put leaves in the WAL and the store: its own, or in an HLL family the union
-/// of its sketch with the elements of the cell's later inputs it combined (D294).
+/// The value a put leaves in the WAL and the store: its own, or in a state family its state
+/// with the elements of the cell's later inputs it combined folded in (D294, D298).
 fn put_value(family: &str, value: &[u8], combined: Option<&Vec<i64>>) -> Vec<u8> {
     match combined {
-        Some(elements) if is_hll(family) => record_value(
-            &hll_union(value, elements.iter().copied()).expect("a well-formed sketch put"),
-        ),
+        Some(elements) if is_state(family) => {
+            record_value(&state_of(family, Some(value), elements.iter().copied()))
+        }
         _ => record_value(value),
     }
 }
 
-/// The value an `Incr` leaves in the WAL and the store: its delta, or in an HLL family the
-/// sketch of its element and the elements of the cell's later inputs it combined (D294).
+/// The value an `Incr` leaves in the WAL and the store: its delta; in an HLL family the
+/// sketch of its element and the elements of the cell's later inputs it combined (D294); in
+/// an exact `f64` family, once it combined later inputs, their state (D298).
 fn incr_bytes(family: &str, delta: i64, combined: Option<&Vec<i64>>) -> Vec<u8> {
-    if is_hll(family) {
-        let elements = std::iter::once(delta).chain(combined.into_iter().flatten().copied());
-        hll_sketch(elements).expect("one element")
+    let elements = || std::iter::once(delta).chain(combined.into_iter().flatten().copied());
+    if is_hll(family) || (is_state(family) && combined.is_some_and(|c| !c.is_empty())) {
+        state_of(family, None, elements())
     } else {
         delta.to_le_bytes().to_vec()
     }
@@ -1063,6 +1132,16 @@ pub fn value_bytes(v: ValueRef<'_>) -> Vec<u8> {
         ValueRef::I64(x) | ValueRef::Varint(x) => x.to_le_bytes().to_vec(),
         ValueRef::F64(x) => x.to_le_bytes().to_vec(),
         ValueRef::Blob(_) => panic!("blob pointer returned"),
+    }
+}
+
+/// The engine operand of an `Incr`'s `delta`: an `i64`, or in an `f64` family the `f64`
+/// with its bits.
+fn operand(family: &str, delta: i64) -> ValueRef<'static> {
+    if is_f64(family) {
+        ValueRef::F64(f64::from_bits(delta as u64))
+    } else {
+        ValueRef::I64(delta)
     }
 }
 
@@ -3371,9 +3450,9 @@ impl World {
                     qualifier,
                     ts.unwrap_or(default_ts(family, commit_ts)),
                     match elements.get(&i) {
-                        // An HLL put that later inputs of its cell combined into (D294).
-                        Some(e) if is_hll(family) => {
-                            hll_union(value, e.iter().copied()).expect("a well-formed sketch put")
+                        // A state put that later inputs of its cell combined into (D294, D298).
+                        Some(e) if is_state(family) => {
+                            state_of(family, Some(value), e.iter().copied())
                         }
                         _ => value.clone(),
                     },
@@ -4709,7 +4788,7 @@ impl World {
             };
             // A counter family with a TTL refuses its fixed timestamp: a bucket instead.
             let ts = (is_aggregate(&f) && f.contains("ttl")).then_some(now);
-            let op = if is_hll(&f) {
+            let op = if is_state(&f) {
                 ModelOp::Incr {
                     table: t,
                     row: r,

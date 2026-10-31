@@ -168,6 +168,97 @@ fn min_and_max_families() {
 }
 
 #[test]
+fn bitwise_and_f64_families() {
+    // D298: `create` takes the bitwise and f64 kinds; `aggregate` parses a u64 or an f64 by
+    // the family's kind; `incr` is refused there.
+    let dir = TempDir::new("shell-scalars");
+    let path = empty(&dir);
+    let (status, out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s o:bit_or a:bit_and x:bit_xor lo:min_f64 hi:max_f64",
+            "aggregate s r o:t 12",
+            "aggregate s r o:t 3",
+            "aggregate s r lo:t 2.5",
+            "aggregate s r lo:t -0.5",
+            "aggregate s r hi:t -0.5",
+            "aggregate s r hi:t 1e3",
+            "get s r o:t",
+            "get s r lo:t",
+            "get s r hi:t",
+            "\\schema s",
+            "incr s r x:t 1",
+        ],
+    );
+    assert_eq!(status, 1, "the incr is refused: {err}");
+    assert!(err.contains("write its inputs with aggregate_u64"), "{err}");
+    let docs = rows(&out);
+    assert_eq!(docs[7][0]["value"], serde_json::json!({"i64": 15}));
+    assert_eq!(docs[8][0]["value"], serde_json::json!({"f64": -0.5}));
+    assert_eq!(docs[9][0]["value"], serde_json::json!({"f64": 1000.0}));
+    let schema = serde_json::to_string(&docs[10]).unwrap();
+    for kind in ["bit_or", "bit_and", "bit_xor", "min_f64", "max_f64"] {
+        assert!(schema.contains(kind), "{kind}: {schema}");
+    }
+}
+
+#[test]
+fn exact_sum_and_mean_var_families() {
+    // D298 PR 2: `create` takes `:sum_f64` and `:mean_var`, and `aggregate` takes an f64
+    // input there; NaN is refused.
+    let dir = TempDir::new("shell-exact");
+    let path = empty(&dir);
+    let (status, _out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s total:sum_f64 lat:mean_var",
+            "aggregate s r total:t 1e300",
+            "aggregate s r total:t 1",
+            "aggregate s r total:t -1e300",
+            "aggregate s r lat:t 2.5",
+            "\\schema s",
+            "aggregate s r total:t NaN",
+        ],
+    );
+    assert_eq!(status, 1, "the NaN is refused: {err}");
+    assert!(err.contains("finite f64"), "{err}");
+}
+
+#[test]
+fn histogram_and_quantile_families() {
+    // D298 PR 3: `create` takes `:histogram=b0,b1,…` and `:quantiles[=p,n]`, `aggregate`
+    // takes an f64 there, and the schema names the parameters.
+    let dir = TempDir::new("shell-buckets");
+    let path = empty(&dir);
+    let (status, out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s h:histogram=0,10 q:quantiles=5,64",
+            "aggregate s r h:t 3",
+            "aggregate s r q:t 3",
+            "\\schema s",
+            "create bad q:quantiles=13,64",
+        ],
+    );
+    assert_eq!(status, 1, "the bad parameters are refused: {err}");
+    assert!(err.contains("mantissa bits"), "{err}");
+    let docs = rows(&out);
+    let schema = serde_json::to_string(&docs[3]).unwrap();
+    for want in [
+        "histogram",
+        "\"bounds\":[0.0,10.0]",
+        "quantiles",
+        "\"mantissa_bits\":5",
+        "\"max_buckets\":64",
+    ] {
+        assert!(schema.contains(want), "{want}: {schema}");
+    }
+}
+
+#[test]
 fn meta_commands() {
     let dir = TempDir::new("shell-meta");
     let path = empty(&dir);
