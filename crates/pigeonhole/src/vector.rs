@@ -77,8 +77,8 @@ impl Metric {
 /// [`put_vector_bits`](crate::RowMutation::put_vector_bits) (and their `_at` forms, on
 /// [`WriteBatch`](crate::WriteBatch) and [`Transaction`](crate::Transaction) too). A vector
 /// of another element type or dimension, an `f32` component that isn't finite or exceeds
-/// 2^56 in magnitude, or (under cosine) a vector with a zero norm is refused with `InvalidArgument` when the write is built. A vector
-/// family takes nothing else: a plain put, a merge or an aggregate input fails with
+/// 2^56 in magnitude, or (under cosine) a vector with a zero norm is refused with
+/// `InvalidArgument` when the write is built. A vector family takes nothing else: a plain put, a merge or an aggregate input fails with
 /// `InvalidArgument`. Cells version and delete as in an ordinary family.
 ///
 /// Read them back as [`Value::Vector`](crate::Value::Vector) or with

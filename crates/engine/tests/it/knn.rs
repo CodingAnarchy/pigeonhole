@@ -152,7 +152,7 @@ fn brute(
     read: &ReadSpec,
     visitor: &KnnVisitor,
     k: usize,
-) -> Vec<(Vec<u8>, Vec<u8>, f32)> {
+) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
     let mut spec = ScanSpec::new(Bound::Unbounded, Bound::Unbounded);
     spec.read = read.clone();
     let mut cur = db.engine.scan(snap, db.table, spec).unwrap();
@@ -183,7 +183,7 @@ fn knn(
     metric: Metric,
     k: usize,
     skips: &Arc<KnnSkips>,
-) -> Vec<(Vec<u8>, Vec<u8>, f32)> {
+) -> Vec<(Vec<u8>, Vec<u8>, f64)> {
     db.engine
         .reduce(
             snap,
@@ -292,4 +292,166 @@ fn filtered_knn_ranks_only_the_selected_cells() {
         &Arc::new(KnnSkips::default()),
     );
     assert_eq!(got, want);
+}
+
+/// D296 PR 4 (D303): a typed visitor over a vector family ranks exactly as the family's
+/// `Params::distance` (the function `VectorSpec::distance_*` uses), for `f32` and `i8`
+/// vectors and every metric they take, over ranges and key sets, sequentially and fanned
+/// out over three tablets (asserted). Ties, frequent with `i8`, go by row.
+#[test]
+fn typed_knn_ranks_as_the_familys_distance_at_any_fan_out() {
+    use pigeonhole_engine::{KeySet, KnnQuery};
+    use pigeonhole_format::vector::{Element, Params, Query, VectorRef};
+    let vfs = SimVfs::new(4913);
+    let opts = || common::options(Arc::clone(&vfs), 4, BUDGET);
+    let db = Engine::open(Path::new(DB), opts()).unwrap();
+    let metrics = [
+        pigeonhole_format::vector::Metric::L2,
+        pigeonhole_format::vector::Metric::InnerProduct,
+        pigeonhole_format::vector::Metric::Cosine,
+    ];
+    let mut families = Vec::new();
+    for (e, el) in [("f", Element::F32), ("i", Element::I8)] {
+        for (m, metric) in metrics.iter().enumerate() {
+            let p = Params::new(el, 4, *metric).unwrap();
+            families.push((
+                format!("{e}{m}"),
+                FamilyOptions::default()
+                    .kind(pigeonhole_format::manifest::FamilyKind::Vector)
+                    .kind_params(p.encode()),
+                p,
+            ));
+        }
+    }
+    let t = db
+        .create_table(
+            "t",
+            &families
+                .iter()
+                .map(|(n, o, _)| (n.clone(), o.clone()))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+    db.close().unwrap();
+    drop(db);
+    let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), opts()).unwrap();
+    let mut rng = Rng(4913);
+    let mut wb = WriteBatch::new();
+    for i in 0..ROWS {
+        for (name, _, p) in &families {
+            let f = t.family(name).unwrap().id;
+            let payload: Vec<u8> = match p.element {
+                Element::F32 => le(&rng.vector()[..4]),
+                // Small i8 components: many ties. Never all zeros (cosine refuses that).
+                _ => {
+                    let mut v: Vec<u8> =
+                        (0..4).map(|_| ((rng.f() * 3.0) as i8 + 1) as u8).collect();
+                    if v.iter().all(|b| *b == 0) {
+                        v[0] = 1;
+                    }
+                    v
+                }
+            };
+            wb.put(
+                t.id,
+                f,
+                &row(i),
+                b"",
+                None,
+                ValueRef::Vector(VectorRef::new(p.element, 4, &payload).unwrap()),
+            )
+            .unwrap();
+        }
+        if i % 200 == 199 {
+            drive(
+                &mut shards,
+                engine
+                    .submit(std::mem::take(&mut wb), Some(Durability::Buffered))
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+    }
+    drive(&mut shards, engine.submit_flush().unwrap()).unwrap();
+    for at in [row(ROWS / 3), row(2 * ROWS / 3)] {
+        let split = engine.split_tablet_pending(t.id, &at).unwrap();
+        drive(&mut shards, split).unwrap();
+    }
+    let snap = engine.snapshot().unwrap();
+    let qf: Arc<[f32]> = vec![0.3, -0.7, 0.2, 0.9].into();
+    let qi: Arc<[i8]> = vec![1, -1, 2, 0].into();
+    let keys = Arc::new(KeySet::from_unsorted((0..ROWS).step_by(3).map(row)));
+    for (name, _, p) in &families {
+        let f = t.family(name).unwrap().id;
+        let (query, q) = match p.element {
+            Element::F32 => (KnnQuery::F32(Arc::clone(&qf)), Query::F32(&qf)),
+            _ => (KnnQuery::I8(Arc::clone(&qi)), Query::I8(&qi)),
+        };
+        // Brute force over a scan, ranked by (distance, row).
+        let mut spec = ScanSpec::new(Bound::Unbounded, Bound::Unbounded);
+        spec.read.families = vec![f];
+        let mut cur = engine.scan(&snap, t.id, spec).unwrap();
+        let mut all = Vec::new();
+        while cur.next_row().unwrap() {
+            let r = cur.row().to_vec();
+            while let Some(c) = cur.next_cell().unwrap() {
+                let ValueRef::Vector(v) = pigeonhole_format::value::decode_value(c.stored).unwrap()
+                else {
+                    panic!("a vector");
+                };
+                all.push((Score(p.distance(q, &v)), r.clone()));
+            }
+        }
+        all.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        let in_keys = |r: &Vec<u8>| keys.iter().any(|k| k == r.as_slice());
+        for (input, want) in [
+            (
+                ReadInput::Ranges(vec![(Bound::Unbounded, Bound::Unbounded)]),
+                all.iter().take(25).cloned().collect::<Vec<_>>(),
+            ),
+            (
+                ReadInput::Keys(Arc::clone(&keys)),
+                all.iter()
+                    .filter(|(_, r)| in_keys(r))
+                    .take(25)
+                    .cloned()
+                    .collect(),
+            ),
+        ] {
+            let want: Vec<(Vec<u8>, f64)> = want.into_iter().map(|(s, r)| (r, s.0)).collect();
+            let mut rspec = ReduceSpec::new(input);
+            rspec.read.families = vec![f];
+            for (threads, floor) in [(1, rspec.parallel_floor), (4, 0)] {
+                rspec.parallelism = threads;
+                rspec.parallel_floor = floor;
+                let skips = Arc::new(KnnSkips::default());
+                let engine = Arc::clone(&engine);
+                let got = std::thread::scope(|s| {
+                    s.spawn(|| {
+                        engine
+                            .reduce(
+                                &snap,
+                                t.id,
+                                &rspec,
+                                || {
+                                    KnnVisitor::typed(*p, query.clone(), Arc::clone(&skips))
+                                        .unwrap()
+                                },
+                                || TopK::new(25),
+                            )
+                            .unwrap()
+                    })
+                    .join()
+                    .unwrap()
+                });
+                if threads > 1 {
+                    assert!(got.stats.threads > 1, "{name}: fanned out");
+                }
+                let got: Vec<(Vec<u8>, f64)> =
+                    got.items.into_iter().map(|(c, s)| (c.row, s.0)).collect();
+                assert_eq!(got, want, "{name}, {threads} threads");
+                assert_eq!(skips.counts(), (0, 0), "{name}: nothing skipped");
+            }
+        }
+    }
 }

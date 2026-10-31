@@ -3,10 +3,12 @@
 //! transaction) read back as `Value::Vector`, through flushes and compactions and at a
 //! blob threshold every vector is above (they stay inline). Each write is refused when it's
 //! built if it doesn't fit the family's spec, and a vector family refuses plain puts, merges
-//! and aggregate inputs. `VectorSpec::distance_*` scores as the kernels do.
+//! and aggregate inputs. `VectorSpec::distance_*` scores as the kernels do, and D296 PR 4's
+//! `nearest_*` equals a brute force ranked by it, ties by row, at any fan-out.
 
 use pigeonhole::{
-    Element, ErrorCode, Family, Metric, Options, Pigeonhole, Table, Value, VectorSpec,
+    Element, ErrorCode, Family, KeySet, Metric, Neighbour, Options, Pigeonhole, Table, Value,
+    VectorSpec,
 };
 
 fn open() -> (pigeonhole::doc_support::TempDir, Pigeonhole, Table) {
@@ -222,6 +224,182 @@ fn writes_that_dont_fit_the_spec_are_refused_when_built() {
             ErrorCode::InvalidArgument,
             "{d} {e:?} {m:?}"
         );
+    }
+    db.close().expect("close");
+}
+
+/// Every row's vector in `family`, scored by `score` and ranked as `nearest_*` ranks:
+/// distance (`total_cmp`), then row key, then qualifier; the first `k`.
+fn brute(
+    t: &Table,
+    family: &str,
+    rows: &[Vec<u8>],
+    score: impl Fn(pigeonhole::VectorRef<'_>) -> f64,
+    k: usize,
+) -> Vec<(Vec<u8>, f64)> {
+    let mut all: Vec<(f64, Vec<u8>)> = rows
+        .iter()
+        .filter_map(|r| {
+            let cell = t.get(r, family, b"").expect("get")?;
+            Some((score(cell.as_vector().expect("vector")), r.clone()))
+        })
+        .collect();
+    all.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    all.into_iter().take(k).map(|(d, r)| (r, d)).collect()
+}
+
+fn got(n: Vec<Neighbour>) -> Vec<(Vec<u8>, f64)> {
+    assert!(n.iter().all(|x| x.qualifier.is_empty() && x.ts > 0));
+    n.into_iter().map(|x| (x.row, x.distance)).collect()
+}
+
+#[test]
+fn nearest_equals_a_brute_force_ranked_by_the_spec_for_every_element() {
+    let (_dir, db, t) = open();
+    let rows: Vec<Vec<u8>> = (0..300u32)
+        .map(|i| format!("r{i:04}").into_bytes())
+        .collect();
+    for (i, row) in rows.iter().enumerate() {
+        let i = i as u32;
+        t.mutate(row)
+            .put_vector_f32("f", b"", &f32s(i))
+            .put_vector_i8("q", b"", &[(i % 7) as i8, -((i % 5) as i8), 3, 1])
+            .put_vector_bits("b", b"", &((i % 37) as u16).to_le_bytes())
+            .commit()
+            .expect("put");
+        if i == 150 {
+            db.flush().expect("flush");
+        }
+    }
+    let spec = |f: &str| t.family_info(f).and_then(|i| i.vector).expect("spec");
+    let (fs, qs, bs) = (spec("f"), spec("q"), spec("b"));
+    let qf = [0.5f32, -1.0, 2.0, 0.25, 3.0, -2.5, 1.5, 0.75];
+    let qi = [2i8, -1, 3, 0];
+    let qb = 0b1010_0101_0011_1100u16.to_le_bytes();
+    let some: Vec<Vec<u8>> = rows.iter().step_by(3).cloned().collect();
+    let some_set = KeySet::from_unsorted(&some);
+    for k in [1usize, 7, 50, 1000] {
+        let want = brute(&t, "f", &rows, |v| fs.distance_f32(&qf, v).unwrap(), k);
+        assert_eq!(
+            got(t
+                .scan_prefix(b"")
+                .family("f")
+                .nearest_f32(&qf, k)
+                .run()
+                .unwrap()),
+            want,
+            "f32 k={k}"
+        );
+        assert_eq!(
+            got(t
+                .scan_prefix(b"")
+                .family("f")
+                .nearest_f32(&qf, k)
+                .parallel(4)
+                .run()
+                .unwrap()),
+            want,
+            "f32 k={k}, fanned out"
+        );
+        // Integer distances tie often: the order is by row then.
+        let want = brute(&t, "q", &rows, |v| qs.distance_i8(&qi, v).unwrap(), k);
+        assert_eq!(
+            got(t
+                .scan_prefix(b"")
+                .family("q")
+                .nearest_i8(&qi, k)
+                .run()
+                .unwrap()),
+            want,
+            "i8 k={k}"
+        );
+        let want = brute(&t, "b", &rows, |v| bs.distance_bits(&qb, v).unwrap(), k);
+        assert_eq!(
+            got(t
+                .scan_prefix(b"")
+                .family("b")
+                .nearest_bits(&qb, k)
+                .run()
+                .unwrap()),
+            want,
+            "bits k={k}"
+        );
+        // Over a key set.
+        let want = brute(&t, "f", &some, |v| fs.distance_f32(&qf, v).unwrap(), k);
+        assert_eq!(
+            got(t
+                .keys(&some_set)
+                .family("f")
+                .nearest_f32(&qf, k)
+                .parallel(4)
+                .run()
+                .unwrap()),
+            want,
+            "keys k={k}"
+        );
+    }
+    // A range narrows the candidates.
+    let want = brute(
+        &t,
+        "f",
+        &rows[100..200],
+        |v| fs.distance_f32(&qf, v).unwrap(),
+        5,
+    );
+    let near = t
+        .scan_bounds(
+            std::ops::Bound::Included(b"r0100"),
+            std::ops::Bound::Excluded(b"r0200"),
+        )
+        .family("f")
+        .nearest_f32(&qf, 5)
+        .run()
+        .unwrap();
+    assert_eq!(got(near), want);
+    assert!(
+        t.scan_prefix(b"")
+            .family("f")
+            .nearest_f32(&qf, 0)
+            .run()
+            .unwrap()
+            .is_empty()
+    );
+    db.close().expect("close");
+}
+
+#[test]
+fn nearest_refuses_what_doesnt_fit() {
+    let (_dir, db, t) = open();
+    t.mutate(b"r")
+        .put_vector_f32("f", b"", &[1.0; 8])
+        .commit()
+        .expect("put");
+    let code = |r: pigeonhole::Result<Vec<Neighbour>>| r.expect_err("refused").code();
+    for r in [
+        t.scan_prefix(b"")
+            .family("f")
+            .nearest_f32(&[1.0; 7], 3)
+            .run(),
+        t.scan_prefix(b"").family("f").nearest_i8(&[1; 8], 3).run(),
+        t.scan_prefix(b"")
+            .family("f")
+            .nearest_f32(&[0.0; 8], 3)
+            .run(),
+        t.scan_prefix(b"")
+            .family("f")
+            .nearest_f32(&[f32::NAN; 8], 3)
+            .run(),
+        t.scan_prefix(b"")
+            .family("plain")
+            .nearest_f32(&[1.0; 8], 3)
+            .run(),
+        t.scan_prefix(b"")
+            .families(["f", "q"])
+            .nearest_f32(&[1.0; 8], 3)
+            .run(),
+        t.scan_prefix(b"").nearest_f32(&[1.0; 8], 3).run(),
+    ] {
+        assert_eq!(code(r), ErrorCode::InvalidArgument);
     }
     db.close().expect("close");
 }

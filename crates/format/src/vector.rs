@@ -301,11 +301,14 @@ impl Params {
     }
 }
 
-/// Whether every component is zero (`-0.0` included).
 /// The largest `f32` component magnitude a vector may hold: 2^56. With at most 4096
 /// components, every kernel's sum stays below `f32::MAX` (Σ(2x)² ≤ 4096 × 4 × 2^112 = 2^126),
 /// so no distance overflows to infinity or NaN (perf287's B1 on #1255).
 pub const MAX_F32_COMPONENT: f32 = 72_057_594_037_927_936.0;
+
+const F32_RANGE: &str = "a vector's components must be finite and at most 2^56 in magnitude";
+const COSINE_NORM: &str =
+    "a cosine vector needs a nonzero norm (not all zeros, nor so small its square underflows)";
 
 /// The `f32` components a vector may hold under `metric` (D303): finite and at most
 /// [`MAX_F32_COMPONENT`] in magnitude, and under cosine a squared norm (as the kernels sum
@@ -315,15 +318,10 @@ fn check_f32(q: &[f32], metric: Metric) -> Result<(), VectorError> {
     if q.iter()
         .any(|x| !x.is_finite() || x.abs() > MAX_F32_COMPONENT)
     {
-        return Err(VectorError(
-            "a vector's components must be finite and at most 2^56 in magnitude",
-        ));
+        return Err(VectorError(F32_RANGE));
     }
     if metric == Metric::Cosine && crate::distance::norm2_f32(q) < f32::MIN_POSITIVE {
-        return Err(VectorError(
-            "a cosine vector needs a nonzero norm (not all zeros, nor so small its square \
-             underflows)",
-        ));
+        return Err(VectorError(COSINE_NORM));
     }
     Ok(())
 }
@@ -389,13 +387,16 @@ impl<'a> VectorRef<'a> {
         let p = self.payload;
         match self.element {
             Element::F32 => {
-                let xs: Vec<f32> = p
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect();
-                check_f32(&xs, metric)
+                let mut xs = p.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c));
+                if xs.any(|x| !x.is_finite() || x.abs() > MAX_F32_COMPONENT) {
+                    return Err(VectorError(F32_RANGE));
+                }
+                // The norm the kernels sum, read from the stored bytes (no copy per put).
+                if metric == Metric::Cosine && crate::distance::norm2_f32_le(p) < f32::MIN_POSITIVE
+                {
+                    return Err(VectorError(COSINE_NORM));
+                }
+                Ok(())
             }
             Element::I8 | Element::Bit => check_bytes(p.iter().all(|b| *b == 0), metric),
         }
