@@ -34,7 +34,7 @@ jobs:
           - { name: Windows x86_64, os: windows-latest, target: x64, manylinux: '' }
     steps:
       - uses: actions/checkout@v5
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: '3.11'
       - uses: PyO3/maturin-action@v1

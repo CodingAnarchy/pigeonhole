@@ -38,19 +38,23 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python }}
+      # Every step runs in bash with the venv's python named: on Windows, a path bash
+      # writes to GITHUB_PATH (/d/a/...) means nothing to PowerShell.
       - name: Build into a venv
         shell: bash
         run: |
           python -m venv .venv
           if [ -d .venv/Scripts ]; then bin=.venv/Scripts; else bin=.venv/bin; fi
-          echo "$PWD/$bin" >> "$GITHUB_PATH"
+          echo "VENV_PY=$PWD/$bin/python" >> "$GITHUB_ENV"
           "$bin/python" -m pip install --quiet maturin pytest hypothesis mypy
           VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop --release -m crates/python/Cargo.toml
       - name: pytest
-        run: python -m pytest crates/python/tests -q
+        shell: bash
+        run: '"$VENV_PY" -m pytest crates/python/tests -q'
       - name: stubtest (the stubs match the module)
+        shell: bash
         working-directory: crates/python
-        run: python -m mypy.stubtest pigeonhole
+        run: '"$VENV_PY" -m mypy.stubtest pigeonhole'
