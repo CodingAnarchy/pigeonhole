@@ -12,8 +12,13 @@
   - **pigeonhole-engine:** `KeySet`, `KeyCursor` (`next_key`, `row`, `next_cell`, `next_cell_into`, `push_next_cell`, `current_data`, `skip_rest_of_key`, `keys`), `Engine::multi_get`.
   - **pigeonhole-compaction:** `MergingCursor::rebuild_positioned`, `CellResolver::seek_with`.
 
-## PR 2 (planned): async
-`KeyRows::poll_next` and `next_async` (lending) and `into_owned_stream()` behind the `async` feature.
+## PR 2: async
+- **pigeonhole** (behind the `async` feature):
+  - `KeyRows::poll_next(&mut self, &mut Context) -> Poll<Result<Option<(usize, RowRef<'_>)>>>` and `KeyRows::next_async(&mut self) -> Result<Option<(usize, RowRef<'_>)>>` (an `async fn`): `next`'s rows, lent the same way, never blocking on the device.
+  - `KeyRows::into_owned_stream(self) -> nonblocking::KeyStream`: a `Stream<Item = Result<(usize, Row)>>` that holds its table.
+- **Internal crates** (no promise):
+  - **pigeonhole-engine:** `KeyCursor::poll_next_key` and `KeyCursor::counted`.
+  - **pigeonhole-sst:** `SstReader::fetch_for(&self, target, priority) -> Option<Fetch>` and `Fetch::offset`.
 
 ## Why
 D299 (#489 item 2): a frontier read row by row sets up every read from scratch; a multi-get sets each tablet's read up once and moves its sources forward from key to key.

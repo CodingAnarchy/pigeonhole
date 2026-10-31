@@ -533,13 +533,13 @@ impl RowRead<'_> {
 #[derive(Debug)]
 #[must_use = "a multi-get does nothing until .read()"]
 pub struct KeysRead<'t> {
-    core: &'t TableCore,
+    core: &'t Arc<TableCore>,
     keys: KeySet,
     sel: Selection,
 }
 
 impl<'t> KeysRead<'t> {
-    pub(crate) fn new(core: &'t TableCore, keys: &KeySet) -> Self {
+    pub(crate) fn new(core: &'t Arc<TableCore>, keys: &KeySet) -> Self {
         Self {
             core,
             keys: keys.clone(),
@@ -573,7 +573,7 @@ impl<'t> KeysRead<'t> {
         Ok(KeyRows {
             cursor,
             buf: RowBuf::new(info, 0),
-            core: self.core,
+            core: Cow::Borrowed(self.core),
             generation,
             done: false,
         })
@@ -582,16 +582,24 @@ impl<'t> KeysRead<'t> {
 
 /// The rows of a multi-get, in key order ([`KeysRead::read`]): each lent with its index in
 /// the [`KeySet`] until the next call. One buffer is reused for every row.
+///
+/// With the `async` feature, [`KeyRows::next_async`] and [`KeyRows::poll_next`] read the
+/// same rows without blocking on the device, and [`KeyRows::into_owned_stream`] makes a
+/// [`Stream`](futures_core::Stream) of owned rows. Each key is positioned from the block
+/// cache only; the blocks it lacks, and those the next few keys' reads start from, are
+/// fetched asynchronously, in flight together.
 #[derive(Debug)]
 pub struct KeyRows<'t> {
     cursor: KeyCursor,
     buf: RowBuf,
-    core: &'t TableCore,
+    /// The table: borrowed, or held by an owned stream. Its database's closed flag stops
+    /// the read (#826).
+    core: Cow<'t, Arc<TableCore>>,
     generation: u64,
     done: bool,
 }
 
-impl KeyRows<'_> {
+impl<'t> KeyRows<'t> {
     /// The next row with a cell the selection keeps, and its key's index in the key set;
     /// `None` after the last. After an error the read is finished.
     #[allow(clippy::should_implement_trait)] // A lending step: an `Iterator` cannot lend.
@@ -604,6 +612,11 @@ impl KeyRows<'_> {
             .db
             .check_generation(self.generation)
             .and_then(|()| self.fill());
+        self.finish(r)
+    }
+
+    /// The row a step read, lent; the read is finished at its end or an error.
+    fn finish(&mut self, r: Result<Option<usize>>) -> Result<Option<(usize, RowRef<'_>)>> {
         match r {
             Ok(Some(i)) => Ok(Some((i, RowRef::borrowed(&self.buf)))),
             Ok(None) => {
@@ -618,14 +631,132 @@ impl KeyRows<'_> {
     }
 
     fn fill(&mut self) -> Result<Option<usize>> {
-        self.buf.clear();
         let Some(i) = self.cursor.next_key()? else {
             return Ok(None);
         };
-        self.buf.key.extend_from_slice(self.cursor.row());
-        while self.cursor.push_next_cell(&mut self.buf)? {}
+        fill_key(&mut self.cursor, &mut self.buf)?;
         Ok(Some(i))
     }
+
+    /// [`KeyRows::next`] without blocking: `Pending` while a block the next row needs is
+    /// being fetched.
+    #[cfg(feature = "async")]
+    pub fn poll_next(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<(usize, RowRef<'_>)>>> {
+        match self.poll_fill(cx) {
+            std::task::Poll::Pending => std::task::Poll::Pending,
+            std::task::Poll::Ready(r) => std::task::Poll::Ready(self.finish(r)),
+        }
+    }
+
+    /// [`KeyRows::next`] as a future that never blocks on the device
+    /// ([`KeyRows::poll_next`]).
+    ///
+    /// ```
+    /// use pigeonhole::{Family, KeySet, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+    /// g.mutate(b"v:1").put("out", b"v:2", b"").commit()?;
+    ///
+    /// let frontier = KeySet::from_unsorted([&b"v:1"[..], b"v:2"]);
+    /// let mut rows = g.keys(&frontier).read()?;
+    /// let mut seen = 0;
+    /// # pigeonhole::doc_support::block_on(async {
+    /// while let Some((i, row)) = rows.next_async().await? {
+    ///     assert_eq!(frontier.get(i), b"v:1");
+    ///     seen += row.iter().count();
+    /// }
+    /// # Ok::<(), pigeonhole::Error>(())
+    /// # })?;
+    /// assert_eq!(seen, 1);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn next_async(&mut self) -> Result<Option<(usize, RowRef<'_>)>> {
+        let r = std::future::poll_fn(|cx| self.poll_fill(cx)).await;
+        self.finish(r)
+    }
+
+    /// The rows as a [`Stream`](futures_core::Stream) of owned [`Row`]s with their keys'
+    /// indexes, holding the table ([`KeyRows::poll_next`] reads them).
+    #[cfg(feature = "async")]
+    pub fn into_owned_stream(self) -> crate::nonblocking::KeyStream {
+        crate::nonblocking::KeyStream::new(KeyRows {
+            cursor: self.cursor,
+            buf: self.buf,
+            core: Cow::Owned(self.core.into_owned()),
+            generation: self.generation,
+            done: self.done,
+        })
+    }
+
+    /// Polls the next row into the buffer: its key's index, or `None` after the last.
+    #[cfg(feature = "async")]
+    fn poll_fill(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<Option<usize>>> {
+        use std::task::Poll;
+        if self.done {
+            return Poll::Ready(Ok(None));
+        }
+        // As `next`: nothing is read after `close` (#826), nor after a recovery onto a newer
+        // engine (D265).
+        if let Err(e) = self.core.db.check_generation(self.generation) {
+            return Poll::Ready(Err(e));
+        }
+        Poll::Ready(match self.cursor.poll_next_key(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(Ok(Some(i))) => {
+                let buf = &mut self.buf;
+                self.cursor.counted(|c| fill_key(c, buf)).map(|()| Some(i))
+            }
+            Poll::Ready(Ok(None)) => Ok(None),
+            Poll::Ready(Err(e)) => Err(e.into()),
+        })
+    }
+
+    /// The next row, owned, for [`KeyStream`](crate::nonblocking::KeyStream).
+    #[cfg(feature = "async")]
+    pub(crate) fn poll_owned(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<(usize, Row)>>> {
+        use std::task::Poll;
+        let r = match self.poll_fill(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(r) => r,
+        };
+        Poll::Ready(match r {
+            Ok(Some(i)) => {
+                let next = self.buf.empty_like();
+                Some(Ok((i, Row::new(std::mem::replace(&mut self.buf, next)))))
+            }
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        })
+    }
+}
+
+/// Reads the cells of the key `cursor` is on into `buf` (cleared first).
+fn fill_key(cursor: &mut KeyCursor, buf: &mut RowBuf) -> Result<()> {
+    buf.clear();
+    buf.key.extend_from_slice(cursor.row());
+    while cursor.push_next_cell(buf)? {}
+    Ok(())
 }
 
 /// A position within a row: the column (family and qualifier) a walk of the row handed out

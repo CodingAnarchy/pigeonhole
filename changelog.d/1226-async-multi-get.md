@@ -1,0 +1,2 @@
+### Added
+- Async multi-get (D299): `KeyRows::next_async` and `KeyRows::poll_next` read a multi-get's rows without blocking on the device, and `KeyRows::into_owned_stream()` turns them into a `Stream` of owned rows with their keys' indexes. Each key is read from the block cache, and the blocks it lacks are fetched asynchronously, together with those of the next few keys, so a cold frontier's reads are in flight at once rather than one per key.

@@ -138,6 +138,12 @@ impl Fetch {
         submit_bytes(&self.file, offset, len)
     }
 
+    /// The file offset of the read (its first piece's): two fetches of one block of the same
+    /// file share it.
+    pub fn offset(&self) -> u64 {
+        self.pieces.first().map_or(0, |p| p.0)
+    }
+
     /// Starts the read: the one already in flight when the cache-only read that missed
     /// submitted it (a data or index block whose read did not complete at once, #709), else a
     /// new one ([`Fetch::submit`]).

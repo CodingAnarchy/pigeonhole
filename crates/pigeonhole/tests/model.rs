@@ -730,12 +730,13 @@ fn ref_cells(row: &pigeonhole::RowRef<'_>) -> Vec<ModelCell> {
         .collect()
 }
 
-/// An owned public row as model cells (through `Row::entry`).
-/// Every version of the rows of `keys` a multi-get returns (D299), with their keys.
+/// Every version of the rows of `keys` a multi-get returns (D299), with their keys; through
+/// `next_async` with `async_front`.
 fn multi_get_rows(
     t: &pigeonhole::Table,
     keys: &pigeonhole::KeySet,
     snap: Option<&pigeonhole::Snapshot>,
+    async_front: bool,
 ) -> pigeonhole::Result<Vec<(Vec<u8>, Vec<ModelCell>)>> {
     let mut r = t.keys(keys).versions(0);
     if let Some(s) = snap {
@@ -743,7 +744,7 @@ fn multi_get_rows(
     }
     let mut rows = r.read()?;
     let mut out = Vec::new();
-    while let Some((i, row)) = rows.next()? {
+    let mut push = |i: usize, row: pigeonhole::RowRef<'_>| {
         let cells = row
             .iter()
             .map(|e| ModelCell {
@@ -754,6 +755,20 @@ fn multi_get_rows(
             })
             .collect();
         out.push((keys.get(i).to_vec(), cells));
+    };
+    #[cfg(feature = "async")]
+    if async_front {
+        pigeonhole::doc_support::block_on(async {
+            while let Some((i, row)) = rows.next_async().await? {
+                push(i, row);
+            }
+            Ok::<(), pigeonhole::Error>(())
+        })?;
+        return Ok(out);
+    }
+    let _ = async_front;
+    while let Some((i, row)) = rows.next()? {
+        push(i, row);
     }
     Ok(out)
 }
@@ -822,6 +837,7 @@ fn walk_row(
     Ok(out)
 }
 
+/// An owned public row as model cells (through `Row::entry`).
 fn owned_cells(row: &pigeonhole::Row) -> Vec<ModelCell> {
     (0..row.len())
         .map(|i| {
@@ -2339,7 +2355,7 @@ impl Run {
                         recent.iter().filter(|r| table_index(r) == ti),
                     )
                 };
-                let got = multi_get_rows(t, &keys, snap.as_ref().map(|(s, _)| s));
+                let got = multi_get_rows(t, &keys, snap.as_ref().map(|(s, _)| s), async_front);
                 let mut want = Ok(Vec::new());
                 for k in keys.iter() {
                     match self.model.try_read_row(TABLES[ti], k, &[], 0, ms, now) {

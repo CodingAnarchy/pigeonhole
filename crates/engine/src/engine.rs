@@ -2436,6 +2436,7 @@ impl Engine {
             read,
             now,
             keys,
+            Arc::clone(&self.inner.shared),
         )
     }
 

@@ -486,6 +486,34 @@ impl SstReader {
         }
     }
 
+    /// The first block a point read's seek to `target` loads past the pinned top index (the
+    /// index partition, then the data block it names), if the cache does not hold it: read
+    /// from the index only, so an async multi-get fetches the blocks of the keys after the one
+    /// it reads before it reaches them (D299). `None` when both are cached or `target` sorts
+    /// past the SST's last block.
+    pub fn fetch_for(&self, target: &[u8], priority: Priority) -> Option<Fetch> {
+        use pigeonhole_format::block::{Block, BlockAddr, BlockKind};
+        use pigeonhole_format::cursor::Cursor as _;
+        let blocks = &self.inner.blocks;
+        let mut top = Block::new(self.inner.top.clone()).ok()?.into_cursor();
+        top.seek(target).ok()?;
+        if !top.valid() {
+            return None;
+        }
+        let addr = BlockAddr::decode_varint(top.value()).ok()?;
+        let partition = match blocks.lookup(addr).ok()? {
+            Some(h) => h,
+            None => return Some(blocks.fetch(addr, BlockKind::Index, priority)),
+        };
+        let mut index = Block::new(partition).ok()?.into_cursor();
+        index.seek(target).ok()?;
+        if !index.valid() {
+            return None;
+        }
+        let data = BlockAddr::decode_varint(index.value()).ok()?;
+        blocks.fetch_if_missing(data, BlockKind::Data, priority, true)
+    }
+
     /// A cursor applying `filter`; unpositioned until a seek. Owns a clone of the `Arc`.
     /// Allocation-free.
     #[inline]

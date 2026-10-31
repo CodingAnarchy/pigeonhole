@@ -412,6 +412,30 @@ fn polled_after_done() -> Error {
     )
 }
 
+/// A multi-get as a [`Stream`](futures_core::Stream) of owned [`Row`]s, each with its key's
+/// index in the [`KeySet`](crate::KeySet) ([`KeyRows::into_owned_stream`](crate::KeyRows::into_owned_stream)).
+/// It holds its table; after the database is closed, the next item is `Closed` and the
+/// stream ends (#826). Dropping it is always safe.
+#[must_use = "a stream does nothing unless polled"]
+#[derive(Debug)]
+pub struct KeyStream {
+    rows: crate::KeyRows<'static>,
+}
+
+impl KeyStream {
+    pub(crate) fn new(rows: crate::KeyRows<'static>) -> Self {
+        Self { rows }
+    }
+}
+
+impl futures_core::Stream for KeyStream {
+    type Item = Result<(usize, Row)>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.rows.poll_owned(cx)
+    }
+}
+
 /// A scan as a [`Stream`](futures_core::Stream) of owned [`Row`]s ([`Scan::stream`](crate::Scan::stream)).
 /// After the database is closed, the next item is `Closed` and the stream ends (#826).
 /// Borrows its table as a lifetime, as [`RowIter`](crate::RowIter) does, or holds it

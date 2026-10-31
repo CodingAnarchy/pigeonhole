@@ -3398,7 +3398,10 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Borrowed cell steps for consumers** (cli692's M2): `next_key`, `next_cell`/`next_cell_into`, `push_next_cell`, `current_data`, and `skip_rest_of_key` (D296's `NextRow`). `KeyRows` fills one reused row buffer with them; D296's visitor runs on the borrowed cells.
 - **`Table::keys(&KeySet)`** (and on `ReadTable`) returns `KeysRead`, with a row read's selection, `versions` and a per-row `column_limit`; `read()` returns `KeyRows`, which lends `(index, RowRef)` for each key with a cell the selection keeps, in key order, under one snapshot. The row cache is not consulted.
 - **Not in 1.1** (cli692's M3): `parallel(n)` on the lending `KeyRows`. Parallel key-set reads go through D296's bounded `reduce`.
-- **PR 2:** the async form, with an 8-key lookahead that fetches the blocks of the next keys from an index-only probe (M4).
+- **PR 2: the async form** (`KeyRows::poll_next`, `next_async`, `into_owned_stream`; `KeyCursor::poll_next_key`):
+  - Each key is positioned cache-only, as an async scan positions a tablet (D196). A miss unwinds the key: its sources stay in the merge and seek afresh on the next attempt, since one may have read past the row's start. The missed block is fetched, and the key is positioned again.
+  - First, the blocks of the next 8 keys in the group that the cache lacks are fetched, all in flight together (M4). They are found from the index alone (`SstReader::fetch_for`: the index partition, or the data block it names), or, if a reader is not open yet, from what opening it needs. Only SSTs whose key range and row filter admit the key are probed, as for positioning. A key is probed once, and again after one of its fetches lands, since a fetched partition names the data block next.
+  - A key's cells past the first are read synchronously and counted in `async_sync_reads`. As for scans, the cache keeping nothing, or a key needing more than 64 fetches, switches the rest to synchronous reads (counted).
 
 **Measured (PR 1, Mac, warm, 300K-node graph, row cache off for both):** a dense frontier (10,000 contiguous rows) 0.86 µs/row against 1.48 for row reads, with no allocation per row (7 for row reads); a sparse BFS hop 1.71–1.77 µs/row against 1.93–2.16. The AX102 figures come with PR 2's box run.
 
