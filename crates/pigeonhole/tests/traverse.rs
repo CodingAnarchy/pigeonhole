@@ -555,7 +555,10 @@ fn an_async_traversal_yields_over_filtered_edges_and_absent_keys() {
             .value_filter(keep())
             .run_async(),
     );
-    assert_eq!(got.expect("run_async").hops(), want.hops());
+    let got = got.expect("run_async");
+    assert_eq!(got.hops(), want.hops());
+    // `edges` counts the kept edges, as `run` does; the budget counted the dropped ones.
+    assert_eq!((got.stats().edges, want.stats().edges), (100, 100));
     assert!(
         pending >= 2,
         "{pending} yields over 10,000 edges, 9,900 filtered out"
