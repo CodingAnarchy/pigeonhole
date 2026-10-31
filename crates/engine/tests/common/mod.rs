@@ -1666,7 +1666,7 @@ struct World {
     ack_owners: HashMap<Seqno, (Vec<ModelOp>, Vec<Option<u16>>)>,
     /// The open engine's `commit_separations` as last read, and which engine that was
     /// (`Stats::commit_separations`, summed across reopens).
-    separations_seen: (usize, u64),
+    separations_seen: (std::sync::Weak<Engine>, u64),
     /// Bottommost compactions applied to the model, by manifest version.
     purges: Vec<PurgeEvent>,
     /// Compactions reported by the engine whose manifest version is not published yet.
@@ -1729,7 +1729,7 @@ impl World {
             decided_ids: HashMap::new(),
             revert_aliases: true,
             ack_owners: HashMap::new(),
-            separations_seen: (0, 0),
+            separations_seen: (std::sync::Weak::new(), 0),
             purges: Vec::new(),
             pending_purges: Vec::new(),
             compaction_floor: 0,
@@ -1813,18 +1813,13 @@ impl World {
         let Some(store) = self.store.as_ref() else {
             return;
         };
-        let engine = Arc::as_ptr(&store.engine) as usize;
+        // The counter counts a value when it is appended to its blob sink, so a separation
+        // whose sink later fails to finish is counted too (perf287 on #1233).
         let now = store.engine.commit_separations();
-        let (seen, last) = self.separations_seen;
-        // A reopened engine may take the dropped one's address: one whose count went down
-        // is a new engine too.
-        let since = if seen == engine && now >= last {
-            now - last
-        } else {
-            now
-        };
-        self.stats.commit_separations += since;
-        self.separations_seen = (engine, now);
+        let (seen, last) = &self.separations_seen;
+        let same = std::sync::Weak::ptr_eq(seen, &Arc::downgrade(&store.engine));
+        self.stats.commit_separations += if same { now - last } else { now };
+        self.separations_seen = (Arc::downgrade(&store.engine), now);
     }
 
     fn trace_on(&self) -> bool {

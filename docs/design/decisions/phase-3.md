@@ -3483,7 +3483,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - a 2^21-bit filter put at commit goes to a blob file; an input folds onto it; a compaction folds it;
   - the cap: a 2 KiB filter's get leaves a checkpoint, a 4 KiB one's never does.
   - **Mutations:** `attach` skipping bloom fails 3 tests; no `base_blobs` fails the compaction fold test; no cap fails the cap test.
-- **Model checks:** both harnesses give `bloom` families a blob threshold of 64, so the `scalar_counters` sweeps fold onto separated bases at reads and compactions.
+- **Model checks:** both harnesses give `bloom` families a blob threshold of 64, so the `counters` sweeps (every aggregate kind since #1233) fold onto separated bases at reads and compactions. The commit-time separation test counts the engine's own commit-time separations (#1233), so these flush-time ones don't enter it.
 
 <a id="d299"></a>
 ## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)
