@@ -40,8 +40,12 @@ fn an_idle_fifo_family_drops_ssts_when_they_expire() {
         ValueRef::Bytes(b"v"),
     )
     .unwrap();
-    db.commit(wb, Some(Durability::Buffered)).unwrap();
+    // The cell expires TTL after its commit timestamp, which the commit takes before it
+    // returns: an instant read before the commit is a lower bound on it, so `gone` measured
+    // from it is never short of the TTL however long the commit took (a busy test binary
+    // made it 1.2 ms short, #1204's CI). The upper bound below allows for the same slack.
     let written = Instant::now();
+    db.commit(wb, Some(Durability::Buffered)).unwrap();
     db.flush().unwrap();
     let ssts = || db.sst_levels().into_iter().filter(|s| s.0 == t.id).count();
     assert_eq!(ssts(), 1);
