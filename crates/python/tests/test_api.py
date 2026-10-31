@@ -2,6 +2,8 @@
 scans, snapshots, deletes, typed values and aggregate families, batches, durability,
 conditional commits and closed handles. Each test names its Rust counterpart."""
 
+from datetime import timedelta
+
 import pytest
 
 import pigeonhole as ph
@@ -40,10 +42,15 @@ def test_family_settings_are_stored(db):
         .create()
     )
     info = t.family_info("f")
-    assert info["max_versions"] == 3
-    assert info["ttl_micros"] == 60_000_000
-    assert t.family_info("n")["counter"] is True
+    assert (info.name, info.max_versions, info.aggregation) == ("f", 3, None)
+    assert info.ttl == timedelta(seconds=60)
+    assert (info.compression, info.zstd_level) == ("zstd", 5)
+    n = t.family_info("n")
+    assert (n.counter, n.aggregation) == (True, "sum")
     assert t.family_info("missing") is None
+    # A family's options recreate it elsewhere.
+    u = db.table("u").family("f", info.family).create()
+    assert u.family_info("f").max_versions == 3
     with pytest.raises(ValueError):
         ph.Family(compression="snappy")
     with pytest.raises(ValueError):
@@ -246,6 +253,20 @@ def test_durability_defaults_and_overrides(path):
     with ph.open(path, shards=1) as db:
         t = db.table("t").open()
         assert len(t.row(b"r")) == 3
+
+
+def test_durability_is_an_int_enum(db):
+    """The binding's own rule: Durability is an IntEnum, and its ints are accepted."""
+    import enum
+
+    assert issubclass(ph.Durability, enum.IntEnum)
+    assert [d.name for d in ph.Durability] == ["NONE", "BUFFERED", "GROUP_SYNC", "SYNC"]
+    t = db.table("t").family("f").create()
+    t.put(b"r", "f", b"q", b"v", durability=3)
+    with pytest.raises(ValueError):
+        t.put(b"r", "f", b"q", b"v", durability=7)
+    with pytest.raises(TypeError):
+        t.put(b"r", "f", b"q", b"v", durability=True)
 
 
 def test_conditional_commits(db):

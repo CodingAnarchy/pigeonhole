@@ -4,11 +4,12 @@ The Python API's snapshot (ICR 0102): `mypy.stubtest` checks these stubs against
 module in CI.
 """
 
+import enum
 from collections.abc import Callable, Iterator
 from datetime import timedelta
 from os import PathLike
 from types import TracebackType
-from typing import Any, ClassVar, Literal, TypeVar, final
+from typing import Literal, TypeVar, final
 
 __version__: str
 
@@ -20,15 +21,13 @@ Seconds = timedelta | int | float
 
 _T = TypeVar("_T")
 
-@final
-class Durability:
+class Durability(enum.IntEnum):
     """How durable a commit is before it returns."""
 
-    NONE: ClassVar[Durability]
-    BUFFERED: ClassVar[Durability]
-    GROUP_SYNC: ClassVar[Durability]
-    SYNC: ClassVar[Durability]
-    def __int__(self) -> int: ...
+    NONE = 0
+    BUFFERED = 1
+    GROUP_SYNC = 2
+    SYNC = 3
 
 @final
 class Family:
@@ -76,6 +75,39 @@ class Family:
     ) -> Family: ...
 
 @final
+class FamilyInfo:
+    """A family's stored options (`Table.family_info`)."""
+
+    @property
+    def name(self) -> str: ...
+    @property
+    def counter(self) -> bool: ...
+    @property
+    def aggregation(self) -> str | None: ...
+    @property
+    def max_versions(self) -> int: ...
+    @property
+    def ttl(self) -> timedelta | None: ...
+    @property
+    def bloom_bits(self) -> int: ...
+    @property
+    def blob_threshold(self) -> int: ...
+    @property
+    def block_size(self) -> int: ...
+    @property
+    def compression(self) -> Literal["lz4", "zstd", "none", "unknown"]: ...
+    @property
+    def zstd_level(self) -> int | None: ...
+    @property
+    def merge_operator(self) -> str | None: ...
+    @property
+    def cache_priority(self) -> Literal["low", "normal", "high", "unknown"]: ...
+    @property
+    def compaction(self) -> Literal["leveled", "tiered", "fifo-by-time", "unknown"]: ...
+    @property
+    def family(self) -> Family: ...
+
+@final
 class Condition:
     """A condition for `Mutation.commit_if`."""
 
@@ -95,7 +127,9 @@ class Cell:
     @property
     def ts(self) -> int: ...
     @property
-    def typed(self) -> bytes | int | float | None: ...
+    def typed(self) -> bytes | int | float | None:
+        """The value as bytes, int or float; None for a value type this binding doesn't
+        know yet (vector cells, until bindings PR 2: read them with `value`)."""
     def as_int(self) -> int | None: ...
     def as_u64(self) -> int | None: ...
     def as_float(self) -> float | None: ...
@@ -164,7 +198,7 @@ class Table:
     @property
     def name(self) -> str: ...
     def families(self) -> list[str]: ...
-    def family_info(self, family: str) -> dict[str, Any] | None: ...
+    def family_info(self, family: str) -> FamilyInfo | None: ...
     def get(
         self, row: Key, family: str, qualifier: Key, *, snapshot: Snapshot | None = None
     ) -> Cell | None: ...

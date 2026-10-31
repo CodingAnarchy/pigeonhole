@@ -33,10 +33,11 @@ A new workspace crate, `crates/python` (`pigeonhole-python`, `publish = false` o
   - `Cell`: `value`, `ts`, `typed`, `as_int`, `as_u64`, `as_float`, and the aggregate readers `hll_estimate`, `sum_f64`, `mean_var`, `histogram_counts`, `quantile` and `bloom_contains`.
   - `Row`: `key`, `get`, `cells`, `len`; iterating gives `(family, qualifier, cell)`.
   - `Snapshot`: `seqno`, `release`; also a context manager.
+  - `FamilyInfo` (`Table.family_info`), with typed read-only properties that mirror Rust's `FamilyInfo`: `name`, `counter`, `aggregation`, `max_versions`, `ttl` (a `timedelta`), `bloom_bits`, `blob_threshold`, `block_size`, `compression`, `zstd_level`, `merge_operator`, `cache_priority`, `compaction` and `family` (a `Family`). It is a class rather than a dict, so the stubs pin it (cli692's S1).
 - **Options:**
   - `Family(*, max_versions, ttl, bloom_bits, block_size, blob_threshold, compression, zstd_level)`, `Family.counter`, `Family.aggregate(kind, ...)`;
   - `Condition.absent`, `.exists` and `.equals`;
-  - `Durability.NONE`, `BUFFERED`, `GROUP_SYNC` and `SYNC`.
+  - `Durability`, an `enum.IntEnum` defined in the package: `NONE`, `BUFFERED`, `GROUP_SYNC`, `SYNC` (0–3). An int with one of those values is accepted too.
 - **Errors:** `Error`, plus one subclass per `ErrorCode`, named as the code. Each carries `code` (the name) and `code_num`.
 
 ## Why
@@ -46,5 +47,11 @@ D307 (#696): most agent frameworks and AI tooling are Python. The owner decided 
 This is new API, so there are no callers. No Rust interface changes: the crate uses `pigeonhole`'s public API only.
 
 ## Later PRs
-- **PR 2:** graph reads (`keys`, `traverse`) and wide-row walks; the per-op overhead benchmark; the Python guide page. Each addition lands in the stubs.
+- **PR 2** (#1261):
+  - vectors: `Family.vector`, `put_vector` from a buffer or a list, `Cell.as_vector`, and `nearest` on scans and `keys()` returning a typed `Neighbour`. Until then, `Cell.typed` is `None` for vector cells;
+  - `ScanIter.close()` and context-manager support;
+  - the remaining 1.1 reads: `keys()` multi-get, `traverse`, and row walking (`cells`/`pages`/`RowPosition`);
+  - the per-op overhead benchmark, and the Python guide page.
+
+  Each addition lands in the stubs.
 - **PR 3:** the PyPI publish workflow, after the owner's go.

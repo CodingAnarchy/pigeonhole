@@ -7,28 +7,41 @@ use std::sync::Mutex;
 use pigeonhole::{Aggregation, Compression};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
 
 use crate::convert::{self, Val};
 use crate::error::{OrPy, with_code};
 use crate::read::{Cell, Row, ScanIter, Snapshot, snapshot_arg};
 
-/// How durable a commit is before it returns (see the Durability guide).
-#[pyclass(module = "pigeonhole", frozen, eq, eq_int, from_py_object)]
+/// How durable a commit is before it returns: `pigeonhole.Durability`, an `enum.IntEnum`
+/// defined in the Python package (`NONE` 0, `BUFFERED` 1, `GROUP_SYNC` 2, `SYNC` 3). Any int
+/// with one of those values is accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Durability {
-    /// In memory only: lost on a crash.
-    #[pyo3(name = "NONE")]
     None_,
-    /// Written to the OS: survives a process crash.
-    #[pyo3(name = "BUFFERED")]
     Buffered,
-    /// Synced with other commits in a group: survives power loss (the default).
-    #[pyo3(name = "GROUP_SYNC")]
     GroupSync,
-    /// Synced by this commit alone.
-    #[pyo3(name = "SYNC")]
     Sync,
+}
+
+impl<'a, 'py> FromPyObject<'a, 'py> for Durability {
+    type Error = PyErr;
+
+    fn extract(ob: pyo3::Borrowed<'a, 'py, PyAny>) -> PyResult<Self> {
+        if ob.is_instance_of::<pyo3::types::PyBool>() {
+            return Err(PyTypeError::new_err(
+                "durability is a pigeonhole.Durability",
+            ));
+        }
+        match ob.extract::<i64>() {
+            Ok(0) => Ok(Self::None_),
+            Ok(1) => Ok(Self::Buffered),
+            Ok(2) => Ok(Self::GroupSync),
+            Ok(3) => Ok(Self::Sync),
+            _ => Err(PyValueError::new_err(
+                "durability is a pigeonhole.Durability (NONE, BUFFERED, GROUP_SYNC or SYNC)",
+            )),
+        }
+    }
 }
 
 impl From<Durability> for pigeonhole::Durability {
@@ -212,6 +225,126 @@ fn options(
     Ok(Family(f))
 }
 
+/// A family's stored options (`Table.family_info`).
+#[pyclass(module = "pigeonhole", frozen)]
+pub(crate) struct FamilyInfo(pigeonhole::FamilyInfo);
+
+#[pymethods]
+impl FamilyInfo {
+    /// The family's name.
+    #[getter]
+    fn name(&self) -> String {
+        self.0.name.clone()
+    }
+
+    /// Whether it is a counter (`sum`) family, or a standard family naming the built-in
+    /// `i64` add operator.
+    #[getter]
+    fn counter(&self) -> bool {
+        self.0.counter
+    }
+
+    /// The aggregation kind (`"sum"`, `"min"`, ..., the names `Family.aggregate` takes), or
+    /// `None` for a plain family.
+    #[getter]
+    fn aggregation(&self) -> Option<&'static str> {
+        self.0.aggregation.as_ref().map(aggregation_name)
+    }
+
+    /// Versions kept per column (0 keeps all).
+    #[getter]
+    fn max_versions(&self) -> u32 {
+        self.0.max_versions
+    }
+
+    /// How long cells live after their timestamp, or `None`.
+    #[getter]
+    fn ttl(&self) -> Option<std::time::Duration> {
+        self.0.ttl
+    }
+
+    /// Bloom filter bits per key.
+    #[getter]
+    fn bloom_bits(&self) -> u8 {
+        self.0.bloom_bits
+    }
+
+    /// Values longer than this are stored in blob files.
+    #[getter]
+    fn blob_threshold(&self) -> u32 {
+        self.0.blob_threshold
+    }
+
+    /// The data block size.
+    #[getter]
+    fn block_size(&self) -> u32 {
+        self.0.block_size
+    }
+
+    /// `"lz4"`, `"zstd"` or `"none"`.
+    #[getter]
+    fn compression(&self) -> &'static str {
+        match self.0.compression {
+            Compression::None => "none",
+            Compression::Zstd(_) => "zstd",
+            Compression::Lz4 => "lz4",
+            _ => "unknown",
+        }
+    }
+
+    /// The zstd level, with `compression == "zstd"`.
+    #[getter]
+    fn zstd_level(&self) -> Option<i8> {
+        match self.0.compression {
+            Compression::Zstd(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    /// The merge operator a standard family names, or `None`.
+    #[getter]
+    fn merge_operator(&self) -> Option<String> {
+        self.0.merge_operator.clone()
+    }
+
+    /// `"low"`, `"normal"` or `"high"`: the family's block cache priority.
+    #[getter]
+    fn cache_priority(&self) -> &'static str {
+        match self.0.cache_priority {
+            pigeonhole::Priority::Low => "low",
+            pigeonhole::Priority::Normal => "normal",
+            pigeonhole::Priority::High => "high",
+            _ => "unknown",
+        }
+    }
+
+    /// `"leveled"`, `"tiered"` or `"fifo-by-time"`.
+    #[getter]
+    fn compaction(&self) -> &'static str {
+        match self.0.compaction {
+            pigeonhole::Compaction::Leveled => "leveled",
+            pigeonhole::Compaction::Tiered => "tiered",
+            pigeonhole::Compaction::FifoByTime => "fifo-by-time",
+            _ => "unknown",
+        }
+    }
+
+    /// The family's options as a `Family`, to create the same family elsewhere.
+    #[getter]
+    fn family(&self) -> Family {
+        Family(self.0.family.clone())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "FamilyInfo(name={:?}, aggregation={:?}, max_versions={})",
+            self.0.name,
+            self.aggregation(),
+            self.0.max_versions
+        )
+    }
+}
+
 /// A condition a row must meet for `Mutation.commit_if` to apply.
 #[pyclass(module = "pigeonhole", frozen)]
 #[derive(Clone)]
@@ -366,23 +499,9 @@ impl Table {
             .collect())
     }
 
-    /// A family's stored options as a dict, or `None` for no such family.
-    fn family_info<'py>(
-        &self,
-        py: Python<'py>,
-        family: &str,
-    ) -> PyResult<Option<Bound<'py, PyDict>>> {
-        let Some(f) = either!(&self.0, |t| t.family_info(family)) else {
-            return Ok(None);
-        };
-        let d = PyDict::new(py);
-        d.set_item("name", &f.name)?;
-        d.set_item("counter", f.counter)?;
-        d.set_item("aggregation", f.aggregation.as_ref().map(aggregation_name))?;
-        d.set_item("max_versions", f.max_versions)?;
-        d.set_item("ttl_micros", f.ttl.map(|t| t.as_micros() as u64))?;
-        d.set_item("merge_operator", f.merge_operator.clone())?;
-        Ok(Some(d))
+    /// A family's stored options, or `None` for no such family.
+    fn family_info(&self, family: &str) -> Option<FamilyInfo> {
+        either!(&self.0, |t| t.family_info(family)).map(FamilyInfo)
     }
 
     /// The newest version of one cell, or `None`.

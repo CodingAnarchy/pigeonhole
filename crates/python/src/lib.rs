@@ -28,7 +28,7 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<table::TableBuilder>()?;
     m.add_class::<table::Family>()?;
     m.add_class::<table::Condition>()?;
-    m.add_class::<table::Durability>()?;
+    m.add_class::<table::FamilyInfo>()?;
     m.add_class::<table::Mutation>()?;
     m.add_class::<read::Cell>()?;
     m.add_class::<read::Row>()?;
