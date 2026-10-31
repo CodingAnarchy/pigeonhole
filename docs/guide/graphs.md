@@ -108,7 +108,7 @@ assert_eq!((first, second), (1_000, 1_000));
 ```
 
 ## Frontiers: many nodes at once
-`Table::keys(&KeySet)` reads the rows of many keys in key order, under one snapshot. Each tablet's read is set up once for all of its keys, and moves forward from key to key, so a frontier of sorted ids costs well under a row read per key. `KeySet::from_unsorted` sorts and deduplicates. Rows are lent one at a time, with each key's index in the set, and keys without a row are skipped. `next_async` and `into_owned_stream` are the async forms ([Async](async.md)).
+`Table::keys(&KeySet)` reads the rows of many keys in key order, under one snapshot. Each tablet's read is set up once for all of its keys, and moves forward from key to key, so a frontier of sorted ids costs well under a row read per key. `KeySet::from_unsorted` sorts and deduplicates. Rows are lent one at a time, with each key's index in the set, and keys with no cell the selection keeps are skipped. `next_async` and `into_owned_stream` are the async forms ([Async](async.md)).
 
 ```rust
 # use pigeonhole::*;
@@ -135,12 +135,12 @@ assert_eq!(next.len(), 3);
 |---|---|
 | `family("out")` | The edge family (required; exactly one). |
 | `hops(k)` | Hops to take, 1 to 64 (default 1). |
-| `per_node_limit(m)` | At most the first `m` edges of each node per hop, in qualifier order; the rest of the row is skipped with a seek. Edges to visited nodes count. |
+| `per_node_limit(m)` | At most the first `m` edges of each node per hop, in qualifier order; the rest of the row is skipped with a seek. Edges to visited nodes count; edges the selection drops (a value filter's misses, say) don't. |
 | `hop_limit(n)` | At most `n` new nodes per hop: the ones whose first edge comes first, by source row and then qualifier. Deterministic, not a sample. |
 | `max_nodes(t)` | At most `t` nodes visited in all, the seeds included (default 10,000,000). |
-| `parents(true)` | Each node's parent: the index, in the previous hop's nodes, of the source of the first edge that reached it. |
+| `parents(true)` | Each node's parent: the index, in the previous hop's nodes (or the seeds, for hop 1), of the source of the first edge that reached it. |
 | `parallel(n)` | Read each hop on up to `n` threads when its frontier spans several tablets with at least 1,000 keys per thread. |
-| `qualifier_prefix`, `qualifier_range`, `time_range`, `value_filter`, `snapshot` | The edges' selection, as for a row read. |
+| `qualifier_prefix`, `qualifier_range`, `qualifier_bounds`, `time_range`, `value_filter`, `snapshot` | The edges' selection, as for a row read. |
 
 `run()` returns the hops in order. Each hop's `nodes()` is a sorted `KeySet`, ready for `keys()` to read the nodes' properties. A traversal ends early when a hop finds no new node, or when `max_nodes` is reached (`stats().cut_by_max_nodes`).
 
@@ -175,7 +175,7 @@ assert_eq!(path, [b"n:a".to_vec(), b"n:b".to_vec(), b"n:d".to_vec(), b"n:e".to_v
 # Ok::<(), pigeonhole::Error>(())
 ```
 
-**`run_async()`** is the async form. Each hop's rows are positioned from the block cache, and the blocks they and the next rows need are fetched asynchronously, so the task never waits on the device for a block it could predict. A poll yields after 4,096 edges, so a hub never holds an executor thread for long, but cap hubs with `per_node_limit` all the same. Its result equals `run()`'s. It reads each hop on the polling task and never fans out.
+**`run_async()`** is the async form. Each hop's rows are positioned from the block cache, and the blocks they and the next rows need are fetched asynchronously. A row's edges past its first block are read synchronously if they aren't cached, so cap hubs with `per_node_limit`. A poll also yields after 4,096 edges, so a hub never holds an executor thread for long. It gives the same hops and parents as `run()`, reads each hop on the polling task, and never fans out.
 
 ```rust
 # use pigeonhole::*;
