@@ -183,7 +183,8 @@ fn a_put_sets_the_bucket_and_later_inputs_fold_onto_it() {
 fn a_lone_f64_put_at_a_bucket_is_stored_as_its_state() {
     // An `f64` put alone in its commit, at an explicit timestamp, still becomes the state of
     // its one input before the WAL, as at the fixed timestamp: a read, a flush and a reopen
-    // all see a state, never the raw `f64` (found with D298 PR 4's bloom inputs).
+    // all see a state, never the raw `f64` (found with D298 PR 4's bloom inputs). The
+    // histogram and quantile kinds: `bucket_aggregates.rs`.
     let vfs = SimVfs::new(5);
     let r = Rig::open(&vfs, 128);
     r.commit(|wb| {
@@ -196,7 +197,7 @@ fn a_lone_f64_put_at_a_bucket_is_stored_as_its_state() {
             .unwrap();
     })
     .unwrap();
-    let at = |f: FamilyId| {
+    let at = |r: &Rig, f: FamilyId| {
         let snap = r.db.snapshot().unwrap();
         let c =
             r.db.get(&snap, r.t, f, b"b", b"q")
@@ -208,10 +209,17 @@ fn a_lone_f64_put_at_a_bucket_is_stored_as_its_state() {
             v => panic!("not a state: {v:?}"),
         }
     };
-    assert_eq!(at(r.sum), sum_of(&[2.5]));
-    assert_eq!(at(r.mv), mean_var_of(&[2.5]));
+    assert_eq!(at(&r, r.sum), sum_of(&[2.5]));
+    assert_eq!(at(&r, r.mv), mean_var_of(&[2.5]));
     r.db.flush().unwrap();
-    assert_eq!(at(r.sum), sum_of(&[2.5]));
+    assert_eq!(at(&r, r.sum), sum_of(&[2.5]));
+    r.db.close().unwrap();
+    let r = Rig {
+        db: Engine::open(Path::new(DB), options(&vfs, 128)).unwrap(),
+        ..r
+    };
+    assert_eq!(at(&r, r.sum), sum_of(&[2.5]));
+    assert_eq!(at(&r, r.mv), mean_var_of(&[2.5]));
     r.db.close().unwrap();
 }
 

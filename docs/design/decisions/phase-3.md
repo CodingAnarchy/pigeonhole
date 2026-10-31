@@ -3399,13 +3399,14 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Form:** sparse sorted bit indexes while `4·n < m/8`, else a dense bitmap.
   - **Positions:** Kirsch–Mitzenmacher, `(h1 + i·h2) mod m`.
   - **Merge:** OR. A lookup never gives a false negative.
+  - **Cost** (perf287's review): an element's state is built from its `k` positions, never a bitmap. A fold works in place, as HLL's does: a dense accumulator takes each operand's bits (a sparse operand's bits set directly, a dense one OR'd byte-wise) with no allocation. A sparse accumulator merges with a sparse operand from the back of its own list, and turns dense once, when the union reaches `4·n ≥ m/8`. An operand is checked in full; the accumulator only by its header (and its list while sparse), with one full check per fold in `finish`. So a fold costs the size of its operands, not `m` per operand, and a 2^24-bit family's inputs never build its 2 MiB bitmap until the filter is that dense.
 - **Elements, i64 or bytes:**
   - Bytes elements hash `0x01 ‖ bytes` (D294's reserved domain tag; `hll::hash_bytes`), so they never collide with an `i64` element's untagged 8 bytes. An HLL family takes bytes elements too, through the same hash.
   - Inputs become their one-element state before the WAL, an HLL sketch or bloom filter, as HLL's `i64` inputs already did. So the operators only fold states.
 - **The commit-preparation gate** (a bug in PRs 2–3, fixed here):
   - **Before:** `prepare_counter_writes` ran only for fixed-timestamp writes, several aggregate writes, or HLL inputs. A lone `put_f64_at` (explicit timestamp, alone in its commit) into a SumF64, MeanVar, Histogram or Quantiles family was stored as its raw `F64` and read back as one. A lone bloom input at a bucket would have reached the WAL unconverted.
   - **Now:** the gate runs for any write that must be converted.
-  - **Coverage:** the model puts states, and the earlier tests used the fixed timestamp, so neither caught it. The bloom model checks did. A regression test (`it/exact_aggregates.rs`) fails without the fix. Unreleased, so no release was affected.
+  - **Coverage:** the model puts states, and the earlier tests used the fixed timestamp, so neither caught it. The bloom model checks did. Regression tests for all four kinds (`it/exact_aggregates.rs`, `it/bucket_aggregates.rs`), through a flush and a reopen, fail without the fix. Unreleased, so no release was affected.
 - **`FamilyKind::values_stay_inline()`** (§ "Separation keys on its own predicate"): the explicit list, Bloom included until PR 5. `separation_threshold()` and commit-time separation key on it.
   - A dense filter of 2^21 bits or more is larger than one WAL record, so a put of one whole (`phdb load`) is refused as too large until PR 5's separated bases. Inputs are small one-element filters and fold at read and compaction, so they're unaffected.
 - **API** (ICR 0096):
@@ -3417,10 +3418,11 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Tests (PR 4).**
 - **Format:**
   - no false negatives, and a false-positive rate within half of `(1 − e^(−kn/m))^k`;
-  - any grouping of merges gives the same bytes, through sparse to dense;
+  - any grouping of merges gives the same bytes, through sparse to dense, and those of an independent encoder written from FORMAT §3.6;
   - idempotence;
-  - bytes and `i64` elements hash apart;
-  - malformed states and parameters.
+  - bytes and `i64` elements hash apart, and `hash_bytes` equals xxh3 over the tagged bytes on both sides of its 256-byte stack buffer, allocating only past it;
+  - malformed states and parameters, including a malformed accumulator;
+  - **cost:** 1,000 one-element operands fold into a 2^24-bit filter in under 256 KiB of allocation (the bitmap is 2 MiB), and folding elements and a dense operand into a dense filter allocates nothing.
 - **Engine (`it/bloom_aggregates.rs`):**
   - `i64` and bytes elements fold through flushes, compactions and checkpoints, compared with the format's states;
   - a dense filter past a blob threshold of 8 stays inline;
@@ -3428,9 +3430,10 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - puts of the family's own filter, with others refused;
   - parameter checks;
   - the operator bound to its kind;
-  - the gate fix's regression test, in `it/exact_aggregates.rs`.
+  - the gate fix's regression tests, in `it/exact_aggregates.rs` and `it/bucket_aggregates.rs`.
 - **Model checks:** `ModelAggregation::Bloom` is a state kind with fixed parameters (`m = 2^10`, `k = 3`, so filters turn dense). Its oracle (`pigeonhole_sim::bloom_state`) computes positions and encodes apart from the format crate, and a test checks that the two agree. `scalar_counters` trades `fsum` for `bloom`.
   - **Mutation:** a wrong `h2` fails 30 of the 33 engine `scalar_counters` tests.
+  - **Not modeled:** the model's bloom families take `i64` elements only; bytes elements are covered by the engine, API and phdb tests. PR 5 adds bytes elements to the model.
 - **API, phdb and corpus:** a `pigeonhole` API test, a phdb shell test, and the help snapshot. The corpus gains `seen_b` (`i64` and bytes elements) and bytes elements in `users`.
 
 <a id="d299"></a>

@@ -33,6 +33,7 @@
 //! assert!((0..20).all(|v| bloom::contains(&s, pigeonhole_format::hll::hash_i64(v)).unwrap()));
 //! ```
 
+use std::cmp::Ordering;
 use std::fmt;
 
 use crate::kind_params;
@@ -138,13 +139,24 @@ fn positions(h: u64, log2_bits: u8, hashes: u8) -> impl Iterator<Item = u32> {
     (0..u64::from(hashes)).map(move |i| (h1.wrapping_add(i.wrapping_mul(h2)) & mask) as u32)
 }
 
-/// A decoded filter: its parameters and set bits.
-enum Bits {
-    Sparse(Vec<u32>),
-    Dense(Vec<u8>),
+/// A state's body: the sparse list's bytes, or the dense bitmap.
+enum View<'a> {
+    Sparse(&'a [u8]),
+    Dense(&'a [u8]),
 }
 
-fn decode(s: &[u8], params: Option<BloomParams>) -> Result<(BloomParams, Bits)> {
+/// The `i`th bit of a sparse body.
+fn sparse_at(body: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(body[4 * i..4 * i + 4].try_into().expect("4 bytes"))
+}
+
+fn set_bit(bitmap: &mut [u8], j: u32) {
+    bitmap[j as usize / 8] |= 1 << (j % 8);
+}
+
+/// The header and the body's shape (its length for the representation): O(1). The bits
+/// themselves are not looked at.
+fn header(s: &[u8], params: Option<BloomParams>) -> Result<(BloomParams, View<'_>)> {
     if s.len() < HEADER || s[0] != ENCODING {
         return Err(BloomError("not a bloom state"));
     }
@@ -158,127 +170,247 @@ fn decode(s: &[u8], params: Option<BloomParams>) -> Result<(BloomParams, Bits)> 
     }
     let m = p.bits() as usize;
     let body = &s[HEADER..];
-    let bits = match s[3] {
-        0 => {
-            if body.is_empty() || !body.len().is_multiple_of(4) || body.len() >= m / 8 {
-                return Err(BloomError("bloom state not in canonical form"));
-            }
-            let set: Vec<u32> = body
-                .chunks(4)
-                .map(|c| u32::from_le_bytes(c.try_into().expect("4 bytes")))
-                .collect();
-            if set.windows(2).any(|w| w[0] >= w[1]) || set.last().is_some_and(|&b| b as usize >= m)
+    match s[3] {
+        0 if !body.is_empty() && body.len().is_multiple_of(4) && body.len() < m / 8 => {
+            Ok((p, View::Sparse(body)))
+        }
+        1 if body.len() == m / 8 => Ok((p, View::Dense(body))),
+        0 | 1 => Err(BloomError("bloom state not in canonical form")),
+        _ => Err(BloomError("unknown bloom representation")),
+    }
+}
+
+/// [`header`], then the bits: sparse ones strictly increasing and in range, a dense bitmap
+/// with enough bits set to be canonical. O(the state's size).
+fn view(s: &[u8], params: Option<BloomParams>) -> Result<(BloomParams, View<'_>)> {
+    let (p, v) = header(s, params)?;
+    match v {
+        View::Sparse(b) => {
+            let n = b.len() / 4;
+            if (1..n).any(|i| sparse_at(b, i - 1) >= sparse_at(b, i))
+                || sparse_at(b, n - 1) >= p.bits()
             {
                 return Err(BloomError("bloom bits not increasing or out of range"));
             }
-            Bits::Sparse(set)
         }
-        1 => {
-            let n: u32 = body.iter().map(|b| b.count_ones()).sum();
-            if body.len() != m / 8 || 4 * (n as usize) < m / 8 {
+        View::Dense(b) => {
+            if 4 * set_bits(b) < b.len() {
                 return Err(BloomError("bloom state not in canonical form"));
             }
-            Bits::Dense(body.to_vec())
         }
-        _ => return Err(BloomError("unknown bloom representation")),
-    };
-    Ok((p, bits))
+    }
+    Ok((p, v))
 }
 
-/// Writes the canonical encoding of `bitmap` (a dense bitmap of `p`'s size).
-fn encode(out: &mut Vec<u8>, p: BloomParams, bitmap: &[u8]) {
-    out.clear();
+fn set_bits(bitmap: &[u8]) -> usize {
+    bitmap.iter().map(|b| b.count_ones() as usize).sum()
+}
+
+/// Writes the state of the sorted, distinct bits `set` (a new filter) to `out`.
+fn encode_new(out: &mut Vec<u8>, p: BloomParams, set: &[u32]) {
+    let m = p.bits() as usize;
     out.extend_from_slice(&[ENCODING, p.log2_bits, p.hashes]);
-    let n: usize = bitmap.iter().map(|b| b.count_ones() as usize).sum();
-    if 4 * n < bitmap.len() {
+    if 4 * set.len() < m / 8 {
         out.push(0);
-        for (i, byte) in bitmap.iter().enumerate() {
-            for bit in 0..8 {
-                if byte >> bit & 1 == 1 {
-                    out.extend_from_slice(&((8 * i + bit) as u32).to_le_bytes());
-                }
-            }
+        for &j in set {
+            out.extend_from_slice(&j.to_le_bytes());
         }
     } else {
         out.push(1);
-        out.extend_from_slice(bitmap);
-    }
-}
-
-fn bitmap(p: BloomParams, bits: &Bits) -> Vec<u8> {
-    match bits {
-        Bits::Dense(b) => b.clone(),
-        Bits::Sparse(set) => {
-            let mut b = vec![0u8; p.bits() as usize / 8];
-            for &j in set {
-                b[j as usize / 8] |= 1 << (j % 8);
-            }
-            b
+        let at = out.len();
+        out.resize(at + m / 8, 0);
+        for &j in set {
+            set_bit(&mut out[at..], j);
         }
     }
 }
 
-/// Starts or extends `acc` (a state, or empty for none yet) with the element of hash `h`.
-pub fn add(acc: &mut Vec<u8>, params: BloomParams, h: u64) -> Result<()> {
-    params.check()?;
-    let mut b = if acc.is_empty() {
-        vec![0u8; params.bits() as usize / 8]
-    } else {
-        let (_, bits) = decode(acc, Some(params))?;
-        bitmap(params, &bits)
-    };
-    for j in positions(h, params.log2_bits, params.hashes) {
-        b[j as usize / 8] |= 1 << (j % 8);
+/// The sorted, distinct positions of hash `h`, in `buf`.
+fn sorted_positions(buf: &mut [u32; 16], p: BloomParams, h: u64) -> &[u32] {
+    let k = usize::from(p.hashes);
+    for (slot, j) in buf.iter_mut().zip(positions(h, p.log2_bits, p.hashes)) {
+        *slot = j;
     }
-    encode(acc, params, &b);
+    let set = &mut buf[..k];
+    set.sort_unstable();
+    let mut n = 0;
+    for i in 0..k {
+        if n == 0 || set[i] != set[n - 1] {
+            set[n] = set[i];
+            n += 1;
+        }
+    }
+    &buf[..n]
+}
+
+/// ORs the bits of `other` (a checked body of `p`) into the state at `acc[start..]`, whose
+/// header was checked. A dense state is updated in place; a sparse one by an in-place merge
+/// from the back, or turned dense once the union is large enough. The sparse state's own bits
+/// are checked on the way (its union is walked anyway); a dense one's are not.
+fn or_into(acc: &mut Vec<u8>, start: usize, p: BloomParams, other: View<'_>) -> Result<()> {
+    let m = p.bits() as usize;
+    let base = start + HEADER;
+    if acc[start + 3] == 1 {
+        let bitmap = &mut acc[base..];
+        match other {
+            View::Sparse(b) => (0..b.len() / 4).for_each(|i| set_bit(bitmap, sparse_at(b, i))),
+            View::Dense(b) => bitmap.iter_mut().zip(b).for_each(|(x, y)| *x |= y),
+        }
+        return Ok(());
+    }
+    let n = (acc.len() - base) / 4;
+    let bad = || BloomError("bloom bits not increasing or out of range");
+    {
+        let a = &acc[base..];
+        if (1..n).any(|i| sparse_at(a, i - 1) >= sparse_at(a, i))
+            || sparse_at(a, n - 1) as usize >= m
+        {
+            return Err(bad());
+        }
+    }
+    let b = match other {
+        View::Dense(b) => {
+            let mut bitmap = b.to_vec();
+            (0..n).for_each(|i| set_bit(&mut bitmap, sparse_at(&acc[base..], i)));
+            acc.truncate(start + 3);
+            acc.push(1);
+            acc.extend_from_slice(&bitmap);
+            return Ok(());
+        }
+        View::Sparse(b) => b,
+    };
+    let j = b.len() / 4;
+    // The union's size, by a merge walk.
+    let (mut x, mut y, mut union) = (0, 0, 0);
+    while x < n || y < j {
+        if x == n {
+            y += 1;
+        } else if y == j {
+            x += 1;
+        } else {
+            match sparse_at(&acc[base..], x).cmp(&sparse_at(b, y)) {
+                Ordering::Less => x += 1,
+                Ordering::Greater => y += 1,
+                Ordering::Equal => (x, y) = (x + 1, y + 1),
+            }
+        }
+        union += 1;
+    }
+    if 4 * union >= m / 8 {
+        let mut bitmap = vec![0u8; m / 8];
+        (0..n).for_each(|i| set_bit(&mut bitmap, sparse_at(&acc[base..], i)));
+        (0..j).for_each(|i| set_bit(&mut bitmap, sparse_at(b, i)));
+        acc.truncate(start + 3);
+        acc.push(1);
+        acc.extend_from_slice(&bitmap);
+        return Ok(());
+    }
+    // Merge from the back into the grown list: each write lands at or past the read point.
+    acc.resize(base + 4 * union, 0);
+    let (mut x, mut y, mut w) = (n, j, union);
+    while y > 0 {
+        let by = sparse_at(b, y - 1);
+        let ax = (x > 0).then(|| sparse_at(&acc[base..], x - 1));
+        let v = match ax {
+            Some(a) if a > by => {
+                x -= 1;
+                a
+            }
+            Some(a) if a == by => {
+                (x, y) = (x - 1, y - 1);
+                a
+            }
+            _ => {
+                y -= 1;
+                by
+            }
+        };
+        w -= 1;
+        acc[base + 4 * w..base + 4 * w + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    debug_assert_eq!(w, x, "the rest of the list is in place");
     Ok(())
 }
 
-/// The one-element state of hash `h`, appended to `out` (after a tag byte, say).
+/// Starts or extends `acc` (a state, or empty for none yet) with the element of hash `h`.
+/// O(k) for a new or dense filter, O(the sparse list) otherwise.
+pub fn add(acc: &mut Vec<u8>, params: BloomParams, h: u64) -> Result<()> {
+    params.check()?;
+    let mut buf = [0u32; 16];
+    let set = sorted_positions(&mut buf, params, h);
+    if acc.is_empty() {
+        encode_new(acc, params, set);
+        return Ok(());
+    }
+    header(acc, Some(params))?;
+    let mut body = [0u8; 64];
+    for (i, &j) in set.iter().enumerate() {
+        body[4 * i..4 * i + 4].copy_from_slice(&j.to_le_bytes());
+    }
+    or_into(acc, 0, params, View::Sparse(&body[..4 * set.len()]))
+}
+
+/// The one-element state of hash `h`, appended to `out` (after a tag byte, say). O(k), unless
+/// `m` is so small that k bits make it dense.
 pub fn append_element(out: &mut Vec<u8>, params: BloomParams, h: u64) {
-    let mut s = Vec::new();
-    add(&mut s, params, h).expect("checked parameters");
-    out.extend_from_slice(&s);
+    debug_assert!(params.check().is_ok(), "checked parameters");
+    let mut buf = [0u32; 16];
+    encode_new(out, params, sorted_positions(&mut buf, params, h));
 }
 
 /// Merges the state `other` into `acc` (`acc` may be empty for none), both of `params`.
 pub fn merge(acc: &mut Vec<u8>, params: BloomParams, other: &[u8]) -> Result<()> {
-    let (_, o) = decode(other, Some(params))?;
-    let mut b = if acc.is_empty() {
-        vec![0u8; params.bits() as usize / 8]
-    } else {
-        let (_, bits) = decode(acc, Some(params))?;
-        bitmap(params, &bits)
-    };
-    for (x, y) in b.iter_mut().zip(bitmap(params, &o)) {
-        *x |= y;
+    if acc.is_empty() {
+        view(other, Some(params))?;
+        acc.extend_from_slice(other);
+        return Ok(());
     }
-    encode(acc, params, &b);
-    Ok(())
+    merge_at(acc, 0, params, other)
+}
+
+/// Merges the state `other` into the state at `acc[start..]`, both of `params`. `other` is
+/// checked in full; of the accumulator only its header and, while sparse, its list (a dense
+/// accumulator's bits are not re-read: [`validate`] it once, after a fold). O(the operand)
+/// once the accumulator is dense, with no allocation.
+pub fn merge_at(acc: &mut Vec<u8>, start: usize, params: BloomParams, other: &[u8]) -> Result<()> {
+    let (_, o) = view(other, Some(params))?;
+    header(&acc[start..], Some(params))?;
+    or_into(acc, start, params, o)
 }
 
 /// Checks a state against a family's parameters.
 pub fn validate(s: &[u8], params: BloomParams) -> Result<()> {
-    decode(s, Some(params)).map(|_| ())
+    view(s, Some(params)).map(|_| ())
 }
 
 /// Whether the element of hash `h` may be in the filter: `false` means certainly not. The
 /// state carries its own parameters.
 pub fn contains(s: &[u8], h: u64) -> Result<bool> {
-    let (p, bits) = decode(s, None)?;
-    let set = |j: u32| match &bits {
-        Bits::Sparse(v) => v.binary_search(&j).is_ok(),
-        Bits::Dense(b) => b[j as usize / 8] >> (j % 8) & 1 == 1,
+    let (p, v) = view(s, None)?;
+    let set = |j: u32| match v {
+        View::Sparse(b) => {
+            let (mut lo, mut hi) = (0, b.len() / 4);
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                match sparse_at(b, mid).cmp(&j) {
+                    Ordering::Less => lo = mid + 1,
+                    Ordering::Greater => hi = mid,
+                    Ordering::Equal => return true,
+                }
+            }
+            false
+        }
+        View::Dense(b) => b[j as usize / 8] >> (j % 8) & 1 == 1,
     };
     Ok(positions(h, p.log2_bits, p.hashes).all(set))
 }
 
 /// The fraction of bits set (the false-positive rate is about this to the power `k`).
 pub fn fill(s: &[u8]) -> Result<f64> {
-    let (p, bits) = decode(s, None)?;
-    let n = match &bits {
-        Bits::Sparse(v) => v.len() as u64,
-        Bits::Dense(b) => b.iter().map(|x| u64::from(x.count_ones())).sum(),
+    let (p, v) = view(s, None)?;
+    let n = match v {
+        View::Sparse(b) => b.len() / 4,
+        View::Dense(b) => set_bits(b),
     };
     Ok(n as f64 / f64::from(p.bits()))
 }

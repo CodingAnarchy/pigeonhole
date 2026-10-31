@@ -101,12 +101,16 @@ pub fn hash_i64(v: i64) -> u64 {
     crate::checksum::xxh3_64(&v.to_le_bytes())
 }
 
-/// The hash of a bytes element: xxh3-64 over [`BYTES_DOMAIN`] then the bytes (D298).
+/// The hash of a bytes element: xxh3-64 over [`BYTES_DOMAIN`] then the bytes (D298). An
+/// element under 256 bytes is hashed from a stack buffer; a longer one allocates once.
 pub fn hash_bytes(b: &[u8]) -> u64 {
-    let mut buf = Vec::with_capacity(1 + b.len());
-    buf.push(BYTES_DOMAIN);
-    buf.extend_from_slice(b);
-    crate::checksum::xxh3_64(&buf)
+    let mut buf = [0u8; 256];
+    if b.len() < buf.len() {
+        buf[0] = BYTES_DOMAIN;
+        buf[1..=b.len()].copy_from_slice(b);
+        return crate::checksum::xxh3_64(&buf[..=b.len()]);
+    }
+    crate::checksum::xxh3_64(&[&[BYTES_DOMAIN][..], b].concat())
 }
 
 /// The register and rank of an element hash `h`.

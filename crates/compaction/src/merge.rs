@@ -657,8 +657,10 @@ impl MergeOperator for Buckets {
 /// Bloom filter union (D298), the operator of a `FamilyKind::Bloom` family, built from the
 /// family's parameters (`kind_params`): operands and values are `ValueTag::Bytes` filter
 /// states (`pigeonhole_format::bloom`; an element becomes its one-element state before the
-/// WAL), and a merge is their bitwise OR in canonical form. A state of other parameters, a
-/// malformed one or another tag is a [`MergeError`].
+/// WAL), and a merge is their bitwise OR in canonical form. It folds in place: a dense
+/// accumulator takes each operand's bits without allocating, so a fold costs the size of its
+/// operands, not `m` per operand. A state of other parameters, a malformed one or another tag
+/// is a [`MergeError`].
 ///
 /// ```
 /// use pigeonhole_compaction::{BloomUnion, MergeOperator};
@@ -689,24 +691,17 @@ impl BloomUnion {
         BloomUnion { params }
     }
 
-    fn combine(&self, acc: &mut Vec<u8>, other: Option<&[u8]>) -> Result<(), MergeError> {
-        use pigeonhole_format::bloom;
-        let state = |v: &[u8]| -> Result<Vec<u8>, MergeError> {
-            match v {
-                [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => Ok(rest.to_vec()),
-                _ => Err(MergeError::new(Self::NAME, "operand is not a bloom state")),
-            }
-        };
-        let bad = |e: bloom::BloomError| MergeError::new(Self::NAME, e.0);
-        let mut s = state(acc)?;
-        bloom::validate(&s, self.params).map_err(bad)?;
-        if let Some(o) = other {
-            bloom::merge(&mut s, self.params, &state(o)?).map_err(bad)?;
+    fn state<'a>(v: &'a [u8], what: &str) -> Result<&'a [u8], MergeError> {
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => Ok(rest),
+            _ => Err(MergeError::new(Self::NAME, what)),
         }
-        acc.clear();
-        acc.push(ValueTag::Bytes as u8);
-        acc.extend_from_slice(&s);
-        Ok(())
+    }
+
+    fn merge_into(&self, acc: &mut Vec<u8>, other: &[u8]) -> Result<(), MergeError> {
+        Self::state(acc, "operand is not a bloom state")?;
+        pigeonhole_format::bloom::merge_at(acc, 1, self.params, other)
+            .map_err(|e| MergeError::new(Self::NAME, e.0))
     }
 }
 
@@ -716,11 +711,17 @@ impl MergeOperator for BloomUnion {
     }
 
     fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
-        self.combine(acc, Some(older))
+        self.merge_into(acc, Self::state(older, "operand is not a bloom state")?)
     }
 
     fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
-        self.combine(acc, base)
+        if let Some(base) = base {
+            self.merge_into(acc, Self::state(base, "base value is not a bloom state")?)?;
+        }
+        // The accumulator's own bits are checked here, once per fold.
+        let state = Self::state(acc, "operand is not a bloom state")?;
+        pigeonhole_format::bloom::validate(state, self.params)
+            .map_err(|e| MergeError::new(Self::NAME, e.0))
     }
 }
 

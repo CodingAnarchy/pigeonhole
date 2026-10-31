@@ -4881,7 +4881,7 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
                             pigeonhole_format::bloom::BloomParams::parse(&f.options.kind_params)
                                 .ok()
                         })
-                        .expect("a bloom family's parameters were checked at creation");
+                        .ok_or_else(|| Error::Corruption("a bloom family's parameters".into()))?;
                     pigeonhole_format::bloom::append_element(&mut v, params, h);
                 }
                 Some(v)
