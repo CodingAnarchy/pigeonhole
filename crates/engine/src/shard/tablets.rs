@@ -438,6 +438,29 @@ impl ShardState {
         self.arena.free_bytes().saturating_sub(self.reserved) > self.room_refused_free
     }
 
+    /// Tells the coordinators this shard refused for room that its room will not free: it
+    /// waits on a frozen clock with nothing in flight (#70). Their retries give up with
+    /// `Busy`, as a waiting single is refused (D301).
+    #[inline(never)]
+    pub(super) fn notify_room_gone(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.room_generation += 1;
+        let generation = self.room_generation;
+        for c in std::mem::take(&mut self.room_refused) {
+            trace!(
+                "shard {} room gone ({generation}): tells {}",
+                self.id.0, c.0
+            );
+            self.send(
+                c,
+                ShardMsg::Wake {
+                    from: self.id,
+                    reason: WakeReason::RoomGone { generation },
+                },
+                ctx,
+            );
+        }
+    }
+
     /// Tells the coordinators this shard refused for room that it has room again (D245).
     #[inline(never)]
     pub(super) fn notify_room_freed(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
@@ -895,6 +918,10 @@ impl ShardState {
             let seen = &mut self.room_freed[usize::from(from.0)];
             *seen = (*seen).max(generation);
         }
+        if let WakeReason::RoomGone { generation } = reason {
+            let seen = &mut self.room_gone[usize::from(from.0)];
+            *seen = (*seen).max(generation);
+        }
         if let WakeReason::Doomed { priority } = reason {
             self.on_doomed(priority, ctx);
             return;
@@ -926,10 +953,18 @@ impl ShardState {
             r.wait = None;
             if self.closing {
                 r.reply.notify(Err(Error::Closed));
+            } else if matches!(reason, WakeReason::RoomGone { .. }) {
+                // Its room will not free (D301).
+                trace!(
+                    "shard {} gives up on a room retry: room gone on {}",
+                    self.id.0, from.0
+                );
+                r.reply.notify(Err(Error::Busy));
             } else {
                 self.retry(r, ctx);
             }
         }
+        self.try_finish_close(ctx);
         self.arm_tablet_timer(ctx);
     }
 

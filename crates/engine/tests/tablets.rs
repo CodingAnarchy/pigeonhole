@@ -3687,18 +3687,20 @@ fn a_retry_waiting_for_room_fails_busy_at_the_write_stall_timeout() {
 }
 
 #[test]
-fn a_retry_waiting_for_room_ends_closed_at_close() {
-    // The same retry on the frozen clock, which never reaches a timeout: the close ends it
-    // with `Closed` (not committed).
+fn a_retry_waiting_for_room_fails_busy_on_a_frozen_clock_once_room_cannot_free() {
+    // D301 (#1205, seed 183): the same retry on the frozen clock, which never reaches the
+    // timeout. A snapshot pins the arena and nothing is in flight, so the participant's room
+    // cannot free: its room wait reaches #70's frozen-and-idle refusal, as a waiting single's
+    // does, and tells the coordinator, whose retry fails `Busy` (not committed). Before D301
+    // it waited until the close.
     let (mut db, mut pc, before) = prepare_against_a_full_arena(false, true);
-    for _ in 0..1_000 {
-        db.step();
-    }
-    assert!(poll_commit(&mut pc).is_none(), "resolved before the close");
+    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
+    assert!(matches!(r, Err(pigeonhole_engine::Error::Busy)), "{r:?}");
     assert!(db.engine.room_refusals() > before, "never refused for room");
     db.engine.close().unwrap();
-    let r = poll_until(&mut db, &mut pc, 100_000).expect("resolved");
-    assert!(matches!(r, Err(pigeonhole_engine::Error::Closed)), "{r:?}");
+    for _ in 0..8 {
+        db.step();
+    }
 }
 
 /// A cross-shard commit refused `Moved` while its tablet moves to a shard with a lower

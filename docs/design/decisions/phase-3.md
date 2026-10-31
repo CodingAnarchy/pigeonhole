@@ -3292,3 +3292,23 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Checks.**
   - `clock_loom`'s reader now takes two readings and requires the second to be at least the first. With the old step 1 restored, that check fails.
   - `shm/tests/protocol.rs`'s `a_reservation_never_moves_the_visible_seqno_back` places another shard's whole group at every step of a reservation, and keeps the old step 1's counterexample.
+
+<a id="d301"></a>
+## D301 — A shard whose room will not free tells the coordinators it refused for room, and their retries fail `Busy` (coordinator decision, 2026-10-31; engine; #1205; amends D245, applies #70)
+**Why.** The `pigeonhole` `counters` target hung at seed 183 (2 shards), with the client parked for a reply and both shards idle.
+- **What happened:** a cross-shard commit's PREPARE was refused for arena room (D245), because the harness's snapshots pinned the participant's memtables. Its coordinator's retry then waited for that participant's room wake.
+- **Why it never came, on the model's frozen clock:**
+  - No member waited in the participant's room wait (the PREPARE was refused, not queued). So nothing brought the wait back to #70's frozen-and-idle check, which refuses a waiting single with `Busy` there.
+  - The retry's own way out is D241's timeout, which a frozen clock never reaches.
+- **On a moving clock** the retry fails `Busy` at the write-stall timeout, as before.
+
+**Decided.**
+- **The participant looks again.** While a shard has coordinators it refused for room and its room wait's timers have given up on a frozen clock (`StallWait::stopped`), a kick finds the wait again even with no member pending.
+- **The same condition as for singles.** When it reaches #70's condition (refuse, or frozen and idle), it ends the wait and sends those coordinators `WakeReason::RoomGone` in a new room generation.
+- **The coordinator gives up.** A retry waiting on that shard's room from an earlier generation fails `Busy`, whether it is queued (`on_wake`) or still in its abort round (`room_gone`, checked as `room_freed` is), and is not committed. The caller may drop what pins the arena and commit again, as the model does after a `Busy` single.
+- **Moving clocks are unchanged:** `stopped` is false there, so nothing new runs.
+
+**Checks.**
+- `tablets`' `a_retry_waiting_for_room_fails_busy_on_a_frozen_clock_once_room_cannot_free` replaces `a_retry_waiting_for_room_ends_closed_at_close`, which recorded the old wait until the close.
+- `RetryWait::woken_by`'s unit test covers `RoomGone`.
+- Seed 183 of `counters` passes.
