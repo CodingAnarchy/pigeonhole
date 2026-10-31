@@ -97,7 +97,8 @@ pub struct TraverseStats {
     pub edges: u64,
     /// Hops that `hop_limit` or `max_nodes` cut short.
     pub hops_cut: u32,
-    /// Whether `max_nodes` cut the traversal short.
+    /// Whether `max_nodes` was reached with hops left to take: a hop cut short by it, or the
+    /// remaining hops skipped (they may have found nothing new).
     pub cut_by_max_nodes: bool,
     /// The most threads a hop used (1 when every hop ran on the caller's thread).
     pub threads: u64,
@@ -290,7 +291,7 @@ impl Reducer for DedupeLimit {
 pub(crate) fn traverse(
     snapshot: &Snapshot,
     table: TableId,
-    seeds: &KeySet,
+    seeds: Arc<KeySet>,
     spec: &TraverseSpec,
     ctx: (Timestamp, bool, &Arc<crate::shard::Shared>),
 ) -> Result<Traversal> {
@@ -316,8 +317,13 @@ pub(crate) fn traverse(
     read.versions = 1;
     read.columns_per_row = 0;
     let mut visited: Arc<HashSet<Vec<u8>>> = Arc::new(seeds.iter().map(<[u8]>::to_vec).collect());
-    let mut frontier = Arc::new(seeds.clone());
+    let mut frontier = seeds;
     for _ in 0..spec.hops {
+        // Between hops, as a multi-get between rows (D304 §2.5): nothing is read after a
+        // fork (#901) or once the snapshot is no longer current (a close or a recovery onto
+        // a newer engine, D265, #826). The key cursors check it per key as well.
+        snapshot.check_process()?;
+        snapshot.check_current()?;
         let room = spec.max_nodes.saturating_sub(visited.len() as u64);
         if room == 0 {
             out.stats.cut_by_max_nodes = true;

@@ -13,7 +13,7 @@
   - `Hop` (`#[non_exhaustive]`): `nodes(&self) -> &KeySet` (sorted), `parents(&self) -> Option<&[u32]>` (each node's source, as an index in the previous hop's nodes or the seeds).
   - `TraverseStats` (`#[non_exhaustive]`, `Copy`): `rows`, `edges`, `hops_cut` (by `hop_limit` or `max_nodes`), `cut_by_max_nodes`.
 - **Internal crates** (no promise):
-  - **pigeonhole-engine:** `Engine::traverse(&Snapshot, TableId, &KeySet, &TraverseSpec) -> Result<Traversal>`; `TraverseSpec` (`new(family)`, with `hops`, `per_node_limit`, `hop_limit`, `max_nodes`, `read`, `parallelism`, `parallel_floor`), `Traversal`, `Hop`, `TraverseStats` (also `threads`), and the constants `MAX_HOPS`, `DEFAULT_MAX_NODES` and `TRAVERSE_PARALLEL_FLOOR`.
+  - **pigeonhole-engine:** `Engine::traverse(&Snapshot, TableId, Arc<KeySet>, &TraverseSpec) -> Result<Traversal>`; `TraverseSpec` (`new(family)`, with `hops`, `per_node_limit`, `hop_limit`, `max_nodes`, `read`, `parallelism`, `parallel_floor`), `Traversal`, `Hop`, `TraverseStats` (also `threads`), and the constants `MAX_HOPS`, `DEFAULT_MAX_NODES` and `TRAVERSE_PARALLEL_FLOOR`.
 
 D304 rev 1 listed two more counts. **Not added:**
 - **Unusable destinations:** every qualifier is a valid row key, since both are limited to 64 KiB (`MAX_KEY_PART`).

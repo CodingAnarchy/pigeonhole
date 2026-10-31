@@ -882,7 +882,7 @@ fn traverse_hops(
 }
 
 /// D304 §2.1 over the model: per hop, the frontier's rows in key order and each row's newest
-/// versions in qualifier order, the first `per_node` of them, each destination not visited
+/// versions in qualifier order, the first `per_node` of them (0: all), each destination not visited
 /// before kept once with its first source, at most `per_hop` (0: all).
 fn model_traversal(
     model: &pigeonhole_sim::Model,
@@ -901,7 +901,12 @@ fn model_traversal(
         let mut kept: Vec<(Vec<u8>, u32)> = Vec::new();
         'rows: for (i, k) in frontier.iter().enumerate() {
             let cells = model.try_read_row(table, k, &[family], 1, ms, now)?;
-            for c in cells.iter().take(per_node as usize) {
+            let cap = if per_node == 0 {
+                usize::MAX
+            } else {
+                per_node as usize
+            };
+            for c in cells.iter().take(cap) {
                 if visited.contains(&c.qualifier) || kept.iter().any(|(d, _)| *d == c.qualifier) {
                     continue;
                 }
@@ -2475,9 +2480,10 @@ impl Run {
                     }
                 }
                 // A two-hop traversal (D304) from the same keys over the get's family, with
-                // limits taken from the model's seqno (not the RNG): the hops as a BFS over
-                // the model's rows gives them.
-                let (m, n) = (1 + (ms % 3) as u32, ms % 4);
+                // limits taken from the model's seqno (not the RNG; 0 is no limit): the hops
+                // as a BFS over the model's rows gives them. The workload's qualifiers never
+                // name rows, so this checks hop 1; #1232 adds a graph-shaped table.
+                let (m, n) = ((ms % 4) as u32, (ms / 4) % 4);
                 let got = traverse_hops(t, &keys, &family, m, n, snap.as_ref().map(|(s, _)| s));
                 let want =
                     model_traversal(&self.model, TABLES[ti], &keys, &family, (m, n), ms, now);

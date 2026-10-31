@@ -50,16 +50,16 @@ fn a_fanned_out_traversal_equals_the_sequential_one() {
     db.split_table(t.id, (1..4).map(|i| node(i * 100)).collect(), &[0, 1, 0, 1])
         .unwrap();
     let snap = db.snapshot().unwrap();
-    let seeds = KeySet::from_unsorted((0..NODES).step_by(9).map(node));
+    let seeds = Arc::new(KeySet::from_unsorted((0..NODES).step_by(9).map(node)));
     for (per_node, hop_limit) in [(0, 0), (4, 0), (0, 30), (2, 7)] {
         let mut spec = TraverseSpec::new(out);
         spec.hops = 4;
         spec.per_node_limit = per_node;
         spec.hop_limit = hop_limit;
-        let seq = db.traverse(&snap, t.id, &seeds, &spec).unwrap();
+        let seq = db.traverse(&snap, t.id, Arc::clone(&seeds), &spec).unwrap();
         spec.parallelism = 4;
         spec.parallel_floor = 0;
-        let par = db.traverse(&snap, t.id, &seeds, &spec).unwrap();
+        let par = db.traverse(&snap, t.id, Arc::clone(&seeds), &spec).unwrap();
         assert!(
             !seq.hops.is_empty(),
             "per_node {per_node}, hop_limit {hop_limit}"

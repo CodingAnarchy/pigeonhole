@@ -872,6 +872,7 @@ impl<'t> Traverse<'t> {
             ));
         }
         let (_, snapshot, families) = self.sel.start(self.core)?;
+        let seeds = Arc::new(std::mem::take(&mut self.seeds));
         let mut spec = pigeonhole_engine::TraverseSpec::new(families[0]);
         spec.hops = self.hops;
         spec.per_node_limit = self.per_node_limit;
@@ -881,7 +882,7 @@ impl<'t> Traverse<'t> {
         spec.parallelism = self.parallelism;
         let t = self
             .core
-            .with(|e| e.traverse(&snapshot, self.core.info.id, &self.seeds, &spec))?;
+            .with(|e| e.traverse(&snapshot, self.core.info.id, Arc::clone(&seeds), &spec))?;
         let parents = self.parents;
         Ok(Traversal {
             hops: t
@@ -956,7 +957,8 @@ pub struct TraverseStats {
     pub edges: u64,
     /// Hops that `hop_limit` or `max_nodes` cut short.
     pub hops_cut: u32,
-    /// Whether `max_nodes` cut the traversal short.
+    /// Whether `max_nodes` was reached with hops left to take: a hop cut short by it, or the
+    /// remaining hops skipped (they may have found nothing new).
     pub cut_by_max_nodes: bool,
 }
 

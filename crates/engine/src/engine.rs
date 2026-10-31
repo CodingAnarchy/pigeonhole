@@ -2462,7 +2462,7 @@ impl Engine {
         &self,
         snapshot: &Snapshot,
         table: TableId,
-        seeds: &crate::KeySet,
+        seeds: Arc<crate::KeySet>,
         spec: &crate::TraverseSpec,
     ) -> Result<crate::Traversal> {
         snapshot.check_process()?;
