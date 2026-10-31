@@ -10,3 +10,8 @@ proptest-regressions/
 /.claude/settings.local.json
 /scratch/
 __pycache__/
+# The Python bindings: the extension maturin builds into the package, and test caches.
+/crates/python/python/pigeonhole/_native*.so
+/crates/python/python/pigeonhole/_native*.pyd
+.hypothesis/
+.pytest_cache/

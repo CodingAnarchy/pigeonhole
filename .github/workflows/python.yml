@@ -1,0 +1,60 @@
+name: Python
+
+# The Python bindings (#696, D307): build the extension into a venv, run the pytest suite,
+# and check the typed stubs (the API's snapshot, ICR 0102) against the built module. Wheels
+# for every platform are python-wheels.yml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.lock'
+      - '.github/workflows/python.yml'
+  pull_request:
+    paths:
+      - 'crates/python/**'
+      - 'crates/pigeonhole/src/**'
+      - '.github/workflows/python.yml'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The oldest supported Python on every OS, and the newest on Linux.
+          - { os: ubuntu-latest, python: '3.11' }
+          - { os: macos-latest, python: '3.11' }
+          - { os: windows-latest, python: '3.11' }
+          - { os: ubuntu-latest, python: '3.14' }
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      # Every step runs in bash with the venv's python named: on Windows, a path bash
+      # writes to GITHUB_PATH (/d/a/...) means nothing to PowerShell.
+      - name: Build into a venv
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ -d .venv/Scripts ]; then bin=.venv/Scripts; else bin=.venv/bin; fi
+          echo "VENV_PY=$PWD/$bin/python" >> "$GITHUB_ENV"
+          "$bin/python" -m pip install --quiet maturin pytest hypothesis mypy
+          VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop --release -m crates/python/Cargo.toml
+      - name: pytest
+        shell: bash
+        run: '"$VENV_PY" -m pytest crates/python/tests -q'
+      - name: stubtest (the stubs match the module)
+        shell: bash
+        working-directory: crates/python
+        run: '"$VENV_PY" -m mypy.stubtest pigeonhole'
