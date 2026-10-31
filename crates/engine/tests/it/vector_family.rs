@@ -1,17 +1,19 @@
 //! D303 PR 1 (#490 B): the engine knows the vector family kind. Its parameters are checked
 //! at creation (`InvalidArgument` for a malformed list, a tag the kind doesn't define, or
 //! values out of range or mispaired), and a well-formed vector family is refused as
-//! `Unsupported` until its write checks land (PR 2). A vector family is not an aggregate.
+//! `Unsupported` until its write checks land (PR 2), and so is a vector value put or merged
+//! into any family (tag 0x04 only ever lands in a vector family). A vector family is not an
+//! aggregate.
 
 use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, Error, FamilyOptions};
+use pigeonhole_engine::{Engine, Error, FamilyOptions, ValueRef, WriteBatch};
 use pigeonhole_format::kind_params;
 use pigeonhole_format::manifest::FamilyKind;
-use pigeonhole_format::vector::{Element, Metric, Params};
+use pigeonhole_format::vector::{Element, Metric, Params, VectorRef};
 use pigeonhole_io::sim::SimVfs;
 
 fn vector(params: Vec<u8>) -> FamilyOptions {
@@ -58,4 +60,23 @@ fn vector_families_check_their_parameters_and_wait_for_pr_2() {
         "nothing was created by a refused family"
     );
     assert!(!FamilyKind::Vector.is_aggregate() && FamilyKind::Vector.values_stay_inline());
+
+    // A vector value into a standard family: refused at the batch, put and merge alike, so
+    // tag 0x04 never reaches a file without the vector kind's feature bit.
+    let t = db
+        .create_table("s", &[("f".into(), FamilyOptions::default())])
+        .unwrap();
+    let f = t.families[0].id;
+    let payload = 1.0f32.to_le_bytes();
+    let v = ValueRef::Vector(VectorRef::new(Element::F32, 1, &payload).unwrap());
+    let mut wb = WriteBatch::new();
+    assert!(matches!(
+        wb.put(t.id, f, b"r", b"q", None, v),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
+        wb.merge(t.id, f, b"r", b"q", v),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(wb.is_empty(), "nothing was added to the batch");
 }

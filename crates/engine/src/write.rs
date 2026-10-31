@@ -160,6 +160,14 @@ impl WriteBatch {
             )?;
             return Ok(());
         }
+        // Tag 0x04 belongs only in a vector family (D303), whose creation sets `incompat` bit
+        // 0 first: a vector in any other family would reach a file 1.0.x opens. No family
+        // takes one until #490 B PR 2 checks writes against the family's parameters.
+        if matches!(value, ValueRef::Vector(_)) {
+            return Err(Error::Unsupported(
+                "vector values are not writable yet (#490 B PR 2)",
+            ));
+        }
         self.value_buf.clear();
         encode_value(&mut self.value_buf, value);
         self.builder
