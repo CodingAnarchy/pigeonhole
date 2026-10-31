@@ -16,10 +16,19 @@
 //! The scan's and the row read's own code are untouched (D296's R3): this is a sibling that
 //! drives the same [`Lane`]s.
 //!
+//! An async multi-get ([`KeyCursor::poll_next_key`]) positions each key cache-only, as an
+//! async scan positions a tablet (D196): a miss unwinds the key's positioning and fetches the
+//! block before positioning it again. Before it does, it fetches the blocks of the next
+//! 8 keys ([`LOOKAHEAD`]) that the cache lacks, found from the index alone
+//! ([`SstReader::fetch_for`]), so a cold frontier's reads are in flight together rather than
+//! one per key.
+//!
 //! [`MergingCursor::rebuild_positioned`]: pigeonhole_compaction::MergingCursor::rebuild_positioned
 
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::task::{Context, Poll};
 
 use pigeonhole_format::Cursor;
 use pigeonhole_format::filter::row_hash;
@@ -31,9 +40,9 @@ use pigeonhole_sst::SstReader;
 
 use super::{
     CellData, FORK_CHECK_ROWS, Lane, MergeKind, ReadSpec, ResolverBlobs, RowSink, ScanCell,
-    give_back, skips_columns, take_scan_resolver,
+    as_async_read, give_back, skips_columns, take_scan_resolver,
 };
-use crate::snapshot::{OpenSst, Snapshot};
+use crate::snapshot::{FamilySsts, OpenSst, Snapshot, SstSet};
 use crate::source::{Source, mem_sources, read_options, row_prefix};
 use crate::{Error, Result};
 
@@ -160,6 +169,58 @@ struct SstSlot {
     source: Option<Source>,
 }
 
+impl SstSlot {
+    /// The SST's reader, opened on first use (from the cache only, for an async attempt).
+    fn reader(
+        &mut self,
+        set: &SstSet,
+        priority: pigeonhole_cache::Priority,
+        cache_only: bool,
+    ) -> Result<Arc<SstReader>> {
+        if let Some(r) = &self.reader {
+            return Ok(Arc::clone(r));
+        }
+        let r = if cache_only {
+            self.sst.reader_cache_only(set, priority)?
+        } else {
+            self.sst.reader(set, priority)?
+        };
+        self.reader = Some(Arc::clone(&r));
+        Ok(r)
+    }
+}
+
+/// Calls `f` on each SST of a family's read whose key range holds the row `prefix`, by
+/// level, newest first (the row filter is `f`'s to check).
+fn each_sst(
+    fam: Option<&FamilySsts>,
+    levels: &[Range<usize>],
+    ssts: &mut [SstSlot],
+    prefix: &[u8],
+    mut f: impl FnMut(usize, &mut SstSlot) -> Result<()>,
+) -> Result<()> {
+    let Some(fam) = fam else {
+        return Ok(());
+    };
+    for (l, range) in levels.iter().enumerate() {
+        let (from, search) = fam.level_start(l, prefix);
+        for (i, slot) in ssts
+            .iter_mut()
+            .enumerate()
+            .take(range.end)
+            .skip(range.start + from)
+        {
+            if search && slot.sst.first_row() > prefix {
+                break;
+            }
+            if slot.sst.first_row() <= prefix && prefix <= slot.sst.last_row() {
+                f(i, slot)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Where a source in a lane's merge came from, to put it back after the key.
 #[derive(Clone, Copy)]
 enum Slot {
@@ -183,6 +244,9 @@ struct FamilyRead {
     fam: Option<Arc<crate::snapshot::FamilySsts>>,
     /// The sources in the lane's merge for the current key, in order.
     in_merge: Vec<Slot>,
+    /// An async attempt at a key was unwound (a cache miss): its sources may have moved past
+    /// the row's start, so the next positioning seeks every source afresh.
+    reseek: bool,
 }
 
 /// A multi-get over a snapshot (D299): positioned on one key at a time ([`KeyCursor::next_key`]),
@@ -210,6 +274,44 @@ pub struct KeyCursor {
     last_lane: Option<usize>,
     qual_buf: Vec<u8>,
     rows_read: u64,
+    /// The group whose reads are open.
+    opened: Option<usize>,
+    shared: Arc<crate::shard::Shared>,
+    /// An async multi-get's state ([`KeyCursor::poll_next_key`]), made on its first poll.
+    nb: Option<Box<AsyncKeys>>,
+}
+
+/// Keys past the one being positioned whose uncached blocks an async multi-get fetches
+/// ahead ([`SstReader::fetch_for`]).
+pub(crate) const LOOKAHEAD: usize = 8;
+
+/// Fetches an async multi-get makes positioning one key before it reads synchronously.
+const MAX_KEY_FETCHES: u32 = 64;
+
+/// What an async multi-get keeps between polls.
+#[derive(Default)]
+struct AsyncKeys {
+    /// Reads in flight, each with the first key that needs it.
+    in_flight: Vec<(usize, pigeonhole_io::Completion, Box<pigeonhole_sst::Fetch>)>,
+    /// Blocks fetched for keys not positioned yet, with their key.
+    pinned: Vec<(usize, pigeonhole_cache::BlockHandle)>,
+    /// Keys below this one have been probed for the blocks they need.
+    probed: usize,
+    /// Fetches while positioning the current key.
+    fetches: u32,
+    /// The cache keeps nothing, or a key needed too many fetches: read synchronously from now
+    /// on (counted).
+    sync: bool,
+}
+
+/// Where positioning on one key left the cursor.
+enum Step {
+    /// On the key with this index.
+    Key(usize),
+    /// The key has no cell to read.
+    Absent,
+    /// Past the last key.
+    End,
 }
 
 impl std::fmt::Debug for KeyCursor {
@@ -229,6 +331,7 @@ impl KeyCursor {
         spec: ReadSpec,
         now: Timestamp,
         keys: KeySet,
+        shared: Arc<crate::shard::Shared>,
     ) -> Result<Self> {
         let groups = key_groups(&snapshot, table, &keys)?;
         Ok(Self {
@@ -249,6 +352,9 @@ impl KeyCursor {
             last_lane: None,
             qual_buf: Vec::new(),
             rows_read: 0,
+            opened: None,
+            shared,
+            nb: None,
         })
     }
 
@@ -313,13 +419,16 @@ impl KeyCursor {
                 levels,
                 fam,
                 in_merge: Vec::new(),
+                reseek: false,
             });
         }
+        self.opened = Some(g);
         Ok(())
     }
 
     /// Ends the current group's reads, giving their resolvers back.
     fn close_reads(&mut self) {
+        self.opened = None;
         for mut r in self.reads.drain(..) {
             r.lane.resolver.cursor_mut().sources_mut().clear();
             if !r.lane.grew {
@@ -332,35 +441,200 @@ impl KeyCursor {
     /// `None` after the last.
     pub fn next_key(&mut self) -> Result<Option<usize>> {
         self.current = None;
-        while self.next < self.keys.len() {
+        loop {
+            match self.step(false)? {
+                Step::Key(i) => return Ok(Some(i)),
+                Step::Absent => {}
+                Step::End => return Ok(None),
+            }
+        }
+    }
+
+    /// The next key of an async multi-get: `Ready(Ok(Some(i)))` when the cursor is on key
+    /// `i` (read its cells inside [`KeyCursor::counted`]), `Ready(Ok(None))` after the last.
+    ///
+    /// Each key is positioned cache-only: what its sources' seeks and first cells miss is
+    /// fetched asynchronously, and the key positioned again from scratch. First, the blocks
+    /// the next 8 keys' seeks read that the cache lacks are fetched, all in flight
+    /// together. A key's further cells are read synchronously, and the blocks read so are
+    /// counted in `Metrics::async_sync_reads`. When the cache keeps nothing, or a key needs
+    /// more than 64 fetches, the rest is read synchronously (counted), as an async scan does
+    /// (D196).
+    pub fn poll_next_key(&mut self, cx: &mut Context<'_>) -> Poll<Result<Option<usize>>> {
+        let _poll = pigeonhole_io::async_poll_scope();
+        let mut nb = self.nb.take().unwrap_or_default();
+        self.current = None;
+        let out = loop {
+            if let Err(e) = admit_arrived(&mut nb, &self.shared, cx) {
+                break Err(e);
+            }
+            if nb.sync {
+                break self.counted(Self::next_key);
+            }
             let i = self.next;
-            self.next += 1;
-            while self.groups[self.group].keys.end <= i {
-                self.group += 1;
+            if i < self.keys.len() {
+                let entered = self.enter(i);
+                if let Err(e) = self.snapshot.checked(entered) {
+                    break Err(e);
+                }
+                if self.look_ahead(&mut nb, i) {
+                    // Poll the new reads before waiting on them.
+                    continue;
+                }
+                if nb.in_flight.iter().any(|f| f.0 <= i) {
+                    // Invariant: the wakers are registered last. Poll the reads waited on
+                    // once more, as the last thing before `Pending`, as a scan or a get
+                    // returns right after its one poll. The work since the first poll takes
+                    // the block cache's shard locks, and a contended std `RwLock` waits with
+                    // `Thread::park` where std has no futex (macOS and other non-Linux Unix,
+                    // its queue lock), using up an unpark a read's waker delivered meanwhile:
+                    // an executor that parks its thread on `Pending` then sleeps for ever
+                    // (#1226, seen with deferred I/O in the model test).
+                    let waiting = nb.in_flight.len();
+                    if let Err(e) = admit_arrived(&mut nb, &self.shared, cx) {
+                        break Err(e);
+                    }
+                    if nb.in_flight.len() < waiting {
+                        continue;
+                    }
+                    self.nb = Some(nb);
+                    return Poll::Pending;
+                }
             }
-            if self.groups[self.group].keys.start == i {
-                let g = self.group;
-                let opened = self.open_group(g);
-                self.snapshot.checked(opened)?;
+            let (stepped, sync_reads) = as_async_read(true, || self.step(true));
+            if sync_reads > 0 {
+                self.shared
+                    .async_sync_reads
+                    .fetch_add(sync_reads, Ordering::Relaxed);
             }
-            self.rows_read += 1;
-            if self.rows_read.is_multiple_of(FORK_CHECK_ROWS) {
-                self.snapshot.check_process()?;
+            match stepped {
+                Ok(Step::Key(i)) => {
+                    nb.fetches = 0;
+                    nb.pinned.retain(|(k, _)| *k > i);
+                    for r in &mut self.reads {
+                        for source in r.lane.resolver.cursor_mut().sources_mut() {
+                            source.set_cache_only(false);
+                        }
+                    }
+                    break Ok(Some(i));
+                }
+                Ok(Step::Absent) => {
+                    nb.fetches = 0;
+                    nb.pinned.retain(|(k, _)| *k > i);
+                }
+                Ok(Step::End) => break Ok(None),
+                Err(Error::WouldBlock(mut fetch)) => {
+                    nb.fetches += 1;
+                    if nb.fetches > MAX_KEY_FETCHES {
+                        nb.sync = true;
+                        self.shared.async_sync_reads.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        let completion = fetch.start();
+                        nb.in_flight.push((i, completion, fetch));
+                    }
+                }
+                Err(e) => break Err(e),
             }
-            let read = self.position(i);
-            if self.snapshot.checked(read)? {
+        };
+        self.nb = Some(nb);
+        Poll::Ready(out)
+    }
+
+    /// Runs `f` on this cursor counting the file reads it makes synchronously into
+    /// `Metrics::async_sync_reads` (an async multi-get reading a key's cells after
+    /// [`KeyCursor::poll_next_key`]); on a cursor never polled it just runs `f`.
+    pub fn counted<T>(&mut self, f: impl FnOnce(&mut Self) -> T) -> T {
+        if self.nb.is_none() {
+            return f(self);
+        }
+        let ((out, blob_reads), file_reads) =
+            pigeonhole_sst::counting_file_reads(|| as_async_read(false, || f(self)));
+        if blob_reads + file_reads > 0 {
+            self.shared
+                .async_sync_reads
+                .fetch_add(blob_reads + file_reads, Ordering::Relaxed);
+        }
+        out
+    }
+
+    /// Moves to key `i`'s group, opening its reads if they are not open.
+    fn enter(&mut self, i: usize) -> Result<()> {
+        while self.groups[self.group].keys.end <= i {
+            self.group += 1;
+        }
+        if self.opened != Some(self.group) {
+            self.open_group(self.group)?;
+        }
+        Ok(())
+    }
+
+    /// Positions on the next key, from the cache only if `cache_only`; a miss there unwinds
+    /// the attempt (the key is read again, every source seeking afresh) and is returned as
+    /// `Error::WouldBlock`.
+    fn step(&mut self, cache_only: bool) -> Result<Step> {
+        let i = self.next;
+        if i >= self.keys.len() {
+            self.close_reads();
+            return Ok(Step::End);
+        }
+        let entered = self.enter(i);
+        self.snapshot.checked(entered)?;
+        self.rows_read += 1;
+        if self.rows_read.is_multiple_of(FORK_CHECK_ROWS) {
+            self.snapshot.check_process()?;
+        }
+        match self.position(i, cache_only) {
+            Ok(any) => {
+                self.next = i + 1;
+                if !any {
+                    return Ok(Step::Absent);
+                }
                 self.current = Some(i);
                 self.lane_idx = 0;
                 self.last_lane = None;
-                return Ok(Some(i));
+                Ok(Step::Key(i))
+            }
+            Err(e @ Error::WouldBlock(_)) if cache_only => {
+                for r in &mut self.reads {
+                    r.unwind();
+                }
+                Err(e)
+            }
+            Err(e) => {
+                self.next = i + 1;
+                self.snapshot.checked(Err(e))
             }
         }
-        self.close_reads();
-        Ok(None)
+    }
+
+    /// Fetches the blocks the seeks of keys `i..i + LOOKAHEAD` (within `i`'s group) read
+    /// that the cache lacks and no read in flight brings, each key probed once (again after
+    /// a fetch lands: an index partition fetched names the data block next). Whether it
+    /// submitted any.
+    fn look_ahead(&mut self, nb: &mut AsyncKeys, i: usize) -> bool {
+        let end = (i + LOOKAHEAD).min(self.groups[self.group].keys.end);
+        let from = nb.probed.max(i);
+        let before = nb.in_flight.len();
+        for k in from..end {
+            let Ok(prefix) = row_prefix(self.keys.get(k)) else {
+                continue;
+            };
+            let hash = row_hash(&prefix[..prefix.len() - TERMINATOR.len()]);
+            for r in &mut self.reads {
+                r.probe(&prefix, hash, |mut fetch| {
+                    if !nb.in_flight.iter().any(|f| f.2.offset() == fetch.offset()) {
+                        let completion = fetch.start();
+                        nb.in_flight.push((k, completion, Box::new(fetch)));
+                    }
+                });
+            }
+        }
+        nb.probed = nb.probed.max(end);
+        nb.in_flight.len() > before
     }
 
     /// Positions every family's read on key `i`: whether any has a cell in its row.
-    fn position(&mut self, i: usize) -> Result<bool> {
+    fn position(&mut self, i: usize, cache_only: bool) -> Result<bool> {
         let prefix = row_prefix(self.keys.get(i))?;
         self.prefix.clear();
         self.prefix.extend_from_slice(&prefix);
@@ -373,7 +647,7 @@ impl KeyCursor {
         }
         let mut any = false;
         for r in &mut self.reads {
-            r.position(&self.prefix, hash, &self.past)?;
+            r.position(&self.prefix, hash, &self.past, cache_only)?;
             if r.lane.pending && in_row(&r.lane, &self.prefix) {
                 any = true;
             }
@@ -492,6 +766,37 @@ impl Drop for KeyCursor {
     }
 }
 
+/// Admits the async multi-get's reads that have completed (registering `cx` with the rest):
+/// their blocks pinned until their key is read, and the keys they serve probed again.
+fn admit_arrived(
+    nb: &mut AsyncKeys,
+    shared: &crate::shard::Shared,
+    cx: &mut Context<'_>,
+) -> Result<()> {
+    use std::future::Future;
+    let mut j = 0;
+    while j < nb.in_flight.len() {
+        let buf = match std::pin::Pin::new(&mut nb.in_flight[j].1).poll(cx) {
+            Poll::Pending => {
+                j += 1;
+                continue;
+            }
+            Poll::Ready(buf) => buf,
+        };
+        let (k, _, fetch) = nb.in_flight.swap_remove(j);
+        let handle = buf.map_err(Error::from).and_then(|b| Ok(fetch.admit(b)?))?;
+        nb.pinned.extend(handle.map(|h| (k, h)));
+        nb.probed = nb.probed.min(k);
+        if !fetch.is_kept() {
+            // The cache keeps nothing: fetching ahead or positioning cache-only would fetch
+            // the same block again; read synchronously from now on (counted).
+            nb.sync = true;
+            shared.async_sync_reads.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Ok(())
+}
+
 /// Whether the lane's held cell is in the row whose prefix (escaped row and terminator) is
 /// `prefix`.
 fn in_row(lane: &Lane, prefix: &[u8]) -> bool {
@@ -501,8 +806,10 @@ fn in_row(lane: &Lane, prefix: &[u8]) -> bool {
 impl FamilyRead {
     /// Returns the sources of the last key's merge to their slots, then gathers and
     /// positions this key's (the row filter prunes SSTs, as a point row read does), and
-    /// reads its first cell.
-    fn position(&mut self, prefix: &[u8], hash: u64, past: &[u8]) -> Result<()> {
+    /// reads its first cell. With `cache_only`, a block the cache lacks fails it with
+    /// `Error::WouldBlock` (then [`FamilyRead::unwind`]); every source stays in the merge, to
+    /// go back to its slot next time.
+    fn position(&mut self, prefix: &[u8], hash: u64, past: &[u8], cache_only: bool) -> Result<()> {
         let FamilyRead {
             lane,
             filter,
@@ -513,6 +820,7 @@ impl FamilyRead {
             levels,
             fam,
             in_merge,
+            reseek,
         } = self;
         let sources = lane.resolver.cursor_mut().sources_mut();
         for (src, slot) in sources.drain(..).zip(in_merge.drain(..)) {
@@ -521,54 +829,41 @@ impl FamilyRead {
                 Slot::Sst(i) => ssts[i].source = Some(src),
             }
         }
-        for (i, m) in mems.iter_mut().enumerate() {
-            let mut src = m.take().expect("a memtable source is in its slot");
-            move_to(&mut src, prefix, false)?;
-            sources.push(src);
-            in_merge.push(Slot::Mem(i));
-        }
-        if let Some(f) = fam.as_deref() {
-            // A point read's options without `one_row`: a cursor that stopped at its row's
-            // end could not move forward to the next key, and would seek from the top.
-            let mut read_opts = read_options(*priority, false, false, false);
-            read_opts.one_row = false;
-            for (l, range) in levels.iter().enumerate() {
-                let (from, search) = f.level_start(l, prefix);
-                for (i, slot) in ssts
-                    .iter_mut()
-                    .enumerate()
-                    .take(range.end)
-                    .skip(range.start + from)
-                {
-                    if search && slot.sst.first_row() > prefix {
-                        break;
-                    }
-                    if !(slot.sst.first_row() <= prefix && prefix <= slot.sst.last_row()) {
-                        continue;
-                    }
-                    let reader = match &slot.reader {
-                        Some(r) => Arc::clone(r),
-                        None => {
-                            let r = slot.sst.reader(&lane.ssts, *priority)?;
-                            slot.reader = Some(Arc::clone(&r));
-                            r
-                        }
-                    };
-                    if !reader.may_contain_row(hash) {
-                        continue;
-                    }
-                    let fresh = slot.source.is_none();
-                    let mut src = slot.source.take().unwrap_or_else(|| {
-                        Source::Sst(reader.iter(filter.clone(), read_opts).into())
-                    });
-                    move_to(&mut src, prefix, fresh)?;
-                    sources.push(src);
-                    in_merge.push(Slot::Sst(i));
-                }
-            }
-        }
+        let reseek = std::mem::take(reseek);
         lane.pending = false;
         lane.pinned = None;
+        for (i, m) in mems.iter_mut().enumerate() {
+            let mut src = m.take().expect("a memtable source is in its slot");
+            let moved = move_to(&mut src, prefix, reseek);
+            sources.push(src);
+            in_merge.push(Slot::Mem(i));
+            moved?;
+        }
+        // A point read's options without `one_row`: a cursor that stopped at its row's end
+        // could not move forward to the next key, and would seek from the top.
+        let mut read_opts = read_options(*priority, false, false, cache_only);
+        read_opts.one_row = false;
+        let set = Arc::clone(&lane.ssts);
+        each_sst(fam.as_deref(), levels, ssts, prefix, |i, slot| {
+            let reader = slot.reader(&set, *priority, cache_only)?;
+            if !reader.may_contain_row(hash) {
+                return Ok(());
+            }
+            let fresh = reseek || slot.source.is_none();
+            let mut src = match slot.source.take() {
+                Some(mut src) => {
+                    src.set_cache_only(cache_only);
+                    src
+                }
+                None => Source::Sst(reader.iter(filter.clone(), read_opts).into()),
+            };
+            // Kept in the merge even if the move fails: an SST cursor whose move failed is
+            // invalid, and seeks next time.
+            let moved = move_to(&mut src, prefix, fresh);
+            sources.push(src);
+            in_merge.push(Slot::Sst(i));
+            moved
+        })?;
         if sources.is_empty() {
             lane.done = true;
             return Ok(());
@@ -582,6 +877,44 @@ impl FamilyRead {
         resolver.set_upper_bound(Some(past));
         resolver.seek_with(|cursor| cursor.rebuild_positioned())?;
         lane.fetch()
+    }
+
+    /// Undoes a positioning that failed cache-only: the lane holds no cell, and the key's
+    /// next positioning seeks every source afresh (one may have stepped past the row's start
+    /// reading its first cell).
+    fn unwind(&mut self) {
+        self.reseek = true;
+        self.lane.pending = false;
+        self.lane.pinned = None;
+        self.lane.done = true;
+    }
+
+    /// Hands `f` the fetch of each block a seek to the row `prefix` would read first that
+    /// the cache lacks: per SST that may hold the row, its index partition or data block
+    /// ([`SstReader::fetch_for`]), or what opening its reader needs.
+    fn probe(&mut self, prefix: &[u8], hash: u64, mut f: impl FnMut(pigeonhole_sst::Fetch)) {
+        let set = Arc::clone(&self.lane.ssts);
+        let priority = self.priority;
+        let _ = each_sst(
+            self.fam.as_deref(),
+            &self.levels,
+            &mut self.ssts,
+            prefix,
+            |_, slot| {
+                match slot.reader(&set, priority, true) {
+                    Ok(reader) => {
+                        if reader.may_contain_row(hash)
+                            && let Some(fetch) = reader.fetch_for(prefix, priority)
+                        {
+                            f(fetch);
+                        }
+                    }
+                    Err(Error::WouldBlock(fetch)) => f(*fetch),
+                    Err(_) => {}
+                }
+                Ok(())
+            },
+        );
     }
 }
 

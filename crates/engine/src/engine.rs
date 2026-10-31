@@ -2436,6 +2436,7 @@ impl Engine {
             read,
             now,
             keys,
+            Arc::clone(&self.inner.shared),
         )
     }
 
@@ -3421,6 +3422,7 @@ impl std::future::Future for PendingMaintenance {
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
+        let _poll = pigeonhole_io::async_poll_scope();
         if self.owner != pigeonhole_io::sys::process_id() {
             return std::task::Poll::Ready(Err(forked()));
         }

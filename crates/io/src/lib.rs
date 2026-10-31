@@ -19,6 +19,7 @@
 // `unsafe` is permitted in this crate; every block carries a `// SAFETY:` argument.
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod async_poll;
 mod buf;
 mod completion;
 mod error;
@@ -36,6 +37,8 @@ pub mod sys;
 pub mod uring;
 mod vfs;
 
+#[doc(hidden)]
+pub use async_poll::{AsyncPollScope, async_poll_scope, in_async_poll};
 pub use buf::{BufPool, IoBuf};
 pub use completion::{Completion, Resolver};
 pub use error::{Error, ErrorKind, Result};

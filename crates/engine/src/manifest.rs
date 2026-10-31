@@ -1325,6 +1325,10 @@ pub(crate) fn commit_req_from_thread(
             .hooks
             .manifest_thread_parks
             .fetch_add(1, Ordering::AcqRel);
+        debug_assert!(
+            !pigeonhole_io::in_async_poll(),
+            "the manifest thread parks inside an async poll (a lost wake, #1226)"
+        );
         std::thread::park();
     }
 }

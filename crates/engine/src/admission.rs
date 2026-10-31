@@ -271,6 +271,7 @@ impl Admit {
     /// Ready once the commit may submit: it is first in its shard's queue and fits, or the
     /// engine is closing. Wakes the next waiter when admitted, in case it fits too.
     pub fn poll_admit(&mut self, cx: &mut Context<'_>) -> Poll<()> {
+        let _poll = pigeonhole_io::async_poll_scope();
         let AdmitState::Queued(id) = self.state else {
             return Poll::Ready(());
         };
