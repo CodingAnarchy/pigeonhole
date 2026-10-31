@@ -3241,7 +3241,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 
 **What (PR 1: `kind_params`, bitwise and `f64` min/max).**
 - **`kind_params`:** `FamilyOptions::kind_params` (empty for "absent") and `pigeonhole_format::kind_params`.
-  - Decode checks the list is canonical (`Corrupt` otherwise, an empty present field included).
+  - Decode checks the list is canonical (`Corrupt` otherwise). A present field of length 0 is no parameters, the slot a later appended field needs, which a writer emits only then (perf287's S1 on #1213).
   - The catalog refuses a must-understand tag the kind doesn't define with `UnsupportedFeature`, and ignores skippable ones.
   - A writer refuses any tag its kind doesn't define (`InvalidArgument`); no kind defines one yet. A family without parameters encodes exactly as before.
 - **Bitwise kinds:** operators `pigeonhole.u64_or`, `u64_and` and `u64_xor` (`Bitwise`), over the `I64` tag's bits.
@@ -3252,7 +3252,11 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - NaN is refused at write, so none is ever stored; ±∞ are allowed. An operator meeting a NaN or another tag fails with `MergeError`.
 - **In-commit combine** (`prepare_counter_writes`) now goes through the family's bound operator for every kind but HLL's element step, instead of a per-kind `i64` match.
 - **The operators belong to their kinds:** a standard family naming any built-in operator but `pigeonhole.i64_add` (D41) is refused at creation (`builtin_kind`), extending perf287's S1 on #1194.
-- **`incr`** is refused in every aggregate kind but Counter, with a message naming the method that writes that kind's inputs.
+- **Typed inputs are checked at the builder** (perf287's N2 on #1213), with one catalog lookup, and a mismatch is refused with a message naming the method that writes that kind's inputs:
+  - `incr` outside a counter;
+  - `aggregate` in an `f64` family;
+  - `aggregate_u64` outside a bitwise family (a counter would otherwise have added its bits);
+  - `aggregate_f64` outside an `f64` family.
 - **API** (ICR 0096): `Aggregation`'s five variants, minus `Copy`; `aggregate_u64`, `aggregate_f64`, `put_u64` and their `_at` forms on `RowMutation`, `WriteBatch` and `Transaction`; `as_u64`/`as_f64` on `CellRef` and `Cell`. In phdb: the schema names, the shell's `create` suffixes, and `aggregate` parsing by kind.
 
 **Tests (PR 1).**
@@ -3265,11 +3269,13 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - operators bound to their kinds;
   - `kind_params` tags refused at creation;
   - the shared bit set in both pages.
-- **Engine catalog:** an unknown must-understand tag is `UnsupportedFeature` and a skippable one is accepted.
+- **Engine catalog:** an unknown must-understand tag is `UnsupportedFeature` and a skippable one is accepted; `builtin_kind` (a direct match) inverts `aggregate_operator`.
+- **Format, S1:** a length-0 `kind_params`, with and without bytes after it, decodes as no parameters.
 - **Model checks:** `ModelAggregation` gains the five kinds, folding `f64`s by their bits with `total_cmp`. The workload writes one-bit OR words, one-clear AND words, random XOR words, and finite `f64`s, signed zeros and infinities.
-  - The `counters` targets add `bxor` and `fmax_ttl` only. The kinds of each group share their operator's code, and XOR is the one that shows an operand applied twice.
-  - More families stall a one-shard run with tablet changes off: 13 families on 4 tables gave up with `Busy` on seed 6, even with standard families in their place.
-  - **Mutation:** making XOR compute OR fails 25 of the 33 engine `counters` tests.
+  - **New `scalar_counters` targets** (engine and `pigeonhole`) rerun the model checks with all five kinds (`bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`) beside `f`, `counter` and `sum`. The `counters` targets keep main's eight families.
+  - **Why not `counters`:** a one-shard run with tablet changes off must stay at main's 32 slots (owner, 2026-10-31; a larger harness budget would hide #1212). With 13 families on 4 tables, seed 6 gave up with `Busy`, even with standard families in their place. At 10 families (40 slots), 7 of 300 engine `counters` seeds gave up (run 41166497479), against `max_slots`' promised 64.
+  - **Later:** the families join `counters` once #1212 is fixed (#1214). Until then, a change to aggregate families also sweeps engine `scalar_counters` (CONTRIBUTING.md).
+  - **Mutation:** making XOR compute OR fails 10 of the 33 engine `scalar_counters` tests.
 - **API and phdb:** a `pigeonhole` API test; a phdb shell test.
 - **Corpus:** the `aggregates` entry gains one family per kind (signed zeros, infinities, a put, a delete), still refused by 1.0.0.
 

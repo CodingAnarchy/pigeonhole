@@ -158,10 +158,19 @@ pub fn families() -> Vec<ModelFamily> {
             f("max_ttl", 0, 40, false),
             f("hll", 2, 0, false),
             f("hll_ttl", 0, 40, false),
-            // One bitwise and one `f64` family (D298): the kinds of each share their
-            // operator's code, and XOR, unlike OR, AND, min and max, shows an operand applied
-            // twice. More families stall a one-shard run with tablet changes off.
-            f("bxor", 2, 0, false),
+        ]
+    } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
+        // D298's bitwise and `f64` families beside a counter, eight families in all (32
+        // slots), as `counters` has: more stall a one-shard run with tablet changes off
+        // (#1212). They join `counters` once that is fixed (#1214).
+        vec![
+            f("f", 0, 0, false),
+            f("counter", 3, 0, true),
+            f("sum", 2, 0, false),
+            f("bor", 2, 0, false),
+            f("band", 0, 0, false),
+            f("bxor_ttl", 0, 40, false),
+            f("fmin", 2, 0, false),
             f("fmax_ttl", 0, 40, false),
         ]
     } else {

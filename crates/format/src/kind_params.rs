@@ -4,8 +4,10 @@
 //! kind.
 //!
 //! - An entry is `tag` (u8), `len` (varint), then `len` bytes. Entries are sorted by tag, each
-//!   tag at most once, and the list is not empty: so the encoding of a set of parameters is
-//!   one byte string.
+//!   tag at most once: so the encoding of a set of parameters is one byte string.
+//! - No parameters is the empty list. A writer omits the field then, unless a later appended
+//!   `FamilyOptions` field needs its slot, when it writes length 0; a reader takes either as
+//!   no parameters.
 //! - Tags `1..=127` are must-understand: a kind meeting one it doesn't know refuses the family
 //!   (`UnsupportedFeature`, the backstop behind the kind's feature bit). Tags `128..=255` are
 //!   skippable hints. Tag 0 is never written.
@@ -18,7 +20,8 @@
 //! let bytes = kind_params::encode(&[(2, &7u32.to_le_bytes()), (1, &[3])]);
 //! let entries = kind_params::parse(&bytes).unwrap();
 //! assert_eq!(entries, [(1, &[3][..]), (2, &7u32.to_le_bytes()[..])]);
-//! assert!(kind_params::parse(&[]).is_err()); // present means non-empty
+//! assert!(kind_params::parse(&[]).unwrap().is_empty()); // no parameters
+//! assert!(kind_params::parse(&[0, 0]).is_err()); // tag 0 is never written
 //! ```
 
 use crate::Error;
@@ -49,12 +52,10 @@ pub fn encode(entries: &[(u8, &[u8])]) -> Vec<u8> {
     out
 }
 
-/// The entries of a present `kind_params` field, in tag order. It is `Corrupt` unless the
-/// field is canonical: non-empty, tags nonzero, strictly increasing, and lengths in bounds.
+/// The entries of a `kind_params` field, in tag order (none for an empty field). It is
+/// `Corrupt` unless the field is canonical: tags nonzero and strictly increasing, and lengths
+/// in bounds.
 pub fn parse(bytes: &[u8]) -> crate::Result<Vec<(u8, &[u8])>> {
-    if bytes.is_empty() {
-        return Err(corrupt());
-    }
     let mut out: Vec<(u8, &[u8])> = Vec::new();
     let mut at = 0;
     while at < bytes.len() {

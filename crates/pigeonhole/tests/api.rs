@@ -1326,6 +1326,34 @@ fn bitwise_and_f64_families() {
         t.mutate(b"r").aggregate_f64("xor", b"q", 1.0).commit(),
         "aggregate_u64",
     );
+    // Typed inputs of the wrong type are refused at the builder, naming the method to use
+    // (perf287's N2 on #1213): a u64 into a counter would otherwise add its bits.
+    let other = db
+        .table("other")
+        .unwrap()
+        .family("c", Family::counter())
+        .family("lo", Family::aggregate(Aggregation::Min))
+        .create()
+        .unwrap();
+    refused(
+        other.mutate(b"r").aggregate_u64("c", b"q", 1).commit(),
+        "is a counter family: write its inputs with incr, not aggregate_u64",
+    );
+    refused(
+        other.mutate(b"r").aggregate_f64("lo", b"q", 1.0).commit(),
+        "is a min family: write its inputs with aggregate, not aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r").aggregate("warm", b"q", 1).commit(),
+        "is a max_f64 family: write its inputs with aggregate_f64, not aggregate",
+    );
+    let mut wb = db.write_batch();
+    wb.aggregate_u64_at(&other, b"r", "lo", b"q", 5, 1);
+    refused(wb.commit(), "not aggregate_u64");
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate_f64(&other, b"r", "c", b"q", 1.0);
+    refused(txn.commit(), "not aggregate_f64");
+    assert!(other.get(b"r", "c", b"q").unwrap().is_none());
     assert_eq!(
         float("cold"),
         Some(f64::NEG_INFINITY),

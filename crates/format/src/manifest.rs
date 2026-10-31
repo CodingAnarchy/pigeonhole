@@ -541,8 +541,9 @@ impl FamilyOptions {
                     }
                 }
             },
-            // Appended for D298: absent for a kind without parameters. When present it is a
-            // canonical, non-empty list ([`crate::kind_params`]).
+            // Appended for D298: absent for a kind without parameters, and length 0 the same
+            // (the slot a later appended field needs, perf287's S1 on #1213); else a
+            // canonical list ([`crate::kind_params`]). Bytes after it are later fields.
             kind_params: if r.remaining() == 0 {
                 Vec::new()
             } else {
@@ -1106,18 +1107,42 @@ mod encode_tests {
         }
     }
 
-    /// A present `kind_params` that is empty or not canonical is corruption.
+    /// A `BitOr` family's `PutFamily` with `tail` appended to its body by hand.
+    fn with_tail(tail: &[u8]) -> Vec<u8> {
+        let bytes = put_family(FamilyOptions::default().kind(FamilyKind::BitOr));
+        let (body, _) = crate::varint::get_bytes(&bytes[1..]).unwrap();
+        let mut body = body.to_vec();
+        body.extend_from_slice(tail);
+        let mut fixed = vec![bytes[0]];
+        crate::varint::put_bytes(&mut fixed, &body);
+        fixed
+    }
+
+    /// A present `kind_params` of length 0 is no parameters, and what follows it is a later
+    /// appended field this build ignores (perf287's S1 on #1213): the slot a future field
+    /// needs after a family without parameters.
+    #[test]
+    fn a_zero_length_kind_params_is_no_parameters() {
+        for tail in [&[0u8][..], &[0, 0x42], &[0, 3, 1, 2, 3]] {
+            let (Edit::PutFamily { options, .. }, _) = Edit::decode(&with_tail(tail)).unwrap()
+            else {
+                panic!("a family");
+            };
+            assert_eq!(
+                options,
+                FamilyOptions::default().kind(FamilyKind::BitOr),
+                "{tail:?}"
+            );
+        }
+    }
+
+    /// A present `kind_params` that is not canonical is corruption.
     #[test]
     fn non_canonical_kind_params_are_corrupt() {
-        for bad in [vec![], vec![2, 0, 1, 0], vec![0, 0]] {
-            let o = FamilyOptions::default().kind(FamilyKind::BitOr);
-            let bytes = put_family(o);
-            // The edit's body with the field appended by hand around a bad list.
-            let (body, _) = crate::varint::get_bytes(&bytes[1..]).unwrap();
-            let mut body = body.to_vec();
-            crate::varint::put_bytes(&mut body, &bad);
-            let mut fixed = vec![bytes[0]];
-            crate::varint::put_bytes(&mut fixed, &body);
+        for bad in [vec![2, 0, 1, 0], vec![0, 0], vec![1, 5, 0]] {
+            let mut tail = Vec::new();
+            crate::varint::put_bytes(&mut tail, &bad);
+            let fixed = with_tail(&tail);
             assert!(
                 matches!(Edit::decode(&fixed), Err(Error::Corrupt { .. })),
                 "{bad:?}: {:?}",

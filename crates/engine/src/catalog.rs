@@ -52,21 +52,21 @@ pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
 }
 
 /// The aggregate kind whose built-in operator is named `name`, if any. A standard family
-/// may not name one (except `pigeonhole.i64_add`, its 0.1.0 meaning, D41).
+/// may not name one (except `pigeonhole.i64_add`, its 0.1.0 meaning, D41). The inverse
+/// of [`aggregate_operator`], as a direct match (the read path's blob setup calls it).
 pub(crate) fn builtin_kind(name: &str) -> Option<FamilyKind> {
-    [
-        FamilyKind::Counter,
-        FamilyKind::Min,
-        FamilyKind::Max,
-        FamilyKind::Hll,
-        FamilyKind::BitOr,
-        FamilyKind::BitAnd,
-        FamilyKind::BitXor,
-        FamilyKind::MinF64,
-        FamilyKind::MaxF64,
-    ]
-    .into_iter()
-    .find(|&k| aggregate_operator(k) == Some(name))
+    Some(match name {
+        I64_ADD => FamilyKind::Counter,
+        I64_MIN => FamilyKind::Min,
+        I64_MAX => FamilyKind::Max,
+        HLL => FamilyKind::Hll,
+        U64_OR => FamilyKind::BitOr,
+        U64_AND => FamilyKind::BitAnd,
+        U64_XOR => FamilyKind::BitXor,
+        F64_MIN => FamilyKind::MinF64,
+        F64_MAX => FamilyKind::MaxF64,
+        _ => return None,
+    })
 }
 
 /// The tags `kind`'s `kind_params` define (D298): none for every kind so far.
@@ -864,6 +864,30 @@ mod cow_tests {
             .iter()
             .map(|(k, l)| (*k, l.iter().map(|(lv, m)| (*lv, m.id)).collect()))
             .collect()
+    }
+
+    /// `builtin_kind` is `aggregate_operator`'s inverse.
+    #[test]
+    fn builtin_kind_inverts_aggregate_operator() {
+        use FamilyKind as K;
+        let kinds = [
+            K::Standard,
+            K::Counter,
+            K::Min,
+            K::Max,
+            K::Hll,
+            K::BitOr,
+            K::BitAnd,
+            K::BitXor,
+            K::MinF64,
+            K::MaxF64,
+        ];
+        for kind in kinds {
+            if let Some(name) = aggregate_operator(kind) {
+                assert_eq!(builtin_kind(name), Some(kind));
+            }
+        }
+        assert_eq!(builtin_kind("pigeonhole.other"), None);
     }
 
     /// D298: a family whose `kind_params` holds a must-understand tag its kind doesn't define
