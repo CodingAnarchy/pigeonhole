@@ -126,6 +126,34 @@ impl<C: Cursor> MergingCursor<C> {
         *lazy = false;
     }
 
+    /// Rebuilds the merge over the sources as their caller positioned them, each at or past
+    /// a common target, as a seek to that target would leave it (D299: a multi-get moves
+    /// each source forward from the row it read last, and only the sources that may hold
+    /// the next row).
+    ///
+    /// ```
+    /// use pigeonhole_compaction::{MergingCursor, VecCursor};
+    /// use pigeonhole_format::Cursor;
+    ///
+    /// let src = |keys: &[&[u8]]| {
+    ///     VecCursor::new(keys.iter().map(|k| (k.to_vec(), Vec::new())).collect())
+    /// };
+    /// let mut m = MergingCursor::new(vec![src(&[b"a", b"d"]), src(&[b"b", b"c"])]);
+    /// // The caller moves each source itself, then rebuilds: as `seek(b"c")` would leave it.
+    /// for s in m.sources_mut() {
+    ///     s.seek(b"c").unwrap();
+    /// }
+    /// m.reset();
+    /// m.rebuild_positioned().unwrap();
+    /// assert_eq!(m.key(), b"c");
+    /// m.next().unwrap();
+    /// assert_eq!(m.key(), b"d");
+    /// ```
+    pub fn rebuild_positioned(&mut self) -> Result<(), C::Error> {
+        self.rebuild();
+        self.settle_top_after_seek()
+    }
+
     // Always inlined: the lazy settle's extra call site (D288) otherwise moved it out of
     // line in every hot caller (+0.8% on the unfiltered row reads).
     #[inline(always)]

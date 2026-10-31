@@ -503,6 +503,18 @@ where
         self.cursor.seek(key)
     }
 
+    /// [`CellResolver::seek`] with `position` moving the merged cursor instead of a seek: for
+    /// a caller that positions the cursor's sources itself and rebuilds the merge
+    /// ([`MergingCursor::rebuild_positioned`](crate::MergingCursor::rebuild_positioned)), as
+    /// a multi-get does, moving each source forward from the row it read last (D299).
+    pub fn seek_with(
+        &mut self,
+        position: impl FnOnce(&mut C) -> Result<(), C::Error>,
+    ) -> Result<(), C::Error> {
+        self.reset_position();
+        position(&mut self.cursor)
+    }
+
     /// Positions for a point read of one column: first seeks the merged cursor to the row's
     /// marker prefix and records any family markers visible at the snapshot, then seeks to
     /// the column. The second seek goes forward from the first (`Cursor::seek_forward`:

@@ -3,14 +3,15 @@ use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
 use pigeonhole_engine::{
-    FamilyId, QualifierFilter, ReadSpec, ScanCursor, ScanSpec, TableInfo, ValuePredicate,
+    CellData, ColumnPosition, FamilyId, KeyCursor, KeySet, QualifierFilter, ReadSpec, ScanCursor,
+    ScanSpec, TableInfo, ValuePredicate,
 };
 
 use smallvec::SmallVec;
 
 use crate::cell::RowBuf;
 use crate::table::TableCore;
-use crate::{Result, Row, RowRef, Snapshot};
+use crate::{CellEntry, CellRef, Result, Row, RowRef, Snapshot};
 
 /// A predicate on a cell value, evaluated inside the read path before materialization.
 ///
@@ -310,6 +311,8 @@ pub struct RowRead<'t> {
     core: &'t TableCore,
     row: Vec<u8>,
     sel: Selection,
+    /// Where an earlier walk of the row stopped ([`RowRead::resume_after`]).
+    resume: Option<ColumnPosition>,
 }
 
 impl<'t> RowRead<'t> {
@@ -336,10 +339,29 @@ impl<'t> RowRead<'t> {
             core,
             row: row.to_vec(),
             sel: Selection::new(),
+            resume: None,
         }
     }
 
     selection_methods!();
+
+    /// Resume after `position`, the column an earlier walk of a row of this table stopped
+    /// at ([`RowPages::position`], [`RowCells::position`]; D297): the families the selection
+    /// names before the position's family are skipped, the position's family starts after
+    /// its column (all its versions), and later families start at the selection's own
+    /// qualifier bound. A position whose family the read does not select (one dropped
+    /// since, or not named) fails the read with `InvalidArgument`.
+    ///
+    /// A chain of calls is one consistent read of the row only under one
+    /// [`snapshot`](RowRead::snapshot); without one, each call reads as of its own start,
+    /// so a column written or deleted between calls may be seen twice or not at all. A
+    /// position from another table fails the read with `InvalidArgument`; one from another
+    /// row of the same table positions this row's walk at the same column (the caller's
+    /// responsibility).
+    pub fn resume_after(mut self, position: &RowPosition) -> Self {
+        self.resume = Some(position.0.clone());
+        self
+    }
 
     /// Up to `n` versions of each column (0: all retained).
     pub fn versions(mut self, n: u32) -> Self {
@@ -356,6 +378,9 @@ impl<'t> RowRead<'t> {
 
     /// Performs the read. `None` if the row has no matching cell.
     pub fn read(mut self) -> Result<Option<RowRef<'t>>> {
+        if self.resume.is_some() {
+            return self.read_resumed();
+        }
         // As of now, a read takes no snapshot to create and drop (#287); one given, or a
         // family the current catalog does not know yet, goes through a snapshot.
         let latest = match self.sel.snapshot {
@@ -406,6 +431,12 @@ impl RowRead<'_> {
     /// hit is read at the call and resolves on the first poll, and a block the cache does
     /// not hold is read asynchronously (see [`nonblocking`](crate::nonblocking)).
     pub fn read_async(mut self) -> crate::nonblocking::RowFuture {
+        // A resumed read is a walk of the row's cells (D297), read at the call.
+        if self.resume.is_some() {
+            return crate::nonblocking::RowFuture::done(
+                self.read_resumed().map(|r| r.map(|r| r.to_owned())),
+            );
+        }
         let started = (|| {
             let latest = match self.sel.snapshot {
                 None => self.sel.start_latest(self.core)?,
@@ -464,6 +495,653 @@ impl RowRead<'_> {
             Ok(Ok(f)) => crate::nonblocking::RowFuture::new(Ok(f), self.row),
             Err(e) => crate::nonblocking::RowFuture::new(Err(e), self.row),
         }
+    }
+}
+
+/// A multi-get under construction ([`Table::keys`](crate::Table::keys), D299). Finish with
+/// [`KeysRead::read`].
+///
+/// It reads the rows of a [`KeySet`] in key order, under one snapshot (the one given, or one
+/// taken at `read`), with the selection applied to every row. Each tablet's read is set up
+/// once for all of its keys, and each row's sources move forward from the previous key's:
+/// sorted keys that share blocks share their decode. Keys whose row has no cell the
+/// selection keeps are skipped. The row cache is not consulted.
+///
+/// ```
+/// use pigeonhole::{Family, KeySet, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+/// g.mutate(b"v:1").put("out", b"v:2", b"").put("out", b"v:3", b"").commit()?;
+/// g.mutate(b"v:3").put("out", b"v:1", b"").commit()?;
+///
+/// // One hop of a BFS: the neighbours of every node in the frontier.
+/// let frontier = KeySet::from_unsorted([&b"v:3"[..], b"v:1", b"v:9"]);
+/// let mut next = Vec::new();
+/// let mut rows = g.keys(&frontier).family("out").read()?;
+/// while let Some((i, row)) = rows.next()? {
+///     assert!(frontier.get(i) != b"v:9"); // no row: skipped
+///     next.extend(row.iter().map(|e| e.qualifier.to_vec()));
+/// }
+/// assert_eq!(next.len(), 3);
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "a multi-get does nothing until .read()"]
+pub struct KeysRead<'t> {
+    core: &'t TableCore,
+    keys: KeySet,
+    sel: Selection,
+}
+
+impl<'t> KeysRead<'t> {
+    pub(crate) fn new(core: &'t TableCore, keys: &KeySet) -> Self {
+        Self {
+            core,
+            keys: keys.clone(),
+            sel: Selection::new(),
+        }
+    }
+
+    selection_methods!();
+
+    /// Up to `n` versions of each column (0: all retained).
+    pub fn versions(mut self, n: u32) -> Self {
+        self.sel.spec.versions = n;
+        self
+    }
+
+    /// At most `n` columns per family in each row (a hub in a frontier stays a page).
+    pub fn column_limit(mut self, n: u32) -> Self {
+        self.sel.spec.columns_per_row = n;
+        self
+    }
+
+    /// Starts the read.
+    pub fn read(mut self) -> Result<KeyRows<'t>> {
+        let generation = self.core.db.generation();
+        let (info, snapshot, families) = self.sel.start(self.core)?;
+        let mut spec = self.sel.spec;
+        spec.families = families.into_vec();
+        let cursor = self
+            .core
+            .with(|e| e.multi_get(&snapshot, self.core.info.id, self.keys, spec))?;
+        Ok(KeyRows {
+            cursor,
+            buf: RowBuf::new(info, 0),
+            core: self.core,
+            generation,
+            done: false,
+        })
+    }
+}
+
+/// The rows of a multi-get, in key order ([`KeysRead::read`]): each lent with its index in
+/// the [`KeySet`] until the next call. One buffer is reused for every row.
+#[derive(Debug)]
+pub struct KeyRows<'t> {
+    cursor: KeyCursor,
+    buf: RowBuf,
+    core: &'t TableCore,
+    generation: u64,
+    done: bool,
+}
+
+impl KeyRows<'_> {
+    /// The next row with a cell the selection keeps, and its key's index in the key set;
+    /// `None` after the last. After an error the read is finished.
+    #[allow(clippy::should_implement_trait)] // A lending step: an `Iterator` cannot lend.
+    pub fn next(&mut self) -> Result<Option<(usize, RowRef<'_>)>> {
+        if self.done {
+            return Ok(None);
+        }
+        let r = self
+            .core
+            .db
+            .check_generation(self.generation)
+            .and_then(|()| self.fill());
+        match r {
+            Ok(Some(i)) => Ok(Some((i, RowRef::borrowed(&self.buf)))),
+            Ok(None) => {
+                self.done = true;
+                Ok(None)
+            }
+            Err(e) => {
+                self.done = true;
+                Err(e)
+            }
+        }
+    }
+
+    fn fill(&mut self) -> Result<Option<usize>> {
+        self.buf.clear();
+        let Some(i) = self.cursor.next_key()? else {
+            return Ok(None);
+        };
+        self.buf.key.extend_from_slice(self.cursor.row());
+        while self.cursor.push_next_cell(&mut self.buf)? {}
+        Ok(Some(i))
+    }
+}
+
+/// A position within a row: the column (family and qualifier) a walk of the row handed out
+/// last ([`RowPages::position`], [`RowCells::position`]), from which a later read of a row of
+/// the same table resumes ([`RowRead::resume_after`], D297).
+///
+/// It names its table but not its row. [`RowPosition::to_bytes`] is a stable form (its first
+/// byte is the encoding version, 1) to keep a position across processes or hand it over an
+/// API boundary.
+///
+/// ```
+/// use pigeonhole::{Family, Options, Pigeonhole, RowPosition};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+/// let mut m = g.mutate(b"hub");
+/// for i in 0u32..10 {
+///     m = m.put("out", &i.to_be_bytes(), b"");
+/// }
+/// m.commit()?;
+///
+/// // The first page, then the rest in a later call.
+/// let mut pages = g.row(b"hub").family("out").pages(4)?;
+/// assert_eq!(pages.next()?.unwrap().len(), 4);
+/// let at = pages.position().unwrap();
+/// drop(pages);
+/// let token = at.to_bytes();
+///
+/// let at = RowPosition::from_bytes(&token)?;
+/// let rest = g.row(b"hub").family("out").resume_after(&at).read()?.unwrap();
+/// assert_eq!(rest.len(), 6);
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RowPosition(ColumnPosition);
+
+impl RowPosition {
+    /// The stable byte form: the encoding version (1), the table and family ids, the
+    /// qualifier.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        self.0.to_bytes()
+    }
+
+    /// Decodes [`RowPosition::to_bytes`]'s form; anything else fails with
+    /// `InvalidArgument`.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
+        Ok(Self(ColumnPosition::from_bytes(bytes)?))
+    }
+}
+
+/// The scans one walk of a row reads, in order, from one snapshot: one over every selected
+/// family, or for a resumed walk one over the position's family (past its column) and one
+/// over the families after it.
+fn row_walk(
+    core: &TableCore,
+    row: &[u8],
+    mut sel: Selection,
+    resume: Option<&ColumnPosition>,
+) -> Result<(Arc<TableInfo>, Vec<ScanCursor>)> {
+    let (info, snapshot, families) = sel.start(core)?;
+    let table = core.info.id;
+    let scan = |families: Vec<FamilyId>, qualifiers: QualifierFilter| -> Result<ScanCursor> {
+        let mut spec = ScanSpec::new(Bound::Included(row.to_vec()), Bound::Included(row.to_vec()));
+        spec.read = sel.spec.clone();
+        spec.read.families = families;
+        spec.read.qualifiers = qualifiers;
+        spec.limit = 1;
+        core.with(|e| e.scan(&snapshot, table, spec))
+            .map_err(crate::Error::from)
+    };
+    let Some(at) = resume else {
+        return Ok((
+            info,
+            vec![scan(families.into_vec(), sel.spec.qualifiers.clone())?],
+        ));
+    };
+    if at.table() != table {
+        return Err(crate::Error::from(
+            pigeonhole_engine::Error::InvalidArgument(
+                "the row position is from another table".to_owned(),
+            ),
+        ));
+    }
+    // The families in the order the walk reads them.
+    let order: Vec<FamilyId> = if families.is_empty() {
+        info.families.iter().map(|f| f.id).collect()
+    } else {
+        families.into_vec()
+    };
+    let mut cursors = Vec::with_capacity(2);
+    let rest = match order.iter().position(|&f| f == at.family()) {
+        Some(i) => {
+            let past = past_column(&sel.spec.qualifiers, at.qualifier());
+            cursors.push(scan(vec![at.family()], past)?);
+            i + 1
+        }
+        // The walk's order is the selection's (or the table's), not the ids': a position
+        // in a family this read does not select has no place in it (cli692's B1 on #1210).
+        None => {
+            return Err(crate::Error::from(
+                pigeonhole_engine::Error::InvalidArgument(
+                    "the row position's family is not one this read selects".to_owned(),
+                ),
+            ));
+        }
+    };
+    if rest < order.len() {
+        cursors.push(scan(order[rest..].to_vec(), sel.spec.qualifiers.clone())?);
+    }
+    Ok((info, cursors))
+}
+
+/// `selection` with its lower bound raised past `qualifier`: whichever starts later.
+fn past_column(selection: &QualifierFilter, qualifier: &[u8]) -> QualifierFilter {
+    let (lo, hi) = match selection {
+        QualifierFilter::Range(lo, hi) => (lo.clone(), hi.clone()),
+        QualifierFilter::Prefix(p) => (Bound::Included(p.clone()), prefix_end(p)),
+        _ => (Bound::Unbounded, Bound::Unbounded),
+    };
+    let after = Bound::Excluded(qualifier.to_vec());
+    let lo = match &lo {
+        Bound::Included(b) if b.as_slice() > qualifier => lo,
+        Bound::Excluded(b) if b.as_slice() >= qualifier => lo,
+        _ => after,
+    };
+    QualifierFilter::Range(lo, hi)
+}
+
+/// The first qualifier past every one starting with `prefix` (unbounded when none is).
+fn prefix_end(prefix: &[u8]) -> Bound<Vec<u8>> {
+    let mut end = prefix.to_vec();
+    while let Some(last) = end.pop() {
+        if last < u8::MAX {
+            end.push(last + 1);
+            return Bound::Excluded(end);
+        }
+    }
+    Bound::Unbounded
+}
+
+/// The cell-by-cell walk behind [`RowCells`] and [`RowPages`]: the walk's scans in order,
+/// the current cell's family and qualifier, and its version in one reused cell.
+#[derive(Debug)]
+struct CellWalk<'t> {
+    core: &'t TableCore,
+    generation: u64,
+    info: Arc<TableInfo>,
+    /// Scans still to start, in reverse order (the next is the last).
+    pending: Vec<ScanCursor>,
+    /// The scan on the row, if one is.
+    cursor: Option<ScanCursor>,
+    qualifier: Vec<u8>,
+    data: CellData,
+    family: Option<FamilyId>,
+    /// The index in `info` of `family` (cells come grouped by family).
+    family_index: Option<(FamilyId, usize)>,
+    done: bool,
+}
+
+impl<'t> CellWalk<'t> {
+    fn new(
+        core: &'t TableCore,
+        row: &[u8],
+        sel: Selection,
+        resume: Option<&ColumnPosition>,
+    ) -> Result<Self> {
+        let generation = core.db.generation();
+        let (info, mut cursors) = row_walk(core, row, sel, resume)?;
+        cursors.reverse();
+        Ok(Self {
+            core,
+            generation,
+            info,
+            pending: cursors,
+            cursor: None,
+            qualifier: Vec::new(),
+            data: CellData::EMPTY,
+            family: None,
+            family_index: None,
+            done: false,
+        })
+    }
+
+    /// Steps to the next cell: `false` at the end of the walk. After an error the walk is
+    /// done.
+    fn step(&mut self) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        let r = self
+            .core
+            .db
+            .check_generation(self.generation)
+            .and_then(|()| self.step_inner());
+        if !matches!(r, Ok(true)) {
+            self.done = true;
+        }
+        r
+    }
+
+    fn step_inner(&mut self) -> Result<bool> {
+        loop {
+            let Some(cursor) = self.cursor.as_mut() else {
+                let Some(mut next) = self.pending.pop() else {
+                    return Ok(false);
+                };
+                if next.next_row()? {
+                    self.cursor = Some(next);
+                }
+                continue;
+            };
+            let Some(cell) = cursor.next_cell()? else {
+                self.cursor = None;
+                continue;
+            };
+            self.qualifier.clear();
+            self.qualifier.extend_from_slice(cell.qualifier);
+            self.family = Some(cell.family);
+            // A small value is copied into the reused cell; a large one stays pinned.
+            let small = cell.stored.len() <= CellData::INLINE_MAX;
+            if small {
+                self.data.set_inline(cell.ts, cell.stored);
+            } else {
+                self.data = cursor.current_data();
+            }
+            return Ok(true);
+        }
+    }
+
+    /// The current cell's family name.
+    fn family_name(&mut self) -> &str {
+        let Some(id) = self.family else {
+            return "";
+        };
+        let i = match self.family_index {
+            Some((f, i)) if f == id => i,
+            _ => {
+                let i = self
+                    .info
+                    .families
+                    .iter()
+                    .position(|f| f.id == id)
+                    .unwrap_or(usize::MAX);
+                self.family_index = Some((id, i));
+                i
+            }
+        };
+        self.info.families.get(i).map_or("", |f| f.name.as_str())
+    }
+
+    fn position(&self) -> Option<RowPosition> {
+        self.family.map(|f| {
+            RowPosition(ColumnPosition::new(
+                self.core.info.id,
+                f,
+                self.qualifier.clone(),
+            ))
+        })
+    }
+}
+
+/// The cells of one row, one at a time ([`RowRead::cells`], D297): for a row too wide to
+/// read whole, such as a graph hub with millions of edges. Each cell is lent until the next
+/// call, so the walk allocates nothing per cell, and a large value stays pinned rather than
+/// copied. Cells come in [`RowRead::read`]'s order: by family, then qualifier, then newest
+/// version first.
+///
+/// The walk holds its snapshot, and with it the files it reads, until it is dropped. After
+/// the database is closed, the next step fails with `Closed` (#826).
+///
+/// ```
+/// use pigeonhole::{Family, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+/// let mut m = g.mutate(b"hub");
+/// for i in 0u64..1000 {
+///     m = m.put("out", &i.to_be_bytes(), b"");
+/// }
+/// m.commit()?;
+///
+/// let mut degree = 0;
+/// let mut cells = g.row(b"hub").family("out").cells()?;
+/// while let Some(e) = cells.next()? {
+///     assert_eq!(e.family, "out");
+///     degree += 1;
+/// }
+/// assert_eq!(degree, 1000);
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "a cell walk reads nothing until .next()"]
+pub struct RowCells<'t> {
+    walk: CellWalk<'t>,
+}
+
+impl RowCells<'_> {
+    /// The next cell, lent until the next call; `None` at the end of the row. After an
+    /// error the walk is finished.
+    #[allow(clippy::should_implement_trait)] // A lending step: an `Iterator` cannot lend.
+    pub fn next(&mut self) -> Result<Option<CellEntry<'_>>> {
+        if !self.walk.step()? {
+            return Ok(None);
+        }
+        let walk = &mut self.walk;
+        let _ = walk.family_name();
+        let family = walk
+            .family_index
+            .and_then(|(_, i)| walk.info.families.get(i))
+            .map_or("", |f| f.name.as_str());
+        Ok(Some(CellEntry {
+            family,
+            qualifier: &walk.qualifier,
+            cell: CellRef::borrowed(&walk.data),
+        }))
+    }
+
+    /// The column of the cell handed out last, to resume after
+    /// ([`RowRead::resume_after`]). Resuming after it skips that column's remaining
+    /// versions: [`RowRead::pages`] ends its pages on column boundaries for that reason.
+    pub fn position(&self) -> Option<RowPosition> {
+        self.walk.position()
+    }
+}
+
+/// Pages of one row's cells, of at most `n` cells each ([`RowRead::pages`], D297), from one
+/// walk under one snapshot. A page holds whole columns only, so all the versions of a column
+/// the selection keeps are on one page; a column whose versions alone exceed `n` is a page
+/// of its own. One buffer is reused for every page: past the first page a page
+/// allocates nothing.
+///
+/// ```
+/// use pigeonhole::{Family, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+/// let mut m = g.mutate(b"hub");
+/// for i in 0u64..2500 {
+///     m = m.put("out", &i.to_be_bytes(), b"");
+/// }
+/// m.commit()?;
+///
+/// let mut sizes = Vec::new();
+/// let mut pages = g.row(b"hub").family("out").pages(1000)?;
+/// while let Some(page) = pages.next()? {
+///     sizes.push(page.len());
+/// }
+/// assert_eq!(sizes, [1000, 1000, 500]);
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "a page walk reads nothing until .next()"]
+pub struct RowPages<'t> {
+    walk: CellWalk<'t>,
+    row: Vec<u8>,
+    n: usize,
+    buf: RowBuf,
+    /// The column read last: its cells, all versions the selection keeps.
+    col: Column,
+    /// `col` is a whole column that did not fit the last page: it starts the next one.
+    carry: bool,
+    /// The first cell of the column after `col`, read to find `col`'s end.
+    ahead: Option<(FamilyId, CellData)>,
+    ahead_qualifier: Vec<u8>,
+    /// The last column on the pages handed out.
+    last: Option<FamilyId>,
+    last_qualifier: Vec<u8>,
+}
+
+/// One column's cells (reused buffers).
+#[derive(Debug, Default)]
+struct Column {
+    family: Option<FamilyId>,
+    qualifier: Vec<u8>,
+    cells: Vec<CellData>,
+}
+
+impl RowPages<'_> {
+    /// The next page, lent until the next call; `None` at the end of the row. After an
+    /// error the walk is finished.
+    #[allow(clippy::should_implement_trait)] // A lending step: an `Iterator` cannot lend.
+    pub fn next(&mut self) -> Result<Option<RowRef<'_>>> {
+        self.buf.clear();
+        self.buf.key.extend_from_slice(&self.row);
+        loop {
+            if !self.carry && !self.read_column()? {
+                break;
+            }
+            self.carry = false;
+            let family = self.col.family.expect("a read column has a family");
+            if self.buf.len() > 0 && self.buf.len() + self.col.cells.len() > self.n {
+                self.carry = true;
+                break;
+            }
+            for data in self.col.cells.drain(..) {
+                push_cell(&mut self.buf, family, &self.col.qualifier, data);
+            }
+            self.last = Some(family);
+            self.last_qualifier.clear();
+            self.last_qualifier.extend_from_slice(&self.col.qualifier);
+            if self.buf.len() >= self.n {
+                break;
+            }
+        }
+        Ok((self.buf.len() > 0).then(|| RowRef::borrowed(&self.buf)))
+    }
+
+    /// Reads the next whole column into `col`: `false` at the end of the row.
+    fn read_column(&mut self) -> Result<bool> {
+        self.col.cells.clear();
+        self.col.qualifier.clear();
+        if let Some((family, data)) = self.ahead.take() {
+            self.col.family = Some(family);
+            std::mem::swap(&mut self.col.qualifier, &mut self.ahead_qualifier);
+            self.col.cells.push(data);
+        } else if self.walk.step()? {
+            self.col.family = self.walk.family;
+            self.col.qualifier.extend_from_slice(&self.walk.qualifier);
+            self.col
+                .cells
+                .push(std::mem::replace(&mut self.walk.data, CellData::EMPTY));
+        } else {
+            return Ok(false);
+        }
+        while self.walk.step()? {
+            let data = std::mem::replace(&mut self.walk.data, CellData::EMPTY);
+            if self.walk.family == self.col.family && self.walk.qualifier == self.col.qualifier {
+                self.col.cells.push(data);
+            } else {
+                let family = self.walk.family.expect("set by a step");
+                self.ahead_qualifier.clear();
+                self.ahead_qualifier.extend_from_slice(&self.walk.qualifier);
+                self.ahead = Some((family, data));
+                break;
+            }
+        }
+        Ok(true)
+    }
+
+    /// The last column on the pages handed out so far, to resume after in a later read
+    /// ([`RowRead::resume_after`]).
+    pub fn position(&self) -> Option<RowPosition> {
+        self.last.map(|f| {
+            RowPosition(ColumnPosition::new(
+                self.walk.core.info.id,
+                f,
+                self.last_qualifier.clone(),
+            ))
+        })
+    }
+}
+
+fn push_cell(buf: &mut RowBuf, family: FamilyId, qualifier: &[u8], data: CellData) {
+    let start = buf.qualifiers.len();
+    buf.qualifiers.extend_from_slice(qualifier);
+    let end = buf.qualifiers.len();
+    buf.push(family, start..end, data);
+}
+
+impl<'t> RowRead<'t> {
+    /// The row's cells, one at a time ([`RowCells`], D297): for a row too wide to read
+    /// whole. It reads like a scan of one row (the row cache is not consulted), with this
+    /// read's selection, versions and column limit. The column limit counts columns per
+    /// family, per call: a walk resumed in a later call counts afresh.
+    pub fn cells(self) -> Result<RowCells<'t>> {
+        let walk = CellWalk::new(self.core, &self.row, self.sel, self.resume.as_ref())?;
+        Ok(RowCells { walk })
+    }
+
+    /// The row's cells in pages of at most `n` cells, each ending at a column boundary
+    /// ([`RowPages`], D297). `n` of 0 is taken as 1. The column limit counts columns per
+    /// family over the whole walk (not per page), and afresh in each resumed call.
+    pub fn pages(self, n: usize) -> Result<RowPages<'t>> {
+        let walk = CellWalk::new(self.core, &self.row, self.sel, self.resume.as_ref())?;
+        let buf = RowBuf::new(Arc::clone(&walk.info), 0);
+        Ok(RowPages {
+            walk,
+            row: self.row,
+            n: n.max(1),
+            buf,
+            col: Column::default(),
+            carry: false,
+            ahead: None,
+            ahead_qualifier: Vec::new(),
+            last: None,
+            last_qualifier: Vec::new(),
+        })
+    }
+
+    /// [`RowRead::read`] after [`RowRead::resume_after`]: the walk's cells into one row.
+    fn read_resumed(self) -> Result<Option<RowRef<'t>>> {
+        let row = self.row.clone();
+        let mut walk = CellWalk::new(self.core, &self.row, self.sel, self.resume.as_ref())?;
+        let mut buf = RowBuf::new(Arc::clone(&walk.info), 0);
+        while walk.step()? {
+            let family = walk.family.expect("set by a step");
+            let data = std::mem::replace(&mut walk.data, CellData::EMPTY);
+            push_cell(&mut buf, family, &walk.qualifier, data);
+        }
+        if buf.len() == 0 {
+            return Ok(None);
+        }
+        buf.key = row;
+        Ok(Some(RowRef::owned(buf)))
     }
 }
 
@@ -598,6 +1276,31 @@ impl<'t> Scan<'t> {
         })
     }
 
+    /// The scan's cells one at a time, row after row ([`ScanCells`], D297): a scan over rows
+    /// that may be too wide to read whole. Each cell is lent until the next call.
+    pub fn cells(mut self) -> Result<ScanCells<'t>> {
+        let generation = self.core.db.generation();
+        let (info, snapshot, families) = self.sel.start(&self.core)?;
+        let mut spec = ScanSpec::new(self.start, self.end);
+        spec.read = self.sel.spec;
+        spec.read.families = families.into_vec();
+        spec.limit = self.limit.unwrap_or(0);
+        let cursor = self
+            .core
+            .with(|e| e.scan(&snapshot, self.core.info.id, spec))?;
+        Ok(ScanCells {
+            cursor,
+            info,
+            table: self.core,
+            generation,
+            in_row: false,
+            done: self.limit == Some(0),
+            qualifier: Vec::new(),
+            data: CellData::EMPTY,
+            family: None,
+        })
+    }
+
     /// The scan as a [`Stream`](futures_core::Stream) of owned [`Row`]s, in key order (see
     /// [`nonblocking`](crate::nonblocking)): each tablet is positioned without blocking, and
     /// the blocks each step will read are fetched asynchronously first, only as the stream
@@ -620,6 +1323,115 @@ impl<'t> Scan<'t> {
             Ok((cursor, RowBuf::new(info, 0)))
         })();
         crate::nonblocking::RowStream::new(started, limit_zero, self.core, generation)
+    }
+}
+
+/// A scan's cells one at a time, row after row ([`Scan::cells`], D297). Each cell and its
+/// row key are lent until the next call, so the walk allocates nothing per cell; a large
+/// value stays pinned rather than copied. Rows come in key order; within a row, cells come
+/// by family, then qualifier, then newest version first.
+///
+/// ```
+/// use pigeonhole::{Family, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+/// g.mutate(b"a").put("out", b"b", b"").put("out", b"c", b"").commit()?;
+/// g.mutate(b"b").put("out", b"c", b"").commit()?;
+///
+/// let mut edges = Vec::new();
+/// let mut cells = g.scan_prefix(b"").family("out").cells()?;
+/// while let Some((row, e)) = cells.next()? {
+///     edges.push((row.to_vec(), e.qualifier.to_vec()));
+/// }
+/// assert_eq!(edges.len(), 3);
+/// assert_eq!(edges[2], (b"b".to_vec(), b"c".to_vec()));
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "a cell walk reads nothing until .next()"]
+pub struct ScanCells<'t> {
+    cursor: ScanCursor,
+    info: Arc<TableInfo>,
+    table: Cow<'t, Arc<TableCore>>,
+    generation: u64,
+    in_row: bool,
+    done: bool,
+    qualifier: Vec<u8>,
+    data: CellData,
+    /// The current cell's family, and its index in `info`.
+    family: Option<(FamilyId, usize)>,
+}
+
+impl ScanCells<'_> {
+    /// The next cell and its row key, lent until the next call; `None` at the end of the
+    /// scan. After an error the walk is finished.
+    #[allow(clippy::should_implement_trait)] // A lending step: an `Iterator` cannot lend.
+    pub fn next(&mut self) -> Result<Option<(&[u8], CellEntry<'_>)>> {
+        if self.done {
+            return Ok(None);
+        }
+        let r = self
+            .table
+            .db
+            .check_generation(self.generation)
+            .and_then(|()| self.step());
+        if !matches!(r, Ok(true)) {
+            self.done = true;
+        }
+        if !r? {
+            return Ok(None);
+        }
+        let family = self
+            .family
+            .and_then(|(_, i)| self.info.families.get(i))
+            .map_or("", |f| f.name.as_str());
+        Ok(Some((
+            self.cursor.row(),
+            CellEntry {
+                family,
+                qualifier: &self.qualifier,
+                cell: CellRef::borrowed(&self.data),
+            },
+        )))
+    }
+
+    fn step(&mut self) -> Result<bool> {
+        loop {
+            if !self.in_row {
+                if !self.cursor.next_row()? {
+                    return Ok(false);
+                }
+                self.in_row = true;
+            }
+            let Some(cell) = self.cursor.next_cell()? else {
+                self.in_row = false;
+                continue;
+            };
+            self.qualifier.clear();
+            self.qualifier.extend_from_slice(cell.qualifier);
+            let id = cell.family;
+            let small = cell.stored.len() <= CellData::INLINE_MAX;
+            if small {
+                self.data.set_inline(cell.ts, cell.stored);
+            } else {
+                self.data = self.cursor.current_data();
+            }
+            if self.family.is_none_or(|(f, _)| f != id) {
+                let i = self
+                    .info
+                    .families
+                    .iter()
+                    .position(|f| f.id == id)
+                    .unwrap_or(usize::MAX);
+                self.family = Some((id, i));
+            }
+            return Ok(true);
+        }
     }
 }
 

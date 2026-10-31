@@ -3221,6 +3221,22 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
 - a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #1196).
 
+<a id="d297"></a>
+## D297 — Wide rows read cell by cell or in pages, resumed by position (perf287, 2026-10-31; owner accepted revision 2, #489 c6537678922, c6537699771, c6537762158; reviewed by ctr274 and cli692; pigeonhole, engine, #489 item 1, ICR 0095)
+**Why.** A whole-row read builds every cell into one buffer, so a graph hub costs memory in proportion to its edges: a 2M-edge row allocated 824 MB in #489's baseline (AX102). Paging inside a row already worked through the index, but only by hand (`qualifier_range` plus `column_limit`, a fresh read per page).
+
+**Decided.**
+- **`RowRead::cells()`** walks one row's cells with a lending cursor (`RowCells::next`): each cell is borrowed until the next call, a small value copied into one reused cell and a large one pinned. No allocation per cell.
+- **`RowRead::pages(n)`** lends pages of whole columns, at most `n` cells unless one column's versions alone exceed it, from one walk and one reused buffer.
+- **`RowRead::resume_after(&RowPosition)`** resumes after a column: families the read selects before the position's are skipped, the position's family resumes past its column, later families start at the selection's bound. A position whose family the read does not select, or from another table, is `InvalidArgument`. Without an explicit snapshot, a chain of calls is not one consistent read.
+- **`RowPosition`** wraps the engine's `ColumnPosition` (table, family, qualifier); its byte form is version 1, the ids as `u32` LE, the qualifier varint-prefixed (≤ 64 KiB). It names no row.
+- **`Scan::cells()`** walks a scan cell by cell.
+- **The column limit** counts columns per family, over one walk, afresh in each call.
+- **No new engine read path:** the walks drive `ScanCursor`'s borrowed cell step. `read()`, scans and gets are unchanged, and the row cache is not consulted.
+- **Async (PR 2):** a lending `poll_next` and `next_async`, owned streams behind the `async` feature, and an engine `poll_next_cell` sibling with fetch-ahead inside a row, so a cold hub walk reads with about 0 `async_sync_reads`.
+
+**Measured (AX102, a 2M-edge hub, warm):** `cells()` 71.6 ns/edge and 4.8 KB allocated for the walk (`read()`: 122 ns/edge, 738 MB); RocksDB's prefix iterator 71.0 ns/edge. `pages(1000)` 104 µs a page, over D297's 95 µs target; the page fill's cell copies are a follow-up with the callgrind shapes.
+
 <a id="d298"></a>
 ## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D186 for aggregate families in PR 5)
 **Why.** The owner's minimum set for #488, on D294's machinery: bitwise OR, AND and XOR; `f64` min and max; an exact `f64` sum; mean and variance; fixed-bucket histograms; bloom union. Also log-linear quantiles, and #489's roaring `u32` set. Kinds with parameters need a field on `PutFamily`; cli692's #490 vector kind needs one too, so the two share it.
@@ -3368,6 +3384,23 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **With D291 checkpoints at 128:** reads are p50 25 µs, p99 60 µs, close to HLL's 27 µs and 54 µs.
   - **With checkpoints off:** a read refolds every pending input with a full decode and encode of the sketch, giving p50 10.4 ms and p99 26 ms.
   - **Consequence for PR 5:** its 4 KiB checkpoint cap must not come without §4.2's compaction fold, or a fold of many `F64` inputs into one decoded sketch. A larger sketch would otherwise lose its checkpoints and read in milliseconds.
+
+<a id="d299"></a>
+## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)
+**Why.** A BFS hop, a batch lookup or an HNSW neighbourhood reads many rows known up front, and today each row read sets up its read from scratch: routing, gathering the family's sources, a new iterator per SST, a fresh row buffer. In #489's baseline that setup is about half the cost of a dense frontier (row reads 2.18 µs/row against one scan's 0.97 over the same rows, AX102) and seven allocations a row.
+
+**Decided.**
+- **`KeySet`** (engine, re-exported by `pigeonhole`): sorted, distinct row keys in one flat buffer (`from_unsorted` sorts and dedupes; `from_sorted` checks). D296 PR 2's `Keys` input imports it, with `key_groups` (runs of keys routing to one tablet).
+- **`KeyCursor`** (engine, `Engine::multi_get`), a sibling of `ScanCursor` and `read_row_into` (D296's R3: neither changes). Per tablet group and family it keeps its memtable sources and one SST iterator per SST it has read from, for every key of the group. Per key:
+  - an SST takes part only if the row is within its key range and its row filter may hold it, as for a point row read;
+  - a source that takes part moves forward from where the previous key left it (`seek_forward`; a full seek if it is new or ran past its end); SST iterators read without `one_row`, so they can move on;
+  - the merge is rebuilt over just those sources (`MergingCursor::rebuild_positioned`, `CellResolver::seek_with`), and the family's resolver reads the row as a row read does.
+- **Borrowed cell steps for consumers** (cli692's M2): `next_key`, `next_cell`/`next_cell_into`, `push_next_cell`, `current_data`, and `skip_rest_of_key` (D296's `NextRow`). `KeyRows` fills one reused row buffer with them; D296's visitor runs on the borrowed cells.
+- **`Table::keys(&KeySet)`** (and on `ReadTable`) returns `KeysRead`, with a row read's selection, `versions` and a per-row `column_limit`; `read()` returns `KeyRows`, which lends `(index, RowRef)` for each key with a cell the selection keeps, in key order, under one snapshot. The row cache is not consulted.
+- **Not in 1.1** (cli692's M3): `parallel(n)` on the lending `KeyRows`. Parallel key-set reads go through D296's bounded `reduce`.
+- **PR 2:** the async form, with an 8-key lookahead that fetches the blocks of the next keys from an index-only probe (M4).
+
+**Measured (PR 1, Mac, warm, 300K-node graph, row cache off for both):** a dense frontier (10,000 contiguous rows) 0.86 µs/row against 1.48 for row reads, with no allocation per row (7 for row reads); a sparse BFS hop 1.71–1.77 µs/row against 1.93–2.16. The AX102 figures come with PR 2's box run.
 
 <a id="d300"></a>
 ## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)
