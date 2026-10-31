@@ -192,6 +192,13 @@
 # run_group's 16-cell loop compiled differently once the group code left it (per function:
 # option -69, zip +60, run_group's own lines +46, SmallVec -45), with no work to remove,
 # while commit-one, commit-at and commit-async fell 29-30 and commit-overwrite 26.
+#
+# New shapes for #1227 (#1225; D297's row walks and D299's multi-get, D193: every shape has
+# a ceiling), each the head's count (run 41213378854, e0ff4747) times (1 + headroom):
+# wide-row-cells 1501 and wide-row-pages 1515 with 0.3%; multi-get-dense 12505 and
+# multi-get-sparse 17022 with 0.5%, since they read 0.2% and 0.1% above the base there on code
+# this PR does not touch. wide-row-pages fell from 1965 on main (-22.9%): pages are filled
+# directly, without a per-column buffer.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
@@ -222,3 +229,7 @@ scan-narrow-q1 5277 0.3
 scan-wide-q10 1784 0.3
 scan-wide-q1 14326 0.3
 scan-interleaved 3394 0.3
+wide-row-cells 1506 0.3
+wide-row-pages 1520 0.3
+multi-get-dense 12568 0.5
+multi-get-sparse 17108 0.5

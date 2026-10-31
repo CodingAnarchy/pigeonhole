@@ -990,6 +990,59 @@ impl<'t> CellWalk<'t> {
         }
     }
 
+    /// [`CellWalk::step`] straight into `buf` (the cell's qualifier unescaped into its
+    /// qualifiers, a small value copied, a large one pinned): `false` at the end of the walk.
+    /// `qualifier`, `data` and `family` are not set.
+    fn push_step(&mut self, buf: &mut RowBuf) -> Result<bool> {
+        if self.done {
+            return Ok(false);
+        }
+        let r = self
+            .core
+            .db
+            .check_generation(self.generation)
+            .and_then(|()| {
+                loop {
+                    let Some(cursor) = self.cursor.as_mut() else {
+                        let Some(mut next) = self.pending.pop() else {
+                            return Ok(false);
+                        };
+                        if next.next_row()? {
+                            self.cursor = Some(next);
+                        }
+                        continue;
+                    };
+                    // `next_cell` and the sink's pushes, not `ScanCursor::push_next_cell`: a
+                    // third caller of that changed how it inlines into the scan's row fill
+                    // (+2-3% on the scan shapes, #1227's first callgrind run).
+                    let Some(cell) = cursor.next_cell()? else {
+                        self.cursor = None;
+                        continue;
+                    };
+                    let start = buf.qualifiers.len();
+                    buf.qualifiers.extend_from_slice(cell.qualifier);
+                    let qualifier = start..buf.qualifiers.len();
+                    if cell.stored.len() <= CellData::INLINE_MAX {
+                        pigeonhole_engine::RowSink::push_inline(
+                            buf,
+                            cell.family,
+                            qualifier,
+                            cell.ts,
+                            cell.stored,
+                        );
+                    } else {
+                        let family = cell.family;
+                        buf.push(family, qualifier, cursor.current_data());
+                    }
+                    return Ok(true);
+                }
+            });
+        if !matches!(r, Ok(true)) {
+            self.done = true;
+        }
+        r
+    }
+
     /// The current cell's family name.
     fn family_name(&mut self) -> &str {
         let Some(id) = self.family else {
@@ -1126,24 +1179,13 @@ pub struct RowPages<'t> {
     row: Vec<u8>,
     n: usize,
     buf: RowBuf,
-    /// The column read last: its cells, all versions the selection keeps.
-    col: Column,
-    /// `col` is a whole column that did not fit the last page: it starts the next one.
-    carry: bool,
-    /// The first cell of the column after `col`, read to find `col`'s end.
-    ahead: Option<(FamilyId, CellData)>,
-    ahead_qualifier: Vec<u8>,
+    /// The versions of the column that starts the next page (its family as an index into
+    /// the table's families) and its qualifier: a column that did not fit this one.
+    carry: Vec<(usize, CellData)>,
+    carry_qualifier: Vec<u8>,
     /// The last column on the pages handed out.
     last: Option<FamilyId>,
     last_qualifier: Vec<u8>,
-}
-
-/// One column's cells (reused buffers).
-#[derive(Debug, Default)]
-struct Column {
-    family: Option<FamilyId>,
-    qualifier: Vec<u8>,
-    cells: Vec<CellData>,
 }
 
 impl RowPages<'_> {
@@ -1153,59 +1195,38 @@ impl RowPages<'_> {
     pub fn next(&mut self) -> Result<Option<RowRef<'_>>> {
         self.buf.clear();
         self.buf.key.extend_from_slice(&self.row);
+        self.buf.push_column(&mut self.carry, &self.carry_qualifier);
+        // Cells go straight into the page. A column boundary shows as a cell whose column
+        // differs from the one before; the column it starts goes to the next page when this
+        // one is full, and so does a column that grows past `n` on a page it did not start.
+        let mut col_start = 0;
         loop {
-            if !self.carry && !self.read_column()? {
+            let before = self.buf.len();
+            if !self.walk.push_step(&mut self.buf)? {
                 break;
             }
-            self.carry = false;
-            let family = self.col.family.expect("a read column has a family");
-            if self.buf.len() > 0 && self.buf.len() + self.col.cells.len() > self.n {
-                self.carry = true;
+            if before == 0 {
+                continue;
+            }
+            if !self.buf.same_column(before - 1, before) {
+                if before >= self.n {
+                    self.buf
+                        .split_off_column(before, &mut self.carry, &mut self.carry_qualifier);
+                    break;
+                }
+                col_start = before;
+            } else if col_start > 0 && self.buf.len() > self.n {
+                self.buf
+                    .split_off_column(col_start, &mut self.carry, &mut self.carry_qualifier);
                 break;
             }
-            for data in self.col.cells.drain(..) {
-                push_cell(&mut self.buf, family, &self.col.qualifier, data);
-            }
+        }
+        if let Some((family, qualifier)) = self.buf.last_column() {
             self.last = Some(family);
             self.last_qualifier.clear();
-            self.last_qualifier.extend_from_slice(&self.col.qualifier);
-            if self.buf.len() >= self.n {
-                break;
-            }
+            self.last_qualifier.extend_from_slice(qualifier);
         }
         Ok((self.buf.len() > 0).then(|| RowRef::borrowed(&self.buf)))
-    }
-
-    /// Reads the next whole column into `col`: `false` at the end of the row.
-    fn read_column(&mut self) -> Result<bool> {
-        self.col.cells.clear();
-        self.col.qualifier.clear();
-        if let Some((family, data)) = self.ahead.take() {
-            self.col.family = Some(family);
-            std::mem::swap(&mut self.col.qualifier, &mut self.ahead_qualifier);
-            self.col.cells.push(data);
-        } else if self.walk.step()? {
-            self.col.family = self.walk.family;
-            self.col.qualifier.extend_from_slice(&self.walk.qualifier);
-            self.col
-                .cells
-                .push(std::mem::replace(&mut self.walk.data, CellData::EMPTY));
-        } else {
-            return Ok(false);
-        }
-        while self.walk.step()? {
-            let data = std::mem::replace(&mut self.walk.data, CellData::EMPTY);
-            if self.walk.family == self.col.family && self.walk.qualifier == self.col.qualifier {
-                self.col.cells.push(data);
-            } else {
-                let family = self.walk.family.expect("set by a step");
-                self.ahead_qualifier.clear();
-                self.ahead_qualifier.extend_from_slice(&self.walk.qualifier);
-                self.ahead = Some((family, data));
-                break;
-            }
-        }
-        Ok(true)
     }
 
     /// The last column on the pages handed out so far, to resume after in a later read
@@ -1249,10 +1270,8 @@ impl<'t> RowRead<'t> {
             row: self.row,
             n: n.max(1),
             buf,
-            col: Column::default(),
-            carry: false,
-            ahead: None,
-            ahead_qualifier: Vec::new(),
+            carry: Vec::new(),
+            carry_qualifier: Vec::new(),
             last: None,
             last_qualifier: Vec::new(),
         })
