@@ -3221,6 +3221,22 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
 - a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #1196).
 
+<a id="d297"></a>
+## D297 — Wide rows read cell by cell or in pages, resumed by position (perf287, 2026-10-31; owner accepted revision 2, #489 c6537678922, c6537699771, c6537762158; reviewed by ctr274 and cli692; pigeonhole, engine, #489 item 1, ICR 0095)
+**Why.** A whole-row read builds every cell into one buffer, so a graph hub costs memory in proportion to its edges: a 2M-edge row allocated 824 MB in #489's baseline (AX102). Paging inside a row already worked through the index, but only by hand (`qualifier_range` plus `column_limit`, a fresh read per page).
+
+**Decided.**
+- **`RowRead::cells()`** walks one row's cells with a lending cursor (`RowCells::next`): each cell is borrowed until the next call, a small value copied into one reused cell and a large one pinned. No allocation per cell.
+- **`RowRead::pages(n)`** lends pages of whole columns, at most `n` cells unless one column's versions alone exceed it, from one walk and one reused buffer.
+- **`RowRead::resume_after(&RowPosition)`** resumes after a column: families the read selects before the position's are skipped, the position's family resumes past its column, later families start at the selection's bound. A position whose family the read does not select, or from another table, is `InvalidArgument`. Without an explicit snapshot, a chain of calls is not one consistent read.
+- **`RowPosition`** wraps the engine's `ColumnPosition` (table, family, qualifier); its byte form is version 1, the ids as `u32` LE, the qualifier varint-prefixed (≤ 64 KiB). It names no row.
+- **`Scan::cells()`** walks a scan cell by cell.
+- **The column limit** counts columns per family, over one walk, afresh in each call.
+- **No new engine read path:** the walks drive `ScanCursor`'s borrowed cell step. `read()`, scans and gets are unchanged, and the row cache is not consulted.
+- **Async (PR 2):** a lending `poll_next` and `next_async`, owned streams behind the `async` feature, and an engine `poll_next_cell` sibling with fetch-ahead inside a row, so a cold hub walk reads with about 0 `async_sync_reads`.
+
+**Measured (AX102, a 2M-edge hub, warm):** `cells()` 71.6 ns/edge and 4.8 KB allocated for the walk (`read()`: 122 ns/edge, 738 MB); RocksDB's prefix iterator 71.0 ns/edge. `pages(1000)` 104 µs a page, over D297's 95 µs target; the page fill's cell copies are a follow-up with the callgrind shapes.
+
 <a id="d298"></a>
 ## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D186 for aggregate families in PR 5)
 **Why.** The owner's minimum set for #488, on D294's machinery: bitwise OR, AND and XOR; `f64` min and max; an exact `f64` sum; mean and variance; fixed-bucket histograms; bloom union. Also log-linear quantiles, and #489's roaring `u32` set. Kinds with parameters need a field on `PutFamily`; cli692's #490 vector kind needs one too, so the two share it.
