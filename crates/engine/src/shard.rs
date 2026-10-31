@@ -95,16 +95,25 @@ const ROOM_RECHECK_CAP: u64 = 100;
 /// 1 ms, doubling up to `ROOM_RECHECK_CAP` times this.
 const ROOM_RECHECK_NANOS: u64 = 1_000_000;
 
+/// Stamps run 1 to `u32::MAX` (0 means "not waiting"), so they count milliseconds modulo
+/// this.
+const ROOM_STAMPS: u64 = u32::MAX as u64;
+
 /// A member's `room_since`: the shard clock in milliseconds (wrapping after 49 days, never
-/// 0) when it first waited for arena room.
+/// 0) when it first waited for arena room. No two milliseconds in a row share a stamp, even
+/// at the wrap (#1235: `max(1)` once folded two into 1).
 fn room_stamp(now: u64) -> u32 {
-    ((now / 1_000_000) as u32).wrapping_add(1).max(1)
+    ((now / 1_000_000) % ROOM_STAMPS) as u32 + 1
 }
 
 /// When (in nanoseconds on the clock that reads `now`) the member stamped `stamp` began
-/// waiting, to the millisecond.
+/// waiting, never earlier than it did (#1235). Stamps `d` milliseconds apart span a wait of
+/// more than `d − 1` ms and less than `d + 1`, so counting `d − 1` is a strict lower bound:
+/// a member is refused at `write_stall_timeout_nanos` of its own wait or up to 2 ms after,
+/// never before (D124, D240).
 fn room_since(stamp: u32, now: u64) -> u64 {
-    let waited = u64::from(room_stamp(now).wrapping_sub(stamp)) * 1_000_000;
+    let stamps = (u64::from(room_stamp(now)) + ROOM_STAMPS - u64::from(stamp)) % ROOM_STAMPS;
+    let waited = stamps.saturating_sub(1) * 1_000_000;
     now.saturating_sub(waited)
 }
 
@@ -10860,6 +10869,32 @@ impl ShardHandler for ShardState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_room_wait_is_never_counted_longer_than_it_lasted() {
+        // #1235: the millisecond stamps made a member's wait up to 1 ms longer than it was,
+        // so a 200 ms timeout refused it after 199.51 ms. Every start offset within a
+        // millisecond, and every wait from 0 to 3 ms past the timeout, across a stamp wrap.
+        let timeout = 200_000_000u64;
+        for base in [1_000_000_000u64, (u64::from(u32::MAX) - 5) * 1_000_000] {
+            for offset in (0..1_000_000).step_by(37_013) {
+                let start = base + offset;
+                let stamp = room_stamp(start);
+                for wait in (0..=timeout + 3_000_000).step_by(499_979) {
+                    let now = start + wait;
+                    let counted = now - room_since(stamp, now);
+                    assert!(
+                        counted <= wait,
+                        "start {start}: counted {counted} of {wait}"
+                    );
+                    assert!(
+                        wait - counted < 2_000_000,
+                        "start {start}: {counted} of {wait}"
+                    );
+                }
+            }
+        }
+    }
 
     /// One committer against a stalled shard for two simulated seconds: it commits while
     /// the bucket has a token, else waits for the timer, whose wake `wake` delays as the
