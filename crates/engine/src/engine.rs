@@ -2408,7 +2408,7 @@ impl Engine {
             table,
             &families,
             spec,
-            (now, may_fan_out),
+            (now, may_fan_out, &self.inner.shared),
             &visitor,
             &reducer,
         )

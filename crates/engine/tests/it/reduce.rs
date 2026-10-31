@@ -4,6 +4,7 @@
 //! visitor sees resolved cells only. Cells order as the scan hands them out (row, family,
 //! qualifier, newest version first), so each brute force below is positions in the scan.
 //! Fan-out (scoped threads, from a thread that drives no shard) equals the sequential read.
+//! A `Keys` input (D296 PR 2) reads as a one-row scan of each key would, and as multi-get.
 
 use crate::common;
 
@@ -16,9 +17,9 @@ use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{
-    CellKey, CellRef, CellVisitor, Dedupe, Engine, EngineShard, FamilyOptions, Limit, ReadInput,
-    ReadSpec, ReduceSpec, Reducer, RowRange, ScanSpec, Snapshot, TopK, ValuePredicate, ValueRef,
-    Visit, WriteBatch,
+    CellKey, CellRef, CellVisitor, Dedupe, Engine, EngineShard, FamilyOptions, KeySet, Limit,
+    ReadInput, ReadSpec, ReduceSpec, Reducer, RowRange, ScanSpec, Snapshot, TopK, ValuePredicate,
+    ValueRef, Visit, WriteBatch,
 };
 use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::{Durability, FamilyId, TableId, Timestamp};
@@ -471,4 +472,129 @@ fn overlapping_or_unsorted_ranges_are_refused() {
             "{err:?}"
         );
     }
+}
+
+/// Present rows, deleted rows (r0001 and every 35th from r0036), a row past the data and a
+/// key before it.
+fn key_set() -> Arc<KeySet> {
+    let mut keys: Vec<Vec<u8>> = (0..ROWS).step_by(3).map(row).collect();
+    keys.extend([row(1), row(36), row(9999), b"a".to_vec()]);
+    Arc::new(KeySet::from_unsorted(keys))
+}
+
+/// Each key's cells from a one-row scan, in key order.
+fn cells_of_keys(db: &Db, snap: &Snapshot, keys: &KeySet, read: &ReadSpec) -> Vec<Cell> {
+    keys.iter()
+        .flat_map(|k| {
+            let one = (Bound::Included(k.to_vec()), Bound::Included(k.to_vec()));
+            scan_cells(db, snap, one, read)
+        })
+        .collect()
+}
+
+#[test]
+fn keys_input_reads_each_key_as_a_one_row_scan_and_as_multi_get() {
+    let db = setup(4907);
+    let snap = db.engine.snapshot().unwrap();
+    let keys = key_set();
+    let mut over_five = ReadSpec::default();
+    over_five.value = Some(ValuePredicate::I64(Ordering::Greater, 5));
+    for read in [ReadSpec::default(), over_five] {
+        let want = cells_of_keys(&db, &snap, &keys, &read);
+        assert!(!want.is_empty());
+        let mut spec = ReduceSpec::new(ReadInput::Keys(Arc::clone(&keys)));
+        spec.read = read.clone();
+        let got = db
+            .engine
+            .reduce(&snap, db.table, &spec, || Every, All::default)
+            .unwrap();
+        assert_eq!(ids(&got.items), cell_ids(&want), "read {:?}", read.value);
+        assert_eq!(got.stats.cells as usize, want.len());
+
+        let mut cur = db
+            .engine
+            .multi_get(&snap, db.table, (*keys).clone(), read.clone())
+            .unwrap();
+        let mut multi = Vec::new();
+        while let Some(i) = cur.next_key().unwrap() {
+            let r = keys.get(i).to_vec();
+            while let Some(c) = cur.next_cell().unwrap() {
+                multi.push((r.clone(), c.family, c.qualifier.to_vec(), c.ts));
+            }
+        }
+        assert_eq!(multi, cell_ids(&want), "multi-get agrees");
+    }
+}
+
+#[test]
+fn keys_input_fans_out_per_tablet_and_equals_the_sequential_read() {
+    let mut db = setup(4908);
+    // Key groups are per tablet: three tablets, so the read has three groups to share.
+    for at in [row(100), row(200)] {
+        let split = db.engine.split_tablet_pending(db.table, &at).unwrap();
+        drive(&mut db._shards, split).unwrap();
+    }
+    let snap = db.engine.snapshot().unwrap();
+    let keys = key_set();
+    let cells = cells_of_keys(&db, &snap, &keys, &ReadSpec::default());
+    let spec = ReduceSpec::new(ReadInput::Keys(Arc::clone(&keys)));
+    for n in [1usize, 17, 100_000] {
+        let seq = db
+            .engine
+            .reduce(&snap, db.table, &spec, || Every, || Limit::new(n))
+            .unwrap();
+        assert_eq!(ids(&seq.items), cell_ids(&cells[..n.min(cells.len())]));
+        let par_spec = fanned(&spec);
+        let engine = Arc::clone(&db.engine);
+        let par =
+            off_thread(|| engine.reduce(&snap, db.table, &par_spec, || Every, || Limit::new(n)))
+                .unwrap();
+        assert_eq!(par.items, seq.items, "n = {n}: fan-out equals sequential");
+        assert!(par.stats.threads > 1, "n = {n}: {:?}", par.stats);
+        assert_eq!(seq.stats.groups, 3, "n = {n}: one group per tablet");
+    }
+    let seq = db
+        .engine
+        .reduce(&snap, db.table, &spec, || Score, || TopK::new(25))
+        .unwrap();
+    let par_spec = fanned(&spec);
+    let engine = Arc::clone(&db.engine);
+    let par = off_thread(|| engine.reduce(&snap, db.table, &par_spec, || Score, || TopK::new(25)))
+        .unwrap();
+    assert_eq!(par.items, seq.items);
+}
+
+#[test]
+fn keys_input_next_row_skips_the_rest_of_a_key_and_stop_ends_the_group() {
+    let db = setup(4909);
+    let snap = db.engine.snapshot().unwrap();
+    let keys = key_set();
+    let cells = cells_of_keys(&db, &snap, &keys, &ReadSpec::default());
+    let mut want: Vec<Cell> = Vec::new();
+    for c in &cells {
+        if want.last().is_none_or(|l| l.0 != c.0) {
+            want.push(c.clone());
+        }
+    }
+    let spec = ReduceSpec::new(ReadInput::Keys(Arc::clone(&keys)));
+    let got = db
+        .engine
+        .reduce(&snap, db.table, &spec, || FirstPerRow, All::default)
+        .unwrap();
+    assert_eq!(ids(&got.items), cell_ids(&want));
+    assert_eq!(
+        got.stats.cells as usize,
+        want.len(),
+        "the rest of each key was skipped, not visited"
+    );
+
+    // `Stop` ends only its own group (one per tablet): the groups before `at` read in full,
+    // and every group from the one holding `at` stops at its first key at or past it.
+    let at = row(100);
+    let got = db
+        .engine
+        .reduce(&snap, db.table, &spec, || StopAt(at.clone()), All::default)
+        .unwrap();
+    let before: Vec<Cell> = cells.iter().filter(|c| c.0 < at).cloned().collect();
+    assert_eq!(ids(&got.items), cell_ids(&before));
 }
