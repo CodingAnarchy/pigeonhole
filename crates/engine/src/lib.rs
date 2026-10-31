@@ -70,6 +70,7 @@ pub use error::{Error, Result};
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::EngineOptions;
+pub use read::keys::{KeyCursor, KeySet};
 pub use read::reduce::{
     CellKey, CellRef, CellVisitor, Dedupe, Limit, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec,
     ReduceStats, Reduced, Reducer, RowRange, TopK, Visit,

@@ -256,7 +256,12 @@ pub(crate) fn scan_is_short(remaining: u64) -> bool {
 
 /// Read options for a scan or a point read. `short` (scans only): the scan's limit leaves it
 /// short ([`scan_is_short`]), so its readahead starts later.
-fn read_options(priority: Priority, scan: bool, short: bool, cache_only: bool) -> ReadOptions {
+pub(crate) fn read_options(
+    priority: Priority,
+    scan: bool,
+    short: bool,
+    cache_only: bool,
+) -> ReadOptions {
     let mut o = ReadOptions::default();
     o.priority = priority;
     if scan {

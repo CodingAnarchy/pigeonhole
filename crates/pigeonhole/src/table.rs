@@ -641,6 +641,12 @@ impl Table {
         self.core.scan_prefix(prefix)
     }
 
+    /// Starts a multi-get of `keys` ([`KeysRead`](crate::KeysRead), D299): their rows in key
+    /// order under one snapshot, each tablet's read set up once for all of its keys.
+    pub fn keys<'t>(&'t self, keys: &crate::KeySet) -> crate::KeysRead<'t> {
+        crate::KeysRead::new(&self.core, keys)
+    }
+
     /// Starts a scan from explicit bounds (the form a C ABI exports).
     pub fn scan_bounds(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Scan<'_> {
         self.core.scan(start, end)
@@ -733,6 +739,12 @@ impl ReadTable {
     /// Starts a scan of every row starting with `prefix`.
     pub fn scan_prefix(&self, prefix: &[u8]) -> Scan<'_> {
         self.core.scan_prefix(prefix)
+    }
+
+    /// Starts a multi-get of `keys` ([`KeysRead`](crate::KeysRead), D299): their rows in key
+    /// order under one snapshot, each tablet's read set up once for all of its keys.
+    pub fn keys<'t>(&'t self, keys: &crate::KeySet) -> crate::KeysRead<'t> {
+        crate::KeysRead::new(&self.core, keys)
     }
 
     /// Starts a scan from explicit bounds.

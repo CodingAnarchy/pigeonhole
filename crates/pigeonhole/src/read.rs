@@ -3,7 +3,8 @@ use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
 use pigeonhole_engine::{
-    FamilyId, QualifierFilter, ReadSpec, ScanCursor, ScanSpec, TableInfo, ValuePredicate,
+    FamilyId, KeyCursor, KeySet, QualifierFilter, ReadSpec, ScanCursor, ScanSpec, TableInfo,
+    ValuePredicate,
 };
 
 use smallvec::SmallVec;
@@ -464,6 +465,136 @@ impl RowRead<'_> {
             Ok(Ok(f)) => crate::nonblocking::RowFuture::new(Ok(f), self.row),
             Err(e) => crate::nonblocking::RowFuture::new(Err(e), self.row),
         }
+    }
+}
+
+/// A multi-get under construction ([`Table::keys`](crate::Table::keys), D299). Finish with
+/// [`KeysRead::read`].
+///
+/// It reads the rows of a [`KeySet`] in key order, under one snapshot (the one given, or one
+/// taken at `read`), with the selection applied to every row. Each tablet's read is set up
+/// once for all of its keys, and each row's sources move forward from the previous key's:
+/// sorted keys that share blocks share their decode. Keys whose row has no cell the
+/// selection keeps are skipped. The row cache is not consulted.
+///
+/// ```
+/// use pigeonhole::{Family, KeySet, Options, Pigeonhole};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+/// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+/// g.mutate(b"v:1").put("out", b"v:2", b"").put("out", b"v:3", b"").commit()?;
+/// g.mutate(b"v:3").put("out", b"v:1", b"").commit()?;
+///
+/// // One hop of a BFS: the neighbours of every node in the frontier.
+/// let frontier = KeySet::from_unsorted([&b"v:3"[..], b"v:1", b"v:9"]);
+/// let mut next = Vec::new();
+/// let mut rows = g.keys(&frontier).family("out").read()?;
+/// while let Some((i, row)) = rows.next()? {
+///     assert!(frontier.get(i) != b"v:9"); // no row: skipped
+///     next.extend(row.iter().map(|e| e.qualifier.to_vec()));
+/// }
+/// assert_eq!(next.len(), 3);
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "a multi-get does nothing until .read()"]
+pub struct KeysRead<'t> {
+    core: &'t TableCore,
+    keys: KeySet,
+    sel: Selection,
+}
+
+impl<'t> KeysRead<'t> {
+    pub(crate) fn new(core: &'t TableCore, keys: &KeySet) -> Self {
+        Self {
+            core,
+            keys: keys.clone(),
+            sel: Selection::new(),
+        }
+    }
+
+    selection_methods!();
+
+    /// Up to `n` versions of each column (0: all retained).
+    pub fn versions(mut self, n: u32) -> Self {
+        self.sel.spec.versions = n;
+        self
+    }
+
+    /// At most `n` columns per family in each row (a hub in a frontier stays a page).
+    pub fn column_limit(mut self, n: u32) -> Self {
+        self.sel.spec.columns_per_row = n;
+        self
+    }
+
+    /// Starts the read.
+    pub fn read(mut self) -> Result<KeyRows<'t>> {
+        let generation = self.core.db.generation();
+        let (info, snapshot, families) = self.sel.start(self.core)?;
+        let mut spec = self.sel.spec;
+        spec.families = families.into_vec();
+        let cursor = self
+            .core
+            .with(|e| e.multi_get(&snapshot, self.core.info.id, self.keys, spec))?;
+        Ok(KeyRows {
+            cursor,
+            buf: RowBuf::new(info, 0),
+            core: self.core,
+            generation,
+            done: false,
+        })
+    }
+}
+
+/// The rows of a multi-get, in key order ([`KeysRead::read`]): each lent with its index in
+/// the [`KeySet`] until the next call. One buffer is reused for every row.
+#[derive(Debug)]
+pub struct KeyRows<'t> {
+    cursor: KeyCursor,
+    buf: RowBuf,
+    core: &'t TableCore,
+    generation: u64,
+    done: bool,
+}
+
+impl KeyRows<'_> {
+    /// The next row with a cell the selection keeps, and its key's index in the key set;
+    /// `None` after the last. After an error the read is finished.
+    #[allow(clippy::should_implement_trait)] // A lending step: an `Iterator` cannot lend.
+    pub fn next(&mut self) -> Result<Option<(usize, RowRef<'_>)>> {
+        if self.done {
+            return Ok(None);
+        }
+        let r = self
+            .core
+            .db
+            .check_generation(self.generation)
+            .and_then(|()| self.fill());
+        match r {
+            Ok(Some(i)) => Ok(Some((i, RowRef::borrowed(&self.buf)))),
+            Ok(None) => {
+                self.done = true;
+                Ok(None)
+            }
+            Err(e) => {
+                self.done = true;
+                Err(e)
+            }
+        }
+    }
+
+    fn fill(&mut self) -> Result<Option<usize>> {
+        self.buf.clear();
+        let Some(i) = self.cursor.next_key()? else {
+            return Ok(None);
+        };
+        self.buf.key.extend_from_slice(self.cursor.row());
+        while self.cursor.push_next_cell(&mut self.buf)? {}
+        Ok(Some(i))
     }
 }
 
