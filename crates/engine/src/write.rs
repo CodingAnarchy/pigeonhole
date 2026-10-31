@@ -108,6 +108,20 @@ impl Default for WriteBatch {
     }
 }
 
+/// Refuses what is never a merge operand: a blob pointer, and a vector (D303: a vector
+/// family takes puts only, and tag 0x04 never lands outside one).
+fn check_operand(operand: ValueRef<'_>) -> crate::Result<()> {
+    match operand {
+        ValueRef::Blob(_) => Err(Error::InvalidArgument(
+            "a blob pointer cannot be a merge operand".to_owned(),
+        )),
+        ValueRef::Vector(_) => Err(Error::InvalidArgument(
+            "a vector cannot be a merge operand: put it into a vector family".to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 impl WriteBatch {
     /// An empty batch.
     pub fn new() -> Self {
@@ -160,14 +174,6 @@ impl WriteBatch {
             )?;
             return Ok(());
         }
-        // Tag 0x04 belongs only in a vector family (D303), whose creation sets `incompat` bit
-        // 0 first: a vector in any other family would reach a file 1.0.x opens. No family
-        // takes one until #490 B PR 2 checks writes against the family's parameters.
-        if matches!(value, ValueRef::Vector(_)) {
-            return Err(Error::Unsupported(
-                "vector values are not writable yet (#490 B PR 2)",
-            ));
-        }
         self.value_buf.clear();
         encode_value(&mut self.value_buf, value);
         self.builder
@@ -185,11 +191,7 @@ impl WriteBatch {
         qualifier: &[u8],
         operand: ValueRef<'_>,
     ) -> crate::Result<()> {
-        if matches!(operand, ValueRef::Blob(_)) {
-            return Err(Error::InvalidArgument(
-                "a blob pointer cannot be a merge operand".to_owned(),
-            ));
-        }
+        check_operand(operand)?;
         self.push_value(table, family, Kind::Merge, row, qualifier, None, operand)
     }
 
@@ -204,11 +206,7 @@ impl WriteBatch {
         ts: Timestamp,
         operand: ValueRef<'_>,
     ) -> crate::Result<()> {
-        if matches!(operand, ValueRef::Blob(_)) {
-            return Err(Error::InvalidArgument(
-                "a blob pointer cannot be a merge operand".to_owned(),
-            ));
-        }
+        check_operand(operand)?;
         self.push_value(
             table,
             family,

@@ -5,6 +5,7 @@ use std::task::{Context, Poll, Waker};
 
 use pigeonhole_engine::{FamilyId, PendingCommit, Predicate, TableId, Txn, ValueRef};
 use pigeonhole_format::key::MAX_KEY_PART;
+use pigeonhole_format::vector::{Params as FormatParams, Query, VectorRef as FormatVectorRef};
 
 use crate::db::Db;
 use crate::table::{Operand, TableCore};
@@ -148,6 +149,13 @@ const MAX_PUT_VALUE: usize = u32::MAX as usize - 1;
 
 /// An engine batch plus the first error met while building it (builders never fail; the
 /// error surfaces at commit).
+/// A checked vector's value: the family's element and dimension over `payload`.
+fn vector_value<'a>(p: &FormatParams, payload: &'a [u8]) -> ValueRef<'a> {
+    ValueRef::Vector(
+        FormatVectorRef::new(p.element, p.dim, payload).expect("checked against the family"),
+    )
+}
+
 #[derive(Debug, Default)]
 struct Builder {
     batch: EngineBatch,
@@ -157,6 +165,13 @@ struct Builder {
 }
 
 impl Builder {
+    /// Records `e` as the batch's error, unless an earlier call failed.
+    fn fail(&mut self, e: Error) {
+        if self.error.is_none() {
+            self.error = Some(e);
+        }
+    }
+
     /// Runs `f` against the batch with `family` resolved, unless an earlier call failed. For
     /// a typed operand, a family that refuses it is refused
     /// ([`TableCore::operand_family_id`]).
@@ -546,6 +561,54 @@ impl RowMutation<'_> {
         self.op(family, qualifier, 8, |b, t, f, row| {
             b.put(t, f, row, qualifier, Some(ts), ValueRef::F64(value))
         })
+    }
+
+    /// Puts the `f32` vector `value` into a vector family (D303,
+    /// [`VectorSpec`](crate::VectorSpec)) at the commit timestamp. A vector of another
+    /// element type or dimension, a non-finite component, an all-zero vector in a cosine
+    /// family, or a family that isn't a vector family fails with `InvalidArgument`.
+    pub fn put_vector_f32(self, family: &str, qualifier: &[u8], value: &[f32]) -> Self {
+        self.vector(family, qualifier, None, Query::F32(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) at an explicit timestamp.
+    pub fn put_vector_f32_at(self, family: &str, qualifier: &[u8], ts: u64, value: &[f32]) -> Self {
+        self.vector(family, qualifier, Some(ts), Query::F32(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) for an `i8` vector family.
+    pub fn put_vector_i8(self, family: &str, qualifier: &[u8], value: &[i8]) -> Self {
+        self.vector(family, qualifier, None, Query::I8(value))
+    }
+
+    /// [`put_vector_i8`](Self::put_vector_i8) at an explicit timestamp.
+    pub fn put_vector_i8_at(self, family: &str, qualifier: &[u8], ts: u64, value: &[i8]) -> Self {
+        self.vector(family, qualifier, Some(ts), Query::I8(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) for a bit vector family: `value` is the bits,
+    /// packed eight to a byte, least significant first.
+    pub fn put_vector_bits(self, family: &str, qualifier: &[u8], value: &[u8]) -> Self {
+        self.vector(family, qualifier, None, Query::Bits(value))
+    }
+
+    /// [`put_vector_bits`](Self::put_vector_bits) at an explicit timestamp.
+    pub fn put_vector_bits_at(self, family: &str, qualifier: &[u8], ts: u64, value: &[u8]) -> Self {
+        self.vector(family, qualifier, Some(ts), Query::Bits(value))
+    }
+
+    /// A vector put, checked against the family's spec when it is built.
+    fn vector(mut self, family: &str, qualifier: &[u8], ts: Option<u64>, q: Query<'_>) -> Self {
+        let mut buf = Vec::new();
+        match self.table.vector_payload(family, q, &mut buf) {
+            Err(e) => {
+                self.builder.fail(e);
+                self
+            }
+            Ok(p) => self.op(family, qualifier, buf.len(), |b, t, f, row| {
+                b.put(t, f, row, qualifier, ts, vector_value(&p, &buf))
+            }),
+        }
     }
 
     /// Atomically adds `delta` (wrapping) to the counter in a counter family
@@ -1032,6 +1095,105 @@ impl WriteBatch {
         self.op(table, row, family, qualifier, 8, |b, t, f| {
             b.put(t, f, row, qualifier, Some(ts), ValueRef::F64(value))
         })
+    }
+
+    /// Puts the `f32` vector `value` into a vector family (D303), as
+    /// [`RowMutation::put_vector_f32`] does.
+    pub fn put_vector_f32(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[f32],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::F32(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) at an explicit timestamp.
+    pub fn put_vector_f32_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[f32],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::F32(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) for an `i8` vector family.
+    pub fn put_vector_i8(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[i8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::I8(value))
+    }
+
+    /// [`put_vector_i8`](Self::put_vector_i8) at an explicit timestamp.
+    pub fn put_vector_i8_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[i8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::I8(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) for a bit vector family (bits packed eight to
+    /// a byte, least significant first).
+    pub fn put_vector_bits(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::Bits(value))
+    }
+
+    /// [`put_vector_bits`](Self::put_vector_bits) at an explicit timestamp.
+    pub fn put_vector_bits_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::Bits(value))
+    }
+
+    /// A vector put, checked against the family's spec when it is built.
+    fn vector(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: Option<u64>,
+        q: Query<'_>,
+    ) -> &mut Self {
+        let mut buf = Vec::new();
+        match table.core.vector_payload(family, q, &mut buf) {
+            Err(e) => {
+                self.builder.fail(e);
+                self
+            }
+            Ok(p) => self.op(table, row, family, qualifier, buf.len(), |b, t, f| {
+                b.put(t, f, row, qualifier, ts, vector_value(&p, &buf))
+            }),
+        }
     }
 
     /// Adds to the counter of a counter family (see [`RowMutation::incr`]).
@@ -1920,6 +2082,107 @@ impl Transaction {
         self.op(table, row, family, qualifier, 8, |b, t, f| {
             b.put(t, f, row, qualifier, Some(ts), ValueRef::F64(value))
         })
+    }
+
+    /// Puts the `f32` vector `value` into a vector family (D303), as
+    /// [`RowMutation::put_vector_f32`] does.
+    pub fn put_vector_f32(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[f32],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::F32(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) at an explicit timestamp.
+    pub fn put_vector_f32_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[f32],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::F32(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) for an `i8` vector family.
+    pub fn put_vector_i8(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[i8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::I8(value))
+    }
+
+    /// [`put_vector_i8`](Self::put_vector_i8) at an explicit timestamp.
+    pub fn put_vector_i8_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[i8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::I8(value))
+    }
+
+    /// [`put_vector_f32`](Self::put_vector_f32) for a bit vector family (bits packed eight to
+    /// a byte, least significant first).
+    pub fn put_vector_bits(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::Bits(value))
+    }
+
+    /// [`put_vector_bits`](Self::put_vector_bits) at an explicit timestamp.
+    pub fn put_vector_bits_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u8],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::Bits(value))
+    }
+
+    /// A vector put, checked against the family's spec when it is built.
+    fn vector(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: Option<u64>,
+        q: Query<'_>,
+    ) -> &mut Self {
+        let mut buf = Vec::new();
+        match table.core.vector_payload(family, q, &mut buf) {
+            Err(e) => {
+                if self.error.is_none() {
+                    self.error = Some(e);
+                }
+                self
+            }
+            Ok(p) => self.op(table, row, family, qualifier, buf.len(), |b, t, f| {
+                b.put(t, f, row, qualifier, ts, vector_value(&p, &buf))
+            }),
+        }
     }
 
     /// Buffers an add to the bucket at `ts` of a counter family (see

@@ -1,16 +1,17 @@
-//! D303 PR 1 (#490 B): the engine knows the vector family kind. Its parameters are checked
-//! at creation (`InvalidArgument` for a malformed list, a tag the kind doesn't define, or
-//! values out of range or mispaired), and a well-formed vector family is refused as
-//! `Unsupported` until its write checks land (PR 2), and so is a vector value put or merged
-//! into any family (tag 0x04 only ever lands in a vector family). A vector family is not an
-//! aggregate.
+//! D303 (#490 B): vector families. Their parameters are checked at creation
+//! (`InvalidArgument` for a malformed list, a tag the kind doesn't define, values out of range
+//! or mispaired, or any merge operator). The commit gate takes a vector put only into a vector
+//! family, of its element type and dimension, with finite components and (under cosine) not
+//! all zeros; a vector family takes no other put and no merge, and no other family takes a
+//! vector. A vector family is not an aggregate: a put takes the commit timestamp and keeps
+//! its versions, and two puts never combine.
 
 use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;
 
-use pigeonhole_engine::{Engine, Error, FamilyOptions, ValueRef, WriteBatch};
+use pigeonhole_engine::{Engine, Error, FamilyOptions, ReadSpec, ValueRef, WriteBatch};
 use pigeonhole_format::kind_params;
 use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::vector::{Element, Metric, Params, VectorRef};
@@ -22,14 +23,22 @@ fn vector(params: Vec<u8>) -> FamilyOptions {
         .kind_params(params)
 }
 
-#[test]
-fn vector_families_check_their_parameters_and_wait_for_pr_2() {
-    let vfs = SimVfs::new(4931);
-    let db = Engine::open(
+fn le(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|x| x.to_le_bytes()).collect()
+}
+
+fn open(seed: u64) -> Arc<Engine> {
+    let vfs = SimVfs::new(seed);
+    Engine::open(
         Path::new("/db/vector_family.phdb"),
         common::options(Arc::clone(&vfs), 1, 16 << 20),
     )
-    .unwrap();
+    .unwrap()
+}
+
+#[test]
+fn vector_families_check_their_parameters_and_take_no_operator() {
+    let db = open(4931);
     let raw =
         |e: u8, d: u32, m: u8| kind_params::encode(&[(1, &[e]), (2, &d.to_le_bytes()), (3, &[m])]);
     for (bad, why) in [
@@ -50,33 +59,169 @@ fn vector_families_check_their_parameters_and_wait_for_pr_2() {
             other => panic!("{bad:?}: {other:?}"),
         }
     }
-    let ok = Params::new(Element::F32, 768, Metric::Cosine).unwrap();
-    assert!(matches!(
-        db.create_table("t", &[("v".into(), vector(ok.encode()))]),
-        Err(Error::Unsupported(_))
-    ));
+    let ok = Params::new(Element::F32, 4, Metric::Cosine)
+        .unwrap()
+        .encode();
+    for op in ["pigeonhole.i64_add", "app.concat"] {
+        match db.create_table("t", &[("v".into(), vector(ok.clone()).merge_operator(op))]) {
+            Err(Error::InvalidArgument(msg)) => assert!(msg.contains("no merge operator"), "{msg}"),
+            other => panic!("{op}: {other:?}"),
+        }
+    }
     assert!(
         db.table("t").is_none(),
         "nothing was created by a refused family"
     );
+    db.create_table("t", &[("v".into(), vector(ok))]).unwrap();
     assert!(!FamilyKind::Vector.is_aggregate() && FamilyKind::Vector.values_stay_inline());
+}
 
-    // A vector value into a standard family: refused at the batch, put and merge alike, so
-    // tag 0x04 never reaches a file without the vector kind's feature bit.
+#[test]
+fn the_commit_gate_keeps_vectors_in_vector_families_of_their_spec() {
+    let db = open(4932);
+    let spec = |e, d, m| Params::new(e, d, m).unwrap().encode();
     let t = db
-        .create_table("s", &[("f".into(), FamilyOptions::default())])
+        .create_table(
+            "t",
+            &[
+                ("cos".into(), vector(spec(Element::F32, 2, Metric::Cosine))),
+                ("i8".into(), vector(spec(Element::I8, 2, Metric::L2))),
+                ("std".into(), FamilyOptions::default()),
+            ],
+        )
         .unwrap();
-    let f = t.families[0].id;
-    let payload = 1.0f32.to_le_bytes();
-    let v = ValueRef::Vector(VectorRef::new(Element::F32, 1, &payload).unwrap());
+    let (cos, i8f, std) = (
+        t.family("cos").unwrap().id,
+        t.family("i8").unwrap().id,
+        t.family("std").unwrap().id,
+    );
+    let put = |f, value: ValueRef<'_>| {
+        let mut wb = WriteBatch::new();
+        wb.put(t.id, f, b"r", b"q", None, value)?;
+        db.commit(wb, None).map(|_| ())
+    };
+    let refused = |r: Result<(), Error>, why: &str| match r {
+        Err(Error::InvalidArgument(msg)) => assert!(msg.contains(why), "{why}: {msg}"),
+        other => panic!("{why}: {other:?}"),
+    };
+    let ok = le(&[0.6, 0.8]);
+    put(
+        cos,
+        ValueRef::Vector(VectorRef::new(Element::F32, 2, &ok).unwrap()),
+    )
+    .unwrap();
+    let three = le(&[1.0, 2.0, 3.0]);
+    refused(
+        put(
+            cos,
+            ValueRef::Vector(VectorRef::new(Element::F32, 3, &three).unwrap()),
+        ),
+        "takes no vector",
+    );
+    refused(
+        put(
+            cos,
+            ValueRef::Vector(VectorRef::new(Element::I8, 2, &[1, 2]).unwrap()),
+        ),
+        "takes no vector",
+    );
+    let zero = le(&[0.0, -0.0]);
+    refused(
+        put(
+            cos,
+            ValueRef::Vector(VectorRef::new(Element::F32, 2, &zero).unwrap()),
+        ),
+        "all zeros",
+    );
+    let nan = le(&[f32::NAN, 1.0]);
+    refused(
+        put(
+            cos,
+            ValueRef::Vector(VectorRef::new(Element::F32, 2, &nan).unwrap()),
+        ),
+        "finite",
+    );
+    refused(put(cos, ValueRef::Bytes(b"bytes")), "takes vectors");
+    refused(put(cos, ValueRef::I64(7)), "takes vectors");
+    // An i8 L2 family takes the zero vector; no other family takes a vector.
+    put(
+        i8f,
+        ValueRef::Vector(VectorRef::new(Element::I8, 2, &[0, 0]).unwrap()),
+    )
+    .unwrap();
+    refused(
+        put(
+            std,
+            ValueRef::Vector(VectorRef::new(Element::F32, 2, &ok).unwrap()),
+        ),
+        "not a vector family",
+    );
+    // Never a merge operand, in any family.
     let mut wb = WriteBatch::new();
+    let v = ValueRef::Vector(VectorRef::new(Element::F32, 2, &ok).unwrap());
     assert!(matches!(
-        wb.put(t.id, f, b"r", b"q", None, v),
-        Err(Error::Unsupported(_))
+        wb.merge(t.id, cos, b"r", b"q", v),
+        Err(Error::InvalidArgument(_))
     ));
     assert!(matches!(
-        wb.merge(t.id, f, b"r", b"q", v),
-        Err(Error::Unsupported(_))
+        wb.merge(t.id, std, b"r", b"q", v),
+        Err(Error::InvalidArgument(_))
     ));
-    assert!(wb.is_empty(), "nothing was added to the batch");
+    // A merge of anything into a vector family: it has no operator.
+    let mut wb = WriteBatch::new();
+    wb.merge(t.id, cos, b"r", b"q", ValueRef::I64(1)).unwrap();
+    assert!(matches!(
+        db.commit(wb, None),
+        Err(Error::InvalidArgument(_))
+    ));
+}
+
+#[test]
+fn vector_cells_version_like_a_standard_familys() {
+    let db = open(4933);
+    let t = db
+        .create_table(
+            "t",
+            &[(
+                "v".into(),
+                vector(Params::new(Element::F32, 2, Metric::L2).unwrap().encode()),
+            )],
+        )
+        .unwrap();
+    let f = t.family("v").unwrap().id;
+    let mut ts = Vec::new();
+    for v in [[1.0f32, 2.0], [3.0, 4.0]] {
+        let bytes = le(&v);
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t.id,
+            f,
+            b"r",
+            b"q",
+            None,
+            ValueRef::Vector(VectorRef::new(Element::F32, 2, &bytes).unwrap()),
+        )
+        .unwrap();
+        db.commit(wb, None).unwrap();
+        ts.push(
+            db.get_latest(t.id, f, b"r", b"q")
+                .unwrap()
+                .unwrap()
+                .timestamp(),
+        );
+    }
+    assert!(
+        ts[0] > 0 && ts[1] > ts[0],
+        "commit timestamps, not a fixed one: {ts:?}"
+    );
+    let cell = db.get_latest(t.id, f, b"r", b"q").unwrap().unwrap();
+    let ValueRef::Vector(v) = cell.value() else {
+        panic!("a vector");
+    };
+    assert_eq!(v.as_bytes(), le(&[3.0, 4.0]), "the newest put, not a sum");
+    let snap = db.snapshot().unwrap();
+    let mut spec = ReadSpec::default();
+    spec.versions = 0;
+    let row = db.read_row(&snap, t.id, b"r", &spec).unwrap().unwrap();
+    assert_eq!(row.cells.len(), 2, "both versions kept (max_versions 0)");
 }

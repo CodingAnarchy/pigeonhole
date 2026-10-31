@@ -77,6 +77,10 @@ pub pigeonhole::Durability::Buffered = 1
 pub pigeonhole::Durability::GroupSync = 2
 pub pigeonhole::Durability::None = 0
 pub pigeonhole::Durability::Sync = 3
+#[non_exhaustive] pub enum pigeonhole::Element
+pub pigeonhole::Element::Bit
+pub pigeonhole::Element::F32
+pub pigeonhole::Element::I8
 #[non_exhaustive] #[repr(u32)] pub enum pigeonhole::ErrorCode
 pub pigeonhole::ErrorCode::BatchTooLarge = 27
 pub pigeonhole::ErrorCode::Busy = 24
@@ -117,6 +121,11 @@ pub pigeonhole::FailureCause::Panic = 1
 pub pigeonhole::IoBackend::Auto
 pub pigeonhole::IoBackend::Pread
 pub pigeonhole::IoBackend::Uring
+#[non_exhaustive] pub enum pigeonhole::Metric
+pub pigeonhole::Metric::Cosine
+pub pigeonhole::Metric::Hamming
+pub pigeonhole::Metric::InnerProduct
+pub pigeonhole::Metric::L2
 #[non_exhaustive] pub enum pigeonhole::Priority
 pub pigeonhole::Priority::High
 pub pigeonhole::Priority::Low
@@ -156,6 +165,7 @@ pub pigeonhole::Value::Bytes(&'a [u8])
 pub pigeonhole::Value::F64(f64)
 pub pigeonhole::Value::I64(i64)
 pub pigeonhole::Value::Varint(i64)
+pub pigeonhole::Value::Vector(pigeonhole::VectorRef<'a>)
 #[non_exhaustive] pub enum pigeonhole::ValueFilter
 pub pigeonhole::ValueFilter::Equals(alloc::vec::Vec<u8>)
 pub pigeonhole::ValueFilter::I64(core::cmp::Ordering, i64)
@@ -184,6 +194,7 @@ impl pigeonhole::Cell
 pub fn pigeonhole::Cell::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::Cell::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::Cell::as_u64(&self) -> core::option::Option<u64>
+pub fn pigeonhole::Cell::as_vector(&self) -> core::option::Option<pigeonhole::VectorRef<'_>>
 pub fn pigeonhole::Cell::bloom_contains(&self, i64) -> core::option::Option<bool>
 pub fn pigeonhole::Cell::bloom_contains_bytes(&self, &[u8]) -> core::option::Option<bool>
 pub fn pigeonhole::Cell::bloom_fill(&self) -> core::option::Option<f64>
@@ -205,6 +216,7 @@ impl<'a> pigeonhole::CellRef<'a>
 pub fn pigeonhole::CellRef<'a>::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::CellRef<'a>::as_i64(&self) -> core::option::Option<i64>
 pub fn pigeonhole::CellRef<'a>::as_u64(&self) -> core::option::Option<u64>
+pub fn pigeonhole::CellRef<'a>::as_vector(&self) -> core::option::Option<pigeonhole::VectorRef<'_>>
 pub fn pigeonhole::CellRef<'a>::bloom_contains(&self, i64) -> core::option::Option<bool>
 pub fn pigeonhole::CellRef<'a>::bloom_contains_bytes(&self, &[u8]) -> core::option::Option<bool>
 pub fn pigeonhole::CellRef<'a>::bloom_fill(&self) -> core::option::Option<f64>
@@ -339,6 +351,7 @@ pub fn pigeonhole::Family::counter() -> Self
 pub fn pigeonhole::Family::max_versions(self, u32) -> Self
 pub fn pigeonhole::Family::merge_operator(self, &str) -> Self
 pub fn pigeonhole::Family::ttl(self, core::time::Duration) -> Self
+pub fn pigeonhole::Family::vector(pigeonhole::VectorSpec) -> Self
 #[non_exhaustive] pub struct pigeonhole::FamilyInfo
 pub pigeonhole::FamilyInfo::aggregation: core::option::Option<pigeonhole::Aggregation>
 pub pigeonhole::FamilyInfo::blob_threshold: u32
@@ -353,6 +366,7 @@ pub pigeonhole::FamilyInfo::max_versions: u32
 pub pigeonhole::FamilyInfo::merge_operator: core::option::Option<alloc::string::String>
 pub pigeonhole::FamilyInfo::name: alloc::string::String
 pub pigeonhole::FamilyInfo::ttl: core::option::Option<core::time::Duration>
+pub pigeonhole::FamilyInfo::vector: core::option::Option<pigeonhole::VectorSpec>
 #[non_exhaustive] pub struct pigeonhole::FamilyStorage
 pub pigeonhole::FamilyStorage::blob_bytes: u64
 pub pigeonhole::FamilyStorage::blob_files: u64
@@ -605,6 +619,12 @@ pub fn pigeonhole::RowMutation<'_>::put_i64(self, &str, &[u8], i64) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_i64_at(self, &str, &[u8], u64, i64) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_u64(self, &str, &[u8], u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_u64_at(self, &str, &[u8], u64, u64) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_bits(self, &str, &[u8], &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_bits_at(self, &str, &[u8], u64, &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_f32(self, &str, &[u8], &[f32]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_f32_at(self, &str, &[u8], u64, &[f32]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_i8(self, &str, &[u8], &[i8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_i8_at(self, &str, &[u8], u64, &[i8]) -> Self
 impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
 impl pigeonhole::RowMutation<'_>
@@ -739,6 +759,12 @@ pub fn pigeonhole::Transaction::put_i64(&mut self, &pigeonhole::Table, &[u8], &s
 pub fn pigeonhole::Transaction::put_i64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
 pub fn pigeonhole::Transaction::put_u64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self
 pub fn pigeonhole::Transaction::put_u64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u64) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_bits(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_bits_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_f32(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[f32]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_f32_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[f32]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_i8(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[i8]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_i8_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[i8]) -> &mut Self
 impl pigeonhole::Transaction
 pub fn pigeonhole::Transaction::commit_async(self) -> pigeonhole::nonblocking::TransactionCommitFuture
 pub fn pigeonhole::Transaction::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::TransactionCommitFuture
@@ -770,6 +796,21 @@ pub pigeonhole::TraverseStats::cut_by_max_nodes: bool
 pub pigeonhole::TraverseStats::edges: u64
 pub pigeonhole::TraverseStats::hops_cut: u32
 pub pigeonhole::TraverseStats::rows: u64
+pub struct pigeonhole::VectorRef<'a>
+impl<'a> pigeonhole::VectorRef<'a>
+pub fn pigeonhole::VectorRef<'a>::as_bytes(&self) -> &'a [u8]
+pub fn pigeonhole::VectorRef<'a>::dim(&self) -> u32
+pub fn pigeonhole::VectorRef<'a>::element(&self) -> pigeonhole::Element
+pub fn pigeonhole::VectorRef<'a>::to_f32_vec(&self) -> core::option::Option<alloc::vec::Vec<f32>>
+pub struct pigeonhole::VectorSpec
+impl pigeonhole::VectorSpec
+pub fn pigeonhole::VectorSpec::dim(&self) -> u32
+pub fn pigeonhole::VectorSpec::distance_bits(&self, &[u8], pigeonhole::VectorRef<'_>) -> pigeonhole::Result<f64>
+pub fn pigeonhole::VectorSpec::distance_f32(&self, &[f32], pigeonhole::VectorRef<'_>) -> pigeonhole::Result<f64>
+pub fn pigeonhole::VectorSpec::distance_i8(&self, &[i8], pigeonhole::VectorRef<'_>) -> pigeonhole::Result<f64>
+pub fn pigeonhole::VectorSpec::element(&self) -> pigeonhole::Element
+pub fn pigeonhole::VectorSpec::metric(&self) -> pigeonhole::Metric
+pub fn pigeonhole::VectorSpec::new(u32, pigeonhole::Element, pigeonhole::Metric) -> pigeonhole::Result<Self>
 #[non_exhaustive] pub struct pigeonhole::WalFile
 pub pigeonhole::WalFile::checkpoint: pigeonhole::WalPosition
 pub pigeonhole::WalFile::end: pigeonhole::WalPosition
@@ -812,6 +853,12 @@ pub fn pigeonhole::WriteBatch::put_i64(&mut self, &pigeonhole::Table, &[u8], &st
 pub fn pigeonhole::WriteBatch::put_i64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_u64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_u64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u64) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_bits(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_bits_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_f32(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[f32]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_f32_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[f32]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_i8(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[i8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_i8_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[i8]) -> &mut Self
 impl pigeonhole::WriteBatch
 pub fn pigeonhole::WriteBatch::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
 pub fn pigeonhole::WriteBatch::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::CommitFuture

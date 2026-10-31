@@ -342,6 +342,12 @@ impl Catalog {
                         family.0, options.kind
                     ))
                 })?;
+                if options.kind == FamilyKind::Vector && !name.is_empty() {
+                    return Err(Error::Corruption(format!(
+                        "manifest: vector family {} names operator {name:?}",
+                        family.0
+                    )));
+                }
                 let (merge, merge_op) = if let Some(op) = builtin {
                     // An aggregate family folds with its kind's operator (writes refuse any
                     // other name, `check_merge_operator`).

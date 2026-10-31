@@ -214,6 +214,106 @@ impl Params {
     }
 }
 
+/// A vector given by a caller (a write's value, or a query), in its element's own type.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Query<'a> {
+    /// `f32` components.
+    F32(&'a [f32]),
+    /// `i8` components.
+    I8(&'a [i8]),
+    /// Bits, packed eight to a byte, LSB first.
+    Bits(&'a [u8]),
+}
+
+impl Query<'_> {
+    /// The element type.
+    pub fn element(&self) -> Element {
+        match self {
+            Query::F32(_) => Element::F32,
+            Query::I8(_) => Element::I8,
+            Query::Bits(_) => Element::Bit,
+        }
+    }
+
+    /// The dimension (eight per byte for bits).
+    pub fn dim(&self) -> usize {
+        match self {
+            Query::F32(q) => q.len(),
+            Query::I8(q) => q.len(),
+            Query::Bits(q) => 8 * q.len(),
+        }
+    }
+}
+
+impl Params {
+    /// Checks a caller's vector against the family (D303): its element type and dimension,
+    /// finite components, and not all zeros under cosine.
+    pub fn check(&self, q: Query<'_>) -> Result<(), VectorError> {
+        if q.element() != self.element || q.dim() != self.dim as usize {
+            return Err(VectorError(
+                "the vector's element type or dimension is not the family's",
+            ));
+        }
+        match q {
+            Query::F32(q) if q.iter().any(|x| !x.is_finite()) => Err(VectorError(
+                "a vector's components must be finite (no NaN or infinity)",
+            )),
+            _ if self.metric == Metric::Cosine && is_zero(q) => {
+                Err(VectorError("a cosine vector must not be all zeros"))
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// [`Params::check`], then the vector's payload (`f32` LE, `i8` or bits) appended to
+    /// `out`: what a put of it stores after the element and dimension.
+    pub fn payload(&self, q: Query<'_>, out: &mut Vec<u8>) -> Result<(), VectorError> {
+        self.check(q)?;
+        match q {
+            Query::F32(q) => out.extend(q.iter().flat_map(|x| x.to_le_bytes())),
+            Query::I8(q) => out.extend(q.iter().map(|x| *x as u8)),
+            Query::Bits(q) => out.extend_from_slice(q),
+        }
+        Ok(())
+    }
+
+    /// The distance from `q` to the stored vector `v` under the family's metric, smaller
+    /// nearer, with the `distance` kernels the engine ranks by (D296): `f32` kernels widened
+    /// exactly, `i8` and Hamming distances as exact integers. The caller has checked `q`
+    /// ([`Params::check`]) and `v` is the family's ([`Params::accepts`]); a mismatched
+    /// element pairing is NaN.
+    pub fn distance(&self, q: Query<'_>, v: &VectorRef<'_>) -> f64 {
+        use crate::distance as k;
+        let p = v.payload;
+        match (q, self.metric) {
+            (Query::F32(q), Metric::L2) => f64::from(k::l2_f32_le(q, p)),
+            (Query::F32(q), Metric::InnerProduct) => -f64::from(k::dot_norm_f32_le(q, p).0),
+            (Query::F32(q), Metric::Cosine) => {
+                let (dot, n2) = k::dot_norm_f32_le(q, p);
+                f64::from(k::cosine_from(dot, k::norm2_f32(q), n2))
+            }
+            (Query::I8(q), Metric::L2) => f64::from(k::l2_i8(q, p)),
+            (Query::I8(q), Metric::InnerProduct) => -f64::from(k::dot_i8(q, p)),
+            (Query::I8(q), Metric::Cosine) => {
+                let dot = f64::from(k::dot_i8(q, p));
+                let (nq, nv) = (f64::from(k::dot_i8(q, q)), f64::from(k::dot_i8(p, p)));
+                1.0 - dot / (nq.sqrt() * nv.sqrt())
+            }
+            (Query::Bits(q), Metric::Hamming) => f64::from(k::hamming(q, p)),
+            _ => f64::NAN,
+        }
+    }
+}
+
+/// Whether every component is zero (`-0.0` included).
+fn is_zero(q: Query<'_>) -> bool {
+    match q {
+        Query::F32(q) => q.iter().all(|x| *x == 0.0),
+        Query::I8(q) => q.iter().all(|x| *x == 0),
+        Query::Bits(q) => q.iter().all(|x| *x == 0),
+    }
+}
+
 /// A decoded vector value, borrowing its payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VectorRef<'a> {
@@ -257,6 +357,37 @@ impl<'a> VectorRef<'a> {
     /// The raw payload: `f32` LE, `i8` or packed bits.
     pub fn as_bytes(&self) -> &'a [u8] {
         self.payload
+    }
+
+    /// Checks the components a writer must refuse (D303): a non-finite `f32`, and under
+    /// cosine an all-zero vector (`-0.0` counts as zero), which has no direction. Bit and
+    /// `i8` components are always finite.
+    pub fn check_components(&self, metric: Metric) -> Result<(), VectorError> {
+        let p = self.payload;
+        if self.element == Element::F32
+            && p.as_chunks::<4>()
+                .0
+                .iter()
+                .any(|c| !f32::from_le_bytes(*c).is_finite())
+        {
+            return Err(VectorError(
+                "a vector's components must be finite (no NaN or infinity)",
+            ));
+        }
+        if metric == Metric::Cosine {
+            let zero = match self.element {
+                Element::F32 => p
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .all(|c| f32::from_le_bytes(*c) == 0.0),
+                Element::I8 | Element::Bit => p.iter().all(|b| *b == 0),
+            };
+            if zero {
+                return Err(VectorError("a cosine vector must not be all zeros"));
+            }
+        }
+        Ok(())
     }
 
     /// Appends the encoding after the value tag: element, `dim` varint, payload.
@@ -366,6 +497,42 @@ mod tests {
                 what: "vector element"
             })
         ));
+        // Components: non-finite f32 refused; cosine refuses all zeros (-0.0 too).
+        let f = |xs: &[f32]| -> Vec<u8> { xs.iter().flat_map(|x| x.to_le_bytes()).collect() };
+        let ok = f(&[0.0, 1.0]);
+        let zero = f(&[0.0, -0.0]);
+        let nan = f(&[1.0, f32::NAN]);
+        let inf = f(&[f32::INFINITY, 1.0]);
+        let v = |b| VectorRef::new(Element::F32, 2, b).unwrap();
+        assert!(v(&ok).check_components(Metric::Cosine).is_ok());
+        assert!(v(&zero).check_components(Metric::Cosine).is_err());
+        assert!(v(&zero).check_components(Metric::L2).is_ok());
+        assert!(v(&nan).check_components(Metric::L2).is_err());
+        assert!(v(&inf).check_components(Metric::InnerProduct).is_err());
+        let i8z = VectorRef::new(Element::I8, 2, &[0, 0]).unwrap();
+        assert!(i8z.check_components(Metric::Cosine).is_err());
+        assert!(i8z.check_components(Metric::L2).is_ok());
+        // A caller's vector: checked, encoded, scored with the shared kernels.
+        let p = Params::new(Element::F32, 2, Metric::Cosine).unwrap();
+        assert!(p.check(Query::F32(&[1.0])).is_err(), "wrong dimension");
+        assert!(p.check(Query::I8(&[1, 2])).is_err(), "wrong element");
+        assert!(p.check(Query::F32(&[0.0, -0.0])).is_err(), "cosine zero");
+        assert!(p.check(Query::F32(&[f32::NAN, 1.0])).is_err(), "NaN");
+        let mut payload = Vec::new();
+        p.payload(Query::F32(&[3.0, 4.0]), &mut payload).unwrap();
+        let v = VectorRef::new(Element::F32, 2, &payload).unwrap();
+        assert!(p.distance(Query::F32(&[3.0, 4.0]), &v).abs() < 1e-7);
+        let q8 = Params::new(Element::I8, 2, Metric::L2).unwrap();
+        let mut b8 = Vec::new();
+        q8.payload(Query::I8(&[-128, 127]), &mut b8).unwrap();
+        let v8 = VectorRef::new(Element::I8, 2, &b8).unwrap();
+        assert_eq!(
+            q8.distance(Query::I8(&[127, -128]), &v8),
+            2.0 * 255.0 * 255.0
+        );
+        let qb = Params::new(Element::Bit, 8, Metric::Hamming).unwrap();
+        let vb = VectorRef::new(Element::Bit, 8, &[0b1010_1010]).unwrap();
+        assert_eq!(qb.distance(Query::Bits(&[0b0101_0101]), &vb), 8.0);
         // 4096 dimensions fit; 4097 do not.
         let big = vec![0u8; 4 * 4096];
         assert!(VectorRef::new(Element::F32, 4096, &big).is_ok());

@@ -1372,6 +1372,17 @@ impl Family {
         }
     }
 
+    /// A vector family (D303): every value is a vector of `spec`'s element type and
+    /// dimension, ranked by its metric. See [`VectorSpec`](crate::VectorSpec) for the writes
+    /// it takes and what it refuses.
+    pub fn vector(spec: crate::VectorSpec) -> Self {
+        Self {
+            options: FamilyOptions::default()
+                .kind(FamilyKind::Vector)
+                .kind_params(spec.kind_params()),
+        }
+    }
+
     /// A counter family: every cell is an `i64` sum (decision D179).
     ///
     /// - [`incr`](crate::RowMutation::incr) adds to the column's counter, which lives at

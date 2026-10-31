@@ -3554,6 +3554,12 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - Golden siblings `values_vector.bin` and `edit_put_family_vector.bin`, frozen; the roundtrip proptest over element and dim; the fuzz harness behind a forced `0x04` and through `Params::parse`.
 - `it/vector_family.rs`: eight malformed parameter lists are `InvalidArgument`, a well-formed family is `Unsupported` with nothing created, and a vector put or merge into a Standard family is refused (perf287's B1).
 
+**Checks (PR 2).**
+- `it/vector_family.rs` (rewritten): the eight malformed lists and any merge operator are `InvalidArgument` at creation; the commit gate refuses a vector of another dimension or element, an all-zero cosine vector, a NaN component, a plain `Bytes` or `I64` put into a vector family, and a vector into a Standard family; a vector is never a merge operand; a vector put takes the commit timestamp, keeps both versions, and the newest wins (never combined).
+- `pigeonhole/tests/vectors.rs`: `f32` cosine, `i8` L2 and bit Hamming families written through `RowMutation`, `WriteBatch` and `Transaction`, across a flush and a compaction and at a 16-byte blob threshold (vectors stay inline), read back as `Value::Vector` with `to_f32_vec`, `as_bytes` and `FamilyInfo::vector`; `VectorSpec::distance_*` exact for `i8` and bits; build-time refusals (dimension, element, NaN, cosine zero, a non-vector family), plain puts, merges and aggregate inputs refused, and a refused write failing its whole batch.
+- `format::vector`: `Params::{check, payload, distance}` and `VectorRef::check_components`; the `i8` kernels score a stored vector's bytes as its `i8`s.
+- **Not in PR 2:** a vector family in the pigeonhole model target, a follow-up; the integration test covers the write and read paths meanwhile.
+
 <a id="d304"></a>
 ## D304 — Traversal pushdown: breadth-first hops run in the engine, each a bounded read of the frontier (perf287, 2026-10-31; owner accepted revision 2, #489 c6544597002, c6544636857, c6544708521; reviewed by simp724 and cli692; engine, pigeonhole, #489 item 3, ICR 0099; on D296 and D299)
 **Why.** A BFS over adjacency rows was a client loop over `keys()`: every edge was materialised and copied into the client's neighbour list, duplicates and visited nodes included, and a hub could not be capped without reading it whole (283 ms and 824 MB for a 2M-edge hub through `read()`).
