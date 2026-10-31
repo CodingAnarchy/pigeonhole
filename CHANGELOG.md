@@ -4,6 +4,13 @@ All notable changes to Pigeonhole are recorded here. The format follows [Keep a 
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-31
+
+A correctness fix: snapshots are monotonic again. Upgrade recommended. The file format and the shared-memory layout are unchanged, so a 1.0.1 writer and 1.0.0 reader processes work together, and files move freely between 1.0.0 and 1.0.1.
+
+### Fixed
+- **A snapshot no longer sees fewer commits than an earlier one** (#1208, D300). While two shards reserved seqnos at once, the visible seqno could briefly go backwards: a later snapshot, in the writer process or in a reader process, could miss a commit an earlier snapshot had shown, including a writer's own acknowledged commit. No uncommitted data was ever visible. A shard's hold is now published under the seqno allocator's lock. Readers and the shared-memory layout are unchanged.
+
 ## [1.0.0] - 2026-10-30
 
 Pigeonhole 1.0.0 is the first stable release of an embedded, single-file, wide-column store in Rust: BigTable's data model with SQLite's deployment model. It completes **Phase 4, hardening and 1.0**:
@@ -635,7 +642,8 @@ The first release: the **Phase 1 core engine** of an embedded, single-file, wide
 - Application-owned mode still runs the default I/O backend's 2-16 I/O threads (Phase 3).
 - `pigeonhole-cli` (`phdb`) is a placeholder until Phase 4.
 
-[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/CodingAnarchy/pigeonhole/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.0...v1.0.0
 [0.3.4]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.3.3...v0.3.4
 [0.2.6]: https://github.com/CodingAnarchy/pigeonhole/compare/v0.2.5...v0.2.6

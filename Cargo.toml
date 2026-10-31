@@ -21,7 +21,7 @@ members = [
 ]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -34,23 +34,23 @@ categories = ["database-implementations", "data-structures"]
 # The internal crates are pinned exactly (D282): `pigeonhole` is the stable API, and an
 # internal crate may change incompatibly in any release (its own major then), so a build of
 # one `pigeonhole` release always gets the internal crates it was tested with.
-pigeonhole-format = { path = "crates/format", version = "=1.0.0" }
-pigeonhole-io = { path = "crates/io", version = "=1.0.0" }
-pigeonhole-sim = { path = "crates/sim", version = "=1.0.0" }
-pigeonhole-pager = { path = "crates/pager", version = "=1.0.0" }
-pigeonhole-wal = { path = "crates/wal", version = "=1.0.0" }
-pigeonhole-memtable = { path = "crates/memtable", version = "=1.0.0" }
-pigeonhole-cache = { path = "crates/cache", version = "=1.0.0" }
-pigeonhole-runtime = { path = "crates/runtime", version = "=1.0.0" }
-pigeonhole-shm = { path = "crates/shm", version = "=1.0.0" }
-pigeonhole-sst = { path = "crates/sst", version = "=1.0.0" }
-pigeonhole-compaction = { path = "crates/compaction", version = "=1.0.0" }
-pigeonhole-engine = { path = "crates/engine", version = "=1.0.0" }
-pigeonhole = { path = "crates/pigeonhole", version = "1.0.0" }
-pigeonhole-bench = { path = "crates/bench", version = "1.0.0" }
-pigeonhole-arrow = { path = "crates/arrow", version = "1.0.0" }
-pigeonhole-cli = { path = "crates/cli", version = "1.0.0" }
-pigeonhole-capi = { path = "crates/capi", version = "1.0.0" }
+pigeonhole-format = { path = "crates/format", version = "=1.0.1" }
+pigeonhole-io = { path = "crates/io", version = "=1.0.1" }
+pigeonhole-sim = { path = "crates/sim", version = "=1.0.1" }
+pigeonhole-pager = { path = "crates/pager", version = "=1.0.1" }
+pigeonhole-wal = { path = "crates/wal", version = "=1.0.1" }
+pigeonhole-memtable = { path = "crates/memtable", version = "=1.0.1" }
+pigeonhole-cache = { path = "crates/cache", version = "=1.0.1" }
+pigeonhole-runtime = { path = "crates/runtime", version = "=1.0.1" }
+pigeonhole-shm = { path = "crates/shm", version = "=1.0.1" }
+pigeonhole-sst = { path = "crates/sst", version = "=1.0.1" }
+pigeonhole-compaction = { path = "crates/compaction", version = "=1.0.1" }
+pigeonhole-engine = { path = "crates/engine", version = "=1.0.1" }
+pigeonhole = { path = "crates/pigeonhole", version = "1.0.1" }
+pigeonhole-bench = { path = "crates/bench", version = "1.0.1" }
+pigeonhole-arrow = { path = "crates/arrow", version = "1.0.1" }
+pigeonhole-cli = { path = "crates/cli", version = "1.0.1" }
+pigeonhole-capi = { path = "crates/capi", version = "1.0.1" }
 
 # External dependencies. Each one is justified in docs/design/interfaces.md.
 crc32c = "0.6"
