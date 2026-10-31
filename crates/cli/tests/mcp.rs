@@ -382,6 +382,29 @@ fn a_batch_commits_every_operation_or_none() {
     assert_eq!(u3["cells"][0]["value"], inf);
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
+
+    // A counter made the 0.1.0 way, a standard family naming D41's add operator, takes incr.
+    let db = Pigeonhole::open(db_path(&dir), Options::default().shards(1)).unwrap();
+    db.table("old")
+        .unwrap()
+        .family(
+            "n",
+            pigeonhole::Family::default().merge_operator("pigeonhole.i64_add"),
+        )
+        .create()
+        .unwrap();
+    db.close().unwrap();
+    let mut s = Server::start(&db_path(&dir), &[]);
+    let incr = json!({"op": "incr", "table": "old", "row": "r", "family": "n",
+                      "qualifier": "q", "value": 2});
+    // Two commits: in one commit, writes to one cell of a standard family collapse to the
+    // last (D34); only counter-kind families add them up (D186).
+    s.call("write", json!({"ops": [incr.clone()]}));
+    s.call("write", json!({"ops": [incr]}));
+    let old = s.call("read_row", json!({"table": "old", "row": "r"}));
+    assert_eq!(old["cells"][0]["value"], json!({"i64": 4}), "{old}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
     // The writes are in the file after the server closes it.
     let db = Pigeonhole::open(db_path(&dir), Options::default().shards(1)).unwrap();
     let t = db.table("mem").unwrap().open().unwrap();
