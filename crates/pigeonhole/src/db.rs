@@ -1147,6 +1147,8 @@ impl Pigeonhole {
     /// Empty when no shard thread is pinned: [`Options::pin_threads`](crate::Options::pin_threads)
     /// off, application-owned mode, a platform without hard thread affinity (macOS), a CPU
     /// quota or too few free CPUs, or every pin refused.
+    /// An in-place recovery ([`Options::auto_recover`](crate::Options::auto_recover)) starts
+    /// new shard threads, which may pin to other CPUs: read this again after one.
     ///
     /// ```
     /// use pigeonhole::{Options, Pigeonhole};
