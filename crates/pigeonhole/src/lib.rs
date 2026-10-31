@@ -128,6 +128,9 @@ mod guide {
     struct ScansAndFilters;
     #[doc = include_str!("../../../docs/guide/data-modeling.md")]
     struct DataModeling;
+    #[cfg(feature = "async")]
+    #[doc = include_str!("../../../docs/guide/graphs.md")]
+    struct Graphs;
     #[doc = include_str!("../../../docs/guide/errors.md")]
     struct Errors;
     #[doc = include_str!("../../../docs/guide/recovery.md")]

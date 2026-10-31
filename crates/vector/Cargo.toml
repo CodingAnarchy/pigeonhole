@@ -1,0 +1,20 @@
+[package]
+name = "pigeonhole-vector"
+description = "An IVF vector index for Pigeonhole, built on its public API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+# The public crate only (spec Risks: query features build on the core, never the reverse;
+# D306 is an index of ordinary rows and transactions).
+pigeonhole = { workspace = true }
+
+[lints]
+workspace = true
