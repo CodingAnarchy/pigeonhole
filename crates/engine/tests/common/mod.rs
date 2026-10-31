@@ -150,8 +150,9 @@ pub fn families() -> Vec<ModelFamily> {
         ]
     } else if env!("CARGO_CRATE_NAME") == "counters" {
         // Every aggregate kind (D179, D294, D298) beside `f` and a 0.1.0-style `counter`:
-        // eighteen families, 72 slots on a shard with tablet changes off, which the arena's
-        // 1024 chunks serve with snapshots held across flushes (#1212, D302).
+        // eighteen families, 72 slots on a shard with tablet changes off. The tables are
+        // created after the open, so until a reopen resizes the chunks for them the 72 slots
+        // share the 64-slot geometry, about 14 chunks each (perf287 on #1233; #1212, D302).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
@@ -1753,6 +1754,15 @@ impl World {
             return;
         }
         self.stats.large_puts += large;
+        self.note_blob_files();
+    }
+
+    /// Counts the blob files in the catalog not seen before (`Stats::blob_files`). Called at
+    /// every step as well as at each acknowledged large put: with deferred I/O an ack is
+    /// handled later, and by then a compaction or blob GC may have dropped a file the
+    /// commit separated into (its value overwritten), which an ack-time look alone missed
+    /// (#1233, seed 190). No draws, so every seed runs as before.
+    fn note_blob_files(&mut self) {
         let Some(store) = self.store.as_ref() else {
             return;
         };
@@ -5028,6 +5038,7 @@ impl World {
             eprintln!("op #{} {op:?}", self.op_index);
         }
         self.vfs.advance(1_000);
+        self.note_blob_files();
         if self.cfg.tablet_changes && !self.alive() {
             // An armed crash fired in the background (a flush, a compaction, or a tablet
             // change running while the workload goes on): recover before going on, whatever
