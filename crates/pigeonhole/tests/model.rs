@@ -139,6 +139,9 @@ fn families() -> Vec<ModelFamily> {
             .aggregation(aggregation_of_name(name))
     };
     if env!("CARGO_CRATE_NAME") == "counters" {
+        // Every aggregate kind (D179, D294, D298) beside `f` and a 0.1.0-style `counter`:
+        // eighteen families, 72 slots on a shard with tablet changes off, which the arena's
+        // 1024 chunks serve with snapshots held across flushes (#1212, D302).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
@@ -148,20 +151,12 @@ fn families() -> Vec<ModelFamily> {
             f("max_ttl", 0, 40, false),
             f("hll", 2, 0, false),
             f("hll_ttl", 0, 40, false),
-        ]
-    } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
-        // D298's families beside a counter, eight in all (32 slots), as `counters` has:
-        // more stall a one-shard run with tablet changes off (#1212). PR 2's exact sum and
-        // mean-variance families took `bor`'s and `fmin`'s places; PR 3's histogram and
-        // quantile families take `sum`'s and `band`'s (the counter kind runs in `counters`,
-        // and XOR covers the bitwise operator's code); PR 4's bloom family takes `fsum`'s
-        // (mean/variance runs the same exact-sum code). They all join `counters` once #1212
-        // is fixed (#1214, #1219).
-        vec![
-            f("f", 0, 0, false),
-            f("counter", 3, 0, true),
+            f("bor", 2, 0, false),
+            f("band", 0, 0, false),
             f("bxor_ttl", 0, 40, false),
+            f("fmin", 2, 0, false),
             f("fmax_ttl", 0, 40, false),
+            f("fsum", 2, 0, false),
             f("fmv_ttl", 0, 40, false),
             f("fhist", 2, 0, false),
             f("fq_ttl", 0, 40, false),
@@ -1128,10 +1123,10 @@ impl Vfs for RealFs {
 
 impl Run {
     fn new(seed: u64, mut cfg: Config) -> Result<Self, String> {
-        // The counters targets (and `scalar_counters`, D298) run every other seed with counter
-        // checkpoints after every counter read (D291) under the run's flushes, compactions
-        // and tablet changes, unless `PIGEONHOLE_CHECKPOINT_STEPS` chose (#1051).
-        let counters = matches!(env!("CARGO_CRATE_NAME"), "counters" | "scalar_counters");
+        // The counters target runs every other seed with counter checkpoints after every
+        // counter read (D291) under the run's flushes, compactions and tablet changes, unless
+        // `PIGEONHOLE_CHECKPOINT_STEPS` chose (#1051).
+        let counters = env!("CARGO_CRATE_NAME") == "counters";
         if cfg.checkpoint_steps.is_none() && counters && seed % 2 == 1 {
             cfg.checkpoint_steps = Some(1);
         }
