@@ -656,10 +656,10 @@ const BUDGETS: &[(&str, &str, f64)] = &[
     // rebuilding the slots a commit left alone (322 on Linux, 331 on macOS), then 322 on
     // macOS once the manifest kept its block buffer (#499). Raised to 1,150 by D302 (#1212,
     // owner-accepted): with 1024 arena chunks the rig's 256 idle slots keep their empty
-    // memtables, and a flush's view publish rebuilds every slot (1,091). #1228 makes the
-    // publish incremental and brings this back down.
+    // memtables, and a flush's view publish rebuilt every slot (1,091). Back to 345 with
+    // #1228: a publish reuses each unchanged slot's set (322 on macOS).
     ("flush of one cell, small catalog", "flush", 250.0),
-    ("flush of one cell, 2,048-SST catalog", "flush", 1150.0),
+    ("flush of one cell, 2,048-SST catalog", "flush", 345.0),
     ("flush", "entry", 0.15),
     ("compaction (full)", "input entry", 0.15),
 ];
