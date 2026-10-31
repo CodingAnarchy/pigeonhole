@@ -3307,6 +3307,8 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **The same condition as for singles.** When it reaches #70's condition (refuse, or frozen and idle), it ends the wait and sends those coordinators `WakeReason::RoomGone` in a new room generation.
 - **The coordinator gives up.** A retry waiting on that shard's room from an earlier generation fails `Busy`, whether it is queued (`on_wake`) or still in its abort round (`room_gone`, checked as `room_freed` is), and is not committed. The caller may drop what pins the arena and commit again, as the model does after a `Busy` single.
 - **Moving clocks are unchanged:** `stopped` is false there, so nothing new runs.
+- **Gone wins over an earlier free** within one abort round. Say a refusal at generation g is followed by `Room` at g+1 and `RoomGone` at g+2 before the round ends. The retry then fails `Busy`, though room freed once: conservative and legal, since `Busy` is always allowed there (perf287's P1).
+- **Scope:** #1205 stays open for its other hang (seed 289 of `io_failures_are_recovered_in_place_and_match_a_durable_prefix`, a 1-shard `Sync` commit). It involves no cross-shard PREPARE, so D301 doesn't touch it.
 
 **Checks.**
 - `tablets`' `a_retry_waiting_for_room_fails_busy_on_a_frozen_clock_once_room_cannot_free` replaces `a_retry_waiting_for_room_ends_closed_at_close`, which recorded the old wait until the close.
