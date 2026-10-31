@@ -1,0 +1,4 @@
+### Added
+- Exact `f64` sum and mean/variance aggregate families (D298, ICR 0096): `Aggregation::SumF64` keeps the exact sum of its `f64` inputs, read rounded once with `CellRef::as_f64`, so the same inputs read the same total in any order (`1e300 + 1.0 - 1e300` reads 1.0); `Aggregation::MeanVar` keeps the count, exact sum and exact sum of squares, read with `CellRef::mean_var()` (`count`, `mean`, `variance`, `sample_variance`). Inputs are written with `aggregate_f64`, must be finite, and `put_f64` sets a cell. A cell is up to 274 bytes (sum) or 821 (mean/variance).
+  - Like the other aggregate families, creating the first such family marks the file, which pigeonhole 1.0.x then refuses to open (`UnsupportedFeature`).
+- `phdb`: `"aggregation": "sum_f64" | "mean_var"`, the shell's `create … name:sum_f64` / `name:mean_var`, and `aggregate` taking an `f64` there.
