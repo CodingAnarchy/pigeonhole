@@ -1,10 +1,13 @@
 //! D296 (#490 A): bounded-result reads give exactly what a scan of the same snapshot gives,
 //! reduced: the k best, the first n, one per key, a row's first cell, an early stop. Data
-//! in SSTs and memtables, with overwrites and deletes, so the visitor sees resolved cells only.
+//! in SSTs and memtables, with overwrites, deletes and a counter family's merges, so the
+//! visitor sees resolved cells only. Cells order as the scan hands them out (row, family,
+//! qualifier, newest version first), so each brute force below is positions in the scan.
 //! Fan-out (scoped threads, from a thread that drives no shard) equals the sequential read.
 
 use crate::common;
 
+use std::cmp::Ordering;
 use std::future::Future;
 use std::ops::{Bound, ControlFlow};
 use std::path::Path;
@@ -12,11 +15,12 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
-use pigeonhole_engine::RowRange;
 use pigeonhole_engine::{
-    CellVisitor, Dedupe, Engine, EngineShard, FamilyOptions, Limit, ReadInput, ReduceSpec, Reducer,
-    ScanSpec, Snapshot, TopK, ValueRef, Visit, WriteBatch,
+    CellKey, CellRef, CellVisitor, Dedupe, Engine, EngineShard, FamilyOptions, Limit, ReadInput,
+    ReadSpec, ReduceSpec, Reducer, RowRange, ScanSpec, Snapshot, TopK, ValuePredicate, ValueRef,
+    Visit, WriteBatch,
 };
+use pigeonhole_format::manifest::FamilyKind;
 use pigeonhole_format::{Durability, FamilyId, TableId, Timestamp};
 use pigeonhole_io::sim::SimVfs;
 
@@ -24,8 +28,11 @@ const DB: &str = "/db/data.phdb";
 const BUDGET: u64 = 64 << 20;
 const ROWS: u32 = 300;
 
-/// A visible cell from a scan: (row, family, qualifier, stored value).
-type Cell = (Vec<u8>, FamilyId, Vec<u8>, Vec<u8>);
+/// A visible cell from a scan: (row, family, qualifier, ts, stored value).
+type Cell = (Vec<u8>, FamilyId, Vec<u8>, Timestamp, Vec<u8>);
+
+/// A cell's identity: (row, family, qualifier, ts).
+type Id = (Vec<u8>, FamilyId, Vec<u8>, Timestamp);
 
 fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
@@ -56,29 +63,31 @@ struct Db {
     engine: Arc<Engine>,
     _shards: Vec<EngineShard>,
     table: TableId,
-    f: FamilyId,
-    g: FamilyId,
 }
 
-/// Rows `r0000..r0299` in families `f` and `g`, some flushed to SSTs, then overwrites and
-/// deletes in the memtables.
+/// Rows `r0000..r0299` in families `f` and `g` (bytes) and `c` (a counter), some flushed to
+/// SSTs, then overwrites, deletes and more counter operands in the memtables.
 fn setup(seed: u64) -> Db {
     let vfs = SimVfs::new(seed);
     let opts = || common::options(Arc::clone(&vfs), 4, BUDGET);
     let db = Engine::open(Path::new(DB), opts()).unwrap();
+    let counter = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_add")
+        .kind(FamilyKind::Counter);
     let t = db
         .create_table(
             "t",
             &[
                 ("f".into(), FamilyOptions::default()),
                 ("g".into(), FamilyOptions::default()),
+                ("c".into(), counter),
             ],
         )
         .unwrap();
     db.close().unwrap();
     drop(db);
     let (engine, mut shards) = Engine::open_application_owned(Path::new(DB), opts()).unwrap();
-    let (f, g) = (t.families[0].id, t.families[1].id);
+    let (f, g, c) = (t.families[0].id, t.families[1].id, t.families[2].id);
     let commit = |shards: &mut Vec<EngineShard>, wb: WriteBatch| {
         drive(
             shards,
@@ -102,6 +111,10 @@ fn setup(seed: u64) -> Db {
             ValueRef::Bytes(&i.to_be_bytes()),
         )
         .unwrap();
+        if i % 10 == 0 {
+            wb.merge(t.id, c, &row(i), b"n", ValueRef::I64(i64::from(i % 7)))
+                .unwrap();
+        }
         commit(&mut shards, wb);
     }
     drive(&mut shards, engine.submit_flush().unwrap()).unwrap();
@@ -124,57 +137,37 @@ fn setup(seed: u64) -> Db {
         }
         commit(&mut shards, wb);
     }
+    for i in (0..ROWS).step_by(10) {
+        let mut wb = WriteBatch::new();
+        wb.merge(t.id, c, &row(i), b"n", ValueRef::I64(3)).unwrap();
+        commit(&mut shards, wb);
+    }
     Db {
         engine,
         _shards: shards,
         table: t.id,
-        f,
-        g,
     }
 }
 
-/// Every visible cell of the snapshot in `[start, end)`, from a scan: (row, family,
-/// qualifier, stored value).
-fn scan_cells(db: &Db, snap: &Snapshot, start: Bound<Vec<u8>>, end: Bound<Vec<u8>>) -> Vec<Cell> {
-    let mut cur = db
-        .engine
-        .scan(snap, db.table, ScanSpec::new(start, end))
-        .unwrap();
+/// Every visible cell in `range` under `read`, from a scan, in scan order.
+fn scan_cells(db: &Db, snap: &Snapshot, range: RowRange, read: &ReadSpec) -> Vec<Cell> {
+    let mut spec = ScanSpec::new(range.0, range.1);
+    spec.read = read.clone();
+    let mut cur = db.engine.scan(snap, db.table, spec).unwrap();
     let mut out = Vec::new();
     while cur.next_row().unwrap() {
         let r = cur.row().to_vec();
         while let Some(c) = cur.next_cell().unwrap() {
-            out.push((r.clone(), c.family, c.qualifier.to_vec(), c.stored.to_vec()));
+            out.push((
+                r.clone(),
+                c.family,
+                c.qualifier.to_vec(),
+                c.ts,
+                c.stored.to_vec(),
+            ));
         }
     }
     out
-}
-
-/// Scores each cell's stored value.
-struct Score;
-
-impl CellVisitor for Score {
-    type Item = u32;
-    fn visit(&mut self, _: &[u8], _: FamilyId, _: &[u8], _: Timestamp, value: &[u8]) -> Visit<u32> {
-        Visit::Emit(score(value))
-    }
-}
-
-/// Emits each cell's family id (as `u32`), so results compare against the scan.
-struct Families;
-
-impl CellVisitor for Families {
-    type Item = u32;
-    fn visit(
-        &mut self,
-        _: &[u8],
-        family: FamilyId,
-        _: &[u8],
-        _: Timestamp,
-        _: &[u8],
-    ) -> Visit<u32> {
-        Visit::Emit(family.0)
-    }
 }
 
 fn ranges() -> Vec<RowRange> {
@@ -189,8 +182,43 @@ fn ranges() -> Vec<RowRange> {
 fn cells_in_ranges(db: &Db, snap: &Snapshot) -> Vec<Cell> {
     ranges()
         .into_iter()
-        .flat_map(|(s, e)| scan_cells(db, snap, s, e))
+        .flat_map(|r| scan_cells(db, snap, r, &ReadSpec::default()))
         .collect()
+}
+
+/// A result's cells, comparable with scan cells.
+fn ids<I>(items: &[(CellKey, I)]) -> Vec<Id> {
+    items
+        .iter()
+        .map(|(k, _)| (k.row.clone(), k.family, k.qualifier.clone(), k.ts))
+        .collect()
+}
+
+fn cell_ids(cells: &[Cell]) -> Vec<Id> {
+    cells
+        .iter()
+        .map(|(r, f, q, t, _)| (r.clone(), *f, q.clone(), *t))
+        .collect()
+}
+
+/// Scores each cell's stored value.
+struct Score;
+
+impl CellVisitor for Score {
+    type Item = u32;
+    fn visit(&mut self, _: &[u8], _: FamilyId, _: &[u8], _: Timestamp, value: &[u8]) -> Visit<u32> {
+        Visit::Emit(score(value))
+    }
+}
+
+/// Emits every cell.
+struct Every;
+
+impl CellVisitor for Every {
+    type Item = ();
+    fn visit(&mut self, _: &[u8], _: FamilyId, _: &[u8], _: Timestamp, _: &[u8]) -> Visit<()> {
+        Visit::Emit(())
+    }
 }
 
 /// Runs `reduce` on another thread (one that drives no shard), so it may fan out.
@@ -198,33 +226,39 @@ fn off_thread<T: Send>(f: impl FnOnce() -> T + Send) -> T {
     std::thread::scope(|s| s.spawn(f).join().unwrap())
 }
 
+fn fanned(spec: &ReduceSpec) -> ReduceSpec {
+    let mut s = spec.clone();
+    s.parallelism = 4;
+    s.parallel_floor = 0;
+    s
+}
+
 #[test]
-fn top_k_equals_the_k_smallest_scored_cells_of_a_scan_ties_by_row_then_qualifier() {
+fn top_k_equals_the_k_smallest_scored_cells_of_a_scan_ties_in_scan_order() {
     let db = setup(4901);
     let snap = db.engine.snapshot().unwrap();
-    let mut want: Vec<(u32, Vec<u8>, Vec<u8>)> = cells_in_ranges(&db, &snap)
-        .into_iter()
-        .map(|(r, _, q, v)| (score(&v), r, q))
+    let cells = cells_in_ranges(&db, &snap);
+    let mut order: Vec<(u32, usize)> = cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (score(&c.4), i))
         .collect();
-    want.sort();
-    want.truncate(25);
-    let want: Vec<(Vec<u8>, Vec<u8>, u32)> = want.into_iter().map(|(s, r, q)| (r, q, s)).collect();
+    order.sort();
+    let want: Vec<Cell> = order[..25].iter().map(|&(_, i)| cells[i].clone()).collect();
 
     let spec = ReduceSpec::new(ReadInput::Ranges(ranges()));
     let seq = db
         .engine
         .reduce(&snap, db.table, &spec, || Score, || TopK::new(25))
         .unwrap();
-    assert_eq!(seq.items, want);
+    assert_eq!(ids(&seq.items), cell_ids(&want));
     assert_eq!(seq.stats.threads, 1, "the driving thread never fans out");
 
-    let mut par_spec = spec.clone();
-    par_spec.parallelism = 4;
-    par_spec.parallel_floor = 0;
+    let par_spec = fanned(&spec);
     let engine = Arc::clone(&db.engine);
     let par = off_thread(|| engine.reduce(&snap, db.table, &par_spec, || Score, || TopK::new(25)))
         .unwrap();
-    assert_eq!(par.items, want, "fan-out equals the sequential read");
+    assert_eq!(par.items, seq.items, "fan-out equals the sequential read");
     assert!(
         par.stats.threads > 1,
         "the read fanned out: {:?}",
@@ -234,34 +268,21 @@ fn top_k_equals_the_k_smallest_scored_cells_of_a_scan_ties_by_row_then_qualifier
 }
 
 #[test]
-fn limit_keeps_the_first_n_cells_in_key_order_at_any_fan_out() {
+fn limit_keeps_the_first_n_cells_in_scan_order_at_any_fan_out() {
     let db = setup(4902);
     let snap = db.engine.snapshot().unwrap();
-    let all: Vec<(Vec<u8>, Vec<u8>)> = cells_in_ranges(&db, &snap)
-        .into_iter()
-        .map(|(r, _, q, _)| (r, q))
-        .collect();
-    for n in [1usize, 17, 200] {
-        // The n smallest (row, qualifier) of the scan.
-        let mut keys = all.clone();
-        keys.sort();
-        keys.truncate(n);
-        let mut spec = ReduceSpec::new(ReadInput::Ranges(ranges()));
+    let cells = cells_in_ranges(&db, &snap);
+    for n in [1usize, 2, 17, 200] {
+        let spec = ReduceSpec::new(ReadInput::Ranges(ranges()));
         let seq = db
             .engine
-            .reduce(&snap, db.table, &spec, || Families, || Limit::new(n))
+            .reduce(&snap, db.table, &spec, || Every, || Limit::new(n))
             .unwrap();
-        let kept: Vec<(Vec<u8>, Vec<u8>)> = seq
-            .items
-            .iter()
-            .map(|(r, q, _)| (r.clone(), q.clone()))
-            .collect();
-        assert_eq!(kept, keys, "n = {n}");
-        spec.parallelism = 4;
-        spec.parallel_floor = 0;
+        assert_eq!(ids(&seq.items), cell_ids(&cells[..n]), "n = {n}");
+        let par_spec = fanned(&spec);
         let engine = Arc::clone(&db.engine);
         let par =
-            off_thread(|| engine.reduce(&snap, db.table, &spec, || Families, || Limit::new(n)))
+            off_thread(|| engine.reduce(&snap, db.table, &par_spec, || Every, || Limit::new(n)))
                 .unwrap();
         assert_eq!(par.items, seq.items, "n = {n}: fan-out equals sequential");
         assert!(par.stats.threads > 1, "n = {n}: the read fanned out");
@@ -269,16 +290,12 @@ fn limit_keeps_the_first_n_cells_in_key_order_at_any_fan_out() {
 }
 
 #[test]
-fn dedupe_keeps_one_cell_per_item_key_from_the_smallest_row_and_qualifier() {
+fn dedupe_keeps_one_cell_per_item_key_the_first_in_scan_order() {
     let db = setup(4903);
     let snap = db.engine.snapshot().unwrap();
-    // Key: the score (16 values), so many cells share each key.
-    let mut want = std::collections::BTreeMap::<u32, (Vec<u8>, Vec<u8>)>::new();
-    for (r, _, q, v) in cells_in_ranges(&db, &snap) {
-        let e = want.entry(score(&v)).or_insert((r.clone(), q.clone()));
-        if (r.clone(), q.clone()) < *e {
-            *e = (r, q);
-        }
+    let mut want = std::collections::BTreeMap::<u32, Cell>::new();
+    for c in cells_in_ranges(&db, &snap) {
+        want.entry(score(&c.4)).or_insert(c);
     }
     let exclude = Arc::new(std::collections::HashSet::from([3u32]));
     want.remove(&3);
@@ -288,11 +305,16 @@ fn dedupe_keeps_one_cell_per_item_key_from_the_smallest_row_and_qualifier() {
         .engine
         .reduce(&snap, db.table, &spec, || Score, make)
         .unwrap();
-    let mut got: Vec<(u32, Vec<u8>, Vec<u8>)> =
-        got.items.into_iter().map(|(r, q, s)| (s, r, q)).collect();
+    let mut got: Vec<(u32, Id)> = got
+        .items
+        .iter()
+        .map(|(k, s)| (*s, (k.row.clone(), k.family, k.qualifier.clone(), k.ts)))
+        .collect();
     got.sort();
-    let want: Vec<(u32, Vec<u8>, Vec<u8>)> =
-        want.into_iter().map(|(s, (r, q))| (s, r, q)).collect();
+    let want: Vec<(u32, Id)> = want
+        .into_iter()
+        .map(|(s, (r, f, q, t, _))| (s, (r, f, q, t)))
+        .collect();
     assert_eq!(got, want);
 }
 
@@ -300,16 +322,9 @@ fn dedupe_keeps_one_cell_per_item_key_from_the_smallest_row_and_qualifier() {
 struct FirstPerRow;
 
 impl CellVisitor for FirstPerRow {
-    type Item = u32;
-    fn visit(
-        &mut self,
-        _: &[u8],
-        family: FamilyId,
-        _: &[u8],
-        _: Timestamp,
-        _: &[u8],
-    ) -> Visit<u32> {
-        Visit::EmitAndNextRow(family.0)
+    type Item = ();
+    fn visit(&mut self, _: &[u8], _: FamilyId, _: &[u8], _: Timestamp, _: &[u8]) -> Visit<()> {
+        Visit::EmitAndNextRow(())
     }
 }
 
@@ -317,58 +332,63 @@ impl CellVisitor for FirstPerRow {
 struct StopAt(Vec<u8>);
 
 impl CellVisitor for StopAt {
-    type Item = u32;
-    fn visit(&mut self, row: &[u8], _: FamilyId, _: &[u8], _: Timestamp, _: &[u8]) -> Visit<u32> {
+    type Item = ();
+    fn visit(&mut self, row: &[u8], _: FamilyId, _: &[u8], _: Timestamp, _: &[u8]) -> Visit<()> {
         if row >= self.0.as_slice() {
             Visit::Stop
         } else {
-            Visit::Emit(0)
+            Visit::Emit(())
         }
     }
 }
 
-/// Keeps everything pushed, in order.
+/// Keeps everything pushed.
 #[derive(Default)]
-struct All(Vec<(Vec<u8>, Vec<u8>, u32)>);
+struct All(Vec<(CellKey, ())>);
 
 impl Reducer for All {
-    type Item = u32;
-    fn push(&mut self, row: &[u8], qualifier: &[u8], item: u32) -> ControlFlow<()> {
-        self.0.push((row.to_vec(), qualifier.to_vec(), item));
+    type Item = ();
+    fn push(&mut self, cell: CellRef<'_>, item: ()) -> ControlFlow<()> {
+        self.0.push((cell.to_key(), item));
         ControlFlow::Continue(())
     }
     fn merge(&mut self, other: Self) {
         self.0.extend(other.0);
-        self.0.sort();
+        self.0.sort_by(|a, b| a.0.cmp(&b.0));
     }
-    fn finish(self) -> Vec<(Vec<u8>, Vec<u8>, u32)> {
+    fn finish(self) -> Vec<(CellKey, ())> {
         self.0
     }
+}
+
+fn whole() -> ReduceSpec {
+    ReduceSpec::new(ReadInput::Ranges(vec![(
+        Bound::Unbounded,
+        Bound::Unbounded,
+    )]))
 }
 
 #[test]
 fn next_row_takes_each_rows_first_cell_and_stop_ends_the_read() {
     let db = setup(4904);
     let snap = db.engine.snapshot().unwrap();
-    let cells = scan_cells(&db, &snap, Bound::Unbounded, Bound::Unbounded);
-    let mut want = Vec::new();
-    for (r, fam, q, _) in &cells {
-        if want
-            .last()
-            .is_none_or(|(lr, _, _): &(Vec<u8>, Vec<u8>, u32)| lr != r)
-        {
-            want.push((r.clone(), q.clone(), fam.0));
+    let cells = scan_cells(
+        &db,
+        &snap,
+        (Bound::Unbounded, Bound::Unbounded),
+        &ReadSpec::default(),
+    );
+    let mut want: Vec<Cell> = Vec::new();
+    for c in &cells {
+        if want.last().is_none_or(|l| l.0 != c.0) {
+            want.push(c.clone());
         }
     }
-    let spec = ReduceSpec::new(ReadInput::Ranges(vec![(
-        Bound::Unbounded,
-        Bound::Unbounded,
-    )]));
     let got = db
         .engine
-        .reduce(&snap, db.table, &spec, || FirstPerRow, All::default)
+        .reduce(&snap, db.table, &whole(), || FirstPerRow, All::default)
         .unwrap();
-    assert_eq!(got.items, want);
+    assert_eq!(ids(&got.items), cell_ids(&want));
     assert_eq!(
         got.stats.cells as usize,
         want.len(),
@@ -378,39 +398,77 @@ fn next_row_takes_each_rows_first_cell_and_stop_ends_the_read() {
     let at = row(100);
     let got = db
         .engine
-        .reduce(&snap, db.table, &spec, || StopAt(at.clone()), All::default)
+        .reduce(
+            &snap,
+            db.table,
+            &whole(),
+            || StopAt(at.clone()),
+            All::default,
+        )
         .unwrap();
-    let want: Vec<_> = cells
-        .iter()
-        .filter(|(r, ..)| *r < at)
-        .map(|(r, _, q, _)| (r.clone(), q.clone(), 0))
-        .collect();
-    assert_eq!(got.items, want);
+    let before: Vec<Cell> = cells.iter().filter(|c| c.0 < at).cloned().collect();
+    assert_eq!(ids(&got.items), cell_ids(&before));
 }
 
 #[test]
-fn only_resolved_cells_are_visited() {
+fn deletes_overwrites_merges_and_value_predicates_resolve_before_the_visitor() {
     let db = setup(4905);
     let snap = db.engine.snapshot().unwrap();
-    // Row r0001 was deleted, r0000's "b" column too, and r0000's "a" overwritten.
-    let spec = ReduceSpec::new(ReadInput::Ranges(vec![(
-        Bound::Included(row(0)),
-        Bound::Included(row(1)),
-    )]));
+    // Every cell, then a value predicate (counters above 5: merged results only).
+    let mut over_five = ReadSpec::default();
+    over_five.value = Some(ValuePredicate::I64(Ordering::Greater, 5));
+    for read in [ReadSpec::default(), over_five] {
+        let mut spec = whole();
+        spec.read = read.clone();
+        let got = db
+            .engine
+            .reduce(&snap, db.table, &spec, || Every, All::default)
+            .unwrap();
+        let want = scan_cells(&db, &snap, (Bound::Unbounded, Bound::Unbounded), &read);
+        assert!(!want.is_empty());
+        assert_eq!(ids(&got.items), cell_ids(&want), "read {:?}", read.value);
+    }
+    // A deleted row (r0001), a deleted column and an overwrite (r0000).
+    let first_two: RowRange = (Bound::Included(row(0)), Bound::Included(row(1)));
+    let spec = ReduceSpec::new(ReadInput::Ranges(vec![first_two.clone()]));
     let got = db
         .engine
-        .reduce(&snap, db.table, &spec, || Families, All::default)
+        .reduce(&snap, db.table, &spec, || Every, All::default)
         .unwrap();
-    let want: Vec<_> = scan_cells(&db, &snap, Bound::Included(row(0)), Bound::Included(row(1)))
-        .into_iter()
-        .map(|(r, fam, q, _)| (r, q, fam.0))
-        .collect();
-    assert_eq!(got.items, want);
+    let want = scan_cells(&db, &snap, first_two, &ReadSpec::default());
+    assert_eq!(ids(&got.items), cell_ids(&want));
     assert!(
-        got.items.iter().all(|(r, ..)| *r == row(0)),
-        "{:?}",
-        got.items
+        got.items.iter().all(|(k, _)| k.row == row(0)),
+        "row r0001 was deleted"
     );
-    assert!(!got.items.iter().any(|(_, q, f)| q == b"b" && *f == db.f.0));
-    let _ = db.g;
+}
+
+#[test]
+fn overlapping_or_unsorted_ranges_are_refused() {
+    let db = setup(4906);
+    let snap = db.engine.snapshot().unwrap();
+    for ranges in [
+        vec![
+            (Bound::Unbounded, Bound::Included(row(10))),
+            (Bound::Included(row(10)), Bound::Unbounded),
+        ],
+        vec![
+            (Bound::Included(row(50)), Bound::Excluded(row(60))),
+            (Bound::Included(row(0)), Bound::Excluded(row(10))),
+        ],
+        vec![
+            (Bound::Unbounded, Bound::Unbounded),
+            (Bound::Included(row(0)), Bound::Excluded(row(10))),
+        ],
+    ] {
+        let spec = ReduceSpec::new(ReadInput::Ranges(ranges));
+        let err = db
+            .engine
+            .reduce(&snap, db.table, &spec, || Every, All::default)
+            .unwrap_err();
+        assert!(
+            matches!(err, pigeonhole_engine::Error::InvalidArgument(_)),
+            "{err:?}"
+        );
+    }
 }

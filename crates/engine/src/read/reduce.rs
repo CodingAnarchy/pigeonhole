@@ -25,8 +25,8 @@ use super::{
     FORK_CHECK_ROWS, Lane, MergeKind, ReadSpec, clamp_into, give_back, past_row, row_of,
     skips_columns, take_scan_resolver,
 };
-use crate::Result;
 use crate::snapshot::{Snapshot, TabletEntry, View};
+use crate::{Error, Result};
 
 /// A row range on unescaped row keys, `(start, end)`.
 pub type RowRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -73,21 +73,112 @@ pub trait CellVisitor {
     ) -> Visit<Self::Item>;
 }
 
+/// The cell an item came from, borrowed for a [`Reducer::push`]. Cells order as a scan hands
+/// them out: by row, then family in the read's family order, then qualifier, then newest
+/// version first. That is a total order over a read's cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellRef<'a> {
+    /// Unescaped row key.
+    pub row: &'a [u8],
+    /// The family's position in the read's family order (the scan's).
+    pub family_rank: u32,
+    /// The family.
+    pub family: FamilyId,
+    /// Unescaped qualifier.
+    pub qualifier: &'a [u8],
+    /// The version's timestamp.
+    pub ts: Timestamp,
+}
+
+impl CellRef<'_> {
+    fn order(&self) -> (&[u8], u32, &[u8], std::cmp::Reverse<Timestamp>) {
+        (
+            self.row,
+            self.family_rank,
+            self.qualifier,
+            std::cmp::Reverse(self.ts),
+        )
+    }
+
+    /// An owned copy.
+    pub fn to_key(&self) -> CellKey {
+        CellKey {
+            row: self.row.to_vec(),
+            family_rank: self.family_rank,
+            family: self.family,
+            qualifier: self.qualifier.to_vec(),
+            ts: self.ts,
+        }
+    }
+}
+
+impl PartialOrd for CellRef<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CellRef<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.order().cmp(&other.order())
+    }
+}
+
+/// An owned [`CellRef`]: a result's cell, ordered the same way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CellKey {
+    /// Unescaped row key.
+    pub row: Vec<u8>,
+    /// The family's position in the read's family order.
+    pub family_rank: u32,
+    /// The family.
+    pub family: FamilyId,
+    /// Unescaped qualifier.
+    pub qualifier: Vec<u8>,
+    /// The version's timestamp.
+    pub ts: Timestamp,
+}
+
+impl CellKey {
+    /// This key, borrowed.
+    pub fn as_ref(&self) -> CellRef<'_> {
+        CellRef {
+            row: &self.row,
+            family_rank: self.family_rank,
+            family: self.family,
+            qualifier: &self.qualifier,
+            ts: self.ts,
+        }
+    }
+}
+
+impl PartialOrd for CellKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CellKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_ref().cmp(&other.as_ref())
+    }
+}
+
 /// Keeps a bounded result. `merge` must be associative and commutative, and the result a
 /// function of the multiset of pushes, so fan-out equals the sequential read.
 pub trait Reducer: Send {
     /// What it keeps.
     type Item: Send;
 
-    /// One item from cell `(row, qualifier)`. `Break` ends this group's read (the reducer is
-    /// full, or has all it can take).
-    fn push(&mut self, row: &[u8], qualifier: &[u8], item: Self::Item) -> ControlFlow<()>;
+    /// One item from `cell`. A group pushes in cell order. `Break` ends this group's read
+    /// (the reducer is full, or has all it can take).
+    fn push(&mut self, cell: CellRef<'_>, item: Self::Item) -> ControlFlow<()>;
 
     /// Folds another group's result in.
     fn merge(&mut self, other: Self);
 
     /// The result, in the reducer's order.
-    fn finish(self) -> Vec<(Vec<u8>, Vec<u8>, Self::Item)>;
+    fn finish(self) -> Vec<(CellKey, Self::Item)>;
 }
 
 /// A bounded read's input, per-row selection and fan-out.
@@ -124,8 +215,8 @@ impl ReduceSpec {
 #[derive(Debug)]
 #[non_exhaustive]
 pub struct Reduced<I> {
-    /// `(row, qualifier, item)`, in the reducer's order.
-    pub items: Vec<(Vec<u8>, Vec<u8>, I)>,
+    /// `(cell, item)`, in the reducer's order.
+    pub items: Vec<(CellKey, I)>,
     /// Counts over every group.
     pub stats: ReduceStats,
 }
@@ -171,6 +262,14 @@ struct Group<'a> {
 /// Cuts `input` into tablet groups, in key order.
 fn groups<'a>(view: &'a View, table: TableId, input: &'a ReadInput) -> Result<Vec<Group<'a>>> {
     let ReadInput::Ranges(ranges) = input;
+    // Sorted and disjoint, or a cell would be visited (and counted by a reducer) twice.
+    for pair in ranges.windows(2) {
+        if !before(&pair[0].1, &pair[1].0) {
+            return Err(Error::InvalidArgument(
+                "bounded read: the ranges must be sorted and disjoint".to_owned(),
+            ));
+        }
+    }
     let mut out = Vec::new();
     let (mut lo, mut hi) = (Vec::new(), Vec::new());
     for (start, end) in ranges {
@@ -213,6 +312,17 @@ fn groups<'a>(view: &'a View, table: TableId, input: &'a ReadInput) -> Result<Ve
         }
     }
     Ok(out)
+}
+
+/// Whether every row a range ending at `end` holds comes before every row a range starting
+/// at `start` holds.
+fn before(end: &Bound<Vec<u8>>, start: &Bound<Vec<u8>>) -> bool {
+    match (end, start) {
+        (Bound::Unbounded, _) | (_, Bound::Unbounded) => false,
+        (Bound::Included(e), Bound::Included(s)) => e < s,
+        (Bound::Included(e) | Bound::Excluded(e), Bound::Excluded(s))
+        | (Bound::Excluded(e), Bound::Included(s)) => e <= s,
+    }
 }
 
 /// Entries the group's sources hold (SSTs it may read, memtables): an over-estimate after a
@@ -297,6 +407,14 @@ fn open_lanes(ctx: &Ctx<'_>, g: &Group<'_>, lanes: &mut Vec<Lane>) -> Result<()>
         lane.resolver.seek(g.lo.as_deref().unwrap_or(&[]))?;
     }
     Ok(())
+}
+
+/// The family's position in the read's family order.
+fn rank_of(families: &[FamilyId], family: FamilyId) -> u32 {
+    families
+        .iter()
+        .position(|f| *f == family)
+        .unwrap_or(usize::MAX) as u32
 }
 
 /// Whether the lane's pending cell is in the row whose escaped key is `row_esc`.
@@ -406,6 +524,13 @@ where
                 Escaped::new(&col[row_len..end]).unescape_into(&mut qualifier);
                 stats.cells += 1;
                 let visit = visitor.visit(&row, lane.family, &qualifier, lane.ts, lane.value());
+                let cell = CellRef {
+                    row: &row,
+                    family_rank: rank_of(ctx.families, lane.family),
+                    family: lane.family,
+                    qualifier: &qualifier,
+                    ts: lane.ts,
+                };
                 let (item, after) = match visit {
                     Visit::Skip => (None, None),
                     Visit::Emit(item) => (Some(item), None),
@@ -414,7 +539,7 @@ where
                     Visit::Stop => return Ok(()),
                 };
                 if let Some(item) = item
-                    && reducer.push(&row, &qualifier, item).is_break()
+                    && reducer.push(cell, item).is_break()
                 {
                     return Ok(());
                 }
@@ -524,15 +649,12 @@ where
     })
 }
 
-/// A cell's identity in a result: its row, then its qualifier.
-type CellKey = (Vec<u8>, Vec<u8>);
-
-/// The `k` items with the smallest scores, ties broken by (row, qualifier): a total order, so
-/// the result is the same at any fan-out and in any push order (D296 R1).
+/// The `k` items with the smallest scores, ties broken by cell order: a total order, so the
+/// result is the same at any fan-out and in any push order (D296 R1).
 #[derive(Debug, Clone)]
 pub struct TopK<S> {
     k: usize,
-    /// Sorted ascending by (score, row, qualifier); at most `k`.
+    /// Sorted ascending by (score, cell); at most `k`.
     kept: Vec<(S, CellKey)>,
 }
 
@@ -545,15 +667,20 @@ impl<S: Ord> TopK<S> {
         }
     }
 
-    fn insert(&mut self, score: S, key: CellKey) {
+    /// Whether `(score, cell)` would enter.
+    fn enters(&self, score: &S, cell: CellRef<'_>) -> bool {
         if self.k == 0 {
-            return;
+            return false;
         }
-        if self.kept.len() == self.k {
-            let worst = self.kept.last().expect("k > 0 items");
-            if (&score, &key) >= (&worst.0, &worst.1) {
-                return;
-            }
+        match self.kept.last() {
+            Some((ws, wc)) if self.kept.len() == self.k => (score, cell) < (ws, wc.as_ref()),
+            _ => true,
+        }
+    }
+
+    fn insert(&mut self, score: S, key: CellKey) {
+        if !self.enters(&score, key.as_ref()) {
+            return;
         }
         let at = self.kept.partition_point(|(s, k)| (s, k) < (&score, &key));
         self.kept.insert(at, (score, key));
@@ -564,18 +691,11 @@ impl<S: Ord> TopK<S> {
 impl<S: Ord + Send> Reducer for TopK<S> {
     type Item = S;
 
-    fn push(&mut self, row: &[u8], qualifier: &[u8], item: S) -> ControlFlow<()> {
-        // Only a candidate that can enter is copied.
-        if self.k == 0 {
-            return ControlFlow::Continue(());
+    fn push(&mut self, cell: CellRef<'_>, item: S) -> ControlFlow<()> {
+        // Only a candidate that enters is copied.
+        if self.enters(&item, cell) {
+            self.insert(item, cell.to_key());
         }
-        if self.kept.len() == self.k {
-            let (ws, (wr, wq)) = self.kept.last().expect("k > 0 items");
-            if (&item, row, qualifier) >= (ws, wr.as_slice(), wq.as_slice()) {
-                return ControlFlow::Continue(());
-            }
-        }
-        self.insert(item, (row.to_vec(), qualifier.to_vec()));
         ControlFlow::Continue(())
     }
 
@@ -585,17 +705,17 @@ impl<S: Ord + Send> Reducer for TopK<S> {
         }
     }
 
-    fn finish(self) -> Vec<(Vec<u8>, Vec<u8>, S)> {
-        self.kept.into_iter().map(|(s, (r, q))| (r, q, s)).collect()
+    fn finish(self) -> Vec<(CellKey, S)> {
+        self.kept.into_iter().map(|(s, k)| (k, s)).collect()
     }
 }
 
-/// The first `n` cells in key order (row, then qualifier). A group stops at its own n-th;
-/// merging keeps the `n` smallest keys, which is the sequential first `n` (D296 rev 1.2).
+/// The first `n` cells in scan order. A group pushes in that order and stops at its own n-th;
+/// merging keeps the `n` smallest cells, which is the sequential first `n` (D296 rev 1.2).
 #[derive(Debug, Clone)]
 pub struct Limit<I> {
     n: usize,
-    /// Sorted by key; at most `n`.
+    /// In cell order; at most `n`.
     kept: Vec<(CellKey, I)>,
 }
 
@@ -612,14 +732,13 @@ impl<I> Limit<I> {
 impl<I: Send> Reducer for Limit<I> {
     type Item = I;
 
-    fn push(&mut self, row: &[u8], qualifier: &[u8], item: I) -> ControlFlow<()> {
+    fn push(&mut self, cell: CellRef<'_>, item: I) -> ControlFlow<()> {
         if self.kept.len() >= self.n {
             return ControlFlow::Break(());
         }
-        // A group pushes in key order, so this appends.
-        let key = (row.to_vec(), qualifier.to_vec());
-        let at = self.kept.partition_point(|(k, _)| *k < key);
-        self.kept.insert(at, (key, item));
+        // A group pushes in cell order, so this appends.
+        debug_assert!(self.kept.last().is_none_or(|(k, _)| k.as_ref() < cell));
+        self.kept.push((cell.to_key(), item));
         if self.kept.len() >= self.n {
             ControlFlow::Break(())
         } else {
@@ -635,13 +754,13 @@ impl<I: Send> Reducer for Limit<I> {
         self.kept = all;
     }
 
-    fn finish(self) -> Vec<(Vec<u8>, Vec<u8>, I)> {
-        self.kept.into_iter().map(|((r, q), i)| (r, q, i)).collect()
+    fn finish(self) -> Vec<(CellKey, I)> {
+        self.kept
     }
 }
 
 /// One item per key the item gives (for example a traversal's destination node), the one
-/// from the smallest (row, qualifier) when a key repeats; keys in `exclude` are dropped
+/// from the first cell in scan order when a key repeats; keys in `exclude` are dropped
 /// (#489's visited set). Order-independent, so the same at any fan-out (D296 S2).
 pub struct Dedupe<I, K, F> {
     key_of: F,
@@ -667,19 +786,19 @@ impl<I, K: std::hash::Hash + Eq, F: Fn(&I) -> K> Dedupe<I, K, F> {
         }
     }
 
-    fn offer(&mut self, cell: CellKey, item: I) {
+    fn offer(&mut self, cell: CellRef<'_>, item: I) {
         let key = (self.key_of)(&item);
         if self.exclude.as_ref().is_some_and(|x| x.contains(&key)) {
             return;
         }
         match self.kept.entry(key) {
             std::collections::hash_map::Entry::Occupied(mut o) => {
-                if cell < o.get().0 {
-                    o.insert((cell, item));
+                if cell < o.get().0.as_ref() {
+                    o.insert((cell.to_key(), item));
                 }
             }
             std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((cell, item));
+                v.insert((cell.to_key(), item));
             }
         }
     }
@@ -693,21 +812,21 @@ where
 {
     type Item = I;
 
-    fn push(&mut self, row: &[u8], qualifier: &[u8], item: I) -> ControlFlow<()> {
-        self.offer((row.to_vec(), qualifier.to_vec()), item);
+    fn push(&mut self, cell: CellRef<'_>, item: I) -> ControlFlow<()> {
+        self.offer(cell, item);
         ControlFlow::Continue(())
     }
 
     fn merge(&mut self, other: Self) {
         for (_, (cell, item)) in other.kept {
-            self.offer(cell, item);
+            self.offer(cell.as_ref(), item);
         }
     }
 
-    fn finish(self) -> Vec<(Vec<u8>, Vec<u8>, I)> {
+    fn finish(self) -> Vec<(CellKey, I)> {
         let mut out: Vec<_> = self.kept.into_values().collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        out.into_iter().map(|((r, q), i)| (r, q, i)).collect()
+        out
     }
 }
 
@@ -715,71 +834,110 @@ where
 mod tests {
     use super::*;
 
-    fn push_all<R: Reducer>(
-        r: &mut R,
-        items: impl IntoIterator<Item = (&'static str, &'static str, R::Item)>,
-    ) {
-        for (row, q, i) in items {
-            let _ = r.push(row.as_bytes(), q.as_bytes(), i);
+    fn cell(row: &'static str, rank: u32, q: &'static str, ts: Timestamp) -> CellRef<'static> {
+        CellRef {
+            row: row.as_bytes(),
+            family_rank: rank,
+            family: FamilyId(rank),
+            qualifier: q.as_bytes(),
+            ts,
         }
     }
 
+    fn rows<I>(items: &[(CellKey, I)]) -> Vec<(&[u8], u32, &[u8], Timestamp)> {
+        items
+            .iter()
+            .map(|(k, _)| {
+                (
+                    k.row.as_slice(),
+                    k.family_rank,
+                    k.qualifier.as_slice(),
+                    k.ts,
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn top_k_breaks_equal_scores_by_row_then_qualifier_in_any_merge_order() {
-        // Equal scores across "groups": the smallest (row, qualifier) among the ties win.
+    fn cells_order_as_a_scan_does_family_before_qualifier_newest_version_first() {
+        assert!(
+            cell("r", 0, "z", 1) < cell("r", 1, "a", 1),
+            "family rank before qualifier"
+        );
+        assert!(
+            cell("r", 0, "q", 9) < cell("r", 0, "q", 3),
+            "newest version first"
+        );
+        assert!(cell("a", 9, "z", 0) < cell("b", 0, "a", 9), "row first");
+    }
+
+    #[test]
+    fn top_k_breaks_equal_scores_by_cell_order_in_any_merge_order() {
+        // Equal scores across "groups": the first cells in scan order among the ties win,
+        // including two versions of one column and the same qualifier in two families.
         let cells = [
-            ("r3", "a", 1u32),
-            ("r1", "b", 1),
-            ("r2", "a", 1),
-            ("r1", "a", 1),
-            ("r0", "z", 2),
+            (cell("r3", 0, "a", 1), 1u32),
+            (cell("r1", 1, "a", 1), 1),
+            (cell("r1", 0, "b", 1), 1),
+            (cell("r1", 0, "b", 5), 1),
+            (cell("r2", 0, "a", 1), 1),
+            (cell("r0", 0, "z", 1), 2),
         ];
         let mut seq = TopK::new(3);
-        push_all(&mut seq, cells);
+        for (c, s) in cells {
+            let _ = seq.push(c, s);
+        }
         let want = seq.finish();
         assert_eq!(
-            want.iter()
-                .map(|(r, q, _)| (r.as_slice(), q.as_slice()))
-                .collect::<Vec<_>>(),
-            vec![(&b"r1"[..], &b"a"[..]), (b"r1", b"b"), (b"r2", b"a")]
+            rows(&want),
+            vec![
+                (&b"r1"[..], 0, &b"b"[..], 5),
+                (b"r1", 0, b"b", 1),
+                (b"r1", 1, b"a", 1)
+            ]
         );
         for split in 0..=cells.len() {
             let (a, b) = cells.split_at(split);
             let (mut x, mut y) = (TopK::new(3), TopK::new(3));
-            push_all(&mut x, a.iter().copied());
-            push_all(&mut y, b.iter().rev().copied());
+            for (c, s) in a {
+                let _ = x.push(*c, *s);
+            }
+            for (c, s) in b.iter().rev() {
+                let _ = y.push(*c, *s);
+            }
             y.merge(x);
             assert_eq!(y.finish(), want, "split at {split}");
         }
     }
 
     #[test]
-    fn limit_keeps_the_first_n_keys_whichever_group_finishes_first() {
+    fn limit_keeps_the_first_n_cells_in_scan_order_whichever_group_finishes_first() {
+        // Within a row, family 0's "z" comes before family 1's "a" (ctr274's case).
         let mut early = Limit::new(2);
-        assert!(early.push(b"a", b"1", 1).is_continue());
-        assert!(early.push(b"b", b"1", 2).is_break());
+        assert!(early.push(cell("a", 0, "z", 1), 1).is_continue());
+        assert!(early.push(cell("a", 1, "a", 1), 2).is_break());
         let mut late = Limit::new(2);
-        let _ = late.push(b"m", b"1", 3);
-        let _ = late.push(b"n", b"1", 4);
+        let _ = late.push(cell("m", 0, "a", 1), 3);
+        let _ = late.push(cell("n", 0, "a", 1), 4);
         late.merge(early);
-        let got: Vec<i32> = late.finish().into_iter().map(|(_, _, i)| i).collect();
+        let got: Vec<i32> = late.finish().into_iter().map(|(_, i)| i).collect();
         assert_eq!(got, vec![1, 2]);
     }
 
     #[test]
-    fn dedupe_keeps_the_smallest_cell_per_key_and_drops_excluded_keys() {
+    fn dedupe_keeps_the_first_cell_per_key_and_drops_excluded_keys() {
         fn key(i: &u32) -> u32 {
             *i
         }
         let exclude = Arc::new(std::collections::HashSet::from([9u32]));
         let mut a = Dedupe::new(key as fn(&u32) -> u32, Some(Arc::clone(&exclude)));
-        let _ = a.push(b"r2", b"q", 7);
-        let _ = a.push(b"r1", b"q", 9);
+        let _ = a.push(cell("r2", 0, "q", 1), 7);
+        let _ = a.push(cell("r1", 0, "q", 1), 9);
         let mut b = Dedupe::new(key as fn(&u32) -> u32, Some(exclude));
-        let _ = b.push(b"r1", b"q", 7);
+        let _ = b.push(cell("r1", 0, "q", 1), 7);
         a.merge(b);
         let got = a.finish();
         assert_eq!(got.len(), 1);
-        assert_eq!((got[0].0.as_slice(), got[0].2), (&b"r1"[..], 7));
+        assert_eq!((got[0].0.row.as_slice(), got[0].1), (&b"r1"[..], 7));
     }
 }
