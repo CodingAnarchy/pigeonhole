@@ -280,6 +280,9 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
         "f" => 40,
         "g" => 100,
         "ttl" => 60,
+        // A bloom filter's base separates once it holds about 15 bits, so reads and
+        // compactions fold onto separated bases (D298 §4.1, §4.2).
+        name if name.starts_with("bloom") => 64,
         _ => FamilyOptions::default().blob_threshold,
     };
     FamilyOptions::default()

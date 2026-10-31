@@ -1,8 +1,10 @@
 //! D298 (#488 PR 4): bloom filter families and bytes elements. A bloom family's operator is
 //! built from its parameters (bits, hashes); an input is an `i64` or bytes element, written as
 //! its one-element filter before the WAL, and folded by OR through flushes, checkpoints and
-//! compactions; an HLL family takes bytes elements too, behind the same domain tag. One
-//! engine-owned shard over `SimVfs`.
+//! compactions; an HLL family takes bytes elements too, behind the same domain tag. A
+//! filter's value may be separated into a blob file (PR 5): reads fold inputs onto the
+//! separated base, compaction folds them into a new one, and a counter checkpoint keeps only
+//! a folded value of at most 4 KiB. One engine-owned shard over `SimVfs`.
 
 use crate::common;
 
@@ -121,7 +123,8 @@ fn elements_fold_through_flushes_checkpoints_and_compactions() {
                 "steps {steps}, input {i}"
             );
         }
-        // Dense by now (past its blob threshold of 8), and still inline after a compaction.
+        // Dense by now, so past its blob threshold of 8 and separated since the first flush:
+        // later reads fold onto the separated base, and compactions fold into a new one.
         assert_eq!(want[3], 1, "dense");
         r.db.flush().unwrap();
         r.db.compact(None).unwrap();
@@ -223,4 +226,175 @@ fn puts_take_the_familys_own_filter_and_parameters_are_checked() {
         other => panic!("{other:?}"),
     }
     r.db.close().unwrap();
+}
+
+/// A dense filter of `p` with every other bit set.
+fn dense_filter(p: BloomParams) -> Vec<u8> {
+    let mut s = vec![bloom::ENCODING, p.log2_bits, p.hashes, 1];
+    s.resize(4 + (1usize << p.log2_bits) / 8, 0x55);
+    bloom::validate(&s, p).unwrap();
+    s
+}
+
+fn live_blob_files(db: &Engine, f: FamilyId) -> Vec<(u32, u64)> {
+    db.blob_files()
+        .into_iter()
+        .filter(|b| b.0 == f && b.3 > 0)
+        .map(|b| (b.1, b.3))
+        .collect()
+}
+
+#[test]
+fn a_separated_base_folds_its_inputs_at_reads_and_compactions() {
+    // D298 §4.1 and §4.2: a dense filter past the family's blob threshold is separated at
+    // flush; inputs above it fold onto the value behind the pointer at read, and a
+    // compaction folds them into a new separated base, leaving the old one unreferenced.
+    for steps in [128, 1] {
+        let vfs = SimVfs::new(4);
+        let r = Rig::open(&vfs, steps);
+        let mut want = Vec::new();
+        for v in 0..100 {
+            bloom::add(&mut want, P, hll::hash_i64(v)).unwrap();
+        }
+        r.commit(|wb| {
+            wb.put(r.t, r.b, b"r", b"q", Some(3_600), ValueRef::Bytes(&want))
+                .unwrap();
+        })
+        .unwrap();
+        r.db.flush().unwrap();
+        let base = live_blob_files(&r.db, r.b);
+        assert_eq!(base.len(), 1, "steps {steps}: the base is separated");
+        for v in 100..140i64 {
+            r.commit(|wb| {
+                wb.merge_at(r.t, r.b, b"r", b"q", 3_600, ValueRef::I64(v))
+                    .unwrap();
+            })
+            .unwrap();
+            bloom::add(&mut want, P, hll::hash_i64(v)).unwrap();
+            let got = r.db.get_latest(r.t, r.b, b"r", b"q").unwrap().unwrap();
+            assert_eq!(
+                got.value(),
+                ValueRef::Bytes(&want),
+                "steps {steps}, input {v}"
+            );
+        }
+        r.db.flush().unwrap();
+        r.db.compact(None).unwrap();
+        let after = live_blob_files(&r.db, r.b);
+        assert_eq!(after.len(), 1, "steps {steps}: {after:?}");
+        assert_ne!(
+            after[0].0, base[0].0,
+            "steps {steps}: folded into a new base"
+        );
+        r.db.check_blob_accounting().unwrap();
+        let got = r.db.get_latest(r.t, r.b, b"r", b"q").unwrap().unwrap();
+        assert_eq!(got.value(), ValueRef::Bytes(&want), "steps {steps}");
+        assert_eq!(got.timestamp(), 3_600);
+        r.db.close().unwrap();
+        // And after a reopen.
+        let db = Engine::open(Path::new(DB), options(&vfs, steps)).unwrap();
+        let got = db.get_latest(r.t, r.b, b"r", b"q").unwrap().unwrap();
+        assert_eq!(
+            got.value(),
+            ValueRef::Bytes(&want),
+            "steps {steps}: reopened"
+        );
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn a_whole_filter_larger_than_a_wal_record_is_separated_at_commit() {
+    // 2^21 bits: a 256 KiB dense filter, refused as too large while bloom values stayed
+    // inline (PR 4), now goes to a blob file at commit (`phdb load`'s write back).
+    let vfs = SimVfs::new(5);
+    let db = Engine::open(Path::new(DB), options(&vfs, 128)).unwrap();
+    let p = BloomParams {
+        log2_bits: 21,
+        hashes: 3,
+    };
+    let info = db
+        .create_table("t", &[("b".into(), bloom_family(p))])
+        .unwrap();
+    let (t, b) = (info.id, info.family("b").unwrap().id);
+    let mut want = dense_filter(p);
+    let mut wb = WriteBatch::new();
+    wb.put(t, b, b"r", b"q", None, ValueRef::Bytes(&want))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    assert_eq!(live_blob_files(&db, b).len(), 1);
+    let mut wb = WriteBatch::new();
+    wb.merge(t, b, b"r", b"q", ValueRef::Bytes(b"carol"))
+        .unwrap();
+    db.commit(wb, None).unwrap();
+    bloom::add(&mut want, p, hll::hash_bytes(b"carol")).unwrap();
+    let got = db.get_latest(t, b, b"r", b"q").unwrap().unwrap();
+    assert!(
+        got.value() == ValueRef::Bytes(&want),
+        "the input folds onto the blob"
+    );
+    db.flush().unwrap();
+    db.compact(None).unwrap();
+    let got = db.get_latest(t, b, b"r", b"q").unwrap().unwrap();
+    assert!(got.value() == ValueRef::Bytes(&want), "and into a new base");
+    db.check_blob_accounting().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn a_counter_checkpoint_keeps_only_a_folded_value_of_at_most_4_kib() {
+    // D298 §4.3: with checkpoints after every step, a get of a filter of 2^14 bits (a 2 KiB
+    // value) leaves a checkpoint; one of 2^15 bits (just over 4 KiB) never does.
+    let vfs = SimVfs::new(6);
+    let db = Engine::open(Path::new(DB), options(&vfs, 1)).unwrap();
+    let (small, large) = (
+        BloomParams {
+            log2_bits: 14,
+            hashes: 3,
+        },
+        BloomParams {
+            log2_bits: 15,
+            hashes: 3,
+        },
+    );
+    let info = db
+        .create_table(
+            "t",
+            &[
+                ("s".into(), bloom_family(small).blob_threshold(1 << 20)),
+                ("l".into(), bloom_family(large).blob_threshold(1 << 20)),
+            ],
+        )
+        .unwrap();
+    let t = info.id;
+    for (name, p, kept) in [("s", small, true), ("l", large, false)] {
+        let f = info.family(name).unwrap().id;
+        let mut wb = WriteBatch::new();
+        wb.put(
+            t,
+            f,
+            b"r",
+            b"q",
+            Some(3_600),
+            ValueRef::Bytes(&dense_filter(p)),
+        )
+        .unwrap();
+        wb.merge_at(t, f, b"r", b"q", 3_600, ValueRef::I64(1))
+            .unwrap();
+        db.commit(wb, None).unwrap();
+        let mut wb = WriteBatch::new();
+        wb.merge_at(t, f, b"r", b"q", 3_600, ValueRef::I64(2))
+            .unwrap();
+        db.commit(wb, None).unwrap();
+        let before = db.counter_checkpoints();
+        db.get_latest(t, f, b"r", b"q").unwrap().unwrap();
+        db.get_latest(t, f, b"r", b"q").unwrap().unwrap();
+        let after = db.counter_checkpoints();
+        if kept {
+            assert!(after.0 > before.0, "{name}: {before:?} -> {after:?}");
+        } else {
+            assert_eq!(after, before, "{name}: none sent");
+        }
+    }
+    db.close().unwrap();
 }

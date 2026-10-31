@@ -3261,7 +3261,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Measured (AX102, a 2M-edge hub, warm):** `cells()` 71.6 ns/edge and 4.8 KB allocated for the walk (`read()`: 122 ns/edge, 738 MB); RocksDB's prefix iterator 71.0 ns/edge. `pages(1000)` 104 µs a page, over D297's 95 µs target; the page fill's cell copies are a follow-up with the callgrind shapes.
 
 <a id="d298"></a>
-## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D186 for aggregate families in PR 5)
+## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D73 and D186 for aggregate families in PR 5a)
 **Why.** The owner's minimum set for #488, on D294's machinery: bitwise OR, AND and XOR; `f64` min and max; an exact `f64` sum; mean and variance; fixed-bucket histograms; bloom union. Also log-linear quantiles, and #489's roaring `u32` set. Kinds with parameters need a field on `PutFamily`; cli692's #490 vector kind needs one too, so the two share it.
 
 **Decided (the design note, with revision 1).**
@@ -3459,6 +3459,31 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Mutation:** a wrong `h2` fails 30 of the 33 engine `scalar_counters` tests.
   - **Not modeled:** the model's bloom families take `i64` elements only; bytes elements are covered by the engine, API and phdb tests. PR 5 adds bytes elements to the model.
 - **API, phdb and corpus:** a `pigeonhole` API test, a phdb shell test, and the help snapshot. The corpus gains `seen_b` (`i64` and bytes elements) and bytes elements in `users`.
+
+**What (PR 5a: separated bases, the compaction fold, the checkpoint cap).** PR 5 splits as §8 allowed: 5a is the engine, 5b the roaring `Set`.
+- **Separation keys on its own predicate** (§ above), now apart:
+  - `FamilyKind::values_stay_inline()` no longer lists `Bloom`. A filter's value separates like any `Bytes` value: at flush and compaction past the family's `blob_threshold`, and at commit past a WAL record. A whole dense filter of 2^21 bits or more (`phdb load`), refused in PR 4, now goes to a blob file. Operands (one-element filters) stay inline, as every operand does (D180).
+  - `catalog::folds_separated_bases(kind)`, an explicit list (`Bloom`; 5b adds `Set`), decides the read path's blob attach: `ResolverBlobs::attach` loads a separated base for an application's operator or a kind on the list, and skips the others. A unit test pins that every aggregate kind whose values may separate is on it.
+- **§4.1, reads:** the resolver already loads a separated base before `finish` (`load_base`). Attaching the hook for bloom families was the change. Every read path (gets, scans, multi-get, `reduce`, `keys`, checkpoint reads) goes through `attach`.
+- **§4.2, the compaction fold (S4)** (`Gc::decide_counter`, compaction only; a flush's combine still folds only operands):
+  - **When:** a kept base `P` directly below a run of operands of its own stripe, and `!guarded(P.seqno, newest)`: no other source reaches `[P.seqno, newest]`.
+  - **In-run deletes need no check of their own:** a delete in the inputs with a seqno above `P` covering the bucket (in the group, a column delete at a newer timestamp, or a marker) makes `P` covered, so it is dropped, never kept, and nothing folds onto it. Any seqno between two of a stripe's entries is in that stripe.
+  - **Result:** one `Put` at the newest operand's key (as a read's fold or a D291 checkpoint would be keyed), with `op.finish(Some(base), operands)`. It is separated at the output like any put past the threshold, and the old base's blob bytes are counted dropped.
+  - **A separated base** is read through `JobContext::base_blobs`, which the engine sets for kinds on `folds_separated_bases` when the view has blob files. A base that can't be read, or that the operator refuses, is not folded: the run is combined as before and the base kept, so a read keeps failing on a bad base (#21).
+  - **D73 and D186 are amended** for aggregate families: a bucket is one `(column, timestamp)`, so D73's objections (deletes, TTL and `time_range` at different timestamps inside a run) don't arise. D73 stays for standard families.
+- **§4.3, the checkpoint cap:** a counter get's fold is sent as a D291 checkpoint only when its stored value is at most `MAX_CHECKPOINT_BYTES` (4 KiB): every scalar, an HLL sketch, and most histograms and quantile sketches. A larger value would cost the memtable more than its fold saves; §4.2 keeps such a cell's reads short instead, which is what the PR 3 measurement needed ("must not come without §4.2"). 5b measures the cap with `hotagg` sets.
+
+**Tests (PR 5a).**
+- **Compaction:**
+  - `counter_bases_fold_with_the_operands_of_their_stripe`: the fold at the newest operand's key; no fold under a source at the base's seqno (the widened guard), between the operands (#1051), unknown sources, or a snapshot between base and operands; a refused base kept apart unchanged.
+  - The counter proptests and `counter_checkpoints_survive_combines_fixed_seeds` (deletes, markers, checkpoints, other sources split by column, version or entry, random snapshots) now fold too: the fixed seeds fold over 100 bases, every read at every live snapshot and after later writes unchanged.
+  - **Mutations**, each failing three of the existing counter tests: no guard; the guard narrowed to the newest operand; a fold across stripes; a fold onto a covered base. Keying the result at the base's own seqno survives, as it should: base and operands share a stripe, so no read point lies between them.
+- **Engine (`it/bloom_aggregates.rs`):**
+  - a dense filter separated at flush, inputs folded onto it at read, then compacted into a new separated base with the old one unreferenced (`check_blob_accounting`), with checkpoints at 128 and 1 step, and after a reopen;
+  - a 2^21-bit filter put at commit goes to a blob file; an input folds onto it; a compaction folds it;
+  - the cap: a 2 KiB filter's get leaves a checkpoint, a 4 KiB one's never does.
+  - **Mutations:** `attach` skipping bloom fails 3 tests; no `base_blobs` fails the compaction fold test; no cap fails the cap test.
+- **Model checks:** both harnesses give `bloom` families a blob threshold of 64, so the `scalar_counters` sweeps fold onto separated bases at reads and compactions.
 
 <a id="d299"></a>
 ## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)
