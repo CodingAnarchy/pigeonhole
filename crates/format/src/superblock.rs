@@ -123,7 +123,7 @@ impl Features {
     pub const KNOWN_COMPAT: u64 = 0;
     /// The `ro_compat` bits this build knows (none yet).
     pub const KNOWN_RO_COMPAT: u64 = 0;
-    /// The `incompat` bits this build knows: bit 0, the Min and Max family kinds
+    /// The `incompat` bits this build knows: bit 0, the Min, Max and Hll family kinds
     /// ([`INCOMPAT_AGGREGATES`](crate::manifest::INCOMPAT_AGGREGATES), D294).
     pub const KNOWN_INCOMPAT: u64 = crate::manifest::INCOMPAT_AGGREGATES;
 

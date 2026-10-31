@@ -21,6 +21,7 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
             Aggregation::Sum => "sum",
             Aggregation::Min => "min",
             Aggregation::Max => "max",
+            Aggregation::Hll => "hll",
             _ => "unknown",
         }),
         "max_versions": f.max_versions,
@@ -62,6 +63,7 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
         (Some("sum"), _) | (None, Some(true)) => Family::counter(),
         (Some("min"), _) => Family::aggregate(Aggregation::Min),
         (Some("max"), _) => Family::aggregate(Aggregation::Max),
+        (Some("hll"), _) => Family::aggregate(Aggregation::Hll),
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
         (None, _) => Family::default(),
     };

@@ -144,7 +144,7 @@ fn min_and_max_families() {
         &path,
         "json",
         &[
-            "create s lo:min hi:max",
+            "create s lo:min hi:max u:hll",
             "aggregate s r lo:t 7",
             "aggregate s r hi:t 7",
             "aggregate s r lo:t -2",

@@ -46,22 +46,67 @@ pub enum ModelAggregation {
     Min,
     /// The largest `i64`.
     Max,
+    /// The distinct `i64` elements, as a HyperLogLog sketch (the store's
+    /// `pigeonhole_format::hll` encoding, which [`hll_sketch`] writes independently).
+    Hll,
 }
 
 impl ModelAggregation {
-    /// `a` combined with `b`.
+    /// `a` combined with `b` (`Sum`, `Min`, `Max`; an HLL family's inputs are elements,
+    /// never combined into one `i64`).
     pub fn combine(self, a: i64, b: i64) -> i64 {
         match self {
             ModelAggregation::Sum => a.wrapping_add(b),
             ModelAggregation::Min => a.min(b),
             ModelAggregation::Max => a.max(b),
+            ModelAggregation::Hll => unreachable!("HLL inputs are not combined into an i64"),
         }
     }
 }
 
+/// The canonical sketch of the elements `elements` (D294; FORMAT §3.1), written from the
+/// encoding's description rather than with the store's code: 4096 registers, each the
+/// largest rank of its elements (`pigeonhole_format::hll::register_of`, the hash the format
+/// fixes), sparse while at most 767 are set, else dense with six-bit packed registers.
+/// `None` for no elements.
+pub fn hll_sketch(elements: impl IntoIterator<Item = i64>) -> Option<Vec<u8>> {
+    let mut registers = [0u8; 4096];
+    for v in elements {
+        let (i, r) = pigeonhole_format::hll::register_of(v);
+        let slot = &mut registers[usize::from(i)];
+        *slot = (*slot).max(r);
+    }
+    let set: Vec<(usize, u8)> = (0..4096)
+        .filter(|&i| registers[i] != 0)
+        .map(|i| (i, registers[i]))
+        .collect();
+    if set.is_empty() {
+        return None;
+    }
+    if set.len() <= 767 {
+        let mut out = vec![1, 12, 0, 0];
+        for (i, r) in set {
+            out.extend_from_slice(&(((i as u32) << 8) | u32::from(r)).to_le_bytes());
+        }
+        return Some(out);
+    }
+    let mut out = vec![1, 12, 1, 0];
+    let mut bits = vec![0u8; 3072];
+    for (i, r) in set {
+        for b in 0..6 {
+            if r >> b & 1 == 1 {
+                let bit = 6 * i + b;
+                bits[bit / 8] |= 1 << (bit % 8);
+            }
+        }
+    }
+    out.extend_from_slice(&bits);
+    Some(out)
+}
+
 /// The aggregation of the test families named by convention ([`WorkloadSpec`]): a name
-/// starting with `sum` is a counter family, `min` and `max` the D294 families; `None` for
-/// any other name.
+/// starting with `sum` is a counter family, `min`, `max` and `hll` the D294 families;
+/// `None` for any other name.
 ///
 /// [`WorkloadSpec`]: crate::WorkloadSpec
 pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
@@ -71,6 +116,8 @@ pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
         Some(ModelAggregation::Min)
     } else if family.starts_with("max") {
         Some(ModelAggregation::Max)
+    } else if family.starts_with("hll") {
+        Some(ModelAggregation::Hll)
     } else {
         None
     }
@@ -416,7 +463,8 @@ impl Model {
         for op in ops {
             self.validate(op)?;
         }
-        let combined = combine_counter_writes(ops, |table, family| self.aggregation(table, family));
+        let (combined, elements) =
+            combine_aggregate_writes(ops, |table, family| self.aggregation(table, family));
         let ops = combined.as_slice();
         self.commits.push(durability);
         let seqno = self.commits.len() as Seqno;
@@ -436,9 +484,18 @@ impl Model {
             .enumerate()
             .map(|(i, k)| k.is_some_and(|k| last[&k] != i))
             .collect();
-        for (op, collapsed) in ops.iter().zip(collapsed) {
+        for (i, (op, collapsed)) in ops.iter().zip(collapsed).enumerate() {
             if !collapsed {
                 self.apply(op, commit_ts, seqno);
+                // An HLL input that combined later inputs of its cell: theirs too, as one
+                // operand (the same seqno).
+                for &e in elements.get(&i).into_iter().flatten() {
+                    let mut more = op.clone();
+                    if let ModelOp::Incr { delta, .. } = &mut more {
+                        *delta = e;
+                    }
+                    self.apply(&more, commit_ts, seqno);
+                }
             }
         }
         Ok(seqno)
@@ -472,6 +529,9 @@ impl Model {
             ModelOp::Incr { .. } if f.counter => Ok(()),
             ModelOp::Incr { ts: Some(_), .. } => refused(),
             ModelOp::Incr { .. } if !f.i64_add => Err(ModelError::NoMergeOperator(family.clone())),
+            // The model writes no sketch puts into an HLL family (the store takes only
+            // well-formed sketches there; the workload writes inputs).
+            ModelOp::Put { .. } if f.counter && f.aggregation == ModelAggregation::Hll => refused(),
             ModelOp::Put { ts, value, .. }
                 if f.counter && (value.len() != 8 || fixed_with_ttl(ts)) =>
             {
@@ -1322,26 +1382,42 @@ fn resolve_counter(
     // (`None` if the put is not an `i64`), or its operands combined if it has no put. A
     // group holds at least one put or operand.
     let agg = family.aggregation;
-    let version = |group: &[&Entry]| {
+    let version = |group: &[&Entry]| -> Option<Vec<u8>> {
+        if agg == ModelAggregation::Hll {
+            // The elements newer than the newest put; the model writes no HLL puts.
+            let mut elements = Vec::new();
+            for e in group {
+                match &e.kind {
+                    Kind::Merge(d) => elements.push(*d),
+                    Kind::Put(_) => return None,
+                    _ => {}
+                }
+            }
+            return hll_sketch(elements);
+        }
         let mut acc: Option<i64> = None;
         let fold = |acc: Option<i64>, v: i64| Some(acc.map_or(v, |a| agg.combine(a, v)));
         for e in group {
             match &e.kind {
                 Kind::Merge(d) => acc = fold(acc, *d),
-                Kind::Put(v) => return as_i64(v).and_then(|base| fold(acc, base)),
+                Kind::Put(v) => {
+                    return as_i64(v)
+                        .and_then(|base| fold(acc, base))
+                        .map(|v| v.to_le_bytes().to_vec());
+                }
                 _ => {}
             }
         }
-        acc
+        acc.map(|v| v.to_le_bytes().to_vec())
     };
-    let mut out: Vec<(Timestamp, Option<i64>)> = live
+    let mut out: Vec<(Timestamp, Option<Vec<u8>>)> = live
         .chunk_by(|a, b| a.ts == b.ts)
         .map(|group| (group[0].ts, version(group)))
         .collect();
     out.truncate(version_cap(family, limit));
     out.into_iter()
         .map(|(ts, v)| {
-            v.map(|v| (ts, v.to_le_bytes().to_vec()))
+            v.map(|v| (ts, v))
                 .ok_or_else(|| ModelError::MergeFailed(family.name.clone()))
         })
         .collect()
@@ -1368,11 +1444,23 @@ fn version_cap(family: &ModelFamily, limit: u32) -> usize {
 /// is combined into that write with the family's aggregation (a wrapping add for a counter,
 /// D294's min or max), in order, and dropped. Deletes do not stop a combination; D34 then
 /// collapses what is left of a cell to the last write. `aggregation` gives the aggregation
-/// of `(table, family)`, `None` for an ordinary family, whose ops are unchanged.
+/// of `(table, family)`, `None` for an ordinary family, whose ops are unchanged. In an HLL
+/// family the later inputs are dropped from the ops (the store logs one operand for the
+/// cell); [`combine_aggregate_writes`] keeps their elements.
 pub fn combine_counter_writes(
     ops: &[ModelOp],
     aggregation: impl Fn(&str, &str) -> Option<ModelAggregation>,
 ) -> Vec<ModelOp> {
+    combine_aggregate_writes(ops, aggregation).0
+}
+
+/// [`combine_counter_writes`], with the elements of the HLL inputs combined into an earlier
+/// one, by the index of that one in the returned ops.
+pub fn combine_aggregate_writes(
+    ops: &[ModelOp],
+    aggregation: impl Fn(&str, &str) -> Option<ModelAggregation>,
+) -> (Vec<ModelOp>, BTreeMap<usize, Vec<i64>>) {
+    let mut elements: BTreeMap<usize, Vec<i64>> = BTreeMap::new();
     let mut out: Vec<ModelOp> = Vec::with_capacity(ops.len());
     let mut latest: BTreeMap<CollapseKey<'_>, usize> = BTreeMap::new();
     for op in ops {
@@ -1414,6 +1502,10 @@ pub fn combine_counter_writes(
         if let ModelOp::Incr { delta, .. } = op
             && let Some(&i) = latest.get(&key)
         {
+            if agg == ModelAggregation::Hll {
+                elements.entry(i).or_default().push(*delta);
+                continue;
+            }
             match &mut out[i] {
                 ModelOp::Incr { delta: d, .. } => *d = agg.combine(*d, *delta),
                 ModelOp::Put { value, .. } => {
@@ -1427,7 +1519,7 @@ pub fn combine_counter_writes(
         latest.insert(key, out.len());
         out.push(op.clone());
     }
-    out
+    (out, elements)
 }
 
 /// `(row, family, qualifier, ts)` of a column-level mutation, borrowed.

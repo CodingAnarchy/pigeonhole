@@ -47,6 +47,7 @@ let pages = db
 | Small, hot attributes (status) | `max_versions(1)`, `Priority::High`, `compression(Compression::None)` if tiny |
 | Counters | `Family::counter()`; a `ttl` to keep only recent buckets |
 | Running minimum or maximum | `Family::aggregate(Aggregation::Min)` or `Max`; buckets as for counters |
+| Distinct counts | `Family::aggregate(Aggregation::Hll)`; read with `hll_estimate` |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -200,6 +201,34 @@ Everything in [Counters](#counters) holds, with the family's aggregation in plac
 - **TTL, `max_versions`, values.** As for counters: buckets only with a TTL, and only `i64`s.
 - **`FamilyInfo::aggregation`** says a family's aggregation (`None` for an ordinary family; a counter family's is `Some(Sum)`).
 - **The file can no longer be opened by 1.0.x.** Min and max families came after 1.0: creating the first one marks the file (a feature bit), and from then on pigeonhole 1.0.x refuses to open it (`UnsupportedFeature`), even after the family is dropped. Back up first if you may roll back ([upgrades](concepts.md#file-format-and-upgrades)).
+
+
+## Distinct counts (HLL)
+`Family::aggregate(Aggregation::Hll)` counts **distinct** `i64` inputs per cell with a HyperLogLog sketch (D294): unique visitors per page, distinct devices per hour. `aggregate` adds an element without reading the cell, and `CellRef::hll_estimate` reads the estimated count (4096 registers, about 1.6% standard error; small counts are exact or nearly so). Hash a string or other key to an `i64` yourself before writing it.
+
+```rust
+use pigeonhole::{Aggregation, Family};
+# fn main() -> pigeonhole::Result<()> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = pigeonhole::Pigeonhole::open(dir.join("app.phdb"), pigeonhole::Options::default())?;
+let t = db
+    .table("pages")?
+    .family("visitors", Family::aggregate(Aggregation::Hll))
+    .create_if_missing()?;
+for user in [7, 9, 7, 12, 9] {
+    t.mutate(b"home").aggregate("visitors", b"all", user).commit()?;
+}
+let n = t.get(b"home", "visitors", b"all")?.unwrap().hll_estimate();
+assert_eq!(n, Some(3));
+# Ok(())
+# }
+```
+
+As for counters and min/max: `aggregate_at` writes a bucket, a delete starts the cell again, and the TTL expires each bucket. Differences:
+- **Size and speed:** a cell is a sketch of up to 3 KiB, against 9 bytes for a counter, and reads and the row cache carry it whole. Bound a wide row's buckets with a TTL or `max_versions`. Reading a hot HLL cell takes about 14 µs at least, the copy of its 3 KiB sketch, against about 1 µs for a counter. With the default checkpoints, its p99 stayed under 50 µs under a steady stream of inputs (D294).
+- **Writes:** `incr` and `put_i64` are refused. `put` takes only a well-formed sketch, as `phdb load` writes one back.
+- **Storage:** sketches are never moved to blob files (`blob_threshold` below 3076 is refused).
+- **The file can no longer be opened by 1.0.x**, as with min and max ([Min and max](#min-and-max)).
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

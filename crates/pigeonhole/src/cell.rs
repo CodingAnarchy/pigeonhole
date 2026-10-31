@@ -35,6 +35,14 @@ fn typed(data: &CellData) -> Value<'_> {
     }
 }
 
+/// The estimated distinct count of an HLL family's cell (D294).
+fn hll_estimate(data: &CellData) -> Option<u64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::hll::estimate(b).ok(),
+        _ => None,
+    }
+}
+
 fn as_i64(data: &CellData) -> Option<i64> {
     match data.value() {
         ValueRef::I64(v) | ValueRef::Varint(v) => Some(v),
@@ -104,6 +112,14 @@ impl<'a> CellRef<'a> {
         as_i64(&self.data)
     }
 
+    /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
+    /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
+    /// error. The value's shape decides, not its family: `None` unless it is a well-formed
+    /// sketch.
+    pub fn hll_estimate(&self) -> Option<u64> {
+        hll_estimate(&self.data)
+    }
+
     /// The version's timestamp (microseconds since the Unix epoch by default).
     pub fn timestamp(&self) -> u64 {
         self.data.timestamp()
@@ -149,6 +165,14 @@ impl Cell {
     /// The value as an `i64`, if it is one.
     pub fn as_i64(&self) -> Option<i64> {
         as_i64(&self.data)
+    }
+
+    /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
+    /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
+    /// error. The value's shape decides, not its family: `None` unless it is a well-formed
+    /// sketch.
+    pub fn hll_estimate(&self) -> Option<u64> {
+        hll_estimate(&self.data)
     }
 
     /// The version's timestamp.

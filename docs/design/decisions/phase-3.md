@@ -3151,13 +3151,21 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - Info: `FamilyInfo::aggregation`, with `counter` still meaning Sum.
   - phdb: schema JSON `"aggregation"`, the shell's `:min`/`:max` and `aggregate`, and an `info` column.
 
-**What (PR 2: HyperLogLog, planned).** Kind 4. It takes bit 0 if it ships in the release that ships Min and Max, the next free bit otherwise. The design is in the note on #487:
-- p = 12;
-- a canonical sparse/dense byte encoding of at most 3076 bytes;
-- an in-place merge;
-- Ertl's estimator with pinned constants;
-- `i64` input, with a domain tag reserved for a later bytes form;
-- a hot-cell benchmark for its own D291 step (owner, 2026-10-30).
+**What (PR 2: HyperLogLog).**
+- **Kind and bit:** kind 4 (`FamilyKind::Hll`), under bit 0, since it ships in the release that ships Min and Max. Operator `pigeonhole.hll` (`HllUnion`); public `Aggregation::Hll` and `CellRef::hll_estimate`/`Cell::hll_estimate` (ICR 0094).
+- **The sketch** (`pigeonhole_format::hll`, FORMAT §3.1):
+  - precision 12 (4096 registers, about 1.6%);
+  - xxh3-64 over the element's 8 LE bytes, untagged, so a later bytes input hashes a type byte first;
+  - a canonical encoding, sparse with at most 767 registers set, else dense with 6-bit packed registers, 3076 bytes at most.
+- **Merge:** in place (perf287's S2). A dense accumulator takes the larger ranks straight into its packed bytes, and a sparse one merges its entry list from the end. It reserves the dense length once and converts through a stack copy, so folding into a dense sketch allocates nothing and a sparse fold allocates once at most (allocation-counting tests).
+- **Estimate:** Ertl's improved estimator, with α∞ pinned as a bit pattern and only `+ × ÷`, halving and `√` (perf287's S3). Estimates are pinned in tests.
+- **Writes:**
+  - an input is an `i64` element, which the engine turns into its one-register sketch when it prepares the commit, before the WAL; same-cell inputs of a commit merge;
+  - `incr` and `put_i64` are refused;
+  - a `put` must carry a well-formed sketch, so `phdb load` writes a dumped one back;
+  - a standard family can't name `pigeonhole.hll`;
+  - an HLL family's `blob_threshold` must reach 3076, so sketches are never separated.
+- **D291's threshold stays 128 for every kind, HLL included** (owner, 2026-10-30: an HLL p99 under 50 µs is acceptable, since users expect it a little slower than plain gets; no per-kind threshold). Hot-cell bench: #487 PR 2, `examples/hotagg.rs`. At 128 an HLL read's p99 was 43 µs, against 24 µs at 32 and 307 µs at 512. Each HLL checkpoint adds about 3 KiB to the memtable: about 105 B per write at 128 against 168 at 32, and Sum's 63–84.
 
 **Tests.**
 - `aggregates.rs` (engine):
@@ -3165,10 +3173,12 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - the bit set in both pages by the first such family and kept after its drop;
   - refused creations leaving both pages at 0;
   - a family without its bit read as corruption;
-  - an unknown bit refused before decoding.
-- **Model checks:** the `counters` targets of the engine and `pigeonhole` model checks add the `min` and `max_ttl` families, which the model folds with `ModelAggregation`. So the five standard sweeps cover them, checkpoints on odd seeds included.
+  - an unknown bit refused before decoding;
+  - HLL (PR 2): folds against the sim's independent encoder (sparse, dense, buckets, deletes, a sketch put, inputs combined in a commit), checkpoints at every fold, and the write, operator and blob-threshold refusals.
+- **`tests/hll.rs` (format):** the encoding against a plain-register reference across the 767/768 boundary; merges commutative, associative, idempotent and in place behind a tag byte; the estimate within 3σ from 1 to 10⁶ elements, and pinned on four sketches; malformed sketches refused; the allocation guards.
+- **Model checks:** the `counters` targets of the engine and `pigeonhole` model checks add the `min`, `max_ttl`, `hll` and `hll_ttl` families, which the model folds with `ModelAggregation`. Its HLL resolves to `hll_sketch`, an encoder written apart from the format crate's. So the five standard sweeps cover them, checkpoints on odd seeds included. Mutations: encoding the wrong element in the engine fails 30 of the 33 engine `counters` tests; keeping the smaller rank in the sparse merge fails the format tests.
 - **API and phdb:** `pigeonhole` API and phdb shell tests.
-- **Corpus:** a corpus entry `aggregates` (crashed, so its tail replays) carries `refused-by-1.0.0.txt`. The Compatibility workflow fails if the published 1.0.0 opens it or refuses it for other bits.
+- **Corpus:** a corpus entry `aggregates` (crashed, so its tail replays, with min, max and HLL families, sparse and dense sketches) carries `refused-by-1.0.0.txt`. The Compatibility workflow fails if the published 1.0.0 opens it or refuses it for other bits.
 
 <a id="d295"></a>
 ## D295 — Two version lines: the internal crates share one, apart from the public crates (owner decision, 2026-10-30; workspace, release tooling, CI; #487, #1194; applies D282)

@@ -12,11 +12,11 @@ use crate::{ModelOp, Rng};
 /// a store configured with the `i64` add operator for those families never sees a malformed
 /// operand. A family whose name starts with `sum` is a counter family of decision D179 (the
 /// model's [`ModelFamily::counter`](crate::ModelFamily::counter)), and one starting with
-/// `min` or `max` an aggregate family of D294 ([`aggregation_of_name`](crate::aggregation_of_name)):
-/// the same writes, some at
-/// the fixed counter timestamp and some at bucket timestamps (multiples of 4); if its name
-/// contains `ttl`, every put and `Incr` there takes a bucket timestamp (a counter family with
-/// a TTL refuses the fixed one).
+/// `min`, `max` or `hll` an aggregate family of D294
+/// ([`aggregation_of_name`](crate::aggregation_of_name)): the same writes, some at the fixed
+/// counter timestamp and some at bucket timestamps (multiples of 4), except that an `hll`
+/// family gets inputs where the others get puts; if its name contains `ttl`, every put and
+/// `Incr` there takes a bucket timestamp (a counter family with a TTL refuses the fixed one).
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct WorkloadSpec {
@@ -241,7 +241,9 @@ impl Workload {
             };
         }
         let qualifier = self.qualifier();
-        if counter && self.rng.chance(800_000) {
+        // An HLL family takes inputs only: the model writes no sketch puts there.
+        let hll = crate::aggregation_of_name(&family) == Some(crate::ModelAggregation::Hll);
+        if counter && (hll || self.rng.chance(800_000)) {
             let delta = self.rng.below(2001) as i64 - 1000;
             let ts = if sum { self.sum_ts(&family) } else { None };
             return ModelOp::Incr {
@@ -308,8 +310,10 @@ impl Workload {
         let tick = (self.tick / 4 * 4).max(4);
         let sum_ts =
             |rng: &mut Rng| (family.contains("ttl") || rng.chance(500_000)).then_some(tick);
+        // An HLL family takes inputs only (no puts), so its put case is an input too.
+        let hll = crate::aggregation_of_name(&family) == Some(crate::ModelAggregation::Hll);
         match self.rng.below(6) {
-            0 if counter => ModelOp::Incr {
+            n if counter && (n == 0 || (hll && n == 1)) => ModelOp::Incr {
                 ts: if sum { sum_ts(&mut self.rng) } else { None },
                 table,
                 row,

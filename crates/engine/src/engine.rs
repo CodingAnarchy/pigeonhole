@@ -3746,6 +3746,7 @@ impl Inner {
         // many counter puts and operands there are (two may combine, #295).
         let mut fixed_ts = false;
         let mut counter_writes = 0usize;
+        let mut hll_inputs = false;
         // The shard of the last row routed: a batch's writes to one row route once.
         let mut last: Option<(TableId, &[u8], ShardId)> = None;
         for m in batch.batch().iter() {
@@ -3762,6 +3763,8 @@ impl Inner {
             if meta.options.kind.is_aggregate() {
                 fixed_ts |= check_counter_write(&m, meta, catalog)?;
                 counter_writes += usize::from(matches!(m.kind, Kind::Put | Kind::Merge));
+                // An HLL input is an element, written as its one-register sketch (D294).
+                hll_inputs |= meta.options.kind == FamilyKind::Hll && m.kind == Kind::Merge;
             } else if m.kind == Kind::Merge && m.ts.is_some() {
                 return Err(Error::InvalidArgument(format!(
                     "{} is not a counter family: only a counter family takes increments at a \
@@ -3801,7 +3804,7 @@ impl Inner {
                 shards.push(shard);
             }
         }
-        if fixed_ts || counter_writes > 1 {
+        if fixed_ts || counter_writes > 1 || hll_inputs {
             return Ok((prepare_counter_writes(&batch.builder, catalog)?, shards));
         }
         Ok((batch.builder, shards))
@@ -4609,7 +4612,25 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
     if !matches!(m.kind, Kind::Put | Kind::Merge) {
         return Ok(false);
     }
-    if m.value.len() != 9 || m.value[0] != ValueTag::I64 as u8 {
+    let i64_value = m.value.len() == 9 && m.value[0] == ValueTag::I64 as u8;
+    if meta.options.kind == FamilyKind::Hll {
+        // Inputs are `i64` elements; a put sets a bucket to a sketch (as `phdb load` writes
+        // one back), which must be well-formed (D294).
+        let ok = match m.kind {
+            Kind::Merge => i64_value,
+            _ => {
+                m.value.first() == Some(&(ValueTag::Bytes as u8))
+                    && pigeonhole_format::hll::validate(&m.value[1..]).is_ok()
+            }
+        };
+        if !ok {
+            return Err(Error::InvalidArgument(format!(
+                "{} is an hll family: it takes i64 elements (aggregate) and puts of a \
+                 well-formed sketch",
+                family_name(catalog, m.table, m.family)
+            )));
+        }
+    } else if !i64_value {
         let hint = if meta.options.kind == FamilyKind::Counter {
             "put_i64 / incr"
         } else {
@@ -4640,6 +4661,7 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::Counter => "counter",
         FamilyKind::Min => "min",
         FamilyKind::Max => "max",
+        FamilyKind::Hll => "hll",
         FamilyKind::Standard => "standard",
     }
 }
@@ -4684,26 +4706,42 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
         }
         let ts = *m.ts.get_or_insert(COUNTER_TS);
         let key = (m.table, m.family, m.row, m.qualifier, ts);
+        // An HLL input's stored operand is the sketch of its element (D294).
+        let own = (kind == FamilyKind::Hll && m.kind == Kind::Merge).then(|| {
+            let mut v = Vec::with_capacity(9);
+            v.push(ValueTag::Bytes as u8);
+            pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
+            v
+        });
         if m.kind == Kind::Merge
             && let Some(&i) = latest.get(&key)
         {
             let w = &mut writes[i];
-            let (earlier, this) = (
-                stored_i64(w.value.as_deref().unwrap_or(w.m.value)),
-                stored_i64(m.value),
-            );
-            let combined = match kind {
-                FamilyKind::Min => earlier.min(this),
-                FamilyKind::Max => earlier.max(this),
-                _ => earlier.wrapping_add(this),
+            let combined = if let Some(own) = &own {
+                // The earlier write is a validated put of a sketch, or an input's sketch.
+                let mut v = w.value.take().unwrap_or_else(|| w.m.value.to_vec());
+                pigeonhole_format::hll::merge_at(&mut v, 1, &own[1..])
+                    .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+                v
+            } else {
+                let (earlier, this) = (
+                    stored_i64(w.value.as_deref().unwrap_or(w.m.value)),
+                    stored_i64(m.value),
+                );
+                let combined = match kind {
+                    FamilyKind::Min => earlier.min(this),
+                    FamilyKind::Max => earlier.max(this),
+                    _ => earlier.wrapping_add(this),
+                };
+                let mut v = Vec::with_capacity(9);
+                encode_value(&mut v, ValueRef::I64(combined));
+                v
             };
-            let mut v = Vec::with_capacity(9);
-            encode_value(&mut v, ValueRef::I64(combined));
-            w.value = Some(v);
+            w.value = Some(combined);
             continue;
         }
         latest.insert(key, writes.len());
-        writes.push(Write { m, value: None });
+        writes.push(Write { m, value: own });
     }
     let mut out = BatchBuilder::new();
     for w in &writes {
@@ -4744,16 +4782,27 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
     // would fold across timestamps with no feature bit, so 1.0.x would open it and fail its
     // reads instead of refusing the file (perf287's S1 on #1194). `pigeonhole.i64_add` keeps
     // its 0.1.0 meaning on a standard family (D41).
+    let kind_of = |n: &str| match n {
+        crate::catalog::I64_MIN => Some("min"),
+        crate::catalog::I64_MAX => Some("max"),
+        crate::catalog::HLL => Some("hll"),
+        _ => None,
+    };
     if options.kind == FamilyKind::Standard
-        && [crate::catalog::I64_MIN, crate::catalog::I64_MAX].contains(&name)
+        && let Some(kind) = kind_of(name)
     {
         return Err(Error::InvalidArgument(format!(
-            "{name} is the operator of a {} family: create it with that kind",
-            if name == crate::catalog::I64_MIN {
-                "min"
-            } else {
-                "max"
-            }
+            "{name} is the operator of a {kind} family: create it with that kind"
+        )));
+    }
+    // An HLL family's sketches are never separated into blob files (D294): a payload longer
+    // than the threshold is, so the threshold must reach the largest sketch (3076 bytes).
+    let largest = pigeonhole_format::hll::MAX_LEN as u64;
+    if options.kind == FamilyKind::Hll && u64::from(options.blob_threshold) < largest {
+        return Err(Error::InvalidArgument(format!(
+            "an hll family keeps its sketches inline: blob_threshold must be at least {largest}, \
+             not {}",
+            options.blob_threshold
         )));
     }
     if name.is_empty() || registry.get(name).is_some() {

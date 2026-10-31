@@ -19,6 +19,7 @@ pub mod cursor;
 pub mod error;
 pub mod filter;
 pub mod hash;
+pub mod hll;
 pub mod ids;
 pub mod key;
 pub mod manifest;

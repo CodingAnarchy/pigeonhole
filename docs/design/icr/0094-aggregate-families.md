@@ -29,3 +29,15 @@ D294 (#487): Bigtable's other `i64` aggregations, fixed per family at creation.
   - the engine and `pigeonhole` model harnesses (families named `min*`/`max*`);
   - the compaction tests' `combine_counter_writes` call;
   - the corpus (`aggregates` entry) and its compat-reader.
+
+## PR 2: HyperLogLog (#487 PR 2)
+- **pigeonhole:**
+  - `Aggregation::Hll` (a new variant of the non-exhaustive enum).
+  - `CellRef::hll_estimate()` and `Cell::hll_estimate() -> Option<u64>`.
+  - **Behaviour:** in an HLL family, `aggregate` writes an element. `incr` and `put_i64` are refused, and `put` takes a well-formed sketch only. A `blob_threshold` below 3076 is refused at creation.
+- **phdb:** `"aggregation": "hll"` in the schema JSON, and `:hll` on the shell's `create`.
+- **Internal:**
+  - `pigeonhole_format::hll`, the sketch codec;
+  - `FamilyKind::Hll` (in the unpublished internal 2.0.0, D295);
+  - `pigeonhole_compaction::HllUnion`;
+  - `pigeonhole_sim::{hll_sketch, combine_aggregate_writes}`.

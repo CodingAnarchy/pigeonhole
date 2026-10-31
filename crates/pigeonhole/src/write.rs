@@ -559,7 +559,8 @@ impl RowMutation<'_> {
     /// Writes the input `value` to the cell of an aggregate family
     /// ([`Family::aggregate`](crate::Family::aggregate)) without reading it: the cell
     /// combines it with the family's aggregation (added to a sum, kept by a min or max if it
-    /// is the smallest or largest). The cell lives at one fixed timestamp (0), as a
+    /// is the smallest or largest, counted as an element by an HLL family). The cell lives
+    /// at one fixed timestamp (0), as a
     /// counter's does. Within one mutation (or batch) the writes of a cell apply in order:
     /// `put_i64(c, 5).aggregate(c, 9)` in a min family sets 5. Other families fail with
     /// `InvalidArgument` at commit.

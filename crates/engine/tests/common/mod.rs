@@ -58,7 +58,7 @@ use pigeonhole_io::{ErrorKind, FileRef, OpenOptions, Vfs};
 use pigeonhole_sim::{
     COUNTER_TS, CommitStreams, Model, ModelAggregation, ModelCell, ModelFamily, ModelOp,
     ModelPurge, Op, Rng, Sim, Step, StreamCommit, StreamRecord, Workload, WorkloadSpec,
-    aggregation_of_name, check_acknowledged_survive, combine_counter_writes,
+    aggregation_of_name, check_acknowledged_survive, combine_aggregate_writes, hll_sketch,
     recovered_from_records,
 };
 
@@ -156,6 +156,8 @@ pub fn families() -> Vec<ModelFamily> {
             f("sum_ttl", 0, 40, false),
             f("min", 2, 0, false),
             f("max_ttl", 0, 40, false),
+            f("hll", 2, 0, false),
+            f("hll_ttl", 0, 40, false),
         ]
     } else {
         vec![
@@ -172,9 +174,15 @@ fn is_aggregate(family: &str) -> bool {
     aggregation_of_name(family).is_some()
 }
 
-/// A family holding only `i64`s (what `put_i64` writes).
+/// A family holding only `i64`s (what `put_i64` writes): not an HLL family, whose cells
+/// are sketches.
 fn is_i64(family: &str) -> bool {
-    family.starts_with("counter") || is_aggregate(family)
+    family.starts_with("counter") || (is_aggregate(family) && !is_hll(family))
+}
+
+/// An HLL family (D294): it takes inputs (`Incr` elements), never `i64` puts.
+fn is_hll(family: &str) -> bool {
+    aggregation_of_name(family) == Some(ModelAggregation::Hll)
 }
 
 /// Where a put or operand without a timestamp lands: the counter's timestamp in a counter
@@ -248,6 +256,7 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
         .max_versions(f.max_versions)
         .ttl_micros(f.ttl_micros)
         .merge_operator(match (f.counter, f.aggregation) {
+            (true, ModelAggregation::Hll) => "pigeonhole.hll",
             (true, ModelAggregation::Min) => "pigeonhole.i64_min",
             (true, ModelAggregation::Max) => "pigeonhole.i64_max",
             (true, ModelAggregation::Sum) => "pigeonhole.i64_add",
@@ -259,6 +268,7 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Sum) => FamilyKind::Counter,
             (true, ModelAggregation::Min) => FamilyKind::Min,
             (true, ModelAggregation::Max) => FamilyKind::Max,
+            (true, ModelAggregation::Hll) => FamilyKind::Hll,
         })
 }
 
@@ -1013,6 +1023,17 @@ fn large_puts(ops: &[ModelOp]) -> usize {
 
 /// A put's value as the recovery oracle compares it: itself, or for a value above
 /// [`LARGE_VALUE`] (logged as a blob pointer when separated at commit time) its length.
+/// The value an `Incr` leaves in the WAL and the store: its delta, or in an HLL family the
+/// sketch of its element and the elements of the cell's later inputs it combined (D294).
+fn incr_value(family: &str, delta: i64, combined: Option<&Vec<i64>>) -> Vec<u8> {
+    if is_hll(family) {
+        let elements = std::iter::once(delta).chain(combined.into_iter().flatten().copied());
+        record_value(&hll_sketch(elements).expect("one element"))
+    } else {
+        delta.to_le_bytes().to_vec()
+    }
+}
+
 fn record_value(value: &[u8]) -> Vec<u8> {
     if value.len() > LARGE_VALUE {
         large_value_key(value.len())
@@ -2170,7 +2191,8 @@ impl World {
     fn mutation_keys(ops: &[ModelOp]) -> BTreeSet<MutationKey> {
         let mut out = BTreeSet::new();
         // Counter writes of one cell combine before they are logged (#295).
-        for op in &combine_counter_writes(ops, |_, f| aggregation_of_name(f)) {
+        let (combined, elements) = combine_aggregate_writes(ops, |_, f| aggregation_of_name(f));
+        for (i, op) in combined.iter().enumerate() {
             let t = op_table(op).to_owned();
             match op {
                 ModelOp::Put {
@@ -2209,7 +2231,7 @@ impl World {
                         row.clone(),
                         qualifier.clone(),
                         ts,
-                        delta.to_le_bytes().to_vec(),
+                        incr_value(family, *delta, elements.get(&i)),
                     ));
                 }
                 ModelOp::DeleteCell {
@@ -3295,7 +3317,8 @@ impl World {
         #[allow(clippy::type_complexity)]
         let mut last: BTreeMap<(String, String, Vec<u8>, Vec<u8>, Timestamp), MutationKey> =
             BTreeMap::new();
-        for op in &combine_counter_writes(ops, |_, f| aggregation_of_name(f)) {
+        let (combined, elements) = combine_aggregate_writes(ops, |_, f| aggregation_of_name(f));
+        for (i, op) in combined.iter().enumerate() {
             let t = op_table(op).to_owned();
             let mut push = |family: String,
                             kind: u8,
@@ -3351,7 +3374,7 @@ impl World {
                     row,
                     qualifier,
                     ts.unwrap_or(default_ts(family, commit_ts)),
-                    delta.to_le_bytes().to_vec(),
+                    incr_value(family, *delta, elements.get(&i)),
                 ),
                 ModelOp::DeleteCell {
                     row,
@@ -4669,13 +4692,24 @@ impl World {
             };
             // A counter family with a TTL refuses its fixed timestamp: a bucket instead.
             let ts = (is_aggregate(&f) && f.contains("ttl")).then_some(now);
-            let op = ModelOp::Put {
-                table: t,
-                row: r,
-                family: f,
-                qualifier: q,
-                ts,
-                value,
+            let op = if is_hll(&f) {
+                ModelOp::Incr {
+                    table: t,
+                    row: r,
+                    family: f,
+                    qualifier: q,
+                    ts,
+                    delta: 77,
+                }
+            } else {
+                ModelOp::Put {
+                    table: t,
+                    row: r,
+                    family: f,
+                    qualifier: q,
+                    ts,
+                    value,
+                }
             };
             self.vfs.advance(1_000);
             if !self.run_alone_now(vec![op], Durability::Buffered, rng)? {
