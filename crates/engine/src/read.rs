@@ -749,6 +749,7 @@ impl ScanCursor {
         &mut self,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Result<bool>> {
+        let _poll = pigeonhole_io::async_poll_scope();
         use std::future::Future;
         use std::sync::atomic::Ordering;
         use std::task::Poll;

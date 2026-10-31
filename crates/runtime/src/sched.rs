@@ -569,6 +569,10 @@ impl IdlePark {
         let cap = if self.real { MAX_PARK_REAL } else { MAX_PARK };
         let want = Duration::from_nanos(deadline.saturating_sub(now)).min(cap);
         let started = Instant::now();
+        debug_assert!(
+            !pigeonhole_io::in_async_poll(),
+            "an idle shard driver parks inside an async poll (a lost wake, #1226)"
+        );
         thread::park_timeout(want);
         let slept = started.elapsed();
         // An early unpark says nothing about the clock.

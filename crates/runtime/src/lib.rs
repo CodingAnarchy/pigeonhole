@@ -772,6 +772,10 @@ impl<H: ShardHandler> ShardCore<H> {
                 if ring {
                     pigeonhole_io::reap_own_io(Some(wait));
                 } else {
+                    debug_assert!(
+                        !pigeonhole_io::in_async_poll(),
+                        "a shard wait parks inside an async poll (a lost wake, #1226)"
+                    );
                     thread::park_timeout(wait);
                 }
             },

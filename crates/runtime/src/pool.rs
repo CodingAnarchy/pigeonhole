@@ -761,7 +761,13 @@ impl PoolDriver {
         let pool = &self.pool;
         self.signal().sleep_unless(
             || pool.queued.load(Ordering::Acquire) > 0 || pool.closed(),
-            || thread::park_timeout(wait),
+            || {
+                debug_assert!(
+                    !pigeonhole_io::in_async_poll(),
+                    "a pool worker parks inside an async poll (a lost wake, #1226)"
+                );
+                thread::park_timeout(wait)
+            },
         );
     }
 
@@ -846,7 +852,13 @@ pub(crate) fn worker_main(mut driver: PoolDriver, vfs: VfsRef) {
             continue;
         }
         match driver.next_deadline() {
-            None => thread::park(),
+            None => {
+                debug_assert!(
+                    !pigeonhole_io::in_async_poll(),
+                    "an idle pool worker parks inside an async poll (a lost wake, #1226)"
+                );
+                thread::park()
+            }
             Some(deadline) => idle_park.park(&*vfs, deadline),
         }
         signal.awake();

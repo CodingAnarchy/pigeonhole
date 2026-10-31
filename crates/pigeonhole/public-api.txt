@@ -13,6 +13,10 @@ pub struct pigeonhole::nonblocking::GetFuture
 impl core::future::future::Future for pigeonhole::nonblocking::GetFuture
 pub type pigeonhole::nonblocking::GetFuture::Output = core::result::Result<core::option::Option<pigeonhole::Cell>, pigeonhole::Error>
 pub fn pigeonhole::nonblocking::GetFuture::poll(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<Self::Output>
+pub struct pigeonhole::nonblocking::KeyStream
+impl futures_core::stream::Stream for pigeonhole::nonblocking::KeyStream
+pub type pigeonhole::nonblocking::KeyStream::Item = core::result::Result<(usize, pigeonhole::Row), pigeonhole::Error>
+pub fn pigeonhole::nonblocking::KeyStream::poll_next(core::pin::Pin<&mut Self>, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<core::option::Option<Self::Item>>
 pub struct pigeonhole::nonblocking::MaintenanceFuture
 impl core::future::future::Future for pigeonhole::nonblocking::MaintenanceFuture
 pub type pigeonhole::nonblocking::MaintenanceFuture::Output = core::result::Result<(), pigeonhole::Error>
@@ -366,8 +370,11 @@ pub pigeonhole::IoRings::attach_failures: u64
 pub pigeonhole::IoRings::inline: u64
 pub pigeonhole::IoRings::rings: usize
 pub struct pigeonhole::KeyRows<'t>
-impl pigeonhole::KeyRows<'_>
-pub fn pigeonhole::KeyRows<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>
+impl<'t> pigeonhole::KeyRows<'t>
+pub fn pigeonhole::KeyRows<'t>::into_owned_stream(self) -> pigeonhole::nonblocking::KeyStream
+pub fn pigeonhole::KeyRows<'t>::next(&mut self) -> pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>
+pub async fn pigeonhole::KeyRows<'t>::next_async(&mut self) -> pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>
+pub fn pigeonhole::KeyRows<'t>::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>>
 pub struct pigeonhole::KeysRead<'t>
 impl<'t> pigeonhole::KeysRead<'t>
 pub fn pigeonhole::KeysRead<'t>::column_limit(self, u32) -> Self

@@ -722,7 +722,13 @@ pub(crate) fn driver_main<H: ShardHandler>(
             core.signal().parked();
         }
         match next_deadline(&cores) {
-            None => thread::park(),
+            None => {
+                debug_assert!(
+                    !pigeonhole_io::in_async_poll(),
+                    "an idle shard driver parks inside an async poll (a lost wake, #1226)"
+                );
+                thread::park()
+            }
             Some(at) => idle_park.park(&*vfs, at),
         }
         record_gap(&mut gaps, idle_from);

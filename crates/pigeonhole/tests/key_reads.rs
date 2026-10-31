@@ -214,3 +214,77 @@ fn key_sets_sort_dedupe_and_check() {
     assert!(KeySet::from_sorted([&b"a"[..], b"b"]).is_ok());
     assert!(KeySet::from_unsorted(Vec::<Vec<u8>>::new()).is_empty());
 }
+
+/// The async multi-get (`next_async`, `poll_next`, `into_owned_stream`) returns what the sync
+/// one does, from a cold block cache (a reopen) across several SSTs, levels and tablets, and
+/// fetches what it reads ahead instead of reading it synchronously.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_multi_get_returns_what_the_sync_one_returns() {
+    use pigeonhole::doc_support::block_on;
+    let (dir, db, t) = open();
+    build(&db, &t);
+    t.split_over_shards((1..4).map(|i| key(i * 400)).collect())
+        .expect("split");
+    db.compact().expect("compact");
+    // A fourth round on top of the compacted levels, flushed, and a memtable on top.
+    for i in (0u32..1_500).step_by(5) {
+        t.mutate(&key(i))
+            .put("b", b"top", &i.to_le_bytes())
+            .commit()
+            .expect("commit");
+    }
+    db.flush().expect("flush");
+    t.mutate(&key(15))
+        .put("a", b"mem", b"m")
+        .commit()
+        .expect("commit");
+    db.close().expect("close");
+    let db = Pigeonhole::open(dir.join("k.phdb"), Options::default().shards(2)).expect("reopen");
+    let t = db.table("t").expect("table").open().expect("open table");
+    let s = db.snapshot().expect("snapshot");
+    let sets = [
+        KeySet::from_unsorted((0..1_500).step_by(3).map(key)),
+        KeySet::from_unsorted((0..1_500).step_by(61).map(key).chain([b"zz".to_vec()])),
+    ];
+    for keys in &sets {
+        let before = db.engine_metrics().async_sync_reads;
+        let mut rows = t.keys(keys).snapshot(&s).versions(0).read().expect("keys");
+        let mut got = Vec::new();
+        block_on(async {
+            while let Some((i, row)) = rows.next_async().await.expect("next") {
+                got.push((i, cells(&row)));
+            }
+        });
+        let sync_reads = db.engine_metrics().async_sync_reads - before;
+        let want = multi(&t, keys, &s, 0, None);
+        assert_eq!(got, want);
+        // Rows of a few cells, each positioned cache-only: a cell past a key's first block is
+        // all that is read synchronously.
+        assert!(
+            sync_reads <= keys.len() as u64 / 50,
+            "{sync_reads} synchronous reads for {} keys",
+            keys.len()
+        );
+        // The owned stream, as the table's handle is dropped.
+        let stream = t
+            .keys(keys)
+            .snapshot(&s)
+            .versions(0)
+            .read()
+            .expect("keys")
+            .into_owned_stream();
+        let mut stream = std::pin::pin!(stream);
+        let mut owned = Vec::new();
+        while let Some(r) = block_on(std::future::poll_fn(|cx| {
+            futures_core::Stream::poll_next(stream.as_mut(), cx)
+        })) {
+            let (i, row) = r.expect("row");
+            owned.push((i, cells(&row.view())));
+        }
+        assert_eq!(owned, want);
+    }
+    // The first set started from a cold cache: its blocks were fetched, not found.
+    assert!(db.engine_metrics().block_cache_misses > 0);
+    db.close().expect("close");
+}
