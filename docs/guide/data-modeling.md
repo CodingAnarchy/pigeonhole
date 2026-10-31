@@ -127,7 +127,7 @@ let page = g.row(b"node:a").family("out").column_limit(100).read()?;
 - Writing both directions in one `WriteBatch` makes them atomic even if the rows live on different shards.
 
 ## Counters
-Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
+Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). A counter is one kind of aggregate family; [Min and max](#min-and-max) and [Distinct counts (HLL)](#distinct-counts-hll) cover the others. `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
 
 ```rust
 # use pigeonhole::*;
