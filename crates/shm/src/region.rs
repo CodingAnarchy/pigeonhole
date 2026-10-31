@@ -786,9 +786,12 @@ impl ShmRegion {
             .fetch_max(to, Ordering::AcqRel);
     }
 
-    /// Publishes `shard`'s pending watermark with release ordering: its current group's
-    /// lower bound; `u64::MAX` when it holds nothing, so an idle shard never holds back
-    /// snapshots.
+    /// Publishes `shard`'s pending watermark with release ordering: the lowest seqno it holds
+    /// unapplied; `u64::MAX` when it holds nothing, so an idle shard never holds back
+    /// snapshots. A new group's hold is stored under the writer's allocator lock, before
+    /// [`ShmRegion::advance_next_seqno`] passes it (FORMAT §11.3, D300): stored any later, or
+    /// as a bound read from [`ShmRegion::next_seqno`], it could land below a seqno readers
+    /// already see, and the visible seqno would go back (#1208).
     pub fn publish_pending(&self, shard: u32, pending: Seqno) {
         self.inner.pending(shard).store(pending, Ordering::Release);
     }
@@ -828,8 +831,8 @@ impl ShmRegion {
     }
 
     /// The mirror of the next seqno the writer will reserve ([`ShmRegion::advance_next_seqno`];
-    /// acquire load). It never runs ahead of the writer's reservations, so step 1 of the
-    /// protocol publishes it as the lower bound before reserving.
+    /// acquire load). It never runs ahead of the writer's reservations. Snapshots load it
+    /// first (FORMAT §11.3).
     pub fn next_seqno(&self) -> Seqno {
         self.inner.h64(header::NEXT_SEQNO).load(Ordering::Acquire)
     }

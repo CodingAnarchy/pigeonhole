@@ -5070,20 +5070,22 @@ impl ShardState {
         self.shared.wake_visible();
     }
 
-    /// Reserves a group's `n` seqnos and `k` default timestamps per FORMAT §11.3 (publish
-    /// the lower bound, reserve, publish the reservation) from the one allocator (D271).
-    /// Returns the first seqno and the first timestamp.
+    /// Reserves a group's `n` seqnos and `k` default timestamps per FORMAT §11.3 from the one
+    /// allocator (D271), which stores the group's hold in this shard's pending watermark under
+    /// its lock (D300). Returns the first seqno and the first timestamp.
     fn reserve_stamps(&mut self, n: u64, k: u64) -> (Seqno, Timestamp) {
         let shm = &self.shared.shm;
         let shard = u32::from(self.id.0);
-        // The mirror never passes the allocator's `S`, so it is a lower bound (§11.3 step 1).
-        shm.publish_pending(shard, self.watermark().min(shm.next_seqno()));
         let now = self.shared.vfs.now_micros();
-        let (first, t0) = self
-            .shared
-            .clock
-            .reserve_group(n, k, now, self.last_stamp, shm);
-        shm.publish_pending(shard, self.watermark().min(first));
+        let (first, t0) = self.shared.clock.reserve_group(
+            n,
+            k,
+            now,
+            self.last_stamp,
+            shm,
+            shard,
+            self.watermark(),
+        );
         trace!(
             "shard {} reserves {first}+{n} at {t0}+{k} (now {now}, last {})",
             self.id.0, self.last_stamp

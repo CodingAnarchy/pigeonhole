@@ -311,6 +311,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D293](phase-3.md#d293) — A scan whose row limit leaves at most 128 rows starts its readahead after 8 forward blocks, not 2 (short scans waited on fetches they had just submitted; the block bound keeps wide, filtered or deleted runs reading ahead) · engine, sst, #712, #974 · refines D222
 - [D294](phase-3.md#d294) — Min, Max and HyperLogLog aggregate families: kinds 2–3 behind `incompat` bit 0, set in both superblock pages before the first such family and never cleared; `Aggregation` (non-exhaustive), `Family::aggregate`, `aggregate`/`aggregate_at` · perf2, #487, #488, ICR 0094 · extends D179
 - [D295](phase-3.md#d295) — Two version lines: the 12 internal crates share one (2.0.0 now; any incompatible change bumps its major), the public crates keep the workspace's 1.x; `scripts/versions.py` keeps both and every pin in step (and refuses a release whose changed line didn't move); internal enums stay exhaustive, so a new variant takes an internal major · owner decision, #487, #1194 · applies D282
+- [D300](phase-3.md#d300) — A group's hold (`pending[shard] = min(watermark, first)`) is stored under the allocator's lock before the `NEXT_SEQNO` mirror passes it, replacing FORMAT §11.3's step-1 bound read from the mirror, which could land below a visible seqno and move snapshots back (#1208) · coordinator decision, shm, engine · amends D271's reservation protocol
 
 ## Open questions
 _None._
