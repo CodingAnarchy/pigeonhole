@@ -37,11 +37,12 @@
 //! config.view_buffer_bytes = 64 << 10;
 //! let shm = ShmRegion::in_memory([7; 16], &config);
 //!
-//! // Writer side: a group of three commits on shard 0.
-//! shm.publish_pending(0, shm.visible_seqno() + 1);
+//! // Writer side: a group of three commits on shard 0. Under the writer's allocator lock
+//! // (here, one thread), the group's hold is stored before the mirror passes it (FORMAT
+//! // §11.3, D300).
 //! let first = shm.next_seqno(); // the writer's own allocator, mirrored here
-//! shm.advance_next_seqno(first + 3);
 //! shm.publish_pending(0, first);
+//! shm.advance_next_seqno(first + 3);
 //! // ... apply the group ...
 //! shm.publish_pending(0, u64::MAX);
 //! assert_eq!(shm.visible_seqno(), first + 2);
