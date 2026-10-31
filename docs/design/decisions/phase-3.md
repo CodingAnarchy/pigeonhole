@@ -168,6 +168,7 @@ RocksDB's sparse-wide `Buffered` put p99 is 17 µs: about 2.9× under `Embedded`
 | ycsb-a `Buffered` paced to 1,000 / 4,000 ops/s: cores | 0.11 / 0.32 | 0.12 / 0.38 | 0.11 / 0.34 |
 | ycsb-a `Buffered` paced to 20,000 ops/s: cores, put p99 | 0.65, 37 µs | 3.49, 24 µs | 0.98, 29–36 µs |
 | cores, sparse-wide full-load rows | 15.2–15.6 | 16.8–17.3 | 16.3–16.6 |
+| ycsb-a, ycsb-f, ycsb-f transactional, transfer, counters (both levels, ×3; `.coord/out-1176c-20261031`) | | | ops/s 0.996–1.020×, p99 level within run spread; cores −0.15 to +0.29 at `Buffered`, +0.3 to +1.2 at the default durability |
 
 At 20K ops/s spread over 16 drivers, each driver's gaps average about 800 µs. So a window past about 256 µs would cost more poll per gap than 200 µs, and the windows stay at 200–256 µs. That's what keeps the CPU near `Embedded`'s.
 
