@@ -3545,6 +3545,6 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **The pigeonhole model:** a two-hop traversal from each multi-get's keys against a BFS over the model's rows, under faults and concurrent changes.
   - The workload's qualifiers (`q…`) never name rows (`row…`), so in PR 1 it checked hop 1's limits, dedupe and ranking.
   - **#1232 (with PR 2):** the default pigeonhole model has a graph family, `adj`, whose qualifiers the workload draws from the row-key space (`Workload::qualifier_in`). Other families draw as before, so targets without `adj` replay unchanged.
-    - The traversal check reads `adj` on even model seqnos and the get's family on odd ones, so counter, TTL and versioned families keep their coverage. On the async front door it goes through `run_async`.
+    - The traversal check reads `adj` on half the model seqnos (bit 4, independent of the limits' bits 0–3) and the get's family on the rest, so counter, TTL and versioned families keep their coverage. On the async front door it goes through `run_async`.
     - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
 
