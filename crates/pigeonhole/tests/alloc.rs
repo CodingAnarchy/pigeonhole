@@ -246,3 +246,52 @@ fn row_read_allocations_per_cell() {
 /// `(allocator calls for a 1-cell row read, per extra cell)`; lower them when a change
 /// improves the path.
 const ROW_READ_BUDGET: (u64, f64) = (10, 0.5);
+
+/// D299: a multi-get lends every row from one reused buffer and reuses each tablet's read
+/// setup, so past its first rows it allocates nothing per row. Allocator calls of 200 rows
+/// after 20, against 2,000 rows after 20, with the blocks cached: the same.
+#[test]
+fn multi_get_allocations_do_not_grow_with_rows() {
+    let (db, t) = open("multi_get");
+    for r in 0..3_000u32 {
+        t.mutate(format!("r{r:05}").as_bytes())
+            .put("f", b"q", &[7u8; 24])
+            .put("g", b"q", &[7u8; 24])
+            .commit()
+            .expect("commit");
+    }
+    db.flush().expect("flush");
+    // A first pass reads every block into the cache: a miss allocates its block.
+    let all =
+        pigeonhole::KeySet::from_unsorted((0..3_000u32).map(|i| format!("r{i:05}").into_bytes()));
+    let mut warm = t.keys(&all).read().expect("keys");
+    while warm.next().expect("next").is_some() {}
+    drop(warm);
+    let mut calls = Vec::new();
+    for n in [200u32, 2_000] {
+        let keys = pigeonhole::KeySet::from_unsorted(
+            (0..n + 20).map(|i| format!("r{:05}", i).into_bytes()),
+        );
+        let mut rows = t.keys(&keys).read().expect("keys");
+        for _ in 0..20 {
+            rows.next().expect("next").expect("a row");
+        }
+        let (c, seen) = allocations(|| {
+            let mut seen = 0;
+            for _ in 0..n {
+                let (_, row) = rows.next().expect("next").expect("a row");
+                seen += row.len();
+            }
+            seen
+        });
+        assert_eq!(seen, n as usize * 2);
+        eprintln!("multi-get: {c} allocator calls for {n} rows past the first 20");
+        calls.push(c);
+    }
+    assert!(
+        calls[1] <= calls[0] + 4,
+        "a multi-get's allocations grow with rows: {calls:?} (200 vs 2,000 rows)"
+    );
+    drop(t);
+    db.close().expect("close");
+}

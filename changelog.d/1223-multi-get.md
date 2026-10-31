@@ -1,0 +1,2 @@
+### Added
+- Frontier multi-get (D299): `Table::keys(&KeySet)` reads many rows in key order under one snapshot, with a row read's selection, and lends each row (with its key's index) from one reused buffer. Each tablet's read is set up once for all of its keys and moves forward from key to key, so a graph traversal's hop or a batch lookup no longer pays a whole row read's setup per key. `KeySet` sorts and deduplicates the keys.

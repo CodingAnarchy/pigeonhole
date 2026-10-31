@@ -691,6 +691,9 @@ struct Run {
     generation: u64,
     /// Injected read errors accepted so far (a `Cell`: counted while a table is borrowed).
     io_errors: Cell<usize>,
+    /// The rows read last (at most 8), multi-got with each new row read (D299). A `RefCell`:
+    /// updated while a table is borrowed.
+    recent: std::cell::RefCell<Vec<Vec<u8>>>,
 }
 
 /// Every delete generated so far (lost ones too: dropping more is harmless), so `prepare`
@@ -728,6 +731,33 @@ fn ref_cells(row: &pigeonhole::RowRef<'_>) -> Vec<ModelCell> {
 }
 
 /// An owned public row as model cells (through `Row::entry`).
+/// Every version of the rows of `keys` a multi-get returns (D299), with their keys.
+fn multi_get_rows(
+    t: &pigeonhole::Table,
+    keys: &pigeonhole::KeySet,
+    snap: Option<&pigeonhole::Snapshot>,
+) -> pigeonhole::Result<Vec<(Vec<u8>, Vec<ModelCell>)>> {
+    let mut r = t.keys(keys).versions(0);
+    if let Some(s) = snap {
+        r = r.snapshot(s);
+    }
+    let mut rows = r.read()?;
+    let mut out = Vec::new();
+    while let Some((i, row)) = rows.next()? {
+        let cells = row
+            .iter()
+            .map(|e| ModelCell {
+                family: e.family.to_owned(),
+                qualifier: e.qualifier.to_vec(),
+                ts: e.cell.timestamp(),
+                value: e.cell.value().to_vec(),
+            })
+            .collect();
+        out.push((keys.get(i).to_vec(), cells));
+    }
+    Ok(out)
+}
+
 fn owned_cells(row: &pigeonhole::Row) -> Vec<ModelCell> {
     (0..row.len())
         .map(|i| {
@@ -976,6 +1006,7 @@ impl Run {
             op: 0,
             trace: Vec::new(),
             stats: Stats::default(),
+            recent: std::cell::RefCell::new(Vec::new()),
             deletes: Deletes::default(),
             generation: 0,
             io_errors: Cell::new(0),
@@ -2194,6 +2225,55 @@ impl Run {
                         return Err(format!(
                             "row read {} (model seqno {ms}): store {g:?} vs model {w:?}",
                             text(&row)
+                        ));
+                    }
+                }
+                // A multi-get (D299) of this row and the rows read last in the same table,
+                // under the same snapshot: every row as the model has it, absent ones
+                // skipped. The keys come from the run's own reads, not the RNG.
+                let keys = {
+                    let mut recent = self.recent.borrow_mut();
+                    if !recent.contains(&row) {
+                        recent.push(row.clone());
+                        if recent.len() > 8 {
+                            recent.remove(0);
+                        }
+                    }
+                    pigeonhole::KeySet::from_unsorted(
+                        recent.iter().filter(|r| table_index(r) == ti),
+                    )
+                };
+                let got = multi_get_rows(t, &keys, snap.as_ref().map(|(s, _)| s));
+                let mut want = Ok(Vec::new());
+                for k in keys.iter() {
+                    match self.model.try_read_row(TABLES[ti], k, &[], 0, ms, now) {
+                        Ok(c) if c.is_empty() => {}
+                        Ok(c) => {
+                            if let Ok(w) = &mut want {
+                                w.push((k.to_vec(), c));
+                            }
+                        }
+                        Err(e) => {
+                            want = Err(e);
+                            break;
+                        }
+                    }
+                }
+                match (got, want) {
+                    (Ok(g), Ok(w)) if g == w => {}
+                    (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
+                        if e.code() == ErrorCode::MergeFailed => {}
+                    (Err(e), _) if self.armed && self.fired() => {
+                        return self.recover_fired(&e);
+                    }
+                    (Err(e), _) if self.failed_over() => {
+                        return self.recover_in_place(&format!("read: {e}"), None);
+                    }
+                    (Err(e), _) if self.injected(&e) => {}
+                    (g, w) => {
+                        return Err(format!(
+                            "multi-get of {} keys (model seqno {ms}): store {g:?} vs model {w:?}",
+                            keys.len()
                         ));
                     }
                 }

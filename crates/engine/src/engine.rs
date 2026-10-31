@@ -2414,6 +2414,31 @@ impl Engine {
         )
     }
 
+    /// A multi-get (D299): the rows of `keys` under `snapshot`, in key order, with `read`'s
+    /// selection applied to each. Each tablet's reads are set up once for all of its keys,
+    /// and a row's sources move forward from the previous key's. Keys whose row has no cell
+    /// the selection keeps are skipped ([`crate::KeyCursor::next_key`]). The row cache is not
+    /// consulted.
+    pub fn multi_get(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        keys: crate::KeySet,
+        read: ReadSpec,
+    ) -> Result<crate::KeyCursor> {
+        snapshot.check_process()?;
+        let families = families_in_order(&snapshot.view, table, &read.families)?;
+        let now = self.inner.shared.vfs.now_micros();
+        crate::KeyCursor::new(
+            snapshot.clone(),
+            table,
+            families.into_vec(),
+            read,
+            now,
+            keys,
+        )
+    }
+
     /// [`Engine::scan`] for an async scan: its rows are polled with
     /// [`ScanCursor::poll_next_row`], which never blocks on a block it could predict (D196).
     pub fn scan_async(

@@ -3369,6 +3369,23 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **With checkpoints off:** a read refolds every pending input with a full decode and encode of the sketch, giving p50 10.4 ms and p99 26 ms.
   - **Consequence for PR 5:** its 4 KiB checkpoint cap must not come without §4.2's compaction fold, or a fold of many `F64` inputs into one decoded sketch. A larger sketch would otherwise lose its checkpoints and read in milliseconds.
 
+<a id="d299"></a>
+## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)
+**Why.** A BFS hop, a batch lookup or an HNSW neighbourhood reads many rows known up front, and today each row read sets up its read from scratch: routing, gathering the family's sources, a new iterator per SST, a fresh row buffer. In #489's baseline that setup is about half the cost of a dense frontier (row reads 2.18 µs/row against one scan's 0.97 over the same rows, AX102) and seven allocations a row.
+
+**Decided.**
+- **`KeySet`** (engine, re-exported by `pigeonhole`): sorted, distinct row keys in one flat buffer (`from_unsorted` sorts and dedupes; `from_sorted` checks). D296 PR 2's `Keys` input imports it, with `key_groups` (runs of keys routing to one tablet).
+- **`KeyCursor`** (engine, `Engine::multi_get`), a sibling of `ScanCursor` and `read_row_into` (D296's R3: neither changes). Per tablet group and family it keeps its memtable sources and one SST iterator per SST it has read from, for every key of the group. Per key:
+  - an SST takes part only if the row is within its key range and its row filter may hold it, as for a point row read;
+  - a source that takes part moves forward from where the previous key left it (`seek_forward`; a full seek if it is new or ran past its end); SST iterators read without `one_row`, so they can move on;
+  - the merge is rebuilt over just those sources (`MergingCursor::rebuild_positioned`, `CellResolver::seek_with`), and the family's resolver reads the row as a row read does.
+- **Borrowed cell steps for consumers** (cli692's M2): `next_key`, `next_cell`/`next_cell_into`, `push_next_cell`, `current_data`, and `skip_rest_of_key` (D296's `NextRow`). `KeyRows` fills one reused row buffer with them; D296's visitor runs on the borrowed cells.
+- **`Table::keys(&KeySet)`** (and on `ReadTable`) returns `KeysRead`, with a row read's selection, `versions` and a per-row `column_limit`; `read()` returns `KeyRows`, which lends `(index, RowRef)` for each key with a cell the selection keeps, in key order, under one snapshot. The row cache is not consulted.
+- **Not in 1.1** (cli692's M3): `parallel(n)` on the lending `KeyRows`. Parallel key-set reads go through D296's bounded `reduce`.
+- **PR 2:** the async form, with an 8-key lookahead that fetches the blocks of the next keys from an index-only probe (M4).
+
+**Measured (PR 1, Mac, warm, 300K-node graph, row cache off for both):** a dense frontier (10,000 contiguous rows) 0.86 µs/row against 1.48 for row reads, with no allocation per row (7 for row reads); a sparse BFS hop 1.71–1.77 µs/row against 1.93–2.16. The AX102 figures come with PR 2's box run.
+
 <a id="d300"></a>
 ## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)
 **Why.** On macOS CI a reader process saw the visible seqno go from 21169 to 21162 (`crates/shm/tests/multiprocess.rs`, seed 1592590338). FORMAT §11.3's step 1, `pending[shard].store(next_seqno.load())`, was a load and a separate store. Another shard could reserve a seqno, raise the mirror, apply it and release its hold in between, so the visible seqno passed it. The stale bound then landed below it, and the visible seqno went back until the first shard published its reservation. It's an interleaving, not a memory-ordering effect: it reproduces in one thread, through the public API. Nothing unapplied ever became visible, but snapshots weren't monotonic: a later snapshot, in-process or in a reader process, could miss a commit an earlier one included, including a writer's own acknowledged commit.

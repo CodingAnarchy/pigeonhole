@@ -1,4 +1,5 @@
 pub mod pigeonhole
+pub use pigeonhole::KeySet
 pub mod pigeonhole::nonblocking
 pub struct pigeonhole::nonblocking::CheckFuture
 impl core::future::future::Future for pigeonhole::nonblocking::CheckFuture
@@ -364,6 +365,23 @@ pub fn pigeonhole::HistogramParams::new(impl core::convert::Into<alloc::vec::Vec
 pub pigeonhole::IoRings::attach_failures: u64
 pub pigeonhole::IoRings::inline: u64
 pub pigeonhole::IoRings::rings: usize
+pub struct pigeonhole::KeyRows<'t>
+impl pigeonhole::KeyRows<'_>
+pub fn pigeonhole::KeyRows<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>
+pub struct pigeonhole::KeysRead<'t>
+impl<'t> pigeonhole::KeysRead<'t>
+pub fn pigeonhole::KeysRead<'t>::column_limit(self, u32) -> Self
+pub fn pigeonhole::KeysRead<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
+pub fn pigeonhole::KeysRead<'t>::family(self, &str) -> Self
+pub fn pigeonhole::KeysRead<'t>::latest(self) -> Self
+pub fn pigeonhole::KeysRead<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> Self
+pub fn pigeonhole::KeysRead<'t>::qualifier_prefix(self, &[u8]) -> Self
+pub fn pigeonhole::KeysRead<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
+pub fn pigeonhole::KeysRead<'t>::read(self) -> pigeonhole::Result<pigeonhole::KeyRows<'t>>
+pub fn pigeonhole::KeysRead<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
+pub fn pigeonhole::KeysRead<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
+pub fn pigeonhole::KeysRead<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
+pub fn pigeonhole::KeysRead<'t>::versions(self, u32) -> Self
 #[non_exhaustive] pub struct pigeonhole::LevelInfo
 pub pigeonhole::LevelInfo::bytes: u64
 pub pigeonhole::LevelInfo::entries: u64
@@ -470,6 +488,7 @@ pub fn pigeonhole::ReadTable::get(&self, &[u8], &str, &[u8]) -> pigeonhole::Resu
 pub fn pigeonhole::ReadTable::get_async(&self, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
 pub fn pigeonhole::ReadTable::get_at(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
 pub fn pigeonhole::ReadTable::get_at_async(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
+pub fn pigeonhole::ReadTable::keys<'t>(&'t self, &pigeonhole_engine::read::keys::KeySet) -> pigeonhole::KeysRead<'t>
 pub fn pigeonhole::ReadTable::name(&self) -> &str
 pub fn pigeonhole::ReadTable::row<'t>(&'t self, &[u8]) -> pigeonhole::RowRead<'t>
 pub fn pigeonhole::ReadTable::scan<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(&self, impl core::ops::range::RangeBounds<&'k K>) -> pigeonhole::Scan<'_>
@@ -624,6 +643,7 @@ pub fn pigeonhole::Table::get(&self, &[u8], &str, &[u8]) -> pigeonhole::Result<c
 pub fn pigeonhole::Table::get_async(&self, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
 pub fn pigeonhole::Table::get_at(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
 pub fn pigeonhole::Table::get_at_async(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
+pub fn pigeonhole::Table::keys<'t>(&'t self, &pigeonhole_engine::read::keys::KeySet) -> pigeonhole::KeysRead<'t>
 pub fn pigeonhole::Table::mutate<'t>(&'t self, &[u8]) -> pigeonhole::RowMutation<'t>
 pub fn pigeonhole::Table::name(&self) -> &str
 pub fn pigeonhole::Table::row<'t>(&'t self, &[u8]) -> pigeonhole::RowRead<'t>
