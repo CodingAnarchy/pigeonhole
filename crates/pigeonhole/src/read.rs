@@ -865,6 +865,54 @@ impl<'t> Traverse<'t> {
     /// Runs the traversal. The edge family must be selected, and only it
     /// (`InvalidArgument` otherwise); empty seeds give no hops.
     pub fn run(mut self) -> Result<Traversal> {
+        let (snapshot, seeds, spec) = self.start()?;
+        let t = self
+            .core
+            .with(|e| e.traverse(&snapshot, self.core.info.id, seeds, &spec))?;
+        Ok(Traversal::from_engine(t, self.parents))
+    }
+
+    /// [`Traverse::run`] as a future that never blocks on the device: each hop's keys are
+    /// positioned from the block cache, with the blocks they and the next keys need fetched
+    /// asynchronously, and a poll yields after 4,096 edges, so a hub never holds the
+    /// executor's thread for long (cap hubs with [`per_node_limit`](Traverse::per_node_limit)
+    /// all the same: edges past a key's first block are read synchronously where the cache
+    /// misses). Hops run on the polling task, never fanned out; the result equals `run`'s.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, KeySet, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let g = db.table("g")?.family("out", Family::default()).create_if_missing()?;
+    /// g.mutate(b"a").put("out", b"b", b"").commit()?;
+    /// g.mutate(b"b").put("out", b"c", b"").commit()?;
+    ///
+    /// let seeds = KeySet::from_unsorted([b"a"]);
+    /// let t = pigeonhole::doc_support::block_on(g.traverse(&seeds).family("out").hops(2).run_async())?;
+    /// assert_eq!(t.hops().len(), 2);
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn run_async(mut self) -> Result<Traversal> {
+        let (snapshot, seeds, spec) = self.start()?;
+        let pending = self
+            .core
+            .with(|e| e.traverse_async(&snapshot, self.core.info.id, seeds, spec))?;
+        Ok(Traversal::from_engine(pending.await?, self.parents))
+    }
+
+    /// The snapshot, the seeds and the engine's spec.
+    fn start(
+        &mut self,
+    ) -> Result<(
+        pigeonhole_engine::Snapshot,
+        Arc<KeySet>,
+        pigeonhole_engine::TraverseSpec,
+    )> {
         if self.sel.ends.len() != 1 {
             return Err(crate::Error::new(
                 crate::ErrorCode::InvalidArgument,
@@ -880,11 +928,13 @@ impl<'t> Traverse<'t> {
         spec.max_nodes = self.max_nodes;
         spec.read = self.sel.spec.clone();
         spec.parallelism = self.parallelism;
-        let t = self
-            .core
-            .with(|e| e.traverse(&snapshot, self.core.info.id, Arc::clone(&seeds), &spec))?;
-        let parents = self.parents;
-        Ok(Traversal {
+        Ok((snapshot, seeds, spec))
+    }
+}
+
+impl Traversal {
+    fn from_engine(t: pigeonhole_engine::Traversal, parents: bool) -> Self {
+        Traversal {
             hops: t
                 .hops
                 .into_iter()
@@ -899,7 +949,7 @@ impl<'t> Traverse<'t> {
                 hops_cut: t.stats.hops_cut,
                 cut_by_max_nodes: t.stats.cut_by_max_nodes,
             },
-        })
+        }
     }
 }
 

@@ -2481,6 +2481,28 @@ impl Engine {
         )
     }
 
+    /// [`Engine::traverse`] as a future that never blocks on a block it can fetch (D304 PR
+    /// 2): each hop is read on the polling task through the multi-get cursor's async path,
+    /// a poll yields after [`TRAVERSE_POLL_CELLS`](crate::TRAVERSE_POLL_CELLS) cells, and the
+    /// result equals `traverse`'s. `spec.parallelism` is ignored.
+    pub fn traverse_async(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        seeds: Arc<crate::KeySet>,
+        spec: crate::TraverseSpec,
+    ) -> Result<crate::PendingTraversal> {
+        snapshot.check_process()?;
+        Ok(read::traverse::PendingTraversal::new(
+            snapshot.clone(),
+            table,
+            seeds,
+            spec,
+            self.inner.shared.vfs.now_micros(),
+            Arc::clone(&self.inner.shared),
+        ))
+    }
+
     /// [`Engine::scan`] for an async scan: its rows are polled with
     /// [`ScanCursor::poll_next_row`], which never blocks on a block it could predict (D196).
     pub fn scan_async(

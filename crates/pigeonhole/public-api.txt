@@ -761,6 +761,7 @@ pub fn pigeonhole::Traverse<'t>::qualifier_bounds(self, core::ops::range::Bound<
 pub fn pigeonhole::Traverse<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::Traverse<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
 pub fn pigeonhole::Traverse<'t>::run(self) -> pigeonhole::Result<pigeonhole::Traversal>
+pub async fn pigeonhole::Traverse<'t>::run_async(self) -> pigeonhole::Result<pigeonhole::Traversal>
 pub fn pigeonhole::Traverse<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::Traverse<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
 pub fn pigeonhole::Traverse<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
