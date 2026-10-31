@@ -3320,6 +3320,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **New `scalar_counters` targets** (engine and `pigeonhole`) rerun the model checks with all five kinds (`bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`) beside `f`, `counter` and `sum`. The `counters` targets keep main's eight families.
   - **Why not `counters`:** a one-shard run with tablet changes off must stay at main's 32 slots (owner, 2026-10-31; a larger harness budget would hide #1212). With 13 families on 4 tables, seed 6 gave up with `Busy`, even with standard families in their place. At 10 families (40 slots), 7 of 300 engine `counters` seeds gave up (run 41166497479), against `max_slots`' promised 64.
   - **Later:** the families join `counters` once #1212 is fixed (#1214). Until then, a change to aggregate families also sweeps engine `scalar_counters` (CONTRIBUTING.md).
+  - **Done (#1214, after D302):** `counters` (engine and `pigeonhole`) holds every aggregate kind, eighteen families and 72 slots on a shard with tablet changes off, and the `scalar_counters` targets are gone. 100 seeds of each passed locally before the sweeps.
   - **Mutation:** making XOR compute OR fails 10 of the 33 engine `scalar_counters` tests.
 - **API and phdb:** a `pigeonhole` API test; a phdb shell test.
 - **Corpus:** the `aggregates` entry gains one family per kind (signed zeros, infinities, a put, a delete), still refused by 1.0.0.

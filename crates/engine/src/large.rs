@@ -304,6 +304,11 @@ pub(crate) fn separate(
                 }
             };
             let ptr = sink.append(m.value)?;
+            #[cfg(feature = "test-hooks")]
+            shared
+                .hooks
+                .commit_separations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             out.push(
                 m.table,
                 m.family,

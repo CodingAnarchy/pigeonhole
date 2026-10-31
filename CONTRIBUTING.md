@@ -67,8 +67,7 @@ Several agents often build and test on one machine, so local runs stay small:
 - **The standard sweeps for engine, WAL and I/O changes** (300 seeds, 6 chunks each, each with `-f tools=gdb`), all five on the PR's head:
   - engine `model_check` with `PIGEONHOLE_DEFERRED_IO=1`;
   - engine `model_check` plain;
-  - engine `counters` plain (`model_check` with aggregate families: `sum`, `sum_ttl`, `min`, `max_ttl`, `hll`, `hll_ttl`);
-    a change to aggregate families also sweeps engine `scalar_counters` (D298's bitwise and `f64` families), which folds back into `counters` with #1214;
+  - engine `counters` plain (`model_check` with every aggregate kind: `sum`, `sum_ttl`, `min`, `max_ttl`, `hll`, `hll_ttl`, `bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`, `fsum`, `fmv_ttl`, `fhist`, `fq_ttl` and `bloom`);
   - `pigeonhole` `model`;
   - engine `tablets` with `PIGEONHOLE_DEFERRED_IO=1`.
 
@@ -94,7 +93,7 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS` | engine `model_check`, `counters`, `scalar_counters`, `slots`, `tablets`, `deferred_waits`, `tail_index`, and in the engine's `it` binary `blobs`, `inflight_window`, `reader_crash_matrix` and `reader_pins` (a module inside `it` is swept with `-f test=it -f filter=<file>::`); pigeonhole `model`, `counters`, `scalar_counters` | First seed and number of seeds. The Sweep workflow sets both per chunk. The `counters` targets rerun `model_check` / `model` with counter families (D179). |
+| `PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS` | engine `model_check`, `counters`, `slots`, `tablets`, `deferred_waits`, `tail_index`, and in the engine's `it` binary `blobs`, `inflight_window`, `reader_crash_matrix` and `reader_pins` (a module inside `it` is swept with `-f test=it -f filter=<file>::`); pigeonhole `model`, `counters` | First seed and number of seeds. The Sweep workflow sets both per chunk. The `counters` targets rerun `model_check` / `model` with counter families (D179). |
 | `PIGEONHOLE_SEED` alone | shm `protocol` and `multiprocess`, memtable and pager `tests/common` | The one seed to run. |
 | `PIGEONHOLE_TABLET_CHANGES` | engine harness (`tests/common`), pigeonhole `model` | Engine: `1` adds the fast balancer so tablets change during a run, `0` turns tablet changes off. Pigeonhole: `0` turns them off. |
 | `PIGEONHOLE_DEFERRED_IO` | engine harness, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |
