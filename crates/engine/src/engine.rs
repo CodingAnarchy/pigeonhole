@@ -4483,12 +4483,23 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
-        match self.route_and_send(batch, durability, None, None, NoAdmission)? {
+        let vfs = &self.shared.vfs;
+        let t0 = vfs.monotonic_nanos();
+        pigeonhole_runtime::scratch_take_woke();
+        let routed = self.route_and_send(batch, durability, None, None, NoAdmission)?;
+        let sent = vfs.monotonic_nanos();
+        let asleep = pigeonhole_runtime::scratch_take_woke();
+        let r = match routed {
             Routed::Sent {
                 mut waiter, spins, ..
             } => crate::write::wait_blocking(&self.shared, &mut waiter, spins),
             Routed::Held(p) => self.send(p)?.wait(),
-        }
+        };
+        let ret = vfs.monotonic_nanos();
+        let s = crate::scratch_stages::SETTLED.with(|c| c.replace([0; 7]));
+        let c = crate::scratch_stages::CLIENT.with(|c| c.replace([0; 2]));
+        crate::scratch_stages::record(asleep, t0, sent, s, c, ret);
+        r
     }
 
     /// The pending commit for a request [`route_and_send`](Self::route_and_send) sent.

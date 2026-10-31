@@ -41,6 +41,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { workspace = true }
 rocksdb = { version = "0.25", default-features = false, optional = true }
 rusqlite = { version = "0.40", features = ["bundled"], optional = true }
+pigeonhole-engine = { workspace = true }
 
 [lints]
 workspace = true
@@ -48,7 +49,6 @@ workspace = true
 [dev-dependencies]
 proptest = { workspace = true }
 # The `commitpath` example drives the engine's shards directly.
-pigeonhole-engine = { workspace = true }
 # The `coldscan` example counts what the scan readahead did.
 pigeonhole-sst = { workspace = true }
 # The `arrowexport` example measures the Arrow export (#691).

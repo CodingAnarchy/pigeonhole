@@ -22,6 +22,8 @@
 #![forbid(unsafe_code)]
 
 mod admission;
+mod scratch_stages;
+pub use scratch_stages::{scratch_stages_record, scratch_stages_report};
 mod catalog;
 mod check;
 mod clock;

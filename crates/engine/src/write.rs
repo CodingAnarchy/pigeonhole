@@ -83,11 +83,16 @@ fn recycle(batch: Option<BatchBuilder>) {
 pub(crate) struct Settled {
     pub(crate) info: CommitInfo,
     pub(crate) batch: Option<BatchBuilder>,
+    pub(crate) scratch: [u64; 7],
 }
 
 impl From<CommitInfo> for Settled {
     fn from(info: CommitInfo) -> Self {
-        Self { info, batch: None }
+        Self {
+            info,
+            batch: None,
+            scratch: [0; 7],
+        }
     }
 }
 
@@ -576,15 +581,29 @@ fn wait_body(
     let window = if spins { shared.commit_spin_nanos } else { 0 };
     if window == 0 {
         // No spin: exactly the parking wait.
-        let Settled { info, batch } = wait_reply(shared, waiter)?;
+        let Settled {
+            info,
+            batch,
+            scratch,
+        } = wait_reply(shared, waiter)?;
+        let woken = shared.vfs.monotonic_nanos();
         recycle(batch);
         wait_visible(shared, info.seqno)?;
+        crate::scratch_stages::SETTLED.with(|c| c.set(scratch));
+        crate::scratch_stages::CLIENT.with(|c| c.set([woken, shared.vfs.monotonic_nanos()]));
         return Ok(info);
     }
     let mut spin = SpinWait::new(window);
-    let Settled { info, batch } = wait_reply_spinning(shared, waiter, &mut spin)?;
+    let Settled {
+        info,
+        batch,
+        scratch,
+    } = wait_reply_spinning(shared, waiter, &mut spin)?;
+    let woken = shared.vfs.monotonic_nanos();
     recycle(batch);
     wait_visible_spinning(shared, info.seqno, &mut spin)?;
+    crate::scratch_stages::SETTLED.with(|c| c.set(scratch));
+    crate::scratch_stages::CLIENT.with(|c| c.set([woken, shared.vfs.monotonic_nanos()]));
     Ok(info)
 }
 
@@ -897,7 +916,7 @@ impl Future for PendingCommit {
                 Poll::Pending => return pending_or_forked(&this.sub.shared),
                 Poll::Ready(None) => return Poll::Ready(Err(dropped_reply_now(&this.sub.shared))),
                 Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(e)),
-                Poll::Ready(Some(Ok(Settled { info, batch }))) => {
+                Poll::Ready(Some(Ok(Settled { info, batch, .. }))) => {
                     recycle(batch);
                     this.resolved = Some(info);
                     info

@@ -104,6 +104,7 @@ impl Signal {
     pub(crate) fn notify(&self) {
         fence(Ordering::SeqCst);
         if self.sleeping.load(Ordering::Relaxed) && self.sleeping.swap(false, Ordering::AcqRel) {
+            crate::SCRATCH_WOKE.with(|w| w.set(true));
             self.wakes.fetch_add(1, Ordering::Relaxed);
             self.wake_target();
         }

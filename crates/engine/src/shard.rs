@@ -1280,10 +1280,22 @@ impl Reply {
     /// freed here, it would be freed on another thread than the one that allocated it.
     fn resolve_returning(self, outcome: Result<CommitInfo>, batch: Option<BatchBuilder>) {
         match self {
-            Reply::Commit(n) => n.notify(outcome.map(|info| Settled { info, batch })),
-            Reply::Returning(r) => r
-                .notifier
-                .notify(outcome.map(|info| Settled { info, batch })),
+            Reply::Commit(n) => {
+                let scratch = crate::scratch_stages::SHARD.with(|c| c.replace([0; 7]));
+                n.notify(outcome.map(|info| Settled {
+                    info,
+                    batch,
+                    scratch,
+                }))
+            }
+            Reply::Returning(r) => {
+                let scratch = crate::scratch_stages::SHARD.with(|c| c.replace([0; 7]));
+                r.notifier.notify(outcome.map(|info| Settled {
+                    info,
+                    batch,
+                    scratch,
+                }))
+            }
             Reply::Check(n) => n.notify(outcome.map(|i| (true, Some(i)))),
             Reply::None => {}
         }
@@ -1752,6 +1764,8 @@ struct Member {
     /// The token of admission's decode of its batch (`Dedup::decode`), which its apply
     /// reuses when nothing was decoded since (#1206); 0: none.
     decoded: u32,
+    /// SCRATCH #1206: when the shard took it from its inbox.
+    scratch_pick: u64,
     /// A single waiting for undecided shares: its id in `ShardState::waiting_singles` (0:
     /// it is not waiting). It waits only for the shares undecided on its rows when it
     /// started; shares that come after wait for it (D267).
@@ -1818,6 +1832,7 @@ impl Member {
             map_version: req.map_version,
             room_since: 0,
             decoded: 0,
+            scratch_pick: 0,
             share_wait: 0,
             rank: 0,
             voted: false,
@@ -3285,6 +3300,8 @@ pub(crate) struct ShardState {
     /// This shard's room generation: a PREPARE refused for room carries it, and each
     /// room `Wake` this shard sends carries the next (D245).
     room_generation: u64,
+    /// SCRATCH #1206: the current group's start, admitted, written and applied stamps.
+    scratch_g: [u64; 4],
     /// Per shard, the latest room generation its room `Wake` reported: a room retry waits
     /// for a later one than its refusal's.
     room_freed: Vec<u64>,
@@ -3671,6 +3688,7 @@ impl ShardState {
             room_refused: Vec::new(),
             room_refused_free: 0,
             room_generation: 0,
+            scratch_g: [0; 4],
             room_freed: vec![0; shards],
             room_gone: vec![0; shards],
             overlap_refused: Vec::new(),
@@ -7006,6 +7024,7 @@ impl ShardState {
         self.end_backoff_on_event(ctx);
         let spare = self.member_buf();
         let mut members = std::mem::replace(&mut self.pending, spare);
+        self.scratch_g[0] = self.shared.vfs.monotonic_nanos();
 
         // Admission, in order. A conditional member whose predicate cell or read rows an
         // earlier member of this group already wrote runs in the next group instead, so
@@ -7328,6 +7347,7 @@ impl ShardState {
             return;
         }
 
+        self.scratch_g[1] = self.shared.vfs.monotonic_nanos();
         // Seqnos (one reservation per group) and timestamps.
         let singles = admitted
             .iter()
@@ -7574,6 +7594,7 @@ impl ShardState {
             }
         }
 
+        self.scratch_g[2] = self.shared.vfs.monotonic_nanos();
         // Apply. Every member is logged (or failed): a mid-batch failure here is a bug or an
         // arena miscount; the shard poisons itself so nothing half-applied is extended.
         for m in &mut group.members {
@@ -7676,6 +7697,7 @@ impl ShardState {
                 }
             }
         }
+        self.scratch_g[3] = self.shared.vfs.monotonic_nanos();
         let published = if self.view_dirty && fault!(self, NextGroupPublish) {
             Err(Error::Corruption(
                 "injected view publish failure (Fault::NextGroupPublish)".into(),
@@ -8798,6 +8820,9 @@ impl ShardState {
                     Bytes::Own(b) => Some(b),
                     _ => None,
                 };
+                let g = self.scratch_g;
+                crate::scratch_stages::SHARD
+                    .with(|c| c.set([m.submitted_at, m.scratch_pick, g[0], g[1], g[2], g[3], now]));
                 m.reply.resolve_returning(result, batch);
             }
             MemberKind::Prepare { coordinator } => {
@@ -9139,6 +9164,7 @@ impl ShardState {
             retry: None,
             room_since: 0,
             decoded: 0,
+            scratch_pick: 0,
             share_wait: 0,
             rank: 0,
             voted: false,
@@ -9301,6 +9327,7 @@ impl ShardState {
             retry: None,
             room_since: 0,
             decoded: 0,
+            scratch_pick: 0,
             share_wait: 0,
             rank: 0,
             voted: false,
@@ -11436,7 +11463,9 @@ impl ShardState {
                 if self.closing {
                     req.reply.resolve(Err(Error::Closed));
                 } else {
-                    self.pending.push(Member::single(req));
+                    let mut m = Member::single(req);
+                    m.scratch_pick = self.shared.vfs.monotonic_nanos();
+                    self.pending.push(m);
                 }
             }
             ShardMsg::Coordinate(req) => self.start_coordination(*req, ctx),

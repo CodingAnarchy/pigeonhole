@@ -1544,3 +1544,14 @@ impl<H: ShardHandler> ShardDriver<H> {
         core.handler
     }
 }
+
+thread_local! {
+    /// SCRATCH (#1206): this thread's last notify found its consumer's `sleeping` set.
+    pub(crate) static SCRATCH_WOKE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// SCRATCH (#1206): whether a notify by this thread found its consumer asleep since the
+/// last call; clears it.
+pub fn scratch_take_woke() -> bool {
+    SCRATCH_WOKE.with(|w| w.replace(false))
+}
