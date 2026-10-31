@@ -245,7 +245,7 @@ impl Workload {
         // An HLL family's puts are sketches (of a few elements), its inputs elements.
         let hll = crate::aggregation_of_name(&family) == Some(crate::ModelAggregation::Hll);
         if counter && self.rng.chance(if hll { 850_000 } else { 800_000 }) {
-            let delta = self.rng.below(2001) as i64 - 1000;
+            let delta = self.scalar(&family);
             let ts = if sum { self.sum_ts(&family) } else { None };
             return ModelOp::Incr {
                 table,
@@ -264,7 +264,7 @@ impl Workload {
         let value = if hll {
             self.sketch()
         } else if counter {
-            (self.rng.below(2001) as i64 - 1000).to_le_bytes().to_vec()
+            self.scalar(&family).to_le_bytes().to_vec()
         } else {
             self.value()
         };
@@ -275,6 +275,30 @@ impl Workload {
             qualifier,
             ts,
             value,
+        }
+    }
+
+    /// An operand or put value for a counter or scalar aggregate family: a small `i64`; in a
+    /// bitwise family (D298) a word with one bit set (OR), cleared (AND) or a few random bits
+    /// (XOR), so the result stays interesting; in an `f64` family the bits of a finite
+    /// value, a signed zero or an infinity, never NaN.
+    fn scalar(&mut self, family: &str) -> i64 {
+        use crate::ModelAggregation as A;
+        match crate::aggregation_of_name(family) {
+            Some(A::BitOr) => (1u64 << self.rng.below(64)) as i64,
+            Some(A::BitAnd) => !(1u64 << self.rng.below(64)) as i64,
+            Some(A::BitXor) => (self.rng.next_u64() & self.rng.next_u64()) as i64,
+            Some(A::MinF64 | A::MaxF64) => {
+                let x = match self.rng.below(10) {
+                    0 => 0.0,
+                    1 => -0.0,
+                    2 => f64::INFINITY,
+                    3 => f64::NEG_INFINITY,
+                    _ => (self.rng.below(2001) as f64 - 1000.0) / 8.0,
+                };
+                x.to_bits() as i64
+            }
+            _ => self.rng.below(2001) as i64 - 1000,
         }
     }
 

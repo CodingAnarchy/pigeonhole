@@ -18,7 +18,7 @@ use pigeonhole_format::{Cursor, FamilyId, Seqno, TableId, TabletId, Timestamp};
 use pigeonhole_memtable::ArenaSlice;
 use pigeonhole_sst::QualifierFilter;
 
-use crate::catalog::{FamilyMeta, HLL, I64_ADD, I64_MAX, I64_MIN, MergeKind};
+use crate::catalog::{FamilyMeta, MergeKind};
 use crate::snapshot::{Snapshot, SstSet, TabletEntry, View};
 use crate::source::{ColumnKey, Pinned, Resolver, Source, row_prefix};
 use crate::{Error, Result};
@@ -289,7 +289,7 @@ impl ResolverBlobs {
         let folds = opts
             .merge
             .as_ref()
-            .is_some_and(|m| ![I64_ADD, I64_MIN, I64_MAX, HLL].contains(&m.name()));
+            .is_some_and(|m| crate::catalog::builtin_kind(m.name()).is_none());
         if !(opts.value.is_some() || folds) || !ssts.has_blobs() {
             return None;
         }

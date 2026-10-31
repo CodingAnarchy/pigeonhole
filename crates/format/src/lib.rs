@@ -22,6 +22,7 @@ pub mod hash;
 pub mod hll;
 pub mod ids;
 pub mod key;
+pub mod kind_params;
 pub mod manifest;
 pub mod scan;
 pub mod shm;

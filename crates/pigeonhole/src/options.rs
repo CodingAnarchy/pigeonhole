@@ -1013,17 +1013,17 @@ pub struct Family {
 }
 
 /// How an aggregate family combines the values written to a cell, fixed when the family is
-/// created, as in Bigtable's aggregate families (decisions D179, D294; [`Family::aggregate`]).
+/// created, as in Bigtable's aggregate families (decisions D179, D294, D298;
+/// [`Family::aggregate`]).
 ///
-/// Every aggregation takes `i64` inputs, written with
-/// [`aggregate`](crate::RowMutation::aggregate) (and [`aggregate_at`] for a bucket), and
-/// combines them within one bucket: a column at one timestamp. A bucket nothing was written
-/// to (or whose writes were all deleted) reads as absent, never as 0.
+/// Inputs are written with [`aggregate`](crate::RowMutation::aggregate) (`i64`),
+/// [`aggregate_u64`](crate::RowMutation::aggregate_u64) (the bitwise kinds) or
+/// [`aggregate_f64`](crate::RowMutation::aggregate_f64) (the `f64` kinds), and `_at` forms for
+/// a bucket. They combine within one bucket: a column at one timestamp. A bucket nothing was
+/// written to (or whose writes were all deleted) reads as absent, never as 0.
 ///
-/// Non-exhaustive: later releases add aggregations (#488).
-///
-/// [`aggregate_at`]: crate::RowMutation::aggregate_at
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Non-exhaustive: later releases add aggregations, some carrying parameters.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Aggregation {
     /// The sum of the inputs, wrapping on overflow: a counter ([`Family::counter`]).
@@ -1037,35 +1037,63 @@ pub enum Aggregation {
     /// standard error). A bucket's sketch is up to 3 KiB; reads and the row cache carry it
     /// whole, so bound a wide row's buckets with a TTL or `max_versions`.
     Hll,
+    /// The bitwise OR of `u64` inputs ([`aggregate_u64`](crate::RowMutation::aggregate_u64);
+    /// read with [`CellRef::as_u64`](crate::CellRef::as_u64)): a set of flags.
+    BitOr,
+    /// The bitwise AND of `u64` inputs.
+    BitAnd,
+    /// The bitwise XOR of `u64` inputs.
+    BitXor,
+    /// The smallest `f64` input ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read
+    /// with [`CellRef::as_f64`](crate::CellRef::as_f64)), by `f64::total_cmp`: `-0.0` is
+    /// below `+0.0`, infinities are allowed, NaN is refused.
+    MinF64,
+    /// The largest `f64` input, as [`Aggregation::MinF64`].
+    MaxF64,
 }
 
 impl Aggregation {
-    fn kind(self) -> FamilyKind {
+    fn kind(&self) -> FamilyKind {
         match self {
             Aggregation::Sum => FamilyKind::Counter,
             Aggregation::Min => FamilyKind::Min,
             Aggregation::Max => FamilyKind::Max,
             Aggregation::Hll => FamilyKind::Hll,
+            Aggregation::BitOr => FamilyKind::BitOr,
+            Aggregation::BitAnd => FamilyKind::BitAnd,
+            Aggregation::BitXor => FamilyKind::BitXor,
+            Aggregation::MinF64 => FamilyKind::MinF64,
+            Aggregation::MaxF64 => FamilyKind::MaxF64,
         }
     }
 
     /// The aggregation of an engine family kind (`None` for a standard family).
     pub(crate) fn of_kind(kind: FamilyKind) -> Option<Self> {
         match kind {
+            FamilyKind::Standard => None,
             FamilyKind::Counter => Some(Aggregation::Sum),
             FamilyKind::Min => Some(Aggregation::Min),
             FamilyKind::Max => Some(Aggregation::Max),
             FamilyKind::Hll => Some(Aggregation::Hll),
-            _ => None,
+            FamilyKind::BitOr => Some(Aggregation::BitOr),
+            FamilyKind::BitAnd => Some(Aggregation::BitAnd),
+            FamilyKind::BitXor => Some(Aggregation::BitXor),
+            FamilyKind::MinF64 => Some(Aggregation::MinF64),
+            FamilyKind::MaxF64 => Some(Aggregation::MaxF64),
         }
     }
 
-    fn operator(self) -> &'static str {
+    fn operator(&self) -> &'static str {
         match self {
             Aggregation::Sum => I64_ADD,
             Aggregation::Min => I64_MIN,
             Aggregation::Max => I64_MAX,
             Aggregation::Hll => HLL,
+            Aggregation::BitOr => "pigeonhole.u64_or",
+            Aggregation::BitAnd => "pigeonhole.u64_and",
+            Aggregation::BitXor => "pigeonhole.u64_xor",
+            Aggregation::MinF64 => "pigeonhole.f64_min",
+            Aggregation::MaxF64 => "pigeonhole.f64_max",
         }
     }
 }

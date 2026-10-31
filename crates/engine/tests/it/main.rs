@@ -77,6 +77,7 @@ mod review;
 mod room_freeze;
 mod room_group;
 mod row_cache_write_through;
+mod scalar_aggregates;
 mod scan_readahead_limit;
 mod shrink;
 mod smoke;

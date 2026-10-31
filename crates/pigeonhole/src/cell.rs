@@ -43,6 +43,13 @@ fn hll_estimate(data: &CellData) -> Option<u64> {
     }
 }
 
+fn as_f64(data: &CellData) -> Option<f64> {
+    match data.value() {
+        ValueRef::F64(x) => Some(x),
+        _ => None,
+    }
+}
+
 fn as_i64(data: &CellData) -> Option<i64> {
     match data.value() {
         ValueRef::I64(v) | ValueRef::Varint(v) => Some(v),
@@ -112,6 +119,17 @@ impl<'a> CellRef<'a> {
         as_i64(&self.data)
     }
 
+    /// The value as a `u64`: an `i64` value's bits, as a bitwise aggregate family holds them
+    /// ([`Aggregation::BitOr`](crate::Aggregation::BitOr), D298); `None` if it isn't one.
+    pub fn as_u64(&self) -> Option<u64> {
+        as_i64(&self.data).map(|v| v as u64)
+    }
+
+    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
+    pub fn as_f64(&self) -> Option<f64> {
+        as_f64(&self.data)
+    }
+
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
     /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
     /// error. The value's shape decides, not its family: `None` unless it is a well-formed
@@ -165,6 +183,17 @@ impl Cell {
     /// The value as an `i64`, if it is one.
     pub fn as_i64(&self) -> Option<i64> {
         as_i64(&self.data)
+    }
+
+    /// The value as a `u64`: an `i64` value's bits, as a bitwise aggregate family holds them
+    /// ([`Aggregation::BitOr`](crate::Aggregation::BitOr), D298); `None` if it isn't one.
+    pub fn as_u64(&self) -> Option<u64> {
+        as_i64(&self.data).map(|v| v as u64)
+    }
+
+    /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
+    pub fn as_f64(&self) -> Option<f64> {
+        as_f64(&self.data)
     }
 
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's

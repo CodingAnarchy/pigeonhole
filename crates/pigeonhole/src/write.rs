@@ -522,6 +522,18 @@ impl RowMutation<'_> {
         })
     }
 
+    /// Puts a `u64` as the `i64` with the same bits, as a bitwise aggregate family holds it
+    /// ([`Aggregation::BitOr`](crate::Aggregation::BitOr), D298); reads back with `as_u64`.
+    pub fn put_u64(self, family: &str, qualifier: &[u8], value: u64) -> Self {
+        self.put_i64(family, qualifier, value as i64)
+    }
+
+    /// [`put_u64`](Self::put_u64) at an explicit timestamp; in a bitwise family, sets that
+    /// bucket.
+    pub fn put_u64_at(self, family: &str, qualifier: &[u8], ts: u64, value: u64) -> Self {
+        self.put_i64_at(family, qualifier, ts, value as i64)
+    }
+
     /// Puts a typed `f64`.
     pub fn put_f64(self, family: &str, qualifier: &[u8], value: f64) -> Self {
         self.op(family, qualifier, 8, |b, t, f, row| {
@@ -584,6 +596,39 @@ impl RowMutation<'_> {
             8,
             |b, t, f, row| b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value)),
         )
+    }
+
+    /// Writes the `u64` input `value` to the cell of a bitwise aggregate family
+    /// ([`Aggregation::BitOr`](crate::Aggregation::BitOr), `BitAnd`, `BitXor`; D298), stored
+    /// as an `i64` with the same bits. Other families fail with `InvalidArgument`, naming the
+    /// method their inputs take.
+    pub fn aggregate_u64(self, family: &str, qualifier: &[u8], value: u64) -> Self {
+        self.op_as(Some(Operand::U64), family, qualifier, 8, |b, t, f, row| {
+            b.merge(t, f, row, qualifier, ValueRef::I64(value as i64))
+        })
+    }
+
+    /// [`aggregate_u64`](Self::aggregate_u64) to the bucket at timestamp `ts`.
+    pub fn aggregate_u64_at(self, family: &str, qualifier: &[u8], ts: u64, value: u64) -> Self {
+        self.op_as(Some(Operand::U64), family, qualifier, 8, |b, t, f, row| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value as i64))
+        })
+    }
+
+    /// Writes the `f64` input `value` to the cell of an `f64` aggregate family
+    /// ([`Aggregation::MinF64`](crate::Aggregation::MinF64), `MaxF64`; D298). NaN, and other
+    /// families, fail with `InvalidArgument`.
+    pub fn aggregate_f64(self, family: &str, qualifier: &[u8], value: f64) -> Self {
+        self.op_as(Some(Operand::F64), family, qualifier, 8, |b, t, f, row| {
+            b.merge(t, f, row, qualifier, ValueRef::F64(value))
+        })
+    }
+
+    /// [`aggregate_f64`](Self::aggregate_f64) to the bucket at timestamp `ts`.
+    pub fn aggregate_f64_at(self, family: &str, qualifier: &[u8], ts: u64, value: f64) -> Self {
+        self.op_as(Some(Operand::F64), family, qualifier, 8, |b, t, f, row| {
+            b.merge_at(t, f, row, qualifier, ts, ValueRef::F64(value))
+        })
     }
 
     /// Writes an untyped operand for the family's merge operator (custom operators, Phase 2).
@@ -910,6 +955,31 @@ impl WriteBatch {
         })
     }
 
+    /// [`RowMutation::put_u64`]: a `u64`'s bits as an `i64`.
+    pub fn put_u64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: u64,
+    ) -> &mut Self {
+        self.put_i64(table, row, family, qualifier, value as i64)
+    }
+
+    /// [`RowMutation::put_u64_at`].
+    pub fn put_u64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: u64,
+    ) -> &mut Self {
+        self.put_i64_at(table, row, family, qualifier, ts, value as i64)
+    }
+
     /// Puts a typed `f64`.
     pub fn put_f64(
         &mut self,
@@ -1020,6 +1090,88 @@ impl WriteBatch {
             qualifier,
             8,
             |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_u64`]: a `u64` input to a bitwise aggregate family.
+    pub fn aggregate_u64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: u64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::U64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::I64(value as i64)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_u64_at`].
+    pub fn aggregate_u64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: u64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::U64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value as i64)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_f64`]: an `f64` input to an `f64` aggregate family.
+    pub fn aggregate_f64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: f64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::F64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::F64(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_f64_at`].
+    pub fn aggregate_f64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: f64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::F64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::F64(value)),
         )
     }
 
@@ -1447,6 +1599,31 @@ impl Transaction {
         })
     }
 
+    /// Buffers a [`RowMutation::put_u64`]: a `u64`'s bits as an `i64`.
+    pub fn put_u64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: u64,
+    ) -> &mut Self {
+        self.put_i64(table, row, family, qualifier, value as i64)
+    }
+
+    /// [`put_u64`](Self::put_u64) at an explicit timestamp.
+    pub fn put_u64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: u64,
+    ) -> &mut Self {
+        self.put_i64_at(table, row, family, qualifier, ts, value as i64)
+    }
+
     /// Buffers a typed `f64` put.
     pub fn put_f64(
         &mut self,
@@ -1523,6 +1700,88 @@ impl Transaction {
             qualifier,
             8,
             |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_u64`]: a `u64` input to a bitwise aggregate family.
+    pub fn aggregate_u64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: u64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::U64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::I64(value as i64)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_u64_at`].
+    pub fn aggregate_u64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: u64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::U64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::I64(value as i64)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_f64`]: an `f64` input to an `f64` aggregate family.
+    pub fn aggregate_f64(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: f64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::F64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::F64(value)),
+        )
+    }
+
+    /// [`RowMutation::aggregate_f64_at`].
+    pub fn aggregate_f64_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: f64,
+    ) -> &mut Self {
+        self.op_as(
+            Some(Operand::F64),
+            table,
+            row,
+            family,
+            qualifier,
+            8,
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::F64(value)),
         )
     }
 

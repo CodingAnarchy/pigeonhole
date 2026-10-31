@@ -244,7 +244,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 
 | Set | Bit | Feature |
 |---|---|---|
-| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 9 so far, and a family's `kind_params`, §9.2.1). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
 
@@ -303,7 +303,23 @@ The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log
 
 Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know, where §9.3's tag ranges allow it. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
 
-*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1); another name is `Corrupt`. Kinds 2, 3 and 4 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, decision D298), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`); another name is `Corrupt`. Kinds 2 to 9 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+
+#### 9.2.1 Kind parameters
+
+`kind_params` (D298) holds a kind's parameters as a list of entries, each `tag` u8, `len` varint, then `len` bytes. The list is canonical: tags strictly increasing (each at most once), tag 0 never written, every length within the field. A list that breaks any of these is `Corrupt`.
+
+**No parameters** is the empty list, and it has two encodings, each used in one case:
+- **Absent:** when nothing follows the field. The body ends at `kind`, as before the field existed.
+- **A present field of length 0:** only when a later appended `FamilyOptions` field needs this slot.
+
+A reader takes both as no parameters, and ignores bytes after the field (later appended fields), so a field can still be appended after `kind_params` (perf287's S1 on #1213).
+
+- Tags 1 to 127 are must-understand: a build whose kind doesn't define the tag refuses the family with `UnsupportedFeature`, the backstop behind the kind's feature bit.
+- Tags 128 to 255 are skippable hints, ignored by a build that doesn't know them.
+- A kind fixes its tags and their value encodings when it lands. A later must-understand tag on an existing kind takes a new `incompat` bit.
+
+No kind defines a tag yet: the field is reserved for the #488 kinds that take parameters (histogram bounds, quantile thresholds, bloom sizing) and for #490's vector kind. A writer refuses any tag the family's kind doesn't define.
 
 *SstMeta* = `id` u64, `extent` extent, `len` u64, `smallest_key` bytes, `largest_key` bytes, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `entries` u64, `deletes` u64.
 
@@ -619,7 +635,7 @@ How each feature tracked for after 1.0 fits format 4 (D269 §3). The bit numbers
 | Feature | Path |
 |---|---|
 | Min, Max and HLL families (#487) | `FamilyKind` 2, 3 and 4 behind `incompat` bit 0, the first real feature bit (D294, §8.2); an HLL value is a `Bytes` sketch with a fixed encoding (§3.1) |
-| More aggregations (#488) | more `FamilyKind` values, plus an optional `kind_params` byte field appended to `PutFamily` (must-understand when present, under the same bit) |
+| More aggregations (#488) | more `FamilyKind` values under `incompat` bit 0 (5 to 9: bitwise and `f64` min/max, D298), plus the optional `kind_params` field appended to `PutFamily` (§9.2.1) |
 | Adjacency sets, roaring (#489) | a `FamilyKind` value and a value encoding, behind a bit |
 | Vector values (#490) | a value tag (0x04) behind an `incompat` bit; payload alignment as a data-block kind (6) or an entry flag under the same bit; dimension and metric in `kind_params` |
 | Time-series codec (#491) | a compression code (3..) or a block kind, behind an `incompat` bit |

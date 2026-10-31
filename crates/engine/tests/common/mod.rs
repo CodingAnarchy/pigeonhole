@@ -159,6 +159,20 @@ pub fn families() -> Vec<ModelFamily> {
             f("hll", 2, 0, false),
             f("hll_ttl", 0, 40, false),
         ]
+    } else if env!("CARGO_CRATE_NAME") == "scalar_counters" {
+        // D298's bitwise and `f64` families beside a counter, eight families in all (32
+        // slots), as `counters` has: more stall a one-shard run with tablet changes off
+        // (#1212). They join `counters` once that is fixed (#1214).
+        vec![
+            f("f", 0, 0, false),
+            f("counter", 3, 0, true),
+            f("sum", 2, 0, false),
+            f("bor", 2, 0, false),
+            f("band", 0, 0, false),
+            f("bxor_ttl", 0, 40, false),
+            f("fmin", 2, 0, false),
+            f("fmax_ttl", 0, 40, false),
+        ]
     } else {
         vec![
             f("f", 0, 0, false),
@@ -178,6 +192,11 @@ fn is_aggregate(family: &str) -> bool {
 /// are sketches.
 fn is_i64(family: &str) -> bool {
     family.starts_with("counter") || (is_aggregate(family) && !is_hll(family))
+}
+
+/// An `f64` family (D298): its puts and operands are `f64`s, the model's `i64` their bits.
+fn is_f64(family: &str) -> bool {
+    aggregation_of_name(family).is_some_and(ModelAggregation::is_f64)
 }
 
 /// An HLL family (D294): it takes inputs (`Incr` elements), never `i64` puts.
@@ -260,6 +279,11 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Min) => "pigeonhole.i64_min",
             (true, ModelAggregation::Max) => "pigeonhole.i64_max",
             (true, ModelAggregation::Sum) => "pigeonhole.i64_add",
+            (true, ModelAggregation::BitOr) => "pigeonhole.u64_or",
+            (true, ModelAggregation::BitAnd) => "pigeonhole.u64_and",
+            (true, ModelAggregation::BitXor) => "pigeonhole.u64_xor",
+            (true, ModelAggregation::MinF64) => "pigeonhole.f64_min",
+            (true, ModelAggregation::MaxF64) => "pigeonhole.f64_max",
             (false, _) if f.i64_add => "pigeonhole.i64_add",
             (false, _) => "",
         })
@@ -269,6 +293,11 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Min) => FamilyKind::Min,
             (true, ModelAggregation::Max) => FamilyKind::Max,
             (true, ModelAggregation::Hll) => FamilyKind::Hll,
+            (true, ModelAggregation::BitOr) => FamilyKind::BitOr,
+            (true, ModelAggregation::BitAnd) => FamilyKind::BitAnd,
+            (true, ModelAggregation::BitXor) => FamilyKind::BitXor,
+            (true, ModelAggregation::MinF64) => FamilyKind::MinF64,
+            (true, ModelAggregation::MaxF64) => FamilyKind::MaxF64,
         })
 }
 
@@ -847,8 +876,10 @@ impl Store {
                     value,
                     ..
                 } => {
-                    // Counter families hold tagged `i64`s (what `put_i64` writes).
+                    // Counter families hold tagged `i64`s (what `put_i64` writes), `f64`
+                    // families tagged `f64`s.
                     let value = match (is_i64(family), <[u8; 8]>::try_from(value.as_slice())) {
+                        (true, Ok(b)) if is_f64(family) => ValueRef::F64(f64::from_le_bytes(b)),
                         (true, Ok(b)) => ValueRef::I64(i64::from_le_bytes(b)),
                         _ => ValueRef::Bytes(value),
                     };
@@ -861,7 +892,7 @@ impl Store {
                     ts: None,
                     delta,
                     ..
-                } => wb.merge(t, fam(family), row, qualifier, ValueRef::I64(*delta))?,
+                } => wb.merge(t, fam(family), row, qualifier, operand(family, *delta))?,
                 ModelOp::Incr {
                     row,
                     family,
@@ -869,7 +900,7 @@ impl Store {
                     ts: Some(ts),
                     delta,
                     ..
-                } => wb.merge_at(t, fam(family), row, qualifier, *ts, ValueRef::I64(*delta))?,
+                } => wb.merge_at(t, fam(family), row, qualifier, *ts, operand(family, *delta))?,
                 ModelOp::DeleteCell {
                     row,
                     family,
@@ -1063,6 +1094,16 @@ pub fn value_bytes(v: ValueRef<'_>) -> Vec<u8> {
         ValueRef::I64(x) | ValueRef::Varint(x) => x.to_le_bytes().to_vec(),
         ValueRef::F64(x) => x.to_le_bytes().to_vec(),
         ValueRef::Blob(_) => panic!("blob pointer returned"),
+    }
+}
+
+/// The engine operand of an `Incr`'s `delta`: an `i64`, or in an `f64` family the `f64`
+/// with its bits.
+fn operand(family: &str, delta: i64) -> ValueRef<'static> {
+    if is_f64(family) {
+        ValueRef::F64(f64::from_bits(delta as u64))
+    } else {
+        ValueRef::I64(delta)
     }
 }
 
