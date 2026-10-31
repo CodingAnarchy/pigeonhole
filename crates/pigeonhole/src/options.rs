@@ -85,7 +85,8 @@ pub enum CpuProfile {
     /// and every SMT sibling, to the application. A shard thread that handled a commit
     /// polls for the next one before it sleeps for a window sized from its recent gaps
     /// between commits: up to 1 ms when they come steadily, and never more poll per gap
-    /// than a 200 µs window would cost (#1176). The default.
+    /// than a 200 µs window would cost (D198 as amended again on 2026-10-30; #1176). The
+    /// default.
     #[default]
     Embedded,
     /// The database has the machine or container to itself, and its clients reach it from
@@ -154,7 +155,7 @@ fn shard_spin_default(profile: CpuProfile) -> Option<Duration> {
     }
 }
 
-/// The cap of `Embedded`'s adaptive window (#1176): each shard thread polls up to 1 ms when
+/// The cap of `Embedded`'s adaptive window (D198's third amendment, #1176): each shard thread polls up to 1 ms when
 /// its recent gaps between commits make that cost no more poll per gap than the fixed 200
 /// µs window could. On the reference machine that took sparse-wide's default-durability put
 /// p99 from 390 to 122 µs and its `Buffered` put p99 to `Server`'s, at `Embedded`'s CPU under
