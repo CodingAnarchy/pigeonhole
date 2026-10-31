@@ -7548,7 +7548,10 @@ impl ShardState {
         }
         if appended {
             let wal = self.wal.as_mut().expect("appended through it");
-            if wal.write().is_err() {
+            let tw = std::time::Instant::now();
+            let wrote = wal.write();
+            scratch_part("rg:wal.write", tw);
+            if wrote.is_err() {
                 self.poison(crate::health::FailureCause::Io);
                 // A partial write may leave whole records in the file.
                 self.fail_all(group.members, true, ctx);
@@ -11424,8 +11427,16 @@ impl ShardState {
             }
             return;
         }
-        match self.wal.as_mut() {
-            Some(wal) => match wal.submit_sync() {
+        let t = std::time::Instant::now();
+        if let Some(wal) = self.wal.as_mut() {
+            let _ = wal.write();
+        }
+        scratch_part("sb:write", t);
+        let t = std::time::Instant::now();
+        let submitted = self.wal.as_mut().map(|wal| wal.submit_sync());
+        scratch_part("sb:submit", t);
+        match submitted {
+            Some(submitted) => match submitted {
                 Ok(c) => {
                     // A flush's or checkpoint's barrier sync covers the feed's held records
                     // too: the next settle drops them (#1415, simp724's C1).
