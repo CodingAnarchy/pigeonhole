@@ -257,7 +257,10 @@ pub struct KeyCursor {
     families: Vec<FamilyId>,
     spec: ReadSpec,
     now: Timestamp,
-    keys: KeySet,
+    keys: Arc<KeySet>,
+    /// One past the last key this cursor reads: the key set's length, or a group's end
+    /// ([`KeyCursor::for_group`]).
+    end: usize,
     groups: Vec<KeyGroup>,
     group: usize,
     /// The next key to read.
@@ -334,15 +337,64 @@ impl KeyCursor {
         shared: Arc<crate::shard::Shared>,
     ) -> Result<Self> {
         let groups = key_groups(&snapshot, table, &keys)?;
-        Ok(Self {
+        let end = keys.len();
+        Ok(Self::with_groups(
+            snapshot,
+            families,
+            spec,
+            now,
+            Arc::new(keys),
+            groups,
+            (0, end),
+            shared,
+        ))
+    }
+
+    /// A cursor over one key group of `keys` (D296's `Keys` input: each tablet group of a
+    /// bounded read gets its own cursor, all sharing one key set).
+    pub(crate) fn for_group(
+        snapshot: Snapshot,
+        families: Vec<FamilyId>,
+        spec: ReadSpec,
+        now: Timestamp,
+        keys: Arc<KeySet>,
+        group: KeyGroup,
+        shared: Arc<crate::shard::Shared>,
+    ) -> Self {
+        let range = (group.keys.start, group.keys.end);
+        Self::with_groups(
             snapshot,
             families,
             spec,
             now,
             keys,
+            vec![group],
+            range,
+            shared,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn with_groups(
+        snapshot: Snapshot,
+        families: Vec<FamilyId>,
+        spec: ReadSpec,
+        now: Timestamp,
+        keys: Arc<KeySet>,
+        groups: Vec<KeyGroup>,
+        (next, end): (usize, usize),
+        shared: Arc<crate::shard::Shared>,
+    ) -> Self {
+        Self {
+            snapshot,
+            families,
+            spec,
+            now,
+            keys,
+            end,
             groups,
             group: 0,
-            next: 0,
+            next,
             current: None,
             reads: Vec::new(),
             prefix: Vec::new(),
@@ -355,7 +407,7 @@ impl KeyCursor {
             opened: None,
             shared,
             nb: None,
-        })
+        }
     }
 
     /// The key set.
@@ -472,7 +524,7 @@ impl KeyCursor {
                 break self.counted(Self::next_key);
             }
             let i = self.next;
-            if i < self.keys.len() {
+            if i < self.end {
                 let entered = self.enter(i);
                 if let Err(e) = self.snapshot.checked(entered) {
                     break Err(e);
@@ -573,7 +625,7 @@ impl KeyCursor {
     /// `Error::WouldBlock`.
     fn step(&mut self, cache_only: bool) -> Result<Step> {
         let i = self.next;
-        if i >= self.keys.len() {
+        if i >= self.end {
             self.close_reads();
             return Ok(Step::End);
         }

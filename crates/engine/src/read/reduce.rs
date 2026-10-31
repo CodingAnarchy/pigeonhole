@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use pigeonhole_format::key::{Escaped, TERMINATOR, encode_row_prefix};
 use pigeonhole_format::{FamilyId, TableId, Timestamp};
 
+use super::keys::{KeyCursor, KeyGroup, KeySet, key_groups};
 use super::{
     FORK_CHECK_ROWS, Lane, MergeKind, ReadSpec, clamp_into, give_back, past_row, row_of,
     skips_columns, take_scan_resolver,
@@ -39,6 +40,9 @@ pub enum ReadInput {
     /// is a scan's input; several cover, for example, an IVF index's probed partitions in one
     /// read under one snapshot.
     Ranges(Vec<RowRange>),
+    /// Rows by key (D299's multi-get, #489): sorted and distinct by construction, read with
+    /// one forward cursor per source per tablet group.
+    Keys(Arc<KeySet>),
 }
 
 /// What a [`CellVisitor`] tells the read to do after one cell.
@@ -195,7 +199,9 @@ pub struct ReduceSpec {
     /// that drives a shard (D88).
     pub parallelism: usize,
     /// Estimated entries per thread below which a read does not fan out
-    /// ([`PARALLEL_FLOOR_ENTRIES`] by default; 0 fans out whenever there are groups).
+    /// ([`PARALLEL_FLOOR_ENTRIES`] by default; 0 fans out whenever there are groups). For a
+    /// [`ReadInput::Keys`] input it counts keys: a key set's rows are not estimated before
+    /// they are read. Key groups are per tablet, so keys inside one tablet never fan out.
     pub parallel_floor: u64,
 }
 
@@ -259,9 +265,28 @@ struct Group<'a> {
     hi: Option<Vec<u8>>,
 }
 
-/// Cuts `input` into tablet groups, in key order.
-fn groups<'a>(view: &'a View, table: TableId, input: &'a ReadInput) -> Result<Vec<Group<'a>>> {
-    let ReadInput::Ranges(ranges) = input;
+/// A unit of a bounded read: one tablet's share of a range, or one tablet's run of keys.
+enum Work<'a> {
+    Range(Group<'a>),
+    Keys(KeyGroup),
+}
+
+/// Cuts `input` into work units, in key order.
+fn work<'a>(snapshot: &'a Snapshot, table: TableId, input: &'a ReadInput) -> Result<Vec<Work<'a>>> {
+    match input {
+        ReadInput::Ranges(ranges) => Ok(groups(&snapshot.view, table, ranges)?
+            .into_iter()
+            .map(Work::Range)
+            .collect()),
+        ReadInput::Keys(keys) => Ok(key_groups(snapshot, table, keys)?
+            .into_iter()
+            .map(Work::Keys)
+            .collect()),
+    }
+}
+
+/// Cuts row ranges into tablet groups, in key order.
+fn groups<'a>(view: &'a View, table: TableId, ranges: &'a [RowRange]) -> Result<Vec<Group<'a>>> {
     // Sorted and disjoint, or a cell would be visited (and counted by a reducer) twice.
     for pair in ranges.windows(2) {
         if !before(&pair[0].1, &pair[1].0) {
@@ -349,6 +374,9 @@ fn estimate(view: &View, families: &[FamilyId], g: &Group<'_>) -> u64 {
 /// What a group's read needs from the call.
 struct Ctx<'a> {
     snapshot: &'a Snapshot,
+    /// For the `Keys` input's cursors (their async-read counters).
+    shared: &'a Arc<crate::shard::Shared>,
+    input: &'a ReadInput,
     families: &'a [FamilyId],
     read: &'a ReadSpec,
     now: Timestamp,
@@ -564,13 +592,93 @@ where
     }
 }
 
-/// [`Engine::reduce`](crate::Engine::reduce): the groups, sequential or fanned out.
+/// Reads one key group into `reducer` through its own [`KeyCursor`] (D296 PR 2): the visitor
+/// sees each present key's resolved cells in place, as for a range; `NextRow` skips the rest
+/// of the key without reading it.
+fn run_keys<V, R>(
+    ctx: &Ctx<'_>,
+    group: &KeyGroup,
+    visitor: &mut V,
+    reducer: &mut R,
+    stats: &mut ReduceStats,
+) -> Result<()>
+where
+    V: CellVisitor<Item = R::Item>,
+    R: Reducer,
+{
+    let ReadInput::Keys(keys) = &ctx.input else {
+        unreachable!("a key group comes from a Keys input");
+    };
+    let mut cur = KeyCursor::for_group(
+        ctx.snapshot.clone(),
+        ctx.families.to_vec(),
+        ctx.read.clone(),
+        ctx.now,
+        Arc::clone(keys),
+        group.clone(),
+        Arc::clone(ctx.shared),
+    );
+    stats.groups += 1;
+    let mut row = Vec::new();
+    // Cells come grouped by family: the rank of the last family seen, looked up once.
+    let mut rank: Option<(FamilyId, u32)> = None;
+    while let Some(i) = cur.next_key()? {
+        if ctx.abort.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        stats.rows += 1;
+        row.clear();
+        row.extend_from_slice(keys.get(i));
+        loop {
+            let Some(c) = cur.next_cell()? else {
+                break;
+            };
+            stats.cells += 1;
+            let family_rank = match rank {
+                Some((f, r)) if f == c.family => r,
+                _ => {
+                    let r = rank_of(ctx.families, c.family);
+                    rank = Some((c.family, r));
+                    r
+                }
+            };
+            let cell = CellRef {
+                row: &row,
+                family_rank,
+                family: c.family,
+                qualifier: c.qualifier,
+                ts: c.ts,
+            };
+            let (item, next_row) = match visitor.visit(&row, c.family, c.qualifier, c.ts, c.stored)
+            {
+                Visit::Skip => (None, false),
+                Visit::Emit(item) => (Some(item), false),
+                Visit::EmitAndNextRow(item) => (Some(item), true),
+                Visit::NextRow => (None, true),
+                Visit::Stop => return Ok(()),
+            };
+            if let Some(item) = item
+                && reducer.push(cell, item).is_break()
+            {
+                return Ok(());
+            }
+            if next_row {
+                cur.skip_rest_of_key();
+                break;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`Engine::reduce`](crate::Engine::reduce): [`reduce_into`], then the merged reducer's
+/// [`Reducer::finish`].
 pub(crate) fn reduce<V, R>(
     snapshot: &Snapshot,
     table: TableId,
     families: &[FamilyId],
     spec: &ReduceSpec,
-    (now, may_fan_out): (Timestamp, bool),
+    ctx: (Timestamp, bool, &Arc<crate::shard::Shared>),
     visitor: &(impl Fn() -> V + Sync),
     reducer: &(impl Fn() -> R + Sync),
 ) -> Result<Reduced<R::Item>>
@@ -578,11 +686,36 @@ where
     V: CellVisitor<Item = R::Item>,
     R: Reducer,
 {
+    let (acc, stats) = reduce_into(snapshot, table, families, spec, ctx, visitor, reducer)?;
+    Ok(Reduced {
+        items: acc.finish(),
+        stats,
+    })
+}
+
+/// The groups, sequential or fanned out, merged into one reducer and handed back unfinished,
+/// for a caller that takes its result in another form (traversal's `DedupeLimit::into_nodes`,
+/// D304).
+pub(crate) fn reduce_into<V, R>(
+    snapshot: &Snapshot,
+    table: TableId,
+    families: &[FamilyId],
+    spec: &ReduceSpec,
+    (now, may_fan_out, shared): (Timestamp, bool, &Arc<crate::shard::Shared>),
+    visitor: &(impl Fn() -> V + Sync),
+    reducer: &(impl Fn() -> R + Sync),
+) -> Result<(R, ReduceStats)>
+where
+    V: CellVisitor<Item = R::Item>,
+    R: Reducer,
+{
     let view = Arc::clone(&snapshot.view);
-    let groups = groups(&view, table, &spec.input)?;
+    let groups = work(snapshot, table, &spec.input)?;
     let abort = AtomicBool::new(false);
     let ctx = Ctx {
         snapshot,
+        shared,
+        input: &spec.input,
         families,
         read: &spec.read,
         now,
@@ -592,7 +725,13 @@ where
         let by_work = match spec.parallel_floor {
             0 => usize::MAX,
             floor => {
-                let total: u64 = groups.iter().map(|g| estimate(&view, families, g)).sum();
+                let total: u64 = groups
+                    .iter()
+                    .map(|w| match w {
+                        Work::Range(g) => estimate(&view, families, g),
+                        Work::Keys(k) => k.keys.len() as u64,
+                    })
+                    .sum();
                 usize::try_from(total / floor).unwrap_or(usize::MAX).max(1)
             }
         };
@@ -601,10 +740,13 @@ where
         1
     };
     // One visitor and reducer per group: a group stops only on its own account.
-    let run = |g: &Group<'_>, stats: &mut ReduceStats| -> Result<R> {
+    let run = |w: &Work<'_>, stats: &mut ReduceStats| -> Result<R> {
         let mut v = visitor();
         let mut r = reducer();
-        run_group(&ctx, g, &mut v, &mut r, stats)?;
+        match w {
+            Work::Range(g) => run_group(&ctx, g, &mut v, &mut r, stats)?,
+            Work::Keys(k) => run_keys(&ctx, k, &mut v, &mut r, stats)?,
+        }
         Ok(r)
     };
     let mut stats = ReduceStats::default();
@@ -651,10 +793,7 @@ where
         }
         stats.threads = threads as u64;
     }
-    Ok(Reduced {
-        items: acc.finish(),
-        stats,
-    })
+    Ok((acc, stats))
 }
 
 /// The `k` items with the smallest scores, ties broken by cell order: a total order, so the
