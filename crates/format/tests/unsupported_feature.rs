@@ -30,7 +30,6 @@ fn key_kind_and_value_tag() {
     unsupported(Kind::from_u8(0x06), "key kind", 6);
     unsupported(Kind::from_u8(0xff), "key kind", 0xff);
     unsupported(decode_value(&[0x05, 1, 2, 3]), "value tag", 5);
-    unsupported(decode_value(&[0x04, 9, 1, 0]), "vector element", 9);
     unsupported(decode_value(&[0x81]), "value tag", 0x81);
 }
 

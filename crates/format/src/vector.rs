@@ -266,15 +266,15 @@ impl<'a> VectorRef<'a> {
         out.extend_from_slice(self.payload);
     }
 
-    /// Decodes the bytes after the value tag. An unknown element is `UnsupportedFeature`;
-    /// anything else malformed is `Corrupt`.
+    /// Decodes the bytes after the value tag; anything malformed is `Corrupt`. An unknown
+    /// element is too, as in `kind_params`: a new element would come under a new `incompat`
+    /// bit, so a reader that meets one has a damaged file.
     pub(crate) fn decode(bytes: &'a [u8]) -> crate::Result<Self> {
         let Some((&e, rest)) = bytes.split_first() else {
             return Err(Error::Truncated { what: "vector" });
         };
-        let element = Element::from_u8(e).ok_or(Error::UnsupportedFeature {
+        let element = Element::from_u8(e).ok_or(Error::Corrupt {
             what: "vector element",
-            value: u64::from(e),
         })?;
         let (dim, used) = crate::varint::get_u32(rest)?;
         Self::new(element, dim, &rest[used..]).map_err(|_| Error::Corrupt { what: "vector" })
@@ -362,9 +362,8 @@ mod tests {
         }
         assert!(matches!(
             VectorRef::decode(&[9, 1, 0]),
-            Err(Error::UnsupportedFeature {
-                what: "vector element",
-                value: 9
+            Err(Error::Corrupt {
+                what: "vector element"
             })
         ));
         // 4096 dimensions fit; 4097 do not.
