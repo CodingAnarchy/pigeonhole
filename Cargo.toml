@@ -19,6 +19,7 @@ members = [
     "crates/cli",
     "crates/capi",
     "crates/vector",
+    "crates/python",
 ]
 
 [workspace.package]

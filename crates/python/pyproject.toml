@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.16,<2"]
+build-backend = "maturin"
+
+[project]
+name = "pigeonhole-db"
+description = "Pigeonhole: an embedded, single-file, wide-column store (BigTable's data model, SQLite's deployment)."
+requires-python = ">=3.11"
+license = "MIT"
+readme = "README.md"
+dynamic = ["version"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Rust",
+    "Topic :: Database :: Database Engines/Servers",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/CodingAnarchy/pigeonhole"
+Documentation = "https://github.com/CodingAnarchy/pigeonhole/blob/main/crates/python/README.md"
+
+[tool.maturin]
+python-source = "python"
+module-name = "pigeonhole._native"
+features = []
