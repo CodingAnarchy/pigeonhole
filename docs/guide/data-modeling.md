@@ -48,6 +48,8 @@ let pages = db
 | Counters | `Family::counter()`; a `ttl` to keep only recent buckets |
 | Running minimum or maximum | `Family::aggregate(Aggregation::Min)` or `Max`; buckets as for counters |
 | Distinct counts | `Family::aggregate(Aggregation::Hll)`; read with `hll_estimate` |
+| Flags seen, or common to all writers | `Family::aggregate(Aggregation::BitOr)` (or `BitAnd`, `BitXor`); write with `aggregate_u64`, read with `as_u64` |
+| Lowest or highest reading (temperatures, latencies) | `Family::aggregate(Aggregation::MinF64)` or `MaxF64`; write with `aggregate_f64`, read with `as_f64` |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -127,7 +129,7 @@ let page = g.row(b"node:a").family("out").column_limit(100).read()?;
 - Writing both directions in one `WriteBatch` makes them atomic even if the rows live on different shards.
 
 ## Counters
-Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). A counter is one kind of aggregate family; [Min and max](#min-and-max) and [Distinct counts (HLL)](#distinct-counts-hll) cover the others. `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
+Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). A counter is one kind of aggregate family; [Min and max](#min-and-max), [Distinct counts (HLL)](#distinct-counts-hll) and [Bitwise and `f64` aggregations](#bitwise-and-f64-aggregations) cover the others. `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
 
 ```rust
 # use pigeonhole::*;
@@ -229,6 +231,13 @@ As for counters and min/max: `aggregate_at` writes a bucket, a delete starts the
 - **Writes:** `incr` and `put_i64` are refused. `put` takes only a well-formed sketch, as `phdb load` writes one back.
 - **Storage:** sketches are never moved to blob files (`blob_threshold` below 3076 is refused).
 - **The file can no longer be opened by 1.0.x**, as with min and max ([Min and max](#min-and-max)).
+
+## Bitwise and `f64` aggregations
+These combine like min and max (buckets, puts, deletes, TTL), over other value types (D298):
+- **`BitOr`, `BitAnd`, `BitXor`** fold `u64` inputs bit by bit: the flags any writer set, the flags every writer kept, or a parity. Write inputs with `aggregate_u64` and set a cell with `put_u64`; read with `CellRef::as_u64`. The value is stored as the `i64` with the same bits.
+- **`MinF64`, `MaxF64`** keep the smallest or largest `f64` input. Write with `aggregate_f64` and set with `put_f64`; read with `as_f64`. They order by `f64::total_cmp`: `-0.0` is below `+0.0`, infinities are allowed, and NaN is refused (`InvalidArgument`).
+
+`incr` is refused in all five, and each marks the file like min and max (1.0.x refuses it).
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

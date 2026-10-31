@@ -49,17 +49,44 @@ pub enum ModelAggregation {
     /// The distinct `i64` elements, as a HyperLogLog sketch (the store's
     /// `pigeonhole_format::hll` encoding, which [`hll_sketch`] writes independently).
     Hll,
+    /// Bitwise OR of `u64`s carried as `i64` bits (D298).
+    BitOr,
+    /// Bitwise AND, as [`BitOr`](Self::BitOr).
+    BitAnd,
+    /// Bitwise XOR, as [`BitOr`](Self::BitOr).
+    BitXor,
+    /// The `f64` minimum by `total_cmp`, the `f64`s carried as their bits in the `i64`
+    /// (D298; never NaN).
+    MinF64,
+    /// The `f64` maximum, as [`MinF64`](Self::MinF64).
+    MaxF64,
 }
 
 impl ModelAggregation {
-    /// `a` combined with `b` (`Sum`, `Min`, `Max`; an HLL family's inputs are elements,
-    /// never combined into one `i64`).
+    /// Whether the family holds `f64`s, carried as their bits (`MinF64`, `MaxF64`).
+    pub fn is_f64(self) -> bool {
+        matches!(self, ModelAggregation::MinF64 | ModelAggregation::MaxF64)
+    }
+
+    /// `a` combined with `b` (an HLL family's inputs are elements, never combined into one
+    /// `i64`).
     pub fn combine(self, a: i64, b: i64) -> i64 {
         match self {
             ModelAggregation::Sum => a.wrapping_add(b),
             ModelAggregation::Min => a.min(b),
             ModelAggregation::Max => a.max(b),
             ModelAggregation::Hll => unreachable!("HLL inputs are not combined into an i64"),
+            ModelAggregation::BitOr => a | b,
+            ModelAggregation::BitAnd => a & b,
+            ModelAggregation::BitXor => a ^ b,
+            ModelAggregation::MinF64 | ModelAggregation::MaxF64 => {
+                let (x, y) = (f64::from_bits(a as u64), f64::from_bits(b as u64));
+                let pick_y = match self {
+                    ModelAggregation::MinF64 => y.total_cmp(&x).is_lt(),
+                    _ => y.total_cmp(&x).is_gt(),
+                };
+                if pick_y { b } else { a }
+            }
         }
     }
 }
@@ -152,8 +179,9 @@ fn decode_registers(s: &[u8]) -> Option<[u8; 4096]> {
 }
 
 /// The aggregation of the test families named by convention ([`WorkloadSpec`]): a name
-/// starting with `sum` is a counter family, `min`, `max` and `hll` the D294 families;
-/// `None` for any other name.
+/// starting with `sum` is a counter family, `min`, `max` and `hll` the D294 families, `bor`,
+/// `band`, `bxor`, `fmin` and `fmax` the D298 bitwise and `f64` families; `None` for any other
+/// name.
 ///
 /// [`WorkloadSpec`]: crate::WorkloadSpec
 pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
@@ -165,6 +193,16 @@ pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
         Some(ModelAggregation::Max)
     } else if family.starts_with("hll") {
         Some(ModelAggregation::Hll)
+    } else if family.starts_with("bor") {
+        Some(ModelAggregation::BitOr)
+    } else if family.starts_with("band") {
+        Some(ModelAggregation::BitAnd)
+    } else if family.starts_with("bxor") {
+        Some(ModelAggregation::BitXor)
+    } else if family.starts_with("fmin") {
+        Some(ModelAggregation::MinF64)
+    } else if family.starts_with("fmax") {
+        Some(ModelAggregation::MaxF64)
     } else {
         None
     }
@@ -584,6 +622,14 @@ impl Model {
         let fixed_with_ttl = |ts: &Option<Timestamp>| ts.is_none() && f.ttl_micros != 0;
         match op {
             ModelOp::Incr { ts, .. } if f.counter && fixed_with_ttl(ts) => refused(),
+            // An f64 family never holds a NaN (D298).
+            ModelOp::Incr { delta, .. }
+                if f.counter
+                    && f.aggregation.is_f64()
+                    && f64::from_bits(*delta as u64).is_nan() =>
+            {
+                refused()
+            }
             ModelOp::Incr { .. } if f.counter => Ok(()),
             ModelOp::Incr { ts: Some(_), .. } => refused(),
             ModelOp::Incr { .. } if !f.i64_add => Err(ModelError::NoMergeOperator(family.clone())),
@@ -599,6 +645,13 @@ impl Model {
             }
             ModelOp::Put { ts, value, .. }
                 if f.counter && (value.len() != 8 || fixed_with_ttl(ts)) =>
+            {
+                refused()
+            }
+            ModelOp::Put { value, .. }
+                if f.counter
+                    && f.aggregation.is_f64()
+                    && as_i64(value).is_some_and(|v| f64::from_bits(v as u64).is_nan()) =>
             {
                 refused()
             }

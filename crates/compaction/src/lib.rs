@@ -41,7 +41,9 @@ pub use job::{
     BlobRefs, CompactionJob, CompactionOutput, GcPolicy, JobContext, JobPoll, NewBlobFile,
     OtherSource, StreamGc, output_piece_bytes,
 };
-pub use merge::{HllUnion, I64Add, I64Max, I64Min, MergeError, MergeOperator, MergeRegistry};
+pub use merge::{
+    Bitwise, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeError, MergeOperator, MergeRegistry,
+};
 pub use picker::{CompactionPicker, CompactionTask, KeyRange, Levels, PickerOptions, TaskKind};
 pub use resolver::{COUNTER_FOLD_MIN, CellResolver, ResolveOptions, ResolvedCell, ValuePredicate};
 

@@ -243,17 +243,24 @@ impl TableCore {
             }
         };
         let why = match (operand, f.options.kind) {
-            (Operand::Incr, FamilyKind::Min) => {
-                "is a min family: write its inputs with aggregate, not incr"
-            }
-            (Operand::Incr, FamilyKind::Max) => {
-                "is a max family: write its inputs with aggregate, not incr"
-            }
-            (Operand::Incr, FamilyKind::Hll) => {
-                "is an hll family: write its inputs with aggregate, not incr"
+            // Every aggregate kind but the counter: "increment" would mislead there.
+            (Operand::Incr, kind) if kind.is_aggregate() && kind != FamilyKind::Counter => {
+                let (what, method) = match kind {
+                    FamilyKind::Min => ("a min", "aggregate"),
+                    FamilyKind::Max => ("a max", "aggregate"),
+                    FamilyKind::Hll => ("an hll", "aggregate"),
+                    FamilyKind::BitOr => ("a bit_or", "aggregate_u64"),
+                    FamilyKind::BitAnd => ("a bit_and", "aggregate_u64"),
+                    FamilyKind::BitXor => ("a bit_xor", "aggregate_u64"),
+                    FamilyKind::MinF64 => ("a min_f64", "aggregate_f64"),
+                    FamilyKind::MaxF64 => ("a max_f64", "aggregate_f64"),
+                    FamilyKind::Standard | FamilyKind::Counter => unreachable!("guarded"),
+                };
+                format!("is {what} family: write its inputs with {method}, not incr")
             }
             (Operand::Aggregate, kind) if !kind.is_aggregate() => {
                 "is not an aggregate family: aggregate needs Family::aggregate or Family::counter"
+                    .to_owned()
             }
             _ => return Ok(f.id),
         };

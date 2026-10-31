@@ -3221,6 +3221,58 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - the internal crates at 2.0.0 pass against 1.0.0, since a major allows breaking changes;
 - a breaking change to a public crate still fails (a scratch control removing a public `pigeonhole` item fails `cargo semver-checks -p pigeonhole`; #1196).
 
+<a id="d298"></a>
+## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D186 for aggregate families in PR 5)
+**Why.** The owner's minimum set for #488, on D294's machinery: bitwise OR, AND and XOR; `f64` min and max; an exact `f64` sum; mean and variance; fixed-bucket histograms; bloom union. Also log-linear quantiles, and #489's roaring `u32` set. Kinds with parameters need a field on `PutFamily`; cli692's #490 vector kind needs one too, so the two share it.
+
+**Decided (the design note, with revision 1).**
+- **Kinds** (`FamilyKind` 5 to 15): BitOr, BitAnd, BitXor (5–7), MinF64, MaxF64 (8–9), SumF64 (10), MeanVar (11), Histogram (12), Quantiles (13), Bloom (14), Set (15). Each fixes its built-in operator, as D294's do.
+  - Values reuse the `I64`, `F64` and `Bytes` tags: no new tag, key kind or block kind.
+  - Every kind follows D294: an absent bucket is the identity; a put sets a bucket; in-commit writes combine in order; deletes (D186, D187) and checkpoints (D291) apply unchanged.
+- **Feature bit:** all of them, and `kind_params`, share `incompat` bit 0 with D294, since everything ships in 1.1.0 (owner, 2026-10-31). A kind that misses 1.1.0 takes a new bit from the owner.
+- **`kind_params`** (FORMAT §9.2.1, agreed with cli692): a canonical list of `(tag u8, len varint, bytes)` entries, appended to `PutFamily` only when the kind has parameters.
+  - Tags 1–127 are must-understand (an unknown one is `UnsupportedFeature`), 128–255 are skippable, and 0 is never written.
+  - A kind fixes its tags when it lands; a later must-understand tag on an existing kind takes a new bit.
+- **Exact sums:** SumF64 is a 2176-bit two's-complement accumulator, so the sum is deterministic under any grouping, with one rounding at read. MeanVar adds a 4288-bit Σx² accumulator of exact integer squares (revision 1's S1), with the trim rule of S2.
+- **Quantiles** collapse below the threshold `t = max_index − max_buckets + 1` into bucket `t` (S3), so collapsing is associative.
+- **Engine (PR 5):** built-in operators fold onto blob-separated bases. Compaction folds an aggregate bucket's operands into a same-stripe base under the widened guard `[P.seqno, newest.seqno]`, never across an in-run delete (S4; D73's restriction stays for standard families). D291 checkpoints are capped at 4 KiB.
+- **Not taken** (§6): KLL and t-digest (randomised or merge-order-sensitive), Space-Saving top-K, decayed counters as a kind. Count-Min, Theta sketches, a bounded recent list, `u64`/bytes sets and per-column types go to a tracking issue (PR 6).
+- **PRs:** 1 `kind_params` and the scalar kinds; 2 exact sum and MeanVar; 3 histogram and quantiles; 4 bloom and `aggregate_bytes`; 5 separated bases, the compaction fold, the checkpoint cap and Set; 6 docs and the tracking issue. perf287 reviews each, and each runs the five sweeps.
+
+**What (PR 1: `kind_params`, bitwise and `f64` min/max).**
+- **`kind_params`:** `FamilyOptions::kind_params` (empty for "absent") and `pigeonhole_format::kind_params`.
+  - Decode checks the list is canonical (`Corrupt` otherwise, an empty present field included).
+  - The catalog refuses a must-understand tag the kind doesn't define with `UnsupportedFeature`, and ignores skippable ones.
+  - A writer refuses any tag its kind doesn't define (`InvalidArgument`); no kind defines one yet. A family without parameters encodes exactly as before.
+- **Bitwise kinds:** operators `pigeonhole.u64_or`, `u64_and` and `u64_xor` (`Bitwise`), over the `I64` tag's bits.
+  - Inputs come from `aggregate_u64` and puts from `put_u64` (or `aggregate`/`put_i64` with the same bits), read with `as_u64`.
+  - XOR isn't idempotent, so the #1051 guard matters for it as it does for Sum. Every kind keeps the guard.
+- **`f64` kinds:** operators `pigeonhole.f64_min` and `f64_max` (`F64Extreme`), ordered by `f64::total_cmp`, so `-0.0 < +0.0` and the result is deterministic.
+  - Inputs come from `aggregate_f64`, puts from `put_f64`, and reads from `as_f64`.
+  - NaN is refused at write, so none is ever stored; ±∞ are allowed. An operator meeting a NaN or another tag fails with `MergeError`.
+- **In-commit combine** (`prepare_counter_writes`) now goes through the family's bound operator for every kind but HLL's element step, instead of a per-kind `i64` match.
+- **The operators belong to their kinds:** a standard family naming any built-in operator but `pigeonhole.i64_add` (D41) is refused at creation (`builtin_kind`), extending perf287's S1 on #1194.
+- **`incr`** is refused in every aggregate kind but Counter, with a message naming the method that writes that kind's inputs.
+- **API** (ICR 0096): `Aggregation`'s five variants, minus `Copy`; `aggregate_u64`, `aggregate_f64`, `put_u64` and their `_at` forms on `RowMutation`, `WriteBatch` and `Transaction`; `as_u64`/`as_f64` on `CellRef` and `Cell`. In phdb: the schema names, the shell's `create` suffixes, and `aggregate` parsing by kind.
+
+**Tests (PR 1).**
+- **Format:** `kind_params` canonical-form tests; kinds 5–9 and `kind_params` round-trip through `PutFamily`; non-canonical lists are `Corrupt`; unknown kinds now start at 10.
+- **Compaction:** doctests for both operator types (XOR's `finish` onto a base, signed zeros, NaN refused).
+- **Engine (`it/scalar_aggregates.rs`):**
+  - inputs fold through flushes, compactions, and checkpoints at every fold;
+  - puts as bases, in one commit and across a flush;
+  - NaN and wrong-tag refusals;
+  - operators bound to their kinds;
+  - `kind_params` tags refused at creation;
+  - the shared bit set in both pages.
+- **Engine catalog:** an unknown must-understand tag is `UnsupportedFeature` and a skippable one is accepted.
+- **Model checks:** `ModelAggregation` gains the five kinds, folding `f64`s by their bits with `total_cmp`. The workload writes one-bit OR words, one-clear AND words, random XOR words, and finite `f64`s, signed zeros and infinities.
+  - The `counters` targets add `bxor` and `fmax_ttl` only. The kinds of each group share their operator's code, and XOR is the one that shows an operand applied twice.
+  - More families stall a one-shard run with tablet changes off: 13 families on 4 tables gave up with `Busy` on seed 6, even with standard families in their place.
+  - **Mutation:** making XOR compute OR fails 25 of the 33 engine `counters` tests.
+- **API and phdb:** a `pigeonhole` API test; a phdb shell test.
+- **Corpus:** the `aggregates` entry gains one family per kind (signed zeros, infinities, a put, a delete), still refused by 1.0.0.
+
 <a id="d300"></a>
 ## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)
 **Why.** On macOS CI a reader process saw the visible seqno go from 21169 to 21162 (`crates/shm/tests/multiprocess.rs`, seed 1592590338). FORMAT §11.3's step 1, `pending[shard].store(next_seqno.load())`, was a load and a separate store. Another shard could reserve a seqno, raise the mirror, apply it and release its hold in between, so the visible seqno passed it. The stale bound then landed below it, and the visible seqno went back until the first shard published its reservation. It's an interleaving, not a memory-ordering effect: it reproduces in one thread, through the public API. Nothing unapplied ever became visible, but snapshots weren't monotonic: a later snapshot, in-process or in a reader process, could miss a commit an earlier one included, including a writer's own acknowledged commit.

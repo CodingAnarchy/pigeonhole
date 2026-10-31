@@ -17,11 +17,16 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
     let v = json!({
         "name": f.name,
         "counter": f.counter,
-        "aggregation": f.aggregation.map(|a| match a {
+        "aggregation": f.aggregation.as_ref().map(|a| match a {
             Aggregation::Sum => "sum",
             Aggregation::Min => "min",
             Aggregation::Max => "max",
             Aggregation::Hll => "hll",
+            Aggregation::BitOr => "bit_or",
+            Aggregation::BitAnd => "bit_and",
+            Aggregation::BitXor => "bit_xor",
+            Aggregation::MinF64 => "min_f64",
+            Aggregation::MaxF64 => "max_f64",
             _ => "unknown",
         }),
         "max_versions": f.max_versions,
@@ -64,6 +69,11 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
         (Some("min"), _) => Family::aggregate(Aggregation::Min),
         (Some("max"), _) => Family::aggregate(Aggregation::Max),
         (Some("hll"), _) => Family::aggregate(Aggregation::Hll),
+        (Some("bit_or"), _) => Family::aggregate(Aggregation::BitOr),
+        (Some("bit_and"), _) => Family::aggregate(Aggregation::BitAnd),
+        (Some("bit_xor"), _) => Family::aggregate(Aggregation::BitXor),
+        (Some("min_f64"), _) => Family::aggregate(Aggregation::MinF64),
+        (Some("max_f64"), _) => Family::aggregate(Aggregation::MaxF64),
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
         (None, _) => Family::default(),
     };

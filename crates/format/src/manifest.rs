@@ -251,6 +251,20 @@ pub enum FamilyKind {
     /// A HyperLogLog family (D294): a bucket holds a sketch of the distinct `i64` elements
     /// written to it ([`crate::hll`]). Needs [`INCOMPAT_AGGREGATES`].
     Hll = 4,
+    /// A bitwise-OR family over `u64` (D298): a bucket holds the OR of the values written to
+    /// it (`ValueTag::I64`, the `u64`'s bits). Needs [`INCOMPAT_AGGREGATES`].
+    BitOr = 5,
+    /// A bitwise-AND family over `u64` (D298). Needs [`INCOMPAT_AGGREGATES`].
+    BitAnd = 6,
+    /// A bitwise-XOR family over `u64` (D298). Needs [`INCOMPAT_AGGREGATES`].
+    BitXor = 7,
+    /// An `f64` minimum family (D298): a bucket holds the smallest value written to it by
+    /// `f64::total_cmp` (`-0.0 < +0.0`; NaN is refused at write). Needs
+    /// [`INCOMPAT_AGGREGATES`].
+    MinF64 = 8,
+    /// An `f64` maximum family (D298), as [`FamilyKind::MinF64`]. Needs
+    /// [`INCOMPAT_AGGREGATES`].
+    MaxF64 = 9,
 }
 
 impl FamilyKind {
@@ -280,13 +294,20 @@ impl FamilyKind {
     pub fn required_incompat(self) -> u64 {
         match self {
             FamilyKind::Standard | FamilyKind::Counter => 0,
-            FamilyKind::Min | FamilyKind::Max | FamilyKind::Hll => INCOMPAT_AGGREGATES,
+            FamilyKind::Min
+            | FamilyKind::Max
+            | FamilyKind::Hll
+            | FamilyKind::BitOr
+            | FamilyKind::BitAnd
+            | FamilyKind::BitXor
+            | FamilyKind::MinF64
+            | FamilyKind::MaxF64 => INCOMPAT_AGGREGATES,
         }
     }
 }
 
-/// The `incompat` feature bit of the aggregate kinds added after 1.0 (bit 0, D294): Min,
-/// Max and Hll.
+/// The `incompat` feature bit of the aggregate kinds added after 1.0 (bit 0, D294, D298):
+/// every kind from Min on, and `kind_params`; they ship together in 1.1.0.
 pub const INCOMPAT_AGGREGATES: u64 = 1 << 0;
 
 /// The persisted policy of one family. Stored in the manifest so another binary interprets
@@ -330,6 +351,10 @@ pub struct FamilyOptions {
     pub compaction: CompactionStyle,
     /// What the family's columns hold (appended field; absent reads as `Standard`).
     pub kind: FamilyKind,
+    /// The kind's parameters ([`crate::kind_params`], D298): a canonical tag-length-value
+    /// list, empty for a kind that defines none (every kind so far). Appended to the
+    /// encoding after `kind` only when non-empty.
+    pub kind_params: Vec<u8>,
 }
 
 impl Default for FamilyOptions {
@@ -348,6 +373,7 @@ impl Default for FamilyOptions {
             cache_priority: CachePriority::Normal,
             compaction: CompactionStyle::Leveled,
             kind: FamilyKind::Standard,
+            kind_params: Vec::new(),
         }
     }
 }
@@ -423,6 +449,12 @@ impl FamilyOptions {
         self
     }
 
+    /// Sets `kind_params` (a canonical list, [`crate::kind_params::encode`]).
+    pub fn kind_params(mut self, params: Vec<u8>) -> Self {
+        self.kind_params = params;
+        self
+    }
+
     /// Sets `merge_operator`: the merge operator's name; empty for none.
     #[must_use]
     pub fn merge_operator(mut self, name: impl Into<String>) -> Self {
@@ -442,6 +474,10 @@ impl FamilyOptions {
         out.push(self.cache_priority as u8);
         out.push(self.compaction as u8);
         out.push(self.kind as u8);
+        // Appended for D298: present only when the kind has parameters.
+        if !self.kind_params.is_empty() {
+            crate::varint::put_bytes(out, &self.kind_params);
+        }
     }
 
     fn decode(r: &mut Reader<'_>) -> crate::Result<Self> {
@@ -492,6 +528,11 @@ impl FamilyOptions {
                     2 => FamilyKind::Min,
                     3 => FamilyKind::Max,
                     4 => FamilyKind::Hll,
+                    5 => FamilyKind::BitOr,
+                    6 => FamilyKind::BitAnd,
+                    7 => FamilyKind::BitXor,
+                    8 => FamilyKind::MinF64,
+                    9 => FamilyKind::MaxF64,
                     k => {
                         return Err(Error::UnsupportedFeature {
                             what: "family kind",
@@ -499,6 +540,15 @@ impl FamilyOptions {
                         });
                     }
                 }
+            },
+            // Appended for D298: absent for a kind without parameters. When present it is a
+            // canonical, non-empty list ([`crate::kind_params`]).
+            kind_params: if r.remaining() == 0 {
+                Vec::new()
+            } else {
+                let params = r.bytes()?;
+                crate::kind_params::parse(params)?;
+                params.to_vec()
             },
         })
     }
@@ -1005,6 +1055,74 @@ mod encode_tests {
             out.extend_from_slice(&body);
             set_body_len(&mut out, 1);
             assert_eq!(out, expected, "body of {len} bytes");
+        }
+    }
+
+    fn put_family(options: FamilyOptions) -> Vec<u8> {
+        let mut out = Vec::new();
+        Edit::PutFamily {
+            table: TableId(1),
+            family: FamilyId(2),
+            name: "f".into(),
+            options,
+        }
+        .encode(&mut out);
+        out
+    }
+
+    /// D298's kinds round-trip, and `kind_params` is appended only when present: a family
+    /// without parameters encodes as before it existed.
+    #[test]
+    fn d298_kinds_and_kind_params_round_trip() {
+        for kind in [
+            FamilyKind::BitOr,
+            FamilyKind::BitAnd,
+            FamilyKind::BitXor,
+            FamilyKind::MinF64,
+            FamilyKind::MaxF64,
+        ] {
+            let plain = FamilyOptions::default().kind(kind);
+            let bytes = put_family(plain.clone());
+            assert_eq!(
+                bytes.last(),
+                Some(&(kind as u8)),
+                "{kind:?}: kind is the last field"
+            );
+            let (Edit::PutFamily { options, .. }, _) = Edit::decode(&bytes).unwrap() else {
+                panic!("a family");
+            };
+            assert_eq!(options, plain);
+            assert_eq!(
+                kind.required_incompat(),
+                crate::manifest::INCOMPAT_AGGREGATES
+            );
+            let params = crate::kind_params::encode(&[(1, &[3]), (200, &9u32.to_le_bytes())]);
+            let with = plain.kind_params(params.clone());
+            let bytes = put_family(with.clone());
+            let (Edit::PutFamily { options, .. }, _) = Edit::decode(&bytes).unwrap() else {
+                panic!("a family");
+            };
+            assert_eq!((options.kind_params, options.kind), (params, kind));
+        }
+    }
+
+    /// A present `kind_params` that is empty or not canonical is corruption.
+    #[test]
+    fn non_canonical_kind_params_are_corrupt() {
+        for bad in [vec![], vec![2, 0, 1, 0], vec![0, 0]] {
+            let o = FamilyOptions::default().kind(FamilyKind::BitOr);
+            let bytes = put_family(o);
+            // The edit's body with the field appended by hand around a bad list.
+            let (body, _) = crate::varint::get_bytes(&bytes[1..]).unwrap();
+            let mut body = body.to_vec();
+            crate::varint::put_bytes(&mut body, &bad);
+            let mut fixed = vec![bytes[0]];
+            crate::varint::put_bytes(&mut fixed, &body);
+            assert!(
+                matches!(Edit::decode(&fixed), Err(Error::Corrupt { .. })),
+                "{bad:?}: {:?}",
+                Edit::decode(&fixed)
+            );
         }
     }
 

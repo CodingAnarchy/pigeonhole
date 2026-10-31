@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use pigeonhole_compaction::{HllUnion, I64Add, I64Max, I64Min, MergeOperator, MergeRegistry};
+use pigeonhole_compaction::{
+    Bitwise, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeOperator, MergeRegistry,
+};
 use pigeonhole_format::hash::{FastMap, FastSet};
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
 use pigeonhole_format::superblock::ExtentRef;
@@ -24,6 +26,13 @@ pub(crate) const I64_MIN: &str = "pigeonhole.i64_min";
 pub(crate) const I64_MAX: &str = "pigeonhole.i64_max";
 /// Name of the built-in HyperLogLog union (`pigeonhole_compaction::HllUnion`, D294).
 pub(crate) const HLL: &str = "pigeonhole.hll";
+/// Names of the built-in bitwise operators (`pigeonhole_compaction::Bitwise`, D298).
+pub(crate) const U64_OR: &str = "pigeonhole.u64_or";
+pub(crate) const U64_AND: &str = "pigeonhole.u64_and";
+pub(crate) const U64_XOR: &str = "pigeonhole.u64_xor";
+/// Names of the built-in `f64` extremes (`pigeonhole_compaction::F64Extreme`, D298).
+pub(crate) const F64_MIN: &str = "pigeonhole.f64_min";
+pub(crate) const F64_MAX: &str = "pigeonhole.f64_max";
 
 /// The operator an aggregate family of `kind` folds with, by name (D179, D294); `None` for
 /// a standard family, whose operator is its own choice.
@@ -34,6 +43,45 @@ pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
         FamilyKind::Min => Some(I64_MIN),
         FamilyKind::Max => Some(I64_MAX),
         FamilyKind::Hll => Some(HLL),
+        FamilyKind::BitOr => Some(U64_OR),
+        FamilyKind::BitAnd => Some(U64_AND),
+        FamilyKind::BitXor => Some(U64_XOR),
+        FamilyKind::MinF64 => Some(F64_MIN),
+        FamilyKind::MaxF64 => Some(F64_MAX),
+    }
+}
+
+/// The aggregate kind whose built-in operator is named `name`, if any. A standard family
+/// may not name one (except `pigeonhole.i64_add`, its 0.1.0 meaning, D41).
+pub(crate) fn builtin_kind(name: &str) -> Option<FamilyKind> {
+    [
+        FamilyKind::Counter,
+        FamilyKind::Min,
+        FamilyKind::Max,
+        FamilyKind::Hll,
+        FamilyKind::BitOr,
+        FamilyKind::BitAnd,
+        FamilyKind::BitXor,
+        FamilyKind::MinF64,
+        FamilyKind::MaxF64,
+    ]
+    .into_iter()
+    .find(|&k| aggregate_operator(k) == Some(name))
+}
+
+/// The tags `kind`'s `kind_params` define (D298): none for every kind so far.
+pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
+    match kind {
+        FamilyKind::Standard
+        | FamilyKind::Counter
+        | FamilyKind::Min
+        | FamilyKind::Max
+        | FamilyKind::Hll
+        | FamilyKind::BitOr
+        | FamilyKind::BitAnd
+        | FamilyKind::BitXor
+        | FamilyKind::MinF64
+        | FamilyKind::MaxF64 => &[],
     }
 }
 
@@ -45,6 +93,11 @@ fn builtin_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
         FamilyKind::Min => Some(Arc::new(I64Min)),
         FamilyKind::Max => Some(Arc::new(I64Max)),
         FamilyKind::Hll => Some(Arc::new(HllUnion)),
+        FamilyKind::BitOr => Some(Arc::new(Bitwise::OR)),
+        FamilyKind::BitAnd => Some(Arc::new(Bitwise::AND)),
+        FamilyKind::BitXor => Some(Arc::new(Bitwise::XOR)),
+        FamilyKind::MinF64 => Some(Arc::new(F64Extreme::MIN)),
+        FamilyKind::MaxF64 => Some(Arc::new(F64Extreme::MAX)),
     }
 }
 
@@ -199,6 +252,22 @@ impl Catalog {
                     None => info.families.push(new),
                 }
                 let name = options.merge_operator.as_str();
+                // `kind_params` (D298), canonical since decode: a must-understand tag the kind
+                // doesn't define is a parameter of a later build (unsupported, not corrupt);
+                // skippable tags are hints this build ignores.
+                if !options.kind_params.is_empty() {
+                    let defined = kind_param_tags(options.kind);
+                    for (tag, _) in pigeonhole_format::kind_params::parse(&options.kind_params)? {
+                        if pigeonhole_format::kind_params::must_understand(tag)
+                            && !defined.contains(&tag)
+                        {
+                            return Err(Error::UnsupportedFeature(format!(
+                                "family {} of kind {:?}: parameter tag {tag}",
+                                family.0, options.kind
+                            )));
+                        }
+                    }
+                }
                 let (merge, merge_op) = if let Some(op) = builtin_operator(options.kind) {
                     // An aggregate family folds with its kind's operator (writes refuse any
                     // other name, `check_merge_operator`).
@@ -795,6 +864,33 @@ mod cow_tests {
             .iter()
             .map(|(k, l)| (*k, l.iter().map(|(lv, m)| (*lv, m.id)).collect()))
             .collect()
+    }
+
+    /// D298: a family whose `kind_params` holds a must-understand tag its kind doesn't define
+    /// is a later build's (unsupported, not corrupt); a skippable tag is ignored.
+    #[test]
+    fn an_unknown_must_understand_kind_param_is_unsupported() {
+        let put = |tag: u8| Edit::PutFamily {
+            table: TableId(1),
+            family: FamilyId(2),
+            name: "f".into(),
+            options: FamilyOptions::default()
+                .merge_operator(U64_OR)
+                .kind(FamilyKind::BitOr)
+                .kind_params(pigeonhole_format::kind_params::encode(&[(tag, &[7])])),
+        };
+        let mut c = Catalog::default();
+        let table = Edit::CreateTable {
+            table: TableId(1),
+            name: "t".into(),
+        };
+        c.apply(&table, 1).unwrap();
+        match c.apply(&put(1), 1) {
+            Err(Error::UnsupportedFeature(why)) => assert!(why.contains("tag 1"), "{why}"),
+            other => panic!("{other:?}"),
+        }
+        c.apply(&put(200), 1).unwrap();
+        assert!(c.family(FamilyId(2)).is_some_and(|f| f.merge_op.is_some()));
     }
 
     /// Random batches of edits (#499): the slot-level `removed_since` and

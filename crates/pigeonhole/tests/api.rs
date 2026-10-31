@@ -1224,6 +1224,126 @@ fn hll_families_estimate_distinct_inputs() {
     assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
 }
 
+/// D298: bitwise families fold `u64` inputs (`aggregate_u64`, read with `as_u64`) with OR,
+/// AND or XOR; `f64` families keep the smallest or largest `f64` (`aggregate_f64`, read with
+/// `as_f64`) by total order, never NaN; `incr` is refused, and each info names its kind.
+#[test]
+fn bitwise_and_f64_families() {
+    let db = db();
+    let t = db
+        .table("scalars")
+        .unwrap()
+        .family("or", Family::aggregate(Aggregation::BitOr))
+        .family("and", Family::aggregate(Aggregation::BitAnd))
+        .family("xor", Family::aggregate(Aggregation::BitXor))
+        .family("cold", Family::aggregate(Aggregation::MinF64))
+        .family("warm", Family::aggregate(Aggregation::MaxF64))
+        .create()
+        .unwrap();
+    let bits = |f: &str| t.get(b"r", f, b"q").unwrap().map(|c| c.as_u64().unwrap());
+    let float = |f: &str| t.get(b"r", f, b"q").unwrap().map(|c| c.as_f64().unwrap());
+    assert_eq!(bits("or"), None, "no input: absent");
+    for (b, x) in [(0b1100u64, 0.0), (0b1010, -0.0), (u64::MAX - 1, 2.5)] {
+        t.mutate(b"r")
+            .aggregate_u64("or", b"q", b)
+            .aggregate_u64("and", b"q", b)
+            .aggregate_u64("xor", b"q", b)
+            .aggregate_f64("cold", b"q", x)
+            .aggregate_f64("warm", b"q", x)
+            .commit()
+            .unwrap();
+    }
+    assert_eq!(bits("or"), Some(u64::MAX - 1));
+    assert_eq!(bits("and"), Some(0b1000));
+    assert_eq!(bits("xor"), Some(0b0110 ^ (u64::MAX - 1)));
+    // -0.0 orders below +0.0.
+    assert_eq!(float("cold").map(f64::to_bits), Some((-0.0f64).to_bits()));
+    assert_eq!(float("warm"), Some(2.5));
+    // A put sets the cell; later inputs combine with it. Batches, transactions, buckets.
+    t.mutate(b"r")
+        .put_f64("warm", b"q", f64::NEG_INFINITY)
+        .aggregate_f64("warm", b"q", -1.0)
+        .commit()
+        .unwrap();
+    assert_eq!(float("warm"), Some(-1.0));
+    let mut wb = db.write_batch();
+    wb.aggregate_u64(&t, b"r", "xor", b"q", 0b0110)
+        .aggregate_f64_at(&t, b"r", "cold", b"b", 10, 4.0)
+        .aggregate_f64_at(&t, b"r", "cold", b"b", 10, f64::INFINITY);
+    wb.commit().unwrap();
+    assert_eq!(bits("xor"), Some(u64::MAX - 1));
+    let cell = t.get(b"r", "cold", b"b").unwrap().unwrap();
+    assert_eq!((cell.timestamp(), cell.as_f64()), (10, Some(4.0)));
+    let mut txn = db.transaction().unwrap();
+    txn.aggregate_u64(&t, b"r", "and", b"q", 0).aggregate_f64(
+        &t,
+        b"r",
+        "cold",
+        b"q",
+        f64::NEG_INFINITY,
+    );
+    txn.commit().unwrap();
+    assert_eq!(bits("and"), Some(0));
+    // put_u64 sets a bitwise bucket.
+    t.mutate(b"r")
+        .put_u64("and", b"q", u64::MAX)
+        .aggregate_u64("and", b"q", 0xf0)
+        .commit()
+        .unwrap();
+    assert_eq!(bits("and"), Some(0xf0));
+    let mut wb = db.write_batch();
+    wb.put_u64_at(&t, b"r", "or", b"b", 5, 1 << 63);
+    wb.commit().unwrap();
+    let cell = t.get(b"r", "or", b"b").unwrap().unwrap();
+    assert_eq!((cell.timestamp(), cell.as_u64()), (5, Some(1 << 63)));
+    assert_eq!(float("cold"), Some(f64::NEG_INFINITY));
+    // Refused: incr, NaN, and the other numeric type.
+    let refused = |r: pigeonhole::Result<pigeonhole::CommitInfo>, what: &str| {
+        let err = r.unwrap_err();
+        assert_eq!(err.code(), ErrorCode::InvalidArgument, "{err}");
+        assert!(err.message().contains(what), "{err}");
+    };
+    refused(
+        t.mutate(b"r").incr("or", b"q", 1).commit(),
+        "is a bit_or family: write its inputs with aggregate_u64",
+    );
+    refused(
+        t.mutate(b"r").incr("warm", b"q", 1).commit(),
+        "is a max_f64 family: write its inputs with aggregate_f64",
+    );
+    refused(
+        t.mutate(b"r")
+            .aggregate_f64("cold", b"q", f64::NAN)
+            .commit(),
+        "never NaN",
+    );
+    refused(
+        t.mutate(b"r").put_f64("warm", b"q", f64::NAN).commit(),
+        "never NaN",
+    );
+    refused(t.mutate(b"r").aggregate("cold", b"q", 1).commit(), "f64");
+    refused(
+        t.mutate(b"r").aggregate_f64("xor", b"q", 1.0).commit(),
+        "aggregate_u64",
+    );
+    assert_eq!(
+        float("cold"),
+        Some(f64::NEG_INFINITY),
+        "nothing refused was written"
+    );
+    for (f, a) in [
+        ("or", Aggregation::BitOr),
+        ("and", Aggregation::BitAnd),
+        ("xor", Aggregation::BitXor),
+        ("cold", Aggregation::MinF64),
+        ("warm", Aggregation::MaxF64),
+    ] {
+        let info = t.family_info(f).unwrap();
+        assert_eq!(info.aggregation, Some(a), "{f}");
+        assert!(!info.counter && info.merge_operator.is_none(), "{f}");
+    }
+}
+
 /// A family that names `pigeonhole.i64_add` without being a counter family reads and writes
 /// as 0.1.0 created them (D41): increments at the commit timestamp, folded across
 /// timestamps, and bytes on top of a counter fail at read.

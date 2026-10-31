@@ -168,6 +168,42 @@ fn min_and_max_families() {
 }
 
 #[test]
+fn bitwise_and_f64_families() {
+    // D298: `create` takes the bitwise and f64 kinds; `aggregate` parses a u64 or an f64 by
+    // the family's kind; `incr` is refused there.
+    let dir = TempDir::new("shell-scalars");
+    let path = empty(&dir);
+    let (status, out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s o:bit_or a:bit_and x:bit_xor lo:min_f64 hi:max_f64",
+            "aggregate s r o:t 12",
+            "aggregate s r o:t 3",
+            "aggregate s r lo:t 2.5",
+            "aggregate s r lo:t -0.5",
+            "aggregate s r hi:t -0.5",
+            "aggregate s r hi:t 1e3",
+            "get s r o:t",
+            "get s r lo:t",
+            "get s r hi:t",
+            "\\schema s",
+            "incr s r x:t 1",
+        ],
+    );
+    assert_eq!(status, 1, "the incr is refused: {err}");
+    assert!(err.contains("write its inputs with aggregate_u64"), "{err}");
+    let docs = rows(&out);
+    assert_eq!(docs[7][0]["value"], serde_json::json!({"i64": 15}));
+    assert_eq!(docs[8][0]["value"], serde_json::json!({"f64": -0.5}));
+    assert_eq!(docs[9][0]["value"], serde_json::json!({"f64": 1000.0}));
+    let schema = serde_json::to_string(&docs[10]).unwrap();
+    for kind in ["bit_or", "bit_and", "bit_xor", "min_f64", "max_f64"] {
+        assert!(schema.contains(kind), "{kind}: {schema}");
+    }
+}
+
+#[test]
 fn meta_commands() {
     let dir = TempDir::new("shell-meta");
     let path = empty(&dir);

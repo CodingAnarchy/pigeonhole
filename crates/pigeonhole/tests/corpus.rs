@@ -204,9 +204,10 @@ fn entries() -> Vec<Entry> {
     ]
 }
 
-/// Min, max and HLL families (D294, the first `incompat` feature bit): inputs at the fixed
-/// timestamp and in buckets, puts, deletes and checkpointed reads, sparse and dense
-/// sketches; flushed, then more in the WAL that the crash leaves for replay.
+/// Min, max and HLL families (D294, the first `incompat` feature bit), and the bitwise and
+/// `f64` families (D298, the same bit): inputs at the fixed timestamp and in buckets, puts,
+/// deletes and checkpointed reads, sparse and dense sketches, signed zeros and infinities;
+/// flushed, then more in the WAL that the crash leaves for replay.
 fn write_aggregates(db: &Pigeonhole) {
     let t = db
         .table("aggregates")
@@ -214,6 +215,11 @@ fn write_aggregates(db: &Pigeonhole) {
         .family("lo", Family::aggregate(Aggregation::Min))
         .family("hi", Family::aggregate(Aggregation::Max).max_versions(3))
         .family("users", Family::aggregate(Aggregation::Hll))
+        .family("seen", Family::aggregate(Aggregation::BitOr))
+        .family("common", Family::aggregate(Aggregation::BitAnd))
+        .family("parity", Family::aggregate(Aggregation::BitXor))
+        .family("coldest", Family::aggregate(Aggregation::MinF64))
+        .family("warmest", Family::aggregate(Aggregation::MaxF64))
         .create()
         .unwrap();
     for i in 0..40u64 {
@@ -226,6 +232,23 @@ fn write_aggregates(db: &Pigeonhole) {
             .aggregate_at("lo", b"hourly", T0 + (i % 4) * 3_600_000_000, v)
             .aggregate_at("hi", b"hourly", T0 + (i % 4) * 3_600_000_000, v)
             .aggregate_at("users", b"hourly", T0 + (i % 4) * 3_600_000_000, v);
+        // Bits from a mixing constant; temperatures with signed zeros and infinities.
+        let bits = 0x9e37_79b9_7f4a_7c15u64.rotate_left(i as u32 * 5) | 1 << (i % 64);
+        let x = match i % 9 {
+            0 => -0.0,
+            1 => 0.0,
+            2 => f64::INFINITY,
+            3 => f64::NEG_INFINITY,
+            _ => v as f64 / 4.0,
+        };
+        m = m
+            .aggregate_u64("seen", b"all", bits)
+            .aggregate_u64("common", b"all", bits)
+            .aggregate_u64("parity", b"all", bits)
+            .aggregate_u64_at("parity", b"hourly", T0 + (i % 4) * 3_600_000_000, bits)
+            .aggregate_f64("coldest", b"all", x)
+            .aggregate_f64("warmest", b"all", x)
+            .aggregate_f64_at("warmest", b"hourly", T0 + (i % 4) * 3_600_000_000, x);
         // Row a00's distinct users pass the sparse/dense boundary; the others stay sparse.
         let users = if i % 6 == 0 { 400 } else { 3 };
         for u in 0..users {
@@ -237,6 +260,8 @@ fn write_aggregates(db: &Pigeonhole) {
                 t.mutate(b"a01")
                     .put_i64("lo", b"all", -1_000)
                     .put_i64("hi", b"all", 1_000)
+                    .put_i64("common", b"all", -1)
+                    .put_f64("coldest", b"all", 1.0e6)
                     .commit()
                     .unwrap();
             }
@@ -244,6 +269,8 @@ fn write_aggregates(db: &Pigeonhole) {
                 t.mutate(b"a02")
                     .delete_column("lo", b"all")
                     .delete_column("hi", b"all")
+                    .delete_column("parity", b"all")
+                    .delete_column("warmest", b"all")
                     .commit()
                     .unwrap();
                 // A read that folds what the flush below writes as a base.
