@@ -126,3 +126,88 @@ pub fn scratch_stages_report() {
         }
     }
 }
+
+// ---- outer stages (one Instant clock): bench op start, pigeonhole commit entry, engine ----
+pub const OUTER: [&str; 5] = [
+    "build (op start->pigeonhole commit)",
+    "pigeonhole pre-engine",
+    "engine (Instant)",
+    "post-engine (engine return->op end)",
+    "TOTAL op (bench)",
+];
+static H2: [[[AtomicU64; N]; 5]; 2] =
+    [const { [const { [const { AtomicU64::new(0) }; N] }; 5] }; 2];
+static BASE: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+fn inow() -> u64 {
+    BASE.get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_nanos() as u64
+}
+type Last = Option<(bool, u64, u64, [u64; 7], [u64; 2], u64)>;
+thread_local! {
+    /// [op start, pigeonhole commit entry, engine entry, engine return].
+    static O: std::cell::Cell<[u64; 4]> = const { std::cell::Cell::new([0; 4]) };
+    static LAST: std::cell::Cell<Last> = const { std::cell::Cell::new(None) };
+}
+pub fn scratch_op_start() {
+    LAST.with(|l| l.set(None));
+    O.with(|o| o.set([inow(), 0, 0, 0]));
+}
+pub fn scratch_mark_commit() {
+    O.with(|o| {
+        let mut v = o.get();
+        v[1] = inow();
+        o.set(v)
+    });
+}
+pub(crate) fn engine_mark(i: usize) {
+    O.with(|o| {
+        let mut v = o.get();
+        v[i] = inow();
+        o.set(v)
+    });
+}
+pub(crate) fn stash(asleep: bool, t0: u64, sent: u64, s: [u64; 7], c: [u64; 2], ret: u64) {
+    LAST.with(|l| l.set(Some((asleep, t0, sent, s, c, ret))));
+}
+pub fn scratch_op_end() {
+    let Some((asleep, t0, sent, s, c, ret)) = LAST.with(|l| l.take()) else {
+        return;
+    };
+    if !ON.load(Ordering::Relaxed) || s[6] == 0 {
+        return;
+    }
+    record(asleep, t0, sent, s, c, ret);
+    let o = O.with(|o| o.get());
+    let end = inow();
+    if o[0] == 0 || o[1] == 0 || o[2] == 0 || o[3] == 0 {
+        return;
+    }
+    let d = |a: u64, b: u64| b.saturating_sub(a);
+    let v = [
+        d(o[0], o[1]),
+        d(o[1], o[2]),
+        d(o[2], o[3]),
+        d(o[3], end),
+        d(o[0], end),
+    ];
+    for (i, x) in v.iter().enumerate() {
+        H2[usize::from(asleep)][i][bucket(*x)].fetch_add(1, Ordering::Relaxed);
+    }
+}
+pub fn scratch_outer_report() {
+    for (k, name) in ["awake", "asleep"].iter().enumerate() {
+        for (i, st) in OUTER.iter().enumerate() {
+            let h: Vec<u64> = (0..N)
+                .map(|b| H2[k][i][b].load(Ordering::Relaxed))
+                .collect();
+            eprintln!(
+                "SCRATCH-OUTER {name} | {st:38} | p50 {:8.2} | p90 {:8.2} | p99 {:8.2} | p999 {:8.2}",
+                pct(&h, 0.5),
+                pct(&h, 0.9),
+                pct(&h, 0.99),
+                pct(&h, 0.999)
+            );
+        }
+    }
+}

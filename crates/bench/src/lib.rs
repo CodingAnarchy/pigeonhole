@@ -1586,7 +1586,9 @@ fn pass(
             if deadline.is_some_and(|d| t >= d) {
                 break;
             }
+            pigeonhole_engine::scratch_op_start();
             exec(op)?;
+            pigeonhole_engine::scratch_op_end();
             if record {
                 let latency = t.elapsed();
                 hist.record(latency);

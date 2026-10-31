@@ -4483,6 +4483,7 @@ impl Inner {
         batch: WriteBatch,
         durability: Option<Durability>,
     ) -> Result<CommitInfo> {
+        crate::scratch_stages::engine_mark(2);
         let vfs = &self.shared.vfs;
         let t0 = vfs.monotonic_nanos();
         pigeonhole_runtime::scratch_take_woke();
@@ -4498,7 +4499,8 @@ impl Inner {
         let ret = vfs.monotonic_nanos();
         let s = crate::scratch_stages::SETTLED.with(|c| c.replace([0; 7]));
         let c = crate::scratch_stages::CLIENT.with(|c| c.replace([0; 2]));
-        crate::scratch_stages::record(asleep, t0, sent, s, c, ret);
+        crate::scratch_stages::stash(asleep, t0, sent, s, c, ret);
+        crate::scratch_stages::engine_mark(3);
         r
     }
 

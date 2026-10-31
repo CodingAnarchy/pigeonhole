@@ -895,6 +895,7 @@ impl RowMutation<'_> {
 
     /// Commits.
     pub fn commit(self) -> Result<CommitInfo> {
+        pigeonhole_engine::scratch_mark_commit();
         let RowMutation {
             table,
             builder,

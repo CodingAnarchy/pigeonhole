@@ -1011,6 +1011,7 @@ impl Runner for PigeonholeRunner {
             "end" => {
                 pigeonhole_engine::scratch_stages_record(false);
                 pigeonhole_engine::scratch_stages_report();
+                pigeonhole_engine::scratch_outer_report();
             }
             _ => {}
         }
