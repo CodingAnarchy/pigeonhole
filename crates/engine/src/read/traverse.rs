@@ -618,11 +618,11 @@ impl PendingTraversal {
                         ..
                     } = hop;
                     let row = frontier.get(i);
-                    let before = budget;
                     let filter = self.filter.as_ref();
-                    let ended =
-                        cursor.counted(|c| read_key(c, row, visitor, reducer, filter, &mut budget));
-                    self.out.stats.edges += u64::from(before - budget);
+                    let edges = &mut self.out.stats.edges;
+                    let ended = cursor.counted(|c| {
+                        read_key(c, row, (visitor, reducer), filter, &mut budget, edges)
+                    });
                     match ended {
                         Ok(KeyEnd::Done) => {
                             hop.key = None;
@@ -656,14 +656,15 @@ impl PendingTraversal {
 }
 
 /// Runs the visitor and reducer over the current key's cells, within `budget` cells: those
-/// `filter` drops count too, and never reach the visitor (nor its per-node count).
+/// `filter` drops count toward it too, but never reach the visitor (nor its per-node count)
+/// nor `edges`, which counts the edges the selection keeps, as the sync path does.
 fn read_key(
     c: &mut KeyCursor,
     row: &[u8],
-    visitor: &mut EdgeVisitor,
-    reducer: &mut DedupeLimit,
+    (visitor, reducer): (&mut EdgeVisitor, &mut DedupeLimit),
     filter: Option<&(ValuePredicate, Arc<crate::snapshot::SstSet>)>,
     budget: &mut u32,
+    edges: &mut u64,
 ) -> Result<KeyEnd> {
     loop {
         if *budget == 0 {
@@ -682,6 +683,7 @@ fn read_key(
                 continue;
             }
         }
+        *edges += 1;
         let cref = CellRef {
             row,
             family_rank: 0,
