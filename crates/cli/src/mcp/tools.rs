@@ -571,7 +571,7 @@ fn write_op(
         "incr" => {
             op.only(&["op", "table", "row", "family", "qualifier", "value", "ts"])?;
             let (f, q) = column()?;
-            if !matches!(family_kind(t, f)?, Some(Aggregation::Sum)) {
+            if !is_counter(t, f)? {
                 return Err(usage(format!(
                     "incr adds to a counter (sum) family, and {f} is not one: use put for a \
                      plain family, aggregate for another aggregate family (list_tables shows \
@@ -638,6 +638,19 @@ fn family_kind(t: &Table, family: &str) -> Result<Option<Aggregation>, Failure> 
         None => Err(Failure::family_not_found(t.name(), family)),
     }
 }
+
+/// Whether `incr` adds to `family`: a counter (`sum`) family, or a standard family that
+/// names the built-in `i64` add operator, as 0.1.0 made counters (D41).
+fn is_counter(t: &Table, family: &str) -> Result<bool, Failure> {
+    let info = t
+        .family_info(family)
+        .ok_or_else(|| Failure::family_not_found(t.name(), family))?;
+    Ok(matches!(info.aggregation, Some(Aggregation::Sum))
+        || info.merge_operator.as_deref() == Some(I64_ADD))
+}
+
+/// D41's counter operator.
+const I64_ADD: &str = "pigeonhole.i64_add";
 
 /// An aggregate family's input.
 enum Input {
