@@ -295,6 +295,32 @@ fn find_zero_words(b: &[u8]) -> Option<usize> {
     rest.iter().position(|&c| c == 0).map(|i| at + i)
 }
 
+/// The index of the first `0x00` among eight bytes, if any: the lowest flagged byte is the
+/// first zero (a flag above a zero may be false).
+#[inline(always)]
+fn zero_in_word(c: [u8; 8]) -> Option<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let w = u64::from_le_bytes(c);
+    let z = w.wrapping_sub(ONES) & !w & HIGHS;
+    (z != 0).then(|| (z.trailing_zeros() / 8) as usize)
+}
+
+/// The index of the first `0x00` in `b`, eight bytes per step and then the last few one at a
+/// time, all inline and without a call. [`decode_key`] searches a whole key body with it, where
+/// the row's terminator is usually in the first or second word (#1167).
+#[inline(always)]
+fn find_zero_inline(b: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(c) = b[i..].first_chunk::<8>() {
+        if let Some(z) = zero_in_word(*c) {
+            return Some(i + z);
+        }
+        i += 8;
+    }
+    b[i..].iter().position(|&c| c == 0).map(|z| i + z)
+}
+
 /// [`Escaped::unescape_into`] for a long part: the runs between escapes copied whole. Out of
 /// line, so the short path inlines as small as it was.
 #[inline(never)]
@@ -340,10 +366,23 @@ pub struct KeyParts<'a> {
 /// terminator follows it) and its unescaped length, or `Corrupt` if a `0x00` is followed by
 /// anything other than `0xFF` or the terminator.
 fn scan_escaped(b: &[u8]) -> crate::Result<(usize, usize)> {
+    scan_escaped_with(b, |rest| rest.iter().position(|&c| c == 0))
+}
+
+/// [`scan_escaped`] with the zero search `find`. [`row_prefix_len`] and [`decode_key_in_row`]
+/// keep the byte loop: they inline into the read path's and the resolver's per-cell loops, and
+/// any larger or out-of-line search there cost the short-key shapes about 5 instructions a
+/// cell in callgrind, even where it rarely ran (#1150, #1165, #1167). [`decode_key`], out of
+/// line, searches eight bytes per step ([`find_zero_inline`]).
+#[inline(always)]
+fn scan_escaped_with(
+    b: &[u8],
+    find: impl Fn(&[u8]) -> Option<usize>,
+) -> crate::Result<(usize, usize)> {
     let mut i = 0;
     let mut raw = 0;
     loop {
-        let Some(z) = b[i..].iter().position(|&c| c == 0) else {
+        let Some(z) = find(&b[i..]) else {
             return Err(Error::Corrupt {
                 what: "key: missing terminator",
             });
@@ -368,12 +407,12 @@ fn scan_escaped(b: &[u8]) -> crate::Result<(usize, usize)> {
 /// Decodes an internal key. Never panics, whatever the input.
 pub fn decode_key(key: &[u8]) -> crate::Result<KeyParts<'_>> {
     let (body, ts, seqno, kind) = split_suffix(key)?;
-    let (row_len, row_raw) = scan_escaped(body)?;
+    let (row_len, row_raw) = scan_escaped_with(body, find_zero_inline)?;
     let rest = &body[row_len + 2..];
     let qualifier = if rest == MARKER_QUALIFIER {
         None
     } else {
-        let (q_len, q_raw) = scan_escaped(rest)?;
+        let (q_len, q_raw) = scan_escaped_with(rest, find_zero_inline)?;
         if q_len + 2 != rest.len() {
             return Err(Error::Corrupt {
                 what: "key: trailing bytes",
@@ -547,5 +586,35 @@ impl<'a> Escaped<'a> {
             }
             Some(b)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::find_zero_inline;
+
+    #[test]
+    fn the_word_search_finds_the_first_zero_wherever_it_is() {
+        // Every length up to three words, the zero at every position or absent, around bytes
+        // the word test can falsely flag (0x01 and 0x80 above a zero, as in a terminator).
+        for len in 0..=24 {
+            for zero in (0..len).map(Some).chain([None]) {
+                for fill in [0x01u8, 0x80, 0xFF, b'q'] {
+                    let mut b = vec![fill; len];
+                    if let Some(z) = zero {
+                        b[z] = 0;
+                        if z + 1 < len {
+                            b[z + 1] = 0x01;
+                        }
+                    }
+                    let want = b.iter().position(|&c| c == 0);
+                    assert_eq!(
+                        find_zero_inline(&b),
+                        want,
+                        "len {len}, zero {zero:?}, fill {fill:#x}"
+                    );
+                }
+            }
+        }
     }
 }
