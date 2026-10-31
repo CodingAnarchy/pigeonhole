@@ -1,0 +1,2 @@
+### Added
+- Traversal pushdown (D304): `Table::traverse(&KeySet)` runs a breadth-first traversal over adjacency rows (one column per edge, the qualifier naming the destination row) inside the engine, under one snapshot. Each hop keeps every node not visited before once, with optional parents. `per_node_limit` caps a hub by seeking past the rest of its row, `hop_limit` keeps the first nodes in key order, and `max_nodes` (10,000,000 by default) bounds the visited set. Edges can be filtered by qualifier, time and value, and a hop can fan out over tablets with `parallel(n)`.
