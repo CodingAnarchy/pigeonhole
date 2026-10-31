@@ -3509,3 +3509,22 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Checks.**
 - `it/snapshot_room.rs`: 8 snapshots held across 8 flushes on a 64-slot shard, then 4 more rounds of writes to every slot. It fails on the old geometry at round 2 with the write-stall timeout.
 - Tests that hard-coded the old geometry keep their intent: `milestone_b` (no freeze), `api` (a batch larger than the whole arena), `read_only_fallback` (nothing flushed before the crash), and `pigeonhole`'s `processes` (a reader process's held snapshot gets room for its 3,510 rows).
+
+<a id="d303"></a>
+## D303 — Typed vector families: element, dimension and metric fixed per family, values under tag `0x04` (cli692, 2026-10-31; owner accepted revision 2, #490 c6537204287, c6542621844, c6542686802; reviewed by perf287 and perf2; format, engine, pigeonhole, #490 B, ICR 0098; under D294's `incompat` bit 0; uses D298's `kind_params`)
+**Why.** Embeddings stored as `Bytes` carry no shape: nothing checks a vector's length or components, a search has to guess the layout, and a NaN or a zero vector under cosine gives distances with no order. D296's KNN (#490 A, C) needs every stored vector to have a finite, ordered distance to every valid query.
+
+**Decided.**
+- **`FamilyKind::Vector = 16`.** Its `kind_params` (FORMAT §9.2.1) carry tag 1, the element (1 `f32`, 2 `i8`, 3 bit); tag 2, the dimension (u32 LE, 1–4096, a multiple of 8 for bit); tag 3, the metric (1 L2, 2 inner product, 3 cosine, 4 Hamming). All three are required, and the encoding is canonical. L2, inner product and cosine take `f32` or `i8`; Hamming takes bit, and bit takes only Hamming. One parse, `pigeonhole_format::vector::Params::parse`, serves catalog decode (`Corruption`) and creation (`InvalidArgument`). Skippable tags (128 and up) stay free for later hints.
+- **Value tag `0x04`** (FORMAT §3.7): element, `dim` varint, then the payload (`f32` LE, `i8`, or bits LSB first), with no alignment padding. A malformed value, an unknown element included, is `Corrupt`: a new element would take a new `incompat` bit. At most 16 KiB plus 4 bytes.
+- **Not an aggregate.** `FamilyKind::is_aggregate()` is an explicit list without `Vector`, so a vector family's cells take the commit timestamp, keep their versions (`max_versions`) and delete as a Standard family's.
+- **Never separated.** `Vector` is in `FamilyKind::values_stay_inline()`: typed values, bounded, read in place by D296's visitor.
+- **Feature bit:** the kind and tag `0x04` fall under `incompat` bit 0 with the 1.1.0 aggregate kinds; a vector family's creation sets it, and `0x04` is only ever written into a vector family.
+- **Writes (PR 2):** only `put_vector_f32`, `put_vector_i8` and `put_vector_bits` (and `_at` forms) into a vector family, of its element and dimension, refused when the write is built otherwise; no merge operator and no other value. NaN, ±∞ and (cosine) all-zero vectors are refused, as is an all-zero cosine query.
+- **Reads:** `Value::Vector`/`VectorRef` (PR 2); the typed `nearest_f32`, `nearest_i8` and `nearest_bits` with D296 PR 4. `i8` is raw signed bytes: the application quantises.
+- **PRs:** 1, the format, with the engine refusing a vector family (`Unsupported`) and a vector value in any batch until 2, the engine and public API; 3, the Arrow and `phdb` mappings.
+
+**Checks (PR 1).**
+- `vector.rs`: every valid configuration round-trips; each bad range, pairing and tag is refused; values decode strictly (short, long, zero dim, bit dim, overlong varint, empty, unknown element, 4,097 dims).
+- Golden siblings `values_vector.bin` and `edit_put_family_vector.bin`, frozen; the roundtrip proptest over element and dim; the fuzz harness behind a forced `0x04` and through `Params::parse`.
+- `it/vector_family.rs`: eight malformed parameter lists are `InvalidArgument`, a well-formed family is `Unsupported` with nothing created, and a vector put or merge into a Standard family is refused (perf287's B1).

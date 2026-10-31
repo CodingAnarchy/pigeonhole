@@ -317,6 +317,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D300](phase-3.md#d300) — A group's hold (`pending[shard] = min(watermark, first)`) is stored under the allocator's lock before the `NEXT_SEQNO` mirror passes it, replacing FORMAT §11.3's step-1 bound read from the mirror, which could land below a visible seqno and move snapshots back (#1208) · coordinator decision, shm, engine · amends D271's reservation protocol
 - [D301](phase-3.md#d301) — A shard that refused PREPAREs for room and whose room wait reaches #70's frozen-and-idle condition tells their coordinators `RoomGone`, and the retries fail `Busy` instead of waiting for a timeout a frozen clock never reaches (#1205, seed 183); moving clocks unchanged · coordinator decision, engine · amends D245
 - [D302](phase-3.md#d302) — Arenas are cut into 1024 chunks (64 KiB at the default budget), 16 per slot, so snapshots held across flushes leave room for writes; `max_slots` stays 64; the many-idle-slot flush cost is accepted (#1228); no minimum chunk size beyond 1 KiB · engine, #1212, #1219 · owner decision · amends D136, D189
+- [D303](phase-3.md#d303) — Typed vector families: `FamilyKind::Vector` (16) fixes each value's element (`f32`, `i8`, bit), dimension (1–4096) and metric (L2, inner product, cosine, Hamming) in `kind_params`; values are tag `0x04`, inline, versioned as a Standard family's; NaN, ±∞ and cosine zero vectors refused; PR 1 lands the format · cli692, #490 B, ICR 0098 · under D294's `incompat` bit 0, uses D298's `kind_params`
 
 ## Open questions
 _None._
