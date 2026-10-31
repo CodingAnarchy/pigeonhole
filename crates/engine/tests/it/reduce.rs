@@ -945,7 +945,7 @@ fn a_read_resumes_after_each_column_of_a_row_for_ranges_and_keys() {
 }
 
 #[test]
-fn a_resume_position_from_another_table_or_an_unselected_family_is_refused() {
+fn a_resume_from_another_table_an_unselected_family_or_an_excluded_row_is_refused() {
     let db = setup(4917);
     let snap = db.engine.snapshot().unwrap();
     let cells = scan_cells(
@@ -965,6 +965,23 @@ fn a_resume_position_from_another_table_or_an_unselected_family_is_refused() {
     spec.resume = Some((
         row(0),
         pigeonhole_engine::ColumnPosition::new(db.table, g, b"x".to_vec()),
+    ));
+    let e = db
+        .engine
+        .reduce(&snap, db.table, &spec, || Every, All::default)
+        .unwrap_err();
+    assert!(
+        matches!(e, pigeonhole_engine::Error::InvalidArgument(_)),
+        "{e:?}"
+    );
+    // A range that excludes the resumed row by its start would skip it whole (N1).
+    let mut spec = ReduceSpec::new(ReadInput::Ranges(vec![(
+        Bound::Excluded(row(0)),
+        Bound::Unbounded,
+    )]));
+    spec.resume = Some((
+        row(0),
+        pigeonhole_engine::ColumnPosition::new(db.table, f, b"a".to_vec()),
     ));
     let e = db
         .engine

@@ -207,7 +207,9 @@ pub struct ReduceSpec {
     /// column: families the read selects before the position's skip the row, the
     /// position's family starts past the column (all its versions), and later families
     /// start at the selection's own bound. Other rows are read as usual. A position from
-    /// another table, or whose family the read doesn't select, is `InvalidArgument`.
+    /// another table, or whose family the read doesn't select, is `InvalidArgument`; so is
+    /// one whose row a range excludes by its start (`Bound::Excluded(row)`): the row would be
+    /// skipped whole, so a range resumed in a row starts at `Bound::Included(row)`.
     pub resume: Option<(Vec<u8>, ColumnPosition)>,
 }
 
@@ -804,6 +806,18 @@ where
         .as_ref()
         .map(|r| Resume::new(table, families, r))
         .transpose()?;
+    // perf287's N1 on #1264: an excluded start skips its row before the resume could apply.
+    if let (Some((row, _)), ReadInput::Ranges(ranges)) = (&spec.resume, &spec.input)
+        && ranges
+            .iter()
+            .any(|(start, _)| matches!(start, Bound::Excluded(s) if s == row))
+    {
+        return Err(Error::InvalidArgument(
+            "a resume in a row that a range's excluded start skips: start the range at the \
+             row, included"
+                .to_owned(),
+        ));
+    }
     let groups = work(snapshot, table, &spec.input)?;
     let abort = AtomicBool::new(false);
     let ctx = Ctx {
