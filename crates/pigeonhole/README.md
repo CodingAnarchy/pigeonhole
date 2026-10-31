@@ -39,7 +39,7 @@ cargo add pigeonhole
 or `pigeonhole = "1"` in `Cargo.toml`. Requires Rust 1.96 (2024 edition). API docs are on
 [docs.rs](https://docs.rs/pigeonhole). See the
 [changelog](https://github.com/CodingAnarchy/pigeonhole/blob/main/CHANGELOG.md) and the
-[1.0.0 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.0).
+[1.0.1 release](https://github.com/CodingAnarchy/pigeonhole/releases/tag/v1.0.1).
 
 ## Quickstart
 
