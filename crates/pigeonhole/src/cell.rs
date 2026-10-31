@@ -71,6 +71,20 @@ fn quantiles_count(data: &CellData) -> Option<u64> {
     }
 }
 
+fn bloom_contains(data: &CellData, h: u64) -> Option<bool> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::bloom::contains(b, h).ok(),
+        _ => None,
+    }
+}
+
+fn bloom_fill(data: &CellData) -> Option<f64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::bloom::fill(b).ok(),
+        _ => None,
+    }
+}
+
 fn sum_f64(data: &CellData) -> Option<f64> {
     match data.value() {
         ValueRef::Bytes(b) => pigeonhole_format::exact::sum_read(b).ok(),
@@ -241,6 +255,25 @@ impl<'a> CellRef<'a> {
         quantiles_count(&self.data)
     }
 
+    /// Whether a bloom filter ([`Aggregation::Bloom`](crate::Aggregation::Bloom), D298) may
+    /// hold the `i64` element `v`: `Some(false)` means certainly not. `None` unless the value
+    /// is a well-formed filter.
+    pub fn bloom_contains(&self, v: i64) -> Option<bool> {
+        bloom_contains(&self.data, pigeonhole_format::hll::hash_i64(v))
+    }
+
+    /// [`bloom_contains`](Self::bloom_contains) for a bytes element, as
+    /// [`aggregate_bytes`](crate::RowMutation::aggregate_bytes) writes one.
+    pub fn bloom_contains_bytes(&self, v: &[u8]) -> Option<bool> {
+        bloom_contains(&self.data, pigeonhole_format::hll::hash_bytes(v))
+    }
+
+    /// The fraction of a bloom filter's bits set: its false-positive rate is about this to
+    /// the power of its hashes.
+    pub fn bloom_fill(&self) -> Option<f64> {
+        bloom_fill(&self.data)
+    }
+
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
     /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
     /// error. The value's shape decides, not its family: `None` unless it is a well-formed
@@ -341,6 +374,25 @@ impl Cell {
     /// The number of inputs a quantile sketch holds.
     pub fn quantiles_count(&self) -> Option<u64> {
         quantiles_count(&self.data)
+    }
+
+    /// Whether a bloom filter ([`Aggregation::Bloom`](crate::Aggregation::Bloom), D298) may
+    /// hold the `i64` element `v`: `Some(false)` means certainly not. `None` unless the value
+    /// is a well-formed filter.
+    pub fn bloom_contains(&self, v: i64) -> Option<bool> {
+        bloom_contains(&self.data, pigeonhole_format::hll::hash_i64(v))
+    }
+
+    /// [`bloom_contains`](Self::bloom_contains) for a bytes element, as
+    /// [`aggregate_bytes`](crate::RowMutation::aggregate_bytes) writes one.
+    pub fn bloom_contains_bytes(&self, v: &[u8]) -> Option<bool> {
+        bloom_contains(&self.data, pigeonhole_format::hll::hash_bytes(v))
+    }
+
+    /// The fraction of a bloom filter's bits set: its false-positive rate is about this to
+    /// the power of its hashes.
+    pub fn bloom_fill(&self) -> Option<f64> {
+        bloom_fill(&self.data)
     }
 
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's

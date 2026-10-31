@@ -259,6 +259,33 @@ fn histogram_and_quantile_families() {
 }
 
 #[test]
+fn bloom_families() {
+    // D298 PR 4: `create` takes `:bloom=bits,hashes`; `aggregate` takes an integer as an
+    // i64 element and any other word as a bytes element; the schema names the parameters.
+    let dir = TempDir::new("shell-bloom");
+    let path = empty(&dir);
+    let (status, out, err) = shell(
+        &path,
+        "json",
+        &[
+            "create s b:bloom=1024,3 u:hll",
+            "aggregate s r b:t 42",
+            "aggregate s r b:t alice",
+            "aggregate s r u:t bob",
+            "\\schema s",
+            "create bad b:bloom=1000,3",
+        ],
+    );
+    assert_eq!(status, 1, "the bad bits are refused: {err}");
+    assert!(err.contains("power of two"), "{err}");
+    let docs = rows(&out);
+    let schema = serde_json::to_string(&docs[4]).unwrap();
+    for want in ["bloom", "\"bits\":1024", "\"hashes\":3"] {
+        assert!(schema.contains(want), "{want}: {schema}");
+    }
+}
+
+#[test]
 fn meta_commands() {
     let dir = TempDir::new("shell-meta");
     let path = empty(&dir);

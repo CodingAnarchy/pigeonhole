@@ -164,17 +164,18 @@ pub fn families() -> Vec<ModelFamily> {
         // more stall a one-shard run with tablet changes off (#1212). PR 2's exact sum and
         // mean-variance families took `bor`'s and `fmin`'s places; PR 3's histogram and
         // quantile families take `sum`'s and `band`'s (the counter kind runs in `counters`,
-        // and XOR covers the bitwise operator's code). They all join `counters` once #1212
+        // and XOR covers the bitwise operator's code); PR 4's bloom family takes `fsum`'s
+        // (mean/variance runs the same exact-sum code). They all join `counters` once #1212
         // is fixed (#1214, #1219).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
             f("bxor_ttl", 0, 40, false),
             f("fmax_ttl", 0, 40, false),
-            f("fsum", 2, 0, false),
             f("fmv_ttl", 0, 40, false),
             f("fhist", 2, 0, false),
             f("fq_ttl", 0, 40, false),
+            f("bloom", 2, 0, false),
         ]
     } else {
         vec![
@@ -305,6 +306,7 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::MeanVar) => "pigeonhole.f64_mean_var",
             (true, ModelAggregation::Histogram) => "pigeonhole.f64_histogram",
             (true, ModelAggregation::Quantiles) => "pigeonhole.f64_quantiles",
+            (true, ModelAggregation::Bloom) => "pigeonhole.bloom",
             (false, _) if f.i64_add => "pigeonhole.i64_add",
             (false, _) => "",
         })
@@ -323,6 +325,7 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::MeanVar) => FamilyKind::MeanVar,
             (true, ModelAggregation::Histogram) => FamilyKind::Histogram,
             (true, ModelAggregation::Quantiles) => FamilyKind::Quantiles,
+            (true, ModelAggregation::Bloom) => FamilyKind::Bloom,
         })
         // The model's fixed parameters (D298).
         .kind_params(match (f.counter, f.aggregation) {
@@ -332,6 +335,11 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Quantiles) => pigeonhole_format::buckets::QuantileParams {
                 mantissa_bits: pigeonhole_sim::MODEL_QUANTILE_BITS,
                 max_buckets: pigeonhole_sim::MODEL_QUANTILE_MAX,
+            }
+            .encode(),
+            (true, ModelAggregation::Bloom) => pigeonhole_format::bloom::BloomParams {
+                log2_bits: pigeonhole_sim::MODEL_BLOOM_LOG2_BITS,
+                hashes: pigeonhole_sim::MODEL_BLOOM_HASHES,
             }
             .encode(),
             _ => Vec::new(),
@@ -1107,7 +1115,12 @@ fn put_value(family: &str, value: &[u8], combined: Option<&Vec<i64>>) -> Vec<u8>
 /// an exact `f64` family, once it combined later inputs, their state (D298).
 fn incr_bytes(family: &str, delta: i64, combined: Option<&Vec<i64>>) -> Vec<u8> {
     let elements = || std::iter::once(delta).chain(combined.into_iter().flatten().copied());
-    if is_hll(family) || (is_state(family) && combined.is_some_and(|c| !c.is_empty())) {
+    // An HLL or bloom input is logged as its one-element state, combined or not.
+    let element = matches!(
+        aggregation_of_name(family),
+        Some(ModelAggregation::Hll | ModelAggregation::Bloom)
+    );
+    if element || (is_state(family) && combined.is_some_and(|c| !c.is_empty())) {
         state_of(family, None, elements())
     } else {
         delta.to_le_bytes().to_vec()

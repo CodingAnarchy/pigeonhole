@@ -180,6 +180,42 @@ fn a_put_sets_the_bucket_and_later_inputs_fold_onto_it() {
 }
 
 #[test]
+fn a_lone_f64_put_at_a_bucket_is_stored_as_its_state() {
+    // An `f64` put alone in its commit, at an explicit timestamp, still becomes the state of
+    // its one input before the WAL, as at the fixed timestamp: a read, a flush and a reopen
+    // all see a state, never the raw `f64` (found with D298 PR 4's bloom inputs).
+    let vfs = SimVfs::new(5);
+    let r = Rig::open(&vfs, 128);
+    r.commit(|wb| {
+        wb.put(r.t, r.sum, b"b", b"q", Some(3_600), ValueRef::F64(2.5))
+            .unwrap();
+    })
+    .unwrap();
+    r.commit(|wb| {
+        wb.put(r.t, r.mv, b"b", b"q", Some(3_600), ValueRef::F64(2.5))
+            .unwrap();
+    })
+    .unwrap();
+    let at = |f: FamilyId| {
+        let snap = r.db.snapshot().unwrap();
+        let c =
+            r.db.get(&snap, r.t, f, b"b", b"q")
+                .unwrap()
+                .expect("the bucket");
+        assert_eq!(c.timestamp(), 3_600);
+        match c.value() {
+            ValueRef::Bytes(b) => b.to_vec(),
+            v => panic!("not a state: {v:?}"),
+        }
+    };
+    assert_eq!(at(r.sum), sum_of(&[2.5]));
+    assert_eq!(at(r.mv), mean_var_of(&[2.5]));
+    r.db.flush().unwrap();
+    assert_eq!(at(r.sum), sum_of(&[2.5]));
+    r.db.close().unwrap();
+}
+
+#[test]
 fn only_finite_f64s_and_well_formed_states_are_taken() {
     let vfs = SimVfs::new(3);
     let r = Rig::open(&vfs, 128);

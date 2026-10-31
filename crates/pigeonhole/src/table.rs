@@ -167,6 +167,8 @@ pub(crate) enum Operand {
     U64,
     /// `aggregate_f64`: an input to an `f64` family (D298).
     F64,
+    /// `aggregate_bytes`: a bytes element for an HLL or bloom family (D298).
+    Bytes,
 }
 
 /// What every table handle shares: the database and the catalog entry it was opened with.
@@ -265,6 +267,7 @@ impl TableCore {
                     )
             }
             Operand::U64 => matches!(kind, K::BitOr | K::BitAnd | K::BitXor),
+            Operand::Bytes => matches!(kind, K::Hll | K::Bloom),
             Operand::F64 => matches!(
                 kind,
                 K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar | K::Histogram | K::Quantiles
@@ -278,6 +281,7 @@ impl TableCore {
             Operand::Aggregate => "aggregate",
             Operand::U64 => "aggregate_u64",
             Operand::F64 => "aggregate_f64",
+            Operand::Bytes => "aggregate_bytes",
         };
         let (what, method) = match kind {
             K::Standard => {
@@ -303,6 +307,7 @@ impl TableCore {
             K::MeanVar => ("a mean_var", "aggregate_f64"),
             K::Histogram => ("a histogram", "aggregate_f64"),
             K::Quantiles => ("a quantiles", "aggregate_f64"),
+            K::Bloom => ("a bloom", "aggregate or aggregate_bytes"),
         };
         Err(Error::new(
             ErrorCode::InvalidArgument,

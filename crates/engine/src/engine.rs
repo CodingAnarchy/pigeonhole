@@ -3812,7 +3812,10 @@ impl Inner {
         // many counter puts and operands there are (two may combine, #295).
         let mut fixed_ts = false;
         let mut counter_writes = 0usize;
-        let mut hll_inputs = false;
+        // Whether a write must be rewritten before the WAL: an HLL or bloom input (an element,
+        // written as its one-element state; D294, D298), or an `f64` put into a state kind
+        // (the state of that one input, D298), whatever its timestamp.
+        let mut converts = false;
         // The shard of the last row routed: a batch's writes to one row route once.
         let mut last: Option<(TableId, &[u8], ShardId)> = None;
         for m in batch.batch().iter() {
@@ -3829,8 +3832,17 @@ impl Inner {
             if meta.options.kind.is_aggregate() {
                 fixed_ts |= check_counter_write(&m, meta, catalog)?;
                 counter_writes += usize::from(matches!(m.kind, Kind::Put | Kind::Merge));
-                // An HLL input is an element, written as its one-register sketch (D294).
-                hll_inputs |= meta.options.kind == FamilyKind::Hll && m.kind == Kind::Merge;
+                converts |= match (meta.options.kind, m.kind) {
+                    (FamilyKind::Hll | FamilyKind::Bloom, Kind::Merge) => true,
+                    (
+                        FamilyKind::SumF64
+                        | FamilyKind::MeanVar
+                        | FamilyKind::Histogram
+                        | FamilyKind::Quantiles,
+                        Kind::Put,
+                    ) => m.value.first() == Some(&(ValueTag::F64 as u8)),
+                    _ => false,
+                };
             } else if m.kind == Kind::Merge && m.ts.is_some() {
                 return Err(Error::InvalidArgument(format!(
                     "{} is not a counter family: only a counter family takes increments at a \
@@ -3870,7 +3882,7 @@ impl Inner {
                 shards.push(shard);
             }
         }
-        if fixed_ts || counter_writes > 1 || hll_inputs {
+        if fixed_ts || counter_writes > 1 || converts {
             return Ok((prepare_counter_writes(&batch.builder, catalog)?, shards));
         }
         Ok((batch.builder, shards))
@@ -4679,20 +4691,34 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
         return Ok(false);
     }
     let i64_value = m.value.len() == 9 && m.value[0] == ValueTag::I64 as u8;
-    if meta.options.kind == FamilyKind::Hll {
-        // Inputs are `i64` elements; a put sets a bucket to a sketch (as `phdb load` writes
-        // one back), which must be well-formed (D294).
+    let bytes_value = m.value.first() == Some(&(ValueTag::Bytes as u8));
+    if matches!(meta.options.kind, FamilyKind::Hll | FamilyKind::Bloom) {
+        // Inputs are `i64` or bytes elements (D294, D298's `aggregate_bytes`); a put sets a
+        // bucket to a sketch or filter (as `phdb load` writes one back), which must be
+        // well-formed, and for a bloom filter of the family's parameters (its operator
+        // judges: the state must come back unchanged).
         let ok = match m.kind {
-            Kind::Merge => i64_value,
+            Kind::Merge => i64_value || bytes_value,
+            _ if meta.options.kind == FamilyKind::Hll => {
+                bytes_value && pigeonhole_format::hll::validate(&m.value[1..]).is_ok()
+            }
             _ => {
-                m.value.first() == Some(&(ValueTag::Bytes as u8))
-                    && pigeonhole_format::hll::validate(&m.value[1..]).is_ok()
+                bytes_value
+                    && meta.merge_op.as_ref().is_some_and(|op| {
+                        let mut v = m.value.to_vec();
+                        op.finish(None, &mut v).is_ok() && v == m.value
+                    })
             }
         };
         if !ok {
+            let (family, what) = if meta.options.kind == FamilyKind::Hll {
+                ("an hll", "a well-formed sketch")
+            } else {
+                ("a bloom", "a well-formed filter of the family's parameters")
+            };
             return Err(Error::InvalidArgument(format!(
-                "{} is an hll family: it takes i64 elements (aggregate) and puts of a \
-                 well-formed sketch",
+                "{} is {family} family: it takes i64 or bytes elements (aggregate / \
+                 aggregate_bytes) and puts of {what}",
                 family_name(catalog, m.table, m.family)
             )));
         }
@@ -4788,6 +4814,7 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::MeanVar => "mean_var",
         FamilyKind::Histogram => "histogram",
         FamilyKind::Quantiles => "quantiles",
+        FamilyKind::Bloom => "bloom",
         FamilyKind::Standard => "standard",
     }
 }
@@ -4836,10 +4863,27 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
         // or mean-variance put of an `f64` is the state of that one input (D298), so every
         // value a bucket holds is a state (inputs stay `f64` operands until a fold).
         let own = match (kind, m.kind) {
-            (FamilyKind::Hll, Kind::Merge) => {
-                let mut v = Vec::with_capacity(9);
+            (FamilyKind::Hll | FamilyKind::Bloom, Kind::Merge) => {
+                // An element: an `i64`'s 8 bytes, or bytes behind their domain tag (D298).
+                let h = if m.value.first() == Some(&(ValueTag::Bytes as u8)) {
+                    pigeonhole_format::hll::hash_bytes(&m.value[1..])
+                } else {
+                    pigeonhole_format::hll::hash_i64(stored_i64(m.value))
+                };
+                let mut v = Vec::with_capacity(16);
                 v.push(ValueTag::Bytes as u8);
-                pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
+                if kind == FamilyKind::Hll {
+                    pigeonhole_format::hll::append_hashed(&mut v, h);
+                } else {
+                    let params = catalog
+                        .family(m.family)
+                        .and_then(|f| {
+                            pigeonhole_format::bloom::BloomParams::parse(&f.options.kind_params)
+                                .ok()
+                        })
+                        .expect("a bloom family's parameters were checked at creation");
+                    pigeonhole_format::bloom::append_element(&mut v, params, h);
+                }
                 Some(v)
             }
             (

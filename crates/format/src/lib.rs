@@ -12,6 +12,7 @@
 
 pub mod blob;
 pub mod block;
+pub mod bloom;
 pub mod buckets;
 mod bytes;
 pub mod checksum;

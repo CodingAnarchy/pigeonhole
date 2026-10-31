@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use pigeonhole::{
-    Aggregation, Compaction, Compression, Family, FamilyInfo, HistogramParams, Priority,
-    QuantileParams,
+    Aggregation, BloomParams, Compaction, Compression, Family, FamilyInfo, HistogramParams,
+    Priority, QuantileParams,
 };
 use serde_json::{Map, Value, json};
 
@@ -34,11 +34,13 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
             Aggregation::MeanVar => "mean_var",
             Aggregation::Histogram(_) => "histogram",
             Aggregation::Quantiles(_) => "quantiles",
+            Aggregation::Bloom(_) => "bloom",
             _ => "unknown",
         }),
         // A histogram's bounds, a quantile sketch's parameters (D298).
         "aggregation_params": match &f.aggregation {
             Some(Aggregation::Histogram(h)) => json!({ "bounds": h.bounds() }),
+            Some(Aggregation::Bloom(b)) => json!({ "bits": b.bits(), "hashes": b.hashes() }),
             Some(Aggregation::Quantiles(q)) => json!({
                 "mantissa_bits": q.get_mantissa_bits(),
                 "max_buckets": q.get_max_buckets(),
@@ -119,6 +121,19 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
                 );
             }
             Family::aggregate(Aggregation::Quantiles(q))
+        }
+        (Some("bloom"), _) => {
+            let p = &v["aggregation_params"];
+            let bits = p["bits"].as_u64().and_then(|n| u32::try_from(n).ok());
+            let hashes = p["hashes"].as_u64().and_then(|n| u8::try_from(n).ok());
+            let (Some(bits), Some(hashes)) = (bits, hashes) else {
+                return Err(format!(
+                    "family {name}: a bloom filter needs its bits and hashes"
+                ));
+            };
+            let params =
+                BloomParams::new(bits, hashes).map_err(|e| format!("family {name}: {e}"))?;
+            Family::aggregate(Aggregation::Bloom(params))
         }
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
         (None, _) => Family::default(),

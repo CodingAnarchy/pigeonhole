@@ -88,7 +88,29 @@ type Result<T> = std::result::Result<T, SketchError>;
 /// The register and rank of the `i64` element `v`.
 #[inline]
 pub fn register_of(v: i64) -> (u16, u8) {
-    let h = crate::checksum::xxh3_64(&v.to_le_bytes());
+    register_of_hash(hash_i64(v))
+}
+
+/// The domain tag of a bytes element (D294 reserved it, D298 uses it): its hash is over the tag
+/// then the bytes, so it never collides with an `i64` element's 8 untagged bytes.
+pub const BYTES_DOMAIN: u8 = 0x01;
+
+/// The hash of an `i64` element: xxh3-64 over its 8 little-endian bytes. HLL and bloom
+/// families hash an element the same way.
+pub fn hash_i64(v: i64) -> u64 {
+    crate::checksum::xxh3_64(&v.to_le_bytes())
+}
+
+/// The hash of a bytes element: xxh3-64 over [`BYTES_DOMAIN`] then the bytes (D298).
+pub fn hash_bytes(b: &[u8]) -> u64 {
+    let mut buf = Vec::with_capacity(1 + b.len());
+    buf.push(BYTES_DOMAIN);
+    buf.extend_from_slice(b);
+    crate::checksum::xxh3_64(&buf)
+}
+
+/// The register and rank of an element hash `h`.
+pub fn register_of_hash(h: u64) -> (u16, u8) {
     let index = (h >> (64 - PRECISION)) as u16;
     let rank = ((h << PRECISION).leading_zeros() + 1).min(u32::from(MAX_RANK)) as u8;
     (index, rank)
@@ -103,7 +125,18 @@ pub fn encode_element(out: &mut Vec<u8>, v: i64) {
 
 /// [`encode_element`], appended to `out` (after a tag byte, say).
 pub fn append_element(out: &mut Vec<u8>, v: i64) {
-    let (index, rank) = register_of(v);
+    append_hashed(out, hash_i64(v));
+}
+
+/// The one-element sketch of the bytes element `b` (D298), appended to `out`.
+pub fn append_bytes_element(out: &mut Vec<u8>, b: &[u8]) {
+    append_hashed(out, hash_bytes(b));
+}
+
+/// The one-element sketch of the element hash `h` ([`hash_i64`], [`hash_bytes`]), appended
+/// to `out`.
+pub fn append_hashed(out: &mut Vec<u8>, h: u64) {
+    let (index, rank) = register_of_hash(h);
     out.extend_from_slice(&[ENCODING, PRECISION, SPARSE, 0]);
     out.extend_from_slice(&entry(index, rank).to_le_bytes());
 }

@@ -154,17 +154,18 @@ fn families() -> Vec<ModelFamily> {
         // more stall a one-shard run with tablet changes off (#1212). PR 2's exact sum and
         // mean-variance families took `bor`'s and `fmin`'s places; PR 3's histogram and
         // quantile families take `sum`'s and `band`'s (the counter kind runs in `counters`,
-        // and XOR covers the bitwise operator's code). They all join `counters` once #1212
+        // and XOR covers the bitwise operator's code); PR 4's bloom family takes `fsum`'s
+        // (mean/variance runs the same exact-sum code). They all join `counters` once #1212
         // is fixed (#1214, #1219).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
             f("bxor_ttl", 0, 40, false),
             f("fmax_ttl", 0, 40, false),
-            f("fsum", 2, 0, false),
             f("fmv_ttl", 0, 40, false),
             f("fhist", 2, 0, false),
             f("fq_ttl", 0, 40, false),
+            f("bloom", 2, 0, false),
         ]
     } else {
         vec![
@@ -283,6 +284,13 @@ fn public_family(f: &ModelFamily) -> Family {
         (true, ModelAggregation::MeanVar) => Family::aggregate(Aggregation::MeanVar),
         (true, ModelAggregation::Histogram) => Family::aggregate(Aggregation::Histogram(
             pigeonhole::HistogramParams::new(pigeonhole_sim::MODEL_HISTOGRAM_BOUNDS).unwrap(),
+        )),
+        (true, ModelAggregation::Bloom) => Family::aggregate(Aggregation::Bloom(
+            pigeonhole::BloomParams::new(
+                1 << pigeonhole_sim::MODEL_BLOOM_LOG2_BITS,
+                pigeonhole_sim::MODEL_BLOOM_HASHES,
+            )
+            .unwrap(),
         )),
         (true, ModelAggregation::Quantiles) => Family::aggregate(Aggregation::Quantiles(
             pigeonhole::QuantileParams::default()

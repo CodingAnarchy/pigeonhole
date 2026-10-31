@@ -202,15 +202,16 @@ pub(crate) fn separate(
     if batch.as_bytes().len() <= limit {
         return Ok((builder, None));
     }
-    // An aggregate family's values stay inline whatever the limit (D298): its built-in
-    // operator folds stored values, never blob pointers, and its values are bounded states (an
-    // HLL sketch is the largest, 3076 bytes), far below the WAL segment's payload that the
-    // limit is in practice; only a test's lowered limit reaches them.
+    // A family whose values stay inline keeps them inline whatever the limit (D298,
+    // `FamilyKind::values_stay_inline`): its built-in operator folds stored values, never blob
+    // pointers. Its inputs are small (an element, an `f64`, a one-input state); a put of a
+    // whole state (`phdb load`) larger than a WAL record can carry, as a dense bloom filter
+    // of 2^21 bits or more is, is refused as too large until #488 PR 5's separated bases.
     let view = shared.view.load();
     let inline = |f: FamilyId| {
         view.catalog
             .family(f)
-            .is_some_and(|meta| meta.options.kind.is_aggregate())
+            .is_some_and(|meta| meta.options.kind.values_stay_inline())
     };
     let mut large = false;
     for m in batch.iter() {

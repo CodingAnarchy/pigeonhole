@@ -280,6 +280,10 @@ pub enum FamilyKind {
     /// `kind_params` set the mantissa bits and bucket limit ([`crate::buckets`], FORMAT
     /// §3.5). Needs [`INCOMPAT_AGGREGATES`].
     Quantiles = 13,
+    /// A bloom filter family (D298): inputs are `i64` or bytes elements, set in a filter of
+    /// the bits and hashes its `kind_params` give ([`crate::bloom`], FORMAT §3.6). Needs
+    /// [`INCOMPAT_AGGREGATES`].
+    Bloom = 14,
 }
 
 impl FamilyKind {
@@ -320,8 +324,41 @@ impl FamilyKind {
             | FamilyKind::SumF64
             | FamilyKind::MeanVar
             | FamilyKind::Histogram
-            | FamilyKind::Quantiles => INCOMPAT_AGGREGATES,
+            | FamilyKind::Quantiles
+            | FamilyKind::Bloom => INCOMPAT_AGGREGATES,
         }
+    }
+
+    /// Whether the kind's values must stay inline, never separated into blob files at commit,
+    /// flush or compaction (D298): a value its built-in operator folds, or a reader must see
+    /// whole. An explicit list (not "every aggregate kind"): #488 PR 5 takes `Bloom` out once
+    /// its operator folds a separated base (§4.1), and never puts `Set` in; #490's typed
+    /// vectors join it.
+    ///
+    /// ```
+    /// use pigeonhole_format::manifest::FamilyKind;
+    ///
+    /// assert!(FamilyKind::Hll.values_stay_inline());
+    /// assert!(!FamilyKind::Standard.values_stay_inline());
+    /// ```
+    pub fn values_stay_inline(self) -> bool {
+        matches!(
+            self,
+            FamilyKind::Counter
+                | FamilyKind::Min
+                | FamilyKind::Max
+                | FamilyKind::Hll
+                | FamilyKind::BitOr
+                | FamilyKind::BitAnd
+                | FamilyKind::BitXor
+                | FamilyKind::MinF64
+                | FamilyKind::MaxF64
+                | FamilyKind::SumF64
+                | FamilyKind::MeanVar
+                | FamilyKind::Histogram
+                | FamilyKind::Quantiles
+                | FamilyKind::Bloom
+        )
     }
 }
 
@@ -475,11 +512,11 @@ impl FamilyOptions {
     }
 
     /// The payload length above which a flush or compaction separates a put's value into a
-    /// blob file: [`blob_threshold`](Self::blob_threshold), or never (`u32::MAX`) in an
-    /// aggregate family, whose built-in operator folds stored values and never reads a blob
-    /// pointer (D298; commit-time separation keeps them inline too).
+    /// blob file: [`blob_threshold`](Self::blob_threshold), or never (`u32::MAX`) for a kind
+    /// whose values stay inline ([`FamilyKind::values_stay_inline`], D298; commit-time
+    /// separation keeps them inline too).
     pub fn separation_threshold(&self) -> u32 {
-        if self.kind.is_aggregate() {
+        if self.kind.values_stay_inline() {
             u32::MAX
         } else {
             self.blob_threshold
@@ -568,6 +605,7 @@ impl FamilyOptions {
                     11 => FamilyKind::MeanVar,
                     12 => FamilyKind::Histogram,
                     13 => FamilyKind::Quantiles,
+                    14 => FamilyKind::Bloom,
                     k => {
                         return Err(Error::UnsupportedFeature {
                             what: "family kind",
@@ -1120,6 +1158,7 @@ mod encode_tests {
             FamilyKind::MeanVar,
             FamilyKind::Histogram,
             FamilyKind::Quantiles,
+            FamilyKind::Bloom,
         ] {
             let plain = FamilyOptions::default().kind(kind);
             let bytes = put_family(plain.clone());

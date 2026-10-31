@@ -3251,6 +3251,12 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - A kind fixes its tags when it lands; a later must-understand tag on an existing kind takes a new bit.
 - **Exact sums:** SumF64 is a 2176-bit two's-complement accumulator, so the sum is deterministic under any grouping, with one rounding at read. MeanVar adds a 4288-bit Σx² accumulator of exact integer squares (revision 1's S1), with the trim rule of S2.
 - **Quantiles** collapse below the threshold `t = max_index − max_buckets + 1` into bucket `t` (S3), so collapsing is associative.
+- **Separation keys on its own predicate** (owner, 2026-10-31, after perf287's note on #490 B, c6542686802; named with cli692 on #490). Two questions stay apart, so PR 5 doesn't inherit a "never separate" it mustn't have:
+  - **`FamilyKind::values_stay_inline()`** (the owner's "`values_never_separate()`") decides whether a family's values may go to blob files at commit, flush or compaction. It's true for the bounded aggregate states and #490's typed vectors.
+  - **The read path's blob attach** keys separately, on whether the family's operator can fold a blob pointer.
+  - **Today** the two coincide for every aggregate kind: no built-in operator reads a separated base, so Bloom stays inline in PR 4.
+  - **PR 5 parts them:** §4.1 lets the Bloom and Set operators fold a separated base, so it takes `Bloom` out of `values_stay_inline()`, never puts `Set` in it, and attaches the blob hook for both.
+  - The predicate is an explicit list, not "every aggregate kind", whoever (#488 or #490 B) lands it first.
 - **Engine (PR 5):** built-in operators fold onto blob-separated bases. Compaction folds an aggregate bucket's operands into a same-stripe base under the widened guard `[P.seqno, newest.seqno]`, never across an in-run delete (S4; D73's restriction stays for standard families). D291 checkpoints are capped at 4 KiB.
 - **Not taken** (§6): KLL and t-digest (randomised or merge-order-sensitive), Space-Saving top-K, decayed counters as a kind. Count-Min, Theta sketches, a bounded recent list, `u64`/bytes sets and per-column types go to a tracking issue (PR 6).
 - **PRs:** 1 `kind_params` and the scalar kinds; 2 exact sum and MeanVar; 3 histogram and quantiles; 4 bloom and `aggregate_bytes`; 5 separated bases, the compaction fold, the checkpoint cap and Set; 6 docs and the tracking issue. perf287 reviews each, and each runs the five sweeps.
@@ -3384,6 +3390,48 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **With D291 checkpoints at 128:** reads are p50 25 µs, p99 60 µs, close to HLL's 27 µs and 54 µs.
   - **With checkpoints off:** a read refolds every pending input with a full decode and encode of the sketch, giving p50 10.4 ms and p99 26 ms.
   - **Consequence for PR 5:** its 4 KiB checkpoint cap must not come without §4.2's compaction fold, or a fold of many `F64` inputs into one decoded sketch. A larger sketch would otherwise lose its checkpoints and read in milliseconds.
+
+**What (PR 4: bloom filters and bytes elements).**
+- **Kind:** `Bloom` (14), operator `pigeonhole.bloom` (`BloomUnion`, built from the family's parameters), under bit 0.
+- **Parameters** (FORMAT §9.2.1, both required): bits `m` (tag 1: a power of two, 2^6 to 2^24) and positions `k` (tag 2: 1 to 16).
+- **State** (`pigeonhole_format::bloom`, FORMAT §3.6):
+  - **Header:** encoding 6, `log2 m`, `k`, so a read needs no family context.
+  - **Form:** sparse sorted bit indexes while `4·n < m/8`, else a dense bitmap.
+  - **Positions:** Kirsch–Mitzenmacher, `(h1 + i·h2) mod m`.
+  - **Merge:** OR. A lookup never gives a false negative.
+- **Elements, i64 or bytes:**
+  - Bytes elements hash `0x01 ‖ bytes` (D294's reserved domain tag; `hll::hash_bytes`), so they never collide with an `i64` element's untagged 8 bytes. An HLL family takes bytes elements too, through the same hash.
+  - Inputs become their one-element state before the WAL, an HLL sketch or bloom filter, as HLL's `i64` inputs already did. So the operators only fold states.
+- **The commit-preparation gate** (a bug in PRs 2–3, fixed here):
+  - **Before:** `prepare_counter_writes` ran only for fixed-timestamp writes, several aggregate writes, or HLL inputs. A lone `put_f64_at` (explicit timestamp, alone in its commit) into a SumF64, MeanVar, Histogram or Quantiles family was stored as its raw `F64` and read back as one. A lone bloom input at a bucket would have reached the WAL unconverted.
+  - **Now:** the gate runs for any write that must be converted.
+  - **Coverage:** the model puts states, and the earlier tests used the fixed timestamp, so neither caught it. The bloom model checks did. A regression test (`it/exact_aggregates.rs`) fails without the fix. Unreleased, so no release was affected.
+- **`FamilyKind::values_stay_inline()`** (§ "Separation keys on its own predicate"): the explicit list, Bloom included until PR 5. `separation_threshold()` and commit-time separation key on it.
+  - A dense filter of 2^21 bits or more is larger than one WAL record, so a put of one whole (`phdb load`) is refused as too large until PR 5's separated bases. Inputs are small one-element filters and fold at read and compaction, so they're unaffected.
+- **API** (ICR 0096):
+  - `Aggregation::Bloom(BloomParams)`, with `BloomParams::new(bits, hashes) -> Result`, `bits()` and `hashes()`;
+  - `aggregate_bytes` and `aggregate_bytes_at` on `RowMutation`, `WriteBatch` and `Transaction`, for HLL and bloom families only (the builder refuses others);
+  - `CellRef::bloom_contains(i64)`, `bloom_contains_bytes(&[u8])` and `bloom_fill()`.
+  - phdb: `"bloom"` with `{"bits", "hashes"}`; the shell's `:bloom=m,k`; `aggregate` taking a non-integer word as a bytes element in HLL and bloom families.
+
+**Tests (PR 4).**
+- **Format:**
+  - no false negatives, and a false-positive rate within half of `(1 − e^(−kn/m))^k`;
+  - any grouping of merges gives the same bytes, through sparse to dense;
+  - idempotence;
+  - bytes and `i64` elements hash apart;
+  - malformed states and parameters.
+- **Engine (`it/bloom_aggregates.rs`):**
+  - `i64` and bytes elements fold through flushes, compactions and checkpoints, compared with the format's states;
+  - a dense filter past a blob threshold of 8 stays inline;
+  - HLL bytes elements;
+  - puts of the family's own filter, with others refused;
+  - parameter checks;
+  - the operator bound to its kind;
+  - the gate fix's regression test, in `it/exact_aggregates.rs`.
+- **Model checks:** `ModelAggregation::Bloom` is a state kind with fixed parameters (`m = 2^10`, `k = 3`, so filters turn dense). Its oracle (`pigeonhole_sim::bloom_state`) computes positions and encodes apart from the format crate, and a test checks that the two agree. `scalar_counters` trades `fsum` for `bloom`.
+  - **Mutation:** a wrong `h2` fails 30 of the 33 engine `scalar_counters` tests.
+- **API, phdb and corpus:** a `pigeonhole` API test, a phdb shell test, and the help snapshot. The corpus gains `seen_b` (`i64` and bytes elements) and bytes elements in `users`.
 
 <a id="d299"></a>
 ## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)

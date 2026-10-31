@@ -66,3 +66,19 @@ D298 (#488): the owner's minimum set of further aggregations for 1.1.0, and the 
   - **pigeonhole-format:** `buckets` (histogram and quantile states and parameters); `FamilyKind::{Histogram, Quantiles}`; `FamilyOptions::separation_threshold`.
   - **pigeonhole-compaction:** `Buckets` (`histogram(bounds)`, `quantiles(params)`).
   - **pigeonhole-sim:** `bucket_state`, `bucket_state_valid`, `MODEL_HISTOGRAM_BOUNDS`, `MODEL_QUANTILE_BITS`, `MODEL_QUANTILE_MAX`, and `ModelAggregation::{Histogram, Quantiles, finite_inputs}`.
+
+## PR 4: bloom filters and bytes elements
+- **pigeonhole:**
+  - `Aggregation::Bloom(BloomParams)`, with `BloomParams::new(bits: u32, hashes: u8) -> Result<Self>` (bits a power of two, 2^6 to 2^24; hashes 1 to 16), `bits()` and `hashes()`. It is `Copy`, `Eq` and `Hash`.
+  - `aggregate_bytes(family, qualifier, &[u8])` and `aggregate_bytes_at`, on `RowMutation`, and on `WriteBatch` and `Transaction` with `table` and `row` first: a bytes element for an HLL or bloom family. They are refused in other families when the write is built, naming the method to use.
+  - `CellRef`/`Cell::bloom_contains(i64) -> Option<bool>`, `bloom_contains_bytes(&[u8]) -> Option<bool>` and `bloom_fill() -> Option<f64>`.
+  - **Behaviour:**
+    - `aggregate(i64)` writes an `i64` element to a bloom family.
+    - Bytes elements hash apart from `i64`s (a domain tag), in HLL and bloom families alike.
+    - A put takes a well-formed filter of the family's parameters.
+    - A lone `put_f64_at` into a SumF64, MeanVar, Histogram or Quantiles family is now stored as its one-input state, as at the fixed timestamp. Before, it was stored as a raw `f64`: a fix to PRs 2–3, unreleased.
+- **phdb:** `"aggregation": "bloom"` with `"aggregation_params": {"bits", "hashes"}`; the shell's `create … name:bloom=m,k`; `aggregate` takes a non-integer word as a bytes element in HLL and bloom families.
+- **Internal crates:**
+  - **pigeonhole-format:** `bloom` (states and parameters); `hll::{hash_i64, hash_bytes, register_of_hash, append_hashed, append_bytes_element, BYTES_DOMAIN}`; `FamilyKind::Bloom`; `FamilyKind::values_stay_inline`.
+  - **pigeonhole-compaction:** `BloomUnion`.
+  - **pigeonhole-sim:** `bloom_state`, `bloom_state_valid`, `MODEL_BLOOM_LOG2_BITS`, `MODEL_BLOOM_HASHES`, and `ModelAggregation::Bloom`.
