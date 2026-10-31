@@ -89,6 +89,13 @@ impl Reservation {
     /// A group's `n` seqnos and the first of `k` default timestamps (`T0 .. T0 + k`): `T0`
     /// above `H` after a decision, and above this shard's own last stamp `last`, so a
     /// shard's stamps strictly increase (D271 variant B).
+    ///
+    /// The group's hold, `shard`'s pending watermark `min(watermark, first)`, is stored
+    /// (Release) under the lock, before the mirror passes `first` (FORMAT §11.3, D300): every
+    /// `fetch_max` past it comes after it, and `first`, the allocator's next seqno, is above
+    /// every seqno a reader can see, so the store never lowers the visible seqno. `watermark`
+    /// is the shard's lowest unapplied seqno before this group (`u64::MAX` when none).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reserve_group(
         &self,
         n: u64,
@@ -96,10 +103,13 @@ impl Reservation {
         now: Timestamp,
         last: Timestamp,
         shm: &ShmRegion,
+        shard: u32,
+        watermark: Seqno,
     ) -> (Seqno, Timestamp) {
         let (first, t0) = {
             let mut st = self.lock();
             let first = st.next;
+            shm.publish_pending(shard, watermark.min(first));
             st.next += n;
             let t0 = now.max(st.h + u64::from(st.decided)).max(last + 1);
             st.h = st.h.max(t0 + k.max(1) - 1);
@@ -184,10 +194,10 @@ mod tests {
         r.seed_seqno(10);
         r.seed_ts(100);
         // Two shards' groups, a decision, and a group in the same µs after it.
-        let (s1, t1) = r.reserve_group(2, 2, 50, 0, &shm);
-        let (s2, t2) = r.reserve_group(1, 1, 50, 0, &shm);
+        let (s1, t1) = r.reserve_group(2, 2, 50, 0, &shm, 0, u64::MAX);
+        let (s2, t2) = r.reserve_group(1, 1, 50, 0, &shm, 0, u64::MAX);
         let (s3, t3) = r.reserve_decision(50, &shm);
-        let (s4, t4) = r.reserve_group(1, 1, 50, 0, &shm);
+        let (s4, t4) = r.reserve_group(1, 1, 50, 0, &shm, 0, u64::MAX);
         assert_eq!((s1, s2, s3, s4), (10, 12, 13, 14));
         // A group's k stamps are t1, t1 + 1; the next group may share H (another shard),
         // the decision is strictly above, and the group after it strictly above that.
@@ -204,9 +214,9 @@ mod tests {
     fn a_shard_never_repeats_its_own_stamp_and_the_clock_leads_when_ahead() {
         let (r, shm) = (Reservation::default(), shm());
         r.seed_seqno(1);
-        let (_, a) = r.reserve_group(1, 1, 500, 0, &shm);
-        let (_, b) = r.reserve_group(1, 1, 500, a, &shm);
-        let (_, c) = r.reserve_group(1, 1, 900, b, &shm);
+        let (_, a) = r.reserve_group(1, 1, 500, 0, &shm, 0, u64::MAX);
+        let (_, b) = r.reserve_group(1, 1, 500, a, &shm, 0, u64::MAX);
+        let (_, c) = r.reserve_group(1, 1, 900, b, &shm, 0, u64::MAX);
         assert_eq!((a, b, c), (500, 501, 900));
     }
 
@@ -216,9 +226,11 @@ mod tests {
         r.seed_seqno(5);
         let (a, _) = r.reserve_decision(10, &shm);
         let (b, _) = r.reserve_decision(10, &shm);
-        let (g, _) = r.reserve_group(1, 1, 10, 0, &shm);
+        let (g, _) = r.reserve_group(1, 1, 10, 0, &shm, 0, u64::MAX);
         assert_eq!((a, b, g, shm.next_seqno()), (5, 6, 7, 8));
-        // The group's shard published nothing pending: only the holds stop snapshots.
+        // The group's hold was stored as it was reserved (D300), above the decisions'.
+        assert_eq!(shm.visible_seqno(), a - 1);
+        shm.publish_pending(0, u64::MAX); // the group applied
         assert_eq!(r.lowest_held(), a);
         assert_eq!(shm.visible_seqno(), a - 1);
         // The later decision finishing first frees nothing yet.

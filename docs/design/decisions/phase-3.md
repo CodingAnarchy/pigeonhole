@@ -3119,3 +3119,17 @@ The root cause is the readahead path's latency, not the scan's length. A demand 
 Mutations: never reading ahead when short fails the last two; dropping the rule fails the first.
 
 #974 A stays parked. The same box slot's long-scan wait-on-in-flight decides it.
+
+<a id="d300"></a>
+## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)
+**Why.** On macOS CI a reader process saw the visible seqno go from 21169 to 21162 (`crates/shm/tests/multiprocess.rs`, seed 1592590338). FORMAT §11.3's step 1, `pending[shard].store(next_seqno.load())`, was a load and a separate store. Another shard could reserve a seqno, raise the mirror, apply it and release its hold in between, so the visible seqno passed it. The stale bound then landed below it, and the visible seqno went back until the first shard published its reservation. It's an interleaving, not a memory-ordering effect: it reproduces in one thread, through the public API. Nothing unapplied ever became visible, but snapshots weren't monotonic: a later snapshot, in-process or in a reader process, could miss a commit an earlier one included, including a writer's own acknowledged commit.
+
+**Decided.**
+- **Where the hold is stored.** A group's hold, `pending[shard] = min(its lowest unapplied seqno, first)` (Release), is stored **under the allocator's lock**, as `first` is reserved and before `next_seqno.fetch_max` passes it. That's the way a cross-shard decision's `cross_held` already was (D278).
+  - The step-1 lower bound read from the mirror is gone.
+  - `first`, read under the lock, is above every seqno a reader can see, so the store never lowers the visible seqno.
+  - Every `fetch_max` past `first` comes after the store, so §11.3's safety argument is unchanged: every seqno below the mirror is applied or held.
+- **Scope.** The writer side only (`Clock::reserve_group`, `ShardState::reserve_stamps`). Readers, the shm layout and the snapshot computation are unchanged.
+- **Checks.**
+  - `clock_loom`'s reader now takes two readings and requires the second to be at least the first. With the old step 1 restored, that check fails.
+  - `shm/tests/protocol.rs`'s `a_reservation_never_moves_the_visible_seqno_back` places another shard's whole group at every step of a reservation, and keeps the old step 1's counterexample.

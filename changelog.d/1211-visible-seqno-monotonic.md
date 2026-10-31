@@ -1,0 +1,2 @@
+### Fixed
+- **A snapshot no longer sees fewer commits than an earlier one** (#1208, D300). While two shards reserved seqnos at once, the visible seqno could briefly go backwards: a later snapshot, in the writer process or in a reader process, could miss a commit an earlier snapshot had shown, including a writer's own acknowledged commit. No uncommitted data was ever visible. A shard's hold is now published under the seqno allocator's lock. Readers and the shared-memory layout are unchanged.
