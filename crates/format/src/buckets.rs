@@ -131,7 +131,7 @@ pub fn histogram_counts(s: &[u8], buckets: Option<usize>) -> Result<Vec<u64>> {
     }
     let mut at = 1;
     let n = get_varint(s, &mut at)? as usize;
-    if n < 2 || n > MAX_BOUNDS + 1 || buckets.is_some_and(|b| b != n) {
+    if !(2..=MAX_BOUNDS + 1).contains(&n) || buckets.is_some_and(|b| b != n) {
         return Err(BucketError("a histogram state of the wrong bucket count"));
     }
     let mut counts = Vec::with_capacity(n);

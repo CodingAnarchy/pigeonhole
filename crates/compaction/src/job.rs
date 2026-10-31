@@ -691,7 +691,7 @@ impl CompactionJob {
                 last_row: Vec::new(),
                 blobs: None,
                 blob_ids: context.blob_ids,
-                blob_threshold: context.family.blob_threshold,
+                blob_threshold: context.family.separation_threshold(),
                 gc_files,
                 copied: Vec::new(),
             },

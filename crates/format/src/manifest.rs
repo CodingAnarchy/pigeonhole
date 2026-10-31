@@ -272,6 +272,14 @@ pub enum FamilyKind {
     /// holds their count, exact sum and exact sum of squares ([`crate::exact`], FORMAT
     /// §3.3). Needs [`INCOMPAT_AGGREGATES`].
     MeanVar = 11,
+    /// A fixed-bucket histogram family (D298): inputs are `f64`s (NaN refused), counted in
+    /// the buckets its `kind_params` bounds give ([`crate::buckets`], FORMAT §3.4). Needs
+    /// [`INCOMPAT_AGGREGATES`].
+    Histogram = 12,
+    /// A log-linear quantile sketch family (D298): inputs are finite `f64`s, and its
+    /// `kind_params` set the mantissa bits and bucket limit ([`crate::buckets`], FORMAT
+    /// §3.5). Needs [`INCOMPAT_AGGREGATES`].
+    Quantiles = 13,
 }
 
 impl FamilyKind {
@@ -310,7 +318,9 @@ impl FamilyKind {
             | FamilyKind::MinF64
             | FamilyKind::MaxF64
             | FamilyKind::SumF64
-            | FamilyKind::MeanVar => INCOMPAT_AGGREGATES,
+            | FamilyKind::MeanVar
+            | FamilyKind::Histogram
+            | FamilyKind::Quantiles => INCOMPAT_AGGREGATES,
         }
     }
 }
@@ -464,6 +474,18 @@ impl FamilyOptions {
         self
     }
 
+    /// The payload length above which a flush or compaction separates a put's value into a
+    /// blob file: [`blob_threshold`](Self::blob_threshold), or never (`u32::MAX`) in an
+    /// aggregate family, whose built-in operator folds stored values and never reads a blob
+    /// pointer (D298; commit-time separation keeps them inline too).
+    pub fn separation_threshold(&self) -> u32 {
+        if self.kind.is_aggregate() {
+            u32::MAX
+        } else {
+            self.blob_threshold
+        }
+    }
+
     /// Sets `merge_operator`: the merge operator's name; empty for none.
     #[must_use]
     pub fn merge_operator(mut self, name: impl Into<String>) -> Self {
@@ -544,6 +566,8 @@ impl FamilyOptions {
                     9 => FamilyKind::MaxF64,
                     10 => FamilyKind::SumF64,
                     11 => FamilyKind::MeanVar,
+                    12 => FamilyKind::Histogram,
+                    13 => FamilyKind::Quantiles,
                     k => {
                         return Err(Error::UnsupportedFeature {
                             what: "family kind",
@@ -1094,6 +1118,8 @@ mod encode_tests {
             FamilyKind::MaxF64,
             FamilyKind::SumF64,
             FamilyKind::MeanVar,
+            FamilyKind::Histogram,
+            FamilyKind::Quantiles,
         ] {
             let plain = FamilyOptions::default().kind(kind);
             let bytes = put_family(plain.clone());

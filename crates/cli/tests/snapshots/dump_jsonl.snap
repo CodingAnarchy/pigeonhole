@@ -3,7 +3,7 @@ source: crates/cli/tests/common/mod.rs
 expression: text
 ---
 {"phdb":1,"command":"dump","format_version":4,"snapshot":"latest","seqno":[SEQNO],"mode":"writer"}
-{"table":"a","families":[{"name":"p","counter":false,"aggregation":null,"max_versions":3,"ttl_micros":null,"bloom_bits":10,"blob_threshold":4096,"compression":"zstd","zstd_level":5,"block_size":16384,"merge_operator":null,"cache_priority":"high","compaction":"leveled"},{"name":"c","counter":true,"aggregation":"sum","max_versions":0,"ttl_micros":null,"bloom_bits":10,"blob_threshold":4096,"compression":"lz4","zstd_level":null,"block_size":16384,"merge_operator":null,"cache_priority":"normal","compaction":"leveled"}]}
+{"table":"a","families":[{"name":"p","counter":false,"aggregation":null,"aggregation_params":null,"max_versions":3,"ttl_micros":null,"bloom_bits":10,"blob_threshold":4096,"compression":"zstd","zstd_level":5,"block_size":16384,"merge_operator":null,"cache_priority":"high","compaction":"leveled"},{"name":"c","counter":true,"aggregation":"sum","aggregation_params":null,"max_versions":0,"ttl_micros":null,"bloom_bits":10,"blob_threshold":4096,"compression":"lz4","zstd_level":null,"block_size":16384,"merge_operator":null,"cache_priority":"normal","compaction":"leveled"}]}
 {"table":"a","row":"row000","family":"p","qualifier":"name","ts":1760000000000002,"value":"n0-2"}
 {"table":"a","row":"row000","family":"p","qualifier":"name","ts":1760000000000001,"value":"n0-1"}
 {"table":"a","row":"row000","family":"p","qualifier":"name","ts":1760000000000000,"value":"n0-0"}

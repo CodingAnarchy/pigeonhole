@@ -50,6 +50,27 @@ fn as_f64(data: &CellData) -> Option<f64> {
     }
 }
 
+fn histogram_counts(data: &CellData) -> Option<Vec<u64>> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::buckets::histogram_counts(b, None).ok(),
+        _ => None,
+    }
+}
+
+fn quantile(data: &CellData, q: f64) -> Option<f64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::buckets::quantile(b, q),
+        _ => None,
+    }
+}
+
+fn quantiles_count(data: &CellData) -> Option<u64> {
+    match data.value() {
+        ValueRef::Bytes(b) => pigeonhole_format::buckets::quantiles_count(b).ok(),
+        _ => None,
+    }
+}
+
 fn sum_f64(data: &CellData) -> Option<f64> {
     match data.value() {
         ValueRef::Bytes(b) => pigeonhole_format::exact::sum_read(b).ok(),
@@ -199,6 +220,27 @@ impl<'a> CellRef<'a> {
         mean_var(&self.data)
     }
 
+    /// The per-bucket counts a histogram state holds, one per bucket of the family's
+    /// [`HistogramParams`](crate::HistogramParams) (D298); `None` unless the value is a
+    /// well-formed one.
+    pub fn histogram_counts(&self) -> Option<Vec<u64>> {
+        histogram_counts(&self.data)
+    }
+
+    /// The `q`-quantile (`0 ≤ q ≤ 1`) a quantile sketch holds
+    /// ([`Aggregation::Quantiles`](crate::Aggregation::Quantiles), D298): its bucket's
+    /// midpoint for the input of rank `⌊q·(n−1)⌋`, within a relative error of 2^-p while
+    /// nothing has collapsed. `None` unless the value is a well-formed sketch and `q` is in
+    /// range.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        quantile(&self.data, q)
+    }
+
+    /// The number of inputs a quantile sketch holds.
+    pub fn quantiles_count(&self) -> Option<u64> {
+        quantiles_count(&self.data)
+    }
+
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
     /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
     /// error. The value's shape decides, not its family: `None` unless it is a well-formed
@@ -278,6 +320,27 @@ impl Cell {
     /// is a well-formed one.
     pub fn mean_var(&self) -> Option<MeanVar> {
         mean_var(&self.data)
+    }
+
+    /// The per-bucket counts a histogram state holds, one per bucket of the family's
+    /// [`HistogramParams`](crate::HistogramParams) (D298); `None` unless the value is a
+    /// well-formed one.
+    pub fn histogram_counts(&self) -> Option<Vec<u64>> {
+        histogram_counts(&self.data)
+    }
+
+    /// The `q`-quantile (`0 ≤ q ≤ 1`) a quantile sketch holds
+    /// ([`Aggregation::Quantiles`](crate::Aggregation::Quantiles), D298): its bucket's
+    /// midpoint for the input of rank `⌊q·(n−1)⌋`, within a relative error of 2^-p while
+    /// nothing has collapsed. `None` unless the value is a well-formed sketch and `q` is in
+    /// range.
+    pub fn quantile(&self, q: f64) -> Option<f64> {
+        quantile(&self.data, q)
+    }
+
+    /// The number of inputs a quantile sketch holds.
+    pub fn quantiles_count(&self) -> Option<u64> {
+        quantiles_count(&self.data)
     }
 
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's

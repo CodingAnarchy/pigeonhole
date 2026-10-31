@@ -535,6 +535,125 @@ impl MergeOperator for ExactF64 {
     }
 }
 
+/// A histogram's or quantile sketch's operator (D298), the operator of a
+/// `FamilyKind::Histogram` or `Quantiles` family, built from the family's parameters
+/// (`kind_params`): operands are `ValueTag::F64` inputs or `ValueTag::Bytes` states
+/// (`pigeonhole_format::buckets`), and a merge or finish always leaves the canonical state.
+/// A refused input (NaN; for quantiles any non-finite value), a malformed state or one of
+/// other parameters, or another tag is a [`MergeError`].
+///
+/// ```
+/// use pigeonhole_compaction::{Buckets, MergeOperator};
+///
+/// let f = |x: f64| [&[2u8][..], &x.to_le_bytes()].concat();
+/// let op = Buckets::histogram(vec![0.0, 10.0]);
+/// let mut acc = f(5.0);
+/// op.merge(&mut acc, &f(-1.0)).unwrap();
+/// op.finish(Some(&f(50.0)), &mut acc).unwrap();
+/// let counts = pigeonhole_format::buckets::histogram_counts(&acc[1..], Some(3)).unwrap();
+/// assert_eq!(counts, [1, 1, 1]);
+/// ```
+#[derive(Debug, Clone)]
+pub struct Buckets {
+    kind: BucketsKind,
+}
+
+#[derive(Debug, Clone)]
+enum BucketsKind {
+    Histogram(Arc<[f64]>),
+    Quantiles(pigeonhole_format::buckets::QuantileParams),
+}
+
+impl Buckets {
+    /// The name of the histogram operator.
+    pub const HISTOGRAM: &'static str = "pigeonhole.f64_histogram";
+    /// The name of the quantile sketch operator.
+    pub const QUANTILES: &'static str = "pigeonhole.f64_quantiles";
+
+    /// A histogram's operator over `bounds` (checked by the caller: finite, strictly
+    /// increasing, 1 to 1023 of them).
+    pub fn histogram(bounds: Vec<f64>) -> Self {
+        Buckets {
+            kind: BucketsKind::Histogram(bounds.into()),
+        }
+    }
+
+    /// A quantile sketch's operator with `params` (checked by the caller).
+    pub fn quantiles(params: pigeonhole_format::buckets::QuantileParams) -> Self {
+        Buckets {
+            kind: BucketsKind::Quantiles(params),
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self.kind {
+            BucketsKind::Histogram(_) => Self::HISTOGRAM,
+            BucketsKind::Quantiles(_) => Self::QUANTILES,
+        }
+    }
+
+    /// Folds the stored value `v` (an input or a state) into the raw state `state`.
+    fn fold(&self, state: &mut Vec<u8>, v: &[u8]) -> Result<(), MergeError> {
+        use pigeonhole_format::buckets;
+        let bad = |e: buckets::BucketError| MergeError::new(self.label(), e.0);
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::F64 as u8 => {
+                let x = <[u8; 8]>::try_from(rest)
+                    .map(f64::from_le_bytes)
+                    .map_err(|_| MergeError::new(self.label(), "operand is not an f64"))?;
+                match &self.kind {
+                    BucketsKind::Histogram(b) => buckets::histogram_add(state, b, x),
+                    BucketsKind::Quantiles(p) => buckets::quantiles_add(state, *p, x),
+                }
+                .map_err(bad)
+            }
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => match &self.kind {
+                BucketsKind::Histogram(b) => buckets::histogram_merge(state, b, rest),
+                BucketsKind::Quantiles(p) => buckets::quantiles_merge(state, *p, rest),
+            }
+            .map_err(bad),
+            _ => Err(MergeError::new(
+                self.label(),
+                "operand is not an f64 or a state",
+            )),
+        }
+    }
+
+    /// `acc` as the state of `acc` and `other`, tagged `ValueTag::Bytes`, built in the
+    /// thread's scratch buffer.
+    fn combine(&self, acc: &mut Vec<u8>, other: Option<&[u8]>) -> Result<(), MergeError> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        SCRATCH.with(|scratch| {
+            let mut state = scratch.borrow_mut();
+            state.clear();
+            self.fold(&mut state, acc)?;
+            if let Some(o) = other {
+                self.fold(&mut state, o)?;
+            }
+            acc.clear();
+            acc.push(ValueTag::Bytes as u8);
+            acc.extend_from_slice(&state);
+            Ok(())
+        })
+    }
+}
+
+impl MergeOperator for Buckets {
+    fn name(&self) -> &str {
+        self.label()
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        self.combine(acc, Some(older))
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        self.combine(acc, base)
+    }
+}
+
 /// Built-in HyperLogLog union, the operator of a `FamilyKind::Hll` family (D294): operands
 /// and values are `ValueTag::Bytes` sketches (`pigeonhole_format::hll`), and the result is
 /// their register-wise maximum, in canonical form. It folds in place: no decode, no re-encode,
@@ -638,6 +757,9 @@ impl MergeRegistry {
         for op in [ExactF64::SUM, ExactF64::MEAN_VAR] {
             r.register(Arc::new(op));
         }
+        // Their names only: a family of these kinds binds its own, from its parameters.
+        r.register(Arc::new(Buckets::histogram(vec![0.0])));
+        r.register(Arc::new(Buckets::quantiles(Default::default())));
         r
     }
 

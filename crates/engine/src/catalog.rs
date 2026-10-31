@@ -5,7 +5,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use pigeonhole_compaction::{
-    Bitwise, ExactF64, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeOperator, MergeRegistry,
+    Bitwise, Buckets, ExactF64, F64Extreme, HllUnion, I64Add, I64Max, I64Min, MergeOperator,
+    MergeRegistry,
 };
 use pigeonhole_format::hash::{FastMap, FastSet};
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
@@ -36,6 +37,10 @@ pub(crate) const F64_MAX: &str = "pigeonhole.f64_max";
 /// Names of the built-in exact `f64` aggregations (`pigeonhole_compaction::ExactF64`, D298).
 pub(crate) const F64_SUM: &str = "pigeonhole.f64_sum";
 pub(crate) const F64_MEAN_VAR: &str = "pigeonhole.f64_mean_var";
+/// Names of the built-in histogram and quantile operators (`pigeonhole_compaction::Buckets`,
+/// D298), built from each family's `kind_params`.
+pub(crate) const F64_HISTOGRAM: &str = Buckets::HISTOGRAM;
+pub(crate) const F64_QUANTILES: &str = Buckets::QUANTILES;
 
 /// The operator an aggregate family of `kind` folds with, by name (D179, D294); `None` for
 /// a standard family, whose operator is its own choice.
@@ -53,6 +58,8 @@ pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
         FamilyKind::MaxF64 => Some(F64_MAX),
         FamilyKind::SumF64 => Some(F64_SUM),
         FamilyKind::MeanVar => Some(F64_MEAN_VAR),
+        FamilyKind::Histogram => Some(F64_HISTOGRAM),
+        FamilyKind::Quantiles => Some(F64_QUANTILES),
     }
 }
 
@@ -72,11 +79,14 @@ pub(crate) fn builtin_kind(name: &str) -> Option<FamilyKind> {
         F64_MAX => FamilyKind::MaxF64,
         F64_SUM => FamilyKind::SumF64,
         F64_MEAN_VAR => FamilyKind::MeanVar,
+        F64_HISTOGRAM => FamilyKind::Histogram,
+        F64_QUANTILES => FamilyKind::Quantiles,
         _ => return None,
     })
 }
 
-/// The tags `kind`'s `kind_params` define (D298): none for every kind so far.
+/// The tags `kind`'s `kind_params` define (D298): a histogram's bounds, a quantile sketch's
+/// mantissa bits and bucket limit (`pigeonhole_format::buckets`); none for the other kinds.
 pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
     match kind {
         FamilyKind::Standard
@@ -91,11 +101,34 @@ pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
         | FamilyKind::MaxF64
         | FamilyKind::SumF64
         | FamilyKind::MeanVar => &[],
+        FamilyKind::Histogram => &[pigeonhole_format::buckets::TAG_BOUNDS],
+        FamilyKind::Quantiles => &[
+            pigeonhole_format::buckets::TAG_MANTISSA_BITS,
+            pigeonhole_format::buckets::TAG_MAX_BUCKETS,
+        ],
     }
 }
 
-/// The built-in operator of an aggregate kind (never a registered one: the kind fixes it).
-fn builtin_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
+/// The built-in operator of an aggregate family (never a registered one: the kind fixes
+/// it), built from its `kind_params` where the kind takes them; the parameters' fault if
+/// they are malformed.
+pub(crate) fn builtin_operator(
+    options: &FamilyOptions,
+) -> std::result::Result<Option<Arc<dyn MergeOperator>>, &'static str> {
+    use pigeonhole_format::buckets;
+    Ok(match options.kind {
+        FamilyKind::Histogram => Some(Arc::new(Buckets::histogram(
+            buckets::histogram_bounds(&options.kind_params).map_err(|e| e.0)?,
+        ))),
+        FamilyKind::Quantiles => Some(Arc::new(Buckets::quantiles(
+            buckets::QuantileParams::parse(&options.kind_params).map_err(|e| e.0)?,
+        ))),
+        kind => fixed_operator(kind),
+    })
+}
+
+/// The operator of a kind without parameters.
+fn fixed_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
     match kind {
         FamilyKind::Standard => None,
         FamilyKind::Counter => Some(Arc::new(I64Add)),
@@ -109,6 +142,7 @@ fn builtin_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
         FamilyKind::MaxF64 => Some(Arc::new(F64Extreme::MAX)),
         FamilyKind::SumF64 => Some(Arc::new(ExactF64::SUM)),
         FamilyKind::MeanVar => Some(Arc::new(ExactF64::MEAN_VAR)),
+        FamilyKind::Histogram | FamilyKind::Quantiles => unreachable!("built from parameters"),
     }
 }
 
@@ -279,7 +313,13 @@ impl Catalog {
                         }
                     }
                 }
-                let (merge, merge_op) = if let Some(op) = builtin_operator(options.kind) {
+                let builtin = builtin_operator(options).map_err(|why| {
+                    Error::Corruption(format!(
+                        "family {} of kind {:?}: its parameters: {why}",
+                        family.0, options.kind
+                    ))
+                })?;
+                let (merge, merge_op) = if let Some(op) = builtin {
                     // An aggregate family folds with its kind's operator (writes refuse any
                     // other name, `check_merge_operator`).
                     if aggregate_operator(options.kind) != Some(name) {
@@ -894,6 +934,8 @@ mod cow_tests {
             K::MaxF64,
             K::SumF64,
             K::MeanVar,
+            K::Histogram,
+            K::Quantiles,
         ];
         for kind in kinds {
             if let Some(name) = aggregate_operator(kind) {

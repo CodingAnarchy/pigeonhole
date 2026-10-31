@@ -4644,24 +4644,38 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
                 kind_name(meta.options.kind)
             )));
         }
-    } else if matches!(meta.options.kind, FamilyKind::SumF64 | FamilyKind::MeanVar) {
-        // Finite `f64` inputs and puts; a put may also set a bucket to a well-formed state of
-        // the kind, as `phdb load` writes one back (D298).
-        let finite_f64 = m.value.len() == 9
-            && m.value[0] == ValueTag::F64 as u8
-            && f64::from_le_bytes(m.value[1..9].try_into().expect("9 bytes")).is_finite();
+    } else if matches!(
+        meta.options.kind,
+        FamilyKind::SumF64 | FamilyKind::MeanVar | FamilyKind::Histogram | FamilyKind::Quantiles
+    ) {
+        // `f64` inputs and puts (finite, or for a histogram anything but NaN); a put may also
+        // set a bucket to a well-formed state of the family, as `phdb load` writes one back
+        // (D298). Only the family's operator knows its parameters, so it judges a state.
+        let x = (m.value.len() == 9 && m.value[0] == ValueTag::F64 as u8)
+            .then(|| f64::from_le_bytes(m.value[1..9].try_into().expect("9 bytes")));
+        let input_ok = x.is_some_and(|x| {
+            if meta.options.kind == FamilyKind::Histogram {
+                !x.is_nan()
+            } else {
+                x.is_finite()
+            }
+        });
         let state = || {
             m.value.first() == Some(&(ValueTag::Bytes as u8))
-                && if meta.options.kind == FamilyKind::SumF64 {
-                    pigeonhole_format::exact::sum_validate(&m.value[1..]).is_ok()
-                } else {
-                    pigeonhole_format::exact::mean_var_validate(&m.value[1..]).is_ok()
-                }
+                && meta.merge_op.as_ref().is_some_and(|op| {
+                    let mut v = m.value.to_vec();
+                    op.finish(None, &mut v).is_ok() && v == m.value
+                })
         };
-        if !(finite_f64 || (m.kind == Kind::Put && state())) {
+        if !(input_ok || (m.kind == Kind::Put && state())) {
+            let what = if meta.options.kind == FamilyKind::Histogram {
+                "f64 inputs, never NaN,"
+            } else {
+                "finite f64 inputs"
+            };
             return Err(Error::InvalidArgument(format!(
-                "{} is a {} family: it takes finite f64 inputs (aggregate_f64) and puts of a \
-                 finite f64 or a well-formed state",
+                "{} is a {} family: it takes {what} (aggregate_f64) and puts of such an f64 \
+                 or a well-formed state of the family",
                 family_name(catalog, m.table, m.family),
                 kind_name(meta.options.kind)
             )));
@@ -4707,6 +4721,8 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::MaxF64 => "max_f64",
         FamilyKind::SumF64 => "sum_f64",
         FamilyKind::MeanVar => "mean_var",
+        FamilyKind::Histogram => "histogram",
+        FamilyKind::Quantiles => "quantiles",
         FamilyKind::Standard => "standard",
     }
 }
@@ -4761,20 +4777,21 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
                 pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
                 Some(v)
             }
-            (FamilyKind::SumF64 | FamilyKind::MeanVar, Kind::Put)
-                if m.value.first() == Some(&(ValueTag::F64 as u8)) =>
-            {
-                let x = f64::from_le_bytes(m.value[1..9].try_into().expect("checked"));
-                let mut state = Vec::new();
-                let added = if kind == FamilyKind::SumF64 {
-                    pigeonhole_format::exact::sum_add(&mut state, x)
-                } else {
-                    pigeonhole_format::exact::mean_var_add(&mut state, x)
-                };
-                added.expect("check_counter_write admitted a finite f64");
-                let mut v = Vec::with_capacity(1 + state.len());
-                v.push(ValueTag::Bytes as u8);
-                v.extend_from_slice(&state);
+            (
+                FamilyKind::SumF64
+                | FamilyKind::MeanVar
+                | FamilyKind::Histogram
+                | FamilyKind::Quantiles,
+                Kind::Put,
+            ) if m.value.first() == Some(&(ValueTag::F64 as u8)) => {
+                // The family's operator makes the one-input state (it holds the parameters).
+                let op = catalog
+                    .family(m.family)
+                    .and_then(|f| f.merge_op.clone())
+                    .expect("an aggregate family binds its built-in operator");
+                let mut v = m.value.to_vec();
+                op.finish(None, &mut v)
+                    .expect("check_counter_write admitted the f64");
                 Some(v)
             }
             _ => None,
@@ -4852,7 +4869,8 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
             kind_name(kind)
         )));
     }
-    // `kind_params` (D298): only the tags the kind defines, and none for every kind so far.
+    // `kind_params` (D298): only the tags the kind defines (a histogram's bounds, a quantile
+    // sketch's mantissa bits and bucket limit), with values in range.
     if !options.kind_params.is_empty() {
         let defined = crate::catalog::kind_param_tags(options.kind);
         let entries = pigeonhole_format::kind_params::parse(&options.kind_params)
@@ -4864,6 +4882,12 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
             )));
         }
     }
+    crate::catalog::builtin_operator(options).map_err(|why| {
+        Error::InvalidArgument(format!(
+            "a {} family's parameters: {why}",
+            kind_name(options.kind)
+        ))
+    })?;
     // An HLL family's sketches, and an exact sum's or mean-variance state, are never
     // separated into blob files (D294, D298): a payload longer than the threshold is, so the
     // threshold must reach the largest one (3076, 274 or 821 bytes).

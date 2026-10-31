@@ -3,7 +3,10 @@
 
 use std::time::Duration;
 
-use pigeonhole::{Aggregation, Compaction, Compression, Family, FamilyInfo, Priority};
+use pigeonhole::{
+    Aggregation, Compaction, Compression, Family, FamilyInfo, HistogramParams, Priority,
+    QuantileParams,
+};
 use serde_json::{Map, Value, json};
 
 /// A family's stored options as JSON fields (`name` first).
@@ -29,8 +32,19 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
             Aggregation::MaxF64 => "max_f64",
             Aggregation::SumF64 => "sum_f64",
             Aggregation::MeanVar => "mean_var",
+            Aggregation::Histogram(_) => "histogram",
+            Aggregation::Quantiles(_) => "quantiles",
             _ => "unknown",
         }),
+        // A histogram's bounds, a quantile sketch's parameters (D298).
+        "aggregation_params": match &f.aggregation {
+            Some(Aggregation::Histogram(h)) => json!({ "bounds": h.bounds() }),
+            Some(Aggregation::Quantiles(q)) => json!({
+                "mantissa_bits": q.get_mantissa_bits(),
+                "max_buckets": q.get_max_buckets(),
+            }),
+            _ => Value::Null,
+        },
         "max_versions": f.max_versions,
         "ttl_micros": f.ttl.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX)),
         "bloom_bits": f.bloom_bits,
@@ -78,6 +92,34 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
         (Some("max_f64"), _) => Family::aggregate(Aggregation::MaxF64),
         (Some("sum_f64"), _) => Family::aggregate(Aggregation::SumF64),
         (Some("mean_var"), _) => Family::aggregate(Aggregation::MeanVar),
+        (Some("histogram"), _) => {
+            let bounds: Vec<f64> = v["aggregation_params"]["bounds"]
+                .as_array()
+                .ok_or_else(|| format!("family {name}: a histogram needs its bounds"))?
+                .iter()
+                .map(|b| {
+                    b.as_f64()
+                        .ok_or_else(|| format!("family {name}: a bound is not a number"))
+                })
+                .collect::<Result<_, _>>()?;
+            let params = HistogramParams::new(bounds).map_err(|e| format!("family {name}: {e}"))?;
+            Family::aggregate(Aggregation::Histogram(params))
+        }
+        (Some("quantiles"), _) => {
+            let p = &v["aggregation_params"];
+            let mut q = QuantileParams::default();
+            if let Some(n) = p["mantissa_bits"].as_u64() {
+                q = q.mantissa_bits(
+                    u8::try_from(n).map_err(|_| format!("family {name}: bad mantissa_bits"))?,
+                );
+            }
+            if let Some(n) = p["max_buckets"].as_u64() {
+                q = q.max_buckets(
+                    u16::try_from(n).map_err(|_| format!("family {name}: bad max_buckets"))?,
+                );
+            }
+            Family::aggregate(Aggregation::Quantiles(q))
+        }
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
         (None, _) => Family::default(),
     };

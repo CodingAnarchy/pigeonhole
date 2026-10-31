@@ -3321,6 +3321,47 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Mutation:** a sum that drops merged operands fails 26 of the 33 engine `scalar_counters` tests.
 - **API, phdb and corpus:** a `pigeonhole` API test and a phdb shell test. The `aggregates` corpus entry gains `total` (SumF64) and `spread` (MeanVar).
 
+**What (PR 3: histograms and quantiles, the first `kind_params` tags).**
+- **Kinds:** `Histogram` (12) and `Quantiles` (13), with operators `pigeonhole.f64_histogram` and `pigeonhole.f64_quantiles` (`Buckets`), under bit 0.
+- **Parameters** (FORMAT §9.2.1): a histogram's bounds (tag 1, required: finite, strictly increasing, 1 to 1023, never `-0.0`); a quantile sketch's mantissa bits (tag 1, 1–12, default 7) and bucket limit per store (tag 2, 16–4096, default 2048).
+  - The catalog builds each family's operator from its parameters: `builtin_operator` now takes the family's options.
+  - Bad values are `InvalidArgument` at creation and `Corruption` when a manifest is read.
+- **States** (`pigeonhole_format::buckets`, FORMAT §3.4, §3.5):
+  - **Histogram:** the bucket count and per-bucket counts, with trailing zeros dropped. Buckets are found by binary search with `total_cmp`.
+  - **Quantiles:** `p`, a zero count, and sparse positive and negative stores. An index is `bits(x) >> (52 − p)` (log-linear, no `ln`). Each store collapses at the threshold of revision 1's S3. A quantile is the exact midpoint of the bucket at rank `⌊q·(n−1)⌋`.
+  - Both states carry what a read needs except a histogram's bounds, which come from the family's parameters, since a `CellRef` has no family context. So a read is `histogram_counts()` plus `HistogramParams::bounds()`, not one `histogram()` accessor.
+- **Values, as PR 2:**
+  - Inputs stay `F64` operands, which the operator folds into the canonical state.
+  - A `put_f64` becomes the one-input state through the family's operator, which also judges a state put (the parameters must match).
+  - Histograms take infinities; quantiles take finite inputs only. NaN is refused in both.
+- **An aggregate family's values are never separated into blob files** (`FamilyOptions::separation_threshold`, at flush and compaction, as at commit since PR 2). A quantile sketch at the default limit can reach about 80 KiB, so a `blob_threshold` floor like HLL's would be hostile. PR 5's separated bases for Bloom and Set will refine this rule.
+- **API** (ICR 0096):
+  - `Aggregation::Histogram(HistogramParams)` and `Aggregation::Quantiles(QuantileParams)`. These are the first data-carrying variants, which is why PR 1 dropped `Copy`.
+  - `HistogramParams::new(bounds) -> Result`, `bounds()`, `bucket_of(x)`. `QuantileParams::default().mantissa_bits(p).max_buckets(n)`.
+  - `CellRef::histogram_counts`, `quantile(q)` and `quantiles_count`.
+  - `FamilyInfo::aggregation` carries the parameters back.
+  - phdb: `"aggregation_params"` in the schema JSON (`dump`/`load` round-trip it), and the shell's `:histogram=b0,…` and `:quantiles[=p,n]`.
+
+**Tests (PR 3).**
+- **Format:**
+  - quantile merges in random groupings give the bytes of one-shot adding, through frequent collapses (S3's test);
+  - quantiles within 2^-p of the exact order statistic over 30 binades;
+  - histogram counts against a direct count, in any grouping;
+  - malformed states and parameters.
+  - **Mutation:** collapsing into the lowest kept bucket instead of `t` fails the grouping test and a unit test.
+- **Engine (`it/bucket_aggregates.rs`):**
+  - folds through flushes, compactions and checkpoints, compared with the format's states;
+  - puts of an `f64` or the family's own state, and another family's state refused;
+  - input refusals;
+  - parameter checks at creation;
+  - a collapsed sketch past a `blob_threshold` of 8 staying inline. Making aggregate values separate again fails the test.
+- **Model checks:**
+  - `ModelAggregation::{Histogram, Quantiles}` are state kinds with fixed model parameters (`MODEL_HISTOGRAM_BOUNDS`; `p = 3`, 16 buckets, so the workload's magnitudes collapse).
+  - Their oracle (`pigeonhole_sim::bucket_state`) is written apart from the format crate: plain counts and `BTreeMap` stores, one collapse at the end, its own codec. A test checks that the two agree.
+  - `scalar_counters` trades `sum` and `band` for `fhist` and `fq_ttl`, staying at 32 slots until #1219.
+  - **Mutations:** a histogram bound check off by one, and a collapse threshold off by one, each fail 27 of 33 engine `scalar_counters` tests.
+- **API, phdb and corpus:** a `pigeonhole` API test; a phdb shell test; snapshots updated for `aggregation_params`. The corpus `aggregates` entry gains `latency_h` and `latency_q`.
+
 <a id="d300"></a>
 ## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)
 **Why.** On macOS CI a reader process saw the visible seqno go from 21169 to 21162 (`crates/shm/tests/multiprocess.rs`, seed 1592590338). FORMAT §11.3's step 1, `pending[shard].store(next_seqno.load())`, was a load and a separate store. Another shard could reserve a seqno, raise the mirror, apply it and release its hold in between, so the visible seqno passed it. The stale bound then landed below it, and the visible seqno went back until the first shard published its reservation. It's an interleaving, not a memory-ordering effect: it reproduces in one thread, through the public API. Nothing unapplied ever became visible, but snapshots weren't monotonic: a later snapshot, in-process or in a reader process, could miss a commit an earlier one included, including a writer's own acknowledged commit.

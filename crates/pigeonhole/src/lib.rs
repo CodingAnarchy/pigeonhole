@@ -164,8 +164,8 @@ pub use info::{
 };
 pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
 pub use options::{
-    Aggregation, Compaction, CpuProfile, Family, IoBackend, IoRings, Options, Priority,
-    ReaderOptions, Recovery, days,
+    Aggregation, Compaction, CpuProfile, Family, HistogramParams, IoBackend, IoRings, Options,
+    Priority, QuantileParams, ReaderOptions, Recovery, days,
 };
 pub use read::{Condition, RowIter, RowRead, Scan, ValueFilter};
 pub use recovery::RecoveryStats;

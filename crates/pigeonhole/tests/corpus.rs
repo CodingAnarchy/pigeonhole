@@ -205,7 +205,8 @@ fn entries() -> Vec<Entry> {
 }
 
 /// Min, max and HLL families (D294, the first `incompat` feature bit), and the bitwise, `f64`,
-/// exact-sum and mean-variance families (D298, the same bit): inputs at the fixed timestamp and in buckets, puts,
+/// exact-sum, mean-variance, histogram and quantile families (D298, the same bit; the last
+/// two with `kind_params`): inputs at the fixed timestamp and in buckets, puts,
 /// deletes and checkpointed reads, sparse and dense sketches, signed zeros and infinities;
 /// flushed, then more in the WAL that the crash leaves for replay.
 fn write_aggregates(db: &Pigeonhole) {
@@ -222,6 +223,20 @@ fn write_aggregates(db: &Pigeonhole) {
         .family("warmest", Family::aggregate(Aggregation::MaxF64))
         .family("total", Family::aggregate(Aggregation::SumF64))
         .family("spread", Family::aggregate(Aggregation::MeanVar))
+        .family(
+            "latency_h",
+            Family::aggregate(Aggregation::Histogram(
+                pigeonhole::HistogramParams::new([-1.0, 0.0, 10.0, 100.0]).unwrap(),
+            )),
+        )
+        .family(
+            "latency_q",
+            Family::aggregate(Aggregation::Quantiles(
+                pigeonhole::QuantileParams::default()
+                    .mantissa_bits(4)
+                    .max_buckets(16),
+            )),
+        )
         .create()
         .unwrap();
     for i in 0..40u64 {
@@ -261,7 +276,10 @@ fn write_aggregates(db: &Pigeonhole) {
         m = m
             .aggregate_f64("total", b"all", y)
             .aggregate_f64_at("total", b"hourly", T0 + (i % 4) * 3_600_000_000, y)
-            .aggregate_f64("spread", b"all", y);
+            .aggregate_f64("spread", b"all", y)
+            .aggregate_f64("latency_h", b"all", x)
+            .aggregate_f64_at("latency_h", b"hourly", T0 + (i % 4) * 3_600_000_000, y)
+            .aggregate_f64("latency_q", b"all", y);
         // Row a00's distinct users pass the sparse/dense boundary; the others stay sparse.
         let users = if i % 6 == 0 { 400 } else { 3 };
         for u in 0..users {

@@ -129,6 +129,43 @@ The value of a mean-variance family's cell (§9.2 `kind` 11, D298) holds the inp
 
 A state is at most 821 bytes. The encoding bytes 2 and 3 keep these states apart from an HLL sketch (§3.1, encoding 1).
 
+### 3.4 Histogram
+
+The value of a histogram family's cell (§9.2 `kind` 12, D298) counts its inputs in the buckets the family's bounds give (§9.2.1 tag 1). `n` bounds `b0 < … < b(n-1)` make `n + 1` buckets, `(-∞, b0)`, `[b0, b1)`, …, `[b(n-1), +∞)`. An input's bucket is the number of bounds at or below it in IEEE 754 `totalOrder`, so `-0.0` lies below a bound of `0.0`. Infinities fall in the end buckets; NaN is refused at write.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 4 |
+| 1 | varint | bucket count `n + 1` (the family's) |
+| … | varints | the counts, first bucket first, trailing zero counts dropped (so the last is nonzero) |
+
+Merging adds the counts. A state with the wrong bucket count, a trailing zero, or no input is malformed.
+
+### 3.5 Quantile sketch
+
+The value of a quantile family's cell (§9.2 `kind` 13, D298) is a log-linear sketch of its finite inputs, with the family's mantissa bits `p` (1–12, default 7) and bucket limit (16–4096 per store, default 2048; §9.2.1 tags 1 and 2).
+- **Index:** a positive `x` maps to `bits(x) >> (52 − p)`, its binary exponent and top `p` mantissa bits. A bucket's values then lie within a factor `1 + 2^-p`, with no logarithm computed.
+- **Stores:** negative inputs map their magnitude into a second store, and zeros (either sign) are counted apart.
+- **Collapse** (D298 revision 1's S3): when a store's indexes span more than the limit, set `t = max_index − limit + 1`; every bucket below `t` folds into bucket `t`, which is created if absent. `t` depends only on the store's largest index, which only grows, so collapsing after every merge gives what one collapse at the end would. Merges are associative and commutative.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | encoding: 5 |
+| 1 | 1 | `p` (the family's) |
+| 2 | varint | the zero count |
+| … | | the positive store, then the negative store: each a bucket count `k` (varint), then `k` pairs (varints): the first bucket's index and count, then each later bucket's index gap (at least 1) and count (at least 1) |
+
+**Malformed:** a state is malformed if any of these hold:
+- its `p` is not the family's;
+- a store is not collapsed;
+- a count is zero;
+- an index lies past the `f64` range (`≥ 2^(11 + p)`);
+- it holds no input.
+
+**Read:** the `q`-quantile is the midpoint of the bucket holding the input of rank `⌊q·(n−1)⌋`, in increasing order. The midpoint is the bucket's lower edge's bits with the bit below the kept ones set, which is exact. It is within 2^-p of the input while its store has not collapsed. A zero reads `0.0`, a negative bucket its midpoint negated.
+
+**Storage:** an aggregate family's values are never separated into blob files, at flush, compaction or commit (D298): the built-in operators fold stored values, never blob pointers. A family's `blob_threshold` therefore does not apply to them.
+
 ## 4. Blocks
 
 ### 4.1 Physical block
@@ -280,7 +317,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 
 | Set | Bit | Feature |
 |---|---|---|
-| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 11 so far, and a family's `kind_params`, §9.2.1). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 13 so far, and a family's `kind_params`, §9.2.1). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
 
@@ -339,7 +376,7 @@ The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log
 
 Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know, where §9.3's tag ranges allow it. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
 
-*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, 10 SumF64, 11 MeanVar, decision D298), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`), `pigeonhole.f64_sum`, `pigeonhole.f64_mean_var` (SumF64, MeanVar: finite `F64` inputs, values the states of §3.2 and §3.3); another name is `Corrupt`. Kinds 2 to 11 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, 10 SumF64, 11 MeanVar, 12 Histogram, 13 Quantiles, decision D298), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`), `pigeonhole.f64_sum`, `pigeonhole.f64_mean_var` (SumF64, MeanVar: finite `F64` inputs, values the states of §3.2 and §3.3), `pigeonhole.f64_histogram`, `pigeonhole.f64_quantiles` (Histogram, Quantiles: `F64` inputs, values the states of §3.4 and §3.5, built from the family's `kind_params`); another name is `Corrupt`. Kinds 2 to 13 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
 
 #### 9.2.1 Kind parameters
 
@@ -355,7 +392,11 @@ A reader takes both as no parameters, and ignores bytes after the field (later a
 - Tags 128 to 255 are skippable hints, ignored by a build that doesn't know them.
 - A kind fixes its tags and their value encodings when it lands. A later must-understand tag on an existing kind takes a new `incompat` bit.
 
-No kind defines a tag yet: the field is reserved for the #488 kinds that take parameters (histogram bounds, quantile thresholds, bloom sizing) and for #490's vector kind. A writer refuses any tag the family's kind doesn't define.
+The tags defined so far (D298):
+- **Histogram** (`kind` 12): tag 1, its bounds, as `n` `f64` LE (1 ≤ `n` ≤ 1023; finite, strictly increasing, never `-0.0`). Required.
+- **Quantiles** (`kind` 13): tag 1, the mantissa bits `p` (u8, 1–12, default 7); tag 2, the bucket limit per store (u16 LE, 16–4096, default 2048). Both optional.
+
+Values out of range are `Corrupt` at read. A writer refuses them, and any tag the family's kind doesn't define. #488's bloom kind and #490's vector kind will add their own tags.
 
 *SstMeta* = `id` u64, `extent` extent, `len` u64, `smallest_key` bytes, `largest_key` bytes, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `entries` u64, `deletes` u64.
 
@@ -671,7 +712,7 @@ How each feature tracked for after 1.0 fits format 4 (D269 §3). The bit numbers
 | Feature | Path |
 |---|---|
 | Min, Max and HLL families (#487) | `FamilyKind` 2, 3 and 4 behind `incompat` bit 0, the first real feature bit (D294, §8.2); an HLL value is a `Bytes` sketch with a fixed encoding (§3.1) |
-| More aggregations (#488) | more `FamilyKind` values under `incompat` bit 0 (5 to 11: bitwise, `f64` min/max, exact sum and mean/variance, D298), plus the optional `kind_params` field appended to `PutFamily` (§9.2.1) |
+| More aggregations (#488) | more `FamilyKind` values under `incompat` bit 0 (5 to 13: bitwise, `f64` min/max, exact sum, mean/variance, histograms and quantiles, D298), plus the optional `kind_params` field appended to `PutFamily` (§9.2.1) |
 | Adjacency sets, roaring (#489) | a `FamilyKind` value and a value encoding, behind a bit |
 | Vector values (#490) | a value tag (0x04) behind an `incompat` bit; payload alignment as a data-block kind (6) or an entry flag under the same bit; dimension and metric in `kind_params` |
 | Time-series codec (#491) | a compression code (3..) or a block kind, behind an `incompat` bit |
