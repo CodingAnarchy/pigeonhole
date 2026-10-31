@@ -2517,7 +2517,7 @@ impl Run {
                 let (m, n) = ((ms % 4) as u32, (ms / 4) % 4);
                 // Every other seqno it reads the get's family instead, so counter, TTL and
                 // versioned families keep their traversal coverage.
-                let tf = if has_graph_family() && ms % 2 == 0 {
+                let tf = if has_graph_family() && ms.is_multiple_of(2) {
                     GRAPH_FAMILY
                 } else {
                     family.as_str()
