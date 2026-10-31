@@ -839,6 +839,33 @@ impl KeyCursor {
         self.reads[i].lane.data(|| view)
     }
 
+    /// D308: positions the current key's reads to resume after a column (see
+    /// [`ReduceSpec::resume`](crate::ReduceSpec)): whether the row has a cell left to read.
+    pub(super) fn resume_in_row(&mut self, resume: &super::reduce::Resume) -> Result<bool> {
+        if self.current.is_none() {
+            return Ok(false);
+        }
+        if let Some(i) = self.last_lane.take() {
+            let fetched = self.reads[i].lane.fetch();
+            self.snapshot.checked(fetched)?;
+        }
+        let mut any = false;
+        for r in &mut self.reads {
+            let rank = self
+                .families
+                .iter()
+                .position(|f| *f == r.lane.family)
+                .unwrap_or(usize::MAX) as u32;
+            // The escaped row without its terminator, as the reduce loop's rows are.
+            let row_esc = &self.prefix[..self.row_esc_len];
+            let applied = resume.apply(&mut r.lane, rank, row_esc);
+            self.snapshot.checked(applied)?;
+            any |= super::reduce::in_row(&r.lane, row_esc);
+        }
+        self.lane_idx = 0;
+        Ok(any)
+    }
+
     /// Drops the current key's remaining cells without reading them: the next
     /// [`KeyCursor::next_key`] moves every source on from where it is (D296's `NextRow`).
     pub fn skip_rest_of_key(&mut self) {
