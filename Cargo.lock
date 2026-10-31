@@ -1201,6 +1201,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole-vector"
+version = "1.0.0"
+dependencies = [
+ "pigeonhole",
+]
+
+[[package]]
 name = "pigeonhole-wal"
 version = "2.0.0"
 dependencies = [
