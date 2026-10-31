@@ -1050,6 +1050,16 @@ pub enum Aggregation {
     MinF64,
     /// The largest `f64` input, as [`Aggregation::MinF64`].
     MaxF64,
+    /// The exact sum of finite `f64` inputs
+    /// ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read with
+    /// [`CellRef::sum_f64`](crate::CellRef::sum_f64)), rounded once when read: the same
+    /// inputs read the same sum in any order. A cell is a state of up to 274 bytes.
+    SumF64,
+    /// The count, mean and variance of finite `f64` inputs
+    /// ([`aggregate_f64`](crate::RowMutation::aggregate_f64); read with
+    /// [`CellRef::mean_var`](crate::CellRef::mean_var)), each computed exactly and rounded
+    /// once. A cell is a state of up to 821 bytes.
+    MeanVar,
 }
 
 impl Aggregation {
@@ -1064,6 +1074,8 @@ impl Aggregation {
             Aggregation::BitXor => FamilyKind::BitXor,
             Aggregation::MinF64 => FamilyKind::MinF64,
             Aggregation::MaxF64 => FamilyKind::MaxF64,
+            Aggregation::SumF64 => FamilyKind::SumF64,
+            Aggregation::MeanVar => FamilyKind::MeanVar,
         }
     }
 
@@ -1080,6 +1092,8 @@ impl Aggregation {
             FamilyKind::BitXor => Some(Aggregation::BitXor),
             FamilyKind::MinF64 => Some(Aggregation::MinF64),
             FamilyKind::MaxF64 => Some(Aggregation::MaxF64),
+            FamilyKind::SumF64 => Some(Aggregation::SumF64),
+            FamilyKind::MeanVar => Some(Aggregation::MeanVar),
         }
     }
 
@@ -1094,6 +1108,8 @@ impl Aggregation {
             Aggregation::BitXor => "pigeonhole.u64_xor",
             Aggregation::MinF64 => "pigeonhole.f64_min",
             Aggregation::MaxF64 => "pigeonhole.f64_max",
+            Aggregation::SumF64 => "pigeonhole.f64_sum",
+            Aggregation::MeanVar => "pigeonhole.f64_mean_var",
         }
     }
 }

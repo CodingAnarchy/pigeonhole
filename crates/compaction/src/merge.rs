@@ -434,6 +434,107 @@ impl MergeOperator for F64Extreme {
     }
 }
 
+/// Exact `f64` aggregation (D298), the operator of a `FamilyKind::SumF64` or `MeanVar`
+/// family. Operands are `ValueTag::F64` inputs (finite) or `ValueTag::Bytes` states
+/// (`pigeonhole_format::exact`); a merge or finish always leaves the canonical state, so a
+/// bucket reads the same bytes however its inputs were grouped. A NaN or infinite input, a
+/// malformed state or another tag is a [`MergeError`].
+///
+/// ```
+/// use pigeonhole_compaction::{ExactF64, MergeOperator};
+///
+/// let f = |x: f64| [&[2u8][..], &x.to_le_bytes()].concat();
+/// let mut acc = f(1e100);
+/// ExactF64::SUM.merge(&mut acc, &f(1.0)).unwrap();
+/// ExactF64::SUM.finish(Some(&f(-1e100)), &mut acc).unwrap();
+/// assert_eq!(pigeonhole_format::exact::sum_read(&acc[1..]).unwrap(), 1.0);
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ExactF64 {
+    name: &'static str,
+    mean_var: bool,
+}
+
+impl ExactF64 {
+    /// `pigeonhole.f64_sum`.
+    pub const SUM: ExactF64 = ExactF64 {
+        name: "pigeonhole.f64_sum",
+        mean_var: false,
+    };
+    /// `pigeonhole.f64_mean_var`.
+    pub const MEAN_VAR: ExactF64 = ExactF64 {
+        name: "pigeonhole.f64_mean_var",
+        mean_var: true,
+    };
+
+    /// Folds the stored value `v` (an input or a state) into the raw state `state`.
+    fn fold(&self, state: &mut Vec<u8>, v: &[u8]) -> Result<(), MergeError> {
+        use pigeonhole_format::exact;
+        let bad = |e: exact::StateError| MergeError::new(self.name, e.0);
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::F64 as u8 => {
+                let x = <[u8; 8]>::try_from(rest)
+                    .map(f64::from_le_bytes)
+                    .map_err(|_| MergeError::new(self.name, "operand is not an f64"))?;
+                if self.mean_var {
+                    exact::mean_var_add(state, x).map_err(bad)
+                } else {
+                    exact::sum_add(state, x).map_err(bad)
+                }
+            }
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => {
+                if self.mean_var {
+                    exact::mean_var_validate(rest).map_err(bad)?;
+                    exact::mean_var_merge(state, rest).map_err(bad)
+                } else {
+                    exact::sum_validate(rest).map_err(bad)?;
+                    exact::sum_merge(state, rest).map_err(bad)
+                }
+            }
+            _ => Err(MergeError::new(
+                self.name,
+                "operand is not an f64 or a state",
+            )),
+        }
+    }
+
+    /// `acc` as the state of `acc` and `other`, tagged `ValueTag::Bytes`. The state is built
+    /// in a scratch buffer the thread keeps (perf287's N1 on #1220): a fold of many operands
+    /// allocates nothing once the buffer has grown to the largest state.
+    fn combine(&self, acc: &mut Vec<u8>, other: Option<&[u8]>) -> Result<(), MergeError> {
+        thread_local! {
+            static SCRATCH: std::cell::RefCell<Vec<u8>> =
+                std::cell::RefCell::new(Vec::with_capacity(pigeonhole_format::exact::MEAN_VAR_MAX_LEN));
+        }
+        SCRATCH.with(|scratch| {
+            let mut state = scratch.borrow_mut();
+            state.clear();
+            self.fold(&mut state, acc)?;
+            if let Some(o) = other {
+                self.fold(&mut state, o)?;
+            }
+            acc.clear();
+            acc.push(ValueTag::Bytes as u8);
+            acc.extend_from_slice(&state);
+            Ok(())
+        })
+    }
+}
+
+impl MergeOperator for ExactF64 {
+    fn name(&self) -> &str {
+        self.name
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        self.combine(acc, Some(older))
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        self.combine(acc, base)
+    }
+}
+
 /// Built-in HyperLogLog union, the operator of a `FamilyKind::Hll` family (D294): operands
 /// and values are `ValueTag::Bytes` sketches (`pigeonhole_format::hll`), and the result is
 /// their register-wise maximum, in canonical form. It folds in place: no decode, no re-encode,
@@ -532,6 +633,9 @@ impl MergeRegistry {
             r.register(Arc::new(op));
         }
         for op in [F64Extreme::MIN, F64Extreme::MAX] {
+            r.register(Arc::new(op));
+        }
+        for op in [ExactF64::SUM, ExactF64::MEAN_VAR] {
             r.register(Arc::new(op));
         }
         r

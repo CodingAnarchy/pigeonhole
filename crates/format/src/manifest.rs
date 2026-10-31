@@ -265,6 +265,13 @@ pub enum FamilyKind {
     /// An `f64` maximum family (D298), as [`FamilyKind::MinF64`]. Needs
     /// [`INCOMPAT_AGGREGATES`].
     MaxF64 = 9,
+    /// An exact `f64` sum family (D298): inputs are finite `f64`s, and a bucket's value is
+    /// the exact sum's state ([`crate::exact`], FORMAT §3.2). Needs [`INCOMPAT_AGGREGATES`].
+    SumF64 = 10,
+    /// A mean-and-variance family (D298): inputs are finite `f64`s, and a bucket's value
+    /// holds their count, exact sum and exact sum of squares ([`crate::exact`], FORMAT
+    /// §3.3). Needs [`INCOMPAT_AGGREGATES`].
+    MeanVar = 11,
 }
 
 impl FamilyKind {
@@ -301,7 +308,9 @@ impl FamilyKind {
             | FamilyKind::BitAnd
             | FamilyKind::BitXor
             | FamilyKind::MinF64
-            | FamilyKind::MaxF64 => INCOMPAT_AGGREGATES,
+            | FamilyKind::MaxF64
+            | FamilyKind::SumF64
+            | FamilyKind::MeanVar => INCOMPAT_AGGREGATES,
         }
     }
 }
@@ -533,6 +542,8 @@ impl FamilyOptions {
                     7 => FamilyKind::BitXor,
                     8 => FamilyKind::MinF64,
                     9 => FamilyKind::MaxF64,
+                    10 => FamilyKind::SumF64,
+                    11 => FamilyKind::MeanVar,
                     k => {
                         return Err(Error::UnsupportedFeature {
                             what: "family kind",
@@ -1081,6 +1092,8 @@ mod encode_tests {
             FamilyKind::BitXor,
             FamilyKind::MinF64,
             FamilyKind::MaxF64,
+            FamilyKind::SumF64,
+            FamilyKind::MeanVar,
         ] {
             let plain = FamilyOptions::default().kind(kind);
             let bytes = put_family(plain.clone());

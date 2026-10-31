@@ -27,6 +27,8 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
             Aggregation::BitXor => "bit_xor",
             Aggregation::MinF64 => "min_f64",
             Aggregation::MaxF64 => "max_f64",
+            Aggregation::SumF64 => "sum_f64",
+            Aggregation::MeanVar => "mean_var",
             _ => "unknown",
         }),
         "max_versions": f.max_versions,
@@ -74,6 +76,8 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
         (Some("bit_xor"), _) => Family::aggregate(Aggregation::BitXor),
         (Some("min_f64"), _) => Family::aggregate(Aggregation::MinF64),
         (Some("max_f64"), _) => Family::aggregate(Aggregation::MaxF64),
+        (Some("sum_f64"), _) => Family::aggregate(Aggregation::SumF64),
+        (Some("mean_var"), _) => Family::aggregate(Aggregation::MeanVar),
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
         (None, _) => Family::default(),
     };

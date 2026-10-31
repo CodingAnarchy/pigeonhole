@@ -4644,6 +4644,28 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
                 kind_name(meta.options.kind)
             )));
         }
+    } else if matches!(meta.options.kind, FamilyKind::SumF64 | FamilyKind::MeanVar) {
+        // Finite `f64` inputs and puts; a put may also set a bucket to a well-formed state of
+        // the kind, as `phdb load` writes one back (D298).
+        let finite_f64 = m.value.len() == 9
+            && m.value[0] == ValueTag::F64 as u8
+            && f64::from_le_bytes(m.value[1..9].try_into().expect("9 bytes")).is_finite();
+        let state = || {
+            m.value.first() == Some(&(ValueTag::Bytes as u8))
+                && if meta.options.kind == FamilyKind::SumF64 {
+                    pigeonhole_format::exact::sum_validate(&m.value[1..]).is_ok()
+                } else {
+                    pigeonhole_format::exact::mean_var_validate(&m.value[1..]).is_ok()
+                }
+        };
+        if !(finite_f64 || (m.kind == Kind::Put && state())) {
+            return Err(Error::InvalidArgument(format!(
+                "{} is a {} family: it takes finite f64 inputs (aggregate_f64) and puts of a \
+                 finite f64 or a well-formed state",
+                family_name(catalog, m.table, m.family),
+                kind_name(meta.options.kind)
+            )));
+        }
     } else if !i64_value {
         let hint = match meta.options.kind {
             FamilyKind::Counter => "put_i64 / incr",
@@ -4683,6 +4705,8 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::BitXor => "bit_xor",
         FamilyKind::MinF64 => "min_f64",
         FamilyKind::MaxF64 => "max_f64",
+        FamilyKind::SumF64 => "sum_f64",
+        FamilyKind::MeanVar => "mean_var",
         FamilyKind::Standard => "standard",
     }
 }
@@ -4727,13 +4751,34 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
         }
         let ts = *m.ts.get_or_insert(COUNTER_TS);
         let key = (m.table, m.family, m.row, m.qualifier, ts);
-        // An HLL input's stored operand is the sketch of its element (D294).
-        let own = (kind == FamilyKind::Hll && m.kind == Kind::Merge).then(|| {
-            let mut v = Vec::with_capacity(9);
-            v.push(ValueTag::Bytes as u8);
-            pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
-            v
-        });
+        // An HLL input's stored operand is the sketch of its element (D294); an exact sum's
+        // or mean-variance put of an `f64` is the state of that one input (D298), so every
+        // value a bucket holds is a state (inputs stay `f64` operands until a fold).
+        let own = match (kind, m.kind) {
+            (FamilyKind::Hll, Kind::Merge) => {
+                let mut v = Vec::with_capacity(9);
+                v.push(ValueTag::Bytes as u8);
+                pigeonhole_format::hll::append_element(&mut v, stored_i64(m.value));
+                Some(v)
+            }
+            (FamilyKind::SumF64 | FamilyKind::MeanVar, Kind::Put)
+                if m.value.first() == Some(&(ValueTag::F64 as u8)) =>
+            {
+                let x = f64::from_le_bytes(m.value[1..9].try_into().expect("checked"));
+                let mut state = Vec::new();
+                let added = if kind == FamilyKind::SumF64 {
+                    pigeonhole_format::exact::sum_add(&mut state, x)
+                } else {
+                    pigeonhole_format::exact::mean_var_add(&mut state, x)
+                };
+                added.expect("check_counter_write admitted a finite f64");
+                let mut v = Vec::with_capacity(1 + state.len());
+                v.push(ValueTag::Bytes as u8);
+                v.extend_from_slice(&state);
+                Some(v)
+            }
+            _ => None,
+        };
         if m.kind == Kind::Merge
             && let Some(&i) = latest.get(&key)
         {
@@ -4819,13 +4864,29 @@ fn check_merge_operator(options: &FamilyOptions, registry: &MergeRegistry) -> Re
             )));
         }
     }
-    // An HLL family's sketches are never separated into blob files (D294): a payload longer
-    // than the threshold is, so the threshold must reach the largest sketch (3076 bytes).
-    let largest = pigeonhole_format::hll::MAX_LEN as u64;
-    if options.kind == FamilyKind::Hll && u64::from(options.blob_threshold) < largest {
+    // An HLL family's sketches, and an exact sum's or mean-variance state, are never
+    // separated into blob files (D294, D298): a payload longer than the threshold is, so the
+    // threshold must reach the largest one (3076, 274 or 821 bytes).
+    let largest = match options.kind {
+        FamilyKind::Hll => Some((
+            "an hll family keeps its sketches",
+            pigeonhole_format::hll::MAX_LEN,
+        )),
+        FamilyKind::SumF64 => Some((
+            "a sum_f64 family keeps its states",
+            pigeonhole_format::exact::SUM_MAX_LEN,
+        )),
+        FamilyKind::MeanVar => Some((
+            "a mean_var family keeps its states",
+            pigeonhole_format::exact::MEAN_VAR_MAX_LEN,
+        )),
+        _ => None,
+    };
+    if let Some((what, largest)) = largest
+        && u64::from(options.blob_threshold) < largest as u64
+    {
         return Err(Error::InvalidArgument(format!(
-            "an hll family keeps its sketches inline: blob_threshold must be at least {largest}, \
-             not {}",
+            "{what} inline: blob_threshold must be at least {largest}, not {}",
             options.blob_threshold
         )));
     }

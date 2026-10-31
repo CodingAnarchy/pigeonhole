@@ -17,6 +17,7 @@ pub mod checksum;
 pub mod compress;
 pub mod cursor;
 pub mod error;
+pub mod exact;
 pub mod filter;
 pub mod hash;
 pub mod hll;

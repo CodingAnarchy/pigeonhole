@@ -152,7 +152,7 @@ mod guide {
 #[cfg(feature = "async")]
 pub mod nonblocking;
 
-pub use cell::{Cell, CellEntry, CellRef, Row, RowRef, Value};
+pub use cell::{Cell, CellEntry, CellRef, MeanVar, Row, RowRef, Value};
 pub use check::{
     CheckCounts, CheckOptions, CheckReport, Finding, Region, RegionKind, Severity, Structure,
     WalFile, WalPosition, check,

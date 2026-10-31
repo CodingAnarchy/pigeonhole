@@ -202,10 +202,20 @@ pub(crate) fn separate(
     if batch.as_bytes().len() <= limit {
         return Ok((builder, None));
     }
+    // An aggregate family's values stay inline whatever the limit (D298): its built-in
+    // operator folds stored values, never blob pointers, and its values are bounded states (an
+    // HLL sketch is the largest, 3076 bytes), far below the WAL segment's payload that the
+    // limit is in practice; only a test's lowered limit reaches them.
+    let view = shared.view.load();
+    let inline = |f: FamilyId| {
+        view.catalog
+            .family(f)
+            .is_some_and(|meta| meta.options.kind.is_aggregate())
+    };
     let mut large = false;
     for m in batch.iter() {
         let m = m?;
-        if m.value.len() > limit {
+        if m.value.len() > limit && !inline(m.family) {
             if m.kind != Kind::Put || m.value.len() > MAX_STORED {
                 // Merge operands are never separated, and a pointer's length is a `u32`.
                 return Err(Error::ValueTooLarge);
@@ -270,7 +280,7 @@ pub(crate) fn separate(
             if last.get(&key) != Some(&i) {
                 continue;
             }
-            if m.value.len() <= limit {
+            if m.value.len() <= limit || inline(m.family) {
                 out.push(m.table, m.family, m.kind, m.row, m.qualifier, m.ts, m.value)?;
                 continue;
             }

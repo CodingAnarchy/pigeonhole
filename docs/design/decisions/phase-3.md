@@ -3279,6 +3279,48 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **API and phdb:** a `pigeonhole` API test; a phdb shell test.
 - **Corpus:** the `aggregates` entry gains one family per kind (signed zeros, infinities, a put, a delete), still refused by 1.0.0.
 
+**What (PR 2: exact `f64` sum and mean/variance).**
+- **Kinds:** `SumF64` (10) and `MeanVar` (11), with operators `pigeonhole.f64_sum` and `pigeonhole.f64_mean_var` (`ExactF64`), under bit 0.
+- **States** (`pigeonhole_format::exact`, FORMAT §3.2, §3.3):
+  - Σx is a 2176-bit two's-complement integer in units of 2^-1074, and Σx² a 4288-bit one in units of 2^-2148 (revision 1's S1: exact integer squares, no double-double);
+  - limbs are trimmed by S2's rule (zero is no limbs);
+  - encoding bytes 2 and 3 keep the states apart from HLL sketches.
+- **Reads round once** (to nearest, ties to even), from exact big-integer arithmetic:
+  - the sum;
+  - the mean `Σx/n`;
+  - the population and sample variances, from `n·Σx² − (Σx)²`. The quotient keeps at least 56 bits, and a division's remainder breaks ties.
+- **Values:**
+  - Inputs stay `F64` operands (9 bytes in the WAL and memtable). The operator folds them into a state, and its `finish` always leaves the canonical state, even for a single operand with no base (the resolver finishes those too), so a bucket reads the same bytes however its inputs were grouped.
+  - A `put_f64` is turned into the state of its one input when the commit is prepared, so every stored value is a state.
+  - A put may also carry a well-formed state of the family's kind (`phdb load`).
+  - Inputs and `f64` puts must be finite: NaN and ±∞ are refused.
+  - A `blob_threshold` below the largest state (274 and 821 bytes) is refused, as for HLL.
+- **Commit-time separation keeps aggregate families inline** (`large::separate`, #230):
+  - Built-in operators never read blob pointers, and their values are bounded (an HLL sketch, at 3,076 bytes, is the largest), far below the WAL segment payload that the inline limit is in practice.
+  - Only the harness's lowered limit (120 bytes) reached them. With PR 2's states it separated them, and the read then failed with `MergeFailed`. Before PR 2 the gap was latent: HLL puts in the harness are 1 to 3 elements.
+- **API** (ICR 0096): `Aggregation::SumF64` and `MeanVar`; `aggregate_f64` writes their inputs; `CellRef::sum_f64` reads a sum state (the value's shape decides, as for `hll_estimate`), and `as_f64` stays tag-only (perf287 on #1220: shape decoding in `as_f64` would read a standard family's `b"\x02\x00"` as 0.0; the design note's table said `as_f64`); `CellRef::mean_var` gives `MeanVar` (`count`, `mean`, `variance`, `sample_variance`). In phdb: `sum_f64`, `mean_var`.
+
+**Tests (PR 2).**
+- **Format (`tests/exact.rs`):**
+  - sums against Shewchuk's exactly rounded summation (`math.fsum`'s algorithm) over random and adversarial inputs (±max, subnormals, cancellation), with at least 200 of 400 seeds in range;
+  - mean and variances of integer inputs against `f64` division of their exact ratios;
+  - any grouping of merges gives the same bytes;
+  - extremes, refusals and canonical form.
+  - **Mutations:** truncating instead of rounding fails five tests. Ignoring a division's remainder fails `a_division_remainder_breaks_a_tie`, a crafted near-tie no random input reaches.
+- **Engine (`it/exact_aggregates.rs`):**
+  - folds through flushes, compactions and checkpoints at every fold, compared with the format's states;
+  - puts as bases;
+  - refusals;
+  - the blob-threshold floor;
+  - operators bound to their kinds;
+  - a state kept inline under a lowered commit-time limit. Reverting that fix fails the test.
+- **Model checks:**
+  - `ModelAggregation::{SumF64, MeanVar}` are state kinds, with an oracle (`pigeonhole_sim::exact_state`) written apart from the format crate's: its own 32-bit limbs, trimming and decoder. A test checks that the two agree.
+  - The workload writes finite inputs at cancelling magnitudes, and puts of states of a few inputs.
+  - The `scalar_counters` targets trade `bor` and `fmin` for `fsum` and `fmv_ttl`, staying at 32 slots until #1219.
+  - **Mutation:** a sum that drops merged operands fails 26 of the 33 engine `scalar_counters` tests.
+- **API, phdb and corpus:** a `pigeonhole` API test and a phdb shell test. The `aggregates` corpus entry gains `total` (SumF64) and `spread` (MeanVar).
+
 <a id="d300"></a>
 ## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)
 **Why.** On macOS CI a reader process saw the visible seqno go from 21169 to 21162 (`crates/shm/tests/multiprocess.rs`, seed 1592590338). FORMAT §11.3's step 1, `pending[shard].store(next_seqno.load())`, was a load and a separate store. Another shard could reserve a seqno, raise the mirror, apply it and release its hold in between, so the visible seqno passed it. The stale bound then landed below it, and the visible seqno went back until the first shard published its reservation. It's an interleaving, not a memory-ordering effect: it reproduces in one thread, through the public API. Nothing unapplied ever became visible, but snapshots weren't monotonic: a later snapshot, in-process or in a reader process, could miss a commit an earlier one included, including a writer's own acknowledged commit.

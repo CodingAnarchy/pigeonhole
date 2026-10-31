@@ -204,8 +204,8 @@ fn entries() -> Vec<Entry> {
     ]
 }
 
-/// Min, max and HLL families (D294, the first `incompat` feature bit), and the bitwise and
-/// `f64` families (D298, the same bit): inputs at the fixed timestamp and in buckets, puts,
+/// Min, max and HLL families (D294, the first `incompat` feature bit), and the bitwise, `f64`,
+/// exact-sum and mean-variance families (D298, the same bit): inputs at the fixed timestamp and in buckets, puts,
 /// deletes and checkpointed reads, sparse and dense sketches, signed zeros and infinities;
 /// flushed, then more in the WAL that the crash leaves for replay.
 fn write_aggregates(db: &Pigeonhole) {
@@ -220,6 +220,8 @@ fn write_aggregates(db: &Pigeonhole) {
         .family("parity", Family::aggregate(Aggregation::BitXor))
         .family("coldest", Family::aggregate(Aggregation::MinF64))
         .family("warmest", Family::aggregate(Aggregation::MaxF64))
+        .family("total", Family::aggregate(Aggregation::SumF64))
+        .family("spread", Family::aggregate(Aggregation::MeanVar))
         .create()
         .unwrap();
     for i in 0..40u64 {
@@ -249,6 +251,17 @@ fn write_aggregates(db: &Pigeonhole) {
             .aggregate_f64("coldest", b"all", x)
             .aggregate_f64("warmest", b"all", x)
             .aggregate_f64_at("warmest", b"hourly", T0 + (i % 4) * 3_600_000_000, x);
+        // Exact sums and mean/variance of finite values, with magnitudes that cancel.
+        let y = match i % 5 {
+            0 => 1e300,
+            1 => -1e300,
+            2 => 5e-324,
+            _ => v as f64 / 8.0,
+        };
+        m = m
+            .aggregate_f64("total", b"all", y)
+            .aggregate_f64_at("total", b"hourly", T0 + (i % 4) * 3_600_000_000, y)
+            .aggregate_f64("spread", b"all", y);
         // Row a00's distinct users pass the sparse/dense boundary; the others stay sparse.
         let users = if i % 6 == 0 { 400 } else { 3 };
         for u in 0..users {
@@ -262,6 +275,7 @@ fn write_aggregates(db: &Pigeonhole) {
                     .put_i64("hi", b"all", 1_000)
                     .put_i64("common", b"all", -1)
                     .put_f64("coldest", b"all", 1.0e6)
+                    .put_f64("total", b"all", 0.5)
                     .commit()
                     .unwrap();
             }
@@ -271,6 +285,7 @@ fn write_aggregates(db: &Pigeonhole) {
                     .delete_column("hi", b"all")
                     .delete_column("parity", b"all")
                     .delete_column("warmest", b"all")
+                    .delete_column("spread", b"all")
                     .commit()
                     .unwrap();
                 // A read that folds what the flush below writes as a base.

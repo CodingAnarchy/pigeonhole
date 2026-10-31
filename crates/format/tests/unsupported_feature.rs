@@ -116,10 +116,10 @@ fn family_settings() {
         family_edit_with(
             with(&|o| o.kind = FamilyKind::Standard),
             with(&|o| o.kind = FamilyKind::Counter),
-            10,
+            12,
         ),
         "family kind",
-        10,
+        12,
     );
     unsupported(
         family_edit_with(

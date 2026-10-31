@@ -50,6 +50,8 @@ let pages = db
 | Distinct counts | `Family::aggregate(Aggregation::Hll)`; read with `hll_estimate` |
 | Flags seen, or common to all writers | `Family::aggregate(Aggregation::BitOr)` (or `BitAnd`, `BitXor`); write with `aggregate_u64`, read with `as_u64` |
 | Lowest or highest reading (temperatures, latencies) | `Family::aggregate(Aggregation::MinF64)` or `MaxF64`; write with `aggregate_f64`, read with `as_f64` |
+| Totals of decimals (amounts, durations) | `Family::aggregate(Aggregation::SumF64)`: an exact sum, read with `sum_f64` |
+| Averages and spread (latency mean and variance) | `Family::aggregate(Aggregation::MeanVar)`; read with `mean_var` |
 | Sparse or wide sets (links, tags) | `bloom_bits(10)` |
 | Large payloads read rarely | its own family; scan other families without touching it. Values over 4 KiB already go to blob files by default; lower `blob_threshold` for smaller payloads |
 | Data that should expire | `ttl(days(n))`; add `Compaction::FifoByTime` to drop whole files (time-ordered data); `Compaction::Tiered` suits write-heavy families ([styles](concepts.md#compaction-styles)) |
@@ -238,6 +240,13 @@ These combine like min and max (buckets, puts, deletes, TTL), over other value t
 - **`MinF64`, `MaxF64`** keep the smallest or largest `f64` input. Write with `aggregate_f64` and set with `put_f64`; read with `as_f64`. They order by `f64::total_cmp`: `-0.0` is below `+0.0`, infinities are allowed, and NaN is refused (`InvalidArgument`).
 
 `incr` is refused in all five, and each marks the file like min and max (1.0.x refuses it).
+
+## Exact sums and mean/variance
+`f64` addition rounds at every step, so a floating-point total depends on the order its inputs arrive in, and loses small terms beside large ones. These two aggregations don't:
+- **`SumF64`** keeps the exact sum of its `f64` inputs (an integer in units of the smallest `f64`). `CellRef::sum_f64` reads it rounded once. The same inputs read the same total in any order: `1e300 + 1.0 - 1e300` reads 1.0.
+- **`MeanVar`** keeps the count, the exact sum and the exact sum of squares. `mean_var()` reads the count, mean, population variance and sample variance, each computed exactly and rounded once.
+
+Write inputs with `aggregate_f64`. A `put_f64` sets a cell. Inputs must be finite (NaN and infinities are refused). A cell is up to 274 bytes for a sum and 821 for mean/variance, against 9 for a counter. Like the others, these families mark the file (1.0.x refuses it).
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

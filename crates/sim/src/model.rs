@@ -60,12 +60,63 @@ pub enum ModelAggregation {
     MinF64,
     /// The `f64` maximum, as [`MinF64`](Self::MinF64).
     MaxF64,
+    /// The exact sum of finite `f64` inputs (D298), as the store's exact-sum state, which
+    /// [`exact_state`](crate::exact_state) writes independently.
+    SumF64,
+    /// The count, exact sum and exact sum of squares of finite `f64` inputs (D298), as
+    /// [`SumF64`](Self::SumF64).
+    MeanVar,
 }
 
 impl ModelAggregation {
-    /// Whether the family holds `f64`s, carried as their bits (`MinF64`, `MaxF64`).
+    /// Whether the family's inputs are `f64`s, carried as their bits (`MinF64`, `MaxF64`,
+    /// `SumF64`, `MeanVar`).
     pub fn is_f64(self) -> bool {
-        matches!(self, ModelAggregation::MinF64 | ModelAggregation::MaxF64)
+        matches!(
+            self,
+            ModelAggregation::MinF64
+                | ModelAggregation::MaxF64
+                | ModelAggregation::SumF64
+                | ModelAggregation::MeanVar
+        )
+    }
+
+    /// Whether a cell holds a state its inputs fold into (an HLL sketch, an exact sum's or
+    /// mean-variance state), not one of the inputs' own type: inputs are kept as elements
+    /// and the state built by the oracle.
+    pub fn is_state(self) -> bool {
+        matches!(
+            self,
+            ModelAggregation::Hll | ModelAggregation::SumF64 | ModelAggregation::MeanVar
+        )
+    }
+
+    /// The state of `base` (a put's state, if any) with `elements` folded in (a state kind);
+    /// `None` if `base` is malformed, an element is refused, or there is nothing.
+    pub fn state_of(
+        self,
+        base: Option<&[u8]>,
+        elements: impl IntoIterator<Item = i64>,
+    ) -> Option<Vec<u8>> {
+        match self {
+            ModelAggregation::Hll => match base {
+                Some(b) => hll_union(b, elements),
+                None => hll_sketch(elements),
+            },
+            ModelAggregation::SumF64 => crate::exact_state(false, base, elements),
+            ModelAggregation::MeanVar => crate::exact_state(true, base, elements),
+            _ => unreachable!("not a state kind"),
+        }
+    }
+
+    /// Whether `s` is a well-formed, canonical state of this (state) kind.
+    pub fn state_valid(self, s: &[u8]) -> bool {
+        match self {
+            ModelAggregation::Hll => decode_registers(s).is_some(),
+            ModelAggregation::SumF64 => crate::exact_state_valid(false, s),
+            ModelAggregation::MeanVar => crate::exact_state_valid(true, s),
+            _ => false,
+        }
     }
 
     /// `a` combined with `b` (an HLL family's inputs are elements, never combined into one
@@ -75,7 +126,9 @@ impl ModelAggregation {
             ModelAggregation::Sum => a.wrapping_add(b),
             ModelAggregation::Min => a.min(b),
             ModelAggregation::Max => a.max(b),
-            ModelAggregation::Hll => unreachable!("HLL inputs are not combined into an i64"),
+            ModelAggregation::Hll | ModelAggregation::SumF64 | ModelAggregation::MeanVar => {
+                unreachable!("a state kind's inputs are not combined into an i64")
+            }
             ModelAggregation::BitOr => a | b,
             ModelAggregation::BitAnd => a & b,
             ModelAggregation::BitXor => a ^ b,
@@ -180,8 +233,8 @@ fn decode_registers(s: &[u8]) -> Option<[u8; 4096]> {
 
 /// The aggregation of the test families named by convention ([`WorkloadSpec`]): a name
 /// starting with `sum` is a counter family, `min`, `max` and `hll` the D294 families, `bor`,
-/// `band`, `bxor`, `fmin` and `fmax` the D298 bitwise and `f64` families; `None` for any other
-/// name.
+/// `band`, `bxor`, `fmin`, `fmax`, `fsum` and `fmv` the D298 bitwise, `f64` and exact `f64`
+/// families; `None` for any other name.
 ///
 /// [`WorkloadSpec`]: crate::WorkloadSpec
 pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
@@ -203,6 +256,10 @@ pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
         Some(ModelAggregation::MinF64)
     } else if family.starts_with("fmax") {
         Some(ModelAggregation::MaxF64)
+    } else if family.starts_with("fsum") {
+        Some(ModelAggregation::SumF64)
+    } else if family.starts_with("fmv") {
+        Some(ModelAggregation::MeanVar)
     } else {
         None
     }
@@ -572,12 +629,24 @@ impl Model {
         for (i, (op, collapsed)) in ops.iter().zip(collapsed).enumerate() {
             if !collapsed {
                 let combined = elements.get(&i);
-                if let (ModelOp::Put { value, .. }, Some(extra)) = (op, combined) {
-                    // An HLL put that later inputs of its cell combined into: one put of the
-                    // union, as the store logs it.
+                if let (
+                    ModelOp::Put {
+                        table,
+                        family,
+                        value,
+                        ..
+                    },
+                    Some(extra),
+                ) = (op, combined)
+                {
+                    // A state put that later inputs of its cell combined into: one put of the
+                    // folded state, as the store logs it.
+                    let agg = self.aggregation(table, family).expect("a state family");
                     let mut put = op.clone();
                     if let ModelOp::Put { value: v, .. } = &mut put {
-                        *v = hll_union(value, extra.iter().copied()).expect("a validated sketch");
+                        *v = agg
+                            .state_of(Some(value), extra.iter().copied())
+                            .expect("a validated state");
                     }
                     self.apply(&put, commit_ts, seqno);
                     continue;
@@ -622,6 +691,17 @@ impl Model {
         let fixed_with_ttl = |ts: &Option<Timestamp>| ts.is_none() && f.ttl_micros != 0;
         match op {
             ModelOp::Incr { ts, .. } if f.counter && fixed_with_ttl(ts) => refused(),
+            // An exact f64 family takes finite inputs only (D298).
+            ModelOp::Incr { delta, .. }
+                if f.counter
+                    && matches!(
+                        f.aggregation,
+                        ModelAggregation::SumF64 | ModelAggregation::MeanVar
+                    )
+                    && !f64::from_bits(*delta as u64).is_finite() =>
+            {
+                refused()
+            }
             // An f64 family never holds a NaN (D298).
             ModelOp::Incr { delta, .. }
                 if f.counter
@@ -633,11 +713,10 @@ impl Model {
             ModelOp::Incr { .. } if f.counter => Ok(()),
             ModelOp::Incr { ts: Some(_), .. } => refused(),
             ModelOp::Incr { .. } if !f.i64_add => Err(ModelError::NoMergeOperator(family.clone())),
-            // An HLL family takes puts of a well-formed, canonical sketch only (D294).
-            ModelOp::Put { ts, value, .. }
-                if f.counter && f.aggregation == ModelAggregation::Hll =>
-            {
-                if decode_registers(value).is_none() || fixed_with_ttl(ts) {
+            // A state family takes puts of a well-formed, canonical state only: an HLL sketch
+            // (D294), an exact sum's or mean-variance state (D298).
+            ModelOp::Put { ts, value, .. } if f.counter && f.aggregation.is_state() => {
+                if !f.aggregation.state_valid(value) || fixed_with_ttl(ts) {
                     refused()
                 } else {
                     Ok(())
@@ -1501,17 +1580,17 @@ fn resolve_counter(
     // group holds at least one put or operand.
     let agg = family.aggregation;
     let version = |group: &[&Entry]| -> Option<Vec<u8>> {
-        if agg == ModelAggregation::Hll {
-            // The elements newer than the newest put, merged into that put's sketch.
+        if agg.is_state() {
+            // The elements newer than the newest put, folded into that put's state.
             let mut elements = Vec::new();
             for e in group {
                 match &e.kind {
                     Kind::Merge(d) => elements.push(*d),
-                    Kind::Put(v) => return hll_union(v, elements),
+                    Kind::Put(v) => return agg.state_of(Some(v), elements),
                     _ => {}
                 }
             }
-            return hll_sketch(elements);
+            return agg.state_of(None, elements);
         }
         let mut acc: Option<i64> = None;
         let fold = |acc: Option<i64>, v: i64| Some(acc.map_or(v, |a| agg.combine(a, v)));
@@ -1620,7 +1699,7 @@ pub fn combine_aggregate_writes(
         if let ModelOp::Incr { delta, .. } = op
             && let Some(&i) = latest.get(&key)
         {
-            if agg == ModelAggregation::Hll {
+            if agg.is_state() {
                 elements.entry(i).or_default().push(*delta);
                 continue;
             }
