@@ -54,6 +54,20 @@ pub(crate) fn run(
             )
             .map(Outcome::Streamed);
         }
+        Command::Mcp {
+            file,
+            read_only,
+            create,
+            max_result_bytes,
+            max_value_bytes,
+        } => {
+            let limits = crate::mcp::Limits {
+                result_bytes: *max_result_bytes,
+                value_bytes: *max_value_bytes,
+            };
+            return crate::mcp::run(&cli, file, *read_only, *create, limits, stdout, stderr)
+                .map(Outcome::Streamed);
+        }
         Command::Load {
             file,
             input,

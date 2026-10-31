@@ -23,9 +23,7 @@ use std::ops::Bound;
 use std::path::Path;
 use std::time::Instant;
 
-use pigeonhole::{
-    Aggregation, Family, ReadTable, RowMutation, RowRef, Snapshot, Table, ValueFilter,
-};
+use pigeonhole::{Aggregation, Family, RowMutation, RowRef, Snapshot, Table, ValueFilter};
 use serde_json::{Map, Value, json};
 
 use crate::ExitStatus;
@@ -33,7 +31,7 @@ use crate::args::{Cli, Format};
 use crate::cmd::dump::value_json;
 use crate::cmd::schema::{bytes_json, family_json};
 use crate::exit::Failure;
-use crate::open::{self, Db};
+use crate::open::{self, Db, Handle};
 use crate::output::{self, Column, Report};
 
 pub(crate) mod lex;
@@ -126,12 +124,6 @@ struct Session {
     format: Format,
     timing: bool,
     path: std::path::PathBuf,
-}
-
-/// A table handle in either role.
-enum Handle {
-    Writer(Table),
-    Reader(ReadTable),
 }
 
 impl Session {
@@ -298,11 +290,7 @@ impl Session {
     }
 
     fn handle(&self, table: &str) -> Result<Handle, Failure> {
-        let fail = |e: pigeonhole::Error| Failure::db(&format!("table {table}"), &e);
-        Ok(match &self.db {
-            Db::Writer(db) => Handle::Writer(db.table(table).and_then(|b| b.open()).map_err(fail)?),
-            Db::Reader(db) => Handle::Reader(db.table(table).map_err(fail)?),
-        })
+        self.db.handle(table)
     }
 
     fn snapshot_arg(&self, args: &Args) -> Result<Option<&Snapshot>, Failure> {

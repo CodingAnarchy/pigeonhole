@@ -1,0 +1,2 @@
+### Added
+- `phdb mcp`: a Model Context Protocol server on standard input and output, so AI agents can use a database as a tool (#1249). Its tools list tables, read a row, scan, traverse a graph, write in one atomic batch and create tables, each with a JSON schema and an agent-oriented description; results past `--max-result-bytes` are cut with a cursor that continues them, and `--read-only` serves a live database as a reader process. Guide: "Using Pigeonhole from AI agents".

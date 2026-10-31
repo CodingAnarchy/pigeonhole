@@ -208,6 +208,38 @@ pub(crate) fn bytes_from_json(v: &Value) -> Result<Vec<u8>, String> {
     }
 }
 
+/// A cell value as `dump` writes it and `load` and `phdb mcp` read it.
+#[derive(Debug, PartialEq)]
+pub(crate) enum JsonValue {
+    I64(i64),
+    F64(f64),
+    Bytes(Vec<u8>),
+}
+
+/// The value [`value_json`](super::dump::value_json) wrote: `{"i64": n}`, `{"f64": x}`,
+/// `{"f64_bits": n}`, or bytes ([`bytes_json`]).
+pub(crate) fn value_from_json(v: &Value) -> Result<JsonValue, String> {
+    if let Some(x) = v.get("i64") {
+        return x
+            .as_i64()
+            .map(JsonValue::I64)
+            .ok_or_else(|| "i64 value: not an integer".into());
+    }
+    if let Some(x) = v.get("f64") {
+        return x
+            .as_f64()
+            .map(JsonValue::F64)
+            .ok_or_else(|| "f64 value: not a number".into());
+    }
+    if let Some(x) = v.get("f64_bits") {
+        return x
+            .as_u64()
+            .map(|b| JsonValue::F64(f64::from_bits(b)))
+            .ok_or_else(|| "f64_bits value: not a u64".into());
+    }
+    bytes_from_json(v).map(JsonValue::Bytes)
+}
+
 const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Standard base64 (RFC 4648) with padding.
@@ -229,7 +261,7 @@ pub(crate) fn base64_encode(b: &[u8]) -> String {
     out
 }
 
-fn base64_decode(s: &str) -> Option<Vec<u8>> {
+pub(crate) fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.as_bytes();
     if !s.len().is_multiple_of(4) {
         return None;
@@ -284,5 +316,24 @@ mod tests {
         for b in [&b"abc"[..], &[0xff, 0, 1][..], b""] {
             assert_eq!(bytes_from_json(&bytes_json(b)).unwrap(), b);
         }
+    }
+
+    #[test]
+    fn typed_values_round_trip() {
+        use super::super::dump::value_json;
+        use pigeonhole::Value as Cell;
+        let cases = [
+            (Cell::I64(-7), JsonValue::I64(-7)),
+            (Cell::F64(0.5), JsonValue::F64(0.5)),
+            (Cell::Bytes(b"hi"), JsonValue::Bytes(b"hi".to_vec())),
+            (Cell::Bytes(&[0xff]), JsonValue::Bytes(vec![0xff])),
+        ];
+        for (cell, want) in cases {
+            assert_eq!(value_from_json(&value_json(cell)).unwrap(), want);
+        }
+        let inf = value_from_json(&value_json(Cell::F64(f64::INFINITY))).unwrap();
+        assert_eq!(inf, JsonValue::F64(f64::INFINITY));
+        assert!(value_from_json(&json!({"i64": "x"})).is_err());
+        assert!(value_from_json(&json!(3)).is_err());
     }
 }

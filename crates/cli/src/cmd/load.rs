@@ -9,7 +9,7 @@ use std::path::Path;
 use pigeonhole::{Durability, Pigeonhole, Table, WriteBatch};
 use serde_json::{Value, json};
 
-use super::schema::{bytes_from_json, family_from_json};
+use super::schema::{JsonValue, bytes_from_json, family_from_json, value_from_json};
 use crate::ExitStatus;
 use crate::args::Cli;
 use crate::exit::Failure;
@@ -157,21 +157,14 @@ fn load(db: &Pigeonhole, reader: Box<dyn BufRead>, header_line: usize) -> Result
             .ok_or_else(|| bad("a cell without a timestamp"))?;
         let value = &v["value"];
         let mut size = row.len() + qualifier.len() + 16;
-        if let Some(x) = value.get("i64") {
-            let x = x.as_i64().ok_or_else(|| bad("i64 value"))?;
-            batch.put_i64_at(table, &row, family, &qualifier, ts, x);
-        } else if let Some(x) = value.get("f64").and_then(Value::as_f64).or_else(|| {
-            value
-                .get("f64_bits")
-                .and_then(Value::as_u64)
-                .map(f64::from_bits)
-        }) {
-            batch.put_f64_at(table, &row, family, &qualifier, ts, x);
-        } else {
-            let bytes = bytes_from_json(value).map_err(|m| bad(&format!("value: {m}")))?;
-            size += bytes.len();
-            batch.put_at(table, &row, family, &qualifier, ts, &bytes);
-        }
+        match value_from_json(value).map_err(|m| bad(&format!("value: {m}")))? {
+            JsonValue::I64(x) => batch.put_i64_at(table, &row, family, &qualifier, ts, x),
+            JsonValue::F64(x) => batch.put_f64_at(table, &row, family, &qualifier, ts, x),
+            JsonValue::Bytes(bytes) => {
+                size += bytes.len();
+                batch.put_at(table, &row, family, &qualifier, ts, &bytes)
+            }
+        };
         n.cells += 1;
         batch_bytes += size;
         if batch.len() >= BATCH_CELLS || batch_bytes >= BATCH_BYTES {
