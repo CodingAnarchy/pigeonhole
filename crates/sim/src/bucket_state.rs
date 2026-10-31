@@ -36,12 +36,9 @@ fn get_varint(s: &[u8], at: &mut usize) -> Option<u64> {
     None
 }
 
-/// The bucket of `x`: the number of bounds `b` with `b ≤ x` in the total order.
+/// The bucket of `x`: the number of bounds `b` with `b <= x` (IEEE: `-0.0` equals `0.0`).
 fn bucket(x: f64) -> usize {
-    MODEL_HISTOGRAM_BOUNDS
-        .iter()
-        .filter(|b| b.total_cmp(&x).is_le())
-        .count()
+    MODEL_HISTOGRAM_BOUNDS.iter().filter(|&&b| b <= x).count()
 }
 
 fn encode_histogram(counts: &[u64]) -> Vec<u8> {

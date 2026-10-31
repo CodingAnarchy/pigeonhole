@@ -1518,7 +1518,7 @@ fn histogram_and_quantile_families() {
     // [-inf, 0): 0; [0, 10): 0.25..9.75 = 39; [10, 100): 40..399 = 360; [100, inf): 601 + inf.
     assert_eq!(h.histogram_counts(), Some(vec![0, 39, 360, 602]));
     assert_eq!(bounds.bucket_of(10.0), 2);
-    assert_eq!(bounds.bucket_of(-0.0), 0);
+    assert_eq!(bounds.bucket_of(-0.0), 1, "-0.0 shares 0.0's bucket (IEEE)");
     let c = t.get(b"r", "q", b"ms").unwrap().unwrap();
     assert_eq!(c.quantiles_count(), Some(1000));
     for (qq, exact) in [(0.0, 0.25), (0.5, 125.0), (0.99, 247.5), (1.0, 250.0)] {

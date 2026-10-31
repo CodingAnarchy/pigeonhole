@@ -4,9 +4,10 @@
 //!
 //! **Histogram.** A family fixes `n` bounds `b0 < b1 < … < b(n-1)` (finite, `1 ≤ n ≤ 1023`,
 //! never `-0.0`), so `n + 1` buckets: `(-∞, b0)`, `[b0, b1)`, …, `[b(n-1), +∞)`. An input's
-//! bucket is the number of bounds at or below it by `f64::total_cmp` (so `-0.0` lies below a
-//! bound of `0.0`); infinities fall in the end buckets and NaN is refused. A state is the
-//! bucket count and the per-bucket counts; merging adds them.
+//! bucket is the number of bounds at or below it by IEEE `<=` (perf287's S1 on #1221: `-0.0`
+//! falls in `[0.0, …)` as `x >= 0.0` would put it; NaN is refused and no bound is `-0.0`, so
+//! the comparison is total and deterministic); infinities fall in the end buckets. A state is
+//! the bucket count and the per-bucket counts; merging adds them.
 //!
 //! **Quantiles.** A positive finite `x` maps to the index `bits(x) >> (52 - p)`: its binary
 //! exponent and top `p` mantissa bits, so a bucket's values lie within a factor of
@@ -14,7 +15,9 @@
 //! and no logarithm is computed. Negative inputs map their magnitude into a second store;
 //! zeros (either sign) are counted apart. Past `max_buckets`, each store collapses (D298
 //! revision 1's S3): with `t = max_index − max_buckets + 1`, every bucket below `t` folds
-//! into bucket `t`. `t` depends only on the store's largest index, which only grows, so
+//! into bucket `t`. Indexes grow with magnitude, so a collapse folds the **smallest
+//! magnitudes** in both stores: in a signed distribution it coarsens the quantiles nearest
+//! zero, not the low tail (perf287's N2 on #1221; DDSketch's choice too). `t` depends only on the store's largest index, which only grows, so
 //! collapsing after every merge gives what one collapse at the end would: merges are
 //! associative and commutative. A read walks the counts to rank `⌊q·(n−1)⌋` and returns the
 //! bucket's midpoint, built from its bits (exact).
@@ -118,9 +121,10 @@ pub fn histogram_params(bounds: &[f64]) -> Vec<u8> {
     kind_params::encode(&[(TAG_BOUNDS, &bytes)])
 }
 
-/// The bucket of `x` among `bounds`: how many bounds lie at or below it (`total_cmp`).
+/// The bucket of `x` (never NaN) among `bounds`: how many bounds lie at or below it, by IEEE
+/// `<=`, so `-0.0` and `0.0` share a bucket.
 pub fn bucket_of(bounds: &[f64], x: f64) -> usize {
-    bounds.partition_point(|b| b.total_cmp(&x).is_le())
+    bounds.partition_point(|b| *b <= x)
 }
 
 /// The counts of a histogram state, one per bucket (trailing zeros included), and validates
@@ -534,7 +538,7 @@ mod tests {
     #[test]
     fn bounds_and_buckets() {
         let b = histogram_bounds(&histogram_params(&[0.0, 10.0, 100.0])).unwrap();
-        assert_eq!(bucket_of(&b, -0.0), 0); // -0.0 lies below a bound of 0.0
+        assert_eq!(bucket_of(&b, -0.0), 1); // -0.0 is at a bound of 0.0, as 0.0 is
         assert_eq!(bucket_of(&b, 0.0), 1);
         assert_eq!(bucket_of(&b, 9.99), 1);
         assert_eq!(bucket_of(&b, 10.0), 2);

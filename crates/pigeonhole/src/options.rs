@@ -1097,8 +1097,10 @@ impl HistogramParams {
         self.bounds.iter().map(|&b| f64::from_bits(b)).collect()
     }
 
-    /// The bucket an input `x` falls in: how many bounds lie at or below it (by
-    /// `f64::total_cmp`, so `-0.0` lies below a bound of `0.0`).
+    /// The bucket an input `x` falls in: how many bounds lie at or below it (IEEE `<=`, so
+    /// `-0.0` and `0.0` share a bucket). Counts from
+    /// [`CellRef::histogram_counts`](crate::CellRef::histogram_counts) are indexed the same
+    /// way: `n` bounds give `n + 1` counts.
     pub fn bucket_of(&self, x: f64) -> usize {
         pigeonhole_format::buckets::bucket_of(&self.bounds(), x)
     }

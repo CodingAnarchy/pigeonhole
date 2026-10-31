@@ -158,7 +158,8 @@ fn histograms_count_and_merge_in_any_grouping() {
         assert_eq!(one, other, "seed {seed}");
         let mut want = vec![0u64; 5];
         for &x in &xs {
-            let b = bounds.iter().filter(|b| b.total_cmp(&x).is_le()).count();
+            // IEEE `<=`: -0.0 counts at a bound of 0.0 (perf287's S1 on #1221).
+            let b = bounds.iter().filter(|&&b| b <= x).count();
             want[b] += 1;
         }
         assert_eq!(

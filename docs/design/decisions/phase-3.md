@@ -3361,6 +3361,13 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - `scalar_counters` trades `sum` and `band` for `fhist` and `fq_ttl`, staying at 32 slots until #1219.
   - **Mutations:** a histogram bound check off by one, and a collapse threshold off by one, each fail 27 of 33 engine `scalar_counters` tests.
 - **API, phdb and corpus:** a `pigeonhole` API test; a phdb shell test; snapshots updated for `aggregation_params`. The corpus `aggregates` entry gains `latency_h` and `latency_q`.
+- **Review (perf287 on #1221):**
+  - **S1:** histogram buckets compare by IEEE `<=`, not `total_cmp`, so `-0.0` shares `0.0`'s bucket, as `x >= 0.0` puts it. NaN is refused and no bound is `-0.0`, so the comparison is total and deterministic. `total_cmp` stays right for `MinF64`/`MaxF64`, which return the value.
+  - **N2:** collapse folds the smallest magnitudes in both stores, so it coarsens the quantiles nearest zero.
+- **A hot quantile cell (perf287's N1; `hotagg quantiles`, local, 4 cells, 40,000 inputs).** The default parameters and inputs over about 20 binades give a sketch of about 920 buckets (3.7 KB).
+  - **With D291 checkpoints at 128:** reads are p50 25 µs, p99 60 µs, close to HLL's 27 µs and 54 µs.
+  - **With checkpoints off:** a read refolds every pending input with a full decode and encode of the sketch, giving p50 10.4 ms and p99 26 ms.
+  - **Consequence for PR 5:** its 4 KiB checkpoint cap must not come without §4.2's compaction fold, or a fold of many `F64` inputs into one decoded sketch. A larger sketch would otherwise lose its checkpoints and read in milliseconds.
 
 <a id="d300"></a>
 ## D300 — A group's hold is stored under the allocator's lock, so the visible seqno never goes back (coordinator decision, 2026-10-31; shm, engine, FORMAT §11.3; #1208; amends the reservation protocol of D271 and FORMAT §11.3)

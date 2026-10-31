@@ -131,7 +131,7 @@ A state is at most 821 bytes. The encoding bytes 2 and 3 keep these states apart
 
 ### 3.4 Histogram
 
-The value of a histogram family's cell (§9.2 `kind` 12, D298) counts its inputs in the buckets the family's bounds give (§9.2.1 tag 1). `n` bounds `b0 < … < b(n-1)` make `n + 1` buckets, `(-∞, b0)`, `[b0, b1)`, …, `[b(n-1), +∞)`. An input's bucket is the number of bounds at or below it in IEEE 754 `totalOrder`, so `-0.0` lies below a bound of `0.0`. Infinities fall in the end buckets; NaN is refused at write.
+The value of a histogram family's cell (§9.2 `kind` 12, D298) counts its inputs in the buckets the family's bounds give (§9.2.1 tag 1). `n` bounds `b0 < … < b(n-1)` make `n + 1` buckets, `(-∞, b0)`, `[b0, b1)`, …, `[b(n-1), +∞)`. An input's bucket is the number of bounds at or below it by IEEE `<=`, so `-0.0` and `0.0` share a bucket. NaN is refused and no bound is `-0.0`, so the comparison is total and deterministic (perf287's S1 on #1221). Infinities fall in the end buckets; NaN is refused at write.
 
 | Offset | Size | Field |
 |---|---|---|
@@ -146,7 +146,7 @@ Merging adds the counts. A state with the wrong bucket count, a trailing zero, o
 The value of a quantile family's cell (§9.2 `kind` 13, D298) is a log-linear sketch of its finite inputs, with the family's mantissa bits `p` (1–12, default 7) and bucket limit (16–4096 per store, default 2048; §9.2.1 tags 1 and 2).
 - **Index:** a positive `x` maps to `bits(x) >> (52 − p)`, its binary exponent and top `p` mantissa bits. A bucket's values then lie within a factor `1 + 2^-p`, with no logarithm computed.
 - **Stores:** negative inputs map their magnitude into a second store, and zeros (either sign) are counted apart.
-- **Collapse** (D298 revision 1's S3): when a store's indexes span more than the limit, set `t = max_index − limit + 1`; every bucket below `t` folds into bucket `t`, which is created if absent. `t` depends only on the store's largest index, which only grows, so collapsing after every merge gives what one collapse at the end would. Merges are associative and commutative.
+- **Collapse** (D298 revision 1's S3): when a store's indexes span more than the limit, set `t = max_index − limit + 1`; every bucket below `t` folds into bucket `t`, which is created if absent. `t` depends only on the store's largest index, which only grows, so collapsing after every merge gives what one collapse at the end would. Merges are associative and commutative. Indexes grow with magnitude, so a collapse folds the **smallest magnitudes** in both stores: in a signed distribution it coarsens the quantiles nearest zero, not the low tail.
 
 | Offset | Size | Field |
 |---|---|---|
