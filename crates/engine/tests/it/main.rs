@@ -75,6 +75,7 @@ mod reader_reclaim;
 mod reader_reclaim_stall;
 mod reader_row_cache;
 mod reclaim;
+mod reduce;
 mod review;
 mod room_freeze;
 mod room_group;
