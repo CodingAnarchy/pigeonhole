@@ -1,0 +1,4 @@
+### Added
+- Bitwise and `f64` aggregate families (D298, ICR 0096): `Aggregation::BitOr`, `BitAnd` and `BitXor` fold `u64` inputs bit by bit (`aggregate_u64`, `put_u64`, read with `as_u64`); `Aggregation::MinF64` and `MaxF64` keep the smallest or largest `f64` input by `f64::total_cmp`, so `-0.0` is below `+0.0` (`aggregate_f64`, `put_f64`, read with `as_f64`). NaN is refused, and so is `incr`.
+  - Like min and max families, creating the first such family marks the file, which pigeonhole 1.0.x then refuses to open (`UnsupportedFeature`).
+- `phdb`: `"aggregation": "bit_or" | "bit_and" | "bit_xor" | "min_f64" | "max_f64"`, the shell's `create … name:bit_or` (and the others), and `aggregate` taking an `f64` or a `u64` by the family's kind.
