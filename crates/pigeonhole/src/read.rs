@@ -1012,10 +1012,29 @@ impl<'t> CellWalk<'t> {
                         }
                         continue;
                     };
-                    if cursor.push_next_cell(buf)? {
-                        return Ok(true);
+                    // `next_cell` and the sink's pushes, not `ScanCursor::push_next_cell`: a
+                    // third caller of that changed how it inlines into the scan's row fill
+                    // (+2-3% on the scan shapes, #1227's first callgrind run).
+                    let Some(cell) = cursor.next_cell()? else {
+                        self.cursor = None;
+                        continue;
+                    };
+                    let start = buf.qualifiers.len();
+                    buf.qualifiers.extend_from_slice(cell.qualifier);
+                    let qualifier = start..buf.qualifiers.len();
+                    if cell.stored.len() <= CellData::INLINE_MAX {
+                        pigeonhole_engine::RowSink::push_inline(
+                            buf,
+                            cell.family,
+                            qualifier,
+                            cell.ts,
+                            cell.stored,
+                        );
+                    } else {
+                        let family = cell.family;
+                        buf.push(family, qualifier, cursor.current_data());
                     }
-                    self.cursor = None;
+                    return Ok(true);
                 }
             });
         if !matches!(r, Ok(true)) {
