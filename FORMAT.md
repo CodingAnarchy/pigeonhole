@@ -476,7 +476,7 @@ One 64-byte line per shard at `watermarks_off + 64 x shard`. The rest of the lin
 
 A group's seqnos are held back by its shard's `pending`; a cross-shard commit's decided seqno (the seqno a Decision applies at, §10.3) by the header's `cross_held` (layout version 6, D278). A commit's id is reserved like any seqno and never held, since nothing is written at it.
 
-1. Under the writer process's one allocator lock (D271): `first` = the allocator's next seqno; `pending[shard].store(min(pending, first))` (Release), the group's hold, where `pending` is the shard's lowest unapplied seqno before this group; then the `n` seqnos and the group's default timestamps are reserved.
+1. Under the writer process's one allocator lock (D271): `first` = the allocator's next seqno; `pending[shard].store(min(pending, first))` (Release), the group's hold, where `pending` is the shard's lowest unapplied seqno before this group (the value `pending[shard]` already holds, or `u64::MAX`, so the `min` never lowers it); then the `n` seqnos and the group's default timestamps are reserved.
 2. After the lock, `next_seqno.fetch_max(first + n)` (AcqRel): `next_seqno` is a mirror of the allocator and never passes a reservation, and every `fetch_max` past `first`, by any thread, comes after the hold.
 3. Apply the group; then store the next unapplied seqno, which is `u64::MAX` when nothing is pending.
 
