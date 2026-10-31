@@ -295,3 +295,75 @@ fn multi_get_allocations_do_not_grow_with_rows() {
     drop(t);
     db.close().expect("close");
 }
+
+/// Writes a row of `cells` cells (24-byte values) in commits of 1,000.
+fn wide_row(t: &Table, row: &[u8], cells: usize) {
+    for chunk in (0..cells).collect::<Vec<_>>().chunks(1_000) {
+        let mut m = t.mutate(row);
+        for &c in chunk {
+            m = m.put("f", format!("q{c:06}").as_bytes(), &[7u8; 24]);
+        }
+        m.commit().expect("commit");
+    }
+}
+
+/// D297: walking a row cell by cell allocates nothing per cell. The allocator calls of a
+/// whole walk (setup included) are the same for a row of 100 cells and one of 10,000.
+#[test]
+fn row_cells_allocations_do_not_grow_with_cells() {
+    let (db, t) = open("row_cells");
+    let mut calls = Vec::new();
+    for cells in [100usize, 10_000] {
+        let row = format!("hub{cells}");
+        wide_row(&t, row.as_bytes(), cells);
+        let walk = || {
+            let mut it = t.row(row.as_bytes()).family("f").cells().expect("cells");
+            let mut seen = 0;
+            while let Some(e) = it.next().expect("next") {
+                seen += e.cell.value().len().min(1) + e.qualifier.len().min(1);
+            }
+            seen
+        };
+        let _ = walk();
+        let (n, seen) = allocations(walk);
+        assert_eq!(seen, cells * 2);
+        eprintln!("cells(): {n} allocator calls for a {cells}-cell row");
+        calls.push(n);
+    }
+    assert!(
+        calls[1] <= calls[0] + 4,
+        "a cell walk's allocations grow with cells: {calls:?} (100 vs 10,000 cells)"
+    );
+    drop(t);
+    db.close().expect("close");
+}
+
+/// D297: past its first page, a page walk allocates nothing per page. The pages measured
+/// are the second to the ninth: the tenth reaches the row's end, where the walk drops its
+/// scan (teardown, not per-page work).
+#[test]
+fn row_pages_allocate_nothing_past_the_first_page() {
+    let (db, t) = open("row_pages");
+    wide_row(&t, b"hub", 10_000);
+    let mut pages = t.row(b"hub").family("f").pages(1_000).expect("pages");
+    assert_eq!(pages.next().expect("next").expect("page").len(), 1_000);
+    let (n, count) = allocations(|| {
+        let mut count = 0;
+        for _ in 0..8 {
+            let page = pages.next().expect("next").expect("a page");
+            count += page.iter().filter(|e| !e.cell.value().is_empty()).count();
+        }
+        count
+    });
+    assert_eq!(count, 8_000);
+    eprintln!("pages(1000): {n} allocator calls for 8 pages past the first");
+    assert_eq!(n, 0, "{n} allocator calls for 8 pages past the first");
+    assert_eq!(
+        pages.next().expect("next").expect("the last page").len(),
+        1_000
+    );
+    assert!(pages.next().expect("next").is_none());
+    drop(pages);
+    drop(t);
+    db.close().expect("close");
+}

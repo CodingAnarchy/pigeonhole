@@ -543,6 +543,10 @@ pub pigeonhole::RowCacheStats::fills: u64
 pub pigeonhole::RowCacheStats::hits: u64
 pub pigeonhole::RowCacheStats::misses: u64
 pub pigeonhole::RowCacheStats::write_throughs: u64
+pub struct pigeonhole::RowCells<'t>
+impl pigeonhole::RowCells<'_>
+pub fn pigeonhole::RowCells<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<pigeonhole::CellEntry<'_>>>
+pub fn pigeonhole::RowCells<'_>::position(&self) -> core::option::Option<pigeonhole::RowPosition>
 pub struct pigeonhole::RowIter<'t>
 impl pigeonhole::RowIter<'_>
 pub fn pigeonhole::RowIter<'_>::next_ref(&mut self) -> pigeonhole::Result<core::option::Option<pigeonhole::RowRef<'_>>>
@@ -579,9 +583,20 @@ impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
 impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_if_async(self, &pigeonhole::Condition) -> pigeonhole::nonblocking::CheckFuture
+pub struct pigeonhole::RowPages<'t>
+impl pigeonhole::RowPages<'_>
+pub fn pigeonhole::RowPages<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<pigeonhole::RowRef<'_>>>
+pub fn pigeonhole::RowPages<'_>::position(&self) -> core::option::Option<pigeonhole::RowPosition>
+pub struct pigeonhole::RowPosition(_)
+impl pigeonhole::RowPosition
+pub fn pigeonhole::RowPosition::from_bytes(&[u8]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::RowPosition::to_bytes(&self) -> alloc::vec::Vec<u8>
 pub struct pigeonhole::RowRead<'t>
 impl pigeonhole::RowRead<'_>
 pub fn pigeonhole::RowRead<'_>::read_async(self) -> pigeonhole::nonblocking::RowFuture
+impl<'t> pigeonhole::RowRead<'t>
+pub fn pigeonhole::RowRead<'t>::cells(self) -> pigeonhole::Result<pigeonhole::RowCells<'t>>
+pub fn pigeonhole::RowRead<'t>::pages(self, usize) -> pigeonhole::Result<pigeonhole::RowPages<'t>>
 impl<'t> pigeonhole::RowRead<'t>
 pub fn pigeonhole::RowRead<'t>::column_limit(self, u32) -> Self
 pub fn pigeonhole::RowRead<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
@@ -591,6 +606,7 @@ pub fn pigeonhole::RowRead<'t>::qualifier_bounds(self, core::ops::range::Bound<&
 pub fn pigeonhole::RowRead<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::RowRead<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
 pub fn pigeonhole::RowRead<'t>::read(self) -> pigeonhole::Result<core::option::Option<pigeonhole::RowRef<'t>>>
+pub fn pigeonhole::RowRead<'t>::resume_after(self, &pigeonhole::RowPosition) -> Self
 pub fn pigeonhole::RowRead<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::RowRead<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
 pub fn pigeonhole::RowRead<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
@@ -606,6 +622,7 @@ pub fn pigeonhole::RowRef<'a>::len(&self) -> usize
 pub fn pigeonhole::RowRef<'a>::to_owned(&self) -> pigeonhole::Row
 pub struct pigeonhole::Scan<'t>
 impl<'t> pigeonhole::Scan<'t>
+pub fn pigeonhole::Scan<'t>::cells(self) -> pigeonhole::Result<pigeonhole::ScanCells<'t>>
 pub fn pigeonhole::Scan<'t>::column_limit(self, u32) -> Self
 pub fn pigeonhole::Scan<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
 pub fn pigeonhole::Scan<'t>::family(self, &str) -> Self
@@ -621,6 +638,9 @@ pub fn pigeonhole::Scan<'t>::stream(self) -> pigeonhole::nonblocking::RowStream<
 pub fn pigeonhole::Scan<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
 pub fn pigeonhole::Scan<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
 pub fn pigeonhole::Scan<'t>::versions(self, u32) -> Self
+pub struct pigeonhole::ScanCells<'t>
+impl pigeonhole::ScanCells<'_>
+pub fn pigeonhole::ScanCells<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<(&[u8], pigeonhole::CellEntry<'_>)>>
 pub struct pigeonhole::Shard
 impl pigeonhole::Shard
 pub fn pigeonhole::Shard::closed(&self) -> core::option::Option<pigeonhole::Result<()>>

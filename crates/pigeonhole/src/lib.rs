@@ -169,7 +169,10 @@ pub use options::{
 };
 /// A sorted set of distinct row keys, the input of [`Table::keys`] (D299).
 pub use pigeonhole_engine::KeySet;
-pub use read::{Condition, KeyRows, KeysRead, RowIter, RowRead, Scan, ValueFilter};
+pub use read::{
+    Condition, KeyRows, KeysRead, RowCells, RowIter, RowPages, RowPosition, RowRead, Scan,
+    ScanCells, ValueFilter,
+};
 pub use recovery::RecoveryStats;
 pub use retry::RetryPolicy;
 pub use table::{ReadTable, Table, TableBuilder};
