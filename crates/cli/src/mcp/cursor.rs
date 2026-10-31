@@ -70,7 +70,8 @@ impl Cursor {
         if hash != fingerprint(args) {
             return Err(
                 "cursor: it belongs to a call with other arguments; repeat the call \
-                        that returned it with only the cursor added"
+                 that returned it exactly, with only the cursor added (an argument given \
+                 its default value differs from one left out)"
                     .into(),
             );
         }
@@ -89,12 +90,13 @@ impl Cursor {
     }
 }
 
-/// A hash of `args` without `cursor`, with object keys sorted.
+/// A hash of `args` without `cursor`, with object keys sorted. A `null` argument counts as
+/// left out, as the tools read it: some clients send omitted optional fields as `null`.
 fn fingerprint(args: &Map<String, Value>) -> u64 {
     fn feed(v: &Value, h: &mut DefaultHasher) {
         match v {
             Value::Object(m) => {
-                let mut keys: Vec<&String> = m.keys().collect();
+                let mut keys: Vec<&String> = m.keys().filter(|k| !m[*k].is_null()).collect();
                 keys.sort();
                 h.write_u8(b'{');
                 for k in keys {
@@ -112,7 +114,10 @@ fn fingerprint(args: &Map<String, Value>) -> u64 {
         }
     }
     let mut h = DefaultHasher::new();
-    let mut keys: Vec<&String> = args.keys().filter(|k| *k != "cursor").collect();
+    let mut keys: Vec<&String> = args
+        .keys()
+        .filter(|k| *k != "cursor" && !args[*k].is_null())
+        .collect();
     keys.sort();
     for k in keys {
         k.hash(&mut h);
@@ -163,6 +168,16 @@ mod tests {
             Cursor::decode(&other)
                 .unwrap_err()
                 .contains("other arguments")
+        );
+        // A null argument is one left out, at any depth.
+        let mut nulls = args(json!({"table": "t", "limit": 5, "versions": null}));
+        nulls.insert(
+            "cursor".into(),
+            Cursor::Traverse { hop: 0, index: 1 }.encode(&call).into(),
+        );
+        assert_eq!(
+            Cursor::decode(&nulls).unwrap(),
+            Some(Cursor::Traverse { hop: 0, index: 1 })
         );
         let junk = args(json!({"table": "t", "limit": 5, "cursor": "nope"}));
         assert!(Cursor::decode(&junk).is_err());

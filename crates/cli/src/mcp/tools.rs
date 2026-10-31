@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 
-use pigeonhole::{CellEntry, KeySet, RowPosition, Table, Value as Cell};
+use pigeonhole::{Aggregation, CellEntry, KeySet, RowPosition, Table, Value as Cell};
 use serde_json::{Map, Value, json};
 
 use super::Limits;
@@ -29,6 +29,24 @@ use crate::cmd::schema::{
 };
 use crate::exit::Failure;
 use crate::open::{Db, Handle};
+
+/// The aggregation kinds `create_table` takes (`family_from_json`'s names).
+const AGGREGATIONS: &[&str] = &[
+    "sum",
+    "min",
+    "max",
+    "hll",
+    "bit_or",
+    "bit_and",
+    "bit_xor",
+    "min_f64",
+    "max_f64",
+    "sum_f64",
+    "mean_var",
+    "histogram",
+    "quantiles",
+    "bloom",
+];
 
 /// The most rows a `scan`, and columns per row, one call may ask for.
 const MAX_ROWS: u64 = 10_000;
@@ -454,7 +472,15 @@ impl Tools {
             write_op(&mut batch, &tables, Args(op)).map_err(|f| f.within(&format!("ops[{i}]")))?;
         }
         let n = batch.len();
-        let info = batch.commit().map_err(|e| Failure::db("write", &e))?;
+        let info = batch.commit().map_err(|e| {
+            let f = Failure::db("write", &e);
+            // The library's message may name its Rust methods; say what to check here.
+            if e.code() == pigeonhole::ErrorCode::InvalidArgument {
+                f.hint("check each family's kind and options with list_tables")
+            } else {
+                f
+            }
+        })?;
         Ok(object(json!({"committed": n, "seqno": info.seqno})))
     }
 
@@ -545,6 +571,13 @@ fn write_op(
         "incr" => {
             op.only(&["op", "table", "row", "family", "qualifier", "value", "ts"])?;
             let (f, q) = column()?;
+            if !matches!(family_kind(t, f)?, Some(Aggregation::Sum)) {
+                return Err(usage(format!(
+                    "incr adds to a counter (sum) family, and {f} is not one: use put for a \
+                     plain family, aggregate for another aggregate family (list_tables shows \
+                     each family's aggregation)"
+                )));
+            }
             let v = value()?;
             let delta = v
                 .as_i64()
@@ -558,29 +591,20 @@ fn write_op(
         "aggregate" => {
             op.only(&["op", "table", "row", "family", "qualifier", "value", "ts"])?;
             let (f, q) = column()?;
-            let v = value()?;
-            if let Some(bits) = v.get("u64") {
-                let bits = bits
-                    .as_u64()
-                    .ok_or_else(|| usage("value: u64 is not a u64".into()))?;
-                match ts {
-                    None => batch.aggregate_u64(t, &row, f, q, bits),
-                    Some(ts) => batch.aggregate_u64_at(t, &row, f, q, ts, bits),
-                };
-                return Ok(());
-            }
-            let v = match v {
-                Value::Number(n) if n.is_i64() => JsonValue::I64(n.as_i64().expect("i64")),
-                Value::Number(n) => JsonValue::F64(n.as_f64().unwrap_or(f64::NAN)),
-                v => value_of(v)?,
+            let Some(agg) = family_kind(t, f)? else {
+                return Err(usage(format!(
+                    "aggregate writes to an aggregate family, and {f} is a plain family: use put"
+                )));
             };
-            match (v, ts) {
-                (JsonValue::I64(n), None) => batch.aggregate(t, &row, f, q, n),
-                (JsonValue::I64(n), Some(ts)) => batch.aggregate_at(t, &row, f, q, ts, n),
-                (JsonValue::F64(x), None) => batch.aggregate_f64(t, &row, f, q, x),
-                (JsonValue::F64(x), Some(ts)) => batch.aggregate_f64_at(t, &row, f, q, ts, x),
-                (JsonValue::Bytes(b), None) => batch.aggregate_bytes(t, &row, f, q, &b),
-                (JsonValue::Bytes(b), Some(ts)) => batch.aggregate_bytes_at(t, &row, f, q, ts, &b),
+            match (aggregate_input(&agg, value()?)?, ts) {
+                (Input::I64(n), None) => batch.aggregate(t, &row, f, q, n),
+                (Input::I64(n), Some(ts)) => batch.aggregate_at(t, &row, f, q, ts, n),
+                (Input::U64(n), None) => batch.aggregate_u64(t, &row, f, q, n),
+                (Input::U64(n), Some(ts)) => batch.aggregate_u64_at(t, &row, f, q, ts, n),
+                (Input::F64(x), None) => batch.aggregate_f64(t, &row, f, q, x),
+                (Input::F64(x), Some(ts)) => batch.aggregate_f64_at(t, &row, f, q, ts, x),
+                (Input::Bytes(b), None) => batch.aggregate_bytes(t, &row, f, q, &b),
+                (Input::Bytes(b), Some(ts)) => batch.aggregate_bytes_at(t, &row, f, q, ts, &b),
             };
         }
         "delete" => {
@@ -604,6 +628,56 @@ fn write_op(
         }
     }
     Ok(())
+}
+
+/// `family`'s aggregation in `t`: `None` for a plain family. A family `t` doesn't have
+/// fails with `FamilyNotFound`, as the commit would.
+fn family_kind(t: &Table, family: &str) -> Result<Option<Aggregation>, Failure> {
+    match t.family_info(family) {
+        Some(info) => Ok(info.aggregation),
+        None => Err(Failure::family_not_found(t.name(), family)),
+    }
+}
+
+/// An aggregate family's input.
+enum Input {
+    I64(i64),
+    U64(u64),
+    F64(f64),
+    Bytes(Vec<u8>),
+}
+
+/// `v` as an input to a family of kind `agg`, by the family's kind rather than the JSON
+/// number's shape: an agent writes `3` to an f64 family as often as `3.0`.
+fn aggregate_input(agg: &Aggregation, v: &Value) -> Result<Input, Failure> {
+    let bad = |want: &str| Failure::usage(&format!("aggregate: this family takes {want}"));
+    // `{"i64": n}`, `{"f64": x}` and `{"u64": n}` stand for the plain numbers.
+    let number = v
+        .get("i64")
+        .or_else(|| v.get("f64"))
+        .or_else(|| v.get("u64"))
+        .unwrap_or(v);
+    Ok(match agg {
+        Aggregation::MinF64
+        | Aggregation::MaxF64
+        | Aggregation::SumF64
+        | Aggregation::MeanVar
+        | Aggregation::Histogram(_)
+        | Aggregation::Quantiles(_) => Input::F64(number.as_f64().ok_or_else(|| bad("a number"))?),
+        Aggregation::BitOr | Aggregation::BitAnd | Aggregation::BitXor => Input::U64(
+            number
+                .as_u64()
+                .ok_or_else(|| bad("a non-negative integer (a 64-bit mask)"))?,
+        ),
+        // An element: an integer, or bytes.
+        Aggregation::Hll | Aggregation::Bloom(_) => match number.as_i64() {
+            Some(n) if !v.is_string() => Input::I64(n),
+            _ => Input::Bytes(
+                bytes_from_json(v).map_err(|_| bad("an integer, a string or {\"base64\"}"))?,
+            ),
+        },
+        _ => Input::I64(number.as_i64().ok_or_else(|| bad("an integer"))?),
+    })
 }
 
 /// The selection `read_row` and `scan` share.
@@ -1018,8 +1092,9 @@ fn write() -> Value {
          - put: set family:qualifier to `value` (a string, {\"base64\"}, {\"i64\": n} or \
          {\"f64\": x}); a new version unless `ts` repeats one.\n\
          - incr: add an integer `value` to a counter family's cell.\n\
-         - aggregate: add `value` to an aggregate family's cell (an integer, a number, \
-         {\"u64\": n} for bitwise families, or bytes for hll and bloom).\n\
+         - aggregate: add `value` to an aggregate family's cell: a number (f64 kinds take \
+         any number), a non-negative integer for bit_or/bit_and/bit_xor, an integer or a \
+         string for hll and bloom.\n\
          - delete: the whole row; with family, that family; with qualifier too, the column; \
          with ts too, one version.\n\
          `ts` is microseconds since the Unix epoch, default now. Families must exist \
@@ -1058,8 +1133,9 @@ fn create_table() -> Value {
         "Create a table",
         "Create a table with its column families, if it does not exist (an existing table \
          and its families are left as they are). A family is a name, or an object with a \
-         name and options as list_tables shows them: \"aggregation\" (sum for counters, min, \
-         max, hll, ...), \"max_versions\", \"ttl_micros\". Plain families hold any bytes or \
+         name and options as list_tables shows them: \"aggregation\" (one of the kinds the \
+         schema lists; sum is a counter), \"aggregation_params\" for histogram, quantiles \
+         and bloom, \"max_versions\" (0 keeps every version), \"ttl_micros\". Plain families hold any bytes or \
          numbers; group data read together in one family.",
         json!({
             "type": "object",
@@ -1073,7 +1149,20 @@ fn create_table() -> Value {
                             "type": "object",
                             "properties": {
                                 "name": {"type": "string"},
-                                "aggregation": {"type": "string"},
+                                "aggregation": {
+                                    "enum": AGGREGATIONS,
+                                    "description": "An aggregate family's kind: sum is a \
+                                                    counter (incr); histogram, quantiles and \
+                                                    bloom take aggregation_params.",
+                                },
+                                "aggregation_params": {
+                                    "type": "object",
+                                    "description": "histogram: {\"bounds\": [b0, b1, ...]} \
+                                                    (ascending); quantiles: \
+                                                    {\"mantissa_bits\": p, \"max_buckets\": n} \
+                                                    (both optional); bloom: {\"bits\": m, \
+                                                    \"hashes\": k} (both required).",
+                                },
                                 "max_versions": {"type": "integer", "minimum": 1},
                                 "ttl_micros": {"type": "integer", "minimum": 1},
                             },

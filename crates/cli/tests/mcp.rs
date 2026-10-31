@@ -330,6 +330,56 @@ fn a_batch_commits_every_operation_or_none() {
     assert_eq!(e["code"], "FamilyNotFound", "{e}");
     let u2 = s.call("read_row", json!({"table": "mem", "row": "u2"}));
     assert_eq!(u2["cells"], json!([]));
+
+    // An aggregate's input type follows the family's kind, not the JSON number's shape.
+    s.call(
+        "create_table",
+        json!({"table": "agg", "families": [{"name": "hi", "aggregation": "max_f64"},
+                                           {"name": "bits", "aggregation": "bit_or"},
+                                           {"name": "seen", "aggregation": "hll"},
+                                           "plain"]}),
+    );
+    let agg = |f: &str, v: Value| {
+        json!({"op": "aggregate", "table": "agg", "row": "r", "family": f, "qualifier": "q",
+               "value": v})
+    };
+    s.call(
+        "write",
+        json!({"ops": [agg("hi", json!(3)), agg("hi", json!(2.5)), agg("hi", json!({"i64": 1})),
+                       agg("bits", json!(1)), agg("bits", json!({"u64": 4})),
+                       agg("seen", json!("ada")), agg("seen", json!(7))]}),
+    );
+    let hi = s.call(
+        "read_row",
+        json!({"table": "agg", "row": "r", "families": ["hi"]}),
+    );
+    assert_eq!(hi["cells"][0]["value"], json!({"f64": 3.0}), "{hi}");
+    // Writes of the wrong kind say what to use, in this tool's terms.
+    for (op, needle) in [
+        (agg("bits", json!(-1)), "non-negative integer"),
+        (agg("plain", json!(1)), "use put"),
+        (
+            json!({"op": "incr", "table": "agg", "row": "r", "family": "hi", "qualifier": "q",
+                   "value": 1}),
+            "counter (sum) family",
+        ),
+    ] {
+        let e = s.fail("write", json!({"ops": [op]}));
+        let m = e["message"].as_str().unwrap();
+        assert!(m.contains(needle), "{e}");
+        assert!(
+            !m.contains("aggregate_f64") && !m.contains("Family::"),
+            "{e}"
+        );
+    }
+    let e = s.fail("write", json!({"ops": [agg("nope", json!(1))]}));
+    assert_eq!(e["code"], "FamilyNotFound", "{e}");
+
+    // A non-finite float reads back as {"f64_bits"}, which a put takes back.
+    let inf = json!({"f64_bits": f64::INFINITY.to_bits()});
+    s.call("write", json!({"ops": [put("u3", "x", inf.clone())]}));
+    let u3 = s.call("read_row", json!({"table": "mem", "row": "u3"}));
+    assert_eq!(u3["cells"][0]["value"], inf);
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
     // The writes are in the file after the server closes it.
@@ -387,6 +437,17 @@ fn long_results_are_cut_with_cursors_that_continue_them() {
     let want: Vec<String> = (0..40).map(|r| format!("r{r:02}")).collect();
     assert_eq!(keys, want);
     assert!(calls > 3, "{calls} calls: the limit did not cut");
+    // A client that re-sends omitted arguments as null keeps its cursor.
+    let first = s.call("scan", json!({"table": "t", "prefix": "r"}));
+    let again = s.call(
+        "scan",
+        json!({"table": "t", "prefix": "r", "limit": null, "families": null,
+               "cursor": first["cursor"]}),
+    );
+    assert_eq!(
+        again["rows"][0]["row"],
+        rows[first["rows"].as_array().unwrap().len()]["row"]
+    );
     // So does the row limit.
     let (rows, calls) = pages(
         &mut s,

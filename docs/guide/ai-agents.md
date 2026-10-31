@@ -77,7 +77,7 @@ Six tools, each with a JSON schema and a description written for the agent. `too
 | `read_row` | One row's cells. Selects `families`, one `qualifier` or a `qualifier_prefix`, and `versions` (default 1). A wide row comes back in parts. |
 | `scan` | Rows in key order: a `prefix`, a `start`/`end` range, or all; `limit` rows (default 100), `columns_per_row` (default 100), and the same selection as `read_row`. |
 | `traverse` | Breadth-first hops over an edge family from `seeds` ([Graphs](graphs.md#traversal-hops-inside-the-engine)): `hops`, `per_node_limit`, `hop_limit`, `max_nodes` (default 100,000), and `parents` for shortest paths. |
-| `write` | Up to 10,000 operations in one atomic `WriteBatch`: `put`, `incr` (counter families), `aggregate` (other aggregate families) and `delete` (a row, a family, a column, or one version with `ts`). All commit, or none. |
+| `write` | Up to 10,000 operations in one atomic `WriteBatch`: `put`, `incr` (counter families), `aggregate` (other aggregate families) and `delete` (a row, a family, a column, or one version with `ts`). All commit, or none. An `aggregate` value is read by the family's kind: any number for the f64 kinds, a non-negative integer for the bitwise ones, an integer or a string for `hll` and `bloom`. |
 | `create_table` | A table and its families, if missing. A family is a name, or an object in `list_tables`' shape (`{"name": "hits", "aggregation": "sum"}`). |
 
 **Encoding.** Values use [`phdb dump`](cli.md#phdb-dump)'s JSON shapes. Row keys, qualifiers and byte values are JSON strings when they are UTF-8, else `{"base64": "..."}`. Integer and float cells are `{"i64": n}` and `{"f64": x}`. Timestamps are microseconds since the Unix epoch. A cell in a result is `{"family", "qualifier", "ts", "value"}`.

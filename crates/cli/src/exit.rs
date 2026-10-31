@@ -70,6 +70,16 @@ impl Failure {
         }
     }
 
+    /// A family the table doesn't have (exit 5, `FamilyNotFound`).
+    pub(crate) fn family_not_found(table: &str, family: &str) -> Self {
+        Self {
+            code: "FamilyNotFound".into(),
+            code_num: Some(ErrorCode::FamilyNotFound as u32),
+            message: format!("table {table} has no family {family}"),
+            status: ExitStatus::NOT_FOUND,
+        }
+    }
+
     /// Bad usage that clap's checks do not catch (exit 2).
     pub(crate) fn usage(message: &str) -> Self {
         Self {
@@ -141,6 +151,12 @@ impl Failure {
     /// The same failure, naming the part of a request it came from (`ops[3]: …`).
     pub(crate) fn within(mut self, what: &str) -> Self {
         self.message = format!("{what}: {}", self.message);
+        self
+    }
+
+    /// The same failure with a hint at what to do about it.
+    pub(crate) fn hint(mut self, hint: &str) -> Self {
+        self.message = format!("{} ({hint})", self.message);
         self
     }
 
