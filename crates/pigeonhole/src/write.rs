@@ -147,8 +147,6 @@ fn value_too_large(len: usize, max_value: usize) -> Error {
 /// The longest put value: a blob pointer's length is a `u32` and covers the tag byte too.
 const MAX_PUT_VALUE: usize = u32::MAX as usize - 1;
 
-/// An engine batch plus the first error met while building it (builders never fail; the
-/// error surfaces at commit).
 /// A checked vector's value: the family's element and dimension over `payload`.
 fn vector_value<'a>(p: &FormatParams, payload: &'a [u8]) -> ValueRef<'a> {
     ValueRef::Vector(
@@ -156,6 +154,8 @@ fn vector_value<'a>(p: &FormatParams, payload: &'a [u8]) -> ValueRef<'a> {
     )
 }
 
+/// An engine batch plus the first error met while building it (builders never fail; the
+/// error surfaces at commit).
 #[derive(Debug, Default)]
 struct Builder {
     batch: EngineBatch,
@@ -565,7 +565,8 @@ impl RowMutation<'_> {
 
     /// Puts the `f32` vector `value` into a vector family (D303,
     /// [`VectorSpec`](crate::VectorSpec)) at the commit timestamp. A vector of another
-    /// element type or dimension, a non-finite component, an all-zero vector in a cosine
+    /// element type or dimension, an `f32` component that isn't finite or exceeds 2^56 in
+    /// magnitude, a vector with a zero norm in a cosine
     /// family, or a family that isn't a vector family fails with `InvalidArgument`.
     pub fn put_vector_f32(self, family: &str, qualifier: &[u8], value: &[f32]) -> Self {
         self.vector(family, qualifier, None, Query::F32(value))

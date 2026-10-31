@@ -24,7 +24,7 @@ pub enum Metric {
     L2,
     /// The negated inner product, so the largest product ranks first (`f32` and `i8`).
     InnerProduct,
-    /// `1 - cosine similarity` (`f32` and `i8`; all-zero vectors are refused).
+    /// `1 - cosine similarity` (`f32` and `i8`; vectors with a zero norm are refused).
     Cosine,
     /// The number of differing bits (bit vectors only).
     Hamming,
@@ -76,8 +76,8 @@ impl Metric {
 /// [`put_vector_i8`](crate::RowMutation::put_vector_i8) or
 /// [`put_vector_bits`](crate::RowMutation::put_vector_bits) (and their `_at` forms, on
 /// [`WriteBatch`](crate::WriteBatch) and [`Transaction`](crate::Transaction) too). A vector
-/// of another element type or dimension, a non-finite `f32` component, or (under cosine) an
-/// all-zero vector is refused with `InvalidArgument` when the write is built. A vector
+/// of another element type or dimension, an `f32` component that isn't finite or exceeds
+/// 2^56 in magnitude, or (under cosine) a vector with a zero norm is refused with `InvalidArgument` when the write is built. A vector
 /// family takes nothing else: a plain put, a merge or an aggregate input fails with
 /// `InvalidArgument`. Cells version and delete as in an ordinary family.
 ///
@@ -139,7 +139,8 @@ impl VectorSpec {
     /// The distance from the `f32` vector `query` to `stored` under this spec's metric, as
     /// the engine ranks vectors (exact for `i8` and bit vectors, and the `f32` kernels'
     /// result widened exactly). `query` must have this spec's dimension and finite
-    /// components (and not be all zeros under cosine), and `stored` must be of this spec;
+    /// components a write takes (finite, at most 2^56 in magnitude, and a nonzero norm under
+    /// cosine), and `stored` must be of this spec;
     /// otherwise `InvalidArgument`.
     pub fn distance_f32(&self, query: &[f32], stored: VectorRef<'_>) -> Result<f64> {
         self.distance(fmt::Query::F32(query), stored)

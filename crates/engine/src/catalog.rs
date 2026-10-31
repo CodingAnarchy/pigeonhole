@@ -1002,6 +1002,42 @@ mod cow_tests {
         assert!(c.family(FamilyId(2)).is_some_and(|f| f.merge_op.is_some()));
     }
 
+    /// D303: a vector family takes no merge operator, so a manifest whose vector family names
+    /// one (built-in or registered) is corrupt; one that names none decodes, with no operator.
+    #[test]
+    fn a_vector_family_naming_an_operator_is_corrupt() {
+        use pigeonhole_format::vector::{Element, Metric, Params};
+        let params = Params::new(Element::F32, 4, Metric::Cosine)
+            .unwrap()
+            .encode();
+        let put = |op: &str| Edit::PutFamily {
+            table: TableId(1),
+            family: FamilyId(2),
+            name: "v".into(),
+            options: FamilyOptions::default()
+                .merge_operator(op)
+                .kind(FamilyKind::Vector)
+                .kind_params(params.clone()),
+        };
+        let mut c = Catalog::default();
+        let table = Edit::CreateTable {
+            table: TableId(1),
+            name: "t".into(),
+        };
+        c.apply(&table, 1).unwrap();
+        for op in [I64_ADD, "app.concat"] {
+            match c.apply(&put(op), 1) {
+                Err(Error::Corruption(why)) => {
+                    assert!(why.contains("vector family"), "{op}: {why}")
+                }
+                other => panic!("{op}: {other:?}"),
+            }
+        }
+        c.apply(&put(""), 1).unwrap();
+        let f = c.family(FamilyId(2)).expect("decoded");
+        assert!(f.merge_op.is_none() && f.merge == MergeKind::None);
+    }
+
     /// Random batches of edits (#499): the slot-level `removed_since` and
     /// `prune_blob_refs_since` equal the full recomputes, `same_ssts` only reports equal
     /// lists, and editing a clone leaves the catalog it came from unchanged. Prints the seed

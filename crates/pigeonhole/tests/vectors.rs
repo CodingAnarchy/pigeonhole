@@ -167,6 +167,28 @@ fn writes_that_dont_fit_the_spec_are_refused_when_built() {
             .commit(),
         "not a vector family",
     );
+    // perf287's B1: components that would overflow a kernel, and a cosine norm that
+    // underflows, are refused, so every stored vector has a finite distance to every query.
+    invalid(
+        t.mutate(b"r").put_vector_f32("f", b"", &[1e30; 8]).commit(),
+        "2^56",
+    );
+    let mut tiny = [0.0f32; 8];
+    tiny[0] = 1e-45;
+    invalid(
+        t.mutate(b"r").put_vector_f32("f", b"", &tiny).commit(),
+        "nonzero norm",
+    );
+    let spec = t.family_info("f").and_then(|f| f.vector).expect("spec");
+    t.mutate(b"ok")
+        .put_vector_f32("f", b"", &[1.0; 8])
+        .commit()
+        .expect("put");
+    let ok = t.get(b"ok", "f", b"").expect("get").expect("written");
+    let e = spec
+        .distance_f32(&tiny, ok.as_vector().expect("vector"))
+        .expect_err("the same rule for a query");
+    assert_eq!(e.code(), ErrorCode::InvalidArgument);
     // An i8 L2 family takes the zero vector.
     t.mutate(b"r")
         .put_vector_i8("q", b"", &[0; 4])
