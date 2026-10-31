@@ -21,6 +21,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+permissions:
+  contents: read
+
 jobs:
   test:
     name: pytest (${{ matrix.os }}, ${{ matrix.python }})
