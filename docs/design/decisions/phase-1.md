@@ -840,6 +840,10 @@ With many tablets per shard, every `(tablet, family)` slot takes memtable chunks
 
 **Interim behavior (with `tablet_changes` on):** a batch reserves a chunk for each slot it would create; empty slots release their memtables after a flush and before a room wait; a freeze never takes a chunk admitted members reserved; the balancer and tablet-change validation keep each shard's slots to a quarter of its arena's chunks (`max_slots`: with the default 64 MiB budget and 1 MiB chunks, 16 slots per shard). A room wait that nothing can end follows D126 (#84). Smaller arena chunks for shards with many tablets are the longer-term fix.
 
+**Since D302:** arenas are cut into 1024 chunks (`arena_len / 1024`, 1 KiB to 256 KiB), and `max_slots` is a sixteenth of them, still 64 per shard, so held snapshots' pinned generations leave room for writes (#1212).
+
+*History: Amended by D302 (1024 chunks, 16 per slot).*
+
 <a id="d137"></a>
 ## D137 — What does `Engine::compact` guarantee while tablets split, merge and move (approved; engine)
 `Engine::compact` sends one `CompactAll` to every shard; each shard compacts the slots it owns and replies. With tablet changes on, the balancer kept moving and merging tablets meanwhile: a tablet could leave a shard before that shard's round reached it and arrive at a shard whose round was over, so it was never compacted (seed 13 of `results_are_identical_across_shard_counts_with_tablet_changes`). And a slot holding one SST above the last level was moved there without a rewrite, keeping deletes that a rewrite of the same rows purges (D74). How many SSTs a slot holds depends on when splits and moves flushed it, which depends on the shard count (seed 106).

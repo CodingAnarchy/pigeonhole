@@ -938,9 +938,10 @@ fn value_limits_arena_pressure_and_closed_handles() {
         written += 1;
     }
     assert!(db.metrics().flushes >= 1, "flushes freed the arena");
-    // A batch that could never fit, even in an empty arena, is refused at once.
+    // A batch that could never fit, even in an empty arena, is refused at once: more value
+    // bytes than the whole arena holds, whatever its chunk size (D302).
     let mut wb = WriteBatch::new();
-    for i in 0..300u32 {
+    for i in 0..600u32 {
         put(
             &mut wb,
             &t,

@@ -1194,9 +1194,10 @@ fn sim_run_closes_to_one_file_and_reopens_without_replay() {
 fn large_memtable_values_are_pinned_not_copied() {
     let vfs = SimVfs::new(29);
     let mut o = owned(Arc::clone(&vfs), 1);
-    // Chunks of 16 KiB (arena / 256 with tablet changes on, D140): every value fits one, so
-    // nothing freezes and all of them stay memtable-resident.
+    // Nothing freezes (the freeze threshold well above the values), so all of them stay
+    // memtable-resident; the 8 KiB value spans a run of the arena's 4 KiB chunks (D302).
     o.memtable_budget = 4 << 20;
+    o.memtable_freeze_bytes = 4 << 20;
     let db = Engine::open(Path::new(DB), o).unwrap();
     let t = db
         .create_table("t", &[("f".into(), FamilyOptions::default())])

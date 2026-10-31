@@ -602,21 +602,34 @@ fn first_seqno(ceiling: Seqno, max_replayed: Seqno) -> Seqno {
     ceiling.max(max_replayed + 1).max(1)
 }
 
-/// Most `(tablet, family)` slots an arena of `arena_len` bytes in `chunk` chunks serves: a
-/// quarter of its chunks (every slot written to takes a chunk, usually two before it
-/// freezes, and frozen memtables keep theirs until flushed).
+/// Chunks per arena by default (#1212, D302; 256 before).
+const ARENA_CHUNKS: usize = 1024;
+
+/// Chunks of an arena per slot it serves (#1212, D302; 4 before): a slot written to takes a
+/// chunk, usually two before it freezes, and frozen memtables keep theirs until flushed (the
+/// first four), and each snapshot held across a flush pins a generation of memtables, at
+/// least a chunk per slot (the rest).
+const CHUNKS_PER_SLOT: usize = 16;
+
+/// Most `(tablet, family)` slots an arena of `arena_len` bytes in `chunk` chunks serves: one
+/// per [`CHUNKS_PER_SLOT`] chunks, 64 at the default chunk count, as before D302.
 pub(crate) fn max_slots(arena_len: usize, chunk: usize) -> usize {
-    arena_len / chunk.max(1) / 4
+    arena_len / chunk.max(1) / CHUNKS_PER_SLOT
 }
 
-/// The arena chunk size (D136, #104, #283): at least 256 chunks per arena, so every shard
-/// serves 64 slots whatever the budget, and smaller still when the tablets placed at open
-/// need more (a reopen with fewer shards after splits, or many tables and families with
-/// tablet changes off). Never below 1 KiB.
+/// The arena chunk size (D136, #104, #283, D302): at least 1024 chunks per arena, so every
+/// shard serves 64 slots whatever the budget with 16 chunks each, and smaller still when
+/// the tablets placed at open need more (a reopen with fewer shards after splits, or many
+/// tables and families with tablet changes off). Never below 1 KiB.
+///
+/// A memtable holds at least one chunk however little it holds, and each held snapshot pins
+/// the memtables of its generation, so snapshots held across flushes pin `snapshots ×
+/// slots` chunks. 256 chunks of 4 per slot let 8 of them take a 32-slot shard's whole
+/// arena (#1212).
 fn arena_chunk_size(arena_len: usize, placed_slots: usize) -> usize {
-    let mut chunk = (arena_len / 256).clamp(1024, ShardArena::DEFAULT_CHUNK);
+    let mut chunk = (arena_len / ARENA_CHUNKS).clamp(1024, ShardArena::DEFAULT_CHUNK);
     if max_slots(arena_len, chunk) < placed_slots {
-        chunk = arena_len / (4 * placed_slots);
+        chunk = arena_len / (CHUNKS_PER_SLOT * placed_slots);
     }
     chunk.max(1024) & !63
 }

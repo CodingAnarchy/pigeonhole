@@ -589,6 +589,10 @@ D136 sized arenas for many slots only with tablet changes on: at least 256 chunk
 
 **Coordinator:** confirmed. Smaller chunks can't fail at apply: an entry larger than a chunk takes a contiguous run, and admission waits for one (`values_larger_than_a_small_chunk_are_admitted_and_applied`).
 
+**Since D302:** arenas are cut into 1024 chunks (`arena_len / 1024`, 1 KiB to 256 KiB), and `max_slots` is a sixteenth of them, still 64 per shard, so held snapshots' pinned generations leave room for writes (#1212).
+
+*History: Amended by D302 (1024 chunks, 16 per slot).*
+
 <a id="d190"></a>
 ## D190 — `shrink` clears a region when a large extent has no hole below it (approved; pager, engine, #314, #319; amends D160)
 ### Proposed decision (amends D160): `shrink` clears a region when a large extent has no hole
