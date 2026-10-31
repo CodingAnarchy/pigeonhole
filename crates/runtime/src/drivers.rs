@@ -737,7 +737,9 @@ fn record_gap(gaps: &mut Option<GapWindow>, idle_from: Instant) {
 
 /// A driver's spin window sized from its recent idle gaps (#1176): each gap runs from the
 /// end of a pass with nothing left to the next pass, whether a spin, a ring wait or a park
-/// ended it. The window is the longest, up to the cap, whose expected poll per gap is at
+/// ended it. A pass a timer starts (a balance pass, a flush deadline, a ring wait's timeout)
+/// ends a gap too, and a parked gap includes the wake: both count gaps as no shorter than
+/// the commits' own, so they bias the window short, never long. The window is the longest, up to the cap, whose expected poll per gap is at
 /// most the base window: a poll ends when the gap does or the window runs out, so it costs
 /// `min(gap, window)`. The base window always qualifies (it costs at most itself), so the
 /// window is never shorter than the base. Gaps mostly short (a steady stream, however
@@ -1134,6 +1136,22 @@ mod tests {
             g.record(Duration::from_micros(5000));
         }
         assert_eq!(g.window(), Duration::from_micros(200));
+    }
+
+    #[test]
+    fn the_window_grows_back_when_the_load_returns() {
+        // Slow to fast: the long gaps still weigh until the short ones outnumber them (and
+        // the decay halves them), then the window is the cap again.
+        let mut g = gaps(200, 1000, std::iter::repeat_n(5000, 256));
+        assert_eq!(g.window(), Duration::from_micros(200));
+        for _ in 0..32 {
+            g.record(Duration::from_micros(20));
+        }
+        assert_eq!(g.window(), Duration::from_micros(200), "one choice in");
+        for _ in 0..2048 {
+            g.record(Duration::from_micros(20));
+        }
+        assert_eq!(g.window(), Duration::from_micros(1000));
     }
 
     #[test]

@@ -470,8 +470,8 @@ impl Options {
     ///
     /// Sizes each shard thread's poll from its recent idle gaps, up to `cap`: the longest
     /// poll whose expected cost per gap is no more than the [`shard_spin`](Self::shard_spin)
-    /// window's could be. A cap at or under that window keeps the window fixed (the
-    /// default).
+    /// window's could be. A cap at or below that window keeps the window fixed, as with no
+    /// cap (the default under [`CpuProfile::Server`] or with an explicit window).
     #[cfg(feature = "__unstable-hooks")]
     #[doc(hidden)]
     pub fn shard_spin_cap(mut self, cap: Duration) -> Self {
