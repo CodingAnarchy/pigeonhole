@@ -1219,6 +1219,7 @@ Each record carries `detail.settle` (milliseconds, settled, the work done while 
     - [D252](#d252): when the shards fit but the compaction threads don't, the shards are pinned and only the compaction threads run unpinned.
 - **Several databases in one process:** a process-wide registry of claimed CPUs makes each plan skip CPUs another live runtime holds, so the second database pins elsewhere or runs unpinned (D158's first case). Claims are released when the runtime's threads are joined.
 - **Never fails an open.** A pin the OS refuses leaves that thread unpinned. `Runtime::start` returned `Spawn` on a pin error before.
+- [D305](#d305): a pinned driver's io_uring workers run on the affinity set less the drivers' CPUs, so they don't preempt it.
   - `Runtime::pinning` and `Metrics::{pinned_threads, unpinned}` report threads, pinned, and why not.
 - **Several processes on one host** can't see each other's pins and would pin onto the same CPUs. That's documented on `pin_threads`, in the guide and the agent reference: give each process its own CPUs (an affinity mask or cpuset) or `pin_threads(false)`. No option names cores; the affinity mask chooses them.
 - **Windows** pins within the process affinity mask (one processor group) with `SetThreadAffinityMask`, as before.
@@ -3509,3 +3510,33 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Checks.**
 - `it/snapshot_room.rs`: 8 snapshots held across 8 flushes on a 64-slot shard, then 4 more rounds of writes to every slot. It fails on the old geometry at round 2 with the write-stall timeout.
 - Tests that hard-coded the old geometry keep their intent: `milestone_b` (no freeze), `api` (a batch larger than the whole arena), `read_only_fallback` (nothing flushed before the crash), and `pigeonhole`'s `processes` (a reader process's held snapshot gets room for its 3,510 rows).
+
+<a id="d305"></a>
+## D305 — A pinned shard driver's io_uring workers run off the drivers' CPUs (coordinator decision, 2026-10-31; io, runtime; #1206 lever 3; amends D235)
+**Why.** #1206 traced the waits behind sparse-wide's awake inbox p99.9 (317–480 µs on the AX102, `Buffered`) to the pinned driver threads being **preempted**, not to long shard turns.
+- **The drivers' own I/O workers.** io_uring hands a WAL sync, and any request it can't complete inline, to io-wq. io-wq is per task, and a driver's workers were preempting the driver on its own CPU: 357–390 preemptions over 100 µs per run, about 0.3 s in all, and every slow `SyncBarrier` submit (0.5–1.3 ms).
+- **Client threads** the scheduler placed on a driver's CPU: the rest, which is application placement (the coordinator took that question to the owner).
+- **Unpinned drivers** (`pin_threads(false)`) weren't the answer: put p99 got worse (28.4–35.6 µs) and client preemption about 4x.
+
+**Decided.**
+- **Where the workers go.** A pinned driver registers its io-wq affinity (`IORING_REGISTER_IOWQ_AFF`) when its ring is made: the opener's affinity set, the one D235 planned from, less the CPUs the plan gave the drivers (`PinPlan::io_worker_cpus`). The workers keep every CPU they had, except the drivers'.
+- **Best effort.** A kernel without `IOWQ_AFF` (before 5.14), a set outside the cpuset, or nothing left after the drivers' CPUs leaves them where they were. It never fails an open.
+- **Scope.**
+  - Only pinned drivers. Unpinned drivers, compaction and pool threads, application-owned threads and the shared ring are unchanged.
+  - Another database's drivers in the same process aren't excluded: each runtime knows its own plan only.
+- **How.** The runtime names the CPUs on each pinned driver thread (`pigeonhole_io::sys::set_io_worker_cpus`) before the thread attaches its ring, and the io_uring backend applies them as it makes that ring.
+
+**Measured (scratch, AX102, `Buffered`, gate settings; `.coord/out-1206l-20261031`):**
+
+| run | put p99 | put p99.9 | awake inbox p99.9 | ops/s |
+|---|---|---|---|---|
+| sparse-wide, today (x2) | 28.5–28.7 µs | 737–901 µs | 317–480 µs | 92.0–93.9K |
+| sparse-wide, workers off the drivers (x2) | 24.7–25.2 µs | 183–406 µs | 66–73 µs | 92.9–94.1K |
+| ycsb-a, today | 22.0 µs | 48.4 µs | 17.0 µs | 1.50M |
+| ycsb-a, workers off the drivers | 21.6 µs | 42.8 µs | 14.5 µs | 1.52M |
+
+With the workers moved, the trace counted no `iou-wrk` preemption of a driver over 100 µs. The PR's own box A/B over every gate row is on its PR.
+
+**Checks.**
+- `io`'s `a_pinned_threads_io_workers_run_off_its_cpu` (Linux): a pinned thread that named its workers' CPUs runs a sync, and every `iou-wrk-<tid>` worker's `Cpus_allowed_list` is within them and excludes the thread's CPU.
+- `sys`'s `io_workers_go_to_the_affinity_set_less_the_drivers_cpus` covers the plan's set, including an empty remainder.

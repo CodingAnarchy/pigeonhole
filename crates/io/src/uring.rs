@@ -1489,6 +1489,22 @@ impl ThreadRing {
         if !probe.is_supported(opcode::PollAdd::CODE) {
             return Err(Permanent);
         }
+        // D305: io-wq is per task, and a pinned shard driver's workers ran on its CPU and
+        // preempted it (#1206). Its CPUs for them, if it named any; best effort: a kernel
+        // without `IOWQ_AFF` (before 5.14), or a set outside the cpuset, leaves them.
+        let workers = crate::sys::io_worker_cpus();
+        if !workers.is_empty() {
+            // SAFETY: a zeroed `cpu_set_t` is the empty set, and `CPU_SET` writes within it
+            // for the ids below `CPU_SETSIZE` the filter keeps.
+            let set = unsafe {
+                let mut set: libc::cpu_set_t = std::mem::zeroed();
+                for &c in workers.iter().filter(|&&c| c < libc::CPU_SETSIZE as usize) {
+                    libc::CPU_SET(c, &mut set);
+                }
+                set
+            };
+            let _ = uring.submitter().register_iowq_aff(&set);
+        }
         // Signalled on each completion, for an application's own event loop (#408). Kept off
         // `wake`, which the ring itself polls: a registered eventfd the ring also polled
         // would signal itself with every poll completion.
