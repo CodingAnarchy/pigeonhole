@@ -3453,6 +3453,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - Each key is positioned cache-only, as an async scan positions a tablet (D196). A miss unwinds the key: its sources stay in the merge and seek afresh on the next attempt, since one may have read past the row's start. The missed block is fetched, and the key is positioned again.
   - First, the blocks of the next 8 keys in the group that the cache lacks are fetched, all in flight together (M4). They are found from the index alone (`SstReader::fetch_for`: the index partition, or the data block it names), or, if a reader is not open yet, from what opening it needs. Only SSTs whose key range and row filter admit the key are probed, as for positioning. A key is probed once, and again after one of its fetches lands, since a fetched partition names the data block next.
   - A key's cells past the first are read synchronously and counted in `async_sync_reads`. As for scans, the cache keeping nothing, or a key needing more than 64 fetches, switches the rest to synchronous reads (counted).
+  - **#1237:** a poll yields after 4,096 keys with no cell to read (`POLL_ABSENT_KEYS`), so a long run of absent keys never holds the executor.
 
 **Measured (PR 1, Mac, warm, 300K-node graph, row cache off for both):** a dense frontier (10,000 contiguous rows) 0.86 µs/row against 1.48 for row reads, with no allocation per row (7 for row reads); a sparse BFS hop 1.71–1.77 µs/row against 1.93–2.16. The AX102 figures come with PR 2's box run.
 
@@ -3528,3 +3529,42 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - `vector.rs`: every valid configuration round-trips; each bad range, pairing and tag is refused; values decode strictly (short, long, zero dim, bit dim, overlong varint, empty, unknown element, 4,097 dims).
 - Golden siblings `values_vector.bin` and `edit_put_family_vector.bin`, frozen; the roundtrip proptest over element and dim; the fuzz harness behind a forced `0x04` and through `Params::parse`.
 - `it/vector_family.rs`: eight malformed parameter lists are `InvalidArgument`, a well-formed family is `Unsupported` with nothing created, and a vector put or merge into a Standard family is refused (perf287's B1).
+
+<a id="d304"></a>
+## D304 — Traversal pushdown: breadth-first hops run in the engine, each a bounded read of the frontier (perf287, 2026-10-31; owner accepted revision 2, #489 c6544597002, c6544636857, c6544708521; reviewed by simp724 and cli692; engine, pigeonhole, #489 item 3, ICR 0099; on D296 and D299)
+**Why.** A BFS over adjacency rows was a client loop over `keys()`: every edge was materialised and copied into the client's neighbour list, duplicates and visited nodes included, and a hub could not be capped without reading it whole (283 ms and 824 MB for a 2M-edge hub through `read()`).
+
+**Decided.**
+- **Model.** A node is a row, its edges are the columns of one family, and an edge's qualifier is the destination's row key. Every qualifier is a valid row key, since both are limited to 64 KiB.
+- **`Table::traverse(&KeySet)`**, with the edge family, the edge selection, `hops`, `per_node_limit`, `hop_limit`, `max_nodes` (default 10,000,000, the seeds included; owner), `parents` and `parallel`, returns per-hop nodes (`KeySet`s) and optional parent indexes. Its semantics are exact at a snapshot:
+  - one snapshot for all hops;
+  - per hop, the frontier's rows in key order and each row's newest versions in qualifier order;
+  - the first `per_node_limit` edges per row, visited destinations included, after which the rest of the row is skipped by a seek;
+  - each destination not visited before kept once, ranked by its first edge;
+  - at most `hop_limit` new nodes per hop (the first in that ranking) and `max_nodes` in all.
+
+  Empty seeds give no hops.
+- **Engine.** Each hop is `reduce_into` over D296's `Keys` input, which is D299's multi-get cursor per tablet:
+  - `EdgeVisitor` emits the source's index in the frontier and returns `EmitAndNextRow` at the cap;
+  - `DedupeLimit` keeps destination → smallest source index, borrowing the qualifier for the visited and kept checks. It stops a group at its (n+1)-th distinct destination, and merges by union, then the n smallest (source, destination), which is commutative and associative;
+  - `into_nodes()` returns the next frontier and the parents without a `CellKey`.
+
+  §2.3 of the note (with rev 2's two cases) shows local stops keep `hop_limit` exact under fan-out. The visited set is held in memory, about (key length + 48) B per node. It grows in place between hops, with a debug assertion that no clone outlives a hop.
+- **Fan-out:** `parallel(n)` over the frontier's tablets, past 1,000 keys per thread.
+- **PR 2: `run_async`** (`Engine::traverse_async`, `PendingTraversal`). Each hop is read on the polling task through one multi-get cursor over the frontier (`KeyCursor::poll_next_key`: cache-only positioning, the next keys' blocks fetched ahead), with the same `EdgeVisitor` and `DedupeLimit` run inline on its borrowed cells.
+  - **One group, no fan-out.** D296's determinism makes the hops and parents equal to `run`'s.
+  - **Budget:** a poll yields (`wake_by_ref`, then `Pending`) after 4,096 cells, so an uncapped hub never holds the executor for long. It counts every edge the read returns. Since #1237, the value predicate is applied before the visitor rather than in the read, so its misses count too, with blob-separated values read as the resolver reads them. The multi-get cursor also yields after 4,096 keys without a row. Versions the read resolves away (deleted, expired, outside the time range) are still stepped over within one cell's read and aren't counted: until compaction drops them, a hub of mostly deleted edges can read more in one poll.
+  - **State:** the hop's reducer, the visitor's row and count, the cursor and the visited set all survive each `Pending`. Dropping the future releases the cursor's pins and the snapshot.
+  - **Synchronous reads:** a key's cells past the first are read synchronously where a block misses, counted in `async_sync_reads`.
+
+**Checks.**
+- `tests/traverse.rs`: a client BFS over `keys()` implementing the semantics independently, on a graph with hubs, self-loops, deletes of every scope, several SSTs and levels, and tablets on two shards. Every limit alone and combined, the edge selection, parents and stats, `parallel(4)`, and the argument errors are all checked.
+- The engine's `it/traverse.rs`: fan-out (asserted) equals the sequential traversal, hop by hop and parent by parent.
+- `DedupeLimit`'s unit test: any cut into groups, merged in any order, equals the sequential result.
+- `alloc.rs`: a hop's allocations don't grow with edges (450 calls for 4,000 and for 40,000 edges with no new node), nor with a capped hub's size (508 calls for 2,000 and 20,000 edges at `per_node_limit(100)`).
+- **The pigeonhole model:** a two-hop traversal from each multi-get's keys against a BFS over the model's rows, under faults and concurrent changes.
+  - The workload's qualifiers (`q…`) never name rows (`row…`), so in PR 1 it checked hop 1's limits, dedupe and ranking.
+  - **#1232 (with PR 2):** the default pigeonhole model has a graph family, `adj`, whose qualifiers the workload draws from the row-key space (`Workload::qualifier_in`). Other families draw as before, so targets without `adj` replay unchanged.
+    - The traversal check reads `adj` on half the model seqnos (bit 4, independent of the limits' bits 0–3) and the get's family on the rest, so counter, TTL and versioned families keep their coverage. On the async front door it goes through `run_async`.
+    - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
+

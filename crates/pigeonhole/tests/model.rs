@@ -173,8 +173,19 @@ fn families() -> Vec<ModelFamily> {
             f("g", 2, 0, false),
             f("ttl", 0, 40, false),
             f("counter", 3, 0, true),
+            // A graph family: its qualifiers are row keys (the workload's `adj…`), so the
+            // traversal check reaches past hop 1 (#1232).
+            f(GRAPH_FAMILY, 0, 0, false),
         ]
     }
+}
+
+/// The model's graph family (#1232), in the targets that have it.
+const GRAPH_FAMILY: &str = "adj";
+
+/// Whether this target's tables have [`GRAPH_FAMILY`].
+fn has_graph_family() -> bool {
+    families().iter().any(|f| f.name == GRAPH_FAMILY)
 }
 
 /// An aggregate family: a counter family of decision D179, or a min or max family of D294.
@@ -522,6 +533,9 @@ struct Stats {
     file_len: u64,
     /// Row cache hits over the run's handles (D201).
     row_cache_hits: u64,
+    /// Traversals checked, and those that reached a second hop (D304, #1232).
+    traversals: usize,
+    deep_traversals: usize,
     /// With the recovery option on: recoveries in place, give-ups (then a reopen by hand),
     /// commits answered `OutcomeUnknown` (decided by reading back), commits retried after a
     /// failure refused them, injected read errors accepted on reads.
@@ -702,6 +716,9 @@ struct Run {
     /// The rows read last (at most 8), multi-got with each new row read (D299). A `RefCell`:
     /// updated while a table is borrowed.
     recent: std::cell::RefCell<Vec<Vec<u8>>>,
+    /// Traversals checked and those that reached a second hop, kept here while the check
+    /// holds a table borrowed (folded into `stats` at the end).
+    traversal_counts: std::cell::Cell<(usize, usize)>,
 }
 
 /// Every delete generated so far (lost ones too: dropping more is harmless), so `prepare`
@@ -841,6 +858,99 @@ fn walk_row(
                 position = Some(pigeonhole::RowPosition::from_bytes(&bytes)?);
             }
         }
+    }
+    Ok(out)
+}
+
+/// Per hop, the nodes (sorted) and their parents' indexes in the previous hop.
+type TraversalHops = Vec<Vec<(Vec<u8>, u32)>>;
+
+/// Two hops of `Table::traverse` (D304) over `family`, with parents; through `run_async`
+/// with `async_front`.
+fn traverse_hops(
+    t: &pigeonhole::Table,
+    seeds: &pigeonhole::KeySet,
+    family: &str,
+    (per_node, per_hop): (u32, u64),
+    snap: Option<&pigeonhole::Snapshot>,
+    async_front: bool,
+) -> pigeonhole::Result<TraversalHops> {
+    let mut r = t
+        .traverse(seeds)
+        .family(family)
+        .hops(2)
+        .per_node_limit(per_node)
+        .hop_limit(per_hop)
+        .parents(true);
+    if let Some(s) = snap {
+        r = r.snapshot(s);
+    }
+    #[cfg(feature = "async")]
+    let out = if async_front {
+        pigeonhole::doc_support::block_on(r.run_async())?
+    } else {
+        r.run()?
+    };
+    #[cfg(not(feature = "async"))]
+    let out = {
+        let _ = async_front;
+        r.run()?
+    };
+    Ok(out
+        .hops()
+        .iter()
+        .map(|h| {
+            h.nodes()
+                .iter()
+                .map(<[u8]>::to_vec)
+                .zip(h.parents().expect("asked for").iter().copied())
+                .collect()
+        })
+        .collect())
+}
+
+/// D304 §2.1 over the model: per hop, the frontier's rows in key order and each row's newest
+/// versions in qualifier order, the first `per_node` of them (0: all), each destination not visited
+/// before kept once with its first source, at most `per_hop` (0: all).
+fn model_traversal(
+    model: &pigeonhole_sim::Model,
+    table: &str,
+    seeds: &pigeonhole::KeySet,
+    family: &str,
+    (per_node, per_hop): (u32, u64),
+    ms: u64,
+    now: u64,
+) -> Result<TraversalHops, pigeonhole_sim::ModelError> {
+    let mut visited: std::collections::HashSet<Vec<u8>> =
+        seeds.iter().map(<[u8]>::to_vec).collect();
+    let mut frontier: Vec<Vec<u8>> = seeds.iter().map(<[u8]>::to_vec).collect();
+    let mut out = Vec::new();
+    for _ in 0..2 {
+        let mut kept: Vec<(Vec<u8>, u32)> = Vec::new();
+        'rows: for (i, k) in frontier.iter().enumerate() {
+            let cells = model.try_read_row(table, k, &[family], 1, ms, now)?;
+            let cap = if per_node == 0 {
+                usize::MAX
+            } else {
+                per_node as usize
+            };
+            for c in cells.iter().take(cap) {
+                if visited.contains(&c.qualifier) || kept.iter().any(|(d, _)| *d == c.qualifier) {
+                    continue;
+                }
+                if per_hop != 0 && kept.len() as u64 == per_hop {
+                    break 'rows;
+                }
+                kept.push((c.qualifier.clone(), i as u32));
+            }
+        }
+        if kept.is_empty() {
+            break;
+        }
+        kept.sort();
+        visited.extend(kept.iter().map(|(d, _)| d.clone()));
+        frontier = kept.iter().map(|(d, _)| d.clone()).collect();
+        out.push(kept);
     }
     Ok(out)
 }
@@ -1095,6 +1205,7 @@ impl Run {
             trace: Vec::new(),
             stats: Stats::default(),
             recent: std::cell::RefCell::new(Vec::new()),
+            traversal_counts: std::cell::Cell::new((0, 0)),
             deletes: Deletes::default(),
             generation: 0,
             io_errors: Cell::new(0),
@@ -2397,6 +2508,47 @@ impl Run {
                         ));
                     }
                 }
+                // A two-hop traversal (D304) from the same keys, with limits taken from the
+                // model's seqno (not the RNG; 0 is no limit): the hops as a BFS over the
+                // model's rows gives them. Where the target has a graph family it reads that
+                // (whose qualifiers name rows, #1232) on half the seqnos; otherwise the get's
+                // family, whose qualifiers never name rows, so it checks hop 1. Through the async
+                // front door (`run_async`, D304 PR 2) with `async_front`.
+                let (m, n) = ((ms % 4) as u32, (ms / 4) % 4);
+                // On half the seqnos it reads the get's family instead, so counter, TTL and
+                // versioned families keep their traversal coverage; the choice takes bit 4
+                // of the seqno, independent of `m` and `n` (bits 0-3).
+                let tf = if has_graph_family() && (ms / 16).is_multiple_of(2) {
+                    GRAPH_FAMILY
+                } else {
+                    family.as_str()
+                };
+                let snap_ref = snap.as_ref().map(|(s, _)| s);
+                let got = traverse_hops(t, &keys, tf, (m, n), snap_ref, async_front);
+                let want = model_traversal(&self.model, TABLES[ti], &keys, tf, (m, n), ms, now);
+                match (got, want) {
+                    (Ok(g), Ok(w)) if g == w => {
+                        let (all, deep) = self.traversal_counts.get();
+                        self.traversal_counts
+                            .set((all + 1, deep + usize::from(g.len() >= 2)));
+                    }
+                    (Err(e), Err(pigeonhole_sim::ModelError::MergeFailed(_)))
+                        if e.code() == ErrorCode::MergeFailed => {}
+                    (Err(e), _) if self.armed && self.fired() => {
+                        return self.recover_fired(&e);
+                    }
+                    (Err(e), _) if self.failed_over() => {
+                        return self.recover_in_place(&format!("read: {e}"), None);
+                    }
+                    (Err(e), _) if self.injected(&e) => {}
+                    (g, w) => {
+                        return Err(format!(
+                            "traversal from {} keys over {tf}, per node {m}, per hop {n} \
+                             (model seqno {ms}): store {g:?} vs model {w:?}",
+                            keys.len()
+                        ));
+                    }
+                }
                 // Latest-version reads of the get's family, then of every family: the reads
                 // the row cache serves when it is on (D201), and fills, so the get above can
                 // hit next time. No randomness, so a seed's operations are unchanged.
@@ -2712,6 +2864,7 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
             }
             run.note_row_cache();
             run.stats.io_errors = run.io_errors.get();
+            (run.stats.traversals, run.stats.deep_traversals) = run.traversal_counts.get();
             if let Some((db, tables)) = run.db.take() {
                 drop(tables);
                 // With the recovery option on, a failure the supervisor has not marked yet
@@ -2802,6 +2955,7 @@ fn check(cfg: &Config) -> Vec<Stats> {
     // Row cache hits over every seed: a crash-heavy seed may hit none (each crash empties
     // the cache), but a test whose seeds never hit is not testing the cache (D201).
     let (mut reads, mut row_cache_hits) = (0, 0);
+    let (mut traversals, mut deep_traversals) = (0, 0);
     let mut all = Vec::new();
     for seed in seeds() {
         let started = Instant::now();
@@ -2821,6 +2975,8 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 eprintln!("seed {seed}: {stats:?} in {:?}", started.elapsed());
                 reads += stats.reads;
                 row_cache_hits += stats.row_cache_hits;
+                traversals += stats.traversals;
+                deep_traversals += stats.deep_traversals;
                 all.push(stats);
             }
             Ok(Err(e)) => {
@@ -2912,6 +3068,12 @@ fn check(cfg: &Config) -> Vec<Stats> {
     assert!(
         cfg.row_cache == 0 || reads < 500 || row_cache_hits > 0,
         "{test}: the row cache never hit in {reads} reads"
+    );
+    // With a graph family, traversals must reach past hop 1, or multi-hop goes unchecked
+    // (#1232).
+    assert!(
+        !has_graph_family() || traversals < 200 || deep_traversals > 0,
+        "{test}: none of {traversals} traversals reached a second hop"
     );
     all
 }

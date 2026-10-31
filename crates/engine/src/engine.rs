@@ -2453,6 +2453,56 @@ impl Engine {
         )
     }
 
+    /// A breadth-first traversal (D304): from `seeds`, `spec.hops` hops over the edge family
+    /// `spec.family`, whose qualifiers name the destination rows. Each hop is one bounded
+    /// read of the frontier ([`Engine::reduce`] over a key-set input) that keeps each
+    /// destination not yet visited once, ranked by the first edge that reached it, within
+    /// the per-node, per-hop and total limits. One snapshot covers every hop.
+    pub fn traverse(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        seeds: Arc<crate::KeySet>,
+        spec: &crate::TraverseSpec,
+    ) -> Result<crate::Traversal> {
+        snapshot.check_process()?;
+        let now = self.inner.shared.vfs.now_micros();
+        let may_fan_out = self
+            .inner
+            .shared
+            .refuse_blocking_on_driver("traverse")
+            .is_ok();
+        read::traverse::traverse(
+            snapshot,
+            table,
+            seeds,
+            spec,
+            (now, may_fan_out, &self.inner.shared),
+        )
+    }
+
+    /// [`Engine::traverse`] as a future that never blocks on a block it can fetch (D304 PR
+    /// 2): each hop is read on the polling task through the multi-get cursor's async path,
+    /// a poll yields after [`TRAVERSE_POLL_CELLS`](crate::TRAVERSE_POLL_CELLS) cells, and the
+    /// result equals `traverse`'s. `spec.parallelism` is ignored.
+    pub fn traverse_async(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        seeds: Arc<crate::KeySet>,
+        spec: crate::TraverseSpec,
+    ) -> Result<crate::PendingTraversal> {
+        snapshot.check_process()?;
+        Ok(read::traverse::PendingTraversal::new(
+            snapshot.clone(),
+            table,
+            seeds,
+            spec,
+            self.inner.shared.vfs.now_micros(),
+            Arc::clone(&self.inner.shared),
+        ))
+    }
+
     /// [`Engine::scan`] for an async scan: its rows are polled with
     /// [`ScanCursor::poll_next_row`], which never blocks on a block it could predict (D196).
     pub fn scan_async(

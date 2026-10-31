@@ -72,11 +72,15 @@ pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::EngineOptions;
 pub use position::ColumnPosition;
-pub use read::keys::{KeyCursor, KeySet};
+pub use read::keys::{KeyCursor, KeySet, POLL_ABSENT_KEYS};
 pub use read::knn::{KnnSkips, KnnVisitor, Metric, Score};
 pub use read::reduce::{
     CellKey, CellRef, CellVisitor, Dedupe, Limit, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec,
     ReduceStats, Reduced, Reducer, RowRange, TopK, Visit,
+};
+pub use read::traverse::{
+    DEFAULT_MAX_NODES, Hop, MAX_HOPS, PendingTraversal, TRAVERSE_PARALLEL_FLOOR,
+    TRAVERSE_POLL_CELLS, Traversal, TraverseSpec, TraverseStats,
 };
 pub use read::{CellData, ReadSpec, RowCell, RowData, RowSink, ScanCell, ScanCursor, ScanSpec};
 pub use row_cache::{RowCacheStats, table_slots as row_epoch_slots};

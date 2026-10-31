@@ -318,6 +318,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D301](phase-3.md#d301) — A shard that refused PREPAREs for room and whose room wait reaches #70's frozen-and-idle condition tells their coordinators `RoomGone`, and the retries fail `Busy` instead of waiting for a timeout a frozen clock never reaches (#1205, seed 183); moving clocks unchanged · coordinator decision, engine · amends D245
 - [D302](phase-3.md#d302) — Arenas are cut into 1024 chunks (64 KiB at the default budget), 16 per slot, so snapshots held across flushes leave room for writes; `max_slots` stays 64; the many-idle-slot flush cost is accepted (#1228); no minimum chunk size beyond 1 KiB · engine, #1212, #1219 · owner decision · amends D136, D189
 - [D303](phase-3.md#d303) — Typed vector families: `FamilyKind::Vector` (16) fixes each value's element (`f32`, `i8`, bit), dimension (1–4096) and metric (L2, inner product, cosine, Hamming) in `kind_params`; values are tag `0x04`, inline, versioned as a Standard family's; NaN, ±∞ and cosine zero vectors refused; PR 1 lands the format · cli692, #490 B, ICR 0098 · under D294's `incompat` bit 0, uses D298's `kind_params`
+- [D304](phase-3.md#d304) — Traversal pushdown: `Table::traverse(&KeySet)` runs breadth-first hops in the engine, each a bounded read of the frontier (D296's `Keys` input on D299's multi-get) keeping each new destination once, ranked by its first edge, within per-node, per-hop and total limits (`max_nodes` 10,000,000 by default) · perf287, #489, ICR 0099
 
 ## Open questions
 _None._

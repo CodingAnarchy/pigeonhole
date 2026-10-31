@@ -288,6 +288,10 @@ pub struct KeyCursor {
 /// ahead ([`SstReader::fetch_for`]).
 pub(crate) const LOOKAHEAD: usize = 8;
 
+/// Keys with no cell to read that one poll of an async multi-get passes over before it
+/// yields (#1237): a run of absent keys never holds the executor for long.
+pub const POLL_ABSENT_KEYS: u32 = 4_096;
+
 /// Fetches an async multi-get makes positioning one key before it reads synchronously.
 const MAX_KEY_FETCHES: u32 = 64;
 
@@ -344,6 +348,31 @@ impl KeyCursor {
             spec,
             now,
             Arc::new(keys),
+            groups,
+            (0, end),
+            shared,
+        ))
+    }
+
+    /// [`KeyCursor::new`] over a shared key set (D304's async traversal reads each hop's
+    /// frontier, which it also keeps).
+    pub(crate) fn over(
+        snapshot: Snapshot,
+        table: TableId,
+        families: Vec<FamilyId>,
+        spec: ReadSpec,
+        now: Timestamp,
+        keys: Arc<KeySet>,
+        shared: Arc<crate::shard::Shared>,
+    ) -> Result<Self> {
+        let groups = key_groups(&snapshot, table, &keys)?;
+        let end = keys.len();
+        Ok(Self::with_groups(
+            snapshot,
+            families,
+            spec,
+            now,
+            keys,
             groups,
             (0, end),
             shared,
@@ -516,6 +545,7 @@ impl KeyCursor {
         let _poll = pigeonhole_io::async_poll_scope();
         let mut nb = self.nb.take().unwrap_or_default();
         self.current = None;
+        let mut absent = 0;
         let out = loop {
             if let Err(e) = admit_arrived(&mut nb, &self.shared, cx) {
                 break Err(e);
@@ -573,6 +603,14 @@ impl KeyCursor {
                 Ok(Step::Absent) => {
                     nb.fetches = 0;
                     nb.pinned.retain(|(k, _)| *k > i);
+                    absent += 1;
+                    if absent >= POLL_ABSENT_KEYS {
+                        // Many keys in a row with nothing to read: yield rather than walk
+                        // them all in one poll (#1237); the next poll goes on from here.
+                        cx.waker().wake_by_ref();
+                        self.nb = Some(nb);
+                        return Poll::Pending;
+                    }
                 }
                 Ok(Step::End) => break Ok(None),
                 Err(Error::WouldBlock(mut fetch)) => {

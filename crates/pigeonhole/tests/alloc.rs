@@ -296,6 +296,85 @@ fn multi_get_allocations_do_not_grow_with_rows() {
     db.close().expect("close");
 }
 
+/// A traversal (D304) allocates per new node, never per edge: a hop over 200 nodes whose
+/// edges all lead back to visited nodes allocates the same with 20 or 200 edges per node
+/// (the visited and kept checks borrow the qualifier), and a hub capped at 100 edges
+/// allocates the same at 2,000 or 20,000 edges (the rest of the row is a seek).
+#[test]
+fn traversal_allocations_grow_with_new_nodes_not_edges() {
+    let (db, t) = open("traverse");
+    // Nodes `a000..a199` with 20 edges each and `b000..b199` with 200 each, every edge to a
+    // node of the same group.
+    for (prefix, degree) in [(b'a', 20u32), (b'b', 200)] {
+        for i in 0..200u32 {
+            let mut m = t.mutate(format!("{}{i:03}", prefix as char).as_bytes());
+            for k in 1..=degree {
+                let d = format!("{}{:03}", prefix as char, (i + k) % 200);
+                m = m.put("f", d.as_bytes(), b"");
+            }
+            m.commit().expect("commit");
+        }
+    }
+    // Hubs: `h1` with 2,000 edges and `h2` with 20,000, all to new nodes.
+    for (hub, edges) in [(&b"h1"[..], 2_000u32), (b"h2", 20_000)] {
+        for chunk in (0..edges).collect::<Vec<_>>().chunks(1_000) {
+            let mut m = t.mutate(hub);
+            for &e in chunk {
+                m = m.put("f", format!("x{}{e:06}", hub[1] as char).as_bytes(), b"");
+            }
+            m.commit().expect("commit");
+        }
+    }
+    db.flush().expect("flush");
+    let measure = |seeds: &pigeonhole::KeySet, per_node: u32| {
+        // The first run reads every block into the cache.
+        for _ in 0..2 {
+            t.traverse(seeds)
+                .family("f")
+                .per_node_limit(per_node)
+                .run()
+                .expect("warm");
+        }
+        allocations(|| {
+            let r = t
+                .traverse(seeds)
+                .family("f")
+                .per_node_limit(per_node)
+                .run()
+                .expect("run");
+            (
+                r.stats().edges,
+                r.hops().iter().map(|h| h.nodes().len()).sum::<usize>(),
+            )
+        })
+    };
+    let group = |prefix: char| {
+        pigeonhole::KeySet::from_unsorted((0..200u32).map(|i| format!("{prefix}{i:03}")))
+    };
+    let (narrow, (edges, new)) = measure(&group('a'), 0);
+    assert_eq!((edges, new), (4_000, 0));
+    let (wide, (edges, new)) = measure(&group('b'), 0);
+    assert_eq!((edges, new), (40_000, 0));
+    eprintln!("traverse: {narrow} allocator calls for 4,000 edges, {wide} for 40,000");
+    assert!(
+        wide <= narrow + 4,
+        "a traversal allocates per edge: {narrow} vs {wide} (4,000 vs 40,000 edges, no new node)"
+    );
+    let (small, (_, new)) = measure(&pigeonhole::KeySet::from_unsorted([b"h1"]), 100);
+    assert_eq!(new, 100);
+    let (large, (_, new)) = measure(&pigeonhole::KeySet::from_unsorted([b"h2"]), 100);
+    assert_eq!(new, 100);
+    eprintln!(
+        "traverse: {small} allocator calls for a 2,000-edge hub capped at 100, {large} for 20,000"
+    );
+    assert!(
+        large <= small + 4,
+        "a capped hub allocates with its size: {small} vs {large} (2,000 vs 20,000 edges)"
+    );
+    drop(t);
+    db.close().expect("close");
+}
+
 /// Writes a row of `cells` cells (24-byte values) in commits of 1,000.
 fn wide_row(t: &Table, row: &[u8], cells: usize) {
     for chunk in (0..cells).collect::<Vec<_>>().chunks(1_000) {
