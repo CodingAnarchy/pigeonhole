@@ -190,9 +190,11 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 | `Table::scan<K: AsRef<[u8]> + ?Sized>(&self, range: impl RangeBounds<&K>) -> Scan<'_>` | Row range. Both ends same type (use slices). |
 | `Table::scan_prefix(&self, prefix: &[u8]) -> Scan<'_>` | Rows starting with prefix. |
 | `Table::scan_bounds(&self, Bound<&[u8]>, Bound<&[u8]>) -> Scan<'_>` | Explicit bounds. |
+| `Table::keys(&self, &KeySet) -> KeysRead<'_>` | Multi-get of many rows in key order, one snapshot (D299; section below). |
+| `Table::traverse(&self, &KeySet) -> Traverse<'_>` | Breadth-first traversal over an edge family, in the engine (D304; section below). |
 | `Table::shard_of(&self, row: &[u8]) -> Option<usize>` | The shard owning `row` now (`Shard::index`): a routing hint for application-owned mode (commit owned rows inline); may change after a split or move; commits are correct either way (ICR 0022). |
 
-`ReadTable` has `name`, `get`, `get_at`, `row`, `scan`, `scan_prefix`, `scan_bounds` with the same signatures.
+`ReadTable` has `name`, `get`, `get_at`, `row`, `scan`, `scan_prefix`, `scan_bounds`, `keys`, `traverse` with the same signatures.
 
 ## `RowMutation` (builder; each `self -> Self`)
 | Method | Semantics |
@@ -257,6 +259,25 @@ Test and bench hooks are not in this table: `vfs` (also on `ReaderOptions`), `wa
 `RowIter`: `Iterator<Item = Result<Row>>`; `next_ref(&mut self) -> Result<Option<RowRef<'_>>>` (zero-copy, valid until next call). After `close` (any handle) the next step is `Closed`, then the end; also `RowStream` and owned scans (#826).
 Pushdown (D22): qualifier and time filters in the block decoder; versions, column limits, value filters in resolution on snapshot-visible data. Deletes and merge operands always pass the decoder filters. Details: [`scans-and-filters.md`](scans-and-filters.md).
 
+## Wide rows, multi-get, traversal (1.1.0)
+Guide: [`graphs.md`](graphs.md).
+
+| Signature | Semantics |
+|---|---|
+| `RowRead::cells(self) -> Result<RowCells<'t>>` | One cell at a time (D297). `RowCells::next(&mut self) -> Result<Option<CellEntry<'_>>>`, lent until the next call; nothing allocated per cell. |
+| `RowRead::pages(self, n: usize) -> Result<RowPages<'t>>` | Pages of at most `n` cells, each ending on a column boundary (a column larger than `n` gets its own page). `RowPages::next(&mut self) -> Result<Option<RowRef<'_>>>`; `position(&self) -> Option<RowPosition>`, the last column handed out. |
+| `RowRead::resume_after(self, &RowPosition) -> Self` | Continue a walk after a position, in `read`, `cells` or `pages`. `RowPosition::to_bytes(&self) -> Vec<u8>`, `RowPosition::from_bytes(&[u8]) -> Result<RowPosition>`: a stable token (`InvalidArgument` for another table's, or a family the read doesn't select). |
+| `Scan::cells(self) -> Result<ScanCells<'t>>` | A scan cell by cell. `ScanCells::next(&mut self) -> Result<Option<(&[u8], CellEntry<'_>)>>` gives the row key and the cell. |
+| `KeySet::from_unsorted(impl IntoIterator<Item = impl AsRef<[u8]>>) -> KeySet` | Sorted and deduplicated. `from_sorted(..) -> Result<KeySet>` (`InvalidArgument` unless strictly increasing), `len`, `is_empty`, `get(i) -> &[u8]`, `iter`. |
+| `KeysRead` (`Table::keys`) | The row-read selection, plus `versions(u32)` and `column_limit(u32)`; `read(self) -> Result<KeyRows<'t>>`. |
+| `KeyRows::next(&mut self) -> Result<Option<(usize, RowRef<'_>)>>` | The next row with a cell the selection keeps, with its key's index in the set; keys without one are skipped. The row cache is not consulted. |
+| `Traverse` (`Table::traverse`) | `family(&str)` (exactly one, required), `hops(u32)` (1 to 64, default 1), `per_node_limit(u32)` (0: all), `hop_limit(u64)` (0: all), `max_nodes(u64)` (default 10,000,000, the seeds included), `parents(bool)`, `parallel(usize)`, and the edge selection (`qualifier_prefix`, `qualifier_range`, `qualifier_bounds`, `time_range`, `value_filter`, `snapshot`). `run(self) -> Result<Traversal>`. Empty seeds give no hops. |
+| `Traversal` | `hops(&self) -> &[Hop]` (hop 1 first; fewer than asked when a frontier ran empty or `max_nodes` was reached), `stats(&self) -> TraverseStats`. |
+| `Hop` | `nodes(&self) -> &KeySet` (sorted, new at this hop), `parents(&self) -> Option<&[u32]>` (with `parents(true)`: each node's source, as an index in the previous hop's nodes, or the seeds for hop 1). |
+| `TraverseStats` | `rows`, `edges`, `hops_cut: u32` (cut by `hop_limit` or `max_nodes`), `cut_by_max_nodes: bool`. |
+
+Traversal model: a node is a row; an edge is a column of the edge family, whose qualifier is the destination's row key. Per hop, the frontier's rows are read in key order and their newest edges in qualifier order; each destination not visited before is kept once, ranked by its first edge; `per_node_limit` counts edges read and skips the rest of the row with a seek. The visited set is held in memory, about (key length + 48) bytes per node.
+
 ## Results
 | Type | Methods |
 |---|---|
@@ -280,6 +301,9 @@ Same semantics as the blocking call; any executor; no `spawn_blocking`. Guide: [
 |---|---|
 | `Table::get_async(&self, row, family, qualifier) -> GetFuture` / `get_at_async(&self, &Snapshot, ..)` | `Output = Result<Option<Cell>>`. Also on `ReadTable`. A memtable or cache hit is read at the call (as of then) and ready on first poll. On Linux, a block the page cache holds is copied on the calling thread instead of waiting on the ring (D292). A block that must come from the device has its read submitted at the call; the future waits for it and keeps the call's read point, so the result is as of the call either way (#709). At a snapshot, the read is at that snapshot. |
 | `RowRead::read_async(self) -> RowFuture` | `Output = Result<Option<Row>>`. |
+| `KeyRows::next_async(&mut self)`, `poll_next(&mut self, &mut Context)` | The next multi-get row, lent as `next` lends it. Keys are positioned from the cache, and the blocks they and the next 8 keys need are fetched asynchronously; a poll yields after 4,096 keys without a row. |
+| `KeyRows::into_owned_stream(self) -> nonblocking::KeyStream` | `Stream<Item = Result<(usize, Row)>>`, holding the table. |
+| `Traverse::run_async(self)` | An `async fn` (its future is `Send`): `run`'s result. It reads each hop on the polling task, never fans out, and a poll yields after 4,096 edges (edges the value filter drops count). |
 | `Scan::stream(self) -> RowStream<'t>` | `futures_core::Stream<Item = Result<Row>>`, key order; setup error is the first item. Fetches the next step's blocks only as polled. |
 | `RowMutation::commit_async(self) -> CommitFuture` | `Output = Result<CommitInfo>`. Submitted at the call when its shard has room, else when polled with room (D210); resolves when durable and visible. |
 | `WriteBatch::commit_async(self)` / `commit_with_async(self, Durability) -> CommitFuture` | As above. |

@@ -21,6 +21,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 12. [Reader processes](readers.md): one writer and many reader processes on a host: what readers see, crashes and restarts on either side, long-held snapshots, the limits and the requirements.
 13. [Transactions](transactions.md): optimistic multi-row transactions: `transact` and retries, what is read and what conflicts (per cell for `get`, per family for `get_row`), the isolation level and anomalies, read-only transactions, the cost model.
 14. [Performance compared with SQLite](performance.md): point reads under a mixed load at equal cache memory: throughput, median, p99 and the far tail, and when each store fits.
+15. [Graphs](graphs.md): adjacency rows, reverse edges and degree, walking a hub's row cell by cell or in pages, frontier multi-gets, and breadth-first traversal inside the engine (sync and async).
 
 Multi-process readers have their own page, [Reader processes](readers.md); [Concepts](concepts.md#multi-process-readers) has the overview.
 

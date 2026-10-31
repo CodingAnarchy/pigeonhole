@@ -132,6 +132,7 @@ let page = g.row(b"node:a").family("out").column_limit(100).read()?;
 - Edge properties go in the value, or as extra families keyed the same way.
 - `delete_column("out", b"node:b")` removes the edge; `delete_family("out")` removes all out-edges of a node.
 - Writing both directions in one `WriteBatch` makes them atomic even if the rows live on different shards.
+- [Graphs](graphs.md) covers the rest: degree, hubs too wide to read whole, many nodes at once, and multi-hop traversal.
 
 ## Counters
 Counters live in a **counter family**, declared with `Family::counter()` (after Bigtable's aggregate families). A counter is one kind of aggregate family; [Min and max](#min-and-max), [Distinct counts (HLL)](#distinct-counts-hll) and [Bitwise and `f64` aggregations](#bitwise-and-f64-aggregations) cover the others. `incr` adds to an `i64` **without reading it**: the write is a blind operand, so concurrent writers never lose updates. `incr` on any other family fails with `ErrorCode::InvalidArgument`.
