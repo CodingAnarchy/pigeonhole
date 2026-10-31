@@ -11868,27 +11868,58 @@ impl ShardHandler for ShardState {
     type Msg = ShardMsg;
 
     fn handle(&mut self, ctx: &mut ShardContext<'_, Self::Msg>, msg: Self::Msg) {
+        let t = std::time::Instant::now();
+        let name = scratch_msg_name(&msg);
         self.handle_msg(msg, ctx);
+        scratch_part(name, t);
     }
 
     fn end_batch(&mut self, ctx: &mut ShardContext<'_, Self::Msg>) {
+        let t = std::time::Instant::now();
+        let v0 = self.shared.vfs.monotonic_nanos();
         self.run_group(ctx);
+        let took = t.elapsed().as_nanos() as u64;
+        if took > 50_000 {
+            pigeonhole_runtime::scratch_slices::record("eb:run_group", took, false);
+            let g = self.scratch_g;
+            let v1 = self.shared.vfs.monotonic_nanos();
+            if g[0] >= v0 && g[3] >= g[0] {
+                let r = pigeonhole_runtime::scratch_slices::record;
+                r("rg:admission", g[1] - g[0], false);
+                r("rg:wal", g[2] - g[1], false);
+                r("rg:apply", g[3] - g[2], false);
+                r("rg:after-apply", v1.saturating_sub(g[3]), false);
+            } else {
+                pigeonhole_runtime::scratch_slices::record("rg:no-group", took, false);
+            }
+        }
+        let t = std::time::Instant::now();
         // Coordinators refused for room hear once the room wait has ended, or once no single
         // waits, no flush is in flight and more room is free than at the refusal: their
         // retry may fit then. Never while nothing has freed room, so never a loop (D245).
         if self.cross && !self.room_refused.is_empty() && self.room_freed_since_refusal() {
             self.notify_room_freed(ctx);
         }
+        scratch_part("eb:room-notify", t);
+        let t = std::time::Instant::now();
         if self.op.is_some() {
             self.progress_op(ctx);
         }
+        scratch_part("eb:progress_op", t);
+        let t = std::time::Instant::now();
         self.run_retries(ctx);
+        scratch_part("eb:run_retries", t);
+        let t = std::time::Instant::now();
         if self.continuations.kick_due() {
             // Continue on the next batch, not this one: the budgets bound a batch's work.
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
         self.expire_tablet_waits(ctx);
+        scratch_part("eb:kick+expire", t);
+        let t = std::time::Instant::now();
         self.maybe_balance(false, None, ctx);
+        scratch_part("eb:maybe_balance", t);
+        let t = std::time::Instant::now();
         if (self.freeze_all_pending
             || (!self.to_freeze.is_empty() && self.freeze_deferred)
             || self.wait_room)
@@ -11897,8 +11928,12 @@ impl ShardHandler for ShardState {
             self.spawn_flush(ctx);
             self.check_flush_waiters();
         }
+        scratch_part("eb:freeze+flush", t);
+        let t = std::time::Instant::now();
         self.retry_starved_freeze(ctx);
         self.try_finish_close(ctx);
+        scratch_part("eb:starved+close", t);
+        let t = std::time::Instant::now();
         #[cfg(feature = "test-hooks")]
         {
             let m = &self.shared.metrics[usize::from(self.id.0)].hooks;
@@ -11910,6 +11945,54 @@ impl ShardHandler for ShardState {
         }
         self.checkpoint_pops = 0;
         self.publish_arena();
+        scratch_part("eb:publish_arena", t);
+    }
+}
+/// SCRATCH #1206: a message's kind, for the long-turn table.
+fn scratch_msg_name(m: &ShardMsg) -> &'static str {
+    match m {
+        ShardMsg::Commit { .. } => "msg:Commit",
+        ShardMsg::Coordinate { .. } => "msg:Coordinate",
+        ShardMsg::Prepare { .. } => "msg:Prepare",
+        ShardMsg::Prepared { .. } => "msg:Prepared",
+        ShardMsg::Wake { .. } => "msg:Wake",
+        ShardMsg::Released { .. } => "msg:Released",
+        ShardMsg::Decide { .. } => "msg:Decide",
+        ShardMsg::Applied { .. } => "msg:Applied",
+        ShardMsg::SyncDone { .. } => "msg:SyncDone",
+        ShardMsg::FlushAll { .. } => "msg:FlushAll",
+        ShardMsg::Flushed { .. } => "msg:Flushed",
+        ShardMsg::SyncBarrier { .. } => "msg:SyncBarrier",
+        ShardMsg::AwaitFlushed { .. } => "msg:AwaitFlushed",
+        ShardMsg::FlushedThrough { .. } => "msg:FlushedThrough",
+        ShardMsg::Created { .. } => "msg:Created",
+        ShardMsg::Unpin { .. } => "msg:Unpin",
+        ShardMsg::Checkpointed { .. } => "msg:Checkpointed",
+        ShardMsg::Maintain { .. } => "msg:Maintain",
+        ShardMsg::CompactionCommitting { .. } => "msg:CompactionCommitting",
+        ShardMsg::CompactionDone { .. } => "msg:CompactionDone",
+        ShardMsg::CompactAll { .. } => "msg:CompactAll",
+        ShardMsg::PumpManifest { .. } => "msg:PumpManifest",
+        ShardMsg::DropTablets { .. } => "msg:DropTablets",
+        ShardMsg::Start { .. } => "msg:Start",
+        ShardMsg::Kick { .. } => "msg:Kick",
+        ShardMsg::CounterCheckpoint { .. } => "msg:CounterCheckpoint",
+        ShardMsg::PinSlice { .. } => "msg:PinSlice",
+        ShardMsg::RetryCompaction { .. } => "msg:RetryCompaction",
+        ShardMsg::RetryCheckpoint { .. } => "msg:RetryCheckpoint",
+        ShardMsg::RetryFlush { .. } => "msg:RetryFlush",
+        ShardMsg::TabletOp { .. } => "msg:TabletOp",
+        ShardMsg::TabletOpDone { .. } => "msg:TabletOpDone",
+        ShardMsg::Balance { .. } => "msg:Balance",
+        ShardMsg::Close { .. } => "msg:Close",
+    }
+}
+
+/// SCRATCH #1206: records a part of a turn over 50 µs.
+fn scratch_part(name: &'static str, t: std::time::Instant) {
+    let ns = t.elapsed().as_nanos() as u64;
+    if ns > 50_000 {
+        pigeonhole_runtime::scratch_slices::record(name, ns, false);
     }
 }
 

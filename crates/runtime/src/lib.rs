@@ -1594,7 +1594,8 @@ pub mod scratch_slices {
         }
         ON.store(on, Ordering::Relaxed);
     }
-    pub(crate) fn record(name: &'static str, ns: u64, held: bool) {
+    /// Records one timed part.
+    pub fn record(name: &'static str, ns: u64, held: bool) {
         if !ON.load(Ordering::Relaxed) {
             return;
         }
