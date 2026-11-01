@@ -203,10 +203,20 @@
 # New shapes for #1272 (#490; D296's exact KNN, D193: every shape has a ceiling), each the
 # head's count (run 41350787020, da9243b8) times (1 + 0.3%): knn-exact 1690 and knn-filtered
 # 3389, equal to the base there.
+#
+# Raised for #1246 (D298 PR 5a: separated bloom bases, the compaction fold) by owner
+# decision (one-off, beyond D195's 0.5%, 2026-11-01): get-mem 5681 -> 5710. Main reads
+# 5656-5658 (8 repeats, scratch A/B run 41255386988 on bcffa93e); the head reads 5688-5689, with a
+# seed-dependent mode up to 5709 (13 head runs, 5685-5709). The +31 (+0.55%) is codegen
+# layout: 5a's compaction-crate fold changes how the same crate's resolver is compiled under
+# thin LTO and one codegen unit, giving one more memcpy call per get with no new work (no
+# lever found: #1246's bisect). The upper mode is View::locate's FastMap probe under
+# foldhash's per-process seed (+11 per get in those runs), which main shares; #1273 seeds it
+# deterministically for callgrind.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
-get-mem 5681 0.3
+get-mem 5710 0.3
 get-sst 17360 0.5
 get-miss 4190 0.3
 row 2475 1.0
