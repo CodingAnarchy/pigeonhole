@@ -772,7 +772,20 @@ fn app_owned_close_reports_a_failed_final_sync() {
         move || db.close()
     })
     .expect("close hung");
-    assert!(closed.is_err(), "a failed close reported Ok");
+    if closed.is_ok() {
+        // #1265 (seen once on x86 CI): say which way the close returned `Ok`. Shards whose
+        // `closed()` reports `Err` mean `close()` didn't wait for them (an application-owned
+        // close waits only when every shard is driven elsewhere); shards reporting `Ok`
+        // mean their final syncs succeeded with the gate armed, a durability bug.
+        let outcomes: Vec<_> = drivers
+            .into_iter()
+            .map(|(_, h)| h.join().unwrap())
+            .collect();
+        panic!(
+            "a failed close reported Ok; the shards' closed(): {outcomes:?}; failure: {:?}",
+            db.failure()
+        );
+    }
     for (_, h) in drivers {
         assert!(h.join().unwrap().is_err(), "a shard's closed() reported Ok");
     }
