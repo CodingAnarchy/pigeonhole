@@ -29,7 +29,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use pigeonhole::{Durability, Family, IoBackend, Options, Pigeonhole, Table};
+use pigeonhole::{Durability, ErrorCode, Family, IoBackend, Options, Pigeonhole, Table};
 
 const CHILD_ENV: &str = "PIGEONHOLE_KILL_LOOP_CHILD";
 /// Every line a child prints for the parent starts with this.
@@ -358,8 +358,11 @@ fn acknowledged_commits_survive_a_writer_killed_at_random_points() {
     let mut dir: Option<PathBuf> = None;
     let started = Instant::now();
     let (mut acked_total, mut killed_before_ready) = (0u64, 0u64);
+    // The database file doesn't exist yet: this cycle's child creates it (#1279).
+    let mut creating = true;
     for cycle in 0..cycles {
         if cycle % CYCLES_PER_DB == 0 {
+            creating = true;
             if let Some(d) = dir.take() {
                 let _ = std::fs::remove_dir_all(&d);
             }
@@ -400,12 +403,29 @@ fn acknowledged_commits_survive_a_writer_killed_at_random_points() {
         if !acks.ready {
             killed_before_ready += 1;
         }
-        let db = Pigeonhole::open(&path, options(IoBackend::Pread)).unwrap_or_else(|e| {
+        let reopened = match Pigeonhole::open(&path, options(IoBackend::Pread)) {
+            // D59: a kill inside the create, before the child reported READY (so before
+            // any commit), leaves a file with no valid superblock, which open refuses and
+            // never deletes. Do what D59 tells an application to: nothing was committed, so
+            // delete the file and open again (#1279). Anywhere else it's a failure.
+            Err(e)
+                if creating
+                    && !acks.ready
+                    && e.code() == ErrorCode::Corruption
+                    && e.to_string().contains("interrupted create") =>
+            {
+                std::fs::remove_file(&path).unwrap();
+                Pigeonhole::open(&path, options(IoBackend::Pread))
+            }
+            r => r,
+        };
+        let db = reopened.unwrap_or_else(|e| {
             panic!(
                 "{at}: reopen failed: {e} (the database is at {})",
                 path.display()
             )
         });
+        creating = false;
         let counts = recovered(&db)
             .unwrap_or_else(|e| panic!("{at}: {e} (the database is at {})", path.display()));
         for th in 0..THREADS {
