@@ -33,7 +33,7 @@ Phase 4 shipped as 1.0.0. Main was versioned 0.4.0 during the phase (#775) becau
 | Stable C ABI | **deferred** to post-1.0 (#690, [D250](design/decisions/phase-3.md#d250)). |
 | Arrow export | **done** (#691: #822, #823, #825; [guide](guide/arrow.md)). |
 | CLI and dump tools (`phdb`) | **done on main** (#692: info, check, dump, load, backup, compact, schema and the shell; [CLI guide](guide/cli.md)). `phdb mcp`, an MCP server for AI agents, is on main for 1.1.0 (#1249; [guide](guide/ai-agents.md)). The issue stays open until `pigeonhole-cli` is published: crates.io still has the 0.3.0 placeholder. |
-| Python bindings (`pigeonhole-db`) | **in progress** (#696, D307, ICR 0102): PR 1, the core API, stubs, tests and CI wheels (no PyPI publish yet). |
+| Python bindings (`pigeonhole-db`) | **in progress** (#696, D307, ICR 0102): PR 1 (the core API, stubs, tests, CI wheels) merged; PR 2 (vectors, multi-get, traversal, row pages, the [guide](guide/python.md)) in review; no PyPI publish yet. |
 | Multi-process readers, 1.0 hardening | **done** (#693: #39 by #894, #150 by #898, #683 by #846 and #848; #397 deferred by the owner; the reader row cache #926). |
 | OCC transactions, 1.0 hardening | **done** (#694; #655 by #679). #656 is deferred. |
 | File format frozen | **done** ([D269](design/decisions/phase-3.md#d269), #496: #850, #851, #853, #858, #863; format 4, [`FORMAT.md` §13](../FORMAT.md#13-compatibility-promise)). The upgrade corpus of 0.2.5 and 0.3.3 files is #1064; the corpus of 1.0.0-written files is `tests/corpus/v1.0.0/`, committed with the release. |

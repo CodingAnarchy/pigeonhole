@@ -44,6 +44,17 @@ macro_rules! apply {
             Op::Aggregate(f, q, Some(ts), Input::Bytes(v)) => {
                 b.aggregate_bytes_at(t, row, f, q, *ts, v)
             }
+            Op::PutVector(f, q, ts, v) => {
+                use crate::vector::Vector;
+                match (v, ts) {
+                    (Vector::F32(x), None) => b.put_vector_f32(t, row, f, q, x),
+                    (Vector::F32(x), Some(ts)) => b.put_vector_f32_at(t, row, f, q, *ts, x),
+                    (Vector::I8(x), None) => b.put_vector_i8(t, row, f, q, x),
+                    (Vector::I8(x), Some(ts)) => b.put_vector_i8_at(t, row, f, q, *ts, x),
+                    (Vector::Bits(x), None) => b.put_vector_bits(t, row, f, q, x),
+                    (Vector::Bits(x), Some(ts)) => b.put_vector_bits_at(t, row, f, q, *ts, x),
+                }
+            }
             Op::DeleteRow => b.delete_row(t, row),
             Op::DeleteFamily(f) => b.delete_family(t, row, f),
             Op::DeleteColumn(f, q) => b.delete_column(t, row, f, q),
@@ -124,6 +135,25 @@ macro_rules! write_methods {
             ) -> PyResult<Bound<'py, Self>> {
                 let input = aggregate_input(table.writer()?, &family, value)?;
                 let op = Op::Aggregate(family, convert::bytes(qualifier)?, ts, input);
+                slf.get().record(table, convert::bytes(row)?, op)?;
+                Ok(slf.clone())
+            }
+
+            /// Puts a vector in a vector family: a buffer (a NumPy array, `array.array`) or a
+            /// sequence, of the family's element type (bits: packed, bytes-like).
+            #[pyo3(signature = (table, row, family, qualifier, vector, *, ts=None))]
+            #[allow(clippy::too_many_arguments)]
+            fn put_vector<'py>(
+                slf: &Bound<'py, Self>,
+                table: &Table,
+                row: &Bound<'_, PyAny>,
+                family: String,
+                qualifier: &Bound<'_, PyAny>,
+                vector: &Bound<'_, PyAny>,
+                ts: Option<u64>,
+            ) -> PyResult<Bound<'py, Self>> {
+                let v = crate::table::vector_input(table.writer()?, &family, vector)?;
+                let op = Op::PutVector(family, convert::bytes(qualifier)?, ts, v);
                 slf.get().record(table, convert::bytes(row)?, op)?;
                 Ok(slf.clone())
             }

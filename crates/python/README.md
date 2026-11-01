@@ -26,6 +26,7 @@ with ph.open("app.phdb", create=True) as db:
 
 - **Requirements:** CPython 3.11 or later. One abi3 wheel per platform: Linux (manylinux and musllinux, x86_64 and aarch64), macOS (universal2) and Windows (x86_64).
 - **Typed:** the package ships stubs and `py.typed`.
+- **Also covered:** vector families (writes take NumPy arrays), multi-get, graph traversal, and walking wide rows in pages. The [Python guide](https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/python.md) covers them.
 - **Processes:** one writer process per database, and any number of readers through `ph.open_reader(path)`.
 - **`fork`:** a forked child can't use handles it inherited. Open databases inside each `multiprocessing` worker, or use the `spawn` or `forkserver` start method.
 

@@ -23,6 +23,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 14. [Performance compared with SQLite](performance.md): point reads under a mixed load at equal cache memory: throughput, median, p99 and the far tail, and when each store fits.
 15. [Graphs](graphs.md): adjacency rows, reverse edges and degree, walking a hub's row cell by cell or in pages, frontier multi-gets, and breadth-first traversal inside the engine (sync and async).
 16. [Using Pigeonhole from AI agents](ai-agents.md): `phdb mcp`, an MCP server that gives an agent tools to list, read, scan, traverse and write a database; client configuration, cursors for long results, and modelling agent memory.
+17. [Python](python.md): the `pigeonhole-db` bindings (`import pigeonhole`): values and types, reads and scans, batches and transactions, vectors, graphs, readers and threads, errors, and the per-call overhead.
 
 Multi-process readers have their own page, [Reader processes](readers.md); [Concepts](concepts.md#multi-process-readers) has the overview.
 

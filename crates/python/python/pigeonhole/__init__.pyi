@@ -4,12 +4,13 @@ The Python API's snapshot (ICR 0102): `mypy.stubtest` checks these stubs against
 module in CI.
 """
 
+import array
 import enum
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import timedelta
 from os import PathLike
 from types import TracebackType
-from typing import Literal, TypeVar, final
+from typing import Any, Literal, TypeVar, final
 
 __version__: str
 
@@ -29,6 +30,38 @@ class Durability(enum.IntEnum):
     GROUP_SYNC = 2
     SYNC = 3
 
+class Element(enum.StrEnum):
+    """A vector family's element type."""
+
+    F32 = "f32"
+    I8 = "i8"
+    BIT = "bit"
+
+class Metric(enum.StrEnum):
+    """How a vector family compares vectors."""
+
+    L2 = "l2"
+    COSINE = "cosine"
+    INNER_PRODUCT = "inner_product"
+    HAMMING = "hamming"
+
+@final
+class VectorSpec:
+    """A vector family's spec."""
+
+    def __new__(cls, dim: int, element: Element | str, metric: Metric | str) -> VectorSpec: ...
+    @property
+    def dim(self) -> int: ...
+    @property
+    def element(self) -> Literal["f32", "i8", "bit", "unknown"]: ...
+    @property
+    def metric(self) -> Literal["l2", "cosine", "inner_product", "hamming", "unknown"]: ...
+
+Vector = Sequence[float] | Sequence[int] | bytes | bytearray | memoryview | array.array[Any]
+"""A vector as written. For an f32 or i8 family: a float32 (or float64) or int8 buffer, such
+as a NumPy array or array.array, or a sequence of numbers; bytes are refused. For a bit
+family: the packed bits, bytes-like."""
+
 @final
 class Family:
     """A column family's options."""
@@ -46,6 +79,15 @@ class Family:
     ) -> Family: ...
     @staticmethod
     def counter(*, max_versions: int | None = None, ttl: Seconds | None = None) -> Family: ...
+    @staticmethod
+    def vector(
+        dim: int,
+        element: Element | str,
+        metric: Metric | str,
+        *,
+        max_versions: int | None = None,
+        ttl: Seconds | None = None,
+    ) -> Family: ...
     @staticmethod
     def aggregate(
         kind: Literal[
@@ -65,7 +107,7 @@ class Family:
             "bloom",
         ],
         *,
-        bounds: list[float] | None = None,
+        bounds: Sequence[float] | None = None,
         mantissa_bits: int | None = None,
         max_buckets: int | None = None,
         bits: int | None = None,
@@ -105,6 +147,8 @@ class FamilyInfo:
     @property
     def compaction(self) -> Literal["leveled", "tiered", "fifo-by-time", "unknown"]: ...
     @property
+    def vector(self) -> VectorSpec | None: ...
+    @property
     def family(self) -> Family: ...
 
 @final
@@ -127,9 +171,10 @@ class Cell:
     @property
     def ts(self) -> int: ...
     @property
-    def typed(self) -> bytes | int | float | None:
-        """The value as bytes, int or float; None for a value type this binding doesn't
-        know yet (vector cells, until bindings PR 2: read them with `value`)."""
+    def typed(self) -> bytes | int | float | array.array[Any] | None:
+        """The value as bytes, int, float, or for a vector cell what `as_vector` returns;
+        None for a value type this binding doesn't know."""
+    def as_vector(self) -> array.array[Any] | bytes | None: ...
     def as_int(self) -> int | None: ...
     def as_u64(self) -> int | None: ...
     def as_float(self) -> float | None: ...
@@ -173,6 +218,60 @@ class ScanIter:
 
     def __iter__(self) -> ScanIter: ...
     def __next__(self) -> Row: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> ScanIter: ...
+    def __exit__(
+        self,
+        ty: type[BaseException] | None,
+        value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool: ...
+
+@final
+class Hop:
+    """One hop's new nodes, sorted; with parents=True, each node's parent index."""
+
+    @property
+    def nodes(self) -> list[bytes]: ...
+    @property
+    def parents(self) -> list[int] | None: ...
+    def __len__(self) -> int: ...
+
+@final
+class Traversal:
+    """A traversal's hops, the sorted seeds (hop 1's parents index them), and its counts."""
+
+    @property
+    def hops(self) -> list[Hop]: ...
+    @property
+    def seeds(self) -> list[bytes]: ...
+    @property
+    def rows(self) -> int: ...
+    @property
+    def edges(self) -> int: ...
+    @property
+    def hops_cut(self) -> int: ...
+    @property
+    def cut_by_max_nodes(self) -> bool: ...
+
+@final
+class RowPosition:
+    """Where a walk of a row stopped; its bytes are stable."""
+
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(b: Key) -> RowPosition: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+@final
+class Pages:
+    """A wide row's pages, each read when it is asked for."""
+
+    @property
+    def position(self) -> RowPosition | None: ...
+    def __iter__(self) -> Pages: ...
+    def __next__(self) -> Row: ...
 
 @final
 class Mutation:
@@ -180,6 +279,7 @@ class Mutation:
 
     def put(self, family: str, qualifier: Key, value: Value, *, ts: int | None = None) -> Mutation: ...
     def put_u64(self, family: str, qualifier: Key, value: int, *, ts: int | None = None) -> Mutation: ...
+    def put_vector(self, family: str, qualifier: Key, vector: Vector, *, ts: int | None = None) -> Mutation: ...
     def incr(self, family: str, qualifier: Key, delta: int, *, ts: int | None = None) -> Mutation: ...
     def aggregate(
         self, family: str, qualifier: Key, value: int | float | Key, *, ts: int | None = None
@@ -206,7 +306,7 @@ class Table:
         self,
         row: Key,
         *,
-        families: list[str] | None = None,
+        families: Sequence[str] | None = None,
         qualifier_prefix: Key | None = None,
         versions: int = 1,
         column_limit: int | None = None,
@@ -218,7 +318,7 @@ class Table:
         *,
         start: Key | None = None,
         end: Key | None = None,
-        families: list[str] | None = None,
+        families: Sequence[str] | None = None,
         qualifier_prefix: Key | None = None,
         versions: int = 1,
         limit: int | None = None,
@@ -226,6 +326,41 @@ class Table:
         snapshot: Snapshot | None = None,
         chunk: int = 256,
     ) -> ScanIter: ...
+    def multi_get(
+        self,
+        keys: Sequence[Key],
+        *,
+        families: Sequence[str] | None = None,
+        qualifier_prefix: Key | None = None,
+        versions: int = 1,
+        column_limit: int | None = None,
+        snapshot: Snapshot | None = None,
+    ) -> list[Row | None]: ...
+    def traverse(
+        self,
+        seeds: Sequence[Key],
+        family: str,
+        *,
+        hops: int = 1,
+        per_node_limit: int | None = None,
+        hop_limit: int | None = None,
+        max_nodes: int | None = None,
+        parents: bool = False,
+        qualifier_prefix: Key | None = None,
+        snapshot: Snapshot | None = None,
+        parallel: int | None = None,
+    ) -> Traversal: ...
+    def pages(
+        self,
+        row: Key,
+        size: int,
+        *,
+        families: Sequence[str] | None = None,
+        qualifier_prefix: Key | None = None,
+        versions: int = 1,
+        snapshot: Snapshot | None = None,
+        after: RowPosition | None = None,
+    ) -> Pages: ...
     def mutate(self, row: Key) -> Mutation: ...
     def put(
         self,
@@ -276,6 +411,9 @@ class WriteBatch:
     def put_u64(
         self, table: Table, row: Key, family: str, qualifier: Key, value: int, *, ts: int | None = None
     ) -> WriteBatch: ...
+    def put_vector(
+        self, table: Table, row: Key, family: str, qualifier: Key, vector: Vector, *, ts: int | None = None
+    ) -> WriteBatch: ...
     def incr(
         self, table: Table, row: Key, family: str, qualifier: Key, delta: int, *, ts: int | None = None
     ) -> WriteBatch: ...
@@ -313,12 +451,15 @@ class Transaction:
     """An optimistic transaction."""
 
     def get(self, table: Table, row: Key, family: str, qualifier: Key) -> Cell | None: ...
-    def get_row(self, table: Table, row: Key, families: list[str]) -> Row | None: ...
+    def get_row(self, table: Table, row: Key, families: Sequence[str]) -> Row | None: ...
     def put(
         self, table: Table, row: Key, family: str, qualifier: Key, value: Value, *, ts: int | None = None
     ) -> Transaction: ...
     def put_u64(
         self, table: Table, row: Key, family: str, qualifier: Key, value: int, *, ts: int | None = None
+    ) -> Transaction: ...
+    def put_vector(
+        self, table: Table, row: Key, family: str, qualifier: Key, vector: Vector, *, ts: int | None = None
     ) -> Transaction: ...
     def incr(
         self, table: Table, row: Key, family: str, qualifier: Key, delta: int, *, ts: int | None = None
