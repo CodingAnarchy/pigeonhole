@@ -255,6 +255,19 @@ class Traversal:
     def cut_by_max_nodes(self) -> bool: ...
 
 @final
+class Neighbour:
+    """A nearest-neighbour result: the cell's row, qualifier, distance and timestamp."""
+
+    @property
+    def row(self) -> bytes: ...
+    @property
+    def qualifier(self) -> bytes: ...
+    @property
+    def distance(self) -> float: ...
+    @property
+    def ts(self) -> int: ...
+
+@final
 class RowPosition:
     """Where a walk of a row stopped; its bytes are stable."""
 
@@ -350,6 +363,20 @@ class Table:
         snapshot: Snapshot | None = None,
         parallel: int | None = None,
     ) -> Traversal: ...
+    def nearest(
+        self,
+        family: str,
+        query: Vector,
+        k: int,
+        *,
+        prefix: Key | None = None,
+        start: Key | None = None,
+        end: Key | None = None,
+        keys: list[Key] | None = None,
+        qualifier_prefix: Key | None = None,
+        snapshot: Snapshot | None = None,
+        parallel: int | None = None,
+    ) -> list[Neighbour]: ...
     def pages(
         self,
         row: Key,

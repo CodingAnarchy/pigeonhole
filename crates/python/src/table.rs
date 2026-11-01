@@ -746,6 +746,43 @@ impl Table {
         )
     }
 
+    /// The `k` cells of vector family `family` nearest `query` (D296): over `prefix`, or
+    /// `start`/`end`, or the whole table, or the rows of `keys`; in (distance, row,
+    /// qualifier) order. `query` is read by the family's element type, as `put_vector`'s
+    /// vector is. An exact search: every cell in the read is scored (`parallel` threads may
+    /// share the work).
+    #[pyo3(signature = (family, query, k, *, prefix=None, start=None, end=None, keys=None, qualifier_prefix=None, snapshot=None, parallel=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn nearest(
+        &self,
+        py: Python<'_>,
+        family: String,
+        query: &Bound<'_, PyAny>,
+        k: usize,
+        prefix: Option<&Bound<'_, PyAny>>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        keys: Option<Vec<Bound<'_, PyAny>>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        parallel: Option<usize>,
+    ) -> PyResult<Vec<crate::walk::Neighbour>> {
+        crate::walk::nearest(
+            py,
+            &self.0,
+            family,
+            query,
+            k,
+            prefix,
+            start,
+            end,
+            keys,
+            qualifier_prefix,
+            snapshot,
+            parallel,
+        )
+    }
+
     /// A wide row's pages, at most `size` cells each (a column's versions never split), each
     /// read when it is asked for; `after` resumes after an earlier walk's `position`.
     #[pyo3(signature = (row, size, *, families=None, qualifier_prefix=None, versions=1, snapshot=None, after=None))]

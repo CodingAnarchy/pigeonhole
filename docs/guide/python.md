@@ -125,7 +125,7 @@ A vector family stores fixed-size vectors (D303):
   - Bits go in packed, as bytes. An `f32` or `i8` family refuses `bytes`, which in Python would otherwise read as one element per byte.
 - `Cell.as_vector()` returns an `array.array` (`'f'` or `'b'`), which `numpy.frombuffer` wraps without a copy, or `bytes` for bits.
 
-Nearest-neighbour search joins the bindings once it lands in `pigeonhole` (#1259).
+`nearest(family, query, k)` finds the `k` cells nearest `query` by the family's metric. It searches a prefix, a `start`/`end` range, the whole table, or the rows of `keys`, and returns `Neighbour`s (`row`, `qualifier`, `distance`, `ts`) nearest first. The search is exact: every vector in the read is scored, and `parallel=n` shares the work across threads.
 
 ```python
 import array
@@ -140,6 +140,9 @@ with ph.open(path, create=True) as db:
     docs.mutate(b"d1").put("text", b"body", "hello").put_vector("emb", b"v", [0.1, 0.2, 0.3, 0.4]).commit()
     v = docs.get(b"d1", "emb", b"v").as_vector()
     assert v == array.array("f", [0.1, 0.2, 0.3, 0.4])
+    docs.mutate(b"d2").put_vector("emb", b"v", [0.4, 0.3, 0.2, 0.1]).commit()
+    best = docs.nearest("emb", [0.1, 0.2, 0.3, 0.5], k=1)
+    assert best[0].row == b"d1"
 ```
 
 ## Graphs

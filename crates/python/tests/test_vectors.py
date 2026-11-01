@@ -81,3 +81,38 @@ def test_wrong_vectors_are_refused(t):
     with pytest.raises(ph.Error):
         t.mutate(b"a").put_vector("emb", b"x", [1.0, 2.0]).commit()
     assert t.get(b"a", "emb", b"x") is None
+
+
+def test_nearest_equals_a_brute_force_over_a_range_or_keys(db):
+    """Mirrors pigeonhole's nearest tests: the k nearest by the family's metric, nearest
+    first, over a range or a key set."""
+    import math
+    import random
+
+    rng = random.Random(1259)
+    t = db.table("n").family("emb", ph.Family.vector(8, ph.Element.F32, ph.Metric.L2)).create()
+    vecs = {f"r{i:03}".encode(): [rng.uniform(-1, 1) for _ in range(8)] for i in range(200)}
+    with db.write_batch() as wb:
+        for row, v in vecs.items():
+            wb.put_vector(t, row, "emb", b"v", v)
+    query = [rng.uniform(-1, 1) for _ in range(8)]
+
+    def l2(v):
+        return math.sqrt(sum((a - b) ** 2 for a, b in zip(v, query)))
+
+    want = sorted(vecs, key=lambda r: (l2(array.array("f", vecs[r])), r))[:5]
+    got = t.nearest("emb", query, 5)
+    assert [n.row for n in got] == want
+    assert all(n.qualifier == b"v" for n in got)
+    assert [n.distance for n in got] == sorted(n.distance for n in got)
+    assert t.nearest("emb", array.array("f", query), 5, parallel=2)[0].row == want[0]
+    # Over a range, and over a key set.
+    in_range = sorted((r for r in vecs if b"r050" <= r < b"r100"), key=lambda r: (l2(array.array("f", vecs[r])), r))
+    assert [n.row for n in t.nearest("emb", query, 3, start=b"r050", end=b"r100")] == in_range[:3]
+    some = [b"r007", b"r150", b"r199", b"r999"]
+    by_keys = sorted((r for r in some if r in vecs), key=lambda r: (l2(array.array("f", vecs[r])), r))
+    assert [n.row for n in t.nearest("emb", query, 10, keys=some)] == by_keys
+    with pytest.raises(TypeError):
+        t.nearest("emb", "bad", 1)
+    with pytest.raises(ValueError):
+        t.nearest("emb", query, 1, prefix=b"r", keys=[b"r001"])
