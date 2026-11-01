@@ -496,6 +496,7 @@ pub fn pigeonhole::Pigeonhole::is_failed(&self) -> bool
 pub fn pigeonhole::Pigeonhole::open(impl core::convert::AsRef<std::path::Path>, pigeonhole::Options) -> pigeonhole::Result<pigeonhole::Pigeonhole>
 pub fn pigeonhole::Pigeonhole::open_application_owned(impl core::convert::AsRef<std::path::Path>, pigeonhole::Options) -> pigeonhole::Result<pigeonhole::AppOwned>
 pub fn pigeonhole::Pigeonhole::open_reader(impl core::convert::AsRef<std::path::Path>, pigeonhole::ReaderOptions) -> pigeonhole::Result<pigeonhole::PigeonholeReader>
+pub fn pigeonhole::Pigeonhole::pinned_shard_cpus(&self) -> alloc::vec::Vec<usize>
 pub fn pigeonhole::Pigeonhole::recovery_stats(&self) -> pigeonhole::RecoveryStats
 pub fn pigeonhole::Pigeonhole::row_cache_stats(&self) -> pigeonhole::RowCacheStats
 pub fn pigeonhole::Pigeonhole::set_default_durability(&self, pigeonhole::Durability)
