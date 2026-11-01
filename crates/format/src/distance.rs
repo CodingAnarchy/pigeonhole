@@ -115,6 +115,25 @@ pub fn norm2_f32(q: &[f32]) -> f32 {
     sum
 }
 
+/// The squared norm of the little-endian `f32` vector `v`, in [`norm2_f32`]'s order: the
+/// same bits as `norm2_f32` of its components, and as [`dot_norm_f32_le`]'s norm.
+pub fn norm2_f32_le(v: &[u8]) -> f32 {
+    let (g, t) = v.as_chunks::<{ 4 * LANES }>();
+    let mut acc = [0f32; LANES];
+    for c in g {
+        for (i, a) in acc.iter_mut().enumerate() {
+            let x = le(c, i);
+            *a += x * x;
+        }
+    }
+    let mut sum = tree(acc);
+    for c in t.as_chunks::<4>().0 {
+        let x = f32::from_le_bytes(*c);
+        sum += x * x;
+    }
+    sum
+}
+
 /// Cosine distance `1 - (q·v) / (|q| |v|)` from [`dot_norm_f32_le`]'s parts and `q`'s
 /// squared norm. NaN when either norm is zero (the caller refuses or skips those).
 pub fn cosine_from(dot: f32, q_norm2: f32, v_norm2: f32) -> f32 {
@@ -246,6 +265,11 @@ mod tests {
                 .sum();
             assert!((f64::from(dot) - dot_ref).abs() <= 1e-4, "n = {n}");
             assert_eq!(norm.to_bits(), norm2_f32(&v).to_bits(), "one norm order");
+            assert_eq!(
+                norm2_f32_le(&vb).to_bits(),
+                norm.to_bits(),
+                "from the stored bytes"
+            );
             let cos = cosine_from(dot, norm2_f32(&q), norm);
             assert!((-1e-6..=2.0 + 1e-6).contains(&cos), "n = {n}: {cos}");
         }

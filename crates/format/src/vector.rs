@@ -277,35 +277,119 @@ impl Params {
     /// nearer, with the `distance` kernels the engine ranks by (D296): `f32` kernels widened
     /// exactly, `i8` and Hamming distances as exact integers. The caller has checked `q`
     /// ([`Params::check`]) and `v` is the family's ([`Params::accepts`]); a mismatched
-    /// element pairing is NaN.
+    /// element pairing is NaN. To score many vectors against one query, [`Params::prepare`]
+    /// it once: the same result, with the query's norm computed once.
     pub fn distance(&self, q: Query<'_>, v: &VectorRef<'_>) -> f64 {
-        use crate::distance as k;
-        let p = v.payload;
-        match (q, self.metric) {
-            (Query::F32(q), Metric::L2) => f64::from(k::l2_f32_le(q, p)),
-            (Query::F32(q), Metric::InnerProduct) => -f64::from(k::dot_norm_f32_le(q, p).0),
-            (Query::F32(q), Metric::Cosine) => {
-                let (dot, n2) = k::dot_norm_f32_le(q, p);
-                f64::from(k::cosine_from(dot, k::norm2_f32(q), n2))
-            }
-            (Query::I8(q), Metric::L2) => f64::from(k::l2_i8(q, p)),
-            (Query::I8(q), Metric::InnerProduct) => -f64::from(k::dot_i8(q, p)),
-            (Query::I8(q), Metric::Cosine) => {
-                let dot = f64::from(k::dot_i8(q, p));
-                let (nq, nv) = (f64::from(k::dot_i8(q, q)), f64::from(k::dot_i8(p, p)));
-                1.0 - dot / (nq.sqrt() * nv.sqrt())
-            }
-            (Query::Bits(q), Metric::Hamming) => f64::from(k::hamming(q, p)),
-            _ => f64::NAN,
+        score(self.metric, q, query_norm(self.metric, q), v)
+    }
+
+    /// `q` checked against the family ([`Params::check`]) and made ready to score many
+    /// stored vectors: its norm, which cosine needs, is computed here once
+    /// ([`Prepared::distance`] equals [`Params::distance`] bit for bit).
+    pub fn prepare(&self, q: QueryBuf) -> Result<Prepared, VectorError> {
+        self.check(q.as_query())?;
+        let norm = query_norm(self.metric, q.as_query());
+        Ok(Prepared {
+            params: *self,
+            query: q,
+            norm,
+        })
+    }
+}
+
+/// An owned query, in the vector family's element type: what a search holds while it
+/// scores ([`Params::prepare`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum QueryBuf {
+    /// `f32` components.
+    F32(std::sync::Arc<[f32]>),
+    /// `i8` components.
+    I8(std::sync::Arc<[i8]>),
+    /// Bits, packed eight to a byte, LSB first.
+    Bits(std::sync::Arc<[u8]>),
+}
+
+impl QueryBuf {
+    /// The query, borrowed.
+    pub fn as_query(&self) -> Query<'_> {
+        match self {
+            QueryBuf::F32(q) => Query::F32(q),
+            QueryBuf::I8(q) => Query::I8(q),
+            QueryBuf::Bits(q) => Query::Bits(q),
         }
     }
 }
 
-/// Whether every component is zero (`-0.0` included).
+/// A checked query with its norm, ready to score stored vectors of one family
+/// ([`Params::prepare`]). Cheap to clone: the query is shared.
+#[derive(Debug, Clone)]
+pub struct Prepared {
+    params: Params,
+    query: QueryBuf,
+    norm: QueryNorm,
+}
+
+impl Prepared {
+    /// The family's parameters.
+    pub fn params(&self) -> &Params {
+        &self.params
+    }
+
+    /// The distance to the stored vector `v`, which must be the family's
+    /// ([`Params::accepts`]); [`Params::distance`]'s result, bit for bit.
+    pub fn distance(&self, v: &VectorRef<'_>) -> f64 {
+        score(self.params.metric, self.query.as_query(), self.norm, v)
+    }
+}
+
+/// The query norm cosine needs, in the type its formula uses.
+#[derive(Debug, Clone, Copy)]
+enum QueryNorm {
+    None,
+    F32(f32),
+    I8(f64),
+}
+
+fn query_norm(metric: Metric, q: Query<'_>) -> QueryNorm {
+    use crate::distance as k;
+    match (q, metric) {
+        (Query::F32(q), Metric::Cosine) => QueryNorm::F32(k::norm2_f32(q)),
+        (Query::I8(q), Metric::Cosine) => QueryNorm::I8(f64::from(k::dot_i8(q, q))),
+        _ => QueryNorm::None,
+    }
+}
+
+/// The one scoring function: [`Params::distance`] and [`Prepared::distance`] both call it.
+fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f64 {
+    use crate::distance as k;
+    let p = v.payload;
+    match (q, metric, norm) {
+        (Query::F32(q), Metric::L2, _) => f64::from(k::l2_f32_le(q, p)),
+        (Query::F32(q), Metric::InnerProduct, _) => -f64::from(k::dot_norm_f32_le(q, p).0),
+        (Query::F32(q), Metric::Cosine, QueryNorm::F32(nq)) => {
+            let (dot, n2) = k::dot_norm_f32_le(q, p);
+            f64::from(k::cosine_from(dot, nq, n2))
+        }
+        (Query::I8(q), Metric::L2, _) => f64::from(k::l2_i8(q, p)),
+        (Query::I8(q), Metric::InnerProduct, _) => -f64::from(k::dot_i8(q, p)),
+        (Query::I8(q), Metric::Cosine, QueryNorm::I8(nq)) => {
+            let dot = f64::from(k::dot_i8(q, p));
+            let nv = f64::from(k::dot_i8(p, p));
+            1.0 - dot / (nq.sqrt() * nv.sqrt())
+        }
+        (Query::Bits(q), Metric::Hamming, _) => f64::from(k::hamming(q, p)),
+        _ => f64::NAN,
+    }
+}
+
 /// The largest `f32` component magnitude a vector may hold: 2^56. With at most 4096
 /// components, every kernel's sum stays below `f32::MAX` (Σ(2x)² ≤ 4096 × 4 × 2^112 = 2^126),
 /// so no distance overflows to infinity or NaN (perf287's B1 on #1255).
 pub const MAX_F32_COMPONENT: f32 = 72_057_594_037_927_936.0;
+
+const F32_RANGE: &str = "a vector's components must be finite and at most 2^56 in magnitude";
+const COSINE_NORM: &str =
+    "a cosine vector needs a nonzero norm (not all zeros, nor so small its square underflows)";
 
 /// The `f32` components a vector may hold under `metric` (D303): finite and at most
 /// [`MAX_F32_COMPONENT`] in magnitude, and under cosine a squared norm (as the kernels sum
@@ -315,15 +399,10 @@ fn check_f32(q: &[f32], metric: Metric) -> Result<(), VectorError> {
     if q.iter()
         .any(|x| !x.is_finite() || x.abs() > MAX_F32_COMPONENT)
     {
-        return Err(VectorError(
-            "a vector's components must be finite and at most 2^56 in magnitude",
-        ));
+        return Err(VectorError(F32_RANGE));
     }
     if metric == Metric::Cosine && crate::distance::norm2_f32(q) < f32::MIN_POSITIVE {
-        return Err(VectorError(
-            "a cosine vector needs a nonzero norm (not all zeros, nor so small its square \
-             underflows)",
-        ));
+        return Err(VectorError(COSINE_NORM));
     }
     Ok(())
 }
@@ -389,13 +468,16 @@ impl<'a> VectorRef<'a> {
         let p = self.payload;
         match self.element {
             Element::F32 => {
-                let xs: Vec<f32> = p
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect();
-                check_f32(&xs, metric)
+                let mut xs = p.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c));
+                if xs.any(|x| !x.is_finite() || x.abs() > MAX_F32_COMPONENT) {
+                    return Err(VectorError(F32_RANGE));
+                }
+                // The norm the kernels sum, read from the stored bytes (no copy per put).
+                if metric == Metric::Cosine && crate::distance::norm2_f32_le(p) < f32::MIN_POSITIVE
+                {
+                    return Err(VectorError(COSINE_NORM));
+                }
+                Ok(())
             }
             Element::I8 | Element::Bit => check_bytes(p.iter().all(|b| *b == 0), metric),
         }
@@ -589,6 +671,38 @@ mod tests {
         assert!(
             small.distance(Query::F32(&[1.1e-19]), &sv).is_finite(),
             "at the norm floor"
+        );
+        // A prepared query scores as Params::distance, bit for bit, for every element.
+        for (p, q, v) in [
+            (
+                Params::new(Element::F32, 2, Metric::Cosine).unwrap(),
+                QueryBuf::F32(vec![0.3, -0.4].into()),
+                le_bytes(&[1.5, 2.5]),
+            ),
+            (
+                Params::new(Element::I8, 2, Metric::Cosine).unwrap(),
+                QueryBuf::I8(vec![3, -7].into()),
+                vec![5u8, 250],
+            ),
+            (
+                Params::new(Element::Bit, 8, Metric::Hamming).unwrap(),
+                QueryBuf::Bits(vec![0x0f].into()),
+                vec![0x3c],
+            ),
+        ] {
+            let v = VectorRef::new(p.element, p.dim, &v).unwrap();
+            let prepared = p.prepare(q.clone()).unwrap();
+            assert_eq!(
+                prepared.distance(&v).to_bits(),
+                p.distance(q.as_query(), &v).to_bits()
+            );
+        }
+        assert!(
+            Params::new(Element::F32, 2, Metric::Cosine)
+                .unwrap()
+                .prepare(QueryBuf::F32(vec![0.0, 0.0].into()))
+                .is_err(),
+            "prepare checks"
         );
         // 4096 dimensions fit; 4097 do not.
         let big = vec![0u8; 4 * 4096];

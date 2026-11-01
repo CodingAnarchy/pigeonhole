@@ -3,10 +3,11 @@ use std::ops::{Bound, Range, RangeBounds};
 use std::sync::Arc;
 
 use pigeonhole_engine::{
-    CellData, ColumnPosition, FamilyId, KeyCursor, KeySet, QualifierFilter, ReadSpec, ScanCursor,
-    ScanSpec, TableInfo, ValuePredicate,
+    CellData, ColumnPosition, FamilyId, KeyCursor, KeySet, KnnSkips, KnnVisitor, QualifierFilter,
+    ReadInput, ReadSpec, ReduceSpec, ScanCursor, ScanSpec, TableInfo, TopK, ValuePredicate,
 };
 
+use pigeonhole_format::vector::QueryBuf;
 use smallvec::SmallVec;
 
 use crate::cell::RowBuf;
@@ -539,6 +540,36 @@ pub struct KeysRead<'t> {
 }
 
 impl<'t> KeysRead<'t> {
+    /// The `k` vectors nearest to the `f32` `query` in this read's one vector family (D296,
+    /// D303), as a [`Nearest`] to run: exact, ranked by the family's metric, ties by row
+    /// then qualifier. The read's selection applies (qualifiers, time range, value filter),
+    /// with the newest version of each cell.
+    pub fn nearest_f32(self, query: &[f32], k: usize) -> Nearest<'t> {
+        self.nearest(QueryBuf::F32(query.into()), k)
+    }
+
+    /// [`nearest_f32`](Self::nearest_f32) for an `i8` vector family.
+    pub fn nearest_i8(self, query: &[i8], k: usize) -> Nearest<'t> {
+        self.nearest(QueryBuf::I8(query.into()), k)
+    }
+
+    /// [`nearest_f32`](Self::nearest_f32) for a bit vector family (`query` packed eight bits
+    /// to a byte, least significant first).
+    pub fn nearest_bits(self, query: &[u8], k: usize) -> Nearest<'t> {
+        self.nearest(QueryBuf::Bits(query.into()), k)
+    }
+
+    fn nearest(self, query: QueryBuf, k: usize) -> Nearest<'t> {
+        Nearest {
+            core: Cow::Borrowed(self.core),
+            input: NearestInput::Keys(Arc::new(self.keys)),
+            sel: self.sel,
+            query,
+            k,
+            parallelism: 1,
+        }
+    }
+
     pub(crate) fn new(core: &'t Arc<TableCore>, keys: &KeySet) -> Self {
         Self {
             core,
@@ -1599,6 +1630,36 @@ pub struct Scan<'t> {
 }
 
 impl<'t> Scan<'t> {
+    /// The `k` vectors nearest to the `f32` `query` in this read's one vector family (D296,
+    /// D303), as a [`Nearest`] to run: exact, ranked by the family's metric, ties by row
+    /// then qualifier. The read's selection applies (qualifiers, time range, value filter),
+    /// with the newest version of each cell.
+    pub fn nearest_f32(self, query: &[f32], k: usize) -> Nearest<'t> {
+        self.nearest(QueryBuf::F32(query.into()), k)
+    }
+
+    /// [`nearest_f32`](Self::nearest_f32) for an `i8` vector family.
+    pub fn nearest_i8(self, query: &[i8], k: usize) -> Nearest<'t> {
+        self.nearest(QueryBuf::I8(query.into()), k)
+    }
+
+    /// [`nearest_f32`](Self::nearest_f32) for a bit vector family (`query` packed eight bits
+    /// to a byte, least significant first).
+    pub fn nearest_bits(self, query: &[u8], k: usize) -> Nearest<'t> {
+        self.nearest(QueryBuf::Bits(query.into()), k)
+    }
+
+    fn nearest(self, query: QueryBuf, k: usize) -> Nearest<'t> {
+        Nearest {
+            core: self.core,
+            input: NearestInput::Range(self.start, self.end),
+            sel: self.sel,
+            query,
+            k,
+            parallelism: 1,
+        }
+    }
+
     pub(crate) fn new(
         core: &'t Arc<TableCore>,
         start: Bound<Vec<u8>>,
@@ -2012,5 +2073,157 @@ mod tests {
         sel.ends.clear();
         sel.push_family("g");
         assert_eq!(sel.family_names().collect::<Vec<_>>(), ["g"]);
+    }
+}
+
+/// One vector of a nearest-neighbour search ([`Nearest::run`]): the cell's row, qualifier
+/// and timestamp, and its distance to the query under the family's metric (smaller is
+/// nearer; exact for `i8` and bit vectors).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Neighbour {
+    /// The row key.
+    pub row: Vec<u8>,
+    /// The qualifier.
+    pub qualifier: Vec<u8>,
+    /// The distance, as [`VectorSpec::distance_f32`](crate::VectorSpec::distance_f32) and
+    /// the other forms give it.
+    pub distance: f64,
+    /// The version's timestamp.
+    pub ts: u64,
+}
+
+/// What a nearest-neighbour search reads.
+#[derive(Debug)]
+enum NearestInput {
+    Range(Bound<Vec<u8>>, Bound<Vec<u8>>),
+    Keys(Arc<KeySet>),
+}
+
+/// An exact nearest-neighbour search under construction ([`Scan::nearest_f32`],
+/// [`KeysRead::nearest_f32`] and their `i8` and bit forms; D296 PR 4, D303). Finish with
+/// [`run`](Nearest::run).
+///
+/// It reads every selected cell of the one vector family the read names and keeps the `k`
+/// nearest, in the engine, without materialising rows. The order is total: distance, then
+/// row key, then qualifier, the same at any [`parallel`](Nearest::parallel). The query
+/// must have the family's element type and dimension, with finite components (at most
+/// 2^56 in magnitude) and, under cosine, a nonzero norm; otherwise `InvalidArgument`.
+///
+/// ```
+/// use pigeonhole::{Element, Family, KeySet, Metric, Options, Pigeonhole, VectorSpec};
+///
+/// # fn main() -> pigeonhole::Result<()> {
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+/// let spec = VectorSpec::new(2, Element::F32, Metric::L2)?;
+/// let t = db.table("docs")?.family("emb", Family::vector(spec)).create_if_missing()?;
+/// for (row, v) in [(b"a", [0.0, 0.0]), (b"b", [1.0, 0.0]), (b"c", [5.0, 5.0])] {
+///     t.mutate(row).put_vector_f32("emb", b"", &v).commit()?;
+/// }
+/// let near = t.scan_prefix(b"").family("emb").nearest_f32(&[0.9, 0.0], 2).run()?;
+/// let rows: Vec<&[u8]> = near.iter().map(|n| n.row.as_slice()).collect();
+/// assert_eq!(rows, [&b"b"[..], b"a"]);
+///
+/// // Over chosen rows: a key-set read.
+/// let some = KeySet::from_unsorted([b"a", b"c"]);
+/// let near = t.keys(&some).family("emb").nearest_f32(&[4.0, 4.0], 1).run()?;
+/// assert_eq!(near[0].row, b"c");
+/// # db.close()?;
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug)]
+#[must_use = "a search does nothing until .run()"]
+pub struct Nearest<'t> {
+    core: Cow<'t, Arc<TableCore>>,
+    input: NearestInput,
+    sel: Selection,
+    query: QueryBuf,
+    k: usize,
+    parallelism: usize,
+}
+
+impl Nearest<'_> {
+    /// Search on up to `n` threads owned by the call (default 1), over the input's tablets:
+    /// a range fans out past the engine's work floor, and a key set (a few wide rows, as an
+    /// IVF index's lists) whenever its keys span more than one tablet. The result is the
+    /// same at any `n`.
+    pub fn parallel(mut self, n: usize) -> Self {
+        self.parallelism = n.max(1);
+        self
+    }
+
+    /// Runs the search: at most `k` neighbours, nearest first. The read must name exactly
+    /// one family, a vector family, and the query must fit it (`InvalidArgument`).
+    pub fn run(mut self) -> Result<Vec<Neighbour>> {
+        let invalid = |m: String| crate::Error::new(crate::ErrorCode::InvalidArgument, m);
+        if self.sel.ends.len() != 1 {
+            return Err(invalid(
+                "nearest reads exactly one vector family: select it with .family()".into(),
+            ));
+        }
+        let core: &TableCore = &self.core;
+        let (info, snapshot, families) = self.sel.start(core)?;
+        let family = families[0];
+        let options = &info
+            .families
+            .iter()
+            .find(|f| f.id == family)
+            .ok_or_else(|| invalid("the family is not in the table".into()))?
+            .options;
+        let name = self
+            .sel
+            .family_names()
+            .next()
+            .unwrap_or_default()
+            .to_owned();
+        let params = (options.kind == pigeonhole_engine::FamilyKind::Vector)
+            .then(|| pigeonhole_format::vector::Params::parse(&options.kind_params).ok())
+            .flatten()
+            .ok_or_else(|| invalid(format!("family {name:?} is not a vector family")))?;
+        let skips = Arc::new(KnnSkips::default());
+        // Checked and prepared once (the query's norm too); every group's visitor shares it.
+        let prepared = params
+            .prepare(self.query.clone())
+            .map_err(|e| invalid(format!("family {name:?}: the query: {e}")))?;
+        if self.k == 0 {
+            return Ok(Vec::new());
+        }
+        let keys = matches!(self.input, NearestInput::Keys(_));
+        let input = match std::mem::replace(&mut self.input, NearestInput::Keys(Arc::default())) {
+            NearestInput::Range(lo, hi) => ReadInput::Ranges(vec![(lo, hi)]),
+            NearestInput::Keys(k) => ReadInput::Keys(k),
+        };
+        let mut spec = ReduceSpec::new(input);
+        let mut read = self.sel.spec.clone();
+        read.families = vec![family];
+        read.versions = 1;
+        spec.read = read;
+        spec.parallelism = self.parallelism;
+        if keys && self.parallelism > 1 {
+            // A key set's floor counts keys; an IVF query reads a few wide rows (#490 D).
+            spec.parallel_floor = 0;
+        }
+        let k = self.k;
+        let reduced = core.with(|e| {
+            e.reduce(
+                &snapshot,
+                core.info.id,
+                &spec,
+                || KnnVisitor::typed(prepared.clone(), Arc::clone(&skips)),
+                || TopK::new(k),
+            )
+        })?;
+        Ok(reduced
+            .items
+            .into_iter()
+            .map(|(cell, score)| Neighbour {
+                row: cell.row,
+                qualifier: cell.qualifier,
+                distance: score.0,
+                ts: cell.ts,
+            })
+            .collect())
     }
 }

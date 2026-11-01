@@ -411,6 +411,9 @@ pub fn pigeonhole::KeysRead<'t>::column_limit(self, u32) -> Self
 pub fn pigeonhole::KeysRead<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
 pub fn pigeonhole::KeysRead<'t>::family(self, &str) -> Self
 pub fn pigeonhole::KeysRead<'t>::latest(self) -> Self
+pub fn pigeonhole::KeysRead<'t>::nearest_bits(self, &[u8], usize) -> pigeonhole::Nearest<'t>
+pub fn pigeonhole::KeysRead<'t>::nearest_f32(self, &[f32], usize) -> pigeonhole::Nearest<'t>
+pub fn pigeonhole::KeysRead<'t>::nearest_i8(self, &[i8], usize) -> pigeonhole::Nearest<'t>
 pub fn pigeonhole::KeysRead<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> Self
 pub fn pigeonhole::KeysRead<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::KeysRead<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
@@ -438,6 +441,15 @@ pub fn pigeonhole::MergeError::new(impl core::convert::Into<alloc::string::Strin
 impl core::error::Error for pigeonhole::MergeError
 impl core::fmt::Display for pigeonhole::MergeError
 pub fn pigeonhole::MergeError::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole::Nearest<'t>
+impl pigeonhole::Nearest<'_>
+pub fn pigeonhole::Nearest<'_>::parallel(self, usize) -> Self
+pub fn pigeonhole::Nearest<'_>::run(self) -> pigeonhole::Result<alloc::vec::Vec<pigeonhole::Neighbour>>
+#[non_exhaustive] pub struct pigeonhole::Neighbour
+pub pigeonhole::Neighbour::distance: f64
+pub pigeonhole::Neighbour::qualifier: alloc::vec::Vec<u8>
+pub pigeonhole::Neighbour::row: alloc::vec::Vec<u8>
+pub pigeonhole::Neighbour::ts: u64
 pub struct pigeonhole::Options
 impl pigeonhole::Options
 pub fn pigeonhole::Options::adaptive_shard_threads(self, bool) -> Self
@@ -676,6 +688,9 @@ pub fn pigeonhole::Scan<'t>::into_owned(self) -> pigeonhole::Scan<'static>
 pub fn pigeonhole::Scan<'t>::iter(self) -> pigeonhole::Result<pigeonhole::RowIter<'t>>
 pub fn pigeonhole::Scan<'t>::latest(self) -> Self
 pub fn pigeonhole::Scan<'t>::limit(self, u64) -> Self
+pub fn pigeonhole::Scan<'t>::nearest_bits(self, &[u8], usize) -> pigeonhole::Nearest<'t>
+pub fn pigeonhole::Scan<'t>::nearest_f32(self, &[f32], usize) -> pigeonhole::Nearest<'t>
+pub fn pigeonhole::Scan<'t>::nearest_i8(self, &[i8], usize) -> pigeonhole::Nearest<'t>
 pub fn pigeonhole::Scan<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> Self
 pub fn pigeonhole::Scan<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::Scan<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
@@ -796,6 +811,14 @@ pub pigeonhole::TraverseStats::cut_by_max_nodes: bool
 pub pigeonhole::TraverseStats::edges: u64
 pub pigeonhole::TraverseStats::hops_cut: u32
 pub pigeonhole::TraverseStats::rows: u64
+pub struct pigeonhole::Vector
+impl pigeonhole::Vector
+pub fn pigeonhole::Vector::as_ref(&self) -> pigeonhole::VectorRef<'_>
+pub fn pigeonhole::Vector::dim(&self) -> u32
+pub fn pigeonhole::Vector::element(&self) -> pigeonhole::Element
+pub fn pigeonhole::Vector::from_bits(u32, &[u8]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::Vector::from_f32(&[f32]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::Vector::from_i8(&[i8]) -> pigeonhole::Result<Self>
 pub struct pigeonhole::VectorRef<'a>
 impl<'a> pigeonhole::VectorRef<'a>
 pub fn pigeonhole::VectorRef<'a>::as_bytes(&self) -> &'a [u8]

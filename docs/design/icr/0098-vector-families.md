@@ -18,8 +18,14 @@
 
 **Not done as D303 rev 0 worded it:** a plain put (`put`, `put_i64`, …) into a vector family is refused at commit by the engine's gate, not when the write is built. That's how a plain put into an aggregate family is refused, and it keeps the plain `put`'s hot path free of a kind check. The typed `put_vector_*` are checked when built, as rev 2 (N2) says.
 
-## D296 PR 4 (planned): `nearest_*`
-`nearest_f32(&[f32], k)`, `nearest_i8(&[i8], k)` and `nearest_bits(&[u8], k)`, with `_async` forms, on scans and `KeysRead`. Each returns `Vec<Neighbour>` (`#[non_exhaustive]`: `row`, `qualifier`, `distance: f64`, `ts`) in (distance, row, qualifier) order. An explicit `parallel(n)` on a key set fans out over its tablet groups (#490 D's seam, c6548060686).
+## D296 PR 4: `nearest_*`
+- **pigeonhole:** `Scan::nearest_f32(self, &[f32], k: usize) -> Nearest<'t>`, `nearest_i8(&[i8], k)` and `nearest_bits(&[u8], k)`, and the same three on `KeysRead`.
+  - `Nearest` (`#[must_use]`): `parallel(n)` (default 1; on a key set an explicit `n > 1` fans out over its tablet groups whatever their count, #490 D's seam, c6548060686), and `run(self) -> Result<Vec<Neighbour>>`.
+  - `Neighbour` (`#[non_exhaustive]`): `row`, `qualifier`, `distance: f64`, `ts`.
+  - `Vector` (`Clone + PartialEq + Debug`), an owned vector for ones that aren't cells (#490 D's centroids and means): `from_f32(&[f32])`, `from_i8(&[i8])`, `from_bits(dim, &[u8])` (each `InvalidArgument` outside 1 to 4096 dimensions, bits a multiple of 8), `element`, `dim`, and `as_ref() -> VectorRef<'_>` for `VectorSpec::distance_*`. Its components aren't checked against a family; a write or a query is.
+  - The result is the `k` nearest of the read's one vector family, in (distance, row, qualifier) order, the same at any `parallel`. The read's selection applies, at the newest version of each cell. Its distances equal `VectorSpec::distance_*`'s to the bit. A read naming no family or several, a non-vector family, or a query that doesn't fit the spec is `InvalidArgument`.
+- **pigeonhole-engine** (no promise): `KnnVisitor::typed(Params, KnnQuery, Arc<KnnSkips>) -> Result<KnnVisitor>`, `KnnQuery` (`F32`, `I8`, `Bits`), and `Score` holding an `f64`.
+- **Next:** `run_async` on `Nearest` (a key set's async cursor, as D304's `PendingTraversal`) follows in its own PR, and D308's `run_within` after that.
 
 ## Why
 D303 (#490 B): embeddings stored as `Bytes` carry no shape. A typed family fixes element, dimension and metric, so every stored vector has a finite, ordered distance to every valid query (D296).

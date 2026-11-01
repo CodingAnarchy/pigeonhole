@@ -77,9 +77,10 @@ impl Metric {
 /// [`put_vector_bits`](crate::RowMutation::put_vector_bits) (and their `_at` forms, on
 /// [`WriteBatch`](crate::WriteBatch) and [`Transaction`](crate::Transaction) too). A vector
 /// of another element type or dimension, an `f32` component that isn't finite or exceeds
-/// 2^56 in magnitude, or (under cosine) a vector with a zero norm is refused with `InvalidArgument` when the write is built. A vector
-/// family takes nothing else: a plain put, a merge or an aggregate input fails with
-/// `InvalidArgument`. Cells version and delete as in an ordinary family.
+/// 2^56 in magnitude, or (under cosine) a vector with a zero norm is refused with
+/// `InvalidArgument` when the write is built. A vector family takes nothing else: a plain put, a
+/// merge or an aggregate input fails with `InvalidArgument`. Cells version and delete as in an
+/// ordinary family.
 ///
 /// Read them back as [`Value::Vector`](crate::Value::Vector) or with
 /// [`CellRef::as_vector`](crate::CellRef::as_vector).
@@ -224,6 +225,72 @@ impl<'a> VectorRef<'a> {
             fmt::Element::I8 => Some(p.iter().map(|b| f32::from(*b as i8)).collect()),
             fmt::Element::Bit => None,
         }
+    }
+}
+
+/// An owned vector, for vectors that aren't cells: a client's centroids or means, scored
+/// with [`VectorSpec::distance_f32`] and the other forms through [`as_ref`](Self::as_ref)
+/// (#490 D). It holds the element type, dimension and payload as a cell does; its
+/// components aren't checked against a family (a write or a query is, when it's made).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Vector {
+    element: fmt::Element,
+    dim: u32,
+    payload: Vec<u8>,
+}
+
+impl Vector {
+    /// An `f32` vector of `components.len()` dimensions (1 to 4096; else `InvalidArgument`).
+    pub fn from_f32(components: &[f32]) -> Result<Self> {
+        let payload = components.iter().flat_map(|x| x.to_le_bytes()).collect();
+        Self::new(fmt::Element::F32, components.len(), payload)
+    }
+
+    /// An `i8` vector of `components.len()` dimensions (1 to 4096).
+    pub fn from_i8(components: &[i8]) -> Result<Self> {
+        let payload = components.iter().map(|x| *x as u8).collect();
+        Self::new(fmt::Element::I8, components.len(), payload)
+    }
+
+    /// A bit vector of `dim` bits (a multiple of 8, 8 to 4096), packed eight to a byte,
+    /// least significant first: `bits` is `dim / 8` bytes.
+    pub fn from_bits(dim: u32, bits: &[u8]) -> Result<Self> {
+        if bits.len() as u64 * 8 != u64::from(dim) {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "a bit vector of dim bits is dim / 8 bytes",
+            ));
+        }
+        Self::new(fmt::Element::Bit, dim as usize, bits.to_vec())
+    }
+
+    fn new(element: fmt::Element, dim: usize, payload: Vec<u8>) -> Result<Self> {
+        let dim =
+            u32::try_from(dim).map_err(|_| invalid(fmt::VectorError("too many dimensions")))?;
+        fmt::VectorRef::new(element, dim, &payload).map_err(invalid)?;
+        Ok(Self {
+            element,
+            dim,
+            payload,
+        })
+    }
+
+    /// The element type.
+    pub fn element(&self) -> Element {
+        Element::from_format(self.element)
+    }
+
+    /// The dimension.
+    pub fn dim(&self) -> u32 {
+        self.dim
+    }
+
+    /// The vector, borrowed as a stored vector is, for [`VectorSpec::distance_f32`] and the
+    /// other forms.
+    pub fn as_ref(&self) -> VectorRef<'_> {
+        VectorRef::new(
+            fmt::VectorRef::new(self.element, self.dim, &self.payload).expect("checked when made"),
+        )
     }
 }
 

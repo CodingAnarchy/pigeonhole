@@ -1,0 +1,2 @@
+### Added
+- Exact nearest-neighbour search over vector families (D296, D303, ICR 0098): `nearest_f32`, `nearest_i8` and `nearest_bits` on a scan or a multi-get (`table.keys(&set)`) give the `k` nearest vectors of the read's one vector family, in the engine without materialising rows, as `Neighbour`s (row, qualifier, distance, timestamp), ordered by distance and then row and qualifier. The read's selection applies, `parallel(n)` spreads a search over tablets with the same result, and distances equal `VectorSpec::distance_*`'s exactly.
