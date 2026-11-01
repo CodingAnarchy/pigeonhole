@@ -225,9 +225,9 @@ enum Source {
 /// positioned from the cache, their blocks fetched asynchronously) and scored inline with
 /// a prepared query. It never fans out; one `TopK` over the input in order gives the sync
 /// read's result. A poll yields after [`NEAREST_POLL_CELLS`] cells (a value filter's misses
-/// included: it is tested here, not in the read), so a wide row never holds the executor; a row's cells past its first block are read synchronously where the
-/// cache misses (counted in `async_sync_reads`). Dropping it releases its pins and its
-/// snapshot.
+/// included: it is tested here, not in the read), so a wide row never holds the executor;
+/// a row's cells past its first block are read synchronously where the cache misses
+/// (counted in `async_sync_reads`). Dropping it releases its pins and its snapshot.
 #[must_use = "a future does nothing unless polled"]
 pub struct PendingNearest {
     source: Source,

@@ -494,7 +494,11 @@ fn an_async_search_returns_what_the_sync_one_returns() {
         let db =
             Pigeonhole::open(dir.join("v.phdb"), Options::default().shards(2)).expect("reopen");
         let t = db.table("v").expect("table").open().expect("open");
-        // First, from the cold cache: the async path waits on its fetches at least once.
+        // First, from the cold cache. Whether a poll returns `Pending` depends on the backend
+        // (io_uring can complete a fetch before the poll returns), so the proof that the
+        // async path ran is in the counters: the search missed the cache, and fewer of its
+        // reads were synchronous than it missed, so the rest were fetched asynchronously.
+        let before = db.engine_metrics();
         let (got, pending) = poll_counting(
             t.scan_prefix(b"")
                 .family("f")
@@ -502,9 +506,15 @@ fn an_async_search_returns_what_the_sync_one_returns() {
                 .run_async(),
         );
         let got = got.unwrap();
+        let after = db.engine_metrics();
+        let misses = after.block_cache_misses - before.block_cache_misses;
+        let sync_reads = after.async_sync_reads - before.async_sync_reads;
+        eprintln!("k={k}: {misses} misses, {sync_reads} sync reads, {pending} pending");
+        assert!(misses > 0, "k={k}: the search started from a cold cache");
         assert!(
-            pending > 0,
-            "k={k}: a cold search went Pending on its fetches"
+            sync_reads < misses,
+            "k={k}: some of the {misses} missed blocks were fetched asynchronously \
+             ({sync_reads} read synchronously, {pending} Pending)"
         );
         let want = t
             .scan_prefix(b"")
