@@ -389,7 +389,8 @@ fn a_counter_checkpoint_keeps_only_a_folded_value_of_at_most_4_kib() {
         let before = db.counter_checkpoints();
         db.get_latest(t, f, b"r", b"q").unwrap().unwrap();
         db.get_latest(t, f, b"r", b"q").unwrap().unwrap();
-        let after = db.counter_checkpoints();
+        // The shard keeps a checkpoint the get sent a moment later, on its own thread.
+        let after = settled_checkpoints(&db, before, kept);
         if kept {
             assert!(after.0 > before.0, "{name}: {before:?} -> {after:?}");
         } else {
@@ -397,4 +398,18 @@ fn a_counter_checkpoint_keeps_only_a_folded_value_of_at_most_4_kib() {
         }
     }
     db.close().unwrap();
+}
+
+/// The checkpoint counts once the shard has kept one more than `before` (when `kept`), or
+/// after a quiet second (when not): the get sends its checkpoint, and the shard thread keeps
+/// it a moment later.
+fn settled_checkpoints(db: &Engine, before: (u64, u64), kept: bool) -> (u64, u64) {
+    for _ in 0..200 {
+        let now = db.counter_checkpoints();
+        if kept && now.0 > before.0 {
+            return now;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    db.counter_checkpoints()
 }
