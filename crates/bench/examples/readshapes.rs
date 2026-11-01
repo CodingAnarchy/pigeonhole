@@ -32,7 +32,12 @@
 //!   only for these shapes, flushed) with `RowRead::cells()` and with `pages(500)` (D297);
 //! - `multi-get-dense`, `multi-get-sparse`: a multi-get (`Table::keys`, D299) of 200 rows of
 //!   table `t`, contiguous or spread over the table, counted per row (the key set is built
-//!   outside the measured function).
+//!   outside the measured function);
+//! - `scan-budget`: a byte-budgeted page (`Scan::read_within`, D308) of 64 KiB of table `t`
+//!   from a random row, about 139 rows of 8 cells, counted per returned cell;
+//! - `scan-budget-twin`: the same rows through a plain scan (`limit(139)`), counted per
+//!   cell: the budgeted page reads about its budget, so its per-cell count stays near the
+//!   twin's, where reading the rest of the range would multiply it;
 //! - `knn-exact`, `knn-filtered`: an exact nearest-neighbour search (`nearest_f32`, D296 PR 4)
 //!   for the 10 nearest of table `v` (built only for these shapes, flushed): 2,000 rows of two
 //!   64-dimension `f32` L2 vectors (qualifiers `a` and `b`), over every vector, or with
@@ -310,6 +315,40 @@ fn shape_knn(v: &Table, query: &[f32], filtered: bool) -> usize {
     KNN_ROWS as usize * if filtered { 1 } else { 2 }
 }
 
+/// A budgeted page's size: about 139 of table `t`'s rows (8 cells of 58 bytes, a 7-byte
+/// key).
+const PAGE_BYTES: u64 = 64 << 10;
+const PAGE_ROWS: u64 = 139;
+
+#[inline(never)]
+fn shape_scan_budget(t: &Table, rng: &mut Rng) -> usize {
+    let start = row_key(rng.below(ROWS - PAGE_ROWS as u32));
+    let _measured = Measured::start();
+    let page = t
+        .scan_bounds(Bound::Included(&start[..]), Bound::Unbounded)
+        .family("f")
+        .read_within(PAGE_BYTES)
+        .unwrap();
+    std::hint::black_box(page.rows().iter().map(|r| r.len()).sum::<usize>())
+}
+
+#[inline(never)]
+fn shape_scan_budget_twin(t: &Table, rng: &mut Rng) -> usize {
+    let start = row_key(rng.below(ROWS - PAGE_ROWS as u32));
+    let _measured = Measured::start();
+    let mut it = t
+        .scan_bounds(Bound::Included(&start[..]), Bound::Unbounded)
+        .family("f")
+        .limit(PAGE_ROWS)
+        .iter()
+        .unwrap();
+    let mut n = 0;
+    while let Some(r) = it.next_ref().unwrap() {
+        n += std::hint::black_box(r.len());
+    }
+    n
+}
+
 /// 200 keys of table `t` for a multi-get shape: contiguous from a random row, or spread.
 fn multi_get_keys(rng: &mut Rng, dense: bool) -> KeySet {
     if dense {
@@ -495,6 +534,8 @@ fn main() {
                 }
                 "wide-row-cells" => shape_wide_cells(w.as_ref().expect("built above")),
                 "wide-row-pages" => shape_wide_pages(w.as_ref().expect("built above")),
+                "scan-budget" => shape_scan_budget(&t, &mut rng),
+                "scan-budget-twin" => shape_scan_budget_twin(&t, &mut rng),
                 "multi-get-dense" | "multi-get-sparse" => {
                     let keys = multi_get_keys(&mut rng, shape == "multi-get-dense");
                     shape_multi_get(&t, &keys)
