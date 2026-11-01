@@ -2157,6 +2157,61 @@ impl Nearest<'_> {
     /// Runs the search: at most `k` neighbours, nearest first. The read must name exactly
     /// one family, a vector family, and the query must fit it (`InvalidArgument`).
     pub fn run(mut self) -> Result<Vec<Neighbour>> {
+        let Some(go) = self.start()? else {
+            return Ok(Vec::new());
+        };
+        let core: &TableCore = &self.core;
+        let (k, skips) = (self.k, Arc::new(KnnSkips::default()));
+        let reduced = core.with(|e| {
+            e.reduce(
+                &go.snapshot,
+                core.info.id,
+                &go.spec,
+                || KnnVisitor::typed(go.prepared.clone(), Arc::clone(&skips)),
+                || TopK::new(k),
+            )
+        })?;
+        Ok(neighbours(reduced.items))
+    }
+
+    /// [`Nearest::run`] as a future that never blocks on a block it can fetch: the input is
+    /// read on the polling task (rows positioned from the block cache, with the blocks they
+    /// and the next rows need fetched asynchronously), and a poll yields after 4,096 cells,
+    /// so a wide row (an IVF list) never holds the executor's thread for long. A row's cells
+    /// past its first block are read synchronously where the cache misses. It never fans out
+    /// ([`parallel`](Nearest::parallel) is ignored); the result equals `run`'s.
+    ///
+    /// ```
+    /// use pigeonhole::{Element, Family, Metric, Options, Pigeonhole, VectorSpec};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let spec = VectorSpec::new(2, Element::F32, Metric::L2)?;
+    /// let t = db.table("docs")?.family("emb", Family::vector(spec)).create_if_missing()?;
+    /// t.mutate(b"a").put_vector_f32("emb", b"", &[0.0, 1.0]).commit()?;
+    /// let search = t.scan_prefix(b"").family("emb").nearest_f32(&[0.0, 0.9], 1);
+    /// let near = pigeonhole::doc_support::block_on(search.run_async())?;
+    /// assert_eq!(near[0].row, b"a");
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[cfg(feature = "async")]
+    pub async fn run_async(mut self) -> Result<Vec<Neighbour>> {
+        let Some(go) = self.start()? else {
+            return Ok(Vec::new());
+        };
+        let core: &TableCore = &self.core;
+        let k = self.k;
+        let pending =
+            core.with(|e| e.nearest_async(&go.snapshot, core.info.id, &go.spec, go.prepared, k))?;
+        Ok(neighbours(pending.await?))
+    }
+
+    /// The checks, the snapshot, the prepared query and the engine's spec; `None` for
+    /// `k == 0` once the arguments are checked.
+    fn start(&mut self) -> Result<Option<Started>> {
         let invalid = |m: String| crate::Error::new(crate::ErrorCode::InvalidArgument, m);
         if self.sel.ends.len() != 1 {
             return Err(invalid(
@@ -2182,13 +2237,12 @@ impl Nearest<'_> {
             .then(|| pigeonhole_format::vector::Params::parse(&options.kind_params).ok())
             .flatten()
             .ok_or_else(|| invalid(format!("family {name:?} is not a vector family")))?;
-        let skips = Arc::new(KnnSkips::default());
         // Checked and prepared once (the query's norm too); every group's visitor shares it.
         let prepared = params
             .prepare(self.query.clone())
             .map_err(|e| invalid(format!("family {name:?}: the query: {e}")))?;
         if self.k == 0 {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         let keys = matches!(self.input, NearestInput::Keys(_));
         let input = match std::mem::replace(&mut self.input, NearestInput::Keys(Arc::default())) {
@@ -2205,25 +2259,32 @@ impl Nearest<'_> {
             // A key set's floor counts keys; an IVF query reads a few wide rows (#490 D).
             spec.parallel_floor = 0;
         }
-        let k = self.k;
-        let reduced = core.with(|e| {
-            e.reduce(
-                &snapshot,
-                core.info.id,
-                &spec,
-                || KnnVisitor::typed(prepared.clone(), Arc::clone(&skips)),
-                || TopK::new(k),
-            )
-        })?;
-        Ok(reduced
-            .items
-            .into_iter()
-            .map(|(cell, score)| Neighbour {
-                row: cell.row,
-                qualifier: cell.qualifier,
-                distance: score.0,
-                ts: cell.ts,
-            })
-            .collect())
+        Ok(Some(Started {
+            snapshot,
+            spec,
+            prepared,
+        }))
     }
+}
+
+/// What [`Nearest::start`] hands a run.
+struct Started {
+    snapshot: pigeonhole_engine::Snapshot,
+    spec: ReduceSpec,
+    prepared: pigeonhole_format::vector::Prepared,
+}
+
+/// A ranking's cells as neighbours.
+fn neighbours(
+    items: Vec<(pigeonhole_engine::CellKey, pigeonhole_engine::Score)>,
+) -> Vec<Neighbour> {
+    items
+        .into_iter()
+        .map(|(cell, score)| Neighbour {
+            row: cell.row,
+            qualifier: cell.qualifier,
+            distance: score.0,
+            ts: cell.ts,
+        })
+        .collect()
 }

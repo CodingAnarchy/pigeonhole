@@ -17,7 +17,7 @@ use pigeonhole_format::value::{ValueRef, decode_value};
 use pigeonhole_format::vector::Prepared;
 use pigeonhole_format::{FamilyId, Timestamp};
 
-use super::reduce::{CellVisitor, Visit};
+use super::reduce::{CellVisitor, TopK, Visit};
 
 /// How a distance is measured. Smaller is nearer for every metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +200,185 @@ impl CellVisitor for KnnVisitor {
                 Visit::Skip
             }
             Some(d) => Visit::Emit(Score(d)),
+        }
+    }
+}
+
+/// Cells an async nearest-neighbour search reads in one poll before it yields, as an async
+/// traversal does ([`TRAVERSE_POLL_CELLS`](crate::TRAVERSE_POLL_CELLS)).
+pub const NEAREST_POLL_CELLS: u32 = 4_096;
+
+/// What an async search reads.
+enum Source {
+    /// A range, through an async scan ([`ScanCursor::poll_next_row`]).
+    Scan(super::ScanCursor),
+    /// A key set, through a multi-get cursor ([`KeyCursor::poll_next_key`]).
+    Keys {
+        cursor: super::keys::KeyCursor,
+        keys: Arc<super::keys::KeySet>,
+    },
+}
+
+/// An async exact nearest-neighbour search
+/// ([`Engine::nearest_async`](crate::Engine::nearest_async), D296): the `k` nearest
+/// vectors of one vector family over a range or a key set, read on the polling task (rows
+/// positioned from the cache, their blocks fetched asynchronously) and scored inline with
+/// a prepared query. It never fans out; one `TopK` over the input in order gives the sync
+/// read's result. A poll yields after [`NEAREST_POLL_CELLS`] cells, so a wide row never
+/// holds the executor; a row's cells past its first block are read synchronously where the
+/// cache misses (counted in `async_sync_reads`). Dropping it releases its pins and its
+/// snapshot.
+#[must_use = "a future does nothing unless polled"]
+pub struct PendingNearest {
+    source: Source,
+    visitor: KnnVisitor,
+    top: TopK<Score>,
+    /// The row being read, if one is.
+    row: Option<Vec<u8>>,
+    done: bool,
+}
+
+impl std::fmt::Debug for PendingNearest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingNearest")
+            .field("reading", &self.row.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingNearest {
+    pub(crate) fn scan(cursor: super::ScanCursor, query: Prepared, k: usize) -> Self {
+        Self::with(Source::Scan(cursor), query, k)
+    }
+
+    pub(crate) fn keys(
+        cursor: super::keys::KeyCursor,
+        keys: Arc<super::keys::KeySet>,
+        query: Prepared,
+        k: usize,
+    ) -> Self {
+        Self::with(Source::Keys { cursor, keys }, query, k)
+    }
+
+    fn with(source: Source, query: Prepared, k: usize) -> Self {
+        Self {
+            source,
+            visitor: KnnVisitor::typed(query, Arc::new(KnnSkips::default())),
+            top: TopK::new(k),
+            row: None,
+            done: false,
+        }
+    }
+
+    fn step(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<crate::Result<()>> {
+        use std::task::Poll;
+        let mut budget = NEAREST_POLL_CELLS;
+        loop {
+            if self.row.is_none() {
+                let next = match &mut self.source {
+                    Source::Scan(c) => match c.poll_next_row(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(r) => r?.then(|| c.row().to_vec()),
+                    },
+                    Source::Keys { cursor, keys } => match cursor.poll_next_key(cx) {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(r) => r?.map(|i| keys.get(i).to_vec()),
+                    },
+                };
+                match next {
+                    Some(row) => self.row = Some(row),
+                    None => return Poll::Ready(Ok(())),
+                }
+            }
+            let row = self.row.as_deref().expect("set above");
+            let (visitor, top) = (&mut self.visitor, &mut self.top);
+            let ended = match &mut self.source {
+                Source::Scan(c) => c.counted(|c| read_row(c, row, &mut budget, visitor, top)),
+                Source::Keys { cursor, .. } => {
+                    cursor.counted(|c| read_row(c, row, &mut budget, visitor, top))
+                }
+            }?;
+            if ended {
+                self.row = None;
+            } else {
+                // The budget ran out mid-row: yield, keeping the row's place.
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+        }
+    }
+}
+
+/// A cursor that lends the current row's cells one at a time.
+trait RowCells {
+    fn next_cell(&mut self) -> crate::Result<Option<super::ScanCell<'_>>>;
+}
+
+impl RowCells for super::ScanCursor {
+    fn next_cell(&mut self) -> crate::Result<Option<super::ScanCell<'_>>> {
+        super::ScanCursor::next_cell(self)
+    }
+}
+
+impl RowCells for super::keys::KeyCursor {
+    fn next_cell(&mut self) -> crate::Result<Option<super::ScanCell<'_>>> {
+        super::keys::KeyCursor::next_cell(self)
+    }
+}
+
+/// Scores the current row's cells into `top` within `budget` cells: whether the row ended.
+fn read_row(
+    cells: &mut impl RowCells,
+    row: &[u8],
+    budget: &mut u32,
+    visitor: &mut KnnVisitor,
+    top: &mut TopK<Score>,
+) -> crate::Result<bool> {
+    use super::reduce::{CellRef, Reducer};
+    loop {
+        if *budget == 0 {
+            return Ok(false);
+        }
+        let Some(c) = cells.next_cell()? else {
+            return Ok(true);
+        };
+        *budget -= 1;
+        if let Visit::Emit(score) = visitor.visit(row, c.family, c.qualifier, c.ts, c.stored) {
+            let cell = CellRef {
+                row,
+                family_rank: 0,
+                family: c.family,
+                qualifier: c.qualifier,
+                ts: c.ts,
+            };
+            let _ = top.push(cell, score);
+        }
+    }
+}
+
+impl std::future::Future for PendingNearest {
+    type Output = crate::Result<Vec<(super::reduce::CellKey, Score)>>;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        use super::reduce::Reducer;
+        use std::task::Poll;
+        let _poll = pigeonhole_io::async_poll_scope();
+        let this = self.get_mut();
+        if this.done {
+            return Poll::Ready(Err(crate::Error::InvalidArgument(
+                "a search polled after it resolved".to_owned(),
+            )));
+        }
+        match this.step(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(r) => {
+                this.done = true;
+                this.row = None;
+                Poll::Ready(r.map(|()| std::mem::replace(&mut this.top, TopK::new(0)).finish()))
+            }
         }
     }
 }

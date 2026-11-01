@@ -448,3 +448,182 @@ fn owned_vectors_score_as_stored_ones() {
     }
     db.close().expect("close");
 }
+
+/// Polls `fut` to completion with a no-op waker: its output, and how often it was `Pending`.
+#[cfg(feature = "async")]
+fn poll_counting<F: std::future::Future>(fut: F) -> (F::Output, usize) {
+    use std::task::{Context, Poll, Waker};
+    let mut fut = std::pin::pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    let mut pending = 0;
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => return (r, pending),
+            Poll::Pending => pending += 1,
+        }
+        assert!(pending < 1_000_000, "never finished");
+    }
+}
+
+/// `run_async` gives `run`'s neighbours from a cold block cache (a reopen, so its rows'
+/// blocks are fetched), for every element, over a scan and a key set.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_search_returns_what_the_sync_one_returns() {
+    let (dir, db, t) = open();
+    let rows: Vec<Vec<u8>> = (0..400u32)
+        .map(|i| format!("r{i:04}").into_bytes())
+        .collect();
+    for (i, row) in rows.iter().enumerate() {
+        let i = i as u32;
+        t.mutate(row)
+            .put_vector_f32("f", b"", &f32s(i))
+            .put_vector_i8("q", b"", &[(i % 7) as i8, -((i % 5) as i8), 3, 1])
+            .put_vector_bits("b", b"", &((i % 37) as u16).to_le_bytes())
+            .commit()
+            .expect("put");
+    }
+    db.flush().expect("flush");
+    drop(t);
+    db.close().expect("close");
+    let qf = [0.5f32, -1.0, 2.0, 0.25, 3.0, -2.5, 1.5, 0.75];
+    let qi = [2i8, -1, 3, 0];
+    let qb = 0b1010_0101_0011_1100u16.to_le_bytes();
+    let some = KeySet::from_unsorted(rows.iter().step_by(3));
+    for k in [1usize, 25, 1000] {
+        let db =
+            Pigeonhole::open(dir.join("v.phdb"), Options::default().shards(2)).expect("reopen");
+        let t = db.table("v").expect("table").open().expect("open");
+        let want = t
+            .scan_prefix(b"")
+            .family("f")
+            .nearest_f32(&qf, k)
+            .run()
+            .unwrap();
+        let got = pigeonhole::doc_support::block_on(
+            t.scan_prefix(b"")
+                .family("f")
+                .nearest_f32(&qf, k)
+                .run_async(),
+        )
+        .unwrap();
+        assert_eq!(got, want, "f32 k={k}");
+        let want = t
+            .scan_prefix(b"")
+            .family("q")
+            .nearest_i8(&qi, k)
+            .run()
+            .unwrap();
+        let got = pigeonhole::doc_support::block_on(
+            t.scan_prefix(b"")
+                .family("q")
+                .nearest_i8(&qi, k)
+                .run_async(),
+        )
+        .unwrap();
+        assert_eq!(got, want, "i8 k={k}");
+        let want = t
+            .keys(&some)
+            .family("b")
+            .nearest_bits(&qb, k)
+            .run()
+            .unwrap();
+        let got = pigeonhole::doc_support::block_on(
+            t.keys(&some).family("b").nearest_bits(&qb, k).run_async(),
+        )
+        .unwrap();
+        assert_eq!(got, want, "bits over keys k={k}");
+        drop(t);
+        db.close().expect("close");
+    }
+}
+
+/// A poll reads at most 4,096 cells, then yields: one row of 10,000 vectors (an IVF list's
+/// shape) takes at least three polls, every block cached, and gives `run`'s result.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_search_yields_within_a_wide_row() {
+    let (_dir, db, t) = open();
+    for chunk in (0..10_000u32).collect::<Vec<_>>().chunks(1_000) {
+        let mut m = t.mutate(b"list");
+        for &i in chunk {
+            m = m.put_vector_f32("f", format!("id{i:05}").as_bytes(), &f32s(i));
+        }
+        m.commit().expect("put");
+    }
+    db.flush().expect("flush");
+    let q = [1.0f32; 8];
+    let list = KeySet::from_unsorted([b"list"]);
+    let want = t.keys(&list).family("f").nearest_f32(&q, 10).run().unwrap();
+    // Warm the cache, then count polls.
+    let _ = pigeonhole::doc_support::block_on(
+        t.keys(&list).family("f").nearest_f32(&q, 10).run_async(),
+    );
+    let (got, pending) = poll_counting(t.keys(&list).family("f").nearest_f32(&q, 10).run_async());
+    assert_eq!(got.unwrap(), want);
+    assert!(pending >= 2, "{pending} yields over 10,000 cells");
+    db.close().expect("close");
+}
+
+/// `run_async`'s future is `Send`, so a multi-threaded executor can run it (compile-time).
+#[cfg(feature = "async")]
+#[allow(dead_code)]
+fn run_async_is_send(t: &Table, keys: &KeySet) {
+    fn send<T: Send>(_: T) {}
+    send(
+        t.keys(keys)
+            .family("f")
+            .nearest_f32(&[1.0; 8], 3)
+            .run_async(),
+    );
+    send(
+        t.scan_prefix(b"")
+            .family("f")
+            .nearest_f32(&[1.0; 8], 3)
+            .run_async(),
+    );
+}
+
+/// Dropping an async search between a `Pending` and its next poll releases what it holds:
+/// the database flushes, compacts, searches and closes after.
+#[cfg(feature = "async")]
+#[test]
+fn a_dropped_async_search_releases_what_it_holds() {
+    use std::task::{Context, Poll, Waker};
+    let (_dir, db, t) = open();
+    for chunk in (0..10_000u32).collect::<Vec<_>>().chunks(1_000) {
+        let mut m = t.mutate(b"list");
+        for &i in chunk {
+            m = m.put_vector_f32("f", format!("id{i:05}").as_bytes(), &f32s(i));
+        }
+        m.commit().expect("put");
+    }
+    db.flush().expect("flush");
+    let list = KeySet::from_unsorted([b"list"]);
+    {
+        let mut fut = std::pin::pin!(
+            t.keys(&list)
+                .family("f")
+                .nearest_f32(&[1.0; 8], 5)
+                .run_async()
+        );
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(
+            matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+            "a 10,000-cell row yields"
+        );
+    }
+    db.flush().expect("flush after the drop");
+    db.compact().expect("compact after the drop");
+    assert_eq!(
+        t.keys(&list)
+            .family("f")
+            .nearest_f32(&[1.0; 8], 5)
+            .run()
+            .unwrap()
+            .len(),
+        5
+    );
+    drop(t);
+    db.close().expect("close after the drop");
+}
