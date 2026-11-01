@@ -794,10 +794,14 @@ fn close_reports_a_failed_final_sync(seed: u64) {
         // #1265 (seen once on x86 CI): say which way the close returned `Ok`. Shards whose
         // `closed()` reports `Err` mean `close()` didn't wait for them (an application-owned
         // close waits only when every shard is driven elsewhere); shards reporting `Ok`
-        // mean their final syncs succeeded with the gate armed, a durability bug.
-        let outcomes: Vec<_> = drivers
+        // mean their final syncs succeeded with the gate armed, a durability bug. A driver
+        // that never sees `closed()` is reported as such (route (a) too), not waited on.
+        let outcomes: Vec<String> = drivers
             .into_iter()
-            .map(|(_, h)| h.join().unwrap())
+            .map(|(_, h)| match gate::within(10, move || h.join().unwrap()) {
+                Some(outcome) => format!("{outcome:?}"),
+                None => "never closed (10 s)".to_owned(),
+            })
             .collect();
         panic!(
             "a failed close reported Ok; the shards' closed(): {outcomes:?}; failure: {:?}",
