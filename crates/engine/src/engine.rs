@@ -2524,6 +2524,15 @@ impl Engine {
                 "a nearest-neighbour search reads exactly one family".into(),
             ));
         }
+        // With one version per cell, the read's value predicate tests the version the visitor
+        // sees (D22), so the search tests it itself, before the visitor, where its misses
+        // count toward the poll budget (#1237's rule).
+        let mut read = spec.read.clone();
+        read.versions = 1;
+        let filter = read
+            .value
+            .take()
+            .map(|p| (p, Arc::clone(&snapshot.view.ssts)));
         Ok(match &spec.input {
             crate::ReadInput::Ranges(ranges) => {
                 let [(lo, hi)] = ranges.as_slice() else {
@@ -2532,21 +2541,21 @@ impl Engine {
                     ));
                 };
                 let mut scan = ScanSpec::new(lo.clone(), hi.clone());
-                scan.read = spec.read.clone();
+                scan.read = read;
                 let cursor = self.scan_async(snapshot, table, scan)?;
-                read::knn::PendingNearest::scan(cursor, query, k)
+                read::knn::PendingNearest::scan(cursor, query, k, filter)
             }
             crate::ReadInput::Keys(keys) => {
                 let cursor = crate::KeyCursor::over(
                     snapshot.clone(),
                     table,
                     families.into_vec(),
-                    spec.read.clone(),
+                    read,
                     self.inner.shared.vfs.now_micros(),
                     Arc::clone(keys),
                     Arc::clone(&self.inner.shared),
                 )?;
-                read::knn::PendingNearest::keys(cursor, Arc::clone(keys), query, k)
+                read::knn::PendingNearest::keys(cursor, Arc::clone(keys), query, k, filter)
             }
         })
     }

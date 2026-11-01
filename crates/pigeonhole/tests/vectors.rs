@@ -8,7 +8,7 @@
 
 use pigeonhole::{
     Element, ErrorCode, Family, KeySet, Metric, Neighbour, Options, Pigeonhole, Table, Value,
-    Vector, VectorSpec,
+    ValueFilter, Vector, VectorSpec,
 };
 
 fn open() -> (pigeonhole::doc_support::TempDir, Pigeonhole, Table) {
@@ -494,19 +494,24 @@ fn an_async_search_returns_what_the_sync_one_returns() {
         let db =
             Pigeonhole::open(dir.join("v.phdb"), Options::default().shards(2)).expect("reopen");
         let t = db.table("v").expect("table").open().expect("open");
+        // First, from the cold cache: the async path waits on its fetches at least once.
+        let (got, pending) = poll_counting(
+            t.scan_prefix(b"")
+                .family("f")
+                .nearest_f32(&qf, k)
+                .run_async(),
+        );
+        let got = got.unwrap();
+        assert!(
+            pending > 0,
+            "k={k}: a cold search went Pending on its fetches"
+        );
         let want = t
             .scan_prefix(b"")
             .family("f")
             .nearest_f32(&qf, k)
             .run()
             .unwrap();
-        let got = pigeonhole::doc_support::block_on(
-            t.scan_prefix(b"")
-                .family("f")
-                .nearest_f32(&qf, k)
-                .run_async(),
-        )
-        .unwrap();
         assert_eq!(got, want, "f32 k={k}");
         let want = t
             .scan_prefix(b"")
@@ -626,4 +631,46 @@ fn a_dropped_async_search_releases_what_it_holds() {
     );
     drop(t);
     db.close().expect("close after the drop");
+}
+
+/// perf287's S1 on #1269 (#1237's rule): a value filter's misses count toward the poll
+/// budget. One row of 10,000 vectors, of which 1% pass the filter (a value-equality on the
+/// vector's bytes), still takes several polls, and gives `run`'s result.
+#[cfg(feature = "async")]
+#[test]
+fn an_async_search_yields_over_filtered_cells() {
+    let (_dir, db, t) = open();
+    let kept = [1.0f32; 8];
+    for chunk in (0..10_000u32).collect::<Vec<_>>().chunks(1_000) {
+        let mut m = t.mutate(b"list");
+        for &i in chunk {
+            let v = if i % 100 == 0 { kept.to_vec() } else { f32s(i) };
+            m = m.put_vector_f32("f", format!("id{i:05}").as_bytes(), &v);
+        }
+        m.commit().expect("put");
+    }
+    db.flush().expect("flush");
+    // The filter compares a vector cell's value: element, dimension, payload.
+    let value = t
+        .get(b"list", "f", b"id00000")
+        .expect("get")
+        .expect("written");
+    let only_kept = || ValueFilter::Equals(value.value().to_vec());
+    let list = KeySet::from_unsorted([b"list"]);
+    let search = || {
+        t.keys(&list)
+            .family("f")
+            .value_filter(only_kept())
+            .nearest_f32(&[0.5; 8], 5)
+    };
+    let want = search().run().unwrap();
+    assert_eq!(want.len(), 5);
+    assert!(want.iter().all(|n| n.qualifier.ends_with(b"00")));
+    let (got, pending) = poll_counting(search().run_async());
+    assert_eq!(got.unwrap(), want);
+    assert!(
+        pending >= 2,
+        "{pending} yields over 10,000 cells, 9,900 filtered out"
+    );
+    db.close().expect("close");
 }
