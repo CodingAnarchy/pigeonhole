@@ -3598,3 +3598,49 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
     - The traversal check reads `adj` on half the model seqnos (bit 4, independent of the limits' bits 0–3) and the get's family on the rest, so counter, TTL and versioned families keep their coverage. On the async front door it goes through `run_async`.
     - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
 
+
+<a id="d306"></a>
+## D306 — An IVF vector index in `pigeonhole-vector`: lists as wide rows, moves as transactions, rebalancing inside the writes (perf287, 2026-10-31; owner accepted revision 4, #490 c6548019940 with revs c6548079840, c6548105943, c6548115678, c6548128553, decision c6548492501; reviewed by cli692 and simp724; vector, #490 D, ICR 0100; on D296, D299 and D303)
+**Why.** An exact `nearest_*` (D296) reads every candidate, which a collection of millions can't do within an interactive budget. The target is 95% recall@10 on SIFT1M at ≤10 ms, single-threaded. An inverted-file index narrows a query to the few lists nearest it. Built from ordinary rows and transactions, it is as durable and consistent as the database and needs nothing new in the engine.
+
+**Decided.**
+- **A companion crate, `pigeonhole-vector`,** on the public 1.x line (D295), depending on `pigeonhole` only.
+- **Layout:** one table per index.
+  - `L{scramble(list)}`: a list, one wide row of the index's vector family, one column per id. The `u32` scramble spreads consecutive lists across tablets, so a parallel search fans out over them.
+  - `C{list}`: the centroid and its version (`cen`, `meta:v`).
+  - `M{id}`: the id's list.
+  - `N{list}`: a counter, the list's length.
+  - `G`: the layout version, the next list id and the options.
+  - Centroids are `f32` vectors (normalised under cosine), or majority bit vectors with ties going to 0, so D303 never refuses one.
+  - A list row stays at most 4 MiB: the target length scales down for large vectors.
+- **Search:**
+  1. Read `G:layout` at one snapshot and use the cached centroids of that layout, or load them.
+  2. Pick the `nprobe` nearest centroids in memory.
+  3. Run `KeysRead::nearest_*(q, k)` over those list rows (D296 PR 4, D299).
+
+  Every distance the crate computes is `VectorSpec`'s, so a search that probes every list equals an exact search.
+- **Writes** are optimistic transactions with stated read sets (rev 3's table).
+  - **An insert or delete** reads `M{id}` and the versions of the lists it writes, never `N` or `G`. A list read as absent means reload the centroids and place again, and it is never written (M1).
+  - **An upsert within its list** writes the vector only (M2).
+- **Rebalancing:**
+  - **Split:** a list is split when its length is above `2 × target`, checked after each write into it.
+    - Phase 1 runs 2-means on a snapshot read. It is seeded by farthest points, deterministic, and balanced so each side keeps at least the merge bound.
+    - One transaction then moves what its own per-cell reads return (rev 4 N1).
+    - Phase 2 (LIRE) reassigns the nearest `r` neighbours' vectors, one transaction per neighbour, and bumps the neighbour's version.
+  - **Merge:** a list below `target / 4`, unless it is the only list, merges into its nearest neighbour, in one transaction that reads the list row whole.
+  - **Concurrency:** an in-process in-flight set keeps a list's split or merge to one thread. Across processes, the loser re-checks the length before retrying (S2).
+- **Crashes:** `Index::open` scans the `N` rows and queues every list outside its bounds, and the next write rebalances them (M3).
+- **Background mode** (owner, §6.4): a crate-owned `Rebalancer`, run by the application in application-owned mode, and by a crate thread in engine-owned mode. There is no engine hook. It ships in PR 2.
+- **PRs:**
+  1. The index, inline rebalancing, the model and race tests.
+  2. `bulk_load` and the `Rebalancer`.
+  3. The AX102 measurements, the defaults and `docs/guide/vectors.md`.
+
+**PR 1 (#490 D).**
+- **Tests:**
+  - **Model:** a seeded model of inserts, upserts, deletes and searches over every element type and metric (3 seeds × 5 specs × 400 operations). After every operation, `verify` agrees, the index holds exactly the model's vectors, and every list is within its bounds. A search with every list probed equals a brute force by `VectorSpec`'s distances.
+  - **Snapshots and reopening:** a reopen keeps the vectors and options, and a search at an older snapshot sees the index as of it.
+  - **Concurrency:** a stale handle's inserts never write a merged-away list (M1), and 8 threads inserting into one splitting list lose and duplicate nothing.
+  - **Recall:** recall@10 on 4,000 vectors in 200 overlapping clusters is pinned at 0.94 (0.966 measured, nprobe 8 of 94 lists).
+  - **Hold seams** (`__unstable-hooks`, ICR 0085's convention): a delete and an in-place update between a split's snapshot read and its transaction (N1), and a crash between a write and its rebalance, healed after the reopen (M3).
+- **Not in PR 1:** `search_*_async`. It waits for `nearest_*_async`, which follows #1259.
