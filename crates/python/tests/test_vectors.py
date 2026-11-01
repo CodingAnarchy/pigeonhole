@@ -27,7 +27,7 @@ def test_a_vector_family_stores_its_spec(t):
     assert t.family_info("plain").vector is None
     assert ph.VectorSpec(8, ph.Element.I8, ph.Metric.INNER_PRODUCT).dim == 8
     with pytest.raises(ValueError):
-        ph.Family.vector(4, "f16", "l2")
+        ph.Family.vector(4, "f64", "l2")
 
 
 def test_vectors_round_trip_from_sequences_and_buffers(db, t):
@@ -122,3 +122,39 @@ def test_nearest_equals_a_brute_force_over_a_range_or_keys(db):
         t.nearest("emb", b"\x00" * 32, 1)
     # Neighbours compare by value.
     assert t.nearest("emb", query, 2) == got[:2]
+
+
+def test_half_precision_families_round_and_widen_through_f32(db):
+    """#1263: f16 and bf16 families take f32 numbers (rounded to nearest-even), read back
+    widened to array('f'), and rank as the widened vectors in an f32 family do."""
+    t = (
+        db.table("h")
+        .family("h16", ph.Family.vector(4, ph.Element.F16, ph.Metric.L2))
+        .family("hb", ph.Family.vector(4, "bf16", "cosine"))
+        .family("w", ph.Family.vector(4, ph.Element.F32, ph.Metric.L2))
+        .create()
+    )
+    assert t.family_info("h16").vector.element == "f16"
+    assert t.family_info("hb").vector.element == "bf16"
+    # Exactly representable in both: stored and read back unchanged.
+    exact = [1.5, -0.25, 3.0, 0.0]
+    t.mutate(b"a").put_vector("h16", b"", exact).put_vector("hb", b"", exact).commit()
+    assert t.get(b"a", "h16", b"").as_vector() == array.array("f", exact)
+    assert t.get(b"a", "hb", b"").as_vector() == array.array("f", exact)
+    # 1 + 2**-11 is the midpoint between 1 and f16's next value: ties to even (1.0).
+    t.mutate(b"b").put_vector("h16", b"", [1 + 2**-11, 1, 1, 1]).commit()
+    assert t.get(b"b", "h16", b"").as_vector()[0] == 1.0
+    # 65,520 overflows f16 (its largest is 65,504), and bf16's range is f32's.
+    with pytest.raises(ph.Error):
+        t.mutate(b"c").put_vector("h16", b"", [65520.0, 0, 0, 0]).commit()
+    t.mutate(b"c").put_vector("hb", b"", [65520.0, 1, 0, 0]).commit()
+    # A half family ranks as the widened vectors would in an f32 family.
+    rows = [[float(i), float(i % 3), -float(i), 0.5] for i in range(20)]
+    for i, v in enumerate(rows):
+        t.mutate(b"r%02d" % i).put_vector("h16", b"", v).commit()
+        widened = t.get(b"r%02d" % i, "h16", b"").as_vector()
+        t.mutate(b"r%02d" % i).put_vector("w", b"", widened).commit()
+    q = [3.3, 1.1, -2.9, 0.4]
+    got = t.nearest("h16", q, 5, prefix=b"r")
+    want = t.nearest("w", q, 5, prefix=b"r")
+    assert [(n.row, n.distance) for n in got] == [(n.row, n.distance) for n in want]

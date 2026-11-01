@@ -22,6 +22,7 @@ pub mod distance;
 pub mod error;
 pub mod exact;
 pub mod filter;
+pub mod half;
 pub mod hash;
 pub mod hll;
 pub mod ids;

@@ -83,6 +83,7 @@ serde_json = { version = "1", features = ["preserve_order"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_Threading"] }
 # Dev-only.
 proptest = "1"
+half = { version = "2.7", default-features = false }
 loom = "0.7"
 criterion = "0.8"
 rustix = { version = "1", default-features = false, features = ["std", "time"] }

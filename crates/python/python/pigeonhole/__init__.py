@@ -31,6 +31,11 @@ class Element(_enum.StrEnum):
     """Signed bytes."""
     BIT = "bit"
     """Packed bits (Hamming distance)."""
+    F16 = "f16"
+    """IEEE half-precision floats: written as f32 (rounded to nearest-even), read back
+    widened to f32."""
+    BF16 = "bf16"
+    """bfloat16: written as f32 (rounded to nearest-even), read back widened to f32."""
 
 
 class Metric(_enum.StrEnum):

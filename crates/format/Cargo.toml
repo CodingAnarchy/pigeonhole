@@ -20,6 +20,7 @@ zstd = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+half = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]

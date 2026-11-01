@@ -15,8 +15,10 @@ pub(crate) fn element(ob: &Bound<'_, PyAny>) -> PyResult<Element> {
         "f32" => Ok(Element::F32),
         "i8" => Ok(Element::I8),
         "bit" => Ok(Element::Bit),
+        "f16" => Ok(Element::F16),
+        "bf16" => Ok(Element::BF16),
         other => Err(PyValueError::new_err(format!(
-            "unknown vector element {other:?} (f32, i8 or bit)"
+            "unknown vector element {other:?} (f32, i8, bit, f16 or bf16)"
         ))),
     }
 }
@@ -39,6 +41,8 @@ fn element_name(e: Element) -> &'static str {
         Element::F32 => "f32",
         Element::I8 => "i8",
         Element::Bit => "bit",
+        Element::F16 => "f16",
+        Element::BF16 => "bf16",
         _ => "unknown",
     }
 }
@@ -70,7 +74,7 @@ impl VectorSpec {
 
 #[pymethods]
 impl VectorSpec {
-    /// A spec: `dim` elements of `element` (`Element.F32`, `I8` or `BIT`), compared by
+    /// A spec: `dim` elements of `element` (`Element.F32`, `I8`, `BIT`, `F16` or `BF16`), compared by
     /// `metric` (`Metric.L2`, `COSINE`, `INNER_PRODUCT` or `HAMMING`).
     #[new]
     fn new(dim: u32, element: &Bound<'_, PyAny>, metric: &Bound<'_, PyAny>) -> PyResult<Self> {
@@ -119,9 +123,11 @@ pub(crate) enum Vector {
 ///   a `float64` buffer (NumPy's default dtype; narrowed to `f32`), or a sequence of numbers;
 /// - `I8`: an `int8` buffer or a sequence of ints;
 /// - `Bit`: the packed bits, bytes-like;
-/// - an element this build doesn't name (a half-precision family a newer `pigeonhole`
-///   adds): read as `F32`, which `put_vector_f32` and `nearest_f32` round to the family's
-///   element.
+/// - `F16`, `BF16` (#1263): read as `F32`, as above. `put_vector_f32` rounds each component
+///   to the family's element (nearest, ties to even; an overflow is refused), and
+///   `nearest_f32` takes the query as `f32`. A NumPy `float16` array goes through the
+///   sequence path, and its values convert back exactly;
+/// - an element this build doesn't name: read as `F32` too.
 ///
 /// A bytes-like object is refused for `F32` and `I8` (cli692's S2 on #1276): `bytes` is a
 /// sequence of ints in Python, so it would otherwise be stored as one element per byte.
@@ -141,7 +147,8 @@ pub(crate) fn vector(ob: &Bound<'_, PyAny>, element: Element) -> PyResult<Vector
         Element::Bit => Ok(Vector::Bits(crate::convert::bytes(ob).map_err(|_| {
             PyTypeError::new_err("a bit vector is its packed bits, bytes-like")
         })?)),
-        // F32, and any element this build doesn't name.
+        // F32, F16 and BF16 (all written and queried as f32), and any element this build
+        // doesn't name.
         _ => {
             if let Ok(b) = PyBuffer::<f32>::get(ob) {
                 return Ok(Vector::F32(b.to_vec(py)?));
@@ -179,8 +186,9 @@ fn refuse_bytes(ob: &Bound<'_, PyAny>, want: &str) -> PyResult<()> {
 }
 
 /// A vector cell as Python: `array.array('f')` (f32) or `array.array('b')` (i8), buffers
-/// NumPy wraps without a copy (`numpy.frombuffer`); the packed bits as `bytes`; and an
-/// element this build doesn't name (half precision) widened exactly to `array.array('f')`.
+/// NumPy wraps without a copy (`numpy.frombuffer`); the packed bits as `bytes`; and `f16` or
+/// `bf16` (#1263), or an element this build doesn't name, widened exactly to
+/// `array.array('f')` (`array` has no half-precision typecode).
 pub(crate) fn to_py<'py>(
     py: Python<'py>,
     v: pigeonhole::VectorRef<'_>,
