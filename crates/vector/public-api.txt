@@ -70,5 +70,6 @@ impl<'a> pigeonhole_vector::Search<'a>
 pub fn pigeonhole_vector::Search<'a>::nprobe(self, u32) -> Self
 pub fn pigeonhole_vector::Search<'a>::parallel(self, usize) -> Self
 pub fn pigeonhole_vector::Search<'a>::run(self) -> pigeonhole_vector::Result<alloc::vec::Vec<pigeonhole_vector::Hit>>
+pub async fn pigeonhole_vector::Search<'a>::run_async(self) -> pigeonhole_vector::Result<alloc::vec::Vec<pigeonhole_vector::Hit>>
 pub fn pigeonhole_vector::Search<'a>::snapshot(self, &'a pigeonhole::db::Snapshot) -> Self
 pub type pigeonhole_vector::Result<T> = core::result::Result<T, pigeonhole_vector::Error>
