@@ -1,0 +1,2 @@
+### Added
+- Byte-budgeted reads (D308, #1250): `Scan::read_within(bytes)` and `KeysRead::read_within(bytes)` return the longest prefix of the read's cells that fits a byte budget (each cell's qualifier, value and 16 bytes, each row's key once), as owned rows, with `next_bytes` when the budget cut the read and a `resume()` position (`ScanPosition`, `KeysPosition`, with stable bytes) for `resume_after`. `Traverse::byte_budget` bounds a traversal's nodes, with `TraverseStats::cut_by_budget`. For filling a context window or an API page without over-reading.

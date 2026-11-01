@@ -140,6 +140,52 @@ let page = t
 # Ok::<(), pigeonhole::Error>(())
 ```
 
+## Byte budgets
+`read_within(bytes)` returns as much of a scan, or a multi-get, as fits in `bytes` (D308): the longest prefix of the read's cells, in order, whose size fits. Use it to fill a fixed-size buffer, such as a page of an API response or a language model's context window, without over-reading and trimming.
+
+- **What counts:** each cell counts its qualifier, its value (as `CellRef::value` returns it) and 16 bytes, and each row counts its key once.
+  - A column, with all the versions the read selects, is taken whole or not at all.
+  - A row may be cut between columns.
+  - The size definition is stable, so a page is the same on every run and every release.
+- **Tokens:** the budget is bytes. Convert a token budget yourself, and leave a margin for your own framing: the JSON or prompt text the cells end up in.
+- **The page:**
+  - `rows()` are owned rows;
+  - `bytes()` is their size, never more than the budget;
+  - `cut_by_budget()` says whether the budget stopped the read;
+  - `resume()` is where to continue. It's `Some` whenever the read stopped before its input ended, by the budget or by `limit`, which applies too, whichever stops first.
+- **An item too big for the budget:** when the first column alone doesn't fit, the page is empty and cut. `next_bytes()` is that column's size, with its row key. Retry from the same `resume()` with at least that budget.
+- **Resuming:** `resume_after(&position)` continues a later read, also in another process (`ScanPosition::to_bytes`/`from_bytes`).
+  - It starts at the later of the range's start and the position, so a position past the range's end reads nothing.
+  - A multi-get's `KeysPosition` names the last key, not an index, so a key set rebuilt between pages resumes at the right key.
+  - Pass the same `snapshot` to every page for one consistent read.
+- **The cost:** the read runs inside the engine's bounded-read path, and reads about the budget plus one column. A traversal takes a budget too: `Traverse::byte_budget` ([graphs](graphs.md#traversal-hops-inside-the-engine)).
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let t = pigeonhole::doc_support::table(&db, "t", &["text"])?;
+# for i in 0..50u32 { t.mutate(format!("doc:{i:02}").as_bytes()).put("text", b"body", &[b'x'; 300]).commit()?; }
+let snap = db.snapshot()?;
+let mut at: Option<ScanPosition> = None;
+let mut docs = 0;
+loop {
+    let mut scan = t.scan_prefix(b"doc:").snapshot(&snap);
+    if let Some(p) = &at {
+        scan = scan.resume_after(p);
+    }
+    let page = scan.read_within(4096)?;        // about a thousand tokens of text
+    assert!(page.bytes() <= 4096);
+    docs += page.rows().len();
+    match page.resume() {
+        Some(p) => at = Some(p.clone()),
+        None => break,
+    }
+}
+assert_eq!(docs, 50);
+# Ok::<(), pigeonhole::Error>(())
+```
+
 ## Value predicates
 ```rust
 # use pigeonhole::*;

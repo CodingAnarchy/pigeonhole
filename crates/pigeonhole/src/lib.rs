@@ -174,8 +174,9 @@ pub use options::{
 /// A sorted set of distinct row keys, the input of [`Table::keys`] (D299).
 pub use pigeonhole_engine::KeySet;
 pub use read::{
-    Condition, Hop, KeyRows, KeysRead, Nearest, Neighbour, RowCells, RowIter, RowPages,
-    RowPosition, RowRead, Scan, ScanCells, Traversal, Traverse, TraverseStats, ValueFilter,
+    Condition, Hop, KeyRows, KeysPage, KeysPosition, KeysRead, Nearest, Neighbour, RowCells,
+    RowIter, RowPages, RowPosition, RowRead, Scan, ScanCells, ScanPage, ScanPosition, Traversal,
+    Traverse, TraverseStats, ValueFilter,
 };
 pub use recovery::RecoveryStats;
 pub use retry::RetryPolicy;

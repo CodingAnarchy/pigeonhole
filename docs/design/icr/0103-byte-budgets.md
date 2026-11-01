@@ -19,7 +19,24 @@
     - This holds for `traverse` and `traverse_async` alike.
   - The sequential reduce path pushes every group into one accumulator, so a `Break` ends the read (B2). Fanned-out reads keep D296 rev 1.2's per-group reducers.
 
-## PR 2: the public API (`pigeonhole`, under semver)
+## PR 2: the public API (`pigeonhole`, under semver), as built
+- **The pages:**
+  - `Scan::read_within(bytes) -> Result<ScanPage>` and `KeysRead::read_within(bytes) -> Result<KeysPage>`;
+  - each page has `rows()`, `into_rows()`, `bytes()`, `cut_by_budget()`, `next_bytes()` and `resume()`.
+- **The positions:**
+  - `ScanPosition` (`row()`) and `KeysPosition` (`key()`), each with `to_bytes`/`from_bytes`. The byte forms are versioned and tagged, so one kind's bytes are refused as the other's (`InvalidArgument`).
+  - `Scan::resume_after(&ScanPosition)` and `KeysRead::resume_after(&KeysPosition)`. Only `read_within` takes a position: `Scan::iter`/`cells`/`stream` and `KeysRead::read` refuse one with `InvalidArgument`, since they can't resume inside a row.
+- **Traversal:** `Traverse::byte_budget(bytes)`, with parents counted when `parents(true)`, and `TraverseStats::cut_by_budget`.
+- **Internal** (no promise): `pigeonhole_engine::CellData::from_stored(ts, stored)`, to build a page's rows from the values the read copied out.
+- **How resume is chosen:**
+  - a budget cut inside a row resumes after the last kept column;
+  - a cut at a row boundary resumes after the last kept row;
+  - an empty cut page resumes at its own start: the given position, or the first column's row;
+  - a `limit` stop resumes after the `limit`-th row;
+  - `limit(0)` reads nothing (`resume()` `None`).
+- **Not in PR 2:** `read_within_async`, and the `scan-budget` callgrind shape. The instructions job builds the base with the head's examples, so the shape lands in a follow-up PR once this API is on main.
+
+## PR 2: the plan it followed (D308 rev 2 §4)
 As D308 rev 2 §4:
 - **Scans and multi-gets:**
   - `Scan::read_within(bytes) -> Result<ScanPage>` and `KeysRead::read_within(bytes) -> Result<KeysPage>`;
