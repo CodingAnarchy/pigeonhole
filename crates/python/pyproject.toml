@@ -18,7 +18,7 @@ classifiers = [
 
 [project.urls]
 Repository = "https://github.com/CodingAnarchy/pigeonhole"
-Documentation = "https://github.com/CodingAnarchy/pigeonhole/blob/main/crates/python/README.md"
+Documentation = "https://github.com/CodingAnarchy/pigeonhole/blob/main/docs/guide/python.md"
 
 [tool.maturin]
 python-source = "python"

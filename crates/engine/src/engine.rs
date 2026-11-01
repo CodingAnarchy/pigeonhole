@@ -2427,6 +2427,40 @@ impl Engine {
         )
     }
 
+    /// [`Engine::reduce`], with the merged reducer handed back unfinished, for a caller that
+    /// takes the result in another form (D308's [`ByteBudget::into_page`](crate::ByteBudget),
+    /// with the cut and its overflow).
+    pub fn reduce_into<V, R>(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        spec: &ReduceSpec,
+        visitor: impl Fn() -> V + Sync,
+        reducer: impl Fn() -> R + Sync,
+    ) -> Result<(R, crate::ReduceStats)>
+    where
+        V: CellVisitor<Item = R::Item>,
+        R: Reducer,
+    {
+        snapshot.check_process()?;
+        let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
+        let now = self.inner.shared.vfs.now_micros();
+        let may_fan_out = self
+            .inner
+            .shared
+            .refuse_blocking_on_driver("reduce")
+            .is_ok();
+        read::reduce::reduce_into(
+            snapshot,
+            table,
+            &families,
+            spec,
+            (now, may_fan_out, &self.inner.shared),
+            &visitor,
+            &reducer,
+        )
+    }
+
     /// A multi-get (D299): the rows of `keys` under `snapshot`, in key order, with `read`'s
     /// selection applied to each. Each tablet's reads are set up once for all of its keys,
     /// and a row's sources move forward from the previous key's. Keys whose row has no cell

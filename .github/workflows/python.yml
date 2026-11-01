@@ -52,7 +52,7 @@ jobs:
           python -m venv .venv
           if [ -d .venv/Scripts ]; then bin=.venv/Scripts; else bin=.venv/bin; fi
           echo "VENV_PY=$PWD/$bin/python" >> "$GITHUB_ENV"
-          "$bin/python" -m pip install --quiet maturin pytest hypothesis mypy
+          "$bin/python" -m pip install --quiet maturin pytest hypothesis mypy numpy
           VIRTUAL_ENV="$PWD/.venv" "$bin/maturin" develop --release -m crates/python/Cargo.toml
       - name: pytest
         shell: bash

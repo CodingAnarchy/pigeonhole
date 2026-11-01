@@ -2,7 +2,7 @@
 
 > **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `phdb mcp` is new in 1.1.0 ([#1249](https://github.com/CodingAnarchy/pigeonhole/issues/1249)). Nearest-neighbour search joins its tools once vector families land.
 
-`phdb mcp` serves a Pigeonhole database to AI agents over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Add it to an MCP client (Claude Code, Claude Desktop, an editor, an agent framework) and the agent can list tables, read rows, scan, traverse graphs and write in atomic batches, with no glue code.
+`phdb mcp` serves a Pigeonhole database to AI agents over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Add it to an MCP client (Claude Code, Claude Desktop, an editor, an agent framework) and the agent can list tables, read rows, scan, traverse graphs and write in atomic batches, with no glue code. Agent code written in Python can use the [Python bindings](python.md) directly instead.
 
 A database gives an agent memory and state that a folder of markdown files can't: writes are transactional, reads are queryable by key and prefix, cells keep versions, and other processes can read the same file while the agent writes it.
 
