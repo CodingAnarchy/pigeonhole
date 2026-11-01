@@ -1,0 +1,105 @@
+# #1246's get-path regression: CI's instructions table for each revision in ab-revs.txt (base
+# first), plus per-function self-cost diffs for the get shapes. Not for main; the branch is
+# deleted after.
+name: scratch perf2 1246 A/B repeats
+on:
+  push:
+    branches: [scratch/perf2-1246-ab]
+permissions:
+  contents: read
+env:
+  EXAMPLES: hotrow readshapes writepath ycsb scanrate
+  SHAPES: >-
+    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered
+    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,flush,compact
+    ycsb:ycsb-c,ycsb-a
+    scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build every revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=(); for e in $EXAMPLES; do flags+=(--example "$e"); done
+          n=0
+          while read -r rev; do
+            [ -z "$rev" ] && continue
+            git worktree add -q "/tmp/src$n" "$rev"
+            # The examples and their support module at this branch's version, as CI does.
+            cp crates/bench/examples/*.rs "/tmp/src$n/crates/bench/examples/"
+            cp -R crates/bench/examples/support "/tmp/src$n/crates/bench/examples/"
+            (cd "/tmp/src$n" && cargo build -q --release -p pigeonhole-bench "${flags[@]}" --target-dir /tmp/target)
+            mkdir -p "/tmp/bin$n"; for e in $EXAMPLES; do cp "/tmp/target/release/examples/$e" "/tmp/bin$n/"; done
+            echo "$n $rev" >> /tmp/revs.txt; n=$((n+1))
+          done < ab-revs.txt
+      - name: count every revision, repeated
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r n rev; do
+            for k in 1 2; do
+              groups=(); for g in $SHAPES; do groups+=("/tmp/bin$n/$g"); done
+              scripts/instructions-per-cell.sh "/tmp/bin$n/hotrow" "${groups[@]}" > "/tmp/count$n-$k.txt"
+            done
+          done < /tmp/revs.txt
+          python3 - <<'PYX' | tee -a "$GITHUB_STEP_SUMMARY"
+          revs = [l.split() for l in open('/tmp/revs.txt')]
+          print('### Instructions per unit, 2 repeats\n')
+          for n, rev in revs:
+              runs = [dict(l.split()[:2] for l in open(f'/tmp/count{n}-{k}.txt') if l.strip()) for k in range(1, 3)]
+              for shape in runs[0]:
+                  vals = [r[shape] for r in runs]
+                  print(f'| {rev[:8]} | {shape} | ' + ' '.join(vals) + ' |')
+          PYX
+      - name: per-function diffs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cg
+          one() { # n name env cmd...
+            local n=$1 name=$2 e=$3; shift 3; rm -rf /tmp/w; mkdir -p /tmp/w
+            env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.tcache_count=65535 $e \
+              valgrind --tool=callgrind --collect-atstart=no --callgrind-out-file=cg/$n-$name.cg "$@" </dev/null >/dev/null 2>cg/$n-$name.err
+            callgrind_annotate --inclusive=no --threshold=100 cg/$n-$name.cg > cg/$n-$name.txt
+          }
+          while read -r n rev; do
+            B=/tmp/bin$n
+            one $n get-mem "" $B/readshapes get-mem 4 /tmp/w
+            one $n get-miss "" $B/readshapes get-miss 4 /tmp/w
+
+          done < /tmp/revs.txt
+          python3 - <<'PY' | tee -a "$GITHUB_STEP_SUMMARY"
+          import re
+          def load(p):
+              d = {}; on = False
+              for l in open(p):
+                  if 'file:function' in l: on = True; continue
+                  if on and (l.startswith('-- ') or 'Auto-annotated' in l): break
+                  m = re.match(r'\s*([\d,]+)\s+\(\s*[\d.]+%\)\s+(.*)$', l)
+                  if on and m:
+                      f = m.group(2).split(' [')[0]; f = f.split(':', 1)[1] if ':' in f else f
+                      d[f] = d.get(f, 0) + int(m.group(1).replace(',', ''))
+              return d
+          revs = [l.split() for l in open('/tmp/revs.txt')]
+          for name in ['get-mem', 'get-miss']:
+              b = load(f'cg/0-{name}.txt'); bt = sum(b.values())
+              for n, rev in revs[1:]:
+                  h = load(f'cg/{n}-{name}.txt'); ht = sum(h.values())
+                  print(f'### {name}, {rev[:8]}: {bt:,} -> {ht:,} ({100 * (ht - bt) / bt:+.2f}%)\n')
+                  print('| delta | base | head | function |\n|--:|--:|--:|---|')
+                  for k in sorted(set(b) | set(h), key=lambda k: -abs(h.get(k, 0) - b.get(k, 0)))[:15]:
+                      print(f'| {h.get(k, 0) - b.get(k, 0):+,} | {b.get(k, 0):,} | {h.get(k, 0):,} | `{k[:120]}` |')
+                  print()
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cg
+          path: cg/
