@@ -1,0 +1,2 @@
+### Added
+- `Pigeonhole::pinned_shard_cpus()` returns the CPUs the engine pinned its shard threads to (ICR 0101), and is empty when none is pinned. On a machine with spare physical cores (fewer shards than cores), running busy application threads on those cores keeps them from preempting the shards. With the default of one shard per core, leave thread placement to the OS; the guide's deployment notes explain why.

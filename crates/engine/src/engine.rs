@@ -2938,6 +2938,18 @@ impl Engine {
         self.inner.shared.failure.get()
     }
 
+    /// The CPUs this engine pinned its shard threads to (D235, ICR 0101), one per pinned
+    /// shard driver thread. Empty when none is pinned: application-owned mode, `pin_threads`
+    /// off, a platform or CPU set where pinning is unsafe, or every pin refused.
+    pub fn pinned_shard_cpus(&self) -> Vec<usize> {
+        self.inner
+            .runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map_or_else(Vec::new, |rt| rt.pinned_driver_cpus().to_vec())
+    }
+
     /// Current metrics.
     pub fn metrics(&self) -> Metrics {
         if self.inner.forked() {
