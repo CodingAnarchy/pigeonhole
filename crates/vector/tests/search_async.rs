@@ -1,6 +1,7 @@
 //! #1268 item 6: `Search::run_async` (on D296 PR 5's `Nearest::run_async`) returns what
-//! `run` returns: for every element and metric, from a cold cache after a reopen, at the
-//! current snapshot and at an older one, and across a layout the async path loads itself.
+//! `run` returns: for every element and metric, from a cold cache after a reopen (the
+//! counters show its fetches were asynchronous), at the current snapshot and at an older one,
+//! and across a layout change a stale handle's async search loads itself.
 #![cfg(feature = "async")]
 
 mod common;
@@ -47,11 +48,12 @@ fn an_async_search_returns_what_the_sync_one_returns() {
             drop(index);
             db.close().unwrap();
         }
-        // Cold: a reopen, then the async search first, so it loads the layout and reads the
-        // lists' blocks itself.
+        // Cold: a reopen, and the async search is the first read of the lists (Index::open
+        // reads only the C, N and Q rows). The counters prove the async path ran, as #1269
+        // does: the search missed the cache, and fewer of its reads were synchronous than it
+        // missed, so the rest were fetched asynchronously.
         let db = open(&dir);
         let index = &Index::open(&db, "idx").unwrap();
-        check(index, &model, &ctx);
         let mut rng = Rng::new(22);
         let qs: Vec<V> = (0..4)
             .map(|_| {
@@ -59,13 +61,23 @@ fn an_async_search_returns_what_the_sync_one_returns() {
                 V::random(&mut rng, &spec, c)
             })
             .collect();
+        let before = db.engine_metrics();
+        let cold = block_on(query(index, &qs[0], 10, 3).run_async()).unwrap();
+        let after = db.engine_metrics();
+        let misses = after.block_cache_misses - before.block_cache_misses;
+        let sync_reads = after.async_sync_reads - before.async_sync_reads;
+        assert!(misses > 0, "{ctx}: the cold search missed the cache");
+        assert!(
+            sync_reads < misses,
+            "{ctx}: some of {misses} missed blocks were fetched asynchronously ({sync_reads} sync)"
+        );
+        assert_eq!(
+            cold,
+            query(index, &qs[0], 10, 3).run().unwrap(),
+            "{ctx} cold"
+        );
+        check(index, &model, &ctx);
         for (i, q) in qs.iter().enumerate() {
-            let cold = block_on(query(index, q, 10, 3).run_async()).unwrap();
-            assert_eq!(
-                cold,
-                query(index, q, 10, 3).run().unwrap(),
-                "{ctx} cold {i}"
-            );
             for (k, nprobe) in [(1, 1), (10, 3), (50, 1000)] {
                 both(
                     || query(index, q, k, nprobe),
@@ -73,8 +85,11 @@ fn an_async_search_returns_what_the_sync_one_returns() {
                 );
             }
         }
-        // An older snapshot, then a layout change the async path must load itself.
-        let before = &db.snapshot().unwrap();
+        // A layout change that `stale` must load itself: it's opened before the inserts that
+        // split lists, so its centroid cache predates them, and its `run_async` goes first.
+        let stale = &Index::open(&db, "idx").unwrap();
+        let older = &db.snapshot().unwrap();
+        let lists = index.verify().unwrap().list_lens.len();
         let mut rng = Rng::new(23);
         for i in 300..500u32 {
             let c = rng.below(6);
@@ -82,12 +97,21 @@ fn an_async_search_returns_what_the_sync_one_returns() {
                 .insert(index, &i.to_be_bytes())
                 .unwrap();
         }
-        for q in &qs {
+        assert!(
+            index.verify().unwrap().list_lens.len() > lists,
+            "{ctx}: the inserts split lists, so the layout changed"
+        );
+        for (i, q) in qs.iter().enumerate() {
+            let got = block_on(query(stale, q, 10, 4).run_async()).unwrap();
+            let want = query(index, q, 10, 4).run().unwrap();
+            assert_eq!(
+                got, want,
+                "{ctx} q{i}: a stale handle's async search loads the layout"
+            );
             both(
-                || query(index, q, 10, 1000).snapshot(before),
+                || query(index, q, 10, 1000).snapshot(older),
                 &format!("{ctx} older"),
             );
-            both(|| query(index, q, 10, 4), &format!("{ctx} after splits"));
         }
         db.close().unwrap();
     }
