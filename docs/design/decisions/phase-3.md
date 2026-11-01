@@ -3644,3 +3644,26 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Recall:** recall@10 on 4,000 vectors in 200 overlapping clusters is pinned at 0.94 (0.966 measured, nprobe 8 of 94 lists).
   - **Hold seams** (`__unstable-hooks`, ICR 0085's convention): a delete and an in-place update between a split's snapshot read and its transaction (N1), and a crash between a write and its rebalance, healed after the reopen (M3).
 - **Not in PR 1:** `search_*_async`. It waits for `nearest_*_async`, which follows #1259.
+
+**PR 2 (#490 D).**
+- **Background rebalancing** (§3, the owner's §6.4):
+  - With `Rebalance::Background`, a write marks a list it took out of bounds: a `Q{list}` row in its own transaction after the commit (rev 4 N2), plus the in-process queue, skipped when the list is already queued.
+  - A `Rebalancer` splits and merges marked lists: `run_once`, `wait`, `closed`, `set_wakeup`. It re-checks the bounds first, deletes a stale marker, and deletes a live one in the split's or merge's transaction.
+  - `open` re-queues the markers and the out-of-bounds `N` rows.
+  - Who runs it: the crate's own thread (`open`, `create`), or the application (`open_with_rebalancer`, `create_with_rebalancer`). It holds the index weakly, so it ends when the last handle drops.
+- **`bulk_load_*`** into an empty index:
+  - k-means on the first `max(50,000, expected / target)` vectors into `expected / target` lists;
+  - each vector to its nearest list, 256 per transaction, as upserts (a repeated id keeps its last vector);
+  - then the usual rebalance.
+- **#1268, items 1–4:**
+  - the opposite commit order to N1 (a delete or an update held across a split conflicts, retries and lands in the new layout);
+  - phase 2 against a split of its destination (conflicts and is skipped);
+  - a crash between a split's commit and its phase 2 (consistent and exact after a reopen);
+  - new hold points and a `fail_after_split` fault seam, all hidden under `__unstable-hooks`;
+  - a capped backoff in `delete`'s retry;
+  - the tie-order doc line.
+- **Tests:**
+  - bulk loads over every spec, against the model and exact searches, with repeats and both refusals;
+  - the crate's thread catching up;
+  - an application's rebalancer, with its wakeup and `closed`;
+  - markers a crash left, rebalanced after the reopen.

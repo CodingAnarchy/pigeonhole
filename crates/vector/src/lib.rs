@@ -9,8 +9,9 @@
 //! A query finds the `nprobe` centroids nearest the query in memory, then reads those lists
 //! with one multi-get and a top-k nearest search (`KeysRead::nearest_*`). Inserts and deletes
 //! are optimistic transactions. A list that grows past its bound splits, and one that shrinks
-//! below it merges, inside the write that caused it (a `Rebalancer` the application drives
-//! comes with D306's second PR). The application never calls a rebalance itself.
+//! below it merges, inside the write that caused it, or, with [`Rebalance::Background`], in a
+//! [`Rebalancer`] on the crate's thread or one the application runs. The application never
+//! calls a rebalance itself.
 //!
 //! Each centroid, list, id mapping and length is an ordinary row, so the index is as
 //! durable and as consistent as the database: a search reads one snapshot, and every move
@@ -30,6 +31,8 @@ pub mod hooks;
 mod index;
 mod layout;
 mod point;
+mod rebalancer;
 
 pub use error::{Error, Result};
-pub use index::{Hit, Index, IndexOptions, IndexStats, Search};
+pub use index::{BulkStats, Hit, Index, IndexOptions, IndexStats, Rebalance, Search};
+pub use rebalancer::Rebalancer;
