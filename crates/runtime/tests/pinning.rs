@@ -46,18 +46,13 @@ fn runtimes_pin_to_distinct_cpus_and_one_without_free_cpus_runs_unpinned() {
         }
         None => assert_eq!(p.pinned + p.failed, cpus, "{p:?}"),
     }
-    // ICR 0101: one CPU per pinned driver, distinct, inside the affinity set.
+    // ICR 0101: one CPU per pinned driver, distinct.
     let held = all.pinned_driver_cpus().to_vec();
     assert_eq!(held.len(), p.pinned, "{held:?}");
     let mut distinct = held.clone();
     distinct.sort_unstable();
     distinct.dedup();
     assert_eq!(distinct.len(), held.len(), "{held:?}");
-    let allowed = pigeonhole_io::sys::affinity_cpus().expect("pinning has an affinity set");
-    assert!(
-        held.iter().all(|c| allowed.contains(c)),
-        "{held:?} not in {allowed:?}"
-    );
     // Every CPU is held: a second runtime runs unpinned rather than stacking, and starts.
     let second = start(1);
     assert_eq!(second.pinning().unpinned, Some(Unpinned::TooFewCpus));

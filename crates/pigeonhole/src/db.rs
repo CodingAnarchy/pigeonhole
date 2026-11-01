@@ -1141,9 +1141,13 @@ impl Pigeonhole {
     }
 
     /// The CPUs the engine pinned its shard threads to (D235, ICR 0101): one per pinned
-    /// shard thread, in thread order. Keep the application's busy threads off them, for
-    /// example by setting their affinity to the process's CPUs less these: a thread the OS
-    /// places on a shard's CPU preempts the shard and delays the commits it serves (#1206).
+    /// shard thread, in thread order. A thread the OS places on a shard's CPU preempts the
+    /// shard and delays the commits it serves (#1206). Where the machine has physical cores
+    /// the shards don't use (fewer shards than cores), running busy application threads on
+    /// those cores avoids that. Don't confine threads to the shards' SMT siblings instead:
+    /// with one shard per core (the default) that only leaves the siblings, and a thread
+    /// spinning there slows the shard on the same core (#1244 measured `Buffered` put p99
+    /// about doubling).
     /// Empty when no shard thread is pinned: [`Options::pin_threads`](crate::Options::pin_threads)
     /// off, application-owned mode, a platform without hard thread affinity (macOS), a CPU
     /// quota or too few free CPUs, or every pin refused.

@@ -12,16 +12,14 @@
 - **Internal crates** (no promise):
   - **pigeonhole-engine:** `Engine::pinned_shard_cpus(&self) -> Vec<usize>`.
   - **pigeonhole-runtime:** `Runtime::pinned_driver_cpus(&self) -> &[usize]`: the CPUs of the driver threads whose pin succeeded, in driver order.
-  - **pigeonhole-io:** `sys::affinity_cpus() -> Option<Vec<usize>>`, the calling thread's affinity set in ascending order (`None` without hard affinity). Also `sys::set_current_thread_cpus(&[usize]) -> Result<()>`, which restricts the calling thread to a set (Linux `sched_setaffinity`, Windows `SetThreadAffinityMask`, `Unsupported` elsewhere).
 
 ## Why
-#1206: the waits behind sparse-wide's awake inbox p99.9 were pinned shard threads being preempted, mostly by application (bench client) threads the OS placed on their CPUs. The owner decided:
-- the bench keeps its client threads off the pinned shard CPUs;
-- the guide advises applications to do the same;
-- the report notes the placement.
+#1206 traced the waits behind sparse-wide's awake inbox p99.9 to the pinned shard threads being preempted, mostly by application (bench client) threads that the OS placed on their CPUs. An application needs the CPU ids to keep its threads off them, and `engine_metrics()` only reports counts (`threads_pinned`).
 
-An application needs the CPU ids to do that. `engine_metrics()` only reports counts (`threads_pinned`).
+**The owner's decision, 2026-11-01 (option 1 on #1244):**
+- **Kept:** the accessor.
+- **Dropped:** the bench's client placement. Its gate-row A/B on the AX102 showed that at the default topology (one shard per physical core), keeping the clients off the shard CPUs leaves only the shards' SMT siblings. There, `Buffered` put p99 roughly doubled (sparse-wide 24.8 → 48.6 µs).
+- **The guide's note:** placement helps only where there are spare physical cores.
 
 ## Callers
-- **`pigeonhole-bench`:** `Runner::client_cpus`, which the Pigeonhole runner answers as the affinity set less `pinned_shard_cpus()`. The client threads restrict themselves to it before each pass. `RunDetail::client_cpus` records it, and the markdown report prints a "Client placement" line.
-- **The guide's deployment notes** (`getting-started.md`) and the agent reference.
+- The guide's getting-started notes and the agent reference.

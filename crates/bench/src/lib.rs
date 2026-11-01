@@ -649,14 +649,6 @@ pub trait Runner {
         String::new()
     }
 
-    /// The CPUs the client threads run on, read once the store is open. `None` (the
-    /// default) leaves them where the OS puts them. The Pigeonhole runner keeps them off
-    /// the shard threads' pinned CPUs (the owner's decision on #1206; ICR 0101), as the
-    /// guide advises applications to do.
-    fn client_cpus(&self) -> Option<Vec<usize>> {
-        None
-    }
-
     /// A finer latency class for `op` than its [`BenchOp::type_name`], read before the
     /// measured pass (outside each operation's timing): `None` (the default) keeps the type
     /// name. The Pigeonhole runner splits transfers by whether their two accounts are on one
@@ -1001,7 +993,6 @@ pub fn run_detailed(
     let result = measure(runner, config, &mut workload, warmup, options)
         .and_then(|measured| workload.check_epoch_age().map(|()| measured));
     let busy_retries = runner.busy_retries();
-    let client_cpus = runner.client_cpus();
     let closing = Instant::now();
     let closed = runner.close();
     let close_ms = closing.elapsed().as_secs_f64() * 1e3;
@@ -1059,7 +1050,6 @@ pub fn run_detailed(
             warmup_settled: Some(warmed.settled),
             settle_after_warmup: warmed.settle_after,
             drivers: warmed.drivers,
-            client_cpus,
             seqnos_used,
             txn_conflicts,
             riders,
@@ -1584,7 +1574,6 @@ fn pass(
         return Ok((start.elapsed(), hist, split));
     }
     let barrier = Arc::new(Barrier::new(clients.len() + 1));
-    let cpus = runner.client_cpus();
     std::thread::scope(|scope| {
         let handles: Vec<_> = clients
             .iter_mut()
@@ -1592,13 +1581,7 @@ fn pass(
             .enumerate()
             .map(|(i, (client, share))| {
                 let barrier = Arc::clone(&barrier);
-                let cpus = cpus.as_deref();
                 scope.spawn(move || {
-                    if let Some(cpus) = cpus
-                        && let Err(e) = pigeonhole_io::sys::set_current_thread_cpus(cpus)
-                    {
-                        eprintln!("warning: client threads not placed: {e}");
-                    }
                     barrier.wait();
                     let ops: Vec<&BenchOp> = share.iter().map(|(op, _)| op).collect();
                     // A paced share runs operation by operation, on its schedule.
