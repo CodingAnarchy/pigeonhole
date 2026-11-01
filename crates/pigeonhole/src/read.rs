@@ -98,6 +98,9 @@ pub enum Condition {
     },
 }
 
+mod budget;
+pub use budget::{KeysPage, KeysPosition, ScanPage, ScanPosition};
+
 /// A read's selected families, resolved: inline for up to four.
 pub(crate) type FamilyIds = SmallVec<[FamilyId; 4]>;
 
@@ -537,6 +540,8 @@ pub struct KeysRead<'t> {
     core: &'t Arc<TableCore>,
     keys: KeySet,
     sel: Selection,
+    /// D308: where [`KeysRead::read_within`] resumes ([`KeysRead::resume_after`]).
+    after: Option<KeysPosition>,
 }
 
 impl<'t> KeysRead<'t> {
@@ -575,7 +580,32 @@ impl<'t> KeysRead<'t> {
             core,
             keys: keys.clone(),
             sel: Selection::new(),
+            after: None,
         }
+    }
+
+    /// Resume after `position`, where an earlier [`read_within`](KeysRead::read_within)
+    /// page stopped ([`KeysPage::resume`], D308): at the first key of this set at or after
+    /// the position's key (inside its row, after the column, when the page cut it), or
+    /// after it when the page ended on its row. It names a key, not an index, so a set
+    /// rebuilt between pages resumes at the right key. Only `read_within` takes a position:
+    /// [`read`](KeysRead::read) refuses one (`InvalidArgument`).
+    pub fn resume_after(mut self, position: &KeysPosition) -> Self {
+        self.after = Some(position.clone());
+        self
+    }
+
+    /// Reads the longest prefix of the key set's cells, in key order, whose size is at most
+    /// `bytes` (D308), as owned rows: [`Scan::read_within`] for a multi-get. Keys with no
+    /// cell the selection keeps return nothing.
+    pub fn read_within(mut self, bytes: u64) -> Result<KeysPage> {
+        budget::keys(
+            self.core,
+            &mut self.sel,
+            &self.keys,
+            self.after.as_ref(),
+            bytes,
+        )
     }
 
     selection_methods!();
@@ -594,6 +624,12 @@ impl<'t> KeysRead<'t> {
 
     /// Starts the read.
     pub fn read(mut self) -> Result<KeyRows<'t>> {
+        if self.after.is_some() {
+            return Err(crate::Error::new(
+                crate::ErrorCode::InvalidArgument,
+                "a multi-get position resumes read_within only",
+            ));
+        }
         let generation = self.core.db.generation();
         let (info, snapshot, families) = self.sel.start(self.core)?;
         let mut spec = self.sel.spec;
@@ -834,6 +870,7 @@ pub struct Traverse<'t> {
     hop_limit: u64,
     max_nodes: u64,
     parents: bool,
+    byte_budget: u64,
     parallelism: usize,
 }
 
@@ -846,6 +883,7 @@ impl<'t> Traverse<'t> {
             hops: 1,
             per_node_limit: 0,
             hop_limit: 0,
+            byte_budget: 0,
             max_nodes: pigeonhole_engine::DEFAULT_MAX_NODES,
             parents: false,
             parallelism: 1,
@@ -877,6 +915,16 @@ impl<'t> Traverse<'t> {
     /// `u64::MAX` for no limit).
     pub fn max_nodes(mut self, t: u64) -> Self {
         self.max_nodes = t;
+        self
+    }
+
+    /// At most `bytes` of nodes in all, over the hops in order (D308): a node counts its key
+    /// and 16 bytes, plus 4 with [`parents`](Traverse::parents); the seeds aren't counted.
+    /// The hop the budget cuts keeps the in-budget prefix of its ranking (the nodes
+    /// [`hop_limit`](Traverse::hop_limit) would keep first), and the traversal ends with it
+    /// ([`TraverseStats::cut_by_budget`]). 0, the default, sets no budget.
+    pub fn byte_budget(mut self, bytes: u64) -> Self {
+        self.byte_budget = bytes;
         self
     }
 
@@ -957,6 +1005,8 @@ impl<'t> Traverse<'t> {
         spec.per_node_limit = self.per_node_limit;
         spec.hop_limit = self.hop_limit;
         spec.max_nodes = self.max_nodes;
+        spec.byte_budget = self.byte_budget;
+        spec.parents_in_budget = self.parents;
         spec.read = self.sel.spec.clone();
         spec.parallelism = self.parallelism;
         Ok((snapshot, seeds, spec))
@@ -979,6 +1029,7 @@ impl Traversal {
                 edges: t.stats.edges,
                 hops_cut: t.stats.hops_cut,
                 cut_by_max_nodes: t.stats.cut_by_max_nodes,
+                cut_by_budget: t.stats.cut_by_budget,
             },
         }
     }
@@ -1041,6 +1092,9 @@ pub struct TraverseStats {
     /// Whether `max_nodes` was reached with hops left to take: a hop cut short by it, or the
     /// remaining hops skipped (they may have found nothing new).
     pub cut_by_max_nodes: bool,
+    /// Whether [`byte_budget`](Traverse::byte_budget) cut a hop short (the traversal ended
+    /// with it).
+    pub cut_by_budget: bool,
 }
 
 /// Reads the cells of the key `cursor` is on into `buf` (cleared first).
@@ -1627,6 +1681,8 @@ pub struct Scan<'t> {
     end: Bound<Vec<u8>>,
     sel: Selection,
     limit: Option<u64>,
+    /// D308: where [`Scan::read_within`] resumes ([`Scan::resume_after`]).
+    after: Option<ScanPosition>,
 }
 
 impl<'t> Scan<'t> {
@@ -1671,10 +1727,81 @@ impl<'t> Scan<'t> {
             end,
             sel: Selection::new(),
             limit: None,
+            after: None,
         }
     }
 
     selection_methods!();
+
+    /// Resume after `position`, where an earlier [`read_within`](Scan::read_within) page
+    /// stopped ([`ScanPage::resume`], D308): the read starts at the later of the range's
+    /// start and the position, so a position before the range starts at the range and one
+    /// past its end reads nothing. Without an explicit [`snapshot`](Scan::snapshot), a
+    /// chain of pages is not one consistent read. Only `read_within` takes a position:
+    /// [`iter`](Scan::iter), [`cells`](Scan::cells) and `stream` refuse one
+    /// (`InvalidArgument`), as they cannot resume inside a row.
+    pub fn resume_after(mut self, position: &ScanPosition) -> Self {
+        self.after = Some(position.clone());
+        self
+    }
+
+    /// Reads the longest prefix of the scan's cells, in scan order, whose size is at most
+    /// `bytes` (D308), as owned rows: each cell counts its qualifier, its value (as
+    /// [`CellRef::value`] gives it) and 16 bytes, and each row its key once. A column (all
+    /// the versions the read selects) is kept whole or not at all; a row may be cut between
+    /// columns. If the first column doesn't fit, the page is empty and
+    /// [`next_bytes`](ScanPage::next_bytes) says what it needs.
+    ///
+    /// [`limit`](Scan::limit) applies too, and whichever stops the read first wins;
+    /// [`ScanPage::resume`] is `Some` whenever it stopped early. The read runs in the
+    /// engine's bounded-read path (D296): sequentially it reads about the budget and one
+    /// column more.
+    ///
+    /// ```
+    /// use pigeonhole::{Family, Options, Pigeonhole};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default().shards(1))?;
+    /// let t = db.table("docs")?.family("text", Family::default()).create_if_missing()?;
+    /// for i in 0..100u32 {
+    ///     t.mutate(format!("doc:{i:03}").as_bytes()).put("text", b"body", &[b'x'; 200]).commit()?;
+    /// }
+    /// // A page of at most 2 KiB, then the next from where it stopped.
+    /// let page = t.scan_prefix(b"doc:").read_within(2048)?;
+    /// assert!(page.bytes() <= 2048 && page.cut_by_budget());
+    /// let next = t
+    ///     .scan_prefix(b"doc:")
+    ///     .resume_after(page.resume().expect("more to read"))
+    ///     .read_within(2048)?;
+    /// assert_eq!(next.rows()[0].key(), b"doc:009");
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn read_within(mut self, bytes: u64) -> Result<ScanPage> {
+        let range = (self.start, self.end);
+        budget::scan(
+            &self.core,
+            &mut self.sel,
+            range,
+            self.limit,
+            self.after.as_ref(),
+            bytes,
+        )
+    }
+
+    /// `InvalidArgument` when a [`resume_after`](Scan::resume_after) position is set: only
+    /// `read_within` takes one.
+    fn refuse_position(&self) -> Result<()> {
+        if self.after.is_some() {
+            return Err(crate::Error::new(
+                crate::ErrorCode::InvalidArgument,
+                "a scan position resumes read_within only",
+            ));
+        }
+        Ok(())
+    }
 
     /// Up to `n` versions of each column.
     pub fn versions(mut self, n: u32) -> Self {
@@ -1724,11 +1851,13 @@ impl<'t> Scan<'t> {
             end: self.end,
             sel: self.sel,
             limit: self.limit,
+            after: self.after,
         }
     }
 
     /// Starts the scan.
     pub fn iter(mut self) -> Result<RowIter<'t>> {
+        self.refuse_position()?;
         let generation = self.core.db.generation();
         let (info, snapshot, families) = self.sel.start(&self.core)?;
         let mut spec = ScanSpec::new(self.start, self.end);
@@ -1751,6 +1880,7 @@ impl<'t> Scan<'t> {
     /// The scan's cells one at a time, row after row ([`ScanCells`], D297): a scan over rows
     /// that may be too wide to read whole. Each cell is lent until the next call.
     pub fn cells(mut self) -> Result<ScanCells<'t>> {
+        self.refuse_position()?;
         let generation = self.core.db.generation();
         let (info, snapshot, families) = self.sel.start(&self.core)?;
         let mut spec = ScanSpec::new(self.start, self.end);
@@ -1783,7 +1913,9 @@ impl<'t> Scan<'t> {
     pub fn stream(mut self) -> crate::nonblocking::RowStream<'t> {
         let limit_zero = self.limit == Some(0);
         let generation = self.core.db.generation();
+        let refused = self.refuse_position();
         let started = (|| {
+            refused?;
             let (info, snapshot, families) = self.sel.start(&self.core)?;
             let mut spec = ScanSpec::new(self.start, self.end);
             spec.read = self.sel.spec;

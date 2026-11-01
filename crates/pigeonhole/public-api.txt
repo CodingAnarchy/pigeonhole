@@ -405,6 +405,19 @@ pub fn pigeonhole::KeyRows<'t>::into_owned_stream(self) -> pigeonhole::nonblocki
 pub fn pigeonhole::KeyRows<'t>::next(&mut self) -> pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>
 pub async fn pigeonhole::KeyRows<'t>::next_async(&mut self) -> pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>
 pub fn pigeonhole::KeyRows<'t>::poll_next(&mut self, &mut core::task::wake::Context<'_>) -> core::task::poll::Poll<pigeonhole::Result<core::option::Option<(usize, pigeonhole::RowRef<'_>)>>>
+pub struct pigeonhole::KeysPage
+impl pigeonhole::KeysPage
+pub fn pigeonhole::KeysPage::bytes(&self) -> u64
+pub fn pigeonhole::KeysPage::cut_by_budget(&self) -> bool
+pub fn pigeonhole::KeysPage::into_rows(self) -> alloc::vec::Vec<pigeonhole::Row>
+pub fn pigeonhole::KeysPage::next_bytes(&self) -> core::option::Option<u64>
+pub fn pigeonhole::KeysPage::resume(&self) -> core::option::Option<&pigeonhole::KeysPosition>
+pub fn pigeonhole::KeysPage::rows(&self) -> &[pigeonhole::Row]
+pub struct pigeonhole::KeysPosition(_)
+impl pigeonhole::KeysPosition
+pub fn pigeonhole::KeysPosition::from_bytes(&[u8]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::KeysPosition::key(&self) -> &[u8]
+pub fn pigeonhole::KeysPosition::to_bytes(&self) -> alloc::vec::Vec<u8>
 pub struct pigeonhole::KeysRead<'t>
 impl<'t> pigeonhole::KeysRead<'t>
 pub fn pigeonhole::KeysRead<'t>::column_limit(self, u32) -> Self
@@ -418,6 +431,8 @@ pub fn pigeonhole::KeysRead<'t>::qualifier_bounds(self, core::ops::range::Bound<
 pub fn pigeonhole::KeysRead<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::KeysRead<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
 pub fn pigeonhole::KeysRead<'t>::read(self) -> pigeonhole::Result<pigeonhole::KeyRows<'t>>
+pub fn pigeonhole::KeysRead<'t>::read_within(self, u64) -> pigeonhole::Result<pigeonhole::KeysPage>
+pub fn pigeonhole::KeysRead<'t>::resume_after(self, &pigeonhole::KeysPosition) -> Self
 pub fn pigeonhole::KeysRead<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::KeysRead<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
 pub fn pigeonhole::KeysRead<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
@@ -696,6 +711,8 @@ pub fn pigeonhole::Scan<'t>::nearest_i8(self, &[i8], usize) -> pigeonhole::Neare
 pub fn pigeonhole::Scan<'t>::qualifier_bounds(self, core::ops::range::Bound<&[u8]>, core::ops::range::Bound<&[u8]>) -> Self
 pub fn pigeonhole::Scan<'t>::qualifier_prefix(self, &[u8]) -> Self
 pub fn pigeonhole::Scan<'t>::qualifier_range<'k, K: core::convert::AsRef<[u8]> + ?core::marker::Sized + 'k>(self, impl core::ops::range::RangeBounds<&'k K>) -> Self
+pub fn pigeonhole::Scan<'t>::read_within(self, u64) -> pigeonhole::Result<pigeonhole::ScanPage>
+pub fn pigeonhole::Scan<'t>::resume_after(self, &pigeonhole::ScanPosition) -> Self
 pub fn pigeonhole::Scan<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::Scan<'t>::stream(self) -> pigeonhole::nonblocking::RowStream<'t>
 pub fn pigeonhole::Scan<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
@@ -704,6 +721,19 @@ pub fn pigeonhole::Scan<'t>::versions(self, u32) -> Self
 pub struct pigeonhole::ScanCells<'t>
 impl pigeonhole::ScanCells<'_>
 pub fn pigeonhole::ScanCells<'_>::next(&mut self) -> pigeonhole::Result<core::option::Option<(&[u8], pigeonhole::CellEntry<'_>)>>
+pub struct pigeonhole::ScanPage
+impl pigeonhole::ScanPage
+pub fn pigeonhole::ScanPage::bytes(&self) -> u64
+pub fn pigeonhole::ScanPage::cut_by_budget(&self) -> bool
+pub fn pigeonhole::ScanPage::into_rows(self) -> alloc::vec::Vec<pigeonhole::Row>
+pub fn pigeonhole::ScanPage::next_bytes(&self) -> core::option::Option<u64>
+pub fn pigeonhole::ScanPage::resume(&self) -> core::option::Option<&pigeonhole::ScanPosition>
+pub fn pigeonhole::ScanPage::rows(&self) -> &[pigeonhole::Row]
+pub struct pigeonhole::ScanPosition(_)
+impl pigeonhole::ScanPosition
+pub fn pigeonhole::ScanPosition::from_bytes(&[u8]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::ScanPosition::row(&self) -> &[u8]
+pub fn pigeonhole::ScanPosition::to_bytes(&self) -> alloc::vec::Vec<u8>
 pub struct pigeonhole::Shard
 impl pigeonhole::Shard
 pub fn pigeonhole::Shard::closed(&self) -> core::option::Option<pigeonhole::Result<()>>
@@ -791,6 +821,7 @@ pub fn pigeonhole::Traversal::hops(&self) -> &[pigeonhole::Hop]
 pub fn pigeonhole::Traversal::stats(&self) -> pigeonhole::TraverseStats
 pub struct pigeonhole::Traverse<'t>
 impl<'t> pigeonhole::Traverse<'t>
+pub fn pigeonhole::Traverse<'t>::byte_budget(self, u64) -> Self
 pub fn pigeonhole::Traverse<'t>::families<'f>(self, impl core::iter::traits::collect::IntoIterator<Item = &'f str>) -> Self
 pub fn pigeonhole::Traverse<'t>::family(self, &str) -> Self
 pub fn pigeonhole::Traverse<'t>::hop_limit(self, u64) -> Self
@@ -809,6 +840,7 @@ pub fn pigeonhole::Traverse<'t>::snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::Traverse<'t>::time_range(self, core::ops::range::Range<u64>) -> Self
 pub fn pigeonhole::Traverse<'t>::value_filter(self, pigeonhole::ValueFilter) -> Self
 #[non_exhaustive] pub struct pigeonhole::TraverseStats
+pub pigeonhole::TraverseStats::cut_by_budget: bool
 pub pigeonhole::TraverseStats::cut_by_max_nodes: bool
 pub pigeonhole::TraverseStats::edges: u64
 pub pigeonhole::TraverseStats::hops_cut: u32

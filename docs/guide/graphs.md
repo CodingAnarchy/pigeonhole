@@ -139,6 +139,7 @@ assert_eq!(next.len(), 3);
 | `hop_limit(n)` | At most `n` new nodes per hop: the ones whose first edge comes first, by source row and then qualifier. Deterministic, not a sample. |
 | `max_nodes(t)` | At most `t` nodes visited in all, the seeds included (default 10,000,000). |
 | `parents(true)` | Each node's parent: the index, in the previous hop's nodes (or the seeds, for hop 1), of the source of the first edge that reached it. |
+| `byte_budget(bytes)` | At most `bytes` of nodes in all, over the hops in order (D308): a node counts its key and 16 bytes, plus 4 with `parents`; the seeds don't count. The hop the budget cuts keeps the in-budget prefix of its ranking (the nodes `hop_limit` would keep first), and the traversal ends with it (`stats().cut_by_budget`). |
 | `parallel(n)` | Read each hop on up to `n` threads when its frontier spans several tablets with at least 1,000 keys per thread. |
 | `qualifier_prefix`, `qualifier_range`, `qualifier_bounds`, `time_range`, `value_filter`, `snapshot` | The edges' selection, as for a row read. |
 

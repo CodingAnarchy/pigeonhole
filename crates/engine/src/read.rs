@@ -81,6 +81,22 @@ impl CellData {
         },
     };
 
+    /// A cell holding `stored` (a stored value, its tag byte first) at `ts`: inline when it
+    /// fits, else the buffer itself. For results built from values a read copied out, such
+    /// as a byte-budgeted read's (D308).
+    pub fn from_stored(ts: Timestamp, stored: Vec<u8>) -> Self {
+        if stored.len() <= Self::INLINE_MAX {
+            let mut c = Self::EMPTY;
+            c.set_inline(ts, &stored);
+            c
+        } else {
+            CellData {
+                ts,
+                value: CellValue::Owned(stored),
+            }
+        }
+    }
+
     /// Makes this cell a copy of `stored` (a stored value of at most
     /// [`CellData::INLINE_MAX`] bytes) at `ts`, reusing its inline bytes when it has them.
     #[inline]
