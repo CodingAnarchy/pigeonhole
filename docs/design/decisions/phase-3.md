@@ -3236,7 +3236,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **`reduce_into`** (PR 2) hands back the merged reducer unfinished, for a caller that takes the result in another form (D304's `DedupeLimit::into_nodes`).
 - **Versions:** `reduce` takes the read's `ReadSpec` as given; `nearest` forces one version per cell.
 - **KNN (PR 3, #490 C):** `pigeonhole_format::distance`'s safe 16-lane kernels (`f32` L2, dot with norm, cosine from parts; exact `i8` L2 and dot; Hamming), with a fixed pairwise summation order and no FMA, so a kernel gives the same bits on every run and fan-out. `KnnVisitor` scores each cell against the query; `TopK<Score>` (`f32::total_cmp`) keeps the k nearest; malformed values and NaN distances are skipped and counted (`KnnSkips`). Until D303's typed vectors, a vector is a `Bytes` value of little-endian `f32`s (engine-level only).
-- **PR 4:** the public `nearest_f32`, `nearest_i8` and `nearest_bits` (and `_async`) on scans and `KeysRead`, typed by D303's vector families, returning `Neighbour { row, qualifier, distance: f64, ts }` in (distance, row, qualifier) order; an explicit `parallel(n)` on a key set fans out over its groups (#490 D's seam, c6548060686).
+- **PR 4:** the public `nearest_f32`, `nearest_i8` and `nearest_bits` on scans and `KeysRead`, typed by D303's vector families: a `Nearest` builder (`parallel(n)`, `run()`) returning `Neighbour { row, qualifier, distance: f64, ts }` in (distance, row, qualifier) order. An explicit `parallel(n)` on a key set fans out over its groups (#490 D's seam, c6548060686). `KnnVisitor::typed` scores with D303's `Params::distance`, so a ranking equals `VectorSpec::distance_*` to the bit; `Score` holds an `f64`. `run_async` follows in its own PR.
 
 **Checks.**
 - `it/reduce.rs`: `TopK`, `Limit` and `Dedupe` against brute force over a scan of the same snapshot (SSTs and memtables, overwrites, deletes, a counter family's merges, value predicates); `NextRow` visits only each row's first cell; `Stop`; refused ranges; fan-out equal to sequential with threads asserted. For `Keys` (PR 2): equal to one-row scans of each key and to `multi_get`, fan-out over three tablets equal to sequential, `NextRow` and per-group `Stop`.
@@ -3320,6 +3320,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **New `scalar_counters` targets** (engine and `pigeonhole`) rerun the model checks with all five kinds (`bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`) beside `f`, `counter` and `sum`. The `counters` targets keep main's eight families.
   - **Why not `counters`:** a one-shard run with tablet changes off must stay at main's 32 slots (owner, 2026-10-31; a larger harness budget would hide #1212). With 13 families on 4 tables, seed 6 gave up with `Busy`, even with standard families in their place. At 10 families (40 slots), 7 of 300 engine `counters` seeds gave up (run 41166497479), against `max_slots`' promised 64.
   - **Later:** the families join `counters` once #1212 is fixed (#1214). Until then, a change to aggregate families also sweeps engine `scalar_counters` (CONTRIBUTING.md).
+  - **Done (#1214, after D302):** `counters` (engine and `pigeonhole`) holds every aggregate kind, eighteen families and 72 slots on a shard with tablet changes off, and the `scalar_counters` targets are gone. 100 seeds of each passed locally before the sweeps.
   - **Mutation:** making XOR compute OR fails 10 of the 33 engine `scalar_counters` tests.
 - **API and phdb:** a `pigeonhole` API test; a phdb shell test.
 - **Corpus:** the `aggregates` entry gains one family per kind (signed zeros, infinities, a put, a delete), still refused by 1.0.0.
@@ -3533,6 +3534,31 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Checks.**
 - `it/snapshot_room.rs`: 8 snapshots held across 8 flushes on a 64-slot shard, then 4 more rounds of writes to every slot. It fails on the old geometry at round 2 with the write-stall timeout.
 - Tests that hard-coded the old geometry keep their intent: `milestone_b` (no freeze), `api` (a batch larger than the whole arena), `read_only_fallback` (nothing flushed before the crash), and `pigeonhole`'s `processes` (a reader process's held snapshot gets room for its 3,510 rows).
+
+<a id="d303"></a>
+## D303 — Typed vector families: element, dimension and metric fixed per family, values under tag `0x04` (cli692, 2026-10-31; owner accepted revision 2, #490 c6537204287, c6542621844, c6542686802; reviewed by perf287 and perf2; format, engine, pigeonhole, #490 B, ICR 0098; under D294's `incompat` bit 0; uses D298's `kind_params`)
+**Why.** Embeddings stored as `Bytes` carry no shape: nothing checks a vector's length or components, a search has to guess the layout, and a NaN or a zero vector under cosine gives distances with no order. D296's KNN (#490 A, C) needs every stored vector to have a finite, ordered distance to every valid query.
+
+**Decided.**
+- **`FamilyKind::Vector = 16`.** Its `kind_params` (FORMAT §9.2.1) carry tag 1, the element (1 `f32`, 2 `i8`, 3 bit); tag 2, the dimension (u32 LE, 1–4096, a multiple of 8 for bit); tag 3, the metric (1 L2, 2 inner product, 3 cosine, 4 Hamming). All three are required, and the encoding is canonical. L2, inner product and cosine take `f32` or `i8`; Hamming takes bit, and bit takes only Hamming. One parse, `pigeonhole_format::vector::Params::parse`, serves catalog decode (`Corruption`) and creation (`InvalidArgument`). Skippable tags (128 and up) stay free for later hints.
+- **Value tag `0x04`** (FORMAT §3.7): element, `dim` varint, then the payload (`f32` LE, `i8`, or bits LSB first), with no alignment padding. A malformed value, an unknown element included, is `Corrupt`: a new element would take a new `incompat` bit. At most 16 KiB plus 4 bytes.
+- **Not an aggregate.** `FamilyKind::is_aggregate()` is an explicit list without `Vector`, so a vector family's cells take the commit timestamp, keep their versions (`max_versions`) and delete as a Standard family's.
+- **Never separated.** `Vector` is in `FamilyKind::values_stay_inline()`: typed values, bounded, read in place by D296's visitor.
+- **Feature bit:** the kind and tag `0x04` fall under `incompat` bit 0 with the 1.1.0 aggregate kinds; a vector family's creation sets it, and `0x04` is only ever written into a vector family.
+- **Writes (PR 2):** only `put_vector_f32`, `put_vector_i8` and `put_vector_bits` (and `_at` forms) into a vector family, of its element and dimension, refused when the write is built otherwise; no merge operator and no other value. NaN, ±∞, `f32` components above 2^56 in magnitude, and (cosine) vectors with a zero norm (an `f32` squared norm below `f32::MIN_POSITIVE`) are refused, for stored vectors and queries alike, so every distance is finite (perf287's B1 on #1255).
+- **Reads:** `Value::Vector`/`VectorRef` (PR 2); the typed `nearest_f32`, `nearest_i8` and `nearest_bits` with D296 PR 4. `i8` is raw signed bytes: the application quantises.
+- **PRs:** 1, the format, with the engine refusing a vector family (`Unsupported`) and a vector value in any batch until 2, the engine and public API; 3, the Arrow and `phdb` mappings.
+
+**Checks (PR 1).**
+- `vector.rs`: every valid configuration round-trips; each bad range, pairing and tag is refused; values decode strictly (short, long, zero dim, bit dim, overlong varint, empty, unknown element, 4,097 dims).
+- Golden siblings `values_vector.bin` and `edit_put_family_vector.bin`, frozen; the roundtrip proptest over element and dim; the fuzz harness behind a forced `0x04` and through `Params::parse`.
+- `it/vector_family.rs`: eight malformed parameter lists are `InvalidArgument`, a well-formed family is `Unsupported` with nothing created, and a vector put or merge into a Standard family is refused (perf287's B1).
+
+**Checks (PR 2).**
+- `it/vector_family.rs` (rewritten): the eight malformed lists and any merge operator are `InvalidArgument` at creation; the commit gate refuses a vector of another dimension or element, an all-zero cosine vector, a NaN component, a component above 2^56, a cosine vector whose squared norm underflows, a plain `Bytes` or `I64` put into a vector family, and a vector into a Standard family; a vector is never a merge operand; a vector put takes the commit timestamp, keeps both versions, and the newest wins (never combined).
+- `pigeonhole/tests/vectors.rs`: `f32` cosine, `i8` L2 and bit Hamming families written through `RowMutation`, `WriteBatch` and `Transaction`, across a flush and a compaction and at a 16-byte blob threshold (vectors stay inline), read back as `Value::Vector` with `to_f32_vec`, `as_bytes` and `FamilyInfo::vector`; `VectorSpec::distance_*` exact for `i8` and bits; build-time refusals (dimension, element, NaN, cosine zero, a non-vector family), plain puts, merges and aggregate inputs refused, and a refused write failing its whole batch.
+- `format::vector`: `Params::{check, payload, distance}` and `VectorRef::check_components`; the `i8` kernels score a stored vector's bytes as its `i8`s.
+- **Not in PR 2:** a vector family in the pigeonhole model target, #1256 (milestone 1.1.0); the integration test covers the write and read paths meanwhile.
 
 <a id="d304"></a>
 ## D304 — Traversal pushdown: breadth-first hops run in the engine, each a bounded read of the frontier (perf287, 2026-10-31; owner accepted revision 2, #489 c6544597002, c6544636857, c6544708521; reviewed by simp724 and cli692; engine, pigeonhole, #489 item 3, ICR 0099; on D296 and D299)

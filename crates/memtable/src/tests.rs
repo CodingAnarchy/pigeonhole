@@ -978,3 +978,22 @@ fn reused_chunks_never_show_a_previous_memtables_tails() {
         assert_eq!(seen, 120);
     }
 }
+
+#[test]
+fn a_reader_reads_its_own_memtable_only() {
+    // #1228: the engine's publish cache reuses a slot's readers while they still read the
+    // slot's memtables, compared by identity, never by root.
+    let mut arena = small();
+    let a = Memtable::create(&mut arena).unwrap();
+    let b = Memtable::create(&mut arena).unwrap();
+    let ra = a.reader();
+    assert!(ra.reads(&a) && ra.clone().reads(&a));
+    assert!(!ra.reads(&b) && b.reader().reads(&b));
+    // A memtable that reuses a reclaimed one's root is another memtable.
+    drop(ra);
+    let old_root = b.root();
+    arena.reclaim(b.retire());
+    let c = Memtable::create(&mut arena).unwrap();
+    assert_eq!(c.root(), old_root);
+    assert!(!a.reader().reads(&c) && c.reader().reads(&c));
+}

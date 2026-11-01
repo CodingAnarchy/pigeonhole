@@ -14,6 +14,7 @@ use std::io::Write;
 mod args;
 mod cmd;
 mod exit;
+mod mcp;
 mod open;
 mod output;
 mod shell;

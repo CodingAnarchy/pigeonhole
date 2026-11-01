@@ -258,26 +258,38 @@ fn harness_regressions_from_the_seed_sweep() {
 fn deferred_io_runs_take_the_commit_time_separation_path() {
     // #306: with deferred I/O the harness thread is the device, and a commit separating a
     // large value (#230) waits on the manifest writer; that wait runs the device (ICR 0028)
-    // instead of parking, so deferred runs separate values as plain runs do.
+    // instead of parking, so deferred runs separate values at commit as plain runs do. The
+    // engine counts the separations itself (`Engine::commit_separations`, #1233), so no
+    // flush, compaction or blob GC file is in the count. A seed whose runs acknowledge no
+    // large put into a family that separates (the aggregate families' values stay inline)
+    // tests nothing and is skipped; most must test.
+    let (mut tested, mut skipped) = (0u32, 0u32);
     for seed in seeds() {
         let share = |deferred: bool| {
             let mut cfg = Config::standard(250);
             cfg.shards = 3;
             cfg.deferred_io = deferred;
             let s = run(seed, &cfg).unwrap_or_else(|f| panic!("{f}"));
-            assert!(s.large_puts > 0, "seed {seed}: no large puts");
             eprintln!(
-                "seed {seed} deferred={deferred}: {} blob files for {} large puts",
-                s.blob_files, s.large_puts
+                "seed {seed} deferred={deferred}: {} commit-time separations for {} large puts",
+                s.commit_separations, s.large_puts
             );
-            s.blob_files as f64 / s.large_puts as f64
+            (s.large_puts > 0).then(|| s.commit_separations as f64 / s.large_puts as f64)
         };
-        let (plain, deferred) = (share(false), share(true));
+        let (Some(plain), Some(deferred)) = (share(false), share(true)) else {
+            skipped += 1;
+            continue;
+        };
+        tested += 1;
         assert!(
             plain > 0.0 && deferred >= plain / 2.0 && deferred <= plain * 2.0,
-            "seed {seed}: blob files per large put {deferred:.2} deferred, {plain:.2} plain"
+            "seed {seed}: commit-time separations per large put {deferred:.2} deferred, {plain:.2} plain"
         );
     }
+    assert!(
+        tested > skipped,
+        "{tested} seeds tested, {skipped} without large puts"
+    );
 }
 
 /// Transactions under frequent injected read errors, no crash armed.

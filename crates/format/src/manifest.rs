@@ -284,20 +284,43 @@ pub enum FamilyKind {
     /// the bits and hashes its `kind_params` give ([`crate::bloom`], FORMAT §3.6). Needs
     /// [`INCOMPAT_AGGREGATES`].
     Bloom = 14,
+    /// A vector family (D303, #490 B): every value is a vector (value tag `0x04`) of the
+    /// element type, dimension and metric its `kind_params` give ([`crate::vector`]). Not an
+    /// aggregate: cells version and delete as a `Standard` family's. Needs
+    /// [`INCOMPAT_AGGREGATES`].
+    Vector = 16,
 }
 
 impl FamilyKind {
-    /// Whether the kind is an aggregate family (every kind but `Standard`): operands combine
-    /// within one bucket, and the kind fixes the operator.
+    /// Whether the kind is an aggregate family: operands combine within one bucket, and the
+    /// kind fixes the operator. An explicit list (D303): every kind but `Standard` and
+    /// `Vector`.
     ///
     /// ```
     /// use pigeonhole_format::manifest::FamilyKind;
     ///
     /// assert!(!FamilyKind::Standard.is_aggregate());
     /// assert!(FamilyKind::Counter.is_aggregate() && FamilyKind::Min.is_aggregate());
+    /// assert!(!FamilyKind::Vector.is_aggregate());
     /// ```
     pub fn is_aggregate(self) -> bool {
-        self != FamilyKind::Standard
+        matches!(
+            self,
+            FamilyKind::Counter
+                | FamilyKind::Min
+                | FamilyKind::Max
+                | FamilyKind::Hll
+                | FamilyKind::BitOr
+                | FamilyKind::BitAnd
+                | FamilyKind::BitXor
+                | FamilyKind::MinF64
+                | FamilyKind::MaxF64
+                | FamilyKind::SumF64
+                | FamilyKind::MeanVar
+                | FamilyKind::Histogram
+                | FamilyKind::Quantiles
+                | FamilyKind::Bloom
+        )
     }
 
     /// The `incompat` feature bits a file must carry, in both superblock pages, before a
@@ -325,15 +348,16 @@ impl FamilyKind {
             | FamilyKind::MeanVar
             | FamilyKind::Histogram
             | FamilyKind::Quantiles
-            | FamilyKind::Bloom => INCOMPAT_AGGREGATES,
+            | FamilyKind::Bloom
+            | FamilyKind::Vector => INCOMPAT_AGGREGATES,
         }
     }
 
     /// Whether the kind's values must stay inline, never separated into blob files at commit,
     /// flush or compaction (D298): a value its built-in operator folds, or a reader must see
     /// whole. An explicit list (not "every aggregate kind"): #488 PR 5 takes `Bloom` out once
-    /// its operator folds a separated base (§4.1), and never puts `Set` in; #490's typed
-    /// vectors join it.
+    /// its operator folds a separated base (§4.1), and never puts `Set` in. Vectors are in it
+    /// (D303): typed values, at most 16 KiB, read in place.
     ///
     /// ```
     /// use pigeonhole_format::manifest::FamilyKind;
@@ -358,12 +382,14 @@ impl FamilyKind {
                 | FamilyKind::Histogram
                 | FamilyKind::Quantiles
                 | FamilyKind::Bloom
+                | FamilyKind::Vector
         )
     }
 }
 
-/// The `incompat` feature bit of the aggregate kinds added after 1.0 (bit 0, D294, D298):
-/// every kind from Min on, and `kind_params`; they ship together in 1.1.0.
+/// The `incompat` feature bit of the family kinds added after 1.0 (bit 0, D294, D298, D303):
+/// every kind from Min on (the vector kind and value tag `0x04` included), and
+/// `kind_params`; they ship together in 1.1.0.
 pub const INCOMPAT_AGGREGATES: u64 = 1 << 0;
 
 /// The persisted policy of one family. Stored in the manifest so another binary interprets
@@ -606,6 +632,7 @@ impl FamilyOptions {
                     12 => FamilyKind::Histogram,
                     13 => FamilyKind::Quantiles,
                     14 => FamilyKind::Bloom,
+                    16 => FamilyKind::Vector,
                     k => {
                         return Err(Error::UnsupportedFeature {
                             what: "family kind",
@@ -1159,6 +1186,7 @@ mod encode_tests {
             FamilyKind::Histogram,
             FamilyKind::Quantiles,
             FamilyKind::Bloom,
+            FamilyKind::Vector,
         ] {
             let plain = FamilyOptions::default().kind(kind);
             let bytes = put_family(plain.clone());

@@ -117,6 +117,9 @@ pub struct FamilyInfo {
     /// The aggregation of an aggregate family ([`Family::aggregate`]), `None` for an
     /// ordinary family. A counter family's is `Some(Aggregation::Sum)`.
     pub aggregation: Option<crate::Aggregation>,
+    /// The spec of a vector family ([`Family::vector`](crate::Family::vector), D303), `None`
+    /// for any other family.
+    pub vector: Option<crate::VectorSpec>,
     /// Versions kept per column; 0 keeps all.
     pub max_versions: u32,
     /// Cells older than this by timestamp expire; `None` keeps them.
@@ -203,6 +206,9 @@ impl FamilyInfo {
             family: Family::from_engine(o.clone()),
             counter: o.kind == FamilyKind::Counter,
             aggregation: crate::Aggregation::of_options(o),
+            vector: (o.kind == FamilyKind::Vector)
+                .then(|| crate::VectorSpec::from_kind_params(&o.kind_params))
+                .flatten(),
             max_versions: o.max_versions,
             ttl: (o.ttl_micros != 0).then(|| Duration::from_micros(o.ttl_micros)),
             bloom_bits: o.bloom_bits,

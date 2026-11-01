@@ -64,6 +64,7 @@ A stored value is a one-byte tag followed by the payload. Delete kinds have an e
 | `I64` | `0x01` | 8 bytes, `i64` LE |
 | `F64` | `0x02` | 8 bytes, IEEE-754 bit pattern LE |
 | `Varint` | `0x03` | zigzag-LEB128 `i64` |
+| `Vector` | `0x04` | a vector (§3.7; only in a vector family, D303) |
 | `Blob` | `0x80` | 16-byte blob pointer |
 
 The largest value is `2^32 - 1` bytes (decision D16).
@@ -183,7 +184,19 @@ The value of a bloom family's cell (§9.2 `kind` 14, D298) is a filter of `m` bi
 
 **Canonical form:** sparse if and only if `4·n < m/8` (the smaller form). A state that holds no bit, is dense below that threshold, has unsorted or out-of-range bits, or carries other parameters than the family's is malformed. A filter only gains bits, so it turns dense once and never back.
 
-**Storage:** the values of the kinds listed by `FamilyKind::values_stay_inline` (every aggregate kind so far) are never separated into blob files, at flush, compaction or commit (D298): their built-in operators fold stored values, never blob pointers, so a family's `blob_threshold` does not apply to them. #488 PR 5 takes Bloom out of the list once its operator folds a separated base. A whole state larger than one WAL record (a dense bloom filter of 2^21 bits or more) cannot be put in a commit until then.
+### 3.7 Vector
+
+The value of a vector family's cell (§9.2 `kind` 16, D303) is a vector of the family's element type and dimension (§9.2.1 tags 1 and 2). Tag `0x04` is followed by:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 1 | element: 1 `f32`, 2 `i8`, 3 bit |
+| 1 | varint | `dim`: 1 to 4096, a multiple of 8 for bit |
+| 1 + varint | payload | `dim` × 4 bytes of IEEE-754 `f32` LE, `dim` bytes of `i8`, or `dim / 8` bytes of bits (bit `j` in byte `j / 8` at bit `j % 8`) |
+
+There is no alignment padding. A payload whose length does not match the element and `dim`, a `dim` out of range, an overlong varint, or an unknown element is `Corrupt` (as in `kind_params`: a new element would take a new `incompat` bit). A writer refuses an element or dimension other than the family's, an `f32` component that isn't finite or exceeds 2^56 in magnitude, and in a cosine family a vector with a zero norm (all zeros, or an `f32` squared norm below `f32::MIN_POSITIVE`), so every distance is finite (from #490 B PR 2; until then no family takes a vector). The largest value is 16 KiB plus 4 bytes (tag included).
+
+**Storage:** the values of the kinds listed by `FamilyKind::values_stay_inline` (every aggregate kind so far, and Vector) are never separated into blob files, at flush, compaction or commit (D298, D303): aggregate operators fold stored values, never blob pointers, and a reader takes a vector in place, so a family's `blob_threshold` does not apply to them. #488 PR 5 takes Bloom out of the list once its operator folds a separated base. A whole state larger than one WAL record (a dense bloom filter of 2^21 bits or more) cannot be put in a commit until then.
 
 ## 4. Blocks
 
@@ -336,7 +349,7 @@ The first 128 bytes of the page, then the extension area (bytes 128..4088; forma
 
 | Set | Bit | Feature |
 |---|---|---|
-| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 14 so far, and a family's `kind_params`, §9.2.1). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
+| `incompat` | 0 | Aggregate families of kinds Min, Max and Hll (D294; §9.2 `kind` 2, 3 and 4), and of the kinds #488 adds (D298; `kind` 5 to 14 so far, and a family's `kind_params`, §9.2.1), and vector families with value tag `0x04` (D303; `kind` 16, §3.7). Set, in both pages, before the manifest commit that writes the first such family; never cleared, even once no such family remains (sticky). |
 
 A reader handles a bit it does not know by its set: an unknown `incompat` bit refuses the file (`UnsupportedFeature`), in either page, like a newer version; an unknown `ro_compat` bit allows a read-only open only (a reader process, or a writer with `read_only_fallback`, ICR 0059, which then writes nothing to any of the database's files); an unknown `compat` bit is ignored and kept by every commit. A file written before format 4 has zero in all three.
 
@@ -395,7 +408,7 @@ The body (`body_len` bytes) follows at offset 64: `edit_count` edits. In the log
 
 Each edit is `tag: u8, body_len: varint, body`. The length prefix lets a reader skip tags it does not know, where §9.3's tag ranges allow it. Field types: fixed-width LE integers; *bytes* = varint length + bytes; *string* = *bytes* of UTF-8; *opt-bytes* = `u8` (0 absent, 1 present) then *bytes* if present; *extent* = `page` u64 + `size_class` u8.
 
-*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, 10 SumF64, 11 MeanVar, 12 Histogram, 13 Quantiles, 14 Bloom, decision D298), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`), `pigeonhole.f64_sum`, `pigeonhole.f64_mean_var` (SumF64, MeanVar: finite `F64` inputs, values the states of §3.2 and §3.3), `pigeonhole.f64_histogram`, `pigeonhole.f64_quantiles` (Histogram, Quantiles: `F64` inputs, values the states of §3.4 and §3.5, built from the family's `kind_params`), `pigeonhole.bloom` (Bloom: `Bytes` filter states of §3.6, from its `kind_params`); another name is `Corrupt`. Kinds 2 to 14 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
+*FamilyOptions* = `compression` u8, `compression_level` i8, `block_size` u32, `bloom_bits` u8, `max_versions` u32, `ttl_micros` u64, `blob_threshold` u32, `merge_operator` string, `cache_priority` u8 (0 Low, 1 Normal, 2 High), `compaction` u8 (0 Leveled, 1 Tiered, 2 FifoByTime), `kind` u8 (0 Standard, 1 Counter, decision D179; 2 Min, 3 Max, 4 Hll, decision D294; 5 BitOr, 6 BitAnd, 7 BitXor, 8 MinF64, 9 MaxF64, 10 SumF64, 11 MeanVar, 12 Histogram, 13 Quantiles, 14 Bloom, decision D298; 16 Vector, decision D303), then `kind_params` *bytes*, written only when the family has parameters or a later appended field needs its slot (§9.2.1). Every kind but Standard and Vector is an aggregate family, whose `merge_operator` is fixed by the kind: `pigeonhole.i64_add` (Counter), `pigeonhole.i64_min` (Min), `pigeonhole.i64_max` (Max), `pigeonhole.hll` (Hll, its values sketches, §3.1), `pigeonhole.u64_or`, `pigeonhole.u64_and`, `pigeonhole.u64_xor` (BitOr, BitAnd, BitXor: `I64` values read as the `u64` with the same bits), `pigeonhole.f64_min`, `pigeonhole.f64_max` (MinF64, MaxF64: `F64` values, never NaN, ordered by IEEE 754 `totalOrder`, so `-0.0 < +0.0`), `pigeonhole.f64_sum`, `pigeonhole.f64_mean_var` (SumF64, MeanVar: finite `F64` inputs, values the states of §3.2 and §3.3), `pigeonhole.f64_histogram`, `pigeonhole.f64_quantiles` (Histogram, Quantiles: `F64` inputs, values the states of §3.4 and §3.5, built from the family's `kind_params`), `pigeonhole.bloom` (Bloom: `Bytes` filter states of §3.6, from its `kind_params`); another name is `Corrupt`. A Vector family's cells version and delete as a Standard family's; its values are the vectors of §3.7. Kinds 2 to 14 and 16 need `incompat` feature bit 0 (§8.2): a family of such a kind in a file whose superblock lacks the bit is `Corrupt`, and a build that does not know the bit refuses the file at the superblock, before any `PutFamily` is decoded. `kind` was appended after the 0.1.0 release: a body that ends before it (a file 0.1.0 wrote) reads as Standard, and an unknown value is `UnsupportedFeature` (ICR 0058; reached only if a file lacks the bit its kind needs). It relies on format version 2 (D181): a 0.1.0 reader ignores trailing body bytes, so without the bump it would open a file with counter families, read them as Standard and fold their fixed-timestamp increments wrongly; version 2 makes it refuse the file.
 
 #### 9.2.1 Kind parameters
 
@@ -415,8 +428,9 @@ The tags defined so far (D298):
 - **Histogram** (`kind` 12): tag 1, its bounds, as `n` `f64` LE (1 ≤ `n` ≤ 1023; finite, strictly increasing, never `-0.0`). Required.
 - **Quantiles** (`kind` 13): tag 1, the mantissa bits `p` (u8, 1–12, default 7); tag 2, the bucket limit per store (u16 LE, 16–4096, default 2048). Both optional.
 - **Bloom** (`kind` 14): tag 1, the bits `m` (u32 LE, a power of two, 2^6 to 2^24); tag 2, the positions per element `k` (u8, 1–16). Both required.
+- **Vector** (`kind` 16, D303): tag 1, the element (u8: 1 `f32`, 2 `i8`, 3 bit); tag 2, the dimension (u32 LE, 1–4096, a multiple of 8 for bit); tag 3, the metric (u8: 1 L2, 2 inner product, 3 cosine, 4 Hamming). All three required. L2, inner product and cosine take `f32` or `i8`; Hamming takes bit, and bit takes only Hamming.
 
-Values out of range are `Corrupt` at read. A writer refuses them, and any tag the family's kind doesn't define. #490's vector kind will add its own tags.
+Values out of range are `Corrupt` at read. A writer refuses them, and any tag the family's kind doesn't define.
 
 *SstMeta* = `id` u64, `extent` extent, `len` u64, `smallest_key` bytes, `largest_key` bytes, `min_seqno` u64, `max_seqno` u64, `min_ts` u64, `max_ts` u64, `entries` u64, `deletes` u64.
 

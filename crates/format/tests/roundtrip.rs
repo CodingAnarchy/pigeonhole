@@ -14,6 +14,7 @@ use pigeonhole_format::sst::{Footer, Properties};
 use pigeonhole_format::superblock::Superblock;
 use pigeonhole_format::value::{BlobPointer, ValueRef, decode_value, encode_value};
 use pigeonhole_format::varint;
+use pigeonhole_format::vector::{Element, VectorRef};
 use pigeonhole_format::wal::{
     BatchBuilder, BatchRef, FRAME_SIZE, SegmentHeader, StreamList, WalRecord,
 };
@@ -35,6 +36,17 @@ fn value() -> impl Strategy<Value = Vec<u8>> {
         any::<i64>().prop_map(|i| enc(ValueRef::I64(i))),
         any::<f64>().prop_map(|f| enc(ValueRef::F64(f))),
         any::<i64>().prop_map(|i| enc(ValueRef::Varint(i))),
+        (1u32..=64, 0u8..3, any::<u8>()).prop_map(|(n, e, fill)| {
+            let (element, dim) = match e {
+                0 => (Element::F32, n),
+                1 => (Element::I8, n),
+                _ => (Element::Bit, 8 * n),
+            };
+            let payload = vec![fill; element.payload_len(dim)];
+            enc(ValueRef::Vector(
+                VectorRef::new(element, dim, &payload).unwrap(),
+            ))
+        }),
         (any::<u32>(), any::<u32>(), any::<u64>()).prop_map(|(b, len, offset)| enc(
             ValueRef::Blob(BlobPointer {
                 blob_file: BlobFileId(b),

@@ -1061,6 +1061,12 @@ pub struct MemtableReader {
 }
 
 impl MemtableReader {
+    /// Whether this handle reads `table`: the same memtable, not one that later took its
+    /// root after its chunks were reclaimed (#1228's publish cache compares by this).
+    pub fn reads(&self, table: &Memtable) -> bool {
+        Arc::ptr_eq(&self.pin, &table.pin)
+    }
+
     /// Whether the memtable may hold a delete marker (ICR 0020). `false` only in the writer
     /// process, for a memtable whose writer never called [`Memtable::note_marker`]. Load it
     /// after taking the read point: a marker visible at that point was linked after its

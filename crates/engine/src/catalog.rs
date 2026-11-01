@@ -48,7 +48,7 @@ pub(crate) const BLOOM: &str = BloomUnion::NAME;
 /// a standard family, whose operator is its own choice.
 pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
     match kind {
-        FamilyKind::Standard => None,
+        FamilyKind::Standard | FamilyKind::Vector => None,
         FamilyKind::Counter => Some(I64_ADD),
         FamilyKind::Min => Some(I64_MIN),
         FamilyKind::Max => Some(I64_MAX),
@@ -114,6 +114,11 @@ pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
             pigeonhole_format::bloom::TAG_BITS,
             pigeonhole_format::bloom::TAG_HASHES,
         ],
+        FamilyKind::Vector => &[
+            pigeonhole_format::vector::TAG_ELEMENT,
+            pigeonhole_format::vector::TAG_DIM,
+            pigeonhole_format::vector::TAG_METRIC,
+        ],
     }
 }
 
@@ -134,6 +139,11 @@ pub(crate) fn builtin_operator(
         FamilyKind::Bloom => Some(Arc::new(BloomUnion::new(
             pigeonhole_format::bloom::BloomParams::parse(&options.kind_params).map_err(|e| e.0)?,
         ))),
+        // No operator, but its parameters are checked here all the same (D303).
+        FamilyKind::Vector => {
+            pigeonhole_format::vector::Params::parse(&options.kind_params).map_err(|e| e.0)?;
+            None
+        }
         kind => fixed_operator(kind),
     })
 }
@@ -141,7 +151,7 @@ pub(crate) fn builtin_operator(
 /// The operator of a kind without parameters.
 fn fixed_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
     match kind {
-        FamilyKind::Standard => None,
+        FamilyKind::Standard | FamilyKind::Vector => None,
         FamilyKind::Counter => Some(Arc::new(I64Add)),
         FamilyKind::Min => Some(Arc::new(I64Min)),
         FamilyKind::Max => Some(Arc::new(I64Max)),
@@ -332,6 +342,12 @@ impl Catalog {
                         family.0, options.kind
                     ))
                 })?;
+                if options.kind == FamilyKind::Vector && !name.is_empty() {
+                    return Err(Error::Corruption(format!(
+                        "manifest: vector family {} names operator {name:?}",
+                        family.0
+                    )));
+                }
                 let (merge, merge_op) = if let Some(op) = builtin {
                     // An aggregate family folds with its kind's operator (writes refuse any
                     // other name, `check_merge_operator`).
@@ -984,6 +1000,42 @@ mod cow_tests {
         }
         c.apply(&put(200), 1).unwrap();
         assert!(c.family(FamilyId(2)).is_some_and(|f| f.merge_op.is_some()));
+    }
+
+    /// D303: a vector family takes no merge operator, so a manifest whose vector family names
+    /// one (built-in or registered) is corrupt; one that names none decodes, with no operator.
+    #[test]
+    fn a_vector_family_naming_an_operator_is_corrupt() {
+        use pigeonhole_format::vector::{Element, Metric, Params};
+        let params = Params::new(Element::F32, 4, Metric::Cosine)
+            .unwrap()
+            .encode();
+        let put = |op: &str| Edit::PutFamily {
+            table: TableId(1),
+            family: FamilyId(2),
+            name: "v".into(),
+            options: FamilyOptions::default()
+                .merge_operator(op)
+                .kind(FamilyKind::Vector)
+                .kind_params(params.clone()),
+        };
+        let mut c = Catalog::default();
+        let table = Edit::CreateTable {
+            table: TableId(1),
+            name: "t".into(),
+        };
+        c.apply(&table, 1).unwrap();
+        for op in [I64_ADD, "app.concat"] {
+            match c.apply(&put(op), 1) {
+                Err(Error::Corruption(why)) => {
+                    assert!(why.contains("vector family"), "{op}: {why}")
+                }
+                other => panic!("{op}: {other:?}"),
+            }
+        }
+        c.apply(&put(""), 1).unwrap();
+        let f = c.family(FamilyId(2)).expect("decoded");
+        assert!(f.merge_op.is_none() && f.merge == MergeKind::None);
     }
 
     /// Random batches of edits (#499): the slot-level `removed_since` and

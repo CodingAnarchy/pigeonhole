@@ -14,7 +14,9 @@
 
 use std::path::Path;
 
-use pigeonhole::{ErrorCode, Options, Pigeonhole, PigeonholeReader, ReaderOptions};
+use pigeonhole::{
+    ErrorCode, Options, Pigeonhole, PigeonholeReader, ReadTable, ReaderOptions, Table,
+};
 
 use crate::args::Cli;
 use crate::exit::Failure;
@@ -28,13 +30,33 @@ pub(crate) enum Db {
     Reader(PigeonholeReader),
 }
 
+/// A table handle in either role.
+pub(crate) enum Handle {
+    Writer(Table),
+    Reader(ReadTable),
+}
+
 impl Db {
+    /// `table`'s handle in this role.
+    pub(crate) fn handle(&self, table: &str) -> Result<Handle, Failure> {
+        let fail = |e: pigeonhole::Error| Failure::db(&format!("table {table}"), &e);
+        Ok(match self {
+            Db::Writer(db) => Handle::Writer(db.table(table).and_then(|b| b.open()).map_err(fail)?),
+            Db::Reader(db) => Handle::Reader(db.table(table).map_err(fail)?),
+        })
+    }
+
     /// `"writer"` or `"reader"`, for the output.
     pub(crate) fn mode(&self) -> &'static str {
         match self {
             Db::Writer(_) => "writer",
             Db::Reader(_) => "reader",
         }
+    }
+
+    /// Whether writes can succeed: the writer, unless it fell back to a read-only open.
+    pub(crate) fn writable(&self) -> bool {
+        matches!(self, Db::Writer(_)) && self.info().is_ok_and(|i| !i.read_only)
     }
 
     pub(crate) fn info(&self) -> pigeonhole::Result<pigeonhole::DatabaseInfo> {
@@ -171,6 +193,12 @@ pub(crate) fn for_read(cli: &Cli, path: &Path) -> Result<Db, Failure> {
         }
         Err(e) => Err(Failure::db("open", &e)),
     }
+}
+
+/// Opens `path` as a reader process only (`phdb mcp --read-only`), whatever `--writer` says.
+pub(crate) fn reader_only(cli: &Cli, path: &Path) -> Result<Db, Failure> {
+    exists(path)?;
+    reader(cli, path).map(Db::Reader)
 }
 
 fn exists(path: &Path) -> Result<(), Failure> {

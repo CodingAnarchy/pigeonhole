@@ -34,6 +34,7 @@ pub mod sst;
 pub mod superblock;
 pub mod value;
 pub mod varint;
+pub mod vector;
 pub mod version;
 pub mod wal;
 

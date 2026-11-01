@@ -17,6 +17,7 @@
 | `phdb backup <file> <dest> [--latest] [--check]` | Copy the database into one new file, consistent at one snapshot, also while your application runs. |
 | `phdb compact <file> [--shrink]` | Full compaction, with progress; optionally release free space at the file's end. |
 | `phdb shell <file> [-c CMD]... [-f SCRIPT] [--read-only]` | An interactive shell: get, scan, put, incr, delete, create and snapshots. |
+| `phdb mcp <file> [--read-only] [--create]` | A Model Context Protocol server on standard input and output, for AI agents: see [Using Pigeonhole from AI agents](ai-agents.md). New in 1.1.0. |
 
 **Global flags,** before or after the command:
 

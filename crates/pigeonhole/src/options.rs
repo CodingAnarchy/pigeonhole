@@ -1275,10 +1275,10 @@ impl Aggregation {
     }
 
     /// The aggregation of an engine family kind without parameters (`None` for a standard
-    /// family).
+    /// or vector family).
     fn of_kind(kind: FamilyKind) -> Option<Self> {
         match kind {
-            FamilyKind::Standard => None,
+            FamilyKind::Standard | FamilyKind::Vector => None,
             FamilyKind::Counter => Some(Aggregation::Sum),
             FamilyKind::Min => Some(Aggregation::Min),
             FamilyKind::Max => Some(Aggregation::Max),
@@ -1369,6 +1369,17 @@ impl Family {
                 .merge_operator(aggregation.operator().to_owned())
                 .kind(aggregation.kind())
                 .kind_params(aggregation.kind_params()),
+        }
+    }
+
+    /// A vector family (D303): every value is a vector of `spec`'s element type and
+    /// dimension, ranked by its metric. See [`VectorSpec`](crate::VectorSpec) for the writes
+    /// it takes and what it refuses.
+    pub fn vector(spec: crate::VectorSpec) -> Self {
+        Self {
+            options: FamilyOptions::default()
+                .kind(FamilyKind::Vector)
+                .kind_params(spec.kind_params()),
         }
     }
 

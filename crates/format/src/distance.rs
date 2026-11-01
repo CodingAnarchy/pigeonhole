@@ -115,18 +115,59 @@ pub fn norm2_f32(q: &[f32]) -> f32 {
     sum
 }
 
+/// The squared norm of the little-endian `f32` vector `v`, in [`norm2_f32`]'s order: the
+/// same bits as `norm2_f32` of its components, and as [`dot_norm_f32_le`]'s norm.
+pub fn norm2_f32_le(v: &[u8]) -> f32 {
+    let (g, t) = v.as_chunks::<{ 4 * LANES }>();
+    let mut acc = [0f32; LANES];
+    for c in g {
+        for (i, a) in acc.iter_mut().enumerate() {
+            let x = le(c, i);
+            *a += x * x;
+        }
+    }
+    let mut sum = tree(acc);
+    for c in t.as_chunks::<4>().0 {
+        let x = f32::from_le_bytes(*c);
+        sum += x * x;
+    }
+    sum
+}
+
 /// Cosine distance `1 - (q·v) / (|q| |v|)` from [`dot_norm_f32_le`]'s parts and `q`'s
 /// squared norm. NaN when either norm is zero (the caller refuses or skips those).
 pub fn cosine_from(dot: f32, q_norm2: f32, v_norm2: f32) -> f32 {
     1.0 - dot / (q_norm2.sqrt() * v_norm2.sqrt())
 }
 
-/// Squared Euclidean distance between two `i8` vectors, exact.
-pub fn l2_i8(a: &[i8], b: &[i8]) -> u32 {
+/// A signed byte: an `i8`, or a stored byte read as one (a vector's `i8` payload), so the
+/// exact integer kernels take either without reinterpreting a slice.
+pub trait SignedByte: Copy {
+    /// The byte's value.
+    fn value(self) -> i32;
+}
+
+impl SignedByte for i8 {
+    #[inline(always)]
+    fn value(self) -> i32 {
+        i32::from(self)
+    }
+}
+
+impl SignedByte for u8 {
+    #[inline(always)]
+    fn value(self) -> i32 {
+        i32::from(self as i8)
+    }
+}
+
+/// Squared Euclidean distance between two `i8` vectors (either as `i8`s or as the bytes of a
+/// stored `i8` vector), exact.
+pub fn l2_i8<A: SignedByte, B: SignedByte>(a: &[A], b: &[B]) -> u32 {
     debug_assert_eq!(a.len(), b.len());
     let ((ga, ta), (gb, tb)) = (a.as_chunks::<LANES>(), b.as_chunks::<LANES>());
-    let sq = |x: i8, y: i8| {
-        let d = (i32::from(x) - i32::from(y)).unsigned_abs();
+    let sq = |x: A, y: B| {
+        let d = (x.value() - y.value()).unsigned_abs();
         d * d
     };
     let mut acc = [0u32; LANES];
@@ -138,20 +179,20 @@ pub fn l2_i8(a: &[i8], b: &[i8]) -> u32 {
     acc.iter().sum::<u32>() + ta.iter().zip(tb).map(|(x, y)| sq(*x, *y)).sum::<u32>()
 }
 
-/// The inner product of two `i8` vectors, exact.
-pub fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+/// The inner product of two `i8` vectors (either as `i8`s or as stored bytes), exact.
+pub fn dot_i8<A: SignedByte, B: SignedByte>(a: &[A], b: &[B]) -> i32 {
     debug_assert_eq!(a.len(), b.len());
     let ((ga, ta), (gb, tb)) = (a.as_chunks::<LANES>(), b.as_chunks::<LANES>());
     let mut acc = [0i32; LANES];
     for (ca, cb) in ga.iter().zip(gb) {
         for i in 0..LANES {
-            acc[i] += i32::from(ca[i]) * i32::from(cb[i]);
+            acc[i] += ca[i].value() * cb[i].value();
         }
     }
     acc.iter().sum::<i32>()
         + ta.iter()
             .zip(tb)
-            .map(|(x, y)| i32::from(*x) * i32::from(*y))
+            .map(|(x, y)| x.value() * y.value())
             .sum::<i32>()
 }
 
@@ -224,6 +265,11 @@ mod tests {
                 .sum();
             assert!((f64::from(dot) - dot_ref).abs() <= 1e-4, "n = {n}");
             assert_eq!(norm.to_bits(), norm2_f32(&v).to_bits(), "one norm order");
+            assert_eq!(
+                norm2_f32_le(&vb).to_bits(),
+                norm.to_bits(),
+                "from the stored bytes"
+            );
             let cos = cosine_from(dot, norm2_f32(&q), norm);
             assert!((-1e-6..=2.0 + 1e-6).contains(&cos), "n = {n}: {cos}");
         }
@@ -249,6 +295,12 @@ mod tests {
             .map(|(x, y)| i32::from(*x) * i32::from(*y))
             .sum();
         assert_eq!((l2_i8(&a, &b), dot_i8(&a, &b)), (l2, dot));
+        let stored: Vec<u8> = b.iter().map(|x| *x as u8).collect();
+        assert_eq!(
+            (l2_i8(&a, &stored), dot_i8(&a, &stored)),
+            (l2, dot),
+            "a stored i8 vector's bytes score as its i8s"
+        );
         let extremes = [i8::MIN; 4096];
         let other = [i8::MAX; 4096];
         assert_eq!(

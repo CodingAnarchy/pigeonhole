@@ -18,10 +18,13 @@ members = [
     "crates/arrow",
     "crates/cli",
     "crates/capi",
+    "crates/vector",
+    "crates/python",
 ]
 
 [workspace.package]
-# The public version line (D295): `pigeonhole`, `pigeonhole-arrow` and `pigeonhole-cli`,
+# The public version line (D295): `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli` and
+# `pigeonhole-vector`,
 # which follow semver from 1.0; the unpublished `pigeonhole-capi` and `pigeonhole-bench` take
 # the public line's version too. The 12 internal crates set their own `version`: one shared
 # internal line, which takes a new major for any incompatible change to any of them.
@@ -56,6 +59,7 @@ pigeonhole = { path = "crates/pigeonhole", version = "1.0.0" }
 pigeonhole-bench = { path = "crates/bench", version = "1.0.0" }
 pigeonhole-arrow = { path = "crates/arrow", version = "1.0.0" }
 pigeonhole-cli = { path = "crates/cli", version = "1.0.0" }
+pigeonhole-vector = { path = "crates/vector", version = "1.0.0" }
 pigeonhole-capi = { path = "crates/capi", version = "1.0.0" }
 
 # External dependencies. Each one is justified in docs/design/interfaces.md.

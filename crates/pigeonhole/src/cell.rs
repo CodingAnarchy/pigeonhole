@@ -16,6 +16,8 @@ pub enum Value<'a> {
     F64(f64),
     /// A varint-encoded signed integer.
     Varint(i64),
+    /// A vector, in a vector family (D303, [`VectorSpec`](crate::VectorSpec)).
+    Vector(crate::VectorRef<'a>),
 }
 
 /// The value bytes of a stored value: everything after the tag byte.
@@ -30,6 +32,7 @@ fn typed(data: &CellData) -> Value<'_> {
         ValueRef::I64(v) => Value::I64(v),
         ValueRef::F64(v) => Value::F64(v),
         ValueRef::Varint(v) => Value::Varint(v),
+        ValueRef::Vector(v) => Value::Vector(crate::VectorRef::new(v)),
         // The engine resolves blob pointers on read; never reached.
         ValueRef::Blob(_) => Value::Bytes(&[]),
     }
@@ -219,6 +222,14 @@ impl<'a> CellRef<'a> {
         as_f64(&self.data)
     }
 
+    /// The value as a vector, if it is one (a vector family's cells are, D303).
+    pub fn as_vector(&self) -> Option<crate::VectorRef<'_>> {
+        match self.data.value() {
+            ValueRef::Vector(v) => Some(crate::VectorRef::new(v)),
+            _ => None,
+        }
+    }
+
     /// The sum an exact-sum state holds, rounded once to the nearest `f64`, as an exact-sum
     /// family's cells hold ([`Aggregation::SumF64`](crate::Aggregation::SumF64), D298). The
     /// value's shape decides, as for [`hll_estimate`](Self::hll_estimate): `None` unless it
@@ -338,6 +349,14 @@ impl Cell {
     /// The value as an `f64`, if it is one (an `f64` aggregate family's cells are).
     pub fn as_f64(&self) -> Option<f64> {
         as_f64(&self.data)
+    }
+
+    /// The value as a vector, if it is one (a vector family's cells are, D303).
+    pub fn as_vector(&self) -> Option<crate::VectorRef<'_>> {
+        match self.data.value() {
+            ValueRef::Vector(v) => Some(crate::VectorRef::new(v)),
+            _ => None,
+        }
     }
 
     /// The sum an exact-sum state holds, rounded once to the nearest `f64`, as an exact-sum

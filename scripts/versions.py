@@ -9,8 +9,8 @@
 
 - **The internal line:** the 12 internal crates (`INTERNAL`) each set the same `version` in
   their own Cargo.toml. Any incompatible change to any of them takes the line's next major.
-- **The public line:** `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli` and the unpublished
-  `pigeonhole-capi` and `pigeonhole-bench` take the workspace version
+- **The public line:** `pigeonhole`, `pigeonhole-arrow`, `pigeonhole-cli`, `pigeonhole-vector`
+  and the unpublished `pigeonhole-capi` and `pigeonhole-bench` take the workspace version
   (`[workspace.package] version`), under semver from 1.0.
 - **Pins:** the workspace's `[workspace.dependencies]` pins each internal crate exactly at
   the internal line (`=X.Y.Z`, D282) and each public crate at the public line.
@@ -38,7 +38,7 @@ INTERNAL = [
     "format", "io", "sim", "pager", "wal", "memtable", "cache", "runtime", "shm", "sst",
     "compaction", "engine",
 ]
-PUBLIC = ["pigeonhole", "arrow", "cli"]
+PUBLIC = ["pigeonhole", "arrow", "cli", "vector"]
 UNPUBLISHED = ["capi", "bench"]
 
 

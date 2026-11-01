@@ -284,7 +284,7 @@ impl TableCore {
             Operand::Bytes => "aggregate_bytes",
         };
         let (what, method) = match kind {
-            K::Standard => {
+            K::Standard | K::Vector => {
                 return Err(Error::new(
                     ErrorCode::InvalidArgument,
                     format!(
@@ -317,6 +317,53 @@ impl TableCore {
                 self.info.name
             ),
         ))
+    }
+
+    /// Checks a vector put's value against its family (D303): a vector family, and a vector
+    /// of its spec, encoded into `out`. Returns the family's parameters for the value.
+    pub(crate) fn vector_payload(
+        &self,
+        name: &str,
+        q: pigeonhole_format::vector::Query<'_>,
+        out: &mut Vec<u8>,
+    ) -> Result<pigeonhole_format::vector::Params> {
+        let current;
+        let f = match self.info.family(name) {
+            Some(f) => f,
+            None => {
+                current = self.current_info();
+                current
+                    .family(name)
+                    .ok_or_else(|| family_not_found(&self.info.name, name))?
+            }
+        };
+        let spec = (f.options.kind == pigeonhole_engine::FamilyKind::Vector)
+            .then(|| crate::VectorSpec::from_kind_params(&f.options.kind_params))
+            .flatten()
+            .ok_or_else(|| {
+                Error::new(
+                    ErrorCode::InvalidArgument,
+                    format!(
+                        "family {name:?} of table {:?} is not a vector family: put_vector_* \
+                         needs Family::vector",
+                        self.info.name
+                    ),
+                )
+            })?;
+        crate::vector::payload(&spec, q, out).map_err(|e| {
+            Error::new(
+                e.code(),
+                format!(
+                    "family {name:?} of table {:?} ({} {:?}, {:?}): {}",
+                    self.info.name,
+                    spec.dim(),
+                    spec.element(),
+                    spec.metric(),
+                    e.message()
+                ),
+            )
+        })?;
+        Ok(*spec.params())
     }
 
     /// Resolves a family name: from the handle's entry (no allocation), else from the
