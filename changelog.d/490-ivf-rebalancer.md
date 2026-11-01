@@ -1,0 +1,2 @@
+### Added
+- `pigeonhole-vector` (D306 PR 2): `Index::bulk_load_*` loads an empty index from a stream of vectors: k-means chooses the lists, then each list is written a batch per transaction. `Rebalance::Background` moves splits and merges out of the writes, into the crate's own thread or into a `Rebalancer` the application runs (`Index::open_with_rebalancer`), as with application-owned background workers.

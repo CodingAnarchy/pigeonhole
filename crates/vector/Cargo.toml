@@ -18,3 +18,11 @@ pigeonhole = { workspace = true }
 
 [lints]
 workspace = true
+
+[features]
+# Hold and fault seams for this crate's tests (`hooks`, as ICR 0085's): hidden, outside the
+# semver promise; never turn it on in an application.
+__unstable-hooks = []
+
+[dev-dependencies]
+pigeonhole-vector = { path = ".", features = ["__unstable-hooks"] }

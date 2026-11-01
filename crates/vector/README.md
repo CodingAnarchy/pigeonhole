@@ -6,4 +6,4 @@ An IVF (inverted-file) vector index for [Pigeonhole](https://github.com/CodingAn
 - **Rebalancing:** lists split and merge incrementally, inside the inserts and deletes that cause them. A `Rebalancer` the application drives can take that work instead. Every move is a transaction.
 - **Target:** 95% recall@10 on SIFT1M at 10 ms or less, single-threaded.
 
-**Status:** this crate is being built for Pigeonhole 1.1.0 and has no API yet. It follows the public 1.x version line, with semver from its first release.
+**Status:** the index, bulk loading, and inline or background rebalancing (D306 PRs 1 and 2). The measured defaults and a guide come next. It follows the public 1.x version line, with semver from its first release.

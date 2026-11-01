@@ -27,7 +27,7 @@ use super::{
     skips_columns, take_scan_resolver,
 };
 use crate::snapshot::{Snapshot, TabletEntry, View};
-use crate::{Error, Result};
+use crate::{ColumnPosition, Error, Result};
 
 /// A row range on unescaped row keys, `(start, end)`.
 pub type RowRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
@@ -203,6 +203,14 @@ pub struct ReduceSpec {
     /// [`ReadInput::Keys`] input it counts keys: a key set's rows are not estimated before
     /// they are read. Key groups are per tablet, so keys inside one tablet never fan out.
     pub parallel_floor: u64,
+    /// D308: the read of this row (unescaped), if the input reaches it, resumes after this
+    /// column: families the read selects before the position's skip the row, the
+    /// position's family starts past the column (all its versions), and later families
+    /// start at the selection's own bound. Other rows are read as usual. A position from
+    /// another table, or whose family the read doesn't select, is `InvalidArgument`; so is
+    /// one whose row a range excludes by its start (`Bound::Excluded(row)`): the row would be
+    /// skipped whole, so a range resumed in a row starts at `Bound::Included(row)`.
+    pub resume: Option<(Vec<u8>, ColumnPosition)>,
 }
 
 impl ReduceSpec {
@@ -213,6 +221,7 @@ impl ReduceSpec {
             read: ReadSpec::default(),
             parallelism: 1,
             parallel_floor: PARALLEL_FLOOR_ENTRIES,
+            resume: None,
         }
     }
 }
@@ -381,6 +390,72 @@ struct Ctx<'a> {
     read: &'a ReadSpec,
     now: Timestamp,
     abort: &'a AtomicBool,
+    resume: Option<&'a Resume>,
+}
+
+/// [`ReduceSpec::resume`], checked and encoded: the row, the position's family's rank in the
+/// read's family order, and the key just past every version of the column.
+pub(super) struct Resume {
+    row: Vec<u8>,
+    rank: u32,
+    past: Vec<u8>,
+}
+
+impl Resume {
+    pub(super) fn new(
+        table: TableId,
+        families: &[FamilyId],
+        (row, pos): &(Vec<u8>, ColumnPosition),
+    ) -> Result<Self> {
+        if pos.table() != table {
+            return Err(Error::InvalidArgument(
+                "a position from another table".to_owned(),
+            ));
+        }
+        let Some(rank) = families.iter().position(|f| *f == pos.family()) else {
+            return Err(Error::InvalidArgument(
+                "a position whose family the read does not select".to_owned(),
+            ));
+        };
+        let mut col = Vec::new();
+        pigeonhole_format::key::encode_column_prefix(&mut col, row, pos.qualifier())?;
+        let mut past = Vec::new();
+        past_row(&col, &mut past);
+        Ok(Self {
+            row: row.clone(),
+            rank: rank as u32,
+            past,
+        })
+    }
+
+    /// Whether `row` (unescaped) is the position's row.
+    pub(super) fn is(&self, row: &[u8]) -> bool {
+        self.row == row
+    }
+
+    /// Positions the lane of family rank `rank`, pending in the position's row (escaped as
+    /// `row_esc`), as the resume says: dropped from the row, moved past the column, or left.
+    pub(super) fn apply(&self, lane: &mut Lane, rank: u32, row_esc: &[u8]) -> Result<()> {
+        if !in_row(lane, row_esc) {
+            return Ok(());
+        }
+        match rank.cmp(&self.rank) {
+            std::cmp::Ordering::Less => {
+                lane.pending = false;
+                lane.resolver.skip_row()
+            }
+            std::cmp::Ordering::Equal => {
+                if lane.col() < self.past.as_slice() {
+                    lane.pending = false;
+                    lane.pinned = None;
+                    lane.resolver.seek(&self.past)?;
+                    lane.fetch()?;
+                }
+                Ok(())
+            }
+            std::cmp::Ordering::Greater => Ok(()),
+        }
+    }
 }
 
 /// Opens the group's lanes, one per family with data in the tablet's range, each seeked to
@@ -446,7 +521,7 @@ fn rank_of(families: &[FamilyId], family: FamilyId) -> u32 {
 }
 
 /// Whether the lane's pending cell is in the row whose escaped key is `row_esc`.
-fn in_row(lane: &Lane, row_esc: &[u8]) -> bool {
+pub(super) fn in_row(lane: &Lane, row_esc: &[u8]) -> bool {
     if !lane.pending {
         return false;
     }
@@ -466,14 +541,14 @@ fn skip_row(lanes: &mut [Lane], row_esc: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Reads one group into `reducer`.
+/// Reads one group into `reducer`; `true` when the reducer broke (it has all it can take).
 fn run_group<V, R>(
     ctx: &Ctx<'_>,
     g: &Group<'_>,
     visitor: &mut V,
     reducer: &mut R,
     stats: &mut ReduceStats,
-) -> Result<()>
+) -> Result<bool>
 where
     V: CellVisitor<Item = R::Item>,
     R: Reducer,
@@ -506,7 +581,7 @@ fn visit_lanes<V, R>(
     visitor: &mut V,
     reducer: &mut R,
     stats: &mut ReduceStats,
-) -> Result<()>
+) -> Result<bool>
 where
     V: CellVisitor<Item = R::Item>,
     R: Reducer,
@@ -514,7 +589,7 @@ where
     let (mut row_esc, mut row, mut qualifier) = (Vec::new(), Vec::new(), Vec::new());
     loop {
         if ctx.abort.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(false);
         }
         for lane in lanes.iter_mut() {
             if !lane.pending && !lane.done {
@@ -528,7 +603,7 @@ where
             .map(|l| row_of(l.col()))
             .min()
         else {
-            return Ok(());
+            return Ok(false);
         };
         row_esc.clear();
         row_esc.extend_from_slice(best);
@@ -544,7 +619,17 @@ where
             Bound::Unbounded => false,
         };
         if past {
-            return Ok(());
+            return Ok(false);
+        }
+        if let Some(r) = ctx.resume
+            && r.is(&row)
+        {
+            for (lane, &rank) in lanes.iter_mut().zip(ranks) {
+                r.apply(lane, rank, &row_esc)?;
+            }
+            if !lanes.iter().any(|l| in_row(l, &row_esc)) {
+                continue;
+            }
         }
         stats.rows += 1;
         if stats.rows.is_multiple_of(FORK_CHECK_ROWS) {
@@ -572,12 +657,12 @@ where
                     Visit::Emit(item) => (Some(item), None),
                     Visit::EmitAndNextRow(item) => (Some(item), Some(false)),
                     Visit::NextRow => (None, Some(false)),
-                    Visit::Stop => return Ok(()),
+                    Visit::Stop => return Ok(false),
                 };
                 if let Some(item) = item
                     && reducer.push(cell, item).is_break()
                 {
-                    return Ok(());
+                    return Ok(true);
                 }
                 if after.is_some() {
                     next_row = true;
@@ -594,14 +679,14 @@ where
 
 /// Reads one key group into `reducer` through its own [`KeyCursor`] (D296 PR 2): the visitor
 /// sees each present key's resolved cells in place, as for a range; `NextRow` skips the rest
-/// of the key without reading it.
+/// of the key without reading it. `true` when the reducer broke.
 fn run_keys<V, R>(
     ctx: &Ctx<'_>,
     group: &KeyGroup,
     visitor: &mut V,
     reducer: &mut R,
     stats: &mut ReduceStats,
-) -> Result<()>
+) -> Result<bool>
 where
     V: CellVisitor<Item = R::Item>,
     R: Reducer,
@@ -624,11 +709,17 @@ where
     let mut rank: Option<(FamilyId, u32)> = None;
     while let Some(i) = cur.next_key()? {
         if ctx.abort.load(Ordering::Relaxed) {
-            return Ok(());
+            return Ok(false);
         }
-        stats.rows += 1;
         row.clear();
         row.extend_from_slice(keys.get(i));
+        if let Some(r) = ctx.resume
+            && r.is(&row)
+            && !cur.resume_in_row(r)?
+        {
+            continue;
+        }
+        stats.rows += 1;
         loop {
             let Some(c) = cur.next_cell()? else {
                 break;
@@ -655,12 +746,12 @@ where
                 Visit::Emit(item) => (Some(item), false),
                 Visit::EmitAndNextRow(item) => (Some(item), true),
                 Visit::NextRow => (None, true),
-                Visit::Stop => return Ok(()),
+                Visit::Stop => return Ok(false),
             };
             if let Some(item) = item
                 && reducer.push(cell, item).is_break()
             {
-                return Ok(());
+                return Ok(true);
             }
             if next_row {
                 cur.skip_rest_of_key();
@@ -668,7 +759,7 @@ where
             }
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// [`Engine::reduce`](crate::Engine::reduce): [`reduce_into`], then the merged reducer's
@@ -710,6 +801,23 @@ where
     R: Reducer,
 {
     let view = Arc::clone(&snapshot.view);
+    let resume = spec
+        .resume
+        .as_ref()
+        .map(|r| Resume::new(table, families, r))
+        .transpose()?;
+    // perf287's N1 on #1264: an excluded start skips its row before the resume could apply.
+    if let (Some((row, _)), ReadInput::Ranges(ranges)) = (&spec.resume, &spec.input)
+        && ranges
+            .iter()
+            .any(|(start, _)| matches!(start, Bound::Excluded(s) if s == row))
+    {
+        return Err(Error::InvalidArgument(
+            "a resume in a row that a range's excluded start skips: start the range at the \
+             row, included"
+                .to_owned(),
+        ));
+    }
     let groups = work(snapshot, table, &spec.input)?;
     let abort = AtomicBool::new(false);
     let ctx = Ctx {
@@ -720,6 +828,7 @@ where
         read: &spec.read,
         now,
         abort: &abort,
+        resume: resume.as_ref(),
     };
     let threads = if may_fan_out && spec.parallelism > 1 && groups.len() > 1 {
         let by_work = match spec.parallel_floor {
@@ -739,21 +848,31 @@ where
     } else {
         1
     };
-    // One visitor and reducer per group: a group stops only on its own account.
-    let run = |w: &Work<'_>, stats: &mut ReduceStats| -> Result<R> {
+    // One visitor per group. `true` when the reducer broke.
+    let run_into = |w: &Work<'_>, r: &mut R, stats: &mut ReduceStats| -> Result<bool> {
         let mut v = visitor();
-        let mut r = reducer();
         match w {
-            Work::Range(g) => run_group(&ctx, g, &mut v, &mut r, stats)?,
-            Work::Keys(k) => run_keys(&ctx, k, &mut v, &mut r, stats)?,
+            Work::Range(g) => run_group(&ctx, g, &mut v, r, stats),
+            Work::Keys(k) => run_keys(&ctx, k, &mut v, r, stats),
         }
+    };
+    // Fanned out, one reducer per group as well: a group stops only on its own account.
+    let run = |w: &Work<'_>, stats: &mut ReduceStats| -> Result<R> {
+        let mut r = reducer();
+        run_into(w, &mut r, stats)?;
         Ok(r)
     };
     let mut stats = ReduceStats::default();
     let mut acc = reducer();
     if threads <= 1 {
+        // Sequentially, every group pushes into the one accumulator (D308 B2). The groups
+        // are in key order, so its pushes are the read's cells in order, exactly as one
+        // scan would push them; a `Break` means the whole read has what it needs, and the
+        // groups after it are not read. No per-group merge.
         for g in &groups {
-            acc.merge(run(g, &mut stats)?);
+            if run_into(g, &mut acc, &mut stats)? {
+                break;
+            }
         }
         stats.threads = 1;
     } else {
@@ -903,6 +1022,214 @@ impl<I: Send> Reducer for Limit<I> {
 
     fn finish(self) -> Vec<(CellKey, I)> {
         self.kept
+    }
+}
+
+/// D308: the per-item overhead in a budget's size, standing for the timestamp (8 bytes), the
+/// family and the item's framing. Stable from 1.1.0.
+pub const BUDGET_ITEM_OVERHEAD: u64 = 16;
+
+/// The first column past a [`ByteBudget`]'s prefix: its first cell, and its size as the
+/// first item of a page (every version the read selects, plus the row key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Overflow {
+    /// The column's first cell.
+    pub key: CellKey,
+    /// Its size, the row key included: a budget of this size returns it whole when a read
+    /// resumes at it.
+    pub bytes: u64,
+}
+
+/// A [`ByteBudget`]'s result.
+#[derive(Debug)]
+#[non_exhaustive]
+pub struct BytePage<I> {
+    /// The kept cells, in cell order.
+    pub items: Vec<(CellKey, I)>,
+    /// Their size by D308's rule: each item's own size, plus each row's key once.
+    pub bytes: u64,
+    /// The first column that didn't fit, when the budget cut the read.
+    pub overflow: Option<Overflow>,
+}
+
+struct Kept<I> {
+    key: CellKey,
+    item: I,
+    /// The item's own size, without its row key.
+    size: u64,
+}
+
+/// The longest prefix of the read's cells, in cell order, whose size is at most `budget`
+/// bytes (D308): `Limit` measured in bytes, cut at column boundaries. An item's own size is
+/// `size(cell, item)` (by D308, its qualifier, its value and [`BUDGET_ITEM_OVERHEAD`]); each
+/// row's key counts once, on the row's first kept cell.
+///
+/// A column (every version the read selects) is admitted whole or not at all: the read
+/// pushes one cell per version, so a column that doesn't fit is rolled back, and its
+/// remaining versions are counted into the [`Overflow`] before the group breaks on the next
+/// column. A group stops on its own budget (D296 rev 1.2); `merge` concatenates and cuts the
+/// global prefix again, which is exact: a row never spans two groups, so each cell's size is
+/// the same in its group as in the whole read, and a group's share of the global prefix is a
+/// prefix of its own cells that its budget already covered.
+pub struct ByteBudget<I, F> {
+    budget: u64,
+    size: F,
+    kept: Vec<Kept<I>>,
+    used: u64,
+    /// The open column's first cell, and its start in `kept`.
+    open: Option<CellKey>,
+    open_at: usize,
+    overflow: Option<Overflow>,
+}
+
+impl<I, F> std::fmt::Debug for ByteBudget<I, F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteBudget")
+            .field("budget", &self.budget)
+            .field("kept", &self.kept.len())
+            .field("used", &self.used)
+            .field("overflow", &self.overflow)
+            .finish()
+    }
+}
+
+impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
+    /// Keeps the in-budget prefix, an item's own size given by `size`.
+    pub fn new(budget: u64, size: F) -> Self {
+        Self {
+            budget,
+            size,
+            kept: Vec::new(),
+            used: 0,
+            open: None,
+            open_at: 0,
+            overflow: None,
+        }
+    }
+
+    /// The result: the kept cells, their size, and the first column that didn't fit.
+    pub fn into_page(mut self) -> BytePage<I> {
+        self.cut();
+        BytePage {
+            bytes: self.used,
+            overflow: self.overflow,
+            items: self.kept.into_iter().map(|k| (k.key, k.item)).collect(),
+        }
+    }
+
+    /// Re-cuts `kept` (in cell order) to the global prefix: columns admitted whole while
+    /// they fit, and nothing at or past a recorded overflow.
+    fn cut(&mut self) {
+        let mut used = 0u64;
+        let mut keep = 0;
+        let mut i = 0;
+        let mut first_out: Option<Overflow> = None;
+        while i < self.kept.len() {
+            if let Some(o) = &self.overflow
+                && self.kept[i].key >= o.key
+            {
+                break;
+            }
+            // The column starting at `i`.
+            let mut j = i + 1;
+            while j < self.kept.len() && same_column(&self.kept[j].key, &self.kept[i].key) {
+                j += 1;
+            }
+            let row = &self.kept[i].key.row;
+            let new_row = keep == 0 || self.kept[keep - 1].key.row != *row;
+            let own: u64 = self.kept[i..j].iter().map(|k| k.size).sum();
+            let charge = if new_row { row.len() as u64 } else { 0 };
+            if used + own + charge > self.budget {
+                first_out = Some(Overflow {
+                    key: self.kept[i].key.clone(),
+                    bytes: own + row.len() as u64,
+                });
+                break;
+            }
+            used += own + charge;
+            keep = j;
+            i = j;
+        }
+        self.overflow = match (self.overflow.take(), first_out) {
+            (Some(a), Some(b)) => Some(if a.key <= b.key { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        self.kept.truncate(keep);
+        self.used = used;
+    }
+}
+
+fn same_column(a: &CellKey, b: &CellKey) -> bool {
+    a.row == b.row && a.family_rank == b.family_rank && a.qualifier == b.qualifier
+}
+
+impl<I: Send, F: Fn(&CellRef<'_>, &I) -> u64 + Send> Reducer for ByteBudget<I, F> {
+    type Item = I;
+
+    fn push(&mut self, cell: CellRef<'_>, item: I) -> ControlFlow<()> {
+        let same = self.open.as_ref().is_some_and(|o| {
+            o.row == cell.row && o.family_rank == cell.family_rank && o.qualifier == cell.qualifier
+        });
+        let size = (self.size)(&cell, &item);
+        if let Some(o) = &mut self.overflow {
+            // The overflow column's later versions count into its size; the next column ends
+            // the group (B1).
+            if same {
+                o.bytes += size;
+                return ControlFlow::Continue(());
+            }
+            return ControlFlow::Break(());
+        }
+        if !same {
+            self.open = Some(cell.to_key());
+            self.open_at = self.kept.len();
+        }
+        // A group pushes in cell order, so this appends.
+        debug_assert!(self.kept.last().is_none_or(|k| k.key.as_ref() < cell));
+        let new_row = self.kept.last().is_none_or(|k| k.key.row != cell.row);
+        let charge = if new_row { cell.row.len() as u64 } else { 0 };
+        if self.used + size + charge <= self.budget {
+            self.used += size + charge;
+            self.kept.push(Kept {
+                key: cell.to_key(),
+                item,
+                size,
+            });
+            return ControlFlow::Continue(());
+        }
+        // The column doesn't fit: roll back its earlier versions.
+        let rolled: Vec<Kept<I>> = self.kept.drain(self.open_at..).collect();
+        let own: u64 = rolled.iter().map(|k| k.size).sum::<u64>() + size;
+        let open = self.open.clone().expect("a column is open");
+        self.overflow = Some(Overflow {
+            bytes: own + open.row.len() as u64,
+            key: open,
+        });
+        let kept_row = self.kept.last().map(|k| k.key.row.as_slice());
+        let rolled_charge = rolled
+            .first()
+            .filter(|k| kept_row != Some(k.key.row.as_slice()))
+            .map_or(0, |k| k.key.row.len() as u64);
+        self.used -= rolled.iter().map(|k| k.size).sum::<u64>() + rolled_charge;
+        ControlFlow::Continue(())
+    }
+
+    fn merge(&mut self, other: Self) {
+        let mut all = std::mem::take(&mut self.kept);
+        all.extend(other.kept);
+        all.sort_by(|a, b| a.key.cmp(&b.key));
+        self.kept = all;
+        self.overflow = match (self.overflow.take(), other.overflow) {
+            (Some(a), Some(b)) => Some(if a.key <= b.key { a } else { b }),
+            (a, b) => a.or(b),
+        };
+        self.cut();
+        self.open = None;
+        self.open_at = self.kept.len();
+    }
+
+    fn finish(self) -> Vec<(CellKey, I)> {
+        self.into_page().items
     }
 }
 
@@ -1086,5 +1413,114 @@ mod tests {
         let got = a.finish();
         assert_eq!(got.len(), 1);
         assert_eq!((got[0].0.row.as_slice(), got[0].1), (&b"r1"[..], 7));
+    }
+
+    /// D308: cut a read's cells into groups at row boundaries, push each group into its own
+    /// budget with its local stop, merge in a random order: the result (cells, size and
+    /// overflow) equals one budget over the whole read, and the hand-cut prefix.
+    #[test]
+    fn a_byte_budget_merges_to_the_sequential_result_in_any_order() {
+        struct Rng(u64);
+        impl Rng {
+            fn below(&mut self, n: u64) -> u64 {
+                self.0 ^= self.0 << 13;
+                self.0 ^= self.0 >> 7;
+                self.0 ^= self.0 << 17;
+                self.0 % n
+            }
+        }
+        let seed = 0x5EED_D308;
+        let mut rng = Rng(seed);
+        // An item's own size: the length it carries.
+        let size = |_: &CellRef<'_>, n: &u64| *n;
+        for case in 0..500 {
+            // Cells in cell order: rows, then two families, qualifiers, and 1 to 3 versions.
+            let mut cells: Vec<(CellKey, u64)> = Vec::new();
+            for r in 0..1 + rng.below(8) {
+                let row = vec![b'r'; 1 + r as usize];
+                for rank in 0..2 {
+                    for q in 0..rng.below(3) {
+                        let versions = 1 + rng.below(3);
+                        for v in 0..versions {
+                            cells.push((
+                                CellKey {
+                                    row: row.clone(),
+                                    family_rank: rank,
+                                    family: FamilyId(rank),
+                                    qualifier: vec![b'q', q as u8],
+                                    ts: 10 - v,
+                                },
+                                1 + rng.below(20),
+                            ));
+                        }
+                    }
+                }
+            }
+            let budget = rng.below(120);
+            let run = |part: &[(CellKey, u64)]| {
+                let mut b = ByteBudget::new(budget, size);
+                for (k, n) in part {
+                    if b.push(k.as_ref(), *n).is_break() {
+                        break;
+                    }
+                }
+                b
+            };
+            let whole = run(&cells).into_page();
+            // Groups at row boundaries.
+            let mut cuts = vec![0];
+            for i in 1..cells.len() {
+                if cells[i].0.row != cells[i - 1].0.row && rng.below(2) == 0 {
+                    cuts.push(i);
+                }
+            }
+            cuts.push(cells.len());
+            let mut parts: Vec<_> = cuts.windows(2).map(|w| run(&cells[w[0]..w[1]])).collect();
+            let mut acc = parts.swap_remove(rng.below(parts.len() as u64) as usize);
+            while !parts.is_empty() {
+                let next = parts.swap_remove(rng.below(parts.len() as u64) as usize);
+                if rng.below(2) == 0 {
+                    acc.merge(next);
+                } else {
+                    let mut other = next;
+                    other.merge(acc);
+                    acc = other;
+                }
+            }
+            let merged = acc.into_page();
+            let ctx = format!("seed {seed:#x}, case {case}, budget {budget}");
+            assert_eq!(rows(&merged.items), rows(&whole.items), "{ctx}");
+            assert_eq!(merged.bytes, whole.bytes, "{ctx}");
+            assert_eq!(merged.overflow, whole.overflow, "{ctx}");
+            assert!(whole.bytes <= budget, "{ctx}");
+            // The hand-cut prefix: whole columns while they fit, each row's key once.
+            let (mut used, mut keep, mut i) = (0u64, 0usize, 0usize);
+            let mut over = None;
+            while i < cells.len() {
+                let mut j = i + 1;
+                while j < cells.len() && same_column(&cells[j].0, &cells[i].0) {
+                    j += 1;
+                }
+                let own: u64 = cells[i..j].iter().map(|c| c.1).sum();
+                let row = cells[i].0.row.len() as u64;
+                let charge = if keep == 0 || cells[keep - 1].0.row != cells[i].0.row {
+                    row
+                } else {
+                    0
+                };
+                if used + own + charge > budget {
+                    over = Some((cells[i].0.clone(), own + row));
+                    break;
+                }
+                used += own + charge;
+                keep = j;
+                i = j;
+            }
+            let want: Vec<CellKey> = cells[..keep].iter().map(|c| c.0.clone()).collect();
+            let got: Vec<CellKey> = whole.items.iter().map(|c| c.0.clone()).collect();
+            assert_eq!(got, want, "{ctx}");
+            assert_eq!(whole.bytes, used, "{ctx}");
+            assert_eq!(whole.overflow.map(|o| (o.key, o.bytes)), over, "{ctx}");
+        }
     }
 }

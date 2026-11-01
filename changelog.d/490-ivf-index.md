@@ -1,0 +1,2 @@
+### Added
+- `pigeonhole-vector` (D306): an IVF vector index built on the public API. `Index::create`/`open`, `insert_*`, `delete` and `search_*(q, k).nprobe(n).run()` over a vector family's rows. Lists split and merge inside the inserts and deletes that cause them, each move one transaction, so the index stays consistent across crashes and concurrent writers. A search reads one snapshot, and with every list probed it equals an exact `nearest_*`.

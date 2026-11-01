@@ -1,1 +1,74 @@
 pub mod pigeonhole_vector
+#[non_exhaustive] pub enum pigeonhole_vector::Error
+pub pigeonhole_vector::Error::Conflict(alloc::string::String)
+pub pigeonhole_vector::Error::Corruption(alloc::string::String)
+pub pigeonhole_vector::Error::Db(pigeonhole::error::Error)
+pub pigeonhole_vector::Error::InvalidArgument(alloc::string::String)
+impl pigeonhole_vector::Error
+pub fn pigeonhole_vector::Error::code(&self) -> pigeonhole::error::ErrorCode
+impl core::convert::From<pigeonhole::error::Error> for pigeonhole_vector::Error
+pub fn pigeonhole_vector::Error::from(pigeonhole::error::Error) -> Self
+impl core::error::Error for pigeonhole_vector::Error
+pub fn pigeonhole_vector::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for pigeonhole_vector::Error
+pub fn pigeonhole_vector::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum pigeonhole_vector::Rebalance
+pub pigeonhole_vector::Rebalance::Background
+pub pigeonhole_vector::Rebalance::Inline
+#[non_exhaustive] pub struct pigeonhole_vector::BulkStats
+pub pigeonhole_vector::BulkStats::lists: u32
+pub pigeonhole_vector::BulkStats::vectors: u64
+#[non_exhaustive] pub struct pigeonhole_vector::Hit
+pub pigeonhole_vector::Hit::distance: f64
+pub pigeonhole_vector::Hit::id: alloc::vec::Vec<u8>
+pub struct pigeonhole_vector::Index
+impl pigeonhole_vector::Index
+pub fn pigeonhole_vector::Index::bulk_load_bits<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[u8]>
+pub fn pigeonhole_vector::Index::bulk_load_f32<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[f32]>
+pub fn pigeonhole_vector::Index::bulk_load_i8<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[i8]>
+pub fn pigeonhole_vector::Index::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole::vector::VectorSpec, pigeonhole_vector::IndexOptions) -> pigeonhole_vector::Result<pigeonhole_vector::Index>
+pub fn pigeonhole_vector::Index::create_with_rebalancer(&pigeonhole::db::Pigeonhole, &str, pigeonhole::vector::VectorSpec, pigeonhole_vector::IndexOptions) -> pigeonhole_vector::Result<(pigeonhole_vector::Index, pigeonhole_vector::Rebalancer)>
+pub fn pigeonhole_vector::Index::delete(&self, &[u8]) -> pigeonhole_vector::Result<bool>
+pub fn pigeonhole_vector::Index::insert_bits(&self, &[u8], &[u8]) -> pigeonhole_vector::Result<()>
+pub fn pigeonhole_vector::Index::insert_f32(&self, &[u8], &[f32]) -> pigeonhole_vector::Result<()>
+pub fn pigeonhole_vector::Index::insert_i8(&self, &[u8], &[i8]) -> pigeonhole_vector::Result<()>
+pub fn pigeonhole_vector::Index::max_list_len(&self) -> u64
+pub fn pigeonhole_vector::Index::min_list_len(&self) -> u64
+pub fn pigeonhole_vector::Index::open(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_vector::Result<pigeonhole_vector::Index>
+pub fn pigeonhole_vector::Index::open_with_rebalancer(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_vector::Result<(pigeonhole_vector::Index, pigeonhole_vector::Rebalancer)>
+pub fn pigeonhole_vector::Index::options(&self) -> pigeonhole_vector::IndexOptions
+pub fn pigeonhole_vector::Index::search_bits<'a>(&'a self, &'a [u8], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::Index::search_f32<'a>(&'a self, &'a [f32], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::Index::search_i8<'a>(&'a self, &'a [i8], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::Index::spec(&self) -> pigeonhole::vector::VectorSpec
+pub fn pigeonhole_vector::Index::verify(&self) -> pigeonhole_vector::Result<pigeonhole_vector::IndexStats>
+impl core::fmt::Debug for pigeonhole_vector::Index
+pub fn pigeonhole_vector::Index::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_vector::IndexOptions
+impl pigeonhole_vector::IndexOptions
+pub fn pigeonhole_vector::IndexOptions::new() -> Self
+pub fn pigeonhole_vector::IndexOptions::nprobe(self, u32) -> Self
+pub fn pigeonhole_vector::IndexOptions::reassign_neighbours(self, u32) -> Self
+pub fn pigeonhole_vector::IndexOptions::rebalance(self, pigeonhole_vector::Rebalance) -> Self
+pub fn pigeonhole_vector::IndexOptions::rebalance_mode(&self) -> pigeonhole_vector::Rebalance
+pub fn pigeonhole_vector::IndexOptions::target_list_len(self, u32) -> Self
+impl core::default::Default for pigeonhole_vector::IndexOptions
+pub fn pigeonhole_vector::IndexOptions::default() -> Self
+#[non_exhaustive] pub struct pigeonhole_vector::IndexStats
+pub pigeonhole_vector::IndexStats::list_lens: alloc::vec::Vec<u64>
+pub pigeonhole_vector::IndexStats::vectors: u64
+pub struct pigeonhole_vector::Rebalancer
+impl pigeonhole_vector::Rebalancer
+pub fn pigeonhole_vector::Rebalancer::closed(&self) -> bool
+pub fn pigeonhole_vector::Rebalancer::run_once(&mut self, core::time::Duration) -> pigeonhole_vector::Result<bool>
+pub fn pigeonhole_vector::Rebalancer::set_wakeup(&mut self, alloc::boxed::Box<(dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync)>)
+pub fn pigeonhole_vector::Rebalancer::wait(&mut self, core::time::Duration)
+impl core::fmt::Debug for pigeonhole_vector::Rebalancer
+pub fn pigeonhole_vector::Rebalancer::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_vector::Search<'a>
+impl<'a> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::Search<'a>::nprobe(self, u32) -> Self
+pub fn pigeonhole_vector::Search<'a>::parallel(self, usize) -> Self
+pub fn pigeonhole_vector::Search<'a>::run(self) -> pigeonhole_vector::Result<alloc::vec::Vec<pigeonhole_vector::Hit>>
+pub fn pigeonhole_vector::Search<'a>::snapshot(self, &'a pigeonhole::db::Snapshot) -> Self
+pub type pigeonhole_vector::Result<T> = core::result::Result<T, pigeonhole_vector::Error>

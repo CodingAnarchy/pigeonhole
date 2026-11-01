@@ -445,6 +445,7 @@ pub struct pigeonhole::Nearest<'t>
 impl pigeonhole::Nearest<'_>
 pub fn pigeonhole::Nearest<'_>::parallel(self, usize) -> Self
 pub fn pigeonhole::Nearest<'_>::run(self) -> pigeonhole::Result<alloc::vec::Vec<pigeonhole::Neighbour>>
+pub async fn pigeonhole::Nearest<'_>::run_async(self) -> pigeonhole::Result<alloc::vec::Vec<pigeonhole::Neighbour>>
 #[non_exhaustive] pub struct pigeonhole::Neighbour
 pub pigeonhole::Neighbour::distance: f64
 pub pigeonhole::Neighbour::qualifier: alloc::vec::Vec<u8>
