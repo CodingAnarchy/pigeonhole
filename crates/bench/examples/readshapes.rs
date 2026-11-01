@@ -33,6 +33,11 @@
 //! - `multi-get-dense`, `multi-get-sparse`: a multi-get (`Table::keys`, D299) of 200 rows of
 //!   table `t`, contiguous or spread over the table, counted per row (the key set is built
 //!   outside the measured function).
+//! - `knn-exact`, `knn-filtered`: an exact nearest-neighbour search (`nearest_f32`, D296 PR 4)
+//!   for the 10 nearest of table `v` (built only for these shapes, flushed): 2,000 rows of two
+//!   64-dimension `f32` L2 vectors (qualifiers `a` and `b`), over every vector, or with
+//!   qualifier prefix `b` (half of them). Counted per scored vector; the query is built
+//!   outside the measured function.
 //!
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
 //! iteration is one `#[inline(never)]` function named `shape_*` that counts its work with a
@@ -53,7 +58,7 @@ use measure::Measured;
 
 use std::ops::Bound;
 
-use pigeonhole::{Durability, Family, KeySet, Options, Table};
+use pigeonhole::{Durability, Element, Family, KeySet, Metric, Options, Table, VectorSpec};
 
 const ROWS: u32 = 20_000;
 const CELLS: u32 = 8;
@@ -279,6 +284,32 @@ fn shape_multi_get(t: &Table, keys: &KeySet) -> usize {
     n
 }
 
+/// Rows and dimensions of table `v`.
+const KNN_ROWS: u32 = 2_000;
+const KNN_DIM: usize = 64;
+
+/// A deterministic vector in [-1, 1).
+fn knn_vector(rng: &mut Rng) -> Vec<f32> {
+    (0..KNN_DIM)
+        .map(|_| (rng.below(1 << 16) as f32 / f32::from(1u16 << 15)) - 1.0)
+        .collect()
+}
+
+#[inline(never)]
+fn shape_knn(v: &Table, query: &[f32], filtered: bool) -> usize {
+    let _measured = Measured::start();
+    let scan = v.scan_prefix(b"").family("e");
+    let scan = if filtered {
+        scan.qualifier_prefix(b"b")
+    } else {
+        scan
+    };
+    let near = scan.nearest_f32(query, 10).run().unwrap();
+    std::hint::black_box(&near);
+    // Every selected vector is scored: one unit each.
+    KNN_ROWS as usize * if filtered { 1 } else { 2 }
+}
+
 /// 200 keys of table `t` for a multi-get shape: contiguous from a random row, or spread.
 fn multi_get_keys(rng: &mut Rng, dense: bool) -> KeySet {
     if dense {
@@ -401,6 +432,31 @@ fn main() {
         drop(cells);
         w
     });
+    // Table `v`, only for its shapes: two vectors per row, flushed, then read once.
+    let v = shape.starts_with("knn-").then(|| {
+        let spec = VectorSpec::new(KNN_DIM as u32, Element::F32, Metric::L2).unwrap();
+        let v = db
+            .table("v")
+            .unwrap()
+            .family("e", Family::vector(spec).bloom_bits(10))
+            .create_if_missing()
+            .unwrap();
+        let mut vr = Rng(0x5EED_0490);
+        for r in 0..KNN_ROWS {
+            v.mutate(&key(b'v', r))
+                .put_vector_f32("e", b"a", &knn_vector(&mut vr))
+                .put_vector_f32("e", b"b", &knn_vector(&mut vr))
+                .commit()
+                .unwrap();
+        }
+        db.flush().unwrap();
+        let mut it = v.scan_prefix(b"").family("e").iter().unwrap();
+        while let Some(r) = it.next_ref().unwrap() {
+            std::hint::black_box(r.iter().count());
+        }
+        drop(it);
+        v
+    });
     warm(&t);
     let mut it = l.scan_prefix(b"").family("f").iter().unwrap();
     while let Some(r) = it.next_ref().unwrap() {
@@ -443,6 +499,14 @@ fn main() {
                     let keys = multi_get_keys(&mut rng, shape == "multi-get-dense");
                     shape_multi_get(&t, &keys)
                 }
+                "knn-exact" | "knn-filtered" => {
+                    let query = knn_vector(&mut rng);
+                    shape_knn(
+                        v.as_ref().expect("built above"),
+                        &query,
+                        shape == "knn-filtered",
+                    )
+                }
                 other => panic!("unknown shape {other}"),
             };
         }
@@ -454,6 +518,7 @@ fn main() {
     drop(l);
     drop(i);
     drop(w);
+    drop(v);
     db.close().unwrap();
     driver.join();
     std::fs::remove_dir_all(&dir).ok();

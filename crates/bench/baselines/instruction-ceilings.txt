@@ -199,6 +199,10 @@
 # multi-get-sparse 17022 with 0.5%, since they read 0.2% and 0.1% above the base there on code
 # this PR does not touch. wide-row-pages fell from 1965 on main (-22.9%): pages are filled
 # directly, without a per-column buffer.
+#
+# New shapes for #1272 (#490; D296's exact KNN, D193: every shape has a ceiling), each the
+# head's count (run 41350787020, da9243b8) times (1 + 0.3%): knn-exact 1690 and knn-filtered
+# 3389, equal to the base there.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
@@ -233,3 +237,5 @@ wide-row-cells 1506 0.3
 wide-row-pages 1520 0.3
 multi-get-dense 12568 0.5
 multi-get-sparse 17108 0.5
+knn-exact 1696 0.3
+knn-filtered 3400 0.3
