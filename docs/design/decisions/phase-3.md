@@ -3667,3 +3667,5 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - the crate's thread catching up;
   - an application's rebalancer, with its wakeup and `closed`;
   - markers a crash left, rebalanced after the reopen.
+
+**`Search::run_async` (#1268 item 6).** It's on D296 PR 5's `Nearest::run_async`. Every read of the search is async: the layout version, a changed layout's centroids (a scan stream), and the probed lists. Its result equals `run`'s. It's tested from a cold reopen, at an older snapshot and across splits, for every element and metric.

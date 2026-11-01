@@ -753,10 +753,28 @@ fn app_owned_close_waits_for_in_flight_close_io_and_is_clean() {
 }
 
 /// A WAL sync failing during the close: `close()` reports it (it used to return `Ok`), and
-/// so does every shard's `closed()`.
+/// so does every shard's `closed()`. Once by default; a sweep's `PIGEONHOLE_SEEDS` repeats
+/// it from `PIGEONHOLE_SEED`, to stress the timing #1265 hit once on x86 CI.
 #[test]
 fn app_owned_close_reports_a_failed_final_sync() {
-    let (vfs, gate) = gate::vfs(1354);
+    let runs: u64 = std::env::var("PIGEONHOLE_SEEDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let base: u64 = std::env::var("PIGEONHOLE_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1354);
+    for seed in base..base + runs {
+        if let Err(e) = std::panic::catch_unwind(|| close_reports_a_failed_final_sync(seed)) {
+            eprintln!("failed at seed {seed}");
+            std::panic::resume_unwind(e);
+        }
+    }
+}
+
+fn close_reports_a_failed_final_sync(seed: u64) {
+    let (vfs, gate) = gate::vfs(seed);
     let (db, shards) =
         Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
     let drivers: Vec<_> = shards.into_iter().map(driver).collect();
@@ -772,7 +790,24 @@ fn app_owned_close_reports_a_failed_final_sync() {
         move || db.close()
     })
     .expect("close hung");
-    assert!(closed.is_err(), "a failed close reported Ok");
+    if closed.is_ok() {
+        // #1265 (seen once on x86 CI): say which way the close returned `Ok`. Shards whose
+        // `closed()` reports `Err` mean `close()` didn't wait for them (an application-owned
+        // close waits only when every shard is driven elsewhere); shards reporting `Ok`
+        // mean their final syncs succeeded with the gate armed, a durability bug. A driver
+        // that never sees `closed()` is reported as such (route (a) too), not waited on.
+        let outcomes: Vec<String> = drivers
+            .into_iter()
+            .map(|(_, h)| match gate::within(10, move || h.join().unwrap()) {
+                Some(outcome) => format!("{outcome:?}"),
+                None => "never closed (10 s)".to_owned(),
+            })
+            .collect();
+        panic!(
+            "a failed close reported Ok; the shards' closed(): {outcomes:?}; failure: {:?}",
+            db.failure()
+        );
+    }
     for (_, h) in drivers {
         assert!(h.join().unwrap().is_err(), "a shard's closed() reported Ok");
     }
