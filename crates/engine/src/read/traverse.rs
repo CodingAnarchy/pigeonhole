@@ -21,7 +21,9 @@ use std::sync::Arc;
 use pigeonhole_format::{FamilyId, TableId, Timestamp};
 
 use super::keys::{KeyCursor, KeySet};
-use super::reduce::{CellKey, CellRef, CellVisitor, ReadInput, ReduceSpec, Reducer, Visit};
+use super::reduce::{
+    BUDGET_ITEM_OVERHEAD, CellKey, CellRef, CellVisitor, ReadInput, ReduceSpec, Reducer, Visit,
+};
 use super::{ReadSpec, ValuePredicate, reduce::reduce_into};
 use crate::snapshot::Snapshot;
 use crate::{Error, Result};
@@ -58,6 +60,14 @@ pub struct TraverseSpec {
     pub parallelism: usize,
     /// Keys per thread below which a hop does not fan out.
     pub parallel_floor: u64,
+    /// D308: the bytes the traversal's nodes may take in all, over its hops in order (0: no
+    /// budget). A node counts its key and [`BUDGET_ITEM_OVERHEAD`], plus 4 with
+    /// `parents_in_budget`; the seeds aren't counted. A hop the budget cuts keeps the
+    /// in-budget prefix of its ranking (the nodes `hop_limit` would keep first), and the
+    /// traversal ends with it.
+    pub byte_budget: u64,
+    /// Count each node's parent index (4 bytes) in `byte_budget`.
+    pub parents_in_budget: bool,
 }
 
 impl TraverseSpec {
@@ -72,6 +82,8 @@ impl TraverseSpec {
             read: ReadSpec::default(),
             parallelism: 1,
             parallel_floor: TRAVERSE_PARALLEL_FLOOR,
+            byte_budget: 0,
+            parents_in_budget: false,
         }
     }
 }
@@ -100,6 +112,8 @@ pub struct TraverseStats {
     /// Whether `max_nodes` was reached with hops left to take: a hop cut short by it, or the
     /// remaining hops skipped (they may have found nothing new).
     pub cut_by_max_nodes: bool,
+    /// Whether `byte_budget` cut a hop short (the traversal ended with it).
+    pub cut_by_budget: bool,
     /// The most threads a hop used (1 when every hop ran on the caller's thread).
     pub threads: u64,
 }
@@ -174,6 +188,28 @@ fn index_of(keys: &KeySet, key: &[u8]) -> usize {
     lo
 }
 
+/// A hop's result from [`DedupeLimit::into_nodes`].
+pub(crate) struct HopNodes {
+    nodes: KeySet,
+    parents: Vec<u32>,
+    /// Some destination was left out for `n`.
+    full: bool,
+    /// What the kept nodes take of the byte budget.
+    bytes: u64,
+    /// Some destination was left out for the byte budget.
+    cut_by_bytes: bool,
+}
+
+/// The byte budget a traversal starts with, and what a node costs on top of its key.
+fn budget_of(spec: &TraverseSpec) -> (u64, u64) {
+    let bytes = if spec.byte_budget == 0 {
+        u64::MAX
+    } else {
+        spec.byte_budget
+    };
+    (bytes, if spec.parents_in_budget { 4 } else { 0 })
+}
+
 /// One entry per destination (the cell's qualifier) not in `exclude`, with the smallest
 /// source index that reached it; at most `n`: the destinations whose first edge comes first
 /// in scan order. A group stops at its `n + 1`-th distinct destination, which D304 §2.3
@@ -188,6 +224,13 @@ pub(crate) struct DedupeLimit {
     kept: HashMap<Vec<u8>, u32>,
     /// Some destination was left out for `n`.
     full: bool,
+    /// D308: the bytes the kept nodes may take (`u64::MAX`: no budget), what each costs on
+    /// top of its key, and what the kept ones take.
+    bytes: u64,
+    node_extra: u64,
+    used: u64,
+    /// Some destination was left out for `bytes`.
+    cut_by_bytes: bool,
 }
 
 impl DedupeLimit {
@@ -196,6 +239,7 @@ impl DedupeLimit {
         exclude: Arc<HashSet<Vec<u8>>>,
         frontier: Arc<KeySet>,
         family: FamilyId,
+        (bytes, node_extra): (u64, u64),
     ) -> Self {
         Self {
             n,
@@ -204,29 +248,64 @@ impl DedupeLimit {
             family,
             kept: HashMap::new(),
             full: false,
+            bytes,
+            node_extra,
+            used: 0,
+            cut_by_bytes: false,
         }
     }
 
-    /// Keeps the `n` smallest (source, destination) entries.
+    /// A node's size in the budget (D308): its key, the overhead, and its parent if counted.
+    fn node_bytes(&self, dest: &[u8]) -> u64 {
+        dest.len() as u64 + BUDGET_ITEM_OVERHEAD + self.node_extra
+    }
+
+    /// Keeps the `n` smallest (source, destination) entries, then the prefix of them, in
+    /// that order, within the byte budget (D308).
     fn truncate(&mut self) {
-        if self.kept.len() <= self.n {
+        let over_n = self.kept.len() > self.n;
+        let used: u64 = self.kept.keys().map(|k| self.node_bytes(k)).sum();
+        if !over_n && used <= self.bytes {
+            self.used = used;
             return;
         }
         let mut all: Vec<(u32, Vec<u8>)> = self.kept.drain().map(|(k, s)| (s, k)).collect();
         all.sort_unstable();
-        all.truncate(self.n);
+        if over_n {
+            all.truncate(self.n);
+            self.full = true;
+        }
+        let mut used = 0;
+        let mut keep = all.len();
+        for (i, (_, k)) in all.iter().enumerate() {
+            let size = self.node_bytes(k);
+            if used + size > self.bytes {
+                keep = i;
+                self.cut_by_bytes = true;
+                break;
+            }
+            used += size;
+        }
+        all.truncate(keep);
+        self.used = used;
         self.kept = all.into_iter().map(|(s, k)| (k, s)).collect();
-        self.full = true;
     }
 
-    /// The destinations, sorted, with their sources; and whether any was left out.
-    pub(crate) fn into_nodes(mut self) -> (KeySet, Vec<u32>, bool) {
+    /// The destinations, sorted, with their sources; whether any was left out for `n`; and
+    /// what the kept ones take of the byte budget, and whether it left any out.
+    pub(crate) fn into_nodes(mut self) -> HopNodes {
         self.truncate();
         let mut kept: Vec<(Vec<u8>, u32)> = self.kept.into_iter().collect();
         kept.sort_unstable();
         let nodes =
             KeySet::from_sorted(kept.iter().map(|(k, _)| k)).expect("distinct keys, sorted");
-        (nodes, kept.into_iter().map(|(_, s)| s).collect(), self.full)
+        HopNodes {
+            nodes,
+            parents: kept.into_iter().map(|(_, s)| s).collect(),
+            full: self.full,
+            bytes: self.used,
+            cut_by_bytes: self.cut_by_bytes,
+        }
     }
 }
 
@@ -247,12 +326,21 @@ impl Reducer for DedupeLimit {
             self.full = true;
             return ControlFlow::Break(());
         }
+        let size = self.node_bytes(dest);
+        if self.used + size > self.bytes {
+            // A group stops on its own budget (D296 rev 1.2): its running size counts only
+            // destinations the global prefix would also hold before this one.
+            self.cut_by_bytes = true;
+            return ControlFlow::Break(());
+        }
+        self.used += size;
         self.kept.insert(dest.to_vec(), src);
         ControlFlow::Continue(())
     }
 
     fn merge(&mut self, other: Self) {
         self.full |= other.full;
+        self.cut_by_bytes |= other.cut_by_bytes;
         for (k, s) in other.kept {
             self.kept
                 .entry(k)
@@ -328,6 +416,7 @@ pub(crate) fn traverse(
     }
     let mut visited: Arc<HashSet<Vec<u8>>> = Arc::new(seeds.iter().map(<[u8]>::to_vec).collect());
     let mut frontier = seeds;
+    let (mut bytes, node_extra) = budget_of(spec);
     for _ in 0..spec.hops {
         // Between hops, as a multi-get between rows (D304 §2.5): nothing is read after a
         // fork (#901) or once the snapshot is no longer current (a close or a recovery onto
@@ -367,18 +456,34 @@ pub(crate) fn traverse(
                     Arc::clone(&visited),
                     Arc::clone(&frontier),
                     spec.family,
+                    (bytes, node_extra),
                 )
             },
         )?;
         out.stats.rows += stats.rows;
         out.stats.edges += stats.cells;
         out.stats.threads = out.stats.threads.max(stats.threads);
-        let (nodes, parents, full) = acc.into_nodes();
+        let HopNodes {
+            nodes,
+            parents,
+            full,
+            bytes: used,
+            cut_by_bytes,
+        } = acc.into_nodes();
         if full {
             out.stats.hops_cut += 1;
             if room < by_hop {
                 out.stats.cut_by_max_nodes = true;
             }
+        }
+        bytes = bytes.saturating_sub(used);
+        if cut_by_bytes {
+            // The budget's hop is the last: its in-budget nodes, then nothing more (D308).
+            out.stats.cut_by_budget = true;
+            if !nodes.is_empty() {
+                out.hops.push(Hop { nodes, parents });
+            }
+            break;
         }
         if nodes.is_empty() {
             break;
@@ -426,6 +531,8 @@ pub struct PendingTraversal {
     visited: Arc<HashSet<Vec<u8>>>,
     frontier: Arc<KeySet>,
     hops_done: u32,
+    /// The byte budget left (D308; `u64::MAX`: none).
+    bytes: u64,
     out: Traversal,
     hop: Option<HopRead>,
     /// The edges' value predicate, applied to each cell before the visitor rather than in
@@ -487,6 +594,7 @@ impl PendingTraversal {
             .take()
             .map(|p| (p, Arc::clone(&snapshot.view.ssts)));
         let visited = Arc::new(seeds.iter().map(<[u8]>::to_vec).collect());
+        let bytes = budget_of(&spec).0;
         Self {
             snapshot,
             table,
@@ -497,6 +605,7 @@ impl PendingTraversal {
             now,
             shared,
             visited,
+            bytes,
             frontier: seeds,
             out: Traversal::default(),
             hop: None,
@@ -551,6 +660,7 @@ impl PendingTraversal {
                 Arc::clone(&self.visited),
                 Arc::clone(&self.frontier),
                 self.spec.family,
+                (self.bytes, budget_of(&self.spec).1),
             ),
             key: None,
             by_room: room < by_hop,
@@ -570,13 +680,28 @@ impl PendingTraversal {
             ..
         } = hop;
         drop((cursor, visitor));
-        let (nodes, parents, full) = reducer.into_nodes();
+        let HopNodes {
+            nodes,
+            parents,
+            full,
+            bytes: used,
+            cut_by_bytes,
+        } = reducer.into_nodes();
         self.hops_done += 1;
         if full {
             self.out.stats.hops_cut += 1;
             if by_room {
                 self.out.stats.cut_by_max_nodes = true;
             }
+        }
+        self.bytes = self.bytes.saturating_sub(used);
+        if cut_by_bytes {
+            // As the sync traversal: the budget's hop is the last.
+            self.out.stats.cut_by_budget = true;
+            if !nodes.is_empty() {
+                self.out.hops.push(Hop { nodes, parents });
+            }
+            return false;
         }
         if nodes.is_empty() {
             return false;
@@ -761,13 +886,17 @@ mod tests {
     }
 
     /// The sequential result: the first `n` distinct non-excluded destinations in
-    /// (source, destination) order, with their first source.
+    /// (source, destination) order, with their first source, cut to the in-budget prefix
+    /// of that order (D308: each node its key and the overhead); and whether the budget cut.
     fn reference(
         edges: &[(u32, Vec<u8>)],
         n: usize,
         exclude: &HashSet<Vec<u8>>,
-    ) -> Vec<(Vec<u8>, u32)> {
+        bytes: u64,
+    ) -> (Vec<(Vec<u8>, u32)>, bool) {
         let mut seen: Vec<(Vec<u8>, u32)> = Vec::new();
+        let mut used = 0;
+        let mut cut = false;
         for (s, d) in edges {
             if exclude.contains(d) || seen.iter().any(|(k, _)| k == d) {
                 continue;
@@ -775,10 +904,16 @@ mod tests {
             if seen.len() == n {
                 break;
             }
+            let size = d.len() as u64 + BUDGET_ITEM_OVERHEAD;
+            if used + size > bytes {
+                cut = true;
+                break;
+            }
+            used += size;
             seen.push((d.clone(), *s));
         }
         seen.sort();
-        seen
+        (seen, cut)
     }
 
     /// D304 §2.3 and rev 2: any cut of the edges into groups (in order), each pushed with
@@ -807,7 +942,13 @@ mod tests {
                 .collect();
             let exclude = Arc::new(exclude);
             let n = 1 + rng.below(8) as usize;
-            let want = reference(&edges, n, &exclude);
+            // A byte budget in half the cases: room for 0 to 9 nodes of 18 bytes.
+            let bytes = if rng.below(2) == 0 {
+                u64::MAX
+            } else {
+                rng.below(10 * 18)
+            };
+            let (want, want_cut) = reference(&edges, n, &exclude, bytes);
             // Cut at source boundaries (groups are tablets: whole rows).
             let mut cuts: Vec<u32> = (1..sources).filter(|_| rng.below(2) == 0).collect();
             cuts.insert(0, 0);
@@ -820,6 +961,7 @@ mod tests {
                         Arc::clone(&exclude),
                         Arc::clone(&frontier),
                         FamilyId(1),
+                        (bytes, 0),
                     );
                     for (s, d) in edges.iter().filter(|(s, _)| (w[0]..w[1]).contains(s)) {
                         let row = frontier.get(*s as usize).to_vec();
@@ -842,9 +984,15 @@ mod tests {
                     acc = other;
                 }
             }
-            let (nodes, parents, _) = acc.into_nodes();
-            let got: Vec<(Vec<u8>, u32)> = nodes.iter().map(<[u8]>::to_vec).zip(parents).collect();
+            let hop = acc.into_nodes();
+            let got: Vec<(Vec<u8>, u32)> = hop
+                .nodes
+                .iter()
+                .map(<[u8]>::to_vec)
+                .zip(hop.parents)
+                .collect();
             assert_eq!(got, want, "seed {seed:#x}, case {case}");
+            assert_eq!(hop.cut_by_bytes, want_cut, "seed {seed:#x}, case {case}");
         }
     }
 
