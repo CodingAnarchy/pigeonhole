@@ -377,3 +377,157 @@ impl Pages {
         }
     }
 }
+
+/// One of a nearest-neighbour search's results: the cell's row and qualifier, its distance
+/// from the query (by the family's metric), and its timestamp.
+#[pyclass(module = "pigeonhole", frozen)]
+pub(crate) struct Neighbour(pigeonhole::Neighbour);
+
+#[pymethods]
+impl Neighbour {
+    /// The cell's row key.
+    #[getter]
+    fn row<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.0.row)
+    }
+
+    /// The cell's qualifier.
+    #[getter]
+    fn qualifier<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        PyBytes::new(py, &self.0.qualifier)
+    }
+
+    /// The distance from the query, by the family's metric.
+    #[getter]
+    fn distance(&self) -> f64 {
+        self.0.distance
+    }
+
+    /// The cell's timestamp.
+    #[getter]
+    fn ts(&self) -> u64 {
+        self.0.ts
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "Neighbour(row={:?}, qualifier={:?}, distance={}, ts={})",
+            String::from_utf8_lossy(&self.0.row),
+            String::from_utf8_lossy(&self.0.qualifier),
+            self.0.distance,
+            self.0.ts
+        )
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other.cast::<Neighbour>().is_ok_and(|o| {
+            let (a, b) = (&self.0, &o.get().0);
+            (&a.row, &a.qualifier, a.distance, a.ts) == (&b.row, &b.qualifier, b.distance, b.ts)
+        })
+    }
+}
+
+/// The `k` cells of a vector family nearest `query` (D296), over a prefix, a range, the
+/// whole table, or the rows of `keys`, in (distance, row, qualifier) order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn nearest(
+    py: Python<'_>,
+    h: &Handle,
+    family: String,
+    query: &Bound<'_, PyAny>,
+    k: usize,
+    prefix: Option<&Bound<'_, PyAny>>,
+    start: Option<&Bound<'_, PyAny>>,
+    end: Option<&Bound<'_, PyAny>>,
+    keys: Option<Vec<Bound<'_, PyAny>>>,
+    qualifier_prefix: Option<&Bound<'_, PyAny>>,
+    snapshot: Option<&Bound<'_, Snapshot>>,
+    parallel: Option<usize>,
+) -> PyResult<Vec<Neighbour>> {
+    use std::ops::Bound as KeyBound;
+
+    use crate::vector::Vector;
+    let info = either!(h, |t| t.family_info(&family)).ok_or_else(|| {
+        crate::error::with_code(
+            pigeonhole::ErrorCode::FamilyNotFound,
+            &format!("no family {family}"),
+        )
+    })?;
+    let spec = info.vector.ok_or_else(|| {
+        pyo3::exceptions::PyTypeError::new_err(format!(
+            "nearest searches a vector family, and {family} is not one"
+        ))
+    })?;
+    let query = crate::vector::vector(query, spec.element())?;
+    let prefix = prefix.map(convert::bytes).transpose()?;
+    let start = start.map(convert::bytes).transpose()?;
+    let end = end.map(convert::bytes).transpose()?;
+    let ranged = prefix.is_some() || start.is_some() || end.is_some();
+    if prefix.is_some() && (start.is_some() || end.is_some()) {
+        return Err(PyValueError::new_err(
+            "nearest takes a prefix or start/end, not both",
+        ));
+    }
+    let keys = keys
+        .map(|ks| ks.iter().map(convert::bytes).collect::<PyResult<Vec<_>>>())
+        .transpose()?
+        .map(KeySet::from_unsorted);
+    if keys.is_some() && ranged {
+        return Err(PyValueError::new_err(
+            "nearest takes keys or a range, not both",
+        ));
+    }
+    let qp = qualifier_prefix.map(convert::bytes).transpose()?;
+    let snap = snapshot_arg(snapshot)?;
+    let h = h.clone();
+    macro_rules! search {
+        ($read:expr) => {{
+            let r = $read;
+            let mut n = match &query {
+                Vector::F32(q) => r.nearest_f32(q, k),
+                Vector::I8(q) => r.nearest_i8(q, k),
+                Vector::Bits(q) => r.nearest_bits(q, k),
+            };
+            if let Some(p) = parallel {
+                n = n.parallel(p);
+            }
+            n.run()
+        }};
+    }
+    let found = py
+        .detach(move || {
+            either!(&h, |t| {
+                if let Some(keys) = &keys {
+                    let mut r = t.keys(keys).family(&family);
+                    if let Some(q) = &qp {
+                        r = r.qualifier_prefix(q);
+                    }
+                    if let Some(s) = &snap {
+                        r = r.snapshot(s);
+                    }
+                    search!(r)
+                } else {
+                    let mut r = match &prefix {
+                        Some(p) => t.scan_prefix(p),
+                        None => t.scan_bounds(
+                            start
+                                .as_deref()
+                                .map_or(KeyBound::Unbounded, KeyBound::Included),
+                            end.as_deref()
+                                .map_or(KeyBound::Unbounded, KeyBound::Excluded),
+                        ),
+                    }
+                    .family(&family);
+                    if let Some(q) = &qp {
+                        r = r.qualifier_prefix(q);
+                    }
+                    if let Some(s) = &snap {
+                        r = r.snapshot(s);
+                    }
+                    search!(r)
+                }
+            })
+        })
+        .or_py()?;
+    Ok(found.into_iter().map(Neighbour).collect())
+}

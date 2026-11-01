@@ -58,7 +58,11 @@ A new workspace crate, `crates/python` (`pigeonhole-python`, `publish = false` o
   - `Table.pages(row, size, *, families, qualifier_prefix, versions, snapshot, after) -> Pages` (D297): an iterator of `Row` pages with `position`, holding no read open between pages. `RowPosition` has `to_bytes`, `from_bytes`, `==` and a hash.
 - **Sequences:** list-valued parameters (`keys`, `seeds`, `families`, `bounds`) take any sequence; the stubs say `Sequence[...]`.
 - **`ScanIter.close()`** and context-manager support. After `Database.close()`, a live iterator hands out the rows it already read, then raises `Closed`.
-- **Not yet:** `nearest` waits for D296 PR 4 (#1259) in `pigeonhole`.
+
+### PR 3: nearest-neighbour search
+- `Table.nearest(family, query, k, *, prefix, start, end, keys, qualifier_prefix, snapshot, parallel) -> list[Neighbour]` (D296 PR 4):
+  - one method over a range or a key set, its `query` read by the family's element type (`nearest_f32`, `nearest_i8` or `nearest_bits`);
+  - `Neighbour` has `row`, `qualifier`, `distance` and `ts`.
 
 ## Why
 D307 (#696): most agent frameworks and AI tooling are Python. The owner decided to bind the Rust crate directly rather than go through the C ABI (#690).
@@ -68,5 +72,5 @@ This is new API, so there are no callers. No Rust interface changes: the crate u
 
 ## Later PRs
 - **PR 2** (#1261): above, with the per-op overhead benchmark and `docs/guide/python.md`.
-- **Next:** `nearest` on scans and `multi_get`, returning a typed `Neighbour`, once #1259 lands.
-- **PR 3:** the PyPI publish workflow, after the owner's go.
+- **PR 3:** `nearest` (above).
+- **PR 4:** the PyPI publish workflow, after the owner's go.
