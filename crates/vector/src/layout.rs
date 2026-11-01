@@ -23,6 +23,8 @@ pub(crate) const LAYOUT: &[u8] = b"layout";
 pub(crate) const NEXT: &[u8] = b"next";
 /// `G:meta:opts`, the index's options.
 pub(crate) const OPTS: &[u8] = b"opts";
+/// `Q{list}:meta:q`, a background rebalance's marker: the list left its bounds.
+pub(crate) const MARK: &[u8] = b"q";
 
 /// A fixed bijection on `u32` (rev 1): consecutive list ids land far apart in the key
 /// space, so tablet splits by size spread the lists a query reads across tablets, and a
@@ -46,6 +48,12 @@ pub(crate) fn centroid_row(list: u32) -> [u8; 5] {
 /// `N{list}`: the list's length.
 pub(crate) fn count_row(list: u32) -> [u8; 5] {
     keyed(b'N', list)
+}
+
+/// `Q{list}`: the list is marked for a background split or merge (a hint; `open`'s scan of
+/// the `N` rows is the record).
+pub(crate) fn queue_row(list: u32) -> [u8; 5] {
+    keyed(b'Q', list)
 }
 
 /// `M{id}`: the id's list.

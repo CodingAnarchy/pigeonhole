@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::time::Duration;
 
 use pigeonhole::{
     Element, ErrorCode, Family, KeySet, Pigeonhole, RetryPolicy, Snapshot, Table, Transaction,
@@ -9,10 +10,11 @@ use pigeonhole::{
 };
 
 use crate::layout::{
-    CEN, CNT, GLOBAL, LAYOUT, LIST, MAP, META, NEXT, OPTS, VEC, VERSION, centroid_row, count_row,
-    list_of, list_row, map_row, scramble,
+    CEN, CNT, GLOBAL, LAYOUT, LIST, MAP, MARK, META, NEXT, OPTS, VEC, VERSION, centroid_row,
+    count_row, list_of, list_row, map_row, queue_row, scramble,
 };
 use crate::point::{Input, Plan, Point, Stored, distance, two_means, unit};
+use crate::rebalancer::{Rebalancer, Signal};
 use crate::{Error, Result};
 
 /// A list row stays at most this large (D306 §1): the target list length is scaled down
@@ -32,6 +34,23 @@ pub struct IndexOptions {
     target: u32,
     nprobe: u32,
     reassign: u32,
+    rebalance: Rebalance,
+}
+
+/// Who splits and merges an index's lists (D306 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Rebalance {
+    /// Inside the insert or delete that took the list out of its bounds, before the call
+    /// returns: the writer pays for the split.
+    #[default]
+    Inline,
+    /// In a [`Rebalancer`]: a write marks the list and returns, and the rebalancer splits or
+    /// merges it soon after. [`Index::open`] runs one on a thread of the crate's own;
+    /// [`Index::open_with_rebalancer`] hands it to the application instead. Until it runs,
+    /// a list may hold more than [`Index::max_list_len`] vectors, which costs searches that
+    /// probe it, never their correctness.
+    Background,
 }
 
 impl Default for IndexOptions {
@@ -40,6 +59,7 @@ impl Default for IndexOptions {
             target: 1000,
             nprobe: 16,
             reassign: 2,
+            rebalance: Rebalance::Inline,
         }
     }
 }
@@ -72,6 +92,17 @@ impl IndexOptions {
         self
     }
 
+    /// Who splits and merges the lists ([`Rebalance::Inline`] by default).
+    pub fn rebalance(mut self, r: Rebalance) -> Self {
+        self.rebalance = r;
+        self
+    }
+
+    /// Who splits and merges the lists.
+    pub fn rebalance_mode(&self) -> Rebalance {
+        self.rebalance
+    }
+
     fn checked(mut self, spec: &VectorSpec) -> Result<Self> {
         if self.target < 4 || self.nprobe == 0 {
             return Err(Error::InvalidArgument(format!(
@@ -90,16 +121,27 @@ impl IndexOptions {
         Ok(self)
     }
 
+    /// Version 2: version 1's three `u32`s, then the rebalance mode (0 inline, 1
+    /// background). Version 1 (PR 1) decodes as inline.
     fn encode(&self) -> Vec<u8> {
-        let mut out = vec![1];
+        let mut out = vec![2];
         for v in [self.target, self.nprobe, self.reassign] {
             out.extend_from_slice(&v.to_le_bytes());
         }
+        out.push(match self.rebalance {
+            Rebalance::Inline => 0,
+            Rebalance::Background => 1,
+        });
         out
     }
 
     fn decode(b: &[u8]) -> Option<Self> {
-        let [1, rest @ ..] = b else { return None };
+        let (rest, rebalance) = match b {
+            [1, rest @ ..] => (rest, Rebalance::Inline),
+            [2, rest @ .., 0] => (rest, Rebalance::Inline),
+            [2, rest @ .., 1] => (rest, Rebalance::Background),
+            _ => return None,
+        };
         let (words, []) = rest.as_chunks::<4>() else {
             return None;
         };
@@ -110,12 +152,18 @@ impl IndexOptions {
             target: u32::from_le_bytes(*target),
             nprobe: u32::from_le_bytes(*nprobe),
             reassign: u32::from_le_bytes(*reassign),
+            rebalance,
         })
     }
 }
 
 /// One result of a [`Search`]: the id given at insert, and its distance to the query under
 /// the index's metric (smaller is nearer), as [`VectorSpec`]'s `distance_*` give it.
+///
+/// Hits at an equal distance come back in the order of the lists that hold them, then by
+/// id, as `nearest_*` orders a list's row then its qualifiers. That order is fixed at a
+/// snapshot, but a split can move a tied id to another list, so which of several tied ids
+/// makes the cut at `k` can change from one layout to the next.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct Hit {
@@ -124,6 +172,23 @@ pub struct Hit {
     /// Its distance to the query.
     pub distance: f64,
 }
+
+/// What a bulk load did ([`Index::bulk_load_f32`] and its forms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BulkStats {
+    /// Vectors written (a repeated id counts once per occurrence).
+    pub vectors: u64,
+    /// Lists k-means made before the load (splits and merges may change the count after).
+    pub lists: u32,
+}
+
+/// Vectors a bulk load clusters to choose its lists: the first this many it reads.
+const BULK_SAMPLE: usize = 50_000;
+/// Vectors per transaction when a bulk load writes a list.
+const BULK_BATCH: usize = 256;
+/// Lloyd iterations of a bulk load's k-means.
+const KMEANS_ITERATIONS: usize = 10;
 
 /// Counts from [`Index::verify`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,7 +240,7 @@ impl std::fmt::Debug for Index {
     }
 }
 
-struct Inner {
+pub(crate) struct Inner {
     db: Pigeonhole,
     table: Table,
     spec: VectorSpec,
@@ -189,6 +254,14 @@ struct Inner {
     in_flight: Mutex<HashSet<u32>>,
     /// Lists to check against their bounds: after writes, and found by `open` (rev 3 M3).
     pending: Mutex<VecDeque<u32>>,
+    /// Wakes the background rebalancer, and tells it when the last handle is gone.
+    signal: Arc<Signal>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        self.signal.close();
+    }
 }
 
 /// The centroids at one snapshot.
@@ -256,6 +329,11 @@ impl From<Tx> for Error {
             Tx::Fail(e) => e,
         }
     }
+}
+
+/// A retry's pause: 5 µs doubling, at most 1 ms.
+fn backoff(attempt: usize) -> Duration {
+    Duration::from_micros(5u64 << attempt.min(8)).min(Duration::from_millis(1))
 }
 
 fn is_conflict(t: &Tx) -> bool {
@@ -377,6 +455,49 @@ fn load(t: &Table, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
     })
 }
 
+/// `k` centroids of `points` by Lloyd's k-means (D306 §5), seeded deterministically with
+/// evenly spaced points; a cluster that empties keeps its centroid.
+fn kmeans(cen: &VectorSpec, points: &[Point], k: usize) -> Result<Vec<Point>> {
+    let metric = cen.metric();
+    let dim = cen.dim();
+    let mut centroids: Vec<Point> = (0..k)
+        .map(|i| crate::point::unit(metric, points[i * points.len() / k].clone()))
+        .collect();
+    let mut owner = vec![0usize; points.len()];
+    for _ in 0..KMEANS_ITERATIONS {
+        let vectors = centroids
+            .iter()
+            .map(|c| c.to_vector(dim))
+            .collect::<Result<Vec<_>>>()?;
+        let mut changed = false;
+        for (p, o) in points.iter().zip(owner.iter_mut()) {
+            let mut best = (f64::INFINITY, 0);
+            for (j, c) in vectors.iter().enumerate() {
+                let d = distance(cen, p, c)?;
+                if d < best.0 {
+                    best = (d, j);
+                }
+            }
+            changed |= *o != best.1;
+            *o = best.1;
+        }
+        for (j, c) in centroids.iter_mut().enumerate() {
+            let members = points
+                .iter()
+                .zip(&owner)
+                .filter(|(_, o)| **o == j)
+                .map(|(p, _)| p);
+            if let Some(m) = crate::point::mean(metric, members) {
+                *c = m;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    Ok(centroids)
+}
+
 /// Removes its list from the in-flight set when the split or merge ends, however it ends.
 struct Claim<'a> {
     set: &'a Mutex<HashSet<u32>>,
@@ -393,7 +514,8 @@ impl Drop for Claim<'_> {
 }
 
 impl Index {
-    /// Creates the index `name`, a new table, for vectors of `spec`.
+    /// Creates the index `name`, a new table, for vectors of `spec`, and opens it as
+    /// [`open`](Self::open) does.
     ///
     /// The table holds the index's rows only; don't write to it directly. Fails with
     /// `TableExists` if a table of that name exists.
@@ -403,6 +525,28 @@ impl Index {
         spec: VectorSpec,
         options: IndexOptions,
     ) -> Result<Index> {
+        Self::create_table(db, name, spec, options)?;
+        Self::open(db, name)
+    }
+
+    /// [`create`](Self::create), opened as
+    /// [`open_with_rebalancer`](Self::open_with_rebalancer) is.
+    pub fn create_with_rebalancer(
+        db: &Pigeonhole,
+        name: &str,
+        spec: VectorSpec,
+        options: IndexOptions,
+    ) -> Result<(Index, Rebalancer)> {
+        Self::create_table(db, name, spec, options)?;
+        Self::open_with_rebalancer(db, name)
+    }
+
+    fn create_table(
+        db: &Pigeonhole,
+        name: &str,
+        spec: VectorSpec,
+        options: IndexOptions,
+    ) -> Result<()> {
         let opts = options.checked(&spec)?;
         let cen = centroid_spec(&spec)?;
         let table = db
@@ -419,13 +563,43 @@ impl Index {
             .put_u64(META, LAYOUT, 0)
             .put_u64(META, NEXT, 0)
             .commit()?;
-        Self::open(db, name)
+        Ok(())
     }
 
     /// Opens the index `name`. Lists a crash left outside their bounds (a write committed,
     /// and its split or merge never ran) are queued, and the next insert or delete
-    /// rebalances them.
+    /// rebalances them, or with [`Rebalance::Background`] the crate's rebalancing thread
+    /// does: it starts here, and stops when the last handle to this index drops. An
+    /// application that runs its own threads opens with
+    /// [`open_with_rebalancer`](Self::open_with_rebalancer) instead.
     pub fn open(db: &Pigeonhole, name: &str) -> Result<Index> {
+        let index = Self::open_inner(db, name)?;
+        if index.inner.opts.rebalance == Rebalance::Background {
+            crate::rebalancer::spawn(Rebalancer::new(
+                &index.inner,
+                Arc::clone(&index.inner.signal),
+            ))
+            .map_err(|e| Error::InvalidArgument(format!("starting the rebalancer: {e}")))?;
+        }
+        Ok(index)
+    }
+
+    /// Opens the index `name` with its [`Rebalancer`] handed to the caller, and no thread of
+    /// the crate's own: for an application that runs its threads itself (an
+    /// application-owned database, D284). With [`Rebalance::Background`] the application
+    /// runs the rebalancer; with [`Rebalance::Inline`] the writes rebalance, and the
+    /// rebalancer only finds what `open` queued.
+    pub fn open_with_rebalancer(db: &Pigeonhole, name: &str) -> Result<(Index, Rebalancer)> {
+        let index = Self::open_inner(db, name)?;
+        let rebalancer = Rebalancer::new(&index.inner, Arc::clone(&index.inner.signal));
+        Ok((index, rebalancer))
+    }
+
+    pub(crate) fn from_inner(inner: Arc<Inner>) -> Self {
+        Index { inner }
+    }
+
+    fn open_inner(db: &Pigeonhole, name: &str) -> Result<Index> {
         let table = db.table(name)?.open()?;
         let not = |why: &str| {
             Error::InvalidArgument(format!("table {name:?} is not a vector index: {why}"))
@@ -454,6 +628,7 @@ impl Index {
                 layout: RwLock::new(Arc::new(layout)),
                 in_flight: Mutex::new(HashSet::new()),
                 pending: Mutex::new(VecDeque::new()),
+                signal: Arc::new(Signal::default()),
             }),
         };
         index.queue_out_of_bounds(&s)?;
@@ -505,7 +680,7 @@ impl Index {
     pub fn delete(&self, id: &[u8]) -> Result<bool> {
         let inn = &*self.inner;
         let t = &inn.table;
-        for _ in 0..RELOADS {
+        for attempt in 0..RELOADS {
             let r = inn.db.transact(&RetryPolicy::default(), |tx| {
                 let Some(l) = read_list_of(tx, t, id)? else {
                     return Ok(None);
@@ -514,6 +689,8 @@ impl Index {
                 if read_version(tx, t, l)?.is_none() {
                     return Err(Tx::Stale);
                 }
+                #[cfg(feature = "__unstable-hooks")]
+                crate::hooks::hold(crate::hooks::Hold::DeleteBeforeCommit);
                 tx.delete_column(t, &list_row(l), VEC, id)
                     .delete_column(t, &map_row(id), MAP, LIST)
                     .incr(t, &count_row(l), CNT, b"", -1);
@@ -522,11 +699,12 @@ impl Index {
             match r {
                 Ok((None, _)) => return Ok(false),
                 Ok((Some(l), _)) => {
-                    self.queue([l]);
-                    self.maintain()?;
+                    self.after_write([l])?;
                     return Ok(true);
                 }
-                Err(Tx::Stale) => std::thread::yield_now(),
+                // Only a merge in flight shows a mapping to a list with no centroid: back off
+                // (capped, as `RetryPolicy`'s pauses) rather than spin against it (#1268).
+                Err(Tx::Stale) => std::thread::sleep(backoff(attempt)),
                 Err(e) => return Err(e.into()),
             }
         }
@@ -548,6 +726,183 @@ impl Index {
     /// [`search_f32`](Self::search_f32) for a bit index.
     pub fn search_bits<'a>(&'a self, query: &'a [u8], k: usize) -> Search<'a> {
         Search::new(self, Input::Bits(query), k)
+    }
+
+    /// Loads many vectors into an **empty** index faster than inserting them one by one: it
+    /// clusters the first 50,000 vectors (or more if `expected` needs more lists) with
+    /// k-means into about `expected / target` lists, writes those centroids, then streams
+    /// every vector to its nearest list, a list's vectors written a batch per transaction.
+    /// Lists left out of bounds are then split or merged as the index rebalances
+    /// ([`Rebalance`]). `expected` is the number of vectors you're about to load, used only
+    /// to choose the number of lists. The sample is the input's first vectors, so shuffle an
+    /// input that is sorted by cluster. A repeated id keeps its last vector.
+    ///
+    /// Fails with `InvalidArgument` if the index already holds a list, or on the first
+    /// vector of another shape; the vectors before that are loaded.
+    pub fn bulk_load_f32<K, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<BulkStats>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[f32]>,
+    {
+        self.bulk(expected, vectors, |v: &V| Input::F32(v.as_ref()))
+    }
+
+    /// [`bulk_load_f32`](Self::bulk_load_f32) for an `i8` index.
+    pub fn bulk_load_i8<K, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<BulkStats>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[i8]>,
+    {
+        self.bulk(expected, vectors, |v: &V| Input::I8(v.as_ref()))
+    }
+
+    /// [`bulk_load_f32`](Self::bulk_load_f32) for a bit index.
+    pub fn bulk_load_bits<K, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+    ) -> Result<BulkStats>
+    where
+        K: AsRef<[u8]>,
+        V: AsRef<[u8]>,
+    {
+        self.bulk(expected, vectors, |v: &V| Input::Bits(v.as_ref()))
+    }
+
+    fn bulk<K: AsRef<[u8]>, V>(
+        &self,
+        expected: u64,
+        vectors: impl IntoIterator<Item = (K, V)>,
+        input: for<'v> fn(&'v V) -> Input<'v>,
+    ) -> Result<BulkStats> {
+        let inn = &*self.inner;
+        let t = &inn.table;
+        let empty = || Error::InvalidArgument("bulk_load needs an empty index".into());
+        if t.get(GLOBAL, META, NEXT)?.and_then(|c| c.as_u64()) != Some(0) {
+            return Err(empty());
+        }
+        let target = u64::from(inn.opts.target);
+        let want = usize::try_from(expected.div_ceil(target).max(1)).unwrap_or(usize::MAX);
+        let mut it = vectors.into_iter();
+        let sample: Vec<(K, V)> = it.by_ref().take(BULK_SAMPLE.max(want)).collect();
+        if sample.is_empty() {
+            return Ok(BulkStats {
+                vectors: 0,
+                lists: 0,
+            });
+        }
+        let mut points = Vec::with_capacity(sample.len());
+        for (_, v) in &sample {
+            let v = input(v);
+            v.check(&inn.spec)?;
+            points.push(v.point());
+        }
+        let centroids = kmeans(&inn.cen, &points, want.min(sample.len()))?;
+        drop(points);
+        let lists = u32::try_from(centroids.len()).map_err(|_| corrupt("too many lists"))?;
+        inn.db.transact(&RetryPolicy::default(), |tx| {
+            if read_u64(tx, t, GLOBAL, META, NEXT)? != Some(0) {
+                return Err(Tx::Fail(empty()));
+            }
+            for (i, c) in (0u32..).zip(&centroids) {
+                put_centroid(tx, t, i, c);
+                tx.put_u64(t, &centroid_row(i), META, VERSION, 1);
+            }
+            tx.put_u64(t, GLOBAL, META, NEXT, u64::from(lists))
+                .put_u64(t, GLOBAL, META, LAYOUT, 1);
+            Ok(())
+        })?;
+        let layout = self.reload()?;
+        // Each list's unwritten batch, and which batch holds an id (a repeat replaces it).
+        let mut batches: HashMap<u32, Vec<(K, V)>> = HashMap::new();
+        let mut waiting: HashMap<Vec<u8>, u32> = HashMap::new();
+        let mut loaded = 0u64;
+        for (id, v) in sample.into_iter().chain(it) {
+            let vi = input(&v);
+            vi.check(&inn.spec)?;
+            let l = layout.nearest(&inn.cen, &vi.point(), 1, &[])?[0];
+            if let Some(prev) = waiting.insert(id.as_ref().to_vec(), l) {
+                let b = batches.get_mut(&prev).expect("a waiting id's batch");
+                b.retain(|(k, _)| k.as_ref() != id.as_ref());
+            }
+            let batch = batches.entry(l).or_default();
+            batch.push((id, v));
+            loaded += 1;
+            if batch.len() >= BULK_BATCH {
+                let full = std::mem::take(batch);
+                for (k, _) in &full {
+                    waiting.remove(k.as_ref());
+                }
+                self.write_batch(l, &full, input)?;
+            }
+        }
+        for (l, batch) in batches {
+            if !batch.is_empty() {
+                self.write_batch(l, &batch, input)?;
+            }
+        }
+        let all: Vec<u32> = layout.lists.iter().map(|l| l.id).collect();
+        match inn.opts.rebalance {
+            Rebalance::Inline => {
+                self.queue(all);
+                while self.maintain_one()?.is_some() {}
+            }
+            _ => self.after_write(all)?,
+        }
+        Ok(BulkStats {
+            vectors: loaded,
+            lists,
+        })
+    }
+
+    /// One transaction writing `batch` into list `l`, each vector as an upsert would.
+    fn write_batch<K: AsRef<[u8]>, V>(
+        &self,
+        l: u32,
+        batch: &[(K, V)],
+        input: for<'v> fn(&'v V) -> Input<'v>,
+    ) -> Result<()> {
+        let inn = &*self.inner;
+        let t = &inn.table;
+        let row = list_row(l);
+        inn.db.transact(&RetryPolicy::default(), |tx| {
+            if read_version(tx, t, l)?.is_none() {
+                return Err(Tx::Fail(Error::Conflict(
+                    "a list merged away during a bulk load".into(),
+                )));
+            }
+            let mut added = 0i64;
+            for (id, v) in batch {
+                let id = id.as_ref();
+                let old = read_list_of(tx, t, id)?;
+                match old {
+                    Some(o) if o == l => input(v).put(tx, t, &row, id),
+                    Some(o) => {
+                        tx.delete_column(t, &list_row(o), VEC, id)
+                            .incr(t, &count_row(o), CNT, b"", -1)
+                            .put_u64(t, &map_row(id), MAP, LIST, u64::from(l));
+                        input(v).put(tx, t, &row, id);
+                        added += 1;
+                    }
+                    None => {
+                        tx.put_u64(t, &map_row(id), MAP, LIST, u64::from(l));
+                        input(v).put(tx, t, &row, id);
+                        added += 1;
+                    }
+                }
+            }
+            tx.incr(t, &count_row(l), CNT, b"", added);
+            Ok(())
+        })?;
+        Ok(())
     }
 
     /// Checks the index's rows against each other at one snapshot: every id in exactly one
@@ -629,10 +984,7 @@ impl Index {
                 self.place(&layout, id, v, &point)
             };
             match r {
-                Ok(touched) => {
-                    self.queue(touched);
-                    return self.maintain();
-                }
+                Ok(touched) => return self.after_write(touched),
                 Err(Tx::Stale) => layout = self.reload()?,
                 Err(e) => return Err(e.into()),
             }
@@ -713,6 +1065,8 @@ impl Index {
                     );
                 }
             }
+            #[cfg(feature = "__unstable-hooks")]
+            crate::hooks::hold(crate::hooks::Hold::PlaceBeforeCommit);
             Ok(old)
         })?;
         Ok(match old {
@@ -806,6 +1160,11 @@ impl Index {
                 out.push(list);
             }
         }
+        // Background markers: a hint, re-checked before any work (rev 3 M3).
+        for row in t.scan_prefix(b"Q").family(META).snapshot(s).iter()? {
+            let row = row?;
+            out.push(list_of(row.key()).ok_or_else(|| corrupt("a marker row key"))?);
+        }
         self.queue(out);
         Ok(())
     }
@@ -813,26 +1172,90 @@ impl Index {
     /// Splits or merges queued lists that are outside their bounds, a bounded number per
     /// call (a bound check, never an edge: rev 3 M3).
     fn maintain(&self) -> Result<()> {
+        for _ in 0..MAINTENANCE_PER_CALL {
+            if self.maintain_one()?.is_none() {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks the next queued list against its bounds, and splits or merges it: `None` when
+    /// nothing is queued, else whether it was out of bounds. In background mode a list found
+    /// within its bounds has its stale marker removed. An error puts the list back.
+    pub(crate) fn maintain_one(&self) -> Result<Option<bool>> {
+        let next = self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front();
+        let Some(l) = next else {
+            return Ok(None);
+        };
+        let r = (|| {
+            let n = self.count(l)?;
+            if n > self.max_list_len() {
+                self.split(l)?;
+                Ok(true)
+            } else if n < self.min_list_len() && self.layout().lists.len() > 1 {
+                self.merge(l)?;
+                Ok(true)
+            } else {
+                if self.inner.opts.rebalance == Rebalance::Background {
+                    self.inner
+                        .table
+                        .mutate(&queue_row(l))
+                        .delete_row()
+                        .commit()?;
+                }
+                Ok(false)
+            }
+        })();
+        if r.is_err() {
+            self.queue([l]);
+        }
+        r.map(Some)
+    }
+
+    /// After a write committed into `lists`: rebalance them now ([`Rebalance::Inline`]), or
+    /// mark those out of bounds for the rebalancer ([`Rebalance::Background`]): a `Q` row in
+    /// its own transaction (rev 4 N2) and the in-process queue. A list already queued here
+    /// isn't marked again.
+    fn after_write(&self, lists: impl IntoIterator<Item = u32>) -> Result<()> {
         #[cfg(feature = "__unstable-hooks")]
         if crate::hooks::skipping_rebalance() {
             return Ok(());
         }
-        for _ in 0..MAINTENANCE_PER_CALL {
-            let next = self
+        if self.inner.opts.rebalance == Rebalance::Inline {
+            self.queue(lists);
+            return self.maintain();
+        }
+        let mut marked = false;
+        for l in lists {
+            let queued = self
                 .inner
                 .pending
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .pop_front();
-            let Some(l) = next else {
-                return Ok(());
-            };
-            let n = self.count(l)?;
-            if n > self.max_list_len() {
-                self.split(l)?;
-            } else if n < self.min_list_len() && self.layout().lists.len() > 1 {
-                self.merge(l)?;
+                .contains(&l);
+            if queued {
+                continue;
             }
+            let n = self.count(l)?;
+            let several = self.layout().lists.len() > 1;
+            if n > self.max_list_len() || (n < self.min_list_len() && several) {
+                self.inner
+                    .table
+                    .mutate(&queue_row(l))
+                    .put_u64(META, MARK, 1)
+                    .commit()?;
+                self.queue([l]);
+                marked = true;
+            }
+        }
+        if marked {
+            self.inner.signal.notify();
         }
         Ok(())
     }
@@ -902,6 +1325,11 @@ impl Index {
                 Ok(new) => {
                     let layout = self.reload()?;
                     self.queue([list, new]);
+                    #[cfg(feature = "__unstable-hooks")]
+                    if crate::hooks::failing_after_split() {
+                        // A crash between the split's commit and its phase 2.
+                        return Ok(());
+                    }
                     return self.reassign(&layout, list, new, &plan);
                 }
                 Err(Tx::Stale) => return Ok(()),
@@ -959,6 +1387,9 @@ impl Index {
                     .incr(t, &count_row(new), CNT, b"", moved)
                     .put_u64(t, GLOBAL, META, NEXT, next + 1)
                     .put_u64(t, GLOBAL, META, LAYOUT, layout + 1);
+                if inn.opts.rebalance == Rebalance::Background {
+                    tx.delete_row(t, &queue_row(list));
+                }
                 Ok(new)
             })?;
         Ok(new)
@@ -1034,6 +1465,8 @@ impl Index {
                     for (dest, n) in &gained {
                         tx.incr(t, &count_row(*dest), CNT, b"", *n);
                     }
+                    #[cfg(feature = "__unstable-hooks")]
+                    crate::hooks::hold(crate::hooks::Hold::ReassignBeforeCommit);
                     Ok(())
                 });
             match done {
@@ -1104,6 +1537,9 @@ impl Index {
                         .incr(t, &count_row(dst), CNT, b"", moving.len() as i64)
                         .put_u64(t, &centroid_row(dst), META, VERSION, version + 1)
                         .put_u64(t, GLOBAL, META, LAYOUT, layout + 1);
+                    if inn.opts.rebalance == Rebalance::Background {
+                        tx.delete_row(t, &queue_row(list));
+                    }
                     Ok(true)
                 });
             match r {
@@ -1171,9 +1607,12 @@ impl<'a> Search<'a> {
         self
     }
 
-    /// Runs the search: at most `k` hits, nearest first, ties by list row and then id. One
-    /// snapshot covers the centroids and the lists, so a concurrent split never shows a
-    /// vector twice or hides it.
+    /// Runs the search: at most `k` hits, nearest first. One snapshot covers the centroids
+    /// and the lists, so a concurrent split never shows a vector twice or hides it.
+    ///
+    /// Hits at an equal distance come back by the list that holds them, then by id. A split
+    /// can move a tied id to another list, so which of several ids tied at the `k`-th
+    /// distance makes the cut can differ between layouts; at one snapshot it's fixed.
     pub fn run(self) -> Result<Vec<Hit>> {
         let index = self.index;
         let inn = &*index.inner;
