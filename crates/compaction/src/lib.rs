@@ -43,7 +43,7 @@ pub use job::{
 };
 pub use merge::{
     Bitwise, BloomUnion, Buckets, ExactF64, F64Extreme, HllUnion, I64Add, I64Max, I64Min,
-    MergeError, MergeOperator, MergeRegistry,
+    MergeError, MergeOperator, MergeRegistry, SetOps,
 };
 pub use picker::{CompactionPicker, CompactionTask, KeyRange, Levels, PickerOptions, TaskKind};
 pub use resolver::{COUNTER_FOLD_MIN, CellResolver, ResolveOptions, ResolvedCell, ValuePredicate};

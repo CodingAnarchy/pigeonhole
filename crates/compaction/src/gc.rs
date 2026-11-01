@@ -567,7 +567,7 @@ impl Gc {
                     }
                 }
                 if pending.is_some() {
-                    out.push(&self.acc_key, &self.acc);
+                    self.push_acc(out);
                 }
                 pending = Some(i);
                 self.acc_key.clear();
@@ -577,12 +577,12 @@ impl Gc {
                 continue;
             }
             if pending.take().is_some() {
-                out.push(&self.acc_key, &self.acc);
+                self.push_acc(out);
             }
             out.push_group(key.start, value.start, value.end);
         }
         if pending.is_some() {
-            out.push(&self.acc_key, &self.acc);
+            self.push_acc(out);
         }
         self.col_stripe = self.col_stripe.min(coldel_min);
     }
@@ -664,7 +664,7 @@ impl Gc {
                     }
                 }
                 if pending.is_some() {
-                    out.push(&self.acc_key, &self.acc);
+                    self.push_acc(out);
                 }
                 pending = Some((i, e.seqno));
                 self.acc_key.clear();
@@ -688,20 +688,37 @@ impl Gc {
                 account_drop(&mut self.blob_delta, Kind::Put, &self.group_data[value]);
                 let n = self.acc_key.len();
                 self.acc_key[n - 1] = Kind::Put as u8;
-                out.push(&self.acc_key, &self.acc);
+                self.push_acc(out);
                 pending = None;
                 self.kept -= 1;
                 self.folded += 1;
                 continue;
             }
             if pending.take().is_some() {
-                out.push(&self.acc_key, &self.acc);
+                self.push_acc(out);
             }
             out.push_group(key.start, value.start, value.end);
         }
         if pending.is_some() {
-            out.push(&self.acc_key, &self.acc);
+            self.push_acc(out);
         }
+    }
+
+    /// Pushes the accumulator, a combined operand (or a fold's result), settled into one an
+    /// operator stores ([`MergeOperator::settle`]): never a working form (D298).
+    fn push_acc(&mut self, out: &mut OutBuf) {
+        let (merge, acc) = (&self.merge, &mut self.acc);
+        if let Some(op) = merge
+            && op.settle(acc).is_err()
+        {
+            debug_assert!(false, "settling operands merge already checked failed");
+        }
+        debug_assert_ne!(
+            acc.first(),
+            Some(&pigeonhole_format::value::TRANSIENT_TAG),
+            "a working accumulator reached a compaction's output"
+        );
+        out.push(&self.acc_key, &self.acc);
     }
 
     /// Applies the combined operands in `acc` to the base at `value` (read from its blob
