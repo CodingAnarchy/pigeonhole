@@ -14,6 +14,8 @@ mod db;
 mod error;
 mod read;
 mod table;
+mod vector;
+mod walk;
 
 /// The native module.
 #[pymodule]
@@ -34,6 +36,11 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<read::Row>()?;
     m.add_class::<read::Snapshot>()?;
     m.add_class::<read::ScanIter>()?;
+    m.add_class::<vector::VectorSpec>()?;
+    m.add_class::<walk::Hop>()?;
+    m.add_class::<walk::Traversal>()?;
+    m.add_class::<walk::RowPosition>()?;
+    m.add_class::<walk::Pages>()?;
     error::register(m)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

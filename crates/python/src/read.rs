@@ -49,6 +49,15 @@ impl Cell {
         self.0.as_f64()
     }
 
+    /// A vector cell's vector: `array.array('f')` (f32) or `array.array('b')` (i8), which
+    /// NumPy wraps without a copy (`numpy.frombuffer`), or the packed bits as `bytes`.
+    fn as_vector<'py>(&self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
+        self.0
+            .as_vector()
+            .map(|v| crate::vector::to_py(py, v))
+            .transpose()
+    }
+
     /// An `hll` family's distinct-count estimate.
     fn hll_estimate(&self) -> Option<u64> {
         self.0.hll_estimate()
@@ -106,6 +115,7 @@ pub(crate) fn typed<'py>(py: Python<'py>, v: Value<'_>) -> PyResult<Bound<'py, P
         Value::I64(n) | Value::Varint(n) => n.into_pyobject(py)?.into_any(),
         Value::F64(x) => x.into_pyobject(py)?.into_any(),
         Value::Bytes(b) => PyBytes::new(py, b).into_any(),
+        Value::Vector(v) => crate::vector::to_py(py, v)?,
         // A value type this build doesn't know: its bytes.
         _ => py.None().into_bound(py),
     })
@@ -244,6 +254,28 @@ impl ScanIter {
 impl ScanIter {
     fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
         slf
+    }
+
+    /// Ends the scan: its read (and the snapshot it holds, a reader process's slot
+    /// included) is released now rather than when the iterator is collected. Iterating
+    /// afterwards ends at once. Closing twice does nothing.
+    fn close(&mut self) {
+        self.rows.lock().expect("not poisoned").take();
+        self.buffered.clear();
+    }
+
+    fn __enter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __exit__(
+        &mut self,
+        _ty: &Bound<'_, PyAny>,
+        _value: &Bound<'_, PyAny>,
+        _tb: &Bound<'_, PyAny>,
+    ) -> bool {
+        self.close();
+        false
     }
 
     fn __next__(&mut self, py: Python<'_>) -> PyResult<Option<Row>> {

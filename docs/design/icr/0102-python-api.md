@@ -40,6 +40,20 @@ A new workspace crate, `crates/python` (`pigeonhole-python`, `publish = false` o
   - `Durability`, an `enum.IntEnum` defined in the package: `NONE`, `BUFFERED`, `GROUP_SYNC`, `SYNC` (0–3). An int with one of those values is accepted too.
 - **Errors:** `Error`, plus one subclass per `ErrorCode`, named as the code. Each carries `code` (the name) and `code_num`.
 
+### PR 2: vectors, the 1.1 reads, closing a scan (#1261)
+- **Vectors (D303):**
+  - `Element` (`F32`, `I8`, `BIT`) and `Metric` (`L2`, `COSINE`, `INNER_PRODUCT`, `HAMMING`), `enum.StrEnum`s in the package;
+  - `VectorSpec(dim, element, metric)` with `dim`, `element`, `metric`;
+  - `Family.vector(dim, element, metric, *, max_versions, ttl)`, and `FamilyInfo.vector`;
+  - `put_vector(family, qualifier, vector, *, ts)` on `Mutation`, and with a table and row first on `WriteBatch` and `Transaction`. The family's element type decides how a buffer (PyO3's `PyBuffer`, so NumPy arrays and `array.array`) or a sequence is read; bits are packed bytes.
+  - `Cell.as_vector()`, and `Cell.typed` for vector cells: an `array.array('f'|'b')`, or `bytes` for bits.
+- **Reads:**
+  - `Table.multi_get(keys, *, families, qualifier_prefix, versions, column_limit, snapshot) -> list[Row]` (D299). It's named `multi_get`, not `keys`, which reads like a dict method in Python.
+  - `Table.traverse(seeds, family, *, hops, per_node_limit, hop_limit, max_nodes, parents, qualifier_prefix, snapshot, parallel) -> Traversal` (D304). `Traversal` has `hops`, `seeds` (sorted: hop 1's parents index them), `rows`, `edges`, `hops_cut` and `cut_by_max_nodes`; `Hop` has `nodes` and `parents`.
+  - `Table.pages(row, size, *, families, qualifier_prefix, versions, snapshot, after) -> Pages` (D297): an iterator of `Row` pages with `position`, holding no read open between pages. `RowPosition` has `to_bytes`, `from_bytes` and `==`.
+- **`ScanIter.close()`** and context-manager support. After `Database.close()`, a live iterator hands out the rows it already read, then raises `Closed`.
+- **Not yet:** `nearest` waits for D296 PR 4 (#1259) in `pigeonhole`.
+
 ## Why
 D307 (#696): most agent frameworks and AI tooling are Python. The owner decided to bind the Rust crate directly rather than go through the C ABI (#690).
 
@@ -47,11 +61,6 @@ D307 (#696): most agent frameworks and AI tooling are Python. The owner decided 
 This is new API, so there are no callers. No Rust interface changes: the crate uses `pigeonhole`'s public API only.
 
 ## Later PRs
-- **PR 2** (#1261):
-  - vectors: `Family.vector`, `put_vector` from a buffer or a list, `Cell.as_vector`, and `nearest` on scans and `keys()` returning a typed `Neighbour`. Until then, `Cell.typed` is `None` for vector cells;
-  - `ScanIter.close()` and context-manager support;
-  - the remaining 1.1 reads: `keys()` multi-get, `traverse`, and row walking (`cells`/`pages`/`RowPosition`);
-  - the per-op overhead benchmark, and the Python guide page.
-
-  Each addition lands in the stubs.
+- **PR 2** (#1261): above, with the per-op overhead benchmark and `docs/guide/python.md`.
+- **Next:** `nearest` on scans and `multi_get`, returning a typed `Neighbour`, once #1259 lands.
 - **PR 3:** the PyPI publish workflow, after the owner's go.

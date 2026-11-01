@@ -109,6 +109,31 @@ impl Family {
         )
     }
 
+    /// A vector family (D303): `dim` elements of `element` (`Element.F32`, `I8` or `BIT`),
+    /// compared by `metric` (`Metric.L2`, `COSINE`, `INNER_PRODUCT` or `HAMMING`). Its
+    /// cells are written with `put_vector`.
+    #[staticmethod]
+    #[pyo3(signature = (dim, element, metric, *, max_versions=None, ttl=None))]
+    fn vector(
+        dim: u32,
+        element: &Bound<'_, PyAny>,
+        metric: &Bound<'_, PyAny>,
+        max_versions: Option<u32>,
+        ttl: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        let spec = crate::vector::VectorSpec::new_spec(dim, element, metric)?;
+        options(
+            pigeonhole::Family::vector(spec),
+            max_versions,
+            ttl,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
     /// An aggregate family of `kind`: `"sum"`, `"min"`, `"max"`, `"hll"`, `"bit_or"`,
     /// `"bit_and"`, `"bit_xor"`, `"min_f64"`, `"max_f64"`, `"sum_f64"`, `"mean_var"`,
     /// `"histogram"` (with `bounds`), `"quantiles"` (with optional `mantissa_bits` and
@@ -329,6 +354,12 @@ impl FamilyInfo {
         }
     }
 
+    /// A vector family's spec, or `None`.
+    #[getter]
+    fn vector(&self) -> Option<crate::vector::VectorSpec> {
+        self.0.vector.map(crate::vector::VectorSpec)
+    }
+
     /// The family's options as a `Family`, to create the same family elsewhere.
     #[getter]
     fn family(&self) -> Family {
@@ -393,6 +424,7 @@ pub(crate) enum Op {
     PutU64(String, Vec<u8>, Option<u64>, u64),
     Incr(String, Vec<u8>, Option<u64>, i64),
     Aggregate(String, Vec<u8>, Option<u64>, Input),
+    PutVector(String, Vec<u8>, Option<u64>, crate::vector::Vector),
     DeleteRow,
     DeleteFamily(String),
     DeleteColumn(String, Vec<u8>),
@@ -446,6 +478,26 @@ pub(crate) fn aggregate_input(
         },
         Some(_) => Input::I64(ob.extract().map_err(|_| bad("an int"))?),
     })
+}
+
+/// `ob` as a vector for `table`'s `family`, read by the family's element type.
+pub(crate) fn vector_input(
+    table: &pigeonhole::Table,
+    family: &str,
+    ob: &Bound<'_, PyAny>,
+) -> PyResult<crate::vector::Vector> {
+    let info = table.family_info(family).ok_or_else(|| {
+        with_code(
+            pigeonhole::ErrorCode::FamilyNotFound,
+            &format!("table {} has no family {family}", table.name()),
+        )
+    })?;
+    let spec = info.vector.ok_or_else(|| {
+        PyTypeError::new_err(format!(
+            "put_vector writes to a vector family, and {family} is not one"
+        ))
+    })?;
+    crate::vector::vector(ob, spec.element())
 }
 
 /// A table handle, as the writer or as a reader process.
@@ -632,6 +684,93 @@ impl Table {
         ScanIter::new(scan, chunk)
     }
 
+    /// The rows of `keys` (a multi-get, D299), in key order, with the selection `row` takes;
+    /// keys whose row has no cell the selection keeps are left out.
+    #[pyo3(signature = (keys, *, families=None, qualifier_prefix=None, versions=1, column_limit=None, snapshot=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn multi_get(
+        &self,
+        py: Python<'_>,
+        keys: Vec<Bound<'_, PyAny>>,
+        families: Option<Vec<String>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        versions: u32,
+        column_limit: Option<u32>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+    ) -> PyResult<Vec<Row>> {
+        crate::walk::multi_get(
+            py,
+            &self.0,
+            &keys,
+            families,
+            qualifier_prefix,
+            versions,
+            column_limit,
+            snapshot,
+        )
+    }
+
+    /// A breadth-first traversal (D304) of a graph stored as adjacency rows: each hop
+    /// follows `family`'s edges (a column per edge, its qualifier the destination's key)
+    /// from the previous hop's nodes, and keeps the nodes not visited before.
+    #[pyo3(signature = (seeds, family, *, hops=1, per_node_limit=None, hop_limit=None, max_nodes=None, parents=false, qualifier_prefix=None, snapshot=None, parallel=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn traverse(
+        &self,
+        py: Python<'_>,
+        seeds: Vec<Bound<'_, PyAny>>,
+        family: String,
+        hops: u32,
+        per_node_limit: Option<u32>,
+        hop_limit: Option<u64>,
+        max_nodes: Option<u64>,
+        parents: bool,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        parallel: Option<usize>,
+    ) -> PyResult<crate::walk::Traversal> {
+        crate::walk::traverse(
+            py,
+            &self.0,
+            &seeds,
+            family,
+            hops,
+            per_node_limit,
+            hop_limit,
+            max_nodes,
+            parents,
+            qualifier_prefix,
+            snapshot,
+            parallel,
+        )
+    }
+
+    /// A wide row's pages, at most `size` cells each (a column's versions never split), each
+    /// read when it is asked for; `after` resumes after an earlier walk's `position`.
+    #[pyo3(signature = (row, size, *, families=None, qualifier_prefix=None, versions=1, snapshot=None, after=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn pages(
+        &self,
+        row: &Bound<'_, PyAny>,
+        size: usize,
+        families: Option<Vec<String>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        versions: u32,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        after: Option<&crate::walk::RowPosition>,
+    ) -> PyResult<crate::walk::Pages> {
+        crate::walk::Pages::new(
+            &self.0,
+            row,
+            size,
+            families,
+            qualifier_prefix,
+            versions,
+            snapshot,
+            after,
+        )
+    }
+
     /// A mutation of one row: chain writes, then `commit()` them atomically.
     fn mutate(&self, row: &Bound<'_, PyAny>) -> PyResult<Mutation> {
         let table = self.writer()?.clone();
@@ -804,6 +943,17 @@ pub(crate) fn commit_row(
                 Op::Aggregate(f, q, Some(ts), Input::Bytes(b)) => {
                     m.aggregate_bytes_at(f, q, *ts, b)
                 }
+                Op::PutVector(f, q, ts, v) => {
+                    use crate::vector::Vector;
+                    match (v, ts) {
+                        (Vector::F32(x), None) => m.put_vector_f32(f, q, x),
+                        (Vector::F32(x), Some(ts)) => m.put_vector_f32_at(f, q, *ts, x),
+                        (Vector::I8(x), None) => m.put_vector_i8(f, q, x),
+                        (Vector::I8(x), Some(ts)) => m.put_vector_i8_at(f, q, *ts, x),
+                        (Vector::Bits(x), None) => m.put_vector_bits(f, q, x),
+                        (Vector::Bits(x), Some(ts)) => m.put_vector_bits_at(f, q, *ts, x),
+                    }
+                }
                 Op::DeleteRow => m.delete_row(),
                 Op::DeleteFamily(f) => m.delete_family(f),
                 Op::DeleteColumn(f, q) => m.delete_column(f, q),
@@ -906,6 +1056,24 @@ impl Mutation {
         Self::push(
             slf,
             Op::Aggregate(family, convert::bytes(qualifier)?, ts, input),
+        )?;
+        Ok(slf.clone())
+    }
+
+    /// Puts a vector in a vector family: a buffer (a NumPy array, `array.array`) or a
+    /// sequence, of the family's element type (bits: packed, bytes-like).
+    #[pyo3(signature = (family, qualifier, vector, *, ts=None))]
+    fn put_vector<'py>(
+        slf: &Bound<'py, Self>,
+        family: String,
+        qualifier: &Bound<'_, PyAny>,
+        vector: &Bound<'_, PyAny>,
+        ts: Option<u64>,
+    ) -> PyResult<Bound<'py, Self>> {
+        let v = vector_input(&slf.get().table, &family, vector)?;
+        Self::push(
+            slf,
+            Op::PutVector(family, convert::bytes(qualifier)?, ts, v),
         )?;
         Ok(slf.clone())
     }

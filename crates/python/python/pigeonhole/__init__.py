@@ -21,9 +21,34 @@ class Durability(_enum.IntEnum):
     """Synced by this commit alone."""
 
 
+class Element(_enum.StrEnum):
+    """A vector family's element type."""
+
+    F32 = "f32"
+    """32-bit floats."""
+    I8 = "i8"
+    """Signed bytes."""
+    BIT = "bit"
+    """Packed bits (Hamming distance)."""
+
+
+class Metric(_enum.StrEnum):
+    """How a vector family compares vectors."""
+
+    L2 = "l2"
+    COSINE = "cosine"
+    INNER_PRODUCT = "inner_product"
+    HAMMING = "hamming"
+
+
 Key = bytes | bytearray | memoryview | str
 """A row key, qualifier or byte value: bytes-like, or str (as UTF-8)."""
 Value = Key | int | float
 """A cell value: bytes-like or str (a byte value), int (an i64), float (an f64)."""
+import array as _array
+
+Vector = list[float] | list[int] | bytes | bytearray | memoryview | _array.array
+"""A vector as written: a buffer (a NumPy array, array.array) or a sequence of the family's
+element type; bits: packed, bytes-like."""
 Seconds = _timedelta | int | float
 """A duration: a timedelta, or seconds."""
