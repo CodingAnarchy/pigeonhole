@@ -337,6 +337,43 @@ fn bad_positions_are_refused() {
             .map(|_| ()),
     );
     invalid(t.scan_prefix(b"r").resume_after(&mid).iter().map(|_| ()));
+    // Every position carries its table (perf287's S1 on #1281), not only a mid-row one: an
+    // after-row position and an empty page's at-row position from t are refused on u.
+    let after_row = t.scan_prefix(b"r").limit(1).read_within(1 << 20).unwrap();
+    let after_row = after_row.resume().unwrap().clone();
+    invalid(
+        other
+            .scan_prefix(b"r")
+            .resume_after(&after_row)
+            .read_within(1 << 20)
+            .map(|_| ()),
+    );
+    let at_row = t.scan_prefix(b"r").read_within(1).unwrap();
+    assert!(at_row.rows().is_empty());
+    let at_row = at_row.resume().unwrap().clone();
+    invalid(
+        other
+            .scan_prefix(b"r")
+            .resume_after(&at_row)
+            .read_within(1 << 20)
+            .map(|_| ()),
+    );
+    let kpos = t
+        .keys(&KeySet::from_unsorted([b"r001", b"r002"]))
+        .read_within(80)
+        .unwrap();
+    let kpos = kpos.resume().unwrap().clone();
+    invalid(
+        other
+            .keys(&KeySet::from_unsorted([b"r000"]))
+            .resume_after(&kpos)
+            .read_within(1 << 20)
+            .map(|_| ()),
+    );
+    // A key length past the bytes, or past usize when added, is refused, not a panic.
+    let mut huge = after_row.to_bytes();
+    huge[7..11].copy_from_slice(&u32::MAX.to_le_bytes());
+    invalid(ScanPosition::from_bytes(&huge).map(|_| ()));
     invalid(ScanPosition::from_bytes(b"nonsense").map(|_| ()));
     let kp = t
         .keys(&KeySet::from_unsorted([b"r001"]))

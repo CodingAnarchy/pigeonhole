@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use pigeonhole_engine::{
     BUDGET_ITEM_OVERHEAD, ByteBudget, CellData, CellKey, CellVisitor, ColumnPosition, FamilyId,
-    KeySet, ReadInput, ReduceSpec, Timestamp, Visit,
+    KeySet, ReadInput, ReduceSpec, TableId, Timestamp, Visit,
 };
 
 use super::{Selection, TableCore};
@@ -30,6 +30,9 @@ enum Mark {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Position {
+    /// The table the position is from: a read of another table refuses it
+    /// (`InvalidArgument`, perf287's S1 on #1281), whatever its mark.
+    table: TableId,
     key: Vec<u8>,
     mark: Mark,
 }
@@ -40,6 +43,8 @@ const SCAN: u8 = b'S';
 const KEYS: u8 = b'K';
 
 impl Position {
+    /// `version, kind, mark, table (u32 LE), key length (u32 LE), key`, then for a mark
+    /// after a column, the column's own bytes.
     fn to_bytes(&self, kind: u8) -> Vec<u8> {
         let mut b = vec![VERSION, kind];
         b.push(match self.mark {
@@ -47,6 +52,7 @@ impl Position {
             Mark::AfterColumn(_) => 1,
             Mark::AtRow => 2,
         });
+        b.extend_from_slice(&self.table.0.to_le_bytes());
         b.extend_from_slice(&(self.key.len() as u32).to_le_bytes());
         b.extend_from_slice(&self.key);
         if let Mark::AfterColumn(c) = &self.mark {
@@ -57,19 +63,39 @@ impl Position {
 
     fn from_bytes(b: &[u8], kind: u8, what: &str) -> Result<Self> {
         let bad = || Error::new(ErrorCode::InvalidArgument, format!("not a {what}"));
-        if b.len() < 7 || b[0] != VERSION || b[1] != kind {
+        const HEAD: usize = 11;
+        if b.len() < HEAD || b[0] != VERSION || b[1] != kind {
             return Err(bad());
         }
-        let len = u32::from_le_bytes(b[3..7].try_into().expect("4 bytes")) as usize;
-        let key = b.get(7..7 + len).ok_or_else(bad)?.to_vec();
-        let rest = &b[7 + len..];
+        let table = TableId(u32::from_le_bytes(b[3..7].try_into().expect("4 bytes")));
+        let len = u32::from_le_bytes(b[7..11].try_into().expect("4 bytes")) as usize;
+        let end = HEAD.checked_add(len).ok_or_else(bad)?;
+        let key = b.get(HEAD..end).ok_or_else(bad)?.to_vec();
+        let rest = &b[end..];
         let mark = match (b[2], rest.is_empty()) {
             (0, true) => Mark::AfterRow,
             (2, true) => Mark::AtRow,
-            (1, false) => Mark::AfterColumn(ColumnPosition::from_bytes(rest).map_err(|_| bad())?),
+            (1, false) => {
+                let c = ColumnPosition::from_bytes(rest).map_err(|_| bad())?;
+                if c.table() != table {
+                    return Err(bad());
+                }
+                Mark::AfterColumn(c)
+            }
             _ => return Err(bad()),
         };
-        Ok(Self { key, mark })
+        Ok(Self { table, key, mark })
+    }
+
+    /// `InvalidArgument` unless the position is from `table`.
+    fn check(&self, table: TableId) -> Result<()> {
+        if self.table != table {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "a position from another table",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -77,6 +103,7 @@ impl Position {
 /// [`Scan::resume_after`](super::Scan::resume_after): after its last row, after a column
 /// inside it when the page cut the row, or (an empty page) at its own start. Its bytes
 /// (`to_bytes`) are versioned and stable, so a client can hand it back later.
+/// It names its table: a read of another table refuses it (`InvalidArgument`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ScanPosition(Position);
 
@@ -103,6 +130,7 @@ impl ScanPosition {
 /// key returned (and the column when the page cut its row), not an index into the key set,
 /// so a set rebuilt between pages (keys added or removed) resumes at the right key
 /// (cli692's S1 on #1250).
+/// It names its table: a read of another table refuses it (`InvalidArgument`).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct KeysPosition(Position);
 
@@ -187,9 +215,9 @@ page!(
 );
 
 /// Copies each cell's stored value (tag byte first) for the page.
-struct Copy;
+struct CopyValue;
 
-impl CellVisitor for Copy {
+impl CellVisitor for CopyValue {
     type Item = Vec<u8>;
     fn visit(
         &mut self,
@@ -204,11 +232,17 @@ impl CellVisitor for Copy {
 }
 
 /// A cell's own size (D308 §2): its qualifier, its value as `CellRef::value` gives it (the
-/// stored bytes after the tag), and the overhead. It takes `&Vec<u8>` because the reducer
+/// stored bytes after the tag), and the overhead. The reducer's size function and the
+/// page's row sizes both use it.
+fn own_size(qualifier: &[u8], stored: &[u8]) -> u64 {
+    qualifier.len() as u64 + stored.len().saturating_sub(1) as u64 + BUDGET_ITEM_OVERHEAD
+}
+
+/// [`own_size`] as the reducer's size function. It takes `&Vec<u8>` because the reducer
 /// hands its size function `&Item`, and the item is the copied value.
 #[allow(clippy::ptr_arg)]
 fn size(cell: &pigeonhole_engine::CellRef<'_>, stored: &Vec<u8>) -> u64 {
-    cell.qualifier.len() as u64 + stored.len().saturating_sub(1) as u64 + BUDGET_ITEM_OVERHEAD
+    own_size(cell.qualifier, stored)
 }
 
 /// A page's parts before its resume point is set.
@@ -240,7 +274,7 @@ fn read(
             &snapshot,
             table,
             &spec,
-            || Copy,
+            || CopyValue,
             || ByteBudget::new(budget, size),
         )
     })?;
@@ -249,9 +283,7 @@ fn read(
     let (mut rows, mut row_bytes) = (Vec::new(), Vec::new());
     let mut buf: Option<(RowBuf, u64)> = None;
     for (key, stored) in page.items {
-        let own = key.qualifier.len() as u64
-            + stored.len().saturating_sub(1) as u64
-            + BUDGET_ITEM_OVERHEAD;
+        let own = own_size(&key.qualifier, &stored);
         if buf.as_ref().is_none_or(|(b, _)| b.key != key.row) {
             if let Some((b, n)) = buf.take() {
                 rows.push(Row::new(b));
@@ -272,6 +304,11 @@ fn read(
         rows.push(Row::new(b));
         row_bytes.push(n);
     }
+    debug_assert_eq!(
+        row_bytes.iter().sum::<u64>(),
+        page.bytes,
+        "the rows' sizes are the reducer's"
+    );
     Ok(Read {
         rows,
         row_bytes,
@@ -289,6 +326,7 @@ impl Read {
         let o = self.overflow.as_ref()?;
         Some(match &self.last {
             Some(l) if l.row == o.key.row => Position {
+                table: self.table,
                 key: l.row.clone(),
                 mark: Mark::AfterColumn(ColumnPosition::new(
                     self.table,
@@ -297,10 +335,12 @@ impl Read {
                 )),
             },
             Some(l) => Position {
+                table: self.table,
                 key: l.row.clone(),
                 mark: Mark::AfterRow,
             },
             None => given.cloned().unwrap_or(Position {
+                table: self.table,
                 key: o.key.row.clone(),
                 mark: Mark::AtRow,
             }),
@@ -364,6 +404,9 @@ pub(super) fn scan(
         });
     }
     let given = after.map(|p| &p.0);
+    if let Some(p) = given {
+        p.check(core.info.id)?;
+    }
     let (lo, resume) = clamp(start, given);
     let r = read(
         core,
@@ -390,6 +433,7 @@ pub(super) fn scan(
             rows,
             next_bytes: None,
             resume: Some(ScanPosition(Position {
+                table: core.info.id,
                 key,
                 mark: Mark::AfterRow,
             })),
@@ -412,6 +456,9 @@ pub(super) fn keys(
     budget: u64,
 ) -> Result<KeysPage> {
     let given = after.map(|p| &p.0);
+    if let Some(p) = given {
+        p.check(core.info.id)?;
+    }
     // The keys from the position on (cli692's S1: by key, so a rebuilt set resumes at the
     // right one), and the resume inside the position's row when it names a column.
     let (from, resume) = match given {
