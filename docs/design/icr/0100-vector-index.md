@@ -52,6 +52,14 @@
 - **Docs:** `Hit` and `Search::run` state the tie order. Hits at an equal distance come by list, then id, so a split can change which tied id makes the cut at `k` (#1268).
 - **Hidden and unstable** (`__unstable-hooks`): `Hold::{PlaceBeforeCommit, DeleteBeforeCommit, ReassignBeforeCommit}`, `Armed::wait_for`, and `fail_after_split`.
 
+## `Search::run_async` (#1268 item 6)
+- **`Search::run_async(self) -> Result<Vec<Hit>>`**, behind the crate's new default-on `async` feature (`pigeonhole/async`, plus `futures-core`), mirroring `pigeonhole`'s. It's an `async fn` whose future is `Send`.
+- **It equals `run`.** It never blocks on the device:
+  - the layout version is read with `Table::get_at_async`;
+  - a layout that changed is reloaded through `Scan::stream`;
+  - the probed lists are read with `Nearest::run_async` (D296 PR 5), which yields within a wide list.
+- **It never fans out:** `parallel` is ignored, as for `Nearest::run_async`.
+
 ## The table (internal, not promised)
 The table holds:
 - the families `vec` (the index's spec), `cen` (an `f32` vector family of the same dimension and metric, or the index's own spec for bits; D306 rev 2 S1), `meta`, `map` and `cnt` (a counter);

@@ -1212,6 +1212,7 @@ dependencies = [
 name = "pigeonhole-vector"
 version = "1.0.0"
 dependencies = [
+ "futures-core",
  "pigeonhole",
  "pigeonhole-vector",
 ]

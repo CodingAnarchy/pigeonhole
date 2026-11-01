@@ -15,11 +15,15 @@ readme = "README.md"
 # The public crate only (spec Risks: query features build on the core, never the reverse;
 # D306 is an index of ordinary rows and transactions).
 pigeonhole = { workspace = true }
+futures-core = { workspace = true, optional = true }
 
 [lints]
 workspace = true
 
 [features]
+# `Search::run_async`, on `pigeonhole`'s async front door; default-on, as there.
+default = ["async"]
+async = ["pigeonhole/async", "dep:futures-core"]
 # Hold and fault seams for this crate's tests (`hooks`, as ICR 0085's): hidden, outside the
 # semver promise; never turn it on in an application.
 __unstable-hooks = []

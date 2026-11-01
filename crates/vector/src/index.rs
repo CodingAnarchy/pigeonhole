@@ -434,28 +434,58 @@ fn load(t: &Table, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
         .snapshot(s)
         .iter()?
     {
-        let row = row?;
-        let id = list_of(row.key()).ok_or_else(|| corrupt("a centroid row key"))?;
-        let v = row
-            .get(CEN, b"")
-            .and_then(|c| c.as_vector())
-            .ok_or_else(|| corrupt("a list has no centroid"))?;
-        let point = Point::of(v);
-        let version = row
-            .get(META, VERSION)
-            .and_then(|c| c.as_u64())
-            .ok_or_else(|| corrupt("a list has no version"))?;
-        lists.push(List {
-            id,
-            version,
-            centroid: point.to_vector(cen.dim())?,
-            point,
-        });
+        lists.push(list_of_row(&row?, cen)?);
     }
     Ok(Layout {
         seqno: s.seqno(),
         version,
         lists,
+    })
+}
+
+/// The centroids at `s`, as [`load`] reads them, without blocking on the device.
+#[cfg(feature = "async")]
+async fn load_async(t: &Table, cen: &VectorSpec, s: &Snapshot) -> Result<Layout> {
+    use futures_core::Stream;
+    let version = t
+        .get_at_async(s, GLOBAL, META, LAYOUT)
+        .await?
+        .and_then(|c| c.as_u64())
+        .unwrap_or(0);
+    let mut rows = std::pin::pin!(
+        t.scan_prefix(b"C")
+            .families([CEN, META])
+            .snapshot(s)
+            .stream()
+    );
+    let mut lists = Vec::new();
+    while let Some(row) = std::future::poll_fn(|cx| rows.as_mut().poll_next(cx)).await {
+        lists.push(list_of_row(&row?, cen)?);
+    }
+    Ok(Layout {
+        seqno: s.seqno(),
+        version,
+        lists,
+    })
+}
+
+/// One `C{list}` row's list.
+fn list_of_row(row: &pigeonhole::Row, cen: &VectorSpec) -> Result<List> {
+    let id = list_of(row.key()).ok_or_else(|| corrupt("a centroid row key"))?;
+    let v = row
+        .get(CEN, b"")
+        .and_then(|c| c.as_vector())
+        .ok_or_else(|| corrupt("a list has no centroid"))?;
+    let point = Point::of(v);
+    let version = row
+        .get(META, VERSION)
+        .and_then(|c| c.as_u64())
+        .ok_or_else(|| corrupt("a list has no version"))?;
+    Ok(List {
+        id,
+        version,
+        centroid: point.to_vector(cen.dim())?,
+        point,
     })
 }
 
@@ -1139,14 +1169,43 @@ impl Index {
         if version == shared.version {
             return Ok(shared);
         }
-        let fresh = Arc::new(load(&inn.table, &inn.cen, s)?);
+        let fresh = load(&inn.table, &inn.cen, s)?;
+        Ok(self.adopt(fresh, current))
+    }
+
+    /// [`layout_at`](Self::layout_at), without blocking on the device.
+    #[cfg(feature = "async")]
+    async fn layout_at_async(&self, s: &Snapshot, current: bool) -> Result<Arc<Layout>> {
+        let inn = &*self.inner;
+        let shared = self.layout();
+        let version = inn
+            .table
+            .get_at_async(s, GLOBAL, META, LAYOUT)
+            .await?
+            .and_then(|c| c.as_u64())
+            .unwrap_or(0);
+        if version == shared.version {
+            return Ok(shared);
+        }
+        let fresh = load_async(&inn.table, &inn.cen, s).await?;
+        Ok(self.adopt(fresh, current))
+    }
+
+    /// A layout loaded for a search: it replaces the shared cache when the search is at the
+    /// current snapshot and the cache is older (rev 3 S4).
+    fn adopt(&self, fresh: Layout, current: bool) -> Arc<Layout> {
+        let fresh = Arc::new(fresh);
         if current {
-            let mut w = inn.layout.write().unwrap_or_else(PoisonError::into_inner);
+            let mut w = self
+                .inner
+                .layout
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
             if fresh.seqno >= w.seqno {
                 *w = Arc::clone(&fresh);
             }
         }
-        Ok(fresh)
+        fresh
     }
 
     fn count(&self, list: u32) -> Result<u64> {
@@ -1600,6 +1659,15 @@ impl Index {
     }
 }
 
+fn hits(near: Vec<pigeonhole::Neighbour>) -> Vec<Hit> {
+    near.into_iter()
+        .map(|n| Hit {
+            id: n.qualifier,
+            distance: n.distance,
+        })
+        .collect()
+}
+
 /// A nearest-neighbour search under construction ([`Index::search_f32`] and its `i8` and
 /// bit forms). Finish with [`run`](Search::run).
 #[derive(Debug)]
@@ -1665,27 +1733,59 @@ impl<'a> Search<'a> {
             }
         };
         let layout = index.layout_at(s, self.snapshot.is_none())?;
-        if layout.lists.is_empty() || self.k == 0 {
+        let Some(keys) = self.probed(&layout)? else {
             return Ok(Vec::new());
+        };
+        let near = self.nearest(&keys, s).parallel(self.parallel).run()?;
+        Ok(hits(near))
+    }
+
+    /// [`run`](Self::run) as a future that never blocks on the device (D296 PR 5): the
+    /// layout version is read with `get_at_async`, a layout that changed is reloaded through
+    /// an async scan, and the probed lists are read with `Nearest::run_async`, which yields
+    /// within a wide list. Its result equals `run`'s. It never fans out:
+    /// [`parallel`](Self::parallel) is ignored. The future is `Send`.
+    #[cfg(feature = "async")]
+    pub async fn run_async(self) -> Result<Vec<Hit>> {
+        let index = self.index;
+        let inn = &*index.inner;
+        self.query.check(&inn.spec)?;
+        let taken;
+        let s = match self.snapshot {
+            Some(s) => s,
+            None => {
+                taken = inn.db.snapshot()?;
+                &taken
+            }
+        };
+        let layout = index.layout_at_async(s, self.snapshot.is_none()).await?;
+        let Some(keys) = self.probed(&layout)? else {
+            return Ok(Vec::new());
+        };
+        let near = self.nearest(&keys, s).run_async().await?;
+        Ok(hits(near))
+    }
+
+    /// The probed lists' rows, or `None` when there's nothing to read.
+    fn probed(&self, layout: &Layout) -> Result<Option<KeySet>> {
+        let inn = &*self.index.inner;
+        if layout.lists.is_empty() || self.k == 0 {
+            return Ok(None);
         }
         let probe = self.nprobe.unwrap_or(inn.opts.nprobe).max(1) as usize;
         let lists = layout.nearest(&inn.cen, &self.query.point(), probe, &[])?;
-        let keys = KeySet::from_unsorted(lists.iter().map(|l| list_row(*l)));
-        let read = inn.table.keys(&keys).family(VEC).snapshot(s);
-        let near = match self.query {
+        Ok(Some(KeySet::from_unsorted(
+            lists.iter().map(|l| list_row(*l)),
+        )))
+    }
+
+    fn nearest(&self, keys: &KeySet, s: &Snapshot) -> pigeonhole::Nearest<'a> {
+        let read = self.index.inner.table.keys(keys).family(VEC).snapshot(s);
+        match self.query {
             Input::F32(q) => read.nearest_f32(q, self.k),
             Input::I8(q) => read.nearest_i8(q, self.k),
             Input::Bits(q) => read.nearest_bits(q, self.k),
-        };
-        Ok(near
-            .parallel(self.parallel)
-            .run()?
-            .into_iter()
-            .map(|n| Hit {
-                id: n.qualifier,
-                distance: n.distance,
-            })
-            .collect())
+        }
     }
 }
 
