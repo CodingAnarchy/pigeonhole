@@ -2503,6 +2503,63 @@ impl Engine {
         ))
     }
 
+    /// An async exact nearest-neighbour search (D296): the `k` nearest vectors to `query`
+    /// (prepared for the family, `Params::prepare`) in the one vector family `spec.read`
+    /// names, over `spec.input` (one range, or a key set), as a future read on the polling
+    /// task ([`crate::PendingNearest`]). Its result equals [`Engine::reduce`] with a typed
+    /// [`crate::KnnVisitor`] and a `TopK` over the same input; `spec.parallelism` is
+    /// ignored.
+    pub fn nearest_async(
+        &self,
+        snapshot: &Snapshot,
+        table: TableId,
+        spec: &crate::ReduceSpec,
+        query: pigeonhole_format::vector::Prepared,
+        k: usize,
+    ) -> Result<crate::PendingNearest> {
+        snapshot.check_process()?;
+        let families = families_in_order(&snapshot.view, table, &spec.read.families)?;
+        if families.len() != 1 {
+            return Err(Error::InvalidArgument(
+                "a nearest-neighbour search reads exactly one family".into(),
+            ));
+        }
+        // With one version per cell, the read's value predicate tests the version the visitor
+        // sees (D22), so the search tests it itself, before the visitor, where its misses
+        // count toward the poll budget (#1237's rule).
+        let mut read = spec.read.clone();
+        read.versions = 1;
+        let filter = read
+            .value
+            .take()
+            .map(|p| (p, Arc::clone(&snapshot.view.ssts)));
+        Ok(match &spec.input {
+            crate::ReadInput::Ranges(ranges) => {
+                let [(lo, hi)] = ranges.as_slice() else {
+                    return Err(Error::InvalidArgument(
+                        "an async nearest-neighbour search reads one range".into(),
+                    ));
+                };
+                let mut scan = ScanSpec::new(lo.clone(), hi.clone());
+                scan.read = read;
+                let cursor = self.scan_async(snapshot, table, scan)?;
+                read::knn::PendingNearest::scan(cursor, query, k, filter)
+            }
+            crate::ReadInput::Keys(keys) => {
+                let cursor = crate::KeyCursor::over(
+                    snapshot.clone(),
+                    table,
+                    families.into_vec(),
+                    read,
+                    self.inner.shared.vfs.now_micros(),
+                    Arc::clone(keys),
+                    Arc::clone(&self.inner.shared),
+                )?;
+                read::knn::PendingNearest::keys(cursor, Arc::clone(keys), query, k, filter)
+            }
+        })
+    }
+
     /// [`Engine::scan`] for an async scan: its rows are polled with
     /// [`ScanCursor::poll_next_row`], which never blocks on a block it could predict (D196).
     pub fn scan_async(
