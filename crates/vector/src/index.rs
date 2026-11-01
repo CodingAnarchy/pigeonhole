@@ -228,6 +228,10 @@ pub struct IndexStats {
 #[derive(Clone)]
 pub struct Index {
     inner: Arc<Inner>,
+    /// Counts the application's handles: a rebalancer's own temporary handle has a token of
+    /// its own, so it can tell when every application handle is gone (simp724's R1 on
+    /// #1271).
+    user: Arc<()>,
 }
 
 impl std::fmt::Debug for Index {
@@ -571,15 +575,22 @@ impl Index {
     /// rebalances them, or with [`Rebalance::Background`] the crate's rebalancing thread
     /// does: it starts here, and stops when the last handle to this index drops. An
     /// application that runs its own threads opens with
-    /// [`open_with_rebalancer`](Self::open_with_rebalancer) instead.
+    /// [`open_with_rebalancer`](Self::open_with_rebalancer) instead: in an
+    /// application-owned database (D284) the crate shouldn't start threads of its own.
+    ///
+    /// Open an index once per process and clone the handle: each open has its own centroid
+    /// cache and, in background mode, its own rebalancer. Two would be correct (they
+    /// serialise on the index's rows, as two processes do) but would duplicate the work.
+    ///
+    /// The rebalancing thread holds the index, and with it a database handle, until it sees
+    /// the last [`Index`] handle drop, at most one split later. To reopen the database in
+    /// the same process, [`close`](Pigeonhole::close) it first: a closed database refuses
+    /// the thread's next write, and the thread ends.
     pub fn open(db: &Pigeonhole, name: &str) -> Result<Index> {
         let index = Self::open_inner(db, name)?;
         if index.inner.opts.rebalance == Rebalance::Background {
-            crate::rebalancer::spawn(Rebalancer::new(
-                &index.inner,
-                Arc::clone(&index.inner.signal),
-            ))
-            .map_err(|e| Error::InvalidArgument(format!("starting the rebalancer: {e}")))?;
+            crate::rebalancer::spawn(Rebalancer::new(&index, Arc::clone(&index.inner.signal)))
+                .map_err(|e| Error::InvalidArgument(format!("starting the rebalancer: {e}")))?;
         }
         Ok(index)
     }
@@ -591,12 +602,24 @@ impl Index {
     /// rebalancer only finds what `open` queued.
     pub fn open_with_rebalancer(db: &Pigeonhole, name: &str) -> Result<(Index, Rebalancer)> {
         let index = Self::open_inner(db, name)?;
-        let rebalancer = Rebalancer::new(&index.inner, Arc::clone(&index.inner.signal));
+        let rebalancer = Rebalancer::new(&index, Arc::clone(&index.inner.signal));
         Ok((index, rebalancer))
     }
 
+    /// A rebalancer's temporary handle: not one of the application's.
     pub(crate) fn from_inner(inner: Arc<Inner>) -> Self {
-        Index { inner }
+        Index {
+            inner,
+            user: Arc::new(()),
+        }
+    }
+
+    pub(crate) fn inner(&self) -> &Arc<Inner> {
+        &self.inner
+    }
+
+    pub(crate) fn user(&self) -> &Arc<()> {
+        &self.user
     }
 
     fn open_inner(db: &Pigeonhole, name: &str) -> Result<Index> {
@@ -619,6 +642,7 @@ impl Index {
         let s = db.snapshot()?;
         let layout = load(&table, &cen, &s)?;
         let index = Index {
+            user: Arc::new(()),
             inner: Arc::new(Inner {
                 db: db.clone(),
                 table,
@@ -733,9 +757,14 @@ impl Index {
     /// k-means into about `expected / target` lists, writes those centroids, then streams
     /// every vector to its nearest list, a list's vectors written a batch per transaction.
     /// Lists left out of bounds are then split or merged as the index rebalances
-    /// ([`Rebalance`]). `expected` is the number of vectors you're about to load, used only
-    /// to choose the number of lists. The sample is the input's first vectors, so shuffle an
-    /// input that is sorted by cluster. A repeated id keeps its last vector.
+    /// ([`Rebalance`]).
+    ///
+    /// `expected` is about how many vectors you're about to load. It only chooses how many
+    /// lists k-means starts with (`expected / target`, at least one); a wrong estimate costs
+    /// time, not correctness, since the lists then split or merge to their bounds after the
+    /// load. The sample is the input's first vectors, so shuffle an input that is sorted by
+    /// cluster. A repeated id keeps its last vector, and [`BulkStats::vectors`] counts every
+    /// occurrence.
     ///
     /// Fails with `InvalidArgument` if the index already holds a list, or on the first
     /// vector of another shape; the vectors before that are loaded.
@@ -1178,6 +1207,16 @@ impl Index {
             }
         }
         Ok(())
+    }
+
+    /// Whether lists are queued for a bound check.
+    pub(crate) fn has_pending(&self) -> bool {
+        !self
+            .inner
+            .pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
     }
 
     /// Checks the next queued list against its bounds, and splits or merges it: `None` when

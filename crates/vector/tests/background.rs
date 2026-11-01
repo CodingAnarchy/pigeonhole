@@ -155,6 +155,7 @@ fn an_applications_rebalancer_splits_what_the_writes_marked() {
     // Nothing split them: the application hasn't run its rebalancer.
     assert!(out_of_bounds(&index), "writes only marked");
     assert!(woken.load(Ordering::Relaxed) > 0, "the wakeup ran");
+    // As the doc's loop: call again while it says so.
     while rebalancer.run_once(Duration::from_millis(50)).unwrap() {}
     check(&index, &model, "after the application's rebalancer");
     assert!(!rebalancer.closed());
@@ -184,7 +185,46 @@ fn marks_a_crash_left_are_rebalanced_after_the_reopen() {
     }
     let db = open(&dir);
     let (index, mut rebalancer) = Index::open_with_rebalancer(&db, "idx").unwrap();
-    while rebalancer.run_once(Duration::from_millis(50)).unwrap() {}
+    // A zero budget is a machine too slow to finish any list in it (Windows CI on #1271):
+    // each call still does one list, and says to call again while any is left.
+    let mut calls = 0;
+    while rebalancer.run_once(Duration::ZERO).unwrap() {
+        calls += 1;
+        assert!(calls < 10_000, "run_once never finished");
+    }
     check(&index, &model, "after the reopen's rebalance");
+    db.close().unwrap();
+}
+
+/// simp724's R1 on #1271: an application that drops its handles without `close()` and
+/// reopens isn't held off by the rebalancer. Once the last `Index` handle is gone the
+/// rebalancer stops without taking the index again, so it holds no database handle.
+#[test]
+fn a_rebalancer_holds_no_database_handle_after_the_last_index_drops() {
+    let spec = VectorSpec::new(4, Element::F32, Metric::L2).unwrap();
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (index, mut rebalancer) =
+        Index::create_with_rebalancer(&db, "idx", spec, background()).unwrap();
+    for (id, v) in vectors(&spec, 100, 7) {
+        v.insert(&index, &id).unwrap();
+    }
+    assert!(out_of_bounds(&index), "lists are marked");
+    drop(index);
+    assert!(rebalancer.closed());
+    assert!(
+        !rebalancer.run_once(Duration::from_secs(1)).unwrap(),
+        "it stops"
+    );
+    // No close(): dropping the last handle releases the database, so it reopens at once.
+    drop(db);
+    let db = open(&dir);
+    let (index, mut rebalancer) = Index::open_with_rebalancer(&db, "idx").unwrap();
+    while rebalancer.run_once(Duration::ZERO).unwrap() {}
+    assert!(
+        !out_of_bounds(&index),
+        "the reopen's rebalancer did the marked work"
+    );
+    drop((index, rebalancer));
     db.close().unwrap();
 }

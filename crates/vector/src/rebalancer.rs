@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use crate::Result;
 use crate::index::{Index, Inner};
 
-type Wakeup = Box<dyn Fn() + Send + Sync>;
+type Wakeup = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Debug, Default)]
 struct State {
@@ -39,7 +39,18 @@ impl Signal {
             .unwrap_or_else(PoisonError::into_inner)
             .notified = true;
         self.cv.notify_all();
-        if let Some(f) = &*self.wakeup.lock().unwrap_or_else(PoisonError::into_inner) {
+        self.wake();
+    }
+
+    /// Calls the application's wakeup, outside the lock that holds it (cli692 on #1271): a
+    /// callback that sets another wakeup, or blocks, can't deadlock a writer.
+    fn wake(&self) {
+        let f = self
+            .wakeup
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(f) = f {
             f();
         }
     }
@@ -51,9 +62,7 @@ impl Signal {
             .unwrap_or_else(PoisonError::into_inner)
             .closed = true;
         self.cv.notify_all();
-        if let Some(f) = &*self.wakeup.lock().unwrap_or_else(PoisonError::into_inner) {
-            f();
-        }
+        self.wake();
     }
 
     fn wait(&self, timeout: Duration) {
@@ -94,6 +103,9 @@ impl Signal {
 /// again by the next [`Index::open`](crate::Index::open).
 pub struct Rebalancer {
     index: Weak<Inner>,
+    /// The application's handles (simp724's R1 on #1271): once none is left, stop between
+    /// lists, so a handle this rebalancer upgraded doesn't keep the database open long.
+    user: Weak<()>,
     signal: Arc<Signal>,
 }
 
@@ -106,30 +118,41 @@ impl std::fmt::Debug for Rebalancer {
 }
 
 impl Rebalancer {
-    pub(crate) fn new(index: &Arc<Inner>, signal: Arc<Signal>) -> Self {
+    pub(crate) fn new(index: &Index, signal: Arc<Signal>) -> Self {
         Self {
-            index: Arc::downgrade(index),
+            index: Arc::downgrade(index.inner()),
+            user: Arc::downgrade(index.user()),
             signal,
         }
     }
 
-    /// Splits and merges marked lists until none is left or `budget` has passed (a split
-    /// in progress finishes first): whether it did any. An error leaves the list marked for
-    /// a later call.
+    /// Splits and merges marked lists until none is left or `budget` has passed, always
+    /// taking at least one (a split in progress finishes first). Returns whether to call
+    /// again soon: it did some work, or marked lists are left because the budget ran out.
+    /// When it returns `false`, nothing is left until a write marks a list, so
+    /// [`wait`](Self::wait). An error leaves the list marked for a later call.
     pub fn run_once(&mut self, budget: Duration) -> Result<bool> {
+        if self.closed() {
+            return Ok(false);
+        }
         let Some(inner) = self.index.upgrade() else {
             return Ok(false);
         };
         let index = Index::from_inner(inner);
         let start = Instant::now();
         let mut did = false;
-        while start.elapsed() < budget {
+        loop {
             match index.maintain_one()? {
                 Some(worked) => did |= worked,
-                None => break,
+                None => return Ok(did),
+            }
+            if self.closed() {
+                return Ok(false);
+            }
+            if start.elapsed() >= budget {
+                return Ok(did || index.has_pending());
             }
         }
-        Ok(did)
     }
 
     /// Waits until a write marks a list, the index's last handle drops, or `timeout`
@@ -140,7 +163,7 @@ impl Rebalancer {
 
     /// Whether every [`Index`](crate::Index) handle is gone: nothing is left to do.
     pub fn closed(&self) -> bool {
-        self.index.strong_count() == 0
+        self.user.strong_count() == 0
     }
 
     /// Calls `wakeup` whenever a write marks a list (and once when the index closes), for an
@@ -151,7 +174,7 @@ impl Rebalancer {
             .signal
             .wakeup
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(wakeup);
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::from(wakeup));
     }
 }
 
