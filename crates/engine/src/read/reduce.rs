@@ -1050,8 +1050,9 @@ pub struct BytePage<I> {
     pub bytes: u64,
     /// The first column that didn't fit, when the budget cut the read.
     pub overflow: Option<Overflow>,
-    /// Whether [`ByteBudget::with_rows`]'s row limit stopped the read first (more rows
-    /// followed); then `overflow` is `None`.
+    /// Whether [`ByteBudget::with_rows`]'s row limit stopped the read first: true only when
+    /// a row followed the `n`-th, so an input of exactly `n` rows gives `false` (the read ran
+    /// out, with nothing to resume). Then `overflow` is `None`.
     pub cut_by_rows: bool,
 }
 
