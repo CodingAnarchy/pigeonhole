@@ -150,9 +150,9 @@ pub fn families() -> Vec<ModelFamily> {
         ]
     } else if env!("CARGO_CRATE_NAME") == "counters" {
         // Every aggregate kind (D179, D294, D298) beside `f` and a 0.1.0-style `counter`:
-        // eighteen families, 72 slots on a shard with tablet changes off. The tables are
-        // created after the open, so until a reopen resizes the chunks for them the 72 slots
-        // share the 64-slot geometry, about 14 chunks each (perf287 on #1233; #1212, D302).
+        // nineteen families, 76 slots on a shard with tablet changes off. The tables are
+        // created after the open, so until a reopen resizes the chunks for them the 76 slots
+        // share the 64-slot geometry, about 13 chunks each (perf287 on #1233; #1212, D302).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
@@ -172,6 +172,7 @@ pub fn families() -> Vec<ModelFamily> {
             f("fhist", 2, 0, false),
             f("fq_ttl", 0, 40, false),
             f("bloom", 2, 0, false),
+            f("set", 2, 0, false),
         ]
     } else {
         vec![
@@ -282,7 +283,7 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
         "ttl" => 60,
         // A bloom filter's base separates once it holds about 15 bits, so reads and
         // compactions fold onto separated bases (D298 §4.1, §4.2).
-        name if name.starts_with("bloom") => 64,
+        name if name.starts_with("bloom") || name.starts_with("set") => 64,
         _ => FamilyOptions::default().blob_threshold,
     };
     FamilyOptions::default()
@@ -306,6 +307,7 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Histogram) => "pigeonhole.f64_histogram",
             (true, ModelAggregation::Quantiles) => "pigeonhole.f64_quantiles",
             (true, ModelAggregation::Bloom) => "pigeonhole.bloom",
+            (true, ModelAggregation::Set) => "pigeonhole.set",
             (false, _) if f.i64_add => "pigeonhole.i64_add",
             (false, _) => "",
         })
@@ -325,6 +327,7 @@ fn family_options(f: &ModelFamily) -> FamilyOptions {
             (true, ModelAggregation::Histogram) => FamilyKind::Histogram,
             (true, ModelAggregation::Quantiles) => FamilyKind::Quantiles,
             (true, ModelAggregation::Bloom) => FamilyKind::Bloom,
+            (true, ModelAggregation::Set) => FamilyKind::Set,
         })
         // The model's fixed parameters (D298).
         .kind_params(match (f.counter, f.aggregation) {
@@ -938,7 +941,13 @@ impl Store {
                     ts: None,
                     delta,
                     ..
-                } => wb.merge(t, fam(family), row, qualifier, operand(family, *delta))?,
+                } => {
+                    let set = set_operand_of(family, *delta);
+                    let v = set
+                        .as_deref()
+                        .map_or(operand(family, *delta), ValueRef::Bytes);
+                    wb.merge(t, fam(family), row, qualifier, v)?
+                }
                 ModelOp::Incr {
                     row,
                     family,
@@ -946,7 +955,13 @@ impl Store {
                     ts: Some(ts),
                     delta,
                     ..
-                } => wb.merge_at(t, fam(family), row, qualifier, *ts, operand(family, *delta))?,
+                } => {
+                    let set = set_operand_of(family, *delta);
+                    let v = set
+                        .as_deref()
+                        .map_or(operand(family, *delta), ValueRef::Bytes);
+                    wb.merge_at(t, fam(family), row, qualifier, *ts, v)?
+                }
                 ModelOp::DeleteCell {
                     row,
                     family,
@@ -1161,6 +1176,11 @@ fn put_value(family: &str, value: &[u8], combined: Option<&Vec<i64>>) -> Vec<u8>
 /// an exact `f64` family, once it combined later inputs, their state (D298).
 fn incr_bytes(family: &str, delta: i64, combined: Option<&Vec<i64>>) -> Vec<u8> {
     let elements = || std::iter::once(delta).chain(combined.into_iter().flatten().copied());
+    // A set input is logged as its operand, combined with the cell's later inputs in commit
+    // order (D298).
+    if aggregation_of_name(family) == Some(ModelAggregation::Set) {
+        return pigeonhole_sim::set_operand(elements());
+    }
     // An HLL or bloom input is logged as its one-element state, combined or not.
     let element = matches!(
         aggregation_of_name(family),
@@ -1203,6 +1223,13 @@ fn operand(family: &str, delta: i64) -> ValueRef<'static> {
     } else {
         ValueRef::I64(delta)
     }
+}
+
+/// A set family's operand for the input `delta` (`set_add` or `set_remove`, D298); `None`
+/// in any other family.
+fn set_operand_of(family: &str, delta: i64) -> Option<Vec<u8>> {
+    (aggregation_of_name(family) == Some(ModelAggregation::Set))
+        .then(|| pigeonhole_sim::set_operand([delta]))
 }
 
 /// Polls a pending commit without a real waker.

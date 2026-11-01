@@ -3485,6 +3485,39 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Mutations:** `attach` skipping bloom fails 3 tests; no `base_blobs` fails the compaction fold test; no cap fails the cap test.
 - **Model checks:** both harnesses give `bloom` families a blob threshold of 64, so the `counters` sweeps (every aggregate kind since #1233) fold onto separated bases at reads and compactions. The commit-time separation test counts the engine's own commit-time separations (#1233), so these flush-time ones don't enter it.
 
+**What (PR 5b: roaring sets).**
+- **Kind:** `Set` (15), operator `pigeonhole.set` (`SetOps`), under bit 0. It is on `catalog::folds_separated_bases` and never in `values_stay_inline()`: a set's value separates like any `Bytes` value, and reads and compactions fold onto it there (5a's §4.1 and §4.2).
+- **State** (`pigeonhole_format::roaring`, FORMAT §3.8): the standard 32-bit RoaringFormatSpec without run containers, so CRoaring and roaring-rs read a cell's bytes as they are. It is canonical: an array container up to 4096 elements, else a bitmap; containers in key order, none empty; the empty set is the 8-byte header.
+- **Operands:** `(A, R)`, disjoint, as `A`'s length (u32 LE), `A`, then `R`. Combine (older, newer): `((A1 ∖ R2) ∪ A2, (R1 ∖ A2) ∪ R2)`; apply onto `B`: `(B ∖ R) ∪ A`. Not commutative, so every fold runs in commit order (D31): the resolver, flush and compaction combines, the in-commit combine and the compaction fold all pass the newer operand as the accumulator.
+- **Reads:** `SetRef` borrows the value: `len` from the container cardinalities, `contains` by a container search, `iter`, and `intersection_len`, `intersection` and `union_len` container by container, without decoding either set.
+- **The fold is linear** (perf287's note on the cap; owner, #488). `SetOps::merge` doesn't combine pairwise into a new set, which cost O(accumulated) per operand. It appends each older operand to a working form of the accumulator: `0xFF` (`value::TRANSIENT_TAG`), then the operands newest first, each length-prefixed. `finish` decodes the base once into a mutable set (`roaring::MutSet`), applies the operands oldest first (`acc |= A_i; acc -= R_i`), and encodes once (`apply_all`). Without a base, `combine_all` folds `A = (A − R_i) ∪ A_i`, `R = (R − A_i) ∪ R_i`.
+  - **Never stored** (perf287's four conditions):
+    1. A new provided method, `MergeOperator::settle`, a no-op for every other operator, turns a working form into its canonical `(A, R)`. It runs wherever a merged accumulator is stored without `finish`: the GC's combined push (compaction and flush) and the in-commit combine before the WAL.
+    2. `0xFF` is no value tag, and `SetOps` refuses it as an operand or base ("a missed settle"), so one that escapes fails its read.
+    3. A `debug_assert` guards every persist point: the GC push, the in-commit combine, commit-time separation, and the checkpoint value.
+    4. Tests cover each path.
+  - **The algebra** also works per container: a container on one side only is copied as bytes, two arrays merge as sorted lists, and a bitmap is built only where one side is one.
+- **Checkpoints, the stopgap** (owner, #488): a set is exempt from the 4 KiB cap up to 256 KiB (`MAX_SET_CHECKPOINT_BYTES`). Past that a set gets no checkpoints, and compaction's fold bounds its base. A cap proportional to the operand bytes a fold read (checkpoint when `steps >= sink.steps` and those bytes are at least `stored / R`) is measured next, as a D298 amendment for the owner.
+- **API** (ICR 0096): `Aggregation::Set`; `set_add` / `set_remove` (and `_at`) on the three write types; `CellRef`/`Cell::as_set`. phdb: `"set"`, the shell's `:set`, and `aggregate … +x` / `-x`.
+
+**Tests (PR 5b).**
+- **Format (`tests/roaring.rs`):** reads and the set algebra against `BTreeSet<u32>` over random sets on both sides of the array/bitmap boundary; pinned RoaringFormatSpec bytes; operands combined in any grouping that keeps commit order, then applied, against a replay of the adds and removes; malformed sets and operands. A cross-check against roaring-rs would need a dev-dependency, so the bytes are pinned by hand against the spec instead.
+- **Engine (`it/set_aggregates.rs`):** adds and removes, sometimes two to one element in a commit, through flushes, compactions and checkpoints at 128 and 1 step, against a `BTreeSet`; a 2^20-element set put whole past a WAL record goes to a blob file at commit, inputs fold onto it at read, and a compaction folds them into a new separated base, also after a reopen; operands and canonical sets only; the operator bound to its kind.
+- **Model checks:** `ModelAggregation::Set`, a state kind whose oracle (`pigeonhole_sim::set_state`) encodes and decodes apart from the format crate. An input `delta` adds or removes one of seven elements spanning two containers (`set_input`), so a cell's adds and removes of one element meet often. Both harnesses' `counters` sets gain a `set` family (19 families, 76 slots), with a 64-byte blob threshold so bases separate.
+  - **The model's fold order:** a state kind's inputs had been folded newest first, which no earlier kind could tell. The model now folds them by seqno, a stable sort keeping a commit's several inputs in the order written.
+  - **Mutation:** combining operands in the wrong order fails 7 of the 33 engine `counters` tests over 10 seeds. With the first element domain (97 elements) it survived: adds and removes of one element rarely met.
+- **Corpus:** the `aggregates` entry gains `members`, a set across two containers with adds and removes.
+- **`hotagg set`** (local; 4 hot cells; each input a new element; a get every 16th write; 100,000 writes, about 25k elements and 50 KB per set):
+
+  | | read p50 | read p99 | checkpoints kept | memtable B/write (bound) |
+  |---|--:|--:|--:|--:|
+  | pairwise fold, 4 KiB cap | 13.8 ms | 58 ms | 52 | 126 |
+  | linear fold, 4 KiB cap | 502 µs | 1.07 ms | 52 | 126 |
+  | linear fold, 256 KiB stopgap | 29 µs | 52 µs | 776 | 377 |
+
+- **Engine tests for the persist paths:** a commit's inputs combined before the WAL and replayed after a reopen; a large operand refused (operands are never separated); compaction's combined operand settled and its fold onto a base (`compaction.rs`); the stopgap (an 8 KB set keeps its checkpoint, a 400 KB one sends none).
+- **Still to come:** a box run of the hub case, the common neighbours of two 2M-element sets, against perf287's ≤ 2 ms estimate.
+
 <a id="d299"></a>
 ## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)
 **Why.** A BFS hop, a batch lookup or an HNSW neighbourhood reads many rows known up front, and today each row read sets up its read from scratch: routing, gathering the family's sources, a new iterator per SST, a fresh row buffer. In #489's baseline that setup is about half the cost of a dense frontier (row reads 2.18 µs/row against one scan's 0.97 over the same rows, AX102) and seven allocations a row.

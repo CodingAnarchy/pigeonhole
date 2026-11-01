@@ -821,6 +821,31 @@ fn compact(
     (out, entries)
 }
 
+/// [`compact`] with the family's merge operator `op` (the context's is `I64Add`).
+fn compact_op(
+    db: &Db,
+    family: &FamilyOptions,
+    inputs: &[(SstMeta, Arc<SstReader>)],
+    gc: GcPolicy,
+    op: Arc<dyn pigeonhole_compaction::MergeOperator>,
+) -> (CompactionOutput, Vec<KeyValue>) {
+    let ids = inputs.iter().map(|s| s.0.id).collect();
+    let mut ctx = db.context(family.clone(), gc);
+    ctx.merge = Some(op);
+    let mut job = CompactionJob::new(
+        task(vec![(1, ids)], 2),
+        inputs.iter().map(|s| s.1.clone()).collect(),
+        ctx,
+    );
+    run_sliced(db, &mut job);
+    let out = job.finish().unwrap();
+    let mut entries = Vec::new();
+    for (_, meta) in &out.added {
+        entries.extend(sst_entries(&open_sst(&db.pager, &db.cache, meta)));
+    }
+    (out, entries)
+}
+
 fn kinds(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<(Timestamp, Seqno, Kind)> {
     entries
         .iter()
@@ -1209,6 +1234,58 @@ fn counter_bases_fold_with_the_operands_of_their_stripe() {
     gc.other_sources = Some(vec![]);
     let (_, kept) = compact(&db, &family, &[input], gc);
     assert_eq!(kept, bad);
+}
+
+/// D298 PR 5b: a set family's operands combine through the operator's working form, and
+/// what compaction stores is settled: one canonical `(A, R)` operand without a base, one
+/// canonical set folded onto a base, never the working form.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn set_operands_combine_into_a_settled_operand_or_fold_into_a_set() {
+    use pigeonhole_format::roaring::{self, SetRef};
+    let mut db = Db::new(11);
+    let family = FamilyOptions::default()
+        .merge_operator("pigeonhole.set")
+        .kind(FamilyKind::Set);
+    let op = |adds: &[u32], removes: &[u32]| {
+        let mut v = vec![0u8];
+        roaring::encode_operand(&mut v, adds, removes);
+        v
+    };
+    // Newest first, as keys sort: add 9; remove 1; add 1 and 70000; add 5.
+    let run = vec![
+        (key(b"r", b"s", 7, 5, Kind::Merge), op(&[9], &[])),
+        (key(b"r", b"s", 7, 4, Kind::Merge), op(&[], &[1])),
+        (key(b"r", b"s", 7, 3, Kind::Merge), op(&[1, 70_000], &[])),
+        (key(b"r", b"s", 7, 2, Kind::Merge), op(&[5], &[])),
+    ];
+    let mut gc = policy(vec![], 100, false);
+    gc.other_sources = Some(vec![]);
+    let input = db.sst(&family, &run);
+    let set_ops =
+        || Arc::new(pigeonhole_compaction::SetOps) as Arc<dyn pigeonhole_compaction::MergeOperator>;
+    let (_, kept) = compact_op(&db, &family, &[input], gc.clone(), set_ops());
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].0, key(b"r", b"s", 7, 5, Kind::Merge));
+    let v = &kept[0].1;
+    assert_eq!(v[0], 0, "a stored operand, not a working form");
+    let (a, r) = roaring::parse_operand(&v[1..]).unwrap();
+    assert_eq!(a.iter().collect::<Vec<_>>(), [5, 9, 70_000]);
+    assert_eq!(r.iter().collect::<Vec<_>>(), [1]);
+    // Onto a base {1, 2}: one set, (({1, 2} ∪ {5}) ∪ {1, 70000} − {1}) ∪ {9}.
+    let mut base = vec![0u8];
+    roaring::encode_sorted(&mut base, [1, 2]);
+    let mut with_base = run.clone();
+    with_base.push((key(b"r", b"s", 7, 1, Kind::Put), base));
+    let input = db.sst(&family, &with_base);
+    let (_, kept) = compact_op(&db, &family, &[input], gc, set_ops());
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].0, key(b"r", b"s", 7, 5, Kind::Put));
+    let set = SetRef::parse(&kept[0].1[1..]).unwrap();
+    assert_eq!(set.iter().collect::<Vec<_>>(), [2, 5, 9, 70_000]);
 }
 
 /// A counter family's operands are not combined across the seqno range of another source

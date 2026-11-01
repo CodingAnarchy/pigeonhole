@@ -4942,6 +4942,21 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
                 kind_name(meta.options.kind)
             )));
         }
+    } else if meta.options.kind == FamilyKind::Set {
+        // Inputs are `(adds, removes)` operands (`set_add` / `set_remove`); a put sets a
+        // bucket to a canonical roaring set, as `phdb load` writes one back (D298).
+        let ok = bytes_value
+            && match m.kind {
+                Kind::Merge => pigeonhole_format::roaring::parse_operand(&m.value[1..]).is_ok(),
+                _ => pigeonhole_format::roaring::SetRef::parse(&m.value[1..]).is_ok(),
+            };
+        if !ok {
+            return Err(Error::InvalidArgument(format!(
+                "{} is a set family: it takes set_add / set_remove inputs and puts of a \
+                 canonical roaring set",
+                family_name(catalog, m.table, m.family)
+            )));
+        }
     } else if !i64_value {
         let hint = match meta.options.kind {
             FamilyKind::Counter => "put_i64 / incr",
@@ -4986,6 +5001,7 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::Histogram => "histogram",
         FamilyKind::Quantiles => "quantiles",
         FamilyKind::Bloom => "bloom",
+        FamilyKind::Set => "set",
         FamilyKind::Vector => "vector",
         FamilyKind::Standard => "standard",
     }
@@ -5093,9 +5109,17 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
             let combined = if w.m.kind == Kind::Put {
                 op.finish(Some(&earlier), &mut acc)
             } else {
+                // A combined operand goes to the WAL as one (D298: settled, never a set
+                // fold's working form).
                 op.merge(&mut acc, &earlier)
+                    .and_then(|()| op.settle(&mut acc))
             };
             combined.map_err(|e| Error::InvalidArgument(e.to_string()))?;
+            debug_assert_ne!(
+                acc.first(),
+                Some(&pigeonhole_format::value::TRANSIENT_TAG),
+                "a working accumulator reached a commit"
+            );
             w.value = Some(acc);
             continue;
         }
