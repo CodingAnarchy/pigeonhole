@@ -85,14 +85,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: sweep
+      # The tools only add diagnostics (gdb stacks for the hang watchdog): a stalled apt mirror
+      # held four #1259 chunks for the whole 90-minute job timeout without running a test, so the
+      # install gives up after a few minutes and the sweep runs without them.
       - name: Extra tools
         if: inputs.tools != ''
+        timeout-minutes: 5
+        continue-on-error: true
         env:
           TOOLS: ${{ inputs.tools }}
         run: |
           re='^[a-z0-9.+ -]+$'
           [[ "$TOOLS" =~ $re ]] || { echo "bad tools: $TOOLS"; exit 1; }
-          sudo apt-get update -q && sudo apt-get install -y -q $TOOLS
+          apt_opts=(-o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 -o Acquire::Retries=3)
+          sudo apt-get "${apt_opts[@]}" update -q && sudo apt-get "${apt_opts[@]}" install -y -q $TOOLS
       - name: Extra environment
         env:
           EXTRA: ${{ inputs.env }}
