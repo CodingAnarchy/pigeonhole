@@ -6,7 +6,7 @@ module in CI.
 
 import array
 import enum
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from datetime import timedelta
 from os import PathLike
 from types import TracebackType
@@ -57,9 +57,10 @@ class VectorSpec:
     @property
     def metric(self) -> Literal["l2", "cosine", "inner_product", "hamming", "unknown"]: ...
 
-Vector = list[float] | list[int] | bytes | bytearray | memoryview | array.array[Any]
-"""A vector as written: a buffer (a NumPy array, array.array) or a sequence of the family's
-element type; bits: packed, bytes-like."""
+Vector = Sequence[float] | Sequence[int] | bytes | bytearray | memoryview | array.array[Any]
+"""A vector as written. For an f32 or i8 family: a float32 (or float64) or int8 buffer, such
+as a NumPy array or array.array, or a sequence of numbers; bytes are refused. For a bit
+family: the packed bits, bytes-like."""
 
 @final
 class Family:
@@ -106,7 +107,7 @@ class Family:
             "bloom",
         ],
         *,
-        bounds: list[float] | None = None,
+        bounds: Sequence[float] | None = None,
         mantissa_bits: int | None = None,
         max_buckets: int | None = None,
         bits: int | None = None,
@@ -261,6 +262,7 @@ class RowPosition:
     @staticmethod
     def from_bytes(b: Key) -> RowPosition: ...
     def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
 
 @final
 class Pages:
@@ -304,7 +306,7 @@ class Table:
         self,
         row: Key,
         *,
-        families: list[str] | None = None,
+        families: Sequence[str] | None = None,
         qualifier_prefix: Key | None = None,
         versions: int = 1,
         column_limit: int | None = None,
@@ -316,7 +318,7 @@ class Table:
         *,
         start: Key | None = None,
         end: Key | None = None,
-        families: list[str] | None = None,
+        families: Sequence[str] | None = None,
         qualifier_prefix: Key | None = None,
         versions: int = 1,
         limit: int | None = None,
@@ -326,17 +328,17 @@ class Table:
     ) -> ScanIter: ...
     def multi_get(
         self,
-        keys: list[Key],
+        keys: Sequence[Key],
         *,
-        families: list[str] | None = None,
+        families: Sequence[str] | None = None,
         qualifier_prefix: Key | None = None,
         versions: int = 1,
         column_limit: int | None = None,
         snapshot: Snapshot | None = None,
-    ) -> list[Row]: ...
+    ) -> list[Row | None]: ...
     def traverse(
         self,
-        seeds: list[Key],
+        seeds: Sequence[Key],
         family: str,
         *,
         hops: int = 1,
@@ -353,7 +355,7 @@ class Table:
         row: Key,
         size: int,
         *,
-        families: list[str] | None = None,
+        families: Sequence[str] | None = None,
         qualifier_prefix: Key | None = None,
         versions: int = 1,
         snapshot: Snapshot | None = None,
@@ -449,7 +451,7 @@ class Transaction:
     """An optimistic transaction."""
 
     def get(self, table: Table, row: Key, family: str, qualifier: Key) -> Cell | None: ...
-    def get_row(self, table: Table, row: Key, families: list[str]) -> Row | None: ...
+    def get_row(self, table: Table, row: Key, families: Sequence[str]) -> Row | None: ...
     def put(
         self, table: Table, row: Key, family: str, qualifier: Key, value: Value, *, ts: int | None = None
     ) -> Transaction: ...

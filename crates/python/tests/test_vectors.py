@@ -54,6 +54,11 @@ def test_numpy_arrays_write_and_read_without_conversion(t):
     t.mutate(b"n").put_vector("emb", b"x", v).commit()
     back = np.frombuffer(t.get(b"n", "emb", b"x").as_vector(), dtype=np.float32)
     assert (back == v).all()
+    # NumPy's default float64 takes the buffer path too, narrowed to f32.
+    t.mutate(b"n64").put_vector("emb", b"x", np.array([0.5, 1.0, 1.5, 2.0])).commit()
+    assert t.get(b"n64", "emb", b"x").as_vector().tolist() == [0.5, 1.0, 1.5, 2.0]
+    t.mutate(b"n8").put_vector("q8", b"x", np.array([1, -1, 3], dtype=np.int8)).commit()
+    assert t.get(b"n8", "q8", b"x").as_vector().tolist() == [1, -1, 3]
 
 
 def test_wrong_vectors_are_refused(t):
@@ -63,6 +68,15 @@ def test_wrong_vectors_are_refused(t):
         t.mutate(b"a").put_vector("emb", b"x", "not a vector")
     with pytest.raises(ph.FamilyNotFound):
         t.mutate(b"a").put_vector("missing", b"x", [1.0])
+    # Bytes are a bit vector's form: an f32 or i8 family refuses them (cli692's S2 on
+    # #1276), rather than storing one element per byte.
+    import struct
+
+    for raw in [struct.pack("<4f", 1, 2, 3, 4), bytearray(4), memoryview(b"\x01\x02\x03")]:
+        with pytest.raises(TypeError, match="bit vector"):
+            t.mutate(b"a").put_vector("emb", b"x", raw)
+        with pytest.raises(TypeError, match="bit vector"):
+            t.mutate(b"a").put_vector("q8", b"x", raw)
     # The dimension is the family's: a wrong one fails the commit.
     with pytest.raises(ph.Error):
         t.mutate(b"a").put_vector("emb", b"x", [1.0, 2.0]).commit()

@@ -114,25 +114,26 @@ pub(crate) enum Vector {
     Bits(Vec<u8>),
 }
 
-/// `ob` as a vector of `element`: for `F32`, a buffer of `float32` (a NumPy `float32`
-/// array, `array.array('f')`) or a sequence of numbers; for `I8`, a buffer of `int8` or a
-/// sequence of ints; for `Bit`, the packed bits as bytes-like. The family checks the
-/// dimension at commit.
+/// `ob` as a vector of `element`:
+/// - `F32`: a `float32` buffer (a NumPy `float32` array, `array.array('f')`; the fast path),
+///   a `float64` buffer (NumPy's default dtype; narrowed to `f32`), or a sequence of numbers;
+/// - `I8`: an `int8` buffer or a sequence of ints;
+/// - `Bit`: the packed bits, bytes-like;
+/// - an element this build doesn't name (a half-precision family a newer `pigeonhole`
+///   adds): read as `F32`, which `put_vector_f32` and `nearest_f32` round to the family's
+///   element.
+///
+/// A bytes-like object is refused for `F32` and `I8` (cli692's S2 on #1276): `bytes` is a
+/// sequence of ints in Python, so it would otherwise be stored as one element per byte.
+/// The family checks the dimension at commit.
 pub(crate) fn vector(ob: &Bound<'_, PyAny>, element: Element) -> PyResult<Vector> {
     let py = ob.py();
     match element {
-        Element::F32 => {
-            if let Ok(b) = PyBuffer::<f32>::get(ob) {
-                return Ok(Vector::F32(b.to_vec(py)?));
-            }
-            Ok(Vector::F32(ob.extract::<Vec<f32>>().map_err(|_| {
-                PyTypeError::new_err("an f32 vector is a float32 buffer or a sequence of numbers")
-            })?))
-        }
         Element::I8 => {
             if let Ok(b) = PyBuffer::<i8>::get(ob) {
                 return Ok(Vector::I8(b.to_vec(py)?));
             }
+            refuse_bytes(ob, "an i8 vector is an int8 buffer or a sequence of ints")?;
             Ok(Vector::I8(ob.extract::<Vec<i8>>().map_err(|_| {
                 PyTypeError::new_err("an i8 vector is an int8 buffer or a sequence of ints")
             })?))
@@ -140,24 +141,62 @@ pub(crate) fn vector(ob: &Bound<'_, PyAny>, element: Element) -> PyResult<Vector
         Element::Bit => Ok(Vector::Bits(crate::convert::bytes(ob).map_err(|_| {
             PyTypeError::new_err("a bit vector is its packed bits, bytes-like")
         })?)),
-        _ => Err(PyTypeError::new_err(
-            "a vector element this binding doesn't know",
-        )),
+        // F32, and any element this build doesn't name.
+        _ => {
+            if let Ok(b) = PyBuffer::<f32>::get(ob) {
+                return Ok(Vector::F32(b.to_vec(py)?));
+            }
+            if let Ok(b) = PyBuffer::<f64>::get(ob) {
+                return Ok(Vector::F32(
+                    b.to_vec(py)?.into_iter().map(|x| x as f32).collect(),
+                ));
+            }
+            const WANT: &str =
+                "an f32 vector is a float32 or float64 buffer, or a sequence of numbers";
+            refuse_bytes(ob, WANT)?;
+            Ok(Vector::F32(
+                ob.extract::<Vec<f32>>()
+                    .map_err(|_| PyTypeError::new_err(WANT))?,
+            ))
+        }
     }
 }
 
-/// A vector cell as Python: `array.array('f')` or `array.array('b')` (a buffer: NumPy wraps
-/// it without a copy), or the packed bits as `bytes`.
+/// Refuses `bytes`, `bytearray` and a `memoryview` (whose typed buffer didn't match) for a
+/// numeric vector.
+fn refuse_bytes(ob: &Bound<'_, PyAny>, want: &str) -> PyResult<()> {
+    use pyo3::types::{PyByteArray, PyMemoryView};
+    if ob.is_instance_of::<PyBytes>()
+        || ob.is_instance_of::<PyByteArray>()
+        || ob.is_instance_of::<PyMemoryView>()
+    {
+        return Err(PyTypeError::new_err(format!(
+            "{want}, not {} (bytes are a bit vector's form)",
+            ob.get_type().name()?
+        )));
+    }
+    Ok(())
+}
+
+/// A vector cell as Python: `array.array('f')` (f32) or `array.array('b')` (i8), buffers
+/// NumPy wraps without a copy (`numpy.frombuffer`); the packed bits as `bytes`; and an
+/// element this build doesn't name (half precision) widened exactly to `array.array('f')`.
 pub(crate) fn to_py<'py>(
     py: Python<'py>,
     v: pigeonhole::VectorRef<'_>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let code = match v.element() {
-        Element::F32 => "f",
-        Element::I8 => "b",
-        _ => return Ok(PyBytes::new(py, v.as_bytes()).into_any()),
+    let array = py.import("array")?.getattr("array")?;
+    let arr = match v.element() {
+        Element::Bit => return Ok(PyBytes::new(py, v.as_bytes()).into_any()),
+        Element::F32 => array.call1(("f",))?,
+        Element::I8 => array.call1(("b",))?,
+        _ => {
+            return match v.to_f32_vec() {
+                Some(x) => array.call1(("f", x)),
+                None => Ok(PyBytes::new(py, v.as_bytes()).into_any()),
+            };
+        }
     };
-    let arr = py.import("array")?.getattr("array")?.call1((code,))?;
     // Little-endian payload; every platform the bindings build for is little-endian.
     arr.call_method1("frombytes", (PyBytes::new(py, v.as_bytes()),))?;
     Ok(arr)

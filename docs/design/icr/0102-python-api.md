@@ -45,12 +45,18 @@ A new workspace crate, `crates/python` (`pigeonhole-python`, `publish = false` o
   - `Element` (`F32`, `I8`, `BIT`) and `Metric` (`L2`, `COSINE`, `INNER_PRODUCT`, `HAMMING`), `enum.StrEnum`s in the package;
   - `VectorSpec(dim, element, metric)` with `dim`, `element`, `metric`;
   - `Family.vector(dim, element, metric, *, max_versions, ttl)`, and `FamilyInfo.vector`;
-  - `put_vector(family, qualifier, vector, *, ts)` on `Mutation`, and with a table and row first on `WriteBatch` and `Transaction`. The family's element type decides how a buffer (PyO3's `PyBuffer`, so NumPy arrays and `array.array`) or a sequence is read; bits are packed bytes.
+  - `put_vector(family, qualifier, vector, *, ts)` on `Mutation`, and with a table and row first on `WriteBatch` and `Transaction`. The family's element type decides how a buffer (PyO3's `PyBuffer`, so NumPy arrays and `array.array`) or a sequence is read:
+    - `f32`: a `float32` buffer, a `float64` buffer narrowed, or a sequence of numbers;
+    - `i8`: an `int8` buffer or ints;
+    - bits: packed bytes;
+    - a bytes-like is refused for `f32` and `i8` (cli692's S2);
+    - an element this build doesn't name (`f16`/`bf16`, #1263) reads as `f32`, and its cells widen to `array('f')`.
   - `Cell.as_vector()`, and `Cell.typed` for vector cells: an `array.array('f'|'b')`, or `bytes` for bits.
 - **Reads:**
-  - `Table.multi_get(keys, *, families, qualifier_prefix, versions, column_limit, snapshot) -> list[Row]` (D299). It's named `multi_get`, not `keys`, which reads like a dict method in Python.
+  - `Table.multi_get(keys, *, families, qualifier_prefix, versions, column_limit, snapshot) -> list[Row | None]` (D299). The result is aligned with `keys` (cli692's S1): one entry per key given, in that order, `None` for a miss, a repeated key repeated. The read itself is one sorted multi-get. It's named `multi_get`, not `keys`, which reads like a dict method in Python.
   - `Table.traverse(seeds, family, *, hops, per_node_limit, hop_limit, max_nodes, parents, qualifier_prefix, snapshot, parallel) -> Traversal` (D304). `Traversal` has `hops`, `seeds` (sorted: hop 1's parents index them), `rows`, `edges`, `hops_cut` and `cut_by_max_nodes`; `Hop` has `nodes` and `parents`.
-  - `Table.pages(row, size, *, families, qualifier_prefix, versions, snapshot, after) -> Pages` (D297): an iterator of `Row` pages with `position`, holding no read open between pages. `RowPosition` has `to_bytes`, `from_bytes` and `==`.
+  - `Table.pages(row, size, *, families, qualifier_prefix, versions, snapshot, after) -> Pages` (D297): an iterator of `Row` pages with `position`, holding no read open between pages. `RowPosition` has `to_bytes`, `from_bytes`, `==` and a hash.
+- **Sequences:** list-valued parameters (`keys`, `seeds`, `families`, `bounds`) take any sequence; the stubs say `Sequence[...]`.
 - **`ScanIter.close()`** and context-manager support. After `Database.close()`, a live iterator hands out the rows it already read, then raises `Closed`.
 - **Not yet:** `nearest` waits for D296 PR 4 (#1259) in `pigeonhole`.
 

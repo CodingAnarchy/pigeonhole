@@ -16,11 +16,12 @@ def g(db):
     return g
 
 
-def test_multi_get_reads_rows_in_key_order_and_skips_missing_keys(g):
-    """key_reads.rs: rows of a key set, in key order, missing keys left out."""
-    rows = g.multi_get([b"n:d", b"n:zz", b"n:a", b"n:a"], families=["out"])
-    assert [r.key for r in rows] == [b"n:a", b"n:d"]
-    assert [q for _, q, _ in rows[0]] == [b"n:b", b"n:c"]
+def test_multi_get_aligns_its_rows_with_the_keys_given(g):
+    """key_reads.rs's rows, aligned with the keys as given (cli692's S1 on #1276): one entry
+    per key, None for a miss, a repeated key repeated."""
+    rows = g.multi_get((b"n:d", b"n:zz", "n:a", b"n:a"), families=["out"])
+    assert [r.key if r else None for r in rows] == [b"n:d", None, b"n:a", b"n:a"]
+    assert [q for _, q, _ in rows[2]] == [b"n:b", b"n:c"]
     assert g.multi_get([b"n:a"], families=["props"])[0].get("props", "name").value == b"A"
     assert g.multi_get([]) == []
 
@@ -58,6 +59,7 @@ def test_pages_walk_a_wide_row_and_resume_from_a_position(db):
     qualifiers = [q for p in [first, *rest] for _, q, _ in p]
     assert qualifiers == [f"{i:03}".encode() for i in range(25)]
     assert ph.RowPosition.from_bytes(token) == walk.position
+    assert len({ph.RowPosition.from_bytes(token), walk.position}) == 1
     with db.snapshot() as s:
         t.put(b"hub", "e", b"zzz", 1)
         assert sum(len(p) for p in t.pages(b"hub", 7, snapshot=s)) == 25

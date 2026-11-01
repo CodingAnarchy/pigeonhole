@@ -28,7 +28,9 @@ impl Cell {
         self.0.timestamp()
     }
 
-    /// The value as its type: `bytes`, `int` (an `i64` cell) or `float` (an `f64` cell).
+    /// The value as its type: `bytes`, `int` (an `i64` cell), `float` (an `f64` cell), or a
+    /// vector cell's `as_vector()`. A bit vector is `bytes` too, like a byte value: the
+    /// family's `FamilyInfo.vector` tells the two apart.
     #[getter]
     fn typed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         typed(py, self.0.typed())

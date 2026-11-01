@@ -66,7 +66,7 @@ with ph.open(path, create=True) as db:
 - **`get(row, family, qualifier)`** returns the newest version of one cell, or `None`.
 - **`row(row, families=..., qualifier_prefix=..., versions=..., column_limit=...)`** returns one row's cells.
 - **`scan(prefix=...)`, or `scan(start=..., end=...)`,** returns an iterator over rows in key order. It reads `chunk` rows (default 256) per GIL release, all under one snapshot. Close a scan you stop early (`with t.scan() as it:`, or `it.close()`): a live iterator holds its snapshot, and in a reader process its slot.
-- **`multi_get(keys)`** reads the rows of many keys in key order, and leaves out keys with no row.
+- **`multi_get(keys)`** reads the rows of many keys in one read. The result is aligned with `keys`: one entry per key, in the order given, with `None` for a key with no row.
 - **`pages(row, size)`** walks a wide row a page at a time, each at most `size` cells, with a column's versions never split. Its `position` resumes the walk later, also in another process: `RowPosition.to_bytes()`, then `pages(row, size, after=RowPosition.from_bytes(token))`.
 
 Every read takes `snapshot=`: pass the same one to a chain of reads (or pages) to make them one consistent read.
@@ -119,7 +119,10 @@ with ph.open(path, create=True) as db:
 ## Vectors
 A vector family stores fixed-size vectors (D303):
 - `Family.vector(dim, Element.F32 | I8 | BIT, Metric.L2 | COSINE | INNER_PRODUCT | HAMMING)`.
-- `put_vector` takes a buffer, such as a NumPy array or an `array.array`, or a plain sequence, of the family's element type. Bits go in packed, as bytes.
+- `put_vector` takes a buffer or a plain sequence of the family's element type.
+  - For `f32`: a NumPy `float32` array or `array.array('f')` is the fast path. NumPy's default `float64` works too, narrowed to `f32`.
+  - For `i8`: an `int8` buffer.
+  - Bits go in packed, as bytes. An `f32` or `i8` family refuses `bytes`, which in Python would otherwise read as one element per byte.
 - `Cell.as_vector()` returns an `array.array` (`'f'` or `'b'`), which `numpy.frombuffer` wraps without a copy, or `bytes` for bits.
 
 Nearest-neighbour search joins the bindings once it lands in `pigeonhole` (#1259).

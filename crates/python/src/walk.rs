@@ -20,8 +20,9 @@ macro_rules! either {
     };
 }
 
-/// The rows of `keys` (D299), in key order, with the read's selection; a key whose row has
-/// no cell the selection keeps is left out.
+/// The rows of `keys` (D299), aligned with `keys`: one entry per key given, in that order,
+/// `None` for a key whose row has no cell the selection keeps; a repeated key repeats its
+/// row. The read itself is one multi-get, in key order, outside the GIL.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn multi_get(
     py: Python<'_>,
@@ -32,18 +33,17 @@ pub(crate) fn multi_get(
     versions: u32,
     column_limit: Option<u32>,
     snapshot: Option<&Bound<'_, Snapshot>>,
-) -> PyResult<Vec<Row>> {
-    let keys = KeySet::from_unsorted(
-        keys.iter()
-            .map(convert::bytes)
-            .collect::<PyResult<Vec<_>>>()?,
-    );
+) -> PyResult<Vec<Option<Row>>> {
+    let given: Vec<Vec<u8>> = keys.iter().map(convert::bytes).collect::<PyResult<_>>()?;
     let qp = qualifier_prefix.map(convert::bytes).transpose()?;
     let snap = snapshot_arg(snapshot)?;
     let h = h.clone();
     py.detach(move || {
+        let set = KeySet::from_unsorted(&given);
+        let mut found: std::collections::HashMap<Vec<u8>, pigeonhole::Row> =
+            std::collections::HashMap::new();
         either!(&h, |t| {
-            let mut r = t.keys(&keys).versions(versions);
+            let mut r = t.keys(&set).versions(versions);
             if let Some(f) = &families {
                 r = r.families(f.iter().map(String::as_str));
             }
@@ -57,15 +57,18 @@ pub(crate) fn multi_get(
                 r = r.snapshot(s);
             }
             let mut rows = r.read()?;
-            let mut out = Vec::new();
             while let Some((_, row)) = rows.next()? {
-                out.push(row.to_owned());
+                found.insert(row.key().to_vec(), row.to_owned());
             }
-            Ok(out)
-        })
+            Ok::<_, pigeonhole::Error>(())
+        })?;
+        Ok(given
+            .iter()
+            .map(|k| found.get(k).cloned())
+            .collect::<Vec<_>>())
     })
     .or_py()
-    .map(|rows| rows.into_iter().map(Row).collect())
+    .map(|rows| rows.into_iter().map(|r| r.map(Row)).collect())
 }
 
 /// One hop of a traversal: its new nodes, sorted, and with `parents=True` each node's parent
@@ -260,6 +263,13 @@ impl RowPosition {
         other
             .cast::<RowPosition>()
             .is_ok_and(|o| o.get().0.to_bytes() == self.0.to_bytes())
+    }
+
+    fn __hash__(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::hash::DefaultHasher::new();
+        self.0.to_bytes().hash(&mut h);
+        h.finish()
     }
 }
 

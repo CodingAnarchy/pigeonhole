@@ -684,8 +684,9 @@ impl Table {
         ScanIter::new(scan, chunk)
     }
 
-    /// The rows of `keys` (a multi-get, D299), in key order, with the selection `row` takes;
-    /// keys whose row has no cell the selection keeps are left out.
+    /// The rows of `keys` (a multi-get, D299), with the selection `row` takes, aligned with
+    /// `keys`: one entry per key given, in that order, `None` where the row has no cell the
+    /// selection keeps (a repeated key repeats its row).
     #[pyo3(signature = (keys, *, families=None, qualifier_prefix=None, versions=1, column_limit=None, snapshot=None))]
     #[allow(clippy::too_many_arguments)]
     fn multi_get(
@@ -697,7 +698,7 @@ impl Table {
         versions: u32,
         column_limit: Option<u32>,
         snapshot: Option<&Bound<'_, Snapshot>>,
-    ) -> PyResult<Vec<Row>> {
+    ) -> PyResult<Vec<Option<Row>>> {
         crate::walk::multi_get(
             py,
             &self.0,
