@@ -1,0 +1,40 @@
+# #1206 lever 1 (apply / memtable insert): where main's commit path spends its instructions,
+# per function (self and inclusive), on CI's x86 callgrind. Not for main; the branch is
+# deleted after.
+name: scratch ctr274 lever1 profile
+on:
+  push:
+    branches: [scratch/ctr274-lever1]
+permissions:
+  contents: read
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - run: cargo build -q --release -p pigeonhole-bench --example writepath
+      - name: profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p cg
+          B=target/release/examples/writepath
+          for shape in commit-one commit-sixteen commit-overwrite; do
+            rm -rf /tmp/w; mkdir -p /tmp/w
+            env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.tcache_count=65535 \
+              valgrind --tool=callgrind --collect-atstart=no --callgrind-out-file=cg/$shape.cg \
+              $B $shape 4 /tmp/w </dev/null >/dev/null 2>cg/$shape.err
+            callgrind_annotate --inclusive=no --threshold=99 cg/$shape.cg > cg/$shape-self.txt
+            callgrind_annotate --inclusive=yes --threshold=99 cg/$shape.cg > cg/$shape-incl.txt
+            { echo "### $shape: self cost, top 40"; echo '```';
+              grep -A45 'file:function' cg/$shape-self.txt | head -45; echo '```';
+              echo "### $shape: inclusive cost, top 60"; echo '```';
+              grep -A65 'file:function' cg/$shape-incl.txt | head -65; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cg
+          path: cg/
