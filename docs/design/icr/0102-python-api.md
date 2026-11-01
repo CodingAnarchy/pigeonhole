@@ -73,4 +73,4 @@ This is new API, so there are no callers. No Rust interface changes: the crate u
 ## Later PRs
 - **PR 2** (#1261): above, with the per-op overhead benchmark and `docs/guide/python.md`.
 - **PR 3:** `nearest` (above).
-- **PR 3:** the PyPI publish workflow, after the owner's go.
+- **PR 4:** the PyPI publish workflow, after the owner's go.

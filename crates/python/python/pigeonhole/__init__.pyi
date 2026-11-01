@@ -266,6 +266,7 @@ class Neighbour:
     def distance(self) -> float: ...
     @property
     def ts(self) -> int: ...
+    def __eq__(self, other: object, /) -> bool: ...
 
 @final
 class RowPosition:
@@ -372,7 +373,7 @@ class Table:
         prefix: Key | None = None,
         start: Key | None = None,
         end: Key | None = None,
-        keys: list[Key] | None = None,
+        keys: Sequence[Key] | None = None,
         qualifier_prefix: Key | None = None,
         snapshot: Snapshot | None = None,
         parallel: int | None = None,

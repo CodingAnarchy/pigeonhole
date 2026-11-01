@@ -411,11 +411,19 @@ impl Neighbour {
 
     fn __repr__(&self) -> String {
         format!(
-            "Neighbour(row={:?}, qualifier={:?}, distance={})",
+            "Neighbour(row={:?}, qualifier={:?}, distance={}, ts={})",
             String::from_utf8_lossy(&self.0.row),
             String::from_utf8_lossy(&self.0.qualifier),
-            self.0.distance
+            self.0.distance,
+            self.0.ts
         )
+    }
+
+    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
+        other.cast::<Neighbour>().is_ok_and(|o| {
+            let (a, b) = (&self.0, &o.get().0);
+            (&a.row, &a.qualifier, a.distance, a.ts) == (&b.row, &b.qualifier, b.distance, b.ts)
+        })
     }
 }
 

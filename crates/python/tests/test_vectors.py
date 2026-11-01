@@ -116,3 +116,9 @@ def test_nearest_equals_a_brute_force_over_a_range_or_keys(db):
         t.nearest("emb", "bad", 1)
     with pytest.raises(ValueError):
         t.nearest("emb", query, 1, prefix=b"r", keys=[b"r001"])
+    with pytest.raises(ValueError):
+        t.nearest("emb", query, 1, prefix=b"r", start=b"r001")
+    with pytest.raises(TypeError, match="bit vector"):
+        t.nearest("emb", b"\x00" * 32, 1)
+    # Neighbours compare by value.
+    assert t.nearest("emb", query, 2) == got[:2]
