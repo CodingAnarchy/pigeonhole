@@ -60,8 +60,11 @@ pub enum Element {
 
 impl Element {
     /// Whether the element is a half-precision float (`f16` or `bf16`, #1263).
+    #[inline]
     pub fn is_half(self) -> bool {
-        matches!(self, Element::F16 | Element::BF16)
+        // One compare on the code (4 and 5 are the half elements): `score` tests it per
+        // vector.
+        self as u8 >= Element::F16 as u8
     }
 
     /// From its byte.
@@ -181,7 +184,7 @@ impl Params {
             match (tag, v) {
                 (TAG_ELEMENT, [b]) => {
                     element = Some(Element::from_u8(*b).ok_or(VectorError(
-                        "the element must be 1 (f32), 2 (i8) or 3 (bit)",
+                        "the element must be 1 (f32), 2 (i8), 3 (bit), 4 (f16) or 5 (bf16)",
                     ))?);
                 }
                 (TAG_ELEMENT, _) => return Err(VectorError("the element is one byte")),
@@ -423,21 +426,20 @@ fn query_norm(metric: Metric, q: Query<'_>) -> QueryNorm {
 /// The one scoring function: [`Params::distance`] and [`Prepared::distance`] both call it.
 fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f64 {
     use crate::distance as k;
-    let p = v.payload;
-    if let Query::F32(q) = q {
-        // An `f32` query against `f32`, `f16` or `bf16` stored vectors: the same kernels,
-        // the half ones widening each stored lane (bit-identical to the `f32` kernel over
-        // the widened vector). Each arm passes its kernels as fn items, so every call stays
-        // direct and inlines (as function pointers they cost the `f32` path ~22
-        // instructions a vector: perf287 on #1285).
-        return match v.element {
-            Element::F32 => f32_query(metric, norm, q, p, k::l2_f32_le, k::dot_norm_f32_le),
-            Element::F16 => f32_query(metric, norm, q, p, k::l2_f16_le, k::dot_norm_f16_le),
-            Element::BF16 => f32_query(metric, norm, q, p, k::l2_bf16_le, k::dot_norm_bf16_le),
-            Element::I8 | Element::Bit => f64::NAN,
-        };
+    // Half-precision stored vectors (#1263) leave the hot path with one test, so the `f32`,
+    // `i8` and bit arms below compile as they did before (perf287 on #1285: the f32 row
+    // must hold its ceiling).
+    if v.element.is_half() {
+        return score_half(metric, q, norm, v);
     }
+    let p = v.payload;
     match (q, metric, norm) {
+        (Query::F32(q), Metric::L2, _) => f64::from(k::l2_f32_le(q, p)),
+        (Query::F32(q), Metric::InnerProduct, _) => -f64::from(k::dot_norm_f32_le(q, p).0),
+        (Query::F32(q), Metric::Cosine, QueryNorm::F32(nq)) => {
+            let (dot, n2) = k::dot_norm_f32_le(q, p);
+            f64::from(k::cosine_from(dot, nq, n2))
+        }
         (Query::I8(q), Metric::L2, _) => f64::from(k::l2_i8(q, p)),
         (Query::I8(q), Metric::InnerProduct, _) => -f64::from(k::dot_i8(q, p)),
         (Query::I8(q), Metric::Cosine, QueryNorm::I8(nq)) => {
@@ -450,20 +452,38 @@ fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f6
     }
 }
 
-/// An `f32` query's distance by `metric`, with the stored element's kernels (fn items,
-/// monomorphised per element, so the calls inline).
-#[inline(always)]
-fn f32_query<L, D>(metric: Metric, norm: QueryNorm, q: &[f32], p: &[u8], l2: L, dot_norm: D) -> f64
-where
-    L: Fn(&[f32], &[u8]) -> f32,
-    D: Fn(&[f32], &[u8]) -> (f32, f32),
-{
+/// [`score`] for an `f16` or `bf16` stored vector: an `f32` query through the widening
+/// kernels, which equal the `f32` kernels over the widened vector bit for bit. Out of line,
+/// so it costs the other elements' path nothing.
+#[cold]
+#[inline(never)]
+fn score_half(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f64 {
+    use crate::distance as k;
+    let (Query::F32(q), p) = (q, v.payload) else {
+        return f64::NAN;
+    };
+    let f16 = v.element == Element::F16;
     match (metric, norm) {
-        (Metric::L2, _) => f64::from(l2(q, p)),
-        (Metric::InnerProduct, _) => -f64::from(dot_norm(q, p).0),
+        (Metric::L2, _) => f64::from(if f16 {
+            k::l2_f16_le(q, p)
+        } else {
+            k::l2_bf16_le(q, p)
+        }),
+        (Metric::InnerProduct, _) => {
+            let (dot, _) = if f16 {
+                k::dot_norm_f16_le(q, p)
+            } else {
+                k::dot_norm_bf16_le(q, p)
+            };
+            -f64::from(dot)
+        }
         (Metric::Cosine, QueryNorm::F32(nq)) => {
-            let (dot, n2) = dot_norm(q, p);
-            f64::from(crate::distance::cosine_from(dot, nq, n2))
+            let (dot, n2) = if f16 {
+                k::dot_norm_f16_le(q, p)
+            } else {
+                k::dot_norm_bf16_le(q, p)
+            };
+            f64::from(k::cosine_from(dot, nq, n2))
         }
         _ => f64::NAN,
     }
@@ -556,7 +576,13 @@ impl<'a> VectorRef<'a> {
                 "a vector's dimension must be 1 to 4096, a multiple of 8 for bit",
             ));
         }
-        if payload.len() != element.payload_len(dim) {
+        // `f32` first: the common element skips the match, once per scored vector.
+        let want = if element == Element::F32 {
+            4 * dim as usize
+        } else {
+            element.payload_len(dim)
+        };
+        if payload.len() != want {
             return Err(VectorError(
                 "a vector's payload must match its element and dimension",
             ));
@@ -616,6 +642,9 @@ impl<'a> VectorRef<'a> {
     /// Decodes the bytes after the value tag; anything malformed is `Corrupt`. An unknown
     /// element is too, as in `kind_params`: a new element would come under a new `incompat`
     /// bit, so a reader that meets one has a damaged file.
+    // Inlined into `decode_value`, once per scored vector: #1263's larger element matches
+    // pushed it out of line, at about 7 instructions a vector (#1285's callgrind).
+    #[inline]
     pub(crate) fn decode(bytes: &'a [u8]) -> crate::Result<Self> {
         let Some((&e, rest)) = bytes.split_first() else {
             return Err(Error::Truncated { what: "vector" });
