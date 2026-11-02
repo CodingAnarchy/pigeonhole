@@ -3402,6 +3402,11 @@ fn spill_recovered(
 /// Registers a stream's feed marks with the change feed (D310), when it is on.
 fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
     if let (Some(feed), Some(marks)) = (&shared.feed, wal.feed_marks()) {
+        // The start of the stream's first segment of this open: every record before it has
+        // a key below the allocator's start (the reader's start bound, D310 PR 3). For a new
+        // stream that is the start of its only segment, so nothing counts as dropped.
+        let key = shared.shm.next_seqno().saturating_sub(1);
+        feed.note_checkpoint(stream, Lsn::new(marks.head(), 0), key);
         feed.set_marks(stream, marks);
     }
 }

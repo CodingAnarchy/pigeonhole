@@ -260,6 +260,18 @@ pub(crate) struct Feed {
     /// Bytes of the held files (`DatabaseInfo`).
     held_bytes: AtomicU64,
     sidecar: Mutex<Option<Sidecar>>,
+    /// Each stream's checkpoint history, for the feed reader's start positions
+    /// ([`Feed::start_at`]).
+    checkpoints: Vec<Mutex<CheckpointHistory>>,
+}
+
+/// One stream's recent checkpoints, each with the largest key (the seqno a feed reader
+/// orders a record by) of any record before it (D310 PR 3). Keys only grow along the list.
+/// Written by the stream's shard as its checkpoints commit, and pruned in its maintenance
+/// once the stream's floor passes them; read by feed readers choosing where to start.
+#[derive(Debug, Default)]
+struct CheckpointHistory {
+    entries: std::collections::VecDeque<(pigeonhole_format::Lsn, pigeonhole_format::Seqno)>,
 }
 
 impl Feed {
@@ -282,7 +294,118 @@ impl Feed {
             held: Mutex::default(),
             held_bytes: AtomicU64::new(0),
             sidecar: Mutex::new(None),
+            checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
         }
+    }
+
+    /// Stream `stream`'s checkpoint moved to `at`, past records of keys at most `key`
+    /// (`ShardState::ckpt_key`). Called before the stream's own checkpoint mark is stored,
+    /// so a reader that loaded the mark finds an entry at least that new. At most two
+    /// entries per segment: the first, and the latest.
+    pub(crate) fn note_checkpoint(
+        &self,
+        stream: usize,
+        at: pigeonhole_format::Lsn,
+        key: pigeonhole_format::Seqno,
+    ) {
+        let Some(h) = self.checkpoints.get(stream) else {
+            return;
+        };
+        let mut h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        let e = &mut h.entries;
+        let key = e.back().map_or(key, |&(_, k)| k.max(key));
+        match e.back() {
+            Some(&(last, _)) if last >= at => return,
+            _ => {}
+        }
+        let n = e.len();
+        if n >= 2 && e[n - 1].0.epoch() == at.epoch() && e[n - 2].0.epoch() == at.epoch() {
+            e[n - 1] = (at, key);
+        } else {
+            e.push_back((at, key));
+        }
+    }
+
+    /// Drops stream `stream`'s checkpoint entries below `floor` (its oldest segment kept),
+    /// keeping the first at or past the floor's start: its key bounds every record before
+    /// it, the lost ones included.
+    pub(crate) fn prune_checkpoints(&self, stream: usize, floor: u32) {
+        let Some(h) = self.checkpoints.get(stream) else {
+            return;
+        };
+        let start = pigeonhole_format::Lsn::new(floor, 0);
+        let mut h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        while h.entries.len() >= 2 && h.entries[1].0 <= start {
+            h.entries.pop_front();
+        }
+    }
+
+    /// Where a feed reader of stream `stream` starts to see every record with a key above
+    /// `bound`: the latest checkpoint whose records before it all have keys at most `bound`.
+    /// `None` when records the stream has already dropped (below `floor`) may have keys
+    /// above `bound`: that history is gone.
+    pub(crate) fn start_at(
+        &self,
+        stream: usize,
+        bound: pigeonhole_format::Seqno,
+        floor: u32,
+    ) -> Option<pigeonhole_format::Lsn> {
+        let h = self.checkpoints.get(stream)?;
+        let h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        let start = pigeonhole_format::Lsn::new(floor, 0);
+        // The first entry at or past the floor's start bounds what was dropped.
+        let lost = h
+            .entries
+            .iter()
+            .find(|&&(at, _)| at >= start)
+            .or(h.entries.back())
+            .map_or(0, |&(_, k)| k);
+        if lost > bound {
+            return None;
+        }
+        h.entries
+            .iter()
+            .rev()
+            .find(|&&(at, k)| k <= bound && at >= start)
+            .map(|&(at, _)| at)
+            .or(Some(start))
+    }
+
+    /// The smallest start bound stream `stream`'s retained history serves (above `floor`):
+    /// the key bounding what it already dropped. [`FeedStart::Oldest`](crate::FeedStart)
+    /// starts at the largest of these over the streams.
+    pub(crate) fn oldest_bound(&self, stream: usize, floor: u32) -> pigeonhole_format::Seqno {
+        let Some(h) = self.checkpoints.get(stream) else {
+            return 0;
+        };
+        let h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        let start = pigeonhole_format::Lsn::new(floor, 0);
+        h.entries
+            .iter()
+            .find(|&&(at, _)| at >= start)
+            .or(h.entries.back())
+            .map_or(0, |&(_, k)| k)
+    }
+
+    /// The largest key any stream's checkpoint has passed (a start bound every stream can
+    /// serve from its checkpoint).
+    pub(crate) fn checkpoint_key(&self) -> pigeonhole_format::Seqno {
+        self.checkpoints
+            .iter()
+            .filter_map(|h| {
+                h.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entries
+                    .back()
+                    .map(|&(_, k)| k)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Stream `stream`'s marks, if its stream is open.
+    pub(crate) fn marks(&self, stream: usize) -> Option<&Arc<FeedMarks>> {
+        self.marks.get(stream).and_then(OnceLock::get)
     }
 
     /// Whether the feed needs a record (D310): a batch or PREPARE that writes a fed table,

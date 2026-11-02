@@ -42,6 +42,7 @@ mod durable_freeze;
 mod durable_snapshot;
 mod early_decide;
 mod exact_aggregates;
+mod feed_reader;
 mod feed_retention;
 mod feed_written;
 mod fifo_expiry;
