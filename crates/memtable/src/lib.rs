@@ -794,6 +794,9 @@ impl Memtable {
                     cur = next;
                 }
                 prev[level] = cur;
+                // The next insert's predecessor at this level, unless this node takes it
+                // (below).
+                self.splice[level] = cur;
             }
         }
 
@@ -832,18 +835,12 @@ impl Memtable {
             mem.store_u32(tower(p, level), node, Ordering::Release);
         }
 
-        // The next insert's predecessors: this node below its height, `prev` above it. After
-        // an insert right after the last one `prev` is the splice already, so only the
-        // node's own levels change (every level was rewritten per insert, about 30
-        // instructions, #1206). After a search, one write per level as before: a copy of
-        // the levels above the node (a `memcpy` call) cost commit-at 34 more (perf287).
-        if after_last {
-            self.splice[..height].fill(node);
-        } else {
-            for (level, p) in prev.iter().enumerate() {
-                self.splice[level] = if level < height { node } else { *p };
-            }
-        }
+        // The next insert's predecessors: this node below its height, `prev` above it. The
+        // splice already holds `prev` (an insert right after the last one leaves it as it
+        // was; a search writes it as it goes), so only the node's own levels change. Every
+        // level was rewritten per insert before (about 30 instructions, #1206); a flag to
+        // choose between the two kept a register live across the insert (perf287 on #1315).
+        self.splice[..height].fill(node);
         self.bump += node_len;
         self.used += node_len as u64;
         self.count += 1;
