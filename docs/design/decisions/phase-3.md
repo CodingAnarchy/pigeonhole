@@ -3921,6 +3921,7 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **The walk:** a `df`-only scan of the `P` rows from the fixed prefix. At a key the automaton rejects partway, it seeks to the smallest byte string above the key that the automaton hasn't rejected. A term whose `df` is 0 isn't an expansion.
 - **Expansions:** at most `max_expansions` (50), ordered by distance, then df descending, then bytewise.
   - Each scores as a term times `1 − d / min(len)`, and a document takes its best expansion.
+  - **Rev 5 §4.4 amended (coordinator, 2026-11-02, a Lucene-parity correction, from simp724's review of #1327):** every kept expansion scores with the idf of the largest df among the kept expansions. This is Lucene's blended `TopTermsBlendedFreqScoringRewrite`. Rev 5 had each expansion's own idf, which let a rare misspelling outrank the common word, about 2× for df 1 against 1,000.
   - An addition to rev 5 (coordinator, 2026-11-02): a match with `d ≥ min(len)` isn't an expansion, since its boost would be 0 or below.
 - **MaxScore:** the fuzzy clause merges its expansions' walks, taking the maximum. Its bound is the largest expansion's bound.
 - **API** (ICR 0105 PR 4):

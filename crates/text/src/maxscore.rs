@@ -175,7 +175,8 @@ impl<'t> Scored<'t> {
         })
     }
 
-    /// A fuzzy clause over its expansions: `(term, df, boost)` each.
+    /// A fuzzy clause over its expansions: `(term, df, boost)` each, the df the one its idf
+    /// scores with (the search passes the expansions' blended df).
     pub(crate) fn fuzzy(
         t: &'t Rows,
         s: &Snapshot,

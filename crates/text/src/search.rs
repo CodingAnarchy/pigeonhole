@@ -232,9 +232,13 @@ impl<'a> Search<'a> {
             }
             for exps in &expanded {
                 if !exps.is_empty() {
+                    // Lucene's blended statistics (TopTermsBlendedFreqScoringRewrite): every
+                    // kept expansion scores with the largest df among them, so a rare
+                    // misspelling's high idf can't outrank the common word it misspells.
+                    let df = exps.iter().map(|e| e.df).max().expect("not empty");
                     let e: Vec<(&str, i64, f64)> = exps
                         .iter()
-                        .map(|e| (e.term.as_str(), e.df, e.boost))
+                        .map(|e| (e.term.as_str(), df, e.boost))
                         .collect();
                     clauses.push(Scored::fuzzy(t, s, &bm, &e, prefix)?);
                 }

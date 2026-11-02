@@ -99,7 +99,11 @@ Rev 5 §4.4 as decided. The dependency is `levenshtein_automata` 0.2.1 (MIT, no 
   - The UTF-8 automaton rejects a character only at its last byte, so a seek can land on a multi-byte lead byte. That's still a valid lower bound.
   - A term whose `df` is 0 (every document deleted) is not an expansion.
 - **One addition to rev 5:** a match whose distance is at least the shorter term's length in characters isn't an expansion. Its boost `1 − d / min(len)` would be 0 or negative: `a~1` would otherwise match every one-letter term, at a boost of 0.
-- **MaxScore's fuzzy clause** merges its expansions' posting walks. A document's contribution is the largest of theirs, and a lookup is the largest of their lookups. The bound is the largest expansion's `boost · idf · tf_factor(maxtf, minlen)`. A term clause is the one-walk case with boost 1, so its scores are unchanged.
+- **Blended statistics** (Lucene's `TopTermsBlendedFreqScoringRewrite`, simp724 on #1327; coordinator, 2026-11-02, as a Lucene-parity correction to rev 5 §4.4):
+  - every kept expansion's idf is `idf(max df over the kept expansions)`, after the `max_expansions` cut;
+  - the boost and the per-document maximum stay.
+  - With rev 5's per-expansion idf, a typo in 1 document outranked the exact term in 1,000 by about 2×. A test pins that case.
+- **MaxScore's fuzzy clause** merges its expansions' posting walks. A document's contribution is the largest of theirs, and a lookup is the largest of their lookups. The bound is the largest expansion's `boost · idf · tf_factor(maxtf, minlen)`, with the blended idf. A term clause is the one-walk case with boost 1, so its scores are unchanged.
 - **Tests:**
   - against a brute-force optimal-string-alignment scan of every term (transpositions, Greek and accented words, `prefix_length`, the `max_expansions` cut and its order, deleted terms), at full depth and at k = 1 and 3;
   - the syntax's tokenising;

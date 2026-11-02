@@ -82,7 +82,8 @@ assert_eq!(fuzzy[0].id, b"a");
   - **Scoring:** each match adds `1 / (distance + 1)` to the phrase's frequency, so closer matches score higher, and an exact match scores as it does without slop.
 - **Fuzzy terms** match the index's terms within 1 or 2 edits, counting an adjacent transposition as one. `Auto` allows 0 edits up to 2 characters, 1 up to 5, and 2 beyond.
   - **Syntax and builder:** `word~` in a query string is tokenised as documents are, so `Postgress~` works. `.fuzzy(term, ..)` takes the term as given, like `.term`.
-  - **Scoring:** each matching term scores as a term, times `1 − edits / length` (the shorter term's length), and a document scores its best match, not their sum. So three misspellings don't outrank the real word.
+  - **Scoring:** each matching term scores as a term, times `1 − edits / length` (the shorter term's length), and a document scores its best match, not their sum.
+    - **Every match uses the idf of the most frequent one** (Lucene's blended statistics). A rare misspelling can't outrank the common word it misspells, and three misspellings in one document don't outrank the real word.
   - **Expansions:** at most 50 terms per fuzzy term, the closest first, then the most frequent. `.max_expansions(n)` changes that. `.prefix_length(n)` requires the first `n` characters to match exactly, which makes a fuzzy search on a large dictionary much cheaper. `SearchStats::fuzzy` says how many terms each one matched, and whether the limit cut it.
   - Composed and decomposed accents differ by edits, so keep the default `Nfc` normalisation if you search with fuzzy terms.
 - **A namespace:** `.id_prefix(p)` restricts a search to ids starting with `p`. Include the namespace's terminator (`agent:alice\0`), or `agent:alice2` matches too. Scores keep the whole index's statistics.

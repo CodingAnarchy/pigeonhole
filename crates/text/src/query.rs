@@ -156,8 +156,10 @@ impl Query {
     ///   [`prefix_length`](crate::Search::prefix_length) makes the first characters match
     ///   exactly, which narrows the walk on a large dictionary.
     /// - **Scoring:** each expansion scores as a term, times `1 − d / min(len(q), len(t))`
-    ///   (Lucene's boost, `d` its distance, lengths in characters). A document's score for
-    ///   the clause is its best expansion's, not their sum.
+    ///   (Lucene's boost, `d` its distance, lengths in characters), with Lucene's blended
+    ///   statistics: every expansion's idf is that of the most frequent one, so a rare
+    ///   misspelling never outranks the word it misspells. A document's score for the
+    ///   clause is its best expansion's, not their sum.
     /// - **Composed and decomposed characters** are edits apart: the index's normalisation
     ///   (NFC by default) makes them one form.
     pub fn fuzzy(self, term: impl Into<String>, fuzziness: Fuzziness) -> Self {

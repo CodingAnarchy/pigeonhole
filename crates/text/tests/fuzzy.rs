@@ -171,11 +171,13 @@ impl<'a> Model<'a> {
         (out, cut)
     }
 
-    /// One fuzzy clause's scores: each document's best expansion.
+    /// One fuzzy clause's scores: each document's best expansion, every expansion's idf from
+    /// the largest df among the kept ones (Lucene's blend).
     fn fuzzy(&self, exps: &[(String, usize, usize, f64)]) -> BTreeMap<Vec<u8>, f64> {
         let mut out: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
-        for (t, _, df, boost) in exps {
-            let w = boost * self.idf(*df);
+        let blended = exps.iter().map(|e| e.2).max().unwrap_or(0);
+        for (t, _, _, boost) in exps {
+            let w = boost * self.idf(blended);
             for (d, words) in &self.docs {
                 let tf = words.iter().filter(|x| *x == t).count();
                 if tf > 0 {
@@ -315,6 +317,29 @@ fn a_document_with_three_misspellings_does_not_outrank_one_with_the_term() {
     let ids: Vec<&[u8]> = hits.iter().map(|h| h.id.as_slice()).collect();
     assert_eq!(ids, [&b"exact"[..], b"typos"]);
     assert!(hits[0].score > hits[1].score);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_rare_typo_does_not_outrank_the_common_exact_term() {
+    // simp724's case on #1327: the exact term in 1,000 documents, a typo of it in one.
+    // Scored with its own idf, the typo's document would rank about twice as high.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    for i in 0..1000 {
+        index
+            .put(format!("e{i:04}").as_bytes(), "postgres")
+            .unwrap();
+    }
+    index.put(b"typo", "postgers").unwrap();
+    let hits = index
+        .search(Query::new().fuzzy("postgres", Fuzziness::Auto), 2000)
+        .run()
+        .unwrap();
+    assert_eq!(hits.len(), 1001);
+    assert_eq!(hits.last().unwrap().id, b"typo");
+    assert!(hits[0].score > hits[1000].score);
     db.close().unwrap();
 }
 
