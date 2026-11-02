@@ -224,10 +224,19 @@
 # 2504 and knn-exact-bf16 1687. Their per-cell figures include reading half the bytes of
 # knn-exact's vectors, not only the widening kernels (perf287 on #1304): bf16 widens with a
 # shift and lands below knn-exact; f16's branch-free widening costs more than the read saves.
+#
+# Lowered for #1307 (#1273, fixed hash seeds; D195 ceilings commit): get-mem 5710 -> 5699,
+# headroom 0.1% (perf287, 2026-11-02). With the seeds fixed, #1246's seed-dependent mode (up
+# to 5709) can't recur, so the one-off 5710 no longer has anything to cover. The head reads
+# 5693 (run 41412958065, cc150c49), +1 on its base's 5692, so FIXED_SEED gives the measured
+# key no long probe (the band moved from 5688-5689 with main's code since #1246, not with the
+# seed). 5693 x 1.001 = 5698.7. The seed was not tuned. Shapes that still vary between runs
+# of one commit (get-sst, the multi-gets, ycsb-a, commit-at, short-scans) keep their ceilings
+# until #1305 finds the cause (scratch run 41384928480).
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
-get-mem 5710 0.3
+get-mem 5699 0.1
 get-sst 17360 0.5
 get-miss 4190 0.3
 row 2475 1.0

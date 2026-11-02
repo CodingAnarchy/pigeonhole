@@ -17,16 +17,22 @@ name = "phdb-bench"
 path = "src/main.rs"
 
 [features]
-default = []
+default = ["fixed-seed"]
 # Comparison runners. Off by default: they pull C/C++ builds (RocksDB, SQLite) into the
 # build.
 rocksdb = ["dep:rocksdb"]
 sqlite = ["dep:rusqlite"]
+# Fixed hash seeds in the measured examples (#1273, `support/measure.rs`). On by default, so
+# instructions.yml (which passes no features) gets it; a base from before #1273, built with
+# the head's example sources, has no such feature and keeps random seeds.
+fixed-seed = []
 
 [dependencies]
 # Default features (async included): the instruction counts measure what users get.
 # The bench reads pigeonhole's test and bench hooks (ICR 0085).
 pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
+# The fixed hash seeds of the measured examples (#1273): only adds the setter, no measured code.
+pigeonhole-format = { workspace = true, features = ["__unstable-fixed-seed"] }
 # D306 PR 3: the IVF index on SIFT1M (`examples/ivfsift.rs`).
 pigeonhole-vector = { workspace = true }
 # The default shard count (D220), for the D213 and scaling runs and the report.
