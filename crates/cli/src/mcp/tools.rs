@@ -71,8 +71,8 @@ const MAX_K: u64 = 1_000;
 /// The most commits one `feed_poll` returns, and the longest it waits (milliseconds).
 const MAX_COMMITS: u64 = 1_000;
 const MAX_WAIT_MS: u64 = 30_000;
-/// The largest traversal result the server keeps for its cursors (#1254), in node-key bytes:
-/// past it, a cursor runs the traversal again, as before.
+/// The largest traversal result the server keeps for its cursors (#1254), about: counted in
+/// node-key bytes, plus 4 a node for parents. Past it, a cursor runs the traversal again.
 const MAX_CACHED_TRAVERSAL_BYTES: usize = 64 << 20;
 
 type Outcome = Result<Map<String, Value>, Failure>;
@@ -82,9 +82,11 @@ pub(super) struct Tools {
     writable: bool,
     limits: Limits,
     /// The last cut traversal (#1254): its cursors page from it, in O(page), all from one
-    /// consistent result. One at a time; another traversal replaces it.
+    /// consistent result. One at a time: the next traversal that returns a cursor replaces
+    /// it (one that fits a single result leaves it alone).
     traversal: Mutex<Option<CachedTraversal>>,
-    /// The id the next traversal run gets: its cursors carry it.
+    /// The id the next traversal run gets: its cursors carry it. Seeded from the clock, so a
+    /// cursor kept across a server restart misses the new server's runs (ai1249 on #1365).
     runs: AtomicU64,
 }
 
@@ -103,7 +105,11 @@ impl Tools {
             writable,
             limits,
             traversal: Mutex::new(None),
-            runs: AtomicU64::new(1),
+            runs: AtomicU64::new(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(1, |d| d.as_nanos() as u64),
+            ),
         }
     }
 
@@ -491,8 +497,9 @@ impl Tools {
                 .hops()
                 .iter()
                 .map(|h| {
+                    let parents = if h.parents().is_some() { 4 } else { 0 };
                     (0..h.nodes().len())
-                        .map(|i| h.nodes().get(i).len())
+                        .map(|i| h.nodes().get(i).len() + parents)
                         .sum::<usize>()
                 })
                 .sum();
