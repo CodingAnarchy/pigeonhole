@@ -334,7 +334,8 @@ fn shape_knn_budget(v: &Table, query: &[f32]) -> usize {
         .nearest_f32(query, 10)
         .run_within(KNN_BUDGET)
         .unwrap();
-    debug_assert_eq!(page.neighbours().len(), 5);
+    // Release builds check it too: a key or overhead change would alter what this counts.
+    assert_eq!(page.neighbours().len(), 5);
     std::hint::black_box(&page);
     // Every vector is scored, as in `knn-exact`: one unit each.
     KNN_ROWS as usize * 2

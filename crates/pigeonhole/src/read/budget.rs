@@ -274,7 +274,7 @@ impl NearestPage {
     }
 
     /// With [`cut_by_budget`](Self::cut_by_budget), the size of the first neighbour left
-    /// out: a budget of [`bytes`](Self::bytes)` + next_bytes()` includes it.
+    /// out: a budget of `bytes() + next_bytes()` includes it.
     pub fn next_bytes(&self) -> Option<u64> {
         self.next_bytes
     }
