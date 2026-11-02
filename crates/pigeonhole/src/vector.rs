@@ -224,6 +224,10 @@ impl<'a> VectorRef<'a> {
     /// The components as `f32`s: exact for `f32`, `i8`, `f16` and `bf16` vectors (a half
     /// widens exactly), `None` for bit vectors.
     pub fn to_f32_vec(&self) -> Option<Vec<f32>> {
+        // A bit vector before allocating (perf287 on #1312).
+        if self.inner.element() == fmt::Element::Bit {
+            return None;
+        }
         let mut out = Vec::with_capacity(self.dim() as usize);
         self.widen_into(&mut out).then_some(out)
     }

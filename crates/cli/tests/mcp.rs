@@ -728,3 +728,134 @@ fn vector_families_read_and_write_in_dump_shapes() {
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
 }
+
+/// `nearest` (#1253): listed once the database has a vector family; the k nearest, in
+/// order, under the read's selection; queries checked against the family; bit queries as
+/// 0s and 1s or packed base64; a result past the size cap cut at a neighbour.
+#[test]
+fn nearest_ranks_vectors_under_the_selection() {
+    use pigeonhole::{Element, Family, Metric, VectorSpec};
+    let dir = TempDir::new("mcp-nearest");
+    let path = db_path(&dir);
+    let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
+    let t = db
+        .table("docs")
+        .unwrap()
+        .family(
+            "emb",
+            Family::vector(VectorSpec::new(2, Element::F32, Metric::L2).unwrap()),
+        )
+        .family(
+            "sig",
+            Family::vector(VectorSpec::new(16, Element::Bit, Metric::Hamming).unwrap()),
+        )
+        .family("note", Family::default())
+        .create()
+        .unwrap();
+    for (row, v, bits) in [
+        (b"a", [0.0, 0.0], [0b0000_0000u8, 0b00]),
+        (b"b", [1.0, 0.0], [0b0000_0011, 0b10]),
+        (b"c", [5.0, 5.0], [0b1111_1111, 0b11]),
+    ] {
+        t.mutate(row)
+            .put_vector_f32("emb", b"v", &v)
+            .put_vector_bits("sig", b"s", &bits)
+            .commit()
+            .unwrap();
+    }
+    drop(t);
+    db.close().unwrap();
+
+    let mut s = Server::start(&path, &[]);
+    let names = s.tool_names();
+    assert_eq!(
+        names[..5],
+        ["list_tables", "read_row", "scan", "traverse", "nearest"]
+    );
+    let rows = |r: &Value| -> Vec<String> {
+        r["neighbours"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["row"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let near = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.9, 0.0], "k": 2}),
+    );
+    assert_eq!(rows(&near), ["b", "a"], "{near}");
+    assert_eq!(
+        near["vector"],
+        json!({"dim": 2, "element": "f32", "metric": "l2"})
+    );
+    let n = &near["neighbours"];
+    assert_eq!(n[0]["qualifier"], "v");
+    assert!(n[0]["ts"].as_u64().unwrap() > 0);
+    assert!(n[0]["distance"].as_f64().unwrap() < n[1]["distance"].as_f64().unwrap());
+    assert!(near.get("truncated").is_none());
+    // The selection: a prefix, one row; write's vector shape as the query.
+    let c = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.0, 0.0], "prefix": "c"}),
+    );
+    assert_eq!(rows(&c), ["c"], "{c}");
+    let a = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "row": "a", "qualifier": "v",
+               "query": {"vector": {"dim": 2, "element": "f32", "values": [5.0, 5.0]}}}),
+    );
+    assert_eq!(rows(&a), ["a"], "{a}");
+    // Bits: 0s and 1s, least significant first, or the packed bytes.
+    let bits = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "sig", "k": 3,
+               "query": [1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]}),
+    );
+    assert_eq!(rows(&bits), ["b", "a", "c"], "{bits}");
+    let packed = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "sig", "k": 3, "query": {"base64": "AwI="}}),
+    );
+    assert_eq!(packed["neighbours"], bits["neighbours"]);
+    // Refusals name what the family takes.
+    for (args, want) in [
+        (json!({"query": [1.0]}), "f32[2]"),
+        (json!({"query": [1.0, "x"]}), "finite f32"),
+        (
+            json!({"family": "note", "query": [1.0, 0.0]}),
+            "not a vector family",
+        ),
+        (
+            json!({"family": "sig", "query": [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}),
+            "0 or 1",
+        ),
+        (
+            json!({"query": [1.0, 0.0], "row": "a", "prefix": "a"}),
+            "not two of them",
+        ),
+        (json!({"query": [1.0, 0.0], "k": 0}), "k:"),
+    ] {
+        let mut call = json!({"table": "docs", "family": "emb"});
+        for (k, v) in args.as_object().unwrap() {
+            call[k] = v.clone();
+        }
+        let err = s.fail("nearest", call);
+        assert!(err.to_string().contains(want), "{want}: {err}");
+    }
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // Past the size cap: the nearest that fit, marked truncated (a ranking can't resume).
+    let mut s = Server::start(&path, &["--max-result-bytes", "200"]);
+    let cut = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.9, 0.0], "k": 3}),
+    );
+    assert_eq!(cut["truncated"], true, "{cut}");
+    let kept = rows(&cut);
+    assert!(!kept.is_empty() && kept.len() < 3, "{cut}");
+    assert_eq!(kept[0], "b");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
