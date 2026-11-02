@@ -142,7 +142,7 @@ A reader process opens the index with `Index::open_reader(&reader, name)`. That 
 ## Performance
 MaxScore reads only the postings that can still change the top `k`. The result is the same as scoring every document.
 
-The numbers below are for 1,000,000 documents of about 40 words, from a 50,000-word Zipf vocabulary, on the reference AX102 (`crates/text/examples/bench.rs`). They are p50 and p99 over 1,000 queries per kind, top 10 unless noted, after a flush and a full compaction. They're the means of two runs, which agreed within 4%. The build had #1332's compaction fix, and not #1350, which changes how a full compaction sizes its pieces.
+The numbers below are for 1,000,000 documents of about 40 words, from a 50,000-word Zipf vocabulary, on the reference AX102 (`crates/text/examples/bench.rs`). They are p50 and p99 over 1,000 queries per kind, top 10 unless noted, after a flush and a full compaction. They're the means of two runs, which agreed within 4%.
 
 **Writing** goes one document per transaction, `Buffered`:
 
@@ -173,7 +173,7 @@ The write rate stays flat from the first document to the millionth. A full compa
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.
 - **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Compaction doesn't change that, since it's the positions' size. Positional skipping is tracked in #1334.
 - **Fuzzy terms** cost a walk over the dictionary near the term, then the matching terms' postings. Once the top `k` are held, an expansion that can't lift a document into them stops being read (#1333). On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk.
-- **A fuzzy term beside a common term** has a long tail. When the common term drives, each of its documents looks the fuzzy term's expansions up. #1355 makes those lookups advance along the postings once that's cheaper, and #1363 tracks the opposite case: a fuzzy term over common expansions, beside a rare term.
+- **A fuzzy term beside a common term** has a long tail. When the common term drives, each of its documents looks the fuzzy term's expansions up. #1368 makes those lookups advance along the postings once that's cheaper, and #1363 tracks the opposite case: a fuzzy term over common expansions, beside a rare term.
 - **Positions are cheap to write:** 13% more time per document on the reference machine, much less than a laptop suggests.
 
 ## Errors

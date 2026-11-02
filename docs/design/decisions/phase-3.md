@@ -3920,7 +3920,7 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
     - **Compaction:** a full compaction takes 4–7 s. Search latency for terms and phrases matches the flush-only numbers, so phrase-hub's ~400 ms is the design's cost (#1334).
     - **Writes:** positions cost +13% write time (139 → 157 µs) and +58% bytes.
     - **Fuzzy, after #1353:** 1 edit 17 ms p50 (from 375), 2 edits 21 ms (from 406), prefix 2 15 ms.
-    - **A fuzzy term beside a common term:** 26 ms p50, but a 2.9 s p99: the common term's documents look up the fuzzy term's expansions. That's #1355, and #1363 is the converse.
+    - **A fuzzy term beside a common term:** 26 ms p50, but a 2.9 s p99: the common term's documents look up the fuzzy term's expansions. That's #1368 (lookups that advance; #1355's bound tightening was closed as not a lever), and #1363 is the converse.
 
 **PR 4.** Fuzzy terms, as rev 5 §4.4, with `levenshtein_automata` 0.2.1 (Damerau, with an adjacent transposition as one edit).
 - **The walk:** a `df`-only scan of the `P` rows from the fixed prefix. At a key the automaton rejects partway, it seeks to the smallest byte string above the key that the automaton hasn't rejected. A term whose `df` is 0 isn't an expansion.
