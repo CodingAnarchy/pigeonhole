@@ -832,9 +832,14 @@ impl Memtable {
             mem.store_u32(tower(p, level), node, Ordering::Release);
         }
 
-        for (level, p) in prev.iter().enumerate() {
-            self.splice[level] = if level < height { node } else { *p };
+        // The next insert's predecessors: this node below its height, `prev` above it. After
+        // an insert right after the last one `prev` is the splice already, so only the
+        // node's own levels change (every level was rewritten per insert, about 30
+        // instructions, #1206).
+        if !after_last {
+            self.splice = prev;
         }
+        self.splice[..height].fill(node);
         self.bump += node_len;
         self.used += node_len as u64;
         self.count += 1;
