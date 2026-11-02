@@ -281,6 +281,7 @@ impl FeedBuilder {
                 changes: Vec::new(),
             },
             oldest_retained: None,
+            failed: None,
         })
     }
 }
@@ -353,6 +354,10 @@ pub struct Feed {
     names: Names,
     commit: Commit,
     oldest_retained: Option<u64>,
+    /// The error that ended the feed, returned by every later call (simp724 on #1321): the
+    /// reader had already moved past the commit it was delivering, so going on would skip
+    /// it.
+    failed: Option<Error>,
 }
 
 /// The longest single wait handed to the engine; a longer `next` waits again.
@@ -360,16 +365,28 @@ const WAIT_SLICE: Duration = Duration::from_secs(3600);
 
 impl Feed {
     /// The next commit, waiting up to `timeout` for one; `None` if none arrived in time.
+    ///
+    /// An error reading the feed ends it: every later call returns the same error, as an
+    /// expired feed does, so no commit is ever skipped. A value that doesn't decode is
+    /// `Corruption`; the feed's [`token`](Self::token) then points past that commit, so
+    /// resuming from it skips the damaged one.
     pub fn next(&mut self, timeout: Duration) -> Result<Option<&Commit>> {
+        self.check_failed()?;
         let deadline = Instant::now().checked_add(timeout);
         loop {
             self.follow_recovery()?;
             let left = deadline.map_or(WAIT_SLICE, |d| {
                 d.saturating_duration_since(Instant::now()).min(WAIT_SLICE)
             });
-            match self.reader.wait(left)? {
+            let next = match self.reader.wait(left) {
+                Ok(next) => next,
+                Err(e) => return Err(fail(&mut self.failed, e.into())),
+            };
+            match next {
                 Next::Commit(c) => {
-                    fill(&mut self.commit, &mut self.names, &self.db, c)?;
+                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
+                        return Err(fail(&mut self.failed, e));
+                    }
                     return Ok(Some(&self.commit));
                 }
                 Next::Expired(e) => {
@@ -387,12 +404,20 @@ impl Feed {
         }
     }
 
-    /// The next commit if one is ready; `None` otherwise. Never waits.
+    /// The next commit if one is ready; `None` otherwise. Never waits. Errors end the feed
+    /// as [`next`](Self::next)'s do.
     pub fn try_next(&mut self) -> Result<Option<&Commit>> {
+        self.check_failed()?;
         self.follow_recovery()?;
-        match self.reader.try_next()? {
+        let next = match self.reader.try_next() {
+            Ok(next) => next,
+            Err(e) => return Err(fail(&mut self.failed, e.into())),
+        };
+        match next {
             Next::Commit(c) => {
-                fill(&mut self.commit, &mut self.names, &self.db, c)?;
+                if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
+                    return Err(fail(&mut self.failed, e));
+                }
                 Ok(Some(&self.commit))
             }
             Next::Expired(e) => {
@@ -400,6 +425,14 @@ impl Feed {
                 Err(expired(e))
             }
             Next::Pending => Ok(None),
+        }
+    }
+
+    /// The error that ended the feed, again.
+    fn check_failed(&self) -> Result<()> {
+        match &self.failed {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
         }
     }
 
@@ -496,9 +529,67 @@ fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Com
     Ok(())
 }
 
+/// Ends the feed with `e`: kept for every later call, and returned now.
+fn fail(failed: &mut Option<Error>, e: Error) -> Error {
+    failed.get_or_insert(e).clone()
+}
+
 fn expired(e: &pigeonhole_engine::Expiry) -> Error {
     Error::new(
         ErrorCode::FeedExpired,
         format!("the change feed expired: {}", e.reason),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Family, FeedRetention, Options, Pigeonhole};
+
+    /// simp724 on #1321: a value that doesn't decode is `Corruption`, never an empty value,
+    /// and it ends the feed: every later call returns it, so the damaged commit is never
+    /// passed over.
+    #[test]
+    fn an_undecodable_value_fails_the_feed_for_good() {
+        let dir = crate::doc_support::temp_dir();
+        let db = Pigeonhole::open(
+            dir.join("db.phdb"),
+            Options::default().change_feed(FeedRetention::bytes(16 << 20)),
+        )
+        .unwrap();
+        let t = db
+            .table("t")
+            .unwrap()
+            .family("f", Family::default())
+            .create_if_missing()
+            .unwrap();
+        let mut feed = t.feed().open().unwrap();
+        let info = &t.core.info;
+        let bad = pigeonhole_engine::Commit {
+            seqno: 9,
+            ts: 1,
+            changes: vec![pigeonhole_engine::Change {
+                table: info.id,
+                family: info.families[0].id,
+                kind: Kind::Put,
+                ts: 1,
+                row: b"r".to_vec(),
+                qualifier: b"q".to_vec(),
+                // A tag byte no build writes.
+                value: vec![0xEE, 1, 2],
+            }],
+        };
+        let e = fill(&mut feed.commit, &mut feed.names, &feed.db, &bad).unwrap_err();
+        assert_eq!(e.code(), ErrorCode::Corruption, "{e}");
+        assert!(feed.commit.changes.is_empty());
+        // What `next` does with it: kept, and returned by every later call.
+        let e = fail(&mut feed.failed, e);
+        t.mutate(b"after").put("f", b"q", b"v").commit().unwrap();
+        for _ in 0..2 {
+            assert_eq!(feed.next(Duration::from_secs(5)).unwrap_err(), e);
+            assert_eq!(feed.try_next().unwrap_err(), e);
+        }
+        drop(feed);
+        db.close().unwrap();
+    }
 }
