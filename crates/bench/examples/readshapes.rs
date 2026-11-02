@@ -381,7 +381,9 @@ fn main() {
             // itself, comparable with every earlier base.
             .row_cache(0),
     );
-    // Every setup cell is written at a fixed, increasing timestamp (#1305). A timestamp is part
+    // Every setup cell is written at a fixed, increasing timestamp (#1305), vectors included.
+    // Counter increments are not: they combine into one cell whatever the commit timestamp,
+    // so the counter family's SST is the same on every run already. A timestamp is part
     // of a cell's key, so wall-clock ones gave each run differently encoded SSTs (table `t`'s
     // flushed SST took 1,073,791 to 1,077,226 bytes for the same 100,000 entries), different
     // block boundaries, and get-sst and the multi-gets a spread of up to 30 instructions per
@@ -514,8 +516,8 @@ fn main() {
         let mut vr = Rng(0x5EED_0490);
         for r in 0..KNN_ROWS {
             v.mutate(&key(b'v', r))
-                .put_vector_f32("e", b"a", &knn_vector(&mut vr))
-                .put_vector_f32("e", b"b", &knn_vector(&mut vr))
+                .put_vector_f32_at("e", b"a", ts(), &knn_vector(&mut vr))
+                .put_vector_f32_at("e", b"b", ts(), &knn_vector(&mut vr))
                 .commit()
                 .unwrap();
         }
