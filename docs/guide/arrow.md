@@ -44,14 +44,15 @@ assert_eq!(names, [b"Ada".to_vec(), b"Grace".to_vec()]);
 | `family` | `Dictionary<Int32, Utf8>` | |
 | `qualifier` | `Binary` | |
 | `ts` | `Timestamp(Microsecond, "UTC")` | the version's timestamp |
-| `value` | `Binary` | the bytes, or a typed value's little-endian encoding (what `CellRef::value` returns) |
-| `value_type` | `Dictionary<Int8, Utf8>` | `bytes`, `i64`, `f64` or `varint`: with it the export loses nothing |
+| `value` | `Binary` | the bytes, or a typed value's little-endian encoding (what `CellRef::value` returns; for a vector, its element byte, `dim` as a varint, then its payload) |
+| `value_type` | `Dictionary<Int8, Utf8>` | `bytes`, `i64`, `f64`, `varint` or `vector`: with it the export loses nothing |
 
 `pigeonhole_arrow::schema(&options)` returns the schema without scanning. Options change it:
 
 | `ArrowOptions` | Effect |
 |---|---|
 | `typed_values(true)` | adds nullable `value_i64: Int64` (i64 and varint cells, so counters and min and max families) and `value_f64: Float64` (f64 cells) |
+| `vector_dim(n)` | adds nullable `value_vector: FixedSizeList<Float32, n>` (ICR 0108): each vector cell's components, `f32`/`f16`/`bf16` widened exactly and `i8` as exact floats. Other cells and bit vectors are null; a vector of another dimension fails its batch with an error naming the row, so select families of one dimension. It's the shape ML loaders (pyarrow, Polars) read as a fixed-length array column |
 | `utf8_keys(true)` | `row` and `qualifier` as `Utf8`. A key that isn't valid UTF-8 fails its batch with an error naming the key; nothing is replaced |
 | `row_dictionary(true)` | `row` as `Dictionary<Int32, Binary>` (or `Utf8`): each key stored once per batch |
 | `ts(TsType::UInt64)` | `ts` as stored. With the default `Timestamp`, a timestamp above `i64::MAX` fails its batch with an error naming the row |

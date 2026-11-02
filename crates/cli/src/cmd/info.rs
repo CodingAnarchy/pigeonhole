@@ -91,6 +91,7 @@ const COLUMNS: &[(&str, bool)] = &[
     ("tablets", true),
     ("counter", false),
     ("aggregation", false),
+    ("vector", false),
     ("ssts", true),
     ("sst_bytes", true),
     ("entries", true),

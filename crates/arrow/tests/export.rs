@@ -240,3 +240,112 @@ fn an_owned_export_is_a_send_static_reader_on_the_writer_and_a_reader_process() 
     drop(r);
     db.close().unwrap();
 }
+
+/// Vector cells (D303, ICR 0108): never refused. `value_type` is `vector` and `value` is
+/// the stored encoding. With `vector_dim`, `value_vector` holds each vector's components
+/// widened exactly, null for other cells and for bit vectors, and a vector of another
+/// dimension fails the batch.
+#[test]
+fn vector_cells_export_exactly_and_fill_value_vector() {
+    use arrow_array::types::{Float32Type, Int8Type};
+    use pigeonhole::{Element, Metric, VectorSpec};
+    let vfs = SimVfs::new(4);
+    let (db, _) = open(&vfs);
+    let spec = |d, e, m| Family::vector(VectorSpec::new(d, e, m).unwrap());
+    let t = db
+        .table("v")
+        .unwrap()
+        .family("a_f32", spec(4, Element::F32, Metric::L2))
+        .family("b_f16", spec(4, Element::F16, Metric::L2))
+        .family("c_i8", spec(4, Element::I8, Metric::L2))
+        .family("d_bit", spec(32, Element::Bit, Metric::Hamming))
+        .family("e_plain", Family::default())
+        .create()
+        .unwrap();
+    t.mutate(b"r")
+        .put_vector_f32("a_f32", b"", &[0.5, -1.0, 3.25, 0.0])
+        // f16: 1.5, 65,504, the smallest subnormal, -0.
+        .put_vector_f16("b_f16", b"", &[0x3e00, 0x7bff, 0x0001, 0x8000])
+        .put_vector_i8("c_i8", b"", &[-128, -1, 0, 127])
+        .put_vector_bits("d_bit", b"", &[1, 2, 3, 4])
+        .put("e_plain", b"", b"bytes")
+        .commit()
+        .unwrap();
+
+    // Without vector_dim: no extra column; the value is the stored encoding, exactly.
+    let batches: Vec<_> = scan_to_arrow(t.scan_prefix(b""), &ArrowOptions::default())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let batch = &batches[0];
+    assert!(batch.column_by_name("value_vector").is_none());
+    let types = batch.column_by_name("value_type").unwrap();
+    let types = types.as_dictionary::<Int8Type>();
+    let names = types.values().as_string::<i32>();
+    let value = batch.column_by_name("value").unwrap();
+    let value = value.as_binary::<i32>();
+    let row = t.row(b"r").read().unwrap().unwrap();
+    for (i, e) in row.iter().enumerate() {
+        let kind = names.value(types.keys().value(i) as usize);
+        let want = if e.family == "e_plain" {
+            "bytes"
+        } else {
+            "vector"
+        };
+        assert_eq!(kind, want, "{}", e.family);
+        assert_eq!(value.value(i), e.cell.value(), "{}", e.family);
+    }
+
+    // With vector_dim(4): the 4-dim vectors' components, widened exactly.
+    let opts = ArrowOptions::default().vector_dim(4);
+    let batches: Vec<_> = scan_to_arrow(
+        t.scan_prefix(b"")
+            .families(["a_f32", "b_f16", "c_i8", "e_plain"]),
+        &opts,
+    )
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+    let batch = &batches[0];
+    assert_eq!(batch.schema(), pigeonhole_arrow::schema(&opts));
+    let vectors = batch.column_by_name("value_vector").unwrap();
+    let vectors = vectors.as_fixed_size_list();
+    assert_eq!(vectors.value_length(), 4);
+    let comps = |i: usize| -> Vec<f32> {
+        vectors
+            .value(i)
+            .as_primitive::<Float32Type>()
+            .values()
+            .to_vec()
+    };
+    assert_eq!(comps(0), [0.5, -1.0, 3.25, 0.0]);
+    let f16 = comps(1);
+    assert_eq!(f16[..3], [1.5, 65504.0, 2f32.powi(-24)]);
+    assert_eq!(f16[3].to_bits(), (-0.0f32).to_bits());
+    assert_eq!(comps(2), [-128.0, -1.0, 0.0, 127.0]);
+    assert!(vectors.is_null(3), "a plain cell is null in value_vector");
+    assert_eq!(vectors.null_count(), 1);
+
+    // A bit vector is null there; a vector of another dimension fails the batch.
+    let bits: Vec<_> = scan_to_arrow(
+        t.scan_prefix(b"").family("d_bit"),
+        &ArrowOptions::default().vector_dim(32),
+    )
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap();
+    assert!(bits[0].column_by_name("value_vector").unwrap().is_null(0));
+    let wrong = scan_to_arrow(
+        t.scan_prefix(b"").family("a_f32"),
+        &ArrowOptions::default().vector_dim(8),
+    )
+    .unwrap()
+    .collect::<Result<Vec<_>, _>>();
+    let err = wrong.unwrap_err().to_string();
+    assert!(
+        err.contains("4-dimension vector") && err.contains("holds 8"),
+        "{err}"
+    );
+    drop(t);
+    db.close().unwrap();
+}

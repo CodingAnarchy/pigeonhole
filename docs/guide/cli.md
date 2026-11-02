@@ -199,15 +199,16 @@ $ echo $?
 How values are written:
 - **Bytes** (`row`, `qualifier`, and a byte `value`) are a JSON string when they are valid UTF-8, and `{"base64": "…"}` otherwise.
 - **Typed values** are `{"i64": n}` (also every counter) or `{"f64": x}` (`{"f64_bits": n}` for a NaN or an infinity).
+- **Vectors** (D303) are `{"vector": {"dim": n, "element": "f32", "values": [...]}}`: `f32`, `f16` and `bf16` components as the numbers they widen to exactly, `i8` as integers, and a bit vector as `{"dim", "element": "bit", "base64": "..."}`. A vector family's table line carries `"vector": {"dim", "element", "metric"}`. `phdb load` checks each vector against its family's element and dim, and writes it back bit for bit.
 - **`ts`** is microseconds since the Unix epoch.
 
 **`csv`** is for spreadsheets and other tools; `phdb load` doesn't read it.
 - The header is `table,row,family,qualifier,ts,type,value`.
-- `type` is `bytes`, `base64` (a value that isn't UTF-8), `i64` or `f64`.
+- `type` is `bytes`, `base64` (a value that isn't UTF-8), `i64`, `f64` or `vector` (the value is the `jsonl` form's `{"vector": {...}}` as text).
 - A row key or qualifier that isn't UTF-8 prints as `b64:` followed by base64. A key that really starts with `b64:` is ambiguous here, so use `jsonl` to round-trip.
 
 **`arrow`** is an [Arrow IPC stream](https://arrow.apache.org/docs/format/Columnar.html#ipc-streaming-format) of one table, for DuckDB, Polars, pyarrow and other Arrow readers (#691). Name the table with `--table`: a stream has one schema, so `dump --format arrow` without exactly one table fails with status 2.
-- **Schema:** the [Arrow export's](arrow.md) long schema, one Arrow row per cell: `row`, `family`, `qualifier`, `ts` (a UTC microsecond timestamp), `value` (the bytes, or a typed value's little-endian encoding), `value_type` (`bytes`, `i64`, `f64`, `varint`), and the typed columns `value_i64` (i64 and varint cells, so every counter) and `value_f64`, null for other cells.
+- **Schema:** the [Arrow export's](arrow.md) long schema, one Arrow row per cell: `row`, `family`, `qualifier`, `ts` (a UTC microsecond timestamp), `value` (the bytes, or a typed value's little-endian encoding), `value_type` (`bytes`, `i64`, `f64`, `varint`, `vector`), and the typed columns `value_i64` (i64 and varint cells, so every counter) and `value_f64`, null for other cells.
 - **Order:** as `jsonl`. Every retained version, at one snapshot.
 - **Limit:** a timestamp above `i64::MAX` doesn't fit an Arrow timestamp: the dump fails with status 6 (`Unsupported`), naming the row. `jsonl` dumps it. Any other failure of the Arrow writer is status 1 (`Export`).
 - **Check the status.** A dump that fails partway, in any format, leaves what it wrote so far on standard output, and an Arrow stream cut short has no end-of-stream marker: pyarrow and Polars read it as a shorter table without complaint. Treat the output as complete only when `phdb` exits 0.
