@@ -654,14 +654,30 @@ fn traverse_pages_come_from_one_cached_result() {
         "every node of the first result once, none added later"
     );
 
-    // Another traversal replaces the cached one: an old cursor runs its traversal again
-    // (now seeing the added edges), as cursors did before the cache.
+    // A traversal that fits one result leaves the cache alone; one that returns a cursor
+    // replaces it, and then an old cursor runs its traversal again, as cursors did before
+    // the cache: it sees an edge added since its first page.
     let second = s.call("traverse", args.clone());
     let stale = second["cursor"].clone();
+    let counted = second["hops"][0]["node_count"].as_u64().unwrap();
+    s.call("write", json!({"ops": [edge("999")]}));
     s.call(
         "traverse",
         json!({"table": "g", "family": "out", "seeds": ["n:000"]}),
     );
+    let mut cached = args.clone();
+    cached["cursor"] = stale.clone();
+    let page = s.call("traverse", cached);
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(counted),
+        "{page}"
+    );
+    let other = s.call(
+        "traverse",
+        json!({"table": "g", "family": "out", "seeds": ["n:hub"], "per_node_limit": 1000}),
+    );
+    assert!(other["cursor"].is_string(), "{other}");
     let mut again = args.clone();
     again["cursor"] = stale;
     let page = s.call("traverse", again);
@@ -669,9 +685,27 @@ fn traverse_pages_come_from_one_cached_result() {
         page["hops"][0]["first_index"].as_u64().unwrap() > 0,
         "{page}"
     );
-    assert!(
-        page["hops"][0]["node_count"].as_u64().unwrap() > 60,
-        "the re-run sees the added edges: {page}"
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(counted + 1),
+        "the re-run sees the edge added since: {page}"
+    );
+    // The same call run again caches a newer run: a cursor from the older run doesn't
+    // page from it (it carries its run id) but runs again, seeing what's newer still.
+    let older = s.call("traverse", args.clone());
+    let older_cursor = older["cursor"].clone();
+    let base = older["hops"][0]["node_count"].as_u64().unwrap();
+    s.call("write", json!({"ops": [edge("998")]}));
+    let newer = s.call("traverse", args.clone());
+    assert_eq!(newer["hops"][0]["node_count"].as_u64(), Some(base + 1));
+    s.call("write", json!({"ops": [edge("997")]}));
+    let mut again = args.clone();
+    again["cursor"] = older_cursor;
+    let page = s.call("traverse", again);
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(base + 2),
+        "an older run's cursor runs again, not from the newer run's cache: {page}"
     );
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
