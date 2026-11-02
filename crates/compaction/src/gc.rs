@@ -214,6 +214,9 @@ pub(crate) struct Gc {
     gbase: Vec<usize>,
     acc: Vec<u8>,
     acc_key: Vec<u8>,
+    /// The group entries combined into `acc`, `(key start, value start, end)` in
+    /// `group_data`, newest first: kept apart instead if `acc` doesn't settle.
+    acc_parts: Vec<(usize, usize, usize)>,
     scratch: Vec<u8>,
 
     /// Live-byte change per blob file from dropped values.
@@ -265,6 +268,7 @@ impl Gc {
             gbase: vec![0; n],
             acc: Vec::new(),
             acc_key: Vec::new(),
+            acc_parts: Vec::new(),
             scratch: Vec::new(),
             blob_delta: Vec::new(),
             read: 0,
@@ -562,6 +566,7 @@ impl Gc {
                         .is_ok()
                     {
                         std::mem::swap(&mut self.acc, &mut self.scratch);
+                        self.acc_parts.push((key.start, value.start, value.end));
                         self.kept -= 1;
                         continue;
                     }
@@ -570,6 +575,8 @@ impl Gc {
                     self.push_acc(out);
                 }
                 pending = Some(i);
+                self.acc_parts.clear();
+                self.acc_parts.push((key.start, value.start, value.end));
                 self.acc_key.clear();
                 self.acc_key.extend_from_slice(&self.group_data[key]);
                 self.acc.clear();
@@ -659,6 +666,7 @@ impl Gc {
                         .is_ok()
                     {
                         std::mem::swap(&mut self.acc, &mut self.scratch);
+                        self.acc_parts.push((key.start, value.start, value.end));
                         self.kept -= 1;
                         continue;
                     }
@@ -667,6 +675,8 @@ impl Gc {
                     self.push_acc(out);
                 }
                 pending = Some((i, e.seqno));
+                self.acc_parts.clear();
+                self.acc_parts.push((key.start, value.start, value.end));
                 self.acc_key.clear();
                 self.acc_key.extend_from_slice(&self.group_data[key]);
                 self.acc.clear();
@@ -705,16 +715,26 @@ impl Gc {
     }
 
     /// Pushes the accumulator, a combined operand (or a fold's result), settled into one an
-    /// operator stores ([`MergeOperator::settle`]): never a working form (D298).
+    /// operator stores ([`MergeOperator::settle`]): never a working form (D298). If it
+    /// doesn't settle, the operands it combined are pushed apart, unchanged, as if no
+    /// combine had been tried. A fold's result is settled already ([`Gc::fold_onto`]).
     fn push_acc(&mut self, out: &mut OutBuf) {
-        let (merge, acc) = (&self.merge, &mut self.acc);
-        if let Some(op) = merge
-            && op.settle(acc).is_err()
+        if let Some(op) = &self.merge
+            && op.settle(&mut self.acc).is_err()
         {
-            debug_assert!(false, "settling operands merge already checked failed");
+            debug_assert_ne!(
+                self.acc_key.last(),
+                Some(&(Kind::Put as u8)),
+                "a fold onto a base left an unsettled result"
+            );
+            self.kept += self.acc_parts.len() as u64 - 1;
+            for &(k, v, e) in &self.acc_parts {
+                out.push_group(k, v, e);
+            }
+            return;
         }
         debug_assert_ne!(
-            acc.first(),
+            self.acc.first(),
             Some(&pigeonhole_format::value::TRANSIENT_TAG),
             "a working accumulator reached a compaction's output"
         );
@@ -742,7 +762,9 @@ impl Gc {
         };
         self.scratch.clear();
         self.scratch.extend_from_slice(&self.acc);
-        if op.finish(Some(base), &mut self.scratch).is_err() {
+        if op.finish(Some(base), &mut self.scratch).is_err()
+            || op.settle(&mut self.scratch).is_err()
+        {
             return false;
         }
         std::mem::swap(&mut self.acc, &mut self.scratch);

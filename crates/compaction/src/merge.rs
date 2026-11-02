@@ -806,12 +806,15 @@ impl SetOps {
         if acc.first() != Some(&pigeonhole_format::value::TRANSIENT_TAG) {
             return Ok(vec![Self::payload(acc, "operand is not a set operand")?]);
         }
+        let truncated = || MergeError::new(Self::NAME, "a set fold's working form is truncated");
         let mut out = Vec::new();
         let mut rest = &acc[1..];
         while !rest.is_empty() {
-            let len = u32::from_le_bytes(rest[..4].try_into().expect("4 bytes")) as usize;
-            out.push(&rest[4..4 + len]);
-            rest = &rest[4 + len..];
+            let (len, tail) = rest.split_first_chunk::<4>().ok_or_else(truncated)?;
+            let len = u32::from_le_bytes(*len) as usize;
+            let (entry, tail) = tail.split_at_checked(len).ok_or_else(truncated)?;
+            out.push(entry);
+            rest = tail;
         }
         Ok(out)
     }
@@ -826,7 +829,9 @@ impl MergeOperator for SetOps {
         Self::to_working(acc)?;
         if older.first() == Some(&pigeonhole_format::value::TRANSIENT_TAG) {
             // Another fold's working form (a resolver run merging its groups): its entries,
-            // newest first, all older than ours.
+            // newest first, all older than ours. Its framing is checked first, so a corrupt
+            // one fails here and leaves `acc` as it was.
+            Self::operands(older)?;
             acc.extend_from_slice(&older[1..]);
             return Ok(());
         }
