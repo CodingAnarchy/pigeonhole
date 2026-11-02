@@ -3,6 +3,7 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use pigeonhole::{
@@ -125,6 +126,13 @@ impl Rows {
         match self {
             Rows::W(t) => t.row(row),
             Rows::R(t) => t.row(row),
+        }
+    }
+
+    pub(crate) fn scan_bounds(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Scan<'_> {
+        match self {
+            Rows::W(t) => t.scan_bounds(start, end),
+            Rows::R(t) => t.scan_bounds(start, end),
         }
     }
 

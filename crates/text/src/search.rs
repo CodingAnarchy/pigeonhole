@@ -1,14 +1,15 @@
-//! Search (D309 §4): disjunctive BM25 over terms and exact phrases, term at a time.
+//! Search (D309 §4): disjunctive BM25 over terms, phrases and fuzzy terms, by MaxScore.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use pigeonhole::Snapshot;
 
 use crate::error::{Error, Result, corrupt};
+use crate::fuzzy::{Expansion, edits, expand};
 use crate::index::{Index, Rows};
 use crate::layout::*;
 use crate::maxscore::{Bm25, Scored};
-use crate::query::{Clause, Query};
+use crate::query::{Clause, Fuzziness, Query};
 
 /// One search result.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,12 +22,40 @@ pub struct Hit {
 }
 
 /// What a search met besides its hits.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct SearchStats {
     /// Hits skipped because their source cell is gone: the source was deleted around the
     /// index (a bypass, D309 §3). The next candidate took each one's place.
     pub stale: u64,
+    /// Each fuzzy term's expansions, in the order the query's clauses yield them (a fuzzy
+    /// term two clauses yield is listed once, under the first).
+    pub fuzzy: Vec<FuzzyStats>,
+}
+
+/// One fuzzy term's expansions ([`SearchStats::fuzzy`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FuzzyStats {
+    /// The clause that yielded it: an index into [`Query::clauses`].
+    pub clause: usize,
+    /// The fuzzy term, normalised (and for [`Clause::FuzzyText`], tokenised).
+    pub term: String,
+    /// The terms it expanded to.
+    pub expansions: usize,
+    /// Whether [`Search::max_expansions`] left matching terms out.
+    pub cut: bool,
+}
+
+/// [`Search::max_expansions`]' default (D309 §4.4).
+const DEFAULT_MAX_EXPANSIONS: usize = 50;
+
+/// A fuzzy term as the search expands it.
+#[derive(Debug, PartialEq)]
+struct FuzzyTerm {
+    clause: usize,
+    term: String,
+    edits: u8,
 }
 
 /// A search to run ([`Index::search`]).
@@ -38,6 +67,8 @@ pub struct Search<'a> {
     k: usize,
     snapshot: Option<&'a Snapshot>,
     prefix: Option<Vec<u8>>,
+    max_expansions: usize,
+    prefix_length: usize,
 }
 
 /// A phrase as the evaluator matches it: each term with its offset from the first, and the
@@ -56,7 +87,26 @@ impl<'a> Search<'a> {
             k,
             snapshot: None,
             prefix: None,
+            max_expansions: DEFAULT_MAX_EXPANSIONS,
+            prefix_length: 0,
         }
+    }
+
+    /// The most terms each fuzzy term expands to: 50 by default (D309 §4.4). When more
+    /// match, the closest are kept, then the most frequent, then bytewise, so the choice is
+    /// deterministic; [`SearchStats::fuzzy`] says which terms were cut. It applies to every
+    /// fuzzy term of the query. A search with 0 is refused (`InvalidArgument`).
+    pub fn max_expansions(mut self, n: usize) -> Self {
+        self.max_expansions = n;
+        self
+    }
+
+    /// How many leading characters of each fuzzy term must match exactly: 0 by default.
+    /// A few narrow the walk over a large dictionary to the terms sharing them. It applies
+    /// to every fuzzy term of the query.
+    pub fn prefix_length(mut self, n: usize) -> Self {
+        self.prefix_length = n;
+        self
     }
 
     /// Searches at `snapshot` rather than the latest state.
@@ -89,6 +139,11 @@ impl<'a> Search<'a> {
     /// [`run`](Self::run), with what the search met.
     pub fn run_with_stats(self) -> Result<(Vec<Hit>, SearchStats)> {
         self.query.check()?;
+        if self.max_expansions == 0 {
+            return Err(Error::InvalidArgument(
+                "max_expansions must be at least 1".into(),
+            ));
+        }
         let index = self.index;
         let inn = &*index.inner;
         let owned;
@@ -104,8 +159,8 @@ impl<'a> Search<'a> {
             return Err(Error::Busy);
         }
         let mut stats = SearchStats::default();
-        let (terms, phrases) = self.resolve()?;
-        if self.k == 0 || (terms.is_empty() && phrases.is_empty()) {
+        let (terms, phrases, fuzzy) = self.resolve()?;
+        if self.k == 0 || (terms.is_empty() && phrases.is_empty() && fuzzy.is_empty()) {
             return Ok((Vec::new(), stats));
         }
         let counter = |q: &[u8]| -> Result<i64> {
@@ -136,6 +191,27 @@ impl<'a> Search<'a> {
                 df_of.insert(term.clone(), df);
             }
         }
+        // Each fuzzy term's expansions, from the whole dictionary (not only `id_prefix`'s
+        // documents), as the ranking statistics are.
+        let mut expanded: Vec<Vec<Expansion>> = Vec::with_capacity(fuzzy.len());
+        for f in &fuzzy {
+            let (exps, cut) = expand(
+                t,
+                s,
+                &f.term,
+                f.edits,
+                self.prefix_length,
+                self.max_expansions,
+            )?;
+            stats.fuzzy.push(FuzzyStats {
+                clause: f.clause,
+                term: f.term.clone(),
+                expansions: exps.len(),
+                cut,
+            });
+            expanded.push(exps);
+        }
+        let fuzzy_stats = std::mem::take(&mut stats.fuzzy);
         let prefix = self.prefix.as_deref();
         // The phrases, scored up front (D309 §4.2): their bounds are their actual maxima.
         let mut phrase_scores = Vec::with_capacity(phrases.len());
@@ -154,13 +230,25 @@ impl<'a> Search<'a> {
                     clauses.push(Scored::term(t, s, &bm, term, df, prefix)?);
                 }
             }
+            for exps in &expanded {
+                if !exps.is_empty() {
+                    let e: Vec<(&str, i64, f64)> = exps
+                        .iter()
+                        .map(|e| (e.term.as_str(), e.df, e.boost))
+                        .collect();
+                    clauses.push(Scored::fuzzy(t, s, &bm, &e, prefix)?);
+                }
+            }
             for ps in &phrase_scores {
                 clauses.push(Scored::phrase(ps.clone()));
             }
             let ranked = crate::maxscore::top_k(t, s, &bm, clauses, want)?;
             let complete = ranked.len() < want;
             let mut hits = Vec::with_capacity(self.k);
-            stats = SearchStats::default();
+            stats = SearchStats {
+                fuzzy: fuzzy_stats.clone(),
+                ..SearchStats::default()
+            };
             for (id, score) in ranked {
                 if hits.len() == self.k {
                     break;
@@ -178,13 +266,27 @@ impl<'a> Search<'a> {
         }
     }
 
-    /// The query's distinct terms and phrases, normalised and tokenised as the clauses say.
-    /// A term a clause yields twice counts once; a one-term phrase is a term.
-    fn resolve(&self) -> Result<(BTreeSet<String>, Vec<Phrase>)> {
+    /// The query's distinct terms, phrases and fuzzy terms, normalised and tokenised as the
+    /// clauses say. A term a clause yields twice counts once; a one-term phrase is a term.
+    fn resolve(&self) -> Result<(BTreeSet<String>, Vec<Phrase>, Vec<FuzzyTerm>)> {
         let index = self.index;
         let cap = index.inner.opts.get_max_term_bytes() as usize;
         let mut terms = BTreeSet::new();
         let mut phrases: Vec<Phrase> = Vec::new();
+        let mut fuzzy: Vec<FuzzyTerm> = Vec::new();
+        let mut add_fuzzy = |clause: usize, term: String, fuzziness: Fuzziness| {
+            if term.is_empty() {
+                return;
+            }
+            let edits = edits(&term, fuzziness);
+            if !fuzzy.iter().any(|f| f.term == term && f.edits == edits) {
+                fuzzy.push(FuzzyTerm {
+                    clause,
+                    term,
+                    edits,
+                });
+            }
+        };
         let mut add_phrase = |p: Phrase, terms: &mut BTreeSet<String>| match p.terms.len() {
             0 => {}
             // A one-term phrase is that term, whatever its slop.
@@ -197,7 +299,7 @@ impl<'a> Search<'a> {
                 }
             }
         };
-        for clause in self.query.clauses() {
+        for (at, clause) in self.query.clauses().iter().enumerate() {
             match clause {
                 Clause::Term(t) => {
                     let t = index.normalize_term(t);
@@ -234,10 +336,13 @@ impl<'a> Search<'a> {
                         &mut terms,
                     );
                 }
-                Clause::Fuzzy { .. } => {
-                    return Err(Error::InvalidArgument(
-                        "fuzzy terms are not supported yet: they come in D309 PR 4 (#1247)".into(),
-                    ));
+                Clause::Fuzzy { term, fuzziness } => {
+                    add_fuzzy(at, index.normalize_term(term).into_owned(), *fuzziness);
+                }
+                Clause::FuzzyText { text, fuzziness } => {
+                    for (term, _) in index.query_tokens(text) {
+                        add_fuzzy(at, term, *fuzziness);
+                    }
                 }
             }
         }
@@ -246,7 +351,7 @@ impl<'a> Search<'a> {
                 "the index has no positions, which a phrase needs".into(),
             ));
         }
-        Ok((terms, phrases))
+        Ok((terms, phrases, fuzzy))
     }
 }
 

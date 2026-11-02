@@ -4,6 +4,7 @@
 //! Every clause has an upper bound on what it can add to one document's score:
 //! - a term clause: `idf · tf_factor(maxtf, minlen)`, from its posting row's `maxtf` and
 //!   `minlen` aggregates. Those only ever over-estimate (M1), so the bound is safe;
+//! - a fuzzy clause: the largest of its expansions' term bounds, each times its boost;
 //! - a phrase clause, scored up front: its largest actual score.
 //!
 //! Clauses are taken in ascending order of bound. While fewer than `k` documents are held,
@@ -52,15 +53,96 @@ impl Bm25 {
     }
 }
 
+/// A term's posting row, walked in document order. A posting contributes
+/// `weight · tf_factor`: the weight is the term's idf, times its boost in a fuzzy clause.
+pub(crate) struct Walk<'t> {
+    row: Vec<u8>,
+    weight: f64,
+    /// Boxed: a walk is far larger than a phrase clause.
+    cells: Box<RowCells<'t>>,
+    /// The posting the walk stands on: its document and contribution.
+    cur: Option<(Vec<u8>, f64)>,
+}
+
+impl<'t> Walk<'t> {
+    /// The walk over `term`'s postings (restricted to doc ids starting with `prefix`), and
+    /// its bound: `weight · tf_factor(maxtf, minlen)`.
+    fn new(
+        t: &'t Rows,
+        s: &Snapshot,
+        bm: &Bm25,
+        term: &str,
+        weight: f64,
+        prefix: Option<&[u8]>,
+    ) -> Result<(Self, f64)> {
+        let row = post_row(term);
+        let agg = |family: &str| -> Result<Option<i64>> {
+            Ok(t.get_at(s, &row, family, BOUND)?.and_then(|c| c.as_i64()))
+        };
+        // MaxScore's bound (M1): the largest frequency at the shortest length any posting had.
+        // Without the aggregates (they're written with every posting, so never in practice),
+        // `k1 + 1` bounds the tf factor for any frequency and length.
+        let factor = match (agg(MAXTF)?, agg(MINLEN)?) {
+            (Some(maxtf), Some(minlen)) => bm.tf_factor(maxtf.max(0) as f64, minlen.max(0) as f64),
+            _ => bm.k1 + 1.0,
+        };
+        let mut read = t.row(&row).family(POST).snapshot(s);
+        if let Some(p) = prefix {
+            read = read.qualifier_prefix(p);
+        }
+        let mut w = Walk {
+            row,
+            weight,
+            cells: Box::new(read.cells()?),
+            cur: None,
+        };
+        w.step(bm)?;
+        Ok((w, weight * factor))
+    }
+
+    fn doc(&self) -> Option<&[u8]> {
+        self.cur.as_ref().map(|(d, _)| d.as_slice())
+    }
+
+    fn step(&mut self, bm: &Bm25) -> Result<()> {
+        self.cur = match self.cells.next()? {
+            Some(e) => {
+                let (tf, len) = unposting(
+                    e.cell
+                        .as_u64()
+                        .ok_or_else(|| corrupt("a posting isn't a u64"))?,
+                );
+                Some((
+                    e.qualifier.to_vec(),
+                    self.weight * bm.tf_factor(f64::from(tf), f64::from(len)),
+                ))
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    fn lookup(&self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+        match t.get_at(s, &self.row, POST, doc)? {
+            Some(c) => {
+                let (tf, len) =
+                    unposting(c.as_u64().ok_or_else(|| corrupt("a posting isn't a u64"))?);
+                Ok(self.weight * bm.tf_factor(f64::from(tf), f64::from(len)))
+            }
+            None => Ok(0.0),
+        }
+    }
+}
+
 /// A clause as MaxScore runs it.
 pub(crate) enum Clause<'t> {
-    /// A term's posting row, walked in document order.
-    Term {
-        row: Vec<u8>,
-        idf: f64,
-        /// Boxed: a walk is far larger than a phrase clause.
-        cells: Box<RowCells<'t>>,
-        /// The posting the walk stands on: its document and contribution.
+    /// A term's posting row.
+    Term(Walk<'t>),
+    /// A fuzzy term's expansions (D309 §4.4): a document's contribution is the largest of
+    /// theirs, not their sum.
+    Fuzzy {
+        walks: Vec<Walk<'t>>,
+        /// The document the clause stands on (the walks' smallest) and its contribution.
         cur: Option<(Vec<u8>, f64)>,
     },
     /// A phrase, scored up front: its documents and their scores, in document order.
@@ -86,33 +168,49 @@ impl<'t> Scored<'t> {
         df: i64,
         prefix: Option<&[u8]>,
     ) -> Result<Self> {
-        let row = post_row(term);
-        let idf = bm.idf(df);
-        let agg = |family: &str| -> Result<Option<i64>> {
-            Ok(t.get_at(s, &row, family, BOUND)?.and_then(|c| c.as_i64()))
-        };
-        // MaxScore's bound (M1): the largest frequency at the shortest length any posting had.
-        // Without the aggregates (they're written with every posting, so never in practice),
-        // `k1 + 1` bounds the tf factor for any frequency and length.
-        let factor = match (agg(MAXTF)?, agg(MINLEN)?) {
-            (Some(maxtf), Some(minlen)) => bm.tf_factor(maxtf.max(0) as f64, minlen.max(0) as f64),
-            _ => bm.k1 + 1.0,
-        };
-        let mut read = t.row(&row).family(POST).snapshot(s);
-        if let Some(p) = prefix {
-            read = read.qualifier_prefix(p);
+        let (walk, bound) = Walk::new(t, s, bm, term, bm.idf(df), prefix)?;
+        Ok(Scored {
+            clause: Clause::Term(walk),
+            bound: bound * (1.0 + SLACK),
+        })
+    }
+
+    /// A fuzzy clause over its expansions: `(term, df, boost)` each.
+    pub(crate) fn fuzzy(
+        t: &'t Rows,
+        s: &Snapshot,
+        bm: &Bm25,
+        expansions: &[(&str, i64, f64)],
+        prefix: Option<&[u8]>,
+    ) -> Result<Self> {
+        let mut walks = Vec::with_capacity(expansions.len());
+        let mut bound = 0.0f64;
+        for &(term, df, boost) in expansions {
+            let (walk, b) = Walk::new(t, s, bm, term, boost * bm.idf(df), prefix)?;
+            walks.push(walk);
+            bound = bound.max(b);
         }
         let mut c = Scored {
-            clause: Clause::Term {
-                row,
-                idf,
-                cells: Box::new(read.cells()?),
-                cur: None,
-            },
-            bound: idf * factor * (1.0 + SLACK),
+            clause: Clause::Fuzzy { walks, cur: None },
+            bound: bound * (1.0 + SLACK),
         };
-        c.step(bm)?;
+        c.settle();
         Ok(c)
+    }
+
+    /// A fuzzy clause's document: its walks' smallest, with the largest contribution there.
+    fn settle(&mut self) {
+        if let Clause::Fuzzy { walks, cur } = &mut self.clause {
+            *cur = walks.iter().filter_map(|w| w.doc()).min().map(|doc| {
+                let best = walks
+                    .iter()
+                    .filter_map(|w| w.cur.as_ref())
+                    .filter(|(d, _)| d.as_slice() == doc)
+                    .map(|(_, c)| *c)
+                    .fold(0.0, f64::max);
+                (doc.to_vec(), best)
+            });
+        }
     }
 
     /// A phrase clause from its scores.
@@ -130,7 +228,8 @@ impl<'t> Scored<'t> {
     /// The document the clause stands on, if any.
     fn doc(&self) -> Option<&[u8]> {
         match &self.clause {
-            Clause::Term { cur, .. } => cur.as_ref().map(|(d, _)| d.as_slice()),
+            Clause::Term(w) => w.doc(),
+            Clause::Fuzzy { cur, .. } => cur.as_ref().map(|(d, _)| d.as_slice()),
             Clause::Phrase { scores, at } => scores.get(*at).map(|(d, _)| d.as_slice()),
         }
     }
@@ -138,7 +237,9 @@ impl<'t> Scored<'t> {
     /// The contribution where it stands.
     fn here(&self) -> f64 {
         match &self.clause {
-            Clause::Term { cur, .. } => cur.as_ref().map_or(0.0, |(_, c)| *c),
+            Clause::Term(Walk { cur, .. }) | Clause::Fuzzy { cur, .. } => {
+                cur.as_ref().map_or(0.0, |(_, c)| *c)
+            }
             Clause::Phrase { scores, at } => scores.get(*at).map_or(0.0, |(_, c)| *c),
         }
     }
@@ -146,23 +247,17 @@ impl<'t> Scored<'t> {
     /// Moves to the next document.
     fn step(&mut self, bm: &Bm25) -> Result<()> {
         match &mut self.clause {
-            Clause::Term {
-                idf, cells, cur, ..
-            } => {
-                *cur = match cells.next()? {
-                    Some(e) => {
-                        let (tf, len) = unposting(
-                            e.cell
-                                .as_u64()
-                                .ok_or_else(|| corrupt("a posting isn't a u64"))?,
-                        );
-                        Some((
-                            e.qualifier.to_vec(),
-                            *idf * bm.tf_factor(f64::from(tf), f64::from(len)),
-                        ))
-                    }
-                    None => None,
+            Clause::Term(w) => w.step(bm)?,
+            Clause::Fuzzy { walks, cur } => {
+                let Some((doc, _)) = cur.take() else {
+                    return Ok(());
                 };
+                for w in walks.iter_mut() {
+                    if w.doc() == Some(doc.as_slice()) {
+                        w.step(bm)?;
+                    }
+                }
+                self.settle();
             }
             Clause::Phrase { at, .. } => *at += 1,
         }
@@ -172,14 +267,14 @@ impl<'t> Scored<'t> {
     /// The clause's contribution to `doc`, looked up out of order (a non-essential clause).
     fn lookup(&self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
         match &self.clause {
-            Clause::Term { row, idf, .. } => match t.get_at(s, row, POST, doc)? {
-                Some(c) => {
-                    let (tf, len) =
-                        unposting(c.as_u64().ok_or_else(|| corrupt("a posting isn't a u64"))?);
-                    Ok(*idf * bm.tf_factor(f64::from(tf), f64::from(len)))
+            Clause::Term(w) => w.lookup(t, s, bm, doc),
+            Clause::Fuzzy { walks, .. } => {
+                let mut best = 0.0f64;
+                for w in walks {
+                    best = best.max(w.lookup(t, s, bm, doc)?);
                 }
-                None => Ok(0.0),
-            },
+                Ok(best)
+            }
             Clause::Phrase { scores, .. } => Ok(scores
                 .binary_search_by(|(d, _)| d.as_slice().cmp(doc))
                 .map_or(0.0, |i| scores[i].1)),

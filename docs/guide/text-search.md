@@ -46,7 +46,7 @@ index.delete(b"note:2")?;
 | `postgres meeting` | `Query::new().text("postgres meeting")` | either word, tokenised as documents are |
 | `"march meeting"` | `.phrase(["march", "meeting"])` | the words at consecutive positions |
 | `"march meeting"~2` | `.phrase_with_slop(["march", "meeting"], 2)` | within 2 position moves |
-| `postgress~` | `.fuzzy("postgress", Fuzziness::Auto)` | fuzzy terms (D309 PR 4) |
+| `postgress~`, `postgress~1` | `.fuzzy("postgress", Fuzziness::Auto)`, `Fuzziness::One` | terms within a few edits |
 
 ```rust
 # use pigeonhole::*;
@@ -67,6 +67,9 @@ assert!(sloppy[0].score > sloppy[1].score);
 // The same query, built.
 let q = Query::new().phrase_with_slop(["march", "meeting"], 4);
 assert_eq!(index.search(q, 10).run()?, sloppy);
+// A misspelling, within two edits of "postgres".
+let fuzzy = index.search("Postgress~", 10).run()?;
+assert_eq!(fuzzy[0].id, b"a");
 # db.close()?;
 # Ok(())
 # }
@@ -77,6 +80,11 @@ assert_eq!(index.search(q, 10).run()?, sloppy);
 - **Phrases with slop** use Lucene's sloppy-phrase rule.
   - **What a match is:** one position per word, spanning at most `N` once each word's place in the phrase is taken off. Words out of order cost moves: a reversed pair is 2.
   - **Scoring:** each match adds `1 / (distance + 1)` to the phrase's frequency, so closer matches score higher, and an exact match scores as it does without slop.
+- **Fuzzy terms** match the index's terms within 1 or 2 edits, counting an adjacent transposition as one. `Auto` allows 0 edits up to 2 characters, 1 up to 5, and 2 beyond.
+  - **Syntax and builder:** `word~` in a query string is tokenised as documents are, so `Postgress~` works. `.fuzzy(term, ..)` takes the term as given, like `.term`.
+  - **Scoring:** each matching term scores as a term, times `1 − edits / length` (the shorter term's length), and a document scores its best match, not their sum. So three misspellings don't outrank the real word.
+  - **Expansions:** at most 50 terms per fuzzy term, the closest first, then the most frequent. `.max_expansions(n)` changes that. `.prefix_length(n)` requires the first `n` characters to match exactly, which makes a fuzzy search on a large dictionary much cheaper. `SearchStats::fuzzy` says how many terms each one matched, and whether the limit cut it.
+  - Composed and decomposed accents differ by edits, so keep the default `Nfc` normalisation if you search with fuzzy terms.
 - **A namespace:** `.id_prefix(p)` restricts a search to ids starting with `p`. Include the namespace's terminator (`agent:alice\0`), or `agent:alice2` matches too. Scores keep the whole index's statistics.
 
 ## Options
@@ -126,11 +134,15 @@ The write rate stays flat from the first document to the millionth.
 | that mixed phrase, slop 2 | 78 ms | 270 ms |
 | that mixed phrase, slop 10 | 81 ms | 360 ms |
 | two terms, top 1,000 | 30 ms | 184 ms |
+| a fuzzy term, 1 edit (41 expansions) | 375 ms | 1,180 ms |
+| a fuzzy term, 2 edits (44 expansions) | 406 ms | 1,184 ms |
+| a fuzzy term, 2 edits, `prefix_length(2)` (37 expansions) | 130 ms | 852 ms |
 
 These are the means of two runs, which agreed within 4%.
 
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.
 - **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Positional skipping is tracked in #1334.
+- **Fuzzy terms** cost a walk over the dictionary near the term, then the union of the matching terms' postings. On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk. Pruning inside a fuzzy clause is tracked in #1333.
 - **Positions are cheap to write:** 18% more time per document on the reference machine, much less than a laptop suggests.
 
 ## Errors
