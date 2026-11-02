@@ -137,6 +137,8 @@ All MIT/Apache-2.0 compatible (D6); none is a storage engine (spec: Pigeonhole o
 | `criterion` (dev) | MIT/Apache-2.0 | declared | Benchmarks for every path with a latency target. |
 | `rustix` (dev, unix, `time`) | Apache-2.0 WITH LLVM-exception/Apache-2.0/MIT | engine | A test thread's CPU time (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`) without `unsafe`, for cost comparisons that other tests running beside them must not skew (#795; owner, 2026-10-21). Already in the tree through `tempfile`. |
 | `clap` (derive) | MIT/Apache-2.0 | cli | `phdb`'s arguments, help and usage errors (#692; owner, 2026-10-20). |
+| `unicode-normalization` | MIT/Apache-2.0 | text | `pigeonhole-text`'s per-token NFC/NFKC normalisation, with quick checks that skip text already in form (D309 rev 6, #1291; owner, 2026-11-02). |
+| `unicode-segmentation` | MIT/Apache-2.0 | text | `pigeonhole-text`'s tokeniser: Unicode word boundaries (UAX #29), with byte offsets for highlighting (D309; owner, 2026-11-02). |
 | `serde_json` (`preserve_order`) | MIT/Apache-2.0 | cli (bench also uses it) | `phdb`'s JSON and JSONL output, with fields in their documented order. |
 | `insta` (dev, `filters`) | Apache-2.0 | cli | Snapshot tests of `phdb`'s output (the spec's "snapshot tests of CLI output"). |
 | `arrow-array`, `arrow-buffer`, `arrow-schema` 60 (no default features; `arrow-array/ffi` behind pigeonhole-arrow's `ffi` feature) | Apache-2.0 | arrow, cli | The `RecordBatch` export (#691, D5; owner, 2026-10-21). One major, pinned; the `arrow` umbrella crate is not used. 34 crates with their dependencies (chrono comes in through `arrow-array`). |

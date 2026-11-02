@@ -1,0 +1,22 @@
+[package]
+name = "pigeonhole-text"
+description = "Full-text search with BM25 and phrases for Pigeonhole, built on its public API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+# The public crate only (spec Risks: query features build on the core, never the reverse;
+# D309 is an index of ordinary rows and transactions).
+pigeonhole = { workspace = true }
+unicode-normalization = { workspace = true }
+unicode-segmentation = { workspace = true }
+
+[lints]
+workspace = true
