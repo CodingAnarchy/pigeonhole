@@ -10,7 +10,8 @@ use pigeonhole_format::key::Kind;
 use pigeonhole_format::value::decode_value;
 
 use crate::db::{Db, Snapshot};
-use crate::{Error, ErrorCode, Result, Table, Value};
+use crate::table::TableCore;
+use crate::{Error, ErrorCode, ReadTable, Result, Table, Value};
 
 /// Table and family names by id, as the feed's changes carry them.
 type Names = HashMap<(TableId, FamilyId), (Arc<str>, Arc<str>)>;
@@ -161,12 +162,12 @@ impl FeedToken {
     }
 }
 
-/// Builds a [`Feed`] ([`Table::feed`]).
+/// Builds a [`Feed`] ([`Table::feed`], or [`ReadTable::feed`] in a reader process).
 #[derive(Debug)]
 #[must_use = "a builder does nothing until `open`"]
 pub struct FeedBuilder {
     db: Arc<Db>,
-    tables: Vec<Table>,
+    tables: Vec<Arc<TableCore>>,
     prefix: Vec<u8>,
     durable: bool,
     start: FeedStart,
@@ -175,10 +176,10 @@ pub struct FeedBuilder {
 }
 
 impl FeedBuilder {
-    pub(crate) fn new(table: &Table) -> Self {
+    pub(crate) fn new(core: &Arc<TableCore>) -> Self {
         FeedBuilder {
-            db: Arc::clone(&table.core.db),
-            tables: vec![table.clone()],
+            db: Arc::clone(&core.db),
+            tables: vec![Arc::clone(core)],
             prefix: Vec::new(),
             durable: true,
             start: FeedStart::Now,
@@ -188,17 +189,26 @@ impl FeedBuilder {
 
     /// Follows `table` as well: one feed, the commits of all its tables in one order, each
     /// commit whole across them.
-    pub fn table(mut self, table: &Table) -> Self {
-        if let Err(e) = crate::write::check_table(&self.db, table) {
-            self.error.get_or_insert(e);
+    pub fn table(self, table: &Table) -> Self {
+        self.add(&table.core)
+    }
+
+    /// Follows `table` as well, in a reader process ([`table`](Self::table) for a
+    /// [`ReadTable`]).
+    pub fn read_table(self, table: &ReadTable) -> Self {
+        self.add(&table.core)
+    }
+
+    fn add(mut self, core: &Arc<TableCore>) -> Self {
+        if !Arc::ptr_eq(&self.db, &core.db) {
+            self.error.get_or_insert(Error::new(
+                ErrorCode::InvalidArgument,
+                format!("table {:?} belongs to another database", core.info.name),
+            ));
             return self;
         }
-        if !self
-            .tables
-            .iter()
-            .any(|t| t.core.info.id == table.core.info.id)
-        {
-            self.tables.push(table.clone());
+        if !self.tables.iter().any(|t| t.info.id == core.info.id) {
+            self.tables.push(Arc::clone(core));
         }
         self
     }
@@ -252,21 +262,21 @@ impl FeedBuilder {
     ///
     /// Fails with `InvalidArgument` if the database's change feed is off or doesn't follow
     /// one of the tables ([`Options::feed_tables`](crate::Options::feed_tables)), or if a
-    /// token is not one of this database's; `Unsupported` in a reader process (for now). A
-    /// start whose history is gone shows at the first [`Feed::next`], as `FeedExpired`.
+    /// token is not one of this database's. A start whose history is gone shows at the first
+    /// [`Feed::next`], as `FeedExpired`.
     pub fn open(self) -> Result<Feed> {
         if let Some(e) = self.error {
             return Err(e);
         }
         let spec = FeedSpec {
-            tables: self.tables.iter().map(|t| t.core.info.id).collect(),
+            tables: self.tables.iter().map(|t| t.info.id).collect(),
             prefix: self.prefix,
             durable: self.durable,
             start: self.start,
         };
         let mut names = HashMap::new();
         for t in &self.tables {
-            note_names(&mut names, &t.core.info);
+            note_names(&mut names, &t.info);
         }
         let (reader, generation) = subscribe(&self.db, spec.clone())?;
         Ok(Feed {
@@ -381,6 +391,11 @@ impl Feed {
             });
             let next = match self.reader.wait(left) {
                 Ok(next) => next,
+                // A reader process's writer restarted: follow it from the token.
+                Err(pigeonhole_engine::Error::SnapshotExpired) => {
+                    self.resubscribe()?;
+                    continue;
+                }
                 // The old engine failing under a recovery's swap: follow the recovery.
                 Err(_) if swapped(&self.db, self.generation) => continue,
                 Err(e) => return Err(fail(&mut self.failed, e.into())),
@@ -419,6 +434,11 @@ impl Feed {
             self.follow_recovery()?;
             let next = match self.reader.try_next() {
                 Ok(next) => next,
+                // A reader process's writer restarted: follow it from the token.
+                Err(pigeonhole_engine::Error::SnapshotExpired) => {
+                    self.resubscribe()?;
+                    continue;
+                }
                 // The old engine failing under a recovery's swap: follow it and look again
                 // (a swap is rare, so this goes round once or twice).
                 Err(_) if swapped(&self.db, self.generation) => continue,
@@ -471,6 +491,14 @@ impl Feed {
             Err(e) if e.code() == ErrorCode::SnapshotExpired => {}
             Err(e) => return Err(e),
         }
+        self.resubscribe()
+    }
+
+    /// Subscribes again from the feed's own token, on the current engine (after a recovery)
+    /// or a fresh attachment (a reader process after its writer restarted, D310 PR 4): the
+    /// engine checks the token, so a durable feed continues and a visible one that delivered
+    /// what was lost expires.
+    fn resubscribe(&mut self) -> Result<()> {
         let mut spec = self.spec.clone();
         spec.start = FeedStart::Token(self.reader.token());
         let (reader, generation) = subscribe(&self.db, spec)?;

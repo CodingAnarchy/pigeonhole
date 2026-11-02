@@ -3462,7 +3462,48 @@ fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
         // stream that is the start of its only segment, so nothing counts as dropped.
         let key = shared.shm.next_seqno().saturating_sub(1);
         feed.note_checkpoint(stream, Lsn::new(marks.head(), 0), key);
+        // Published in shared memory too, for change feeds in any process (layout version
+        // 8, D310 PR 4). Before the shard runs, so the first publication races no store.
+        marks.set_mirror(Box::new(ShmMarks {
+            shm: shared.shm.clone(),
+            shard: stream as u32,
+            feed: Arc::downgrade(feed),
+        }));
         feed.set_marks(stream, marks);
+    }
+}
+
+/// A stream's feed marks in the shared-memory region (D310 PR 4). `feed` is weak: the feed
+/// holds the stream's `FeedMarks`, which hold this.
+#[derive(Debug)]
+struct ShmMarks {
+    shm: ShmRegion,
+    shard: u32,
+    feed: std::sync::Weak<crate::feed::Feed>,
+}
+
+impl ShmMarks {
+    /// The lost bound for `floor` (`FEED_BOUND`, simp724's B1): what the checkpoint
+    /// history says records below the floor may have as keys.
+    fn publish_bound(&self, floor: u32) {
+        if let Some(feed) = self.feed.upgrade() {
+            self.shm
+                .publish_feed_bound(self.shard, feed.oldest_bound(self.shard as usize, floor));
+        }
+    }
+}
+
+impl pigeonhole_wal::MarkMirror for ShmMarks {
+    fn floor(&self, epoch: u32) {
+        // The bound before its floor: a reader that loads the floor and then the bound gets
+        // one at least that floor's.
+        self.publish_bound(epoch);
+        self.shm.publish_feed_floor(self.shard, epoch);
+    }
+    fn checkpoint(&self, lsn: Lsn) {
+        // A new checkpoint-history entry can raise the bound for the current floor.
+        self.publish_bound(self.shm.feed_marks(self.shard).floor);
+        self.shm.publish_feed_checkpoint(self.shard, lsn.0);
     }
 }
 
@@ -4786,6 +4827,86 @@ impl Inner {
         Ok(Some(view))
     }
 
+    /// A reader process's attachment, current: re-attached to the new writer's generation
+    /// when the writer it was attached to is gone, with a fresh slot; or with a fresh slot
+    /// when its slot was freed under it. Callers hold `r.shm`'s lock.
+    fn refresh_attachment(&self, a: &mut Attachment) -> Result<()> {
+        let r = self.reader.as_ref().expect("reader");
+        if a.shm.is_stale() {
+            let shm = a.shm.reattach(&self.shared.vfs, &r.file)?;
+            // The old slot's liveness byte is on this same file handle: give it up before
+            // claiming in the new generation (`ReaderSlot::abandon`).
+            a.pins.abandon();
+            let slot = claim_slot(
+                &shm,
+                self.shared.vfs.current_process(),
+                &r.file,
+                self.opened_in,
+            )?;
+            // Snapshots of the old generation leave the abandoned slot alone: they can no
+            // longer be read, so they must not hold this generation's pin back.
+            *a = Attachment {
+                row_cache: reader_row_cache(&self.options, &shm),
+                shm,
+                pins: crate::snapshot::ReaderPins::new(slot),
+            };
+            *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            // Start the new generation from the new writer's root.
+            r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
+        } else if !a.pins.slot().is_owned() {
+            // The slot was freed under this process (#834 review). Defensive since #693
+            // PR 3: the writer frees a slot only once it holds the slot's liveness lock,
+            // which this process holds until it drops the slot. If it happened anyway,
+            // the snapshots fail as expired and pinning there could overwrite another
+            // reader's pins: abandon it and claim a fresh slot.
+            a.pins.abandon();
+            a.pins = crate::snapshot::ReaderPins::new(claim_slot(
+                &a.shm,
+                self.shared.vfs.current_process(),
+                &r.file,
+                self.opened_in,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Where a change feed in this reader process reads from (D310 PR 4): the current
+    /// attachment (re-attached first if its writer is gone), and its views for blob values.
+    pub(crate) fn reader_feed_origin(self: &Arc<Self>) -> Result<crate::feed_reader::Origin> {
+        let r = self.reader.as_ref().expect("reader");
+        if pigeonhole_io::sys::process_id() != self.opened_in {
+            return Err(Error::Unsupported(FORKED_READER));
+        }
+        let shm = {
+            let mut guard = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
+            self.refresh_attachment(&mut guard)?;
+            guard.shm.clone()
+        };
+        let inner = Arc::clone(self);
+        let at = shm.clone();
+        Ok(crate::feed_reader::Origin {
+            shm,
+            writer: None,
+            view: Box::new(move || {
+                // `None` while the durable root names another manifest version: the record
+                // is being republished. Wait for it as a snapshot does.
+                let deadline = std::time::Instant::now() + READER_VIEW_WAIT;
+                loop {
+                    if at.is_stale() {
+                        return Err(Error::SnapshotExpired);
+                    }
+                    if let Some(view) = inner.reader_view(&at)? {
+                        return Ok(view);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Busy);
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }),
+        })
+    }
+
     fn reader_snapshot(&self, durable: bool) -> Result<Snapshot> {
         let r = self.reader.as_ref().expect("reader");
         // A forked child's copy of the reader takes no snapshot (and so claims no slot).
@@ -4797,41 +4918,7 @@ impl Inner {
         loop {
             let mut guard = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
             let a = &mut *guard;
-            if a.shm.is_stale() {
-                let shm = a.shm.reattach(&self.shared.vfs, &r.file)?;
-                // The old slot's liveness byte is on this same file handle: give it up before
-                // claiming in the new generation (`ReaderSlot::abandon`).
-                a.pins.abandon();
-                let slot = claim_slot(
-                    &shm,
-                    self.shared.vfs.current_process(),
-                    &r.file,
-                    self.opened_in,
-                )?;
-                // Snapshots of the old generation leave the abandoned slot alone: they can no
-                // longer be read, so they must not hold this generation's pin back.
-                *a = Attachment {
-                    row_cache: reader_row_cache(&self.options, &shm),
-                    shm,
-                    pins: crate::snapshot::ReaderPins::new(slot),
-                };
-                *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                // Start the new generation from the new writer's root.
-                r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
-            } else if !a.pins.slot().is_owned() {
-                // The slot was freed under this process (#834 review). Defensive since #693
-                // PR 3: the writer frees a slot only once it holds the slot's liveness lock,
-                // which this process holds until it drops the slot. If it happened anyway,
-                // the snapshots fail as expired and pinning there could overwrite another
-                // reader's pins: abandon it and claim a fresh slot.
-                a.pins.abandon();
-                a.pins = crate::snapshot::ReaderPins::new(claim_slot(
-                    &a.shm,
-                    self.shared.vfs.current_process(),
-                    &r.file,
-                    self.opened_in,
-                )?);
-            }
+            self.refresh_attachment(a)?;
             // The slot pins exactly what this reader's live snapshots need: this one's seqno
             // and view join them here, before the view is read (#693 PR 2).
             let (seqno, key) = a.pins.take(&a.shm, durable);
@@ -5526,6 +5613,17 @@ impl EngineShard {
         };
         self.engine.shared.drivers.enter(usize::from(d.shard().0));
         d.run_once(deadline_nanos)
+    }
+
+    /// Whether this shard's WAL segment header is held back behind its predecessor's sync
+    /// (an inspection helper for tests, D310 PR 4: a change feed polled in that window must
+    /// wait for the segment, not take the stream's readable end for its head).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn wal_header_held(&mut self) -> bool {
+        self.driver
+            .as_mut()
+            .is_some_and(|d| d.with_handler(|s, _| s.wal.as_ref().is_some_and(|w| w.header_held())))
     }
 
     /// How many messages this shard has handled and background slices it has run, in all

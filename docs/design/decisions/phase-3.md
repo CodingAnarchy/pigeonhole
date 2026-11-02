@@ -3916,7 +3916,11 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **The AX102 numbers** (1M documents of about 40 words, flush only, the mean of two runs):
   - **The owner's write-cost row:** positions cost +18% write time (136 → 160 µs a document) and +58% stored bytes (1,044 → 1,649 a document). That's well under the Mac's 2.5×, so positions stay on by default.
   - **Searches:** two terms 2.5 ms p50, two hub terms 44 ms, a rare phrase 0.28 ms, a phrase of two hub words 403 ms (#1334, Post-1.0).
-  - They're re-taken after #1332 (#1313's fix), in the pre-1.1.0 recheck.
+  - **Re-taken after #1332 (#1349, the pre-1.1.0 recheck):** a full compaction, with #1353, without #1350, the mean of two runs.
+    - **Compaction:** a full compaction takes 4–7 s. Search latency for terms and phrases matches the flush-only numbers, so phrase-hub's ~400 ms is the design's cost (#1334).
+    - **Writes:** positions cost +13% write time (139 → 157 µs) and +58% bytes.
+    - **Fuzzy, after #1353:** 1 edit 17 ms p50 (from 375), 2 edits 21 ms (from 406), prefix 2 15 ms.
+    - **A fuzzy term beside a common term:** 26 ms p50, but a 2.9 s p99: the common term's documents look up the fuzzy term's expansions. That's #1368 (lookups that advance; #1355's bound tightening was closed as not a lever), and #1363 is the converse.
 
 **PR 4.** Fuzzy terms, as rev 5 §4.4, with `levenshtein_automata` 0.2.1 (Damerau, with an adjacent transposition as one edit).
 - **The walk:** a `df`-only scan of the `P` rows from the fixed prefix. At a key the automaton rejects partway, it seeks to the smallest byte string above the key that the automaton hasn't rejected. A term whose `df` is 0 isn't an expansion.
@@ -4076,6 +4080,25 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `pigeonhole/tests/feed.rs`: a tool's plain open between two app sessions keeps the token (the shard count inherited too, three shards so no default matches); an explicit new shard count expires it; `change_feed_off()` ends it.
   - The unit test `the_last_session_is_inherited_until_an_open_turns_the_feed_off`.
 - **Companion change (d), cli692:** `phdb`'s read-only commands open read-only.
+
+**How PR 4 builds it** (reader processes; shm layout 8, the coordinator's numbers):
+- **One reader, two origins.** `FeedReader` reads the stream files and shared memory in both processes. The writer mirrors each stream's floor and checkpoint into shm (`FEED_FLOOR`, `FEED_CKPT`) through `FeedMarks`' `MarkMirror`, right after each store it mirrors (per retention pass and checkpoint, never per commit). A reader process takes the writer's session and fed tables from the sidecar's last session entry (written before the writer's shared memory exists), its attachment from `reader_feed_origin`, and its view for blob values from its own attachment.
+- **No head mark** (simp724 and the coordinator, after the deterministic test). The frontier never passes a record behind a held segment header: D200 hides such a group until a sync writes the header, and the feed's holds settle on `Wal::written`. So "every stream read to its readable end" is enough for M1. `it::feed_head` holds the header for real and pins this. If D200 ever showed such a group early, that test fails and a head mark comes back with a reason.
+- **Start positions in a reader process:**
+  - **`Now`:** each stream's checkpoint, loaded before the bound.
+  - **`After(seqno)`, `Oldest` and tokens:** the floor, skipping keys at or below the bound.
+  - **The lost bound** (simp724's B1): the writer mirrors its checkpoint history's bound at the floor (`oldest_bound`) as `FEED_BOUND`, stored before the floor it belongs to and raised at checkpoints. An `After(seqno)` below a stream's bound has lost history and expires, as the writer's `start_at` does, rather than skipping recycled commits. `Oldest` starts at the largest bound.
+- **A writer restart mid-poll** (simp724's B2): the poll re-checks the attachment after reading the streams, and before expiring on a record outside the history. A restart is then always `SnapshotExpired` (resubscribe), never a permanent gap. `HookSite::ReaderFeedReads` lets a test restart the writer in that window.
+- **Blob files newer than the view** (simp724's question): a value separated at commit time names a blob file the manifest committed before the commit was logged, which a reader process's lagging view may not list yet. The reader waits for a newer view, up to a second, before it takes the file as removed.
+- **A new writer with another shard count** mid-start makes `writer_session` return `SnapshotExpired` (simp724's nit).
+- **A writer restart (M2):** a stale attachment fails the poll with `SnapshotExpired`. The public `Feed` resubscribes from its own token on a fresh attachment, so a durable feed continues and a visible one that delivered what was lost expires.
+- **Waiting:** a bounded backoff, 50 µs doubling to 5 ms. The writer does no per-commit work for reader processes.
+- **A bug the model found in this PR:** `emit` took a commit before loading the view, and a reader process's view load can fail (`Busy` while republished, or a stale attachment), so a retry skipped the commit. The view is now loaded before anything is taken. A blob-read failure after the take ends the reader for good.
+- **Public API:** `ReadTable::feed()` and `FeedBuilder::read_table`.
+- **Tests:**
+  - `it/feed_reader_process.rs`: commit order across shards, a writer restart resumed from a token, and the refusals.
+  - `it/feed_head.rs`: the D200 dependency.
+  - `feed_model`: a durable and a visible subscriber in a reader process beside the writer's, plain and with deferred I/O. Clean reopens exercise the stale-attachment resubscribe; power losses reopen the reader too.
 
 <a id="d311"></a>
 ## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)

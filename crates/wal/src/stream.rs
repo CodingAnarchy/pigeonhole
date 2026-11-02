@@ -457,6 +457,19 @@ pub struct FeedMarks {
     floor: AtomicU32,
     retained_bytes: AtomicU64,
     checkpoint: AtomicU64,
+    /// Where the marks are published for other processes (D310 PR 4), once set.
+    mirror: std::sync::OnceLock<Box<dyn MarkMirror>>,
+}
+
+/// Publishes a stream's feed marks beyond this process (D310 PR 4: the engine's shared-memory
+/// region, for reader processes' change feeds). Each call follows the mark's own store, on
+/// the same thread and in the same place, so it keeps the mark's ordering: `checkpoint` once
+/// the checkpoint is unneeded. Called per retention pass and per checkpoint, never per record.
+pub trait MarkMirror: Send + Sync + fmt::Debug {
+    /// The floor rose to `epoch` (as [`FeedMarks::floor`]).
+    fn floor(&self, epoch: u32);
+    /// The checkpoint rose to `lsn` (as [`FeedMarks::checkpoint`]).
+    fn checkpoint(&self, lsn: Lsn);
 }
 
 impl FeedMarks {
@@ -493,6 +506,33 @@ impl FeedMarks {
 
     pub(crate) fn set_checkpoint(&self, at: Lsn) {
         self.checkpoint.fetch_max(at.0, Ordering::AcqRel);
+        if let Some(m) = self.mirror.get() {
+            m.checkpoint(self.checkpoint());
+        }
+    }
+
+    fn set_head(&self, epoch: u32) {
+        self.head.store(epoch, Ordering::Release);
+    }
+
+    fn raise_floor(&self, floor: u32) {
+        self.floor.fetch_max(floor, Ordering::AcqRel);
+        if let Some(m) = self.mirror.get() {
+            m.floor(self.floor());
+        }
+    }
+
+    /// Publishes the marks through `mirror` from now on, starting with their current values
+    /// (so nothing stored before it is missed). The first call wins; later ones are ignored.
+    /// Call it before the stream's shard runs: a store racing the first publication could
+    /// publish an older head after a newer one.
+    pub fn set_mirror(&self, mirror: Box<dyn MarkMirror>) {
+        if self.mirror.set(mirror).is_ok()
+            && let Some(m) = self.mirror.get()
+        {
+            m.floor(self.floor());
+            m.checkpoint(self.checkpoint());
+        }
     }
 }
 
@@ -1758,7 +1798,7 @@ impl WalStream {
             .map(|i| self.slots[i])
             .min();
         if let Some(floor) = floor {
-            self.marks.floor.fetch_max(floor, Ordering::AcqRel);
+            self.marks.raise_floor(floor);
         }
         let retained = (0..self.slots.len())
             .filter(|&i| self.is_retained(i))
@@ -1894,7 +1934,7 @@ impl WalStream {
                 .ok()
                 .flatten();
         }
-        self.marks.head.store(epoch, Ordering::Release);
+        self.marks.set_head(epoch);
         self.written_off = 0;
         self.enc = FrameEncoder::new(epoch, FRAME);
         self.buf.resize(FRAME_SIZE, 0);
@@ -2220,6 +2260,10 @@ impl Wal for WalStream {
         }
         self.update_retain_floor(max_age.map(|a| (now, a)));
         self.publish_recyclable();
+    }
+
+    fn header_held(&self) -> bool {
+        self.held_header().is_some()
     }
 
     fn feed_marks(&self) -> Option<Arc<FeedMarks>> {
