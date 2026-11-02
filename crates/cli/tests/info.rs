@@ -172,8 +172,8 @@ fn closed_pipe_is_not_an_error() {
 
 /// D310 amendment (d), ICR 0109: the commands that only read (`info`, `dump`, `backup`,
 /// `shell --read-only`) open read-only and write nothing, so running them between two of an
-/// application's fed opens leaves its change-feed token valid. A writable phdb open (the
-/// shell without `--read-only`) still ends it until D310 (c) inherits the feed.
+/// application's fed opens leaves its change-feed token valid. (A writable phdb open keeps
+/// it through D310 (c)'s inheritance: the next test.)
 #[test]
 fn read_only_commands_keep_an_applications_feed_token() {
     use std::time::Duration;

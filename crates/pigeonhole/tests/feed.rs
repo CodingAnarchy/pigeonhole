@@ -279,8 +279,6 @@ fn a_read_only_open_between_keeps_a_token() {
     db.close().unwrap();
 }
 
-/// Writes through an open with the feed off, then resumes `token`: it has expired, and stays
-/// so.
 /// Writes through an open with the feed turned off, then resumes `token`: it has expired,
 /// and stays so.
 fn expire_between(path: &Path, token: FeedToken) {

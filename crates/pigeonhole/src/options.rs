@@ -847,10 +847,16 @@ impl Options {
     /// [`ErrorCode::ReadOnly`](crate::ErrorCode::ReadOnly), and
     /// [`DatabaseInfo::read_only`](crate::DatabaseInfo::read_only) is true. It replays the
     /// write-ahead log into memory, so a log that doesn't fit
-    /// [`memtable_budget`](Self::memtable_budget) fails the open with `ReadOnly`. It still
-    /// holds the writer lock while open; to read while a writer runs, open a reader process
-    /// ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)). A missing file isn't
-    /// created, whatever [`create_if_missing`](Self::create_if_missing) says.
+    /// [`memtable_budget`](Self::memtable_budget) fails the open with `ReadOnly`. A missing
+    /// file isn't created, whatever [`create_if_missing`](Self::create_if_missing) says.
+    ///
+    /// **It is still a writer-process open in every other respect:**
+    /// - It takes the writer lock, which needs write access to the file, so it fails on a
+    ///   read-only file or mount.
+    /// - It excludes a running writer, failing with `WriterLocked` while one has the database
+    ///   open. To read beside a running writer, open a reader process
+    ///   ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)), as `phdb` does.
+    /// - It creates the writer's shared-memory region ([`shm_dir`](Self::shm_dir)).
     pub fn read_only(mut self, yes: bool) -> Self {
         self.read_only = yes;
         self

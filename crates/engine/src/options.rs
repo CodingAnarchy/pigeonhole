@@ -170,7 +170,8 @@ pub struct EngineOptions {
     /// Open read-only whatever the file needs (ICR 0109): the same open as
     /// `read_only_fallback` takes, which writes nothing to the database's files: no format
     /// upgrade, no change-feed session or root entries, no new WAL segment, no flush or
-    /// compaction, no clean-close commit. Reads only; writes fail with `ReadOnly`.
+    /// compaction, no clean-close commit. Reads only; writes fail with `ReadOnly`. It still
+    /// takes the writer lock (write access to the file) and creates the shared-memory region.
     pub read_only: bool,
     /// Accept a database on a FUSE filesystem (D173, #299): only for a local FUSE mount
     /// the user trusts (ntfs-3g, an encrypted home directory). FUSE byte-range locks may be

@@ -8,7 +8,11 @@
   - **Writes are refused:** writes, schema changes, `flush`, `compact` and `shrink` fail with `ReadOnly`, and `DatabaseInfo::read_only` is true.
   - **The replay must fit `memtable_budget`,** or the open fails with `ReadOnly`, as under the fallback.
   - **It never creates a file,** whatever `create_if_missing` says.
-  - **It still takes the writer lock:** one process at a time, as any writer-process open. To read while a writer runs, open a reader process.
+  - **It is still a writer-process open otherwise** (simp724 on #1347):
+    - It takes the writer lock, which needs write access to the file, so it fails on a read-only file or mount.
+    - It excludes a running writer (`WriterLocked`). phdb handles that case by opening a reader process.
+    - It creates the writer's shared-memory region.
+    - A true read-only open (a shared lock, no shared memory) for read-only media and backups is a separate, Post-1.0 issue (#1348).
 - **pigeonhole-engine** (internal, additive; `EngineOptions` is `#[non_exhaustive]`): `EngineOptions::read_only`. `Engine::open` starts with `no_writes` set, opens the pager read-only, skips the unknown-merge-operator refusal (as the fallback does), and never creates a missing file.
 - **phdb:** `info`, `dump`, `backup` and `shell --read-only` open with it when no writer runs (`open::for_inspect`). With a writer running they open a reader process, as before. The shell without `--read-only` and `mcp` still open writable.
 
