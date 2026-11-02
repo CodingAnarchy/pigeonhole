@@ -204,7 +204,9 @@ def test_a_column_of_several_versions_is_kept_whole(db):
             if page.resume is None or not page.rows:
                 break
             after = page.resume
-        if budget >= 400:
+        # Every column is under 3 × (2 + 119 + 16) + 4 = 415 bytes, so 1000 reads them all;
+        # a smaller budget can stop at an empty page before one that's too large.
+        if budget >= 1000:
             assert got == whole
 
 
