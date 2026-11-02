@@ -508,11 +508,13 @@ fn mismatched_layout_version_is_refused() {
     let (_lock, presence, shm) = db.open_writer(&file);
     shm.publish_view(&view(1, 1, 4)).unwrap();
 
-    // Pretend the live region was built by a build with another layout version.
+    // Pretend the live region was built by a build with another layout version: an older
+    // writer's (6, before D310's written watermark), which a reader must refuse cleanly
+    // rather than run a change feed with no hold on unwritten records.
     let (mapping, _, _) = shm.arena(0);
     mapping
         .atomic_u32(header::LAYOUT_VERSION)
-        .store(7, Ordering::Release);
+        .store(6, Ordering::Release);
     db.vfs
         .open_shared(
             &directory_name(db.identity.device, db.identity.inode),
@@ -522,12 +524,12 @@ fn mismatched_layout_version_is_refused() {
         )
         .unwrap()
         .atomic_u32(directory::LAYOUT_VERSION)
-        .store(7, Ordering::Release);
+        .store(6, Ordering::Release);
 
     let mut reader = Peer::spawn("reader", &db.path);
     let answer = reader.recv();
     assert!(
-        answer.starts_with("ERR VersionMismatch") && answer.contains("found: 7"),
+        answer.starts_with("ERR VersionMismatch") && answer.contains("found: 6"),
         "{answer}"
     );
     drop(reader);

@@ -140,6 +140,19 @@ pub mod watermark {
     /// sync has not returned; `u64::MAX` when idle. Durable snapshots read it, and
     /// [`CROSS_HELD`](super::header::CROSS_HELD).
     pub const DURABLE: usize = 8;
+    /// `u64` atomic (layout version 7, D310): the lowest seqno this shard holds whose WAL
+    /// record is not yet in its stream file, among the records the change feed needs (a
+    /// fed table's `Durability::None` commits, buffered until the lazy flush or a stronger
+    /// write); `u64::MAX` when it holds none. The change feed's frontier stays below it.
+    /// Stored before `PENDING` lets the seqno go, and lowered only there or under a hold
+    /// that still covers the seqno, so a reader that loads `PENDING` and then this (Acquire
+    /// both) never passes an unwritten record. Only a writer with the feed on stores
+    /// anything but `u64::MAX`.
+    pub const WRITTEN: usize = 16;
+    /// `u64` atomic (layout version 7, D310): as [`WRITTEN`], for records not yet synced:
+    /// a durable change feed stays below it, so it never delivers a `Durability::None`
+    /// change a power loss could still undo. `u64::MAX` when it holds none.
+    pub const SYNCED: usize = 24;
 }
 
 /// Byte offsets within a reader slot.
