@@ -210,11 +210,14 @@ pub(crate) fn for_inspect(cli: &Cli, path: &Path) -> Result<Db, Failure> {
     if cli.reader {
         return reader(cli, path).map(Db::Reader);
     }
-    match Pigeonhole::open(path, options(cli, path, false)
+    match Pigeonhole::open(
+        path,
+        options(cli, path, false)
             // A read-only open writes no feed session, so its shard count can't reshard:
             // one keeps phdb light (D-a: any count replays).
             .shards(1)
-            .read_only(true)) {
+            .read_only(true),
+    ) {
         Ok(db) => Ok(Db::Writer(db)),
         Err(e) if e.code() == ErrorCode::WriterLocked && !cli.writer => {
             reader(cli, path).map(Db::Reader)

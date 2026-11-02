@@ -95,8 +95,15 @@ pub struct EngineOptions {
     /// WAL segment configuration. Its change-feed fields (`retain_segments`,
     /// `feed_session`) are the engine's to set from `feed`; values set here are ignored.
     pub wal: WalOptions,
-    /// The change feed (D310): `None`, the default, feeds nothing.
+    /// The change feed (D310): `None`, the default, feeds nothing, unless `feed_inherit`.
     pub feed: Option<FeedOptions>,
+    /// With `feed` `None`: take the change feed's settings from the sidecar's last session
+    /// (its retention, age and fed tables), so an open that doesn't mention the feed continues
+    /// its history rather than ending it (D310's amendment, the owner, 2026-11-02). Off by
+    /// default here; `pigeonhole::Options` turns it on unless `change_feed_off()`. A last
+    /// open that recorded "fed: none", or no sidecar, means off as before. Independently, an
+    /// unset `shards` (0) takes the last session's stream count when there is one.
+    pub feed_inherit: bool,
     /// Bytes a shard's WAL stream may hold past its oldest record that is not yet in SSTs
     /// before the shard flushes the memtables that record (and the ones after it) wrote,
     /// however small they are (#137). Without it one write to a slot that is never written
@@ -264,6 +271,7 @@ impl EngineOptions {
             reader_slots: 128,
             wal: WalOptions::default(),
             feed: None,
+            feed_inherit: false,
             wal_pin_bytes: 0,
             tablet_split_bytes: 256 << 20,
             tablet_changes: true,
