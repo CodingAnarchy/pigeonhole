@@ -27,7 +27,12 @@ fn payload(data: &CellData) -> &[u8] {
 }
 
 fn typed(data: &CellData) -> Value<'_> {
-    match data.value() {
+    typed_value(data.value())
+}
+
+/// A decoded stored value as the read API types it (reads, and the change feed's values).
+pub(crate) fn typed_value(value: ValueRef<'_>) -> Value<'_> {
+    match value {
         ValueRef::Bytes(b) => Value::Bytes(b),
         ValueRef::I64(v) => Value::I64(v),
         ValueRef::F64(v) => Value::F64(v),

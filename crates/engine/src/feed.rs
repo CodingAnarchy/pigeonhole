@@ -441,7 +441,12 @@ impl Feed {
                     .iter()
                     .flatten()
                     .any(|m| self.tables.contains(m.table)),
-                Some(Err(_)) => false,
+                Some(Err(e)) => {
+                    // Admission decodes every batch before it can be appended (perf287 on
+                    // #1297): one that fails here never reaches the log.
+                    debug_assert!(false, "a batch admission decoded fails to decode: {e}");
+                    false
+                }
             },
         }
     }

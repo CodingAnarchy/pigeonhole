@@ -4003,3 +4003,20 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `it/feed_reader.rs` covers the start kinds, filtering, tokens across a reopen, expiry, and rule C both ways.
   - `wal/tests/feed_cursor.rs` covers the cursor, including a mid-segment hole: it stops where recovery did and then follows the next session's segment (Q2).
 
+**How PR 3b builds it** (pigeonhole's public API, additive; ICR 0106):
+- **Opening:** `Table::feed()` gives a `FeedBuilder`. `.table(&t)` adds tables to the same feed, `.prefix(..)` limits it to a row prefix, and `.visible()` opts out of the durable frontier. The start is the commits after `open()`, or `.from_snapshot(&s)` (after `s.seqno()`), `.from_oldest()` or `.resume(&token)`. `open()` refuses with `InvalidArgument` (feed off, table not fed, bad token) and `Unsupported` (a reader process, until PR 4). An expired start shows at the first `next`, so `open` never consumes a commit.
+- **`Feed`:**
+  - `next(timeout)` and `try_next()` lend `Option<&Commit>`, reused between calls;
+  - `token()` gives a `FeedToken`, whose bytes round-trip through `as_bytes` and `from_bytes`;
+  - `oldest_retained()` reports the oldest retained seqno after an expiry, when known.
+  - **An error ends the feed** (simp724 and cli692 on #1321). Every later call returns the same error, as an expired feed does. The engine reader has already moved past the commit it was delivering, so a retry would skip it. A value that doesn't decode is `Corruption`, never an empty value, and the token then points past that commit. Only the live engine's errors stick (cli692's S2, simp724): an error or an expiry from a reader whose engine a recovery replaced belongs to the superseded generation. The feed then follows the recovery and lets the new engine's reader decide from the token. The old reader, still waiting through the swap, reads the new session's records as outside its history, so its expiry is never the feed's.
+- **Types:**
+  - `Commit`: `seqno`, `timestamp`, `changes`.
+  - `Change`: `table` and `family` by name, `kind`, `row`, `qualifier`, `timestamp`, and `value()` as the read API's `Value` (`None` for deletes).
+  - `ChangeKind`: `Put`, `Merge`, `DeleteCell`, `DeleteColumn`, `DeleteFamily` (a row delete is one per family); `#[non_exhaustive]`.
+  - A family created after the feed opened is named from the current catalog.
+- **`ErrorCode::FeedExpired` = 31** (the coordinator's number). It is mapped in python as the `FeedExpired` exception class and listed in the `.pyi` stubs. The C ABI crate has no code table yet: its future enum takes the numbers from `ErrorCode`.
+- **Automatic recovery** (D265): a feed checks its engine generation on each call (one load). After a swap it resubscribes on the new engine from its own token, so a durable feed continues and a visible one that delivered lost commits expires. After `close()` it fails with `Closed`.
+- **perf287's `debug_assert`** (on #1297): `Feed::needs` asserts that a fed batch decodes. Admission decodes every batch first, so it holds today.
+- **Tests:** `pigeonhole/tests/feed.rs` covers named and typed changes of every kind, a cross-table commit arriving whole, a snapshot start, a token across a reopen, a prefix, the refusals, and expiry across a feed-off open. `tests/recovery.rs` has a durable feed following an automatic recovery, mutation-checked.
+
