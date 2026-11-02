@@ -92,8 +92,11 @@ pub struct EngineOptions {
     pub shm_dir: Option<PathBuf>,
     /// Reader slots in the shared-memory region.
     pub reader_slots: u32,
-    /// WAL segment configuration.
+    /// WAL segment configuration. Its change-feed fields (`retain_segments`,
+    /// `feed_session`) are the engine's to set from `feed`; values set here are ignored.
     pub wal: WalOptions,
+    /// The change feed (D310): `None`, the default, feeds nothing.
+    pub feed: Option<FeedOptions>,
     /// Bytes a shard's WAL stream may hold past its oldest record that is not yet in SSTs
     /// before the shard flushes the memtables that record (and the ones after it) wrote,
     /// however small they are (#137). Without it one write to a slot that is never written
@@ -255,6 +258,7 @@ impl EngineOptions {
             shm_dir: None,
             reader_slots: 128,
             wal: WalOptions::default(),
+            feed: None,
             wal_pin_bytes: 0,
             tablet_split_bytes: 256 << 20,
             tablet_changes: true,
@@ -280,4 +284,31 @@ impl EngineOptions {
             async_commit_bound: 0,
         }
     }
+}
+
+/// The change feed's configuration at open (D310, [`EngineOptions::feed`]).
+///
+/// With a feed, the WAL keeps `retention_bytes` (for the whole database, split evenly over
+/// the streams, at least two segments each) of history past the checkpoint, a clean close
+/// keeps the WAL files, blob GC keeps every blob file a retained record may point into, and
+/// the open records the session in the `<db>-feed` sidecar (FORMAT §10.4).
+///
+/// ```
+/// use pigeonhole_engine::FeedOptions;
+///
+/// let mut feed = FeedOptions::default();
+/// feed.retention_bytes = 1 << 30;
+/// feed.tables = Some(vec!["orders".to_owned()]);
+/// assert_eq!(feed.max_age_micros, None);
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FeedOptions {
+    /// Retained WAL history for the whole database, in bytes.
+    pub retention_bytes: u64,
+    /// History older than this (microseconds) is dropped even under the byte limit.
+    pub max_age_micros: Option<u64>,
+    /// The tables fed, by name; `None` feeds every table. Names are resolved at open: a name
+    /// with no table is refused.
+    pub tables: Option<Vec<String>>,
 }

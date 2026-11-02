@@ -460,7 +460,7 @@ Rules: family ids are unique across the database, so `(tablet, family)` names on
 
 ### 10.1 Files and segments
 
-Stream `N` of database `data.phdb` is the file `data.phdb-wal-N` (decimal `N`). Stream numbers are independent of shard numbers. A stream file is a sequence of equal-size **slots** (default 64 MiB, a multiple of 32 KiB, at most 4 GiB − 32 KiB so that `prev_end` always fits a `u32`; decision D43) at offsets `k x segment_size`. Slots are preallocated and recycled after checkpoint, never deleted while the database is open. Each use of a slot is a **segment** with its own **epoch** (u32), above the largest epoch in any segment header of the stream: one more at a rollover (rule 1), three more when a stream reopens after recovery (rule 2). So epochs never repeat, including the epochs of successors whose headers never reached the disk (decision D209).
+Stream `N` of database `data.phdb` is the file `data.phdb-wal-N` (decimal `N`). Stream numbers are independent of shard numbers. A stream file is a sequence of equal-size **slots** (default 64 MiB, a multiple of 32 KiB, at most 4 GiB − 32 KiB so that `prev_end` always fits a `u32`; decision D43) at offsets `k x segment_size`. Slots are preallocated and recycled after checkpoint, never deleted while the database is open. With the change feed on (D310, §10.4), a stream keeps its newest segments past the checkpoint as history (retained) and recycles a slot only once retention lets it go; a writer that finds no other slot ready takes the oldest retained one rather than wait, and a clean close keeps the files. Each use of a slot is a **segment** with its own **epoch** (u32), above the largest epoch in any segment header of the stream: one more at a rollover (rule 1), three more when a stream reopens after recovery (rule 2). So epochs never repeat, including the epochs of successors whose headers never reached the disk (decision D209).
 
 An **LSN** is `(epoch << 32) | offset_within_segment`. LSNs increase monotonically within a stream. The manifest records each stream's checkpoint LSN. **No checkpoint may name a stream whose file creation is not durable** (its file and directory syncs finished; decision D211): otherwise a power loss could take the file's name and leave the checkpoint to a stream the next open creates afresh, past that stream's first records.
 
@@ -494,7 +494,8 @@ Segment header (offset 0 of frame 0). From format 4 it is 128 bytes; a segment w
 | 52 | 4 | `prev_end` u32: offset where the predecessor's data ends |
 | 56 | 4 | `features` u32: the segment's feature bits (none defined, so 0). A reader refuses a segment with a bit it does not know (`UnsupportedFeature`) |
 | 60 | 16 | reserved for a per-database salt (#176), zero |
-| 76 | 48 | reserved |
+| 76 | 8 | `feed_session` u64 (D310): the change-feed session that wrote the segment, 0 for none (§10.4). Never checked by a reader: a build that does not know it accepts the segment and writes 0 in its own, which ends the feed's history, so it needs no `features` bit |
+| 84 | 40 | reserved |
 | 124 | 4 | `crc` u32: CRC32C of bytes 0..124 |
 
 Frames 1.. hold **fragments**. Fragment header (12 bytes):
@@ -539,6 +540,48 @@ The payload of a reassembled record:
 A **Commit** (type 3) is the decision as format version 2 (0.2.x, 0.3.x) wrote it: its Prepares carry the commit's own seqno and timestamp, and are applied at those. This build replays it; it writes only Decisions.
 
 A `Durability::None` commit's record is appended to the shard's in-memory stream buffer with no I/O of its own; the next `write()` or fsync, triggered by a stronger commit on the same stream, carries it to the file. So a stronger commit also makes every earlier `None` commit of its stream durable (the mixed-levels rule), and a `None` commit that no stronger commit follows survives nothing past the last flush.
+
+### 10.4 Feed sidecar
+
+The change feed's sidecar (D310), `data.phdb-feed` beside `data.phdb`. It isn't part of the main file or the WAL: builds that don't know the change feed never open it, and it needs no feature bit. Each writable open of a build that knows it appends one entry, and syncs it before writing any WAL segment:
+- a **Session** entry, from an open with the feed on (creating the file if it's missing, or replacing one whose header is another database's or damaged);
+- an **Unfed** entry, from an open with the feed off, only if the file exists.
+
+A feeding session then appends a **Root** entry after each root commit it makes (§8.2), including its close's. Root entries aren't synced: a lost one only makes the next comparison see a gap.
+
+Header (40 bytes):
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | magic `PHDBFEED` |
+| 8 | 4 | `version` u32 (1) |
+| 12 | 4 | reserved, zero |
+| 16 | 16 | `db_id` (must match the superblock) |
+| 32 | 4 | reserved, zero |
+| 36 | 4 | `crc` u32: CRC32C of bytes 0..36 |
+
+**Entries** follow the header, each framed as:
+- `len` u32;
+- `crc` u32: CRC32C of the payload;
+- `len` payload bytes. The first is the entry type; integers are little-endian.
+
+| Type | Byte 0 | Fields after the type byte |
+|---|---|---|
+| Session | `1` | `session` u64 (random, nonzero), `opened_at` u64 (the superblock `sequence` the open read, before any root commit of its own), `retention_bytes` u64, `retention_age_secs` u64 (0 = none), `streams` u32 (WAL streams, the shard count), `all_tables` u8 (1 = every table), `count` u32, then `count` × `table` u32 (zero when `all_tables` is 1) |
+| Root | `2` | `session` u64, `sequence` u64 (the new superblock's) |
+| Unfed | `3` | `sequence` u64 (the superblock `sequence` the open read) |
+
+**Torn and unknown entries:**
+- A reader stops at the first entry whose length runs past the file's end, whose length is zero, whose CRC fails, or whose payload doesn't decode.
+- A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one.
+- An entry type a reader doesn't know, with a valid CRC, comes from a newer build. It ends the history before it.
+
+**What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), and their `streams` must be equal.
+
+The history ends at any of these:
+- a segment marked 0, or marked by another session;
+- an Unfed entry;
+- a sequence gap, meaning another session, of any build, committed a root in between. Every open commits one, older builds too.
 
 ## 11. Shared-memory region
 
@@ -708,6 +751,7 @@ The writer fully writes a node, then links it bottom-up with Release stores to e
 - **Shared-memory layout version 2** adds each shard's `durable` watermark (§11.2, D227). A version 1 process cannot attach to a version 2 region, nor the reverse, so writer and reader processes must run builds with the same layout.
 - **Version 3** adds the WAL's Decision record (§10.3, D263, ICR 0046). A version 2 build (0.2.x, 0.3.x) would fail on it as corruption, and would skip a version 3 segment header as torn, dropping every record from there on. So a writable open of an older file first commits its current root twice (`OpenedPager::finish`), and both superblock pages carry version 3 before this build writes any WAL record; a version 2 build then refuses the file (`UnsupportedFormat(3)`) instead of falling back to the page it can still decode. A crash between the two commits leaves one older page naming the same root, and the next writable open finishes the upgrade. This build still reads version 1 and 2 files and replays their Commit records.
 - **Version 2** adds blob files (§7): separated values, `PutBlobFile`/`DropBlobFile` edits in use, and the `Blob` value tag in SSTs. A version 1 build (0.1.0) would read a blob pointer as an empty value, so every structure is now written with version 2 and a version 1 build refuses the file (version 2 also covers zstd blocks, codec 2 in §4.1, which a version 1 build cannot decode). This build still reads version 1 files; a file it writes to (any commit rewrites the superblock) is version 2 from then on.
+- **The change feed (D310, 1.1)** uses no feature bit and no version: it writes a session id into the WAL segment header's reserved bytes 76..84 (§10.2), which earlier format 4 builds accept, never check and write as 0, and keeps its sessions in the `-feed` sidecar (§10.4), which only builds that know the feed open. An older build's session ends the feed's history, by its zero marks and by the superblock `sequence` it moves; it cannot corrupt it. Golden files: `wal_segment_header_feed.bin`, `feed_sidecar.bin`.
 - Manifest edits and the properties block are length-delimited, so fields and edit tags can be added without breaking older readers within the same major format.
 - Block, filter, WAL record, value tag and key kind numbers are frozen; new variants take new numbers.
 - Golden files for every structure are frozen at 1.0 (format brief).
@@ -736,7 +780,7 @@ From 1.0.0 (D269):
 | SST (§5) | footer `flags` as per-SST feature bits; properties block fields appended (length-delimited); new block kinds |
 | Values and keys (§2, §3) | new value tags (0x04.., 0x81..) and key kinds, each behind an `incompat` bit |
 | Blocks (§4) | new compression codes (3..) and block kinds, behind an `incompat` bit |
-| WAL (§10) | segment header `features` bits and reserved bytes (the salt slot at 60..76); new record types behind an `incompat` bit |
+| WAL (§10) | segment header `features` bits and reserved bytes (the salt slot at 60..76; 84..124, after the feed session at 76..84); new record types behind an `incompat` bit |
 | Blob extents (§7) | reserved header bytes 20..56; new blob pointer tags behind a bit |
 
 ### 13.2 Paths for tracked features

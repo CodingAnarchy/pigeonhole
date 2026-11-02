@@ -890,6 +890,12 @@ pub(crate) fn begin(shared: &Shared) -> Option<Commit> {
             }
             Ok(own)
         });
+        // The change feed's blob horizon (D310): a drop of a file a retained WAL record may
+        // still point into is held instead.
+        let own = match &shared.feed {
+            Some(feed) => own.map(|own| feed.hold_drops(&catalog, own)),
+            None => own,
+        };
         match own {
             Ok(own) => {
                 let new_blobs = added_blobs(&catalog, &own);

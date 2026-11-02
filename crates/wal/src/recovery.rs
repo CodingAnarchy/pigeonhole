@@ -390,6 +390,7 @@ impl Recovery {
                     grid.segment_size,
                     opts.spare_segments,
                 );
+                s.configure_feed(&opts);
                 s.adopt(&epochs, max_epoch, checkpoint.epoch());
                 s.open_segment(end.epoch(), end.offset())?;
                 s
@@ -405,6 +406,7 @@ impl Recovery {
                     opts.segment_size,
                     opts.spare_segments,
                 );
+                s.configure_feed(&opts);
                 s.open_segment(0, 0)?;
                 s
             }

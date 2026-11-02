@@ -33,5 +33,7 @@ wal_segment_header_v3.bin 60 29f5fac990ee2963
 sealed_block_zstd.bin 205 6aba6fbd119aed6b
 values_vector.bin 30 8d4d81588fe7424e
 edit_put_family_vector.bin 60 1896c9629137eb63
+wal_segment_header_feed.bin 128 fd95d45f4f5ec21e
+feed_sidecar.bin 190 eccf796fb82e172b
 values_vector_half.bin 22 4fbba551c92de5da
 edit_put_family_vector_f16.bin 64 31cf5b488e9d740f

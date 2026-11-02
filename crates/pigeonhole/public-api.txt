@@ -280,6 +280,7 @@ pub pigeonhole::CrossShardMetrics::rounds: u64
 #[non_exhaustive] pub struct pigeonhole::DatabaseInfo
 pub pigeonhole::DatabaseInfo::db_id: [u8; 16]
 pub pigeonhole::DatabaseInfo::features: pigeonhole::FileFeatures
+pub pigeonhole::DatabaseInfo::feed: core::option::Option<pigeonhole::FeedInfo>
 pub pigeonhole::DatabaseInfo::file_bytes: u64
 pub pigeonhole::DatabaseInfo::format_version: u32
 pub pigeonhole::DatabaseInfo::free_bytes: core::option::Option<u64>
@@ -378,6 +379,16 @@ pub pigeonhole::FamilyStorage::levels: alloc::vec::Vec<pigeonhole::LevelInfo>
 impl pigeonhole::FamilyStorage
 pub fn pigeonhole::FamilyStorage::sst_bytes(&self) -> u64
 pub fn pigeonhole::FamilyStorage::ssts(&self) -> u64
+#[non_exhaustive] pub struct pigeonhole::FeedInfo
+pub pigeonhole::FeedInfo::held_blob_bytes: u64
+pub pigeonhole::FeedInfo::retained_wal_bytes: u64
+pub pigeonhole::FeedInfo::retention_bytes: u64
+#[non_exhaustive] pub struct pigeonhole::FeedRetention
+pub pigeonhole::FeedRetention::age: core::option::Option<core::time::Duration>
+pub pigeonhole::FeedRetention::bytes: u64
+impl pigeonhole::FeedRetention
+pub fn pigeonhole::FeedRetention::age(self, core::time::Duration) -> Self
+pub fn pigeonhole::FeedRetention::bytes(u64) -> Self
 #[non_exhaustive] pub struct pigeonhole::FileFeatures
 pub pigeonhole::FileFeatures::compat: u64
 pub pigeonhole::FileFeatures::incompat: u64
@@ -475,11 +486,13 @@ pub fn pigeonhole::Options::allow_fuse(self, bool) -> Self
 pub fn pigeonhole::Options::auto_recover(self, pigeonhole::Recovery) -> Self
 pub fn pigeonhole::Options::background_workers(self, usize) -> Self
 pub fn pigeonhole::Options::block_cache(self, usize) -> Self
+pub fn pigeonhole::Options::change_feed(self, pigeonhole::FeedRetention) -> Self
 pub fn pigeonhole::Options::compaction_cores(self, usize) -> Self
 pub fn pigeonhole::Options::cpu_profile(self, pigeonhole::CpuProfile) -> Self
 pub fn pigeonhole::Options::create_if_missing(self, bool) -> Self
 pub fn pigeonhole::Options::direct_io(self, bool) -> Self
 pub fn pigeonhole::Options::durability(self, pigeonhole::Durability) -> Self
+pub fn pigeonhole::Options::feed_tables<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
 pub fn pigeonhole::Options::io_backend(self, pigeonhole::IoBackend) -> Self
 pub fn pigeonhole::Options::memtable_budget(self, u64) -> Self
 pub fn pigeonhole::Options::merge_operator(self, alloc::rcs::arc::Arc<dyn pigeonhole::MergeOperator>) -> Self

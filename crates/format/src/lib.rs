@@ -21,6 +21,7 @@ pub mod cursor;
 pub mod distance;
 pub mod error;
 pub mod exact;
+pub mod feed;
 pub mod filter;
 pub mod half;
 pub mod hash;

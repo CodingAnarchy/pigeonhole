@@ -73,6 +73,50 @@ pub struct Options {
     background_workers: usize,
     cpu_profile: CpuProfile,
     auto_recover: Recovery,
+    change_feed: Option<FeedRetention>,
+    feed_tables: Option<Vec<String>>,
+}
+
+/// How much committed history the change feed keeps (D310, [`Options::change_feed`]).
+///
+/// The history is the write-ahead log itself: with a feed, the log keeps `bytes` of it past
+/// the point that is already in the main file, for the whole database, and recycles the
+/// oldest part beyond that. A writer never waits for the history: a write that would need
+/// to, drops the oldest part instead. What it costs on disk is retention × (WAL bytes + the
+/// bytes of overwritten large values, which their blob files keep for as long as a retained
+/// record may name them); [`DatabaseInfo::feed`](crate::DatabaseInfo::feed) reports both.
+///
+/// ```
+/// use std::time::Duration;
+/// use pigeonhole::{FeedRetention, Options};
+///
+/// let retention = FeedRetention::bytes(1 << 30).age(Duration::from_secs(3600));
+/// assert_eq!(retention.bytes, 1 << 30);
+/// let options = Options::default().change_feed(retention);
+/// # let _ = options;
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FeedRetention {
+    /// History to keep for the whole database, in bytes. Rounded up to whole WAL segments
+    /// (64 MiB) per shard, and at least two of them per shard.
+    pub bytes: u64,
+    /// History older than this is dropped even under `bytes`. `None`, the default, keeps it
+    /// until `bytes` pushes it out.
+    pub age: Option<Duration>,
+}
+
+impl FeedRetention {
+    /// Keeps `bytes` of history, with no age limit.
+    pub fn bytes(bytes: u64) -> Self {
+        Self { bytes, age: None }
+    }
+
+    /// Also drops history older than `age`.
+    pub fn age(mut self, age: Duration) -> Self {
+        self.age = Some(age);
+        self
+    }
 }
 
 /// Who the machine's (or container's) CPUs are for: how much of them the engine's threads
@@ -242,6 +286,8 @@ impl Default for Options {
             background_workers: 0,
             cpu_profile: CpuProfile::Embedded,
             auto_recover: Recovery::Off,
+            change_feed: None,
+            feed_tables: None,
         }
     }
 }
@@ -593,6 +639,31 @@ impl Options {
     /// Block cache capacity in bytes.
     pub fn block_cache(mut self, bytes: usize) -> Self {
         self.block_cache = Some(bytes);
+        self
+    }
+
+    /// Turns on the change feed's history (D310, off by default): the log keeps `retention`
+    /// of committed changes, a clean close keeps it, and the next open with the feed on
+    /// takes it up again without replaying it. Configured per open: an open without it
+    /// keeps no history, and the history a subscriber could resume from ends there. With a
+    /// feed, the database at rest is the main file plus its `-wal-N` files and the
+    /// `-feed` file beside it.
+    pub fn change_feed(mut self, retention: FeedRetention) -> Self {
+        self.change_feed = Some(retention);
+        self
+    }
+
+    /// The tables the change feed covers, by name (default: every table). Each must exist
+    /// when the database opens, and the feed must be on
+    /// ([`change_feed`](Self::change_feed)), or the open fails with
+    /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument). A table added to
+    /// the list later has history from that open on.
+    pub fn feed_tables<I, S>(mut self, tables: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.feed_tables = Some(tables.into_iter().map(Into::into).collect());
         self
     }
 
@@ -1610,6 +1681,23 @@ impl Options {
         if let Some(bytes) = self.wal_segment_size {
             o.wal.segment_size = bytes;
         }
+        o.feed = match (self.change_feed, &self.feed_tables) {
+            (Some(r), tables) => {
+                let mut f = pigeonhole_engine::FeedOptions::default();
+                f.retention_bytes = r.bytes;
+                f.max_age_micros = r
+                    .age
+                    .map(|a| u64::try_from(a.as_micros()).unwrap_or(u64::MAX));
+                f.tables.clone_from(tables);
+                Some(f)
+            }
+            (None, Some(_)) => {
+                return Err(pigeonhole_engine::Error::InvalidArgument(
+                    "feed_tables needs the change feed on (Options::change_feed)".into(),
+                ));
+            }
+            (None, None) => None,
+        };
         o.tablet_changes = self.tablet_changes;
         o.balance_pack = self.tablet_packing;
         if let Some(window) = self.commit_spin {
