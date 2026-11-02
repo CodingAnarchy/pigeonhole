@@ -2774,6 +2774,8 @@ impl ShardState {
                 last,
                 busy,
                 true,
+                // A cleanup is no full compaction: `None` below means busy inputs only.
+                false,
                 self.shared.picker.target_sst_bytes,
                 // Rewritten anyway: it holds rows outside the tablet.
                 |_| false,
