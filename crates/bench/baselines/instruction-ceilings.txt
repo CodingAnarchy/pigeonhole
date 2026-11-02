@@ -218,6 +218,12 @@
 # each the head's count (run 41381538777, 2ca0d6c6) times (1 + 0.3%): scan-budget 3332
 # (+0.1% on the base's 3328: the scan passes its row limit to the reducer) and
 # scan-budget-twin 1369 (equal to the base).
+#
+# New shapes for #1304 (#1263; D303's half-precision families, D193: every shape has a
+# ceiling), each the head's count (run 41395578924, ef73f7d6) times (1 + 0.3%): knn-exact-f16
+# 2504 and knn-exact-bf16 1687. Their per-cell figures include reading half the bytes of
+# knn-exact's vectors, not only the widening kernels (perf287 on #1304): bf16 widens with a
+# shift and lands below knn-exact; f16's branch-free widening costs more than the read saves.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
@@ -256,3 +262,5 @@ knn-exact 1696 0.3
 knn-filtered 3400 0.3
 scan-budget 3342 0.3
 scan-budget-twin 1374 0.3
+knn-exact-f16 2512 0.3
+knn-exact-bf16 1693 0.3
