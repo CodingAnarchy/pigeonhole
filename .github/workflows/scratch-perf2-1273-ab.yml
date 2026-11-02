@@ -1,0 +1,74 @@
+# #1273: are callgrind counts identical across runs of one commit with fixed seeds? Every
+# shape 5 times for each revision in ab-revs.txt (main first, random seeds; then the head).
+# Not for main; the branch is deleted after.
+name: scratch perf2 1273 repeats
+on:
+  push:
+    branches: [scratch/perf2-1273-ab]
+permissions:
+  contents: read
+env:
+  PIGEONHOLE_IO: pread
+  EXAMPLES: hotrow readshapes writepath ycsb scanrate
+  SHAPES: >-
+    readshapes:get-mem,get-sst,get-miss,row,scan,scan-filtered,versions,counter,rows,level-scans,short-scans,scan-interleaved,wide-row-cells,wide-row-pages,multi-get-dense,multi-get-sparse,knn-exact,knn-filtered
+    writepath:commit-one,commit-sixteen,commit-overwrite,commit-at,commit-async,flush,compact
+    ycsb:ycsb-c,ycsb-a
+    scanrate:scan-narrow,scan-small,scan-wide,scan-narrow-q1,scan-wide-q10,scan-wide-q1
+jobs:
+  repeats:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build every revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          flags=(); for e in $EXAMPLES; do flags+=(--example "$e"); done
+          n=0
+          while read -r rev; do
+            [ -z "$rev" ] && continue
+            git worktree add -q "/tmp/src$n" "$rev"
+            cp crates/bench/examples/*.rs "/tmp/src$n/crates/bench/examples/"
+            cp -R crates/bench/examples/support "/tmp/src$n/crates/bench/examples/"
+            (cd "/tmp/src$n" && cargo build -q --release -p pigeonhole-bench "${flags[@]}" --target-dir /tmp/target)
+            mkdir -p "/tmp/bin$n"; for e in $EXAMPLES; do cp "/tmp/target/release/examples/$e" "/tmp/bin$n/"; done
+            echo "$n $rev" >> /tmp/revs.txt; n=$((n+1))
+          done < ab-revs.txt
+      - name: count every revision, 5 times
+        shell: bash
+        run: |
+          set -euo pipefail
+          while read -r n rev; do
+            for k in 1 2 3 4 5; do
+              groups=(); for g in $SHAPES; do groups+=("/tmp/bin$n/$g"); done
+              scripts/instructions-per-cell.sh "/tmp/bin$n/hotrow" "${groups[@]}" > "/tmp/count$n-$k.txt"
+            done
+          done < /tmp/revs.txt
+          mkdir -p counts; cp /tmp/count*.txt /tmp/revs.txt counts/
+          python3 - <<'PYX' | tee -a "$GITHUB_STEP_SUMMARY"
+          revs = [l.split() for l in open('/tmp/revs.txt')]
+          runs = {n: [dict(l.split()[:2] for l in open(f'/tmp/count{n}-{k}.txt') if l.strip()) for k in range(1, 6)] for n, _ in revs}
+          print('### Instructions per unit, 5 runs each\n')
+          print('| shape | ' + ' | '.join(f'{r[:8]} runs | spread' for _, r in revs) + ' |')
+          print('|---|' + '---|--:|' * len(revs))
+          for shape in runs[revs[0][0]][0]:
+              row = []
+              for n, _ in revs:
+                  vals = [r.get(shape, '-') for r in runs[n]]
+                  try:
+                      f = [float(v) for v in vals]; spread = f'{max(f) - min(f):g}'
+                  except ValueError:
+                      spread = '?'
+                  row += [' '.join(vals), spread]
+              print(f'| {shape} | ' + ' | '.join(row) + ' |')
+          PYX
+      - uses: actions/upload-artifact@v4
+        with:
+          name: counts
+          path: counts/
