@@ -37,10 +37,14 @@
   - `ShmRegion::written_seqno(durable)`.
 - **pigeonhole-engine** (additive):
   - `Engine::feed_frontier(durable)`;
+  - `Engine::feed_background_syncs()`;
+  - `FeedOptions::sync_interval_micros`;
   - `Wal::write`'s doc states the M1 invariant.
 
+- **pigeonhole** (semver, additive; `FeedRetention` is unreleased and `non_exhaustive`): `FeedRetention::sync_interval` (field and builder).
+
 **Callers:**
-- the shard's commit path (`run_group`, `decide_share`), `publish_watermark` and the lazy flush;
+- the shard's commit path (`run_group`, `decide_share`), `publish_watermark`, the lazy flush and the background sync;
 - `crates/engine/tests/it/feed_written.rs`, and the shm and format tests.
 
 ## Later PRs

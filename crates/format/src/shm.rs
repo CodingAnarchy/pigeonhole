@@ -149,9 +149,10 @@ pub mod watermark {
     /// both) never passes an unwritten record. Only a writer with the feed on stores
     /// anything but `u64::MAX`.
     pub const WRITTEN: usize = 16;
-    /// `u64` atomic (layout version 7, D310): as [`WRITTEN`], for records not yet synced:
-    /// a durable change feed stays below it, so it never delivers a `Durability::None`
-    /// change a power loss could still undo. `u64::MAX` when it holds none.
+    /// `u64` atomic (layout version 7, D310): the lowest seqno this shard holds whose fed
+    /// record no sync covers yet (`Durability::None` and `Buffered`), stored as
+    /// [`WRITTEN`] is: a durable change feed stays below it, so it never delivers a change
+    /// a power loss could still undo. `u64::MAX` when it holds none.
     pub const SYNCED: usize = 24;
 }
 

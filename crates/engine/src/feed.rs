@@ -184,6 +184,9 @@ pub(crate) fn open_session(
     let sidecar = open_sidecar(vfs, path, db_id, &entry, true)?
         .ok_or_else(|| Error::Corruption("the feed sidecar could not be created".into()))?;
     let mut feed = Feed::new(session, retain, cfg.max_age_micros, tables, shards);
+    if let Some(us) = cfg.sync_interval_micros {
+        feed.sync_interval_nanos = us.saturating_mul(1_000).max(1);
+    }
     feed.retention_bytes = u64::from(retain) * segment * streams;
     if feed.retention_bytes > cfg.retention_bytes {
         crate::shard::trace!(
@@ -198,6 +201,16 @@ pub(crate) fn open_session(
 
 /// The lazy flush's interval, *T* (D310 §2.3): 10 ms.
 const FLUSH_INTERVAL_NANOS: u64 = 10_000_000;
+
+/// The background sync's default interval, *T_sync* (D310; simp724's M1 and perf287's
+/// review on #1297): 100 ms, and 1 s on macOS, where `F_FULLFSYNC` is device-wide and
+/// takes milliseconds. A durable feed on fed `Buffered` or `None` tables nothing else syncs
+/// lags by about this plus a sync.
+const SYNC_INTERVAL_NANOS: u64 = if cfg!(target_os = "macos") {
+    1_000_000_000
+} else {
+    100_000_000
+};
 
 /// The fewest segments a stream retains with the feed on (D310 §2.1).
 const MIN_RETAINED: u64 = 2;
@@ -238,6 +251,9 @@ pub(crate) struct Feed {
     pub tables: FeedTables,
     /// The lazy flush's interval for fed `Durability::None` records (D310 §2.3, *T*).
     pub flush_interval_nanos: u64,
+    /// The background sync's interval for fed records no sync of their group covered
+    /// (`None` and `Buffered`; *T_sync*, simp724's M1 on #1297).
+    pub sync_interval_nanos: u64,
     /// Each stream's feed marks, set as its stream opens.
     marks: Vec<OnceLock<Arc<FeedMarks>>>,
     held: Mutex<Held>,
@@ -261,6 +277,7 @@ impl Feed {
             age_micros,
             tables,
             flush_interval_nanos: FLUSH_INTERVAL_NANOS,
+            sync_interval_nanos: SYNC_INTERVAL_NANOS,
             marks: (0..streams).map(|_| OnceLock::new()).collect(),
             held: Mutex::default(),
             held_bytes: AtomicU64::new(0),
@@ -269,7 +286,7 @@ impl Feed {
     }
 
     /// Whether the feed needs `record` (D310): a batch or PREPARE that writes a fed table,
-    /// or a decision (whose shares may).
+    /// or a decision (whose shares may). Only asked of `None` and `Buffered` records.
     pub(crate) fn needs(&self, record: &pigeonhole_format::wal::WalRecord<'_>) -> bool {
         use pigeonhole_format::wal::WalRecord;
         match record {
