@@ -599,6 +599,118 @@ fn traverse_follows_edges_hop_by_hop() {
     assert_eq!(status, 0, "{err}");
 }
 
+/// #1254: a traversal's cursors page from the server's cached result, so writes between
+/// pages change nothing: every node of the first result comes back exactly once, and none
+/// added later. (Re-running the traversal, as before, would shift indexes: the edges added
+/// below sort among the first page's nodes, so the next page would repeat one.) A cursor
+/// whose run isn't cached any more (another traversal ran) runs it again.
+#[test]
+fn traverse_pages_come_from_one_cached_result() {
+    let dir = TempDir::new("mcp-traverse-cache");
+    let mut s = Server::start(&db_path(&dir), &["--create", "--max-result-bytes", "200"]);
+    s.call("create_table", json!({"table": "g", "families": ["out"]}));
+    let edge = |b: &str| {
+        json!({"op": "put", "table": "g", "row": "n:hub", "family": "out",
+               "qualifier": format!("n:{b}"), "value": ""})
+    };
+    let ops: Vec<Value> = (0..60).map(|i| edge(&format!("{:03}", i * 10))).collect();
+    s.call("write", json!({"ops": ops}));
+    let want: Vec<String> = (0..60).map(|i| format!("n:{:03}", i * 10)).collect();
+    let args = json!({"table": "g", "family": "out", "seeds": ["n:hub"]});
+
+    let first = s.call("traverse", args.clone());
+    let mut got: Vec<String> = first["hops"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_owned())
+        .collect();
+    let mut cursor = first["cursor"].clone();
+    assert!(cursor.is_string(), "{first}");
+    let mut wrote = 0;
+    while cursor.is_string() {
+        // A writer adds an edge that sorts before the next page's first node.
+        let ops: Vec<Value> = (0..3)
+            .map(|j| edge(&format!("{:03}", wrote * 3 + j + 1)))
+            .collect();
+        s.call("write", json!({"ops": ops}));
+        wrote += 1;
+        let mut next = args.clone();
+        next["cursor"] = cursor;
+        let page = s.call("traverse", next);
+        got.extend(
+            page["hops"][0]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_owned()),
+        );
+        cursor = page.get("cursor").cloned().unwrap_or(Value::Null);
+        assert!(wrote < 100, "cursors never end");
+    }
+    assert!(wrote > 1, "the result fit one page");
+    assert_eq!(
+        got, want,
+        "every node of the first result once, none added later"
+    );
+
+    // A traversal that fits one result leaves the cache alone; one that returns a cursor
+    // replaces it, and then an old cursor runs its traversal again, as cursors did before
+    // the cache: it sees an edge added since its first page.
+    let second = s.call("traverse", args.clone());
+    let stale = second["cursor"].clone();
+    let counted = second["hops"][0]["node_count"].as_u64().unwrap();
+    s.call("write", json!({"ops": [edge("999")]}));
+    s.call(
+        "traverse",
+        json!({"table": "g", "family": "out", "seeds": ["n:000"]}),
+    );
+    let mut cached = args.clone();
+    cached["cursor"] = stale.clone();
+    let page = s.call("traverse", cached);
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(counted),
+        "{page}"
+    );
+    let other = s.call(
+        "traverse",
+        json!({"table": "g", "family": "out", "seeds": ["n:hub"], "per_node_limit": 1000}),
+    );
+    assert!(other["cursor"].is_string(), "{other}");
+    let mut again = args.clone();
+    again["cursor"] = stale;
+    let page = s.call("traverse", again);
+    assert!(
+        page["hops"][0]["first_index"].as_u64().unwrap() > 0,
+        "{page}"
+    );
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(counted + 1),
+        "the re-run sees the edge added since: {page}"
+    );
+    // The same call run again caches a newer run: a cursor from the older run doesn't
+    // page from it (it carries its run id) but runs again, seeing what's newer still.
+    let older = s.call("traverse", args.clone());
+    let older_cursor = older["cursor"].clone();
+    let base = older["hops"][0]["node_count"].as_u64().unwrap();
+    s.call("write", json!({"ops": [edge("998")]}));
+    let newer = s.call("traverse", args.clone());
+    assert_eq!(newer["hops"][0]["node_count"].as_u64(), Some(base + 1));
+    s.call("write", json!({"ops": [edge("997")]}));
+    let mut again = args.clone();
+    again["cursor"] = older_cursor;
+    let page = s.call("traverse", again);
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(base + 2),
+        "an older run's cursor runs again, not from the newer run's cache: {page}"
+    );
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
 #[test]
 fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     let dir = TempDir::new("mcp-reader");
@@ -612,12 +724,14 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     assert_eq!(status, 4, "{err}");
     assert!(err.contains("NoWriter") || err.contains("writer"), "{err}");
 
+    // The writer feeds (D310), so the reader serves feed_poll too (#1361).
     let db = Pigeonhole::open(
         &path,
         Options::default()
             .shards(1)
             .pin_threads(false)
-            .create_if_missing(true),
+            .create_if_missing(true)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
     )
     .unwrap();
     let t = db
@@ -630,8 +744,18 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     let mut s = Server::start(&path, &["--read-only"]);
     assert_eq!(
         s.tool_names(),
-        ["list_tables", "read_row", "scan", "traverse"]
+        ["list_tables", "read_row", "scan", "traverse", "feed_poll"]
     );
+    // A reader process follows the writer's feed: a first poll's token, then the writer's
+    // next commit arrives from it.
+    let first = s.call("feed_poll", json!({"tables": ["t"]}));
+    assert_eq!(first["commits"], json!([]), "{first}");
+    t.mutate(b"fed").put("f", b"q", b"x").commit().unwrap();
+    let fed = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": first["token"], "wait_ms": 5000}),
+    );
+    assert_eq!(fed["commits"][0]["changes"][0]["row"], "fed", "{fed}");
     let tables = s.call("list_tables", json!({}));
     assert_eq!(tables["mode"], "reader");
     assert_eq!(tables["writable"], false);
@@ -654,10 +778,13 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     db.close().unwrap();
 
     // Without --read-only, phdb mcp beside a running writer is a reader too, with no write
-    // tools.
+    // tools (feed_poll is listed on any reader open, #1361).
     let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
     let mut s = Server::start(&path, &[]);
-    assert_eq!(s.tool_names().len(), 4);
+    assert_eq!(
+        s.tool_names(),
+        ["list_tables", "read_row", "scan", "traverse", "feed_poll"]
+    );
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
     db.close().unwrap();
@@ -725,6 +852,12 @@ fn vector_families_read_and_write_in_dump_shapes() {
     );
     let err = s.fail("write", put(json!([1.0, 0.0]), 2));
     assert!(err.to_string().contains("f32[4]"), "{err}");
+    // Under cosine, an all-zero query is the agent's mistake, refused before the search.
+    let err = s.fail(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.0, 0.0, 0.0, 0.0]}),
+    );
+    assert!(err.to_string().contains("no direction"), "{err}");
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
 }
@@ -835,6 +968,7 @@ fn nearest_ranks_vectors_under_the_selection() {
             "not two of them",
         ),
         (json!({"query": [1.0, 0.0], "k": 0}), "k:"),
+        (json!({"query": [1e30, 0.0]}), "2^56"),
     ] {
         let mut call = json!({"table": "docs", "family": "emb"});
         for (k, v) in args.as_object().unwrap() {
@@ -856,6 +990,117 @@ fn nearest_ranks_vectors_under_the_selection() {
     let kept = rows(&cut);
     assert!(!kept.is_empty() && kept.len() < 3, "{cut}");
     assert_eq!(kept[0], "b");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
+/// `feed_poll` (#1322): listed when the database's feed is on (`--change-feed`, or inherited
+/// from the last open, D310 amendment (c)); whole commits in order after a token, the next
+/// token continuing exactly; `max_commits` with `more`; and a token whose history an open
+/// with the feed off ended is a `FeedExpired` tool error.
+#[test]
+fn feed_poll_continues_from_its_token_and_reports_expiry() {
+    let dir = TempDir::new("mcp-feed");
+    let path = db_path(&dir);
+    let feed = ["--change-feed", "16777216"];
+    let mut s = Server::start(&path, &["--create", feed[0], feed[1]]);
+    assert!(s.tool_names().contains(&"feed_poll".to_owned()));
+    s.call(
+        "create_table",
+        json!({"table": "t", "families": ["f", {"name": "n", "aggregation": "sum"}]}),
+    );
+    let first = s.call("feed_poll", json!({"tables": ["t"]}));
+    assert_eq!(first["commits"], json!([]), "{first}");
+    let t0 = first["token"].clone();
+    let put = |row: &str| {
+        json!({"ops": [{"op": "put", "table": "t", "row": row, "family": "f",
+                        "qualifier": "q", "value": "v"}]})
+    };
+    s.call("write", put("r1"));
+    s.call(
+        "write",
+        json!({"ops": [
+            {"op": "incr", "table": "t", "row": "r1", "family": "n", "qualifier": "c", "value": 2},
+            {"op": "delete", "table": "t", "row": "r1", "family": "f", "qualifier": "q"},
+        ]}),
+    );
+    let got = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": t0, "wait_ms": 5000}),
+    );
+    let commits = got["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{got}");
+    assert_eq!(
+        commits[0]["changes"],
+        json!([{"table": "t", "family": "f", "kind": "put", "row": "r1", "qualifier": "q",
+                "ts": commits[0]["changes"][0]["ts"], "value": "v"}])
+    );
+    let kinds: Vec<&str> = commits[1]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["merge", "delete_column"], "{got}");
+    assert!(commits[1]["changes"][1].get("value").is_none());
+    assert!(commits[1]["seqno"].as_u64() > commits[0]["seqno"].as_u64());
+    let t1 = got["token"].clone();
+    // The token continues exactly: nothing new yet.
+    let again = s.call("feed_poll", json!({"tables": ["t"], "token": t1}));
+    assert_eq!(again["commits"], json!([]), "{again}");
+    // max_commits, with `more`, and the token after the last returned.
+    for r in ["a", "b", "c"] {
+        s.call("write", put(r));
+    }
+    let two = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": t1, "max_commits": 2, "wait_ms": 5000}),
+    );
+    assert_eq!(two["commits"].as_array().unwrap().len(), 2, "{two}");
+    assert_eq!(two["more"], true, "{two}");
+    let rest = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": two["token"], "wait_ms": 5000}),
+    );
+    assert_eq!(rest["commits"].as_array().unwrap().len(), 1, "{rest}");
+    assert_eq!(rest["commits"][0]["changes"][0]["row"], "c");
+    assert!(rest.get("more").is_none());
+    let kept = rest["token"].clone();
+    // Refusals.
+    let err = s.fail("feed_poll", json!({"tables": ["t"], "token": "!!"}));
+    assert!(err.to_string().contains("token"), "{err}");
+    let err = s.fail(
+        "feed_poll",
+        json!({"tables": ["t"], "token": kept, "from_oldest": true}),
+    );
+    assert!(err.to_string().contains("not both"), "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // A server without --change-feed inherits the feed the last open had: listed, and the
+    // token continues.
+    let mut s = Server::start(&path, &[]);
+    assert!(s.tool_names().contains(&"feed_poll".to_owned()));
+    let same = s.call("feed_poll", json!({"tables": ["t"], "token": kept}));
+    assert_eq!(same["commits"], json!([]), "{same}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // An open that turns the feed off ends its history: the token expired.
+    Pigeonhole::open(
+        &path,
+        Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .change_feed_off(),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let mut s = Server::start(&path, &feed);
+    let err = s.fail("feed_poll", json!({"tables": ["t"], "token": kept}));
+    assert_eq!(err["code"], "FeedExpired", "{err}");
+    assert_eq!(err["code_num"], 31, "{err}");
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
 }

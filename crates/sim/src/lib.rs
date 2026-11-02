@@ -37,4 +37,4 @@ pub use streams::{
     CommitStreams, StreamCommit, StreamRecord, check_acknowledged_survive, commit_records,
     recovered_commits, recovered_from_records, stream_lengths,
 };
-pub use workload::{Op, Workload, WorkloadSpec};
+pub use workload::{Op, VECTOR_DIM, Workload, WorkloadSpec, vector_components, vector_value};

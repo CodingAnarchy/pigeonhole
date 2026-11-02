@@ -911,6 +911,64 @@ impl Table {
         )
     }
 
+    /// Subscribes to this table's committed changes (the change feed, D310): a `Feed` of
+    /// whole commits, once each, in commit order. The database's change feed must be on, set
+    /// with `change_feed=` or inherited from the last open, and follow this table. A reader
+    /// process's table (`Reader.table(...)`) feeds too, from the running writer's history.
+    ///
+    /// `tables` adds more tables to the same feed (a commit across them arrives whole),
+    /// `prefix` keeps only changes to rows under it, and `visible=True` delivers a commit as
+    /// soon as reads see it rather than once it is durable. The feed starts after this call,
+    /// or after the commits `from_snapshot` sees, or at the oldest history kept
+    /// (`from_oldest=True`), or after a stored `resume` token (`Feed.token()`'s bytes).
+    #[pyo3(signature = (*, tables=None, prefix=None, visible=false, from_snapshot=None, from_oldest=false, resume=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn feed(
+        &self,
+        py: Python<'_>,
+        tables: Option<Vec<Bound<'_, Table>>>,
+        prefix: Option<&Bound<'_, PyAny>>,
+        visible: bool,
+        from_snapshot: Option<&Bound<'_, Snapshot>>,
+        from_oldest: bool,
+        resume: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<crate::feed::Feed> {
+        let starts = usize::from(from_snapshot.is_some())
+            + usize::from(from_oldest)
+            + usize::from(resume.is_some());
+        if starts > 1 {
+            return Err(PyValueError::new_err(
+                "one of from_snapshot, from_oldest and resume, not several",
+            ));
+        }
+        // A reader process's table feeds from the writer's shared history (D310 PR 4, #1361).
+        let mut b = either!(&self.0, |t| t.feed());
+        for other in tables.iter().flatten() {
+            b = match &other.get().0 {
+                Handle::Writer(t) => b.table(t),
+                Handle::Reader(t) => b.read_table(t),
+            };
+        }
+        if let Some(p) = prefix {
+            b = b.prefix(&convert::bytes(p)?);
+        }
+        if visible {
+            b = b.visible();
+        }
+        if let Some(s) = snapshot_arg(from_snapshot)? {
+            b = b.from_snapshot(&s);
+        }
+        if from_oldest {
+            b = b.from_oldest();
+        }
+        if let Some(r) = resume {
+            b = b.resume(&pigeonhole::FeedToken::from_bytes(convert::bytes(r)?));
+        }
+        py.detach(move || b.open())
+            .or_py()
+            .map(crate::feed::Feed::new)
+    }
+
     /// A wide row's pages, at most `size` cells each (a column's versions never split), each
     /// read when it is asked for; `after` resumes after an earlier walk's `position`.
     #[pyo3(signature = (row, size, *, families=None, qualifier_prefix=None, versions=1, snapshot=None, after=None))]

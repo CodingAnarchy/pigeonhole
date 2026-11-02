@@ -150,6 +150,11 @@ pub(crate) enum Command {
         /// length (a read may ask for more, up to `--max-result-bytes`).
         #[arg(long, value_name = "BYTES", default_value_t = 4 << 10)]
         max_value_bytes: usize,
+        /// Turn the change feed on, keeping up to this many bytes of history (and serve
+        /// `feed_poll`). Without it, a database whose application feeds keeps its feed, which
+        /// `feed_poll` serves too: phdb's open inherits it.
+        #[arg(long, value_name = "BYTES", conflicts_with = "read_only")]
+        change_feed: Option<u64>,
     },
 }
 

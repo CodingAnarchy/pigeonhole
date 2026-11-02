@@ -82,7 +82,7 @@ use std::sync::atomic::AtomicBool;
 use pigeonhole_format::{Seqno, ShmLayoutVersion};
 use pigeonhole_io::{FileRef, ProcessId};
 
-pub use region::{RowEpochTable, ShmRegion};
+pub use region::{FeedMarksView, RowEpochTable, ShmRegion};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;

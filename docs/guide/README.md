@@ -26,6 +26,7 @@ This guide is for people and agents **using** Pigeonhole in their own projects. 
 17. [Python](python.md): the `pigeonhole-db` bindings (`import pigeonhole`): values and types, reads and scans, batches and transactions, vectors, graphs, readers and threads, errors, and the per-call overhead.
 18. [Vectors](vectors.md): vector families, exact nearest-neighbour search (`nearest_*`), and the `pigeonhole-vector` IVF index: recall against latency on SIFT1M, sizing the block cache, bulk loading and who rebalances.
 19. [Full-text search](text-search.md): `pigeonhole-text`'s BM25 index over a source column: writing through the index in your transaction, the query syntax, phrases and slop, normalisation and options, namespaces with `id_prefix`, reader processes, and search latency on the AX102.
+20. [Agent memory](agent-memory.md): `pigeonhole-memory`'s long-term memory for agents: namespaces, a pinned embedding model, writes in transactions with exact dedup, links and supersede, and hybrid recall (vector, keyword, recency) fused by RRF within a byte budget, in reader processes too.
 
 Multi-process readers have their own page, [Reader processes](readers.md); [Concepts](concepts.md#multi-process-readers) has the overview.
 

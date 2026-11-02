@@ -20,8 +20,9 @@ pub(crate) enum Cursor {
     Row(Vec<u8>),
     /// `scan`: at this row key, or after it.
     Scan { key: Vec<u8>, inclusive: bool },
-    /// `traverse`: this hop's node at this index.
-    Traverse { hop: u32, index: u64 },
+    /// `traverse`: this hop's node at this index, of the server's traversal `run` (#1254: a
+    /// cursor of the cached run pages from it).
+    Traverse { hop: u32, index: u64, run: u64 },
 }
 
 const ROW: u8 = b'r';
@@ -44,11 +45,12 @@ impl Cursor {
                 b.push(u8::from(*inclusive));
                 b.extend_from_slice(key);
             }
-            Cursor::Traverse { hop, index } => {
+            Cursor::Traverse { hop, index, run } => {
                 b.push(TRAVERSE);
                 b.extend_from_slice(&fingerprint(args).to_le_bytes());
                 b.extend_from_slice(&hop.to_le_bytes());
                 b.extend_from_slice(&index.to_le_bytes());
+                b.extend_from_slice(&run.to_le_bytes());
             }
         }
         base64_encode(&b)
@@ -81,9 +83,10 @@ impl Cursor {
                 key: rest[1..].to_vec(),
                 inclusive: rest[0] == 1,
             },
-            TRAVERSE if rest.len() == 12 => Cursor::Traverse {
+            TRAVERSE if rest.len() == 20 => Cursor::Traverse {
                 hop: u32::from_le_bytes(rest[..4].try_into().expect("4 bytes")),
-                index: u64::from_le_bytes(rest[4..].try_into().expect("8 bytes")),
+                index: u64::from_le_bytes(rest[4..12].try_into().expect("8 bytes")),
+                run: u64::from_le_bytes(rest[12..].try_into().expect("8 bytes")),
             },
             _ => return Err(bad()),
         }))
@@ -92,7 +95,7 @@ impl Cursor {
 
 /// A hash of `args` without `cursor`, with object keys sorted. A `null` argument counts as
 /// left out, as the tools read it: some clients send omitted optional fields as `null`.
-fn fingerprint(args: &Map<String, Value>) -> u64 {
+pub(crate) fn fingerprint(args: &Map<String, Value>) -> u64 {
     fn feed(v: &Value, h: &mut DefaultHasher) {
         match v {
             Value::Object(m) => {
@@ -151,7 +154,11 @@ mod tests {
                 key: Vec::new(),
                 inclusive: false,
             },
-            Cursor::Traverse { hop: 2, index: 9 },
+            Cursor::Traverse {
+                hop: 2,
+                index: 9,
+                run: 7,
+            },
         ] {
             let mut again = args(json!({"families": ["a", "b"], "limit": 5, "table": "t"}));
             again.insert("cursor".into(), c.encode(&call).into());
@@ -162,7 +169,12 @@ mod tests {
     #[test]
     fn a_cursor_with_other_arguments_is_refused() {
         let call = args(json!({"table": "t", "limit": 5}));
-        let cursor = Cursor::Traverse { hop: 0, index: 1 }.encode(&call);
+        let cursor = Cursor::Traverse {
+            hop: 0,
+            index: 1,
+            run: 3,
+        }
+        .encode(&call);
         let other = args(json!({"table": "t", "limit": 6, "cursor": cursor}));
         assert!(
             Cursor::decode(&other)
@@ -173,11 +185,21 @@ mod tests {
         let mut nulls = args(json!({"table": "t", "limit": 5, "versions": null}));
         nulls.insert(
             "cursor".into(),
-            Cursor::Traverse { hop: 0, index: 1 }.encode(&call).into(),
+            Cursor::Traverse {
+                hop: 0,
+                index: 1,
+                run: 3,
+            }
+            .encode(&call)
+            .into(),
         );
         assert_eq!(
             Cursor::decode(&nulls).unwrap(),
-            Some(Cursor::Traverse { hop: 0, index: 1 })
+            Some(Cursor::Traverse {
+                hop: 0,
+                index: 1,
+                run: 3
+            })
         );
         let junk = args(json!({"table": "t", "limit": 5, "cursor": "nope"}));
         assert!(Cursor::decode(&junk).is_err());

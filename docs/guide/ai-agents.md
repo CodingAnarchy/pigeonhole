@@ -21,6 +21,7 @@ The server speaks MCP's stdio transport: one JSON-RPC message per line on standa
 | `--create` | Create the file if it doesn't exist. |
 | `--read-only` | Open as a [reader process](readers.md) of a running writer, and leave the write tools out. Without a writer running, the server exits with status 4 (`NoWriter`). |
 | `--max-result-bytes N` | A tool result's size, about, in bytes of JSON (default 32 KiB, about 8,000 tokens). A longer result is cut and returns a cursor. |
+| `--change-feed BYTES` | Turn the [change feed](#following-changes) on, keeping up to `BYTES` of history. Without it, a database whose application already feeds keeps that feed: `phdb`'s open inherits it, and `feed_poll` serves it. Only as the writer. |
 | `--max-value-bytes N` | The longest value a read returns whole by default (4 KiB). A longer one comes back as `{"omitted_bytes": n}`; a read can ask for more with `max_value_bytes`. |
 | `--shm-dir DIR`, `--reader`, `--writer` | As for every `phdb` command ([CLI guide](cli.md#how-phdb-opens-a-database)). |
 
@@ -69,7 +70,7 @@ or, for a project, a `.mcp.json` at its root:
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
 ## The tools
-Seven tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md), and `write` and `create_table` out when the database is read-only.
+Eight tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md), `feed_poll` out unless the database's change feed is on (the application's, which the server inherits, or `--change-feed`; with `--read-only` it's always listed, since a reader can't see the writer's options), and `write` and `create_table` out when the database is read-only.
 
 | Tool | What it does |
 |---|---|
@@ -78,6 +79,7 @@ Seven tools, each with a JSON schema and a description written for the agent. `t
 | `scan` | Rows in key order: a `prefix`, a `start`/`end` range, or all; `limit` rows (default 100), `columns_per_row` (default 100), and the same selection as `read_row`. |
 | `traverse` | Breadth-first hops over an edge family from `seeds` ([Graphs](graphs.md#traversal-hops-inside-the-engine)): `hops`, `per_node_limit`, `hop_limit`, `max_nodes` (default 100,000), and `parents` for shortest paths. |
 | `nearest` | The `k` vectors nearest a `query` in a vector family (default 10, at most 1,000), nearest first, each with its `row`, `qualifier`, `ts` and `distance` under the family's metric: an exact search ([Vectors](vectors.md)). The query is a list of the family's `dim` numbers: integers from -128 to 127 for `i8`, 0s and 1s for `bit` (or `{"base64"}` of the packed bytes). Narrows to a `row`, a `prefix` or a `start`/`end` range, and a `qualifier` or `qualifier_prefix`. |
+| `feed_poll` | The commits to `tables` since a `token`, whole and in commit order, and the token to pass next ([Following changes](#following-changes)). `max_commits` (default 100), `wait_ms` to wait for a first commit, `prefix`, `from_oldest` and `visible`. |
 | `write` | Up to 10,000 operations in one atomic `WriteBatch`: `put`, `incr` (counter families), `aggregate` (other aggregate families) and `delete` (a row, a family, a column, or one version with `ts`). All commit, or none. An `aggregate` value is read by the family's kind: any number for the f64 kinds, a non-negative integer for the bitwise ones, an integer or a string for `hll` and `bloom`. |
 | `create_table` | A table and its families, if missing. A family is a name, or an object in `list_tables`' shape (`{"name": "hits", "aggregation": "sum"}`). |
 
@@ -92,7 +94,18 @@ A result that would pass `--max-result-bytes` stops early and carries a `cursor`
 - **`traverse`** cuts between nodes, and each hop in a result says which node it starts at (`first_index`) and how many the hop has (`node_count`).
 - **`nearest`** has no cursor, since a ranking can't resume partway. A result that would pass the limit keeps the nearest neighbours that fit and is marked `"truncated": true`; ask for a smaller `k`.
 
-A cursor is bound to its call's arguments: one passed with other arguments fails, rather than resuming some other read at a meaningless place. A cursor doesn't hold a snapshot. Each call reads the latest data, so a row written between calls may be missed or seen twice, as with [`resume_after`](graphs.md#hubs-walking-a-wide-row) without a snapshot. A traversal's cursor runs the traversal again and skips what was returned, so it costs the whole traversal each time; tighten `hop_limit` or `max_nodes` rather than paging through a huge one.
+A cursor is bound to its call's arguments: one passed with other arguments fails, rather than resuming some other read at a meaningless place.
+- **`read_row` and `scan` cursors** don't hold a snapshot. Each call reads the latest data, so a row written between calls may be missed or seen twice, as with [`resume_after`](graphs.md#hubs-walking-a-wide-row) without a snapshot.
+- **A traversal's cursor pages from the result the first call computed.** The server keeps the last traversal that returned a cursor (up to about 64 MiB), so each later page costs only that page, and every page comes from one consistent result: writes between pages change nothing. The server keeps one traversal at a time: the next one that returns a cursor replaces it. A cursor whose traversal was replaced, or was too large to keep, or that comes from before a server restart, runs the traversal again and skips what was returned, as over unchanged data it would. That costs the whole traversal, and writes since the first page can shift its nodes.
+
+## Following changes
+When the database's change feed is on, `feed_poll` lets an agent follow what is committed (its own writes, other clients of the same server, and what the application committed before the server started, while the feed's history holds it) without polling whole tables. Each call returns the commits after its `token`, whole (a batch across tables arrives as one) and in commit order, each `{"seqno", "ts", "changes"}`. A change is `{"table", "family", "kind", "row", "qualifier", "ts", "value"}`: `kind` is `put`, `merge` (a counter increment or aggregate input), `delete_cell`, `delete_column` or `delete_family`, and deletes have no `value`. The result's `token` continues exactly where it stopped, so an agent that keeps it misses nothing and sees nothing twice; `more: true` says more commits are ready now.
+- **The first call** has no token and starts with the commits after it, or with the oldest history kept (`from_oldest`). To build a view and then keep it current, take a first token, `scan`, then poll from the token: a change committed during the scan may be seen twice, never missed.
+- **Nothing is held in the server between calls:** the token is the agent's state.
+- **Errors partway through a batch:** the commits gathered before the error come back with their token, and the next call, from that token, reports the error. Keep a token across sessions: it survives the application's restarts and the server's own reconnects.
+- **`FeedExpired`** means the history the token needs is gone: retention passed it, or an open turned the feed off since. Re-read with `scan` and start again without a token.
+- **The size cap:** a result holds whole commits only, cut between commits; the first commit always comes back whole, however large.
+- **Beside a running application** (`--read-only`, a reader process), `feed_poll` follows the application's feed too, from its shared history. If the application restarts during a call, the call fails with `SnapshotExpired`; call again with the same token.
 
 ## An example session
 An agent keeping notes about users, as the client sends it (requests abbreviated to `tools/call`'s `name` and `arguments`):

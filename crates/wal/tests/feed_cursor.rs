@@ -311,3 +311,115 @@ fn a_cursor_past_where_recovery_cut_its_segment_is_cut_never_corrupt() {
     let mut before = FeedCursor::open(&vfs, db(), STREAM, DB_ID, ends[1]).unwrap();
     assert_eq!(drain(&mut before).unwrap().0, [10]);
 }
+
+#[test]
+fn a_stop_read_before_the_segment_was_complete_is_read_again_not_corrupt() {
+    // #1370: a cursor that read a segment's frames while more were still to be written stops
+    // short (here: its cached frames predate the rest; in production, a torn read), and the
+    // successor's header lands before the same step looks at it. The stop is read again,
+    // once, never reported as a chain corruption; nothing is skipped.
+    let vfs = sim(7);
+    let o = fed(8, 2, 8);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, o).unwrap();
+    wal.spares().prepare(2).unwrap();
+    append(&mut wal, 1);
+    append(&mut wal, 2);
+    let mut cursor = FeedCursor::open(&vfs, db(), STREAM, DB_ID, Lsn::default()).unwrap();
+    // One record: the cursor now caches the segment's frames, the tail still zero.
+    assert!(matches!(
+        cursor.step().unwrap(),
+        pigeonhole_wal::Step::Record { .. }
+    ));
+    // The writer fills the segment and rolls over; the successor's header is on disk.
+    let first_epoch = wal.written().epoch();
+    let mut s = 3;
+    while wal.written().epoch() == first_epoch {
+        append(&mut wal, s);
+        s += 1;
+    }
+    append(&mut wal, s);
+    let last = s;
+    // The cursor goes on from its stale cache: record 2, then a stop short of the
+    // successor's end. That reads as "not yet", and the next steps read the rest.
+    let mut got = vec![1];
+    let mut ends = 0;
+    loop {
+        match cursor.step().unwrap() {
+            pigeonhole_wal::Step::Record { record, .. } => got.push(seqno_of(&record)),
+            pigeonhole_wal::Step::End => {
+                ends += 1;
+                if got.last() == Some(&last) || ends > 3 {
+                    break;
+                }
+            }
+            other => panic!("{other:?} after {got:?}"),
+        }
+    }
+    assert_eq!(
+        got,
+        (1..=last).collect::<Vec<_>>(),
+        "every record once, in order"
+    );
+    assert_eq!(cursor.epoch(), wal.written().epoch());
+}
+
+#[test]
+fn a_segment_still_short_of_its_successor_on_the_second_look_is_corrupt() {
+    // #1370: the deferral is once per (segment, stop). A segment that really ends short of
+    // what its successor records (synced data lost) still fails on the next look.
+    let vfs = sim(8);
+    let o = fed(4, 2, 8);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, o).unwrap();
+    wal.spares().prepare(2).unwrap();
+    let first_epoch = wal.written().epoch();
+    let mut ends = Vec::new();
+    let mut s = 1;
+    while wal.written().epoch() == first_epoch {
+        ends.push(append(&mut wal, s));
+        s += 1;
+    }
+    drop(wal);
+    // Damage the full first segment's last record: it now ends short of its successor's
+    // `prev_end`, with the successor still naming the old end.
+    let slot = headers(&vfs, o.segment_size)
+        .iter()
+        .position(|h| h.as_ref().is_some_and(|h| h.epoch == first_epoch))
+        .unwrap() as u64;
+    let last_in_first = ends
+        .iter()
+        .rev()
+        .find(|e| e.epoch() == first_epoch)
+        .copied()
+        .unwrap();
+    let f = vfs
+        .open(&path(), {
+            let mut w = pigeonhole_io::OpenOptions::read();
+            w.write = true;
+            w
+        })
+        .unwrap();
+    f.write_at(
+        &[0xFF; 16],
+        slot * o.segment_size + u64::from(last_in_first.offset()) - 16,
+    )
+    .unwrap();
+    drop(f);
+    let mut cursor = FeedCursor::open(&vfs, db(), STREAM, DB_ID, Lsn::default()).unwrap();
+    // The first look at the short stop: "not yet".
+    loop {
+        match cursor.step().unwrap() {
+            pigeonhole_wal::Step::Record { .. } => continue,
+            pigeonhole_wal::Step::End => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    // The second, at the same stop: the chain corruption.
+    let e = loop {
+        match cursor.step() {
+            Ok(pigeonhole_wal::Step::Record { .. }) => continue,
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => break e,
+        }
+    };
+    assert!(e.to_string().contains("predecessor end mismatch"), "{e}");
+}

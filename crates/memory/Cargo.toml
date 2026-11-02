@@ -1,0 +1,22 @@
+[package]
+name = "pigeonhole-memory"
+description = "Long-term agent memory with hybrid recall (vector, keyword, recency) for Pigeonhole, built on its public API."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "README.md"
+
+[dependencies]
+# The public crates only (D311: built on the public API, as pigeonhole-text is).
+pigeonhole = { workspace = true }
+pigeonhole-text = { workspace = true }
+twox-hash = { workspace = true, features = ["xxhash3_128"] }
+getrandom = { workspace = true }
+
+[lints]
+workspace = true

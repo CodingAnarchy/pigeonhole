@@ -192,6 +192,28 @@ with ph.open(path, create=True) as db:
     assert [h.nodes for h in t.hops] == [[b"n:b", b"n:c"], [b"n:d"], [b"n:e"]]
 ```
 
+## The change feed
+Open the database with `change_feed=` (the history to keep, in bytes; `feed_age=` bounds it in time too); later opens that don't mention the feed keep it, and `change_feed_off=True` turns it off. Then `t.feed()` subscribes to a table's committed changes: whole commits, once each, in commit order. A commit arrives once it is durable at its level, so nothing delivered is ever undone (`visible=True` for sooner). Each `Commit` has `seqno`, `timestamp` and `changes`. Each `Change` has `table`, `family`, `kind` (`"put"`, `"merge"`, `"delete_cell"`, `"delete_column"`, `"delete_family"`), `row`, `qualifier`, `timestamp` and `value` (typed as reads type it, `None` for deletes).
+
+`feed.next(timeout=...)` waits for the next commit with the GIL released, and returns `None` if none came in time. `try_next()` never waits, and `for commit in feed:` waits for each in turn. Store `feed.token()` with what the commits fed: `t.feed(resume=token)` continues there, after a reopen too. `tables=[...]` adds tables to the same feed, `prefix=` keeps only rows under it, and `from_snapshot=` starts after what a snapshot saw, so a reader can load a snapshot and then follow the changes without missing or repeating any. When the history a feed needs is gone (retention passed it, or an open with `change_feed_off=True` ended it), the feed raises `FeedExpired` from then on: rebuild from a snapshot and start again. A reader process's table (`ph.open_reader(path).table(...)`) subscribes too, following the running writer's feed. If that writer restarts, the feed follows it. While no writer runs, `next` raises `NoWriter` (or `SnapshotExpired` while a new one starts): call `next` again on the same feed.
+
+```python
+import pigeonhole as ph
+
+with ph.open(path, create=True, change_feed=64 << 20) as db:
+    t = db.table("orders").family("f").create()
+    feed = t.feed()
+    t.put(b"order:1", "f", b"status", b"paid")
+    commit = feed.next(timeout=5)
+    (change,) = commit.changes
+    assert (change.kind, change.row, change.value) == ("put", b"order:1", b"paid")
+    token = feed.token()  # store it with what the commit fed
+    feed.close()
+    t.put(b"order:1", "f", b"status", b"shipped")
+    with t.feed(resume=token) as feed:
+        assert feed.next(timeout=5).changes[0].value == b"shipped"
+```
+
 ## Readers, threads and processes
 - **Processes:** one process opens a database as the writer (`ph.open`). Any number of others open it as readers (`ph.open_reader(path)`), which see every commit and can't write ([reader processes](readers.md)).
 - **Threads:** every engine call releases the GIL, so threads in one process run reads and commits in parallel. Handles (`Database`, `Table`, `Snapshot`) are safe to share between threads.
