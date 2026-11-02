@@ -106,18 +106,34 @@ impl Engine {
     }
 
     /// Subscribes to the committed changes of some tables (D310): a [`FeedReader`] that
-    /// delivers whole commits in seqno order. The writer only: a reader process can't
-    /// subscribe yet (`Unsupported`, D310 PR 4). The tables must be fed by this open
-    /// (`FeedOptions::tables`); `InvalidArgument` otherwise, or with the feed off.
+    /// delivers whole commits in seqno order, in the writer or in a reader process (PR 4,
+    /// which follows its writer's feed through shared memory). The tables must be fed by the
+    /// writer (`FeedOptions::tables`); `InvalidArgument` otherwise, or with its feed off. In
+    /// a reader process, a feed fails with `SnapshotExpired` once its writer is gone (a
+    /// restart): subscribe again from its token, which the new writer's feed checks.
     ///
     /// [`FeedReader`]: crate::FeedReader
     pub fn feed(&self, spec: crate::FeedSpec) -> crate::Result<crate::FeedReader> {
-        if self.inner.is_reader() {
-            return Err(crate::Error::Unsupported(
-                "a change feed in a reader process (D310 PR 4)",
-            ));
-        }
-        crate::feed_reader::FeedReader::open(std::sync::Arc::clone(&self.inner.shared), spec)
+        let origin = if self.inner.is_reader() {
+            self.inner.reader_feed_origin()?
+        } else {
+            let Some(feed) = self.inner.shared.feed.clone() else {
+                return Err(crate::Error::InvalidArgument(
+                    "the change feed is off: open with it on to subscribe".into(),
+                ));
+            };
+            let shared = std::sync::Arc::clone(&self.inner.shared);
+            crate::feed_reader::Origin {
+                shm: self.inner.shared.shm.clone(),
+                writer: Some(feed),
+                view: Box::new(move || Ok(shared.view.load_full())),
+            }
+        };
+        crate::feed_reader::FeedReader::open(
+            std::sync::Arc::clone(&self.inner.shared),
+            spec,
+            origin,
+        )
     }
 
     /// What the database holds and how it is stored (ICR 0047). Cheap: reads the current

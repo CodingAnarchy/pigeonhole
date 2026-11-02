@@ -417,6 +417,7 @@ pub fn pigeonhole::FeedBuilder::from_oldest(self) -> Self
 pub fn pigeonhole::FeedBuilder::from_snapshot(self, &pigeonhole::Snapshot) -> Self
 pub fn pigeonhole::FeedBuilder::open(self) -> pigeonhole::Result<pigeonhole::Feed>
 pub fn pigeonhole::FeedBuilder::prefix(self, &[u8]) -> Self
+pub fn pigeonhole::FeedBuilder::read_table(self, &pigeonhole::ReadTable) -> Self
 pub fn pigeonhole::FeedBuilder::resume(self, &pigeonhole::FeedToken) -> Self
 pub fn pigeonhole::FeedBuilder::table(self, &pigeonhole::Table) -> Self
 pub fn pigeonhole::FeedBuilder::visible(self) -> Self
@@ -623,6 +624,7 @@ pub struct pigeonhole::ReadTable
 impl pigeonhole::ReadTable
 pub fn pigeonhole::ReadTable::families(&self) -> alloc::vec::Vec<&str>
 pub fn pigeonhole::ReadTable::family_info(&self, &str) -> core::option::Option<pigeonhole::FamilyInfo>
+pub fn pigeonhole::ReadTable::feed(&self) -> pigeonhole::FeedBuilder
 pub fn pigeonhole::ReadTable::get(&self, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
 pub fn pigeonhole::ReadTable::get_async(&self, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
 pub fn pigeonhole::ReadTable::get_at(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>

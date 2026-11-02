@@ -4081,6 +4081,25 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - The unit test `the_last_session_is_inherited_until_an_open_turns_the_feed_off`.
 - **Companion change (d), cli692:** `phdb`'s read-only commands open read-only.
 
+**How PR 4 builds it** (reader processes; shm layout 8, the coordinator's numbers):
+- **One reader, two origins.** `FeedReader` reads the stream files and shared memory in both processes. The writer mirrors each stream's floor and checkpoint into shm (`FEED_FLOOR`, `FEED_CKPT`) through `FeedMarks`' `MarkMirror`, right after each store it mirrors (per retention pass and checkpoint, never per commit). A reader process takes the writer's session and fed tables from the sidecar's last session entry (written before the writer's shared memory exists), its attachment from `reader_feed_origin`, and its view for blob values from its own attachment.
+- **No head mark** (simp724 and the coordinator, after the deterministic test). The frontier never passes a record behind a held segment header: D200 hides such a group until a sync writes the header, and the feed's holds settle on `Wal::written`. So "every stream read to its readable end" is enough for M1. `it::feed_head` holds the header for real and pins this. If D200 ever showed such a group early, that test fails and a head mark comes back with a reason.
+- **Start positions in a reader process:**
+  - **`Now`:** each stream's checkpoint, loaded before the bound.
+  - **`After(seqno)`, `Oldest` and tokens:** the floor, skipping keys at or below the bound.
+  - **The lost bound** (simp724's B1): the writer mirrors its checkpoint history's bound at the floor (`oldest_bound`) as `FEED_BOUND`, stored before the floor it belongs to and raised at checkpoints. An `After(seqno)` below a stream's bound has lost history and expires, as the writer's `start_at` does, rather than skipping recycled commits. `Oldest` starts at the largest bound.
+- **A writer restart mid-poll** (simp724's B2): the poll re-checks the attachment after reading the streams, and before expiring on a record outside the history. A restart is then always `SnapshotExpired` (resubscribe), never a permanent gap. `HookSite::ReaderFeedReads` lets a test restart the writer in that window.
+- **Blob files newer than the view** (simp724's question): a value separated at commit time names a blob file the manifest committed before the commit was logged, which a reader process's lagging view may not list yet. The reader waits for a newer view, up to a second, before it takes the file as removed.
+- **A new writer with another shard count** mid-start makes `writer_session` return `SnapshotExpired` (simp724's nit).
+- **A writer restart (M2):** a stale attachment fails the poll with `SnapshotExpired`. The public `Feed` resubscribes from its own token on a fresh attachment, so a durable feed continues and a visible one that delivered what was lost expires.
+- **Waiting:** a bounded backoff, 50 µs doubling to 5 ms. The writer does no per-commit work for reader processes.
+- **A bug the model found in this PR:** `emit` took a commit before loading the view, and a reader process's view load can fail (`Busy` while republished, or a stale attachment), so a retry skipped the commit. The view is now loaded before anything is taken. A blob-read failure after the take ends the reader for good.
+- **Public API:** `ReadTable::feed()` and `FeedBuilder::read_table`.
+- **Tests:**
+  - `it/feed_reader_process.rs`: commit order across shards, a writer restart resumed from a token, and the refusals.
+  - `it/feed_head.rs`: the D200 dependency.
+  - `feed_model`: a durable and a visible subscriber in a reader process beside the writer's, plain and with deferred I/O. Clean reopens exercise the stale-attachment resubscribe; power losses reopen the reader too.
+
 <a id="d311"></a>
 ## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)
 **Why.** Agents need durable memory they can recall by meaning, by keyword and by recency, scoped per agent or shared, inside the database they already use (#1251). Built on the public API with D309's text index, it needs nothing new in the engine.
@@ -4132,4 +4151,3 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - namespaces;
   - a write given up in the caller's transaction leaves nothing;
   - S3's races (a merge or a link racing a delete of its target conflicts; `mark_used` after a delete), each ending in `verify`.
-
