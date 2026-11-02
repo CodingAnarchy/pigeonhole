@@ -3736,6 +3736,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   1. The core API: open, readers, tables, reads, writes, transactions, values and options (#1260).
   2. Vectors, the 1.1 reads, closing a scan, the per-op overhead benchmark and `docs/guide/python.md` (#1276).
   3. `Table.nearest` (#1277).
+     - The half-precision arms (`Element.F16`/`BF16`, written and queried as `f32`, read back widened to `array('f')`) come with #1285, under D303's amendment and ICR 0104.
   4. The PyPI publish workflow, after the owner's go.
 
 <a id="d308"></a>
@@ -3753,15 +3754,15 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **The pages:** `Scan::read_within` and `KeysRead::read_within`, returning pages with `rows`, `bytes`, `cut_by_budget`, `next_bytes` and `resume`.
   - **The positions:** `ScanPosition` and `KeysPosition`, whose byte forms are versioned, tagged and carry the table id, so a position from another table is refused.
   - **Resuming:** `resume_after` on scans and multi-gets. Only `read_within` takes a position.
-  - **Traversal:** `Traverse::byte_budget`.
+  - **Traversal:** `Traverse::byte_budget`, with `TraverseStats::cut_by_budget` saying when a hop was cut.
 - **Resume rules:**
   - a cut inside a row resumes after the last kept column;
   - a cut at a row boundary resumes after the last kept row;
   - an empty cut page resumes at its own start;
-  - a `limit` stop resumes after the `limit`-th row;
+  - a `limit` stop resumes after the `limit`-th row. PR 2 cuts the page there after the read; PR 3 stops the read itself there, so it reads no further;
   - `limit(0)` reads nothing.
 - **PRs:**
   1. The engine (#1264).
   2. The public API (#1281).
-  3. The follow-ups (#1284): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
+  3. The follow-ups (#1284, in progress): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
 - **Deferred:** `read_within_async` (#1286, Post-1.0).
