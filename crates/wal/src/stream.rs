@@ -1555,13 +1555,13 @@ impl WalStream {
         }
     }
 
-    /// Takes the change-feed settings of `opts` (D310): retention and the feed session. Called
-    /// before the stream's first segment.
     /// The stream's feed marks, for the crate's own updates.
     pub(crate) fn feed_marks_ref(&self) -> &FeedMarks {
         &self.marks
     }
 
+    /// Takes the change-feed settings of `opts` (D310): retention and the feed session. Called
+    /// before the stream's first segment.
     pub(crate) fn configure_feed(&mut self, opts: &WalOptions) {
         self.retain = opts.retain_segments;
         self.retain_floor = if self.retain == 0 { u32::MAX } else { 0 };
