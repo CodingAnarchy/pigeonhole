@@ -30,24 +30,34 @@ impl Point {
     }
 }
 
-/// A caller's vector, borrowed.
+/// A caller's vector, borrowed. A half vector is its raw bit patterns (#1268 item 7).
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Input<'a> {
     F32(&'a [f32]),
     I8(&'a [i8]),
     Bits(&'a [u8]),
+    F16(&'a [u16]),
+    BF16(&'a [u16]),
 }
 
 impl Input<'_> {
     /// Refuses a vector of another element type or dimension than `spec`'s. The components
     /// are checked by the write (or the search) itself.
+    ///
+    /// An `f32` vector also fits a half index: written, it's rounded to the element, as
+    /// `put_vector_f32` rounds into a half family; searched, it's compared in `f32`, as
+    /// `nearest_f32` compares a half family (ICR 0104).
     pub(crate) fn check(&self, spec: &VectorSpec) -> Result<()> {
         let (element, dim) = match self {
             Input::F32(x) => (Element::F32, x.len()),
             Input::I8(x) => (Element::I8, x.len()),
             Input::Bits(x) => (Element::Bit, 8 * x.len()),
+            Input::F16(x) => (Element::F16, x.len()),
+            Input::BF16(x) => (Element::BF16, x.len()),
         };
-        if element != spec.element() || dim != spec.dim() as usize {
+        let fits = element == spec.element()
+            || (element == Element::F32 && matches!(spec.element(), Element::F16 | Element::BF16));
+        if !fits || dim != spec.dim() as usize {
             return Err(Error::InvalidArgument(format!(
                 "the index holds vectors of {} {:?}, not {dim} {element:?}",
                 spec.dim(),
@@ -59,10 +69,27 @@ impl Input<'_> {
 
     pub(crate) fn point(&self) -> Point {
         match self {
-            Input::F32(x) => Point::F32(x.to_vec()),
-            Input::I8(x) => Point::F32(x.iter().map(|v| f32::from(*v)).collect()),
             Input::Bits(x) => Point::Bits(x.to_vec()),
+            _ => {
+                let mut out = Vec::new();
+                self.widen_into(&mut out);
+                Point::F32(out)
+            }
         }
+    }
+
+    /// Appends the vector to `out` as `f32`s (an `i8` or half vector widened, exactly);
+    /// `false`, with nothing appended, for bits. A bulk load can widen every vector into
+    /// one reused buffer this way.
+    pub(crate) fn widen_into(&self, out: &mut Vec<f32>) -> bool {
+        match self {
+            Input::F32(x) => out.extend_from_slice(x),
+            Input::I8(x) => out.extend(x.iter().map(|v| f32::from(*v))),
+            Input::F16(x) => crate::half::widen_into(Element::F16, x, out),
+            Input::BF16(x) => crate::half::widen_into(Element::BF16, x, out),
+            Input::Bits(_) => return false,
+        }
+        true
     }
 
     pub(crate) fn put(&self, tx: &mut Transaction, t: &Table, row: &[u8], id: &[u8]) {
@@ -70,6 +97,8 @@ impl Input<'_> {
             Input::F32(x) => tx.put_vector_f32(t, row, crate::layout::VEC, id, x),
             Input::I8(x) => tx.put_vector_i8(t, row, crate::layout::VEC, id, x),
             Input::Bits(x) => tx.put_vector_bits(t, row, crate::layout::VEC, id, x),
+            Input::F16(x) => tx.put_vector_f16(t, row, crate::layout::VEC, id, x),
+            Input::BF16(x) => tx.put_vector_bf16(t, row, crate::layout::VEC, id, x),
         };
     }
 }
@@ -80,6 +109,9 @@ pub(crate) enum Stored {
     F32(Vec<f32>),
     I8(Vec<i8>),
     Bits(Vec<u8>),
+    /// A half vector's bit patterns, so a move rewrites it exactly.
+    F16(Vec<u16>),
+    BF16(Vec<u16>),
 }
 
 impl Stored {
@@ -88,6 +120,8 @@ impl Stored {
             Element::F32 => Stored::F32(v.to_f32_vec().unwrap_or_default()),
             Element::I8 => Stored::I8(v.as_bytes().iter().map(|b| *b as i8).collect()),
             Element::Bit => Stored::Bits(v.as_bytes().to_vec()),
+            Element::F16 => Stored::F16(halves(v.as_bytes())),
+            Element::BF16 => Stored::BF16(halves(v.as_bytes())),
             other => {
                 return Err(Error::Corruption(format!(
                     "a list holds a vector of element {other:?}"
@@ -101,8 +135,20 @@ impl Stored {
             Stored::F32(x) => Input::F32(x),
             Stored::I8(x) => Input::I8(x),
             Stored::Bits(x) => Input::Bits(x),
+            Stored::F16(x) => Input::F16(x),
+            Stored::BF16(x) => Input::BF16(x),
         }
     }
+}
+
+/// A half vector's stored payload (little-endian `u16`s) as its bit patterns.
+fn halves(payload: &[u8]) -> Vec<u16> {
+    payload
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
+        .collect()
 }
 
 /// `p`'s distance to the centroid `c`, under the centroid family's spec (`f32` for `f32`
