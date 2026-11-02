@@ -771,13 +771,14 @@ impl Memtable {
             node != NULL && node.is_multiple_of(4) && (node as usize) < self.region.len()
         );
 
-        // Predecessors at every level: the last insert's when the key sorts right after
-        // the last key inserted (between it and its successor, two comparisons), else from a
-        // search down from the top of the head tower.
+        // Predecessors at every level, kept in the splice itself: the last insert's when the
+        // key sorts right after the last key inserted (between it and its successor, two
+        // comparisons), else from a search down from the top of the head tower, which
+        // replaces them. Kept nowhere else: a copy cost the search path a second write per
+        // level (perf287 on #1315).
         let mem = &self.region.mem;
-        let mut prev = self.splice;
         let after_last = {
-            let last = prev[0];
+            let last = self.splice[0];
             (last == self.head || self.key_cmp(last, key) == Cmp::Less) && {
                 let next = mem.load_u32(tower(last, 0), Ordering::Relaxed);
                 next == NULL || self.key_cmp(next, key) != Cmp::Less
@@ -793,9 +794,6 @@ impl Memtable {
                     }
                     cur = next;
                 }
-                prev[level] = cur;
-                // The next insert's predecessor at this level, unless this node takes it
-                // (below).
                 self.splice[level] = cur;
             }
         }
@@ -809,13 +807,13 @@ impl Memtable {
         // (D277, perf287's P2). `record_tail` overwrites it below when the node has one.
         mem.write_u32(off + layout::N_TAIL, NULL);
         // Level 0 first: its successor is the stale tail's too.
-        let next0 = mem.load_u32(tower(prev[0], 0), Ordering::Relaxed);
+        let next0 = mem.load_u32(tower(self.splice[0], 0), Ordering::Relaxed);
         mem.write_u32(tower(node, 0), next0);
         // An index loop: the iterator form (`enumerate().take(height).skip(1)` over the
         // array) compiled to an out-of-line adapter, about 38 instructions per insert.
         #[allow(clippy::needless_range_loop)]
         for level in 1..height {
-            let next = mem.load_u32(tower(prev[level], level), Ordering::Relaxed);
+            let next = mem.load_u32(tower(self.splice[level], level), Ordering::Relaxed);
             mem.write_u32(tower(node, level), next);
         }
         let key_off = off + layout::N_TOWER + 4 * height;
@@ -830,16 +828,14 @@ impl Memtable {
 
         // Publish: link bottom-up, each with release so a reader that acquires the link
         // sees the whole node.
-        for (level, &p) in prev.iter().enumerate().take(height) {
+        for (level, &p) in self.splice.iter().enumerate().take(height) {
             debug_assert!(p != NULL && p.is_multiple_of(4) && (p as usize) < self.region.len());
             mem.store_u32(tower(p, level), node, Ordering::Release);
         }
 
-        // The next insert's predecessors: this node below its height, `prev` above it. The
-        // splice already holds `prev` (an insert right after the last one leaves it as it
-        // was; a search writes it as it goes), so only the node's own levels change. Every
-        // level was rewritten per insert before (about 30 instructions, #1206); a flag to
-        // choose between the two kept a register live across the insert (perf287 on #1315).
+        // The next insert's predecessors: this node below its height, the ones found above
+        // it. Only the node's own levels change (every level was rewritten per insert before,
+        // about 30 instructions, #1206).
         self.splice[..height].fill(node);
         self.bump += node_len;
         self.used += node_len as u64;
