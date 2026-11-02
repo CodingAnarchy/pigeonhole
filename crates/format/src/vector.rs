@@ -427,22 +427,14 @@ fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f6
     if let Query::F32(q) = q {
         // An `f32` query against `f32`, `f16` or `bf16` stored vectors: the same kernels,
         // the half ones widening each stored lane (bit-identical to the `f32` kernel over
-        // the widened vector).
-        type Kernels = (fn(&[f32], &[u8]) -> f32, fn(&[f32], &[u8]) -> (f32, f32));
-        let (l2, dot_norm): Kernels = match v.element {
-            Element::F32 => (k::l2_f32_le, k::dot_norm_f32_le),
-            Element::F16 => (k::l2_f16_le, k::dot_norm_f16_le),
-            Element::BF16 => (k::l2_bf16_le, k::dot_norm_bf16_le),
-            Element::I8 | Element::Bit => return f64::NAN,
-        };
-        return match (metric, norm) {
-            (Metric::L2, _) => f64::from(l2(q, p)),
-            (Metric::InnerProduct, _) => -f64::from(dot_norm(q, p).0),
-            (Metric::Cosine, QueryNorm::F32(nq)) => {
-                let (dot, n2) = dot_norm(q, p);
-                f64::from(k::cosine_from(dot, nq, n2))
-            }
-            _ => f64::NAN,
+        // the widened vector). Each arm passes its kernels as fn items, so every call stays
+        // direct and inlines (as function pointers they cost the `f32` path ~22
+        // instructions a vector: perf287 on #1285).
+        return match v.element {
+            Element::F32 => f32_query(metric, norm, q, p, k::l2_f32_le, k::dot_norm_f32_le),
+            Element::F16 => f32_query(metric, norm, q, p, k::l2_f16_le, k::dot_norm_f16_le),
+            Element::BF16 => f32_query(metric, norm, q, p, k::l2_bf16_le, k::dot_norm_bf16_le),
+            Element::I8 | Element::Bit => f64::NAN,
         };
     }
     match (q, metric, norm) {
@@ -454,6 +446,25 @@ fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f6
             1.0 - dot / (nq.sqrt() * nv.sqrt())
         }
         (Query::Bits(q), Metric::Hamming, _) => f64::from(k::hamming(q, p)),
+        _ => f64::NAN,
+    }
+}
+
+/// An `f32` query's distance by `metric`, with the stored element's kernels (fn items,
+/// monomorphised per element, so the calls inline).
+#[inline(always)]
+fn f32_query<L, D>(metric: Metric, norm: QueryNorm, q: &[f32], p: &[u8], l2: L, dot_norm: D) -> f64
+where
+    L: Fn(&[f32], &[u8]) -> f32,
+    D: Fn(&[f32], &[u8]) -> (f32, f32),
+{
+    match (metric, norm) {
+        (Metric::L2, _) => f64::from(l2(q, p)),
+        (Metric::InnerProduct, _) => -f64::from(dot_norm(q, p).0),
+        (Metric::Cosine, QueryNorm::F32(nq)) => {
+            let (dot, n2) = dot_norm(q, p);
+            f64::from(crate::distance::cosine_from(dot, nq, n2))
+        }
         _ => f64::NAN,
     }
 }
