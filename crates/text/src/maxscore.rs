@@ -166,7 +166,8 @@ impl<'t> Walk<'t> {
         Ok(())
     }
 
-    /// The walk's contribution to `doc`, for a non-essential clause; `doc`s come in
+    /// The walk's contribution to `doc`, for a non-essential clause or an essential fuzzy
+    /// clause's unwalked expansion (#1363); `doc`s come in
     /// ascending order. Point reads first, then, once their cost passes stepping through
     /// the rest of the row (lookups × [`LOOKUP_IN_STEPS`] > the postings left), advancing
     /// to `doc` for good: the ski-rental rule (perf287 on #1355), never much more than twice

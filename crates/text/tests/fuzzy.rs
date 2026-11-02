@@ -346,6 +346,45 @@ fn two_fuzzy_clauses_and_a_term_equal_a_brute_force() {
     }
 }
 
+/// simp724's T1 on #1383: a fuzzy clause that turns non-essential while some of its
+/// expansions are unwalked is looked up over every expansion, walked or not. The fillers
+/// hold the top `k` on the exact expansion alone, so `wb` (boost 0.5) goes unwalked; two
+/// `zeta wa` documents then lift the threshold past the fuzzy clause's bound, and
+/// `zeta zeta wb`'s fuzzy contribution comes only from a lookup of the unwalked `wb`.
+#[test]
+fn a_non_essential_fuzzy_clause_looks_up_its_unwalked_expansions() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    let mut corpus: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    let mut put = |id: String, text: &str| {
+        index.put(id.as_bytes(), text).unwrap();
+        corpus.insert(id.into_bytes(), text.to_owned());
+    };
+    for i in 0..30 {
+        put(format!("d{i:02}"), "wa filler words here");
+    }
+    put("d30".into(), "zeta wa");
+    put("d31".into(), "zeta wa");
+    // Twice `zeta`: it outscores the two above, so it's in the top 2, with a score that
+    // needs the lookup of `wb`.
+    put("d32".into(), "zeta zeta wb");
+    for i in 33..40 {
+        put(format!("d{i:02}"), "wb filler words here");
+    }
+    let m = Model::new(&corpus);
+    let (exps, _) = m.expansions("wa", Fuzziness::One, 0, 50);
+    assert!(exps.iter().any(|e| e.0 == "wb"), "{exps:?}");
+    let mut want = m.fuzzy(&exps);
+    add(&mut want, m.term("zeta"));
+    let q = Query::new().fuzzy("wa", Fuzziness::One).term("zeta");
+    for k in [2, 3, 4] {
+        let got = index.search(q.clone(), k).run().unwrap();
+        same_top_k(&got, &want, k, &format!("k {k}"));
+    }
+    db.close().unwrap();
+}
+
 #[test]
 fn a_document_with_three_misspellings_does_not_outrank_one_with_the_term() {
     let dir = pigeonhole::doc_support::temp_dir();
