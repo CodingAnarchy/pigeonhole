@@ -6,7 +6,8 @@
 //!   `minlen` aggregates. Those only ever over-estimate (M1), so the bound is safe;
 //! - a fuzzy clause: the largest of its expansions' term bounds, each times its boost.
 //!   Inside it, once `k` are held, an expansion that can't lift a document to the threshold
-//!   (even with every other clause at its bound) stops being walked (#1333);
+//!   (even with every other clause at its bound) is dropped, from the walk or from the
+//!   lookups (#1333);
 //! - a phrase clause, scored up front: its largest actual score.
 //!
 //! Clauses are taken in ascending order of bound. While fewer than `k` documents are held,
@@ -363,19 +364,26 @@ pub(crate) fn top_k(
     let mut held: BinaryHeap<Held> = BinaryHeap::with_capacity(k + 1);
     // How many of `by_bound`'s first clauses are non-essential.
     let mut skip = 0;
+    // The threshold the non-essential prefix and the fuzzy cuts were last taken at.
+    let mut cut_at = f64::NEG_INFINITY;
     let mut contrib = vec![0.0f64; n];
     let mut has = vec![false; n];
     loop {
         let threshold = (held.len() == k).then(|| held.peek().expect("k > 0 held").0);
-        if let Some(th) = threshold {
+        // Only when the threshold has risen since the last pass: nothing else moves the
+        // non-essential prefix or the fuzzy cuts (perf287 and simp724 on #1353).
+        if let Some(th) = threshold.filter(|&th| th > cut_at) {
+            cut_at = th;
             while skip < n && prefix[skip + 1] < th {
                 skip += 1;
             }
-            // Inside each essential fuzzy clause, the expansions that can't lift a document
-            // to the threshold even with every other clause at its bound (#1333).
-            for &c in &by_bound[skip..] {
-                let cut = th - (prefix[n] - clauses[c].bound);
-                clauses[c].drop_below(cut);
+            // Inside every fuzzy clause, essential or not, the expansions that can't lift a
+            // document to the threshold even with every other clause at its bound (#1333).
+            // A non-essential one is then looked up over fewer expansions.
+            let total = prefix[n];
+            for c in clauses.iter_mut() {
+                let cut = th - (total - c.bound);
+                c.drop_below(cut);
             }
         }
         let essential = &by_bound[skip..];
