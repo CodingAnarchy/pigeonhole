@@ -11,6 +11,13 @@ keywords.workspace = true
 categories.workspace = true
 readme = "README.md"
 
+[features]
+# Bench hook (#1273): `hash::fix_seed_for_measurement`, which fixes every hash map's seeds so
+# callgrind counts one number per commit. Only `pigeonhole-bench` enables it. Hidden, outside
+# the semver promise; never turn it on in an application (fixed seeds give up the flooding
+# resistance of random ones).
+__unstable-fixed-seed = []
+
 [dependencies]
 crc32c = { workspace = true }
 foldhash = { workspace = true }
