@@ -4150,8 +4150,16 @@ The stage's instructions are about 0.25 µs. (`.coord/ctr274-1206-lever4-b2-deci
   - a segment header held behind the previous segment's sync (FORMAT §10.1 rule 1). A header written in the same buffer as its segment's first records (after an inline sync) goes through the mapping with them, which keeps rule 1's order;
   - a range beyond the file's length (a store there would fault), a direct-I/O or read-only handle, and every platform but Linux. macOS keeps `pwrite` until it's settled that `F_FULLFSYNC` covers mapped stores without an `msync`;
   - a mapping that fails: the rollover falls back, and never fails on it.
-- **How it's switched on:** off by default, reached through the test variable `PIGEONHOLE_WAL_MAPPED=1` (the bench, under `__unstable-hooks`, and the test harnesses). The owner picks the default, and whether it becomes a public option, after the measurements.
+- **How it's switched on:** an engine option, `EngineOptions::wal.mapped_writes`, off by default, which the engine and WAL test harnesses set directly. The public `pigeonhole::Options` doesn't expose it yet. A public setter is a semver-checked API change that's better made once, when the owner picks the default after the measurements (with an ICR), than added now and possibly renamed. Until then the bench and the `pigeonhole` model harness, which build through `pigeonhole::Options`, reach it through the test variable `PIGEONHOLE_WAL_MAPPED=1` (read only under `__unstable-hooks`).
 - **Where the code is:** the only `unsafe` is `pigeonhole-io`'s `map::store` (a bounds-checked copy), which Miri runs. The simulator's mapping (`SimWriteMap`) stores through its write model, so power-loss runs drop and reorder mapped stores as they do written ones.
+- **What the simulator's model covers, and what it doesn't.** `SimWriteMap::write` is `write_at` on the same file.
+  - **Covered:** every crash point between stores and syncs; a power loss dropping any unsynced store; torn stores (the simulator's torn writes); and reordering among unsynced stores and against unsynced `pwrite`s of the same file, such as a held header. Those are the orderings recovery depends on, and a mapped store and a written page reach the device through the same page-cache writeback, so the same ones apply.
+  - **Not covered:**
+    - a store's own non-atomicity seen by a *concurrent* reader (a `pread` in another thread or process can see part of a group's bytes mid-`memcpy`, at byte rather than whole-call granularity). The readers that read past the visible frontier (the D310 feed cursor, a reader process) already treat a bad CRC or a short frame at the tail as "not there yet";
+    - SIGBUS, which the length check rules out, and `mmap` failures, which fall back to `pwrite` (that path is the default `None`);
+    - page faults and their latency, which only the box measures;
+    - writeback's page order within a segment, which is the same for written and mapped pages.
+  - The real-file `map_write` test covers visibility to other handles.
 - **Concurrency:** one row in concurrency.md. The mapping is the stream's alone.
 
 **Still to measure, before the owner decides:**
