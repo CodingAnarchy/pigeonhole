@@ -24,7 +24,10 @@ pub struct Hit {
     pub text: Option<String>,
     /// With [`Search::highlight`], every occurrence of every query clause in
     /// [`text`](Self::text), by position; empty otherwise. [`snippet`](crate::snippet)
-    /// picks a window of them.
+    /// picks a window of them. They're computed from the source text as it is at the
+    /// search's snapshot: if the source drifted from the index (a write around it, which
+    /// [`verify`](crate::Index::verify) reports), they describe the current text, which may
+    /// not be what the hit was scored on.
     pub matches: Vec<Match>,
 }
 
