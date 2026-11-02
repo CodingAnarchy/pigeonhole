@@ -174,6 +174,12 @@ impl Writer {
         self.flushed + self.out.len() as u64 + self.data.estimated_len() as u64
     }
 
+    /// An upper bound on the SST's whole length if it were finished now: data, index,
+    /// filters and footer.
+    pub(crate) fn len_bound(&self) -> u64 {
+        self.bound_with(0, 0)
+    }
+
     pub(crate) fn fits(&self, key_len: usize, value_len: usize) -> bool {
         self.bound_with(key_len, value_len) <= self.extent.len()
     }

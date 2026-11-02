@@ -1,9 +1,13 @@
-//! #1313: a full compaction ends when a slot's lone last-level SST is just over one output
-//! piece. The planner judged such an SST by its whole length (index, filters and footer
-//! included) and asked for it to be cut, while the sink, cutting by data length, wrote the same
-//! SST back, so `compact()` rewrote it about once a millisecond for as long as it ran (47 GB
-//! in 91 s on the box). Many small cells make the index and filters large enough to open that
-//! window, as the text index's counters did.
+//! A full compaction's outputs fit their pieces as the planner measures them (#1313, #1324).
+//!
+//! `plan_full` cuts a lone last-level SST larger than one output piece, judging it by its whole
+//! length (index, filters and footer included). The sink used to cut a piece by its data alone,
+//! so an output could end just over its piece. The next full compaction asked for it to be cut
+//! again and got the same SST back: `compact()` rewrote it about once a millisecond for as long
+//! as it ran (#1313, 47 GB in 91 s on the box, until its once-per-request guard). The sink now
+//! cuts by the whole length too (#1324), so no such SST is written, and a second full compaction
+//! leaves the outputs alone. Small blocks make the index large enough to open that window, as
+//! the text index's many small counters did.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -13,7 +17,8 @@ use pigeonhole_engine::{Engine, EngineOptions, FamilyOptions, ValueRef, WriteBat
 use pigeonhole_format::Durability;
 
 /// Runs a full compaction on another thread and waits up to `limit` for it: before the fix,
-/// it never returned.
+/// it never returned. On a timeout, the close stops it (#991), so it doesn't go on writing
+/// beside the binary's other tests.
 fn compact_within(engine: &Arc<Engine>, limit: Duration) -> bool {
     let (tx, rx) = mpsc::channel();
     let e = Arc::clone(engine);
@@ -25,7 +30,10 @@ fn compact_within(engine: &Arc<Engine>, limit: Duration) -> bool {
             r.expect("compact");
             true
         }
-        Err(_) => false,
+        Err(_) => {
+            let _ = engine.close();
+            false
+        }
     }
 }
 
@@ -84,37 +92,38 @@ fn build(dir: &std::path::Path, rows: u64) -> Option<(Arc<Engine>, Ssts)> {
 }
 
 #[test]
-fn a_full_compaction_ends_on_a_lone_sst_just_over_one_piece() {
-    let dir = std::env::temp_dir().join(format!("pigeonhole-1313-{}", std::process::id()));
-    // Step the row count until the full compaction leaves one last-level SST between one
-    // piece (64 KiB) and two: the shape that looped. With 256-byte blocks the sink cuts only
-    // at about 77 KB, so the window is wide (2,000 rows leave a 74 KB SST); each step adds
-    // about 900 bytes.
-    let mut found = None;
-    for rows in (1500..2100u64).step_by(25) {
+fn a_full_compactions_outputs_fit_their_pieces_and_stay_put() {
+    let dir = std::env::temp_dir().join(format!(
+        "phdb-full-compaction-pieces-{}",
+        std::process::id()
+    ));
+    // With 256-byte blocks, the data-length cut left one SST of up to about 77 KB, above one
+    // piece (64 KiB): 2,000 rows left a 74 KB SST that every full compaction rewrote whole.
+    for rows in (1500..2100u64).step_by(100) {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let Some((engine, ssts)) = build(&dir, rows) else {
             panic!("{rows} rows: the first full compaction never ended (#1313)");
         };
-        if let [(level, len)] = ssts[..]
-            && level > 0
-            && len > 64 << 10
-            && len < 128 << 10
-        {
-            found = Some((rows, len, engine));
-            break;
-        }
+        // Every output fits one piece by its whole length: at these sizes, 64 KiB.
+        assert!(
+            ssts.iter()
+                .all(|&(level, len)| level > 0 && len <= 64 << 10),
+            "{rows} rows: {ssts:?}"
+        );
+        // So a second full compaction plans nothing: the same SSTs, by id.
+        let ids = |e: &Engine| {
+            let mut v: Vec<u64> = e.sst_levels().iter().map(|s| s.2).collect();
+            v.sort_unstable();
+            v
+        };
+        let before = ids(&engine);
+        assert!(
+            compact_within(&engine, Duration::from_secs(30)),
+            "{rows} rows: a second full compaction never ended (#1313)"
+        );
+        assert_eq!(ids(&engine), before, "{rows} rows: rewritten again (#1324)");
         engine.close().unwrap();
     }
-    let (rows, len, engine) = found.expect("no row count left a lone SST just over one piece");
-    // Another full compaction of the same slot ends too, and leaves the SST as it is.
-    assert!(
-        compact_within(&engine, Duration::from_secs(30)),
-        "{rows} rows ({len}-byte SST): a full compaction never ended (#1313)"
-    );
-    let after: Vec<(u8, u64)> = engine.sst_lens().iter().map(|s| (s.0, s.1)).collect();
-    assert_eq!(after.len(), 1, "{rows} rows: {after:?}");
-    engine.close().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
 }
