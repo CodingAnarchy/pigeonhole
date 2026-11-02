@@ -5172,6 +5172,45 @@ impl ShardState {
 
     // ---- the change feed's written hold (D310) ----
 
+    /// The change feed's lazy records of one appended group (D310): each `None` or
+    /// `Buffered` record the feed needs, which no sync of this group covers (and, for
+    /// `None`, no write). A single is held at its seqno (held by this group's pending), a
+    /// decision at its apply seqno (held by `cross_held` until every participant applied),
+    /// and a PREPARE once decided, at its apply seqno (`decide_share`): the commit's id is
+    /// never held, so a hold there could lower the frontier.
+    #[inline(never)]
+    fn note_feed_group(&mut self, members: &[Member], ctx: &mut ShardContext<'_, ShardMsg>) {
+        let Some(feed) = self.shared.feed.clone() else {
+            return;
+        };
+        for m in members {
+            if !matches!(m.durability, Durability::None | Durability::Buffered) {
+                continue;
+            }
+            let Some(t) = &m.ticket else { continue };
+            // Not `m.record()`: a second caller would take it out of line in `run_group`.
+            let needed = feed.needs(|| match m.kind {
+                MemberKind::CommitRecord { .. } => None,
+                MemberKind::Single | MemberKind::Prepare { .. } => Some(m.bytes.batch()),
+            });
+            if !needed {
+                continue;
+            }
+            let none = m.durability == Durability::None;
+            match m.kind {
+                MemberKind::Prepare { .. } => {
+                    if let Some(share) = self.prepared.get_mut(&m.seqno) {
+                        share.feed_end = Some((t.end, none));
+                    }
+                }
+                MemberKind::CommitRecord { apply_seqno, .. } => {
+                    self.note_feed_unwritten(apply_seqno, t.end, none, ctx);
+                }
+                MemberKind::Single => self.note_feed_unwritten(m.seqno, t.end, none, ctx),
+            }
+        }
+    }
+
     /// Holds the feed's watermarks at `seqno` (still held by this group's pending, or by
     /// `cross_held`) for a fed record ending at `end` that no sync of its group covers: the
     /// synced hold always, and the written hold too when `unwritten` (a `None` record),
@@ -6815,10 +6854,6 @@ impl ShardState {
         let mut buffered_end: Option<Lsn> = None;
         // The end of the group's last written record (any level but `None`), for D227.
         let mut group_end: Option<Lsn> = None;
-        // The change feed's lazy records (D310), as (seqno held, end, whether `None`), and
-        // the PREPAREs, held once decided. Empty, never allocated, with the feed off.
-        let mut feed_lazy_records: Vec<(Seqno, Lsn, bool)> = Vec::new();
-        let mut feed_prepares: Vec<(Seqno, Lsn, bool)> = Vec::new();
         #[cfg(feature = "test-hooks")]
         let mut appends = 0usize;
         for m in &mut group.members {
@@ -6856,11 +6891,6 @@ impl ShardState {
             } else {
                 wal.append(&record, m.durability)
             };
-            // The change feed (D310): a `None` or `Buffered` record the feed needs, which no
-            // sync of this group covers (and, for `None`, no write). One compare with the
-            // feed off.
-            let fed_lazy = matches!(m.durability, Durability::None | Durability::Buffered)
-                && self.shared.feed.as_ref().is_some_and(|f| f.needs(&record));
             // The commit point of a value separated at commit time: a record the stream
             // accepted (even one whose write then fails: it may have landed) may be applied
             // or replayed, so its blob files must stay (#230).
@@ -6899,25 +6929,6 @@ impl ShardState {
             match result {
                 Ok(t) => {
                     m.ticket = Some(t);
-                    if fed_lazy {
-                        let none = m.durability == Durability::None;
-                        let at = match m.kind {
-                            // Held at its apply seqno once decided (`decide_share`): the
-                            // commit's id is never held, so a hold there could lower the
-                            // frontier.
-                            MemberKind::Prepare { .. } => {
-                                feed_prepares.push((m.seqno, t.end, none));
-                                None
-                            }
-                            // The decision's seqno is held by `cross_held` until every
-                            // participant applied; a single's by this group's pending.
-                            MemberKind::CommitRecord { apply_seqno, .. } => Some(apply_seqno),
-                            MemberKind::Single => Some(m.seqno),
-                        };
-                        if let Some(at) = at {
-                            feed_lazy_records.push((at, t.end, none));
-                        }
-                    }
                     self.stream_end = self.stream_end.max(t.end);
                     if m.durability == Durability::Buffered {
                         buffered_end = Some(t.end);
@@ -6971,13 +6982,10 @@ impl ShardState {
                 Durability::Buffered | Durability::None => {}
             }
         }
-        for (seqno, end, none) in feed_lazy_records {
-            self.note_feed_unwritten(seqno, end, none, ctx);
-        }
-        for (id, end, none) in feed_prepares {
-            if let Some(share) = self.prepared.get_mut(&id) {
-                share.feed_end = Some((end, none));
-            }
+        // The change feed (D310), out of line: the append loop above stays as it is with
+        // the feed off.
+        if self.shared.feed.is_some() {
+            self.note_feed_group(&group.members, ctx);
         }
         // D279: a Buffered PREPARE votes once its record is appended, when its group has no
         // sync of its own, so its coordinator decides while this shard writes and applies.

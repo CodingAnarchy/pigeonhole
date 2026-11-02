@@ -285,20 +285,24 @@ impl Feed {
         }
     }
 
-    /// Whether the feed needs `record` (D310): a batch or PREPARE that writes a fed table,
-    /// or a decision (whose shares may). Only asked of `None` and `Buffered` records.
-    pub(crate) fn needs(&self, record: &pigeonhole_format::wal::WalRecord<'_>) -> bool {
-        use pigeonhole_format::wal::WalRecord;
-        match record {
-            WalRecord::Batch { batch, .. } | WalRecord::Prepare { batch, .. } => match &self.tables
-            {
-                FeedTables::All => true,
-                FeedTables::Only(_) => batch
+    /// Whether the feed needs a record (D310): a batch or PREPARE that writes a fed table,
+    /// or a decision (whose shares may), given as `None`. `batch` is asked for only when
+    /// the feed names its tables; a batch that doesn't decode is not needed (its record was
+    /// never appended). Only asked of `None` and `Buffered` records.
+    pub(crate) fn needs<'a>(
+        &self,
+        batch: impl FnOnce() -> Option<pigeonhole_format::Result<pigeonhole_format::wal::BatchRef<'a>>>,
+    ) -> bool {
+        match &self.tables {
+            FeedTables::All => true,
+            FeedTables::Only(_) => match batch() {
+                None => true,
+                Some(Ok(batch)) => batch
                     .iter()
                     .flatten()
                     .any(|m| self.tables.contains(m.table)),
+                Some(Err(_)) => false,
             },
-            _ => true,
         }
     }
 
