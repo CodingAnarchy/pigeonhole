@@ -326,6 +326,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D308](phase-3.md#d308) — Byte-budgeted reads: `Scan`/`KeysRead::read_within` pages of whole columns within a byte budget, resumed from versioned table-tagged positions (`resume_after`), and `Traverse::byte_budget`, on a `ByteBudget` reducer · ai1249, #1250, ICR 0103 · on D296 and D304
 - [D309](phase-3.md#d309) — Full-text search in `pigeonhole-text`: BM25 over posting rows written through the index in the caller's transaction, with positions, exact and sloppy phrases, fuzzy terms, NFC/NFKC normalisation and recomputed highlighting · ai1249, #1247, ICR 0105
 - [D310](phase-3.md#d310) — A change feed of committed mutations: the WAL with open-time feed retention (ring recycling, never stalls writers), the `<db>-feed` sidecar plus a session id in WAL header bytes 76..84 and the superblock `sequence` check (no incompat bit), a lazy `None` flush behind a shm written-watermark hold, `FeedExpired`, the durable frontier by default, clean close keeps history, whole-commit delivery · ai1249 design, feed1248, #1248, ICR 0106 · owner decision
+- [D311](phase-3.md#d311) — Long-term agent memory in `pigeonhole-memory`: one table per store with exact namespaces, time-ordered ids, exact dedup in the transaction, a pinned embedding model, hybrid recall (vector, keyword, recency) fused by RRF within a byte budget, existence reads in every write · ai1249, #1251, ICR 0107 · owner decision
 
 ## Open questions
 _None._
