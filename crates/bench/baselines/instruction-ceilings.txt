@@ -225,6 +225,11 @@
 # knn-exact's vectors, not only the widening kernels (perf287 on #1304): bf16 widens with a
 # shift and lands below knn-exact; f16's branch-free widening costs more than the read saves.
 #
+# New shape for #1320 (#1302; D308's byte-budgeted nearest search, D193: every shape has a
+# ceiling), the head's count (run 41501153418, 2c6f21a8) times (1 + 0.3%): knn-budget 1694,
+# equal to knn-exact's: the budget bounds the result, not the read, and the cut over 10
+# neighbours is lost in 4,000 scored vectors.
+#
 # Lowered for #1307 (#1273, fixed hash seeds; D195 ceilings commit): get-mem 5710 -> 5699,
 # headroom 0.1% (perf287, 2026-11-02). With the seeds fixed, #1246's seed-dependent mode (up
 # to 5709) can't recur, so the one-off 5710 no longer has anything to cover. The head reads
@@ -282,3 +287,4 @@ scan-budget 3342 0.3
 scan-budget-twin 1374 0.3
 knn-exact-f16 2512 0.3
 knn-exact-bf16 1693 0.3
+knn-budget 1700 0.3
