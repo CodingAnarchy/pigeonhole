@@ -138,6 +138,13 @@ Rev 5 §4.5, with `Match` as recorded below (cli692 on #1300).
   - snippet ties and boundaries.
   - Mutations of the occurrence count, a phrase's end, the snippet's tie and the sloppy snapshot were all caught.
 
+## #1333: pruning inside a fuzzy clause
+No API change.
+- **The rule:** once `k` are held, an essential fuzzy clause drops each expansion whose bound is below the `k`-th held score less every other clause's bound. That's MaxScore for a clause that takes the largest of its expansions rather than their sum.
+- **Why it's exact:** a document whose clause value would come from a dropped expansion scores below the threshold, so it can't enter. So every document that enters takes its maximum from a kept expansion. Dropped expansions are neither walked nor looked up. The threshold only rises, so a drop is final.
+- **The test:** on a dense `w`+digits vocabulary, the top 1, 3 and 10 equal the full ranking's prefix with the same scores. A cut that ignores the other clauses' bounds fails it.
+- **Measured** at 100,000 documents on a laptop: fuzzy-1 p50 25 → 2.7 ms (p99 92 → 16 ms), fuzzy-2 30 → 5.5 ms. The AX102 numbers come with #1349.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 

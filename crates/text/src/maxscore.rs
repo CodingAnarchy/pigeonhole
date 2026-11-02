@@ -4,7 +4,9 @@
 //! Every clause has an upper bound on what it can add to one document's score:
 //! - a term clause: `idf · tf_factor(maxtf, minlen)`, from its posting row's `maxtf` and
 //!   `minlen` aggregates. Those only ever over-estimate (M1), so the bound is safe;
-//! - a fuzzy clause: the largest of its expansions' term bounds, each times its boost;
+//! - a fuzzy clause: the largest of its expansions' term bounds, each times its boost.
+//!   Inside it, once `k` are held, an expansion that can't lift a document to the threshold
+//!   (even with every other clause at its bound) stops being walked (#1333);
 //! - a phrase clause, scored up front: its largest actual score.
 //!
 //! Clauses are taken in ascending order of bound. While fewer than `k` documents are held,
@@ -58,6 +60,8 @@ impl Bm25 {
 pub(crate) struct Walk<'t> {
     row: Vec<u8>,
     weight: f64,
+    /// `weight · tf_factor(maxtf, minlen)`: the most it adds to a document.
+    bound: f64,
     /// Boxed: a walk is far larger than a phrase clause.
     cells: Box<RowCells<'t>>,
     /// The posting the walk stands on: its document and contribution.
@@ -93,11 +97,13 @@ impl<'t> Walk<'t> {
         let mut w = Walk {
             row,
             weight,
+            bound: weight * factor,
             cells: Box::new(read.cells()?),
             cur: None,
         };
         w.step(bm)?;
-        Ok((w, weight * factor))
+        let b = w.bound;
+        Ok((w, b))
     }
 
     fn doc(&self) -> Option<&[u8]> {
@@ -141,6 +147,8 @@ pub(crate) enum Clause<'t> {
     /// A fuzzy term's expansions (D309 §4.4): a document's contribution is the largest of
     /// theirs, not their sum.
     Fuzzy {
+        /// The expansions still walked. One whose bound falls below what a document would
+        /// need from it is dropped ([`Scored::drop_below`], #1333).
         walks: Vec<Walk<'t>>,
         /// The document the clause stands on (the walks' smallest) and its contribution.
         cur: Option<(Vec<u8>, f64)>,
@@ -201,7 +209,7 @@ impl<'t> Scored<'t> {
 
     /// A fuzzy clause's document: its walks' smallest, with the largest contribution there.
     fn settle(&mut self) {
-        if let Clause::Fuzzy { walks, cur } = &mut self.clause {
+        if let Clause::Fuzzy { walks, cur, .. } = &mut self.clause {
             *cur = walks.iter().filter_map(|w| w.doc()).min().map(|doc| {
                 let best = walks
                     .iter()
@@ -249,7 +257,7 @@ impl<'t> Scored<'t> {
     fn step(&mut self, bm: &Bm25) -> Result<()> {
         match &mut self.clause {
             Clause::Term(w) => w.step(bm)?,
-            Clause::Fuzzy { walks, cur } => {
+            Clause::Fuzzy { walks, cur, .. } => {
                 let Some((doc, _)) = cur.take() else {
                     return Ok(());
                 };
@@ -279,6 +287,29 @@ impl<'t> Scored<'t> {
             Clause::Phrase { scores, .. } => Ok(scores
                 .binary_search_by(|(d, _)| d.as_slice().cmp(doc))
                 .map_or(0.0, |i| scores[i].1)),
+        }
+    }
+}
+
+impl Scored<'_> {
+    /// Drops a fuzzy clause's expansions whose bound is below `cut`: the `k`-th held score
+    /// less every other clause's bound (#1333). That's MaxScore for a clause that takes the
+    /// largest of its expansions rather than their sum.
+    ///
+    /// **Exact.** A document whose clause value comes from a dropped expansion `e` scores
+    /// at most (the other clauses' bounds) + `bound(e)`, below the threshold, so it can't
+    /// enter the top `k`. So every document that does enter takes its maximum from a kept
+    /// expansion, and its score is the same. The threshold only rises, so a drop is final.
+    /// Dropped expansions aren't looked up either: by the same bound, they can't change
+    /// the score of a document that enters.
+    fn drop_below(&mut self, cut: f64) {
+        let Clause::Fuzzy { walks, .. } = &mut self.clause else {
+            return;
+        };
+        let before = walks.len();
+        walks.retain(|w| w.bound * (1.0 + SLACK) >= cut);
+        if walks.len() != before {
+            self.settle();
         }
     }
 }
@@ -339,6 +370,12 @@ pub(crate) fn top_k(
         if let Some(th) = threshold {
             while skip < n && prefix[skip + 1] < th {
                 skip += 1;
+            }
+            // Inside each essential fuzzy clause, the expansions that can't lift a document
+            // to the threshold even with every other clause at its bound (#1333).
+            for &c in &by_bound[skip..] {
+                let cut = th - (prefix[n] - clauses[c].bound);
+                clauses[c].drop_below(cut);
             }
         }
         let essential = &by_bound[skip..];
