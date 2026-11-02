@@ -32,7 +32,9 @@ pub enum Fusion {
 }
 
 /// Each signal's weight in the fusion (D311 §10a). Plain data, so bindings can build it:
-/// start from `Weights::default()` (every weight 1) and set the fields.
+/// start from `Weights::default()` (every weight 1) and set the fields. Under
+/// [`Fusion::Rrf`] a weight multiplies the signal's `1 / (60 + rank)`; under
+/// [`Fusion::Linear`], its min-max-normalised value. A weight of 0 leaves the signal out.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct Weights {
@@ -45,7 +47,7 @@ pub struct Weights {
     /// The memory's importance.
     pub importance: f64,
     /// `ln(1 + uses)`, decayed by the time since the last use.
-    pub use_: f64,
+    pub uses: f64,
 }
 
 impl Default for Weights {
@@ -55,7 +57,7 @@ impl Default for Weights {
             keyword: 1.0,
             recency: 1.0,
             importance: 1.0,
-            use_: 1.0,
+            uses: 1.0,
         }
     }
 }
@@ -64,8 +66,9 @@ impl Default for Weights {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub struct Signal {
-    /// Its rank among the candidates that have it, from 1. Equal values share a rank: one
-    /// more than how many candidates have a greater value.
+    /// Its rank for this signal among the candidates that have it (not the final order),
+    /// 1-based: 1 is the best. Equal values share a rank, one more than how many candidates
+    /// have a greater value.
     pub rank: u32,
     /// Its value.
     pub value: f64,
@@ -84,7 +87,7 @@ pub struct Signals {
     /// Its importance.
     pub importance: Option<Signal>,
     /// Its decayed use, if it was ever used.
-    pub use_: Option<Signal>,
+    pub uses: Option<Signal>,
 }
 
 /// One recalled memory.
@@ -101,6 +104,9 @@ pub struct RecallHit {
     pub importance: f64,
     /// When it was created, in µs.
     pub created_us: u64,
+    /// The memory that superseded it: only with
+    /// [`include_superseded`](Recall::include_superseded), which keeps such memories.
+    pub superseded_by: Option<MemoryId>,
     /// Its fused score.
     pub score: f64,
     /// Its signals, with [`Recall::with_signals`].
@@ -115,7 +121,8 @@ pub struct RecallHit {
 pub struct RecallStats {
     /// The candidates scored, over every namespace.
     pub candidates: usize,
-    /// Whether the byte budget cut the list (not `k`).
+    /// Whether the byte budget cut the list (not `k`), including when the first hit alone
+    /// was larger than the budget.
     pub truncated: bool,
 }
 
@@ -212,27 +219,34 @@ impl<'a> Recall<'a> {
     }
 
     /// The query embedding, for vector recall: from the store's model, as `f32` whatever
-    /// the store's element type.
+    /// the store's element type, at its dimension. `InvalidArgument` on a store without a
+    /// model, or a handle opened without it; recall by text alone there.
     pub fn embedding(mut self, e: impl Into<Vec<f32>>) -> Self {
         self.embedding = Some(e.into());
         self
     }
 
-    /// At most `k` hits: 10 by default.
+    /// At most `k` hits: 10 by default. `k`, [`candidates`](Self::candidates) and
+    /// [`byte_budget`](Self::byte_budget) apply in that order of scope: candidates bound
+    /// what is scored, then the fused list is returned until `k` hits or the budget, which
+    /// comes first.
     pub fn k(mut self, k: usize) -> Self {
         self.k = k;
         self
     }
 
-    /// How many candidates each signal contributes per namespace: 50 by default.
+    /// How many candidates each signal contributes per namespace: 50 by default, counted
+    /// after the filters (superseded memories, [`session`](Self::session)). A signal reads
+    /// further down its list until that many pass or its namespace is exhausted.
     pub fn candidates(mut self, n: usize) -> Self {
         self.per_signal = n;
         self
     }
 
     /// At most `bytes` of hits, by D308's rules: each hit's text, its id and 16 bytes, plus
-    /// its signals and embedding when asked for. A hit is whole or left out, and at least
-    /// one is returned.
+    /// its signals and embedding when asked for. A hit is whole or left out. As with the
+    /// engine's byte budgets, the first hit is returned even if it alone is larger, and
+    /// [`RecallStats::truncated`] says the budget cut the list.
     pub fn byte_budget(mut self, bytes: u64) -> Self {
         self.byte_budget = Some(bytes);
         self
@@ -244,9 +258,10 @@ impl<'a> Recall<'a> {
         self
     }
 
-    /// Ages are measured from `us` (µs since the Unix epoch) rather than now. With an
-    /// explicit snapshot too, the same call always returns the same result.
-    pub fn at(mut self, us: u64) -> Self {
+    /// Ages (recency, use) are measured from `us`, in µs since the Unix epoch, rather than
+    /// the wall clock. With an explicit [`snapshot`](Self::snapshot) too, the same call
+    /// always returns the same result.
+    pub fn now_us(mut self, us: u64) -> Self {
         self.at_us = Some(us);
         self
     }
@@ -293,7 +308,8 @@ impl<'a> Recall<'a> {
         self
     }
 
-    /// The hits, best first.
+    /// The hits, best first. [`run_with_stats`](Self::run_with_stats) also says whether
+    /// the byte budget cut them.
     pub fn run(self) -> Result<Vec<RecallHit>> {
         self.run_with_stats().map(|(h, _)| h)
     }
@@ -346,107 +362,88 @@ impl<'a> Recall<'a> {
         if self.k == 0 {
             return Ok((Vec::new(), stats));
         }
-        // 1. Candidates, per namespace.
-        let mut keys: BTreeSet<Vec<u8>> = BTreeSet::new();
-        let mut bm25: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
-        for ns in &self.namespaces {
-            let prefix = [ns.as_bytes(), MEMORY_TAG].concat();
-            if let Some(e) = &self.embedding {
-                for n in self.rows.nearest(s, &prefix, e, self.per_signal)? {
-                    keys.insert(n);
+        // 1. Candidates: per namespace and signal, its best `n`, read in one multi-get; the
+        // filters (superseded, session) apply to each. Until every list holds `per_signal`
+        // that pass, or came back short (its namespace is exhausted), `n` doubles, so a
+        // filtered recall still gets each signal's best `per_signal` eligible memories
+        // (simp724's N1 on #1374).
+        let mut n = self.per_signal.max(1);
+        let (lists, eligible) = loop {
+            let mut lists: Vec<(usize, Vec<Vec<u8>>, bool)> = Vec::new();
+            let mut scores: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
+            for ns in &self.namespaces {
+                let prefix = [ns.as_bytes(), MEMORY_TAG].concat();
+                if let Some(e) = &self.embedding {
+                    let l = self.rows.nearest(s, &prefix, e, n)?;
+                    let full = l.len() == n;
+                    lists.push((0, l, full));
                 }
-            }
-            if let Some(t) = text {
-                for (id, score) in self.index.search(s, t, &prefix, self.per_signal)? {
-                    keys.insert(id.clone());
-                    bm25.insert(id, score);
+                if let Some(t) = text {
+                    let hits = self.index.search(s, t, &prefix, n)?;
+                    let full = hits.len() == n;
+                    let mut l = Vec::with_capacity(hits.len());
+                    for (id, score) in hits {
+                        scores.insert(id.clone(), score);
+                        l.push(id);
+                    }
+                    lists.push((1, l, full));
                 }
+                let l = self.rows.newest(s, &prefix, n)?;
+                let full = l.len() == n;
+                lists.push((2, l, full));
             }
-            for k in self.rows.newest(s, &prefix, self.per_signal)? {
-                keys.insert(k);
+            let keys: BTreeSet<&Vec<u8>> = lists.iter().flat_map(|(_, l, _)| l.iter()).collect();
+            let set = KeySet::from_unsorted(keys.into_iter().collect::<Vec<_>>());
+            let mut eligible: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
+            self.rows.read_each(s, &set, |key, row| {
+                if let Some(c) = self.candidate(key, row, spec.as_ref(), now)? {
+                    eligible.insert(key.to_vec(), c);
+                }
+                Ok(())
+            })?;
+            let done = lists.iter().all(|(_, l, full)| {
+                !full || l.iter().filter(|k| eligible.contains_key(*k)).count() >= self.per_signal
+            });
+            if done {
+                // BM25 counts for the keyword lists' kept keys only (below).
+                for c in eligible.values_mut() {
+                    c.vals[1] = None;
+                }
+                for (sig, l, _) in &lists {
+                    if *sig == 1 {
+                        let top: Vec<&Vec<u8>> = l
+                            .iter()
+                            .filter(|k| eligible.contains_key(*k))
+                            .take(self.per_signal)
+                            .collect();
+                        for k in top {
+                            if let Some(c) = eligible.get_mut(k) {
+                                c.vals[1] = scores.get(k).copied();
+                            }
+                        }
+                    }
+                }
+                break (lists, eligible);
+            }
+            n = n.saturating_mul(2);
+        };
+        // Each list's best `per_signal` eligible memories, together.
+        let mut kept: BTreeSet<&Vec<u8>> = BTreeSet::new();
+        for (_, l, _) in &lists {
+            for k in l
+                .iter()
+                .filter(|k| eligible.contains_key(*k))
+                .take(self.per_signal)
+            {
+                kept.insert(k);
             }
         }
-        // 2. Read them, in one multi-get, and compute every signal.
-        let mut cands = Vec::new();
-        let set = KeySet::from_unsorted(keys.iter().collect::<Vec<_>>());
-        self.rows.read_each(s, &set, |key, row| {
-            let Some(id) = MemoryId::from_row(key) else {
-                return Ok(());
-            };
-            let Some(text) = row.get(CONTENT, TEXT) else {
-                return Ok(());
-            };
-            if !self.include_superseded && row.get(META, SUPERSEDED_BY).is_some() {
-                return Ok(());
-            }
-            if let Some(want) = &self.session
-                && !row
-                    .get(META, SESSION)
-                    .is_some_and(|c| c.value() == want.as_bytes())
-            {
-                return Ok(());
-            }
-            let text = std::str::from_utf8(text.value())
-                .map_err(|_| corrupt("a memory's text"))?
-                .to_owned();
-            let kind = match row.get(META, KIND).and_then(|c| c.value().first().copied()) {
-                Some(1) => Kind::Semantic,
-                Some(2) => Kind::Procedural,
-                _ => Kind::Episodic,
-            };
-            let importance = row
-                .get(PEAK, IMPORTANCE)
-                .and_then(|c| c.as_i64())
-                .map_or(0.0, |p| p as f64 / PPM);
-            let uses = row
-                .get(STATS, USES)
-                .and_then(|c| c.as_i64())
-                .unwrap_or(0)
-                .max(0);
-            let last_used = row.get(PEAK, LAST_USED).and_then(|c| c.as_i64());
-            let stored = row.get(EMB, V);
-            let vector = match (&self.embedding, &spec, &stored) {
-                (Some(q), Some(spec), Some(c)) => match c.as_vector() {
-                    Some(v) => Some(1.0 - similarity_distance(spec, q, v)?),
-                    None => None,
-                },
-                _ => None,
-            };
-            let embedding = if self.with_embeddings {
-                stored.and_then(|c| c.as_vector().and_then(|v| v.to_f32_vec()))
-            } else {
-                None
-            };
-            let created = id.created_us();
-            let age = now.saturating_sub(created) as f64;
-            let recency = (-age / self.half_life_us as f64).exp();
-            let use_ = (uses > 0).then(|| {
-                let since = last_used.map_or(age, |l| now.saturating_sub(l.max(0) as u64) as f64);
-                (1.0 + uses as f64).ln() * (-since / self.half_life_us as f64).exp()
-            });
-            cands.push(Cand {
-                vals: [
-                    vector,
-                    bm25.get(key).copied(),
-                    Some(recency),
-                    Some(importance),
-                    use_,
-                ],
-                ranks: [None; 5],
-                score: 0.0,
-                hit: RecallHit {
-                    id,
-                    text,
-                    kind,
-                    importance,
-                    created_us: created,
-                    score: 0.0,
-                    signals: None,
-                    embedding,
-                },
-            });
-            Ok(())
-        })?;
+        let kept: BTreeSet<Vec<u8>> = kept.into_iter().cloned().collect();
+        let mut cands: Vec<Cand> = eligible
+            .into_iter()
+            .filter(|(k, _)| kept.contains(k))
+            .map(|(_, c)| c)
+            .collect();
         stats.candidates = cands.len();
         // 3. Fusion.
         let w = [
@@ -454,7 +451,7 @@ impl<'a> Recall<'a> {
             self.weights.keyword,
             self.weights.recency,
             self.weights.importance,
-            self.weights.use_,
+            self.weights.uses,
         ];
         for (sig, &w) in w.iter().enumerate() {
             let mut order: Vec<usize> = (0..cands.len())
@@ -526,21 +523,107 @@ impl<'a> Recall<'a> {
                     keyword: sig(1),
                     recency: sig(2),
                     importance: sig(3),
-                    use_: sig(4),
+                    uses: sig(4),
                 });
             }
             let size = hit_size(&hit, self.with_signals);
             if let Some(budget) = self.byte_budget
-                && !out.is_empty()
                 && used + size > budget
             {
                 stats.truncated = true;
-                break;
+                // D308: the first item always, even past the budget.
+                if !out.is_empty() {
+                    break;
+                }
             }
             used += size;
             out.push(hit);
         }
         Ok((out, stats))
+    }
+    /// One candidate from its row, or `None` if it's filtered out or gone. Its keyword
+    /// signal is filled in by the caller.
+    fn candidate(
+        &self,
+        key: &[u8],
+        row: &pigeonhole::RowRef<'_>,
+        spec: Option<&VectorSpec>,
+        now: u64,
+    ) -> Result<Option<Cand>> {
+        let Some(id) = MemoryId::from_row(key) else {
+            return Ok(None);
+        };
+        let Some(text) = row.get(CONTENT, TEXT) else {
+            return Ok(None);
+        };
+        let superseded_by = row
+            .get(META, SUPERSEDED_BY)
+            .map(|c| MemoryId::from_row(c.value()).ok_or_else(|| corrupt("superseded_by")))
+            .transpose()?;
+        if !self.include_superseded && superseded_by.is_some() {
+            return Ok(None);
+        }
+        if let Some(want) = &self.session
+            && !row
+                .get(META, SESSION)
+                .is_some_and(|c| c.value() == want.as_bytes())
+        {
+            return Ok(None);
+        }
+        let text = std::str::from_utf8(text.value())
+            .map_err(|_| corrupt("a memory's text"))?
+            .to_owned();
+        let kind = match row.get(META, KIND).and_then(|c| c.value().first().copied()) {
+            Some(1) => Kind::Semantic,
+            Some(2) => Kind::Procedural,
+            _ => Kind::Episodic,
+        };
+        let importance = row
+            .get(PEAK, IMPORTANCE)
+            .and_then(|c| c.as_i64())
+            .map_or(0.0, |p| p as f64 / PPM);
+        let uses = row
+            .get(STATS, USES)
+            .and_then(|c| c.as_i64())
+            .unwrap_or(0)
+            .max(0);
+        let last_used = row.get(PEAK, LAST_USED).and_then(|c| c.as_i64());
+        let stored = row.get(EMB, V);
+        let vector = match (&self.embedding, spec, &stored) {
+            (Some(q), Some(spec), Some(c)) => match c.as_vector() {
+                Some(v) => Some(1.0 - similarity_distance(spec, q, v)?),
+                None => None,
+            },
+            _ => None,
+        };
+        let embedding = if self.with_embeddings {
+            stored.and_then(|c| c.as_vector().and_then(|v| v.to_f32_vec()))
+        } else {
+            None
+        };
+        let created = id.created_us();
+        let age = now.saturating_sub(created) as f64;
+        let recency = (-age / self.half_life_us as f64).exp();
+        let used = (uses > 0).then(|| {
+            let since = last_used.map_or(age, |l| now.saturating_sub(l.max(0) as u64) as f64);
+            (1.0 + uses as f64).ln() * (-since / self.half_life_us as f64).exp()
+        });
+        Ok(Some(Cand {
+            vals: [vector, None, Some(recency), Some(importance), used],
+            ranks: [None; 5],
+            score: 0.0,
+            hit: RecallHit {
+                id,
+                text,
+                kind,
+                importance,
+                created_us: created,
+                superseded_by,
+                score: 0.0,
+                signals: None,
+                embedding,
+            },
+        }))
     }
 }
 

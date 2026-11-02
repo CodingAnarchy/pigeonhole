@@ -141,7 +141,7 @@ fn check_rrf(
             "{ctx}"
         );
         assert!(close(s.importance.unwrap().value, *imp, 1e-6), "{ctx}");
-        assert_eq!(s.use_.is_some(), *uses > 0, "{ctx}");
+        assert_eq!(s.uses.is_some(), *uses > 0, "{ctx}");
         let key = row_key(&h.id);
         match (s.keyword, bm25.get(&key)) {
             (Some(k), Some(b)) => assert_eq!(k.value, *b, "{ctx}"),
@@ -156,7 +156,7 @@ fn check_rrf(
         |s| s.keyword,
         |s| s.recency,
         |s| s.importance,
-        |s| s.use_,
+        |s| s.uses,
     ];
     for get in sigs {
         let ranked: Vec<(&MemoryId, Signal)> = hits
@@ -170,7 +170,7 @@ fn check_rrf(
     }
     for h in hits {
         let s = h.signals.unwrap();
-        let want: f64 = [s.vector, s.keyword, s.recency, s.importance, s.use_]
+        let want: f64 = [s.vector, s.keyword, s.recency, s.importance, s.uses]
             .iter()
             .flatten()
             .map(|x| 1.0 / (60.0 + f64::from(x.rank)))
@@ -221,7 +221,7 @@ fn every_signal_rank_and_score_matches_its_definition() {
                 .embedding(qe.clone())
                 .candidates(1000)
                 .k(1000)
-                .at(now)
+                .now_us(now)
                 .snapshot(&s)
                 .with_signals(true)
                 .run_with_stats()
@@ -240,7 +240,7 @@ fn every_signal_rank_and_score_matches_its_definition() {
                 .embedding(qe.clone())
                 .candidates(1000)
                 .k(5)
-                .at(now)
+                .now_us(now)
                 .snapshot(&s)
                 .run()
                 .unwrap();
@@ -422,7 +422,7 @@ fn the_linear_blend_sums_min_max_normalised_signals() {
     let s = f.db.snapshot().unwrap();
     let mut w = Weights::default();
     w.recency = 0.0;
-    w.use_ = 0.0;
+    w.uses = 0.0;
     let hits = f
         .store
         .recall(&["a"])
@@ -521,7 +521,7 @@ fn a_reader_process_recalls_what_the_writer_committed() {
             .embedding(vec![0.2, -0.4, 0.9, 0.1])
             .candidates(1000)
             .k(20)
-            .at(now)
+            .now_us(now)
             .run()
             .unwrap()
     };
@@ -571,5 +571,126 @@ fn equal_values_share_a_rank_so_ties_favour_no_one() {
         .map(|h| h.signals.unwrap().importance.unwrap().rank)
         .collect();
     assert_eq!(ranks, [1, 1]);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_filtered_recall_reads_on_until_each_signal_has_its_n() {
+    // simp724's N1 on #1374: 40 memories, the 2 of session "s1" the oldest. With
+    // candidates(5), the newest 5 are all another session's, so a filter applied after a
+    // fixed top 5 would return nothing; reading on finds both.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("mem.phdb"), Options::default()).unwrap();
+    let store = Store::create(&db, "s", StoreOptions::new()).unwrap();
+    let mut s1 = Vec::new();
+    for i in 0..2 {
+        s1.push(
+            store
+                .remember("a", Memory::new(format!("deploy notes {i}")).session("s1"))
+                .unwrap()
+                .id()
+                .clone(),
+        );
+    }
+    for i in 0..38 {
+        store
+            .remember(
+                "a",
+                Memory::new(format!("deploy notes other {i}")).session("s2"),
+            )
+            .unwrap();
+    }
+    let hits = store
+        .recall(&["a"])
+        .text("deploy notes")
+        .session("s1")
+        .candidates(5)
+        .k(10)
+        .run()
+        .unwrap();
+    let mut got: Vec<MemoryId> = hits.into_iter().map(|h| h.id).collect();
+    got.sort();
+    s1.sort();
+    assert_eq!(got, s1);
+    // The same with superseded memories. The 5 newest are superseded and, being shorter, rank
+    // first by BM25 too: a fixed top 3 per signal would find only `head`. Reading on finds 3.
+    let olds: Vec<MemoryId> = (0..5)
+        .map(|i| {
+            store
+                .remember("b", Memory::new(format!("window old notes kept here {i}")))
+                .unwrap()
+                .id()
+                .clone()
+        })
+        .collect();
+    let newest: Vec<MemoryId> = (0..5)
+        .map(|i| {
+            store
+                .remember("b", Memory::new(format!("window {i}")))
+                .unwrap()
+                .id()
+                .clone()
+        })
+        .collect();
+    let head = store
+        .remember("b", Memory::new("window head"))
+        .unwrap()
+        .id()
+        .clone();
+    for n in &newest {
+        store.supersede(n, &head).unwrap();
+    }
+    let hits = store
+        .recall(&["b"])
+        .text("window")
+        .candidates(3)
+        .k(3)
+        .run()
+        .unwrap();
+    assert_eq!(hits.len(), 3);
+    assert!(hits.iter().all(|h| !newest.contains(&h.id)));
+    assert!(hits.iter().any(|h| olds.contains(&h.id)));
+    db.close().unwrap();
+}
+
+#[test]
+fn a_first_hit_past_the_budget_is_returned_and_marked_truncated() {
+    // simp724's N2 on #1374: D308's rule, as the engine's budgets have it.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("mem.phdb"), Options::default()).unwrap();
+    let store = Store::create(&db, "s", StoreOptions::new()).unwrap();
+    store
+        .remember("a", Memory::new("only one memory here"))
+        .unwrap();
+    let (hits, st) = store
+        .recall(&["a"])
+        .text("memory")
+        .byte_budget(4)
+        .run_with_stats()
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(st.truncated);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_superseded_hit_says_what_superseded_it() {
+    // cli692's S1 on #1374.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("mem.phdb"), Options::default()).unwrap();
+    let store = Store::create(&db, "s", StoreOptions::new()).unwrap();
+    let old = store.remember("a", Memory::new("deploy tuesday")).unwrap();
+    let new = store.remember("a", Memory::new("deploy thursday")).unwrap();
+    store.supersede(old.id(), new.id()).unwrap();
+    let hits = store
+        .recall(&["a"])
+        .text("deploy")
+        .include_superseded(true)
+        .run()
+        .unwrap();
+    let by: BTreeMap<MemoryId, Option<MemoryId>> =
+        hits.into_iter().map(|h| (h.id, h.superseded_by)).collect();
+    assert_eq!(by[old.id()].as_ref(), Some(new.id()));
+    assert_eq!(by[new.id()], None);
     db.close().unwrap();
 }

@@ -82,7 +82,6 @@ impl core::fmt::Debug for pigeonhole_memory::ReadStore
 pub fn pigeonhole_memory::ReadStore::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_memory::Recall<'a>
 impl<'a> pigeonhole_memory::Recall<'a>
-pub fn pigeonhole_memory::Recall<'a>::at(self, u64) -> Self
 pub fn pigeonhole_memory::Recall<'a>::byte_budget(self, u64) -> Self
 pub fn pigeonhole_memory::Recall<'a>::candidates(self, usize) -> Self
 pub fn pigeonhole_memory::Recall<'a>::embedding(self, impl core::convert::Into<alloc::vec::Vec<f32>>) -> Self
@@ -90,6 +89,7 @@ pub fn pigeonhole_memory::Recall<'a>::fusion(self, pigeonhole_memory::Fusion) ->
 pub fn pigeonhole_memory::Recall<'a>::half_life(self, core::time::Duration) -> Self
 pub fn pigeonhole_memory::Recall<'a>::include_superseded(self, bool) -> Self
 pub fn pigeonhole_memory::Recall<'a>::k(self, usize) -> Self
+pub fn pigeonhole_memory::Recall<'a>::now_us(self, u64) -> Self
 pub fn pigeonhole_memory::Recall<'a>::run(self) -> pigeonhole_memory::Result<alloc::vec::Vec<pigeonhole_memory::RecallHit>>
 pub fn pigeonhole_memory::Recall<'a>::run_with_stats(self) -> pigeonhole_memory::Result<(alloc::vec::Vec<pigeonhole_memory::RecallHit>, pigeonhole_memory::RecallStats)>
 pub fn pigeonhole_memory::Recall<'a>::session(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -108,6 +108,7 @@ pub pigeonhole_memory::RecallHit::importance: f64
 pub pigeonhole_memory::RecallHit::kind: pigeonhole_memory::Kind
 pub pigeonhole_memory::RecallHit::score: f64
 pub pigeonhole_memory::RecallHit::signals: core::option::Option<pigeonhole_memory::Signals>
+pub pigeonhole_memory::RecallHit::superseded_by: core::option::Option<pigeonhole_memory::MemoryId>
 pub pigeonhole_memory::RecallHit::text: alloc::string::String
 #[non_exhaustive] pub struct pigeonhole_memory::RecallStats
 pub pigeonhole_memory::RecallStats::candidates: usize
@@ -119,7 +120,7 @@ pub pigeonhole_memory::Signal::value: f64
 pub pigeonhole_memory::Signals::importance: core::option::Option<pigeonhole_memory::Signal>
 pub pigeonhole_memory::Signals::keyword: core::option::Option<pigeonhole_memory::Signal>
 pub pigeonhole_memory::Signals::recency: core::option::Option<pigeonhole_memory::Signal>
-pub pigeonhole_memory::Signals::use_: core::option::Option<pigeonhole_memory::Signal>
+pub pigeonhole_memory::Signals::uses: core::option::Option<pigeonhole_memory::Signal>
 pub pigeonhole_memory::Signals::vector: core::option::Option<pigeonhole_memory::Signal>
 #[non_exhaustive] pub struct pigeonhole_memory::Source
 pub pigeonhole_memory::Source::at_us: u64
@@ -177,7 +178,7 @@ pub pigeonhole_memory::StoredMemory::uses: u64
 pub pigeonhole_memory::Weights::importance: f64
 pub pigeonhole_memory::Weights::keyword: f64
 pub pigeonhole_memory::Weights::recency: f64
-pub pigeonhole_memory::Weights::use_: f64
+pub pigeonhole_memory::Weights::uses: f64
 pub pigeonhole_memory::Weights::vector: f64
 impl core::default::Default for pigeonhole_memory::Weights
 pub fn pigeonhole_memory::Weights::default() -> Self

@@ -55,22 +55,22 @@
 - **`Store::recall(&[&str]) -> Recall<'_>`** and **`ReadStore::recall`.** `Recall` is a `#[must_use]` builder:
   - **The query:** `.text(t)` and `.embedding(Vec<f32>)`. At least one is needed. The embedding is checked against the dimension, and is refused on a handle without the model.
   - **Limits:** `.k(n)` (default 10), `.candidates(n)` (per signal per namespace, default 50) and `.byte_budget(bytes)`.
-  - **Reproducibility:** `.snapshot(&s)` and `.at(us)` (the time ages are measured from, default now).
+  - **Reproducibility:** `.snapshot(&s)` and `.now_us(us)` (the time ages are measured from, default now).
   - **Scoring:** `.half_life(Duration)` (default 7 days), `.fusion(Fusion)` and `.weights(Weights)`.
   - **Filters:** `.include_superseded(bool)` and `.session(s)`.
   - **What a hit carries:** `.with_signals(bool)` and `.with_embeddings(bool)`.
   - **Running it:** `run() -> Result<Vec<RecallHit>>` and `run_with_stats() -> Result<(Vec<RecallHit>, RecallStats)>`.
 - **`Fusion`** (`#[non_exhaustive]`, default `Rrf`): `Rrf` or `Linear`.
-- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1): `vector`, `keyword`, `recency`, `importance`, `use_`. Build it from `default()` and set its fields. T4 adds `graph`.
-- **`RecallHit`** (`#[non_exhaustive]`): `id`, `text`, `kind`, `importance`, `created_us`, `score`, `signals: Option<Signals>` and `embedding: Option<Vec<f32>>`.
+- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1): `vector`, `keyword`, `recency`, `importance`, `uses`. Build it from `default()` and set its fields. T4 adds `graph`.
+- **`RecallHit`** (`#[non_exhaustive]`): `id`, `text`, `kind`, `importance`, `created_us`, `superseded_by: Option<MemoryId>` (set only under `include_superseded`; cli692's S1 on #1374), `score`, `signals: Option<Signals>` and `embedding: Option<Vec<f32>>`.
 - **The signal types** are `#[non_exhaustive]`:
-  - `Signals` has `vector`, `keyword`, `recency`, `importance` and `use_`, each an `Option<Signal>`;
+  - `Signals` has `vector`, `keyword`, `recency`, `importance` and `uses`, each an `Option<Signal>`;
   - `Signal` has `rank: u32` and `value: f64`.
 - **`RecallStats`** (`#[non_exhaustive]`): `candidates` and `truncated`.
 - **`ReadStore`** comes from `Store::open_reader(&PigeonholeReader, name, model_id)`, which fails with `Mismatch` as `open` does, or from `Store::open_reader_without_embeddings`. It has `recall`, `get`, `verify` and `embedding_model`, and no writes.
 
 **The rules as built:**
-- **Candidates, per namespace:**
+- **Candidates, per namespace,** counted after the filters (simp724's N1 on #1374). Each signal's list reads further down, with `n` doubling, until it holds `n` memories that pass the superseded and session filters, or its namespace is exhausted. So a filtered recall still gets each signal's best `n` eligible memories. The lists are:
   - the `n` nearest by the core's exact cosine search;
   - the `n` best from the text index with `id_prefix({ns}\0m)`;
   - the `n` newest by prefix scan.
@@ -83,7 +83,8 @@
 - **Ranks:** competition ranking, `1 + the number of strictly greater values`, so equal values share a rank. With a tie-break by id instead, every importance at its default would have handed the newest memory an edge.
 - **RRF:** `Σ w / (60 + rank)`. Linear is `Σ w · min-max-normalised value`.
 - **Order:** score descending, then id.
-- **A hit's size:** its text, its id's byte form, and 16, plus 60 with signals and `4 · dim` with the embedding. Hits are whole, at least one is returned, and `truncated` is set when the budget, not `k`, cut the list.
+- **A hit's size:** its text, its id's byte form, and 16, plus 60 with signals and `4 · dim` with the embedding. Hits are whole, and at least one is returned, as with the engine's budgets (D308): the first even if it alone is larger. `truncated` is set whenever the budget cut the list, that case included (simp724's N2 on #1374).
+- **Names settled with cli692 on #1374:** `now_us(us)` (not `at`), and `uses` in `Signals` and `Weights` (not `use_`).
 
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:

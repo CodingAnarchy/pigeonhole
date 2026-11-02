@@ -59,7 +59,7 @@ store.mark_used(&[hits[0].id.clone()])?;
 # }
 ```
 
-- **Candidates:** for each namespace, the 50 most similar by embedding (an exact search), the 50 best keyword matches (BM25 from the text index), and the 50 newest. `candidates(n)` changes the 50.
+- **Candidates:** for each namespace, the 50 most similar by embedding (an exact search), the 50 best keyword matches (BM25 from the text index), and the 50 newest. `candidates(n)` changes the 50. They're counted after the filters below: a session-filtered recall reads on until each signal has its 50 from that session, or runs out.
 - **Signals:** every candidate gets each signal:
   - its similarity;
   - its keyword score, if it was a keyword match;
@@ -67,9 +67,9 @@ store.mark_used(&[hits[0].id.clone()])?;
   - its importance;
   - its use, `ln(1 + uses)`, decayed since its last use.
 - **Fusion:** reciprocal rank fusion, `Σ w / (60 + rank)` over the signals a memory ranks in. Equal values share a rank, so a tie gives no memory an edge, and equal fused scores are ordered by id. `Fusion::Linear` sums min-max-normalised signals instead. `Weights` sets each signal's weight.
-- **The byte budget:** each hit counts its text, its id and 16 bytes, plus its signals and embedding when asked for (`with_signals`, `with_embeddings`). Hits are whole or left out, and at least one is returned. `RecallStats::truncated` says when the budget cut the list.
-- **Filters:** superseded memories are left out unless `include_superseded(true)`, and `session(s)` keeps one session.
-- **Determinism:** with an explicit `snapshot` and `at(time)`, the same call always returns the same result.
+- **The byte budget:** each hit counts its text, its id and 16 bytes, plus its signals and embedding when asked for (`with_signals`, `with_embeddings`). Hits are whole or left out, and at least one is returned, even if it alone is over the budget. `run_with_stats()`'s `RecallStats::truncated` says when the budget cut the list.
+- **Filters:** superseded memories are left out unless `include_superseded(true)`, and then each such hit's `superseded_by` names its successor. `session(s)` keeps one session.
+- **Determinism:** with an explicit `snapshot` and `now_us(time)`, the same call always returns the same result.
 - **Either signal alone works:** text alone recalls by keyword and recency, and an embedding alone by similarity and recency.
 
 ## Lifecycle

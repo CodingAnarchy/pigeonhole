@@ -450,7 +450,9 @@ impl Store {
         })
     }
 
-    /// Recalls memories from `namespaces` (D311 §3): set `text`, an `embedding`, or both,
+    /// Recalls memories from `namespaces` (D311 §3): each an exact namespace, as written
+    /// (no prefixes or patterns), fused together into one ranking. At least one is needed:
+    /// an empty list fails `run` with `InvalidArgument`. Set `text`, an `embedding`, or both,
     /// then [`run`](Recall::run). On a handle opened without the store's model, recall is
     /// by keyword and recency only.
     pub fn recall(&self, namespaces: &[&str]) -> Recall<'_> {
