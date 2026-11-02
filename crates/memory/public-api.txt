@@ -52,6 +52,12 @@ pub pigeonhole_memory::ForgetPass::protected: u64
 pub pigeonhole_memory::ForgetPass::resume: core::option::Option<pigeonhole_memory::MemoryId>
 #[non_exhaustive] pub struct pigeonhole_memory::ForgetPolicy
 impl pigeonhole_memory::ForgetPolicy
+pub fn pigeonhole_memory::ForgetPolicy::get_half_life(&self) -> core::time::Duration
+pub fn pigeonhole_memory::ForgetPolicy::get_interval(&self) -> core::time::Duration
+pub fn pigeonhole_memory::ForgetPolicy::get_max_age(&self, pigeonhole_memory::Kind) -> core::option::Option<core::time::Duration>
+pub fn pigeonhole_memory::ForgetPolicy::get_max_per_pass(&self) -> usize
+pub fn pigeonhole_memory::ForgetPolicy::get_min_retention(&self) -> core::option::Option<f64>
+pub fn pigeonhole_memory::ForgetPolicy::get_use_weight(&self) -> f64
 pub fn pigeonhole_memory::ForgetPolicy::half_life(self, core::time::Duration) -> Self
 pub fn pigeonhole_memory::ForgetPolicy::interval(self, core::time::Duration) -> Self
 pub fn pigeonhole_memory::ForgetPolicy::max_age(self, pigeonhole_memory::Kind, core::time::Duration) -> Self

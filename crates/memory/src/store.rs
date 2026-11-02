@@ -88,14 +88,16 @@ impl StoreOptions {
     }
 
     /// The store's forget policy (T2): the [`Forgetter`] runs it, and
-    /// [`Store::forget`] uses it by default.
+    /// [`Store::forget`] uses it by default. It replaces any policy set before, including an
+    /// [`episodic_ttl`](Self::episodic_ttl): call that after this to add one.
     pub fn forget(mut self, policy: ForgetPolicy) -> Self {
         self.forget = Some(policy);
         self
     }
 
     /// Shorthand: episodic memories are forgotten `age` after their creation, as
-    /// [`ForgetPolicy::max_age`] with [`Kind::Episodic`] (added to any policy already set).
+    /// [`ForgetPolicy::max_age`] with [`Kind::Episodic`]. After [`forget`](Self::forget), it
+    /// adds the age to that policy; before it, `forget` replaces it.
     pub fn episodic_ttl(mut self, age: std::time::Duration) -> Self {
         let p = self.forget.take().unwrap_or_default();
         self.forget = Some(p.max_age(Kind::Episodic, age));
@@ -400,8 +402,9 @@ impl StoreStats {
 }
 
 /// A memory store, in the writer process: one table plus its text index (D311 §2). Clone it
-/// to share it: clones are cheap, and the store's [`Forgetter`] stops when the last one
-/// drops.
+/// to share it: clones are cheap and share everything (the database handle, the pinned model,
+/// the persisted forget policy and the one [`Forgetter`], which stops when the last clone
+/// drops); nothing is cached per clone, so a write through one is seen by all.
 #[derive(Clone)]
 pub struct Store {
     db: Pigeonhole,

@@ -89,7 +89,36 @@ impl ForgetPolicy {
         self
     }
 
-    pub(crate) fn interval_value(&self) -> Duration {
+    /// The retention below which a memory is forgotten, if any.
+    pub fn get_min_retention(&self) -> Option<f64> {
+        self.min_retention
+    }
+
+    /// The maximum age set for `kind`, if any.
+    pub fn get_max_age(&self, kind: Kind) -> Option<Duration> {
+        self.max_age
+            .iter()
+            .find(|(k, _)| *k == kind)
+            .map(|(_, a)| *a)
+    }
+
+    /// Retention's half-life.
+    pub fn get_half_life(&self) -> Duration {
+        self.half_life
+    }
+
+    /// The weight of `ln(1 + uses)` in retention.
+    pub fn get_use_weight(&self) -> f64 {
+        self.use_weight
+    }
+
+    /// The most memories a pass deletes.
+    pub fn get_max_per_pass(&self) -> usize {
+        self.max_per_pass
+    }
+
+    /// How often the [`Forgetter`] runs a pass.
+    pub fn get_interval(&self) -> Duration {
         self.interval
     }
 
@@ -550,12 +579,22 @@ impl Drop for UserToken {
 /// It watches the application's handles: once every [`Store`] handle is gone,
 /// [`closed`](Self::closed) is true and the loop ends. Each deletion is its own transaction,
 /// so stopping between calls is always safe.
+///
+/// [`Pigeonhole::close`](pigeonhole::Pigeonhole::close) doesn't wait for a pass: a pass in
+/// flight fails with [`Closed`](pigeonhole::ErrorCode::Closed) at its next read or commit, and
+/// the deletion it had open is dropped whole, so the store stays consistent. To let the
+/// forgetter finish instead, drop the [`Store`] handles and wait for it to stop (on the crate's
+/// thread, it stops within its current pass) before closing.
 pub struct Forgetter {
     store: Store,
     user: Weak<UserToken>,
     signal: Arc<Signal>,
     resume: Option<MemoryId>,
     next_pass: Instant,
+    /// Passes failed in a row: each waits twice as long, from 5 s up to `interval`.
+    failures: u32,
+    /// The interval of the policy last read (the default before one is).
+    interval: Duration,
 }
 
 impl std::fmt::Debug for Forgetter {
@@ -574,6 +613,8 @@ impl Forgetter {
             signal,
             resume: None,
             next_pass: Instant::now(),
+            failures: 0,
+            interval: ForgetPolicy::default().interval,
         }
     }
 
@@ -583,16 +624,36 @@ impl Forgetter {
     /// again soon (a pass stopped at `max_per_pass` with more to look at). When it returns
     /// `false`, the next pass is due after the policy's interval: [`wait`](Self::wait).
     /// Without a policy it does nothing, and checks again after an hour or when one is set.
+    ///
+    /// A failed pass (the database closed, retries used up) returns its error, and the next
+    /// pass waits: 5 s after the first failure, doubling with each failure in a row up to the
+    /// policy's interval. A pass that succeeds resets it. Calls before then return `false`.
+    #[must_use = "`true` means call again soon; `false` means wait"]
     pub fn run_once(&mut self, budget: Duration) -> Result<bool> {
         if self.closed() || Instant::now() < self.next_pass {
             return Ok(false);
         }
+        let r = self.passes(budget);
+        if r.is_err() {
+            self.failures = self.failures.saturating_add(1);
+            let backoff = Duration::from_secs(5)
+                .saturating_mul(1 << (self.failures - 1).min(20))
+                .min(self.interval);
+            self.next_pass = Instant::now() + backoff;
+        } else {
+            self.failures = 0;
+        }
+        r
+    }
+
+    fn passes(&mut self, budget: Duration) -> Result<bool> {
         let start = Instant::now();
         loop {
             let Some(policy) = self.store.forget_policy()? else {
-                self.next_pass = Instant::now() + ForgetPolicy::default().interval_value();
+                self.next_pass = Instant::now() + ForgetPolicy::default().interval;
                 return Ok(false);
             };
+            self.interval = policy.interval;
             let mut f = self.store.forget().policy(&policy);
             if let Some(r) = &self.resume {
                 f = f.after(r);
@@ -600,7 +661,7 @@ impl Forgetter {
             let pass = f.run()?;
             self.resume = pass.resume;
             if self.resume.is_none() {
-                self.next_pass = Instant::now() + policy.interval_value();
+                self.next_pass = Instant::now() + policy.interval;
                 return Ok(false);
             }
             if self.closed() || start.elapsed() >= budget {
@@ -639,11 +700,9 @@ pub(crate) fn spawn(mut f: Forgetter) -> std::io::Result<()> {
         .name("pigeonhole-memory-forgetter".into())
         .spawn(move || {
             while !f.closed() {
-                match f.run_once(Duration::from_millis(100)) {
-                    Ok(true) => {}
-                    Ok(false) => f.wait(Duration::from_secs(60)),
-                    // A failed pass (the database closing, say) is retried after a wait.
-                    Err(_) => f.wait(Duration::from_secs(5)),
+                // A failed pass (the database closing, say) is retried after run_once's backoff.
+                if !matches!(f.run_once(Duration::from_millis(100)), Ok(true)) {
+                    f.wait(Duration::from_secs(60));
                 }
             }
         })

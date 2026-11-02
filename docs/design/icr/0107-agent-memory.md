@@ -92,8 +92,9 @@ The shapes were settled with cli692 on #1336 (c6589132014).
   - `min_retention(f64)`;
   - `max_age(Kind, Duration)`, counted from `created_us`;
   - `half_life(Duration)` (7 days), `use_weight(f64)` (0.1), `max_per_pass(usize)` (1,000), `interval(Duration)` (1 h).
+  - **Getters** for every field (#1380 review): `get_min_retention`, `get_max_age(Kind)`, `get_half_life`, `get_use_weight`, `get_max_per_pass`, `get_interval`.
   - **Retention** is `importance · exp(−since_last_use / half_life) + use_weight · ln(1 + uses)`. The use term doesn't decay, so heavy use protects a memory from retention (not from `max_age`).
-- **The persisted policy:** `StoreOptions::forget(ForgetPolicy)` and `StoreOptions::episodic_ttl(Duration)` (the shorthand) record it in `G` (`meta:forget`, versioned). `Store::forget_policy()` reads it, and `Store::set_forget_policy(Option<ForgetPolicy>)` changes it (`None` turns forgetting off).
+- **The persisted policy:** `StoreOptions::forget(ForgetPolicy)` and `StoreOptions::episodic_ttl(Duration)` (the shorthand; after `forget` it adds to that policy, before it `forget` replaces it) record it in `G` (`meta:forget`, versioned). `Store::forget_policy()` reads it, and `Store::set_forget_policy(Option<ForgetPolicy>)` changes it (`None` turns forgetting off).
 - **A pass:** `Store::forget() -> Forget<'_>`, with `.policy(&p)` (a one-off override), `.after(&MemoryId)` (resume) and `.now_us(u64)`, then `.run() -> Result<ForgetPass>`.
   - `InvalidArgument` with no persisted policy and no override.
   - `ForgetPass` (`#[non_exhaustive]`): `examined`, `deleted`, `protected`, and `resume: Option<MemoryId>`.
@@ -110,7 +111,9 @@ The shapes were settled with cli692 on #1336 (c6589132014).
 - **The `Forgetter`:**
   - **The crate's thread:** without `own_forgetter`, the crate runs one on its own thread when the store has a policy at open, or once `set_forget_policy` sets one.
   - **The application's:** with `own_forgetter`, `Store::take_forgetter() -> Option<Forgetter>` hands it out once.
-  - **Its API:** `run_once(budget) -> Result<bool>`, `wait(timeout)`, `closed()` and `set_wakeup`, as `pigeonhole-vector`'s `Rebalancer` has. It reads the persisted policy before each pass, and it's closed once every application handle drops.
+  - **Its API:** `run_once(budget) -> Result<bool>`, `wait(timeout)`, `closed()` and `set_wakeup`, as `pigeonhole-vector`'s `Rebalancer` has. It reads the persisted policy before each pass, and it's closed once every application handle drops. `run_once` is `#[must_use]`.
+  - **A failed pass** returns its error and backs off: the next pass is due 5 s later, doubling with each failure in a row up to the policy's interval (#1380 review B1).
+  - **`Pigeonhole::close`** doesn't wait for a pass: the deletion in flight fails with `Closed` and is dropped whole (#1380 review Q1).
 - **`Store` is `Clone`** (cheap clones), so the forgetter can watch the application's handles.
 - **A forgotten memory** is deleted as `delete` deletes, so the change feed (D310) shows deletes.
 - **Nothing on `ReadStore`:** forgetting writes.

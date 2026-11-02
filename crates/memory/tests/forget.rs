@@ -345,3 +345,122 @@ fn the_crates_forgetter_thread_runs_the_policy() {
     drop(store);
     db.close().unwrap();
 }
+
+/// simp724's B1 on #1380: a failed pass backs off (5 s, doubling up to the interval) instead
+/// of retrying at once, for the crate's thread and an application's loop alike.
+#[test]
+fn a_failed_pass_backs_off() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create_with(
+        &db,
+        "m",
+        StoreOptions::new().forget(ForgetPolicy::new().min_retention(0.5)),
+        OpenOptions::new().without_embeddings().own_forgetter(),
+    )
+    .unwrap();
+    store
+        .remember("a", Memory::new("note").importance(0.1))
+        .unwrap();
+    let mut f = store.take_forgetter().unwrap();
+    db.close().unwrap();
+    assert!(f.run_once(Duration::from_secs(1)).is_err());
+    // Within the backoff no pass runs (one would fail again on the closed database), and
+    // wait sleeps out its timeout instead of returning after a millisecond.
+    let start = Instant::now();
+    let mut passes = 0;
+    while start.elapsed() < Duration::from_millis(100) {
+        assert!(
+            !f.run_once(Duration::from_secs(1)).unwrap(),
+            "no pass is due"
+        );
+        passes += 1;
+        f.wait(Duration::from_millis(25));
+    }
+    assert!(passes <= 5, "{passes} calls in 100 ms");
+    assert!(!f.closed());
+    drop(store);
+    assert!(f.closed());
+}
+
+/// simp724's Q1 on #1380: closing the database doesn't wait for a forget pass. The deletion
+/// it had open fails with `Closed` and is dropped whole, so the memory and its index entries
+/// are all still there after a reopen.
+#[test]
+fn a_close_during_a_pass_drops_its_deletion_whole() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = Store::create(
+        &db,
+        "m",
+        StoreOptions::new().forget(ForgetPolicy::new().min_retention(0.5)),
+    )
+    .unwrap();
+    let m = store
+        .remember("a", Memory::new("note doomed").importance(0.1))
+        .unwrap();
+    let mut txn = db.transaction().unwrap();
+    assert_eq!(
+        store.forget_in(&mut txn, m.id(), now()).unwrap(),
+        Forgot::Deleted
+    );
+    drop(store);
+    db.close().unwrap();
+    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Closed);
+    let db = open(&dir);
+    let store = Store::open_with(
+        &db,
+        "m",
+        OpenOptions::new().without_embeddings().own_forgetter(),
+    )
+    .unwrap();
+    assert_eq!(ids(&store), vec![m.id().clone()]);
+    check(&store, "after a close mid-pass");
+    drop(store);
+    db.close().unwrap();
+}
+
+/// cli692's S1 on #1380: a policy read back can be inspected.
+#[test]
+fn a_policy_reads_back_through_its_getters() {
+    let p = ForgetPolicy::new()
+        .min_retention(0.3)
+        .max_age(Kind::Episodic, Duration::from_secs(60))
+        .half_life(Duration::from_secs(10))
+        .use_weight(0.2)
+        .max_per_pass(7)
+        .interval(Duration::from_secs(5));
+    assert_eq!(p.get_min_retention(), Some(0.3));
+    assert_eq!(p.get_max_age(Kind::Episodic), Some(Duration::from_secs(60)));
+    assert_eq!(p.get_max_age(Kind::Semantic), None);
+    assert_eq!(p.get_half_life(), Duration::from_secs(10));
+    assert_eq!(p.get_use_weight(), 0.2);
+    assert_eq!(p.get_max_per_pass(), 7);
+    assert_eq!(p.get_interval(), Duration::from_secs(5));
+    // episodic_ttl after forget adds to the policy; forget after episodic_ttl replaces it.
+    let after = StoreOptions::new()
+        .forget(ForgetPolicy::new().min_retention(0.3))
+        .episodic_ttl(Duration::from_secs(9));
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let s = Store::create(&db, "after", after).unwrap();
+    let got = s.forget_policy().unwrap().unwrap();
+    assert_eq!(got.get_min_retention(), Some(0.3));
+    assert_eq!(
+        got.get_max_age(Kind::Episodic),
+        Some(Duration::from_secs(9))
+    );
+    let before = StoreOptions::new()
+        .episodic_ttl(Duration::from_secs(9))
+        .forget(ForgetPolicy::new().min_retention(0.3));
+    let s2 = Store::create(&db, "before", before).unwrap();
+    assert_eq!(
+        s2.forget_policy()
+            .unwrap()
+            .unwrap()
+            .get_max_age(Kind::Episodic),
+        None
+    );
+    drop((s, s2));
+    db.close().unwrap();
+}

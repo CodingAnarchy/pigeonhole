@@ -108,6 +108,7 @@ assert_eq!(pass.deleted, 1);
 - **Protected memories** are never forgotten: pinned ones, and the sources a live semantic memory was derived from.
 - **Each deletion re-checks its memory in its own transaction.** So a `mark_used`, a merge or a new link that lands meanwhile is respected.
 - **The `Forgetter`:** the crate runs one on its own thread when the store has a policy. An application that runs its own threads opens with `OpenOptions::new().own_forgetter()` and drives `take_forgetter()` itself.
+- **Failures and closing:** a failed pass is retried after 5 s, doubling with each failure in a row up to the policy's interval. `Pigeonhole::close` doesn't wait for a pass: the deletion in flight fails with `Closed` and is dropped whole, so nothing is left half-forgotten. To let a pass finish, drop the `Store` handles before closing.
 - **Forgotten memories are deletes,** so the change feed shows them.
 
 ## Reader processes
