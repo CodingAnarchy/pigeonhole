@@ -9374,14 +9374,17 @@ impl ShardState {
         }
     }
 
-    /// The change feed's key of a logged record (`ckpt_key`): the seqno a reader orders it
-    /// by. An undecided or aborted PREPARE has none (0).
-    fn logged_key(&self, l: &Logged) -> Seqno {
-        match &l.kind {
+    /// Raises `ckpt_key` to a popped record's change-feed key: the seqno a reader orders it
+    /// by (an undecided or aborted PREPARE has none, 0). Out of line, called only with the
+    /// feed on (`advance_checkpoint`).
+    #[inline(never)]
+    fn note_ckpt_key(&mut self, l: &Logged) {
+        let key = match &l.kind {
             LoggedKind::Single { .. } => l.seqno,
             LoggedKind::Prepare { .. } => self.share_seqnos.get(&l.seqno).map_or(0, |s| s.0),
             LoggedKind::Commit { apply, .. } => apply.unwrap_or(0),
-        }
+        };
+        self.ckpt_key = self.ckpt_key.max(key);
     }
 
     /// The other shards among `holders` whose flushed-through seqno is below `seqno` (D266).
@@ -9482,6 +9485,9 @@ impl ShardState {
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
         let mut more = false;
+        // Tested once, not per record; the key's update is out of line (perf287 on #1316:
+        // feed code inlined into a per-record loop costs the feed-off shapes, as on #1297).
+        let feed_on = self.shared.feed.is_some();
         while let Some(front) = self.log.front() {
             if self.needed(catalog, front) {
                 break;
@@ -9496,8 +9502,8 @@ impl ShardState {
             }
             self.checkpoint_pops += 1;
             let l = self.log.pop_front().expect("checked");
-            if self.shared.feed.is_some() {
-                self.ckpt_key = self.ckpt_key.max(self.logged_key(&l));
+            if feed_on {
+                self.note_ckpt_key(&l);
             }
             self.unindex_front(&l);
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
