@@ -1148,6 +1148,17 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
     /// Re-cuts `kept` (in cell order) to the global prefix: columns admitted whole while
     /// they fit, and nothing at or past a recorded overflow.
     fn cut(&mut self) {
+        // Two copies: a read without a row limit runs the loop with no row counting at all
+        // (#1284: counting on every kept cell cost scan-budget 13 instructions per cell).
+        if self.rows == NO_ROW_LIMIT {
+            self.cut_rows::<false>();
+        } else {
+            self.cut_rows::<true>();
+        }
+    }
+
+    /// [`cut`](Self::cut), counting rows against the limit only when `LIMITED`.
+    fn cut_rows<const LIMITED: bool>(&mut self) {
         let mut used = 0u64;
         let mut keep = 0;
         let mut i = 0;
@@ -1167,7 +1178,7 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
             }
             let row = &self.kept[i].key.row;
             let new_row = keep == 0 || self.kept[keep - 1].key.row != *row;
-            if new_row && rows == self.rows {
+            if LIMITED && new_row && rows == self.rows {
                 // The row limit stops first: what follows is past it.
                 hit_rows = true;
                 break;
@@ -1182,7 +1193,9 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
                 break;
             }
             used += own + charge;
-            rows += usize::from(new_row);
+            if LIMITED {
+                rows += usize::from(new_row);
+            }
             keep = j;
             i = j;
         }
@@ -1192,7 +1205,8 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
         };
         // An overflow in a row past the `rows`-th: the row limit stopped the read first.
         let last_row = keep.checked_sub(1).map(|k| self.kept[k].key.row.as_slice());
-        if let Some(o) = &overflow
+        if LIMITED
+            && let Some(o) = &overflow
             && rows == self.rows
             && last_row != Some(o.key.row.as_slice())
         {
