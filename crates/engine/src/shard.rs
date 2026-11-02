@@ -1655,6 +1655,9 @@ struct Member {
     /// room the shard freed for the members ahead of it meanwhile. Four bytes, in padding
     /// `Member` already had: every member is moved several times per group.
     room_since: u32,
+    /// The token of admission's decode of its batch (`Dedup::decode`), which its apply
+    /// reuses when nothing was decoded since (#1206); 0: none.
+    decoded: u32,
     /// A single waiting for undecided shares: its id in `ShardState::waiting_singles` (0:
     /// it is not waiting). It waits only for the shares undecided on its rows when it
     /// started; shares that come after wait for it (D267).
@@ -1720,6 +1723,7 @@ impl Member {
             reserved: 0,
             map_version: req.map_version,
             room_since: 0,
+            decoded: 0,
             share_wait: 0,
             rank: 0,
             voted: false,
@@ -2243,11 +2247,17 @@ fn slot_of<'a>(
 /// Same-commit collapse scratch (decision D34): the last mutation per
 /// `(table, family, row, qualifier, timestamp)` wins. Mutations are compared exactly (by the
 /// bytes of their key parts, located by offset within the batch), with reusable buffers and
-/// no per-cell allocation. The scan is also the batch's only decode on apply: `apply` reads
-/// each mutation back from `keys`.
+/// no per-cell allocation. The decode is the batch's only one on the shard (#1206): admission
+/// (`reserve_room`) decodes a single into `keys`, and its apply reads them back when nothing
+/// was decoded in between (`decoded`, the token the member carries); `apply` decodes again
+/// otherwise.
 #[derive(Debug, Default)]
 struct Dedup {
     keys: Vec<MutKey>,
+    /// The token of the decode `keys` holds, unresolved and unscanned (0: none).
+    held: u32,
+    /// The last token handed out.
+    tokens: u32,
     order: Vec<u32>,
     loser: Vec<bool>,
     /// The batch failed to decode after `keys.len()` mutations.
@@ -2262,8 +2272,10 @@ struct MutKey {
     table: u32,
     family: u32,
     kind: Kind,
-    /// The timestamp it applies at (its own, or the commit's).
+    /// The timestamp it applies at (its own, or the commit's once `scan` resolves it).
     ts: Timestamp,
+    /// It carries its own timestamp (D273), not the commit's.
+    own_ts: bool,
     row: (u32, u32),
     qualifier: (u32, u32),
     value: (u32, u32),
@@ -2281,9 +2293,10 @@ fn span(bytes: &[u8], (off, len): (u32, u32)) -> &[u8] {
 }
 
 impl Dedup {
-    /// Fills the tables for `batch` (whose bytes are `bytes`). Returns whether any
-    /// duplicate exists.
-    fn scan(&mut self, batch: BatchRef<'_>, bytes: &[u8], commit_ts: Timestamp) -> bool {
+    /// Decodes `batch` (whose bytes are `bytes`) into `keys`, with the commit's timestamp
+    /// not yet filled in, and returns the token naming this decode: a later `scan` given it
+    /// reuses the keys if nothing was decoded since.
+    fn decode(&mut self, batch: BatchRef<'_>, bytes: &[u8]) -> u32 {
         self.keys.clear();
         self.error = None;
         let base = bytes.as_ptr() as usize;
@@ -2305,13 +2318,42 @@ impl Dedup {
                 table: m.table.0,
                 family: m.family.0,
                 kind: m.kind,
-                ts: m.ts.unwrap_or(commit_ts),
+                ts: m.ts.unwrap_or(0),
+                own_ts: m.ts.is_some(),
                 row: at(m.row),
                 qualifier: at(m.qualifier),
                 value: at(m.value),
             });
         }
         self.explicit = explicit;
+        self.tokens = self.tokens.wrapping_add(1).max(1);
+        self.held = self.tokens;
+        self.held
+    }
+
+    /// Fills the tables for `batch` (whose bytes are `bytes`), reusing the decode named by
+    /// `token` if `keys` still holds it, at `commit_ts`. Returns whether any duplicate
+    /// exists.
+    fn scan(
+        &mut self,
+        batch: BatchRef<'_>,
+        bytes: &[u8],
+        commit_ts: Timestamp,
+        token: u32,
+    ) -> bool {
+        if token == 0 || token != self.held {
+            self.decode(batch, bytes);
+        }
+        self.held = 0;
+        if !self.explicit {
+            for k in &mut self.keys {
+                k.ts = commit_ts;
+            }
+        } else {
+            for k in self.keys.iter_mut().filter(|k| !k.own_ts) {
+                k.ts = commit_ts;
+            }
+        }
         let n = self.keys.len();
         self.loser.clear();
         self.loser.resize(n, false);
@@ -3826,7 +3868,7 @@ impl ShardState {
         commit_ts: Timestamp,
     ) -> Result<Vec<(TabletId, FamilyId)>> {
         self.note_stamped(commit_ts);
-        self.apply(BatchRef::new(bytes)?, seqno, commit_ts)?;
+        self.apply(BatchRef::new(bytes)?, seqno, commit_ts, 0)?;
         Ok(self.touched_slots.clone())
     }
 
@@ -4041,7 +4083,7 @@ impl ShardState {
     /// With `group` (a single in a group, #749), a slot an earlier single of the group already
     /// reserved for costs no chunk, nor do the fixed two once one did; the slots it touches are
     /// added to the group's (the caller truncates them again if the member is not admitted).
-    fn arena_needed(&self, batch: BatchRef<'_>, rows: &mut Vec<u64>) -> ArenaNeed {
+    fn arena_needed(&self, bytes: &[u8], rows: &mut Vec<u64>) -> ArenaNeed {
         rows.clear();
         let mut total = 0usize;
         let mut waste = 0usize;
@@ -4056,9 +4098,12 @@ impl ShardState {
         // The row of the previous write and its tablet: a run of writes to one row routes
         // and hashes it once.
         let mut last: Option<(TableId, &[u8], Option<TabletId>)> = None;
-        for m in batch.iter().flatten() {
-            let key = 2 * (m.row.len() + m.qualifier.len()) + KEY_FIXED;
-            let entry = ENTRY_OVERHEAD + key + m.value.len();
+        // The batch as `reserve_room` just decoded it (#1206): its apply reads the same keys.
+        for k in &self.dedup.keys {
+            let (table, family) = (TableId(k.table), FamilyId(k.family));
+            let (row, qualifier) = (span(bytes, k.row), span(bytes, k.qualifier));
+            let key = 2 * (row.len() + qualifier.len()) + KEY_FIXED;
+            let entry = ENTRY_OVERHEAD + key + k.value.1 as usize;
             total += entry;
             waste += entry.min(self.chunk_size);
             largest = largest.max(entry);
@@ -4069,18 +4114,18 @@ impl ShardState {
                 min_large = min_large.min(chunks);
             }
             let tablet = match last {
-                Some((t, r, tablet)) if t == m.table && compare(r, m.row).is_eq() => tablet,
+                Some((t, r, tablet)) if t == table && compare(r, row).is_eq() => tablet,
                 _ => {
-                    let tablet = self.tablets.route(m.table, m.row).map(|(t, _)| t);
-                    rows.push(hash_row(m.table, m.row));
-                    last = Some((m.table, m.row, tablet));
+                    let tablet = self.tablets.route(table, row).map(|(t, _)| t);
+                    rows.push(hash_row(table, row));
+                    last = Some((table, row, tablet));
                     tablet
                 }
             };
             match tablet {
-                Some(tablet) if !touched.contains(&(tablet, m.family)) => {
-                    touched.push((tablet, m.family));
-                    if self.tablets_on() && !self.memtables.contains_key(&(tablet, m.family)) {
+                Some(tablet) if !touched.contains(&(tablet, family)) => {
+                    touched.push((tablet, family));
+                    if self.tablets_on() && !self.memtables.contains_key(&(tablet, family)) {
                         new_slots += 1;
                     }
                 }
@@ -4211,7 +4256,10 @@ impl ShardState {
         let mut rows = std::mem::take(&mut self.admit_rows);
         rows.clear();
         let need = match batch {
-            Some(batch) => self.arena_needed(batch, &mut rows),
+            Some(batch) => {
+                self.dedup.decode(batch, batch.as_bytes());
+                self.arena_needed(batch.as_bytes(), &mut rows)
+            }
             None => ArenaNeed {
                 bytes: 0,
                 run_chunks: 1,
@@ -5461,7 +5509,13 @@ impl ShardState {
     /// Applies `bytes` at `seqno`/`commit_ts` to this shard's memtables, last write winning
     /// per `(column, timestamp)` (decision D34). Records the slots written in
     /// `touched_slots`.
-    fn apply(&mut self, batch: BatchRef<'_>, seqno: Seqno, commit_ts: Timestamp) -> Result<()> {
+    fn apply(
+        &mut self,
+        batch: BatchRef<'_>,
+        seqno: Seqno,
+        commit_ts: Timestamp,
+        decoded: u32,
+    ) -> Result<()> {
         // Nothing is applied once the close reported: no flush would persist it (a late
         // cross-shard decision is left to the WAL, `on_decide`).
         debug_assert_ne!(
@@ -5471,7 +5525,7 @@ impl ShardState {
             self.id.0
         );
         let bytes = batch.as_bytes();
-        let dups = self.dedup.scan(batch, bytes, commit_ts);
+        let dups = self.dedup.scan(batch, bytes, commit_ts, decoded);
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let tablets = Arc::clone(&self.tablets);
         let mut last_route: Option<(TableId, &[u8], TabletId)> = None;
@@ -6404,7 +6458,10 @@ impl ShardState {
                 let group = (shares_room && matches!(m.kind, MemberKind::Single))
                     .then(|| group_room.get_or_insert_with(GroupRoom::default));
                 match self.reserve_room(m.bytes.batch().ok(), group) {
-                    Ok(bytes) => m.reserved = bytes,
+                    Ok(bytes) => {
+                        m.reserved = bytes;
+                        m.decoded = self.dedup.held;
+                    }
                     Err(Room::Never) => {
                         // Not a stall: no flush could ever make room. The caller must split
                         // the batch or raise `memtable_budget` (issue #141).
@@ -6743,7 +6800,7 @@ impl ShardState {
                         m.bytes
                             .batch()
                             .map_err(Error::from)
-                            .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts))
+                            .and_then(|batch| self.apply(batch, m.seqno, m.commit_ts, m.decoded))
                     };
                     if let Err(e) = applied {
                         trace!("shard {} apply of {} failed: {e}", self.id.0, m.seqno);
@@ -8251,6 +8308,7 @@ impl ShardState {
             map_version: req.map_version,
             retry: None,
             room_since: 0,
+            decoded: 0,
             share_wait: 0,
             rank: 0,
             voted: false,
@@ -8412,6 +8470,7 @@ impl ShardState {
             map_version: 0,
             retry: None,
             room_since: 0,
+            decoded: 0,
             share_wait: 0,
             rank: 0,
             voted: false,
@@ -8680,10 +8739,10 @@ impl ShardState {
                 {
                     Err(Error::Busy)
                 } else {
-                    self.apply(share.bytes.batch(), apply_seqno, commit_ts)
+                    self.apply(share.bytes.batch(), apply_seqno, commit_ts, 0)
                 };
                 #[cfg(not(feature = "test-hooks"))]
-                let applied = self.apply(share.bytes.batch(), apply_seqno, commit_ts);
+                let applied = self.apply(share.bytes.batch(), apply_seqno, commit_ts, 0);
                 match applied {
                     Ok(()) => {
                         for key in &self.touched_slots {
@@ -11013,8 +11072,28 @@ mod tests {
             }
             let batch = b.batch();
             let mut d = Dedup::default();
-            let dup = d.scan(batch, batch.as_bytes(), 9);
-            (dup, (0..cells.len()).map(|i| d.wins(i)).collect::<Vec<_>>())
+            let dup = d.scan(batch, batch.as_bytes(), 9, 0);
+            let wins = (0..cells.len()).map(|i| d.wins(i)).collect::<Vec<_>>();
+            // Admission's decode reused by the apply (#1206), the commit's timestamp filled in
+            // afterwards: the same losers.
+            let token = d.decode(batch, batch.as_bytes());
+            assert_eq!(d.scan(batch, batch.as_bytes(), 9, token), dup);
+            assert_eq!(
+                (0..cells.len()).map(|i| d.wins(i)).collect::<Vec<_>>(),
+                wins
+            );
+            // A token another decode has replaced since decodes afresh.
+            let mut other = BatchBuilder::new();
+            other.push(t, f, Kind::Put, b"x", b"y", None, b"w").unwrap();
+            let stale = d.decode(batch, batch.as_bytes());
+            d.decode(other.batch(), other.batch().as_bytes());
+            assert_eq!(d.scan(batch, batch.as_bytes(), 9, stale), dup);
+            assert_eq!(
+                (0..cells.len()).map(|i| d.wins(i)).collect::<Vec<_>>(),
+                wins
+            );
+            assert_eq!(d.keys.len(), cells.len());
+            (dup, wins)
         };
         // A row's cells in order: nothing collapses.
         assert_eq!(
