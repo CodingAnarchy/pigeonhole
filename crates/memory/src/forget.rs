@@ -83,7 +83,8 @@ impl ForgetPolicy {
         self
     }
 
-    /// How often the [`Forgetter`] runs a pass when nothing else wakes it: 1 hour by default.
+    /// How often the [`Forgetter`] runs a pass when nothing else wakes it: 1 hour by default,
+    /// at least 1 s.
     pub fn interval(mut self, d: Duration) -> Self {
         self.interval = d;
         self
@@ -137,6 +138,11 @@ impl ForgetPolicy {
         }
         if self.max_per_pass == 0 {
             return bad("max_per_pass must be at least 1");
+        }
+        // The floor between passes, and the cap on a failed pass's backoff: below it a
+        // forgetter would spin (simp724 on #1380).
+        if self.interval < Duration::from_secs(1) {
+            return bad("interval must be at least 1 s");
         }
         Ok(())
     }

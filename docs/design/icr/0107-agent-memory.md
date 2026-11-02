@@ -91,7 +91,7 @@ The shapes were settled with cli692 on #1336 (c6589132014).
 - **`ForgetPolicy`** (`#[non_exhaustive]`, `Clone`, `PartialEq`, a `Default` builder):
   - `min_retention(f64)`;
   - `max_age(Kind, Duration)`, counted from `created_us`;
-  - `half_life(Duration)` (7 days), `use_weight(f64)` (0.1), `max_per_pass(usize)` (1,000), `interval(Duration)` (1 h).
+  - `half_life(Duration)` (7 days), `use_weight(f64)` (0.1), `max_per_pass(usize)` (1,000), `interval(Duration)` (1 h, at least 1 s: `InvalidArgument` below, so a forgetter never spins).
   - **Getters** for every field (#1380 review): `get_min_retention`, `get_max_age(Kind)`, `get_half_life`, `get_use_weight`, `get_max_per_pass`, `get_interval`.
   - **Retention** is `importance · exp(−since_last_use / half_life) + use_weight · ln(1 + uses)`. The use term doesn't decay, so heavy use protects a memory from retention (not from `max_age`).
 - **The persisted policy:** `StoreOptions::forget(ForgetPolicy)` and `StoreOptions::episodic_ttl(Duration)` (the shorthand; after `forget` it adds to that policy, before it `forget` replaces it) record it in `G` (`meta:forget`, versioned). `Store::forget_policy()` reads it, and `Store::set_forget_policy(Option<ForgetPolicy>)` changes it (`None` turns forgetting off).

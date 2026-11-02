@@ -261,6 +261,22 @@ fn the_policy_persists_changes_and_is_required() {
             .set_forget_policy(Some(ForgetPolicy::new().max_per_pass(0)))
             .is_err()
     );
+    // An interval below 1 s would let a forgetter spin (and cap a failed pass's backoff at
+    // nothing): refused, at create as well.
+    assert!(matches!(
+        again.set_forget_policy(Some(
+            ForgetPolicy::new().interval(Duration::from_millis(999))
+        )),
+        Err(Error::InvalidArgument(_))
+    ));
+    assert!(matches!(
+        Store::create(
+            &db,
+            "fast",
+            StoreOptions::new().forget(ForgetPolicy::new().interval(Duration::ZERO))
+        ),
+        Err(Error::InvalidArgument(_))
+    ));
     // The episodic TTL shorthand.
     let ttl = Store::create(
         &db,
@@ -330,7 +346,7 @@ fn the_crates_forgetter_thread_runs_the_policy() {
         .set_forget_policy(Some(
             ForgetPolicy::new()
                 .min_retention(0.5)
-                .interval(Duration::from_millis(50)),
+                .interval(Duration::from_secs(1)),
         ))
         .unwrap();
     let start = Instant::now();
