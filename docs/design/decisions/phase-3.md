@@ -3624,21 +3624,22 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
     - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
 
 
-<a id="d306"></a>
+<a id="d305"></a>
 ## D305 — WITHDRAWN: a pinned shard driver's io_uring workers run off the drivers' CPUs (coordinator decision, 2026-10-31; io, runtime; #1206 lever 3, #1234; would have amended D235; withdrawn 2026-10-31 before it landed)
 **Status: withdrawn.** #1234 was closed unmerged. D235 is unchanged: io_uring's workers (io-wq) stay wherever the kernel places them.
 
 **What it proposed.**
 - **The problem:** on Linux with io_uring, io-wq is per task, so a pinned driver's workers ran on the driver's own CPU and preempted it.
 - **The traced cost:** on sparse-wide, 357–390 preemptions over 100 µs per run (about 0.3 s), and every slow `SyncBarrier` submit.
-- **The proposal:** register the driver's planned CPU set less the drivers' own CPUs with `IORING_REGISTER_IOWQ_AFF` when its ring is made. That was best effort, for pinned engine-owned drivers only.
+- **The proposal:** register the opener's affinity set (the one D235's pin plan is drawn from), less the drivers' CPUs, with `IORING_REGISTER_IOWQ_AFF` when the driver's ring is made. That was best effort, for pinned engine-owned drivers only.
 
 **Why it was withdrawn** (ctr274's rerun on #1206):
 - **What it fixed:** moving io-wq off the driver CPUs halved, or better, sparse-wide's `Buffered` put p99.9.
 - **What it cost:** every `Default` commit, with ycsb-a's put p99 1.26–1.40× and throughput 0.86–0.89×. At `Default`, the group fsync's worker running on the driver's own parked CPU is a benefit, not a cost.
-- **What went forward instead:** the owner's client placement (#1244, ICR 0101), which handles the larger source of driver preemption: bench client threads placed on driver CPUs.
+- **Nothing replaced it on the commit path.** #1244's bench client placement was dropped too, at the default topology. With one shard per physical core, it confines clients to the shards' SMT siblings, and Buffered put p99 roughly doubled (`.coord/out-1244-20261031`). #1244 landed reduced, as the owner's option 1 of 2026-11-01: the `Pigeonhole::pinned_shard_cpus()` accessor (ICR 0101), and a guide note that placement helps only where there are spare physical cores.
 - **Left open, not pursued:** moving only `Buffered` barriers' io-wq work off the driver (submitting them from a non-driver ring) while keeping `Default`'s fsync local. It's measurable, but it would add a second submission path for WAL syncs.
 
+<a id="d306"></a>
 ## D306 — An IVF vector index in `pigeonhole-vector`: lists as wide rows, moves as transactions, rebalancing inside the writes (perf287, 2026-10-31; owner accepted revision 4, #490 c6548019940 with revs c6548079840, c6548105943, c6548115678, c6548128553, decision c6548492501; reviewed by cli692 and simp724; vector, #490 D, ICR 0100; on D296, D299 and D303)
 **Why.** An exact `nearest_*` (D296) reads every candidate, which a collection of millions can't do within an interactive budget. The target is 95% recall@10 on SIFT1M at ≤10 ms, single-threaded. An inverted-file index narrows a query to the few lists nearest it. Built from ordinary rows and transactions, it is as durable and consistent as the database and needs nothing new in the engine.
 
@@ -3718,6 +3719,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 
 **`Search::run_async` (#1268 item 6).** It's on D296 PR 5's `Nearest::run_async`. Every read of the search is async: the layout version, a changed layout's centroids (a scan stream), and the probed lists. Its result equals `run`'s. It's tested from a cold reopen, at an older snapshot and across splits, for every element and metric.
 
+<a id="d307"></a>
 ## D307 — Python bindings: PyO3 directly over `pigeonhole`, published as `pigeonhole-db` for CPython 3.11 and later (ai1249, 2026-10-31; owner decision on #696; reviewed by cli692; python, #696, ICR 0102)
 **Why.** Most agent frameworks are Python (#696, #1251). Bindings straight over the Rust crate keep one implementation and its guarantees, with nothing to keep in step through the C ABI.
 
@@ -3736,6 +3738,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   3. `Table.nearest` (#1277).
   4. The PyPI publish workflow, after the owner's go.
 
+<a id="d308"></a>
 ## D308 — Byte-budgeted reads: a page fits a byte budget, whole columns at a time, and resumes from a versioned position (ai1249, 2026-10-31; owner accepted revision 2, #1250 c6549794531; reviewed by perf287 (engine) and cli692 (API); engine, pigeonhole, #1250, ICR 0103; on D296 and D304)
 **Why.** An agent or a service with a context or response budget needs reads that stop at a size, not a row count, and that resume exactly where they stopped, across processes and restarts (#1250).
 
