@@ -878,12 +878,7 @@ impl Engine {
         mode: Mode,
         held: &mut Option<Locks>,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
-        let shards = if options.shards == 0 {
-            pigeonhole_io::sys::default_shards()
-        } else {
-            options.shards
-        };
-        if shards > 1 << 16 {
+        if options.shards > 1 << 16 {
             return Err(Error::InvalidArgument("at most 65536 shards".to_owned()));
         }
         if options.memtable_budget < 2 * ShardArena::DEFAULT_CHUNK as u64 / 4 {
@@ -949,6 +944,20 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         let db_id = opened.db_id();
+        // What the change feed's last session recorded (D310's amendment): an unset shard
+        // count takes its stream count, and an open that doesn't mention the feed its
+        // settings, so neither ends the feed's history by accident.
+        let last_session =
+            if options.shards == 0 || (options.feed.is_none() && options.feed_inherit) {
+                crate::feed::last_session(&vfs, path, db_id)?
+            } else {
+                None
+            };
+        let shards = match (options.shards, &last_session) {
+            (0, Some(last)) if last.streams > 0 => last.streams as usize,
+            (0, _) => pigeonhole_io::sys::default_shards(),
+            (n, _) => n,
+        };
         // The change feed's sequence check (D310 §2.2): the superblock's sequence before any
         // root commit of this open.
         let opened_at = opened.sequence();
@@ -992,6 +1001,19 @@ impl Engine {
         let read_only = no_writes;
         // The change feed (D310): the session's sidecar entry, written and synced before any
         // WAL segment; then every root commit of this open appends its sequence.
+        // An open that doesn't mention the feed takes the last session's settings.
+        let mut options = options;
+        if options.feed.is_none()
+            && options.feed_inherit
+            && let Some(last) = &last_session
+        {
+            // Every table the last session fed dropped since: nothing to feed, so the open
+            // records the feed off rather than a session that feeds no table (cli692).
+            let inherited = last.feed_options(&catalog);
+            if inherited.tables.as_ref().is_none_or(|t| !t.is_empty()) {
+                options.feed = Some(inherited);
+            }
+        }
         let feed = if no_writes {
             None
         } else {

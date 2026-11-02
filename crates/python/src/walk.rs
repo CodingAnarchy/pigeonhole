@@ -112,6 +112,7 @@ pub(crate) struct Traversal {
     edges: u64,
     hops_cut: u32,
     cut_by_max_nodes: bool,
+    cut_by_budget: bool,
 }
 
 #[pymethods]
@@ -152,6 +153,12 @@ impl Traversal {
         self.cut_by_max_nodes
     }
 
+    /// Whether `byte_budget` cut a hop short (the traversal ended with it).
+    #[getter]
+    fn cut_by_budget(&self) -> bool {
+        self.cut_by_budget
+    }
+
     fn __repr__(&self) -> String {
         format!("Traversal(hops={})", self.hops.len())
     }
@@ -168,6 +175,7 @@ pub(crate) fn traverse(
     per_node_limit: Option<u32>,
     hop_limit: Option<u64>,
     max_nodes: Option<u64>,
+    byte_budget: Option<u64>,
     parents: bool,
     qualifier_prefix: Option<&Bound<'_, PyAny>>,
     snapshot: Option<&Bound<'_, Snapshot>>,
@@ -179,6 +187,12 @@ pub(crate) fn traverse(
             .map(convert::bytes)
             .collect::<PyResult<Vec<_>>>()?,
     );
+    if byte_budget == Some(0) {
+        return Err(PyValueError::new_err(
+            "byte_budget must be at least 1 (None sets no budget)",
+        ));
+    }
+    let byte_budget = byte_budget.unwrap_or(0);
     let qp = qualifier_prefix.map(convert::bytes).transpose()?;
     let snap = snapshot_arg(snapshot)?;
     let h = h.clone();
@@ -189,6 +203,7 @@ pub(crate) fn traverse(
                     .traverse(&seeds)
                     .family(&family)
                     .hops(hops)
+                    .byte_budget(byte_budget)
                     .parents(parents);
                 if let Some(n) = per_node_limit {
                     r = r.per_node_limit(n);
@@ -234,6 +249,7 @@ pub(crate) fn traverse(
         edges: stats.edges,
         hops_cut: stats.hops_cut,
         cut_by_max_nodes: stats.cut_by_max_nodes,
+        cut_by_budget: stats.cut_by_budget,
     })
 }
 
@@ -381,7 +397,7 @@ impl Pages {
 /// One of a nearest-neighbour search's results: the cell's row and qualifier, its distance
 /// from the query (by the family's metric), and its timestamp.
 #[pyclass(module = "pigeonhole", frozen)]
-pub(crate) struct Neighbour(pigeonhole::Neighbour);
+pub(crate) struct Neighbour(pub(crate) pigeonhole::Neighbour);
 
 #[pymethods]
 impl Neighbour {
@@ -427,8 +443,13 @@ impl Neighbour {
     }
 }
 
+/// What a nearest search found: its neighbours and, with a byte budget, the page's size and
+/// the first left-out neighbour's size.
+pub(crate) type Found = (Vec<pigeonhole::Neighbour>, Option<(u64, Option<u64>)>);
+
 /// The `k` cells of a vector family nearest `query` (D296), over a prefix, a range, the
-/// whole table, or the rows of `keys`, in (distance, row, qualifier) order.
+/// whole table, or the rows of `keys`, in (distance, row, qualifier) order; with `within`,
+/// the nearest that fit that many bytes (D308 PR 3).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn nearest(
     py: Python<'_>,
@@ -443,7 +464,8 @@ pub(crate) fn nearest(
     qualifier_prefix: Option<&Bound<'_, PyAny>>,
     snapshot: Option<&Bound<'_, Snapshot>>,
     parallel: Option<usize>,
-) -> PyResult<Vec<Neighbour>> {
+    within: Option<u64>,
+) -> PyResult<Found> {
     use std::ops::Bound as KeyBound;
 
     use crate::vector::Vector;
@@ -491,7 +513,13 @@ pub(crate) fn nearest(
             if let Some(p) = parallel {
                 n = n.parallel(p);
             }
-            n.run()
+            match within {
+                Some(b) => n.run_within(b).map(|p| {
+                    let (bytes, next) = (p.bytes(), p.next_bytes());
+                    (p.into_neighbours(), Some((bytes, next)))
+                }),
+                None => n.run().map(|v| (v, None)),
+            }
         }};
     }
     let found = py
@@ -529,5 +557,5 @@ pub(crate) fn nearest(
             })
         })
         .or_py()?;
-    Ok(found.into_iter().map(Neighbour).collect())
+    Ok(found)
 }

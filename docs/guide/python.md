@@ -92,6 +92,37 @@ with ph.open(path, create=True) as db:
         assert len(t.row(b"timeline", snapshot=snap)) == 25
 ```
 
+### Reads within a byte budget
+For filling a context window by size rather than by row count (D308; see [Byte budgets](scans-and-filters.md#byte-budgets)):
+- **`scan_within(prefix, bytes=...)`** returns a `ScanPage`: the longest prefix of the scan's cells whose size fits `bytes`. Each cell counts its qualifier, its value and 16 bytes, and each row its key once. A column is kept whole or not at all, and a row may be cut between columns. `limit` applies too: whichever comes first stops the read.
+- **`multi_get_within(keys, bytes=...)`** returns a `KeysPage`, the same over a multi-get's rows. Unlike `multi_get`, its rows aren't aligned with `keys`: they come in key order, with no entry for a key that has no cell.
+- **A page** has `rows`, `bytes`, `cut_by_budget`, `next_bytes` and `resume`.
+  - `next_bytes` is the size of the first column that didn't fit, its row key included. A page resumed with that budget returns it.
+  - Pass `after=page.resume` to read the next page.
+  - A `ScanPosition` or `KeysPosition` has `to_bytes()` and `from_bytes()`, to hand to a client.
+  - A position from another table, or of the other kind, raises `InvalidArgument`.
+  - A chain of pages is one consistent read only with one `snapshot=`.
+- **`nearest_within(family, query, k, bytes=...)`** returns a `NearestPage`: `nearest`'s neighbours that fit. Each counts its row key, its qualifier and 16 bytes. The budget bounds the result, not the work, and there's no resume position.
+- **`traverse(..., byte_budget=n)`** stops the traversal at `n` bytes of nodes, and sets `cut_by_budget`.
+  - Each node counts its key and 16 bytes, plus 4 with `parents=True`. The seeds aren't counted.
+  - `None`, the default, sets no budget, and 0 is refused.
+
+The budget is keyword-only (`bytes=`) in all three. Budgets and sizes are bytes, not characters.
+
+```python
+import pigeonhole as ph
+
+with ph.open(path, create=True) as db:
+    t = db.table("docs").family("text").create()
+    for i in range(100):
+        t.put(f"doc:{i:03}", "text", b"body", bytes(200))
+    page = t.scan_within(b"doc:", bytes=2048)
+    assert page.bytes <= 2048 and page.cut_by_budget
+    token = page.resume.to_bytes()            # hand this to a client
+    nxt = t.scan_within(b"doc:", bytes=2048, after=ph.ScanPosition.from_bytes(token))
+    assert nxt.rows[0].key == b"doc:009"
+```
+
 ## Writes, batches and transactions
 - **`Table.put`, `incr` and `delete`** each commit one change.
 - **`mutate(row)`** chains writes to one row and commits them atomically. `commit_if(Condition.absent(...))` commits only if the condition holds, and returns `None` otherwise.
@@ -147,7 +178,7 @@ with ph.open(path, create=True) as db:
 ```
 
 ## Graphs
-Store a graph as adjacency rows, as in the [graphs guide](graphs.md): a row per node, and in an edge family one column per edge, its qualifier the destination's key. `traverse(seeds, family, hops=...)` runs a breadth-first search inside the engine. It returns each hop's new nodes, sorted, with `parents=True` for shortest paths, and takes `per_node_limit`, `hop_limit` and `max_nodes`.
+Store a graph as adjacency rows, as in the [graphs guide](graphs.md): a row per node, and in an edge family one column per edge, its qualifier the destination's key. `traverse(seeds, family, hops=...)` runs a breadth-first search inside the engine. It returns each hop's new nodes, sorted, with `parents=True` for shortest paths, and takes `per_node_limit`, `hop_limit`, `max_nodes` and `byte_budget`.
 
 ```python
 import pigeonhole as ph

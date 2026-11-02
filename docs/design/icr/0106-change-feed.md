@@ -63,7 +63,23 @@
 - `crates/engine/tests/feed_model.rs` (new sweep target), `it/feed_reader.rs` and `wal/tests/feed_cursor.rs`;
 - PR 3b's public `Feed`.
 
+## The inherit amendment (the owner, 2026-11-02)
+- **pigeonhole** (additive): `Options::change_feed_off()`.
+  - **Behaviour:** with neither `change_feed` nor `change_feed_off`, an open inherits the last session's feed settings (retention, age, fed tables; not `sync_interval`, which is per open). If every table it fed was dropped since, the open records the feed off.
+  - **The shard count:** with `shards` unset, an open takes the stream count the last session recorded, and only when that session fed. With no sidecar, or with the feed last off, unset `shards` keeps its old meaning (one per physical core).
+- **pigeonhole-engine:** `EngineOptions::feed_inherit` (default `false`).
+
+## PR 3b: the public change feed (pigeonhole, additive)
+- `Table::feed() -> FeedBuilder`. The builder has `table`, `prefix`, `visible`, `from_snapshot`, `from_oldest`, `resume` and `open() -> Result<Feed>`.
+- `Feed`: `next(Duration)` and `try_next()` return `Result<Option<&Commit>>`. It also has `token() -> FeedToken` and `oldest_retained() -> Option<u64>`.
+- `Commit` (`seqno`, `timestamp`, `changes`) and `Change` (`table`, `family`, `kind`, `row`, `qualifier`, `timestamp`, `value() -> Option<Value>`).
+- `ChangeKind` (`Put`, `Merge`, `DeleteCell`, `DeleteColumn`, `DeleteFamily`; `#[non_exhaustive]`, with `is_delete`).
+- `FeedToken` (`as_bytes`, `from_bytes`).
+- `ErrorCode::FeedExpired = 31`.
+- **Python:** the `FeedExpired` exception class (code 31), with the feed API itself still Rust-only.
+- **capi:** nothing to change. The crate has no code table yet, and its future C enum takes `ErrorCode`'s numbers.
+- **Internal:** pigeonhole-engine's `Feed::needs` gains a `debug_assert` (perf287 on #1297).
+
 ## Later PRs
-- PR 3b: pigeonhole's `Feed`, `Commit`, `Change`, `FeedToken` and `ErrorCode::FeedExpired` (31), mapped in capi and python.
 - PR 4: reader processes.
 - PR 5: `poll_next`.
