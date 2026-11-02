@@ -70,7 +70,7 @@ or, for a project, a `.mcp.json` at its root:
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
 ## The tools
-Eight tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md) (the server advertises `listChanged`, and sends `notifications/tools/list_changed` once a call adds the first one), `feed_poll` out unless the database's change feed is on (the application's, which the server inherits, or `--change-feed`; with `--read-only` it's always listed, since a reader can't see the writer's options), and `write` and `create_table` out when the database is read-only.
+Eight tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md) (the server advertises `listChanged`, and after any tool call that finds the list changed, such as the first vector family appearing, whether this session or the writer added it, it sends `notifications/tools/list_changed`), `feed_poll` out unless the database's change feed is on (the application's, which the server inherits, or `--change-feed`; with `--read-only` it's always listed, since a reader can't see the writer's options), and `write` and `create_table` out when the database is read-only.
 
 | Tool | What it does |
 |---|---|

@@ -87,6 +87,7 @@ pub(crate) fn run(
     let server = Server {
         tools: tools::Tools::new(db, writable, limits),
         listed: std::cell::RefCell::new(None),
+        called: std::cell::Cell::new(false),
     };
     let served = server.serve(&mut std::io::stdin().lock(), stdout);
     let closed = server.tools.close();
@@ -106,6 +107,9 @@ struct Server {
     /// (`create_table` adding the first vector family brings `nearest`), the server sends
     /// `notifications/tools/list_changed` (#1356). `None` until the client lists.
     listed: std::cell::RefCell<Option<Vec<String>>>,
+    /// Whether the line being answered held a `tools/call`: only then is the list checked
+    /// (ai1249 on #1379), so a ping or a notification costs no catalog walk.
+    called: std::cell::Cell<bool>,
 }
 
 impl Server {
@@ -135,6 +139,9 @@ impl Server {
     /// `notifications/tools/list_changed` if the tools differ from those last listed, once
     /// per change.
     fn list_changed(&self) -> Option<Value> {
+        if !self.called.replace(false) {
+            return None;
+        }
         let mut listed = self.listed.borrow_mut();
         let before = listed.as_ref()?;
         let now = self.tools.names();
@@ -215,6 +222,7 @@ impl Server {
                 Ok(json!({"tools": tools}))
             }
             "tools/call" => {
+                self.called.set(true);
                 let name = params["name"]
                     .as_str()
                     .ok_or((INVALID_PARAMS, "tools/call needs a tool name".to_owned()))?;
