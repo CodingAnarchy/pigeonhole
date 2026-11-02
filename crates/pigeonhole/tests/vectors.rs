@@ -456,12 +456,20 @@ fn poll_counting<F: std::future::Future>(fut: F) -> (F::Output, usize) {
     let mut fut = std::pin::pin!(fut);
     let mut cx = Context::from_waker(Waker::noop());
     let mut pending = 0;
+    // Bounded by time, not by polls (#1289): a cold fetch on a loaded host (or a slow
+    // runner disk) can outlast any fixed number of polls. Yield between polls so the busy
+    // loop doesn't starve the I/O it waits for.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         match fut.as_mut().poll(&mut cx) {
             Poll::Ready(r) => return (r, pending),
             Poll::Pending => pending += 1,
         }
-        assert!(pending < 1_000_000, "never finished");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never finished: still pending after 60 s and {pending} polls"
+        );
+        std::thread::yield_now();
     }
 }
 
