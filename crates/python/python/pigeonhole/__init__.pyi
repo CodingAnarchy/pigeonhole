@@ -324,7 +324,9 @@ class ScanPage:
 
 @final
 class KeysPage:
-    """A `multi_get_within` page: its rows, size, and where to resume."""
+    """A `multi_get_within` page: its rows, size, and where to resume. Unlike `multi_get`,
+    the rows are in key order, with no entry for a key without a cell: not aligned with the
+    keys given."""
 
     @property
     def rows(self) -> list[Row]: ...
@@ -336,7 +338,6 @@ class KeysPage:
     def next_bytes(self) -> int | None: ...
     @property
     def resume(self) -> KeysPosition | None: ...
-    # Unlike multi_get, the rows are in key order and not aligned with the keys given.
     def __len__(self) -> int: ...
 
 @final
@@ -434,7 +435,7 @@ class Table:
         per_node_limit: int | None = None,
         hop_limit: int | None = None,
         max_nodes: int | None = None,
-        byte_budget: int = 0,
+        byte_budget: int | None = None,
         parents: bool = False,
         qualifier_prefix: Key | None = None,
         snapshot: Snapshot | None = None,
@@ -459,8 +460,8 @@ class Table:
         family: str,
         query: Vector,
         k: int,
-        bytes: int,
         *,
+        bytes: int,
         prefix: Key | None = None,
         start: Key | None = None,
         end: Key | None = None,
@@ -471,9 +472,9 @@ class Table:
     ) -> NearestPage: ...
     def scan_within(
         self,
-        bytes: int,
         prefix: Key | None = None,
         *,
+        bytes: int,
         start: Key | None = None,
         end: Key | None = None,
         families: Sequence[str] | None = None,
@@ -487,8 +488,8 @@ class Table:
     def multi_get_within(
         self,
         keys: Sequence[Key],
-        bytes: int,
         *,
+        bytes: int,
         families: Sequence[str] | None = None,
         qualifier_prefix: Key | None = None,
         versions: int = 1,

@@ -714,7 +714,11 @@ impl Table {
     /// A breadth-first traversal (D304) of a graph stored as adjacency rows: each hop
     /// follows `family`'s edges (a column per edge, its qualifier the destination's key)
     /// from the previous hop's nodes, and keeps the nodes not visited before.
-    #[pyo3(signature = (seeds, family, *, hops=1, per_node_limit=None, hop_limit=None, max_nodes=None, byte_budget=0, parents=false, qualifier_prefix=None, snapshot=None, parallel=None))]
+    /// `byte_budget` stops it at that many bytes of nodes (each its key and 16, plus 4 with
+    /// `parents`; the seeds aren't counted), D308: the hop it cuts keeps its in-budget
+    /// prefix, and `cut_by_budget` says so. `None`, the default, sets no budget; 0 is
+    /// refused.
+    #[pyo3(signature = (seeds, family, *, hops=1, per_node_limit=None, hop_limit=None, max_nodes=None, byte_budget=None, parents=false, qualifier_prefix=None, snapshot=None, parallel=None))]
     #[allow(clippy::too_many_arguments)]
     fn traverse(
         &self,
@@ -725,7 +729,7 @@ impl Table {
         per_node_limit: Option<u32>,
         hop_limit: Option<u64>,
         max_nodes: Option<u64>,
-        byte_budget: u64,
+        byte_budget: Option<u64>,
         parents: bool,
         qualifier_prefix: Option<&Bound<'_, PyAny>>,
         snapshot: Option<&Bound<'_, Snapshot>>,
@@ -791,7 +795,7 @@ impl Table {
     /// key, its qualifier and 16 bytes, and a neighbour is in whole or not at all. The budget
     /// bounds the result, not the work: the search reads and ranks as `nearest` does. There's
     /// no resume position: ask again with a larger budget or `k`.
-    #[pyo3(signature = (family, query, k, bytes, *, prefix=None, start=None, end=None, keys=None, qualifier_prefix=None, snapshot=None, parallel=None))]
+    #[pyo3(signature = (family, query, k, *, bytes, prefix=None, start=None, end=None, keys=None, qualifier_prefix=None, snapshot=None, parallel=None))]
     #[allow(clippy::too_many_arguments)]
     fn nearest_within(
         &self,
@@ -840,13 +844,13 @@ impl Table {
     /// columns. `limit` applies too: whichever comes first stops the read. `after` resumes
     /// where an earlier page stopped (its `resume`). Without a `snapshot`, a chain of pages
     /// is not one consistent read.
-    #[pyo3(signature = (bytes, prefix=None, *, start=None, end=None, families=None, qualifier_prefix=None, versions=1, limit=None, column_limit=None, snapshot=None, after=None))]
+    #[pyo3(signature = (prefix=None, *, bytes, start=None, end=None, families=None, qualifier_prefix=None, versions=1, limit=None, column_limit=None, snapshot=None, after=None))]
     #[allow(clippy::too_many_arguments)]
     fn scan_within(
         &self,
         py: Python<'_>,
-        bytes: u64,
         prefix: Option<&Bound<'_, PyAny>>,
+        bytes: u64,
         start: Option<&Bound<'_, PyAny>>,
         end: Option<&Bound<'_, PyAny>>,
         families: Option<Vec<String>>,
@@ -879,7 +883,7 @@ impl Table {
     /// they come in key order, and keys with no cell the selection keeps return nothing. `after` resumes where an earlier page stopped:
     /// at the first key at or after its position's key, so keys added or removed between
     /// pages resume at the right one.
-    #[pyo3(signature = (keys, bytes, *, families=None, qualifier_prefix=None, versions=1, column_limit=None, snapshot=None, after=None))]
+    #[pyo3(signature = (keys, *, bytes, families=None, qualifier_prefix=None, versions=1, column_limit=None, snapshot=None, after=None))]
     #[allow(clippy::too_many_arguments)]
     fn multi_get_within(
         &self,

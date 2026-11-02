@@ -94,17 +94,20 @@ with ph.open(path, create=True) as db:
 
 ### Reads within a byte budget
 For filling a context window by size rather than by row count (D308; see [Byte budgets](scans-and-filters.md#byte-budgets)):
-- **`scan_within(bytes, prefix=...)`** returns a `ScanPage`: the longest prefix of the scan's cells whose size fits `bytes`. Each cell counts its qualifier, its value and 16 bytes, and each row its key once. A column is kept whole or not at all, and a row may be cut between columns. `limit` applies too: whichever comes first stops the read.
-- **`multi_get_within(keys, bytes)`** returns a `KeysPage`, the same over a multi-get's rows. Unlike `multi_get`, its rows aren't aligned with `keys`: they come in key order, with no entry for a key that has no cell.
-- **A page** has `rows`, `bytes`, `cut_by_budget`, `next_bytes` (the size of the first column that didn't fit) and `resume`.
+- **`scan_within(prefix, bytes=...)`** returns a `ScanPage`: the longest prefix of the scan's cells whose size fits `bytes`. Each cell counts its qualifier, its value and 16 bytes, and each row its key once. A column is kept whole or not at all, and a row may be cut between columns. `limit` applies too: whichever comes first stops the read.
+- **`multi_get_within(keys, bytes=...)`** returns a `KeysPage`, the same over a multi-get's rows. Unlike `multi_get`, its rows aren't aligned with `keys`: they come in key order, with no entry for a key that has no cell.
+- **A page** has `rows`, `bytes`, `cut_by_budget`, `next_bytes` and `resume`.
+  - `next_bytes` is the size of the first column that didn't fit, its row key included. A page resumed with that budget returns it.
   - Pass `after=page.resume` to read the next page.
   - A `ScanPosition` or `KeysPosition` has `to_bytes()` and `from_bytes()`, to hand to a client.
   - A position from another table, or of the other kind, raises `InvalidArgument`.
   - A chain of pages is one consistent read only with one `snapshot=`.
-- **`nearest_within(family, query, k, bytes)`** returns a `NearestPage`: `nearest`'s neighbours that fit. Each counts its row key, its qualifier and 16 bytes. The budget bounds the result, not the work, and there's no resume position.
-- **`traverse(..., byte_budget=n)`** stops the traversal at `n` bytes of nodes (a key and 16 each), and sets `cut_by_budget`.
+- **`nearest_within(family, query, k, bytes=...)`** returns a `NearestPage`: `nearest`'s neighbours that fit. Each counts its row key, its qualifier and 16 bytes. The budget bounds the result, not the work, and there's no resume position.
+- **`traverse(..., byte_budget=n)`** stops the traversal at `n` bytes of nodes, and sets `cut_by_budget`.
+  - Each node counts its key and 16 bytes, plus 4 with `parents=True`. The seeds aren't counted.
+  - `None`, the default, sets no budget, and 0 is refused.
 
-Budgets and sizes are bytes, not characters.
+The budget is keyword-only (`bytes=`) in all three. Budgets and sizes are bytes, not characters.
 
 ```python
 import pigeonhole as ph
@@ -113,10 +116,10 @@ with ph.open(path, create=True) as db:
     t = db.table("docs").family("text").create()
     for i in range(100):
         t.put(f"doc:{i:03}", "text", b"body", bytes(200))
-    page = t.scan_within(2048, b"doc:")
+    page = t.scan_within(b"doc:", bytes=2048)
     assert page.bytes <= 2048 and page.cut_by_budget
     token = page.resume.to_bytes()            # hand this to a client
-    nxt = t.scan_within(2048, b"doc:", after=ph.ScanPosition.from_bytes(token))
+    nxt = t.scan_within(b"doc:", bytes=2048, after=ph.ScanPosition.from_bytes(token))
     assert nxt.rows[0].key == b"doc:009"
 ```
 

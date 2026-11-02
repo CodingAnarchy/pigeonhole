@@ -175,7 +175,7 @@ pub(crate) fn traverse(
     per_node_limit: Option<u32>,
     hop_limit: Option<u64>,
     max_nodes: Option<u64>,
-    byte_budget: u64,
+    byte_budget: Option<u64>,
     parents: bool,
     qualifier_prefix: Option<&Bound<'_, PyAny>>,
     snapshot: Option<&Bound<'_, Snapshot>>,
@@ -187,6 +187,12 @@ pub(crate) fn traverse(
             .map(convert::bytes)
             .collect::<PyResult<Vec<_>>>()?,
     );
+    if byte_budget == Some(0) {
+        return Err(PyValueError::new_err(
+            "byte_budget must be at least 1 (None sets no budget)",
+        ));
+    }
+    let byte_budget = byte_budget.unwrap_or(0);
     let qp = qualifier_prefix.map(convert::bytes).transpose()?;
     let snap = snapshot_arg(snapshot)?;
     let h = h.clone();
