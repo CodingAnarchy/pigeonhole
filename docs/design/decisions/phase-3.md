@@ -4100,6 +4100,8 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `it/feed_head.rs`: the D200 dependency.
   - `feed_model`: a durable and a visible subscriber in a reader process beside the writer's, plain and with deferred I/O. Clean reopens exercise the stale-attachment resubscribe; power losses reopen the reader too.
 
+**A fix after PR 4 (#1370; simp724's D312 heads-up).** A cursor that reads a frame mid-write stops short. If the successor's header lands in the same step, `chain()` used to report the mismatch as corruption. Now the first stop short of a successor's recorded end, per `(epoch, stop)`, is "not yet" (`End`), and the next step reads again from there. The same stop on the second look is still corruption. M1 makes the deferral safe: a torn read only hits records past the frontier the poll loaded before reading. A D312 mapped store completes before its group's seqno is published, so that holds there too.
+
 <a id="d311"></a>
 ## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)
 **Why.** Agents need durable memory they can recall by meaning, by keyword and by recency, scoped per agent or shared, inside the database they already use (#1251). Built on the public API with D309's text index, it needs nothing new in the engine.
