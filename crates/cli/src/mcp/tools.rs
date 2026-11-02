@@ -633,31 +633,20 @@ impl Tools {
         }
         let mut feed = b.open().map_err(fail)?;
         let mut budget = Budget::new(self.limits.result_bytes);
-        let mut commits = Vec::new();
-        // Where the result ends: after the last commit returned, never past one left out.
-        let mut token = feed.token();
-        let mut more = false;
-        while commits.len() < max_commits {
+        let start = feed.token();
+        let (commits, token, more) = gather(max_commits, &mut budget, start, |first| {
             // Wait for the first commit only; then take what is ready.
-            let next = if commits.is_empty() {
+            let next = if first {
                 feed.next(wait)
             } else {
                 feed.try_next()
             };
-            let Some(c) = next.map_err(fail)? else {
-                break;
+            let v = match next.map_err(fail)? {
+                Some(c) => commit_json(c, max_value),
+                None => return Ok(None),
             };
-            let v = commit_json(c, max_value);
-            if !budget.take(std::slice::from_ref(&v)) {
-                more = true;
-                break;
-            }
-            commits.push(v);
-            token = feed.token();
-        }
-        if commits.len() == max_commits {
-            more = feed.try_next().map_err(fail)?.is_some();
-        }
+            Ok(Some((v, feed.token())))
+        })?;
         let mut out = object(json!({
             "commits": commits,
             "token": base64_encode(token.as_bytes()),
@@ -1033,6 +1022,39 @@ fn cell_json(e: &CellEntry<'_>, max_value: usize) -> Value {
         "ts": e.cell.timestamp(),
         "value": value,
     })
+}
+
+/// `feed_poll`'s loop: up to `max` commits from `pull` (`first` on the first call; each with
+/// the token after it) that fit `budget`, the token after the last one kept, and whether
+/// more are ready.
+///
+/// The token never passes a commit left out: one the budget refuses is delivered again from
+/// it. An error after some commits ends the batch there, and they come back with their token
+/// (feed1248 on #1360): they were delivered in order before it, and the next call, from that
+/// token, meets the error again and reports it. An error before any is the call's error. An
+/// error from the probe for `more` after `max` commits leaves `more` unset.
+fn gather<T, E>(
+    max: usize,
+    budget: &mut Budget,
+    mut token: T,
+    mut pull: impl FnMut(bool) -> Result<Option<(Value, T)>, E>,
+) -> Result<(Vec<Value>, T, bool), E> {
+    let mut commits = Vec::new();
+    while commits.len() < max {
+        let (v, after) = match pull(commits.is_empty()) {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok((commits, token, false)),
+            Err(e) if commits.is_empty() => return Err(e),
+            Err(_) => return Ok((commits, token, false)),
+        };
+        if !budget.take(std::slice::from_ref(&v)) {
+            return Ok((commits, token, true));
+        }
+        commits.push(v);
+        token = after;
+    }
+    let more = matches!(pull(false), Ok(Some(_)));
+    Ok((commits, token, more))
 }
 
 /// A change-feed commit in a `feed_poll` result: its changes in `dump`'s shapes, a value
@@ -1619,7 +1641,8 @@ fn feed_poll() -> Value {
          and starts with commits after it (or from_oldest: the oldest history kept); \
          wait_ms waits for a first commit. `more` says more commits are ready now. An error \
          FeedExpired means the history is gone: re-read with scan and start again without \
-         a token.",
+         a token. Otherwise keep the token: it survives the application's restarts and this \
+         server's reconnects, so there's no need to re-read on every session.",
         json!({
             "type": "object",
             "properties": {
@@ -1775,6 +1798,50 @@ mod tests {
         assert_eq!(successor(b"a\xff"), Some(b"b".to_vec()));
         assert_eq!(successor(b"\xff\xff"), None);
         assert_eq!(successor(b""), None);
+    }
+
+    /// feed1248 on #1360: an error after some commits returns them with the token after the
+    /// last; before any, it's the call's error; a refused commit keeps the token before it.
+    #[test]
+    fn feed_poll_returns_what_it_gathered_before_an_error() {
+        // A feed of commits 1, 2, then an error; each commit's token is its number.
+        let pulls = |script: Vec<Result<Option<u32>, &'static str>>| {
+            let mut it = script.into_iter();
+            move |_first: bool| {
+                it.next()
+                    .unwrap_or(Ok(None))
+                    .map(|c| c.map(|n| (json!(n), n)))
+            }
+        };
+        let big = || Budget::new(1 << 20);
+        let r = gather(
+            10,
+            &mut big(),
+            0,
+            pulls(vec![Ok(Some(1)), Ok(Some(2)), Err("expired")]),
+        );
+        assert_eq!(r, Ok((vec![json!(1), json!(2)], 2, false)));
+        let r = gather(10, &mut big(), 0, pulls(vec![Err("expired")]));
+        assert_eq!(r, Err("expired"));
+        // The probe for `more` after `max`: an error there leaves `more` unset.
+        let r = gather(
+            2,
+            &mut big(),
+            0,
+            pulls(vec![Ok(Some(1)), Ok(Some(2)), Err("x")]),
+        );
+        assert_eq!(r, Ok((vec![json!(1), json!(2)], 2, false)));
+        let r = gather(
+            2,
+            &mut big(),
+            0,
+            pulls(vec![Ok(Some(1)), Ok(Some(2)), Ok(Some(3))]),
+        );
+        assert_eq!(r, Ok((vec![json!(1), json!(2)], 2, true)));
+        // A commit the budget refuses: the token stays before it, and `more` is set.
+        let mut small = Budget::new(2);
+        let r = gather(10, &mut small, 0, pulls(vec![Ok(Some(1)), Ok(Some(22222))]));
+        assert_eq!(r, Ok((vec![json!(1)], 1, true)));
     }
 
     #[test]

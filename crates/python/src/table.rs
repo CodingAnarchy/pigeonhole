@@ -912,9 +912,9 @@ impl Table {
     }
 
     /// Subscribes to this table's committed changes (the change feed, D310): a `Feed` of
-    /// whole commits, once each, in commit order. The database must be opened with
-    /// `change_feed=` (and `feed_tables=`, if given, naming this table). The writer process
-    /// only, for now.
+    /// whole commits, once each, in commit order. The database's change feed must be on, set
+    /// with `change_feed=` or inherited from the last open, and follow this table. The writer
+    /// process only, for now.
     ///
     /// `tables` adds more tables to the same feed (a commit across them arrives whole),
     /// `prefix` keeps only changes to rows under it, and `visible=True` delivers a commit as
