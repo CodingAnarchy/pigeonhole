@@ -89,6 +89,7 @@ pub(crate) fn open_sidecar(
         // finds no session for the segments' marks and expires.
         _ => None,
     };
+    let rewritten = valid.is_none();
     let mut sidecar = match valid {
         Some(end) => {
             if end as u64 != len {
@@ -113,7 +114,9 @@ pub(crate) fn open_sidecar(
     };
     sidecar.append(entry)?;
     sidecar.file.sync_all()?;
-    if !exists {
+    // A new file's name, and a rewritten one's (its creator may have died before its own
+    // directory sync, leaving the name in the page cache only; simp724 on fix A).
+    if !exists || rewritten {
         let dir = match db.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
@@ -260,9 +263,21 @@ pub(crate) struct Feed {
     /// Bytes of the held files (`DatabaseInfo`).
     held_bytes: AtomicU64,
     sidecar: Mutex<Option<Sidecar>>,
+    /// The coalesced sidecar sync's state ([`Feed::request_sidecar_sync`]).
+    sidecar_sync: Mutex<SidecarSync>,
+    /// Sidecar syncs completed.
+    sidecar_syncs: AtomicU64,
     /// Each stream's checkpoint history, for the feed reader's start positions
     /// ([`Feed::start_at`]).
     checkpoints: Vec<Mutex<CheckpointHistory>>,
+}
+
+/// Whether a sidecar sync is in flight, and whether appends since its submission wait for
+/// the next.
+#[derive(Debug, Default)]
+struct SidecarSync {
+    inflight: bool,
+    dirty: bool,
 }
 
 /// One stream's recent checkpoints, each with the largest key (the seqno a feed reader
@@ -294,6 +309,8 @@ impl Feed {
             held: Mutex::default(),
             held_bytes: AtomicU64::new(0),
             sidecar: Mutex::new(None),
+            sidecar_sync: Mutex::default(),
+            sidecar_syncs: AtomicU64::new(0),
             checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
         }
     }
@@ -441,20 +458,102 @@ impl Feed {
         *self.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = Some(sidecar);
     }
 
-    /// After a root commit of this session (the pager's observer): appends its sequence.
-    /// Not synced, and a failure is only traced: a lost entry makes the next feeding open
-    /// see the sequence ahead of the last one recorded, so every token expires, which is the
-    /// safe direction (D310 §2.2).
-    pub(crate) fn note_root(&self, sequence: u64) {
-        let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(s) = sidecar.as_mut()
-            && let Err(e) = s.append(&FeedEntry::Root {
+    /// After a root commit of this session (the pager's observer): appends its sequence and
+    /// asks for a coalesced sync ([`Feed::request_sidecar_sync`]). A failure is only traced:
+    /// a lost entry makes the next feeding open see the sequence ahead of the last one
+    /// recorded, so every token expires, which is the safe direction (D310 §2.2).
+    pub(crate) fn note_root(self: &Arc<Self>, sequence: u64) {
+        let file = {
+            let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(s) = sidecar.as_mut() else {
+                return;
+            };
+            if let Err(e) = s.append(&FeedEntry::Root {
                 session: self.session,
                 sequence,
-            })
+            }) {
+                crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
+                return;
+            }
+            Arc::clone(&s.file)
+        };
+        self.request_sidecar_sync(file);
+    }
+
+    /// Makes the sidecar's appends durable (D310 call 4, fix A): an entry a power loss
+    /// dropped would break the session chain at the next open and expire every durable
+    /// feed, which call 4 promises survives a restart; now only a crash before the sync
+    /// lands does (the safe direction).
+    ///
+    /// - **Coalesced** (perf287): at most one sync in flight; appends made meanwhile share
+    ///   the next one. At most one per root commit, never one per data commit.
+    /// - **Never waited on:** the thread that completes a root commit (the manifest pump's,
+    ///   or an application thread making a catalog change) only submits it. The pread
+    ///   backend runs it on its pool and io_uring in the kernel, so no thread blocks on it, a
+    ///   shard's least of all. The simulator runs it inline, to keep seeds deterministic.
+    /// - **At the pager's durability** (simp724): the VFS's `sync_all`, `F_FULLFSYNC` on
+    ///   macOS, and `sync_all` since an append grows the file.
+    /// - **Fail closed:** a failed sync ends the session's appends (no retry).
+    fn request_sidecar_sync(self: &Arc<Self>, file: FileRef) {
         {
-            crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
+            let mut st = self
+                .sidecar_sync
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if st.inflight {
+                st.dirty = true;
+                return;
+            }
+            st.inflight = true;
         }
+        let this = Arc::clone(self);
+        let again = Arc::clone(&file);
+        // `sync_all`: an append grows the file, and its new length must be durable with it.
+        drop(file.submit_sync_all().map(move |r| {
+            if let Err(e) = &r {
+                // Fail closed (simp724): no retry, and no append that a later sync could
+                // report clean over pages the kernel dropped. The next open finds the
+                // sequence ahead of the last entry and expires every token.
+                crate::shard::trace!("feed: sidecar sync failed, no more appends: {e}");
+                *this.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                let mut st = this
+                    .sidecar_sync
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                st.inflight = false;
+                st.dirty = false;
+                return Ok(());
+            }
+            this.sidecar_syncs.fetch_add(1, Ordering::Relaxed);
+            let more = {
+                let mut st = this
+                    .sidecar_sync
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                st.inflight = false;
+                std::mem::take(&mut st.dirty)
+            };
+            if more {
+                this.request_sidecar_sync(again);
+            }
+            Ok(())
+        }));
+    }
+
+    /// Whether a sidecar sync is in flight or wanted: Root entries a power loss may still
+    /// drop (an inspection helper for tests).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn sidecar_sync_pending(&self) -> bool {
+        let st = self
+            .sidecar_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        st.inflight || st.dirty
+    }
+
+    /// Sidecar syncs completed (`Engine::feed_sidecar_syncs`).
+    pub(crate) fn sidecar_syncs(&self) -> u64 {
+        self.sidecar_syncs.load(Ordering::Relaxed)
     }
 
     /// The WAL bytes retained as history, over every stream.

@@ -171,6 +171,8 @@ enum Pending {
         stream: usize,
         start: Lsn,
         end: Lsn,
+        /// The session that wrote the Decision.
+        session: u64,
     },
 }
 
@@ -240,6 +242,8 @@ pub struct FeedReader {
     out: Commit,
     expired: Option<Expiry>,
     key: u64,
+    /// This open's session.
+    current: u64,
 }
 
 impl std::fmt::Debug for FeedReader {
@@ -306,6 +310,7 @@ impl FeedReader {
             out: Commit::default(),
             expired: None,
             key,
+            current: feed.session,
             shared,
         };
         // Where each stream starts, and the bound below which nothing is delivered.
@@ -565,10 +570,13 @@ impl FeedReader {
                 caught_up = false;
             }
         }
-        self.drop_aborted(&checkpoints, &feed);
         if !caught_up {
             return Ok(Polled::Pending { held: true });
         }
+        // Only now: simp724's rule holds once every stream was read to its end after the
+        // checkpoints were loaded (a Decision in a stream not yet read to its head may be
+        // the one a held PREPARE waits for).
+        self.drop_aborted(&checkpoints, &feed);
         self.frontier = self.frontier.max(frontier);
         if self.emit()? {
             return Ok(Polled::Commit);
@@ -667,6 +675,7 @@ impl FeedReader {
                             stream: s,
                             start,
                             end,
+                            session,
                         },
                     );
                 }
@@ -808,6 +817,7 @@ impl FeedReader {
                     participants,
                     stream,
                     end,
+                    session,
                     ..
                 } => {
                     let st = &mut self.streams[stream];
@@ -818,6 +828,17 @@ impl FeedReader {
                     let complete = participants
                         .iter()
                         .all(|p| shares.iter().any(|h| h.stream == p.0 as usize));
+                    if !complete && session != self.current {
+                        // A power loss took a share of a `Buffered` commit an earlier session
+                        // wrote, and that session's recovery dropped it whole, as replay
+                        // does (all or nothing): it never happened, so it isn't delivered.
+                        for h in &shares {
+                            let st = &mut self.streams[h.stream];
+                            st.delivered_end = st.delivered_end.max(h.end);
+                        }
+                        self.delivered = key;
+                        continue;
+                    }
                     if !complete || shares.iter().any(|h| h.outside) {
                         self.expired = Some(gap(key));
                         return Ok(false);
@@ -880,9 +901,12 @@ fn floor(feed: &crate::feed::Feed, s: usize) -> u32 {
 }
 
 /// The sessions whose segments hold the feed's history: the current one, and each one
-/// before it while it fed every table in `tables`, had the same stream count, and chains
-/// (its `opened_at` is the previous session's last recorded `sequence`, with no feed-off
-/// open between).
+/// before it while it fed every table in `tables`, had the same stream count, and chains.
+/// A session chains when its `opened_at` is the previous session's last recorded
+/// `sequence` and every sequence between was recorded: the previous session's Root
+/// entries run contiguously from its own `opened_at` (simp724 on fix A: a lost middle
+/// entry could hide another session's root commits, so a gap breaks the chain), with no
+/// feed-off open between.
 fn read_history(shared: &Shared, current: u64, tables: &[TableId]) -> Result<History> {
     let path = crate::feed::sidecar_path(&shared.path);
     let file = shared.vfs.open(&path, OpenOptions::read())?;
@@ -893,6 +917,13 @@ fn read_history(shared: &Shared, current: u64, tables: &[TableId]) -> Result<His
         Ok(h) if h.db_id == shared.pager.db_id() => decode_entries(&bytes[FeedHeader::LEN..]).0,
         _ => Vec::new(),
     };
+    Ok(History {
+        sessions: chain(&entries, current, tables),
+    })
+}
+
+/// [`read_history`]'s rule over the sidecar's entries.
+fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
     // (id, feeds the tables, streams, chained to the previous)
     let mut sessions: Vec<(u64, bool, u32, bool)> = Vec::new();
     let mut last_seq: Option<u64> = None;
@@ -906,31 +937,31 @@ fn read_history(shared: &Shared, current: u64, tables: &[TableId]) -> Result<His
                 tables: fed,
                 ..
             } => {
-                let feeds = tables.iter().all(|&t| match &fed {
+                let feeds = tables.iter().all(|&t| match fed {
                     FeedTables::All => true,
                     FeedTables::Only(_) => fed.contains(t),
                 });
-                let chained = !broken && last_seq == Some(opened_at);
-                sessions.push((session, feeds, streams, chained));
-                last_seq = Some(opened_at);
+                let chained = !broken && last_seq == Some(*opened_at);
+                sessions.push((*session, feeds, *streams, chained));
+                last_seq = Some(*opened_at);
                 broken = false;
             }
             FeedEntry::Root { session, sequence } => {
-                if sessions.last().is_some_and(|s| s.0 == session) {
-                    last_seq = Some(sequence);
+                let ours = sessions.last().is_some_and(|s| s.0 == *session);
+                if !ours || last_seq.map(|l| l + 1) != Some(*sequence) {
+                    broken = true;
                 }
+                last_seq = Some(*sequence);
             }
             FeedEntry::Unfed { .. } => broken = true,
             FeedEntry::Unknown(_) => {}
         }
     }
-    let mut run = Vec::new();
     let Some(pos) = sessions.iter().rposition(|s| s.0 == current) else {
-        return Ok(History {
-            sessions: vec![current],
-        });
+        return vec![current];
     };
     let streams = sessions[pos].2;
+    let mut run = Vec::new();
     for (i, s) in sessions[..=pos].iter().enumerate().rev() {
         if !s.1 || s.2 != streams {
             break;
@@ -940,5 +971,73 @@ fn read_history(shared: &Shared, current: u64, tables: &[TableId]) -> Result<His
             break;
         }
     }
-    Ok(History { sessions: run })
+    run
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(session: u64, opened_at: u64) -> FeedEntry {
+        FeedEntry::Session {
+            session,
+            opened_at,
+            retention_bytes: 1 << 20,
+            retention_age_secs: 0,
+            streams: 2,
+            tables: FeedTables::All,
+        }
+    }
+
+    fn root(session: u64, sequence: u64) -> FeedEntry {
+        FeedEntry::Root { session, sequence }
+    }
+
+    #[test]
+    fn sessions_chain_only_through_contiguous_sequences() {
+        let t = [TableId(1)];
+        let whole = [
+            session(1, 1),
+            root(1, 2),
+            root(1, 3),
+            root(1, 4),
+            session(2, 4),
+            root(2, 5),
+        ];
+        assert_eq!(chain(&whole, 2, &t), [2, 1]);
+        // A lost middle entry: the last still matches the next open, but the root commit at
+        // 3 is unaccounted for, so session 1's history ends there (simp724 on fix A).
+        let gap = [
+            session(1, 1),
+            root(1, 2),
+            root(1, 4),
+            session(2, 4),
+            root(2, 5),
+        ];
+        assert_eq!(chain(&gap, 2, &t), [2]);
+        // A lost last entry: the next open is ahead.
+        let ahead = [session(1, 1), root(1, 2), session(2, 3)];
+        assert_eq!(chain(&ahead, 2, &t), [2]);
+        // A feed-off open between.
+        let unfed = [
+            session(1, 1),
+            root(1, 2),
+            FeedEntry::Unfed { sequence: 2 },
+            session(2, 2),
+        ];
+        assert_eq!(chain(&unfed, 2, &t), [2]);
+        // A session with another stream count, or not feeding the table, ends it too.
+        let narrower = [
+            FeedEntry::Session {
+                session: 1,
+                opened_at: 1,
+                retention_bytes: 1 << 20,
+                retention_age_secs: 0,
+                streams: 2,
+                tables: FeedTables::Only(vec![TableId(9)]),
+            },
+            session(2, 1),
+        ];
+        assert_eq!(chain(&narrower, 2, &t), [2]);
+    }
 }
