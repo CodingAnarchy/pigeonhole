@@ -17,6 +17,7 @@ readme = "README.md"
 pigeonhole = { workspace = true }
 unicode-normalization = { workspace = true }
 unicode-segmentation = { workspace = true }
+levenshtein_automata = { workspace = true }
 
 [lints]
 workspace = true

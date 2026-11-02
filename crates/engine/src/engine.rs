@@ -878,12 +878,7 @@ impl Engine {
         mode: Mode,
         held: &mut Option<Locks>,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
-        let shards = if options.shards == 0 {
-            pigeonhole_io::sys::default_shards()
-        } else {
-            options.shards
-        };
-        if shards > 1 << 16 {
+        if options.shards > 1 << 16 {
             return Err(Error::InvalidArgument("at most 65536 shards".to_owned()));
         }
         if options.memtable_budget < 2 * ShardArena::DEFAULT_CHUNK as u64 / 4 {
@@ -896,7 +891,8 @@ impl Engine {
 
         // Create first, then open through the normal path (the writer lock comes first).
         if !vfs.exists(path)? {
-            if !options.create_if_missing {
+            // A read-only open (ICR 0109) never creates the file.
+            if !options.create_if_missing || options.read_only {
                 return Err(Error::Io(pigeonhole_io::Error::new(
                     ErrorKind::NotFound,
                     "open database",
@@ -929,8 +925,9 @@ impl Engine {
         // 2. The page file and the manifest. A file this build may read but not write (a
         //    read-only-compatible feature bit it does not know, D269) opens read-only under
         //    `read_only_fallback` (ICR 0059): `no_writes`, and nothing below writes to it.
-        let mut no_writes = false;
-        let opened = match Pager::open(&vfs, path, true) {
+        // `read_only` (ICR 0109) asks for that open whatever the file needs.
+        let mut no_writes = options.read_only;
+        let opened = match Pager::open(&vfs, path, !no_writes) {
             Ok(o) => o,
             Err(pigeonhole_pager::Error::Format(
                 pigeonhole_format::Error::UnsupportedFeature { .. },
@@ -949,6 +946,20 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         let db_id = opened.db_id();
+        // What the change feed's last session recorded (D310's amendment): an unset shard
+        // count takes its stream count, and an open that doesn't mention the feed its
+        // settings, so neither ends the feed's history by accident.
+        let last_session =
+            if options.shards == 0 || (options.feed.is_none() && options.feed_inherit) {
+                crate::feed::last_session(&vfs, path, db_id)?
+            } else {
+                None
+            };
+        let shards = match (options.shards, &last_session) {
+            (0, Some(last)) if last.streams > 0 => last.streams as usize,
+            (0, _) => pigeonhole_io::sys::default_shards(),
+            (n, _) => n,
+        };
         // The change feed's sequence check (D310 §2.2): the superblock's sequence before any
         // root commit of this open.
         let opened_at = opened.sequence();
@@ -961,7 +972,7 @@ impl Engine {
         // Refuse what will be refused before `finish`, which may upgrade the file's
         // superblocks: a refused open must leave an older file as it was (#496). An
         // unregistered merge operator opens read-only under `read_only_fallback`.
-        if catalog.has_unknown_merge && !options.read_only_fallback {
+        if catalog.has_unknown_merge && !options.read_only_fallback && !options.read_only {
             let name = catalog
                 .tables()
                 .flat_map(|t| t.families.iter())
@@ -992,6 +1003,19 @@ impl Engine {
         let read_only = no_writes;
         // The change feed (D310): the session's sidecar entry, written and synced before any
         // WAL segment; then every root commit of this open appends its sequence.
+        // An open that doesn't mention the feed takes the last session's settings.
+        let mut options = options;
+        if options.feed.is_none()
+            && options.feed_inherit
+            && let Some(last) = &last_session
+        {
+            // Every table the last session fed dropped since: nothing to feed, so the open
+            // records the feed off rather than a session that feeds no table (cli692).
+            let inherited = last.feed_options(&catalog);
+            if inherited.tables.as_ref().is_none_or(|t| !t.is_empty()) {
+                options.feed = Some(inherited);
+            }
+        }
         let feed = if no_writes {
             None
         } else {
@@ -1004,6 +1028,12 @@ impl Engine {
                     f.note_root(sequence);
                 }
             }));
+            // Root commits of this open before the observer: only `finish`'s upgrade of an
+            // older file's superblocks. They are this session's, so record them; replay,
+            // recovery's checkpoint edits and repairs all come after (simp724's Q1, #1316).
+            for sequence in opened_at + 1..=pager.sequence() {
+                f.note_root(sequence);
+            }
         }
         let mut wal_opts = options.wal;
         wal_opts.retain_segments = feed.as_ref().map_or(0, |f| f.retain_segments);
@@ -2725,6 +2755,43 @@ impl Engine {
         })
     }
 
+    /// Whether a power loss now may leave a root commit without its change-feed Root entry,
+    /// expiring every token at the next open: a manifest root commit in flight (its entry
+    /// is appended once it completes), or a sidecar sync not yet landed (D310 fix A's
+    /// window; an inspection helper for tests).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn feed_sidecar_sync_pending(&self) -> bool {
+        let shared = &self.inner.shared;
+        shared
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.sidecar_sync_pending() || shared.manifest_flight.in_flight())
+    }
+
+    /// The change feed's sidecar syncs (D310 call 4, fix A): each makes the session's Root
+    /// entries since the last durable, coalesced to one in flight. About one per root commit
+    /// (manifest commits), never one per data commit. 0 with the feed off.
+    pub fn feed_sidecar_syncs(&self) -> u64 {
+        self.inner
+            .shared
+            .feed
+            .as_ref()
+            .map_or(0, |f| f.sidecar_syncs())
+    }
+
+    /// The change feed's background syncs since open (D310, *T_sync*): syncs submitted
+    /// because fed `Buffered` or `None` records waited for one longer than the interval and
+    /// no other sync covered them. 0 with the feed off.
+    pub fn feed_background_syncs(&self) -> u64 {
+        self.inner
+            .shared
+            .metrics
+            .iter()
+            .map(|m| m.feed_syncs.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// What the row cache did since open (D201); all zero when it is off. In a reader process,
     /// its cache since the last attach to a writer generation (D281). A method rather than [`Metrics`] fields, which would break struct literals.
     pub fn row_cache_stats(&self) -> RowCacheStats {
@@ -3390,7 +3457,53 @@ fn spill_recovered(
 /// Registers a stream's feed marks with the change feed (D310), when it is on.
 fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
     if let (Some(feed), Some(marks)) = (&shared.feed, wal.feed_marks()) {
+        // The start of the stream's first segment of this open: every record before it has
+        // a key below the allocator's start (the reader's start bound, D310 PR 3). For a new
+        // stream that is the start of its only segment, so nothing counts as dropped.
+        let key = shared.shm.next_seqno().saturating_sub(1);
+        feed.note_checkpoint(stream, Lsn::new(marks.head(), 0), key);
+        // Published in shared memory too, for change feeds in any process (layout version
+        // 8, D310 PR 4). Before the shard runs, so the first publication races no store.
+        marks.set_mirror(Box::new(ShmMarks {
+            shm: shared.shm.clone(),
+            shard: stream as u32,
+            feed: Arc::downgrade(feed),
+        }));
         feed.set_marks(stream, marks);
+    }
+}
+
+/// A stream's feed marks in the shared-memory region (D310 PR 4). `feed` is weak: the feed
+/// holds the stream's `FeedMarks`, which hold this.
+#[derive(Debug)]
+struct ShmMarks {
+    shm: ShmRegion,
+    shard: u32,
+    feed: std::sync::Weak<crate::feed::Feed>,
+}
+
+impl ShmMarks {
+    /// The lost bound for `floor` (`FEED_BOUND`, simp724's B1): what the checkpoint
+    /// history says records below the floor may have as keys.
+    fn publish_bound(&self, floor: u32) {
+        if let Some(feed) = self.feed.upgrade() {
+            self.shm
+                .publish_feed_bound(self.shard, feed.oldest_bound(self.shard as usize, floor));
+        }
+    }
+}
+
+impl pigeonhole_wal::MarkMirror for ShmMarks {
+    fn floor(&self, epoch: u32) {
+        // The bound before its floor: a reader that loads the floor and then the bound gets
+        // one at least that floor's.
+        self.publish_bound(epoch);
+        self.shm.publish_feed_floor(self.shard, epoch);
+    }
+    fn checkpoint(&self, lsn: Lsn) {
+        // A new checkpoint-history entry can raise the bound for the current floor.
+        self.publish_bound(self.shm.feed_marks(self.shard).floor);
+        self.shm.publish_feed_checkpoint(self.shard, lsn.0);
     }
 }
 
@@ -4714,6 +4827,86 @@ impl Inner {
         Ok(Some(view))
     }
 
+    /// A reader process's attachment, current: re-attached to the new writer's generation
+    /// when the writer it was attached to is gone, with a fresh slot; or with a fresh slot
+    /// when its slot was freed under it. Callers hold `r.shm`'s lock.
+    fn refresh_attachment(&self, a: &mut Attachment) -> Result<()> {
+        let r = self.reader.as_ref().expect("reader");
+        if a.shm.is_stale() {
+            let shm = a.shm.reattach(&self.shared.vfs, &r.file)?;
+            // The old slot's liveness byte is on this same file handle: give it up before
+            // claiming in the new generation (`ReaderSlot::abandon`).
+            a.pins.abandon();
+            let slot = claim_slot(
+                &shm,
+                self.shared.vfs.current_process(),
+                &r.file,
+                self.opened_in,
+            )?;
+            // Snapshots of the old generation leave the abandoned slot alone: they can no
+            // longer be read, so they must not hold this generation's pin back.
+            *a = Attachment {
+                row_cache: reader_row_cache(&self.options, &shm),
+                shm,
+                pins: crate::snapshot::ReaderPins::new(slot),
+            };
+            *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
+            // Start the new generation from the new writer's root.
+            r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
+        } else if !a.pins.slot().is_owned() {
+            // The slot was freed under this process (#834 review). Defensive since #693
+            // PR 3: the writer frees a slot only once it holds the slot's liveness lock,
+            // which this process holds until it drops the slot. If it happened anyway,
+            // the snapshots fail as expired and pinning there could overwrite another
+            // reader's pins: abandon it and claim a fresh slot.
+            a.pins.abandon();
+            a.pins = crate::snapshot::ReaderPins::new(claim_slot(
+                &a.shm,
+                self.shared.vfs.current_process(),
+                &r.file,
+                self.opened_in,
+            )?);
+        }
+        Ok(())
+    }
+
+    /// Where a change feed in this reader process reads from (D310 PR 4): the current
+    /// attachment (re-attached first if its writer is gone), and its views for blob values.
+    pub(crate) fn reader_feed_origin(self: &Arc<Self>) -> Result<crate::feed_reader::Origin> {
+        let r = self.reader.as_ref().expect("reader");
+        if pigeonhole_io::sys::process_id() != self.opened_in {
+            return Err(Error::Unsupported(FORKED_READER));
+        }
+        let shm = {
+            let mut guard = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
+            self.refresh_attachment(&mut guard)?;
+            guard.shm.clone()
+        };
+        let inner = Arc::clone(self);
+        let at = shm.clone();
+        Ok(crate::feed_reader::Origin {
+            shm,
+            writer: None,
+            view: Box::new(move || {
+                // `None` while the durable root names another manifest version: the record
+                // is being republished. Wait for it as a snapshot does.
+                let deadline = std::time::Instant::now() + READER_VIEW_WAIT;
+                loop {
+                    if at.is_stale() {
+                        return Err(Error::SnapshotExpired);
+                    }
+                    if let Some(view) = inner.reader_view(&at)? {
+                        return Ok(view);
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(Error::Busy);
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(100));
+                }
+            }),
+        })
+    }
+
     fn reader_snapshot(&self, durable: bool) -> Result<Snapshot> {
         let r = self.reader.as_ref().expect("reader");
         // A forked child's copy of the reader takes no snapshot (and so claims no slot).
@@ -4725,41 +4918,7 @@ impl Inner {
         loop {
             let mut guard = r.shm.lock().unwrap_or_else(PoisonError::into_inner);
             let a = &mut *guard;
-            if a.shm.is_stale() {
-                let shm = a.shm.reattach(&self.shared.vfs, &r.file)?;
-                // The old slot's liveness byte is on this same file handle: give it up before
-                // claiming in the new generation (`ReaderSlot::abandon`).
-                a.pins.abandon();
-                let slot = claim_slot(
-                    &shm,
-                    self.shared.vfs.current_process(),
-                    &r.file,
-                    self.opened_in,
-                )?;
-                // Snapshots of the old generation leave the abandoned slot alone: they can no
-                // longer be read, so they must not hold this generation's pin back.
-                *a = Attachment {
-                    row_cache: reader_row_cache(&self.options, &shm),
-                    shm,
-                    pins: crate::snapshot::ReaderPins::new(slot),
-                };
-                *r.view.lock().unwrap_or_else(PoisonError::into_inner) = None;
-                // Start the new generation from the new writer's root.
-                r.catalog.lock().unwrap_or_else(PoisonError::into_inner).0 = NO_MANIFEST_VERSION;
-            } else if !a.pins.slot().is_owned() {
-                // The slot was freed under this process (#834 review). Defensive since #693
-                // PR 3: the writer frees a slot only once it holds the slot's liveness lock,
-                // which this process holds until it drops the slot. If it happened anyway,
-                // the snapshots fail as expired and pinning there could overwrite another
-                // reader's pins: abandon it and claim a fresh slot.
-                a.pins.abandon();
-                a.pins = crate::snapshot::ReaderPins::new(claim_slot(
-                    &a.shm,
-                    self.shared.vfs.current_process(),
-                    &r.file,
-                    self.opened_in,
-                )?);
-            }
+            self.refresh_attachment(a)?;
             // The slot pins exactly what this reader's live snapshots need: this one's seqno
             // and view join them here, before the view is read (#693 PR 2).
             let (seqno, key) = a.pins.take(&a.shm, durable);
@@ -5454,6 +5613,17 @@ impl EngineShard {
         };
         self.engine.shared.drivers.enter(usize::from(d.shard().0));
         d.run_once(deadline_nanos)
+    }
+
+    /// Whether this shard's WAL segment header is held back behind its predecessor's sync
+    /// (an inspection helper for tests, D310 PR 4: a change feed polled in that window must
+    /// wait for the segment, not take the stream's readable end for its head).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn wal_header_held(&mut self) -> bool {
+        self.driver
+            .as_mut()
+            .is_some_and(|d| d.with_handler(|s, _| s.wal.as_ref().is_some_and(|w| w.header_held())))
     }
 
     /// How many messages this shard has handled and background slices it has run, in all

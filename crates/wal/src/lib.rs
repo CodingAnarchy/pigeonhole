@@ -57,6 +57,7 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod feed;
 mod foreground;
 mod mem;
 mod recovery;
@@ -70,10 +71,13 @@ use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
 use pigeonhole_io::{Completion, VfsRef};
 
+pub use feed::{FeedCursor, Step};
 pub use foreground::StrictForeground;
 pub use mem::MemWal;
 pub use recovery::Recovery;
-pub use stream::{FeedMarks, IoTracker, SparePrep, SpareSegments, WalCounters, WalStream};
+pub use stream::{
+    FeedMarks, IoTracker, MarkMirror, SparePrep, SpareSegments, WalCounters, WalStream,
+};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -264,6 +268,12 @@ pub trait Wal: Send + fmt::Debug {
 
     /// Hands every appended byte to the kernel with one `write()`. After this, every ticket
     /// appended so far satisfies `Buffered`.
+    ///
+    /// The change feed relies on this (D310's M1 invariant): a record is in the stream file,
+    /// readable by another handle, once `write` (or `sync`) returns past it, and the engine
+    /// makes a seqno visible, or passes it on the feed's frontier, only after that. A later
+    /// asynchronous write path must keep that order, or hold the feed's written watermark
+    /// itself until its write completes.
     fn write(&mut self) -> Result<Lsn>;
 
     /// Writes (if needed) and fdatasyncs, blocking. After this, every ticket appended so far
@@ -313,6 +323,14 @@ pub trait Wal: Send + fmt::Debug {
     /// in-memory one).
     fn feed_marks(&self) -> Option<Arc<FeedMarks>> {
         None
+    }
+
+    /// Whether the current segment's header is held back behind its predecessor's sync
+    /// (FORMAT §10.1 rule 1; [`WalStream::held_header`]): an inspection helper for tests
+    /// that must poll a change feed inside that window (D310 PR 4).
+    #[doc(hidden)]
+    fn header_held(&self) -> bool {
+        false
     }
 
     /// A handle on this stream's count of submitted, unfinished I/O operations

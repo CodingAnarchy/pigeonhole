@@ -289,6 +289,7 @@ fn rate(shape: Shape, place: &str, passes: usize) {
 }
 
 fn main() {
+    measure::fix_hash_seeds();
     let mut args = std::env::args().skip(1);
     let first = args.next().expect("rate or SHAPE");
     if first == "rate" {

@@ -56,6 +56,7 @@ pub struct Options {
     create_if_missing: bool,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     read_only_fallback: bool,
+    read_only: bool,
     allow_fuse: bool,
     io_backend: Option<IoBackend>,
     direct_io: Option<bool>,
@@ -74,6 +75,8 @@ pub struct Options {
     cpu_profile: CpuProfile,
     auto_recover: Recovery,
     change_feed: Option<FeedRetention>,
+    /// `change_feed_off()`: no feed, and nothing inherited.
+    feed_off: bool,
     feed_tables: Option<Vec<String>>,
 }
 
@@ -104,17 +107,33 @@ pub struct FeedRetention {
     /// History older than this is dropped even under `bytes`. `None`, the default, keeps it
     /// until `bytes` pushes it out.
     pub age: Option<Duration>,
+    /// How long fed `Buffered` and `None` commits wait for a sync before the writer syncs
+    /// them in the background, so a durable subscriber (the default) sees them: `None`, the
+    /// default, is 100 ms, or 1 s on macOS, where a sync flushes the whole device. Commits
+    /// at `GroupSync` or `Sync` never wait for it.
+    pub sync_interval: Option<Duration>,
 }
 
 impl FeedRetention {
     /// Keeps `bytes` of history, with no age limit.
     pub fn bytes(bytes: u64) -> Self {
-        Self { bytes, age: None }
+        Self {
+            bytes,
+            age: None,
+            sync_interval: None,
+        }
     }
 
     /// Also drops history older than `age`.
     pub fn age(mut self, age: Duration) -> Self {
         self.age = Some(age);
+        self
+    }
+
+    /// Sets the background sync's interval for fed `Buffered` and `None` commits (see
+    /// [`sync_interval`](Self#structfield.sync_interval)).
+    pub fn sync_interval(mut self, interval: Duration) -> Self {
+        self.sync_interval = Some(interval);
         self
     }
 }
@@ -269,6 +288,7 @@ impl Default for Options {
             create_if_missing: true,
             merge_operators: Vec::new(),
             read_only_fallback: false,
+            read_only: false,
             allow_fuse: false,
             io_backend: None,
             direct_io: None,
@@ -287,6 +307,7 @@ impl Default for Options {
             cpu_profile: CpuProfile::Embedded,
             auto_recover: Recovery::Off,
             change_feed: None,
+            feed_off: false,
             feed_tables: None,
         }
     }
@@ -304,7 +325,10 @@ impl Options {
     /// still caps it). Engine-owned shards run on up to a thread each, as few as the load
     /// needs ([`adaptive_shard_threads`](Options::adaptive_shard_threads), on by default),
     /// unless [`shard_threads`](Options::shard_threads) fixes the count (D289).
-    /// `1` is a valid configuration.
+    /// `1` is a valid configuration. **Unset, an existing database with a change feed keeps
+    /// the shard count its last open recorded**, since another count ends the feed's history
+    /// (D310's amendment). Set it to reshard on purpose; a feed then expires with "the shard
+    /// count changed".
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
         self
@@ -642,20 +666,38 @@ impl Options {
         self
     }
 
-    /// Turns on the change feed's history (D310, off by default): the log keeps `retention`
-    /// of committed changes, a clean close keeps it, and the next open with the feed on
-    /// takes it up again without replaying it. Configured per open: an open without it
-    /// keeps no history, and the history a subscriber could resume from ends there. With a
-    /// feed, the database at rest is the main file plus its `-wal-N` files and the
-    /// `-feed` file beside it.
+    /// Turns on the change feed's history (D310): the log keeps `retention` of committed
+    /// changes, a clean close keeps it, and the next open with the feed on takes it up again
+    /// without replaying it. With a feed, the database at rest is the main file plus its
+    /// `-wal-N` files and the `-feed` file beside it.
+    ///
+    /// **An open that doesn't mention the feed inherits it** (D310's amendment): if the last
+    /// open fed, the next one with neither `change_feed` nor
+    /// [`change_feed_off`](Self::change_feed_off) feeds the same tables with the same
+    /// retention and age, so a tool that opens the file between two runs of the app
+    /// (`phdb load`, say) keeps the app's feed history instead of ending it.
+    /// [`FeedRetention::sync_interval`] is per open: an inherited feed uses the default. A new
+    /// database, one whose last open had the feed off, or one whose fed tables were all
+    /// dropped since, stays off.
     pub fn change_feed(mut self, retention: FeedRetention) -> Self {
         self.change_feed = Some(retention);
+        self.feed_off = false;
         self
     }
 
-    /// The tables the change feed covers, by name (default: every table). Each must exist
-    /// when the database opens, and the feed must be on
-    /// ([`change_feed`](Self::change_feed)), or the open fails with
+    /// Turns the change feed off for this open, whatever the last open did. This ends the
+    /// feed's history: a subscriber's token from before can't resume past this open
+    /// ([`ErrorCode::FeedExpired`](crate::ErrorCode::FeedExpired)), and the retained log
+    /// is no longer kept.
+    pub fn change_feed_off(mut self) -> Self {
+        self.change_feed = None;
+        self.feed_off = true;
+        self
+    }
+
+    /// The tables the change feed covers, by name (default: every table, or what an
+    /// inherited feed covered). Each must exist when the database opens, and the feed must
+    /// be turned on in this open ([`change_feed`](Self::change_feed)), or the open fails with
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument). A table added to
     /// the list later has history from that open on.
     pub fn feed_tables<I, S>(mut self, tables: I) -> Self
@@ -792,6 +834,31 @@ impl Options {
     /// writable is unaffected.
     pub fn read_only_fallback(mut self, yes: bool) -> Self {
         self.read_only_fallback = yes;
+        self
+    }
+
+    /// Open read-only, whatever the file needs (default off; ICR 0109): the open
+    /// [`read_only_fallback`](Self::read_only_fallback) falls back to, asked for. It writes
+    /// nothing to the database's files, so a tool that only reads leaves the database as it
+    /// found it: no format upgrade, no change-feed session (so an application's feed tokens
+    /// stay valid, D310), no new log segment, no flush, compaction or clean-close commit.
+    ///
+    /// Writes, schema changes, `flush`, `compact` and `shrink` fail with
+    /// [`ErrorCode::ReadOnly`](crate::ErrorCode::ReadOnly), and
+    /// [`DatabaseInfo::read_only`](crate::DatabaseInfo::read_only) is true. It replays the
+    /// write-ahead log into memory, so a log that doesn't fit
+    /// [`memtable_budget`](Self::memtable_budget) fails the open with `ReadOnly`. A missing
+    /// file isn't created, whatever [`create_if_missing`](Self::create_if_missing) says.
+    ///
+    /// **It is still a writer-process open in every other respect:**
+    /// - It takes the writer lock, which needs write access to the file, so it fails on a
+    ///   read-only file or mount.
+    /// - It excludes a running writer, failing with `WriterLocked` while one has the database
+    ///   open. To read beside a running writer, open a reader process
+    ///   ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)), as `phdb` does.
+    /// - It creates the writer's shared-memory region ([`shm_dir`](Self::shm_dir)).
+    pub fn read_only(mut self, yes: bool) -> Self {
+        self.read_only = yes;
         self
     }
 
@@ -1687,6 +1754,7 @@ impl Options {
         o.shm_dir.clone_from(&self.shm_dir);
         o.reader_slots = self.reader_slots;
         o.read_only_fallback = self.read_only_fallback;
+        o.read_only = self.read_only;
         o.allow_fuse = self.allow_fuse;
         if let Some(bytes) = self.wal_segment_size {
             o.wal.segment_size = bytes;
@@ -1699,6 +1767,9 @@ impl Options {
                     .age
                     .map(|a| u64::try_from(a.as_micros()).unwrap_or(u64::MAX));
                 f.tables.clone_from(tables);
+                f.sync_interval_micros = r
+                    .sync_interval
+                    .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
                 Some(f)
             }
             (None, Some(_)) => {
@@ -1708,6 +1779,8 @@ impl Options {
             }
             (None, None) => None,
         };
+        // Unset (neither `change_feed` nor `change_feed_off`): inherit the last session's.
+        o.feed_inherit = self.change_feed.is_none() && !self.feed_off;
         o.tablet_changes = self.tablet_changes;
         o.balance_pack = self.tablet_packing;
         if let Some(window) = self.commit_spin {

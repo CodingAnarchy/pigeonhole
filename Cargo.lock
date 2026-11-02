@@ -813,6 +813,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "20870f649af7073d53e38067b2a84312175d56ea15217e1b15bc83506ec50afb"
 
 [[package]]
+name = "levenshtein_automata"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0c2cdeb66e45e9f36bfad5bbdb4d2384e70936afbee843c6f6543f0c551ebb25"
+
+[[package]]
 name = "libc"
 version = "0.2.190"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1141,6 +1147,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pigeonhole-memory"
+version = "1.0.0"
+dependencies = [
+ "getrandom 0.3.4",
+ "pigeonhole",
+ "pigeonhole-text",
+ "twox-hash",
+]
+
+[[package]]
 name = "pigeonhole-memtable"
 version = "2.0.0"
 dependencies = [
@@ -1215,6 +1231,7 @@ dependencies = [
 name = "pigeonhole-text"
 version = "1.0.0"
 dependencies = [
+ "levenshtein_automata",
  "pigeonhole",
  "unicode-normalization",
  "unicode-segmentation",

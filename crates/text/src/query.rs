@@ -43,10 +43,22 @@ pub enum Clause {
         /// The position moves a match may take: 0 for an exact phrase.
         slop: u16,
     },
-    /// A fuzzy term (D309 §4.4). The term is matched as given.
+    /// A fuzzy term (D309 §4.4), matched as given after the index's normalisation:
+    /// [`Query::fuzzy`].
     Fuzzy {
         /// The term.
         term: String,
+        /// How far a match may be.
+        fuzziness: Fuzziness,
+    },
+    /// A fuzzy word of the syntax (`word~`, `word~1`, `word~2`): tokenised as documents are,
+    /// and each of its terms is a fuzzy term. [`Fuzziness::Auto`] applies to each term's
+    /// own length. A word that tokenises into several terms (`foo-bar~`) gives one fuzzy
+    /// term each, scored separately and summed, as [`Text`](Clause::Text) does for its
+    /// words.
+    FuzzyText {
+        /// The word.
+        text: String,
         /// How far a match may be.
         fuzziness: Fuzziness,
     },
@@ -59,7 +71,8 @@ pub enum Clause {
 /// - whitespace-separated words, each tokenised as documents are ([`Clause::Text`]);
 /// - `"..."` for a phrase, and `"..."~N` for one within `N` position moves (0 to 65,535)
 ///   ([`Clause::QuotedPhrase`]);
-/// - `word~`, `word~1` or `word~2` for a fuzzy term ([`Clause::Fuzzy`]);
+/// - `word~`, `word~1` or `word~2` for a fuzzy word, tokenised as documents are
+///   ([`Clause::FuzzyText`]);
 /// - `\"`, `\~` and `\\` for a literal `"`, `~` or `\`.
 ///
 /// **The builder's terms and phrase words are matched exactly as given, never tokenised:**
@@ -130,10 +143,28 @@ impl Query {
         self.with(Clause::Text(text.into()))
     }
 
-    /// Adds a fuzzy term, matched as given (D309 §4.4).
+    /// Adds a fuzzy term (D309 §4.4): it matches the index's terms within `fuzziness` edits
+    /// of it, an adjacent transposition counting as one (Damerau–Levenshtein over
+    /// characters).
     ///
-    /// Fuzzy terms come in D309 PR 4: until then a search with one is refused
-    /// (`InvalidArgument`).
+    /// - **The term is matched as given,** after the index's normalisation, like
+    ///   [`term`](Self::term): pass it as the tokeniser emits terms.
+    /// - **[`Fuzziness::Auto`]** allows 0 edits for 1–2 characters, 1 for 3–5 and 2 for 6
+    ///   or more.
+    /// - **An edit count as large as the shorter term's length never matches** (`a` and `b`
+    ///   are one edit apart, but nothing of `a` is left).
+    /// - **The expansions:** at most [`max_expansions`](crate::Search::max_expansions) terms
+    ///   (50 by default), the closest first, then the most frequent, then bytewise. A
+    ///   [`prefix_length`](crate::Search::prefix_length) makes the first characters match
+    ///   exactly, which narrows the walk on a large dictionary.
+    /// - **Scoring:** each expansion scores as a term, times `1 − d / min(len(q), len(t))`
+    ///   (Lucene's boost, `d` its distance, lengths in characters), with Lucene's blended
+    ///   statistics: every expansion's idf is that of the most frequent one, so a rare
+    ///   misspelling no longer outranks the word it misspells on idf alone (a document can
+    ///   still win on its term frequency and length). A document's score for the clause is
+    ///   its best expansion's, not their sum.
+    /// - **Composed and decomposed characters** are edits apart: the index's normalisation
+    ///   (NFC by default) makes them one form.
     pub fn fuzzy(self, term: impl Into<String>, fuzziness: Fuzziness) -> Self {
         self.with(Clause::Fuzzy {
             term: term.into(),
@@ -287,8 +318,8 @@ fn parse_into(s: &str, q: &mut Query) -> std::result::Result<(), ParseError> {
             i += c.len_utf8();
         }
         match fuzzy {
-            Some(fuzziness) => q.push(Clause::Fuzzy {
-                term: word,
+            Some(fuzziness) => q.push(Clause::FuzzyText {
+                text: word,
                 fuzziness,
             }),
             None if !word.is_empty() => q.push(Clause::Text(word)),
@@ -316,23 +347,23 @@ mod tests {
     #[test]
     fn words_phrases_and_fuzzy_terms() {
         assert_eq!(
-            clauses(r#"postgres "March meeting" postgress~ x~1 y~2"#),
+            clauses(r#"postgres "March meeting" Postgress~ x~1 y~2"#),
             [
                 Clause::Text("postgres".into()),
                 Clause::QuotedPhrase {
                     text: "March meeting".into(),
                     slop: 0
                 },
-                Clause::Fuzzy {
-                    term: "postgress".into(),
+                Clause::FuzzyText {
+                    text: "Postgress".into(),
                     fuzziness: Fuzziness::Auto
                 },
-                Clause::Fuzzy {
-                    term: "x".into(),
+                Clause::FuzzyText {
+                    text: "x".into(),
                     fuzziness: Fuzziness::One
                 },
-                Clause::Fuzzy {
-                    term: "y".into(),
+                Clause::FuzzyText {
+                    text: "y".into(),
                     fuzziness: Fuzziness::Two
                 },
             ]

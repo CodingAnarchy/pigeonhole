@@ -9,9 +9,11 @@
 
 use pyo3::prelude::*;
 
+mod budget;
 mod convert;
 mod db;
 mod error;
+mod feed;
 mod read;
 mod table;
 mod vector;
@@ -42,6 +44,15 @@ fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<walk::RowPosition>()?;
     m.add_class::<walk::Pages>()?;
     m.add_class::<walk::Neighbour>()?;
+    m.add_class::<budget::ScanPosition>()?;
+    m.add_class::<budget::KeysPosition>()?;
+    m.add_class::<budget::ScanPage>()?;
+    m.add_class::<budget::KeysPage>()?;
+    m.add_class::<budget::NearestPage>()?;
+    m.add_class::<feed::Feed>()?;
+    m.add_class::<feed::FeedIter>()?;
+    m.add_class::<feed::Commit>()?;
+    m.add_class::<feed::Change>()?;
     error::register(m)?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())

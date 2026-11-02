@@ -9,7 +9,9 @@ use std::path::Path;
 use pigeonhole::{Durability, Pigeonhole, Table, WriteBatch};
 use serde_json::{Value, json};
 
-use super::schema::{JsonValue, bytes_from_json, family_from_json, value_from_json};
+use super::schema::{
+    Components, JsonValue, bytes_from_json, element_name, family_from_json, value_from_json,
+};
 use crate::ExitStatus;
 use crate::args::Cli;
 use crate::exit::Failure;
@@ -163,6 +165,44 @@ fn load(db: &Pigeonhole, reader: Box<dyn BufRead>, header_line: usize) -> Result
             JsonValue::Bytes(bytes) => {
                 size += bytes.len();
                 batch.put_at(table, &row, family, &qualifier, ts, &bytes)
+            }
+            JsonValue::Vector {
+                element,
+                dim,
+                components,
+            } => {
+                // Checked here, so a mismatch names its line rather than failing the batch.
+                let spec = table
+                    .family_info(family)
+                    .ok_or_else(|| bad(&format!("table {name} has no family {family}")))?
+                    .vector
+                    .ok_or_else(|| {
+                        bad(&format!("a vector value in {family}, not a vector family"))
+                    })?;
+                if spec.element() != element || spec.dim() != dim {
+                    return Err(bad(&format!(
+                        "a {}[{dim}] vector in {family}, whose vectors are {}[{}]",
+                        element_name(element),
+                        element_name(spec.element()),
+                        spec.dim()
+                    )));
+                }
+                match components {
+                    // `f16`/`bf16` values were written widened, so `put_vector_f32` rounds
+                    // them back to the same bits.
+                    Components::Floats(xs) => {
+                        size += 4 * xs.len();
+                        batch.put_vector_f32_at(table, &row, family, &qualifier, ts, &xs)
+                    }
+                    Components::Ints(xs) => {
+                        size += xs.len();
+                        batch.put_vector_i8_at(table, &row, family, &qualifier, ts, &xs)
+                    }
+                    Components::Bits(b) => {
+                        size += b.len();
+                        batch.put_vector_bits_at(table, &row, family, &qualifier, ts, &b)
+                    }
+                }
             }
         };
         n.cells += 1;

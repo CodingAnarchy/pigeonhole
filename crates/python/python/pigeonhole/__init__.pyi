@@ -255,6 +255,8 @@ class Traversal:
     def hops_cut(self) -> int: ...
     @property
     def cut_by_max_nodes(self) -> bool: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
 
 @final
 class Neighbour:
@@ -271,6 +273,64 @@ class Neighbour:
     def __eq__(self, other: object, /) -> bool: ...
 
 @final
+class Change:
+    """One mutation of a change-feed commit."""
+
+    @property
+    def table(self) -> str: ...
+    @property
+    def family(self) -> str: ...
+    @property
+    def kind(self) -> Literal["put", "merge", "delete_cell", "delete_column", "delete_family", "unknown"]: ...
+    @property
+    def row(self) -> bytes: ...
+    @property
+    def qualifier(self) -> bytes: ...
+    @property
+    def timestamp(self) -> int: ...
+    @property
+    def value(self) -> Any: ...
+
+@final
+class Commit:
+    """One whole commit a change feed delivered."""
+
+    @property
+    def seqno(self) -> int: ...
+    @property
+    def timestamp(self) -> int: ...
+    @property
+    def changes(self) -> list[Change]: ...
+    def __len__(self) -> int: ...
+
+@final
+class FeedIter:
+    """A feed's commits as an iterator."""
+
+    def __iter__(self) -> FeedIter: ...
+    def __next__(self) -> Commit: ...
+
+@final
+class Feed:
+    """A subscription to committed changes: whole commits, once each, in commit order."""
+
+    def next(self, timeout: Seconds | None = None) -> Commit | None: ...
+    def try_next(self) -> Commit | None: ...
+    def token(self) -> bytes: ...
+    @property
+    def oldest_retained(self) -> int | None: ...
+    def iter(self, timeout: Seconds | None = None) -> FeedIter: ...
+    def __iter__(self) -> FeedIter: ...
+    def close(self) -> None: ...
+    def __enter__(self) -> Feed: ...
+    def __exit__(
+        self,
+        ty: type[BaseException] | None,
+        value: BaseException | None,
+        tb: TracebackType | None,
+    ) -> bool: ...
+
+@final
 class RowPosition:
     """Where a walk of a row stopped; its bytes are stable."""
 
@@ -279,6 +339,78 @@ class RowPosition:
     def from_bytes(b: Key) -> RowPosition: ...
     def __eq__(self, other: object, /) -> bool: ...
     def __hash__(self) -> int: ...
+
+@final
+class ScanPosition:
+    """Where a `scan_within` page stopped, to resume with `after=`; its bytes are stable."""
+
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(b: Key) -> ScanPosition: ...
+    @property
+    def row(self) -> bytes: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+@final
+class KeysPosition:
+    """Where a `multi_get_within` page stopped, to resume with `after=`; its bytes are stable."""
+
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(b: Key) -> KeysPosition: ...
+    @property
+    def key(self) -> bytes: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+@final
+class ScanPage:
+    """A `scan_within` page: its rows, size, and where to resume."""
+
+    @property
+    def rows(self) -> list[Row]: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
+    @property
+    def next_bytes(self) -> int | None: ...
+    @property
+    def resume(self) -> ScanPosition | None: ...
+    def __len__(self) -> int: ...
+
+@final
+class KeysPage:
+    """A `multi_get_within` page: its rows, size, and where to resume. Unlike `multi_get`,
+    the rows are in key order, with no entry for a key without a cell: not aligned with the
+    keys given."""
+
+    @property
+    def rows(self) -> list[Row]: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
+    @property
+    def next_bytes(self) -> int | None: ...
+    @property
+    def resume(self) -> KeysPosition | None: ...
+    def __len__(self) -> int: ...
+
+@final
+class NearestPage:
+    """A `nearest_within` page: the nearest neighbours that fit a byte budget."""
+
+    @property
+    def neighbours(self) -> list[Neighbour]: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
+    @property
+    def next_bytes(self) -> int | None: ...
+    def __len__(self) -> int: ...
 
 @final
 class Pages:
@@ -361,6 +493,7 @@ class Table:
         per_node_limit: int | None = None,
         hop_limit: int | None = None,
         max_nodes: int | None = None,
+        byte_budget: int | None = None,
         parents: bool = False,
         qualifier_prefix: Key | None = None,
         snapshot: Snapshot | None = None,
@@ -380,6 +513,58 @@ class Table:
         snapshot: Snapshot | None = None,
         parallel: int | None = None,
     ) -> list[Neighbour]: ...
+    def nearest_within(
+        self,
+        family: str,
+        query: Vector,
+        k: int,
+        *,
+        bytes: int,
+        prefix: Key | None = None,
+        start: Key | None = None,
+        end: Key | None = None,
+        keys: Sequence[Key] | None = None,
+        qualifier_prefix: Key | None = None,
+        snapshot: Snapshot | None = None,
+        parallel: int | None = None,
+    ) -> NearestPage: ...
+    def scan_within(
+        self,
+        prefix: Key | None = None,
+        *,
+        bytes: int,
+        start: Key | None = None,
+        end: Key | None = None,
+        families: Sequence[str] | None = None,
+        qualifier_prefix: Key | None = None,
+        versions: int = 1,
+        limit: int | None = None,
+        column_limit: int | None = None,
+        snapshot: Snapshot | None = None,
+        after: ScanPosition | None = None,
+    ) -> ScanPage: ...
+    def multi_get_within(
+        self,
+        keys: Sequence[Key],
+        *,
+        bytes: int,
+        families: Sequence[str] | None = None,
+        qualifier_prefix: Key | None = None,
+        versions: int = 1,
+        column_limit: int | None = None,
+        snapshot: Snapshot | None = None,
+        after: KeysPosition | None = None,
+    ) -> KeysPage: ...
+    def feed(
+        self,
+        *,
+        tables: Sequence[Table] | None = None,
+        prefix: Key | None = None,
+        visible: bool = False,
+        from_snapshot: Snapshot | None = None,
+        from_oldest: bool = False,
+        resume: Key | None = None,
+    ) -> Feed: ...
     def pages(
         self,
         row: Key,
@@ -579,6 +764,10 @@ def open(
     memtable_budget: int | None = None,
     shm_dir: str | PathLike[str] | None = None,
     read_only_fallback: bool | None = None,
+    change_feed: int | None = None,
+    change_feed_off: bool = False,
+    feed_age: Seconds | None = None,
+    feed_tables: Sequence[str] | None = None,
 ) -> Database: ...
 def open_reader(
     path: str | PathLike[str],
@@ -624,3 +813,4 @@ class BatchTooLarge(Error): ...
 class OutcomeUnknown(Error): ...
 class NoWriter(Error): ...
 class UnsupportedFeature(Error): ...
+class FeedExpired(Error): ...

@@ -140,6 +140,36 @@ pub mod watermark {
     /// sync has not returned; `u64::MAX` when idle. Durable snapshots read it, and
     /// [`CROSS_HELD`](super::header::CROSS_HELD).
     pub const DURABLE: usize = 8;
+    /// `u64` atomic (layout version 7, D310): the lowest seqno this shard holds whose WAL
+    /// record is not yet in its stream file, among the records the change feed needs (a
+    /// fed table's `Durability::None` commits, buffered until the lazy flush or a stronger
+    /// write); `u64::MAX` when it holds none. The change feed's frontier stays below it.
+    /// Stored before `PENDING` lets the seqno go, and lowered only there or under a hold
+    /// that still covers the seqno, so a reader that loads `PENDING` and then this (Acquire
+    /// both) never passes an unwritten record. Only a writer with the feed on stores
+    /// anything but `u64::MAX`.
+    pub const WRITTEN: usize = 16;
+    /// `u64` atomic (layout version 7, D310): the lowest seqno this shard holds whose fed
+    /// record no sync covers yet (`Durability::None` and `Buffered`), stored as
+    /// [`WRITTEN`] is: a durable change feed stays below it, so it never delivers a change
+    /// a power loss could still undo. `u64::MAX` when it holds none.
+    pub const SYNCED: usize = 24;
+    /// `u64` atomic (layout version 8, D310 PR 4): the smallest epoch of any segment of this
+    /// shard's stream not yet recyclable (the writer's `FeedMarks::floor`); never goes down. 0
+    /// until a writer with the feed on stores it. A reader process's change feed reads it for
+    /// expiry and as rule C's backstop.
+    pub const FEED_FLOOR: usize = 32;
+    /// `u64` atomic (layout version 8): the stream's checkpoint `Lsn` (`FeedMarks::checkpoint`),
+    /// stored once the checkpoint edit is durable; never goes down. 0 until stored.
+    pub const FEED_CKPT: usize = 40;
+    /// `u64` atomic (layout version 8, simp724's B1 on #1352): the largest start bound the
+    /// stream's retained history can't serve: the key of the writer's checkpoint-history
+    /// entry at the floor (`Feed::oldest_bound`), so some record dropped below the floor may
+    /// have a key up to it. A reader process's feed asked to start after a seqno below it
+    /// has lost history and expires. Stored (`fetch_max`, Release) before the floor it
+    /// belongs to, so a reader that loads `FEED_FLOOR` and then this (Acquire both) gets a
+    /// bound at least that floor's; raised at checkpoints too. 0 until stored.
+    pub const FEED_BOUND: usize = 48;
 }
 
 /// Byte offsets within a reader slot.

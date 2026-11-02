@@ -214,6 +214,77 @@ page!(
     KeysPosition
 );
 
+/// A [`Nearest::run_within`](super::Nearest::run_within) result (D308 PR 3, #1302): the
+/// nearest neighbours, nearest first, that fit a byte budget.
+///
+/// There's no resume position. A nearest search ranks every candidate it reads, so a later
+/// page couldn't continue the ranking; a larger budget, or a larger `k`, returns more.
+#[derive(Debug, Clone)]
+pub struct NearestPage {
+    neighbours: Vec<super::Neighbour>,
+    bytes: u64,
+    next_bytes: Option<u64>,
+}
+
+impl NearestPage {
+    /// The longest prefix of `ranked` (nearest first) whose sizes fit `budget`: a neighbour
+    /// is in whole or not at all, and the first that doesn't fit ends the page.
+    pub(super) fn cut(ranked: Vec<super::Neighbour>, budget: u64) -> Self {
+        let mut bytes = 0u64;
+        let mut keep = ranked.len();
+        let mut next_bytes = None;
+        for (i, n) in ranked.iter().enumerate() {
+            let size = neighbour_size(n);
+            if bytes + size > budget {
+                keep = i;
+                next_bytes = Some(size);
+                break;
+            }
+            bytes += size;
+        }
+        let mut neighbours = ranked;
+        neighbours.truncate(keep);
+        NearestPage {
+            neighbours,
+            bytes,
+            next_bytes,
+        }
+    }
+
+    /// The neighbours that fit, nearest first, in [`run`](super::Nearest::run)'s order.
+    pub fn neighbours(&self) -> &[super::Neighbour] {
+        &self.neighbours
+    }
+
+    /// The neighbours, owned.
+    pub fn into_neighbours(self) -> Vec<super::Neighbour> {
+        self.neighbours
+    }
+
+    /// The page's size by D308's rule: each neighbour's row key, qualifier and 16 bytes.
+    /// Never more than the budget.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// Whether the budget left out a neighbour the search found (not `k` or the input
+    /// running out).
+    pub fn cut_by_budget(&self) -> bool {
+        self.next_bytes.is_some()
+    }
+
+    /// With [`cut_by_budget`](Self::cut_by_budget), the size of the first neighbour left
+    /// out: a budget of `bytes() + next_bytes()` includes it.
+    pub fn next_bytes(&self) -> Option<u64> {
+        self.next_bytes
+    }
+}
+
+/// A neighbour's size (D308 §2): its row key, its qualifier and the overhead.
+fn neighbour_size(n: &super::Neighbour) -> u64 {
+    n.row.len() as u64 + n.qualifier.len() as u64 + BUDGET_ITEM_OVERHEAD
+}
+
 /// Copies each cell's stored value (tag byte first) for the page.
 struct CopyValue;
 

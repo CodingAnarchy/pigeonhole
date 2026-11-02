@@ -48,6 +48,17 @@ const VIEW_READ_ATTEMPTS: u32 = 8;
 /// Size of the fixed part of a view record (`FORMAT.md` §11.4).
 const VIEW_HEADER_LEN: usize = 32;
 
+/// A stream's change-feed marks as a reader loaded them ([`ShmRegion::feed_marks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedMarksView {
+    /// The smallest epoch not yet recyclable.
+    pub floor: u32,
+    /// The checkpoint `Lsn`'s raw value.
+    pub checkpoint: u64,
+    /// The largest start bound the retained history can't serve.
+    pub bound: u64,
+}
+
 /// The mapped region for one database.
 ///
 /// Cheap to clone: every clone shares one mapping. See the [crate docs](crate) for the
@@ -101,6 +112,59 @@ impl Inner {
         );
         let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
         self.region.atomic_u64(off + watermark::DURABLE)
+    }
+
+    fn written(&self, shard: u32) -> &AtomicU64 {
+        assert!(
+            shard < self.header.shard_count,
+            "shard {shard} out of range (region has {} shards)",
+            self.header.shard_count
+        );
+        let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
+        self.region.atomic_u64(off + watermark::WRITTEN)
+    }
+
+    /// One of `shard`'s change-feed marks (layout version 8): `field` is
+    /// [`watermark::FEED_FLOOR`], [`watermark::FEED_CKPT`] or [`watermark::FEED_BOUND`].
+    fn feed_mark(&self, shard: u32, field: usize) -> &AtomicU64 {
+        assert!(
+            shard < self.header.shard_count,
+            "shard {shard} out of range (region has {} shards)",
+            self.header.shard_count
+        );
+        let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
+        self.region.atomic_u64(off + field)
+    }
+
+    fn synced(&self, shard: u32) -> &AtomicU64 {
+        assert!(
+            shard < self.header.shard_count,
+            "shard {shard} out of range (region has {} shards)",
+            self.header.shard_count
+        );
+        let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
+        self.region.atomic_u64(off + watermark::SYNCED)
+    }
+
+    /// The change feed's frontier (D310): as [`visible_seqno`](Self::visible_seqno), or as
+    /// [`durable_seqno`](Self::durable_seqno) with `durable`, and also below every shard's
+    /// written watermark (and, with `durable`, its synced one). Per shard, `pending` (and
+    /// `durable`) first, then `written` (and `synced`), all Acquire: a shard stores those
+    /// before `pending` lets a seqno go.
+    fn written_seqno(&self, durable: bool) -> Seqno {
+        let (next, held) = self.next_and_held();
+        let mut lowest = next.min(held);
+        for shard in 0..self.header.shard_count {
+            lowest = lowest.min(self.pending(shard).load(Ordering::Acquire));
+            if durable {
+                lowest = lowest.min(self.durable(shard).load(Ordering::Acquire));
+            }
+            lowest = lowest.min(self.written(shard).load(Ordering::Acquire));
+            if durable {
+                lowest = lowest.min(self.synced(shard).load(Ordering::Acquire));
+            }
+        }
+        lowest.saturating_sub(1)
     }
 
     fn slot_off(&self, index: u32) -> usize {
@@ -299,10 +363,23 @@ fn init_region(
     region.write(0, &page);
     for shard in 0..h.shard_count {
         let off = h.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
-        for field in [watermark::PENDING, watermark::DURABLE] {
+        for field in [
+            watermark::PENDING,
+            watermark::DURABLE,
+            watermark::WRITTEN,
+            watermark::SYNCED,
+        ] {
             region
                 .atomic_u64(off + field)
                 .store(u64::MAX, Ordering::Relaxed);
+        }
+        // The change feed's marks start unknown (layout version 8).
+        for field in [
+            watermark::FEED_FLOOR,
+            watermark::FEED_CKPT,
+            watermark::FEED_BOUND,
+        ] {
+            region.atomic_u64(off + field).store(0, Ordering::Relaxed);
         }
     }
     region
@@ -823,6 +900,69 @@ impl ShmRegion {
         self.inner.durable(shard).store(durable, Ordering::Release);
     }
 
+    /// Publishes `shard`'s written watermark with release ordering (layout version 7, D310):
+    /// the lowest seqno it holds whose record the change feed needs and that is not yet in
+    /// its stream file; `u64::MAX` when none. Store it before
+    /// [`publish_pending`](Self::publish_pending) releases the seqno (FORMAT §11.2).
+    pub fn publish_written(&self, shard: u32, written: Seqno) {
+        self.inner.written(shard).store(written, Ordering::Release);
+    }
+
+    /// Publishes `shard`'s synced watermark with release ordering (layout version 7, D310):
+    /// as [`publish_written`](Self::publish_written), for the records the change feed needs
+    /// that are not yet synced; `u64::MAX` when none.
+    pub fn publish_synced(&self, shard: u32, synced: Seqno) {
+        self.inner.synced(shard).store(synced, Ordering::Release);
+    }
+
+    /// Raises `shard`'s stream's feed floor (the smallest epoch not yet recyclable) with
+    /// release ordering; it never goes down.
+    pub fn publish_feed_floor(&self, shard: u32, epoch: u32) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_FLOOR)
+            .fetch_max(u64::from(epoch), Ordering::AcqRel);
+    }
+
+    /// Raises `shard`'s stream's checkpoint for change feeds (an `Lsn`'s raw value) with
+    /// release ordering, once the checkpoint edit is durable; it never goes down.
+    pub fn publish_feed_checkpoint(&self, shard: u32, lsn: u64) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_CKPT)
+            .fetch_max(lsn, Ordering::AcqRel);
+    }
+
+    /// Raises `shard`'s stream's lost bound (layout version 8, `watermark::FEED_BOUND`) with
+    /// release ordering; it never goes down. The writer stores it before the floor it
+    /// belongs to.
+    pub fn publish_feed_bound(&self, shard: u32, bound: u64) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_BOUND)
+            .fetch_max(bound, Ordering::AcqRel);
+    }
+
+    /// `shard`'s stream's change-feed marks (layout version 8, Acquire each, in this order):
+    /// the floor epoch, the checkpoint `Lsn`'s raw value, and the lost bound (loaded after the
+    /// floor, so it is at least that floor's); zeros until a writer with the feed on stores
+    /// them.
+    pub fn feed_marks(&self, shard: u32) -> FeedMarksView {
+        let load = |f| self.inner.feed_mark(shard, f).load(Ordering::Acquire);
+        let floor = load(watermark::FEED_FLOOR) as u32;
+        let checkpoint = load(watermark::FEED_CKPT);
+        let bound = load(watermark::FEED_BOUND);
+        FeedMarksView {
+            floor,
+            checkpoint,
+            bound,
+        }
+    }
+
+    /// The change feed's frontier (D310): every commit at or below it is applied on every
+    /// shard and its records are in their stream files; with `durable`, it is durable at its
+    /// level and the records the feed needs are synced, so no crash undoes it. Never above [`ShmRegion::visible_seqno`].
+    pub fn written_seqno(&self, durable: bool) -> Seqno {
+        self.inner.written_seqno(durable)
+    }
+
     /// The highest seqno a durable snapshot may include (D227, ICR 0037): every commit at or
     /// below it is applied on every shard and durable at its level. Never above
     /// [`ShmRegion::visible_seqno`].
@@ -1291,6 +1431,31 @@ mod tests {
     }
 
     #[test]
+    fn the_written_watermark_holds_the_feed_frontier() {
+        // D310: `written` bounds the feed's frontier as `pending` bounds snapshots, and
+        // `u64::MAX` (the fresh value) holds nothing.
+        let shm = ShmRegion::in_memory([3; 16], &small());
+        shm.advance_next_seqno(100);
+        assert_eq!(shm.visible_seqno(), 99);
+        assert_eq!(shm.written_seqno(false), 99);
+        shm.publish_written(1, 40);
+        assert_eq!(shm.written_seqno(false), 39);
+        assert_eq!(shm.written_seqno(true), 39);
+        assert_eq!(shm.visible_seqno(), 99, "snapshots ignore it");
+        // A durable feed is also below every durable and synced watermark.
+        shm.publish_durable(0, 20);
+        assert_eq!(shm.written_seqno(true), 19);
+        assert_eq!(shm.written_seqno(false), 39);
+        shm.publish_synced(0, 10);
+        assert_eq!(shm.written_seqno(true), 9);
+        assert_eq!(shm.written_seqno(false), 39, "a visible feed ignores it");
+        shm.publish_written(1, u64::MAX);
+        shm.publish_durable(0, u64::MAX);
+        shm.publish_synced(0, u64::MAX);
+        assert_eq!(shm.written_seqno(true), 99);
+    }
+
+    #[test]
     fn fresh_region_is_idle() {
         let shm = ShmRegion::in_memory([3; 16], &small());
         assert_eq!(shm.generation(), Generation(1));
@@ -1354,7 +1519,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 6
+                expected: 8
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });

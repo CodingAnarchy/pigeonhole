@@ -95,8 +95,15 @@ pub struct EngineOptions {
     /// WAL segment configuration. Its change-feed fields (`retain_segments`,
     /// `feed_session`) are the engine's to set from `feed`; values set here are ignored.
     pub wal: WalOptions,
-    /// The change feed (D310): `None`, the default, feeds nothing.
+    /// The change feed (D310): `None`, the default, feeds nothing, unless `feed_inherit`.
     pub feed: Option<FeedOptions>,
+    /// With `feed` `None`: take the change feed's settings from the sidecar's last session
+    /// (its retention, age and fed tables), so an open that doesn't mention the feed continues
+    /// its history rather than ending it (D310's amendment, the owner, 2026-11-02). Off by
+    /// default here; `pigeonhole::Options` turns it on unless `change_feed_off()`. A last
+    /// open that recorded "fed: none", or no sidecar, means off as before. Independently, an
+    /// unset `shards` (0) takes the last session's stream count when there is one.
+    pub feed_inherit: bool,
     /// Bytes a shard's WAL stream may hold past its oldest record that is not yet in SSTs
     /// before the shard flushes the memtables that record (and the ones after it) wrote,
     /// however small they are (#137). Without it one write to a slot that is never written
@@ -160,6 +167,12 @@ pub struct EngineOptions {
     /// WAL segment, no flush or compaction, no clean-close commit. It replays the WAL into
     /// memory, and fails with `ReadOnlyOpen` if that does not fit `memtable_budget`.
     pub read_only_fallback: bool,
+    /// Open read-only whatever the file needs (ICR 0109): the same open as
+    /// `read_only_fallback` takes, which writes nothing to the database's files: no format
+    /// upgrade, no change-feed session or root entries, no new WAL segment, no flush or
+    /// compaction, no clean-close commit. Reads only; writes fail with `ReadOnly`. It still
+    /// takes the writer lock (write access to the file) and creates the shared-memory region.
+    pub read_only: bool,
     /// Accept a database on a FUSE filesystem (D173, #299): only for a local FUSE mount
     /// the user trusts (ntfs-3g, an encrypted home directory). FUSE byte-range locks may be
     /// local to one host, so two hosts could both open it as writers, and a sync may not
@@ -259,6 +272,7 @@ impl EngineOptions {
             reader_slots: 128,
             wal: WalOptions::default(),
             feed: None,
+            feed_inherit: false,
             wal_pin_bytes: 0,
             tablet_split_bytes: 256 << 20,
             tablet_changes: true,
@@ -268,6 +282,7 @@ impl EngineOptions {
             balance_pack: true,
             merge_operators: MergeRegistry::default(),
             read_only_fallback: false,
+            read_only: false,
             allow_fuse: false,
             direct_io: false,
             compaction: PickerOptions::default(),
@@ -311,4 +326,9 @@ pub struct FeedOptions {
     /// The tables fed, by name; `None` feeds every table. Names are resolved at open: a name
     /// with no table is refused.
     pub tables: Option<Vec<String>>,
+    /// The background sync's interval, *T_sync* (microseconds): fed `Buffered` and `None`
+    /// records that no sync covered for this long are synced in the background, so a
+    /// durable feed advances on tables nothing else syncs. `None`: 100 ms, or 1 s on macOS,
+    /// where `F_FULLFSYNC` flushes the whole device.
+    pub sync_interval_micros: Option<u64>,
 }

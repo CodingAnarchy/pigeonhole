@@ -529,11 +529,8 @@ fn query_strings_are_parsed_when_the_search_runs() {
             other => panic!("{q}: {other:?}"),
         }
     }
-    // Fuzzy terms parse, and wait for their PR.
-    assert!(matches!(
-        index.search("postgres~", 10).run(),
-        Err(Error::InvalidArgument(_))
-    ));
+    // A fuzzy word parses and runs (D309 PR 4).
+    assert_eq!(index.search("postgress~", 10).run().unwrap().len(), 1);
     assert!(index.search("", 10).run().unwrap().is_empty());
     assert!(index.search("postgres", 0).run().unwrap().is_empty());
     db.close().unwrap();
@@ -687,36 +684,6 @@ fn a_repeated_phrase_word_needs_two_occurrences() {
 /// Checks a top-`k` search against the reference's scores: the hits are the reference's best
 /// `k` (by score, then id), with the same scores. Scores within 1e-9 count as tied, so either
 /// side of a tie may make the cut.
-fn same_top_k(got: &[pigeonhole_text::Hit], want: &BTreeMap<Vec<u8>, f64>, k: usize, ctx: &str) {
-    let mut ranked: Vec<(&Vec<u8>, f64)> = want.iter().map(|(d, s)| (d, *s)).collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    assert_eq!(got.len(), k.min(ranked.len()), "{ctx}: how many");
-    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(1.0);
-    for (i, h) in got.iter().enumerate() {
-        let w = want
-            .get(&h.id)
-            .unwrap_or_else(|| panic!("{ctx}: {:?} isn't a match", h.id));
-        assert!(
-            close(h.score, *w),
-            "{ctx}: {:?} scored {} not {w}",
-            h.id,
-            h.score
-        );
-        assert!(
-            close(h.score, ranked[i].1),
-            "{ctx}: rank {i} is {} not {}",
-            h.score,
-            ranked[i].1
-        );
-    }
-    // Exactly equal scores come by id ascending.
-    for w in got.windows(2) {
-        if w[0].score == w[1].score {
-            assert!(w[0].id < w[1].id, "{ctx}: a tie out of id order");
-        }
-    }
-}
-
 #[test]
 fn maxscore_returns_the_exact_top_k_at_small_k() {
     for seed in seeds(&[21, 22, 23]) {
@@ -814,5 +781,86 @@ fn an_id_prefix_restricts_the_search_and_keeps_its_scores() {
             .unwrap()
             .is_empty()
     );
+    db.close().unwrap();
+}
+
+#[test]
+fn a_reader_process_searches_what_the_writer_committed() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let t = docs(&db);
+    let index = Index::create(&db, "docs_text", source(&t), IndexOptions::new()).unwrap();
+    let custom = Index::create_with_tokenizer(
+        &db,
+        "custom",
+        source(&t),
+        IndexOptions::new(),
+        Box::new(Spaces(7)),
+    )
+    .unwrap();
+    let mut rng = Rng::new(41);
+    for i in 0..50 {
+        index
+            .put(format!("d{i:02}").as_bytes(), &text(&mut rng, 12))
+            .unwrap();
+    }
+    custom.rebuild().unwrap();
+    let reader = pigeonhole::Pigeonhole::open_reader(
+        dir.join("text.phdb"),
+        pigeonhole::ReaderOptions::default(),
+    )
+    .unwrap();
+    let read = Index::open_reader(&reader, "docs_text").unwrap();
+    assert_eq!(read.options(), index.options());
+    assert_eq!(read.source(), index.source());
+    for q in [
+        r#"memory store "memory store""#,
+        "agent",
+        r#""the agent"~2 search"#,
+    ] {
+        let w = index.search(q, 7).run().unwrap();
+        let r = read.search(q, 7).run().unwrap();
+        assert_eq!(r, w, "{q}");
+        let r = read.search(q, 100).id_prefix("d1").run().unwrap();
+        assert_eq!(
+            r,
+            index.search(q, 100).id_prefix("d1").run().unwrap(),
+            "{q} with a prefix"
+        );
+    }
+    let v = read.verify().unwrap();
+    assert!(v.is_consistent(), "{v:?}");
+    assert_eq!(v.documents, 50);
+    // A later commit shows in the reader's next search.
+    index.put(b"new", "vector feed vector").unwrap();
+    assert_eq!(ids(&read.search("vector", 1).run().unwrap()), [&b"new"[..]]);
+    // A repair in the writer makes the reader's searches Busy.
+    let rows = db.table("docs_text").unwrap().open().unwrap();
+    rows.mutate(b"G")
+        .put("meta", b"repair", b"")
+        .commit()
+        .unwrap();
+    assert!(matches!(read.search("vector", 1).run(), Err(Error::Busy)));
+    index.repair().unwrap();
+    assert_eq!(ids(&read.search("vector", 1).run().unwrap()), [&b"new"[..]]);
+    // The tokeniser checks hold at a reader's open too. (Both indexes share the source
+    // column, so the writes above through `index` bypassed `custom`: rebuild it first.)
+    custom.rebuild().unwrap();
+    assert!(matches!(
+        Index::open_reader(&reader, "custom"),
+        Err(Error::Mismatch(_))
+    ));
+    let c = Index::open_reader_with_tokenizer(&reader, "custom", Box::new(Spaces(7))).unwrap();
+    assert!(c.verify().unwrap().is_consistent());
+    assert!(matches!(
+        Index::open_reader(&reader, "docs"),
+        Err(Error::InvalidArgument(_))
+    ));
+    // And the writer's open of a table that isn't an index.
+    assert!(matches!(
+        Index::open(&db, "docs"),
+        Err(Error::InvalidArgument(_))
+    ));
+    drop(reader);
     db.close().unwrap();
 }

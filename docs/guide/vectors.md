@@ -67,6 +67,7 @@ assert_eq!(near[1].row, b"a");
 - **The read's selection applies:** a key range or prefix, a key set (`table.keys(&set)`), qualifiers, a time range, and a value filter.
 - **`parallel(n)`** spreads a large read over `n` threads the call owns, and the result is the same.
 - **`run_async()`** never blocks on the device, and yields within a wide row.
+- **`run_within(bytes)`** (and `run_within_async`) returns a `NearestPage`: the nearest neighbours, in `run`'s order, that fit a byte budget. Each counts its row key, its qualifier and 16 bytes. `cut_by_budget()` and `next_bytes()` say what was left out. There's no resume position: ask again with a larger budget or `k`. The budget bounds the result, not the work: the search reads and ranks as `run` does, then keeps what fits.
 - **The cost is linear in the vectors read:** about 140 ns per 128-dimension `f32` vector on the reference machine, with the data in the block cache. So it's the right tool up to tens of thousands of vectors per query at interactive latency.
 
 ## The IVF index (`pigeonhole-vector`)

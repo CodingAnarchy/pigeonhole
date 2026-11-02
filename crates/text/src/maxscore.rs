@@ -4,6 +4,10 @@
 //! Every clause has an upper bound on what it can add to one document's score:
 //! - a term clause: `idf · tf_factor(maxtf, minlen)`, from its posting row's `maxtf` and
 //!   `minlen` aggregates. Those only ever over-estimate (M1), so the bound is safe;
+//! - a fuzzy clause: the largest of its expansions' term bounds, each times its boost.
+//!   Inside it, once `k` are held, an expansion that can't lift a document to the threshold
+//!   (even with every other clause at its bound) is dropped, from the walk or from the
+//!   lookups (#1333);
 //! - a phrase clause, scored up front: its largest actual score.
 //!
 //! Clauses are taken in ascending order of bound. While fewer than `k` documents are held,
@@ -22,7 +26,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
-use pigeonhole::{RowCells, Snapshot, Table};
+use pigeonhole::{RowCells, Snapshot};
+
+use crate::index::Rows;
 
 use crate::error::{Result, corrupt};
 use crate::layout::*;
@@ -50,15 +56,102 @@ impl Bm25 {
     }
 }
 
+/// A term's posting row, walked in document order. A posting contributes
+/// `weight · tf_factor`: the weight is the term's idf, times its boost in a fuzzy clause.
+pub(crate) struct Walk<'t> {
+    row: Vec<u8>,
+    weight: f64,
+    /// `weight · tf_factor(maxtf, minlen)`: the most it adds to a document.
+    bound: f64,
+    /// Boxed: a walk is far larger than a phrase clause.
+    cells: Box<RowCells<'t>>,
+    /// The posting the walk stands on: its document and contribution.
+    cur: Option<(Vec<u8>, f64)>,
+}
+
+impl<'t> Walk<'t> {
+    /// The walk over `term`'s postings (restricted to doc ids starting with `prefix`), and
+    /// its bound: `weight · tf_factor(maxtf, minlen)`.
+    fn new(
+        t: &'t Rows,
+        s: &Snapshot,
+        bm: &Bm25,
+        term: &str,
+        weight: f64,
+        prefix: Option<&[u8]>,
+    ) -> Result<(Self, f64)> {
+        let row = post_row(term);
+        let agg = |family: &str| -> Result<Option<i64>> {
+            Ok(t.get_at(s, &row, family, BOUND)?.and_then(|c| c.as_i64()))
+        };
+        // MaxScore's bound (M1): the largest frequency at the shortest length any posting had.
+        // Without the aggregates (they're written with every posting, so never in practice),
+        // `k1 + 1` bounds the tf factor for any frequency and length.
+        let factor = match (agg(MAXTF)?, agg(MINLEN)?) {
+            (Some(maxtf), Some(minlen)) => bm.tf_factor(maxtf.max(0) as f64, minlen.max(0) as f64),
+            _ => bm.k1 + 1.0,
+        };
+        let mut read = t.row(&row).family(POST).snapshot(s);
+        if let Some(p) = prefix {
+            read = read.qualifier_prefix(p);
+        }
+        let mut w = Walk {
+            row,
+            weight,
+            bound: weight * factor,
+            cells: Box::new(read.cells()?),
+            cur: None,
+        };
+        w.step(bm)?;
+        let b = w.bound;
+        Ok((w, b))
+    }
+
+    fn doc(&self) -> Option<&[u8]> {
+        self.cur.as_ref().map(|(d, _)| d.as_slice())
+    }
+
+    fn step(&mut self, bm: &Bm25) -> Result<()> {
+        self.cur = match self.cells.next()? {
+            Some(e) => {
+                let (tf, len) = unposting(
+                    e.cell
+                        .as_u64()
+                        .ok_or_else(|| corrupt("a posting isn't a u64"))?,
+                );
+                Some((
+                    e.qualifier.to_vec(),
+                    self.weight * bm.tf_factor(f64::from(tf), f64::from(len)),
+                ))
+            }
+            None => None,
+        };
+        Ok(())
+    }
+
+    fn lookup(&self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+        match t.get_at(s, &self.row, POST, doc)? {
+            Some(c) => {
+                let (tf, len) =
+                    unposting(c.as_u64().ok_or_else(|| corrupt("a posting isn't a u64"))?);
+                Ok(self.weight * bm.tf_factor(f64::from(tf), f64::from(len)))
+            }
+            None => Ok(0.0),
+        }
+    }
+}
+
 /// A clause as MaxScore runs it.
 pub(crate) enum Clause<'t> {
-    /// A term's posting row, walked in document order.
-    Term {
-        row: Vec<u8>,
-        idf: f64,
-        /// Boxed: a walk is far larger than a phrase clause.
-        cells: Box<RowCells<'t>>,
-        /// The posting the walk stands on: its document and contribution.
+    /// A term's posting row.
+    Term(Walk<'t>),
+    /// A fuzzy term's expansions (D309 §4.4): a document's contribution is the largest of
+    /// theirs, not their sum.
+    Fuzzy {
+        /// The expansions still walked. One whose bound falls below what a document would
+        /// need from it is dropped ([`Scored::drop_below`], #1333).
+        walks: Vec<Walk<'t>>,
+        /// The document the clause stands on (the walks' smallest) and its contribution.
         cur: Option<(Vec<u8>, f64)>,
     },
     /// A phrase, scored up front: its documents and their scores, in document order.
@@ -77,40 +170,57 @@ pub(crate) struct Scored<'t> {
 impl<'t> Scored<'t> {
     /// A term clause over its posting row (restricted to doc ids starting with `prefix`).
     pub(crate) fn term(
-        t: &'t Table,
+        t: &'t Rows,
         s: &Snapshot,
         bm: &Bm25,
         term: &str,
         df: i64,
         prefix: Option<&[u8]>,
     ) -> Result<Self> {
-        let row = post_row(term);
-        let idf = bm.idf(df);
-        let agg = |family: &str| -> Result<Option<i64>> {
-            Ok(t.get_at(s, &row, family, BOUND)?.and_then(|c| c.as_i64()))
-        };
-        // MaxScore's bound (M1): the largest frequency at the shortest length any posting had.
-        // Without the aggregates (they're written with every posting, so never in practice),
-        // `k1 + 1` bounds the tf factor for any frequency and length.
-        let factor = match (agg(MAXTF)?, agg(MINLEN)?) {
-            (Some(maxtf), Some(minlen)) => bm.tf_factor(maxtf.max(0) as f64, minlen.max(0) as f64),
-            _ => bm.k1 + 1.0,
-        };
-        let mut read = t.row(&row).family(POST).snapshot(s);
-        if let Some(p) = prefix {
-            read = read.qualifier_prefix(p);
+        let (walk, bound) = Walk::new(t, s, bm, term, bm.idf(df), prefix)?;
+        Ok(Scored {
+            clause: Clause::Term(walk),
+            bound: bound * (1.0 + SLACK),
+        })
+    }
+
+    /// A fuzzy clause over its expansions: `(term, df, boost)` each, the df the one its idf
+    /// scores with (the search passes the expansions' blended df).
+    pub(crate) fn fuzzy(
+        t: &'t Rows,
+        s: &Snapshot,
+        bm: &Bm25,
+        expansions: &[(&str, i64, f64)],
+        prefix: Option<&[u8]>,
+    ) -> Result<Self> {
+        let mut walks = Vec::with_capacity(expansions.len());
+        let mut bound = 0.0f64;
+        for &(term, df, boost) in expansions {
+            let (walk, b) = Walk::new(t, s, bm, term, boost * bm.idf(df), prefix)?;
+            walks.push(walk);
+            bound = bound.max(b);
         }
         let mut c = Scored {
-            clause: Clause::Term {
-                row,
-                idf,
-                cells: Box::new(read.cells()?),
-                cur: None,
-            },
-            bound: idf * factor * (1.0 + SLACK),
+            clause: Clause::Fuzzy { walks, cur: None },
+            bound: bound * (1.0 + SLACK),
         };
-        c.step(bm)?;
+        c.settle();
         Ok(c)
+    }
+
+    /// A fuzzy clause's document: its walks' smallest, with the largest contribution there.
+    fn settle(&mut self) {
+        if let Clause::Fuzzy { walks, cur, .. } = &mut self.clause {
+            *cur = walks.iter().filter_map(|w| w.doc()).min().map(|doc| {
+                let best = walks
+                    .iter()
+                    .filter_map(|w| w.cur.as_ref())
+                    .filter(|(d, _)| d.as_slice() == doc)
+                    .map(|(_, c)| *c)
+                    .fold(0.0, f64::max);
+                (doc.to_vec(), best)
+            });
+        }
     }
 
     /// A phrase clause from its scores.
@@ -128,7 +238,8 @@ impl<'t> Scored<'t> {
     /// The document the clause stands on, if any.
     fn doc(&self) -> Option<&[u8]> {
         match &self.clause {
-            Clause::Term { cur, .. } => cur.as_ref().map(|(d, _)| d.as_slice()),
+            Clause::Term(w) => w.doc(),
+            Clause::Fuzzy { cur, .. } => cur.as_ref().map(|(d, _)| d.as_slice()),
             Clause::Phrase { scores, at } => scores.get(*at).map(|(d, _)| d.as_slice()),
         }
     }
@@ -136,7 +247,9 @@ impl<'t> Scored<'t> {
     /// The contribution where it stands.
     fn here(&self) -> f64 {
         match &self.clause {
-            Clause::Term { cur, .. } => cur.as_ref().map_or(0.0, |(_, c)| *c),
+            Clause::Term(Walk { cur, .. }) | Clause::Fuzzy { cur, .. } => {
+                cur.as_ref().map_or(0.0, |(_, c)| *c)
+            }
             Clause::Phrase { scores, at } => scores.get(*at).map_or(0.0, |(_, c)| *c),
         }
     }
@@ -144,23 +257,17 @@ impl<'t> Scored<'t> {
     /// Moves to the next document.
     fn step(&mut self, bm: &Bm25) -> Result<()> {
         match &mut self.clause {
-            Clause::Term {
-                idf, cells, cur, ..
-            } => {
-                *cur = match cells.next()? {
-                    Some(e) => {
-                        let (tf, len) = unposting(
-                            e.cell
-                                .as_u64()
-                                .ok_or_else(|| corrupt("a posting isn't a u64"))?,
-                        );
-                        Some((
-                            e.qualifier.to_vec(),
-                            *idf * bm.tf_factor(f64::from(tf), f64::from(len)),
-                        ))
-                    }
-                    None => None,
+            Clause::Term(w) => w.step(bm)?,
+            Clause::Fuzzy { walks, cur, .. } => {
+                let Some((doc, _)) = cur.take() else {
+                    return Ok(());
                 };
+                for w in walks.iter_mut() {
+                    if w.doc() == Some(doc.as_slice()) {
+                        w.step(bm)?;
+                    }
+                }
+                self.settle();
             }
             Clause::Phrase { at, .. } => *at += 1,
         }
@@ -168,19 +275,42 @@ impl<'t> Scored<'t> {
     }
 
     /// The clause's contribution to `doc`, looked up out of order (a non-essential clause).
-    fn lookup(&self, t: &Table, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+    fn lookup(&self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
         match &self.clause {
-            Clause::Term { row, idf, .. } => match t.get_at(s, row, POST, doc)? {
-                Some(c) => {
-                    let (tf, len) =
-                        unposting(c.as_u64().ok_or_else(|| corrupt("a posting isn't a u64"))?);
-                    Ok(*idf * bm.tf_factor(f64::from(tf), f64::from(len)))
+            Clause::Term(w) => w.lookup(t, s, bm, doc),
+            Clause::Fuzzy { walks, .. } => {
+                let mut best = 0.0f64;
+                for w in walks {
+                    best = best.max(w.lookup(t, s, bm, doc)?);
                 }
-                None => Ok(0.0),
-            },
+                Ok(best)
+            }
             Clause::Phrase { scores, .. } => Ok(scores
                 .binary_search_by(|(d, _)| d.as_slice().cmp(doc))
                 .map_or(0.0, |i| scores[i].1)),
+        }
+    }
+}
+
+impl Scored<'_> {
+    /// Drops a fuzzy clause's expansions whose bound is below `cut`: the `k`-th held score
+    /// less every other clause's bound (#1333). That's MaxScore for a clause that takes the
+    /// largest of its expansions rather than their sum.
+    ///
+    /// **Exact.** A document whose clause value comes from a dropped expansion `e` scores
+    /// at most (the other clauses' bounds) + `bound(e)`, below the threshold, so it can't
+    /// enter the top `k`. So every document that does enter takes its maximum from a kept
+    /// expansion, and its score is the same. The threshold only rises, so a drop is final.
+    /// Dropped expansions aren't looked up either: by the same bound, they can't change
+    /// the score of a document that enters.
+    fn drop_below(&mut self, cut: f64) {
+        let Clause::Fuzzy { walks, .. } = &mut self.clause else {
+            return;
+        };
+        let before = walks.len();
+        walks.retain(|w| w.bound * (1.0 + SLACK) >= cut);
+        if walks.len() != before {
+            self.settle();
         }
     }
 }
@@ -215,7 +345,7 @@ impl Ord for Held {
 /// The top `k` documents of `clauses` (in their fixed order), by score descending then id
 /// ascending, with their exact scores.
 pub(crate) fn top_k(
-    t: &Table,
+    t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
     mut clauses: Vec<Scored<'_>>,
@@ -234,13 +364,26 @@ pub(crate) fn top_k(
     let mut held: BinaryHeap<Held> = BinaryHeap::with_capacity(k + 1);
     // How many of `by_bound`'s first clauses are non-essential.
     let mut skip = 0;
+    // The threshold the non-essential prefix and the fuzzy cuts were last taken at.
+    let mut cut_at = f64::NEG_INFINITY;
     let mut contrib = vec![0.0f64; n];
     let mut has = vec![false; n];
     loop {
         let threshold = (held.len() == k).then(|| held.peek().expect("k > 0 held").0);
-        if let Some(th) = threshold {
+        // Only when the threshold has risen since the last pass: nothing else moves the
+        // non-essential prefix or the fuzzy cuts (perf287 and simp724 on #1353).
+        if let Some(th) = threshold.filter(|&th| th > cut_at) {
+            cut_at = th;
             while skip < n && prefix[skip + 1] < th {
                 skip += 1;
+            }
+            // Inside every fuzzy clause, essential or not, the expansions that can't lift a
+            // document to the threshold even with every other clause at its bound (#1333).
+            // A non-essential one is then looked up over fewer expansions.
+            let total = prefix[n];
+            for c in clauses.iter_mut() {
+                let cut = th - (total - c.bound);
+                c.drop_below(cut);
             }
         }
         let essential = &by_bound[skip..];

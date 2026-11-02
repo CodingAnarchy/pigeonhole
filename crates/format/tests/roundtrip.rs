@@ -376,14 +376,27 @@ fn versions_are_checked() {
         assert_eq!(Footer::decode(&old.encode()), Ok(old));
     }
     let mut page = [0u8; 4096];
+    // A newer layout is refused; so is an older one (version 7, before D310 PR 4's feed
+    // marks).
+    for old in [7, 9] {
+        let h = ShmHeader {
+            layout_version: pigeonhole_format::ShmLayoutVersion(old),
+            ..ShmHeader::layout([0; 16], 1, 1, 64, 1, 1, 0, 0)
+        };
+        h.encode(&mut page);
+        assert!(matches!(
+            ShmHeader::decode(&page),
+            Err(pigeonhole_format::Error::UnsupportedVersion { found, .. }) if found == old
+        ));
+    }
     let h = ShmHeader {
-        layout_version: pigeonhole_format::ShmLayoutVersion(7),
+        layout_version: pigeonhole_format::ShmLayoutVersion(9),
         ..ShmHeader::layout([0; 16], 1, 1, 64, 1, 1, 0, 0)
     };
     h.encode(&mut page);
     assert!(matches!(
         ShmHeader::decode(&page),
-        Err(pigeonhole_format::Error::UnsupportedVersion { found: 7, .. })
+        Err(pigeonhole_format::Error::UnsupportedVersion { found: 9, .. })
     ));
     // A newer superblock is reported as such even if the other copy is garbage.
     let sb = Superblock {

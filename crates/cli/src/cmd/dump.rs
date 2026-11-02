@@ -36,7 +36,7 @@ pub(crate) fn run(
             "dump writes jsonl, csv or arrow (--format jsonl|csv|arrow)",
         ));
     }
-    let db = open::for_read(cli, file)?;
+    let db = open::for_inspect(cli, file)?;
     let result = dump(
         &db,
         format,
@@ -204,13 +204,16 @@ pub(crate) fn value_json(v: Cell<'_>) -> Value {
         Cell::I64(n) | Cell::Varint(n) => json!({ "i64": n }),
         Cell::F64(x) if x.is_finite() => json!({ "f64": x }),
         Cell::F64(x) => json!({ "f64_bits": x.to_bits() }),
+        // D303: element, dim and exact components (`schema::vector_json`).
+        Cell::Vector(v) => super::schema::vector_json(&v),
         // A value type this build of `phdb` doesn't know (`Value` is non-exhaustive).
         _ => json!({ "unknown_type": true }),
     }
 }
 
 /// One CSV line. Keys and qualifiers that are not valid UTF-8 print as `b64:` and base64; a
-/// value's `type` column says how to read it: `bytes`, `base64`, `i64` or `f64`.
+/// value's `type` column says how to read it: `bytes`, `base64`, `i64`, `f64` or `vector`
+/// (the value is the JSONL form's `{"vector": {...}}` as text).
 fn csv_line(
     out: &mut dyn Write,
     table: &str,
@@ -231,6 +234,8 @@ fn csv_line(
         },
         Cell::I64(n) | Cell::Varint(n) => ("i64", n.to_string()),
         Cell::F64(x) => ("f64", x.to_string()),
+        // The JSONL form, `{"vector": {...}}`, as text.
+        Cell::Vector(v) => ("vector", super::schema::vector_json(&v).to_string()),
         // A value type this build of `phdb` doesn't know (`Value` is non-exhaustive).
         _ => ("unknown", String::new()),
     };

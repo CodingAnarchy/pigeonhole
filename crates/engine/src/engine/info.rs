@@ -97,6 +97,45 @@ pub struct LevelStorage {
 }
 
 impl Engine {
+    /// The change feed's frontier (D310): the highest seqno every commit at or below which
+    /// is applied, in its stream file (the written watermark, shm `WRITTEN`) and, with
+    /// `durable`, durable at its level. Without the feed it equals the visible (or durable)
+    /// seqno, since nothing is held unwritten.
+    pub fn feed_frontier(&self, durable: bool) -> pigeonhole_format::Seqno {
+        self.inner.shared.shm.written_seqno(durable)
+    }
+
+    /// Subscribes to the committed changes of some tables (D310): a [`FeedReader`] that
+    /// delivers whole commits in seqno order, in the writer or in a reader process (PR 4,
+    /// which follows its writer's feed through shared memory). The tables must be fed by the
+    /// writer (`FeedOptions::tables`); `InvalidArgument` otherwise, or with its feed off. In
+    /// a reader process, a feed fails with `SnapshotExpired` once its writer is gone (a
+    /// restart): subscribe again from its token, which the new writer's feed checks.
+    ///
+    /// [`FeedReader`]: crate::FeedReader
+    pub fn feed(&self, spec: crate::FeedSpec) -> crate::Result<crate::FeedReader> {
+        let origin = if self.inner.is_reader() {
+            self.inner.reader_feed_origin()?
+        } else {
+            let Some(feed) = self.inner.shared.feed.clone() else {
+                return Err(crate::Error::InvalidArgument(
+                    "the change feed is off: open with it on to subscribe".into(),
+                ));
+            };
+            let shared = std::sync::Arc::clone(&self.inner.shared);
+            crate::feed_reader::Origin {
+                shm: self.inner.shared.shm.clone(),
+                writer: Some(feed),
+                view: Box::new(move || Ok(shared.view.load_full())),
+            }
+        };
+        crate::feed_reader::FeedReader::open(
+            std::sync::Arc::clone(&self.inner.shared),
+            spec,
+            origin,
+        )
+    }
+
     /// What the database holds and how it is stored (ICR 0047). Cheap: reads the current
     /// catalog, no file I/O beyond the file's length.
     pub fn info(&self) -> crate::Result<DbInfo> {

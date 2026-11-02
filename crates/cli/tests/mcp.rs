@@ -599,6 +599,84 @@ fn traverse_follows_edges_hop_by_hop() {
     assert_eq!(status, 0, "{err}");
 }
 
+/// #1254: a traversal's cursors page from the server's cached result, so writes between
+/// pages change nothing: every node of the first result comes back exactly once, and none
+/// added later. (Re-running the traversal, as before, would shift indexes: the edges added
+/// below sort among the first page's nodes, so the next page would repeat one.) A cursor
+/// whose run isn't cached any more (another traversal ran) runs it again.
+#[test]
+fn traverse_pages_come_from_one_cached_result() {
+    let dir = TempDir::new("mcp-traverse-cache");
+    let mut s = Server::start(&db_path(&dir), &["--create", "--max-result-bytes", "200"]);
+    s.call("create_table", json!({"table": "g", "families": ["out"]}));
+    let edge = |b: &str| {
+        json!({"op": "put", "table": "g", "row": "n:hub", "family": "out",
+               "qualifier": format!("n:{b}"), "value": ""})
+    };
+    let ops: Vec<Value> = (0..60).map(|i| edge(&format!("{:03}", i * 10))).collect();
+    s.call("write", json!({"ops": ops}));
+    let want: Vec<String> = (0..60).map(|i| format!("n:{:03}", i * 10)).collect();
+    let args = json!({"table": "g", "family": "out", "seeds": ["n:hub"]});
+
+    let first = s.call("traverse", args.clone());
+    let mut got: Vec<String> = first["hops"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_owned())
+        .collect();
+    let mut cursor = first["cursor"].clone();
+    assert!(cursor.is_string(), "{first}");
+    let mut wrote = 0;
+    while cursor.is_string() {
+        // A writer adds an edge that sorts before the next page's first node.
+        let ops: Vec<Value> = (0..3)
+            .map(|j| edge(&format!("{:03}", wrote * 3 + j + 1)))
+            .collect();
+        s.call("write", json!({"ops": ops}));
+        wrote += 1;
+        let mut next = args.clone();
+        next["cursor"] = cursor;
+        let page = s.call("traverse", next);
+        got.extend(
+            page["hops"][0]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_owned()),
+        );
+        cursor = page.get("cursor").cloned().unwrap_or(Value::Null);
+        assert!(wrote < 100, "cursors never end");
+    }
+    assert!(wrote > 1, "the result fit one page");
+    assert_eq!(
+        got, want,
+        "every node of the first result once, none added later"
+    );
+
+    // Another traversal replaces the cached one: an old cursor runs its traversal again
+    // (now seeing the added edges), as cursors did before the cache.
+    let second = s.call("traverse", args.clone());
+    let stale = second["cursor"].clone();
+    s.call(
+        "traverse",
+        json!({"table": "g", "family": "out", "seeds": ["n:000"]}),
+    );
+    let mut again = args.clone();
+    again["cursor"] = stale;
+    let page = s.call("traverse", again);
+    assert!(
+        page["hops"][0]["first_index"].as_u64().unwrap() > 0,
+        "{page}"
+    );
+    assert!(
+        page["hops"][0]["node_count"].as_u64().unwrap() > 60,
+        "the re-run sees the added edges: {page}"
+    );
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
 #[test]
 fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     let dir = TempDir::new("mcp-reader");
@@ -661,4 +739,319 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
     db.close().unwrap();
+}
+
+/// Vector families through the read and write tools (D303, #1309): `list_tables` shows
+/// the spec, `read_row` returns vectors in `dump`'s shape (or their shape, when long), and
+/// `write` puts one in that shape, checked against the family.
+#[test]
+fn vector_families_read_and_write_in_dump_shapes() {
+    use pigeonhole::{Element, Metric, VectorSpec};
+    let dir = TempDir::new("mcp-vectors");
+    let path = db_path(&dir);
+    let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
+    let t = db
+        .table("docs")
+        .unwrap()
+        .family(
+            "emb",
+            pigeonhole::Family::vector(VectorSpec::new(4, Element::F32, Metric::Cosine).unwrap()),
+        )
+        .create()
+        .unwrap();
+    t.mutate(b"d1")
+        .put_vector_f32("emb", b"v", &[0.5, -1.0, 2.0, 0.25])
+        .commit()
+        .unwrap();
+    drop(t);
+    db.close().unwrap();
+
+    let mut s = Server::start(&path, &[]);
+    let tables = s.call("list_tables", json!({}));
+    assert_eq!(
+        tables["tables"][0]["families"][0]["vector"],
+        json!({"dim": 4, "element": "f32", "metric": "cosine"}),
+        "{tables}"
+    );
+    let row = s.call("read_row", json!({"table": "docs", "row": "d1"}));
+    assert_eq!(
+        row["cells"][0]["value"],
+        json!({"vector": {"dim": 4, "element": "f32", "values": [0.5, -1.0, 2.0, 0.25]}}),
+        "{row}"
+    );
+    // A payload over max_value_bytes comes back as its shape.
+    let short = s.call(
+        "read_row",
+        json!({"table": "docs", "row": "d1", "max_value_bytes": 8}),
+    );
+    assert_eq!(
+        short["cells"][0]["value"],
+        json!({"omitted_vector": {"element": "f32", "dim": 4}}),
+        "{short}"
+    );
+    // write takes the same shape, checked against the family.
+    let put = |values: Value, dim: u64| {
+        json!({"ops": [{"op": "put", "table": "docs", "row": "d2", "family": "emb",
+                        "qualifier": "v", "value": {"vector": {"dim": dim, "element": "f32",
+                                                               "values": values}}}]})
+    };
+    s.call("write", put(json!([1.0, 0.0, 0.0, 0.0]), 4));
+    let d2 = s.call("read_row", json!({"table": "docs", "row": "d2"}));
+    assert_eq!(
+        d2["cells"][0]["value"]["vector"]["values"],
+        json!([1.0, 0.0, 0.0, 0.0])
+    );
+    let err = s.fail("write", put(json!([1.0, 0.0]), 2));
+    assert!(err.to_string().contains("f32[4]"), "{err}");
+    // Under cosine, an all-zero query is the agent's mistake, refused before the search.
+    let err = s.fail(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.0, 0.0, 0.0, 0.0]}),
+    );
+    assert!(err.to_string().contains("no direction"), "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
+/// `nearest` (#1253): listed once the database has a vector family; the k nearest, in
+/// order, under the read's selection; queries checked against the family; bit queries as
+/// 0s and 1s or packed base64; a result past the size cap cut at a neighbour.
+#[test]
+fn nearest_ranks_vectors_under_the_selection() {
+    use pigeonhole::{Element, Family, Metric, VectorSpec};
+    let dir = TempDir::new("mcp-nearest");
+    let path = db_path(&dir);
+    let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
+    let t = db
+        .table("docs")
+        .unwrap()
+        .family(
+            "emb",
+            Family::vector(VectorSpec::new(2, Element::F32, Metric::L2).unwrap()),
+        )
+        .family(
+            "sig",
+            Family::vector(VectorSpec::new(16, Element::Bit, Metric::Hamming).unwrap()),
+        )
+        .family("note", Family::default())
+        .create()
+        .unwrap();
+    for (row, v, bits) in [
+        (b"a", [0.0, 0.0], [0b0000_0000u8, 0b00]),
+        (b"b", [1.0, 0.0], [0b0000_0011, 0b10]),
+        (b"c", [5.0, 5.0], [0b1111_1111, 0b11]),
+    ] {
+        t.mutate(row)
+            .put_vector_f32("emb", b"v", &v)
+            .put_vector_bits("sig", b"s", &bits)
+            .commit()
+            .unwrap();
+    }
+    drop(t);
+    db.close().unwrap();
+
+    let mut s = Server::start(&path, &[]);
+    let names = s.tool_names();
+    assert_eq!(
+        names[..5],
+        ["list_tables", "read_row", "scan", "traverse", "nearest"]
+    );
+    let rows = |r: &Value| -> Vec<String> {
+        r["neighbours"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n["row"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let near = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.9, 0.0], "k": 2}),
+    );
+    assert_eq!(rows(&near), ["b", "a"], "{near}");
+    assert_eq!(
+        near["vector"],
+        json!({"dim": 2, "element": "f32", "metric": "l2"})
+    );
+    let n = &near["neighbours"];
+    assert_eq!(n[0]["qualifier"], "v");
+    assert!(n[0]["ts"].as_u64().unwrap() > 0);
+    assert!(n[0]["distance"].as_f64().unwrap() < n[1]["distance"].as_f64().unwrap());
+    assert!(near.get("truncated").is_none());
+    // The selection: a prefix, one row; write's vector shape as the query.
+    let c = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.0, 0.0], "prefix": "c"}),
+    );
+    assert_eq!(rows(&c), ["c"], "{c}");
+    let a = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "row": "a", "qualifier": "v",
+               "query": {"vector": {"dim": 2, "element": "f32", "values": [5.0, 5.0]}}}),
+    );
+    assert_eq!(rows(&a), ["a"], "{a}");
+    // Bits: 0s and 1s, least significant first, or the packed bytes.
+    let bits = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "sig", "k": 3,
+               "query": [1, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0]}),
+    );
+    assert_eq!(rows(&bits), ["b", "a", "c"], "{bits}");
+    let packed = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "sig", "k": 3, "query": {"base64": "AwI="}}),
+    );
+    assert_eq!(packed["neighbours"], bits["neighbours"]);
+    // Refusals name what the family takes.
+    for (args, want) in [
+        (json!({"query": [1.0]}), "f32[2]"),
+        (json!({"query": [1.0, "x"]}), "finite f32"),
+        (
+            json!({"family": "note", "query": [1.0, 0.0]}),
+            "not a vector family",
+        ),
+        (
+            json!({"family": "sig", "query": [2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]}),
+            "0 or 1",
+        ),
+        (
+            json!({"query": [1.0, 0.0], "row": "a", "prefix": "a"}),
+            "not two of them",
+        ),
+        (json!({"query": [1.0, 0.0], "k": 0}), "k:"),
+        (json!({"query": [1e30, 0.0]}), "2^56"),
+    ] {
+        let mut call = json!({"table": "docs", "family": "emb"});
+        for (k, v) in args.as_object().unwrap() {
+            call[k] = v.clone();
+        }
+        let err = s.fail("nearest", call);
+        assert!(err.to_string().contains(want), "{want}: {err}");
+    }
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // Past the size cap: the nearest that fit, marked truncated (a ranking can't resume).
+    let mut s = Server::start(&path, &["--max-result-bytes", "200"]);
+    let cut = s.call(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.9, 0.0], "k": 3}),
+    );
+    assert_eq!(cut["truncated"], true, "{cut}");
+    let kept = rows(&cut);
+    assert!(!kept.is_empty() && kept.len() < 3, "{cut}");
+    assert_eq!(kept[0], "b");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
+/// `feed_poll` (#1322): listed when the database's feed is on (`--change-feed`, or inherited
+/// from the last open, D310 amendment (c)); whole commits in order after a token, the next
+/// token continuing exactly; `max_commits` with `more`; and a token whose history an open
+/// with the feed off ended is a `FeedExpired` tool error.
+#[test]
+fn feed_poll_continues_from_its_token_and_reports_expiry() {
+    let dir = TempDir::new("mcp-feed");
+    let path = db_path(&dir);
+    let feed = ["--change-feed", "16777216"];
+    let mut s = Server::start(&path, &["--create", feed[0], feed[1]]);
+    assert!(s.tool_names().contains(&"feed_poll".to_owned()));
+    s.call(
+        "create_table",
+        json!({"table": "t", "families": ["f", {"name": "n", "aggregation": "sum"}]}),
+    );
+    let first = s.call("feed_poll", json!({"tables": ["t"]}));
+    assert_eq!(first["commits"], json!([]), "{first}");
+    let t0 = first["token"].clone();
+    let put = |row: &str| {
+        json!({"ops": [{"op": "put", "table": "t", "row": row, "family": "f",
+                        "qualifier": "q", "value": "v"}]})
+    };
+    s.call("write", put("r1"));
+    s.call(
+        "write",
+        json!({"ops": [
+            {"op": "incr", "table": "t", "row": "r1", "family": "n", "qualifier": "c", "value": 2},
+            {"op": "delete", "table": "t", "row": "r1", "family": "f", "qualifier": "q"},
+        ]}),
+    );
+    let got = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": t0, "wait_ms": 5000}),
+    );
+    let commits = got["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{got}");
+    assert_eq!(
+        commits[0]["changes"],
+        json!([{"table": "t", "family": "f", "kind": "put", "row": "r1", "qualifier": "q",
+                "ts": commits[0]["changes"][0]["ts"], "value": "v"}])
+    );
+    let kinds: Vec<&str> = commits[1]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["merge", "delete_column"], "{got}");
+    assert!(commits[1]["changes"][1].get("value").is_none());
+    assert!(commits[1]["seqno"].as_u64() > commits[0]["seqno"].as_u64());
+    let t1 = got["token"].clone();
+    // The token continues exactly: nothing new yet.
+    let again = s.call("feed_poll", json!({"tables": ["t"], "token": t1}));
+    assert_eq!(again["commits"], json!([]), "{again}");
+    // max_commits, with `more`, and the token after the last returned.
+    for r in ["a", "b", "c"] {
+        s.call("write", put(r));
+    }
+    let two = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": t1, "max_commits": 2, "wait_ms": 5000}),
+    );
+    assert_eq!(two["commits"].as_array().unwrap().len(), 2, "{two}");
+    assert_eq!(two["more"], true, "{two}");
+    let rest = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": two["token"], "wait_ms": 5000}),
+    );
+    assert_eq!(rest["commits"].as_array().unwrap().len(), 1, "{rest}");
+    assert_eq!(rest["commits"][0]["changes"][0]["row"], "c");
+    assert!(rest.get("more").is_none());
+    let kept = rest["token"].clone();
+    // Refusals.
+    let err = s.fail("feed_poll", json!({"tables": ["t"], "token": "!!"}));
+    assert!(err.to_string().contains("token"), "{err}");
+    let err = s.fail(
+        "feed_poll",
+        json!({"tables": ["t"], "token": kept, "from_oldest": true}),
+    );
+    assert!(err.to_string().contains("not both"), "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // A server without --change-feed inherits the feed the last open had: listed, and the
+    // token continues.
+    let mut s = Server::start(&path, &[]);
+    assert!(s.tool_names().contains(&"feed_poll".to_owned()));
+    let same = s.call("feed_poll", json!({"tables": ["t"], "token": kept}));
+    assert_eq!(same["commits"], json!([]), "{same}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // An open that turns the feed off ends its history: the token expired.
+    Pigeonhole::open(
+        &path,
+        Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .change_feed_off(),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let mut s = Server::start(&path, &feed);
+    let err = s.fail("feed_poll", json!({"tables": ["t"], "token": kept}));
+    assert_eq!(err["code"], "FeedExpired", "{err}");
+    assert_eq!(err["code_num"], 31, "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
 }
