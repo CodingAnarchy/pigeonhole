@@ -1075,7 +1075,7 @@ struct Kept<I> {
 /// global prefix again, which is exact: a row never spans two groups, so each cell's size is
 /// the same in its group as in the whole read, and a group's share of the global prefix is a
 /// prefix of its own cells that its budget already covered.
-pub struct ByteBudget<I, F> {
+pub struct ByteBudget<I, F, L: RowLimit = NoRowLimit> {
     budget: u64,
     size: F,
     kept: Vec<Kept<I>>,
@@ -1084,20 +1084,76 @@ pub struct ByteBudget<I, F> {
     open: Option<CellKey>,
     open_at: usize,
     overflow: Option<Overflow>,
-    /// D308's N4 (#1280): at most this many rows, so a scan's `limit` bounds the read too;
-    /// [`NO_ROW_LIMIT`] for none. A plain integer, not an `Option`, so a read without a limit
-    /// pays one compare at each new row (#1284's scan-budget count).
-    rows: usize,
-    /// Rows with a kept cell.
-    kept_rows: usize,
-    /// More rows followed the `rows`-th (this group's own account until `cut`).
-    rows_full: bool,
+    /// D308's N4 (#1280): a scan's `limit` bounds the read too. [`NoRowLimit`] (the default,
+    /// zero-sized) compiles every row-limit branch away, so a read without one runs exactly
+    /// the budget's own code (#1284: an in-struct limit cost scan-budget 20 instructions per
+    /// cell, mostly codegen around fields it never used).
+    limit: L,
 }
 
-/// [`ByteBudget`]'s row limit when there is none: no read keeps this many rows.
-const NO_ROW_LIMIT: usize = usize::MAX;
+/// A [`ByteBudget`]'s row limit: [`NoRowLimit`] or [`RowsLimit`].
+pub trait RowLimit: Send {
+    /// Whether this limits rows at all; `false` compiles the limit's branches away.
+    const LIMITED: bool;
+    /// The most rows the read keeps.
+    fn max_rows(&self) -> usize;
+    /// Rows with a kept cell (this group's own account until `cut`).
+    fn kept_rows(&self) -> usize;
+    /// Sets the kept-row count.
+    fn set_kept_rows(&mut self, n: usize);
+    /// Whether more rows followed the limit's last.
+    fn full(&self) -> bool;
+    /// Records whether more rows followed the limit's last.
+    fn set_full(&mut self, full: bool);
+}
 
-impl<I, F> std::fmt::Debug for ByteBudget<I, F> {
+/// No row limit: the budget alone stops the read.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoRowLimit;
+
+impl RowLimit for NoRowLimit {
+    const LIMITED: bool = false;
+    fn max_rows(&self) -> usize {
+        usize::MAX
+    }
+    fn kept_rows(&self) -> usize {
+        0
+    }
+    fn set_kept_rows(&mut self, _: usize) {}
+    fn full(&self) -> bool {
+        false
+    }
+    fn set_full(&mut self, _: bool) {}
+}
+
+/// At most `n` rows ([`ByteBudget::with_rows`]).
+#[derive(Debug, Clone, Copy)]
+pub struct RowsLimit {
+    n: usize,
+    kept: usize,
+    full: bool,
+}
+
+impl RowLimit for RowsLimit {
+    const LIMITED: bool = true;
+    fn max_rows(&self) -> usize {
+        self.n
+    }
+    fn kept_rows(&self) -> usize {
+        self.kept
+    }
+    fn set_kept_rows(&mut self, n: usize) {
+        self.kept = n;
+    }
+    fn full(&self) -> bool {
+        self.full
+    }
+    fn set_full(&mut self, full: bool) {
+        self.full = full;
+    }
+}
+
+impl<I, F, L: RowLimit> std::fmt::Debug for ByteBudget<I, F, L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ByteBudget")
             .field("budget", &self.budget)
@@ -1119,9 +1175,7 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
             open: None,
             open_at: 0,
             overflow: None,
-            rows: NO_ROW_LIMIT,
-            kept_rows: 0,
-            rows_full: false,
+            limit: NoRowLimit,
         }
     }
 
@@ -1129,36 +1183,40 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
     /// of the budget and the row limit stops the read first wins, and the read reads no
     /// further than that. A group stops at its own `n`-th row, which keeps everything the
     /// merged prefix needs from it, as `Limit` does.
-    pub fn with_rows(mut self, n: usize) -> Self {
-        self.rows = n;
-        self
+    pub fn with_rows(self, n: usize) -> ByteBudget<I, F, RowsLimit> {
+        ByteBudget {
+            budget: self.budget,
+            size: self.size,
+            kept: self.kept,
+            used: self.used,
+            open: self.open,
+            open_at: self.open_at,
+            overflow: self.overflow,
+            limit: RowsLimit {
+                n,
+                kept: 0,
+                full: false,
+            },
+        }
     }
+}
 
+impl<I, F: Fn(&CellRef<'_>, &I) -> u64, L: RowLimit> ByteBudget<I, F, L> {
     /// The result: the kept cells, their size, and the first column that didn't fit.
     pub fn into_page(mut self) -> BytePage<I> {
         self.cut();
         BytePage {
             bytes: self.used,
             overflow: self.overflow,
-            cut_by_rows: self.rows_full,
+            cut_by_rows: self.limit.full(),
             items: self.kept.into_iter().map(|k| (k.key, k.item)).collect(),
         }
     }
 
     /// Re-cuts `kept` (in cell order) to the global prefix: columns admitted whole while
-    /// they fit, and nothing at or past a recorded overflow.
+    /// they fit, and nothing at or past a recorded overflow. With a row limit, also no row
+    /// past the limit's last.
     fn cut(&mut self) {
-        // Two copies: a read without a row limit runs the loop with no row counting at all
-        // (#1284: counting on every kept cell cost scan-budget 13 instructions per cell).
-        if self.rows == NO_ROW_LIMIT {
-            self.cut_rows::<false>();
-        } else {
-            self.cut_rows::<true>();
-        }
-    }
-
-    /// [`cut`](Self::cut), counting rows against the limit only when `LIMITED`.
-    fn cut_rows<const LIMITED: bool>(&mut self) {
         let mut used = 0u64;
         let mut keep = 0;
         let mut i = 0;
@@ -1178,7 +1236,7 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
             }
             let row = &self.kept[i].key.row;
             let new_row = keep == 0 || self.kept[keep - 1].key.row != *row;
-            if LIMITED && new_row && rows == self.rows {
+            if L::LIMITED && new_row && rows == self.limit.max_rows() {
                 // The row limit stops first: what follows is past it.
                 hit_rows = true;
                 break;
@@ -1193,7 +1251,7 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
                 break;
             }
             used += own + charge;
-            if LIMITED {
+            if L::LIMITED {
                 rows += usize::from(new_row);
             }
             keep = j;
@@ -1203,23 +1261,26 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
             (Some(a), Some(b)) => Some(if a.key <= b.key { a } else { b }),
             (a, b) => a.or(b),
         };
-        // An overflow in a row past the `rows`-th: the row limit stopped the read first.
-        let last_row = keep.checked_sub(1).map(|k| self.kept[k].key.row.as_slice());
-        if LIMITED
-            && let Some(o) = &overflow
-            && rows == self.rows
-            && last_row != Some(o.key.row.as_slice())
-        {
-            overflow = None;
-            hit_rows = true;
+        if L::LIMITED {
+            // An overflow in a row past the limit's last: the row limit stopped the read
+            // first.
+            let last_row = keep.checked_sub(1).map(|k| self.kept[k].key.row.as_slice());
+            if let Some(o) = &overflow
+                && rows == self.limit.max_rows()
+                && last_row != Some(o.key.row.as_slice())
+            {
+                overflow = None;
+                hit_rows = true;
+            }
+            // The budget stopping first (an overflow within the limit's rows) wins over a
+            // group's own row limit.
+            let full = overflow.is_none() && (hit_rows || self.limit.full());
+            self.limit.set_full(full);
+            self.limit.set_kept_rows(rows);
         }
-        // The budget stopping first (an overflow within the first `rows` rows) wins over a
-        // group's own row limit.
-        self.rows_full = overflow.is_none() && (hit_rows || self.rows_full);
         self.overflow = overflow;
         self.kept.truncate(keep);
         self.used = used;
-        self.kept_rows = rows;
     }
 }
 
@@ -1227,7 +1288,7 @@ fn same_column(a: &CellKey, b: &CellKey) -> bool {
     a.row == b.row && a.family_rank == b.family_rank && a.qualifier == b.qualifier
 }
 
-impl<I: Send, F: Fn(&CellRef<'_>, &I) -> u64 + Send> Reducer for ByteBudget<I, F> {
+impl<I: Send, F: Fn(&CellRef<'_>, &I) -> u64 + Send, L: RowLimit> Reducer for ByteBudget<I, F, L> {
     type Item = I;
 
     fn push(&mut self, cell: CellRef<'_>, item: I) -> ControlFlow<()> {
@@ -1244,23 +1305,29 @@ impl<I: Send, F: Fn(&CellRef<'_>, &I) -> u64 + Send> Reducer for ByteBudget<I, F
             }
             return ControlFlow::Break(());
         }
-        // A group pushes in cell order, so this appends.
-        debug_assert!(self.kept.last().is_none_or(|k| k.key.as_ref() < cell));
-        // Computed once, for the row limit and the row key's charge: the limit is compared
-        // only at a new row (a cell of the open column is never one).
-        let new_row = self.kept.last().is_none_or(|k| k.key.row != cell.row);
-        if new_row && self.kept_rows == self.rows {
-            self.rows_full = true;
+        // At the row limit, a new row ends the group (a cell of the open column never starts
+        // one).
+        if L::LIMITED
+            && !same
+            && self.limit.kept_rows() == self.limit.max_rows()
+            && self.kept.last().is_none_or(|k| k.key.row != cell.row)
+        {
+            self.limit.set_full(true);
             return ControlFlow::Break(());
         }
         if !same {
             self.open = Some(cell.to_key());
             self.open_at = self.kept.len();
         }
+        // A group pushes in cell order, so this appends.
+        debug_assert!(self.kept.last().is_none_or(|k| k.key.as_ref() < cell));
+        let new_row = self.kept.last().is_none_or(|k| k.key.row != cell.row);
         let charge = if new_row { cell.row.len() as u64 } else { 0 };
         if self.used + size + charge <= self.budget {
             self.used += size + charge;
-            self.kept_rows += usize::from(new_row);
+            if L::LIMITED && new_row {
+                self.limit.set_kept_rows(self.limit.kept_rows() + 1);
+            }
             self.kept.push(Kept {
                 key: cell.to_key(),
                 item,
@@ -1283,16 +1350,20 @@ impl<I: Send, F: Fn(&CellRef<'_>, &I) -> u64 + Send> Reducer for ByteBudget<I, F
             .map_or(0, |k| k.key.row.len() as u64);
         self.used -= rolled.iter().map(|k| k.size).sum::<u64>() + rolled_charge;
         // A rolled-back column that opened its row takes the row back out of the count.
-        self.kept_rows -= usize::from(
-            rolled
+        if L::LIMITED
+            && rolled
                 .first()
-                .is_some_and(|k| kept_row != Some(k.key.row.as_slice())),
-        );
+                .is_some_and(|k| kept_row != Some(k.key.row.as_slice()))
+        {
+            self.limit.set_kept_rows(self.limit.kept_rows() - 1);
+        }
         ControlFlow::Continue(())
     }
 
     fn merge(&mut self, other: Self) {
-        self.rows_full |= other.rows_full;
+        if L::LIMITED {
+            self.limit.set_full(self.limit.full() || other.limit.full());
+        }
         let mut all = std::mem::take(&mut self.kept);
         all.extend(other.kept);
         all.sort_by(|a, b| a.key.cmp(&b.key));
@@ -1496,6 +1567,46 @@ mod tests {
     /// D308: cut a read's cells into groups at row boundaries, push each group into its own
     /// budget with its local stop, merge in a random order: the result (cells, size and
     /// overflow) equals one budget over the whole read, and the hand-cut prefix.
+    /// The whole read's page, and the page of its groups (cut at `cuts`) merged in `plan`'s
+    /// order: each step takes a remaining group by index, merged into the accumulator or the
+    /// accumulator into it.
+    fn pages<F, L>(
+        make: impl Fn() -> ByteBudget<u64, F, L>,
+        cells: &[(CellKey, u64)],
+        cuts: &[usize],
+        plan: &[(usize, bool)],
+    ) -> (BytePage<u64>, BytePage<u64>)
+    where
+        F: Fn(&CellRef<'_>, &u64) -> u64 + Send,
+        L: RowLimit,
+    {
+        let run = |part: &[(CellKey, u64)]| {
+            let mut b = make();
+            for (k, n) in part {
+                if b.push(k.as_ref(), *n).is_break() {
+                    break;
+                }
+            }
+            b
+        };
+        let whole = run(cells).into_page();
+        let mut parts: Vec<_> = cuts.windows(2).map(|w| run(&cells[w[0]..w[1]])).collect();
+        let mut steps = plan.iter();
+        let (first, _) = steps.next().expect("a group at least");
+        let mut acc = parts.swap_remove(*first);
+        for (pick, into_acc) in steps {
+            let next = parts.swap_remove(*pick);
+            if *into_acc {
+                acc.merge(next);
+            } else {
+                let mut other = next;
+                other.merge(acc);
+                acc = other;
+            }
+        }
+        (whole, acc.into_page())
+    }
+
     #[test]
     fn a_byte_budget_merges_to_the_sequential_result_in_any_order() {
         struct Rng(u64);
@@ -1537,20 +1648,7 @@ mod tests {
             let budget = rng.below(120);
             // A row limit (a scan's `limit`, #1280) in a third of the cases.
             let row_limit = (rng.below(3) == 0).then(|| rng.below(5) as usize);
-            let run = |part: &[(CellKey, u64)]| {
-                let mut b = ByteBudget::new(budget, size);
-                if let Some(n) = row_limit {
-                    b = b.with_rows(n);
-                }
-                for (k, n) in part {
-                    if b.push(k.as_ref(), *n).is_break() {
-                        break;
-                    }
-                }
-                b
-            };
-            let whole = run(&cells).into_page();
-            // Groups at row boundaries.
+            // Groups at row boundaries, and the order they merge in.
             let mut cuts = vec![0];
             for i in 1..cells.len() {
                 if cells[i].0.row != cells[i - 1].0.row && rng.below(2) == 0 {
@@ -1558,19 +1656,19 @@ mod tests {
                 }
             }
             cuts.push(cells.len());
-            let mut parts: Vec<_> = cuts.windows(2).map(|w| run(&cells[w[0]..w[1]])).collect();
-            let mut acc = parts.swap_remove(rng.below(parts.len() as u64) as usize);
-            while !parts.is_empty() {
-                let next = parts.swap_remove(rng.below(parts.len() as u64) as usize);
-                if rng.below(2) == 0 {
-                    acc.merge(next);
-                } else {
-                    let mut other = next;
-                    other.merge(acc);
-                    acc = other;
-                }
+            let mut plan = Vec::new();
+            for left in (1..cuts.len()).rev() {
+                plan.push((rng.below(left as u64) as usize, rng.below(2) == 0));
             }
-            let merged = acc.into_page();
+            let (whole, merged) = match row_limit {
+                None => pages(|| ByteBudget::new(budget, size), &cells, &cuts, &plan),
+                Some(n) => pages(
+                    || ByteBudget::new(budget, size).with_rows(n),
+                    &cells,
+                    &cuts,
+                    &plan,
+                ),
+            };
             let ctx = format!("seed {seed:#x}, case {case}, budget {budget}, rows {row_limit:?}");
             assert_eq!(rows(&merged.items), rows(&whole.items), "{ctx}");
             assert_eq!(merged.bytes, whole.bytes, "{ctx}");

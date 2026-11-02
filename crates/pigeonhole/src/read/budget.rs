@@ -272,22 +272,33 @@ fn read(
     spec.read = r;
     spec.resume = resume;
     let table = core.info.id;
-    let (acc, _) = core.with(|e| {
-        e.reduce_into(
-            &snapshot,
-            table,
-            &spec,
-            || CopyValue,
-            || {
-                let b = ByteBudget::new(budget, size);
-                match row_limit {
-                    Some(n) => b.with_rows(n),
-                    None => b,
-                }
-            },
-        )
-    })?;
-    let page = acc.into_page();
+    // Two reducer types, so a read without a row limit runs the budget's code alone (#1284).
+    let page = match row_limit {
+        None => core
+            .with(|e| {
+                e.reduce_into(
+                    &snapshot,
+                    table,
+                    &spec,
+                    || CopyValue,
+                    || ByteBudget::new(budget, size),
+                )
+            })?
+            .0
+            .into_page(),
+        Some(n) => core
+            .with(|e| {
+                e.reduce_into(
+                    &snapshot,
+                    table,
+                    &spec,
+                    || CopyValue,
+                    || ByteBudget::new(budget, size).with_rows(n),
+                )
+            })?
+            .0
+            .into_page(),
+    };
     let last = page.items.last().map(|(k, _)| k.clone());
     let (mut rows, mut row_bytes) = (Vec::new(), Vec::new());
     let mut buf: Option<(RowBuf, u64)> = None;

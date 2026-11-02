@@ -78,8 +78,8 @@ pub use read::keys::{KeyCursor, KeySet, POLL_ABSENT_KEYS};
 pub use read::knn::{KnnSkips, KnnVisitor, Metric, NEAREST_POLL_CELLS, PendingNearest, Score};
 pub use read::reduce::{
     BUDGET_ITEM_OVERHEAD, ByteBudget, BytePage, CellKey, CellRef, CellVisitor, Dedupe, Limit,
-    Overflow, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec, ReduceStats, Reduced, Reducer,
-    RowRange, TopK, Visit,
+    NoRowLimit, Overflow, PARALLEL_FLOOR_ENTRIES, ReadInput, ReduceSpec, ReduceStats, Reduced,
+    Reducer, RowLimit, RowRange, RowsLimit, TopK, Visit,
 };
 pub use read::traverse::{
     DEFAULT_MAX_NODES, Hop, MAX_HOPS, PendingTraversal, TRAVERSE_PARALLEL_FLOOR,
