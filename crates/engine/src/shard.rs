@@ -9953,23 +9953,24 @@ impl ShardState {
                     continue;
                 };
                 let rewrite = self.tablets_on();
-                // A lone SST or a last-level run that may hold purgeable entries is rewritten,
-                // unless this request already rewrote the slot (#805, #820, `full_purged`); its
-                // properties are read through the open-SST cache, and only when the cheaper
-                // checks miss.
+                // A lone SST or a last-level run that may hold purgeable entries is rewritten
+                // (#805, #820); its properties are read through the open-SST cache, and only
+                // when the cheaper checks miss. A slot this request already rewrote
+                // (`full_purged`) is not rewritten again once it is one run at the last level,
+                // for any reason (#1313: `plan_full`).
+                let rewritten = self.full_purged.contains(&key);
                 let purgeable = |sst: &pigeonhole_format::manifest::SstMeta| {
-                    !self.full_purged.contains(&key)
-                        && compact::may_hold_purgeable(sst, &meta.options, now, || {
-                            let (_, open) = fam.find(sst.id)?;
-                            let priority =
-                                crate::snapshot::SstSet::priority(meta.options.cache_priority);
-                            let reader = open.reader(&view.ssts, priority).ok()?;
-                            let props = reader.properties();
-                            Some(compact::PurgeProps {
-                                rows: props.rows,
-                                fully_purged: props.fully_purged,
-                            })
+                    compact::may_hold_purgeable(sst, &meta.options, now, || {
+                        let (_, open) = fam.find(sst.id)?;
+                        let priority =
+                            crate::snapshot::SstSet::priority(meta.options.cache_priority);
+                        let reader = open.reader(&view.ssts, priority).ok()?;
+                        let props = reader.properties();
+                        Some(compact::PurgeProps {
+                            rows: props.rows,
+                            fully_purged: props.fully_purged,
                         })
+                    })
                 };
                 if let Some(mut t) = compact::plan_full(
                     tablet,
@@ -9978,6 +9979,7 @@ impl ShardState {
                     last,
                     &busy,
                     rewrite,
+                    rewritten,
                     self.shared.picker.target_sst_bytes,
                     purgeable,
                 ) {
