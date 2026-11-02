@@ -71,12 +71,13 @@ pub struct Change {
 }
 
 impl Change {
-    /// The table's name.
+    /// The table's name. Empty only for a family created after the feed opened whose table
+    /// was dropped before the feed reached this change: its name went with the table.
     pub fn table(&self) -> &str {
         &self.table
     }
 
-    /// The family's name.
+    /// The family's name (empty in the same case as [`table`](Self::table)).
     pub fn family(&self) -> &str {
         &self.family
     }
@@ -106,15 +107,17 @@ impl Change {
         if self.kind.is_delete() {
             return None;
         }
-        Some(crate::cell::typed_value(
-            decode_value(&self.stored).unwrap_or(pigeonhole_engine::ValueRef::Bytes(&[])),
-        ))
+        // Checked when the commit was delivered (`fill`): a value that doesn't decode fails
+        // `next` with `Corruption` instead of reaching here.
+        decode_value(&self.stored)
+            .ok()
+            .map(crate::cell::typed_value)
     }
 }
 
 /// One whole commit: every change of it in the feed's tables and row prefix, never part of
 /// one. Commits arrive once each, in commit order ([`Commit::seqno`]).
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Commit {
     seqno: u64,
     ts: u64,
@@ -167,6 +170,8 @@ pub struct FeedBuilder {
     prefix: Vec<u8>,
     durable: bool,
     start: FeedStart,
+    /// The first refusal (a handle from another database), returned by `open`.
+    error: Option<Error>,
 }
 
 impl FeedBuilder {
@@ -177,12 +182,17 @@ impl FeedBuilder {
             prefix: Vec::new(),
             durable: true,
             start: FeedStart::Now,
+            error: None,
         }
     }
 
     /// Follows `table` as well: one feed, the commits of all its tables in one order, each
     /// commit whole across them.
     pub fn table(mut self, table: &Table) -> Self {
+        if let Err(e) = crate::write::check_table(&self.db, table) {
+            self.error.get_or_insert(e);
+            return self;
+        }
         if !self
             .tables
             .iter()
@@ -210,6 +220,10 @@ impl FeedBuilder {
     /// Starts after the commits `snapshot` sees: read the snapshot, then follow the feed,
     /// and nothing is missed or seen twice.
     pub fn from_snapshot(mut self, snapshot: &Snapshot) -> Self {
+        if let Err(e) = self.db.check_snapshot(snapshot) {
+            self.error.get_or_insert(e);
+            return self;
+        }
         self.start = FeedStart::After(snapshot.seqno());
         self
     }
@@ -230,13 +244,20 @@ impl FeedBuilder {
     }
 
     /// Subscribes. With none of `from_snapshot`, `from_oldest` and `resume`, the feed starts
-    /// with the commits after this call.
+    /// with the commits after this call; with several, the last one called wins.
+    ///
+    /// A table or snapshot from another database is `InvalidArgument`, as everywhere else,
+    /// and a snapshot from before an automatic recovery is `SnapshotExpired`, as reading it
+    /// would be.
     ///
     /// Fails with `InvalidArgument` if the database's change feed is off or doesn't follow
     /// one of the tables ([`Options::feed_tables`](crate::Options::feed_tables)), or if a
     /// token is not one of this database's; `Unsupported` in a reader process (for now). A
     /// start whose history is gone shows at the first [`Feed::next`], as `FeedExpired`.
     pub fn open(self) -> Result<Feed> {
+        if let Some(e) = self.error {
+            return Err(e);
+        }
         let spec = FeedSpec {
             tables: self.tables.iter().map(|t| t.core.info.id).collect(),
             prefix: self.prefix,
@@ -254,7 +275,11 @@ impl FeedBuilder {
             reader,
             generation,
             names,
-            commit: Commit::default(),
+            commit: Commit {
+                seqno: 0,
+                ts: 0,
+                changes: Vec::new(),
+            },
             oldest_retained: None,
         })
     }
@@ -344,7 +369,7 @@ impl Feed {
             });
             match self.reader.wait(left)? {
                 Next::Commit(c) => {
-                    fill(&mut self.commit, &mut self.names, &self.db, c);
+                    fill(&mut self.commit, &mut self.names, &self.db, c)?;
                     return Ok(Some(&self.commit));
                 }
                 Next::Expired(e) => {
@@ -367,7 +392,7 @@ impl Feed {
         self.follow_recovery()?;
         match self.reader.try_next()? {
             Next::Commit(c) => {
-                fill(&mut self.commit, &mut self.names, &self.db, c);
+                fill(&mut self.commit, &mut self.names, &self.db, c)?;
                 Ok(Some(&self.commit))
             }
             Next::Expired(e) => {
@@ -409,11 +434,12 @@ impl Feed {
 }
 
 /// `c` into `out`, with its tables' and families' names.
-fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Commit) {
+fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Commit) -> Result<()> {
     out.seqno = c.seqno;
     out.ts = c.ts;
-    out.changes.clear();
-    for ch in &c.changes {
+    // The commit's `Change`s are reused: their buffers keep their capacity across commits.
+    out.changes.truncate(c.changes.len());
+    for (i, ch) in c.changes.iter().enumerate() {
         let key = (ch.table, ch.family);
         if !names.contains_key(&key) {
             // A family created after the feed opened.
@@ -421,20 +447,53 @@ fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Com
                 note_names(names, &info);
             }
         }
+        // Unnamed only if the family was created after the feed opened and its table was
+        // dropped before the feed reached this commit: the names went with the table.
         let (table, family) = names
             .get(&key)
             .cloned()
             .unwrap_or_else(|| (Arc::from(""), Arc::from("")));
-        out.changes.push(Change {
-            table,
-            family,
-            kind: ChangeKind::of(ch.kind),
-            ts: ch.ts,
-            row: ch.row.clone(),
-            qualifier: ch.qualifier.clone(),
-            stored: ch.value.clone(),
-        });
+        let kind = ChangeKind::of(ch.kind);
+        // Admission decoded every value before it was logged; one that doesn't decode now is
+        // damage, never an empty value (simp724 on #1321).
+        if !kind.is_delete()
+            && let Err(e) = decode_value(&ch.value)
+        {
+            out.changes.clear();
+            return Err(Error::new(
+                ErrorCode::Corruption,
+                format!(
+                    "a change feed value at seqno {} doesn't decode: {e}",
+                    c.seqno
+                ),
+            ));
+        }
+        if let Some(slot) = out.changes.get_mut(i) {
+            slot.table = table;
+            slot.family = family;
+            slot.kind = kind;
+            slot.ts = ch.ts;
+            for (to, from) in [
+                (&mut slot.row, &ch.row),
+                (&mut slot.qualifier, &ch.qualifier),
+                (&mut slot.stored, &ch.value),
+            ] {
+                to.clear();
+                to.extend_from_slice(from);
+            }
+        } else {
+            out.changes.push(Change {
+                table,
+                family,
+                kind,
+                ts: ch.ts,
+                row: ch.row.clone(),
+                qualifier: ch.qualifier.clone(),
+                stored: ch.value.clone(),
+            });
+        }
     }
+    Ok(())
 }
 
 fn expired(e: &pigeonhole_engine::Expiry) -> Error {

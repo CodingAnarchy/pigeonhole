@@ -194,6 +194,37 @@ fn subscribing_needs_the_feed_and_a_token_of_this_database() {
     db.close().unwrap();
 }
 
+/// cli692's S1 on #1321: a table or snapshot from another database is refused, as every
+/// other API refuses one, not followed under the wrong name or from another log's seqno.
+#[test]
+fn a_table_or_snapshot_from_another_database_is_refused() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("one.phdb"), fed()).unwrap();
+    let other = Pigeonhole::open(dir.join("two.phdb"), fed()).unwrap();
+    let (a, _) = tables(&db);
+    // The same names, so the same table ids: only the database tells them apart.
+    let (foreign, _) = tables(&other);
+    let e = a.feed().table(&foreign).open().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+    assert!(e.message().contains("another database"), "{e}");
+    let snap = other.snapshot().unwrap();
+    let e = a.feed().from_snapshot(&snap).open().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+    assert!(e.message().contains("another database"), "{e}");
+    // The first refusal stands whatever follows it.
+    let mine = db.snapshot().unwrap();
+    let e = a
+        .feed()
+        .table(&foreign)
+        .from_snapshot(&mine)
+        .open()
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::InvalidArgument, "{e}");
+    drop((snap, mine));
+    other.close().unwrap();
+    db.close().unwrap();
+}
+
 #[test]
 fn an_open_without_the_feed_between_expires_a_token() {
     let dir = pigeonhole::doc_support::temp_dir();

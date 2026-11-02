@@ -2281,6 +2281,10 @@ fn the_default_backend_is_io_uring_where_the_kernel_offers_it() {
 #[test]
 fn an_owned_scan_outlives_its_table_handle() {
     fn send_static<T: Send + 'static>(_: &T) {}
+    // A feed's subscriber usually runs on its own thread (cli692 on #1321).
+    fn _feed_send_static(f: pigeonhole::Feed) -> impl Send + 'static {
+        f
+    }
     #[cfg(feature = "async")]
     fn _stream_send_static(s: pigeonhole::nonblocking::RowStream<'static>) -> impl Send + 'static {
         s
