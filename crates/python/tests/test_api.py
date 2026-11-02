@@ -67,6 +67,9 @@ def test_error_codes_are_stable_numbers(db):
     with pytest.raises(ph.FamilyNotFound) as e:
         t.put(b"r", "nope", b"q", b"v")
     assert e.value.code_num == 10
+    # Every code has its class, the change feed's too (D310; the feed itself is Rust-only
+    # for now).
+    assert issubclass(ph.FeedExpired, ph.Error)
 
 
 def test_row_reads_order_families_by_creation_or_request(db):

@@ -878,12 +878,7 @@ impl Engine {
         mode: Mode,
         held: &mut Option<Locks>,
     ) -> Result<(Arc<Engine>, Option<Vec<EngineShard>>)> {
-        let shards = if options.shards == 0 {
-            pigeonhole_io::sys::default_shards()
-        } else {
-            options.shards
-        };
-        if shards > 1 << 16 {
+        if options.shards > 1 << 16 {
             return Err(Error::InvalidArgument("at most 65536 shards".to_owned()));
         }
         if options.memtable_budget < 2 * ShardArena::DEFAULT_CHUNK as u64 / 4 {
@@ -896,7 +891,8 @@ impl Engine {
 
         // Create first, then open through the normal path (the writer lock comes first).
         if !vfs.exists(path)? {
-            if !options.create_if_missing {
+            // A read-only open (ICR 0109) never creates the file.
+            if !options.create_if_missing || options.read_only {
                 return Err(Error::Io(pigeonhole_io::Error::new(
                     ErrorKind::NotFound,
                     "open database",
@@ -929,8 +925,9 @@ impl Engine {
         // 2. The page file and the manifest. A file this build may read but not write (a
         //    read-only-compatible feature bit it does not know, D269) opens read-only under
         //    `read_only_fallback` (ICR 0059): `no_writes`, and nothing below writes to it.
-        let mut no_writes = false;
-        let opened = match Pager::open(&vfs, path, true) {
+        // `read_only` (ICR 0109) asks for that open whatever the file needs.
+        let mut no_writes = options.read_only;
+        let opened = match Pager::open(&vfs, path, !no_writes) {
             Ok(o) => o,
             Err(pigeonhole_pager::Error::Format(
                 pigeonhole_format::Error::UnsupportedFeature { .. },
@@ -949,6 +946,20 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         let db_id = opened.db_id();
+        // What the change feed's last session recorded (D310's amendment): an unset shard
+        // count takes its stream count, and an open that doesn't mention the feed its
+        // settings, so neither ends the feed's history by accident.
+        let last_session =
+            if options.shards == 0 || (options.feed.is_none() && options.feed_inherit) {
+                crate::feed::last_session(&vfs, path, db_id)?
+            } else {
+                None
+            };
+        let shards = match (options.shards, &last_session) {
+            (0, Some(last)) if last.streams > 0 => last.streams as usize,
+            (0, _) => pigeonhole_io::sys::default_shards(),
+            (n, _) => n,
+        };
         // The change feed's sequence check (D310 §2.2): the superblock's sequence before any
         // root commit of this open.
         let opened_at = opened.sequence();
@@ -961,7 +972,7 @@ impl Engine {
         // Refuse what will be refused before `finish`, which may upgrade the file's
         // superblocks: a refused open must leave an older file as it was (#496). An
         // unregistered merge operator opens read-only under `read_only_fallback`.
-        if catalog.has_unknown_merge && !options.read_only_fallback {
+        if catalog.has_unknown_merge && !options.read_only_fallback && !options.read_only {
             let name = catalog
                 .tables()
                 .flat_map(|t| t.families.iter())
@@ -992,6 +1003,19 @@ impl Engine {
         let read_only = no_writes;
         // The change feed (D310): the session's sidecar entry, written and synced before any
         // WAL segment; then every root commit of this open appends its sequence.
+        // An open that doesn't mention the feed takes the last session's settings.
+        let mut options = options;
+        if options.feed.is_none()
+            && options.feed_inherit
+            && let Some(last) = &last_session
+        {
+            // Every table the last session fed dropped since: nothing to feed, so the open
+            // records the feed off rather than a session that feeds no table (cli692).
+            let inherited = last.feed_options(&catalog);
+            if inherited.tables.as_ref().is_none_or(|t| !t.is_empty()) {
+                options.feed = Some(inherited);
+            }
+        }
         let feed = if no_writes {
             None
         } else {

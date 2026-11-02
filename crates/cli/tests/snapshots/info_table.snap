@@ -4,7 +4,7 @@ expression: text
 ---
 path            [DIR]/sample.phdb
 mode            writer
-read_only       false
+read_only       true
 format_version  4
 features        {"compat":0,"ro_compat":0,"incompat":0}
 db_id           [DB_ID]

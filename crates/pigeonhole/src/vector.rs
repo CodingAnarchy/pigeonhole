@@ -224,32 +224,36 @@ impl<'a> VectorRef<'a> {
     /// The components as `f32`s: exact for `f32`, `i8`, `f16` and `bf16` vectors (a half
     /// widens exactly), `None` for bit vectors.
     pub fn to_f32_vec(&self) -> Option<Vec<f32>> {
+        let mut out = Vec::with_capacity(self.dim() as usize);
+        self.widen_into(&mut out).then_some(out)
+    }
+
+    /// Appends the components to `out` as `f32`s, as [`to_f32_vec`](Self::to_f32_vec)
+    /// gives them, without allocating a vector of its own (for a caller filling one buffer
+    /// with many vectors: an Arrow column, a batch of embeddings). `false`, with nothing
+    /// appended, for a bit vector.
+    pub fn widen_into(&self, out: &mut Vec<f32>) -> bool {
         let p = self.inner.as_bytes();
         match self.inner.element() {
-            fmt::Element::F32 => Some(
-                p.as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|c| f32::from_le_bytes(*c))
-                    .collect(),
-            ),
-            fmt::Element::I8 => Some(p.iter().map(|b| f32::from(*b as i8)).collect()),
-            fmt::Element::F16 => Some(
+            fmt::Element::F32 => {
+                out.extend(p.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)));
+            }
+            fmt::Element::I8 => out.extend(p.iter().map(|b| f32::from(*b as i8))),
+            fmt::Element::F16 => out.extend(
                 p.as_chunks::<2>()
                     .0
                     .iter()
-                    .map(|c| pigeonhole_format::half::f16_to_f32(u16::from_le_bytes(*c)))
-                    .collect(),
+                    .map(|c| pigeonhole_format::half::f16_to_f32(u16::from_le_bytes(*c))),
             ),
-            fmt::Element::BF16 => Some(
+            fmt::Element::BF16 => out.extend(
                 p.as_chunks::<2>()
                     .0
                     .iter()
-                    .map(|c| pigeonhole_format::half::bf16_to_f32(u16::from_le_bytes(*c)))
-                    .collect(),
+                    .map(|c| pigeonhole_format::half::bf16_to_f32(u16::from_le_bytes(*c))),
             ),
-            fmt::Element::Bit => None,
+            fmt::Element::Bit => return false,
         }
+        true
     }
 }
 

@@ -25,7 +25,8 @@ use super::Limits;
 use super::cursor::Cursor;
 use crate::cmd::dump::value_json;
 use crate::cmd::schema::{
-    JsonValue, bytes_from_json, bytes_json, family_from_json, family_json, value_from_json,
+    Components, JsonValue, bytes_from_json, bytes_json, element_name, family_from_json,
+    family_json, value_from_json,
 };
 use crate::exit::Failure;
 use crate::open::{Db, Handle};
@@ -566,6 +567,42 @@ fn write_op(
                 (JsonValue::I64(n), Some(ts)) => batch.put_i64_at(t, &row, f, q, ts, n),
                 (JsonValue::F64(x), None) => batch.put_f64(t, &row, f, q, x),
                 (JsonValue::F64(x), Some(ts)) => batch.put_f64_at(t, &row, f, q, ts, x),
+                (
+                    JsonValue::Vector {
+                        element,
+                        dim,
+                        components,
+                    },
+                    ts,
+                ) => {
+                    let spec = t
+                        .family_info(f)
+                        .ok_or_else(|| Failure::family_not_found(t.name(), f))?
+                        .vector
+                        .ok_or_else(|| usage(format!("put: {f} is not a vector family")))?;
+                    if spec.element() != element || spec.dim() != dim {
+                        return Err(usage(format!(
+                            "put: a {}[{dim}] vector, and {f}'s vectors are {}[{}]",
+                            element_name(element),
+                            element_name(spec.element()),
+                            spec.dim()
+                        )));
+                    }
+                    match (components, ts) {
+                        (Components::Floats(xs), None) => batch.put_vector_f32(t, &row, f, q, &xs),
+                        (Components::Floats(xs), Some(ts)) => {
+                            batch.put_vector_f32_at(t, &row, f, q, ts, &xs)
+                        }
+                        (Components::Ints(xs), None) => batch.put_vector_i8(t, &row, f, q, &xs),
+                        (Components::Ints(xs), Some(ts)) => {
+                            batch.put_vector_i8_at(t, &row, f, q, ts, &xs)
+                        }
+                        (Components::Bits(b), None) => batch.put_vector_bits(t, &row, f, q, &b),
+                        (Components::Bits(b), Some(ts)) => {
+                            batch.put_vector_bits_at(t, &row, f, q, ts, &b)
+                        }
+                    }
+                }
             };
         }
         "incr" => {
@@ -758,6 +795,10 @@ impl Budget {
 fn cell_json(e: &CellEntry<'_>, max_value: usize) -> Value {
     let value = match e.cell.typed() {
         Cell::Bytes(b) if b.len() > max_value => json!({ "omitted_bytes": b.len() }),
+        // A vector whose payload passes the limit: its shape, not its components.
+        Cell::Vector(v) if v.as_bytes().len() > max_value => json!({
+            "omitted_vector": {"element": element_name(v.element()), "dim": v.dim()},
+        }),
         v => value_json(v),
     };
     json!({
@@ -1103,7 +1144,9 @@ fn write() -> Value {
         "Apply operations in one atomic batch: all of them commit, or none (across rows and \
          tables). Each op names `op`, `table` and `row`:\n\
          - put: set family:qualifier to `value` (a string, {\"base64\"}, {\"i64\": n} or \
-         {\"f64\": x}); a new version unless `ts` repeats one.\n\
+         {\"f64\": x}); a new version unless `ts` repeats one. In a vector family, the value \
+         is {\"vector\": {\"dim\": n, \"element\": \"f32\", \"values\": [...]}} with the \
+         family's dim and element (list_tables shows them).\n\
          - incr: add an integer `value` to a counter family's cell.\n\
          - aggregate: add `value` to an aggregate family's cell: a number (f64 kinds take \
          any number), a non-negative integer for bit_or/bit_and/bit_xor, an integer or a \
@@ -1148,7 +1191,9 @@ fn create_table() -> Value {
          and its families are left as they are). A family is a name, or an object with a \
          name and options as list_tables shows them: \"aggregation\" (one of the kinds the \
          schema lists; sum is a counter), \"aggregation_params\" for histogram, quantiles \
-         and bloom, \"max_versions\" (0 keeps every version), \"ttl_micros\". Plain families hold any bytes or \
+         and bloom, \"max_versions\" (0 keeps every version), \"ttl_micros\", or \"vector\": \
+         {\"dim\", \"element\" (f32, i8, bit, f16, bf16), \"metric\" (l2, inner_product, \
+         cosine, hamming)} for a vector family. Plain families hold any bytes or \
          numbers; group data read together in one family.",
         json!({
             "type": "object",
@@ -1178,6 +1223,18 @@ fn create_table() -> Value {
                                 },
                                 "max_versions": {"type": "integer", "minimum": 1},
                                 "ttl_micros": {"type": "integer", "minimum": 1},
+                                "vector": {
+                                    "type": "object",
+                                    "description": "A vector family's shape: every value is \
+                                                    a vector of `dim` `element`s, compared \
+                                                    by `metric`.",
+                                    "properties": {
+                                        "dim": {"type": "integer", "minimum": 1, "maximum": 4096},
+                                        "element": {"enum": ["f32", "i8", "bit", "f16", "bf16"]},
+                                        "metric": {"enum": ["l2", "inner_product", "cosine", "hamming"]},
+                                    },
+                                    "required": ["dim", "element", "metric"],
+                                },
                             },
                             "required": ["name"],
                         },

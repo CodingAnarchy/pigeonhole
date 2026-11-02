@@ -42,6 +42,35 @@ pub enum Step<'a> {
     /// them has expired. Never reported for a short read: a recycled slot shows as a newer
     /// epoch, in its header or in its frames.
     Gone,
+    /// The records the cursor read past some point of its segment are gone: the successor
+    /// names an earlier end for it, so a recovery cut the segment there (a power loss took
+    /// the unsynced records the cursor had read; the next writer replayed only up to the
+    /// cut). A feed that delivered any of them has lost them; one resuming past the cut
+    /// expires. Distinct from a successor naming a later end, which is corruption.
+    Cut,
+}
+
+/// Where the successor of segment `epoch` in `grid` says it ends, if exactly one is there
+/// (several are corruption, which [`FeedCursor::chain`] reports at the stop).
+fn cut_of_grid(grid: &Grid, epoch: u32) -> Option<u64> {
+    let mut successors = grid
+        .headers
+        .iter()
+        .flatten()
+        .filter(|h| h.prev_epoch == epoch);
+    match (successors.next(), successors.next()) {
+        (Some(h), None) => Some(u64::from(h.prev_end)),
+        _ => None,
+    }
+}
+
+/// Whether [`FeedCursor::chain`] moved to the successor.
+enum Chained {
+    Moved,
+    /// No successor on disk yet.
+    No,
+    /// The successor names an earlier end than the cursor read to ([`Step::Cut`]).
+    Cut,
 }
 
 /// A live, read-only reader of one WAL stream from a record boundary (D310).
@@ -175,6 +204,11 @@ impl FeedCursor {
             .map_or(Lsn::default(), |c| Lsn::new(c.epoch, c.last_end as u32))
     }
 
+    /// Where the successor of segment `epoch` says it ends, as the headers were last read.
+    fn cut_of(&self, epoch: u32) -> Option<u64> {
+        self.grid.as_ref().and_then(|g| cut_of_grid(g, epoch))
+    }
+
     fn segment_size(&self) -> u64 {
         self.grid.as_ref().map_or(0, |g| g.segment_size)
     }
@@ -218,12 +252,12 @@ impl FeedCursor {
         Ok(here)
     }
 
-    /// The segment stopped at `stop`: moves to its successor if one is on disk. Returns
-    /// whether it moved. A successor naming another offset means the cursor's segment was
-    /// rewritten under it (gone), or synced data was lost (corrupt) if it is still there.
-    fn chain(&mut self, epoch: u32, stop: u64) -> Result<bool> {
+    /// The segment stopped at `stop`: moves to its successor if one is on disk. A successor
+    /// naming an earlier end means a recovery cut the segment before `stop` ([`Step::Cut`]);
+    /// a later one, that synced data was lost (corrupt).
+    fn chain(&mut self, epoch: u32, stop: u64) -> Result<Chained> {
         let Some(grid) = self.grid.as_ref() else {
-            return Ok(false);
+            return Ok(Chained::No);
         };
         let mut successors = grid
             .headers
@@ -231,7 +265,7 @@ impl FeedCursor {
             .enumerate()
             .filter_map(|(i, h)| h.filter(|h| h.prev_epoch == epoch).map(|h| (i, h)));
         let (slot, h) = match (successors.next(), successors.next()) {
-            (None, _) => return Ok(false),
+            (None, _) => return Ok(Chained::No),
             (Some(s), None) => s,
             (Some(_), Some(_)) => {
                 return Err(crate::stream::corrupt(
@@ -239,6 +273,9 @@ impl FeedCursor {
                 ));
             }
         };
+        if u64::from(h.prev_end) < stop {
+            return Ok(Chained::Cut);
+        }
         if u64::from(h.prev_end) != stop {
             return Err(crate::stream::corrupt(
                 "wal segment chain: predecessor end mismatch",
@@ -252,7 +289,7 @@ impl FeedCursor {
             frame: FRAME,
             last_end: FRAME,
         });
-        Ok(true)
+        Ok(Chained::Moved)
     }
 
     /// The next record, or where reading stops for now ([`Step::End`]) or for good
@@ -269,6 +306,16 @@ impl FeedCursor {
                 return Ok(Step::Gone);
             };
             let (slot, epoch, frame, last_end) = (cur.slot, cur.epoch, cur.frame, cur.last_end);
+            // A successor already on disk names where this segment ends. Past it, any frame
+            // still here is one a power loss left after the recovery cut it (simp724's C1 on
+            // #1328): CRC-valid, but discarded, and its seqnos may be reused. A cursor there
+            // (a token resumed past the cut) has lost what it read, so it is cut before
+            // reading anything more.
+            let cut = self.cut_of(epoch);
+            if cut.is_some_and(|c| last_end > c) {
+                self.cur = None;
+                return Ok(Step::Cut);
+            }
             let stop = if frame >= self.segment_size() {
                 Some(last_end)
             } else {
@@ -277,6 +324,11 @@ impl FeedCursor {
                 let bytes = &self.chunk[at..at + FRAME_SIZE];
                 let cur = self.cur.as_mut().expect("checked above");
                 match cur.dec.decode(bytes)? {
+                    Some(Decoded::Record { offset }) if cut.is_some_and(|c| offset >= c) => {
+                        // A frame past the cut (above): never delivered.
+                        self.cur = None;
+                        return Ok(Step::Cut);
+                    }
                     Some(Decoded::Record { offset }) => {
                         let len = cur.dec.record().len();
                         let end = offset + FrameEncoder::new(epoch, offset).encoded_len(len) as u64;
@@ -306,8 +358,13 @@ impl FeedCursor {
             if !self.refresh()? {
                 return Ok(Step::Gone);
             }
-            if self.chain(epoch, stop)? {
-                continue;
+            match self.chain(epoch, stop)? {
+                Chained::Moved => continue,
+                Chained::Cut => {
+                    self.cur = None;
+                    return Ok(Step::Cut);
+                }
+                Chained::No => {}
             }
             // Not moved: resume just past the last complete record next time.
             let cur = self.cur.as_mut().expect("refresh kept it");

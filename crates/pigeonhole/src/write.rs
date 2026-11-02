@@ -415,7 +415,7 @@ fn commit_error(e: pigeonhole_engine::Error, largest_value: usize, max_value: us
 }
 
 /// Refuses a table handle from another database.
-fn check_table(db: &Arc<Db>, table: &Table) -> Result<()> {
+pub(crate) fn check_table(db: &Arc<Db>, table: &Table) -> Result<()> {
     if Arc::ptr_eq(db, &table.core.db) {
         Ok(())
     } else {
