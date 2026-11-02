@@ -1,0 +1,84 @@
+# Agent memory
+
+`pigeonhole-memory` gives agents long-term memory in a Pigeonhole database (D311). Memories are stored with their text and an embedding, scoped to a namespace, written in transactions, and recalled by meaning, keyword and recency together.
+
+## Creating a store and remembering
+A store is one table plus a full-text index. Pin it to the embedding model your application uses: the store records the model's id and dimension, and refuses vectors from any other.
+
+```rust
+# use pigeonhole::*;
+use pigeonhole_memory::{EmbeddingModel, Memory, Remembered, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let model = EmbeddingModel::new("my-embedder-v1", 4, Element::F32)?;
+let store = Store::create(&db, "agents", StoreOptions::new().embedding(model))?;
+let r = store.remember(
+    "agent:alice",
+    Memory::new("The March meeting chose Postgres.").embedding(vec![0.9, 0.1, 0.0, 0.2]),
+)?;
+// The same text again (spacing aside) merges into the first memory.
+let again = store.remember(
+    "agent:alice",
+    Memory::new("The  March meeting chose Postgres. ").embedding(vec![0.9, 0.1, 0.0, 0.2]),
+)?;
+assert_eq!(again, Remembered::Merged(r.id().clone()));
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Namespaces** are exact strings, such as `agent:alice` or `shared:team`. `agent:alice/x` is a different namespace, not a child. An empty namespace, or one containing `\0`, is refused.
+- **A memory** can also carry a kind (episodic, semantic or procedural), an importance from 0 to 1, a source id, a session, links to other memories in its namespace, and a pinned flag.
+- **Every write is one transaction:** the memory, its text index entry, its dedup row and both directions of its links commit together. `remember_in` joins your own transaction.
+- **Exact dedup:** the same text after trimming and collapsing whitespace merges into the live memory that has it. It keeps the larger importance, adds the source and counts a use. There's no case folding.
+- **The model check:** `Store::open(&db, name, model_id)` fails with `Mismatch` for another model. `open_without_embeddings` gives a handle that can delete, link and mark memories used, but can't add or supersede them in a pinned store.
+
+## Recall
+```rust
+# use pigeonhole::*;
+# use pigeonhole_memory::{EmbeddingModel, Memory, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let store = Store::create(&db, "agents", StoreOptions::new().embedding(EmbeddingModel::new("m", 4, Element::F32)?))?;
+# store.remember("agent:alice", Memory::new("The March meeting chose Postgres.").embedding(vec![0.9, 0.1, 0.0, 0.2]))?;
+# store.remember("agent:alice", Memory::new("Lunch was good.").embedding(vec![0.0, 0.0, 1.0, 0.0]))?;
+let hits = store
+    .recall(&["agent:alice"])
+    .text("database choice from the meeting")
+    .embedding(vec![0.8, 0.2, 0.0, 0.1])
+    .k(5)
+    .byte_budget(4 << 10)
+    .run()?;
+assert_eq!(hits[0].text, "The March meeting chose Postgres.");
+// Tell the store which memories helped: recall itself never writes.
+store.mark_used(&[hits[0].id.clone()])?;
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Candidates:** for each namespace, the 50 most similar by embedding (an exact search), the 50 best keyword matches (BM25 from the text index), and the 50 newest. `candidates(n)` changes the 50.
+- **Signals:** every candidate gets each signal:
+  - its similarity;
+  - its keyword score, if it was a keyword match;
+  - its recency, `exp(−age / half_life)` with a half-life of 7 days by default;
+  - its importance;
+  - its use, `ln(1 + uses)`, decayed since its last use.
+- **Fusion:** reciprocal rank fusion, `Σ w / (60 + rank)` over the signals a memory ranks in. Equal values share a rank, so a tie gives no memory an edge, and equal fused scores are ordered by id. `Fusion::Linear` sums min-max-normalised signals instead. `Weights` sets each signal's weight.
+- **The byte budget:** each hit counts its text, its id and 16 bytes, plus its signals and embedding when asked for (`with_signals`, `with_embeddings`). Hits are whole or left out, and at least one is returned. `RecallStats::truncated` says when the budget cut the list.
+- **Filters:** superseded memories are left out unless `include_superseded(true)`, and `session(s)` keeps one session.
+- **Determinism:** with an explicit `snapshot` and `at(time)`, the same call always returns the same result.
+- **Either signal alone works:** text alone recalls by keyword and recency, and an embedding alone by similarity and recency.
+
+## Lifecycle
+- **`get(&id)`** returns a memory with all its metadata.
+- **`delete(&id)`** removes the memory, its index entry, its dedup row and both directions of its links, in one transaction.
+- **`link(&from, &to, type, weight)`** links two memories in a namespace.
+- **`supersede(&old, &new)`** keeps the old memory but leaves it out of recall: the fact changed, and its history stays.
+- **`mark_used(&ids)`** counts a use. It's how recall's use signal learns.
+- **`verify()`** checks the store against itself and its text index.
+
+## Reader processes
+`Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools.

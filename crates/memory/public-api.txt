@@ -16,6 +16,9 @@ impl core::error::Error for pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum pigeonhole_memory::Fusion
+pub pigeonhole_memory::Fusion::Linear
+pub pigeonhole_memory::Fusion::Rrf
 #[non_exhaustive] pub enum pigeonhole_memory::Kind
 pub pigeonhole_memory::Kind::Episodic
 pub pigeonhole_memory::Kind::Procedural
@@ -69,6 +72,55 @@ pub fn pigeonhole_memory::MemoryId::fmt(&self, &mut core::fmt::Formatter<'_>) ->
 impl core::str::traits::FromStr for pigeonhole_memory::MemoryId
 pub type pigeonhole_memory::MemoryId::Err = pigeonhole_memory::Error
 pub fn pigeonhole_memory::MemoryId::from_str(&str) -> pigeonhole_memory::Result<Self>
+pub struct pigeonhole_memory::ReadStore
+impl pigeonhole_memory::ReadStore
+pub fn pigeonhole_memory::ReadStore::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
+pub fn pigeonhole_memory::ReadStore::get(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::StoredMemory>>
+pub fn pigeonhole_memory::ReadStore::recall(&self, &[&str]) -> pigeonhole_memory::Recall<'_>
+pub fn pigeonhole_memory::ReadStore::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
+impl core::fmt::Debug for pigeonhole_memory::ReadStore
+pub fn pigeonhole_memory::ReadStore::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_memory::Recall<'a>
+impl<'a> pigeonhole_memory::Recall<'a>
+pub fn pigeonhole_memory::Recall<'a>::at(self, u64) -> Self
+pub fn pigeonhole_memory::Recall<'a>::byte_budget(self, u64) -> Self
+pub fn pigeonhole_memory::Recall<'a>::candidates(self, usize) -> Self
+pub fn pigeonhole_memory::Recall<'a>::embedding(self, impl core::convert::Into<alloc::vec::Vec<f32>>) -> Self
+pub fn pigeonhole_memory::Recall<'a>::fusion(self, pigeonhole_memory::Fusion) -> Self
+pub fn pigeonhole_memory::Recall<'a>::half_life(self, core::time::Duration) -> Self
+pub fn pigeonhole_memory::Recall<'a>::include_superseded(self, bool) -> Self
+pub fn pigeonhole_memory::Recall<'a>::k(self, usize) -> Self
+pub fn pigeonhole_memory::Recall<'a>::run(self) -> pigeonhole_memory::Result<alloc::vec::Vec<pigeonhole_memory::RecallHit>>
+pub fn pigeonhole_memory::Recall<'a>::run_with_stats(self) -> pigeonhole_memory::Result<(alloc::vec::Vec<pigeonhole_memory::RecallHit>, pigeonhole_memory::RecallStats)>
+pub fn pigeonhole_memory::Recall<'a>::session(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn pigeonhole_memory::Recall<'a>::snapshot(self, &'a pigeonhole::db::Snapshot) -> Self
+pub fn pigeonhole_memory::Recall<'a>::text(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn pigeonhole_memory::Recall<'a>::weights(self, pigeonhole_memory::Weights) -> Self
+pub fn pigeonhole_memory::Recall<'a>::with_embeddings(self, bool) -> Self
+pub fn pigeonhole_memory::Recall<'a>::with_signals(self, bool) -> Self
+impl core::fmt::Debug for pigeonhole_memory::Recall<'_>
+pub fn pigeonhole_memory::Recall<'_>::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole_memory::RecallHit
+pub pigeonhole_memory::RecallHit::created_us: u64
+pub pigeonhole_memory::RecallHit::embedding: core::option::Option<alloc::vec::Vec<f32>>
+pub pigeonhole_memory::RecallHit::id: pigeonhole_memory::MemoryId
+pub pigeonhole_memory::RecallHit::importance: f64
+pub pigeonhole_memory::RecallHit::kind: pigeonhole_memory::Kind
+pub pigeonhole_memory::RecallHit::score: f64
+pub pigeonhole_memory::RecallHit::signals: core::option::Option<pigeonhole_memory::Signals>
+pub pigeonhole_memory::RecallHit::text: alloc::string::String
+#[non_exhaustive] pub struct pigeonhole_memory::RecallStats
+pub pigeonhole_memory::RecallStats::candidates: usize
+pub pigeonhole_memory::RecallStats::truncated: bool
+#[non_exhaustive] pub struct pigeonhole_memory::Signal
+pub pigeonhole_memory::Signal::rank: u32
+pub pigeonhole_memory::Signal::value: f64
+#[non_exhaustive] pub struct pigeonhole_memory::Signals
+pub pigeonhole_memory::Signals::importance: core::option::Option<pigeonhole_memory::Signal>
+pub pigeonhole_memory::Signals::keyword: core::option::Option<pigeonhole_memory::Signal>
+pub pigeonhole_memory::Signals::recency: core::option::Option<pigeonhole_memory::Signal>
+pub pigeonhole_memory::Signals::use_: core::option::Option<pigeonhole_memory::Signal>
+pub pigeonhole_memory::Signals::vector: core::option::Option<pigeonhole_memory::Signal>
 #[non_exhaustive] pub struct pigeonhole_memory::Source
 pub pigeonhole_memory::Source::at_us: u64
 pub pigeonhole_memory::Source::name: alloc::string::String
@@ -83,10 +135,14 @@ pub fn pigeonhole_memory::Store::link(&self, &pigeonhole_memory::MemoryId, &pige
 pub fn pigeonhole_memory::Store::mark_used(&self, &[pigeonhole_memory::MemoryId]) -> pigeonhole_memory::Result<pigeonhole_memory::Marked>
 pub fn pigeonhole_memory::Store::open(&pigeonhole::db::Pigeonhole, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::open_without_embeddings(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
+pub fn pigeonhole_memory::Store::recall(&self, &[&str]) -> pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::Store::remember(&self, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
 pub fn pigeonhole_memory::Store::remember_in(&self, &mut pigeonhole::write::Transaction, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
 pub fn pigeonhole_memory::Store::supersede(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
+impl pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::open_reader(&pigeonhole::db::PigeonholeReader, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::ReadStore>
+pub fn pigeonhole_memory::Store::open_reader_without_embeddings(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_memory::Result<pigeonhole_memory::ReadStore>
 impl core::fmt::Debug for pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::StoreOptions
@@ -117,5 +173,13 @@ pub pigeonhole_memory::StoredMemory::sources: alloc::vec::Vec<pigeonhole_memory:
 pub pigeonhole_memory::StoredMemory::superseded_by: core::option::Option<pigeonhole_memory::MemoryId>
 pub pigeonhole_memory::StoredMemory::text: alloc::string::String
 pub pigeonhole_memory::StoredMemory::uses: u64
+#[non_exhaustive] pub struct pigeonhole_memory::Weights
+pub pigeonhole_memory::Weights::importance: f64
+pub pigeonhole_memory::Weights::keyword: f64
+pub pigeonhole_memory::Weights::recency: f64
+pub pigeonhole_memory::Weights::use_: f64
+pub pigeonhole_memory::Weights::vector: f64
+impl core::default::Default for pigeonhole_memory::Weights
+pub fn pigeonhole_memory::Weights::default() -> Self
 pub fn pigeonhole_memory::normalize(&str) -> alloc::string::String
 pub type pigeonhole_memory::Result<T> = core::result::Result<T, pigeonhole_memory::Error>
