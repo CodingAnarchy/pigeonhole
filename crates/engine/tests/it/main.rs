@@ -53,6 +53,7 @@ mod flush_publish;
 mod flushed_through;
 mod format_upgrade;
 mod freeze_wake;
+mod full_compaction_pieces;
 mod full_compaction_purge;
 mod group_sync_batch;
 mod handover;
