@@ -211,3 +211,39 @@ pub fn same_scores(got: &[pigeonhole_text::Hit], want: &BTreeMap<Vec<u8>, f64>, 
         "{ctx}: order"
     );
 }
+
+/// Compares a top-`k` search with the reference's scores: the same scores, in rank order.
+pub fn same_top_k(
+    got: &[pigeonhole_text::Hit],
+    want: &BTreeMap<Vec<u8>, f64>,
+    k: usize,
+    ctx: &str,
+) {
+    let mut ranked: Vec<(&Vec<u8>, f64)> = want.iter().map(|(d, s)| (d, *s)).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    assert_eq!(got.len(), k.min(ranked.len()), "{ctx}: how many");
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(1.0);
+    for (i, h) in got.iter().enumerate() {
+        let w = want
+            .get(&h.id)
+            .unwrap_or_else(|| panic!("{ctx}: {:?} isn't a match", h.id));
+        assert!(
+            close(h.score, *w),
+            "{ctx}: {:?} scored {} not {w}",
+            h.id,
+            h.score
+        );
+        assert!(
+            close(h.score, ranked[i].1),
+            "{ctx}: rank {i} is {} not {}",
+            h.score,
+            ranked[i].1
+        );
+    }
+    // Exactly equal scores come by id ascending.
+    for w in got.windows(2) {
+        if w[0].score == w[1].score {
+            assert!(w[0].id < w[1].id, "{ctx}: a tie out of id order");
+        }
+    }
+}

@@ -3918,6 +3918,20 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - **Searches:** two terms 2.5 ms p50, two hub terms 44 ms, a rare phrase 0.28 ms, a phrase of two hub words 403 ms (#1334, Post-1.0).
   - They're re-taken after #1332 (#1313's fix), in the pre-1.1.0 recheck.
 
+**PR 4.** Fuzzy terms, as rev 5 §4.4, with `levenshtein_automata` 0.2.1 (Damerau, with an adjacent transposition as one edit).
+- **The walk:** a `df`-only scan of the `P` rows from the fixed prefix. At a key the automaton rejects partway, it seeks to the smallest byte string above the key that the automaton hasn't rejected. A term whose `df` is 0 isn't an expansion.
+- **Expansions:** at most `max_expansions` (50), ordered by distance, then df descending, then bytewise.
+  - Each scores as a term times `1 − d / min(len)`, and a document takes its best expansion.
+  - **Rev 5 §4.4 amended (coordinator, 2026-11-02, a Lucene-parity correction, from simp724's review of #1327):** every kept expansion scores with the idf of the largest df among the kept expansions. This is Lucene's blended `TopTermsBlendedFreqScoringRewrite`. Rev 5 had each expansion's own idf, which let a rare misspelling outrank the common word, about 2× for df 1 against 1,000.
+  - An addition to rev 5 (coordinator, 2026-11-02): a match with `d ≥ min(len)` isn't an expansion, since its boost would be 0 or below.
+- **MaxScore:** the fuzzy clause merges its expansions' walks, taking the maximum. Its bound is the largest expansion's bound.
+- **API** (ICR 0105 PR 4):
+  - `Clause::FuzzyText` for the syntax's `word~`, tokenised as documents are;
+  - `Search::max_expansions` and `Search::prefix_length`;
+  - `SearchStats::fuzzy`, so `SearchStats` loses `Copy`.
+- **Tests:** a brute-force optimal-string-alignment scan of every term, at full depth and at small `k`.
+- **The AX102 numbers** (the 3b run, 1M documents, flush only, the mean of two runs): 1 edit 375 ms p50 (41 expansions), 2 edits 406 ms, 2 edits with `prefix_length(2)` 130 ms. A fuzzy clause walks the union of its expansions' postings, and on the bench's dense `w`+digits vocabulary those include common words. Pruning inside the clause (max-combine MaxScore) is #1333, in 1.1.0.
+
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
 **Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.

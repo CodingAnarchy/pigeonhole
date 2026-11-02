@@ -21,7 +21,13 @@
 //! - `phrase-rare`, `phrase-mixed`, `phrase-hub`: an exact two-word phrase drawn from a
 //!   document, its words both rare (rank ≥ 1,000), one each, or both common (rank < 20);
 //! - `slop-2`, `slop-10`: the mixed phrases with slop 2 and 10;
-//! - `terms-2-k1000`: `terms-2` at top 1,000.
+//! - `terms-2-k1000`: `terms-2` at top 1,000;
+//! - `fuzzy-1`, `fuzzy-2`: a fuzzy term (D309 PR 4) at 1 and 2 edits, a word drawn by Zipf
+//!   frequency with one digit replaced. The vocabulary is `w0` to `w49999`, so a term has
+//!   dozens of terms within 2 edits: a dense dictionary, the hard case for the walk.
+//! - `fuzzy-2-prefix2`: `fuzzy-2` with `prefix_length(2)`.
+//!
+//! The fuzzy kinds also print the mean expansions per query.
 //!
 //! Run it on the reference machine for the published numbers. On a laptop, use a few
 //! thousand documents to check that it runs.
@@ -29,7 +35,7 @@
 use std::time::Instant;
 
 use pigeonhole::{Durability, Family, Options, Pigeonhole};
-use pigeonhole_text::{Index, IndexOptions, Query, Source};
+use pigeonhole_text::{Fuzziness, Index, IndexOptions, Query, Source};
 
 struct Rng(u64);
 
@@ -160,16 +166,31 @@ fn time(
     queries: &[Query],
     k: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    time_with(name, index, queries, k, 0)
+}
+
+/// [`time`], with each fuzzy term's first `prefix_length` characters fixed.
+fn time_with(
+    name: &str,
+    index: &Index,
+    queries: &[Query],
+    k: usize,
+    prefix_length: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let search = |q: &Query| index.search(q.clone(), k).prefix_length(prefix_length);
     // One warm-up pass, so the block cache holds what the queries read.
     for q in queries.iter().take(50) {
-        index.search(q.clone(), k).run()?;
+        search(q).run()?;
     }
     let mut us: Vec<f64> = Vec::with_capacity(queries.len());
     let mut hits = 0usize;
+    let mut expansions = 0usize;
     for q in queries {
         let t = Instant::now();
-        hits += index.search(q.clone(), k).run()?.len();
+        let (h, stats) = search(q).run_with_stats()?;
         us.push(t.elapsed().as_secs_f64() * 1e6);
+        hits += h.len();
+        expansions += stats.fuzzy.iter().map(|f| f.expansions).sum::<usize>();
     }
     us.sort_by(f64::total_cmp);
     let at = |p: f64| us[((us.len() as f64 * p) as usize).min(us.len() - 1)];
@@ -181,6 +202,12 @@ fn time(
         us.len(),
         hits as f64 / us.len() as f64
     );
+    if expansions > 0 {
+        println!(
+            "search {name}: {:.1} expansions each",
+            expansions as f64 / us.len() as f64
+        );
+    }
     Ok(())
 }
 
@@ -257,6 +284,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     time("slop-2", &index, &as_phrase(&mixed, 2), 10)?;
     time("slop-10", &index, &as_phrase(&mixed, 10), 10)?;
     time("terms-2-k1000", &index, &terms2, 1_000)?;
+    // A Zipf-drawn word with one digit replaced (`w` and at least one digit stay).
+    let typos: Vec<String> = (0..nq)
+        .map(|_| {
+            let mut w = word(z.rank(&mut rng)).into_bytes();
+            let at = 1 + rng.below(w.len() - 1);
+            w[at] = b'0' + ((w[at] - b'0' + 1 + rng.below(9) as u8) % 10);
+            String::from_utf8(w).expect("ASCII")
+        })
+        .collect();
+    let fuzzy = |f: Fuzziness| -> Vec<Query> {
+        typos
+            .iter()
+            .map(|t| Query::new().fuzzy(t.clone(), f))
+            .collect()
+    };
+    time("fuzzy-1", &index, &fuzzy(Fuzziness::One), 10)?;
+    time("fuzzy-2", &index, &fuzzy(Fuzziness::Two), 10)?;
+    time_with("fuzzy-2-prefix2", &index, &fuzzy(Fuzziness::Two), 10, 2)?;
     drop(index);
     db.close()?;
     Ok(())

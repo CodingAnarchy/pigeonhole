@@ -87,6 +87,30 @@ No API is added: `Query::phrase_with_slop(words, u16)`, the `Clause` slop fields
 - **`open` and `open_reader` of a table that lacks the index's families** now fail with `InvalidArgument` ("not a text index"), where they used to fail with the database's error for a missing family.
 - **The guide page** `docs/guide/text-search.md`, doctested, and the bench example `crates/text/examples/bench.rs`, with the AX102 numbers.
 
+## PR 4: fuzzy terms
+Rev 5 §4.4 as decided. The dependency is `levenshtein_automata` 0.2.1 (MIT, no dependencies; `cargo deny` passes).
+- **A search runs `Clause::Fuzzy`,** which PR 1 refused.
+- **`Clause::FuzzyText { text, fuzziness }`** (new variant) is what the syntax's `word~` parses to. It's tokenised as documents are, and each of its terms is a fuzzy term. So `Postgress~` matches `postgres`, as the syntax's bare words do, while `Query::fuzzy` keeps the builder contract: the term as given, after normalisation. `Auto` applies to each term's own length.
+  - PR 1 parsed `word~` to `Clause::Fuzzy`, so `clauses()` changes for that input. The crate is unreleased.
+- **`Search::max_expansions(n)`** (default 50; 0 is refused with `InvalidArgument`) and **`Search::prefix_length(n)`** (default 0): search-wide, as rev 5 §6b says.
+- **`SearchStats::fuzzy: Vec<FuzzyStats>`.** `FuzzyStats` (`#[non_exhaustive]`) has `clause` (an index into `clauses()`), `term`, `expansions` and `cut`. `SearchStats` loses `Copy` for the `Vec`.
+- **The walk:** a scan of the `P` rows from the fixed prefix, reading only the `df` counter.
+  - At a key the automaton rejects partway, the scan seeks to the smallest byte string above the key that the automaton hasn't rejected.
+  - The UTF-8 automaton rejects a character only at its last byte, so a seek can land on a multi-byte lead byte. That's still a valid lower bound.
+  - A term whose `df` is 0 (every document deleted) is not an expansion.
+- **One addition to rev 5:** a match whose distance is at least the shorter term's length in characters isn't an expansion. Its boost `1 − d / min(len)` would be 0 or negative: `a~1` would otherwise match every one-letter term, at a boost of 0.
+- **Blended statistics** (Lucene's `TopTermsBlendedFreqScoringRewrite`, simp724 on #1327; coordinator, 2026-11-02, as a Lucene-parity correction to rev 5 §4.4):
+  - every kept expansion's idf is `idf(max df over the kept expansions)`, after the `max_expansions` cut;
+  - the boost and the per-document maximum stay.
+  - With rev 5's per-expansion idf, a typo in 1 document outranked the exact term in 1,000 by about 2×. A test pins that case.
+- **MaxScore's fuzzy clause** merges its expansions' posting walks. A document's contribution is the largest of theirs, and a lookup is the largest of their lookups. The bound is the largest expansion's `boost · idf · tf_factor(maxtf, minlen)`, with the blended idf. A term clause is the one-walk case with boost 1, so its scores are unchanged.
+- **Tests:**
+  - against a brute-force optimal-string-alignment scan of every term (transpositions, Greek and accented words, `prefix_length`, the `max_expansions` cut and its order, deleted terms), at full depth and at k = 1 and 3;
+  - the syntax's tokenising;
+  - the per-clause maximum;
+  - mutations of the boost, the maximum, the transposition flag and the order were all caught.
+- **The bench** adds `fuzzy-1`, `fuzzy-2` and `fuzzy-2-prefix2`, and prints the mean expansions.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 

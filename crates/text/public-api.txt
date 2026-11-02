@@ -3,6 +3,9 @@ pub mod pigeonhole_text
 pub pigeonhole_text::Clause::Fuzzy
 pub pigeonhole_text::Clause::Fuzzy::fuzziness: pigeonhole_text::Fuzziness
 pub pigeonhole_text::Clause::Fuzzy::term: alloc::string::String
+pub pigeonhole_text::Clause::FuzzyText
+pub pigeonhole_text::Clause::FuzzyText::fuzziness: pigeonhole_text::Fuzziness
+pub pigeonhole_text::Clause::FuzzyText::text: alloc::string::String
 pub pigeonhole_text::Clause::Phrase
 pub pigeonhole_text::Clause::Phrase::slop: u16
 pub pigeonhole_text::Clause::Phrase::words: alloc::vec::Vec<alloc::string::String>
@@ -43,6 +46,11 @@ pub pigeonhole_text::QueryErrorKind::Slop
 pub pigeonhole_text::QueryErrorKind::UnclosedQuote
 impl core::fmt::Display for pigeonhole_text::QueryErrorKind
 pub fn pigeonhole_text::QueryErrorKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole_text::FuzzyStats
+pub pigeonhole_text::FuzzyStats::clause: usize
+pub pigeonhole_text::FuzzyStats::cut: bool
+pub pigeonhole_text::FuzzyStats::expansions: usize
+pub pigeonhole_text::FuzzyStats::term: alloc::string::String
 #[non_exhaustive] pub struct pigeonhole_text::Hit
 pub pigeonhole_text::Hit::id: alloc::vec::Vec<u8>
 pub pigeonhole_text::Hit::score: f64
@@ -126,10 +134,13 @@ pub pigeonhole_text::RebuildStats::invalid_utf8: u64
 pub struct pigeonhole_text::Search<'a>
 impl<'a> pigeonhole_text::Search<'a>
 pub fn pigeonhole_text::Search<'a>::id_prefix(self, impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
+pub fn pigeonhole_text::Search<'a>::max_expansions(self, usize) -> Self
+pub fn pigeonhole_text::Search<'a>::prefix_length(self, usize) -> Self
 pub fn pigeonhole_text::Search<'a>::run(self) -> pigeonhole_text::Result<alloc::vec::Vec<pigeonhole_text::Hit>>
 pub fn pigeonhole_text::Search<'a>::run_with_stats(self) -> pigeonhole_text::Result<(alloc::vec::Vec<pigeonhole_text::Hit>, pigeonhole_text::SearchStats)>
 pub fn pigeonhole_text::Search<'a>::snapshot(self, &'a pigeonhole::db::Snapshot) -> Self
 #[non_exhaustive] pub struct pigeonhole_text::SearchStats
+pub pigeonhole_text::SearchStats::fuzzy: alloc::vec::Vec<pigeonhole_text::FuzzyStats>
 pub pigeonhole_text::SearchStats::stale: u64
 pub struct pigeonhole_text::Source
 impl pigeonhole_text::Source

@@ -47,6 +47,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod fuzzy;
 mod index;
 mod layout;
 mod maxscore;
@@ -59,7 +60,7 @@ pub use error::{Error, QueryErrorKind, Result};
 pub use index::{Index, IndexStats, ReadIndex, RebuildStats};
 pub use layout::{IndexOptions, Normalization, Source};
 pub use query::{Clause, Fuzziness, Query};
-pub use search::{Hit, Search, SearchStats};
+pub use search::{FuzzyStats, Hit, Search, SearchStats};
 pub use tokenizer::{Token, Tokenizer};
 
 /// The user guide's text-search page and the crate README, compiled and run as doctests.

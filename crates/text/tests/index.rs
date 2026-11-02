@@ -529,11 +529,8 @@ fn query_strings_are_parsed_when_the_search_runs() {
             other => panic!("{q}: {other:?}"),
         }
     }
-    // Fuzzy terms parse, and wait for their PR.
-    assert!(matches!(
-        index.search("postgres~", 10).run(),
-        Err(Error::InvalidArgument(_))
-    ));
+    // A fuzzy word parses and runs (D309 PR 4).
+    assert_eq!(index.search("postgress~", 10).run().unwrap().len(), 1);
     assert!(index.search("", 10).run().unwrap().is_empty());
     assert!(index.search("postgres", 0).run().unwrap().is_empty());
     db.close().unwrap();
@@ -687,36 +684,6 @@ fn a_repeated_phrase_word_needs_two_occurrences() {
 /// Checks a top-`k` search against the reference's scores: the hits are the reference's best
 /// `k` (by score, then id), with the same scores. Scores within 1e-9 count as tied, so either
 /// side of a tie may make the cut.
-fn same_top_k(got: &[pigeonhole_text::Hit], want: &BTreeMap<Vec<u8>, f64>, k: usize, ctx: &str) {
-    let mut ranked: Vec<(&Vec<u8>, f64)> = want.iter().map(|(d, s)| (d, *s)).collect();
-    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
-    assert_eq!(got.len(), k.min(ranked.len()), "{ctx}: how many");
-    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(1.0);
-    for (i, h) in got.iter().enumerate() {
-        let w = want
-            .get(&h.id)
-            .unwrap_or_else(|| panic!("{ctx}: {:?} isn't a match", h.id));
-        assert!(
-            close(h.score, *w),
-            "{ctx}: {:?} scored {} not {w}",
-            h.id,
-            h.score
-        );
-        assert!(
-            close(h.score, ranked[i].1),
-            "{ctx}: rank {i} is {} not {}",
-            h.score,
-            ranked[i].1
-        );
-    }
-    // Exactly equal scores come by id ascending.
-    for w in got.windows(2) {
-        if w[0].score == w[1].score {
-            assert!(w[0].id < w[1].id, "{ctx}: a tie out of id order");
-        }
-    }
-}
-
 #[test]
 fn maxscore_returns_the_exact_top_k_at_small_k() {
     for seed in seeds(&[21, 22, 23]) {
