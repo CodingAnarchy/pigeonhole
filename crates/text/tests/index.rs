@@ -133,6 +133,34 @@ fn an_identical_put_and_a_delete_of_nothing_change_nothing() {
 }
 
 #[test]
+fn an_empty_document_keeps_the_document_count_exact() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    let docs_now = |want: u64, step: &str| {
+        let v = index.verify().unwrap();
+        assert!(v.is_consistent(), "{step}: {v:?}");
+        assert_eq!(v.documents, want, "{step}");
+    };
+    index.put(b"e", "").unwrap();
+    docs_now(1, "an empty document is a document");
+    index.put(b"e", "").unwrap();
+    docs_now(1, "putting it again doesn't count it twice");
+    index.put(b"e", "  ,  ").unwrap();
+    docs_now(1, "text with no words is empty too");
+    index.put(b"e", "memory store").unwrap();
+    docs_now(1, "words replace the empty text");
+    index.put(b"e", "").unwrap();
+    docs_now(1, "and empty text replaces them");
+    assert!(index.search("memory", 10).run().unwrap().is_empty());
+    assert!(index.delete(b"e").unwrap());
+    docs_now(0, "deleted");
+    assert!(!index.delete(b"e").unwrap());
+    docs_now(0, "deleted twice");
+    db.close().unwrap();
+}
+
+#[test]
 fn a_hit_whose_source_was_deleted_around_the_index_is_skipped_and_counted() {
     let dir = pigeonhole::doc_support::temp_dir();
     let db = open(&dir);

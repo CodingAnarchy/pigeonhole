@@ -449,7 +449,10 @@ impl Index {
     /// changes nothing.
     ///
     /// It never removes a document the source no longer has (a bypassed delete):
-    /// [`repair`](Self::repair) does. `Busy` during a repair.
+    /// [`repair`](Self::repair) does. Its counters (`df`, the document count and the corpus
+    /// length) trust `F{doc}` as the record of what was indexed, so after a write around the
+    /// index's own rows (not just the source column), use `repair`, which starts from an
+    /// emptied table. `Busy` during a repair.
     pub fn rebuild(&self) -> Result<RebuildStats> {
         self.rebuild_inner(false)
     }
