@@ -6,7 +6,7 @@ use std::fmt;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
@@ -387,6 +387,7 @@ pub struct WalCounters {
     inline_rollover_syncs: AtomicU64,
     rollover_blocks: AtomicU64,
     rollover_waits: AtomicU64,
+    retained_taken: AtomicU64,
 }
 
 impl WalCounters {
@@ -412,6 +413,61 @@ impl WalCounters {
     /// [`Wal::blocked`] leaves room for). Expected to stay 0 (#19).
     pub fn rollover_waits(&self) -> u64 {
         self.rollover_waits.load(Ordering::Relaxed)
+    }
+
+    /// Rollovers that took the oldest retained segment's slot because no recyclable or
+    /// prepared slot was ready (D310): the change feed's history lost a segment early
+    /// rather than the writer waiting. Expected to stay 0 while spares keep up.
+    pub fn retained_taken(&self) -> u64 {
+        self.retained_taken.load(Ordering::Relaxed)
+    }
+}
+
+/// A stream's change-feed marks (D310), written by the stream on its shard thread and read
+/// from any thread: the blob GC horizon and `DatabaseInfo` use them.
+///
+/// ```
+/// use std::path::Path;
+/// use pigeonhole_format::StreamId;
+/// use pigeonhole_io::sim::SimVfs;
+/// use pigeonhole_wal::{Wal, WalOptions, WalStream};
+///
+/// # fn main() -> pigeonhole_wal::Result<()> {
+/// let vfs: pigeonhole_io::VfsRef = SimVfs::new(1);
+/// let mut opts = WalOptions::default();
+/// opts.segment_size = 2 * 32 * 1024;
+/// let wal = WalStream::create(&vfs, Path::new("/db/x.phdb"), StreamId(0), [0; 16], opts)?;
+/// let marks = wal.feed_marks().unwrap();
+/// assert_eq!((marks.head(), marks.floor(), marks.retained_bytes()), (1, 1, 0));
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Default)]
+pub struct FeedMarks {
+    head: AtomicU32,
+    floor: AtomicU32,
+    retained_bytes: AtomicU64,
+}
+
+impl FeedMarks {
+    /// The current segment's epoch. Stored (Release) when a segment starts, before any of
+    /// its records is appended, so a thread that learned of a record (through the engine's
+    /// own synchronization) and then loads this (Acquire) sees at least that record's
+    /// segment.
+    pub fn head(&self) -> u32 {
+        self.head.load(Ordering::Acquire)
+    }
+
+    /// The smallest epoch of any segment not yet recyclable (retained, or past the
+    /// checkpoint): a record in a segment of a smaller epoch is gone, or may be overwritten
+    /// at any time. Never goes down.
+    pub fn floor(&self) -> u32 {
+        self.floor.load(Ordering::Acquire)
+    }
+
+    /// The bytes of the segments the checkpoint passed and retention keeps.
+    pub fn retained_bytes(&self) -> u64 {
+        self.retained_bytes.load(Ordering::Relaxed)
     }
 }
 
@@ -1215,8 +1271,20 @@ pub struct WalStream {
     slots: Vec<u32>,
     /// Largest epoch in any header ever seen or written for this stream.
     max_epoch: u32,
-    /// Slots with an epoch below this are recyclable.
+    /// Slots with an epoch below this are past the checkpoint: retained, or recyclable.
     checkpoint_epoch: u32,
+    /// Change-feed retention (D310): segments past the checkpoint kept as history.
+    retain: u32,
+    /// Past-checkpoint slots with an epoch below this are recyclable; the rest of them are
+    /// retained. `u32::MAX` without retention. Never lowered.
+    retain_floor: u32,
+    /// When each slot's segment was sealed, by the caller's clock (`trim_retained`); `None`
+    /// until the first trim after its rollover or adoption. Empty without retention.
+    sealed_at: Vec<Option<u64>>,
+    /// The feed session written into each new segment header (D310).
+    feed_session: u64,
+    /// Published for other threads (D310).
+    marks: Arc<FeedMarks>,
     /// Slot of the current segment.
     slot: usize,
     /// Epoch of the current segment.
@@ -1404,7 +1472,7 @@ impl WalStream {
         let path = stream_path(db_path, stream);
         let file = vfs.open(&path, OpenOptions::read_write_create())?;
         file.set_len(0)?;
-        Ok(Self::blank(
+        let mut s = Self::blank(
             Arc::clone(vfs),
             file,
             path,
@@ -1412,7 +1480,9 @@ impl WalStream {
             db_id,
             opts.segment_size,
             opts.spare_segments,
-        ))
+        );
+        s.configure_feed(&opts);
+        Ok(s)
     }
 
     /// A stream over `file` with no current segment yet.
@@ -1439,6 +1509,11 @@ impl WalStream {
             slots: Vec::new(),
             max_epoch: 0,
             checkpoint_epoch: 0,
+            retain: 0,
+            retain_floor: u32::MAX,
+            sealed_at: Vec::new(),
+            feed_session: 0,
+            marks: Arc::default(),
             slot: 0,
             epoch: 0,
             enc: FrameEncoder::new(0, FRAME),
@@ -1462,6 +1537,14 @@ impl WalStream {
         }
     }
 
+    /// Takes the change-feed settings of `opts` (D310): retention and the feed session. Called
+    /// before the stream's first segment.
+    pub(crate) fn configure_feed(&mut self, opts: &WalOptions) {
+        self.retain = opts.retain_segments;
+        self.retain_floor = if self.retain == 0 { u32::MAX } else { 0 };
+        self.feed_session = opts.feed_session;
+    }
+
     /// Adopts an existing file's slots (from recovery): `epochs` has 0 for a blank slot.
     pub(crate) fn adopt(&mut self, epochs: &[u32], max_epoch: u32, checkpoint_epoch: u32) {
         let mut pool = self.shared.pool();
@@ -1481,6 +1564,7 @@ impl WalStream {
         drop(pool);
         self.max_epoch = max_epoch;
         self.checkpoint_epoch = checkpoint_epoch;
+        self.update_retain_floor(None);
         self.publish_recyclable();
     }
 
@@ -1567,12 +1651,58 @@ impl WalStream {
 
     /// Whether the next segment can start in a recyclable or prepared slot.
     fn spare_ready(&self) -> bool {
-        (0..self.slots.len()).any(|i| self.is_recyclable(i)) || !self.shared.pool().ready.is_empty()
+        (0..self.slots.len()).any(|i| self.is_recyclable(i) || self.is_retained(i))
+            || !self.shared.pool().ready.is_empty()
     }
 
     fn is_recyclable(&self, slot: usize) -> bool {
         let epoch = self.slots[slot];
-        epoch != POOLED && epoch < self.checkpoint_epoch
+        epoch != POOLED && epoch < self.checkpoint_epoch && epoch < self.retain_floor
+    }
+
+    /// Whether `slot` holds a segment the checkpoint passed that retention keeps (D310).
+    fn is_retained(&self, slot: usize) -> bool {
+        let epoch = self.slots[slot];
+        epoch != POOLED && epoch < self.checkpoint_epoch && epoch >= self.retain_floor
+    }
+
+    /// The retained slot with the oldest segment, if any.
+    fn oldest_retained(&self) -> Option<usize> {
+        (0..self.slots.len())
+            .filter(|&i| self.is_retained(i))
+            .min_by_key(|&i| self.slots[i])
+    }
+
+    /// Raises `retain_floor` so that at most `retain` past-checkpoint segments stay retained
+    /// and, with `age` as `(now, max_age)`, none sealed more than `max_age` before `now`
+    /// (D310). The floor never goes down: a segment once recyclable stays so.
+    fn update_retain_floor(&mut self, age: Option<(u64, u64)>) {
+        if self.retain == 0 {
+            return;
+        }
+        let mut past: Vec<(u32, usize)> = (0..self.slots.len())
+            .filter(|&i| self.slots[i] != POOLED && self.slots[i] < self.checkpoint_epoch)
+            .map(|i| (self.slots[i], i))
+            .collect();
+        past.sort_unstable_by(|a, b| b.cmp(a));
+        let mut floor = self.retain_floor;
+        if let Some(&(epoch, _)) = past.get(self.retain as usize - 1)
+            && past.len() > self.retain as usize
+        {
+            floor = floor.max(epoch);
+        }
+        if let Some((now, max_age)) = age {
+            for &(epoch, slot) in past.iter().rev() {
+                if epoch < floor {
+                    continue;
+                }
+                match self.sealed_at.get(slot).copied().flatten() {
+                    Some(at) if now.saturating_sub(at) > max_age => floor = floor.max(epoch + 1),
+                    _ => break,
+                }
+            }
+        }
+        self.retain_floor = floor;
     }
 
     fn publish_recyclable(&self) {
@@ -1580,6 +1710,20 @@ impl WalStream {
             .filter(|&i| self.is_recyclable(i))
             .count();
         self.shared.pool().recyclable = n;
+        // The feed marks (D310): the oldest segment not recyclable, and what is retained.
+        let floor = (0..self.slots.len())
+            .filter(|&i| self.slots[i] != POOLED && !self.is_recyclable(i))
+            .map(|i| self.slots[i])
+            .min();
+        if let Some(floor) = floor {
+            self.marks.floor.fetch_max(floor, Ordering::AcqRel);
+        }
+        let retained = (0..self.slots.len())
+            .filter(|&i| self.is_retained(i))
+            .count() as u64;
+        self.marks
+            .retained_bytes
+            .store(retained * self.segment_size, Ordering::Relaxed);
     }
 
     /// Picks the slot for a new segment: recyclable, then prepared, then blank, else a new
@@ -1592,6 +1736,17 @@ impl WalStream {
             let mut pool = self.shared.pool();
             if !pool.ready.is_empty() {
                 (pool.ready.remove(0), SlotSource::Prepared)
+            } else if let Some(i) = self.oldest_retained().filter(|_| !at_open) {
+                // Retention never stalls the writer (D310): with nothing recyclable or
+                // prepared, the oldest retained segment goes now rather than waiting for the
+                // trim. Its slot is a recycled one: a stale header of a lower epoch.
+                drop(pool);
+                self.retain_floor = self.retain_floor.max(self.slots[i] + 1);
+                self.shared
+                    .counters
+                    .retained_taken
+                    .fetch_add(1, Ordering::Relaxed);
+                return Ok((i, SlotSource::Recycled));
             } else if !pool.blank.is_empty() {
                 (pool.blank.remove(0), SlotSource::Blank)
             } else {
@@ -1667,9 +1822,13 @@ impl WalStream {
         let (slot, source) = self.take_slot(at_open)?;
         self.stale = (source == SlotSource::Recycled).then_some(self.slots[slot]);
         self.slots[slot] = epoch;
+        if let Some(at) = self.sealed_at.get_mut(slot) {
+            *at = None;
+        }
         self.max_epoch = epoch;
         self.slot = slot;
         self.epoch = epoch;
+        self.marks.head.store(epoch, Ordering::Release);
         self.written_off = 0;
         self.enc = FrameEncoder::new(epoch, FRAME);
         self.buf.resize(FRAME_SIZE, 0);
@@ -1682,6 +1841,7 @@ impl WalStream {
             db_id: self.db_id,
             segment_size: self.segment_size,
             features: 0,
+            feed_session: self.feed_session,
         };
         let frame: &mut [u8; FRAME_SIZE] = (&mut self.buf[..FRAME_SIZE])
             .try_into()
@@ -1960,8 +2120,29 @@ impl Wal for WalStream {
         // The current segment is never recycled, so the checkpoint epoch never exceeds it.
         let epoch = upto.epoch().min(self.epoch);
         self.checkpoint_epoch = self.checkpoint_epoch.max(epoch);
+        self.update_retain_floor(None);
         self.publish_recyclable();
         Ok(())
+    }
+
+    fn trim_retained(&mut self, now: u64, max_age: Option<u64>) {
+        if self.retain == 0 {
+            return;
+        }
+        // Stamp every sealed segment that has no seal time yet (the current one is not
+        // sealed).
+        self.sealed_at.resize(self.slots.len(), None);
+        for i in 0..self.slots.len() {
+            if self.slots[i] != POOLED && i != self.slot && self.sealed_at[i].is_none() {
+                self.sealed_at[i] = Some(now);
+            }
+        }
+        self.update_retain_floor(max_age.map(|a| (now, a)));
+        self.publish_recyclable();
+    }
+
+    fn feed_marks(&self) -> Option<Arc<FeedMarks>> {
+        Some(Arc::clone(&self.marks))
     }
 
     fn io_tracker(&self) -> Option<IoTracker> {

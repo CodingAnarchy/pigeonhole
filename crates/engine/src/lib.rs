@@ -31,6 +31,7 @@ mod close_gate;
 mod compact;
 mod engine;
 mod error;
+mod feed;
 mod flush;
 mod flushed_roots;
 #[cfg(all(test, engine_loom))]
@@ -65,12 +66,13 @@ pub use engine::Handover;
 pub use engine::PendingMaintenance;
 pub use engine::{
     AppOwned, BackgroundWorker, CommitInfo, CrossShardMetrics, DbInfo, Engine, EngineShard,
-    FamilyInfo, FamilyStorage, LevelStorage, Metrics, Role, ShardStats, TableInfo, TableStorage,
+    FamilyInfo, FamilyStorage, FeedStorage, LevelStorage, Metrics, Role, ShardStats, TableInfo,
+    TableStorage,
 };
 pub use error::{Error, Result};
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
-pub use options::EngineOptions;
+pub use options::{EngineOptions, FeedOptions};
 pub use position::ColumnPosition;
 pub use read::keys::{KeyCursor, KeySet, POLL_ABSENT_KEYS};
 pub use read::knn::{KnnSkips, KnnVisitor, Metric, NEAREST_POLL_CELLS, PendingNearest, Score};

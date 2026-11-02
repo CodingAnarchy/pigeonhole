@@ -564,6 +564,8 @@ pub(crate) struct Shared {
     /// Bytes a stream may hold past its oldest needed record before the slots pinning it
     /// are flushed (`EngineOptions::wal_pin_bytes`, resolved; #137).
     pub wal_pin_bytes: u64,
+    /// The change feed's writer-side state (D310), `None` with the feed off.
+    pub feed: Option<Arc<crate::feed::Feed>>,
     /// Submitters for every shard, set once the runtime is built.
     pub submitters: std::sync::OnceLock<Vec<Submitter<ShardMsg>>>,
     /// Per shard, a handle on its WAL stream's count of submitted, unfinished I/O
@@ -977,7 +979,8 @@ impl Shared {
 
     /// The final close, run by the last shard to finish: records a clean close and, if this
     /// is the last process, removes the WAL files (every stream is checkpointed to its end
-    /// by now) and the shared-memory region, so the database is one file at rest.
+    /// by now; with the change feed on they stay, D310) and the shared-memory region, so the
+    /// database is one file at rest.
     pub(crate) fn final_close(&self, failed: bool) -> Result<()> {
         let result = self.final_close_steps(failed);
         if self.application_owned {
@@ -1028,7 +1031,11 @@ impl Shared {
             }
             return clean;
         }
-        if clean.is_ok() && last {
+        // With the change feed on, a clean close keeps the WAL files and their checkpoints
+        // (at their ends): the next open adopts the retained segments as history and replays
+        // nothing (D310 §2.1).
+        let keep_wal = self.feed.is_some();
+        if clean.is_ok() && last && !keep_wal {
             // The WAL files go away with this close: the streams the next open creates
             // start over at epoch 1, so their checkpoints must not point into the old
             // files (recovery would skip everything below them).
@@ -1044,7 +1051,7 @@ impl Shared {
         if last {
             // Under the locks (still held): no other process is in the file. A write of
             // this instance still in flight lands in the unlinked inode, harmlessly.
-            if clean.is_ok() {
+            if clean.is_ok() && !keep_wal {
                 remove_wal_files(&self.vfs, &self.path)?;
             }
             ShmRegion::remove(&self.vfs, self.identity, self.shm_dir.as_deref())?;
@@ -9252,6 +9259,7 @@ impl ShardState {
                 {
                     self.poison(crate::health::FailureCause::Io);
                 }
+                self.feed_maintain();
             }
             Err(e) => {
                 // Retry at the next checkpoint event, or once a backoff passes.
@@ -9339,6 +9347,21 @@ impl ShardState {
         }
     }
 
+    /// The change feed's maintenance (D310): ages out retained WAL history and drops the
+    /// held blob files the history has passed. Off the commit path; nothing without the
+    /// feed.
+    fn feed_maintain(&mut self) {
+        let Some(feed) = &self.shared.feed else {
+            return;
+        };
+        if let Some(wal) = self.wal.as_mut()
+            && !self.poisoned
+        {
+            wal.trim_retained(self.shared.vfs.now_micros(), feed.age_micros);
+        }
+        crate::feed::release_held(&self.shared, self.id);
+    }
+
     /// Scores the shard's slots, refreshes the stall score (L0 depth only, D119) and starts
     /// the most urgent compaction (or the next step of a full compaction) if none is running.
     fn maintain(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
@@ -9346,6 +9369,7 @@ impl ShardState {
         if self.replaying || self.shared.no_writes {
             return;
         }
+        self.feed_maintain();
         let view = self.shared.view.load_full();
         let now = self.shared.vfs.now_micros();
         // The write stall's score: the highest L0 depth over its trigger among the slots.

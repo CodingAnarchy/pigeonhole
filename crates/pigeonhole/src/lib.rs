@@ -164,12 +164,13 @@ pub use check::{
 pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
 pub use info::{
-    Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FileFeatures, LevelInfo, TableInfo,
+    Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,
+    TableInfo,
 };
 pub use metrics::{CommitStats, CrossShardMetrics, EngineMetrics};
 pub use options::{
-    Aggregation, BloomParams, Compaction, CpuProfile, Family, HistogramParams, IoBackend, IoRings,
-    Options, Priority, QuantileParams, ReaderOptions, Recovery, days,
+    Aggregation, BloomParams, Compaction, CpuProfile, Family, FeedRetention, HistogramParams,
+    IoBackend, IoRings, Options, Priority, QuantileParams, ReaderOptions, Recovery, days,
 };
 /// A sorted set of distinct row keys, the input of [`Table::keys`] (D299).
 pub use pigeonhole_engine::KeySet;

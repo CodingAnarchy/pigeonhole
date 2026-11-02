@@ -324,6 +324,7 @@ Project-level decisions that refine or deviate from [spec.md](../spec.md) and [t
 - [D306](phase-3.md#d306) — An IVF vector index in `pigeonhole-vector`: each list is one wide row of a vector family, moves between lists are transactions with stated read sets, lists split (2-means, then LIRE) and merge inside the writes, and a search runs `nearest_*` over the `nprobe` nearest lists at one snapshot · perf287, #490 D, ICR 0100 · on D296, D299 and D303
 - [D307](phase-3.md#d307) — Python bindings: PyO3 directly over `pigeonhole` in `crates/python`, `abi3-py311`, published as `pigeonhole-db` (`import pigeonhole`) after the owner's go; typed stubs checked by `mypy.stubtest` are the API snapshot · ai1249, #696, ICR 0102
 - [D308](phase-3.md#d308) — Byte-budgeted reads: `Scan`/`KeysRead::read_within` pages of whole columns within a byte budget, resumed from versioned table-tagged positions (`resume_after`), and `Traverse::byte_budget`, on a `ByteBudget` reducer · ai1249, #1250, ICR 0103 · on D296 and D304
+- [D310](phase-3.md#d310) — A change feed of committed mutations: the WAL with open-time feed retention (ring recycling, never stalls writers), the `<db>-feed` sidecar plus a session id in WAL header bytes 76..84 and the superblock `sequence` check (no incompat bit), a lazy `None` flush behind a shm written-watermark hold, `FeedExpired`, the durable frontier by default, clean close keeps history, whole-commit delivery · ai1249 design, feed1248, #1248, ICR 0106 · owner decision
 
 ## Open questions
 _None._
