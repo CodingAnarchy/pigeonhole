@@ -420,8 +420,9 @@ impl Sink {
             // included), as `plan_full` judges a lone SST by its manifest length (#1324): cut
             // by data alone, an output could end just over its piece, and a full compaction
             // would ask for it to be cut again and get the same SST back (#1313).
-            // A row is never split, so an output whose last row is larger than the piece's
-            // slack (a thirty-second) can still end over its piece by up to that row: a full
+            // The piece cut waits for a row start (only a full extent splits a row, below), so
+            // an output whose last row is larger than the piece's slack (a thirty-second) can
+            // still end over its piece by up to that row: a full
             // compaction then rewrites it once per `compact()` for nothing (#1351; bounded by
             // `plan_full`'s once-per-request guard, #1313).
             let margin = (o.extent.len() / if self.pieces { 32 } else { 8 }) as usize;

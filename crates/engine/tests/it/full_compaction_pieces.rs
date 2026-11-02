@@ -5,8 +5,9 @@
 //! so an output could end just over its piece. The next full compaction asked for it to be cut
 //! again and got the same SST back: `compact()` rewrote it about once a millisecond for as long
 //! as it ran (#1313, 47 GB in 91 s on the box, until its once-per-request guard). The sink now
-//! cuts by the whole length too (#1324), so no such SST is written, and a second full compaction
-//! leaves the outputs alone. Small blocks make the index large enough to open that window, as
+//! cuts by the whole length too (#1324), so no such SST is written from rows narrower than the
+//! piece's slack, and a second full compaction leaves the outputs alone. (A last row wider than
+//! the slack can still end an output over its piece: #1351.) Small blocks make the index large enough to open that window, as
 //! the text index's many small counters did.
 
 use std::sync::Arc;
