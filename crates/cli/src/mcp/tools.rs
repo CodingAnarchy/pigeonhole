@@ -10,6 +10,7 @@
 //! | `nearest` | The `k` nearest vectors to a query in a vector family (`Scan::nearest_f32`). |
 //! | `write` | Puts, increments, aggregate inputs and deletes in one atomic batch. |
 //! | `create_table` | A table and its families, if missing. |
+//! | `feed_poll` | Whole committed changes after a token (`Table::feed`), with the next token. |
 //!
 //! The JSON shapes of bytes and values are `phdb dump`'s. A result that would pass
 //! [`Limits::result_bytes`] stops at a column, row or node boundary with a `cursor`; a
@@ -29,8 +30,8 @@ use super::Limits;
 use super::cursor::Cursor;
 use crate::cmd::dump::value_json;
 use crate::cmd::schema::{
-    Components, JsonValue, bytes_from_json, bytes_json, element_name, family_from_json,
-    family_json, value_from_json, vector_spec_json,
+    Components, JsonValue, base64_decode, base64_encode, bytes_from_json, bytes_json, element_name,
+    family_from_json, family_json, value_from_json, vector_spec_json,
 };
 use crate::exit::Failure;
 use crate::open::{Db, Handle};
@@ -65,6 +66,9 @@ const DEFAULT_MAX_NODES: u64 = 100_000;
 const MAX_NODES: u64 = 10_000_000;
 /// The most neighbours a `nearest` may ask for.
 const MAX_K: u64 = 1_000;
+/// The most commits one `feed_poll` returns, and the longest it waits (milliseconds).
+const MAX_COMMITS: u64 = 1_000;
+const MAX_WAIT_MS: u64 = 30_000;
 
 type Outcome = Result<Map<String, Value>, Failure>;
 
@@ -95,6 +99,10 @@ impl Tools {
         if self.has_vector_family() {
             tools.push(nearest());
         }
+        // The feed is on when the writer's open inherited one or `--change-feed` turned it on.
+        if self.db.info().is_ok_and(|i| i.feed.is_some()) {
+            tools.push(feed_poll());
+        }
         if self.writable {
             tools.extend([write(), create_table()]);
         }
@@ -109,6 +117,7 @@ impl Tools {
             "read_row" => self.read_row(a),
             "scan" => self.scan(a),
             "traverse" => self.traverse(a),
+            "feed_poll" => self.feed_poll(a),
             "nearest" => self.nearest(a),
             "write" => self.write(a),
             "create_table" => self.create_table(a),
@@ -544,6 +553,121 @@ impl Tools {
         Ok(out)
     }
 
+    fn feed_poll(&self, a: Args<'_>) -> Outcome {
+        a.only(&[
+            "tables",
+            "prefix",
+            "token",
+            "from_oldest",
+            "visible",
+            "max_commits",
+            "wait_ms",
+            "max_value_bytes",
+        ])?;
+        let names = a.str_list("tables")?;
+        if names.is_empty() {
+            return Err(Failure::usage("tables: at least one table name"));
+        }
+        let prefix = a.opt_bytes("prefix")?;
+        let token = a
+            .opt_str("token")?
+            .map(|t| {
+                base64_decode(t).ok_or_else(|| {
+                    Failure::usage("token: the token string a previous feed_poll returned")
+                })
+            })
+            .transpose()?;
+        let from_oldest = a.bool_or("from_oldest", false)?;
+        if token.is_some() && from_oldest {
+            return Err(Failure::usage("token or from_oldest, not both"));
+        }
+        let visible = a.bool_or("visible", false)?;
+        let max_commits = a.u64_or("max_commits", 100, 1, MAX_COMMITS)? as usize;
+        let wait = std::time::Duration::from_millis(a.u64_or("wait_ms", 0, 0, MAX_WAIT_MS)?);
+        let max_value = self.max_value(&a)?;
+        let Db::Writer(db) = &self.db else {
+            return Err(Failure::unsupported(
+                "feed_poll: a reader process can't follow the change feed yet; serve the \
+                 database as its writer (stop the application, or wait for D310 PR 4)"
+                    .into(),
+            ));
+        };
+        let fail = |e: pigeonhole::Error| {
+            let f = Failure::db("feed_poll", &e);
+            match e.code() {
+                pigeonhole::ErrorCode::FeedExpired => f.hint(
+                    "the history this token needs is gone: re-read the tables (scan) and \
+                     call feed_poll again without a token",
+                ),
+                pigeonhole::ErrorCode::InvalidArgument => f.hint(
+                    "the database's change feed must be on (the application's, or \
+                     --change-feed) and follow these tables, and the token must come from this \
+                     database",
+                ),
+                _ => f,
+            }
+        };
+        let mut tables = Vec::with_capacity(names.len());
+        for n in &names {
+            tables.push(
+                db.table(n)
+                    .and_then(|b| b.open())
+                    .map_err(|e| Failure::db(&format!("table {n}"), &e))?,
+            );
+        }
+        let mut b = tables[0].feed();
+        for t in &tables[1..] {
+            b = b.table(t);
+        }
+        if let Some(p) = &prefix {
+            b = b.prefix(p);
+        }
+        if visible {
+            b = b.visible();
+        }
+        if from_oldest {
+            b = b.from_oldest();
+        }
+        if let Some(t) = token {
+            b = b.resume(&pigeonhole::FeedToken::from_bytes(t));
+        }
+        let mut feed = b.open().map_err(fail)?;
+        let mut budget = Budget::new(self.limits.result_bytes);
+        let mut commits = Vec::new();
+        // Where the result ends: after the last commit returned, never past one left out.
+        let mut token = feed.token();
+        let mut more = false;
+        while commits.len() < max_commits {
+            // Wait for the first commit only; then take what is ready.
+            let next = if commits.is_empty() {
+                feed.next(wait)
+            } else {
+                feed.try_next()
+            };
+            let Some(c) = next.map_err(fail)? else {
+                break;
+            };
+            let v = commit_json(c, max_value);
+            if !budget.take(std::slice::from_ref(&v)) {
+                more = true;
+                break;
+            }
+            commits.push(v);
+            token = feed.token();
+        }
+        if commits.len() == max_commits {
+            more = feed.try_next().map_err(fail)?.is_some();
+        }
+        let mut out = object(json!({
+            "commits": commits,
+            "token": base64_encode(token.as_bytes()),
+        }));
+        if more {
+            out.insert("more".into(), true.into());
+        }
+        Ok(out)
+    }
+
     fn write(&self, a: Args<'_>) -> Outcome {
         a.only(&["ops"])?;
         let Some(Value::Array(ops)) = a.0.get("ops") else {
@@ -902,20 +1026,61 @@ impl Budget {
 /// A cell in a read's result: `dump`'s shape without the table and row, with a byte value
 /// longer than `max_value` replaced by its length.
 fn cell_json(e: &CellEntry<'_>, max_value: usize) -> Value {
-    let value = match e.cell.typed() {
-        Cell::Bytes(b) if b.len() > max_value => json!({ "omitted_bytes": b.len() }),
-        // A vector whose payload passes the limit: its shape, not its components.
-        Cell::Vector(v) if v.as_bytes().len() > max_value => json!({
-            "omitted_vector": {"element": element_name(v.element()), "dim": v.dim()},
-        }),
-        v => value_json(v),
-    };
+    let value = typed_json(e.cell.typed(), max_value);
     json!({
         "family": e.family,
         "qualifier": bytes_json(e.qualifier),
         "ts": e.cell.timestamp(),
         "value": value,
     })
+}
+
+/// A change-feed commit in a `feed_poll` result: its changes in `dump`'s shapes, a value
+/// longer than `max_value` replaced as reads replace it.
+fn commit_json(c: &pigeonhole::Commit, max_value: usize) -> Value {
+    let changes: Vec<Value> = c
+        .changes()
+        .iter()
+        .map(|ch| {
+            let mut m = object(json!({
+                "table": ch.table(),
+                "family": ch.family(),
+                "kind": change_kind(ch.kind()),
+                "row": bytes_json(ch.row()),
+                "qualifier": bytes_json(ch.qualifier()),
+                "ts": ch.timestamp(),
+            }));
+            if let Some(v) = ch.value() {
+                m.insert("value".into(), typed_json(v, max_value));
+            }
+            Value::Object(m)
+        })
+        .collect();
+    json!({"seqno": c.seqno(), "ts": c.timestamp(), "changes": changes})
+}
+
+fn change_kind(kind: pigeonhole::ChangeKind) -> &'static str {
+    use pigeonhole::ChangeKind as K;
+    match kind {
+        K::Put => "put",
+        K::Merge => "merge",
+        K::DeleteCell => "delete_cell",
+        K::DeleteColumn => "delete_column",
+        K::DeleteFamily => "delete_family",
+        _ => "unknown",
+    }
+}
+
+/// A value in a result: `dump`'s shape, with a byte value longer than `max_value` replaced
+/// by its length, and a vector whose payload is, by its shape.
+fn typed_json(v: Cell<'_>, max_value: usize) -> Value {
+    match v {
+        Cell::Bytes(b) if b.len() > max_value => json!({ "omitted_bytes": b.len() }),
+        Cell::Vector(v) if v.as_bytes().len() > max_value => json!({
+            "omitted_vector": {"element": element_name(v.element()), "dim": v.dim()},
+        }),
+        v => value_json(v),
+    }
 }
 
 /// A family's options as `phdb info` shows them, without the unset ones.
@@ -977,6 +1142,30 @@ impl Query {
     /// integers, bit families 0s and 1s), `{"base64"}` of a bit family's packed bytes, or
     /// `write`'s `{"vector"}` shape. Its element type and dimension must be the family's.
     fn parse(v: &Value, spec: &VectorSpec) -> Result<Self, Failure> {
+        let q = Self::parse_shape(v, spec)?;
+        // What the search would refuse, refused here as the agent's mistake (ai1249 on
+        // #1354): a component past 2^56, and under cosine a vector with no direction.
+        let usage = |m: &str| Failure::usage(&format!("query: {m}"));
+        if let Query::F32(xs) = &q
+            && xs.iter().any(|x| x.abs() > (1u64 << 56) as f32)
+        {
+            return Err(usage("a component is more than 2^56 in magnitude"));
+        }
+        let zero = match &q {
+            Query::F32(xs) => xs.iter().all(|x| *x == 0.0),
+            Query::I8(xs) => xs.iter().all(|x| *x == 0),
+            Query::Bits(_) => false,
+        };
+        if zero && spec.metric() == pigeonhole::Metric::Cosine {
+            return Err(usage(
+                "an all-zero vector has no direction, so cosine can't rank against it",
+            ));
+        }
+        Ok(q)
+    }
+
+    /// [`parse`](Self::parse)'s shapes, checked against the family's element and dimension.
+    fn parse_shape(v: &Value, spec: &VectorSpec) -> Result<Self, Failure> {
         let usage = |m: String| Failure::usage(&format!("query: {m}"));
         let (element, dim) = (spec.element(), spec.dim() as usize);
         let want = format!("{}[{dim}]", element_name(element));
@@ -1384,6 +1573,8 @@ fn nearest() -> Value {
          distance under the family's metric (smaller is nearer); read a neighbour's cells \
          with read_row. The query is a list of `dim` numbers: integers from -128 to 127 for \
          an i8 family, 0s and 1s for a bit family (or {\"base64\"} of its packed bytes). \
+         The query must be an embedding from the same model as the stored vectors: \
+         distances between two models' vectors mean nothing. \
          Narrow the search to a `row`, a `prefix` or a `start`/`end` range, and to one \
          `qualifier` or a `qualifier_prefix`. A result marked `truncated` holds the nearest \
          that fit: ask for a smaller k.",
@@ -1410,6 +1601,53 @@ fn nearest() -> Value {
                 "qualifier_prefix": bytes_schema("Only columns whose qualifier starts with this."),
             },
             "required": ["table", "family", "query"],
+            "additionalProperties": false,
+        }),
+        true,
+    )
+}
+
+fn feed_poll() -> Value {
+    tool(
+        "feed_poll",
+        "Poll committed changes",
+        "Return the changes committed to `tables` since `token`, as whole commits in commit \
+         order: each has seqno, ts and `changes` (table, family, kind, row, qualifier, ts and, \
+         for put and merge, value; kind is put, merge, delete_cell, delete_column or \
+         delete_family). Pass the returned `token` to the next call to continue exactly \
+         where this one stopped: nothing is missed or repeated. The first call has no token \
+         and starts with commits after it (or from_oldest: the oldest history kept); \
+         wait_ms waits for a first commit. `more` says more commits are ready now. An error \
+         FeedExpired means the history is gone: re-read with scan and start again without \
+         a token.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tables": {
+                    "type": "array", "minItems": 1, "items": {"type": "string"},
+                    "description": "The tables to follow; a commit across them arrives whole.",
+                },
+                "prefix": bytes_schema("Only changes to rows whose key starts with this."),
+                "token": {"type": "string",
+                          "description": "The token the previous feed_poll returned."},
+                "from_oldest": {"type": "boolean",
+                                "description": "Without a token: start with the oldest \
+                                                history kept, not after now."},
+                "visible": {"type": "boolean",
+                            "description": "Return commits once reads see them, not once \
+                                            durable (default false)."},
+                "max_commits": {"type": "integer", "minimum": 1, "maximum": MAX_COMMITS,
+                                "description": "At most this many commits (default 100)."},
+                "wait_ms": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS,
+                            "description": "Wait up to this long for a first commit \
+                                            (default 0: return at once)."},
+                "max_value_bytes": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Byte values longer than this come back as \
+                                    {\"omitted_bytes\": n} (default: the server's limit).",
+                },
+            },
+            "required": ["tables"],
             "additionalProperties": false,
         }),
         true,
@@ -1555,6 +1793,7 @@ mod tests {
             scan(),
             traverse(),
             nearest(),
+            feed_poll(),
             write(),
             create_table(),
         ] {

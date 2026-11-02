@@ -725,6 +725,12 @@ fn vector_families_read_and_write_in_dump_shapes() {
     );
     let err = s.fail("write", put(json!([1.0, 0.0]), 2));
     assert!(err.to_string().contains("f32[4]"), "{err}");
+    // Under cosine, an all-zero query is the agent's mistake, refused before the search.
+    let err = s.fail(
+        "nearest",
+        json!({"table": "docs", "family": "emb", "query": [0.0, 0.0, 0.0, 0.0]}),
+    );
+    assert!(err.to_string().contains("no direction"), "{err}");
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
 }
@@ -835,6 +841,7 @@ fn nearest_ranks_vectors_under_the_selection() {
             "not two of them",
         ),
         (json!({"query": [1.0, 0.0], "k": 0}), "k:"),
+        (json!({"query": [1e30, 0.0]}), "2^56"),
     ] {
         let mut call = json!({"table": "docs", "family": "emb"});
         for (k, v) in args.as_object().unwrap() {
@@ -856,6 +863,117 @@ fn nearest_ranks_vectors_under_the_selection() {
     let kept = rows(&cut);
     assert!(!kept.is_empty() && kept.len() < 3, "{cut}");
     assert_eq!(kept[0], "b");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
+/// `feed_poll` (#1322): listed when the database's feed is on (`--change-feed`, or inherited
+/// from the last open, D310 amendment (c)); whole commits in order after a token, the next
+/// token continuing exactly; `max_commits` with `more`; and a token whose history an open
+/// with the feed off ended is a `FeedExpired` tool error.
+#[test]
+fn feed_poll_continues_from_its_token_and_reports_expiry() {
+    let dir = TempDir::new("mcp-feed");
+    let path = db_path(&dir);
+    let feed = ["--change-feed", "16777216"];
+    let mut s = Server::start(&path, &["--create", feed[0], feed[1]]);
+    assert!(s.tool_names().contains(&"feed_poll".to_owned()));
+    s.call(
+        "create_table",
+        json!({"table": "t", "families": ["f", {"name": "n", "aggregation": "sum"}]}),
+    );
+    let first = s.call("feed_poll", json!({"tables": ["t"]}));
+    assert_eq!(first["commits"], json!([]), "{first}");
+    let t0 = first["token"].clone();
+    let put = |row: &str| {
+        json!({"ops": [{"op": "put", "table": "t", "row": row, "family": "f",
+                        "qualifier": "q", "value": "v"}]})
+    };
+    s.call("write", put("r1"));
+    s.call(
+        "write",
+        json!({"ops": [
+            {"op": "incr", "table": "t", "row": "r1", "family": "n", "qualifier": "c", "value": 2},
+            {"op": "delete", "table": "t", "row": "r1", "family": "f", "qualifier": "q"},
+        ]}),
+    );
+    let got = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": t0, "wait_ms": 5000}),
+    );
+    let commits = got["commits"].as_array().unwrap();
+    assert_eq!(commits.len(), 2, "{got}");
+    assert_eq!(
+        commits[0]["changes"],
+        json!([{"table": "t", "family": "f", "kind": "put", "row": "r1", "qualifier": "q",
+                "ts": commits[0]["changes"][0]["ts"], "value": "v"}])
+    );
+    let kinds: Vec<&str> = commits[1]["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["merge", "delete_column"], "{got}");
+    assert!(commits[1]["changes"][1].get("value").is_none());
+    assert!(commits[1]["seqno"].as_u64() > commits[0]["seqno"].as_u64());
+    let t1 = got["token"].clone();
+    // The token continues exactly: nothing new yet.
+    let again = s.call("feed_poll", json!({"tables": ["t"], "token": t1}));
+    assert_eq!(again["commits"], json!([]), "{again}");
+    // max_commits, with `more`, and the token after the last returned.
+    for r in ["a", "b", "c"] {
+        s.call("write", put(r));
+    }
+    let two = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": t1, "max_commits": 2, "wait_ms": 5000}),
+    );
+    assert_eq!(two["commits"].as_array().unwrap().len(), 2, "{two}");
+    assert_eq!(two["more"], true, "{two}");
+    let rest = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": two["token"], "wait_ms": 5000}),
+    );
+    assert_eq!(rest["commits"].as_array().unwrap().len(), 1, "{rest}");
+    assert_eq!(rest["commits"][0]["changes"][0]["row"], "c");
+    assert!(rest.get("more").is_none());
+    let kept = rest["token"].clone();
+    // Refusals.
+    let err = s.fail("feed_poll", json!({"tables": ["t"], "token": "!!"}));
+    assert!(err.to_string().contains("token"), "{err}");
+    let err = s.fail(
+        "feed_poll",
+        json!({"tables": ["t"], "token": kept, "from_oldest": true}),
+    );
+    assert!(err.to_string().contains("not both"), "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // A server without --change-feed inherits the feed the last open had: listed, and the
+    // token continues.
+    let mut s = Server::start(&path, &[]);
+    assert!(s.tool_names().contains(&"feed_poll".to_owned()));
+    let same = s.call("feed_poll", json!({"tables": ["t"], "token": kept}));
+    assert_eq!(same["commits"], json!([]), "{same}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+
+    // An open that turns the feed off ends its history: the token expired.
+    Pigeonhole::open(
+        &path,
+        Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .change_feed_off(),
+    )
+    .unwrap()
+    .close()
+    .unwrap();
+    let mut s = Server::start(&path, &feed);
+    let err = s.fail("feed_poll", json!({"tables": ["t"], "token": kept}));
+    assert_eq!(err["code"], "FeedExpired", "{err}");
+    assert_eq!(err["code_num"], 31, "{err}");
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
 }
