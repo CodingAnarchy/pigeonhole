@@ -88,6 +88,38 @@ assert_eq!(fuzzy[0].id, b"a");
   - Composed and decomposed accents differ by edits, so keep the default `Nfc` normalisation if you search with fuzzy terms.
 - **A namespace:** `.id_prefix(p)` restricts a search to ids starting with `p`. Include the namespace's terminator (`agent:alice\0`), or `agent:alice2` matches too. Scores keep the whole index's statistics.
 
+## Highlighting
+`.highlight(true)` fills each hit's `text` (its source text) and `matches`. Each `Match` has three fields:
+- **`range`:** a UTF-8 byte range into `text`;
+- **`clause`:** the index into `query.clauses()` of the clause it matched;
+- **`occurrence`:** which of that clause's occurrences it is.
+
+A term or fuzzy term matches one token. An exact phrase covers its first token to its last. A sloppy phrase match lists one range per phrase word, all sharing one `occurrence`. `pigeonhole_text::snippet(&text, &matches, max_bytes)` picks a window, cut on word boundaries. It prefers the most distinct clauses, then the most matches, then the earliest.
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_text::{Index, IndexOptions, Source, snippet};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let notes = db.table("notes")?.family("body", Family::default()).create_if_missing()?;
+# let index = Index::create(&db, "notes_text", Source::new(&notes, "body", b"text"), IndexOptions::new())?;
+index.put(b"a", "Notes from the March meeting: we chose Postgres over SQLite.")?;
+let hits = index.search(r#""march meeting" postgress~"#, 10).highlight(true).run()?;
+let text = hits[0].text.as_deref().unwrap();
+let found: Vec<&str> = hits[0].matches.iter().map(|m| &text[m.range.clone()]).collect();
+assert_eq!(found, ["March meeting", "Postgres"]);
+let s = snippet(text, &hits[0].matches, 40);
+assert_eq!(&text[s.range], "March meeting: we chose Postgres over ");
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Matches are recomputed** by tokenising the hit's text again, so they always fit the text returned. That costs one pass per hit, and nothing when highlighting is off.
+- **An index without positions** still highlights terms and fuzzy terms.
+- **Python and MCP callers get code-point offsets,** not bytes.
+
 ## Options
 Options are fixed when the index is created.
 

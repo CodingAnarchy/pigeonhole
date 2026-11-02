@@ -53,7 +53,9 @@ pub pigeonhole_text::FuzzyStats::expansions: usize
 pub pigeonhole_text::FuzzyStats::term: alloc::string::String
 #[non_exhaustive] pub struct pigeonhole_text::Hit
 pub pigeonhole_text::Hit::id: alloc::vec::Vec<u8>
+pub pigeonhole_text::Hit::matches: alloc::vec::Vec<pigeonhole_text::Match>
 pub pigeonhole_text::Hit::score: f64
+pub pigeonhole_text::Hit::text: core::option::Option<alloc::string::String>
 pub struct pigeonhole_text::Index
 impl pigeonhole_text::Index
 pub fn pigeonhole_text::Index::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions) -> pigeonhole_text::Result<pigeonhole_text::Index>
@@ -103,6 +105,10 @@ pub pigeonhole_text::IndexStats::source_mismatch: u64
 pub pigeonhole_text::IndexStats::terms: u64
 impl pigeonhole_text::IndexStats
 pub fn pigeonhole_text::IndexStats::is_consistent(&self) -> bool
+#[non_exhaustive] pub struct pigeonhole_text::Match
+pub pigeonhole_text::Match::clause: usize
+pub pigeonhole_text::Match::occurrence: u32
+pub pigeonhole_text::Match::range: core::ops::range::Range<usize>
 pub struct pigeonhole_text::Query
 impl pigeonhole_text::Query
 pub fn pigeonhole_text::Query::clauses(&self) -> &[pigeonhole_text::Clause]
@@ -133,6 +139,7 @@ pub pigeonhole_text::RebuildStats::documents: u64
 pub pigeonhole_text::RebuildStats::invalid_utf8: u64
 pub struct pigeonhole_text::Search<'a>
 impl<'a> pigeonhole_text::Search<'a>
+pub fn pigeonhole_text::Search<'a>::highlight(self, bool) -> Self
 pub fn pigeonhole_text::Search<'a>::id_prefix(self, impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
 pub fn pigeonhole_text::Search<'a>::max_expansions(self, usize) -> Self
 pub fn pigeonhole_text::Search<'a>::prefix_length(self, usize) -> Self
@@ -142,6 +149,9 @@ pub fn pigeonhole_text::Search<'a>::snapshot(self, &'a pigeonhole::db::Snapshot)
 #[non_exhaustive] pub struct pigeonhole_text::SearchStats
 pub pigeonhole_text::SearchStats::fuzzy: alloc::vec::Vec<pigeonhole_text::FuzzyStats>
 pub pigeonhole_text::SearchStats::stale: u64
+#[non_exhaustive] pub struct pigeonhole_text::Snippet
+pub pigeonhole_text::Snippet::matches: alloc::vec::Vec<pigeonhole_text::Match>
+pub pigeonhole_text::Snippet::range: core::ops::range::Range<usize>
 pub struct pigeonhole_text::Source
 impl pigeonhole_text::Source
 pub fn pigeonhole_text::Source::family(&self) -> &str
@@ -158,4 +168,5 @@ pub trait pigeonhole_text::Tokenizer: core::marker::Send + core::marker::Sync
 pub fn pigeonhole_text::Tokenizer::fingerprint(&self) -> u64
 pub fn pigeonhole_text::Tokenizer::name(&self) -> &str
 pub fn pigeonhole_text::Tokenizer::tokens(&self, &str, &mut dyn core::ops::function::FnMut(pigeonhole_text::Token<'_>))
+pub fn pigeonhole_text::snippet(&str, &[pigeonhole_text::Match], usize) -> pigeonhole_text::Snippet
 pub type pigeonhole_text::Result<T> = core::result::Result<T, pigeonhole_text::Error>
