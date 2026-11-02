@@ -50,6 +50,20 @@ pub enum Step<'a> {
     Cut,
 }
 
+/// Where the successor of segment `epoch` in `grid` says it ends, if exactly one is there
+/// (several are corruption, which [`FeedCursor::chain`] reports at the stop).
+fn cut_of_grid(grid: &Grid, epoch: u32) -> Option<u64> {
+    let mut successors = grid
+        .headers
+        .iter()
+        .flatten()
+        .filter(|h| h.prev_epoch == epoch);
+    match (successors.next(), successors.next()) {
+        (Some(h), None) => Some(u64::from(h.prev_end)),
+        _ => None,
+    }
+}
+
 /// Whether [`FeedCursor::chain`] moved to the successor.
 enum Chained {
     Moved,
@@ -190,6 +204,11 @@ impl FeedCursor {
             .map_or(Lsn::default(), |c| Lsn::new(c.epoch, c.last_end as u32))
     }
 
+    /// Where the successor of segment `epoch` says it ends, as the headers were last read.
+    fn cut_of(&self, epoch: u32) -> Option<u64> {
+        self.grid.as_ref().and_then(|g| cut_of_grid(g, epoch))
+    }
+
     fn segment_size(&self) -> u64 {
         self.grid.as_ref().map_or(0, |g| g.segment_size)
     }
@@ -287,6 +306,16 @@ impl FeedCursor {
                 return Ok(Step::Gone);
             };
             let (slot, epoch, frame, last_end) = (cur.slot, cur.epoch, cur.frame, cur.last_end);
+            // A successor already on disk names where this segment ends. Past it, any frame
+            // still here is one a power loss left after the recovery cut it (simp724's C1 on
+            // #1328): CRC-valid, but discarded, and its seqnos may be reused. A cursor there
+            // (a token resumed past the cut) has lost what it read, so it is cut before
+            // reading anything more.
+            let cut = self.cut_of(epoch);
+            if cut.is_some_and(|c| last_end > c) {
+                self.cur = None;
+                return Ok(Step::Cut);
+            }
             let stop = if frame >= self.segment_size() {
                 Some(last_end)
             } else {
@@ -295,6 +324,11 @@ impl FeedCursor {
                 let bytes = &self.chunk[at..at + FRAME_SIZE];
                 let cur = self.cur.as_mut().expect("checked above");
                 match cur.dec.decode(bytes)? {
+                    Some(Decoded::Record { offset }) if cut.is_some_and(|c| offset >= c) => {
+                        // A frame past the cut (above): never delivered.
+                        self.cur = None;
+                        return Ok(Step::Cut);
+                    }
                     Some(Decoded::Record { offset }) => {
                         let len = cur.dec.record().len();
                         let end = offset + FrameEncoder::new(epoch, offset).encoded_len(len) as u64;

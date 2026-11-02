@@ -296,6 +296,17 @@ fn a_cursor_past_where_recovery_cut_its_segment_is_cut_never_corrupt() {
         }
     };
     assert_eq!(step, "Cut");
+    // simp724's C1: a cursor resumed at record 4's start, past the cut, where record 4's
+    // frame survived the hole CRC-valid. Recovery discarded it (and the next session may
+    // reuse its seqno): the cursor is cut at once, and never returns it.
+    let mut stale = FeedCursor::open(&vfs, db(), STREAM, DB_ID, ends[2]).unwrap();
+    match stale.step().unwrap() {
+        pigeonhole_wal::Step::Cut => {}
+        pigeonhole_wal::Step::Record { record, .. } => {
+            panic!("a record recovery discarded: {}", seqno_of(&record))
+        }
+        other => panic!("{other:?}"),
+    }
     // A cursor at or before the cut follows the next session.
     let mut before = FeedCursor::open(&vfs, db(), STREAM, DB_ID, ends[1]).unwrap();
     assert_eq!(drain(&mut before).unwrap().0, [10]);
