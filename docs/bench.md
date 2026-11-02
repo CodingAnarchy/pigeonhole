@@ -405,7 +405,7 @@ IVF_BLOCK_CACHE_MB=1024 IVF_NPROBES=16,20,24,28,32 \
 
 - **D306's target, 95% recall@10 at ≤ 10 ms,** is met at nprobe 24, with p99 at 5.4 ms.
 - **Under the default 256 MiB block cache** (half the 512 MB index cached), nprobe 32 took 10.8 ms. The guide's sizing section says to hold the index.
-- **Faiss IVF-Flat:** the same recall within ±0.015 at every nprobe from 4 to 128, 9–10× faster (0.50 ms at nprobe 32). The gap is the engine's per-cell read path (#1283).
+- **Faiss IVF-Flat:** the same recall within ±0.015 at every nprobe from 4 to 128, 9–10× faster with the index cached (0.50 ms at nprobe 32), up to 22× under the default 256 MiB cache. The gap is the engine's per-cell read path (#1283).
 - **Builds:** `bulk_load` 138 s. 1M inserts at `Buffered` 67 s (insert p50 56 µs, p99 93 µs, p999 415 µs). Faiss 3.3 s.
 
 ## Larger-than-RAM results (this Mac, non-reference)

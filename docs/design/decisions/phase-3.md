@@ -3673,7 +3673,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **The table:** nprobe 16, 20, 28 and 32 gave 92.2, 94.3, 96.7 and 97.4% at p50 2.30, 2.84, 3.92 and 4.47 ms.
   - **`IndexOptions::nprobe`'s default is 24** (it was 16).
 - **Under the default 256 MiB cache** (half the 512 MB index cached), nprobe 32 took 10.8 ms. The guide tells users to size the block cache to the index.
-- **Faiss IVF-Flat (1,000 lists):** equal recall within ±0.015 at every nprobe from 4 to 128, 9–22× faster per query. A profile puts the gap in the engine's per-cell read path (resolver, merging, the value copy), not the distance kernel: #1283, in 1.1.0.
+- **Faiss IVF-Flat (1,000 lists):** equal recall within ±0.015 at every nprobe from 4 to 128, and faster per query: 9–10× with the index cached, up to 22× under the default 256 MiB cache. A profile puts the gap in the engine's per-cell read path (resolver, merging, the value copy), not the distance kernel: #1283, in 1.1.0.
 - **Builds:** `bulk_load` 138 s for 1M. 1M inserts at `Buffered` 67 s, with insert p50, p99 and p999 of 56, 93 and 415 µs. `run_async` matches `run` throughout.
 - **`examples/ivfsift.rs`** and `docs/bench.md` describe the run; `docs/guide/vectors.md` is the guide page.
 

@@ -93,7 +93,7 @@ assert!(index.delete(&42u32.to_be_bytes())?);
 - **Ids are bytes,** at most a row key's length. An insert of an existing id replaces its vector (an upsert).
 - **Every insert and delete is one transaction.** Lists split above twice `target_list_len` (default 1,000) and merge below a quarter of it, each move a transaction too. A search reads one snapshot, so a concurrent split never shows a vector twice or hides it.
 - **`search_f32(q, k)`** returns `Hit { id, distance }`, nearest first. Options:
-  - `nprobe(n)`: the lists probed (default 24);
+  - `nprobe(n)`: the lists probed. It overrides the index's own default, `IndexOptions::nprobe`: 24 for an index created now. Options are fixed when an index is created, so an older index keeps the default it was created with;
   - `snapshot(&s)`;
   - `parallel(n)`;
   - `run_async()`.
@@ -113,9 +113,10 @@ On SIFT1M (1M × 128-dimension `f32`, L2, 10,000 queries; the reference machine,
 | 28 | 96.7% | 3.92 ms | 6.08 ms |
 | 32 | 97.4% | 4.47 ms | 6.75 ms |
 
-- **Recall** follows `nprobe` and the clustering. It matched Faiss IVF-Flat's (1,000 lists) at every `nprobe` measured, from 4 to 128.
+- **Recall depends on the data,** not only on `nprobe`: how clustered your vectors are, and how your queries relate to them. Measure on a sample of your own corpus (exact search gives the ground truth) and pick `nprobe` from that. The default suits data like SIFT1M.
+- **On SIFT1M, recall** follows `nprobe` and the clustering. It matched Faiss IVF-Flat's (1,000 lists) at every `nprobe` measured, from 4 to 128.
 - **Latency** is about linear in `nprobe`: about `nprobe` × list length × the exact search's per-vector cost.
-- **Faiss** answers the same queries 9–10× faster at equal recall (0.50 ms at `nprobe` 32). Most of the gap is the engine's per-cell read path, not the distance arithmetic; [#1283](https://github.com/CodingAnarchy/pigeonhole/issues/1283) works on it.
+- **Faiss** answers the same queries 9–10× faster at equal recall with this index cached (0.50 ms at `nprobe` 32), and up to 22× faster when it isn't (the default 256 MiB cache). Most of the gap is the engine's per-cell read path, not the distance arithmetic; [#1283](https://github.com/CodingAnarchy/pigeonhole/issues/1283) works on it.
 - **The `ivfsift` bench** (`crates/bench/examples/ivfsift.rs`) measures your own build.
 
 ### Sizing the block cache
