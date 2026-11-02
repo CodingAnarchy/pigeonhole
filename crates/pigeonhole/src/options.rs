@@ -672,9 +672,11 @@ impl Options {
     /// **An open that doesn't mention the feed inherits it** (D310's amendment): if the last
     /// open fed, the next one with neither `change_feed` nor
     /// [`change_feed_off`](Self::change_feed_off) feeds the same tables with the same
-    /// retention, so a tool that opens the file between two runs of the app (`phdb load`,
-    /// say) keeps the app's feed history instead of ending it. A new database, or one
-    /// whose last open had the feed off, stays off.
+    /// retention and age, so a tool that opens the file between two runs of the app
+    /// (`phdb load`, say) keeps the app's feed history instead of ending it.
+    /// [`FeedRetention::sync_interval`] is per open: an inherited feed uses the default. A new
+    /// database, one whose last open had the feed off, or one whose fed tables were all
+    /// dropped since, stays off.
     pub fn change_feed(mut self, retention: FeedRetention) -> Self {
         self.change_feed = Some(retention);
         self.feed_off = false;

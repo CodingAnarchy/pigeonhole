@@ -1007,7 +1007,12 @@ impl Engine {
             && options.feed_inherit
             && let Some(last) = &last_session
         {
-            options.feed = Some(last.feed_options(&catalog));
+            // Every table the last session fed dropped since: nothing to feed, so the open
+            // records the feed off rather than a session that feeds no table (cli692).
+            let inherited = last.feed_options(&catalog);
+            if inherited.tables.as_ref().is_none_or(|t| !t.is_empty()) {
+                options.feed = Some(inherited);
+            }
         }
         let feed = if no_writes {
             None

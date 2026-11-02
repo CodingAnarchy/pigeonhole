@@ -65,7 +65,8 @@
 
 ## The inherit amendment (the owner, 2026-11-02)
 - **pigeonhole** (additive): `Options::change_feed_off()`.
-  - **Behaviour:** with neither `change_feed` nor `change_feed_off`, an open inherits the last session's feed settings. With `shards` unset, it inherits the recorded stream count.
+  - **Behaviour:** with neither `change_feed` nor `change_feed_off`, an open inherits the last session's feed settings (retention, age, fed tables; not `sync_interval`, which is per open). If every table it fed was dropped since, the open records the feed off.
+  - **The shard count:** with `shards` unset, an open takes the stream count the last session recorded, and only when that session fed. With no sidecar, or with the feed last off, unset `shards` keeps its old meaning (one per physical core).
 - **pigeonhole-engine:** `EngineOptions::feed_inherit` (default `false`).
 
 ## PR 3b: the public change feed (pigeonhole, additive)

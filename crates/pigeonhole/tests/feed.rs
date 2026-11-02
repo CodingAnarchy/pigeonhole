@@ -330,3 +330,27 @@ fn an_explicit_new_shard_count_expires_the_token() {
     drop(feed);
     db.close().unwrap();
 }
+
+/// cli692 on #1344: if every table the last session fed was dropped since, an open that
+/// doesn't mention the feed has nothing to inherit, and records the feed off.
+#[test]
+fn an_open_inherits_nothing_once_every_fed_table_is_dropped() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("db.phdb");
+    let db = Pigeonhole::open(&path, Options::default().shards(2)).unwrap();
+    tables(&db);
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, fed().feed_tables(["a"])).unwrap();
+    db.drop_table("a").unwrap();
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, Options::default()).unwrap();
+    assert!(
+        db.info().unwrap().feed.is_none(),
+        "no fed table left: the feed is off"
+    );
+    db.close().unwrap();
+    // And the open after that inherits nothing either (it recorded `fed: none`).
+    let db = Pigeonhole::open(&path, Options::default()).unwrap();
+    assert!(db.info().unwrap().feed.is_none());
+    db.close().unwrap();
+}
