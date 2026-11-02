@@ -793,9 +793,10 @@ fn close_reports_a_failed_final_sync(seed: u64) {
     // #1265: every driver must have run its shard before the close, or the close can't wait
     // (a shard nobody has run yet has no driver) and returns `Ok` at once, the outcome
     // going to `closed()` only (`a_close_before_every_shard_ran_returns_ok_at_once`). The
-    // 100 commits can all land on one shard (a new table is one tablet), so a driver thread
-    // the scheduler hasn't started yet, on a loaded CI runner, left its shard un-run. A
-    // driver runs a command only after its first `run_once`.
+    // table's one tablet always goes to shard 1 (`tablet % shards`), so the 100 commits
+    // always run shard 1 and never shard 0: only shard 0's own driver's first `run_once`
+    // marks it, and on a loaded CI runner that thread hadn't started yet. A driver runs a
+    // command only after its first `run_once`.
     for d in &drivers {
         on_driver(d, |_| ()).expect("the driver ran its shard");
     }
@@ -831,18 +832,24 @@ fn close_reports_a_failed_final_sync(seed: u64) {
     assert!(!Engine::inspect_manifest(&vfs, Path::new(DB)).unwrap().clean);
 }
 
-/// #1265's route: a close made before every shard has been run cannot wait (a shard nobody
-/// has run has no driver to wait on), so it returns `Ok` at once, and a failed final sync is
-/// reported only by that shard's `closed()`. Shard 1's driver starts only after the close,
-/// as a driver thread the scheduler hadn't started yet did on CI.
+/// #1265's route, the CI test's exact sequence: a close made before every shard has been run
+/// cannot wait (a shard nobody has run has no driver to wait on), so it returns `Ok` at
+/// once, and a failed final sync is reported only by the shards' `closed()`. The table's
+/// tablet is on shard 1 (`tablet % shards`), so the 100 commits run only shard 1; shard 0's
+/// driver starts only after the close, as a driver thread the scheduler hadn't started yet
+/// did on CI (simp724's R1 on #1384: the other direction hangs the first commit).
 #[test]
 fn a_close_before_every_shard_ran_returns_ok_at_once() {
     let (vfs, gate) = gate::vfs(1356);
     let (db, mut shards) =
         Engine::open_application_owned(Path::new(DB), options(Arc::clone(&vfs), 2)).unwrap();
-    let late = shards.pop().expect("shard 1");
-    let first = driver(shards.pop().expect("shard 0"));
-    on_driver(&first, |_| ()).expect("shard 0 ran");
+    let first = driver(shards.pop().expect("shard 1"));
+    let late = shards.pop().expect("shard 0");
+    let t = table(&db, "t");
+    for i in 0..100 {
+        db.commit(put(&t, &format!("r{i:04}")), Some(Durability::Buffered))
+            .unwrap();
+    }
     gate.fail(&wal(0));
     gate.fail(&wal(1));
     let closed = gate::within(20, {
