@@ -91,6 +91,7 @@ mod cell;
 mod check;
 mod db;
 mod error;
+mod feed;
 mod info;
 mod merge;
 mod metrics;
@@ -164,6 +165,7 @@ pub use check::{
 };
 pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
+pub use feed::{Change, ChangeKind, Commit, Feed, FeedBuilder, FeedToken};
 pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,
     TableInfo,
@@ -176,9 +178,9 @@ pub use options::{
 /// A sorted set of distinct row keys, the input of [`Table::keys`] (D299).
 pub use pigeonhole_engine::KeySet;
 pub use read::{
-    Condition, Hop, KeyRows, KeysPage, KeysPosition, KeysRead, Nearest, Neighbour, RowCells,
-    RowIter, RowPages, RowPosition, RowRead, Scan, ScanCells, ScanPage, ScanPosition, Traversal,
-    Traverse, TraverseStats, ValueFilter,
+    Condition, Hop, KeyRows, KeysPage, KeysPosition, KeysRead, Nearest, NearestPage, Neighbour,
+    RowCells, RowIter, RowPages, RowPosition, RowRead, Scan, ScanCells, ScanPage, ScanPosition,
+    Traversal, Traverse, TraverseStats, ValueFilter,
 };
 pub use recovery::RecoveryStats;
 pub use retry::RetryPolicy;

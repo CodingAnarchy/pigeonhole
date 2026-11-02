@@ -51,6 +51,7 @@ fn hotrow_iteration(t: &pigeonhole::Table, hot: &[u8]) -> (usize, usize, u64, u6
 }
 
 fn main() {
+    measure::fix_hash_seeds();
     let iters: usize = std::env::args()
         .nth(1)
         .map_or(2000, |s| s.parse().expect("ITERATIONS"));

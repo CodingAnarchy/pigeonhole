@@ -51,6 +51,14 @@ pub pigeonhole::Aggregation::Quantiles(pigeonhole::QuantileParams)
 pub pigeonhole::Aggregation::Set
 pub pigeonhole::Aggregation::Sum
 pub pigeonhole::Aggregation::SumF64
+#[non_exhaustive] pub enum pigeonhole::ChangeKind
+pub pigeonhole::ChangeKind::DeleteCell
+pub pigeonhole::ChangeKind::DeleteColumn
+pub pigeonhole::ChangeKind::DeleteFamily
+pub pigeonhole::ChangeKind::Merge
+pub pigeonhole::ChangeKind::Put
+impl pigeonhole::ChangeKind
+pub fn pigeonhole::ChangeKind::is_delete(self) -> bool
 #[non_exhaustive] pub enum pigeonhole::Compaction
 pub pigeonhole::Compaction::FifoByTime
 pub pigeonhole::Compaction::Leveled
@@ -92,6 +100,7 @@ pub pigeonhole::ErrorCode::Conflict = 14
 pub pigeonhole::ErrorCode::Corruption = 2
 pub pigeonhole::ErrorCode::FamilyExists = 11
 pub pigeonhole::ErrorCode::FamilyNotFound = 10
+pub pigeonhole::ErrorCode::FeedExpired = 31
 pub pigeonhole::ErrorCode::InvalidArgument = 19
 pub pigeonhole::ErrorCode::Io = 1
 pub pigeonhole::ErrorCode::KeyTooLarge = 16
@@ -235,6 +244,15 @@ pub fn pigeonhole::CellRef<'a>::timestamp(&self) -> u64
 pub fn pigeonhole::CellRef<'a>::to_owned(&self) -> pigeonhole::Cell
 pub fn pigeonhole::CellRef<'a>::typed(&self) -> pigeonhole::Value<'_>
 pub fn pigeonhole::CellRef<'a>::value(&self) -> &[u8]
+pub struct pigeonhole::Change
+impl pigeonhole::Change
+pub fn pigeonhole::Change::family(&self) -> &str
+pub fn pigeonhole::Change::kind(&self) -> pigeonhole::ChangeKind
+pub fn pigeonhole::Change::qualifier(&self) -> &[u8]
+pub fn pigeonhole::Change::row(&self) -> &[u8]
+pub fn pigeonhole::Change::table(&self) -> &str
+pub fn pigeonhole::Change::timestamp(&self) -> u64
+pub fn pigeonhole::Change::value(&self) -> core::option::Option<pigeonhole::Value<'_>>
 #[non_exhaustive] pub struct pigeonhole::CheckCounts
 pub pigeonhole::CheckCounts::blob_files: u64
 pub pigeonhole::CheckCounts::blob_pointers: u64
@@ -260,6 +278,11 @@ pub pigeonhole::CheckReport::regions: alloc::vec::Vec<pigeonhole::Region>
 pub pigeonhole::CheckReport::wal: alloc::vec::Vec<pigeonhole::WalFile>
 impl pigeonhole::CheckReport
 pub fn pigeonhole::CheckReport::is_ok(&self) -> bool
+pub struct pigeonhole::Commit
+impl pigeonhole::Commit
+pub fn pigeonhole::Commit::changes(&self) -> &[pigeonhole::Change]
+pub fn pigeonhole::Commit::seqno(&self) -> u64
+pub fn pigeonhole::Commit::timestamp(&self) -> u64
 #[non_exhaustive] pub struct pigeonhole::CommitInfo
 pub pigeonhole::CommitInfo::durability: pigeonhole::Durability
 pub pigeonhole::CommitInfo::seqno: u64
@@ -382,6 +405,21 @@ pub pigeonhole::FamilyStorage::levels: alloc::vec::Vec<pigeonhole::LevelInfo>
 impl pigeonhole::FamilyStorage
 pub fn pigeonhole::FamilyStorage::sst_bytes(&self) -> u64
 pub fn pigeonhole::FamilyStorage::ssts(&self) -> u64
+pub struct pigeonhole::Feed
+impl pigeonhole::Feed
+pub fn pigeonhole::Feed::next(&mut self, core::time::Duration) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
+pub fn pigeonhole::Feed::oldest_retained(&self) -> core::option::Option<u64>
+pub fn pigeonhole::Feed::token(&self) -> pigeonhole::FeedToken
+pub fn pigeonhole::Feed::try_next(&mut self) -> pigeonhole::Result<core::option::Option<&pigeonhole::Commit>>
+pub struct pigeonhole::FeedBuilder
+impl pigeonhole::FeedBuilder
+pub fn pigeonhole::FeedBuilder::from_oldest(self) -> Self
+pub fn pigeonhole::FeedBuilder::from_snapshot(self, &pigeonhole::Snapshot) -> Self
+pub fn pigeonhole::FeedBuilder::open(self) -> pigeonhole::Result<pigeonhole::Feed>
+pub fn pigeonhole::FeedBuilder::prefix(self, &[u8]) -> Self
+pub fn pigeonhole::FeedBuilder::resume(self, &pigeonhole::FeedToken) -> Self
+pub fn pigeonhole::FeedBuilder::table(self, &pigeonhole::Table) -> Self
+pub fn pigeonhole::FeedBuilder::visible(self) -> Self
 #[non_exhaustive] pub struct pigeonhole::FeedInfo
 pub pigeonhole::FeedInfo::held_blob_bytes: u64
 pub pigeonhole::FeedInfo::retained_wal_bytes: u64
@@ -389,9 +427,15 @@ pub pigeonhole::FeedInfo::retention_bytes: u64
 #[non_exhaustive] pub struct pigeonhole::FeedRetention
 pub pigeonhole::FeedRetention::age: core::option::Option<core::time::Duration>
 pub pigeonhole::FeedRetention::bytes: u64
+pub pigeonhole::FeedRetention::sync_interval: core::option::Option<core::time::Duration>
 impl pigeonhole::FeedRetention
 pub fn pigeonhole::FeedRetention::age(self, core::time::Duration) -> Self
 pub fn pigeonhole::FeedRetention::bytes(u64) -> Self
+pub fn pigeonhole::FeedRetention::sync_interval(self, core::time::Duration) -> Self
+pub struct pigeonhole::FeedToken(_)
+impl pigeonhole::FeedToken
+pub fn pigeonhole::FeedToken::as_bytes(&self) -> &[u8]
+pub fn pigeonhole::FeedToken::from_bytes(impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
 #[non_exhaustive] pub struct pigeonhole::FileFeatures
 pub pigeonhole::FileFeatures::compat: u64
 pub pigeonhole::FileFeatures::incompat: u64
@@ -477,6 +521,15 @@ impl pigeonhole::Nearest<'_>
 pub fn pigeonhole::Nearest<'_>::parallel(self, usize) -> Self
 pub fn pigeonhole::Nearest<'_>::run(self) -> pigeonhole::Result<alloc::vec::Vec<pigeonhole::Neighbour>>
 pub async fn pigeonhole::Nearest<'_>::run_async(self) -> pigeonhole::Result<alloc::vec::Vec<pigeonhole::Neighbour>>
+pub fn pigeonhole::Nearest<'_>::run_within(self, u64) -> pigeonhole::Result<pigeonhole::NearestPage>
+pub async fn pigeonhole::Nearest<'_>::run_within_async(self, u64) -> pigeonhole::Result<pigeonhole::NearestPage>
+pub struct pigeonhole::NearestPage
+impl pigeonhole::NearestPage
+pub fn pigeonhole::NearestPage::bytes(&self) -> u64
+pub fn pigeonhole::NearestPage::cut_by_budget(&self) -> bool
+pub fn pigeonhole::NearestPage::into_neighbours(self) -> alloc::vec::Vec<pigeonhole::Neighbour>
+pub fn pigeonhole::NearestPage::neighbours(&self) -> &[pigeonhole::Neighbour]
+pub fn pigeonhole::NearestPage::next_bytes(&self) -> core::option::Option<u64>
 #[non_exhaustive] pub struct pigeonhole::Neighbour
 pub pigeonhole::Neighbour::distance: f64
 pub pigeonhole::Neighbour::qualifier: alloc::vec::Vec<u8>
@@ -797,6 +850,7 @@ pub struct pigeonhole::Table
 impl pigeonhole::Table
 pub fn pigeonhole::Table::families(&self) -> alloc::vec::Vec<&str>
 pub fn pigeonhole::Table::family_info(&self, &str) -> core::option::Option<pigeonhole::FamilyInfo>
+pub fn pigeonhole::Table::feed(&self) -> pigeonhole::FeedBuilder
 pub fn pigeonhole::Table::get(&self, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>
 pub fn pigeonhole::Table::get_async(&self, &[u8], &str, &[u8]) -> pigeonhole::nonblocking::GetFuture
 pub fn pigeonhole::Table::get_at(&self, &pigeonhole::Snapshot, &[u8], &str, &[u8]) -> pigeonhole::Result<core::option::Option<pigeonhole::CellRef<'_>>>

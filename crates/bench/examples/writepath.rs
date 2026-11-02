@@ -40,6 +40,7 @@ use pigeonhole::{Family, Pigeonhole, Table};
 const VALUE: [u8; 100] = [7; 100];
 
 fn main() {
+    measure::fix_hash_seeds();
     let mut args = std::env::args().skip(1);
     let usage = "usage: writepath SHAPE ITERATIONS DIR";
     let shape = args.next().expect(usage);

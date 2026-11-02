@@ -424,7 +424,7 @@ impl WalCounters {
 }
 
 /// A stream's change-feed marks (D310), written by the stream on its shard thread and read
-/// from any thread: the blob GC horizon and `DatabaseInfo` use them.
+/// from any thread: the blob GC horizon, `DatabaseInfo` and the feed reader use them.
 ///
 /// ```
 /// use std::path::Path;
@@ -449,6 +449,7 @@ pub struct FeedMarks {
     head: AtomicU32,
     floor: AtomicU32,
     retained_bytes: AtomicU64,
+    checkpoint: AtomicU64,
 }
 
 impl FeedMarks {
@@ -470,6 +471,21 @@ impl FeedMarks {
     /// The bytes of the segments the checkpoint passed and retention keeps.
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The stream's checkpoint: replay would start here, so nothing before it is needed
+    /// again. Stored (Release) by [`Wal::checkpoint`](crate::Wal::checkpoint), which the
+    /// engine calls only once the records it passes are unneeded, and by a reopen from the
+    /// checkpoint it recovered from. A feed reader that loads it (Acquire) sees what the
+    /// engine knew when it moved the checkpoint: a cross-shard PREPARE it passed was aborted
+    /// or decided and settled (D310 PR 3; simp724's rule for held PREPAREs). Never goes down.
+    /// Kept only with retention on (the default `Lsn` otherwise).
+    pub fn checkpoint(&self) -> Lsn {
+        Lsn(self.checkpoint.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_checkpoint(&self, at: Lsn) {
+        self.checkpoint.fetch_max(at.0, Ordering::AcqRel);
     }
 }
 
@@ -1539,6 +1555,11 @@ impl WalStream {
         }
     }
 
+    /// The stream's feed marks, for the crate's own updates.
+    pub(crate) fn feed_marks_ref(&self) -> &FeedMarks {
+        &self.marks
+    }
+
     /// Takes the change-feed settings of `opts` (D310): retention and the feed session. Called
     /// before the stream's first segment.
     pub(crate) fn configure_feed(&mut self, opts: &WalOptions) {
@@ -2138,6 +2159,9 @@ impl Wal for WalStream {
         // The current segment is never recycled, so the checkpoint epoch never exceeds it.
         let epoch = upto.epoch().min(self.epoch);
         self.checkpoint_epoch = self.checkpoint_epoch.max(epoch);
+        if self.retain != 0 {
+            self.marks.set_checkpoint(upto);
+        }
         self.update_retain_floor(None);
         self.publish_recyclable();
         Ok(())

@@ -284,41 +284,67 @@ fn combined_inputs_are_settled_before_the_wal_and_a_large_operand_is_refused() {
 }
 
 #[test]
-fn a_set_keeps_checkpoints_up_to_256_kib() {
-    // The owner's stopgap (D298 PR 5b): a set is exempt from the 4 KiB checkpoint cap up to
-    // 256 KiB. With checkpoints after every step, a get of an 8 KB set leaves one; a get of a
-    // 400 KB set never does.
+fn a_set_checkpoint_needs_operands_of_a_quarter_of_its_value() {
+    // D298 §4.3 (amended, R = 4): with checkpoints after every step, a get keeps its fold only
+    // when the operands it folded sum to at least a quarter of the set it produced. The base
+    // the fold starts from is not an operand: onto an 8 KB set, two one-element inputs leave
+    // no checkpoint, and an input of 2,000 new elements leaves one. Onto a 400 KB hub, a few
+    // small inputs never do, so a hub can't flood the memtable with copies of itself.
     let vfs = SimVfs::new(5);
     let db = Engine::open(Path::new(DB), options(&vfs, 1)).unwrap();
     let info = db
         .create_table("t", &[("s".into(), set_family().blob_threshold(1 << 30))])
         .unwrap();
     let (t, s) = (info.id, info.family("s").unwrap().id);
-    for (row, n, kept) in [
-        (&b"small"[..], 4_000u32, true),
-        (&b"large"[..], 200_000, false),
+    // Scattered, so every container is an array: about 2 bytes per element.
+    let scattered = |n: u32, salt: u32| -> BTreeSet<u32> {
+        (0..n)
+            .map(|i| i.wrapping_mul(2_654_435_761).wrapping_add(salt))
+            .collect()
+    };
+    let one = |add, x| vec![operand(add, x), operand(!add, x + 1)];
+    let mut wide = Vec::new();
+    let new: Vec<u32> = scattered(2_000, 1).into_iter().collect();
+    roaring::encode_operand(&mut wide, &new, &[]);
+    for (row, base, ops, kept) in [
+        (&b"few"[..], scattered(4_000, 0), one(true, 7), false),
+        (&b"wide"[..], scattered(4_000, 0), vec![wide], true),
+        (&b"hub"[..], scattered(200_000, 0), one(true, 7), false),
     ] {
-        // Scattered, so every container is an array: about 2 bytes per element.
-        let set: BTreeSet<u32> = (0..n).map(|i| i.wrapping_mul(2_654_435_761)).collect();
+        let mut state = base.clone();
+        for op in &ops {
+            let (a, r) = roaring::parse_operand(op).unwrap();
+            r.iter().for_each(|x| {
+                state.remove(&x);
+            });
+            state.extend(a.iter());
+        }
+        let op_bytes: usize = ops.iter().map(|o| o.len()).sum();
+        let stored = encode(&state).len();
+        assert_eq!(
+            op_bytes * 4 >= stored,
+            kept,
+            "{row:?}: {op_bytes} of {stored} bytes"
+        );
         let mut wb = WriteBatch::new();
-        wb.put(t, s, row, b"q", None, ValueRef::Bytes(&encode(&set)))
-            .unwrap();
-        wb.merge(t, s, row, b"q", ValueRef::Bytes(&operand(true, 7)))
+        wb.put(t, s, row, b"q", None, ValueRef::Bytes(&encode(&base)))
             .unwrap();
         db.commit(wb, None).unwrap();
-        let mut wb = WriteBatch::new();
-        wb.merge(t, s, row, b"q", ValueRef::Bytes(&operand(false, 7)))
-            .unwrap();
-        db.commit(wb, None).unwrap();
+        for op in &ops {
+            let mut wb = WriteBatch::new();
+            wb.merge(t, s, row, b"q", ValueRef::Bytes(op)).unwrap();
+            db.commit(wb, None).unwrap();
+        }
         let before = db.counter_checkpoints();
-        db.get_latest(t, s, row, b"q").unwrap().unwrap();
+        let got = db.get_latest(t, s, row, b"q").unwrap().unwrap();
+        assert!(got.value() == ValueRef::Bytes(&encode(&state)), "{row:?}");
         db.get_latest(t, s, row, b"q").unwrap().unwrap();
         // The shard keeps a checkpoint the get sent a moment later, on its own thread.
         let after = settled_checkpoints(&db, before, kept);
         if kept {
-            assert!(after.0 > before.0, "{n}: {before:?} -> {after:?}");
+            assert!(after.0 > before.0, "{row:?}: {before:?} -> {after:?}");
         } else {
-            assert_eq!(after, before, "{n}: none sent");
+            assert_eq!(after, before, "{row:?}: none sent");
         }
     }
     db.close().unwrap();

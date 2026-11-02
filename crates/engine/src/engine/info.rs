@@ -97,6 +97,29 @@ pub struct LevelStorage {
 }
 
 impl Engine {
+    /// The change feed's frontier (D310): the highest seqno every commit at or below which
+    /// is applied, in its stream file (the written watermark, shm `WRITTEN`) and, with
+    /// `durable`, durable at its level. Without the feed it equals the visible (or durable)
+    /// seqno, since nothing is held unwritten.
+    pub fn feed_frontier(&self, durable: bool) -> pigeonhole_format::Seqno {
+        self.inner.shared.shm.written_seqno(durable)
+    }
+
+    /// Subscribes to the committed changes of some tables (D310): a [`FeedReader`] that
+    /// delivers whole commits in seqno order. The writer only: a reader process can't
+    /// subscribe yet (`Unsupported`, D310 PR 4). The tables must be fed by this open
+    /// (`FeedOptions::tables`); `InvalidArgument` otherwise, or with the feed off.
+    ///
+    /// [`FeedReader`]: crate::FeedReader
+    pub fn feed(&self, spec: crate::FeedSpec) -> crate::Result<crate::FeedReader> {
+        if self.inner.is_reader() {
+            return Err(crate::Error::Unsupported(
+                "a change feed in a reader process (D310 PR 4)",
+            ));
+        }
+        crate::feed_reader::FeedReader::open(std::sync::Arc::clone(&self.inner.shared), spec)
+    }
+
     /// What the database holds and how it is stored (ICR 0047). Cheap: reads the current
     /// catalog, no file I/O beyond the file's length.
     pub fn info(&self) -> crate::Result<DbInfo> {

@@ -99,7 +99,7 @@ pub enum Condition {
 }
 
 mod budget;
-pub use budget::{KeysPage, KeysPosition, ScanPage, ScanPosition};
+pub use budget::{KeysPage, KeysPosition, NearestPage, ScanPage, ScanPosition};
 
 /// A read's selected families, resolved: inline for up to four.
 pub(crate) type FamilyIds = SmallVec<[FamilyId; 4]>;
@@ -2305,6 +2305,46 @@ impl Nearest<'_> {
             )
         })?;
         Ok(neighbours(reduced.items))
+    }
+
+    /// [`run`](Nearest::run), cut to a byte budget (D308 PR 3, #1302): the nearest
+    /// neighbours, in `run`'s order, while their sizes fit `bytes`. A neighbour counts its
+    /// row key, its qualifier and 16 bytes (D308 §2).
+    ///
+    /// The search ranks as `run` does and reads as much, then cuts the ranked list. A first
+    /// neighbour larger than the budget, or a budget of 0, gives an empty page marked
+    /// [`cut_by_budget`](NearestPage::cut_by_budget) with its
+    /// [`next_bytes`](NearestPage::next_bytes). There's no resume position: a larger
+    /// budget, or a larger `k`, returns more.
+    ///
+    /// ```
+    /// use pigeonhole::{Element, Family, Metric, Options, Pigeonhole, VectorSpec};
+    ///
+    /// # fn main() -> pigeonhole::Result<()> {
+    /// # let dir = pigeonhole::doc_support::temp_dir();
+    /// let db = Pigeonhole::open(dir.join("app.phdb"), Options::default())?;
+    /// let spec = VectorSpec::new(2, Element::F32, Metric::L2)?;
+    /// let t = db.table("docs")?.family("emb", Family::vector(spec)).create_if_missing()?;
+    /// for (row, v) in [(&b"a"[..], [0.0, 1.0]), (b"b", [0.0, 2.0]), (b"c", [0.0, 3.0])] {
+    ///     t.mutate(row).put_vector_f32("emb", b"", &v).commit()?;
+    /// }
+    /// // Each neighbour is its 1-byte row key, an empty qualifier and 16 bytes: 17.
+    /// let page = t.scan_prefix(b"").family("emb").nearest_f32(&[0.0, 0.0], 3).run_within(40)?;
+    /// assert_eq!(page.neighbours().len(), 2);
+    /// assert_eq!((page.bytes(), page.cut_by_budget(), page.next_bytes()), (34, true, Some(17)));
+    /// # db.close()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn run_within(self, bytes: u64) -> Result<NearestPage> {
+        Ok(NearestPage::cut(self.run()?, bytes))
+    }
+
+    /// [`run_within`](Nearest::run_within) on [`run_async`](Nearest::run_async): the same
+    /// page.
+    #[cfg(feature = "async")]
+    pub async fn run_within_async(self, bytes: u64) -> Result<NearestPage> {
+        Ok(NearestPage::cut(self.run_async().await?, bytes))
     }
 
     /// [`Nearest::run`] as a future that never blocks on a block it can fetch: the input is

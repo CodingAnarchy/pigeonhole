@@ -3471,7 +3471,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Result:** one `Put` at the newest operand's key (as a read's fold or a D291 checkpoint would be keyed), with `op.finish(Some(base), operands)`. It is separated at the output like any put past the threshold, and the old base's blob bytes are counted dropped.
   - **A separated base** is read through `JobContext::base_blobs`, which the engine sets for kinds on `folds_separated_bases` when the view has blob files. A base that can't be read, or that the operator refuses, is not folded: the run is combined as before and the base kept, so a read keeps failing on a bad base (#21).
   - **D73 and D186 are amended** for aggregate families: a bucket is one `(column, timestamp)`, so D73's objections (deletes, TTL and `time_range` at different timestamps inside a run) don't arise. D73 stays for standard families.
-- **§4.3, the checkpoint cap:** a counter get's fold is sent as a D291 checkpoint only when its stored value is at most `MAX_CHECKPOINT_BYTES` (4 KiB): every scalar, an HLL sketch, and most histograms and quantile sketches. A larger value would cost the memtable more than its fold saves; §4.2 keeps such a cell's reads short instead, which is what the PR 3 measurement needed ("must not come without §4.2"). 5b measures the cap with `hotagg` sets.
+- **§4.3, the checkpoint cap:** a counter get's fold is sent as a D291 checkpoint only when its stored value is at most `MAX_CHECKPOINT_BYTES` (4 KiB): every scalar, an HLL sketch, and most histograms and quantile sketches. A larger value would cost the memtable more than its fold saves; §4.2 keeps such a cell's reads short instead, which is what the PR 3 measurement needed ("must not come without §4.2"). 5b measures the cap with `hotagg` sets. **Amended** (owner, 2026-10-31): the cap is now proportional to the operands a fold read, below.
 
 **Tests (PR 5a).**
 - **Compaction:**
@@ -3517,6 +3517,21 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 
 - **Engine tests for the persist paths:** a commit's inputs combined before the WAL and replayed after a reopen; a large operand refused (operands are never separated); compaction's combined operand settled and its fold onto a base (`compaction.rs`); the stopgap (an 8 KB set keeps its checkpoint, a 400 KB one sends none).
 - **Still to come:** a box run of the hub case, the common neighbours of two 2M-element sets, against perf287's ≤ 2 ms estimate.
+
+**Amendment (owner, 2026-10-31; perf2, perf287 reviewed): §4.3's cap is proportional (R = 4).** It replaces 5a's 4 KiB cap and 5b's 256 KiB set stopgap.
+- **Rule:** a counter get's fold is kept as a D291 checkpoint when
+  1. it read at least `counter_checkpoint_steps` entries (unchanged), **and**
+  2. the summed lengths of the `Merge` operands it folded are at least `stored.len() / 4` (`read::CHECKPOINT_BYTES_RATIO`).
+- **The base is not an operand.** The put or checkpoint the fold starts from adds nothing to those bytes, only the operands above it do. Otherwise every fold from a large checkpoint would pass `stored / 4` and checkpoint again (perf287's review).
+- **A run counts only its last group.** When a counter column's operands span several timestamps, the operand bytes count only the last group folded (the one the fold record is set from), as `steps` already does (D291's per-group accounting). A run under-counts and keeps fewer checkpoints, which is the safe direction for the memtable bound (perf287's review of #1310).
+- **What it bounds:**
+  - **Memtable bytes:** at most 4 checkpoint bytes per operand byte written, whatever the value's size, so a multi-MB hub can't flood the memtable with copies of itself.
+  - **Reads:** a read decodes its checkpoint and folds under `stored / 4` operand bytes onto it (5b's linear fold), O(S), which a get of S bytes costs anyway.
+  - **One rule for every kind:** a small value (`stored ≤ 4 × steps × operand size`) behaves as before, with `steps` deciding. A dense HLL sketch (3,076 bytes) needs 769 operand bytes, about 96 one-element inputs of 8 bytes, under the default 128 steps. A 3.7 KB quantile sketch keeps its checkpoints too, so §4.3's warning about large sketches goes away.
+- **Implementation:** the resolver's counter group adds each folded operand's length (`CellResolver::counter_fold_operand_bytes`, set with the fold record), and `note_checkpoint` compares on its cold path.
+- **Tests:**
+  - `it/set_aggregates.rs`: onto an 8 KB set, two one-element inputs leave no checkpoint and an input of 2,000 new elements leaves one; onto a 400 KB hub, small inputs leave none. Each case asserts its own operand bytes against `stored / 4`.
+  - `it/bloom_aggregates.rs`: a 4 KiB filter with 2 inputs leaves none, and with 200 inputs one, past the old cap.
 
 <a id="d299"></a>
 ## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)
@@ -3803,7 +3818,8 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **PRs:**
   1. The engine (#1264).
   2. The public API (#1281).
-  3. The follow-ups (#1284, in progress): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
+  3. The follow-ups (#1284): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
+  4. `Nearest::run_within` and `run_within_async` → `NearestPage` (#1302, D308 rev 2's PR 3): `run()`'s ranked list cut to the budget, with no resume position.
 - **Deferred:** `read_within_async` (#1286, Post-1.0).
 
 <a id="d309"></a>
@@ -3921,6 +3937,87 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **The ring.** `WalStream`'s recyclable predicate excludes the newest `retain_segments` segments past the checkpoint, and those `trim_retained` hasn't aged out. Seal times come from the maintenance clock, at the first trim after a rollover. Segments adopted at open count from the open.
 - **The never-stall fallback** takes the oldest retained slot ahead of a blank slot or an inline growth, never at open. It's counted in `WalCounters::retained_taken`.
 - **The blob horizon.** With the feed on, the manifest writer turns a `DropBlobFile` of a file that still has live bytes into a live-0 `PutBlobFile`, plus a hold. The hold records each stream's head epoch, which `FeedMarks::head` stores (Release) as a segment starts, before any of its records. Maintenance drops a held file once every stream's floor, the oldest non-recyclable epoch, has passed its head; the drop is computed against the catalog at commit. An open holds live-0 files again, at the new heads, and doesn't sweep them.
-- **The sidecar.** The session's entry is written and synced after the pager's `finish` and before any WAL segment. It carries `opened_at` (the sequence before any root commit of the open), the retention, the stream count and the fed tables. The pager's root-commit observer appends a Root entry, unsynced, after each durable root commit, so a lost append gives the safe, spurious expiry. A torn tail is cut off before the next append.
+- **The sidecar.** The session's entry is written and synced after the pager's `finish` and before any WAL segment. It carries `opened_at` (the sequence before any root commit of the open), the retention, the stream count and the fed tables. The pager's root-commit observer appends a Root entry after each durable root commit, so a lost append gives the safe, spurious expiry. A torn tail is cut off before the next append. (PR 3a's fix A syncs each append; see below.)
 - **The clean close** skips `forget_checkpoints` and the WAL files' removal with the feed on. Their checkpoints sit at their ends, so the next open replays nothing and adopts the retained slots.
+
+**How PR 2 builds it** (call 3: the lazy flush, not the raise):
+- **The hold.** Each shard's `written` watermark (shm layout 7, FORMAT §11.2) holds the lowest seqno whose fed `Durability::None` record is still only in the stream's buffer. The shard stores it (Release) while the seqno is still held, so it never lowers the frontier:
+  - a single's seqno, under its group's `pending`, before the group's apply publishes;
+  - a decision's apply seqno, under `cross_held`, at its record's append;
+  - a participant's PREPARE, at the apply seqno in `decide_share`, before the share reports applied. The commit id is never held, so it's never used.
+- **The release.** The hold goes to `u64::MAX` once any write passed every held record: a stronger group's, or the lazy flush's. `publish_watermark` checks this with one compare, and `feed_low` is always `u64::MAX` with the feed off.
+- **The lazy flush.** It's a `ClockTimer` (`ShardMsg::FeedFlush`) armed only when the hold goes from empty to held, *T* = 10 ms. A sleeping timer is what engine-owned drivers park until and what `EngineShard::next_deadline` / `Shard::next_wakeup` report, so an application-owned shard wakes for it. An idle shard has no deadline. On a frozen simulated clock the timer gives up, and the shard's kick runs the flush. A record behind a held segment header re-arms the timer.
+- **Which records the feed needs:**
+  - with `FeedTables::All`, every `None` batch, PREPARE and decision;
+  - with a table list, a batch or PREPARE that writes a listed table (a scan of its mutation headers, with the feed on only), plus every decision.
+- **The frontier.** `ShmRegion::written_seqno(durable)` is the snapshot rule under every shard's `written` too (`Engine::feed_frontier`).
+- **A second hold, `synced`** (offset 24), and only the durable frontier reads it. It covers every fed record its group doesn't sync, `None` and `Buffered` alike: singles, PREPAREs at their apply seqno, and decisions. It's released once a sync passes them.
+  - **Why:** D227 counts a `None` commit durable once applied and a `Buffered` one once written. Without this hold, a `durable()` feed could deliver a change a power loss still undoes (S3; simp724's M1 on #1297 added `Buffered`).
+- **The background sync.** The lazy flush never syncs, so a feed-only background sync (`submit_sync`, never waited on) runs when the synced hold has been held for *T_sync* and no other sync covered it.
+  - **The timer:** armed only on empty to held, with one sync in flight per shard.
+  - **The default:** 100 ms, and 1 s on macOS, where `F_FULLFSYNC` is device-wide (perf287). It's configurable as `FeedOptions::sync_interval_micros` and `FeedRetention::sync_interval`.
+  - **Counted:** `Engine::feed_background_syncs`.
+  - **Effect:** a durable feed on a pure-`Buffered` or pure-`None` fed table lags by about *T_sync* plus a sync.
+- **The M1 invariant** is stated in concurrency.md (the written-hold protocol) and on `Wal::write`.
+
+**How PR 3a builds it** (the writer-process feed, engine-level; PR 3b is the public API):
+- **The cursor.** `pigeonhole-wal`'s `FeedCursor` reads one stream file read-only and live. It follows segment chaining like `Recovery`, but re-reads the segment headers at each stop. `step()` returns:
+  - `Record`, with the segment's `feed_session`;
+  - `End`, for now;
+  - `Gone`, when its segment's slot now holds a newer epoch. A recycled slot is never read as a short log.
+- **The merge** (`FeedReader`, feed_reader.rs). Each poll loads the checkpoint marks, then the frontier F, then the heads, then reads every stream to its end. By M1 every record ≤ F is then read. A stream behind its head waits for its next header.
+  - Commits are keyed: a single by its seqno, a cross-shard commit by its Decision's apply seqno, with its PREPAREs held by id until then.
+  - They're delivered whole, in key order, filtered by table and then row prefix before anything is copied.
+  - A blob pointer is resolved. A blob file the view no longer lists expires the feed (S1); any other read failure, a checksum's included, is an error (simp724 on #1316).
+- **Held PREPAREs** (S2, simp724's rule replacing rev 3's "passes `cross_held`"). An aborted round's PREPARE is dropped once its own stream's checkpoint, loaded before F, has passed it with no Decision read.
+  - **Why it's exact:** a checkpoint passes a decided PREPARE only once its apply seqno is visible, and the Decision was in its file by then. It passes an undecided one only through `mark_aborted`, or through recovery without a Decision. Both were checked in the code.
+  - **The floor fails closed** (simp724's H1 on #1316). The floor never passes the checkpoint's segment, so an undecided share the floor passed but the checkpoint didn't means a bound was broken: the feed expires rather than dropping it.
+  - **A round rule C dropped is remembered** until the floor passes its segment. A Decision for it then expires the feed instead of being passed over as recovery's all-or-nothing.
+  - It applies only once every stream is read to its head.
+- **Start positions.** The shard records, with each checkpoint, the largest key it passed (`ckpt_key`, carried in `Checkpointed`). `Feed::note_checkpoint` stores that pair before the WAL's own checkpoint mark (`FeedMarks::checkpoint`, new).
+  - A start bound B then reads each stream from the latest checkpoint whose key is ≤ B.
+  - The bound is the frontier and checkpoints for `Now`, the seqno for `After` (a snapshot's), and the largest bound every stream's retained history still serves for `Oldest` (coordinator, 2026-11-02; it can expire at once under load).
+  - A stream that already dropped history above B has expired.
+  - An open seeds each stream with `(Lsn(head, 0), next_seqno − 1)`.
+- **Tokens:** a version, the database id, the stream count, the last delivered seqno, the newest session read, and per stream where to read again (the earliest record held or pending) and how far delivered records reached.
+- **Expiry,** each case with its reason:
+  - a shard-count change;
+  - a token's session outside the chain;
+  - retention past a token's position, or `Gone`;
+  - a record of a non-feeding session past the delivered seqno (the mark rule);
+  - delivered records lost (a torn tail, or a restart that lost them, M2);
+  - a vanished blob;
+  - a held share past the floor but not the checkpoint, or a Decision for a round rule C dropped (H1).
+- **Sessions chain** (the mark rule) only through contiguous Root sequences: each one above the one before it, from the session's `opened_at` (simp724 on fix A). A lost middle entry breaks the chain, and so does an entry type this build doesn't know.
+  - **`opened_at`** is the superblock's sequence before any root commit of the open. The root-commit observer is registered right after the session's entry, before replay, recovery's checkpoint edits and repairs. The only earlier root commits are `finish`'s two upgrade commits of an older file; the open records those as the session's own (simp724's Q1 on #1316).
+- **Recovery's all-or-nothing.** A Decision from an earlier session whose shares aren't all in the files is a `Buffered` commit a power loss took a share of. Recovery dropped it whole, and the reader skips it.
+- **Fix A** (coordinator, 2026-11-02, so call 4 holds). Each Root sidecar append is synced.
+  - **When:** after the durable root commit, coalesced to one sync in flight, submitted and never waited on (perf287).
+  - **How:** through the VFS's `sync_all`, at the pager's durability (`F_FULLFSYNC` on macOS); `sync_all` because an append grows the file.
+  - **On failure:** a failed sync ends the session's appends (fail closed, simp724).
+  - **Counted:** `Engine::feed_sidecar_syncs`.
+  - **The directory entry** is made durable on a rewrite of the sidecar too.
+  - **Before fix A:** unsynced entries expired every durable feed at a power loss, against call 4.
+- **Waiting.** `FeedReader::wait` registers in the visible or durable watermark registry with a thread-unpark waker, and bounds each sleep by the hold's interval where the feed's own holds keep F back. It never spins.
+- **Tests:**
+  - `feed_model` is a sweep target: seeded single and cross-shard commits at every durability, flushes, clean reopens, power losses and unsynced bursts, with a durable and a visible subscriber resuming from tokens. After each power loss the reopen flushes (a root commit) before the tokens resume, and a durable token must continue.
+  - `it/feed_reader.rs` covers the start kinds, filtering, tokens across a reopen, expiry, and rule C both ways.
+  - `wal/tests/feed_cursor.rs` covers the cursor, including a mid-segment hole: it stops where recovery did and then follows the next session's segment (Q2).
+
+**How PR 3b builds it** (pigeonhole's public API, additive; ICR 0106):
+- **Opening:** `Table::feed()` gives a `FeedBuilder`. `.table(&t)` adds tables to the same feed, `.prefix(..)` limits it to a row prefix, and `.visible()` opts out of the durable frontier. The start is the commits after `open()`, or `.from_snapshot(&s)` (after `s.seqno()`), `.from_oldest()` or `.resume(&token)`. `open()` refuses with `InvalidArgument` (feed off, table not fed, bad token) and `Unsupported` (a reader process, until PR 4). An expired start shows at the first `next`, so `open` never consumes a commit.
+- **`Feed`:**
+  - `next(timeout)` and `try_next()` lend `Option<&Commit>`, reused between calls;
+  - `token()` gives a `FeedToken`, whose bytes round-trip through `as_bytes` and `from_bytes`;
+  - `oldest_retained()` reports the oldest retained seqno after an expiry, when known.
+  - **An error ends the feed** (simp724 and cli692 on #1321). Every later call returns the same error, as an expired feed does. The engine reader has already moved past the commit it was delivering, so a retry would skip it. A value that doesn't decode is `Corruption`, never an empty value, and the token then points past that commit. Only the live engine's errors stick (cli692's S2, simp724): an error or an expiry from a reader whose engine a recovery replaced belongs to the superseded generation. The feed then follows the recovery and lets the new engine's reader decide from the token. The old reader, still waiting through the swap, reads the new session's records as outside its history, so its expiry is never the feed's.
+- **Types:**
+  - `Commit`: `seqno`, `timestamp`, `changes`.
+  - `Change`: `table` and `family` by name, `kind`, `row`, `qualifier`, `timestamp`, and `value()` as the read API's `Value` (`None` for deletes).
+  - `ChangeKind`: `Put`, `Merge`, `DeleteCell`, `DeleteColumn`, `DeleteFamily` (a row delete is one per family); `#[non_exhaustive]`.
+  - A family created after the feed opened is named from the current catalog.
+- **`ErrorCode::FeedExpired` = 31** (the coordinator's number). It is mapped in python as the `FeedExpired` exception class and listed in the `.pyi` stubs. The C ABI crate has no code table yet: its future enum takes the numbers from `ErrorCode`.
+- **Automatic recovery** (D265): a feed checks its engine generation on each call (one load). After a swap it resubscribes on the new engine from its own token, so a durable feed continues and a visible one that delivered lost commits expires. After `close()` it fails with `Closed`.
+- **perf287's `debug_assert`** (on #1297): `Feed::needs` asserts that a fed batch decodes. Admission decodes every batch first, so it holds today.
+- **Tests:** `pigeonhole/tests/feed.rs` covers named and typed changes of every kind, a cross-table commit arriving whole, a snapshot start, a token across a reopen, a prefix, the refusals, and expiry across a feed-off open. `tests/recovery.rs` has a durable feed following an automatic recovery, mutation-checked.
 
