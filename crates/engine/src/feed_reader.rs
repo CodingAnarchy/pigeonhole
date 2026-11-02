@@ -743,6 +743,12 @@ impl FeedReader {
                 ));
                 return Ok(None);
             }
+            Step::Cut => {
+                self.expired = Some(expiry(
+                    "records the feed read were lost: a power loss cut the log before them",
+                ));
+                return Ok(None);
+            }
         };
         let item = match record {
             WalRecord::Batch {

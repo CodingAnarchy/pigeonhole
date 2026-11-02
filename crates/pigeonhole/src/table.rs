@@ -611,6 +611,19 @@ impl Table {
         self.core.get(Some(snapshot), row, family, qualifier)
     }
 
+    /// Subscribes to this table's committed changes (D310): [`FeedBuilder::open`] gives a
+    /// [`Feed`] of whole commits, once each, in commit order. The database's change feed must
+    /// be on and follow the table ([`Options::change_feed`](crate::Options::change_feed),
+    /// [`Options::feed_tables`](crate::Options::feed_tables)). [`FeedBuilder::table`] adds
+    /// more tables to the same feed.
+    ///
+    /// [`FeedBuilder::open`]: crate::FeedBuilder::open
+    /// [`Feed`]: crate::Feed
+    /// [`FeedBuilder::table`]: crate::FeedBuilder::table
+    pub fn feed(&self) -> crate::FeedBuilder {
+        crate::FeedBuilder::new(self)
+    }
+
     /// The shard that owns `row` right now ([`Shard::index`](crate::Shard::index)), for
     /// application-owned mode: a thread driving a shard can commit the rows that shard owns,
     /// so its writes run on its own shard with no handoff (the spec's inline local writes).

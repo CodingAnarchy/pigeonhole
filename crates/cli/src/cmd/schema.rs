@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use pigeonhole::{
-    Aggregation, BloomParams, Compaction, Compression, Family, FamilyInfo, HistogramParams,
-    Priority, QuantileParams,
+    Aggregation, BloomParams, Compaction, Compression, Element, Family, FamilyInfo,
+    HistogramParams, Metric, Priority, QuantileParams, VectorRef, VectorSpec,
 };
 use serde_json::{Map, Value, json};
 
@@ -48,6 +48,8 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
             }),
             _ => Value::Null,
         },
+        // A vector family's shape (D303): what its every value is, and how it's compared.
+        "vector": f.vector.as_ref().map(vector_spec_json),
         "max_versions": f.max_versions,
         "ttl_micros": f.ttl.map(|t| u64::try_from(t.as_micros()).unwrap_or(u64::MAX)),
         "bloom_bits": f.bloom_bits,
@@ -73,6 +75,64 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
         Value::Object(m) => m,
         _ => unreachable!("json! of an object literal"),
     }
+}
+
+/// A vector family's spec as JSON: `{"dim", "element", "metric"}`.
+pub(crate) fn vector_spec_json(spec: &VectorSpec) -> Value {
+    json!({
+        "dim": spec.dim(),
+        "element": element_name(spec.element()),
+        "metric": match spec.metric() {
+            Metric::L2 => "l2",
+            Metric::InnerProduct => "inner_product",
+            Metric::Cosine => "cosine",
+            Metric::Hamming => "hamming",
+            _ => "unknown",
+        },
+    })
+}
+
+/// An element type's name in JSON (D303, and #1263's halves).
+pub(crate) fn element_name(e: Element) -> &'static str {
+    match e {
+        Element::F32 => "f32",
+        Element::I8 => "i8",
+        Element::Bit => "bit",
+        Element::F16 => "f16",
+        Element::BF16 => "bf16",
+        _ => "unknown",
+    }
+}
+
+fn element_from_name(name: &str) -> Option<Element> {
+    Some(match name {
+        "f32" => Element::F32,
+        "i8" => Element::I8,
+        "bit" => Element::Bit,
+        "f16" => Element::F16,
+        "bf16" => Element::BF16,
+        _ => return None,
+    })
+}
+
+/// The spec [`vector_spec_json`] wrote.
+pub(crate) fn vector_spec_from_json(v: &Value) -> Result<VectorSpec, String> {
+    let dim = v["dim"]
+        .as_u64()
+        .and_then(|d| u32::try_from(d).ok())
+        .ok_or("a vector spec needs its dim")?;
+    let element = v["element"]
+        .as_str()
+        .and_then(element_from_name)
+        .ok_or("a vector spec's element is f32, i8, bit, f16 or bf16")?;
+    let metric = match v["metric"].as_str() {
+        Some("l2") => Metric::L2,
+        Some("inner_product") => Metric::InnerProduct,
+        Some("cosine") => Metric::Cosine,
+        Some("hamming") => Metric::Hamming,
+        _ => return Err("a vector spec's metric is l2, inner_product, cosine or hamming".into()),
+    };
+    VectorSpec::new(dim, element, metric).map_err(|e| e.to_string())
 }
 
 /// The family [`family_json`] describes: its name and a [`Family`] with those options.
@@ -138,8 +198,20 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
         }
         (Some("set"), _) => Family::aggregate(Aggregation::Set),
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
-        (None, _) => Family::default(),
+        (None, _) => match v.get("vector").filter(|s| !s.is_null()) {
+            Some(spec) => Family::vector(
+                vector_spec_from_json(spec).map_err(|m| format!("family {name}: {m}"))?,
+            ),
+            None => Family::default(),
+        },
     };
+    if v.get("vector").is_some_and(|s| !s.is_null())
+        && (v["aggregation"].is_string() || v["counter"].as_bool() == Some(true))
+    {
+        return Err(format!(
+            "family {name}: a vector family can't also be an aggregate"
+        ));
+    }
     let num = |key: &str| v[key].as_u64();
     let bad = |key: &str| format!("family {name}: bad {key}");
     if let Some(n) = num("max_versions") {
@@ -216,11 +288,111 @@ pub(crate) enum JsonValue {
     I64(i64),
     F64(f64),
     Bytes(Vec<u8>),
+    /// A vector (D303): its element and dim as written, and its components.
+    Vector {
+        element: Element,
+        dim: u32,
+        components: Components,
+    },
+}
+
+/// A JSON vector's components, by element.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Components {
+    /// `f32`, `f16` and `bf16`: the values, exact (a half widens exactly, and writing it back
+    /// with `put_vector_f32` rounds to the same bits).
+    Floats(Vec<f32>),
+    /// `i8`.
+    Ints(Vec<i8>),
+    /// Bit vectors' packed bytes.
+    Bits(Vec<u8>),
+}
+
+/// A vector value as JSON: `{"vector": {"dim", "element", "values": [...]}}`, or for a bit
+/// vector `{"vector": {"dim", "element": "bit", "base64": "..."}}` (the spec's key order). Floats are written as
+/// the `f64`s they widen to exactly, so a dump and load round-trips every bit; `None` for a
+/// vector of an element this build doesn't name.
+pub(crate) fn vector_json(v: &VectorRef<'_>) -> Value {
+    let element = v.element();
+    let body = match element {
+        Element::Bit => json!({
+            "dim": v.dim(),
+            "element": "bit",
+            "base64": base64_encode(v.as_bytes()),
+        }),
+        Element::I8 => json!({
+            "dim": v.dim(),
+            "element": "i8",
+            "values": v.as_bytes().iter().map(|b| *b as i8).collect::<Vec<_>>(),
+        }),
+        _ => match v.to_f32_vec() {
+            Some(xs) => json!({
+                "dim": v.dim(),
+                "element": element_name(element),
+                "values": xs.iter().map(|x| f64::from(*x)).collect::<Vec<_>>(),
+            }),
+            None => json!({ "dim": v.dim(), "element": "unknown" }),
+        },
+    };
+    json!({ "vector": body })
+}
+
+/// The vector [`vector_json`] wrote (the object under `"vector"`).
+fn vector_from_json(v: &Value) -> Result<JsonValue, String> {
+    let element = v["element"]
+        .as_str()
+        .and_then(element_from_name)
+        .ok_or("a vector's element is f32, i8, bit, f16 or bf16")?;
+    let dim = v["dim"]
+        .as_u64()
+        .and_then(|d| u32::try_from(d).ok())
+        .ok_or("a vector needs its dim")?;
+    let components = if element == Element::Bit {
+        let b = v["base64"]
+            .as_str()
+            .and_then(base64_decode)
+            .ok_or("a bit vector's bits are base64")?;
+        Components::Bits(b)
+    } else {
+        let values = v["values"].as_array().ok_or("a vector needs its values")?;
+        if element == Element::I8 {
+            Components::Ints(
+                values
+                    .iter()
+                    .map(|x| {
+                        x.as_i64()
+                            .and_then(|n| i8::try_from(n).ok())
+                            .ok_or("an i8 vector's values are integers from -128 to 127")
+                    })
+                    .collect::<Result<_, _>>()?,
+            )
+        } else {
+            Components::Floats(
+                values
+                    .iter()
+                    .map(|x| {
+                        x.as_f64()
+                            .map(|f| f as f32)
+                            .filter(|f| f.is_finite())
+                            .ok_or("a vector's values are finite numbers")
+                    })
+                    .collect::<Result<_, _>>()?,
+            )
+        }
+    };
+    Ok(JsonValue::Vector {
+        element,
+        dim,
+        components,
+    })
 }
 
 /// The value [`value_json`](super::dump::value_json) wrote: `{"i64": n}`, `{"f64": x}`,
 /// `{"f64_bits": n}`, or bytes ([`bytes_json`]).
 pub(crate) fn value_from_json(v: &Value) -> Result<JsonValue, String> {
+    if let Some(x) = v.get("vector") {
+        return vector_from_json(x);
+    }
     if let Some(x) = v.get("i64") {
         return x
             .as_i64()

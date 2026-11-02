@@ -200,8 +200,18 @@ pub(crate) fn may_hold_purgeable(
 /// A lone SST, or a run already at the last level, is rewritten rather than moved or left
 /// alone when `purgeable` says one of its SSTs may hold entries a bottommost rewrite purges
 /// ([`may_hold_purgeable`]): a full compaction leaves nothing purgeable (#805, #820, D268).
-/// The caller answers no for a slot the same full compaction already rewrote, so a rewrite
-/// whose output still matches does not repeat.
+///
+/// **Once per request** (#1313): with `rewritten`, the same full compaction already rewrote
+/// this slot. A slot that is then one run at the last level is left as it is, whichever reason
+/// would rewrite it again: purgeable entries, rows outside the tablet, or a lone SST above one
+/// piece. A rewrite already produced that run, so another one may produce it again, and a full
+/// compaction runs until no slot plans a task. For pieces, the plan judges an SST by its whole
+/// length (index, filters and footer included), while the sink cuts by its data. An SST whose
+/// data fits a piece but whose whole length is just over it was rewritten into itself about once
+/// a millisecond, for as long as the `compact()` ran. New data flushed meanwhile makes the slot
+/// more than one run, and it compacts again. The sink now cuts by the whole length too (#1324);
+/// what remains is an output whose last row overruns its piece's slack, which only this guard
+/// bounds (#1351).
 ///
 /// A lone SST is also rewritten, not moved, when it is larger than one output piece
 /// (`output_piece_bytes` at `target`): the rewrite cuts it into pieces that pack below one
@@ -219,6 +229,7 @@ pub(crate) fn plan_full(
     last_level: u8,
     busy: &[SstId],
     rewrite: bool,
+    rewritten: bool,
     target: u64,
     mut purgeable: impl FnMut(&SstMeta) -> bool,
 ) -> Option<CompactionTask> {
@@ -238,6 +249,9 @@ pub(crate) fn plan_full(
         .flat_map(|(_, ids)| ids)
         .any(|id| busy.contains(id))
     {
+        return None;
+    }
+    if rewritten && inputs.len() == 1 && inputs[0].0 == last_level {
         return None;
     }
     // Already one run at the bottom: nothing to do, unless it may hold purgeable entries
@@ -1208,6 +1222,86 @@ mod tests {
             blob_edits(&c, changes(-301)),
             Err(Error::Corruption(_))
         ));
+    }
+
+    /// #1313's shape on the box: a lone last-level SST of a counter family, 65,834 bytes over
+    /// many rows. `output_piece_bytes` makes its piece 64 KiB, so a full compaction would cut
+    /// it, but the sink, cutting by data length, wrote the same SST back. Once the request has
+    /// rewritten the slot, it is left as it is; new data still compacts.
+    #[test]
+    fn a_full_compaction_rewrites_a_settled_slot_at_most_once_per_request() {
+        let tablet = TabletEntry {
+            id: TabletId(42),
+            table: TableId(1),
+            start: b"Pw46584".to_vec(),
+            end: Some(b"Pw516".to_vec()),
+            shard: ShardId(1),
+        };
+        let mut lone = sst(81059, b"Pw46584");
+        lone.largest_key = sst(0, b"Pw5159").largest_key;
+        lone.len = 65_834;
+        lone.entries = 3971;
+        let target = 64 << 20;
+        assert!(pigeonhole_compaction::output_piece_bytes(lone.len, target) < lone.len);
+        let mut levels = Levels {
+            levels: vec![Vec::new(); 7],
+        };
+        levels.levels[6].push(Arc::new(lone));
+        let plan = |levels: &Levels, rewritten| {
+            plan_full(
+                &tablet,
+                FamilyId(3),
+                levels,
+                6,
+                &[],
+                true,
+                rewritten,
+                target,
+                |_| false,
+            )
+        };
+        // The first time, it is cut into pieces.
+        let first = plan(&levels, false).expect("a lone SST above one piece is rewritten");
+        assert_eq!(first.kind, TaskKind::Rewrite);
+        // Rewritten once already in this request: not again (it looped about once a
+        // millisecond for as long as `compact()` ran).
+        assert!(plan(&levels, true).is_none());
+        // Purgeable entries and rows outside the tablet don't bring it back either.
+        let mut outside = (*levels.levels[6][0]).clone();
+        outside.largest_key = sst(0, b"Pz").largest_key;
+        let mut wide = levels.clone();
+        wide.levels[6][0] = Arc::new(outside);
+        assert!(
+            plan_full(
+                &tablet,
+                FamilyId(3),
+                &wide,
+                6,
+                &[],
+                true,
+                false,
+                target,
+                |_| false
+            )
+            .is_some()
+        );
+        assert!(
+            plan_full(
+                &tablet,
+                FamilyId(3),
+                &wide,
+                6,
+                &[],
+                true,
+                true,
+                target,
+                |_| true
+            )
+            .is_none()
+        );
+        // New data flushed meanwhile makes the slot two runs: it compacts again.
+        levels.levels[0].push(Arc::new(sst(81070, b"Pw47")));
+        assert!(plan(&levels, true).is_some());
     }
 
     fn sst(id: u64, row: &[u8]) -> SstMeta {

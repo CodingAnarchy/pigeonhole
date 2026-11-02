@@ -73,6 +73,10 @@ Several agents often build and test on one machine, so local runs stay small:
 
   `-f tools=gdb` installs `gdb` on the runner, so a seed the hang watchdog catches leaves every thread's stack in the chunk's log. Runners don't have it, and #1205's first hang left none.
 
+  **Change-feed PRs** (the WAL's feed cursor, the engine's feed reader, retention, the sidecar, the written and synced holds, D310) add two more, seven in all:
+  - engine `feed_model` plain;
+  - engine `feed_model` with `PIGEONHOLE_DEFERRED_IO=1`. It's the only sweep where syncs, rollovers and power losses land between a feed's polls, and it found a resumed token past recovery's cut that failed as corruption instead of expiring (#1248).
+
   The `tablets` sweep is the only standard sweep that crashes around tablet changes and new streams with the device's completion order shuffled. It found #520 (D211), which the others missed. The `counters` sweep is the only one with counter-kind families, the only families D186/D287 combining and D291 checkpoints touch. Nobody ran it until perf287's long sweeps of 2026-10-28 found a live-read failure there.
 - **Long sweeps for proptests with a small per-PR case count.** CI runs each property at its own case count (`ProptestConfig::with_cases`, or 256 by default). A few costly ones ask for fewer, and get more cases here, with fresh random inputs in each chunk (6 chunks of 2,000 cases each; these targets don't read `PIGEONHOLE_SEED`):
   ```sh
@@ -93,10 +97,10 @@ These are the only `PIGEONHOLE_*` variables the code reads. All of them are for 
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS` | engine `model_check`, `counters`, `slots`, `tablets`, `deferred_waits`, `tail_index`, and in the engine's `it` binary `blobs`, `inflight_window`, `reader_crash_matrix` and `reader_pins` (a module inside `it` is swept with `-f test=it -f filter=<file>::`); pigeonhole `model`, `counters` | First seed and number of seeds. The Sweep workflow sets both per chunk. The `counters` targets rerun `model_check` / `model` with counter families (D179). |
+| `PIGEONHOLE_SEED`, `PIGEONHOLE_SEEDS` | engine `model_check`, `counters`, `slots`, `tablets`, `deferred_waits`, `tail_index`, `feed_model`, and in the engine's `it` binary `blobs`, `inflight_window`, `reader_crash_matrix` and `reader_pins` (a module inside `it` is swept with `-f test=it -f filter=<file>::`); pigeonhole `model`, `counters` | First seed and number of seeds. The Sweep workflow sets both per chunk. The `counters` targets rerun `model_check` / `model` with counter families (D179). |
 | `PIGEONHOLE_SEED` alone | shm `protocol` and `multiprocess`, memtable and pager `tests/common` | The one seed to run. |
 | `PIGEONHOLE_TABLET_CHANGES` | engine harness (`tests/common`), pigeonhole `model` | Engine: `1` adds the fast balancer so tablets change during a run, `0` turns tablet changes off. Pigeonhole: `0` turns them off. |
-| `PIGEONHOLE_DEFERRED_IO` | engine harness, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |
+| `PIGEONHOLE_DEFERRED_IO` | engine harness, engine `feed_model`, pigeonhole `model` | `1` runs on `SimVfs` with deferred I/O completion. |
 | `PIGEONHOLE_SHARD_THREADS` | pigeonhole `model` | `k` runs the shards on `k` shared engine-owned driver threads (`Options::shard_threads`, D289); unset or `0`, a thread per shard. |
 | `PIGEONHOLE_DRIVER_CHURN` | pigeonhole `model` | `1` forces the load controller's driver target to a seeded count after one step in ten (D289 PR 2), so shards move between drivers throughout. |
 | `PIGEONHOLE_ADAPTIVE_SHARD_THREADS` | pigeonhole `model` | `1` turns the load controller on (`Options::adaptive_shard_threads`, D289) when `PIGEONHOLE_SHARD_THREADS` is unset or `0`. With churn, a forced target goes back to the controller one time in three. |

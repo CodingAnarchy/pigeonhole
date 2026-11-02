@@ -290,6 +290,7 @@ fn error_codes_are_stable_numbers() {
         (ErrorCode::OutcomeUnknown, 28),
         (ErrorCode::NoWriter, 29),
         (ErrorCode::UnsupportedFeature, 30),
+        (ErrorCode::FeedExpired, 31),
     ];
     for (code, n) in codes {
         assert_eq!(code as u32, n, "{code:?}");
@@ -2280,6 +2281,10 @@ fn the_default_backend_is_io_uring_where_the_kernel_offers_it() {
 #[test]
 fn an_owned_scan_outlives_its_table_handle() {
     fn send_static<T: Send + 'static>(_: &T) {}
+    // A feed's subscriber usually runs on its own thread (cli692 on #1321).
+    fn _feed_send_static(f: pigeonhole::Feed) -> impl Send + 'static {
+        f
+    }
     #[cfg(feature = "async")]
     fn _stream_send_static(s: pigeonhole::nonblocking::RowStream<'static>) -> impl Send + 'static {
         s

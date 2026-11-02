@@ -1,8 +1,8 @@
 # Using Pigeonhole from AI agents
 
-> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `phdb mcp` is new in 1.1.0 ([#1249](https://github.com/CodingAnarchy/pigeonhole/issues/1249)). Nearest-neighbour search joins its tools once vector families land.
+> **Status:** this guide describes `main`; the current release on crates.io is 1.0.0, and [`changelog.d/`](../../changelog.d/README.md) lists what `main` adds after it. `phdb mcp` is new in 1.1.0 ([#1249](https://github.com/CodingAnarchy/pigeonhole/issues/1249)).
 
-`phdb mcp` serves a Pigeonhole database to AI agents over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Add it to an MCP client (Claude Code, Claude Desktop, an editor, an agent framework) and the agent can list tables, read rows, scan, traverse graphs and write in atomic batches, with no glue code. Agent code written in Python can use the [Python bindings](python.md) directly instead.
+`phdb mcp` serves a Pigeonhole database to AI agents over the [Model Context Protocol](https://modelcontextprotocol.io) (MCP). Add it to an MCP client (Claude Code, Claude Desktop, an editor, an agent framework) and the agent can list tables, read rows, scan, traverse graphs, find nearest vectors and write in atomic batches, with no glue code. Agent code written in Python can use the [Python bindings](python.md) directly instead.
 
 A database gives an agent memory and state that a folder of markdown files can't: writes are transactional, reads are queryable by key and prefix, cells keep versions, and other processes can read the same file while the agent writes it.
 
@@ -69,7 +69,7 @@ or, for a project, a `.mcp.json` at its root:
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
 ## The tools
-Six tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `write` and `create_table` out when the database is read-only.
+Seven tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md), and `write` and `create_table` out when the database is read-only.
 
 | Tool | What it does |
 |---|---|
@@ -77,6 +77,7 @@ Six tools, each with a JSON schema and a description written for the agent. `too
 | `read_row` | One row's cells. Selects `families`, one `qualifier` or a `qualifier_prefix`, and `versions` (default 1). A wide row comes back in parts. |
 | `scan` | Rows in key order: a `prefix`, a `start`/`end` range, or all; `limit` rows (default 100), `columns_per_row` (default 100), and the same selection as `read_row`. |
 | `traverse` | Breadth-first hops over an edge family from `seeds` ([Graphs](graphs.md#traversal-hops-inside-the-engine)): `hops`, `per_node_limit`, `hop_limit`, `max_nodes` (default 100,000), and `parents` for shortest paths. |
+| `nearest` | The `k` vectors nearest a `query` in a vector family (default 10, at most 1,000), nearest first, each with its `row`, `qualifier`, `ts` and `distance` under the family's metric: an exact search ([Vectors](vectors.md)). The query is a list of the family's `dim` numbers: integers from -128 to 127 for `i8`, 0s and 1s for `bit` (or `{"base64"}` of the packed bytes). Narrows to a `row`, a `prefix` or a `start`/`end` range, and a `qualifier` or `qualifier_prefix`. |
 | `write` | Up to 10,000 operations in one atomic `WriteBatch`: `put`, `incr` (counter families), `aggregate` (other aggregate families) and `delete` (a row, a family, a column, or one version with `ts`). All commit, or none. An `aggregate` value is read by the family's kind: any number for the f64 kinds, a non-negative integer for the bitwise ones, an integer or a string for `hll` and `bloom`. |
 | `create_table` | A table and its families, if missing. A family is a name, or an object in `list_tables`' shape (`{"name": "hits", "aggregation": "sum"}`). |
 
@@ -89,6 +90,7 @@ A result that would pass `--max-result-bytes` stops early and carries a `cursor`
 - **`read_row`** cuts at a column boundary: every version of a column is in one part.
 - **`scan`** cuts between rows. A single row too big for a result comes back marked `"truncated": true` with as many columns as fit; read the rest with `read_row`. A row that `columns_per_row` cut is marked `"columns_capped": true`.
 - **`traverse`** cuts between nodes, and each hop in a result says which node it starts at (`first_index`) and how many the hop has (`node_count`).
+- **`nearest`** has no cursor, since a ranking can't resume partway. A result that would pass the limit keeps the nearest neighbours that fit and is marked `"truncated": true`; ask for a smaller `k`.
 
 A cursor is bound to its call's arguments: one passed with other arguments fails, rather than resuming some other read at a meaningless place. A cursor doesn't hold a snapshot. Each call reads the latest data, so a row written between calls may be missed or seen twice, as with [`resume_after`](graphs.md#hubs-walking-a-wide-row) without a snapshot. A traversal's cursor runs the traversal again and skips what was returned, so it costs the whole traversal each time; tighten `hop_limit` or `max_nodes` rather than paging through a huge one.
 
@@ -130,3 +132,4 @@ A later session reads the same facts back, and `"versions": 5` on `read_row` sho
 - **One family per kind of data,** read together: `fact`, `note`, `link`. A family's options (`max_versions`, `ttl_micros`) apply to all of its cells, so give history and expiring data families of their own.
 - **Counters in a `sum` family,** incremented in the same `write` as the data they count.
 - **Links as a graph:** an edge family whose qualifiers are other rows' keys, with the reverse edge in the same `write`. Then `traverse` finds what is related, a few hops out. [Data modeling](data-modeling.md) and [Graphs](graphs.md) have more.
+- **Embeddings in a vector family** (`create_table` with `"vector": {"dim", "element", "metric"}`), one per note, beside the note's text in the same row. Then `nearest` finds the notes closest in meaning, and `read_row` reads them.

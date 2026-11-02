@@ -23,6 +23,7 @@ pub struct ArrowOptions {
     pub(crate) utf8_keys: bool,
     pub(crate) typed_values: bool,
     pub(crate) ts: TsType,
+    pub(crate) vector_dim: Option<i32>,
 }
 
 /// The largest [`ArrowOptions::batch_bytes`]: the byte columns use 32-bit offsets.
@@ -37,6 +38,7 @@ impl Default for ArrowOptions {
             utf8_keys: false,
             typed_values: false,
             ts: TsType::Timestamp,
+            vector_dim: None,
         }
     }
 }
@@ -81,6 +83,18 @@ impl ArrowOptions {
     /// The `ts` column's type. Default [`TsType::Timestamp`].
     pub fn ts(mut self, ts: TsType) -> Self {
         self.ts = ts;
+        self
+    }
+
+    /// Adds the nullable column `value_vector`, a `FixedSizeList<Float32, dim>` of each
+    /// vector cell's components (D303, ICR 0108): `f32`, `f16` and `bf16` vectors widened
+    /// exactly, `i8` vectors as exact floats. Other cells, and bit vectors, are null there.
+    /// A vector of another dimension fails the batch with an error naming its row, so
+    /// select one dimension's families (a vector family, or several of the same `dim`).
+    /// Default off; `dim` is 1 to 4096, a vector family's range (clamped).
+    pub fn vector_dim(mut self, dim: u32) -> Self {
+        // In 1..=4096, so it fits the list size's i32.
+        self.vector_dim = Some(dim.clamp(1, 4096) as i32);
         self
     }
 }
@@ -134,5 +148,17 @@ pub fn schema(options: &ArrowOptions) -> SchemaRef {
         fields.push(Field::new("value_i64", DataType::Int64, true));
         fields.push(Field::new("value_f64", DataType::Float64, true));
     }
+    if let Some(dim) = options.vector_dim {
+        fields.push(Field::new(
+            "value_vector",
+            DataType::FixedSizeList(vector_item(), dim),
+            true,
+        ));
+    }
     Arc::new(Schema::new(fields))
+}
+
+/// `value_vector`'s item field: non-null `Float32`s (a null vector is a null list entry).
+pub(crate) fn vector_item() -> Arc<Field> {
+    Arc::new(Field::new("item", DataType::Float32, false))
 }

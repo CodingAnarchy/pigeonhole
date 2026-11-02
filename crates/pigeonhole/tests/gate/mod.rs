@@ -52,6 +52,8 @@ pub struct Gate {
     reads_released: std::sync::Condvar,
     /// When each injected read failure happened.
     read_failures: Mutex<Vec<Instant>>,
+    /// `read_marker` fails one read only: the failing read clears it.
+    read_once: std::sync::atomic::AtomicBool,
     /// Writes to the main `.phdb` file whose bytes contain this marker fail (one table's
     /// SST blocks; WAL records go to other files).
     write_marker: Mutex<Option<Vec<u8>>>,
@@ -92,6 +94,15 @@ impl Gate {
     /// Fails every later read (blocking) whose bytes contain `marker`, or none (`None`).
     pub fn fail_reads_containing(&self, marker: Option<&[u8]>) {
         *self.read_marker.lock().unwrap() = marker.map(<[u8]>::to_vec);
+    }
+
+    /// Fails the next read (blocking) whose bytes contain `marker`, once: that read clears it,
+    /// under the lock, so no later read can fail for it.
+    pub fn fail_next_read_containing(&self, marker: &[u8]) {
+        let mut m = self.read_marker.lock().unwrap();
+        self.read_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        *m = Some(marker.to_vec());
     }
 
     /// Holds, on the reading thread, every later blocking read whose bytes contain `marker`
@@ -348,9 +359,18 @@ impl pigeonhole_io::File for GateFile {
             }
             *n -= 1;
         }
-        if let Some(marker) = &*self.gate.read_marker.lock().unwrap()
+        let mut failing = self.gate.read_marker.lock().unwrap();
+        if let Some(marker) = &*failing
             && buf.windows(marker.len()).any(|w| w == &marker[..])
         {
+            if self
+                .gate
+                .read_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                *failing = None;
+            }
+            drop(failing);
             self.gate.read_failures.lock().unwrap().push(Instant::now());
             return Err(pigeonhole_io::Error::new(
                 pigeonhole_io::ErrorKind::Other,
