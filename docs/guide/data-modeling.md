@@ -292,7 +292,7 @@ assert_eq!(labelled, [(f64::NEG_INFINITY, 1), (10.0, 2), (100.0, 1)]);
 
 `aggregate_bytes` also feeds an HLL family. Hash a string key there with it, rather than converting it to an `i64` yourself. A bytes element and an `i64` hash apart, so `aggregate_bytes(&7i64.to_le_bytes())` and `aggregate(7)` are two elements.
 
-These cells are never moved to blob files, whatever `blob_threshold` says (until a later release lets large bloom filters move).
+Aggregate cells are never moved to blob files, whatever `blob_threshold` says, with one exception: a bloom filter larger than its family's `blob_threshold` is, like any large value. Reads and compactions fold new elements into it there, so a large filter costs one blob read per get plus its pending elements, and compaction rewrites it once per pass. A get that folds a filter of at most 4 KiB keeps the result in memory for the next reads; a larger one relies on compaction instead.
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

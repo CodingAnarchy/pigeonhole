@@ -448,13 +448,14 @@ fn check_counter_purge(seed: u64, commits: usize, checkpoints: bool) {
 /// [`check_counter_purge`]; with `checkpoints_outside`, every counter checkpoint (D291) goes
 /// to the other source and every other entry to the inputs, entry by entry, with the other
 /// source listed: the layout where a combine of input operands could pass a checkpoint
-/// (#1051), which a random split reaches about once in thousands of cases.
+/// (#1051), which a random split reaches about once in thousands of cases. Returns how many
+/// bases the compaction folded with the operands above them (D298 §4.2).
 fn check_counter_purge_with(
     seed: u64,
     commits: usize,
     checkpoints: bool,
     checkpoints_outside: bool,
-) {
+) -> u64 {
     let mut h = counter_history(seed, common::commits(commits));
     let mut rng = Rng::new(seed ^ 0x290);
     let first_checkpoint = h.entries.len();
@@ -497,7 +498,7 @@ fn check_counter_purge_with(
     inputs.sort();
     other.sort();
     if inputs.is_empty() {
-        return;
+        return 0;
     }
     let mut input_ssts = Vec::new();
     let cut = rng.below(inputs.len() as u64 + 1) as usize;
@@ -540,6 +541,7 @@ fn check_counter_purge_with(
         db.context(family.clone(), gc),
     );
     run_sliced(&db, &mut job);
+    let folded = job.bases_folded();
     let out = job.finish().unwrap();
     assert_disjoint(&out);
     let mut after: Vec<Arc<SstReader>> = out
@@ -574,6 +576,7 @@ fn check_counter_purge_with(
         let a = resolver_reads(&h, s, now, |o| sst_resolver(&after, o));
         assert_same(&what("later writes", s, now), &expected, &a);
     }
+    folded
 }
 
 /// Output SSTs are sorted and disjoint.
@@ -650,14 +653,18 @@ fn a_checkpoint_in_another_source_keeps_operands_apart() {
 #[test]
 #[cfg_attr(miri, ignore = "hundreds of SimVfs pagers; covered natively")]
 fn counter_checkpoints_survive_combines_fixed_seeds() {
+    let mut folded = 0;
     for seed in 0..1_000u64 {
         let seed = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
         for commits in [3, 6, 12, 24] {
-            check_counter_purge(seed, commits, true);
-            check_counter_purge_with(seed, commits, true, true);
+            folded += check_counter_purge_with(seed, commits, true, false);
+            folded += check_counter_purge_with(seed, commits, true, true);
         }
         check_compaction(seed, 20, Choose::Random, true);
     }
+    // D298 §4.2: these layouts fold bases too, beside deletes, checkpoints and other
+    // sources, so the same reads check the fold.
+    assert!(folded > 50, "{folded} bases folded");
 }
 
 /// Issue #32: the FIFO-by-time picker's drops of expired SSTs, and its merges of L0 files,
@@ -1139,6 +1146,69 @@ fn counter_deletes_purge_at_the_bottom_by_seqno() {
         want.sort();
         assert_eq!(kept, want, "{others:?}");
     }
+}
+
+/// D298 §4.2: a counter family's base and the operands above it in its stripe become one
+/// base, at the newest operand's key. Not across a snapshot, nor when another source
+/// reaches into `[base, newest]` (S4's widened guard: a source at the base's own seqno, as a
+/// checkpoint would be, keeps them apart), nor onto a base the operator refuses.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn counter_bases_fold_with_the_operands_of_their_stripe() {
+    let mut db = Db::new(10);
+    let family = FamilyOptions::default()
+        .merge_operator("pigeonhole.i64_add")
+        .kind(FamilyKind::Counter);
+    let i64v = |v: i64| stored(&v.to_le_bytes());
+    let run = vec![
+        (key(b"r", b"n", 7, 4, Kind::Merge), i64v(4)),
+        (key(b"r", b"n", 7, 3, Kind::Merge), i64v(2)),
+        (key(b"r", b"n", 7, 2, Kind::Put), i64v(100)),
+    ];
+    let input = db.sst(&family, &run);
+    let source = |seqnos| OtherSource {
+        keys: Some((
+            key(b"r", b"", 0, 1, Kind::Put),
+            key(b"r", b"z", 0, 1, Kind::Put),
+        )),
+        seqnos,
+    };
+    let folded = vec![(key(b"r", b"n", 7, 4, Kind::Put), i64v(106))];
+    let apart = vec![
+        (key(b"r", b"n", 7, 4, Kind::Merge), i64v(6)),
+        (key(b"r", b"n", 7, 2, Kind::Put), i64v(100)),
+    ];
+    for (snapshots, others, want) in [
+        (vec![], Some(vec![]), &folded),
+        // Another source below the base, or above the newest operand, can't split them.
+        (vec![], Some(vec![source((0, 1)), source((5, 9))]), &folded),
+        // One at the base's seqno, or unknown sources: combined only.
+        (vec![], Some(vec![source((2, 2))]), &apart),
+        (vec![], None, &run),
+        // One between the operands keeps all three apart (#1051).
+        (vec![], Some(vec![source((3, 3))]), &run),
+        // A snapshot at 2 sees the base alone: nothing folds onto it.
+        (vec![2], Some(vec![]), &apart),
+    ] {
+        let mut gc = policy(snapshots.clone(), 100, false);
+        gc.other_sources = others.clone();
+        let (_, kept) = compact(&db, &family, std::slice::from_ref(&input), gc);
+        assert_eq!(&kept, want, "{snapshots:?} {others:?}");
+    }
+    // A base the operator refuses (not an i64) is kept apart, unchanged, so a read still
+    // fails on it (#21).
+    let bad = vec![
+        (key(b"r", b"n", 7, 4, Kind::Merge), i64v(4)),
+        (key(b"r", b"n", 7, 2, Kind::Put), stored(b"abc")),
+    ];
+    let input = db.sst(&family, &bad);
+    let mut gc = policy(vec![], 100, false);
+    gc.other_sources = Some(vec![]);
+    let (_, kept) = compact(&db, &family, &[input], gc);
+    assert_eq!(kept, bad);
 }
 
 /// A counter family's operands are not combined across the seqno range of another source

@@ -1,0 +1,3 @@
+### Changed
+- Bloom filter families' values can now go to blob files, like any large value (D298). A whole dense filter of 2^21 bits or more can be written in one commit, and reads and compactions fold new elements onto a separated filter. Every other aggregate kind's values still stay inline.
+- A compaction folds an aggregate bucket's pending inputs into its stored value when no snapshot or other source separates them (D298). A hot aggregate cell keeps one value per compaction instead of a value plus an accumulated input. Reads keep a folded aggregate value for later reads only when it is at most 4 KiB.
