@@ -1,0 +1,107 @@
+pub mod pigeonhole_memory
+#[non_exhaustive] pub enum pigeonhole_memory::Error
+pub pigeonhole_memory::Error::Corruption(alloc::string::String)
+pub pigeonhole_memory::Error::Db(pigeonhole::error::Error)
+pub pigeonhole_memory::Error::InvalidArgument(alloc::string::String)
+pub pigeonhole_memory::Error::Mismatch(alloc::string::String)
+pub pigeonhole_memory::Error::NotFound(alloc::string::String)
+pub pigeonhole_memory::Error::Text(pigeonhole_text::error::Error)
+impl pigeonhole_memory::Error
+pub fn pigeonhole_memory::Error::code(&self) -> pigeonhole::error::ErrorCode
+impl core::convert::From<pigeonhole::error::Error> for pigeonhole_memory::Error
+pub fn pigeonhole_memory::Error::from(pigeonhole::error::Error) -> Self
+impl core::convert::From<pigeonhole_text::error::Error> for pigeonhole_memory::Error
+pub fn pigeonhole_memory::Error::from(pigeonhole_text::error::Error) -> Self
+impl core::error::Error for pigeonhole_memory::Error
+pub fn pigeonhole_memory::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for pigeonhole_memory::Error
+pub fn pigeonhole_memory::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum pigeonhole_memory::Kind
+pub pigeonhole_memory::Kind::Episodic
+pub pigeonhole_memory::Kind::Procedural
+pub pigeonhole_memory::Kind::Semantic
+#[non_exhaustive] pub enum pigeonhole_memory::Remembered
+pub pigeonhole_memory::Remembered::Merged(pigeonhole_memory::MemoryId)
+pub pigeonhole_memory::Remembered::New(pigeonhole_memory::MemoryId)
+impl pigeonhole_memory::Remembered
+pub fn pigeonhole_memory::Remembered::id(&self) -> &pigeonhole_memory::MemoryId
+pub struct pigeonhole_memory::EmbeddingModel
+impl pigeonhole_memory::EmbeddingModel
+pub fn pigeonhole_memory::EmbeddingModel::dim(&self) -> u32
+pub fn pigeonhole_memory::EmbeddingModel::element(&self) -> pigeonhole::vector::Element
+pub fn pigeonhole_memory::EmbeddingModel::id(&self) -> &str
+pub fn pigeonhole_memory::EmbeddingModel::new(impl core::convert::Into<alloc::string::String>, u32, pigeonhole::vector::Element) -> pigeonhole_memory::Result<Self>
+pub struct pigeonhole_memory::LinkType(pub u8)
+impl pigeonhole_memory::LinkType
+pub const pigeonhole_memory::LinkType::DERIVED_FROM: pigeonhole_memory::LinkType
+pub const pigeonhole_memory::LinkType::SIMILAR_TO: pigeonhole_memory::LinkType
+pub const pigeonhole_memory::LinkType::SUPERSEDES: pigeonhole_memory::LinkType
+#[non_exhaustive] pub struct pigeonhole_memory::Memory
+impl pigeonhole_memory::Memory
+pub fn pigeonhole_memory::Memory::embedding(self, impl core::convert::Into<alloc::vec::Vec<f32>>) -> Self
+pub fn pigeonhole_memory::Memory::importance(self, f64) -> Self
+pub fn pigeonhole_memory::Memory::kind(self, pigeonhole_memory::Kind) -> Self
+pub fn pigeonhole_memory::Memory::link(self, pigeonhole_memory::MemoryId, pigeonhole_memory::LinkType, f32) -> Self
+pub fn pigeonhole_memory::Memory::new(impl core::convert::Into<alloc::string::String>) -> Self
+pub fn pigeonhole_memory::Memory::pinned(self, bool) -> Self
+pub fn pigeonhole_memory::Memory::session(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn pigeonhole_memory::Memory::source(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub struct pigeonhole_memory::MemoryId
+impl pigeonhole_memory::MemoryId
+pub fn pigeonhole_memory::MemoryId::created_us(&self) -> u64
+pub fn pigeonhole_memory::MemoryId::from_bytes(&[u8]) -> pigeonhole_memory::Result<Self>
+pub fn pigeonhole_memory::MemoryId::namespace(&self) -> &str
+pub fn pigeonhole_memory::MemoryId::to_bytes(&self) -> alloc::vec::Vec<u8>
+impl core::fmt::Debug for pigeonhole_memory::MemoryId
+pub fn pigeonhole_memory::MemoryId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::fmt::Display for pigeonhole_memory::MemoryId
+pub fn pigeonhole_memory::MemoryId::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::str::traits::FromStr for pigeonhole_memory::MemoryId
+pub type pigeonhole_memory::MemoryId::Err = pigeonhole_memory::Error
+pub fn pigeonhole_memory::MemoryId::from_str(&str) -> pigeonhole_memory::Result<Self>
+pub struct pigeonhole_memory::Store
+impl pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
+pub fn pigeonhole_memory::Store::delete(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<bool>
+pub fn pigeonhole_memory::Store::delete_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<bool>
+pub fn pigeonhole_memory::Store::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
+pub fn pigeonhole_memory::Store::get(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::StoredMemory>>
+pub fn pigeonhole_memory::Store::link(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId, pigeonhole_memory::LinkType, f32) -> pigeonhole_memory::Result<()>
+pub fn pigeonhole_memory::Store::mark_used(&self, &[pigeonhole_memory::MemoryId]) -> pigeonhole_memory::Result<usize>
+pub fn pigeonhole_memory::Store::open(&pigeonhole::db::Pigeonhole, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
+pub fn pigeonhole_memory::Store::open_without_embeddings(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
+pub fn pigeonhole_memory::Store::remember(&self, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
+pub fn pigeonhole_memory::Store::remember_in(&self, &mut pigeonhole::write::Transaction, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
+pub fn pigeonhole_memory::Store::supersede(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
+pub fn pigeonhole_memory::Store::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
+impl core::fmt::Debug for pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole_memory::StoreOptions
+impl pigeonhole_memory::StoreOptions
+pub fn pigeonhole_memory::StoreOptions::embedding(self, pigeonhole_memory::EmbeddingModel) -> Self
+pub fn pigeonhole_memory::StoreOptions::new() -> Self
+#[non_exhaustive] pub struct pigeonhole_memory::StoreStats
+pub pigeonhole_memory::StoreStats::broken_links: u64
+pub pigeonhole_memory::StoreStats::memories: u64
+pub pigeonhole_memory::StoreStats::missing_embeddings: u64
+pub pigeonhole_memory::StoreStats::no_content: u64
+pub pigeonhole_memory::StoreStats::stale_dedup: u64
+pub pigeonhole_memory::StoreStats::text_index_inconsistent: bool
+impl pigeonhole_memory::StoreStats
+pub fn pigeonhole_memory::StoreStats::is_consistent(&self) -> bool
+#[non_exhaustive] pub struct pigeonhole_memory::StoredMemory
+pub pigeonhole_memory::StoredMemory::backlinks: alloc::vec::Vec<(pigeonhole_memory::MemoryId, pigeonhole_memory::LinkType, f32)>
+pub pigeonhole_memory::StoredMemory::embedding: core::option::Option<alloc::vec::Vec<f32>>
+pub pigeonhole_memory::StoredMemory::id: pigeonhole_memory::MemoryId
+pub pigeonhole_memory::StoredMemory::importance: f64
+pub pigeonhole_memory::StoredMemory::kind: pigeonhole_memory::Kind
+pub pigeonhole_memory::StoredMemory::last_used_us: core::option::Option<u64>
+pub pigeonhole_memory::StoredMemory::links: alloc::vec::Vec<(pigeonhole_memory::MemoryId, pigeonhole_memory::LinkType, f32)>
+pub pigeonhole_memory::StoredMemory::pinned: bool
+pub pigeonhole_memory::StoredMemory::session: core::option::Option<alloc::string::String>
+pub pigeonhole_memory::StoredMemory::sources: alloc::vec::Vec<(alloc::string::String, u64)>
+pub pigeonhole_memory::StoredMemory::superseded_by: core::option::Option<pigeonhole_memory::MemoryId>
+pub pigeonhole_memory::StoredMemory::text: alloc::string::String
+pub pigeonhole_memory::StoredMemory::uses: u64
+pub fn pigeonhole_memory::normalize(&str) -> alloc::string::String
+pub type pigeonhole_memory::Result<T> = core::result::Result<T, pigeonhole_memory::Error>

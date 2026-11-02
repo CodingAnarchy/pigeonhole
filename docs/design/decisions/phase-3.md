@@ -4075,3 +4075,52 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `pigeonhole/tests/feed.rs`: a tool's plain open between two app sessions keeps the token (the shard count inherited too, three shards so no default matches); an explicit new shard count expires it; `change_feed_off()` ends it.
   - The unit test `the_last_session_is_inherited_until_an_open_turns_the_feed_off`.
 - **Companion change (d), cli692:** `phdb`'s read-only commands open read-only.
+
+<a id="d311"></a>
+## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)
+**Why.** Agents need durable memory they can recall by meaning, by keyword and by recency, scoped per agent or shared, inside the database they already use (#1251). Built on the public API with D309's text index, it needs nothing new in the engine.
+
+**Decided** (revision 2 §10, all 11 calls):
+1. **The crate:** `pigeonhole-memory`, on the public 1.x line (D295), on the public API only, with its API in ICR 0107.
+2. **The layout:**
+   - one table per store (`mem_{name}`), with exact, flat namespaces as row-key prefixes (`{ns}\0m{rid}`, `{ns}\0h{hash}`);
+   - time-ordered `rid`s that carry `created`, so recency is a prefix scan;
+   - explicit `backlinks`, a `sources` family, and `importance` as a `max` aggregate;
+   - `F32`/`F16`/`BF16` embeddings;
+   - the frozen `MemoryId` forms.
+3. **Vector recall in v1:** exact per-namespace search (`Scan::nearest_*`), not IVF.
+4. **Fusion:** RRF (k = 60), with a linear blend as the alternative.
+5. **Recall is read-only,** and works in reader processes. `mark_used` is explicit.
+6. **Dedup:** exact, after trimming and collapsing whitespace (no case folding), checked against its live target in the transaction. A hit on a superseded memory counts as new. Near duplicates are optional, with `Link` as the default.
+7. **Consolidation:** the application's `Consolidator`, called outside transactions; conflict-checked commits; a conflicting group is skipped.
+8. **Existence reads in every write (M1–M5).**
+9. **TTL as a forget policy** (`max_age`), with no core TTL on the store's families.
+10. **D309's two additions** (`id_prefix`, and `open_reader` → `ReadIndex`).
+11. **The benchmark:** LongMemEval first, then LoCoMo, with a fixed open embedding model.
+
+**Since revision 2** (owner, 2026-11-02; the ICR 0107 amendment on #1251, c6578450948 and c6578478485):
+- **The store's text index has positions off.**
+- **The embedding model is pinned:**
+  - `StoreOptions::embedding(EmbeddingModel::new(id, dim, element))` at create, recorded in `G`;
+  - `Store::open(db, name, model_id)` fails with `Mismatch` on another model (ids compare byte for byte);
+  - `open_without_embeddings` gives a handle that refuses content writes on a pinned store, and allows `delete`, `link` and `mark_used`;
+  - every embedding is checked against the dimension, and a pinned store requires one on every memory.
+
+**Tickets:** T1 #1335 (in two PRs: the store, then recall and `ReadStore`), T2 #1336, T3 #1337, T4 #1338, T5 #1339, T6 #1340, T7 #1341, T8 #1342 (only if T5 calls for it), T9 #1343.
+
+**T1, first PR (#1335).**
+- **What's in it:**
+  - `Store` (`create`, `open`, `open_without_embeddings`, `remember`, `remember_in`, `get`, `delete`, `delete_in`, `link`, `supersede`, `mark_used`, `verify`, `embedding_model`);
+  - `Memory`, `Kind`, `LinkType`, `Remembered`, `StoredMemory`, `StoreStats`, `EmbeddingModel`, `StoreOptions`, `MemoryId` and `normalize`.
+- **Dedup's cases:** the dedup row and its target's `content:text` and `superseded_by` are read in the transaction.
+  - A live, same-text, unsuperseded target merges: importance goes to the max, the source is added, and a use is counted.
+  - A gone or superseded target inserts as new and repoints the dedup row.
+  - A hash collision inserts as new and leaves the dedup row alone.
+- **Links** stay within a namespace. A missing target is `NotFound`, before anything is written.
+- **Tests:**
+  - round trips, dedup's cases, links both ways, delete removing links and the dedup row, `mark_used` skipping deleted ids;
+  - the model checks (`Mismatch`, wrong dimension, missing embedding, the model-less handle);
+  - namespaces;
+  - a write given up in the caller's transaction leaves nothing;
+  - S3's races (a merge or a link racing a delete of its target conflicts; `mark_used` after a delete), each ending in `verify`.
+
