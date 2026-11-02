@@ -519,7 +519,7 @@ fn layout_at(
     cen: &VectorSpec,
     cache: &RwLock<Arc<Layout>>,
     s: &Snapshot,
-    current: bool,
+    current: Option<&dyn Fn() -> Option<u64>>,
 ) -> Result<Arc<Layout>> {
     let shared = cached(cache);
     if t.layout_version(s)? == shared.version {
@@ -535,7 +535,7 @@ async fn layout_at_async(
     cen: &VectorSpec,
     cache: &RwLock<Arc<Layout>>,
     s: &Snapshot,
-    current: bool,
+    current: Option<&(dyn Fn() -> Option<u64> + Sync)>,
 ) -> Result<Arc<Layout>> {
     let shared = cached(cache);
     let version = t
@@ -546,18 +546,35 @@ async fn layout_at_async(
     if version == shared.version {
         return Ok(shared);
     }
-    Ok(adopt(cache, load_async(t, cen, s).await?, current))
+    // Converted after the await: the future holds only the `Sync` reference across it.
+    let fresh = load_async(t, cen, s).await?;
+    Ok(adopt(
+        cache,
+        fresh,
+        current.map(|f| f as &dyn Fn() -> Option<u64>),
+    ))
 }
 
 fn cached(cache: &RwLock<Arc<Layout>>) -> Arc<Layout> {
     Arc::clone(&cache.read().unwrap_or_else(PoisonError::into_inner))
 }
 
-fn adopt(cache: &RwLock<Arc<Layout>>, fresh: Layout, current: bool) -> Arc<Layout> {
+/// A layout a search loaded replaces the shared cache when the search is at the current
+/// snapshot (`latest` given: the latest visible seqno now) and the cache is older (rev 3
+/// S4), so a slower search at an earlier snapshot never overwrites a newer layout. Or when
+/// the cache is from **beyond** the latest visible seqno: commits the writer lost (a
+/// restart after a power loss took a visible tail, perf287 on #1385). The cache then can't
+/// be current, and without this every search would reload the centroids until the writer
+/// passed the lost seqno again.
+fn adopt(
+    cache: &RwLock<Arc<Layout>>,
+    fresh: Layout,
+    latest: Option<&dyn Fn() -> Option<u64>>,
+) -> Arc<Layout> {
     let fresh = Arc::new(fresh);
-    if current {
+    if let Some(latest) = latest {
         let mut w = cache.write().unwrap_or_else(PoisonError::into_inner);
-        if fresh.seqno >= w.seqno {
+        if fresh.seqno >= w.seqno || latest().is_some_and(|now| w.seqno > now) {
             *w = Arc::clone(&fresh);
         }
     }
@@ -1290,7 +1307,15 @@ impl Index {
     /// a search at the current snapshot replaces the shared cache (rev 3 S4).
     fn layout_at(&self, s: &Snapshot, current: bool) -> Result<Arc<Layout>> {
         let inn = &*self.inner;
-        layout_at(&inn.table, &inn.cen, &inn.layout, s, current)
+        let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+        let latest: &dyn Fn() -> Option<u64> = &latest;
+        layout_at(
+            &inn.table,
+            &inn.cen,
+            &inn.layout,
+            s,
+            current.then_some(latest),
+        )
     }
 
     fn count(&self, list: u32) -> Result<u64> {
@@ -1756,8 +1781,9 @@ fn hits(near: Vec<pigeonhole::Neighbour>) -> Vec<Hit> {
 /// An index opened from a reader process ([`Index::open_reader`], #1268 item 5): searches
 /// only, at the reader's snapshots, with the same results as the writer's
 /// [`Index`] at the same snapshot. It holds its own centroid cache, reloaded when a search
-/// sees the layout changed. If the writer restarts, a search fails with `SnapshotExpired`
-/// (`Error::Db`) until the reader attaches to the new writer; searching again is enough.
+/// sees the layout changed. If the writer restarts, a search fails with `NoWriter` or
+/// `SnapshotExpired` (`Error::Db`) until the reader attaches to the new writer; searching
+/// again is enough. A reader process has its own block cache: size it as the writer's.
 #[derive(Clone)]
 pub struct ReadIndex {
     inner: Arc<ReadInner>,
@@ -1862,7 +1888,18 @@ impl<'a> Of<'a> {
     fn layout_at(&self, s: &Snapshot, current: bool) -> Result<Arc<Layout>> {
         match *self {
             Of::W(i) => i.layout_at(s, current),
-            Of::R(i) => layout_at(&i.inner.table, &i.inner.cen, &i.inner.layout, s, current),
+            Of::R(i) => {
+                let inn = &*i.inner;
+                let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+                let latest: &dyn Fn() -> Option<u64> = &latest;
+                layout_at(
+                    &inn.table,
+                    &inn.cen,
+                    &inn.layout,
+                    s,
+                    current.then_some(latest),
+                )
+            }
         }
     }
 
@@ -1871,11 +1908,29 @@ impl<'a> Of<'a> {
         match *self {
             Of::W(i) => {
                 let inn = &*i.inner;
-                layout_at_async(&inn.table, &inn.cen, &inn.layout, s, current).await
+                let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+                let latest: &(dyn Fn() -> Option<u64> + Sync) = &latest;
+                layout_at_async(
+                    &inn.table,
+                    &inn.cen,
+                    &inn.layout,
+                    s,
+                    current.then_some(latest),
+                )
+                .await
             }
             Of::R(i) => {
                 let inn = &*i.inner;
-                layout_at_async(&inn.table, &inn.cen, &inn.layout, s, current).await
+                let latest = || inn.db.snapshot().ok().map(|s| s.seqno());
+                let latest: &(dyn Fn() -> Option<u64> + Sync) = &latest;
+                layout_at_async(
+                    &inn.table,
+                    &inn.cen,
+                    &inn.layout,
+                    s,
+                    current.then_some(latest),
+                )
+                .await
             }
         }
     }
@@ -1996,6 +2051,48 @@ impl<'a> Search<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn layout(seqno: u64, version: u64) -> Layout {
+        Layout {
+            seqno,
+            version,
+            lists: Vec::new(),
+        }
+    }
+
+    /// The shared layout cache (rev 3 S4, perf287 on #1385): a search at the current snapshot
+    /// adopts a newer layout, never an older one a slower search loaded, and does adopt one
+    /// when the cache is from beyond the latest visible seqno (commits a restarted writer
+    /// lost). A search at an older snapshot never adopts.
+    #[test]
+    fn the_layout_cache_adopts_newer_layouts_and_drops_a_lost_tails() {
+        let cache = RwLock::new(Arc::new(layout(100, 5)));
+        let at = |c: &RwLock<Arc<Layout>>| (c.read().unwrap().seqno, c.read().unwrap().version);
+        let now_120 = || Some(120);
+        let now: &dyn Fn() -> Option<u64> = &now_120;
+        // A slower search's older layout, the cache still visible: kept.
+        adopt(&cache, layout(90, 4), Some(now));
+        assert_eq!(at(&cache), (100, 5));
+        // A newer one: adopted.
+        adopt(&cache, layout(110, 6), Some(now));
+        assert_eq!(at(&cache), (110, 6));
+        // Not at the current snapshot: never adopted.
+        adopt(&cache, layout(115, 7), None);
+        assert_eq!(at(&cache), (110, 6));
+        // The writer lost its tail: the latest visible seqno is 60, below the cache's 110.
+        // The fresh layout (seqno 55) replaces it, and later loads adopt as usual.
+        let now_60 = || Some(60);
+        let lost: &dyn Fn() -> Option<u64> = &now_60;
+        adopt(&cache, layout(55, 3), Some(lost));
+        assert_eq!(at(&cache), (55, 3));
+        adopt(&cache, layout(58, 4), Some(lost));
+        assert_eq!(at(&cache), (58, 4));
+        // The latest seqno unknown (the snapshot failed): an older layout is kept.
+        let unknown = || None;
+        let unknown: &dyn Fn() -> Option<u64> = &unknown;
+        adopt(&cache, layout(50, 2), Some(unknown));
+        assert_eq!(at(&cache), (58, 4));
+    }
 
     #[test]
     fn options_round_trip_and_scale_for_large_vectors() {

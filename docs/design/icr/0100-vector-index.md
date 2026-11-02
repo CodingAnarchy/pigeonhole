@@ -65,7 +65,8 @@
 - **`ReadIndex`** (`Clone`, `Debug`): `spec()`, `options()`, and `search_f32`/`search_i8`/`search_bits` returning the same `Search`. So `nprobe`, `snapshot`, `parallel`, `run` and `run_async` all work. It has no write method.
   - **The centroids load with reads only,** at the reader's snapshot. The handle keeps its own cache and reloads it when a search sees `G:layout` change, as `Index` does.
   - **The results equal the writer's `Index` at the same snapshot.**
-  - **If the writer restarts,** a search fails with `SnapshotExpired` (`Error::Db`) until the reader reattaches; searching again is enough.
+  - **If the writer restarts,** a search fails with `NoWriter` or `SnapshotExpired` (`Error::Db`) until the reader reattaches; searching again is enough.
+  - **The layout cache follows a writer that lost commits:** a search at the current snapshot adopts its fresh layout when the cache's seqno is newer than any now visible (perf287 on #1385). The same rule applies to `Index`.
 - **Internal:** the centroid load and the layout check are shared through a crate-private `Rows` trait over `Table` and `ReadTable`, and `Search` reads either kind of index.
 
 ## The table (internal, not promised)

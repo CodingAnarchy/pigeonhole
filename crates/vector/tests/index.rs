@@ -374,3 +374,70 @@ fn a_reader_process_searches_as_the_writer_does() {
         db.close().unwrap();
     }
 }
+
+/// #1268 item 5, perf287 on #1385: a `ReadIndex` outlives its writer's restart. While the
+/// writer is gone or starting, a search fails (`NoWriter` or `SnapshotExpired`); searching
+/// again once the new writer runs is enough, and it sees the new writer's vectors, splits
+/// included (the layout cache follows the new writer).
+#[test]
+fn a_reader_index_keeps_searching_across_a_writer_restart() {
+    let spec = VectorSpec::new(4, Element::F32, Metric::L2).unwrap();
+    let dir = pigeonhole::doc_support::temp_dir();
+    let mut rng = Rng::new(41);
+    let mut model = BTreeMap::new();
+    let db = open(&dir);
+    let index = Index::create(&db, "idx", spec, small()).expect("create");
+    for i in 0..60u32 {
+        let v = V::random(&mut rng, &spec, u64::from(i % 3));
+        v.insert(&index, &i.to_be_bytes()).unwrap();
+        model.insert(i.to_be_bytes().to_vec(), v);
+    }
+    let reader = pigeonhole::Pigeonhole::open_reader(
+        dir.join("idx.phdb"),
+        pigeonhole::ReaderOptions::default(),
+    )
+    .unwrap();
+    let read = Index::open_reader(&reader, "idx").unwrap();
+    let q = V::random(&mut rng, &spec, 1);
+    assert_eq!(
+        q.search_read(&read, 5, u32::MAX),
+        q.search(&index, 5, u32::MAX)
+    );
+    drop(index);
+    db.close().unwrap();
+
+    // A new writer, more vectors (more splits), then the same ReadIndex searches again.
+    let db = open(&dir);
+    let index = Index::open(&db, "idx").unwrap();
+    for i in 1000..1080u32 {
+        let v = V::random(&mut rng, &spec, u64::from(i % 3));
+        v.insert(&index, &i.to_be_bytes()).unwrap();
+        model.insert(i.to_be_bytes().to_vec(), v);
+    }
+    let search = || match &q {
+        V::F32(x) => read.search_f32(x, 5).nprobe(u32::MAX).run(),
+        _ => unreachable!("an f32 query"),
+    };
+    let mut got = search();
+    for _ in 0..200 {
+        match &got {
+            Err(pigeonhole_vector::Error::Db(e))
+                if matches!(
+                    e.code(),
+                    pigeonhole::ErrorCode::NoWriter | pigeonhole::ErrorCode::SnapshotExpired
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                got = search();
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        got.expect("the reader searches again"),
+        q.search(&index, 5, u32::MAX)
+    );
+    exact(&index, &model, &q, 5, "after the restart");
+    drop((read, reader, index));
+    db.close().unwrap();
+}
