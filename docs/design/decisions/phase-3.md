@@ -3261,7 +3261,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 **Measured (AX102, a 2M-edge hub, warm):** `cells()` 71.6 ns/edge and 4.8 KB allocated for the walk (`read()`: 122 ns/edge, 738 MB); RocksDB's prefix iterator 71.0 ns/edge. `pages(1000)` 104 µs a page, over D297's 95 µs target; the page fill's cell copies are a follow-up with the callgrind shapes.
 
 <a id="d298"></a>
-## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D186 for aggregate families in PR 5)
+## D298 — More aggregate families for 1.1.0, and the `kind_params` field (perf2, 2026-10-31; owner accepted the design note and revision 1, #488 c6537729376, c6537767020, with every §9 recommendation and the §6 verdicts; reviewed by perf287, c6537749932; format, compaction, engine, pigeonhole, cli, sim, #488, #489, #490, ICR 0096; extends D294; amends D73 and D186 for aggregate families in PR 5a)
 **Why.** The owner's minimum set for #488, on D294's machinery: bitwise OR, AND and XOR; `f64` min and max; an exact `f64` sum; mean and variance; fixed-bucket histograms; bloom union. Also log-linear quantiles, and #489's roaring `u32` set. Kinds with parameters need a field on `PutFamily`; cli692's #490 vector kind needs one too, so the two share it.
 
 **Decided (the design note, with revision 1).**
@@ -3460,6 +3460,31 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Not modeled:** the model's bloom families take `i64` elements only; bytes elements are covered by the engine, API and phdb tests. PR 5 adds bytes elements to the model.
 - **API, phdb and corpus:** a `pigeonhole` API test, a phdb shell test, and the help snapshot. The corpus gains `seen_b` (`i64` and bytes elements) and bytes elements in `users`.
 
+**What (PR 5a: separated bases, the compaction fold, the checkpoint cap).** PR 5 splits as §8 allowed: 5a is the engine, 5b the roaring `Set`.
+- **Separation keys on its own predicate** (§ above), now apart:
+  - `FamilyKind::values_stay_inline()` no longer lists `Bloom`. A filter's value separates like any `Bytes` value: at flush and compaction past the family's `blob_threshold`, and at commit past a WAL record. A whole dense filter of 2^21 bits or more (`phdb load`), refused in PR 4, now goes to a blob file. Operands (one-element filters) stay inline, as every operand does (D180).
+  - `catalog::folds_separated_bases(kind)`, an explicit list (`Bloom`; 5b adds `Set`), decides the read path's blob attach: `ResolverBlobs::attach` loads a separated base for an application's operator or a kind on the list, and skips the others. A unit test pins that every aggregate kind whose values may separate is on it.
+- **§4.1, reads:** the resolver already loads a separated base before `finish` (`load_base`). Attaching the hook for bloom families was the change. Every read path (gets, scans, multi-get, `reduce`, `keys`, checkpoint reads) goes through `attach`.
+- **§4.2, the compaction fold (S4)** (`Gc::decide_counter`, compaction only; a flush's combine still folds only operands):
+  - **When:** a kept base `P` directly below a run of operands of its own stripe, and `!guarded(P.seqno, newest)`: no other source reaches `[P.seqno, newest]`.
+  - **In-run deletes need no check of their own:** a delete in the inputs with a seqno above `P` covering the bucket (in the group, a column delete at a newer timestamp, or a marker) makes `P` covered, so it is dropped, never kept, and nothing folds onto it. Any seqno between two of a stripe's entries is in that stripe.
+  - **Result:** one `Put` at the newest operand's key (as a read's fold or a D291 checkpoint would be keyed), with `op.finish(Some(base), operands)`. It is separated at the output like any put past the threshold, and the old base's blob bytes are counted dropped.
+  - **A separated base** is read through `JobContext::base_blobs`, which the engine sets for kinds on `folds_separated_bases` when the view has blob files. A base that can't be read, or that the operator refuses, is not folded: the run is combined as before and the base kept, so a read keeps failing on a bad base (#21).
+  - **D73 and D186 are amended** for aggregate families: a bucket is one `(column, timestamp)`, so D73's objections (deletes, TTL and `time_range` at different timestamps inside a run) don't arise. D73 stays for standard families.
+- **§4.3, the checkpoint cap:** a counter get's fold is sent as a D291 checkpoint only when its stored value is at most `MAX_CHECKPOINT_BYTES` (4 KiB): every scalar, an HLL sketch, and most histograms and quantile sketches. A larger value would cost the memtable more than its fold saves; §4.2 keeps such a cell's reads short instead, which is what the PR 3 measurement needed ("must not come without §4.2"). 5b measures the cap with `hotagg` sets.
+
+**Tests (PR 5a).**
+- **Compaction:**
+  - `counter_bases_fold_with_the_operands_of_their_stripe`: the fold at the newest operand's key; no fold under a source at the base's seqno (the widened guard), between the operands (#1051), unknown sources, or a snapshot between base and operands; a refused base kept apart unchanged.
+  - The counter proptests and `counter_checkpoints_survive_combines_fixed_seeds` (deletes, markers, checkpoints, other sources split by column, version or entry, random snapshots) now fold too: the fixed seeds fold over 100 bases, every read at every live snapshot and after later writes unchanged.
+  - **Mutations**, each failing three of the existing counter tests: no guard; the guard narrowed to the newest operand; a fold across stripes; a fold onto a covered base. Keying the result at the base's own seqno survives, as it should: base and operands share a stripe, so no read point lies between them.
+- **Engine (`it/bloom_aggregates.rs`):**
+  - a dense filter separated at flush, inputs folded onto it at read, then compacted into a new separated base with the old one unreferenced (`check_blob_accounting`), with checkpoints at 128 and 1 step, and after a reopen;
+  - a 2^21-bit filter put at commit goes to a blob file; an input folds onto it; a compaction folds it;
+  - the cap: a 2 KiB filter's get leaves a checkpoint, a 4 KiB one's never does.
+  - **Mutations:** `attach` skipping bloom fails 3 tests; no `base_blobs` fails the compaction fold test; no cap fails the cap test.
+- **Model checks:** both harnesses give `bloom` families a blob threshold of 64, so the `counters` sweeps (every aggregate kind since #1233) fold onto separated bases at reads and compactions. The commit-time separation test counts the engine's own commit-time separations (#1233), so these flush-time ones don't enter it.
+
 <a id="d299"></a>
 ## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)
 **Why.** A BFS hop, a batch lookup or an HNSW neighbourhood reads many rows known up front, and today each row read sets up its read from scratch: routing, gathering the family's sources, a new iterator per SST, a fresh row buffer. In #489's baseline that setup is about half the cost of a dense frontier (row reads 2.18 µs/row against one scan's 0.97 over the same rows, AX102) and seven allocations a row.
@@ -3604,6 +3629,21 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
     - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
 
 
+<a id="d305"></a>
+## D305 — WITHDRAWN: a pinned shard driver's io_uring workers run off the drivers' CPUs (coordinator decision, 2026-10-31; io, runtime; #1206 lever 3, #1234; would have amended D235; withdrawn 2026-10-31 before it landed)
+**Status: withdrawn.** #1234 was closed unmerged. D235 is unchanged: io_uring's workers (io-wq) stay wherever the kernel places them.
+
+**What it proposed.**
+- **The problem:** on Linux with io_uring, io-wq is per task, so a pinned driver's workers ran on the driver's own CPU and preempted it.
+- **The traced cost:** on sparse-wide, 357–390 preemptions over 100 µs per run (about 0.3 s), and every slow `SyncBarrier` submit.
+- **The proposal:** register the opener's affinity set (the one D235's pin plan is drawn from), less the drivers' CPUs, with `IORING_REGISTER_IOWQ_AFF` when the driver's ring is made. That was best effort, for pinned engine-owned drivers only.
+
+**Why it was withdrawn** (ctr274's rerun on #1206):
+- **What it fixed:** moving io-wq off the driver CPUs halved, or better, sparse-wide's `Buffered` put p99.9.
+- **What it cost:** every `Default` commit, with ycsb-a's put p99 1.26–1.40× and throughput 0.86–0.89×. At `Default`, the group fsync's worker running on the driver's own parked CPU is a benefit, not a cost.
+- **Nothing replaced it on the commit path.** #1244's bench client placement was dropped too, at the default topology. With one shard per physical core, it confines clients to the shards' SMT siblings, and Buffered put p99 roughly doubled (`.coord/out-1244-20261031`). #1244 landed reduced, as the owner's option 1 of 2026-11-01: the `Pigeonhole::pinned_shard_cpus()` accessor (ICR 0101), and a guide note that placement helps only where there are spare physical cores.
+- **Left open, not pursued:** moving only `Buffered` barriers' io-wq work off the driver (submitting them from a non-driver ring) while keeping `Default`'s fsync local. It's measurable, but it would add a second submission path for WAL syncs.
+
 <a id="d306"></a>
 ## D306 — An IVF vector index in `pigeonhole-vector`: lists as wide rows, moves as transactions, rebalancing inside the writes (perf287, 2026-10-31; owner accepted revision 4, #490 c6548019940 with revs c6548079840, c6548105943, c6548115678, c6548128553, decision c6548492501; reviewed by cli692 and simp724; vector, #490 D, ICR 0100; on D296, D299 and D303)
 **Why.** An exact `nearest_*` (D296) reads every candidate, which a collection of millions can't do within an interactive budget. The target is 95% recall@10 on SIFT1M at ≤10 ms, single-threaded. An inverted-file index narrows a query to the few lists nearest it. Built from ordinary rows and transactions, it is as durable and consistent as the database and needs nothing new in the engine.
@@ -3673,4 +3713,61 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - an application's rebalancer, with its wakeup and `closed`;
   - markers a crash left, rebalanced after the reopen.
 
+**PR 3 (measurements, defaults, guide).**
+- **SIFT1M on the AX102,** one thread, one query at a time, bulk build, target 1,000, the index held in a 1 GiB block cache: nprobe 24 gives 95.8% recall@10 at 3.38 ms p50 and 5.39 ms p99, which meets D306's 95% at ≤ 10 ms.
+  - **The table:** nprobe 16, 20, 28 and 32 gave 92.2, 94.3, 96.7 and 97.4% at p50 2.30, 2.84, 3.92 and 4.47 ms.
+  - **`IndexOptions::nprobe`'s default is 24** (it was 16).
+- **Under the default 256 MiB cache** (half the 512 MB index cached), nprobe 32 took 10.8 ms. The guide tells users to size the block cache to the index.
+- **Faiss IVF-Flat (1,000 lists):** equal recall within ±0.015 at every nprobe from 4 to 128, and faster per query: 9–10× with the index cached, up to 22× under the default 256 MiB cache. A profile puts the gap in the engine's per-cell read path (resolver, merging, the value copy), not the distance kernel: #1283, in 1.1.0.
+- **Builds:** `bulk_load` 138 s for 1M. 1M inserts at `Buffered` 67 s, with insert p50, p99 and p999 of 56, 93 and 415 µs. `run_async` matches `run` throughout.
+- **`examples/ivfsift.rs`** and `docs/bench.md` describe the run; `docs/guide/vectors.md` is the guide page.
+
 **`Search::run_async` (#1268 item 6).** It's on D296 PR 5's `Nearest::run_async`. Every read of the search is async: the layout version, a changed layout's centroids (a scan stream), and the probed lists. Its result equals `run`'s. It's tested from a cold reopen, at an older snapshot and across splits, for every element and metric.
+
+<a id="d307"></a>
+## D307 — Python bindings: PyO3 directly over `pigeonhole`, published as `pigeonhole-db` for CPython 3.11 and later (ai1249, 2026-10-31; owner decision on #696; reviewed by cli692; python, #696, ICR 0102)
+**Why.** Most agent frameworks are Python (#696, #1251). Bindings straight over the Rust crate keep one implementation and its guarantees, with nothing to keep in step through the C ABI.
+
+**Decided.**
+- **The binding:**
+  - **PyO3, directly over the Rust `pigeonhole` crate,** in a new workspace crate `crates/python` (`pigeonhole-python`, `publish = false` on crates.io). It builds the extension module `pigeonhole._native`, which the `pigeonhole` package re-exports.
+  - **The build:** maturin, with `abi3-py311`, so one wheel per platform serves CPython 3.11 and later.
+  - **Unsafe code:** the crate needs a deny/allow exception for the `unsafe` that PyO3's macros generate at their call sites, approved by the coordinator.
+- **The PyPI name is `pigeonhole-db`,** imported as `import pigeonhole`.
+  - **The first publish needs the owner's go,** and its workflow (PR 4) sets least-privilege permissions, with `id-token: write` on the publish job only.
+- **The API snapshot:** the package's typed stubs (`crates/python/python/pigeonhole/__init__.pyi`). CI's `mypy.stubtest` fails when the stubs and the built module disagree, so it plays the role `public-api.txt` plays for the Rust crates.
+- **The value rules:** the Python type picks the cell type (bytes and `str` are bytes, `int` is `i64`, `float` is `f64`, and a `bool` is refused). `aggregate` reads its input by the family's kind.
+- **PRs:**
+  1. The core API: open, readers, tables, reads, writes, transactions, values and options (#1260).
+  2. Vectors, the 1.1 reads, closing a scan, the per-op overhead benchmark and `docs/guide/python.md` (#1276).
+  3. `Table.nearest` (#1277).
+     - The half-precision arms (`Element.F16`/`BF16`, written and queried as `f32`, read back widened to `array('f')`) come with #1285, under D303's amendment and ICR 0104.
+  4. The PyPI publish workflow, after the owner's go.
+
+<a id="d308"></a>
+## D308 — Byte-budgeted reads: a page fits a byte budget, whole columns at a time, and resumes from a versioned position (ai1249, 2026-10-31; owner accepted revision 2, #1250 c6549794531; reviewed by perf287 (engine) and cli692 (API); engine, pigeonhole, #1250, ICR 0103; on D296 and D304)
+**Why.** An agent or a service with a context or response budget needs reads that stop at a size, not a row count, and that resume exactly where they stopped, across processes and restarts (#1250).
+
+**Decided.**
+- **The engine:** a `ByteBudget` reducer (D296).
+  - **It keeps the longest in-budget prefix** of a read's cells, in cell order. Each row's key counts once.
+  - **A column is admitted whole or rolled back** (B1). The overflow column's size is reported, so a page that resumes at it fits it in exactly that budget.
+  - **The sequential reduce path is one accumulator** (B2). Fanned-out reads keep per-group reducers, merged and cut again.
+  - **`ReduceSpec::resume`** resumes a read inside a row, after a column (B3).
+  - **Traversal's `byte_budget`** runs across hops in order, and a cut hop ends the traversal (B4).
+- **The public API:**
+  - **The pages:** `Scan::read_within` and `KeysRead::read_within`, returning pages with `rows`, `bytes`, `cut_by_budget`, `next_bytes` and `resume`.
+  - **The positions:** `ScanPosition` and `KeysPosition`, whose byte forms are versioned, tagged and carry the table id, so a position from another table is refused.
+  - **Resuming:** `resume_after` on scans and multi-gets. Only `read_within` takes a position.
+  - **Traversal:** `Traverse::byte_budget`, with `TraverseStats::cut_by_budget` saying when a hop was cut.
+- **Resume rules:**
+  - a cut inside a row resumes after the last kept column;
+  - a cut at a row boundary resumes after the last kept row;
+  - an empty cut page resumes at its own start;
+  - a `limit` stop resumes after the `limit`-th row. PR 2 cuts the page there after the read; PR 3 stops the read itself there, so it reads no further;
+  - `limit(0)` reads nothing.
+- **PRs:**
+  1. The engine (#1264).
+  2. The public API (#1281).
+  3. The follow-ups (#1284, in progress): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
+- **Deferred:** `read_within_async` (#1286, Post-1.0).

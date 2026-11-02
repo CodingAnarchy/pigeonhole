@@ -300,17 +300,16 @@ pub(crate) struct ResolverBlobs {
 impl ResolverBlobs {
     /// Sets `opts.blobs` when the resolver may need a separated value and `ssts` names blob
     /// files; returns the handle to check after each resolver step. It may need one for a
-    /// value predicate, or to fold operands onto a separated base. The built-in operators
-    /// are the exception. The `i64` ones (add, min, max) reject every base that is not a
-    /// stored `i64`, with the same error, and a separated value never is one (only `Bytes`
-    /// are separated), so loading the base could not change their result; an HLL family's
-    /// sketches are never separated (its `blob_threshold` passes the largest, D294). Skipping
-    /// it keeps a default family's reads free of the hook.
+    /// value predicate, or to fold operands onto a separated base: under an application's
+    /// operator, or a built-in one whose kind's values may be separated (a bloom filter,
+    /// D298 §4.1; `catalog::folds_separated_bases`). The other built-in operators never see
+    /// a separated base: their kinds' values stay inline (`FamilyKind::values_stay_inline`),
+    /// and a standard family's `i64` add rejects every base that is not a stored `i64`, which
+    /// a separated value never is. Skipping it keeps their reads free of the hook.
     pub(crate) fn attach(opts: &mut ResolveOptions, ssts: &Arc<SstSet>) -> Option<Arc<Self>> {
-        let folds = opts
-            .merge
-            .as_ref()
-            .is_some_and(|m| crate::catalog::builtin_kind(m.name()).is_none());
+        let folds = opts.merge.as_ref().is_some_and(|m| {
+            crate::catalog::builtin_kind(m.name()).is_none_or(crate::catalog::folds_separated_bases)
+        });
         if !(opts.value.is_some() || folds) || !ssts.has_blobs() {
             return None;
         }
@@ -1899,6 +1898,12 @@ fn get_with<const CACHE_ONLY: bool>(
     }
 }
 
+/// The largest folded value kept as a counter checkpoint (D298 §4.3): every scalar, an HLL
+/// sketch (at most about 3 KiB) and most histograms and quantile sketches. A larger value
+/// would cost the memtable more than its fold saves; compaction's fold onto the base (§4.2)
+/// keeps such a cell's reads short instead.
+pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4096;
+
 /// Hands a counter get's result to its row's shard as a checkpoint (D291), when its fold
 /// read at least the writer's checkpoint steps. Out of line: a get pays only for taking the
 /// resolver's fold record, which only a counter group sets.
@@ -1920,7 +1925,7 @@ fn note_checkpoint(
     let Ok(Some(cell)) = got else {
         return;
     };
-    if steps < sink.steps {
+    if steps < sink.steps || cell.stored().len() > MAX_CHECKPOINT_BYTES {
         return;
     }
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
