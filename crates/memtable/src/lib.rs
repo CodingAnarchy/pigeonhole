@@ -835,12 +835,15 @@ impl Memtable {
         // The next insert's predecessors: this node below its height, `prev` above it. After
         // an insert right after the last one `prev` is the splice already, so only the
         // node's own levels change (every level was rewritten per insert, about 30
-        // instructions, #1206). After a search only the levels above the node are copied:
-        // the whole array then the fill cost commit-at 31 more (perf287).
-        if !after_last {
-            self.splice[height..].copy_from_slice(&prev[height..]);
+        // instructions, #1206). After a search, one write per level as before: a copy of
+        // the levels above the node (a `memcpy` call) cost commit-at 34 more (perf287).
+        if after_last {
+            self.splice[..height].fill(node);
+        } else {
+            for (level, p) in prev.iter().enumerate() {
+                self.splice[level] = if level < height { node } else { *p };
+            }
         }
-        self.splice[..height].fill(node);
         self.bump += node_len;
         self.used += node_len as u64;
         self.count += 1;
