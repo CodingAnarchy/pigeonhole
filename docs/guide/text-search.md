@@ -88,6 +88,38 @@ assert_eq!(fuzzy[0].id, b"a");
   - Composed and decomposed accents differ by edits, so keep the default `Nfc` normalisation if you search with fuzzy terms.
 - **A namespace:** `.id_prefix(p)` restricts a search to ids starting with `p`. Include the namespace's terminator (`agent:alice\0`), or `agent:alice2` matches too. Scores keep the whole index's statistics.
 
+## Highlighting
+`.highlight(true)` fills each hit's `text` (its source text) and `matches`. Each `Match` has three fields:
+- **`range`:** a UTF-8 byte range into `text`;
+- **`clause`:** the index into `query.clauses()` of the clause it matched;
+- **`occurrence`:** which of that clause's occurrences it is.
+
+A term or fuzzy term matches one token. An exact phrase covers its first token to its last. A sloppy phrase match lists one range per phrase word, all sharing one `occurrence`. `pigeonhole_text::snippet(&text, &matches, max_bytes)` picks a window, cut on word boundaries. It prefers the most distinct clauses, then the most matches, then the earliest.
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_text::{Index, IndexOptions, Source, snippet};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let notes = db.table("notes")?.family("body", Family::default()).create_if_missing()?;
+# let index = Index::create(&db, "notes_text", Source::new(&notes, "body", b"text"), IndexOptions::new())?;
+index.put(b"a", "Notes from the March meeting: we chose Postgres over SQLite.")?;
+let hits = index.search(r#""march meeting" postgress~"#, 10).highlight(true).run()?;
+let text = hits[0].text.as_deref().unwrap();
+let found: Vec<&str> = hits[0].matches.iter().map(|m| &text[m.range.clone()]).collect();
+assert_eq!(found, ["March meeting", "Postgres"]);
+let s = snippet(text, &hits[0].matches, 40);
+assert_eq!(&text[s.range], "March meeting: we chose Postgres over ");
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Matches are recomputed** by tokenising the hit's text again, so they always fit the text returned. That costs one pass per hit, and nothing when highlighting is off.
+- **An index without positions** still highlights terms and fuzzy terms.
+- **Python and MCP callers get code-point offsets,** not bytes.
+
 ## Options
 Options are fixed when the index is created.
 
@@ -143,7 +175,7 @@ These are the means of two runs, which agreed within 4%.
 
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.
 - **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Positional skipping is tracked in #1334.
-- **Fuzzy terms** cost a walk over the dictionary near the term, then the union of the matching terms' postings. On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk. Pruning inside a fuzzy clause is tracked in #1333.
+- **Fuzzy terms** cost a walk over the dictionary near the term, then the matching terms' postings. Once the top `k` are held, an expansion that can't lift a document into them stops being read (#1333). On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk. The fuzzy rows above predate #1333's pruning: at 100,000 documents on a laptop, it cut fuzzy-1's p50 from 25 ms to 2.7 ms. #1349 re-takes them.
 - **Positions are cheap to write:** 18% more time per document on the reference machine, much less than a laptop suggests.
 
 ## Errors

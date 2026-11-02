@@ -80,6 +80,10 @@ pub enum HookSite {
     /// before it reads the streams: where a test restarts the writer in between (D310 PR 4,
     /// simp724's B2).
     ReaderFeedReads,
+    /// On the coordinator's shard, right after it answered `OutcomeUnknown` for a
+    /// cross-shard commit whose share apply failed: where a caller that heard the answer
+    /// commits again while the shard thread is still inside the handler (#1358).
+    FailedShareAnswered,
 }
 
 /// A one-shot test callback.

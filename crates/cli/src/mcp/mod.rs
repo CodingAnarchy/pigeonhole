@@ -45,6 +45,8 @@ pub(crate) struct Limits {
     pub result_bytes: usize,
     /// The longest value a read returns whole unless it asks for more.
     pub value_bytes: usize,
+    /// `--change-feed`: turn the change feed on with this retention in bytes.
+    pub feed_bytes: Option<u64>,
 }
 
 /// JSON-RPC error codes.
@@ -65,9 +67,14 @@ pub(crate) fn run(
     let db = if read_only {
         open::reader_only(cli, file)?
     } else if create && !file.exists() {
-        Db::Writer(open::for_write(cli, file, true)?)
+        Db::Writer(open::for_write_with_feed(
+            cli,
+            file,
+            true,
+            limits.feed_bytes,
+        )?)
     } else {
-        open::for_read(cli, file)?
+        open::for_read_with_feed(cli, file, limits.feed_bytes)?
     };
     let writable = !read_only && db.writable();
     let _ = writeln!(

@@ -430,3 +430,53 @@ fn prefix_length_counts_characters_not_bytes() {
     assert_eq!(ids(1), [b"acute".to_vec()]);
     db.close().unwrap();
 }
+
+#[test]
+fn pruned_fuzzy_searches_equal_the_full_ranking_on_a_dense_vocabulary() {
+    // #1333: the bench's hard case at test scale. A `w`+digits vocabulary puts dozens of
+    // terms, common ones among them, within two edits of a typo. A small `k` idles most
+    // expansions; the full ranking (`k` above the document count) idles none. The top `k`
+    // must be its prefix, with the same scores.
+    for seed in seeds(&[51, 52]) {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = open(&dir);
+        let (_docs, index) = create(&db, IndexOptions::new());
+        let mut rng = Rng::new(seed);
+        let word = |rng: &mut Rng| {
+            let a = rng.below(400);
+            let b = rng.below(400);
+            format!("w{}", a.min(b))
+        };
+        for i in 0..600 {
+            let n = 3 + rng.below(12);
+            let text: Vec<String> = (0..n).map(|_| word(&mut rng)).collect();
+            index
+                .put(format!("d{i:04}").as_bytes(), &text.join(" "))
+                .unwrap();
+        }
+        for q in 0..60 {
+            let mut t = word(&mut rng).into_bytes();
+            let at = 1 + rng.below(t.len() as u64 - 1) as usize;
+            t[at] = b'0' + ((t[at] - b'0' + 1 + rng.below(9) as u8) % 10);
+            let typo = String::from_utf8(t).unwrap();
+            let f = [Fuzziness::One, Fuzziness::Two][rng.below(2) as usize];
+            let mut query = Query::new().fuzzy(typo.clone(), f);
+            if rng.below(2) == 0 {
+                query = query.term(word(&mut rng));
+            }
+            let full = index.search(query.clone(), 10_000).run().unwrap();
+            let want: BTreeMap<Vec<u8>, f64> =
+                full.iter().map(|h| (h.id.clone(), h.score)).collect();
+            for k in [1, 3, 10] {
+                let got = index.search(query.clone(), k).run().unwrap();
+                same_top_k(
+                    &got,
+                    &want,
+                    k,
+                    &format!("seed {seed}, query {q} {typo:?} {f:?}, k {k}"),
+                );
+            }
+        }
+        db.close().unwrap();
+    }
+}

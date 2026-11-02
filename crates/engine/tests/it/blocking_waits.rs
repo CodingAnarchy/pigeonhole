@@ -654,6 +654,13 @@ fn a_failed_share_apply_ends_visibility_instead_of_stalling_it() {
     let drivers: Vec<_> = shards.into_iter().map(driver).collect();
     let (on_a, on_b) = tables_on_0_and_1(&db);
     db.inject(pigeonhole_engine::Fault::NextApply, true);
+    // #1358: the coordinator's shard thread stays in the handler a while after it answers,
+    // so the later commits below run while it is still there. They must be refused all the
+    // same: the shard's death is recorded before the answer, never after.
+    db.on_next(
+        pigeonhole_engine::HookSite::FailedShareAnswered,
+        Box::new(|| thread::sleep(Duration::from_millis(200))),
+    );
     let (db2, a2, b2) = (Arc::clone(&db), Arc::clone(&on_a), Arc::clone(&on_b));
     let crossed = gate::within(10, move || {
         db2.commit(cross(&b2, &a2, "fails"), Some(Durability::Sync))

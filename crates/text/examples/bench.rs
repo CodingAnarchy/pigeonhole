@@ -25,7 +25,9 @@
 //! - `fuzzy-1`, `fuzzy-2`: a fuzzy term (D309 PR 4) at 1 and 2 edits, a word drawn by Zipf
 //!   frequency with one digit replaced. The vocabulary is `w0` to `w49999`, so a term has
 //!   dozens of terms within 2 edits: a dense dictionary, the hard case for the walk.
-//! - `fuzzy-2-prefix2`: `fuzzy-2` with `prefix_length(2)`.
+//! - `fuzzy-2-prefix2`: `fuzzy-2` with `prefix_length(2)`;
+//! - `fuzzy-1-term`: `fuzzy-1` plus a term drawn by Zipf frequency, so the fuzzy clause can
+//!   be non-essential (#1333).
 //!
 //! The fuzzy kinds also print the mean expansions per query.
 //!
@@ -302,6 +304,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     time("fuzzy-1", &index, &fuzzy(Fuzziness::One), 10)?;
     time("fuzzy-2", &index, &fuzzy(Fuzziness::Two), 10)?;
     time_with("fuzzy-2-prefix2", &index, &fuzzy(Fuzziness::Two), 10, 2)?;
+    let fuzzy_term: Vec<Query> = typos
+        .iter()
+        .map(|t| {
+            Query::new()
+                .fuzzy(t.clone(), Fuzziness::One)
+                .term(word(z.rank(&mut rng)))
+        })
+        .collect();
+    time("fuzzy-1-term", &index, &fuzzy_term, 10)?;
     drop(index);
     db.close()?;
     Ok(())

@@ -3931,6 +3931,13 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `SearchStats::fuzzy`, so `SearchStats` loses `Copy`.
 - **Tests:** a brute-force optimal-string-alignment scan of every term, at full depth and at small `k`.
 - **The AX102 numbers** (the 3b run, 1M documents, flush only, the mean of two runs): 1 edit 375 ms p50 (41 expansions), 2 edits 406 ms, 2 edits with `prefix_length(2)` 130 ms. A fuzzy clause walks the union of its expansions' postings, and on the bench's dense `w`+digits vocabulary those include common words. Pruning inside the clause (max-combine MaxScore) is #1333, in 1.1.0.
+- **#1333 (pruning inside a fuzzy clause):** once `k` are held, an expansion whose bound is below the threshold less every other clause's bound is dropped. It's exact, because such an expansion can't give a document that enters its maximum. Laptop, 100k documents: fuzzy-1 p50 25 → 2.7 ms.
+
+**PR 5.** Highlighting, as rev 5 §4.5.
+- **`Search::highlight(true)`** fills `Hit::text` and `Hit::matches`, recomputed by tokenising the source text again. `Match` has `range`, `clause` and `occurrence`.
+- **Sloppy matches:** the sloppy matcher reports each counted match's positions through a zero-sized recorder, so scoring is unchanged.
+- **`snippet()`** picks a word-bounded window by distinct clauses, then matches, then the earliest start.
+- **Tests:** against a brute-force matcher over the source texts.
 
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
