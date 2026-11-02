@@ -19,7 +19,7 @@ readme = "README.md"
 __unstable-fixed-seed = []
 
 [dependencies]
-crc32c = { workspace = true }
+crc-fast = { workspace = true }
 foldhash = { workspace = true }
 twox-hash = { workspace = true }
 lz4_flex = { workspace = true }
