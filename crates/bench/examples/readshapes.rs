@@ -38,9 +38,6 @@
 //!   64-dimension `f32` L2 vectors (qualifiers `a` and `b`), over every vector, or with
 //!   qualifier prefix `b` (half of them). Counted per scored vector; the query is built
 //!   outside the measured function.
-//! - `knn-exact-f16`, `knn-exact-bf16`: `knn-exact` over the same vectors rounded to `f16` and
-//!   to `bf16` (#1263), in table `vh` (built only for these two shapes, so `knn-exact`'s
-//!   store is unchanged): the half-precision kernels' cost per cell beside `knn-exact`'s.
 //!
 //! It follows the shape-binary contract of `scripts/instructions-per-cell.sh`: each measured
 //! iteration is one `#[inline(never)]` function named `shape_*` that counts its work with a
@@ -299,9 +296,9 @@ fn knn_vector(rng: &mut Rng) -> Vec<f32> {
 }
 
 #[inline(never)]
-fn shape_knn(v: &Table, query: &[f32], family: &str, filtered: bool) -> usize {
+fn shape_knn(v: &Table, query: &[f32], filtered: bool) -> usize {
     let _measured = Measured::start();
-    let scan = v.scan_prefix(b"").family(family);
+    let scan = v.scan_prefix(b"").family("e");
     let scan = if filtered {
         scan.qualifier_prefix(b"b")
     } else {
@@ -435,18 +432,11 @@ fn main() {
         drop(cells);
         w
     });
-    // Table `v` (or `vh` for the half-precision shapes), only for its shapes: two vectors
-    // per row, the same vectors in either (rounded to the family's element), flushed, then
-    // read once.
-    let (table, element) = match shape.as_str() {
-        "knn-exact-f16" => ("vh", Element::F16),
-        "knn-exact-bf16" => ("vh", Element::BF16),
-        _ => ("v", Element::F32),
-    };
+    // Table `v`, only for its shapes: two vectors per row, flushed, then read once.
     let v = shape.starts_with("knn-").then(|| {
-        let spec = VectorSpec::new(KNN_DIM as u32, element, Metric::L2).unwrap();
+        let spec = VectorSpec::new(KNN_DIM as u32, Element::F32, Metric::L2).unwrap();
         let v = db
-            .table(table)
+            .table("v")
             .unwrap()
             .family("e", Family::vector(spec).bloom_bits(10))
             .create_if_missing()
@@ -509,12 +499,11 @@ fn main() {
                     let keys = multi_get_keys(&mut rng, shape == "multi-get-dense");
                     shape_multi_get(&t, &keys)
                 }
-                "knn-exact" | "knn-filtered" | "knn-exact-f16" | "knn-exact-bf16" => {
+                "knn-exact" | "knn-filtered" => {
                     let query = knn_vector(&mut rng);
                     shape_knn(
                         v.as_ref().expect("built above"),
                         &query,
-                        "e",
                         shape == "knn-filtered",
                     )
                 }
