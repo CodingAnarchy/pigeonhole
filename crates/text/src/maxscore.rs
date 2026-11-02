@@ -363,6 +363,8 @@ pub(crate) fn top_k(
     let mut held: BinaryHeap<Held> = BinaryHeap::with_capacity(k + 1);
     // How many of `by_bound`'s first clauses are non-essential.
     let mut skip = 0;
+    // The threshold the fuzzy clauses' expansions were last cut at (#1333).
+    let mut cut_at = f64::NEG_INFINITY;
     let mut contrib = vec![0.0f64; n];
     let mut has = vec![false; n];
     loop {
@@ -372,10 +374,14 @@ pub(crate) fn top_k(
                 skip += 1;
             }
             // Inside each essential fuzzy clause, the expansions that can't lift a document
-            // to the threshold even with every other clause at its bound (#1333).
-            for &c in &by_bound[skip..] {
-                let cut = th - (prefix[n] - clauses[c].bound);
-                clauses[c].drop_below(cut);
+            // to the threshold even with every other clause at its bound (#1333). Only when
+            // the threshold has risen since the last cut: nothing else changes the cut.
+            if th > cut_at {
+                cut_at = th;
+                for &c in &by_bound[skip..] {
+                    let cut = th - (prefix[n] - clauses[c].bound);
+                    clauses[c].drop_below(cut);
+                }
             }
         }
         let essential = &by_bound[skip..];
