@@ -255,6 +255,8 @@ class Traversal:
     def hops_cut(self) -> int: ...
     @property
     def cut_by_max_nodes(self) -> bool: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
 
 @final
 class Neighbour:
@@ -279,6 +281,77 @@ class RowPosition:
     def from_bytes(b: Key) -> RowPosition: ...
     def __eq__(self, other: object, /) -> bool: ...
     def __hash__(self) -> int: ...
+
+@final
+class ScanPosition:
+    """Where a `scan_within` page stopped, to resume with `after=`; its bytes are stable."""
+
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(b: Key) -> ScanPosition: ...
+    @property
+    def row(self) -> bytes: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+@final
+class KeysPosition:
+    """Where a `multi_get_within` page stopped, to resume with `after=`; its bytes are stable."""
+
+    def to_bytes(self) -> bytes: ...
+    @staticmethod
+    def from_bytes(b: Key) -> KeysPosition: ...
+    @property
+    def key(self) -> bytes: ...
+    def __eq__(self, other: object, /) -> bool: ...
+    def __hash__(self) -> int: ...
+
+@final
+class ScanPage:
+    """A `scan_within` page: its rows, size, and where to resume."""
+
+    @property
+    def rows(self) -> list[Row]: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
+    @property
+    def next_bytes(self) -> int | None: ...
+    @property
+    def resume(self) -> ScanPosition | None: ...
+    def __len__(self) -> int: ...
+
+@final
+class KeysPage:
+    """A `multi_get_within` page: its rows, size, and where to resume."""
+
+    @property
+    def rows(self) -> list[Row]: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
+    @property
+    def next_bytes(self) -> int | None: ...
+    @property
+    def resume(self) -> KeysPosition | None: ...
+    # Unlike multi_get, the rows are in key order and not aligned with the keys given.
+    def __len__(self) -> int: ...
+
+@final
+class NearestPage:
+    """A `nearest_within` page: the nearest neighbours that fit a byte budget."""
+
+    @property
+    def neighbours(self) -> list[Neighbour]: ...
+    @property
+    def bytes(self) -> int: ...
+    @property
+    def cut_by_budget(self) -> bool: ...
+    @property
+    def next_bytes(self) -> int | None: ...
+    def __len__(self) -> int: ...
 
 @final
 class Pages:
@@ -361,6 +434,7 @@ class Table:
         per_node_limit: int | None = None,
         hop_limit: int | None = None,
         max_nodes: int | None = None,
+        byte_budget: int = 0,
         parents: bool = False,
         qualifier_prefix: Key | None = None,
         snapshot: Snapshot | None = None,
@@ -380,6 +454,48 @@ class Table:
         snapshot: Snapshot | None = None,
         parallel: int | None = None,
     ) -> list[Neighbour]: ...
+    def nearest_within(
+        self,
+        family: str,
+        query: Vector,
+        k: int,
+        bytes: int,
+        *,
+        prefix: Key | None = None,
+        start: Key | None = None,
+        end: Key | None = None,
+        keys: Sequence[Key] | None = None,
+        qualifier_prefix: Key | None = None,
+        snapshot: Snapshot | None = None,
+        parallel: int | None = None,
+    ) -> NearestPage: ...
+    def scan_within(
+        self,
+        bytes: int,
+        prefix: Key | None = None,
+        *,
+        start: Key | None = None,
+        end: Key | None = None,
+        families: Sequence[str] | None = None,
+        qualifier_prefix: Key | None = None,
+        versions: int = 1,
+        limit: int | None = None,
+        column_limit: int | None = None,
+        snapshot: Snapshot | None = None,
+        after: ScanPosition | None = None,
+    ) -> ScanPage: ...
+    def multi_get_within(
+        self,
+        keys: Sequence[Key],
+        bytes: int,
+        *,
+        families: Sequence[str] | None = None,
+        qualifier_prefix: Key | None = None,
+        versions: int = 1,
+        column_limit: int | None = None,
+        snapshot: Snapshot | None = None,
+        after: KeysPosition | None = None,
+    ) -> KeysPage: ...
     def pages(
         self,
         row: Key,

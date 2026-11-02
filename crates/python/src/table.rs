@@ -714,7 +714,7 @@ impl Table {
     /// A breadth-first traversal (D304) of a graph stored as adjacency rows: each hop
     /// follows `family`'s edges (a column per edge, its qualifier the destination's key)
     /// from the previous hop's nodes, and keeps the nodes not visited before.
-    #[pyo3(signature = (seeds, family, *, hops=1, per_node_limit=None, hop_limit=None, max_nodes=None, parents=false, qualifier_prefix=None, snapshot=None, parallel=None))]
+    #[pyo3(signature = (seeds, family, *, hops=1, per_node_limit=None, hop_limit=None, max_nodes=None, byte_budget=0, parents=false, qualifier_prefix=None, snapshot=None, parallel=None))]
     #[allow(clippy::too_many_arguments)]
     fn traverse(
         &self,
@@ -725,6 +725,7 @@ impl Table {
         per_node_limit: Option<u32>,
         hop_limit: Option<u64>,
         max_nodes: Option<u64>,
+        byte_budget: u64,
         parents: bool,
         qualifier_prefix: Option<&Bound<'_, PyAny>>,
         snapshot: Option<&Bound<'_, Snapshot>>,
@@ -739,6 +740,7 @@ impl Table {
             per_node_limit,
             hop_limit,
             max_nodes,
+            byte_budget,
             parents,
             qualifier_prefix,
             snapshot,
@@ -767,7 +769,7 @@ impl Table {
         snapshot: Option<&Bound<'_, Snapshot>>,
         parallel: Option<usize>,
     ) -> PyResult<Vec<crate::walk::Neighbour>> {
-        crate::walk::nearest(
+        let (found, _) = crate::walk::nearest(
             py,
             &self.0,
             family,
@@ -780,6 +782,128 @@ impl Table {
             qualifier_prefix,
             snapshot,
             parallel,
+            None,
+        )?;
+        Ok(found.into_iter().map(crate::walk::Neighbour).collect())
+    }
+
+    /// `nearest`'s neighbours, nearest first, that fit `bytes` (D308): each counts its row
+    /// key, its qualifier and 16 bytes, and a neighbour is in whole or not at all. The budget
+    /// bounds the result, not the work: the search reads and ranks as `nearest` does. There's
+    /// no resume position: ask again with a larger budget or `k`.
+    #[pyo3(signature = (family, query, k, bytes, *, prefix=None, start=None, end=None, keys=None, qualifier_prefix=None, snapshot=None, parallel=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn nearest_within(
+        &self,
+        py: Python<'_>,
+        family: String,
+        query: &Bound<'_, PyAny>,
+        k: usize,
+        bytes: u64,
+        prefix: Option<&Bound<'_, PyAny>>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        keys: Option<Vec<Bound<'_, PyAny>>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        parallel: Option<usize>,
+    ) -> PyResult<crate::budget::NearestPage> {
+        let (found, page) = crate::walk::nearest(
+            py,
+            &self.0,
+            family,
+            query,
+            k,
+            prefix,
+            start,
+            end,
+            keys,
+            qualifier_prefix,
+            snapshot,
+            parallel,
+            Some(bytes),
+        )?;
+        let (bytes, next_bytes) = page.expect("a budgeted search returns its page");
+        Ok(crate::budget::NearestPage {
+            neighbours: found
+                .into_iter()
+                .map(|n| Py::new(py, crate::walk::Neighbour(n)))
+                .collect::<PyResult<_>>()?,
+            bytes,
+            next_bytes,
+        })
+    }
+
+    /// A page of `scan`'s cells, in scan order, at most `bytes` long (D308): each cell counts
+    /// its qualifier, its value and 16 bytes, and each row its key once. A column (all the
+    /// versions the read selects) is kept whole or not at all; a row may be cut between
+    /// columns. `limit` applies too: whichever comes first stops the read. `after` resumes
+    /// where an earlier page stopped (its `resume`). Without a `snapshot`, a chain of pages
+    /// is not one consistent read.
+    #[pyo3(signature = (bytes, prefix=None, *, start=None, end=None, families=None, qualifier_prefix=None, versions=1, limit=None, column_limit=None, snapshot=None, after=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_within(
+        &self,
+        py: Python<'_>,
+        bytes: u64,
+        prefix: Option<&Bound<'_, PyAny>>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        families: Option<Vec<String>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        versions: u32,
+        limit: Option<u64>,
+        column_limit: Option<u32>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        after: Option<&crate::budget::ScanPosition>,
+    ) -> PyResult<crate::budget::ScanPage> {
+        crate::budget::scan_within(
+            py,
+            &self.0,
+            bytes,
+            prefix,
+            start,
+            end,
+            families,
+            qualifier_prefix,
+            versions,
+            limit,
+            column_limit,
+            snapshot,
+            after,
+        )
+    }
+
+    /// A page of `multi_get`'s cells, in key order, at most `bytes` long (D308), as
+    /// `scan_within` counts them. Unlike `multi_get`, the rows aren't aligned with `keys`:
+    /// they come in key order, and keys with no cell the selection keeps return nothing. `after` resumes where an earlier page stopped:
+    /// at the first key at or after its position's key, so keys added or removed between
+    /// pages resume at the right one.
+    #[pyo3(signature = (keys, bytes, *, families=None, qualifier_prefix=None, versions=1, column_limit=None, snapshot=None, after=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn multi_get_within(
+        &self,
+        py: Python<'_>,
+        keys: Vec<Bound<'_, PyAny>>,
+        bytes: u64,
+        families: Option<Vec<String>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        versions: u32,
+        column_limit: Option<u32>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        after: Option<&crate::budget::KeysPosition>,
+    ) -> PyResult<crate::budget::KeysPage> {
+        crate::budget::multi_get_within(
+            py,
+            &self.0,
+            &keys,
+            bytes,
+            families,
+            qualifier_prefix,
+            versions,
+            column_limit,
+            snapshot,
+            after,
         )
     }
 
