@@ -715,3 +715,133 @@ fn a_durable_feed_follows_the_recovery() {
     drop(feed);
     db.close().unwrap();
 }
+
+/// cli692's S2 on #1321: a feed waiting in `next` on the engine a recovery replaces keeps
+/// going. Whatever the old engine's reader returns as it closes under the wait (an error
+/// included) belongs to the superseded generation, so the feed follows the recovery rather
+/// than ending.
+#[test]
+fn a_feed_waiting_through_the_swap_follows_it() {
+    let (vfs, gate) = gate::vfs(2003);
+    let db = Pigeonhole::open(
+        DB,
+        options(Arc::clone(&vfs), Recovery::Io)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+    )
+    .unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let mut feed = t.feed().open().unwrap();
+    put(&t, "first").unwrap();
+    let first = feed.next(Duration::from_secs(10)).unwrap().unwrap().seqno();
+    // The subscriber waits on its own thread, on the old engine, through the failure and
+    // the swap.
+    let waiter = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        while rows.last().map(Vec::as_slice) != Some(&b"after"[..]) {
+            let c = feed.next(Duration::from_secs(30));
+            let c = c
+                .map_err(|e| format!("{e:?}"))?
+                .ok_or("no commit within 30 s")?;
+            assert!(c.seqno() > first, "never a commit twice");
+            rows.push(c.changes()[0].row().to_vec());
+        }
+        Ok::<_, String>(rows)
+    });
+    std::thread::sleep(Duration::from_millis(50));
+    let _ = fail_shard(&gate, &t, "lost");
+    assert!(
+        wait_until(20, || !db.is_failed()
+            && db.recovery_stats().recoveries == 1),
+        "the supervisor did not recover"
+    );
+    put(&t, "after").unwrap();
+    let rows = waiter
+        .join()
+        .unwrap()
+        .expect("the feed followed the recovery");
+    assert!(
+        rows.len() <= 2 && (rows.len() == 1 || rows[0] == b"lost"),
+        "{rows:?}"
+    );
+    db.close().unwrap();
+}
+
+/// cli692's S2 on #1321: an I/O error from the old engine's feed reader, read after a
+/// recovery swapped in a new engine, is the old engine's: the feed follows the recovery and
+/// delivers the commit the error hit, from the new engine, instead of ending.
+///
+/// The record the error hits sits in a segment before the checkpoint, so the reopen's replay
+/// never reads it; the feed's read of it is held across the failure and the swap, then
+/// fails once.
+#[test]
+fn an_io_error_from_the_old_engine_during_the_swap_follows_it() {
+    let (vfs, gate) = gate::vfs(2004);
+    let db = Pigeonhole::open(
+        DB,
+        options(Arc::clone(&vfs), Recovery::Io)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+    )
+    .unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let mut feed = t.feed().open().unwrap();
+    put(&t, "first").unwrap();
+    let first = feed.next(Duration::from_secs(10)).unwrap().unwrap().seqno();
+    const MARK: &[u8] = b"feed-io-marker-2004";
+    gate.hold_reads_containing(Some(MARK));
+    t.mutate(b"poison").put("f", b"q", MARK).commit().unwrap();
+    let waiter = std::thread::spawn(move || {
+        let mut rows = Vec::new();
+        while rows.last().map(Vec::as_slice) != Some(&b"after"[..]) {
+            let c = feed.next(Duration::from_secs(30));
+            let c = c
+                .map_err(|e| format!("{e:?}"))?
+                .ok_or("no commit within 30 s")?;
+            assert!(c.seqno() > first, "never a commit twice");
+            rows.push(c.changes()[0].row().to_vec());
+        }
+        Ok::<_, String>(rows)
+    });
+    // The feed's read of the poison record is held on the old engine.
+    gate.wait_held_read();
+    // Past the segment (512 KiB), then flushed: the checkpoint moves past the poison's
+    // segment, so the reopen's replay starts after it.
+    for i in 0..40 {
+        put_sized(&t, &format!("fill{i:02}"), 16 << 10).unwrap();
+    }
+    db.flush().unwrap();
+    let _ = fail_shard(&gate, &t, "lost");
+    assert!(
+        wait_until(20, || !db.is_failed()
+            && db.recovery_stats().recoveries == 1),
+        "the supervisor did not recover"
+    );
+    // Now the held read fails, once, on the superseded engine.
+    gate.fail_next_read_containing(MARK);
+    gate.release_reads();
+    put(&t, "after").unwrap();
+    let rows = waiter
+        .join()
+        .unwrap()
+        .expect("the feed followed the recovery");
+    assert_eq!(
+        gate.read_failures().len(),
+        1,
+        "the old reader's read failed"
+    );
+    assert_eq!(
+        rows.first().map(Vec::as_slice),
+        Some(&b"poison"[..]),
+        "{rows:?}"
+    );
+    db.close().unwrap();
+}

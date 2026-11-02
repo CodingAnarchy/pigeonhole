@@ -380,6 +380,8 @@ impl Feed {
             });
             let next = match self.reader.wait(left) {
                 Ok(next) => next,
+                // The old engine failing under a recovery's swap: follow the recovery.
+                Err(_) if swapped(&self.db, self.generation) => continue,
                 Err(e) => return Err(fail(&mut self.failed, e.into())),
             };
             match next {
@@ -389,6 +391,10 @@ impl Feed {
                     }
                     return Ok(Some(&self.commit));
                 }
+                // The old engine's reader, still waiting as a recovery swapped in a new
+                // engine, reads the new session's records as outside its history: the new
+                // engine's reader decides from the token instead (cli692's S2 on #1321).
+                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
                 Next::Expired(e) => {
                     self.oldest_retained = e.oldest_retained;
                     return Err(expired(e));
@@ -408,23 +414,30 @@ impl Feed {
     /// as [`next`](Self::next)'s do.
     pub fn try_next(&mut self) -> Result<Option<&Commit>> {
         self.check_failed()?;
-        self.follow_recovery()?;
-        let next = match self.reader.try_next() {
-            Ok(next) => next,
-            Err(e) => return Err(fail(&mut self.failed, e.into())),
-        };
-        match next {
-            Next::Commit(c) => {
-                if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
-                    return Err(fail(&mut self.failed, e));
+        loop {
+            self.follow_recovery()?;
+            let next = match self.reader.try_next() {
+                Ok(next) => next,
+                // The old engine failing under a recovery's swap: follow it and look again
+                // (a swap is rare, so this goes round once or twice).
+                Err(_) if swapped(&self.db, self.generation) => continue,
+                Err(e) => return Err(fail(&mut self.failed, e.into())),
+            };
+            return match next {
+                Next::Commit(c) => {
+                    if let Err(e) = fill(&mut self.commit, &mut self.names, &self.db, c) {
+                        return Err(fail(&mut self.failed, e));
+                    }
+                    Ok(Some(&self.commit))
                 }
-                Ok(Some(&self.commit))
-            }
-            Next::Expired(e) => {
-                self.oldest_retained = e.oldest_retained;
-                Err(expired(e))
-            }
-            Next::Pending => Ok(None),
+                // As in `next`: a superseded reader's expiry is not the feed's.
+                Next::Expired(_) if swapped(&self.db, self.generation) => continue,
+                Next::Expired(e) => {
+                    self.oldest_retained = e.oldest_retained;
+                    Err(expired(e))
+                }
+                Next::Pending => Ok(None),
+            };
         }
     }
 
@@ -527,6 +540,13 @@ fn fill(out: &mut Commit, names: &mut Names, db: &Db, c: &pigeonhole_engine::Com
         }
     }
     Ok(())
+}
+
+/// Whether the engine of `generation` was replaced by a recovery (or the database closed)
+/// since the feed's reader subscribed: an error from that reader then is the old engine's,
+/// not the feed's (simp724 on #1321), and `Feed::follow_recovery` decides what follows.
+fn swapped(db: &Db, generation: u64) -> bool {
+    db.check_generation(generation).is_err()
 }
 
 /// Ends the feed with `e`: kept for every later call, and returned now.

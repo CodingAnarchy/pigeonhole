@@ -4009,7 +4009,7 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `next(timeout)` and `try_next()` lend `Option<&Commit>`, reused between calls;
   - `token()` gives a `FeedToken`, whose bytes round-trip through `as_bytes` and `from_bytes`;
   - `oldest_retained()` reports the oldest retained seqno after an expiry, when known.
-  - **An error ends the feed** (simp724 and cli692 on #1321). Every later call returns the same error, as an expired feed does. The engine reader has already moved past the commit it was delivering, so a retry would skip it. A value that doesn't decode is `Corruption`, never an empty value, and the token then points past that commit.
+  - **An error ends the feed** (simp724 and cli692 on #1321). Every later call returns the same error, as an expired feed does. The engine reader has already moved past the commit it was delivering, so a retry would skip it. A value that doesn't decode is `Corruption`, never an empty value, and the token then points past that commit. Only the live engine's errors stick (cli692's S2, simp724): an error or an expiry from a reader whose engine a recovery replaced belongs to the superseded generation. The feed then follows the recovery and lets the new engine's reader decide from the token. The old reader, still waiting through the swap, reads the new session's records as outside its history, so its expiry is never the feed's.
 - **Types:**
   - `Commit`: `seqno`, `timestamp`, `changes`.
   - `Change`: `table` and `family` by name, `kind`, `row`, `qualifier`, `timestamp`, and `value()` as the read API's `Value` (`None` for deletes).
