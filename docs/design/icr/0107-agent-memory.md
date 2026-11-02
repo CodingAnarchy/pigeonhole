@@ -86,6 +86,35 @@
 - **A hit's size:** its text, its id's byte form, and 16, plus 60 with signals and `4 · dim` with the embedding. Hits are whole, and at least one is returned, as with the engine's budgets (D308): the first even if it alone is larger. `truncated` is set whenever the budget cut the list, that case included (simp724's N2 on #1374).
 - **Names settled with cli692 on #1374:** `now_us(us)` (not `at`), and `uses` in `Signals` and `Weights` (not `use_`).
 
+## T2: forgetting (#1336)
+The shapes were settled with cli692 on #1336 (c6589132014).
+- **`ForgetPolicy`** (`#[non_exhaustive]`, `Clone`, `PartialEq`, a `Default` builder):
+  - `min_retention(f64)`;
+  - `max_age(Kind, Duration)`, counted from `created_us`;
+  - `half_life(Duration)` (7 days), `use_weight(f64)` (0.1), `max_per_pass(usize)` (1,000), `interval(Duration)` (1 h).
+  - **Retention** is `importance · exp(−since_last_use / half_life) + use_weight · ln(1 + uses)`. The use term doesn't decay, so heavy use protects a memory from retention (not from `max_age`).
+- **The persisted policy:** `StoreOptions::forget(ForgetPolicy)` and `StoreOptions::episodic_ttl(Duration)` (the shorthand) record it in `G` (`meta:forget`, versioned). `Store::forget_policy()` reads it, and `Store::set_forget_policy(Option<ForgetPolicy>)` changes it (`None` turns forgetting off).
+- **A pass:** `Store::forget() -> Forget<'_>`, with `.policy(&p)` (a one-off override), `.after(&MemoryId)` (resume) and `.now_us(u64)`, then `.run() -> Result<ForgetPass>`.
+  - `InvalidArgument` with no persisted policy and no override.
+  - `ForgetPass` (`#[non_exhaustive]`): `examined`, `deleted`, `protected`, and `resume: Option<MemoryId>`.
+  - A pass deletes at most `max_per_pass`. It goes in id order, so a resumed pass doesn't see memories created behind its position until the next pass from the start.
+- **`Store::forget_in(txn, &id, now_us) -> Result<Forgot>`** re-evaluates one memory, under the persisted policy, in the caller's transaction (M2).
+  - **What it reads there:** `content:text`, `meta:kind`/`pinned`, `peak:importance`/`last_used`, `stats:uses`, and the `backlinks` row, plus each `DERIVED_FROM` source's `content:text` and kind.
+  - If the memory is still due and not protected, it deletes it through `delete_in`.
+  - `Forgot` (`#[non_exhaustive]`) is `Deleted`, `Protected`, `NotDue` or `Gone`.
+  - **Protected** means pinned, or a source of a live semantic memory's `DERIVED_FROM` link. Protection applies to `max_age` too.
+- **Opening:**
+  - `OpenOptions` (`#[non_exhaustive]`) takes `.model(id)` or `.without_embeddings()` (exactly one), and `.own_forgetter()`.
+  - `Store::open_with(db, name, OpenOptions)` and `Store::create_with(db, name, StoreOptions, OpenOptions)`.
+  - `open` and `open_without_embeddings` are the short forms, and `create` opens with its own model.
+- **The `Forgetter`:**
+  - **The crate's thread:** without `own_forgetter`, the crate runs one on its own thread when the store has a policy at open, or once `set_forget_policy` sets one.
+  - **The application's:** with `own_forgetter`, `Store::take_forgetter() -> Option<Forgetter>` hands it out once.
+  - **Its API:** `run_once(budget) -> Result<bool>`, `wait(timeout)`, `closed()` and `set_wakeup`, as `pigeonhole-vector`'s `Rebalancer` has. It reads the persisted policy before each pass, and it's closed once every application handle drops.
+- **`Store` is `Clone`** (cheap clones), so the forgetter can watch the application's handles.
+- **A forgotten memory** is deleted as `delete` deletes, so the change feed (D310) shows deletes.
+- **Nothing on `ReadStore`:** forgetting writes.
+
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:
   - `content:text`, the text index's source;
@@ -97,3 +126,4 @@
   - `links:{target row}` and `backlinks:{source row}`, each `[type u8][weight f32 LE]`.
 - **Dedup rows:** `{ns}\0h{xxh3_128 of the normalised text, big-endian}`, holding `meta:rid` (the memory's row key).
 - **`G`'s `meta`:** `layout` (1), `text_index`, `model_id`, `model_dim` and `model_element` (`0` for F32, `1` for F16, `2` for BF16).
+  - `forget` (T2) holds the policy: a version byte (1), `min_retention` (a flag, then `f64`), `half_life` µs, `use_weight`, `max_per_pass`, `interval` µs (each 8 bytes, little endian), then a count and the `(kind u8, max_age µs)` pairs.

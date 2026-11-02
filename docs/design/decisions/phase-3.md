@@ -4175,3 +4175,15 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - the byte budget, the filters, the linear blend, several namespaces, the refusals, and a reader process recalling exactly what the writer does.
   - Mutations of `id_prefix`, 0-based ranks and the superseded filter were all caught.
 
+
+**T2 (#1336).** Forgetting, as revision 2 §4, with cli692's API on #1336:
+- **The persisted policy** (`StoreOptions::forget`/`episodic_ttl`, `set_forget_policy`) is the default. `forget()` takes a one-off `.policy`.
+- **Opening:** `OpenOptions` with `open_with`/`create_with`, and `take_forgetter` for an application-owned forgetter.
+- **Each deletion re-evaluates in its transaction (M2):** `forget_in` reads the stats, peak, meta and backlinks there, then deletes through `delete_in`. Protection covers pinned memories and the sources of a live semantic memory.
+- **Tests:**
+  - retention, TTL and protection, including protection lapsing when the semantic memory goes;
+  - bounded, resumable passes;
+  - forget racing `mark_used`, a merge's importance raise, and a new `DERIVED_FROM` link, each conflicting and ending in `verify`;
+  - the persisted policy;
+  - the application's forgetter and the crate's thread.
+  - Mutations of the transaction's reads and of protection were caught.

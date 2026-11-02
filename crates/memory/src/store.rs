@@ -9,7 +9,10 @@ use pigeonhole::{
 };
 use pigeonhole_text::{Index, IndexOptions, ReadIndex};
 
+use crate::forget::{ForgetPolicy, Forgetter, Signal, UserToken};
 use crate::recall::{Idx, Recall, Rows, Snap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use crate::error::{Error, Result, corrupt};
 use crate::layout::*;
@@ -63,11 +66,13 @@ impl EmbeddingModel {
     }
 }
 
-/// A store's options, fixed at create.
+/// A store's options, fixed at create (the forget policy can change later:
+/// [`Store::set_forget_policy`]).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct StoreOptions {
     embedding: Option<EmbeddingModel>,
+    forget: Option<ForgetPolicy>,
 }
 
 impl StoreOptions {
@@ -79,6 +84,57 @@ impl StoreOptions {
     /// Pins the store to `model`: its memories carry embeddings of that model.
     pub fn embedding(mut self, model: EmbeddingModel) -> Self {
         self.embedding = Some(model);
+        self
+    }
+
+    /// The store's forget policy (T2): the [`Forgetter`] runs it, and
+    /// [`Store::forget`] uses it by default.
+    pub fn forget(mut self, policy: ForgetPolicy) -> Self {
+        self.forget = Some(policy);
+        self
+    }
+
+    /// Shorthand: episodic memories are forgotten `age` after their creation, as
+    /// [`ForgetPolicy::max_age`] with [`Kind::Episodic`] (added to any policy already set).
+    pub fn episodic_ttl(mut self, age: std::time::Duration) -> Self {
+        let p = self.forget.take().unwrap_or_default();
+        self.forget = Some(p.max_age(Kind::Episodic, age));
+        self
+    }
+}
+
+/// How to open a store ([`Store::open_with`], [`Store::create_with`]).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct OpenOptions {
+    model: Option<String>,
+    without_embeddings: bool,
+    own_forgetter: bool,
+}
+
+impl OpenOptions {
+    /// The defaults: name the model with [`model`](Self::model), or open
+    /// [`without_embeddings`](Self::without_embeddings).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The embedding model the caller embeds with, as [`Store::open`] checks it.
+    pub fn model(mut self, id: impl Into<String>) -> Self {
+        self.model = Some(id.into());
+        self
+    }
+
+    /// No embedding model, as [`Store::open_without_embeddings`] opens.
+    pub fn without_embeddings(mut self) -> Self {
+        self.without_embeddings = true;
+        self
+    }
+
+    /// No thread of the crate's own: the application takes the store's [`Forgetter`] with
+    /// [`Store::take_forgetter`] and runs it itself (an application-owned database, D284).
+    pub fn own_forgetter(mut self) -> Self {
+        self.own_forgetter = true;
         self
     }
 }
@@ -97,7 +153,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Kind::Episodic => 0,
             Kind::Semantic => 1,
@@ -105,7 +161,7 @@ impl Kind {
         }
     }
 
-    fn from_code(c: u8) -> Result<Self> {
+    pub(crate) fn from_code(c: u8) -> Result<Self> {
         Ok(match c {
             0 => Kind::Episodic,
             1 => Kind::Semantic,
@@ -343,7 +399,10 @@ impl StoreStats {
     }
 }
 
-/// A memory store, in the writer process: one table plus its text index (D311 §2).
+/// A memory store, in the writer process: one table plus its text index (D311 §2). Clone it
+/// to share it: clones are cheap, and the store's [`Forgetter`] stops when the last one
+/// drops.
+#[derive(Clone)]
 pub struct Store {
     db: Pigeonhole,
     table: Table,
@@ -353,6 +412,19 @@ pub struct Store {
     /// Whether this handle was opened with the store's model (always so for a store
     /// without one).
     embeds: bool,
+    /// The application's handles: `None` for the forgetter's own, which mustn't keep it alive.
+    user: Option<Arc<UserToken>>,
+    shared: Arc<Shared>,
+}
+
+/// What a store's handles share: the forgetter's signal, and its forgetter while nobody runs
+/// it.
+struct Shared {
+    signal: Arc<Signal>,
+    forgetter: Mutex<Option<Forgetter>>,
+    /// Whether a forgetter runs (the crate's thread) or was handed out.
+    started: AtomicBool,
+    own: bool,
 }
 
 impl std::fmt::Debug for Store {
@@ -376,8 +448,27 @@ fn index_name(name: &str) -> String {
 impl Store {
     /// Creates the store `name`: the table `mem_{name}` and its text index
     /// `mem_{name}_text`, the index without positions (recall queries are rarely phrases;
-    /// owner, 2026-11-02). `TableExists` if the table is there.
+    /// owner, 2026-11-02), and opens it with its own model (as [`open`](Self::open) would).
+    /// With a forget policy, the crate's [`Forgetter`] thread starts. `TableExists` if the
+    /// table is there.
     pub fn create(db: &Pigeonhole, name: &str, options: StoreOptions) -> Result<Store> {
+        let open = match &options.embedding {
+            Some(m) => OpenOptions::new().model(m.id.clone()),
+            None => OpenOptions::new().without_embeddings(),
+        };
+        Self::create_with(db, name, options, open)
+    }
+
+    /// [`create`](Self::create), opened as `open` says ([`open_with`](Self::open_with)).
+    pub fn create_with(
+        db: &Pigeonhole,
+        name: &str,
+        store: StoreOptions,
+        open: OpenOptions,
+    ) -> Result<Store> {
+        if let Some(p) = &store.forget {
+            p.check()?;
+        }
         let mut b = db
             .table(&table_name(name))?
             .family(CONTENT, Family::default())
@@ -387,7 +478,7 @@ impl Store {
             .family(PEAK, Family::aggregate(Aggregation::Max))
             .family(LINKS, Family::default())
             .family(BACKLINKS, Family::default());
-        if let Some(m) = &options.embedding {
+        if let Some(m) = &store.embedding {
             b = b.family(EMB, Family::vector(m.spec()));
         }
         let table = b.create()?;
@@ -395,36 +486,31 @@ impl Store {
             .mutate(GLOBAL)
             .put_u64(META, LAYOUT, LAYOUT_VERSION)
             .put(META, TEXT_INDEX, index_name(name).as_bytes());
-        if let Some(m) = &options.embedding {
+        if let Some(m) = &store.embedding {
             g = g
                 .put(META, MODEL_ID, m.id.as_bytes())
                 .put_u64(META, MODEL_DIM, u64::from(m.dim))
                 .put(META, MODEL_ELEMENT, &[element_code(m.element)]);
         }
+        if let Some(p) = &store.forget {
+            g = g.put(META, FORGET, &p.encode());
+        }
         g.commit()?;
-        let index = Index::create(
+        Index::create(
             db,
             &index_name(name),
             pigeonhole_text::Source::new(&table, CONTENT, TEXT),
             IndexOptions::new().positions(false),
         )?;
-        Ok(Store {
-            db: db.clone(),
-            table,
-            index,
-            model: options.embedding,
-            embeds: true,
-        })
+        Self::open_with(db, name, open)
     }
 
     /// Opens the store `name` for a caller embedding with `model_id`, compared byte for
     /// byte with the store's. `Mismatch` if it's another model; `InvalidArgument` if the
     /// store has none (use [`open_without_embeddings`](Self::open_without_embeddings)).
+    /// With a forget policy, the crate's [`Forgetter`] thread starts.
     pub fn open(db: &Pigeonhole, name: &str, model_id: &str) -> Result<Store> {
-        let mut s = Self::open_inner(db, name)?;
-        check_model(&s.model, name, model_id)?;
-        s.embeds = true;
-        Ok(s)
+        Self::open_with(db, name, OpenOptions::new().model(model_id))
     }
 
     /// Opens the store `name` without an embedding model. On a store pinned to one, the
@@ -432,22 +518,137 @@ impl Store {
     /// (`remember`, `supersede`), so every memory there keeps its embedding; it allows
     /// `delete`, `link` and `mark_used`, and recalls by keyword and recency.
     pub fn open_without_embeddings(db: &Pigeonhole, name: &str) -> Result<Store> {
-        let mut s = Self::open_inner(db, name)?;
-        s.embeds = s.model.is_none();
+        Self::open_with(db, name, OpenOptions::new().without_embeddings())
+    }
+
+    /// Opens the store `name` as `options` say: with the caller's model
+    /// ([`OpenOptions::model`]) or without one, and with the crate's forgetter thread or the
+    /// application's ([`OpenOptions::own_forgetter`], then
+    /// [`take_forgetter`](Self::take_forgetter)). `InvalidArgument` if `options` name neither
+    /// a model nor `without_embeddings`, or both.
+    pub fn open_with(db: &Pigeonhole, name: &str, options: OpenOptions) -> Result<Store> {
+        let table = db.table(&table_name(name))?.open()?;
+        let model = load(Rows::W(&table))?;
+        let embeds = match (&options.model, options.without_embeddings) {
+            (Some(id), false) => {
+                check_model(&model, name, id)?;
+                true
+            }
+            (None, true) => model.is_none(),
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "OpenOptions takes a model or without_embeddings, one of the two".into(),
+                ));
+            }
+        };
+        let index = Index::open(db, &index_name(name))?;
+        let s = Store::assemble(db, table, index, model, embeds, options.own_forgetter);
+        s.start_forgetter_if_due()?;
         Ok(s)
     }
 
-    fn open_inner(db: &Pigeonhole, name: &str) -> Result<Store> {
-        let table = db.table(&table_name(name))?.open()?;
-        let model = load(Rows::W(&table))?;
-        let index = Index::open(db, &index_name(name))?;
-        Ok(Store {
+    fn assemble(
+        db: &Pigeonhole,
+        table: Table,
+        index: Index,
+        model: Option<EmbeddingModel>,
+        embeds: bool,
+        own: bool,
+    ) -> Store {
+        let signal = Arc::new(Signal::default());
+        Store {
             db: db.clone(),
             table,
             index,
             model,
-            embeds: false,
-        })
+            embeds,
+            user: Some(Arc::new(UserToken(Arc::clone(&signal)))),
+            shared: Arc::new(Shared {
+                signal,
+                forgetter: Mutex::new(None),
+                started: AtomicBool::new(false),
+                own,
+            }),
+        }
+    }
+
+    /// Makes the store's forgetter once: on the crate's thread when the store has a policy
+    /// (unless the application owns it), or kept for [`take_forgetter`](Self::take_forgetter).
+    fn start_forgetter_if_due(&self) -> Result<()> {
+        if self.shared.own {
+            if !self.shared.started.swap(true, Ordering::AcqRel) {
+                *self
+                    .shared
+                    .forgetter
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(self.make_forgetter());
+            }
+            return Ok(());
+        }
+        if self.forget_policy()?.is_none() || self.shared.started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        crate::forget::spawn(self.make_forgetter())
+            .map_err(|e| Error::InvalidArgument(format!("starting the forgetter: {e}")))
+    }
+
+    fn make_forgetter(&self) -> Forgetter {
+        let mut inner = self.clone();
+        inner.user = None;
+        let user = self.user.as_ref().map_or_else(Weak::new, Arc::downgrade);
+        Forgetter::new(inner, user, Arc::clone(&self.shared.signal))
+    }
+
+    /// The store's [`Forgetter`], for an application that runs it itself: opened with
+    /// [`OpenOptions::own_forgetter`]. `None` otherwise, or once taken.
+    pub fn take_forgetter(&self) -> Option<Forgetter> {
+        self.shared
+            .forgetter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// The store's forget policy, if it has one.
+    pub fn forget_policy(&self) -> Result<Option<ForgetPolicy>> {
+        match self.table.get(GLOBAL, META, FORGET)? {
+            Some(c) => Ok(Some(ForgetPolicy::decode(c.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Sets the store's forget policy (`None` turns forgetting off). The forgetter reads it
+    /// before each pass, so it takes effect at the next pass; setting one wakes this
+    /// process's forgetter, and starts the crate's thread if none runs yet.
+    pub fn set_forget_policy(&self, policy: Option<ForgetPolicy>) -> Result<()> {
+        match &policy {
+            Some(p) => {
+                p.check()?;
+                self.table
+                    .mutate(GLOBAL)
+                    .put(META, FORGET, &p.encode())
+                    .commit()?;
+            }
+            None => {
+                self.table
+                    .mutate(GLOBAL)
+                    .delete_column(META, FORGET)
+                    .commit()?;
+            }
+        }
+        if policy.is_some() {
+            self.start_forgetter_if_due()?;
+            self.shared.signal.notify();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn db(&self) -> &Pigeonhole {
+        &self.db
+    }
+
+    pub(crate) fn table(&self) -> &Table {
+        &self.table
     }
 
     /// Recalls memories from `namespaces` (D311 §3): each an exact namespace, as written

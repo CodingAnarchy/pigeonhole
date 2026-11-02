@@ -48,6 +48,8 @@ pub(crate) const MODEL_ID: &[u8] = b"model_id";
 pub(crate) const MODEL_DIM: &[u8] = b"model_dim";
 pub(crate) const MODEL_ELEMENT: &[u8] = b"model_element";
 pub(crate) const TEXT_INDEX: &[u8] = b"text_index";
+/// `G`'s forget policy (T2), when the store has one.
+pub(crate) const FORGET: &[u8] = b"forget";
 
 pub(crate) const LAYOUT_VERSION: u64 = 1;
 
