@@ -76,6 +76,19 @@ fn options(vfs: &Arc<SimVfs>, shards: usize) -> EngineOptions {
     o
 }
 
+thread_local! {
+    /// The run's VFS while deferred I/O is on (`PIGEONHOLE_DEFERRED_IO=1`): the shard loops
+    /// below complete one deferred operation, chosen by the seed, per turn, as a device
+    /// finishes I/O on its own. Syncs and rollovers then land between the feed's polls, and a
+    /// power loss finds more in flight.
+    static DEFERRED: std::cell::RefCell<Option<Arc<SimVfs>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Completes one deferred operation if deferred I/O is on; whether one completed.
+fn complete_one() -> bool {
+    DEFERRED.with(|d| d.borrow().as_ref().is_some_and(|v| v.complete_io()))
+}
+
 fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Output {
     let mut cx = Context::from_waker(Waker::noop());
     for _ in 0..1_000_000 {
@@ -85,6 +98,7 @@ fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Ou
         if let Poll::Ready(r) = Pin::new(&mut pending).poll(&mut cx) {
             return r;
         }
+        complete_one();
     }
     panic!("never resolved");
 }
@@ -95,6 +109,7 @@ fn settle(shards: &mut [EngineShard]) {
         for s in shards.iter_mut() {
             more |= s.run_once(u64::MAX);
         }
+        more |= complete_one();
         if !more {
             return;
         }
@@ -470,7 +485,13 @@ impl Run {
                 // A visible feed may have delivered what was lost; a durable one never
                 // expires across a power loss (call 4: everything it delivered survived).
                 assert!(
-                    !durable || (root_unsynced && reason.contains("another session wrote")),
+                    // Fix A's window: a lost Root entry breaks the session chain, which
+                    // shows at the token ("another session wrote") or at the first record
+                    // past it ("a session that did not feed these tables wrote").
+                    !durable
+                        || (root_unsynced
+                            && (reason.contains("another session wrote")
+                                || reason.contains("did not feed these tables"))),
                     "seed {}: the durable feed expired after a power loss: {reason} \
                      (a sidecar sync in flight: {root_unsynced})",
                     self.seed
@@ -494,6 +515,7 @@ fn close_app_owned(db: Arc<Engine>, mut shards: Vec<EngineShard>) {
         for s in shards.iter_mut() {
             s.run_once(u64::MAX);
         }
+        complete_one();
         std::thread::yield_now();
     }
     closer.join().unwrap().unwrap();
@@ -501,6 +523,8 @@ fn close_app_owned(db: Arc<Engine>, mut shards: Vec<EngineShard>) {
 
 fn run(seed: u64) {
     let vfs = SimVfs::new(seed);
+    let deferred = std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1");
+    DEFERRED.with(|d| *d.borrow_mut() = deferred.then(|| Arc::clone(&vfs)));
     let mut rng = Rng(seed);
     let shards_n = 1 + rng.below(3) as usize;
     let tables = {
@@ -511,6 +535,11 @@ fn run(seed: u64) {
         db.close().unwrap();
         [a, b]
     };
+    // After the setup engine (threaded) closed: from here the run's own loops step the
+    // device.
+    if deferred {
+        vfs.set_deferred_io(true);
+    }
     let mut run = Run {
         seed,
         vfs,

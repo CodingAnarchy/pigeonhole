@@ -56,6 +56,7 @@ pub struct Options {
     create_if_missing: bool,
     merge_operators: Vec<Arc<dyn MergeOperator>>,
     read_only_fallback: bool,
+    read_only: bool,
     allow_fuse: bool,
     io_backend: Option<IoBackend>,
     direct_io: Option<bool>,
@@ -287,6 +288,7 @@ impl Default for Options {
             create_if_missing: true,
             merge_operators: Vec::new(),
             read_only_fallback: false,
+            read_only: false,
             allow_fuse: false,
             io_backend: None,
             direct_io: None,
@@ -832,6 +834,31 @@ impl Options {
     /// writable is unaffected.
     pub fn read_only_fallback(mut self, yes: bool) -> Self {
         self.read_only_fallback = yes;
+        self
+    }
+
+    /// Open read-only, whatever the file needs (default off; ICR 0109): the open
+    /// [`read_only_fallback`](Self::read_only_fallback) falls back to, asked for. It writes
+    /// nothing to the database's files, so a tool that only reads leaves the database as it
+    /// found it: no format upgrade, no change-feed session (so an application's feed tokens
+    /// stay valid, D310), no new log segment, no flush, compaction or clean-close commit.
+    ///
+    /// Writes, schema changes, `flush`, `compact` and `shrink` fail with
+    /// [`ErrorCode::ReadOnly`](crate::ErrorCode::ReadOnly), and
+    /// [`DatabaseInfo::read_only`](crate::DatabaseInfo::read_only) is true. It replays the
+    /// write-ahead log into memory, so a log that doesn't fit
+    /// [`memtable_budget`](Self::memtable_budget) fails the open with `ReadOnly`. A missing
+    /// file isn't created, whatever [`create_if_missing`](Self::create_if_missing) says.
+    ///
+    /// **It is still a writer-process open in every other respect:**
+    /// - It takes the writer lock, which needs write access to the file, so it fails on a
+    ///   read-only file or mount.
+    /// - It excludes a running writer, failing with `WriterLocked` while one has the database
+    ///   open. To read beside a running writer, open a reader process
+    ///   ([`Pigeonhole::open_reader`](crate::Pigeonhole::open_reader)), as `phdb` does.
+    /// - It creates the writer's shared-memory region ([`shm_dir`](Self::shm_dir)).
+    pub fn read_only(mut self, yes: bool) -> Self {
+        self.read_only = yes;
         self
     }
 
@@ -1727,6 +1754,7 @@ impl Options {
         o.shm_dir.clone_from(&self.shm_dir);
         o.reader_slots = self.reader_slots;
         o.read_only_fallback = self.read_only_fallback;
+        o.read_only = self.read_only;
         o.allow_fuse = self.allow_fuse;
         if let Some(bytes) = self.wal_segment_size {
             o.wal.segment_size = bytes;

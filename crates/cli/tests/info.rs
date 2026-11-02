@@ -169,3 +169,108 @@ fn closed_pipe_is_not_an_error() {
     assert_eq!(status.code(), 0);
     assert!(stderr.is_empty());
 }
+
+/// D310 amendment (d), ICR 0109: the commands that only read (`info`, `dump`, `backup`,
+/// `shell --read-only`) open read-only and write nothing, so running them between two of an
+/// application's fed opens leaves its change-feed token valid. (A writable phdb open keeps
+/// it through D310 (c)'s inheritance: the next test.)
+#[test]
+fn read_only_commands_keep_an_applications_feed_token() {
+    use std::time::Duration;
+    let dir = TempDir::new("info-feed");
+    let path = dir.path().join("app.phdb");
+    let app = || {
+        Options::default()
+            .shards(2)
+            .pin_threads(false)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20))
+    };
+    let db = Pigeonhole::open(&path, app()).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let mut feed = t.feed().open().unwrap();
+    t.mutate(b"r1").put("f", b"q", b"v").commit().unwrap();
+    feed.next(Duration::from_secs(5)).unwrap().expect("r1");
+    let token = feed.token();
+    t.mutate(b"r2").put("f", b"q", b"v").commit().unwrap();
+    drop(feed);
+    drop(t);
+    db.close().unwrap();
+
+    let p = path.to_str().unwrap();
+    let copy = dir.path().join("copy.phdb");
+    for args in [
+        vec!["info", p],
+        vec!["dump", p],
+        vec!["backup", p, copy.to_str().unwrap()],
+        vec!["shell", p, "--read-only", "-c", "get t r2 f:q"],
+    ] {
+        let run = phdb(&args);
+        assert_eq!(run.status, 0, "{args:?}: {}", run.stderr);
+    }
+    let info = phdb(&["info", p, "--format", "json"]);
+    let doc: serde_json::Value = serde_json::from_str(&info.stdout).unwrap();
+    assert_eq!(doc["read_only"], true, "{}", info.stdout);
+
+    let db = Pigeonhole::open(&path, app()).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    let mut feed = t.feed().resume(&token).open().unwrap();
+    let c = feed
+        .next(Duration::from_secs(5))
+        .unwrap()
+        .expect("the commit after the token");
+    assert_eq!(c.changes()[0].row(), b"r2");
+    drop(feed);
+    drop(t);
+    db.close().unwrap();
+}
+
+/// D310 amendment (c) with phdb's open: a writing command (here the shell's `put`) on an
+/// existing database leaves the shard count unset, so the open inherits the application's
+/// feed and its shard count, and the app's token resumes through phdb's write, which the
+/// feed delivers too.
+#[test]
+fn a_writable_command_keeps_an_applications_feed_token() {
+    use std::time::Duration;
+    let dir = TempDir::new("shell-feed");
+    let path = dir.path().join("app.phdb");
+    let app = || {
+        Options::default()
+            .shards(3)
+            .pin_threads(false)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20))
+    };
+    let db = Pigeonhole::open(&path, app()).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create()
+        .unwrap();
+    let mut feed = t.feed().open().unwrap();
+    t.mutate(b"r1").put("f", b"q", b"v").commit().unwrap();
+    feed.next(Duration::from_secs(5)).unwrap().expect("r1");
+    let token = feed.token();
+    drop(feed);
+    drop(t);
+    db.close().unwrap();
+
+    let run = phdb(&["shell", path.to_str().unwrap(), "-c", "put t by-phdb f:q v"]);
+    assert_eq!(run.status, 0, "{}", run.stderr);
+
+    let db = Pigeonhole::open(&path, app()).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    let mut feed = t.feed().resume(&token).open().unwrap();
+    let c = feed
+        .next(Duration::from_secs(5))
+        .unwrap()
+        .expect("phdb's write, fed under the inherited feed");
+    assert_eq!(c.changes()[0].row(), b"by-phdb");
+    drop(feed);
+    drop(t);
+    db.close().unwrap();
+}

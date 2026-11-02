@@ -7,7 +7,7 @@ expression: text
   "command": "info",
   "path": "[DIR]/sample.phdb",
   "mode": "writer",
-  "read_only": false,
+  "read_only": true,
   "format_version": 4,
   "features": {
     "compat": 0,
