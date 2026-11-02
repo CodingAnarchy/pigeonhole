@@ -179,16 +179,36 @@ fn real_options(vfs: &VfsRef, feed: Option<FeedOptions>) -> EngineOptions {
     o
 }
 
-/// Runs the shard until `pending` resolves.
-fn drive(shard: &mut EngineShard, mut pending: PendingCommit) -> CommitInfo {
+/// How long [`drive`] waits for a commit: bounded by time, not turns, since a commit on the
+/// real VFS waits on real I/O (a `GroupSync` commit's fsync on the pool), which a slow host
+/// (Windows CI's `FlushFileBuffers`) can hold for longer than a million idle turns take
+/// (#1325, as #1289).
+const DRIVE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Runs the shard until `pending` resolves, yielding between turns; on a timeout, fails
+/// with where the commit stood, so a stuck wait reads differently from a slow one.
+fn drive(db: &Engine, shard: &mut EngineShard, mut pending: PendingCommit) -> CommitInfo {
     let mut cx = Context::from_waker(Waker::noop());
-    for _ in 0..1_000_000 {
+    let start = Instant::now();
+    let mut turns = 0u64;
+    loop {
         shard.run_once(u64::MAX);
+        turns += 1;
         if let Poll::Ready(r) = Pin::new(&mut pending).poll(&mut cx) {
             return r.unwrap();
         }
+        if start.elapsed() > DRIVE_LIMIT {
+            panic!(
+                "the commit never resolved: {turns} turns over {:?}; feed frontier {} \
+                 visible, {} durable; {} background syncs",
+                start.elapsed(),
+                db.feed_frontier(false),
+                db.feed_frontier(true),
+                db.feed_background_syncs(),
+            );
+        }
+        std::thread::yield_now();
     }
-    panic!("the commit never resolved");
 }
 
 /// Runs the shard until it has nothing to do now.
@@ -219,6 +239,7 @@ fn an_application_owned_shard_flushes_on_its_next_wakeup_alone() {
 
     let start = Instant::now();
     let info = drive(
+        &db,
         shard,
         db.submit(batch(&t, b"a"), Some(Durability::None)).unwrap(),
     );
@@ -294,6 +315,7 @@ fn an_unfed_table_holds_nothing() {
     let other = (*db.table("other").unwrap()).clone();
     settle(shard);
     let info = drive(
+        &db,
         shard,
         db.submit(batch(&other, b"a"), Some(Durability::None))
             .unwrap(),
@@ -337,6 +359,7 @@ fn a_durable_feed_waits_for_a_sync_on_buffered_commits() {
     let t = table(&db, "t");
     settle(&mut shard);
     let info = drive(
+        &db,
         &mut shard,
         db.submit(batch(&t, b"a"), Some(Durability::Buffered))
             .unwrap(),
@@ -348,6 +371,7 @@ fn a_durable_feed_waits_for_a_sync_on_buffered_commits() {
         "not durable until synced"
     );
     let synced = drive(
+        &db,
         &mut shard,
         db.submit(batch(&t, b"b"), Some(Durability::GroupSync))
             .unwrap(),
@@ -376,6 +400,7 @@ fn the_background_sync_moves_the_durable_feed_on_a_buffered_only_table() {
     assert!(shard.next_deadline().is_none(), "idle: no sync deadline");
     let start = Instant::now();
     let info = drive(
+        &db,
         &mut shard,
         db.submit(batch(&t, b"a"), Some(Durability::Buffered))
             .unwrap(),
