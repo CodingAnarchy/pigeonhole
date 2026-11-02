@@ -543,6 +543,7 @@ pub fn pigeonhole::Options::auto_recover(self, pigeonhole::Recovery) -> Self
 pub fn pigeonhole::Options::background_workers(self, usize) -> Self
 pub fn pigeonhole::Options::block_cache(self, usize) -> Self
 pub fn pigeonhole::Options::change_feed(self, pigeonhole::FeedRetention) -> Self
+pub fn pigeonhole::Options::change_feed_off(self) -> Self
 pub fn pigeonhole::Options::compaction_cores(self, usize) -> Self
 pub fn pigeonhole::Options::cpu_profile(self, pigeonhole::CpuProfile) -> Self
 pub fn pigeonhole::Options::create_if_missing(self, bool) -> Self

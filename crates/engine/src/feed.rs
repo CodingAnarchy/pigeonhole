@@ -31,7 +31,28 @@ use pigeonhole_wal::FeedMarks;
 use crate::catalog::Catalog;
 use crate::manifest::{self, ManifestReq, ReqKind};
 use crate::shard::Shared;
-use crate::{EngineOptions, Error, Result};
+use crate::{EngineOptions, Error, FeedOptions, Result};
+
+impl LastSession {
+    /// The feed settings an open that doesn't mention the feed inherits from this session:
+    /// its retention and age, and its fed tables by name (a table dropped since is left out).
+    pub(crate) fn feed_options(&self, catalog: &Catalog) -> FeedOptions {
+        FeedOptions {
+            retention_bytes: self.retention_bytes,
+            max_age_micros: (self.retention_age_secs > 0)
+                .then(|| self.retention_age_secs.saturating_mul(1_000_000)),
+            tables: match &self.tables {
+                FeedTables::All => None,
+                FeedTables::Only(ids) => Some(
+                    ids.iter()
+                        .filter_map(|&id| catalog.table(id).map(|t| t.name.clone()))
+                        .collect(),
+                ),
+            },
+            sync_interval_micros: None,
+        }
+    }
+}
 
 /// The sidecar's path: `data.phdb-feed` beside `data.phdb`.
 pub(crate) fn sidecar_path(db: &Path) -> PathBuf {
@@ -124,6 +145,65 @@ pub(crate) fn open_sidecar(
         vfs.sync_dir(dir)?;
     }
     Ok(Some(sidecar))
+}
+
+/// What an open inherits from the sidecar's last session (the D310 amendment, the owner
+/// 2026-11-02): its retention, age, stream count and fed tables, so an open that doesn't
+/// mention the feed (a tool's, `phdb`'s) continues its history instead of ending it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LastSession {
+    pub(crate) retention_bytes: u64,
+    pub(crate) retention_age_secs: u64,
+    pub(crate) streams: u32,
+    pub(crate) tables: FeedTables,
+}
+
+/// The sidecar's last session, read-only: `None` without a sidecar, with another database's
+/// or a damaged header, or when the last open recorded "fed: none" (or an entry this build
+/// doesn't know, which fails closed). Root entries after the session don't change it.
+pub(crate) fn last_session(
+    vfs: &VfsRef,
+    db: &Path,
+    db_id: [u8; 16],
+) -> Result<Option<LastSession>> {
+    let path = sidecar_path(db);
+    if !vfs.exists(&path)? {
+        return Ok(None);
+    }
+    let file = vfs.open(&path, OpenOptions::read())?;
+    let mut bytes = vec![0u8; file.len()? as usize];
+    file.read_at(&mut bytes, 0)?;
+    match FeedHeader::decode(&bytes) {
+        Ok(h) if h.db_id == db_id => {}
+        _ => return Ok(None),
+    }
+    let (entries, _) = decode_entries(&bytes[FeedHeader::LEN..]);
+    Ok(last_of(&entries))
+}
+
+/// [`last_session`]'s rule over decoded entries.
+pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
+    for e in entries.iter().rev() {
+        match e {
+            FeedEntry::Root { .. } => continue,
+            FeedEntry::Session {
+                retention_bytes,
+                retention_age_secs,
+                streams,
+                tables,
+                ..
+            } => {
+                return Some(LastSession {
+                    retention_bytes: *retention_bytes,
+                    retention_age_secs: *retention_age_secs,
+                    streams: *streams,
+                    tables: tables.clone(),
+                });
+            }
+            FeedEntry::Unfed { .. } | FeedEntry::Unknown(_) => return None,
+        }
+    }
+    None
 }
 
 /// The change feed's session at open (D310): `None` with the feed off, after appending
@@ -717,4 +797,64 @@ pub(crate) fn release_held(shared: &Arc<Shared>, shard: ShardId) {
         ..req
     };
     manifest::submit(shared, shard, req);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pigeonhole_format::TableId;
+
+    fn session(streams: u32) -> FeedEntry {
+        FeedEntry::Session {
+            session: 1,
+            opened_at: 1,
+            retention_bytes: 1 << 20,
+            retention_age_secs: 60,
+            streams,
+            tables: FeedTables::Only(vec![TableId(2)]),
+        }
+    }
+
+    /// D310's amendment: an open inherits the last session's settings, through any Root
+    /// entries after it, and nothing once a later open recorded the feed off (or an entry
+    /// this build doesn't know).
+    #[test]
+    fn the_last_session_is_inherited_until_an_open_turns_the_feed_off() {
+        assert_eq!(last_of(&[]), None);
+        let want = LastSession {
+            retention_bytes: 1 << 20,
+            retention_age_secs: 60,
+            streams: 3,
+            tables: FeedTables::Only(vec![TableId(2)]),
+        };
+        let roots = [
+            session(3),
+            FeedEntry::Root {
+                session: 1,
+                sequence: 2,
+            },
+            FeedEntry::Root {
+                session: 1,
+                sequence: 3,
+            },
+        ];
+        assert_eq!(last_of(&roots), Some(want.clone()));
+        // The newest session wins.
+        assert_eq!(
+            last_of(&[session(2), session(3)]).map(|l| l.streams),
+            Some(3)
+        );
+        // A feed-off open since: nothing to inherit.
+        assert_eq!(
+            last_of(&[session(3), FeedEntry::Unfed { sequence: 4 }]),
+            None
+        );
+        // An entry this build doesn't know: fail closed.
+        assert_eq!(last_of(&[session(3), FeedEntry::Unknown(0xee)]), None);
+        // A feed-off open, then a feeding one: that one.
+        assert_eq!(
+            last_of(&[FeedEntry::Unfed { sequence: 1 }, session(3)]),
+            Some(want)
+        );
+    }
 }
