@@ -175,7 +175,7 @@ These are the means of two runs, which agreed within 4%.
 
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.
 - **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Positional skipping is tracked in #1334.
-- **Fuzzy terms** cost a walk over the dictionary near the term, then the union of the matching terms' postings. On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk. Pruning inside a fuzzy clause is tracked in #1333.
+- **Fuzzy terms** cost a walk over the dictionary near the term, then the matching terms' postings. Once the top `k` are held, an expansion that can't lift a document into them stops being read (#1333). On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk. The fuzzy rows above predate #1333's pruning: at 100,000 documents on a laptop, it cut fuzzy-1's p50 from 25 ms to 2.7 ms. #1349 re-takes them.
 - **Positions are cheap to write:** 18% more time per document on the reference machine, much less than a laptop suggests.
 
 ## Errors
