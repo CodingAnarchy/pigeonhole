@@ -57,7 +57,7 @@ impl Default for IndexOptions {
     fn default() -> Self {
         Self {
             target: 1000,
-            nprobe: 16,
+            nprobe: 24,
             reassign: 2,
             rebalance: Rebalance::Inline,
         }
@@ -65,7 +65,8 @@ impl Default for IndexOptions {
 }
 
 impl IndexOptions {
-    /// The defaults: lists of about 1,000 vectors, 16 lists probed per search, and 2
+    /// The defaults: lists of about 1,000 vectors, 24 lists probed per search (95.8%
+    /// recall@10 on SIFT1M, D306 PR 3), and 2
     /// neighbouring lists reassigned after a split.
     pub fn new() -> Self {
         Self::default()

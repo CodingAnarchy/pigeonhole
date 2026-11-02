@@ -36,3 +36,12 @@ mod rebalancer;
 pub use error::{Error, Result};
 pub use index::{BulkStats, Hit, Index, IndexOptions, IndexStats, Rebalance, Search};
 pub use rebalancer::Rebalancer;
+
+/// The user guide's vectors page and the crate README, compiled and run as doctests.
+#[cfg(doctest)]
+mod guide {
+    #[doc = include_str!("../../../docs/guide/vectors.md")]
+    struct Vectors;
+    #[doc = include_str!("../README.md")]
+    struct CrateReadme;
+}

@@ -3668,4 +3668,13 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - an application's rebalancer, with its wakeup and `closed`;
   - markers a crash left, rebalanced after the reopen.
 
+**PR 3 (measurements, defaults, guide).**
+- **SIFT1M on the AX102,** one thread, one query at a time, bulk build, target 1,000, the index held in a 1 GiB block cache: nprobe 24 gives 95.8% recall@10 at 3.38 ms p50 and 5.39 ms p99, which meets D306's 95% at ≤ 10 ms.
+  - **The table:** nprobe 16, 20, 28 and 32 gave 92.2, 94.3, 96.7 and 97.4% at p50 2.30, 2.84, 3.92 and 4.47 ms.
+  - **`IndexOptions::nprobe`'s default is 24** (it was 16).
+- **Under the default 256 MiB cache** (half the 512 MB index cached), nprobe 32 took 10.8 ms. The guide tells users to size the block cache to the index.
+- **Faiss IVF-Flat (1,000 lists):** equal recall within ±0.015 at every nprobe from 4 to 128, 9–22× faster per query. A profile puts the gap in the engine's per-cell read path (resolver, merging, the value copy), not the distance kernel: #1283, in 1.1.0.
+- **Builds:** `bulk_load` 138 s for 1M. 1M inserts at `Buffered` 67 s, with insert p50, p99 and p999 of 56, 93 and 415 µs. `run_async` matches `run` throughout.
+- **`examples/ivfsift.rs`** and `docs/bench.md` describe the run; `docs/guide/vectors.md` is the guide page.
+
 **`Search::run_async` (#1268 item 6).** It's on D296 PR 5's `Nearest::run_async`. Every read of the search is async: the layout version, a changed layout's centroids (a scan stream), and the probed lists. Its result equals `run`'s. It's tested from a cold reopen, at an older snapshot and across splits, for every element and metric.

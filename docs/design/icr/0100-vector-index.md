@@ -16,7 +16,7 @@
 - **`IndexOptions`** (`Copy + Eq + Default`):
   - `new()`;
   - `target_list_len(n)`: default 1,000, at least 4, and scaled down so `2 × target` vectors fit in 4 MiB;
-  - `nprobe(n)`: default 16, at least 1;
+  - `nprobe(n)`: default 24 (PR 3: 95.8% recall@10 on SIFT1M at 3.4 ms p50; it was 16 before PR 3), at least 1;
   - `reassign_neighbours(r)`: default 2, and 0 turns phase 2 off.
 
   They're stored with the index and fixed at creation.
