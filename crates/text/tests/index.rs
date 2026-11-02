@@ -478,7 +478,7 @@ fn normalised_phrases_fuzzy_terms_and_reopens_match() {
     assert!(!found(&nfc, Query::new().phrase([composed, "office"])));
     // Fuzzy terms: one edit from the NFC term "café" (a precomposed `é` is one character, so
     // `a` for it is one substitution), and one edit from NFKC's "office" ("offica"), which is
-    // two from NFC's five-character "ofﬁce".
+    // three from NFC's five-character "ofﬁce".
     assert!(found(&nfc, Query::new().fuzzy("cafa", Fuzziness::One)));
     assert!(found(&nfkc, Query::new().fuzzy("offica", Fuzziness::One)));
     assert!(!found(&nfc, Query::new().fuzzy("offica", Fuzziness::One)));
