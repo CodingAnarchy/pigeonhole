@@ -43,6 +43,10 @@
 //!   64-dimension `f32` L2 vectors (qualifiers `a` and `b`), over every vector, or with
 //!   qualifier prefix `b` (half of them). Counted per scored vector; the query is built
 //!   outside the measured function.
+//! - `knn-budget`: `knn-exact`'s search through `Nearest::run_within` (D308 PR 3) with a
+//!   budget of 120 bytes, which keeps 5 of the 10 nearest (24 bytes each: a 7-byte key, a
+//!   1-byte qualifier and 16). Counted per scored vector like `knn-exact`: the budget bounds
+//!   the result, not the read, so the two should count about the same.
 //! - `knn-exact-f16`, `knn-exact-bf16`: `knn-exact` over the same vectors rounded to `f16` and
 //!   to `bf16` (#1263), in table `vh` (built only for these two shapes, so `knn-exact`'s
 //!   store is unchanged): the half-precision kernels' cost per cell beside `knn-exact`'s.
@@ -318,6 +322,25 @@ fn shape_knn(v: &Table, query: &[f32], filtered: bool) -> usize {
     KNN_ROWS as usize * if filtered { 1 } else { 2 }
 }
 
+/// `knn-budget`'s budget: 5 of the 10 nearest, at 24 bytes each.
+const KNN_BUDGET: u64 = 120;
+
+#[inline(never)]
+fn shape_knn_budget(v: &Table, query: &[f32]) -> usize {
+    let _measured = Measured::start();
+    let page = v
+        .scan_prefix(b"")
+        .family("e")
+        .nearest_f32(query, 10)
+        .run_within(KNN_BUDGET)
+        .unwrap();
+    // Release builds check it too: a key or overhead change would alter what this counts.
+    assert_eq!(page.neighbours().len(), 5);
+    std::hint::black_box(&page);
+    // Every vector is scored, as in `knn-exact`: one unit each.
+    KNN_ROWS as usize * 2
+}
+
 /// A budgeted page's size: about 139 of table `t`'s rows (8 cells of 58 bytes, a 7-byte
 /// key).
 const PAGE_BYTES: u64 = 64 << 10;
@@ -558,6 +581,10 @@ fn main() {
                         &query,
                         shape == "knn-filtered",
                     )
+                }
+                "knn-budget" => {
+                    let query = knn_vector(&mut rng);
+                    shape_knn_budget(v.as_ref().expect("built above"), &query)
                 }
                 other => panic!("unknown shape {other}"),
             };
