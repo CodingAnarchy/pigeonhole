@@ -4003,6 +4003,10 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `it/feed_reader.rs` covers the start kinds, filtering, tokens across a reopen, expiry, and rule C both ways.
   - `wal/tests/feed_cursor.rs` covers the cursor, including a mid-segment hole: it stops where recovery did and then follows the next session's segment (Q2).
 
+**A fix after 3a (#1248, found by PR 4's deferred-I/O model):** a cursor whose segment's successor names an earlier end than it read to reports `Step::Cut`, and the feed expires ("records the feed read were lost"). That's a recovery's cut after a power loss took records the cursor had read: a visible feed resuming from a token past the cut used to fail with a chain `Corruption`. A later end stays corruption.
+- **Past the cut, nothing is read** (simp724's C1 on #1328). Once a successor on disk names the segment's end, a cursor positioned past it is cut at once. So is any frame it meets at or past that end. A power loss can leave CRC-valid frames after the hole, which recovery discarded and whose seqnos the next session may reuse, so a visible token resumed there would otherwise deliver them before reaching the stop.
+- **A durable feed is never past the cut** (simp724's step). Every record before a token's hint was delivered (so synced) or skipped as at or below the delivered seqno. Recovery keeps every synced record, so the hint is at or before the cut. `feed_model` gained a `PIGEONHOLE_DEFERRED_IO=1` mode, now a sweep for feed PRs.
+
 **How PR 3b builds it** (pigeonhole's public API, additive; ICR 0106):
 - **Opening:** `Table::feed()` gives a `FeedBuilder`. `.table(&t)` adds tables to the same feed, `.prefix(..)` limits it to a row prefix, and `.visible()` opts out of the durable frontier. The start is the commits after `open()`, or `.from_snapshot(&s)` (after `s.seqno()`), `.from_oldest()` or `.resume(&token)`. `open()` refuses with `InvalidArgument` (feed off, table not fed, bad token) and `Unsupported` (a reader process, until PR 4). An expired start shows at the first `next`, so `open` never consumes a commit.
 - **`Feed`:**
