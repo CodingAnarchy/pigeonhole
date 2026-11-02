@@ -246,12 +246,12 @@ pub struct Marked {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Memory {
-    text: String,
+    pub(crate) text: String,
     embedding: Option<Vec<f32>>,
-    kind: Kind,
+    pub(crate) kind: Kind,
     importance: f64,
     source: Option<String>,
-    session: Option<String>,
+    pub(crate) session: Option<String>,
     links: Vec<(MemoryId, LinkType, f32)>,
     pinned: bool,
 }
@@ -357,6 +357,8 @@ pub struct StoredMemory {
     pub session: Option<String>,
     /// Whether it's pinned.
     pub pinned: bool,
+    /// Whether a consolidation took it in ([`Store::consolidate`], T3).
+    pub consolidated: bool,
     /// The memory that superseded it, if one did.
     pub superseded_by: Option<MemoryId>,
     /// Its sources, each with its first-seen time (µs).
@@ -701,7 +703,7 @@ impl Store {
         self.remember_with(txn, ns, &memory, rid, now)
     }
 
-    fn check_memory(&self, ns: &str, m: &Memory) -> Result<()> {
+    pub(crate) fn check_memory(&self, ns: &str, m: &Memory) -> Result<()> {
         check_namespace(ns)?;
         if self.model.is_some() && !self.embeds {
             return Err(Error::InvalidArgument(
@@ -751,7 +753,7 @@ impl Store {
         Ok(())
     }
 
-    fn remember_with(
+    pub(crate) fn remember_with(
         &self,
         txn: &mut Transaction,
         ns: &str,
@@ -838,7 +840,13 @@ impl Store {
     }
 
     /// A source column, if the memory doesn't have it yet (its first-seen time stays).
-    fn add_source(&self, txn: &mut Transaction, row: &[u8], src: &str, now: u64) -> Result<()> {
+    pub(crate) fn add_source(
+        &self,
+        txn: &mut Transaction,
+        row: &[u8],
+        src: &str,
+        now: u64,
+    ) -> Result<()> {
         let t = &self.table;
         if txn.get(t, row, SOURCES, src.as_bytes())?.is_none() {
             txn.put_u64(t, row, SOURCES, src.as_bytes(), now);
@@ -989,9 +997,7 @@ impl Store {
                     "{old} is already superseded by {cur}: supersede that one instead"
                 )));
             }
-            txn.put(t, &old.row(), META, SUPERSEDED_BY, &new.row())
-                .put_u64(t, &old.row(), META, VALID_TO, now);
-            write_link(txn, t, &new.row(), &old.row(), LinkType::SUPERSEDES, 1.0);
+            supersede_in(txn, t, &old.row(), &new.row(), now);
             Ok(())
         })?;
         Ok(())
@@ -1256,7 +1262,15 @@ fn verify(
     Ok(st)
 }
 
-fn write_link(txn: &mut Transaction, t: &Table, from: &[u8], to: &[u8], ty: LinkType, w: f32) {
+/// Marks the memory at `old` superseded by the one at `new` since `valid_to`, with the
+/// `new → old` link: the writes [`Store::supersede`] makes once its reads pass.
+pub(crate) fn supersede_in(txn: &mut Transaction, t: &Table, old: &[u8], new: &[u8], valid_to: u64) {
+    txn.put(t, old, META, SUPERSEDED_BY, new)
+        .put_u64(t, old, META, VALID_TO, valid_to);
+    write_link(txn, t, new, old, LinkType::SUPERSEDES, 1.0);
+}
+
+pub(crate) fn write_link(txn: &mut Transaction, t: &Table, from: &[u8], to: &[u8], ty: LinkType, w: f32) {
     let mut v = [0u8; 5];
     v[0] = ty.0;
     v[1..].copy_from_slice(&w.to_le_bytes());
@@ -1295,7 +1309,7 @@ fn element_from_code(c: u8) -> Option<Element> {
 }
 
 /// A memory from its row.
-fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemory>> {
+pub(crate) fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemory>> {
     let view = row.view();
     let Some(text) = view.get(CONTENT, TEXT) else {
         return Ok(None);
@@ -1324,6 +1338,7 @@ fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemor
         .get(META, SESSION)
         .map(|c| String::from_utf8_lossy(c.value()).into_owned());
     let pinned = view.get(META, PINNED).is_some();
+    let consolidated = view.get(META, CONSOLIDATED).is_some();
     let superseded_by = view
         .get(META, SUPERSEDED_BY)
         .map(|c| MemoryId::from_row(c.value()).ok_or_else(|| corrupt("superseded_by")))
@@ -1354,6 +1369,7 @@ fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemor
         last_used_us,
         session,
         pinned,
+        consolidated,
         superseded_by,
         sources,
         links,

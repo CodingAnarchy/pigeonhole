@@ -48,6 +48,10 @@ pub struct Weights {
     pub importance: f64,
     /// `ln(1 + uses)`, decayed by the time since the last use.
     pub uses: f64,
+    /// Not a signal's weight: a factor on the importance signal of a memory a consolidation
+    /// took in ([`Store::consolidate`](crate::Store::consolidate)), so its summary ranks
+    /// ahead of it. 0.5 by default; 1 leaves consolidated memories as they were.
+    pub consolidated: f64,
 }
 
 impl Default for Weights {
@@ -58,6 +62,7 @@ impl Default for Weights {
             recency: 1.0,
             importance: 1.0,
             uses: 1.0,
+            consolidated: 0.5,
         }
     }
 }
@@ -582,6 +587,11 @@ impl<'a> Recall<'a> {
             .get(PEAK, IMPORTANCE)
             .and_then(|c| c.as_i64())
             .map_or(0.0, |p| p as f64 / PPM);
+        let importance_signal = if row.get(META, CONSOLIDATED).is_some() {
+            importance * self.weights.consolidated
+        } else {
+            importance
+        };
         let uses = row
             .get(STATS, USES)
             .and_then(|c| c.as_i64())
@@ -609,7 +619,7 @@ impl<'a> Recall<'a> {
             (1.0 + uses as f64).ln() * (-since / self.half_life_us as f64).exp()
         });
         Ok(Some(Cand {
-            vals: [vector, None, Some(recency), Some(importance), used],
+            vals: [vector, None, Some(recency), Some(importance_signal), used],
             ranks: [None; 5],
             score: 0.0,
             hit: RecallHit {

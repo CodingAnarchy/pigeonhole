@@ -28,6 +28,16 @@ pub enum Error {
     Mismatch(String),
     /// The store's rows don't parse.
     Corruption(String),
+    /// The application's [`Consolidator`](crate::Consolidator) failed, which stops the pass
+    /// ([`Store::consolidate`](crate::Store::consolidate)). The groups before it committed:
+    /// `pass` counts them. Its [`code`](Error::code) is `MergeFailed`, the code for an
+    /// application callback that failed; match the variant to tell it apart.
+    Consolidate {
+        /// The consolidator's error.
+        error: Box<dyn std::error::Error + Send + Sync>,
+        /// The pass up to the failure.
+        pass: crate::ConsolidatePass,
+    },
 }
 
 impl Error {
@@ -40,6 +50,7 @@ impl Error {
                 ErrorCode::InvalidArgument
             }
             Error::Corruption(_) => ErrorCode::Corruption,
+            Error::Consolidate { .. } => ErrorCode::MergeFailed,
         }
     }
 }
@@ -53,6 +64,7 @@ impl fmt::Display for Error {
             Error::NotFound(m) => write!(f, "not found: {m}"),
             Error::Mismatch(m) => write!(f, "embedding model mismatch: {m}"),
             Error::Corruption(m) => write!(f, "store corruption: {m}"),
+            Error::Consolidate { error, .. } => write!(f, "the consolidator failed: {error}"),
         }
     }
 }
@@ -62,6 +74,7 @@ impl std::error::Error for Error {
         match self {
             Error::Db(e) => Some(e),
             Error::Text(e) => Some(e),
+            Error::Consolidate { error, .. } => Some(error.as_ref()),
             _ => None,
         }
     }
