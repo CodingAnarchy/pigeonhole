@@ -50,12 +50,47 @@ impl Walk<'_> {
     }
 }
 
+/// What the walk tells its caller about each match it counts: nothing when scoring (a
+/// zero-sized [`Count`], so the scoring walk does no extra work), the matched positions when
+/// highlighting ([`Positions`]).
+pub(crate) trait Record {
+    /// Whether the walk keeps the positions of the match it's minimising.
+    const ON: bool;
+    /// A counted match: one document position per phrase term, in the phrase's order.
+    fn matched(&mut self, positions: &[u32]);
+}
+
+/// Counts only.
+pub(crate) struct Count;
+
+impl Record for Count {
+    const ON: bool = false;
+    fn matched(&mut self, _: &[u32]) {}
+}
+
+/// Every counted match's positions, in the order the walk counts them.
+#[derive(Default)]
+pub(crate) struct Positions(pub(crate) Vec<Vec<u32>>);
+
+impl Record for Positions {
+    const ON: bool = true;
+    fn matched(&mut self, positions: &[u32]) {
+        self.0.push(positions.to_vec());
+    }
+}
+
 /// The sloppy frequency of a phrase in one document.
 ///
 /// `terms` holds each phrase term's sorted positions in the document, its offset in the
 /// phrase, and its word's index (equal for repeats of one word). Every term must have at
 /// least one position.
 pub(crate) fn sloppy_freq(terms: &[(&[u32], u32, usize)], slop: u16) -> f64 {
+    sloppy(terms, slop, &mut Count)
+}
+
+/// [`sloppy_freq`], telling `rec` about each match it counts: the positions where the
+/// match's distance was smallest.
+pub(crate) fn sloppy<R: Record>(terms: &[(&[u32], u32, usize)], slop: u16, rec: &mut R) -> f64 {
     let slop = i64::from(slop);
     let mut w: Vec<Walk<'_>> = terms
         .iter()
@@ -111,9 +146,18 @@ pub(crate) fn sloppy_freq(terms: &[(&[u32], u32, usize)], slop: u16) -> f64 {
         true
     };
     let weight = |distance: i64| 1.0 / (distance as f64 + 1.0);
+    // The positions where the current match's distance was smallest (only with `R::ON`).
+    let mut best: Vec<u32> = Vec::new();
+    let snap = |w: &[Walk<'_>], best: &mut Vec<u32>| {
+        if R::ON {
+            best.clear();
+            best.extend(w.iter().map(|x| x.position() as u32));
+        }
+    };
     let mut freq = 0.0;
     let mut lead = pop(&w, &mut queued);
     let mut distance = end - w[lead].at;
+    snap(&w, &mut best);
     let mut next = top(&w, &queued);
     loop {
         if !advance(&mut w, lead, &mut end) {
@@ -126,17 +170,21 @@ pub(crate) fn sloppy_freq(terms: &[(&[u32], u32, usize)], slop: u16) -> f64 {
             // The match the old lead was minimising is done.
             if distance <= slop {
                 freq += weight(distance);
+                rec.matched(&best);
             }
             queued[lead] = true;
             lead = pop(&w, &mut queued);
             next = top(&w, &queued);
             distance = end - w[lead].at;
-        } else {
-            distance = distance.min(end - w[lead].at);
+            snap(&w, &mut best);
+        } else if end - w[lead].at < distance {
+            distance = end - w[lead].at;
+            snap(&w, &mut best);
         }
     }
     if distance <= slop {
         freq += weight(distance);
+        rec.matched(&best);
     }
     freq
 }
@@ -341,6 +389,72 @@ mod tests {
                     "case {case}: {phrase:?} ~{slop} in {doc:?} gave {f} without a placement"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn each_counted_match_is_a_placement_and_their_weights_are_the_frequency() {
+        let mut seed = 0x5_1092_u64;
+        let vocab = ["a", "b", "c"];
+        for case in 0..3000 {
+            let n = 2 + (rng(&mut seed) % 2) as usize;
+            let phrase: Vec<&str> = (0..n)
+                .map(|_| vocab[(rng(&mut seed) % 3) as usize])
+                .collect();
+            let len = 1 + (rng(&mut seed) % 9) as usize;
+            let words: Vec<&str> = (0..len)
+                .map(|_| vocab[(rng(&mut seed) % 3) as usize])
+                .collect();
+            let slop = (rng(&mut seed) % 4) as u16;
+            let lists: Vec<Vec<u32>> = phrase
+                .iter()
+                .map(|t| {
+                    (0..len as u32)
+                        .filter(|&p| words[p as usize] == *t)
+                        .collect()
+                })
+                .collect();
+            if lists.iter().any(Vec::is_empty) {
+                continue;
+            }
+            let terms: Vec<(&[u32], u32, usize)> = phrase
+                .iter()
+                .zip(&lists)
+                .zip(0u32..)
+                .map(|((t, l), off)| {
+                    let g = phrase.iter().position(|x| x == t).expect("itself");
+                    (l.as_slice(), off, g)
+                })
+                .collect();
+            let mut rec = Positions::default();
+            let f = sloppy(&terms, slop, &mut rec);
+            assert_eq!(f, sloppy_freq(&terms, slop), "case {case}");
+            let ctx = format!("case {case}: {phrase:?} ~{slop} in {words:?}");
+            let mut sum = 0.0;
+            for ps in &rec.0 {
+                assert_eq!(ps.len(), n, "{ctx}");
+                for (i, &p) in ps.iter().enumerate() {
+                    assert_eq!(words[p as usize], phrase[i], "{ctx}: {ps:?}");
+                    for j in 0..i {
+                        assert!(
+                            phrase[j] != phrase[i] || ps[j] != p,
+                            "{ctx}: {ps:?} reuses {p}"
+                        );
+                    }
+                }
+                let at: Vec<i64> = ps
+                    .iter()
+                    .zip(0i64..)
+                    .map(|(&p, o)| i64::from(p) - o)
+                    .collect();
+                let d = at.iter().max().unwrap() - at.iter().min().unwrap();
+                assert!(d <= i64::from(slop), "{ctx}: {ps:?} spans {d}");
+                sum += 1.0 / (d as f64 + 1.0);
+            }
+            assert!(
+                (sum - f).abs() < 1e-12,
+                "{ctx}: weights {sum} vs frequency {f}"
+            );
         }
     }
 }

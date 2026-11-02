@@ -111,6 +111,33 @@ Rev 5 §4.4 as decided. The dependency is `levenshtein_automata` 0.2.1 (MIT, no 
   - mutations of the boost, the maximum, the transposition flag and the order were all caught.
 - **The bench** adds `fuzzy-1`, `fuzzy-2` and `fuzzy-2-prefix2`, and prints the mean expansions.
 
+## PR 5: highlighting
+Rev 5 §4.5, with `Match` as recorded below (cli692 on #1300).
+- **`Search::highlight(bool)`** fills `Hit::text: Option<String>` (the source text) and `Hit::matches: Vec<Match>` (new fields; `Hit` is `#[non_exhaustive]`).
+- **`Match`** (`#[non_exhaustive]`, `Clone`, `Eq`, `Hash`) has `range: Range<usize>`, `clause: usize` and `occurrence: u32`.
+  - Matches are sorted by range, then clause, then occurrence.
+  - A term, text term or fuzzy expansion is one token's range.
+  - An exact phrase is its first token to its last.
+  - A sloppy match is one range per phrase word, sharing an `occurrence`, at the positions where the matcher found that match's smallest distance.
+  - A clause's occurrences count from 0 in the order they're found.
+- **`snippet(&str, &[Match], max_bytes) -> Snippet`,** with `Snippet { range, matches }` (`#[non_exhaustive]`).
+  - A window starts at the text's start or at a match, and ends on the last UAX #29 word boundary within `max_bytes`.
+  - It's chosen by distinct clauses, then matches, then the earliest start.
+  - It returns only the matches wholly inside it.
+- **How it's computed:**
+  - **The tokens:** the hit's source cell, already read for the stale check, is tokenised again (`Index::spans`, the indexing path's normalisation and cap, with ranges).
+  - **Fuzzy clauses** match their search's expansions.
+  - **A term two clauses yield** is listed under both.
+- **The sloppy matcher** is generic over a zero-sized `Record`. Scoring passes `Count`, so its walk is the same code with nothing extra, and highlighting passes `Positions`.
+- **Tests:**
+  - against a brute-force matcher over the source texts (3 seeds × 60 queries: a term, text, an exact phrase, the same phrase at slop 2, and a fuzzy term, at once);
+  - each counted sloppy match is a placement within the slop, and their weights sum to the frequency (3,000 cases);
+  - decomposed and capitalised source text;
+  - an index without positions;
+  - stop words in a phrase;
+  - snippet ties and boundaries.
+  - Mutations of the occurrence count, a phrase's end, the snippet's tie and the sloppy snapshot were all caught.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 
