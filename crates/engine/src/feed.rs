@@ -459,9 +459,10 @@ impl Feed {
     }
 
     /// After a root commit of this session (the pager's observer): appends its sequence and
-    /// asks for a coalesced sync ([`Feed::request_sidecar_sync`]). A failure is only traced:
-    /// a lost entry makes the next feeding open see the sequence ahead of the last one
-    /// recorded, so every token expires, which is the safe direction (D310 §2.2).
+    /// asks for a coalesced sync ([`Feed::request_sidecar_sync`]). A failure ends the
+    /// session's appends, as a failed sync does (fail closed): a partly written entry is
+    /// never followed by more, and the next feeding open sees the sequence ahead of the last
+    /// one recorded, so every token expires, which is the safe direction (D310 §2.2).
     pub(crate) fn note_root(self: &Arc<Self>, sequence: u64) {
         let file = {
             let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
@@ -473,6 +474,7 @@ impl Feed {
                 sequence,
             }) {
                 crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
+                *sidecar = None;
                 return;
             }
             Arc::clone(&s.file)

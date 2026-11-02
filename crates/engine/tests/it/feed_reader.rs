@@ -18,7 +18,7 @@ use pigeonhole_engine::{
     FeedSpec, FeedStart, Next, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::{Durability, Kind, Seqno};
-use pigeonhole_io::sim::SimVfs;
+use pigeonhole_io::sim::{FaultPlan, SimVfs};
 
 const DB: &str = "/db/data.phdb";
 const WAIT: Duration = Duration::from_secs(10);
@@ -302,6 +302,36 @@ fn a_session_without_the_feed_between_expires_a_token() {
     assert!(
         matches!(r.try_next().unwrap(), Next::Expired(_)),
         "a gap is never skipped silently"
+    );
+    db.close().unwrap();
+}
+
+#[test]
+fn a_failed_sidecar_append_expires_every_token_at_the_next_open() {
+    let vfs = SimVfs::new(3109);
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let (a, _) = tables(&db);
+    let mut r = db.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    let s = single(&db, &a, b"1", Durability::GroupSync);
+    assert_eq!(next(&mut r).seqno, s);
+    let token = r.token();
+    // The next sidecar write fails (simp724 on fix A, condition 2): the flush's root
+    // commit goes unrecorded, and the session records no more after it.
+    let mut plan = FaultPlan::none();
+    plan.fail_on = Some("phdb-feed");
+    vfs.set_faults(plan);
+    single(&db, &a, b"2", Durability::GroupSync);
+    db.flush().unwrap();
+    assert_eq!(vfs.scheduled_fired(), 1, "the sidecar's write failed");
+    vfs.set_faults(FaultPlan::none());
+    single(&db, &a, b"3", Durability::GroupSync);
+    db.flush().unwrap();
+    db.close().unwrap();
+    let db = open(&vfs, Some(feed(1 << 20)));
+    let mut r = db.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    assert!(
+        matches!(r.try_next().unwrap(), Next::Expired(_)),
+        "a session the sidecar lost track of never resumes"
     );
     db.close().unwrap();
 }
