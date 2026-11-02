@@ -28,8 +28,22 @@
 - `pigeonhole`'s `Options` and `DatabaseInfo`;
 - the WAL's own tests, and `crates/engine/tests/it/feed_retention.rs`.
 
+## PR 2: the written watermark and the lazy `None` flush
+- **pigeonhole-format:**
+  - `shm::watermark::WRITTEN` (16) and `shm::watermark::SYNCED` (24).
+  - `ShmLayoutVersion::CURRENT` is now 7.
+- **pigeonhole-shm** (additive):
+  - `ShmRegion::publish_written(shard, seqno)` and `ShmRegion::publish_synced(shard, seqno)`;
+  - `ShmRegion::written_seqno(durable)`.
+- **pigeonhole-engine** (additive):
+  - `Engine::feed_frontier(durable)`;
+  - `Wal::write`'s doc states the M1 invariant.
+
+**Callers:**
+- the shard's commit path (`run_group`, `decide_share`), `publish_watermark` and the lazy flush;
+- `crates/engine/tests/it/feed_written.rs`, and the shm and format tests.
+
 ## Later PRs
-- PR 2: the per-shard written watermark in shm (layout version 7) and the lazy `None` flush.
 - PR 3: `Feed`, `Commit`, `Change`, tokens and `FeedExpired`.
 - PR 4: reader processes.
 - PR 5: `poll_next`.

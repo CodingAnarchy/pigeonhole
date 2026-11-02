@@ -264,6 +264,12 @@ pub trait Wal: Send + fmt::Debug {
 
     /// Hands every appended byte to the kernel with one `write()`. After this, every ticket
     /// appended so far satisfies `Buffered`.
+    ///
+    /// The change feed relies on this (D310's M1 invariant): a record is in the stream file,
+    /// readable by another handle, once `write` (or `sync`) returns past it, and the engine
+    /// makes a seqno visible, or passes it on the feed's frontier, only after that. A later
+    /// asynchronous write path must keep that order, or hold the feed's written watermark
+    /// itself until its write completes.
     fn write(&mut self) -> Result<Lsn>;
 
     /// Writes (if needed) and fdatasyncs, blocking. After this, every ticket appended so far
