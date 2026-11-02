@@ -53,7 +53,9 @@ pub enum Clause {
     },
     /// A fuzzy word of the syntax (`word~`, `word~1`, `word~2`): tokenised as documents are,
     /// and each of its terms is a fuzzy term. [`Fuzziness::Auto`] applies to each term's
-    /// own length.
+    /// own length. A word that tokenises into several terms (`foo-bar~`) gives one fuzzy
+    /// term each, scored separately and summed, as [`Text`](Clause::Text) does for its
+    /// words.
     FuzzyText {
         /// The word.
         text: String,

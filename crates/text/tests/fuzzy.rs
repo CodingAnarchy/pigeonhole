@@ -403,3 +403,30 @@ fn max_expansions_of_zero_is_refused_and_an_empty_dictionary_matches_nothing() {
     assert_eq!(hits.len(), 1);
     db.close().unwrap();
 }
+
+#[test]
+fn prefix_length_counts_characters_not_bytes() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    index.put(b"acute", "éxyz").unwrap();
+    index.put(b"grave", "èxyz").unwrap();
+    let ids = |prefix: usize| -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = index
+            .search(Query::new().fuzzy("éxyz", Fuzziness::One), 10)
+            .prefix_length(prefix)
+            .run()
+            .unwrap()
+            .into_iter()
+            .map(|h| h.id)
+            .collect();
+        v.sort();
+        v
+    };
+    // "èxyz" is one substitution away.
+    assert_eq!(ids(0), [b"acute".to_vec(), b"grave".to_vec()]);
+    // One character fixed is the whole `é`. `è` shares its first byte (0xC3), so a prefix
+    // of one byte would still let it match.
+    assert_eq!(ids(1), [b"acute".to_vec()]);
+    db.close().unwrap();
+}

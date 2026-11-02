@@ -39,7 +39,8 @@ pub struct SearchStats {
 pub struct FuzzyStats {
     /// The clause that yielded it: an index into [`Query::clauses`].
     pub clause: usize,
-    /// The fuzzy term, normalised (and for [`Clause::FuzzyText`], tokenised).
+    /// The fuzzy term as it was expanded: normalised, and for [`Clause::FuzzyText`]
+    /// tokenised and case-folded as documents are. Not the text as typed.
     pub term: String,
     /// The terms it expanded to.
     pub expansions: usize,
@@ -101,9 +102,13 @@ impl<'a> Search<'a> {
         self
     }
 
-    /// How many leading characters of each fuzzy term must match exactly: 0 by default.
-    /// A few narrow the walk over a large dictionary to the terms sharing them. It applies
-    /// to every fuzzy term of the query.
+    /// How many leading characters (not bytes) of each fuzzy term must match exactly: 0 by
+    /// default. A few narrow the walk over a large dictionary to the terms sharing them. It
+    /// applies to every fuzzy term of the query.
+    ///
+    /// At or above a term's length, the whole term is fixed: it matches itself and the
+    /// terms that extend it by up to its edits (`postgr`, two edits, matches `postgres`),
+    /// as Lucene's prefix does.
     pub fn prefix_length(mut self, n: usize) -> Self {
         self.prefix_length = n;
         self
