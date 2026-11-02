@@ -1946,6 +1946,10 @@ pub(crate) struct WaitingSingle {
     pub rows: Vec<u64>,
 }
 
+/// A change-feed lazy record of one group (D310): (seqno, end, whether `None`, whether a
+/// PREPARE, whose seqno is its commit id).
+type FeedLazy = (Seqno, Lsn, bool, bool);
+
 /// A share this shard prepared and holds until the decision.
 #[derive(Debug)]
 struct PreparedShare {
@@ -5121,6 +5125,21 @@ impl ShardState {
 
     // ---- the change feed's written hold (D310) ----
 
+    /// The change feed's lazy records of one group (D310): singles and decisions held now,
+    /// PREPAREs once decided (`decide_share`). Out of line: the feed-off group never calls it.
+    #[inline(never)]
+    fn note_feed_lazy(&mut self, records: Vec<FeedLazy>, ctx: &mut ShardContext<'_, ShardMsg>) {
+        for (seqno, end, none, prepare) in records {
+            if prepare {
+                if let Some(share) = self.prepared.get_mut(&seqno) {
+                    share.feed_end = Some((end, none));
+                }
+            } else {
+                self.note_feed_unwritten(seqno, end, none, ctx);
+            }
+        }
+    }
+
     /// Holds the feed's watermarks at `seqno` (still held by this group's pending, or by
     /// `cross_held`) for a fed record ending at `end` that no sync of its group covers: the
     /// synced hold always, and the written hold too when `unwritten` (a `None` record),
@@ -6755,10 +6774,9 @@ impl ShardState {
         let mut buffered_end: Option<Lsn> = None;
         // The end of the group's last written record (any level but `None`), for D227.
         let mut group_end: Option<Lsn> = None;
-        // The change feed's lazy records (D310), as (seqno held, end, whether `None`), and
-        // the PREPAREs, held once decided. Empty, never allocated, with the feed off.
-        let mut feed_lazy_records: Vec<(Seqno, Lsn, bool)> = Vec::new();
-        let mut feed_prepares: Vec<(Seqno, Lsn, bool)> = Vec::new();
+        // The change feed's lazy records (D310), as (seqno, end, whether `None`, whether a
+        // PREPARE, held once decided). Empty, never allocated, with the feed off.
+        let mut feed_lazy: Vec<FeedLazy> = Vec::new();
         #[cfg(feature = "test-hooks")]
         let mut appends = 0usize;
         for m in &mut group.members {
@@ -6841,22 +6859,18 @@ impl ShardState {
                     m.ticket = Some(t);
                     if fed_lazy {
                         let none = m.durability == Durability::None;
-                        let at = match m.kind {
+                        feed_lazy.push(match m.kind {
                             // Held at its apply seqno once decided (`decide_share`): the
                             // commit's id is never held, so a hold there could lower the
                             // frontier.
-                            MemberKind::Prepare { .. } => {
-                                feed_prepares.push((m.seqno, t.end, none));
-                                None
-                            }
+                            MemberKind::Prepare { .. } => (m.seqno, t.end, none, true),
                             // The decision's seqno is held by `cross_held` until every
                             // participant applied; a single's by this group's pending.
-                            MemberKind::CommitRecord { apply_seqno, .. } => Some(apply_seqno),
-                            MemberKind::Single => Some(m.seqno),
-                        };
-                        if let Some(at) = at {
-                            feed_lazy_records.push((at, t.end, none));
-                        }
+                            MemberKind::CommitRecord { apply_seqno, .. } => {
+                                (apply_seqno, t.end, none, false)
+                            }
+                            MemberKind::Single => (m.seqno, t.end, none, false),
+                        });
                     }
                     self.stream_end = self.stream_end.max(t.end);
                     if m.durability == Durability::Buffered {
@@ -6911,13 +6925,8 @@ impl ShardState {
                 Durability::Buffered | Durability::None => {}
             }
         }
-        for (seqno, end, none) in feed_lazy_records {
-            self.note_feed_unwritten(seqno, end, none, ctx);
-        }
-        for (id, end, none) in feed_prepares {
-            if let Some(share) = self.prepared.get_mut(&id) {
-                share.feed_end = Some((end, none));
-            }
+        if !feed_lazy.is_empty() {
+            self.note_feed_lazy(feed_lazy, ctx);
         }
         // D279: a Buffered PREPARE votes once its record is appended, when its group has no
         // sync of its own, so its coordinator decides while this shard writes and applies.
