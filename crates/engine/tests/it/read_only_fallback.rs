@@ -129,9 +129,15 @@ fn crashed_db(seed: u64, shards: usize, flushed: u32, logged: u32) -> Arc<SimVfs
 /// Opens with `read_only_fallback` (no merge operator registered), reads every row,
 /// tries each kind of write, closes, and checks the files never changed.
 fn open_read_only_and_check(vfs: &Arc<SimVfs>, shards: usize, rows: u32) {
-    let before = files(vfs);
     let mut o = common::options(Arc::clone(vfs), shards, 16 << 20);
     o.read_only_fallback = true;
+    open_and_check(vfs, o, rows);
+}
+
+/// Opens with `o` (which must open read-only), reads every row, tries each kind of write,
+/// closes, and checks nothing did I/O beyond reads and the files never changed.
+fn open_and_check(vfs: &Arc<SimVfs>, o: pigeonhole_engine::EngineOptions, rows: u32) {
+    let before = files(vfs);
     vfs.record_ops();
     let db = Engine::open(Path::new(DB), o).unwrap();
     let info = db.info().unwrap();
@@ -367,4 +373,41 @@ fn a_read_only_open_never_compacts_even_with_compaction_debt() {
     drop(db);
     no_io(&vfs);
     assert!(files(&vfs) == before, "a read-only open changed the files");
+}
+
+/// ICR 0109: `read_only` asks for the same open whatever the file needs. On a file this
+/// build could write (the merge operator registered), it still writes nothing: no format
+/// upgrade, no new WAL segment, no change-feed session, no clean-close commit.
+#[test]
+fn a_requested_read_only_open_writes_nothing() {
+    let vfs = crashed_db(5905, 2, 30, 30);
+    let mut o = common::options(Arc::clone(&vfs), 2, 16 << 20);
+    o.merge_operators.register(Arc::new(Concat));
+    o.read_only = true;
+    open_and_check(&vfs, o, 60);
+    // Any shard count, as the fallback.
+    let mut o = common::options(Arc::clone(&vfs), 3, 16 << 20);
+    o.merge_operators.register(Arc::new(Concat));
+    o.read_only = true;
+    open_and_check(&vfs, o, 60);
+    // Without the operator, `read_only` alone opens too (no `read_only_fallback` needed).
+    let mut o = common::options(Arc::clone(&vfs), 2, 16 << 20);
+    o.read_only = true;
+    open_and_check(&vfs, o, 60);
+}
+
+#[test]
+fn a_requested_read_only_open_never_creates_the_file() {
+    let vfs = SimVfs::new(5906);
+    let mut o = common::options(Arc::clone(&vfs), 1, 16 << 20);
+    o.read_only = true;
+    o.create_if_missing = true;
+    vfs.record_ops();
+    match Engine::open(Path::new(DB), o) {
+        Err(Error::Io(e)) => assert_eq!(e.kind, pigeonhole_io::ErrorKind::NotFound, "{e:?}"),
+        Ok(_) => panic!("opened"),
+        Err(e) => panic!("{e:?}"),
+    }
+    no_io(&vfs);
+    assert!(!vfs.exists(Path::new(DB)).unwrap());
 }

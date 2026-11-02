@@ -662,3 +662,69 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     assert_eq!(status, 0, "{err}");
     db.close().unwrap();
 }
+
+/// Vector families through the read and write tools (D303, #1309): `list_tables` shows
+/// the spec, `read_row` returns vectors in `dump`'s shape (or their shape, when long), and
+/// `write` puts one in that shape, checked against the family.
+#[test]
+fn vector_families_read_and_write_in_dump_shapes() {
+    use pigeonhole::{Element, Metric, VectorSpec};
+    let dir = TempDir::new("mcp-vectors");
+    let path = db_path(&dir);
+    let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
+    let t = db
+        .table("docs")
+        .unwrap()
+        .family(
+            "emb",
+            pigeonhole::Family::vector(VectorSpec::new(4, Element::F32, Metric::Cosine).unwrap()),
+        )
+        .create()
+        .unwrap();
+    t.mutate(b"d1")
+        .put_vector_f32("emb", b"v", &[0.5, -1.0, 2.0, 0.25])
+        .commit()
+        .unwrap();
+    drop(t);
+    db.close().unwrap();
+
+    let mut s = Server::start(&path, &[]);
+    let tables = s.call("list_tables", json!({}));
+    assert_eq!(
+        tables["tables"][0]["families"][0]["vector"],
+        json!({"dim": 4, "element": "f32", "metric": "cosine"}),
+        "{tables}"
+    );
+    let row = s.call("read_row", json!({"table": "docs", "row": "d1"}));
+    assert_eq!(
+        row["cells"][0]["value"],
+        json!({"vector": {"dim": 4, "element": "f32", "values": [0.5, -1.0, 2.0, 0.25]}}),
+        "{row}"
+    );
+    // A payload over max_value_bytes comes back as its shape.
+    let short = s.call(
+        "read_row",
+        json!({"table": "docs", "row": "d1", "max_value_bytes": 8}),
+    );
+    assert_eq!(
+        short["cells"][0]["value"],
+        json!({"omitted_vector": {"element": "f32", "dim": 4}}),
+        "{short}"
+    );
+    // write takes the same shape, checked against the family.
+    let put = |values: Value, dim: u64| {
+        json!({"ops": [{"op": "put", "table": "docs", "row": "d2", "family": "emb",
+                        "qualifier": "v", "value": {"vector": {"dim": dim, "element": "f32",
+                                                               "values": values}}}]})
+    };
+    s.call("write", put(json!([1.0, 0.0, 0.0, 0.0]), 4));
+    let d2 = s.call("read_row", json!({"table": "docs", "row": "d2"}));
+    assert_eq!(
+        d2["cells"][0]["value"]["vector"]["values"],
+        json!([1.0, 0.0, 0.0, 0.0])
+    );
+    let err = s.fail("write", put(json!([1.0, 0.0]), 2));
+    assert!(err.to_string().contains("f32[4]"), "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}

@@ -209,7 +209,9 @@ pub(crate) fn may_hold_purgeable(
 /// length (index, filters and footer included), while the sink cuts by its data. An SST whose
 /// data fits a piece but whose whole length is just over it was rewritten into itself about once
 /// a millisecond, for as long as the `compact()` ran. New data flushed meanwhile makes the slot
-/// more than one run, and it compacts again.
+/// more than one run, and it compacts again. The sink now cuts by the whole length too (#1324);
+/// what remains is an output whose last row overruns its piece's slack, which only this guard
+/// bounds (#1351).
 ///
 /// A lone SST is also rewritten, not moved, when it is larger than one output piece
 /// (`output_piece_bytes` at `target`): the rewrite cuts it into pieces that pack below one

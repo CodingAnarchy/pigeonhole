@@ -3,6 +3,9 @@ pub mod pigeonhole_text
 pub pigeonhole_text::Clause::Fuzzy
 pub pigeonhole_text::Clause::Fuzzy::fuzziness: pigeonhole_text::Fuzziness
 pub pigeonhole_text::Clause::Fuzzy::term: alloc::string::String
+pub pigeonhole_text::Clause::FuzzyText
+pub pigeonhole_text::Clause::FuzzyText::fuzziness: pigeonhole_text::Fuzziness
+pub pigeonhole_text::Clause::FuzzyText::text: alloc::string::String
 pub pigeonhole_text::Clause::Phrase
 pub pigeonhole_text::Clause::Phrase::slop: u16
 pub pigeonhole_text::Clause::Phrase::words: alloc::vec::Vec<alloc::string::String>
@@ -43,6 +46,11 @@ pub pigeonhole_text::QueryErrorKind::Slop
 pub pigeonhole_text::QueryErrorKind::UnclosedQuote
 impl core::fmt::Display for pigeonhole_text::QueryErrorKind
 pub fn pigeonhole_text::QueryErrorKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole_text::FuzzyStats
+pub pigeonhole_text::FuzzyStats::clause: usize
+pub pigeonhole_text::FuzzyStats::cut: bool
+pub pigeonhole_text::FuzzyStats::expansions: usize
+pub pigeonhole_text::FuzzyStats::term: alloc::string::String
 #[non_exhaustive] pub struct pigeonhole_text::Hit
 pub pigeonhole_text::Hit::id: alloc::vec::Vec<u8>
 pub pigeonhole_text::Hit::score: f64
@@ -53,6 +61,8 @@ pub fn pigeonhole_text::Index::create_with_tokenizer(&pigeonhole::db::Pigeonhole
 pub fn pigeonhole_text::Index::delete(&self, &[u8]) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::delete_in(&self, &mut pigeonhole::write::Transaction, &[u8]) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::open(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::open_reader(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
+pub fn pigeonhole_text::Index::open_reader_with_tokenizer(&pigeonhole::db::PigeonholeReader, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
 pub fn pigeonhole_text::Index::open_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::options(&self) -> pigeonhole_text::IndexOptions
 pub fn pigeonhole_text::Index::put(&self, &[u8], &str) -> pigeonhole_text::Result<()>
@@ -109,6 +119,14 @@ impl core::convert::From<&str> for pigeonhole_text::Query
 pub fn pigeonhole_text::Query::from(&str) -> Self
 impl core::convert::From<alloc::string::String> for pigeonhole_text::Query
 pub fn pigeonhole_text::Query::from(alloc::string::String) -> Self
+pub struct pigeonhole_text::ReadIndex
+impl pigeonhole_text::ReadIndex
+pub fn pigeonhole_text::ReadIndex::options(&self) -> pigeonhole_text::IndexOptions
+pub fn pigeonhole_text::ReadIndex::search(&self, impl core::convert::Into<pigeonhole_text::Query>, usize) -> pigeonhole_text::Search<'_>
+pub fn pigeonhole_text::ReadIndex::source(&self) -> &pigeonhole_text::Source
+pub fn pigeonhole_text::ReadIndex::verify(&self) -> pigeonhole_text::Result<pigeonhole_text::IndexStats>
+impl core::fmt::Debug for pigeonhole_text::ReadIndex
+pub fn pigeonhole_text::ReadIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_text::RebuildStats
 pub pigeonhole_text::RebuildStats::changed: u64
 pub pigeonhole_text::RebuildStats::documents: u64
@@ -116,10 +134,13 @@ pub pigeonhole_text::RebuildStats::invalid_utf8: u64
 pub struct pigeonhole_text::Search<'a>
 impl<'a> pigeonhole_text::Search<'a>
 pub fn pigeonhole_text::Search<'a>::id_prefix(self, impl core::convert::Into<alloc::vec::Vec<u8>>) -> Self
+pub fn pigeonhole_text::Search<'a>::max_expansions(self, usize) -> Self
+pub fn pigeonhole_text::Search<'a>::prefix_length(self, usize) -> Self
 pub fn pigeonhole_text::Search<'a>::run(self) -> pigeonhole_text::Result<alloc::vec::Vec<pigeonhole_text::Hit>>
 pub fn pigeonhole_text::Search<'a>::run_with_stats(self) -> pigeonhole_text::Result<(alloc::vec::Vec<pigeonhole_text::Hit>, pigeonhole_text::SearchStats)>
 pub fn pigeonhole_text::Search<'a>::snapshot(self, &'a pigeonhole::db::Snapshot) -> Self
 #[non_exhaustive] pub struct pigeonhole_text::SearchStats
+pub pigeonhole_text::SearchStats::fuzzy: alloc::vec::Vec<pigeonhole_text::FuzzyStats>
 pub pigeonhole_text::SearchStats::stale: u64
 pub struct pigeonhole_text::Source
 impl pigeonhole_text::Source

@@ -3,9 +3,13 @@
 
 use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::Arc;
 
-use pigeonhole::{Family, Pigeonhole, RetryPolicy, Snapshot, Table, Transaction};
+use pigeonhole::{
+    CellRef, Family, Pigeonhole, PigeonholeReader, ReadTable, RetryPolicy, RowRead, Scan, Snapshot,
+    Table, Transaction,
+};
 use unicode_normalization::{IsNormalized, UnicodeNormalization, is_nfc_quick, is_nfkc_quick};
 
 use crate::error::{Error, Result, corrupt};
@@ -37,14 +41,107 @@ impl std::fmt::Debug for Index {
 }
 
 pub(crate) struct Inner {
-    pub(crate) db: Pigeonhole,
-    pub(crate) table: Table,
-    pub(crate) src: Table,
+    /// The read side: a writer's handles, or a reader process's ([`ReadIndex`]).
+    pub(crate) db: Handle,
+    pub(crate) table: Rows,
+    pub(crate) src: Rows,
+    /// The write side: only an [`Index`] has one.
+    writer: Option<Writer>,
     pub(crate) source: Source,
     pub(crate) opts: IndexOptions,
     pub(crate) tok: Box<dyn Tokenizer>,
     /// The built-in tokeniser lowercases again after NFKC (D309 rev 6 §A.2).
     builtin: bool,
+}
+
+/// An [`Index`]'s write handles.
+struct Writer {
+    db: Pigeonhole,
+    table: Table,
+    src: Table,
+}
+
+/// A database handle for reads: a writer's, or a reader process's.
+pub(crate) enum Handle {
+    W(Pigeonhole),
+    R(PigeonholeReader),
+}
+
+impl Handle {
+    pub(crate) fn snapshot(&self) -> pigeonhole::Result<Snapshot> {
+        match self {
+            Handle::W(d) => d.snapshot(),
+            Handle::R(d) => d.snapshot(),
+        }
+    }
+}
+
+/// A table handle for reads: a writer's [`Table`], or a reader process's [`ReadTable`].
+pub(crate) enum Rows {
+    W(Table),
+    R(ReadTable),
+}
+
+impl Rows {
+    pub(crate) fn name(&self) -> &str {
+        match self {
+            Rows::W(t) => t.name(),
+            Rows::R(t) => t.name(),
+        }
+    }
+
+    pub(crate) fn family_info(&self, family: &str) -> Option<pigeonhole::FamilyInfo> {
+        match self {
+            Rows::W(t) => t.family_info(family),
+            Rows::R(t) => t.family_info(family),
+        }
+    }
+
+    pub(crate) fn get(
+        &self,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> pigeonhole::Result<Option<CellRef<'_>>> {
+        match self {
+            Rows::W(t) => t.get(row, family, qualifier),
+            Rows::R(t) => t.get(row, family, qualifier),
+        }
+    }
+
+    pub(crate) fn get_at(
+        &self,
+        s: &Snapshot,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+    ) -> pigeonhole::Result<Option<CellRef<'_>>> {
+        match self {
+            Rows::W(t) => t.get_at(s, row, family, qualifier),
+            Rows::R(t) => t.get_at(s, row, family, qualifier),
+        }
+    }
+
+    pub(crate) fn row(&self, row: &[u8]) -> RowRead<'_> {
+        match self {
+            Rows::W(t) => t.row(row),
+            Rows::R(t) => t.row(row),
+        }
+    }
+
+    pub(crate) fn scan_bounds(&self, start: Bound<&[u8]>, end: Bound<&[u8]>) -> Scan<'_> {
+        match self {
+            Rows::W(t) => t.scan_bounds(start, end),
+            Rows::R(t) => t.scan_bounds(start, end),
+        }
+    }
+
+    pub(crate) fn scan_prefix(&self, prefix: &[u8]) -> Scan<'_> {
+        match self {
+            Rows::W(t) => t.scan_prefix(prefix),
+            Rows::R(t) => t.scan_prefix(prefix),
+        }
+    }
 }
 
 /// A document's terms, with their positions, and its length in terms.
@@ -234,9 +331,14 @@ impl Index {
             .commit()?;
         let index = Index {
             inner: Arc::new(Inner {
-                db: db.clone(),
-                table,
-                src,
+                db: Handle::W(db.clone()),
+                table: Rows::W(table.clone()),
+                src: Rows::W(src.clone()),
+                writer: Some(Writer {
+                    db: db.clone(),
+                    table,
+                    src,
+                }),
                 source,
                 opts,
                 tok,
@@ -271,63 +373,50 @@ impl Index {
         custom: Option<Box<dyn Tokenizer>>,
     ) -> Result<Index> {
         let table = db.table(name)?.open()?;
-        let not = |why: &str| {
-            Error::InvalidArgument(format!("table {name:?} is not a text index: {why}"))
-        };
-        let g = |q: &[u8]| {
-            table
-                .get(GLOBAL, META, q)
-                .map(|c| c.map(|c| c.value().to_vec()))
-        };
-        match table.get(GLOBAL, META, LAYOUT)?.and_then(|c| c.as_u64()) {
-            Some(LAYOUT_VERSION) => {}
-            Some(v) => return Err(not(&format!("layout version {v} is unknown"))),
-            None => return Err(not("it has no layout")),
-        }
-        let opts = g(OPTS)?
-            .and_then(|b| IndexOptions::decode(&b))
-            .ok_or_else(|| not("its options don't parse"))?;
-        let source = g(SOURCE)?
-            .and_then(|b| Source::decode(&b))
-            .ok_or_else(|| not("its source doesn't parse"))?;
-        let stored_name = g(TOKENIZER)?.ok_or_else(|| not("it names no tokeniser"))?;
-        let stored_fp = table
-            .get(GLOBAL, META, FINGERPRINT)?
-            .and_then(|c| c.as_u64())
-            .ok_or_else(|| not("it has no tokeniser fingerprint"))?;
-        let builtin = custom.is_none();
-        let tok: Box<dyn Tokenizer> = match custom {
-            Some(t) => t,
-            None => Box::new(Standard {
-                stop_words: opts.get_stop_words(),
-            }),
-        };
-        if stored_name != tok.name().as_bytes() {
-            return Err(Error::Mismatch(format!(
-                "the index was created with the tokeniser {:?}, not {:?}",
-                String::from_utf8_lossy(&stored_name),
-                tok.name()
-            )));
-        }
-        if stored_fp != tok.fingerprint() {
-            return Err(Error::Mismatch(format!(
-                "the tokeniser {:?} has another fingerprint than the index was created with \
-                 (its options or Unicode version changed): repair the index into a new one",
-                tok.name()
-            )));
-        }
+        let rows = Rows::W(table.clone());
+        let (source, opts, tok, builtin) = load(&rows, name, custom)?;
         let src = db.table(&source.table)?.open()?;
         Ok(Index {
             inner: Arc::new(Inner {
-                db: db.clone(),
-                table,
-                src,
+                db: Handle::W(db.clone()),
+                table: rows,
+                src: Rows::W(src.clone()),
+                writer: Some(Writer {
+                    db: db.clone(),
+                    table,
+                    src,
+                }),
                 source,
                 opts,
                 tok,
                 builtin,
             }),
         })
+    }
+
+    /// Opens the index `name` from a reader process, with the built-in tokeniser: a
+    /// [`ReadIndex`], which searches and verifies but doesn't write. `Mismatch` as for
+    /// [`open`](Self::open).
+    pub fn open_reader(reader: &PigeonholeReader, name: &str) -> Result<ReadIndex> {
+        ReadIndex::open_inner(reader, name, None)
+    }
+
+    /// [`open_reader`](Self::open_reader) with the custom tokeniser the index was created
+    /// with.
+    pub fn open_reader_with_tokenizer(
+        reader: &PigeonholeReader,
+        name: &str,
+        tokenizer: Box<dyn Tokenizer>,
+    ) -> Result<ReadIndex> {
+        ReadIndex::open_inner(reader, name, Some(tokenizer))
+    }
+
+    /// The write handles: an [`Index`] is always built with them.
+    fn w(&self) -> &Writer {
+        self.inner
+            .writer
+            .as_ref()
+            .expect("an Index is built with its write handles")
     }
 
     /// The index's options.
@@ -360,8 +449,9 @@ impl Index {
     pub fn put_in(&self, txn: &mut Transaction, doc: &[u8], text: &str) -> Result<()> {
         self.check_not_repairing(txn)?;
         let inn = &*self.inner;
+        let w = self.w();
         let stored = txn
-            .get(&inn.src, doc, &inn.source.family, &inn.source.qualifier)?
+            .get(&w.src, doc, &inn.source.family, &inn.source.qualifier)?
             .map(|c| c.value() == text.as_bytes());
         let old = self.read_forward(txn, doc)?;
         if old.present && stored == Some(true) {
@@ -369,7 +459,7 @@ impl Index {
         }
         let new = self.analyse(text)?;
         txn.put(
-            &inn.src,
+            &w.src,
             doc,
             &inn.source.family,
             &inn.source.qualifier,
@@ -386,14 +476,15 @@ impl Index {
     pub fn delete_in(&self, txn: &mut Transaction, doc: &[u8]) -> Result<bool> {
         self.check_not_repairing(txn)?;
         let inn = &*self.inner;
+        let w = self.w();
         let old = self.read_forward(txn, doc)?;
-        txn.delete_column(&inn.src, doc, &inn.source.family, &inn.source.qualifier);
+        txn.delete_column(&w.src, doc, &inn.source.family, &inn.source.qualifier);
         if !old.present {
             return Ok(false);
         }
         // Deletes only: `apply` would also write `F{doc}`'s cells, which the row delete
         // below would meet at the same seqno.
-        let t = &inn.table;
+        let t = &w.table;
         for term in old.terms.keys() {
             let row = [POST_PREFIX, term].concat();
             txn.delete_column(t, &row, POST, doc);
@@ -411,7 +502,7 @@ impl Index {
     /// [`put_in`](Self::put_in) in its own transaction, retried on conflicts with
     /// `RetryPolicy::default()` (use `put_in` for any other policy).
     pub fn put(&self, doc: &[u8], text: &str) -> Result<()> {
-        self.inner
+        self.w()
             .db
             .transact(&RetryPolicy::default(), |tx| {
                 self.put_in(tx, doc, text).map_err(Tx::from)
@@ -423,7 +514,7 @@ impl Index {
     /// [`delete_in`](Self::delete_in) in its own transaction, retried on conflicts with
     /// `RetryPolicy::default()`.
     pub fn delete(&self, doc: &[u8]) -> Result<bool> {
-        self.inner
+        self.w()
             .db
             .transact(&RetryPolicy::default(), |tx| {
                 self.delete_in(tx, doc).map_err(Tx::from)
@@ -455,22 +546,22 @@ impl Index {
     }
 
     /// Rebuilds the index from an emptied table (D309 §3, M2): drops every index row, then
-    /// [`rebuild`](Self::rebuild)s. Writes through the index and searches of it fail with
+    /// [`rebuild`](Self::rebuild)s. Writes through the index and searches of it fail
     /// with `Busy` until it finishes. If it's interrupted (a crash), the index stays `Busy` until
     /// `repair` is run again.
     pub fn repair(&self) -> Result<RebuildStats> {
-        let inn = &*self.inner;
-        let t = &inn.table;
+        let w = self.w();
+        let t = &w.table;
         // The flag first: every write in flight read it, so they conflict and retry into Busy.
         t.mutate(GLOBAL).put(META, REPAIR, b"").commit()?;
-        let s = inn.db.snapshot()?;
+        let s = w.db.snapshot()?;
         for prefix in [POST_PREFIX, FWD_PREFIX, STATS_ROW] {
             let mut keys = Vec::new();
             for row in t.scan_prefix(prefix).snapshot(&s).iter()? {
                 keys.push(row?.key().to_vec());
             }
             for chunk in keys.chunks(256) {
-                let mut batch = inn.db.write_batch();
+                let mut batch = w.db.write_batch();
                 for k in chunk {
                     batch.delete_row(t, k);
                 }
@@ -484,7 +575,8 @@ impl Index {
 
     fn rebuild_inner(&self, repairing: bool) -> Result<RebuildStats> {
         let inn = &*self.inner;
-        let s = inn.db.snapshot()?;
+        let w = self.w();
+        let s = w.db.snapshot()?;
         let mut stats = RebuildStats::default();
         let q = inn.source.qualifier.as_slice();
         let docs = inn
@@ -497,12 +589,12 @@ impl Index {
         for row in docs {
             let doc = row?.key().to_vec();
             stats.documents += 1;
-            let ((changed, bad), _) = inn.db.transact(&RetryPolicy::default(), |tx| {
+            let ((changed, bad), _) = w.db.transact(&RetryPolicy::default(), |tx| {
                 if !repairing {
                     self.check_not_repairing(tx)?;
                 }
                 // The current text, not the snapshot's: a put since the scan wins.
-                let text = match tx.get(&inn.src, &doc, &inn.source.family, q)? {
+                let text = match tx.get(&w.src, &doc, &inn.source.family, q)? {
                     None => return Ok((false, false)),
                     Some(c) => match std::str::from_utf8(c.value()) {
                         Ok(t) => t.to_owned(),
@@ -521,7 +613,7 @@ impl Index {
     }
 
     fn check_not_repairing(&self, txn: &mut Transaction) -> Result<()> {
-        match txn.get(&self.inner.table, GLOBAL, META, REPAIR)? {
+        match txn.get(&self.w().table, GLOBAL, META, REPAIR)? {
             Some(_) => Err(Error::Busy),
             None => Ok(()),
         }
@@ -529,7 +621,7 @@ impl Index {
 
     fn read_forward(&self, txn: &mut Transaction, doc: &[u8]) -> Result<Forward> {
         let mut f = Forward::default();
-        let Some(row) = txn.get_row(&self.inner.table, &fwd_row(doc), &[TERMS, META])? else {
+        let Some(row) = txn.get_row(&self.w().table, &fwd_row(doc), &[TERMS, META])? else {
             return Ok(f);
         };
         for e in row.iter() {
@@ -557,7 +649,8 @@ impl Index {
         mode: Mode,
     ) -> Result<bool> {
         let inn = &*self.inner;
-        let t = &inn.table;
+        let w = self.w();
+        let t = &w.table;
         let positions = inn.opts.get_positions();
         let fwd = fwd_row(doc);
         let mut changed = false;
@@ -888,6 +981,139 @@ impl Index {
             .filter(|(d, f)| f.present && !sourced.contains(*d))
             .count() as u64;
         Ok(())
+    }
+}
+
+/// Reads an index's `G` row and checks it: its source, options, and the tokeniser to use
+/// (the built-in one, or `custom`), which must match the stored name and fingerprint.
+fn load(
+    rows: &Rows,
+    name: &str,
+    custom: Option<Box<dyn Tokenizer>>,
+) -> Result<(Source, IndexOptions, Box<dyn Tokenizer>, bool)> {
+    let not =
+        |why: &str| Error::InvalidArgument(format!("table {name:?} is not a text index: {why}"));
+    // A table without the index's families isn't one (a read of a missing family would fail
+    // as the database's error, not as this one).
+    if [POST, DF, TERMS, META, STATS]
+        .iter()
+        .any(|f| rows.family_info(f).is_none())
+    {
+        return Err(not("it lacks the index's families"));
+    }
+    let g = |q: &[u8]| {
+        rows.get(GLOBAL, META, q)
+            .map(|c| c.map(|c| c.value().to_vec()))
+    };
+    match rows.get(GLOBAL, META, LAYOUT)?.and_then(|c| c.as_u64()) {
+        Some(LAYOUT_VERSION) => {}
+        Some(v) => return Err(not(&format!("layout version {v} is unknown"))),
+        None => return Err(not("it has no layout")),
+    }
+    let opts = g(OPTS)?
+        .and_then(|b| IndexOptions::decode(&b))
+        .ok_or_else(|| not("its options don't parse"))?;
+    let source = g(SOURCE)?
+        .and_then(|b| Source::decode(&b))
+        .ok_or_else(|| not("its source doesn't parse"))?;
+    let stored_name = g(TOKENIZER)?.ok_or_else(|| not("it names no tokeniser"))?;
+    let stored_fp = rows
+        .get(GLOBAL, META, FINGERPRINT)?
+        .and_then(|c| c.as_u64())
+        .ok_or_else(|| not("it has no tokeniser fingerprint"))?;
+    let builtin = custom.is_none();
+    let tok: Box<dyn Tokenizer> = match custom {
+        Some(t) => t,
+        None => Box::new(Standard {
+            stop_words: opts.get_stop_words(),
+        }),
+    };
+    if stored_name != tok.name().as_bytes() {
+        return Err(Error::Mismatch(format!(
+            "the index was created with the tokeniser {:?}, not {:?}",
+            String::from_utf8_lossy(&stored_name),
+            tok.name()
+        )));
+    }
+    if stored_fp != tok.fingerprint() {
+        return Err(Error::Mismatch(format!(
+            "the tokeniser {:?} has another fingerprint than the index was created with \
+             (its options or Unicode version changed): repair the index into a new one",
+            tok.name()
+        )));
+    }
+    Ok((source, opts, tok, builtin))
+}
+
+/// A text index opened from a reader process ([`PigeonholeReader`]): searches and
+/// [`verify`](ReadIndex::verify) at the reader's snapshots, and no writes (D309 rev 5 §10).
+///
+/// The writer process writes the index ([`Index`]). A reader process opens it by name, and
+/// sees what the writer has committed, as any read there does. A search while the writer
+/// runs [`Index::repair`] fails with `Busy`.
+#[derive(Clone)]
+pub struct ReadIndex {
+    index: Index,
+}
+
+impl std::fmt::Debug for ReadIndex {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadIndex")
+            .field("table", &self.index.inner.table.name())
+            .field("source", &self.index.inner.source)
+            .field("options", &self.index.inner.opts)
+            .finish()
+    }
+}
+
+impl ReadIndex {
+    fn open_inner(
+        reader: &PigeonholeReader,
+        name: &str,
+        custom: Option<Box<dyn Tokenizer>>,
+    ) -> Result<ReadIndex> {
+        let rows = Rows::R(reader.table(name)?);
+        let (source, opts, tok, builtin) = load(&rows, name, custom)?;
+        let src = Rows::R(reader.table(&source.table)?);
+        Ok(ReadIndex {
+            index: Index {
+                inner: Arc::new(Inner {
+                    db: Handle::R(reader.clone()),
+                    table: rows,
+                    src,
+                    writer: None,
+                    source,
+                    opts,
+                    tok,
+                    builtin,
+                }),
+            },
+        })
+    }
+
+    /// The `k` best documents for `query`, as [`Index::search`] gives them, at the
+    /// reader's snapshot.
+    ///
+    /// While the writer process runs [`Index::repair`], the search fails with
+    /// [`Error::Busy`](crate::Error::Busy). That's transient: retry after the repair
+    /// finishes, and the search succeeds on the repaired index.
+    pub fn search(&self, query: impl Into<Query>, k: usize) -> Search<'_> {
+        self.index.search(query, k)
+    }
+
+    /// Checks the index's rows, as [`Index::verify`] does, at the reader's snapshot.
+    pub fn verify(&self) -> Result<IndexStats> {
+        self.index.verify()
+    }
+
+    /// The index's options.
+    pub fn options(&self) -> IndexOptions {
+        self.index.options()
+    }
+
+    /// The column the index is built over.
+    pub fn source(&self) -> &Source {
+        self.index.source()
     }
 }
 

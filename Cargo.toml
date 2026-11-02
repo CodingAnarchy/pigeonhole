@@ -77,6 +77,7 @@ unicode-normalization = "0.1"
 # Its Unicode version is in pigeonhole-text's tokeniser fingerprint (UAX #29 changes between
 # versions): a bump that moves it makes existing text indexes refuse to open until `repair`.
 unicode-segmentation = "1"
+levenshtein_automata = "0.2.1"
 libc = "0.2"
 io-uring = "0.7.15"
 # Arrow export (pigeonhole-arrow, and phdb dump --format arrow): one arrow-rs major, pinned (#691).

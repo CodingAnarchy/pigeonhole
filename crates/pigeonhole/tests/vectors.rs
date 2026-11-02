@@ -404,6 +404,28 @@ fn nearest_refuses_what_doesnt_fit() {
     db.close().expect("close");
 }
 
+/// `VectorRef::widen_into` appends what `to_f32_vec` returns, after what's already there,
+/// and appends nothing (returning `false`) for a bit vector.
+#[test]
+fn widen_into_appends_the_widened_components() {
+    let f16 = Vector::from_f16_bits(&[0x3e00, 0x7bff, 0x0001, 0x8000]).unwrap();
+    let i8s = Vector::from_i8(&[-128, 0, 127]).unwrap();
+    let bits = Vector::from_bits(16, &[0xa5, 0x01]).unwrap();
+    let mut out = vec![9.0];
+    assert!(f16.as_ref().widen_into(&mut out));
+    assert!(i8s.as_ref().widen_into(&mut out));
+    let mut want = vec![9.0];
+    want.extend(f16.as_ref().to_f32_vec().unwrap());
+    want.extend(i8s.as_ref().to_f32_vec().unwrap());
+    assert_eq!(
+        out.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+        want.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+    );
+    assert_eq!(out.len(), 1 + 4 + 3);
+    assert!(!bits.as_ref().widen_into(&mut out));
+    assert_eq!(out.len(), 8, "a bit vector appends nothing");
+}
+
 /// An owned `Vector` (#490 D: centroids and means aren't cells) scores as a stored vector
 /// does, and widening an `i8` vector to `f32` against an `f32` spec is exact.
 #[test]

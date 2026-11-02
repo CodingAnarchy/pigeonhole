@@ -3621,6 +3621,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Writes (PR 2):** only `put_vector_f32`, `put_vector_i8` and `put_vector_bits` (and `_at` forms) into a vector family, of its element and dimension, refused when the write is built otherwise; no merge operator and no other value. NaN, ±∞, `f32` components above 2^56 in magnitude, and (cosine) vectors with a zero norm (an `f32` squared norm below `f32::MIN_POSITIVE`) are refused, for stored vectors and queries alike, so every distance is finite (perf287's B1 on #1255).
 - **Reads:** `Value::Vector`/`VectorRef` (PR 2); the typed `nearest_f32`, `nearest_i8` and `nearest_bits` with D296 PR 4. `i8` is raw signed bytes: the application quantises.
 - **PRs:** 1, the format, with the engine refusing a vector family (`Unsupported`) and a vector value in any batch until 2, the engine and public API; 3, the Arrow and `phdb` mappings.
+- **PR 3 (#1309, ICR 0108):** `phdb` dumps vector values as `{"vector": {"dim", "element", "values"}}` (bit vectors as `base64`; floats as the `f64`s they widen to), exact for every element, and `load` writes them back bit for bit after checking the family's element and dim. A family's options carry `"vector": {"dim", "element", "metric"}`. In Arrow, `value_type` gains `vector`, `value` is the stored encoding, and `ArrowOptions::vector_dim(n)` adds `value_vector: FixedSizeList<Float32, n>`, widened exactly, null for other cells and bit vectors, and an error for another dimension. Before it, a dump lost vectors and an Arrow export of a vector family failed.
 - **Half precision (amendment, owner 2026-10-31, #1263, ICR 0104):** element codes 4 = `f16` (IEEE binary16) and 5 = `bf16` (bfloat16), each a 2-byte little-endian bit pattern, under L2, inner product and cosine (Hamming stays bit-only), sharing `incompat` bit 0.
   - **Writes:** `put_vector_f16`/`put_vector_bf16(&[u16])` store the bits as given. `put_vector_f32` into a half family rounds each component to nearest, ties to even, refuses one that overflows the element, and checks the rounded vector as stored, so an `f32` vector that rounds to zero under cosine is refused ("rounds to a zero vector").
   - **Bounds:** `f16` needs only finiteness (its largest value, 65,504, bounds it; an `f32` query's 2^56 rule bounds the mixed sums). `bf16` keeps `f32`'s 2^56 bound. Under cosine, the squared norm of the widened components must be at least `f32::MIN_POSITIVE`.
@@ -3905,6 +3906,32 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `id_prefix` equals the full search filtered by prefix, at large and small `k`;
   - the terminator's effect.
 
+**PR 3b.** `ReadIndex` and the guide.
+- **`Index::open_reader` (and `_with_tokenizer`)** opens the index from a `PigeonholeReader`. It runs the same tokeniser checks as `open`, and both opens now refuse a table without the index's families (`InvalidArgument`).
+- **`ReadIndex`** searches and verifies at the reader's snapshots. Its searches fail with `Busy` while the writer's `repair` runs.
+- **Code shape:** the writer and reader handles share one `Index` core over a small enum of table kinds, so a search runs the same code from either process.
+- **The guide page** `docs/guide/text-search.md` is doctested.
+- **The AX102 bench** (`crates/text/examples/bench.rs`) flushes only, with no forced `compact()`. A full compaction of this index writes about 1,000× its size (#1313, a 1.1.0 blocker owned by perf2). The coordinator's call (2026-11-02) is to ship flush-only numbers, say so in the guide, and re-take them once #1313 is fixed, as part of the pre-1.1.0 recheck.
+- **Tests:** a reader process searches what the writer committed, and a plain table is refused.
+- **The AX102 numbers** (1M documents of about 40 words, flush only, the mean of two runs):
+  - **The owner's write-cost row:** positions cost +18% write time (136 → 160 µs a document) and +58% stored bytes (1,044 → 1,649 a document). That's well under the Mac's 2.5×, so positions stay on by default.
+  - **Searches:** two terms 2.5 ms p50, two hub terms 44 ms, a rare phrase 0.28 ms, a phrase of two hub words 403 ms (#1334, Post-1.0).
+  - They're re-taken after #1332 (#1313's fix), in the pre-1.1.0 recheck.
+
+**PR 4.** Fuzzy terms, as rev 5 §4.4, with `levenshtein_automata` 0.2.1 (Damerau, with an adjacent transposition as one edit).
+- **The walk:** a `df`-only scan of the `P` rows from the fixed prefix. At a key the automaton rejects partway, it seeks to the smallest byte string above the key that the automaton hasn't rejected. A term whose `df` is 0 isn't an expansion.
+- **Expansions:** at most `max_expansions` (50), ordered by distance, then df descending, then bytewise.
+  - Each scores as a term times `1 − d / min(len)`, and a document takes its best expansion.
+  - **Rev 5 §4.4 amended (coordinator, 2026-11-02, a Lucene-parity correction, from simp724's review of #1327):** every kept expansion scores with the idf of the largest df among the kept expansions. This is Lucene's blended `TopTermsBlendedFreqScoringRewrite`. Rev 5 had each expansion's own idf, which let a rare misspelling outrank the common word, about 2× for df 1 against 1,000.
+  - An addition to rev 5 (coordinator, 2026-11-02): a match with `d ≥ min(len)` isn't an expansion, since its boost would be 0 or below.
+- **MaxScore:** the fuzzy clause merges its expansions' walks, taking the maximum. Its bound is the largest expansion's bound.
+- **API** (ICR 0105 PR 4):
+  - `Clause::FuzzyText` for the syntax's `word~`, tokenised as documents are;
+  - `Search::max_expansions` and `Search::prefix_length`;
+  - `SearchStats::fuzzy`, so `SearchStats` loses `Copy`.
+- **Tests:** a brute-force optimal-string-alignment scan of every term, at full depth and at small `k`.
+- **The AX102 numbers** (the 3b run, 1M documents, flush only, the mean of two runs): 1 edit 375 ms p50 (41 expansions), 2 edits 406 ms, 2 edits with `prefix_length(2)` 130 ms. A fuzzy clause walks the union of its expansions' postings, and on the bench's dense `w`+digits vocabulary those include common words. Pruning inside the clause (max-combine MaxScore) is #1333, in 1.1.0.
+
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
 **Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.
@@ -4023,6 +4050,8 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **Automatic recovery** (D265): a feed checks its engine generation on each call (one load). After a swap it resubscribes on the new engine from its own token, so a durable feed continues and a visible one that delivered lost commits expires. After `close()` it fails with `Closed`.
 - **perf287's `debug_assert`** (on #1297): `Feed::needs` asserts that a fed batch decodes. Admission decodes every batch first, so it holds today.
 - **Tests:** `pigeonhole/tests/feed.rs` covers named and typed changes of every kind, a cross-table commit arriving whole, a snapshot start, a token across a reopen, a prefix, the refusals, and expiry across a feed-off open. `tests/recovery.rs` has a durable feed following an automatic recovery, mutation-checked.
+
+**Amendment (d), owner 2026-11-02: phdb's read-only commands write nothing** (cli692; ICR 0109). Under the original D310, any writer open without the feed configuration, or with another shard count, ended feed history, so `phdb info app.phdb` on a stopped application expired its tokens. Since (c) that is only an open that turns the feed off or sets an explicit different count, but a read-only command should write nothing at all. `Options::read_only(bool)` (new, public) forces the `no_writes` open `read_only_fallback` takes: no session or Root entries, no WAL segment, no upgrade, no clean-close commit. `phdb info`, `dump`, `backup` and `shell --read-only` use it when no writer runs, and a reader process when one does. Writable phdb opens (the shell, `mcp`, `load`, `compact`) rely on amendment (c), feed1248's inherited feed configuration (#1344), so phdb now leaves `shards` unset for an existing database and sets one shard only for one it creates (cli692's S1 on #1344): an explicit `shards(1)` would reshard an app's feed. Tests: `engine/tests/it/read_only_fallback.rs` (a requested open does no write I/O, at any shard count, and never creates a file), `pigeonhole/tests/feed.rs` (a read-only open between two fed opens keeps the token), `cli/tests/info.rs` (all four read-only commands, and a writable `shell` put, between two fed opens keep it).
 
 **Amendment (the owner, 2026-11-02: feed settings are inherited by default).** Any open without the feed settings, or with another shard count, used to end the feed's history, so `phdb load app.phdb` while the app was stopped silently expired the app's feed.
 - **`Options::change_feed` has three states:**
