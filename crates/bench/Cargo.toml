@@ -27,6 +27,8 @@ sqlite = ["dep:rusqlite"]
 # Default features (async included): the instruction counts measure what users get.
 # The bench reads pigeonhole's test and bench hooks (ICR 0085).
 pigeonhole = { workspace = true, features = ["__unstable-hooks"] }
+# D306 PR 3: the IVF index on SIFT1M (`examples/ivfsift.rs`).
+pigeonhole-vector = { workspace = true }
 # The default shard count (D220), for the D213 and scaling runs and the report.
 pigeonhole-io = { workspace = true }
 serde = { version = "1", features = ["derive"] }
