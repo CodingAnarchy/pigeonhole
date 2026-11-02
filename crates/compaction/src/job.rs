@@ -415,10 +415,20 @@ impl Sink {
             // thirty-second for pieces, which should fill their class: the index, filters
             // and footer take a few KiB), or (pieces) once the output holds the piece the
             // projection now calls for, if that is smaller than its extent.
+            //
+            // The piece is judged by the output's whole length (index, filters and footer
+            // included), as `plan_full` judges a lone SST by its manifest length (#1324): cut
+            // by data alone, an output could end just over its piece, and a full compaction
+            // would ask for it to be cut again and get the same SST back (#1313).
+            // A row is never split, so an output whose last row is larger than the piece's
+            // slack (a thirty-second) can still end over its piece by up to that row: a full
+            // compaction then rewrites it once per `compact()` for nothing (#1351; bounded by
+            // `plan_full`'s once-per-request guard, #1313).
             let margin = (o.extent.len() / if self.pieces { 32 } else { 8 }) as usize;
             let piece_full = self.pieces && row_start && {
-                let len = o.writer.data_len();
-                let piece = output_piece_bytes(len + self.projected_rest(), self.target);
+                let len = o.writer.len_bound();
+                let piece =
+                    output_piece_bytes(o.writer.data_len() + self.projected_rest(), self.target);
                 piece < o.extent.len() && len >= piece - piece / 32
             };
             if (row_start && !o.writer.fits(0, margin))

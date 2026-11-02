@@ -336,6 +336,14 @@ impl SstWriter {
         self.inner.data_len()
     }
 
+    /// An upper bound on the SST's whole length if it were finished now: the data so far plus
+    /// the index, filters and footer it would carry. What a reader of the SST's length (a
+    /// manifest's `SstMeta::len`) sees, where [`data_len`](Self::data_len) leaves those out:
+    /// a writer that cuts outputs to fit a size measured that way reads this (#1324).
+    pub fn len_bound(&self) -> u64 {
+        self.inner.len_bound()
+    }
+
     /// Entries added.
     pub fn entries(&self) -> u64 {
         self.inner.entries()

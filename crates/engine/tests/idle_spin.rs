@@ -11,32 +11,12 @@ use std::time::{Duration, Instant};
 use pigeonhole_engine::{Engine, EngineOptions, FamilyOptions, ValueRef, WriteBatch};
 use pigeonhole_format::Durability;
 
-/// This process's user plus system CPU time.
-#[cfg(target_os = "linux")]
+/// This process's user plus system CPU time, in nanoseconds (`CLOCK_PROCESS_CPUTIME_ID`). The
+/// 10 ms ticks of `/proc/self/stat` made one tick the whole idle budget: 2 ticks of runner
+/// noise in the idle second failed the test (#1331).
 fn process_cpu() -> Duration {
-    // Fields 14 and 15 of /proc/self/stat (after the parenthesized command name), in clock
-    // ticks of 1/100 s.
-    let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
-    let rest = &stat[stat.rfind(')').unwrap() + 2..];
-    let fields: Vec<&str> = rest.split_whitespace().collect();
-    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
-    Duration::from_millis(ticks * 10)
-}
-
-/// This process's user plus system CPU time.
-#[cfg(target_os = "macos")]
-fn process_cpu() -> Duration {
-    // `ps` prints `[[hh:]mm:]ss.cc`.
-    let out = std::process::Command::new("ps")
-        .args(["-o", "time=", "-p", &std::process::id().to_string()])
-        .output()
-        .unwrap();
-    let text = String::from_utf8(out.stdout).unwrap();
-    let mut secs = 0.0f64;
-    for part in text.trim().split(':') {
-        secs = secs * 60.0 + part.parse::<f64>().unwrap();
-    }
-    Duration::from_secs_f64(secs)
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
 }
 
 fn cpu_share(f: impl FnOnce()) -> f64 {
@@ -79,8 +59,12 @@ fn spinning_stops_when_the_database_goes_idle() {
     }
     // Idle: no shard and no client keeps polling.
     std::thread::sleep(Duration::from_millis(200));
-    let idle = cpu_share(|| std::thread::sleep(Duration::from_millis(1_000)));
-    assert!(idle < 0.01, "{:.1}% of a core while idle", idle * 100.0);
+    // The better of two windows: a spin shows in both, while one background job (a flush,
+    // a spare segment's preparation) landing in one of them doesn't decide it (#1331).
+    let idle = (0..2)
+        .map(|_| cpu_share(|| std::thread::sleep(Duration::from_millis(1_000))))
+        .fold(f64::INFINITY, f64::min);
+    assert!(idle < 0.01, "{:.2}% of a core while idle", idle * 100.0);
     // Sparse: a commit every 2 ms; polls that find nothing back off.
     let sparse = cpu_share(|| {
         for i in 0..500 {

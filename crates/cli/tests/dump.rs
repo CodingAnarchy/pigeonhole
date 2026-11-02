@@ -518,3 +518,174 @@ fn load_refuses_an_input_without_a_dump_header() {
         "{err}"
     );
 }
+
+/// A table with a vector family of each element (D303, #1263), written at fixed
+/// timestamps, with the half-precision edge values: the smallest subnormal, the largest
+/// finite value and negative zero.
+fn vectors(path: &Path) {
+    use pigeonhole::{Element, Metric, VectorSpec};
+    let db = Pigeonhole::open(path, options()).unwrap();
+    let spec = |d, e, m| Family::vector(VectorSpec::new(d, e, m).unwrap());
+    let t = db
+        .table("v")
+        .unwrap()
+        .family("f32", spec(3, Element::F32, Metric::Cosine).max_versions(2))
+        .family("i8", spec(4, Element::I8, Metric::L2))
+        .family("bit", spec(16, Element::Bit, Metric::Hamming))
+        .family("f16", spec(4, Element::F16, Metric::L2))
+        .family("bf16", spec(4, Element::BF16, Metric::InnerProduct))
+        .family("plain", Family::default())
+        .create()
+        .unwrap();
+    t.mutate(b"r1")
+        .put_vector_f32_at("f32", b"e", T0, &[0.1, -2.5, 3.0e-38])
+        .put_vector_f32_at("f32", b"e", T0 + 1, &[1.0, 0.0, -0.0])
+        .put_vector_i8_at("i8", b"q", T0, &[-128, -1, 0, 127])
+        .put_vector_bits_at("bit", b"b", T0, &[0b1010_0101, 0xff])
+        // f16: the smallest subnormal, 65,504, -0 and 1.5.
+        .put_vector_f16_at("f16", b"h", T0, &[0x0001, 0x7bff, 0x8000, 0x3e00])
+        // bf16: 1.5, -0.25, 3.0 and 2^-126.
+        .put_vector_bf16_at("bf16", b"h", T0, &[0x3fc0, 0xbe80, 0x4040, 0x0080])
+        .put_at("plain", b"x", T0, b"not a vector")
+        .commit()
+        .unwrap();
+    db.flush().unwrap();
+    db.close().unwrap();
+}
+
+#[test]
+fn vector_cells_and_specs_round_trip_through_dump_and_load() {
+    let dir = TempDir::new("dump-vectors");
+    let src = dir.path().join("src.phdb");
+    vectors(&src);
+    let first = dump(&src, &[]);
+    // The table line carries each vector family's spec, and each cell its vector.
+    assert!(
+        first.contains(r#""vector":{"dim":3,"element":"f32","metric":"cosine"}"#),
+        "{first}"
+    );
+    assert!(
+        first.contains(r#""vector":{"dim":16,"element":"bit","metric":"hamming"}"#),
+        "{first}"
+    );
+    assert!(
+        first.contains(r#""value":{"vector":{"dim":4,"element":"i8","values":[-128,-1,0,127]}}"#),
+        "{first}"
+    );
+    assert!(
+        first.contains(r#""value":{"vector":{"dim":16,"element":"bit","base64":"pf8="}}"#),
+        "{first}"
+    );
+    assert!(!first.contains("unknown_type"), "{first}");
+    let file = dir.path().join("dump.jsonl");
+    std::fs::write(&file, &first).unwrap();
+    let target = dir.path().join("loaded.phdb");
+    let out = phdb(&[
+        "load",
+        "--create",
+        target.to_str().unwrap(),
+        file.to_str().unwrap(),
+    ]);
+    assert_eq!(out.status, 0, "{out:?}");
+    assert_eq!(body(&first), body(&dump(&target, &[])));
+
+    // Every stored vector's bytes, and every spec, are the source's, bit for bit.
+    let a = Pigeonhole::open(&src, options()).unwrap();
+    let b = Pigeonhole::open(&target, options()).unwrap();
+    let (ta, tb) = (
+        a.table("v").unwrap().open().unwrap(),
+        b.table("v").unwrap().open().unwrap(),
+    );
+    for (family, q) in [
+        ("f32", &b"e"[..]),
+        ("i8", b"q"),
+        ("bit", b"b"),
+        ("f16", b"h"),
+        ("bf16", b"h"),
+    ] {
+        assert_eq!(
+            ta.family_info(family).unwrap().vector,
+            tb.family_info(family).unwrap().vector,
+            "{family}"
+        );
+        let versions = |t: &pigeonhole::Table| -> Vec<(u64, Vec<u8>)> {
+            t.row(b"r1")
+                .family(family)
+                .versions(0)
+                .read()
+                .unwrap()
+                .unwrap()
+                .iter()
+                .filter(|e| e.qualifier == q)
+                .map(|e| (e.cell.timestamp(), e.cell.value().to_vec()))
+                .collect()
+        };
+        assert_eq!(versions(&ta), versions(&tb), "{family}");
+    }
+    a.close().unwrap();
+    b.close().unwrap();
+
+    // CSV names the type and carries the JSONL form.
+    let csv = dump(&src, &["--format", "csv"]);
+    assert!(csv.contains(",vector,"), "{csv}");
+}
+
+#[test]
+fn load_refuses_vectors_that_dont_fit_their_family() {
+    let dir = TempDir::new("load-vectors");
+    let src = dir.path().join("src.phdb");
+    vectors(&src);
+    let good = dump(&src, &[]);
+    let input = dir.path().join("in.jsonl");
+    let i8_cell = r#""value":{"vector":{"dim":4,"element":"i8","values":[-128,-1,0,127]}}"#;
+    for (what, from, to, needle) in [
+        (
+            "the wrong dim",
+            i8_cell,
+            r#""value":{"vector":{"dim":3,"element":"i8","values":[-128,-1,0]}}"#,
+            "a i8[3] vector in i8, whose vectors are i8[4]",
+        ),
+        (
+            "the wrong element",
+            i8_cell,
+            r#""value":{"vector":{"dim":4,"element":"f32","values":[1,2,3,4]}}"#,
+            "a f32[4] vector in i8, whose vectors are i8[4]",
+        ),
+        (
+            "an i8 out of range",
+            i8_cell,
+            r#""value":{"vector":{"dim":4,"element":"i8","values":[-129,0,0,0]}}"#,
+            "integers from -128 to 127",
+        ),
+        (
+            "a component that overflows f32",
+            r#""value":{"vector":{"dim":3,"element":"f32","values":[1.0,0.0,-0.0]}}"#,
+            r#""value":{"vector":{"dim":3,"element":"f32","values":[1e300,0.0,1.0]}}"#,
+            "finite numbers",
+        ),
+        (
+            "a vector in a plain family",
+            r#""family":"plain","qualifier":"x","ts":1760000000000000,"value":"not a vector""#,
+            r#""family":"plain","qualifier":"x","ts":1760000000000000,"value":{"vector":{"dim":4,"element":"i8","values":[1,2,3,4]}}"#,
+            "not a vector family",
+        ),
+    ] {
+        assert!(good.contains(from), "{what}: {from} not in the dump");
+        std::fs::write(&input, good.replacen(from, to, 1)).unwrap();
+        let target = dir
+            .path()
+            .join(format!("t-{}.phdb", what.replace(' ', "-")));
+        let out = phdb(&[
+            "load",
+            "--create",
+            target.to_str().unwrap(),
+            input.to_str().unwrap(),
+        ]);
+        assert_ne!(out.status, 0, "{what}: {out:?}");
+        assert!(out.stderr.contains(needle), "{what}: {out:?}");
+        assert!(
+            out.stderr.contains("line "),
+            "{what} names its line: {out:?}"
+        );
+    }
+}

@@ -3621,6 +3621,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Writes (PR 2):** only `put_vector_f32`, `put_vector_i8` and `put_vector_bits` (and `_at` forms) into a vector family, of its element and dimension, refused when the write is built otherwise; no merge operator and no other value. NaN, ±∞, `f32` components above 2^56 in magnitude, and (cosine) vectors with a zero norm (an `f32` squared norm below `f32::MIN_POSITIVE`) are refused, for stored vectors and queries alike, so every distance is finite (perf287's B1 on #1255).
 - **Reads:** `Value::Vector`/`VectorRef` (PR 2); the typed `nearest_f32`, `nearest_i8` and `nearest_bits` with D296 PR 4. `i8` is raw signed bytes: the application quantises.
 - **PRs:** 1, the format, with the engine refusing a vector family (`Unsupported`) and a vector value in any batch until 2, the engine and public API; 3, the Arrow and `phdb` mappings.
+- **PR 3 (#1309, ICR 0108):** `phdb` dumps vector values as `{"vector": {"dim", "element", "values"}}` (bit vectors as `base64`; floats as the `f64`s they widen to), exact for every element, and `load` writes them back bit for bit after checking the family's element and dim. A family's options carry `"vector": {"dim", "element", "metric"}`. In Arrow, `value_type` gains `vector`, `value` is the stored encoding, and `ArrowOptions::vector_dim(n)` adds `value_vector: FixedSizeList<Float32, n>`, widened exactly, null for other cells and bit vectors, and an error for another dimension. Before it, a dump lost vectors and an Arrow export of a vector family failed.
 - **Half precision (amendment, owner 2026-10-31, #1263, ICR 0104):** element codes 4 = `f16` (IEEE binary16) and 5 = `bf16` (bfloat16), each a 2-byte little-endian bit pattern, under L2, inner product and cosine (Hamming stays bit-only), sharing `incompat` bit 0.
   - **Writes:** `put_vector_f16`/`put_vector_bf16(&[u16])` store the bits as given. `put_vector_f32` into a half family rounds each component to nearest, ties to even, refuses one that overflows the element, and checks the rounded vector as stored, so an `f32` vector that rounds to zero under cosine is refused ("rounds to a zero vector").
   - **Bounds:** `f16` needs only finiteness (its largest value, 65,504, bounds it; an `f32` query's 2^56 rule bounds the mixed sums). `bf16` keeps `f32`'s 2^56 bound. Under cosine, the squared norm of the widened components must be at least `f32::MIN_POSITIVE`.
@@ -4035,3 +4036,42 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `it/feed_reader.rs` covers the start kinds, filtering, tokens across a reopen, expiry, and rule C both ways.
   - `wal/tests/feed_cursor.rs` covers the cursor, including a mid-segment hole: it stops where recovery did and then follows the next session's segment (Q2).
 
+**A fix after 3a (#1248, found by PR 4's deferred-I/O model):** a cursor whose segment's successor names an earlier end than it read to reports `Step::Cut`, and the feed expires ("records the feed read were lost"). That's a recovery's cut after a power loss took records the cursor had read: a visible feed resuming from a token past the cut used to fail with a chain `Corruption`. A later end stays corruption.
+- **Past the cut, nothing is read** (simp724's C1 on #1328). Once a successor on disk names the segment's end, a cursor positioned past it is cut at once. So is any frame it meets at or past that end. A power loss can leave CRC-valid frames after the hole, which recovery discarded and whose seqnos the next session may reuse, so a visible token resumed there would otherwise deliver them before reaching the stop.
+- **A durable feed is never past the cut** (simp724's step). Every record before a token's hint was delivered (so synced) or skipped as at or below the delivered seqno. Recovery keeps every synced record, so the hint is at or before the cut. `feed_model` gained a `PIGEONHOLE_DEFERRED_IO=1` mode, now a sweep for feed PRs.
+
+**How PR 3b builds it** (pigeonhole's public API, additive; ICR 0106):
+- **Opening:** `Table::feed()` gives a `FeedBuilder`. `.table(&t)` adds tables to the same feed, `.prefix(..)` limits it to a row prefix, and `.visible()` opts out of the durable frontier. The start is the commits after `open()`, or `.from_snapshot(&s)` (after `s.seqno()`), `.from_oldest()` or `.resume(&token)`. `open()` refuses with `InvalidArgument` (feed off, table not fed, bad token) and `Unsupported` (a reader process, until PR 4). An expired start shows at the first `next`, so `open` never consumes a commit.
+- **`Feed`:**
+  - `next(timeout)` and `try_next()` lend `Option<&Commit>`, reused between calls;
+  - `token()` gives a `FeedToken`, whose bytes round-trip through `as_bytes` and `from_bytes`;
+  - `oldest_retained()` reports the oldest retained seqno after an expiry, when known.
+  - **An error ends the feed** (simp724 and cli692 on #1321). Every later call returns the same error, as an expired feed does. The engine reader has already moved past the commit it was delivering, so a retry would skip it. A value that doesn't decode is `Corruption`, never an empty value, and the token then points past that commit. Only the live engine's errors stick (cli692's S2, simp724): an error or an expiry from a reader whose engine a recovery replaced belongs to the superseded generation. The feed then follows the recovery and lets the new engine's reader decide from the token. The old reader, still waiting through the swap, reads the new session's records as outside its history, so its expiry is never the feed's.
+- **Types:**
+  - `Commit`: `seqno`, `timestamp`, `changes`.
+  - `Change`: `table` and `family` by name, `kind`, `row`, `qualifier`, `timestamp`, and `value()` as the read API's `Value` (`None` for deletes).
+  - `ChangeKind`: `Put`, `Merge`, `DeleteCell`, `DeleteColumn`, `DeleteFamily` (a row delete is one per family); `#[non_exhaustive]`.
+  - A family created after the feed opened is named from the current catalog.
+- **`ErrorCode::FeedExpired` = 31** (the coordinator's number). It is mapped in python as the `FeedExpired` exception class and listed in the `.pyi` stubs. The C ABI crate has no code table yet: its future enum takes the numbers from `ErrorCode`.
+- **Automatic recovery** (D265): a feed checks its engine generation on each call (one load). After a swap it resubscribes on the new engine from its own token, so a durable feed continues and a visible one that delivered lost commits expires. After `close()` it fails with `Closed`.
+- **perf287's `debug_assert`** (on #1297): `Feed::needs` asserts that a fed batch decodes. Admission decodes every batch first, so it holds today.
+- **Tests:** `pigeonhole/tests/feed.rs` covers named and typed changes of every kind, a cross-table commit arriving whole, a snapshot start, a token across a reopen, a prefix, the refusals, and expiry across a feed-off open. `tests/recovery.rs` has a durable feed following an automatic recovery, mutation-checked.
+
+**Amendment (d), owner 2026-11-02: phdb's read-only commands write nothing** (cli692; ICR 0109). Under the original D310, any writer open without the feed configuration, or with another shard count, ended feed history, so `phdb info app.phdb` on a stopped application expired its tokens. Since (c) that is only an open that turns the feed off or sets an explicit different count, but a read-only command should write nothing at all. `Options::read_only(bool)` (new, public) forces the `no_writes` open `read_only_fallback` takes: no session or Root entries, no WAL segment, no upgrade, no clean-close commit. `phdb info`, `dump`, `backup` and `shell --read-only` use it when no writer runs, and a reader process when one does. Writable phdb opens (the shell, `mcp`, `load`, `compact`) rely on amendment (c), feed1248's inherited feed configuration (#1344), so phdb now leaves `shards` unset for an existing database and sets one shard only for one it creates (cli692's S1 on #1344): an explicit `shards(1)` would reshard an app's feed. Tests: `engine/tests/it/read_only_fallback.rs` (a requested open does no write I/O, at any shard count, and never creates a file), `pigeonhole/tests/feed.rs` (a read-only open between two fed opens keeps the token), `cli/tests/info.rs` (all four read-only commands, and a writable `shell` put, between two fed opens keep it).
+
+**Amendment (the owner, 2026-11-02: feed settings are inherited by default).** Any open without the feed settings, or with another shard count, used to end the feed's history, so `phdb load app.phdb` while the app was stopped silently expired the app's feed.
+- **`Options::change_feed` has three states:**
+  - unset (the default) inherits the sidecar's last session: its retention, age, and fed tables by id (a table dropped since is left out);
+  - `change_feed(r)` turns it on;
+  - the new `change_feed_off()` turns it off.
+  - A last open that recorded "fed: none", an entry this build doesn't know, or no sidecar means off, as before.
+- **The shard count:** an unset `Options::shards` with a recorded session takes its stream count. An explicit, different count (resharding on purpose) still expires the feed with "the shard count changed".
+- **No format change:** the sidecar already holds all of it.
+- **How it's built:**
+  - `EngineOptions::feed_inherit`, which `pigeonhole::Options` sets unless the feed is turned on or off explicitly;
+  - `feed::last_session`, read right after the pager gives the database id, so the shard count resolves before the manifest loads;
+  - the inherited settings become `options.feed` once the catalog has loaded.
+- **Tests:**
+  - `pigeonhole/tests/feed.rs`: a tool's plain open between two app sessions keeps the token (the shard count inherited too, three shards so no default matches); an explicit new shard count expires it; `change_feed_off()` ends it.
+  - The unit test `the_last_session_is_inherited_until_an_open_turns_the_feed_off`.
+- **Companion change (d), cli692:** `phdb`'s read-only commands open read-only.
