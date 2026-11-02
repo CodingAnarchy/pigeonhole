@@ -654,8 +654,12 @@ impl Tools {
                      call feed_poll again without a token",
                 ),
                 pigeonhole::ErrorCode::SnapshotExpired => f.hint(
-                    "the application restarted under this reader: call feed_poll again with \
-                     the same token",
+                    "the application is restarting under this reader: call feed_poll again \
+                     with the same token",
+                ),
+                pigeonhole::ErrorCode::NoWriter => f.hint(
+                    "the application isn't running: call feed_poll again with the same token \
+                     once it is",
                 ),
                 pigeonhole::ErrorCode::InvalidArgument => f.hint(
                     "the database's change feed must be on (the application's, or \

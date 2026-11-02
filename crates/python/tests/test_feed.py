@@ -172,3 +172,33 @@ def test_a_reader_process_follows_the_writers_feed(path, fdb, t):
         t.put(b"after the token", "f", b"q", b"v")
         with rt.feed(resume=token) as feed:
             assert feed.next(timeout=5).changes[0].row == b"after the token"
+
+
+def test_a_reader_feed_follows_a_writer_restart(path, fdb, t):
+    # feed1248 on #1376: the same Feed follows the writer's restart. While no writer runs,
+    # next raises NoWriter (or SnapshotExpired as a new one starts); calling it again on the
+    # same feed continues, and the commit after the restart arrives.
+    r = ph.open_reader(path)
+    feed = r.table("t").feed()
+    t.put(b"before", "f", b"q", b"v")
+    assert feed.next(timeout=5).changes[0].row == b"before"
+    fdb.close()
+    try:
+        assert feed.try_next() is None  # nothing new, or the writer's absence noticed
+    except (ph.NoWriter, ph.SnapshotExpired):
+        pass
+    writer = ph.open(path, shards=1)  # inherits the feed (D310 amendment (c))
+    try:
+        writer.table("t").open().put(b"after", "f", b"q", b"v")
+        got = None
+        deadline = time.monotonic() + 10
+        while got is None and time.monotonic() < deadline:
+            try:
+                got = feed.next(timeout=0.5)
+            except (ph.NoWriter, ph.SnapshotExpired):
+                time.sleep(0.05)
+        assert got is not None and got.changes[0].row == b"after"
+    finally:
+        feed.close()
+        r.close()
+        writer.close()
