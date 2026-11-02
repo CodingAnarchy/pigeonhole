@@ -60,7 +60,8 @@ impl<'a> Search<'a> {
     /// The top `k` hits: by score descending, then id ascending.
     ///
     /// `InvalidQuery` for a query string that didn't parse; `InvalidArgument` for a phrase
-    /// on an index without positions; `Busy` during a [`repair`](Index::repair).
+    /// on an index without positions. It fails with `Busy` while a [`repair`](Index::repair)
+    /// runs: retry after it finishes.
     pub fn run(self) -> Result<Vec<Hit>> {
         self.run_with_stats().map(|(hits, _)| hits)
     }
@@ -203,7 +204,7 @@ impl<'a> Search<'a> {
                 }
                 Clause::Fuzzy { .. } => {
                     return Err(Error::InvalidArgument(
-                        "fuzzy terms come with D309 PR 3".into(),
+                        "fuzzy terms are not supported yet: they come in D309 PR 4 (#1247)".into(),
                     ));
                 }
             }
@@ -220,7 +221,7 @@ impl<'a> Search<'a> {
 fn refuse_slop(slop: u16) -> Result<()> {
     if slop > 0 {
         return Err(Error::InvalidArgument(
-            "phrase slop comes with D309 PR 2".into(),
+            "phrase slop is not supported yet: it comes in D309 PR 2 (#1290)".into(),
         ));
     }
     Ok(())

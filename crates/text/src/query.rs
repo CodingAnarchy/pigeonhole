@@ -126,7 +126,7 @@ impl Query {
 
     /// Adds a fuzzy term, matched as given (D309 §4.4).
     ///
-    /// Fuzzy terms come with D309 PR 3: until then a search with one is refused
+    /// Fuzzy terms come in D309 PR 4: until then a search with one is refused
     /// (`InvalidArgument`).
     pub fn fuzzy(self, term: impl Into<String>, fuzziness: Fuzziness) -> Self {
         self.with(Clause::Fuzzy {

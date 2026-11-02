@@ -340,11 +340,6 @@ impl Index {
         &self.inner.source
     }
 
-    /// The index's table.
-    pub fn table(&self) -> &Table {
-        &self.inner.table
-    }
-
     /// Writes `text` as the document `doc`'s source text, and indexes it, inside the
     /// caller's transaction: the source cell, its postings and the statistics commit
     /// together, with the caller's own writes.
@@ -360,7 +355,8 @@ impl Index {
     ///
     /// Like any `transact` body it may run more than once per commit. `InvalidArgument` for
     /// a document over [`IndexOptions::max_terms`] distinct terms, before anything is
-    /// written; `Busy` during a [`repair`](Self::repair).
+    /// written. It fails with `Busy` while a [`repair`](Self::repair) runs: retry after it
+    /// finishes.
     pub fn put_in(&self, txn: &mut Transaction, doc: &[u8], text: &str) -> Result<()> {
         self.check_not_repairing(txn)?;
         let inn = &*self.inner;
@@ -385,7 +381,8 @@ impl Index {
 
     /// Deletes the document `doc`: its source cell and its index rows, inside the caller's
     /// transaction. `false` (and no counter changes) if the index didn't hold it; its source
-    /// cell is deleted either way. `Busy` during a [`repair`](Self::repair).
+    /// cell is deleted either way. It fails with `Busy` while a [`repair`](Self::repair) runs:
+    /// retry after it finishes.
     pub fn delete_in(&self, txn: &mut Transaction, doc: &[u8]) -> Result<bool> {
         self.check_not_repairing(txn)?;
         let inn = &*self.inner;
@@ -452,14 +449,14 @@ impl Index {
     /// [`repair`](Self::repair) does. Its counters (`df`, the document count and the corpus
     /// length) trust `F{doc}` as the record of what was indexed, so after a write around the
     /// index's own rows (not just the source column), use `repair`, which starts from an
-    /// emptied table. `Busy` during a repair.
+    /// emptied table. It fails with `Busy` while a repair runs.
     pub fn rebuild(&self) -> Result<RebuildStats> {
         self.rebuild_inner(false)
     }
 
     /// Rebuilds the index from an emptied table (D309 §3, M2): drops every index row, then
     /// [`rebuild`](Self::rebuild)s. Writes through the index and searches of it fail with
-    /// `Busy` until it finishes. If it's interrupted (a crash), the index stays `Busy` until
+    /// with `Busy` until it finishes. If it's interrupted (a crash), the index stays `Busy` until
     /// `repair` is run again.
     pub fn repair(&self) -> Result<RebuildStats> {
         let inn = &*self.inner;

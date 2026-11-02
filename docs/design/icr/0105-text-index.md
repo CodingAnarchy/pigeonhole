@@ -25,9 +25,9 @@
     - `rebuild() -> Result<RebuildStats>`: online, one transaction per document, diffed against the stored cells;
     - `repair() -> Result<RebuildStats>`: from an emptied table, behind the repair flag;
     - `verify() -> Result<IndexStats>`.
-  - **Accessors:** `options()`, `source()`, `table()`.
+  - **Accessors:** `options()` and `source()`. There's no handle to the index's own table (cli692): it holds the index's rows only.
 - **`Source`** (`Clone + Eq`): `Source::new(&Table, family, qualifier)`, plus the `table()`, `family()` and `qualifier()` getters.
-- **`IndexOptions`** (`Copy + PartialEq + Default`). Every option is fixed at create, and each has a `get_*` getter.
+- **`IndexOptions`** (`Copy + PartialEq + Default`). Every option is fixed at create, and each has a `get_*` getter. That's a deliberate exception to the plain getter names, since the setters take those names and `Index::options()` returns this type.
   - `new()`;
   - `k1` (default 1.2) and `b` (default 0.75);
   - `stop_words` (default off; built-in tokeniser only);
@@ -52,12 +52,12 @@
 - **`Fuzziness`** (`#[non_exhaustive]`, `Default`): `Auto`, `One` or `Two`.
 - **`Tokenizer`** (`Send + Sync`, dyn-compatible): `name()`, `fingerprint()`, and `tokens(&self, &str, &mut dyn FnMut(Token<'_>))`.
 - **`Token<'a>`** (`#[non_exhaustive]`): `text`, `position`, `range`, and `Token::new(text, position, range)`.
-- **`Error`** (`#[non_exhaustive]`): `Db`, `InvalidArgument`, `InvalidQuery { at, reason }`, `Busy`, `Mismatch` and `Corruption`.
+- **`Error`** (`#[non_exhaustive]`): `Db`, `InvalidArgument`, `InvalidQuery { at, reason }` (the variant is `#[non_exhaustive]` too, so it can gain fields), `Busy` (writes and searches fail with it while a repair runs), `Mismatch` and `Corruption`.
   - It has `code() -> ErrorCode`, `Display`, `std::error::Error` and `From<pigeonhole::Error>`.
   - **`QueryErrorKind`** (`#[non_exhaustive]`): `UnclosedQuote`, `Slop`, `FuzzyInPhrase`, `Distance`.
 - **`Result<T>`**.
 
-**Refused until their PRs (PR 1 is unreleased):** a fuzzy clause, and a phrase with slop above 0, parse and build, but a search refuses them with `InvalidArgument`.
+**Refused until their PRs (PR 1 is unreleased):** a fuzzy clause, and a phrase with slop above 0, parse and build, but a search refuses them with `InvalidArgument`. The message names the PR that adds each: D309 PR 4 for fuzzy, PR 2 for slop.
 
 **Clauses, against rev 5's wording:**
 - **Each bare word of the syntax is one `Clause::Text`,** and each quoted phrase one `Clause::QuotedPhrase`. They're tokenised when the search runs, since the tokeniser belongs to the index, not to the `Query`.

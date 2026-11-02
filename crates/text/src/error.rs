@@ -17,6 +17,7 @@ pub enum Error {
     InvalidArgument(String),
     /// A query string didn't parse ([`Query::parse`](crate::Query::parse)). `at` is a byte
     /// offset into the string.
+    #[non_exhaustive]
     InvalidQuery {
         /// Where in the query string, in bytes.
         at: usize,
@@ -24,7 +25,7 @@ pub enum Error {
         reason: QueryErrorKind,
     },
     /// The index is being repaired ([`Index::repair`](crate::Index::repair)): writes through
-    /// it and searches of it wait until the repair finishes.
+    /// it and searches of it fail with this while the repair runs. Retry after it finishes.
     Busy,
     /// The index was created with another tokeniser (its name or fingerprint differs).
     Mismatch(String),

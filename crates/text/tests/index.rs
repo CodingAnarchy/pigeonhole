@@ -304,9 +304,8 @@ fn writes_and_searches_wait_out_a_repair() {
     let (_docs, index) = create(&db, IndexOptions::new());
     index.put(b"a", "postgres").unwrap();
     // An interrupted repair leaves its flag set (as a crash mid-repair would).
-    index
-        .table()
-        .mutate(b"G")
+    let rows = db.table("docs_text").unwrap().open().unwrap();
+    rows.mutate(b"G")
         .put("meta", b"repair", b"")
         .commit()
         .unwrap();
@@ -522,7 +521,9 @@ fn query_strings_are_parsed_when_the_search_runs() {
         ("postgres~3", 8, QueryErrorKind::Distance),
     ] {
         match index.search(q, 10).run() {
-            Err(Error::InvalidQuery { at: a, reason: r }) => {
+            Err(Error::InvalidQuery {
+                at: a, reason: r, ..
+            }) => {
                 assert_eq!((a, r), (at, reason), "{q}")
             }
             other => panic!("{q}: {other:?}"),

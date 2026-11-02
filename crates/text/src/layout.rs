@@ -145,6 +145,11 @@ impl Normalization {
 }
 
 /// An index's options, fixed at create and stored in `G` (D309 §6).
+///
+/// The setters take the options' plain names (`k1(1.2)`), so the getters are `get_*`
+/// (`get_k1()`): a deliberate exception to the usual getter naming, since
+/// [`Index::options`](crate::Index::options) returns this type and its values must stay
+/// readable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IndexOptions {
     k1: f64,

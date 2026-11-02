@@ -16,7 +16,7 @@ pub pigeonhole_text::Error::Busy
 pub pigeonhole_text::Error::Corruption(alloc::string::String)
 pub pigeonhole_text::Error::Db(pigeonhole::error::Error)
 pub pigeonhole_text::Error::InvalidArgument(alloc::string::String)
-pub pigeonhole_text::Error::InvalidQuery
+#[non_exhaustive] pub pigeonhole_text::Error::InvalidQuery
 pub pigeonhole_text::Error::InvalidQuery::at: usize
 pub pigeonhole_text::Error::InvalidQuery::reason: pigeonhole_text::QueryErrorKind
 pub pigeonhole_text::Error::Mismatch(alloc::string::String)
@@ -61,7 +61,6 @@ pub fn pigeonhole_text::Index::rebuild(&self) -> pigeonhole_text::Result<pigeonh
 pub fn pigeonhole_text::Index::repair(&self) -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>
 pub fn pigeonhole_text::Index::search(&self, impl core::convert::Into<pigeonhole_text::Query>, usize) -> pigeonhole_text::Search<'_>
 pub fn pigeonhole_text::Index::source(&self) -> &pigeonhole_text::Source
-pub fn pigeonhole_text::Index::table(&self) -> &pigeonhole::table::Table
 pub fn pigeonhole_text::Index::verify(&self) -> pigeonhole_text::Result<pigeonhole_text::IndexStats>
 impl core::fmt::Debug for pigeonhole_text::Index
 pub fn pigeonhole_text::Index::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
