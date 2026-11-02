@@ -3639,6 +3639,12 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - `format::vector`: `Params::{check, payload, distance}` and `VectorRef::check_components`; the `i8` kernels score a stored vector's bytes as its `i8`s.
 - **Not in PR 2:** a vector family in the pigeonhole model target, #1256 (milestone 1.1.0); the integration test covers the write and read paths meanwhile.
 
+**Checks (model coverage, #1256).** The pigeonhole `model` target's tables gain `vec`: 32-dimension `f32` cosine vectors, two versions kept, a blob threshold of 120 so every vector (about 130 bytes) separates.
+- **Writes:** the sim workload's puts there are vectors (`pigeonhole_sim::vector_value`, the stored bytes; components in quarters, never all zero), written with `put_vector_f32`/`_at` through `RowMutation` and `WriteBatch`. They're overwritten and deleted at every scope, through flushes, compactions, crashes, recoveries in place and tablet changes, and reads compare the stored bytes exactly.
+- **Refusals:** on one seqno in eleven, a wrong dimension, a NaN, a zero vector or a plain put into `vec` is `InvalidArgument`, and the column stays empty.
+- **Search:** each read also runs `nearest_f32` (k from 1 to 7, the query from the seqno) over the read's keys or the whole table, through `run_async` on the async front door. It must equal brute force over the model's newest vectors, scored by `VectorSpec::distance_f32`, in (distance, row, qualifier) order, bit for bit. A run whose searches never find a vector fails.
+- **Seeds:** the family changes every seed's stream in that target (no regression seed is pinned to it). The `counters` target and the engine's `model_check` draw as before.
+
 <a id="d304"></a>
 ## D304 — Traversal pushdown: breadth-first hops run in the engine, each a bounded read of the frontier (perf287, 2026-10-31; owner accepted revision 2, #489 c6544597002, c6544636857, c6544708521; reviewed by simp724 and cli692; engine, pigeonhole, #489 item 3, ICR 0099; on D296 and D299)
 **Why.** A BFS over adjacency rows was a client loop over `keys()`: every edge was materialised and copied into the client's neighbour list, duplicates and visited nodes included, and a hub could not be capped without reading it whole (283 ms and 824 MB for a 2M-edge hub through `read()`).

@@ -35,6 +35,10 @@
 //! in flight while the shard threads go on. The OS schedules those threads, so such a run
 //! does not replay exactly.
 //!
+//! **Vectors** (#1256): the tables have a vector family, `vec`, whose puts go through
+//! `put_vector_f32`; every read also runs an exact `nearest_f32` and compares it with brute
+//! force over the model's rows, and some seqnos try writes the family must refuse.
+//!
 //! `PIGEONHOLE_REAL_FS=1` runs the store on real files in a temporary directory, through the
 //! backend `PIGEONHOLE_IO` names (`uring` for io_uring, #402; `pread` otherwise), with the
 //! run's simulated clock still driving timestamps and TTLs. Crashes cannot reach real files,
@@ -173,8 +177,137 @@ fn families() -> Vec<ModelFamily> {
             // A graph family: its qualifiers are row keys (the workload's `adj…`), so the
             // traversal check reaches past hop 1 (#1232).
             f(GRAPH_FAMILY, 0, 0, false),
+            // A vector family (D303, #1256): 32-dimension f32 cosine vectors, overwritten
+            // and deleted at every scope like any family's values; each is above the
+            // family's blob threshold, so they separate into blobs.
+            f(VECTOR_FAMILY, 2, 0, false),
         ]
     }
+}
+
+/// The model's vector family (#1256), in the targets that have it.
+const VECTOR_FAMILY: &str = "vec";
+
+/// Whether this target's tables have [`VECTOR_FAMILY`].
+fn has_vector_family() -> bool {
+    families().iter().any(|f| f.name == VECTOR_FAMILY)
+}
+
+/// A nearest-neighbour check's query (#1256), from the model's seqno: never all zero.
+fn nearest_query(ms: u64) -> Vec<f32> {
+    (0..pigeonhole_sim::VECTOR_DIM)
+        .map(|i| ((ms.rotate_right(i as u32) & 3) as f32) - 1.5)
+        .collect()
+}
+
+/// A neighbour as the check compares it: row, qualifier, timestamp, distance.
+type Neighbours = Vec<(Vec<u8>, Vec<u8>, u64, f64)>;
+
+/// `nearest_f32` over [`VECTOR_FAMILY`] (D296 PR 4): from `keys`, or over the whole table;
+/// through `run_async` with `async_front`.
+fn nearest_rows(
+    t: &pigeonhole::Table,
+    keys: Option<&pigeonhole::KeySet>,
+    q: &[f32],
+    k: usize,
+    snap: Option<&pigeonhole::Snapshot>,
+    async_front: bool,
+) -> pigeonhole::Result<Neighbours> {
+    let run = |n: pigeonhole::Nearest<'_>| -> pigeonhole::Result<Vec<pigeonhole::Neighbour>> {
+        #[cfg(feature = "async")]
+        if async_front {
+            return pigeonhole::doc_support::block_on(n.run_async());
+        }
+        #[cfg(not(feature = "async"))]
+        let _ = async_front;
+        n.run()
+    };
+    let found = match keys {
+        Some(ks) => {
+            let mut r = t.keys(ks).family(VECTOR_FAMILY);
+            if let Some(s) = snap {
+                r = r.snapshot(s);
+            }
+            run(r.nearest_f32(q, k))?
+        }
+        None => {
+            let mut r = t.scan_prefix(b"").family(VECTOR_FAMILY);
+            if let Some(s) = snap {
+                r = r.snapshot(s);
+            }
+            run(r.nearest_f32(q, k))?
+        }
+    };
+    Ok(found
+        .into_iter()
+        .map(|n| (n.row, n.qualifier, n.ts, n.distance))
+        .collect())
+}
+
+/// [`nearest_rows`] by brute force over the model's newest vectors at seqno `ms`, scored by
+/// `VectorSpec::distance_f32`, in (distance, row, qualifier) order.
+fn model_nearest(
+    model: &pigeonhole_sim::Model,
+    table: &str,
+    keys: Option<&pigeonhole::KeySet>,
+    q: &[f32],
+    k: usize,
+    ms: u64,
+    now: u64,
+) -> Result<Neighbours, pigeonhole_sim::ModelError> {
+    let rows: Vec<(Vec<u8>, Vec<pigeonhole_sim::ModelCell>)> = match keys {
+        Some(ks) => {
+            let mut rows = Vec::new();
+            for key in ks.iter() {
+                let cells = model.try_read_row(table, key, &[VECTOR_FAMILY], 1, ms, now)?;
+                rows.push((key.to_vec(), cells));
+            }
+            rows
+        }
+        None => model.try_scan(
+            table,
+            Bound::Unbounded,
+            Bound::Unbounded,
+            &[VECTOR_FAMILY],
+            ms,
+            now,
+        )?,
+    };
+    let spec = vector_spec();
+    let mut all: Neighbours = Vec::new();
+    for (row, cells) in rows {
+        for c in cells {
+            let v = pigeonhole::Vector::from_f32(&vector_of(&c.value)).expect("a vector");
+            let d = spec.distance_f32(q, v.as_ref()).expect("the query fits");
+            all.push((row.clone(), c.qualifier, c.ts, d));
+        }
+    }
+    all.sort_by(|a, b| {
+        a.3.total_cmp(&b.3)
+            .then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1)))
+    });
+    all.truncate(k);
+    Ok(all)
+}
+
+/// A vector family: the workload's puts there are vectors (`pigeonhole_sim::vector_value`).
+fn is_vector(family: &str) -> bool {
+    family.starts_with("vec")
+}
+
+/// The spec of [`VECTOR_FAMILY`].
+fn vector_spec() -> pigeonhole::VectorSpec {
+    pigeonhole::VectorSpec::new(
+        pigeonhole_sim::VECTOR_DIM as u32,
+        pigeonhole::Element::F32,
+        pigeonhole::Metric::Cosine,
+    )
+    .expect("a valid spec")
+}
+
+/// A vector family put's components, from the stored bytes the model holds.
+fn vector_of(value: &[u8]) -> Vec<f32> {
+    pigeonhole_sim::vector_components(value).expect("the workload's vector")
 }
 
 /// The model's graph family (#1232), in the targets that have it.
@@ -294,9 +427,12 @@ fn public_family(f: &ModelFamily) -> Family {
         // A bloom filter's base separates once it holds about 15 bits, so reads and
         // compactions fold onto separated bases (D298 §4.1, §4.2).
         name if name.starts_with("bloom") || name.starts_with("set") => 64,
+        // Every vector (about 130 bytes) is above it (#1256).
+        name if is_vector(name) => 120,
         _ => 4096,
     };
     let family = match (f.counter, f.aggregation) {
+        (false, _) if is_vector(&f.name) => Family::vector(vector_spec()),
         (false, _) => Family::default(),
         (true, ModelAggregation::Sum) => Family::counter(),
         (true, ModelAggregation::Min) => Family::aggregate(Aggregation::Min),
@@ -553,6 +689,9 @@ struct Stats {
     /// Traversals checked, and those that reached a second hop (D304, #1232).
     traversals: usize,
     deep_traversals: usize,
+    /// Nearest-neighbour searches checked, and those that found one (#1256).
+    nearests: usize,
+    nearests_found: usize,
     /// With the recovery option on: recoveries in place, give-ups (then a reopen by hand),
     /// commits answered `OutcomeUnknown` (decided by reading back), commits retried after a
     /// failure refused them, injected read errors accepted on reads.
@@ -736,6 +875,8 @@ struct Run {
     /// Traversals checked and those that reached a second hop, kept here while the check
     /// holds a table borrowed (folded into `stats` at the end).
     traversal_counts: std::cell::Cell<(usize, usize)>,
+    /// Nearest-neighbour searches checked, and those that found a neighbour (#1256).
+    nearest_counts: std::cell::Cell<(usize, usize)>,
 }
 
 /// Every delete generated so far (lost ones too: dropping more is harmless), so `prepare`
@@ -1223,6 +1364,7 @@ impl Run {
             stats: Stats::default(),
             recent: std::cell::RefCell::new(Vec::new()),
             traversal_counts: std::cell::Cell::new((0, 0)),
+            nearest_counts: std::cell::Cell::new((0, 0)),
             deletes: Deletes::default(),
             generation: 0,
             io_errors: Cell::new(0),
@@ -1480,6 +1622,12 @@ impl Run {
                         value,
                         ..
                     } => match (is_i64(family), ts) {
+                        (false, None) if is_vector(family) => {
+                            m.put_vector_f32(family, qualifier, &vector_of(value))
+                        }
+                        (false, Some(ts)) if is_vector(family) => {
+                            m.put_vector_f32_at(family, qualifier, *ts, &vector_of(value))
+                        }
                         (true, None) if is_f64(family) => {
                             m.put_f64(family, qualifier, f64_value(value))
                         }
@@ -1569,6 +1717,24 @@ impl Run {
                         ..
                     } if is_i64(family) => {
                         wb.put_i64_at(t, &row, family, qualifier, *ts, counter_value(value))
+                    }
+                    ModelOp::Put {
+                        family,
+                        qualifier,
+                        ts: None,
+                        value,
+                        ..
+                    } if is_vector(family) => {
+                        wb.put_vector_f32(t, &row, family, qualifier, &vector_of(value))
+                    }
+                    ModelOp::Put {
+                        family,
+                        qualifier,
+                        ts: Some(ts),
+                        value,
+                        ..
+                    } if is_vector(family) => {
+                        wb.put_vector_f32_at(t, &row, family, qualifier, *ts, &vector_of(value))
                     }
                     ModelOp::Put {
                         family,
@@ -2566,6 +2732,82 @@ impl Run {
                         ));
                     }
                 }
+                // An exact nearest-neighbour search (D296 PR 4) over the vector family
+                // (#1256): from the same keys on even seqnos, over the whole table on odd
+                // ones, with a query and `k` taken from the seqno (not the RNG). Brute force
+                // over the model's rows, scored by `VectorSpec::distance_f32`, gives the
+                // neighbours in (distance, row, qualifier) order.
+                // Writes the vector family must refuse (#1256): a wrong dimension, a NaN, an
+                // all-zero vector (no direction under cosine), and a plain put. Each is
+                // `InvalidArgument`, and the column (one the workload never writes) stays
+                // empty. Chosen by the seqno, not the RNG.
+                if has_vector_family() && ms % 11 == 3 {
+                    let dim = pigeonhole_sim::VECTOR_DIM;
+                    let m = t.mutate(&row);
+                    let (what, m) = match ms / 11 % 4 {
+                        0 => (
+                            "a wrong dimension",
+                            m.put_vector_f32(VECTOR_FAMILY, b"refused", &[1.0; 3]),
+                        ),
+                        1 => {
+                            let mut v = vec![1.0; dim];
+                            v[dim / 2] = f32::NAN;
+                            ("a NaN", m.put_vector_f32(VECTOR_FAMILY, b"refused", &v))
+                        }
+                        2 => (
+                            "a zero vector",
+                            m.put_vector_f32(VECTOR_FAMILY, b"refused", &vec![0.0; dim]),
+                        ),
+                        _ => ("a plain put", m.put(VECTOR_FAMILY, b"refused", b"bytes")),
+                    };
+                    match m.commit() {
+                        Err(e) if e.code() == ErrorCode::InvalidArgument => {}
+                        Err(e) if self.injected(&e) => {}
+                        other => {
+                            return Err(format!(
+                                "{what} in the vector family (model seqno {ms}): {other:?}, \
+                                 want InvalidArgument"
+                            ));
+                        }
+                    }
+                    match t.get(&row, VECTOR_FAMILY, b"refused") {
+                        Ok(None) => {}
+                        Err(e) if self.injected(&e) => {}
+                        other => {
+                            return Err(format!("{what} was refused but left {other:?}"));
+                        }
+                    }
+                }
+                if has_vector_family() {
+                    let over_keys = ms.is_multiple_of(2);
+                    let q = nearest_query(ms);
+                    let k = 1 + (ms / 2 % 7) as usize;
+                    let ks = over_keys.then_some(&keys);
+                    let got =
+                        nearest_rows(t, ks, &q, k, snap.as_ref().map(|(s, _)| s), async_front);
+                    let want = model_nearest(&self.model, TABLES[ti], ks, &q, k, ms, now);
+                    match (got, want) {
+                        (Ok(g), Ok(w)) if g == w => {
+                            let (all, found) = self.nearest_counts.get();
+                            self.nearest_counts
+                                .set((all + 1, found + usize::from(!g.is_empty())));
+                        }
+                        (Err(e), _) if self.armed && self.fired() => {
+                            return self.recover_fired(&e);
+                        }
+                        (Err(e), _) if self.failed_over() => {
+                            return self.recover_in_place(&format!("read: {e}"), None);
+                        }
+                        (Err(e), _) if self.injected(&e) => {}
+                        (g, w) => {
+                            return Err(format!(
+                                "nearest {k} over {} (model seqno {ms}): store {g:?} vs model \
+                                 {w:?}",
+                                if over_keys { "the keys" } else { "the table" }
+                            ));
+                        }
+                    }
+                }
                 // Latest-version reads of the get's family, then of every family: the reads
                 // the row cache serves when it is on (D201), and fills, so the get above can
                 // hit next time. No randomness, so a seed's operations are unchanged.
@@ -2882,6 +3124,7 @@ fn run(seed: u64, cfg: &Config, progress: &Mutex<String>) -> Result<Stats, Strin
             run.note_row_cache();
             run.stats.io_errors = run.io_errors.get();
             (run.stats.traversals, run.stats.deep_traversals) = run.traversal_counts.get();
+            (run.stats.nearests, run.stats.nearests_found) = run.nearest_counts.get();
             if let Some((db, tables)) = run.db.take() {
                 drop(tables);
                 // With the recovery option on, a failure the supervisor has not marked yet
@@ -2973,6 +3216,7 @@ fn check(cfg: &Config) -> Vec<Stats> {
     // the cache), but a test whose seeds never hit is not testing the cache (D201).
     let (mut reads, mut row_cache_hits) = (0, 0);
     let (mut traversals, mut deep_traversals) = (0, 0);
+    let (mut nearests, mut nearests_found) = (0, 0);
     let mut all = Vec::new();
     for seed in seeds() {
         let started = Instant::now();
@@ -2994,6 +3238,8 @@ fn check(cfg: &Config) -> Vec<Stats> {
                 row_cache_hits += stats.row_cache_hits;
                 traversals += stats.traversals;
                 deep_traversals += stats.deep_traversals;
+                nearests += stats.nearests;
+                nearests_found += stats.nearests_found;
                 all.push(stats);
             }
             Ok(Err(e)) => {
@@ -3091,6 +3337,12 @@ fn check(cfg: &Config) -> Vec<Stats> {
     assert!(
         !has_graph_family() || traversals < 200 || deep_traversals > 0,
         "{test}: none of {traversals} traversals reached a second hop"
+    );
+    // With a vector family, searches must find neighbours, or the check compares nothing
+    // (#1256).
+    assert!(
+        !has_vector_family() || nearests < 200 || nearests_found > 0,
+        "{test}: none of {nearests} nearest-neighbour searches found a vector"
     );
     all
 }
