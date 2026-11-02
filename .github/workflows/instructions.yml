@@ -83,11 +83,7 @@ env:
   # 2026-10-28): a counter group counts the entries it folds and tests for its stop at a base
   # or column delete (+42 per get, +0.49%, scratch x86 A/B run of 06c4ef89 against d77b17d3),
   # while the counter read the D280 row measures fell from 2.3-5.5 ms to 35-40 µs at p99.
-  # TEMPORARY, for #1246 only (D298 PR 5a; owner via the coordinator, 2026-11-01): `get-mem`
-  # 0.6% and `get-miss` 1.1%, for the owner-approved +31 instructions per get (+0.55%, +1.0%),
-  # codegen layout in the compaction crate with no new work (#1246's bisect; get-mem's
-  # ceiling 5710). A PR right after #1246 merges restores 0.5% and 0.8%.
-  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-mem=0.6 get-miss=1.1 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8
+  THRESHOLDS: default=0.5 row=1.5 ycsb-c=1.0 ycsb-a=1.0 commit-overwrite=1.0 compact=1.0 get-sst=1.0 compacted=0.8 get-miss=0.8 scan-wide-q10=0.8 scan-filtered=0.8 counter=0.8
 
 jobs:
   instructions:
