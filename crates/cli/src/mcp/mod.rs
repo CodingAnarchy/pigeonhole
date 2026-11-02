@@ -86,6 +86,7 @@ pub(crate) fn run(
     );
     let server = Server {
         tools: tools::Tools::new(db, writable, limits),
+        listed: std::cell::RefCell::new(None),
     };
     let served = server.serve(&mut std::io::stdin().lock(), stdout);
     let closed = server.tools.close();
@@ -101,6 +102,10 @@ pub(crate) fn run(
 
 struct Server {
     tools: tools::Tools,
+    /// The tool names the client was last given (`tools/list`): when a call changes them
+    /// (`create_table` adding the first vector family brings `nearest`), the server sends
+    /// `notifications/tools/list_changed` (#1356). `None` until the client lists.
+    listed: std::cell::RefCell<Option<Vec<String>>>,
 }
 
 impl Server {
@@ -119,7 +124,25 @@ impl Server {
                 writeln!(output, "{reply}")?;
                 output.flush()?;
             }
+            // After the reply: tell a client that listed the tools when a call changed them.
+            if let Some(note) = self.list_changed() {
+                writeln!(output, "{note}")?;
+                output.flush()?;
+            }
         }
+    }
+
+    /// `notifications/tools/list_changed` if the tools differ from those last listed, once
+    /// per change.
+    fn list_changed(&self) -> Option<Value> {
+        let mut listed = self.listed.borrow_mut();
+        let before = listed.as_ref()?;
+        let now = self.tools.names();
+        if *before == now {
+            return None;
+        }
+        *listed = Some(now);
+        Some(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}))
     }
 
     /// One line: a request, a notification or a batch (2025-03-26). Returns the reply, if
@@ -171,7 +194,7 @@ impl Server {
                     .unwrap_or(&PROTOCOL_VERSIONS[0]);
                 Ok(json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
+                    "capabilities": {"tools": {"listChanged": true}},
                     "serverInfo": {
                         "name": "phdb",
                         "title": "Pigeonhole",
@@ -181,7 +204,16 @@ impl Server {
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": self.tools.list()})),
+            "tools/list" => {
+                let tools = self.tools.list();
+                *self.listed.borrow_mut() = Some(
+                    tools
+                        .iter()
+                        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+                        .collect(),
+                );
+                Ok(json!({"tools": tools}))
+            }
             "tools/call" => {
                 let name = params["name"]
                     .as_str()

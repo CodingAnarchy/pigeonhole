@@ -17,6 +17,8 @@ struct Server {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    /// Notifications the server sent, in order (#1356).
+    notes: Vec<Value>,
 }
 
 impl Server {
@@ -53,6 +55,7 @@ impl Server {
             stdin,
             stdout,
             next_id: 1,
+            notes: Vec::new(),
         }
     }
 
@@ -66,13 +69,21 @@ impl Server {
         stdin.flush().unwrap();
     }
 
+    /// The next reply; notifications before it are kept in `notes`.
     fn reply(&mut self) -> Value {
-        let mut line = String::new();
-        assert!(
-            self.stdout.read_line(&mut line).unwrap() > 0,
-            "the server exited"
-        );
-        serde_json::from_str(&line).unwrap()
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "the server exited"
+            );
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v.get("id").is_none() && v.get("method").is_some() {
+                self.notes.push(v);
+                continue;
+            }
+            return v;
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -1101,6 +1112,42 @@ fn feed_poll_continues_from_its_token_and_reports_expiry() {
     let err = s.fail("feed_poll", json!({"tables": ["t"], "token": kept}));
     assert_eq!(err["code"], "FeedExpired", "{err}");
     assert_eq!(err["code_num"], 31, "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
+/// #1356: the server advertises `listChanged`, and once the client has listed the tools, a
+/// call that changes them (the first vector family brings `nearest`) is followed by
+/// `notifications/tools/list_changed`, once; a call that changes nothing sends none.
+#[test]
+fn a_new_vector_family_announces_nearest() {
+    let dir = TempDir::new("mcp-list-changed");
+    let mut s = Server::spawn(&db_path(&dir), &["--create"]);
+    let init = s.request("initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], true);
+    s.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let names = s.tool_names();
+    assert!(!names.contains(&"nearest".to_owned()), "{names:?}");
+    // A plain table changes nothing: no notification.
+    s.call("create_table", json!({"table": "plain", "families": ["f"]}));
+    s.call("list_tables", json!({}));
+    assert!(s.notes.is_empty(), "{:?}", s.notes);
+    // The first vector family: the reply, then the notification.
+    s.call(
+        "create_table",
+        json!({"table": "docs", "families": [
+            {"name": "emb", "vector": {"dim": 2, "element": "f32", "metric": "l2"}}
+        ]}),
+    );
+    s.call("list_tables", json!({}));
+    assert_eq!(
+        s.notes,
+        [json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})]
+    );
+    assert!(s.tool_names().contains(&"nearest".to_owned()));
+    // Once per change.
+    s.call("list_tables", json!({}));
+    assert_eq!(s.notes.len(), 1);
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
 }
