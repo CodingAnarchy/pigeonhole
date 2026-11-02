@@ -121,6 +121,7 @@ Every option, with its default and limits, is in the agent reference's [`Options
 | `pigeonhole-arrow` | Arrow export. | semver |
 | `pigeonhole-cli` | The `phdb` tool. | semver for commands, flags, exit statuses and output |
 | `pigeonhole-vector` | An IVF vector index, built on the public API (1.1.0, D306). | semver |
+| `pigeonhole-text` | Full-text search with BM25 and phrases, built on the public API (1.1.0, D309). | semver |
 | `pigeonhole-engine` | Tablets, shards, MVCC, recovery. | internal: none |
 | `pigeonhole-{format,io,pager,wal,memtable,cache,runtime,shm,sst,compaction}` | Engine components. | internal: none |
 | `pigeonhole-sim` | Deterministic simulation and reference model. | internal: none |

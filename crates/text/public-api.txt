@@ -1,0 +1,140 @@
+pub mod pigeonhole_text
+#[non_exhaustive] pub enum pigeonhole_text::Clause
+pub pigeonhole_text::Clause::Fuzzy
+pub pigeonhole_text::Clause::Fuzzy::fuzziness: pigeonhole_text::Fuzziness
+pub pigeonhole_text::Clause::Fuzzy::term: alloc::string::String
+pub pigeonhole_text::Clause::Phrase
+pub pigeonhole_text::Clause::Phrase::slop: u16
+pub pigeonhole_text::Clause::Phrase::words: alloc::vec::Vec<alloc::string::String>
+pub pigeonhole_text::Clause::QuotedPhrase
+pub pigeonhole_text::Clause::QuotedPhrase::slop: u16
+pub pigeonhole_text::Clause::QuotedPhrase::text: alloc::string::String
+pub pigeonhole_text::Clause::Term(alloc::string::String)
+pub pigeonhole_text::Clause::Text(alloc::string::String)
+#[non_exhaustive] pub enum pigeonhole_text::Error
+pub pigeonhole_text::Error::Busy
+pub pigeonhole_text::Error::Corruption(alloc::string::String)
+pub pigeonhole_text::Error::Db(pigeonhole::error::Error)
+pub pigeonhole_text::Error::InvalidArgument(alloc::string::String)
+pub pigeonhole_text::Error::InvalidQuery
+pub pigeonhole_text::Error::InvalidQuery::at: usize
+pub pigeonhole_text::Error::InvalidQuery::reason: pigeonhole_text::QueryErrorKind
+pub pigeonhole_text::Error::Mismatch(alloc::string::String)
+impl pigeonhole_text::Error
+pub fn pigeonhole_text::Error::code(&self) -> pigeonhole::error::ErrorCode
+impl core::convert::From<pigeonhole::error::Error> for pigeonhole_text::Error
+pub fn pigeonhole_text::Error::from(pigeonhole::error::Error) -> Self
+impl core::error::Error for pigeonhole_text::Error
+pub fn pigeonhole_text::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
+impl core::fmt::Display for pigeonhole_text::Error
+pub fn pigeonhole_text::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum pigeonhole_text::Fuzziness
+pub pigeonhole_text::Fuzziness::Auto
+pub pigeonhole_text::Fuzziness::One
+pub pigeonhole_text::Fuzziness::Two
+#[non_exhaustive] pub enum pigeonhole_text::Normalization
+pub pigeonhole_text::Normalization::Nfc
+pub pigeonhole_text::Normalization::Nfkc
+pub pigeonhole_text::Normalization::None
+#[non_exhaustive] pub enum pigeonhole_text::QueryErrorKind
+pub pigeonhole_text::QueryErrorKind::Distance
+pub pigeonhole_text::QueryErrorKind::FuzzyInPhrase
+pub pigeonhole_text::QueryErrorKind::Slop
+pub pigeonhole_text::QueryErrorKind::UnclosedQuote
+impl core::fmt::Display for pigeonhole_text::QueryErrorKind
+pub fn pigeonhole_text::QueryErrorKind::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub struct pigeonhole_text::Hit
+pub pigeonhole_text::Hit::id: alloc::vec::Vec<u8>
+pub pigeonhole_text::Hit::score: f64
+pub struct pigeonhole_text::Index
+impl pigeonhole_text::Index
+pub fn pigeonhole_text::Index::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::create_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, pigeonhole_text::Source, pigeonhole_text::IndexOptions, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::delete(&self, &[u8]) -> pigeonhole_text::Result<bool>
+pub fn pigeonhole_text::Index::delete_in(&self, &mut pigeonhole::write::Transaction, &[u8]) -> pigeonhole_text::Result<bool>
+pub fn pigeonhole_text::Index::open(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::open_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::options(&self) -> pigeonhole_text::IndexOptions
+pub fn pigeonhole_text::Index::put(&self, &[u8], &str) -> pigeonhole_text::Result<()>
+pub fn pigeonhole_text::Index::put_in(&self, &mut pigeonhole::write::Transaction, &[u8], &str) -> pigeonhole_text::Result<()>
+pub fn pigeonhole_text::Index::rebuild(&self) -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>
+pub fn pigeonhole_text::Index::repair(&self) -> pigeonhole_text::Result<pigeonhole_text::RebuildStats>
+pub fn pigeonhole_text::Index::search(&self, impl core::convert::Into<pigeonhole_text::Query>, usize) -> pigeonhole_text::Search<'_>
+pub fn pigeonhole_text::Index::source(&self) -> &pigeonhole_text::Source
+pub fn pigeonhole_text::Index::table(&self) -> &pigeonhole::table::Table
+pub fn pigeonhole_text::Index::verify(&self) -> pigeonhole_text::Result<pigeonhole_text::IndexStats>
+impl core::fmt::Debug for pigeonhole_text::Index
+pub fn pigeonhole_text::Index::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct pigeonhole_text::IndexOptions
+impl pigeonhole_text::IndexOptions
+pub fn pigeonhole_text::IndexOptions::b(self, f64) -> Self
+pub fn pigeonhole_text::IndexOptions::get_b(&self) -> f64
+pub fn pigeonhole_text::IndexOptions::get_k1(&self) -> f64
+pub fn pigeonhole_text::IndexOptions::get_max_term_bytes(&self) -> u32
+pub fn pigeonhole_text::IndexOptions::get_max_terms(&self) -> u32
+pub fn pigeonhole_text::IndexOptions::get_normalization(&self) -> pigeonhole_text::Normalization
+pub fn pigeonhole_text::IndexOptions::get_positions(&self) -> bool
+pub fn pigeonhole_text::IndexOptions::get_stop_words(&self) -> bool
+pub fn pigeonhole_text::IndexOptions::k1(self, f64) -> Self
+pub fn pigeonhole_text::IndexOptions::max_term_bytes(self, u32) -> Self
+pub fn pigeonhole_text::IndexOptions::max_terms(self, u32) -> Self
+pub fn pigeonhole_text::IndexOptions::new() -> Self
+pub fn pigeonhole_text::IndexOptions::normalization(self, pigeonhole_text::Normalization) -> Self
+pub fn pigeonhole_text::IndexOptions::positions(self, bool) -> Self
+pub fn pigeonhole_text::IndexOptions::stop_words(self, bool) -> Self
+impl core::default::Default for pigeonhole_text::IndexOptions
+pub fn pigeonhole_text::IndexOptions::default() -> Self
+#[non_exhaustive] pub struct pigeonhole_text::IndexStats
+pub pigeonhole_text::IndexStats::counter_drift: u64
+pub pigeonhole_text::IndexStats::documents: u64
+pub pigeonhole_text::IndexStats::forward_mismatch: u64
+pub pigeonhole_text::IndexStats::invalid_utf8: u64
+pub pigeonhole_text::IndexStats::postings: u64
+pub pigeonhole_text::IndexStats::source_mismatch: u64
+pub pigeonhole_text::IndexStats::terms: u64
+impl pigeonhole_text::IndexStats
+pub fn pigeonhole_text::IndexStats::is_consistent(&self) -> bool
+pub struct pigeonhole_text::Query
+impl pigeonhole_text::Query
+pub fn pigeonhole_text::Query::clauses(&self) -> &[pigeonhole_text::Clause]
+pub fn pigeonhole_text::Query::fuzzy(self, impl core::convert::Into<alloc::string::String>, pigeonhole_text::Fuzziness) -> Self
+pub fn pigeonhole_text::Query::new() -> Self
+pub fn pigeonhole_text::Query::parse(&str) -> pigeonhole_text::Result<pigeonhole_text::Query>
+pub fn pigeonhole_text::Query::phrase<I, S>(self, I) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn pigeonhole_text::Query::phrase_with_slop<I, S>(self, I, u16) -> Self where I: core::iter::traits::collect::IntoIterator<Item = S>, S: core::convert::Into<alloc::string::String>
+pub fn pigeonhole_text::Query::term(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn pigeonhole_text::Query::text(self, impl core::convert::Into<alloc::string::String>) -> Self
+impl core::convert::From<&alloc::string::String> for pigeonhole_text::Query
+pub fn pigeonhole_text::Query::from(&alloc::string::String) -> Self
+impl core::convert::From<&str> for pigeonhole_text::Query
+pub fn pigeonhole_text::Query::from(&str) -> Self
+impl core::convert::From<alloc::string::String> for pigeonhole_text::Query
+pub fn pigeonhole_text::Query::from(alloc::string::String) -> Self
+#[non_exhaustive] pub struct pigeonhole_text::RebuildStats
+pub pigeonhole_text::RebuildStats::changed: u64
+pub pigeonhole_text::RebuildStats::documents: u64
+pub pigeonhole_text::RebuildStats::invalid_utf8: u64
+pub struct pigeonhole_text::Search<'a>
+impl<'a> pigeonhole_text::Search<'a>
+pub fn pigeonhole_text::Search<'a>::run(self) -> pigeonhole_text::Result<alloc::vec::Vec<pigeonhole_text::Hit>>
+pub fn pigeonhole_text::Search<'a>::run_with_stats(self) -> pigeonhole_text::Result<(alloc::vec::Vec<pigeonhole_text::Hit>, pigeonhole_text::SearchStats)>
+pub fn pigeonhole_text::Search<'a>::snapshot(self, &'a pigeonhole::db::Snapshot) -> Self
+#[non_exhaustive] pub struct pigeonhole_text::SearchStats
+pub pigeonhole_text::SearchStats::stale: u64
+pub struct pigeonhole_text::Source
+impl pigeonhole_text::Source
+pub fn pigeonhole_text::Source::family(&self) -> &str
+pub fn pigeonhole_text::Source::new(&pigeonhole::table::Table, &str, &[u8]) -> Self
+pub fn pigeonhole_text::Source::qualifier(&self) -> &[u8]
+pub fn pigeonhole_text::Source::table(&self) -> &str
+#[non_exhaustive] pub struct pigeonhole_text::Token<'a>
+pub pigeonhole_text::Token::position: u32
+pub pigeonhole_text::Token::range: core::ops::range::Range<usize>
+pub pigeonhole_text::Token::text: &'a str
+impl<'a> pigeonhole_text::Token<'a>
+pub fn pigeonhole_text::Token<'a>::new(&'a str, u32, core::ops::range::Range<usize>) -> Self
+pub trait pigeonhole_text::Tokenizer: core::marker::Send + core::marker::Sync
+pub fn pigeonhole_text::Tokenizer::fingerprint(&self) -> u64
+pub fn pigeonhole_text::Tokenizer::name(&self) -> &str
+pub fn pigeonhole_text::Tokenizer::tokens(&self, &str, &mut dyn core::ops::function::FnMut(pigeonhole_text::Token<'_>))
+pub type pigeonhole_text::Result<T> = core::result::Result<T, pigeonhole_text::Error>
