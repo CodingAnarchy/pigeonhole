@@ -63,6 +63,9 @@
 - `crates/engine/tests/feed_model.rs` (new sweep target), `it/feed_reader.rs` and `wal/tests/feed_cursor.rs`;
 - PR 3b's public `Feed`.
 
+## The cut fix (after 3a)
+- **pigeonhole-wal:** `Step::Cut`, a new variant. `Step` is new since 1.0 (#1316, unreleased), so this breaks no released API. The engine's feed reader maps it to an expiry.
+
 ## The inherit amendment (the owner, 2026-11-02)
 - **pigeonhole** (additive): `Options::change_feed_off()`.
   - **Behaviour:** with neither `change_feed` nor `change_feed_off`, an open inherits the last session's feed settings (retention, age, fed tables; not `sync_interval`, which is per open). If every table it fed was dropped since, the open records the feed off.

@@ -42,6 +42,21 @@ pub enum Step<'a> {
     /// them has expired. Never reported for a short read: a recycled slot shows as a newer
     /// epoch, in its header or in its frames.
     Gone,
+    /// The records the cursor read past some point of its segment are gone: the successor
+    /// names an earlier end for it, so a recovery cut the segment there (a power loss took
+    /// the unsynced records the cursor had read; the next writer replayed only up to the
+    /// cut). A feed that delivered any of them has lost them; one resuming past the cut
+    /// expires. Distinct from a successor naming a later end, which is corruption.
+    Cut,
+}
+
+/// Whether [`FeedCursor::chain`] moved to the successor.
+enum Chained {
+    Moved,
+    /// No successor on disk yet.
+    No,
+    /// The successor names an earlier end than the cursor read to ([`Step::Cut`]).
+    Cut,
 }
 
 /// A live, read-only reader of one WAL stream from a record boundary (D310).
@@ -218,12 +233,12 @@ impl FeedCursor {
         Ok(here)
     }
 
-    /// The segment stopped at `stop`: moves to its successor if one is on disk. Returns
-    /// whether it moved. A successor naming another offset means the cursor's segment was
-    /// rewritten under it (gone), or synced data was lost (corrupt) if it is still there.
-    fn chain(&mut self, epoch: u32, stop: u64) -> Result<bool> {
+    /// The segment stopped at `stop`: moves to its successor if one is on disk. A successor
+    /// naming an earlier end means a recovery cut the segment before `stop` ([`Step::Cut`]);
+    /// a later one, that synced data was lost (corrupt).
+    fn chain(&mut self, epoch: u32, stop: u64) -> Result<Chained> {
         let Some(grid) = self.grid.as_ref() else {
-            return Ok(false);
+            return Ok(Chained::No);
         };
         let mut successors = grid
             .headers
@@ -231,7 +246,7 @@ impl FeedCursor {
             .enumerate()
             .filter_map(|(i, h)| h.filter(|h| h.prev_epoch == epoch).map(|h| (i, h)));
         let (slot, h) = match (successors.next(), successors.next()) {
-            (None, _) => return Ok(false),
+            (None, _) => return Ok(Chained::No),
             (Some(s), None) => s,
             (Some(_), Some(_)) => {
                 return Err(crate::stream::corrupt(
@@ -239,6 +254,9 @@ impl FeedCursor {
                 ));
             }
         };
+        if u64::from(h.prev_end) < stop {
+            return Ok(Chained::Cut);
+        }
         if u64::from(h.prev_end) != stop {
             return Err(crate::stream::corrupt(
                 "wal segment chain: predecessor end mismatch",
@@ -252,7 +270,7 @@ impl FeedCursor {
             frame: FRAME,
             last_end: FRAME,
         });
-        Ok(true)
+        Ok(Chained::Moved)
     }
 
     /// The next record, or where reading stops for now ([`Step::End`]) or for good
@@ -306,8 +324,13 @@ impl FeedCursor {
             if !self.refresh()? {
                 return Ok(Step::Gone);
             }
-            if self.chain(epoch, stop)? {
-                continue;
+            match self.chain(epoch, stop)? {
+                Chained::Moved => continue,
+                Chained::Cut => {
+                    self.cur = None;
+                    return Ok(Step::Cut);
+                }
+                Chained::No => {}
             }
             // Not moved: resume just past the last complete record next time.
             let cur = self.cur.as_mut().expect("refresh kept it");
