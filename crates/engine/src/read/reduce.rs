@@ -1084,13 +1084,18 @@ pub struct ByteBudget<I, F> {
     open: Option<CellKey>,
     open_at: usize,
     overflow: Option<Overflow>,
-    /// D308's N4 (#1280): at most this many rows, so a scan's `limit` bounds the read too.
-    rows: Option<usize>,
+    /// D308's N4 (#1280): at most this many rows, so a scan's `limit` bounds the read too;
+    /// [`NO_ROW_LIMIT`] for none. A plain integer, not an `Option`, so a read without a limit
+    /// pays one compare at each new row (#1284's scan-budget count).
+    rows: usize,
     /// Rows with a kept cell.
     kept_rows: usize,
     /// More rows followed the `rows`-th (this group's own account until `cut`).
     rows_full: bool,
 }
+
+/// [`ByteBudget`]'s row limit when there is none: no read keeps this many rows.
+const NO_ROW_LIMIT: usize = usize::MAX;
 
 impl<I, F> std::fmt::Debug for ByteBudget<I, F> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1114,7 +1119,7 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
             open: None,
             open_at: 0,
             overflow: None,
-            rows: None,
+            rows: NO_ROW_LIMIT,
             kept_rows: 0,
             rows_full: false,
         }
@@ -1125,7 +1130,7 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
     /// further than that. A group stops at its own `n`-th row, which keeps everything the
     /// merged prefix needs from it, as `Limit` does.
     pub fn with_rows(mut self, n: usize) -> Self {
-        self.rows = Some(n);
+        self.rows = n;
         self
     }
 
@@ -1162,7 +1167,7 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
             }
             let row = &self.kept[i].key.row;
             let new_row = keep == 0 || self.kept[keep - 1].key.row != *row;
-            if new_row && self.rows.is_some_and(|n| rows == n) {
+            if new_row && rows == self.rows {
                 // The row limit stops first: what follows is past it.
                 hit_rows = true;
                 break;
@@ -1187,8 +1192,8 @@ impl<I, F: Fn(&CellRef<'_>, &I) -> u64> ByteBudget<I, F> {
         };
         // An overflow in a row past the `rows`-th: the row limit stopped the read first.
         let last_row = keep.checked_sub(1).map(|k| self.kept[k].key.row.as_slice());
-        if let (Some(o), Some(n)) = (&overflow, self.rows)
-            && rows == n
+        if let Some(o) = &overflow
+            && rows == self.rows
             && last_row != Some(o.key.row.as_slice())
         {
             overflow = None;
@@ -1225,21 +1230,19 @@ impl<I: Send, F: Fn(&CellRef<'_>, &I) -> u64 + Send> Reducer for ByteBudget<I, F
             }
             return ControlFlow::Break(());
         }
+        // A group pushes in cell order, so this appends.
+        debug_assert!(self.kept.last().is_none_or(|k| k.key.as_ref() < cell));
+        // Computed once, for the row limit and the row key's charge: the limit is compared
+        // only at a new row (a cell of the open column is never one).
+        let new_row = self.kept.last().is_none_or(|k| k.key.row != cell.row);
+        if new_row && self.kept_rows == self.rows {
+            self.rows_full = true;
+            return ControlFlow::Break(());
+        }
         if !same {
-            // The count first: the row key is compared only at the limit, so a read without
-            // one pays a compare of two integers here (#1284's scan-budget count).
-            if self.rows == Some(self.kept_rows)
-                && self.kept.last().is_none_or(|k| k.key.row != cell.row)
-            {
-                self.rows_full = true;
-                return ControlFlow::Break(());
-            }
             self.open = Some(cell.to_key());
             self.open_at = self.kept.len();
         }
-        // A group pushes in cell order, so this appends.
-        debug_assert!(self.kept.last().is_none_or(|k| k.key.as_ref() < cell));
-        let new_row = self.kept.last().is_none_or(|k| k.key.row != cell.row);
         let charge = if new_row { cell.row.len() as u64 } else { 0 };
         if self.used + size + charge <= self.budget {
             self.used += size + charge;
