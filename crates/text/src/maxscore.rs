@@ -22,7 +22,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 
-use pigeonhole::{RowCells, Snapshot, Table};
+use pigeonhole::{RowCells, Snapshot};
+
+use crate::index::Rows;
 
 use crate::error::{Result, corrupt};
 use crate::layout::*;
@@ -77,7 +79,7 @@ pub(crate) struct Scored<'t> {
 impl<'t> Scored<'t> {
     /// A term clause over its posting row (restricted to doc ids starting with `prefix`).
     pub(crate) fn term(
-        t: &'t Table,
+        t: &'t Rows,
         s: &Snapshot,
         bm: &Bm25,
         term: &str,
@@ -168,7 +170,7 @@ impl<'t> Scored<'t> {
     }
 
     /// The clause's contribution to `doc`, looked up out of order (a non-essential clause).
-    fn lookup(&self, t: &Table, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+    fn lookup(&self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
         match &self.clause {
             Clause::Term { row, idf, .. } => match t.get_at(s, row, POST, doc)? {
                 Some(c) => {
@@ -215,7 +217,7 @@ impl Ord for Held {
 /// The top `k` documents of `clauses` (in their fixed order), by score descending then id
 /// ascending, with their exact scores.
 pub(crate) fn top_k(
-    t: &Table,
+    t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
     mut clauses: Vec<Scored<'_>>,

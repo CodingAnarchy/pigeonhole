@@ -56,8 +56,17 @@ mod sloppy;
 mod tokenizer;
 
 pub use error::{Error, QueryErrorKind, Result};
-pub use index::{Index, IndexStats, RebuildStats};
+pub use index::{Index, IndexStats, ReadIndex, RebuildStats};
 pub use layout::{IndexOptions, Normalization, Source};
 pub use query::{Clause, Fuzziness, Query};
 pub use search::{Hit, Search, SearchStats};
 pub use tokenizer::{Token, Tokenizer};
+
+/// The user guide's text-search page and the crate README, compiled and run as doctests.
+#[cfg(doctest)]
+mod guide {
+    #[doc = include_str!("../../../docs/guide/text-search.md")]
+    struct TextSearch;
+    #[doc = include_str!("../README.md")]
+    struct CrateReadme;
+}

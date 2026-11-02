@@ -2,10 +2,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use pigeonhole::{Snapshot, Table};
+use pigeonhole::Snapshot;
 
 use crate::error::{Error, Result, corrupt};
-use crate::index::Index;
+use crate::index::{Index, Rows};
 use crate::layout::*;
 use crate::maxscore::{Bm25, Scored};
 use crate::query::{Clause, Query};
@@ -255,7 +255,7 @@ impl<'a> Search<'a> {
 /// and its sloppy frequency (`Σ 1 / (distance + 1)` over its matches, D309 rev 6 §B) above
 /// that.
 fn score_phrase(
-    t: &Table,
+    t: &Rows,
     s: &Snapshot,
     bm: &Bm25,
     df_of: &HashMap<String, i64>,
@@ -335,7 +335,7 @@ fn score_phrase(
 
 /// A term's positions by document, for the documents in `keep` (all when `None`).
 fn read_positions(
-    t: &Table,
+    t: &Rows,
     s: &Snapshot,
     term: &str,
     keep: Option<&BTreeMap<Vec<u8>, Vec<u32>>>,

@@ -53,6 +53,8 @@ pub fn pigeonhole_text::Index::create_with_tokenizer(&pigeonhole::db::Pigeonhole
 pub fn pigeonhole_text::Index::delete(&self, &[u8]) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::delete_in(&self, &mut pigeonhole::write::Transaction, &[u8]) -> pigeonhole_text::Result<bool>
 pub fn pigeonhole_text::Index::open(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_text::Result<pigeonhole_text::Index>
+pub fn pigeonhole_text::Index::open_reader(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
+pub fn pigeonhole_text::Index::open_reader_with_tokenizer(&pigeonhole::db::PigeonholeReader, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::ReadIndex>
 pub fn pigeonhole_text::Index::open_with_tokenizer(&pigeonhole::db::Pigeonhole, &str, alloc::boxed::Box<dyn pigeonhole_text::Tokenizer>) -> pigeonhole_text::Result<pigeonhole_text::Index>
 pub fn pigeonhole_text::Index::options(&self) -> pigeonhole_text::IndexOptions
 pub fn pigeonhole_text::Index::put(&self, &[u8], &str) -> pigeonhole_text::Result<()>
@@ -109,6 +111,14 @@ impl core::convert::From<&str> for pigeonhole_text::Query
 pub fn pigeonhole_text::Query::from(&str) -> Self
 impl core::convert::From<alloc::string::String> for pigeonhole_text::Query
 pub fn pigeonhole_text::Query::from(alloc::string::String) -> Self
+pub struct pigeonhole_text::ReadIndex
+impl pigeonhole_text::ReadIndex
+pub fn pigeonhole_text::ReadIndex::options(&self) -> pigeonhole_text::IndexOptions
+pub fn pigeonhole_text::ReadIndex::search(&self, impl core::convert::Into<pigeonhole_text::Query>, usize) -> pigeonhole_text::Search<'_>
+pub fn pigeonhole_text::ReadIndex::source(&self) -> &pigeonhole_text::Source
+pub fn pigeonhole_text::ReadIndex::verify(&self) -> pigeonhole_text::Result<pigeonhole_text::IndexStats>
+impl core::fmt::Debug for pigeonhole_text::ReadIndex
+pub fn pigeonhole_text::ReadIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_text::RebuildStats
 pub pigeonhole_text::RebuildStats::changed: u64
 pub pigeonhole_text::RebuildStats::documents: u64
