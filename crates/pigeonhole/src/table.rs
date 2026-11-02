@@ -744,8 +744,7 @@ impl ReadTable {
     /// same [`Feed`](crate::Feed) a writer's [`Table::feed`] gives, following the writer's
     /// feed through shared memory. The writer must feed the table. Across a writer restart
     /// the feed resubscribes from its own token on the new writer: a durable feed continues,
-    /// and a visible one that delivered what a power loss took expires. Not from the oldest
-    /// retained history (`Unsupported`): start [`from_snapshot`](crate::FeedBuilder::from_snapshot).
+    /// and a visible one that delivered what a power loss took expires.
     pub fn feed(&self) -> crate::FeedBuilder {
         crate::FeedBuilder::new(&self.core)
     }

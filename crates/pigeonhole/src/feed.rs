@@ -262,8 +262,8 @@ impl FeedBuilder {
     ///
     /// Fails with `InvalidArgument` if the database's change feed is off or doesn't follow
     /// one of the tables ([`Options::feed_tables`](crate::Options::feed_tables)), or if a
-    /// token is not one of this database's; `Unsupported` in a reader process (for now). A
-    /// start whose history is gone shows at the first [`Feed::next`], as `FeedExpired`.
+    /// token is not one of this database's. A start whose history is gone shows at the first
+    /// [`Feed::next`], as `FeedExpired`.
     pub fn open(self) -> Result<Feed> {
         if let Some(e) = self.error {
             return Err(e);

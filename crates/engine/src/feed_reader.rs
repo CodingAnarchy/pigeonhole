@@ -240,6 +240,9 @@ pub struct FeedReader {
     view: ViewFn,
     /// A reader process's wait between polls, doubling while nothing arrives.
     backoff: Duration,
+    /// Since when a reader process has waited for a view listing the next commit's blob
+    /// files.
+    blob_wait: Option<Instant>,
     tables: Vec<TableId>,
     prefix: Vec<u8>,
     durable: bool,
@@ -297,6 +300,9 @@ pub(crate) struct Origin {
 /// watermarks in shared memory, so the writer does no per-commit work for it.
 const READER_BACKOFF_MIN: Duration = Duration::from_micros(50);
 const READER_BACKOFF_MAX: Duration = Duration::from_millis(5);
+/// How long a reader process waits for a view that lists a commit's blob files before it
+/// takes them as removed (the bound a reader snapshot waits for its view too).
+const READER_BLOB_WAIT: Duration = Duration::from_secs(1);
 
 /// What one poll left.
 enum Polled {
@@ -335,12 +341,6 @@ impl FeedReader {
                 t.0
             )));
         }
-        if origin.writer.is_none() && matches!(spec.start, FeedStart::Oldest) {
-            return Err(Error::Unsupported(
-                "a change feed from the oldest retained history in a reader process: start \
-                 after a snapshot instead",
-            ));
-        }
         let history = read_history(&shared, session, &tables)?;
         let key = (3 << 62) | NEXT_KEY.fetch_add(1, Ordering::Relaxed);
         let db_id = shared.pager.db_id();
@@ -366,6 +366,7 @@ impl FeedReader {
             writer: origin.writer,
             view: origin.view,
             backoff: READER_BACKOFF_MIN,
+            blob_wait: None,
         };
         // Where each stream starts, and the bound below which nothing is delivered.
         let starts: Vec<(Lsn, Option<Lsn>)> = match spec.start {
@@ -378,6 +379,11 @@ impl FeedReader {
             },
             start => {
                 let mut reader_starts: Vec<Lsn> = Vec::new();
+                // A reader process's view of each stream's floor and lost bound, loaded once
+                // (the floor first, so the bound is at least that floor's).
+                let marks: Vec<pigeonhole_shm::FeedMarksView> = (0..this.shared.shards)
+                    .map(|s| this.shm.feed_marks(s as u32))
+                    .collect();
                 let bound = match start {
                     FeedStart::Now => {
                         // A reader process starts each stream at its checkpoint, loaded
@@ -385,7 +391,7 @@ impl FeedReader {
                         // checkpoint moved, so its key is at or below the bound loaded next.
                         if this.writer.is_none() {
                             reader_starts = (0..this.shared.shards)
-                                .map(|s| Lsn(this.shm.feed_marks(s as u32).1))
+                                .map(|s| Lsn(this.shm.feed_marks(s as u32).checkpoint))
                                 .collect();
                         }
                         this.shm
@@ -395,28 +401,36 @@ impl FeedReader {
                     }
                     FeedStart::After(seqno) => seqno,
                     FeedStart::Oldest => {
-                        // The largest bound every stream's retained history serves.
-                        let feed = this.writer.as_ref().expect("refused above");
-                        (0..this.shared.shards)
-                            .map(|s| feed.oldest_bound(s, this.floor(s)))
-                            .max()
-                            .unwrap_or(0)
+                        // The largest bound every stream's retained history serves: from the
+                        // writer's checkpoint history, or in a reader process from the
+                        // bounds it mirrors (`FEED_BOUND`).
+                        match &this.writer {
+                            Some(feed) => (0..this.shared.shards)
+                                .map(|s| feed.oldest_bound(s, this.floor(s)))
+                                .max()
+                                .unwrap_or(0),
+                            None => marks.iter().map(|m| m.bound).max().unwrap_or(0),
+                        }
                     }
                     FeedStart::Token(_) => unreachable!("handled above"),
                 };
                 this.delivered = bound;
                 let mut starts = Vec::with_capacity(this.shared.shards);
-                for s in 0..this.shared.shards {
+                for (s, m) in marks.iter().enumerate() {
                     // A reader process has no checkpoint history: from its checkpoint for
                     // `Now`, else from the stream's floor, skipping keys at or below the
                     // bound (correct, and slower to start).
                     let at = match &this.writer {
                         Some(feed) => feed.start_at(s, bound, this.floor(s)),
+                        // A record dropped below the floor may have a key above the bound:
+                        // that history is gone (simp724's B1), as `start_at` says for the
+                        // writer.
+                        None if reader_starts.is_empty() && m.bound > bound => None,
                         None => Some(
                             reader_starts
                                 .get(s)
                                 .copied()
-                                .unwrap_or(Lsn::new(this.floor(s), 0)),
+                                .unwrap_or(Lsn::new(m.floor, 0)),
                         ),
                     };
                     match at {
@@ -651,13 +665,28 @@ impl FeedReader {
         // `Wal::written` (which excludes it). `it::feed_head` pins this; no head mark is
         // needed (D310 PR 4).
         let checkpoints: Vec<Lsn> = (0..self.streams.len())
-            .map(|s| Lsn(self.shm.feed_marks(s as u32).1))
+            .map(|s| Lsn(self.shm.feed_marks(s as u32).checkpoint))
             .collect();
         let frontier = self.shm.written_seqno(self.durable);
+        // Reader processes: where a test restarts the writer between the stale check above
+        // and the reads below (simp724's B2).
+        #[cfg(feature = "test-hooks")]
+        self.shared
+            .hooks
+            .sites
+            .run(crate::engine::hooks::HookSite::ReaderFeedReads);
         for s in 0..self.streams.len() {
             if !self.read_stream(s)? {
                 return Ok(Polled::Expired);
             }
+        }
+        // The writer may have restarted while the streams were read (simp724's B2): the new
+        // session's records are then in, read as outside the history, and the frontier is
+        // the old one's. Nothing read here is delivered: the caller resubscribes from the
+        // token. A new writer's segments are written after its shared memory exists, so this
+        // check sees every such restart.
+        if self.shm.is_stale() {
+            return Err(Error::SnapshotExpired);
         }
         // Only now: simp724's rule holds once every stream was read to its end after the
         // checkpoints were loaded.
@@ -716,6 +745,10 @@ impl FeedReader {
                         continue;
                     }
                     if !inside {
+                        // A writer restart, not a gap: the caller resubscribes (B2).
+                        if self.shm.is_stale() {
+                            return Err(Error::SnapshotExpired);
+                        }
                         self.expired = Some(gap(seqno));
                         return Ok(false);
                     }
@@ -752,6 +785,10 @@ impl FeedReader {
                         continue;
                     }
                     if !inside {
+                        // A writer restart, not a gap: the caller resubscribes (B2).
+                        if self.shm.is_stale() {
+                            return Err(Error::SnapshotExpired);
+                        }
                         self.expired = Some(gap(apply));
                         return Ok(false);
                     }
@@ -895,6 +932,25 @@ impl FeedReader {
             // whose writer is gone, or whose view is being republished), and a failure here
             // leaves the commit to the next call.
             let view = (self.view)()?;
+            // A reader process's view can lag the writer's manifest: a value separated at
+            // commit time names a blob file the manifest committed before the commit was
+            // logged, which a view record of an older manifest version doesn't list yet
+            // (simp724's question on #1352). Wait for a newer view, up to a bound, rather
+            // than take the commit and expire; past the bound, the take below expires as for
+            // a file retention removed.
+            if self.writer.is_none() {
+                let listed = self
+                    .ready
+                    .first_key_value()
+                    .is_some_and(|(_, p)| self.blobs_listed(&view, p));
+                if !listed {
+                    let since = *self.blob_wait.get_or_insert_with(Instant::now);
+                    if since.elapsed() < READER_BLOB_WAIT {
+                        return Ok(false);
+                    }
+                }
+            }
+            self.blob_wait = None;
             let (_, p) = self.ready.pop_first().expect("checked");
             let (ts, raws) = match p {
                 Pending::Single {
@@ -1043,10 +1099,27 @@ fn drop_undecided(
 }
 
 impl FeedReader {
+    /// Whether `view` lists every blob file pending commit `p`'s values point into.
+    fn blobs_listed(&self, view: &crate::snapshot::View, p: &Pending) -> bool {
+        let listed = |raws: &[Raw]| {
+            raws.iter().all(|r| {
+                blob_pointer(&r.value)
+                    .is_none_or(|ptr| view.ssts.blob_reader(ptr.blob_file).is_some())
+            })
+        };
+        match p {
+            Pending::Single { changes, .. } => listed(changes),
+            Pending::Decided { id, .. } => self
+                .held
+                .get(id)
+                .is_none_or(|shares| shares.iter().all(|h| listed(&h.changes))),
+        }
+    }
+
     /// Stream `s`'s floor: no segment of a smaller epoch is kept (the writer's shared-memory
     /// mark).
     fn floor(&self, s: usize) -> u32 {
-        self.shm.feed_marks(s as u32).0
+        self.shm.feed_marks(s as u32).floor
     }
 }
 
@@ -1081,7 +1154,9 @@ fn writer_session(shared: &Shared) -> Result<(u64, FeedTables)> {
                 ..
             } => {
                 if *streams as usize != shared.shards {
-                    return Err(off());
+                    // A new writer with another shard count is starting: this attachment is
+                    // the old one's (simp724's nit). Subscribe again once it runs.
+                    return Err(Error::SnapshotExpired);
                 }
                 return Ok((*session, tables.clone()));
             }

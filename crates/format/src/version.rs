@@ -70,7 +70,7 @@ impl ShmLayoutVersion {
     /// would see a commit before every share of it is applied. Version 7 adds each shard's
     /// written watermark (D310): a version 6 writer never stores it, so a version 7 reader's
     /// change feed could pass a record not yet in its stream file. Version 8 adds each
-    /// stream's change-feed floor and checkpoint (D310 PR 4), so a reader process can follow
+    /// stream's change-feed floor, checkpoint and lost bound (D310 PR 4), so a reader process can follow
     /// the feed: a version 7 writer never stores them, and a version 8 reader's feed would
     /// drop no aborted round's PREPARE and see no retention.
     pub const CURRENT: Self = Self(8);

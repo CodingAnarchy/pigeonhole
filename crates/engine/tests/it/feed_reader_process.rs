@@ -36,10 +36,16 @@ struct Writer {
 
 impl Writer {
     fn open(vfs: &Arc<SimVfs>, feed: bool) -> Self {
+        Self::open_retaining(vfs, feed.then_some(4 << 20))
+    }
+
+    /// With the feed on and `retention` bytes of history (the smallest is two segments
+    /// per stream).
+    fn open_retaining(vfs: &Arc<SimVfs>, retention: Option<u64>) -> Self {
         let mut o = common::options(Arc::clone(vfs), 2, 4 << 20);
-        if feed {
+        if let Some(bytes) = retention {
             let mut f = FeedOptions::default();
-            f.retention_bytes = 4 << 20;
+            f.retention_bytes = bytes;
             o.feed = Some(f);
         }
         let (db, shards) = Engine::open_application_owned(Path::new(DB), o).unwrap();
@@ -60,15 +66,20 @@ impl Writer {
 
     /// Commits `rows` of `t` (several tables' rows in one batch make a cross-shard commit).
     fn commit(&mut self, rows: &[(&TableInfo, &[u8])]) -> Seqno {
+        self.commit_values(&rows.iter().map(|&(t, r)| (t, r, r)).collect::<Vec<_>>())
+    }
+
+    /// Commits `(table, row, value)` triples in one batch.
+    fn commit_values(&mut self, rows: &[(&TableInfo, &[u8], &[u8])]) -> Seqno {
         let mut wb = WriteBatch::new();
-        for (t, row) in rows {
+        for (t, row, value) in rows {
             wb.put(
                 t.id,
                 t.families[0].id,
                 row,
                 b"q",
                 None,
-                ValueRef::Bytes(row),
+                ValueRef::Bytes(value),
             )
             .unwrap();
         }
@@ -82,6 +93,14 @@ impl Writer {
             self.run();
         }
         panic!("commit did not finish");
+    }
+
+    fn flush(&mut self) {
+        let mut m = self.db.flush_pending().unwrap();
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        while std::pin::Pin::new(&mut m).poll(&mut cx).is_pending() {
+            self.run();
+        }
     }
 
     fn close(mut self) {
@@ -210,7 +229,7 @@ fn a_writer_restart_expires_the_attachment_and_the_token_continues_on_the_new_wr
 }
 
 #[test]
-fn a_reader_process_needs_a_feeding_writer_and_starts_after_a_seqno_not_the_oldest() {
+fn a_reader_process_needs_a_feeding_writer_and_starts_after_a_seqno() {
     let vfs = SimVfs::new(4103);
     vfs.enter_process(WRITER);
     let mut w = Writer::open(&vfs, false);
@@ -235,10 +254,6 @@ fn a_reader_process_needs_a_feeding_writer_and_starts_after_a_seqno_not_the_olde
     let after = w.commit(&[(&a, b"after")]);
     vfs.enter_process(READER);
     let r = reader(&vfs);
-    assert!(matches!(
-        r.feed(spec(&[&a], FeedStart::Oldest)),
-        Err(Error::Unsupported(_))
-    ));
     // From the floor, skipping what the seqno covers.
     let mut feed = r.feed(spec(&[&a], FeedStart::After(before))).unwrap();
     assert_eq!(
@@ -246,6 +261,139 @@ fn a_reader_process_needs_a_feeding_writer_and_starts_after_a_seqno_not_the_olde
         [(after, vec![b"after".to_vec()])]
     );
     drop(feed);
+    vfs.enter_process(WRITER);
+    w.close();
+}
+
+/// simp724's B1 on #1352: a reader process asked to start after a seqno whose later commits
+/// retention already recycled has lost history, and expires (`FEED_BOUND`), never skipping
+/// them; the writer's own feed expires the same way (`start_at`). The oldest retained start
+/// still works there.
+#[test]
+fn a_reader_process_start_past_recycled_history_expires() {
+    let vfs = SimVfs::new(4104);
+    vfs.enter_process(WRITER);
+    // The smallest retention: two segments per stream.
+    let mut w = Writer::open_retaining(&vfs, Some(1));
+    let (a, _) = tables(&w.db);
+    w.settle();
+    let snap = w.commit(&[(&a, b"snapshot")]);
+    // Far past the retention, flushed as it goes so the checkpoints move on: the commits just
+    // after `snap` are recycled.
+    let big = vec![7u8; 20_000];
+    for i in 0..300u32 {
+        let row = format!("r{i:03}");
+        w.commit_values(&[(&a, row.as_bytes(), &big)]);
+        if i % 30 == 29 {
+            w.flush();
+        }
+    }
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut feed = r.feed(spec(&[&a], FeedStart::After(snap))).unwrap();
+    assert!(
+        matches!(feed.try_next().unwrap(), Next::Expired(_)),
+        "history past the snapshot is gone: never skipped silently"
+    );
+    // From the oldest retained start (`FEED_BOUND`): not expired, and it goes on with what
+    // follows. Here everything retained is at or below that bound (the last flush
+    // checkpointed it all), so the next commit is the first delivered.
+    let mut feed = r.feed(spec(&[&a], FeedStart::Oldest)).unwrap();
+    assert!(matches!(feed.try_next().unwrap(), Next::Pending));
+    vfs.enter_process(WRITER);
+    let next = w.commit(&[(&a, b"next")]);
+    vfs.enter_process(READER);
+    assert_eq!(ready(&mut feed).unwrap(), [(next, vec![b"next".to_vec()])]);
+    drop(feed);
+    drop(r);
+    vfs.enter_process(WRITER);
+    w.close();
+}
+
+/// simp724's B2 on #1352: a writer restart between the poll's stale check and its stream
+/// reads is `SnapshotExpired` (resubscribe from the token), never a permanent gap expiry,
+/// and the token then continues on the new writer.
+#[test]
+fn a_writer_restart_during_a_poll_is_snapshot_expired_never_a_gap() {
+    let vfs = SimVfs::new(4105);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut feed = r.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    vfs.enter_process(WRITER);
+    let first = w.commit(&[(&a, b"one")]);
+    vfs.enter_process(READER);
+    assert_eq!(ready(&mut feed).unwrap(), [(first, vec![b"one".to_vec()])]);
+    let token = feed.token();
+    // The restart lands inside the next poll, after its stale check.
+    let writer = Arc::new(std::sync::Mutex::new(Some(w)));
+    let second = Arc::new(std::sync::Mutex::new(0));
+    {
+        let (writer, second, vfs) = (Arc::clone(&writer), Arc::clone(&second), Arc::clone(&vfs));
+        r.on_next(
+            pigeonhole_engine::HookSite::ReaderFeedReads,
+            Box::new(move || {
+                vfs.enter_process(WRITER);
+                let mut slot = writer.lock().unwrap();
+                slot.take().unwrap().close();
+                let mut w = Writer::open(&vfs, true);
+                let a = (*w.db.table("a").unwrap()).clone();
+                *second.lock().unwrap() = w.commit(&[(&a, b"two")]);
+                *slot = Some(w);
+                vfs.enter_process(READER);
+            }),
+        );
+    }
+    assert!(
+        matches!(feed.try_next(), Err(Error::SnapshotExpired)),
+        "a restart mid-poll is the writer's, not a gap"
+    );
+    let mut feed = r.feed(spec(&[&a], FeedStart::Token(token))).unwrap();
+    let two = *second.lock().unwrap();
+    assert_eq!(ready(&mut feed).unwrap(), [(two, vec![b"two".to_vec()])]);
+    drop(feed);
+    drop(r);
+    vfs.enter_process(WRITER);
+    writer.lock().unwrap().take().unwrap().close();
+}
+
+/// A value separated into a blob file at commit time is delivered whole in a reader
+/// process, through its own view (simp724's question on #1352: such a file is in the
+/// manifest before the commit is logged; a lagging view waits rather than expiring).
+#[test]
+fn a_reader_process_delivers_a_separated_value() {
+    let vfs = SimVfs::new(4106);
+    vfs.enter_process(WRITER);
+    let mut w = Writer::open(&vfs, true);
+    let (a, _) = tables(&w.db);
+    w.settle();
+    vfs.enter_process(READER);
+    let r = reader(&vfs);
+    let mut feed = r.feed(spec(&[&a], FeedStart::Now)).unwrap();
+    vfs.enter_process(WRITER);
+    let large = vec![9u8; 2 << 20];
+    let seqno = w.commit_values(&[(&a, b"big", &large)]);
+    vfs.enter_process(READER);
+    let c = loop {
+        match feed.try_next().unwrap() {
+            Next::Commit(c) => break c.clone(),
+            Next::Pending => continue,
+            Next::Expired(e) => panic!("expired: {e:?}"),
+        }
+    };
+    assert_eq!(c.seqno, seqno);
+    let value = &c.changes[0].value;
+    assert_eq!(
+        value.len(),
+        large.len() + 1,
+        "the tag byte and the whole value"
+    );
+    assert!(value[1..] == large[..]);
+    drop(feed);
+    drop(r);
     vfs.enter_process(WRITER);
     w.close();
 }

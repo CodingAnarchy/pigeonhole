@@ -162,6 +162,14 @@ pub mod watermark {
     /// `u64` atomic (layout version 8): the stream's checkpoint `Lsn` (`FeedMarks::checkpoint`),
     /// stored once the checkpoint edit is durable; never goes down. 0 until stored.
     pub const FEED_CKPT: usize = 40;
+    /// `u64` atomic (layout version 8, simp724's B1 on #1352): the largest start bound the
+    /// stream's retained history can't serve: the key of the writer's checkpoint-history
+    /// entry at the floor (`Feed::oldest_bound`), so some record dropped below the floor may
+    /// have a key up to it. A reader process's feed asked to start after a seqno below it
+    /// has lost history and expires. Stored (`fetch_max`, Release) before the floor it
+    /// belongs to, so a reader that loads `FEED_FLOOR` and then this (Acquire both) gets a
+    /// bound at least that floor's; raised at checkpoints too. 0 until stored.
+    pub const FEED_BOUND: usize = 48;
 }
 
 /// Byte offsets within a reader slot.

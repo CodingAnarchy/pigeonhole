@@ -3465,23 +3465,42 @@ fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
         marks.set_mirror(Box::new(ShmMarks {
             shm: shared.shm.clone(),
             shard: stream as u32,
+            feed: Arc::downgrade(feed),
         }));
         feed.set_marks(stream, marks);
     }
 }
 
-/// A stream's feed marks in the shared-memory region (D310 PR 4).
+/// A stream's feed marks in the shared-memory region (D310 PR 4). `feed` is weak: the feed
+/// holds the stream's `FeedMarks`, which hold this.
 #[derive(Debug)]
 struct ShmMarks {
     shm: ShmRegion,
     shard: u32,
+    feed: std::sync::Weak<crate::feed::Feed>,
+}
+
+impl ShmMarks {
+    /// The lost bound for `floor` (`FEED_BOUND`, simp724's B1): what the checkpoint
+    /// history says records below the floor may have as keys.
+    fn publish_bound(&self, floor: u32) {
+        if let Some(feed) = self.feed.upgrade() {
+            self.shm
+                .publish_feed_bound(self.shard, feed.oldest_bound(self.shard as usize, floor));
+        }
+    }
 }
 
 impl pigeonhole_wal::MarkMirror for ShmMarks {
     fn floor(&self, epoch: u32) {
+        // The bound before its floor: a reader that loads the floor and then the bound gets
+        // one at least that floor's.
+        self.publish_bound(epoch);
         self.shm.publish_feed_floor(self.shard, epoch);
     }
     fn checkpoint(&self, lsn: Lsn) {
+        // A new checkpoint-history entry can raise the bound for the current floor.
+        self.publish_bound(self.shm.feed_marks(self.shard).floor);
         self.shm.publish_feed_checkpoint(self.shard, lsn.0);
     }
 }

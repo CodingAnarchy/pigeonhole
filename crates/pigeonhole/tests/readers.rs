@@ -181,7 +181,7 @@ fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
 
 /// D310 PR 4: a reader process follows the writer's change feed (`ReadTable::feed`), and
 /// across a writer restart resumes from its own token on the new writer, with nothing
-/// missed or repeated. `from_oldest` is refused there.
+/// missed or repeated.
 #[test]
 fn a_reader_process_follows_the_change_feed_across_a_writer_restart() {
     let vfs = SimVfs::new(1248);
@@ -204,10 +204,6 @@ fn a_reader_process_follows_the_change_feed_across_a_writer_restart() {
     let r = reader(&vfs, 2).unwrap();
     vfs.enter_process(reader_process(2));
     let rt = r.table("t").unwrap();
-    assert_eq!(
-        rt.feed().from_oldest().open().unwrap_err().code(),
-        ErrorCode::Unsupported
-    );
     let mut feed = rt.feed().open().unwrap();
     vfs.enter_process(WRITER);
     let one = t.mutate(b"one").put("f", b"q", b"1").commit().unwrap();

@@ -76,6 +76,10 @@ pub enum HookSite {
     /// Reader processes: when a snapshot found the durable root at the view record's
     /// manifest version and is about to read that manifest.
     ReaderManifestLoad,
+    /// Reader processes: in the next change-feed poll, after its stale-attachment check and
+    /// before it reads the streams: where a test restarts the writer in between (D310 PR 4,
+    /// simp724's B2).
+    ReaderFeedReads,
 }
 
 /// A one-shot test callback.

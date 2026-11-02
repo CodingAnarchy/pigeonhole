@@ -85,10 +85,10 @@
 
 ## PR 4: reader processes
 - **pigeonhole** (additive): `ReadTable::feed() -> FeedBuilder`, and `FeedBuilder::read_table(&ReadTable)`.
-- **pigeonhole-engine:** `Engine::feed` works in a reader process. In a reader process, `FeedStart::Oldest` is `Unsupported`. A feed whose writer restarted fails with `SnapshotExpired` (resubscribe from the token). `EngineShard::wal_header_held` is a test-hooks inspection helper.
+- **pigeonhole-engine:** `Engine::feed` works in a reader process, every start included. A feed whose writer restarted fails with `SnapshotExpired` (resubscribe from the token). `EngineShard::wal_header_held` is a test-hooks inspection helper, and so is `HookSite::ReaderFeedReads`.
 - **pigeonhole-wal:** `FeedMarks::set_mirror` and the `MarkMirror` trait (`floor`, `checkpoint`). `Wal::header_held` is a hidden inspection helper.
-- **pigeonhole-shm:** `publish_feed_floor`, `publish_feed_checkpoint`, `feed_marks`.
-- **pigeonhole-format:** shm layout 8 (`watermark::FEED_FLOOR`, `FEED_CKPT`).
+- **pigeonhole-shm:** `publish_feed_floor`, `publish_feed_checkpoint`, `publish_feed_bound`, `feed_marks` (returns `FeedMarksView`).
+- **pigeonhole-format:** shm layout 8 (`watermark::FEED_FLOOR`, `FEED_CKPT`, `FEED_BOUND`).
 
 ## Later PRs
 - PR 5: `poll_next`.

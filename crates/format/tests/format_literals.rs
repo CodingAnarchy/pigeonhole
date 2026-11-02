@@ -378,6 +378,7 @@ fn shm_layout() {
     // reader processes' feeds.
     assert_eq!(pigeonhole_format::shm::watermark::FEED_FLOOR, 32);
     assert_eq!(pigeonhole_format::shm::watermark::FEED_CKPT, 40);
+    assert_eq!(pigeonhole_format::shm::watermark::FEED_BOUND, 48);
     // §8.3: reader slot `i`'s liveness lock is byte 2^62 + i (layout version 3, #693).
     assert_eq!(pigeonhole_format::superblock::READER_LOCK_BASE, 1 << 62);
     // §11.2: each shard's 64-byte watermark line holds `pending` at 0 and `durable` at 8
