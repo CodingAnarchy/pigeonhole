@@ -43,6 +43,12 @@ static FIXED_SHARED: SharedSeed = SharedSeed::from_u64(FIXED_SEED);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Random,
+    /// Only `fix_seed_for_measurement` sets it, so a build without the feature never
+    /// constructs it. `default` still matches on it, so every build runs the same code.
+    #[cfg_attr(
+        not(feature = "__unstable-fixed-seed"),
+        expect(dead_code, reason = "set only by the feature-gated setter")
+    )]
     Fixed,
 }
 
