@@ -29,11 +29,14 @@ docs.mutate(b"doc:1")
 # }
 ```
 
-- **Elements:** `F32`, `I8` (raw signed bytes; you quantise), and `Bit` (packed bits, Hamming only).
+- **Elements:** `F32`, `I8` (raw signed bytes; you quantise), `Bit` (packed bits, Hamming only), and `F16` and `BF16` (IEEE half precision and bfloat16, 2 bytes a component; #1263).
+  - **Writing a half-precision family:** `put_vector_f16`/`put_vector_bf16` store raw `u16` bit patterns as given. `put_vector_f32` rounds each component to nearest, ties to even, and refuses one that overflows the element (an `f16`'s largest is 65,504).
+  - **Queries stay `f32`:** `nearest_f32` and `VectorSpec::distance_f32` accept a half family, and score a half vector exactly as its widened `f32` vector. `VectorRef::to_f32_vec` widens one exactly.
 - **Metrics:** `L2` (squared Euclidean), `InnerProduct` (negated, so the largest product ranks first), `Cosine` (`1 − cosine similarity`), and `Hamming`. Smaller is always nearer.
 - **What a write refuses:**
   - another element type or dimension;
   - an `f32` component that isn't finite, or exceeds 2^56 in magnitude;
+  - an `f16` or `bf16` component that isn't finite (and a `bf16` one above 2^56), or an `f32` component that overflows the half-precision element when converted;
   - under cosine, a vector whose norm is zero.
 
   These rules guarantee every distance is finite, so every stored vector can be found.
@@ -162,4 +165,4 @@ assert_eq!(stats.vectors, 500);
 - **Open an index once per process,** and clone the handle. Clones share the centroid cache and the rebalancer.
 - **To reopen a database in the same process, `close()` it first.** A rebalancing thread can hold a handle for up to one split after the last `Index` drops.
 - **The index's table holds its rows only.** Don't write to it directly.
-- **Vector elements:** `f32`, `i8` and bit vectors. Half-precision elements ([#1263](https://github.com/CodingAnarchy/pigeonhole/issues/1263)) come to the index once vector families have them.
+- **Vector elements:** `f32`, `i8` and bit vectors. Half-precision families (`F16`, `BF16`) work with exact search now. The IVF index takes them in [#1268](https://github.com/CodingAnarchy/pigeonhole/issues/1268) item 7.

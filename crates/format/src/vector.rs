@@ -62,9 +62,9 @@ impl Element {
     /// Whether the element is a half-precision float (`f16` or `bf16`, #1263).
     #[inline]
     pub fn is_half(self) -> bool {
-        // One compare on the code (4 and 5 are the half elements): `score` tests it per
-        // vector.
-        self as u8 >= Element::F16 as u8
+        // The two codes are adjacent, so this is one range compare, and an element code
+        // added later isn't taken for a half (perf287 on #1285).
+        matches!(self, Element::F16 | Element::BF16)
     }
 
     /// From its byte.
@@ -455,7 +455,6 @@ fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f6
 /// [`score`] for an `f16` or `bf16` stored vector: an `f32` query through the widening
 /// kernels, which equal the `f32` kernels over the widened vector bit for bit. Out of line,
 /// so it costs the other elements' path nothing.
-#[cold]
 #[inline(never)]
 fn score_half(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f64 {
     use crate::distance as k;
