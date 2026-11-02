@@ -391,6 +391,9 @@ impl Recovery {
                     opts.spare_segments,
                 );
                 s.configure_feed(&opts);
+                if opts.retain_segments != 0 {
+                    s.feed_marks_ref().set_checkpoint(checkpoint);
+                }
                 s.adopt(&epochs, max_epoch, checkpoint.epoch());
                 s.open_segment(end.epoch(), end.offset())?;
                 s

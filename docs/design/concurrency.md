@@ -537,10 +537,13 @@ The pending commit's handle on the shared state is per shard too (D236): `Inner:
 | `Feed::sidecar` feed.rs | `Mutex<Option<Sidecar>>` | The `-feed` sidecar's handle and append offset. | The open (`set_sidecar`); `note_root` (the pager's root-commit observer, on the committing thread). | Same. | A leaf (lock order item 16). | D310 PR 1, FORMAT §10.4. |
 
 **Declared outside the engine, beside these:**
-- **`pigeonhole-wal`'s `FeedMarks`** `{ head: AtomicU32, floor: AtomicU32, retained_bytes: AtomicU64 }`, one per stream. Only its stream writes it, on its shard thread.
+- **`pigeonhole-wal`'s `FeedMarks`** `{ head: AtomicU32, floor: AtomicU32, retained_bytes: AtomicU64, checkpoint: AtomicU64 }`, one per stream. Only its stream writes it, on its shard thread.
   - **`head`:** stored Release as a segment starts, before any of its records. A thread that learned of a record through the engine's own hand-offs (the flush, the manifest commit that emptied a blob file) loads it Acquire, so it sees at least that record's segment.
   - **`floor`:** `fetch_max` AcqRel, so it never goes down, and loaded Acquire. A stale load only delays a release.
   - **`retained_bytes`:** Relaxed, a statistic.
+  - **`checkpoint`** (PR 3): an `Lsn` that `Wal::checkpoint` raises with `fetch_max` AcqRel, so it never goes down. A reopen seeds it from the recovered checkpoint. The feed reader loads it Acquire **before** the frontier F, and treats a held PREPARE it passed with no Decision read as aborted (simp724's rule).
+    - **Why that's exact:** the engine moves a checkpoint past a decided PREPARE only once every other holder's `flushed_through` passed its apply seqno (D266, `needed`). `flushed_through` never exceeds the visible watermark, so that apply seqno was visible before the store. By M1 the Decision was then already in its stream file, and the reader reads every stream to its end after this load.
+    - **Undecided PREPAREs:** the checkpoint never passes one; `mark_aborted` and a recovery without its Decision are the only ways it passes an undecided one.
 - **`pigeonhole-pager`'s `Inner::root_observer`**, a `OnceLock` set once at open.
 - **`pigeonhole-shm`'s `WRITTEN[shard]` and `SYNCED[shard]`** (layout 7, watermark-line offsets 16 and 24, PR 2), one pair per shard in the region. Only their shard writes them, on its shard thread (`note_feed_unwritten`, `settle_feed_written`), with Release stores. A hold is stored while `pending` or `cross_held` still holds its seqno, so it never lowers a frontier. `written_seqno` loads them (Acquire) after the shard's `pending`/`durable`. `SYNCED` is read only by the durable frontier.
   - **Why `SYNCED`:** D227 counts `None` commits durable at their level once applied and `Buffered` ones once written. Without it, a `durable()` feed (the default, call 5) could pass an unsynced change that a power loss undoes.

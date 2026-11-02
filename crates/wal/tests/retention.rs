@@ -58,6 +58,8 @@ fn retention_deepens_the_ring_then_recycles_it() {
     // The three retained segments are the three before the current one.
     assert_eq!(oldest, current - 3);
     assert_eq!(wal.feed_marks().unwrap().head(), current);
+    // The checkpoint mark follows the last checkpoint (`run` checkpoints each record).
+    assert_eq!(wal.feed_marks().unwrap().checkpoint(), wal.written());
     let hs = headers(&vfs, seg);
     let mut epochs: Vec<u32> = hs.iter().flatten().map(|h| h.epoch).collect();
     epochs.sort_unstable();
@@ -76,8 +78,9 @@ fn without_retention_nothing_is_retained() {
     wal.spares().prepare(2).unwrap();
     run(&mut wal, 1, 40, true);
     assert_eq!(file_len(&vfs), 3 * o.segment_size);
-    // Without the feed the marks' floor and retained bytes aren't kept.
+    // Without the feed the marks' floor, retained bytes and checkpoint aren't kept.
     assert_eq!(history(&wal), (0, 0));
+    assert_eq!(wal.feed_marks().unwrap().checkpoint(), Lsn::default());
     let hs = headers(&vfs, o.segment_size);
     assert!(hs.iter().flatten().all(|h| h.feed_session == 0));
 }
@@ -158,6 +161,8 @@ fn a_reopen_adopts_retained_segments_without_replaying_them() {
         "nothing past the checkpoint replays"
     );
     let mut wal = r.into_stream(o).unwrap();
+    // A reopen's checkpoint mark is the checkpoint it recovered from.
+    assert_eq!(wal.feed_marks().unwrap().checkpoint(), end);
     // The open's segment took a new slot, never a retained one.
     assert_eq!(wal.counters().retained_taken(), 0);
     assert_eq!(history(&wal).1, kept);
