@@ -151,7 +151,11 @@ impl ConsolidatePolicy {
     }
 
     fn check(&self) -> Result<()> {
-        let bad = |m: &str| Err(Error::InvalidArgument(format!("a consolidate policy's {m}")));
+        let bad = |m: &str| {
+            Err(Error::InvalidArgument(format!(
+                "a consolidate policy's {m}"
+            )))
+        };
         if !(-1.0..=1.0).contains(&self.group_similarity) {
             return bad("group_similarity must be from -1 to 1");
         }
@@ -278,11 +282,7 @@ impl<'a> Consolidate<'a> {
             let Some(m) = crate::store::read_memory(id, &r.to_owned())? else {
                 continue;
             };
-            if m.kind != Kind::Episodic
-                || m.consolidated
-                || m.superseded_by.is_some()
-                || m.pinned
-            {
+            if m.kind != Kind::Episodic || m.consolidated || m.superseded_by.is_some() || m.pinned {
                 continue;
             }
             by_session.entry(m.session.clone()).or_default().push(m);
@@ -364,7 +364,7 @@ impl<'a> Consolidate<'a> {
         let mut results: Vec<MemoryId> = Vec::with_capacity(made.len());
         let mut counts = (0, 0);
         for m in made {
-            let r = store.remember_with(&mut txn, self.ns, m, new_rid(now)?, now)?;
+            let r = store.remember_with(&mut txn, self.ns, m, new_rid(now)?, now, None)?;
             match &r {
                 Remembered::New(_) => counts.0 += 1,
                 _ => counts.1 += 1,
@@ -384,15 +384,20 @@ impl<'a> Consolidate<'a> {
         for id in &kept {
             txn.put(t, &id.row(), META, CONSOLIDATED, b"1");
         }
-        let others: Vec<&StoredMemory> = group
-            .iter()
-            .filter(|m| !results.contains(&m.id))
-            .collect();
+        let others: Vec<&StoredMemory> =
+            group.iter().filter(|m| !results.contains(&m.id)).collect();
         // 3. The links and the source policy.
         if p.sources != SourcePolicy::Delete {
             for r in &results {
                 for m in &others {
-                    write_link(&mut txn, t, &r.row(), &m.id.row(), LinkType::DERIVED_FROM, 1.0);
+                    write_link(
+                        &mut txn,
+                        t,
+                        &r.row(),
+                        &m.id.row(),
+                        LinkType::DERIVED_FROM,
+                        1.0,
+                    );
                 }
             }
         }

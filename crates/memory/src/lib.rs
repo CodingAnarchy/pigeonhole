@@ -18,6 +18,7 @@
 //!   processes ([`Store::open_reader`], [`ReadStore`]).
 
 mod consolidate;
+mod dedup;
 mod error;
 mod forget;
 mod layout;
@@ -27,6 +28,7 @@ mod store;
 pub use consolidate::{
     Consolidate, ConsolidatePass, ConsolidatePolicy, Consolidator, SourcePolicy,
 };
+pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
 pub use layout::{MemoryId, normalize};

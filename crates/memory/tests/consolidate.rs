@@ -107,7 +107,13 @@ fn keep_links_the_summary_marks_the_sources_and_moves_their_provenance() {
     let pass = store.consolidate("a", &c).policy(&any_age()).run().unwrap();
     // Session s2 has one memory: a group of one, left alone at min_group 2.
     assert_eq!(
-        (pass.groups, pass.committed, pass.skipped, pass.created, pass.sources),
+        (
+            pass.groups,
+            pass.committed,
+            pass.skipped,
+            pass.created,
+            pass.sources
+        ),
         (1, 1, 0, 1, 2),
         "{pass:?}"
     );
@@ -175,15 +181,19 @@ fn delete_and_supersede_handle_the_sources() {
         // The application's own link to a source: under Delete it goes with the source.
         let about = LinkType::custom(20).unwrap();
         let c = F(move |g: &[StoredMemory]| {
-            Ok(vec![
-                Memory::new("note summary")
-                    .importance(0.9)
-                    .link(g[0].id.clone(), about, 0.5),
-            ])
+            Ok(vec![Memory::new("note summary").importance(0.9).link(
+                g[0].id.clone(),
+                about,
+                0.5,
+            )])
         });
         let p = any_age().sources(policy);
         let pass = store.consolidate("a", &c).policy(&p).run().unwrap();
-        assert_eq!((pass.committed, pass.sources), (1, 2), "{policy:?}: {pass:?}");
+        assert_eq!(
+            (pass.committed, pass.sources),
+            (1, 2),
+            "{policy:?}: {pass:?}"
+        );
         let s = semantic(&store).remove(0);
         let mut names: Vec<&str> = s.sources.iter().map(|x| x.name.as_str()).collect();
         names.sort();
@@ -220,7 +230,11 @@ fn delete_and_supersede_handle_the_sources() {
 
 #[test]
 fn nothing_returned_marks_or_deletes_the_sources() {
-    for policy in [SourcePolicy::Keep, SourcePolicy::Delete, SourcePolicy::Supersede] {
+    for policy in [
+        SourcePolicy::Keep,
+        SourcePolicy::Delete,
+        SourcePolicy::Supersede,
+    ] {
         let dir = pigeonhole::doc_support::temp_dir();
         let db = open(&dir);
         let store = plain(&db);
@@ -255,7 +269,11 @@ fn nothing_returned_marks_or_deletes_the_sources() {
 /// which becomes the result: never deleted, superseded by itself, or linked to itself.
 #[test]
 fn a_summary_equal_to_a_source_makes_that_source_the_result() {
-    for policy in [SourcePolicy::Keep, SourcePolicy::Delete, SourcePolicy::Supersede] {
+    for policy in [
+        SourcePolicy::Keep,
+        SourcePolicy::Delete,
+        SourcePolicy::Supersede,
+    ] {
         let dir = pigeonhole::doc_support::temp_dir();
         let db = open(&dir);
         let store = plain(&db);
@@ -264,9 +282,16 @@ fn a_summary_equal_to_a_source_makes_that_source_the_result() {
         let c = F(|_: &[StoredMemory]| Ok(vec![Memory::new("note  the fact")]));
         let p = any_age().sources(policy);
         let pass = store.consolidate("a", &c).policy(&p).run().unwrap();
-        assert_eq!((pass.committed, pass.created, pass.merged), (1, 0, 1), "{pass:?}");
+        assert_eq!(
+            (pass.committed, pass.created, pass.merged),
+            (1, 0, 1),
+            "{pass:?}"
+        );
         let ma = store.get(&a).unwrap().unwrap();
-        assert!(ma.consolidated && ma.superseded_by.is_none(), "{policy:?}: {ma:?}");
+        assert!(
+            ma.consolidated && ma.superseded_by.is_none(),
+            "{policy:?}: {ma:?}"
+        );
         assert!(!derived(&store, &a).contains(&a));
         let mut names: Vec<&str> = ma.sources.iter().map(|x| x.name.as_str()).collect();
         names.sort();
@@ -306,8 +331,16 @@ fn two_consolidations_of_one_group_one_commits_and_the_other_skips() {
         assert_eq!(pass.committed, 1, "{pass:?}");
         Ok(vec![Memory::new("note outer summary")])
     });
-    let pass = store.consolidate("a", &outer).policy(&any_age()).run().unwrap();
-    assert_eq!((pass.committed, pass.skipped, pass.created), (0, 1, 0), "{pass:?}");
+    let pass = store
+        .consolidate("a", &outer)
+        .policy(&any_age())
+        .run()
+        .unwrap();
+    assert_eq!(
+        (pass.committed, pass.skipped, pass.created),
+        (0, 1, 0),
+        "{pass:?}"
+    );
     let texts: Vec<String> = semantic(&store).into_iter().map(|m| m.text).collect();
     assert_eq!(texts, ["note inner summary"]);
     check(&store, "nested");
@@ -358,7 +391,10 @@ fn groups_follow_sessions_similarity_age_and_the_limits() {
     let store = Store::create(&db, "m", StoreOptions::new().embedding(model)).unwrap();
     let mem = |text: &str, e: [f32; 2], session: &str| {
         store
-            .remember("a", Memory::new(text).embedding(e.to_vec()).session(session))
+            .remember(
+                "a",
+                Memory::new(text).embedding(e.to_vec()).session(session),
+            )
             .unwrap()
             .id()
             .clone()
@@ -510,7 +546,10 @@ fn two_returned_memories_of_one_text_are_one() {
     put(&store, "note one", "s1", "c1");
     put(&store, "note two", "s1", "c2");
     let c = F(|_: &[StoredMemory]| {
-        Ok(vec![Memory::new("note summary"), Memory::new("note  summary ")])
+        Ok(vec![
+            Memory::new("note summary"),
+            Memory::new("note  summary "),
+        ])
     });
     let pass = store.consolidate("a", &c).policy(&any_age()).run().unwrap();
     assert_eq!((pass.created, pass.merged), (1, 1), "{pass:?}");

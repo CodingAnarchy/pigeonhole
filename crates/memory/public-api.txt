@@ -1,5 +1,12 @@
 pub mod pigeonhole_memory
+#[non_exhaustive] pub enum pigeonhole_memory::DedupPolicy
+pub pigeonhole_memory::DedupPolicy::Link
+pub pigeonhole_memory::DedupPolicy::Merge
+pub pigeonhole_memory::DedupPolicy::Skip
 #[non_exhaustive] pub enum pigeonhole_memory::Error
+pub pigeonhole_memory::Error::Consolidate
+pub pigeonhole_memory::Error::Consolidate::error: alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>
+pub pigeonhole_memory::Error::Consolidate::pass: pigeonhole_memory::ConsolidatePass
 pub pigeonhole_memory::Error::Corruption(alloc::string::String)
 pub pigeonhole_memory::Error::Db(pigeonhole::error::Error)
 pub pigeonhole_memory::Error::InvalidArgument(alloc::string::String)
@@ -31,8 +38,42 @@ pub pigeonhole_memory::Kind::Semantic
 #[non_exhaustive] pub enum pigeonhole_memory::Remembered
 pub pigeonhole_memory::Remembered::Merged(pigeonhole_memory::MemoryId)
 pub pigeonhole_memory::Remembered::New(pigeonhole_memory::MemoryId)
+pub pigeonhole_memory::Remembered::Similar(pigeonhole_memory::MemoryId)
 impl pigeonhole_memory::Remembered
 pub fn pigeonhole_memory::Remembered::id(&self) -> &pigeonhole_memory::MemoryId
+#[non_exhaustive] pub enum pigeonhole_memory::SourcePolicy
+pub pigeonhole_memory::SourcePolicy::Delete
+pub pigeonhole_memory::SourcePolicy::Keep
+pub pigeonhole_memory::SourcePolicy::Supersede
+pub struct pigeonhole_memory::Consolidate<'a>
+impl<'a> pigeonhole_memory::Consolidate<'a>
+pub fn pigeonhole_memory::Consolidate<'a>::now_us(self, u64) -> Self
+pub fn pigeonhole_memory::Consolidate<'a>::policy(self, &'a pigeonhole_memory::ConsolidatePolicy) -> Self
+pub fn pigeonhole_memory::Consolidate<'a>::run(self) -> pigeonhole_memory::Result<pigeonhole_memory::ConsolidatePass>
+#[non_exhaustive] pub struct pigeonhole_memory::ConsolidatePass
+pub pigeonhole_memory::ConsolidatePass::committed: u64
+pub pigeonhole_memory::ConsolidatePass::created: u64
+pub pigeonhole_memory::ConsolidatePass::groups: u64
+pub pigeonhole_memory::ConsolidatePass::merged: u64
+pub pigeonhole_memory::ConsolidatePass::skipped: u64
+pub pigeonhole_memory::ConsolidatePass::sources: u64
+#[non_exhaustive] pub struct pigeonhole_memory::ConsolidatePolicy
+impl pigeonhole_memory::ConsolidatePolicy
+pub fn pigeonhole_memory::ConsolidatePolicy::get_group_similarity(&self) -> f32
+pub fn pigeonhole_memory::ConsolidatePolicy::get_max_group(&self) -> usize
+pub fn pigeonhole_memory::ConsolidatePolicy::get_max_groups(&self) -> usize
+pub fn pigeonhole_memory::ConsolidatePolicy::get_min_age(&self) -> core::time::Duration
+pub fn pigeonhole_memory::ConsolidatePolicy::get_min_group(&self) -> usize
+pub fn pigeonhole_memory::ConsolidatePolicy::get_sources(&self) -> pigeonhole_memory::SourcePolicy
+pub fn pigeonhole_memory::ConsolidatePolicy::group_similarity(self, f32) -> Self
+pub fn pigeonhole_memory::ConsolidatePolicy::max_group(self, usize) -> Self
+pub fn pigeonhole_memory::ConsolidatePolicy::max_groups(self, usize) -> Self
+pub fn pigeonhole_memory::ConsolidatePolicy::min_age(self, core::time::Duration) -> Self
+pub fn pigeonhole_memory::ConsolidatePolicy::min_group(self, usize) -> Self
+pub fn pigeonhole_memory::ConsolidatePolicy::new() -> Self
+pub fn pigeonhole_memory::ConsolidatePolicy::sources(self, pigeonhole_memory::SourcePolicy) -> Self
+impl core::default::Default for pigeonhole_memory::ConsolidatePolicy
+pub fn pigeonhole_memory::ConsolidatePolicy::default() -> Self
 pub struct pigeonhole_memory::EmbeddingModel
 impl pigeonhole_memory::EmbeddingModel
 pub fn pigeonhole_memory::EmbeddingModel::dim(&self) -> u32
@@ -113,6 +154,12 @@ pub fn pigeonhole_memory::MemoryId::fmt(&self, &mut core::fmt::Formatter<'_>) ->
 impl core::str::traits::FromStr for pigeonhole_memory::MemoryId
 pub type pigeonhole_memory::MemoryId::Err = pigeonhole_memory::Error
 pub fn pigeonhole_memory::MemoryId::from_str(&str) -> pigeonhole_memory::Result<Self>
+#[non_exhaustive] pub struct pigeonhole_memory::NearDedup
+impl pigeonhole_memory::NearDedup
+pub fn pigeonhole_memory::NearDedup::get_policy(&self) -> pigeonhole_memory::DedupPolicy
+pub fn pigeonhole_memory::NearDedup::get_similarity(&self) -> f32
+pub fn pigeonhole_memory::NearDedup::new(f32) -> Self
+pub fn pigeonhole_memory::NearDedup::policy(self, pigeonhole_memory::DedupPolicy) -> Self
 #[non_exhaustive] pub struct pigeonhole_memory::OpenOptions
 impl pigeonhole_memory::OpenOptions
 pub fn pigeonhole_memory::OpenOptions::model(self, impl core::convert::Into<alloc::string::String>) -> Self
@@ -174,6 +221,8 @@ pub pigeonhole_memory::Source::at_us: u64
 pub pigeonhole_memory::Source::name: alloc::string::String
 pub struct pigeonhole_memory::Store
 impl pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::consolidate<'a>(&'a self, &'a str, &'a dyn pigeonhole_memory::Consolidator) -> pigeonhole_memory::Consolidate<'a>
+impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::create_with(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions, pigeonhole_memory::OpenOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::delete(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<bool>
@@ -197,6 +246,10 @@ impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::forget(&self) -> pigeonhole_memory::Forget<'_>
 pub fn pigeonhole_memory::Store::forget_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::MemoryId, u64) -> pigeonhole_memory::Result<pigeonhole_memory::Forgot>
 impl pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::near_dedup(&self) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::NearDedup>>
+pub fn pigeonhole_memory::Store::near_duplicate(&self, &str, &pigeonhole_memory::Memory) -> pigeonhole_memory::Result<core::option::Option<(pigeonhole_memory::MemoryId, f32)>>
+pub fn pigeonhole_memory::Store::set_near_dedup(&self, core::option::Option<pigeonhole_memory::NearDedup>) -> pigeonhole_memory::Result<()>
+impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::open_reader(&pigeonhole::db::PigeonholeReader, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::ReadStore>
 pub fn pigeonhole_memory::Store::open_reader_without_embeddings(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_memory::Result<pigeonhole_memory::ReadStore>
 impl core::fmt::Debug for pigeonhole_memory::Store
@@ -206,6 +259,7 @@ impl pigeonhole_memory::StoreOptions
 pub fn pigeonhole_memory::StoreOptions::embedding(self, pigeonhole_memory::EmbeddingModel) -> Self
 pub fn pigeonhole_memory::StoreOptions::episodic_ttl(self, core::time::Duration) -> Self
 pub fn pigeonhole_memory::StoreOptions::forget(self, pigeonhole_memory::ForgetPolicy) -> Self
+pub fn pigeonhole_memory::StoreOptions::near_dedup(self, pigeonhole_memory::NearDedup) -> Self
 pub fn pigeonhole_memory::StoreOptions::new() -> Self
 #[non_exhaustive] pub struct pigeonhole_memory::StoreStats
 pub pigeonhole_memory::StoreStats::broken_links: u64
@@ -219,6 +273,7 @@ impl pigeonhole_memory::StoreStats
 pub fn pigeonhole_memory::StoreStats::is_consistent(&self) -> bool
 #[non_exhaustive] pub struct pigeonhole_memory::StoredMemory
 pub pigeonhole_memory::StoredMemory::backlinks: alloc::vec::Vec<pigeonhole_memory::Link>
+pub pigeonhole_memory::StoredMemory::consolidated: bool
 pub pigeonhole_memory::StoredMemory::embedding: core::option::Option<alloc::vec::Vec<f32>>
 pub pigeonhole_memory::StoredMemory::id: pigeonhole_memory::MemoryId
 pub pigeonhole_memory::StoredMemory::importance: f64
@@ -232,6 +287,7 @@ pub pigeonhole_memory::StoredMemory::superseded_by: core::option::Option<pigeonh
 pub pigeonhole_memory::StoredMemory::text: alloc::string::String
 pub pigeonhole_memory::StoredMemory::uses: u64
 #[non_exhaustive] pub struct pigeonhole_memory::Weights
+pub pigeonhole_memory::Weights::consolidated: f64
 pub pigeonhole_memory::Weights::importance: f64
 pub pigeonhole_memory::Weights::keyword: f64
 pub pigeonhole_memory::Weights::recency: f64
@@ -239,5 +295,7 @@ pub pigeonhole_memory::Weights::uses: f64
 pub pigeonhole_memory::Weights::vector: f64
 impl core::default::Default for pigeonhole_memory::Weights
 pub fn pigeonhole_memory::Weights::default() -> Self
+pub trait pigeonhole_memory::Consolidator: core::marker::Send + core::marker::Sync
+pub fn pigeonhole_memory::Consolidator::consolidate(&self, &[pigeonhole_memory::StoredMemory]) -> core::result::Result<alloc::vec::Vec<pigeonhole_memory::Memory>, alloc::boxed::Box<(dyn core::error::Error + core::marker::Send + core::marker::Sync)>>
 pub fn pigeonhole_memory::normalize(&str) -> alloc::string::String
 pub type pigeonhole_memory::Result<T> = core::result::Result<T, pigeonhole_memory::Error>

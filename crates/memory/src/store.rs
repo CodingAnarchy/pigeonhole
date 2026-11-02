@@ -9,6 +9,7 @@ use pigeonhole::{
 };
 use pigeonhole_text::{Index, IndexOptions, ReadIndex};
 
+use crate::dedup::{DedupPolicy, Near, NearDedup};
 use crate::forget::{ForgetPolicy, Forgetter, Signal, UserToken};
 use crate::recall::{Idx, Recall, Rows, Snap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -73,6 +74,7 @@ impl EmbeddingModel {
 pub struct StoreOptions {
     embedding: Option<EmbeddingModel>,
     forget: Option<ForgetPolicy>,
+    near_dedup: Option<NearDedup>,
 }
 
 impl StoreOptions {
@@ -92,6 +94,14 @@ impl StoreOptions {
     /// [`episodic_ttl`](Self::episodic_ttl): call that after this to add one.
     pub fn forget(mut self, policy: ForgetPolicy) -> Self {
         self.forget = Some(policy);
+        self
+    }
+
+    /// Near-duplicate dedup (T3): see [`NearDedup`]. Needs an
+    /// [`embedding`](Self::embedding) model. It can change later
+    /// ([`Store::set_near_dedup`]).
+    pub fn near_dedup(mut self, n: NearDedup) -> Self {
+        self.near_dedup = Some(n);
         self
     }
 
@@ -247,7 +257,7 @@ pub struct Marked {
 #[non_exhaustive]
 pub struct Memory {
     pub(crate) text: String,
-    embedding: Option<Vec<f32>>,
+    pub(crate) embedding: Option<Vec<f32>>,
     pub(crate) kind: Kind,
     importance: f64,
     source: Option<String>,
@@ -323,16 +333,20 @@ impl Memory {
 pub enum Remembered {
     /// A new memory.
     New(MemoryId),
-    /// The text was already remembered (exact dedup): merged into that memory, which kept
-    /// the larger importance, gained the source, and counted a use.
+    /// The text was already remembered (exact dedup), or a near duplicate was under
+    /// [`DedupPolicy::Merge`]: merged into that memory, which kept the larger importance,
+    /// gained the source, and counted a use.
     Merged(MemoryId),
+    /// A near duplicate under [`DedupPolicy::Skip`] (T3): nothing was written, and this is
+    /// the memory it's near.
+    Similar(MemoryId),
 }
 
 impl Remembered {
     /// The memory written or merged into.
     pub fn id(&self) -> &MemoryId {
         match self {
-            Remembered::New(id) | Remembered::Merged(id) => id,
+            Remembered::New(id) | Remembered::Merged(id) | Remembered::Similar(id) => id,
         }
     }
 }
@@ -474,6 +488,14 @@ impl Store {
         if let Some(p) = &store.forget {
             p.check()?;
         }
+        if let Some(n) = &store.near_dedup {
+            n.check()?;
+            if store.embedding.is_none() {
+                return Err(Error::InvalidArgument(
+                    "near dedup compares embeddings, and the store has no model".into(),
+                ));
+            }
+        }
         let mut b = db
             .table(&table_name(name))?
             .family(CONTENT, Family::default())
@@ -499,6 +521,9 @@ impl Store {
         }
         if let Some(p) = &store.forget {
             g = g.put(META, FORGET, &p.encode());
+        }
+        if let Some(n) = &store.near_dedup {
+            g = g.put(META, NEAR_DEDUP, &n.encode());
         }
         g.commit()?;
         Index::create(
@@ -680,17 +705,26 @@ impl Store {
     /// the text index, the dedup row, and both directions of each link. An exact duplicate
     /// (after trimming and collapsing whitespace) of a live, unsuperseded memory merges into
     /// it instead.
+    ///
+    /// With [near dedup](NearDedup), the nearest live memory is looked up first, outside the
+    /// transaction, and a close enough one is skipped, merged into or linked to.
     pub fn remember(&self, ns: &str, memory: Memory) -> Result<Remembered> {
         self.check_memory(ns, &memory)?;
+        let near = match self.near_dedup()? {
+            Some(setting) => self.near(ns, &memory, setting)?,
+            None => None,
+        };
         let now = now_us();
         let rid = new_rid(now)?;
         let (r, _) = self.db.transact(&RetryPolicy::default(), |txn| {
-            self.remember_with(txn, ns, &memory, rid, now)
+            self.remember_with(txn, ns, &memory, rid, now, near.as_ref())
         })?;
         Ok(r)
     }
 
-    /// [`remember`](Self::remember) inside the caller's transaction.
+    /// [`remember`](Self::remember) inside the caller's transaction, with exact dedup but
+    /// no near dedup: that check reads outside a transaction, so it couldn't be part of the
+    /// caller's. Call [`near_duplicate`](Self::near_duplicate) first to do it yourself.
     pub fn remember_in(
         &self,
         txn: &mut Transaction,
@@ -700,7 +734,7 @@ impl Store {
         self.check_memory(ns, &memory)?;
         let now = now_us();
         let rid = new_rid(now)?;
-        self.remember_with(txn, ns, &memory, rid, now)
+        self.remember_with(txn, ns, &memory, rid, now, None)
     }
 
     pub(crate) fn check_memory(&self, ns: &str, m: &Memory) -> Result<()> {
@@ -760,6 +794,7 @@ impl Store {
         m: &Memory,
         rid: [u8; 16],
         now: u64,
+        near: Option<&Near>,
     ) -> Result<Remembered> {
         let t = &self.table;
         let norm = normalize(&m.text);
@@ -789,10 +824,54 @@ impl Store {
             // Gone, superseded, or a hash collision: insert as new below. A collision
             // leaves the dedup row alone (it names a live memory of other text).
             if text.is_some() && !same {
-                return self.insert(txn, ns, m, rid, now, importance, None);
+                return self.insert_near(txn, ns, m, rid, now, importance, None, near);
             }
         }
-        self.insert(txn, ns, m, rid, now, importance, dedup.as_deref())
+        self.insert_near(txn, ns, m, rid, now, importance, dedup.as_deref(), near)
+    }
+
+    /// A new memory, unless a near duplicate's policy says otherwise (T3).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_near(
+        &self,
+        txn: &mut Transaction,
+        ns: &str,
+        m: &Memory,
+        rid: [u8; 16],
+        now: u64,
+        importance: i64,
+        dedup: Option<&[u8]>,
+        near: Option<&Near>,
+    ) -> Result<Remembered> {
+        let t = &self.table;
+        let Some(n) = near else {
+            return self.insert(txn, ns, m, rid, now, importance, dedup);
+        };
+        let id = || MemoryId::from_row(&n.row).ok_or_else(|| corrupt("a near match's row"));
+        if n.policy == DedupPolicy::Skip {
+            return Ok(Remembered::Similar(id()?));
+        }
+        // The match read here (M1's rule for a near match): gone or superseded since the
+        // check, it's ignored.
+        let live = txn.get(t, &n.row, CONTENT, TEXT)?.is_some()
+            && txn.get(t, &n.row, META, SUPERSEDED_BY)?.is_none();
+        match n.policy {
+            DedupPolicy::Merge if live => {
+                txn.aggregate(t, &n.row, PEAK, IMPORTANCE, importance)
+                    .incr(t, &n.row, STATS, USES, 1);
+                if let Some(src) = &m.source {
+                    self.add_source(txn, &n.row, src, now)?;
+                }
+                Ok(Remembered::Merged(id()?))
+            }
+            DedupPolicy::Link if live => {
+                let r = self.insert(txn, ns, m, rid, now, importance, dedup)?;
+                let w = n.similarity.clamp(0.0, 1.0);
+                write_link(txn, t, &r.id().row(), &n.row, LinkType::SIMILAR_TO, w);
+                Ok(r)
+            }
+            _ => self.insert(txn, ns, m, rid, now, importance, dedup),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1264,13 +1343,26 @@ fn verify(
 
 /// Marks the memory at `old` superseded by the one at `new` since `valid_to`, with the
 /// `new → old` link: the writes [`Store::supersede`] makes once its reads pass.
-pub(crate) fn supersede_in(txn: &mut Transaction, t: &Table, old: &[u8], new: &[u8], valid_to: u64) {
+pub(crate) fn supersede_in(
+    txn: &mut Transaction,
+    t: &Table,
+    old: &[u8],
+    new: &[u8],
+    valid_to: u64,
+) {
     txn.put(t, old, META, SUPERSEDED_BY, new)
         .put_u64(t, old, META, VALID_TO, valid_to);
     write_link(txn, t, new, old, LinkType::SUPERSEDES, 1.0);
 }
 
-pub(crate) fn write_link(txn: &mut Transaction, t: &Table, from: &[u8], to: &[u8], ty: LinkType, w: f32) {
+pub(crate) fn write_link(
+    txn: &mut Transaction,
+    t: &Table,
+    from: &[u8],
+    to: &[u8],
+    ty: LinkType,
+    w: f32,
+) {
     let mut v = [0u8; 5];
     v[0] = ty.0;
     v[1..].copy_from_slice(&w.to_le_bytes());

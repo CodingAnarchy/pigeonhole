@@ -4187,3 +4187,20 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - the persisted policy;
   - the application's forgetter and the crate's thread.
   - Mutations of the transaction's reads and of protection were caught.
+
+**T3 (#1337).** Consolidation and near-duplicate dedup, as revision 2 §4, with cli692's API (c6589818220) and simp724's C1–C4 on #1337:
+- **The commit:** one transaction per group, skipped (never retried) on a change or a conflict.
+  - **The re-reads:** content, `consolidated`, `superseded_by` and `pinned`, plus the `sources` whose union moves to the new memories (C1).
+  - **A summary that merges into one of the group's own memories** makes that memory the result (C2).
+  - **Under `Delete`:** a deleted memory's superseded memories move to the summary (C3).
+- **Transaction reads are at the snapshot,** so the commit folds duplicate returned texts itself, and removes the links a result made to a memory it deletes.
+- **The policy is per call, with no thread.** A consolidator `Err` stops the pass with `Error::Consolidate { error, pass }`.
+- **Near dedup** is a persisted `NearDedup`, checked before `remember`'s transaction. `remember_in` doesn't check; `near_duplicate` is there for its callers.
+- **Tests:**
+  - two consolidations of one group: nested, so the second finds its group taken, and two threads, one committing and the other skipping;
+  - the three source policies, with nothing returned and with a summary equal to a source;
+  - grouping by session, similarity, age, pinning and limits;
+  - a consolidator's failure, the refusals, and the folding of duplicate texts;
+  - near dedup's policies, threshold, superseded match and exact precedence, the setting, `near_duplicate` and `remember_in`.
+  - Each ends in `verify`.
+  - Mutations of the `consolidated` re-read, the C3 re-pointing, the link removal under `Delete` and the folding were caught.

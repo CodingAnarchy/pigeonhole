@@ -52,6 +52,8 @@ pub(crate) const MODEL_ELEMENT: &[u8] = b"model_element";
 pub(crate) const TEXT_INDEX: &[u8] = b"text_index";
 /// `G`'s forget policy (T2), when the store has one.
 pub(crate) const FORGET: &[u8] = b"forget";
+/// `G`: the near-duplicate dedup setting (T3).
+pub(crate) const NEAR_DEDUP: &[u8] = b"near_dedup";
 
 pub(crate) const LAYOUT_VERSION: u64 = 1;
 

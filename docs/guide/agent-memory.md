@@ -111,5 +111,61 @@ assert_eq!(pass.deleted, 1);
 - **Failures and closing:** a failed pass is retried after 5 s, doubling with each failure in a row up to the policy's interval. `Pigeonhole::close` doesn't wait for a pass: the deletion in flight fails with `Closed` and is dropped whole, so nothing is left half-forgotten. To let a pass finish, drop the `Store` handles before closing.
 - **Forgotten memories are deletes,** so the change feed shows them.
 
+## Consolidation
+Consolidation folds episodic memories into semantic ones. The summariser is yours, behind the `Consolidator` trait. It's called outside any transaction, so it can call a model.
+
+```rust
+# use pigeonhole::*;
+use std::time::Duration;
+use pigeonhole_memory::{
+    ConsolidatePolicy, Consolidator, Kind, Memory, SourcePolicy, Store, StoreOptions, StoredMemory,
+};
+struct Summarise;
+impl Consolidator for Summarise {
+    fn consolidate(
+        &self,
+        group: &[StoredMemory],
+    ) -> Result<Vec<Memory>, Box<dyn std::error::Error + Send + Sync>> {
+        // A model call in practice.
+        let text = group.iter().map(|m| m.text.as_str()).collect::<Vec<_>>().join(" ");
+        Ok(vec![Memory::new(format!("Summary: {text}")).importance(0.8)])
+    }
+}
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let store = Store::create(&db, "agents", StoreOptions::new())?;
+store.remember("agent:alice", Memory::new("Standup moved to 10.").session("s1"))?;
+store.remember("agent:alice", Memory::new("Standup is in room B.").session("s1"))?;
+let policy = ConsolidatePolicy::new().min_age(Duration::ZERO).sources(SourcePolicy::Keep);
+let pass = store.consolidate("agent:alice", &Summarise).policy(&policy).run()?;
+assert_eq!((pass.committed, pass.created), (1, 1));
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Groups:** episodic memories at least `min_age` old (an hour by default) that no consolidation took in.
+  - They're grouped by session first.
+  - With an embedding model, a memory then joins a group when its cosine to the group's oldest memory is at least `group_similarity` (0.8).
+  - A memory with nothing like it is left alone, unless `min_group(1)` asks for rewrites.
+- **Each group commits in its own transaction:**
+  - the new memories, with `DERIVED_FROM` links to the group and the group's sources;
+  - then the source policy: `Keep` (the default) marks the group consolidated, `Delete` deletes it, and `Supersede` supersedes it by the first new memory.
+- **Recall and consolidated memories:** recall weights a consolidated memory's importance by `Weights::consolidated` (0.5), so its summary ranks ahead of it.
+- **Concurrent passes:** a group that changed while the consolidator ran is skipped, not retried, and so is one another pass took. The next pass regroups. `ConsolidatePass` counts both.
+- **A summary equal to one of its sources** merges into that source, which becomes the summary.
+- **A consolidator error** stops the pass with `Error::Consolidate { error, pass }`. The groups before it stay committed.
+- **When to run it:** on demand. Unlike forgetting, there's no thread.
+
+## Near duplicates
+With an embedding model, a store can catch near duplicates as well as exact ones. Turn it on with `StoreOptions::near_dedup(NearDedup::new(0.95))`, or later with `set_near_dedup`. `remember` then looks up the nearest live memory first.
+- **Policies, for a match at or above the similarity:**
+  - `Link` (the default) writes the memory with a `SIMILAR_TO` link to the match;
+  - `Skip` writes nothing and returns `Remembered::Similar(id)`;
+  - `Merge` merges into the match as an exact duplicate would.
+- **The check runs outside the transaction,** so two near duplicates written at once can both land. Consolidation folds them later.
+- **`remember_in` doesn't check:** call `near_duplicate(ns, &memory)` before your transaction to do it yourself.
+
 ## Reader processes
 `Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools.
