@@ -98,6 +98,7 @@ mod options;
 mod read;
 mod recovery;
 mod retry;
+mod set;
 mod table;
 mod vector;
 mod write;
@@ -180,6 +181,7 @@ pub use read::{
 };
 pub use recovery::RecoveryStats;
 pub use retry::RetryPolicy;
+pub use set::{SetIntersection, SetIter, SetRef};
 pub use table::{ReadTable, Table, TableBuilder};
 pub use vector::{Element, Metric, Vector, VectorRef, VectorSpec};
 pub use write::{CommitInfo, CommitTicket, Durability, RowMutation, Transaction, WriteBatch};

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use pigeonhole_compaction::{
     Bitwise, BloomUnion, Buckets, ExactF64, F64Extreme, HllUnion, I64Add, I64Max, I64Min,
-    MergeOperator, MergeRegistry,
+    MergeOperator, MergeRegistry, SetOps,
 };
 use pigeonhole_format::hash::{FastMap, FastSet};
 use pigeonhole_format::manifest::{Edit, FamilyKind, FamilyOptions, SstMeta};
@@ -43,6 +43,8 @@ pub(crate) const F64_HISTOGRAM: &str = Buckets::HISTOGRAM;
 pub(crate) const F64_QUANTILES: &str = Buckets::QUANTILES;
 /// Name of the built-in bloom union (`pigeonhole_compaction::BloomUnion`, D298).
 pub(crate) const BLOOM: &str = BloomUnion::NAME;
+/// Name of the built-in roaring set operator (`pigeonhole_compaction::SetOps`, D298).
+pub(crate) const SET: &str = SetOps::NAME;
 
 /// The operator an aggregate family of `kind` folds with, by name (D179, D294); `None` for
 /// a standard family, whose operator is its own choice.
@@ -63,6 +65,7 @@ pub(crate) fn aggregate_operator(kind: FamilyKind) -> Option<&'static str> {
         FamilyKind::Histogram => Some(F64_HISTOGRAM),
         FamilyKind::Quantiles => Some(F64_QUANTILES),
         FamilyKind::Bloom => Some(BLOOM),
+        FamilyKind::Set => Some(SET),
     }
 }
 
@@ -85,6 +88,7 @@ pub(crate) fn builtin_kind(name: &str) -> Option<FamilyKind> {
         F64_HISTOGRAM => FamilyKind::Histogram,
         F64_QUANTILES => FamilyKind::Quantiles,
         BLOOM => FamilyKind::Bloom,
+        SET => FamilyKind::Set,
         _ => return None,
     })
 }
@@ -94,7 +98,7 @@ pub(crate) fn builtin_kind(name: &str) -> Option<FamilyKind> {
 /// list of its own, apart from [`FamilyKind::values_stay_inline`]: one asks whether a value
 /// may leave the SST, this whether the operator is handed the value behind a pointer.
 pub(crate) fn folds_separated_bases(kind: FamilyKind) -> bool {
-    matches!(kind, FamilyKind::Bloom)
+    matches!(kind, FamilyKind::Bloom | FamilyKind::Set)
 }
 
 /// The tags `kind`'s `kind_params` define (D298): a histogram's bounds, a quantile sketch's
@@ -112,7 +116,8 @@ pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
         | FamilyKind::MinF64
         | FamilyKind::MaxF64
         | FamilyKind::SumF64
-        | FamilyKind::MeanVar => &[],
+        | FamilyKind::MeanVar
+        | FamilyKind::Set => &[],
         FamilyKind::Histogram => &[pigeonhole_format::buckets::TAG_BOUNDS],
         FamilyKind::Quantiles => &[
             pigeonhole_format::buckets::TAG_MANTISSA_BITS,
@@ -171,6 +176,7 @@ fn fixed_operator(kind: FamilyKind) -> Option<Arc<dyn MergeOperator>> {
         FamilyKind::MaxF64 => Some(Arc::new(F64Extreme::MAX)),
         FamilyKind::SumF64 => Some(Arc::new(ExactF64::SUM)),
         FamilyKind::MeanVar => Some(Arc::new(ExactF64::MEAN_VAR)),
+        FamilyKind::Set => Some(Arc::new(SetOps)),
         FamilyKind::Histogram | FamilyKind::Quantiles | FamilyKind::Bloom => {
             unreachable!("built from parameters")
         }
@@ -1207,6 +1213,7 @@ mod tests {
             FamilyKind::Histogram,
             FamilyKind::Quantiles,
             FamilyKind::Bloom,
+            FamilyKind::Set,
         ] {
             let separates = !kind.values_stay_inline();
             assert_eq!(

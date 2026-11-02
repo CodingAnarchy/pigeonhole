@@ -47,4 +47,6 @@ pigeonhole-engine = { workspace = true }
 pigeonhole-sst = { workspace = true }
 # The `arrowexport` example measures the Arrow export (#691).
 pigeonhole-arrow = { workspace = true }
+# The `hotagg` and `hubset` examples write roaring sets and set operands (D298).
+pigeonhole-format = { workspace = true }
 

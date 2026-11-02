@@ -336,6 +336,8 @@ impl Workload {
                 };
                 x.to_bits() as i64
             }
+            // A set's inputs add (0 and up) or remove an element (`set_input`).
+            Some(A::Set) => self.rng.below(193) as i64 - 96,
             _ => self.rng.below(2001) as i64 - 1000,
         }
     }

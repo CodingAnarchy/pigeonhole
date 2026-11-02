@@ -48,6 +48,7 @@ pub pigeonhole::Aggregation::MeanVar
 pub pigeonhole::Aggregation::Min
 pub pigeonhole::Aggregation::MinF64
 pub pigeonhole::Aggregation::Quantiles(pigeonhole::QuantileParams)
+pub pigeonhole::Aggregation::Set
 pub pigeonhole::Aggregation::Sum
 pub pigeonhole::Aggregation::SumF64
 #[non_exhaustive] pub enum pigeonhole::Compaction
@@ -193,6 +194,7 @@ pub struct pigeonhole::Cell
 impl pigeonhole::Cell
 pub fn pigeonhole::Cell::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::Cell::as_i64(&self) -> core::option::Option<i64>
+pub fn pigeonhole::Cell::as_set(&self) -> core::option::Option<pigeonhole::SetRef<'_>>
 pub fn pigeonhole::Cell::as_u64(&self) -> core::option::Option<u64>
 pub fn pigeonhole::Cell::as_vector(&self) -> core::option::Option<pigeonhole::VectorRef<'_>>
 pub fn pigeonhole::Cell::bloom_contains(&self, i64) -> core::option::Option<bool>
@@ -215,6 +217,7 @@ pub struct pigeonhole::CellRef<'a>
 impl<'a> pigeonhole::CellRef<'a>
 pub fn pigeonhole::CellRef<'a>::as_f64(&self) -> core::option::Option<f64>
 pub fn pigeonhole::CellRef<'a>::as_i64(&self) -> core::option::Option<i64>
+pub fn pigeonhole::CellRef<'a>::as_set(&self) -> core::option::Option<pigeonhole::SetRef<'_>>
 pub fn pigeonhole::CellRef<'a>::as_u64(&self) -> core::option::Option<u64>
 pub fn pigeonhole::CellRef<'a>::as_vector(&self) -> core::option::Option<pigeonhole::VectorRef<'_>>
 pub fn pigeonhole::CellRef<'a>::bloom_contains(&self, i64) -> core::option::Option<bool>
@@ -654,6 +657,10 @@ pub fn pigeonhole::RowMutation<'_>::put_vector_f32(self, &str, &[u8], &[f32]) ->
 pub fn pigeonhole::RowMutation<'_>::put_vector_f32_at(self, &str, &[u8], u64, &[f32]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_i8(self, &str, &[u8], &[i8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_i8_at(self, &str, &[u8], u64, &[i8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::set_add(self, &str, &[u8], u32) -> Self
+pub fn pigeonhole::RowMutation<'_>::set_add_at(self, &str, &[u8], u64, u32) -> Self
+pub fn pigeonhole::RowMutation<'_>::set_remove(self, &str, &[u8], u32) -> Self
+pub fn pigeonhole::RowMutation<'_>::set_remove_at(self, &str, &[u8], u64, u32) -> Self
 impl pigeonhole::RowMutation<'_>
 pub fn pigeonhole::RowMutation<'_>::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
 impl pigeonhole::RowMutation<'_>
@@ -734,6 +741,25 @@ impl pigeonhole::ScanPosition
 pub fn pigeonhole::ScanPosition::from_bytes(&[u8]) -> pigeonhole::Result<Self>
 pub fn pigeonhole::ScanPosition::row(&self) -> &[u8]
 pub fn pigeonhole::ScanPosition::to_bytes(&self) -> alloc::vec::Vec<u8>
+pub struct pigeonhole::SetIntersection<'a, 'b>(_)
+impl core::iter::traits::iterator::Iterator for pigeonhole::SetIntersection<'_, '_>
+pub type pigeonhole::SetIntersection<'_, '_>::Item = u32
+pub fn pigeonhole::SetIntersection<'_, '_>::next(&mut self) -> core::option::Option<u32>
+pub struct pigeonhole::SetIter<'a>(_)
+impl core::iter::traits::iterator::Iterator for pigeonhole::SetIter<'_>
+pub type pigeonhole::SetIter<'_>::Item = u32
+pub fn pigeonhole::SetIter<'_>::next(&mut self) -> core::option::Option<u32>
+pub struct pigeonhole::SetRef<'a>(_)
+impl<'a> pigeonhole::SetRef<'a>
+pub fn pigeonhole::SetRef<'a>::as_bytes(&self) -> &'a [u8]
+pub fn pigeonhole::SetRef<'a>::contains(&self, u32) -> bool
+pub fn pigeonhole::SetRef<'a>::from_bytes(&'a [u8]) -> core::option::Option<Self>
+pub fn pigeonhole::SetRef<'a>::intersection<'b>(&self, &pigeonhole::SetRef<'b>) -> pigeonhole::SetIntersection<'a, 'b>
+pub fn pigeonhole::SetRef<'a>::intersection_len(&self, &pigeonhole::SetRef<'_>) -> u64
+pub fn pigeonhole::SetRef<'a>::is_empty(&self) -> bool
+pub fn pigeonhole::SetRef<'a>::iter(&self) -> pigeonhole::SetIter<'a>
+pub fn pigeonhole::SetRef<'a>::len(&self) -> u64
+pub fn pigeonhole::SetRef<'a>::union_len(&self, &pigeonhole::SetRef<'_>) -> u64
 pub struct pigeonhole::Shard
 impl pigeonhole::Shard
 pub fn pigeonhole::Shard::closed(&self) -> core::option::Option<pigeonhole::Result<()>>
@@ -812,6 +838,10 @@ pub fn pigeonhole::Transaction::put_vector_f32(&mut self, &pigeonhole::Table, &[
 pub fn pigeonhole::Transaction::put_vector_f32_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[f32]) -> &mut Self
 pub fn pigeonhole::Transaction::put_vector_i8(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[i8]) -> &mut Self
 pub fn pigeonhole::Transaction::put_vector_i8_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[i8]) -> &mut Self
+pub fn pigeonhole::Transaction::set_add(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u32) -> &mut Self
+pub fn pigeonhole::Transaction::set_add_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u32) -> &mut Self
+pub fn pigeonhole::Transaction::set_remove(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u32) -> &mut Self
+pub fn pigeonhole::Transaction::set_remove_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u32) -> &mut Self
 impl pigeonhole::Transaction
 pub fn pigeonhole::Transaction::commit_async(self) -> pigeonhole::nonblocking::TransactionCommitFuture
 pub fn pigeonhole::Transaction::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::TransactionCommitFuture
@@ -916,6 +946,10 @@ pub fn pigeonhole::WriteBatch::put_vector_f32(&mut self, &pigeonhole::Table, &[u
 pub fn pigeonhole::WriteBatch::put_vector_f32_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[f32]) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_vector_i8(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[i8]) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_vector_i8_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[i8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::set_add(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u32) -> &mut Self
+pub fn pigeonhole::WriteBatch::set_add_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u32) -> &mut Self
+pub fn pigeonhole::WriteBatch::set_remove(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u32) -> &mut Self
+pub fn pigeonhole::WriteBatch::set_remove_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u32) -> &mut Self
 impl pigeonhole::WriteBatch
 pub fn pigeonhole::WriteBatch::commit_async(self) -> pigeonhole::nonblocking::CommitFuture
 pub fn pigeonhole::WriteBatch::commit_with_async(self, pigeonhole::Durability) -> pigeonhole::nonblocking::CommitFuture

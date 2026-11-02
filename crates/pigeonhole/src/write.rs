@@ -507,6 +507,17 @@ impl<'t> RowMutation<'t> {
     }
 }
 
+/// The set operand adding or removing `x` (`pigeonhole_format::roaring`, D298).
+fn set_operand(x: u32, add: bool) -> Vec<u8> {
+    let mut v = Vec::with_capacity(32);
+    if add {
+        pigeonhole_format::roaring::encode_operand(&mut v, &[x], &[]);
+    } else {
+        pigeonhole_format::roaring::encode_operand(&mut v, &[], &[x]);
+    }
+    v
+}
+
 impl RowMutation<'_> {
     /// Puts bytes at the commit timestamp.
     pub fn put(self, family: &str, qualifier: &[u8], value: &[u8]) -> Self {
@@ -717,6 +728,57 @@ impl RowMutation<'_> {
             qualifier,
             value.len(),
             |b, t, f, row| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(value)),
+        )
+    }
+
+    /// Adds `x` to the set in the cell of a set family
+    /// ([`Aggregation::Set`](crate::Aggregation::Set); D298). Adds and removes apply in
+    /// commit order, so a later [`set_remove`](Self::set_remove) of `x` undoes this. Other
+    /// families fail with `InvalidArgument`.
+    pub fn set_add(self, family: &str, qualifier: &[u8], x: u32) -> Self {
+        let operand = set_operand(x, true);
+        self.op_as(
+            Some(Operand::Set),
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f, row| b.merge(t, f, row, qualifier, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`set_add`](Self::set_add) to the bucket at timestamp `ts`.
+    pub fn set_add_at(self, family: &str, qualifier: &[u8], ts: u64, x: u32) -> Self {
+        let operand = set_operand(x, true);
+        self.op_as(
+            Some(Operand::Set),
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f, row| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// Removes `x` from the set in the cell of a set family (a no-op if it is not there).
+    pub fn set_remove(self, family: &str, qualifier: &[u8], x: u32) -> Self {
+        let operand = set_operand(x, false);
+        self.op_as(
+            Some(Operand::Set),
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f, row| b.merge(t, f, row, qualifier, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`set_remove`](Self::set_remove) at the bucket at timestamp `ts`.
+    pub fn set_remove_at(self, family: &str, qualifier: &[u8], ts: u64, x: u32) -> Self {
+        let operand = set_operand(x, false);
+        self.op_as(
+            Some(Operand::Set),
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f, row| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(&operand)),
         )
     }
 
@@ -1404,6 +1466,92 @@ impl WriteBatch {
         )
     }
 
+    /// [`RowMutation::set_add`].
+    pub fn set_add(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, true);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`RowMutation::set_add_at`].
+    pub fn set_add_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, true);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`RowMutation::set_remove`].
+    pub fn set_remove(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, false);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`RowMutation::set_remove_at`].
+    pub fn set_remove_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, false);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(&operand)),
+        )
+    }
+
     /// Writes an untyped operand for the family's merge operator (custom operators, Phase 2).
     /// The built-in `i64` add takes typed operands only: use `incr`, or the read fails with
     /// [`ErrorCode::MergeFailed`](crate::ErrorCode::MergeFailed).
@@ -2052,6 +2200,92 @@ impl Transaction {
             qualifier,
             value.len(),
             |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(value)),
+        )
+    }
+
+    /// [`RowMutation::set_add`].
+    pub fn set_add(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, true);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`RowMutation::set_add_at`].
+    pub fn set_add_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, true);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`RowMutation::set_remove`].
+    pub fn set_remove(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, false);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge(t, f, row, qualifier, ValueRef::Bytes(&operand)),
+        )
+    }
+
+    /// [`RowMutation::set_remove_at`].
+    pub fn set_remove_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        x: u32,
+    ) -> &mut Self {
+        let operand = set_operand(x, false);
+        self.op_as(
+            Some(Operand::Set),
+            table,
+            row,
+            family,
+            qualifier,
+            operand.len(),
+            |b, t, f| b.merge_at(t, f, row, qualifier, ts, ValueRef::Bytes(&operand)),
         )
     }
 

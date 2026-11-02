@@ -35,6 +35,7 @@ pub(crate) fn family_json(f: &FamilyInfo) -> Map<String, Value> {
             Aggregation::Histogram(_) => "histogram",
             Aggregation::Quantiles(_) => "quantiles",
             Aggregation::Bloom(_) => "bloom",
+            Aggregation::Set => "set",
             _ => "unknown",
         }),
         // A histogram's bounds, a quantile sketch's parameters (D298).
@@ -135,6 +136,7 @@ pub(crate) fn family_from_json(v: &Value) -> Result<(String, Family), String> {
                 BloomParams::new(bits, hashes).map_err(|e| format!("family {name}: {e}"))?;
             Family::aggregate(Aggregation::Bloom(params))
         }
+        (Some("set"), _) => Family::aggregate(Aggregation::Set),
         (Some(other), _) => return Err(format!("family {name}: unknown aggregation {other:?}")),
         (None, _) => Family::default(),
     };

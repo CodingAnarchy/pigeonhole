@@ -84,6 +84,7 @@ mod room_group;
 mod row_cache_write_through;
 mod scalar_aggregates;
 mod scan_readahead_limit;
+mod set_aggregates;
 mod shrink;
 mod smoke;
 mod snapshot_room;

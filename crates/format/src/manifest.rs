@@ -284,6 +284,10 @@ pub enum FamilyKind {
     /// the bits and hashes its `kind_params` give ([`crate::bloom`], FORMAT §3.6). Needs
     /// [`INCOMPAT_AGGREGATES`].
     Bloom = 14,
+    /// A roaring set family of `u32`s (D298): inputs add or remove elements, as operands
+    /// `(A, R)` folded in commit order ([`crate::roaring`], FORMAT §3.8). Its values may be
+    /// separated into blob files. Needs [`INCOMPAT_AGGREGATES`].
+    Set = 15,
     /// A vector family (D303, #490 B): every value is a vector (value tag `0x04`) of the
     /// element type, dimension and metric its `kind_params` give ([`crate::vector`]). Not an
     /// aggregate: cells version and delete as a `Standard` family's. Needs
@@ -320,6 +324,7 @@ impl FamilyKind {
                 | FamilyKind::Histogram
                 | FamilyKind::Quantiles
                 | FamilyKind::Bloom
+                | FamilyKind::Set
         )
     }
 
@@ -349,7 +354,8 @@ impl FamilyKind {
             | FamilyKind::Histogram
             | FamilyKind::Quantiles
             | FamilyKind::Bloom
-            | FamilyKind::Vector => INCOMPAT_AGGREGATES,
+            | FamilyKind::Vector
+            | FamilyKind::Set => INCOMPAT_AGGREGATES,
         }
     }
 
@@ -631,6 +637,7 @@ impl FamilyOptions {
                     12 => FamilyKind::Histogram,
                     13 => FamilyKind::Quantiles,
                     14 => FamilyKind::Bloom,
+                    15 => FamilyKind::Set,
                     16 => FamilyKind::Vector,
                     k => {
                         return Err(Error::UnsupportedFeature {
@@ -1185,6 +1192,7 @@ mod encode_tests {
             FamilyKind::Histogram,
             FamilyKind::Quantiles,
             FamilyKind::Bloom,
+            FamilyKind::Set,
             FamilyKind::Vector,
         ] {
             let plain = FamilyOptions::default().kind(kind);
