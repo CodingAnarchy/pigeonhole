@@ -21,9 +21,10 @@
   - **Writes:**
     - `remember(ns, Memory) -> Result<Remembered>` and `remember_in(txn, ns, Memory)`;
     - `delete(&id) -> Result<bool>` and `delete_in(txn, &id)`;
-    - `link(&from, &to, LinkType, f32)`;
-    - `supersede(&old, &new)`;
-    - `mark_used(&[MemoryId]) -> Result<usize>`.
+    - `link(&from, &to, LinkType, f32)`, with the weight from 0 to 1 (anything else, NaN included, is `InvalidArgument`);
+    - `supersede(&old, &new)`: a memory is superseded once. `old`'s `superseded_by` is read in the transaction, so two concurrent supersedes conflict. The same `new` again does nothing; another is `InvalidArgument` naming the current one;
+    - `mark_used(&[MemoryId]) -> Result<Marked>`.
+  - **Deleting a superseder** clears the superseded memory's `superseded_by` and `valid_to`, read in the transaction, so that memory is recalled again (simp724's G1 on #1362).
   - **Reads:** `get(&id) -> Result<Option<StoredMemory>>`, `verify() -> Result<StoreStats>` and `embedding_model()`.
 - **`Memory`** is a `#[non_exhaustive]` builder:
   - `Memory::new(text)`, with `.embedding(Vec<f32>)`, `.kind(Kind)`, `.importance(f64)` (clamped to 0–1, default 0.5), `.source(id)`, `.session(s)`, `.link(MemoryId, LinkType, f32)` and `.pinned(bool)`.
@@ -32,16 +33,23 @@
   - Links stay within the memory's namespace.
 - **The small types:**
   - **`Kind`** (`#[non_exhaustive]`, default `Episodic`): `Episodic`, `Semantic`, `Procedural`.
-  - **`LinkType(pub u8)`:** values below 16 are the crate's (`DERIVED_FROM` = 1, `SUPERSEDES` = 2, `SIMILAR_TO` = 3); the application's are 16 and up.
+  - **`LinkType`:** a `u8` newtype with a private field (cli692 on #1362).
+    - The crate's types are `DERIVED_FROM` = 1, `SUPERSEDES` = 2 and `SIMILAR_TO` = 3.
+    - `LinkType::custom(n)` gives the application's, and refuses `n` below `FIRST_CUSTOM` (16) with `InvalidArgument`. `get()` returns the value.
+    - Reads return whatever is stored, a reserved value this build doesn't name included.
+  - **`Link`** (`#[non_exhaustive]`): `id`, `ty` and `weight`.
+  - **`Source`** (`#[non_exhaustive]`): `name` and `at_us`.
+  - **`Marked`** (`#[non_exhaustive]`): `marked`, and `missing` (the deleted ids, never resurrected).
   - **`Remembered`** (`#[non_exhaustive]`): `New(MemoryId)` or `Merged(MemoryId)`, with `id()`.
-- **`StoredMemory`** (`#[non_exhaustive]`): `id`, `text`, `kind`, `importance`, `uses`, `last_used_us`, `session`, `pinned`, `superseded_by`, `sources`, `links`, `backlinks`, `embedding`.
-- **`StoreStats`** (`#[non_exhaustive]`): `memories`, `no_content`, `stale_dedup`, `broken_links`, `missing_embeddings`, `text_index_inconsistent`, and `is_consistent()`.
+- **`StoredMemory`** (`#[non_exhaustive]`): `id`, `text`, `kind`, `importance`, `uses`, `last_used_us`, `session`, `pinned`, `superseded_by`, `sources: Vec<Source>`, `links: Vec<Link>`, `backlinks: Vec<Link>` and `embedding`.
+- **`StoreStats`** (`#[non_exhaustive]`): `memories`, `no_content`, `stale_dedup`, `broken_links`, `missing_embeddings`, `dangling_superseded` (a `superseded_by` naming a memory that's gone), `text_index_inconsistent`, and `is_consistent()`.
 - **`MemoryId`** (`Clone`, `Eq`, `Ord`, `Hash`) has `namespace()`, `created_us()`, `to_bytes()`/`from_bytes()`, and `Display`/`FromStr`. The forms are frozen:
   - **The byte form:** the namespace's length as `u16` little endian, the namespace, then the 16-byte `rid`.
   - **The text form:** RFC 4648 base32 of the byte form, lowercase, without padding.
   - **The `rid`:** `(u64::MAX − created_µs)` big-endian, then 8 random bytes.
 - **`normalize(&str) -> String`** is dedup's normalisation, frozen: trim, then collapse every run of Unicode whitespace to one space.
-- **`Error`** (`#[non_exhaustive]`): `Db`, `Text` (passed through, including `Busy`), `InvalidArgument`, `NotFound`, `Mismatch` and `Corruption`, with `code()`, `Display`, `std::error::Error` and `From` for both crates' errors.
+- **`Error`** (`#[non_exhaustive]`): `Db`, `Text` (passed through, including `Busy`), `InvalidArgument`, `NotFound`, `Mismatch` and `Corruption`, with `code()`, `Display`, `std::error::Error` and `From` for both crates' errors. `NotFound`'s `code()` is `InvalidArgument`, since there's no general not-found code, and its doc says so.
+- **`Memory::embedding`** into an `F16` or `BF16` model is rounded to the element when stored (to nearest, ties to even).
 
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:

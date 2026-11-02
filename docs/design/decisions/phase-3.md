@@ -4117,6 +4117,10 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - A gone or superseded target inserts as new and repoints the dedup row.
   - A hash collision inserts as new and leaves the dedup row alone.
 - **Links** stay within a namespace. A missing target is `NotFound`, before anything is written.
+- **From the reviews on #1362:**
+  - **simp724:** a memory is superseded once (`superseded_by` is read in the transaction, so concurrent supersedes conflict, and another `new` is refused); deleting a superseder clears `superseded_by` and `valid_to`, so the old memory is recalled again; `verify` counts a dangling `superseded_by`.
+  - **cli692:** `LinkType`'s field is private (`custom(n ≥ 16)` and `get()`); links and sources are `Link` and `Source` structs; `mark_used` returns `Marked { marked, missing }`; a link's weight is 0 to 1.
+  - **New tests:** a merge racing a supersede conflicts, which is what the merge's in-transaction target read is for; two remembers of one new text conflict, and the retry merges.
 - **Tests:**
   - round trips, dedup's cases, links both ways, delete removing links and the dedup row, `mark_used` skipping deleted ids;
   - the model checks (`Mismatch`, wrong dimension, missing embedding, the model-less handle);

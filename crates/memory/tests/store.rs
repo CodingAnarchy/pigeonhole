@@ -56,7 +56,7 @@ fn a_memory_round_trips_with_its_metadata() {
     );
     assert_eq!(m.session.as_deref(), Some("s1"));
     assert_eq!(m.sources.len(), 1);
-    assert_eq!(m.sources[0].0, "call-17");
+    assert_eq!(m.sources[0].name, "call-17");
     assert_eq!(m.embedding.as_deref(), Some(&emb(0.1)[..]));
     // The id's text form round-trips, and created is the rid's time.
     assert_eq!(id.to_string().parse::<MemoryId>().unwrap(), id);
@@ -139,7 +139,11 @@ fn a_deleted_or_superseded_memory_is_not_a_duplicate() {
     let old = store.get(b.id()).unwrap().unwrap();
     assert_eq!(old.superseded_by.as_ref(), Some(newer.id()));
     let n = store.get(newer.id()).unwrap().unwrap();
-    assert_eq!(n.links, vec![(b.id().clone(), LinkType::SUPERSEDES, 1.0)]);
+    assert_eq!(n.links.len(), 1);
+    assert_eq!(
+        (&n.links[0].id, n.links[0].ty, n.links[0].weight),
+        (b.id(), LinkType::SUPERSEDES, 1.0)
+    );
     let again = store
         .remember(ns, Memory::new(text).embedding(emb(0.1)))
         .unwrap();
@@ -164,25 +168,25 @@ fn links_go_both_ways_and_a_delete_removes_both() {
     let b = store
         .remember(
             ns,
-            Memory::new("b")
-                .embedding(emb(0.2))
-                .link(a.id().clone(), LinkType(16), 0.5),
+            Memory::new("b").embedding(emb(0.2)).link(
+                a.id().clone(),
+                LinkType::custom(16).unwrap(),
+                0.5,
+            ),
         )
         .unwrap();
     let c = store
         .remember(ns, Memory::new("c").embedding(emb(0.3)))
         .unwrap();
-    store.link(c.id(), a.id(), LinkType(17), 0.25).unwrap();
+    store
+        .link(c.id(), a.id(), LinkType::custom(17).unwrap(), 0.25)
+        .unwrap();
     let am = store.get(a.id()).unwrap().unwrap();
-    let mut back: Vec<_> = am
-        .backlinks
-        .iter()
-        .map(|(id, t, _)| (id.clone(), *t))
-        .collect();
+    let mut back: Vec<_> = am.backlinks.iter().map(|l| (l.id.clone(), l.ty)).collect();
     back.sort();
     let mut want = vec![
-        (b.id().clone(), LinkType(16)),
-        (c.id().clone(), LinkType(17)),
+        (b.id().clone(), LinkType::custom(16).unwrap()),
+        (c.id().clone(), LinkType::custom(17).unwrap()),
     ];
     want.sort();
     assert_eq!(back, want);
@@ -194,13 +198,15 @@ fn links_go_both_ways_and_a_delete_removes_both() {
     store.delete(gone.id()).unwrap();
     let r = store.remember(
         ns,
-        Memory::new("d")
-            .embedding(emb(0.5))
-            .link(gone.id().clone(), LinkType(16), 1.0),
+        Memory::new("d").embedding(emb(0.5)).link(
+            gone.id().clone(),
+            LinkType::custom(16).unwrap(),
+            1.0,
+        ),
     );
     assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
     assert!(matches!(
-        store.link(c.id(), gone.id(), LinkType(16), 1.0),
+        store.link(c.id(), gone.id(), LinkType::custom(16).unwrap(), 1.0),
         Err(Error::NotFound(_))
     ));
     // Deleting a removes b's and c's links to it.
@@ -223,18 +229,15 @@ fn mark_used_counts_live_memories_and_skips_deleted_ones() {
     let b = store
         .remember(ns, Memory::new("b").embedding(emb(0.2)))
         .unwrap();
-    assert_eq!(
-        store
-            .mark_used(&[a.id().clone(), a.id().clone(), b.id().clone()])
-            .unwrap(),
-        2
-    );
+    let m = store
+        .mark_used(&[a.id().clone(), a.id().clone(), b.id().clone()])
+        .unwrap();
+    assert_eq!((m.marked, m.missing.len()), (2, 0));
     store.delete(b.id()).unwrap();
     // S3: mark_used after a delete skips it and never resurrects the row.
-    assert_eq!(
-        store.mark_used(&[a.id().clone(), b.id().clone()]).unwrap(),
-        1
-    );
+    let m = store.mark_used(&[a.id().clone(), b.id().clone()]).unwrap();
+    assert_eq!(m.marked, 1);
+    assert_eq!(m.missing, vec![b.id().clone()]);
     assert_eq!(store.get(b.id()).unwrap(), None);
     let m = store.get(a.id()).unwrap().unwrap();
     assert_eq!(m.uses, 2);
@@ -276,8 +279,9 @@ fn the_pinned_model_is_checked_at_open_and_on_every_embedding() {
         bare.supersede(a.id(), b.id()),
         Err(Error::InvalidArgument(_))
     ));
-    bare.link(a.id(), b.id(), LinkType(16), 1.0).unwrap();
-    assert_eq!(bare.mark_used(&[a.id().clone()]).unwrap(), 1);
+    bare.link(a.id(), b.id(), LinkType::custom(16).unwrap(), 1.0)
+        .unwrap();
+    assert_eq!(bare.mark_used(&[a.id().clone()]).unwrap().marked, 1);
     assert!(bare.delete(b.id()).unwrap());
     check(&bare, "a model-less handle");
     // A store without a model takes no embeddings, and opens only without one.
@@ -332,9 +336,11 @@ fn a_write_given_up_in_the_callers_transaction_leaves_nothing() {
         store.remember_in(
             txn,
             ns,
-            Memory::new("b")
-                .embedding(emb(0.2))
-                .link(a.id().clone(), LinkType(16), 1.0),
+            Memory::new("b").embedding(emb(0.2)).link(
+                a.id().clone(),
+                LinkType::custom(16).unwrap(),
+                1.0,
+            ),
         )?;
         Err::<(), _>(Error::InvalidArgument("the application gave up".into()))
     });
@@ -389,13 +395,148 @@ fn a_link_racing_a_delete_of_its_target_conflicts() {
         .remember_in(
             &mut txn,
             ns,
-            Memory::new("b")
-                .embedding(emb(0.2))
-                .link(a.id().clone(), LinkType(16), 1.0),
+            Memory::new("b").embedding(emb(0.2)).link(
+                a.id().clone(),
+                LinkType::custom(16).unwrap(),
+                1.0,
+            ),
         )
         .unwrap();
     store.delete(a.id()).unwrap();
     assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
     check(&store, "link racing a delete");
+    db.close().unwrap();
+}
+
+#[test]
+fn a_merge_racing_a_supersede_of_its_target_conflicts_then_inserts_as_new() {
+    // simp724 on #1362: supersede writes superseded_by without touching the dedup row, so
+    // only the merge's in-transaction read of the target (M1) makes the two conflict.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = pinned(&db);
+    let ns = "agent:alice";
+    let text = "The window is Tuesday.";
+    let a = store
+        .remember(ns, Memory::new(text).embedding(emb(0.1)))
+        .unwrap();
+    let b = store
+        .remember(
+            ns,
+            Memory::new("The window is Thursday.").embedding(emb(0.2)),
+        )
+        .unwrap();
+    let mut txn = db.transaction().unwrap();
+    let r = store
+        .remember_in(&mut txn, ns, Memory::new(text).embedding(emb(0.1)))
+        .unwrap();
+    assert_eq!(r, Remembered::Merged(a.id().clone()));
+    store.supersede(a.id(), b.id()).unwrap();
+    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
+    // The retry sees a superseded target, so the text is a new statement of it.
+    let again = store
+        .remember(ns, Memory::new(text).embedding(emb(0.1)))
+        .unwrap();
+    assert!(matches!(again, Remembered::New(_)));
+    check(&store, "merge racing a supersede");
+    db.close().unwrap();
+}
+
+#[test]
+fn two_remembers_of_one_new_text_conflict_and_the_retry_merges() {
+    // The first reads the dedup row absent; the second commits it; the first's absent-cell
+    // read conflicts, and its retry merges.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = pinned(&db);
+    let ns = "agent:alice";
+    let text = "Both at once.";
+    let mut txn = db.transaction().unwrap();
+    let first = store
+        .remember_in(&mut txn, ns, Memory::new(text).embedding(emb(0.1)))
+        .unwrap();
+    assert!(matches!(first, Remembered::New(_)));
+    let second = store
+        .remember(ns, Memory::new(text).embedding(emb(0.1)))
+        .unwrap();
+    assert!(matches!(second, Remembered::New(_)));
+    assert_eq!(txn.commit().unwrap_err().code(), ErrorCode::Conflict);
+    let retry = store
+        .remember(ns, Memory::new(text).embedding(emb(0.1)))
+        .unwrap();
+    assert_eq!(retry, Remembered::Merged(second.id().clone()));
+    assert_eq!(store.verify().unwrap().memories, 1);
+    check(&store, "two remembers");
+    db.close().unwrap();
+}
+
+#[test]
+fn a_memory_is_superseded_once_and_recalled_again_when_its_superseder_goes() {
+    // simp724's G1 and G2 on #1362.
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = pinned(&db);
+    let ns = "agent:alice";
+    let old = store
+        .remember(ns, Memory::new("v1").embedding(emb(0.1)))
+        .unwrap();
+    let v2 = store
+        .remember(ns, Memory::new("v2").embedding(emb(0.2)))
+        .unwrap();
+    let v3 = store
+        .remember(ns, Memory::new("v3").embedding(emb(0.3)))
+        .unwrap();
+    store.supersede(old.id(), v2.id()).unwrap();
+    // Again with the same superseder: nothing changes.
+    store.supersede(old.id(), v2.id()).unwrap();
+    assert_eq!(store.get(v2.id()).unwrap().unwrap().links.len(), 1);
+    // With another: refused, naming the current one.
+    let e = store.supersede(old.id(), v3.id()).unwrap_err();
+    assert!(
+        matches!(&e, Error::InvalidArgument(m) if m.contains(&v2.id().to_string())),
+        "{e}"
+    );
+    // Two concurrent supersedes of one memory: the second reads superseded_by and refuses
+    // (in a transact retry it would conflict first, then refuse).
+    check(&store, "superseded once");
+    // Deleting the superseder clears old's superseded_by, so old is current again.
+    store.delete(v2.id()).unwrap();
+    let o = store.get(old.id()).unwrap().unwrap();
+    assert_eq!(o.superseded_by, None);
+    check(&store, "superseder deleted");
+    // And it can be superseded again.
+    store.supersede(old.id(), v3.id()).unwrap();
+    check(&store, "superseded again");
+    db.close().unwrap();
+}
+
+#[test]
+fn link_types_and_weights_are_checked() {
+    assert!(LinkType::custom(15).is_err());
+    assert_eq!(LinkType::custom(16).unwrap().get(), 16);
+    assert_eq!(LinkType::SUPERSEDES.get(), 2);
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let store = pinned(&db);
+    let ns = "agent:alice";
+    let a = store
+        .remember(ns, Memory::new("a").embedding(emb(0.1)))
+        .unwrap();
+    let b = store
+        .remember(ns, Memory::new("b").embedding(emb(0.2)))
+        .unwrap();
+    let ty = LinkType::custom(16).unwrap();
+    for w in [-0.1, 1.5, f32::NAN] {
+        assert!(
+            matches!(
+                store.link(a.id(), b.id(), ty, w),
+                Err(Error::InvalidArgument(_))
+            ),
+            "{w}"
+        );
+    }
+    store.link(a.id(), b.id(), ty, 1.0).unwrap();
+    store.link(a.id(), b.id(), ty, 0.0).unwrap();
+    check(&store, "weights");
     db.close().unwrap();
 }

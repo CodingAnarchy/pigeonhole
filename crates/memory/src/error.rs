@@ -20,7 +20,9 @@ pub enum Error {
     /// - a write that adds content through a handle without the store's model;
     /// - a table that isn't a store.
     InvalidArgument(String),
-    /// A link names a memory that doesn't exist.
+    /// A link names a memory that doesn't exist. Its [`code`](Error::code) is
+    /// `InvalidArgument`, since Pigeonhole's codes have no general not-found: match the
+    /// variant to tell it apart.
     NotFound(String),
     /// The store was created with another embedding model than the one the handle names.
     Mismatch(String),

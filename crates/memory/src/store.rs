@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use pigeonhole::{
     Aggregation, Element, Family, Metric, Pigeonhole, RetryPolicy, Table, Transaction, VectorSpec,
 };
-use pigeonhole_text::{Index, IndexOptions, Source};
+use pigeonhole_text::{Index, IndexOptions};
 
 use crate::error::{Error, Result, corrupt};
 use crate::layout::*;
@@ -113,17 +113,72 @@ impl Kind {
 }
 
 /// A link's type: the application's (for example "about" or "follows"), from 16 up; the
-/// crate's own are below 16 (frozen in ICR 0107).
+/// crate's own are below 16 (frozen in ICR 0107). A read returns whatever is stored, a
+/// reserved value this build doesn't name included.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct LinkType(pub u8);
+pub struct LinkType(u8);
 
 impl LinkType {
+    /// The first value an application may use.
+    pub const FIRST_CUSTOM: u8 = 16;
+
+    /// The application's link type `n`: 16 or above (`InvalidArgument` below, where the
+    /// crate's own types live).
+    pub fn custom(n: u8) -> Result<LinkType> {
+        if n < Self::FIRST_CUSTOM {
+            return Err(Error::InvalidArgument(format!(
+                "link types below {} are the crate's; an application's start at {}",
+                Self::FIRST_CUSTOM,
+                Self::FIRST_CUSTOM
+            )));
+        }
+        Ok(LinkType(n))
+    }
+
+    /// The type's stored value.
+    pub fn get(self) -> u8 {
+        self.0
+    }
+
     /// A consolidated memory to each of its sources (T3).
     pub const DERIVED_FROM: LinkType = LinkType(1);
     /// The new memory to the one it supersedes ([`Store::supersede`]).
     pub const SUPERSEDES: LinkType = LinkType(2);
     /// A near duplicate to its match (T3's `DedupPolicy::Link`).
     pub const SIMILAR_TO: LinkType = LinkType(3);
+}
+
+/// A link to or from a memory ([`StoredMemory::links`], [`StoredMemory::backlinks`]).
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct Link {
+    /// The memory at the other end.
+    pub id: MemoryId,
+    /// Its type.
+    pub ty: LinkType,
+    /// Its weight, from 0 to 1.
+    pub weight: f32,
+}
+
+/// A provenance entry ([`StoredMemory::sources`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Source {
+    /// The application's source id (a tool call id, a URL).
+    pub name: String,
+    /// When the store first saw it, in µs.
+    pub at_us: u64,
+}
+
+/// What [`Store::mark_used`] did.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct Marked {
+    /// How many memories were marked used.
+    pub marked: usize,
+    /// The ids that no longer exist (deleted), never resurrected: drop them from a working
+    /// set.
+    pub missing: Vec<MemoryId>,
 }
 
 /// A memory to write ([`Store::remember`]): a builder, so it can grow (D311 §10a).
@@ -155,7 +210,9 @@ impl Memory {
         }
     }
 
-    /// Its embedding, from the store's model. Required in a store pinned to a model.
+    /// Its embedding, from the store's model. Required in a store pinned to a model. Into
+    /// an `F16` or `BF16` model it's rounded to the element when stored (to nearest, ties
+    /// to even, as `put_vector_f32` writes a half family).
     pub fn embedding(mut self, e: impl Into<Vec<f32>>) -> Self {
         self.embedding = Some(e.into());
         self
@@ -185,7 +242,8 @@ impl Memory {
         self
     }
 
-    /// A link to the existing memory `to`, of type `ty`, with weight `weight`.
+    /// A link to the existing memory `to` in the same namespace, of type `ty`, with weight
+    /// `weight` from 0 to 1 (`InvalidArgument` otherwise, NaN included).
     pub fn link(mut self, to: MemoryId, ty: LinkType, weight: f32) -> Self {
         self.links.push((to, ty, weight));
         self
@@ -241,11 +299,11 @@ pub struct StoredMemory {
     /// The memory that superseded it, if one did.
     pub superseded_by: Option<MemoryId>,
     /// Its sources, each with its first-seen time (µs).
-    pub sources: Vec<(String, u64)>,
+    pub sources: Vec<Source>,
     /// Its outgoing links.
-    pub links: Vec<(MemoryId, LinkType, f32)>,
+    pub links: Vec<Link>,
     /// Its incoming links.
-    pub backlinks: Vec<(MemoryId, LinkType, f32)>,
+    pub backlinks: Vec<Link>,
     /// Its embedding, if it has one.
     pub embedding: Option<Vec<f32>>,
 }
@@ -264,6 +322,8 @@ pub struct StoreStats {
     pub broken_links: u64,
     /// Memories missing an embedding in a store pinned to a model.
     pub missing_embeddings: u64,
+    /// Memories whose `superseded_by` names a memory that's gone.
+    pub dangling_superseded: u64,
     /// The text index's own check failed ([`pigeonhole_text::IndexStats::is_consistent`]).
     pub text_index_inconsistent: bool,
 }
@@ -275,6 +335,7 @@ impl StoreStats {
             && self.stale_dedup == 0
             && self.broken_links == 0
             && self.missing_embeddings == 0
+            && self.dangling_superseded == 0
             && !self.text_index_inconsistent
     }
 }
@@ -341,7 +402,7 @@ impl Store {
         let index = Index::create(
             db,
             &index_name(name),
-            Source::new(&table, CONTENT, TEXT),
+            pigeonhole_text::Source::new(&table, CONTENT, TEXT),
             IndexOptions::new().positions(false),
         )?;
         Ok(Store {
@@ -510,11 +571,7 @@ impl Store {
                     to.namespace()
                 )));
             }
-            if !w.is_finite() {
-                return Err(Error::InvalidArgument(
-                    "a link's weight must be finite".into(),
-                ));
-            }
+            check_weight(*w)?;
         }
         Ok(())
     }
@@ -638,13 +695,18 @@ impl Store {
         let Some(text) = txn.get(t, &row, CONTENT, TEXT)?.map(|c| c.value().to_vec()) else {
             return Ok(false);
         };
-        let (links, backlinks) = {
+        let (links, backlinks, superseded) = {
             let r = txn.get_row(t, &row, &[LINKS, BACKLINKS])?;
-            let mut out = (Vec::new(), Vec::new());
+            let mut out = (Vec::new(), Vec::new(), Vec::new());
             if let Some(r) = r {
                 for e in r.iter() {
                     match e.family {
-                        LINKS => out.0.push(e.qualifier.to_vec()),
+                        LINKS => {
+                            if e.cell.value().first() == Some(&LinkType::SUPERSEDES.0) {
+                                out.2.push(e.qualifier.to_vec());
+                            }
+                            out.0.push(e.qualifier.to_vec());
+                        }
                         BACKLINKS => out.1.push(e.qualifier.to_vec()),
                         _ => {}
                     }
@@ -663,6 +725,17 @@ impl Store {
                 .is_some_and(|c| c.value() == row.as_slice())
             {
                 txn.delete_row(t, &d);
+            }
+        }
+        // A memory this one superseded is recalled again (simp724's G1 on #1362): its
+        // `superseded_by`, read here, is cleared if it names this memory.
+        for to in &superseded {
+            if txn
+                .get(t, to, META, SUPERSEDED_BY)?
+                .is_some_and(|c| c.value() == row.as_slice())
+            {
+                txn.delete_column(t, to, META, SUPERSEDED_BY)
+                    .delete_column(t, to, META, VALID_TO);
             }
         }
         for to in &links {
@@ -685,11 +758,7 @@ impl Store {
                 "links stay within a namespace".into(),
             ));
         }
-        if !weight.is_finite() {
-            return Err(Error::InvalidArgument(
-                "a link's weight must be finite".into(),
-            ));
-        }
+        check_weight(weight)?;
         self.db.transact(&RetryPolicy::default(), |txn| {
             let t = &self.table;
             for end in [from, to] {
@@ -706,6 +775,12 @@ impl Store {
     /// Marks `old` superseded by `new` (D311 §2, M4): sets `old`'s `superseded_by` and
     /// `valid_to`, and links `new → old` with [`LinkType::SUPERSEDES`]. Recall leaves `old`
     /// out by default. `NotFound` if either is gone.
+    ///
+    /// A memory is superseded once: `old`'s `superseded_by` is read in the transaction, so
+    /// two concurrent supersedes of it conflict and one retries. Superseding it again with
+    /// the same `new` does nothing; with another, it's `InvalidArgument` naming the current
+    /// one (supersede that one instead: facts change along a chain). Deleting `new` clears
+    /// `old`'s `superseded_by`, so `old` is recalled again.
     pub fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
         if self.model.is_some() && !self.embeds {
             return Err(Error::InvalidArgument(
@@ -727,6 +802,18 @@ impl Store {
                     return Err(Error::NotFound(format!("the memory {end}")));
                 }
             }
+            if let Some(cur) = txn
+                .get(t, &old.row(), META, SUPERSEDED_BY)?
+                .map(|c| c.value().to_vec())
+            {
+                if cur == new.row() {
+                    return Ok(());
+                }
+                let cur = MemoryId::from_row(&cur).ok_or_else(|| corrupt("superseded_by"))?;
+                return Err(Error::InvalidArgument(format!(
+                    "{old} is already superseded by {cur}: supersede that one instead"
+                )));
+            }
             txn.put(t, &old.row(), META, SUPERSEDED_BY, &new.row())
                 .put_u64(t, &old.row(), META, VALID_TO, now);
             write_link(txn, t, &new.row(), &old.row(), LinkType::SUPERSEDES, 1.0);
@@ -737,12 +824,12 @@ impl Store {
 
     /// Counts a use of each of `ids` (M5): reads each one's `content:text`, then writes the
     /// blind `uses` increment and the `last_used` max. A deleted id is skipped, never
-    /// resurrected. Returns how many were marked.
-    pub fn mark_used(&self, ids: &[MemoryId]) -> Result<usize> {
+    /// resurrected, and reported in [`Marked::missing`]. A repeated id counts once.
+    pub fn mark_used(&self, ids: &[MemoryId]) -> Result<Marked> {
         let now = now_us() as i64;
-        let (n, _) = self.db.transact(&RetryPolicy::default(), |txn| {
+        let (m, _) = self.db.transact(&RetryPolicy::default(), |txn| {
             let t = &self.table;
-            let mut n = 0;
+            let mut m = Marked::default();
             let mut seen = BTreeSet::new();
             for id in ids {
                 let row = id.row();
@@ -750,15 +837,16 @@ impl Store {
                     continue;
                 }
                 if txn.get(t, &row, CONTENT, TEXT)?.is_none() {
+                    m.missing.push(id.clone());
                     continue;
                 }
                 txn.incr(t, &row, STATS, USES, 1)
                     .aggregate(t, &row, PEAK, LAST_USED, now);
-                n += 1;
+                m.marked += 1;
             }
-            Ok::<_, Error>(n)
+            Ok::<_, Error>(m)
         })?;
-        Ok(n)
+        Ok(m)
     }
 
     /// Checks the store against itself and its text index, at one snapshot (D311 T1):
@@ -773,6 +861,7 @@ impl Store {
         let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
         let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
         let mut dedups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut superseded_by: Vec<Vec<u8>> = Vec::new();
         for row in t.scan_prefix(b"").snapshot(&s).iter()? {
             let row = row?;
             let key = row.key().to_vec();
@@ -792,6 +881,9 @@ impl Store {
                             texts.insert(key.clone(), normalize(text));
                         }
                         EMB => has_emb = true,
+                        META if e.qualifier == SUPERSEDED_BY => {
+                            superseded_by.push(e.cell.value().to_vec());
+                        }
                         LINKS => {
                             links.insert((
                                 key.clone(),
@@ -846,6 +938,10 @@ impl Store {
                 st.broken_links += 1;
             }
         }
+        st.dangling_superseded = superseded_by
+            .iter()
+            .filter(|s| !texts.contains_key(*s))
+            .count() as u64;
         st.text_index_inconsistent = !self.index.verify()?.is_consistent();
         Ok(st)
     }
@@ -859,13 +955,17 @@ fn write_link(txn: &mut Transaction, t: &Table, from: &[u8], to: &[u8], ty: Link
         .put(t, to, BACKLINKS, from, &v);
 }
 
-fn read_link(q: &[u8], v: &[u8]) -> Result<(MemoryId, LinkType, f32)> {
+fn read_link(q: &[u8], v: &[u8]) -> Result<Link> {
     let id = MemoryId::from_row(q).ok_or_else(|| corrupt("a link's key"))?;
     if v.len() != 5 {
         return Err(corrupt("a link's value"));
     }
     let w = f32::from_le_bytes(v[1..].try_into().expect("4"));
-    Ok((id, LinkType(v[0]), w))
+    Ok(Link {
+        id,
+        ty: LinkType(v[0]),
+        weight: w,
+    })
 }
 
 fn element_code(e: Element) -> u8 {
@@ -927,10 +1027,10 @@ fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemor
     let mut backlinks = Vec::new();
     for e in view.iter() {
         match e.family {
-            SOURCES => sources.push((
-                String::from_utf8_lossy(e.qualifier).into_owned(),
-                e.cell.as_u64().unwrap_or(0),
-            )),
+            SOURCES => sources.push(Source {
+                name: String::from_utf8_lossy(e.qualifier).into_owned(),
+                at_us: e.cell.as_u64().unwrap_or(0),
+            }),
             LINKS => links.push(read_link(e.qualifier, e.cell.value())?),
             BACKLINKS => backlinks.push(read_link(e.qualifier, e.cell.value())?),
             _ => {}
@@ -951,4 +1051,15 @@ fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemor
         backlinks,
         embedding,
     }))
+}
+
+/// A link's weight: from 0 to 1 (NaN refused).
+fn check_weight(w: f32) -> Result<()> {
+    if (0.0..=1.0).contains(&w) {
+        Ok(())
+    } else {
+        Err(Error::InvalidArgument(format!(
+            "a link's weight is from 0 to 1, not {w}"
+        )))
+    }
 }

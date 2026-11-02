@@ -23,6 +23,6 @@ mod store;
 pub use error::{Error, Result};
 pub use layout::{MemoryId, normalize};
 pub use store::{
-    EmbeddingModel, Kind, LinkType, Memory, Remembered, Store, StoreOptions, StoreStats,
-    StoredMemory,
+    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, Remembered, Source, Store, StoreOptions,
+    StoreStats, StoredMemory,
 };
