@@ -113,6 +113,7 @@ The full list, with an upgrade guide, is the [changelog](../CHANGELOG.md#030---2
   - **Compatibility:** all are under `incompat` bit 0, like D294's.
   - **Docs:** the guide's [Data modeling](guide/data-modeling.md#bitwise-and-f64-aggregations).
   - **Deferred:** the candidates D298 didn't take are in #1317.
+  - **Still owed:** §7's box measurement of the hub case (common neighbours of two 2M-element sets, ≤ 2 ms), #1319.
 - **Two version lines** ([D295](design/decisions/phase-3.md#d295), #1196): the internal crates are at 2.0.0, and the public crates stay on 1.x.
 
 ## Tracked follow-ups
