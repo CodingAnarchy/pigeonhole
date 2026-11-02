@@ -816,3 +816,84 @@ fn an_id_prefix_restricts_the_search_and_keeps_its_scores() {
     );
     db.close().unwrap();
 }
+
+#[test]
+fn a_reader_process_searches_what_the_writer_committed() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let t = docs(&db);
+    let index = Index::create(&db, "docs_text", source(&t), IndexOptions::new()).unwrap();
+    let custom = Index::create_with_tokenizer(
+        &db,
+        "custom",
+        source(&t),
+        IndexOptions::new(),
+        Box::new(Spaces(7)),
+    )
+    .unwrap();
+    let mut rng = Rng::new(41);
+    for i in 0..50 {
+        index
+            .put(format!("d{i:02}").as_bytes(), &text(&mut rng, 12))
+            .unwrap();
+    }
+    custom.rebuild().unwrap();
+    let reader = pigeonhole::Pigeonhole::open_reader(
+        dir.join("text.phdb"),
+        pigeonhole::ReaderOptions::default(),
+    )
+    .unwrap();
+    let read = Index::open_reader(&reader, "docs_text").unwrap();
+    assert_eq!(read.options(), index.options());
+    assert_eq!(read.source(), index.source());
+    for q in [
+        r#"memory store "memory store""#,
+        "agent",
+        r#""the agent"~2 search"#,
+    ] {
+        let w = index.search(q, 7).run().unwrap();
+        let r = read.search(q, 7).run().unwrap();
+        assert_eq!(r, w, "{q}");
+        let r = read.search(q, 100).id_prefix("d1").run().unwrap();
+        assert_eq!(
+            r,
+            index.search(q, 100).id_prefix("d1").run().unwrap(),
+            "{q} with a prefix"
+        );
+    }
+    let v = read.verify().unwrap();
+    assert!(v.is_consistent(), "{v:?}");
+    assert_eq!(v.documents, 50);
+    // A later commit shows in the reader's next search.
+    index.put(b"new", "vector feed vector").unwrap();
+    assert_eq!(ids(&read.search("vector", 1).run().unwrap()), [&b"new"[..]]);
+    // A repair in the writer makes the reader's searches Busy.
+    let rows = db.table("docs_text").unwrap().open().unwrap();
+    rows.mutate(b"G")
+        .put("meta", b"repair", b"")
+        .commit()
+        .unwrap();
+    assert!(matches!(read.search("vector", 1).run(), Err(Error::Busy)));
+    index.repair().unwrap();
+    assert_eq!(ids(&read.search("vector", 1).run().unwrap()), [&b"new"[..]]);
+    // The tokeniser checks hold at a reader's open too. (Both indexes share the source
+    // column, so the writes above through `index` bypassed `custom`: rebuild it first.)
+    custom.rebuild().unwrap();
+    assert!(matches!(
+        Index::open_reader(&reader, "custom"),
+        Err(Error::Mismatch(_))
+    ));
+    let c = Index::open_reader_with_tokenizer(&reader, "custom", Box::new(Spaces(7))).unwrap();
+    assert!(c.verify().unwrap().is_consistent());
+    assert!(matches!(
+        Index::open_reader(&reader, "docs"),
+        Err(Error::InvalidArgument(_))
+    ));
+    // And the writer's open of a table that isn't an index.
+    assert!(matches!(
+        Index::open(&db, "docs"),
+        Err(Error::InvalidArgument(_))
+    ));
+    drop(reader);
+    db.close().unwrap();
+}

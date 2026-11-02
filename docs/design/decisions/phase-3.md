@@ -3905,6 +3905,14 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `id_prefix` equals the full search filtered by prefix, at large and small `k`;
   - the terminator's effect.
 
+**PR 3b.** `ReadIndex` and the guide.
+- **`Index::open_reader` (and `_with_tokenizer`)** opens the index from a `PigeonholeReader`. It runs the same tokeniser checks as `open`, and both opens now refuse a table without the index's families (`InvalidArgument`).
+- **`ReadIndex`** searches and verifies at the reader's snapshots. Its searches fail with `Busy` while the writer's `repair` runs.
+- **Code shape:** the writer and reader handles share one `Index` core over a small enum of table kinds, so a search runs the same code from either process.
+- **The guide page** `docs/guide/text-search.md` is doctested.
+- **The AX102 bench** (`crates/text/examples/bench.rs`) flushes only, with no forced `compact()`. A full compaction of this index writes about 1,000× its size (#1313, a 1.1.0 blocker owned by perf2). The coordinator's call (2026-11-02) is to ship flush-only numbers, say so in the guide, and re-take them once #1313 is fixed, as part of the pre-1.1.0 recheck.
+- **Tests:** a reader process searches what the writer committed, and a plain table is refused.
+
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
 **Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.

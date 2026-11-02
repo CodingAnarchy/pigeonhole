@@ -79,6 +79,14 @@ No API is added: `Query::phrase_with_slop(words, u16)`, the `Clause` slop fields
   - The prefix should carry its terminator (`agent:alice\0`), which the docs say.
 - **MaxScore replaces the term-at-a-time evaluator** (no API change). Results and scores are exactly the same as before: a document's contributions are summed in the clauses' fixed order, and pruning tests a strict bound.
 
+## PR 3b: `ReadIndex`, the guide, the measurements
+- **`Index::open_reader(&PigeonholeReader, name) -> Result<ReadIndex>`** and **`Index::open_reader_with_tokenizer(.., Box<dyn Tokenizer>)`**: the index opened from a reader process, with the same tokeniser checks as `open` (`Mismatch`).
+- **`ReadIndex`** (`Clone`, `Debug`): `search(query, k) -> Search<'_>`, `verify() -> Result<IndexStats>`, `options()` and `source()`. It has no write method.
+  - It searches at the reader's snapshots.
+  - A search while the writer's `repair` runs fails with `Busy` (cli692's §10 point).
+- **`open` and `open_reader` of a table that lacks the index's families** now fail with `InvalidArgument` ("not a text index"), where they used to fail with the database's error for a missing family.
+- **The guide page** `docs/guide/text-search.md`, doctested, and the bench example `crates/text/examples/bench.rs`, with the AX102 numbers.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 
