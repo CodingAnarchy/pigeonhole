@@ -16,6 +16,11 @@ impl core::error::Error for pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::source(&self) -> core::option::Option<&(dyn core::error::Error + 'static)>
 impl core::fmt::Display for pigeonhole_memory::Error
 pub fn pigeonhole_memory::Error::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+#[non_exhaustive] pub enum pigeonhole_memory::Forgot
+pub pigeonhole_memory::Forgot::Deleted
+pub pigeonhole_memory::Forgot::Gone
+pub pigeonhole_memory::Forgot::NotDue
+pub pigeonhole_memory::Forgot::Protected
 #[non_exhaustive] pub enum pigeonhole_memory::Fusion
 pub pigeonhole_memory::Fusion::Linear
 pub pigeonhole_memory::Fusion::Rrf
@@ -34,6 +39,42 @@ pub fn pigeonhole_memory::EmbeddingModel::dim(&self) -> u32
 pub fn pigeonhole_memory::EmbeddingModel::element(&self) -> pigeonhole::vector::Element
 pub fn pigeonhole_memory::EmbeddingModel::id(&self) -> &str
 pub fn pigeonhole_memory::EmbeddingModel::new(impl core::convert::Into<alloc::string::String>, u32, pigeonhole::vector::Element) -> pigeonhole_memory::Result<Self>
+pub struct pigeonhole_memory::Forget<'a>
+impl<'a> pigeonhole_memory::Forget<'a>
+pub fn pigeonhole_memory::Forget<'a>::after(self, &pigeonhole_memory::MemoryId) -> Self
+pub fn pigeonhole_memory::Forget<'a>::now_us(self, u64) -> Self
+pub fn pigeonhole_memory::Forget<'a>::policy(self, &'a pigeonhole_memory::ForgetPolicy) -> Self
+pub fn pigeonhole_memory::Forget<'a>::run(self) -> pigeonhole_memory::Result<pigeonhole_memory::ForgetPass>
+#[non_exhaustive] pub struct pigeonhole_memory::ForgetPass
+pub pigeonhole_memory::ForgetPass::deleted: u64
+pub pigeonhole_memory::ForgetPass::examined: u64
+pub pigeonhole_memory::ForgetPass::protected: u64
+pub pigeonhole_memory::ForgetPass::resume: core::option::Option<pigeonhole_memory::MemoryId>
+#[non_exhaustive] pub struct pigeonhole_memory::ForgetPolicy
+impl pigeonhole_memory::ForgetPolicy
+pub fn pigeonhole_memory::ForgetPolicy::get_half_life(&self) -> core::time::Duration
+pub fn pigeonhole_memory::ForgetPolicy::get_interval(&self) -> core::time::Duration
+pub fn pigeonhole_memory::ForgetPolicy::get_max_age(&self, pigeonhole_memory::Kind) -> core::option::Option<core::time::Duration>
+pub fn pigeonhole_memory::ForgetPolicy::get_max_per_pass(&self) -> usize
+pub fn pigeonhole_memory::ForgetPolicy::get_min_retention(&self) -> core::option::Option<f64>
+pub fn pigeonhole_memory::ForgetPolicy::get_use_weight(&self) -> f64
+pub fn pigeonhole_memory::ForgetPolicy::half_life(self, core::time::Duration) -> Self
+pub fn pigeonhole_memory::ForgetPolicy::interval(self, core::time::Duration) -> Self
+pub fn pigeonhole_memory::ForgetPolicy::max_age(self, pigeonhole_memory::Kind, core::time::Duration) -> Self
+pub fn pigeonhole_memory::ForgetPolicy::max_per_pass(self, usize) -> Self
+pub fn pigeonhole_memory::ForgetPolicy::min_retention(self, f64) -> Self
+pub fn pigeonhole_memory::ForgetPolicy::new() -> Self
+pub fn pigeonhole_memory::ForgetPolicy::use_weight(self, f64) -> Self
+impl core::default::Default for pigeonhole_memory::ForgetPolicy
+pub fn pigeonhole_memory::ForgetPolicy::default() -> Self
+pub struct pigeonhole_memory::Forgetter
+impl pigeonhole_memory::Forgetter
+pub fn pigeonhole_memory::Forgetter::closed(&self) -> bool
+pub fn pigeonhole_memory::Forgetter::run_once(&mut self, core::time::Duration) -> pigeonhole_memory::Result<bool>
+pub fn pigeonhole_memory::Forgetter::set_wakeup(&mut self, alloc::boxed::Box<(dyn core::ops::function::Fn() + core::marker::Send + core::marker::Sync)>)
+pub fn pigeonhole_memory::Forgetter::wait(&mut self, core::time::Duration)
+impl core::fmt::Debug for pigeonhole_memory::Forgetter
+pub fn pigeonhole_memory::Forgetter::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct pigeonhole_memory::Link
 pub pigeonhole_memory::Link::id: pigeonhole_memory::MemoryId
 pub pigeonhole_memory::Link::ty: pigeonhole_memory::LinkType
@@ -72,6 +113,12 @@ pub fn pigeonhole_memory::MemoryId::fmt(&self, &mut core::fmt::Formatter<'_>) ->
 impl core::str::traits::FromStr for pigeonhole_memory::MemoryId
 pub type pigeonhole_memory::MemoryId::Err = pigeonhole_memory::Error
 pub fn pigeonhole_memory::MemoryId::from_str(&str) -> pigeonhole_memory::Result<Self>
+#[non_exhaustive] pub struct pigeonhole_memory::OpenOptions
+impl pigeonhole_memory::OpenOptions
+pub fn pigeonhole_memory::OpenOptions::model(self, impl core::convert::Into<alloc::string::String>) -> Self
+pub fn pigeonhole_memory::OpenOptions::new() -> Self
+pub fn pigeonhole_memory::OpenOptions::own_forgetter(self) -> Self
+pub fn pigeonhole_memory::OpenOptions::without_embeddings(self) -> Self
 pub struct pigeonhole_memory::ReadStore
 impl pigeonhole_memory::ReadStore
 pub fn pigeonhole_memory::ReadStore::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
@@ -128,19 +175,27 @@ pub pigeonhole_memory::Source::name: alloc::string::String
 pub struct pigeonhole_memory::Store
 impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
+pub fn pigeonhole_memory::Store::create_with(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::StoreOptions, pigeonhole_memory::OpenOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::delete(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<bool>
 pub fn pigeonhole_memory::Store::delete_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<bool>
 pub fn pigeonhole_memory::Store::embedding_model(&self) -> core::option::Option<&pigeonhole_memory::EmbeddingModel>
+pub fn pigeonhole_memory::Store::forget_policy(&self) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::ForgetPolicy>>
 pub fn pigeonhole_memory::Store::get(&self, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<core::option::Option<pigeonhole_memory::StoredMemory>>
 pub fn pigeonhole_memory::Store::link(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId, pigeonhole_memory::LinkType, f32) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::mark_used(&self, &[pigeonhole_memory::MemoryId]) -> pigeonhole_memory::Result<pigeonhole_memory::Marked>
 pub fn pigeonhole_memory::Store::open(&pigeonhole::db::Pigeonhole, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
+pub fn pigeonhole_memory::Store::open_with(&pigeonhole::db::Pigeonhole, &str, pigeonhole_memory::OpenOptions) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::open_without_embeddings(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_memory::Result<pigeonhole_memory::Store>
 pub fn pigeonhole_memory::Store::recall(&self, &[&str]) -> pigeonhole_memory::Recall<'_>
 pub fn pigeonhole_memory::Store::remember(&self, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
 pub fn pigeonhole_memory::Store::remember_in(&self, &mut pigeonhole::write::Transaction, &str, pigeonhole_memory::Memory) -> pigeonhole_memory::Result<pigeonhole_memory::Remembered>
+pub fn pigeonhole_memory::Store::set_forget_policy(&self, core::option::Option<pigeonhole_memory::ForgetPolicy>) -> pigeonhole_memory::Result<()>
 pub fn pigeonhole_memory::Store::supersede(&self, &pigeonhole_memory::MemoryId, &pigeonhole_memory::MemoryId) -> pigeonhole_memory::Result<()>
+pub fn pigeonhole_memory::Store::take_forgetter(&self) -> core::option::Option<pigeonhole_memory::Forgetter>
 pub fn pigeonhole_memory::Store::verify(&self) -> pigeonhole_memory::Result<pigeonhole_memory::StoreStats>
+impl pigeonhole_memory::Store
+pub fn pigeonhole_memory::Store::forget(&self) -> pigeonhole_memory::Forget<'_>
+pub fn pigeonhole_memory::Store::forget_in(&self, &mut pigeonhole::write::Transaction, &pigeonhole_memory::MemoryId, u64) -> pigeonhole_memory::Result<pigeonhole_memory::Forgot>
 impl pigeonhole_memory::Store
 pub fn pigeonhole_memory::Store::open_reader(&pigeonhole::db::PigeonholeReader, &str, &str) -> pigeonhole_memory::Result<pigeonhole_memory::ReadStore>
 pub fn pigeonhole_memory::Store::open_reader_without_embeddings(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_memory::Result<pigeonhole_memory::ReadStore>
@@ -149,6 +204,8 @@ pub fn pigeonhole_memory::Store::fmt(&self, &mut core::fmt::Formatter<'_>) -> co
 #[non_exhaustive] pub struct pigeonhole_memory::StoreOptions
 impl pigeonhole_memory::StoreOptions
 pub fn pigeonhole_memory::StoreOptions::embedding(self, pigeonhole_memory::EmbeddingModel) -> Self
+pub fn pigeonhole_memory::StoreOptions::episodic_ttl(self, core::time::Duration) -> Self
+pub fn pigeonhole_memory::StoreOptions::forget(self, pigeonhole_memory::ForgetPolicy) -> Self
 pub fn pigeonhole_memory::StoreOptions::new() -> Self
 #[non_exhaustive] pub struct pigeonhole_memory::StoreStats
 pub pigeonhole_memory::StoreStats::broken_links: u64
