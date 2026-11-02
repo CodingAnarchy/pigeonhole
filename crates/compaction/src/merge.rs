@@ -116,6 +116,15 @@ pub trait MergeOperator: Send + Sync + fmt::Debug {
     /// leaving the resulting stored value in `acc`. On error the contents of `acc` are
     /// unspecified.
     fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError>;
+
+    /// Turns an accumulator that [`merge`](Self::merge) left in an internal working form into
+    /// the operand it stands for, before it is stored without a [`finish`](Self::finish) (a
+    /// compaction's or flush's combined operand, a commit's combined inputs). Nothing for an
+    /// operator whose accumulator is always an operand, as most are. A working form starts
+    /// with [`pigeonhole_format::value::TRANSIENT_TAG`], so one that escapes fails its read.
+    fn settle(&self, _acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        Ok(())
+    }
 }
 
 /// The `i64` in a stored `ValueTag::I64` value, or `None` if `stored` is anything else.
@@ -725,6 +734,139 @@ impl MergeOperator for BloomUnion {
     }
 }
 
+/// Roaring set union and removal (D298), the operator of a `FamilyKind::Set` family:
+/// operands are `ValueTag::Bytes` pairs `(A, R)` of the elements added and removed
+/// (`pigeonhole_format::roaring`), combined in commit order (`((A1 ∖ R2) ∪ A2, (R1 ∖ A2) ∪
+/// R2)` for an older and a newer operand); `finish` applies them onto the base, `(B ∖ R) ∪
+/// A`, or with no base leaves `A`. Values are canonical roaring sets, which may be
+/// separated into blob files: the read path loads a separated base before `finish` (§4.1).
+/// A malformed set or operand, or another tag, is a [`MergeError`].
+///
+/// **The fold is linear.** `merge` doesn't combine pairwise into a new set (O(accumulated)
+/// per operand): it appends each older operand to a working form of the accumulator,
+/// `TRANSIENT_TAG` then the operands newest first, each as its length (u32 LE) and its
+/// bytes. `finish` decodes the base once, applies the operands oldest first into one
+/// mutable set, and encodes once; [`settle`](MergeOperator::settle) combines them into one
+/// canonical operand the same way, for a combined operand stored without a base.
+///
+/// ```
+/// use pigeonhole_compaction::{MergeOperator, SetOps};
+/// use pigeonhole_format::roaring::{self, SetRef};
+///
+/// let operand = |adds: &[u32], removes: &[u32]| {
+///     let mut s = vec![0u8]; // ValueTag::Bytes
+///     roaring::encode_operand(&mut s, adds, removes);
+///     s
+/// };
+/// let mut base = vec![0u8];
+/// roaring::encode_sorted(&mut base, [1, 2, 3]);
+/// let mut acc = operand(&[], &[2]); // the newer: remove 2
+/// SetOps.merge(&mut acc, &operand(&[2, 9], &[])).unwrap(); // the older: add 2 and 9
+/// SetOps.finish(Some(&base), &mut acc).unwrap();
+/// let set = SetRef::parse(&acc[1..]).unwrap();
+/// assert_eq!(set.iter().collect::<Vec<_>>(), [1, 3, 9]);
+/// ```
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SetOps;
+
+impl SetOps {
+    /// The operator's name.
+    pub const NAME: &'static str = "pigeonhole.set";
+
+    fn payload<'a>(v: &'a [u8], what: &str) -> Result<&'a [u8], MergeError> {
+        match v {
+            [tag, rest @ ..] if *tag == ValueTag::Bytes as u8 => Ok(rest),
+            [pigeonhole_format::value::TRANSIENT_TAG, ..] => Err(MergeError::new(
+                Self::NAME,
+                "a set fold's working accumulator was stored (a missed settle)",
+            )),
+            _ => Err(MergeError::new(Self::NAME, what)),
+        }
+    }
+
+    fn bad(e: pigeonhole_format::roaring::RoaringError) -> MergeError {
+        MergeError::new(Self::NAME, e.0)
+    }
+
+    /// `acc` in working form: a canonical operand becomes the form's only entry.
+    fn to_working(acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        if acc.first() == Some(&pigeonhole_format::value::TRANSIENT_TAG) {
+            return Ok(());
+        }
+        let payload = Self::payload(acc, "operand is not a set operand")?;
+        pigeonhole_format::roaring::parse_operand(payload).map_err(Self::bad)?;
+        let len = (payload.len() as u32).to_le_bytes();
+        acc[0] = pigeonhole_format::value::TRANSIENT_TAG;
+        acc.splice(1..1, len);
+        Ok(())
+    }
+
+    /// The operands of `acc`, newest first: its working form's entries, or `acc` itself.
+    fn operands(acc: &[u8]) -> Result<Vec<&[u8]>, MergeError> {
+        if acc.first() != Some(&pigeonhole_format::value::TRANSIENT_TAG) {
+            return Ok(vec![Self::payload(acc, "operand is not a set operand")?]);
+        }
+        let truncated = || MergeError::new(Self::NAME, "a set fold's working form is truncated");
+        let mut out = Vec::new();
+        let mut rest = &acc[1..];
+        while !rest.is_empty() {
+            let (len, tail) = rest.split_first_chunk::<4>().ok_or_else(truncated)?;
+            let len = u32::from_le_bytes(*len) as usize;
+            let (entry, tail) = tail.split_at_checked(len).ok_or_else(truncated)?;
+            out.push(entry);
+            rest = tail;
+        }
+        Ok(out)
+    }
+}
+
+impl MergeOperator for SetOps {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+        Self::to_working(acc)?;
+        if older.first() == Some(&pigeonhole_format::value::TRANSIENT_TAG) {
+            // Another fold's working form (a resolver run merging its groups): its entries,
+            // newest first, all older than ours. Its framing is checked first, so a corrupt
+            // one fails here and leaves `acc` as it was.
+            Self::operands(older)?;
+            acc.extend_from_slice(&older[1..]);
+            return Ok(());
+        }
+        let payload = Self::payload(older, "operand is not a set operand")?;
+        pigeonhole_format::roaring::parse_operand(payload).map_err(Self::bad)?;
+        acc.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        acc.extend_from_slice(payload);
+        Ok(())
+    }
+
+    fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        let base = base
+            .map(|b| Self::payload(b, "base value is not a set"))
+            .transpose()?;
+        let mut out = vec![ValueTag::Bytes as u8];
+        let ops = Self::operands(acc)?;
+        pigeonhole_format::roaring::apply_all(&mut out, base, ops.into_iter().rev())
+            .map_err(Self::bad)?;
+        *acc = out;
+        Ok(())
+    }
+
+    fn settle(&self, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+        if acc.first() != Some(&pigeonhole_format::value::TRANSIENT_TAG) {
+            return Ok(());
+        }
+        let mut out = vec![ValueTag::Bytes as u8];
+        let ops = Self::operands(acc)?;
+        pigeonhole_format::roaring::combine_all(&mut out, ops.into_iter().rev())
+            .map_err(Self::bad)?;
+        *acc = out;
+        Ok(())
+    }
+}
+
 /// Built-in HyperLogLog union, the operator of a `FamilyKind::Hll` family (D294): operands
 /// and values are `ValueTag::Bytes` sketches (`pigeonhole_format::hll`), and the result is
 /// their register-wise maximum, in canonical form. It folds in place: no decode, no re-encode,
@@ -837,6 +979,7 @@ impl MergeRegistry {
                 hashes: 1,
             },
         )));
+        r.register(Arc::new(SetOps));
         r
     }
 

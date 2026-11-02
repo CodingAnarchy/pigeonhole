@@ -235,6 +235,7 @@ fn write_aggregates(db: &Pigeonhole) {
                 pigeonhole::BloomParams::new(512, 3).unwrap(),
             )),
         )
+        .family("members", Family::aggregate(Aggregation::Set))
         .family(
             "latency_q",
             Family::aggregate(Aggregation::Quantiles(
@@ -288,7 +289,12 @@ fn write_aggregates(db: &Pigeonhole) {
             .aggregate_f64("latency_q", b"all", y)
             .aggregate("seen_b", b"all", v)
             .aggregate_bytes("seen_b", b"names", format!("user-{}", i % 7).as_bytes())
-            .aggregate_bytes("users", b"names", format!("user-{}", i % 7).as_bytes());
+            .aggregate_bytes("users", b"names", format!("user-{}", i % 7).as_bytes())
+            // A set across two containers: adds, and removes of earlier adds (D298).
+            .set_add("members", b"all", (i % 13) as u32 * 6000);
+        if i % 4 == 0 {
+            m = m.set_remove("members", b"all", ((i + 5) % 13) as u32 * 6000);
+        }
         // Row a00's distinct users pass the sparse/dense boundary; the others stay sparse.
         let users = if i % 6 == 0 { 400 } else { 3 };
         for u in 0..users {

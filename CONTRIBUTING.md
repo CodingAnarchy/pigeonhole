@@ -67,7 +67,7 @@ Several agents often build and test on one machine, so local runs stay small:
 - **The standard sweeps for engine, WAL and I/O changes** (300 seeds, 6 chunks each, each with `-f tools=gdb`), all five on the PR's head:
   - engine `model_check` with `PIGEONHOLE_DEFERRED_IO=1`;
   - engine `model_check` plain;
-  - engine `counters` plain (`model_check` with every aggregate kind: `sum`, `sum_ttl`, `min`, `max_ttl`, `hll`, `hll_ttl`, `bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`, `fsum`, `fmv_ttl`, `fhist`, `fq_ttl` and `bloom`);
+  - engine `counters` plain (`model_check` with every aggregate kind: `sum`, `sum_ttl`, `min`, `max_ttl`, `hll`, `hll_ttl`, `bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`, `fsum`, `fmv_ttl`, `fhist`, `fq_ttl`, `bloom` and `set`);
   - `pigeonhole` `model`;
   - engine `tablets` with `PIGEONHOLE_DEFERRED_IO=1`.
 
@@ -127,4 +127,9 @@ Optimization, simplification and performance are maintained continuously, not bo
   - When a change improves a shape, lower its ceiling in the same PR: `scripts/instruction-ceilings.py lower COUNTS` with the head's counts (from the job summary or `scripts/instructions-per-cell.sh`). The job summary says which ceilings can go lower.
   - A ceiling is never raised without an owner decision; cite it in the commit.
   - A new shape needs a ceiling in the same PR that adds it.
+- **Fixed hash seeds (#1273).** The measured examples call `support/measure.rs`'s `fix_hash_seeds()` first thing. It fixes both of `foldhash`'s seeds, each map's own and the process's shared one, to `pigeonhole_format::hash::FIXED_SEED` (the bytes of `"PIGEONHO"`, picked once). A shape's count then no longer depends on the hash seeds: before this, a random seed sometimes gave a measured key a longer probe, and get-mem moved by up to 20 instructions per get between runs.
+  - **The same code runs:** every build hashes through `SeedableRandomState`, and only the seed values differ. The setter is behind `pigeonhole-format`'s hidden `__unstable-fixed-seed` feature, which only `pigeonhole-bench` enables, and there is no environment variable. Production and tests keep random seeds.
+  - **One seed for every map:** in fixed mode, every map shares a seed (random mode gives each map its own), so a map filled by iterating another can measure differently under fixed seeds (hashbrown clusters when inserts arrive in another map's hash order). No measured shape builds a map that way. Don't add one to a measured path.
+  - **Don't tune the constant** to make a shape pass. A seed with short probes would put the ceilings below what production sees. Changing it re-derives every ceiling, in its own D195 ceilings commit.
+  - **Not fixed:** other run-to-run variation. Some shapes (get-sst, the multi-gets, ycsb-a, commit-at, short-scans) still vary by up to about 36 instructions per operation with the seeds fixed. That spread comes from something other than the seeds, and #1305 tracks it. std `HashMap`s (SipHash, random per process) are not covered either, so keep them off measured paths.
 - **Gate runs.** Every official sparse-wide gate run (the Phase 3 gate, and before each release) is compared with the Phase 2 baseline: `crates/bench/baselines/phase2-gate/run-gate.sh`, on a quiet machine. A loss beyond run-to-run noise in Pigeonhole's throughput, p99, p99.9, or get, put, row-read or scan p99 blocks the gate or release until it's fixed or the owner accepts it (see the README there).

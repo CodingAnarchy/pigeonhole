@@ -311,4 +311,9 @@ pub struct FeedOptions {
     /// The tables fed, by name; `None` feeds every table. Names are resolved at open: a name
     /// with no table is refused.
     pub tables: Option<Vec<String>>,
+    /// The background sync's interval, *T_sync* (microseconds): fed `Buffered` and `None`
+    /// records that no sync covered for this long are synced in the background, so a
+    /// durable feed advances on tables nothing else syncs. `None`: 100 ms, or 1 s on macOS,
+    /// where `F_FULLFSYNC` flushes the whole device.
+    pub sync_interval_micros: Option<u64>,
 }

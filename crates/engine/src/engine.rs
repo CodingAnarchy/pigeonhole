@@ -1004,6 +1004,12 @@ impl Engine {
                     f.note_root(sequence);
                 }
             }));
+            // Root commits of this open before the observer: only `finish`'s upgrade of an
+            // older file's superblocks. They are this session's, so record them; replay,
+            // recovery's checkpoint edits and repairs all come after (simp724's Q1, #1316).
+            for sequence in opened_at + 1..=pager.sequence() {
+                f.note_root(sequence);
+            }
         }
         let mut wal_opts = options.wal;
         wal_opts.retain_segments = feed.as_ref().map_or(0, |f| f.retain_segments);
@@ -2725,6 +2731,43 @@ impl Engine {
         })
     }
 
+    /// Whether a power loss now may leave a root commit without its change-feed Root entry,
+    /// expiring every token at the next open: a manifest root commit in flight (its entry
+    /// is appended once it completes), or a sidecar sync not yet landed (D310 fix A's
+    /// window; an inspection helper for tests).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn feed_sidecar_sync_pending(&self) -> bool {
+        let shared = &self.inner.shared;
+        shared
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.sidecar_sync_pending() || shared.manifest_flight.in_flight())
+    }
+
+    /// The change feed's sidecar syncs (D310 call 4, fix A): each makes the session's Root
+    /// entries since the last durable, coalesced to one in flight. About one per root commit
+    /// (manifest commits), never one per data commit. 0 with the feed off.
+    pub fn feed_sidecar_syncs(&self) -> u64 {
+        self.inner
+            .shared
+            .feed
+            .as_ref()
+            .map_or(0, |f| f.sidecar_syncs())
+    }
+
+    /// The change feed's background syncs since open (D310, *T_sync*): syncs submitted
+    /// because fed `Buffered` or `None` records waited for one longer than the interval and
+    /// no other sync covered them. 0 with the feed off.
+    pub fn feed_background_syncs(&self) -> u64 {
+        self.inner
+            .shared
+            .metrics
+            .iter()
+            .map(|m| m.feed_syncs.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// What the row cache did since open (D201); all zero when it is off. In a reader process,
     /// its cache since the last attach to a writer generation (D281). A method rather than [`Metrics`] fields, which would break struct literals.
     pub fn row_cache_stats(&self) -> RowCacheStats {
@@ -3390,6 +3433,11 @@ fn spill_recovered(
 /// Registers a stream's feed marks with the change feed (D310), when it is on.
 fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
     if let (Some(feed), Some(marks)) = (&shared.feed, wal.feed_marks()) {
+        // The start of the stream's first segment of this open: every record before it has
+        // a key below the allocator's start (the reader's start bound, D310 PR 3). For a new
+        // stream that is the start of its only segment, so nothing counts as dropped.
+        let key = shared.shm.next_seqno().saturating_sub(1);
+        feed.note_checkpoint(stream, Lsn::new(marks.head(), 0), key);
         feed.set_marks(stream, marks);
     }
 }
@@ -4983,6 +5031,21 @@ fn check_counter_write(m: &Mutation<'_>, meta: &FamilyMeta, catalog: &Catalog) -
                 kind_name(meta.options.kind)
             )));
         }
+    } else if meta.options.kind == FamilyKind::Set {
+        // Inputs are `(adds, removes)` operands (`set_add` / `set_remove`); a put sets a
+        // bucket to a canonical roaring set, as `phdb load` writes one back (D298).
+        let ok = bytes_value
+            && match m.kind {
+                Kind::Merge => pigeonhole_format::roaring::parse_operand(&m.value[1..]).is_ok(),
+                _ => pigeonhole_format::roaring::SetRef::parse(&m.value[1..]).is_ok(),
+            };
+        if !ok {
+            return Err(Error::InvalidArgument(format!(
+                "{} is a set family: it takes set_add / set_remove inputs and puts of a \
+                 canonical roaring set",
+                family_name(catalog, m.table, m.family)
+            )));
+        }
     } else if !i64_value {
         let hint = match meta.options.kind {
             FamilyKind::Counter => "put_i64 / incr",
@@ -5027,6 +5090,7 @@ fn kind_name(kind: FamilyKind) -> &'static str {
         FamilyKind::Histogram => "histogram",
         FamilyKind::Quantiles => "quantiles",
         FamilyKind::Bloom => "bloom",
+        FamilyKind::Set => "set",
         FamilyKind::Vector => "vector",
         FamilyKind::Standard => "standard",
     }
@@ -5134,9 +5198,17 @@ fn prepare_counter_writes(batch: &BatchBuilder, catalog: &Catalog) -> Result<Bat
             let combined = if w.m.kind == Kind::Put {
                 op.finish(Some(&earlier), &mut acc)
             } else {
+                // A combined operand goes to the WAL as one (D298: settled, never a set
+                // fold's working form).
                 op.merge(&mut acc, &earlier)
+                    .and_then(|()| op.settle(&mut acc))
             };
             combined.map_err(|e| Error::InvalidArgument(e.to_string()))?;
+            debug_assert_ne!(
+                acc.first(),
+                Some(&pigeonhole_format::value::TRANSIENT_TAG),
+                "a working accumulator reached a commit"
+            );
             w.value = Some(acc);
             continue;
         }

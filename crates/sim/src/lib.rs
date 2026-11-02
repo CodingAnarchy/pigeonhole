@@ -16,6 +16,7 @@
 mod bucket_state;
 mod exact_state;
 mod model;
+mod set_state;
 mod sim;
 mod streams;
 mod workload;
@@ -30,6 +31,7 @@ pub use model::{
     ModelPurge, aggregation_of_name, combine_aggregate_writes, combine_counter_writes, hll_sketch,
     hll_union,
 };
+pub use set_state::{set_input, set_operand, set_state, set_state_valid};
 pub use sim::{Rng, Sim, Step, TaskId};
 pub use streams::{
     CommitStreams, StreamCommit, StreamRecord, check_acknowledged_survive, commit_records,

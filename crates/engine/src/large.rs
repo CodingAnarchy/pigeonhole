@@ -303,6 +303,11 @@ pub(crate) fn separate(
                     &mut sinks.last_mut().expect("pushed").2
                 }
             };
+            debug_assert_ne!(
+                m.value.first(),
+                Some(&pigeonhole_format::value::TRANSIENT_TAG),
+                "a working accumulator reached a blob file"
+            );
             let ptr = sink.append(m.value)?;
             #[cfg(feature = "test-hooks")]
             shared

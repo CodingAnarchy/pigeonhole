@@ -1756,7 +1756,8 @@ pub(crate) fn get_in<const CACHE_ONLY: bool>(
         // A counter group's fold (D291): only counter families set it, and every get takes
         // it, so it is always this get's.
         if let Some(fold) = resolver.take_counter_fold() {
-            note_checkpoint(view, fold, &got, table, family, row, qualifier);
+            let op_bytes = resolver.counter_fold_operand_bytes();
+            note_checkpoint(view, fold, op_bytes, &got, table, family, row, qualifier);
         }
         // Whatever happened, the sources (each pins its memtable or SST) and the options
         // (merge operator, blob reader) go now; only the allocations stay.
@@ -1898,11 +1899,13 @@ fn get_with<const CACHE_ONLY: bool>(
     }
 }
 
-/// The largest folded value kept as a counter checkpoint (D298 §4.3): every scalar, an HLL
-/// sketch (at most about 3 KiB) and most histograms and quantile sketches. A larger value
-/// would cost the memtable more than its fold saves; compaction's fold onto the base (§4.2)
-/// keeps such a cell's reads short instead.
-pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4096;
+/// The checkpoint bound's ratio R (D298 §4.3, amended): a fold is kept as a checkpoint only
+/// when the operands it read sum to at least `1 / R` of the value it produced. The memtable
+/// then takes at most R checkpoint bytes per operand byte written, whatever the value's size,
+/// and a read folds under `S / R` operand bytes onto its checkpoint. The base the fold started
+/// from is not an operand, or every fold from a large checkpoint would pass and checkpoint
+/// again.
+pub(crate) const CHECKPOINT_BYTES_RATIO: u64 = 4;
 
 /// Hands a counter get's result to its row's shard as a checkpoint (D291), when its fold
 /// read at least the writer's checkpoint steps. Out of line: a get pays only for taking the
@@ -1913,6 +1916,7 @@ pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4096;
 fn note_checkpoint(
     view: &View,
     (steps, top): (u64, Seqno),
+    op_bytes: u64,
     got: &Result<Option<CellData>>,
     table: TableId,
     family: FamilyId,
@@ -1925,9 +1929,17 @@ fn note_checkpoint(
     let Ok(Some(cell)) = got else {
         return;
     };
-    if steps < sink.steps || cell.stored().len() > MAX_CHECKPOINT_BYTES {
+    if steps < sink.steps {
         return;
     }
+    if op_bytes < cell.stored().len() as u64 / CHECKPOINT_BYTES_RATIO {
+        return;
+    }
+    debug_assert_ne!(
+        cell.stored().first(),
+        Some(&pigeonhole_format::value::TRANSIENT_TAG),
+        "a working accumulator reached a checkpoint"
+    );
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return;
     };

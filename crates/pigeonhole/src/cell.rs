@@ -27,7 +27,12 @@ fn payload(data: &CellData) -> &[u8] {
 }
 
 fn typed(data: &CellData) -> Value<'_> {
-    match data.value() {
+    typed_value(data.value())
+}
+
+/// A decoded stored value as the read API types it (reads, and the change feed's values).
+pub(crate) fn typed_value(value: ValueRef<'_>) -> Value<'_> {
+    match value {
         ValueRef::Bytes(b) => Value::Bytes(b),
         ValueRef::I64(v) => Value::I64(v),
         ValueRef::F64(v) => Value::F64(v),
@@ -285,6 +290,15 @@ impl<'a> CellRef<'a> {
         bloom_fill(&self.data)
     }
 
+    /// The set a set family's cell holds ([`Aggregation::Set`](crate::Aggregation::Set),
+    /// D298), read in place. `None` unless the value is a well-formed set.
+    pub fn as_set(&self) -> Option<crate::SetRef<'_>> {
+        match self.data.value() {
+            ValueRef::Bytes(b) => crate::SetRef::from_bytes(b),
+            _ => None,
+        }
+    }
+
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's
     /// cells hold ([`Aggregation::Hll`](crate::Aggregation::Hll), D294), about 1.6% standard
     /// error. The value's shape decides, not its family: `None` unless it is a well-formed
@@ -412,6 +426,15 @@ impl Cell {
     /// the power of its hashes.
     pub fn bloom_fill(&self) -> Option<f64> {
         bloom_fill(&self.data)
+    }
+
+    /// The set a set family's cell holds ([`Aggregation::Set`](crate::Aggregation::Set),
+    /// D298), read in place. `None` unless the value is a well-formed set.
+    pub fn as_set(&self) -> Option<crate::SetRef<'_>> {
+        match self.data.value() {
+            ValueRef::Bytes(b) => crate::SetRef::from_bytes(b),
+            _ => None,
+        }
     }
 
     /// The estimated number of distinct elements of an HLL sketch value, as an HLL family's

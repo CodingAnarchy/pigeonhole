@@ -169,6 +169,8 @@ pub(crate) enum Operand {
     F64,
     /// `aggregate_bytes`: a bytes element for an HLL or bloom family (D298).
     Bytes,
+    /// `set_add` / `set_remove`: an element for a set family (D298).
+    Set,
 }
 
 /// What every table handle shares: the database and the catalog entry it was opened with.
@@ -264,10 +266,12 @@ impl TableCore {
                             | K::MeanVar
                             | K::Histogram
                             | K::Quantiles
+                            | K::Set
                     )
             }
             Operand::U64 => matches!(kind, K::BitOr | K::BitAnd | K::BitXor),
             Operand::Bytes => matches!(kind, K::Hll | K::Bloom),
+            Operand::Set => kind == K::Set,
             Operand::F64 => matches!(
                 kind,
                 K::MinF64 | K::MaxF64 | K::SumF64 | K::MeanVar | K::Histogram | K::Quantiles
@@ -282,6 +286,7 @@ impl TableCore {
             Operand::U64 => "aggregate_u64",
             Operand::F64 => "aggregate_f64",
             Operand::Bytes => "aggregate_bytes",
+            Operand::Set => "set_add / set_remove",
         };
         let (what, method) = match kind {
             K::Standard | K::Vector => {
@@ -308,6 +313,7 @@ impl TableCore {
             K::Histogram => ("a histogram", "aggregate_f64"),
             K::Quantiles => ("a quantiles", "aggregate_f64"),
             K::Bloom => ("a bloom", "aggregate or aggregate_bytes"),
+            K::Set => ("a set", "set_add or set_remove"),
         };
         Err(Error::new(
             ErrorCode::InvalidArgument,
@@ -603,6 +609,19 @@ impl Table {
         qualifier: &[u8],
     ) -> Result<Option<CellRef<'_>>> {
         self.core.get(Some(snapshot), row, family, qualifier)
+    }
+
+    /// Subscribes to this table's committed changes (D310): [`FeedBuilder::open`] gives a
+    /// [`Feed`] of whole commits, once each, in commit order. The database's change feed must
+    /// be on and follow the table ([`Options::change_feed`](crate::Options::change_feed),
+    /// [`Options::feed_tables`](crate::Options::feed_tables)). [`FeedBuilder::table`] adds
+    /// more tables to the same feed.
+    ///
+    /// [`FeedBuilder::open`]: crate::FeedBuilder::open
+    /// [`Feed`]: crate::Feed
+    /// [`FeedBuilder::table`]: crate::FeedBuilder::table
+    pub fn feed(&self) -> crate::FeedBuilder {
+        crate::FeedBuilder::new(self)
     }
 
     /// The shard that owns `row` right now ([`Shard::index`](crate::Shard::index)), for

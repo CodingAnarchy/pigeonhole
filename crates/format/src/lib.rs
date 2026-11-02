@@ -30,6 +30,7 @@ pub mod ids;
 pub mod key;
 pub mod kind_params;
 pub mod manifest;
+pub mod roaring;
 pub mod scan;
 pub mod shm;
 pub mod sst;

@@ -104,17 +104,33 @@ pub struct FeedRetention {
     /// History older than this is dropped even under `bytes`. `None`, the default, keeps it
     /// until `bytes` pushes it out.
     pub age: Option<Duration>,
+    /// How long fed `Buffered` and `None` commits wait for a sync before the writer syncs
+    /// them in the background, so a durable subscriber (the default) sees them: `None`, the
+    /// default, is 100 ms, or 1 s on macOS, where a sync flushes the whole device. Commits
+    /// at `GroupSync` or `Sync` never wait for it.
+    pub sync_interval: Option<Duration>,
 }
 
 impl FeedRetention {
     /// Keeps `bytes` of history, with no age limit.
     pub fn bytes(bytes: u64) -> Self {
-        Self { bytes, age: None }
+        Self {
+            bytes,
+            age: None,
+            sync_interval: None,
+        }
     }
 
     /// Also drops history older than `age`.
     pub fn age(mut self, age: Duration) -> Self {
         self.age = Some(age);
+        self
+    }
+
+    /// Sets the background sync's interval for fed `Buffered` and `None` commits (see
+    /// [`sync_interval`](Self#structfield.sync_interval)).
+    pub fn sync_interval(mut self, interval: Duration) -> Self {
+        self.sync_interval = Some(interval);
         self
     }
 }
@@ -1146,6 +1162,13 @@ pub enum Aggregation {
     /// [`CellRef::bloom_contains`](crate::CellRef::bloom_contains)): no false negatives,
     /// false positives at the configured rate.
     Bloom(BloomParams),
+    /// A set of `u32`s, stored as a standard roaring bitmap
+    /// ([`set_add`](crate::RowMutation::set_add) and
+    /// [`set_remove`](crate::RowMutation::set_remove), applied in commit order; read with
+    /// [`CellRef::as_set`](crate::CellRef::as_set)). A cell may be large (about `N / 8`
+    /// bytes for `N` elements spread densely), so above the family's `blob_threshold` it
+    /// moves to a blob file, and reads and compactions fold new inputs onto it there.
+    Set,
 }
 
 /// A bloom family's parameters ([`Aggregation::Bloom`], D298): `bits` (a power of two,
@@ -1301,6 +1324,7 @@ impl Aggregation {
             Aggregation::Histogram(_) => FamilyKind::Histogram,
             Aggregation::Quantiles(_) => FamilyKind::Quantiles,
             Aggregation::Bloom(_) => FamilyKind::Bloom,
+            Aggregation::Set => FamilyKind::Set,
         }
     }
 
@@ -1361,6 +1385,7 @@ impl Aggregation {
             FamilyKind::MaxF64 => Some(Aggregation::MaxF64),
             FamilyKind::SumF64 => Some(Aggregation::SumF64),
             FamilyKind::MeanVar => Some(Aggregation::MeanVar),
+            FamilyKind::Set => Some(Aggregation::Set),
             FamilyKind::Histogram | FamilyKind::Quantiles | FamilyKind::Bloom => None,
         }
     }
@@ -1381,6 +1406,7 @@ impl Aggregation {
             Aggregation::Histogram(_) => "pigeonhole.f64_histogram",
             Aggregation::Quantiles(_) => "pigeonhole.f64_quantiles",
             Aggregation::Bloom(_) => "pigeonhole.bloom",
+            Aggregation::Set => "pigeonhole.set",
         }
     }
 }
@@ -1689,6 +1715,9 @@ impl Options {
                     .age
                     .map(|a| u64::try_from(a.as_micros()).unwrap_or(u64::MAX));
                 f.tables.clone_from(tables);
+                f.sync_interval_micros = r
+                    .sync_interval
+                    .map(|d| u64::try_from(d.as_micros()).unwrap_or(u64::MAX));
                 Some(f)
             }
             (None, Some(_)) => {
