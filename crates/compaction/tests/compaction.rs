@@ -1288,6 +1288,100 @@ fn set_operands_combine_into_a_settled_operand_or_fold_into_a_set() {
     assert_eq!(set.iter().collect::<Vec<_>>(), [2, 5, 9, 70_000]);
 }
 
+/// A set fold's working form with corrupt framing (perf287 on #1295, S1) is a merge error,
+/// never a panic: a length prefix cut short, an entry shorter than its length, either as
+/// the accumulator (`finish`, `settle`) or as the older value `merge` appends.
+#[test]
+fn a_truncated_set_working_form_is_a_merge_error() {
+    use pigeonhole_compaction::{MergeOperator, SetOps};
+    use pigeonhole_format::value::TRANSIENT_TAG;
+    let mut good = vec![0u8];
+    pigeonhole_format::roaring::encode_operand(&mut good, &[3], &[]);
+    let len = (good.len() as u32 - 1).to_le_bytes();
+    let whole = [&[TRANSIENT_TAG][..], &len, &good[1..]].concat();
+    let truncated: Vec<Vec<u8>> = vec![
+        vec![TRANSIENT_TAG, 1, 0],
+        whole[..whole.len() - 1].to_vec(),
+        [&whole[..], &[9, 0, 0, 0, 1]].concat(),
+    ];
+    // The whole form reads.
+    let mut acc = whole.clone();
+    SetOps.settle(&mut acc).unwrap();
+    assert_eq!(acc, good);
+    for bad in &truncated {
+        let mut acc = bad.clone();
+        assert!(SetOps.finish(None, &mut acc).is_err(), "{bad:?}");
+        let mut acc = bad.clone();
+        assert!(SetOps.settle(&mut acc).is_err(), "{bad:?}");
+        let mut acc = good.clone();
+        assert!(SetOps.merge(&mut acc, bad).is_err(), "{bad:?}");
+    }
+}
+
+/// An operator whose combined operand doesn't settle (perf287 on #1295, S2): compaction
+/// keeps the operands apart, unchanged, so no working form is stored, in a release build
+/// too. Folded onto a base, the run is one canonical set (`finish`), which settles.
+#[test]
+#[cfg_attr(
+    miri,
+    ignore = "each SimVfs pager costs ~25 s under Miri; covered natively"
+)]
+fn operands_that_do_not_settle_are_kept_apart() {
+    use pigeonhole_compaction::{MergeError, MergeOperator, SetOps};
+    use pigeonhole_format::roaring;
+    #[derive(Debug)]
+    struct NoSettle;
+    impl MergeOperator for NoSettle {
+        fn name(&self) -> &str {
+            SetOps::NAME
+        }
+        fn merge(&self, acc: &mut Vec<u8>, older: &[u8]) -> Result<(), MergeError> {
+            SetOps.merge(acc, older)
+        }
+        fn finish(&self, base: Option<&[u8]>, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+            SetOps.finish(base, acc)
+        }
+        fn settle(&self, acc: &mut Vec<u8>) -> Result<(), MergeError> {
+            if acc.first() == Some(&pigeonhole_format::value::TRANSIENT_TAG) {
+                return Err(MergeError {
+                    operator: SetOps::NAME.into(),
+                    message: "settle refused (test)".into(),
+                });
+            }
+            Ok(())
+        }
+    }
+    let mut db = Db::new(12);
+    let family = FamilyOptions::default()
+        .merge_operator("pigeonhole.set")
+        .kind(FamilyKind::Set);
+    let op = |adds: &[u32]| {
+        let mut v = vec![0u8];
+        roaring::encode_operand(&mut v, adds, &[]);
+        v
+    };
+    let mut base = vec![0u8];
+    roaring::encode_sorted(&mut base, [1, 2]);
+    let run = vec![
+        (key(b"r", b"s", 7, 4, Kind::Merge), op(&[9])),
+        (key(b"r", b"s", 7, 3, Kind::Merge), op(&[8])),
+        (key(b"r", b"s", 7, 2, Kind::Merge), op(&[7])),
+    ];
+    let mut with_base = run.clone();
+    with_base.push((key(b"r", b"s", 7, 1, Kind::Put), base));
+    let mut gc = policy(vec![], 100, false);
+    gc.other_sources = Some(vec![]);
+    let input = db.sst(&family, &run);
+    let (_, kept) = compact_op(&db, &family, &[input], gc.clone(), Arc::new(NoSettle));
+    assert_eq!(kept, run);
+    let input = db.sst(&family, &with_base);
+    let (_, kept) = compact_op(&db, &family, &[input], gc, Arc::new(NoSettle));
+    assert_eq!(kept.len(), 1, "{kept:?}");
+    assert_eq!(kept[0].0, key(b"r", b"s", 7, 4, Kind::Put));
+    let set = roaring::SetRef::parse(&kept[0].1[1..]).unwrap();
+    assert_eq!(set.iter().collect::<Vec<_>>(), [1, 2, 7, 8, 9]);
+}
+
 /// A counter family's operands are not combined across the seqno range of another source
 /// that overlaps their row: a family marker there (seqno 2) hides the older operand but not
 /// the newer, which one combined operand could not express.
