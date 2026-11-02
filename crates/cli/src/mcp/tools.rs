@@ -138,6 +138,14 @@ impl Tools {
         tools
     }
 
+    /// The names [`list`](Self::list) gives now.
+    pub(super) fn names(&self) -> Vec<String> {
+        self.list()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(str::to_owned))
+            .collect()
+    }
+
     /// `tools/call`, or `None` for a tool this server doesn't have.
     pub(super) fn call(&self, name: &str, args: &Map<String, Value>) -> Option<Outcome> {
         let a = Args(args);
