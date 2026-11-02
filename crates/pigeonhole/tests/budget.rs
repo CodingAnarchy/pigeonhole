@@ -541,3 +541,159 @@ fn a_traversal_budget_cuts_a_hop_and_ends_the_traversal() {
     assert_eq!(p.hops()[0].nodes().len(), 4);
     db.close().unwrap();
 }
+
+/// `Nearest::run_within` (D308 PR 3, #1302): `run`'s ranked neighbours cut to the longest
+/// prefix whose sizes (row key + qualifier + 16 each) fit, for every element and metric.
+#[test]
+fn a_budgeted_nearest_search_is_runs_prefix_that_fits() {
+    let dir = std::env::temp_dir().join(format!("phdb-budget-{}-knn", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Pigeonhole::open(
+        dir.join("k.phdb"),
+        Options::default().shards(2).pin_threads(false),
+    )
+    .unwrap();
+    let specs = [
+        VectorSpec::new(4, Element::F32, Metric::L2).unwrap(),
+        VectorSpec::new(4, Element::F32, Metric::Cosine).unwrap(),
+        VectorSpec::new(4, Element::F32, Metric::InnerProduct).unwrap(),
+        VectorSpec::new(4, Element::I8, Metric::L2).unwrap(),
+        VectorSpec::new(16, Element::Bit, Metric::Hamming).unwrap(),
+    ];
+    let mut seed = 0x1302u64;
+    let mut next = || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+    for (si, spec) in specs.iter().enumerate() {
+        let t = db
+            .table(&format!("v{si}"))
+            .unwrap()
+            .family("e", Family::vector(*spec))
+            .create_if_missing()
+            .unwrap();
+        // Rows and qualifiers of varied lengths, so sizes differ.
+        for i in 0..80u64 {
+            let row = format!("r{}{i}", "x".repeat((next() % 5) as usize)).into_bytes();
+            let q = "q".repeat((next() % 4) as usize).into_bytes();
+            let m = t.mutate(&row);
+            let m = match spec.element() {
+                Element::F32 => {
+                    let v: Vec<f32> = (0..4).map(|_| (next() % 100) as f32 / 10.0 + 0.1).collect();
+                    m.put_vector_f32("e", &q, &v)
+                }
+                Element::I8 => {
+                    let v: Vec<i8> = (0..4).map(|_| (next() % 100) as i8).collect();
+                    m.put_vector_i8("e", &q, &v)
+                }
+                _ => m.put_vector_bits("e", &q, &[next() as u8, next() as u8]),
+            };
+            m.commit().unwrap();
+        }
+        let snap = db.snapshot().unwrap();
+        let search = |k: usize| {
+            let s = t.scan_prefix(b"").family("e").snapshot(&snap);
+            match spec.element() {
+                Element::F32 => s.nearest_f32(&[1.0, 2.0, 3.0, 4.0], k),
+                Element::I8 => s.nearest_i8(&[10, 20, 30, 40], k),
+                _ => s.nearest_bits(&[0b1010_1010, 0b0101_0101], k),
+            }
+        };
+        for _ in 0..40 {
+            let k = 1 + (next() % 30) as usize;
+            let budget = next() % 700;
+            let all = search(k).run().unwrap();
+            let page = search(k).run_within(budget).unwrap();
+            // The hand-cut prefix.
+            let size = |n: &pigeonhole::Neighbour| (n.row.len() + n.qualifier.len() + 16) as u64;
+            let (mut used, mut keep) = (0u64, 0usize);
+            while keep < all.len() && used + size(&all[keep]) <= budget {
+                used += size(&all[keep]);
+                keep += 1;
+            }
+            let ctx = format!("spec {si}, k {k}, budget {budget}");
+            assert_eq!(page.neighbours(), &all[..keep], "{ctx}");
+            assert_eq!(page.bytes(), used, "{ctx}");
+            assert!(page.bytes() <= budget, "{ctx}");
+            assert_eq!(page.cut_by_budget(), keep < all.len(), "{ctx}");
+            assert_eq!(page.next_bytes(), all.get(keep).map(size), "{ctx}");
+        }
+        // A budget of 0, and one too small for the nearest: empty, cut, with next_bytes.
+        let all = search(5).run().unwrap();
+        for budget in [0, size_of_first(&all) - 1] {
+            let page = search(5).run_within(budget).unwrap();
+            assert!(page.neighbours().is_empty() && page.cut_by_budget());
+            assert_eq!(page.next_bytes(), Some(size_of_first(&all)));
+        }
+        // A budget covering every candidate isn't cut.
+        let page = search(5).run_within(u64::MAX).unwrap();
+        assert_eq!(page.clone().into_neighbours(), all);
+        assert!(!page.cut_by_budget() && page.next_bytes().is_none());
+    }
+    // At an older snapshot, the page is that snapshot's.
+    let t = db.table("v0").unwrap().open().unwrap();
+    let before = db.snapshot().unwrap();
+    t.mutate(b"aa-nearest")
+        .put_vector_f32("e", b"", &[1.0, 2.0, 3.0, 4.0])
+        .commit()
+        .unwrap();
+    let then = t
+        .scan_prefix(b"")
+        .family("e")
+        .snapshot(&before)
+        .nearest_f32(&[1.0, 2.0, 3.0, 4.0], 3)
+        .run_within(1 << 20)
+        .unwrap();
+    assert!(then.neighbours().iter().all(|n| n.row != b"aa-nearest"));
+    let now = t
+        .scan_prefix(b"")
+        .family("e")
+        .nearest_f32(&[1.0, 2.0, 3.0, 4.0], 3)
+        .run_within(1 << 20)
+        .unwrap();
+    assert_eq!(now.neighbours()[0].row, b"aa-nearest");
+    db.close().unwrap();
+}
+
+fn size_of_first(all: &[pigeonhole::Neighbour]) -> u64 {
+    (all[0].row.len() + all[0].qualifier.len() + 16) as u64
+}
+
+#[test]
+fn the_async_budgeted_nearest_search_equals_the_sync_one() {
+    let dir = std::env::temp_dir().join(format!("phdb-budget-{}-knn-async", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Pigeonhole::open(
+        dir.join("k.phdb"),
+        Options::default().shards(2).pin_threads(false),
+    )
+    .unwrap();
+    let spec = VectorSpec::new(2, Element::F32, Metric::L2).unwrap();
+    let t = db
+        .table("v")
+        .unwrap()
+        .family("e", Family::vector(spec))
+        .create_if_missing()
+        .unwrap();
+    for i in 0..50u32 {
+        t.mutate(format!("r{i:02}").as_bytes())
+            .put_vector_f32("e", b"", &[i as f32, 1.0])
+            .commit()
+            .unwrap();
+    }
+    for budget in [0, 19, 20, 100, 1 << 20] {
+        let search = || t.scan_prefix(b"").family("e").nearest_f32(&[10.0, 1.0], 8);
+        let sync = search().run_within(budget).unwrap();
+        let fut = pigeonhole::doc_support::block_on(search().run_within_async(budget)).unwrap();
+        assert_eq!(fut.neighbours(), sync.neighbours(), "budget {budget}");
+        assert_eq!(
+            (fut.bytes(), fut.next_bytes()),
+            (sync.bytes(), sync.next_bytes())
+        );
+    }
+    db.close().unwrap();
+}

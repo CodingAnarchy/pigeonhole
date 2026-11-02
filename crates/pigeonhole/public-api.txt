@@ -479,6 +479,15 @@ impl pigeonhole::Nearest<'_>
 pub fn pigeonhole::Nearest<'_>::parallel(self, usize) -> Self
 pub fn pigeonhole::Nearest<'_>::run(self) -> pigeonhole::Result<alloc::vec::Vec<pigeonhole::Neighbour>>
 pub async fn pigeonhole::Nearest<'_>::run_async(self) -> pigeonhole::Result<alloc::vec::Vec<pigeonhole::Neighbour>>
+pub fn pigeonhole::Nearest<'_>::run_within(self, u64) -> pigeonhole::Result<pigeonhole::NearestPage>
+pub async fn pigeonhole::Nearest<'_>::run_within_async(self, u64) -> pigeonhole::Result<pigeonhole::NearestPage>
+pub struct pigeonhole::NearestPage
+impl pigeonhole::NearestPage
+pub fn pigeonhole::NearestPage::bytes(&self) -> u64
+pub fn pigeonhole::NearestPage::cut_by_budget(&self) -> bool
+pub fn pigeonhole::NearestPage::into_neighbours(self) -> alloc::vec::Vec<pigeonhole::Neighbour>
+pub fn pigeonhole::NearestPage::neighbours(&self) -> &[pigeonhole::Neighbour]
+pub fn pigeonhole::NearestPage::next_bytes(&self) -> core::option::Option<u64>
 #[non_exhaustive] pub struct pigeonhole::Neighbour
 pub pigeonhole::Neighbour::distance: f64
 pub pigeonhole::Neighbour::qualifier: alloc::vec::Vec<u8>

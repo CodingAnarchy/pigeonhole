@@ -55,6 +55,15 @@ As D308 rev 2 §4:
 ## PR 3
 `Nearest::run_within(bytes) -> NearestPage` (`neighbours()`, `bytes()`, `cut_by_budget()`, `next_bytes()`), after D296 PR 4. `run()` keeps returning `Vec<Neighbour>`.
 
+**As built (#1302):**
+- **`Nearest::run_within(self, bytes: u64) -> Result<NearestPage>`:** `run()`'s ranked neighbours cut to the longest prefix whose sizes fit. A neighbour's size is its row key, its qualifier and `BUDGET_ITEM_OVERHEAD` (16), per D308 §2, which counts a neighbour without a value.
+  - A first neighbour larger than the budget, or a budget of 0, gives an empty page marked cut, with `next_bytes`.
+- **`Nearest::run_within_async(self, bytes)`,** behind the `async` feature: the same page, on `run_async`.
+- **`NearestPage`** (`Debug`, `Clone`): `neighbours()`, `into_neighbours()`, `bytes()`, `cut_by_budget()`, `next_bytes()`.
+  - **No resume position:** a nearest search ranks every candidate it reads, so a later page couldn't continue the ranking. A larger budget, or a larger `k`, returns more.
+- **The search reads what `run()` reads,** and `run()`'s code is unchanged.
+- **The callgrind shape** `knn-budget`, with its ceiling, comes in a follow-up once this API is on main, since the instructions job builds the base with the head's examples.
+
 ## Why
 D308 (#1250): retrieval for language models is budgeted in bytes and tokens, not rows. A read that stops at a byte budget, after ranking, returns as much of the best data as fits and reads no more than it needs.
 
