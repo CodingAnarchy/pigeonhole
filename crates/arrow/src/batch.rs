@@ -263,6 +263,8 @@ impl Builder {
         if let Some(dim) = self.options.vector_dim {
             // In 1..=4096 (`ArrowOptions::vector_dim`).
             let dim = dim as usize;
+            // Widened straight into the column's buffer: no allocation per cell (perf287's
+            // S1 on #1312). A bit vector has no float form: `widen_into` appends nothing.
             let widened = match &vector {
                 Some(v) if v.dim() as usize != dim => {
                     return Err(ArrowError::InvalidArgumentError(format!(
@@ -271,19 +273,14 @@ impl Builder {
                         String::from_utf8_lossy(key),
                     )));
                 }
-                // `None` for a bit vector: it has no float form.
-                Some(v) => v.to_f32_vec(),
-                None => None,
+                Some(v) => v.widen_into(&mut self.components),
+                None => false,
             };
-            match widened {
-                Some(xs) => {
-                    self.components.extend_from_slice(&xs);
-                    self.vector_nulls.append_non_null();
-                }
-                None => {
-                    self.components.resize(self.components.len() + dim, 0.0);
-                    self.vector_nulls.append_null();
-                }
+            if widened {
+                self.vector_nulls.append_non_null();
+            } else {
+                self.components.resize(self.components.len() + dim, 0.0);
+                self.vector_nulls.append_null();
             }
         }
         Ok(())

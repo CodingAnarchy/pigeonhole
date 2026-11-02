@@ -10,6 +10,7 @@
     - Each vector cell's components go there: `f32`, `f16` and `bf16` widened exactly, `i8` as exact floats.
     - Other cells, and bit vectors (no float form), are null.
     - A vector of another dimension fails its batch with `ArrowError::InvalidArgumentError` naming the row. `schema(&options)` is known before the scan, so one export has one `dim`: select families of one dimension.
+- **pigeonhole:** `VectorRef::widen_into(&self, out: &mut Vec<f32>) -> bool` appends the components as `to_f32_vec` gives them (exact for `f32`, `i8`, `f16`, `bf16`), without allocating its own vector, and returns `false` with nothing appended for a bit vector. The Arrow builder widens into its column buffer with it, so an export allocates nothing per cell (perf287's S1 on #1312); `to_f32_vec` is built on it.
 - **phdb** (`dump`, `load`, `info`, `shell`, `mcp`):
   - **A family's options gain `"vector": {"dim", "element", "metric"}`** (null for other families). Elements are `f32`, `i8`, `bit`, `f16` or `bf16`; metrics are `l2`, `inner_product`, `cosine` or `hamming`. `load` and the MCP `create_table` read it back, so a dump recreates its vector families.
   - **A vector value is `{"vector": {"dim", "element", "values": [...]}}`.** Floats are the `f64`s they widen to exactly, `i8` components are integers, and a bit vector has `"base64"` in place of `values`. A dump and load round-trips every stored bit: a half is written widened, and `put_vector_f32` rounds it back to the same bits.

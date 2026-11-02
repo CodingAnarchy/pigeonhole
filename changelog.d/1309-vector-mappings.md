@@ -4,3 +4,4 @@
 
 ### Added
 - `ArrowOptions::vector_dim(n)` (ICR 0108): a `value_vector: FixedSizeList<Float32, n>` column of each vector cell's components, widened exactly.
+- `VectorRef::widen_into(&mut Vec<f32>) -> bool`: appends a vector's components as `f32`s (exact for every float element and `i8`), without allocating, for callers filling one buffer with many vectors.
