@@ -5038,12 +5038,12 @@ impl ShardState {
             self.wait_room = false;
             let _ = ctx.submitter(self.id).submit(ShardMsg::Kick);
         }
-        if self.pending.is_empty() {
+        if self.pending.is_empty() && self.room_wait.is_some() {
             // No group waits any more: the wait (and its timeout timer) ends here rather
             // than at the next group, which may never come (issue #88).
             self.end_room_wait(ctx.now_nanos());
         }
-        self.end_backoff_on_event(ctx.now_nanos());
+        self.end_backoff_on_event(ctx);
         self.check_flush_waiters();
         self.spawn_flush(ctx);
         self.maintain(ctx);
@@ -6258,7 +6258,7 @@ impl ShardState {
             return;
         }
         self.refresh_tablets();
-        self.end_backoff_on_event(ctx.now_nanos());
+        self.end_backoff_on_event(ctx);
         let spare = self.member_buf();
         let mut members = std::mem::replace(&mut self.pending, spare);
 
@@ -9776,11 +9776,13 @@ impl ShardState {
     /// fires, so these events end a compaction backoff (and every slot's quarantine) there
     /// (D126). On a moving clock only the timer does: otherwise under steady writes every
     /// group would restart a compaction that keeps failing (issue #141).
-    fn end_backoff_on_event(&mut self, now: u64) {
+    fn end_backoff_on_event(&mut self, ctx: &ShardContext<'_, ShardMsg>) {
+        // The clock is read only with a timer to test: every group and batch end comes here,
+        // and an uncontended commit read it twice for nothing (#1206).
         let frozen = self
             .backoff_timer
             .as_ref()
-            .is_some_and(|(t, _)| t.frozen(now));
+            .is_some_and(|(t, _)| t.frozen(ctx.now_nanos()));
         if frozen {
             self.slot_backoff.clear();
             self.due_backing_off = false;
