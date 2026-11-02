@@ -13,10 +13,11 @@
 //! | `family` | `Dictionary<Int32, Utf8>` | |
 //! | `qualifier` | `Binary` | `Utf8` with [`ArrowOptions::utf8_keys`] |
 //! | `ts` | `Timestamp(Microsecond, "UTC")` | `UInt64` with [`TsType::UInt64`] |
-//! | `value` | `Binary` | [`CellRef::value`](pigeonhole::CellRef::value): the bytes, or a typed value's little-endian encoding |
-//! | `value_type` | `Dictionary<Int8, Utf8>` | `bytes`, `i64`, `f64` or `varint` |
+//! | `value` | `Binary` | [`CellRef::value`](pigeonhole::CellRef::value): the bytes, or a typed value's little-endian encoding (a vector's: its element byte, `dim` as a varint, then its payload) |
+//! | `value_type` | `Dictionary<Int8, Utf8>` | `bytes`, `i64`, `f64`, `varint` or `vector` |
 //! | `value_i64` | `Int64`, nullable | with [`ArrowOptions::typed_values`]: i64 and varint cells (counters, min and max families) |
 //! | `value_f64` | `Float64`, nullable | with [`ArrowOptions::typed_values`]: f64 cells |
+//! | `value_vector` | `FixedSizeList<Float32, dim>`, nullable | with [`ArrowOptions::vector_dim`]: vector cells' components, widened exactly (bit vectors and other cells null; D303, ICR 0108) |
 //!
 //! Each key and value is copied once into the batch's buffers; nothing is allocated per
 //! cell. A batch closes at [`ArrowOptions::batch_cells`] cells or

@@ -13,6 +13,7 @@ pub fn pigeonhole_arrow::ArrowOptions::row_dictionary(self, bool) -> Self
 pub fn pigeonhole_arrow::ArrowOptions::ts(self, pigeonhole_arrow::TsType) -> Self
 pub fn pigeonhole_arrow::ArrowOptions::typed_values(self, bool) -> Self
 pub fn pigeonhole_arrow::ArrowOptions::utf8_keys(self, bool) -> Self
+pub fn pigeonhole_arrow::ArrowOptions::vector_dim(self, u32) -> Self
 impl core::default::Default for pigeonhole_arrow::ArrowOptions
 pub fn pigeonhole_arrow::ArrowOptions::default() -> Self
 pub struct pigeonhole_arrow::ArrowScan<'t>

@@ -6,20 +6,21 @@ use std::sync::Arc;
 
 use arrow_array::types::Int32Type;
 use arrow_array::{
-    ArrayRef, BinaryArray, DictionaryArray, Float64Array, Int8Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray, UInt64Array,
+    ArrayRef, BinaryArray, DictionaryArray, FixedSizeListArray, Float32Array, Float64Array,
+    Int8Array, Int32Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
+    UInt64Array,
 };
 use arrow_buffer::{Buffer, NullBufferBuilder, OffsetBuffer, ScalarBuffer};
 use arrow_schema::{ArrowError, SchemaRef};
 use pigeonhole::{CellEntry, RowRef, Value};
 
-use crate::options::{ArrowOptions, TsType, schema};
+use crate::options::{ArrowOptions, TsType, schema, vector_item};
 
 /// The hard cap on a batch's key and value bytes: the byte columns' offsets are `i32`.
 const MAX_BYTES: usize = 1 << 30;
 
 /// `value_type`'s dictionary, in key order.
-const VALUE_TYPES: [&str; 4] = ["bytes", "i64", "f64", "varint"];
+const VALUE_TYPES: [&str; 5] = ["bytes", "i64", "f64", "varint", "vector"];
 
 /// A byte column: values back to back, with `i32` offsets.
 #[derive(Debug)]
@@ -133,6 +134,9 @@ pub(crate) struct Builder {
     int_nulls: NullBufferBuilder,
     floats: Vec<f64>,
     float_nulls: NullBufferBuilder,
+    /// With `vector_dim`: `dim` components per cell (zeros under a null), and the nulls.
+    components: Vec<f32>,
+    vector_nulls: NullBufferBuilder,
 }
 
 impl Builder {
@@ -156,6 +160,8 @@ impl Builder {
             int_nulls: NullBufferBuilder::new(0),
             floats: Vec::new(),
             float_nulls: NullBufferBuilder::new(0),
+            components: Vec::new(),
+            vector_nulls: NullBufferBuilder::new(0),
         }
     }
 
@@ -225,11 +231,17 @@ impl Builder {
         self.ts.push(ts);
         let value = e.cell.value();
         self.values.push(value)?;
+        let mut vector = None;
         let (kind, int, float) = match e.cell.typed() {
             Value::Bytes(_) => (0, None, None),
             Value::I64(v) => (1, Some(v), None),
             Value::F64(v) => (2, None, Some(v)),
             Value::Varint(v) => (3, Some(v), None),
+            // `value` holds its element byte, dim varint and payload, exactly (ICR 0108).
+            Value::Vector(v) => {
+                vector = Some(v);
+                (4, None, None)
+            }
             // A value type added after this build (`Value` is non-exhaustive): refused, never
             // mislabelled as bytes (perf287's S1 on #941). Arrow is built against its own
             // `pigeonhole` (exact versions), so only a variant added without updating this
@@ -247,6 +259,29 @@ impl Builder {
             self.int_nulls.append(int.is_some());
             self.floats.push(float.unwrap_or(0.0));
             self.float_nulls.append(float.is_some());
+        }
+        if let Some(dim) = self.options.vector_dim {
+            // In 1..=4096 (`ArrowOptions::vector_dim`).
+            let dim = dim as usize;
+            // Widened straight into the column's buffer: no allocation per cell (perf287's
+            // S1 on #1312). A bit vector has no float form: `widen_into` appends nothing.
+            let widened = match &vector {
+                Some(v) if v.dim() as usize != dim => {
+                    return Err(ArrowError::InvalidArgumentError(format!(
+                        "a {}-dimension vector in row {:?}, but value_vector holds {dim}",
+                        v.dim(),
+                        String::from_utf8_lossy(key),
+                    )));
+                }
+                Some(v) => v.widen_into(&mut self.components),
+                None => false,
+            };
+            if widened {
+                self.vector_nulls.append_non_null();
+            } else {
+                self.components.resize(self.components.len() + dim, 0.0);
+                self.vector_nulls.append_null();
+            }
         }
         Ok(())
     }
@@ -287,6 +322,16 @@ impl Builder {
             std::mem::replace(&mut self.int_nulls, NullBufferBuilder::new(ints.len())).finish();
         let float_nulls =
             std::mem::replace(&mut self.float_nulls, NullBufferBuilder::new(floats.len())).finish();
+        let components = take(&mut self.components);
+        let vector_nulls = std::mem::replace(
+            &mut self.vector_nulls,
+            NullBufferBuilder::new(
+                self.options
+                    .vector_dim
+                    .map_or(0, |d| components.len() / d as usize),
+            ),
+        )
+        .finish();
 
         let rows = rows?;
         let row: ArrayRef = if self.options.row_dictionary {
@@ -329,6 +374,14 @@ impl Builder {
                 ScalarBuffer::from(floats),
                 float_nulls,
             )));
+        }
+        if let Some(dim) = self.options.vector_dim {
+            columns.push(Arc::new(FixedSizeListArray::try_new(
+                vector_item(),
+                dim,
+                Arc::new(Float32Array::new(ScalarBuffer::from(components), None)),
+                vector_nulls,
+            )?));
         }
         RecordBatch::try_new(Arc::clone(&self.schema), columns)
     }
