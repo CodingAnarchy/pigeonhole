@@ -74,6 +74,8 @@ pub struct Options {
     cpu_profile: CpuProfile,
     auto_recover: Recovery,
     change_feed: Option<FeedRetention>,
+    /// `change_feed_off()`: no feed, and nothing inherited.
+    feed_off: bool,
     feed_tables: Option<Vec<String>>,
 }
 
@@ -303,6 +305,7 @@ impl Default for Options {
             cpu_profile: CpuProfile::Embedded,
             auto_recover: Recovery::Off,
             change_feed: None,
+            feed_off: false,
             feed_tables: None,
         }
     }
@@ -320,7 +323,10 @@ impl Options {
     /// still caps it). Engine-owned shards run on up to a thread each, as few as the load
     /// needs ([`adaptive_shard_threads`](Options::adaptive_shard_threads), on by default),
     /// unless [`shard_threads`](Options::shard_threads) fixes the count (D289).
-    /// `1` is a valid configuration.
+    /// `1` is a valid configuration. **Unset, an existing database with a change feed keeps
+    /// the shard count its last open recorded**, since another count ends the feed's history
+    /// (D310's amendment). Set it to reshard on purpose; a feed then expires with "the shard
+    /// count changed".
     pub fn shards(mut self, n: usize) -> Self {
         self.shards = n;
         self
@@ -658,20 +664,38 @@ impl Options {
         self
     }
 
-    /// Turns on the change feed's history (D310, off by default): the log keeps `retention`
-    /// of committed changes, a clean close keeps it, and the next open with the feed on
-    /// takes it up again without replaying it. Configured per open: an open without it
-    /// keeps no history, and the history a subscriber could resume from ends there. With a
-    /// feed, the database at rest is the main file plus its `-wal-N` files and the
-    /// `-feed` file beside it.
+    /// Turns on the change feed's history (D310): the log keeps `retention` of committed
+    /// changes, a clean close keeps it, and the next open with the feed on takes it up again
+    /// without replaying it. With a feed, the database at rest is the main file plus its
+    /// `-wal-N` files and the `-feed` file beside it.
+    ///
+    /// **An open that doesn't mention the feed inherits it** (D310's amendment): if the last
+    /// open fed, the next one with neither `change_feed` nor
+    /// [`change_feed_off`](Self::change_feed_off) feeds the same tables with the same
+    /// retention and age, so a tool that opens the file between two runs of the app
+    /// (`phdb load`, say) keeps the app's feed history instead of ending it.
+    /// [`FeedRetention::sync_interval`] is per open: an inherited feed uses the default. A new
+    /// database, one whose last open had the feed off, or one whose fed tables were all
+    /// dropped since, stays off.
     pub fn change_feed(mut self, retention: FeedRetention) -> Self {
         self.change_feed = Some(retention);
+        self.feed_off = false;
         self
     }
 
-    /// The tables the change feed covers, by name (default: every table). Each must exist
-    /// when the database opens, and the feed must be on
-    /// ([`change_feed`](Self::change_feed)), or the open fails with
+    /// Turns the change feed off for this open, whatever the last open did. This ends the
+    /// feed's history: a subscriber's token from before can't resume past this open
+    /// ([`ErrorCode::FeedExpired`](crate::ErrorCode::FeedExpired)), and the retained log
+    /// is no longer kept.
+    pub fn change_feed_off(mut self) -> Self {
+        self.change_feed = None;
+        self.feed_off = true;
+        self
+    }
+
+    /// The tables the change feed covers, by name (default: every table, or what an
+    /// inherited feed covered). Each must exist when the database opens, and the feed must
+    /// be turned on in this open ([`change_feed`](Self::change_feed)), or the open fails with
     /// [`ErrorCode::InvalidArgument`](crate::ErrorCode::InvalidArgument). A table added to
     /// the list later has history from that open on.
     pub fn feed_tables<I, S>(mut self, tables: I) -> Self
@@ -1727,6 +1751,8 @@ impl Options {
             }
             (None, None) => None,
         };
+        // Unset (neither `change_feed` nor `change_feed_off`): inherit the last session's.
+        o.feed_inherit = self.change_feed.is_none() && !self.feed_off;
         o.tablet_changes = self.tablet_changes;
         o.balance_pack = self.tablet_packing;
         if let Some(window) = self.commit_spin {

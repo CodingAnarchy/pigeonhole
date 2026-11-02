@@ -4020,3 +4020,19 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **perf287's `debug_assert`** (on #1297): `Feed::needs` asserts that a fed batch decodes. Admission decodes every batch first, so it holds today.
 - **Tests:** `pigeonhole/tests/feed.rs` covers named and typed changes of every kind, a cross-table commit arriving whole, a snapshot start, a token across a reopen, a prefix, the refusals, and expiry across a feed-off open. `tests/recovery.rs` has a durable feed following an automatic recovery, mutation-checked.
 
+**Amendment (the owner, 2026-11-02: feed settings are inherited by default).** Any open without the feed settings, or with another shard count, used to end the feed's history, so `phdb load app.phdb` while the app was stopped silently expired the app's feed.
+- **`Options::change_feed` has three states:**
+  - unset (the default) inherits the sidecar's last session: its retention, age, and fed tables by id (a table dropped since is left out);
+  - `change_feed(r)` turns it on;
+  - the new `change_feed_off()` turns it off.
+  - A last open that recorded "fed: none", an entry this build doesn't know, or no sidecar means off, as before.
+- **The shard count:** an unset `Options::shards` with a recorded session takes its stream count. An explicit, different count (resharding on purpose) still expires the feed with "the shard count changed".
+- **No format change:** the sidecar already holds all of it.
+- **How it's built:**
+  - `EngineOptions::feed_inherit`, which `pigeonhole::Options` sets unless the feed is turned on or off explicitly;
+  - `feed::last_session`, read right after the pager gives the database id, so the shard count resolves before the manifest loads;
+  - the inherited settings become `options.feed` once the catalog has loaded.
+- **Tests:**
+  - `pigeonhole/tests/feed.rs`: a tool's plain open between two app sessions keeps the token (the shard count inherited too, three shards so no default matches); an explicit new shard count expires it; `change_feed_off()` ends it.
+  - The unit test `the_last_session_is_inherited_until_an_open_turns_the_feed_off`.
+- **Companion change (d), cli692:** `phdb`'s read-only commands open read-only.

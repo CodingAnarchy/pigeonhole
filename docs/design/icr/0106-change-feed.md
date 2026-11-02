@@ -63,6 +63,12 @@
 - `crates/engine/tests/feed_model.rs` (new sweep target), `it/feed_reader.rs` and `wal/tests/feed_cursor.rs`;
 - PR 3b's public `Feed`.
 
+## The inherit amendment (the owner, 2026-11-02)
+- **pigeonhole** (additive): `Options::change_feed_off()`.
+  - **Behaviour:** with neither `change_feed` nor `change_feed_off`, an open inherits the last session's feed settings (retention, age, fed tables; not `sync_interval`, which is per open). If every table it fed was dropped since, the open records the feed off.
+  - **The shard count:** with `shards` unset, an open takes the stream count the last session recorded, and only when that session fed. With no sidecar, or with the feed last off, unset `shards` keeps its old meaning (one per physical core).
+- **pigeonhole-engine:** `EngineOptions::feed_inherit` (default `false`).
+
 ## PR 3b: the public change feed (pigeonhole, additive)
 - `Table::feed() -> FeedBuilder`. The builder has `table`, `prefix`, `visible`, `from_snapshot`, `from_oldest`, `resume` and `open() -> Result<Feed>`.
 - `Feed`: `next(Duration)` and `try_next()` return `Result<Option<&Commit>>`. It also has `token() -> FeedToken` and `oldest_retained() -> Option<u64>`.
