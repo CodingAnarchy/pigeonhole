@@ -70,7 +70,8 @@ impl<'a> Search<'a> {
     ///
     /// The ranking statistics stay the whole index's (`N`, each term's `df`, the average
     /// length), so scores aren't comparable to those of an index holding only these
-    /// documents. Fewer than `k` hits may come back.
+    /// documents. Fewer than `k` hits may come back. An empty prefix restricts nothing, and
+    /// calling this again replaces the prefix: the last call wins.
     pub fn id_prefix(mut self, prefix: impl Into<Vec<u8>>) -> Self {
         self.prefix = Some(prefix.into());
         self

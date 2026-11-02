@@ -709,6 +709,12 @@ fn same_top_k(got: &[pigeonhole_text::Hit], want: &BTreeMap<Vec<u8>, f64>, k: us
             ranked[i].1
         );
     }
+    // Exactly equal scores come by id ascending.
+    for w in got.windows(2) {
+        if w[0].score == w[1].score {
+            assert!(w[0].id < w[1].id, "{ctx}: a tie out of id order");
+        }
+    }
 }
 
 #[test]

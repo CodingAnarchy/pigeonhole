@@ -19,7 +19,8 @@
 //! bound, inflated by a relative 1e-9 so a bound rounded the other way never prunes a
 //! document that belongs.
 
-use std::collections::BTreeMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BinaryHeap};
 
 use pigeonhole::{RowCells, Snapshot, Table};
 
@@ -184,6 +185,33 @@ impl<'t> Scored<'t> {
     }
 }
 
+/// A held result, ordered so the worst is greatest (a lower score, or an equal score with a
+/// larger id): the top of a [`BinaryHeap`] is the one a better candidate replaces.
+struct Held(f64, Vec<u8>);
+
+impl PartialEq for Held {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Held {}
+
+impl PartialOrd for Held {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Held {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .0
+            .total_cmp(&self.0)
+            .then_with(|| self.1.cmp(&other.1))
+    }
+}
+
 /// The top `k` documents of `clauses` (in their fixed order), by score descending then id
 /// ascending, with their exact scores.
 pub(crate) fn top_k(
@@ -193,6 +221,7 @@ pub(crate) fn top_k(
     mut clauses: Vec<Scored<'_>>,
     k: usize,
 ) -> Result<Vec<(Vec<u8>, f64)>> {
+    debug_assert!(k > 0, "the search returns before MaxScore at k = 0");
     let n = clauses.len();
     // Ascending bound; `prefix[i]` sums the first `i` bounds in that order.
     let mut by_bound: Vec<usize> = (0..n).collect();
@@ -201,16 +230,14 @@ pub(crate) fn top_k(
     for (i, &c) in by_bound.iter().enumerate() {
         prefix[i + 1] = prefix[i] + clauses[c].bound;
     }
-    // The held documents: (score, id), worst first by (score ascending, id descending).
-    let mut held: Vec<(f64, Vec<u8>)> = Vec::new();
-    let worse =
-        |a: &(f64, Vec<u8>), b: &(f64, Vec<u8>)| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1));
+    // The held documents, the worst on top.
+    let mut held: BinaryHeap<Held> = BinaryHeap::with_capacity(k + 1);
     // How many of `by_bound`'s first clauses are non-essential.
     let mut skip = 0;
     let mut contrib = vec![0.0f64; n];
     let mut has = vec![false; n];
     loop {
-        let threshold = (held.len() == k).then(|| held[0].0);
+        let threshold = (held.len() == k).then(|| held.peek().expect("k > 0 held").0);
         if let Some(th) = threshold {
             while skip < n && prefix[skip + 1] < th {
                 skip += 1;
@@ -261,15 +288,17 @@ pub(crate) fn top_k(
                 score += contrib[c];
             }
         }
-        let entry = (score, doc);
+        let entry = Held(score, doc);
         if held.len() < k {
             held.push(entry);
-            held.sort_by(worse);
-        } else if worse(&held[0], &entry).is_lt() {
-            held[0] = entry;
-            held.sort_by(worse);
+        } else if entry < *held.peek().expect("k > 0 held") {
+            // Better than the worst held: it takes the worst one's place.
+            held.pop();
+            held.push(entry);
         }
     }
-    held.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-    Ok(held.into_iter().map(|(s, d)| (d, s)).collect())
+    // Best first: score descending, then id ascending (`Held` orders the worst greatest).
+    let mut out = held.into_vec();
+    out.sort();
+    Ok(out.into_iter().map(|Held(s, d)| (d, s)).collect())
 }
