@@ -1004,6 +1004,12 @@ impl Engine {
                     f.note_root(sequence);
                 }
             }));
+            // Root commits of this open before the observer: only `finish`'s upgrade of an
+            // older file's superblocks. They are this session's, so record them; replay,
+            // recovery's checkpoint edits and repairs all come after (simp724's Q1, #1316).
+            for sequence in opened_at + 1..=pager.sequence() {
+                f.note_root(sequence);
+            }
         }
         let mut wal_opts = options.wal;
         wal_opts.retain_segments = feed.as_ref().map_or(0, |f| f.retain_segments);

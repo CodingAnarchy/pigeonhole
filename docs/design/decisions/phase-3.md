@@ -3951,10 +3951,11 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **The merge** (`FeedReader`, feed_reader.rs). Each poll loads the checkpoint marks, then the frontier F, then the heads, then reads every stream to its end. By M1 every record ≤ F is then read. A stream behind its head waits for its next header.
   - Commits are keyed: a single by its seqno, a cross-shard commit by its Decision's apply seqno, with its PREPAREs held by id until then.
   - They're delivered whole, in key order, filtered by table and then row prefix before anything is copied.
-  - A blob pointer is resolved, and a file that's gone expires the feed (S1).
+  - A blob pointer is resolved. A blob file the view no longer lists expires the feed (S1); any other read failure, a checksum's included, is an error (simp724 on #1316).
 - **Held PREPAREs** (S2, simp724's rule replacing rev 3's "passes `cross_held`"). An aborted round's PREPARE is dropped once its own stream's checkpoint, loaded before F, has passed it with no Decision read.
   - **Why it's exact:** a checkpoint passes a decided PREPARE only once its apply seqno is visible, and the Decision was in its file by then. It passes an undecided one only through `mark_aborted`, or through recovery without a Decision. Both were checked in the code.
-  - The floor is the backstop.
+  - **The floor fails closed** (simp724's H1 on #1316). The floor never passes the checkpoint's segment, so an undecided share the floor passed but the checkpoint didn't means a bound was broken: the feed expires rather than dropping it.
+  - **A round rule C dropped is remembered** until the floor passes its segment. A Decision for it then expires the feed instead of being passed over as recovery's all-or-nothing.
   - It applies only once every stream is read to its head.
 - **Start positions.** The shard records, with each checkpoint, the largest key it passed (`ckpt_key`, carried in `Checkpointed`). `Feed::note_checkpoint` stores that pair before the WAL's own checkpoint mark (`FeedMarks::checkpoint`, new).
   - A start bound B then reads each stream from the latest checkpoint whose key is ≤ B.
@@ -3968,8 +3969,10 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - retention past a token's position, or `Gone`;
   - a record of a non-feeding session past the delivered seqno (the mark rule);
   - delivered records lost (a torn tail, or a restart that lost them, M2);
-  - a vanished blob.
-- **Sessions chain** (the mark rule) only through contiguous Root sequences: each one above the one before it, from the session's `opened_at` (simp724 on fix A). A lost middle entry breaks the chain.
+  - a vanished blob;
+  - a held share past the floor but not the checkpoint, or a Decision for a round rule C dropped (H1).
+- **Sessions chain** (the mark rule) only through contiguous Root sequences: each one above the one before it, from the session's `opened_at` (simp724 on fix A). A lost middle entry breaks the chain, and so does an entry type this build doesn't know.
+  - **`opened_at`** is the superblock's sequence before any root commit of the open. The root-commit observer is registered right after the session's entry, before replay, recovery's checkpoint edits and repairs. The only earlier root commits are `finish`'s two upgrade commits of an older file; the open records those as the session's own (simp724's Q1 on #1316).
 - **Recovery's all-or-nothing.** A Decision from an earlier session whose shares aren't all in the files is a `Buffered` commit a power loss took a share of. Recovery dropped it whole, and the reader skips it.
 - **Fix A** (coordinator, 2026-11-02, so call 4 holds). Each Root sidecar append is synced.
   - **When:** after the durable root commit, coalesced to one sync in flight, submitted and never waited on (perf287).
@@ -3980,7 +3983,7 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - **Before fix A:** unsynced entries expired every durable feed at a power loss, against call 4.
 - **Waiting.** `FeedReader::wait` registers in the visible or durable watermark registry with a thread-unpark waker, and bounds each sleep by the hold's interval where the feed's own holds keep F back. It never spins.
 - **Tests:**
-  - `feed_model` is a sweep target: seeded single and cross-shard commits at every durability, flushes, clean reopens, power losses and unsynced bursts, with a durable and a visible subscriber resuming from tokens.
+  - `feed_model` is a sweep target: seeded single and cross-shard commits at every durability, flushes, clean reopens, power losses and unsynced bursts, with a durable and a visible subscriber resuming from tokens. After each power loss the reopen flushes (a root commit) before the tokens resume, and a durable token must continue.
   - `it/feed_reader.rs` covers the start kinds, filtering, tokens across a reopen, expiry, and rule C both ways.
-  - `wal/tests/feed_cursor.rs` covers the cursor.
+  - `wal/tests/feed_cursor.rs` covers the cursor, including a mid-segment hole: it stops where recovery did and then follows the next session's segment (Q2).
 

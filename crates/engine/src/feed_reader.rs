@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use pigeonhole_compaction::blob_pointer;
 use pigeonhole_format::feed::{FeedEntry, FeedHeader, FeedTables, decode_entries};
 use pigeonhole_format::wal::{BatchRef, WalRecord};
 use pigeonhole_format::{FamilyId, Kind, Lsn, Seqno, StreamId, TableId, Timestamp};
@@ -239,6 +240,11 @@ pub struct FeedReader {
     session: u64,
     ready: BTreeMap<Seqno, Pending>,
     held: HashMap<Seqno, Vec<Held>>,
+    /// Rounds whose shares rule C dropped (no Decision read, the checkpoint passed): id →
+    /// (stream, epoch) of a dropped share. A Decision for one later expires the feed rather
+    /// than passing over its commit as recovery's all-or-nothing (simp724's H1 on #1316).
+    /// An entry goes once the floor passes its segment.
+    dropped: HashMap<Seqno, (usize, u32)>,
     out: Commit,
     expired: Option<Expiry>,
     key: u64,
@@ -307,6 +313,7 @@ impl FeedReader {
             session: 0,
             ready: BTreeMap::new(),
             held: HashMap::new(),
+            dropped: HashMap::new(),
             out: Commit::default(),
             expired: None,
             key,
@@ -576,7 +583,11 @@ impl FeedReader {
         // Only now: simp724's rule holds once every stream was read to its end after the
         // checkpoints were loaded (a Decision in a stream not yet read to its head may be
         // the one a held PREPARE waits for).
-        self.drop_aborted(&checkpoints, &feed);
+        let floors: Vec<u32> = (0..self.streams.len()).map(|s| floor(&feed, s)).collect();
+        if let Some(e) = self.drop_aborted(&checkpoints, &floors) {
+            self.expired = Some(e);
+            return Ok(Polled::Expired);
+        }
         self.frontier = self.frontier.max(frontier);
         if self.emit()? {
             return Ok(Polled::Commit);
@@ -764,9 +775,11 @@ impl FeedReader {
     }
 
     /// Drops held PREPAREs of rounds that ended without a Decision: their stream's
-    /// checkpoint (loaded before the frontier) passed them and no Decision for them was read;
-    /// or their segment fell below the stream's floor.
-    fn drop_aborted(&mut self, checkpoints: &[Lsn], feed: &crate::feed::Feed) {
+    /// checkpoint (loaded before the frontier) passed them and no Decision for them was read
+    /// (rule C). A held share the floor passed but the checkpoint didn't expires the feed:
+    /// the floor never passes the checkpoint's segment, so that is a bound broken, and
+    /// dropping it could pass over a committed round (fail closed, simp724's H1 on #1316).
+    fn drop_aborted(&mut self, checkpoints: &[Lsn], floors: &[u32]) -> Option<Expiry> {
         let decided: std::collections::HashSet<Seqno> = self
             .ready
             .values()
@@ -775,17 +788,13 @@ impl FeedReader {
                 Pending::Single { .. } => None,
             })
             .collect();
-        self.held.retain(|id, shares| {
-            if decided.contains(id) {
-                return true;
-            }
-            shares.retain(|h| {
-                let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
-                let gone = h.start.epoch() < floor(feed, h.stream);
-                !(passed || gone)
-            });
-            !shares.is_empty()
-        });
+        drop_undecided(
+            &mut self.held,
+            &mut self.dropped,
+            &decided,
+            checkpoints,
+            floors,
+        )
     }
 
     /// Delivers the smallest pending commit at or below the frontier into `out`. Returns
@@ -823,12 +832,14 @@ impl FeedReader {
                     let st = &mut self.streams[stream];
                     st.delivered_end = st.delivered_end.max(end);
                     let shares = self.held.remove(&id).unwrap_or_default();
+                    // A round rule C dropped a share of: never passed over silently.
+                    let dropped = self.dropped.remove(&id).is_some();
                     // Every participant's PREPARE was in its file before the Decision was
                     // written, so it has been read; one missing was lost under the reader.
                     let complete = participants
                         .iter()
                         .all(|p| shares.iter().any(|h| h.stream == p.0 as usize));
-                    if !complete && session != self.current {
+                    if !complete && session != self.current && !dropped {
                         // A power loss took a share of a `Buffered` commit an earlier session
                         // wrote, and that session's recovery dropped it whole, as replay
                         // does (all or nothing): it never happened, so it isn't delivered.
@@ -861,18 +872,18 @@ impl FeedReader {
             self.out.ts = ts;
             self.out.changes.clear();
             for r in raws {
-                let value = match view.ssts.read_blob(&r.value) {
-                    Ok(Some(cell)) => cell.to_vec(),
-                    Ok(None) => r.value,
+                let value = match blob_pointer(&r.value) {
+                    None => r.value,
                     // The blob GC horizon follows the oldest retained segment, not readers: a
-                    // file gone under a slow reader means retention passed it (S1).
-                    Err(Error::Corruption(_)) => {
+                    // file the view no longer lists under a slow reader means retention
+                    // passed it (S1). Any other failure, a checksum's included, is an error.
+                    Some(ptr) if view.ssts.blob_reader(ptr.blob_file).is_none() => {
                         self.expired = Some(expiry(
                             "a blob value the feed was delivering is gone: retention passed the feed",
                         ));
                         return Ok(false);
                     }
-                    Err(e) => return Err(e),
+                    Some(ptr) => view.ssts.read_pointer(&ptr)?.to_vec(),
                 };
                 self.out.changes.push(Change {
                     table: r.table,
@@ -893,6 +904,47 @@ fn gap(key: Seqno) -> Expiry {
     expiry(format!(
         "history has a gap before seqno {key}: a session that did not feed these tables wrote the database"
     ))
+}
+
+/// [`FeedReader::drop_aborted`]'s rule over the held shares: drops each undecided share its
+/// stream's checkpoint passed, noting its round in `dropped`, and expires on one only the
+/// floor passed. Forgets dropped rounds whose segment is below the floor.
+fn drop_undecided(
+    held: &mut HashMap<Seqno, Vec<Held>>,
+    dropped: &mut HashMap<Seqno, (usize, u32)>,
+    decided: &std::collections::HashSet<Seqno>,
+    checkpoints: &[Lsn],
+    floors: &[u32],
+) -> Option<Expiry> {
+    let floor_of = |s: usize| floors.get(s).copied().unwrap_or(0);
+    for (id, shares) in held.iter() {
+        if decided.contains(id) {
+            continue;
+        }
+        for h in shares {
+            let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
+            if !passed && h.start.epoch() < floor_of(h.stream) {
+                return Some(expiry(
+                    "retention passed a held cross-shard share the checkpoint had not",
+                ));
+            }
+        }
+    }
+    held.retain(|id, shares| {
+        if decided.contains(id) {
+            return true;
+        }
+        shares.retain(|h| {
+            let passed = checkpoints.get(h.stream).is_some_and(|&c| c > h.start);
+            if passed {
+                dropped.insert(*id, (h.stream, h.start.epoch()));
+            }
+            !passed
+        });
+        !shares.is_empty()
+    });
+    dropped.retain(|_, &mut (s, epoch)| epoch >= floor_of(s));
+    None
 }
 
 /// Stream `s`'s floor: no segment of a smaller epoch is kept.
@@ -954,7 +1006,8 @@ fn chain(entries: &[FeedEntry], current: u64, tables: &[TableId]) -> Vec<u64> {
                 last_seq = Some(*sequence);
             }
             FeedEntry::Unfed { .. } => broken = true,
-            FeedEntry::Unknown(_) => {}
+            // A newer build's entry may mean a break: fail closed (simp724's nit on #1316).
+            FeedEntry::Unknown(_) => broken = true,
         }
     }
     let Some(pos) = sessions.iter().rposition(|s| s.0 == current) else {
@@ -1039,5 +1092,68 @@ mod tests {
             session(2, 1),
         ];
         assert_eq!(chain(&narrower, 2, &t), [2]);
+        // An entry this build doesn't know may be a break: it ends the chain too.
+        let unknown = [
+            session(1, 1),
+            root(1, 2),
+            FeedEntry::Unknown(0xee),
+            session(2, 2),
+        ];
+        assert_eq!(chain(&unknown, 2, &t), [2]);
+    }
+
+    fn held(stream: usize, epoch: u32) -> Held {
+        Held {
+            stream,
+            start: Lsn::new(epoch, 64),
+            end: Lsn::new(epoch, 128),
+            changes: Vec::new(),
+            outside: false,
+        }
+    }
+
+    /// simp724's H1 on #1316: rule C drops an undecided share its checkpoint passed and
+    /// remembers its round; one only the floor passed expires the feed, never a drop.
+    #[test]
+    fn a_share_only_the_floor_passed_expires_and_never_drops() {
+        let decided = std::collections::HashSet::from([7]);
+        // Stream 0's checkpoint is in epoch 5, stream 1's in epoch 3; the floors are 4 and 2.
+        let checkpoints = [Lsn::new(5, 0), Lsn::new(3, 0)];
+        let floors = [4, 2];
+        let mut held_map = HashMap::from([
+            // Undecided, passed on stream 0: dropped, and remembered.
+            (1, vec![held(0, 4)]),
+            // Undecided, not passed (epoch 5 at offset 64 is after the checkpoint): kept.
+            (2, vec![held(0, 5)]),
+            // Decided: kept whatever the marks say.
+            (7, vec![held(0, 1), held(1, 1)]),
+        ]);
+        let mut dropped = HashMap::new();
+        let e = drop_undecided(&mut held_map, &mut dropped, &decided, &checkpoints, &floors);
+        assert!(e.is_none());
+        assert!(!held_map.contains_key(&1));
+        assert!(held_map.contains_key(&2) && held_map.contains_key(&7));
+        assert_eq!(dropped.get(&1), Some(&(0, 4)));
+
+        // A share below its stream's floor that the checkpoint didn't pass: a bound broken,
+        // so the feed expires and nothing is dropped.
+        let mut held_map = HashMap::from([(3, vec![held(1, 1)])]);
+        let mut dropped = HashMap::new();
+        let checkpoints = [Lsn::new(5, 0), Lsn::new(1, 0)];
+        let e = drop_undecided(&mut held_map, &mut dropped, &decided, &checkpoints, &floors);
+        assert!(e.is_some_and(|e| e.reason.contains("retention passed a held")));
+        assert!(held_map.contains_key(&3) && dropped.is_empty());
+
+        // A remembered round is forgotten once the floor passes its segment.
+        let mut dropped = HashMap::from([(1, (0, 3)), (2, (0, 4))]);
+        let e = drop_undecided(
+            &mut HashMap::new(),
+            &mut dropped,
+            &decided,
+            &checkpoints,
+            &floors,
+        );
+        assert!(e.is_none());
+        assert_eq!(dropped.keys().copied().collect::<Vec<_>>(), [2]);
     }
 }

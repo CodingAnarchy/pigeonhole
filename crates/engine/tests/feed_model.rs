@@ -438,6 +438,11 @@ impl Run {
             }
         }
         self.lost_total += lost.len() as u32;
+        // The reopen's own work commits a root before any token resumes: the replayed
+        // memtables flushed (simp724's Q1 on #1316). The session's Root entries must chain
+        // from its `opened_at`, so a durable token still continues below.
+        let flush = self.db().submit_flush().unwrap();
+        drive(&mut self.shards, flush).unwrap();
         for tag in &lost {
             assert!(
                 !durable_delivered.contains(tag),

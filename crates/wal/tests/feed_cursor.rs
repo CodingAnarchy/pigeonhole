@@ -7,7 +7,7 @@ mod common;
 use common::*;
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, Seqno};
-use pigeonhole_wal::{FeedCursor, Wal, WalOptions, WalStream};
+use pigeonhole_wal::{FeedCursor, Recovery, Wal, WalOptions, WalStream};
 
 fn seqno_of(record: &WalRecord<'_>) -> Seqno {
     match record {
@@ -153,4 +153,83 @@ fn a_recycled_segment_is_gone_never_a_short_log() {
     // A cursor opened at a position whose segment was recycled is gone at once.
     let mut cursor = FeedCursor::open(&vfs, db(), STREAM, DB_ID, first).unwrap();
     assert!(matches!(cursor.step().unwrap(), pigeonhole_wal::Step::Gone));
+}
+
+#[test]
+fn the_cursor_stops_at_a_hole_where_recovery_did_then_follows_the_next_session() {
+    // simp724's Q2 on #1316: a power loss kept a later frame of an unsynced segment and
+    // lost an earlier one. Recovery stops at the hole and the next session writes its own
+    // segment; the cursor must stop at the same place, never deliver the later frame, and
+    // move on to the new session's segment.
+    let vfs = sim(5);
+    let o = fed(8, 2, 8);
+    let mut wal = WalStream::create(&vfs, db(), STREAM, DB_ID, o).unwrap();
+    let ends: Vec<Lsn> = (1..=4).map(|s| append(&mut wal, s)).collect();
+    assert!(
+        ends.iter().all(|e| e.epoch() == ends[0].epoch()),
+        "one segment"
+    );
+    drop(wal);
+    // The hole: record 3's first bytes, with record 4's frame intact after it.
+    let slot = headers(&vfs, o.segment_size)
+        .iter()
+        .position(|h| h.as_ref().is_some_and(|h| h.epoch == ends[0].epoch()))
+        .unwrap() as u64;
+    let f = vfs
+        .open(&path(), {
+            let mut w = pigeonhole_io::OpenOptions::read();
+            w.write = true;
+            w
+        })
+        .unwrap();
+    f.write_at(
+        &[0xFF; 16],
+        slot * o.segment_size + u64::from(ends[1].offset()) + 8,
+    )
+    .unwrap();
+    f.sync_data().unwrap();
+    drop(f);
+
+    // Recovery's view, then the next session's own segment.
+    let mut r = Recovery::open(&vfs, db(), STREAM, DB_ID, Lsn::default()).unwrap();
+    let mut recovered = Vec::new();
+    while let Some((_, rec)) = r.next_record().unwrap() {
+        recovered.push(seqno_of(&rec));
+    }
+    assert_eq!(
+        recovered,
+        [1, 2],
+        "recovery stops at the hole, before record 4's frame"
+    );
+    let mut next = fed(8, 2, 8);
+    next.feed_session = 0x5e55_0002;
+    let mut wal = r.into_stream(next).unwrap();
+    let after: Vec<Seqno> = (10..=11).collect();
+    for &s in &after {
+        append(&mut wal, s);
+    }
+
+    let mut cursor = FeedCursor::open(&vfs, db(), STREAM, DB_ID, Lsn::default()).unwrap();
+    let mut got = Vec::new();
+    let mut sessions = Vec::new();
+    loop {
+        match cursor.step().unwrap() {
+            pigeonhole_wal::Step::Record {
+                session, record, ..
+            } => {
+                got.push(seqno_of(&record));
+                sessions.push(session);
+            }
+            pigeonhole_wal::Step::End => break,
+            pigeonhole_wal::Step::Gone => panic!("retained, never gone"),
+        }
+    }
+    let mut want = recovered.clone();
+    want.extend(&after);
+    assert_eq!(
+        got, want,
+        "the cursor reads what recovery kept, then the next session"
+    );
+    assert_eq!(sessions.last(), Some(&0x5e55_0002));
+    assert_eq!(cursor.epoch(), wal.written().epoch());
 }
