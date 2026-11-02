@@ -72,3 +72,6 @@ No API is added: `Query::phrase_with_slop(words, u16)`, the `Clause` slop fields
 - **Slop 0** is the exact phrase, scored as in PR 1.
 - **Docs:** `phrase_with_slop` documents the rule, the scoring and the cost.
 
+## Later PRs: recorded now (cli692 on #1300)
+- **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
+

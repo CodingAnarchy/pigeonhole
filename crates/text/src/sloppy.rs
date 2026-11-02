@@ -250,6 +250,29 @@ mod tests {
         assert_eq!(freq(&["the", "cat", "the"], "the cat", 3), 0.0);
     }
 
+    /// Repeated words, traced by hand through the walk (simp724 on #1300).
+    #[test]
+    fn repeated_words_by_hand() {
+        // "a a" on "a x a": the second a starts at its word's second position (2), one match
+        // at distance 1; the lead's next step collides at 2 and the lesser runs out.
+        assert_eq!(freq(&["a", "a"], "a x a", 1), 0.5);
+        assert_eq!(freq(&["a", "a"], "a x a", 0), 0.0);
+        // "a a" on "a a a": two exact matches (0-1 and 1-2), as the exact count gives.
+        assert_eq!(freq(&["a", "a"], "a a a", 0), 2.0);
+        // "the cat the" on "the cat the": one exact match; more slop finds no other.
+        assert_eq!(freq(&["the", "cat", "the"], "the cat the", 0), 1.0);
+        assert_eq!(freq(&["the", "cat", "the"], "the cat the", 2), 1.0);
+        // "a b a" on "a b x a": the second a sits one place late, distance 1.
+        assert_eq!(freq(&["a", "b", "a"], "a b x a", 1), 0.5);
+        assert_eq!(freq(&["a", "b", "a"], "a b x a", 0), 0.0);
+        // simp724's "a b a"~2 on "a b a b a": the lead a advances to 2 and collides with the
+        // second a, which moves to 4; that closes a match at distance 0. The new lead b moves
+        // to 3 and closes another at 0. That's the two exact occurrences (0-2, 2-4), sharing
+        // position 2.
+        assert_eq!(freq(&["a", "b", "a"], "a b a b a", 2), 2.0);
+        assert_eq!(freq(&["a", "b", "a"], "a b a b a", 0), 2.0);
+    }
+
     /// xorshift: deterministic per seed.
     fn rng(seed: &mut u64) -> u64 {
         *seed ^= *seed << 13;
