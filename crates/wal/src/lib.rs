@@ -57,6 +57,7 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod feed;
 mod foreground;
 mod mem;
 mod recovery;
@@ -70,6 +71,7 @@ use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
 use pigeonhole_io::{Completion, VfsRef};
 
+pub use feed::{FeedCursor, Step};
 pub use foreground::StrictForeground;
 pub use mem::MemWal;
 pub use recovery::Recovery;

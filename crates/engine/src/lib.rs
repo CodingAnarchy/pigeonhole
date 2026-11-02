@@ -32,6 +32,7 @@ mod compact;
 mod engine;
 mod error;
 mod feed;
+mod feed_reader;
 mod flush;
 mod flushed_roots;
 #[cfg(all(test, engine_loom))]
@@ -70,6 +71,7 @@ pub use engine::{
     TableStorage,
 };
 pub use error::{Error, Result};
+pub use feed_reader::{Change, Commit, Expiry, FeedReader, FeedSpec, FeedStart, Next};
 pub use health::{Failure, FailureCause};
 pub use nonblocking::{GetFuture, MissedRead, RowFuture};
 pub use options::{EngineOptions, FeedOptions};

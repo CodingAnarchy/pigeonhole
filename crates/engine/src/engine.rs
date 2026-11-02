@@ -1004,6 +1004,12 @@ impl Engine {
                     f.note_root(sequence);
                 }
             }));
+            // Root commits of this open before the observer: only `finish`'s upgrade of an
+            // older file's superblocks. They are this session's, so record them; replay,
+            // recovery's checkpoint edits and repairs all come after (simp724's Q1, #1316).
+            for sequence in opened_at + 1..=pager.sequence() {
+                f.note_root(sequence);
+            }
         }
         let mut wal_opts = options.wal;
         wal_opts.retain_segments = feed.as_ref().map_or(0, |f| f.retain_segments);
@@ -2725,6 +2731,31 @@ impl Engine {
         })
     }
 
+    /// Whether a power loss now may leave a root commit without its change-feed Root entry,
+    /// expiring every token at the next open: a manifest root commit in flight (its entry
+    /// is appended once it completes), or a sidecar sync not yet landed (D310 fix A's
+    /// window; an inspection helper for tests).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn feed_sidecar_sync_pending(&self) -> bool {
+        let shared = &self.inner.shared;
+        shared
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.sidecar_sync_pending() || shared.manifest_flight.in_flight())
+    }
+
+    /// The change feed's sidecar syncs (D310 call 4, fix A): each makes the session's Root
+    /// entries since the last durable, coalesced to one in flight. About one per root commit
+    /// (manifest commits), never one per data commit. 0 with the feed off.
+    pub fn feed_sidecar_syncs(&self) -> u64 {
+        self.inner
+            .shared
+            .feed
+            .as_ref()
+            .map_or(0, |f| f.sidecar_syncs())
+    }
+
     /// The change feed's background syncs since open (D310, *T_sync*): syncs submitted
     /// because fed `Buffered` or `None` records waited for one longer than the interval and
     /// no other sync covered them. 0 with the feed off.
@@ -3402,6 +3433,11 @@ fn spill_recovered(
 /// Registers a stream's feed marks with the change feed (D310), when it is on.
 fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
     if let (Some(feed), Some(marks)) = (&shared.feed, wal.feed_marks()) {
+        // The start of the stream's first segment of this open: every record before it has
+        // a key below the allocator's start (the reader's start bound, D310 PR 3). For a new
+        // stream that is the start of its only segment, so nothing counts as dropped.
+        let key = shared.shm.next_seqno().saturating_sub(1);
+        feed.note_checkpoint(stream, Lsn::new(marks.head(), 0), key);
         feed.set_marks(stream, marks);
     }
 }

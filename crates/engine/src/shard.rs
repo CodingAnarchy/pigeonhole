@@ -1539,9 +1539,11 @@ pub(crate) enum ShardMsg {
     Unpin {
         through: Seqno,
     },
-    /// A `WalCheckpoint` edit for this stream is durable (or failed).
+    /// A `WalCheckpoint` edit for this stream is durable (or failed). `key` bounds the
+    /// commits it passed, for the change feed (`ShardState::ckpt_key`; 0 with the feed off).
     Checkpointed {
         lsn: Lsn,
+        key: Seqno,
         result: Result<ManifestVersion>,
     },
     /// The manifest changed: score the shard's slots for compaction, refresh stalls.
@@ -3235,6 +3237,11 @@ pub(crate) struct ShardState {
     /// The checkpoint's front is a cross record whose seqno is not visible yet: a
     /// visibility wake (`Wake::Shard`) is registered for it, and the kick looks again.
     ckpt_vis_wait: Option<Seqno>,
+    /// The change feed's bound on what the checkpoint passed (D310 PR 3): the largest key
+    /// (a single's seqno, a decided cross-shard commit's apply seqno) of any record popped
+    /// from `log`. Every record before the checkpoint was popped, so none has a larger key.
+    /// Kept only with the feed on.
+    ckpt_key: Seqno,
 
     // ---- compaction and stalls ----
     /// Pickers by `CompactionStyle`: each family compacts by its own style.
@@ -3577,6 +3584,7 @@ impl ShardState {
             awaiting: BTreeMap::new(),
             f_waiters: BTreeMap::new(),
             ckpt_vis_wait: None,
+            ckpt_key: 0,
             leveled,
             tiered,
             fifo,
@@ -9366,6 +9374,19 @@ impl ShardState {
         }
     }
 
+    /// Raises `ckpt_key` to a popped record's change-feed key: the seqno a reader orders it
+    /// by (an undecided or aborted PREPARE has none, 0). Out of line, called only with the
+    /// feed on (`advance_checkpoint`).
+    #[inline(never)]
+    fn note_ckpt_key(&mut self, l: &Logged) {
+        let key = match &l.kind {
+            LoggedKind::Single { .. } => l.seqno,
+            LoggedKind::Prepare { .. } => self.share_seqnos.get(&l.seqno).map_or(0, |s| s.0),
+            LoggedKind::Commit { apply, .. } => apply.unwrap_or(0),
+        };
+        self.ckpt_key = self.ckpt_key.max(key);
+    }
+
     /// The other shards among `holders` whose flushed-through seqno is below `seqno` (D266).
     fn peers_behind<'a>(
         &'a self,
@@ -9464,6 +9485,9 @@ impl ShardState {
         };
         let catalog = view.as_ref().map(|v| &*v.catalog);
         let mut more = false;
+        // Tested once, not per record; the key's update is out of line (perf287 on #1316:
+        // feed code inlined into a per-record loop costs the feed-off shapes, as on #1297).
+        let feed_on = self.shared.feed.is_some();
         while let Some(front) = self.log.front() {
             if self.needed(catalog, front) {
                 break;
@@ -9478,6 +9502,9 @@ impl ShardState {
             }
             self.checkpoint_pops += 1;
             let l = self.log.pop_front().expect("checked");
+            if feed_on {
+                self.note_ckpt_key(&l);
+            }
             self.unindex_front(&l);
             self.checkpoint_candidate = self.checkpoint_candidate.max(l.end);
             match l.kind {
@@ -9552,6 +9579,7 @@ impl ShardState {
         self.checkpoint_inflight = true;
         self.checkpoint_dirty = false;
         let lsn = self.checkpoint_candidate;
+        let key = self.ckpt_key;
         let submitter = ctx.submitter(self.id).clone();
         let stream = StreamId(u32::from(self.id.0));
         debug_assert!(
@@ -9562,7 +9590,7 @@ impl ShardState {
             stream.0
         );
         let req = ManifestReq::edits(vec![Edit::WalCheckpoint { stream, lsn }], move |result| {
-            let _ = submitter.submit(ShardMsg::Checkpointed { lsn, result });
+            let _ = submitter.submit(ShardMsg::Checkpointed { lsn, key, result });
         });
         manifest::submit(&self.shared, self.id, req);
     }
@@ -9570,6 +9598,7 @@ impl ShardState {
     fn on_checkpointed(
         &mut self,
         lsn: Lsn,
+        key: Seqno,
         result: Result<ManifestVersion>,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
@@ -9582,6 +9611,11 @@ impl ShardState {
                     t.cancel();
                 }
                 self.checkpoint = self.checkpoint.max(lsn);
+                // Before the stream's own checkpoint mark: a feed reader that loads the mark
+                // then finds a bound at least this new (`Feed::note_checkpoint`).
+                if let Some(feed) = &self.shared.feed {
+                    feed.note_checkpoint(usize::from(self.id.0), lsn, key);
+                }
                 if let Some(wal) = self.wal.as_mut()
                     && !self.poisoned
                     && wal.checkpoint(lsn).is_err()
@@ -9687,6 +9721,10 @@ impl ShardState {
             && !self.poisoned
         {
             wal.trim_retained(self.shared.vfs.now_micros(), feed.age_micros);
+        }
+        let stream = usize::from(self.id.0);
+        if let Some(marks) = feed.marks(stream) {
+            feed.prune_checkpoints(stream, marks.floor());
         }
         crate::feed::release_held(&self.shared, self.id);
     }
@@ -10907,7 +10945,9 @@ impl ShardState {
                 self.try_finish_close(ctx);
             }
             ShardMsg::Unpin { through } => self.on_unpin(through, ctx),
-            ShardMsg::Checkpointed { lsn, result } => self.on_checkpointed(lsn, result, ctx),
+            ShardMsg::Checkpointed { lsn, key, result } => {
+                self.on_checkpointed(lsn, key, result, ctx)
+            }
             ShardMsg::Maintain => {
                 self.maintain(ctx);
                 if self.freeze_deferred || !self.to_freeze.is_empty() {

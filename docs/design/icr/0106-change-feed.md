@@ -47,7 +47,23 @@
 - the shard's commit path (`run_group`, `decide_share`), `publish_watermark`, the lazy flush and the background sync;
 - `crates/engine/tests/it/feed_written.rs`, and the shm and format tests.
 
+## PR 3a: the writer-process feed reader (engine level)
+- **pigeonhole-wal** (additive):
+  - `FeedCursor` (`open`, `step`, `epoch`, `position`) and `Step` (`Record`, `End`, `Gone`);
+  - `FeedMarks::checkpoint()`.
+- **pigeonhole-engine** (additive):
+  - `Engine::feed(FeedSpec) -> FeedReader`, writer only;
+  - `FeedReader`: `try_next`, `wait(timeout)`, `token`, `frontier`, `delivered`;
+  - `FeedSpec { tables, prefix, durable, start }` and `FeedStart` (`Now`, `Oldest`, `After(seqno)`, `Token(bytes)`);
+  - `Commit { seqno, ts, changes }`, `Change { table, family, kind, ts, row, qualifier, value }`, `Expiry { reason, oldest_retained }`, and `Next` (`Commit`, `Pending`, `Expired`);
+  - `Engine::feed_sidecar_syncs()`.
+  - **Test-hooks inspection helpers only:** `FeedReader::held_prepares` and `Engine::feed_sidecar_sync_pending`.
+
+**Callers:**
+- `crates/engine/tests/feed_model.rs` (new sweep target), `it/feed_reader.rs` and `wal/tests/feed_cursor.rs`;
+- PR 3b's public `Feed`.
+
 ## Later PRs
-- PR 3: `Feed`, `Commit`, `Change`, tokens and `FeedExpired`.
+- PR 3b: pigeonhole's `Feed`, `Commit`, `Change`, `FeedToken` and `ErrorCode::FeedExpired` (31), mapped in capi and python.
 - PR 4: reader processes.
 - PR 5: `poll_next`.

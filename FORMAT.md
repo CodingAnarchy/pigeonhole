@@ -566,7 +566,7 @@ The change feed's sidecar (D310), `data.phdb-feed` beside `data.phdb`. It isn't 
 - a **Session** entry, from an open with the feed on (creating the file if it's missing, or replacing one whose header is another database's or damaged);
 - an **Unfed** entry, from an open with the feed off, only if the file exists.
 
-A feeding session then appends a **Root** entry after each root commit it makes (§8.2), including its close's. Root entries aren't synced: a lost one only makes the next comparison see a gap.
+A feeding session then appends a **Root** entry after each root commit it makes (§8.2), including its close's. Root entries are synced, at the pager's durability, after the root commit is durable. One sync covers every entry appended while the previous sync was in flight (D310 call 4). A failed sync ends the session's appends. A lost entry (a crash between a root commit and its entry's sync, or a failed sync) only makes the next comparison see a gap.
 
 Header (40 bytes):
 
@@ -595,7 +595,7 @@ Header (40 bytes):
 - A writer truncates the file there before it appends, so a crash during an append (a torn last entry) never hides a later one.
 - An entry type a reader doesn't know, with a valid CRC, comes from a newer build. It ends the history before it.
 
-**What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), and their `streams` must be equal.
+**What the history is.** The feed's history for table *t* runs through consecutive WAL segments whose `feed_session` (§10.2) names a Session entry that feeds *t*. It runs only across sessions that chain: each session's `opened_at` must equal the last `sequence` the session before it recorded (its last Root entry, or its own `opened_at` if it recorded none), every sequence between must be recorded (each Root entry's `sequence` is one above the entry before it, starting from its session's `opened_at`), and their `streams` must be equal.
 
 The history ends at any of these:
 - a segment marked 0, or marked by another session;

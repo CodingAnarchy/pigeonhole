@@ -1,0 +1,2 @@
+### Changed
+- With the change feed on, each session's entry in the `<db>-feed` sidecar is synced after it is written, in the background and never on a commit's path (D310, #1248). A power loss can no longer drop an entry and make the next open report the feed's history as expired. `pigeonhole-engine` gains the writer-process feed reader (`Engine::feed`) that the public subscriber API will build on.
