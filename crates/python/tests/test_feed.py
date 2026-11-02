@@ -158,3 +158,17 @@ def test_iterating_waits_for_each_commit(fdb, t):
             break
     writer.join()
     assert rows == [b"r0", b"r1", b"r2"]
+
+
+def test_a_reader_process_follows_the_writers_feed(path, fdb, t):
+    # D310 PR 4 (#1361): a reader's table subscribes to the running writer's feed.
+    with ph.open_reader(path) as r:
+        rt = r.table("t")
+        with rt.feed() as feed:
+            t.put(b"seen by the reader", "f", b"q", b"v")
+            c = feed.next(timeout=5)
+            assert c is not None and c.changes[0].row == b"seen by the reader"
+            token = feed.token()
+        t.put(b"after the token", "f", b"q", b"v")
+        with rt.feed(resume=token) as feed:
+            assert feed.next(timeout=5).changes[0].row == b"after the token"
