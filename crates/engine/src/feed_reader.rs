@@ -35,6 +35,7 @@ use pigeonhole_wal::{FeedCursor, Step};
 
 use crate::shard::{Shared, Wake};
 use crate::{Error, Result};
+use pigeonhole_shm::ShmRegion;
 
 /// The token's format version.
 const TOKEN_VERSION: u8 = 1;
@@ -226,6 +227,19 @@ impl std::task::Wake for Unpark {
 /// A subscription to the committed changes of some tables (D310): see the module docs.
 pub struct FeedReader {
     shared: Arc<Shared>,
+    /// The shared-memory region the frontier and the streams' marks are read from: the
+    /// writer's own, or a reader process's attachment (D310 PR 4). Stale once the writer
+    /// that made it is gone: the feed then fails with `SnapshotExpired` and the caller
+    /// subscribes again from its token.
+    shm: ShmRegion,
+    /// The writer's feed, in the writer process (its checkpoint history serves start
+    /// positions and its intervals bound waits); `None` in a reader process.
+    writer: Option<Arc<crate::feed::Feed>>,
+    /// The view blob values are resolved through: the writer's current one, or a reader
+    /// process's view of its attachment.
+    view: ViewFn,
+    /// A reader process's wait between polls, doubling while nothing arrives.
+    backoff: Duration,
     tables: Vec<TableId>,
     prefix: Vec<u8>,
     durable: bool,
@@ -247,6 +261,9 @@ pub struct FeedReader {
     dropped: HashMap<Seqno, (usize, u32)>,
     out: Commit,
     expired: Option<Expiry>,
+    /// An error that ended the reader once a commit was already taken (a blob value that
+    /// couldn't be read): every later call fails, since going on would skip that commit.
+    failed: Option<String>,
     key: u64,
     /// This open's session.
     current: u64,
@@ -264,6 +281,23 @@ impl std::fmt::Debug for FeedReader {
     }
 }
 
+/// The current view, for resolving blob values: the writer's, or a reader process's view of
+/// its attachment.
+pub(crate) type ViewFn = Box<dyn Fn() -> Result<Arc<crate::snapshot::View>> + Send + Sync>;
+
+/// Where a feed reads from (D310 PR 4): the shared-memory region of the writer it follows,
+/// how to get the current view, and the writer's feed when this is the writer process.
+pub(crate) struct Origin {
+    pub(crate) shm: ShmRegion,
+    pub(crate) view: ViewFn,
+    pub(crate) writer: Option<Arc<crate::feed::Feed>>,
+}
+
+/// A reader process's first and longest waits between polls: it watches the writer's
+/// watermarks in shared memory, so the writer does no per-commit work for it.
+const READER_BACKOFF_MIN: Duration = Duration::from_micros(50);
+const READER_BACKOFF_MAX: Duration = Duration::from_millis(5);
+
 /// What one poll left.
 enum Polled {
     Commit,
@@ -279,11 +313,13 @@ fn expiry(reason: impl Into<String>) -> Expiry {
 }
 
 impl FeedReader {
-    pub(crate) fn open(shared: Arc<Shared>, spec: FeedSpec) -> Result<FeedReader> {
-        let Some(feed) = shared.feed.clone() else {
-            return Err(Error::InvalidArgument(
-                "the change feed is off: open with it on to subscribe".into(),
-            ));
+    pub(crate) fn open(shared: Arc<Shared>, spec: FeedSpec, origin: Origin) -> Result<FeedReader> {
+        // The session and fed tables of the writer followed: the writer's own feed, or in a
+        // reader process the writer's session entry, the sidecar's last (it is written before
+        // the writer's shared memory exists, so the attachment's writer wrote it).
+        let (session, fed) = match &origin.writer {
+            Some(feed) => (feed.session, feed.tables.clone()),
+            None => writer_session(&shared)?,
         };
         let mut tables = spec.tables;
         tables.sort_unstable();
@@ -293,13 +329,19 @@ impl FeedReader {
                 "a change feed follows at least one table".into(),
             ));
         }
-        if let Some(t) = tables.iter().find(|&&t| !feed.tables.contains(t)) {
+        if let Some(t) = tables.iter().find(|&&t| !fed.contains(t)) {
             return Err(Error::InvalidArgument(format!(
                 "table {} is not fed: name it in the feed's tables at open",
                 t.0
             )));
         }
-        let history = read_history(&shared, feed.session, &tables)?;
+        if origin.writer.is_none() && matches!(spec.start, FeedStart::Oldest) {
+            return Err(Error::Unsupported(
+                "a change feed from the oldest retained history in a reader process: start \
+                 after a snapshot instead",
+            ));
+        }
+        let history = read_history(&shared, session, &tables)?;
         let key = (3 << 62) | NEXT_KEY.fetch_add(1, Ordering::Relaxed);
         let db_id = shared.pager.db_id();
         let mut this = FeedReader {
@@ -316,9 +358,14 @@ impl FeedReader {
             dropped: HashMap::new(),
             out: Commit::default(),
             expired: None,
+            failed: None,
             key,
-            current: feed.session,
+            current: session,
             shared,
+            shm: origin.shm,
+            writer: origin.writer,
+            view: origin.view,
+            backoff: READER_BACKOFF_MIN,
         };
         // Where each stream starts, and the bound below which nothing is delivered.
         let starts: Vec<(Lsn, Option<Lsn>)> = match spec.start {
@@ -330,18 +377,28 @@ impl FeedReader {
                 }
             },
             start => {
+                let mut reader_starts: Vec<Lsn> = Vec::new();
                 let bound = match start {
-                    FeedStart::Now => this
-                        .shared
-                        .shm
-                        .visible_seqno()
-                        .max(this.shared.shm.written_seqno(this.durable))
-                        .max(feed.checkpoint_key()),
+                    FeedStart::Now => {
+                        // A reader process starts each stream at its checkpoint, loaded
+                        // first: every record before it was applied and visible when the
+                        // checkpoint moved, so its key is at or below the bound loaded next.
+                        if this.writer.is_none() {
+                            reader_starts = (0..this.shared.shards)
+                                .map(|s| Lsn(this.shm.feed_marks(s as u32).1))
+                                .collect();
+                        }
+                        this.shm
+                            .visible_seqno()
+                            .max(this.shm.written_seqno(this.durable))
+                            .max(this.writer.as_ref().map_or(0, |f| f.checkpoint_key()))
+                    }
                     FeedStart::After(seqno) => seqno,
                     FeedStart::Oldest => {
                         // The largest bound every stream's retained history serves.
+                        let feed = this.writer.as_ref().expect("refused above");
                         (0..this.shared.shards)
-                            .map(|s| feed.oldest_bound(s, floor(&feed, s)))
+                            .map(|s| feed.oldest_bound(s, this.floor(s)))
                             .max()
                             .unwrap_or(0)
                     }
@@ -350,7 +407,19 @@ impl FeedReader {
                 this.delivered = bound;
                 let mut starts = Vec::with_capacity(this.shared.shards);
                 for s in 0..this.shared.shards {
-                    match feed.start_at(s, bound, floor(&feed, s)) {
+                    // A reader process has no checkpoint history: from its checkpoint for
+                    // `Now`, else from the stream's floor, skipping keys at or below the
+                    // bound (correct, and slower to start).
+                    let at = match &this.writer {
+                        Some(feed) => feed.start_at(s, bound, this.floor(s)),
+                        None => Some(
+                            reader_starts
+                                .get(s)
+                                .copied()
+                                .unwrap_or(Lsn::new(this.floor(s), 0)),
+                        ),
+                    };
+                    match at {
                         Some(at) => starts.push((at, None)),
                         None => {
                             this.expired = Some(expiry(format!(
@@ -394,6 +463,7 @@ impl FeedReader {
         loop {
             let polled = self.poll()?;
             let Polled::Pending { held } = polled else {
+                self.backoff = READER_BACKOFF_MIN;
                 return Ok(self.lend(polled));
             };
             let now = Instant::now();
@@ -401,7 +471,11 @@ impl FeedReader {
                 return Ok(Next::Pending);
             }
             let mut park = deadline - now;
-            if held {
+            if self.writer.is_none() {
+                // A reader process watches shared memory: a bounded backoff, never a spin.
+                park = park.min(self.backoff);
+                self.backoff = (self.backoff * 2).min(READER_BACKOFF_MAX);
+            } else if held {
                 park = park.min(HELD_BACKOFF);
             } else {
                 let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
@@ -413,12 +487,12 @@ impl FeedReader {
                 };
                 waiters.register(self.key, target, Wake::Task(waker));
                 // A publish that missed the registration is seen here.
-                if self.shared.shm.written_seqno(self.durable) >= target {
+                if self.shm.written_seqno(self.durable) >= target {
                     continue;
                 }
                 // The feed's holds may pass the watermark later than the publish that
                 // wakes this: bound the sleep by the hold's interval.
-                if let Some(feed) = &self.shared.feed {
+                if let Some(feed) = &self.writer {
                     let hold = if self.durable {
                         feed.sync_interval_nanos
                     } else {
@@ -535,12 +609,11 @@ impl FeedReader {
                 "another session wrote without feeding these tables since the token",
             )));
         }
-        let feed = self.shared.feed.clone().expect("checked at open");
         let mut starts = Vec::with_capacity(streams);
         for s in 0..streams {
             let hint = Lsn(u64_at(per, s * 16));
             let reached = Lsn(u64_at(per, s * 16 + 8));
-            if hint.epoch() != 0 && hint.epoch() < floor(&feed, s) {
+            if hint.epoch() != 0 && hint.epoch() < self.floor(s) {
                 return Ok(Err(expiry("retention passed the token")));
             }
             starts.push((hint, (reached > hint).then_some(reached)));
@@ -549,8 +622,19 @@ impl FeedReader {
     }
 
     fn poll(&mut self) -> Result<Polled> {
+        if let Some(e) = &self.failed {
+            return Err(Error::Corruption(format!(
+                "the change feed stopped at an earlier error: {e}"
+            )));
+        }
         if self.expired.is_some() {
             return Ok(Polled::Expired);
+        }
+        // The writer this region belongs to is gone (a reader process's attachment after a
+        // writer restart, D310 M2): seqnos may be reissued, so nothing more is read here.
+        // The caller subscribes again from its token, which the new writer checks.
+        if self.shm.is_stale() {
+            return Err(Error::SnapshotExpired);
         }
         // A commit already read and below the frontier goes first.
         if self.emit()? {
@@ -559,31 +643,25 @@ impl FeedReader {
         if self.expired.is_some() {
             return Ok(Polled::Expired);
         }
-        let feed = self.shared.feed.clone().expect("checked at open");
-        // simp724's order: the checkpoints, then the frontier, then the heads.
+        // simp724's order: the checkpoints, then the frontier, each Acquire from the
+        // shared-memory marks the writer mirrors (layout version 8), then every stream read
+        // to its readable end. By M1 every record at or below F is then read: F never passes
+        // a record behind a held segment header (FORMAT §10.1 rule 1), since D200 hides its
+        // group until a sync writes that header and the feed's holds settle on
+        // `Wal::written` (which excludes it). `it::feed_head` pins this; no head mark is
+        // needed (D310 PR 4).
         let checkpoints: Vec<Lsn> = (0..self.streams.len())
-            .map(|s| feed.marks(s).map_or(Lsn::default(), |m| m.checkpoint()))
+            .map(|s| Lsn(self.shm.feed_marks(s as u32).1))
             .collect();
-        let frontier = self.shared.shm.written_seqno(self.durable);
-        let mut caught_up = true;
+        let frontier = self.shm.written_seqno(self.durable);
         for s in 0..self.streams.len() {
-            let head = feed.marks(s).map_or(0, |m| m.head());
             if !self.read_stream(s)? {
                 return Ok(Polled::Expired);
             }
-            // A stream whose cursor is behind its head waits for the next segment's header
-            // (held back until its predecessor's sync, FORMAT §10.1 rule 1).
-            if self.streams[s].cursor.epoch() < head {
-                caught_up = false;
-            }
-        }
-        if !caught_up {
-            return Ok(Polled::Pending { held: true });
         }
         // Only now: simp724's rule holds once every stream was read to its end after the
-        // checkpoints were loaded (a Decision in a stream not yet read to its head may be
-        // the one a held PREPARE waits for).
-        let floors: Vec<u32> = (0..self.streams.len()).map(|s| floor(&feed, s)).collect();
+        // checkpoints were loaded.
+        let floors: Vec<u32> = (0..self.streams.len()).map(|s| self.floor(s)).collect();
         if let Some(e) = self.drop_aborted(&checkpoints, &floors) {
             self.expired = Some(e);
             return Ok(Polled::Expired);
@@ -597,9 +675,9 @@ impl FeedReader {
         }
         // Held by the feed's own holds: the visible watermark may be past the frontier.
         let watermark = if self.durable {
-            self.shared.shm.durable_seqno()
+            self.shm.durable_seqno()
         } else {
-            self.shared.shm.visible_seqno()
+            self.shm.visible_seqno()
         };
         Ok(Polled::Pending {
             held: watermark > self.frontier,
@@ -813,6 +891,10 @@ impl FeedReader {
             if key > self.frontier {
                 return Ok(false);
             }
+            // Before anything is taken: the view can fail (a reader process's attachment
+            // whose writer is gone, or whose view is being republished), and a failure here
+            // leaves the commit to the next call.
+            let view = (self.view)()?;
             let (_, p) = self.ready.pop_first().expect("checked");
             let (ts, raws) = match p {
                 Pending::Single {
@@ -873,7 +955,6 @@ impl FeedReader {
             if raws.is_empty() {
                 continue;
             }
-            let view = self.shared.view.load();
             self.out.seqno = key;
             self.out.ts = ts;
             self.out.changes.clear();
@@ -889,7 +970,15 @@ impl FeedReader {
                         ));
                         return Ok(false);
                     }
-                    Some(ptr) => view.ssts.read_pointer(&ptr)?.to_vec(),
+                    Some(ptr) => match view.ssts.read_pointer(&ptr) {
+                        Ok(cell) => cell.to_vec(),
+                        // The commit is taken: going on would skip it, so the reader stops
+                        // here for good.
+                        Err(e) => {
+                            self.failed = Some(e.to_string());
+                            return Err(e);
+                        }
+                    },
                 };
                 self.out.changes.push(Change {
                     table: r.table,
@@ -953,9 +1042,54 @@ fn drop_undecided(
     None
 }
 
-/// Stream `s`'s floor: no segment of a smaller epoch is kept.
-fn floor(feed: &crate::feed::Feed, s: usize) -> u32 {
-    feed.marks(s).map_or(0, |m| m.floor())
+impl FeedReader {
+    /// Stream `s`'s floor: no segment of a smaller epoch is kept (the writer's shared-memory
+    /// mark).
+    fn floor(&self, s: usize) -> u32 {
+        self.shm.feed_marks(s as u32).0
+    }
+}
+
+/// In a reader process: the writer's session and fed tables, from its entry in the sidecar
+/// (the last session entry: a writer writes it before its shared memory exists).
+/// `InvalidArgument` when the writer doesn't feed (its open recorded `fed: none`).
+fn writer_session(shared: &Shared) -> Result<(u64, FeedTables)> {
+    let off = || {
+        Error::InvalidArgument(
+            "the writer's change feed is off: subscribe to a writer that feeds".into(),
+        )
+    };
+    let path = crate::feed::sidecar_path(&shared.path);
+    let file = match shared.vfs.open(&path, OpenOptions::read()) {
+        Ok(f) => f,
+        Err(e) if e.kind == pigeonhole_io::ErrorKind::NotFound => return Err(off()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut bytes = vec![0u8; file.len()? as usize];
+    file.read_at(&mut bytes, 0)?;
+    match FeedHeader::decode(&bytes) {
+        Ok(h) if h.db_id == shared.pager.db_id() => {}
+        _ => return Err(off()),
+    }
+    let entries = decode_entries(&bytes[FeedHeader::LEN..]).0;
+    for e in entries.iter().rev() {
+        match e {
+            FeedEntry::Session {
+                session,
+                streams,
+                tables,
+                ..
+            } => {
+                if *streams as usize != shared.shards {
+                    return Err(off());
+                }
+                return Ok((*session, tables.clone()));
+            }
+            FeedEntry::Unfed { .. } => return Err(off()),
+            _ => {}
+        }
+    }
+    Err(off())
 }
 
 /// The sessions whose segments hold the feed's history: the current one, and each one

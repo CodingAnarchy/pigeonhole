@@ -113,6 +113,18 @@ impl Inner {
         self.region.atomic_u64(off + watermark::WRITTEN)
     }
 
+    /// One of `shard`'s change-feed marks (layout version 8): `field` is
+    /// [`watermark::FEED_FLOOR`] or [`watermark::FEED_CKPT`].
+    fn feed_mark(&self, shard: u32, field: usize) -> &AtomicU64 {
+        assert!(
+            shard < self.header.shard_count,
+            "shard {shard} out of range (region has {} shards)",
+            self.header.shard_count
+        );
+        let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
+        self.region.atomic_u64(off + field)
+    }
+
     fn synced(&self, shard: u32) -> &AtomicU64 {
         assert!(
             shard < self.header.shard_count,
@@ -349,6 +361,10 @@ fn init_region(
             region
                 .atomic_u64(off + field)
                 .store(u64::MAX, Ordering::Relaxed);
+        }
+        // The change feed's marks start unknown (layout version 8).
+        for field in [watermark::FEED_FLOOR, watermark::FEED_CKPT] {
+            region.atomic_u64(off + field).store(0, Ordering::Relaxed);
         }
     }
     region
@@ -882,6 +898,33 @@ impl ShmRegion {
     /// that are not yet synced; `u64::MAX` when none.
     pub fn publish_synced(&self, shard: u32, synced: Seqno) {
         self.inner.synced(shard).store(synced, Ordering::Release);
+    }
+
+    /// Raises `shard`'s stream's feed floor (the smallest epoch not yet recyclable) with
+    /// release ordering; it never goes down.
+    pub fn publish_feed_floor(&self, shard: u32, epoch: u32) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_FLOOR)
+            .fetch_max(u64::from(epoch), Ordering::AcqRel);
+    }
+
+    /// Raises `shard`'s stream's checkpoint for change feeds (an `Lsn`'s raw value) with
+    /// release ordering, once the checkpoint edit is durable; it never goes down.
+    pub fn publish_feed_checkpoint(&self, shard: u32, lsn: u64) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_CKPT)
+            .fetch_max(lsn, Ordering::AcqRel);
+    }
+
+    /// `shard`'s stream's change-feed marks (layout version 8, Acquire each): the floor epoch
+    /// and the checkpoint `Lsn`'s raw value; zeros until a writer with the feed on stores
+    /// them.
+    pub fn feed_marks(&self, shard: u32) -> (u32, u64) {
+        let load = |f| self.inner.feed_mark(shard, f).load(Ordering::Acquire);
+        (
+            load(watermark::FEED_FLOOR) as u32,
+            load(watermark::FEED_CKPT),
+        )
     }
 
     /// The change feed's frontier (D310): every commit at or below it is applied on every
@@ -1447,7 +1490,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 7
+                expected: 8
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });

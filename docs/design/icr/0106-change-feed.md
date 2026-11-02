@@ -83,6 +83,12 @@
 - **capi:** nothing to change. The crate has no code table yet, and its future C enum takes `ErrorCode`'s numbers.
 - **Internal:** pigeonhole-engine's `Feed::needs` gains a `debug_assert` (perf287 on #1297).
 
+## PR 4: reader processes
+- **pigeonhole** (additive): `ReadTable::feed() -> FeedBuilder`, and `FeedBuilder::read_table(&ReadTable)`.
+- **pigeonhole-engine:** `Engine::feed` works in a reader process. In a reader process, `FeedStart::Oldest` is `Unsupported`. A feed whose writer restarted fails with `SnapshotExpired` (resubscribe from the token). `EngineShard::wal_header_held` is a test-hooks inspection helper.
+- **pigeonhole-wal:** `FeedMarks::set_mirror` and the `MarkMirror` trait (`floor`, `checkpoint`). `Wal::header_held` is a hidden inspection helper.
+- **pigeonhole-shm:** `publish_feed_floor`, `publish_feed_checkpoint`, `feed_marks`.
+- **pigeonhole-format:** shm layout 8 (`watermark::FEED_FLOOR`, `FEED_CKPT`).
+
 ## Later PRs
-- PR 4: reader processes.
 - PR 5: `poll_next`.

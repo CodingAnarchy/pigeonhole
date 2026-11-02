@@ -178,3 +178,66 @@ fn a_reader_with_no_writer_running_gets_no_writer() {
 fn internal(v: &[(&'static str, u64)], name: &str) -> u64 {
     v.iter().find(|(n, _)| *n == name).map_or(0, |&(_, x)| x)
 }
+
+/// D310 PR 4: a reader process follows the writer's change feed (`ReadTable::feed`), and
+/// across a writer restart resumes from its own token on the new writer, with nothing
+/// missed or repeated. `from_oldest` is refused there.
+#[test]
+fn a_reader_process_follows_the_change_feed_across_a_writer_restart() {
+    let vfs = SimVfs::new(1248);
+    let fed = || {
+        Options::default()
+            .vfs(Arc::clone(&vfs) as _)
+            .shards(1)
+            .pin_threads(false)
+            .memtable_budget(4 << 20)
+            .change_feed(pigeonhole::FeedRetention::bytes(4 << 20))
+    };
+    vfs.enter_process(WRITER);
+    let db = Pigeonhole::open(DB, fed()).unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let r = reader(&vfs, 2).unwrap();
+    vfs.enter_process(reader_process(2));
+    let rt = r.table("t").unwrap();
+    assert_eq!(
+        rt.feed().from_oldest().open().unwrap_err().code(),
+        ErrorCode::Unsupported
+    );
+    let mut feed = rt.feed().open().unwrap();
+    vfs.enter_process(WRITER);
+    let one = t.mutate(b"one").put("f", b"q", b"1").commit().unwrap();
+    vfs.enter_process(reader_process(2));
+    let c = feed
+        .next(Duration::from_secs(10))
+        .unwrap()
+        .expect("the commit")
+        .clone();
+    assert_eq!((c.seqno(), c.changes()[0].row()), (one.seqno, &b"one"[..]));
+
+    // The writer closes and a new one opens: the feed follows it from its own token.
+    vfs.enter_process(WRITER);
+    drop(t);
+    db.close().unwrap();
+    let db = Pigeonhole::open(DB, fed()).unwrap();
+    let t = db.table("t").unwrap().open().unwrap();
+    let two = t.mutate(b"two").put("f", b"q", b"2").commit().unwrap();
+    vfs.enter_process(reader_process(2));
+    let c = feed
+        .next(Duration::from_secs(10))
+        .unwrap()
+        .expect("the commit after the restart")
+        .clone();
+    assert_eq!((c.seqno(), c.changes()[0].row()), (two.seqno, &b"two"[..]));
+    assert!(feed.try_next().unwrap().is_none(), "nothing repeated");
+    drop(feed);
+    drop(rt);
+    drop(r);
+    vfs.enter_process(WRITER);
+    drop(t);
+    db.close().unwrap();
+}

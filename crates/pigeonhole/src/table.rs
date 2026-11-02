@@ -621,7 +621,7 @@ impl Table {
     /// [`Feed`]: crate::Feed
     /// [`FeedBuilder::table`]: crate::FeedBuilder::table
     pub fn feed(&self) -> crate::FeedBuilder {
-        crate::FeedBuilder::new(self)
+        crate::FeedBuilder::new(&self.core)
     }
 
     /// The shard that owns `row` right now ([`Shard::index`](crate::Shard::index)), for
@@ -740,6 +740,16 @@ pub struct ReadTable {
 }
 
 impl ReadTable {
+    /// Subscribes to this table's committed changes from a reader process (D310 PR 4): the
+    /// same [`Feed`](crate::Feed) a writer's [`Table::feed`] gives, following the writer's
+    /// feed through shared memory. The writer must feed the table. Across a writer restart
+    /// the feed resubscribes from its own token on the new writer: a durable feed continues,
+    /// and a visible one that delivered what a power loss took expires. Not from the oldest
+    /// retained history (`Unsupported`): start [`from_snapshot`](crate::FeedBuilder::from_snapshot).
+    pub fn feed(&self) -> crate::FeedBuilder {
+        crate::FeedBuilder::new(&self.core)
+    }
+
     /// The table name.
     pub fn name(&self) -> &str {
         &self.core.info.name
