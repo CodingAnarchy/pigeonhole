@@ -384,9 +384,11 @@ pub pigeonhole::FeedInfo::retention_bytes: u64
 #[non_exhaustive] pub struct pigeonhole::FeedRetention
 pub pigeonhole::FeedRetention::age: core::option::Option<core::time::Duration>
 pub pigeonhole::FeedRetention::bytes: u64
+pub pigeonhole::FeedRetention::sync_interval: core::option::Option<core::time::Duration>
 impl pigeonhole::FeedRetention
 pub fn pigeonhole::FeedRetention::age(self, core::time::Duration) -> Self
 pub fn pigeonhole::FeedRetention::bytes(u64) -> Self
+pub fn pigeonhole::FeedRetention::sync_interval(self, core::time::Duration) -> Self
 #[non_exhaustive] pub struct pigeonhole::FileFeatures
 pub pigeonhole::FileFeatures::compat: u64
 pub pigeonhole::FileFeatures::incompat: u64

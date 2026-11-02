@@ -33,6 +33,13 @@ fn feed(tables: Option<Vec<String>>) -> FeedOptions {
     f
 }
 
+/// A feed of every table whose background sync runs after `sync`.
+fn feed_syncing_after(sync: Duration) -> FeedOptions {
+    let mut f = feed(None);
+    f.sync_interval_micros = Some(sync.as_micros() as u64);
+    f
+}
+
 fn sim_options(vfs: &Arc<SimVfs>, feed: Option<FeedOptions>) -> EngineOptions {
     let mut o = common::options(Arc::clone(vfs), 2, 16 << 20);
     o.feed = feed;
@@ -93,9 +100,9 @@ fn a_none_commit_on_a_fed_table_reaches_the_frontier_through_the_lazy_flush() {
         );
         std::thread::yield_now();
     }
-    // Written, not synced: a durable feed stays below them (a power loss could still undo
-    // them), until a later sync covers them.
-    assert!(db.feed_frontier(true) < last);
+    // A durable feed passes them only once a sync covers them: here the background sync,
+    // whose timer, like the flush's, gives up on the simulator's frozen clock, or the
+    // `GroupSync` commit's (the real-clock tests below tell them apart).
     let synced = db
         .commit(batch(&t, b"sync"), Some(Durability::GroupSync))
         .unwrap();
@@ -194,8 +201,12 @@ fn an_application_owned_shard_flushes_on_its_next_wakeup_alone() {
     let dir = TempDir::new("wakeup");
     let path = dir.0.join("w.phdb");
     let vfs = real_vfs();
+    // The background sync well after the flush, so the flush is what moves the visible
+    // frontier.
+    let t_sync = Duration::from_millis(200);
     let (db, mut shards) =
-        Engine::open_application_owned(&path, real_options(&vfs, Some(feed(None)))).unwrap();
+        Engine::open_application_owned(&path, real_options(&vfs, Some(feed_syncing_after(t_sync))))
+            .unwrap();
     let shard = &mut shards[0];
     let t = table(&db, "t");
     settle(shard);
@@ -230,7 +241,22 @@ fn an_application_owned_shard_flushes_on_its_next_wakeup_alone() {
         }
         settle(shard);
     }
-    // Nothing held any more: no deadline again.
+    // Written but not synced: the durable frontier waits for the background sync, the
+    // shard's only deadline now; then nothing is held and there is no deadline at all.
+    if start.elapsed() < t_sync {
+        assert!(db.feed_frontier(true) < info.seqno);
+    }
+    while db.feed_frontier(true) < info.seqno {
+        assert!(start.elapsed() < Duration::from_secs(5), "never synced");
+        if let Some(due) = shard.next_deadline() {
+            std::thread::sleep(Duration::from_nanos(
+                due.saturating_sub(vfs.monotonic_nanos()),
+            ));
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        settle(shard);
+    }
     settle(shard);
     assert!(
         shard.next_deadline().is_none(),
@@ -281,5 +307,141 @@ fn an_unfed_table_holds_nothing() {
     db.close().unwrap();
     while shard.closed().is_none() {
         shard.run_once(u64::MAX);
+    }
+}
+
+/// Opens an application-owned engine on real files with one shard.
+fn open_real(dir: &TempDir, vfs: &VfsRef, feed: FeedOptions) -> (Arc<Engine>, EngineShard) {
+    let (db, mut shards) =
+        Engine::open_application_owned(&dir.0.join("w.phdb"), real_options(vfs, Some(feed)))
+            .unwrap();
+    let shard = shards.remove(0);
+    (db, shard)
+}
+
+fn close_real(db: &Engine, shard: &mut EngineShard) {
+    db.close().unwrap();
+    while shard.closed().is_none() {
+        shard.run_once(u64::MAX);
+    }
+}
+
+#[test]
+fn a_durable_feed_waits_for_a_sync_on_buffered_commits() {
+    // simp724's M1 on #1297: D227 counts a `Buffered` commit durable once written, so the
+    // durable feed needs the synced hold to stay below it until a sync covers it.
+    let dir = TempDir::new("buffered");
+    let vfs = real_vfs();
+    // A background sync too far off to run here: only the `GroupSync` commit syncs.
+    let (db, mut shard) = open_real(&dir, &vfs, feed_syncing_after(Duration::from_secs(600)));
+    let t = table(&db, "t");
+    settle(&mut shard);
+    let info = drive(
+        &mut shard,
+        db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    assert!(db.feed_frontier(false) >= info.seqno, "visible at once");
+    assert!(
+        db.feed_frontier(true) < info.seqno,
+        "not durable until synced"
+    );
+    let synced = drive(
+        &mut shard,
+        db.submit(batch(&t, b"b"), Some(Durability::GroupSync))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    assert!(
+        db.feed_frontier(true) >= synced.seqno,
+        "the group's sync covered it"
+    );
+    assert_eq!(
+        db.feed_background_syncs(),
+        0,
+        "a covering sync needs none of its own"
+    );
+    close_real(&db, &mut shard);
+}
+
+#[test]
+fn the_background_sync_moves_the_durable_feed_on_a_buffered_only_table() {
+    let dir = TempDir::new("tsync");
+    let vfs = real_vfs();
+    let t_sync = Duration::from_millis(20);
+    let (db, mut shard) = open_real(&dir, &vfs, feed_syncing_after(t_sync));
+    let t = table(&db, "t");
+    settle(&mut shard);
+    assert!(shard.next_deadline().is_none(), "idle: no sync deadline");
+    let start = Instant::now();
+    let info = drive(
+        &mut shard,
+        db.submit(batch(&t, b"a"), Some(Durability::Buffered))
+            .unwrap(),
+    );
+    settle(&mut shard);
+    if start.elapsed() < t_sync {
+        assert!(db.feed_frontier(true) < info.seqno);
+        assert!(
+            shard.next_deadline().is_some(),
+            "the background sync's deadline"
+        );
+    }
+    // Driven only by its wakeups.
+    while db.feed_frontier(true) < info.seqno {
+        assert!(start.elapsed() < Duration::from_secs(5), "never synced");
+        if let Some(due) = shard.next_deadline() {
+            std::thread::sleep(Duration::from_nanos(
+                due.saturating_sub(vfs.monotonic_nanos()),
+            ));
+        } else {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        settle(&mut shard);
+    }
+    assert!(db.feed_background_syncs() >= 1);
+    settle(&mut shard);
+    assert!(shard.next_deadline().is_none(), "nothing held: no deadline");
+    close_real(&db, &mut shard);
+}
+
+#[test]
+fn nothing_the_durable_frontier_passed_is_lost_to_a_power_loss() {
+    // simp724's M1 test: commit at mixed levels, note the durable frontier at each step,
+    // crash, and every commit at or below the last frontier noted is there after the reopen.
+    for seed in 0..8u64 {
+        let vfs = SimVfs::new(1320 + seed);
+        let mut o = sim_options(&vfs, Some(feed(None)));
+        o.shards = 1;
+        let db = Engine::open(Path::new(DB), o).unwrap();
+        let t = table(&db, "t");
+        let mut committed: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut frontier = 0;
+        for i in 0..60u32 {
+            let level = match (u64::from(i) * 7 + seed) % 5 {
+                0 => Durability::GroupSync,
+                1 | 2 => Durability::Buffered,
+                _ => Durability::None,
+            };
+            let row = format!("r{i:03}").into_bytes();
+            let info = db.commit(batch(&t, &row), Some(level)).unwrap();
+            committed.push((info.seqno, row));
+            frontier = frontier.max(db.feed_frontier(true));
+        }
+        vfs.crash(pigeonhole_io::sim::CrashKind::Power);
+        drop(db);
+        let mut o = sim_options(&vfs, Some(feed(None)));
+        o.shards = 1;
+        let db = Engine::open(Path::new(DB), o).unwrap();
+        let t = (*db.table("t").unwrap()).clone();
+        for (seqno, row) in committed.iter().filter(|(s, _)| *s <= frontier) {
+            let got = db.get_latest(t.id, t.families[0].id, row, b"q").unwrap();
+            assert!(
+                got.is_some(),
+                "seed {seed}: commit {seqno} at or below the durable frontier {frontier} was lost"
+            );
+        }
+        db.close().unwrap();
     }
 }

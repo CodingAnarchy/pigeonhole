@@ -187,6 +187,8 @@ pub(crate) struct ShardMetrics {
     /// Counter checkpoints kept, and those dropped (D291).
     pub checkpoints: AtomicU64,
     pub checkpoints_dropped: AtomicU64,
+    /// The change feed's background syncs submitted (D310, *T_sync*).
+    pub feed_syncs: AtomicU64,
     /// L0 pacing spans (D119) begun, and nanoseconds spent in them.
     pub pacing_stalls: AtomicU64,
     pub pacing_stall_nanos: AtomicU64,
@@ -241,6 +243,7 @@ impl Default for ShardMetrics {
             room_stall_nanos: AtomicU64::new(0),
             checkpoints: AtomicU64::new(0),
             checkpoints_dropped: AtomicU64::new(0),
+            feed_syncs: AtomicU64::new(0),
             pacing_stalls: AtomicU64::new(0),
             pacing_stall_nanos: AtomicU64::new(0),
             flushes: AtomicU64::new(0),
@@ -1586,6 +1589,13 @@ pub(crate) enum ShardMsg {
     RetryFlush,
     /// The change feed's lazy flush is due (D310): write the buffered `None` records.
     FeedFlush,
+    /// The change feed's background sync is due (D310, *T_sync*): sync what its synced
+    /// hold covers.
+    FeedSync,
+    /// That sync finished.
+    FeedSynced {
+        ok: bool,
+    },
     /// Split, merge or move tablets this shard owns (replies when done, if asked). Sent by
     /// `Engine::split_table` (benches presplit a table) and the test hooks; the balancer
     /// starts its own changes.
@@ -1961,9 +1971,10 @@ struct PreparedShare {
     /// voted early, in a group resolved through a sync). `settle` runs it.
     parked: Option<Box<ParkedDecide>>,
     /// The change feed (D310): the end of this share's PREPARE record when it is a
-    /// `Durability::None` record the feed needs, buffered with no write of its own. A commit
-    /// decision holds the written watermark at its apply seqno until a write passes it.
-    feed_end: Option<Lsn>,
+    /// `Durability::None` or `Buffered` record the feed needs (its group syncs nothing), and
+    /// whether it is `None` (written by no write of its own). A commit decision holds the
+    /// feed's watermarks at its apply seqno until a write and a sync pass it.
+    feed_end: Option<(Lsn, bool)>,
 }
 
 /// A `Decide` waiting for its share's PREPARE to settle (D279).
@@ -2947,6 +2958,10 @@ pub(crate) struct ShardState {
     feed_sync_end: std::cell::Cell<Lsn>,
     /// The lazy flush's timer (D310), armed only while `feed_low` holds something.
     feed_timer: Option<Arc<TimerState>>,
+    /// The feed's background sync's timer (D310, *T_sync*), armed only while
+    /// `feed_sync_low` holds something, and whether that sync is in flight.
+    feed_sync_timer: Option<Arc<TimerState>>,
+    feed_sync_inflight: bool,
     coord: HashMap<Seqno, Coord>,
     prepared: HashMap<Seqno, PreparedShare>,
     /// Queued or running flushes that may purge versions under the guard (#287), as
@@ -3426,6 +3441,8 @@ impl ShardState {
             feed_sync_low: std::cell::Cell::new(u64::MAX),
             feed_sync_end: std::cell::Cell::new(Lsn::default()),
             feed_timer: None,
+            feed_sync_timer: None,
+            feed_sync_inflight: false,
             coord: HashMap::new(),
             prepared: HashMap::new(),
             guarded: Vec::new(),
@@ -5104,22 +5121,32 @@ impl ShardState {
 
     // ---- the change feed's written hold (D310) ----
 
-    /// Holds the written watermark at `seqno` (still held by this group's pending, or by
-    /// `cross_held`) for a fed `None` record ending at `end`, stored at once (Release), and
-    /// arms the lazy flush if nothing held it before.
+    /// Holds the feed's watermarks at `seqno` (still held by this group's pending, or by
+    /// `cross_held`) for a fed record ending at `end` that no sync of its group covers: the
+    /// synced hold always, and the written hold too when `unwritten` (a `None` record),
+    /// each stored at once (Release). Arms the lazy flush and the background sync when
+    /// their hold goes from empty to held.
     fn note_feed_unwritten(
         &mut self,
         seqno: Seqno,
         end: Lsn,
+        unwritten: bool,
         ctx: &mut ShardContext<'_, ShardMsg>,
     ) {
         let shard = u32::from(self.id.0);
-        let low = self.feed_low.get();
-        if seqno < self.feed_sync_low.get() {
+        let sync_low = self.feed_sync_low.get();
+        if seqno < sync_low {
             self.feed_sync_low.set(seqno);
             self.shared.shm.publish_synced(shard, seqno);
         }
         self.feed_sync_end.set(self.feed_sync_end.get().max(end));
+        if sync_low == u64::MAX {
+            self.arm_feed_sync(ctx);
+        }
+        if !unwritten {
+            return;
+        }
+        let low = self.feed_low.get();
         if seqno < low {
             self.feed_low.set(seqno);
             self.shared.shm.publish_written(shard, seqno);
@@ -5127,6 +5154,72 @@ impl ShardState {
         self.feed_end.set(self.feed_end.get().max(end));
         if low == u64::MAX {
             self.arm_feed_flush(ctx);
+        }
+    }
+
+    /// Arms the background sync's timer (*T_sync*), unless one not yet fired is armed.
+    fn arm_feed_sync(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        let Some(feed) = &self.shared.feed else {
+            return;
+        };
+        if self.feed_sync_timer.as_ref().is_some_and(|t| !t.finished()) {
+            return;
+        }
+        let state = TimerState::new();
+        self.feed_sync_timer = Some(Arc::clone(&state));
+        ctx.spawn(Box::new(ClockTimer::new(
+            &self.shared.vfs,
+            ctx.now_nanos().saturating_add(feed.sync_interval_nanos),
+            state,
+            ctx.submitter(self.id).clone(),
+            ShardMsg::FeedSync,
+        )));
+    }
+
+    /// The feed's background sync (D310, simp724's M1 on #1297): submits a sync (which
+    /// writes what is buffered first) when the synced hold is still held, never waited on.
+    /// Its completion lets the hold go (`FeedSynced`), so a durable feed advances on fed
+    /// `Buffered` and `None` tables that nothing else syncs.
+    fn feed_sync(&mut self, ctx: &mut ShardContext<'_, ShardMsg>) {
+        if self.feed_sync_low.get() == u64::MAX || self.feed_sync_inflight || self.poisoned {
+            return;
+        }
+        // A group sync since the hold was set may already have covered it.
+        self.settle_feed_written();
+        if self.feed_sync_low.get() == u64::MAX {
+            return;
+        }
+        let Some(wal) = self.wal.as_mut() else {
+            return;
+        };
+        match wal.submit_sync() {
+            Ok(c) => {
+                self.feed_sync_inflight = true;
+                self.shared.metrics[usize::from(self.id.0)]
+                    .feed_syncs
+                    .fetch_add(1, Ordering::Relaxed);
+                let submitter = ctx.submitter(self.id).clone();
+                drop(c.map(move |r| {
+                    let _ = submitter.submit(ShardMsg::FeedSynced { ok: r.is_ok() });
+                    Ok(())
+                }));
+            }
+            Err(_) => self.poison(crate::health::FailureCause::Io),
+        }
+    }
+
+    /// The background sync finished: the holds it covered go, and the timer re-arms for
+    /// what was held since.
+    fn on_feed_synced(&mut self, ok: bool, ctx: &mut ShardContext<'_, ShardMsg>) {
+        self.feed_sync_inflight = false;
+        if !ok {
+            self.poison(crate::health::FailureCause::Io);
+            return;
+        }
+        self.settle_feed_written();
+        self.shared.wake_visible();
+        if self.feed_sync_low.get() != u64::MAX {
+            self.arm_feed_sync(ctx);
         }
     }
 
@@ -6662,10 +6755,10 @@ impl ShardState {
         let mut buffered_end: Option<Lsn> = None;
         // The end of the group's last written record (any level but `None`), for D227.
         let mut group_end: Option<Lsn> = None;
-        // The change feed's `None` records (D310): the lowest held seqno and the last end,
-        // and the PREPAREs, held once decided.
-        let mut feed_unwritten: Option<(Seqno, Lsn)> = None;
-        let mut feed_prepares: Vec<(Seqno, Lsn)> = Vec::new();
+        // The change feed's lazy records (D310), as (seqno held, end, whether `None`), and
+        // the PREPAREs, held once decided. Empty, never allocated, with the feed off.
+        let mut feed_lazy_records: Vec<(Seqno, Lsn, bool)> = Vec::new();
+        let mut feed_prepares: Vec<(Seqno, Lsn, bool)> = Vec::new();
         #[cfg(feature = "test-hooks")]
         let mut appends = 0usize;
         for m in &mut group.members {
@@ -6703,9 +6796,10 @@ impl ShardState {
             } else {
                 wal.append(&record, m.durability)
             };
-            // The change feed (D310): a `None` record the feed needs, which no write of this
-            // group may carry. One compare with the feed off.
-            let fed_none = m.durability == Durability::None
+            // The change feed (D310): a `None` or `Buffered` record the feed needs, which no
+            // sync of this group covers (and, for `None`, no write). One compare with the
+            // feed off.
+            let fed_lazy = matches!(m.durability, Durability::None | Durability::Buffered)
                 && self.shared.feed.as_ref().is_some_and(|f| f.needs(&record));
             // The commit point of a value separated at commit time: a record the stream
             // accepted (even one whose write then fails: it may have landed) may be applied
@@ -6745,30 +6839,23 @@ impl ShardState {
             match result {
                 Ok(t) => {
                     m.ticket = Some(t);
-                    if fed_none {
-                        match m.kind {
+                    if fed_lazy {
+                        let none = m.durability == Durability::None;
+                        let at = match m.kind {
                             // Held at its apply seqno once decided (`decide_share`): the
                             // commit's id is never held, so a hold there could lower the
                             // frontier.
-                            MemberKind::Prepare { .. } => feed_prepares.push((m.seqno, t.end)),
+                            MemberKind::Prepare { .. } => {
+                                feed_prepares.push((m.seqno, t.end, none));
+                                None
+                            }
                             // The decision's seqno is held by `cross_held` until every
                             // participant applied; a single's by this group's pending.
-                            MemberKind::CommitRecord { apply_seqno, .. } => {
-                                feed_unwritten = Some(
-                                    feed_unwritten
-                                        .map_or((apply_seqno, t.end), |(s, e): (Seqno, Lsn)| {
-                                            (s.min(apply_seqno), e.max(t.end))
-                                        }),
-                                );
-                            }
-                            MemberKind::Single => {
-                                feed_unwritten = Some(
-                                    feed_unwritten
-                                        .map_or((m.seqno, t.end), |(s, e): (Seqno, Lsn)| {
-                                            (s.min(m.seqno), e.max(t.end))
-                                        }),
-                                );
-                            }
+                            MemberKind::CommitRecord { apply_seqno, .. } => Some(apply_seqno),
+                            MemberKind::Single => Some(m.seqno),
+                        };
+                        if let Some(at) = at {
+                            feed_lazy_records.push((at, t.end, none));
                         }
                     }
                     self.stream_end = self.stream_end.max(t.end);
@@ -6824,12 +6911,12 @@ impl ShardState {
                 Durability::Buffered | Durability::None => {}
             }
         }
-        if let Some((seqno, end)) = feed_unwritten {
-            self.note_feed_unwritten(seqno, end, ctx);
+        for (seqno, end, none) in feed_lazy_records {
+            self.note_feed_unwritten(seqno, end, none, ctx);
         }
-        for (id, end) in feed_prepares {
+        for (id, end, none) in feed_prepares {
             if let Some(share) = self.prepared.get_mut(&id) {
-                share.feed_end = Some(end);
+                share.feed_end = Some((end, none));
             }
         }
         // D279: a Buffered PREPARE votes once its record is appended, when its group has no
@@ -8837,10 +8924,11 @@ impl ShardState {
                 // The change feed (D310): a PREPARE still unwritten holds the written
                 // watermark at the apply seqno, before this share reports applied and
                 // `cross_held` lets it go.
-                if let Some(end) = share.feed_end
-                    && self.wal.as_ref().is_some_and(|w| w.written() < end)
+                if let Some((end, none)) = share.feed_end
+                    && self.wal.as_ref().is_some_and(|w| w.durable() < end)
                 {
-                    self.note_feed_unwritten(apply_seqno, end, ctx);
+                    let unwritten = none && self.wal.as_ref().is_some_and(|w| w.written() < end);
+                    self.note_feed_unwritten(apply_seqno, end, unwritten, ctx);
                 }
                 self.refresh_tablets();
                 // D263: the share lands at the decision's seqno and timestamp, this
@@ -10813,12 +10901,19 @@ impl ShardState {
             }
             ShardMsg::CounterCheckpoint(c) => self.counter_checkpoint(&c),
             ShardMsg::FeedFlush => self.feed_flush(ctx),
+            ShardMsg::FeedSync => self.feed_sync(ctx),
+            ShardMsg::FeedSynced { ok } => self.on_feed_synced(ok, ctx),
             ShardMsg::Kick => {
                 // A lazy flush whose timer gave up on a frozen clock (the simulator) runs now.
                 if self.feed_low.get() != u64::MAX
                     && self.feed_timer.as_ref().is_some_and(|t| t.finished())
                 {
                     self.feed_flush(ctx);
+                }
+                if self.feed_sync_low.get() != u64::MAX
+                    && self.feed_sync_timer.as_ref().is_some_and(|t| t.finished())
+                {
+                    self.feed_sync(ctx);
                 }
                 let due = self.continuations.take_on_kick();
                 // The cross record at the checkpoint's front became visible (`await_front`).

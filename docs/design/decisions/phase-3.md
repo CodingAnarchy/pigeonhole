@@ -3812,6 +3812,12 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - with `FeedTables::All`, every `None` batch, PREPARE and decision;
   - with a table list, a batch or PREPARE that writes a listed table (a scan of its mutation headers, with the feed on only), plus every decision.
 - **The frontier.** `ShmRegion::written_seqno(durable)` is the snapshot rule under every shard's `written` too (`Engine::feed_frontier`).
-- **A second hold, `synced`** (offset 24), covers the same records until a sync passes them, and only the durable frontier reads it. D227 counts a `None` commit as durable at its level once applied, so without this hold a `durable()` feed could deliver a change a power loss still undoes (S3). With it, a durable feed on a pure-`None` fed table advances only when a later sync covers the records (§2.3's guide line). The lazy flush never syncs.
+- **A second hold, `synced`** (offset 24), and only the durable frontier reads it. It covers every fed record its group doesn't sync, `None` and `Buffered` alike: singles, PREPAREs at their apply seqno, and decisions. It's released once a sync passes them.
+  - **Why:** D227 counts a `None` commit durable once applied and a `Buffered` one once written. Without this hold, a `durable()` feed could deliver a change a power loss still undoes (S3; simp724's M1 on #1297 added `Buffered`).
+- **The background sync.** The lazy flush never syncs, so a feed-only background sync (`submit_sync`, never waited on) runs when the synced hold has been held for *T_sync* and no other sync covered it.
+  - **The timer:** armed only on empty to held, with one sync in flight per shard.
+  - **The default:** 100 ms, and 1 s on macOS, where `F_FULLFSYNC` is device-wide (perf287). It's configurable as `FeedOptions::sync_interval_micros` and `FeedRetention::sync_interval`.
+  - **Counted:** `Engine::feed_background_syncs`.
+  - **Effect:** a durable feed on a pure-`Buffered` or pure-`None` fed table lags by about *T_sync* plus a sync.
 - **The M1 invariant** is stated in concurrency.md (the written-hold protocol) and on `Wal::write`.
 
