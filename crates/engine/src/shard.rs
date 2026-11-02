@@ -2283,6 +2283,10 @@ struct MutKey {
     ts: Timestamp,
     /// It carries its own timestamp (D273), not the commit's.
     own_ts: bool,
+    /// Its run of mutations to one row of one table: equal to the previous key's run
+    /// exactly when its table and row bytes are the previous key's (#1206). The dedup's
+    /// order check and apply's route and row-prefix reuse test it instead of the row bytes.
+    run: u32,
     row: (u32, u32),
     qualifier: (u32, u32),
     value: (u32, u32),
@@ -2315,6 +2319,8 @@ impl Dedup {
             (off as u32, part.len() as u32)
         };
         let mut explicit = false;
+        let mut run = 0u32;
+        let mut prev: Option<(u32, &[u8])> = None;
         for m in batch.iter() {
             let m = match m {
                 Ok(m) => m,
@@ -2324,12 +2330,17 @@ impl Dedup {
                 }
             };
             explicit |= m.ts.is_some();
+            if prev.is_some_and(|(t, r)| t != m.table.0 || r != m.row) {
+                run += 1;
+            }
+            prev = Some((m.table.0, m.row));
             self.keys.push(MutKey {
                 table: m.table.0,
                 family: m.family.0,
                 kind: m.kind,
                 ts: m.ts.unwrap_or(0),
                 own_ts: m.ts.is_some(),
+                run,
                 row: at(m.row),
                 qualifier: at(m.qualifier),
                 value: at(m.value),
@@ -2380,8 +2391,19 @@ impl Dedup {
                 .then_with(|| a.ts.cmp(&b.ts))
         };
         // Already strictly increasing (a row's cells in qualifier order, a sorted batch): no
-        // two are equal, so nothing collapses and the sort is skipped.
-        if keys.windows(2).all(|w| cmp(&w[0], &w[1]).is_lt()) {
+        // two are equal, so nothing collapses and the sort is skipped. Within a run the
+        // table and row are equal, so only the rest is compared.
+        let next = |a: &MutKey, b: &MutKey| {
+            if a.run == b.run {
+                (a.family, a.marker())
+                    .cmp(&(b.family, b.marker()))
+                    .then_with(|| compare(part(a.qualifier), part(b.qualifier)))
+                    .then_with(|| a.ts.cmp(&b.ts))
+            } else {
+                cmp(a, b)
+            }
+        };
+        if keys.windows(2).all(|w| next(&w[0], &w[1]).is_lt()) {
             return false;
         }
         self.order.clear();
@@ -4105,14 +4127,13 @@ impl ShardState {
         let mut touched: smallvec::SmallVec<[(TabletId, FamilyId); 4]> = smallvec::SmallVec::new();
         let mut unrouted = 0usize;
         let mut new_slots = 0usize;
-        // The row of the previous write and its tablet: a run of writes to one row routes
-        // and hashes it once.
-        let mut last: Option<(TableId, &[u8], Option<TabletId>)> = None;
+        // The run (`MutKey::run`) of the previous write and its tablet: a run of writes to
+        // one row routes and hashes it once.
+        let mut last: Option<(u32, Option<TabletId>)> = None;
         // The batch as `reserve_room` just decoded it (#1206): its apply reads the same keys.
         for k in keys {
             let (table, family) = (TableId(k.table), FamilyId(k.family));
-            let (row, qualifier) = (span(bytes, k.row), span(bytes, k.qualifier));
-            let key = 2 * (row.len() + qualifier.len()) + KEY_FIXED;
+            let key = 2 * (k.row.1 as usize + k.qualifier.1 as usize) + KEY_FIXED;
             let entry = ENTRY_OVERHEAD + key + k.value.1 as usize;
             total += entry;
             waste += entry.min(self.chunk_size);
@@ -4124,11 +4145,12 @@ impl ShardState {
                 min_large = min_large.min(chunks);
             }
             let tablet = match last {
-                Some((t, r, tablet)) if t == table && compare(r, row).is_eq() => tablet,
+                Some((run, tablet)) if run == k.run => tablet,
                 _ => {
+                    let row = span(bytes, k.row);
                     let tablet = self.tablets.route(table, row).map(|(t, _)| t);
                     rows.push(hash_row(table, row));
-                    last = Some((table, row, tablet));
+                    last = Some((k.run, tablet));
                     tablet
                 }
             };
@@ -5538,9 +5560,12 @@ impl ShardState {
         let dups = self.dedup.scan(batch, bytes, commit_ts, decoded);
         let threshold = self.shared.memtable_freeze_bytes as usize;
         let tablets = Arc::clone(&self.tablets);
-        let mut last_route: Option<(TableId, &[u8], TabletId)> = None;
-        // The row whose escaped prefix `key_buf` starts with, and its length.
-        let mut row_prefix: Option<(&[u8], usize)> = None;
+        // The run (`MutKey::run`: one table and row) last routed, and its tablet.
+        let mut last_route: Option<(u32, TabletId)> = None;
+        // The run whose escaped row `key_buf` starts with, and the prefix's length.
+        let mut row_prefix: Option<(u32, usize)> = None;
+        // The slot the last write went to: a run of writes to it records it once.
+        let mut last_slot: Option<(TabletId, FamilyId)> = None;
         let mut key_buf = std::mem::take(&mut self.key_buf);
         let mut result = Ok(());
         self.touched_slots.clear();
@@ -5580,7 +5605,7 @@ impl ShardState {
                 continue;
             }
             let tablet = match last_route {
-                Some((t, r, id)) if t == m.table && r == m.row => id,
+                Some((run, id)) if run == k.run => id,
                 _ => {
                     // A row of a dropped table, or one another shard owns (replay of a
                     // stream written under a different shard count), is not ours.
@@ -5590,7 +5615,7 @@ impl ShardState {
                     if owner != self.id {
                         continue;
                     }
-                    last_route = Some((m.table, m.row, id));
+                    last_route = Some((k.run, id));
                     if track {
                         self.note_write(id, m.row);
                     }
@@ -5624,14 +5649,14 @@ impl ShardState {
             // The escaped row stays in `key_buf` across a run of writes to one row: only the
             // qualifier and suffix are encoded for each.
             let row_len = match row_prefix {
-                Some((row, len)) if compare(row, m.row).is_eq() => len,
+                Some((run, len)) if run == k.run => len,
                 _ => {
                     key_buf.clear();
                     if let Err(e) = encode_row_prefix(&mut key_buf, m.row) {
                         result = Err(e.into());
                         break;
                     }
-                    row_prefix = Some((m.row, key_buf.len()));
+                    row_prefix = Some((k.run, key_buf.len()));
                     key_buf.len()
                 }
             };
@@ -5677,8 +5702,11 @@ impl ShardState {
                     rc.note_delete(ts);
                 }
             }
-            if !self.touched_slots.contains(&(tablet, m.family)) {
-                self.touched_slots.push((tablet, m.family));
+            if last_slot != Some((tablet, m.family)) {
+                last_slot = Some((tablet, m.family));
+                if !self.touched_slots.contains(&(tablet, m.family)) {
+                    self.touched_slots.push((tablet, m.family));
+                }
             }
             if slot.active.table.allocated_bytes() >= threshold
                 && !self.to_freeze.contains(&(tablet, m.family))
@@ -11146,6 +11174,32 @@ mod tests {
         assert_eq!(
             scan(&[(b"r", b"a", Some(3)), (b"r", b"a", Some(4))]),
             (false, vec![true, true])
+        );
+        // A row written again after another (A, B, A) is a new run, and its repeat of the
+        // first run's cell still loses.
+        assert_eq!(
+            scan(&[(b"r", b"a", None), (b"s", b"a", None), (b"r", b"a", None)]),
+            (true, vec![false, true, true])
+        );
+        // Runs: one per stretch of one table's row; the same row bytes in another table, or
+        // the row again after another, start a new one.
+        let mut b = BatchBuilder::new();
+        for (table, row) in [
+            (1, b"r"),
+            (1, b"r"),
+            (2, b"r"),
+            (2, b"s"),
+            (2, b"r"),
+            (2, b"r"),
+        ] {
+            b.push(TableId(table), f, Kind::Put, row, b"q", None, b"v")
+                .unwrap();
+        }
+        let mut d = Dedup::default();
+        d.decode(b.batch(), b.batch().as_bytes());
+        assert_eq!(
+            d.keys.iter().map(|k| k.run).collect::<Vec<_>>(),
+            [0, 0, 1, 2, 3, 3]
         );
     }
 
