@@ -123,6 +123,8 @@ pub struct FeedCursor {
     chunk_slot: usize,
     /// Segment offset of `chunk[0]`.
     chunk_start: u64,
+    /// A stop short of its successor's recorded end, deferred once (#1370): `(epoch, stop)`.
+    deferred: Option<(u32, u64)>,
 }
 
 #[derive(Debug)]
@@ -172,6 +174,7 @@ impl FeedCursor {
             chunk: Vec::new(),
             chunk_slot: usize::MAX,
             chunk_start: 0,
+            deferred: None,
         };
         this.cur = this.place(at);
         Ok(this)
@@ -277,10 +280,20 @@ impl FeedCursor {
             return Ok(Chained::Cut);
         }
         if u64::from(h.prev_end) != stop {
+            // Short of the successor's end: the frames past `stop` may have been read while
+            // they were being written (a torn read; the successor landed in between). Read
+            // again from here first, once (#1370). By M1 a torn read only hits records past
+            // the frontier the feed loaded before reading, so stopping here skips nothing.
+            // The same short stop on the second look is data a sync covered and lost.
+            if self.deferred != Some((epoch, stop)) {
+                self.deferred = Some((epoch, stop));
+                return Ok(Chained::No);
+            }
             return Err(crate::stream::corrupt(
                 "wal segment chain: predecessor end mismatch",
             ));
         }
+        self.deferred = None;
         self.cur = Some(Cursor {
             slot,
             epoch: h.epoch,
