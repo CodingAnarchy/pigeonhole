@@ -3840,6 +3840,22 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - the syntax equal to the builder;
   - a repeated phrase word needing two occurrences.
 
+**PR 3a.** MaxScore (Turtle and Flood), doc at a time, replaces the term-at-a-time evaluator outright. A test-only exact evaluator would break the no-test-only-paths rule, so the reference is the tests' brute-force BM25.
+- **Bounds:**
+  - a term clause: `idf · tf_factor(maxtf, minlen)`;
+  - a phrase clause, scored up front: its largest actual score, tighter than the maxtf bound and still exact.
+- **The loop:**
+  - clauses sorted by bound; the non-essential prefix is the longest whose bounds sum strictly below the `k`-th score;
+  - candidates come from the essential clauses' postings;
+  - non-essential contributions are looked up per candidate while it can still reach the threshold.
+- **Exactness:** scores are summed in the clauses' fixed order, so they're exactly an unpruned search's. Bounds carry a relative 1e-9 slack.
+- **Stale hits:** a stale top-`k` hit re-runs the search for that many more.
+- **`Search::id_prefix`:** bounds every posting and position walk.
+- **Tests:**
+  - the exact top `k` at `k` 1, 3 and 10 against the brute force (3 seeds × 80 queries over 300 documents with deletes and overwrites, so the aggregates over-estimate). A local count showed thousands of candidates pruned with up to 3 non-essential clauses;
+  - `id_prefix` equals the full search filtered by prefix, at large and small `k`;
+  - the terminator's effect.
+
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
 **Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.

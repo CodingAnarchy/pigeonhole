@@ -72,6 +72,13 @@ No API is added: `Query::phrase_with_slop(words, u16)`, the `Clause` slop fields
 - **Slop 0** is the exact phrase, scored as in PR 1.
 - **Docs:** `phrase_with_slop` documents the rule, the scoring and the cost.
 
+## PR 3a: MaxScore and `id_prefix`
+- **`Search::id_prefix(prefix) -> Search`:** only documents whose id starts with `prefix`.
+  - Every posting and position walk is bounded to the prefix.
+  - The ranking statistics stay the whole index's, so scores equal an unrestricted search's for the same documents, and fewer than `k` hits may come back.
+  - The prefix should carry its terminator (`agent:alice\0`), which the docs say.
+- **MaxScore replaces the term-at-a-time evaluator** (no API change). Results and scores are exactly the same as before: a document's contributions are summed in the clauses' fixed order, and pruning tests a strict bound.
+
 ## Later PRs: recorded now (cli692 on #1300)
 - **PR 5's `Match`** (`#[non_exhaustive]`) has `range`, `clause` and `occurrence: u32`. A sloppy match lists each matched term's range, all sharing one `occurrence`. An exact phrase is one first-to-last range. That's D309 rev 6 §B.6.
 

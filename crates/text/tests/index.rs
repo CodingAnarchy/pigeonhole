@@ -683,3 +683,130 @@ fn a_repeated_phrase_word_needs_two_occurrences() {
     assert_eq!(ids(&hits), [&b"two"[..]]);
     db.close().unwrap();
 }
+
+/// Checks a top-`k` search against the reference's scores: the hits are the reference's best
+/// `k` (by score, then id), with the same scores. Scores within 1e-9 count as tied, so either
+/// side of a tie may make the cut.
+fn same_top_k(got: &[pigeonhole_text::Hit], want: &BTreeMap<Vec<u8>, f64>, k: usize, ctx: &str) {
+    let mut ranked: Vec<(&Vec<u8>, f64)> = want.iter().map(|(d, s)| (d, *s)).collect();
+    ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    assert_eq!(got.len(), k.min(ranked.len()), "{ctx}: how many");
+    let close = |a: f64, b: f64| (a - b).abs() <= 1e-9 * a.abs().max(1.0);
+    for (i, h) in got.iter().enumerate() {
+        let w = want
+            .get(&h.id)
+            .unwrap_or_else(|| panic!("{ctx}: {:?} isn't a match", h.id));
+        assert!(
+            close(h.score, *w),
+            "{ctx}: {:?} scored {} not {w}",
+            h.id,
+            h.score
+        );
+        assert!(
+            close(h.score, ranked[i].1),
+            "{ctx}: rank {i} is {} not {}",
+            h.score,
+            ranked[i].1
+        );
+    }
+}
+
+#[test]
+fn maxscore_returns_the_exact_top_k_at_small_k() {
+    for seed in seeds(&[21, 22, 23]) {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = open(&dir);
+        let (_docs, index) = create(&db, IndexOptions::new());
+        let mut rng = Rng::new(seed);
+        let mut model: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for i in 0..300 {
+            let doc = format!("d{i:03}").into_bytes();
+            let t = text(&mut rng, 24);
+            index.put(&doc, &t).unwrap();
+            model.insert(doc, t);
+        }
+        // Some deletes and overwrites, so the bounds' aggregates over-estimate (M1).
+        for _ in 0..40 {
+            let doc = format!("d{:03}", rng.below(300)).into_bytes();
+            if rng.below(2) == 0 {
+                index.delete(&doc).unwrap();
+                model.remove(&doc);
+            } else {
+                let t = text(&mut rng, 4);
+                index.put(&doc, &t).unwrap();
+                model.insert(doc, t);
+            }
+        }
+        let bm = Bm25::new(&model);
+        for q in 0..80 {
+            let n = 1 + rng.below(4) as usize;
+            let terms: Vec<&str> = (0..n).map(|_| word(&mut rng)).collect();
+            let phrases: Vec<Vec<&str>> = if rng.below(3) == 0 {
+                vec![vec![word(&mut rng), word(&mut rng)]]
+            } else {
+                Vec::new()
+            };
+            let mut query = Query::new().text(terms.join(" "));
+            for p in &phrases {
+                query = query.phrase(p.clone());
+            }
+            let want = bm.scores(&terms, &phrases);
+            for k in [1, 3, 10] {
+                let got = index.search(query.clone(), k).run().unwrap();
+                same_top_k(
+                    &got,
+                    &want,
+                    k,
+                    &format!("seed {seed}, query {q} {terms:?} {phrases:?}, k {k}"),
+                );
+            }
+        }
+        check(&index, "maxscore");
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn an_id_prefix_restricts_the_search_and_keeps_its_scores() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    let mut rng = Rng::new(31);
+    for ns in ["agent:alice\0", "agent:alice2\0", "shared\0"] {
+        for i in 0..40 {
+            index
+                .put(format!("{ns}m{i:02}").as_bytes(), &text(&mut rng, 12))
+                .unwrap();
+        }
+    }
+    let query = r#"memory agent "memory store""#;
+    let all = index.search(query, 1000).run().unwrap();
+    for ns in ["agent:alice\0", "agent:alice2\0", "shared\0"] {
+        let want: Vec<_> = all
+            .iter()
+            .filter(|h| h.id.starts_with(ns.as_bytes()))
+            .cloned()
+            .collect();
+        let got = index.search(query, 1000).id_prefix(ns).run().unwrap();
+        assert_eq!(got, want, "{ns:?}");
+        // At a small k, the prefix's own top k.
+        let top = index.search(query, 3).id_prefix(ns).run().unwrap();
+        assert_eq!(top, want[..want.len().min(3)], "{ns:?} top 3");
+    }
+    // The terminator matters: `agent:alice` alone also matches `agent:alice2`'s ids.
+    let loose = index
+        .search(query, 1000)
+        .id_prefix("agent:alice")
+        .run()
+        .unwrap();
+    assert!(loose.iter().any(|h| h.id.starts_with(b"agent:alice2")));
+    assert!(
+        index
+            .search(query, 10)
+            .id_prefix("nobody\0")
+            .run()
+            .unwrap()
+            .is_empty()
+    );
+    db.close().unwrap();
+}

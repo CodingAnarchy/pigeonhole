@@ -7,6 +7,7 @@ use pigeonhole::{Snapshot, Table};
 use crate::error::{Error, Result, corrupt};
 use crate::index::Index;
 use crate::layout::*;
+use crate::maxscore::{Bm25, Scored};
 use crate::query::{Clause, Query};
 
 /// One search result.
@@ -36,6 +37,7 @@ pub struct Search<'a> {
     query: Query,
     k: usize,
     snapshot: Option<&'a Snapshot>,
+    prefix: Option<Vec<u8>>,
 }
 
 /// A phrase as the evaluator matches it: each term with its offset from the first, and the
@@ -53,12 +55,24 @@ impl<'a> Search<'a> {
             query,
             k,
             snapshot: None,
+            prefix: None,
         }
     }
 
     /// Searches at `snapshot` rather than the latest state.
     pub fn snapshot(mut self, snapshot: &'a Snapshot) -> Self {
         self.snapshot = Some(snapshot);
+        self
+    }
+
+    /// Only documents whose id starts with `prefix` (for example a namespace, with its
+    /// terminator: `agent:alice\0`, so `agent:alice2` isn't included).
+    ///
+    /// The ranking statistics stay the whole index's (`N`, each term's `df`, the average
+    /// length), so scores aren't comparable to those of an index holding only these
+    /// documents. Fewer than `k` hits may come back.
+    pub fn id_prefix(mut self, prefix: impl Into<Vec<u8>>) -> Self {
+        self.prefix = Some(prefix.into());
         self
     }
 
@@ -121,42 +135,46 @@ impl<'a> Search<'a> {
                 df_of.insert(term.clone(), df);
             }
         }
-        let mut scores: HashMap<Vec<u8>, f64> = HashMap::new();
-        for term in &terms {
-            let df = df_of[term];
-            if df <= 0 {
-                continue;
-            }
-            let idf = bm.idf(df);
-            let mut cells = t.row(&post_row(term)).family(POST).snapshot(s).cells()?;
-            while let Some(e) = cells.next()? {
-                let (tf, len) = unposting(
-                    e.cell
-                        .as_u64()
-                        .ok_or_else(|| corrupt("a posting isn't a u64"))?,
-                );
-                *scores.entry(e.qualifier.to_vec()).or_default() +=
-                    idf * bm.tf_factor(f64::from(tf), f64::from(len));
-            }
-        }
+        let prefix = self.prefix.as_deref();
+        // The phrases, scored up front (D309 §4.2): their bounds are their actual maxima.
+        let mut phrase_scores = Vec::with_capacity(phrases.len());
         for phrase in &phrases {
-            score_phrase(t, s, &bm, &df_of, phrase, &mut scores)?;
+            phrase_scores.push(score_phrase(t, s, &bm, &df_of, phrase, prefix)?);
         }
-        let mut ranked: Vec<(Vec<u8>, f64)> = scores.into_iter().collect();
-        ranked.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-        let mut hits = Vec::with_capacity(self.k.min(ranked.len()));
         let (fam, q) = (inn.source.family.as_str(), inn.source.qualifier.as_slice());
-        for (id, score) in ranked {
-            if hits.len() == self.k {
-                break;
+        // A stale hit (its source deleted around the index) is skipped and the next one takes
+        // its place, so a run that met stale hits runs again for that many more.
+        let mut want = self.k;
+        loop {
+            let mut clauses = Vec::with_capacity(terms.len() + phrases.len());
+            for term in &terms {
+                let df = df_of[term];
+                if df > 0 {
+                    clauses.push(Scored::term(t, s, &bm, term, df, prefix)?);
+                }
             }
-            if inn.src.get_at(s, &id, fam, q)?.is_none() {
-                stats.stale += 1;
-                continue;
+            for ps in &phrase_scores {
+                clauses.push(Scored::phrase(ps.clone()));
             }
-            hits.push(Hit { id, score });
+            let ranked = crate::maxscore::top_k(t, s, &bm, clauses, want)?;
+            let complete = ranked.len() < want;
+            let mut hits = Vec::with_capacity(self.k);
+            stats = SearchStats::default();
+            for (id, score) in ranked {
+                if hits.len() == self.k {
+                    break;
+                }
+                if inn.src.get_at(s, &id, fam, q)?.is_none() {
+                    stats.stale += 1;
+                    continue;
+                }
+                hits.push(Hit { id, score });
+            }
+            if hits.len() == self.k || complete {
+                return Ok((hits, stats));
+            }
+            want = self.k + stats.stale as usize;
         }
-        Ok((hits, stats))
     }
 
     /// The query's distinct terms and phrases, normalised and tokenised as the clauses say.
@@ -231,25 +249,6 @@ impl<'a> Search<'a> {
     }
 }
 
-/// BM25 with Lucene's idf (D309 §4).
-struct Bm25 {
-    n: f64,
-    avglen: f64,
-    k1: f64,
-    b: f64,
-}
-
-impl Bm25 {
-    fn idf(&self, df: i64) -> f64 {
-        let df = df as f64;
-        (1.0 + (self.n - df + 0.5) / (df + 0.5)).ln()
-    }
-
-    fn tf_factor(&self, tf: f64, len: f64) -> f64 {
-        tf * (self.k1 + 1.0) / (tf + self.k1 * (1.0 - self.b + self.b * len / self.avglen))
-    }
-}
-
 /// Adds a phrase's scores: Lucene's phrase scoring, the phrase as one pseudo-term whose idf
 /// is the sum of its terms' (D309 §4.3). Its frequency is its exact occurrences at slop 0,
 /// and its sloppy frequency (`Σ 1 / (distance + 1)` over its matches, D309 rev 6 §B) above
@@ -260,11 +259,12 @@ fn score_phrase(
     bm: &Bm25,
     df_of: &HashMap<String, i64>,
     phrase: &Phrase,
-    scores: &mut HashMap<Vec<u8>, f64>,
-) -> Result<()> {
+    prefix: Option<&[u8]>,
+) -> Result<BTreeMap<Vec<u8>, f64>> {
+    let mut scores = BTreeMap::new();
     let terms = &phrase.terms;
     if terms.iter().any(|(term, _)| df_of[term] <= 0) {
-        return Ok(());
+        return Ok(scores);
     }
     let idf: f64 = terms.iter().map(|(term, _)| bm.idf(df_of[term])).sum();
     // Lead with the rarest term; the others narrow its documents.
@@ -273,13 +273,13 @@ fn score_phrase(
         .expect("a phrase has terms");
     let mut by_term: BTreeMap<&str, BTreeMap<Vec<u8>, Vec<u32>>> = BTreeMap::new();
     let lead_term = terms[lead].0.as_str();
-    by_term.insert(lead_term, read_positions(t, s, lead_term, None)?);
+    by_term.insert(lead_term, read_positions(t, s, lead_term, None, prefix)?);
     for (term, _) in terms {
         if by_term.contains_key(term.as_str()) {
             continue;
         }
         let keep = &by_term[lead_term];
-        let got = read_positions(t, s, term, Some(keep))?;
+        let got = read_positions(t, s, term, Some(keep), prefix)?;
         by_term.insert(term, got);
     }
     // A repeated word's terms share one group, so the sloppy matcher keeps them apart.
@@ -327,9 +327,9 @@ fn score_phrase(
             Some(c) => unposting(c.as_u64().ok_or_else(|| corrupt("a posting isn't a u64"))?).1,
             None => return Err(corrupt("a position has no posting")),
         };
-        *scores.entry(doc.clone()).or_default() += idf * bm.tf_factor(freq, f64::from(len));
+        scores.insert(doc.clone(), idf * bm.tf_factor(freq, f64::from(len)));
     }
-    Ok(())
+    Ok(scores)
 }
 
 /// A term's positions by document, for the documents in `keep` (all when `None`).
@@ -338,9 +338,14 @@ fn read_positions(
     s: &Snapshot,
     term: &str,
     keep: Option<&BTreeMap<Vec<u8>, Vec<u32>>>,
+    prefix: Option<&[u8]>,
 ) -> Result<BTreeMap<Vec<u8>, Vec<u32>>> {
     let mut out = BTreeMap::new();
-    let mut cells = t.row(&post_row(term)).family(POS).snapshot(s).cells()?;
+    let mut read = t.row(&post_row(term)).family(POS).snapshot(s);
+    if let Some(p) = prefix {
+        read = read.qualifier_prefix(p);
+    }
+    let mut cells = read.cells()?;
     while let Some(e) = cells.next()? {
         if keep.is_some_and(|k| !k.contains_key(e.qualifier)) {
             continue;

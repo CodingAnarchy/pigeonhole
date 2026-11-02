@@ -49,6 +49,7 @@
 mod error;
 mod index;
 mod layout;
+mod maxscore;
 mod query;
 mod search;
 mod sloppy;
