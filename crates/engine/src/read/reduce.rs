@@ -1226,8 +1226,11 @@ impl<I: Send, F: Fn(&CellRef<'_>, &I) -> u64 + Send> Reducer for ByteBudget<I, F
             return ControlFlow::Break(());
         }
         if !same {
-            let new_row = self.kept.last().is_none_or(|k| k.key.row != cell.row);
-            if new_row && self.rows.is_some_and(|n| self.kept_rows == n) {
+            // The count first: the row key is compared only at the limit, so a read without
+            // one pays a compare of two integers here (#1284's scan-budget count).
+            if self.rows == Some(self.kept_rows)
+                && self.kept.last().is_none_or(|k| k.key.row != cell.row)
+            {
                 self.rows_full = true;
                 return ControlFlow::Break(());
             }
