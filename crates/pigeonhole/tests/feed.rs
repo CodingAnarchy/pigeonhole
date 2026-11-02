@@ -240,6 +240,42 @@ fn an_open_without_the_feed_between_expires_a_token() {
     expire_between(&path, token);
 }
 
+/// ICR 0109 (D310 amendment (d)): a read-only open between two fed opens, with no feed
+/// options and another shard count, writes no session, so the token still resumes, and
+/// what was committed after it arrives.
+#[test]
+fn a_read_only_open_between_keeps_a_token() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("db.phdb");
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    let (a, _) = tables(&db);
+    let mut feed = a.feed().open().unwrap();
+    a.mutate(b"r").put("f", b"q", b"1").commit().unwrap();
+    next(&mut feed);
+    let token = feed.token();
+    a.mutate(b"after").put("f", b"q", b"2").commit().unwrap();
+    drop(feed);
+    db.close().unwrap();
+
+    // A tool reads: as `phdb info` or `phdb dump` does.
+    let ro = Pigeonhole::open(&path, Options::default().shards(1).read_only(true)).unwrap();
+    assert!(ro.info().unwrap().read_only);
+    let t = ro.table("a").unwrap().open().unwrap();
+    assert!(t.get(b"after", "f", b"q").unwrap().is_some());
+    let e = t.mutate(b"x").put("f", b"q", b"v").commit().unwrap_err();
+    assert_eq!(e.code(), ErrorCode::ReadOnly, "{e}");
+    drop(t);
+    ro.close().unwrap();
+
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    let a = db.table("a").unwrap().open().unwrap();
+    let mut feed = a.feed().resume(&token).open().unwrap();
+    let c = feed.next(WAIT).unwrap().expect("the commit after the token");
+    assert_eq!(c.changes()[0].row(), b"after");
+    drop(feed);
+    db.close().unwrap();
+}
+
 /// Writes through an open with the feed off, then resumes `token`: it has expired, and stays
 /// so.
 fn expire_between(path: &Path, token: FeedToken) {

@@ -12,7 +12,7 @@ use crate::open;
 use crate::output::{Column, Report};
 
 pub(crate) fn run(cli: &Cli, file: &Path) -> Result<Report, Failure> {
-    let db = open::for_read(cli, file)?;
+    let db = open::for_inspect(cli, file)?;
     let mode = db.mode();
     let info = db.info().map_err(|e| Failure::db("info", &e));
     db.close()?;

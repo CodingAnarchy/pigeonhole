@@ -160,6 +160,11 @@ pub struct EngineOptions {
     /// WAL segment, no flush or compaction, no clean-close commit. It replays the WAL into
     /// memory, and fails with `ReadOnlyOpen` if that does not fit `memtable_budget`.
     pub read_only_fallback: bool,
+    /// Open read-only whatever the file needs (ICR 0109): the same open as
+    /// `read_only_fallback` takes, which writes nothing to the database's files: no format
+    /// upgrade, no change-feed session or root entries, no new WAL segment, no flush or
+    /// compaction, no clean-close commit. Reads only; writes fail with `ReadOnly`.
+    pub read_only: bool,
     /// Accept a database on a FUSE filesystem (D173, #299): only for a local FUSE mount
     /// the user trusts (ntfs-3g, an encrypted home directory). FUSE byte-range locks may be
     /// local to one host, so two hosts could both open it as writers, and a sync may not
@@ -268,6 +273,7 @@ impl EngineOptions {
             balance_pack: true,
             merge_operators: MergeRegistry::default(),
             read_only_fallback: false,
+            read_only: false,
             allow_fuse: false,
             direct_io: false,
             compaction: PickerOptions::default(),

@@ -36,7 +36,7 @@ pub(crate) fn run(
             "dump writes jsonl, csv or arrow (--format jsonl|csv|arrow)",
         ));
     }
-    let db = open::for_read(cli, file)?;
+    let db = open::for_inspect(cli, file)?;
     let result = dump(
         &db,
         format,

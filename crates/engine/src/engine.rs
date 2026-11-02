@@ -896,7 +896,8 @@ impl Engine {
 
         // Create first, then open through the normal path (the writer lock comes first).
         if !vfs.exists(path)? {
-            if !options.create_if_missing {
+            // A read-only open (ICR 0109) never creates the file.
+            if !options.create_if_missing || options.read_only {
                 return Err(Error::Io(pigeonhole_io::Error::new(
                     ErrorKind::NotFound,
                     "open database",
@@ -929,8 +930,9 @@ impl Engine {
         // 2. The page file and the manifest. A file this build may read but not write (a
         //    read-only-compatible feature bit it does not know, D269) opens read-only under
         //    `read_only_fallback` (ICR 0059): `no_writes`, and nothing below writes to it.
-        let mut no_writes = false;
-        let opened = match Pager::open(&vfs, path, true) {
+        // `read_only` (ICR 0109) asks for that open whatever the file needs.
+        let mut no_writes = options.read_only;
+        let opened = match Pager::open(&vfs, path, !no_writes) {
             Ok(o) => o,
             Err(pigeonhole_pager::Error::Format(
                 pigeonhole_format::Error::UnsupportedFeature { .. },
@@ -961,7 +963,7 @@ impl Engine {
         // Refuse what will be refused before `finish`, which may upgrade the file's
         // superblocks: a refused open must leave an older file as it was (#496). An
         // unregistered merge operator opens read-only under `read_only_fallback`.
-        if catalog.has_unknown_merge && !options.read_only_fallback {
+        if catalog.has_unknown_merge && !options.read_only_fallback && !options.read_only {
             let name = catalog
                 .tables()
                 .flat_map(|t| t.families.iter())

@@ -553,6 +553,7 @@ pub fn pigeonhole::Options::io_backend(self, pigeonhole::IoBackend) -> Self
 pub fn pigeonhole::Options::memtable_budget(self, u64) -> Self
 pub fn pigeonhole::Options::merge_operator(self, alloc::rcs::arc::Arc<dyn pigeonhole::MergeOperator>) -> Self
 pub fn pigeonhole::Options::pin_threads(self, bool) -> Self
+pub fn pigeonhole::Options::read_only(self, bool) -> Self
 pub fn pigeonhole::Options::read_only_fallback(self, bool) -> Self
 pub fn pigeonhole::Options::reader_slots(self, u32) -> Self
 pub fn pigeonhole::Options::row_cache(self, usize) -> Self

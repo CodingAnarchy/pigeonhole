@@ -73,7 +73,12 @@ pub(crate) fn run(
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<ExitStatus, Failure> {
-    let db = open::for_read(cli, file)?;
+    // `--read-only` writes nothing to the database, a change-feed session included.
+    let db = if read_only {
+        open::for_inspect(cli, file)?
+    } else {
+        open::for_read(cli, file)?
+    };
     let writable = !read_only && matches!(db, Db::Writer(_));
     let mut session = Session {
         db,
