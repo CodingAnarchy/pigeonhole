@@ -3817,7 +3817,8 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **PRs:**
   1. The engine (#1264).
   2. The public API (#1281).
-  3. The follow-ups (#1284, in progress): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
+  3. The follow-ups (#1284): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
+  4. `Nearest::run_within` and `run_within_async` → `NearestPage` (#1302, D308 rev 2's PR 3): `run()`'s ranked list cut to the budget, with no resume position.
 - **Deferred:** `read_within_async` (#1286, Post-1.0).
 
 <a id="d309"></a>
