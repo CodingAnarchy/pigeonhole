@@ -103,6 +103,7 @@ fn shape_ycsb(t: &Table, ops: &[BenchOp]) -> usize {
 }
 
 fn main() {
+    measure::fix_hash_seeds();
     let mut args = std::env::args().skip(1);
     let usage = "usage: ycsb SHAPE ITERATIONS DIR";
     let shape = args.next().expect(usage);

@@ -8,6 +8,16 @@
 //! is an instruction sequence, so it does not depend on symbols. Outside valgrind, and on
 //! targets other than x86-64 Linux, it does nothing.
 
+/// Fixes the process's hash seeds (#1273), first thing in `main`, before any map is built:
+/// with them, one commit counts the same instructions on every run. Without the bench's
+/// `fixed-seed` feature (a main from before #1273, built with these sources as the base of
+/// an A/B) the seeds stay random.
+pub fn fix_hash_seeds() {
+    #[cfg(feature = "fixed-seed")]
+    pigeonhole_format::hash::fix_seed_for_measurement()
+        .expect("the seed is fixed before any hash map is built");
+}
+
 /// Counts the work of the current thread while it lives. Do not nest two on one thread: each
 /// toggles collection, so the inner one would turn it off.
 pub struct Measured(());

@@ -321,6 +321,7 @@ fn multi_get_keys(rng: &mut Rng, dense: bool) -> KeySet {
 }
 
 fn main() {
+    measure::fix_hash_seeds();
     let mut args = std::env::args().skip(1);
     let shape = args.next().expect("SHAPE");
     let iters: usize = args.next().map_or(200, |s| s.parse().expect("ITERATIONS"));
