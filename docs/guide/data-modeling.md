@@ -292,7 +292,32 @@ assert_eq!(labelled, [(f64::NEG_INFINITY, 1), (10.0, 2), (100.0, 1)]);
 
 `aggregate_bytes` also feeds an HLL family. Hash a string key there with it, rather than converting it to an `i64` yourself. A bytes element and an `i64` hash apart, so `aggregate_bytes(&7i64.to_le_bytes())` and `aggregate(7)` are two elements.
 
-Aggregate cells are never moved to blob files, whatever `blob_threshold` says, with one exception: a bloom filter larger than its family's `blob_threshold` is, like any large value. Reads and compactions fold new elements into it there, so a large filter costs one blob read per get plus its pending elements, and compaction rewrites it once per pass. A get that folds a filter of at most 4 KiB keeps the result in memory for the next reads; a larger one relies on compaction instead.
+Aggregate cells are never moved to blob files, whatever `blob_threshold` says, with two exceptions: a bloom filter or a set larger than its family's `blob_threshold` is, like any large value. Reads and compactions fold new elements into it there, so a large filter costs one blob read per get plus its pending elements, and compaction rewrites it once per pass. A get that folds a filter of at most 4 KiB keeps the result in memory for the next reads; a larger one relies on compaction instead.
+
+## Sets of integers
+
+A `Family::aggregate(Aggregation::Set)` cell holds a set of `u32`s, such as a node's neighbours or the ids of the users who did something:
+
+```rust
+# use pigeonhole::*;
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+let t = db
+    .table("graph")?
+    .family("out", Family::aggregate(Aggregation::Set))
+    .create_if_missing()?;
+t.mutate(b"node:7").set_add("out", b"", 12).set_add("out", b"", 40).commit()?;
+t.mutate(b"node:7").set_remove("out", b"", 12).commit()?;
+let cell = t.get(b"node:7", "out", b"")?.unwrap();
+let out = cell.as_set().unwrap();
+assert!(out.contains(40) && !out.contains(12));
+# Ok::<(), pigeonhole::Error>(())
+```
+
+- **Order:** adds and removes apply in commit order, so the last write for an element wins, even within one commit.
+- **Reading:** `CellRef::as_set` reads the set where it is stored, without decoding it. `len()` comes from per-block counts. `contains(x)` is a search, and `iter()` runs in ascending order. `intersection_len`, `intersection` and `union_len` take another cell's set, so the common neighbours of two nodes come from two gets.
+- **Storage:** a set is a standard 32-bit roaring bitmap (`SetRef::as_bytes`), which CRoaring and roaring-rs read as they are. Dense ranges cost about one bit per possible element, and sparse ones two bytes per element.
+- **Large sets:** a set past the family's `blob_threshold` moves to a blob file. A get then reads it from there and applies the inputs written since. Compaction folds those inputs into a new copy, so a hub's set is rewritten once per compaction, not on every write.
 
 ## Versions
 A cell has many versions, newest first, each with a `u64` microsecond timestamp.

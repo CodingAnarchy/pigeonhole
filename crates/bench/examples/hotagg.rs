@@ -6,9 +6,13 @@
 //! cargo run --release -p pigeonhole-bench --example hotagg -- KIND STEPS [WRITES] [DIR]
 //! ```
 //!
-//! `KIND` is `sum`, `hll` or `quantiles` (#488 PR 3, perf287's N1 on #1221: a sketch of the
+//! `KIND` is `sum`, `hll`, `quantiles` (#488 PR 3, perf287's N1 on #1221: a sketch of the
 //! default 7 mantissa bits and 2048 buckets, fed values over about ten binades, so a cell
-//! grows to about 1300 buckets, tens of KiB); `STEPS` is `counter_checkpoint_steps` (D291: a get that folds
+//! grows to about 1300 buckets, tens of KiB) or `set` (#488 PR 5b: every input adds a new
+//! element, scattered over 2^22, so a cell grows past D298's 4 KiB checkpoint cap after about
+//! 2,000 inputs and its later gets fold every input since the last flush) or `sethub` (as
+//! `set`, each cell first put whole as a hub of 2^22 random ids below 2^25, about 5 MB, so
+//! every get reads a large separated base); `STEPS` is `counter_checkpoint_steps` (D291: a get that folds
 //! that many entries leaves its result as a base; 0 turns it off). `CELLS` hot cells of one
 //! row take `WRITES` blind inputs round-robin, one per commit; every `READ_EVERY`-th write is
 //! followed by a timed get of one of them. An HLL cell gets a new element with every input,
@@ -43,7 +47,7 @@ fn percentile(sorted: &[u64], p: f64) -> f64 {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let kind = args.next().expect("KIND: sum, hll or quantiles");
+    let kind = args.next().expect("KIND: sum, hll, quantiles or set");
     let steps: u64 = args.next().expect("STEPS").parse().expect("STEPS");
     let writes: usize = args.next().map_or(200_000, |s| s.parse().expect("WRITES"));
     let base = args
@@ -63,6 +67,8 @@ fn main() {
     o.counter_checkpoint_steps = steps;
     let db = Engine::open(&dir.join("hotagg.phdb"), o).unwrap();
     let quantiles = kind == "quantiles";
+    let hub = kind == "sethub";
+    let set = kind == "set" || hub;
     let (family, hll) = match kind.as_str() {
         "sum" => (
             FamilyOptions::default()
@@ -84,11 +90,36 @@ fn main() {
                 .kind_params(Vec::new()),
             false,
         ),
-        other => panic!("KIND {other:?}: sum, hll or quantiles"),
+        "set" | "sethub" => (
+            FamilyOptions::default()
+                .merge_operator("pigeonhole.set")
+                .kind(FamilyKind::Set),
+            false,
+        ),
+        other => panic!("KIND {other:?}: sum, hll, quantiles, set or sethub"),
     };
     let t = db.create_table("t", &[("a".into(), family)]).unwrap();
     let f = t.families[0].id;
     let qualifiers: Vec<Vec<u8>> = (0..CELLS).map(|c| format!("c{c}").into_bytes()).collect();
+    if hub {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        for q in &qualifiers {
+            let mut ids = std::collections::BTreeSet::new();
+            while ids.len() < 1 << 22 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ids.insert((x >> 39) as u32);
+            }
+            let mut bytes = Vec::new();
+            pigeonhole_format::roaring::encode_sorted(&mut bytes, ids);
+            let mut wb = WriteBatch::new();
+            wb.put(t.id, f, b"hot", q, None, ValueRef::Bytes(&bytes))
+                .unwrap();
+            db.commit(wb, None).unwrap();
+        }
+        db.flush().unwrap();
+    }
 
     let mut pending = [0usize; CELLS];
     let mut reads: [Vec<u64>; 4] = Default::default();
@@ -99,7 +130,14 @@ fn main() {
     for i in 0..writes {
         let c = i % CELLS;
         let mut wb = WriteBatch::new();
-        let input = if quantiles {
+        let mut operand = Vec::new();
+        if set {
+            let x = (i as u32).wrapping_mul(2_654_435_761) >> 10;
+            pigeonhole_format::roaring::encode_operand(&mut operand, &[x], &[]);
+        }
+        let input = if set {
+            ValueRef::Bytes(&operand)
+        } else if quantiles {
             // 0.001 to 1000, scattered.
             ValueRef::F64((i as u64).wrapping_mul(2_654_435_761) as f64 % 1e6 * 1e-3 + 1e-3)
         } else {

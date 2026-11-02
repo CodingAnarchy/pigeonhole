@@ -25,6 +25,11 @@ pub enum ValueTag {
     Blob = 0x80,
 }
 
+/// A leading byte no stored value starts with, reserved for an operator's accumulator in the
+/// middle of a fold (the roaring set's working form, D298): it never reaches a file, the WAL
+/// or a reader, and a value that starts with it is malformed.
+pub const TRANSIENT_TAG: u8 = 0xFF;
+
 /// A decoded stored value, borrowing from the input.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ValueRef<'a> {

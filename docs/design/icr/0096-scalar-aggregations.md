@@ -82,3 +82,19 @@ D298 (#488): the owner's minimum set of further aggregations for 1.1.0, and the 
   - **pigeonhole-format:** `bloom` (states and parameters); `hll::{hash_i64, hash_bytes, register_of_hash, append_hashed, append_bytes_element, BYTES_DOMAIN}`; `FamilyKind::Bloom`; `FamilyKind::values_stay_inline`.
   - **pigeonhole-compaction:** `BloomUnion`.
   - **pigeonhole-sim:** `bloom_state`, `bloom_state_valid`, `MODEL_BLOOM_LOG2_BITS`, `MODEL_BLOOM_HASHES`, and `ModelAggregation::Bloom`.
+
+## PR 5b: roaring sets
+- **pigeonhole:**
+  - `Aggregation::Set`: a set of `u32`s, stored as a standard roaring bitmap.
+  - `set_add(family, qualifier, x: u32)`, `set_add_at`, `set_remove` and `set_remove_at`, on `RowMutation`, and on `WriteBatch` and `Transaction` with `table` and `row` first. They are refused in other families when the write is built, naming the method to use; a set family refuses every other input method.
+  - `CellRef`/`Cell::as_set() -> Option<SetRef<'_>>`.
+  - `SetRef<'a>` (`Copy`): `from_bytes(&[u8]) -> Option<Self>`, `as_bytes()`, `len() -> u64`, `is_empty()`, `contains(u32)`, `iter() -> SetIter<'a>`, `intersection(&SetRef) -> SetIntersection`, `intersection_len(&SetRef) -> u64` and `union_len(&SetRef) -> u64`. `SetIter` and `SetIntersection` iterate `u32`s ascending.
+  - **Behaviour:**
+    - Adds and removes apply in commit order: a later `set_remove(x)` undoes an earlier `set_add(x)`, and the reverse, including within one commit.
+    - A put takes a canonical roaring set (as `phdb load` writes one back).
+    - A set past the family's `blob_threshold` moves to a blob file, and reads and compactions fold new inputs onto it there.
+- **phdb:** `"aggregation": "set"`; the shell's `create … name:set`; `aggregate … x` or `+x` adds `x` to a set family's cell, and `-x` removes it.
+- **Internal crates:**
+  - **pigeonhole-format:** `roaring` (sets, operands, their algebra, and `MutSet`, `apply_all` and `combine_all` for a linear fold); `FamilyKind::Set` (15); `value::TRANSIENT_TAG` (0xFF, reserved, never stored).
+  - **pigeonhole-compaction:** `SetOps` (`pigeonhole.set`); a provided method `MergeOperator::settle` (a no-op by default) that a working accumulator passes through before it is stored without `finish`.
+  - **pigeonhole-sim:** `set_input`, `set_operand`, `set_state`, `set_state_valid`, and `ModelAggregation::Set`.

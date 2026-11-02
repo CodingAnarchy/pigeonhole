@@ -140,9 +140,9 @@ fn families() -> Vec<ModelFamily> {
     };
     if env!("CARGO_CRATE_NAME") == "counters" {
         // Every aggregate kind (D179, D294, D298) beside `f` and a 0.1.0-style `counter`:
-        // eighteen families, 72 slots on a shard with tablet changes off. The tables are
-        // created after the open, so until a reopen resizes the chunks for them the 72 slots
-        // share the 64-slot geometry, about 14 chunks each (perf287 on #1233; #1212, D302).
+        // nineteen families, 76 slots on a shard with tablet changes off. The tables are
+        // created after the open, so until a reopen resizes the chunks for them the 76 slots
+        // share the 64-slot geometry, about 13 chunks each (perf287 on #1233; #1212, D302).
         vec![
             f("f", 0, 0, false),
             f("counter", 3, 0, true),
@@ -162,6 +162,7 @@ fn families() -> Vec<ModelFamily> {
             f("fhist", 2, 0, false),
             f("fq_ttl", 0, 40, false),
             f("bloom", 2, 0, false),
+            f("set", 2, 0, false),
         ]
     } else {
         vec![
@@ -200,6 +201,12 @@ fn is_f64(family: &str) -> bool {
     aggregation_of_name(family).is_some_and(ModelAggregation::is_f64)
 }
 
+/// A set family (D298), whose inputs `set_add` and `set_remove` write
+/// (`pigeonhole_sim::set_input`).
+fn is_set(family: &str) -> bool {
+    aggregation_of_name(family) == Some(ModelAggregation::Set)
+}
+
 /// A bitwise family (D298), whose inputs `aggregate_u64` writes.
 fn is_bitwise(family: &str) -> bool {
     matches!(
@@ -218,7 +225,12 @@ fn mutation_input<'t>(
     ts: Option<u64>,
     delta: i64,
 ) -> pigeonhole::RowMutation<'t> {
+    let (add, x) = pigeonhole_sim::set_input(delta);
     match ts {
+        None if is_set(family) && add => m.set_add(family, qualifier, x),
+        None if is_set(family) => m.set_remove(family, qualifier, x),
+        Some(ts) if is_set(family) && add => m.set_add_at(family, qualifier, ts, x),
+        Some(ts) if is_set(family) => m.set_remove_at(family, qualifier, ts, x),
         None if is_f64(family) => m.aggregate_f64(family, qualifier, f64::from_bits(delta as u64)),
         Some(ts) if is_f64(family) => {
             m.aggregate_f64_at(family, qualifier, ts, f64::from_bits(delta as u64))
@@ -241,7 +253,12 @@ fn batch_input(
     delta: i64,
 ) {
     let x = f64::from_bits(delta as u64);
+    let (add, e) = pigeonhole_sim::set_input(delta);
     match ts {
+        None if is_set(family) && add => wb.set_add(t, row, family, qualifier, e),
+        None if is_set(family) => wb.set_remove(t, row, family, qualifier, e),
+        Some(ts) if is_set(family) && add => wb.set_add_at(t, row, family, qualifier, ts, e),
+        Some(ts) if is_set(family) => wb.set_remove_at(t, row, family, qualifier, ts, e),
         None if is_f64(family) => wb.aggregate_f64(t, row, family, qualifier, x),
         Some(ts) if is_f64(family) => wb.aggregate_f64_at(t, row, family, qualifier, ts, x),
         None if is_bitwise(family) => wb.aggregate_u64(t, row, family, qualifier, delta as u64),
@@ -276,7 +293,7 @@ fn public_family(f: &ModelFamily) -> Family {
         "ttl" => 60,
         // A bloom filter's base separates once it holds about 15 bits, so reads and
         // compactions fold onto separated bases (D298 §4.1, §4.2).
-        name if name.starts_with("bloom") => 64,
+        name if name.starts_with("bloom") || name.starts_with("set") => 64,
         _ => 4096,
     };
     let family = match (f.counter, f.aggregation) {
@@ -302,6 +319,7 @@ fn public_family(f: &ModelFamily) -> Family {
             )
             .unwrap(),
         )),
+        (true, ModelAggregation::Set) => Family::aggregate(Aggregation::Set),
         (true, ModelAggregation::Quantiles) => Family::aggregate(Aggregation::Quantiles(
             pigeonhole::QuantileParams::default()
                 .mantissa_bits(pigeonhole_sim::MODEL_QUANTILE_BITS)

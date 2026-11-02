@@ -9,7 +9,7 @@
 //! put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
 //! incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
 //! delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-//! create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K]...
+//! create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K|:set]...
 //! snapshot [--durable] <name>        release <name>
 //! \tables  \schema [table]  \info  \metrics  \health  \format F  \timing on|off  \help  \quit
 //! ```
@@ -46,9 +46,9 @@ commands (one per line; values are bytes: \"quoted\\n\", 0xhex, b64:base64):
          [--limit N] [--columns-per-row N] [--at SNAP]
   put    <table> <row> <family>:<qualifier> <value> [--ts US] [--i64 | --f64]
   incr   <table> <row> <family>:<qualifier> <delta> [--ts US]
-  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]  (f64 in *_f64, mean_var, histogram, quantiles; u64 in bit_*; hll, bloom: an integer, else bytes)
+  aggregate <table> <row> <family>:<qualifier> <value> [--ts US]  (f64 in *_f64, mean_var, histogram, quantiles; u64 in bit_*; hll, bloom: an integer, else bytes; set: x or +x adds, -x removes)
   delete <table> <row> [<family>[:<qualifier>]] [--ts US]
-  create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K]...
+  create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K|:set]...
   snapshot [--durable] <name>     release <name>
   \\tables  \\schema [table]  \\info  \\metrics  \\health
   \\format table|json|jsonl|csv  \\timing on|off  \\help  \\quit
@@ -541,6 +541,22 @@ impl Session {
                     None => m.aggregate_bytes(&family, &qualifier, bytes),
                 }
             }
+            // A set family's element: `x` or `+x` adds it, `-x` removes it (D298).
+            Some(Aggregation::Set) => {
+                let (add, digits) = match text.strip_prefix('-') {
+                    Some(d) => (false, d),
+                    None => (true, text.strip_prefix('+').unwrap_or(text)),
+                };
+                let x: u32 = digits.parse().map_err(|_| {
+                    Failure::usage("a set family's aggregate takes a u32 (+x adds, -x removes)")
+                })?;
+                match (ts, add) {
+                    (Some(ts), true) => m.set_add_at(&family, &qualifier, ts, x),
+                    (None, true) => m.set_add(&family, &qualifier, x),
+                    (Some(ts), false) => m.set_remove_at(&family, &qualifier, ts, x),
+                    (None, false) => m.set_remove(&family, &qualifier, x),
+                }
+            }
             Some(Aggregation::BitOr | Aggregation::BitAnd | Aggregation::BitXor) => {
                 let bits: u64 = text
                     .parse()
@@ -608,7 +624,7 @@ impl Session {
         let table = args.text(0, "table")?;
         if args.positional.len() < 2 {
             return Err(Failure::usage(
-                "create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K]...",
+                "create <table> <family>[:counter|:min|:max|:hll|:bit_or|:bit_and|:bit_xor|:min_f64|:max_f64|:sum_f64|:mean_var|:histogram=B,…|:quantiles[=P,N]|:bloom=M,K|:set]...",
             ));
         }
         let mut b = db.table(table).map_err(|e| Failure::db("create", &e))?;
@@ -628,6 +644,7 @@ impl Session {
                 Some((name, "max_f64")) => b.family(name, Family::aggregate(Aggregation::MaxF64)),
                 Some((name, "sum_f64")) => b.family(name, Family::aggregate(Aggregation::SumF64)),
                 Some((name, "mean_var")) => b.family(name, Family::aggregate(Aggregation::MeanVar)),
+                Some((name, "set")) => b.family(name, Family::aggregate(Aggregation::Set)),
                 // `:histogram=b0,b1,…` and `:quantiles[=p,max_buckets]` (D298).
                 Some((name, kind)) if kind.starts_with("histogram=") => {
                     let bounds = kind["histogram=".len()..]

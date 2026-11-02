@@ -76,6 +76,10 @@ pub enum ModelAggregation {
     /// A bloom filter of `i64` elements with the model's parameters (D298), as the store's
     /// state, which [`bloom_state`](crate::bloom_state) writes independently.
     Bloom,
+    /// A roaring set of `u32`s (D298): inputs add or remove an element in commit order
+    /// ([`set_input`](crate::set_input)), as the store's state, which
+    /// [`set_state`](crate::set_state) writes independently.
+    Set,
 }
 
 impl ModelAggregation {
@@ -114,6 +118,7 @@ impl ModelAggregation {
                 | ModelAggregation::Histogram
                 | ModelAggregation::Quantiles
                 | ModelAggregation::Bloom
+                | ModelAggregation::Set
         )
     }
 
@@ -134,6 +139,7 @@ impl ModelAggregation {
             ModelAggregation::Histogram => crate::bucket_state(false, base, elements),
             ModelAggregation::Quantiles => crate::bucket_state(true, base, elements),
             ModelAggregation::Bloom => crate::bloom_state(base, elements),
+            ModelAggregation::Set => crate::set_state(base, elements),
             _ => unreachable!("not a state kind"),
         }
     }
@@ -147,6 +153,7 @@ impl ModelAggregation {
             ModelAggregation::Histogram => crate::bucket_state_valid(false, s),
             ModelAggregation::Quantiles => crate::bucket_state_valid(true, s),
             ModelAggregation::Bloom => crate::bloom_state_valid(s),
+            ModelAggregation::Set => crate::set_state_valid(s),
             _ => false,
         }
     }
@@ -163,7 +170,8 @@ impl ModelAggregation {
             | ModelAggregation::MeanVar
             | ModelAggregation::Histogram
             | ModelAggregation::Quantiles
-            | ModelAggregation::Bloom => {
+            | ModelAggregation::Bloom
+            | ModelAggregation::Set => {
                 unreachable!("a state kind's inputs are not combined into an i64")
             }
             ModelAggregation::BitOr => a | b,
@@ -304,6 +312,8 @@ pub fn aggregation_of_name(family: &str) -> Option<ModelAggregation> {
         Some(ModelAggregation::Quantiles)
     } else if family.starts_with("bloom") {
         Some(ModelAggregation::Bloom)
+    } else if family.starts_with("set") {
+        Some(ModelAggregation::Set)
     } else {
         None
     }
@@ -1622,16 +1632,23 @@ fn resolve_counter(
     let agg = family.aggregation;
     let version = |group: &[&Entry]| -> Option<Vec<u8>> {
         if agg.is_state() {
-            // The elements newer than the newest put, folded into that put's state.
-            let mut elements = Vec::new();
+            // The elements newer than the newest put, folded into that put's state in commit
+            // order, since a set's adds and removes don't commute (D298). The group runs
+            // newest first, except that a commit's several inputs to the cell share its seqno
+            // in the order written: a stable sort by seqno puts them all in commit order.
+            let mut elements: Vec<(Seqno, i64)> = Vec::new();
+            let in_order = |mut elements: Vec<(Seqno, i64)>| {
+                elements.sort_by_key(|&(seqno, _)| seqno);
+                elements.into_iter().map(|(_, d)| d)
+            };
             for e in group {
                 match &e.kind {
-                    Kind::Merge(d) => elements.push(*d),
-                    Kind::Put(v) => return agg.state_of(Some(v), elements),
+                    Kind::Merge(d) => elements.push((e.seqno, *d)),
+                    Kind::Put(v) => return agg.state_of(Some(v), in_order(elements)),
                     _ => {}
                 }
             }
-            return agg.state_of(None, elements);
+            return agg.state_of(None, in_order(elements));
         }
         let mut acc: Option<i64> = None;
         let fold = |acc: Option<i64>, v: i64| Some(acc.map_or(v, |a| agg.combine(a, v)));

@@ -67,7 +67,7 @@ Several agents often build and test on one machine, so local runs stay small:
 - **The standard sweeps for engine, WAL and I/O changes** (300 seeds, 6 chunks each, each with `-f tools=gdb`), all five on the PR's head:
   - engine `model_check` with `PIGEONHOLE_DEFERRED_IO=1`;
   - engine `model_check` plain;
-  - engine `counters` plain (`model_check` with every aggregate kind: `sum`, `sum_ttl`, `min`, `max_ttl`, `hll`, `hll_ttl`, `bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`, `fsum`, `fmv_ttl`, `fhist`, `fq_ttl` and `bloom`);
+  - engine `counters` plain (`model_check` with every aggregate kind: `sum`, `sum_ttl`, `min`, `max_ttl`, `hll`, `hll_ttl`, `bor`, `band`, `bxor_ttl`, `fmin`, `fmax_ttl`, `fsum`, `fmv_ttl`, `fhist`, `fq_ttl`, `bloom` and `set`);
   - `pigeonhole` `model`;
   - engine `tablets` with `PIGEONHOLE_DEFERRED_IO=1`.
 

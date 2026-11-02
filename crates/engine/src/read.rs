@@ -1904,6 +1904,13 @@ fn get_with<const CACHE_ONLY: bool>(
 /// keeps such a cell's reads short instead.
 pub(crate) const MAX_CHECKPOINT_BYTES: usize = 4096;
 
+/// A set family's checkpoint cap, the owner's stopgap until a cap proportional to the
+/// operand bytes a fold read (D298 PR 5b, perf287 on #488): a set's inputs are folded one
+/// element at a time, so without checkpoints a get folds every input since the flush, but a
+/// hub's whole set per checkpoint would flood the memtable. Up to 256 KiB a set keeps its
+/// checkpoints as other kinds do.
+pub(crate) const MAX_SET_CHECKPOINT_BYTES: usize = 256 << 10;
+
 /// Hands a counter get's result to its row's shard as a checkpoint (D291), when its fold
 /// read at least the writer's checkpoint steps. Out of line: a get pays only for taking the
 /// resolver's fold record, which only a counter group sets.
@@ -1925,9 +1932,26 @@ fn note_checkpoint(
     let Ok(Some(cell)) = got else {
         return;
     };
-    if steps < sink.steps || cell.stored().len() > MAX_CHECKPOINT_BYTES {
+    if steps < sink.steps {
         return;
     }
+    let set = view
+        .catalog
+        .family(family)
+        .is_some_and(|m| m.options.kind == pigeonhole_format::manifest::FamilyKind::Set);
+    let cap = if set {
+        MAX_SET_CHECKPOINT_BYTES
+    } else {
+        MAX_CHECKPOINT_BYTES
+    };
+    if cell.stored().len() > cap {
+        return;
+    }
+    debug_assert_ne!(
+        cell.stored().first(),
+        Some(&pigeonhole_format::value::TRANSIENT_TAG),
+        "a working accumulator reached a checkpoint"
+    );
     let Some((tablet, shard)) = view.tablets().route(table, row) else {
         return;
     };
