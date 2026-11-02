@@ -367,10 +367,13 @@ fn shm_layout() {
     assert_eq!(&p[0..8], b"PHDBSHM\0");
     assert_eq!(
         (le32(&p, 8), le32(&p, 12), le64(&p, 16)),
-        (6, 4096, h.region_len)
+        (7, 4096, h.region_len)
     );
     // Layout version 6 (D278): the cross-shard hold, a live word the writer initializes.
     assert_eq!(pigeonhole_format::shm::header::CROSS_HELD, 192);
+    // Layout version 7 (D310): each shard's written watermark, after `pending` and `durable`.
+    assert_eq!(pigeonhole_format::shm::watermark::WRITTEN, 16);
+    assert_eq!(pigeonhole_format::shm::watermark::SYNCED, 24);
     // §8.3: reader slot `i`'s liveness lock is byte 2^62 + i (layout version 3, #693).
     assert_eq!(pigeonhole_format::superblock::READER_LOCK_BASE, 1 << 62);
     // §11.2: each shard's 64-byte watermark line holds `pending` at 0 and `durable` at 8

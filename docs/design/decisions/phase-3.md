@@ -3801,3 +3801,23 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **The sidecar.** The session's entry is written and synced after the pager's `finish` and before any WAL segment. It carries `opened_at` (the sequence before any root commit of the open), the retention, the stream count and the fed tables. The pager's root-commit observer appends a Root entry, unsynced, after each durable root commit, so a lost append gives the safe, spurious expiry. A torn tail is cut off before the next append.
 - **The clean close** skips `forget_checkpoints` and the WAL files' removal with the feed on. Their checkpoints sit at their ends, so the next open replays nothing and adopts the retained slots.
 
+**How PR 2 builds it** (call 3: the lazy flush, not the raise):
+- **The hold.** Each shard's `written` watermark (shm layout 7, FORMAT §11.2) holds the lowest seqno whose fed `Durability::None` record is still only in the stream's buffer. The shard stores it (Release) while the seqno is still held, so it never lowers the frontier:
+  - a single's seqno, under its group's `pending`, before the group's apply publishes;
+  - a decision's apply seqno, under `cross_held`, at its record's append;
+  - a participant's PREPARE, at the apply seqno in `decide_share`, before the share reports applied. The commit id is never held, so it's never used.
+- **The release.** The hold goes to `u64::MAX` once any write passed every held record: a stronger group's, or the lazy flush's. `publish_watermark` checks this with one compare, and `feed_low` is always `u64::MAX` with the feed off.
+- **The lazy flush.** It's a `ClockTimer` (`ShardMsg::FeedFlush`) armed only when the hold goes from empty to held, *T* = 10 ms. A sleeping timer is what engine-owned drivers park until and what `EngineShard::next_deadline` / `Shard::next_wakeup` report, so an application-owned shard wakes for it. An idle shard has no deadline. On a frozen simulated clock the timer gives up, and the shard's kick runs the flush. A record behind a held segment header re-arms the timer.
+- **Which records the feed needs:**
+  - with `FeedTables::All`, every `None` batch, PREPARE and decision;
+  - with a table list, a batch or PREPARE that writes a listed table (a scan of its mutation headers, with the feed on only), plus every decision.
+- **The frontier.** `ShmRegion::written_seqno(durable)` is the snapshot rule under every shard's `written` too (`Engine::feed_frontier`).
+- **A second hold, `synced`** (offset 24), and only the durable frontier reads it. It covers every fed record its group doesn't sync, `None` and `Buffered` alike: singles, PREPAREs at their apply seqno, and decisions. It's released once a sync passes them.
+  - **Why:** D227 counts a `None` commit durable once applied and a `Buffered` one once written. Without this hold, a `durable()` feed could deliver a change a power loss still undoes (S3; simp724's M1 on #1297 added `Buffered`).
+- **The background sync.** The lazy flush never syncs, so a feed-only background sync (`submit_sync`, never waited on) runs when the synced hold has been held for *T_sync* and no other sync covered it.
+  - **The timer:** armed only on empty to held, with one sync in flight per shard.
+  - **The default:** 100 ms, and 1 s on macOS, where `F_FULLFSYNC` is device-wide (perf287). It's configurable as `FeedOptions::sync_interval_micros` and `FeedRetention::sync_interval`.
+  - **Counted:** `Engine::feed_background_syncs`.
+  - **Effect:** a durable feed on a pure-`Buffered` or pure-`None` fed table lags by about *T_sync* plus a sync.
+- **The M1 invariant** is stated in concurrency.md (the written-hold protocol) and on `Wal::write`.
+
