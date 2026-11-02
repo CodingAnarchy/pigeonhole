@@ -178,8 +178,9 @@ fn families() -> Vec<ModelFamily> {
             // traversal check reaches past hop 1 (#1232).
             f(GRAPH_FAMILY, 0, 0, false),
             // A vector family (D303, #1256): 32-dimension f32 cosine vectors, overwritten
-            // and deleted at every scope like any family's values; each is above the
-            // family's blob threshold, so they separate into blobs.
+            // and deleted at every scope like any family's values. Each run's blob
+            // threshold puts every vector in a blob, or keeps every one inline in the SST
+            // blocks, the default configuration ([`blob_vectors`]; perf287 on #1371).
             f(VECTOR_FAMILY, 2, 0, false),
         ]
     }
@@ -187,6 +188,33 @@ fn families() -> Vec<ModelFamily> {
 
 /// The model's vector family (#1256), in the targets that have it.
 const VECTOR_FAMILY: &str = "vec";
+
+thread_local! {
+    /// This seed's choice for [`VECTOR_FAMILY`]: every vector a blob, or every one inline
+    /// (set by [`check`] on the seed's thread before the run creates its tables).
+    static BLOB_VECTORS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Whether test `test`'s seed `seed` puts [`VECTOR_FAMILY`]'s vectors in blobs (a blob
+/// threshold of 120, below every vector's 130 bytes) or keeps them inline (the default
+/// threshold). By the seed's parity, offset by a hash of the test's name, so a default run
+/// (seed 1 of every test) covers both, and each test flips between them over a sweep's
+/// seeds (perf287 on #1371).
+fn blob_vectors(test: &str, seed: u64) -> bool {
+    let salt = test
+        .bytes()
+        .fold(0u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)));
+    seed.wrapping_add(salt).is_multiple_of(2)
+}
+
+/// [`blob_vectors`]'s choice, for messages.
+fn vector_placement(blob: bool) -> &'static str {
+    if blob {
+        "blob vectors"
+    } else {
+        "inline vectors"
+    }
+}
 
 /// Whether this target's tables have [`VECTOR_FAMILY`].
 fn has_vector_family() -> bool {
@@ -203,10 +231,12 @@ fn nearest_query(ms: u64) -> Vec<f32> {
 /// A neighbour as the check compares it: row, qualifier, timestamp, distance.
 type Neighbours = Vec<(Vec<u8>, Vec<u8>, u64, f64)>;
 
-/// `nearest_f32` over [`VECTOR_FAMILY`] (D296 PR 4): from `keys`, or over the whole table;
+/// `nearest_f32` over vector family `family` (D296 PR 4): from `keys`, or over the whole table;
 /// through `run_async` with `async_front`.
+#[allow(clippy::too_many_arguments)]
 fn nearest_rows(
     t: &pigeonhole::Table,
+    family: &str,
     keys: Option<&pigeonhole::KeySet>,
     q: &[f32],
     k: usize,
@@ -224,14 +254,14 @@ fn nearest_rows(
     };
     let found = match keys {
         Some(ks) => {
-            let mut r = t.keys(ks).family(VECTOR_FAMILY);
+            let mut r = t.keys(ks).family(family);
             if let Some(s) = snap {
                 r = r.snapshot(s);
             }
             run(r.nearest_f32(q, k))?
         }
         None => {
-            let mut r = t.scan_prefix(b"").family(VECTOR_FAMILY);
+            let mut r = t.scan_prefix(b"").family(family);
             if let Some(s) = snap {
                 r = r.snapshot(s);
             }
@@ -246,9 +276,11 @@ fn nearest_rows(
 
 /// [`nearest_rows`] by brute force over the model's newest vectors at seqno `ms`, scored by
 /// `VectorSpec::distance_f32`, in (distance, row, qualifier) order.
+#[allow(clippy::too_many_arguments)]
 fn model_nearest(
     model: &pigeonhole_sim::Model,
     table: &str,
+    family: &str,
     keys: Option<&pigeonhole::KeySet>,
     q: &[f32],
     k: usize,
@@ -259,7 +291,7 @@ fn model_nearest(
         Some(ks) => {
             let mut rows = Vec::new();
             for key in ks.iter() {
-                let cells = model.try_read_row(table, key, &[VECTOR_FAMILY], 1, ms, now)?;
+                let cells = model.try_read_row(table, key, &[family], 1, ms, now)?;
                 rows.push((key.to_vec(), cells));
             }
             rows
@@ -268,7 +300,7 @@ fn model_nearest(
             table,
             Bound::Unbounded,
             Bound::Unbounded,
-            &[VECTOR_FAMILY],
+            &[family],
             ms,
             now,
         )?,
@@ -427,8 +459,9 @@ fn public_family(f: &ModelFamily) -> Family {
         // A bloom filter's base separates once it holds about 15 bits, so reads and
         // compactions fold onto separated bases (D298 §4.1, §4.2).
         name if name.starts_with("bloom") || name.starts_with("set") => 64,
-        // Every vector (about 130 bytes) is above it (#1256).
-        name if is_vector(name) => 120,
+        // Every vector (about 130 bytes) is above it on a blob seed, and under the default
+        // on an inline one (#1256).
+        VECTOR_FAMILY if BLOB_VECTORS.get() => 120,
         _ => 4096,
     };
     let family = match (f.counter, f.aggregation) {
@@ -2733,8 +2766,9 @@ impl Run {
                     }
                 }
                 // An exact nearest-neighbour search (D296 PR 4) over the vector family
-                // (#1256): from the same keys on even seqnos, over the whole table on odd
-                // ones, with a query and `k` taken from the seqno (not the RNG). Brute force
+                // (#1256): over the whole table on one seqno in eight (it scores every
+                // vector, so it's kept rare; perf287 on #1371), from the same keys on the
+                // rest, with a query and `k` taken from the seqno (not the RNG). Brute force
                 // over the model's rows, scored by `VectorSpec::distance_f32`, gives the
                 // neighbours in (distance, row, qualifier) order.
                 // Writes the vector family must refuse (#1256): a wrong dimension, a NaN, an
@@ -2760,8 +2794,16 @@ impl Run {
                         ),
                         _ => ("a plain put", m.put(VECTOR_FAMILY, b"refused", b"bytes")),
                     };
+                    // A power loss that fired in the background, or a failure being recovered
+                    // in place, fails the probe first: recover as the reads do.
                     match m.commit() {
                         Err(e) if e.code() == ErrorCode::InvalidArgument => {}
+                        Err(e) if self.armed && self.fired() => {
+                            return self.recover_fired(&e);
+                        }
+                        Err(e) if self.failed_over() => {
+                            return self.recover_in_place(&format!("refused write: {e}"), None);
+                        }
                         Err(e) if self.injected(&e) => {}
                         other => {
                             return Err(format!(
@@ -2772,6 +2814,12 @@ impl Run {
                     }
                     match t.get(&row, VECTOR_FAMILY, b"refused") {
                         Ok(None) => {}
+                        Err(e) if self.armed && self.fired() => {
+                            return self.recover_fired(&e);
+                        }
+                        Err(e) if self.failed_over() => {
+                            return self.recover_in_place(&format!("read: {e}"), None);
+                        }
                         Err(e) if self.injected(&e) => {}
                         other => {
                             return Err(format!("{what} was refused but left {other:?}"));
@@ -2779,13 +2827,14 @@ impl Run {
                     }
                 }
                 if has_vector_family() {
-                    let over_keys = ms.is_multiple_of(2);
+                    let over_keys = !ms.is_multiple_of(8);
                     let q = nearest_query(ms);
                     let k = 1 + (ms / 2 % 7) as usize;
                     let ks = over_keys.then_some(&keys);
-                    let got =
-                        nearest_rows(t, ks, &q, k, snap.as_ref().map(|(s, _)| s), async_front);
-                    let want = model_nearest(&self.model, TABLES[ti], ks, &q, k, ms, now);
+                    let vf = VECTOR_FAMILY;
+                    let snap_ref = snap.as_ref().map(|(s, _)| s);
+                    let got = nearest_rows(t, vf, ks, &q, k, snap_ref, async_front);
+                    let want = model_nearest(&self.model, TABLES[ti], vf, ks, &q, k, ms, now);
                     match (got, want) {
                         (Ok(g), Ok(w)) if g == w => {
                             let (all, found) = self.nearest_counts.get();
@@ -2801,8 +2850,8 @@ impl Run {
                         (Err(e), _) if self.injected(&e) => {}
                         (g, w) => {
                             return Err(format!(
-                                "nearest {k} over {} (model seqno {ms}): store {g:?} vs model \
-                                 {w:?}",
+                                "nearest {k} in {vf} over {} (model seqno {ms}): store {g:?} vs \
+                                 model {w:?}",
                                 if over_keys { "the keys" } else { "the table" }
                             ));
                         }
@@ -3220,6 +3269,8 @@ fn check(cfg: &Config) -> Vec<Stats> {
     let mut all = Vec::new();
     for seed in seeds() {
         let started = Instant::now();
+        let blob = blob_vectors(&test, seed);
+        let placed = vector_placement(blob);
         let progress = Arc::new(Mutex::new(String::new()));
         let (tx, rx) = mpsc::channel();
         let worker = {
@@ -3227,13 +3278,17 @@ fn check(cfg: &Config) -> Vec<Stats> {
             std::thread::Builder::new()
                 .name(format!("{test} seed {seed}"))
                 .spawn(move || {
+                    BLOB_VECTORS.set(blob);
                     let _ = tx.send(run(seed, &cfg, &progress));
                 })
                 .expect("spawn a seed's thread")
         };
         match rx.recv_timeout(limit) {
             Ok(Ok(stats)) => {
-                eprintln!("seed {seed}: {stats:?} in {:?}", started.elapsed());
+                eprintln!(
+                    "seed {seed} ({placed}): {stats:?} in {:?}",
+                    started.elapsed()
+                );
                 reads += stats.reads;
                 row_cache_hits += stats.row_cache_hits;
                 traversals += stats.traversals;
@@ -3244,7 +3299,8 @@ fn check(cfg: &Config) -> Vec<Stats> {
             }
             Ok(Err(e)) => {
                 log_failure(&format!(
-                    "FAILED: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}): {e}",
+                    "FAILED: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
+                     {placed}): {e}",
                     cfg.shards, cfg.tablet_changes, cfg.deferred_io
                 ));
                 panic!("{e}")
@@ -3256,8 +3312,8 @@ fn check(cfg: &Config) -> Vec<Stats> {
                     .clone();
                 // Straight to stderr: the test harness's capture would lose an `eprintln!`.
                 let hung = format!(
-                    "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}) \
-                     did not finish in {limit:?}; it was at {at}",
+                    "HUNG: {test}: seed {seed} ({} shards, tablet changes {}, deferred I/O {}, \
+                     {placed}) did not finish in {limit:?}; it was at {at}",
                     cfg.shards, cfg.tablet_changes, cfg.deferred_io
                 );
                 log_failure(&hung);
