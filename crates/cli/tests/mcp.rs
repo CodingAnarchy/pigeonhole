@@ -599,6 +599,84 @@ fn traverse_follows_edges_hop_by_hop() {
     assert_eq!(status, 0, "{err}");
 }
 
+/// #1254: a traversal's cursors page from the server's cached result, so writes between
+/// pages change nothing: every node of the first result comes back exactly once, and none
+/// added later. (Re-running the traversal, as before, would shift indexes: the edges added
+/// below sort among the first page's nodes, so the next page would repeat one.) A cursor
+/// whose run isn't cached any more (another traversal ran) runs it again.
+#[test]
+fn traverse_pages_come_from_one_cached_result() {
+    let dir = TempDir::new("mcp-traverse-cache");
+    let mut s = Server::start(&db_path(&dir), &["--create", "--max-result-bytes", "200"]);
+    s.call("create_table", json!({"table": "g", "families": ["out"]}));
+    let edge = |b: &str| {
+        json!({"op": "put", "table": "g", "row": "n:hub", "family": "out",
+               "qualifier": format!("n:{b}"), "value": ""})
+    };
+    let ops: Vec<Value> = (0..60).map(|i| edge(&format!("{:03}", i * 10))).collect();
+    s.call("write", json!({"ops": ops}));
+    let want: Vec<String> = (0..60).map(|i| format!("n:{:03}", i * 10)).collect();
+    let args = json!({"table": "g", "family": "out", "seeds": ["n:hub"]});
+
+    let first = s.call("traverse", args.clone());
+    let mut got: Vec<String> = first["hops"][0]["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_owned())
+        .collect();
+    let mut cursor = first["cursor"].clone();
+    assert!(cursor.is_string(), "{first}");
+    let mut wrote = 0;
+    while cursor.is_string() {
+        // A writer adds an edge that sorts before the next page's first node.
+        let ops: Vec<Value> = (0..3)
+            .map(|j| edge(&format!("{:03}", wrote * 3 + j + 1)))
+            .collect();
+        s.call("write", json!({"ops": ops}));
+        wrote += 1;
+        let mut next = args.clone();
+        next["cursor"] = cursor;
+        let page = s.call("traverse", next);
+        got.extend(
+            page["hops"][0]["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|n| n.as_str().unwrap().to_owned()),
+        );
+        cursor = page.get("cursor").cloned().unwrap_or(Value::Null);
+        assert!(wrote < 100, "cursors never end");
+    }
+    assert!(wrote > 1, "the result fit one page");
+    assert_eq!(
+        got, want,
+        "every node of the first result once, none added later"
+    );
+
+    // Another traversal replaces the cached one: an old cursor runs its traversal again
+    // (now seeing the added edges), as cursors did before the cache.
+    let second = s.call("traverse", args.clone());
+    let stale = second["cursor"].clone();
+    s.call(
+        "traverse",
+        json!({"table": "g", "family": "out", "seeds": ["n:000"]}),
+    );
+    let mut again = args.clone();
+    again["cursor"] = stale;
+    let page = s.call("traverse", again);
+    assert!(
+        page["hops"][0]["first_index"].as_u64().unwrap() > 0,
+        "{page}"
+    );
+    assert!(
+        page["hops"][0]["node_count"].as_u64().unwrap() > 60,
+        "the re-run sees the added edges: {page}"
+    );
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
 #[test]
 fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     let dir = TempDir::new("mcp-reader");

@@ -20,6 +20,8 @@
 
 use std::collections::HashMap;
 use std::ops::Bound;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use pigeonhole::{
     Aggregation, CellEntry, Element, KeySet, RowPosition, Table, Value as Cell, VectorSpec,
@@ -69,6 +71,9 @@ const MAX_K: u64 = 1_000;
 /// The most commits one `feed_poll` returns, and the longest it waits (milliseconds).
 const MAX_COMMITS: u64 = 1_000;
 const MAX_WAIT_MS: u64 = 30_000;
+/// The largest traversal result the server keeps for its cursors (#1254), in node-key bytes:
+/// past it, a cursor runs the traversal again, as before.
+const MAX_CACHED_TRAVERSAL_BYTES: usize = 64 << 20;
 
 type Outcome = Result<Map<String, Value>, Failure>;
 
@@ -76,6 +81,19 @@ pub(super) struct Tools {
     db: Db,
     writable: bool,
     limits: Limits,
+    /// The last cut traversal (#1254): its cursors page from it, in O(page), all from one
+    /// consistent result. One at a time; another traversal replaces it.
+    traversal: Mutex<Option<CachedTraversal>>,
+    /// The id the next traversal run gets: its cursors carry it.
+    runs: AtomicU64,
+}
+
+/// A traversal result kept for its cursors.
+struct CachedTraversal {
+    /// The call's fingerprint and run id, which its cursors carry.
+    fingerprint: u64,
+    run: u64,
+    traversal: pigeonhole::Traversal,
 }
 
 impl Tools {
@@ -84,6 +102,8 @@ impl Tools {
             db,
             writable,
             limits,
+            traversal: Mutex::new(None),
+            runs: AtomicU64::new(1),
         }
     }
 
@@ -369,9 +389,11 @@ impl Tools {
         let max_nodes = a.u64_or("max_nodes", DEFAULT_MAX_NODES, 1, MAX_NODES)?;
         let parents = a.bool_or("parents", false)?;
         let qualifier_prefix = a.opt_bytes("qualifier_prefix")?;
-        let (from_hop, from_index) = match Cursor::decode(a.0).map_err(|m| Failure::usage(&m))? {
-            None => (0, 0),
-            Some(Cursor::Traverse { hop, index }) => (hop as usize, index as usize),
+        let (from_hop, from_index, run) = match Cursor::decode(a.0)
+            .map_err(|m| Failure::usage(&m))?
+        {
+            None => (0, 0, None),
+            Some(Cursor::Traverse { hop, index, run }) => (hop as usize, index as usize, Some(run)),
             Some(_) => return Err(Failure::usage("cursor: not a traverse cursor")),
         };
         let seeds = KeySet::from_unsorted(&seeds);
@@ -396,11 +418,29 @@ impl Tools {
                 t.run().map_err(read)?
             }};
         }
-        // A cursor runs the same traversal again and skips what was returned: it is
-        // deterministic, so over unchanged data the pages join up exactly.
-        let traversal = match self.db.handle(table)? {
-            Handle::Writer(t) => go!(t),
-            Handle::Reader(t) => go!(t),
+        // A cursor of the cached run pages from it (#1254). Otherwise (no cursor, or its run
+        // is no longer cached) the traversal runs: it is deterministic, so over unchanged
+        // data the pages of a re-run join up exactly.
+        let fingerprint = super::cursor::fingerprint(a.0);
+        let cached = run.and_then(|r| {
+            let mut slot = self.traversal.lock().expect("not poisoned");
+            match slot.take() {
+                Some(c) if c.fingerprint == fingerprint && c.run == r => Some(c),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        });
+        let (traversal, run) = match cached {
+            Some(c) => (c.traversal, c.run),
+            None => {
+                let t = match self.db.handle(table)? {
+                    Handle::Writer(t) => go!(t),
+                    Handle::Reader(t) => go!(t),
+                };
+                (t, self.runs.fetch_add(1, Ordering::Relaxed))
+            }
         };
         let mut budget = Budget::new(self.limits.result_bytes);
         let mut out_hops = Vec::new();
@@ -425,6 +465,7 @@ impl Tools {
                     cut = Some(Cursor::Traverse {
                         hop: h as u32,
                         index: i as u64,
+                        run,
                     });
                     out_hops.push(hop_json(h, first, hop.nodes().len(), nodes));
                     break 'hops;
@@ -445,6 +486,23 @@ impl Tools {
         }));
         if let Some(c) = cut {
             out.insert("cursor".into(), c.encode(a.0).into());
+            // Kept for the cursor's next page, unless too large (then it runs again).
+            let bytes: usize = traversal
+                .hops()
+                .iter()
+                .map(|h| {
+                    (0..h.nodes().len())
+                        .map(|i| h.nodes().get(i).len())
+                        .sum::<usize>()
+                })
+                .sum();
+            if bytes <= MAX_CACHED_TRAVERSAL_BYTES {
+                *self.traversal.lock().expect("not poisoned") = Some(CachedTraversal {
+                    fingerprint,
+                    run,
+                    traversal,
+                });
+            }
         }
         Ok(out)
     }
