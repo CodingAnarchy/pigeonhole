@@ -76,6 +76,10 @@ pub enum HookSite {
     /// Reader processes: when a snapshot found the durable root at the view record's
     /// manifest version and is about to read that manifest.
     ReaderManifestLoad,
+    /// On the coordinator's shard, right after it answered `OutcomeUnknown` for a
+    /// cross-shard commit whose share apply failed: where a caller that heard the answer
+    /// commits again while the shard thread is still inside the handler (#1358).
+    FailedShareAnswered,
 }
 
 /// A one-shot test callback.
