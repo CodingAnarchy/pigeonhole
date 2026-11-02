@@ -84,7 +84,7 @@ Options are fixed when the index is created.
 
 | Option | Default | What it does |
 |---|---|---|
-| `positions` | on | Stores each term's positions, which phrases need. About 40% more stored bytes on short documents, and a slower write: see [Performance](#performance). Turn it off for a write-heavy index that never searches phrases. |
+| `positions` | on | Stores each term's positions, which phrases need. On the reference machine, about 18% more write time and 58% more stored bytes: see [Performance](#performance). Turn it off for a write-heavy index that never searches phrases. |
 | `normalization` | `Nfc` | Unicode normalisation of every term: `Nfc` matches composed and decomposed accents, `Nfkc` also folds ligatures and full-width forms, `None` compares code points as written. |
 | `stop_words` | off | Drops English stop words (Lucene's 33). A dropped word keeps its position, so `"state of the art"` still needs its gaps. |
 | `k1`, `b` | 1.2, 0.75 | BM25's saturation and length normalisation. |
@@ -99,17 +99,39 @@ A custom `Tokenizer` (`create_with_tokenizer`) replaces the built-in one, which 
 A reader process opens the index with `Index::open_reader(&reader, name)`. That gives a `ReadIndex`: it searches and verifies at the reader's snapshots, and it can't write. It sees what the writer has committed, as every read in a reader process does. During the writer's `repair`, searches fail with `Busy`.
 
 ## Performance
-<!-- AX102 numbers: filled from .coord/box-text-ai1249 results. -->
 MaxScore reads only the postings that can still change the top `k`. The result is the same as scoring every document.
 
 The numbers below are for 1,000,000 documents of about 40 words, from a 50,000-word Zipf vocabulary, on the reference AX102 (`crates/text/examples/bench.rs`). They are p50 and p99 over 1,000 queries per kind, top 10 unless noted.
 
-> **Measured without a full compaction.** A forced full compaction of a text index currently writes about 1,000 times the index's size, a known engine problem (#1313) that's being fixed before 1.1.0. So these numbers are taken after a flush only, with the index in whatever state background compaction had reached. Stored bytes are an over-estimate, since counter operands haven't all been folded yet, and search latency may improve once the index is compacted. They'll be re-taken once #1313 is fixed.
+> **Measured without a full compaction.** A forced full compaction of a text index currently writes about 1,000 times the index's size, a known engine problem (#1313) that's being fixed before 1.1.0. So these numbers are taken after a flush only, with the index in whatever state background compaction had reached. Stored bytes are an over-estimate, since counter operands haven't all been folded yet, and search latency may improve once the index is compacted. They'll be re-taken once the fix (#1332) is in.
 
-**TBD:** the reference-machine run is queued. Its numbers land in this table before the PR is ready.
+**Writing** goes one document per transaction, `Buffered`:
+
+| | per document | stored bytes per document |
+|---|---|---|
+| positions off | 136 µs | 1,044 |
+| positions on (the default) | 160 µs (+18%) | 1,649 (+58%) |
+
+The write rate stays flat from the first document to the millionth.
+
+**Searching**, top 10 unless noted:
+
+| query | p50 | p99 |
+|---|---|---|
+| two terms, drawn by frequency | 2.5 ms | 92 ms |
+| two of the 20 most common terms | 44 ms | 99 ms |
+| an exact phrase of two rare words | 0.28 ms | 1.1 ms |
+| an exact phrase, one common word | 76 ms | 220 ms |
+| an exact phrase of two common words | 403 ms | 1,110 ms |
+| that mixed phrase, slop 2 | 78 ms | 270 ms |
+| that mixed phrase, slop 10 | 81 ms | 360 ms |
+| two terms, top 1,000 | 30 ms | 184 ms |
+
+These are the means of two runs, which agreed within 4%.
 
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.
-- **Phrases** read every position of their rarest word.
+- **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Positional skipping is tracked in #1334.
+- **Positions are cheap to write:** 18% more time per document on the reference machine, much less than a laptop suggests.
 
 ## Errors
 | Error | When |

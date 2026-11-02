@@ -3912,6 +3912,10 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **The guide page** `docs/guide/text-search.md` is doctested.
 - **The AX102 bench** (`crates/text/examples/bench.rs`) flushes only, with no forced `compact()`. A full compaction of this index writes about 1,000× its size (#1313, a 1.1.0 blocker owned by perf2). The coordinator's call (2026-11-02) is to ship flush-only numbers, say so in the guide, and re-take them once #1313 is fixed, as part of the pre-1.1.0 recheck.
 - **Tests:** a reader process searches what the writer committed, and a plain table is refused.
+- **The AX102 numbers** (1M documents of about 40 words, flush only, the mean of two runs):
+  - **The owner's write-cost row:** positions cost +18% write time (136 → 160 µs a document) and +58% stored bytes (1,044 → 1,649 a document). That's well under the Mac's 2.5×, so positions stay on by default.
+  - **Searches:** two terms 2.5 ms p50, two hub terms 44 ms, a rare phrase 0.28 ms, a phrase of two hub words 403 ms (#1334, Post-1.0).
+  - They're re-taken after #1332 (#1313's fix), in the pre-1.1.0 recheck.
 
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
