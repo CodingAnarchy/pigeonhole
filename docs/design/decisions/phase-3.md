@@ -3471,7 +3471,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - **Result:** one `Put` at the newest operand's key (as a read's fold or a D291 checkpoint would be keyed), with `op.finish(Some(base), operands)`. It is separated at the output like any put past the threshold, and the old base's blob bytes are counted dropped.
   - **A separated base** is read through `JobContext::base_blobs`, which the engine sets for kinds on `folds_separated_bases` when the view has blob files. A base that can't be read, or that the operator refuses, is not folded: the run is combined as before and the base kept, so a read keeps failing on a bad base (#21).
   - **D73 and D186 are amended** for aggregate families: a bucket is one `(column, timestamp)`, so D73's objections (deletes, TTL and `time_range` at different timestamps inside a run) don't arise. D73 stays for standard families.
-- **§4.3, the checkpoint cap:** a counter get's fold is sent as a D291 checkpoint only when its stored value is at most `MAX_CHECKPOINT_BYTES` (4 KiB): every scalar, an HLL sketch, and most histograms and quantile sketches. A larger value would cost the memtable more than its fold saves; §4.2 keeps such a cell's reads short instead, which is what the PR 3 measurement needed ("must not come without §4.2"). 5b measures the cap with `hotagg` sets.
+- **§4.3, the checkpoint cap:** a counter get's fold is sent as a D291 checkpoint only when its stored value is at most `MAX_CHECKPOINT_BYTES` (4 KiB): every scalar, an HLL sketch, and most histograms and quantile sketches. A larger value would cost the memtable more than its fold saves; §4.2 keeps such a cell's reads short instead, which is what the PR 3 measurement needed ("must not come without §4.2"). 5b measures the cap with `hotagg` sets. **Amended** (owner, 2026-10-31): the cap is now proportional to the operands a fold read, below.
 
 **Tests (PR 5a).**
 - **Compaction:**
@@ -3517,6 +3517,21 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 
 - **Engine tests for the persist paths:** a commit's inputs combined before the WAL and replayed after a reopen; a large operand refused (operands are never separated); compaction's combined operand settled and its fold onto a base (`compaction.rs`); the stopgap (an 8 KB set keeps its checkpoint, a 400 KB one sends none).
 - **Still to come:** a box run of the hub case, the common neighbours of two 2M-element sets, against perf287's ≤ 2 ms estimate.
+
+**Amendment (owner, 2026-10-31; perf2, perf287 reviewed): §4.3's cap is proportional (R = 4).** It replaces 5a's 4 KiB cap and 5b's 256 KiB set stopgap.
+- **Rule:** a counter get's fold is kept as a D291 checkpoint when
+  1. it read at least `counter_checkpoint_steps` entries (unchanged), **and**
+  2. the summed lengths of the `Merge` operands it folded are at least `stored.len() / 4` (`read::CHECKPOINT_BYTES_RATIO`).
+- **The base is not an operand.** The put or checkpoint the fold starts from adds nothing to those bytes, only the operands above it do. Otherwise every fold from a large checkpoint would pass `stored / 4` and checkpoint again (perf287's review).
+- **A run counts only its last group.** When a counter column's operands span several timestamps, the operand bytes count only the last group folded (the one the fold record is set from), as `steps` already does (D291's per-group accounting). A run under-counts and keeps fewer checkpoints, which is the safe direction for the memtable bound (perf287's review of #1310).
+- **What it bounds:**
+  - **Memtable bytes:** at most 4 checkpoint bytes per operand byte written, whatever the value's size, so a multi-MB hub can't flood the memtable with copies of itself.
+  - **Reads:** a read decodes its checkpoint and folds under `stored / 4` operand bytes onto it (5b's linear fold), O(S), which a get of S bytes costs anyway.
+  - **One rule for every kind:** a small value (`stored ≤ 4 × steps × operand size`) behaves as before, with `steps` deciding. A dense HLL sketch (3,076 bytes) needs 769 operand bytes, about 96 one-element inputs of 8 bytes, under the default 128 steps. A 3.7 KB quantile sketch keeps its checkpoints too, so §4.3's warning about large sketches goes away.
+- **Implementation:** the resolver's counter group adds each folded operand's length (`CellResolver::counter_fold_operand_bytes`, set with the fold record), and `note_checkpoint` compares on its cold path.
+- **Tests:**
+  - `it/set_aggregates.rs`: onto an 8 KB set, two one-element inputs leave no checkpoint and an input of 2,000 new elements leaves one; onto a 400 KB hub, small inputs leave none. Each case asserts its own operand bytes against `stored / 4`.
+  - `it/bloom_aggregates.rs`: a 4 KiB filter with 2 inputs leaves none, and with 200 inputs one, past the old cap.
 
 <a id="d299"></a>
 ## D299 — Frontier multi-get: many rows read in key order under one snapshot, each tablet's read set up once (perf287, 2026-10-31; owner accepted revision 1, #489 c6537792562, c6537812071; reviewed by cli692; engine, pigeonhole, #489 item 2, ICR 0097; D296's `Keys` input)

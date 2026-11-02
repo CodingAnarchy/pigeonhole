@@ -9,8 +9,8 @@
 //! `KIND` is `sum`, `hll`, `quantiles` (#488 PR 3, perf287's N1 on #1221: a sketch of the
 //! default 7 mantissa bits and 2048 buckets, fed values over about ten binades, so a cell
 //! grows to about 1300 buckets, tens of KiB) or `set` (#488 PR 5b: every input adds a new
-//! element, scattered over 2^22, so a cell grows past D298's 4 KiB checkpoint cap after about
-//! 2,000 inputs and its later gets fold every input since the last flush) or `sethub` (as
+//! element, scattered over 2^22, so a cell grows to about 50 KB in 100,000 writes and keeps
+//! a checkpoint only when a get folded operands of a quarter of it, D298 §4.3 as amended) or `sethub` (as
 //! `set`, each cell first put whole as a hub of 2^22 random ids below 2^25, about 5 MB, so
 //! every get reads a large separated base); `STEPS` is `counter_checkpoint_steps` (D291: a get that folds
 //! that many entries leaves its result as a base; 0 turns it off). `CELLS` hot cells of one

@@ -324,6 +324,9 @@ pub struct CellResolver<C> {
     /// The last counter group read: how many entries it stepped over, and the seqno of its
     /// newest entry at or below the read point (D291's checkpoint seqno).
     fold: Option<(u64, Seqno)>,
+    /// The summed lengths of the merge operands that last counter group folded, its base
+    /// (a put or checkpoint) excluded: D298 §4.3's checkpoint bound. Set with `fold`.
+    fold_bytes: u64,
 }
 
 /// Entries of a skipped column the resolver steps over before it seeks past the column. A
@@ -422,6 +425,7 @@ where
             out_val: Vec::new(),
             past_col: Vec::new(),
             fold: None,
+            fold_bytes: 0,
         };
         debug_assert!(r.is_fresh());
         r
@@ -656,6 +660,13 @@ where
         self.fold.take()
     }
 
+    /// The summed lengths of the merge operands the last counter group folded, with its base
+    /// (the put or checkpoint it started from) excluded (D298 §4.3). It belongs to the fold
+    /// [`counter_fold`](CellResolver::counter_fold) reports, and means nothing without one.
+    pub fn counter_fold_operand_bytes(&self) -> u64 {
+        self.fold_bytes
+    }
+
     /// The underlying cursor (to pin the current block for a zero-copy value).
     pub fn cursor(&self) -> &C {
         &self.cursor
@@ -720,6 +731,7 @@ where
             // Set by every counter group before it can be read, so never stale for the read
             // that asks (and a reset per point get measured 4 instructions, D193).
             fold: _,
+            fold_bytes: _,
         } = self;
         row.clear();
         *family_cover = None;
@@ -795,6 +807,7 @@ where
             out_val,
             past_col,
             fold: _,
+            fold_bytes: _,
         } = self;
         [
             row, col, run_key, run_acc, g_acc, g_key, base_key, base_val, out_key, out_val,
@@ -1026,6 +1039,7 @@ where
         // checkpoint stands in for this group's fold alone), and only those at or below the
         // snapshot.
         let mut steps = 0u64;
+        let mut op_bytes = 0u64;
         let mut top = None;
         // The first entry is in the column (the caller checked); the loop stops on the first
         // that is not, and leaves what it found for the next step.
@@ -1094,6 +1108,8 @@ where
                     }
                     Kind::Merge if !hidden && base == Base::None => {
                         let value = self.cursor.value();
+                        // Operands only: the base this group folds onto adds nothing.
+                        op_bytes += value.len() as u64;
                         if !ops {
                             ops = true;
                             self.g_acc.clear();
@@ -1140,6 +1156,7 @@ where
             // instructions, D193).
             if steps >= COUNTER_FOLD_MIN.load(std::sync::atomic::Ordering::Relaxed) {
                 self.fold = top.map(|top| (steps, top));
+                self.fold_bytes = op_bytes;
             }
         }
         if (if counter { expired } else { hidden }) || (base == Base::None && !ops) {
