@@ -9,9 +9,13 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll, Waker};
+
 use pigeonhole_engine::{
-    Commit, Engine, EngineOptions, FamilyOptions, FeedOptions, FeedReader, FeedSpec, FeedStart,
-    Next, TableInfo, ValueRef, WriteBatch,
+    Commit, Engine, EngineOptions, EngineShard, FamilyOptions, Fault, FeedOptions, FeedReader,
+    FeedSpec, FeedStart, Next, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::{Durability, Kind, Seqno};
 use pigeonhole_io::sim::SimVfs;
@@ -333,4 +337,153 @@ fn retention_passing_a_token_expires_it() {
     };
     assert!(expired, "a token retention passed never resumes");
     db.close().unwrap();
+}
+
+/// Runs every shard until none has anything to do now.
+fn settle(shards: &mut [EngineShard]) {
+    for _ in 0..100_000 {
+        let mut more = false;
+        for s in shards.iter_mut() {
+            more |= s.run_once(u64::MAX);
+        }
+        if !more {
+            return;
+        }
+    }
+    panic!("the shards never settled");
+}
+
+/// Runs every shard until `pending` resolves.
+fn drive<F: Future + Unpin>(shards: &mut [EngineShard], mut pending: F) -> F::Output {
+    let mut cx = Context::from_waker(Waker::noop());
+    for _ in 0..1_000_000 {
+        for s in shards.iter_mut() {
+            s.run_once(u64::MAX);
+        }
+        if let Poll::Ready(r) = Pin::new(&mut pending).poll(&mut cx) {
+            return r;
+        }
+    }
+    panic!("never resolved");
+}
+
+/// Polls `r` (shards settled between) until it stops delivering: the commits it delivered.
+fn drain(r: &mut FeedReader, shards: &mut [EngineShard]) -> Vec<Commit> {
+    let mut got = Vec::new();
+    for _ in 0..1_000 {
+        settle(shards);
+        match r.try_next().unwrap() {
+            Next::Commit(c) => got.push(c.clone()),
+            Next::Pending => return got,
+            Next::Expired(e) => panic!("expired: {e:?}"),
+        }
+    }
+    panic!("never drained");
+}
+
+/// simp724's case (3) on rule C, the slow half: with a cross-shard commit's DECISION held
+/// (`Fault::HoldDecisionRecords`), its PREPAREs stay held by the reader even after a flush
+/// of everything (no checkpoint may pass a PREPARE whose apply seqno isn't visible), and
+/// once the DECISION is written the commit is delivered whole.
+#[test]
+fn a_prepare_waiting_for_its_decision_stays_held_through_a_flush() {
+    let vfs = SimVfs::new(3109);
+    let (a, b) = {
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let t = tables(&db);
+        db.close().unwrap();
+        t
+    };
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(&vfs, Some(feed(1 << 20)))).unwrap();
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    db.inject(Fault::HoldDecisionRecords, true);
+    let mut wb = WriteBatch::new();
+    put(&mut wb, &a, b"x-a", b"1");
+    put(&mut wb, &b, b"x-b", b"2");
+    let mut pc = Box::pin(db.submit(wb, Some(Durability::Buffered)).unwrap());
+    settle(&mut shards);
+    let flush = db.submit_flush().unwrap();
+    drive(&mut shards, flush).unwrap();
+    settle(&mut shards);
+    assert!(drain(&mut r, &mut shards).is_empty());
+    assert_eq!(r.held_prepares(), 2, "both shares held for the DECISION");
+    db.release_held_decisions();
+    let info = drive(&mut shards, &mut pc).unwrap();
+    let got = drain(&mut r, &mut shards);
+    assert_eq!(got.len(), 1);
+    assert_eq!((got[0].seqno, got[0].changes.len()), (info.seqno, 2));
+    assert_eq!(r.held_prepares(), 0);
+}
+
+/// simp724's case (3), the aborted half: a cross-shard transaction that fails validation
+/// on one shard after the other wrote its PREPARE. The reader holds that PREPARE while its
+/// stream's checkpoint is behind it (an earlier unflushed single keeps it there), and drops
+/// it once a flush lets the checkpoint pass, with no Decision read: never earlier.
+#[test]
+fn an_aborted_rounds_prepare_is_dropped_once_its_checkpoint_passes() {
+    let vfs = SimVfs::new(3110);
+    let (a, b) = {
+        let db = open(&vfs, Some(feed(1 << 20)));
+        let t = tables(&db);
+        db.close().unwrap();
+        t
+    };
+    let (db, mut shards) =
+        Engine::open_application_owned(Path::new(DB), options(&vfs, Some(feed(1 << 20)))).unwrap();
+    let mut r = db.feed(spec(&[&a, &b], FeedStart::Now)).unwrap();
+    let commit = |shards: &mut [EngineShard], t: &TableInfo, row: &[u8]| {
+        let mut wb = WriteBatch::new();
+        put(&mut wb, t, row, b"v");
+        drive(shards, db.submit(wb, Some(Durability::Buffered)).unwrap())
+            .unwrap()
+            .seqno
+    };
+    // Unflushed singles on both streams, ahead of the round: the checkpoints stay behind.
+    let s1 = commit(&mut shards, &a, b"first-a");
+    let s2 = commit(&mut shards, &b, b"first-b");
+    let mut txn = db.begin().unwrap();
+    txn.get(a.id, a.families[0].id, b"r", b"q").unwrap();
+    // A conflicting write to the row the transaction read: it fails validation on a's
+    // shard, after b's shard wrote its PREPARE.
+    commit(&mut shards, &a, b"r");
+    txn.batch()
+        .put(
+            a.id,
+            a.families[0].id,
+            b"r",
+            b"q",
+            None,
+            ValueRef::Bytes(b"t"),
+        )
+        .unwrap();
+    txn.batch()
+        .put(
+            b.id,
+            b.families[0].id,
+            b"t",
+            b"q",
+            None,
+            ValueRef::Bytes(b"t"),
+        )
+        .unwrap();
+    let pc = txn.submit(Some(Durability::Buffered)).unwrap();
+    assert!(matches!(
+        drive(&mut shards, pc),
+        Err(pigeonhole_engine::Error::Conflict)
+    ));
+    let got: Vec<Seqno> = drain(&mut r, &mut shards).iter().map(|c| c.seqno).collect();
+    assert_eq!(got[..2], [s1, s2]);
+    let held = r.held_prepares();
+    assert!(held <= 1, "{held}");
+    if held == 1 {
+        // Not before its checkpoint passes it.
+        assert_eq!(r.held_prepares(), 1);
+    }
+    let flush = db.submit_flush().unwrap();
+    drive(&mut shards, flush).unwrap();
+    let later = commit(&mut shards, &b, b"later");
+    let got: Vec<Seqno> = drain(&mut r, &mut shards).iter().map(|c| c.seqno).collect();
+    assert_eq!(got.last(), Some(&later));
+    assert_eq!(r.held_prepares(), 0, "the aborted PREPARE is dropped");
 }

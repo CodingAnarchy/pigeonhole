@@ -427,6 +427,13 @@ impl FeedReader {
         }
     }
 
+    /// PREPAREs read and held for their Decision (an inspection helper for tests).
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn held_prepares(&self) -> usize {
+        self.held.values().map(Vec::len).sum()
+    }
+
     /// The frontier as of the last poll.
     pub fn frontier(&self) -> Seqno {
         self.frontier
