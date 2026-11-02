@@ -3815,6 +3815,26 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   - the parser's refusals.
 - **The positions measurement** (`crates/text/examples/size.rs`, 20,000 Zipf documents of about 40 words, stored bytes after a compaction, on a Mac): positions add 42% (29.1 to 41.4 MB) and make a `Buffered` write about 2.5× as long (161 to 400 µs). The owner kept them on by default, and the option's docs say to turn them off for write-heavy indexes without phrases.
 
+**PR 2 (#1290).** Phrase slop: a phrase with slop above 0 runs a sloppy matcher written from Lucene's documented `SloppyPhraseMatcher` algorithm, not translated from its source.
+- **The walk:** a queue of phrase positions. The lead minimises each match's distance until it passes the next term.
+- **Repeat groups:** a repeated word's `j`-th term starts at the word's `j`-th position, and the lesser of two colliding terms advances.
+- **The frequency:** `Σ 1/(distance+1)`.
+- **Slop 0** stays the exact path.
+
+simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minimised to distance 0, not about 1.83. MaxScore's `Σ maxtf` bound for slop above 0 holds either way.
+
+**Tests:**
+- **Unit:**
+  - without repeats, a match exactly when a brute force over every placement finds one within the slop (3,000 cases);
+  - with repeats, a match only where such a placement exists;
+  - at slop 0, the exact phrase's count;
+  - worked examples (adjacent, gapped, reversed, repeated).
+- **Integration:**
+  - the documents a sloppy phrase returns, against the brute-force rule over a 60-document corpus (2 seeds × 60 queries), and slop 0 equal to the exact phrase;
+  - closer matches scoring higher;
+  - the syntax equal to the builder;
+  - a repeated phrase word needing two occurrences.
+
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
 **Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.

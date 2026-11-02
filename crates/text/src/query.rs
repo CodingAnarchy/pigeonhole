@@ -104,10 +104,16 @@ impl Query {
     }
 
     /// Adds a phrase of words, matched as given, within `slop` position moves of
-    /// consecutive positions (Lucene's sloppy phrase).
+    /// consecutive positions (Lucene's sloppy phrase, D309 rev 6 §B).
     ///
-    /// A slop above 0 comes with D309 PR 2: until then a search with one is refused
-    /// (`InvalidArgument`).
+    /// A match is one position per word, spanning at most `slop` once each word's place in
+    /// the phrase is taken off. Words out of order cost moves too: `"a b"` reversed is 2. The
+    /// phrase's frequency in a document is the sum of `1 / (distance + 1)` over its matches,
+    /// so closer matches score higher, and an exact match counts 1, as at slop 0. A word
+    /// repeated in the phrase never stands on one position twice.
+    ///
+    /// Sloppy matching reads every phrase term's positions in each candidate document, so it
+    /// costs more than an exact phrase.
     pub fn phrase_with_slop<I, S>(self, words: I, slop: u16) -> Self
     where
         I: IntoIterator<Item = S>,

@@ -15,8 +15,8 @@
 //! search at a snapshot never returns a document whose committed text it doesn't match,
 //! and never misses one.
 //!
-//! A [`Query`] is a disjunction (OR) of terms, phrases and text, scored by BM25 with
-//! Lucene's idf, evaluated exactly at one snapshot.
+//! A [`Query`] is a disjunction (OR) of terms, phrases (exact, or within a slop of position
+//! moves) and text, scored by BM25 with Lucene's idf, evaluated exactly at one snapshot.
 //!
 //! ```
 //! use pigeonhole::{Family, Options, Pigeonhole, RetryPolicy};
@@ -51,6 +51,7 @@ mod index;
 mod layout;
 mod query;
 mod search;
+mod sloppy;
 mod tokenizer;
 
 pub use error::{Error, QueryErrorKind, Result};

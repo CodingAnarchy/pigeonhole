@@ -529,13 +529,9 @@ fn query_strings_are_parsed_when_the_search_runs() {
             other => panic!("{q}: {other:?}"),
         }
     }
-    // Fuzzy terms and slop parse, and wait for their PRs.
+    // Fuzzy terms parse, and wait for their PR.
     assert!(matches!(
         index.search("postgres~", 10).run(),
-        Err(Error::InvalidArgument(_))
-    ));
-    assert!(matches!(
-        index.search(r#""a b"~2"#, 10).run(),
         Err(Error::InvalidArgument(_))
     ));
     assert!(index.search("", 10).run().unwrap().is_empty());
@@ -570,5 +566,120 @@ fn put_in_joins_the_callers_transaction() {
         [&b"a"[..]]
     );
     check(&index, "committed");
+    db.close().unwrap();
+}
+
+/// Whether some placement of `phrase`'s words in `text` (distinct positions for a repeated
+/// word) spans at most `slop` once each word's offset is taken off: the match rule.
+fn sloppy_rule(phrase: &[&str], text: &str, slop: u16) -> bool {
+    let w = words(text);
+    fn go(p: &[&str], w: &[String], i: usize, picked: &mut Vec<usize>, slop: i64) -> bool {
+        if i == p.len() {
+            let rel: Vec<i64> = picked
+                .iter()
+                .zip(0i64..)
+                .map(|(&x, o)| x as i64 - o)
+                .collect();
+            return rel.iter().max().unwrap() - rel.iter().min().unwrap() <= slop;
+        }
+        (0..w.len()).any(|x| {
+            if w[x] != p[i] || picked.contains(&x) {
+                return false;
+            }
+            picked.push(x);
+            let ok = go(p, w, i + 1, picked, slop);
+            picked.pop();
+            ok
+        })
+    }
+    go(phrase, &w, 0, &mut Vec::new(), i64::from(slop))
+}
+
+#[test]
+fn a_sloppy_phrase_matches_the_documents_the_rule_allows() {
+    for seed in seeds(&[11, 12]) {
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = open(&dir);
+        let (_docs, index) = create(&db, IndexOptions::new());
+        let mut rng = Rng::new(seed);
+        let mut model: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+        for i in 0..60 {
+            let t = text(&mut rng, 10);
+            index.put(format!("d{i:02}").as_bytes(), &t).unwrap();
+            model.insert(format!("d{i:02}").into_bytes(), t);
+        }
+        for q in 0..60 {
+            let n = 2 + rng.below(2) as usize;
+            let mut phrase: Vec<&str> = (0..n).map(|_| word(&mut rng)).collect();
+            phrase.dedup();
+            if phrase.len() < 2 {
+                continue;
+            }
+            let slop = rng.below(4) as u16;
+            let got = index
+                .search(Query::new().phrase_with_slop(phrase.clone(), slop), 1000)
+                .run()
+                .unwrap();
+            let hits: std::collections::BTreeSet<&[u8]> = ids(&got).into_iter().collect();
+            for (doc, t) in &model {
+                assert_eq!(
+                    hits.contains(doc.as_slice()),
+                    sloppy_rule(&phrase, t, slop),
+                    "seed {seed}, query {q}: {phrase:?}~{slop} on {t:?}"
+                );
+            }
+            // Slop 0 through the sloppy syntax is the exact phrase.
+            if slop == 0 {
+                let exact = index
+                    .search(Query::new().phrase(phrase.clone()), 1000)
+                    .run()
+                    .unwrap();
+                assert_eq!(got, exact, "seed {seed}, query {q}");
+            }
+        }
+        check(&index, "sloppy");
+        db.close().unwrap();
+    }
+}
+
+#[test]
+fn closer_sloppy_matches_score_higher_and_the_syntax_equals_the_builder() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    // Equal lengths, so only the match's distance differs.
+    index.put(b"0", "memory store x x").unwrap();
+    index.put(b"1", "memory x store x").unwrap();
+    index.put(b"2", "memory x x store").unwrap();
+    index.put(b"r", "store memory x x").unwrap();
+    let hits = index.search(r#""memory store"~2"#, 10).run().unwrap();
+    assert_eq!(ids(&hits), [&b"0"[..], b"1", b"2", b"r"]);
+    assert!(hits[1].score > hits[2].score, "distance 1 beats 2");
+    assert_eq!(hits[2].score, hits[3].score, "reversed is distance 2");
+    let built = index
+        .search(Query::new().phrase_with_slop(["memory", "store"], 2), 10)
+        .run()
+        .unwrap();
+    assert_eq!(built, hits);
+    // Slop 1 drops the two at distance 2.
+    let near = index.search(r#""memory store"~1"#, 10).run().unwrap();
+    assert_eq!(ids(&near), [&b"0"[..], b"1"]);
+    // An exact match scores the same with and without slop.
+    let exact = index.search(r#""memory store""#, 10).run().unwrap();
+    let sloppy0 = index.search(r#""memory store"~0"#, 10).run().unwrap();
+    assert_eq!(exact, sloppy0);
+    assert_eq!(exact[0].score, hits[0].score);
+    db.close().unwrap();
+}
+
+#[test]
+fn a_repeated_phrase_word_needs_two_occurrences() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let (_docs, index) = create(&db, IndexOptions::new());
+    index.put(b"one", "the cat sat").unwrap();
+    index.put(b"two", "the cat sat on the mat").unwrap();
+    let hits = index.search(r#""the cat the"~4"#, 10).run().unwrap();
+    assert_eq!(ids(&hits), [&b"two"[..]]);
     db.close().unwrap();
 }

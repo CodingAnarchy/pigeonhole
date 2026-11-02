@@ -38,8 +38,13 @@ pub struct Search<'a> {
     snapshot: Option<&'a Snapshot>,
 }
 
-/// A phrase as the evaluator matches it: each term with its offset from the first.
-type Phrase = Vec<(String, u32)>;
+/// A phrase as the evaluator matches it: each term with its offset from the first, and the
+/// position moves a match may take (0: exact).
+#[derive(Debug, PartialEq)]
+struct Phrase {
+    terms: Vec<(String, u32)>,
+    slop: u16,
+}
 
 impl<'a> Search<'a> {
     pub(crate) fn new(index: &'a Index, query: Query, k: usize) -> Self {
@@ -104,7 +109,10 @@ impl<'a> Search<'a> {
             b: inn.opts.get_b(),
         };
         let mut df_of: HashMap<String, i64> = HashMap::new();
-        for term in terms.iter().chain(phrases.iter().flatten().map(|(t, _)| t)) {
+        for term in terms
+            .iter()
+            .chain(phrases.iter().flat_map(|p| p.terms.iter().map(|(t, _)| t)))
+        {
             if !df_of.contains_key(term) {
                 let df = t
                     .get_at(s, &post_row(term), DF, N)?
@@ -158,10 +166,11 @@ impl<'a> Search<'a> {
         let cap = index.inner.opts.get_max_term_bytes() as usize;
         let mut terms = BTreeSet::new();
         let mut phrases: Vec<Phrase> = Vec::new();
-        let mut add_phrase = |p: Phrase, terms: &mut BTreeSet<String>| match p.len() {
+        let mut add_phrase = |p: Phrase, terms: &mut BTreeSet<String>| match p.terms.len() {
             0 => {}
+            // A one-term phrase is that term, whatever its slop.
             1 => {
-                terms.insert(p.into_iter().next().expect("one").0);
+                terms.insert(p.terms.into_iter().next().expect("one").0);
             }
             _ => {
                 if !phrases.contains(&p) {
@@ -182,23 +191,27 @@ impl<'a> Search<'a> {
                     terms.extend(index.query_tokens(text).into_iter().map(|(t, _)| t));
                 }
                 Clause::Phrase { words, slop } => {
-                    refuse_slop(*slop)?;
-                    let p: Phrase = words
-                        .iter()
-                        .zip(0u32..)
-                        .map(|(w, i)| (index.normalize_term(w).into_owned(), i))
-                        .collect();
+                    let p = Phrase {
+                        terms: words
+                            .iter()
+                            .zip(0u32..)
+                            .map(|(w, i)| (index.normalize_term(w).into_owned(), i))
+                            .collect(),
+                        slop: *slop,
+                    };
                     // A phrase with a word that can't be a term matches nothing.
-                    if p.iter().all(|(w, _)| !w.is_empty() && w.len() <= cap) {
+                    if p.terms.iter().all(|(w, _)| !w.is_empty() && w.len() <= cap) {
                         add_phrase(p, &mut terms);
                     }
                 }
                 Clause::QuotedPhrase { text, slop } => {
-                    refuse_slop(*slop)?;
                     let toks = index.query_tokens(text);
                     let first = toks.first().map_or(0, |(_, p)| *p);
                     add_phrase(
-                        toks.into_iter().map(|(t, p)| (t, p - first)).collect(),
+                        Phrase {
+                            terms: toks.into_iter().map(|(t, p)| (t, p - first)).collect(),
+                            slop: *slop,
+                        },
                         &mut terms,
                     );
                 }
@@ -216,15 +229,6 @@ impl<'a> Search<'a> {
         }
         Ok((terms, phrases))
     }
-}
-
-fn refuse_slop(slop: u16) -> Result<()> {
-    if slop > 0 {
-        return Err(Error::InvalidArgument(
-            "phrase slop is not supported yet: it comes in D309 PR 2 (#1290)".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// BM25 with Lucene's idf (D309 §4).
@@ -246,8 +250,10 @@ impl Bm25 {
     }
 }
 
-/// Adds an exact phrase's scores: Lucene's PhraseQuery, with the phrase as one pseudo-term
-/// whose frequency is its occurrences and whose idf is the sum of its terms' (D309 §4.3).
+/// Adds a phrase's scores: Lucene's phrase scoring, the phrase as one pseudo-term whose idf
+/// is the sum of its terms' (D309 §4.3). Its frequency is its exact occurrences at slop 0,
+/// and its sloppy frequency (`Σ 1 / (distance + 1)` over its matches, D309 rev 6 §B) above
+/// that.
 fn score_phrase(
     t: &Table,
     s: &Snapshot,
@@ -256,18 +262,19 @@ fn score_phrase(
     phrase: &Phrase,
     scores: &mut HashMap<Vec<u8>, f64>,
 ) -> Result<()> {
-    if phrase.iter().any(|(term, _)| df_of[term] <= 0) {
+    let terms = &phrase.terms;
+    if terms.iter().any(|(term, _)| df_of[term] <= 0) {
         return Ok(());
     }
-    let idf: f64 = phrase.iter().map(|(term, _)| bm.idf(df_of[term])).sum();
+    let idf: f64 = terms.iter().map(|(term, _)| bm.idf(df_of[term])).sum();
     // Lead with the rarest term; the others narrow its documents.
-    let lead = (0..phrase.len())
-        .min_by_key(|&i| df_of[&phrase[i].0])
+    let lead = (0..terms.len())
+        .min_by_key(|&i| df_of[&terms[i].0])
         .expect("a phrase has terms");
     let mut by_term: BTreeMap<&str, BTreeMap<Vec<u8>, Vec<u32>>> = BTreeMap::new();
-    let lead_term = phrase[lead].0.as_str();
+    let lead_term = terms[lead].0.as_str();
     by_term.insert(lead_term, read_positions(t, s, lead_term, None)?);
-    for (term, _) in phrase {
+    for (term, _) in terms {
         if by_term.contains_key(term.as_str()) {
             continue;
         }
@@ -275,32 +282,52 @@ fn score_phrase(
         let got = read_positions(t, s, term, Some(keep))?;
         by_term.insert(term, got);
     }
-    let lead_off = phrase[lead].1;
+    // A repeated word's terms share one group, so the sloppy matcher keeps them apart.
+    let groups: Vec<usize> = terms
+        .iter()
+        .map(|(term, _)| terms.iter().position(|(t, _)| t == term).expect("itself"))
+        .collect();
+    let lead_off = terms[lead].1;
     for (doc, lead_ps) in &by_term[lead_term] {
-        let mut freq = 0u32;
-        'start: for &p in lead_ps {
-            for (term, off) in phrase {
-                let Some(at) = (p + off).checked_sub(lead_off) else {
-                    continue 'start;
-                };
-                let found = by_term[term.as_str()]
-                    .get(doc)
-                    .is_some_and(|ps| ps.binary_search(&at).is_ok());
-                if !found {
-                    continue 'start;
+        let lists: Option<Vec<&[u32]>> = terms
+            .iter()
+            .map(|(term, _)| by_term[term.as_str()].get(doc).map(Vec::as_slice))
+            .collect();
+        // A document without every term can't hold the phrase.
+        let Some(lists) = lists else {
+            continue;
+        };
+        let freq = if phrase.slop == 0 {
+            let mut n = 0u32;
+            'start: for &p in lead_ps {
+                for ((_, off), ps) in terms.iter().zip(&lists) {
+                    let Some(at) = (p + off).checked_sub(lead_off) else {
+                        continue 'start;
+                    };
+                    if ps.binary_search(&at).is_err() {
+                        continue 'start;
+                    }
                 }
+                n += 1;
             }
-            freq += 1;
-        }
-        if freq == 0 {
+            f64::from(n)
+        } else {
+            let walks: Vec<(&[u32], u32, usize)> = lists
+                .iter()
+                .zip(terms)
+                .zip(&groups)
+                .map(|((ps, (_, off)), g)| (*ps, *off, *g))
+                .collect();
+            crate::sloppy::sloppy_freq(&walks, phrase.slop)
+        };
+        if freq == 0.0 {
             continue;
         }
         let len = match t.get_at(s, &post_row(lead_term), POST, doc)? {
             Some(c) => unposting(c.as_u64().ok_or_else(|| corrupt("a posting isn't a u64"))?).1,
             None => return Err(corrupt("a position has no posting")),
         };
-        *scores.entry(doc.clone()).or_default() +=
-            idf * bm.tf_factor(f64::from(freq), f64::from(len));
+        *scores.entry(doc.clone()).or_default() += idf * bm.tf_factor(freq, f64::from(len));
     }
     Ok(())
 }
