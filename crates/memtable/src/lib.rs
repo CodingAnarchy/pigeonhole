@@ -835,9 +835,10 @@ impl Memtable {
         // The next insert's predecessors: this node below its height, `prev` above it. After
         // an insert right after the last one `prev` is the splice already, so only the
         // node's own levels change (every level was rewritten per insert, about 30
-        // instructions, #1206).
+        // instructions, #1206). After a search only the levels above the node are copied:
+        // the whole array then the fill cost commit-at 31 more (perf287).
         if !after_last {
-            self.splice = prev;
+            self.splice[height..].copy_from_slice(&prev[height..]);
         }
         self.splice[..height].fill(node);
         self.bump += node_len;
