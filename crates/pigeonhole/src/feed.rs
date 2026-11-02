@@ -318,7 +318,8 @@ fn subscribe(db: &Db, spec: FeedSpec) -> Result<(FeedReader, u64)> {
 /// When the history a feed needs is gone, it expires: [`next`](Self::next) fails with
 /// [`ErrorCode::FeedExpired`] from then on. That happens when retention
 /// ([`Options::change_feed`](crate::Options::change_feed)) passed it, when the database
-/// was opened without the feed for these tables or with another shard count since, or when
+/// was opened since with the feed turned off, without these tables, or with another
+/// explicit shard count (an open that mentions neither inherits them and keeps it), or when
 /// a power loss took commits it delivered. Start again from a snapshot.
 ///
 /// ```

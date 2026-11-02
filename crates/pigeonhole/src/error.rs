@@ -99,8 +99,10 @@ pub enum ErrorCode {
     UnsupportedFeature = 30,
     /// A change feed can't continue: the history it needs is gone ([`Feed`](crate::Feed),
     /// D310). Retention ([`Options::change_feed`](crate::Options::change_feed)) passed it;
-    /// the database was opened without the feed for its tables, or with another shard
-    /// count, since; or a power loss took commits a [`visible`](crate::FeedBuilder::visible)
+    /// the database was opened since with the feed turned off
+    /// ([`Options::change_feed_off`](crate::Options::change_feed_off)), without its tables,
+    /// or with another explicit shard count (an open that doesn't mention the feed or the
+    /// shard count inherits them and keeps it); or a power loss took commits a [`visible`](crate::FeedBuilder::visible)
     /// feed delivered. It stays expired. Start a new feed from a snapshot
     /// ([`FeedBuilder::from_snapshot`](crate::FeedBuilder::from_snapshot)), after rebuilding
     /// what the feed maintained; [`Feed::oldest_retained`](crate::Feed::oldest_retained)

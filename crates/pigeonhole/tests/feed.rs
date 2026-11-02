@@ -226,7 +226,7 @@ fn a_table_or_snapshot_from_another_database_is_refused() {
 }
 
 #[test]
-fn an_open_without_the_feed_between_expires_a_token() {
+fn an_open_with_the_feed_off_between_expires_a_token() {
     let dir = pigeonhole::doc_support::temp_dir();
     let path = dir.join("db.phdb");
     let db = Pigeonhole::open(&path, fed()).unwrap();
@@ -240,10 +240,10 @@ fn an_open_without_the_feed_between_expires_a_token() {
     expire_between(&path, token);
 }
 
-/// Writes through an open with the feed off, then resumes `token`: it has expired, and stays
-/// so.
+/// Writes through an open with the feed turned off, then resumes `token`: it has expired,
+/// and stays so.
 fn expire_between(path: &Path, token: FeedToken) {
-    let db = Pigeonhole::open(path, Options::default().shards(2)).unwrap();
+    let db = Pigeonhole::open(path, Options::default().shards(2).change_feed_off()).unwrap();
     let a = db.table("a").unwrap().open().unwrap();
     a.mutate(b"unfed").put("f", b"q", b"2").commit().unwrap();
     db.close().unwrap();
@@ -256,6 +256,77 @@ fn expire_between(path: &Path, token: FeedToken) {
         assert_eq!(e.code() as u32, 31);
         assert!(e.message().contains("expired"), "{e}");
     }
+    drop(feed);
+    db.close().unwrap();
+}
+
+/// D310's amendment (the owner, 2026-11-02): a tool's open that mentions neither the feed nor
+/// the shard count (`phdb load`, say) inherits both from the app's last session, so the app's
+/// token resumes past it, and the tool's commit is in the feed like any other.
+#[test]
+fn an_open_that_does_not_mention_the_feed_inherits_it_and_keeps_the_token() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("db.phdb");
+    // Three shards: unlikely to be any machine's default, so the tool's unset count is
+    // really inherited.
+    let app = || fed().shards(3).feed_tables(["a"]);
+    // The tables first (a new database: nothing to inherit, the feed is off).
+    let db = Pigeonhole::open(&path, Options::default().shards(3)).unwrap();
+    assert!(db.info().unwrap().feed.is_none());
+    tables(&db);
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, app()).unwrap();
+    let a = db.table("a").unwrap().open().unwrap();
+    let mut feed = a.feed().open().unwrap();
+    a.mutate(b"app1").put("f", b"q", b"1").commit().unwrap();
+    next(&mut feed);
+    let token = feed.token();
+    drop(feed);
+    db.close().unwrap();
+
+    // The tool: plain options, no shard count.
+    let db = Pigeonhole::open(&path, Options::default()).unwrap();
+    let info = db.info().unwrap();
+    assert!(info.feed.is_some(), "the feed is inherited: {info:?}");
+    let a = db.table("a").unwrap().open().unwrap();
+    let tool = a.mutate(b"tool").put("f", b"q", b"t").commit().unwrap();
+    db.close().unwrap();
+
+    let db = Pigeonhole::open(&path, app()).unwrap();
+    let a = db.table("a").unwrap().open().unwrap();
+    let mut feed = a.feed().resume(&token).open().unwrap();
+    let c = next(&mut feed);
+    assert_eq!(
+        (c.seqno(), c.changes()[0].row()),
+        (tool.seqno, &b"tool"[..])
+    );
+    let after = a.mutate(b"app2").put("f", b"q", b"2").commit().unwrap();
+    assert_eq!(next(&mut feed).seqno(), after.seqno);
+    drop(feed);
+    db.close().unwrap();
+}
+
+/// Resharding on purpose (an explicit, different shard count) still ends the history, with
+/// the reason given.
+#[test]
+fn an_explicit_new_shard_count_expires_the_token() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let path = dir.join("db.phdb");
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    let (a, _) = tables(&db);
+    let mut feed = a.feed().open().unwrap();
+    a.mutate(b"r").put("f", b"q", b"1").commit().unwrap();
+    next(&mut feed);
+    let token = feed.token();
+    drop(feed);
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, Options::default().shards(1)).unwrap();
+    db.close().unwrap();
+    let db = Pigeonhole::open(&path, fed()).unwrap();
+    let a = db.table("a").unwrap().open().unwrap();
+    let mut feed = a.feed().resume(&token).open().unwrap();
+    let e = feed.next(WAIT).unwrap_err();
+    assert_eq!(e.code(), ErrorCode::FeedExpired, "{e}");
     drop(feed);
     db.close().unwrap();
 }
