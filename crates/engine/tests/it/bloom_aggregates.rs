@@ -4,7 +4,7 @@
 //! compactions; an HLL family takes bytes elements too, behind the same domain tag. A
 //! filter's value may be separated into a blob file (PR 5): reads fold inputs onto the
 //! separated base, compaction folds them into a new one, and a counter checkpoint keeps only
-//! a folded value of at most 4 KiB. One engine-owned shard over `SimVfs`.
+//! a fold whose operands are at least a quarter of its value. One engine-owned shard over `SimVfs`.
 
 use crate::common;
 
@@ -342,32 +342,28 @@ fn a_whole_filter_larger_than_a_wal_record_is_separated_at_commit() {
 }
 
 #[test]
-fn a_counter_checkpoint_keeps_only_a_folded_value_of_at_most_4_kib() {
-    // D298 §4.3: with checkpoints after every step, a get of a filter of 2^14 bits (a 2 KiB
-    // value) leaves a checkpoint; one of 2^15 bits (just over 4 KiB) never does.
+fn a_counter_checkpoint_needs_operands_of_a_quarter_of_its_value() {
+    // D298 §4.3 (amended): with checkpoints after every step, a get keeps its fold only when
+    // the operands it folded, its base excluded, sum to at least a quarter of the value. A
+    // 4 KiB filter put whole with two inputs above it leaves none; with 200 inputs (about 2
+    // KB of operands) above it, one, though the value is past D298's old 4 KiB cap.
     let vfs = SimVfs::new(6);
     let db = Engine::open(Path::new(DB), options(&vfs, 1)).unwrap();
-    let (small, large) = (
-        BloomParams {
-            log2_bits: 14,
-            hashes: 3,
-        },
-        BloomParams {
-            log2_bits: 15,
-            hashes: 3,
-        },
-    );
+    let p = BloomParams {
+        log2_bits: 15,
+        hashes: 3,
+    };
     let info = db
         .create_table(
             "t",
             &[
-                ("s".into(), bloom_family(small).blob_threshold(1 << 20)),
-                ("l".into(), bloom_family(large).blob_threshold(1 << 20)),
+                ("few".into(), bloom_family(p).blob_threshold(1 << 20)),
+                ("many".into(), bloom_family(p).blob_threshold(1 << 20)),
             ],
         )
         .unwrap();
     let t = info.id;
-    for (name, p, kept) in [("s", small, true), ("l", large, false)] {
+    for (name, inputs, kept) in [("few", 2, false), ("many", 200, true)] {
         let f = info.family(name).unwrap().id;
         let mut wb = WriteBatch::new();
         wb.put(
@@ -379,13 +375,13 @@ fn a_counter_checkpoint_keeps_only_a_folded_value_of_at_most_4_kib() {
             ValueRef::Bytes(&dense_filter(p)),
         )
         .unwrap();
-        wb.merge_at(t, f, b"r", b"q", 3_600, ValueRef::I64(1))
-            .unwrap();
         db.commit(wb, None).unwrap();
-        let mut wb = WriteBatch::new();
-        wb.merge_at(t, f, b"r", b"q", 3_600, ValueRef::I64(2))
-            .unwrap();
-        db.commit(wb, None).unwrap();
+        for i in 0..inputs {
+            let mut wb = WriteBatch::new();
+            wb.merge_at(t, f, b"r", b"q", 3_600, ValueRef::I64(i))
+                .unwrap();
+            db.commit(wb, None).unwrap();
+        }
         let before = db.counter_checkpoints();
         db.get_latest(t, f, b"r", b"q").unwrap().unwrap();
         db.get_latest(t, f, b"r", b"q").unwrap().unwrap();
