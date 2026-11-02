@@ -2725,6 +2725,18 @@ impl Engine {
         })
     }
 
+    /// The change feed's background syncs since open (D310, *T_sync*): syncs submitted
+    /// because fed `Buffered` or `None` records waited for one longer than the interval and
+    /// no other sync covered them. 0 with the feed off.
+    pub fn feed_background_syncs(&self) -> u64 {
+        self.inner
+            .shared
+            .metrics
+            .iter()
+            .map(|m| m.feed_syncs.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// What the row cache did since open (D201); all zero when it is off. In a reader process,
     /// its cache since the last attach to a writer generation (D281). A method rather than [`Metrics`] fields, which would break struct literals.
     pub fn row_cache_stats(&self) -> RowCacheStats {
