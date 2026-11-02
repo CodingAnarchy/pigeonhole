@@ -132,7 +132,12 @@ Options are fixed when the index is created.
 | `max_term_bytes` | 64 | Longer words are dropped. |
 | `max_terms` | 10,000 | A document with more distinct terms is refused before anything is written. |
 
-A custom `Tokenizer` (`create_with_tokenizer`) replaces the built-in one, which splits on Unicode word boundaries and lowercases.
+**Which normalisation to pick** (#1291). Normalisation runs on each token after the tokeniser splits the original text, so highlights still point into the text as written. Queries are normalised the same way (builder terms, phrase words and fuzzy terms included), and the setting is fixed at create.
+- **`Nfc`, the default, for nearly everything.** It only unifies different encodings of the same character, such as a precomposed `é` and `e` plus a combining accent, or composed and decomposed Hangul, so nothing a reader would call different is merged. macOS file names and some keyboards produce decomposed text, and most web text is composed.
+- **`Nfkc` for text whose characters vary in form, not meaning:** text extracted from PDFs or OCR (ligatures such as `ﬁ`), East Asian content with full-width letters and digits, and agent memory fed from mixed sources. It also folds forms some content means literally: `²` becomes `2`, `①` becomes `1`, `ﬁ` becomes `fi`, and full-width becomes ASCII. A memory store's own index is `Nfc` today; a `pigeonhole-memory` option to choose follows (D311).
+- **`None` only where code points must match exactly,** such as identifiers or hashes, or text already normalised before it's written.
+
+A custom `Tokenizer` (`create_with_tokenizer`) replaces the built-in one, which splits on Unicode word boundaries and lowercases. Normalisation applies to its tokens too.
 - **Its name and fingerprint are stored,** and an open with another tokeniser fails with `Mismatch`.
 - **The built-in tokeniser's fingerprint includes its Unicode version,** so a dependency update that changes word boundaries makes `open` refuse until you `repair` into a new index.
 
