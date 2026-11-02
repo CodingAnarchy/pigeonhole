@@ -3766,3 +3766,38 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   2. The public API (#1281).
   3. The follow-ups (#1284, in progress): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
 - **Deferred:** `read_within_async` (#1286, Post-1.0).
+
+<a id="d310"></a>
+## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
+**Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.
+
+**Decided (the seven calls of revision 3, §7).**
+1. **The source is the WAL with feed retention.** A slot goes live → retained → recycled. The ring deepens by the retention and then recycles, so the file stops growing. The trim runs in the shard's maintenance. A rollover with nothing else ready takes the oldest retained slot, so retention never stalls a writer.
+   - Retention is a per-database total, enforced per stream as `bytes / N`, at least two segments per stream. `age` drops older history.
+   - Blob GC's horizon follows the oldest retained segment.
+   - `DatabaseInfo` reports the retained WAL bytes and the blob bytes held for the horizon.
+2. **Configuration is at open.** The history's fed set is made safe by three things:
+   - the `<db>-feed` sidecar (FORMAT §10.4). It records sessions, the superblock `sequence` after each root commit, and "fed: none" from feed-off opens;
+   - a session id in the WAL segment header's reserved bytes 76..84 (FORMAT §10.2). `decode` never reads those bytes, in 1.0.0 too;
+   - the open-time `sequence` check.
+
+   No incompat bit: older builds ignore the mark and write zero, which ends history.
+3. **`Durability::None` on fed tables** gets a lazy flush every *T* (10 ms). A per-shard written watermark `W` acts as a D300-style hold in shm (layout version 7), gated by the feed flag. The timer is armed only while something is unflushed. The fallback is to raise to `Buffered` (PR 2).
+4. **`FeedExpired`** in each of these cases:
+   - retention passed the token;
+   - a shard-count change;
+   - the mark rule;
+   - a torn tail;
+   - a writer restart while tailing (except a durable feed at or below the recovered durable watermark);
+   - a vanished blob or a recycled slot.
+5. **The default frontier is durable.** `visible()` is the opt-in.
+6. **A clean close keeps the retained segments** with the feed on. The next open adopts them without replaying them.
+7. **Delivery is a whole commit.** The token falls between seqnos.
+
+**How PR 1 builds it.**
+- **The ring.** `WalStream`'s recyclable predicate excludes the newest `retain_segments` segments past the checkpoint, and those `trim_retained` hasn't aged out. Seal times come from the maintenance clock, at the first trim after a rollover. Segments adopted at open count from the open.
+- **The never-stall fallback** takes the oldest retained slot ahead of a blank slot or an inline growth, never at open. It's counted in `WalCounters::retained_taken`.
+- **The blob horizon.** With the feed on, the manifest writer turns a `DropBlobFile` of a file that still has live bytes into a live-0 `PutBlobFile`, plus a hold. The hold records each stream's head epoch, which `FeedMarks::head` stores (Release) as a segment starts, before any of its records. Maintenance drops a held file once every stream's floor, the oldest non-recyclable epoch, has passed its head; the drop is computed against the catalog at commit. An open holds live-0 files again, at the new heads, and doesn't sweep them.
+- **The sidecar.** The session's entry is written and synced after the pager's `finish` and before any WAL segment. It carries `opened_at` (the sequence before any root commit of the open), the retention, the stream count and the fed tables. The pager's root-commit observer appends a Root entry, unsynced, after each durable root commit, so a lost append gives the safe, spurious expiry. A torn tail is cut off before the next append.
+- **The clean close** skips `forget_checkpoints` and the WAL files' removal with the feed on. Their checkpoints sit at their ends, so the next open replays nothing and adopts the retained slots.
+

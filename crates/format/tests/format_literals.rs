@@ -289,6 +289,7 @@ fn wal_segment_header_and_fragment() {
         db_id: [0xD2; 16],
         segment_size: 1 << 26,
         features: 0,
+        feed_session: 0,
     };
     let mut f = Box::new([0u8; FRAME_SIZE]);
     h.encode(&mut f);
@@ -313,6 +314,7 @@ fn wal_segment_header_and_fragment() {
     SegmentHeader {
         version: FormatVersion(4),
         features: 0x0102_0304,
+        feed_session: 0,
         ..h
     }
     .encode(&mut f);

@@ -42,6 +42,7 @@ mod durable_freeze;
 mod durable_snapshot;
 mod early_decide;
 mod exact_aggregates;
+mod feed_retention;
 mod fifo_expiry;
 mod file_growth;
 mod flush_fold;
