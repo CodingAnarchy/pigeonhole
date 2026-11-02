@@ -264,6 +264,12 @@ impl OpenedPager {
         self.superblock.db_id
     }
 
+    /// The newest valid superblock's `sequence` (FORMAT §8.2), before any root commit of this
+    /// open.
+    pub fn sequence(&self) -> u64 {
+        self.superblock.sequence
+    }
+
     /// Whether the last writer closed cleanly. The flag stays set until the next root
     /// commit, which clears it.
     pub fn clean_shutdown(&self) -> bool {
@@ -358,6 +364,7 @@ impl OpenedPager {
                 growths_ahead: AtomicU64::new(0),
                 ahead_nanos: AtomicU64::new(0),
                 side: SideSyncs::default(),
+                root_observer: OnceLock::new(),
                 frontier: AtomicU64::new(frontier),
             }),
         })
@@ -432,6 +439,18 @@ struct Inner {
     /// superblock without taking the allocator lock, which a growth holds across its sync
     /// (#182). Updated under that lock whenever the frontier moves.
     frontier: AtomicU64,
+    /// Called with the new superblock's sequence after each successful root commit
+    /// ([`Pager::on_root_commit`], D310).
+    root_observer: OnceLock<RootObserver>,
+}
+
+/// A root-commit observer ([`Pager::on_root_commit`]).
+struct RootObserver(Box<dyn Fn(u64) + Send + Sync>);
+
+impl fmt::Debug for RootObserver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("RootObserver")
+    }
 }
 
 /// Commit steps a finished side sync resumes; [`Parked::run`] them with no pager lock held.
@@ -787,6 +806,11 @@ impl Inner {
             Err(_) => st.poisoned = true,
         }
         drop(st);
+        if result.is_ok()
+            && let Some(observe) = self.root_observer.get()
+        {
+            (observe.0)(p.sequence);
+        }
         if result.is_ok() {
             // The manifest extents the durable root names may no longer be abandoned.
             let mut alloc = lock(&self.alloc);
@@ -970,6 +994,38 @@ impl Pager {
     /// The root most recently committed.
     pub fn root(&self) -> Root {
         lock(&self.inner.state).root
+    }
+
+    /// The current superblock's `sequence` (FORMAT §8.2): as of the last commit, or the last
+    /// reload for a read-only pager.
+    pub fn sequence(&self) -> u64 {
+        lock(&self.inner.state).sequence
+    }
+
+    /// Sets the one observer every later successful root commit calls with its new
+    /// sequence, on the committing thread, once the commit is durable and before the commit
+    /// returns (the change feed's sidecar, D310). Returns `false`, leaving the first one, if
+    /// an observer is already set. It must not commit a root itself.
+    ///
+    /// ```
+    /// use std::sync::Arc;
+    /// use std::sync::atomic::{AtomicU64, Ordering};
+    /// use pigeonhole_io::{VfsRef, sim::SimVfs};
+    /// use pigeonhole_pager::Pager;
+    ///
+    /// # fn main() -> pigeonhole_pager::Result<()> {
+    /// let vfs: VfsRef = SimVfs::new(3);
+    /// let pager = Pager::create(&vfs, "/db/data.phdb".as_ref())?;
+    /// let seen = Arc::new(AtomicU64::new(0));
+    /// let s = Arc::clone(&seen);
+    /// assert!(pager.on_root_commit(Box::new(move |seq| s.store(seq, Ordering::Relaxed))));
+    /// pager.commit_root(pager.root())?;
+    /// assert_eq!(seen.load(Ordering::Relaxed), pager.sequence());
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn on_root_commit(&self, observer: Box<dyn Fn(u64) + Send + Sync>) -> bool {
+        self.inner.root_observer.set(RootObserver(observer)).is_ok()
     }
 
     /// The file's feature sets (D269): as of the last commit, or the last reload for a

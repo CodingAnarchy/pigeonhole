@@ -378,6 +378,36 @@ With N closed-loop clients, throughput is about N divided by commit latency. At 
 
 Buffered reads hid the second miss there: the index partitions sat in the page cache. D215 sized the gate's block cache to hold them (1/64 of the table), and the engine now reports the pinned metadata and warns when it passes half the block cache.
 
+## IVF index on SIFT1M (reference machine, AX102)
+`examples/ivfsift.rs` (D306 PR 3) builds a `pigeonhole-vector` index from the standard SIFT1M files and measures recall@10 and per-query latency, one thread, one query at a time:
+
+```text
+IVF_BLOCK_CACHE_MB=1024 IVF_NPROBES=16,20,24,28,32 \
+  cargo run --release -p pigeonhole-bench --example ivfsift -- SIFT_DIR DB_DIR bulk all 1000 buffered
+```
+
+- **Modes:** `bulk` (`bulk_load_f32`) or `insert` (one `insert_f32` per vector, splits inline).
+- **Other arguments:** `N` (`all`, or a prefix of the base, scored by brute force), the target list length, and the durability.
+- **Knobs:** `IVF_BLOCK_CACHE_MB`, `IVF_NPROBES`, and `IVF_COMPACT=1` (compact after the build).
+- **Output:** JSON lines. Warm rows (sync and `run_async`) come after one untimed pass, then a cold row with direct I/O at the first nprobe reaching 95% recall.
+
+**Comparison:** `crates/bench/baselines/ivf/faiss-ivf.py SIFT_DIR` runs Faiss IVF-Flat (1,000 lists, trained on the first 50,000 vectors) the same way, one thread and one query at a time (`pip install faiss-cpu numpy`).
+
+**Results (2026-11-02, bulk build, target 1,000, 1 GiB block cache):**
+
+| nprobe | recall@10 | p50 | p99 |
+|--:|--:|--:|--:|
+| 16 | 0.922 | 2.30 ms | 3.94 ms |
+| 20 | 0.943 | 2.84 ms | 4.67 ms |
+| 24 (the default) | 0.958 | 3.38 ms | 5.39 ms |
+| 28 | 0.967 | 3.92 ms | 6.08 ms |
+| 32 | 0.974 | 4.47 ms | 6.75 ms |
+
+- **D306's target, 95% recall@10 at ≤ 10 ms,** is met at nprobe 24, with p99 at 5.4 ms.
+- **Under the default 256 MiB block cache** (half the 512 MB index cached), nprobe 32 took 10.8 ms. The guide's sizing section says to hold the index.
+- **Faiss IVF-Flat:** the same recall within ±0.015 at every nprobe from 4 to 128, 9–10× faster with the index cached (0.50 ms at nprobe 32), up to 22× under the default 256 MiB cache. The gap is the engine's per-cell read path (#1283).
+- **Builds:** `bulk_load` 138 s. 1M inserts at `Buffered` 67 s (insert p50 56 µs, p99 93 µs, p999 415 µs). Faiss 3.3 s.
+
 ## Larger-than-RAM results (this Mac, non-reference)
 
 **Single runs, n=1, commit `ba5e996`**, measured 2026-10-06: `phdb-bench ycsb-c` and `phdb-bench ycsb-a` with `--scale larger-than-ram` (Pigeonhole only, release, 1,000,000 records and 1,000,000 operations, 5% warmup, 100-byte values, seed `0x5EED`, 8 MiB memtable, 16 MiB block cache, buffered commits).

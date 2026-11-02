@@ -54,8 +54,41 @@ pub struct DatabaseInfo {
     /// [`Pigeonhole::shrink`](crate::Pigeonhole::shrink) could release at most, plus the
     /// 64 KiB file header. `None` on a reader, which does not track allocations.
     pub free_bytes: Option<u64>,
+    /// The change feed's disk cost (D310): `None` unless this handle is a writer opened with
+    /// [`Options::change_feed`](crate::Options::change_feed).
+    pub feed: Option<FeedInfo>,
     /// Every table, by name.
     pub tables: Vec<TableInfo>,
+}
+
+/// What the change feed's history costs on disk ([`DatabaseInfo::feed`], D310).
+///
+/// ```
+/// use pigeonhole::{FeedRetention, Options, Pigeonhole};
+///
+/// # let dir = pigeonhole::doc_support::temp_dir();
+/// let db = Pigeonhole::open(
+///     dir.join("feed.phdb"),
+///     Options::default().shards(1).change_feed(FeedRetention::bytes(1)),
+/// )?;
+/// let feed = db.info()?.feed.unwrap();
+/// // Raised to two 64 MiB segments for the one shard.
+/// assert_eq!(feed.retention_bytes, 2 * (64 << 20));
+/// assert_eq!(feed.held_blob_bytes, 0);
+/// # Ok::<(), pigeonhole::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FeedInfo {
+    /// The retention in effect for the whole database: the requested
+    /// [`FeedRetention::bytes`](crate::FeedRetention::bytes), rounded up to whole WAL
+    /// segments per shard and at least two of them.
+    pub retention_bytes: u64,
+    /// WAL bytes kept as history.
+    pub retained_wal_bytes: u64,
+    /// Bytes of blob files kept only because retained history may name them: large values
+    /// already overwritten or deleted, which blob GC cannot drop yet.
+    pub held_blob_bytes: u64,
 }
 
 /// The file's feature sets ([`DatabaseInfo::features`]; FORMAT §8.2). A 1.x file sets a
@@ -247,6 +280,11 @@ impl DatabaseInfo {
             shards: d.shards,
             file_bytes: d.file_bytes,
             free_bytes: d.free_bytes,
+            feed: d.feed.map(|f| FeedInfo {
+                retention_bytes: f.retention_bytes,
+                retained_wal_bytes: f.retained_wal_bytes,
+                held_blob_bytes: f.held_blob_bytes,
+            }),
             tables: d
                 .tables
                 .into_iter()

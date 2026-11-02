@@ -511,6 +511,7 @@ D179 says deletes "work normally". With the fixed timestamp they cannot keep tim
 Consequences of seqno-scoped deletes in compaction (`gc.rs`, `decide_counter`):
 - An entry is dropped when a delete in its own stripe with a higher seqno covers it; a delete is redundant next to a wider one in its stripe with a higher seqno; bottommost purges of stripe-0 deletes below `min_ts_above` are unchanged.
 - Two operands are combined only if no other source of the slot can hold a delete with a seqno between theirs: a delete there would hide the older but not the newer. `GcPolicy::other_sources` lists the slot's non-input SSTs (with key ranges) and memtables / prepared shares (unbounded keys) that may hold a seqno at or below the newest input seqno; `None` means unknown (no combining). Sources entirely above the inputs are left out, so in practice a hot counter compacts to one entry.
+- A base and the operands above it in its stripe fold into one base, at the newest operand's key, when no delete with a seqno above the base covers the bucket (in the inputs: the base is then dropped, so nothing folds onto it) and no other source reaches `[base, newest]` (D298 §4.2, S4). The result is the fold a read does. A base the operator refuses is not folded, so the read keeps failing (#21).
 - Versions beyond `max_versions` are **never purged**: a later delete of a newer bucket, or its expiry under a TTL, must show the older one again (found by the compaction proptest; seeds kept in `counter_versions_outlive_newer_expired_buckets`). Reads apply the limit; space is bounded by the TTL. Follow-up decision: #284.
 
 So `Model::purge` is a no-op for counter families.
@@ -537,6 +538,8 @@ The engine and public harnesses keep four families per table; a new `counters` t
 **Owner:**
 - #284: versions beyond `max_versions` in a counter family are never purged. Reads apply the limit, and a TTL bounds the space. This matches Bigtable, whose version limits are also lazy cleanup rather than a read guarantee. #284 is closed.
 - #295: increments of one counter within one mutation combine (`incr(c, 1).incr(c, 2)` adds 3), as Bigtable's read-modify-write rules do. This is an exception to D34 for counter families.
+
+*History: Amended by D298 (a compaction folds a bucket's operands into its base, #488 PR 5).*
 
 <a id="d187"></a>
 ## D187 — Counter-family deletes purge at the bottom level by seqno (approved; compaction, engine, #290, #298; refines D70, D186)

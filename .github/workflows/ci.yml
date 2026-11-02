@@ -60,6 +60,14 @@ jobs:
     env:
       RUSTFLAGS: -D warnings
     steps:
+      # The workspace's debug and release targets plus the clippy and doc builds outgrew the
+      # runner's free space: two runs (#1284 and #1298, 2026-11-02) died on "No space left on
+      # device" mid-test, before any result. Toolchains this job never uses take ~25 GB.
+      - name: free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:

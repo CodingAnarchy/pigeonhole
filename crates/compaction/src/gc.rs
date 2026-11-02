@@ -19,7 +19,8 @@
 //!   versions at every read point that sees it.
 //!
 //! Consecutive kept operands of one group and stripe are combined into one operand. Operands
-//! are never folded across timestamps or onto a base (see `docs/design/questions/compaction.md`).
+//! are never folded across timestamps, nor onto a base in a standard family (D73; see
+//! `docs/design/questions/compaction.md`).
 //!
 //! A counter family (decision D179) resolves differently: every timestamp is its own version
 //! and a delete hides only entries with a lower seqno in its scope. So an entry is hidden at
@@ -39,6 +40,11 @@
 //! starts at or below its seqno: nothing outside the inputs is old enough for it to
 //! hide, and what it hides in the inputs is dropped with it. Sources the engine leaves out
 //! of `other_sources` start above the newest input seqno, so they never block it.
+//!
+//! In a counter family a compaction also folds a run of operands into the base below them
+//! when the base is in their stripe and no other source reaches from the base's seqno to the
+//! newest operand's (D298 §4.2, S4): the result is one base at the newest operand's key.
+//! D73's objections are about entries at different timestamps, and a bucket is one.
 
 use std::sync::Arc;
 
@@ -46,6 +52,7 @@ use pigeonhole_format::key::{Kind, SUFFIX_LEN, row_prefix_len, split_suffix};
 use pigeonhole_format::value::{BlobPointer, ValueTag};
 use pigeonhole_format::{BlobFileId, Cursor, Seqno, Timestamp};
 
+use crate::blob::{BlobFetch, blob_pointer};
 use crate::{MergeOperator, OtherSource};
 
 /// No stripe (no delete seen).
@@ -152,6 +159,12 @@ pub(crate) struct GcConfig {
     pub other_sources: Option<Vec<OtherSource>>,
     /// `GcPolicy::no_outside_deletes`.
     pub no_outside_deletes: bool,
+    /// Counter families: fold a run of operands into the base below them (D298 §4.2).
+    /// Compaction does; a flush's combine (#287) folds only operands.
+    pub fold_bases: bool,
+    /// Reads a separated base for that fold (`JobContext::base_blobs`). Without one, a run
+    /// above a separated base is only combined.
+    pub base_blobs: Option<Arc<dyn BlobFetch>>,
 }
 
 /// Streaming GC state over one ordered input.
@@ -168,6 +181,8 @@ pub(crate) struct Gc {
     counter: bool,
     other_sources: Option<Vec<OtherSource>>,
     no_outside_deletes: bool,
+    fold_bases: bool,
+    base_blobs: Option<Arc<dyn BlobFetch>>,
 
     row: Vec<u8>,
     /// `(ts, stripe, seqno)` of the row's family markers, newest first.
@@ -206,6 +221,8 @@ pub(crate) struct Gc {
     /// Entries read and kept (statistics).
     pub(crate) read: u64,
     pub(crate) kept: u64,
+    /// Bases folded with the operands above them (D298 §4.2; statistics).
+    pub(crate) folded: u64,
 }
 
 impl Gc {
@@ -228,6 +245,8 @@ impl Gc {
             counter: config.counter,
             other_sources: config.other_sources,
             no_outside_deletes: config.no_outside_deletes,
+            fold_bases: config.fold_bases,
+            base_blobs: config.base_blobs,
             row: Vec::new(),
             markers: Vec::new(),
             row_guard: Vec::new(),
@@ -250,6 +269,7 @@ impl Gc {
             blob_delta: Vec::new(),
             read: 0,
             kept: 0,
+            folded: 0,
         }
     }
 
@@ -653,6 +673,27 @@ impl Gc {
                 self.acc.extend_from_slice(&self.group_data[value]);
                 continue;
             }
+            // D298 §4.2: a base below a run of operands of its own stripe becomes one base,
+            // the fold a read would do, at the newest operand's key. Every read point that
+            // sees any of them sees all of them; the base is kept, so no delete in the
+            // inputs with a seqno above it covers the bucket; and the guard, widened to the
+            // base's seqno, rules one out in another source (S4).
+            if e.kind == Kind::Put
+                && let Some((stripe, newest)) = pending
+                && stripe == i
+                && self.fold_bases
+                && !self.guarded(e.seqno, newest)
+                && self.fold_onto(value.clone())
+            {
+                account_drop(&mut self.blob_delta, Kind::Put, &self.group_data[value]);
+                let n = self.acc_key.len();
+                self.acc_key[n - 1] = Kind::Put as u8;
+                out.push(&self.acc_key, &self.acc);
+                pending = None;
+                self.kept -= 1;
+                self.folded += 1;
+                continue;
+            }
             if pending.take().is_some() {
                 out.push(&self.acc_key, &self.acc);
             }
@@ -661,6 +702,34 @@ impl Gc {
         if pending.is_some() {
             out.push(&self.acc_key, &self.acc);
         }
+    }
+
+    /// Applies the combined operands in `acc` to the base at `value` (read from its blob
+    /// file if separated), leaving the result in `acc`. False, with `acc` unchanged, when
+    /// the base can't be read or the operator fails: the inputs are then kept apart (S4).
+    fn fold_onto(&mut self, value: std::ops::Range<usize>) -> bool {
+        let Some(op) = self.merge.clone() else {
+            return false;
+        };
+        let stored = &self.group_data[value];
+        let fetched;
+        let base: &[u8] = match blob_pointer(stored) {
+            None => stored,
+            Some(ptr) => match self.base_blobs.as_ref().and_then(|b| b.fetch(&ptr)) {
+                Some(v) => {
+                    fetched = v;
+                    &fetched
+                }
+                None => return false,
+            },
+        };
+        self.scratch.clear();
+        self.scratch.extend_from_slice(&self.acc);
+        if op.finish(Some(base), &mut self.scratch).is_err() {
+            return false;
+        }
+        std::mem::swap(&mut self.acc, &mut self.scratch);
+        true
     }
 }
 

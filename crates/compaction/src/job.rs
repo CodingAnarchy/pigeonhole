@@ -15,8 +15,8 @@ use pigeonhole_sst::{
 };
 
 use crate::blob::{
-    BLOB_STORED_LEN, BlobSink, blob_pointer, encode_blob_stored, note_blob_ref, record_bytes,
-    separates,
+    BLOB_STORED_LEN, BlobFetch, BlobSink, blob_pointer, encode_blob_stored, note_blob_ref,
+    record_bytes, separates,
 };
 use crate::gc::{Gc, GcConfig, OutBuf};
 use crate::{CompactionTask, KeyRange, MergeOperator, MergingCursor, Result, TaskKind};
@@ -135,6 +135,8 @@ impl StreamGc {
                 counter: family.kind.is_aggregate(),
                 other_sources: policy.other_sources.clone(),
                 no_outside_deletes: policy.no_outside_deletes,
+                fold_bases: false,
+                base_blobs: None,
             }),
             out: OutBuf::default(),
         }
@@ -189,6 +191,10 @@ pub struct JobContext {
     /// Open readers for the family's blob files (to copy live values during blob GC). A
     /// [`TaskKind::BlobGc`] job needs one for every blob file it empties.
     pub blob_files: Vec<(BlobFileId, Arc<BlobReader>)>,
+    /// Reads a separated base, so a counter family's operands fold into it (D298 §4.2). The
+    /// engine sets it for kinds whose values may be separated; without it a run of operands
+    /// above a separated base is only combined.
+    pub base_blobs: Option<Arc<dyn BlobFetch>>,
     /// GC rules.
     pub gc: GcPolicy,
     /// Target output SST size (the picker's `target_sst_bytes`; default 64 MiB). Outputs are
@@ -220,6 +226,7 @@ impl JobContext {
             sst_ids,
             blob_ids,
             blob_files: Vec::new(),
+            base_blobs: None,
             gc,
             target_sst_bytes: 64 << 20,
             clock: None,
@@ -632,6 +639,8 @@ impl CompactionJob {
             counter: context.family.kind.is_aggregate(),
             other_sources: context.gc.other_sources.clone(),
             no_outside_deletes: context.gc.no_outside_deletes,
+            fold_bases: true,
+            base_blobs: context.base_blobs.clone(),
         });
         let mut options =
             SstWriterOptions::for_family(&context.family, context.table, task.family, task.tablet);
@@ -711,6 +720,11 @@ impl CompactionJob {
     /// Entries read from the inputs so far.
     pub fn entries_read(&self) -> u64 {
         self.gc.read
+    }
+
+    /// Counter-family bases folded with the operands above them so far (D298 §4.2).
+    pub fn bases_folded(&self) -> u64 {
+        self.gc.folded
     }
 
     /// Works until `deadline_nanos` (monotonic, from the Vfs clock) or completion.

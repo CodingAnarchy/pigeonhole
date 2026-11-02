@@ -268,6 +268,7 @@ fn segment_header(segment_size: u64) -> Box<[u8; FRAME_SIZE]> {
         db_id: [3; 16],
         segment_size,
         features: 0,
+        feed_session: 0,
     };
     let mut frame = Box::new([0u8; FRAME_SIZE]);
     h.encode(&mut frame);

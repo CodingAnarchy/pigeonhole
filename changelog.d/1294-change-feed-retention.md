@@ -1,0 +1,2 @@
+### Added
+- `Options::change_feed(FeedRetention)` and `Options::feed_tables`: the change feed's history (D310, #1248, ICR 0106). The WAL keeps the configured bytes of committed history past the checkpoint, ring-recycled and never stalling a writer. Blob files stay while retained history may name them. A clean close keeps the history for the next open, and a `<db>-feed` sidecar records each session. `DatabaseInfo::feed` reports the retention and its disk cost. The subscriber API follows in later releases' PRs.

@@ -204,9 +204,9 @@ pub(crate) fn separate(
     }
     // A family whose values stay inline keeps them inline whatever the limit (D298,
     // `FamilyKind::values_stay_inline`): its built-in operator folds stored values, never blob
-    // pointers. Its inputs are small (an element, an `f64`, a one-input state); a put of a
-    // whole state (`phdb load`) larger than a WAL record can carry, as a dense bloom filter
-    // of 2^21 bits or more is, is refused as too large until #488 PR 5's separated bases.
+    // pointers, and its states are bounded well below a WAL record. A bloom filter's may be
+    // separated: reads and compactions fold onto its separated base (§4.1, §4.2), so a put
+    // of a whole dense filter of 2^21 bits or more (`phdb load`) goes to a blob file.
     let view = shared.view.load();
     let inline = |f: FamilyId| {
         view.catalog

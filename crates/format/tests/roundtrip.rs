@@ -225,21 +225,23 @@ proptest! {
     }
 
     #[test]
-    fn segment_header(n in any::<[u32; 5]>(), db_id in any::<[u8; 16]>(), frames in 2u64..=131072) {
+    fn segment_header(n in any::<[u32; 5]>(), db_id in any::<[u8; 16]>(), frames in 2u64..=131072, feed_session in any::<u64>()) {
         let h = SegmentHeader {
             version: FormatVersion::CURRENT, stream: StreamId(n[0]), epoch: n[1], prev_epoch: n[2], prev_end: n[3],
-            db_id, segment_size: frames * FRAME_SIZE as u64,
-        features: 0,
+            db_id, segment_size: frames * FRAME_SIZE as u64, features: 0, feed_session,
         };
         let mut frame = Box::new([0xEEu8; FRAME_SIZE]);
         h.encode(&mut frame);
         // (Under Miri, spot-check the zeroed tail instead of scanning 32 KiB.)
-        // Format 4's header is 128 bytes: 56..60 features, 60..124 zero, then the CRC.
-        prop_assert!(frame[60..124].iter().all(|&b| b == 0));
+        // Format 4's header is 128 bytes: 56..60 features, 60..76 zero, 76..84 the feed
+        // session (D310), 84..124 zero, then the CRC.
+        prop_assert!(frame[60..76].iter().all(|&b| b == 0));
+        prop_assert_eq!(&frame[76..84], &feed_session.to_le_bytes()[..]);
+        prop_assert!(frame[84..124].iter().all(|&b| b == 0));
         prop_assert!(frame[128..sized(FRAME_SIZE, 256)].iter().all(|&b| b == 0));
         prop_assert_eq!(SegmentHeader::decode(&frame[..]).unwrap(), h);
-        // Format 3's 60-byte layout still reads (with no features).
-        let old = SegmentHeader { version: FormatVersion(3), ..h };
+        // Format 3's 60-byte layout still reads (with no features and no feed session).
+        let old = SegmentHeader { version: FormatVersion(3), feed_session: 0, ..h };
         old.encode(&mut frame);
         prop_assert!(frame[60..128].iter().all(|&b| b == 0));
         prop_assert_eq!(SegmentHeader::decode(&frame[..]).unwrap(), old);

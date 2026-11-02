@@ -543,6 +543,18 @@ pub(crate) struct CompactionWork {
     reclaimed: bool,
 }
 
+/// Reads a separated base for a compaction's fold (D298 §4.2), through the view the work
+/// holds. A base it can't read is not folded: the run stays apart and the read that needs it
+/// reports the error.
+#[derive(Debug)]
+struct BaseBlobs(Arc<SstSet>);
+
+impl pigeonhole_compaction::BlobFetch for BaseBlobs {
+    fn fetch(&self, ptr: &pigeonhole_format::value::BlobPointer) -> Option<pigeonhole_cache::Cell> {
+        self.0.read_pointer(ptr).ok()
+    }
+}
+
 impl CompactionWork {
     /// Prepares the work: opens the input readers and builds the job (a `TrivialMove` or
     /// `Drop` needs none).
@@ -579,6 +591,11 @@ impl CompactionWork {
                 gc,
             );
             ctx.merge = meta.merge_op.clone();
+            // D298 §4.2: a run of operands folds into its base, read from its blob file
+            // when separated (only the kinds whose values may be).
+            if crate::catalog::folds_separated_bases(meta.options.kind) && view.ssts.has_blobs() {
+                ctx.base_blobs = Some(Arc::new(BaseBlobs(Arc::clone(&view.ssts))));
+            }
             if let TaskKind::BlobGc { blob_files } = &task.kind {
                 for id in blob_files {
                     let reader = view.ssts.blob_reader(*id).ok_or_else(|| {

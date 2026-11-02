@@ -89,6 +89,14 @@ pub(crate) fn builtin_kind(name: &str) -> Option<FamilyKind> {
     })
 }
 
+/// Whether a read or a compaction loads a separated base for `kind`'s built-in operator to
+/// fold (D298 §4.1, §4.2): the aggregate kinds whose values may be separated. An explicit
+/// list of its own, apart from [`FamilyKind::values_stay_inline`]: one asks whether a value
+/// may leave the SST, this whether the operator is handed the value behind a pointer.
+pub(crate) fn folds_separated_bases(kind: FamilyKind) -> bool {
+    matches!(kind, FamilyKind::Bloom)
+}
+
 /// The tags `kind`'s `kind_params` define (D298): a histogram's bounds, a quantile sketch's
 /// mantissa bits and bucket limit (`pigeonhole_format::buckets`); none for the other kinds.
 pub(crate) fn kind_param_tags(kind: FamilyKind) -> &'static [u8] {
@@ -1172,6 +1180,46 @@ mod cow_tests {
                     "seed {seed}, batch {batch}: the source changed"
                 );
                 cur = diffed;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_aggregate_kind_whose_values_may_separate_folds_separated_bases() {
+        for kind in [
+            FamilyKind::Standard,
+            FamilyKind::Counter,
+            FamilyKind::Min,
+            FamilyKind::Max,
+            FamilyKind::Hll,
+            FamilyKind::BitOr,
+            FamilyKind::BitAnd,
+            FamilyKind::BitXor,
+            FamilyKind::MinF64,
+            FamilyKind::MaxF64,
+            FamilyKind::SumF64,
+            FamilyKind::MeanVar,
+            FamilyKind::Histogram,
+            FamilyKind::Quantiles,
+            FamilyKind::Bloom,
+        ] {
+            let separates = !kind.values_stay_inline();
+            assert_eq!(
+                kind.is_aggregate() && separates,
+                folds_separated_bases(kind),
+                "{kind:?}"
+            );
+            if kind.is_aggregate() {
+                assert_eq!(
+                    aggregate_operator(kind).and_then(builtin_kind),
+                    Some(kind),
+                    "{kind:?}"
+                );
             }
         }
     }

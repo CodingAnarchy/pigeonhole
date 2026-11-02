@@ -355,9 +355,9 @@ impl FamilyKind {
 
     /// Whether the kind's values must stay inline, never separated into blob files at commit,
     /// flush or compaction (D298): a value its built-in operator folds, or a reader must see
-    /// whole. An explicit list (not "every aggregate kind"): #488 PR 5 takes `Bloom` out once
-    /// its operator folds a separated base (§4.1), and never puts `Set` in. Vectors are in it
-    /// (D303): typed values, at most 16 KiB, read in place.
+    /// whole. An explicit list (not "every aggregate kind"): `Bloom` left it in #488 PR 5,
+    /// once reads and compactions fold onto a separated base (§4.1, §4.2); `Set` never joins
+    /// it. Vectors are in it (D303): typed values, at most 16 KiB, read in place.
     ///
     /// ```
     /// use pigeonhole_format::manifest::FamilyKind;
@@ -381,7 +381,6 @@ impl FamilyKind {
                 | FamilyKind::MeanVar
                 | FamilyKind::Histogram
                 | FamilyKind::Quantiles
-                | FamilyKind::Bloom
                 | FamilyKind::Vector
         )
     }

@@ -86,6 +86,13 @@ pub struct SegmentHeader {
     /// does not know a bit refuses the segment ([`Error::UnsupportedFeature`]) rather than
     /// misread its records. No bit is defined yet.
     pub features: u32,
+    /// The change-feed session that wrote this segment (format 4, bytes 76..84; D310), or 0
+    /// for a session that fed nothing (and every segment of an older build, which writes zero
+    /// there). Covered by the header's CRC, but never checked by [`SegmentHeader::decode`]:
+    /// builds that do not know the field accept a marked segment and write zero in theirs,
+    /// which ends the feed's history (FORMAT §10.2). A header before format 4 has no room
+    /// for it and reads as 0.
+    pub feed_session: u64,
 }
 
 /// The segment features this build knows (none yet).
@@ -106,8 +113,11 @@ impl SegmentHeader {
         frame[48..52].copy_from_slice(&(FRAME_SIZE as u32).to_le_bytes());
         frame[52..56].copy_from_slice(&self.prev_end.to_le_bytes());
         if self.version >= FormatVersion(4) {
-            // 60..76: the per-database salt's slot (#176), 76..124 reserved; both zero.
+            // 60..76: the per-database salt's slot (#176), zero; 76..84 the feed session
+            // (D310); 84..124 reserved, zero.
             frame[56..60].copy_from_slice(&self.features.to_le_bytes());
+            frame[FEED_SESSION_AT..FEED_SESSION_AT + 8]
+                .copy_from_slice(&self.feed_session.to_le_bytes());
             let crc = crate::checksum::crc32c(&frame[..V4_CRC_AT]);
             frame[V4_CRC_AT..SEGMENT_HEADER_LEN].copy_from_slice(&crc.to_le_bytes());
         } else {
@@ -142,10 +152,10 @@ impl SegmentHeader {
             return Err(Error::Checksum { what: WHAT });
         }
         version.check(WHAT)?;
-        let features = if version >= FormatVersion(4) {
-            le_u32(b, 56)
+        let (features, feed_session) = if version >= FormatVersion(4) {
+            (le_u32(b, 56), le_u64(b, FEED_SESSION_AT))
         } else {
-            0
+            (0, 0)
         };
         if features & !KNOWN_SEGMENT_FEATURES != 0 {
             return Err(Error::UnsupportedFeature {
@@ -171,6 +181,7 @@ impl SegmentHeader {
             db_id: b[24..40].try_into().expect("16 bytes"),
             segment_size,
             features,
+            feed_session,
         })
     }
 }
@@ -189,6 +200,8 @@ pub struct FrameEncoder {
 pub const SEGMENT_HEADER_LEN: usize = 128;
 /// Where the CRC32C sits (over the bytes before it) in a format 4 header.
 const V4_CRC_AT: usize = 124;
+/// Where a format 4 header keeps its feed session (D310).
+const FEED_SESSION_AT: usize = 76;
 /// Where it sits in a header before format 4.
 const V3_CRC_AT: usize = 56;
 

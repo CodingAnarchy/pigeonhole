@@ -33,8 +33,25 @@ pub struct DbInfo {
     /// Bytes of the main file no extent holds, allocated or awaiting reclamation (writer
     /// only: a reader does not track allocations).
     pub free_bytes: Option<u64>,
+    /// The change feed's disk cost (D310): `None` unless this instance is a writer with the
+    /// feed on.
+    pub feed: Option<FeedStorage>,
     /// Every table, in name order.
     pub tables: Vec<TableStorage>,
+}
+
+/// What the change feed's history costs on disk ([`DbInfo::feed`], D310 §2.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct FeedStorage {
+    /// The retention in effect, for the whole database: the requested bytes rounded up to
+    /// whole WAL segments per stream, and at least two segments per stream.
+    pub retention_bytes: u64,
+    /// WAL bytes kept as history: the segments the checkpoint passed and retention keeps.
+    pub retained_wal_bytes: u64,
+    /// Blob bytes kept only for the history's horizon: files no SST points into any more
+    /// (dead data) that a retained WAL record may still name.
+    pub held_blob_bytes: u64,
 }
 
 /// One table of [`DbInfo`].
@@ -162,6 +179,11 @@ impl Engine {
             shards: shared.shards,
             file_bytes,
             free_bytes,
+            feed: shared.feed.as_ref().map(|f| FeedStorage {
+                retention_bytes: f.retention_bytes,
+                retained_wal_bytes: f.retained_bytes(),
+                held_blob_bytes: f.held_bytes(),
+            }),
             tables,
         })
     }

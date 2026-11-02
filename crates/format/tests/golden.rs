@@ -566,6 +566,52 @@ fn batch() -> BatchBuilder {
     b
 }
 
+/// The change feed's sidecar (D310, FORMAT §10.4): its header and one entry of each type.
+#[test]
+fn feed_sidecar() {
+    use pigeonhole_format::feed::{FeedEntry, FeedHeader, FeedTables, decode_entries};
+    let mut file = FeedHeader {
+        db_id: *b"0123456789abcdef",
+    }
+    .encode()
+    .to_vec();
+    let entries = [
+        FeedEntry::Session {
+            session: 0x0123_4567_89ab_cdef,
+            opened_at: 41,
+            retention_bytes: 1 << 30,
+            retention_age_secs: 3600,
+            streams: 4,
+            tables: FeedTables::Only(vec![TableId(3), TableId(9)]),
+        },
+        FeedEntry::Session {
+            session: 0xfedc_ba98_7654_3210,
+            opened_at: 44,
+            retention_bytes: 256 << 20,
+            retention_age_secs: 0,
+            streams: 1,
+            tables: FeedTables::All,
+        },
+        FeedEntry::Root {
+            session: 0x0123_4567_89ab_cdef,
+            sequence: 42,
+        },
+        FeedEntry::Unfed { sequence: 43 },
+    ];
+    for e in &entries {
+        e.encode(&mut file);
+    }
+    check("feed_sidecar.bin", &file);
+    let bytes = golden("feed_sidecar.bin");
+    assert_eq!(
+        FeedHeader::decode(&bytes).unwrap().db_id,
+        *b"0123456789abcdef"
+    );
+    let (decoded, end) = decode_entries(&bytes[FeedHeader::LEN..]);
+    assert_eq!(decoded, entries);
+    assert_eq!(FeedHeader::LEN + end, bytes.len());
+}
+
 #[test]
 fn wal() {
     let header = SegmentHeader {
@@ -577,10 +623,22 @@ fn wal() {
         db_id: *b"0123456789abcdef",
         segment_size: 64 << 20,
         features: 0,
+        feed_session: 0,
     };
     let mut frame = Box::new([0u8; FRAME_SIZE]);
     header.encode(&mut frame);
     check("wal_segment_header.bin", prefix(&frame[..], 128));
+    // The same header from a feeding session (D310): only bytes 76..84 and the CRC differ.
+    let fed = SegmentHeader {
+        feed_session: 0x0123_4567_89ab_cdef,
+        ..header
+    };
+    let mut fed_frame = Box::new([0u8; FRAME_SIZE]);
+    fed.encode(&mut fed_frame);
+    check("wal_segment_header_feed.bin", prefix(&fed_frame[..], 128));
+    assert_eq!(SegmentHeader::decode(&fed_frame[..]).unwrap(), fed);
+    assert_eq!(&fed_frame[..76], &frame[..76]);
+    assert_eq!(&fed_frame[84..124], &frame[84..124]);
 
     let b = batch();
     let mut participants = Vec::new();

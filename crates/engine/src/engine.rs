@@ -2,7 +2,7 @@
 pub(crate) mod hooks;
 mod info;
 
-pub use info::{DbInfo, FamilyStorage, LevelStorage, TableStorage};
+pub use info::{DbInfo, FamilyStorage, FeedStorage, LevelStorage, TableStorage};
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -949,6 +949,9 @@ impl Engine {
             Err(e) => return Err(e.into()),
         };
         let db_id = opened.db_id();
+        // The change feed's sequence check (D310 §2.2): the superblock's sequence before any
+        // root commit of this open.
+        let opened_at = opened.sequence();
         // The clean flag is informational only: WAL replay is never skipped (decision D57).
         let _clean = opened.clean_shutdown();
         let (mut catalog, manifest_extents) =
@@ -987,6 +990,24 @@ impl Engine {
             pager.set_grow_ahead(block, from)?;
         }
         let read_only = no_writes;
+        // The change feed (D310): the session's sidecar entry, written and synced before any
+        // WAL segment; then every root commit of this open appends its sequence.
+        let feed = if no_writes {
+            None
+        } else {
+            crate::feed::open_session(&vfs, path, db_id, &catalog, &options, shards, opened_at)?
+        };
+        if let Some(f) = &feed {
+            let weak = Arc::downgrade(f);
+            pager.on_root_commit(Box::new(move |sequence| {
+                if let Some(f) = weak.upgrade() {
+                    f.note_root(sequence);
+                }
+            }));
+        }
+        let mut wal_opts = options.wal;
+        wal_opts.retain_segments = feed.as_ref().map_or(0, |f| f.retain_segments);
+        wal_opts.feed_session = feed.as_ref().map_or(0, |f| f.session);
 
         // 3. Shared memory under a new generation, then presence (D37). On a handover the
         //    presence is already held on this handle: the region's `present(file)` is a
@@ -1081,6 +1102,7 @@ impl Engine {
                 0 => options.memtable_budget.saturating_mul(2),
                 n => n,
             },
+            feed: feed.clone(),
             ..Shared::base(
                 &vfs,
                 &shm,
@@ -1408,8 +1430,9 @@ impl Engine {
             }
             for (stream, rec) in recoveries {
                 let i = stream.0 as usize;
-                let wal = rec.into_stream(options.wal)?;
+                let wal = rec.into_stream(wal_opts)?;
                 let _ = shared.metrics[i].wal.set(wal.counters());
+                note_feed_marks(&shared, i, &wal);
                 states[i].set_wal(Box::new(wal));
                 have_wal[i] = true;
             }
@@ -1431,9 +1454,10 @@ impl Engine {
                 let i = stream.0 as usize;
                 if i < shards {
                     let end = rec.end();
-                    let mut wal = rec.into_stream(options.wal)?;
+                    let mut wal = rec.into_stream(wal_opts)?;
                     wal.checkpoint(end)?;
                     let _ = shared.metrics[i].wal.set(wal.counters());
+                    note_feed_marks(&shared, i, &wal);
                     states[i].set_wal(Box::new(wal));
                     states[i].set_recovery_state(
                         catalog.flushed.iter().map(|(k, v)| (*k, *v)).collect(),
@@ -1459,19 +1483,26 @@ impl Engine {
             .map(|i| StreamId(i as u32))
             .collect();
         for (stream, wal) in missing.iter().zip(WalStream::create_all(
-            &vfs,
-            path,
-            &missing,
-            db_id,
-            options.wal,
+            &vfs, path, &missing, db_id, wal_opts,
         )?) {
             let _ = shared.metrics[stream.0 as usize].wal.set(wal.counters());
+            note_feed_marks(&shared, stream.0 as usize, &wal);
             states[stream.0 as usize].set_wal(Box::new(wal));
         }
         for s in &mut states {
             s.finish_replay();
         }
         if !no_writes {
+            // Blob files a horizon held when the last session ended (no live bytes): held
+            // again, against this session's heads, which is later than needed but never
+            // earlier (D310).
+            if let Some(f) = &shared.feed {
+                for (id, b) in catalog.blob_files.iter() {
+                    if b.live_bytes == 0 {
+                        f.hold(*id, b.total_bytes);
+                    }
+                }
+            }
             sweep_unreferenced_blobs(&shared, &mut catalog, &states, shards)?;
         }
 
@@ -3356,6 +3387,13 @@ fn spill_recovered(
 /// manifest commit as the SSTs that point into it, so only a value separated at commit time
 /// can leave one: its commit never became durable, or was refused and its release did not
 /// run before the process ended.
+/// Registers a stream's feed marks with the change feed (D310), when it is on.
+fn note_feed_marks(shared: &Shared, stream: usize, wal: &WalStream) {
+    if let (Some(feed), Some(marks)) = (&shared.feed, wal.feed_marks()) {
+        feed.set_marks(stream, marks);
+    }
+}
+
 fn sweep_unreferenced_blobs(
     shared: &Shared,
     catalog: &mut Catalog,
@@ -3394,10 +3432,13 @@ fn sweep_unreferenced_blobs(
             }
         }
     }
+    // With the feed on, a file with no live bytes is held for the horizon (D310), not swept.
+    let held = shared.feed.is_some();
     let dropped: Vec<(BlobFileId, Vec<ExtentRef>)> = catalog
         .blob_files
         .iter()
         .filter(|(id, b)| !keep.contains(id) && !unrecorded.contains(&b.family))
+        .filter(|(_, b)| !(held && b.live_bytes == 0))
         .map(|(id, b)| (*id, b.extents.to_vec()))
         .collect();
     if dropped.is_empty() {
@@ -5622,6 +5663,7 @@ impl Shared {
             drivers: Default::default(),
             memtable_freeze_bytes: options.memtable_freeze_bytes.max(1),
             wal_pin_bytes: 0,
+            feed: None,
             submitters: std::sync::OnceLock::new(),
             wal_io: (0..shards).map(|_| std::sync::OnceLock::new()).collect(),
             shm_dir: options.shm_dir.clone(),

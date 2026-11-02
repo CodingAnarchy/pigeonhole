@@ -112,6 +112,7 @@ fn segment(features: u32) -> Box<[u8; FRAME_SIZE]> {
         db_id: [7; 16],
         segment_size: 4 * FRAME_SIZE as u64,
         features,
+        feed_session: 0,
     }
     .encode(&mut f);
     f

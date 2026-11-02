@@ -64,6 +64,7 @@ mod stream;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
@@ -72,7 +73,7 @@ use pigeonhole_io::{Completion, VfsRef};
 pub use foreground::StrictForeground;
 pub use mem::MemWal;
 pub use recovery::Recovery;
-pub use stream::{IoTracker, SparePrep, SpareSegments, WalCounters, WalStream};
+pub use stream::{FeedMarks, IoTracker, SparePrep, SpareSegments, WalCounters, WalStream};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -171,6 +172,16 @@ pub struct WalOptions {
     pub segment_size: u64,
     /// Segments kept preallocated ahead of the writer. Default 2.
     pub spare_segments: u32,
+    /// Change-feed retention (D310): how many segments the checkpoint has passed the stream
+    /// keeps as history before recycling them. 0, the default, keeps none: a slot is
+    /// recyclable once the checkpoint passes it. With retention, the ring of slots deepens
+    /// by this many and then recycles the oldest retained one, so the file stops growing.
+    /// Retention never stalls the writer: a rollover that finds no recyclable or prepared
+    /// slot takes the oldest retained one ([`WalCounters::retained_taken`]).
+    pub retain_segments: u32,
+    /// The change-feed session id written into every segment header this stream writes
+    /// (FORMAT §10.2, bytes 76..84; D310), 0 for none.
+    pub feed_session: u64,
 }
 
 impl Default for WalOptions {
@@ -178,6 +189,8 @@ impl Default for WalOptions {
         Self {
             segment_size: 64 * 1024 * 1024,
             spare_segments: 2,
+            retain_segments: 0,
+            feed_session: 0,
         }
     }
 }
@@ -284,6 +297,23 @@ pub trait Wal: Send + fmt::Debug {
     /// and `upto` never passes a COMMIT record while a participant's PREPARE for it may
     /// still need replay (decision D24). This crate checks neither.
     fn checkpoint(&mut self, upto: Lsn) -> Result<()>;
+
+    /// Drops retained history older than `max_age` (D310): `now` and `max_age` are in one
+    /// clock's microseconds, which the caller picks. A segment counts as sealed at the first
+    /// call after its rollover (or, for a segment adopted at open, the first call after the
+    /// open), so a segment is kept at least `max_age` and at most `max_age` plus the time
+    /// between calls. Run from the shard's maintenance, never the commit path. A no-op
+    /// without retention.
+    fn trim_retained(&mut self, now: u64, max_age: Option<u64>) {
+        let _ = (now, max_age);
+    }
+
+    /// The stream's change-feed marks (D310), shared: the engine reads them from any thread
+    /// for the blob GC horizon and `DatabaseInfo`. `None` for a stream without segments (the
+    /// in-memory one).
+    fn feed_marks(&self) -> Option<Arc<FeedMarks>> {
+        None
+    }
 
     /// A handle on this stream's count of submitted, unfinished I/O operations
     /// ([`IoTracker`]), for a close to wait on after the stream's threads are joined
