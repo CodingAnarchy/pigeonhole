@@ -7,18 +7,22 @@
 //! | `read_row` | One row's cells, paged at column boundaries. |
 //! | `scan` | Rows in key order: a prefix or a range, with a row limit. |
 //! | `traverse` | Breadth-first hops over an edge family (`Table::traverse`). |
+//! | `nearest` | The `k` nearest vectors to a query in a vector family (`Scan::nearest_f32`). |
 //! | `write` | Puts, increments, aggregate inputs and deletes in one atomic batch. |
 //! | `create_table` | A table and its families, if missing. |
 //!
 //! The JSON shapes of bytes and values are `phdb dump`'s. A result that would pass
 //! [`Limits::result_bytes`] stops at a column, row or node boundary with a `cursor`; a
-//! value longer than its limit comes back as `{"omitted_bytes": n}`. Nearest-neighbour
-//! search joins the list once vector families' reads are in `pigeonhole` (D303, D296).
+//! value longer than its limit comes back as `{"omitted_bytes": n}`. `nearest` is listed
+//! only when the database has a vector family; its result is cut at a neighbour, with
+//! `truncated`, since a ranking can't resume.
 
 use std::collections::HashMap;
 use std::ops::Bound;
 
-use pigeonhole::{Aggregation, CellEntry, KeySet, RowPosition, Table, Value as Cell};
+use pigeonhole::{
+    Aggregation, CellEntry, Element, KeySet, RowPosition, Table, Value as Cell, VectorSpec,
+};
 use serde_json::{Map, Value, json};
 
 use super::Limits;
@@ -26,7 +30,7 @@ use super::cursor::Cursor;
 use crate::cmd::dump::value_json;
 use crate::cmd::schema::{
     Components, JsonValue, bytes_from_json, bytes_json, element_name, family_from_json,
-    family_json, value_from_json,
+    family_json, value_from_json, vector_spec_json,
 };
 use crate::exit::Failure;
 use crate::open::{Db, Handle};
@@ -59,6 +63,8 @@ const MAX_ITEMS: usize = 10_000;
 /// 10,000,000, is the most it may ask for).
 const DEFAULT_MAX_NODES: u64 = 100_000;
 const MAX_NODES: u64 = 10_000_000;
+/// The most neighbours a `nearest` may ask for.
+const MAX_K: u64 = 1_000;
 
 type Outcome = Result<Map<String, Value>, Failure>;
 
@@ -81,9 +87,14 @@ impl Tools {
         self.db.close()
     }
 
-    /// `tools/list`: the write tools only when the database is writable.
+    /// `tools/list`: `nearest` only when the database has a vector family, and the write
+    /// tools only when it is writable. (`nearest` answers a call either way, for a vector
+    /// family created after the list.)
     pub(super) fn list(&self) -> Vec<Value> {
         let mut tools = vec![list_tables(), read_row(), scan(), traverse()];
+        if self.has_vector_family() {
+            tools.push(nearest());
+        }
         if self.writable {
             tools.extend([write(), create_table()]);
         }
@@ -98,9 +109,19 @@ impl Tools {
             "read_row" => self.read_row(a),
             "scan" => self.scan(a),
             "traverse" => self.traverse(a),
+            "nearest" => self.nearest(a),
             "write" => self.write(a),
             "create_table" => self.create_table(a),
             _ => return None,
+        })
+    }
+
+    /// Whether any table has a vector family.
+    fn has_vector_family(&self) -> bool {
+        self.db.tables().iter().any(|t| {
+            self.db
+                .families(t)
+                .is_ok_and(|fs| fs.iter().any(|f| f.vector.is_some()))
         })
     }
 
@@ -223,23 +244,7 @@ impl Tools {
         let max_value = self.max_value(&a)?;
         let limit = a.u64_or("limit", 100, 1, MAX_ROWS)?;
         let columns = a.u64_or("columns_per_row", 100, 1, MAX_ROWS)?;
-        let prefix = a.opt_bytes("prefix")?;
-        let (start, end) = (a.opt_bytes("start")?, a.opt_bytes("end")?);
-        if prefix.is_some() && (start.is_some() || end.is_some()) {
-            return Err(Failure::usage(
-                "scan takes a prefix or a start/end range, not both",
-            ));
-        }
-        let (mut lo, hi) = match prefix {
-            Some(p) => {
-                let hi = successor(&p).map_or(Bound::Unbounded, Bound::Excluded);
-                (Bound::Included(p), hi)
-            }
-            None => (
-                start.map_or(Bound::Unbounded, Bound::Included),
-                end.map_or(Bound::Unbounded, Bound::Excluded),
-            ),
-        };
+        let (mut lo, hi) = key_range(&a, "scan")?;
         match Cursor::decode(a.0).map_err(|m| Failure::usage(&m))? {
             None => {}
             Some(Cursor::Scan { key, inclusive }) => {
@@ -431,6 +436,110 @@ impl Tools {
         }));
         if let Some(c) = cut {
             out.insert("cursor".into(), c.encode(a.0).into());
+        }
+        Ok(out)
+    }
+
+    fn nearest(&self, a: Args<'_>) -> Outcome {
+        a.only(&[
+            "table",
+            "family",
+            "query",
+            "k",
+            "row",
+            "prefix",
+            "start",
+            "end",
+            "qualifier",
+            "qualifier_prefix",
+        ])?;
+        let table = a.str("table")?;
+        let family = a.str("family")?;
+        let k = a.u64_or("k", 10, 1, MAX_K)? as usize;
+        let (lo, hi) = match a.opt_bytes("row")? {
+            None => key_range(&a, "nearest")?,
+            Some(_)
+                if ["prefix", "start", "end"]
+                    .iter()
+                    .any(|n| a.get(n).is_some()) =>
+            {
+                return Err(Failure::usage(
+                    "nearest takes a row, a prefix or a start/end range, not two of them",
+                ));
+            }
+            Some(row) => (Bound::Included(row.clone()), Bound::Included(row)),
+        };
+        let qualifier = a.opt_bytes("qualifier")?;
+        let qualifier_prefix = a.opt_bytes("qualifier_prefix")?;
+        if qualifier.is_some() && qualifier_prefix.is_some() {
+            return Err(Failure::usage("qualifier or qualifier_prefix, not both"));
+        }
+        let query = a
+            .get("query")
+            .ok_or_else(|| Failure::usage("query is required"))?;
+        let read = |e: pigeonhole::Error| Failure::db(&format!("nearest {table}"), &e);
+        macro_rules! go {
+            ($t:expr) => {{
+                let spec = $t
+                    .family_info(family)
+                    .ok_or_else(|| Failure::family_not_found(table, family))?
+                    .vector
+                    .ok_or_else(|| {
+                        Failure::usage(&format!(
+                            "family: {family} is not a vector family (list_tables shows each \
+                             family's vector spec)"
+                        ))
+                    })?;
+                let query = Query::parse(query, &spec)?;
+                let mut s = $t
+                    .scan_bounds(
+                        lo.as_ref().map(Vec::as_slice),
+                        hi.as_ref().map(Vec::as_slice),
+                    )
+                    .family(family);
+                if let Some(q) = &qualifier_prefix {
+                    s = s.qualifier_prefix(q);
+                }
+                if let Some(q) = &qualifier {
+                    s = s.qualifier_bounds(Bound::Included(q), Bound::Included(q));
+                }
+                let n = match &query {
+                    Query::F32(q) => s.nearest_f32(q, k),
+                    Query::I8(q) => s.nearest_i8(q, k),
+                    Query::Bits(q) => s.nearest_bits(q, k),
+                };
+                (spec, n.run().map_err(read)?)
+            }};
+        }
+        let (spec, found) = match self.db.handle(table)? {
+            Handle::Writer(t) => go!(t),
+            Handle::Reader(t) => go!(t),
+        };
+        let mut budget = Budget::new(self.limits.result_bytes);
+        let mut neighbours = Vec::new();
+        let mut truncated = false;
+        for n in &found {
+            let v = json!({
+                "row": bytes_json(&n.row),
+                "qualifier": bytes_json(&n.qualifier),
+                "ts": n.ts,
+                "distance": n.distance,
+            });
+            if !budget.take(std::slice::from_ref(&v)) {
+                truncated = true;
+                break;
+            }
+            neighbours.push(v);
+        }
+        let mut out = object(json!({
+            "table": table,
+            "family": family,
+            "vector": vector_spec_json(&spec),
+            "neighbours": neighbours,
+        }));
+        if truncated {
+            // A ranking can't resume where it stopped: a smaller k, or a narrower selection.
+            out.insert("truncated".into(), true.into());
         }
         Ok(out)
     }
@@ -832,6 +941,134 @@ fn hop_json(h: usize, first: usize, len: usize, nodes: Vec<Value>) -> Value {
     json!({"hop": h + 1, "first_index": first, "node_count": len, "nodes": nodes})
 }
 
+/// A row key range: its lower and upper bounds.
+type KeyRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
+/// The row keys `prefix`, or `start` and `end`, select (all of them with none).
+fn key_range(a: &Args<'_>, tool: &str) -> Result<KeyRange, Failure> {
+    let prefix = a.opt_bytes("prefix")?;
+    let (start, end) = (a.opt_bytes("start")?, a.opt_bytes("end")?);
+    if prefix.is_some() && (start.is_some() || end.is_some()) {
+        return Err(Failure::usage(&format!(
+            "{tool} takes a prefix or a start/end range, not both"
+        )));
+    }
+    Ok(match prefix {
+        Some(p) => {
+            let hi = successor(&p).map_or(Bound::Unbounded, Bound::Excluded);
+            (Bound::Included(p), hi)
+        }
+        None => (
+            start.map_or(Bound::Unbounded, Bound::Included),
+            end.map_or(Bound::Unbounded, Bound::Excluded),
+        ),
+    })
+}
+
+/// A `nearest` query, in its family's element type.
+enum Query {
+    F32(Vec<f32>),
+    I8(Vec<i8>),
+    Bits(Vec<u8>),
+}
+
+impl Query {
+    /// `v` as a query for a family of `spec`: a list of numbers (`i8` families take
+    /// integers, bit families 0s and 1s), `{"base64"}` of a bit family's packed bytes, or
+    /// `write`'s `{"vector"}` shape. Its element type and dimension must be the family's.
+    fn parse(v: &Value, spec: &VectorSpec) -> Result<Self, Failure> {
+        let usage = |m: String| Failure::usage(&format!("query: {m}"));
+        let (element, dim) = (spec.element(), spec.dim() as usize);
+        let want = format!("{}[{dim}]", element_name(element));
+        let len = |n: usize| {
+            if n == dim {
+                Ok(())
+            } else {
+                Err(usage(format!(
+                    "{n} components, and the family's vectors are {want}"
+                )))
+            }
+        };
+        if v.get("vector").is_some() {
+            let JsonValue::Vector {
+                element: e,
+                dim: d,
+                components,
+            } = value_from_json(v).map_err(usage)?
+            else {
+                return Err(usage("not a vector".into()));
+            };
+            if e != element || d as usize != dim {
+                return Err(usage(format!(
+                    "a {}[{d}] vector, and the family's vectors are {want}",
+                    element_name(e)
+                )));
+            }
+            return Ok(match components {
+                Components::Floats(xs) => Query::F32(xs),
+                Components::Ints(xs) => Query::I8(xs),
+                Components::Bits(b) => Query::Bits(b),
+            });
+        }
+        if let Some(Value::String(_)) = v.get("base64") {
+            if element != Element::Bit {
+                return Err(usage(format!(
+                    "{{\"base64\"}} is a bit family's query, and the family's vectors are {want}"
+                )));
+            }
+            let b = bytes_from_json(v).map_err(usage)?;
+            if b.len() != dim.div_ceil(8) {
+                return Err(usage(format!(
+                    "{} bytes, and a bit[{dim}] query packs into {}",
+                    b.len(),
+                    dim.div_ceil(8)
+                )));
+            }
+            return Ok(Query::Bits(b));
+        }
+        let Value::Array(xs) = v else {
+            return Err(usage(format!(
+                "a list of {dim} numbers (or write's {{\"vector\"}} shape)"
+            )));
+        };
+        len(xs.len())?;
+        Ok(match element {
+            Element::I8 => Query::I8(
+                xs.iter()
+                    .map(|x| {
+                        x.as_i64()
+                            .and_then(|n| i8::try_from(n).ok())
+                            .ok_or_else(|| usage(format!("{x} is not an integer from -128 to 127")))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Element::Bit => {
+                // Packed eight to a byte, least significant first (Scan::nearest_bits).
+                let mut packed = vec![0u8; dim.div_ceil(8)];
+                for (i, x) in xs.iter().enumerate() {
+                    match x.as_u64() {
+                        Some(0) => {}
+                        Some(1) => packed[i / 8] |= 1 << (i % 8),
+                        _ => return Err(usage(format!("{x} is not a bit (0 or 1)"))),
+                    }
+                }
+                Query::Bits(packed)
+            }
+            // f32, and the halves: an f32 query, which the search compares in f32.
+            _ => Query::F32(
+                xs.iter()
+                    .map(|x| {
+                        x.as_f64()
+                            .map(|f| f as f32)
+                            .filter(|f| f.is_finite())
+                            .ok_or_else(|| usage(format!("{x} is not a finite f32")))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+        })
+    }
+}
+
 /// The least key above every key starting with `prefix`, if there is one.
 fn successor(prefix: &[u8]) -> Option<Vec<u8>> {
     let mut s = prefix.to_vec();
@@ -1137,6 +1374,48 @@ fn traverse() -> Value {
     )
 }
 
+fn nearest() -> Value {
+    tool(
+        "nearest",
+        "Find nearest vectors",
+        "Find the `k` vectors nearest to `query` in a vector family (list_tables shows each \
+         family's vector spec: dim, element and metric): an exact search, nearest first, ties \
+         by row then qualifier. Returns `neighbours`, each with its row, qualifier, ts and \
+         distance under the family's metric (smaller is nearer); read a neighbour's cells \
+         with read_row. The query is a list of `dim` numbers: integers from -128 to 127 for \
+         an i8 family, 0s and 1s for a bit family (or {\"base64\"} of its packed bytes). \
+         Narrow the search to a `row`, a `prefix` or a `start`/`end` range, and to one \
+         `qualifier` or a `qualifier_prefix`. A result marked `truncated` holds the nearest \
+         that fit: ask for a smaller k.",
+        json!({
+            "type": "object",
+            "properties": {
+                "table": {"type": "string"},
+                "family": {"type": "string", "description": "The vector family."},
+                "query": {
+                    "description": "The query vector: a list of dim numbers, or for a bit \
+                                    family {\"base64\"} of its packed bytes.",
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "number"}},
+                        {"type": "object"},
+                    ],
+                },
+                "k": {"type": "integer", "minimum": 1, "maximum": MAX_K,
+                      "description": "How many neighbours (default 10)."},
+                "row": bytes_schema("Only this row's vectors."),
+                "prefix": bytes_schema("Only rows whose key starts with this."),
+                "start": bytes_schema("The first row key (inclusive)."),
+                "end": bytes_schema("The key to stop before (exclusive)."),
+                "qualifier": bytes_schema("Only the column with this qualifier."),
+                "qualifier_prefix": bytes_schema("Only columns whose qualifier starts with this."),
+            },
+            "required": ["table", "family", "query"],
+            "additionalProperties": false,
+        }),
+        true,
+    )
+}
+
 fn write() -> Value {
     tool(
         "write",
@@ -1275,6 +1554,7 @@ mod tests {
             read_row(),
             scan(),
             traverse(),
+            nearest(),
             write(),
             create_table(),
         ] {
