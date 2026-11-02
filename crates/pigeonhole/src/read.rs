@@ -1752,8 +1752,9 @@ impl<'t> Scan<'t> {
     /// columns. If the first column doesn't fit, the page is empty and
     /// [`next_bytes`](ScanPage::next_bytes) says what it needs.
     ///
-    /// [`limit`](Scan::limit) applies too, and whichever stops the read first wins;
-    /// [`ScanPage::resume`] is `Some` whenever it stopped early. The read runs in the
+    /// [`limit`](Scan::limit) applies too, inside the read: whichever of the budget and the
+    /// limit comes first stops it, and nothing past that is read. [`ScanPage::resume`] is
+    /// `Some` whenever it stopped early. The read runs in the
     /// engine's bounded-read path (D296): sequentially it reads about the budget and one
     /// column more.
     ///

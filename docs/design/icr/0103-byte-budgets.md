@@ -34,6 +34,7 @@
   - an empty cut page resumes at its own start: the given position, or the first column's row;
   - a `limit` stop resumes after the `limit`-th row;
   - `limit(0)` reads nothing (`resume()` `None`).
+- **#1280 (follow-up):** `ByteBudget::with_rows(n)` and `BytePage::cut_by_rows` (engine-internal), so `limit` runs inside the read and bounds its work, whichever stops first (perf287's N4). `read_within` checks a position's table before `limit(0)` returns. The `scan-budget` and `scan-budget-twin` callgrind shapes are added.
 - **Not in PR 2:** `read_within_async`, and the `scan-budget` callgrind shape. The instructions job builds the base with the head's examples, so the shape lands in a follow-up PR once this API is on main.
 
 ## PR 2: the plan it followed (D308 rev 2 §4)

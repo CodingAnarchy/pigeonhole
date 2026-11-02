@@ -1005,3 +1005,39 @@ fn a_resume_from_another_table_an_unselected_family_or_an_excluded_row_is_refuse
         "{e:?}"
     );
 }
+
+#[test]
+fn a_row_limit_stops_a_budgeted_read_at_its_last_row() {
+    // #1280 (perf287's N4 on #1281): a scan's `limit` as the budget's row limit bounds the
+    // read itself, not only its result.
+    let db = setup(4918);
+    let snap = db.engine.snapshot().unwrap();
+    let cells = cells_in_ranges(&db, &snap);
+    let spec = ReduceSpec::new(ReadInput::Ranges(ranges()));
+    for n in [1usize, 3, 10] {
+        let (acc, stats) = db
+            .engine
+            .reduce_into(
+                &snap,
+                db.table,
+                &spec,
+                || Len,
+                || ByteBudget::new(u64::MAX, own_size).with_rows(n),
+            )
+            .unwrap();
+        let page = acc.into_page();
+        let mut rows: Vec<&[u8]> = page.items.iter().map(|(k, _)| k.row.as_slice()).collect();
+        rows.dedup();
+        assert_eq!(rows.len(), n, "n = {n}");
+        assert!(page.cut_by_rows && page.overflow.is_none(), "n = {n}");
+        let in_rows = cells
+            .iter()
+            .filter(|c| rows.contains(&c.0.as_slice()))
+            .count();
+        assert_eq!(page.items.len(), in_rows, "n = {n}: the rows whole");
+        assert!(
+            stats.cells <= in_rows as u64 + 1,
+            "n = {n}: read stopped at the next row's first cell: {stats:?}"
+        );
+    }
+}

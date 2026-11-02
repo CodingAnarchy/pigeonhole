@@ -252,6 +252,8 @@ struct Read {
     row_bytes: Vec<u64>,
     last: Option<CellKey>,
     overflow: Option<pigeonhole_engine::Overflow>,
+    /// The row limit stopped the read first.
+    cut_by_rows: bool,
     table: pigeonhole_engine::TableId,
 }
 
@@ -261,6 +263,7 @@ fn read(
     input: ReadInput,
     resume: InRow,
     budget: u64,
+    row_limit: Option<usize>,
 ) -> Result<Read> {
     let (info, snapshot, families) = sel.start(core)?;
     let mut spec = ReduceSpec::new(input);
@@ -269,16 +272,33 @@ fn read(
     spec.read = r;
     spec.resume = resume;
     let table = core.info.id;
-    let (acc, _) = core.with(|e| {
-        e.reduce_into(
-            &snapshot,
-            table,
-            &spec,
-            || CopyValue,
-            || ByteBudget::new(budget, size),
-        )
-    })?;
-    let page = acc.into_page();
+    // Two reducer types, so a read without a row limit runs the budget's code alone (#1284).
+    let page = match row_limit {
+        None => core
+            .with(|e| {
+                e.reduce_into(
+                    &snapshot,
+                    table,
+                    &spec,
+                    || CopyValue,
+                    || ByteBudget::new(budget, size),
+                )
+            })?
+            .0
+            .into_page(),
+        Some(n) => core
+            .with(|e| {
+                e.reduce_into(
+                    &snapshot,
+                    table,
+                    &spec,
+                    || CopyValue,
+                    || ByteBudget::new(budget, size).with_rows(n),
+                )
+            })?
+            .0
+            .into_page(),
+    };
     let last = page.items.last().map(|(k, _)| k.clone());
     let (mut rows, mut row_bytes) = (Vec::new(), Vec::new());
     let mut buf: Option<(RowBuf, u64)> = None;
@@ -314,6 +334,7 @@ fn read(
         row_bytes,
         last,
         overflow: page.overflow,
+        cut_by_rows: page.cut_by_rows,
         table,
     })
 }
@@ -395,6 +416,10 @@ pub(super) fn scan(
     after: Option<&ScanPosition>,
     budget: u64,
 ) -> Result<ScanPage> {
+    let given = after.map(|p| &p.0);
+    if let Some(p) = given {
+        p.check(core.info.id)?;
+    }
     if limit == Some(0) {
         return Ok(ScanPage {
             rows: Vec::new(),
@@ -403,44 +428,30 @@ pub(super) fn scan(
             resume: None,
         });
     }
-    let given = after.map(|p| &p.0);
-    if let Some(p) = given {
-        p.check(core.info.id)?;
-    }
     let (lo, resume) = clamp(start, given);
+    // The row limit runs in the reducer (#1280, perf287's N4 on #1281): the read stops at
+    // whichever of the budget and `limit` comes first, reading no further.
+    let row_limit = limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX));
     let r = read(
         core,
         sel,
         ReadInput::Ranges(vec![(lo, end)]),
         resume,
         budget,
+        row_limit,
     )?;
-    if let Some(n) = limit.map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-        && (r.rows.len() > n
-            || (r.rows.len() == n
-                && r.overflow.as_ref().is_some_and(|o| {
-                    r.rows
-                        .last()
-                        .is_some_and(|l| l.key() != o.key.row.as_slice())
-                })))
-    {
-        // `limit` stopped the read first: its rows, resumed after the last.
-        let mut rows = r.rows;
-        rows.truncate(n);
-        let key = rows.last().map(|l| l.key().to_vec()).unwrap_or_default();
-        return Ok(ScanPage {
-            bytes: r.row_bytes[..n].iter().sum(),
-            rows,
-            next_bytes: None,
-            resume: Some(ScanPosition(Position {
-                table: core.info.id,
-                key,
-                mark: Mark::AfterRow,
-            })),
-        });
-    }
+    let resume = if r.cut_by_rows {
+        // `limit` stopped the read first: resume after its last row.
+        r.last.as_ref().map(|l| Position {
+            table: core.info.id,
+            key: l.row.clone(),
+            mark: Mark::AfterRow,
+        })
+    } else {
+        r.resume(given)
+    };
     Ok(ScanPage {
-        resume: r.resume(given).map(ScanPosition),
+        resume: resume.map(ScanPosition),
         next_bytes: r.overflow.as_ref().map(|o| o.bytes),
         bytes: r.row_bytes.iter().sum(),
         rows: r.rows,
@@ -485,7 +496,14 @@ pub(super) fn keys(
             resume: None,
         });
     }
-    let r = read(core, sel, ReadInput::Keys(Arc::new(from)), resume, budget)?;
+    let r = read(
+        core,
+        sel,
+        ReadInput::Keys(Arc::new(from)),
+        resume,
+        budget,
+        None,
+    )?;
     Ok(KeysPage {
         resume: r.resume(given).map(KeysPosition),
         next_bytes: r.overflow.as_ref().map(|o| o.bytes),

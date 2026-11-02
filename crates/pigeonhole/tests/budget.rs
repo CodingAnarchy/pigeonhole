@@ -348,6 +348,15 @@ fn bad_positions_are_refused() {
             .read_within(1 << 20)
             .map(|_| ()),
     );
+    // limit(0) checks the position too (perf287's note on #1281).
+    invalid(
+        other
+            .scan_prefix(b"r")
+            .limit(0)
+            .resume_after(&after_row)
+            .read_within(1 << 20)
+            .map(|_| ()),
+    );
     let at_row = t.scan_prefix(b"r").read_within(1).unwrap();
     assert!(at_row.rows().is_empty());
     let at_row = at_row.resume().unwrap().clone();
