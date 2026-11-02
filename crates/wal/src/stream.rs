@@ -438,7 +438,9 @@ impl WalCounters {
 /// opts.segment_size = 2 * 32 * 1024;
 /// let wal = WalStream::create(&vfs, Path::new("/db/x.phdb"), StreamId(0), [0; 16], opts)?;
 /// let marks = wal.feed_marks().unwrap();
-/// assert_eq!((marks.head(), marks.floor(), marks.retained_bytes()), (1, 1, 0));
+/// // Without retention only `head` is kept: the floor and retained bytes are a fed
+/// // stream's (D310).
+/// assert_eq!((marks.head(), marks.floor(), marks.retained_bytes()), (1, 0, 0));
 /// # Ok(())
 /// # }
 /// ```
@@ -460,7 +462,7 @@ impl FeedMarks {
 
     /// The smallest epoch of any segment not yet recyclable (retained, or past the
     /// checkpoint): a record in a segment of a smaller epoch is gone, or may be overwritten
-    /// at any time. Never goes down.
+    /// at any time. Never goes down. Kept only with retention on (0 otherwise).
     pub fn floor(&self) -> u32 {
         self.floor.load(Ordering::Acquire)
     }
@@ -1711,6 +1713,10 @@ impl WalStream {
             .count();
         self.shared.pool().recyclable = n;
         // The feed marks (D310): the oldest segment not recyclable, and what is retained.
+        // Only a fed stream (retention on) keeps them; without the feed nothing reads them.
+        if self.retain == 0 {
+            return;
+        }
         let floor = (0..self.slots.len())
             .filter(|&i| self.slots[i] != POOLED && !self.is_recyclable(i))
             .map(|i| self.slots[i])
@@ -1740,8 +1746,20 @@ impl WalStream {
                 // Retention never stalls the writer (D310): with nothing recyclable or
                 // prepared, the oldest retained segment goes now rather than waiting for the
                 // trim. Its slot is a recycled one: a stale header of a lower epoch.
+                //
+                // Why before a blank slot or growing the file: a blank slot needs its
+                // zero-fill and a new slot an inline allocation and sync on this thread (D30's
+                // fallback, counted in `inline_grows`), either of which stalls the group.
+                // Taking a retained slot costs only history, which the feed reports as
+                // `FeedExpired` (and `retained_taken` counts); the spares preparation still
+                // deepens the ring when it catches up.
                 drop(pool);
                 self.retain_floor = self.retain_floor.max(self.slots[i] + 1);
+                // The floor mark moves before the slot is overwritten, so "epoch >= floor"
+                // never names a segment that is going (simp724's H2 on #1294).
+                self.marks
+                    .floor
+                    .fetch_max(self.slots[i] + 1, Ordering::AcqRel);
                 self.shared
                     .counters
                     .retained_taken

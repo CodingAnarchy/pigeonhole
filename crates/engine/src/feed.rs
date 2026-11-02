@@ -214,6 +214,9 @@ struct Held {
     files: Vec<HeldBlob>,
     /// A release is in the manifest queue.
     releasing: bool,
+    /// The files that release claimed (`take_releasable`): the only drops of a file at 0
+    /// live bytes the manifest writer lets through (`hold_drops`).
+    claimed: Vec<BlobFileId>,
 }
 
 /// The change feed's writer-side state, in `Shared::feed` while the feed is on.
@@ -314,30 +317,38 @@ impl Feed {
     }
 
     /// The manifest writer's interception (under its exclusion, against the catalog the
-    /// edits apply to): each drop of a blob file that still has live bytes (a compaction's,
-    /// blob GC's or a large value's release) becomes a live-0 put of the same file, and a
-    /// hold. A drop of a file already at 0 live bytes is a release of a held file and goes
-    /// through.
+    /// edits apply to): each drop of a blob file becomes a live-0 put of the same file, and
+    /// a hold, unless it is the release in flight dropping a file it claimed. That covers
+    /// a compaction's, blob GC's or a large value's release. Whether a drop is a release is
+    /// never inferred from the file having no live bytes: a later path that wrote a live-0
+    /// file and dropped it in another commit would bypass the horizon (simp724's H1).
     pub(crate) fn hold_drops(&self, catalog: &Catalog, edits: Vec<Edit>) -> Vec<Edit> {
         if !edits.iter().any(|e| matches!(e, Edit::DropBlobFile { .. })) {
             return edits;
         }
+        let claimed = {
+            let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+            held.claimed.clone()
+        };
         edits
             .into_iter()
             .map(|e| match e {
-                Edit::DropBlobFile { blob_file } => match catalog.blob_files.get(&blob_file) {
-                    Some(b) if b.live_bytes > 0 => {
-                        self.hold(blob_file, b.total_bytes);
-                        Edit::PutBlobFile {
-                            blob_file,
-                            family: b.family,
-                            extents: b.extents.to_vec(),
-                            total_bytes: b.total_bytes,
-                            live_bytes: 0,
+                Edit::DropBlobFile { blob_file } if !claimed.contains(&blob_file) => {
+                    match catalog.blob_files.get(&blob_file) {
+                        Some(b) => {
+                            self.hold(blob_file, b.total_bytes);
+                            Edit::PutBlobFile {
+                                blob_file,
+                                family: b.family,
+                                extents: b.extents.to_vec(),
+                                total_bytes: b.total_bytes,
+                                live_bytes: 0,
+                            }
                         }
+                        // Already gone from the catalog: the drop is a no-op either way.
+                        None => e,
                     }
-                    _ => e,
-                },
+                }
                 e => e,
             })
             .collect()
@@ -370,6 +381,7 @@ impl Feed {
             return None;
         }
         held.releasing = true;
+        held.claimed.clone_from(&due);
         Some(due)
     }
 
@@ -378,6 +390,7 @@ impl Feed {
     fn released(&self, ids: &[BlobFileId], ok: bool) {
         let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
         held.releasing = false;
+        held.claimed.clear();
         if ok {
             let mut freed = 0;
             held.files.retain(|h| {

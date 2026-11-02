@@ -76,7 +76,8 @@ fn without_retention_nothing_is_retained() {
     wal.spares().prepare(2).unwrap();
     run(&mut wal, 1, 40, true);
     assert_eq!(file_len(&vfs), 3 * o.segment_size);
-    assert_eq!(history(&wal), (wal.written().epoch(), 0));
+    // Without the feed the marks' floor and retained bytes aren't kept.
+    assert_eq!(history(&wal), (0, 0));
     let hs = headers(&vfs, o.segment_size);
     assert!(hs.iter().flatten().all(|h| h.feed_session == 0));
 }
