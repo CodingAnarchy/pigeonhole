@@ -1,0 +1,60 @@
+# D310 PR 2 (#1297): where the feed-off commit shapes' ~40 instructions per commit go.
+# Per function, each revision in ab-revs.txt against the first. Not for main; deleted after.
+name: scratch feed1248 ab
+on:
+  push:
+    branches: [scratch/feed1248-ab]
+permissions:
+  contents: read
+env:
+  PIGEONHOLE_IO: pread
+jobs:
+  ab:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build every revision
+        shell: bash
+        run: |
+          set -euo pipefail
+          n=0
+          while read -r rev; do
+            [ -z "$rev" ] && continue
+            git worktree add -q "/tmp/src$n" "$rev"
+            cp crates/bench/examples/*.rs "/tmp/src$n/crates/bench/examples/"
+            cp -R crates/bench/examples/support "/tmp/src$n/crates/bench/examples/"
+            (cd "/tmp/src$n" && cargo build -q --release -p pigeonhole-bench --example writepath --target-dir /tmp/target)
+            cp /tmp/target/release/examples/writepath "/tmp/wp$n"
+            echo "$n $rev" >> /tmp/revs.txt; n=$((n+1))
+          done < ab-revs.txt
+      - name: per function
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for shape in commit-one commit-async commit-sixteen; do
+            while read -r n rev; do
+              mkdir -p "/tmp/w$n-$shape"
+              env GLIBC_TUNABLES=glibc.malloc.mmap_threshold=131072:glibc.malloc.tcache_count=65535 \
+                valgrind --tool=callgrind --collect-atstart=no --callgrind-out-file="out/cg-$shape-$n.out" \
+                "/tmp/wp$n" "$shape" 4 "/tmp/w$n-$shape" </dev/null >/dev/null 2>"out/err-$shape-$n"
+              echo "$shape $n $(sed -n 's/^summary: //p' out/cg-$shape-$n.out)" | tee -a "$GITHUB_STEP_SUMMARY"
+              callgrind_annotate --auto=no --inclusive=no --threshold=100 "out/cg-$shape-$n.out" 2>/dev/null | awk '/^ *[0-9,]+ +\(/ { n=$1; gsub(",", "", n); sub(/^ *[0-9,]+ +\([^)]*\) +/, ""); sub(/ \[[^]]*\]$/, ""); gsub(/\/tmp\/src[0-9]+\//, ""); print n "\t" $0 }' > "out/f-$shape-$n.tsv"
+            done < /tmp/revs.txt
+            while read -r n rev; do
+              [ "$n" = 0 ] && continue
+              {
+                echo "=== $shape: rev $n (${rev:0:8}) vs rev 0, functions changed by more than 200"
+                awk -F'\t' 'NR==FNR { a[$2]+=$1; next } { b[$2]+=$1 } END { for (k in a) if (!(k in b)) b[k]=0; for (k in b) { d=b[k]-a[k]; if (d > 200 || d < -200) printf "%+d\t%d\t%d\t%s\n", d, a[k], b[k], k } }' "out/f-$shape-0.tsv" "out/f-$shape-$n.tsv" | sort -n || true
+              } | tee -a out/diff.txt
+            done < /tmp/revs.txt
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ab
+          path: out/
