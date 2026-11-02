@@ -70,7 +70,7 @@ or, for a project, a `.mcp.json` at its root:
 If `phdb` isn't on the client's `PATH`, give its full path as `command` (`~/.cargo/bin/phdb` after `cargo install`).
 
 ## The tools
-Eight tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md), `feed_poll` out unless the database's change feed is on (the application's, which the server inherits, or `--change-feed`), and `write` and `create_table` out when the database is read-only.
+Eight tools, each with a JSON schema and a description written for the agent. `tools/list` leaves `nearest` out when the database has no [vector family](vectors.md), `feed_poll` out unless the database's change feed is on (the application's, which the server inherits, or `--change-feed`; with `--read-only` it's always listed, since a reader can't see the writer's options), and `write` and `create_table` out when the database is read-only.
 
 | Tool | What it does |
 |---|---|
@@ -105,7 +105,7 @@ When the database's change feed is on, `feed_poll` lets an agent follow what is 
 - **Errors partway through a batch:** the commits gathered before the error come back with their token, and the next call, from that token, reports the error. Keep a token across sessions: it survives the application's restarts and the server's own reconnects.
 - **`FeedExpired`** means the history the token needs is gone: retention passed it, or an open turned the feed off since. Re-read with `scan` and start again without a token.
 - **The size cap:** a result holds whole commits only, cut between commits; the first commit always comes back whole, however large.
-- **Reader processes** (`--read-only`) can't follow the feed yet: `feed_poll` needs the server to be the writer.
+- **Beside a running application** (`--read-only`, a reader process), `feed_poll` follows the application's feed too, from its shared history. If the application restarts during a call, the call fails with `SnapshotExpired`; call again with the same token.
 
 ## An example session
 An agent keeping notes about users, as the client sends it (requests abbreviated to `tools/call`'s `name` and `arguments`):

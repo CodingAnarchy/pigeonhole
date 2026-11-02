@@ -125,8 +125,11 @@ impl Tools {
         if self.has_vector_family() {
             tools.push(nearest());
         }
-        // The feed is on when the writer's open inherited one or `--change-feed` turned it on.
-        if self.db.info().is_ok_and(|i| i.feed.is_some()) {
+        // As the writer: when its open inherited a feed or `--change-feed` turned it on. As a
+        // reader process (#1361): always, since the running writer's feed isn't in a reader's
+        // `info` and can change across the writer's restarts; a call without one fails with
+        // a hint.
+        if matches!(self.db, Db::Reader(_)) || self.db.info().is_ok_and(|i| i.feed.is_some()) {
             tools.push(feed_poll());
         }
         if self.writable {
@@ -650,19 +653,20 @@ impl Tools {
         let max_commits = a.u64_or("max_commits", 100, 1, MAX_COMMITS)? as usize;
         let wait = std::time::Duration::from_millis(a.u64_or("wait_ms", 0, 0, MAX_WAIT_MS)?);
         let max_value = self.max_value(&a)?;
-        let Db::Writer(db) = &self.db else {
-            return Err(Failure::unsupported(
-                "feed_poll: a reader process can't follow the change feed yet; serve the \
-                 database as its writer (stop the application, or wait for D310 PR 4)"
-                    .into(),
-            ));
-        };
         let fail = |e: pigeonhole::Error| {
             let f = Failure::db("feed_poll", &e);
             match e.code() {
                 pigeonhole::ErrorCode::FeedExpired => f.hint(
                     "the history this token needs is gone: re-read the tables (scan) and \
                      call feed_poll again without a token",
+                ),
+                pigeonhole::ErrorCode::SnapshotExpired => f.hint(
+                    "the application is restarting under this reader: call feed_poll again \
+                     with the same token",
+                ),
+                pigeonhole::ErrorCode::NoWriter => f.hint(
+                    "the application isn't running: call feed_poll again with the same token \
+                     once it is",
                 ),
                 pigeonhole::ErrorCode::InvalidArgument => f.hint(
                     "the database's change feed must be on (the application's, or \
@@ -672,17 +676,22 @@ impl Tools {
                 _ => f,
             }
         };
-        let mut tables = Vec::with_capacity(names.len());
+        // As the writer or as a reader process (D310 PR 4, #1361): a reader follows the
+        // writer's feed from shared memory, so `--read-only` serves it too.
+        let mut handles = Vec::with_capacity(names.len());
         for n in &names {
-            tables.push(
-                db.table(n)
-                    .and_then(|b| b.open())
-                    .map_err(|e| Failure::db(&format!("table {n}"), &e))?,
-            );
+            handles.push(self.db.handle(n)?);
         }
-        let mut b = tables[0].feed();
-        for t in &tables[1..] {
-            b = b.table(t);
+        let start = |h: &Handle| match h {
+            Handle::Writer(t) => t.feed(),
+            Handle::Reader(t) => t.feed(),
+        };
+        let mut b = start(&handles[0]);
+        for h in &handles[1..] {
+            b = match h {
+                Handle::Writer(t) => b.table(t),
+                Handle::Reader(t) => b.read_table(t),
+            };
         }
         if let Some(p) = &prefix {
             b = b.prefix(p);

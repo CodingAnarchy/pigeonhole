@@ -404,6 +404,19 @@ fn main() {
             // itself, comparable with every earlier base.
             .row_cache(0),
     );
+    // Every setup cell is written at a fixed, increasing timestamp (#1305), vectors included.
+    // Counter increments are not: they combine into one cell whatever the commit timestamp,
+    // so the counter family's SST is the same on every run already. A timestamp is part
+    // of a cell's key, so wall-clock ones gave each run differently encoded SSTs (table `t`'s
+    // flushed SST took 1,073,791 to 1,077,226 bytes for the same 100,000 entries), different
+    // block boundaries, and get-sst and the multi-gets a spread of up to 30 instructions per
+    // unit on one commit.
+    let clock = std::cell::Cell::new(1_600_000_000_000_000u64);
+    let ts = || {
+        let t = clock.get();
+        clock.set(t + 1);
+        t
+    };
     // Table `l` first, compacted while it is the only table, so table `t` below is built
     // exactly as without it.
     let l = db
@@ -416,7 +429,7 @@ fn main() {
         let key = row_key(r);
         let mut m = l.mutate(&key);
         for q in 0..CELLS {
-            m = m.put("f", format!("q{q}").as_bytes(), &[7u8; 40]);
+            m = m.put_at("f", format!("q{q}").as_bytes(), ts(), &[7u8; 40]);
         }
         m.commit().unwrap();
     }
@@ -435,12 +448,15 @@ fn main() {
             let key = row_key(r);
             let mut m = t.mutate(&key);
             for q in 0..CELLS {
-                m = m.put("f", format!("q{q}").as_bytes(), &val);
+                m = m.put_at("f", format!("q{q}").as_bytes(), ts(), &val);
             }
             m.commit().unwrap();
             // Two more versions of `q0`.
             for v in 0..2u8 {
-                t.mutate(&key).put("f", b"q0", &[v; 40]).commit().unwrap();
+                t.mutate(&key)
+                    .put_at("f", b"q0", ts(), &[v; 40])
+                    .commit()
+                    .unwrap();
             }
             if r % 10 == 0 {
                 for _ in 0..incrs {
@@ -466,11 +482,17 @@ fn main() {
             .create_if_missing()
             .unwrap();
         for r in 0..ROWS {
-            i.mutate(&row_key(r)).put("f", b"a", &val).commit().unwrap();
+            i.mutate(&row_key(r))
+                .put_at("f", b"a", ts(), &val)
+                .commit()
+                .unwrap();
         }
         db.flush().unwrap();
         for r in 0..ROWS {
-            i.mutate(&row_key(r)).put("f", b"b", &val).commit().unwrap();
+            i.mutate(&row_key(r))
+                .put_at("f", b"b", ts(), &val)
+                .commit()
+                .unwrap();
         }
         let mut it = i.scan_prefix(b"").family("f").iter().unwrap();
         while let Some(r) = it.next_ref().unwrap() {
@@ -489,7 +511,7 @@ fn main() {
             .unwrap();
         let mut m = w.mutate(b"w:hub");
         for q in 0..WIDE {
-            m = m.put("f", &q.to_be_bytes(), b"");
+            m = m.put_at("f", &q.to_be_bytes(), ts(), b"");
         }
         m.commit().unwrap();
         db.flush().unwrap();
@@ -517,8 +539,8 @@ fn main() {
         let mut vr = Rng(0x5EED_0490);
         for r in 0..KNN_ROWS {
             v.mutate(&key(b'v', r))
-                .put_vector_f32("e", b"a", &knn_vector(&mut vr))
-                .put_vector_f32("e", b"b", &knn_vector(&mut vr))
+                .put_vector_f32_at("e", b"a", ts(), &knn_vector(&mut vr))
+                .put_vector_f32_at("e", b"b", ts(), &knn_vector(&mut vr))
                 .commit()
                 .unwrap();
         }

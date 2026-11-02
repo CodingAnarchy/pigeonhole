@@ -913,8 +913,8 @@ impl Table {
 
     /// Subscribes to this table's committed changes (the change feed, D310): a `Feed` of
     /// whole commits, once each, in commit order. The database's change feed must be on, set
-    /// with `change_feed=` or inherited from the last open, and follow this table. The writer
-    /// process only, for now.
+    /// with `change_feed=` or inherited from the last open, and follow this table. A reader
+    /// process's table (`Reader.table(...)`) feeds too, from the running writer's history.
     ///
     /// `tables` adds more tables to the same feed (a commit across them arrives whole),
     /// `prefix` keeps only changes to rows under it, and `visible=True` delivers a commit as
@@ -933,12 +933,6 @@ impl Table {
         from_oldest: bool,
         resume: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<crate::feed::Feed> {
-        let Handle::Writer(t) = &self.0 else {
-            return Err(with_code(
-                pigeonhole::ErrorCode::Unsupported,
-                "a reader process can't subscribe to the change feed yet",
-            ));
-        };
         let starts = usize::from(from_snapshot.is_some())
             + usize::from(from_oldest)
             + usize::from(resume.is_some());
@@ -947,9 +941,13 @@ impl Table {
                 "one of from_snapshot, from_oldest and resume, not several",
             ));
         }
-        let mut b = t.feed();
+        // A reader process's table feeds from the writer's shared history (D310 PR 4, #1361).
+        let mut b = either!(&self.0, |t| t.feed());
         for other in tables.iter().flatten() {
-            b = b.table(other.get().writer()?);
+            b = match &other.get().0 {
+                Handle::Writer(t) => b.table(t),
+                Handle::Reader(t) => b.read_table(t),
+            };
         }
         if let Some(p) = prefix {
             b = b.prefix(&convert::bytes(p)?);

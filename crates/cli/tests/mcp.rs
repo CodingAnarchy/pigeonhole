@@ -724,12 +724,14 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     assert_eq!(status, 4, "{err}");
     assert!(err.contains("NoWriter") || err.contains("writer"), "{err}");
 
+    // The writer feeds (D310), so the reader serves feed_poll too (#1361).
     let db = Pigeonhole::open(
         &path,
         Options::default()
             .shards(1)
             .pin_threads(false)
-            .create_if_missing(true),
+            .create_if_missing(true)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
     )
     .unwrap();
     let t = db
@@ -742,8 +744,18 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     let mut s = Server::start(&path, &["--read-only"]);
     assert_eq!(
         s.tool_names(),
-        ["list_tables", "read_row", "scan", "traverse"]
+        ["list_tables", "read_row", "scan", "traverse", "feed_poll"]
     );
+    // A reader process follows the writer's feed: a first poll's token, then the writer's
+    // next commit arrives from it.
+    let first = s.call("feed_poll", json!({"tables": ["t"]}));
+    assert_eq!(first["commits"], json!([]), "{first}");
+    t.mutate(b"fed").put("f", b"q", b"x").commit().unwrap();
+    let fed = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": first["token"], "wait_ms": 5000}),
+    );
+    assert_eq!(fed["commits"][0]["changes"][0]["row"], "fed", "{fed}");
     let tables = s.call("list_tables", json!({}));
     assert_eq!(tables["mode"], "reader");
     assert_eq!(tables["writable"], false);
@@ -766,10 +778,13 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     db.close().unwrap();
 
     // Without --read-only, phdb mcp beside a running writer is a reader too, with no write
-    // tools.
+    // tools (feed_poll is listed on any reader open, #1361).
     let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
     let mut s = Server::start(&path, &[]);
-    assert_eq!(s.tool_names().len(), 4);
+    assert_eq!(
+        s.tool_names(),
+        ["list_tables", "read_row", "scan", "traverse", "feed_poll"]
+    );
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
     db.close().unwrap();
