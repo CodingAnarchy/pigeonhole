@@ -33,9 +33,11 @@ use crate::index::Rows;
 use crate::error::{Result, corrupt};
 use crate::layout::*;
 
-/// A point read's cost in posting steps (perf287's ski-rental rule on #1355): measured at
-/// 100,000 documents on a laptop, a `get_at` of a posting takes about 860 ns and a step
-/// through a posting row about 60 ns.
+/// A point read's cost in posting steps (perf287's ski-rental rule, #1368): measured at
+/// 100,000 documents on a laptop, on one hub term's posting row, a `get_at` of a posting
+/// takes about 860 ns and a step through the row about 60 ns. That's with the index in the
+/// block cache, the conservative end: a cold read costs more steps, so a real index switches
+/// to advancing a little late, never early. A wrong value costs a constant factor at most.
 const LOOKUP_IN_STEPS: u64 = 14;
 
 /// A relative slack on every bound (above), so float rounding never prunes a document that
@@ -72,7 +74,10 @@ pub(crate) struct Walk<'t> {
     cells: Box<RowCells<'t>>,
     /// The posting the walk stands on: its document and contribution.
     cur: Option<(Vec<u8>, f64)>,
-    /// The postings the row holds (its `df`), and how many the walk has stepped past.
+    /// The postings the row holds (its `df`), and how many the walk has stepped past. With
+    /// `id_prefix` the walk reads only part of the row, so `df` over-estimates what's left:
+    /// it switches to advancing a little later than it could, which costs a little and never
+    /// changes a result.
     postings: u64,
     stepped: u64,
     /// Lookups done by point reads, and whether the walk has switched to advancing.
