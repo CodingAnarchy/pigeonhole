@@ -62,3 +62,13 @@
 **Clauses, against rev 5's wording:**
 - **Each bare word of the syntax is one `Clause::Text`,** and each quoted phrase one `Clause::QuotedPhrase`. They're tokenised when the search runs, since the tokeniser belongs to the index, not to the `Query`.
 - **So `clauses()` maps one-to-one onto the input's words and phrases,** which is what `Match.clause` (PR 5) indexes. A word that tokenises into several terms (`e-mail`) is still one clause.
+
+## PR 2: phrase slop (#1290)
+No API is added: `Query::phrase_with_slop(words, u16)`, the `Clause` slop fields and the `"..."~N` syntax shipped in PR 1. What changes is what a search does with them.
+- **A phrase with slop above 0** is matched with Lucene's sloppy-phrase semantics (D309 rev 6 §B), not refused.
+  - **What a match is:** one position per phrase word, spanning at most `slop` once each word's offset in the phrase is taken off.
+  - **The frequency:** the sum of `1 / (distance + 1)` over the matches.
+  - **Repeated words:** a word repeated in the phrase never takes one position twice.
+- **Slop 0** is the exact phrase, scored as in PR 1.
+- **Docs:** `phrase_with_slop` documents the rule, the scoring and the cost.
+
