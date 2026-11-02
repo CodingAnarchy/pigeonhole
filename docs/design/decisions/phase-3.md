@@ -3767,6 +3767,54 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   3. The follow-ups (#1284, in progress): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
 - **Deferred:** `read_within_async` (#1286, Post-1.0).
 
+<a id="d309"></a>
+## D309 — Full-text search in `pigeonhole-text`: BM25 over posting rows, written through the index in the caller's transaction (ai1249, 2026-11-02; owner accepted revision 5 and revision 6's calls, #1247 c6565988061 and c6566486752; reviewed by simp724 and cli692; text, #1247, ICR 0105)
+**Why.** Agents and applications need ranked keyword search over text they already store (#1247), and the agent-memory proposal (D311, #1251) needs it for hybrid recall. An index of ordinary rows and transactions is as durable and consistent as the database, and needs nothing new in the engine.
+
+**Decided.**
+- **A companion crate, `pigeonhole-text`,** on the public 1.x line (D295), depending on `pigeonhole` only. Its dependencies are `unicode-segmentation` and `unicode-normalization`, plus `levenshtein_automata` for fuzzy terms.
+- **Layout:** one table per index.
+  - `P{term}`: `post` (one column per document, its frequency and length), `pos` (positions, an option fixed at create, on by default), `df` (a counter), and `maxtf`/`minlen` (blind max/min aggregates, for MaxScore's bound).
+  - `F{doc}`: the document's terms, its length and a presence marker.
+  - `S`: the document count and corpus length (counters).
+  - `G`: the layout, options, source column, tokeniser name and fingerprint, and the repair flag.
+- **Writes** go through `put_in`/`delete_in` in the caller's transaction, which read `F{doc}`, the source cell and the repair flag. Every statistic is a blind counter, so only writes of one document conflict.
+  - **An identical put writes nothing:** the same text, with `F{doc}` present.
+  - **`rebuild`** diffs each document against its posting and position cells. **`repair`** rebuilds from an emptied table behind a flag that makes writes and searches `Busy`.
+  - **`verify`** checks the rows against each other and the source column.
+  - **The bypass contract:** every write to the source column goes through the index. A stale hit is skipped and counted.
+- **Search:** a disjunction of terms, text, exact phrases (Lucene's PhraseQuery scoring), sloppy phrases (Lucene's matcher and sloppy frequency) and fuzzy terms (Damerau–Levenshtein, at most 2 edits), scored by BM25 with Lucene's idf, at one snapshot.
+  - **Evaluators:** exact term-at-a-time, then MaxScore (bound `min maxtf` for an exact phrase, `Σ maxtf` for a sloppy one).
+  - **Highlighting** is recomputed by re-tokenising the source text.
+- **Normalisation:** NFC by default (NFKC as an option), per token after any tokeniser, fixed at create. Builder terms are normalised but never tokenised.
+- **The fingerprint:** the built-in tokeniser's fingerprint carries its word-boundary Unicode version.
+- **PRs:**
+  1. The crate, with positions, exact phrases and normalisation.
+  2. Slop.
+  3. MaxScore, `id_prefix` and `ReadIndex`, with the guide page. Its AX102 bench includes a write-cost row with positions on and off, rechecked before 1.1.0 (owner, 2026-11-02: positions stay on by default).
+  4. Fuzzy terms.
+  5. Highlighting.
+
+**PR 1 (#1247).**
+- **What's in it:** `Index` (`create`, `create_with_tokenizer`, `open`, `open_with_tokenizer`, `put_in`, `delete_in`, `put`, `delete`, `search`, `rebuild`, `repair`, `verify`), `Query` and the syntax, `Tokenizer`/`Token`, `IndexOptions` with `Normalization`, and the exact evaluator for terms and phrases.
+- **Refused until their PRs:** fuzzy terms and a slop above 0 parse, then are refused with `InvalidArgument`.
+- **Tests:**
+  - against a brute-force BM25 and phrase matcher over the source texts (3 seeds × 300 operations);
+  - snapshots and reopening;
+  - the no-ops;
+  - a stale hit after a bypassed delete, skipped and counted;
+  - a bypass followed by the same text, stale until `repair`;
+  - a backfill at create, after which `rebuild` changes nothing;
+  - eight writers on one document and on shared hub terms, and a delete and a rebuild racing a put, each ending in `verify`;
+  - `Busy` during a repair;
+  - phrases refused without positions;
+  - `max_terms` refusing a document before anything is written;
+  - stop words keeping their positions;
+  - normalisation (NFC, NFKC and none, plus builder terms);
+  - the tokeniser checks at open;
+  - the parser's refusals.
+- **The positions measurement** (`crates/text/examples/size.rs`, 20,000 Zipf documents of about 40 words, stored bytes after a compaction, on a Mac): positions add 42% (29.1 to 41.4 MB) and make a `Buffered` write about 2.5× as long (161 to 400 µs). The owner kept them on by default, and the option's docs say to turn them off for write-heavy indexes without phrases.
+
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
 **Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.
