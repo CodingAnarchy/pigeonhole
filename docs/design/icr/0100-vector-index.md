@@ -60,6 +60,14 @@
   - the probed lists are read with `Nearest::run_async` (D296 PR 5), which yields within a wide list.
 - **It never fans out:** `parallel` is ignored, as for `Nearest::run_async`.
 
+## `Index::open_reader` and `ReadIndex` (#1268 item 5)
+- **`Index::open_reader(&PigeonholeReader, name) -> Result<ReadIndex>`:** the index opened from a reader process, with `open`'s checks (`InvalidArgument` for a table that isn't a vector index).
+- **`ReadIndex`** (`Clone`, `Debug`): `spec()`, `options()`, and `search_f32`/`search_i8`/`search_bits` returning the same `Search`. So `nprobe`, `snapshot`, `parallel`, `run` and `run_async` all work. It has no write method.
+  - **The centroids load with reads only,** at the reader's snapshot. The handle keeps its own cache and reloads it when a search sees `G:layout` change, as `Index` does.
+  - **The results equal the writer's `Index` at the same snapshot.**
+  - **If the writer restarts,** a search fails with `SnapshotExpired` (`Error::Db`) until the reader reattaches; searching again is enough.
+- **Internal:** the centroid load and the layout check are shared through a crate-private `Rows` trait over `Table` and `ReadTable`, and `Search` reads either kind of index.
+
 ## The table (internal, not promised)
 The table holds:
 - the families `vec` (the index's spec), `cen` (an `f32` vector family of the same dimension and metric, or the index's own spec for bits; D306 rev 2 S1), `meta`, `map` and `cnt` (a counter);
