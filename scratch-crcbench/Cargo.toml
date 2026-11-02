@@ -1,0 +1,15 @@
+[package]
+name = "crcbench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+crc32c = "0.6.8"
+crc-fast = { version = "1.10", default-features = false, features = ["std"] }
+crc = "3.4"
+
+[profile.release]
+debug = "line-tables-only"
+
+[workspace]

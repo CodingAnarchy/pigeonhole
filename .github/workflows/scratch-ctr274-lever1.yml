@@ -1,0 +1,32 @@
+# #1206 lever 4: CRC32C candidates' x86 instructions per call (callgrind). Scratch, not for main.
+name: scratch ctr274 lever1 profile
+on:
+  push:
+    branches: [scratch/ctr274-lever1]
+permissions:
+  contents: read
+jobs:
+  crc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update -q && sudo apt-get install -y -q valgrind
+      - name: build
+        run: cd scratch-crcbench && cargo build -q --release
+      - name: count
+        shell: bash
+        run: |
+          set -euo pipefail
+          b=scratch-crcbench/target/release/crcbench
+          { echo "| crate | 16 B | 64 B | 160 B | 256 B | 1 KiB | 4 KiB |"; echo "|---|--:|--:|--:|--:|--:|--:|"; } >> "$GITHUB_STEP_SUMMARY"
+          for w in crc32c crcfast crc16t hand; do
+            row="| $w |"
+            for n in 16 64 160 256 1024 4096; do
+              valgrind --tool=callgrind --callgrind-out-file=/tmp/cg.out --toggle-collect="*b_${w}*" $b $w $n >/dev/null 2>/dev/null
+              ir=$(sed -n 's/^summary: \([0-9]*\).*/\1/p' /tmp/cg.out)
+              row="$row $((ir / 10000)) |"
+            done
+            echo "$row" | tee -a "$GITHUB_STEP_SUMMARY"
+          done
