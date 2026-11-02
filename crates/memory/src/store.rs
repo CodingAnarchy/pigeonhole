@@ -4,9 +4,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pigeonhole::{
-    Aggregation, Element, Family, Metric, Pigeonhole, RetryPolicy, Table, Transaction, VectorSpec,
+    Aggregation, Element, Family, Metric, Pigeonhole, PigeonholeReader, ReadTable, RetryPolicy,
+    Table, Transaction, VectorSpec,
 };
-use pigeonhole_text::{Index, IndexOptions};
+use pigeonhole_text::{Index, IndexOptions, ReadIndex};
+
+use crate::recall::{Idx, Recall, Rows, Snap};
 
 use crate::error::{Error, Result, corrupt};
 use crate::layout::*;
@@ -55,7 +58,7 @@ impl EmbeddingModel {
         self.element
     }
 
-    fn spec(&self) -> VectorSpec {
+    pub(crate) fn spec(&self) -> VectorSpec {
         VectorSpec::new(self.dim, self.element, Metric::Cosine).expect("checked at new")
     }
 }
@@ -419,20 +422,7 @@ impl Store {
     /// store has none (use [`open_without_embeddings`](Self::open_without_embeddings)).
     pub fn open(db: &Pigeonhole, name: &str, model_id: &str) -> Result<Store> {
         let mut s = Self::open_inner(db, name)?;
-        match &s.model {
-            Some(m) if m.id == model_id => {}
-            Some(m) => {
-                return Err(Error::Mismatch(format!(
-                    "the store {name} is pinned to {:?}, not {model_id:?}",
-                    m.id
-                )));
-            }
-            None => {
-                return Err(Error::InvalidArgument(format!(
-                    "the store {name} has no embedding model: open it with open_without_embeddings"
-                )));
-            }
-        }
+        check_model(&s.model, name, model_id)?;
         s.embeds = true;
         Ok(s)
     }
@@ -449,41 +439,7 @@ impl Store {
 
     fn open_inner(db: &Pigeonhole, name: &str) -> Result<Store> {
         let table = db.table(&table_name(name))?.open()?;
-        let not_store =
-            || Error::InvalidArgument(format!("{} is not a memory store", table.name()));
-        for f in [CONTENT, META, SOURCES, STATS, PEAK, LINKS, BACKLINKS] {
-            if table.family_info(f).is_none() {
-                return Err(not_store());
-            }
-        }
-        let g = |q: &[u8]| -> Result<Option<Vec<u8>>> {
-            Ok(table.get(GLOBAL, META, q)?.map(|c| c.value().to_vec()))
-        };
-        let layout = table
-            .get(GLOBAL, META, LAYOUT)?
-            .and_then(|c| c.as_u64())
-            .ok_or_else(not_store)?;
-        if layout != LAYOUT_VERSION {
-            return Err(Error::InvalidArgument(format!(
-                "{} has store layout {layout}, and this build reads {LAYOUT_VERSION}",
-                table.name()
-            )));
-        }
-        let model = match g(MODEL_ID)? {
-            None => None,
-            Some(id) => {
-                let id = String::from_utf8(id).map_err(|_| corrupt("the model id"))?;
-                let dim = table
-                    .get(GLOBAL, META, MODEL_DIM)?
-                    .and_then(|c| c.as_u64())
-                    .ok_or_else(|| corrupt("the model's dimension"))?;
-                let element = g(MODEL_ELEMENT)?
-                    .and_then(|e| e.first().copied())
-                    .and_then(element_from_code)
-                    .ok_or_else(|| corrupt("the model's element"))?;
-                Some(EmbeddingModel::new(id, dim as u32, element)?)
-            }
-        };
+        let model = load(Rows::W(&table))?;
         let index = Index::open(db, &index_name(name))?;
         Ok(Store {
             db: db.clone(),
@@ -492,6 +448,21 @@ impl Store {
             model,
             embeds: false,
         })
+    }
+
+    /// Recalls memories from `namespaces` (D311 §3): each an exact namespace, as written
+    /// (no prefixes or patterns), fused together into one ranking. At least one is needed:
+    /// an empty list fails `run` with `InvalidArgument`. Set `text`, an `embedding`, or both,
+    /// then [`run`](Recall::run). On a handle opened without the store's model, recall is
+    /// by keyword and recency only.
+    pub fn recall(&self, namespaces: &[&str]) -> Recall<'_> {
+        Recall::new(
+            Rows::W(&self.table),
+            Idx::W(&self.index),
+            self.model.as_ref().filter(|_| self.embeds),
+            Snap::W(&self.db),
+            namespaces,
+        )
     }
 
     /// The model the store is pinned to, if any.
@@ -853,98 +824,232 @@ impl Store {
     /// every memory row has content, every dedup row names a live memory with that text,
     /// every link has its backlink with both ends live, and the text index agrees.
     pub fn verify(&self) -> Result<StoreStats> {
-        let t = &self.table;
         let s = self.db.snapshot()?;
-        let mut st = StoreStats::default();
-        // key → normalised text, for live memories.
-        let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
-        let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-        let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-        let mut dedups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut superseded_by: Vec<Vec<u8>> = Vec::new();
-        for row in t.scan_prefix(b"").snapshot(&s).iter()? {
-            let row = row?;
-            let key = row.key().to_vec();
-            if key == GLOBAL {
-                continue;
-            }
-            if MemoryId::from_row(&key).is_some() {
-                st.memories += 1;
-                let mut has_text = false;
-                let mut has_emb = false;
-                for e in row.view().iter() {
-                    match e.family {
-                        CONTENT if e.qualifier == TEXT => {
-                            has_text = true;
-                            let text = std::str::from_utf8(e.cell.value())
-                                .map_err(|_| corrupt("a memory's text"))?;
-                            texts.insert(key.clone(), normalize(text));
-                        }
-                        EMB => has_emb = true,
-                        META if e.qualifier == SUPERSEDED_BY => {
-                            superseded_by.push(e.cell.value().to_vec());
-                        }
-                        LINKS => {
-                            links.insert((
-                                key.clone(),
-                                e.qualifier.to_vec(),
-                                e.cell.value().to_vec(),
-                            ));
-                        }
-                        BACKLINKS => {
-                            backlinks.insert((
-                                e.qualifier.to_vec(),
-                                key.clone(),
-                                e.cell.value().to_vec(),
-                            ));
-                        }
-                        _ => {}
+        let text_ok = self.index.verify()?.is_consistent();
+        verify(Rows::W(&self.table), &s, self.model.as_ref(), text_ok)
+    }
+}
+
+/// A memory store opened from a reader process (D311 §5): recall, `get` and `verify` at
+/// the reader's snapshots, and no writes.
+pub struct ReadStore {
+    reader: PigeonholeReader,
+    table: ReadTable,
+    index: ReadIndex,
+    model: Option<EmbeddingModel>,
+    embeds: bool,
+}
+
+impl std::fmt::Debug for ReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadStore")
+            .field("table", &self.table.name())
+            .field("model", &self.model)
+            .field("embeds", &self.embeds)
+            .finish()
+    }
+}
+
+impl Store {
+    /// Opens the store `name` from a reader process, for a caller embedding with
+    /// `model_id` (as [`open`](Store::open) checks it).
+    pub fn open_reader(reader: &PigeonholeReader, name: &str, model_id: &str) -> Result<ReadStore> {
+        let mut s = Self::open_reader_inner(reader, name)?;
+        check_model(&s.model, name, model_id)?;
+        s.embeds = true;
+        Ok(s)
+    }
+
+    /// Opens the store `name` from a reader process without an embedding model: recall is
+    /// by keyword and recency.
+    pub fn open_reader_without_embeddings(
+        reader: &PigeonholeReader,
+        name: &str,
+    ) -> Result<ReadStore> {
+        let mut s = Self::open_reader_inner(reader, name)?;
+        s.embeds = s.model.is_none();
+        Ok(s)
+    }
+
+    fn open_reader_inner(reader: &PigeonholeReader, name: &str) -> Result<ReadStore> {
+        let table = reader.table(&table_name(name))?;
+        let model = load(Rows::R(&table))?;
+        let index = Index::open_reader(reader, &index_name(name))?;
+        Ok(ReadStore {
+            reader: reader.clone(),
+            table,
+            index,
+            model,
+            embeds: false,
+        })
+    }
+}
+
+impl ReadStore {
+    /// The model the store is pinned to, if any.
+    pub fn embedding_model(&self) -> Option<&EmbeddingModel> {
+        self.model.as_ref()
+    }
+
+    /// Recalls memories, as [`Store::recall`] does, at the reader's snapshots. A search
+    /// while the writer's text index is being repaired fails with `Busy`.
+    pub fn recall(&self, namespaces: &[&str]) -> Recall<'_> {
+        Recall::new(
+            Rows::R(&self.table),
+            Idx::R(&self.index),
+            self.model.as_ref().filter(|_| self.embeds),
+            Snap::R(&self.reader),
+            namespaces,
+        )
+    }
+
+    /// The memory `id`, or `None` if it doesn't exist.
+    pub fn get(&self, id: &MemoryId) -> Result<Option<StoredMemory>> {
+        let Some(row) = self.table.row(&id.row()).read()? else {
+            return Ok(None);
+        };
+        read_memory(id.clone(), &row.to_owned())
+    }
+
+    /// [`Store::verify`], at the reader's snapshot.
+    pub fn verify(&self) -> Result<StoreStats> {
+        let s = self.reader.snapshot()?;
+        let text_ok = self.index.verify()?.is_consistent();
+        verify(Rows::R(&self.table), &s, self.model.as_ref(), text_ok)
+    }
+}
+
+/// `open`'s model check.
+fn check_model(model: &Option<EmbeddingModel>, name: &str, model_id: &str) -> Result<()> {
+    match model {
+        Some(m) if m.id == model_id => Ok(()),
+        Some(m) => Err(Error::Mismatch(format!(
+            "the store {name} is pinned to {:?}, not {model_id:?}",
+            m.id
+        ))),
+        None => Err(Error::InvalidArgument(format!(
+            "the store {name} has no embedding model: open it without embeddings"
+        ))),
+    }
+}
+
+/// The store's families and `G` row, checked; its pinned model.
+fn load(rows: Rows<'_>) -> Result<Option<EmbeddingModel>> {
+    let not_store = || Error::InvalidArgument(format!("{} is not a memory store", rows.name()));
+    for f in [CONTENT, META, SOURCES, STATS, PEAK, LINKS, BACKLINKS] {
+        if !rows.has_family(f) {
+            return Err(not_store());
+        }
+    }
+    let layout = rows.global_u64(LAYOUT)?.ok_or_else(not_store)?;
+    if layout != LAYOUT_VERSION {
+        return Err(Error::InvalidArgument(format!(
+            "{} has store layout {layout}, and this build reads {LAYOUT_VERSION}",
+            rows.name()
+        )));
+    }
+    Ok(match rows.global(MODEL_ID)? {
+        None => None,
+        Some(id) => {
+            let id = String::from_utf8(id).map_err(|_| corrupt("the model id"))?;
+            let dim = rows
+                .global_u64(MODEL_DIM)?
+                .ok_or_else(|| corrupt("the model's dimension"))?;
+            let element = rows
+                .global(MODEL_ELEMENT)?
+                .and_then(|e| e.first().copied())
+                .and_then(element_from_code)
+                .ok_or_else(|| corrupt("the model's element"))?;
+            Some(EmbeddingModel::new(id, dim as u32, element)?)
+        }
+    })
+}
+
+/// [`Store::verify`]'s checks, over either kind of table.
+fn verify(
+    rows: Rows<'_>,
+    s: &pigeonhole::Snapshot,
+    model: Option<&EmbeddingModel>,
+    text_ok: bool,
+) -> Result<StoreStats> {
+    let mut st = StoreStats::default();
+    let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
+    let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
+    let mut dedups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut superseded_by: Vec<Vec<u8>> = Vec::new();
+    rows.scan_all(s, |key, row| {
+        if key == GLOBAL {
+            return Ok(());
+        }
+        if MemoryId::from_row(key).is_some() {
+            st.memories += 1;
+            let mut has_text = false;
+            let mut has_emb = false;
+            for e in row.iter() {
+                match e.family {
+                    CONTENT if e.qualifier == TEXT => {
+                        has_text = true;
+                        let text = std::str::from_utf8(e.cell.value())
+                            .map_err(|_| corrupt("a memory's text"))?;
+                        texts.insert(key.to_vec(), normalize(text));
                     }
+                    EMB => has_emb = true,
+                    META if e.qualifier == SUPERSEDED_BY => {
+                        superseded_by.push(e.cell.value().to_vec());
+                    }
+                    LINKS => {
+                        links.insert((key.to_vec(), e.qualifier.to_vec(), e.cell.value().to_vec()));
+                    }
+                    BACKLINKS => {
+                        backlinks.insert((
+                            e.qualifier.to_vec(),
+                            key.to_vec(),
+                            e.cell.value().to_vec(),
+                        ));
+                    }
+                    _ => {}
                 }
-                if !has_text {
-                    st.no_content += 1;
-                }
-                if self.model.is_some() && !has_emb {
-                    st.missing_embeddings += 1;
-                }
-            } else if let Some(c) = row.view().get(META, RID) {
-                dedups.push((key, c.value().to_vec()));
-            } else {
-                return Err(corrupt("a row that is neither a memory nor a dedup row"));
             }
+            if !has_text {
+                st.no_content += 1;
+            }
+            if model.is_some() && !has_emb {
+                st.missing_embeddings += 1;
+            }
+        } else if let Some(c) = row.get(META, RID) {
+            dedups.push((key.to_vec(), c.value().to_vec()));
+        } else {
+            return Err(corrupt("a row that is neither a memory nor a dedup row"));
         }
-        for (key, target) in &dedups {
-            let ok = texts.get(target).is_some_and(|norm| {
-                let ns_len = key.windows(2).position(|w| w == DEDUP_TAG);
-                ns_len.is_some_and(|at| {
-                    dedup_row(
-                        std::str::from_utf8(&key[..at]).unwrap_or(""),
-                        &content_hash(norm),
-                    ) == *key
+        Ok(())
+    })?;
+    for (key, target) in &dedups {
+        let ok = texts.get(target).is_some_and(|norm| {
+            key.windows(2)
+                .position(|w| w == DEDUP_TAG)
+                .is_some_and(|at| {
+                    std::str::from_utf8(&key[..at])
+                        .is_ok_and(|ns| dedup_row(ns, &content_hash(norm)) == *key)
                 })
-            });
-            if !ok {
-                st.stale_dedup += 1;
-            }
+        });
+        if !ok {
+            st.stale_dedup += 1;
         }
-        // Each link (from, to, value) must have the backlink (from, to, value), and the
-        // reverse; both ends live.
-        for l in links.symmetric_difference(&backlinks) {
-            let _ = l;
+    }
+    // Each link must have its backlink, and the reverse; both ends live.
+    st.broken_links += links.symmetric_difference(&backlinks).count() as u64;
+    for (from, to, _) in &links {
+        if !texts.contains_key(from) || !texts.contains_key(to) {
             st.broken_links += 1;
         }
-        for (from, to, _) in &links {
-            if !texts.contains_key(from) || !texts.contains_key(to) {
-                st.broken_links += 1;
-            }
-        }
-        st.dangling_superseded = superseded_by
-            .iter()
-            .filter(|s| !texts.contains_key(*s))
-            .count() as u64;
-        st.text_index_inconsistent = !self.index.verify()?.is_consistent();
-        Ok(st)
     }
+    st.dangling_superseded = superseded_by
+        .iter()
+        .filter(|s| !texts.contains_key(*s))
+        .count() as u64;
+    st.text_index_inconsistent = !text_ok;
+    Ok(st)
 }
 
 fn write_link(txn: &mut Transaction, t: &Table, from: &[u8], to: &[u8], ty: LinkType, w: f32) {

@@ -4159,3 +4159,19 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - namespaces;
   - a write given up in the caller's transaction leaves nothing;
   - S3's races (a merge or a link racing a delete of its target conflicts; `mark_used` after a delete), each ending in `verify`.
+
+**T1, second PR (#1335).** Recall and `ReadStore`, as revision 2 §3.
+- **One addition:** ranks are competition ranks, so equal values share a rank. A tie-break by id would have given the newest memory an edge whenever importances were equal, as they are by default. The guide's example found it.
+- **Determinism:** `.now_us(us)` fixes the time ages are measured from, so a call with an explicit snapshot is deterministic.
+- **From the reviews on #1374:**
+  - **simp724's N1 (the coordinator: fix, don't document):** each signal reads further down its list until `n` memories pass the filters or its namespace is exhausted.
+  - **simp724's N2:** D308's at-least-one rule, with `truncated` set.
+  - **cli692:** `now_us`, `uses`, and `RecallHit::superseded_by`, plus the doc points.
+- **Tests:**
+  - each signal against an independent computation (similarity within 1e-5);
+  - each rank against the values;
+  - each fused score against RRF's formula, and the order;
+  - the candidate set against each signal's own top `n`;
+  - the byte budget, the filters, the linear blend, several namespaces, the refusals, and a reader process recalling exactly what the writer does.
+  - Mutations of `id_prefix`, 0-based ranks and the superseded filter were all caught.
+

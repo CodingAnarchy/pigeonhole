@@ -13,16 +13,27 @@
 //!   model it embeds with, and another model's vectors are refused.
 //! - **[`Store::verify`]** checks the store against itself and its text index.
 //!
-//! Recall (vector, keyword and recency, fused by RRF within a byte budget) and reader
-//! processes come in T1's second PR.
+//! - **Recall** ([`Store::recall`]) fuses vector, keyword and recency candidates by RRF
+//!   (or a linear blend) within a byte budget, at one snapshot, and works in reader
+//!   processes ([`Store::open_reader`], [`ReadStore`]).
 
 mod error;
 mod layout;
+mod recall;
 mod store;
 
 pub use error::{Error, Result};
 pub use layout::{MemoryId, normalize};
+pub use recall::{Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
 pub use store::{
-    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, Remembered, Source, Store, StoreOptions,
-    StoreStats, StoredMemory,
+    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, ReadStore, Remembered, Source, Store,
+    StoreOptions, StoreStats, StoredMemory,
 };
+
+#[cfg(doctest)]
+mod guide {
+    #[doc = include_str!("../../../docs/guide/agent-memory.md")]
+    struct AgentMemory;
+    #[doc = include_str!("../README.md")]
+    struct CrateReadme;
+}
