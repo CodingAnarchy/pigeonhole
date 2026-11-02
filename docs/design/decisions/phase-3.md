@@ -3624,6 +3624,21 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
     - Runs count traversals that reach a second hop (14–46 of about 200 per seed locally), and the test fails if 200 or more traversals never do.
 
 
+<a id="d305"></a>
+## D305 — WITHDRAWN: a pinned shard driver's io_uring workers run off the drivers' CPUs (coordinator decision, 2026-10-31; io, runtime; #1206 lever 3, #1234; would have amended D235; withdrawn 2026-10-31 before it landed)
+**Status: withdrawn.** #1234 was closed unmerged. D235 is unchanged: io_uring's workers (io-wq) stay wherever the kernel places them.
+
+**What it proposed.**
+- **The problem:** on Linux with io_uring, io-wq is per task, so a pinned driver's workers ran on the driver's own CPU and preempted it.
+- **The traced cost:** on sparse-wide, 357–390 preemptions over 100 µs per run (about 0.3 s), and every slow `SyncBarrier` submit.
+- **The proposal:** register the opener's affinity set (the one D235's pin plan is drawn from), less the drivers' CPUs, with `IORING_REGISTER_IOWQ_AFF` when the driver's ring is made. That was best effort, for pinned engine-owned drivers only.
+
+**Why it was withdrawn** (ctr274's rerun on #1206):
+- **What it fixed:** moving io-wq off the driver CPUs halved, or better, sparse-wide's `Buffered` put p99.9.
+- **What it cost:** every `Default` commit, with ycsb-a's put p99 1.26–1.40× and throughput 0.86–0.89×. At `Default`, the group fsync's worker running on the driver's own parked CPU is a benefit, not a cost.
+- **Nothing replaced it on the commit path.** #1244's bench client placement was dropped too, at the default topology. With one shard per physical core, it confines clients to the shards' SMT siblings, and Buffered put p99 roughly doubled (`.coord/out-1244-20261031`). #1244 landed reduced, as the owner's option 1 of 2026-11-01: the `Pigeonhole::pinned_shard_cpus()` accessor (ICR 0101), and a guide note that placement helps only where there are spare physical cores.
+- **Left open, not pursued:** moving only `Buffered` barriers' io-wq work off the driver (submitting them from a non-driver ring) while keeping `Default`'s fsync local. It's measurable, but it would add a second submission path for WAL syncs.
+
 <a id="d306"></a>
 ## D306 — An IVF vector index in `pigeonhole-vector`: lists as wide rows, moves as transactions, rebalancing inside the writes (perf287, 2026-10-31; owner accepted revision 4, #490 c6548019940 with revs c6548079840, c6548105943, c6548115678, c6548128553, decision c6548492501; reviewed by cli692 and simp724; vector, #490 D, ICR 0100; on D296, D299 and D303)
 **Why.** An exact `nearest_*` (D296) reads every candidate, which a collection of millions can't do within an interactive budget. The target is 95% recall@10 on SIFT1M at ≤10 ms, single-threaded. An inverted-file index narrows a query to the few lists nearest it. Built from ordinary rows and transactions, it is as durable and consistent as the database and needs nothing new in the engine.
@@ -3703,3 +3718,51 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **`examples/ivfsift.rs`** and `docs/bench.md` describe the run; `docs/guide/vectors.md` is the guide page.
 
 **`Search::run_async` (#1268 item 6).** It's on D296 PR 5's `Nearest::run_async`. Every read of the search is async: the layout version, a changed layout's centroids (a scan stream), and the probed lists. Its result equals `run`'s. It's tested from a cold reopen, at an older snapshot and across splits, for every element and metric.
+
+<a id="d307"></a>
+## D307 — Python bindings: PyO3 directly over `pigeonhole`, published as `pigeonhole-db` for CPython 3.11 and later (ai1249, 2026-10-31; owner decision on #696; reviewed by cli692; python, #696, ICR 0102)
+**Why.** Most agent frameworks are Python (#696, #1251). Bindings straight over the Rust crate keep one implementation and its guarantees, with nothing to keep in step through the C ABI.
+
+**Decided.**
+- **The binding:**
+  - **PyO3, directly over the Rust `pigeonhole` crate,** in a new workspace crate `crates/python` (`pigeonhole-python`, `publish = false` on crates.io). It builds the extension module `pigeonhole._native`, which the `pigeonhole` package re-exports.
+  - **The build:** maturin, with `abi3-py311`, so one wheel per platform serves CPython 3.11 and later.
+  - **Unsafe code:** the crate needs a deny/allow exception for the `unsafe` that PyO3's macros generate at their call sites, approved by the coordinator.
+- **The PyPI name is `pigeonhole-db`,** imported as `import pigeonhole`.
+  - **The first publish needs the owner's go,** and its workflow (PR 4) sets least-privilege permissions, with `id-token: write` on the publish job only.
+- **The API snapshot:** the package's typed stubs (`crates/python/python/pigeonhole/__init__.pyi`). CI's `mypy.stubtest` fails when the stubs and the built module disagree, so it plays the role `public-api.txt` plays for the Rust crates.
+- **The value rules:** the Python type picks the cell type (bytes and `str` are bytes, `int` is `i64`, `float` is `f64`, and a `bool` is refused). `aggregate` reads its input by the family's kind.
+- **PRs:**
+  1. The core API: open, readers, tables, reads, writes, transactions, values and options (#1260).
+  2. Vectors, the 1.1 reads, closing a scan, the per-op overhead benchmark and `docs/guide/python.md` (#1276).
+  3. `Table.nearest` (#1277).
+     - The half-precision arms (`Element.F16`/`BF16`, written and queried as `f32`, read back widened to `array('f')`) come with #1285, under D303's amendment and ICR 0104.
+  4. The PyPI publish workflow, after the owner's go.
+
+<a id="d308"></a>
+## D308 — Byte-budgeted reads: a page fits a byte budget, whole columns at a time, and resumes from a versioned position (ai1249, 2026-10-31; owner accepted revision 2, #1250 c6549794531; reviewed by perf287 (engine) and cli692 (API); engine, pigeonhole, #1250, ICR 0103; on D296 and D304)
+**Why.** An agent or a service with a context or response budget needs reads that stop at a size, not a row count, and that resume exactly where they stopped, across processes and restarts (#1250).
+
+**Decided.**
+- **The engine:** a `ByteBudget` reducer (D296).
+  - **It keeps the longest in-budget prefix** of a read's cells, in cell order. Each row's key counts once.
+  - **A column is admitted whole or rolled back** (B1). The overflow column's size is reported, so a page that resumes at it fits it in exactly that budget.
+  - **The sequential reduce path is one accumulator** (B2). Fanned-out reads keep per-group reducers, merged and cut again.
+  - **`ReduceSpec::resume`** resumes a read inside a row, after a column (B3).
+  - **Traversal's `byte_budget`** runs across hops in order, and a cut hop ends the traversal (B4).
+- **The public API:**
+  - **The pages:** `Scan::read_within` and `KeysRead::read_within`, returning pages with `rows`, `bytes`, `cut_by_budget`, `next_bytes` and `resume`.
+  - **The positions:** `ScanPosition` and `KeysPosition`, whose byte forms are versioned, tagged and carry the table id, so a position from another table is refused.
+  - **Resuming:** `resume_after` on scans and multi-gets. Only `read_within` takes a position.
+  - **Traversal:** `Traverse::byte_budget`, with `TraverseStats::cut_by_budget` saying when a hop was cut.
+- **Resume rules:**
+  - a cut inside a row resumes after the last kept column;
+  - a cut at a row boundary resumes after the last kept row;
+  - an empty cut page resumes at its own start;
+  - a `limit` stop resumes after the `limit`-th row. PR 2 cuts the page there after the read; PR 3 stops the read itself there, so it reads no further;
+  - `limit(0)` reads nothing.
+- **PRs:**
+  1. The engine (#1264).
+  2. The public API (#1281).
+  3. The follow-ups (#1284, in progress): `limit` stops inside the budgeted read rather than after it (perf287's N4), and the `scan-budget` callgrind shapes.
+- **Deferred:** `read_within_async` (#1286, Post-1.0).
