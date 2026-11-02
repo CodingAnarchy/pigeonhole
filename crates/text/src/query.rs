@@ -158,8 +158,9 @@ impl Query {
     /// - **Scoring:** each expansion scores as a term, times `1 − d / min(len(q), len(t))`
     ///   (Lucene's boost, `d` its distance, lengths in characters), with Lucene's blended
     ///   statistics: every expansion's idf is that of the most frequent one, so a rare
-    ///   misspelling never outranks the word it misspells. A document's score for the
-    ///   clause is its best expansion's, not their sum.
+    ///   misspelling no longer outranks the word it misspells on idf alone (a document can
+    ///   still win on its term frequency and length). A document's score for the clause is
+    ///   its best expansion's, not their sum.
     /// - **Composed and decomposed characters** are edits apart: the index's normalisation
     ///   (NFC by default) makes them one form.
     pub fn fuzzy(self, term: impl Into<String>, fuzziness: Fuzziness) -> Self {

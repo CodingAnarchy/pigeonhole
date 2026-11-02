@@ -234,7 +234,8 @@ impl<'a> Search<'a> {
                 if !exps.is_empty() {
                     // Lucene's blended statistics (TopTermsBlendedFreqScoringRewrite): every
                     // kept expansion scores with the largest df among them, so a rare
-                    // misspelling's high idf can't outrank the common word it misspells.
+                    // misspelling's idf no longer lifts it above the common word it misspells
+                    // (term frequency and length still count).
                     let df = exps.iter().map(|e| e.df).max().expect("not empty");
                     let e: Vec<(&str, i64, f64)> = exps
                         .iter()
