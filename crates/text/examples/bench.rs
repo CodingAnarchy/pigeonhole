@@ -8,11 +8,11 @@
 //!
 //! **Indexing, twice:** with positions off, then on (the owner's write-cost row). Each pass
 //! writes `Buffered`, one document per transaction, and prints the time per document and
-//! the index table's stored bytes after a flush.
+//! the index table's stored bytes after a flush and a full compaction (with its time).
 //!
-//! **No full compaction:** a forced `compact()` of this index writes about 1,000× its size
-//! (#1313), so the bench flushes only. Stored bytes and search latency are in whatever state
-//! background compaction has reached. Re-take these numbers once #1313 is fixed.
+//! **A full compaction** follows the flush, so stored bytes and search latency are of a
+//! compacted index. #1332 fixed the compaction write amplification (#1313) that kept the
+//! first numbers flush only.
 //!
 //! **Searches,** on the positions-on index: `QUERIES` (default 1,000) of each kind, at top
 //! 10 unless noted, printing p50, p99 and the mean in µs:
@@ -140,8 +140,10 @@ fn build(
         }
     }
     let per_doc = start.elapsed().as_secs_f64() * 1e6 / corpus.len() as f64;
-    // Flush only: a forced full compaction is pending #1313 (above).
     db.flush()?;
+    let c = Instant::now();
+    db.compact()?;
+    let compact_s = c.elapsed().as_secs_f64();
     let info = db.info()?;
     let table = info
         .tables
@@ -154,7 +156,7 @@ fn build(
         .map(|f| f.levels.iter().map(|l| l.bytes).sum::<u64>() + f.blob_bytes)
         .sum();
     println!(
-        "write positions={positions}: {per_doc:.1} µs per document, {bytes} stored bytes after a flush ({:.1} bytes per document; no full compaction, #1313)",
+        "write positions={positions}: {per_doc:.1} µs per document, {bytes} stored bytes after a full compaction ({:.1} bytes per document; the compaction took {compact_s:.1} s)",
         bytes as f64 / corpus.len() as f64
     );
     Ok((db, index))
