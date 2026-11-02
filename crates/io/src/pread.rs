@@ -591,6 +591,20 @@ impl File for PreadFile {
         self.inner.write_at(buf, offset)
     }
 
+    /// Linux only (a sync of the file covers stores through the mapping there), and not for
+    /// a direct-I/O or read-only handle, or a range past the file's end.
+    #[cfg(target_os = "linux")]
+    fn map_write(&self, offset: u64, len: usize) -> Result<Option<Box<dyn crate::WriteMap>>> {
+        if self.inner.direct_align.is_some()
+            || !self.inner.writable
+            || !offset.is_multiple_of(os::system_page_size() as u64)
+        {
+            return Ok(None);
+        }
+        Ok(os::map_range(self.inner.file(), offset, len)?
+            .map(|m| Box::new(crate::map::FileWriteMap::new(m)) as Box<dyn crate::WriteMap>))
+    }
+
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
         if let Err(e) = self.inner.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));

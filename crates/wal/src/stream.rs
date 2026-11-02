@@ -388,6 +388,7 @@ pub struct WalCounters {
     rollover_blocks: AtomicU64,
     rollover_waits: AtomicU64,
     retained_taken: AtomicU64,
+    mapped_writes: AtomicU64,
 }
 
 impl WalCounters {
@@ -420,6 +421,12 @@ impl WalCounters {
     /// rather than the writer waiting. Expected to stay 0 while spares keep up.
     pub fn retained_taken(&self) -> u64 {
         self.retained_taken.load(Ordering::Relaxed)
+    }
+
+    /// Group writes stored through the segment's mapping instead of written (D312's
+    /// prototype, [`WalOptions::mapped_writes`](crate::WalOptions::mapped_writes)).
+    pub fn mapped_writes(&self) -> u64 {
+        self.mapped_writes.load(Ordering::Relaxed)
     }
 }
 
@@ -1317,6 +1324,11 @@ pub struct WalStream {
     held: Option<HeldHeader>,
     /// The epoch the current segment's slot held before, if it was recycled.
     stale: Option<u32>,
+    /// D312: write frames through a mapping of the current segment's slot.
+    mapped_writes: bool,
+    /// The current segment's slot, mapped for writing (D312), when `mapped_writes` and the file
+    /// supports it; frames are `pwrite`n otherwise.
+    map: Option<Box<dyn pigeonhole_io::WriteMap>>,
     shared: Arc<Shared>,
 }
 
@@ -1499,7 +1511,7 @@ impl WalStream {
             opts.segment_size,
             opts.spare_segments,
         );
-        s.configure_feed(&opts);
+        s.configure(&opts);
         Ok(s)
     }
 
@@ -1539,6 +1551,8 @@ impl WalStream {
             buf: Vec::new(),
             held: None,
             stale: None,
+            mapped_writes: false,
+            map: None,
             shared: Arc::new(Shared {
                 durable: AtomicU64::new(0),
                 poisoned: AtomicBool::new(false),
@@ -1560,12 +1574,13 @@ impl WalStream {
         &self.marks
     }
 
-    /// Takes the change-feed settings of `opts` (D310): retention and the feed session. Called
-    /// before the stream's first segment.
-    pub(crate) fn configure_feed(&mut self, opts: &WalOptions) {
+    /// Takes the per-open settings of `opts`: the change feed's retention and session (D310),
+    /// and mapped writes (D312). Called before the stream's first segment.
+    pub(crate) fn configure(&mut self, opts: &WalOptions) {
         self.retain = opts.retain_segments;
         self.retain_floor = if self.retain == 0 { u32::MAX } else { 0 };
         self.feed_session = opts.feed_session;
+        self.mapped_writes = opts.mapped_writes;
     }
 
     /// Adopts an existing file's slots (from recovery): `epochs` has 0 for a blank slot.
@@ -1867,6 +1882,18 @@ impl WalStream {
         self.max_epoch = epoch;
         self.slot = slot;
         self.epoch = epoch;
+        // D312: map the new slot (the old mapping is dropped first: its stores stay in the
+        // page cache, and the rollover's sync covers them). `None` writes with `pwrite`, and
+        // so does a mapping that fails (an `mmap` refused, say): the rollover never fails on
+        // it, and a real I/O error surfaces at the segment's first write as without D312.
+        self.map = None;
+        if self.mapped_writes {
+            self.map = self
+                .file
+                .map_write(slot as u64 * self.segment_size, self.segment_size as usize)
+                .ok()
+                .flatten();
+        }
         self.marks.head.store(epoch, Ordering::Release);
         self.written_off = 0;
         self.enc = FrameEncoder::new(epoch, FRAME);
@@ -2011,8 +2038,20 @@ impl WalStream {
             self.release_header()?;
         }
         if !self.buf.is_empty() {
-            let at = self.slot as u64 * self.segment_size + self.written_off;
-            self.file.write_at(&self.buf, at)?;
+            match self.map.as_mut() {
+                // D312: a store into the slot's mapping, with no system call.
+                Some(map) => {
+                    map.write(self.written_off as usize, &self.buf)?;
+                    self.shared
+                        .counters
+                        .mapped_writes
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                None => {
+                    let at = self.slot as u64 * self.segment_size + self.written_off;
+                    self.file.write_at(&self.buf, at)?;
+                }
+            }
             self.written_off += self.buf.len() as u64;
             self.buf.clear();
         }

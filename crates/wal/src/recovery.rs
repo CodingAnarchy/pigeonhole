@@ -390,7 +390,7 @@ impl Recovery {
                     grid.segment_size,
                     opts.spare_segments,
                 );
-                s.configure_feed(&opts);
+                s.configure(&opts);
                 if opts.retain_segments != 0 {
                     s.feed_marks_ref().set_checkpoint(checkpoint);
                 }
@@ -409,7 +409,7 @@ impl Recovery {
                     opts.segment_size,
                     opts.spare_segments,
                 );
-                s.configure_feed(&opts);
+                s.configure(&opts);
                 s.open_segment(0, 0)?;
                 s
             }

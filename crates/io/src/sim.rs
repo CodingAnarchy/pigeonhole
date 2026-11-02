@@ -60,7 +60,7 @@ use std::time::Duration;
 
 use crate::{
     Completion, Error, ErrorKind, File, FileIdentity, FileRef, IoBuf, LockMode, OpenOptions,
-    ProcessId, Result, SharedOpen, SharedRegion, Vfs,
+    ProcessId, Result, SharedOpen, SharedRegion, Vfs, WriteMap,
 };
 
 thread_local! {
@@ -1112,6 +1112,36 @@ impl fmt::Debug for SimVfs {
     }
 }
 
+/// A simulated writable mapping ([`File::map_write`]): a view of the file that never closes it.
+struct SimWriteMap {
+    file: SimFile,
+    offset: u64,
+    len: usize,
+}
+
+impl fmt::Debug for SimWriteMap {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SimWriteMap")
+            .field("node", &self.file.node)
+            .field("offset", &self.offset)
+            .field("len", &self.len)
+            .finish()
+    }
+}
+
+impl WriteMap for SimWriteMap {
+    fn len(&self) -> usize {
+        self.len
+    }
+
+    fn write(&mut self, at: usize, bytes: &[u8]) -> Result<()> {
+        if at.checked_add(bytes.len()).is_none_or(|end| end > self.len) {
+            return Err(Error::new(ErrorKind::Other, "a store beyond the mapping"));
+        }
+        self.file.write_at(bytes, self.offset + at as u64)
+    }
+}
+
 /// A handle to a simulated file.
 struct SimFile {
     vfs: Arc<SimVfs>,
@@ -1229,6 +1259,29 @@ impl SimFile {
 impl File for SimFile {
     fn direct_align(&self) -> Option<usize> {
         self.direct.then_some(SIM_DIRECT_ALIGN)
+    }
+
+    /// The simulated mapping (D312): each store goes through [`write_at`](File::write_at)'s
+    /// model, unsynced until a sync, so power-loss runs reorder and drop mapped stores exactly
+    /// as they do written ones. Refused as the real one is: direct, read-only, or past the end.
+    fn map_write(&self, offset: u64, len: usize) -> Result<Option<Box<dyn WriteMap>>> {
+        let size = self.len()?;
+        let end = offset.checked_add(len as u64);
+        if self.direct || !self.writable || len == 0 || end.is_none_or(|e| e > size) {
+            return Ok(None);
+        }
+        Ok(Some(Box::new(SimWriteMap {
+            file: SimFile {
+                vfs: Arc::clone(&self.vfs),
+                node: self.node,
+                handle: self.handle,
+                writable: true,
+                direct: false,
+                owner: false,
+            },
+            offset,
+            len,
+        })))
     }
 
     fn read_at(&self, buf: &mut [u8], offset: u64) -> Result<()> {

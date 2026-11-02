@@ -46,6 +46,23 @@ pub enum LockMode {
     Exclusive,
 }
 
+/// A writable mapping of part of a file ([`File::map_write`], D312). Unmapped on drop; what was
+/// stored stays in the page cache.
+pub trait WriteMap: Send + Sync + Debug {
+    /// Its length in bytes.
+    fn len(&self) -> usize;
+
+    /// Whether it maps no bytes.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Stores `bytes` at `at` (bytes from the mapping's start). Fails with `Other` if they
+    /// don't fit, and with whatever error the backend models (the simulator's injected
+    /// faults); a real mapping's store itself can't fail.
+    fn write(&mut self, at: usize, bytes: &[u8]) -> Result<()>;
+}
+
 /// An open file. Shared across threads; all methods take `&self` and use positional I/O.
 ///
 /// Locks are per handle (OFD locks on Linux, `fcntl` behind a per-process registry on macOS
@@ -56,6 +73,21 @@ pub trait File: Send + Sync + Debug {
 
     /// Writes all of `buf` at `offset`.
     fn write_at(&self, buf: &[u8], offset: u64) -> Result<()>;
+
+    /// A shared, writable mapping of `len` bytes at `offset` (D312): stores through it land in
+    /// the file's page cache with no system call, exactly as a completed [`write_at`] does
+    /// (visible to every handle and process, kept across a crash of this process, durable
+    /// only after a sync). `None` where this handle doesn't support it, and the caller writes
+    /// with [`write_at`] instead: by default, on a direct-I/O handle, on a range beyond the
+    /// file's current length (a store there would fault), and on platforms where a sync isn't
+    /// known to cover mapped stores (only Linux maps for now). `offset` must be a multiple of
+    /// the page size.
+    ///
+    /// [`write_at`]: File::write_at
+    fn map_write(&self, offset: u64, len: usize) -> Result<Option<Box<dyn WriteMap>>> {
+        let _ = (offset, len);
+        Ok(None)
+    }
 
     /// For a handle opened with [`OpenOptions::direct`], the alignment its I/O needs: offsets,
     /// lengths and buffer addresses a multiple of it, else

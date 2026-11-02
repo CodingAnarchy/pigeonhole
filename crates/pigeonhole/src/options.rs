@@ -1759,6 +1759,9 @@ impl Options {
         if let Some(bytes) = self.wal_segment_size {
             o.wal.segment_size = bytes;
         }
+        // D312's prototype is reached only through the test variable for now: the owner picks
+        // its default, and whether it becomes an option, after the A/B.
+        o.wal.mapped_writes = env_wal_mapped();
         o.feed = match (self.change_feed, &self.feed_tables) {
             (Some(r), tables) => {
                 let mut f = pigeonhole_engine::FeedOptions::default();
@@ -1915,6 +1918,13 @@ fn env_io_backend() -> IoBackend {
         _ => {}
     }
     IoBackend::Auto
+}
+
+/// `PIGEONHOLE_WAL_MAPPED=1` (a test variable, read only with the `__unstable-hooks` feature)
+/// writes WAL frames through a mapping of the segment (D312's prototype).
+fn env_wal_mapped() -> bool {
+    cfg!(feature = "__unstable-hooks")
+        && std::env::var("PIGEONHOLE_WAL_MAPPED").as_deref() == Ok("1")
 }
 
 /// `PIGEONHOLE_DIRECT=1` (a test variable, read only with the `__unstable-hooks` feature)

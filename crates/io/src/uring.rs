@@ -520,6 +520,10 @@ impl File for UringFile {
         self.file.write_at(buf, offset)
     }
 
+    fn map_write(&self, offset: u64, len: usize) -> Result<Option<Box<dyn crate::WriteMap>>> {
+        self.file.map_write(offset, len)
+    }
+
     fn submit_read(&self, mut buf: IoBuf, offset: u64) -> Completion {
         if let Err(e) = self.file.check_aligned(buf.as_ptr(), buf.len(), offset) {
             return Completion::ready(Err(e));

@@ -301,6 +301,42 @@ pub(crate) fn map_file(file: &fs::File, len: usize) -> Result<Mapping> {
     Ok(Mapping { ptr, len })
 }
 
+/// Maps `len` bytes of `file` at `offset` read-write and shared, for stores that need no system
+/// call (D312's WAL writes). `None` if the file is shorter than `offset + len`: a store past
+/// its end would raise SIGBUS. `offset` must be page-aligned. Linux only: there a sync of the
+/// file covers stores through a shared mapping (`fdatasync`, io_uring's FSYNC).
+#[cfg(target_os = "linux")]
+pub(crate) fn map_range(file: &fs::File, offset: u64, len: usize) -> Result<Option<Mapping>> {
+    let size = file.metadata().map_err(|e| Error::os("stat", e))?.len();
+    let end = offset.checked_add(len as u64);
+    if len == 0 || end.is_none_or(|e| e > size) {
+        return Ok(None);
+    }
+    let off = libc::off_t::try_from(offset)
+        .map_err(|_| Error::new(ErrorKind::Other, "mapping offset out of range"))?;
+    // SAFETY: a fresh shared mapping of an fd we own, inside the file's length; the kernel
+    // picks the address.
+    let p = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            file.as_raw_fd(),
+            off,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return Err(last_error("mmap"));
+    }
+    let ptr = NonNull::new(p.cast()).ok_or(Error::new(ErrorKind::Other, "mmap returned null"))?;
+    // Read the pages in ahead (asynchronously), so the first store to each one takes a minor
+    // fault, not a read. Advisory: a failure only costs that.
+    // SAFETY: the range was just mapped.
+    unsafe { libc::madvise(p, len, libc::MADV_WILLNEED) };
+    Ok(Some(Mapping { ptr, len }))
+}
+
 /// Creates or opens `path` for a file-backed region and sizes it on creation.
 pub(crate) fn open_region_file(path: &Path, len: u64, mode: SharedOpen) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -425,7 +461,7 @@ pub(crate) fn remove_default_shared(name: &str) -> Result<()> {
 /// kernels), which `madvise` and `mincore` work in; `pigeonhole_format::PAGE_SIZE` is the
 /// file's page.
 #[cfg(target_os = "linux")]
-fn system_page_size() -> usize {
+pub(crate) fn system_page_size() -> usize {
     // SAFETY: plain syscall with a constant name.
     let n = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     usize::try_from(n)

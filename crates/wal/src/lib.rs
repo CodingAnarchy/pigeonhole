@@ -184,6 +184,12 @@ pub struct WalOptions {
     /// The change-feed session id written into every segment header this stream writes
     /// (FORMAT §10.2, bytes 76..84; D310), 0 for none.
     pub feed_session: u64,
+    /// D312 (a prototype, off by default): write each group's frames through a shared mapping
+    /// of the segment ([`File::map_write`](pigeonhole_io::File::map_write)) instead of a
+    /// `pwrite`, where the file supports it (Linux), and with `pwrite` otherwise. The same
+    /// guarantee (the frames are in the page cache, as after a completed write) with no
+    /// system call. Segment headers are always written with `pwrite` (FORMAT §10.1 rule 1).
+    pub mapped_writes: bool,
 }
 
 impl Default for WalOptions {
@@ -193,6 +199,7 @@ impl Default for WalOptions {
             spare_segments: 2,
             retain_segments: 0,
             feed_session: 0,
+            mapped_writes: false,
         }
     }
 }

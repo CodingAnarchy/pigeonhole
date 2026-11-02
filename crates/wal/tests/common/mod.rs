@@ -27,6 +27,8 @@ pub fn opts(frames: u64, spare: u32) -> WalOptions {
     let mut o = WalOptions::default();
     o.segment_size = frames * FRAME_SIZE as u64;
     o.spare_segments = spare;
+    // `PIGEONHOLE_WAL_MAPPED=1`: every stream writes through the simulated mapping (D312).
+    o.mapped_writes = std::env::var("PIGEONHOLE_WAL_MAPPED").as_deref() == Ok("1");
     o
 }
 

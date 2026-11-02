@@ -24,6 +24,7 @@ mod buf;
 mod completion;
 mod error;
 mod file;
+mod map;
 mod nowait;
 mod os;
 mod own;
@@ -42,7 +43,7 @@ pub use async_poll::{AsyncPollScope, async_poll_scope, in_async_poll};
 pub use buf::{BufPool, IoBuf};
 pub use completion::{Completion, Resolver};
 pub use error::{Error, ErrorKind, Result};
-pub use file::{File, FileRef, Locality, LockMode, OpenOptions};
+pub use file::{File, FileRef, Locality, LockMode, OpenOptions, WriteMap};
 #[doc(hidden)]
 pub use nowait::{MISS_BUCKETS, NowaitReads};
 pub use own::{

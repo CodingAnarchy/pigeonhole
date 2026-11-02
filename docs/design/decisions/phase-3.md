@@ -4129,3 +4129,37 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - a write given up in the caller's transaction leaves nothing;
   - S3's races (a merge or a link racing a delete of its target conflicts; `mark_used` after a delete), each ending in `verify`.
 
+
+<a id="d312"></a>
+## D312 — Mapped `Buffered` WAL writes: a group's frames stored through a shared mapping of the segment instead of `pwrite` (a prototype, off by default) (ctr274 / simp724, 2026-11-02; owner approved the prototype, option 1; #1206 lever 4 B2; io, wal)
+
+**Context.** #1206's awake-path decomposition put the WAL stage at p50 2.0 µs and p99 5.25 µs per `Buffered` commit on sparse-wide. B1 (bpftrace of every shard-driver `pwrite64`, AX102, gate settings) found the `pwrite` *is* that stage:
+
+| workload | pwrite p50 | p90 | p99 | p99.9 |
+|---|--:|--:|--:|--:|
+| sparse-wide `Buffered` | 2.0 µs | 3.25–3.5 µs | 5.5–5.75 µs | 8.0 µs |
+| ycsb-a `Buffered` | 2.0 µs | 2.25 µs | 4.0 µs | 6.5 µs |
+
+The stage's instructions are about 0.25 µs. (`.coord/ctr274-1206-lever4-b2-decision.md` has the write-up and the risks.)
+
+**Decision (the prototype).**
+- **What it does:** with `WalOptions::mapped_writes`, a stream maps its current segment's slot (`pigeonhole_io::File::map_write`, `MAP_SHARED`, read ahead with `MADV_WILLNEED`) and stores each group's frames through it.
+- **Same guarantee:** a store into the shared mapping is in the page cache at once, exactly as after a completed `pwrite`, which is all `Buffered` (and `None`) promise (D227). It isn't durable until a sync, and syncs cover dirty mapped pages.
+- **No format change.** It's the same frames at the same offsets, and recovery, the change feed cursor (D310) and `check` read the file as before.
+- **`pwrite` stays for:**
+  - a segment header held behind the previous segment's sync (FORMAT §10.1 rule 1). A header written in the same buffer as its segment's first records (after an inline sync) goes through the mapping with them, which keeps rule 1's order;
+  - a range beyond the file's length (a store there would fault), a direct-I/O or read-only handle, and every platform but Linux. macOS keeps `pwrite` until it's settled that `F_FULLFSYNC` covers mapped stores without an `msync`;
+  - a mapping that fails: the rollover falls back, and never fails on it.
+- **How it's switched on:** off by default, reached through the test variable `PIGEONHOLE_WAL_MAPPED=1` (the bench, under `__unstable-hooks`, and the test harnesses). The owner picks the default, and whether it becomes a public option, after the measurements.
+- **Where the code is:** the only `unsafe` is `pigeonhole-io`'s `map::store` (a bounds-checked copy), which Miri runs. The simulator's mapping (`SimWriteMap`) stores through its write model, so power-loss runs drop and reorder mapped stores as they do written ones.
+- **Concurrency:** one row in concurrency.md. The mapping is the stream's alone.
+
+**Still to measure, before the owner decides:**
+- callgrind;
+- the gate-row box A/B ×3 (`PIGEONHOLE_WAL_MAPPED=1` against off);
+- the five standard sweeps, plus the WAL and engine crash suites with `PIGEONHOLE_WAL_MAPPED=1`.
+
+**Open risks the A/B must show:**
+- the first store to each page takes a minor fault, about one per 15–25 frames, mitigated by the read-ahead;
+- the unmap of the full segment at rollover (a TLB shootdown, once per 64 MiB);
+- SIGBUS, ruled out by mapping only within the file's length.

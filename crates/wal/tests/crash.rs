@@ -40,6 +40,8 @@ struct Trace {
     checkpoint: Lsn,
     /// Set when an operation failed with something other than `Crashed`.
     unexpected: Option<String>,
+    /// Group writes the stream stored through its mapping (D312).
+    mapped: u64,
 }
 
 const GROUPS: u64 = 14;
@@ -133,6 +135,7 @@ fn workload(vfs: &VfsRef, opts: WalOptions, seed: u64) -> Trace {
             }
         }
     }
+    trace.mapped = wal.counters().mapped_writes();
     trace
 }
 
@@ -311,13 +314,32 @@ fn durable_levels(t: &CommitTicket) -> bool {
 
 #[test]
 fn group_sync_and_sync_survive_power_loss_at_every_operation() {
-    let opts = opts(4, 1);
-    for seed in 0..6u64 {
+    survive_power_loss_at_every_operation(opts(4, 1), 0..6);
+}
+
+/// D312: frames stored through the segment's mapping survive (or are lost) exactly as written
+/// ones do, under every crash point, torn write and reordering the simulator models.
+#[test]
+fn mapped_writes_survive_power_loss_at_every_operation() {
+    let mut o = opts(4, 1);
+    o.mapped_writes = true;
+    survive_power_loss_at_every_operation(o, 10..14);
+}
+
+fn survive_power_loss_at_every_operation(opts: WalOptions, seeds: std::ops::Range<u64>) {
+    for seed in seeds {
         // Size the sweep from a crash-free run.
         let dry = SimVfs::new(seed);
         let dry_vfs: VfsRef = dry.clone();
         let trace = workload(&dry_vfs, opts, seed);
         assert_eq!(trace.unexpected, None, "seed {seed}");
+        // The mapped run really stores through the mapping; the written one never does.
+        assert_eq!(
+            trace.mapped > 0,
+            opts.mapped_writes,
+            "seed {seed}: {} mapped writes",
+            trace.mapped
+        );
         check(&dry_vfs, &trace, |_| true, &format!("seed {seed} no crash"));
         let total = dry.mutating_ops();
         assert!(total > 20, "seed {seed}: {total} ops");
