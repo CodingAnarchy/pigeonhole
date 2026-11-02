@@ -1083,7 +1083,12 @@ impl ReadIndex {
         })
     }
 
-    /// The `k` best documents for `query`, as [`Index::search`] gives them.
+    /// The `k` best documents for `query`, as [`Index::search`] gives them, at the
+    /// reader's snapshot.
+    ///
+    /// While the writer process runs [`Index::repair`], the search fails with
+    /// [`Error::Busy`](crate::Error::Busy). That's transient: retry after the repair
+    /// finishes, and the search succeeds on the repaired index.
     pub fn search(&self, query: impl Into<Query>, k: usize) -> Search<'_> {
         self.index.search(query, k)
     }
