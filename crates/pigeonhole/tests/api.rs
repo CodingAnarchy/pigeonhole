@@ -290,6 +290,7 @@ fn error_codes_are_stable_numbers() {
         (ErrorCode::OutcomeUnknown, 28),
         (ErrorCode::NoWriter, 29),
         (ErrorCode::UnsupportedFeature, 30),
+        (ErrorCode::FeedExpired, 31),
     ];
     for (code, n) in codes {
         assert_eq!(code as u32, n, "{code:?}");

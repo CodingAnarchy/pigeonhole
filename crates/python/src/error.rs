@@ -61,6 +61,7 @@ codes!(
     OutcomeUnknown,
     NoWriter,
     UnsupportedFeature,
+    FeedExpired,
 );
 
 /// `code`'s exception with `message`, its `code` and `code_num` set.

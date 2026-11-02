@@ -657,3 +657,61 @@ fn transact_survives_a_recovery_with_the_default_policy() {
     assert_eq!(db.engine_metrics().transaction_retries, 1);
     db.close().unwrap();
 }
+
+/// A durable change feed follows the recovery (D310 PR 3b): it resumes on the new engine
+/// from its own token, so every commit it delivered stands, and it goes on with the commits
+/// after the swap, none twice.
+#[test]
+fn a_durable_feed_follows_the_recovery() {
+    let (vfs, gate) = gate::vfs(2002);
+    let db = Pigeonhole::open(
+        DB,
+        options(Arc::clone(&vfs), Recovery::Io)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
+    )
+    .unwrap();
+    let t = db
+        .table("t")
+        .unwrap()
+        .family("f", Family::default())
+        .create_if_missing()
+        .unwrap();
+    let mut feed = t.feed().open().unwrap();
+    let mut seen = Vec::new();
+    for i in 0..8 {
+        put(&t, &format!("row{i}")).unwrap();
+        let c = feed
+            .next(Duration::from_secs(10))
+            .unwrap()
+            .expect("a commit")
+            .clone();
+        seen.push((c.seqno(), c.changes()[0].row().to_vec()));
+    }
+    let _ = fail_shard(&gate, &t, "lost");
+    assert!(
+        wait_until(20, || !db.is_failed()
+            && db.recovery_stats().recoveries == 1),
+        "the supervisor did not recover"
+    );
+    put(&t, "after").unwrap();
+    let mut rows = Vec::new();
+    loop {
+        let c = feed
+            .next(Duration::from_secs(10))
+            .unwrap()
+            .expect("the commit after the swap")
+            .clone();
+        assert!(c.seqno() > seen.last().unwrap().0, "never a commit twice");
+        rows.push(c.changes()[0].row().to_vec());
+        if rows.last().unwrap() == b"after" {
+            break;
+        }
+    }
+    // The failed commit's outcome was unknown: it may or may not have landed.
+    assert!(
+        rows.len() <= 2 && (rows.len() == 1 || rows[0] == b"lost"),
+        "{rows:?}"
+    );
+    drop(feed);
+    db.close().unwrap();
+}

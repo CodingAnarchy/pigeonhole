@@ -97,6 +97,15 @@ pub enum ErrorCode {
     /// the data is intact, not corrupt (#496, ICR 0058). [`ErrorCode::UnsupportedFormat`], by
     /// contrast, means the whole file's format version is unreadable.
     UnsupportedFeature = 30,
+    /// A change feed can't continue: the history it needs is gone ([`Feed`](crate::Feed),
+    /// D310). Retention ([`Options::change_feed`](crate::Options::change_feed)) passed it;
+    /// the database was opened without the feed for its tables, or with another shard
+    /// count, since; or a power loss took commits a [`visible`](crate::FeedBuilder::visible)
+    /// feed delivered. It stays expired. Start a new feed from a snapshot
+    /// ([`FeedBuilder::from_snapshot`](crate::FeedBuilder::from_snapshot)), after rebuilding
+    /// what the feed maintained; [`Feed::oldest_retained`](crate::Feed::oldest_retained)
+    /// tells how far back history goes.
+    FeedExpired = 31,
 }
 
 /// An error: a stable [`ErrorCode`] and a human-readable message.
