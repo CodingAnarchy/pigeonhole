@@ -193,8 +193,14 @@ impl Database {
 }
 
 /// Opens (with `create=True`, creates) the database at `path` as the writer process.
+///
+/// `change_feed=n` turns the change feed on (`Table.feed`), keeping up to `n` bytes of
+/// history, for at most `feed_age` (seconds or a `timedelta`) if given; `feed_tables` limits
+/// it to those tables. With neither `change_feed` nor `change_feed_off=True`, an open
+/// inherits the last open's feed, so a feed's tokens stay valid across an open that doesn't
+/// mention it; `change_feed_off=True` turns it off, which ends its history.
 #[pyfunction]
-#[pyo3(signature = (path, *, create=false, shards=None, durability=None, block_cache=None, row_cache=None, memtable_budget=None, shm_dir=None, read_only_fallback=None))]
+#[pyo3(signature = (path, *, create=false, shards=None, durability=None, block_cache=None, row_cache=None, memtable_budget=None, shm_dir=None, read_only_fallback=None, change_feed=None, change_feed_off=false, feed_age=None, feed_tables=None))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     py: Python<'_>,
@@ -207,6 +213,10 @@ pub(crate) fn open(
     memtable_budget: Option<u64>,
     shm_dir: Option<PathBuf>,
     read_only_fallback: Option<bool>,
+    change_feed: Option<u64>,
+    change_feed_off: bool,
+    feed_age: Option<&Bound<'_, PyAny>>,
+    feed_tables: Option<Vec<String>>,
 ) -> PyResult<Database> {
     let mut o = pigeonhole::Options::default().create_if_missing(create);
     if let Some(n) = shards {
@@ -229,6 +239,32 @@ pub(crate) fn open(
     }
     if let Some(b) = read_only_fallback {
         o = o.read_only_fallback(b);
+    }
+    if change_feed_off {
+        if change_feed.is_some() || feed_age.is_some() {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "change_feed_off or change_feed, not both",
+            ));
+        }
+        o = o.change_feed_off();
+    }
+    match (change_feed, feed_age) {
+        (Some(n), age) => {
+            let mut r = pigeonhole::FeedRetention::bytes(n);
+            if let Some(a) = age {
+                r = r.age(convert::duration(a)?);
+            }
+            o = o.change_feed(r);
+        }
+        (None, Some(_)) => {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "feed_age needs change_feed (the history's size in bytes)",
+            ));
+        }
+        (None, None) => {}
+    }
+    if let Some(t) = feed_tables {
+        o = o.feed_tables(t);
     }
     let db = py
         .detach(move || pigeonhole::Pigeonhole::open(path, o))

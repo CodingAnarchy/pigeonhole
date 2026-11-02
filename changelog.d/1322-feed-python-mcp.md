@@ -1,0 +1,4 @@
+### Added
+- The change feed in Python and `phdb mcp` (#1322, D310):
+  - Python: `open(change_feed=..., change_feed_off=..., feed_age=..., feed_tables=...)` (with neither, an open inherits the last open's feed), and `Table.feed(tables=, prefix=, visible=, from_snapshot=, from_oldest=, resume=)` gives a `Feed`. It has `next(timeout=)` (the GIL released while it waits), `try_next()`, iteration, `token()` and `oldest_retained`, and delivers `Commit` and `Change` objects. `FeedExpired` is raised once the history is gone.
+  - `phdb mcp` serves `feed_poll` when the database's feed is on: inherited from the application's last open, or turned on with `--change-feed BYTES`. The tool returns whole commits after a token, plus the next token. It holds no state between calls, and expiry is a `FeedExpired` tool error.

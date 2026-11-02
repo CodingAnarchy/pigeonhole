@@ -7,25 +7,33 @@
 //! | `read_row` | One row's cells, paged at column boundaries. |
 //! | `scan` | Rows in key order: a prefix or a range, with a row limit. |
 //! | `traverse` | Breadth-first hops over an edge family (`Table::traverse`). |
+//! | `nearest` | The `k` nearest vectors to a query in a vector family (`Scan::nearest_f32`). |
 //! | `write` | Puts, increments, aggregate inputs and deletes in one atomic batch. |
 //! | `create_table` | A table and its families, if missing. |
+//! | `feed_poll` | Whole committed changes after a token (`Table::feed`), with the next token. |
 //!
 //! The JSON shapes of bytes and values are `phdb dump`'s. A result that would pass
 //! [`Limits::result_bytes`] stops at a column, row or node boundary with a `cursor`; a
-//! value longer than its limit comes back as `{"omitted_bytes": n}`. Nearest-neighbour
-//! search joins the list once vector families' reads are in `pigeonhole` (D303, D296).
+//! value longer than its limit comes back as `{"omitted_bytes": n}`. `nearest` is listed
+//! only when the database has a vector family; its result is cut at a neighbour, with
+//! `truncated`, since a ranking can't resume.
 
 use std::collections::HashMap;
 use std::ops::Bound;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use pigeonhole::{Aggregation, CellEntry, KeySet, RowPosition, Table, Value as Cell};
+use pigeonhole::{
+    Aggregation, CellEntry, Element, KeySet, RowPosition, Table, Value as Cell, VectorSpec,
+};
 use serde_json::{Map, Value, json};
 
 use super::Limits;
 use super::cursor::Cursor;
 use crate::cmd::dump::value_json;
 use crate::cmd::schema::{
-    JsonValue, bytes_from_json, bytes_json, family_from_json, family_json, value_from_json,
+    Components, JsonValue, base64_decode, base64_encode, bytes_from_json, bytes_json, element_name,
+    family_from_json, family_json, value_from_json, vector_spec_json,
 };
 use crate::exit::Failure;
 use crate::open::{Db, Handle};
@@ -58,6 +66,14 @@ const MAX_ITEMS: usize = 10_000;
 /// 10,000,000, is the most it may ask for).
 const DEFAULT_MAX_NODES: u64 = 100_000;
 const MAX_NODES: u64 = 10_000_000;
+/// The most neighbours a `nearest` may ask for.
+const MAX_K: u64 = 1_000;
+/// The most commits one `feed_poll` returns, and the longest it waits (milliseconds).
+const MAX_COMMITS: u64 = 1_000;
+const MAX_WAIT_MS: u64 = 30_000;
+/// The largest traversal result the server keeps for its cursors (#1254), in node-key bytes:
+/// past it, a cursor runs the traversal again, as before.
+const MAX_CACHED_TRAVERSAL_BYTES: usize = 64 << 20;
 
 type Outcome = Result<Map<String, Value>, Failure>;
 
@@ -65,6 +81,19 @@ pub(super) struct Tools {
     db: Db,
     writable: bool,
     limits: Limits,
+    /// The last cut traversal (#1254): its cursors page from it, in O(page), all from one
+    /// consistent result. One at a time; another traversal replaces it.
+    traversal: Mutex<Option<CachedTraversal>>,
+    /// The id the next traversal run gets: its cursors carry it.
+    runs: AtomicU64,
+}
+
+/// A traversal result kept for its cursors.
+struct CachedTraversal {
+    /// The call's fingerprint and run id, which its cursors carry.
+    fingerprint: u64,
+    run: u64,
+    traversal: pigeonhole::Traversal,
 }
 
 impl Tools {
@@ -73,6 +102,8 @@ impl Tools {
             db,
             writable,
             limits,
+            traversal: Mutex::new(None),
+            runs: AtomicU64::new(1),
         }
     }
 
@@ -80,9 +111,18 @@ impl Tools {
         self.db.close()
     }
 
-    /// `tools/list`: the write tools only when the database is writable.
+    /// `tools/list`: `nearest` only when the database has a vector family, and the write
+    /// tools only when it is writable. (`nearest` answers a call either way, for a vector
+    /// family created after the list.)
     pub(super) fn list(&self) -> Vec<Value> {
         let mut tools = vec![list_tables(), read_row(), scan(), traverse()];
+        if self.has_vector_family() {
+            tools.push(nearest());
+        }
+        // The feed is on when the writer's open inherited one or `--change-feed` turned it on.
+        if self.db.info().is_ok_and(|i| i.feed.is_some()) {
+            tools.push(feed_poll());
+        }
         if self.writable {
             tools.extend([write(), create_table()]);
         }
@@ -97,9 +137,20 @@ impl Tools {
             "read_row" => self.read_row(a),
             "scan" => self.scan(a),
             "traverse" => self.traverse(a),
+            "feed_poll" => self.feed_poll(a),
+            "nearest" => self.nearest(a),
             "write" => self.write(a),
             "create_table" => self.create_table(a),
             _ => return None,
+        })
+    }
+
+    /// Whether any table has a vector family.
+    fn has_vector_family(&self) -> bool {
+        self.db.tables().iter().any(|t| {
+            self.db
+                .families(t)
+                .is_ok_and(|fs| fs.iter().any(|f| f.vector.is_some()))
         })
     }
 
@@ -222,23 +273,7 @@ impl Tools {
         let max_value = self.max_value(&a)?;
         let limit = a.u64_or("limit", 100, 1, MAX_ROWS)?;
         let columns = a.u64_or("columns_per_row", 100, 1, MAX_ROWS)?;
-        let prefix = a.opt_bytes("prefix")?;
-        let (start, end) = (a.opt_bytes("start")?, a.opt_bytes("end")?);
-        if prefix.is_some() && (start.is_some() || end.is_some()) {
-            return Err(Failure::usage(
-                "scan takes a prefix or a start/end range, not both",
-            ));
-        }
-        let (mut lo, hi) = match prefix {
-            Some(p) => {
-                let hi = successor(&p).map_or(Bound::Unbounded, Bound::Excluded);
-                (Bound::Included(p), hi)
-            }
-            None => (
-                start.map_or(Bound::Unbounded, Bound::Included),
-                end.map_or(Bound::Unbounded, Bound::Excluded),
-            ),
-        };
+        let (mut lo, hi) = key_range(&a, "scan")?;
         match Cursor::decode(a.0).map_err(|m| Failure::usage(&m))? {
             None => {}
             Some(Cursor::Scan { key, inclusive }) => {
@@ -354,9 +389,11 @@ impl Tools {
         let max_nodes = a.u64_or("max_nodes", DEFAULT_MAX_NODES, 1, MAX_NODES)?;
         let parents = a.bool_or("parents", false)?;
         let qualifier_prefix = a.opt_bytes("qualifier_prefix")?;
-        let (from_hop, from_index) = match Cursor::decode(a.0).map_err(|m| Failure::usage(&m))? {
-            None => (0, 0),
-            Some(Cursor::Traverse { hop, index }) => (hop as usize, index as usize),
+        let (from_hop, from_index, run) = match Cursor::decode(a.0)
+            .map_err(|m| Failure::usage(&m))?
+        {
+            None => (0, 0, None),
+            Some(Cursor::Traverse { hop, index, run }) => (hop as usize, index as usize, Some(run)),
             Some(_) => return Err(Failure::usage("cursor: not a traverse cursor")),
         };
         let seeds = KeySet::from_unsorted(&seeds);
@@ -381,11 +418,29 @@ impl Tools {
                 t.run().map_err(read)?
             }};
         }
-        // A cursor runs the same traversal again and skips what was returned: it is
-        // deterministic, so over unchanged data the pages join up exactly.
-        let traversal = match self.db.handle(table)? {
-            Handle::Writer(t) => go!(t),
-            Handle::Reader(t) => go!(t),
+        // A cursor of the cached run pages from it (#1254). Otherwise (no cursor, or its run
+        // is no longer cached) the traversal runs: it is deterministic, so over unchanged
+        // data the pages of a re-run join up exactly.
+        let fingerprint = super::cursor::fingerprint(a.0);
+        let cached = run.and_then(|r| {
+            let mut slot = self.traversal.lock().expect("not poisoned");
+            match slot.take() {
+                Some(c) if c.fingerprint == fingerprint && c.run == r => Some(c),
+                other => {
+                    *slot = other;
+                    None
+                }
+            }
+        });
+        let (traversal, run) = match cached {
+            Some(c) => (c.traversal, c.run),
+            None => {
+                let t = match self.db.handle(table)? {
+                    Handle::Writer(t) => go!(t),
+                    Handle::Reader(t) => go!(t),
+                };
+                (t, self.runs.fetch_add(1, Ordering::Relaxed))
+            }
         };
         let mut budget = Budget::new(self.limits.result_bytes);
         let mut out_hops = Vec::new();
@@ -410,6 +465,7 @@ impl Tools {
                     cut = Some(Cursor::Traverse {
                         hop: h as u32,
                         index: i as u64,
+                        run,
                     });
                     out_hops.push(hop_json(h, first, hop.nodes().len(), nodes));
                     break 'hops;
@@ -430,6 +486,231 @@ impl Tools {
         }));
         if let Some(c) = cut {
             out.insert("cursor".into(), c.encode(a.0).into());
+            // Kept for the cursor's next page, unless too large (then it runs again).
+            let bytes: usize = traversal
+                .hops()
+                .iter()
+                .map(|h| {
+                    (0..h.nodes().len())
+                        .map(|i| h.nodes().get(i).len())
+                        .sum::<usize>()
+                })
+                .sum();
+            if bytes <= MAX_CACHED_TRAVERSAL_BYTES {
+                *self.traversal.lock().expect("not poisoned") = Some(CachedTraversal {
+                    fingerprint,
+                    run,
+                    traversal,
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn nearest(&self, a: Args<'_>) -> Outcome {
+        a.only(&[
+            "table",
+            "family",
+            "query",
+            "k",
+            "row",
+            "prefix",
+            "start",
+            "end",
+            "qualifier",
+            "qualifier_prefix",
+        ])?;
+        let table = a.str("table")?;
+        let family = a.str("family")?;
+        let k = a.u64_or("k", 10, 1, MAX_K)? as usize;
+        let (lo, hi) = match a.opt_bytes("row")? {
+            None => key_range(&a, "nearest")?,
+            Some(_)
+                if ["prefix", "start", "end"]
+                    .iter()
+                    .any(|n| a.get(n).is_some()) =>
+            {
+                return Err(Failure::usage(
+                    "nearest takes a row, a prefix or a start/end range, not two of them",
+                ));
+            }
+            Some(row) => (Bound::Included(row.clone()), Bound::Included(row)),
+        };
+        let qualifier = a.opt_bytes("qualifier")?;
+        let qualifier_prefix = a.opt_bytes("qualifier_prefix")?;
+        if qualifier.is_some() && qualifier_prefix.is_some() {
+            return Err(Failure::usage("qualifier or qualifier_prefix, not both"));
+        }
+        let query = a
+            .get("query")
+            .ok_or_else(|| Failure::usage("query is required"))?;
+        let read = |e: pigeonhole::Error| Failure::db(&format!("nearest {table}"), &e);
+        macro_rules! go {
+            ($t:expr) => {{
+                let spec = $t
+                    .family_info(family)
+                    .ok_or_else(|| Failure::family_not_found(table, family))?
+                    .vector
+                    .ok_or_else(|| {
+                        Failure::usage(&format!(
+                            "family: {family} is not a vector family (list_tables shows each \
+                             family's vector spec)"
+                        ))
+                    })?;
+                let query = Query::parse(query, &spec)?;
+                let mut s = $t
+                    .scan_bounds(
+                        lo.as_ref().map(Vec::as_slice),
+                        hi.as_ref().map(Vec::as_slice),
+                    )
+                    .family(family);
+                if let Some(q) = &qualifier_prefix {
+                    s = s.qualifier_prefix(q);
+                }
+                if let Some(q) = &qualifier {
+                    s = s.qualifier_bounds(Bound::Included(q), Bound::Included(q));
+                }
+                let n = match &query {
+                    Query::F32(q) => s.nearest_f32(q, k),
+                    Query::I8(q) => s.nearest_i8(q, k),
+                    Query::Bits(q) => s.nearest_bits(q, k),
+                };
+                (spec, n.run().map_err(read)?)
+            }};
+        }
+        let (spec, found) = match self.db.handle(table)? {
+            Handle::Writer(t) => go!(t),
+            Handle::Reader(t) => go!(t),
+        };
+        let mut budget = Budget::new(self.limits.result_bytes);
+        let mut neighbours = Vec::new();
+        let mut truncated = false;
+        for n in &found {
+            let v = json!({
+                "row": bytes_json(&n.row),
+                "qualifier": bytes_json(&n.qualifier),
+                "ts": n.ts,
+                "distance": n.distance,
+            });
+            if !budget.take(std::slice::from_ref(&v)) {
+                truncated = true;
+                break;
+            }
+            neighbours.push(v);
+        }
+        let mut out = object(json!({
+            "table": table,
+            "family": family,
+            "vector": vector_spec_json(&spec),
+            "neighbours": neighbours,
+        }));
+        if truncated {
+            // A ranking can't resume where it stopped: a smaller k, or a narrower selection.
+            out.insert("truncated".into(), true.into());
+        }
+        Ok(out)
+    }
+
+    fn feed_poll(&self, a: Args<'_>) -> Outcome {
+        a.only(&[
+            "tables",
+            "prefix",
+            "token",
+            "from_oldest",
+            "visible",
+            "max_commits",
+            "wait_ms",
+            "max_value_bytes",
+        ])?;
+        let names = a.str_list("tables")?;
+        if names.is_empty() {
+            return Err(Failure::usage("tables: at least one table name"));
+        }
+        let prefix = a.opt_bytes("prefix")?;
+        let token = a
+            .opt_str("token")?
+            .map(|t| {
+                base64_decode(t).ok_or_else(|| {
+                    Failure::usage("token: the token string a previous feed_poll returned")
+                })
+            })
+            .transpose()?;
+        let from_oldest = a.bool_or("from_oldest", false)?;
+        if token.is_some() && from_oldest {
+            return Err(Failure::usage("token or from_oldest, not both"));
+        }
+        let visible = a.bool_or("visible", false)?;
+        let max_commits = a.u64_or("max_commits", 100, 1, MAX_COMMITS)? as usize;
+        let wait = std::time::Duration::from_millis(a.u64_or("wait_ms", 0, 0, MAX_WAIT_MS)?);
+        let max_value = self.max_value(&a)?;
+        let Db::Writer(db) = &self.db else {
+            return Err(Failure::unsupported(
+                "feed_poll: a reader process can't follow the change feed yet; serve the \
+                 database as its writer (stop the application, or wait for D310 PR 4)"
+                    .into(),
+            ));
+        };
+        let fail = |e: pigeonhole::Error| {
+            let f = Failure::db("feed_poll", &e);
+            match e.code() {
+                pigeonhole::ErrorCode::FeedExpired => f.hint(
+                    "the history this token needs is gone: re-read the tables (scan) and \
+                     call feed_poll again without a token",
+                ),
+                pigeonhole::ErrorCode::InvalidArgument => f.hint(
+                    "the database's change feed must be on (the application's, or \
+                     --change-feed) and follow these tables, and the token must come from this \
+                     database",
+                ),
+                _ => f,
+            }
+        };
+        let mut tables = Vec::with_capacity(names.len());
+        for n in &names {
+            tables.push(
+                db.table(n)
+                    .and_then(|b| b.open())
+                    .map_err(|e| Failure::db(&format!("table {n}"), &e))?,
+            );
+        }
+        let mut b = tables[0].feed();
+        for t in &tables[1..] {
+            b = b.table(t);
+        }
+        if let Some(p) = &prefix {
+            b = b.prefix(p);
+        }
+        if visible {
+            b = b.visible();
+        }
+        if from_oldest {
+            b = b.from_oldest();
+        }
+        if let Some(t) = token {
+            b = b.resume(&pigeonhole::FeedToken::from_bytes(t));
+        }
+        let mut feed = b.open().map_err(fail)?;
+        let mut budget = Budget::new(self.limits.result_bytes);
+        let start = feed.token();
+        let (commits, token, more) = gather(max_commits, &mut budget, start, |first| {
+            // Wait for the first commit only; then take what is ready.
+            let next = if first {
+                feed.next(wait)
+            } else {
+                feed.try_next()
+            };
+            let v = match next.map_err(fail)? {
+                Some(c) => commit_json(c, max_value),
+                None => return Ok(None),
+            };
+            Ok(Some((v, feed.token())))
+        })?;
+        let mut out = object(json!({
+            "commits": commits,
+            "token": base64_encode(token.as_bytes()),
+        }));
+        if more {
+            out.insert("more".into(), true.into());
         }
         Ok(out)
     }
@@ -566,6 +847,42 @@ fn write_op(
                 (JsonValue::I64(n), Some(ts)) => batch.put_i64_at(t, &row, f, q, ts, n),
                 (JsonValue::F64(x), None) => batch.put_f64(t, &row, f, q, x),
                 (JsonValue::F64(x), Some(ts)) => batch.put_f64_at(t, &row, f, q, ts, x),
+                (
+                    JsonValue::Vector {
+                        element,
+                        dim,
+                        components,
+                    },
+                    ts,
+                ) => {
+                    let spec = t
+                        .family_info(f)
+                        .ok_or_else(|| Failure::family_not_found(t.name(), f))?
+                        .vector
+                        .ok_or_else(|| usage(format!("put: {f} is not a vector family")))?;
+                    if spec.element() != element || spec.dim() != dim {
+                        return Err(usage(format!(
+                            "put: a {}[{dim}] vector, and {f}'s vectors are {}[{}]",
+                            element_name(element),
+                            element_name(spec.element()),
+                            spec.dim()
+                        )));
+                    }
+                    match (components, ts) {
+                        (Components::Floats(xs), None) => batch.put_vector_f32(t, &row, f, q, &xs),
+                        (Components::Floats(xs), Some(ts)) => {
+                            batch.put_vector_f32_at(t, &row, f, q, ts, &xs)
+                        }
+                        (Components::Ints(xs), None) => batch.put_vector_i8(t, &row, f, q, &xs),
+                        (Components::Ints(xs), Some(ts)) => {
+                            batch.put_vector_i8_at(t, &row, f, q, ts, &xs)
+                        }
+                        (Components::Bits(b), None) => batch.put_vector_bits(t, &row, f, q, &b),
+                        (Components::Bits(b), Some(ts)) => {
+                            batch.put_vector_bits_at(t, &row, f, q, ts, &b)
+                        }
+                    }
+                }
             };
         }
         "incr" => {
@@ -756,16 +1073,94 @@ impl Budget {
 /// A cell in a read's result: `dump`'s shape without the table and row, with a byte value
 /// longer than `max_value` replaced by its length.
 fn cell_json(e: &CellEntry<'_>, max_value: usize) -> Value {
-    let value = match e.cell.typed() {
-        Cell::Bytes(b) if b.len() > max_value => json!({ "omitted_bytes": b.len() }),
-        v => value_json(v),
-    };
+    let value = typed_json(e.cell.typed(), max_value);
     json!({
         "family": e.family,
         "qualifier": bytes_json(e.qualifier),
         "ts": e.cell.timestamp(),
         "value": value,
     })
+}
+
+/// `feed_poll`'s loop: up to `max` commits from `pull` (`first` on the first call; each with
+/// the token after it) that fit `budget`, the token after the last one kept, and whether
+/// more are ready.
+///
+/// The token never passes a commit left out: one the budget refuses is delivered again from
+/// it. An error after some commits ends the batch there, and they come back with their token
+/// (feed1248 on #1360): they were delivered in order before it, and the next call, from that
+/// token, meets the error again and reports it. An error before any is the call's error. An
+/// error from the probe for `more` after `max` commits leaves `more` unset.
+fn gather<T, E>(
+    max: usize,
+    budget: &mut Budget,
+    mut token: T,
+    mut pull: impl FnMut(bool) -> Result<Option<(Value, T)>, E>,
+) -> Result<(Vec<Value>, T, bool), E> {
+    let mut commits = Vec::new();
+    while commits.len() < max {
+        let (v, after) = match pull(commits.is_empty()) {
+            Ok(Some(c)) => c,
+            Ok(None) => return Ok((commits, token, false)),
+            Err(e) if commits.is_empty() => return Err(e),
+            Err(_) => return Ok((commits, token, false)),
+        };
+        if !budget.take(std::slice::from_ref(&v)) {
+            return Ok((commits, token, true));
+        }
+        commits.push(v);
+        token = after;
+    }
+    let more = matches!(pull(false), Ok(Some(_)));
+    Ok((commits, token, more))
+}
+
+/// A change-feed commit in a `feed_poll` result: its changes in `dump`'s shapes, a value
+/// longer than `max_value` replaced as reads replace it.
+fn commit_json(c: &pigeonhole::Commit, max_value: usize) -> Value {
+    let changes: Vec<Value> = c
+        .changes()
+        .iter()
+        .map(|ch| {
+            let mut m = object(json!({
+                "table": ch.table(),
+                "family": ch.family(),
+                "kind": change_kind(ch.kind()),
+                "row": bytes_json(ch.row()),
+                "qualifier": bytes_json(ch.qualifier()),
+                "ts": ch.timestamp(),
+            }));
+            if let Some(v) = ch.value() {
+                m.insert("value".into(), typed_json(v, max_value));
+            }
+            Value::Object(m)
+        })
+        .collect();
+    json!({"seqno": c.seqno(), "ts": c.timestamp(), "changes": changes})
+}
+
+fn change_kind(kind: pigeonhole::ChangeKind) -> &'static str {
+    use pigeonhole::ChangeKind as K;
+    match kind {
+        K::Put => "put",
+        K::Merge => "merge",
+        K::DeleteCell => "delete_cell",
+        K::DeleteColumn => "delete_column",
+        K::DeleteFamily => "delete_family",
+        _ => "unknown",
+    }
+}
+
+/// A value in a result: `dump`'s shape, with a byte value longer than `max_value` replaced
+/// by its length, and a vector whose payload is, by its shape.
+fn typed_json(v: Cell<'_>, max_value: usize) -> Value {
+    match v {
+        Cell::Bytes(b) if b.len() > max_value => json!({ "omitted_bytes": b.len() }),
+        Cell::Vector(v) if v.as_bytes().len() > max_value => json!({
+            "omitted_vector": {"element": element_name(v.element()), "dim": v.dim()},
+        }),
+        v => value_json(v),
+    }
 }
 
 /// A family's options as `phdb info` shows them, without the unset ones.
@@ -789,6 +1184,158 @@ fn row_json(key: &[u8], cells: Vec<Value>, capped: bool, truncated: bool) -> Val
 
 fn hop_json(h: usize, first: usize, len: usize, nodes: Vec<Value>) -> Value {
     json!({"hop": h + 1, "first_index": first, "node_count": len, "nodes": nodes})
+}
+
+/// A row key range: its lower and upper bounds.
+type KeyRange = (Bound<Vec<u8>>, Bound<Vec<u8>>);
+
+/// The row keys `prefix`, or `start` and `end`, select (all of them with none).
+fn key_range(a: &Args<'_>, tool: &str) -> Result<KeyRange, Failure> {
+    let prefix = a.opt_bytes("prefix")?;
+    let (start, end) = (a.opt_bytes("start")?, a.opt_bytes("end")?);
+    if prefix.is_some() && (start.is_some() || end.is_some()) {
+        return Err(Failure::usage(&format!(
+            "{tool} takes a prefix or a start/end range, not both"
+        )));
+    }
+    Ok(match prefix {
+        Some(p) => {
+            let hi = successor(&p).map_or(Bound::Unbounded, Bound::Excluded);
+            (Bound::Included(p), hi)
+        }
+        None => (
+            start.map_or(Bound::Unbounded, Bound::Included),
+            end.map_or(Bound::Unbounded, Bound::Excluded),
+        ),
+    })
+}
+
+/// A `nearest` query, in its family's element type.
+enum Query {
+    F32(Vec<f32>),
+    I8(Vec<i8>),
+    Bits(Vec<u8>),
+}
+
+impl Query {
+    /// `v` as a query for a family of `spec`: a list of numbers (`i8` families take
+    /// integers, bit families 0s and 1s), `{"base64"}` of a bit family's packed bytes, or
+    /// `write`'s `{"vector"}` shape. Its element type and dimension must be the family's.
+    fn parse(v: &Value, spec: &VectorSpec) -> Result<Self, Failure> {
+        let q = Self::parse_shape(v, spec)?;
+        // What the search would refuse, refused here as the agent's mistake (ai1249 on
+        // #1354): a component past 2^56, and under cosine a vector with no direction.
+        let usage = |m: &str| Failure::usage(&format!("query: {m}"));
+        if let Query::F32(xs) = &q
+            && xs.iter().any(|x| x.abs() > (1u64 << 56) as f32)
+        {
+            return Err(usage("a component is more than 2^56 in magnitude"));
+        }
+        let zero = match &q {
+            Query::F32(xs) => xs.iter().all(|x| *x == 0.0),
+            Query::I8(xs) => xs.iter().all(|x| *x == 0),
+            Query::Bits(_) => false,
+        };
+        if zero && spec.metric() == pigeonhole::Metric::Cosine {
+            return Err(usage(
+                "an all-zero vector has no direction, so cosine can't rank against it",
+            ));
+        }
+        Ok(q)
+    }
+
+    /// [`parse`](Self::parse)'s shapes, checked against the family's element and dimension.
+    fn parse_shape(v: &Value, spec: &VectorSpec) -> Result<Self, Failure> {
+        let usage = |m: String| Failure::usage(&format!("query: {m}"));
+        let (element, dim) = (spec.element(), spec.dim() as usize);
+        let want = format!("{}[{dim}]", element_name(element));
+        let len = |n: usize| {
+            if n == dim {
+                Ok(())
+            } else {
+                Err(usage(format!(
+                    "{n} components, and the family's vectors are {want}"
+                )))
+            }
+        };
+        if v.get("vector").is_some() {
+            let JsonValue::Vector {
+                element: e,
+                dim: d,
+                components,
+            } = value_from_json(v).map_err(usage)?
+            else {
+                return Err(usage("not a vector".into()));
+            };
+            if e != element || d as usize != dim {
+                return Err(usage(format!(
+                    "a {}[{d}] vector, and the family's vectors are {want}",
+                    element_name(e)
+                )));
+            }
+            return Ok(match components {
+                Components::Floats(xs) => Query::F32(xs),
+                Components::Ints(xs) => Query::I8(xs),
+                Components::Bits(b) => Query::Bits(b),
+            });
+        }
+        if let Some(Value::String(_)) = v.get("base64") {
+            if element != Element::Bit {
+                return Err(usage(format!(
+                    "{{\"base64\"}} is a bit family's query, and the family's vectors are {want}"
+                )));
+            }
+            let b = bytes_from_json(v).map_err(usage)?;
+            if b.len() != dim.div_ceil(8) {
+                return Err(usage(format!(
+                    "{} bytes, and a bit[{dim}] query packs into {}",
+                    b.len(),
+                    dim.div_ceil(8)
+                )));
+            }
+            return Ok(Query::Bits(b));
+        }
+        let Value::Array(xs) = v else {
+            return Err(usage(format!(
+                "a list of {dim} numbers (or write's {{\"vector\"}} shape)"
+            )));
+        };
+        len(xs.len())?;
+        Ok(match element {
+            Element::I8 => Query::I8(
+                xs.iter()
+                    .map(|x| {
+                        x.as_i64()
+                            .and_then(|n| i8::try_from(n).ok())
+                            .ok_or_else(|| usage(format!("{x} is not an integer from -128 to 127")))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+            Element::Bit => {
+                // Packed eight to a byte, least significant first (Scan::nearest_bits).
+                let mut packed = vec![0u8; dim.div_ceil(8)];
+                for (i, x) in xs.iter().enumerate() {
+                    match x.as_u64() {
+                        Some(0) => {}
+                        Some(1) => packed[i / 8] |= 1 << (i % 8),
+                        _ => return Err(usage(format!("{x} is not a bit (0 or 1)"))),
+                    }
+                }
+                Query::Bits(packed)
+            }
+            // f32, and the halves: an f32 query, which the search compares in f32.
+            _ => Query::F32(
+                xs.iter()
+                    .map(|x| {
+                        x.as_f64()
+                            .map(|f| f as f32)
+                            .filter(|f| f.is_finite())
+                            .ok_or_else(|| usage(format!("{x} is not a finite f32")))
+                    })
+                    .collect::<Result<_, _>>()?,
+            ),
+        })
+    }
 }
 
 /// The least key above every key starting with `prefix`, if there is one.
@@ -1096,6 +1643,98 @@ fn traverse() -> Value {
     )
 }
 
+fn nearest() -> Value {
+    tool(
+        "nearest",
+        "Find nearest vectors",
+        "Find the `k` vectors nearest to `query` in a vector family (list_tables shows each \
+         family's vector spec: dim, element and metric): an exact search, nearest first, ties \
+         by row then qualifier. Returns `neighbours`, each with its row, qualifier, ts and \
+         distance under the family's metric (smaller is nearer); read a neighbour's cells \
+         with read_row. The query is a list of `dim` numbers: integers from -128 to 127 for \
+         an i8 family, 0s and 1s for a bit family (or {\"base64\"} of its packed bytes). \
+         The query must be an embedding from the same model as the stored vectors: \
+         distances between two models' vectors mean nothing. \
+         Narrow the search to a `row`, a `prefix` or a `start`/`end` range, and to one \
+         `qualifier` or a `qualifier_prefix`. A result marked `truncated` holds the nearest \
+         that fit: ask for a smaller k.",
+        json!({
+            "type": "object",
+            "properties": {
+                "table": {"type": "string"},
+                "family": {"type": "string", "description": "The vector family."},
+                "query": {
+                    "description": "The query vector: a list of dim numbers, or for a bit \
+                                    family {\"base64\"} of its packed bytes.",
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "number"}},
+                        {"type": "object"},
+                    ],
+                },
+                "k": {"type": "integer", "minimum": 1, "maximum": MAX_K,
+                      "description": "How many neighbours (default 10)."},
+                "row": bytes_schema("Only this row's vectors."),
+                "prefix": bytes_schema("Only rows whose key starts with this."),
+                "start": bytes_schema("The first row key (inclusive)."),
+                "end": bytes_schema("The key to stop before (exclusive)."),
+                "qualifier": bytes_schema("Only the column with this qualifier."),
+                "qualifier_prefix": bytes_schema("Only columns whose qualifier starts with this."),
+            },
+            "required": ["table", "family", "query"],
+            "additionalProperties": false,
+        }),
+        true,
+    )
+}
+
+fn feed_poll() -> Value {
+    tool(
+        "feed_poll",
+        "Poll committed changes",
+        "Return the changes committed to `tables` since `token`, as whole commits in commit \
+         order: each has seqno, ts and `changes` (table, family, kind, row, qualifier, ts and, \
+         for put and merge, value; kind is put, merge, delete_cell, delete_column or \
+         delete_family). Pass the returned `token` to the next call to continue exactly \
+         where this one stopped: nothing is missed or repeated. The first call has no token \
+         and starts with commits after it (or from_oldest: the oldest history kept); \
+         wait_ms waits for a first commit. `more` says more commits are ready now. An error \
+         FeedExpired means the history is gone: re-read with scan and start again without \
+         a token. Otherwise keep the token: it survives the application's restarts and this \
+         server's reconnects, so there's no need to re-read on every session.",
+        json!({
+            "type": "object",
+            "properties": {
+                "tables": {
+                    "type": "array", "minItems": 1, "items": {"type": "string"},
+                    "description": "The tables to follow; a commit across them arrives whole.",
+                },
+                "prefix": bytes_schema("Only changes to rows whose key starts with this."),
+                "token": {"type": "string",
+                          "description": "The token the previous feed_poll returned."},
+                "from_oldest": {"type": "boolean",
+                                "description": "Without a token: start with the oldest \
+                                                history kept, not after now."},
+                "visible": {"type": "boolean",
+                            "description": "Return commits once reads see them, not once \
+                                            durable (default false)."},
+                "max_commits": {"type": "integer", "minimum": 1, "maximum": MAX_COMMITS,
+                                "description": "At most this many commits (default 100)."},
+                "wait_ms": {"type": "integer", "minimum": 0, "maximum": MAX_WAIT_MS,
+                            "description": "Wait up to this long for a first commit \
+                                            (default 0: return at once)."},
+                "max_value_bytes": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Byte values longer than this come back as \
+                                    {\"omitted_bytes\": n} (default: the server's limit).",
+                },
+            },
+            "required": ["tables"],
+            "additionalProperties": false,
+        }),
+        true,
+    )
+}
+
 fn write() -> Value {
     tool(
         "write",
@@ -1103,7 +1742,9 @@ fn write() -> Value {
         "Apply operations in one atomic batch: all of them commit, or none (across rows and \
          tables). Each op names `op`, `table` and `row`:\n\
          - put: set family:qualifier to `value` (a string, {\"base64\"}, {\"i64\": n} or \
-         {\"f64\": x}); a new version unless `ts` repeats one.\n\
+         {\"f64\": x}); a new version unless `ts` repeats one. In a vector family, the value \
+         is {\"vector\": {\"dim\": n, \"element\": \"f32\", \"values\": [...]}} with the \
+         family's dim and element (list_tables shows them).\n\
          - incr: add an integer `value` to a counter family's cell.\n\
          - aggregate: add `value` to an aggregate family's cell: a number (f64 kinds take \
          any number), a non-negative integer for bit_or/bit_and/bit_xor, an integer or a \
@@ -1148,7 +1789,9 @@ fn create_table() -> Value {
          and its families are left as they are). A family is a name, or an object with a \
          name and options as list_tables shows them: \"aggregation\" (one of the kinds the \
          schema lists; sum is a counter), \"aggregation_params\" for histogram, quantiles \
-         and bloom, \"max_versions\" (0 keeps every version), \"ttl_micros\". Plain families hold any bytes or \
+         and bloom, \"max_versions\" (0 keeps every version), \"ttl_micros\", or \"vector\": \
+         {\"dim\", \"element\" (f32, i8, bit, f16, bf16), \"metric\" (l2, inner_product, \
+         cosine, hamming)} for a vector family. Plain families hold any bytes or \
          numbers; group data read together in one family.",
         json!({
             "type": "object",
@@ -1178,6 +1821,18 @@ fn create_table() -> Value {
                                 },
                                 "max_versions": {"type": "integer", "minimum": 1},
                                 "ttl_micros": {"type": "integer", "minimum": 1},
+                                "vector": {
+                                    "type": "object",
+                                    "description": "A vector family's shape: every value is \
+                                                    a vector of `dim` `element`s, compared \
+                                                    by `metric`.",
+                                    "properties": {
+                                        "dim": {"type": "integer", "minimum": 1, "maximum": 4096},
+                                        "element": {"enum": ["f32", "i8", "bit", "f16", "bf16"]},
+                                        "metric": {"enum": ["l2", "inner_product", "cosine", "hamming"]},
+                                    },
+                                    "required": ["dim", "element", "metric"],
+                                },
                             },
                             "required": ["name"],
                         },
@@ -1203,6 +1858,50 @@ mod tests {
         assert_eq!(successor(b""), None);
     }
 
+    /// feed1248 on #1360: an error after some commits returns them with the token after the
+    /// last; before any, it's the call's error; a refused commit keeps the token before it.
+    #[test]
+    fn feed_poll_returns_what_it_gathered_before_an_error() {
+        // A feed of commits 1, 2, then an error; each commit's token is its number.
+        let pulls = |script: Vec<Result<Option<u32>, &'static str>>| {
+            let mut it = script.into_iter();
+            move |_first: bool| {
+                it.next()
+                    .unwrap_or(Ok(None))
+                    .map(|c| c.map(|n| (json!(n), n)))
+            }
+        };
+        let big = || Budget::new(1 << 20);
+        let r = gather(
+            10,
+            &mut big(),
+            0,
+            pulls(vec![Ok(Some(1)), Ok(Some(2)), Err("expired")]),
+        );
+        assert_eq!(r, Ok((vec![json!(1), json!(2)], 2, false)));
+        let r = gather(10, &mut big(), 0, pulls(vec![Err("expired")]));
+        assert_eq!(r, Err("expired"));
+        // The probe for `more` after `max`: an error there leaves `more` unset.
+        let r = gather(
+            2,
+            &mut big(),
+            0,
+            pulls(vec![Ok(Some(1)), Ok(Some(2)), Err("x")]),
+        );
+        assert_eq!(r, Ok((vec![json!(1), json!(2)], 2, false)));
+        let r = gather(
+            2,
+            &mut big(),
+            0,
+            pulls(vec![Ok(Some(1)), Ok(Some(2)), Ok(Some(3))]),
+        );
+        assert_eq!(r, Ok((vec![json!(1), json!(2)], 2, true)));
+        // A commit the budget refuses: the token stays before it, and `more` is set.
+        let mut small = Budget::new(2);
+        let r = gather(10, &mut small, 0, pulls(vec![Ok(Some(1)), Ok(Some(22222))]));
+        assert_eq!(r, Ok((vec![json!(1)], 1, true)));
+    }
+
     #[test]
     fn a_budget_always_takes_the_first_item() {
         let mut b = Budget::new(4);
@@ -1218,6 +1917,8 @@ mod tests {
             read_row(),
             scan(),
             traverse(),
+            nearest(),
+            feed_poll(),
             write(),
             create_table(),
         ] {

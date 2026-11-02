@@ -48,6 +48,17 @@ const VIEW_READ_ATTEMPTS: u32 = 8;
 /// Size of the fixed part of a view record (`FORMAT.md` §11.4).
 const VIEW_HEADER_LEN: usize = 32;
 
+/// A stream's change-feed marks as a reader loaded them ([`ShmRegion::feed_marks`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedMarksView {
+    /// The smallest epoch not yet recyclable.
+    pub floor: u32,
+    /// The checkpoint `Lsn`'s raw value.
+    pub checkpoint: u64,
+    /// The largest start bound the retained history can't serve.
+    pub bound: u64,
+}
+
 /// The mapped region for one database.
 ///
 /// Cheap to clone: every clone shares one mapping. See the [crate docs](crate) for the
@@ -111,6 +122,18 @@ impl Inner {
         );
         let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
         self.region.atomic_u64(off + watermark::WRITTEN)
+    }
+
+    /// One of `shard`'s change-feed marks (layout version 8): `field` is
+    /// [`watermark::FEED_FLOOR`], [`watermark::FEED_CKPT`] or [`watermark::FEED_BOUND`].
+    fn feed_mark(&self, shard: u32, field: usize) -> &AtomicU64 {
+        assert!(
+            shard < self.header.shard_count,
+            "shard {shard} out of range (region has {} shards)",
+            self.header.shard_count
+        );
+        let off = self.header.watermarks_off as usize + WATERMARK_STRIDE * shard as usize;
+        self.region.atomic_u64(off + field)
     }
 
     fn synced(&self, shard: u32) -> &AtomicU64 {
@@ -349,6 +372,14 @@ fn init_region(
             region
                 .atomic_u64(off + field)
                 .store(u64::MAX, Ordering::Relaxed);
+        }
+        // The change feed's marks start unknown (layout version 8).
+        for field in [
+            watermark::FEED_FLOOR,
+            watermark::FEED_CKPT,
+            watermark::FEED_BOUND,
+        ] {
+            region.atomic_u64(off + field).store(0, Ordering::Relaxed);
         }
     }
     region
@@ -882,6 +913,47 @@ impl ShmRegion {
     /// that are not yet synced; `u64::MAX` when none.
     pub fn publish_synced(&self, shard: u32, synced: Seqno) {
         self.inner.synced(shard).store(synced, Ordering::Release);
+    }
+
+    /// Raises `shard`'s stream's feed floor (the smallest epoch not yet recyclable) with
+    /// release ordering; it never goes down.
+    pub fn publish_feed_floor(&self, shard: u32, epoch: u32) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_FLOOR)
+            .fetch_max(u64::from(epoch), Ordering::AcqRel);
+    }
+
+    /// Raises `shard`'s stream's checkpoint for change feeds (an `Lsn`'s raw value) with
+    /// release ordering, once the checkpoint edit is durable; it never goes down.
+    pub fn publish_feed_checkpoint(&self, shard: u32, lsn: u64) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_CKPT)
+            .fetch_max(lsn, Ordering::AcqRel);
+    }
+
+    /// Raises `shard`'s stream's lost bound (layout version 8, `watermark::FEED_BOUND`) with
+    /// release ordering; it never goes down. The writer stores it before the floor it
+    /// belongs to.
+    pub fn publish_feed_bound(&self, shard: u32, bound: u64) {
+        self.inner
+            .feed_mark(shard, watermark::FEED_BOUND)
+            .fetch_max(bound, Ordering::AcqRel);
+    }
+
+    /// `shard`'s stream's change-feed marks (layout version 8, Acquire each, in this order):
+    /// the floor epoch, the checkpoint `Lsn`'s raw value, and the lost bound (loaded after the
+    /// floor, so it is at least that floor's); zeros until a writer with the feed on stores
+    /// them.
+    pub fn feed_marks(&self, shard: u32) -> FeedMarksView {
+        let load = |f| self.inner.feed_mark(shard, f).load(Ordering::Acquire);
+        let floor = load(watermark::FEED_FLOOR) as u32;
+        let checkpoint = load(watermark::FEED_CKPT);
+        let bound = load(watermark::FEED_BOUND);
+        FeedMarksView {
+            floor,
+            checkpoint,
+            bound,
+        }
     }
 
     /// The change feed's frontier (D310): every commit at or below it is applied on every
@@ -1447,7 +1519,7 @@ mod tests {
             e,
             Error::VersionMismatch {
                 found: 9,
-                expected: 7
+                expected: 8
             }
         ));
         let e = Error::from(pigeonhole_format::Error::Corrupt { what: "x" });

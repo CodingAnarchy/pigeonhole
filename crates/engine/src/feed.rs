@@ -31,7 +31,28 @@ use pigeonhole_wal::FeedMarks;
 use crate::catalog::Catalog;
 use crate::manifest::{self, ManifestReq, ReqKind};
 use crate::shard::Shared;
-use crate::{EngineOptions, Error, Result};
+use crate::{EngineOptions, Error, FeedOptions, Result};
+
+impl LastSession {
+    /// The feed settings an open that doesn't mention the feed inherits from this session:
+    /// its retention and age, and its fed tables by name (a table dropped since is left out).
+    pub(crate) fn feed_options(&self, catalog: &Catalog) -> FeedOptions {
+        FeedOptions {
+            retention_bytes: self.retention_bytes,
+            max_age_micros: (self.retention_age_secs > 0)
+                .then(|| self.retention_age_secs.saturating_mul(1_000_000)),
+            tables: match &self.tables {
+                FeedTables::All => None,
+                FeedTables::Only(ids) => Some(
+                    ids.iter()
+                        .filter_map(|&id| catalog.table(id).map(|t| t.name.clone()))
+                        .collect(),
+                ),
+            },
+            sync_interval_micros: None,
+        }
+    }
+}
 
 /// The sidecar's path: `data.phdb-feed` beside `data.phdb`.
 pub(crate) fn sidecar_path(db: &Path) -> PathBuf {
@@ -89,6 +110,7 @@ pub(crate) fn open_sidecar(
         // finds no session for the segments' marks and expires.
         _ => None,
     };
+    let rewritten = valid.is_none();
     let mut sidecar = match valid {
         Some(end) => {
             if end as u64 != len {
@@ -113,7 +135,9 @@ pub(crate) fn open_sidecar(
     };
     sidecar.append(entry)?;
     sidecar.file.sync_all()?;
-    if !exists {
+    // A new file's name, and a rewritten one's (its creator may have died before its own
+    // directory sync, leaving the name in the page cache only; simp724 on fix A).
+    if !exists || rewritten {
         let dir = match db.parent() {
             Some(d) if !d.as_os_str().is_empty() => d,
             _ => Path::new("."),
@@ -121,6 +145,65 @@ pub(crate) fn open_sidecar(
         vfs.sync_dir(dir)?;
     }
     Ok(Some(sidecar))
+}
+
+/// What an open inherits from the sidecar's last session (the D310 amendment, the owner
+/// 2026-11-02): its retention, age, stream count and fed tables, so an open that doesn't
+/// mention the feed (a tool's, `phdb`'s) continues its history instead of ending it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LastSession {
+    pub(crate) retention_bytes: u64,
+    pub(crate) retention_age_secs: u64,
+    pub(crate) streams: u32,
+    pub(crate) tables: FeedTables,
+}
+
+/// The sidecar's last session, read-only: `None` without a sidecar, with another database's
+/// or a damaged header, or when the last open recorded "fed: none" (or an entry this build
+/// doesn't know, which fails closed). Root entries after the session don't change it.
+pub(crate) fn last_session(
+    vfs: &VfsRef,
+    db: &Path,
+    db_id: [u8; 16],
+) -> Result<Option<LastSession>> {
+    let path = sidecar_path(db);
+    if !vfs.exists(&path)? {
+        return Ok(None);
+    }
+    let file = vfs.open(&path, OpenOptions::read())?;
+    let mut bytes = vec![0u8; file.len()? as usize];
+    file.read_at(&mut bytes, 0)?;
+    match FeedHeader::decode(&bytes) {
+        Ok(h) if h.db_id == db_id => {}
+        _ => return Ok(None),
+    }
+    let (entries, _) = decode_entries(&bytes[FeedHeader::LEN..]);
+    Ok(last_of(&entries))
+}
+
+/// [`last_session`]'s rule over decoded entries.
+pub(crate) fn last_of(entries: &[FeedEntry]) -> Option<LastSession> {
+    for e in entries.iter().rev() {
+        match e {
+            FeedEntry::Root { .. } => continue,
+            FeedEntry::Session {
+                retention_bytes,
+                retention_age_secs,
+                streams,
+                tables,
+                ..
+            } => {
+                return Some(LastSession {
+                    retention_bytes: *retention_bytes,
+                    retention_age_secs: *retention_age_secs,
+                    streams: *streams,
+                    tables: tables.clone(),
+                });
+            }
+            FeedEntry::Unfed { .. } | FeedEntry::Unknown(_) => return None,
+        }
+    }
+    None
 }
 
 /// The change feed's session at open (D310): `None` with the feed off, after appending
@@ -260,6 +343,30 @@ pub(crate) struct Feed {
     /// Bytes of the held files (`DatabaseInfo`).
     held_bytes: AtomicU64,
     sidecar: Mutex<Option<Sidecar>>,
+    /// The coalesced sidecar sync's state ([`Feed::request_sidecar_sync`]).
+    sidecar_sync: Mutex<SidecarSync>,
+    /// Sidecar syncs completed.
+    sidecar_syncs: AtomicU64,
+    /// Each stream's checkpoint history, for the feed reader's start positions
+    /// ([`Feed::start_at`]).
+    checkpoints: Vec<Mutex<CheckpointHistory>>,
+}
+
+/// Whether a sidecar sync is in flight, and whether appends since its submission wait for
+/// the next.
+#[derive(Debug, Default)]
+struct SidecarSync {
+    inflight: bool,
+    dirty: bool,
+}
+
+/// One stream's recent checkpoints, each with the largest key (the seqno a feed reader
+/// orders a record by) of any record before it (D310 PR 3). Keys only grow along the list.
+/// Written by the stream's shard as its checkpoints commit, and pruned in its maintenance
+/// once the stream's floor passes them; read by feed readers choosing where to start.
+#[derive(Debug, Default)]
+struct CheckpointHistory {
+    entries: std::collections::VecDeque<(pigeonhole_format::Lsn, pigeonhole_format::Seqno)>,
 }
 
 impl Feed {
@@ -282,7 +389,120 @@ impl Feed {
             held: Mutex::default(),
             held_bytes: AtomicU64::new(0),
             sidecar: Mutex::new(None),
+            sidecar_sync: Mutex::default(),
+            sidecar_syncs: AtomicU64::new(0),
+            checkpoints: (0..streams).map(|_| Mutex::default()).collect(),
         }
+    }
+
+    /// Stream `stream`'s checkpoint moved to `at`, past records of keys at most `key`
+    /// (`ShardState::ckpt_key`). Called before the stream's own checkpoint mark is stored,
+    /// so a reader that loaded the mark finds an entry at least that new. At most two
+    /// entries per segment: the first, and the latest.
+    pub(crate) fn note_checkpoint(
+        &self,
+        stream: usize,
+        at: pigeonhole_format::Lsn,
+        key: pigeonhole_format::Seqno,
+    ) {
+        let Some(h) = self.checkpoints.get(stream) else {
+            return;
+        };
+        let mut h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        let e = &mut h.entries;
+        let key = e.back().map_or(key, |&(_, k)| k.max(key));
+        match e.back() {
+            Some(&(last, _)) if last >= at => return,
+            _ => {}
+        }
+        let n = e.len();
+        if n >= 2 && e[n - 1].0.epoch() == at.epoch() && e[n - 2].0.epoch() == at.epoch() {
+            e[n - 1] = (at, key);
+        } else {
+            e.push_back((at, key));
+        }
+    }
+
+    /// Drops stream `stream`'s checkpoint entries below `floor` (its oldest segment kept),
+    /// keeping the first at or past the floor's start: its key bounds every record before
+    /// it, the lost ones included.
+    pub(crate) fn prune_checkpoints(&self, stream: usize, floor: u32) {
+        let Some(h) = self.checkpoints.get(stream) else {
+            return;
+        };
+        let start = pigeonhole_format::Lsn::new(floor, 0);
+        let mut h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        while h.entries.len() >= 2 && h.entries[1].0 <= start {
+            h.entries.pop_front();
+        }
+    }
+
+    /// Where a feed reader of stream `stream` starts to see every record with a key above
+    /// `bound`: the latest checkpoint whose records before it all have keys at most `bound`.
+    /// `None` when records the stream has already dropped (below `floor`) may have keys
+    /// above `bound`: that history is gone.
+    pub(crate) fn start_at(
+        &self,
+        stream: usize,
+        bound: pigeonhole_format::Seqno,
+        floor: u32,
+    ) -> Option<pigeonhole_format::Lsn> {
+        let h = self.checkpoints.get(stream)?;
+        let h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        let start = pigeonhole_format::Lsn::new(floor, 0);
+        // The first entry at or past the floor's start bounds what was dropped.
+        let lost = h
+            .entries
+            .iter()
+            .find(|&&(at, _)| at >= start)
+            .or(h.entries.back())
+            .map_or(0, |&(_, k)| k);
+        if lost > bound {
+            return None;
+        }
+        h.entries
+            .iter()
+            .rev()
+            .find(|&&(at, k)| k <= bound && at >= start)
+            .map(|&(at, _)| at)
+            .or(Some(start))
+    }
+
+    /// The smallest start bound stream `stream`'s retained history serves (above `floor`):
+    /// the key bounding what it already dropped. [`FeedStart::Oldest`](crate::FeedStart)
+    /// starts at the largest of these over the streams.
+    pub(crate) fn oldest_bound(&self, stream: usize, floor: u32) -> pigeonhole_format::Seqno {
+        let Some(h) = self.checkpoints.get(stream) else {
+            return 0;
+        };
+        let h = h.lock().unwrap_or_else(PoisonError::into_inner);
+        let start = pigeonhole_format::Lsn::new(floor, 0);
+        h.entries
+            .iter()
+            .find(|&&(at, _)| at >= start)
+            .or(h.entries.back())
+            .map_or(0, |&(_, k)| k)
+    }
+
+    /// The largest key any stream's checkpoint has passed (a start bound every stream can
+    /// serve from its checkpoint).
+    pub(crate) fn checkpoint_key(&self) -> pigeonhole_format::Seqno {
+        self.checkpoints
+            .iter()
+            .filter_map(|h| {
+                h.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .entries
+                    .back()
+                    .map(|&(_, k)| k)
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Stream `stream`'s marks, if its stream is open.
+    pub(crate) fn marks(&self, stream: usize) -> Option<&Arc<FeedMarks>> {
+        self.marks.get(stream).and_then(OnceLock::get)
     }
 
     /// Whether the feed needs a record (D310): a batch or PREPARE that writes a fed table,
@@ -301,7 +521,12 @@ impl Feed {
                     .iter()
                     .flatten()
                     .any(|m| self.tables.contains(m.table)),
-                Some(Err(_)) => false,
+                Some(Err(e)) => {
+                    // Admission decodes every batch before it can be appended (perf287 on
+                    // #1297): one that fails here never reaches the log.
+                    debug_assert!(false, "a batch admission decoded fails to decode: {e}");
+                    false
+                }
             },
         }
     }
@@ -318,20 +543,104 @@ impl Feed {
         *self.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = Some(sidecar);
     }
 
-    /// After a root commit of this session (the pager's observer): appends its sequence.
-    /// Not synced, and a failure is only traced: a lost entry makes the next feeding open
-    /// see the sequence ahead of the last one recorded, so every token expires, which is the
-    /// safe direction (D310 §2.2).
-    pub(crate) fn note_root(&self, sequence: u64) {
-        let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(s) = sidecar.as_mut()
-            && let Err(e) = s.append(&FeedEntry::Root {
+    /// After a root commit of this session (the pager's observer): appends its sequence and
+    /// asks for a coalesced sync ([`Feed::request_sidecar_sync`]). A failure ends the
+    /// session's appends, as a failed sync does (fail closed): a partly written entry is
+    /// never followed by more, and the next feeding open sees the sequence ahead of the last
+    /// one recorded, so every token expires, which is the safe direction (D310 §2.2).
+    pub(crate) fn note_root(self: &Arc<Self>, sequence: u64) {
+        let file = {
+            let mut sidecar = self.sidecar.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(s) = sidecar.as_mut() else {
+                return;
+            };
+            if let Err(e) = s.append(&FeedEntry::Root {
                 session: self.session,
                 sequence,
-            })
+            }) {
+                crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
+                *sidecar = None;
+                return;
+            }
+            Arc::clone(&s.file)
+        };
+        self.request_sidecar_sync(file);
+    }
+
+    /// Makes the sidecar's appends durable (D310 call 4, fix A): an entry a power loss
+    /// dropped would break the session chain at the next open and expire every durable
+    /// feed, which call 4 promises survives a restart; now only a crash before the sync
+    /// lands does (the safe direction).
+    ///
+    /// - **Coalesced** (perf287): at most one sync in flight; appends made meanwhile share
+    ///   the next one. At most one per root commit, never one per data commit.
+    /// - **Never waited on:** the thread that completes a root commit (the manifest pump's,
+    ///   or an application thread making a catalog change) only submits it. The pread
+    ///   backend runs it on its pool and io_uring in the kernel, so no thread blocks on it, a
+    ///   shard's least of all. The simulator runs it inline, to keep seeds deterministic.
+    /// - **At the pager's durability** (simp724): the VFS's `sync_all`, `F_FULLFSYNC` on
+    ///   macOS, and `sync_all` since an append grows the file.
+    /// - **Fail closed:** a failed sync ends the session's appends (no retry).
+    fn request_sidecar_sync(self: &Arc<Self>, file: FileRef) {
         {
-            crate::shard::trace!("feed: sidecar append after root {sequence} failed: {e}");
+            let mut st = self
+                .sidecar_sync
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if st.inflight {
+                st.dirty = true;
+                return;
+            }
+            st.inflight = true;
         }
+        let this = Arc::clone(self);
+        let again = Arc::clone(&file);
+        // `sync_all`: an append grows the file, and its new length must be durable with it.
+        drop(file.submit_sync_all().map(move |r| {
+            if let Err(e) = &r {
+                // Fail closed (simp724): no retry, and no append that a later sync could
+                // report clean over pages the kernel dropped. The next open finds the
+                // sequence ahead of the last entry and expires every token.
+                crate::shard::trace!("feed: sidecar sync failed, no more appends: {e}");
+                *this.sidecar.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                let mut st = this
+                    .sidecar_sync
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                st.inflight = false;
+                st.dirty = false;
+                return Ok(());
+            }
+            this.sidecar_syncs.fetch_add(1, Ordering::Relaxed);
+            let more = {
+                let mut st = this
+                    .sidecar_sync
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                st.inflight = false;
+                std::mem::take(&mut st.dirty)
+            };
+            if more {
+                this.request_sidecar_sync(again);
+            }
+            Ok(())
+        }));
+    }
+
+    /// Whether a sidecar sync is in flight or wanted: Root entries a power loss may still
+    /// drop (an inspection helper for tests).
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn sidecar_sync_pending(&self) -> bool {
+        let st = self
+            .sidecar_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        st.inflight || st.dirty
+    }
+
+    /// Sidecar syncs completed (`Engine::feed_sidecar_syncs`).
+    pub(crate) fn sidecar_syncs(&self) -> u64 {
+        self.sidecar_syncs.load(Ordering::Relaxed)
     }
 
     /// The WAL bytes retained as history, over every stream.
@@ -488,4 +797,64 @@ pub(crate) fn release_held(shared: &Arc<Shared>, shard: ShardId) {
         ..req
     };
     manifest::submit(shared, shard, req);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pigeonhole_format::TableId;
+
+    fn session(streams: u32) -> FeedEntry {
+        FeedEntry::Session {
+            session: 1,
+            opened_at: 1,
+            retention_bytes: 1 << 20,
+            retention_age_secs: 60,
+            streams,
+            tables: FeedTables::Only(vec![TableId(2)]),
+        }
+    }
+
+    /// D310's amendment: an open inherits the last session's settings, through any Root
+    /// entries after it, and nothing once a later open recorded the feed off (or an entry
+    /// this build doesn't know).
+    #[test]
+    fn the_last_session_is_inherited_until_an_open_turns_the_feed_off() {
+        assert_eq!(last_of(&[]), None);
+        let want = LastSession {
+            retention_bytes: 1 << 20,
+            retention_age_secs: 60,
+            streams: 3,
+            tables: FeedTables::Only(vec![TableId(2)]),
+        };
+        let roots = [
+            session(3),
+            FeedEntry::Root {
+                session: 1,
+                sequence: 2,
+            },
+            FeedEntry::Root {
+                session: 1,
+                sequence: 3,
+            },
+        ];
+        assert_eq!(last_of(&roots), Some(want.clone()));
+        // The newest session wins.
+        assert_eq!(
+            last_of(&[session(2), session(3)]).map(|l| l.streams),
+            Some(3)
+        );
+        // A feed-off open since: nothing to inherit.
+        assert_eq!(
+            last_of(&[session(3), FeedEntry::Unfed { sequence: 4 }]),
+            None
+        );
+        // An entry this build doesn't know: fail closed.
+        assert_eq!(last_of(&[session(3), FeedEntry::Unknown(0xee)]), None);
+        // A feed-off open, then a feeding one: that one.
+        assert_eq!(
+            last_of(&[FeedEntry::Unfed { sequence: 1 }, session(3)]),
+            Some(want)
+        );
+    }
 }

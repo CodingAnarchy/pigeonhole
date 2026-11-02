@@ -714,7 +714,11 @@ impl Table {
     /// A breadth-first traversal (D304) of a graph stored as adjacency rows: each hop
     /// follows `family`'s edges (a column per edge, its qualifier the destination's key)
     /// from the previous hop's nodes, and keeps the nodes not visited before.
-    #[pyo3(signature = (seeds, family, *, hops=1, per_node_limit=None, hop_limit=None, max_nodes=None, parents=false, qualifier_prefix=None, snapshot=None, parallel=None))]
+    /// `byte_budget` stops it at that many bytes of nodes (each its key and 16, plus 4 with
+    /// `parents`; the seeds aren't counted), D308: the hop it cuts keeps its in-budget
+    /// prefix, and `cut_by_budget` says so. `None`, the default, sets no budget; 0 is
+    /// refused.
+    #[pyo3(signature = (seeds, family, *, hops=1, per_node_limit=None, hop_limit=None, max_nodes=None, byte_budget=None, parents=false, qualifier_prefix=None, snapshot=None, parallel=None))]
     #[allow(clippy::too_many_arguments)]
     fn traverse(
         &self,
@@ -725,6 +729,7 @@ impl Table {
         per_node_limit: Option<u32>,
         hop_limit: Option<u64>,
         max_nodes: Option<u64>,
+        byte_budget: Option<u64>,
         parents: bool,
         qualifier_prefix: Option<&Bound<'_, PyAny>>,
         snapshot: Option<&Bound<'_, Snapshot>>,
@@ -739,6 +744,7 @@ impl Table {
             per_node_limit,
             hop_limit,
             max_nodes,
+            byte_budget,
             parents,
             qualifier_prefix,
             snapshot,
@@ -767,7 +773,7 @@ impl Table {
         snapshot: Option<&Bound<'_, Snapshot>>,
         parallel: Option<usize>,
     ) -> PyResult<Vec<crate::walk::Neighbour>> {
-        crate::walk::nearest(
+        let (found, _) = crate::walk::nearest(
             py,
             &self.0,
             family,
@@ -780,7 +786,189 @@ impl Table {
             qualifier_prefix,
             snapshot,
             parallel,
+            None,
+        )?;
+        Ok(found.into_iter().map(crate::walk::Neighbour).collect())
+    }
+
+    /// `nearest`'s neighbours, nearest first, that fit `bytes` (D308): each counts its row
+    /// key, its qualifier and 16 bytes, and a neighbour is in whole or not at all. The budget
+    /// bounds the result, not the work: the search reads and ranks as `nearest` does. There's
+    /// no resume position: ask again with a larger budget or `k`.
+    #[pyo3(signature = (family, query, k, *, bytes, prefix=None, start=None, end=None, keys=None, qualifier_prefix=None, snapshot=None, parallel=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn nearest_within(
+        &self,
+        py: Python<'_>,
+        family: String,
+        query: &Bound<'_, PyAny>,
+        k: usize,
+        bytes: u64,
+        prefix: Option<&Bound<'_, PyAny>>,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        keys: Option<Vec<Bound<'_, PyAny>>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        parallel: Option<usize>,
+    ) -> PyResult<crate::budget::NearestPage> {
+        let (found, page) = crate::walk::nearest(
+            py,
+            &self.0,
+            family,
+            query,
+            k,
+            prefix,
+            start,
+            end,
+            keys,
+            qualifier_prefix,
+            snapshot,
+            parallel,
+            Some(bytes),
+        )?;
+        let (bytes, next_bytes) = page.expect("a budgeted search returns its page");
+        Ok(crate::budget::NearestPage {
+            neighbours: found
+                .into_iter()
+                .map(|n| Py::new(py, crate::walk::Neighbour(n)))
+                .collect::<PyResult<_>>()?,
+            bytes,
+            next_bytes,
+        })
+    }
+
+    /// A page of `scan`'s cells, in scan order, at most `bytes` long (D308): each cell counts
+    /// its qualifier, its value and 16 bytes, and each row its key once. A column (all the
+    /// versions the read selects) is kept whole or not at all; a row may be cut between
+    /// columns. `limit` applies too: whichever comes first stops the read. `after` resumes
+    /// where an earlier page stopped (its `resume`). Without a `snapshot`, a chain of pages
+    /// is not one consistent read.
+    #[pyo3(signature = (prefix=None, *, bytes, start=None, end=None, families=None, qualifier_prefix=None, versions=1, limit=None, column_limit=None, snapshot=None, after=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn scan_within(
+        &self,
+        py: Python<'_>,
+        prefix: Option<&Bound<'_, PyAny>>,
+        bytes: u64,
+        start: Option<&Bound<'_, PyAny>>,
+        end: Option<&Bound<'_, PyAny>>,
+        families: Option<Vec<String>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        versions: u32,
+        limit: Option<u64>,
+        column_limit: Option<u32>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        after: Option<&crate::budget::ScanPosition>,
+    ) -> PyResult<crate::budget::ScanPage> {
+        crate::budget::scan_within(
+            py,
+            &self.0,
+            bytes,
+            prefix,
+            start,
+            end,
+            families,
+            qualifier_prefix,
+            versions,
+            limit,
+            column_limit,
+            snapshot,
+            after,
         )
+    }
+
+    /// A page of `multi_get`'s cells, in key order, at most `bytes` long (D308), as
+    /// `scan_within` counts them. Unlike `multi_get`, the rows aren't aligned with `keys`:
+    /// they come in key order, and keys with no cell the selection keeps return nothing. `after` resumes where an earlier page stopped:
+    /// at the first key at or after its position's key, so keys added or removed between
+    /// pages resume at the right one.
+    #[pyo3(signature = (keys, *, bytes, families=None, qualifier_prefix=None, versions=1, column_limit=None, snapshot=None, after=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn multi_get_within(
+        &self,
+        py: Python<'_>,
+        keys: Vec<Bound<'_, PyAny>>,
+        bytes: u64,
+        families: Option<Vec<String>>,
+        qualifier_prefix: Option<&Bound<'_, PyAny>>,
+        versions: u32,
+        column_limit: Option<u32>,
+        snapshot: Option<&Bound<'_, Snapshot>>,
+        after: Option<&crate::budget::KeysPosition>,
+    ) -> PyResult<crate::budget::KeysPage> {
+        crate::budget::multi_get_within(
+            py,
+            &self.0,
+            &keys,
+            bytes,
+            families,
+            qualifier_prefix,
+            versions,
+            column_limit,
+            snapshot,
+            after,
+        )
+    }
+
+    /// Subscribes to this table's committed changes (the change feed, D310): a `Feed` of
+    /// whole commits, once each, in commit order. The database's change feed must be on, set
+    /// with `change_feed=` or inherited from the last open, and follow this table. The writer
+    /// process only, for now.
+    ///
+    /// `tables` adds more tables to the same feed (a commit across them arrives whole),
+    /// `prefix` keeps only changes to rows under it, and `visible=True` delivers a commit as
+    /// soon as reads see it rather than once it is durable. The feed starts after this call,
+    /// or after the commits `from_snapshot` sees, or at the oldest history kept
+    /// (`from_oldest=True`), or after a stored `resume` token (`Feed.token()`'s bytes).
+    #[pyo3(signature = (*, tables=None, prefix=None, visible=false, from_snapshot=None, from_oldest=false, resume=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn feed(
+        &self,
+        py: Python<'_>,
+        tables: Option<Vec<Bound<'_, Table>>>,
+        prefix: Option<&Bound<'_, PyAny>>,
+        visible: bool,
+        from_snapshot: Option<&Bound<'_, Snapshot>>,
+        from_oldest: bool,
+        resume: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<crate::feed::Feed> {
+        let Handle::Writer(t) = &self.0 else {
+            return Err(with_code(
+                pigeonhole::ErrorCode::Unsupported,
+                "a reader process can't subscribe to the change feed yet",
+            ));
+        };
+        let starts = usize::from(from_snapshot.is_some())
+            + usize::from(from_oldest)
+            + usize::from(resume.is_some());
+        if starts > 1 {
+            return Err(PyValueError::new_err(
+                "one of from_snapshot, from_oldest and resume, not several",
+            ));
+        }
+        let mut b = t.feed();
+        for other in tables.iter().flatten() {
+            b = b.table(other.get().writer()?);
+        }
+        if let Some(p) = prefix {
+            b = b.prefix(&convert::bytes(p)?);
+        }
+        if visible {
+            b = b.visible();
+        }
+        if let Some(s) = snapshot_arg(from_snapshot)? {
+            b = b.from_snapshot(&s);
+        }
+        if from_oldest {
+            b = b.from_oldest();
+        }
+        if let Some(r) = resume {
+            b = b.resume(&pigeonhole::FeedToken::from_bytes(convert::bytes(r)?));
+        }
+        py.detach(move || b.open())
+            .or_py()
+            .map(crate::feed::Feed::new)
     }
 
     /// A wide row's pages, at most `size` cells each (a column's versions never split), each

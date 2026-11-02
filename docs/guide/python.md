@@ -92,6 +92,37 @@ with ph.open(path, create=True) as db:
         assert len(t.row(b"timeline", snapshot=snap)) == 25
 ```
 
+### Reads within a byte budget
+For filling a context window by size rather than by row count (D308; see [Byte budgets](scans-and-filters.md#byte-budgets)):
+- **`scan_within(prefix, bytes=...)`** returns a `ScanPage`: the longest prefix of the scan's cells whose size fits `bytes`. Each cell counts its qualifier, its value and 16 bytes, and each row its key once. A column is kept whole or not at all, and a row may be cut between columns. `limit` applies too: whichever comes first stops the read.
+- **`multi_get_within(keys, bytes=...)`** returns a `KeysPage`, the same over a multi-get's rows. Unlike `multi_get`, its rows aren't aligned with `keys`: they come in key order, with no entry for a key that has no cell.
+- **A page** has `rows`, `bytes`, `cut_by_budget`, `next_bytes` and `resume`.
+  - `next_bytes` is the size of the first column that didn't fit, its row key included. A page resumed with that budget returns it.
+  - Pass `after=page.resume` to read the next page.
+  - A `ScanPosition` or `KeysPosition` has `to_bytes()` and `from_bytes()`, to hand to a client.
+  - A position from another table, or of the other kind, raises `InvalidArgument`.
+  - A chain of pages is one consistent read only with one `snapshot=`.
+- **`nearest_within(family, query, k, bytes=...)`** returns a `NearestPage`: `nearest`'s neighbours that fit. Each counts its row key, its qualifier and 16 bytes. The budget bounds the result, not the work, and there's no resume position.
+- **`traverse(..., byte_budget=n)`** stops the traversal at `n` bytes of nodes, and sets `cut_by_budget`.
+  - Each node counts its key and 16 bytes, plus 4 with `parents=True`. The seeds aren't counted.
+  - `None`, the default, sets no budget, and 0 is refused.
+
+The budget is keyword-only (`bytes=`) in all three. Budgets and sizes are bytes, not characters.
+
+```python
+import pigeonhole as ph
+
+with ph.open(path, create=True) as db:
+    t = db.table("docs").family("text").create()
+    for i in range(100):
+        t.put(f"doc:{i:03}", "text", b"body", bytes(200))
+    page = t.scan_within(b"doc:", bytes=2048)
+    assert page.bytes <= 2048 and page.cut_by_budget
+    token = page.resume.to_bytes()            # hand this to a client
+    nxt = t.scan_within(b"doc:", bytes=2048, after=ph.ScanPosition.from_bytes(token))
+    assert nxt.rows[0].key == b"doc:009"
+```
+
 ## Writes, batches and transactions
 - **`Table.put`, `incr` and `delete`** each commit one change.
 - **`mutate(row)`** chains writes to one row and commits them atomically. `commit_if(Condition.absent(...))` commits only if the condition holds, and returns `None` otherwise.
@@ -147,7 +178,7 @@ with ph.open(path, create=True) as db:
 ```
 
 ## Graphs
-Store a graph as adjacency rows, as in the [graphs guide](graphs.md): a row per node, and in an edge family one column per edge, its qualifier the destination's key. `traverse(seeds, family, hops=...)` runs a breadth-first search inside the engine. It returns each hop's new nodes, sorted, with `parents=True` for shortest paths, and takes `per_node_limit`, `hop_limit` and `max_nodes`.
+Store a graph as adjacency rows, as in the [graphs guide](graphs.md): a row per node, and in an edge family one column per edge, its qualifier the destination's key. `traverse(seeds, family, hops=...)` runs a breadth-first search inside the engine. It returns each hop's new nodes, sorted, with `parents=True` for shortest paths, and takes `per_node_limit`, `hop_limit`, `max_nodes` and `byte_budget`.
 
 ```python
 import pigeonhole as ph
@@ -159,6 +190,28 @@ with ph.open(path, create=True) as db:
             wb.put(g, f"n:{a}", "out", f"n:{b}", b"")
     t = g.traverse([b"n:a"], "out", hops=3, parents=True)
     assert [h.nodes for h in t.hops] == [[b"n:b", b"n:c"], [b"n:d"], [b"n:e"]]
+```
+
+## The change feed
+Open the database with `change_feed=` (the history to keep, in bytes; `feed_age=` bounds it in time too); later opens that don't mention the feed keep it, and `change_feed_off=True` turns it off. Then `t.feed()` subscribes to a table's committed changes: whole commits, once each, in commit order. A commit arrives once it is durable at its level, so nothing delivered is ever undone (`visible=True` for sooner). Each `Commit` has `seqno`, `timestamp` and `changes`. Each `Change` has `table`, `family`, `kind` (`"put"`, `"merge"`, `"delete_cell"`, `"delete_column"`, `"delete_family"`), `row`, `qualifier`, `timestamp` and `value` (typed as reads type it, `None` for deletes).
+
+`feed.next(timeout=...)` waits for the next commit with the GIL released, and returns `None` if none came in time. `try_next()` never waits, and `for commit in feed:` waits for each in turn. Store `feed.token()` with what the commits fed: `t.feed(resume=token)` continues there, after a reopen too. `tables=[...]` adds tables to the same feed, `prefix=` keeps only rows under it, and `from_snapshot=` starts after what a snapshot saw, so a reader can load a snapshot and then follow the changes without missing or repeating any. When the history a feed needs is gone (retention passed it, or an open with `change_feed_off=True` ended it), the feed raises `FeedExpired` from then on: rebuild from a snapshot and start again. The writer process subscribes; reader processes can't yet.
+
+```python
+import pigeonhole as ph
+
+with ph.open(path, create=True, change_feed=64 << 20) as db:
+    t = db.table("orders").family("f").create()
+    feed = t.feed()
+    t.put(b"order:1", "f", b"status", b"paid")
+    commit = feed.next(timeout=5)
+    (change,) = commit.changes
+    assert (change.kind, change.row, change.value) == ("put", b"order:1", b"paid")
+    token = feed.token()  # store it with what the commit fed
+    feed.close()
+    t.put(b"order:1", "f", b"status", b"shipped")
+    with t.feed(resume=token) as feed:
+        assert feed.next(timeout=5).changes[0].value == b"shipped"
 ```
 
 ## Readers, threads and processes

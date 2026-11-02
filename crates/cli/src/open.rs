@@ -11,6 +11,13 @@
 //!   the command.
 //!
 //! `--reader` and `--writer` force one role.
+//!
+//! A command that only reads (`info`, `dump`, `backup`, `shell --read-only`) opens through
+//! [`for_inspect`] instead: as the writer it opens read-only (`Options::read_only`, ICR
+//! 0109), so it writes nothing to the database. In particular it starts no change-feed
+//! session, so an application's feed tokens stay valid across it (D310 amendment (d)). The
+//! WAL a crashed writer left is replayed into memory and left in place for the
+//! application's next open.
 
 use std::path::Path;
 
@@ -182,15 +189,52 @@ impl Db {
 
 /// Opens `path` for a read command, by the policy above.
 pub(crate) fn for_read(cli: &Cli, path: &Path) -> Result<Db, Failure> {
+    for_read_with_feed(cli, path, None)
+}
+
+/// [`for_read`], with the change feed turned on (`phdb mcp --change-feed`) if `feed` gives
+/// its retention in bytes. Without it, a writer open inherits the application's feed, if it
+/// has one (D310 amendment (c)).
+pub(crate) fn for_read_with_feed(cli: &Cli, path: &Path, feed: Option<u64>) -> Result<Db, Failure> {
     exists(path)?;
     if cli.reader {
         return reader(cli, path).map(Db::Reader);
     }
-    match writer(cli, path) {
+    match Pigeonhole::open(path, with_feed(options(cli, path, false), feed)) {
         Ok(db) => Ok(Db::Writer(db)),
         Err(e) if e.code() == ErrorCode::WriterLocked && !cli.writer => {
             reader(cli, path).map(Db::Reader)
         }
+        Err(e) => Err(Failure::db("open", &e)),
+    }
+}
+
+/// Opens `path` for a command that only reads: as [`for_read`], but a writer open is
+/// read-only (ICR 0109) and writes nothing, so it leaves the database, and an
+/// application's change feed, as it found them.
+pub(crate) fn for_inspect(cli: &Cli, path: &Path) -> Result<Db, Failure> {
+    exists(path)?;
+    if cli.reader {
+        return reader(cli, path).map(Db::Reader);
+    }
+    match Pigeonhole::open(
+        path,
+        options(cli, path, false)
+            // A read-only open writes no feed session, so its shard count can't reshard:
+            // one keeps phdb light (D-a: any count replays).
+            .shards(1)
+            .read_only(true),
+    ) {
+        Ok(db) => Ok(Db::Writer(db)),
+        Err(e) if e.code() == ErrorCode::WriterLocked && !cli.writer => {
+            reader(cli, path).map(Db::Reader)
+        }
+        // The replay of a crashed writer's log must fit in memory: say how to get past it.
+        Err(e) if e.code() == ErrorCode::ReadOnly => Err(Failure::db("open", &e).hint(
+            "phdb reads without writing, so a crashed writer's log is replayed into memory, \
+             and this one is too large: open the database once with your application (or \
+             phdb shell without --read-only) to checkpoint it",
+        )),
         Err(e) => Err(Failure::db("open", &e)),
     }
 }
@@ -212,10 +256,20 @@ fn exists(path: &Path) -> Result<(), Failure> {
 /// Opens `path` as the writer for a write command (`load`): a running writer is exit 4.
 /// With `create`, a missing file is created.
 pub(crate) fn for_write(cli: &Cli, path: &Path, create: bool) -> Result<Pigeonhole, Failure> {
+    for_write_with_feed(cli, path, create, None)
+}
+
+/// [`for_write`], with the change feed on if `feed` gives its retention in bytes.
+pub(crate) fn for_write_with_feed(
+    cli: &Cli,
+    path: &Path,
+    create: bool,
+    feed: Option<u64>,
+) -> Result<Pigeonhole, Failure> {
     if !create {
         exists(path)?;
     }
-    Pigeonhole::open(path, options(cli, create)).map_err(|e| {
+    Pigeonhole::open(path, with_feed(options(cli, path, create), feed)).map_err(|e| {
         if e.code() == ErrorCode::WriterLocked {
             Failure::db_with(
                 "open: a writer process has the database open; stop it to write to the \
@@ -233,14 +287,23 @@ pub(crate) fn for_write(cli: &Cli, path: &Path, create: bool) -> Result<Pigeonho
 /// creating the file, and falling back to a read-only open (ICR 0059) for a database phdb
 /// cannot write: families whose merge operator phdb cannot know, or a feature a newer build
 /// added that this one may only read. That open writes nothing to the file.
-fn writer(cli: &Cli, path: &Path) -> pigeonhole::Result<Pigeonhole> {
-    Pigeonhole::open(path, options(cli, false))
+fn with_feed(options: Options, feed: Option<u64>) -> Options {
+    match feed {
+        Some(bytes) => options.change_feed(pigeonhole::FeedRetention::bytes(bytes)),
+        None => options,
+    }
 }
 
-fn options(cli: &Cli, create: bool) -> Options {
-    let mut options = Options::default()
-        .create_if_missing(create)
-        .shards(1)
+/// The writer's options for `path`. One shard for a database phdb creates; an existing
+/// one keeps its own count. An explicit count that differs from the one the application's
+/// change feed recorded would reshard, ending the feed's history (D310 amendment (c)),
+/// while an unset count inherits it.
+fn options(cli: &Cli, path: &Path, create: bool) -> Options {
+    let mut options = Options::default().create_if_missing(create);
+    if !path.exists() {
+        options = options.shards(1);
+    }
+    let mut options = options
         .pin_threads(false)
         .block_cache(BLOCK_CACHE)
         .row_cache(0)

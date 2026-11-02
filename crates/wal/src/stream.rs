@@ -424,7 +424,7 @@ impl WalCounters {
 }
 
 /// A stream's change-feed marks (D310), written by the stream on its shard thread and read
-/// from any thread: the blob GC horizon and `DatabaseInfo` use them.
+/// from any thread: the blob GC horizon, `DatabaseInfo` and the feed reader use them.
 ///
 /// ```
 /// use std::path::Path;
@@ -449,6 +449,20 @@ pub struct FeedMarks {
     head: AtomicU32,
     floor: AtomicU32,
     retained_bytes: AtomicU64,
+    checkpoint: AtomicU64,
+    /// Where the marks are published for other processes (D310 PR 4), once set.
+    mirror: std::sync::OnceLock<Box<dyn MarkMirror>>,
+}
+
+/// Publishes a stream's feed marks beyond this process (D310 PR 4: the engine's shared-memory
+/// region, for reader processes' change feeds). Each call follows the mark's own store, on
+/// the same thread and in the same place, so it keeps the mark's ordering: `checkpoint` once
+/// the checkpoint is unneeded. Called per retention pass and per checkpoint, never per record.
+pub trait MarkMirror: Send + Sync + fmt::Debug {
+    /// The floor rose to `epoch` (as [`FeedMarks::floor`]).
+    fn floor(&self, epoch: u32);
+    /// The checkpoint rose to `lsn` (as [`FeedMarks::checkpoint`]).
+    fn checkpoint(&self, lsn: Lsn);
 }
 
 impl FeedMarks {
@@ -470,6 +484,48 @@ impl FeedMarks {
     /// The bytes of the segments the checkpoint passed and retention keeps.
     pub fn retained_bytes(&self) -> u64 {
         self.retained_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The stream's checkpoint: replay would start here, so nothing before it is needed
+    /// again. Stored (Release) by [`Wal::checkpoint`](crate::Wal::checkpoint), which the
+    /// engine calls only once the records it passes are unneeded, and by a reopen from the
+    /// checkpoint it recovered from. A feed reader that loads it (Acquire) sees what the
+    /// engine knew when it moved the checkpoint: a cross-shard PREPARE it passed was aborted
+    /// or decided and settled (D310 PR 3; simp724's rule for held PREPAREs). Never goes down.
+    /// Kept only with retention on (the default `Lsn` otherwise).
+    pub fn checkpoint(&self) -> Lsn {
+        Lsn(self.checkpoint.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn set_checkpoint(&self, at: Lsn) {
+        self.checkpoint.fetch_max(at.0, Ordering::AcqRel);
+        if let Some(m) = self.mirror.get() {
+            m.checkpoint(self.checkpoint());
+        }
+    }
+
+    fn set_head(&self, epoch: u32) {
+        self.head.store(epoch, Ordering::Release);
+    }
+
+    fn raise_floor(&self, floor: u32) {
+        self.floor.fetch_max(floor, Ordering::AcqRel);
+        if let Some(m) = self.mirror.get() {
+            m.floor(self.floor());
+        }
+    }
+
+    /// Publishes the marks through `mirror` from now on, starting with their current values
+    /// (so nothing stored before it is missed). The first call wins; later ones are ignored.
+    /// Call it before the stream's shard runs: a store racing the first publication could
+    /// publish an older head after a newer one.
+    pub fn set_mirror(&self, mirror: Box<dyn MarkMirror>) {
+        if self.mirror.set(mirror).is_ok()
+            && let Some(m) = self.mirror.get()
+        {
+            m.floor(self.floor());
+            m.checkpoint(self.checkpoint());
+        }
     }
 }
 
@@ -1539,6 +1595,11 @@ impl WalStream {
         }
     }
 
+    /// The stream's feed marks, for the crate's own updates.
+    pub(crate) fn feed_marks_ref(&self) -> &FeedMarks {
+        &self.marks
+    }
+
     /// Takes the change-feed settings of `opts` (D310): retention and the feed session. Called
     /// before the stream's first segment.
     pub(crate) fn configure_feed(&mut self, opts: &WalOptions) {
@@ -1722,7 +1783,7 @@ impl WalStream {
             .map(|i| self.slots[i])
             .min();
         if let Some(floor) = floor {
-            self.marks.floor.fetch_max(floor, Ordering::AcqRel);
+            self.marks.raise_floor(floor);
         }
         let retained = (0..self.slots.len())
             .filter(|&i| self.is_retained(i))
@@ -1846,7 +1907,7 @@ impl WalStream {
         self.max_epoch = epoch;
         self.slot = slot;
         self.epoch = epoch;
-        self.marks.head.store(epoch, Ordering::Release);
+        self.marks.set_head(epoch);
         self.written_off = 0;
         self.enc = FrameEncoder::new(epoch, FRAME);
         self.buf.resize(FRAME_SIZE, 0);
@@ -2138,6 +2199,9 @@ impl Wal for WalStream {
         // The current segment is never recycled, so the checkpoint epoch never exceeds it.
         let epoch = upto.epoch().min(self.epoch);
         self.checkpoint_epoch = self.checkpoint_epoch.max(epoch);
+        if self.retain != 0 {
+            self.marks.set_checkpoint(upto);
+        }
         self.update_retain_floor(None);
         self.publish_recyclable();
         Ok(())
@@ -2157,6 +2221,10 @@ impl Wal for WalStream {
         }
         self.update_retain_floor(max_age.map(|a| (now, a)));
         self.publish_recyclable();
+    }
+
+    fn header_held(&self) -> bool {
+        self.held_header().is_some()
     }
 
     fn feed_marks(&self) -> Option<Arc<FeedMarks>> {

@@ -1,0 +1,2 @@
+### Added
+- `phdb mcp` has a `nearest` tool (#1253): the `k` vectors nearest a query in a vector family, with their rows, qualifiers, timestamps and distances, under a row, prefix or range and qualifier selection. Queries are lists of numbers (0s and 1s, or packed base64, for bit families), checked against the family's spec. It's listed when the database has a vector family. A result past `--max-result-bytes` keeps the nearest that fit and is marked `truncated`.

@@ -3621,6 +3621,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - **Writes (PR 2):** only `put_vector_f32`, `put_vector_i8` and `put_vector_bits` (and `_at` forms) into a vector family, of its element and dimension, refused when the write is built otherwise; no merge operator and no other value. NaN, ±∞, `f32` components above 2^56 in magnitude, and (cosine) vectors with a zero norm (an `f32` squared norm below `f32::MIN_POSITIVE`) are refused, for stored vectors and queries alike, so every distance is finite (perf287's B1 on #1255).
 - **Reads:** `Value::Vector`/`VectorRef` (PR 2); the typed `nearest_f32`, `nearest_i8` and `nearest_bits` with D296 PR 4. `i8` is raw signed bytes: the application quantises.
 - **PRs:** 1, the format, with the engine refusing a vector family (`Unsupported`) and a vector value in any batch until 2, the engine and public API; 3, the Arrow and `phdb` mappings.
+- **PR 3 (#1309, ICR 0108):** `phdb` dumps vector values as `{"vector": {"dim", "element", "values"}}` (bit vectors as `base64`; floats as the `f64`s they widen to), exact for every element, and `load` writes them back bit for bit after checking the family's element and dim. A family's options carry `"vector": {"dim", "element", "metric"}`. In Arrow, `value_type` gains `vector`, `value` is the stored encoding, and `ArrowOptions::vector_dim(n)` adds `value_vector: FixedSizeList<Float32, n>`, widened exactly, null for other cells and bit vectors, and an error for another dimension. Before it, a dump lost vectors and an Arrow export of a vector family failed.
 - **Half precision (amendment, owner 2026-10-31, #1263, ICR 0104):** element codes 4 = `f16` (IEEE binary16) and 5 = `bf16` (bfloat16), each a 2-byte little-endian bit pattern, under L2, inner product and cosine (Hamming stays bit-only), sharing `incompat` bit 0.
   - **Writes:** `put_vector_f16`/`put_vector_bf16(&[u16])` store the bits as given. `put_vector_f32` into a half family rounds each component to nearest, ties to even, refuses one that overflows the element, and checks the rounded vector as stored, so an `f32` vector that rounds to zero under cosine is refused ("rounds to a zero vector").
   - **Bounds:** `f16` needs only finiteness (its largest value, 65,504, bounds it; an `f32` query's 2^56 rule bounds the mixed sums). `bf16` keeps `f32`'s 2^56 bound. Under cosine, the squared norm of the widened components must be at least `f32::MIN_POSITIVE`.
@@ -3905,6 +3906,43 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `id_prefix` equals the full search filtered by prefix, at large and small `k`;
   - the terminator's effect.
 
+**PR 3b.** `ReadIndex` and the guide.
+- **`Index::open_reader` (and `_with_tokenizer`)** opens the index from a `PigeonholeReader`. It runs the same tokeniser checks as `open`, and both opens now refuse a table without the index's families (`InvalidArgument`).
+- **`ReadIndex`** searches and verifies at the reader's snapshots. Its searches fail with `Busy` while the writer's `repair` runs.
+- **Code shape:** the writer and reader handles share one `Index` core over a small enum of table kinds, so a search runs the same code from either process.
+- **The guide page** `docs/guide/text-search.md` is doctested.
+- **The AX102 bench** (`crates/text/examples/bench.rs`) flushes only, with no forced `compact()`. A full compaction of this index writes about 1,000× its size (#1313, a 1.1.0 blocker owned by perf2). The coordinator's call (2026-11-02) is to ship flush-only numbers, say so in the guide, and re-take them once #1313 is fixed, as part of the pre-1.1.0 recheck.
+- **Tests:** a reader process searches what the writer committed, and a plain table is refused.
+- **The AX102 numbers** (1M documents of about 40 words, flush only, the mean of two runs):
+  - **The owner's write-cost row:** positions cost +18% write time (136 → 160 µs a document) and +58% stored bytes (1,044 → 1,649 a document). That's well under the Mac's 2.5×, so positions stay on by default.
+  - **Searches:** two terms 2.5 ms p50, two hub terms 44 ms, a rare phrase 0.28 ms, a phrase of two hub words 403 ms (#1334, Post-1.0).
+  - **Re-taken after #1332 (#1349, the pre-1.1.0 recheck):** a full compaction, with #1353, without #1350, the mean of two runs.
+    - **Compaction:** a full compaction takes 4–7 s. Search latency for terms and phrases matches the flush-only numbers, so phrase-hub's ~400 ms is the design's cost (#1334).
+    - **Writes:** positions cost +13% write time (139 → 157 µs) and +58% bytes.
+    - **Fuzzy, after #1353:** 1 edit 17 ms p50 (from 375), 2 edits 21 ms (from 406), prefix 2 15 ms.
+    - **A fuzzy term beside a common term:** 26 ms p50, but a 2.9 s p99: the common term's documents look up the fuzzy term's expansions. That's #1368 (lookups that advance; #1355's bound tightening was closed as not a lever), and #1363 is the converse.
+
+**PR 4.** Fuzzy terms, as rev 5 §4.4, with `levenshtein_automata` 0.2.1 (Damerau, with an adjacent transposition as one edit).
+- **The walk:** a `df`-only scan of the `P` rows from the fixed prefix. At a key the automaton rejects partway, it seeks to the smallest byte string above the key that the automaton hasn't rejected. A term whose `df` is 0 isn't an expansion.
+- **Expansions:** at most `max_expansions` (50), ordered by distance, then df descending, then bytewise.
+  - Each scores as a term times `1 − d / min(len)`, and a document takes its best expansion.
+  - **Rev 5 §4.4 amended (coordinator, 2026-11-02, a Lucene-parity correction, from simp724's review of #1327):** every kept expansion scores with the idf of the largest df among the kept expansions. This is Lucene's blended `TopTermsBlendedFreqScoringRewrite`. Rev 5 had each expansion's own idf, which let a rare misspelling outrank the common word, about 2× for df 1 against 1,000.
+  - An addition to rev 5 (coordinator, 2026-11-02): a match with `d ≥ min(len)` isn't an expansion, since its boost would be 0 or below.
+- **MaxScore:** the fuzzy clause merges its expansions' walks, taking the maximum. Its bound is the largest expansion's bound.
+- **API** (ICR 0105 PR 4):
+  - `Clause::FuzzyText` for the syntax's `word~`, tokenised as documents are;
+  - `Search::max_expansions` and `Search::prefix_length`;
+  - `SearchStats::fuzzy`, so `SearchStats` loses `Copy`.
+- **Tests:** a brute-force optimal-string-alignment scan of every term, at full depth and at small `k`.
+- **The AX102 numbers** (the 3b run, 1M documents, flush only, the mean of two runs): 1 edit 375 ms p50 (41 expansions), 2 edits 406 ms, 2 edits with `prefix_length(2)` 130 ms. A fuzzy clause walks the union of its expansions' postings, and on the bench's dense `w`+digits vocabulary those include common words. Pruning inside the clause (max-combine MaxScore) is #1333, in 1.1.0.
+- **#1333 (pruning inside a fuzzy clause):** once `k` are held, an expansion whose bound is below the threshold less every other clause's bound is dropped. It's exact, because such an expansion can't give a document that enters its maximum. Laptop, 100k documents: fuzzy-1 p50 25 → 2.7 ms.
+
+**PR 5.** Highlighting, as rev 5 §4.5.
+- **`Search::highlight(true)`** fills `Hit::text` and `Hit::matches`, recomputed by tokenising the source text again. `Match` has `range`, `clause` and `occurrence`.
+- **Sloppy matches:** the sloppy matcher reports each counted match's positions through a zero-sized recorder, so scoring is unchanged.
+- **`snippet()`** picks a word-bounded window by distinct clauses, then matches, then the earliest start.
+- **Tests:** against a brute-force matcher over the source texts.
+
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
 **Why.** Applications want the committed changes of a table or a row-key prefix, from the writer or a reader process, resumable by token, without slowing writers (#1248). The WAL already holds one record and one seqno per commit with every mutation kind. What it lacks is order across streams, proof of commit, history past the checkpoint, `None` commits, blob values that outlive GC, and readers in other processes.
@@ -3936,7 +3974,7 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **The ring.** `WalStream`'s recyclable predicate excludes the newest `retain_segments` segments past the checkpoint, and those `trim_retained` hasn't aged out. Seal times come from the maintenance clock, at the first trim after a rollover. Segments adopted at open count from the open.
 - **The never-stall fallback** takes the oldest retained slot ahead of a blank slot or an inline growth, never at open. It's counted in `WalCounters::retained_taken`.
 - **The blob horizon.** With the feed on, the manifest writer turns a `DropBlobFile` of a file that still has live bytes into a live-0 `PutBlobFile`, plus a hold. The hold records each stream's head epoch, which `FeedMarks::head` stores (Release) as a segment starts, before any of its records. Maintenance drops a held file once every stream's floor, the oldest non-recyclable epoch, has passed its head; the drop is computed against the catalog at commit. An open holds live-0 files again, at the new heads, and doesn't sweep them.
-- **The sidecar.** The session's entry is written and synced after the pager's `finish` and before any WAL segment. It carries `opened_at` (the sequence before any root commit of the open), the retention, the stream count and the fed tables. The pager's root-commit observer appends a Root entry, unsynced, after each durable root commit, so a lost append gives the safe, spurious expiry. A torn tail is cut off before the next append.
+- **The sidecar.** The session's entry is written and synced after the pager's `finish` and before any WAL segment. It carries `opened_at` (the sequence before any root commit of the open), the retention, the stream count and the fed tables. The pager's root-commit observer appends a Root entry after each durable root commit, so a lost append gives the safe, spurious expiry. A torn tail is cut off before the next append. (PR 3a's fix A syncs each append; see below.)
 - **The clean close** skips `forget_checkpoints` and the WAL files' removal with the feed on. Their checkpoints sit at their ends, so the next open replays nothing and adopts the retained slots.
 
 **How PR 2 builds it** (call 3: the lazy flush, not the raise):
@@ -3959,3 +3997,157 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - **Effect:** a durable feed on a pure-`Buffered` or pure-`None` fed table lags by about *T_sync* plus a sync.
 - **The M1 invariant** is stated in concurrency.md (the written-hold protocol) and on `Wal::write`.
 
+**How PR 3a builds it** (the writer-process feed, engine-level; PR 3b is the public API):
+- **The cursor.** `pigeonhole-wal`'s `FeedCursor` reads one stream file read-only and live. It follows segment chaining like `Recovery`, but re-reads the segment headers at each stop. `step()` returns:
+  - `Record`, with the segment's `feed_session`;
+  - `End`, for now;
+  - `Gone`, when its segment's slot now holds a newer epoch. A recycled slot is never read as a short log.
+- **The merge** (`FeedReader`, feed_reader.rs). Each poll loads the checkpoint marks, then the frontier F, then the heads, then reads every stream to its end. By M1 every record ≤ F is then read. A stream behind its head waits for its next header.
+  - Commits are keyed: a single by its seqno, a cross-shard commit by its Decision's apply seqno, with its PREPAREs held by id until then.
+  - They're delivered whole, in key order, filtered by table and then row prefix before anything is copied.
+  - A blob pointer is resolved. A blob file the view no longer lists expires the feed (S1); any other read failure, a checksum's included, is an error (simp724 on #1316).
+- **Held PREPAREs** (S2, simp724's rule replacing rev 3's "passes `cross_held`"). An aborted round's PREPARE is dropped once its own stream's checkpoint, loaded before F, has passed it with no Decision read.
+  - **Why it's exact:** a checkpoint passes a decided PREPARE only once its apply seqno is visible, and the Decision was in its file by then. It passes an undecided one only through `mark_aborted`, or through recovery without a Decision. Both were checked in the code.
+  - **The floor fails closed** (simp724's H1 on #1316). The floor never passes the checkpoint's segment, so an undecided share the floor passed but the checkpoint didn't means a bound was broken: the feed expires rather than dropping it.
+  - **A round rule C dropped is remembered** until the floor passes its segment. A Decision for it then expires the feed instead of being passed over as recovery's all-or-nothing.
+  - It applies only once every stream is read to its head.
+- **Start positions.** The shard records, with each checkpoint, the largest key it passed (`ckpt_key`, carried in `Checkpointed`). `Feed::note_checkpoint` stores that pair before the WAL's own checkpoint mark (`FeedMarks::checkpoint`, new).
+  - A start bound B then reads each stream from the latest checkpoint whose key is ≤ B.
+  - The bound is the frontier and checkpoints for `Now`, the seqno for `After` (a snapshot's), and the largest bound every stream's retained history still serves for `Oldest` (coordinator, 2026-11-02; it can expire at once under load).
+  - A stream that already dropped history above B has expired.
+  - An open seeds each stream with `(Lsn(head, 0), next_seqno − 1)`.
+- **Tokens:** a version, the database id, the stream count, the last delivered seqno, the newest session read, and per stream where to read again (the earliest record held or pending) and how far delivered records reached.
+- **Expiry,** each case with its reason:
+  - a shard-count change;
+  - a token's session outside the chain;
+  - retention past a token's position, or `Gone`;
+  - a record of a non-feeding session past the delivered seqno (the mark rule);
+  - delivered records lost (a torn tail, or a restart that lost them, M2);
+  - a vanished blob;
+  - a held share past the floor but not the checkpoint, or a Decision for a round rule C dropped (H1).
+- **Sessions chain** (the mark rule) only through contiguous Root sequences: each one above the one before it, from the session's `opened_at` (simp724 on fix A). A lost middle entry breaks the chain, and so does an entry type this build doesn't know.
+  - **`opened_at`** is the superblock's sequence before any root commit of the open. The root-commit observer is registered right after the session's entry, before replay, recovery's checkpoint edits and repairs. The only earlier root commits are `finish`'s two upgrade commits of an older file; the open records those as the session's own (simp724's Q1 on #1316).
+- **Recovery's all-or-nothing.** A Decision from an earlier session whose shares aren't all in the files is a `Buffered` commit a power loss took a share of. Recovery dropped it whole, and the reader skips it.
+- **Fix A** (coordinator, 2026-11-02, so call 4 holds). Each Root sidecar append is synced.
+  - **When:** after the durable root commit, coalesced to one sync in flight, submitted and never waited on (perf287).
+  - **How:** through the VFS's `sync_all`, at the pager's durability (`F_FULLFSYNC` on macOS); `sync_all` because an append grows the file.
+  - **On failure:** a failed sync ends the session's appends (fail closed, simp724).
+  - **Counted:** `Engine::feed_sidecar_syncs`.
+  - **The directory entry** is made durable on a rewrite of the sidecar too.
+  - **Before fix A:** unsynced entries expired every durable feed at a power loss, against call 4.
+- **Waiting.** `FeedReader::wait` registers in the visible or durable watermark registry with a thread-unpark waker, and bounds each sleep by the hold's interval where the feed's own holds keep F back. It never spins.
+- **Tests:**
+  - `feed_model` is a sweep target: seeded single and cross-shard commits at every durability, flushes, clean reopens, power losses and unsynced bursts, with a durable and a visible subscriber resuming from tokens. After each power loss the reopen flushes (a root commit) before the tokens resume, and a durable token must continue.
+  - `it/feed_reader.rs` covers the start kinds, filtering, tokens across a reopen, expiry, and rule C both ways.
+  - `wal/tests/feed_cursor.rs` covers the cursor, including a mid-segment hole: it stops where recovery did and then follows the next session's segment (Q2).
+
+**A fix after 3a (#1248, found by PR 4's deferred-I/O model):** a cursor whose segment's successor names an earlier end than it read to reports `Step::Cut`, and the feed expires ("records the feed read were lost"). That's a recovery's cut after a power loss took records the cursor had read: a visible feed resuming from a token past the cut used to fail with a chain `Corruption`. A later end stays corruption.
+- **Past the cut, nothing is read** (simp724's C1 on #1328). Once a successor on disk names the segment's end, a cursor positioned past it is cut at once. So is any frame it meets at or past that end. A power loss can leave CRC-valid frames after the hole, which recovery discarded and whose seqnos the next session may reuse, so a visible token resumed there would otherwise deliver them before reaching the stop.
+- **A durable feed is never past the cut** (simp724's step). Every record before a token's hint was delivered (so synced) or skipped as at or below the delivered seqno. Recovery keeps every synced record, so the hint is at or before the cut. `feed_model` gained a `PIGEONHOLE_DEFERRED_IO=1` mode, now a sweep for feed PRs.
+
+**How PR 3b builds it** (pigeonhole's public API, additive; ICR 0106):
+- **Opening:** `Table::feed()` gives a `FeedBuilder`. `.table(&t)` adds tables to the same feed, `.prefix(..)` limits it to a row prefix, and `.visible()` opts out of the durable frontier. The start is the commits after `open()`, or `.from_snapshot(&s)` (after `s.seqno()`), `.from_oldest()` or `.resume(&token)`. `open()` refuses with `InvalidArgument` (feed off, table not fed, bad token) and `Unsupported` (a reader process, until PR 4). An expired start shows at the first `next`, so `open` never consumes a commit.
+- **`Feed`:**
+  - `next(timeout)` and `try_next()` lend `Option<&Commit>`, reused between calls;
+  - `token()` gives a `FeedToken`, whose bytes round-trip through `as_bytes` and `from_bytes`;
+  - `oldest_retained()` reports the oldest retained seqno after an expiry, when known.
+  - **An error ends the feed** (simp724 and cli692 on #1321). Every later call returns the same error, as an expired feed does. The engine reader has already moved past the commit it was delivering, so a retry would skip it. A value that doesn't decode is `Corruption`, never an empty value, and the token then points past that commit. Only the live engine's errors stick (cli692's S2, simp724): an error or an expiry from a reader whose engine a recovery replaced belongs to the superseded generation. The feed then follows the recovery and lets the new engine's reader decide from the token. The old reader, still waiting through the swap, reads the new session's records as outside its history, so its expiry is never the feed's.
+- **Types:**
+  - `Commit`: `seqno`, `timestamp`, `changes`.
+  - `Change`: `table` and `family` by name, `kind`, `row`, `qualifier`, `timestamp`, and `value()` as the read API's `Value` (`None` for deletes).
+  - `ChangeKind`: `Put`, `Merge`, `DeleteCell`, `DeleteColumn`, `DeleteFamily` (a row delete is one per family); `#[non_exhaustive]`.
+  - A family created after the feed opened is named from the current catalog.
+- **`ErrorCode::FeedExpired` = 31** (the coordinator's number). It is mapped in python as the `FeedExpired` exception class and listed in the `.pyi` stubs. The C ABI crate has no code table yet: its future enum takes the numbers from `ErrorCode`.
+- **Automatic recovery** (D265): a feed checks its engine generation on each call (one load). After a swap it resubscribes on the new engine from its own token, so a durable feed continues and a visible one that delivered lost commits expires. After `close()` it fails with `Closed`.
+- **perf287's `debug_assert`** (on #1297): `Feed::needs` asserts that a fed batch decodes. Admission decodes every batch first, so it holds today.
+- **Tests:** `pigeonhole/tests/feed.rs` covers named and typed changes of every kind, a cross-table commit arriving whole, a snapshot start, a token across a reopen, a prefix, the refusals, and expiry across a feed-off open. `tests/recovery.rs` has a durable feed following an automatic recovery, mutation-checked.
+
+**Amendment (d), owner 2026-11-02: phdb's read-only commands write nothing** (cli692; ICR 0109). Under the original D310, any writer open without the feed configuration, or with another shard count, ended feed history, so `phdb info app.phdb` on a stopped application expired its tokens. Since (c) that is only an open that turns the feed off or sets an explicit different count, but a read-only command should write nothing at all. `Options::read_only(bool)` (new, public) forces the `no_writes` open `read_only_fallback` takes: no session or Root entries, no WAL segment, no upgrade, no clean-close commit. `phdb info`, `dump`, `backup` and `shell --read-only` use it when no writer runs, and a reader process when one does. Writable phdb opens (the shell, `mcp`, `load`, `compact`) rely on amendment (c), feed1248's inherited feed configuration (#1344), so phdb now leaves `shards` unset for an existing database and sets one shard only for one it creates (cli692's S1 on #1344): an explicit `shards(1)` would reshard an app's feed. Tests: `engine/tests/it/read_only_fallback.rs` (a requested open does no write I/O, at any shard count, and never creates a file), `pigeonhole/tests/feed.rs` (a read-only open between two fed opens keeps the token), `cli/tests/info.rs` (all four read-only commands, and a writable `shell` put, between two fed opens keep it).
+
+**Amendment (the owner, 2026-11-02: feed settings are inherited by default).** Any open without the feed settings, or with another shard count, used to end the feed's history, so `phdb load app.phdb` while the app was stopped silently expired the app's feed.
+- **`Options::change_feed` has three states:**
+  - unset (the default) inherits the sidecar's last session: its retention, age, and fed tables by id (a table dropped since is left out);
+  - `change_feed(r)` turns it on;
+  - the new `change_feed_off()` turns it off.
+  - A last open that recorded "fed: none", an entry this build doesn't know, or no sidecar means off, as before.
+- **The shard count:** an unset `Options::shards` with a recorded session takes its stream count. An explicit, different count (resharding on purpose) still expires the feed with "the shard count changed".
+- **No format change:** the sidecar already holds all of it.
+- **How it's built:**
+  - `EngineOptions::feed_inherit`, which `pigeonhole::Options` sets unless the feed is turned on or off explicitly;
+  - `feed::last_session`, read right after the pager gives the database id, so the shard count resolves before the manifest loads;
+  - the inherited settings become `options.feed` once the catalog has loaded.
+- **Tests:**
+  - `pigeonhole/tests/feed.rs`: a tool's plain open between two app sessions keeps the token (the shard count inherited too, three shards so no default matches); an explicit new shard count expires it; `change_feed_off()` ends it.
+  - The unit test `the_last_session_is_inherited_until_an_open_turns_the_feed_off`.
+- **Companion change (d), cli692:** `phdb`'s read-only commands open read-only.
+
+**How PR 4 builds it** (reader processes; shm layout 8, the coordinator's numbers):
+- **One reader, two origins.** `FeedReader` reads the stream files and shared memory in both processes. The writer mirrors each stream's floor and checkpoint into shm (`FEED_FLOOR`, `FEED_CKPT`) through `FeedMarks`' `MarkMirror`, right after each store it mirrors (per retention pass and checkpoint, never per commit). A reader process takes the writer's session and fed tables from the sidecar's last session entry (written before the writer's shared memory exists), its attachment from `reader_feed_origin`, and its view for blob values from its own attachment.
+- **No head mark** (simp724 and the coordinator, after the deterministic test). The frontier never passes a record behind a held segment header: D200 hides such a group until a sync writes the header, and the feed's holds settle on `Wal::written`. So "every stream read to its readable end" is enough for M1. `it::feed_head` holds the header for real and pins this. If D200 ever showed such a group early, that test fails and a head mark comes back with a reason.
+- **Start positions in a reader process:**
+  - **`Now`:** each stream's checkpoint, loaded before the bound.
+  - **`After(seqno)`, `Oldest` and tokens:** the floor, skipping keys at or below the bound.
+  - **The lost bound** (simp724's B1): the writer mirrors its checkpoint history's bound at the floor (`oldest_bound`) as `FEED_BOUND`, stored before the floor it belongs to and raised at checkpoints. An `After(seqno)` below a stream's bound has lost history and expires, as the writer's `start_at` does, rather than skipping recycled commits. `Oldest` starts at the largest bound.
+- **A writer restart mid-poll** (simp724's B2): the poll re-checks the attachment after reading the streams, and before expiring on a record outside the history. A restart is then always `SnapshotExpired` (resubscribe), never a permanent gap. `HookSite::ReaderFeedReads` lets a test restart the writer in that window.
+- **Blob files newer than the view** (simp724's question): a value separated at commit time names a blob file the manifest committed before the commit was logged, which a reader process's lagging view may not list yet. The reader waits for a newer view, up to a second, before it takes the file as removed.
+- **A new writer with another shard count** mid-start makes `writer_session` return `SnapshotExpired` (simp724's nit).
+- **A writer restart (M2):** a stale attachment fails the poll with `SnapshotExpired`. The public `Feed` resubscribes from its own token on a fresh attachment, so a durable feed continues and a visible one that delivered what was lost expires.
+- **Waiting:** a bounded backoff, 50 µs doubling to 5 ms. The writer does no per-commit work for reader processes.
+- **A bug the model found in this PR:** `emit` took a commit before loading the view, and a reader process's view load can fail (`Busy` while republished, or a stale attachment), so a retry skipped the commit. The view is now loaded before anything is taken. A blob-read failure after the take ends the reader for good.
+- **Public API:** `ReadTable::feed()` and `FeedBuilder::read_table`.
+- **Tests:**
+  - `it/feed_reader_process.rs`: commit order across shards, a writer restart resumed from a token, and the refusals.
+  - `it/feed_head.rs`: the D200 dependency.
+  - `feed_model`: a durable and a visible subscriber in a reader process beside the writer's, plain and with deferred I/O. Clean reopens exercise the stale-attachment resubscribe; power losses reopen the reader too.
+
+<a id="d311"></a>
+## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)
+**Why.** Agents need durable memory they can recall by meaning, by keyword and by recency, scoped per agent or shared, inside the database they already use (#1251). Built on the public API with D309's text index, it needs nothing new in the engine.
+
+**Decided** (revision 2 §10, all 11 calls):
+1. **The crate:** `pigeonhole-memory`, on the public 1.x line (D295), on the public API only, with its API in ICR 0107.
+2. **The layout:**
+   - one table per store (`mem_{name}`), with exact, flat namespaces as row-key prefixes (`{ns}\0m{rid}`, `{ns}\0h{hash}`);
+   - time-ordered `rid`s that carry `created`, so recency is a prefix scan;
+   - explicit `backlinks`, a `sources` family, and `importance` as a `max` aggregate;
+   - `F32`/`F16`/`BF16` embeddings;
+   - the frozen `MemoryId` forms.
+3. **Vector recall in v1:** exact per-namespace search (`Scan::nearest_*`), not IVF.
+4. **Fusion:** RRF (k = 60), with a linear blend as the alternative.
+5. **Recall is read-only,** and works in reader processes. `mark_used` is explicit.
+6. **Dedup:** exact, after trimming and collapsing whitespace (no case folding), checked against its live target in the transaction. A hit on a superseded memory counts as new. Near duplicates are optional, with `Link` as the default.
+7. **Consolidation:** the application's `Consolidator`, called outside transactions; conflict-checked commits; a conflicting group is skipped.
+8. **Existence reads in every write (M1–M5).**
+9. **TTL as a forget policy** (`max_age`), with no core TTL on the store's families.
+10. **D309's two additions** (`id_prefix`, and `open_reader` → `ReadIndex`).
+11. **The benchmark:** LongMemEval first, then LoCoMo, with a fixed open embedding model.
+
+**Since revision 2** (owner, 2026-11-02; the ICR 0107 amendment on #1251, c6578450948 and c6578478485):
+- **The store's text index has positions off.**
+- **The embedding model is pinned:**
+  - `StoreOptions::embedding(EmbeddingModel::new(id, dim, element))` at create, recorded in `G`;
+  - `Store::open(db, name, model_id)` fails with `Mismatch` on another model (ids compare byte for byte);
+  - `open_without_embeddings` gives a handle that refuses content writes on a pinned store, and allows `delete`, `link` and `mark_used`;
+  - every embedding is checked against the dimension, and a pinned store requires one on every memory.
+
+**Tickets:** T1 #1335 (in two PRs: the store, then recall and `ReadStore`), T2 #1336, T3 #1337, T4 #1338, T5 #1339, T6 #1340, T7 #1341, T8 #1342 (only if T5 calls for it), T9 #1343.
+
+**T1, first PR (#1335).**
+- **What's in it:**
+  - `Store` (`create`, `open`, `open_without_embeddings`, `remember`, `remember_in`, `get`, `delete`, `delete_in`, `link`, `supersede`, `mark_used`, `verify`, `embedding_model`);
+  - `Memory`, `Kind`, `LinkType`, `Remembered`, `StoredMemory`, `StoreStats`, `EmbeddingModel`, `StoreOptions`, `MemoryId` and `normalize`.
+- **Dedup's cases:** the dedup row and its target's `content:text` and `superseded_by` are read in the transaction.
+  - A live, same-text, unsuperseded target merges: importance goes to the max, the source is added, and a use is counted.
+  - A gone or superseded target inserts as new and repoints the dedup row.
+  - A hash collision inserts as new and leaves the dedup row alone.
+- **Links** stay within a namespace. A missing target is `NotFound`, before anything is written.
+- **From the reviews on #1362:**
+  - **simp724:** a memory is superseded once (`superseded_by` is read in the transaction, so concurrent supersedes conflict, and another `new` is refused); deleting a superseder clears `superseded_by` and `valid_to`, so the old memory is recalled again; `verify` counts a dangling `superseded_by`.
+  - **cli692:** `LinkType`'s field is private (`custom(n ≥ 16)` and `get()`); links and sources are `Link` and `Source` structs; `mark_used` returns `Marked { marked, missing }`; a link's weight is 0 to 1.
+  - **New tests:** a merge racing a supersede conflicts, which is what the merge's in-transaction target read is for; two remembers of one new text conflict, and the retry merges.
+- **Tests:**
+  - round trips, dedup's cases, links both ways, delete removing links and the dedup row, `mark_used` skipping deleted ids;
+  - the model checks (`Mismatch`, wrong dimension, missing embedding, the model-less handle);
+  - namespaces;
+  - a write given up in the caller's transaction leaves nothing;
+  - S3's races (a merge or a link racing a delete of its target conflicts; `mark_used` after a delete), each ending in `verify`.

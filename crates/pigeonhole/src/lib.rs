@@ -91,6 +91,7 @@ mod cell;
 mod check;
 mod db;
 mod error;
+mod feed;
 mod info;
 mod merge;
 mod metrics;
@@ -164,6 +165,7 @@ pub use check::{
 };
 pub use db::{AppOwned, BackgroundWorker, Pigeonhole, PigeonholeReader, Shard, Snapshot};
 pub use error::{Error, ErrorCode, Result};
+pub use feed::{Change, ChangeKind, Commit, Feed, FeedBuilder, FeedToken};
 pub use info::{
     Compression, DatabaseInfo, FamilyInfo, FamilyStorage, FeedInfo, FileFeatures, LevelInfo,
     TableInfo,

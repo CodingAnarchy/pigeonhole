@@ -57,6 +57,7 @@
 //! Part of [Pigeonhole](https://github.com/CodingAnarchy/pigeonhole). See the crate README.
 #![forbid(unsafe_code)]
 
+mod feed;
 mod foreground;
 mod mem;
 mod recovery;
@@ -70,10 +71,13 @@ use pigeonhole_format::wal::WalRecord;
 use pigeonhole_format::{Durability, Lsn, StreamId};
 use pigeonhole_io::{Completion, VfsRef};
 
+pub use feed::{FeedCursor, Step};
 pub use foreground::StrictForeground;
 pub use mem::MemWal;
 pub use recovery::Recovery;
-pub use stream::{FeedMarks, IoTracker, SparePrep, SpareSegments, WalCounters, WalStream};
+pub use stream::{
+    FeedMarks, IoTracker, MarkMirror, SparePrep, SpareSegments, WalCounters, WalStream,
+};
 
 /// Result alias for this crate.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -319,6 +323,14 @@ pub trait Wal: Send + fmt::Debug {
     /// in-memory one).
     fn feed_marks(&self) -> Option<Arc<FeedMarks>> {
         None
+    }
+
+    /// Whether the current segment's header is held back behind its predecessor's sync
+    /// (FORMAT §10.1 rule 1; [`WalStream::held_header`]): an inspection helper for tests
+    /// that must poll a change feed inside that window (D310 PR 4).
+    #[doc(hidden)]
+    fn header_held(&self) -> bool {
+        false
     }
 
     /// A handle on this stream's count of submitted, unfinished I/O operations

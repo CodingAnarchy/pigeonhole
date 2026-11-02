@@ -30,7 +30,7 @@ pub(crate) fn run(
             dest.display()
         )));
     }
-    let db = open::for_read(cli, file)?;
+    let db = open::for_inspect(cli, file)?;
     let mode = db.mode();
     let started = Instant::now();
     let copied = db.backup(dest, latest);
