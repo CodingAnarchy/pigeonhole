@@ -190,11 +190,11 @@ The value of a vector family's cell (§9.2 `kind` 16, D303) is a vector of the f
 
 | Offset | Size | Field |
 |---|---|---|
-| 0 | 1 | element: 1 `f32`, 2 `i8`, 3 bit |
+| 0 | 1 | element: 1 `f32`, 2 `i8`, 3 bit, 4 `f16`, 5 `bf16` |
 | 1 | varint | `dim`: 1 to 4096, a multiple of 8 for bit |
-| 1 + varint | payload | `dim` × 4 bytes of IEEE-754 `f32` LE, `dim` bytes of `i8`, or `dim / 8` bytes of bits (bit `j` in byte `j / 8` at bit `j % 8`) |
+| 1 + varint | payload | `dim` × 4 bytes of IEEE-754 `f32` LE, `dim` bytes of `i8`, `dim / 8` bytes of bits (bit `j` in byte `j / 8` at bit `j % 8`), or `dim` × 2 bytes of IEEE binary16 (`f16`) or bfloat16 (`bf16`) bit patterns LE |
 
-There is no alignment padding. A payload whose length does not match the element and `dim`, a `dim` out of range, an overlong varint, or an unknown element is `Corrupt` (as in `kind_params`: a new element would take a new `incompat` bit). A writer refuses an element or dimension other than the family's, an `f32` component that isn't finite or exceeds 2^56 in magnitude, and in a cosine family a vector with a zero norm (all zeros, or an `f32` squared norm below `f32::MIN_POSITIVE`), so every distance is finite (from #490 B PR 2; until then no family takes a vector). The largest value is 16 KiB plus 4 bytes (tag included).
+There is no alignment padding. A payload whose length does not match the element and `dim`, a `dim` out of range, an overlong varint, or an unknown element is `Corrupt` (as in `kind_params`: a new element would take a new `incompat` bit). A writer refuses an element or dimension other than the family's, an `f32` component that isn't finite or exceeds 2^56 in magnitude, and in a cosine family a vector with a zero norm (all zeros, or an `f32` squared norm below `f32::MIN_POSITIVE`), so every distance is finite. Half-precision components (#1263) are checked as they widen to `f32`: finite (an `f16`'s largest, 65,504, needs no other bound; a `bf16` keeps `f32`'s 2^56 bound, having its range), and under cosine a squared norm, summed over the widened components, of at least `f32::MIN_POSITIVE`. An `f32` vector written to a half-precision family is rounded to nearest, ties to even; a component that overflows the element is refused, and the rounded vector is checked as stored. Distances widen each stored half component exactly to `f32` in the `f32` kernels' order, so a half-precision vector scores exactly as its widened `f32` vector. The largest value is 16 KiB plus 4 bytes (tag included).
 
 **Storage:** the values of the kinds listed by `FamilyKind::values_stay_inline` (every aggregate kind but Bloom, and Vector) are never separated into blob files, at flush, compaction or commit (D298, D303): their aggregate operators fold stored values, never blob pointers, and a reader takes a vector in place, so a family's `blob_threshold` does not apply to them. A bloom filter's value separates like any `Bytes` value (§7): a read loads a separated base before folding inputs onto it, and so does a compaction's fold. Operands (one-element filters) stay inline, as every operand does. Nothing in the encoding changes: a separated filter's blob record holds the same bytes.
 
@@ -428,7 +428,7 @@ The tags defined so far (D298):
 - **Histogram** (`kind` 12): tag 1, its bounds, as `n` `f64` LE (1 ≤ `n` ≤ 1023; finite, strictly increasing, never `-0.0`). Required.
 - **Quantiles** (`kind` 13): tag 1, the mantissa bits `p` (u8, 1–12, default 7); tag 2, the bucket limit per store (u16 LE, 16–4096, default 2048). Both optional.
 - **Bloom** (`kind` 14): tag 1, the bits `m` (u32 LE, a power of two, 2^6 to 2^24); tag 2, the positions per element `k` (u8, 1–16). Both required.
-- **Vector** (`kind` 16, D303): tag 1, the element (u8: 1 `f32`, 2 `i8`, 3 bit); tag 2, the dimension (u32 LE, 1–4096, a multiple of 8 for bit); tag 3, the metric (u8: 1 L2, 2 inner product, 3 cosine, 4 Hamming). All three required. L2, inner product and cosine take `f32` or `i8`; Hamming takes bit, and bit takes only Hamming.
+- **Vector** (`kind` 16, D303): tag 1, the element (u8: 1 `f32`, 2 `i8`, 3 bit, 4 `f16`, 5 `bf16`, the last two from #1263); tag 2, the dimension (u32 LE, 1–4096, a multiple of 8 for bit); tag 3, the metric (u8: 1 L2, 2 inner product, 3 cosine, 4 Hamming). All three required. L2, inner product and cosine take `f32`, `i8`, `f16` or `bf16`; Hamming takes bit, and bit takes only Hamming.
 
 Values out of range are `Corrupt` at read. A writer refuses them, and any tag the family's kind doesn't define.
 

@@ -78,7 +78,9 @@ pub pigeonhole::Durability::GroupSync = 2
 pub pigeonhole::Durability::None = 0
 pub pigeonhole::Durability::Sync = 3
 #[non_exhaustive] pub enum pigeonhole::Element
+pub pigeonhole::Element::BF16
 pub pigeonhole::Element::Bit
+pub pigeonhole::Element::F16
 pub pigeonhole::Element::F32
 pub pigeonhole::Element::I8
 #[non_exhaustive] #[repr(u32)] pub enum pigeonhole::ErrorCode
@@ -661,8 +663,12 @@ pub fn pigeonhole::RowMutation<'_>::put_i64(self, &str, &[u8], i64) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_i64_at(self, &str, &[u8], u64, i64) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_u64(self, &str, &[u8], u64) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_u64_at(self, &str, &[u8], u64, u64) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_bf16(self, &str, &[u8], &[u16]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_bf16_at(self, &str, &[u8], u64, &[u16]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_bits(self, &str, &[u8], &[u8]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_bits_at(self, &str, &[u8], u64, &[u8]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_f16(self, &str, &[u8], &[u16]) -> Self
+pub fn pigeonhole::RowMutation<'_>::put_vector_f16_at(self, &str, &[u8], u64, &[u16]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_f32(self, &str, &[u8], &[f32]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_f32_at(self, &str, &[u8], u64, &[f32]) -> Self
 pub fn pigeonhole::RowMutation<'_>::put_vector_i8(self, &str, &[u8], &[i8]) -> Self
@@ -819,8 +825,12 @@ pub fn pigeonhole::Transaction::put_i64(&mut self, &pigeonhole::Table, &[u8], &s
 pub fn pigeonhole::Transaction::put_i64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
 pub fn pigeonhole::Transaction::put_u64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self
 pub fn pigeonhole::Transaction::put_u64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u64) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_bf16(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u16]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_bf16_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u16]) -> &mut Self
 pub fn pigeonhole::Transaction::put_vector_bits(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
 pub fn pigeonhole::Transaction::put_vector_bits_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_f16(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u16]) -> &mut Self
+pub fn pigeonhole::Transaction::put_vector_f16_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u16]) -> &mut Self
 pub fn pigeonhole::Transaction::put_vector_f32(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[f32]) -> &mut Self
 pub fn pigeonhole::Transaction::put_vector_f32_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[f32]) -> &mut Self
 pub fn pigeonhole::Transaction::put_vector_i8(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[i8]) -> &mut Self
@@ -863,7 +873,9 @@ impl pigeonhole::Vector
 pub fn pigeonhole::Vector::as_ref(&self) -> pigeonhole::VectorRef<'_>
 pub fn pigeonhole::Vector::dim(&self) -> u32
 pub fn pigeonhole::Vector::element(&self) -> pigeonhole::Element
+pub fn pigeonhole::Vector::from_bf16_bits(&[u16]) -> pigeonhole::Result<Self>
 pub fn pigeonhole::Vector::from_bits(u32, &[u8]) -> pigeonhole::Result<Self>
+pub fn pigeonhole::Vector::from_f16_bits(&[u16]) -> pigeonhole::Result<Self>
 pub fn pigeonhole::Vector::from_f32(&[f32]) -> pigeonhole::Result<Self>
 pub fn pigeonhole::Vector::from_i8(&[i8]) -> pigeonhole::Result<Self>
 pub struct pigeonhole::VectorRef<'a>
@@ -923,8 +935,12 @@ pub fn pigeonhole::WriteBatch::put_i64(&mut self, &pigeonhole::Table, &[u8], &st
 pub fn pigeonhole::WriteBatch::put_i64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, i64) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_u64(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_u64_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, u64) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_bf16(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u16]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_bf16_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u16]) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_vector_bits(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u8]) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_vector_bits_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u8]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_f16(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[u16]) -> &mut Self
+pub fn pigeonhole::WriteBatch::put_vector_f16_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[u16]) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_vector_f32(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[f32]) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_vector_f32_at(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], u64, &[f32]) -> &mut Self
 pub fn pigeonhole::WriteBatch::put_vector_i8(&mut self, &pigeonhole::Table, &[u8], &str, &[u8], &[i8]) -> &mut Self

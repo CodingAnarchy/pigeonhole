@@ -14,17 +14,23 @@ pub enum Element {
     I8,
     /// Bits, packed eight to a byte, least significant bit first.
     Bit,
+    /// IEEE binary16 (`f16`), as its bit pattern (#1263): half the bytes of `f32`.
+    F16,
+    /// bfloat16 (`bf16`), as its bit pattern (#1263): `f32`'s range in half the bytes.
+    BF16,
 }
 
 /// A vector family's distance metric. Smaller is nearer for every metric.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum Metric {
-    /// Squared Euclidean distance (`f32` and `i8`).
+    /// Squared Euclidean distance (`f32`, `i8`, `f16` and `bf16`).
     L2,
-    /// The negated inner product, so the largest product ranks first (`f32` and `i8`).
+    /// The negated inner product, so the largest product ranks first (`f32`, `i8`, `f16`
+    /// and `bf16`).
     InnerProduct,
-    /// `1 - cosine similarity` (`f32` and `i8`; vectors with a zero norm are refused).
+    /// `1 - cosine similarity` (`f32`, `i8`, `f16` and `bf16`; vectors with a zero norm are
+    /// refused).
     Cosine,
     /// The number of differing bits (bit vectors only).
     Hamming,
@@ -36,6 +42,8 @@ impl Element {
             Element::F32 => fmt::Element::F32,
             Element::I8 => fmt::Element::I8,
             Element::Bit => fmt::Element::Bit,
+            Element::F16 => fmt::Element::F16,
+            Element::BF16 => fmt::Element::BF16,
         }
     }
 
@@ -44,6 +52,8 @@ impl Element {
             fmt::Element::F32 => Element::F32,
             fmt::Element::I8 => Element::I8,
             fmt::Element::Bit => Element::Bit,
+            fmt::Element::F16 => Element::F16,
+            fmt::Element::BF16 => Element::BF16,
         }
     }
 }
@@ -211,7 +221,8 @@ impl<'a> VectorRef<'a> {
         self.inner.as_bytes()
     }
 
-    /// The components as `f32`s: exact for `f32` and `i8` vectors, `None` for bit vectors.
+    /// The components as `f32`s: exact for `f32`, `i8`, `f16` and `bf16` vectors (a half
+    /// widens exactly), `None` for bit vectors.
     pub fn to_f32_vec(&self) -> Option<Vec<f32>> {
         let p = self.inner.as_bytes();
         match self.inner.element() {
@@ -223,6 +234,20 @@ impl<'a> VectorRef<'a> {
                     .collect(),
             ),
             fmt::Element::I8 => Some(p.iter().map(|b| f32::from(*b as i8)).collect()),
+            fmt::Element::F16 => Some(
+                p.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| pigeonhole_format::half::f16_to_f32(u16::from_le_bytes(*c)))
+                    .collect(),
+            ),
+            fmt::Element::BF16 => Some(
+                p.as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|c| pigeonhole_format::half::bf16_to_f32(u16::from_le_bytes(*c)))
+                    .collect(),
+            ),
             fmt::Element::Bit => None,
         }
     }
@@ -250,6 +275,20 @@ impl Vector {
     pub fn from_i8(components: &[i8]) -> Result<Self> {
         let payload = components.iter().map(|x| *x as u8).collect();
         Self::new(fmt::Element::I8, components.len(), payload)
+    }
+
+    /// An `f16` vector of `bits.len()` dimensions (1 to 4096), each component an IEEE
+    /// binary16 bit pattern (`half::f16::to_bits`, say).
+    pub fn from_f16_bits(bits: &[u16]) -> Result<Self> {
+        let payload = bits.iter().flat_map(|h| h.to_le_bytes()).collect();
+        Self::new(fmt::Element::F16, bits.len(), payload)
+    }
+
+    /// A `bf16` vector of `bits.len()` dimensions (1 to 4096), each component a bfloat16 bit
+    /// pattern.
+    pub fn from_bf16_bits(bits: &[u16]) -> Result<Self> {
+        let payload = bits.iter().flat_map(|h| h.to_le_bytes()).collect();
+        Self::new(fmt::Element::BF16, bits.len(), payload)
     }
 
     /// A bit vector of `dim` bits (a multiple of 8, 8 to 4096), packed eight to a byte,

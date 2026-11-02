@@ -42,7 +42,7 @@ A new workspace crate, `crates/python` (`pigeonhole-python`, `publish = false` o
 
 ### PR 2: vectors, the 1.1 reads, closing a scan (#1261)
 - **Vectors (D303):**
-  - `Element` (`F32`, `I8`, `BIT`) and `Metric` (`L2`, `COSINE`, `INNER_PRODUCT`, `HAMMING`), `enum.StrEnum`s in the package;
+  - `Element` (`F32`, `I8`, `BIT`; `F16` and `BF16` from #1263, ICR 0104) and `Metric` (`L2`, `COSINE`, `INNER_PRODUCT`, `HAMMING`), `enum.StrEnum`s in the package;
   - `VectorSpec(dim, element, metric)` with `dim`, `element`, `metric`;
   - `Family.vector(dim, element, metric, *, max_versions, ttl)`, and `FamilyInfo.vector`;
   - `put_vector(family, qualifier, vector, *, ts)` on `Mutation`, and with a table and row first on `WriteBatch` and `Transaction`. The family's element type decides how a buffer (PyO3's `PyBuffer`, so NumPy arrays and `array.array`) or a sequence is read:

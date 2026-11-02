@@ -449,6 +449,173 @@ fn owned_vectors_score_as_stored_ones() {
     db.close().expect("close");
 }
 
+/// #1263: `f16` and `bf16` families. Their vectors are stored and read back bit for bit;
+/// `f32` vectors written to them round to nearest-even, with an overflow, a non-finite
+/// component or a vector that rounds to zero under cosine refused when built; and
+/// `nearest_f32` over them gives the same neighbours and distances as the same vectors
+/// widened into an `f32` family. At 4096 dimensions a half vector's value is half the bytes.
+#[test]
+fn half_precision_families_store_bits_and_rank_as_widened_f32() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("h.phdb"), Options::default()).expect("open");
+    let spec = |e, m| VectorSpec::new(8, e, m).expect("spec");
+    let t = db
+        .table("h")
+        .expect("table")
+        .family("h16", Family::vector(spec(Element::F16, Metric::Cosine)))
+        .family("hb", Family::vector(spec(Element::BF16, Metric::L2)))
+        .family("w16", Family::vector(spec(Element::F32, Metric::Cosine)))
+        .family("wb", Family::vector(spec(Element::F32, Metric::L2)))
+        .create_if_missing()
+        .expect("create");
+    assert!(
+        db.info().expect("info").features.incompat & 1 == 1,
+        "a half-precision family marks the file, as every 1.1.0 vector family does"
+    );
+    let bits16 = |i: u32| -> Vec<u16> {
+        (0..8)
+            .map(|j| pigeonhole_format::half::f32_to_f16(f32s(i)[j] / 3.0).expect("fits"))
+            .collect()
+    };
+    let bitsb = |i: u32| -> Vec<u16> {
+        (0..8)
+            .map(|j| pigeonhole_format::half::f32_to_bf16(f32s(i)[j] * 1e3).expect("fits"))
+            .collect()
+    };
+    let widen16 = |b: &[u16]| -> Vec<f32> {
+        b.iter()
+            .map(|h| pigeonhole_format::half::f16_to_f32(*h))
+            .collect()
+    };
+    let widenb = |b: &[u16]| -> Vec<f32> {
+        b.iter()
+            .map(|h| pigeonhole_format::half::bf16_to_f32(*h))
+            .collect()
+    };
+    for i in 0..200u32 {
+        let row = format!("r{i:04}");
+        let (h, b) = (bits16(i), bitsb(i));
+        t.mutate(row.as_bytes())
+            .put_vector_f16("h16", b"", &h)
+            .put_vector_bf16("hb", b"", &b)
+            .put_vector_f32("w16", b"", &widen16(&h))
+            .put_vector_f32("wb", b"", &widenb(&b))
+            .commit()
+            .expect("put");
+    }
+    db.flush().expect("flush");
+    // Bit for bit, and widened exactly.
+    let cell = t.get(b"r0007", "h16", b"").expect("get").expect("written");
+    let v = cell.as_vector().expect("vector");
+    assert_eq!(v.element(), Element::F16);
+    let stored: Vec<u16> = v
+        .as_bytes()
+        .chunks(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    assert_eq!(stored, bits16(7));
+    assert_eq!(v.to_f32_vec(), Some(widen16(&bits16(7))));
+    // nearest_f32 over halves equals nearest_f32 over the widened f32 vectors.
+    let q = [0.5f32, -1.0, 2.0, 0.25, 3.0, -2.5, 1.5, 0.75];
+    for (half, wide) in [("h16", "w16"), ("hb", "wb")] {
+        let a = t
+            .scan_prefix(b"")
+            .family(half)
+            .nearest_f32(&q, 20)
+            .run()
+            .unwrap();
+        let b = t
+            .scan_prefix(b"")
+            .family(wide)
+            .nearest_f32(&q, 20)
+            .run()
+            .unwrap();
+        let strip = |v: Vec<Neighbour>| -> Vec<(Vec<u8>, u64)> {
+            v.into_iter()
+                .map(|n| (n.row, n.distance.to_bits()))
+                .collect()
+        };
+        assert_eq!(strip(a), strip(b), "{half} ranks as {wide}");
+    }
+    // f32 writes into a half family: rounded to nearest-even, refusals at build time.
+    t.mutate(b"conv")
+        .put_vector_f32(
+            "h16",
+            b"",
+            &[1.0, -2.0, 0.333_333, 1e-3, 4.0, 5.0, 6.0, 7.0],
+        )
+        .commit()
+        .expect("put f32 into f16");
+    let c = t.get(b"conv", "h16", b"").expect("get").expect("written");
+    let want: Vec<f32> = [1.0f32, -2.0, 0.333_333, 1e-3, 4.0, 5.0, 6.0, 7.0]
+        .iter()
+        .map(|x| {
+            pigeonhole_format::half::f16_to_f32(pigeonhole_format::half::f32_to_f16(*x).unwrap())
+        })
+        .collect();
+    assert_eq!(c.as_vector().unwrap().to_f32_vec(), Some(want));
+    let invalid = |r: pigeonhole::Result<pigeonhole::CommitInfo>, why: &str| {
+        let e = r.expect_err(why);
+        assert_eq!(e.code(), ErrorCode::InvalidArgument, "{why}: {e}");
+        assert!(e.message().contains(why), "{why}: {}", e.message());
+    };
+    invalid(
+        t.mutate(b"x")
+            .put_vector_f32("h16", b"", &[70_000.0; 8])
+            .commit(),
+        "overflows",
+    );
+    invalid(
+        t.mutate(b"x")
+            .put_vector_f32("h16", b"", &[1e-9; 8])
+            .commit(),
+        "rounds to a zero vector",
+    );
+    invalid(
+        t.mutate(b"x")
+            .put_vector_f16("h16", b"", &[0x7c00; 8])
+            .commit(),
+        "finite",
+    );
+    invalid(
+        t.mutate(b"x")
+            .put_vector_f16("hb", b"", &[0x3c00; 8])
+            .commit(),
+        "element type",
+    );
+    invalid(
+        t.mutate(b"x").put_vector_i8("h16", b"", &[1; 8]).commit(),
+        "element type",
+    );
+    // Half the bytes at 4096 dimensions (the payload after the element and dimension).
+    let big = db
+        .table("big")
+        .expect("table")
+        .family(
+            "h",
+            Family::vector(VectorSpec::new(4096, Element::F16, Metric::L2).unwrap()),
+        )
+        .family(
+            "f",
+            Family::vector(VectorSpec::new(4096, Element::F32, Metric::L2).unwrap()),
+        )
+        .create_if_missing()
+        .expect("create");
+    big.mutate(b"r")
+        .put_vector_f32("h", b"", &[0.5; 4096])
+        .put_vector_f32("f", b"", &[0.5; 4096])
+        .commit()
+        .expect("put");
+    let h = big.get(b"r", "h", b"").unwrap().unwrap();
+    let f = big.get(b"r", "f", b"").unwrap().unwrap();
+    assert_eq!(
+        h.as_vector().unwrap().as_bytes().len() * 2,
+        f.as_vector().unwrap().as_bytes().len()
+    );
+    drop((t, big));
+    db.close().expect("close");
+}
+
 /// Polls `fut` to completion with a no-op waker: its output, and how often it was `Pending`.
 #[cfg(feature = "async")]
 fn poll_counting<F: std::future::Future>(fut: F) -> (F::Output, usize) {

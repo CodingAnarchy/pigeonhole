@@ -197,6 +197,45 @@ fn vector_values_and_family() {
     assert_eq!(back, edit);
 }
 
+/// Half-precision vector values (#1263): an `f16` and a `bf16` vector, each component a
+/// little-endian bit pattern, in a sibling of `values_vector.bin`, and an `f16` family's
+/// `PutFamily`.
+#[test]
+fn half_vector_values_and_family() {
+    use pigeonhole_format::vector::{Element, Metric, Params, VectorRef};
+    let le = |bits: &[u16]| -> Vec<u8> { bits.iter().flat_map(|b| b.to_le_bytes()).collect() };
+    // f16: 1.5, -0.25, 65504 (the largest), the smallest subnormal.
+    let f16s = le(&[0x3e00, 0xb400, 0x7bff, 0x0001]);
+    // bf16: 1.5, -0.25, 3.0.
+    let bf16s = le(&[0x3fc0, 0xbe80, 0x4040]);
+    let mut out = Vec::new();
+    for v in [
+        VectorRef::new(Element::F16, 4, &f16s).unwrap(),
+        VectorRef::new(Element::BF16, 3, &bf16s).unwrap(),
+    ] {
+        let mut one = Vec::new();
+        encode_value(&mut one, ValueRef::Vector(v));
+        assert_eq!(decode_value(&one).unwrap(), ValueRef::Vector(v));
+        pigeonhole_format::varint::put_bytes(&mut out, &one);
+    }
+    check("values_vector_half.bin", &out);
+
+    let params = Params::new(Element::F16, 768, Metric::Cosine).unwrap();
+    let edit = Edit::PutFamily {
+        table: TableId(1),
+        family: FamilyId(5),
+        name: "embedding_f16".into(),
+        options: FamilyOptions::default()
+            .kind(FamilyKind::Vector)
+            .kind_params(params.encode()),
+    };
+    let mut bytes = Vec::new();
+    edit.encode(&mut bytes);
+    check("edit_put_family_vector_f16.bin", &bytes);
+    let (back, _) = Edit::decode(&bytes).unwrap();
+    assert_eq!(back, edit);
+}
+
 fn data_block() -> Vec<u8> {
     let mut b = BlockBuilder::data(2);
     for (i, k) in sample_keys().iter().enumerate() {

@@ -134,6 +134,94 @@ pub fn norm2_f32_le(v: &[u8]) -> f32 {
     sum
 }
 
+/// The `i`-th little-endian `u16` of `bytes`.
+#[inline(always)]
+fn le16(bytes: &[u8], i: usize) -> u16 {
+    u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]])
+}
+
+/// The half-precision kernels (#1263): the `f32` kernels with each stored lane widened to
+/// `f32` (`$widen`) where they read an `f32`, the same 16 lanes, pairwise tree and tail order.
+/// So each equals its `f32` kernel over the widened vector, bit for bit.
+macro_rules! half_kernels {
+    ($elem:literal, $widen:path, $l2:ident, $dot_norm:ident, $norm2:ident) => {
+        #[doc = concat!("[`l2_f32_le`] over a vector of little-endian `", $elem, "` bits.")]
+        pub fn $l2(q: &[f32], v: &[u8]) -> f32 {
+            debug_assert_eq!(v.len(), 2 * q.len());
+            let (gq, tq) = q.as_chunks::<LANES>();
+            let (gv, tv) = v.as_chunks::<{ 2 * LANES }>();
+            let mut acc = [0f32; LANES];
+            for (cq, cv) in gq.iter().zip(gv) {
+                for i in 0..LANES {
+                    let d = cq[i] - $widen(le16(cv, i));
+                    acc[i] += d * d;
+                }
+            }
+            let mut sum = tree(acc);
+            for (j, x) in tq.iter().enumerate() {
+                let d = x - $widen(le16(tv, j));
+                sum += d * d;
+            }
+            sum
+        }
+
+        #[doc = concat!("[`dot_norm_f32_le`] over a vector of little-endian `", $elem, "` bits.")]
+        pub fn $dot_norm(q: &[f32], v: &[u8]) -> (f32, f32) {
+            debug_assert_eq!(v.len(), 2 * q.len());
+            let (gq, tq) = q.as_chunks::<LANES>();
+            let (gv, tv) = v.as_chunks::<{ 2 * LANES }>();
+            let (mut dot, mut norm) = ([0f32; LANES], [0f32; LANES]);
+            for (cq, cv) in gq.iter().zip(gv) {
+                for i in 0..LANES {
+                    let x = $widen(le16(cv, i));
+                    dot[i] += cq[i] * x;
+                    norm[i] += x * x;
+                }
+            }
+            let (mut d, mut n) = (tree(dot), tree(norm));
+            for (j, y) in tq.iter().enumerate() {
+                let x = $widen(le16(tv, j));
+                d += y * x;
+                n += x * x;
+            }
+            (d, n)
+        }
+
+        #[doc = concat!("[`norm2_f32`] of a vector of little-endian `", $elem, "` bits, widened.")]
+        pub fn $norm2(v: &[u8]) -> f32 {
+            let (g, t) = v.as_chunks::<{ 2 * LANES }>();
+            let mut acc = [0f32; LANES];
+            for c in g {
+                for (i, a) in acc.iter_mut().enumerate() {
+                    let x = $widen(le16(c, i));
+                    *a += x * x;
+                }
+            }
+            let mut sum = tree(acc);
+            for c in t.as_chunks::<2>().0 {
+                let x = $widen(u16::from_le_bytes(*c));
+                sum += x * x;
+            }
+            sum
+        }
+    };
+}
+
+half_kernels!(
+    "f16",
+    crate::half::f16_to_f32,
+    l2_f16_le,
+    dot_norm_f16_le,
+    norm2_f16_le
+);
+half_kernels!(
+    "bf16",
+    crate::half::bf16_to_f32,
+    l2_bf16_le,
+    dot_norm_bf16_le,
+    norm2_bf16_le
+);
+
 /// Cosine distance `1 - (q·v) / (|q| |v|)` from [`dot_norm_f32_le`]'s parts and `q`'s
 /// squared norm. NaN when either norm is zero (the caller refuses or skips those).
 pub fn cosine_from(dot: f32, q_norm2: f32, v_norm2: f32) -> f32 {
@@ -278,6 +366,66 @@ mod tests {
             cosine_from(0.0, 0.0, 1.0).is_nan(),
             "a zero norm is NaN, for the caller"
         );
+    }
+
+    /// #1263: each half kernel equals its `f32` kernel over the widened vector, bit for bit,
+    /// for random and boundary payloads (subnormals, ±0, the extremes) at dims around the lane
+    /// width and at 4096.
+    #[test]
+    fn half_kernels_equal_the_f32_kernels_over_widened_vectors() {
+        use crate::half::{bf16_to_f32, f16_to_f32};
+        let mut seed = 0x1263_0001_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let boundary: [u16; 8] = [
+            0x0000, 0x8000, 0x0001, 0x03ff, 0x0400, 0x7bff, 0xfbff, 0x3c00,
+        ];
+        for n in [1usize, 15, 16, 17, 64, 4096] {
+            for (is_f16, widen, lo, hi) in [
+                (true, f16_to_f32 as fn(u16) -> f32, 0x0000u16, 0x7bffu16),
+                (false, bf16_to_f32 as fn(u16) -> f32, 0x0000u16, 0x7f7fu16),
+            ] {
+                let bits: Vec<u16> = (0..n)
+                    .map(|i| {
+                        if i < boundary.len() && is_f16 {
+                            boundary[i]
+                        } else {
+                            let mag = lo + (next() % u64::from(hi - lo)) as u16;
+                            mag | if next() & 1 == 0 { 0 } else { 0x8000 }
+                        }
+                    })
+                    .collect();
+                let half: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+                let wide: Vec<f32> = bits.iter().map(|b| widen(*b)).collect();
+                let wide_le = bytes(&wide);
+                let q = rnd(&mut next(), n);
+                let (l2, dn, n2) = if is_f16 {
+                    (
+                        l2_f16_le(&q, &half),
+                        dot_norm_f16_le(&q, &half),
+                        norm2_f16_le(&half),
+                    )
+                } else {
+                    (
+                        l2_bf16_le(&q, &half),
+                        dot_norm_bf16_le(&q, &half),
+                        norm2_bf16_le(&half),
+                    )
+                };
+                let want_dn = dot_norm_f32_le(&q, &wide_le);
+                assert_eq!(l2.to_bits(), l2_f32_le(&q, &wide_le).to_bits(), "l2 n={n}");
+                assert_eq!(
+                    (dn.0.to_bits(), dn.1.to_bits()),
+                    (want_dn.0.to_bits(), want_dn.1.to_bits()),
+                    "dot/norm n={n}"
+                );
+                assert_eq!(n2.to_bits(), norm2_f32(&wide).to_bits(), "norm2 n={n}");
+            }
+        }
     }
 
     #[test]
