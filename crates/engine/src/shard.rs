@@ -2295,7 +2295,10 @@ fn span(bytes: &[u8], (off, len): (u32, u32)) -> &[u8] {
 impl Dedup {
     /// Decodes `batch` (whose bytes are `bytes`) into `keys`, with the commit's timestamp
     /// not yet filled in, and returns the token naming this decode: a later `scan` given it
-    /// reuses the keys if nothing was decoded since.
+    /// reuses the keys if nothing was decoded since. Out of line: inlined into admission and
+    /// apply, it grew `run_group`'s hot code, and ycsb-e on the box showed about 40% more
+    /// instruction cache misses per cycle with 2-3% less throughput (#1287).
+    #[inline(never)]
     fn decode(&mut self, batch: BatchRef<'_>, bytes: &[u8]) -> u32 {
         self.keys.clear();
         self.error = None;
@@ -4083,7 +4086,7 @@ impl ShardState {
     /// With `group` (a single in a group, #749), a slot an earlier single of the group already
     /// reserved for costs no chunk, nor do the fixed two once one did; the slots it touches are
     /// added to the group's (the caller truncates them again if the member is not admitted).
-    fn arena_needed(&self, bytes: &[u8], rows: &mut Vec<u64>) -> ArenaNeed {
+    fn arena_needed(&self, keys: &[MutKey], bytes: &[u8], rows: &mut Vec<u64>) -> ArenaNeed {
         rows.clear();
         let mut total = 0usize;
         let mut waste = 0usize;
@@ -4099,7 +4102,7 @@ impl ShardState {
         // and hashes it once.
         let mut last: Option<(TableId, &[u8], Option<TabletId>)> = None;
         // The batch as `reserve_room` just decoded it (#1206): its apply reads the same keys.
-        for k in &self.dedup.keys {
+        for k in keys {
             let (table, family) = (TableId(k.table), FamilyId(k.family));
             let (row, qualifier) = (span(bytes, k.row), span(bytes, k.qualifier));
             let key = 2 * (row.len() + qualifier.len()) + KEY_FIXED;
@@ -4258,7 +4261,7 @@ impl ShardState {
         let need = match batch {
             Some(batch) => {
                 self.dedup.decode(batch, batch.as_bytes());
-                self.arena_needed(batch.as_bytes(), &mut rows)
+                self.arena_needed(&self.dedup.keys, batch.as_bytes(), &mut rows)
             }
             None => ArenaNeed {
                 bytes: 0,
