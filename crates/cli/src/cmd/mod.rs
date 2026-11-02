@@ -60,10 +60,12 @@ pub(crate) fn run(
             create,
             max_result_bytes,
             max_value_bytes,
+            change_feed,
         } => {
             let limits = crate::mcp::Limits {
                 result_bytes: *max_result_bytes,
                 value_bytes: *max_value_bytes,
+                feed_bytes: *change_feed,
             };
             return crate::mcp::run(&cli, file, *read_only, *create, limits, stdout, stderr)
                 .map(Outcome::Streamed);

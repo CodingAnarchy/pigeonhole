@@ -770,6 +770,20 @@ impl Index {
         out
     }
 
+    /// A text's tokens as the index holds them, with their byte ranges (highlighting,
+    /// D309 §4.5): the terms `analyse` indexes, in token order.
+    pub(crate) fn spans(&self, text: &str) -> crate::highlight::Spans {
+        let cap = self.inner.opts.get_max_term_bytes() as usize;
+        let mut out = Vec::new();
+        self.inner.tok.tokens(text, &mut |tok| {
+            let term = self.normalize_token(tok.text);
+            if !term.is_empty() && term.len() <= cap {
+                out.push((term.into_owned(), tok.position, tok.range.clone()));
+            }
+        });
+        out
+    }
+
     /// A token as the index stores it: normalised, and for the built-in tokeniser under
     /// NFKC, lowercased again (a compatibility form can fold to an uppercase letter).
     pub(crate) fn normalize_token<'a>(&self, s: &'a str) -> Cow<'a, str> {

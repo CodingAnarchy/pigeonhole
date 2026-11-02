@@ -6,6 +6,7 @@ use pigeonhole::Snapshot;
 
 use crate::error::{Error, Result, corrupt};
 use crate::fuzzy::{Expansion, edits, expand};
+use crate::highlight::{Match, Want, find};
 use crate::index::{Index, Rows};
 use crate::layout::*;
 use crate::maxscore::{Bm25, Scored};
@@ -19,6 +20,15 @@ pub struct Hit {
     pub id: Vec<u8>,
     /// Its BM25 score.
     pub score: f64,
+    /// With [`Search::highlight`], the document's source text; `None` otherwise.
+    pub text: Option<String>,
+    /// With [`Search::highlight`], every occurrence of every query clause in
+    /// [`text`](Self::text), by position; empty otherwise. [`snippet`](crate::snippet)
+    /// picks a window of them. They're computed from the source text as it is at the
+    /// search's snapshot: if the source drifted from the index (a write around it, which
+    /// [`verify`](crate::Index::verify) reports), they describe the current text, which may
+    /// not be what the hit was scored on.
+    pub matches: Vec<Match>,
 }
 
 /// What a search met besides its hits.
@@ -54,7 +64,8 @@ const DEFAULT_MAX_EXPANSIONS: usize = 50;
 /// A fuzzy term as the search expands it.
 #[derive(Debug, PartialEq)]
 struct FuzzyTerm {
-    clause: usize,
+    /// The clauses that yield it, the first for [`SearchStats::fuzzy`].
+    clauses: Vec<usize>,
     term: String,
     edits: u8,
 }
@@ -70,6 +81,7 @@ pub struct Search<'a> {
     prefix: Option<Vec<u8>>,
     max_expansions: usize,
     prefix_length: usize,
+    highlight: bool,
 }
 
 /// A phrase as the evaluator matches it: each term with its offset from the first, and the
@@ -90,7 +102,20 @@ impl<'a> Search<'a> {
             prefix: None,
             max_expansions: DEFAULT_MAX_EXPANSIONS,
             prefix_length: 0,
+            highlight: false,
         }
+    }
+
+    /// Fills each hit's [`text`](Hit::text) and [`matches`](Hit::matches) (D309 §4.5).
+    ///
+    /// The matches are recomputed by tokenising each hit's source text again, as it was
+    /// indexed, so they always match the text returned. The source cell is read for every
+    /// hit anyway, so this costs one tokenising pass per hit, and nothing when it's off.
+    /// Offsets are UTF-8 byte offsets. An index without positions still highlights terms
+    /// and fuzzy terms.
+    pub fn highlight(mut self, on: bool) -> Self {
+        self.highlight = on;
+        self
     }
 
     /// The most terms each fuzzy term expands to: 50 by default (D309 §4.4). When more
@@ -164,7 +189,7 @@ impl<'a> Search<'a> {
             return Err(Error::Busy);
         }
         let mut stats = SearchStats::default();
-        let (terms, phrases, fuzzy) = self.resolve()?;
+        let (terms, phrases, fuzzy, mut wants) = self.resolve()?;
         if self.k == 0 || (terms.is_empty() && phrases.is_empty() && fuzzy.is_empty()) {
             return Ok((Vec::new(), stats));
         }
@@ -208,8 +233,14 @@ impl<'a> Search<'a> {
                 self.prefix_length,
                 self.max_expansions,
             )?;
+            if self.highlight {
+                let set: BTreeSet<String> = exps.iter().map(|e| e.term.clone()).collect();
+                for &c in &f.clauses {
+                    wants.push((c, Want::Terms(set.clone())));
+                }
+            }
             stats.fuzzy.push(FuzzyStats {
-                clause: f.clause,
+                clause: f.clauses[0],
                 term: f.term.clone(),
                 expansions: exps.len(),
                 cut,
@@ -263,11 +294,23 @@ impl<'a> Search<'a> {
                 if hits.len() == self.k {
                     break;
                 }
-                if inn.src.get_at(s, &id, fam, q)?.is_none() {
+                let Some(cell) = inn.src.get_at(s, &id, fam, q)? else {
                     stats.stale += 1;
                     continue;
-                }
-                hits.push(Hit { id, score });
+                };
+                let (text, matches) = match std::str::from_utf8(cell.value()) {
+                    Ok(text) if self.highlight => {
+                        let matches = find(&index.spans(text), &wants);
+                        (Some(text.to_owned()), matches)
+                    }
+                    _ => (None, Vec::new()),
+                };
+                hits.push(Hit {
+                    id,
+                    score,
+                    text,
+                    matches,
+                });
             }
             if hits.len() == self.k || complete {
                 return Ok((hits, stats));
@@ -278,7 +321,17 @@ impl<'a> Search<'a> {
 
     /// The query's distinct terms, phrases and fuzzy terms, normalised and tokenised as the
     /// clauses say. A term a clause yields twice counts once; a one-term phrase is a term.
-    fn resolve(&self) -> Result<(BTreeSet<String>, Vec<Phrase>, Vec<FuzzyTerm>)> {
+    /// With [`highlight`](Self::highlight), also what each clause looks for (its fuzzy
+    /// terms' expansions are added once they're known).
+    #[allow(clippy::type_complexity)]
+    fn resolve(
+        &self,
+    ) -> Result<(
+        BTreeSet<String>,
+        Vec<Phrase>,
+        Vec<FuzzyTerm>,
+        Vec<(usize, Want)>,
+    )> {
         let index = self.index;
         let cap = index.inner.opts.get_max_term_bytes() as usize;
         let mut terms = BTreeSet::new();
@@ -289,12 +342,27 @@ impl<'a> Search<'a> {
                 return;
             }
             let edits = edits(&term, fuzziness);
-            if !fuzzy.iter().any(|f| f.term == term && f.edits == edits) {
-                fuzzy.push(FuzzyTerm {
-                    clause,
+            match fuzzy
+                .iter_mut()
+                .find(|f| f.term == term && f.edits == edits)
+            {
+                Some(f) => {
+                    if !f.clauses.contains(&clause) {
+                        f.clauses.push(clause);
+                    }
+                }
+                None => fuzzy.push(FuzzyTerm {
+                    clauses: vec![clause],
                     term,
                     edits,
-                });
+                }),
+            }
+        };
+        let mut wants: Vec<(usize, Want)> = Vec::new();
+        let hl = self.highlight;
+        let mut want = |clause: usize, w: Want| {
+            if hl {
+                wants.push((clause, w));
             }
         };
         let mut add_phrase = |p: Phrase, terms: &mut BTreeSet<String>| match p.terms.len() {
@@ -315,11 +383,20 @@ impl<'a> Search<'a> {
                     let t = index.normalize_term(t);
                     // A builder term over the cap can't match: the index dropped such words.
                     if !t.is_empty() && t.len() <= cap {
+                        want(at, Want::Terms(BTreeSet::from([t.to_string()])));
                         terms.insert(t.into_owned());
                     }
                 }
                 Clause::Text(text) => {
-                    terms.extend(index.query_tokens(text).into_iter().map(|(t, _)| t));
+                    let ts: BTreeSet<String> = index
+                        .query_tokens(text)
+                        .into_iter()
+                        .map(|(t, _)| t)
+                        .collect();
+                    if !ts.is_empty() {
+                        want(at, Want::Terms(ts.clone()));
+                    }
+                    terms.extend(ts);
                 }
                 Clause::Phrase { words, slop } => {
                     let p = Phrase {
@@ -332,19 +409,23 @@ impl<'a> Search<'a> {
                     };
                     // A phrase with a word that can't be a term matches nothing.
                     if p.terms.iter().all(|(w, _)| !w.is_empty() && w.len() <= cap) {
+                        if let Some(w) = p.want() {
+                            want(at, w);
+                        }
                         add_phrase(p, &mut terms);
                     }
                 }
                 Clause::QuotedPhrase { text, slop } => {
                     let toks = index.query_tokens(text);
                     let first = toks.first().map_or(0, |(_, p)| *p);
-                    add_phrase(
-                        Phrase {
-                            terms: toks.into_iter().map(|(t, p)| (t, p - first)).collect(),
-                            slop: *slop,
-                        },
-                        &mut terms,
-                    );
+                    let p = Phrase {
+                        terms: toks.into_iter().map(|(t, p)| (t, p - first)).collect(),
+                        slop: *slop,
+                    };
+                    if let Some(w) = p.want() {
+                        want(at, w);
+                    }
+                    add_phrase(p, &mut terms);
                 }
                 Clause::Fuzzy { term, fuzziness } => {
                     add_fuzzy(at, index.normalize_term(term).into_owned(), *fuzziness);
@@ -361,7 +442,21 @@ impl<'a> Search<'a> {
                 "the index has no positions, which a phrase needs".into(),
             ));
         }
-        Ok((terms, phrases, fuzzy))
+        Ok((terms, phrases, fuzzy, wants))
+    }
+}
+
+impl Phrase {
+    /// What highlighting looks for: a one-term phrase is that term.
+    fn want(&self) -> Option<Want> {
+        match self.terms.len() {
+            0 => None,
+            1 => Some(Want::Terms(BTreeSet::from([self.terms[0].0.clone()]))),
+            _ => Some(Want::Phrase {
+                terms: self.terms.clone(),
+                slop: self.slop,
+            }),
+        }
     }
 }
 

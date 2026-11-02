@@ -33,9 +33,20 @@ use pigeonhole_engine::{
     FeedStart, Next, TableInfo, ValueRef, WriteBatch,
 };
 use pigeonhole_format::{Durability, Seqno, TableId};
+use pigeonhole_io::ProcessId;
 use pigeonhole_io::sim::{CrashKind, SimVfs};
 
 const DB: &str = "/db/data.phdb";
+/// The writer's process, and a reader process whose subscribers follow the writer's feed
+/// through shared memory (D310 PR 4).
+const WRITER: ProcessId = ProcessId {
+    pid: 1,
+    start_time: 1,
+};
+const READER: ProcessId = ProcessId {
+    pid: 2,
+    start_time: 1,
+};
 
 fn seeds() -> Vec<u64> {
     let n: u64 = std::env::var("PIGEONHOLE_SEEDS")
@@ -128,6 +139,8 @@ struct Made {
 /// A subscriber and what it was delivered since its token.
 struct Sub {
     durable: bool,
+    /// In the reader process (D310 PR 4), not the writer's.
+    process: bool,
     reader: Option<FeedReader>,
     token: Option<Vec<u8>>,
     /// (seqno, tag) delivered, in order.
@@ -142,6 +155,8 @@ struct Run {
     shards_n: usize,
     tables: [Arc<TableInfo>; 2],
     db: Option<Arc<Engine>>,
+    /// The reader process's engine (`Engine::open_reader`), while one runs.
+    reader_db: Option<Arc<Engine>>,
     shards: Vec<EngineShard>,
     /// Every commit that survives (or may), by tag.
     made: BTreeMap<u32, Made>,
@@ -185,6 +200,29 @@ impl Run {
         settle(&mut self.shards);
     }
 
+    /// Opens the reader process's engine on the running writer.
+    fn open_reader(&mut self) {
+        self.vfs.enter_process(READER);
+        let r = Engine::open_reader(Path::new(DB), options(&self.vfs, self.shards_n))
+            .unwrap_or_else(|e| panic!("seed {}: reader open: {e}", self.seed));
+        self.vfs.enter_process(WRITER);
+        self.reader_db = Some(r);
+    }
+
+    /// Subscribes with `spec` in subscriber `i`'s process.
+    fn feed_for(&self, i: usize, spec: FeedSpec) -> FeedReader {
+        let process = self.subs[i].process;
+        let db = if process {
+            self.vfs.enter_process(READER);
+            self.reader_db.as_ref().expect("a reader process")
+        } else {
+            self.db()
+        };
+        let r = db.feed(spec);
+        self.vfs.enter_process(WRITER);
+        r.unwrap_or_else(|e| panic!("seed {}: subscribe (process {process}): {e}", self.seed))
+    }
+
     fn spec(&self, durable: bool, start: FeedStart) -> FeedSpec {
         FeedSpec {
             tables: self.tables.iter().map(|t| t.id).collect(),
@@ -201,7 +239,7 @@ impl Run {
             None => FeedStart::Now,
         };
         let spec = self.spec(self.subs[i].durable, start);
-        let r = self.db().feed(spec).unwrap();
+        let r = self.feed_for(i, spec);
         let sub = &mut self.subs[i];
         if sub.token.is_none() {
             sub.last = r.delivered();
@@ -285,11 +323,17 @@ impl Run {
         // Both subscribers read what they can now, without the shards running (no settle,
         // so no sync): a durable one must take nothing a power loss can undo.
         let seed = self.seed;
+        let vfs = Arc::clone(&self.vfs);
         for sub in &mut self.subs {
             let Some(r) = sub.reader.as_mut() else {
                 continue;
             };
-            while let Next::Commit(c) = r.try_next().unwrap() {
+            if sub.process {
+                vfs.enter_process(READER);
+            }
+            // A reader-process feed whose writer restarted since gets `SnapshotExpired` (its
+            // next poll resubscribes): it reads nothing here.
+            while let Ok(Next::Commit(c)) = r.try_next() {
                 let tag = tag_of(c, seed);
                 if let Some(m) = self.made.get_mut(&tag)
                     && m.seqno == 0
@@ -298,6 +342,7 @@ impl Run {
                 }
                 sub.delivered.push((c.seqno, tag));
             }
+            vfs.enter_process(WRITER);
         }
         drop(pending);
         self.crash_and_reopen();
@@ -311,7 +356,24 @@ impl Run {
                 let seed = self.seed;
                 let sub = &mut self.subs[i];
                 let Some(r) = sub.reader.as_mut() else { break };
-                let c = match r.try_next().unwrap() {
+                if sub.process {
+                    self.vfs.enter_process(READER);
+                }
+                let next = r.try_next();
+                self.vfs.enter_process(WRITER);
+                let next = match next {
+                    Ok(next) => next,
+                    // A reader process's feed after its writer restarted: resubscribe from
+                    // its own token on the new writer (D310 PR 4, M2).
+                    Err(pigeonhole_engine::Error::SnapshotExpired) if sub.process => {
+                        sub.token = Some(r.token());
+                        sub.reader = None;
+                        self.subscribe(i);
+                        continue;
+                    }
+                    Err(e) => panic!("seed {seed}: try_next (process {}): {e}", sub.process),
+                };
+                let c = match next {
                     Next::Commit(c) => c.clone(),
                     Next::Pending => {
                         // M1 at this frontier: every surviving commit at or below it past
@@ -366,9 +428,15 @@ impl Run {
                 for (t, m) in &self.made {
                     assert!(
                         !(m.seqno != 0 && m.seqno > prev && m.seqno < c.seqno),
-                        "seed {seed}: commit {t} (seqno {}) skipped between {prev} and {}",
+                        "seed {seed}: commit {t} (seqno {}, {:?}) skipped between {prev} and {} \
+                         (durable {}, process {}; delivered tail {:?}, last {})",
                         m.seqno,
-                        c.seqno
+                        m.durability,
+                        c.seqno,
+                        sub.durable,
+                        sub.process,
+                        &sub.delivered[sub.delivered.len().saturating_sub(4)..],
+                        sub.last
                     );
                 }
                 sub.delivered.push((c.seqno, tag));
@@ -387,8 +455,12 @@ impl Run {
     fn close_and_reopen(&mut self) {
         self.poll();
         self.take_tokens();
+        // The reader process lives on: its feeds find their attachment stale at their next
+        // poll and resubscribe from their own tokens.
         for sub in &mut self.subs {
-            sub.reader = None;
+            if !sub.process {
+                sub.reader = None;
+            }
         }
         let db = self.db.take().unwrap();
         // A clean close: drive it with the shards.
@@ -396,7 +468,9 @@ impl Run {
         close_app_owned(db, shards);
         self.open();
         for i in 0..self.subs.len() {
-            self.subscribe(i);
+            if !self.subs[i].process {
+                self.subscribe(i);
+            }
         }
     }
 
@@ -417,10 +491,13 @@ impl Run {
         // A root commit whose sidecar sync hasn't landed: its Root entry may be lost with the
         // power, which expires every token (the window fix A leaves, the safe direction).
         let root_unsynced = self.db().feed_sidecar_sync_pending();
+        // A power loss ends every process, the reader's too.
+        self.reader_db = None;
         self.vfs.crash(CrashKind::Power);
         self.shards.clear();
         self.db = None;
         self.open();
+        self.open_reader();
         // Which commits survived: a power loss may undo `None` and `Buffered` ones.
         let mut lost = Vec::new();
         for (tag, m) in &self.made {
@@ -472,11 +549,13 @@ impl Run {
                 self.subscribe(i);
                 continue;
             };
-            let mut r = self
-                .db()
-                .feed(self.spec(durable, FeedStart::Token(token)))
-                .unwrap();
-            let expired = match r.try_next().unwrap() {
+            let mut r = self.feed_for(i, self.spec(durable, FeedStart::Token(token)));
+            if self.subs[i].process {
+                self.vfs.enter_process(READER);
+            }
+            let next = r.try_next();
+            self.vfs.enter_process(WRITER);
+            let expired = match next.unwrap() {
                 Next::Expired(e) => Some(e.reason.clone()),
                 _ => None,
             };
@@ -527,6 +606,9 @@ fn run(seed: u64) {
     DEFERRED.with(|d| *d.borrow_mut() = deferred.then(|| Arc::clone(&vfs)));
     let mut rng = Rng(seed);
     let shards_n = 1 + rng.below(3) as usize;
+    vfs.enter_process(WRITER);
+    let deferred = std::env::var("PIGEONHOLE_DEFERRED_IO").is_ok_and(|v| v == "1");
+    DEFERRED.with(|d| *d.borrow_mut() = deferred.then(|| Arc::clone(&vfs)));
     let tables = {
         let db = Engine::open(Path::new(DB), options(&vfs, shards_n)).unwrap();
         let f = || vec![("f".into(), FamilyOptions::default())];
@@ -546,12 +628,15 @@ fn run(seed: u64) {
         shards_n,
         tables,
         db: None,
+        reader_db: None,
         shards: Vec::new(),
         made: BTreeMap::new(),
-        subs: [true, false]
+        // A durable and a visible subscriber in the writer, and the same in a reader process.
+        subs: [(true, false), (false, false), (true, true), (false, true)]
             .into_iter()
-            .map(|durable| Sub {
+            .map(|(durable, process)| Sub {
                 durable,
+                process,
                 reader: None,
                 token: None,
                 delivered: Vec::new(),
@@ -562,8 +647,10 @@ fn run(seed: u64) {
         lost_total: 0,
     };
     run.open();
-    run.subscribe(0);
-    run.subscribe(1);
+    run.open_reader();
+    for i in 0..run.subs.len() {
+        run.subscribe(i);
+    }
     let levels = [
         Durability::None,
         Durability::Buffered,
@@ -584,7 +671,7 @@ fn run(seed: u64) {
             9 => {
                 // Resume one subscriber from a token taken now, in this session.
                 run.poll();
-                let i = rng.below(2) as usize;
+                let i = rng.below(run.subs.len() as u64) as usize;
                 run.subs[i].token = run.subs[i].reader.as_ref().map(|r| r.token());
                 run.subs[i].reader = None;
                 run.subscribe(i);
@@ -636,8 +723,9 @@ fn run(seed: u64) {
         assert_eq!(
             sub.delivered.last().map(|d| d.0),
             Some(last.seqno),
-            "seed {seed}: the last commit not delivered (durable {})",
-            sub.durable
+            "seed {seed}: the last commit not delivered (durable {}, process {})",
+            sub.durable,
+            sub.process
         );
     }
     eprintln!(
@@ -652,6 +740,11 @@ fn run(seed: u64) {
     for sub in &mut run.subs {
         sub.reader = None;
     }
+    run.vfs.enter_process(READER);
+    if let Some(r) = run.reader_db.take() {
+        r.close().unwrap();
+    }
+    run.vfs.enter_process(WRITER);
     close_app_owned(db, std::mem::take(&mut run.shards));
 }
 

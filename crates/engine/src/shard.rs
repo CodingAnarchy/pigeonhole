@@ -7893,6 +7893,14 @@ impl ShardState {
         let failed = result.is_err();
         if failed {
             self.poison(crate::health::FailureCause::Io);
+            // The durable watermark stays below the failed group for good, so every shard's
+            // freezes (which wait for the durable seqno) would stall behind it: treat the
+            // failure as a shard's death. Visibility ends (waiters get `OutcomeUnknown`), the
+            // close is unclean, and the next open replays only what reached the disk. A
+            // poisoned stream already means the database needs reopening. Before the groups
+            // are answered (#1358): a caller that commits again once it hears
+            // `OutcomeUnknown` is refused with `Closed`, not admitted behind the dead stream.
+            self.shared.shard_died();
         }
         while self.unresolved.front().is_some_and(|g| g.id <= through) {
             let group = self.unresolved.pop_front().expect("checked");
@@ -7908,14 +7916,6 @@ impl ShardState {
                 Ok(())
             };
             self.resolve_group(group, outcome, ctx);
-        }
-        if failed {
-            // The durable watermark stays below the failed group for good, so every shard's
-            // freezes (which wait for the durable seqno) would stall behind it: treat the
-            // failure as a shard's death. Visibility ends (waiters get `OutcomeUnknown`), the
-            // close is unclean, and the next open replays only what reached the disk. A
-            // poisoned stream already means the database needs reopening.
-            self.shared.shard_died();
         }
         self.try_finish_close(ctx);
     }
@@ -9225,6 +9225,11 @@ impl ShardState {
             // `OutcomeUnknown`, the close gives up flushing and is unclean). A poisoned shard
             // already means the database needs reopening. No participant counted the commit
             // down to zero (D278), so its answer is still here.
+            //
+            // The death first, then the answer (#1358): a caller that commits again as soon as
+            // it hears `OutcomeUnknown` must be refused with `Closed`, never admitted, written
+            // and then left undecidable when visibility ends.
+            self.shared.shard_died();
             let reply = c.reply.take().or_else(|| {
                 c.completion
                     .as_ref()
@@ -9234,7 +9239,11 @@ impl ShardState {
             if let Some(reply) = reply {
                 reply.notify(Err(Error::OutcomeUnknown));
             }
-            self.shared.shard_died();
+            #[cfg(feature = "test-hooks")]
+            self.shared
+                .hooks
+                .sites
+                .run(crate::engine::hooks::HookSite::FailedShareAnswered);
             self.try_finish_close(ctx);
             return;
         }

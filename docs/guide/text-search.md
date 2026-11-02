@@ -88,6 +88,38 @@ assert_eq!(fuzzy[0].id, b"a");
   - Composed and decomposed accents differ by edits, so keep the default `Nfc` normalisation if you search with fuzzy terms.
 - **A namespace:** `.id_prefix(p)` restricts a search to ids starting with `p`. Include the namespace's terminator (`agent:alice\0`), or `agent:alice2` matches too. Scores keep the whole index's statistics.
 
+## Highlighting
+`.highlight(true)` fills each hit's `text` (its source text) and `matches`. Each `Match` has three fields:
+- **`range`:** a UTF-8 byte range into `text`;
+- **`clause`:** the index into `query.clauses()` of the clause it matched;
+- **`occurrence`:** which of that clause's occurrences it is.
+
+A term or fuzzy term matches one token. An exact phrase covers its first token to its last. A sloppy phrase match lists one range per phrase word, all sharing one `occurrence`. `pigeonhole_text::snippet(&text, &matches, max_bytes)` picks a window, cut on word boundaries. It prefers the most distinct clauses, then the most matches, then the earliest.
+
+```rust
+# use pigeonhole::*;
+# use pigeonhole_text::{Index, IndexOptions, Source, snippet};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let notes = db.table("notes")?.family("body", Family::default()).create_if_missing()?;
+# let index = Index::create(&db, "notes_text", Source::new(&notes, "body", b"text"), IndexOptions::new())?;
+index.put(b"a", "Notes from the March meeting: we chose Postgres over SQLite.")?;
+let hits = index.search(r#""march meeting" postgress~"#, 10).highlight(true).run()?;
+let text = hits[0].text.as_deref().unwrap();
+let found: Vec<&str> = hits[0].matches.iter().map(|m| &text[m.range.clone()]).collect();
+assert_eq!(found, ["March meeting", "Postgres"]);
+let s = snippet(text, &hits[0].matches, 40);
+assert_eq!(&text[s.range], "March meeting: we chose Postgres over ");
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Matches are recomputed** by tokenising the hit's text again, so they always fit the text returned. That costs one pass per hit, and nothing when highlighting is off.
+- **An index without positions** still highlights terms and fuzzy terms.
+- **Python and MCP callers get code-point offsets,** not bytes.
+
 ## Options
 Options are fixed when the index is created.
 
@@ -110,41 +142,39 @@ A reader process opens the index with `Index::open_reader(&reader, name)`. That 
 ## Performance
 MaxScore reads only the postings that can still change the top `k`. The result is the same as scoring every document.
 
-The numbers below are for 1,000,000 documents of about 40 words, from a 50,000-word Zipf vocabulary, on the reference AX102 (`crates/text/examples/bench.rs`). They are p50 and p99 over 1,000 queries per kind, top 10 unless noted.
-
-> **Measured without a full compaction.** A forced full compaction of a text index currently writes about 1,000 times the index's size, a known engine problem (#1313) that's being fixed before 1.1.0. So these numbers are taken after a flush only, with the index in whatever state background compaction had reached. Stored bytes are an over-estimate, since counter operands haven't all been folded yet, and search latency may improve once the index is compacted. They'll be re-taken once the fix (#1332) is in.
+The numbers below are for 1,000,000 documents of about 40 words, from a 50,000-word Zipf vocabulary, on the reference AX102 (`crates/text/examples/bench.rs`). They are p50 and p99 over 1,000 queries per kind, top 10 unless noted, after a flush and a full compaction. They're the means of two runs, which agreed within 4%.
 
 **Writing** goes one document per transaction, `Buffered`:
 
 | | per document | stored bytes per document |
 |---|---|---|
-| positions off | 136 µs | 1,044 |
-| positions on (the default) | 160 µs (+18%) | 1,649 (+58%) |
+| positions off | 139 µs | 1,038 |
+| positions on (the default) | 157 µs (+13%) | 1,640 (+58%) |
 
-The write rate stays flat from the first document to the millionth.
+The write rate stays flat from the first document to the millionth. A full compaction of the index takes 4 to 7 seconds.
 
 **Searching**, top 10 unless noted:
 
 | query | p50 | p99 |
 |---|---|---|
-| two terms, drawn by frequency | 2.5 ms | 92 ms |
-| two of the 20 most common terms | 44 ms | 99 ms |
-| an exact phrase of two rare words | 0.28 ms | 1.1 ms |
-| an exact phrase, one common word | 76 ms | 220 ms |
-| an exact phrase of two common words | 403 ms | 1,110 ms |
-| that mixed phrase, slop 2 | 78 ms | 270 ms |
-| that mixed phrase, slop 10 | 81 ms | 360 ms |
-| two terms, top 1,000 | 30 ms | 184 ms |
-| a fuzzy term, 1 edit (41 expansions) | 375 ms | 1,180 ms |
-| a fuzzy term, 2 edits (44 expansions) | 406 ms | 1,184 ms |
-| a fuzzy term, 2 edits, `prefix_length(2)` (37 expansions) | 130 ms | 852 ms |
-
-These are the means of two runs, which agreed within 4%.
+| two terms, drawn by frequency | 2.3 ms | 95 ms |
+| two of the 20 most common terms | 43 ms | 96 ms |
+| an exact phrase of two rare words | 0.25 ms | 1 ms |
+| an exact phrase, one common word | 77 ms | 216 ms |
+| an exact phrase of two common words | 402 ms | 1,084 ms |
+| that mixed phrase, slop 2 | 79 ms | 265 ms |
+| that mixed phrase, slop 10 | 81 ms | 357 ms |
+| two terms, top 1,000 | 28 ms | 188 ms |
+| a fuzzy term, 1 edit (41 expansions) | 17 ms | 142 ms |
+| a fuzzy term, 2 edits (44 expansions) | 21 ms | 142 ms |
+| a fuzzy term, 2 edits, `prefix_length(2)` (37 expansions) | 15 ms | 110 ms |
+| a fuzzy term, 1 edit, and a term drawn by frequency | 26 ms | 2,932 ms |
 
 - **The hard cases are queries of only the most common terms,** whether as two terms or as a phrase. MaxScore prunes little when every clause's bound is large.
-- **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Positional skipping is tracked in #1334.
-- **Fuzzy terms** cost a walk over the dictionary near the term, then the union of the matching terms' postings. On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk. Pruning inside a fuzzy clause is tracked in #1333.
-- **Positions are cheap to write:** 18% more time per document on the reference machine, much less than a laptop suggests.
+- **Phrases** read every position of their rarest word. When that word is common too, the read is large: a phrase of two common words takes hundreds of milliseconds at a million documents. Compaction doesn't change that, since it's the positions' size. Positional skipping is tracked in #1334.
+- **Fuzzy terms** cost a walk over the dictionary near the term, then the matching terms' postings. Once the top `k` are held, an expansion that can't lift a document into them stops being read (#1333). On this bench's dense vocabulary (`w0` to `w49999`), a typo has dozens of terms within 2 edits, often common ones, which is the hard case. `prefix_length(2)` narrows the walk.
+- **A fuzzy term beside a common term** has a long tail. When the common term drives, each of its documents looks the fuzzy term's expansions up. #1368 makes those lookups advance along the postings once that's cheaper, and #1363 tracks the opposite case: a fuzzy term over common expansions, beside a rare term.
+- **Positions are cheap to write:** 13% more time per document on the reference machine, much less than a laptop suggests.
 
 ## Errors
 | Error | When |

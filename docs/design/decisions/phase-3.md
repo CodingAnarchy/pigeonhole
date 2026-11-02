@@ -3916,7 +3916,11 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
 - **The AX102 numbers** (1M documents of about 40 words, flush only, the mean of two runs):
   - **The owner's write-cost row:** positions cost +18% write time (136 → 160 µs a document) and +58% stored bytes (1,044 → 1,649 a document). That's well under the Mac's 2.5×, so positions stay on by default.
   - **Searches:** two terms 2.5 ms p50, two hub terms 44 ms, a rare phrase 0.28 ms, a phrase of two hub words 403 ms (#1334, Post-1.0).
-  - They're re-taken after #1332 (#1313's fix), in the pre-1.1.0 recheck.
+  - **Re-taken after #1332 (#1349, the pre-1.1.0 recheck):** a full compaction, with #1353, without #1350, the mean of two runs.
+    - **Compaction:** a full compaction takes 4–7 s. Search latency for terms and phrases matches the flush-only numbers, so phrase-hub's ~400 ms is the design's cost (#1334).
+    - **Writes:** positions cost +13% write time (139 → 157 µs) and +58% bytes.
+    - **Fuzzy, after #1353:** 1 edit 17 ms p50 (from 375), 2 edits 21 ms (from 406), prefix 2 15 ms.
+    - **A fuzzy term beside a common term:** 26 ms p50, but a 2.9 s p99: the common term's documents look up the fuzzy term's expansions. That's #1368 (lookups that advance; #1355's bound tightening was closed as not a lever), and #1363 is the converse.
 
 **PR 4.** Fuzzy terms, as rev 5 §4.4, with `levenshtein_automata` 0.2.1 (Damerau, with an adjacent transposition as one edit).
 - **The walk:** a `df`-only scan of the `P` rows from the fixed prefix. At a key the automaton rejects partway, it seeks to the smallest byte string above the key that the automaton hasn't rejected. A term whose `df` is 0 isn't an expansion.
@@ -3931,6 +3935,13 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `SearchStats::fuzzy`, so `SearchStats` loses `Copy`.
 - **Tests:** a brute-force optimal-string-alignment scan of every term, at full depth and at small `k`.
 - **The AX102 numbers** (the 3b run, 1M documents, flush only, the mean of two runs): 1 edit 375 ms p50 (41 expansions), 2 edits 406 ms, 2 edits with `prefix_length(2)` 130 ms. A fuzzy clause walks the union of its expansions' postings, and on the bench's dense `w`+digits vocabulary those include common words. Pruning inside the clause (max-combine MaxScore) is #1333, in 1.1.0.
+- **#1333 (pruning inside a fuzzy clause):** once `k` are held, an expansion whose bound is below the threshold less every other clause's bound is dropped. It's exact, because such an expansion can't give a document that enters its maximum. Laptop, 100k documents: fuzzy-1 p50 25 → 2.7 ms.
+
+**PR 5.** Highlighting, as rev 5 §4.5.
+- **`Search::highlight(true)`** fills `Hit::text` and `Hit::matches`, recomputed by tokenising the source text again. `Match` has `range`, `clause` and `occurrence`.
+- **Sloppy matches:** the sloppy matcher reports each counted match's positions through a zero-sized recorder, so scoring is unchanged.
+- **`snippet()`** picks a word-bounded window by distinct clauses, then matches, then the earliest start.
+- **Tests:** against a brute-force matcher over the source texts.
 
 <a id="d310"></a>
 ## D310 — A change feed of committed mutations, from the WAL with feed retention (ai1249, design; owner decision, 2026-11-02, all seven calls of revision 3 approved, #1248 c6565998562; reviewed by simp724 c6565869486, c6565961724 and perf287 c6565870188, c6565945185; feed1248 builds it; wal, format, pager, engine, shm, pigeonhole; ICR 0106; FORMAT §10.2, §10.4, and layout version 7 in PR 2)
@@ -4069,3 +4080,76 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `pigeonhole/tests/feed.rs`: a tool's plain open between two app sessions keeps the token (the shard count inherited too, three shards so no default matches); an explicit new shard count expires it; `change_feed_off()` ends it.
   - The unit test `the_last_session_is_inherited_until_an_open_turns_the_feed_off`.
 - **Companion change (d), cli692:** `phdb`'s read-only commands open read-only.
+
+**How PR 4 builds it** (reader processes; shm layout 8, the coordinator's numbers):
+- **One reader, two origins.** `FeedReader` reads the stream files and shared memory in both processes. The writer mirrors each stream's floor and checkpoint into shm (`FEED_FLOOR`, `FEED_CKPT`) through `FeedMarks`' `MarkMirror`, right after each store it mirrors (per retention pass and checkpoint, never per commit). A reader process takes the writer's session and fed tables from the sidecar's last session entry (written before the writer's shared memory exists), its attachment from `reader_feed_origin`, and its view for blob values from its own attachment.
+- **No head mark** (simp724 and the coordinator, after the deterministic test). The frontier never passes a record behind a held segment header: D200 hides such a group until a sync writes the header, and the feed's holds settle on `Wal::written`. So "every stream read to its readable end" is enough for M1. `it::feed_head` holds the header for real and pins this. If D200 ever showed such a group early, that test fails and a head mark comes back with a reason.
+- **Start positions in a reader process:**
+  - **`Now`:** each stream's checkpoint, loaded before the bound.
+  - **`After(seqno)`, `Oldest` and tokens:** the floor, skipping keys at or below the bound.
+  - **The lost bound** (simp724's B1): the writer mirrors its checkpoint history's bound at the floor (`oldest_bound`) as `FEED_BOUND`, stored before the floor it belongs to and raised at checkpoints. An `After(seqno)` below a stream's bound has lost history and expires, as the writer's `start_at` does, rather than skipping recycled commits. `Oldest` starts at the largest bound.
+- **A writer restart mid-poll** (simp724's B2): the poll re-checks the attachment after reading the streams, and before expiring on a record outside the history. A restart is then always `SnapshotExpired` (resubscribe), never a permanent gap. `HookSite::ReaderFeedReads` lets a test restart the writer in that window.
+- **Blob files newer than the view** (simp724's question): a value separated at commit time names a blob file the manifest committed before the commit was logged, which a reader process's lagging view may not list yet. The reader waits for a newer view, up to a second, before it takes the file as removed.
+- **A new writer with another shard count** mid-start makes `writer_session` return `SnapshotExpired` (simp724's nit).
+- **A writer restart (M2):** a stale attachment fails the poll with `SnapshotExpired`. The public `Feed` resubscribes from its own token on a fresh attachment, so a durable feed continues and a visible one that delivered what was lost expires.
+- **Waiting:** a bounded backoff, 50 µs doubling to 5 ms. The writer does no per-commit work for reader processes.
+- **A bug the model found in this PR:** `emit` took a commit before loading the view, and a reader process's view load can fail (`Busy` while republished, or a stale attachment), so a retry skipped the commit. The view is now loaded before anything is taken. A blob-read failure after the take ends the reader for good.
+- **Public API:** `ReadTable::feed()` and `FeedBuilder::read_table`.
+- **Tests:**
+  - `it/feed_reader_process.rs`: commit order across shards, a writer restart resumed from a token, and the refusals.
+  - `it/feed_head.rs`: the D200 dependency.
+  - `feed_model`: a durable and a visible subscriber in a reader process beside the writer's, plain and with deferred I/O. Clean reopens exercise the stale-attachment resubscribe; power losses reopen the reader too.
+
+**A fix after PR 4 (#1370; simp724's D312 heads-up).** A cursor that reads a frame mid-write stops short. If the successor's header lands in the same step, `chain()` used to report the mismatch as corruption. Now the first stop short of a successor's recorded end, per `(epoch, stop)`, is "not yet" (`End`), and the next step reads again from there. The same stop on the second look is still corruption. M1 makes the deferral safe: a torn read only hits records past the frontier the poll loaded before reading. A D312 mapped store completes before its group's seqno is published, so that holds there too.
+
+<a id="d311"></a>
+## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)
+**Why.** Agents need durable memory they can recall by meaning, by keyword and by recency, scoped per agent or shared, inside the database they already use (#1251). Built on the public API with D309's text index, it needs nothing new in the engine.
+
+**Decided** (revision 2 §10, all 11 calls):
+1. **The crate:** `pigeonhole-memory`, on the public 1.x line (D295), on the public API only, with its API in ICR 0107.
+2. **The layout:**
+   - one table per store (`mem_{name}`), with exact, flat namespaces as row-key prefixes (`{ns}\0m{rid}`, `{ns}\0h{hash}`);
+   - time-ordered `rid`s that carry `created`, so recency is a prefix scan;
+   - explicit `backlinks`, a `sources` family, and `importance` as a `max` aggregate;
+   - `F32`/`F16`/`BF16` embeddings;
+   - the frozen `MemoryId` forms.
+3. **Vector recall in v1:** exact per-namespace search (`Scan::nearest_*`), not IVF.
+4. **Fusion:** RRF (k = 60), with a linear blend as the alternative.
+5. **Recall is read-only,** and works in reader processes. `mark_used` is explicit.
+6. **Dedup:** exact, after trimming and collapsing whitespace (no case folding), checked against its live target in the transaction. A hit on a superseded memory counts as new. Near duplicates are optional, with `Link` as the default.
+7. **Consolidation:** the application's `Consolidator`, called outside transactions; conflict-checked commits; a conflicting group is skipped.
+8. **Existence reads in every write (M1–M5).**
+9. **TTL as a forget policy** (`max_age`), with no core TTL on the store's families.
+10. **D309's two additions** (`id_prefix`, and `open_reader` → `ReadIndex`).
+11. **The benchmark:** LongMemEval first, then LoCoMo, with a fixed open embedding model.
+
+**Since revision 2** (owner, 2026-11-02; the ICR 0107 amendment on #1251, c6578450948 and c6578478485):
+- **The store's text index has positions off.**
+- **The embedding model is pinned:**
+  - `StoreOptions::embedding(EmbeddingModel::new(id, dim, element))` at create, recorded in `G`;
+  - `Store::open(db, name, model_id)` fails with `Mismatch` on another model (ids compare byte for byte);
+  - `open_without_embeddings` gives a handle that refuses content writes on a pinned store, and allows `delete`, `link` and `mark_used`;
+  - every embedding is checked against the dimension, and a pinned store requires one on every memory.
+
+**Tickets:** T1 #1335 (in two PRs: the store, then recall and `ReadStore`), T2 #1336, T3 #1337, T4 #1338, T5 #1339, T6 #1340, T7 #1341, T8 #1342 (only if T5 calls for it), T9 #1343.
+
+**T1, first PR (#1335).**
+- **What's in it:**
+  - `Store` (`create`, `open`, `open_without_embeddings`, `remember`, `remember_in`, `get`, `delete`, `delete_in`, `link`, `supersede`, `mark_used`, `verify`, `embedding_model`);
+  - `Memory`, `Kind`, `LinkType`, `Remembered`, `StoredMemory`, `StoreStats`, `EmbeddingModel`, `StoreOptions`, `MemoryId` and `normalize`.
+- **Dedup's cases:** the dedup row and its target's `content:text` and `superseded_by` are read in the transaction.
+  - A live, same-text, unsuperseded target merges: importance goes to the max, the source is added, and a use is counted.
+  - A gone or superseded target inserts as new and repoints the dedup row.
+  - A hash collision inserts as new and leaves the dedup row alone.
+- **Links** stay within a namespace. A missing target is `NotFound`, before anything is written.
+- **From the reviews on #1362:**
+  - **simp724:** a memory is superseded once (`superseded_by` is read in the transaction, so concurrent supersedes conflict, and another `new` is refused); deleting a superseder clears `superseded_by` and `valid_to`, so the old memory is recalled again; `verify` counts a dangling `superseded_by`.
+  - **cli692:** `LinkType`'s field is private (`custom(n ≥ 16)` and `get()`); links and sources are `Link` and `Source` structs; `mark_used` returns `Marked { marked, missing }`; a link's weight is 0 to 1.
+  - **New tests:** a merge racing a supersede conflicts, which is what the merge's in-transaction target read is for; two remembers of one new text conflict, and the retry merges.
+- **Tests:**
+  - round trips, dedup's cases, links both ways, delete removing links and the dedup row, `mark_used` skipping deleted ids;
+  - the model checks (`Mismatch`, wrong dimension, missing embedding, the model-less handle);
+  - namespaces;
+  - a write given up in the caller's transaction leaves nothing;
+  - S3's races (a merge or a link racing a delete of its target conflicts; `mark_used` after a delete), each ending in `verify`.

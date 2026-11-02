@@ -48,6 +48,7 @@
 
 mod error;
 mod fuzzy;
+mod highlight;
 mod index;
 mod layout;
 mod maxscore;
@@ -57,6 +58,7 @@ mod sloppy;
 mod tokenizer;
 
 pub use error::{Error, QueryErrorKind, Result};
+pub use highlight::{Match, Snippet, snippet};
 pub use index::{Index, IndexStats, ReadIndex, RebuildStats};
 pub use layout::{IndexOptions, Normalization, Source};
 pub use query::{Clause, Fuzziness, Query};
