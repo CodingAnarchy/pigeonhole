@@ -28,16 +28,22 @@ pub struct Match {
 pub struct Snippet {
     /// The window's byte range in the text.
     pub range: Range<usize>,
-    /// The matches wholly inside it, by position.
+    /// The matches wholly inside it, by position. Their ranges are still offsets into the
+    /// whole text, not the window, so `&text[m.range.clone()]` works; subtract
+    /// `range.start` to place them in `&text[range]`.
     pub matches: Vec<Match>,
 }
 
 /// The window of `text`, at most `max_bytes` long, that holds the most distinct clauses of
 /// `matches`, then the most matches, then starts earliest (D309 §4.5).
 ///
-/// A window starts at the text's start or at a match, and ends on a word boundary (Unicode
-/// UAX #29), so it never cuts a word or a character. Only matches wholly inside it are
-/// returned. With no matches, it's the text's start.
+/// - **A window starts at the text's start or at a match,** so it shows no context before
+///   its first match (as Lucene's simple fragmenter does).
+/// - **It ends on a word boundary** (Unicode UAX #29), so it never cuts a word or a
+///   character, and it's never longer than `max_bytes`.
+/// - **Only matches wholly inside it are returned.** A match longer than `max_bytes` never
+///   is, and a window starting at it is empty, so another window wins if one holds a match.
+/// - **With no matches,** it's the text's start.
 pub fn snippet(text: &str, matches: &[Match], max_bytes: usize) -> Snippet {
     let mut bounds: Vec<usize> = text.split_word_bound_indices().map(|(i, _)| i).collect();
     bounds.push(text.len());
@@ -218,5 +224,13 @@ mod tests {
         assert_eq!(s.range, 0..5);
         let s = snippet("café crème", &[m(6..12, 0, 0)], 6);
         assert_eq!((s.range, s.matches.len()), (6..12, 1));
+        // A match longer than the budget: its own window would be empty, so a window that
+        // holds another match wins, and with none, the text's start does.
+        let text = "supercalifragilistic and short";
+        let ms = [m(0..20, 0, 0), m(25..30, 1, 0)];
+        let s = snippet(text, &ms, 8);
+        assert_eq!((s.range.clone(), s.matches), (25..30, vec![ms[1].clone()]));
+        let s = snippet(text, &ms[..1], 8);
+        assert_eq!((s.range, s.matches.len()), (0..0, 0));
     }
 }
