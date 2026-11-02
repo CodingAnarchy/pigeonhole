@@ -213,6 +213,11 @@
 # lever found: #1246's bisect). The upper mode is View::locate's FastMap probe under
 # foldhash's per-process seed (+11 per get in those runs), which main shares; #1273 seeds it
 # deterministically for callgrind.
+#
+# New shapes for #1284 (#1280; D308's byte-budgeted scan, D193: every shape has a ceiling),
+# each the head's count (run 41381538777, 2ca0d6c6) times (1 + 0.3%): scan-budget 3332
+# (+0.1% on the base's 3328: the scan passes its row limit to the reducer) and
+# scan-budget-twin 1369 (equal to the base).
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
@@ -249,3 +254,5 @@ multi-get-dense 12568 0.5
 multi-get-sparse 17108 0.5
 knn-exact 1696 0.3
 knn-filtered 3400 0.3
+scan-budget 3342 0.3
+scan-budget-twin 1374 0.3
