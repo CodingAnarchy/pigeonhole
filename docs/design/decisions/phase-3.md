@@ -3523,6 +3523,7 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
   1. it read at least `counter_checkpoint_steps` entries (unchanged), **and**
   2. the summed lengths of the `Merge` operands it folded are at least `stored.len() / 4` (`read::CHECKPOINT_BYTES_RATIO`).
 - **The base is not an operand.** The put or checkpoint the fold starts from adds nothing to those bytes, only the operands above it do. Otherwise every fold from a large checkpoint would pass `stored / 4` and checkpoint again (perf287's review).
+- **A run counts only its last group.** When a counter column's operands span several timestamps, the operand bytes count only the last group folded (the one the fold record is set from), as `steps` already does (D291's per-group accounting). A run under-counts and keeps fewer checkpoints, which is the safe direction for the memtable bound (perf287's review of #1310).
 - **What it bounds:**
   - **Memtable bytes:** at most 4 checkpoint bytes per operand byte written, whatever the value's size, so a multi-MB hub can't flood the memtable with copies of itself.
   - **Reads:** a read decodes its checkpoint and folds under `stored / 4` operand bytes onto it (5b's linear fold), O(S), which a get of S bytes costs anyway.
