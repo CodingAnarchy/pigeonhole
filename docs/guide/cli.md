@@ -33,14 +33,17 @@
 
 `check` is the exception: it never opens the database (see [`phdb check`](#phdb-check)). The rest:
 
-A database has one writer process at a time and any number of reader processes (see [Concepts](concepts.md#multi-process-readers)). A read-only command such as `info` works either way:
+A database has one writer process at a time and any number of reader processes (see [Concepts](concepts.md#multi-process-readers)). A command that only reads (`info`, `dump`, `backup`, `shell --read-only`) works either way, and never changes the database:
 
-- **No writer running:** `phdb` opens the database as the writer for the length of the command, then closes it.
-  - If the last writer crashed, opening **replays its WAL**, exactly as your application's next open would, like `sqlite3` rolling back a hot journal. The close then checkpoints it, so the database is one file again.
+- **No writer running:** `phdb` opens the database read-only (`Options::read_only`) in the writer's place for the length of the command, then closes it.
+  - It writes nothing to the database's files. In particular it starts no change-feed session (`Options::change_feed`), so your application's stored feed tokens stay valid across it.
+  - If the last writer crashed, the open **replays its WAL into memory**, so the command sees every commit, and leaves the WAL for your application's next open to replay and checkpoint. A WAL too large to replay in memory fails with `ReadOnly`: open the database once with your application, or with `phdb shell` (without `--read-only`), to checkpoint it.
   - While `phdb` holds the writer lock, your application can't open as the writer: its open fails with `WriterLocked` until `phdb` exits.
 - **A writer is running:** `phdb` opens as a reader process. It sees everything the writer has committed and changes nothing.
 
-`phdb` opens with one unpinned shard and a 16 MiB block cache (as the writer with no row cache; as a reader process with `ReaderOptions`' default row cache), and never creates a file. A database `phdb` can't write opens read-only (`read_only_fallback`): families that name a merge operator `phdb` doesn't know, or a feature from a newer version that this one may only read. Such an open writes nothing to the file.
+The commands that write (`load`, `compact`, `shell` without `--read-only`, `mcp` without `--read-only`) open writable as the writer when no writer runs.
+
+`phdb` opens with unpinned shards and a 16 MiB block cache (as the writer with no row cache; as a reader process with `ReaderOptions`' default row cache), and never creates a file (except `load --create` and `mcp --create`). A read-only open uses one shard. A writing command leaves the shard count unset for an existing database, so the open keeps the count the application's change feed recorded (another count would reshard and end the feed's history), and uses one shard for a database it creates. A database the writing commands can't write opens read-only (`read_only_fallback`): families that name a merge operator `phdb` doesn't know, or a feature from a newer version that this one may only read. Such an open writes nothing to the file.
 
 `--reader` and `--writer` force one role, and fail rather than fall back.
 
@@ -70,7 +73,7 @@ Choose with `--format`:
 |---|---|
 | `path` | The file as given. |
 | `mode` | `writer` or `reader`: how `phdb` opened it. |
-| `read_only` | Whether the open can't write: `reader` mode, or a writer that fell back to read-only (see below). |
+| `read_only` | Whether the open can't write: `reader` mode, or a writer-process open that is read-only (as `info` opens; see [How phdb opens a database](#how-phdb-opens-a-database)). |
 | `format_version` | The file format version. A read-only open leaves an older file's version as it is. |
 | `features` | The file's feature bits, `{"compat", "ro_compat", "incompat"}`: all 0 until a feature added after 1.0 is used. |
 | `db_id` | The database's id, 32 hex digits. |
@@ -106,7 +109,7 @@ Example:
 $ phdb info app.phdb
 path            app.phdb
 mode            writer
-read_only       false
+read_only       true
 format_version  4
 features        {"compat":0,"ro_compat":0,"incompat":0}
 db_id           5f1c0e9a2b7d4c3e8a6f0b1d2c3e4f50
