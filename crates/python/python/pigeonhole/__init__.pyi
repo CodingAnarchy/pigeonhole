@@ -36,6 +36,8 @@ class Element(enum.StrEnum):
     F32 = "f32"
     I8 = "i8"
     BIT = "bit"
+    F16 = "f16"
+    BF16 = "bf16"
 
 class Metric(enum.StrEnum):
     """How a vector family compares vectors."""
@@ -53,7 +55,7 @@ class VectorSpec:
     @property
     def dim(self) -> int: ...
     @property
-    def element(self) -> Literal["f32", "i8", "bit", "unknown"]: ...
+    def element(self) -> Literal["f32", "i8", "bit", "f16", "bf16", "unknown"]: ...
     @property
     def metric(self) -> Literal["l2", "cosine", "inner_product", "hamming", "unknown"]: ...
 

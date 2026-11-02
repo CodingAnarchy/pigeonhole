@@ -52,15 +52,29 @@ pub enum Element {
     I8 = 2,
     /// Bits, packed eight to a byte, LSB first.
     Bit = 3,
+    /// IEEE binary16 (`f16`) bits, little-endian (#1263).
+    F16 = 4,
+    /// bfloat16 (`bf16`) bits, little-endian (#1263).
+    BF16 = 5,
 }
 
 impl Element {
+    /// Whether the element is a half-precision float (`f16` or `bf16`, #1263).
+    #[inline]
+    pub fn is_half(self) -> bool {
+        // One compare on the code (4 and 5 are the half elements): `score` tests it per
+        // vector.
+        self as u8 >= Element::F16 as u8
+    }
+
     /// From its byte.
     pub fn from_u8(b: u8) -> Option<Self> {
         Some(match b {
             1 => Element::F32,
             2 => Element::I8,
             3 => Element::Bit,
+            4 => Element::F16,
+            5 => Element::BF16,
             _ => return None,
         })
     }
@@ -72,6 +86,7 @@ impl Element {
             Element::F32 => 4 * dim,
             Element::I8 => dim,
             Element::Bit => dim / 8,
+            Element::F16 | Element::BF16 => 2 * dim,
         }
     }
 }
@@ -169,7 +184,7 @@ impl Params {
             match (tag, v) {
                 (TAG_ELEMENT, [b]) => {
                     element = Some(Element::from_u8(*b).ok_or(VectorError(
-                        "the element must be 1 (f32), 2 (i8) or 3 (bit)",
+                        "the element must be 1 (f32), 2 (i8), 3 (bit), 4 (f16) or 5 (bf16)",
                     ))?);
                 }
                 (TAG_ELEMENT, _) => return Err(VectorError("the element is one byte")),
@@ -223,6 +238,10 @@ pub enum Query<'a> {
     I8(&'a [i8]),
     /// Bits, packed eight to a byte, LSB first.
     Bits(&'a [u8]),
+    /// `f16` bit patterns (a write's value).
+    F16(&'a [u16]),
+    /// `bf16` bit patterns (a write's value).
+    BF16(&'a [u16]),
 }
 
 impl Query<'_> {
@@ -232,6 +251,8 @@ impl Query<'_> {
             Query::F32(_) => Element::F32,
             Query::I8(_) => Element::I8,
             Query::Bits(_) => Element::Bit,
+            Query::F16(_) => Element::F16,
+            Query::BF16(_) => Element::BF16,
         }
     }
 
@@ -241,6 +262,7 @@ impl Query<'_> {
             Query::F32(q) => q.len(),
             Query::I8(q) => q.len(),
             Query::Bits(q) => 8 * q.len(),
+            Query::F16(q) | Query::BF16(q) => q.len(),
         }
     }
 }
@@ -248,8 +270,12 @@ impl Query<'_> {
 impl Params {
     /// Checks a caller's vector against the family (D303): its element type and dimension,
     /// and its components as [`VectorRef::check_components`] does.
+    ///
+    /// An `f32` vector also fits a half-precision family (#1263): as a query it stays `f32`,
+    /// and as a write [`Params::payload`] converts it and checks the result.
     pub fn check(&self, q: Query<'_>) -> Result<(), VectorError> {
-        if q.element() != self.element || q.dim() != self.dim as usize {
+        let converts = matches!(q, Query::F32(_)) && self.element.is_half();
+        if (q.element() != self.element && !converts) || q.dim() != self.dim as usize {
             return Err(VectorError(
                 "the vector's element type or dimension is not the family's",
             ));
@@ -258,17 +284,55 @@ impl Params {
             Query::F32(q) => check_f32(q, self.metric),
             Query::I8(q) => check_bytes(q.iter().all(|x| *x == 0), self.metric),
             Query::Bits(q) => check_bytes(q.iter().all(|x| *x == 0), self.metric),
+            Query::F16(q) | Query::BF16(q) => {
+                let bytes: Vec<u8> = q.iter().flat_map(|h| h.to_le_bytes()).collect();
+                check_half(self.element, &bytes, self.metric, COSINE_NORM)
+            }
         }
     }
 
     /// [`Params::check`], then the vector's payload (`f32` LE, `i8` or bits) appended to
     /// `out`: what a put of it stores after the element and dimension.
+    ///
+    /// An `f32` vector written to a half-precision family is converted (to nearest, ties to
+    /// even; a component that overflows the element is refused), and the converted vector
+    /// is checked as stored: an `f32` vector can round to a zero vector (#1263).
     pub fn payload(&self, q: Query<'_>, out: &mut Vec<u8>) -> Result<(), VectorError> {
+        if let (Query::F32(xs), true) = (q, self.element.is_half()) {
+            if xs.len() != self.dim as usize {
+                return Err(VectorError(
+                    "the vector's element type or dimension is not the family's",
+                ));
+            }
+            let start = out.len();
+            for x in xs {
+                let h = if self.element == Element::F16 {
+                    crate::half::f32_to_f16(*x)
+                } else {
+                    crate::half::f32_to_bf16(*x)
+                }
+                .ok_or(VectorError(
+                    "a component isn't finite or overflows the family's half-precision element",
+                ))?;
+                out.extend_from_slice(&h.to_le_bytes());
+            }
+            let checked = check_half(
+                self.element,
+                &out[start..],
+                self.metric,
+                "the vector rounds to a zero vector in the family's half-precision element",
+            );
+            if checked.is_err() {
+                out.truncate(start);
+            }
+            return checked;
+        }
         self.check(q)?;
         match q {
             Query::F32(q) => out.extend(q.iter().flat_map(|x| x.to_le_bytes())),
             Query::I8(q) => out.extend(q.iter().map(|x| *x as u8)),
             Query::Bits(q) => out.extend_from_slice(q),
+            Query::F16(q) | Query::BF16(q) => out.extend(q.iter().flat_map(|h| h.to_le_bytes())),
         }
         Ok(())
     }
@@ -362,6 +426,12 @@ fn query_norm(metric: Metric, q: Query<'_>) -> QueryNorm {
 /// The one scoring function: [`Params::distance`] and [`Prepared::distance`] both call it.
 fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f64 {
     use crate::distance as k;
+    // Half-precision stored vectors (#1263) leave the hot path with one test, so the `f32`,
+    // `i8` and bit arms below compile as they did before (perf287 on #1285: the f32 row
+    // must hold its ceiling).
+    if v.element.is_half() {
+        return score_half(metric, q, norm, v);
+    }
     let p = v.payload;
     match (q, metric, norm) {
         (Query::F32(q), Metric::L2, _) => f64::from(k::l2_f32_le(q, p)),
@@ -378,6 +448,43 @@ fn score(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f6
             1.0 - dot / (nq.sqrt() * nv.sqrt())
         }
         (Query::Bits(q), Metric::Hamming, _) => f64::from(k::hamming(q, p)),
+        _ => f64::NAN,
+    }
+}
+
+/// [`score`] for an `f16` or `bf16` stored vector: an `f32` query through the widening
+/// kernels, which equal the `f32` kernels over the widened vector bit for bit. Out of line,
+/// so it costs the other elements' path nothing.
+#[cold]
+#[inline(never)]
+fn score_half(metric: Metric, q: Query<'_>, norm: QueryNorm, v: &VectorRef<'_>) -> f64 {
+    use crate::distance as k;
+    let (Query::F32(q), p) = (q, v.payload) else {
+        return f64::NAN;
+    };
+    let f16 = v.element == Element::F16;
+    match (metric, norm) {
+        (Metric::L2, _) => f64::from(if f16 {
+            k::l2_f16_le(q, p)
+        } else {
+            k::l2_bf16_le(q, p)
+        }),
+        (Metric::InnerProduct, _) => {
+            let (dot, _) = if f16 {
+                k::dot_norm_f16_le(q, p)
+            } else {
+                k::dot_norm_bf16_le(q, p)
+            };
+            -f64::from(dot)
+        }
+        (Metric::Cosine, QueryNorm::F32(nq)) => {
+            let (dot, n2) = if f16 {
+                k::dot_norm_f16_le(q, p)
+            } else {
+                k::dot_norm_bf16_le(q, p)
+            };
+            f64::from(k::cosine_from(dot, nq, n2))
+        }
         _ => f64::NAN,
     }
 }
@@ -403,6 +510,41 @@ fn check_f32(q: &[f32], metric: Metric) -> Result<(), VectorError> {
     }
     if metric == Metric::Cosine && crate::distance::norm2_f32(q) < f32::MIN_POSITIVE {
         return Err(VectorError(COSINE_NORM));
+    }
+    Ok(())
+}
+
+/// The components a half-precision vector may hold (#1263): finite (an `f16`'s largest,
+/// 65,504, bounds it; a `bf16` keeps `f32`'s 2^56 bound, having its range), and under cosine
+/// a squared norm, as the widening kernels sum it, of at least `f32::MIN_POSITIVE`.
+/// `zero_norm` is the refusal's message (a converted `f32` vector "rounds to" zero).
+fn check_half(
+    element: Element,
+    payload: &[u8],
+    metric: Metric,
+    zero_norm: &'static str,
+) -> Result<(), VectorError> {
+    let widen = if element == Element::F16 {
+        crate::half::f16_to_f32
+    } else {
+        crate::half::bf16_to_f32
+    };
+    let bad = payload
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| widen(u16::from_le_bytes(*c)))
+        .any(|x| !x.is_finite() || x.abs() > MAX_F32_COMPONENT);
+    if bad {
+        return Err(VectorError(F32_RANGE));
+    }
+    let norm = if element == Element::F16 {
+        crate::distance::norm2_f16_le(payload)
+    } else {
+        crate::distance::norm2_bf16_le(payload)
+    };
+    if metric == Metric::Cosine && norm < f32::MIN_POSITIVE {
+        return Err(VectorError(zero_norm));
     }
     Ok(())
 }
@@ -434,7 +576,13 @@ impl<'a> VectorRef<'a> {
                 "a vector's dimension must be 1 to 4096, a multiple of 8 for bit",
             ));
         }
-        if payload.len() != element.payload_len(dim) {
+        // `f32` first: the common element skips the match, once per scored vector.
+        let want = if element == Element::F32 {
+            4 * dim as usize
+        } else {
+            element.payload_len(dim)
+        };
+        if payload.len() != want {
             return Err(VectorError(
                 "a vector's payload must match its element and dimension",
             ));
@@ -480,6 +628,7 @@ impl<'a> VectorRef<'a> {
                 Ok(())
             }
             Element::I8 | Element::Bit => check_bytes(p.iter().all(|b| *b == 0), metric),
+            Element::F16 | Element::BF16 => check_half(self.element, p, metric, COSINE_NORM),
         }
     }
 
@@ -493,6 +642,9 @@ impl<'a> VectorRef<'a> {
     /// Decodes the bytes after the value tag; anything malformed is `Corrupt`. An unknown
     /// element is too, as in `kind_params`: a new element would come under a new `incompat`
     /// bit, so a reader that meets one has a damaged file.
+    // Inlined into `decode_value`, once per scored vector: #1263's larger element matches
+    // pushed it out of line, at about 7 instructions a vector (#1285's callgrind).
+    #[inline]
     pub(crate) fn decode(bytes: &'a [u8]) -> crate::Result<Self> {
         let Some((&e, rest)) = bytes.split_first() else {
             return Err(Error::Truncated { what: "vector" });
@@ -546,7 +698,7 @@ mod tests {
         assert!(Params::parse(&ok(1, 16, 1)).is_ok());
         for bad in [
             ok(0, 16, 1),
-            ok(4, 16, 1),
+            ok(6, 16, 1),
             ok(1, 16, 0),
             ok(1, 16, 5),
             ok(1, 0, 1),
@@ -704,6 +856,77 @@ mod tests {
                 .is_err(),
             "prepare checks"
         );
+        // #1263: half-precision elements.
+        for e in [Element::F16, Element::BF16] {
+            for m in [Metric::L2, Metric::InnerProduct, Metric::Cosine] {
+                let p = Params::new(e, 3, m).unwrap();
+                assert_eq!(Params::parse(&p.encode()).unwrap(), p);
+            }
+            assert!(
+                Params::new(e, 8, Metric::Hamming).is_err(),
+                "Hamming is bit-only"
+            );
+            assert_eq!(e.payload_len(4096), 8192, "half the bytes of f32");
+        }
+        // Raw bits are stored as given; an f32 write converts to nearest-even.
+        let f16c = Params::new(Element::F16, 2, Metric::Cosine).unwrap();
+        let mut out = Vec::new();
+        f16c.payload(Query::F16(&[0x3c00, 0xc000]), &mut out)
+            .unwrap();
+        assert_eq!(out, [0x00, 0x3c, 0x00, 0xc0]);
+        out.clear();
+        f16c.payload(Query::F32(&[1.0, -2.0]), &mut out).unwrap();
+        assert_eq!(
+            out,
+            [0x00, 0x3c, 0x00, 0xc0],
+            "f32 converts to the same halves"
+        );
+        out.clear();
+        assert!(
+            f16c.payload(Query::F32(&[70_000.0, 1.0]), &mut out)
+                .is_err(),
+            "overflows f16"
+        );
+        let zero = f16c
+            .payload(Query::F32(&[1e-9, -1e-9]), &mut out)
+            .unwrap_err();
+        assert!(zero.0.contains("rounds to a zero vector"), "{}", zero.0);
+        assert!(
+            out.is_empty(),
+            "nothing is left in the payload of a refused write"
+        );
+        assert!(
+            f16c.check(Query::F16(&[0x7c00, 0x3c00])).is_err(),
+            "an f16 infinity"
+        );
+        assert!(
+            f16c.check(Query::F16(&[0x0000, 0x8000])).is_err(),
+            "a cosine zero vector"
+        );
+        assert!(f16c.check(Query::I8(&[1, 2])).is_err(), "i8 into f16");
+        let bf = Params::new(Element::BF16, 1, Metric::L2).unwrap();
+        assert!(bf.check(Query::BF16(&[0x7f00])).is_err(), "bf16 above 2^56");
+        assert!(bf.check(Query::BF16(&[0x5b00])).is_ok(), "bf16 at 2^55");
+        // A stored half vector scores as the same vector widened into an f32 family.
+        let halves = [0x3555u16, 0xbc00, 0x0001, 0x7bff];
+        let widened: Vec<f32> = halves.iter().map(|h| crate::half::f16_to_f32(*h)).collect();
+        let hb: Vec<u8> = halves.iter().flat_map(|h| h.to_le_bytes()).collect();
+        let fb = le_bytes(&widened);
+        let q = [0.25f32, -1.5, 3.0, 0.125];
+        for m in [Metric::L2, Metric::InnerProduct, Metric::Cosine] {
+            let ph = Params::new(Element::F16, 4, m).unwrap();
+            let pf = Params::new(Element::F32, 4, m).unwrap();
+            let vh = VectorRef::new(Element::F16, 4, &hb).unwrap();
+            let vf = VectorRef::new(Element::F32, 4, &fb).unwrap();
+            assert_eq!(
+                ph.prepare(QueryBuf::F32(q.to_vec().into()))
+                    .unwrap()
+                    .distance(&vh)
+                    .to_bits(),
+                pf.distance(Query::F32(&q), &vf).to_bits(),
+                "{m:?}"
+            );
+        }
         // 4096 dimensions fit; 4097 do not.
         let big = vec![0u8; 4 * 4096];
         assert!(VectorRef::new(Element::F32, 4096, &big).is_ok());

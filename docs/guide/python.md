@@ -118,12 +118,13 @@ with ph.open(path, create=True) as db:
 
 ## Vectors
 A vector family stores fixed-size vectors (D303):
-- `Family.vector(dim, Element.F32 | I8 | BIT, Metric.L2 | COSINE | INNER_PRODUCT | HAMMING)`.
+- `Family.vector(dim, Element.F32 | I8 | BIT | F16 | BF16, Metric.L2 | COSINE | INNER_PRODUCT | HAMMING)`. `F16` and `BF16` (#1263) store each component in 2 bytes, under L2, inner product or cosine.
 - `put_vector` takes a buffer or a plain sequence of the family's element type.
   - For `f32`: a NumPy `float32` array or `array.array('f')` is the fast path. NumPy's default `float64` works too, narrowed to `f32`.
   - For `i8`: an `int8` buffer.
+  - For `f16` and `bf16`: what `f32` takes. Each component is rounded to nearest, ties to even, and a component that overflows the element is refused. A NumPy `float16` array works too, element by element, and its values convert back exactly.
   - Bits go in packed, as bytes. An `f32` or `i8` family refuses `bytes`, which in Python would otherwise read as one element per byte.
-- `Cell.as_vector()` returns an `array.array` (`'f'` or `'b'`), which `numpy.frombuffer` wraps without a copy, or `bytes` for bits.
+- `Cell.as_vector()` returns an `array.array` (`'f'` or `'b'`), which `numpy.frombuffer` wraps without a copy, or `bytes` for bits. An `f16` or `bf16` vector comes back widened exactly to `array.array('f')`, and `nearest` takes its query as `f32` numbers too.
 
 `nearest(family, query, k)` finds the `k` cells nearest `query` by the family's metric. It searches a prefix, a `start`/`end` range, the whole table, or the rows of `keys`, and returns `Neighbour`s (`row`, `qualifier`, `distance`, `ts`) nearest first. The search is exact: every vector in the read is scored, and `parallel=n` shares the work across threads.
 

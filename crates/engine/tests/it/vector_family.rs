@@ -48,7 +48,7 @@ fn vector_families_check_their_parameters_and_take_no_operator() {
         (raw(3, 12, 4), "multiple of 8"),
         (raw(3, 64, 1), "Hamming takes bit"),
         (raw(1, 64, 4), "Hamming takes bit"),
-        (raw(5, 64, 1), "element"),
+        (raw(6, 64, 1), "element"),
         (
             kind_params::encode(&[(1, &[1]), (2, &8u32.to_le_bytes()), (3, &[1]), (4, &[0])]),
             "no parameter tag 4",

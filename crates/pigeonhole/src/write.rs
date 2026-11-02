@@ -598,6 +598,36 @@ impl RowMutation<'_> {
         self.vector(family, qualifier, Some(ts), Query::Bits(value))
     }
 
+    /// Puts the `f16` vector `value` (IEEE binary16 bit patterns) into an `f16` vector
+    /// family (#1263) at the commit timestamp, refused as
+    /// [`put_vector_f32`](Self::put_vector_f32) is. An `f32` vector can go into the same
+    /// family through `put_vector_f32`, which rounds it to nearest-even.
+    pub fn put_vector_f16(self, family: &str, qualifier: &[u8], value: &[u16]) -> Self {
+        self.vector(family, qualifier, None, Query::F16(value))
+    }
+
+    /// [`put_vector_f16`](Self::put_vector_f16) at an explicit timestamp.
+    pub fn put_vector_f16_at(self, family: &str, qualifier: &[u8], ts: u64, value: &[u16]) -> Self {
+        self.vector(family, qualifier, Some(ts), Query::F16(value))
+    }
+
+    /// [`put_vector_f16`](Self::put_vector_f16) for a `bf16` vector family (bfloat16 bit
+    /// patterns).
+    pub fn put_vector_bf16(self, family: &str, qualifier: &[u8], value: &[u16]) -> Self {
+        self.vector(family, qualifier, None, Query::BF16(value))
+    }
+
+    /// [`put_vector_bf16`](Self::put_vector_bf16) at an explicit timestamp.
+    pub fn put_vector_bf16_at(
+        self,
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u16],
+    ) -> Self {
+        self.vector(family, qualifier, Some(ts), Query::BF16(value))
+    }
+
     /// A vector put, checked against the family's spec when it is built.
     fn vector(mut self, family: &str, qualifier: &[u8], ts: Option<u64>, q: Query<'_>) -> Self {
         let mut buf = Vec::new();
@@ -1173,6 +1203,56 @@ impl WriteBatch {
         value: &[u8],
     ) -> &mut Self {
         self.vector(table, row, family, qualifier, Some(ts), Query::Bits(value))
+    }
+
+    /// Puts a vector into an `f16` vector family (IEEE binary16 bit patterns) (#1263), as [`RowMutation::put_vector_f16`] does.
+    pub fn put_vector_f16(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::F16(value))
+    }
+
+    /// [`put_vector_f16`](Self::put_vector_f16) at an explicit timestamp.
+    pub fn put_vector_f16_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::F16(value))
+    }
+
+    /// Puts a vector into a `bf16` vector family (bfloat16 bit patterns) (#1263), as [`RowMutation::put_vector_bf16`] does.
+    pub fn put_vector_bf16(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::BF16(value))
+    }
+
+    /// [`put_vector_bf16`](Self::put_vector_bf16) at an explicit timestamp.
+    pub fn put_vector_bf16_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::BF16(value))
     }
 
     /// A vector put, checked against the family's spec when it is built.
@@ -2160,6 +2240,56 @@ impl Transaction {
         value: &[u8],
     ) -> &mut Self {
         self.vector(table, row, family, qualifier, Some(ts), Query::Bits(value))
+    }
+
+    /// Puts a vector into an `f16` vector family (IEEE binary16 bit patterns) (#1263), as [`RowMutation::put_vector_f16`] does.
+    pub fn put_vector_f16(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::F16(value))
+    }
+
+    /// [`put_vector_f16`](Self::put_vector_f16) at an explicit timestamp.
+    pub fn put_vector_f16_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::F16(value))
+    }
+
+    /// Puts a vector into a `bf16` vector family (bfloat16 bit patterns) (#1263), as [`RowMutation::put_vector_bf16`] does.
+    pub fn put_vector_bf16(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, None, Query::BF16(value))
+    }
+
+    /// [`put_vector_bf16`](Self::put_vector_bf16) at an explicit timestamp.
+    pub fn put_vector_bf16_at(
+        &mut self,
+        table: &Table,
+        row: &[u8],
+        family: &str,
+        qualifier: &[u8],
+        ts: u64,
+        value: &[u16],
+    ) -> &mut Self {
+        self.vector(table, row, family, qualifier, Some(ts), Query::BF16(value))
     }
 
     /// A vector put, checked against the family's spec when it is built.

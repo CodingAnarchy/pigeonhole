@@ -1119,6 +1119,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "foldhash",
+ "half",
  "lz4_flex",
  "proptest",
  "twox-hash",
