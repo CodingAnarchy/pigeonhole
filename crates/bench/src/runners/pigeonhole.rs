@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use pigeonhole::{
-    Compaction, Condition, Durability, ErrorCode, Family, Options, Pigeonhole, RetryPolicy,
-    RowMutation, Table, Transaction, ValueFilter,
+    Compaction, Condition, Durability, ErrorCode, Family, FeedRetention, Options, Pigeonhole,
+    RetryPolicy, RowMutation, Table, Transaction, ValueFilter,
 };
 
 use super::{
@@ -42,6 +42,9 @@ pub(crate) struct Settings {
     /// Point gets fill the row cache (`Options::row_cache_get_fill`, D290); off, the library
     /// default (#1059).
     pub(crate) get_fill: bool,
+    /// The change feed on (`Options::change_feed`, D310), with the least retention: its
+    /// periodic sync runs during the run. Off, the library default.
+    pub(crate) feed: bool,
     /// Row cache bytes (`Options::row_cache`); `None` keeps the library default (D216), 0
     /// turns it off.
     pub(crate) row_cache: Option<u64>,
@@ -415,6 +418,22 @@ impl PigeonholeRunner {
     /// ```
     pub fn get_fill(mut self, yes: bool) -> Self {
         self.settings.get_fill = yes;
+        self
+    }
+
+    /// The change feed on (`Options::change_feed`, D310) with the least retention, so a run
+    /// measures the feed's periodic WAL sync too (D312's populate window); off without a
+    /// call, the library default.
+    ///
+    /// ```
+    /// use pigeonhole_bench::{PigeonholeRunner, Runner};
+    ///
+    /// let r = PigeonholeRunner::default().feed(true);
+    /// assert!(r.describe().contains("feed=on"));
+    /// assert!(!PigeonholeRunner::default().describe().contains("feed"));
+    /// ```
+    pub fn feed(mut self, yes: bool) -> Self {
+        self.settings.feed = yes;
         self
     }
 
@@ -817,6 +836,10 @@ pub(crate) fn options(s: &Settings) -> Options {
     if s.no_nowait_reads {
         options = options.nowait_reads(false);
     }
+    if s.feed {
+        // The least retention: rounded up to two segments per shard.
+        options = options.change_feed(FeedRetention::bytes(0));
+    }
     if s.get_fill {
         options = options.row_cache_get_fill(true);
     }
@@ -1168,6 +1191,7 @@ impl Runner for PigeonholeRunner {
         );
         flag(s.no_nowait_reads, " nowait=off");
         flag(s.get_fill, " get-fill=on");
+        flag(s.feed, " feed=on");
         match (s.memory.model, s.row_cache) {
             // Under the total model the cache field above names the row cache.
             (CacheModel::Total, _) | (_, None) => {}
