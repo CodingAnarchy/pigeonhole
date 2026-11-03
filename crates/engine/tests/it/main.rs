@@ -103,5 +103,6 @@ mod sync_faults;
 mod traverse;
 mod vector_family;
 mod vote_on_append;
+mod wal_hold_wake;
 mod wal_pin;
 mod wal_spares_steps;
