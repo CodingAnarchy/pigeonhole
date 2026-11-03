@@ -30,6 +30,7 @@ mod ivf;
 mod layout;
 mod recall;
 mod store;
+mod watch;
 
 pub use consolidate::{
     Consolidate, ConsolidatePass, ConsolidatePolicy, Consolidator, SourcePolicy,
@@ -47,6 +48,7 @@ pub use store::{
     EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
     Source, Store, StoreOptions, StoreStats, StoredMemory,
 };
+pub use watch::{MemoryCommit, MemoryEvent, Watch, WatchBuilder, WatchToken};
 
 #[cfg(doctest)]
 mod guide {

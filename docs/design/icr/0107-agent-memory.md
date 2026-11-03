@@ -261,11 +261,29 @@ The design is on #1342 (c6605838140), with cli692's API review, perf287's (R1–
 - **`verify`:** `StoreStats::ivf_mismatched` is the difference between the index's vector count and the memories with an embedding (writer only). The index's own row checks fail `verify` as `Error::Vector`. `StoreStats::ivf_counter_drift` (namespaces whose counter is off) is advisory and left out of `is_consistent` (simp724).
 - **`Error::Vector(pigeonhole_vector::Error)`**, with the index's database errors mapped to `Error::Db`.
 
+## T9, part 1: memory events from the change feed (#1343)
+The design is on #1343 (c6609788373), with simp724's and cli692's reviews. The feed-driven consolidation loop is part 2.
+- **`Store::watch(&[&str]) -> WatchBuilder`** and **`ReadStore::watch`**, over `Table::feed`/`ReadTable::feed`.
+  - An empty list means every namespace. One namespace becomes the feed's row prefix `{ns}\0m`, and several are filtered in the crate.
+  - A bad namespace is `InvalidArgument` at `open`, as is a database whose change feed is off or doesn't follow `mem_{name}`.
+- **`WatchBuilder`:** `from_snapshot(&Snapshot)`, `resume(&WatchToken)`, `visible()` and `open() -> Result<Watch>`.
+- **`Watch`:** `next(Duration) -> Result<Option<MemoryCommit>>`, `try_next()`, `token() -> WatchToken` and `oldest_retained()`. `FeedExpired` passes through, as `Error::Db`.
+- **`WatchToken`:** the feed's token, with `as_bytes()`/`from_bytes()`. Resuming with another namespace list continues the same feed position (cli692's A4).
+- **`MemoryCommit`** (`#[non_exhaustive]`) holds `seqno`, `timestamp_us` and `events` (at least one). Commits with no memory events are passed over.
+- **`MemoryEvent`** (`#[non_exhaustive]`), with `id()`. There's one per memory per commit, the strongest winning (cli692's A2):
+  - `Deleted` (a `DeleteFamily` of `content`);
+  - `Remembered` (a `content:text` put), or `Summarized` (with `meta:summary`);
+  - `Superseded { id, by }` (a `meta:superseded_by` put; `by`, an existing memory, sees `Updated` for the link);
+  - `Updated` (anything else on the row).
+  - Dedup rows, counter rows and `G` are never events.
+- **`meta:summary` (new, `1`):** set on a memory a consolidator returned, when it's new rather than merged. That's how a watch, and part 2's loop, tells a pass's own writes from new memories (simp724's R3 on #1343). It's additive: older builds ignore it. `StoredMemory::summary` reads it (cli692 on #1430).
+- **Async:** `next_async` in the writer, once #1408 (D310 PR 5a) is merged. A reader calls the sync `next` on a thread of its own.
+
 ## The layout (frozen)
 - **Memory rows:** `{ns}\0m{rid}`, with these families:
   - `content:text`, the text index's source;
   - `emb:v`, the embedding;
-  - `meta`: `kind` (a 1-byte code), `session`, `pinned`, `consolidated` (T3: `1`, once a consolidation took it in), `superseded_by` (the newer memory's row key) and `valid_to` (µs);
+  - `meta`: `kind` (a 1-byte code), `session`, `pinned`, `consolidated` (T3: `1`, once a consolidation took it in), `summary` (T9: `1`, a memory a consolidator returned), `superseded_by` (the newer memory's row key) and `valid_to` (µs);
   - `sources:{id}`, the first-seen µs;
   - `stats:uses`, a counter;
   - `peak:importance` (parts per million) and `peak:last_used` (µs), both `max` aggregates;
