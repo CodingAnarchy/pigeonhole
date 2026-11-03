@@ -79,6 +79,14 @@ ICR 0102's PR 2 and PR 3 (Python's `nearest`) and D308's byte budgets, in Ruby's
   - `keys` and `seeds` take an Array or any other `Enumerable` (a `Set`), where Python takes any sequence.
   - The positions and `Pages` are native classes: they hold engine values.
 
+### PR 2b: the change feed
+Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
+- **Opening:** `Pigeonhole.open` adds `change_feed:` (the history's size in bytes), `change_feed_off:`, `feed_age:` (seconds) and `feed_tables:`, with Python's rules: an open that names neither inherits the last open's feed, `feed_age:` needs `change_feed:`, and `change_feed_off:` with `change_feed:` is an `ArgumentError`.
+- **`Table#feed(tables:, prefix:, visible:, from_snapshot:, from_oldest:, resume:)`** returns a `Feed`; with a block, it yields the feed and closes it afterwards. At most one of the three starts; a reader process's table feeds from the writer's history.
+- **`Feed`:** `next(timeout:)`, `try_next`, `each(timeout:)` (`Enumerable`), `token` (a binary String), `oldest_retained`, `close` and `closed?`. A closed feed raises `Closed`.
+- **`Commit`** (`seqno`, `timestamp`, `changes`, `size`) and **`Change`** (`table`, `family`, `kind`, `row`, `qualifier`, `timestamp`, `value`) are frozen `Data`. `kind` is a Symbol, and `value` is typed as `Cell#typed` types it.
+- **Interrupts:** a wait releases the GVL in 100 ms slices and calls `thread_check_ints` between them, as Python's checks for signals, so `Thread#raise`, `Timeout` and Ctrl-C end a blocked `next` within a slice. One engine call still isn't interruptible (O3); a slice bounds how long one runs.
+
 ## The rules
 - **The GVL (O3, G1).** Every engine call runs through `gvl::without_gvl`, the crate's only hand-written `unsafe`:
   - The bounds `F: FnOnce() -> R + Send` and `R: Send` keep every Ruby value (all `!Send` in magnus) out of code that runs without the GVL.
@@ -100,7 +108,6 @@ ICR 0102's PR 2 and PR 3 (Python's `nearest`) and D308's byte budgets, in Ruby's
 - **Publishing:** nothing goes to RubyGems without the owner's go.
 
 ## Later PRs
-- **PR 2b:** the change feed (`Table#feed`, `Feed`, `Commit`, `Change`) and the open options it needs, split from PR 2 for review size.
 - **PR 3:** `pigeonhole-memory`, `pigeonhole-text` and `pigeonhole-vector`.
 
 ## Callers changed

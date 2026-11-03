@@ -32,10 +32,13 @@ module Pigeonhole
 
   def self.open: (path path, ?create: bool, ?shards: Integer?, ?durability: durability?,
                   ?block_cache: Integer?, ?row_cache: Integer?, ?memtable_budget: Integer?,
-                  ?shm_dir: path?, ?read_only_fallback: bool?) -> Database
+                  ?shm_dir: path?, ?read_only_fallback: bool?, ?change_feed: Integer?,
+                  ?change_feed_off: bool, ?feed_age: Numeric?, ?feed_tables: Array[name]?) -> Database
                | [T] (path path, ?create: bool, ?shards: Integer?, ?durability: durability?,
                       ?block_cache: Integer?, ?row_cache: Integer?, ?memtable_budget: Integer?,
-                      ?shm_dir: path?, ?read_only_fallback: bool?) { (Database) -> T } -> T
+                      ?shm_dir: path?, ?read_only_fallback: bool?, ?change_feed: Integer?,
+                      ?change_feed_off: bool, ?feed_age: Numeric?,
+                      ?feed_tables: Array[name]?) { (Database) -> T } -> T
 
   def self.open_reader: (path path, ?shm_dir: path?, ?block_cache: Integer?, ?row_cache: Integer?) -> Reader
                       | [T] (path path, ?shm_dir: path?, ?block_cache: Integer?, ?row_cache: Integer?) { (Reader) -> T } -> T
@@ -218,6 +221,10 @@ module Pigeonhole
     def nearest_within: (name family, vector_in query, Integer k, bytes: Integer, ?prefix: String?,
                          ?start: String?, ?end: String?, ?keys: keys?, ?qualifier_prefix: String?,
                          ?snapshot: Snapshot?, ?parallel: Integer?) -> NearestPage
+    def feed: (?tables: Array[Table]?, ?prefix: String?, ?visible: bool, ?from_snapshot: Snapshot?,
+               ?from_oldest: bool, ?resume: String?) -> Feed
+            | [T] (?tables: Array[Table]?, ?prefix: String?, ?visible: bool, ?from_snapshot: Snapshot?,
+                   ?from_oldest: bool, ?resume: String?) { (Feed) -> T } -> T
     def inspect: () -> String
   end
 
@@ -372,6 +379,64 @@ module Pigeonhole
     def ==: (untyped other) -> bool
     def eql?: (untyped other) -> bool
     def hash: () -> Integer
+  end
+
+  # A change feed subscription. A cursor, like Pages: every Enumerable method consumes the
+  # commits it reads.
+  class Feed
+    include Enumerable[Commit]
+
+    def next: (?timeout: Numeric?) -> Commit?
+    def try_next: () -> Commit?
+    def each: (?timeout: Numeric?) { (Commit) -> void } -> self
+            | (?timeout: Numeric?) -> Enumerator[Commit, self]
+    def token: () -> String
+    def oldest_retained: () -> Integer?
+    def close: () -> nil
+    def closed?: () -> bool
+  end
+
+  # One whole commit from a change feed.
+  class Commit < Data
+    attr_reader seqno: Integer
+    attr_reader timestamp: Integer
+    attr_reader changes: Array[Change]
+
+    def self.new: (Integer seqno, Integer timestamp, Array[Change] changes) -> instance
+                | (seqno: Integer, timestamp: Integer, changes: Array[Change]) -> instance
+    def self.[]: (Integer seqno, Integer timestamp, Array[Change] changes) -> instance
+               | (seqno: Integer, timestamp: Integer, changes: Array[Change]) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (seqno: Integer, timestamp: Integer, changes: Array[Change]) -> void
+    def size: () -> Integer
+  end
+
+  # One mutation of a commit.
+  class Change < Data
+    type kind = :put | :merge | :delete_cell | :delete_column | :delete_family | :unknown
+    type typed = String | Integer | Float | Array[Float] | Array[Integer] | nil
+
+    attr_reader table: String
+    attr_reader family: String
+    attr_reader kind: kind
+    attr_reader row: String
+    attr_reader qualifier: String
+    attr_reader timestamp: Integer
+    attr_reader value: typed
+
+    def self.new: (String table, String family, kind kind, String row, String qualifier, Integer timestamp,
+                   typed value) -> instance
+                | (table: String, family: String, kind: kind, row: String, qualifier: String, timestamp: Integer,
+                   value: typed) -> instance
+    def self.[]: (String table, String family, kind kind, String row, String qualifier, Integer timestamp,
+                  typed value) -> instance
+               | (table: String, family: String, kind: kind, row: String, qualifier: String, timestamp: Integer,
+                  value: typed) -> instance
+    def self.members: () -> Array[Symbol]
+    def self.inspect: () -> String
+    def initialize: (table: String, family: String, kind: kind, row: String, qualifier: String,
+                     timestamp: Integer, value: typed) -> void
   end
 
   # A wide row's pages, each read when it is asked for. A cursor: every Enumerable method

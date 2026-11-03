@@ -80,8 +80,9 @@ fn write<T>(l: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
 // ---- Opening ------------------------------------------------------------------------------
 
 /// `Pigeonhole.native_open(path, create, shards, durability, block_cache, row_cache,
-/// memtable_budget, shm_dir, read_only_fallback)`: opens (with `create`, creates) the
-/// database at `path` as the writer process.
+/// memtable_budget, shm_dir, read_only_fallback, change_feed, change_feed_off, feed_age,
+/// feed_tables)`: opens (with `create`, creates) the database at `path` as the writer
+/// process.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn open(
     ruby: &Ruby,
@@ -94,6 +95,10 @@ pub(crate) fn open(
     memtable_budget: Option<u64>,
     shm_dir: Option<PathBuf>,
     read_only_fallback: Option<bool>,
+    change_feed: Option<u64>,
+    change_feed_off: bool,
+    feed_age: Option<Secs>,
+    feed_tables: Option<magnus::RArray>,
 ) -> Result<Database, Error> {
     let mut o = pigeonhole::Options::default().create_if_missing(create);
     if let Some(n) = shards {
@@ -117,6 +122,7 @@ pub(crate) fn open(
     if let Some(b) = read_only_fallback {
         o = o.read_only_fallback(b);
     }
+    let o = crate::feed::options(ruby, o, change_feed, change_feed_off, feed_age, feed_tables)?;
     let db = engine(ruby, move || pigeonhole::Pigeonhole::open(path, o))?;
     Ok(Database(ForkSafe::new(RwLock::new(Some(db)))))
 }
