@@ -2110,12 +2110,17 @@ impl ConsolidateLoop {
                 Some(state)
             }
         };
-        if closed.is_some() {
-            without_gvl(ruby, move || drop(closed))?;
-        }
+        // The recorded jump wins over an interrupt the drop's `without_gvl` might raise
+        // (ai1249's nit on #1452: "the interrupt takes effect").
+        let dropped = if closed.is_some() {
+            without_gvl(ruby, move || drop(closed))
+        } else {
+            Ok(())
+        };
         if let Some(e) = d.jump {
             return Err(e);
         }
+        dropped?;
         let step = step.or_mem(ruby)?;
         let passes = ruby.ary_new_capa(step.passes.len());
         for (ns, p) in step.passes {

@@ -319,8 +319,9 @@ module Pigeonhole
       # retried after `min_age`. `throw`, another exception (`Interrupt`), or an interrupt
       # (`Timeout`, `Thread#raise`, Ctrl-C) stops the step: its wait for new memories ends
       # within about 50 ms, the groups it still had are refused (their namespaces stay due,
-      # as `stopped` lists them), it saves, and then the interrupt takes effect. A block call
-      # already running finishes first. (`break` in the block raises `LocalJumpError`, a
+      # as `stopped` lists them), it saves, and then the interrupt takes effect. The group
+      # whose block the interrupt lands in is refused as well; a commit already under way
+      # finishes first. (`break` in the block raises `LocalJumpError`, a
       # `StandardError`: the block outlives the `consolidate_loop` call that took it.)
       def run_once(timeout = 1.0)
         events, passes, failed, stopped, interrupted, next_due, token = native_run_once(timeout, @consolidator)
