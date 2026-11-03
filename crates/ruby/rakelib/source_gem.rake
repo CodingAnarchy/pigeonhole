@@ -28,6 +28,8 @@ module SourceGem
   # Dev-only directories, left out of each vendored crate (`fuzz/` is a cargo-fuzz package of
   # its own).
   DEV_DIRS = %w[tests benches examples fuzz].freeze
+  # Dev-only files at a crate's root (perf2's nit 3 on #1414).
+  DEV_FILES = %w[public-api.txt].freeze
   # Package fields a vendored crate must state itself, so cargo enforces them.
   REQUIRED = %w[name version edition rust-version license].freeze
 
@@ -222,7 +224,7 @@ module SourceGem
     files = run("git", "ls-files", "-z", "crates/#{dir}", chdir: ROOT).split("\0")
     files.each do |f|
       rel = f.delete_prefix("crates/#{dir}/")
-      next if DEV_DIRS.include?(rel.split("/").first)
+      next if DEV_DIRS.include?(rel.split("/").first) || DEV_FILES.include?(rel)
 
       dest = File.join(to, rel)
       FileUtils.mkdir_p(File.dirname(dest))
@@ -280,6 +282,11 @@ namespace :gem do
   desc "Build the source gem in pkg/source/, with the engine's path crates vendored (#697)"
   task :source do
     SourceGem.stage
-    Dir.chdir(SourceGem::STAGE) { sh "gem", "build", "pigeonhole.gemspec" }
+    # Outside Bundler's environment: under `bundle exec`, the subprocess would load the
+    # checkout's gemspec (the Gemfile's `gemspec`) and then the staged one, defining
+    # Pigeonhole::VERSION twice (perf2's nit 1 on #1414).
+    Bundler.with_unbundled_env do
+      Dir.chdir(SourceGem::STAGE) { sh "gem", "build", "pigeonhole.gemspec" }
+    end
   end
 end
