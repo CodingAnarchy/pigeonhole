@@ -21,6 +21,11 @@ module Pigeonhole
       end
     end
 
+    # Another consolidation loop of the same name took over the store (`Conflict`): stop this
+    # one. Don't retry it or make a new loop of the name in its place: two supervisors doing
+    # that would take the name back and forth for ever.
+    class LoopTakenOver < Conflict; end
+
     # Link types: the three the crate defines, and the first an application may use (16 to
     # 255).
     module LinkType
@@ -53,7 +58,10 @@ module Pigeonhole
     # A stored memory, as `get` reads it.
     StoredMemory = Data.define(:id, :text, :kind, :importance, :uses, :last_used_us, :session,
                                :pinned, :consolidated, :superseded_by, :sources, :links,
-                               :backlinks, :embedding) do
+                               :backlinks, :embedding, :summary) do
+      # Whether a consolidation wrote it as a summary of its group (T9).
+      def summary? = summary
+
       # Whether it's pinned (a forget pass never deletes it).
       def pinned? = pinned
 
@@ -97,6 +105,23 @@ module Pigeonhole
 
     # A consolidation pass's counts, and where to resume (`consolidate(after:)`).
     ConsolidatePass = Data.define(:groups, :committed, :skipped, :created, :merged, :sources, :resume)
+
+    # One memory event of a commit (T9): `kind` is `:remembered`, `:summarized` (a summary a
+    # consolidation wrote), `:superseded` (`by` is the newer memory), `:deleted`, `:updated`
+    # (anything else on the memory: a merge, a use, a link), or `:unknown` for a kind a later
+    # engine adds. One per memory per commit, the strongest winning.
+    MemoryEvent = Data.define(:kind, :id, :by)
+
+    # One commit's memory events, in commit order (`Watch#next`).
+    MemoryCommit = Data.define(:seqno, :timestamp_us, :events) do
+      def size = events.size
+    end
+
+    # One step of a `ConsolidateLoop`: the events it read, its passes (`[namespace,
+    # ConsolidatePass]`), the namespaces whose pass failed (`[namespace, exception]`: a
+    # `StandardError` from the block is the block's own), when the next pass falls due (µs),
+    # and the loop's position as bytes.
+    LoopStep = Data.define(:events, :passes, :failed, :next_due, :token)
 
     # Recall's signal weights: 1 each by default, but `recency` 0.25 and `graph` and
     # `consolidated` 0.5. A weight of 0 leaves the signal out.
@@ -190,12 +215,18 @@ module Pigeonhole
 
       def stored(a)
         id, text, kind, importance, uses, last_used, session, pinned, consolidated, superseded,
-          sources, links, backlinks, embedding = a
+          sources, links, backlinks, embedding, summary = a
         StoredMemory.new(id, text, kind, importance, uses, last_used, session, pinned, consolidated,
                          superseded, sources.map { |s| Source.new(*s) }.freeze,
                          links.map { |l| Link.new(*l) }.freeze,
-                         backlinks.map { |l| Link.new(*l) }.freeze, embedding)
+                         backlinks.map { |l| Link.new(*l) }.freeze, embedding, summary)
       end
+
+      def commit((seqno, ts, events))
+        MemoryCommit.new(seqno, ts, events.map { |e| MemoryEvent.new(*e) }.freeze)
+      end
+
+      def group(memories) = memories.map { |m| stored(m) }.freeze
 
       def signal(s) = s && Signal.new(*s)
 
@@ -215,6 +246,83 @@ module Pigeonhole
       end
     end
     private_constant :Build
+
+    # The watch method `Store` and `ReadStore` share.
+    module Watches
+      # A `Watch` of the store's memory events in `namespaces` (every namespace by default),
+      # through the database's change feed, which must be on and follow the store's table
+      # (`mem_NAME`). It starts now, or after the commits `from_snapshot:` sees, or after a
+      # stored `resume:` token (`Watch#token`). `visible: true` delivers a commit as soon as
+      # reads see it, rather than once it's durable. With a block, yields the watch and
+      # closes it afterwards.
+      def watch(namespaces = [], from_snapshot: nil, resume: nil, visible: false)
+        w = native_watch([Array(namespaces), from_snapshot, resume, visible])
+        return w unless block_given?
+
+        begin
+          yield w
+        ensure
+          w.close
+        end
+      end
+    end
+
+    # A store's memory events (T9). Like `Pigeonhole::Feed` it's a cursor: every Enumerable
+    # method consumes the commits it reads, and a live watch has no end (`to_a` waits for
+    # ever; `each(timeout: 1).to_a` drains what's there). Waits release the GVL in short
+    # slices, so `Thread#raise`, `Timeout` and Ctrl-C reach a consumer blocked in `next`.
+    class Watch
+      include Enumerable
+
+      # The next `MemoryCommit`, waiting up to `timeout` seconds; nil if none came in time.
+      # `timeout: nil` waits until a commit comes or the thread is interrupted (perf2's N2 on
+      # #1441). `FeedExpired` once the history it needs is gone.
+      def next(timeout: nil)
+        c = native_next(timeout)
+        c && Build.commit(c)
+      end
+
+      # The next `MemoryCommit` if one is ready, else nil.
+      def try_next
+        c = native_try_next
+        c && Build.commit(c)
+      end
+
+      # Yields each commit as it comes; with `timeout:`, stops once one doesn't come in time.
+      def each(timeout: nil)
+        return enum_for(:each, timeout:) unless block_given?
+
+        while (c = self.next(timeout:))
+          yield c
+        end
+        self
+      end
+    end
+
+    # Feed-driven consolidation (T9): `Store#consolidate_loop`'s steps read the store's new
+    # memories and run a pass for each namespace once its memories are `min_age` old, with
+    # the loop's block as the consolidator. Its position is saved in the store under the
+    # loop's name, so a restart resumes it. One loop per name: a newer one takes over, and
+    # this one's next step raises `LoopTakenOver`.
+    class ConsolidateLoop
+      # One step: reads new memories for up to `timeout` seconds (less if a pass falls due),
+      # runs the passes that are due, and saves the position. `timeout` bounds the wait, not
+      # the passes, which run the block. An interrupt (`Timeout`, `Thread#raise`, Ctrl-C)
+      # takes effect once the step's wait for new memories ends, so keep `timeout` short
+      # (the default, 1 s) in a loop that must stop promptly: the step can't be cut into
+      # slices, since each step saves the loop's position (a commit). A `StandardError` from the block fails that
+      # namespace's pass (it's in `failed`, retried after `min_age`). `throw`, another
+      # exception (`Interrupt`) or an interrupt stops the step and takes effect; the groups
+      # the step still had are refused, and the loop treats their namespaces as failed too,
+      # so it retries them after `min_age` (the crate can't tell a refusal from a failure). (`break` in
+      # the block raises `LocalJumpError`, a `StandardError`: the block outlives the
+      # `consolidate_loop` call that took it.)
+      def run_once(timeout = 1.0)
+        events, passes, failed, next_due, token = native_run_once(timeout, @consolidator)
+        LoopStep.new(events, passes.map { |ns, p| [ns, ConsolidatePass.new(*p)].freeze }.freeze,
+                     failed.map { |ns, e| [ns, e].freeze }.freeze, next_due, token)
+      end
+    end
 
     # The recall methods `Store` and `ReadStore` share.
     module Recalls
@@ -257,6 +365,7 @@ module Pigeonhole
     # the block forms) when done; `Database#close` closes the stores opened on it first.
     class Store
       include Recalls
+      include Watches
 
       class << self
         # Creates the store `name` (tables `mem_NAME` and `mem_NAME_text`) and opens it.
@@ -354,7 +463,7 @@ module Pigeonhole
 
         # A Proc, not a block (see native_consolidate). `break`, `throw` and `return` in the
         # caller's block still leave this method, through the native frames.
-        consolidator = proc { |group| yield group.map { |m| Build.stored(m) }.freeze }
+        consolidator = proc { |group| yield Build.group(group) }
         pass, failure = native_consolidate(ns, policy, after, now_us, consolidator)
         pass = ConsolidatePass.new(*pass)
         return pass unless failure
@@ -365,10 +474,27 @@ module Pigeonhole
       end
     end
 
+    class Store
+      # A `ConsolidateLoop` named `name` (non-empty, without `:`), whose block is the
+      # consolidator, as `consolidate`'s is. `policy:` and `namespaces:` (all by default) are
+      # as `consolidate`'s; `clock_offset:` (seconds) shifts the clock `min_age` is measured
+      # on, for tests (a Ruby clock can't run inside a step). Needs the change feed, as
+      # `watch` does.
+      def consolidate_loop(name, policy: nil, namespaces: nil, clock_offset: nil, &block)
+        raise ArgumentError, "consolidate_loop needs a block: the consolidator" unless block
+
+        lp = native_consolidate_loop(name, policy, namespaces, clock_offset && (clock_offset * 1_000_000).to_i)
+        consolidator = proc { |group| block.call(Build.group(group)) }
+        lp.instance_variable_set(:@consolidator, consolidator)
+        lp
+      end
+    end
+
     # A memory store in a reader process: `recall`, `get` and `verify`, at the reader's
     # snapshots.
     class ReadStore
       include Recalls
+      include Watches
     end
   end
 end
