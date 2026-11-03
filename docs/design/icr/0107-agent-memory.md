@@ -61,7 +61,7 @@
   - **What a hit carries:** `.with_signals(bool)` and `.with_embeddings(bool)`.
   - **Running it:** `run() -> Result<Vec<RecallHit>>` and `run_with_stats() -> Result<(Vec<RecallHit>, RecallStats)>`.
 - **`Fusion`** (`#[non_exhaustive]`, default `Rrf`): `Rrf` or `Linear`.
-- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1): `vector`, `keyword`, `recency`, `importance`, `uses`. Build it from `default()` and set its fields. T4 adds `graph`.
+- **`Weights`** (`#[non_exhaustive]`, `Default` with every weight 1): `vector`, `keyword`, `recency`, `importance`, `uses`. Build it from `default()` and set its fields. T4 adds `graph` (default 0.5).
 - **`RecallHit`** (`#[non_exhaustive]`): `id`, `text`, `kind`, `importance`, `created_us`, `superseded_by: Option<MemoryId>` (set only under `include_superseded`; cli692's S1 on #1374), `score`, `signals: Option<Signals>` and `embedding: Option<Vec<f32>>`.
 - **The signal types** are `#[non_exhaustive]`:
   - `Signals` has `vector`, `keyword`, `recency`, `importance` and `uses`, each an `Option<Signal>`;
@@ -83,7 +83,7 @@
 - **Ranks:** competition ranking, `1 + the number of strictly greater values`, so equal values share a rank. With a tie-break by id instead, every importance at its default would have handed the newest memory an edge.
 - **RRF:** `Σ w / (60 + rank)`. Linear is `Σ w · min-max-normalised value`.
 - **Order:** score descending, then id.
-- **A hit's size:** its text, its id's byte form, and 16, plus 60 with signals and `4 · dim` with the embedding. Hits are whole, and at least one is returned, as with the engine's budgets (D308): the first even if it alone is larger. `truncated` is set whenever the budget cut the list, that case included (simp724's N2 on #1374).
+- **A hit's size:** its text, its id's byte form, and 16, plus 72 with signals (six of them since T4, 60 before) and `4 · dim` with the embedding. Hits are whole, and at least one is returned, as with the engine's budgets (D308): the first even if it alone is larger. `truncated` is set whenever the budget cut the list, that case included (simp724's N2 on #1374).
 - **Names settled with cli692 on #1374:** `now_us(us)` (not `at`), and `uses` in `Signals` and `Weights` (not `use_`).
 
 ## T2: forgetting (#1336)
@@ -177,6 +177,22 @@ The shapes were settled on #1337: cli692 on the API (c6589818220), and simp724 o
     - The similarity must be above 0 and at most 1.
   - **`remember_in` doesn't check:** the check reads outside a transaction. `Store::near_duplicate(ns, &Memory) -> Result<Option<(MemoryId, f32)>>` runs it for a caller first, and is `InvalidArgument` without a setting.
   - **The race (S2):** two concurrent near duplicates can both insert, and consolidation folds them.
+
+## T4: graph expansion in recall (#1338)
+- **`Recall::expand(Expand)`:** none by default.
+  - `Expand` is `#[non_exhaustive]`, `Copy` and plain data: `Expand::hops(n).max(m)`, with `pub hops: u32` and `pub max: usize` (default 20). A value rather than `expand(hops, max)`, so the two integers can't be swapped and seeds, directions or link types can come later (cli692 on #1338).
+  - `Expand::MAX_HOPS` is 4, an associated const (cli692). Hops outside 1 to 4 are `InvalidArgument` from the run. `max(0)` gives no memory a graph signal, as `k(0)` returns no hits.
+- **`Weights::graph`** (default 0.5) and **`Signals::graph`**. Neither has an effect, nor a value, without `expand`.
+- **`RecallStats`** gains `expanded` (the memories given a graph signal) and `expansion_truncated` (cli692's name).
+
+**The rules as built** (the calls on #1338, with simp724's O1 and O2):
+- **Seeds:** the top 10 of the fused list before the expansion. Seed `i` (1-based) has the value `1 / i`.
+- **A hop:** each memory of the previous hop has a one-hop `Traverse` over `links` and then one over `backlinks`, at the recall's snapshot. Traverse reads one family, and keeps destinations in key order, so one batched call would favour the newest seeds when cut. The weights come from the same memory's cells over the range the traversal returned. `write_link` puts the same `[type, weight]` in both directions.
+- **The value:** a memory first reached at hop `h` takes the largest `value(q) × weight` over the hop-`h − 1` memories `q` it shares a link with, either way round. That's the best of its shortest paths, not of every path. Seeds get no graph signal; another candidate a seed reaches does.
+- **Filters:** a reached memory passes the candidates' own test (`Recall::candidate`: content, superseded, session) or it is neither scored nor walked through.
+- **`max`:** each hop keeps its best-valued memories, ties by id, while there's room (O1).
+- **The budget:** with `byte_budget(B)`, the walk reads at most `B` bytes of nodes besides the hits' `B`, so a recall holds up to `2B`. That's D308's count, each node read's key plus 16 (memories already visited included). Each call gets what's left, and at least 1, so that only a node that's there can cut. A hop that doesn't fit whole is dropped, and the hops before it stay exact (O2).
+- **Scoring:** reached memories are read in one multi-get per hop and scored like the other candidates (no keyword score unless they were in a keyword list). Then every signal is fused again over the larger set.
 
 ## T7: `phdb mcp` memory tools (#1341)
 The design is on #1341 (cli692, c6593086022), plus the owner's three-part decision there. The flags and tools are `phdb`'s interface. They're not part of `pigeonhole-memory`'s API, which T7 doesn't change.
