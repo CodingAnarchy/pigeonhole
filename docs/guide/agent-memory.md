@@ -170,4 +170,4 @@ With an embedding model, a store can catch near duplicates as well as exact ones
 - **`remember_in` doesn't check:** call `near_duplicate(ns, &memory)` before your transaction to do it yourself.
 
 ## Reader processes
-`Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools.
+`Store::open_reader(&reader, name, model_id)` gives a `ReadStore` that recalls, gets and verifies at the reader's snapshots, and can't write. Writes come from the writer process, for example through `phdb mcp`'s memory tools ([Using Pigeonhole from AI agents](ai-agents.md#the-memory-tools)), which serve a store to any MCP client.

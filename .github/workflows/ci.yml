@@ -82,6 +82,10 @@ jobs:
       - run: cargo doc --workspace --exclude pigeonhole-bench --no-deps --all-features
       - run: cargo doc -p pigeonhole-bench --no-deps --features "$BENCH_FEATURES"
       - run: cargo test --workspace --exclude pigeonhole-bench --all-features
+      # D311 T7: phdb without its default `embed` feature (no HTTP client) still builds,
+      # passes clippy and serves MCP, refusing `--embed-url`.
+      - run: cargo clippy -p pigeonhole-cli --all-targets --no-default-features -- -D warnings
+      - run: cargo test -p pigeonhole-cli --no-default-features --test mcp
       # The golden files frozen at 1.0 (#695): the golden test checks each against its line in
       # golden-frozen.txt, and this checks that a PR only appends lines there.
       - name: frozen golden files only gain siblings

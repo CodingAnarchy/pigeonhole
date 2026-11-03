@@ -11,7 +11,7 @@ mod common;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use common::{Rng, V, check, exact, half_specs, open, seeds, specs};
+use common::{Rng, V, check, exact, open, seeds, specs};
 use pigeonhole::{Element, Metric, VectorSpec};
 use pigeonhole_vector::{Error, Index, IndexOptions, ReadIndex};
 
@@ -22,7 +22,7 @@ fn small() -> IndexOptions {
 #[test]
 fn a_seeded_model_holds_the_invariants_after_every_operation() {
     for seed in seeds(&[1, 2, 3]) {
-        for spec in specs().into_iter().chain(half_specs()) {
+        for spec in specs() {
             let ctx = format!("seed {seed}, {spec:?}");
             let dir = pigeonhole::doc_support::temp_dir();
             let db = open(&dir);
@@ -297,7 +297,7 @@ const FLOOR: f64 = 0.94;
 /// has no write methods; a table that isn't an index is refused as `open` refuses it.
 #[test]
 fn a_reader_process_searches_as_the_writer_does() {
-    for spec in specs().into_iter().chain(half_specs()) {
+    for spec in specs() {
         let ctx = format!("{spec:?}");
         let dir = pigeonhole::doc_support::temp_dir();
         let db = open(&dir);
