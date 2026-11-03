@@ -128,9 +128,10 @@ pub(crate) fn ivf_name(store: &str) -> String {
     format!("mem_{store}_ivf")
 }
 
-/// A seek into a probed list costs about this many scored cells (perf287 on #1342, from
-/// R1's measurement): a prefixed search widens to at most `max(nprobe, count / SEEK_CELLS)`
-/// lists before recall searches the namespace exactly instead.
+/// A seek into a probed list costs about this many scored cells: an estimate, not fitted
+/// (perf287 on #1342 and #1424). R1 showed a prefixed search seeks, and the T8 run's cap
+/// never bit. A prefixed search widens to at most `max(nprobe, count / SEEK_CELLS)` lists
+/// before recall searches the namespace exactly instead.
 pub(crate) const SEEK_CELLS: u64 = 64;
 
 /// The index, in the writer process or a reader's.
@@ -166,6 +167,9 @@ impl Ivf {
                 Some(p) => search.nprobe(p),
                 None => search,
             };
+            // Unset, the index's own `nprobe` is the first probe. `max_probe` never goes below
+            // the first probe, so the floor of 1 here means "the index's `nprobe`" (perf287's
+            // nit on #1424; `IndexOptions` doesn't expose `nprobe`).
             let first = first.unwrap_or(1);
             let cap = u32::try_from(count / SEEK_CELLS)
                 .unwrap_or(u32::MAX)

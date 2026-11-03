@@ -237,9 +237,11 @@ fn the_index_and_the_counter_follow_every_write() {
             .unwrap();
         kept.push(r.id().clone());
     }
+    // A quiet store: `ivf_mismatched` holds only then (simp724's R2 on #1424).
     let ok = |what: &str| {
         let st = store.verify().unwrap();
         assert!(st.is_consistent(), "{what}: {st:?}");
+        assert_eq!(st.ivf_mismatched, 0, "{what}: {st:?}");
         assert_eq!(st.ivf_counter_drift, 0, "{what}: {st:?}");
     };
     ok("after the remembers");
@@ -315,7 +317,50 @@ fn two_remembers_into_one_namespace_dont_conflict_through_the_counter() {
         panic!("the second remember conflicted: {:?}", e.code());
     }
     let st = store.verify().unwrap();
-    assert!(st.is_consistent() && st.ivf_counter_drift == 0, "{st:?}");
+    assert!(
+        st.is_consistent() && st.ivf_mismatched == 0 && st.ivf_counter_drift == 0,
+        "{st:?}"
+    );
+}
+
+/// simp724's R1 on #1424: a caller writing only through `remember_in` never settles, and
+/// its records stop at the cap instead of growing for ever. The next `remember` settles them.
+#[cfg(feature = "__unstable-hooks")]
+#[test]
+fn records_from_remember_in_alone_stay_bounded() {
+    use pigeonhole_memory::hooks::ivf_pending;
+    let (_dir, db) = open();
+    let store = create(&db, small());
+    let mut rng = Rng(0x1024);
+    for i in 0..1_100 {
+        db.transact(&RetryPolicy::default(), |txn| {
+            store.remember_in(
+                txn,
+                "big",
+                Memory::new(format!("in {i}")).embedding(emb(&mut rng)),
+            )
+        })
+        .unwrap();
+    }
+    assert_eq!(ivf_pending(&store), 1_024, "capped");
+    store
+        .remember("big", Memory::new("settles").embedding(emb(&mut rng)))
+        .unwrap();
+    assert_eq!(ivf_pending(&store), 0, "settled");
+    let st = store.verify().unwrap();
+    assert!(st.is_consistent() && st.ivf_mismatched == 0, "{st:?}");
+    // The settle split the lists the remember_in writes left out of bounds.
+    let exact = |exact: bool| {
+        store
+            .recall(&["big"])
+            .embedding(emb(&mut Rng(7)))
+            .weights(vector_only())
+            .nprobe(10_000)
+            .exact(exact)
+            .run()
+            .unwrap()
+    };
+    assert_eq!(ids(&exact(false)), ids(&exact(true)));
 }
 
 #[test]
@@ -339,4 +384,31 @@ fn a_store_without_a_model_refuses_ivf_and_ivf_reads_back() {
     assert_eq!(again.ivf(), Some(small()));
     let plain = Store::create(&db, "noivf", StoreOptions::new().embedding(model)).unwrap();
     assert_eq!(plain.ivf(), None);
+}
+
+/// cli692's R1 on #1424: a `remember_in` and a `delete_in` of the same memory in one
+/// transaction. The delete reads at the transaction's snapshot, which doesn't have the
+/// memory yet, so it deletes nothing, neither the memory nor its vector: the store and the
+/// index agree.
+#[test]
+fn a_delete_in_after_a_remember_in_in_one_transaction_deletes_nothing() {
+    let (_dir, db) = open();
+    let store = create(&db, small());
+    let mut rng = Rng(0x31);
+    let (deleted, _) = db
+        .transact(&RetryPolicy::default(), |txn| {
+            let r = store.remember_in(txn, "big", Memory::new("brief").embedding(emb(&mut rng)))?;
+            store.delete_in(txn, r.id())
+        })
+        .unwrap();
+    assert!(
+        !deleted,
+        "the transaction's snapshot has no such memory to delete"
+    );
+    let st = store.verify().unwrap();
+    assert_eq!(
+        (st.memories, st.ivf_mismatched, st.ivf_counter_drift),
+        (1, 0, 0),
+        "{st:?}"
+    );
 }

@@ -436,6 +436,11 @@ pub struct StoreStats {
     /// count is from the memories with an embedding (0 when they agree). The index's own
     /// row checks (`pigeonhole_vector::Index::verify`) run too, and fail `verify` as
     /// [`Error::Vector`] if they find corruption. Checked in the writer process only.
+    ///
+    /// The index counts at its own snapshot, not `verify`'s, so a write between the two
+    /// shows up here: read it on a quiet store. That's why
+    /// [`is_consistent`](Self::is_consistent) leaves it out (simp724's R2 on #1424). It
+    /// compares totals, so a missing vector and a stale one cancel out (#1427).
     pub ivf_mismatched: u64,
     /// Namespaces whose counter (memories with an embedding, which chooses exact or IVF
     /// recall) differs from a count of them. It's advisory: drift changes only which path a
@@ -453,7 +458,6 @@ impl StoreStats {
             && self.missing_embeddings == 0
             && self.dangling_superseded == 0
             && !self.text_index_inconsistent
-            && self.ivf_mismatched == 0
     }
 }
 
@@ -490,7 +494,14 @@ struct Shared {
     /// (D311 T8): each write's own record, made in its transaction's body, handed on once a
     /// write call's transaction returns. `after_commit` is harmless after a rollback, so a
     /// rolled-back write's record costs a count read at most.
-    ivf_pending: Mutex<Vec<pigeonhole_vector::Placed>>,
+    ///
+    /// The list is shared by the store's handles, so one thread's settle can take another's
+    /// record before that one commits: its `after_commit` then reads the counts too early,
+    /// which only delays a split to the list's next write. At most [`IVF_PENDING_MAX`]
+    /// records wait, the oldest dropped past it (simp724's R1 on #1424): a caller writing only
+    /// through `remember_in`/`delete_in` never settles, and a dropped record only delays a
+    /// split the same way.
+    ivf_pending: Mutex<std::collections::VecDeque<pigeonhole_vector::Placed>>,
 }
 
 impl std::fmt::Debug for Store {
@@ -502,6 +513,9 @@ impl std::fmt::Debug for Store {
             .finish()
     }
 }
+
+/// The most IVF write records a store keeps waiting to settle ([`Shared::ivf_pending`]).
+pub(crate) const IVF_PENDING_MAX: usize = 1_024;
 
 fn table_name(name: &str) -> String {
     format!("mem_{name}")
@@ -682,7 +696,7 @@ impl Store {
                 forgetter: Mutex::new(None),
                 started: AtomicBool::new(false),
                 own,
-                ivf_pending: Mutex::new(Vec::new()),
+                ivf_pending: Mutex::new(std::collections::VecDeque::new()),
             }),
         }
     }
@@ -1059,6 +1073,10 @@ impl Store {
     /// too), so it's also where the IVF index and its namespace counter follow (D311 T8). A
     /// future removal path, a column TTL say, must call it rather than delete rows itself
     /// (simp724 on #1342).
+    ///
+    /// It reads at `txn`'s snapshot, so a memory this same transaction remembered isn't
+    /// there yet: `false`, and nothing deleted (neither the memory nor, in an IVF store, its
+    /// vector).
     pub fn delete_in(&self, txn: &mut Transaction, id: &MemoryId) -> Result<bool> {
         let t = &self.table;
         let row = id.row();
@@ -1148,11 +1166,25 @@ impl Store {
     }
 
     fn park(&self, placed: pigeonhole_vector::Placed) {
+        let mut q = self
+            .shared
+            .ivf_pending
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if q.len() >= IVF_PENDING_MAX {
+            q.pop_front();
+        }
+        q.push_back(placed);
+    }
+
+    /// The IVF records waiting to settle (an inspection helper for `hooks`).
+    #[cfg(feature = "__unstable-hooks")]
+    pub(crate) fn ivf_pending_len(&self) -> usize {
         self.shared
             .ivf_pending
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(placed);
+            .len()
     }
 
     /// Hands the parked IVF writes to `after_commit`, which splits or merges (in background
