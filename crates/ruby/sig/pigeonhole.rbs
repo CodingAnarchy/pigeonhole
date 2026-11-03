@@ -574,4 +574,792 @@ module Pigeonhole
     def self.exists: (name family, String qualifier) -> Condition
     def self.equals: (name family, String qualifier, String value) -> Condition
   end
+
+  # Agent memory (D311, ICR 0107; #697 PR 3a).
+  module Memory
+    # A memory's kind.
+    type kind = :episodic | :semantic | :procedural | :unknown
+
+    # A memory id, or its text form.
+    type id = MemoryId | String
+
+    # A link to write: `[to, link type, weight]`.
+    type link_spec = [id, Integer, Numeric]
+
+    # The store is pinned to another embedding model than the one named.
+    class ModelMismatch < InvalidArgument
+    end
+
+    # The consolidator block raised, which stopped the pass.
+    class ConsolidateError < MergeFailed
+      attr_reader consolidated: ConsolidatePass?
+
+      def initialize: (?String? message, ?String? code, ?Integer? code_num, ?consolidated: ConsolidatePass?) -> void
+    end
+
+    module LinkType
+      DERIVED_FROM: Integer
+      SUPERSEDES: Integer
+      SIMILAR_TO: Integer
+      FIRST_CUSTOM: Integer
+    end
+
+    # A memory's id.
+    class MemoryId
+      include Comparable
+
+      def self.new: (String text) -> MemoryId
+      def self.from_bytes: (String bytes) -> MemoryId
+      def to_bytes: () -> String
+      def namespace: () -> String
+      def created_us: () -> Integer
+      def to_s: () -> String
+      def inspect: () -> String
+      def ==: (untyped other) -> bool
+      def eql?: (untyped other) -> bool
+      def hash: () -> Integer
+      def <=>: (untyped other) -> Integer?
+    end
+
+    # The embedding model a store is pinned to.
+    class EmbeddingModel
+      def self.new: (String id, Integer dim, name element) -> EmbeddingModel
+      def id: () -> String
+      def dim: () -> Integer
+      def element: () -> Symbol
+      def ==: (untyped other) -> bool
+      def eql?: (untyped other) -> bool
+      def hash: () -> Integer
+      def inspect: () -> String
+    end
+
+    # Recall's signal weights.
+    class Weights
+      FIELDS: Array[Symbol]
+
+      def self.new: (?vector: Numeric?, ?keyword: Numeric?, ?recency: Numeric?, ?importance: Numeric?,
+                     ?uses: Numeric?, ?graph: Numeric?, ?consolidated: Numeric?) -> Weights
+      def to_a: () -> [Float, Float, Float, Float, Float, Float, Float]
+      def to_h: () -> Hash[Symbol, Float]
+      def vector: () -> Float
+      def keyword: () -> Float
+      def recency: () -> Float
+      def importance: () -> Float
+      def uses: () -> Float
+      def graph: () -> Float
+      def consolidated: () -> Float
+      def ==: (untyped other) -> bool
+      def eql?: (untyped other) -> bool
+      def hash: () -> Integer
+      def inspect: () -> String
+    end
+
+    # A recall's graph expansion.
+    class Expand
+      MAX_HOPS: Integer
+
+      def self.new: (?Integer hops, ?max: Integer?) -> Expand
+      def hops: () -> Integer
+      def max: () -> Integer
+      def ==: (untyped other) -> bool
+      def eql?: (untyped other) -> bool
+      def hash: () -> Integer
+      def inspect: () -> String
+    end
+
+    # A store's forget policy.
+    class ForgetPolicy
+      def self.new: (?min_retention: Numeric?, ?max_age: Hash[name, Numeric]?, ?half_life: Numeric?,
+                     ?use_weight: Numeric?, ?max_per_pass: Integer?, ?interval: Numeric?) -> ForgetPolicy
+      def min_retention: () -> Float?
+      def max_age: () -> Hash[Symbol, Float]
+      def half_life: () -> Float
+      def use_weight: () -> Float
+      def max_per_pass: () -> Integer
+      def interval: () -> Float
+      def ==: (untyped other) -> bool
+      def inspect: () -> String
+    end
+
+    # How `consolidate` picks and folds groups.
+    class ConsolidatePolicy
+      def self.new: (?min_age: Numeric?, ?group_similarity: Numeric?, ?min_group: Integer?,
+                     ?max_group: Integer?, ?max_groups: Integer?, ?sources: name?) -> ConsolidatePolicy
+      def min_age: () -> Float
+      def group_similarity: () -> Float
+      def min_group: () -> Integer
+      def max_group: () -> Integer
+      def max_groups: () -> Integer
+      def sources: () -> Symbol
+      def ==: (untyped other) -> bool
+      def inspect: () -> String
+    end
+
+    # A store's near-duplicate dedup.
+    class NearDedup
+      def self.new: (Numeric similarity, ?policy: name) -> NearDedup
+      def similarity: () -> Float
+      def policy: () -> Symbol
+      def ==: (untyped other) -> bool
+      def inspect: () -> String
+    end
+
+    # A store's IVF index options.
+    class IvfOptions
+      def self.new: (?min_namespace_len: Integer?, ?nprobe: Integer?, ?target_list_len: Integer?) -> IvfOptions
+      def min_namespace_len: () -> Integer
+      def nprobe: () -> Integer?
+      def target_list_len: () -> Integer?
+      def ==: (untyped other) -> bool
+      def inspect: () -> String
+    end
+
+    # A memory to write.
+    class Memory
+      def self.new: (String text, ?embedding: Array[Numeric]?, ?kind: name?, ?importance: Numeric?,
+                     ?source: String?, ?session: String?, ?links: Array[link_spec]?, ?pinned: bool) -> Memory
+      def text: () -> String
+      def inspect: () -> String
+    end
+
+    # What `remember` did.
+    class Remembered < Data
+      attr_reader id: MemoryId
+      attr_reader outcome: Symbol
+
+      def self.new: (MemoryId id, Symbol outcome) -> instance
+                  | (id: MemoryId, outcome: Symbol) -> instance
+      def self.[]: (MemoryId id, Symbol outcome) -> instance
+                 | (id: MemoryId, outcome: Symbol) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: MemoryId, outcome: Symbol) -> void
+    end
+
+    # What `mark_used` did.
+    class Marked < Data
+      attr_reader marked: Integer
+      attr_reader missing: Array[MemoryId]
+
+      def self.new: (Integer marked, Array[MemoryId] missing) -> instance
+                  | (marked: Integer, missing: Array[MemoryId]) -> instance
+      def self.[]: (Integer marked, Array[MemoryId] missing) -> instance
+                 | (marked: Integer, missing: Array[MemoryId]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (marked: Integer, missing: Array[MemoryId]) -> void
+    end
+
+    # A link.
+    class Link < Data
+      attr_reader id: MemoryId
+      attr_reader type: Integer
+      attr_reader weight: Float
+
+      def self.new: (MemoryId id, Integer type, Float weight) -> instance
+                  | (id: MemoryId, type: Integer, weight: Float) -> instance
+      def self.[]: (MemoryId id, Integer type, Float weight) -> instance
+                 | (id: MemoryId, type: Integer, weight: Float) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: MemoryId, type: Integer, weight: Float) -> void
+    end
+
+    # Where a memory came from.
+    class Source < Data
+      attr_reader name: String
+      attr_reader at_us: Integer
+
+      def self.new: (String name, Integer at_us) -> instance
+                  | (name: String, at_us: Integer) -> instance
+      def self.[]: (String name, Integer at_us) -> instance
+                 | (name: String, at_us: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (name: String, at_us: Integer) -> void
+    end
+
+    # A stored memory, as `get` reads it.
+    class StoredMemory < Data
+      attr_reader id: MemoryId
+      attr_reader text: String
+      attr_reader kind: kind
+      attr_reader importance: Float
+      attr_reader uses: Integer
+      attr_reader last_used_us: Integer?
+      attr_reader session: String?
+      attr_reader pinned: bool
+      attr_reader consolidated: bool
+      attr_reader superseded_by: MemoryId?
+      attr_reader sources: Array[Source]
+      attr_reader links: Array[Link]
+      attr_reader backlinks: Array[Link]
+      attr_reader embedding: Array[Float]?
+
+      def self.new: (MemoryId id, String text, kind kind, Float importance, Integer uses,
+                     Integer? last_used_us, String? session, bool pinned, bool consolidated,
+                     MemoryId? superseded_by, Array[Source] sources, Array[Link] links,
+                     Array[Link] backlinks, Array[Float]? embedding) -> instance
+                  | (id: MemoryId, text: String, kind: kind, importance: Float, uses: Integer,
+                     last_used_us: Integer?, session: String?, pinned: bool, consolidated: bool,
+                     superseded_by: MemoryId?, sources: Array[Source], links: Array[Link],
+                     backlinks: Array[Link], embedding: Array[Float]?) -> instance
+      def self.[]: (MemoryId id, String text, kind kind, Float importance, Integer uses,
+                    Integer? last_used_us, String? session, bool pinned, bool consolidated,
+                    MemoryId? superseded_by, Array[Source] sources, Array[Link] links,
+                    Array[Link] backlinks, Array[Float]? embedding) -> instance
+                 | (id: MemoryId, text: String, kind: kind, importance: Float, uses: Integer,
+                    last_used_us: Integer?, session: String?, pinned: bool, consolidated: bool,
+                    superseded_by: MemoryId?, sources: Array[Source], links: Array[Link],
+                    backlinks: Array[Link], embedding: Array[Float]?) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: MemoryId, text: String, kind: kind, importance: Float, uses: Integer,
+                       last_used_us: Integer?, session: String?, pinned: bool, consolidated: bool,
+                       superseded_by: MemoryId?, sources: Array[Source], links: Array[Link],
+                       backlinks: Array[Link], embedding: Array[Float]?) -> void
+      def pinned?: () -> bool
+      def consolidated?: () -> bool
+    end
+
+    # `verify`'s counts.
+    class StoreStats < Data
+      attr_reader memories: Integer
+      attr_reader no_content: Integer
+      attr_reader stale_dedup: Integer
+      attr_reader broken_links: Integer
+      attr_reader missing_embeddings: Integer
+      attr_reader dangling_superseded: Integer
+      attr_reader text_index_inconsistent: bool
+      attr_reader ivf_mismatched: Integer
+      attr_reader ivf_counter_drift: Integer
+
+      def self.new: (Integer memories, Integer no_content, Integer stale_dedup,
+                     Integer broken_links, Integer missing_embeddings, Integer dangling_superseded,
+                     bool text_index_inconsistent, Integer ivf_mismatched, Integer ivf_counter_drift) -> instance
+                  | (memories: Integer, no_content: Integer, stale_dedup: Integer,
+                     broken_links: Integer, missing_embeddings: Integer,
+                     dangling_superseded: Integer, text_index_inconsistent: bool,
+                     ivf_mismatched: Integer, ivf_counter_drift: Integer) -> instance
+      def self.[]: (Integer memories, Integer no_content, Integer stale_dedup,
+                    Integer broken_links, Integer missing_embeddings, Integer dangling_superseded,
+                    bool text_index_inconsistent, Integer ivf_mismatched, Integer ivf_counter_drift) -> instance
+                 | (memories: Integer, no_content: Integer, stale_dedup: Integer,
+                    broken_links: Integer, missing_embeddings: Integer,
+                    dangling_superseded: Integer, text_index_inconsistent: bool,
+                    ivf_mismatched: Integer, ivf_counter_drift: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (memories: Integer, no_content: Integer, stale_dedup: Integer,
+                       broken_links: Integer, missing_embeddings: Integer,
+                       dangling_superseded: Integer, text_index_inconsistent: bool,
+                       ivf_mismatched: Integer, ivf_counter_drift: Integer) -> void
+      def consistent?: () -> bool
+    end
+
+    # One signal of a hit.
+    class Signal < Data
+      attr_reader rank: Integer
+      attr_reader value: Float
+
+      def self.new: (Integer rank, Float value) -> instance
+                  | (rank: Integer, value: Float) -> instance
+      def self.[]: (Integer rank, Float value) -> instance
+                 | (rank: Integer, value: Float) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (rank: Integer, value: Float) -> void
+    end
+
+    # A hit's signals.
+    class Signals < Data
+      attr_reader vector: Signal?
+      attr_reader keyword: Signal?
+      attr_reader recency: Signal?
+      attr_reader importance: Signal?
+      attr_reader uses: Signal?
+      attr_reader graph: Signal?
+
+      def self.new: (Signal? vector, Signal? keyword, Signal? recency, Signal? importance,
+                     Signal? uses, Signal? graph) -> instance
+                  | (vector: Signal?, keyword: Signal?, recency: Signal?, importance: Signal?,
+                     uses: Signal?, graph: Signal?) -> instance
+      def self.[]: (Signal? vector, Signal? keyword, Signal? recency, Signal? importance,
+                    Signal? uses, Signal? graph) -> instance
+                 | (vector: Signal?, keyword: Signal?, recency: Signal?, importance: Signal?,
+                    uses: Signal?, graph: Signal?) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (vector: Signal?, keyword: Signal?, recency: Signal?, importance: Signal?,
+                       uses: Signal?, graph: Signal?) -> void
+    end
+
+    # One recalled memory.
+    class RecallHit < Data
+      attr_reader id: MemoryId
+      attr_reader text: String
+      attr_reader kind: kind
+      attr_reader importance: Float
+      attr_reader created_us: Integer
+      attr_reader superseded_by: MemoryId?
+      attr_reader score: Float
+      attr_reader signals: Signals?
+      attr_reader embedding: Array[Float]?
+
+      def self.new: (MemoryId id, String text, kind kind, Float importance, Integer created_us,
+                     MemoryId? superseded_by, Float score, Signals? signals, Array[Float]? embedding) -> instance
+                  | (id: MemoryId, text: String, kind: kind, importance: Float,
+                     created_us: Integer, superseded_by: MemoryId?, score: Float,
+                     signals: Signals?, embedding: Array[Float]?) -> instance
+      def self.[]: (MemoryId id, String text, kind kind, Float importance, Integer created_us,
+                    MemoryId? superseded_by, Float score, Signals? signals, Array[Float]? embedding) -> instance
+                 | (id: MemoryId, text: String, kind: kind, importance: Float, created_us: Integer,
+                    superseded_by: MemoryId?, score: Float, signals: Signals?,
+                    embedding: Array[Float]?) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: MemoryId, text: String, kind: kind, importance: Float,
+                       created_us: Integer, superseded_by: MemoryId?, score: Float,
+                       signals: Signals?, embedding: Array[Float]?) -> void
+    end
+
+    # What a recall did.
+    class RecallStats < Data
+      attr_reader candidates: Integer
+      attr_reader truncated: bool
+      attr_reader expanded: Integer
+      attr_reader expansion_truncated: bool
+      attr_reader ivf_namespaces: Integer
+      attr_reader ivf_fallbacks: Integer
+
+      def self.new: (Integer candidates, bool truncated, Integer expanded,
+                     bool expansion_truncated, Integer ivf_namespaces, Integer ivf_fallbacks) -> instance
+                  | (candidates: Integer, truncated: bool, expanded: Integer,
+                     expansion_truncated: bool, ivf_namespaces: Integer, ivf_fallbacks: Integer) -> instance
+      def self.[]: (Integer candidates, bool truncated, Integer expanded, bool expansion_truncated,
+                    Integer ivf_namespaces, Integer ivf_fallbacks) -> instance
+                 | (candidates: Integer, truncated: bool, expanded: Integer,
+                    expansion_truncated: bool, ivf_namespaces: Integer, ivf_fallbacks: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (candidates: Integer, truncated: bool, expanded: Integer,
+                       expansion_truncated: bool, ivf_namespaces: Integer, ivf_fallbacks: Integer) -> void
+    end
+
+    # A forget pass's counts.
+    class ForgetPass < Data
+      attr_reader examined: Integer
+      attr_reader deleted: Integer
+      attr_reader protected: Integer
+      attr_reader resume: MemoryId?
+
+      def self.new: (Integer examined, Integer deleted, Integer protected, MemoryId? resume) -> instance
+                  | (examined: Integer, deleted: Integer, protected: Integer, resume: MemoryId?) -> instance
+      def self.[]: (Integer examined, Integer deleted, Integer protected, MemoryId? resume) -> instance
+                 | (examined: Integer, deleted: Integer, protected: Integer, resume: MemoryId?) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (examined: Integer, deleted: Integer, protected: Integer, resume: MemoryId?) -> void
+    end
+
+    # A consolidation pass's counts.
+    class ConsolidatePass < Data
+      attr_reader groups: Integer
+      attr_reader committed: Integer
+      attr_reader skipped: Integer
+      attr_reader created: Integer
+      attr_reader merged: Integer
+      attr_reader sources: Integer
+      attr_reader resume: MemoryId?
+
+      def self.new: (Integer groups, Integer committed, Integer skipped, Integer created,
+                     Integer merged, Integer sources, MemoryId? resume) -> instance
+                  | (groups: Integer, committed: Integer, skipped: Integer, created: Integer,
+                     merged: Integer, sources: Integer, resume: MemoryId?) -> instance
+      def self.[]: (Integer groups, Integer committed, Integer skipped, Integer created,
+                    Integer merged, Integer sources, MemoryId? resume) -> instance
+                 | (groups: Integer, committed: Integer, skipped: Integer, created: Integer,
+                    merged: Integer, sources: Integer, resume: MemoryId?) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (groups: Integer, committed: Integer, skipped: Integer, created: Integer,
+                       merged: Integer, sources: Integer, resume: MemoryId?) -> void
+    end
+
+    # The recall methods Store and ReadStore share.
+    module Recalls
+      def recall: (String | Array[String] namespaces, ?text: String?, ?embedding: Array[Numeric]?, ?k: Integer?,
+                   ?candidates: Integer?, ?byte_budget: Integer?, ?snapshot: Snapshot?, ?now_us: Integer?,
+                   ?half_life: Numeric?, ?fusion: name, ?weights: Weights?, ?include_superseded: bool,
+                   ?session: String?, ?with_signals: bool, ?with_embeddings: bool,
+                   ?expand: Expand?, ?exact: bool, ?nprobe: Integer?) -> Array[RecallHit]
+      def recall_with_stats: (String | Array[String] namespaces, ?text: String?, ?embedding: Array[Numeric]?,
+                              ?k: Integer?, ?candidates: Integer?, ?byte_budget: Integer?, ?snapshot: Snapshot?,
+                              ?now_us: Integer?, ?half_life: Numeric?, ?fusion: name, ?weights: Weights?,
+                              ?include_superseded: bool, ?session: String?, ?with_signals: bool,
+                              ?with_embeddings: bool, ?expand: Expand?, ?exact: bool,
+                              ?nprobe: Integer?) -> [Array[RecallHit], RecallStats]
+      def get: (id id) -> StoredMemory?
+      def verify: () -> StoreStats
+    end
+
+    # A memory store in the writer process.
+    class Store
+      include Recalls
+
+      def self.create: (Database db, String name, ?embedding: EmbeddingModel?, ?forget: ForgetPolicy?,
+                        ?episodic_ttl: Numeric?, ?near_dedup: NearDedup?, ?normalization: name?,
+                        ?ivf: IvfOptions?) -> Store
+                     | [T] (Database db, String name, ?embedding: EmbeddingModel?, ?forget: ForgetPolicy?,
+                            ?episodic_ttl: Numeric?, ?near_dedup: NearDedup?, ?normalization: name?,
+                        ?ivf: IvfOptions?) { (Store) -> T } -> T
+      def self.open: (Database db, String name, model: String?) -> Store
+                   | [T] (Database db, String name, model: String?) { (Store) -> T } -> T
+      def self.open_reader: (Reader reader, String name, model: String?) -> ReadStore
+                          | [T] (Reader reader, String name, model: String?) { (ReadStore) -> T } -> T
+      def close: () -> nil
+      def closed?: () -> bool
+      def embedding_model: () -> EmbeddingModel?
+      def normalization: () -> Symbol
+      def ivf: () -> IvfOptions?
+      def remember: (String ns, String text, ?embedding: Array[Numeric]?, ?kind: name?, ?importance: Numeric?,
+                     ?source: String?, ?session: String?, ?links: Array[link_spec]?, ?pinned: bool) -> Remembered
+      def remember_in: (Transaction txn, String ns, String text, ?embedding: Array[Numeric]?, ?kind: name?,
+                        ?importance: Numeric?, ?source: String?, ?session: String?, ?links: Array[link_spec]?,
+                        ?pinned: bool) -> Remembered
+      def delete: (id id) -> bool
+      def delete_in: (Transaction txn, id id) -> bool
+      def link: (id from, id to, Integer link_type, ?Numeric weight) -> nil
+      def supersede: (id old, id new) -> nil
+      def mark_used: (Array[id] ids) -> Marked
+      def forget: (?policy: ForgetPolicy?, ?after: id?, ?now_us: Integer?) -> ForgetPass
+      def forget_in: (Transaction txn, id id, Integer now_us) -> Symbol
+      def forget_policy: () -> ForgetPolicy?
+      def forget_policy=: (ForgetPolicy? policy) -> ForgetPolicy?
+      def near_dedup: () -> NearDedup?
+      def near_dedup=: (NearDedup? near) -> NearDedup?
+      def near_duplicate: (String ns, String text, ?embedding: Array[Numeric]?) -> [MemoryId, Float]?
+      def consolidate: (String ns, ?policy: ConsolidatePolicy?, ?after: id?, ?now_us: Integer?) { (Array[StoredMemory]) -> Array[Memory] } -> ConsolidatePass
+    end
+
+    # A memory store in a reader process.
+    class ReadStore
+      include Recalls
+
+      def close: () -> nil
+      def closed?: () -> bool
+      def embedding_model: () -> EmbeddingModel?
+      def normalization: () -> Symbol
+      def ivf: () -> IvfOptions?
+    end
+  end
+
+  # Full-text search (D309, ICR 0105; #697 PR 3b).
+  module Text
+    # A query: a Query, or a String in the query syntax.
+    type query = Query | String
+
+    # A search hit.
+    class Hit < Data
+      attr_reader id: String
+      attr_reader score: Float
+      attr_reader text: String?
+      attr_reader matches: Array[Match]
+
+      def self.new: (String id, Float score, String? text, Array[Match] matches) -> instance
+                  | (id: String, score: Float, text: String?, matches: Array[Match]) -> instance
+      def self.[]: (String id, Float score, String? text, Array[Match] matches) -> instance
+                 | (id: String, score: Float, text: String?, matches: Array[Match]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: String, score: Float, text: String?, matches: Array[Match]) -> void
+    end
+
+    # Where a clause matched: a byte range of the hit's text.
+    class Match < Data
+      attr_reader clause: Integer
+      attr_reader occurrence: Integer
+      attr_reader range: Range[Integer]
+
+      def self.new: (Integer clause, Integer occurrence, Range[Integer] range) -> instance
+                  | (clause: Integer, occurrence: Integer, range: Range[Integer]) -> instance
+      def self.[]: (Integer clause, Integer occurrence, Range[Integer] range) -> instance
+                 | (clause: Integer, occurrence: Integer, range: Range[Integer]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (clause: Integer, occurrence: Integer, range: Range[Integer]) -> void
+    end
+
+    # How a fuzzy clause expanded.
+    class FuzzyStats < Data
+      attr_reader clause: Integer
+      attr_reader term: String
+      attr_reader expansions: Integer
+      attr_reader cut: bool
+
+      def self.new: (Integer clause, String term, Integer expansions, bool cut) -> instance
+                  | (clause: Integer, term: String, expansions: Integer, cut: bool) -> instance
+      def self.[]: (Integer clause, String term, Integer expansions, bool cut) -> instance
+                 | (clause: Integer, term: String, expansions: Integer, cut: bool) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (clause: Integer, term: String, expansions: Integer, cut: bool) -> void
+    end
+
+    # What a search read.
+    class SearchStats < Data
+      attr_reader fuzzy: Array[FuzzyStats]
+      attr_reader stale: Integer
+
+      def self.new: (Array[FuzzyStats] fuzzy, Integer stale) -> instance
+                  | (fuzzy: Array[FuzzyStats], stale: Integer) -> instance
+      def self.[]: (Array[FuzzyStats] fuzzy, Integer stale) -> instance
+                 | (fuzzy: Array[FuzzyStats], stale: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (fuzzy: Array[FuzzyStats], stale: Integer) -> void
+    end
+
+    # An index's options.
+    class IndexOptions < Data
+      attr_reader k1: Float
+      attr_reader b: Float
+      attr_reader positions: bool
+      attr_reader stop_words: bool
+      attr_reader normalization: Symbol
+      attr_reader max_terms: Integer
+      attr_reader max_term_bytes: Integer
+
+      def self.new: (Float k1, Float b, bool positions, bool stop_words, Symbol normalization,
+                     Integer max_terms, Integer max_term_bytes) -> instance
+                  | (k1: Float, b: Float, positions: bool, stop_words: bool, normalization: Symbol,
+                     max_terms: Integer, max_term_bytes: Integer) -> instance
+      def self.[]: (Float k1, Float b, bool positions, bool stop_words, Symbol normalization,
+                    Integer max_terms, Integer max_term_bytes) -> instance
+                 | (k1: Float, b: Float, positions: bool, stop_words: bool, normalization: Symbol,
+                    max_terms: Integer, max_term_bytes: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (k1: Float, b: Float, positions: bool, stop_words: bool,
+                       normalization: Symbol, max_terms: Integer, max_term_bytes: Integer) -> void
+    end
+
+    # The cell an index covers.
+    class Source < Data
+      attr_reader table: String
+      attr_reader family: String
+      attr_reader qualifier: String
+
+      def self.new: (String table, String family, String qualifier) -> instance
+                  | (table: String, family: String, qualifier: String) -> instance
+      def self.[]: (String table, String family, String qualifier) -> instance
+                 | (table: String, family: String, qualifier: String) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (table: String, family: String, qualifier: String) -> void
+    end
+
+    # `verify`'s counts.
+    class IndexStats < Data
+      attr_reader documents: Integer
+      attr_reader terms: Integer
+      attr_reader postings: Integer
+      attr_reader forward_mismatch: Integer
+      attr_reader source_mismatch: Integer
+      attr_reader counter_drift: Integer
+      attr_reader invalid_utf8: Integer
+      attr_reader consistent: bool
+
+      def self.new: (Integer documents, Integer terms, Integer postings, Integer forward_mismatch,
+                     Integer source_mismatch, Integer counter_drift, Integer invalid_utf8,
+                     bool consistent) -> instance
+                  | (documents: Integer, terms: Integer, postings: Integer,
+                     forward_mismatch: Integer, source_mismatch: Integer, counter_drift: Integer,
+                     invalid_utf8: Integer, consistent: bool) -> instance
+      def self.[]: (Integer documents, Integer terms, Integer postings, Integer forward_mismatch,
+                    Integer source_mismatch, Integer counter_drift, Integer invalid_utf8,
+                    bool consistent) -> instance
+                 | (documents: Integer, terms: Integer, postings: Integer,
+                    forward_mismatch: Integer, source_mismatch: Integer, counter_drift: Integer,
+                    invalid_utf8: Integer, consistent: bool) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (documents: Integer, terms: Integer, postings: Integer,
+                       forward_mismatch: Integer, source_mismatch: Integer, counter_drift: Integer,
+                       invalid_utf8: Integer, consistent: bool) -> void
+      def consistent?: () -> bool
+    end
+
+    # What `rebuild` or `repair` did.
+    class RebuildStats < Data
+      attr_reader documents: Integer
+      attr_reader changed: Integer
+      attr_reader invalid_utf8: Integer
+
+      def self.new: (Integer documents, Integer changed, Integer invalid_utf8) -> instance
+                  | (documents: Integer, changed: Integer, invalid_utf8: Integer) -> instance
+      def self.[]: (Integer documents, Integer changed, Integer invalid_utf8) -> instance
+                 | (documents: Integer, changed: Integer, invalid_utf8: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (documents: Integer, changed: Integer, invalid_utf8: Integer) -> void
+    end
+
+    # A full-text query.
+    class Query
+      def self.new: () -> Query
+      def self.parse: (String text) -> Query
+      def term: (String term) -> Query
+      def text: (String text) -> Query
+      def phrase: (Array[String] words, ?slop: Integer) -> Query
+      def fuzzy: (String term, ?(Symbol | Integer) fuzziness) -> Query
+      def ==: (untyped other) -> bool
+      def inspect: () -> String
+    end
+
+    # The search methods Index and ReadIndex share.
+    module Searches
+      def search: (query query, Integer k, ?id_prefix: String?, ?snapshot: Snapshot?, ?highlight: bool,
+                   ?prefix_length: Integer?, ?max_expansions: Integer?) -> Array[Hit]
+      def search_with_stats: (query query, Integer k, ?id_prefix: String?, ?snapshot: Snapshot?, ?highlight: bool,
+                              ?prefix_length: Integer?, ?max_expansions: Integer?) -> [Array[Hit], SearchStats]
+      def verify: () -> IndexStats
+      def options: () -> IndexOptions
+      def source: () -> Source
+    end
+
+    # A full-text index in the writer process.
+    class Index
+      include Searches
+
+      def self.create: (Database db, String name, table: Table, family: name, qualifier: String, ?k1: Numeric?,
+                        ?b: Numeric?, ?positions: bool?, ?stop_words: bool?, ?normalization: name?,
+                        ?max_terms: Integer?, ?max_term_bytes: Integer?) -> Index
+      def self.open: (Database db, String name) -> Index
+      def self.open_reader: (Reader reader, String name) -> ReadIndex
+      def put: (String id, String text) -> nil
+      def put_in: (Transaction txn, String id, String text) -> nil
+      def delete: (String id) -> bool
+      def delete_in: (Transaction txn, String id) -> bool
+      def rebuild: () -> RebuildStats
+      def repair: () -> RebuildStats
+    end
+
+    # A full-text index in a reader process.
+    class ReadIndex
+      include Searches
+    end
+  end
+
+  # The vector index (D306, ICR 0100; #697 PR 3b).
+  module Vector
+    # A search hit.
+    class Hit < Data
+      attr_reader id: String
+      attr_reader distance: Float
+
+      def self.new: (String id, Float distance) -> instance
+                  | (id: String, distance: Float) -> instance
+      def self.[]: (String id, Float distance) -> instance
+                 | (id: String, distance: Float) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (id: String, distance: Float) -> void
+    end
+
+    # What a search read.
+    class SearchStats < Data
+      attr_reader lists_probed: Integer
+      attr_reader lists: Integer
+
+      def self.new: (Integer lists_probed, Integer lists) -> instance
+                  | (lists_probed: Integer, lists: Integer) -> instance
+      def self.[]: (Integer lists_probed, Integer lists) -> instance
+                 | (lists_probed: Integer, lists: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (lists_probed: Integer, lists: Integer) -> void
+    end
+
+    # `verify`'s counts.
+    class IndexStats < Data
+      attr_reader vectors: Integer
+      attr_reader list_lens: Array[Integer]
+
+      def self.new: (Integer vectors, Array[Integer] list_lens) -> instance
+                  | (vectors: Integer, list_lens: Array[Integer]) -> instance
+      def self.[]: (Integer vectors, Array[Integer] list_lens) -> instance
+                 | (vectors: Integer, list_lens: Array[Integer]) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (vectors: Integer, list_lens: Array[Integer]) -> void
+    end
+
+    # What a bulk load did.
+    class BulkStats < Data
+      attr_reader vectors: Integer
+      attr_reader lists: Integer
+
+      def self.new: (Integer vectors, Integer lists) -> instance
+                  | (vectors: Integer, lists: Integer) -> instance
+      def self.[]: (Integer vectors, Integer lists) -> instance
+                 | (vectors: Integer, lists: Integer) -> instance
+      def self.members: () -> Array[Symbol]
+      def self.inspect: () -> String
+      def initialize: (vectors: Integer, lists: Integer) -> void
+    end
+
+    # The search methods Index and ReadIndex share.
+    module Searches
+      def search: (vector_in query, Integer k, ?nprobe: Integer?, ?parallel: Integer?, ?snapshot: Snapshot?,
+                   ?id_prefix: String?, ?max_probe: Integer?) -> Array[Hit]
+      def search_with_stats: (vector_in query, Integer k, ?nprobe: Integer?, ?parallel: Integer?,
+                              ?snapshot: Snapshot?, ?id_prefix: String?, ?max_probe: Integer?) -> [Array[Hit], SearchStats]
+    end
+
+    # A vector index in the writer process.
+    class Index
+      include Searches
+
+      def self.create: (Database db, String name, VectorSpec spec, ?nprobe: Integer?, ?target_list_len: Integer?,
+                        ?reassign_neighbours: Integer?, ?rebalance: name?, ?rebalancer: bool) -> (Index | [Index, Rebalancer])
+      def self.open: (Database db, String name, ?rebalancer: bool) -> (Index | [Index, Rebalancer])
+      def self.open_reader: (Reader reader, String name) -> ReadIndex
+      def spec: () -> VectorSpec
+      def rebalance: () -> Symbol
+      def max_list_len: () -> Integer
+      def min_list_len: () -> Integer
+      def insert: (String id, vector_in vector) -> nil
+      def delete: (String id) -> bool
+      def insert_in: (Transaction txn, Placed placed, String id, vector_in vector) -> nil
+      def delete_in: (Transaction txn, Placed placed, String id) -> bool
+      def after_commit: (Placed placed) -> nil
+      def verify: () -> IndexStats
+      def bulk_load: (Enumerable[[String, vector_in]] pairs, expected: Integer, ?batch: Integer) -> BulkStats
+    end
+
+    # A vector index in a reader process.
+    class ReadIndex
+      include Searches
+
+      def spec: () -> VectorSpec
+    end
+
+    # One transaction's writes to one index.
+    class Placed
+      def self.new: () -> Placed
+    end
+
+    # A background-mode index's rebalancing, driven by a Ruby thread.
+    class Rebalancer
+      def run_once: (Numeric budget) -> bool
+      def wait: (Numeric timeout) -> nil
+      def closed?: () -> bool
+    end
+
+    # A bulk load in progress (Index#bulk_load's).
+    class BulkLoad
+      def push: (Array[[String, vector_in]] pairs) -> nil
+    end
+  end
 end

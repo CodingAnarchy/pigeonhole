@@ -40,10 +40,16 @@ class TestSignatures < Minitest::Test
   # The public classes and modules under Pigeonhole, by name.
   def actual
     out = { "Pigeonhole" => Pigeonhole }
-    Pigeonhole.constants.sort.each do |c|
-      v = Pigeonhole.const_get(c)
-      out["Pigeonhole::#{c}"] = v if v.is_a?(Module) && v != Pigeonhole::Native
+    walk = lambda do |mod, name|
+      mod.constants.sort.each do |c|
+        v = mod.const_get(c)
+        next unless v.is_a?(Module) && v != Pigeonhole::Native && v.name == "#{name}::#{c}"
+
+        out["#{name}::#{c}"] = v
+        walk.call(v, "#{name}::#{c}") # nested modules' classes (Pigeonhole::Memory::Store)
+      end
     end
+    walk.call(Pigeonhole, "Pigeonhole")
     out
   end
 
@@ -69,7 +75,8 @@ class TestSignatures < Minitest::Test
   def test_every_public_method_is_declared_and_no_more
     sigs = declared
     actual.each do |name, mod|
-      instance = mod.is_a?(Class) ? mod.public_instance_methods(false) : []
+      # A module counts too: Pigeonhole::Memory::Recalls is mixed into the stores.
+      instance = mod.public_instance_methods(false)
       instance = instance.grep_v(RBS_HOOK).sort
       singleton = mod.singleton_methods(false).grep_v(RBS_HOOK).sort
       assert_equal instance, sigs[name][:instance], "#{name}: instance methods vs sig/pigeonhole.rbs"

@@ -111,8 +111,36 @@ Split from PR 2 for review size; Python's change feed (D310) in Ruby's idioms:
   - `ruby-gems.yml`'s `source` job installs the gem from a copy outside the checkout into an empty `GEM_HOME` on Linux and macOS, runs `script/source_gem_smoke.rb`, and uploads the gem as an artifact. A plain `gem build` from the checkout still refuses.
 - **Publishing:** nothing goes to RubyGems without the owner's go.
 
-## Later PRs
-- **PR 3:** `pigeonhole-memory`, `pigeonhole-text` and `pigeonhole-vector`.
+### PR 3a: agent memory
+`pigeonhole-memory` as Python's `pigeonhole.memory` binds it (ICR 0102/0107), in Ruby's idioms. The design note and reviews are on #697.
+- **Names.** Everything is under `Pigeonhole::Memory`: `Store`, `ReadStore`, `MemoryId`, the option types (`EmbeddingModel`, `Weights`, `Expand`, `ForgetPolicy`, `ConsolidatePolicy`, `NearDedup`, `Memory`) and `LinkType`. The errors are `ModelMismatch < InvalidArgument` and `ConsolidateError < MergeFailed`, still in the base hierarchy (ai1249's Q1).
+- **Values.** `MemoryId` and the option types are native values that hold no Ruby object. Every result is a frozen `Data`, built in `memory.rb` from Arrays, as PR 2's are. Its Strings and Arrays are frozen too: `StoredMemory`, `RecallHit`, `Signals`, `Signal`, `RecallStats`, `ForgetPass`, `ConsolidatePass`, `Remembered`, `Marked`, `Link`, `Source` and `StoreStats`. Enums are Symbols, with `:unknown` for a kind a later engine adds. Durations are Numeric seconds, and points in time are µs Integers.
+- **`Store.create(..., normalization:)`** takes #1381's setting from the start.
+- **Lifecycle.** Each store handle sits in a slot that `close` empties. A call clones the handle and holds no lock while it runs (perf2's C4), so `close` during a call returns at once, and the call ends with its clone. `Database#close` and `Reader#close` close the stores opened on them first: the list and the handle are taken under one lock, so a store opened during the close is either closed by it or refused with `Closed`.
+- **The consolidator** follows the owner's O3, the channel pattern.
+  - The pass runs on a Rust thread that holds no Ruby value. For each group, that thread sends the group's owned memories over a channel and waits for the answer.
+  - The Ruby thread waits with the GVL released, in 100 ms slices with `thread_check_ints` between them. It calls the block with the GVL held, through a Proc argument and not a block, so an exception the method builds isn't handed the block. It sends the block's memories back.
+  - **A `StandardError` from the block**, or a return that isn't an Array of `Memory`, becomes `ConsolidateError`, whose `consolidated` is the pass so far and whose `cause` is the exception.
+  - **Anything else** takes effect as it is, once the worker has stopped and been joined: `break`, `throw`, `return`, a non-`StandardError` exception, or an interrupt while waiting. That covers perf2's C1, and `Timeout` and `Thread#raise` keep their meaning. It differs from Python, which wraps every exception.
+  - **Whichever way the pass stops,** no thread outlives the call, the committed groups stand, and a rerun is safe (C5).
+- **`test_signatures`** now walks nested modules, so `Pigeonhole::Memory::*` is held to the RBS like the rest.
 
+### PR 3b: full-text search and the vector index
+`pigeonhole-text` and `pigeonhole-vector`, which no other binding has yet. The design note and both reviews are on #697.
+- **Names.** `Pigeonhole::Text` holds `Query`, `Index` and `ReadIndex`. `Pigeonhole::Vector` holds `Index`, `ReadIndex`, `Placed`, `Rebalancer` and `BulkLoad`. Their results (`Hit`, `Match`, the stats and options) are frozen `Data` built in `index.rb`, with ids as frozen binary Strings.
+- **Text.**
+  - A query is a `Query` (immutable: each builder method returns a new one) or a String in the query syntax, parsed when the search runs.
+  - `Match#range` is a byte `Range` of `Hit#text`, and the docs say to use `byteslice` (ai1249's P3).
+  - Custom tokenizers aren't bound (Q2): the engine calls a tokenizer inside its own calls, where a block can't run.
+- **Vector.**
+  - `insert` and `search` take `put_vector`'s forms for the index's element. A half index takes `f32` values, which it rounds.
+  - `insert_in`/`delete_in` take a `Placed`, made inside the transaction's block (P1), and `after_commit` uses it up.
+  - **`bulk_load(pairs, expected:)`** streams (P2). `pairs.each_slice(batch)` feeds a `BulkLoad`, whose `push` converts a batch and sends it over a bounded channel to a loader thread running the crate's one `bulk_load_*` call. `push` waits with the GVL released while the loader is two batches behind, and `finish` joins the loader in interruptible slices.
+- **T8 (#1424) in `Pigeonhole::Memory`:**
+  - `IvfOptions` and `Store.create(ivf:)`, with `Store#ivf`/`ReadStore#ivf`;
+  - `recall(exact:, nprobe:)`;
+  - `RecallStats#ivf_namespaces`/`#ivf_fallbacks`;
+  - `StoreStats#ivf_mismatched`/`#ivf_counter_drift`, which `consistent?` leaves out, as the crate does (ai1249's N3 on #1425).
+- **Rebalancing (Q3).** `rebalance: :background` uses the crate's own thread. With `rebalancer: true`, `create`/`open` return `[index, rebalancer]` for a Ruby thread to drive. `run_once(budget)` and `wait(timeout)` release the GVL, and `wait` runs in 100 ms slices with interrupt checks. `set_wakeup` isn't bound, for Q2's reason.
 ## Callers changed
 None. It's a new crate.

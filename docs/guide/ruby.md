@@ -1,6 +1,6 @@
 # Ruby
 
-> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111), and nothing has been published to RubyGems yet. This is PR 1: the core API. Vectors, graphs, byte-budgeted reads and the change feed follow, as do the memory, text and vector-index surfaces.
+> **Status:** this guide describes `main`. The Ruby bindings are new in 1.1.0 (#697, ICR 0111), and nothing has been published to RubyGems yet.
 
 The `pigeonhole` gem binds the Rust crate directly through magnus and rb-sys (no C layer), as the [Python bindings](python.md) do through PyO3. It needs Ruby 3.3 or later.
 
@@ -180,6 +180,125 @@ Pigeonhole.open(path, create: true, change_feed: 64 << 20) do |db|
   t.feed(resume: token) do |feed|
     raise unless feed.next(timeout: 5).changes.first.value == "shipped"
   end
+end
+```
+
+## Agent memory
+`Pigeonhole::Memory` binds the [`pigeonhole-memory`](agent-memory.md) store: long-term memory for an agent, with ranked recall, dedup, superseding, forgetting and consolidation, kept in the same file as the application's data. The names and rules are the Rust crate's ([ICR 0107](../design/icr/0107-agent-memory.md)), as Python's `pigeonhole.memory` binds them. Every call releases the GVL.
+
+- **Opening.**
+  - `Store.create(db, name, embedding: EmbeddingModel.new(id, dim, :f32))` pins the store to one embedding model. Without `embedding:`, recall is by keyword and recency.
+  - `forget:`, `episodic_ttl:` (seconds) and `near_dedup:` set the store's policies. `normalization:` (`:nfc` by default, `:nfkc` or `:none`) sets how its text index compares terms, and is fixed at create.
+  - `Store.open(db, name, model: id)` opens the store again. It raises `ModelMismatch` (an `InvalidArgument`) for another model, and `model: nil` gives a handle that recalls without embeddings.
+  - `Store.open_reader(reader, name, model: ...)` gives a `ReadStore` in a reader process, with `recall`, `get` and `verify`.
+  - Each takes a block, which gets the store and closes it afterwards.
+- **Writing.**
+  - `store.remember(ns, text, embedding:, kind:, importance:, source:, session:, links: [[id, LinkType::DERIVED_FROM, 0.5]], pinned:)` returns `Remembered(id, outcome)`.
+  - `outcome` is `:new`, `:merged` (an exact duplicate) or `:similar` (a near duplicate the store's `NearDedup` with policy `:skip` didn't write).
+  - `delete`, `link`, `supersede` and `mark_used` take ids as a `MemoryId` or its text form.
+- **Transactions.**
+  - `remember_in(txn, ...)`, `delete_in` and `forget_in` write in a `Pigeonhole::Transaction` and commit with it.
+  - They read in the transaction, so they're safe inside `db.transact { |txn| ... }`, whose retries re-read.
+  - `remember_in` skips near dedup: call `store.near_duplicate(ns, text, embedding:)` first if you need it. Its reads are at the transaction's snapshot, so two `remember_in` of the same text in one transaction both write.
+  - `forget_in` returns `:deleted`, `:protected`, `:not_due` or `:gone`, and none of these is an error.
+- **Recall.**
+  - `store.recall(namespaces, text:, embedding:, k:, byte_budget:, weights: Weights.new(...), fusion: :rrf, include_superseded:, session:, snapshot:, with_signals:)` returns `RecallHit`s, best first, at one snapshot.
+  - `recall_with_stats` returns `[hits, RecallStats]`. Its `truncated` says the budget cut the hits.
+  - `expand: Expand.new(1)` also follows the best candidates' links both ways and gives the memories it reaches a `graph` signal (`Weights.new(graph:)`, 0.5 by default). `RecallStats#expanded` counts them.
+- **IVF for large namespaces** (D311 T8). `Store.create(..., ivf: IvfOptions.new(min_namespace_len: 10_000))` keeps a vector index of the store's embeddings, and it needs `embedding:`. A namespace with at least `min_namespace_len` memories with an embedding recalls through it, and a smaller one by the exact scan. `recall(exact: true)` forces the exact scan, and `nprobe:` sets how many lists the index probes. `RecallStats#ivf_namespaces` and `#ivf_fallbacks` say which path ran. `store.ivf` reads the options back.
+- **Forgetting.** With a policy (`forget: ForgetPolicy.new(...)`, or `store.forget_policy = ...`), a thread of the crate's own forgets in the background. `store.forget(policy:, after:)` runs one pass now.
+- **Consolidation.** `store.consolidate(ns, policy: ConsolidatePolicy.new(...)) { |group| ... }` runs a pass. The block gets each group of episodic memories (an Array of `StoredMemory`) and returns an Array of `Memory` to keep in their place. An empty Array keeps the group, marked consolidated.
+  - **The pass runs on a thread of its own, and the block on yours,** outside every transaction and with no lock held. So the block may call the store (`recall` for context) and take its time, for example calling a model.
+  - **A group that changes before its commit is skipped,** not retried: `skipped` counts it, and the next pass finds it again.
+  - **A `StandardError` from the block,** or a return that isn't an Array of `Memory`, stops the pass with `ConsolidateError` (a `MergeFailed`). Its `consolidated` is the pass so far, and its `cause` is the exception.
+  - **Anything else stops the pass too, then takes effect as it is:** `break`, `throw` or `return` out of the block, another exception (`Interrupt`, `SystemExit`), or an interrupt (`Thread#raise`, `Timeout`, Ctrl-C). This differs from Python, where every exception becomes `ConsolidateError`: here it's whatever `rescue => e` would catch.
+  - **However the pass stops,** its thread has ended, the groups committed before stay committed, and running the pass again is safe.
+- **Closing.** Close a store when you're done with it (`store.close`, or a block form). Its forgetter thread stops once every handle to the store is closed. `db.close` closes the stores opened on it first. After either, store calls raise `Closed`, and a call already running ends with `Closed`.
+
+```ruby
+mem = Pigeonhole::Memory
+Pigeonhole.open(path, create: true) do |db|
+  mem::Store.create(db, "agents", embedding: mem::EmbeddingModel.new("toy", 3, :f32)) do |store|
+    old = store.remember("user:dana", "Dana uses vim", embedding: [1.0, 0, 0]).id
+    new = store.remember("user:dana", "Dana switched to helix", embedding: [0.9, 0.1, 0])
+    store.supersede(old, new.id)
+    hit = store.recall("user:dana", text: "Dana editor helix", k: 1).first
+    raise "recall" unless hit.id == new.id
+
+    store.mark_used([hit.id])
+    ["Dana opened the design doc", "Dana commented on the design doc"].each do |note|
+      store.remember("user:dana", note, embedding: [0, 1.0, 0], session: "mon")
+    end
+    passed = store.consolidate("user:dana", policy: mem::ConsolidatePolicy.new(min_age: 0)) do |group|
+      [mem::Memory.new("Monday: #{group.map(&:text).join('; ')}", embedding: [0, 1.0, 0], kind: :semantic)]
+    end
+    raise "consolidate" unless passed.committed == 1
+  end
+end
+```
+
+## Full-text search
+`Pigeonhole::Text` binds the [`pigeonhole-text`](text-search.md) index: BM25 ranking over one cell of a table's rows, with phrases, fuzzy terms and highlights ([ICR 0105](../design/icr/0105-text-index.md)). Every call releases the GVL.
+
+- **Creating.** `Text::Index.create(db, name, table:, family:, qualifier:)` indexes the cell `family`/`qualifier` of `table`'s rows, including the rows already there. Its options are fixed at create:
+  - `positions:` keeps word positions, which phrases need;
+  - `normalization:` is `:nfc` (the default), `:nfkc` or `:none`;
+  - `k1:` and `b:` tune BM25;
+  - `stop_words:`, `max_terms:` and `max_term_bytes:` bound what's indexed.
+
+  `Text::Index.open(db, name)` opens the index again, and `open_reader(reader, name)` opens a `ReadIndex` in a reader process.
+- **Writing.** `index.put(id, text)` writes the source cell and indexes it, in one transaction. `put_in(txn, id, text)` does the same inside your own transaction, beside your other writes. `delete` and `delete_in` remove a document.
+- **Searching.** `index.search(query, k)` returns `Hit`s, best first. The query is a String in the query syntax (`"march meeting"~2 postgres~`), parsed when the search runs. Or build it as `Text::Query.new.term("postgres").phrase(%w[march meeting], slop: 2).fuzzy("postgress", :auto)`, and use `Text::Query.parse(str)` to check a string first.
+  - `id_prefix:` keeps only document ids that start with it, and `snapshot:` searches at a snapshot.
+  - `highlight: true` fills each hit's `text` and `matches`.
+  - `search_with_stats` also says how each fuzzy term expanded.
+- **Highlights are byte ranges.** A `Match`'s `range` counts bytes of `hit.text`, as the engine gives it. Take it with `hit.text.byteslice(m.range)`: `hit.text[m.range]` counts characters, and goes wrong after the first non-ASCII one.
+- **Maintenance.** `verify` checks the index against its source (`consistent?`), and `rebuild` and `repair` fix what it finds.
+- **No custom tokenizers.** The engine calls a tokenizer inside its own calls, where a Ruby block can't run, so Ruby indexes use the built-in tokenizer.
+
+```ruby
+Pigeonhole.open(path, create: true) do |db|
+  notes = db.table("notes").family("body").create
+  index = Pigeonhole::Text::Index.create(db, "notes_text", table: notes, family: "body", qualifier: "text")
+  db.transact do |txn|
+    txn.put(notes, "note:1", "body", "author", "ada")
+    index.put_in(txn, "note:1", "We chose Postgres at the café meeting")
+  end
+  hit = index.search("café postgres", 1, highlight: true).first
+  raise "search" unless hit.id == "note:1"
+  raise "highlight" unless hit.matches.map { |m| hit.text.byteslice(m.range) }.include?("café")
+end
+```
+
+## Vector index
+`Pigeonhole::Vector` binds the [`pigeonhole-vector`](vectors.md) index: an IVF index of vectors by id, for nearest-neighbour search over many vectors ([ICR 0100](../design/icr/0100-vector-index.md)). Every call releases the GVL.
+
+- **Creating.** `Vector::Index.create(db, name, VectorSpec.new(dim, element, metric))` creates the index. Its options are `nprobe:`, `target_list_len:`, `reassign_neighbours:` and `rebalance:`. `open(db, name)` opens it again, and `open_reader(reader, name)` opens a `ReadIndex` in a reader process.
+- **Writing.** `index.insert(id, vector)` takes the forms `put_vector` takes for the index's element: an Array of Numerics (`:f32`, and `:f16`/`:bf16`, which the index rounds), an Array of Integers (`:i8`), or the packed bits as a String (`:bit`). `delete(id)` removes one.
+- **Bulk loads.** `index.bulk_load(pairs, expected:)` loads an Enumerable of `[id, vector]` into an empty index, faster than inserting one by one. The pairs go to the index `batch:` at a time (4,096 by default), so a lazy enumerator is never held whole. If enumerating raises, the batches sent before it stay loaded.
+- **In your own transaction.** `insert_in(txn, placed, id, vector)` and `delete_in(txn, placed, id)` write the index inside a `Pigeonhole::Transaction`, so the vector commits or rolls back with your other writes.
+  - `placed` is a `Vector::Placed`, the transaction's record of its index writes, so a second write of one id acts on the first.
+  - **Make it inside the transaction's block,** so a retried attempt starts with a fresh one, and use one per index.
+  - Once the transaction commits, `index.after_commit(placed)` splits or merges what the writes left out of bounds.
+- **Searching.** `index.search(query, k)` returns `Hit(id, distance)`s, nearest first.
+  - `nprobe:` sets how many lists to probe, `parallel:` how many threads read them, and `snapshot:` searches at a snapshot.
+  - `id_prefix:` keeps only ids that start with it. The search widens until it finds `k`, probing at most `max_probe:` lists.
+  - `search_with_stats` adds `lists_probed`. A prefixed search with fewer than `k` hits and `lists_probed < lists` stopped at `max_probe`.
+- **Rebalancing.** With `rebalance: :inline`, the default, a write splits or merges a list before it returns. With `rebalance: :background`, a thread of the crate's own does it. Add `rebalancer: true` to `create` or `open`, and you get `[index, rebalancer]` back, to drive from a Ruby thread instead: `rebalancer.run_once(budget)` works for up to `budget` seconds, and `rebalancer.wait(timeout)` waits for work. Both release the GVL and stay interruptible.
+
+```ruby
+Pigeonhole.open(path, create: true) do |db|
+  index = Pigeonhole::Vector::Index.create(db, "docs_vec", Pigeonhole::VectorSpec.new(2, :f32, :l2))
+  index.bulk_load((0...100).lazy.map { |i| ["doc:#{i}", [i.to_f, 0.0]] }, expected: 100)
+  docs = db.table("docs").family("f").create
+  placed = db.transact do |txn|
+    p = Pigeonhole::Vector::Placed.new
+    txn.put(docs, "doc:new", "f", "", "a new document")
+    index.insert_in(txn, p, "doc:new", [41.6, 0.0])
+    p
+  end
+  index.after_commit(placed)
+  raise "search" unless index.search([41.5, 0.0], 2).map(&:id).sort == ["doc:41", "doc:new"]
 end
 ```
 

@@ -218,27 +218,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p pigeonhole-bench --features "${{ env.BENCH_FEATURES }}"
 
+  # MSRV and the loom models. Miri has a job of its own beside it: it was 16-26 minutes of
+  # this job's 27, and #1416's run hit the old 30-minute limit in the loom steps behind it.
   analysis:
-    name: analysis (MSRV, Miri, loom)
+    name: analysis (MSRV, loom)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.96
-      - uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: miri
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: MSRV 1.96
         run: |
           cargo +1.96 check --workspace --exclude pigeonhole-bench --all-features
           cargo +1.96 check -p pigeonhole-bench --all-targets --features "$BENCH_FEATURES"
-      - name: Miri (crates with unsafe)
-        run: cargo +nightly miri test -p pigeonhole-io -p pigeonhole-memtable
-        env:
-          PROPTEST_CASES: 8
-          MIRIFLAGS: -Zmiri-disable-isolation
       - name: loom
         run: cargo test --release -p pigeonhole-memtable -p pigeonhole-cache -p pigeonhole-runtime --lib loom
         env:
@@ -258,3 +252,21 @@ jobs:
         env:
           RUSTFLAGS: --cfg io_loom
           CARGO_TARGET_DIR: target/loom-io
+
+  # Miri over the crates with unsafe code, alone: 16-26 minutes on ubuntu-latest (2026-11-03),
+  # so its limit leaves room for a slow runner.
+  miri:
+    name: Miri (io, memtable)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: Miri (crates with unsafe)
+        run: cargo +nightly miri test -p pigeonhole-io -p pigeonhole-memtable
+        env:
+          PROPTEST_CASES: 8
+          MIRIFLAGS: -Zmiri-disable-isolation
