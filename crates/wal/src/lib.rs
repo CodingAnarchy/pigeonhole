@@ -193,7 +193,9 @@ pub struct WalOptions {
     /// system call. Segment headers are always written with `pwrite` (FORMAT §10.1 rule 1).
     /// A stream maps only until its first `GroupSync` or `Sync` record, and writes with
     /// `pwrite` from then on ([`WalCounters::mapped_stops`]): a sync per group over mapped
-    /// pages costs a write fault per group.
+    /// pages costs a write fault per group. Each mapped segment is faulted in writable in the
+    /// background (`MADV_POPULATE_WRITE`, Linux 5.14), by one `pigeonhole-io` helper thread
+    /// per process that starts with the first mapped segment.
     pub mapped_writes: bool,
 }
 

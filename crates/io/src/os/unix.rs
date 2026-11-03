@@ -337,6 +337,35 @@ pub(crate) fn map_range(file: &fs::File, offset: u64, len: usize) -> Result<Opti
     Ok(Some(Mapping { ptr, len }))
 }
 
+/// Faults `len` bytes at `at` within `mapping` in writable (`MADV_POPULATE_WRITE`, Linux
+/// 5.14), so later stores there take no fault (D312, owner call 3). The contents don't change.
+/// `Err(true)` when the kernel doesn't know the advice (the caller stops populating for
+/// good); `Err(false)` for another failure.
+#[cfg(target_os = "linux")]
+pub(crate) fn populate_write(
+    mapping: &Mapping,
+    at: usize,
+    len: usize,
+) -> std::result::Result<(), bool> {
+    if at.checked_add(len).is_none_or(|end| end > mapping.len) {
+        return Err(false);
+    }
+    // SAFETY: `[at, at + len)` lies inside `mapping`, which is live while borrowed. The advice
+    // only installs page-table entries for the range: no byte of it is read or written, so it
+    // can run while the stream's thread stores into the same pages.
+    let r = unsafe {
+        libc::madvise(
+            mapping.ptr.as_ptr().add(at).cast(),
+            len,
+            libc::MADV_POPULATE_WRITE,
+        )
+    };
+    if r == 0 {
+        return Ok(());
+    }
+    Err(std::io::Error::last_os_error().raw_os_error() == Some(libc::EINVAL))
+}
+
 /// Creates or opens `path` for a file-backed region and sizes it on creation.
 pub(crate) fn open_region_file(path: &Path, len: u64, mode: SharedOpen) -> Result<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;

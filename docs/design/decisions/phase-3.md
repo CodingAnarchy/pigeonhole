@@ -4206,3 +4206,16 @@ The owner picked option 1: **a stream maps only until its first durable record, 
 - **Tests:** `a_mapped_stream_stops_mapping_at_its_first_durable_record` (WAL `stream.rs`). The mapped crash sweep now runs its first half Buffered only, so every crash point meets mapped stores, the switch and the `pwrite`s after it. A mutation that never switches fails the sweep.
 - **What the env-var suites now cover:** with `PIGEONHOLE_WAL_MAPPED=1`, the engine suites' streams stop mapping at their first durable commit, so the mapped path there runs mostly in `Buffered`/`None` tests. The WAL crash sweep is the one that covers it under faults.
 - **Still before the default decision:** a box re-run of sparse-wide and ycsb-e at Buffered ×3 (is the put p99.9 tail first-touch faults on a fresh segment?), Default parity rows, the five sweeps and the crash suites on the new head, and perf287's review.
+
+**Re-run after owner call 2, and owner call 3 (2026-11-03).**
+- **Default parity holds:** every stream stops mapping at its first durable record, and Default rows ran at 0.98–1.07× (#1369's results comment).
+- **Buffered still costs tail:** ycsb-e gained 6–8% throughput in every rep, but put p99.9 was 1.4–1.7× with 55% more page faults. sparse-wide was mixed.
+
+The owner picked pre-faulting.
+- **Where:** the owner's call said "the spare". But a rollover usually takes a *recycled* slot, which no spare preparation touches. So the pre-fault is done on every segment's own mapping instead. Creating a `FileWriteMap` hands it to a populate helper in `pigeonhole-io`, which runs `MADV_POPULATE_WRITE` over it in 2 MiB steps, off the stream's thread. The writer starts at offset 0 while the helper runs ahead, and a 64 MiB segment populates in milliseconds, so nearly every store finds its page already faulted writable.
+- **The helper:** one thread per process, started by the first mapped segment, Linux only. It isn't the I/O backend's pool, because the io_uring backend's files have none.
+  - It holds the mapping while it works, so a rollover can't unmap it underneath. It stops early once the stream has dropped the mapping.
+  - On a kernel without the advice (before 5.14) it stops for good: the no-op fallback.
+  - It only installs page-table entries and never reads or writes a byte, so it runs safely beside the stream's stores.
+  - With mapped writes off (the default), it never starts. With them on, it's the one thread the option adds, which an application-owned database (D284) accepts when it turns the prototype on.
+- **Risk the box run measures:** populating marks the pages dirty. A page cleaned by writeback before the writer reaches it is written once more, which matters for a slow writer on a recycled slot. The re-run records the device's written bytes per run alongside the faults.
