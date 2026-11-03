@@ -225,6 +225,11 @@
 # knn-exact's vectors, not only the widening kernels (perf287 on #1304): bf16 widens with a
 # shift and lands below knn-exact; f16's branch-free widening costs more than the read saves.
 #
+# New shape for #1320 (#1302; D308's byte-budgeted nearest search, D193: every shape has a
+# ceiling), the head's count (run 41501153418, 2c6f21a8) times (1 + 0.3%): knn-budget 1694,
+# equal to knn-exact's: the budget bounds the result, not the read, and the cut over 10
+# neighbours is lost in 4,000 scored vectors.
+#
 # Lowered for #1307 (#1273, fixed hash seeds; D195 ceilings commit): get-mem 5710 -> 5699,
 # headroom 0.1% (perf287, 2026-11-02). With the seeds fixed, #1246's seed-dependent mode (up
 # to 5709) can't recur, so the one-off 5710 no longer has anything to cover. The head reads
@@ -242,6 +247,12 @@
 # the shapes the change moves. commit-at and ycsb-a are among the shapes the #1305 note above
 # keeps, but today's base runs of one main varied by less than their headroom: commit-at
 # 9869-9876 (0.07% against 0.3%) and ycsb-a 25741-25796 (0.21% against 1.0%).
+#
+# Lowered by #1315 (#1206 lever 1 step 3, the memtable insert's splice) from its head a72c3e3e's
+# counts, merged onto main (instructions run 41519592361), with `instruction-ceilings.py lower`:
+# commit-one 8834 -> 8806, commit-sixteen 38937 -> 38504, commit-overwrite 10829 -> 10818,
+# commit-at 9787 -> 9769, commit-async 8956 -> 8928. ycsb-a is left: its lowering would be 7
+# instructions, inside its run-to-run spread.
 as-written 2028 0.3
 flushed 1842 0.3
 compacted 1240 0.3
@@ -256,18 +267,18 @@ counter 9388 0.5
 rows 19655 0.3
 level-scans 14015 0.6
 short-scans 13564 0.3
-commit-one 8834 0.3
-commit-sixteen 38937 0.3
+commit-one 8806 0.3
+commit-sixteen 38504 0.3
 flush 2199 0.3
 compact 2783 0.5
 ycsb-c 43293 1.0
 ycsb-a 25940 1.0
-commit-overwrite 10829 0.5
-commit-at 9787 0.3
+commit-overwrite 10818 0.5
+commit-at 9769 0.3
 scan-narrow 1398 0.3
 scan-small 1374 0.3
 scan-wide 1296 0.3
-commit-async 8956 0.3
+commit-async 8928 0.3
 scan-narrow-q1 5277 0.3
 scan-wide-q10 1784 0.3
 scan-wide-q1 14326 0.3
@@ -282,3 +293,4 @@ scan-budget 3342 0.3
 scan-budget-twin 1374 0.3
 knn-exact-f16 2512 0.3
 knn-exact-bf16 1693 0.3
+knn-budget 1700 0.3

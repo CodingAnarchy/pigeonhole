@@ -4,9 +4,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use pigeonhole::{
-    Aggregation, Element, Family, Metric, Pigeonhole, RetryPolicy, Table, Transaction, VectorSpec,
+    Aggregation, Element, Family, Metric, Pigeonhole, PigeonholeReader, ReadTable, RetryPolicy,
+    Table, Transaction, VectorSpec,
 };
-use pigeonhole_text::{Index, IndexOptions};
+use pigeonhole_text::{Index, IndexOptions, ReadIndex};
+
+use crate::dedup::{DedupPolicy, Near, NearDedup};
+use crate::forget::{ForgetPolicy, Forgetter, Signal, UserToken};
+use crate::recall::{Idx, Recall, Rows, Snap};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use crate::error::{Error, Result, corrupt};
 use crate::layout::*;
@@ -55,16 +62,19 @@ impl EmbeddingModel {
         self.element
     }
 
-    fn spec(&self) -> VectorSpec {
+    pub(crate) fn spec(&self) -> VectorSpec {
         VectorSpec::new(self.dim, self.element, Metric::Cosine).expect("checked at new")
     }
 }
 
-/// A store's options, fixed at create.
+/// A store's options, fixed at create (the forget policy can change later:
+/// [`Store::set_forget_policy`]).
 #[derive(Debug, Clone, Default)]
 #[non_exhaustive]
 pub struct StoreOptions {
     embedding: Option<EmbeddingModel>,
+    forget: Option<ForgetPolicy>,
+    near_dedup: Option<NearDedup>,
 }
 
 impl StoreOptions {
@@ -76,6 +86,67 @@ impl StoreOptions {
     /// Pins the store to `model`: its memories carry embeddings of that model.
     pub fn embedding(mut self, model: EmbeddingModel) -> Self {
         self.embedding = Some(model);
+        self
+    }
+
+    /// The store's forget policy (T2): the [`Forgetter`] runs it, and
+    /// [`Store::forget`] uses it by default. It replaces any policy set before, including an
+    /// [`episodic_ttl`](Self::episodic_ttl): call that after this to add one.
+    pub fn forget(mut self, policy: ForgetPolicy) -> Self {
+        self.forget = Some(policy);
+        self
+    }
+
+    /// Near-duplicate dedup (T3): see [`NearDedup`]. Needs an
+    /// [`embedding`](Self::embedding) model. It can change later
+    /// ([`Store::set_near_dedup`]).
+    pub fn near_dedup(mut self, n: NearDedup) -> Self {
+        self.near_dedup = Some(n);
+        self
+    }
+
+    /// Shorthand: episodic memories are forgotten `age` after their creation, as
+    /// [`ForgetPolicy::max_age`] with [`Kind::Episodic`]. After [`forget`](Self::forget), it
+    /// adds the age to that policy; before it, `forget` replaces it.
+    pub fn episodic_ttl(mut self, age: std::time::Duration) -> Self {
+        let p = self.forget.take().unwrap_or_default();
+        self.forget = Some(p.max_age(Kind::Episodic, age));
+        self
+    }
+}
+
+/// How to open a store ([`Store::open_with`], [`Store::create_with`]).
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
+pub struct OpenOptions {
+    model: Option<String>,
+    without_embeddings: bool,
+    own_forgetter: bool,
+}
+
+impl OpenOptions {
+    /// The defaults: name the model with [`model`](Self::model), or open
+    /// [`without_embeddings`](Self::without_embeddings).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The embedding model the caller embeds with, as [`Store::open`] checks it.
+    pub fn model(mut self, id: impl Into<String>) -> Self {
+        self.model = Some(id.into());
+        self
+    }
+
+    /// No embedding model, as [`Store::open_without_embeddings`] opens.
+    pub fn without_embeddings(mut self) -> Self {
+        self.without_embeddings = true;
+        self
+    }
+
+    /// No thread of the crate's own: the application takes the store's [`Forgetter`] with
+    /// [`Store::take_forgetter`] and runs it itself (an application-owned database, D284).
+    pub fn own_forgetter(mut self) -> Self {
+        self.own_forgetter = true;
         self
     }
 }
@@ -94,7 +165,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    fn code(self) -> u8 {
+    pub(crate) fn code(self) -> u8 {
         match self {
             Kind::Episodic => 0,
             Kind::Semantic => 1,
@@ -102,7 +173,7 @@ impl Kind {
         }
     }
 
-    fn from_code(c: u8) -> Result<Self> {
+    pub(crate) fn from_code(c: u8) -> Result<Self> {
         Ok(match c {
             0 => Kind::Episodic,
             1 => Kind::Semantic,
@@ -185,12 +256,12 @@ pub struct Marked {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Memory {
-    text: String,
-    embedding: Option<Vec<f32>>,
-    kind: Kind,
+    pub(crate) text: String,
+    pub(crate) embedding: Option<Vec<f32>>,
+    pub(crate) kind: Kind,
     importance: f64,
     source: Option<String>,
-    session: Option<String>,
+    pub(crate) session: Option<String>,
     links: Vec<(MemoryId, LinkType, f32)>,
     pinned: bool,
 }
@@ -262,16 +333,22 @@ impl Memory {
 pub enum Remembered {
     /// A new memory.
     New(MemoryId),
-    /// The text was already remembered (exact dedup): merged into that memory, which kept
-    /// the larger importance, gained the source, and counted a use.
+    /// The text was already remembered (exact dedup), or a near duplicate was under
+    /// [`DedupPolicy::Merge`]: merged into that memory, which kept the larger importance,
+    /// gained the source, and counted a use.
     Merged(MemoryId),
+    /// A near duplicate under [`DedupPolicy::Skip`] (T3): nothing was written, and this is
+    /// the memory it's near.
+    Similar(MemoryId),
 }
 
 impl Remembered {
-    /// The memory written or merged into.
+    /// The memory written, merged into, or, for [`Similar`](Remembered::Similar), the near
+    /// duplicate that stopped the write: a memory this call didn't write. Code that links or
+    /// pins the returned id acts on the match once a store turns on [`DedupPolicy::Skip`].
     pub fn id(&self) -> &MemoryId {
         match self {
-            Remembered::New(id) | Remembered::Merged(id) => id,
+            Remembered::New(id) | Remembered::Merged(id) | Remembered::Similar(id) => id,
         }
     }
 }
@@ -296,6 +373,8 @@ pub struct StoredMemory {
     pub session: Option<String>,
     /// Whether it's pinned.
     pub pinned: bool,
+    /// Whether a consolidation took it in ([`Store::consolidate`], T3).
+    pub consolidated: bool,
     /// The memory that superseded it, if one did.
     pub superseded_by: Option<MemoryId>,
     /// Its sources, each with its first-seen time (µs).
@@ -340,7 +419,11 @@ impl StoreStats {
     }
 }
 
-/// A memory store, in the writer process: one table plus its text index (D311 §2).
+/// A memory store, in the writer process: one table plus its text index (D311 §2). Clone it
+/// to share it: clones are cheap and share everything (the database handle, the pinned model,
+/// the persisted forget policy and the one [`Forgetter`], which stops when the last clone
+/// drops); nothing is cached per clone, so a write through one is seen by all.
+#[derive(Clone)]
 pub struct Store {
     db: Pigeonhole,
     table: Table,
@@ -350,6 +433,19 @@ pub struct Store {
     /// Whether this handle was opened with the store's model (always so for a store
     /// without one).
     embeds: bool,
+    /// The application's handles: `None` for the forgetter's own, which mustn't keep it alive.
+    user: Option<Arc<UserToken>>,
+    shared: Arc<Shared>,
+}
+
+/// What a store's handles share: the forgetter's signal, and its forgetter while nobody runs
+/// it.
+struct Shared {
+    signal: Arc<Signal>,
+    forgetter: Mutex<Option<Forgetter>>,
+    /// Whether a forgetter runs (the crate's thread) or was handed out.
+    started: AtomicBool,
+    own: bool,
 }
 
 impl std::fmt::Debug for Store {
@@ -373,8 +469,35 @@ fn index_name(name: &str) -> String {
 impl Store {
     /// Creates the store `name`: the table `mem_{name}` and its text index
     /// `mem_{name}_text`, the index without positions (recall queries are rarely phrases;
-    /// owner, 2026-11-02). `TableExists` if the table is there.
+    /// owner, 2026-11-02), and opens it with its own model (as [`open`](Self::open) would).
+    /// With a forget policy, the crate's [`Forgetter`] thread starts. `TableExists` if the
+    /// table is there.
     pub fn create(db: &Pigeonhole, name: &str, options: StoreOptions) -> Result<Store> {
+        let open = match &options.embedding {
+            Some(m) => OpenOptions::new().model(m.id.clone()),
+            None => OpenOptions::new().without_embeddings(),
+        };
+        Self::create_with(db, name, options, open)
+    }
+
+    /// [`create`](Self::create), opened as `open` says ([`open_with`](Self::open_with)).
+    pub fn create_with(
+        db: &Pigeonhole,
+        name: &str,
+        store: StoreOptions,
+        open: OpenOptions,
+    ) -> Result<Store> {
+        if let Some(p) = &store.forget {
+            p.check()?;
+        }
+        if let Some(n) = &store.near_dedup {
+            n.check()?;
+            if store.embedding.is_none() {
+                return Err(Error::InvalidArgument(
+                    "near dedup compares embeddings, and the store has no model".into(),
+                ));
+            }
+        }
         let mut b = db
             .table(&table_name(name))?
             .family(CONTENT, Family::default())
@@ -384,7 +507,7 @@ impl Store {
             .family(PEAK, Family::aggregate(Aggregation::Max))
             .family(LINKS, Family::default())
             .family(BACKLINKS, Family::default());
-        if let Some(m) = &options.embedding {
+        if let Some(m) = &store.embedding {
             b = b.family(EMB, Family::vector(m.spec()));
         }
         let table = b.create()?;
@@ -392,49 +515,34 @@ impl Store {
             .mutate(GLOBAL)
             .put_u64(META, LAYOUT, LAYOUT_VERSION)
             .put(META, TEXT_INDEX, index_name(name).as_bytes());
-        if let Some(m) = &options.embedding {
+        if let Some(m) = &store.embedding {
             g = g
                 .put(META, MODEL_ID, m.id.as_bytes())
                 .put_u64(META, MODEL_DIM, u64::from(m.dim))
                 .put(META, MODEL_ELEMENT, &[element_code(m.element)]);
         }
+        if let Some(p) = &store.forget {
+            g = g.put(META, FORGET, &p.encode());
+        }
+        if let Some(n) = &store.near_dedup {
+            g = g.put(META, NEAR_DEDUP, &n.encode());
+        }
         g.commit()?;
-        let index = Index::create(
+        Index::create(
             db,
             &index_name(name),
             pigeonhole_text::Source::new(&table, CONTENT, TEXT),
             IndexOptions::new().positions(false),
         )?;
-        Ok(Store {
-            db: db.clone(),
-            table,
-            index,
-            model: options.embedding,
-            embeds: true,
-        })
+        Self::open_with(db, name, open)
     }
 
     /// Opens the store `name` for a caller embedding with `model_id`, compared byte for
     /// byte with the store's. `Mismatch` if it's another model; `InvalidArgument` if the
     /// store has none (use [`open_without_embeddings`](Self::open_without_embeddings)).
+    /// With a forget policy, the crate's [`Forgetter`] thread starts.
     pub fn open(db: &Pigeonhole, name: &str, model_id: &str) -> Result<Store> {
-        let mut s = Self::open_inner(db, name)?;
-        match &s.model {
-            Some(m) if m.id == model_id => {}
-            Some(m) => {
-                return Err(Error::Mismatch(format!(
-                    "the store {name} is pinned to {:?}, not {model_id:?}",
-                    m.id
-                )));
-            }
-            None => {
-                return Err(Error::InvalidArgument(format!(
-                    "the store {name} has no embedding model: open it with open_without_embeddings"
-                )));
-            }
-        }
-        s.embeds = true;
-        Ok(s)
+        Self::open_with(db, name, OpenOptions::new().model(model_id))
     }
 
     /// Opens the store `name` without an embedding model. On a store pinned to one, the
@@ -442,56 +550,152 @@ impl Store {
     /// (`remember`, `supersede`), so every memory there keeps its embedding; it allows
     /// `delete`, `link` and `mark_used`, and recalls by keyword and recency.
     pub fn open_without_embeddings(db: &Pigeonhole, name: &str) -> Result<Store> {
-        let mut s = Self::open_inner(db, name)?;
-        s.embeds = s.model.is_none();
-        Ok(s)
+        Self::open_with(db, name, OpenOptions::new().without_embeddings())
     }
 
-    fn open_inner(db: &Pigeonhole, name: &str) -> Result<Store> {
+    /// Opens the store `name` as `options` say: with the caller's model
+    /// ([`OpenOptions::model`]) or without one, and with the crate's forgetter thread or the
+    /// application's ([`OpenOptions::own_forgetter`], then
+    /// [`take_forgetter`](Self::take_forgetter)). `InvalidArgument` if `options` name neither
+    /// a model nor `without_embeddings`, or both.
+    pub fn open_with(db: &Pigeonhole, name: &str, options: OpenOptions) -> Result<Store> {
         let table = db.table(&table_name(name))?.open()?;
-        let not_store =
-            || Error::InvalidArgument(format!("{} is not a memory store", table.name()));
-        for f in [CONTENT, META, SOURCES, STATS, PEAK, LINKS, BACKLINKS] {
-            if table.family_info(f).is_none() {
-                return Err(not_store());
+        let model = load(Rows::W(&table))?;
+        let embeds = match (&options.model, options.without_embeddings) {
+            (Some(id), false) => {
+                check_model(&model, name, id)?;
+                true
             }
-        }
-        let g = |q: &[u8]| -> Result<Option<Vec<u8>>> {
-            Ok(table.get(GLOBAL, META, q)?.map(|c| c.value().to_vec()))
-        };
-        let layout = table
-            .get(GLOBAL, META, LAYOUT)?
-            .and_then(|c| c.as_u64())
-            .ok_or_else(not_store)?;
-        if layout != LAYOUT_VERSION {
-            return Err(Error::InvalidArgument(format!(
-                "{} has store layout {layout}, and this build reads {LAYOUT_VERSION}",
-                table.name()
-            )));
-        }
-        let model = match g(MODEL_ID)? {
-            None => None,
-            Some(id) => {
-                let id = String::from_utf8(id).map_err(|_| corrupt("the model id"))?;
-                let dim = table
-                    .get(GLOBAL, META, MODEL_DIM)?
-                    .and_then(|c| c.as_u64())
-                    .ok_or_else(|| corrupt("the model's dimension"))?;
-                let element = g(MODEL_ELEMENT)?
-                    .and_then(|e| e.first().copied())
-                    .and_then(element_from_code)
-                    .ok_or_else(|| corrupt("the model's element"))?;
-                Some(EmbeddingModel::new(id, dim as u32, element)?)
+            (None, true) => model.is_none(),
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "OpenOptions takes a model or without_embeddings, one of the two".into(),
+                ));
             }
         };
         let index = Index::open(db, &index_name(name))?;
-        Ok(Store {
+        let s = Store::assemble(db, table, index, model, embeds, options.own_forgetter);
+        s.start_forgetter_if_due()?;
+        Ok(s)
+    }
+
+    fn assemble(
+        db: &Pigeonhole,
+        table: Table,
+        index: Index,
+        model: Option<EmbeddingModel>,
+        embeds: bool,
+        own: bool,
+    ) -> Store {
+        let signal = Arc::new(Signal::default());
+        Store {
             db: db.clone(),
             table,
             index,
             model,
-            embeds: false,
-        })
+            embeds,
+            user: Some(Arc::new(UserToken(Arc::clone(&signal)))),
+            shared: Arc::new(Shared {
+                signal,
+                forgetter: Mutex::new(None),
+                started: AtomicBool::new(false),
+                own,
+            }),
+        }
+    }
+
+    /// Makes the store's forgetter once: on the crate's thread when the store has a policy
+    /// (unless the application owns it), or kept for [`take_forgetter`](Self::take_forgetter).
+    fn start_forgetter_if_due(&self) -> Result<()> {
+        if self.shared.own {
+            if !self.shared.started.swap(true, Ordering::AcqRel) {
+                *self
+                    .shared
+                    .forgetter
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = Some(self.make_forgetter());
+            }
+            return Ok(());
+        }
+        if self.forget_policy()?.is_none() || self.shared.started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        crate::forget::spawn(self.make_forgetter())
+            .map_err(|e| Error::InvalidArgument(format!("starting the forgetter: {e}")))
+    }
+
+    fn make_forgetter(&self) -> Forgetter {
+        let mut inner = self.clone();
+        inner.user = None;
+        let user = self.user.as_ref().map_or_else(Weak::new, Arc::downgrade);
+        Forgetter::new(inner, user, Arc::clone(&self.shared.signal))
+    }
+
+    /// The store's [`Forgetter`], for an application that runs it itself: opened with
+    /// [`OpenOptions::own_forgetter`]. `None` otherwise, or once taken.
+    pub fn take_forgetter(&self) -> Option<Forgetter> {
+        self.shared
+            .forgetter
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// The store's forget policy, if it has one.
+    pub fn forget_policy(&self) -> Result<Option<ForgetPolicy>> {
+        match self.table.get(GLOBAL, META, FORGET)? {
+            Some(c) => Ok(Some(ForgetPolicy::decode(c.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Sets the store's forget policy (`None` turns forgetting off). The forgetter reads it
+    /// before each pass, so it takes effect at the next pass; setting one wakes this
+    /// process's forgetter, and starts the crate's thread if none runs yet.
+    pub fn set_forget_policy(&self, policy: Option<ForgetPolicy>) -> Result<()> {
+        match &policy {
+            Some(p) => {
+                p.check()?;
+                self.table
+                    .mutate(GLOBAL)
+                    .put(META, FORGET, &p.encode())
+                    .commit()?;
+            }
+            None => {
+                self.table
+                    .mutate(GLOBAL)
+                    .delete_column(META, FORGET)
+                    .commit()?;
+            }
+        }
+        if policy.is_some() {
+            self.start_forgetter_if_due()?;
+            self.shared.signal.notify();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn db(&self) -> &Pigeonhole {
+        &self.db
+    }
+
+    pub(crate) fn table(&self) -> &Table {
+        &self.table
+    }
+
+    /// Recalls memories from `namespaces` (D311 §3): each an exact namespace, as written
+    /// (no prefixes or patterns), fused together into one ranking. At least one is needed:
+    /// an empty list fails `run` with `InvalidArgument`. Set `text`, an `embedding`, or both,
+    /// then [`run`](Recall::run). On a handle opened without the store's model, recall is
+    /// by keyword and recency only.
+    pub fn recall(&self, namespaces: &[&str]) -> Recall<'_> {
+        Recall::new(
+            Rows::W(&self.table),
+            Idx::W(&self.index),
+            self.model.as_ref().filter(|_| self.embeds),
+            Snap::W(&self.db),
+            namespaces,
+        )
     }
 
     /// The model the store is pinned to, if any.
@@ -503,17 +707,30 @@ impl Store {
     /// the text index, the dedup row, and both directions of each link. An exact duplicate
     /// (after trimming and collapsing whitespace) of a live, unsuperseded memory merges into
     /// it instead.
+    ///
+    /// With [near dedup](NearDedup), the nearest live memory is looked up first, outside the
+    /// transaction, and a close enough one is skipped, merged into or linked to.
     pub fn remember(&self, ns: &str, memory: Memory) -> Result<Remembered> {
         self.check_memory(ns, &memory)?;
+        let near = match self.near_dedup()? {
+            Some(setting) => self.near(ns, &memory, setting)?,
+            None => None,
+        };
+        #[cfg(feature = "__unstable-hooks")]
+        if near.is_some() {
+            crate::hooks::hold(crate::hooks::Hold::RememberAfterNear);
+        }
         let now = now_us();
         let rid = new_rid(now)?;
         let (r, _) = self.db.transact(&RetryPolicy::default(), |txn| {
-            self.remember_with(txn, ns, &memory, rid, now)
+            self.remember_with(txn, ns, &memory, rid, now, near.as_ref())
         })?;
         Ok(r)
     }
 
-    /// [`remember`](Self::remember) inside the caller's transaction.
+    /// [`remember`](Self::remember) inside the caller's transaction, with exact dedup but
+    /// no near dedup: that check reads outside a transaction, so it couldn't be part of the
+    /// caller's. Call [`near_duplicate`](Self::near_duplicate) first to do it yourself.
     pub fn remember_in(
         &self,
         txn: &mut Transaction,
@@ -523,10 +740,10 @@ impl Store {
         self.check_memory(ns, &memory)?;
         let now = now_us();
         let rid = new_rid(now)?;
-        self.remember_with(txn, ns, &memory, rid, now)
+        self.remember_with(txn, ns, &memory, rid, now, None)
     }
 
-    fn check_memory(&self, ns: &str, m: &Memory) -> Result<()> {
+    pub(crate) fn check_memory(&self, ns: &str, m: &Memory) -> Result<()> {
         check_namespace(ns)?;
         if self.model.is_some() && !self.embeds {
             return Err(Error::InvalidArgument(
@@ -576,13 +793,14 @@ impl Store {
         Ok(())
     }
 
-    fn remember_with(
+    pub(crate) fn remember_with(
         &self,
         txn: &mut Transaction,
         ns: &str,
         m: &Memory,
         rid: [u8; 16],
         now: u64,
+        near: Option<&Near>,
     ) -> Result<Remembered> {
         let t = &self.table;
         let norm = normalize(&m.text);
@@ -612,10 +830,53 @@ impl Store {
             // Gone, superseded, or a hash collision: insert as new below. A collision
             // leaves the dedup row alone (it names a live memory of other text).
             if text.is_some() && !same {
-                return self.insert(txn, ns, m, rid, now, importance, None);
+                return self.insert_near(txn, ns, m, rid, now, importance, None, near);
             }
         }
-        self.insert(txn, ns, m, rid, now, importance, dedup.as_deref())
+        self.insert_near(txn, ns, m, rid, now, importance, dedup.as_deref(), near)
+    }
+
+    /// A new memory, unless a near duplicate's policy says otherwise (T3).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_near(
+        &self,
+        txn: &mut Transaction,
+        ns: &str,
+        m: &Memory,
+        rid: [u8; 16],
+        now: u64,
+        importance: i64,
+        dedup: Option<&[u8]>,
+        near: Option<&Near>,
+    ) -> Result<Remembered> {
+        let t = &self.table;
+        let Some(n) = near else {
+            return self.insert(txn, ns, m, rid, now, importance, dedup);
+        };
+        let id = || MemoryId::from_row(&n.row).ok_or_else(|| corrupt("a near match's row"));
+        // The match read here, for every policy (M1's rule for a near match; simp724's F1 on
+        // #1386 for Skip): gone or superseded since the check, it's ignored, and the memory
+        // is written as new.
+        let live = txn.get(t, &n.row, CONTENT, TEXT)?.is_some()
+            && txn.get(t, &n.row, META, SUPERSEDED_BY)?.is_none();
+        match n.policy {
+            DedupPolicy::Skip if live => Ok(Remembered::Similar(id()?)),
+            DedupPolicy::Merge if live => {
+                txn.aggregate(t, &n.row, PEAK, IMPORTANCE, importance)
+                    .incr(t, &n.row, STATS, USES, 1);
+                if let Some(src) = &m.source {
+                    self.add_source(txn, &n.row, src, now)?;
+                }
+                Ok(Remembered::Merged(id()?))
+            }
+            DedupPolicy::Link if live => {
+                let r = self.insert(txn, ns, m, rid, now, importance, dedup)?;
+                let w = n.similarity.clamp(0.0, 1.0);
+                write_link(txn, t, &r.id().row(), &n.row, LinkType::SIMILAR_TO, w);
+                Ok(r)
+            }
+            _ => self.insert(txn, ns, m, rid, now, importance, dedup),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -663,7 +924,13 @@ impl Store {
     }
 
     /// A source column, if the memory doesn't have it yet (its first-seen time stays).
-    fn add_source(&self, txn: &mut Transaction, row: &[u8], src: &str, now: u64) -> Result<()> {
+    pub(crate) fn add_source(
+        &self,
+        txn: &mut Transaction,
+        row: &[u8],
+        src: &str,
+        now: u64,
+    ) -> Result<()> {
         let t = &self.table;
         if txn.get(t, row, SOURCES, src.as_bytes())?.is_none() {
             txn.put_u64(t, row, SOURCES, src.as_bytes(), now);
@@ -814,9 +1081,7 @@ impl Store {
                     "{old} is already superseded by {cur}: supersede that one instead"
                 )));
             }
-            txn.put(t, &old.row(), META, SUPERSEDED_BY, &new.row())
-                .put_u64(t, &old.row(), META, VALID_TO, now);
-            write_link(txn, t, &new.row(), &old.row(), LinkType::SUPERSEDES, 1.0);
+            supersede_in(txn, t, &old.row(), &new.row(), now);
             Ok(())
         })?;
         Ok(())
@@ -853,101 +1118,256 @@ impl Store {
     /// every memory row has content, every dedup row names a live memory with that text,
     /// every link has its backlink with both ends live, and the text index agrees.
     pub fn verify(&self) -> Result<StoreStats> {
-        let t = &self.table;
         let s = self.db.snapshot()?;
-        let mut st = StoreStats::default();
-        // key → normalised text, for live memories.
-        let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
-        let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-        let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
-        let mut dedups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut superseded_by: Vec<Vec<u8>> = Vec::new();
-        for row in t.scan_prefix(b"").snapshot(&s).iter()? {
-            let row = row?;
-            let key = row.key().to_vec();
-            if key == GLOBAL {
-                continue;
-            }
-            if MemoryId::from_row(&key).is_some() {
-                st.memories += 1;
-                let mut has_text = false;
-                let mut has_emb = false;
-                for e in row.view().iter() {
-                    match e.family {
-                        CONTENT if e.qualifier == TEXT => {
-                            has_text = true;
-                            let text = std::str::from_utf8(e.cell.value())
-                                .map_err(|_| corrupt("a memory's text"))?;
-                            texts.insert(key.clone(), normalize(text));
-                        }
-                        EMB => has_emb = true,
-                        META if e.qualifier == SUPERSEDED_BY => {
-                            superseded_by.push(e.cell.value().to_vec());
-                        }
-                        LINKS => {
-                            links.insert((
-                                key.clone(),
-                                e.qualifier.to_vec(),
-                                e.cell.value().to_vec(),
-                            ));
-                        }
-                        BACKLINKS => {
-                            backlinks.insert((
-                                e.qualifier.to_vec(),
-                                key.clone(),
-                                e.cell.value().to_vec(),
-                            ));
-                        }
-                        _ => {}
-                    }
-                }
-                if !has_text {
-                    st.no_content += 1;
-                }
-                if self.model.is_some() && !has_emb {
-                    st.missing_embeddings += 1;
-                }
-            } else if let Some(c) = row.view().get(META, RID) {
-                dedups.push((key, c.value().to_vec()));
-            } else {
-                return Err(corrupt("a row that is neither a memory nor a dedup row"));
-            }
-        }
-        for (key, target) in &dedups {
-            let ok = texts.get(target).is_some_and(|norm| {
-                let ns_len = key.windows(2).position(|w| w == DEDUP_TAG);
-                ns_len.is_some_and(|at| {
-                    dedup_row(
-                        std::str::from_utf8(&key[..at]).unwrap_or(""),
-                        &content_hash(norm),
-                    ) == *key
-                })
-            });
-            if !ok {
-                st.stale_dedup += 1;
-            }
-        }
-        // Each link (from, to, value) must have the backlink (from, to, value), and the
-        // reverse; both ends live.
-        for l in links.symmetric_difference(&backlinks) {
-            let _ = l;
-            st.broken_links += 1;
-        }
-        for (from, to, _) in &links {
-            if !texts.contains_key(from) || !texts.contains_key(to) {
-                st.broken_links += 1;
-            }
-        }
-        st.dangling_superseded = superseded_by
-            .iter()
-            .filter(|s| !texts.contains_key(*s))
-            .count() as u64;
-        st.text_index_inconsistent = !self.index.verify()?.is_consistent();
-        Ok(st)
+        let text_ok = self.index.verify()?.is_consistent();
+        verify(Rows::W(&self.table), &s, self.model.as_ref(), text_ok)
     }
 }
 
-fn write_link(txn: &mut Transaction, t: &Table, from: &[u8], to: &[u8], ty: LinkType, w: f32) {
+/// A memory store opened from a reader process (D311 §5): recall, `get` and `verify` at
+/// the reader's snapshots, and no writes.
+pub struct ReadStore {
+    reader: PigeonholeReader,
+    table: ReadTable,
+    index: ReadIndex,
+    model: Option<EmbeddingModel>,
+    embeds: bool,
+}
+
+impl std::fmt::Debug for ReadStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadStore")
+            .field("table", &self.table.name())
+            .field("model", &self.model)
+            .field("embeds", &self.embeds)
+            .finish()
+    }
+}
+
+impl Store {
+    /// Opens the store `name` from a reader process, for a caller embedding with
+    /// `model_id` (as [`open`](Store::open) checks it).
+    pub fn open_reader(reader: &PigeonholeReader, name: &str, model_id: &str) -> Result<ReadStore> {
+        let mut s = Self::open_reader_inner(reader, name)?;
+        check_model(&s.model, name, model_id)?;
+        s.embeds = true;
+        Ok(s)
+    }
+
+    /// Opens the store `name` from a reader process without an embedding model: recall is
+    /// by keyword and recency.
+    pub fn open_reader_without_embeddings(
+        reader: &PigeonholeReader,
+        name: &str,
+    ) -> Result<ReadStore> {
+        let mut s = Self::open_reader_inner(reader, name)?;
+        s.embeds = s.model.is_none();
+        Ok(s)
+    }
+
+    fn open_reader_inner(reader: &PigeonholeReader, name: &str) -> Result<ReadStore> {
+        let table = reader.table(&table_name(name))?;
+        let model = load(Rows::R(&table))?;
+        let index = Index::open_reader(reader, &index_name(name))?;
+        Ok(ReadStore {
+            reader: reader.clone(),
+            table,
+            index,
+            model,
+            embeds: false,
+        })
+    }
+}
+
+impl ReadStore {
+    /// The model the store is pinned to, if any.
+    pub fn embedding_model(&self) -> Option<&EmbeddingModel> {
+        self.model.as_ref()
+    }
+
+    /// Recalls memories, as [`Store::recall`] does, at the reader's snapshots. A search
+    /// while the writer's text index is being repaired fails with `Busy`.
+    pub fn recall(&self, namespaces: &[&str]) -> Recall<'_> {
+        Recall::new(
+            Rows::R(&self.table),
+            Idx::R(&self.index),
+            self.model.as_ref().filter(|_| self.embeds),
+            Snap::R(&self.reader),
+            namespaces,
+        )
+    }
+
+    /// The memory `id`, or `None` if it doesn't exist.
+    pub fn get(&self, id: &MemoryId) -> Result<Option<StoredMemory>> {
+        let Some(row) = self.table.row(&id.row()).read()? else {
+            return Ok(None);
+        };
+        read_memory(id.clone(), &row.to_owned())
+    }
+
+    /// [`Store::verify`], at the reader's snapshot.
+    pub fn verify(&self) -> Result<StoreStats> {
+        let s = self.reader.snapshot()?;
+        let text_ok = self.index.verify()?.is_consistent();
+        verify(Rows::R(&self.table), &s, self.model.as_ref(), text_ok)
+    }
+}
+
+/// `open`'s model check.
+fn check_model(model: &Option<EmbeddingModel>, name: &str, model_id: &str) -> Result<()> {
+    match model {
+        Some(m) if m.id == model_id => Ok(()),
+        Some(m) => Err(Error::Mismatch(format!(
+            "the store {name} is pinned to {:?}, not {model_id:?}",
+            m.id
+        ))),
+        None => Err(Error::InvalidArgument(format!(
+            "the store {name} has no embedding model: open it without embeddings"
+        ))),
+    }
+}
+
+/// The store's families and `G` row, checked; its pinned model.
+fn load(rows: Rows<'_>) -> Result<Option<EmbeddingModel>> {
+    let not_store = || Error::InvalidArgument(format!("{} is not a memory store", rows.name()));
+    for f in [CONTENT, META, SOURCES, STATS, PEAK, LINKS, BACKLINKS] {
+        if !rows.has_family(f) {
+            return Err(not_store());
+        }
+    }
+    let layout = rows.global_u64(LAYOUT)?.ok_or_else(not_store)?;
+    if layout != LAYOUT_VERSION {
+        return Err(Error::InvalidArgument(format!(
+            "{} has store layout {layout}, and this build reads {LAYOUT_VERSION}",
+            rows.name()
+        )));
+    }
+    Ok(match rows.global(MODEL_ID)? {
+        None => None,
+        Some(id) => {
+            let id = String::from_utf8(id).map_err(|_| corrupt("the model id"))?;
+            let dim = rows
+                .global_u64(MODEL_DIM)?
+                .ok_or_else(|| corrupt("the model's dimension"))?;
+            let element = rows
+                .global(MODEL_ELEMENT)?
+                .and_then(|e| e.first().copied())
+                .and_then(element_from_code)
+                .ok_or_else(|| corrupt("the model's element"))?;
+            Some(EmbeddingModel::new(id, dim as u32, element)?)
+        }
+    })
+}
+
+/// [`Store::verify`]'s checks, over either kind of table.
+fn verify(
+    rows: Rows<'_>,
+    s: &pigeonhole::Snapshot,
+    model: Option<&EmbeddingModel>,
+    text_ok: bool,
+) -> Result<StoreStats> {
+    let mut st = StoreStats::default();
+    let mut texts: BTreeMap<Vec<u8>, String> = BTreeMap::new();
+    let mut links: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
+    let mut backlinks: BTreeSet<(Vec<u8>, Vec<u8>, Vec<u8>)> = BTreeSet::new();
+    let mut dedups: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut superseded_by: Vec<Vec<u8>> = Vec::new();
+    rows.scan_all(s, |key, row| {
+        if key == GLOBAL {
+            return Ok(());
+        }
+        if MemoryId::from_row(key).is_some() {
+            st.memories += 1;
+            let mut has_text = false;
+            let mut has_emb = false;
+            for e in row.iter() {
+                match e.family {
+                    CONTENT if e.qualifier == TEXT => {
+                        has_text = true;
+                        let text = std::str::from_utf8(e.cell.value())
+                            .map_err(|_| corrupt("a memory's text"))?;
+                        texts.insert(key.to_vec(), normalize(text));
+                    }
+                    EMB => has_emb = true,
+                    META if e.qualifier == SUPERSEDED_BY => {
+                        superseded_by.push(e.cell.value().to_vec());
+                    }
+                    LINKS => {
+                        links.insert((key.to_vec(), e.qualifier.to_vec(), e.cell.value().to_vec()));
+                    }
+                    BACKLINKS => {
+                        backlinks.insert((
+                            e.qualifier.to_vec(),
+                            key.to_vec(),
+                            e.cell.value().to_vec(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if !has_text {
+                st.no_content += 1;
+            }
+            if model.is_some() && !has_emb {
+                st.missing_embeddings += 1;
+            }
+        } else if let Some(c) = row.get(META, RID) {
+            dedups.push((key.to_vec(), c.value().to_vec()));
+        } else {
+            return Err(corrupt("a row that is neither a memory nor a dedup row"));
+        }
+        Ok(())
+    })?;
+    for (key, target) in &dedups {
+        let ok = texts.get(target).is_some_and(|norm| {
+            key.windows(2)
+                .position(|w| w == DEDUP_TAG)
+                .is_some_and(|at| {
+                    std::str::from_utf8(&key[..at])
+                        .is_ok_and(|ns| dedup_row(ns, &content_hash(norm)) == *key)
+                })
+        });
+        if !ok {
+            st.stale_dedup += 1;
+        }
+    }
+    // Each link must have its backlink, and the reverse; both ends live.
+    st.broken_links += links.symmetric_difference(&backlinks).count() as u64;
+    for (from, to, _) in &links {
+        if !texts.contains_key(from) || !texts.contains_key(to) {
+            st.broken_links += 1;
+        }
+    }
+    st.dangling_superseded = superseded_by
+        .iter()
+        .filter(|s| !texts.contains_key(*s))
+        .count() as u64;
+    st.text_index_inconsistent = !text_ok;
+    Ok(st)
+}
+
+/// Marks the memory at `old` superseded by the one at `new` since `valid_to`, with the
+/// `new → old` link: the writes [`Store::supersede`] makes once its reads pass.
+pub(crate) fn supersede_in(
+    txn: &mut Transaction,
+    t: &Table,
+    old: &[u8],
+    new: &[u8],
+    valid_to: u64,
+) {
+    txn.put(t, old, META, SUPERSEDED_BY, new)
+        .put_u64(t, old, META, VALID_TO, valid_to);
+    write_link(txn, t, new, old, LinkType::SUPERSEDES, 1.0);
+}
+
+pub(crate) fn write_link(
+    txn: &mut Transaction,
+    t: &Table,
+    from: &[u8],
+    to: &[u8],
+    ty: LinkType,
+    w: f32,
+) {
     let mut v = [0u8; 5];
     v[0] = ty.0;
     v[1..].copy_from_slice(&w.to_le_bytes());
@@ -986,7 +1406,7 @@ fn element_from_code(c: u8) -> Option<Element> {
 }
 
 /// A memory from its row.
-fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemory>> {
+pub(crate) fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemory>> {
     let view = row.view();
     let Some(text) = view.get(CONTENT, TEXT) else {
         return Ok(None);
@@ -1015,6 +1435,7 @@ fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemor
         .get(META, SESSION)
         .map(|c| String::from_utf8_lossy(c.value()).into_owned());
     let pinned = view.get(META, PINNED).is_some();
+    let consolidated = view.get(META, CONSOLIDATED).is_some();
     let superseded_by = view
         .get(META, SUPERSEDED_BY)
         .map(|c| MemoryId::from_row(c.value()).ok_or_else(|| corrupt("superseded_by")))
@@ -1045,6 +1466,7 @@ fn read_memory(id: MemoryId, row: &pigeonhole::Row) -> Result<Option<StoredMemor
         last_used_us,
         session,
         pinned,
+        consolidated,
         superseded_by,
         sources,
         links,

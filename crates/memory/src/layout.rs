@@ -25,6 +25,8 @@ pub(crate) const META: &str = "meta";
 pub(crate) const KIND: &[u8] = b"kind";
 pub(crate) const SESSION: &[u8] = b"session";
 pub(crate) const PINNED: &[u8] = b"pinned";
+/// Set once a consolidation took the memory in (T3).
+pub(crate) const CONSOLIDATED: &[u8] = b"consolidated";
 pub(crate) const SUPERSEDED_BY: &[u8] = b"superseded_by";
 pub(crate) const VALID_TO: &[u8] = b"valid_to";
 pub(crate) const RID: &[u8] = b"rid";
@@ -48,6 +50,10 @@ pub(crate) const MODEL_ID: &[u8] = b"model_id";
 pub(crate) const MODEL_DIM: &[u8] = b"model_dim";
 pub(crate) const MODEL_ELEMENT: &[u8] = b"model_element";
 pub(crate) const TEXT_INDEX: &[u8] = b"text_index";
+/// `G`'s forget policy (T2), when the store has one.
+pub(crate) const FORGET: &[u8] = b"forget";
+/// `G`: the near-duplicate dedup setting (T3).
+pub(crate) const NEAR_DEDUP: &[u8] = b"near_dedup";
 
 pub(crate) const LAYOUT_VERSION: u64 = 1;
 

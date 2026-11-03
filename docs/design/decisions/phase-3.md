@@ -3639,6 +3639,12 @@ Mutations: never reading ahead when short fails the last two; dropping the rule 
 - `format::vector`: `Params::{check, payload, distance}` and `VectorRef::check_components`; the `i8` kernels score a stored vector's bytes as its `i8`s.
 - **Not in PR 2:** a vector family in the pigeonhole model target, #1256 (milestone 1.1.0); the integration test covers the write and read paths meanwhile.
 
+**Checks (model coverage, #1256).** The pigeonhole `model` target's tables gain `vec`: 32-dimension `f32` cosine vectors, two versions kept. Its blob threshold is picked per run (perf287 on #1371). With 120, every vector (about 130 bytes) separates into a blob. With the default, every one stays inline in the SST blocks, the default configuration. The pick is by the seed's parity, offset by a hash of the test's name, so a default run (seed 1 of every test) covers both, and failures and progress name it. A second family would have cost about 15% more per run (perf287's timing on #1371).
+- **Writes:** the sim workload's puts there are vectors (`pigeonhole_sim::vector_value`, the stored bytes; components in quarters, never all zero), written with `put_vector_f32`/`_at` through `RowMutation` and `WriteBatch`. They're overwritten and deleted at every scope, through flushes, compactions, crashes, recoveries in place and tablet changes, and reads compare the stored bytes exactly.
+- **Refusals:** on one seqno in eleven, a wrong dimension, a NaN, a zero vector or a plain put into `vec` is `InvalidArgument`, and the column stays empty.
+- **Search:** each read also runs `nearest_f32` (k from 1 to 7, the query from the seqno) over the read's keys, or over the whole table on one seqno in eight, through `run_async` on the async front door. It must equal brute force over the model's newest vectors, scored by `VectorSpec::distance_f32`, in (distance, row, qualifier) order, bit for bit. A run whose searches never find a vector fails.
+- **Seeds:** the family changes every seed's stream in that target (no regression seed is pinned to it). The `counters` target and the engine's `model_check` draw as before.
+
 <a id="d304"></a>
 ## D304 — Traversal pushdown: breadth-first hops run in the engine, each a bounded read of the frontier (perf287, 2026-10-31; owner accepted revision 2, #489 c6544597002, c6544636857, c6544708521; reviewed by simp724 and cli692; engine, pigeonhole, #489 item 3, ICR 0099; on D296 and D299)
 **Why.** A BFS over adjacency rows was a client loop over `keys()`: every edge was materialised and copied into the client's neighbour list, duplicates and visited nodes included, and a hub could not be capped without reading it whole (283 ms and 824 MB for a 2M-edge hub through `read()`).
@@ -4100,6 +4106,8 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - `it/feed_head.rs`: the D200 dependency.
   - `feed_model`: a durable and a visible subscriber in a reader process beside the writer's, plain and with deferred I/O. Clean reopens exercise the stale-attachment resubscribe; power losses reopen the reader too.
 
+**A fix after PR 4 (#1370; simp724's D312 heads-up).** A cursor that reads a frame mid-write stops short. If the successor's header lands in the same step, `chain()` used to report the mismatch as corruption. Now the first stop short of a successor's recorded end, per `(epoch, stop)`, is "not yet" (`End`), and the next step reads again from there. The same stop on the second look is still corruption. M1 makes the deferral safe: a torn read only hits records past the frontier the poll loaded before reading. A D312 mapped store completes before its group's seqno is published, so that holds there too.
+
 <a id="d311"></a>
 ## D311 — Long-term agent memory in `pigeonhole-memory`: one table per store, exact namespaces, hybrid recall fused by RRF, transactions with existence reads (ai1249, design; owner decision, 2026-11-02, all 11 calls of revision 2, #1251 c6566064718; reviewed by simp724 and cli692; memory, #1251, ICR 0107)
 **Why.** Agents need durable memory they can recall by meaning, by keyword and by recency, scoped per agent or shared, inside the database they already use (#1251). Built on the public API with D309's text index, it needs nothing new in the engine.
@@ -4152,6 +4160,50 @@ simp724's `"a b"~2` on `a a a b` gives 1.0 under this algorithm, one match minim
   - a write given up in the caller's transaction leaves nothing;
   - S3's races (a merge or a link racing a delete of its target conflicts; `mark_used` after a delete), each ending in `verify`.
 
+**T1, second PR (#1335).** Recall and `ReadStore`, as revision 2 §3.
+- **One addition:** ranks are competition ranks, so equal values share a rank. A tie-break by id would have given the newest memory an edge whenever importances were equal, as they are by default. The guide's example found it.
+- **Determinism:** `.now_us(us)` fixes the time ages are measured from, so a call with an explicit snapshot is deterministic.
+- **From the reviews on #1374:**
+  - **simp724's N1 (the coordinator: fix, don't document):** each signal reads further down its list until `n` memories pass the filters or its namespace is exhausted.
+  - **simp724's N2:** D308's at-least-one rule, with `truncated` set.
+  - **cli692:** `now_us`, `uses`, and `RecallHit::superseded_by`, plus the doc points.
+- **Tests:**
+  - each signal against an independent computation (similarity within 1e-5);
+  - each rank against the values;
+  - each fused score against RRF's formula, and the order;
+  - the candidate set against each signal's own top `n`;
+  - the byte budget, the filters, the linear blend, several namespaces, the refusals, and a reader process recalling exactly what the writer does.
+  - Mutations of `id_prefix`, 0-based ranks and the superseded filter were all caught.
+
+
+**T2 (#1336).** Forgetting, as revision 2 §4, with cli692's API on #1336:
+- **The persisted policy** (`StoreOptions::forget`/`episodic_ttl`, `set_forget_policy`) is the default. `forget()` takes a one-off `.policy`.
+- **Opening:** `OpenOptions` with `open_with`/`create_with`, and `take_forgetter` for an application-owned forgetter.
+- **Each deletion re-evaluates in its transaction (M2):** `forget_in` reads the stats, peak, meta and backlinks there, then deletes through `delete_in`. Protection covers pinned memories and the sources of a live semantic memory.
+- **Tests:**
+  - retention, TTL and protection, including protection lapsing when the semantic memory goes;
+  - bounded, resumable passes;
+  - forget racing `mark_used`, a merge's importance raise, and a new `DERIVED_FROM` link, each conflicting and ending in `verify`;
+  - the persisted policy;
+  - the application's forgetter and the crate's thread.
+  - Mutations of the transaction's reads and of protection were caught.
+
+**T3 (#1337).** Consolidation and near-duplicate dedup, as revision 2 §4, with cli692's API (c6589818220) and simp724's C1–C4 on #1337:
+- **The commit:** one transaction per group, skipped (never retried) on a change or a conflict.
+  - **The re-reads:** content, `consolidated`, `superseded_by` and `pinned`, plus the `sources` whose union moves to the new memories (C1).
+  - **A summary that merges into one of the group's own memories** makes that memory the result (C2).
+  - **Under `Delete`:** a deleted memory's superseded memories move to the summary (C3).
+- **Transaction reads are at the snapshot,** so the commit folds duplicate returned texts itself, and removes the links a result made to a memory it deletes.
+- **The policy is per call, with no thread.** A consolidator `Err` stops the pass with `Error::Consolidate { error, pass }`.
+- **Near dedup** is a persisted `NearDedup`, checked before `remember`'s transaction. `remember_in` doesn't check; `near_duplicate` is there for its callers.
+- **Tests:**
+  - two consolidations of one group: nested, so the second finds its group taken, and two threads, one committing and the other skipping;
+  - the three source policies, with nothing returned and with a summary equal to a source;
+  - grouping by session, similarity, age, pinning and limits;
+  - a consolidator's failure, the refusals, and the folding of duplicate texts;
+  - near dedup's policies, threshold, superseded match and exact precedence, the setting, `near_duplicate` and `remember_in`.
+  - Each ends in `verify`.
+  - Mutations of the `consolidated` re-read, the C3 re-pointing, the link removal under `Delete` and the folding were caught.
 
 <a id="d312"></a>
 ## D312 — Mapped `Buffered` WAL writes: a group's frames stored through a shared mapping of the segment instead of `pwrite` (a prototype, off by default) (ctr274 / simp724, 2026-11-02; owner approved the prototype, option 1; #1206 lever 4 B2; io, wal)

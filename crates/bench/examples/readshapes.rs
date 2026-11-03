@@ -43,6 +43,10 @@
 //!   64-dimension `f32` L2 vectors (qualifiers `a` and `b`), over every vector, or with
 //!   qualifier prefix `b` (half of them). Counted per scored vector; the query is built
 //!   outside the measured function.
+//! - `knn-budget`: `knn-exact`'s search through `Nearest::run_within` (D308 PR 3) with a
+//!   budget of 120 bytes, which keeps 5 of the 10 nearest (24 bytes each: a 7-byte key, a
+//!   1-byte qualifier and 16). Counted per scored vector like `knn-exact`: the budget bounds
+//!   the result, not the read, so the two should count about the same.
 //! - `knn-exact-f16`, `knn-exact-bf16`: `knn-exact` over the same vectors rounded to `f16` and
 //!   to `bf16` (#1263), in table `vh` (built only for these two shapes, so `knn-exact`'s
 //!   store is unchanged): the half-precision kernels' cost per cell beside `knn-exact`'s.
@@ -318,6 +322,25 @@ fn shape_knn(v: &Table, query: &[f32], filtered: bool) -> usize {
     KNN_ROWS as usize * if filtered { 1 } else { 2 }
 }
 
+/// `knn-budget`'s budget: 5 of the 10 nearest, at 24 bytes each.
+const KNN_BUDGET: u64 = 120;
+
+#[inline(never)]
+fn shape_knn_budget(v: &Table, query: &[f32]) -> usize {
+    let _measured = Measured::start();
+    let page = v
+        .scan_prefix(b"")
+        .family("e")
+        .nearest_f32(query, 10)
+        .run_within(KNN_BUDGET)
+        .unwrap();
+    // Release builds check it too: a key or overhead change would alter what this counts.
+    assert_eq!(page.neighbours().len(), 5);
+    std::hint::black_box(&page);
+    // Every vector is scored, as in `knn-exact`: one unit each.
+    KNN_ROWS as usize * 2
+}
+
 /// A budgeted page's size: about 139 of table `t`'s rows (8 cells of 58 bytes, a 7-byte
 /// key).
 const PAGE_BYTES: u64 = 64 << 10;
@@ -381,6 +404,19 @@ fn main() {
             // itself, comparable with every earlier base.
             .row_cache(0),
     );
+    // Every setup cell is written at a fixed, increasing timestamp (#1305), vectors included.
+    // Counter increments are not: they combine into one cell whatever the commit timestamp,
+    // so the counter family's SST is the same on every run already. A timestamp is part
+    // of a cell's key, so wall-clock ones gave each run differently encoded SSTs (table `t`'s
+    // flushed SST took 1,073,791 to 1,077,226 bytes for the same 100,000 entries), different
+    // block boundaries, and get-sst and the multi-gets a spread of up to 30 instructions per
+    // unit on one commit.
+    let clock = std::cell::Cell::new(1_600_000_000_000_000u64);
+    let ts = || {
+        let t = clock.get();
+        clock.set(t + 1);
+        t
+    };
     // Table `l` first, compacted while it is the only table, so table `t` below is built
     // exactly as without it.
     let l = db
@@ -393,7 +429,7 @@ fn main() {
         let key = row_key(r);
         let mut m = l.mutate(&key);
         for q in 0..CELLS {
-            m = m.put("f", format!("q{q}").as_bytes(), &[7u8; 40]);
+            m = m.put_at("f", format!("q{q}").as_bytes(), ts(), &[7u8; 40]);
         }
         m.commit().unwrap();
     }
@@ -412,12 +448,15 @@ fn main() {
             let key = row_key(r);
             let mut m = t.mutate(&key);
             for q in 0..CELLS {
-                m = m.put("f", format!("q{q}").as_bytes(), &val);
+                m = m.put_at("f", format!("q{q}").as_bytes(), ts(), &val);
             }
             m.commit().unwrap();
             // Two more versions of `q0`.
             for v in 0..2u8 {
-                t.mutate(&key).put("f", b"q0", &[v; 40]).commit().unwrap();
+                t.mutate(&key)
+                    .put_at("f", b"q0", ts(), &[v; 40])
+                    .commit()
+                    .unwrap();
             }
             if r % 10 == 0 {
                 for _ in 0..incrs {
@@ -443,11 +482,17 @@ fn main() {
             .create_if_missing()
             .unwrap();
         for r in 0..ROWS {
-            i.mutate(&row_key(r)).put("f", b"a", &val).commit().unwrap();
+            i.mutate(&row_key(r))
+                .put_at("f", b"a", ts(), &val)
+                .commit()
+                .unwrap();
         }
         db.flush().unwrap();
         for r in 0..ROWS {
-            i.mutate(&row_key(r)).put("f", b"b", &val).commit().unwrap();
+            i.mutate(&row_key(r))
+                .put_at("f", b"b", ts(), &val)
+                .commit()
+                .unwrap();
         }
         let mut it = i.scan_prefix(b"").family("f").iter().unwrap();
         while let Some(r) = it.next_ref().unwrap() {
@@ -466,7 +511,7 @@ fn main() {
             .unwrap();
         let mut m = w.mutate(b"w:hub");
         for q in 0..WIDE {
-            m = m.put("f", &q.to_be_bytes(), b"");
+            m = m.put_at("f", &q.to_be_bytes(), ts(), b"");
         }
         m.commit().unwrap();
         db.flush().unwrap();
@@ -494,8 +539,8 @@ fn main() {
         let mut vr = Rng(0x5EED_0490);
         for r in 0..KNN_ROWS {
             v.mutate(&key(b'v', r))
-                .put_vector_f32("e", b"a", &knn_vector(&mut vr))
-                .put_vector_f32("e", b"b", &knn_vector(&mut vr))
+                .put_vector_f32_at("e", b"a", ts(), &knn_vector(&mut vr))
+                .put_vector_f32_at("e", b"b", ts(), &knn_vector(&mut vr))
                 .commit()
                 .unwrap();
         }
@@ -558,6 +603,10 @@ fn main() {
                         &query,
                         shape == "knn-filtered",
                     )
+                }
+                "knn-budget" => {
+                    let query = knn_vector(&mut rng);
+                    shape_knn_budget(v.as_ref().expect("built above"), &query)
                 }
                 other => panic!("unknown shape {other}"),
             };

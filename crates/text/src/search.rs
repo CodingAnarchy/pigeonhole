@@ -273,9 +273,9 @@ impl<'a> Search<'a> {
                     // misspelling's idf no longer lifts it above the common word it misspells
                     // (term frequency and length still count).
                     let df = exps.iter().map(|e| e.df).max().expect("not empty");
-                    let e: Vec<(&str, i64, f64)> = exps
+                    let e: Vec<(&str, i64, u64, f64)> = exps
                         .iter()
-                        .map(|e| (e.term.as_str(), df, e.boost))
+                        .map(|e| (e.term.as_str(), df, e.df.max(0) as u64, e.boost))
                         .collect();
                     clauses.push(Scored::fuzzy(t, s, &bm, &e, prefix)?);
                 }

@@ -23,6 +23,8 @@ fn query<'a>(index: &'a Index, q: &'a V, k: usize, nprobe: u32) -> Search<'a> {
         V::F32(x) => index.search_f32(x, k),
         V::I8(x) => index.search_i8(x, k),
         V::Bits(x) => index.search_bits(x, k),
+        V::F16(x) => index.search_f16(x, k),
+        V::BF16(x) => index.search_bf16(x, k),
     }
     .nprobe(nprobe)
 }

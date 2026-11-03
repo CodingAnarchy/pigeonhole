@@ -11,7 +11,7 @@ use std::sync::Arc;
 use common::*;
 use pigeonhole::RetryPolicy;
 use pigeonhole_text::{
-    Error, Index, IndexOptions, Normalization, Query, QueryErrorKind, Token, Tokenizer,
+    Error, Fuzziness, Index, IndexOptions, Normalization, Query, QueryErrorKind, Token, Tokenizer,
 };
 
 fn ids(hits: &[pigeonhole_text::Hit]) -> Vec<&[u8]> {
@@ -429,6 +429,78 @@ fn normalisation_matches_any_composition_and_builder_terms_are_normalised() {
     assert!(found(&nfkc, Query::new().text("a")));
     assert!(!found(&nfkc, Query::new().term("\u{ff21}")));
     assert!(found(&nfkc, Query::new().term("a")));
+    db.close().unwrap();
+}
+
+/// #1291: phrases and fuzzy terms run on normalised terms, a decomposed document matches a
+/// composed query (the reverse of the test above), and a reopen, as the writer and as a reader
+/// process, keeps the index's setting.
+#[test]
+fn normalised_phrases_fuzzy_terms_and_reopens_match() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let t = docs(&db);
+    let nfc = Index::create(&db, "nfc", source(&t), IndexOptions::new()).unwrap();
+    let nfkc = Index::create(
+        &db,
+        "nfkc",
+        source(&t),
+        IndexOptions::new().normalization(Normalization::Nfkc),
+    )
+    .unwrap();
+    // A decomposed "café" and an "office" with the `ﬁ` ligature.
+    nfc.put(b"d", "the cafe\u{301} of\u{fb01}ce opens").unwrap();
+    nfkc.rebuild().unwrap();
+    for i in [&nfc, &nfkc] {
+        check(i, "normalised");
+    }
+    let found = |i: &Index, q: Query| !i.search(q, 10).run().unwrap().is_empty();
+    let composed = "caf\u{e9}";
+    // The reverse direction: a decomposed document, a composed query.
+    assert!(found(&nfc, Query::new().text(composed)));
+    // Phrases: a quoted one and a builder one, composed against the decomposed source.
+    assert!(
+        !nfc.search("\"caf\u{e9} of\u{fb01}ce\"", 10)
+            .run()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(found(&nfc, Query::new().phrase([composed, "of\u{fb01}ce"])));
+    // NFKC folds the ligature inside a phrase too; NFC keeps it, so the plain word misses.
+    assert!(found(&nfkc, Query::new().phrase([composed, "office"])));
+    assert!(
+        !nfkc
+            .search("\"caf\u{e9} office\"", 10)
+            .run()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!found(&nfc, Query::new().phrase([composed, "office"])));
+    // Fuzzy terms: one edit from the NFC term "café" (a precomposed `é` is one character, so
+    // `a` for it is one substitution), and one edit from NFKC's "office" ("offica"), which is
+    // three from NFC's five-character "ofﬁce".
+    assert!(found(&nfc, Query::new().fuzzy("cafa", Fuzziness::One)));
+    assert!(found(&nfkc, Query::new().fuzzy("offica", Fuzziness::One)));
+    assert!(!found(&nfc, Query::new().fuzzy("offica", Fuzziness::One)));
+    drop((nfc, nfkc, t));
+    db.close().unwrap();
+
+    // Reopened, the setting comes from the index: the writer's handle and a reader's.
+    let db = open(&dir);
+    let nfc = Index::open(&db, "nfc").unwrap();
+    let nfkc = Index::open(&db, "nfkc").unwrap();
+    assert_eq!(nfc.options().get_normalization(), Normalization::Nfc);
+    assert_eq!(nfkc.options().get_normalization(), Normalization::Nfkc);
+    assert!(found(&nfc, Query::new().text("cafe\u{301}")));
+    assert!(found(&nfkc, Query::new().text("office")));
+    let reader = pigeonhole::Pigeonhole::open_reader(
+        dir.join("text.phdb"),
+        pigeonhole::ReaderOptions::default(),
+    )
+    .unwrap();
+    let read = Index::open_reader(&reader, "nfkc").unwrap();
+    assert!(!read.search("office", 10).run().unwrap().is_empty());
+    drop((read, reader, nfc, nfkc));
     db.close().unwrap();
 }
 

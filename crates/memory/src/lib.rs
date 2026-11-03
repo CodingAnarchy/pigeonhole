@@ -13,16 +13,40 @@
 //!   model it embeds with, and another model's vectors are refused.
 //! - **[`Store::verify`]** checks the store against itself and its text index.
 //!
-//! Recall (vector, keyword and recency, fused by RRF within a byte budget) and reader
-//! processes come in T1's second PR.
+//! - **Recall** ([`Store::recall`]) fuses vector, keyword and recency candidates by RRF
+//!   (or a linear blend) within a byte budget, at one snapshot, and works in reader
+//!   processes ([`Store::open_reader`], [`ReadStore`]).
 
+mod consolidate;
+mod dedup;
 mod error;
+mod forget;
+/// Test seams (ICR 0085's convention): only with the `__unstable-hooks` feature, hidden,
+/// unstable, and never needed by applications.
+#[cfg(feature = "__unstable-hooks")]
+#[doc(hidden)]
+pub mod hooks;
 mod layout;
+mod recall;
 mod store;
 
-pub use error::{Error, Result};
-pub use layout::{MemoryId, normalize};
-pub use store::{
-    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, Remembered, Source, Store, StoreOptions,
-    StoreStats, StoredMemory,
+pub use consolidate::{
+    Consolidate, ConsolidatePass, ConsolidatePolicy, Consolidator, SourcePolicy,
 };
+pub use dedup::{DedupPolicy, NearDedup};
+pub use error::{Error, Result};
+pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
+pub use layout::{MemoryId, normalize};
+pub use recall::{Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
+pub use store::{
+    EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
+    Source, Store, StoreOptions, StoreStats, StoredMemory,
+};
+
+#[cfg(doctest)]
+mod guide {
+    #[doc = include_str!("../../../docs/guide/agent-memory.md")]
+    struct AgentMemory;
+    #[doc = include_str!("../README.md")]
+    struct CrateReadme;
+}

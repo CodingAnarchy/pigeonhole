@@ -33,6 +33,13 @@ use crate::index::Rows;
 use crate::error::{Result, corrupt};
 use crate::layout::*;
 
+/// A point read's cost in posting steps (perf287's ski-rental rule, #1368): measured at
+/// 100,000 documents on a laptop, on one hub term's posting row, a `get_at` of a posting
+/// takes about 860 ns and a step through the row about 60 ns. That's with the index in the
+/// block cache, the conservative end: a cold read costs more steps, so a real index switches
+/// to advancing a little late, never early. A wrong value costs a constant factor at most.
+const LOOKUP_IN_STEPS: u64 = 14;
+
 /// A relative slack on every bound (above), so float rounding never prunes a document that
 /// belongs.
 const SLACK: f64 = 1e-9;
@@ -67,17 +74,27 @@ pub(crate) struct Walk<'t> {
     cells: Box<RowCells<'t>>,
     /// The posting the walk stands on: its document and contribution.
     cur: Option<(Vec<u8>, f64)>,
+    /// The postings the row holds (its `df`), and how many the walk has stepped past. With
+    /// `id_prefix` the walk reads only part of the row, so `df` over-estimates what's left:
+    /// it switches to advancing a little later than it could, which costs a little and never
+    /// changes a result.
+    postings: u64,
+    stepped: u64,
+    /// Lookups done by point reads, and whether the walk has switched to advancing.
+    lookups: u64,
+    advancing: bool,
 }
 
 impl<'t> Walk<'t> {
     /// The walk over `term`'s postings (restricted to doc ids starting with `prefix`), and
-    /// its bound: `weight · tf_factor(maxtf, minlen)`.
+    /// its bound: `weight · tf_factor(maxtf, minlen)`. `postings` is the term's `df`.
     fn new(
         t: &'t Rows,
         s: &Snapshot,
         bm: &Bm25,
         term: &str,
         weight: f64,
+        postings: u64,
         prefix: Option<&[u8]>,
     ) -> Result<(Self, f64)> {
         let row = post_row(term);
@@ -101,6 +118,10 @@ impl<'t> Walk<'t> {
             bound: weight * factor,
             cells: Box::new(read.cells()?),
             cur: None,
+            postings,
+            stepped: 0,
+            lookups: 0,
+            advancing: false,
         };
         w.step(bm)?;
         let b = w.bound;
@@ -112,6 +133,7 @@ impl<'t> Walk<'t> {
     }
 
     fn step(&mut self, bm: &Bm25) -> Result<()> {
+        self.stepped += 1;
         self.cur = match self.cells.next()? {
             Some(e) => {
                 let (tf, len) = unposting(
@@ -129,7 +151,26 @@ impl<'t> Walk<'t> {
         Ok(())
     }
 
-    fn lookup(&self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+    /// The walk's contribution to `doc`, for a non-essential clause; `doc`s come in
+    /// ascending order. Point reads first, then, once their cost passes stepping through
+    /// the rest of the row (lookups × [`LOOKUP_IN_STEPS`] > the postings left), advancing
+    /// to `doc` for good: the ski-rental rule (perf287 on #1355), never much more than twice
+    /// the better of the two, without knowing up front how many lookups will come.
+    fn lookup(&mut self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+        if !self.advancing {
+            self.lookups += 1;
+            let left = self.postings.saturating_sub(self.stepped);
+            self.advancing = self.lookups.saturating_mul(LOOKUP_IN_STEPS) > left;
+        }
+        if self.advancing {
+            while self.doc().is_some_and(|d| d < doc) {
+                self.step(bm)?;
+            }
+            return Ok(match &self.cur {
+                Some((d, c)) if d.as_slice() == doc => *c,
+                _ => 0.0,
+            });
+        }
         match t.get_at(s, &self.row, POST, doc)? {
             Some(c) => {
                 let (tf, len) =
@@ -177,26 +218,27 @@ impl<'t> Scored<'t> {
         df: i64,
         prefix: Option<&[u8]>,
     ) -> Result<Self> {
-        let (walk, bound) = Walk::new(t, s, bm, term, bm.idf(df), prefix)?;
+        let (walk, bound) = Walk::new(t, s, bm, term, bm.idf(df), df.max(0) as u64, prefix)?;
         Ok(Scored {
             clause: Clause::Term(walk),
             bound: bound * (1.0 + SLACK),
         })
     }
 
-    /// A fuzzy clause over its expansions: `(term, df, boost)` each, the df the one its idf
-    /// scores with (the search passes the expansions' blended df).
+    /// A fuzzy clause over its expansions: `(term, df, postings, boost)` each, `df` the one
+    /// its idf scores with (the search passes the expansions' blended df) and `postings`
+    /// the term's own.
     pub(crate) fn fuzzy(
         t: &'t Rows,
         s: &Snapshot,
         bm: &Bm25,
-        expansions: &[(&str, i64, f64)],
+        expansions: &[(&str, i64, u64, f64)],
         prefix: Option<&[u8]>,
     ) -> Result<Self> {
         let mut walks = Vec::with_capacity(expansions.len());
         let mut bound = 0.0f64;
-        for &(term, df, boost) in expansions {
-            let (walk, b) = Walk::new(t, s, bm, term, boost * bm.idf(df), prefix)?;
+        for &(term, df, postings, boost) in expansions {
+            let (walk, b) = Walk::new(t, s, bm, term, boost * bm.idf(df), postings, prefix)?;
             walks.push(walk);
             bound = bound.max(b);
         }
@@ -274,13 +316,14 @@ impl<'t> Scored<'t> {
         Ok(())
     }
 
-    /// The clause's contribution to `doc`, looked up out of order (a non-essential clause).
-    fn lookup(&self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
-        match &self.clause {
+    /// The clause's contribution to `doc`, for a non-essential clause: `doc`s come in
+    /// ascending order ([`Walk::lookup`]).
+    fn lookup(&mut self, t: &Rows, s: &Snapshot, bm: &Bm25, doc: &[u8]) -> Result<f64> {
+        match &mut self.clause {
             Clause::Term(w) => w.lookup(t, s, bm, doc),
             Clause::Fuzzy { walks, .. } => {
                 let mut best = 0.0f64;
-                for w in walks {
+                for w in walks.iter_mut() {
                     best = best.max(w.lookup(t, s, bm, doc)?);
                 }
                 Ok(best)

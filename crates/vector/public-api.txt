@@ -23,21 +23,28 @@ pub pigeonhole_vector::Hit::distance: f64
 pub pigeonhole_vector::Hit::id: alloc::vec::Vec<u8>
 pub struct pigeonhole_vector::Index
 impl pigeonhole_vector::Index
+pub fn pigeonhole_vector::Index::bulk_load_bf16<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[u16]>
 pub fn pigeonhole_vector::Index::bulk_load_bits<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[u8]>
+pub fn pigeonhole_vector::Index::bulk_load_f16<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[u16]>
 pub fn pigeonhole_vector::Index::bulk_load_f32<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[f32]>
 pub fn pigeonhole_vector::Index::bulk_load_i8<K, V>(&self, u64, impl core::iter::traits::collect::IntoIterator<Item = (K, V)>) -> pigeonhole_vector::Result<pigeonhole_vector::BulkStats> where K: core::convert::AsRef<[u8]>, V: core::convert::AsRef<[i8]>
 pub fn pigeonhole_vector::Index::create(&pigeonhole::db::Pigeonhole, &str, pigeonhole::vector::VectorSpec, pigeonhole_vector::IndexOptions) -> pigeonhole_vector::Result<pigeonhole_vector::Index>
 pub fn pigeonhole_vector::Index::create_with_rebalancer(&pigeonhole::db::Pigeonhole, &str, pigeonhole::vector::VectorSpec, pigeonhole_vector::IndexOptions) -> pigeonhole_vector::Result<(pigeonhole_vector::Index, pigeonhole_vector::Rebalancer)>
 pub fn pigeonhole_vector::Index::delete(&self, &[u8]) -> pigeonhole_vector::Result<bool>
+pub fn pigeonhole_vector::Index::insert_bf16(&self, &[u8], &[u16]) -> pigeonhole_vector::Result<()>
 pub fn pigeonhole_vector::Index::insert_bits(&self, &[u8], &[u8]) -> pigeonhole_vector::Result<()>
+pub fn pigeonhole_vector::Index::insert_f16(&self, &[u8], &[u16]) -> pigeonhole_vector::Result<()>
 pub fn pigeonhole_vector::Index::insert_f32(&self, &[u8], &[f32]) -> pigeonhole_vector::Result<()>
 pub fn pigeonhole_vector::Index::insert_i8(&self, &[u8], &[i8]) -> pigeonhole_vector::Result<()>
 pub fn pigeonhole_vector::Index::max_list_len(&self) -> u64
 pub fn pigeonhole_vector::Index::min_list_len(&self) -> u64
 pub fn pigeonhole_vector::Index::open(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_vector::Result<pigeonhole_vector::Index>
+pub fn pigeonhole_vector::Index::open_reader(&pigeonhole::db::PigeonholeReader, &str) -> pigeonhole_vector::Result<pigeonhole_vector::ReadIndex>
 pub fn pigeonhole_vector::Index::open_with_rebalancer(&pigeonhole::db::Pigeonhole, &str) -> pigeonhole_vector::Result<(pigeonhole_vector::Index, pigeonhole_vector::Rebalancer)>
 pub fn pigeonhole_vector::Index::options(&self) -> pigeonhole_vector::IndexOptions
+pub fn pigeonhole_vector::Index::search_bf16<'a>(&'a self, &'a [u16], usize) -> pigeonhole_vector::Search<'a>
 pub fn pigeonhole_vector::Index::search_bits<'a>(&'a self, &'a [u8], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::Index::search_f16<'a>(&'a self, &'a [u16], usize) -> pigeonhole_vector::Search<'a>
 pub fn pigeonhole_vector::Index::search_f32<'a>(&'a self, &'a [f32], usize) -> pigeonhole_vector::Search<'a>
 pub fn pigeonhole_vector::Index::search_i8<'a>(&'a self, &'a [i8], usize) -> pigeonhole_vector::Search<'a>
 pub fn pigeonhole_vector::Index::spec(&self) -> pigeonhole::vector::VectorSpec
@@ -57,6 +64,17 @@ pub fn pigeonhole_vector::IndexOptions::default() -> Self
 #[non_exhaustive] pub struct pigeonhole_vector::IndexStats
 pub pigeonhole_vector::IndexStats::list_lens: alloc::vec::Vec<u64>
 pub pigeonhole_vector::IndexStats::vectors: u64
+pub struct pigeonhole_vector::ReadIndex
+impl pigeonhole_vector::ReadIndex
+pub fn pigeonhole_vector::ReadIndex::options(&self) -> pigeonhole_vector::IndexOptions
+pub fn pigeonhole_vector::ReadIndex::search_bf16<'a>(&'a self, &'a [u16], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::ReadIndex::search_bits<'a>(&'a self, &'a [u8], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::ReadIndex::search_f16<'a>(&'a self, &'a [u16], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::ReadIndex::search_f32<'a>(&'a self, &'a [f32], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::ReadIndex::search_i8<'a>(&'a self, &'a [i8], usize) -> pigeonhole_vector::Search<'a>
+pub fn pigeonhole_vector::ReadIndex::spec(&self) -> pigeonhole::vector::VectorSpec
+impl core::fmt::Debug for pigeonhole_vector::ReadIndex
+pub fn pigeonhole_vector::ReadIndex::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct pigeonhole_vector::Rebalancer
 impl pigeonhole_vector::Rebalancer
 pub fn pigeonhole_vector::Rebalancer::closed(&self) -> bool

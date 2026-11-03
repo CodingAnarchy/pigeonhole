@@ -62,7 +62,7 @@ As D308 rev 2 §4:
 - **`NearestPage`** (`Debug`, `Clone`): `neighbours()`, `into_neighbours()`, `bytes()`, `cut_by_budget()`, `next_bytes()`.
   - **No resume position:** a nearest search ranks every candidate it reads, so a later page couldn't continue the ranking. A larger budget, or a larger `k`, returns more.
 - **The search reads what `run()` reads,** and `run()`'s code is unchanged.
-- **The callgrind shape** `knn-budget`, with its ceiling, comes in a follow-up once this API is on main, since the instructions job builds the base with the head's examples.
+- **The callgrind shape** `knn-budget` (a follow-up PR, since the instructions job builds the base with the head's examples): `knn-exact`'s search through `run_within(120)`, which keeps 5 of the 10 nearest, counted per scored vector, with its ceiling.
 
 ## Why
 D308 (#1250): retrieval for language models is budgeted in bytes and tokens, not rows. A read that stops at a byte budget, after ranking, returns as much of the best data as fits and reads no more than it needs.

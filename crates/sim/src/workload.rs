@@ -2,6 +2,42 @@ use pigeonhole_format::Durability;
 
 use crate::{ModelOp, Rng};
 
+/// The dimension of a vector family's vectors (`vec…`, #1256).
+pub const VECTOR_DIM: usize = 32;
+
+/// The stored bytes of `f32` vector `xs` (D303): what a cell's value holds, the value tag
+/// left out (`CellRef::value`). [`vector_components`] reads them back.
+pub fn vector_value(xs: &[f32]) -> Vec<u8> {
+    let payload: Vec<u8> = xs.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let v = pigeonhole_format::vector::VectorRef::new(
+        pigeonhole_format::vector::Element::F32,
+        xs.len() as u32,
+        &payload,
+    )
+    .expect("an f32 vector");
+    let mut out = Vec::new();
+    pigeonhole_format::value::encode_value(&mut out, pigeonhole_format::value::ValueRef::Vector(v));
+    out.remove(0);
+    out
+}
+
+/// The components of an `f32` vector [`vector_value`] stored.
+pub fn vector_components(stored: &[u8]) -> Option<Vec<f32>> {
+    let mut tagged = vec![pigeonhole_format::value::ValueTag::Vector as u8];
+    tagged.extend_from_slice(stored);
+    match pigeonhole_format::value::decode_value(&tagged).ok()? {
+        pigeonhole_format::value::ValueRef::Vector(v) => Some(
+            v.as_bytes()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Shape of a generated workload.
 ///
 /// `WorkloadSpec::default()` is a small, mixed workload (100 rows, 4 qualifiers, one family
@@ -18,7 +54,9 @@ use crate::{ModelOp, Rng};
 /// being states of a few inputs (an `hll` family's sketches, [`hll_sketch`](crate::hll_sketch);
 /// an exact `f64` family's, [`exact_state`](crate::exact_state)); if its name
 /// contains `ttl`, every put and `Incr` there takes a bucket timestamp (a counter family with
-/// a TTL refuses the fixed one).
+/// a TTL refuses the fixed one). A family whose name starts with `vec` is a vector family
+/// (D303): its puts are stored [`VECTOR_DIM`]-dimension `f32` vectors
+/// ([`vector_value`](crate::vector_value)), never all zero, so a cosine family takes them.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub struct WorkloadSpec {
@@ -213,6 +251,19 @@ impl Workload {
         v
     }
 
+    /// A vector family's put (#1256): [`VECTOR_DIM`] components, each a quarter in -2..=2,
+    /// never all zero, as the store holds it ([`vector_value`]).
+    fn vector_put(&mut self) -> Vec<u8> {
+        let mut xs = [0f32; VECTOR_DIM];
+        for x in &mut xs {
+            *x = (self.rng.below(17) as f32 - 8.0) / 4.0;
+        }
+        if xs.iter().all(|x| *x == 0.0) {
+            xs[0] = 1.0;
+        }
+        vector_value(&xs)
+    }
+
     /// A bucket timestamp for a counter family: a recent multiple of 4 (never the fixed
     /// counter timestamp).
     fn bucket(&mut self) -> u64 {
@@ -276,7 +327,9 @@ impl Workload {
         } else {
             self.rng.chance(150_000).then(|| self.recent_ts())
         };
-        let value = if state {
+        let value = if family.starts_with("vec") {
+            self.vector_put()
+        } else if state {
             self.state_put(&family)
         } else if counter {
             self.scalar(&family).to_le_bytes().to_vec()
@@ -404,7 +457,9 @@ impl Workload {
                 } else {
                     self.rng.chance(500_000).then_some(self.tick)
                 };
-                let value = if state {
+                let value = if family.starts_with("vec") {
+                    self.vector_put()
+                } else if state {
                     self.state_put(&family)
                 } else if counter {
                     7i64.to_le_bytes().to_vec()

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use common::{Rng, V, check, exact, open, seeds, specs};
 use pigeonhole::{Element, Metric, VectorSpec};
-use pigeonhole_vector::{Error, Index, IndexOptions};
+use pigeonhole_vector::{Error, Index, IndexOptions, ReadIndex};
 
 fn small() -> IndexOptions {
     IndexOptions::new().target_list_len(8).nprobe(2)
@@ -290,3 +290,216 @@ fn clustered_data_reaches_its_recall_floor() {
 
 /// Pinned a little below the measured recall (seed 42), so clustering regressions fail.
 const FLOOR: f64 = 0.94;
+
+/// #1268 item 5: an index opened from a reader process searches as the writer's does, for
+/// every element type: the same hits at the same probes, before and after the writer's
+/// splits (the reader reloads its centroids when the layout changes), and at a snapshot. It
+/// has no write methods; a table that isn't an index is refused as `open` refuses it.
+#[test]
+fn a_reader_process_searches_as_the_writer_does() {
+    for spec in specs() {
+        let ctx = format!("{spec:?}");
+        let dir = pigeonhole::doc_support::temp_dir();
+        let db = open(&dir);
+        let index = Index::create(&db, "idx", spec, small()).expect("create");
+        let mut rng = Rng::new(31);
+        let mut model = BTreeMap::new();
+        let put = |n: u32, index: &Index, rng: &mut Rng, model: &mut BTreeMap<Vec<u8>, V>| {
+            for i in n..n + 40 {
+                let v = V::random(rng, &spec, u64::from(i % 3));
+                v.insert(index, &i.to_be_bytes()).unwrap();
+                model.insert(i.to_be_bytes().to_vec(), v);
+            }
+        };
+        put(0, &index, &mut rng, &mut model);
+        let reader = pigeonhole::Pigeonhole::open_reader(
+            dir.join("idx.phdb"),
+            pigeonhole::ReaderOptions::default(),
+        )
+        .expect("open the reader");
+        let read: ReadIndex = Index::open_reader(&reader, "idx").expect("open_reader");
+        assert_eq!(
+            (read.spec(), read.options()),
+            (index.spec(), index.options())
+        );
+        let lists = u32::MAX;
+        for round in 0..2 {
+            let q = V::random(&mut rng, &spec, 1);
+            for nprobe in [1, 2, lists] {
+                assert_eq!(
+                    q.search_read(&read, 10, nprobe),
+                    q.search(&index, 10, nprobe),
+                    "{ctx}: round {round}, nprobe {nprobe}"
+                );
+            }
+            exact(&index, &model, &q, 10, &ctx);
+            // More vectors split lists on the writer: the reader sees the new layout.
+            put(1000 * (round + 1), &index, &mut rng, &mut model);
+        }
+        // At a snapshot: the reader's snapshot, the writer's later writes unseen.
+        let snap = reader.snapshot().unwrap();
+        let q = V::random(&mut rng, &spec, 2);
+        let before = match &q {
+            V::F32(x) => read.search_f32(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::I8(x) => read.search_i8(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::Bits(x) => read.search_bits(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::F16(x) => read.search_f16(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::BF16(x) => read.search_bf16(x, 10).nprobe(lists).snapshot(&snap).run(),
+        }
+        .unwrap();
+        let nearest = V::random(&mut rng, &spec, 2);
+        nearest.insert(&index, b"late").unwrap();
+        let again = match &q {
+            V::F32(x) => read.search_f32(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::I8(x) => read.search_i8(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::Bits(x) => read.search_bits(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::F16(x) => read.search_f16(x, 10).nprobe(lists).snapshot(&snap).run(),
+            V::BF16(x) => read.search_bf16(x, 10).nprobe(lists).snapshot(&snap).run(),
+        }
+        .unwrap();
+        assert_eq!(before, again, "{ctx}: the snapshot hides later writes");
+        drop(snap);
+        // Not an index: refused, as `open` refuses it.
+        db.table("plain")
+            .unwrap()
+            .family("f", pigeonhole::Family::default())
+            .create()
+            .unwrap();
+        let reader2 = pigeonhole::Pigeonhole::open_reader(
+            dir.join("idx.phdb"),
+            pigeonhole::ReaderOptions::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            Index::open_reader(&reader2, "plain"),
+            Err(Error::InvalidArgument(_))
+        ));
+        drop((read, reader, reader2, index));
+        db.close().unwrap();
+    }
+}
+
+/// #1268 item 5, perf287 on #1385: a `ReadIndex` outlives its writer's restart. While the
+/// writer is gone or starting, a search fails (`NoWriter` or `SnapshotExpired`); searching
+/// again once the new writer runs is enough, and it sees the new writer's vectors, splits
+/// included (the layout cache follows the new writer).
+#[test]
+fn a_reader_index_keeps_searching_across_a_writer_restart() {
+    let spec = VectorSpec::new(4, Element::F32, Metric::L2).unwrap();
+    let dir = pigeonhole::doc_support::temp_dir();
+    let mut rng = Rng::new(41);
+    let mut model = BTreeMap::new();
+    let db = open(&dir);
+    let index = Index::create(&db, "idx", spec, small()).expect("create");
+    for i in 0..60u32 {
+        let v = V::random(&mut rng, &spec, u64::from(i % 3));
+        v.insert(&index, &i.to_be_bytes()).unwrap();
+        model.insert(i.to_be_bytes().to_vec(), v);
+    }
+    let reader = pigeonhole::Pigeonhole::open_reader(
+        dir.join("idx.phdb"),
+        pigeonhole::ReaderOptions::default(),
+    )
+    .unwrap();
+    let read = Index::open_reader(&reader, "idx").unwrap();
+    let q = V::random(&mut rng, &spec, 1);
+    assert_eq!(
+        q.search_read(&read, 5, u32::MAX),
+        q.search(&index, 5, u32::MAX)
+    );
+    drop(index);
+    db.close().unwrap();
+
+    // A new writer, more vectors (more splits), then the same ReadIndex searches again.
+    let db = open(&dir);
+    let index = Index::open(&db, "idx").unwrap();
+    for i in 1000..1080u32 {
+        let v = V::random(&mut rng, &spec, u64::from(i % 3));
+        v.insert(&index, &i.to_be_bytes()).unwrap();
+        model.insert(i.to_be_bytes().to_vec(), v);
+    }
+    let search = || match &q {
+        V::F32(x) => read.search_f32(x, 5).nprobe(u32::MAX).run(),
+        _ => unreachable!("an f32 query"),
+    };
+    let mut got = search();
+    for _ in 0..200 {
+        match &got {
+            Err(pigeonhole_vector::Error::Db(e))
+                if matches!(
+                    e.code(),
+                    pigeonhole::ErrorCode::NoWriter | pigeonhole::ErrorCode::SnapshotExpired
+                ) =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                got = search();
+            }
+            _ => break,
+        }
+    }
+    assert_eq!(
+        got.expect("the reader searches again"),
+        q.search(&index, 5, u32::MAX)
+    );
+    exact(&index, &model, &q, 5, "after the restart");
+    drop((read, reader, index));
+    db.close().unwrap();
+}
+
+/// #1268 item 7: half-precision indexes. `insert_f16`/`insert_bf16` store the bit patterns
+/// exactly, through splits (a move rewrites the bits it read); `insert_f32` rounds into a
+/// half index as `put_vector_f32` does; `search_f32` and the half searches agree; and the
+/// other elements' vectors are refused.
+#[test]
+fn half_indexes_store_exact_bits_and_take_f32() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let f16 = VectorSpec::new(2, Element::F16, Metric::L2).unwrap();
+    let index = Index::create(&db, "h", f16, small()).expect("create");
+    // Enough vectors in two clusters to split lists: every stored pattern survives.
+    let mut model = BTreeMap::new();
+    for i in 0..60u16 {
+        // 1.0 + i/1024 and 2.0 or 8.0: exact f16 patterns (0x3c00 is 1.0).
+        let v = vec![0x3c00 + i, if i % 2 == 0 { 0x4000 } else { 0x4800 }];
+        index.insert_f16(&i.to_be_bytes(), &v).unwrap();
+        model.insert(i.to_be_bytes().to_vec(), V::F16(v));
+    }
+    check(&index, &model, "f16");
+    assert!(
+        index.verify().unwrap().list_lens.len() > 1,
+        "the lists split"
+    );
+    let q = V::F16(vec![0x3c10, 0x4000]);
+    exact(&index, &model, &q, 5, "f16");
+    // The same query as f32 (1.015625, 2.0) gives the same hits.
+    let as_f32 = index
+        .search_f32(&[1.015_625, 2.0], 5)
+        .nprobe(u32::MAX)
+        .run()
+        .unwrap();
+    assert_eq!(as_f32, q.search(&index, 5, u32::MAX));
+    // insert_f32 rounds: 1.0001 is stored as f16 1.0 (0x3c00), an exact tie with id 0.
+    index.insert_f32(b"rounded", &[1.0001, 2.0]).unwrap();
+    let hits = index
+        .search_f16(&[0x3c00, 0x4000], 2)
+        .nprobe(u32::MAX)
+        .run()
+        .unwrap();
+    assert!(hits.iter().all(|h| h.distance == 0.0), "{hits:?}");
+    // Other elements are refused, f16 bits in a bf16 index included.
+    assert!(matches!(
+        index.insert_i8(b"x", &[1, 2]),
+        Err(Error::InvalidArgument(_))
+    ));
+    let bf16 = VectorSpec::new(2, Element::BF16, Metric::L2).unwrap();
+    let b = Index::create(&db, "b", bf16, small()).expect("create bf16");
+    assert!(matches!(
+        b.insert_f16(b"x", &[0x3c00, 0x4000]),
+        Err(Error::InvalidArgument(_))
+    ));
+    b.insert_bf16(b"one", &[0x3f80, 0x4000]).unwrap();
+    let hit = b.search_bf16(&[0x3f80, 0x4000], 1).run().unwrap();
+    assert_eq!((hit[0].id.as_slice(), hit[0].distance), (&b"one"[..], 0.0));
+    drop((index, b));
+    db.close().unwrap();
+}

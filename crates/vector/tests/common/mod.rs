@@ -6,7 +6,7 @@
 use std::collections::BTreeMap;
 
 use pigeonhole::{Element, Metric, Options, Pigeonhole, Vector, VectorSpec};
-use pigeonhole_vector::{Hit, Index};
+use pigeonhole_vector::{Hit, Index, ReadIndex};
 
 /// The seeds a test runs: `VECTOR_SEED` alone when set, else `defaults`.
 pub fn seeds(defaults: &[u64]) -> Vec<u64> {
@@ -47,6 +47,33 @@ pub enum V {
     F32(Vec<f32>),
     I8(Vec<i8>),
     Bits(Vec<u8>),
+    /// Half vectors' bit patterns (#1268 item 7).
+    F16(Vec<u16>),
+    BF16(Vec<u16>),
+}
+
+/// `x` truncated to an IEEE binary16 bit pattern (exact for the result; tiny values become
+/// zero), so a test's half vectors hold values it can compare exactly.
+fn to_f16(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+    if exp <= 0 {
+        return sign;
+    }
+    sign | ((exp.min(30) as u16) << 10) | ((b >> 13) & 0x3ff) as u16
+}
+
+/// A half vector's components as `f32`s, widened by `pigeonhole` itself.
+fn widen(element: Element, bits: &[u16]) -> Vec<f32> {
+    let v = match element {
+        Element::F16 => Vector::from_f16_bits(bits),
+        _ => Vector::from_bf16_bits(bits),
+    }
+    .expect("a finite half vector");
+    let mut out = Vec::new();
+    v.as_ref().widen_into(&mut out);
+    out
 }
 
 impl V {
@@ -60,6 +87,16 @@ impl V {
             Element::I8 => V::I8(
                 (0..dim)
                     .map(|_| (60.0 * c.unit() + 30.0 * rng.unit()) as i8)
+                    .collect(),
+            ),
+            Element::F16 => V::F16(
+                (0..dim)
+                    .map(|_| to_f16(4.0 * c.unit() + rng.unit()))
+                    .collect(),
+            ),
+            Element::BF16 => V::BF16(
+                (0..dim)
+                    .map(|_| ((4.0 * c.unit() + rng.unit()).to_bits() >> 16) as u16)
                     .collect(),
             ),
             _ => V::Bits(
@@ -77,6 +114,8 @@ impl V {
             V::F32(x) => index.insert_f32(id, x),
             V::I8(x) => index.insert_i8(id, x),
             V::Bits(x) => index.insert_bits(id, x),
+            V::F16(x) => index.insert_f16(id, x),
+            V::BF16(x) => index.insert_bf16(id, x),
         }
     }
 
@@ -85,6 +124,20 @@ impl V {
             V::F32(x) => index.search_f32(x, k).nprobe(nprobe).run(),
             V::I8(x) => index.search_i8(x, k).nprobe(nprobe).run(),
             V::Bits(x) => index.search_bits(x, k).nprobe(nprobe).run(),
+            V::F16(x) => index.search_f16(x, k).nprobe(nprobe).run(),
+            V::BF16(x) => index.search_bf16(x, k).nprobe(nprobe).run(),
+        }
+        .expect("search")
+    }
+
+    /// [`search`](Self::search) through a reader process's handle (#1268 item 5).
+    pub fn search_read(&self, index: &ReadIndex, k: usize, nprobe: u32) -> Vec<Hit> {
+        match self {
+            V::F32(x) => index.search_f32(x, k).nprobe(nprobe).run(),
+            V::I8(x) => index.search_i8(x, k).nprobe(nprobe).run(),
+            V::Bits(x) => index.search_bits(x, k).nprobe(nprobe).run(),
+            V::F16(x) => index.search_f16(x, k).nprobe(nprobe).run(),
+            V::BF16(x) => index.search_bf16(x, k).nprobe(nprobe).run(),
         }
         .expect("search")
     }
@@ -95,18 +148,23 @@ impl V {
             V::F32(x) => Vector::from_f32(x),
             V::I8(x) => Vector::from_i8(x),
             V::Bits(x) => Vector::from_bits(spec.dim(), x),
+            V::F16(x) => Vector::from_f16_bits(x),
+            V::BF16(x) => Vector::from_bf16_bits(x),
         }
         .expect("stored vector");
         match self {
             V::F32(q) => spec.distance_f32(q, s.as_ref()),
             V::I8(q) => spec.distance_i8(q, s.as_ref()),
             V::Bits(q) => spec.distance_bits(q, s.as_ref()),
+            // A half query is compared as its widened `f32`s, as the index searches it.
+            V::F16(q) => spec.distance_f32(&widen(Element::F16, q), s.as_ref()),
+            V::BF16(q) => spec.distance_f32(&widen(Element::BF16, q), s.as_ref()),
         }
         .expect("distance")
     }
 }
 
-/// The specs the model runs over: one of each element, every metric.
+/// The specs the model runs over: every element, every metric.
 pub fn specs() -> Vec<VectorSpec> {
     vec![
         VectorSpec::new(8, Element::F32, Metric::L2).unwrap(),
@@ -114,6 +172,11 @@ pub fn specs() -> Vec<VectorSpec> {
         VectorSpec::new(6, Element::I8, Metric::InnerProduct).unwrap(),
         VectorSpec::new(6, Element::I8, Metric::Cosine).unwrap(),
         VectorSpec::new(32, Element::Bit, Metric::Hamming).unwrap(),
+        // Half precision (#1268 item 7).
+        VectorSpec::new(8, Element::F16, Metric::L2).unwrap(),
+        VectorSpec::new(8, Element::F16, Metric::Cosine).unwrap(),
+        VectorSpec::new(8, Element::BF16, Metric::InnerProduct).unwrap(),
+        VectorSpec::new(8, Element::BF16, Metric::Cosine).unwrap(),
     ]
 }
 

@@ -17,12 +17,20 @@ struct Server {
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    /// Notifications the server sent, in order (#1356).
+    notes: Vec<Value>,
 }
 
 impl Server {
     /// Starts `phdb mcp <path> <flags>` and completes the handshake.
     fn start(path: &Path, flags: &[&str]) -> Self {
-        let mut s = Self::spawn(path, flags);
+        Self::start_env(path, flags, &[]).0
+    }
+
+    /// [`start`](Self::start) with environment variables, returning the `initialize` result
+    /// too.
+    fn start_env(path: &Path, flags: &[&str], env: &[(&str, &str)]) -> (Self, Value) {
+        let mut s = Self::spawn_env(path, flags, env);
         let init = s.request(
             "initialize",
             json!({
@@ -33,14 +41,20 @@ impl Server {
         );
         assert_eq!(init["result"]["protocolVersion"], "2025-06-18", "{init}");
         s.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
-        s
+        (s, init["result"].clone())
     }
 
     fn spawn(path: &Path, flags: &[&str]) -> Self {
+        Self::spawn_env(path, flags, &[])
+    }
+
+    /// [`spawn`](Self::spawn) with environment variables set for the server.
+    fn spawn_env(path: &Path, flags: &[&str], env: &[(&str, &str)]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_phdb"))
             .arg("mcp")
             .arg(path)
             .args(flags)
+            .envs(env.iter().copied())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -53,6 +67,7 @@ impl Server {
             stdin,
             stdout,
             next_id: 1,
+            notes: Vec::new(),
         }
     }
 
@@ -66,13 +81,21 @@ impl Server {
         stdin.flush().unwrap();
     }
 
+    /// The next reply; notifications before it are kept in `notes`.
     fn reply(&mut self) -> Value {
-        let mut line = String::new();
-        assert!(
-            self.stdout.read_line(&mut line).unwrap() > 0,
-            "the server exited"
-        );
-        serde_json::from_str(&line).unwrap()
+        loop {
+            let mut line = String::new();
+            assert!(
+                self.stdout.read_line(&mut line).unwrap() > 0,
+                "the server exited"
+            );
+            let v: Value = serde_json::from_str(&line).unwrap();
+            if v.get("id").is_none() && v.get("method").is_some() {
+                self.notes.push(v);
+                continue;
+            }
+            return v;
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Value {
@@ -654,14 +677,30 @@ fn traverse_pages_come_from_one_cached_result() {
         "every node of the first result once, none added later"
     );
 
-    // Another traversal replaces the cached one: an old cursor runs its traversal again
-    // (now seeing the added edges), as cursors did before the cache.
+    // A traversal that fits one result leaves the cache alone; one that returns a cursor
+    // replaces it, and then an old cursor runs its traversal again, as cursors did before
+    // the cache: it sees an edge added since its first page.
     let second = s.call("traverse", args.clone());
     let stale = second["cursor"].clone();
+    let counted = second["hops"][0]["node_count"].as_u64().unwrap();
+    s.call("write", json!({"ops": [edge("999")]}));
     s.call(
         "traverse",
         json!({"table": "g", "family": "out", "seeds": ["n:000"]}),
     );
+    let mut cached = args.clone();
+    cached["cursor"] = stale.clone();
+    let page = s.call("traverse", cached);
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(counted),
+        "{page}"
+    );
+    let other = s.call(
+        "traverse",
+        json!({"table": "g", "family": "out", "seeds": ["n:hub"], "per_node_limit": 1000}),
+    );
+    assert!(other["cursor"].is_string(), "{other}");
     let mut again = args.clone();
     again["cursor"] = stale;
     let page = s.call("traverse", again);
@@ -669,9 +708,27 @@ fn traverse_pages_come_from_one_cached_result() {
         page["hops"][0]["first_index"].as_u64().unwrap() > 0,
         "{page}"
     );
-    assert!(
-        page["hops"][0]["node_count"].as_u64().unwrap() > 60,
-        "the re-run sees the added edges: {page}"
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(counted + 1),
+        "the re-run sees the edge added since: {page}"
+    );
+    // The same call run again caches a newer run: a cursor from the older run doesn't
+    // page from it (it carries its run id) but runs again, seeing what's newer still.
+    let older = s.call("traverse", args.clone());
+    let older_cursor = older["cursor"].clone();
+    let base = older["hops"][0]["node_count"].as_u64().unwrap();
+    s.call("write", json!({"ops": [edge("998")]}));
+    let newer = s.call("traverse", args.clone());
+    assert_eq!(newer["hops"][0]["node_count"].as_u64(), Some(base + 1));
+    s.call("write", json!({"ops": [edge("997")]}));
+    let mut again = args.clone();
+    again["cursor"] = older_cursor;
+    let page = s.call("traverse", again);
+    assert_eq!(
+        page["hops"][0]["node_count"].as_u64(),
+        Some(base + 2),
+        "an older run's cursor runs again, not from the newer run's cache: {page}"
     );
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
@@ -690,12 +747,14 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     assert_eq!(status, 4, "{err}");
     assert!(err.contains("NoWriter") || err.contains("writer"), "{err}");
 
+    // The writer feeds (D310), so the reader serves feed_poll too (#1361).
     let db = Pigeonhole::open(
         &path,
         Options::default()
             .shards(1)
             .pin_threads(false)
-            .create_if_missing(true),
+            .create_if_missing(true)
+            .change_feed(pigeonhole::FeedRetention::bytes(16 << 20)),
     )
     .unwrap();
     let t = db
@@ -708,8 +767,18 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     let mut s = Server::start(&path, &["--read-only"]);
     assert_eq!(
         s.tool_names(),
-        ["list_tables", "read_row", "scan", "traverse"]
+        ["list_tables", "read_row", "scan", "traverse", "feed_poll"]
     );
+    // A reader process follows the writer's feed: a first poll's token, then the writer's
+    // next commit arrives from it.
+    let first = s.call("feed_poll", json!({"tables": ["t"]}));
+    assert_eq!(first["commits"], json!([]), "{first}");
+    t.mutate(b"fed").put("f", b"q", b"x").commit().unwrap();
+    let fed = s.call(
+        "feed_poll",
+        json!({"tables": ["t"], "token": first["token"], "wait_ms": 5000}),
+    );
+    assert_eq!(fed["commits"][0]["changes"][0]["row"], "fed", "{fed}");
     let tables = s.call("list_tables", json!({}));
     assert_eq!(tables["mode"], "reader");
     assert_eq!(tables["writable"], false);
@@ -732,10 +801,13 @@ fn read_only_serves_a_live_database_as_a_reader_without_write_tools() {
     db.close().unwrap();
 
     // Without --read-only, phdb mcp beside a running writer is a reader too, with no write
-    // tools.
+    // tools (feed_poll is listed on any reader open, #1361).
     let db = Pigeonhole::open(&path, Options::default().shards(1).pin_threads(false)).unwrap();
     let mut s = Server::start(&path, &[]);
-    assert_eq!(s.tool_names().len(), 4);
+    assert_eq!(
+        s.tool_names(),
+        ["list_tables", "read_row", "scan", "traverse", "feed_poll"]
+    );
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
     db.close().unwrap();
@@ -1052,6 +1124,677 @@ fn feed_poll_continues_from_its_token_and_reports_expiry() {
     let err = s.fail("feed_poll", json!({"tables": ["t"], "token": kept}));
     assert_eq!(err["code"], "FeedExpired", "{err}");
     assert_eq!(err["code_num"], 31, "{err}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
+/// #1356: the server advertises `listChanged`, and once the client has listed the tools, a
+/// call that changes them (the first vector family brings `nearest`) is followed by
+/// `notifications/tools/list_changed`, once; a call that changes nothing sends none.
+#[test]
+fn a_new_vector_family_announces_nearest() {
+    let dir = TempDir::new("mcp-list-changed");
+    let mut s = Server::spawn(&db_path(&dir), &["--create"]);
+    let init = s.request("initialize", json!({"protocolVersion": "2025-06-18"}));
+    assert_eq!(init["result"]["capabilities"]["tools"]["listChanged"], true);
+    s.send(&json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+    let names = s.tool_names();
+    assert!(!names.contains(&"nearest".to_owned()), "{names:?}");
+    // A plain table changes nothing: no notification.
+    s.call("create_table", json!({"table": "plain", "families": ["f"]}));
+    s.call("list_tables", json!({}));
+    assert!(s.notes.is_empty(), "{:?}", s.notes);
+    // The first vector family: the reply, then the notification.
+    s.call(
+        "create_table",
+        json!({"table": "docs", "families": [
+            {"name": "emb", "vector": {"dim": 2, "element": "f32", "metric": "l2"}}
+        ]}),
+    );
+    s.call("list_tables", json!({}));
+    assert_eq!(
+        s.notes,
+        [json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"})]
+    );
+    assert!(s.tool_names().contains(&"nearest".to_owned()));
+    // Once per change.
+    s.call("list_tables", json!({}));
+    assert_eq!(s.notes.len(), 1);
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+}
+
+/// The memory tools' names, as `tools/list` gives them on a writable server.
+const MEMORY_TOOLS: [&str; 6] = [
+    "memory_recall",
+    "memory_remember",
+    "memory_mark_used",
+    "memory_supersede",
+    "memory_link",
+    "memory_forget",
+];
+
+/// `--memory` on a store without an embedding model (D311 T7): the six tools, the
+/// instructions and the guide resource, and each tool's round trip.
+#[test]
+fn memory_tools_remember_recall_supersede_and_forget() {
+    let dir = TempDir::new("mcp-memory");
+    let path = db_path(&dir);
+    let (mut s, init) = Server::start_env(&path, &["--create", "--memory", "agent"], &[]);
+    let instructions = init["instructions"].as_str().unwrap();
+    assert!(instructions.contains("Long-term memory"), "{instructions}");
+    assert!(instructions.contains("memory://guide"), "{instructions}");
+    assert!(init["capabilities"]["resources"].is_object(), "{init}");
+    let names = s.tool_names();
+    assert!(
+        names.ends_with(&MEMORY_TOOLS.map(String::from)),
+        "{names:?}"
+    );
+    let list = s.request("tools/list", json!({}));
+    for t in list["result"]["tools"].as_array().unwrap() {
+        let name = t["name"].as_str().unwrap();
+        if name.starts_with("memory_") {
+            assert!(t["description"].as_str().unwrap().len() > 150, "{t}");
+            assert_eq!(
+                t["annotations"]["destructiveHint"],
+                name == "memory_forget",
+                "{t}"
+            );
+            assert_eq!(t["annotations"]["readOnlyHint"], name == "memory_recall");
+        }
+    }
+    // The guide resource.
+    let res = s.request("resources/list", json!({}));
+    assert_eq!(res["result"]["resources"][0]["uri"], "memory://guide");
+    let guide = s.request("resources/read", json!({"uri": "memory://guide"}));
+    let text = guide["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(text.starts_with("# Using the memory tools"), "{text}");
+    let missing = s.request("resources/read", json!({"uri": "memory://nope"}));
+    assert_eq!(missing["error"]["code"], -32002, "{missing}");
+
+    // Remember; an exact duplicate (after whitespace) merges.
+    let tabs = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana prefers tabs in Go code", "kind": "semantic", "importance": 0.9}),
+    );
+    assert_eq!(tabs["outcome"], "new", "{tabs}");
+    let id = tabs["id"].as_str().unwrap().to_owned();
+    let again = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "  Dana prefers tabs   in Go code"}),
+    );
+    assert_eq!(
+        (&again["outcome"], &again["id"]),
+        (&json!("merged"), &json!(id))
+    );
+    s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana's team ships on Thursdays"}),
+    );
+    // Another namespace is never recalled.
+    s.call(
+        "memory_remember",
+        json!({"namespace": "user:sam", "text": "Sam prefers tabs too"}),
+    );
+    let hits = s.call(
+        "memory_recall",
+        json!({"namespace": "user:dana", "text": "tabs"}),
+    );
+    assert_eq!(hits["hits"][0]["id"], json!(id), "{hits}");
+    assert_eq!(hits["hits"][0]["kind"], "semantic");
+    assert_eq!(hits["hits"].as_array().unwrap().len(), 2, "{hits}");
+    assert_eq!(hits["truncated"], false);
+
+    // A changed fact supersedes the old one: recall leaves the old one out.
+    let spaces = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana now prefers spaces in Go code", "supersedes": id}),
+    );
+    assert_eq!(spaces["superseded"], true, "{spaces}");
+    let new_id = spaces["id"].as_str().unwrap().to_owned();
+    let hits = s.call(
+        "memory_recall",
+        json!({"namespace": "user:dana", "text": "prefers Go code"}),
+    );
+    let ids: Vec<&str> = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["id"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&new_id.as_str()) && !ids.contains(&id.as_str()),
+        "{hits}"
+    );
+    let all = s.call(
+        "memory_recall",
+        json!({"namespace": "user:dana", "text": "tabs", "include_superseded": true}),
+    );
+    assert_eq!(all["hits"][0]["superseded_by"], json!(new_id), "{all}");
+
+    // A failed supersede still returns the stored memory (simp724's S2): c is superseded by
+    // d already, so e's supersede fails, and e is stored all the same.
+    let c = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana uses vim"}),
+    )["id"]
+        .clone();
+    let d = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana uses helix"}),
+    )["id"]
+        .clone();
+    s.call("memory_supersede", json!({"old": c, "new": d}));
+    let e = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana uses zed", "supersedes": c}),
+    );
+    assert_eq!(
+        (&e["outcome"], &e["superseded"]),
+        (&json!("new"), &json!(false)),
+        "{e}"
+    );
+    assert!(e["supersede_error"]["message"].as_str().is_some(), "{e}");
+    let zed = s.call(
+        "memory_recall",
+        json!({"namespace": "user:dana", "text": "zed"}),
+    );
+    assert_eq!(zed["hits"][0]["id"], e["id"], "{zed}");
+    // A memory supersedes one of its own namespace only, refused before the write.
+    let e = s.fail(
+        "memory_remember",
+        json!({"namespace": "user:sam", "text": "Sam uses emacs", "supersedes": d}),
+    );
+    assert!(e["message"].as_str().unwrap().contains("namespace"), "{e}");
+    let emacs = s.call(
+        "memory_recall",
+        json!({"namespace": "user:sam", "text": "emacs"}),
+    );
+    assert!(
+        emacs["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["text"] != "Sam uses emacs"),
+        "{emacs}"
+    );
+
+    // Use, links, and forgetting.
+    let used = s.call("memory_mark_used", json!({"ids": [new_id]}));
+    assert_eq!(used, json!({"marked": 1, "missing": []}));
+    s.call(
+        "memory_link",
+        json!({"from": new_id, "to": id, "type": "derived_from", "weight": 0.5}),
+    );
+    let e = s.fail(
+        "memory_link",
+        json!({"from": new_id, "to": id, "type": "supersedes"}),
+    );
+    assert!(
+        e["message"].as_str().unwrap().contains("memory_supersede"),
+        "{e}"
+    );
+    let sam = s.call(
+        "memory_recall",
+        json!({"namespace": "user:sam", "text": "tabs"}),
+    )["hits"][0]["id"]
+        .clone();
+    let e = s.fail("memory_link", json!({"from": new_id, "to": sam}));
+    assert_eq!(e["code"], "InvalidArgument", "{e}");
+    let gone = s.call("memory_forget", json!({"ids": [id]}));
+    assert_eq!(gone, json!({"deleted": 1, "missing": []}));
+    let gone = s.call("memory_forget", json!({"ids": [id]}));
+    assert_eq!(gone, json!({"deleted": 0, "missing": [id]}));
+    let used = s.call("memory_mark_used", json!({"ids": [id]}));
+    assert_eq!(used, json!({"marked": 0, "missing": [id]}));
+
+    // Mistakes are tool errors.
+    for (tool, args) in [
+        ("memory_remember", json!({"text": "x", "kind": "dream"})),
+        ("memory_remember", json!({"text": "x", "importance": 2})),
+        ("memory_remember", json!({"text": "x", "embedding": [1.0]})),
+        ("memory_remember", json!({"text": "x", "colour": "red"})),
+        ("memory_recall", json!({})),
+        (
+            "memory_recall",
+            json!({"text": "x", "namespace": "a", "namespaces": ["b"]}),
+        ),
+        ("memory_forget", json!({"ids": []})),
+        ("memory_forget", json!({"ids": ["not an id"]})),
+        (
+            "memory_supersede",
+            json!({"old": "not an id", "new": new_id}),
+        ),
+    ] {
+        s.fail(tool, args);
+    }
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("created memory store agent (no embedding model"),
+        "{err}"
+    );
+
+    // Reopened, the store is there; a model now is refused, since it has none.
+    let mut s = Server::start(&path, &["--memory", "agent"]);
+    let hits = s.call(
+        "memory_recall",
+        json!({"namespace": "user:dana", "text": "spaces"}),
+    );
+    assert_eq!(hits["hits"][0]["id"], json!(new_id), "{hits}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+    let (status, err) = Server::spawn(
+        &path,
+        &[
+            "--memory",
+            "agent",
+            "--memory-model",
+            "m1",
+            "--memory-dim",
+            "4",
+        ],
+    )
+    .finish();
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("has no embedding model"), "{err}");
+}
+
+/// A store pinned to a client's model (part 2 of the owner's T7 decision): an embedding must
+/// name the store's model and fit its dimension, and another model is refused at startup.
+#[test]
+fn a_pinned_store_refuses_another_models_embeddings() {
+    let dir = TempDir::new("mcp-memory-pinned");
+    let path = db_path(&dir);
+    let flags = [
+        "--create",
+        "--memory",
+        "agent",
+        "--memory-model",
+        "m1",
+        "--memory-dim",
+        "4",
+        "--memory-element",
+        "f16",
+    ];
+    let (mut s, init) = Server::start_env(&path, &flags, &[]);
+    assert!(
+        init["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("\"m1\" (4 dimensions)"),
+        "{init}"
+    );
+    let e = s.fail("memory_remember", json!({"text": "no vector"}));
+    assert!(e["message"].as_str().unwrap().contains("pinned"), "{e}");
+    let v = json!([1.0, 0.0, 0.0, 0.0]);
+    for args in [
+        json!({"text": "x", "embedding": v}),
+        json!({"text": "x", "embedding": v, "embedding_model": "m2"}),
+        json!({"text": "x", "embedding": [1.0, 0.0, 0.0], "embedding_model": "m1"}),
+        json!({"text": "x", "embedding": [1.0, "a", 0.0, 0.0], "embedding_model": "m1"}),
+        json!({"text": "x", "embedding_model": "m1"}),
+    ] {
+        s.fail("memory_remember", args);
+    }
+    let a = s.call(
+        "memory_remember",
+        json!({"text": "the deploy key lives in vault", "embedding": v, "embedding_model": "m1", "importance": 0.9}),
+    );
+    let b = s.call(
+        "memory_remember",
+        json!({"text": "lunch is at noon", "embedding": [0.0, 1.0, 0.0, 0.0], "embedding_model": "m1"}),
+    );
+    // By embedding alone: the vector rank decides between a (more important) and b (newer).
+    // Then by text alone (keyword recall on a pinned store).
+    for (query, want) in [([0.9, 0.1, 0.0, 0.0], &a), ([0.1, 0.9, 0.0, 0.0], &b)] {
+        let hits = s.call(
+            "memory_recall",
+            json!({"embedding": query, "embedding_model": "m1"}),
+        );
+        assert_eq!(hits["hits"][0]["id"], want["id"], "{query:?}: {hits}");
+    }
+    let hits = s.call("memory_recall", json!({"text": "lunch"}));
+    assert_eq!(hits["hits"][0]["id"], b["id"], "{hits}");
+    s.fail(
+        "memory_recall",
+        json!({"embedding": [0.9, 0.1, 0.0, 0.0], "embedding_model": "m2"}),
+    );
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("embedding model m1, 4 dimensions"), "{err}");
+
+    // Reopened without a model flag: the pinned one is used. With another: refused.
+    let (s, init) = Server::start_env(&path, &["--memory", "agent"], &[]);
+    assert!(init["instructions"].as_str().unwrap().contains("\"m1\""));
+    assert_eq!(s.finish().0, 0);
+    for flags in [
+        &[
+            "--memory",
+            "agent",
+            "--memory-model",
+            "m2",
+            "--memory-dim",
+            "4",
+        ][..],
+        &[
+            "--memory",
+            "agent",
+            "--memory-model",
+            "m1",
+            "--memory-dim",
+            "8",
+        ][..],
+    ] {
+        let (status, err) = Server::spawn(&path, flags).finish();
+        assert_eq!(status, 2, "{err}");
+        assert!(err.contains("pinned"), "{err}");
+    }
+}
+
+/// A reader process serves `memory_recall` only, over the writer's store.
+#[test]
+fn a_reader_recalls_the_writers_memories() {
+    let dir = TempDir::new("mcp-memory-reader");
+    let path = db_path(&dir);
+    let db = Pigeonhole::open(
+        &path,
+        Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .create_if_missing(true),
+    )
+    .unwrap();
+    // No store yet: a reader can't create one.
+    let (status, err) = Server::spawn(&path, &["--read-only", "--memory", "agent"]).finish();
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("doesn't exist"), "{err}");
+    let store =
+        pigeonhole_memory::Store::create(&db, "agent", pigeonhole_memory::StoreOptions::new())
+            .unwrap();
+    let id = store
+        .remember(
+            "default",
+            pigeonhole_memory::Memory::new("the build runs on Fridays"),
+        )
+        .unwrap()
+        .id()
+        .to_string();
+    let mut s = Server::start(&path, &["--read-only", "--memory", "agent"]);
+    let names = s.tool_names();
+    assert!(names.contains(&"memory_recall".to_owned()), "{names:?}");
+    assert!(!names.contains(&"memory_remember".to_owned()), "{names:?}");
+    let hits = s.call("memory_recall", json!({"text": "build"}));
+    assert_eq!(hits["hits"][0]["id"], json!(id), "{hits}");
+    let e = s.fail("memory_remember", json!({"text": "x"}));
+    assert_eq!(e["code"], "ReadOnly", "{e}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+    drop(store);
+    db.close().unwrap();
+}
+
+/// A stand-in for an OpenAI-compatible `/embeddings` endpoint: answers each request with a
+/// 4-dimension embedding of its input (counts of letters), or HTTP 500 for an input that
+/// starts with `FAIL:`, and records each request's `Authorization` header and body.
+#[cfg(feature = "embed")]
+struct Stub {
+    url: String,
+    seen: Seen,
+}
+
+/// The stub's record: each request's `Authorization` header and body.
+#[cfg(feature = "embed")]
+type Seen = std::sync::Arc<std::sync::Mutex<Vec<(Option<String>, Value)>>>;
+
+#[cfg(feature = "embed")]
+impl Stub {
+    fn start() -> Self {
+        use std::io::Read;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/v1/embeddings", listener.local_addr().unwrap());
+        let seen: Seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = std::sync::Arc::clone(&seen);
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { return };
+                let mut reader = BufReader::new(conn.try_clone().unwrap());
+                let (mut auth, mut len) = (None, 0usize);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    let (k, v) = line.trim_end().split_once(": ").unwrap_or(("", ""));
+                    match k.to_ascii_lowercase().as_str() {
+                        "authorization" => auth = Some(v.to_owned()),
+                        "content-length" => len = v.parse().unwrap(),
+                        _ => {}
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                let input = body["input"].as_str().unwrap_or("").to_owned();
+                log.lock().unwrap().push((auth, body));
+                let count = |c: char| input.chars().filter(|x| *x == c).count() as f32;
+                let (status, reply) = if input.starts_with("FAIL:") {
+                    (
+                        "500 Internal Server Error",
+                        json!({"error": {"message": "boom"}}),
+                    )
+                } else {
+                    let e = [
+                        input.len() as f32 + 1.0,
+                        count('a') + 1.0,
+                        count('e') + 1.0,
+                        count(' ') + 1.0,
+                    ];
+                    (
+                        "200 OK",
+                        json!({"object": "list", "data": [{"object": "embedding", "index": 0, "embedding": e}], "model": "stub"}),
+                    )
+                };
+                let reply = reply.to_string();
+                let _ = write!(
+                    conn,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        });
+        Self { url, seen }
+    }
+
+    fn requests(&self) -> Vec<(Option<String>, Value)> {
+        self.seen.lock().unwrap().clone()
+    }
+}
+
+/// `--embed-url` (part 3): the server embeds text through the endpoint, with the key from
+/// the environment, pins a new store to the endpoint's model and dimension, and refuses a
+/// client's vectors. The key never reaches stderr or a tool error.
+#[cfg(feature = "embed")]
+#[test]
+fn embed_url_embeds_text_through_the_endpoint() {
+    let dir = TempDir::new("mcp-memory-embed");
+    let path = db_path(&dir);
+    let stub = Stub::start();
+    let key = ("PHDB_TEST_EMBED_KEY", "sekrit-key-123");
+    let flags = [
+        "--create",
+        "--memory",
+        "agent",
+        "--embed-url",
+        &stub.url,
+        "--embed-model",
+        "stub-e",
+        "--embed-key-env",
+        key.0,
+    ];
+    let (mut s, init) = Server::start_env(&path, &flags, &[key]);
+    assert!(
+        init["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("send text only"),
+        "{init}"
+    );
+    let a = s.call(
+        "memory_remember",
+        json!({"text": "the cache sits in front of the database"}),
+    );
+    s.call("memory_remember", json!({"text": "zz"}));
+    let hits = s.call(
+        "memory_recall",
+        json!({"text": "the cache sits in front of the database", "k": 1}),
+    );
+    assert_eq!(hits["hits"][0]["id"], a["id"], "{hits}");
+    let e = s.fail(
+        "memory_remember",
+        json!({"text": "x", "embedding": [1.0, 1.0, 1.0, 1.0], "embedding_model": "stub-e"}),
+    );
+    assert!(
+        e["message"].as_str().unwrap().contains("--embed-url"),
+        "{e}"
+    );
+    // The endpoint's failure is the tool's, and nothing is written.
+    let e = s.fail("memory_remember", json!({"text": "FAIL: zebra"}));
+    let message = e["message"].as_str().unwrap();
+    assert!(message.contains("HTTP 500"), "{e}");
+    assert!(!message.contains(key.1), "{e}");
+    let hits = s.call("memory_recall", json!({"text": "zebra"}));
+    let texts: Vec<&str> = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|h| h["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(texts.len(), 2, "{hits}");
+    assert!(texts.iter().all(|t| !t.contains("zebra")), "{hits}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("embedding model stub-e, 4 dimensions"),
+        "{err}"
+    );
+    assert!(!err.contains(key.1), "{err}");
+    let seen = stub.requests();
+    assert_eq!(seen[0].1["input"], "dimension probe", "{seen:?}");
+    for (auth, body) in &seen {
+        assert_eq!(auth.as_deref(), Some("Bearer sekrit-key-123"));
+        assert_eq!(body["model"], "stub-e");
+    }
+    assert!(
+        seen.iter()
+            .any(|(_, b)| b["input"] == "the cache sits in front of the database"),
+        "{seen:?}"
+    );
+
+    // An unset key variable, or another model than the store's, fails at startup.
+    let mut unset = flags;
+    unset[8] = "PHDB_TEST_EMBED_KEY_UNSET";
+    let (status, err) = Server::spawn(&path, &unset).finish();
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("PHDB_TEST_EMBED_KEY_UNSET"), "{err}");
+    let mut other = flags;
+    other[6] = "another-model";
+    let (status, err) = Server::spawn_env(&path, &other, &[key]).finish();
+    assert_eq!(status, 2, "{err}");
+    assert!(
+        err.contains("pinned to the embedding model \"stub-e\""),
+        "{err}"
+    );
+}
+
+/// Without the `embed` feature, `--embed-url` is refused as unsupported.
+#[cfg(not(feature = "embed"))]
+#[test]
+fn embed_url_needs_the_embed_feature() {
+    let dir = TempDir::new("mcp-memory-no-embed");
+    let path = db_path(&dir);
+    let (status, err) = Server::spawn(
+        &path,
+        &[
+            "--create",
+            "--memory",
+            "agent",
+            "--embed-url",
+            "https://example.invalid/v1/embeddings",
+            "--embed-model",
+            "m",
+        ],
+    )
+    .finish();
+    assert_eq!(status, 6, "{err}");
+    assert!(err.contains("embed"), "{err}");
+}
+
+/// With `supersedes`, a store's near dedup doesn't stop the write (simp724's S1 on #1389): a
+/// correction is near what it corrects, and `Skip` would otherwise store nothing and
+/// supersede with the match.
+#[test]
+fn a_correction_is_stored_through_near_dedup() {
+    let dir = TempDir::new("mcp-memory-near");
+    let path = db_path(&dir);
+    let db = Pigeonhole::open(
+        &path,
+        Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .create_if_missing(true),
+    )
+    .unwrap();
+    let model = pigeonhole_memory::EmbeddingModel::new("m1", 4, pigeonhole::Element::F32).unwrap();
+    let near = pigeonhole_memory::NearDedup::new(0.9).policy(pigeonhole_memory::DedupPolicy::Skip);
+    drop(
+        pigeonhole_memory::Store::create(
+            &db,
+            "agent",
+            pigeonhole_memory::StoreOptions::new()
+                .embedding(model)
+                .near_dedup(near),
+        )
+        .unwrap(),
+    );
+    db.close().unwrap();
+    let mut s = Server::start(&path, &["--memory", "agent"]);
+    let five = s.call(
+        "memory_remember",
+        json!({"text": "the timeout is 5 s", "embedding": [1.0, 0.0, 0.0, 0.0], "embedding_model": "m1"}),
+    );
+    // Near dedup is on: a near memory without supersedes writes nothing.
+    let near = s.call(
+        "memory_remember",
+        json!({"text": "the timeout is five seconds", "embedding": [0.99, 0.01, 0.0, 0.0], "embedding_model": "m1"}),
+    );
+    assert_eq!(
+        (&near["outcome"], &near["id"]),
+        (&json!("similar"), &five["id"]),
+        "{near}"
+    );
+    // The correction is stored, and supersedes the old fact.
+    let six = s.call(
+        "memory_remember",
+        json!({"text": "the timeout is 6 s", "embedding": [0.98, 0.02, 0.0, 0.0], "embedding_model": "m1", "supersedes": five["id"]}),
+    );
+    assert_eq!(
+        (&six["outcome"], &six["superseded"]),
+        (&json!("new"), &json!(true)),
+        "{six}"
+    );
+    assert_ne!(six["id"], five["id"]);
+    let hits = s.call(
+        "memory_recall",
+        json!({"text": "timeout", "include_superseded": true}),
+    );
+    let old = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == five["id"])
+        .unwrap_or_else(|| panic!("{hits}"));
+    assert_eq!(old["superseded_by"], six["id"], "{hits}");
     let (status, err) = s.finish();
     assert_eq!(status, 0, "{err}");
 }

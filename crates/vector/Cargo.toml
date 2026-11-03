@@ -30,3 +30,5 @@ __unstable-hooks = []
 
 [dev-dependencies]
 pigeonhole-vector = { path = ".", features = ["__unstable-hooks"] }
+# Only to check that the crate's f32-to-half rounding is the one a half family stores.
+pigeonhole-format = { workspace = true }

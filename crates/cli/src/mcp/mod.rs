@@ -2,8 +2,9 @@
 //!
 //! The stdio transport: one JSON-RPC 2.0 message per line in each direction, and nothing
 //! else on standard output (diagnostics go to standard error). The server answers
-//! `initialize`, `ping`, `tools/list` and `tools/call`, ignores notifications, and exits
-//! when its input ends, closing the database.
+//! `initialize`, `ping`, `tools/list` and `tools/call` (and, with `--memory`,
+//! `resources/list` and `resources/read` for `memory://guide`), ignores notifications, and
+//! exits when its input ends, closing the database.
 //!
 //! A hand-written loop rather than an MCP SDK: the server is synchronous and needs four
 //! methods, and the Rust SDKs bring an async runtime and a schema generator for them.
@@ -18,11 +19,13 @@ use std::path::Path;
 use serde_json::{Map, Value, json};
 
 use crate::ExitStatus;
-use crate::args::Cli;
+use crate::args::{Cli, MemoryArgs};
 use crate::exit::Failure;
 use crate::open::{self, Db};
 
 mod cursor;
+mod embed;
+mod memory;
 mod tools;
 
 /// The protocol versions this server speaks, newest first. The tool shapes are the same in
@@ -54,13 +57,20 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
+/// MCP's code for a resource that doesn't exist.
+const RESOURCE_NOT_FOUND: i64 = -32002;
 
+/// The memory guide's resource.
+const GUIDE_URI: &str = "memory://guide";
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run(
     cli: &Cli,
     file: &Path,
     read_only: bool,
     create: bool,
     limits: Limits,
+    memory_args: &MemoryArgs,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> Result<ExitStatus, Failure> {
@@ -84,8 +94,19 @@ pub(crate) fn run(
         db.mode(),
         if writable { "" } else { " (read-only)" }
     );
+    let memory = match memory::Memory::open(&db, memory_args, writable, limits.result_bytes, stderr)
+    {
+        Ok(m) => m,
+        Err(f) => {
+            // Close what was opened; the failure is the one to report.
+            let _ = db.close();
+            return Err(f);
+        }
+    };
     let server = Server {
-        tools: tools::Tools::new(db, writable, limits),
+        tools: tools::Tools::new(db, writable, limits, memory),
+        listed: std::cell::RefCell::new(None),
+        called: std::cell::Cell::new(false),
     };
     let served = server.serve(&mut std::io::stdin().lock(), stdout);
     let closed = server.tools.close();
@@ -101,6 +122,13 @@ pub(crate) fn run(
 
 struct Server {
     tools: tools::Tools,
+    /// The tool names the client was last given (`tools/list`): when a call changes them
+    /// (`create_table` adding the first vector family brings `nearest`), the server sends
+    /// `notifications/tools/list_changed` (#1356). `None` until the client lists.
+    listed: std::cell::RefCell<Option<Vec<String>>>,
+    /// Whether the line being answered held a `tools/call`: only then is the list checked
+    /// (ai1249 on #1379), so a ping or a notification costs no catalog walk.
+    called: std::cell::Cell<bool>,
 }
 
 impl Server {
@@ -119,7 +147,28 @@ impl Server {
                 writeln!(output, "{reply}")?;
                 output.flush()?;
             }
+            // After the reply: tell a client that listed the tools when a call changed them.
+            if let Some(note) = self.list_changed() {
+                writeln!(output, "{note}")?;
+                output.flush()?;
+            }
         }
+    }
+
+    /// `notifications/tools/list_changed` if the tools differ from those last listed, once
+    /// per change.
+    fn list_changed(&self) -> Option<Value> {
+        if !self.called.replace(false) {
+            return None;
+        }
+        let mut listed = self.listed.borrow_mut();
+        let before = listed.as_ref()?;
+        let now = self.tools.names();
+        if *before == now {
+            return None;
+        }
+        *listed = Some(now);
+        Some(json!({"jsonrpc": "2.0", "method": "notifications/tools/list_changed"}))
     }
 
     /// One line: a request, a notification or a batch (2025-03-26). Returns the reply, if
@@ -169,20 +218,38 @@ impl Server {
                     .iter()
                     .find(|&&v| v == asked)
                     .unwrap_or(&PROTOCOL_VERSIONS[0]);
+                let memory = self.tools.memory();
+                let mut capabilities = json!({"tools": {"listChanged": true}});
+                let mut instructions = INSTRUCTIONS.to_owned();
+                if let Some(m) = memory {
+                    capabilities["resources"] = json!({});
+                    instructions.push_str("\n\n");
+                    instructions.push_str(&m.instructions());
+                }
                 Ok(json!({
                     "protocolVersion": version,
-                    "capabilities": {"tools": {"listChanged": false}},
+                    "capabilities": capabilities,
                     "serverInfo": {
                         "name": "phdb",
                         "title": "Pigeonhole",
                         "version": env!("CARGO_PKG_VERSION"),
                     },
-                    "instructions": INSTRUCTIONS,
+                    "instructions": instructions,
                 }))
             }
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({"tools": self.tools.list()})),
+            "tools/list" => {
+                let tools = self.tools.list();
+                *self.listed.borrow_mut() = Some(
+                    tools
+                        .iter()
+                        .filter_map(|t| t["name"].as_str().map(str::to_owned))
+                        .collect(),
+                );
+                Ok(json!({"tools": tools}))
+            }
             "tools/call" => {
+                self.called.set(true);
                 let name = params["name"]
                     .as_str()
                     .ok_or((INVALID_PARAMS, "tools/call needs a tool name".to_owned()))?;
@@ -197,6 +264,27 @@ impl Server {
                     .call(name, args)
                     .ok_or_else(|| (INVALID_PARAMS, format!("no tool {name}")))?;
                 Ok(tool_result(outcome))
+            }
+            "resources/list" if self.tools.memory().is_some() => Ok(json!({
+                "resources": [{
+                    "uri": GUIDE_URI,
+                    "name": "memory-guide",
+                    "title": "Using the memory tools",
+                    "description": "When to remember and recall, namespaces, importance, \
+                                    superseding, marking use, and embeddings.",
+                    "mimeType": "text/markdown",
+                }],
+            })),
+            "resources/read" if self.tools.memory().is_some() => {
+                let uri = params["uri"]
+                    .as_str()
+                    .ok_or((INVALID_PARAMS, "resources/read needs a uri".to_owned()))?;
+                if uri != GUIDE_URI {
+                    return Err((RESOURCE_NOT_FOUND, format!("no resource {uri}")));
+                }
+                Ok(json!({
+                    "contents": [{"uri": GUIDE_URI, "mimeType": "text/markdown", "text": memory::GUIDE}],
+                }))
             }
             _ => Err((METHOD_NOT_FOUND, format!("no method {method}"))),
         }
