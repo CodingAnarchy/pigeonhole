@@ -159,6 +159,36 @@ assert_eq!((pass.committed, pass.created), (1, 1));
 - **A consolidator error** stops the pass with `Error::Consolidate { error, pass }`: its own `Err`, a returned memory the store refuses, or a returned link to a memory that's gone. The groups before it stay committed.
 - **When to run it:** on demand. Unlike forgetting, there's no thread.
 
+## Following links
+`expand` widens a recall to the memories its best candidates link to, or that link to them:
+```rust
+# use pigeonhole::*;
+# use pigeonhole_memory::{EmbeddingModel, Expand, LinkType, Memory, Store, StoreOptions};
+# fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+# let dir = pigeonhole::doc_support::temp_dir();
+# let db = Pigeonhole::open(dir.join("guide.phdb"), Options::default())?;
+# let store = Store::create(&db, "agents", StoreOptions::new().embedding(EmbeddingModel::new("m", 4, Element::F32)?))?;
+let why = store.remember("agent:alice", Memory::new("Postgres won on JSON support.").embedding(vec![0.0, 0.0, 1.0, 0.0]))?.id().clone();
+let what = store.remember("agent:alice", Memory::new("The March meeting chose Postgres.").embedding(vec![0.9, 0.1, 0.0, 0.2]))?.id().clone();
+store.link(&what, &why, LinkType::custom(16)?, 0.9)?;
+let hits = store
+    .recall(&["agent:alice"])
+    .embedding(vec![0.8, 0.2, 0.0, 0.1])
+    .candidates(1)
+    .expand(Expand::hops(1))
+    .run()?;
+assert!(hits.iter().any(|h| h.id == why));
+# db.close()?;
+# Ok(())
+# }
+```
+
+- **Seeds:** the top 10 of the fused list. Seed `i` is worth `1 / i`.
+- **The graph signal:** a memory reached at a hop gets the best `value × link weight` over the links between it and the previous hop's memories, in either direction. It's ranked and fused like the other signals, with `Weights::graph` (0.5 by default), and is reported as `Signals::graph`. Seeds don't get one, and nothing does without `expand`.
+- **Bounds:** `Expand::hops(n)` takes 1 to 4 hops. `.max(m)` (default 20) caps how many memories get a graph signal; each hop keeps its best-valued ones while there's room.
+- **The byte budget:** with `byte_budget(B)`, the walk reads at most `B` bytes of nodes, besides the hits' own `B`. A hop that doesn't fit whole is dropped. `RecallStats::expanded` counts the memories reached, and `expansion_truncated` says when `max` or the budget stopped the walk.
+- **Filters:** the walk passes only through memories the recall could return, so a superseded memory or another session's doesn't bridge to its neighbours.
+
 ## Near duplicates
 With an embedding model, a store can catch near duplicates as well as exact ones. Turn it on with `StoreOptions::near_dedup(NearDedup::new(0.95))`, or later with `set_near_dedup`. `remember` then looks up the nearest live memory first.
 - **Policies, for a match at or above the similarity:**

@@ -3,6 +3,7 @@
 //! returned in fused order within a byte budget. Read-only, at one snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 
 use pigeonhole::{KeySet, Pigeonhole, PigeonholeReader, ReadTable, Snapshot, Table, VectorSpec};
 use pigeonhole_text::{Index, Query, ReadIndex};
@@ -15,9 +16,13 @@ use crate::store::{EmbeddingModel, Kind};
 const RRF_K: f64 = 60.0;
 /// D308's per-item overhead, which a recall hit's size counts too.
 const ITEM_OVERHEAD: u64 = 16;
-/// The bytes `with_signals` adds to a hit: five signals, a rank (`u32`) and a value (`f64`)
+/// The bytes `with_signals` adds to a hit: six signals, a rank (`u32`) and a value (`f64`)
 /// each.
-const SIGNALS_BYTES: u64 = 5 * (4 + 8);
+const SIGNALS_BYTES: u64 = 6 * (4 + 8);
+/// How many of the fused candidates seed a graph expansion (D311 §3, `M`).
+const GRAPH_SEEDS: usize = 10;
+/// The most hops an [`Expand`] takes.
+pub const MAX_EXPAND_HOPS: u32 = 4;
 
 /// How the signals are combined (D311 §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -48,6 +53,9 @@ pub struct Weights {
     pub importance: f64,
     /// `ln(1 + uses)`, decayed by the time since the last use.
     pub uses: f64,
+    /// The graph signal of a memory a graph expansion reached ([`Recall::expand`]): 0.5 by
+    /// default. It has no effect on a recall without `expand`.
+    pub graph: f64,
     /// Not a signal's weight: a factor on the importance signal of a memory a consolidation
     /// took in ([`Store::consolidate`](crate::Store::consolidate)), so its summary ranks
     /// ahead of it. 0.5 by default; 1 leaves consolidated memories as they were.
@@ -62,6 +70,7 @@ impl Default for Weights {
             recency: 1.0,
             importance: 1.0,
             uses: 1.0,
+            graph: 0.5,
             consolidated: 0.5,
         }
     }
@@ -93,6 +102,53 @@ pub struct Signals {
     pub importance: Option<Signal>,
     /// Its decayed use, if it was ever used.
     pub uses: Option<Signal>,
+    /// Its graph value, if a graph expansion reached it ([`Recall::expand`]): never for a
+    /// seed, nor without `expand`.
+    pub graph: Option<Signal>,
+}
+
+/// A graph expansion of a recall ([`Recall::expand`], D311 §3): the top 10 fused candidates
+/// seed a walk of the memories' links, in both directions, and every memory it reaches is
+/// scored like the other candidates, with a **graph** signal besides.
+///
+/// - **The graph signal:** seed `i` (its 1-based place in the fused order before the
+///   expansion) has the value `1 / i`. A memory first reached at hop `h` has the largest
+///   `value(q) × weight` over the links between it and the memories `q` kept at hop
+///   `h − 1`, either way round: the best of its shortest paths, not of every path. Seeds
+///   have no graph signal.
+/// - **The walk:** each hop reads every link and backlink of the previous hop's memories
+///   through the engine's [`Traverse`](pigeonhole::Traverse), at the recall's snapshot. It
+///   passes only through memories the recall could return, by the same test as its other
+///   candidates: not a row without content, a superseded memory (without
+///   [`include_superseded`](Recall::include_superseded)), or another
+///   [`session`](Recall::session)'s.
+/// - **Its bounds:** at most [`max`](Expand::max) memories get a graph signal, over every
+///   hop: the best-valued of each hop (ties by id) while there's room. With a
+///   [`byte_budget`](Recall::byte_budget) of `B`, the walk reads at most `B` bytes of nodes
+///   besides (D308's count: each node it reads, its key and 16 bytes), so a recall holds up
+///   to `2B`. A hop that doesn't fit whole is dropped, with the hops before it kept exact.
+///   [`RecallStats::expansion_truncated`] says when either bound stopped it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Expand {
+    /// Hops to take, 1 to [`MAX_EXPAND_HOPS`].
+    pub hops: u32,
+    /// At most this many memories get a graph signal: 20 by default.
+    pub max: usize,
+}
+
+impl Expand {
+    /// An expansion `n` hops deep (1 to [`MAX_EXPAND_HOPS`]; the recall checks it), scoring
+    /// at most 20 memories.
+    pub fn hops(n: u32) -> Self {
+        Expand { hops: n, max: 20 }
+    }
+
+    /// At most `m` memories get a graph signal.
+    pub fn max(mut self, m: usize) -> Self {
+        self.max = m;
+        self
+    }
 }
 
 /// One recalled memory.
@@ -129,6 +185,10 @@ pub struct RecallStats {
     /// Whether the byte budget cut the list (not `k`), including when the first hit alone
     /// was larger than the budget.
     pub truncated: bool,
+    /// The memories a graph expansion gave a graph signal ([`Recall::expand`]).
+    pub expanded: usize,
+    /// Whether [`Expand::max`] or the byte budget stopped the graph expansion.
+    pub expansion_truncated: bool,
 }
 
 /// The table behind a recall: the writer's or a reader process's.
@@ -174,6 +234,7 @@ pub struct Recall<'a> {
     session: Option<String>,
     with_signals: bool,
     with_embeddings: bool,
+    expand: Option<Expand>,
 }
 
 impl std::fmt::Debug for Recall<'_> {
@@ -214,6 +275,7 @@ impl<'a> Recall<'a> {
             session: None,
             with_signals: false,
             with_embeddings: false,
+            expand: None,
         }
     }
 
@@ -251,7 +313,9 @@ impl<'a> Recall<'a> {
     /// At most `bytes` of hits, by D308's rules: each hit's text, its id and 16 bytes, plus
     /// its signals and embedding when asked for. A hit is whole or left out. As with the
     /// engine's byte budgets, the first hit is returned even if it alone is larger, and
-    /// [`RecallStats::truncated`] says the budget cut the list.
+    /// [`RecallStats::truncated`] says the budget cut the list. A graph expansion
+    /// ([`expand`](Self::expand)) reads up to the same number of bytes of nodes besides, so
+    /// a recall holds up to twice this.
     pub fn byte_budget(mut self, bytes: u64) -> Self {
         self.byte_budget = Some(bytes);
         self
@@ -313,6 +377,13 @@ impl<'a> Recall<'a> {
         self
     }
 
+    /// Expands the candidates through the memories' links ([`Expand`]): none by default.
+    /// `InvalidArgument` from the run for hops outside 1 to [`MAX_EXPAND_HOPS`].
+    pub fn expand(mut self, x: Expand) -> Self {
+        self.expand = Some(x);
+        self
+    }
+
     /// The hits, best first. [`run_with_stats`](Self::run_with_stats) also says whether
     /// the byte budget cut them.
     pub fn run(self) -> Result<Vec<RecallHit>> {
@@ -351,6 +422,14 @@ impl<'a> Recall<'a> {
             (Some(_), Some(m)) => Some(m.spec()),
             (None, _) => None,
         };
+        if let Some(x) = self.expand
+            && !(1..=MAX_EXPAND_HOPS).contains(&x.hops)
+        {
+            return Err(Error::InvalidArgument(format!(
+                "an expansion takes 1 to {MAX_EXPAND_HOPS} hops, not {}",
+                x.hops
+            )));
+        }
         let owned;
         let s = match self.snapshot {
             Some(s) => s,
@@ -449,64 +528,26 @@ impl<'a> Recall<'a> {
             .filter(|(k, _)| kept.contains(k))
             .map(|(_, c)| c)
             .collect();
-        stats.candidates = cands.len();
-        // 3. Fusion.
-        let w = [
-            self.weights.vector,
-            self.weights.keyword,
-            self.weights.recency,
-            self.weights.importance,
-            self.weights.uses,
-        ];
-        for (sig, &w) in w.iter().enumerate() {
-            let mut order: Vec<usize> = (0..cands.len())
-                .filter(|&i| cands[i].vals[sig].is_some())
+        // 2. The graph expansion: seeded by the fused order without it.
+        if let Some(x) = self.expand {
+            let mut w = self.signal_weights();
+            w[5] = 0.0;
+            fuse(&mut cands, &w, self.fusion);
+            let seeds = cands
+                .iter()
+                .take(GRAPH_SEEDS)
+                .enumerate()
+                .map(|(i, c)| (c.key.clone(), 1.0 / (i + 1) as f64))
                 .collect();
-            order.sort_by(|&a, &b| {
-                cands[b].vals[sig]
-                    .unwrap()
-                    .total_cmp(&cands[a].vals[sig].unwrap())
-                    .then_with(|| cands[a].hit.id.cmp(&cands[b].hit.id))
-            });
-            // Competition ranking: equal values share a rank (1 + how many are strictly
-            // greater), so a tie (every importance at its default, say) gives no candidate
-            // an edge.
-            for (r, &i) in order.iter().enumerate() {
-                let rank = if r > 0 && cands[order[r - 1]].vals[sig] == cands[i].vals[sig] {
-                    cands[order[r - 1]].ranks[sig].expect("ranked above")
-                } else {
-                    r as u32 + 1
-                };
-                cands[i].ranks[sig] = Some(rank);
-            }
-            match self.fusion {
-                Fusion::Rrf => {
-                    for &i in &order {
-                        let r = f64::from(cands[i].ranks[sig].expect("ranked"));
-                        cands[i].score += w / (RRF_K + r);
-                    }
-                }
-                Fusion::Linear => {
-                    let (lo, hi) =
-                        order
-                            .iter()
-                            .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &i| {
-                                let v = cands[i].vals[sig].expect("ranked");
-                                (l.min(v), h.max(v))
-                            });
-                    for &i in &order {
-                        let v = cands[i].vals[sig].expect("ranked");
-                        let norm = if hi > lo { (v - lo) / (hi - lo) } else { 1.0 };
-                        cands[i].score += w * norm;
-                    }
-                }
+            self.expand_graph(s, &mut cands, seeds, x, spec.as_ref(), now, &mut stats)?;
+            for c in &mut cands {
+                c.score = 0.0;
+                c.ranks = [None; 6];
             }
         }
-        cands.sort_by(|a, b| {
-            b.score
-                .total_cmp(&a.score)
-                .then_with(|| a.hit.id.cmp(&b.hit.id))
-        });
+        stats.candidates = cands.len();
+        // 3. Fusion.
+        fuse(&mut cands, &self.signal_weights(), self.fusion);
         // 4. In fused order, within k and the byte budget.
         let mut out = Vec::new();
         let mut used = 0u64;
@@ -529,6 +570,7 @@ impl<'a> Recall<'a> {
                     recency: sig(2),
                     importance: sig(3),
                     uses: sig(4),
+                    graph: sig(5),
                 });
             }
             let size = hit_size(&hit, self.with_signals);
@@ -546,6 +588,134 @@ impl<'a> Recall<'a> {
         }
         Ok((out, stats))
     }
+
+    /// The signals' weights, in [`Cand::vals`]' order.
+    fn signal_weights(&self) -> [f64; 6] {
+        let w = &self.weights;
+        [
+            w.vector,
+            w.keyword,
+            w.recency,
+            w.importance,
+            w.uses,
+            w.graph,
+        ]
+    }
+
+    /// Walks the links from `seeds` (each with its value, best first) as [`Expand`] says,
+    /// adding the memories it reaches to `cands` and setting their graph values.
+    #[allow(clippy::too_many_arguments)]
+    fn expand_graph(
+        &self,
+        s: &Snapshot,
+        cands: &mut Vec<Cand>,
+        seeds: Vec<(Vec<u8>, f64)>,
+        x: Expand,
+        spec: Option<&VectorSpec>,
+        now: u64,
+        stats: &mut RecallStats,
+    ) -> Result<()> {
+        let mut at: BTreeMap<Vec<u8>, usize> = cands
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.key.clone(), i))
+            .collect();
+        // Seeds and earlier hops' memories: not reached again.
+        let mut visited: BTreeSet<Vec<u8>> = seeds.iter().map(|(k, _)| k.clone()).collect();
+        // Rows the recall couldn't return: neither scored nor walked through.
+        let mut ineligible: BTreeSet<Vec<u8>> = BTreeSet::new();
+        let mut budget = self.byte_budget;
+        let mut graphed = 0usize;
+        let mut level = seeds;
+        for _ in 0..x.hops {
+            if graphed == x.max {
+                break;
+            }
+            // Every link of this hop, each memory valued by its best one. A hop the budget
+            // can't hold whole is dropped, so the hops kept are exact.
+            let mut reached: BTreeMap<Vec<u8>, f64> = BTreeMap::new();
+            let mut read = 0u64;
+            for (q, vq) in &level {
+                for fam in [LINKS, BACKLINKS] {
+                    // With nothing left, a budget of 1 still cuts at the first node (and
+                    // only if there is one); 0 would mean no budget.
+                    let left = budget.map_or(0, |b| (b - read).max(1));
+                    let (edges, cut) = self.rows.edges(s, q, fam, left)?;
+                    if cut {
+                        stats.expansion_truncated = true;
+                        stats.expanded = graphed;
+                        return Ok(());
+                    }
+                    read += edges
+                        .iter()
+                        .map(|(k, _)| k.len() as u64 + ITEM_OVERHEAD)
+                        .sum::<u64>();
+                    for (n, w) in edges {
+                        if visited.contains(&n) || ineligible.contains(&n) {
+                            continue;
+                        }
+                        let v = vq * f64::from(w);
+                        let e = reached.entry(n).or_insert(v);
+                        if v > *e {
+                            *e = v;
+                        }
+                    }
+                }
+            }
+            if let Some(b) = budget.as_mut() {
+                *b -= read;
+            }
+            // The recall's own filters: what it couldn't return is neither scored nor walked
+            // through.
+            let unknown: Vec<&Vec<u8>> = reached.keys().filter(|k| !at.contains_key(*k)).collect();
+            let mut fresh: BTreeMap<Vec<u8>, Cand> = BTreeMap::new();
+            if !unknown.is_empty() {
+                let set = KeySet::from_unsorted(unknown.iter().copied());
+                self.rows.read_each(s, &set, |key, row| {
+                    if let Some(c) = self.candidate(key, row, spec, now)? {
+                        fresh.insert(key.to_vec(), c);
+                    }
+                    Ok(())
+                })?;
+                for k in unknown {
+                    if !fresh.contains_key(k) {
+                        ineligible.insert(k.clone());
+                    }
+                }
+            }
+            let mut l: Vec<(Vec<u8>, f64)> = reached
+                .into_iter()
+                .filter(|(k, _)| !ineligible.contains(k))
+                .collect();
+            l.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            // The best-valued ones, up to `max` in all.
+            if l.len() > x.max - graphed {
+                l.truncate(x.max - graphed);
+                stats.expansion_truncated = true;
+            }
+            for (n, v) in &l {
+                let i = match at.get(n) {
+                    Some(&i) => i,
+                    None => {
+                        let c = fresh.remove(n).expect("an eligible row was read");
+                        at.insert(n.clone(), cands.len());
+                        cands.push(c);
+                        cands.len() - 1
+                    }
+                };
+                cands[i].vals[5] = Some(*v);
+                visited.insert(n.clone());
+            }
+            graphed += l.len();
+            if l.is_empty() {
+                break;
+            }
+            level = l;
+        }
+        stats.expanded = graphed;
+        Ok(())
+    }
+
     /// One candidate from its row, or `None` if it's filtered out or gone. Its keyword
     /// signal is filled in by the caller.
     fn candidate(
@@ -619,8 +789,16 @@ impl<'a> Recall<'a> {
             (1.0 + uses as f64).ln() * (-since / self.half_life_us as f64).exp()
         });
         Ok(Some(Cand {
-            vals: [vector, None, Some(recency), Some(importance_signal), used],
-            ranks: [None; 5],
+            key: key.to_vec(),
+            vals: [
+                vector,
+                None,
+                Some(recency),
+                Some(importance_signal),
+                used,
+                None,
+            ],
+            ranks: [None; 6],
             score: 0.0,
             hit: RecallHit {
                 id,
@@ -637,12 +815,71 @@ impl<'a> Recall<'a> {
     }
 }
 
+/// A linked memory's row and the link's weight.
+type Edge = (Vec<u8>, f32);
+
 struct Cand {
-    /// vector, keyword, recency, importance, use.
-    vals: [Option<f64>; 5],
-    ranks: [Option<u32>; 5],
+    /// Its row.
+    key: Vec<u8>,
+    /// vector, keyword, recency, importance, use, graph.
+    vals: [Option<f64>; 6],
+    ranks: [Option<u32>; 6],
     score: f64,
     hit: RecallHit,
+}
+
+/// Ranks every signal among `cands` and adds each one's weighted term to their scores, then
+/// sorts them best first (ties by id).
+fn fuse(cands: &mut [Cand], w: &[f64; 6], fusion: Fusion) {
+    for (sig, &w) in w.iter().enumerate() {
+        let mut order: Vec<usize> = (0..cands.len())
+            .filter(|&i| cands[i].vals[sig].is_some())
+            .collect();
+        order.sort_by(|&a, &b| {
+            cands[b].vals[sig]
+                .unwrap()
+                .total_cmp(&cands[a].vals[sig].unwrap())
+                .then_with(|| cands[a].hit.id.cmp(&cands[b].hit.id))
+        });
+        // Competition ranking: equal values share a rank (1 + how many are strictly
+        // greater), so a tie (every importance at its default, say) gives no candidate an
+        // edge.
+        for (r, &i) in order.iter().enumerate() {
+            let rank = if r > 0 && cands[order[r - 1]].vals[sig] == cands[i].vals[sig] {
+                cands[order[r - 1]].ranks[sig].expect("ranked above")
+            } else {
+                r as u32 + 1
+            };
+            cands[i].ranks[sig] = Some(rank);
+        }
+        match fusion {
+            Fusion::Rrf => {
+                for &i in &order {
+                    let r = f64::from(cands[i].ranks[sig].expect("ranked"));
+                    cands[i].score += w / (RRF_K + r);
+                }
+            }
+            Fusion::Linear => {
+                let (lo, hi) =
+                    order
+                        .iter()
+                        .fold((f64::INFINITY, f64::NEG_INFINITY), |(l, h), &i| {
+                            let v = cands[i].vals[sig].expect("ranked");
+                            (l.min(v), h.max(v))
+                        });
+                for &i in &order {
+                    let v = cands[i].vals[sig].expect("ranked");
+                    let norm = if hi > lo { (v - lo) / (hi - lo) } else { 1.0 };
+                    cands[i].score += w * norm;
+                }
+            }
+        }
+    }
+    cands.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then_with(|| a.hit.id.cmp(&b.hit.id))
+    });
 }
 
 /// A hit's size for the byte budget: its text, its id's bytes and 16, plus its signals and
@@ -753,6 +990,67 @@ impl Rows<'_> {
             Rows::R(t) => go!(t),
         }
         Ok(out)
+    }
+
+    /// The memories `from` links to (`LINKS`) or that link to it (`BACKLINKS`), at `s`,
+    /// through a one-hop [`Traverse`](pigeonhole::Traverse) with `budget` (0: none), each
+    /// with its link's weight, in key order; and whether the budget cut them. The weights
+    /// come from `from`'s cells over the range the traversal returned.
+    fn edges(
+        &self,
+        s: &Snapshot,
+        from: &[u8],
+        fam: &str,
+        budget: u64,
+    ) -> Result<(Vec<Edge>, bool)> {
+        macro_rules! go {
+            ($t:expr) => {{
+                let t = $t
+                    .traverse(&KeySet::from_unsorted([from]))
+                    .family(fam)
+                    .snapshot(s)
+                    .byte_budget(budget)
+                    .run()?;
+                let cut = t.stats().cut_by_budget;
+                let nodes: Vec<Vec<u8>> = t
+                    .hops()
+                    .first()
+                    .map(|h| h.nodes().iter().map(<[u8]>::to_vec).collect())
+                    .unwrap_or_default();
+                let (Some(first), Some(last)) = (nodes.first(), nodes.last()) else {
+                    return Ok((Vec::new(), cut));
+                };
+                let mut weights: BTreeMap<Vec<u8>, f32> = BTreeMap::new();
+                if let Some(row) = $t
+                    .row(from)
+                    .family(fam)
+                    .qualifier_bounds(Bound::Included(first), Bound::Included(last))
+                    .snapshot(s)
+                    .read()?
+                {
+                    for e in row.iter() {
+                        let v = e.cell.value();
+                        if v.len() != 5 {
+                            return Err(corrupt("a link's value"));
+                        }
+                        let w = f32::from_le_bytes(v[1..].try_into().expect("4"));
+                        weights.insert(e.qualifier.to_vec(), w);
+                    }
+                }
+                let mut out = Vec::with_capacity(nodes.len());
+                for n in nodes {
+                    let w = *weights
+                        .get(&n)
+                        .ok_or_else(|| corrupt("a link the traversal read"))?;
+                    out.push((n, w));
+                }
+                Ok((out, cut))
+            }};
+        }
+        match self {
+            Rows::W(t) => go!(t),
+            Rows::R(t) => go!(t),
+        }
     }
 
     /// Calls `f` with each row of `keys` that has a cell, at `s`.
