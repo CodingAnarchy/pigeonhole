@@ -1,5 +1,6 @@
 //! The agent memory tools (D311 T7): `phdb mcp --memory NAME` serves a `pigeonhole-memory`
-//! store through six tools, plus the `memory://guide` resource.
+//! store through six tools, plus the `memory://guide` resource. The store's tables are
+//! `mem_NAME` and `mem_NAME_text` (ICR 0107, T1).
 //!
 //! | Tool | What it does |
 //! |---|---|
@@ -16,7 +17,7 @@
 //! be the store's. With `--embed-url`, the server embeds the text itself and refuses a
 //! client's vectors. A store without a model recalls by keyword and recency only.
 
-use pigeonhole::Element;
+use pigeonhole::{Element, Pigeonhole, RetryPolicy};
 use pigeonhole_memory::{
     EmbeddingModel, Kind, LinkType, Memory as NewMemory, MemoryId, OpenOptions, ReadStore,
     Remembered, Store, StoreOptions,
@@ -54,6 +55,9 @@ pub(super) struct Memory {
     store: Handle,
     /// Whether writes can succeed.
     writable: bool,
+    /// The database, as the writer: `memory_remember` with `supersedes` remembers in a
+    /// transaction of its own.
+    db: Option<Pigeonhole>,
     /// `--embed-url`: the server embeds text itself.
     endpoint: Option<Endpoint>,
     /// The default recall budget (`--max-result-bytes`).
@@ -90,20 +94,24 @@ impl Memory {
         let exists = db.tables().iter().any(|t| *t == format!("mem_{name}"));
         let store = match db {
             Db::Writer(p) if exists => {
-                // Open without a model to read the pinned one, then as the expected caller.
-                let probe = Store::open_without_embeddings(p, &name).map_err(fail)?;
+                // A probe reads the pinned model; it owns its forgetter, so it starts no
+                // thread (ai1249's M2 on #1389). Then the real handle, as the expected caller.
+                let probe = Store::open_with(
+                    p,
+                    &name,
+                    OpenOptions::new().without_embeddings().own_forgetter(),
+                )
+                .map_err(fail)?;
                 let pinned = probe.embedding_model().cloned();
+                drop(probe);
                 check_pin(&name, pinned.as_ref(), expected.as_deref(), args)?;
-                match pinned {
-                    Some(m) => {
-                        drop(probe);
-                        Handle::Writer(
-                            Store::open_with(p, &name, OpenOptions::new().model(m.id()))
-                                .map_err(fail)?,
-                        )
+                Handle::Writer(
+                    match pinned {
+                        Some(m) => Store::open(p, &name, m.id()),
+                        None => Store::open_without_embeddings(p, &name),
                     }
-                    None => Handle::Writer(probe),
-                }
+                    .map_err(fail)?,
+                )
             }
             Db::Writer(p) if writable => {
                 let mut options = StoreOptions::new();
@@ -173,10 +181,15 @@ impl Memory {
             );
         }
         let writable = writable && matches!(store, Handle::Writer(_));
+        let db = match db {
+            Db::Writer(p) => Some(p.clone()),
+            Db::Reader(_) => None,
+        };
         Ok(Some(Self {
             name,
             store,
             writable,
+            db,
             endpoint,
             result_bytes,
         }))
@@ -266,6 +279,7 @@ impl Memory {
     /// Drops the store (and its forgetter) before the database closes.
     pub(super) fn close(self) {
         drop(self.store);
+        drop(self.db);
     }
 
     /// The embedding a call uses: the endpoint's for `text`, or the client's (checked
@@ -353,6 +367,15 @@ impl Memory {
         let ns = namespace(&a)?;
         let text = a.str("text")?;
         let supersedes = a.opt_str("supersedes")?.map(memory_id).transpose()?;
+        // Before the write: a memory supersedes one of its own namespace only (ai1249's M1).
+        if let Some(old) = &supersedes
+            && old.namespace() != ns
+        {
+            return Err(Failure::usage(&format!(
+                "supersedes: {old} is in namespace {:?}, not {ns:?}",
+                old.namespace()
+            )));
+        }
         let mut m = NewMemory::new(text);
         match self.embedding(&a, Some(text))? {
             Some(v) => m = m.embedding(v),
@@ -392,7 +415,17 @@ impl Memory {
                 .map_err(|f| f.within("links"))?;
             m = m.link(memory_id(l.str("to")?)?, link_type(&l)?, weight(&l)?);
         }
-        let done = store.remember(ns, m).map_err(|e| failure("remember", e))?;
+        // A correction is near what it corrects, so with `supersedes` near dedup mustn't stop
+        // the write (simp724's S1 on #1389): `remember_in` skips it, keeping exact dedup.
+        let done = match (&supersedes, &self.db) {
+            (Some(_), Some(db)) => db
+                .transact(&RetryPolicy::default(), |txn| {
+                    store.remember_in(txn, ns, m.clone())
+                })
+                .map(|(r, _)| r),
+            _ => store.remember(ns, m),
+        }
+        .map_err(|e| failure("remember", e))?;
         let (outcome, id) = match &done {
             Remembered::New(id) => ("new", id),
             Remembered::Merged(id) => ("merged", id),
@@ -403,12 +436,13 @@ impl Memory {
         out.insert("id".into(), json!(id.to_string()));
         out.insert("outcome".into(), json!(outcome));
         if let Some(old) = supersedes {
-            // A second transaction: a crash between the two leaves `old` unsuperseded.
-            let superseded = old != *id;
-            if superseded {
-                store
-                    .supersede(&old, id)
-                    .map_err(|e| failure("remember: supersede", e))?;
+            // A second transaction: a crash between the two leaves `old` unsuperseded. A
+            // failure returns the stored memory's id with the error (simp724's S2), so the
+            // agent can retry the supersede alone.
+            let mut superseded = old != *id;
+            if superseded && let Err(e) = store.supersede(&old, id) {
+                superseded = false;
+                out.insert("supersede_error".into(), failure("supersede", e).json());
             }
             out.insert("superseded".into(), json!(superseded));
         }
@@ -527,13 +561,24 @@ impl Memory {
     fn forget(&self, a: Args<'_>) -> Outcome {
         a.only(&["ids"])?;
         let store = self.writer()?;
+        let ids = ids(&a, "ids")?;
         let mut deleted = 0;
         let mut missing = Vec::new();
-        for id in ids(&a, "ids")? {
-            if store.delete(&id).map_err(|e| failure("forget", e))? {
-                deleted += 1;
-            } else {
-                missing.push(id.to_string());
+        for (i, id) in ids.iter().enumerate() {
+            match store.delete(id) {
+                Ok(true) => deleted += 1,
+                Ok(false) => missing.push(id.to_string()),
+                Err(e) => {
+                    // The deletes before it stand: report them, the error, and what's left
+                    // (simp724's S2 on #1389).
+                    let left: Vec<String> = ids[i..].iter().map(ToString::to_string).collect();
+                    return Ok(super::tools::object(json!({
+                        "deleted": deleted,
+                        "missing": missing,
+                        "error": failure("forget", e).json(),
+                        "not_deleted": left,
+                    })));
+                }
             }
         }
         Ok(super::tools::object(
@@ -551,9 +596,10 @@ impl Memory {
                  recalling in a later conversation, not chatter or what this conversation \
                  already holds. Keep it to one self-contained fact. An exact duplicate of a \
                  live memory merges into it (outcome \"merged\"). When a fact changes, set \
-                 supersedes to the old memory's id: recall then leaves the old one out (a \
-                 second step after the write; if it fails the new memory stays). {embedding} \
-                 Returns the memory's id."
+                 supersedes to the old memory's id: recall then leaves the old one out. That's \
+                 a second step after the write: if it fails, the new memory is still stored, \
+                 superseded is false and supersede_error says why (retry with \
+                 memory_supersede). {embedding} Returns the memory's id."
             ),
             json!({
                 "type": "object",
@@ -878,9 +924,12 @@ fn forget_tool() -> Value {
     tool(
         "memory_forget",
         "Forget memories",
-        "Deletes memories for good: when the user asks you to forget something, or a memory is \
-         wrong. For a fact that changed, prefer memory_remember with supersedes, which keeps \
-         the history. Returns how many were deleted and the ids that didn't exist.",
+        "Deletes memories for good, pinned ones too: when the user asks you to forget \
+         something, or a memory is wrong. For a fact that changed, prefer memory_remember with \
+         supersedes, which keeps the history. Forgetting a memory that superseded another \
+         brings the older one back into recall. Returns how many were deleted and the ids that \
+         didn't exist; on an error partway, also error and not_deleted (the deletes before \
+         it stand).",
         ids_schema("The memories to delete."),
         false,
     )

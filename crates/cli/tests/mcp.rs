@@ -1272,6 +1272,53 @@ fn memory_tools_remember_recall_supersede_and_forget() {
     );
     assert_eq!(all["hits"][0]["superseded_by"], json!(new_id), "{all}");
 
+    // A failed supersede still returns the stored memory (simp724's S2): c is superseded by
+    // d already, so e's supersede fails, and e is stored all the same.
+    let c = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana uses vim"}),
+    )["id"]
+        .clone();
+    let d = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana uses helix"}),
+    )["id"]
+        .clone();
+    s.call("memory_supersede", json!({"old": c, "new": d}));
+    let e = s.call(
+        "memory_remember",
+        json!({"namespace": "user:dana", "text": "Dana uses zed", "supersedes": c}),
+    );
+    assert_eq!(
+        (&e["outcome"], &e["superseded"]),
+        (&json!("new"), &json!(false)),
+        "{e}"
+    );
+    assert!(e["supersede_error"]["message"].as_str().is_some(), "{e}");
+    let zed = s.call(
+        "memory_recall",
+        json!({"namespace": "user:dana", "text": "zed"}),
+    );
+    assert_eq!(zed["hits"][0]["id"], e["id"], "{zed}");
+    // A memory supersedes one of its own namespace only, refused before the write.
+    let e = s.fail(
+        "memory_remember",
+        json!({"namespace": "user:sam", "text": "Sam uses emacs", "supersedes": d}),
+    );
+    assert!(e["message"].as_str().unwrap().contains("namespace"), "{e}");
+    let emacs = s.call(
+        "memory_recall",
+        json!({"namespace": "user:sam", "text": "emacs"}),
+    );
+    assert!(
+        emacs["hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|h| h["text"] != "Sam uses emacs"),
+        "{emacs}"
+    );
+
     // Use, links, and forgetting.
     let used = s.call("memory_mark_used", json!({"ids": [new_id]}));
     assert_eq!(used, json!({"marked": 1, "missing": []}));
@@ -1681,4 +1728,73 @@ fn embed_url_needs_the_embed_feature() {
     .finish();
     assert_eq!(status, 6, "{err}");
     assert!(err.contains("embed"), "{err}");
+}
+
+/// With `supersedes`, a store's near dedup doesn't stop the write (simp724's S1 on #1389): a
+/// correction is near what it corrects, and `Skip` would otherwise store nothing and
+/// supersede with the match.
+#[test]
+fn a_correction_is_stored_through_near_dedup() {
+    let dir = TempDir::new("mcp-memory-near");
+    let path = db_path(&dir);
+    let db = Pigeonhole::open(
+        &path,
+        Options::default()
+            .shards(1)
+            .pin_threads(false)
+            .create_if_missing(true),
+    )
+    .unwrap();
+    let model = pigeonhole_memory::EmbeddingModel::new("m1", 4, pigeonhole::Element::F32).unwrap();
+    let near = pigeonhole_memory::NearDedup::new(0.9).policy(pigeonhole_memory::DedupPolicy::Skip);
+    drop(
+        pigeonhole_memory::Store::create(
+            &db,
+            "agent",
+            pigeonhole_memory::StoreOptions::new()
+                .embedding(model)
+                .near_dedup(near),
+        )
+        .unwrap(),
+    );
+    db.close().unwrap();
+    let mut s = Server::start(&path, &["--memory", "agent"]);
+    let five = s.call(
+        "memory_remember",
+        json!({"text": "the timeout is 5 s", "embedding": [1.0, 0.0, 0.0, 0.0], "embedding_model": "m1"}),
+    );
+    // Near dedup is on: a near memory without supersedes writes nothing.
+    let near = s.call(
+        "memory_remember",
+        json!({"text": "the timeout is five seconds", "embedding": [0.99, 0.01, 0.0, 0.0], "embedding_model": "m1"}),
+    );
+    assert_eq!(
+        (&near["outcome"], &near["id"]),
+        (&json!("similar"), &five["id"]),
+        "{near}"
+    );
+    // The correction is stored, and supersedes the old fact.
+    let six = s.call(
+        "memory_remember",
+        json!({"text": "the timeout is 6 s", "embedding": [0.98, 0.02, 0.0, 0.0], "embedding_model": "m1", "supersedes": five["id"]}),
+    );
+    assert_eq!(
+        (&six["outcome"], &six["superseded"]),
+        (&json!("new"), &json!(true)),
+        "{six}"
+    );
+    assert_ne!(six["id"], five["id"]);
+    let hits = s.call(
+        "memory_recall",
+        json!({"text": "timeout", "include_superseded": true}),
+    );
+    let old = hits["hits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|h| h["id"] == five["id"])
+        .unwrap_or_else(|| panic!("{hits}"));
+    assert_eq!(old["superseded_by"], six["id"], "{hits}");
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
 }

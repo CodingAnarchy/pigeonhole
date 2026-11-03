@@ -38,6 +38,12 @@ impl Endpoint {
                 "--embed-url {url}: an http:// or https:// URL"
             )));
         }
+        if key_env.is_some() && url.starts_with("http://") && !loopback(url) {
+            return Err(Failure::usage(&format!(
+                "--embed-url {url}: an API key goes only over https:// (or plain http:// to \
+                 localhost), never in cleartext across the network"
+            )));
+        }
         #[cfg(feature = "embed")]
         {
             let key = match key_env {
@@ -142,6 +148,24 @@ impl Endpoint {
     }
 }
 
+/// Whether an `http://` URL's host is this machine: `localhost`, `127.x.x.x` or `[::1]`
+/// (simp724's E1 on #1389).
+fn loopback(url: &str) -> bool {
+    let rest = url.trim_start_matches("http://");
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit('@').next().unwrap_or("");
+    let host = if let Some(v6) = host.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        host.split(':').next().unwrap_or("")
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host == "::1"
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
 /// `data[0].embedding` of an OpenAI `/embeddings` response.
 #[cfg_attr(not(feature = "embed"), allow(dead_code))]
 fn parse(body: &str) -> Result<Vec<f32>, String> {
@@ -182,6 +206,33 @@ mod tests {
             Some("PHDB_EMBED_TEST_KEY_NEVER_SET"),
         );
         assert!(unset.is_err());
+    }
+
+    /// A key never goes in cleartext across the network: plain `http://` with a key only to
+    /// this machine (simp724's E1 on #1389).
+    #[test]
+    fn a_key_needs_https_or_loopback() {
+        for (url, ok) in [
+            ("http://localhost:11434/v1/embeddings", true),
+            ("http://LOCALHOST/v1/embeddings", true),
+            ("http://127.0.0.1:8080/v1/embeddings", true),
+            ("http://127.1.2.3/v1/embeddings", true),
+            ("http://[::1]:8080/v1/embeddings", true),
+            ("http://user@localhost/v1", true),
+            ("http://example.com/v1/embeddings", false),
+            ("http://10.0.0.5:8080/v1/embeddings", false),
+            ("http://localhost.example.com/v1", false),
+            ("http://127.0.0.1@example.com/v1", false),
+        ] {
+            assert_eq!(loopback(url), ok, "{url}");
+        }
+        // The variable is set (PATH), so only the URL decides.
+        let refused = Endpoint::new("http://example.com/v1/embeddings", "m", Some("PATH"));
+        assert!(refused.is_err());
+        assert!(
+            Endpoint::new("http://example.com/v1/embeddings", "m", None).is_ok()
+                == cfg!(feature = "embed")
+        );
     }
 
     #[test]

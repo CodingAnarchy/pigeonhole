@@ -40,9 +40,16 @@ so a later conversation can recall what an earlier one learned.
   and `include_superseded` shows it with `superseded_by`.
 - **`memory_supersede` does the same for two memories that already exist.**
 - **Superseding is a second step after the write.** If it fails, the new memory is still
-  stored: retry `memory_supersede`.
+  stored: the result has its `id`, `superseded: false` and a `supersede_error`. Retry with
+  `memory_supersede`.
+- **With `supersedes`, a near-duplicate check never stops the write:** a correction is
+  meant to be close to what it corrects.
 - **Use `memory_forget` only when a memory is wrong or the user asks you to forget.** It
-  deletes for good.
+  deletes for good, pinned memories included: pinning protects only from the store's forget
+  policy.
+- **Forgetting a memory that superseded another brings the older one back** into recall.
+  To change a fact again, supersede the current memory. Forget a correction only when you
+  mean to restore what it corrected.
 
 ## Links
 - **`memory_link` connects two memories:** `derived_from` (a summary drawn from its
