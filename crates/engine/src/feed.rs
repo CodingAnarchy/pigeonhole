@@ -17,7 +17,7 @@
 //! - **A clean close keeps the WAL files** with the feed on (their checkpoints at their
 //!   ends), and the next open adopts them without replaying anything (`final_close`).
 
-use std::collections::HashMap;
+use pigeonhole_format::hash::FastMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -355,7 +355,7 @@ pub(crate) struct Feed {
     /// go (D310 PR 5a), by reader key. The watermark registries wake a reader whose frontier
     /// waits on the visible or durable watermark, but a hold releasing moves the frontier
     /// without a publish there, so the shard wakes these when it releases one.
-    hold_waiters: Mutex<HashMap<u64, std::task::Waker>>,
+    hold_waiters: Mutex<FastMap<u64, std::task::Waker>>,
     /// Whether `hold_waiters` may be non-empty: the shard's release checks this alone, so a
     /// release with no async feed waiting costs one load.
     has_hold_waiters: std::sync::atomic::AtomicBool,

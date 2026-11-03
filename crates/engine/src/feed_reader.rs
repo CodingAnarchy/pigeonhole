@@ -548,12 +548,24 @@ impl FeedReader {
                  thread of its own (#1407)",
             )));
         };
+        // Whether this call left a waker on the hold list: a poll that then finds a commit
+        // takes it back, so releases don't keep paying for a waiter that isn't waiting
+        // (simp724's P1 on #1408).
+        let mut on_hold_list = false;
         loop {
             let polled = match self.poll() {
                 Ok(p) => p,
-                Err(e) => return Poll::Ready(Err(e)),
+                Err(e) => {
+                    if on_hold_list {
+                        feed.forget_hold_waiter(self.key);
+                    }
+                    return Poll::Ready(Err(e));
+                }
             };
             let Polled::Pending { held } = polled else {
+                if on_hold_list {
+                    feed.forget_hold_waiter(self.key);
+                }
                 return Poll::Ready(Ok(self.lend(polled)));
             };
             let target = self.frontier.saturating_add(1);
@@ -561,6 +573,7 @@ impl FeedReader {
                 // The feed's own holds keep the frontier below the watermark: the shard wakes
                 // this when it lets one go.
                 feed.wait_for_hold(self.key, cx.waker());
+                on_hold_list = true;
             } else {
                 let waiters = if self.durable {
                     &self.shared.durable_waiters
