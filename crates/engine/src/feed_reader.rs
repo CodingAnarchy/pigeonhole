@@ -757,9 +757,12 @@ impl FeedReader {
         // frontier (it rises with every commit): by M1 every record at or below it was read
         // then, and `emit` above found none left to deliver. Reading again would only find
         // the same ends, which costs a stream's segment headers and a chunk of frames each
-        // (#1448: an idle reader process spent 1-1.7 ms of CPU per poll there). A writer
-        // restart since the stale check above is seen here, as after the reads below.
-        if self.read_through == Some(frontier) {
+        // (#1448: an idle reader process spent 1-1.7 ms of CPU per poll there). Not while a
+        // PREPARE is held: a checkpoint or floor can move without a commit (a flush), and
+        // `drop_aborted` (rule C) must see it, or the commits behind an aborted round wait
+        // for an unrelated one (feed1248's P1 on #1449). A writer restart since the stale
+        // check above is seen here, as after the reads below.
+        if self.read_through == Some(frontier) && self.held.is_empty() {
             if self.shm.is_stale() {
                 return Err(Error::SnapshotExpired);
             }
