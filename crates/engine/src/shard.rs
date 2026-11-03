@@ -7279,7 +7279,10 @@ impl ShardState {
                 let id = group.id;
                 self.unresolved.push_back(group);
                 self.publish_watermark();
-                // The sync covers the feed's records held so far (#1415).
+                // The sync covers the feed's records held so far (#1415). A `Sync` member's
+                // own sync covers only the records before it in its group, yet this closes
+                // after the whole group: safe, since a bucket goes only once `durable`
+                // passes its end, so a later sync drops it.
                 if self.feed_sync_open_low.get() != u64::MAX {
                     self.close_feed_sync_bucket();
                 }
@@ -10937,6 +10940,11 @@ impl ShardState {
         match self.wal.as_mut() {
             Some(wal) => match wal.submit_sync() {
                 Ok(c) => {
+                    // A flush's or checkpoint's barrier sync covers the feed's held records
+                    // too: the next settle drops them (#1415, simp724's C1).
+                    if self.feed_sync_open_low.get() != u64::MAX {
+                        self.close_feed_sync_bucket();
+                    }
                     drop(c.map(move |r| {
                         reply.notify(r.map(|_| ()).map_err(Error::from));
                         Ok(())
