@@ -1,4 +1,9 @@
 # D311 T5 (#1339): the fixture's embedding model, on CPU. Install into a venv:
 #   python3 -m venv .venv && .venv/bin/pip install --index-url https://download.pytorch.org/whl/cpu torch==2.5.1 && .venv/bin/pip install -r requirements.txt
-sentence-transformers==3.3.1
+# 5.6.0 and later fix GHSA-jhr6-gm9c-rqjv (a local model's code ran without trust_remote_code).
+sentence-transformers==5.6.1
+# Pinned with it (unpinned before, they resolved to these): transformers 5 needs a newer
+# torch than 2.5.1, and pinning them keeps a fresh venv's embeddings the fixture's.
+transformers==4.57.6
+tokenizers==0.22.2
 numpy==2.1.3
