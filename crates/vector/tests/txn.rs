@@ -92,7 +92,8 @@ fn writes_in_a_callers_transaction_commit_and_roll_back_with_it() {
             Ok::<_, Error>((deleted, p))
         })
         .unwrap();
-    assert_eq!(none, (false, Placed::new()), "nothing written or recorded");
+    assert!(!none.0, "nothing to delete");
+    index.after_commit(none.1).unwrap();
     let r = db.transact(&RetryPolicy::default(), |tx| {
         index.delete_in(tx, &mut Placed::new(), &3u32.to_be_bytes())?;
         Err::<(), Error>(Error::InvalidArgument("rolled back".into()))
@@ -513,5 +514,34 @@ fn in_transaction_writes_racing_splits_and_merges_stay_consistent() {
     });
     let stats = index.verify().unwrap();
     assert!(stats.vectors <= 60, "{stats:?}");
+    db.close().unwrap();
+}
+
+/// cli692's C1 on #1412: a `Placed` belongs to the index its first write used.
+#[test]
+fn a_placed_belongs_to_one_index() {
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = open(&dir);
+    let a = Index::create(&db, "a", spec(), small()).unwrap();
+    let b = Index::create(&db, "b", spec(), small()).unwrap();
+    let r = db.transact(&RetryPolicy::default(), |tx| {
+        let mut p = Placed::new();
+        a.insert_f32_in(tx, &mut p, b"x", &point(0, 1))?;
+        // A clone (or another open) of `a` shares its state: the same index.
+        a.clone().insert_f32_in(tx, &mut p, b"y", &point(0, 2))?;
+        let other = b.insert_f32_in(tx, &mut p, b"z", &point(0, 3));
+        assert!(matches!(other, Err(Error::InvalidArgument(_))), "{other:?}");
+        let other = b.delete_in(tx, &mut p, b"x");
+        assert!(matches!(other, Err(Error::InvalidArgument(_))), "{other:?}");
+        Ok::<_, Error>(p)
+    });
+    let (p, _) = r.unwrap();
+    assert!(matches!(
+        b.after_commit(p.clone()),
+        Err(Error::InvalidArgument(_))
+    ));
+    a.after_commit(p).unwrap();
+    assert_eq!(a.verify().unwrap().vectors, 2);
+    assert_eq!(b.verify().unwrap().vectors, 0);
     db.close().unwrap();
 }

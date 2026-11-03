@@ -185,6 +185,12 @@ pub struct Hit {
 /// put each id: a second write of an id in the same transaction (an upsert, a delete after
 /// an insert, an insert after a delete) acts on that, not on the snapshot (cli692's B1 on
 /// #1412). Writes of one transaction through two `Placed` lose that, so use one.
+///
+/// **Make it inside the transaction's body** (the closure
+/// [`Pigeonhole::transact`](pigeonhole::Pigeonhole::transact) runs), so a retried attempt
+/// starts with a fresh one: one made outside would carry an aborted attempt's record into
+/// the retry. A `Placed` belongs to the index its first write used; using it with another
+/// index is [`Error::InvalidArgument`] (cli692's C1 and C2).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[must_use = "pass it to Index::after_commit once the transaction commits; dropping it only delays a split or merge until the next write to its lists"]
 pub struct Placed {
@@ -193,12 +199,29 @@ pub struct Placed {
     ids: HashMap<Vec<u8>, Option<u32>>,
     /// This transaction created list 0 (the index was empty at its snapshot).
     bootstrapped: bool,
+    /// The index it belongs to: its shared state's address, set by its first write.
+    index: Option<usize>,
 }
 
 impl Placed {
     /// No writes yet.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Binds this record to `index` on first use; another index is `InvalidArgument`.
+    fn bind(&mut self, index: &Index) -> Result<()> {
+        let at = Arc::as_ptr(&index.inner) as usize;
+        match self.index {
+            None => {
+                self.index = Some(at);
+                Ok(())
+            }
+            Some(i) if i == at => Ok(()),
+            Some(_) => Err(Error::InvalidArgument(
+                "a Placed records one index's writes: make one per index and transaction".into(),
+            )),
+        }
     }
 
     fn wrote(&mut self, id: &[u8], now: Option<u32>, lists: impl IntoIterator<Item = u32>) {
@@ -1171,6 +1194,7 @@ impl Index {
     /// as of its snapshot. Pass `placed` to [`after_commit`](Self::after_commit) once `tx`
     /// commits, so a list that shrank below its bound is merged.
     pub fn delete_in(&self, tx: &mut Transaction, placed: &mut Placed, id: &[u8]) -> Result<bool> {
+        placed.bind(self)?;
         let t = &self.inner.table;
         let l = match placed.ids.get(id).copied() {
             Some(Some(l)) => l,
@@ -1196,8 +1220,10 @@ impl Index {
     /// its writes left out of bounds, as [`insert_f32`](Self::insert_f32) and
     /// [`delete`](Self::delete) do after theirs. It reads the lists' current lengths, so
     /// calling it after a rollback, twice, or late is harmless, and never calling it only
-    /// delays a rebalance until the next write to those lists.
-    pub fn after_commit(&self, placed: Placed) -> Result<()> {
+    /// delays a rebalance until the next write to those lists. A `Placed` of another index is
+    /// [`Error::InvalidArgument`].
+    pub fn after_commit(&self, mut placed: Placed) -> Result<()> {
+        placed.bind(self)?;
         self.after_write(placed.lists)
     }
 
@@ -1541,6 +1567,7 @@ impl Index {
     ) -> Result<()> {
         let inn = &*self.inner;
         v.check(&inn.spec)?;
+        placed.bind(self)?;
         let point = v.placed(&inn.spec);
         let t = &inn.table;
         // Where `id` is: as this transaction left it, else as its snapshot shows it.
