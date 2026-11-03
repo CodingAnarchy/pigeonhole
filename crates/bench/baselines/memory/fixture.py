@@ -210,7 +210,33 @@ def main():
         "dim": model.get_sentence_embedding_dimension(),
         "datasets": {},
     }
+    # Resumable: a dataset whose four files and summary are written is kept as it is.
+    done_path = os.path.join(a.out, "datasets.jsonl")
+    done = {}
+    if os.path.exists(done_path):
+        for line in open(done_path):
+            d = json.loads(line)
+            done.update(d)
     for name in a.datasets.split(","):
+        files = [os.path.join(a.out, f"{name}.{x}") for x in ("mem.jsonl", "mem.f32", "q.jsonl", "q.f32")]
+        if all(os.path.exists(f) for f in files):
+            if name not in done:
+                # Written by a run that kept no summary: rebuilt from the files.
+                mems = [json.loads(l) for l in open(files[0])]
+                qs = sum(1 for _ in open(files[2]))
+                dim = manifest["dim"]
+                assert os.path.getsize(files[1]) == 4 * dim * len(mems), files[1]
+                assert os.path.getsize(files[3]) == 4 * dim * qs, files[3]
+                done[name] = {
+                    "source": SOURCES[name][0],
+                    "sha256": fetch(raw, name)[1],
+                    "memories": len(mems),
+                    "questions": qs,
+                    "namespaces": len({m["ns"] for m in mems}),
+                }
+            manifest["datasets"][name] = done[name]
+            print(f"{name}: already written", file=sys.stderr)
+            continue
         path, digest = fetch(raw, name)
         if name == "locomo":
             mems, qs = locomo(path)
@@ -235,6 +261,8 @@ def main():
             "namespaces": len({m["ns"] for m in mems}),
         }
         print(json.dumps({name: manifest["datasets"][name]}), file=sys.stderr)
+        with open(done_path, "a") as f:
+            f.write(json.dumps({name: manifest["datasets"][name]}) + "\n")
     with open(os.path.join(a.out, "manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
 
