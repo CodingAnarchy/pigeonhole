@@ -207,7 +207,7 @@ These numbers come from `crates/bench/examples/memrecall.rs` on the reference AX
 - **LongMemEval-S** (Wu et al., 2024): 470 questions, each over its own namespace of about 250 memories, one per user turn and the reply after it. A question counts at `k` when a hit comes from one of its answer sessions.
 - **LoCoMo** (Maharana et al., 2024): 1,531 questions over 10 conversations of about 590 turns each. A question counts when a hit is one of its evidence turns.
 
-Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused:
+Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused. NDCG ranks the memory hits as returned, and counts each evidence session or turn once, at its first hit. So it's over memories, not LongMemEval's session-level variant, which collapses a session's turns first:
 
 | | LongMemEval-S | LoCoMo |
 |---|---|---|
@@ -221,27 +221,29 @@ Recall@5 / recall@10 / NDCG@10, `k = 10`, per signal alone and fused:
 | fused, `expand(Expand::hops(1))` | 0.951 / 0.977 / 0.751 | 0.541 / 0.666 / 0.400 |
 
 - **Fused beats any one signal** once recency's weight comes down. Neither benchmark asks about recent events, so recency there is noise. An agent whose questions do lean on what happened lately should keep a higher weight. `Weights` sets it per call.
-- **The graph signal** here follows only each turn's link to the previous turn of its session, the one link every application can write. It adds a little recall@10 on LoCoMo and costs ranking quality. Links that carry meaning (entities, `derived_from`) are what it's for.
+- **The graph signal** here follows only each turn's link to the previous turn of its session, the one link every application can write. Recall is about level (+0.008 recall@10 on LoCoMo, about 12 of 1,531 questions), and ranking quality drops on both. Links that carry meaning (entities, `derived_from`) are what it's for.
 - **`f16` and `bf16` embeddings** recall the same as `f32`, to within 0.001 on every LongMemEval-S row.
 - **Fuzzy keyword terms** (`Fuzziness::Auto` on words of 5 or more letters) don't help. Recall@10 changes by under a point either way, and the keyword search takes 18 to 100 times as long. Recall doesn't take a fuzziness option for that reason.
 
-**Latency,** fused, `k = 10`, warm, one thread:
+**Latency,** fused, `k = 10`, warm, one thread. The last two rows have 50 questions, so their "p99" is the slowest of 50:
 
 | namespace size | p50 | p99 | with `expand(hops(1))`, p50 / p99 |
 |---|---|---|---|
 | ~250 memories (LongMemEval-S) | 2.0 ms | 3.7 ms | 9.9 / 33 ms |
 | ~590 (LoCoMo) | 1.3 ms | 4.3 ms | 2.8 / 5.7 ms |
-| ~2,400 (LongMemEval-M, 50 questions) | 7.9 ms | 14.6 ms | 15.9 / 37 ms |
-| 94,000 in one namespace | 67 ms | 108 ms | |
+| ~2,400 (LongMemEval-M) | 7.9 ms | 14.6 ms | 15.9 / 37 ms |
+| 94,000 in one namespace | 68 ms | 107 ms | |
 
-Vector recall is an exact search over the namespace, so it grows with the namespace. Per-user or per-agent namespaces of a few thousand memories stay well under 20 ms. A single namespace of 100,000 takes about 70 ms, where an approximate index (IVF, D311 T8) would help.
+At 94,000 memories, the exact vector search is 37 ms of that (p50) and the keyword search 28 ms (slowest 66 ms). Both grow with the namespace. Per-user or per-agent namespaces of a few thousand memories stay well under 20 ms. In a single namespace of 100,000, an approximate vector index (IVF, D311 T8) would take the vector part off, but not the keyword part.
 
-**Size,** per 100,000 LongMemEval memories (about 2 KB of text each), after a full compaction:
+**Size,** per 100,000 LongMemEval memories (about 2 KB of text each, 1.1 KB once compressed), in use after a full compaction:
 
-| embeddings | the store | of which embeddings | the keyword index | the text |
-|---|---|---|---|---|
-| `f32` | 962 MB | 150 MB | 586 MB | 109 MB |
-| `f16` | 882 MB | 77 MB | 586 MB | 109 MB |
-| `bf16` | 879 MB | 77 MB | 586 MB | 109 MB |
+| embeddings | the store | embeddings | the keyword index | the text | other |
+|---|---|---|---|---|---|
+| `f32` | 962 MB | 159 MB | 637 MB | 116 MB | 50 MB |
+| `f16` | 882 MB | 82 MB | 637 MB | 116 MB | 47 MB |
+| `bf16` | 879 MB | 82 MB | 637 MB | 116 MB | 44 MB |
 
-The keyword index (postings, plus each memory's terms for deletes) is most of the store with text this long. Half-precision embeddings save 8%.
+- **The keyword index is most of the store** with text this long, about 5.5 times the compressed text. It keeps a posting for every distinct term of every memory (the memory's id, with the term's frequency and the memory's length), plus each memory's own terms so a delete can find its postings.
+- **"Other"** is the memories' metadata and use counts, the dedup rows, and what the file's extents hold beyond their data.
+- **Half-precision embeddings** save 8%.
