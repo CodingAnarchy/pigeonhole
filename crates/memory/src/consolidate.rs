@@ -195,7 +195,9 @@ pub struct ConsolidatePass {
     /// namespace's end: its scan reached its limit, or `max_groups` left groups for later.
     /// `None` once it looked at every candidate. Groups never span a resume position (cli692's
     /// A1 on #1386: without it, old memories that never group would hold every pass at the
-    /// scan's limit).
+    /// scan's limit). A group that was skipped (it changed, or its commit conflicted) has its
+    /// seed at or before the resume position, so a resumed pass doesn't see it again: a pass
+    /// from the start does.
     pub resume: Option<MemoryId>,
 }
 
