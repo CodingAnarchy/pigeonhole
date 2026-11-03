@@ -694,3 +694,43 @@ fn a_superseded_hit_says_what_superseded_it() {
     assert_eq!(by[new.id()], None);
     db.close().unwrap();
 }
+
+#[test]
+fn an_nfkc_store_matches_ligatures_and_full_width_forms_and_an_nfc_one_does_not() {
+    use pigeonhole_memory::Normalization;
+    let dir = pigeonhole::doc_support::temp_dir();
+    let db = Pigeonhole::open(dir.join("mem.phdb"), Options::default().shards(1)).unwrap();
+    for (name, norm) in [("nfc", None), ("nfkc", Some(Normalization::Nfkc))] {
+        let mut o = StoreOptions::new();
+        if let Some(n) = norm {
+            o = o.normalization(n);
+        }
+        let s = Store::create(&db, name, o).unwrap();
+        assert_eq!(
+            s.normalization(),
+            norm.unwrap_or(Normalization::Nfc),
+            "{name}"
+        );
+        let id = s
+            .remember("a", Memory::new("the deploy configuration file"))
+            .unwrap()
+            .id()
+            .clone();
+        // A ligature (U+FB01) and full-width letters (U+FF46 …).
+        for q in ["\u{FB01}le", "\u{FF46}\u{FF49}\u{FF4C}\u{FF45}"] {
+            let hits = s.recall(&["a"]).text(q).with_signals(true).run().unwrap();
+            // Recency returns the one memory either way: the keyword signal says whether
+            // the query's term matched it.
+            let keyword = hits
+                .iter()
+                .find(|h| h.id == id)
+                .and_then(|h| h.signals.unwrap().keyword);
+            assert_eq!(keyword.is_some(), norm.is_some(), "{name}, {q:?}");
+        }
+    }
+    // Read back from the index on open, so nothing at open can disagree.
+    let s = Store::open_without_embeddings(&db, "nfkc").unwrap();
+    assert_eq!(s.normalization(), Normalization::Nfkc);
+    drop(s);
+    db.close().unwrap();
+}

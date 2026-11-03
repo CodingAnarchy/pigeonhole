@@ -16,6 +16,7 @@ MemoryId = _native.MemoryId
 Memory = _native.Memory
 EmbeddingModel = _native.EmbeddingModel
 Weights = _native.Weights
+Expand = _native.Expand
 ForgetPolicy = _native.ForgetPolicy
 ConsolidatePolicy = _native.ConsolidatePolicy
 NearDedup = _native.NearDedup

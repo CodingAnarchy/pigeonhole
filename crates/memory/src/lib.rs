@@ -37,6 +37,9 @@ pub use dedup::{DedupPolicy, NearDedup};
 pub use error::{Error, Result};
 pub use forget::{Forget, ForgetPass, ForgetPolicy, Forgetter, Forgot};
 pub use layout::{MemoryId, normalize};
+/// The text index's Unicode normalisation ([`StoreOptions::normalization`]), re-exported from
+/// `pigeonhole-text`.
+pub use pigeonhole_text::Normalization;
 pub use recall::{Expand, Fusion, Recall, RecallHit, RecallStats, Signal, Signals, Weights};
 pub use store::{
     EmbeddingModel, Kind, Link, LinkType, Marked, Memory, OpenOptions, ReadStore, Remembered,
