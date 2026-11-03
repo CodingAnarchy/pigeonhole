@@ -120,6 +120,38 @@ def test_recall_ranks_signals_budgets_and_snapshots(db):
             s.recall("n", text="cache", snapshot=snap)
 
 
+def test_recall_expands_through_links(db):
+    """recall.rs's graph expansion (T4): Expand, the graph signal and weight, the stats."""
+    with mem.Store.create(db, "graph", embedding=model()) as s:
+        far = s.remember("n", "the reason behind it", embedding=[0.0, 0.0, 1.0, 0.0]).id
+        seed = s.remember("n", "the decision", embedding=[1.0, 0.0, 0.0, 0.0],
+                          links=[(far, 16, 0.8)]).id
+        q = dict(embedding=[1.0, 0.0, 0.0, 0.0], candidates=1, with_signals=True)
+        # Without expand there's no graph signal, whatever its weight.
+        plain, st = s.recall_with_stats("n", weights=mem.Weights(graph=5.0), **q)
+        assert [h.id for h in plain] == [seed]
+        assert all(h.signals.graph is None for h in plain)
+        assert (st.expanded, st.expansion_truncated) == (0, False)
+        hits, st = s.recall_with_stats("n", expand=mem.Expand(1), **q)
+        by = {h.id: h for h in hits}
+        assert by[seed].signals.graph is None  # a seed
+        g = by[far].signals.graph
+        assert g.rank == 1 and abs(g.value - 0.8) < 1e-6  # seed 1's value (1) times 0.8
+        assert (st.expanded, st.expansion_truncated) == (1, False)
+        # max=0 gives nothing; the budget's cut is reported.
+        _, st = s.recall_with_stats("n", expand=mem.Expand(1, max=0), **q)
+        assert st.expanded == 0
+        _, st = s.recall_with_stats("n", expand=mem.Expand(), byte_budget=1, **q)
+        assert (st.expanded, st.expansion_truncated) == (0, True)
+        x = mem.Expand(2, max=5)
+        assert (x.hops, x.max) == (2, 5) and x == mem.Expand(2, max=5)
+        assert repr(x) == "Expand(hops=2, max=5)" and mem.Expand.MAX_HOPS == 4
+        assert mem.Expand().max == 20 and mem.Weights().graph == 0.5
+        for bad in (0, mem.Expand.MAX_HOPS + 1):
+            with pytest.raises(ph.InvalidArgument):
+                s.recall("n", expand=mem.Expand(bad), **q)
+
+
 def test_open_checks_the_model(db):
     mem.Store.create(db, "agents", embedding=model()).close()
     with pytest.raises(mem.ModelMismatch) as e:

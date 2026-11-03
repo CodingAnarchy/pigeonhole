@@ -209,7 +209,10 @@ The design is on #1340 (cli692, c6594184297), reviewed by ai1249 and simp724 the
   - `Store.close()` and `with` empty the handle's slot, and the forgetter thread stops once every handle to the store is closed.
   - `Database.close()` (and `Reader.close()`) close the stores opened on them first.
   - Afterwards calls raise `Closed`, and a call already running ends with the database's `Closed`.
-- **Not bound in T6:** `own_forgetter`/`take_forgetter` (a Python application drives passes with `forget()`), and `Expand` with the graph signal (#1391 merged first; ai1249 binds them in a follow-up).
+- **Not bound in T6:** `own_forgetter`/`take_forgetter` (a Python application drives passes with `forget()`).
+- **The graph expansion (T4), bound after T6** (ai1249, cli692's N1 on #1395):
+  - `recall(expand=Expand(hops=1, max=20))` and `recall_with_stats(expand=...)` on `Store` and `ReadStore`;
+  - `Expand` (frozen, with `hops`, `max` and `Expand.MAX_HOPS`), `Weights(graph=)`, `Signals.graph`, and `RecallStats.expanded` and `expansion_truncated`.
 
 ## T7: `phdb mcp` memory tools (#1341)
 The design is on #1341 (cli692, c6593086022), plus the owner's three-part decision there. The flags and tools are `phdb`'s interface. They're not part of `pigeonhole-memory`'s API, which T7 doesn't change.

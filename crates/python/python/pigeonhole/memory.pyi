@@ -8,7 +8,7 @@ import enum
 from collections.abc import Callable, Mapping, Sequence
 from datetime import timedelta
 from types import TracebackType
-from typing import Literal, final
+from typing import ClassVar, Literal, final
 
 from pigeonhole import Database, Element, InvalidArgument, MergeFailed, Reader, Seconds, Snapshot, Transaction
 
@@ -79,7 +79,7 @@ class EmbeddingModel:
 
 @final
 class Weights:
-    """Recall's signal weights: every one 1 by default, `consolidated` 0.5."""
+    """Recall's signal weights: every one 1 by default, `graph` and `consolidated` 0.5."""
 
     def __new__(
         cls,
@@ -89,6 +89,7 @@ class Weights:
         recency: float | None = None,
         importance: float | None = None,
         uses: float | None = None,
+        graph: float | None = None,
         consolidated: float | None = None,
     ) -> Weights: ...
     @property
@@ -102,7 +103,25 @@ class Weights:
     @property
     def uses(self) -> float: ...
     @property
+    def graph(self) -> float:
+        """The graph signal's weight: no effect on a recall without `expand`."""
+    @property
     def consolidated(self) -> float: ...
+    def __eq__(self, other: object, /) -> bool: ...
+
+@final
+class Expand:
+    """A graph expansion of a recall: the top 10 fused candidates seed a walk of the
+    memories' links in both directions, and the memories it reaches get a `graph` signal.
+    At most `max` do (0 gives none). With a `byte_budget` of B, the walk reads up to B bytes
+    of nodes besides the hits' own B."""
+
+    MAX_HOPS: ClassVar[int]
+    def __new__(cls, hops: int = 1, *, max: int | None = None) -> Expand: ...
+    @property
+    def hops(self) -> int: ...
+    @property
+    def max(self) -> int: ...
     def __eq__(self, other: object, /) -> bool: ...
 
 @final
@@ -307,6 +326,9 @@ class Signals:
     def importance(self) -> Signal | None: ...
     @property
     def uses(self) -> Signal | None: ...
+    @property
+    def graph(self) -> Signal | None:
+        """Only with `expand`, and never for a seed."""
 
 @final
 class RecallHit:
@@ -339,6 +361,10 @@ class RecallStats:
     def candidates(self) -> int: ...
     @property
     def truncated(self) -> bool: ...
+    @property
+    def expanded(self) -> int: ...
+    @property
+    def expansion_truncated(self) -> bool: ...
 
 @final
 class ForgetPass:
@@ -455,6 +481,7 @@ class Store:
         session: str | None = None,
         with_signals: bool = False,
         with_embeddings: bool = False,
+        expand: Expand | None = None,
     ) -> list[RecallHit]: ...
     def recall_with_stats(
         self,
@@ -474,6 +501,7 @@ class Store:
         session: str | None = None,
         with_signals: bool = False,
         with_embeddings: bool = False,
+        expand: Expand | None = None,
     ) -> tuple[list[RecallHit], RecallStats]: ...
     def forget(
         self,
@@ -536,6 +564,7 @@ class ReadStore:
         session: str | None = None,
         with_signals: bool = False,
         with_embeddings: bool = False,
+        expand: Expand | None = None,
     ) -> list[RecallHit]: ...
     def recall_with_stats(
         self,
@@ -555,4 +584,5 @@ class ReadStore:
         session: str | None = None,
         with_signals: bool = False,
         with_embeddings: bool = False,
+        expand: Expand | None = None,
     ) -> tuple[list[RecallHit], RecallStats]: ...

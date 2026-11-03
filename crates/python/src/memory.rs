@@ -250,7 +250,7 @@ impl EmbeddingModel {
     }
 }
 
-/// Recall's signal weights (every one 1 by default, `consolidated` 0.5).
+/// Recall's signal weights (every one 1 by default; `graph` and `consolidated` 0.5).
 #[pyclass(module = "pigeonhole.memory", frozen)]
 #[derive(Clone)]
 pub(crate) struct Weights(mem::Weights);
@@ -258,13 +258,15 @@ pub(crate) struct Weights(mem::Weights);
 #[pymethods]
 impl Weights {
     #[new]
-    #[pyo3(signature = (*, vector=None, keyword=None, recency=None, importance=None, uses=None, consolidated=None))]
+    #[pyo3(signature = (*, vector=None, keyword=None, recency=None, importance=None, uses=None, graph=None, consolidated=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         vector: Option<f64>,
         keyword: Option<f64>,
         recency: Option<f64>,
         importance: Option<f64>,
         uses: Option<f64>,
+        graph: Option<f64>,
         consolidated: Option<f64>,
     ) -> Self {
         let mut w = mem::Weights::default();
@@ -278,6 +280,7 @@ impl Weights {
         set(&mut w.recency, recency);
         set(&mut w.importance, importance);
         set(&mut w.uses, uses);
+        set(&mut w.graph, graph);
         set(&mut w.consolidated, consolidated);
         Self(w)
     }
@@ -302,6 +305,11 @@ impl Weights {
     fn uses(&self) -> f64 {
         self.0.uses
     }
+    /// The graph signal's weight: it has no effect on a recall without `expand`.
+    #[getter]
+    fn graph(&self) -> f64 {
+        self.0.graph
+    }
     #[getter]
     fn consolidated(&self) -> f64 {
         self.0.consolidated
@@ -314,9 +322,53 @@ impl Weights {
     fn __repr__(&self) -> String {
         let w = &self.0;
         format!(
-            "Weights(vector={}, keyword={}, recency={}, importance={}, uses={}, consolidated={})",
-            w.vector, w.keyword, w.recency, w.importance, w.uses, w.consolidated
+            "Weights(vector={}, keyword={}, recency={}, importance={}, uses={}, graph={}, consolidated={})",
+            w.vector, w.keyword, w.recency, w.importance, w.uses, w.graph, w.consolidated
         )
+    }
+}
+
+/// A graph expansion of a recall (T4, `recall(expand=Expand(hops=1))`): the top 10 fused
+/// candidates seed a walk of the memories' links in both directions, and every memory it
+/// reaches is scored like the others, with a `graph` signal besides. At most `max` memories
+/// get one (20 by default; 0 gives none). With a `byte_budget` of `B`, the walk reads up to
+/// `B` bytes of nodes besides the hits' own `B`.
+#[pyclass(module = "pigeonhole.memory", frozen)]
+#[derive(Clone)]
+pub(crate) struct Expand(mem::Expand);
+
+#[pymethods]
+impl Expand {
+    /// The most hops an expansion takes.
+    #[classattr]
+    const MAX_HOPS: u32 = mem::Expand::MAX_HOPS;
+
+    /// `hops` from 1 to `MAX_HOPS` (the recall refuses others with `InvalidArgument`).
+    #[new]
+    #[pyo3(signature = (hops=1, *, max=None))]
+    fn new(hops: u32, max: Option<usize>) -> Self {
+        let mut x = mem::Expand::hops(hops);
+        if let Some(m) = max {
+            x = x.max(m);
+        }
+        Self(x)
+    }
+
+    #[getter]
+    fn hops(&self) -> u32 {
+        self.0.hops
+    }
+    #[getter]
+    fn max(&self) -> usize {
+        self.0.max
+    }
+
+    fn __eq__(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+
+    fn __repr__(&self) -> String {
+        format!("Expand(hops={}, max={})", self.0.hops, self.0.max)
     }
 }
 
@@ -802,6 +854,7 @@ pub(crate) struct Signals {
     recency: Option<Signal>,
     importance: Option<Signal>,
     uses: Option<Signal>,
+    graph: Option<Signal>,
 }
 
 fn signal(s: Option<mem::Signal>) -> Option<Signal> {
@@ -840,6 +893,8 @@ impl RecallHit {
 pub(crate) struct RecallStats {
     candidates: usize,
     truncated: bool,
+    expanded: usize,
+    expansion_truncated: bool,
 }
 
 /// A forget pass's counts, and where to resume (`Store.forget(after=...)`).
@@ -896,6 +951,7 @@ struct RecallArgs {
     session: Option<String>,
     with_signals: bool,
     with_embeddings: bool,
+    expand: Option<mem::Expand>,
 }
 
 impl RecallArgs {
@@ -931,6 +987,9 @@ impl RecallArgs {
         if let Some(w) = self.weights {
             r = r.weights(w);
         }
+        if let Some(x) = self.expand {
+            r = r.expand(x);
+        }
         if let Some(s) = self.session {
             r = r.session(s);
         }
@@ -958,6 +1017,7 @@ fn recall_args(
     session: Option<String>,
     with_signals: bool,
     with_embeddings: bool,
+    expand: Option<&Bound<'_, Expand>>,
 ) -> PyResult<RecallArgs> {
     let namespaces: Vec<String> = if namespaces.is_instance_of::<pyo3::types::PyString>() {
         vec![namespaces.extract()?]
@@ -985,6 +1045,7 @@ fn recall_args(
         session,
         with_signals,
         with_embeddings,
+        expand: expand.map(|x| x.get().0),
     })
 }
 
@@ -1006,6 +1067,7 @@ fn hits(
                             recency: signal(s.recency),
                             importance: signal(s.importance),
                             uses: signal(s.uses),
+                            graph: signal(s.graph),
                         },
                     )
                 })
@@ -1028,6 +1090,8 @@ fn hits(
         RecallStats {
             candidates: stats.candidates,
             truncated: stats.truncated,
+            expanded: stats.expanded,
+            expansion_truncated: stats.expansion_truncated,
         },
     ))
 }
@@ -1387,7 +1451,7 @@ impl Store {
 
     /// The memories best matching `text` and/or `embedding` in `namespaces` (a list, or one
     /// str), best first, at one snapshot.
-    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false))]
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall(
         &self,
@@ -1407,6 +1471,7 @@ impl Store {
         session: Option<String>,
         with_signals: bool,
         with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
     ) -> PyResult<Vec<RecallHit>> {
         self.recall_with_stats(
             py,
@@ -1425,12 +1490,13 @@ impl Store {
             session,
             with_signals,
             with_embeddings,
+            expand,
         )
         .map(|(h, _)| h)
     }
 
     /// `recall`, with its `RecallStats`.
-    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false))]
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall_with_stats(
         &self,
@@ -1450,6 +1516,7 @@ impl Store {
         session: Option<String>,
         with_signals: bool,
         with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
     ) -> PyResult<(Vec<RecallHit>, RecallStats)> {
         let a = recall_args(
             namespaces,
@@ -1467,6 +1534,7 @@ impl Store {
             session,
             with_signals,
             with_embeddings,
+            expand,
         )?;
         let s = self.handle()?;
         let out = py
@@ -1699,7 +1767,7 @@ impl ReadStore {
         Ok(py.detach(move || s.verify()).or_mem()?.into())
     }
 
-    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false))]
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall(
         &self,
@@ -1719,6 +1787,7 @@ impl ReadStore {
         session: Option<String>,
         with_signals: bool,
         with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
     ) -> PyResult<Vec<RecallHit>> {
         self.recall_with_stats(
             py,
@@ -1737,11 +1806,12 @@ impl ReadStore {
             session,
             with_signals,
             with_embeddings,
+            expand,
         )
         .map(|(h, _)| h)
     }
 
-    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false))]
+    #[pyo3(signature = (namespaces, *, text=None, embedding=None, k=None, candidates=None, byte_budget=None, snapshot=None, now_us=None, half_life=None, fusion="rrf", weights=None, include_superseded=false, session=None, with_signals=false, with_embeddings=false, expand=None))]
     #[allow(clippy::too_many_arguments)]
     fn recall_with_stats(
         &self,
@@ -1761,6 +1831,7 @@ impl ReadStore {
         session: Option<String>,
         with_signals: bool,
         with_embeddings: bool,
+        expand: Option<&Bound<'_, Expand>>,
     ) -> PyResult<(Vec<RecallHit>, RecallStats)> {
         let a = recall_args(
             namespaces,
@@ -1778,6 +1849,7 @@ impl ReadStore {
             session,
             with_signals,
             with_embeddings,
+            expand,
         )?;
         let s = self.store()?;
         let out = py
@@ -1797,6 +1869,7 @@ pub(crate) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<MemoryId>()?;
     m.add_class::<EmbeddingModel>()?;
     m.add_class::<Weights>()?;
+    m.add_class::<Expand>()?;
     m.add_class::<ForgetPolicy>()?;
     m.add_class::<ConsolidatePolicy>()?;
     m.add_class::<NearDedup>()?;
