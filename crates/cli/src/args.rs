@@ -181,6 +181,11 @@ pub(crate) struct MemoryArgs {
     /// A new store's embedding element: f32, f16 (half the size) or bf16.
     #[arg(long, value_name = "ELEMENT", default_value = "f32", value_parser = ["f32", "f16", "bf16"], requires = "memory")]
     pub memory_element: String,
+    /// A new store's text-index normalisation: nfc (the default), nfkc (folds ligatures and
+    /// full-width forms, for text from PDFs, OCR or East Asian sources) or none. Fixed at
+    /// create: for an existing store it must match the store's, or the server won't start.
+    #[arg(long, value_name = "FORM", value_parser = ["nfc", "nfkc", "none"], requires = "memory")]
+    pub memory_normalization: Option<String>,
     /// A new store's episodic memories are forgotten this many hours after they were made,
     /// unless pinned or a summary derives from them (the store's forget policy, D311 T2).
     #[arg(long, value_name = "HOURS", requires = "memory")]

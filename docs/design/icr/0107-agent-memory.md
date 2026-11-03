@@ -238,6 +238,7 @@ The design is on #1341 (cli692, c6593086022), plus the owner's three-part decisi
 - **`StoreOptions::normalization(Normalization)`** sets the Unicode normalisation of the store's text index at create. The default is `Nfc`, so existing stores and every call that doesn't set it behave as before.
 - **`Store::normalization()` and `ReadStore::normalization()`** read it back from the index. The index fixes it at create, so nothing at open can disagree.
 - **`pigeonhole_memory::Normalization`** re-exports `pigeonhole_text::Normalization` (`#[non_exhaustive]`), so callers don't need the text crate.
+- **The other surfaces (#1405):** Python's `Store.create(..., normalization="nfc" | "nfkc" | "none")` (`InvalidArgument` for anything else) with `Store.normalization` and `ReadStore.normalization` (`"unknown"` for a form this build doesn't name), and `phdb mcp --memory-normalization nfc|nfkc|none` for a new store, checked against an existing store's at startup (exit 2 on a mismatch, as for the model flags).
 - **It's a keyword-recall setting only:** exact dedup's text normalisation (trim, collapse whitespace, no case folding) is unchanged.
 
 ## The layout (frozen)

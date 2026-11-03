@@ -1492,6 +1492,49 @@ fn a_pinned_store_refuses_another_models_embeddings() {
     }
 }
 
+/// `--memory-normalization` (#1405): a new store's text-index normalisation, fixed at
+/// create. Reopened, the flag may repeat it or be left out; another value fails at startup.
+#[test]
+fn a_new_stores_normalization_is_fixed_and_checked_at_startup() {
+    let dir = TempDir::new("mcp-normalization");
+    let path = db_path(&dir);
+    let (s, _) = Server::start_env(
+        &path,
+        &[
+            "--create",
+            "--memory",
+            "agent",
+            "--memory-normalization",
+            "nfkc",
+        ],
+        &[],
+    );
+    let (status, err) = s.finish();
+    assert_eq!(status, 0, "{err}");
+    let db = Pigeonhole::open(&path, Options::default()).unwrap();
+    let store = pigeonhole_memory::Store::open_without_embeddings(&db, "agent").unwrap();
+    assert_eq!(
+        store.normalization(),
+        pigeonhole_memory::Normalization::Nfkc
+    );
+    drop(store);
+    db.close().unwrap();
+    for flags in [
+        &["--memory", "agent"][..],
+        &["--memory", "agent", "--memory-normalization", "nfkc"][..],
+    ] {
+        let (status, err) = Server::start(&path, flags).finish();
+        assert_eq!(status, 0, "{flags:?}: {err}");
+    }
+    let (status, err) = Server::spawn(
+        &path,
+        &["--memory", "agent", "--memory-normalization", "nfc"],
+    )
+    .finish();
+    assert_eq!(status, 2, "{err}");
+    assert!(err.contains("is nfkc, fixed when it was created"), "{err}");
+}
+
 /// A reader process serves `memory_recall` only, over the writer's store.
 #[test]
 fn a_reader_recalls_the_writers_memories() {
